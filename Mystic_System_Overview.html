@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mystic Autonomous AI Trading Engine – System Overview</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      line-height: 1.5;
+      color: #1a1a1a;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 2rem;
+      background: #fff;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    .subtitle { font-size: 1.1rem; color: #333; margin-bottom: 2rem; }
+    h2 { font-size: 1.15rem; margin-top: 1.5rem; margin-bottom: 0.75rem; border-bottom: 1px solid #ccc; padding-bottom: 0.25rem; }
+    p { margin: 0.75rem 0; }
+    ul { margin: 0.5rem 0; padding-left: 1.5rem; }
+    li { margin: 0.35rem 0; }
+    .flow {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      margin: 1.25rem 0;
+      font-size: 0.9rem;
+    }
+    .flow-box {
+      background: #f0f4f8;
+      border: 1px solid #b0c0d0;
+      padding: 0.5rem 0.75rem;
+      border-radius: 4px;
+    }
+    .flow-arrow { color: #555; }
+    .footer {
+      margin-top: 2.5rem;
+      padding-top: 1rem;
+      border-top: 1px solid #ddd;
+      font-size: 0.9rem;
+      color: #555;
+    }
+    .disclaimer { font-size: 0.8rem; color: #666; margin-top: 1rem; }
+    @media print {
+      body { padding: 1rem; }
+      .page-break { page-break-before: always; }
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Mystic Autonomous AI Trading Engine – System Overview</h1>
+  <p class="subtitle"><strong>Mystic Quantitative Trading Systems LLC</strong><br />Autonomous AI Trading Infrastructure</p>
+
+  <h2>Page 1 – High-Level Overview</h2>
+
+  <h3>Short Description</h3>
+  <p>The Mystic Autonomous AI Trading Engine is a <strong>self-hosted AI crypto trading system</strong> that runs on your own infrastructure. It executes <strong>fully autonomously</strong>: from ingesting market data and generating signals to placing and managing orders, without manual intervention. The design is <strong>risk-first</strong>, with capital protection, position limits, and circuit breakers built into the pipeline before any execution. Every decision and trade is <strong>continuously logged</strong> and traceable, with structured evidence packets produced for audit and compliance.</p>
+
+  <h3>Architecture (Data Flow)</h3>
+  <div class="flow">
+    <span class="flow-box">Market Data</span>
+    <span class="flow-arrow">→</span>
+    <span class="flow-box">AI Signal Engine</span>
+    <span class="flow-arrow">→</span>
+    <span class="flow-box">Redis Signal Layer</span>
+    <span class="flow-arrow">→</span>
+    <span class="flow-box">Portfolio / Risk Engine</span>
+    <span class="flow-arrow">→</span>
+    <span class="flow-box">Exchange Execution</span>
+    <span class="flow-arrow">→</span>
+    <span class="flow-box">Ledger &amp; Logs</span>
+  </div>
+
+  <div class="page-break"></div>
+
+  <h2>Page 2 – Capabilities</h2>
+
+  <h3>Core Functions</h3>
+  <ul>
+    <li><strong>Autonomous Buy/Sell Execution</strong> — Order placement and lifecycle managed by the engine.</li>
+    <li><strong>AI Confidence Scoring</strong> — Signals carry confidence scores; execution respects thresholds.</li>
+    <li><strong>Risk &amp; Position Controls</strong> — Limits on size, exposure, and symbol concentration.</li>
+    <li><strong>Portfolio Management</strong> — Position tracking, rebalancing, and dust handling.</li>
+    <li><strong>Precision/Dust Handling</strong> — Minimum order sizes and dust rules to avoid failed orders.</li>
+    <li><strong>Continuous Logging</strong> — Structured logs for signals, risk checks, and executions.</li>
+    <li><strong>Evidence Packet Automation</strong> — Packets generated for audits and handoff.</li>
+  </ul>
+
+  <h3>Technical Stack</h3>
+  <ul>
+    <li><strong>Python / FastAPI</strong> — Core services and API layer.</li>
+    <li><strong>Redis</strong> — Signal layer and shared state.</li>
+    <li><strong>SQLite</strong> — Persistent ledger and config.</li>
+    <li><strong>Binance API</strong> — Market data and execution (exchange integration).</li>
+    <li><strong>Self-Hosted Architecture</strong> — No dependency on third-party trading clouds.</li>
+  </ul>
+
+  <h3>Operational Traits</h3>
+  <ul>
+    <li>Runs <strong>without supervision</strong> in production.</li>
+    <li><strong>Crash-resilient</strong> design with recovery and circuit breakers.</li>
+    <li><strong>Transfer-ready documentation</strong> for handoff or due diligence.</li>
+    <li><strong>Evidence packets</strong> auto-generated from logs and state.</li>
+  </ul>
+
+  <div class="footer">
+    <strong>Owner / Architect:</strong> Lloyd Wylie<br />
+    Mystic Quantitative Trading Systems LLC
+  </div>
+  <p class="disclaimer">This document describes structure and capability only. No profit claims, dollar figures, exchange keys, or secrets.</p>
+
+</body>
+</html>

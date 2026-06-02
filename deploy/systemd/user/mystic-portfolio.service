@@ -1,0 +1,16 @@
+[Unit]
+Description=Mystic portfolio engine integration
+After=network-online.target mystic-uvicorn.service mystic-market-data.service mystic-ai-signals.service
+PartOf=mystic.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mystic/mystic
+EnvironmentFile=-/home/mystic/mystic/.env
+ExecStart=/home/mystic/mystic/venv/bin/python /home/mystic/mystic/start_portfolio_engine_integration.py
+Restart=always
+RestartSec=15
+TimeoutStopSec=60
+
+[Install]
+WantedBy=mystic.target

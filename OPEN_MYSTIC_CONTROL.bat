@@ -1,0 +1,2 @@
+@echo off
+start "" "http://192.168.4.128:8000/dashboard/control.html"

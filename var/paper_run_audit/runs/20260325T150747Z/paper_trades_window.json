@@ -1,0 +1,112 @@
+[
+  {
+    "id": 59,
+    "trade_id": "mystic_sell_ETH/USDT_1774451876698",
+    "symbol": "ETH/USDT",
+    "side": "SELL",
+    "timestamp": "2026-03-25T15:17:56.698710+00:00",
+    "exit_type": "STOP_LOSS",
+    "exit_reason": null,
+    "pnl_usd_net": null,
+    "status": "executed"
+  },
+  {
+    "id": 60,
+    "trade_id": "mystic_LINK/USDT_1774452360030",
+    "symbol": "LINK/USDT",
+    "side": "BUY",
+    "timestamp": "2026-03-25T15:26:00.030037+00:00",
+    "exit_type": null,
+    "exit_reason": null,
+    "pnl_usd_net": null,
+    "status": "executed"
+  },
+  {
+    "id": 61,
+    "trade_id": "mystic_ADA/USDT_1774452420060",
+    "symbol": "ADA/USDT",
+    "side": "BUY",
+    "timestamp": "2026-03-25T15:27:00.060803+00:00",
+    "exit_type": null,
+    "exit_reason": null,
+    "pnl_usd_net": null,
+    "status": "executed"
+  },
+  {
+    "id": 62,
+    "trade_id": "mystic_SOL/USDT_1774452960017",
+    "symbol": "SOL/USDT",
+    "side": "BUY",
+    "timestamp": "2026-03-25T15:36:00.017508+00:00",
+    "exit_type": null,
+    "exit_reason": null,
+    "pnl_usd_net": null,
+    "status": "executed"
+  },
+  {
+    "id": 63,
+    "trade_id": "mystic_ETH/USDT_1774456020034",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "timestamp": "2026-03-25T16:27:00.034570+00:00",
+    "exit_type": null,
+    "exit_reason": null,
+    "pnl_usd_net": null,
+    "status": "executed"
+  },
+  {
+    "id": 64,
+    "trade_id": "mystic_DOGE/USDT_1774456080025",
+    "symbol": "DOGE/USDT",
+    "side": "BUY",
+    "timestamp": "2026-03-25T16:28:00.025141+00:00",
+    "exit_type": null,
+    "exit_reason": null,
+    "pnl_usd_net": null,
+    "status": "executed"
+  },
+  {
+    "id": 65,
+    "trade_id": "mystic_BTC/USDT_1774456140036",
+    "symbol": "BTC/USDT",
+    "side": "BUY",
+    "timestamp": "2026-03-25T16:29:00.036929+00:00",
+    "exit_type": null,
+    "exit_reason": null,
+    "pnl_usd_net": null,
+    "status": "executed"
+  },
+  {
+    "id": 66,
+    "trade_id": "mystic_sell_LINK/USDT_1774456861617",
+    "symbol": "LINK/USDT",
+    "side": "SELL",
+    "timestamp": "2026-03-25T16:41:01.617795+00:00",
+    "exit_type": "TIME_EXIT",
+    "exit_reason": null,
+    "pnl_usd_net": null,
+    "status": "executed"
+  },
+  {
+    "id": 67,
+    "trade_id": "mystic_sell_DOGE/USDT_1774460580036",
+    "symbol": "DOGE/USDT",
+    "side": "SELL",
+    "timestamp": "2026-03-25T17:43:00.036294+00:00",
+    "exit_type": "TIME_EXIT",
+    "exit_reason": null,
+    "pnl_usd_net": null,
+    "status": "executed"
+  },
+  {
+    "id": 68,
+    "trade_id": "mystic_sell_BTC/USDT_1774461070488",
+    "symbol": "BTC/USDT",
+    "side": "SELL",
+    "timestamp": "2026-03-25T17:51:10.488795+00:00",
+    "exit_type": "STOP_LOSS",
+    "exit_reason": null,
+    "pnl_usd_net": null,
+    "status": "executed"
+  }
+]

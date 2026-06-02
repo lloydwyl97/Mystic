@@ -1,0 +1,16 @@
+[Unit]
+Description=Mystic AI learning and retrain loop
+After=network-online.target mystic-market-data.service
+PartOf=mystic.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mystic/mystic
+EnvironmentFile=-/home/mystic/mystic/.env
+ExecStart=/home/mystic/mystic/venv/bin/python /home/mystic/mystic/start_ai_learning.py
+Restart=always
+RestartSec=15
+TimeoutStopSec=45
+
+[Install]
+WantedBy=mystic.target

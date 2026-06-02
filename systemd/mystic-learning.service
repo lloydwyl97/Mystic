@@ -1,0 +1,22 @@
+[Unit]
+Description=Mystic AI Learning
+After=network.target mystic-backend.service
+Wants=mystic-backend.service
+
+[Service]
+Type=simple
+User=mystic
+Group=mystic
+WorkingDirectory=/home/mystic/mystic
+Environment=PATH=/home/mystic/mystic/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/home/mystic/mystic
+Environment=AI_CANONICAL_EXECUTION_ONLY=true
+EnvironmentFile=/home/mystic/mystic/.env
+EnvironmentFile=-/home/mystic/mystic/deploy/core_only_local.env
+Nice=10
+ExecStart=/home/mystic/mystic/venv/bin/python start_ai_learning.py
+Restart=always
+RestartSec=20
+
+[Install]
+WantedBy=multi-user.target

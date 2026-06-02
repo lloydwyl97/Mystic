@@ -1,0 +1,11 @@
+{
+  "features": {
+    "social_sentiment": { "enabled": true },
+    "news_sentiment": { "enabled": true },
+    "technical_indicators": {
+      "enabled": true,
+      "advanced_indicators": ["ichimoku_cloud", "fibonacci_retracements"]
+    },
+    "accelerated_learning": { "enabled": true }
+  }
+}

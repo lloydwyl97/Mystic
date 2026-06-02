@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""
+Circuit Breaker Service for Fault Tolerance and Resilience
+"""
+
+import asyncio
+import contextlib
+import logging
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
+
+from backend.database_schema import get_state, set_state
+
+# Import task manager for proper task tracking
+try:
+    from backend.services.task_manager import task_manager
+except (ImportError, ModuleNotFoundError, AttributeError, ValueError, TypeError, RuntimeError):
+    task_manager = None  # type: ignore[assignment, misc]
+
+logger = logging.getLogger(__name__)
+
+
+class CircuitState(Enum):
+    CLOSED = "closed"  # Normal operation
+    OPEN = "open"  # Circuit is open, failing fast
+    HALF_OPEN = "half_open"  # Testing if service recovered
+
+
+@dataclass
+class CircuitBreakerConfig:
+    failure_threshold: int = 5  # Failures before opening
+    recovery_timeout: float = 60.0  # Seconds to wait before trying again
+    expected_exception: tuple = (Exception,)  # Exception types to count as failures
+    success_threshold: int = 3  # Successes needed in half-open state
+
+
+@dataclass
+class CircuitStats:
+    total_calls: int = 0
+    total_failures: int = 0
+    consecutive_failures: int = 0
+    consecutive_successes: int = 0
+    last_failure_time: float | None = None
+    last_success_time: float | None = None
+
+
+class CircuitBreaker:
+    """Circuit breaker implementation for service resilience"""
+
+    def __init__(self, name: str, config: CircuitBreakerConfig = None):
+        self.name = name
+        self.config = config or CircuitBreakerConfig()
+        self.state = CircuitState.CLOSED
+        self.stats = CircuitStats()
+        self._lock = asyncio.Lock()
+
+    async def call(self, func: Callable, *args, **kwargs) -> Any:
+        """Execute function through circuit breaker"""
+        async with self._lock:
+            if self.state == CircuitState.OPEN:
+                if self._should_attempt_reset():
+                    self.state = CircuitState.HALF_OPEN
+                    logger.info(f"[RELOAD] Circuit {self.name}: HALF-OPEN - Testing recovery")
+                else:
+                    msg = f"Circuit {self.name} is OPEN. Next retry in {self._time_until_retry():.1f}s"
+                    raise CircuitBreakerOpenError(msg)
+
+            try:
+                self.stats.total_calls += 1
+                result = await func(*args, **kwargs)
+
+                await self._record_success()
+            except self.config.expected_exception:
+                await self._record_failure()
+                raise
+            else:
+                return result
+
+    def _should_attempt_reset(self) -> bool:
+        """Check if enough time has passed to attempt recovery"""
+        if self.stats.last_failure_time is None:
+            return True
+        return (time.time() - self.stats.last_failure_time) >= self.config.recovery_timeout
+
+    def _time_until_retry(self) -> float:
+        """Calculate time until next retry attempt"""
+        if self.stats.last_failure_time is None:
+            return 0.0
+        elapsed = time.time() - self.stats.last_failure_time
+        return max(0.0, self.config.recovery_timeout - elapsed)
+
+    async def _record_success(self):
+        """Record successful call"""
+        self.stats.consecutive_successes += 1
+        self.stats.consecutive_failures = 0
+        self.stats.last_success_time = time.time()
+
+        if self.state == CircuitState.HALF_OPEN and self.stats.consecutive_successes >= self.config.success_threshold:
+            self.state = CircuitState.CLOSED
+            self.stats.consecutive_successes = 0
+            logger.info(f"[OK] Circuit {self.name}: CLOSED - Service recovered")
+
+    async def _record_failure(self):
+        """Record failed call"""
+        self.stats.total_failures += 1
+        self.stats.consecutive_failures += 1
+        self.stats.consecutive_successes = 0
+        self.stats.last_failure_time = time.time()
+
+        if self.state == CircuitState.HALF_OPEN:
+            self.state = CircuitState.OPEN
+            logger.warning(f"[ERROR] Circuit {self.name}: OPEN - Recovery failed")
+        elif self.state == CircuitState.CLOSED and self.stats.consecutive_failures >= self.config.failure_threshold:
+            self.state = CircuitState.OPEN
+            logger.warning(f"[ERROR] Circuit {self.name}: OPEN - Too many failures ({self.stats.consecutive_failures})")
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get circuit breaker statistics"""
+        return {
+            "name": self.name,
+            "state": self.state.value,
+            "total_calls": self.stats.total_calls,
+            "total_failures": self.stats.total_failures,
+            "consecutive_failures": self.stats.consecutive_failures,
+            "consecutive_successes": self.stats.consecutive_successes,
+            "failure_rate": (self.stats.total_failures / self.stats.total_calls) if self.stats.total_calls > 0 else 0,
+            "last_failure_time": self.stats.last_failure_time,
+            "last_success_time": self.stats.last_success_time,
+            "time_until_retry": self._time_until_retry(),
+        }
+
+
+class CircuitBreakerOpenError(Exception):
+    """Exception raised when circuit breaker is open"""
+
+
+class CircuitBreakerService:
+    """Service managing multiple circuit breakers"""
+
+    def __init__(self):
+        self.breakers: dict[str, CircuitBreaker] = {}
+        self._monitoring_task: asyncio.Task | None = None
+
+    def get_or_create_breaker(self, name: str, config: CircuitBreakerConfig = None) -> CircuitBreaker:
+        """Get existing breaker or create new one"""
+        if name not in self.breakers:
+            self.breakers[name] = CircuitBreaker(name, config)
+        return self.breakers[name]
+
+    async def start_monitoring(self):
+        """Start background monitoring task"""
+        if self._monitoring_task is None:
+            if task_manager is not None:
+                self._monitoring_task = await task_manager.create_task(self._monitor_breakers(), name="circuit_breaker_service:monitor_breakers")
+            else:
+                self._monitoring_task = asyncio.create_task(self._monitor_breakers())
+            logger.info("Circuit breaker monitoring started")
+
+    async def stop_monitoring(self):
+        """Stop background monitoring"""
+        if self._monitoring_task:
+            self._monitoring_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._monitoring_task
+            self._monitoring_task = None
+            logger.info("Circuit breaker monitoring stopped")
+
+    async def _monitor_breakers(self):
+        """Monitor circuit breaker health"""
+        while True:
+            try:
+                # Log stats for unhealthy breakers every 30 seconds
+                unhealthy_breakers = [name for name, breaker in self.breakers.items() if breaker.state != CircuitState.CLOSED]
+
+                if unhealthy_breakers:
+                    stats = {name: self.breakers[name].get_stats() for name in unhealthy_breakers}
+                    logger.warning(f"[WARN] Unhealthy circuit breakers: {stats}")
+
+                await asyncio.sleep(30)
+
+            except asyncio.CancelledError:
+                # BUG #45 FIX: Clean exit on cancellation
+                break
+            except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError) as e:
+                logger.exception(f"Circuit breaker monitoring error: {e}")
+                await asyncio.sleep(10)
+
+    def get_all_stats(self) -> dict[str, dict[str, Any]]:
+        """Get stats for all circuit breakers"""
+        return {name: breaker.get_stats() for name, breaker in self.breakers.items()}
+
+
+class TradingCircuitBreaker:
+    """
+    Hard kill protection for trading system - overrides all other logic
+    """
+
+    def __init__(self):
+        self.daily_loss_freeze_active = False
+        self.equity_circuit_breaker_active = False
+        self.account_failsafe_active = False
+        self.session_high_equity = 0.0
+        self.last_daily_reset = None
+
+        # Load state from SQLite on initialization
+        self._load_circuit_state()
+
+    def update_session_high(self, current_equity: float) -> None:
+        """Update session high equity for circuit breaker calculations"""
+        self.session_high_equity = max(self.session_high_equity, current_equity)
+
+    def check_daily_loss_freeze(self, realized_pnl_today: float, equity: float) -> bool:
+        """
+        DAILY LOSS FREEZE: Block new entries if daily loss exceeds threshold
+        if realized_pnl_today <= -2.5% of equity: block_new_entries = True, mode = SAFE
+        """
+        threshold = equity * -0.025  # -2.5%
+        if realized_pnl_today <= threshold:
+            if not self.daily_loss_freeze_active:
+                self.daily_loss_freeze_active = True
+                logger.critical(f"[HARD KILL] DAILY LOSS FREEZE ACTIVATED | PnL: ${realized_pnl_today:.2f} <= ${threshold:.2f} (-2.5%)")
+                return True
+        elif self.daily_loss_freeze_active:
+            self.daily_loss_freeze_active = False
+            logger.info("[HARD KILL] DAILY LOSS FREEZE DEACTIVATED | PnL recovered")
+        return self.daily_loss_freeze_active
+
+    def check_equity_circuit_breaker(self, current_equity: float) -> bool:
+        """
+        EQUITY CIRCUIT BREAKER: Force safe mode and reduce exposure
+        if equity <= session_high * 0.93: force_safe_mode(), reduce_exposure_to_30_percent()
+        """
+        if self.session_high_equity == 0:
+            return False
+
+        threshold = self.session_high_equity * 0.93  # 7% drawdown from session high
+        if current_equity <= threshold:
+            if not self.equity_circuit_breaker_active:
+                self.equity_circuit_breaker_active = True
+                logger.critical(f"[HARD KILL] EQUITY CIRCUIT BREAKER ACTIVATED | Equity: ${current_equity:.2f} <= ${threshold:.2f} (7% from session high ${self.session_high_equity:.2f})")
+                return True
+        elif self.equity_circuit_breaker_active:
+            self.equity_circuit_breaker_active = False
+            logger.info("[HARD KILL] EQUITY CIRCUIT BREAKER DEACTIVATED | Equity recovered")
+        return self.equity_circuit_breaker_active
+
+    def check_account_failsafe(self, current_equity: float, principal: float) -> bool:
+        """
+        ACCOUNT FAILSAFE: Close all positions and pause trading
+        if equity <= principal * 0.90: close_all_positions(), pause_trading = True
+        """
+        threshold = principal * 0.90  # 10% loss from starting capital
+        if current_equity <= threshold and not self.account_failsafe_active:
+            self.account_failsafe_active = True
+            logger.critical(f"[HARD KILL] ACCOUNT FAILSAFE ACTIVATED | Equity: ${current_equity:.2f} <= ${threshold:.2f} (10% from principal ${principal:.2f})")
+            return True
+        return self.account_failsafe_active
+
+    def check_all_hard_kills(self, portfolio_data: dict, market_data: dict | None = None) -> dict:
+        """
+        Check all hard kill conditions - returns actions to take
+        Note: market_data parameter reserved for future use
+        """
+        # Prevent unused parameter warning - parameter kept for future API compatibility
+        _ = market_data
+        current_equity = portfolio_data.get("total_equity", 0)
+        principal = portfolio_data.get("principal", 0.0)
+        realized_pnl_today = portfolio_data.get("realized_pnl_today", 0)
+
+        # Update session high
+        self.update_session_high(current_equity)
+
+        results = {
+            "daily_loss_freeze": self.check_daily_loss_freeze(realized_pnl_today, current_equity),
+            "equity_circuit_breaker": self.check_equity_circuit_breaker(current_equity),
+            "account_failsafe": self.check_account_failsafe(current_equity, principal),
+        }
+
+        # Determine actions
+        actions = {
+            "force_safe_mode": any(results.values()),
+            "block_new_entries": results["daily_loss_freeze"] or results["equity_circuit_breaker"],
+            "reduce_exposure_30pct": results["equity_circuit_breaker"],
+            "close_all_positions": results["account_failsafe"],
+            "pause_trading": results["account_failsafe"],
+        }
+
+        # Persist state changes to SQLite (sync path - bails if in async context)
+        self._persist_circuit_state()
+
+        return {"conditions": results, "actions": actions, "any_active": any(results.values())}
+
+    async def check_all_hard_kills_async(self, portfolio_data: dict, market_data: dict | None = None) -> dict:
+        """Async variant: check conditions and persist via async (use from async context)."""
+        result = self.check_all_hard_kills(portfolio_data, market_data)
+        # Re-persist via async path since sync _persist may have bailed in async context
+        await self.persist_circuit_state_async()
+        return result
+
+    def _load_circuit_state(self) -> None:
+        """Load circuit breaker state from SQLite (authoritative source)"""
+        try:
+            import asyncio
+
+            # Handle case where we're already in an async context (e.g., FastAPI startup)
+            try:
+                loop = asyncio.get_running_loop()
+                # If we're in an async context, defer the loading for later
+                logger.info("[CIRCUIT BREAKER] Async context detected, state loading deferred to first use")
+                return
+            except RuntimeError:
+                # No running loop, safe to create one
+                pass
+
+            loop = None
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            # Load circuit breaker states
+            circuit_data = loop.run_until_complete(get_state("risk:circuit_breakers"))
+            if circuit_data:
+                self.daily_loss_freeze_active = circuit_data.get("daily_loss_freeze_active", False)
+                self.equity_circuit_breaker_active = circuit_data.get("equity_circuit_breaker_active", False)
+                self.account_failsafe_active = circuit_data.get("account_failsafe_active", False)
+                self.session_high_equity = circuit_data.get("session_high_equity", 0.0)
+                logger.info(
+                    f"[CIRCUIT BREAKER] Loaded state from SQLite: freeze={self.daily_loss_freeze_active}, equity_cb={self.equity_circuit_breaker_active}, failsafe={self.account_failsafe_active}"
+                )
+
+            # Load trading paused state
+            paused_data = loop.run_until_complete(get_state("risk:trading_paused"))
+            if paused_data:
+                logger.info(f"[CIRCUIT BREAKER] Trading paused state: {paused_data}")
+
+        except Exception as e:
+            logger.warning(f"[CIRCUIT BREAKER] Failed to load state from SQLite: {e}")
+
+    def _persist_circuit_state(self) -> None:
+        """Persist circuit breaker state to SQLite (authoritative source)"""
+        try:
+            import asyncio
+            from datetime import datetime, timezone
+
+            # Handle case where we're already in an async context
+            try:
+                loop = asyncio.get_running_loop()
+                logger.warning("[CIRCUIT BREAKER] Cannot persist state synchronously in async context")
+                return
+            except RuntimeError:
+                # No running loop, safe to create one
+                pass
+
+            loop = asyncio.get_event_loop()
+
+            # Persist circuit breaker states
+            circuit_data = {
+                "daily_loss_freeze_active": self.daily_loss_freeze_active,
+                "equity_circuit_breaker_active": self.equity_circuit_breaker_active,
+                "account_failsafe_active": self.account_failsafe_active,
+                "session_high_equity": self.session_high_equity,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            loop.run_until_complete(set_state("risk:circuit_breakers", circuit_data))
+
+            # Persist trading paused state if any circuit is active
+            any_active = any([self.daily_loss_freeze_active, self.equity_circuit_breaker_active, self.account_failsafe_active])
+            if any_active:
+                paused_data = {"trading_paused": True, "pause_reason": "circuit_breaker_active", "updated_at": datetime.now(timezone.utc).isoformat()}
+                loop.run_until_complete(set_state("risk:trading_paused", paused_data))
+
+        except Exception as e:
+            logger.warning(f"[CIRCUIT BREAKER] Failed to persist state to SQLite: {e}")
+
+    # BUG #M3 FIX: Add async variants for use from async context
+    async def load_circuit_state_async(self) -> None:
+        """Async version of _load_circuit_state - use from async context."""
+        try:
+            circuit_data = await get_state("risk:circuit_breakers")
+            if circuit_data:
+                self.daily_loss_freeze_active = circuit_data.get("daily_loss_freeze_active", False)
+                self.equity_circuit_breaker_active = circuit_data.get("equity_circuit_breaker_active", False)
+                self.account_failsafe_active = circuit_data.get("account_failsafe_active", False)
+                self.session_high_equity = circuit_data.get("session_high_equity", 0.0)
+                logger.info(f"[CIRCUIT BREAKER] Loaded state (async): freeze={self.daily_loss_freeze_active}, equity_cb={self.equity_circuit_breaker_active}, failsafe={self.account_failsafe_active}")
+            paused_data = await get_state("risk:trading_paused")
+            if paused_data:
+                logger.info(f"[CIRCUIT BREAKER] Trading paused state (async): {paused_data}")
+        except Exception as e:
+            logger.warning(f"[CIRCUIT BREAKER] Failed to load state (async): {e}")
+
+    async def persist_circuit_state_async(self) -> None:
+        """Async version of _persist_circuit_state - use from async context."""
+        try:
+            from datetime import datetime, timezone
+
+            circuit_data = {
+                "daily_loss_freeze_active": self.daily_loss_freeze_active,
+                "equity_circuit_breaker_active": self.equity_circuit_breaker_active,
+                "account_failsafe_active": self.account_failsafe_active,
+                "session_high_equity": self.session_high_equity,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            await set_state("risk:circuit_breakers", circuit_data)
+            any_active = any([self.daily_loss_freeze_active, self.equity_circuit_breaker_active, self.account_failsafe_active])
+            if any_active:
+                paused_data = {"trading_paused": True, "pause_reason": "circuit_breaker_active", "updated_at": datetime.now(timezone.utc).isoformat()}
+                await set_state("risk:trading_paused", paused_data)
+            logger.debug("[CIRCUIT BREAKER] State persisted (async)")
+        except Exception as e:
+            logger.warning(f"[CIRCUIT BREAKER] Failed to persist state (async): {e}")
+
+
+# Global circuit breaker service instance
+circuit_breaker_service = CircuitBreakerService()
+
+# Global trading circuit breaker instance
+trading_circuit_breaker = TradingCircuitBreaker()
+
+
+# Convenience functions for common use cases
+def get_api_breaker(name: str) -> CircuitBreaker:
+    """Get circuit breaker configured for personal use"""
+    config = CircuitBreakerConfig(
+        failure_threshold=10,  # Much higher threshold for personal use
+        recovery_timeout=5.0,  # Quick recovery for personal system
+        success_threshold=1,  # Single success resets circuit
+    )
+    return circuit_breaker_service.get_or_create_breaker(f"api_{name}", config)
+
+
+def get_database_breaker(name: str) -> CircuitBreaker:
+    """Get circuit breaker configured for database operations"""
+    config = CircuitBreakerConfig(
+        failure_threshold=5,  # More tolerant for DB issues
+        recovery_timeout=60.0,  # Longer recovery time for DB
+        success_threshold=3,
+    )
+    return circuit_breaker_service.get_or_create_breaker(f"db_{name}", config)
+
+
+def get_external_service_breaker(name: str) -> CircuitBreaker:
+    """Get circuit breaker configured for external services"""
+    config = CircuitBreakerConfig(
+        failure_threshold=5,
+        recovery_timeout=120.0,  # Longer timeout for external services
+        success_threshold=3,
+    )
+    return circuit_breaker_service.get_or_create_breaker(f"external_{name}", config)

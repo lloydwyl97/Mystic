@@ -1,0 +1,28 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 200
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ruff.lint]
+select = ["F","E","W","B","I","UP","A","C4","DTZ","TRY","RUF","SIM","NPY","PD","PGH","PLC","PLR","PTH","N","ARG","ERA","PLW"]
+ignore = [
+    "TRY401","N803","N806","ERA001","PLR0911","PLR0912","PLR0913","PLR0915","PLR2004","PLC0415","E402",
+    "TRY300","TRY003","TRY301","TRY400","PLW0603","SIM105","N999","PTH120","PTH100","PTH118","PTH110","PTH117","PTH123",
+    "ARG001","ARG002","ARG003","SIM102","RUF006","SIM115","A002","DTZ005","F401","PLW0602","PLW1510","RUF012","SIM108","SIM113",
+]
+extend-select = ["F821","DTZ005","RUF006","B904","PGH003","TRY301","B008","B025","RUF001","PLE0604"]
+
+[tool.ruff.lint.per-file-ignores]
+"backend/**/__init__.py" = ["PLC0415"]
+"backend/services/portfolio_engine.py" = ["PLC0415"]
+"**/*.py" = ["PLR2004"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["backend"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["backend"]
+asyncio_mode = "auto"

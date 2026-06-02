@@ -1,0 +1,20 @@
+[Unit]
+Description=Mystic Agent Orchestrator
+After=network.target mystic-backend.service
+Wants=mystic-backend.service
+
+[Service]
+Type=simple
+User=mystic
+Group=mystic
+WorkingDirectory=/home/mystic/mystic
+Environment=PATH=/home/mystic/mystic/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/home/mystic/mystic
+EnvironmentFile=/home/mystic/mystic/.env
+EnvironmentFile=-/home/mystic/mystic/deploy/core_only_local.env
+ExecStart=/home/mystic/mystic/venv/bin/python start_agent_orchestrator.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

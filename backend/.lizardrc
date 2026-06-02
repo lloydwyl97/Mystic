@@ -1,0 +1,4 @@
+--exclude venv,venv311,venv312,__pycache__,build,dist,migrations,node_modules,.tox,.mypy_cache,.ruff_cache,.pytest_cache,htmlcov,.git,.eggs,.egg-info,tests
+--languages python
+--CCN 10
+--length 100

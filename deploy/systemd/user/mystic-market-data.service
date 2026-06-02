@@ -1,0 +1,16 @@
+[Unit]
+Description=Mystic live market data writer
+After=network-online.target
+PartOf=mystic.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mystic/mystic
+EnvironmentFile=-/home/mystic/mystic/.env
+ExecStart=/home/mystic/mystic/venv/bin/python /home/mystic/mystic/start_live_market_data.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=mystic.target

@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mystic Trading Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css?v=31">
+</head>
+<body>
+    <header class="header">
+        <img class="header__logo" src="assets/mystic-logo.png" alt="Mystic" loading="eager" />
+        <button type="button" class="header__mode header__mode--clickable header__tooltip" id="mode-badge" data-tooltip="Click to switch PAPER/LIVE" title="Click to switch PAPER/LIVE">--</button>
+        <span class="header__regime header__regime--neutral header__tooltip" id="regime-badge" role="status" aria-live="polite" aria-atomic="true" data-tooltip="Crypto Fear &amp; Greed index (alternative.me), not price-trend ML" title="Fear &amp; Greed label (see hover)">Fear &amp; Greed: --</span>
+        <span class="header__system header__system--unknown header__tooltip" id="system-badge" data-tooltip="OK / Warning / Critical from memory thresholds" title="System health">--</span>
+        <span class="header__meta" id="header-meta">Last update: --</span>
+        <button type="button" class="header__refresh" id="refresh-btn" title="Refresh now" aria-label="Refresh data">↻</button>
+    </header>
+
+    <section class="hero">
+        <img class="hero__img" src="assets/hero-banner.png" alt="" loading="eager" aria-hidden="true" />
+        <div class="hero__overlay"></div>
+        <div class="hero__content">
+            <h1 class="hero__title">Mystic Trading Dashboard</h1>
+        </div>
+    </section>
+
+    <section class="status-bar" aria-label="Account metrics from canonical snapshot" title="Cash, equity, positions, and health from the same portfolio snapshot as Open Positions">
+        <div class="status-item" title="Available cash balance"><span class="status-label">Cash</span><span class="status-value" id="status-cash">--</span></div>
+        <div class="status-item" title="Total equity (cash + positions)"><span class="status-label">Equity</span><span class="status-value" id="status-equity">--</span></div>
+        <div class="status-item" title="Open position count"><span class="status-label">Positions</span><span class="status-value" id="status-positions">--</span></div>
+        <div class="status-item" title="Account status (HEALTHY / OVERALLOCATED)"><span class="status-label">Health</span><span class="status-value" id="status-health">--</span></div>
+    </section>
+    <section class="status-bar status-bar--secondary" title="Risk % from canonical snapshot; Memory and Latency from separate system endpoints">
+        <div class="status-item" title="Total open risk % (canonical snapshot)"><span class="status-label">Risk</span><span class="status-value" id="status-risk">--</span></div>
+        <div class="status-item" title="Backend process memory"><span class="status-label">Memory</span><span class="status-value" id="status-memory">--</span></div>
+        <div class="status-item" title="Data freshness (OK / STALE_DATA)"><span class="status-label">Latency</span><span class="status-value" id="status-latency">--</span></div>
+        <div class="status-item" title="Redis market_data:last_update heartbeat (canonical lite)"><span class="status-label">Market heartbeat</span><span class="status-value" id="status-market-heartbeat">--</span></div>
+    </section>
+
+    <section class="widget widget--full" aria-label="Live market readiness">
+            <h2 class="widget__title">Market data readiness</h2>
+            <p class="widget__subtitle">
+                Symbols: BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT — live probes from Binance.US (heavy; refreshes ~90s).
+                Full row uses <code>/api/portfolio-engine/market-data-readiness</code>. Lite Redis heartbeat ships in canonical snapshot.
+            </p>
+            <div id="market-readiness-lite" class="market-readiness-lite" aria-live="polite"></div>
+            <div class="widget__table-wrap widget__table-wrap--scroll">
+                <table class="positions-table" id="market-readiness-table">
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>price</th>
+                            <th>vol</th>
+                            <th>spread</th>
+                            <th>DAY gate</th>
+                            <th>bundle</th>
+                            <th>month</th>
+                            <th>145 vec</th>
+                            <th>buy ctx</th>
+                            <th>hold ctx</th>
+                            <th>sell ctx</th>
+                            <th>missing</th>
+                        </tr>
+                    </thead>
+                    <tbody id="market-readiness-tbody"></tbody>
+                </table>
+                <p class="widget__no-data" id="market-readiness-loading">Loading readiness probe…</p>
+                <p class="widget__subtitle" id="market-readiness-summary"></p>
+            </div>
+        </section>
+
+    <main class="main">
+        <section class="widget widget--full">
+            <h2 class="widget__title">Portfolio Value</h2>
+            <p class="widget__subtitle">Historical time series (snapshots + ledger via /api/performance/portfolio-value). Last point tracks ledger total equity; poll timing can differ slightly from the status bar.</p>
+            <div class="widget__chart-wrap">
+                <canvas id="chart-portfolio-value"></canvas>
+                <p class="widget__no-data" id="portfolio-no-data">No data</p>
+            </div>
+        </section>
+
+        <section class="widget-row">
+            <div class="widget widget--half">
+                <h2 class="widget__title">Open Positions</h2>
+                <p class="widget__subtitle">Live book from canonical snapshot (/api/portfolio-engine/dashboard-canonical).</p>
+                <div class="widget__table-wrap">
+                    <table class="positions-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Sleeve</th>
+                                <th>Size</th>
+                                <th>Entry</th>
+                                <th>Current</th>
+                                <th>Unrealized PnL</th>
+                            </tr>
+                        </thead>
+                        <tbody id="positions-tbody"></tbody>
+                    </table>
+                    <p class="widget__no-data" id="positions-no-data">No open positions</p>
+                </div>
+            </div>
+            <div class="widget widget--half">
+                <h2 class="widget__title">Daily Returns</h2>
+                <p class="widget__subtitle">Historical: day-to-day % moves between portfolio-value points (/api/performance/daily-returns). Not intraday snapshot PnL.</p>
+                <div class="widget__chart-wrap">
+                    <canvas id="chart-daily-returns"></canvas>
+                    <p class="widget__no-data" id="daily-returns-no-data">No data</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="widget widget--full">
+            <h2 class="widget__title">Cumulative Returns (%)</h2>
+            <p class="widget__subtitle">Historical: cumulative % vs first point in the performance series (/api/performance/cumulative-returns). Different metric from the Total PnL tile.</p>
+            <div class="widget__chart-wrap">
+                <canvas id="chart-cumulative-returns"></canvas>
+                <p class="widget__no-data" id="cumulative-no-data">No data</p>
+            </div>
+        </section>
+
+        <section class="widget-row">
+            <div class="widget widget--half">
+                <h2 class="widget__title">Trade PnL Histogram (USD)</h2>
+                <p class="widget__subtitle">Historical: distribution of closed-trade PnL (/api/performance/trade-pnl).</p>
+                <div class="widget__chart-wrap">
+                    <canvas id="chart-pnl-histogram"></canvas>
+                    <p class="widget__no-data" id="pnl-histogram-no-data">No data</p>
+                </div>
+            </div>
+            <div class="widget widget--half">
+                <h2 class="widget__title">Trade Duration Histogram</h2>
+                <p class="widget__subtitle">Historical: closed-trade hold durations (/api/performance/trade-duration).</p>
+                <div class="widget__chart-wrap">
+                    <canvas id="chart-trade-duration"></canvas>
+                    <p class="widget__no-data" id="trade-duration-no-data">No data</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="widget widget--full">
+            <h2 class="widget__title">Strategy Performance (PnL $)</h2>
+            <p class="widget__subtitle">Analytics rollup by strategy (/api/performance/strategy-performance), not live ledger totals.</p>
+            <div class="widget__chart-wrap">
+                <canvas id="chart-strategy-performance"></canvas>
+                <p class="widget__no-data" id="strategy-performance-no-data">No data</p>
+            </div>
+        </section>
+
+        <section class="analytics-row" aria-label="Canonical snapshot metrics">
+            <p class="widget__subtitle">Same API tick as Open Positions. Mini-cards: Total Trades / Win Rate = closed SELL stats. Realized / Unrealized = ledger components (may be negative). Total PnL = account return vs principal (equity − principal). Scoreboard = today&rsquo;s closed sells only.</p>
+            <div class="mini-card">
+                <span class="mini-card__label">Total Trades</span>
+                <span class="mini-card__value" id="analytics-trades">--</span>
+            </div>
+            <div class="mini-card">
+                <span class="mini-card__label">Win Rate</span>
+                <span class="mini-card__value" id="analytics-winrate">--</span>
+            </div>
+            <div class="mini-card">
+                <span class="mini-card__label">Realized PnL</span>
+                <span class="mini-card__value" id="analytics-realized">--</span>
+            </div>
+            <div class="mini-card">
+                <span class="mini-card__label">Unrealized PnL</span>
+                <span class="mini-card__value" id="analytics-unrealized">--</span>
+            </div>
+            <div class="mini-card">
+                <span class="mini-card__label">Total PnL (vs principal)</span>
+                <span class="mini-card__value" id="analytics-pnl">--</span>
+            </div>
+            <div class="mini-card">
+                <span class="mini-card__label">Scoreboard</span>
+                <span class="mini-card__value" id="analytics-scoreboard">--</span>
+            </div>
+            <div class="mini-card">
+                <span class="mini-card__label">Risk Status</span>
+                <span class="mini-card__value" id="analytics-risk-status">--</span>
+            </div>
+            <div class="mini-card">
+                <span class="mini-card__label">Invariants</span>
+                <span class="mini-card__value" id="analytics-invariants">--</span>
+            </div>
+        </section>
+
+        <section class="sleeve-summary-section" id="sleeve-summary-wrap">
+            <h2 class="widget__title">Sleeve Allocation</h2>
+            <p class="widget__subtitle">Live sleeve budgets and utilization from canonical snapshot.</p>
+            <div class="sleeve-summary" id="sleeve-summary">
+                <span class="sleeve-disabled">Loading...</span>
+            </div>
+        </section>
+
+        <section class="widget widget--full">
+            <h2 class="widget__title">Recent Trades</h2>
+            <p class="widget__subtitle">Latest fills from canonical snapshot (same tick as snapshot row and open positions).</p>
+            <div class="widget__table-wrap">
+                <table class="positions-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Symbol</th>
+                            <th>Sleeve</th>
+                            <th>Side</th>
+                            <th>Size</th>
+                            <th>Price</th>
+                            <th>PnL</th>
+                        </tr>
+                    </thead>
+                    <tbody id="trades-tbody"></tbody>
+                </table>
+                <p class="widget__no-data" id="trades-no-data">No trades yet</p>
+            </div>
+        </section>
+
+        <section class="widget widget--full">
+            <h2 class="widget__title">Daily Performance Snapshot</h2>
+            <p class="widget__subtitle">SQLite daily rollup included in canonical snapshot (today’s trade stats, not the historical return charts).</p>
+            <div class="snapshot-grid" id="snapshot-container">
+                <div class="snapshot-section">
+                    <h3 class="snapshot-subtitle">Trade counts</h3>
+                    <pre id="snapshot-counts" class="snapshot-pre">--</pre>
+                </div>
+                <div class="snapshot-section">
+                    <h3 class="snapshot-subtitle">SELL performance</h3>
+                    <pre id="snapshot-sell" class="snapshot-pre">--</pre>
+                </div>
+                <div class="snapshot-section">
+                    <h3 class="snapshot-subtitle">Exit types</h3>
+                    <pre id="snapshot-exit-types" class="snapshot-pre">--</pre>
+                </div>
+                <div class="snapshot-section">
+                    <h3 class="snapshot-subtitle">Churn &amp; mode gate</h3>
+                    <pre id="snapshot-churn" class="snapshot-pre">--</pre>
+                </div>
+                <div class="snapshot-section">
+                    <h3 class="snapshot-subtitle">Top symbols by SELL count</h3>
+                    <pre id="snapshot-top-symbols" class="snapshot-pre">--</pre>
+                </div>
+            </div>
+            <p class="widget__no-data" id="snapshot-no-data">No snapshot data</p>
+        </section>
+
+        <section class="widget widget--full">
+            <h2 class="widget__title">Observability</h2>
+            <p class="widget__subtitle">Diagnostics from individual APIs (invariants detail, rejects, health, …) — timing may differ from the canonical snapshot.</p>
+            <div class="observability-panels">
+                <details class="observability-panel">
+                    <summary>Invariants Detail</summary>
+                    <pre id="panel-invariants-content" class="panel-pre">--</pre>
+                </details>
+                <details class="observability-panel">
+                    <summary>Risk Detail</summary>
+                    <pre id="panel-risk-content" class="panel-pre">--</pre>
+                </details>
+                <details class="observability-panel">
+                    <summary>Latency Detail</summary>
+                    <pre id="panel-latency-content" class="panel-pre">--</pre>
+                </details>
+                <details class="observability-panel">
+                    <summary>Recent Rejects</summary>
+                    <pre id="panel-rejects-content" class="panel-pre">--</pre>
+                </details>
+                <details class="observability-panel">
+                    <summary>Decisions</summary>
+                    <pre id="panel-decisions-content" class="panel-pre">--</pre>
+                </details>
+                <details class="observability-panel">
+                    <summary>System Health</summary>
+                    <pre id="panel-system-health-content" class="panel-pre">--</pre>
+                </details>
+                <details class="observability-panel">
+                    <summary>Scoreboard 7d</summary>
+                    <pre id="panel-scoreboard7d-content" class="panel-pre">--</pre>
+                </details>
+                <details class="observability-panel">
+                    <summary>AI Learning</summary>
+                    <pre id="panel-learning-status-content" class="panel-pre">--</pre>
+                </details>
+            </div>
+        </section>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="app.js?v=31"></script>
+</body>
+</html>

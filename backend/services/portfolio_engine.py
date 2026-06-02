@@ -1,0 +1,15187 @@
+"""
+Mystic Pro Portfolio Engine - Master Trading System
+
+Live, DAY-only, top-4 Binance.US USDT trading. Authoritative cash/position
+ledger. All buys/sells go through this engine and live_trading_service.
+
+NON-NEGOTIABLE OBJECTIVES:
+1. Truth: Portfolio engine maintains AUTHORITATIVE cash/positions ledger.
+2. Discipline: Max open positions (env), max 1 open position per symbol.
+3. Minimal live core (buy path): per-coin model score ranks candidates; skip symbols already open;
+   one spread sanity check at bar rank; execution-time context freshness + buy_margin in execute_buy_fifo;
+   hard capital/position limits in _can_open_position / execute_buy_fifo; first valid candidate executes.
+4. Risk-based sizing: Position size from calculate_position_size (risk-based); EV/expectancy multipliers removed.
+5. Exit reliability: Every open position monitored, always, without tracking-set skips.
+6. Observability: Logs + endpoints; former gate reasons logged as TELEMETRY_ONLY where applicable.
+
+CRITICAL INVARIANT:
+    positions_value + cash_balance + unrealized_pnl == total_equity (±$1)
+
+If violated: trading pauses, /risk reports ACCOUNT_OVERALLOCATED, auto-deleverage triggers.
+
+This module is the SOLE EXECUTOR for buys. Legacy buy paths are disabled.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import math
+import os
+import random
+import sqlite3
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from decimal import ROUND_FLOOR, Decimal
+from enum import Enum
+from typing import TYPE_CHECKING, Any
+
+from backend.config.buy_admission import (
+    buy_margin_threshold_active,
+    buy_margin_threshold_core,
+    resolve_buy_margin_from_payload,
+)
+from backend.config.core_test_flags import (
+    ENABLE_ATR_ENFORCEMENT,
+    ENABLE_COOLDOWN_ENFORCEMENT,
+    ENABLE_OVERFLOW_SIZING,
+    ENABLE_SLEEVE_BLOCKING,
+    log_effective_flags_once,
+)
+from backend.config.live_test_mode import assert_full_live_safety_at_startup as _assert_full_live_safety_at_startup
+from backend.config.live_test_mode import log_live_test_mode_at_startup as _log_live_test_mode_at_startup
+from backend.config.mystic_api_schedule import SELL_MARK_MAX_AGE_SECONDS as _SCHED_SELL_MARK_MAX_AGE_SEC
+from backend.config.protected_execution import MAKER_FEE, USE_PROTECTED_LIMIT_EXECUTION
+from backend.config.protected_execution import log_protected_execution_at_startup as _log_protected_execution_at_startup
+from backend.config.repair_add_economics import log_repair_add_economics_at_startup as _log_repair_add_economics_at_startup
+from backend.config.signal_thresholds import MIN_CONFIDENCE_BUY
+from backend.config.trading_economics import (
+    BINANCE_US_TAKER_FEE_PCT,
+    ESTIMATED_ROUNDTRIP_COST,
+    ESTIMATED_ROUNDTRIP_COST_PCT,
+    MIN_NET_PROFIT_TO_SELL,
+    TAKER_FEE,
+)
+from backend.config.trading_economics import (
+    SLIPPAGE_BUFFER as SLIPPAGE_PCT,
+)
+from backend.config.trading_economics import (
+    log_trading_economics_at_startup as _log_trading_economics_at_startup,
+)
+from backend.config.trading_mode import (
+    TradingMode,
+    TradingModeError,
+)
+from backend.config.trading_mode import (
+    log_trading_mode_at_startup as _log_trading_mode_at_startup,
+)
+from backend.config.trading_universe import DAY_TRADE_SYMBOLS, get_trading_symbols
+from backend.database_schema import DATABASE_PATH, create_paper_trades_table
+from backend.services.ai_artifact_contract_gate import evaluate_signal_hash_artifact_contract
+from backend.services.ai_decision_contract import REDIS_KEY_AI_CONTEXT
+from backend.services.ai_entry_context_gate import get_ctx_fresh_max_age_sec, needs_context_audit_emit_refresh
+from backend.services.decision_trace import log_decision_trace
+from backend.services.live_strategy_contracts import (
+    live_ai_fail_closed_without_context,
+    per_coin_artifact_file,
+    redis_ai_signal_key,
+)
+from backend.services.paper_trading_service import get_paper_trading_service
+from backend.services.risk_governor import (
+    LOSS_HOLD_COOLDOWN_MIN,
+    MAX_CONSEC_LOSSES,
+)
+from backend.utils.sqlite_runtime import connect_rw, run_locked_retry
+from backend.utils.symbols import normalize_symbol
+
+if TYPE_CHECKING:
+    from backend.services.live_trading_service import LiveTradingService
+    from backend.services.paper_trading_service import PaperTradingService
+
+logger = logging.getLogger(__name__)
+log_effective_flags_once()
+
+
+# =============================================================================
+# TRADING MODE (single source of truth: MYSTIC_TRADING_MODE = paper | live)
+# =============================================================================
+# Paper and live use the SAME trading brain, SAME symbols, SAME indicators,
+# SAME sell rules, SAME cooldown rules, SAME learning, SAME logs, and SAME
+# dust cleanup behavior. The only thing the mode controls is the execution
+# adapter (see backend.services.execution_adapter).
+#
+# We try to resolve the canonical mode here. If the operator forgot to set
+# MYSTIC_TRADING_MODE we DO NOT silently default to live; we treat the
+# legacy ``LIVE_EXECUTION`` flag as a soft hint only and refuse to log a
+# misleading "LIVE" banner unless the canonical mode resolves to ``live``.
+try:
+    _MYSTIC_TRADING_MODE: TradingMode | None = _log_trading_mode_at_startup()
+except TradingModeError as _mode_err:
+    # Surface the configuration error loudly; keep import-time safe so other
+    # subsystems can still import this module for read-only inspection.
+    _MYSTIC_TRADING_MODE = None
+    logger.warning(
+        "MYSTIC_TRADING_MODE_UNCONFIGURED %s — execution adapter will fail closed until the operator sets MYSTIC_TRADING_MODE=paper or MYSTIC_TRADING_MODE=live",
+        _mode_err,
+    )
+
+_log_trading_economics_at_startup()
+_log_repair_add_economics_at_startup()
+_log_protected_execution_at_startup(taker_fee=TAKER_FEE)
+_log_live_test_mode_at_startup()
+_assert_full_live_safety_at_startup()
+
+LIVE_EXECUTION = _MYSTIC_TRADING_MODE is TradingMode.LIVE if _MYSTIC_TRADING_MODE is not None else os.getenv("LIVE_EXECUTION", "false").lower() == "true"
+if LIVE_EXECUTION:
+    logger.warning("=" * 60)
+    logger.warning("LIVE EXECUTION ENABLED - REAL MONEY TRADES WILL EXECUTE")
+    logger.warning("=" * 60)
+
+# =============================================================================
+# CONFIGURATION CONSTANTS
+# =============================================================================
+
+# Portfolio Limits (Phase 2)
+# Resolve: .env MAX_OPEN_POSITIONS → .env MAX_POSITIONS → code default (single source of truth)
+_DEFAULT_MAX_OPEN_POSITIONS = 6
+_env_max = os.getenv("MAX_OPEN_POSITIONS") or os.getenv("MAX_POSITIONS")
+MAX_OPEN_POSITIONS = int(_env_max) if _env_max is not None else _DEFAULT_MAX_OPEN_POSITIONS
+_max_pos_source = "env" if _env_max is not None else "default"
+MAX_OPEN_PER_SYMBOL = 1  # Hard limit: never stack positions on same symbol
+
+# Risk Management (Phase 4)
+RISK_PER_TRADE_PCT = 0.04  # 4% of equity risked per trade (sized for profit on $10k account)
+MAX_TOTAL_OPEN_RISK_PCT = 0.03  # 3% max total open risk across portfolio
+MIN_STOP_PCT = 0.010  # Minimum 1.0% stop distance (0.5% was noise-level for crypto)
+ATR_MULTIPLIER = 1.5  # ATR multiplier for stop distance
+
+# =========================================================================
+# PHASE 1 FIX #4: LIVE TRADING SAFETY MULTIPLIER (EMERGENCY RISK REDUCTION)
+# =========================================================================
+# Reduce all position sizes by 50% as emergency measure for live trading safety
+# This prevents catastrophic losses from double-trading bugs
+LIVE_TRADING_SAFETY_MULTIPLIER = float(os.getenv("LIVE_TRADING_SAFETY_MULTIPLIER", "1.0"))
+logger_bootstrap = logging.getLogger("app_bootstrap")
+logger_bootstrap.info(
+    "MAX_OPEN_POSITIONS resolved to %s (source=%s, default=%s)",
+    MAX_OPEN_POSITIONS,
+    _max_pos_source,
+    _DEFAULT_MAX_OPEN_POSITIONS,
+)
+logger_bootstrap.warning(f"🚨 LIVE TRADING SAFETY MODE ENABLED: position_multiplier={LIVE_TRADING_SAFETY_MULTIPLIER}, max_positions={MAX_OPEN_POSITIONS}")
+# =========================================================================
+MIN_POSITION_NOTIONAL = float(os.getenv("MIN_POSITION_NOTIONAL", "11.0"))  # Binance US min=10, use 11 for safety
+# Entry/roundtrip cost buffers for effective min notional (buy-side only uses ENTRY_COST_PCT)
+ENTRY_COST_PCT = float(os.getenv("ENTRY_COST_PCT", "0.0018"))  # Buy-side buffer
+# Low-cash deploy-to-min mode (avoids dead-zone when cash ~ min notional)
+LOW_CASH_MIN_DEPLOY_ENABLED = os.getenv("LOW_CASH_MIN_DEPLOY_ENABLED", "true").lower() == "true"
+LOW_CASH_DEPLOY_BAND_USD = float(os.getenv("LOW_CASH_DEPLOY_BAND_USD", "3.00"))
+LOW_CASH_DEPLOY_PCT = float(os.getenv("LOW_CASH_DEPLOY_PCT", "0.95"))
+# Confidence-tiered position sizing (only buy-side)
+CONF_TIER_FULL = float(os.getenv("CONF_TIER_FULL", "0.75"))
+CONF_TIER_MED = float(os.getenv("CONF_TIER_MED", "0.62"))
+CONF_TIER_MIN = float(os.getenv("CONF_TIER_MIN", "0.55"))
+CONF_SIZE_FULL = float(os.getenv("CONF_SIZE_FULL", "1.00"))
+CONF_SIZE_MED = float(os.getenv("CONF_SIZE_MED", "0.65"))
+CONF_SIZE_LOW = float(os.getenv("CONF_SIZE_LOW", "0.25"))
+
+# Per-Coin Scoring (Phase 6)
+PAUSE_THRESHOLD_TRADES_24H = 8  # Pause if >= 8 trades in 24h
+PAUSE_THRESHOLD_WIN_RATE = 0.45  # Pause if win rate < 45%
+PAUSE_THRESHOLD_STOP_HITS = 3  # Pause if >= 3 stop hits in last 10
+PAUSE_DURATION_UNDERPERFORM = 6 * 3600  # 6 hours pause for underperformers
+PAUSE_DURATION_STOP_HEAVY = 3 * 3600  # 3 hours for stop-heavy
+PAUSE_DURATION_SEVERE_DD = 12 * 3600  # 12 hours for severe drawdown
+
+# =============================================================================
+# SELL GATE (DAY-only, real-net-profit gate)
+#
+# Mystic sells ONLY when real net profit after costs is confirmed:
+#   net_pnl_pct = (mark - entry) / entry  -  ESTIMATED_ROUNDTRIP_COST
+#   net_pnl_pct >= MIN_NET_PROFIT_TO_SELL  =>  fire profit-take sell
+# Anything that does not satisfy the net-profit gate is HOLD.
+# =============================================================================
+# Constants `ESTIMATED_ROUNDTRIP_COST` and `MIN_NET_PROFIT_TO_SELL` come from
+# `backend.config.trading_economics` (single source: .env).
+DAY_MODE_ENABLED = True
+DAY_HOLD_MAX_SEC = int(os.getenv("DAY_HOLD_MAX_MINUTES", "180")) * 60  # advisory metadata only
+ENABLE_POSITION_ROTATION_FOR_BUY = False
+POSITION_FIRST_ROUTING_ENABLED = True
+# Hold-time floor used by surrounding telemetry (advisory, not a sell trigger).
+POSITION_ADD_MIN_HOLD_SEC = int(os.getenv("POSITION_ADD_MIN_HOLD_SEC", "600"))
+
+# =============================================================================
+# ENTRY-TIME PROFILE METADATA (advisory only; never drives sells)
+#
+# These constants only feed the per-trade `paper_trades` insert and the
+# `OpenPosition` metadata so persisted schema columns (`stop_price`,
+# `take_profit_1_price`, `take_profit_2_price`) keep getting populated for
+# downstream readers. `_check_exit_conditions` honors only the
+# real-net-profit gate above.
+# =============================================================================
+TP1_R_MULTIPLE = 1.0
+TP2_R_MULTIPLE = 2.0
+MAJOR_COIN_ATR_SL_MULT = 1.8
+MAJOR_COIN_SL_BOUNDS: dict[str, tuple[float, float]] = {
+    "BTCUSDT": (0.010, 0.020),
+    "ETHUSDT": (0.012, 0.020),
+    "SOLUSDT": (0.012, 0.020),
+    "XRPUSDT": (0.012, 0.020),
+}
+
+# Phase 3: Exchange symbol constraints TTL (6-12h recommended; Binance filter drift)
+CONSTRAINTS_TTL_SECONDS = int(os.getenv("CONSTRAINTS_TTL_HOURS", "12")) * 3600
+
+# Soft per-symbol buy cooldown (anti-thrash when signals flicker)
+BUY_COOLDOWN_SEC = int(os.getenv("BUY_COOLDOWN_SEC", "90"))
+
+# =============================================================================
+# RECOVERY / CORRUPTION DETECTION FEATURE FLAGS
+# =============================================================================
+# Offload SQLite-heavy recovery/corruption detection work to background threads
+# to keep the event loop responsive. Default is OFF to preserve legacy behavior
+# until validated in production.
+RECOVERY_ASYNC_OFFLOAD = os.getenv("RECOVERY_ASYNC_OFFLOAD", "0") == "1"
+
+# =============================================================================
+# MAJOR COINS — wider stops, longer holds, volatility-based dynamic SL
+# =============================================================================
+MAJOR_COINS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}
+
+
+class _SymbolFormAgnosticSet(set):
+    """A frozen-like set that compares symbols in Binance.US API form.
+
+    Membership tests normalize the queried symbol (stripping ``/``, ``-``,
+    ``_`` and uppercasing) so legacy slash/dash/underscore separator forms
+    coming from upstream callers still hit the canonical API-form entry.
+    Kept for historical compatibility of legacy slash-form callers only.
+    """
+
+    def __contains__(self, item: object) -> bool:  # type: ignore[override]
+        if isinstance(item, str):
+            normalized = item.replace("/", "").replace("-", "").replace("_", "").upper()
+            return super().__contains__(normalized)
+        return super().__contains__(item)
+
+
+MAJOR_COINS = _SymbolFormAgnosticSet(MAJOR_COINS)
+ENTRY_GATES_ENFORCED = os.getenv("ENTRY_GATES_ENFORCED", "false").lower() in ("1", "true", "yes", "on")
+ENTRY_MAJOR_ONLY = ENTRY_GATES_ENFORCED and os.getenv("ENTRY_MAJOR_ONLY", "false").lower() in ("1", "true", "yes", "on")
+
+
+def _parse_entry_allowed_symbols(raw: str) -> set[str]:
+    out: set[str] = set()
+    for tok in str(raw or "").split(","):
+        sym = str(tok or "").strip().upper().replace("-", "/")
+        if not sym:
+            continue
+        if "/" not in sym and sym.endswith("USDT"):
+            sym = f"{sym[:-4]}/USDT"
+        out.add(normalize_symbol(sym))
+    return out
+
+
+ENTRY_ALLOWED_SYMBOLS = _parse_entry_allowed_symbols(os.getenv("ENTRY_ALLOWED_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"))
+if not ENTRY_ALLOWED_SYMBOLS:
+    ENTRY_ALLOWED_SYMBOLS = set(MAJOR_COINS)
+
+# Symbol-priority / trust groups (ranking+sizing only; never admission gates).
+CORE_SYMBOLS = _SymbolFormAgnosticSet({"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"})
+SECONDARY_SYMBOLS: set[str] = set()
+LOW_TRUST_SYMBOLS: set[str] = set()
+
+
+def _symbol_group(symbol: str) -> str:
+    sym = normalize_symbol(symbol)
+    if sym in CORE_SYMBOLS:
+        return "core"
+    if sym in SECONDARY_SYMBOLS:
+        return "secondary"
+    if sym in LOW_TRUST_SYMBOLS:
+        return "low_trust"
+    return "secondary"
+
+
+def _symbol_group_baseline(group: str) -> float:
+    # Bounded rank baseline tilt; low-trust symbols are demoted by default but
+    # can earn back rank via setup-strength / EV / expectancy.
+    g = str(group or "secondary").strip().lower()
+    if g == "core":
+        return 0.012
+    if g == "low_trust":
+        return -0.060
+    return -0.010
+
+
+# =============================================================================
+# PER-COIN PROFIT PROFILES (DAY-only top 4 Binance.US USDT markets)
+# Used solely by the profit-confirmation logic. Keys are Binance.US API symbols.
+# The legacy `sl`, `trail`, and `max_hold_min` fields are retained for back-
+# compat with downstream consumers that look them up by key, but the active
+# sell path only honors real-net-profit-after-costs (see _check_exit_conditions).
+# =============================================================================
+COIN_PROFILES = {
+    "BTCUSDT": {"tp": 0.012, "sl": 0.008, "trail": 0.0040, "max_hold_min": 90},
+    "ETHUSDT": {"tp": 0.013, "sl": 0.009, "trail": 0.0045, "max_hold_min": 90},
+    "SOLUSDT": {"tp": 0.015, "sl": 0.010, "trail": 0.0055, "max_hold_min": 75},
+    "XRPUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0050, "max_hold_min": 75},
+}
+
+DEFAULT_COIN_PROFILE = {
+    "tp": 0.014,
+    "sl": 0.010,
+    "trail": 0.005,
+    "max_hold_min": 75,
+}
+
+
+def _to_api_symbol(symbol: str) -> str:
+    """Normalize any internal symbol form to Binance.US API form (BTCUSDT)."""
+    if not symbol:
+        return symbol
+    s = symbol.replace("/", "").replace("-", "").replace("_", "").upper()
+    return s
+
+
+def get_coin_profile(symbol: str) -> dict:
+    """Get profile for a coin; lookup uses Binance.US API form."""
+    return COIN_PROFILES.get(_to_api_symbol(symbol), DEFAULT_COIN_PROFILE)
+
+
+def compute_entry_distance_pct(symbol: str, atr: float, price: float) -> float:
+    """
+    Entry-time ATR-derived distance fraction used ONLY to populate the
+    ``stop_price`` schema column on the ``paper_trades`` insert and the
+    OpenPosition metadata. The sell gate (`_check_exit_conditions`) ignores
+    this value and sells only on confirmed real net profit after costs.
+    """
+    if price <= 0:
+        return get_coin_profile(symbol)["sl"]
+    atr_pct = atr / price
+    if atr_pct <= 0:
+        return get_coin_profile(symbol)["sl"]
+    dynamic_sl = atr_pct * MAJOR_COIN_ATR_SL_MULT
+    floor, ceiling = MAJOR_COIN_SL_BOUNDS.get(_to_api_symbol(symbol), (0.007, 0.015))
+    return max(floor, min(dynamic_sl, ceiling))
+
+
+def compute_position_risk_usd(quantity: float, entry_price: float, stop_price: float) -> float:
+    """USD at risk to the advisory stop for a long position (dashboard/risk cap)."""
+    qty = float(quantity or 0)
+    if qty <= 0:
+        return 0.0
+    entry = float(entry_price or 0)
+    stop = float(stop_price or 0)
+    if entry <= 0 or stop <= 0:
+        return 0.0
+    return qty * max(0.0, entry - stop)
+
+
+# Fee/Slippage: `TAKER_FEE`, `SLIPPAGE_PCT`, `BINANCE_US_TAKER_FEE_PCT` imported from
+# `backend.config.trading_economics` (aligned with .env / Binance.US spot taker).
+# MAKER_FEE imported from backend.config.protected_execution (Binance.US maker = 0%)
+DEFAULT_MIN_EXIT_COST_PCT = float(os.getenv("DEFAULT_MIN_EXIT_COST_PCT", "0.0003"))
+DEFAULT_MIN_ROUNDTRIP_COST_PCT = float(os.getenv("DEFAULT_MIN_ROUNDTRIP_COST_PCT", "0.0010"))
+DEFAULT_REQUIRED_NET_PROFIT_BUFFER_PCT = float(os.getenv("DEFAULT_REQUIRED_NET_PROFIT_BUFFER_PCT", "0.0005"))
+SELL_MARK_MAX_AGE_SECONDS = float(os.getenv("SELL_MARK_MAX_AGE_SECONDS", str(_SCHED_SELL_MARK_MAX_AGE_SEC)))
+SELL_COST_SAMPLE_MIN = int(os.getenv("SELL_COST_SAMPLE_MIN", "8"))
+SELL_COST_SAMPLE_WINDOW = int(os.getenv("SELL_COST_SAMPLE_WINDOW", "20"))
+# Always-on operating rule: never execute a sell unless it is net-profitable after costs.
+# This applies to all symbols in the day path.
+STRICT_NO_NEGATIVE_SELLS = True
+
+# Per-symbol defaults (base symbol keys); falls back to DEFAULT_* for unknown symbols.
+# DAY_TRADE_SYMBOLS only: BTCUSDT / ETHUSDT / SOLUSDT / XRPUSDT.
+SYMBOL_MIN_ROUNDTRIP_DEFAULTS: dict[str, float] = {
+    "BTC": 0.0008,
+    "ETH": 0.0008,
+    "SOL": 0.0010,
+    "XRP": 0.0012,
+}
+SYMBOL_REQUIRED_NET_BUFFER_DEFAULTS: dict[str, float] = {}
+
+# Minimum confidence (winner-probability floor); env/override resolved in signal_thresholds
+MIN_CONFIDENCE = MIN_CONFIDENCE_BUY
+# Integration stamps buy_margin=1.0 for RULE (redis source=RULE); ML/HOT enqueue prob-derived margin in [~0,1).
+_BAR_PRE_RANK_RULE_BUY_MARGIN_SENTINEL = 1.0
+
+# Bar-close hard filters (in addition to signal-consumer gates).
+BAR_EXEC_ENFORCE_BUY_MARGIN = os.getenv("BAR_EXEC_ENFORCE_BUY_MARGIN", "true").lower() in ("1", "true", "yes", "on")
+MIN_BUY_MARGIN = 0.02
+BAR_EXEC_ABSOLUTE_MIN_BUY_MARGIN = max(MIN_BUY_MARGIN, float(os.getenv("BAR_EXEC_ABSOLUTE_MIN_BUY_MARGIN", "0.02")))
+
+
+def _full_universe_pair_key(symbol: str, strategy_id: str) -> tuple[str, str]:
+    return (normalize_symbol(symbol), str(strategy_id or "day").strip().lower())
+
+
+def _safe_float(raw: Any, default: float = 0.0) -> float:
+    try:
+        if raw is None or str(raw).strip() == "":
+            return default
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _pct(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    xs = sorted(values)
+    if len(xs) == 1:
+        return float(xs[0])
+    p = max(0.0, min(100.0, float(percentile)))
+    rank = (p / 100.0) * (len(xs) - 1)
+    lo = math.floor(rank)
+    hi = math.ceil(rank)
+    if lo == hi:
+        return float(xs[lo])
+    w = rank - lo
+    return float(xs[lo] * (1.0 - w) + xs[hi] * w)
+
+
+# STEP 2: Entry spread filter (soft guard)
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "1.0")) / 100
+# STEP 4: ATR/volatility minimum (avoid flat candles)
+MIN_ATR_RATIO = float(os.getenv("MIN_ATR_RATIO", "0.00002"))
+
+# =============================================================================
+# REGIME GUARDRAIL CONSTANTS (Item 4)
+# =============================================================================
+VOL_SPIKE_THRESHOLD = 0.50  # 50% increase in ATR vs baseline triggers reduction
+VOL_SPIKE_RISK_FACTOR = 0.5  # Reduce risk_per_trade_pct by this factor
+VOL_SPIKE_COOLDOWN_BARS = 30  # Duration of vol spike guard
+
+SPREAD_SPIKE_THRESHOLD = float(os.getenv("SPREAD_SPIKE_THRESHOLD") or os.getenv("MYSTIC_SPREAD_SPIKE_THRESHOLD", "0.003"))  # e.g. paper test MYSTIC_SPREAD_SPIKE_THRESHOLD=0.004
+SPREAD_BLOCK_BARS = int(os.getenv("SPREAD_BLOCK_BARS") or os.getenv("MYSTIC_SPREAD_BLOCK_BARS", "15"))
+
+# DRAWDOWN PROTECTION (from env - fallback to defaults)
+DRAWDOWN_LIMIT_PCT = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "10.0")) / 100  # 10% daily
+MAX_WEEKLY_DRAWDOWN_PCT = float(os.getenv("MAX_WEEKLY_DRAWDOWN_PCT", "15.0")) / 100  # 15% weekly
+MAX_DAILY_DRAWDOWN_USD = float(os.getenv("MAX_DAILY_DRAWDOWN_USD", "3.0"))  # $3 max daily loss
+PAUSE_ON_DRAWDOWN = os.getenv("PAUSE_ON_DRAWDOWN", "true").lower() == "true"
+DRAWDOWN_PEAK_WINDOW = 24 * 60 * 60  # 24h rolling window for peak
+
+# Paper harness uses MYSTIC_CHURN_RATIO_LIMIT (see deploy/paper_test_engine.env); CHURN_RATIO_LIMIT wins if set.
+CHURN_RATIO_LIMIT = float(os.getenv("CHURN_RATIO_LIMIT") or os.getenv("MYSTIC_CHURN_RATIO_LIMIT", "0.5"))
+CHURN_TRADE_WINDOW = 20  # Look at last 20 trades for churn
+# Require enough SELL rows before churn_guard can arm (avoids fee/profit blowups on 1-2 wins)
+CHURN_GUARD_MIN_SAMPLES = int(os.getenv("CHURN_GUARD_MIN_SAMPLES", "5"))
+# Sum of winning sell PnL (audit invariant_diff > 0) must exceed this before churn ratio can arm guard
+CHURN_GUARD_MIN_GROSS_WIN_SUM = float(os.getenv("CHURN_GUARD_MIN_GROSS_WIN_SUM", "15.0"))
+
+# =============================================================================
+# SIGNAL QUALITY GATE CONSTANTS (Item 5)
+# =============================================================================
+MULTI_BAR_CONFIRM_REQUIRED = 2  # Need 2/3 bars confirming
+MULTI_BAR_LOOKBACK = 3  # Look at last 3 bars
+MULTI_BAR_BYPASS_CONFIDENCE = 0.75  # High confidence can bypass
+
+CHOP_TREND_THRESHOLD = 0.4  # Below this = choppy
+CHOP_VOL_THRESHOLD = 0.02  # Below this = low vol
+CHOP_BYPASS_CONFIDENCE = 0.80  # Very high conf to bypass chop filter
+
+# -----------------------------------------------------------------------------
+# Price-structure regime (local opt-in): ADX vs threshold tilts bar rank only.
+# Default off everywhere — set ENABLE_PRICE_REGIME_BEHAVIOR_SPLIT=true locally.
+# No extra buy blockers; does not replace Fear&Greed regime on decision_data["regime"].
+# -----------------------------------------------------------------------------
+PRICE_REGIME_ADX_THRESHOLD = float(os.getenv("PRICE_REGIME_ADX_THRESHOLD", "25"))
+# Stronger default so rank moves when align != 0 (still override via env locally).
+PRICE_REGIME_RANK_TILT = float(os.getenv("PRICE_REGIME_RANK_TILT", "0.20"))
+
+
+def classify_price_structure_regime(decision_data: dict[str, Any]) -> str:
+    """
+    Per-symbol regime from existing signal ADX (already on ai_signal / decision_data).
+    ADX < threshold → range_bound (mean-reversion tilt).
+    ADX >= threshold → trending (trend-following tilt).
+    """
+    raw = decision_data.get("adx")
+    try:
+        if raw is None or str(raw).strip() == "":
+            return "unknown"
+        adx = float(raw)
+    except (TypeError, ValueError):
+        return "unknown"
+    if not math.isfinite(adx) or adx <= 0:
+        return "unknown"
+    return "range_bound" if adx < PRICE_REGIME_ADX_THRESHOLD else "trending"
+
+
+def _price_regime_behavior_split_enabled() -> bool:
+    return os.getenv("ENABLE_PRICE_REGIME_BEHAVIOR_SPLIT", "false").lower() == "true"
+
+
+POST_SELL_COOLDOWN_BARS = int(os.getenv("POST_SELL_COOLDOWN_BARS", "40"))  # Block same symbol for N bars after sell (reduce churn)
+GLOBAL_SELL_COOLDOWN_BARS = int(os.getenv("GLOBAL_SELL_COOLDOWN_BARS", "10"))  # Block ALL buys for N bars after any sell
+POST_SELL_COOLDOWN_WALL_SEC = int(os.getenv("POST_SELL_COOLDOWN_WALL_SEC", "2400"))  # 40 min wall-clock backup
+GLOBAL_SELL_COOLDOWN_WALL_SEC = int(os.getenv("GLOBAL_SELL_COOLDOWN_WALL_SEC", "600"))  # 10 min wall-clock backup
+# Local staged testing only (set in deploy/core_only_local.env). Production droplets omit that file — defaults false.
+PORTFOLIO_LOCAL_SKIP_GLOBAL_SELL_COOLDOWN = os.getenv("PORTFOLIO_LOCAL_SKIP_GLOBAL_SELL_COOLDOWN", "false").lower() == "true"
+# Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
+PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN = os.getenv("PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN", "false").lower() == "true"
+# Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
+PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK = os.getenv("PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK", "false").lower() == "true"
+# Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
+PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK = os.getenv("PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK", "false").lower() == "true"
+# Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
+PORTFOLIO_LOCAL_SKIP_ADD_TO_POSITION_BLOCK = os.getenv("PORTFOLIO_LOCAL_SKIP_ADD_TO_POSITION_BLOCK", "false").lower() == "true"
+# Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
+PORTFOLIO_LOCAL_SKIP_OVERALLOCATED_BLOCK = os.getenv("PORTFOLIO_LOCAL_SKIP_OVERALLOCATED_BLOCK", "false").lower() == "true"
+# Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
+PORTFOLIO_LOCAL_SKIP_MIN_HOLD_EXIT_BLOCK = os.getenv("PORTFOLIO_LOCAL_SKIP_MIN_HOLD_EXIT_BLOCK", "false").lower() == "true"
+# Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
+PORTFOLIO_LOCAL_SKIP_DECISION_MIN_NOTIONAL_BLOCK = os.getenv("PORTFOLIO_LOCAL_SKIP_DECISION_MIN_NOTIONAL_BLOCK", "false").lower() == "true"
+# Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
+PORTFOLIO_LOCAL_SKIP_EXCHANGE_MIN_NOTIONAL_BLOCK = os.getenv("PORTFOLIO_LOCAL_SKIP_EXCHANGE_MIN_NOTIONAL_BLOCK", "false").lower() == "true"
+# Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
+PORTFOLIO_LOCAL_SKIP_BAR_SPREAD_EXEC_SANITY = os.getenv("PORTFOLIO_LOCAL_SKIP_BAR_SPREAD_EXEC_SANITY", "false").lower() == "true"
+# Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
+PORTFOLIO_LOCAL_SKIP_BAR_ATR_EXEC_SANITY = os.getenv("PORTFOLIO_LOCAL_SKIP_BAR_ATR_EXEC_SANITY", "false").lower() == "true"
+LOSS_STREAK_LOOKBACK = int(os.getenv("LOSS_STREAK_LOOKBACK", "6"))  # Win-rate circuit breaker lookback
+LOSS_STREAK_MIN_WIN_RATE = float(os.getenv("LOSS_STREAK_MIN_WIN_RATE", "0.20"))  # Min 20% wins or pause
+LOSS_STREAK_PAUSE_SEC = int(os.getenv("LOSS_STREAK_PAUSE_SEC", "7200"))  # 2h pause when win rate too low
+CHURN_GUARD_MAX_SEC = int(os.getenv("CHURN_GUARD_MAX_SEC", "14400"))  # 4h max hard block, then auto-clear
+
+MAX_BUYS_PER_HOUR = int(os.getenv("MAX_BUYS_PER_HOUR", "3"))  # Portfolio pacing
+HOURLY_OVERFLOW_CONF_DELTA = float(os.getenv("HOURLY_OVERFLOW_CONF_DELTA", "0.03"))
+HOURLY_OVERFLOW_SIZE_MULT = float(os.getenv("HOURLY_OVERFLOW_SIZE_MULT", "0.50"))
+MAX_OVERFLOW_BUYS_PER_HOUR = int(os.getenv("MAX_OVERFLOW_BUYS_PER_HOUR", "1"))
+# Emergency anomaly fuse only; normal pacing via RiskGovernor (MAX_BUYS_PER_DAY=500 = never hit in normal ops)
+MAX_BUYS_PER_DAY = int(os.getenv("MAX_BUYS_PER_DAY", "500"))  # Safety fuse, not normal throttle
+
+# Phase 2: Quality/regime state persistence (Redis keys and TTL)
+QUALITY_STATE_KEY_PREFIX = "portfolio_engine:quality:"
+REGIME_STATE_KEY_PREFIX = "portfolio_engine:regime:"
+# Sole writer: engine. Governor only reads account.loss_hold_until / current_time_utc.
+GOVERNANCE_LOSS_HOLD_KEY = "portfolio_engine:governance:loss_hold_until"
+QUALITY_STATE_TTL_SECONDS = 86400 * 2  # 2 days max; prune on load
+
+# Memory caps (24/7 bots - prevent slow leaks)
+TRADE_EXPLANATIONS_MAX = 1000  # Ring-buffer; prune oldest
+COIN_PERFORMANCE_MAX_SYMBOLS = 300  # Prune when over; keep open_positions symbols
+
+# =============================================================================
+# EXCHANGE CONSTRAINTS (Item 6)
+# =============================================================================
+# Per-symbol quantity steps (will be loaded from config)
+DEFAULT_QTY_STEP = 0.00001  # Default step if not configured
+DEFAULT_PRICE_TICK = 0.01  # Default price tick
+PARTIAL_FILL_ENABLED = False  # Enable partial fill simulation
+PARTIAL_FILL_MIN_PCT = 0.6  # Minimum fill percentage
+PARTIAL_FILL_MAX_PCT = 1.0  # Maximum fill percentage
+
+# =============================================================================
+# SLEEVE ARCHITECTURE (Phase-1 Multi-Sleeve)
+# =============================================================================
+# Two capital sleeves under one shared system:
+#   CORE   — higher-conviction, slower, larger-cap compounding
+#   ACTIVE — shorter-duration swing, higher turnover
+#
+# Phase-1 constraint: one open position per symbol across ALL sleeves
+# (current architecture uses symbol as PK in portfolio_engine_positions).
+# =============================================================================
+
+
+class Sleeve(str, Enum):
+    CORE = "CORE"
+    ACTIVE = "ACTIVE"
+
+
+SLEEVE_ENABLED = os.getenv("SLEEVE_ENABLED", "true").lower() == "true"
+SLEEVE_CORE_CAPITAL_FRACTION = float(os.getenv("SLEEVE_CORE_CAPITAL_FRACTION", "0.60"))
+SLEEVE_ACTIVE_CAPITAL_FRACTION = float(os.getenv("SLEEVE_ACTIVE_CAPITAL_FRACTION", "0.40"))
+SLEEVE_CORE_MAX_POSITIONS = int(os.getenv("SLEEVE_CORE_MAX_POSITIONS", "3"))
+SLEEVE_ACTIVE_MAX_POSITIONS = int(os.getenv("SLEEVE_ACTIVE_MAX_POSITIONS", "3"))
+SLEEVE_CORE_MAX_UTILIZATION = float(os.getenv("SLEEVE_CORE_MAX_UTILIZATION", "0.95"))
+SLEEVE_ACTIVE_MAX_UTILIZATION = float(os.getenv("SLEEVE_ACTIVE_MAX_UTILIZATION", "0.95"))
+SLEEVE_DEFAULT = Sleeve.ACTIVE
+
+# Validate fractions at import time
+_sleeve_total = SLEEVE_CORE_CAPITAL_FRACTION + SLEEVE_ACTIVE_CAPITAL_FRACTION
+if _sleeve_total > 1.01 or _sleeve_total < 0.50:
+    logger.warning(
+        "SLEEVE_CONFIG_INVALID: CORE(%.2f)+ACTIVE(%.2f)=%.2f — falling back to 60/40",
+        SLEEVE_CORE_CAPITAL_FRACTION,
+        SLEEVE_ACTIVE_CAPITAL_FRACTION,
+        _sleeve_total,
+    )
+    SLEEVE_CORE_CAPITAL_FRACTION = 0.60
+    SLEEVE_ACTIVE_CAPITAL_FRACTION = 0.40
+
+SLEEVE_CORE_SYMBOLS: set[str] = {"BTCUSDT", "ETHUSDT"}
+SLEEVE_NO_CORE_BY_HOLD: frozenset[str] = frozenset(
+    {
+        "SOLUSDT",
+        "XRPUSDT",
+    }
+)
+# Min confidence for CORE assignment.
+SLEEVE_CORE_MIN_CONFIDENCE = float(os.getenv("SLEEVE_CORE_MIN_CONFIDENCE", "0.70"))
+# Max hold time hint: trades with max_hold_min >= this lean CORE
+SLEEVE_CORE_HOLD_THRESHOLD_MIN = int(os.getenv("SLEEVE_CORE_HOLD_THRESHOLD_MIN", "75"))
+
+
+def assign_sleeve(symbol: str, confidence: float, decision_data: dict | None = None) -> str:
+    """Deterministic sleeve assignment using available signal metadata.
+
+    Rules (evaluated in order):
+    1. If sleeves disabled → ACTIVE (backward-compat singular mode)
+    2. Symbol in SLEEVE_CORE_SYMBOLS AND confidence >= CORE threshold → CORE
+    3. COIN_PROFILES max_hold_min >= CORE hold threshold AND symbol not in SLEEVE_NO_CORE_BY_HOLD
+       AND confidence >= CORE threshold → CORE
+    4. Otherwise → ACTIVE
+    """
+    if not SLEEVE_ENABLED:
+        return Sleeve.ACTIVE.value
+
+    sym = (symbol or "").upper().replace("-", "/")
+    if "/" not in sym and sym.endswith("USDT"):
+        sym = f"{sym[:-4]}/USDT"
+
+    profile = get_coin_profile(sym)
+    max_hold = profile.get("max_hold_min", 45)
+
+    is_known_profile = sym in COIN_PROFILES
+    is_core_symbol = sym in SLEEVE_CORE_SYMBOLS
+    is_high_hold = is_known_profile and max_hold >= SLEEVE_CORE_HOLD_THRESHOLD_MIN and sym not in SLEEVE_NO_CORE_BY_HOLD
+    meets_confidence = confidence >= SLEEVE_CORE_MIN_CONFIDENCE
+
+    if (is_core_symbol or is_high_hold) and meets_confidence:
+        return Sleeve.CORE.value
+
+    return Sleeve.ACTIVE.value
+
+
+class ExitType(Enum):
+    """Sell reason classification.
+
+    Live sells emitted by `_check_exit_conditions` are limited to
+    `TAKE_PROFIT_1` and `TAKE_PROFIT_FULL` (real net profit after costs).
+    `MANUAL` is emitted by the human-manual-sell reconciliation path.
+    `DUST_WRITEOFF` is emitted when a residual position is below the dust
+    threshold and is cleared without an exchange order.
+    """
+
+    TAKE_PROFIT_1 = "TP1"
+    TAKE_PROFIT_FULL = "take_profit_full"
+    MANUAL = "MANUAL"
+    DUST_WRITEOFF = "DUST_WRITEOFF"
+
+
+class AccountStatus(Enum):
+    """Account status for trading gates"""
+
+    HEALTHY = "HEALTHY"  # All invariants pass, trading allowed
+    OVERALLOCATED = "ACCOUNT_OVERALLOCATED"  # positions_value > equity, trading paused
+    DELEVERAGING = "DELEVERAGING"  # Auto-sell in progress to restore invariant
+    INSUFFICIENT_CASH = "INSUFFICIENT_CASH"  # Cash <= 0, buys blocked
+    MAX_POSITIONS = "MAX_POSITIONS_REACHED"  # At position limit
+
+
+class KillSwitchMode(Enum):
+    """Kill switch modes for instant trading control"""
+
+    RESUME = "RESUME"  # Normal operation
+    PAUSE_BUYS = "PAUSE_BUYS"  # Block BUYs only, allow SELLs
+    PAUSE_ALL = "PAUSE_ALL"  # Block all BUYs and SELLs
+
+
+class RegimeGuard(Enum):
+    """Active regime guardrails"""
+
+    VOL_SPIKE = "VOL_SPIKE"  # Volatility spike - reduce risk
+    SPREAD_SPIKE = "SPREAD_SPIKE"  # Spread too wide - block buys
+    DRAWDOWN_GUARD = "DRAWDOWN_GUARD"  # Equity drawdown - pause/reduce
+    CHURN_GUARD = "CHURN_GUARD"  # Excessive fees - tighten filters
+
+
+@dataclass
+class CoinPerformance:
+    """Per-coin performance tracking (Phase 6). COIN UNIVERSE RULES: per-coin metrics and risk scaling."""
+
+    symbol: str
+    trades_24h: int = 0
+    pnl_24h: float = 0.0
+    win_count_20: int = 0
+    loss_count_20: int = 0
+    total_trades_20: int = 0
+    avg_win: float = 0.0
+    avg_loss: float = 0.0
+    expectancy: float = 0.0
+    stop_loss_hits_10: int = 0
+    current_drawdown: float = 0.0
+    peak_value: float = 0.0
+    pause_until: float = 0.0  # Timestamp when pause ends
+    sizing_multiplier: float = 1.0  # 0.5 to 1.2 range (per-coin only)
+    last_updated: float = field(default_factory=time.time)
+    # COIN UNIVERSE RULES: daily metrics (persisted); None = undefined (SQLite NULL after wins-only window)
+    profit_factor: float | None = None
+    trades_last_30d: int = 0
+    avg_pnl: float = 0.0
+    confidence_to_pnl_correlation: float = 0.0
+    # Rolling history for correct 20-trade window (not stored in SQLite; rebuilt on restart)
+    _outcome_history: deque = field(default_factory=lambda: deque(maxlen=20), compare=False, repr=False)
+
+    @property
+    def win_rate_20(self) -> float:
+        """Win rate from last 20 trades"""
+        if self.total_trades_20 == 0:
+            return 0.5  # Neutral for new coins
+        return self.win_count_20 / self.total_trades_20
+
+    def compute_profit_factor(self) -> float | None:
+        """Profit factor from rolling 20: gross_profit / gross_loss. Undefined => None (persist as SQL NULL)."""
+        gross_loss = self.loss_count_20 * abs(self.avg_loss) if self.avg_loss else 0
+        gross_profit = self.win_count_20 * self.avg_win if self.avg_win else 0
+        if gross_loss <= 0:
+            return None if gross_profit > 0 else 1.0
+        return gross_profit / gross_loss
+
+    @property
+    def is_paused(self) -> bool:
+        """Check if coin is currently paused"""
+        return time.time() < self.pause_until
+
+    def update_expectancy(self) -> None:
+        """Calculate expectancy from win rate and avg win/loss"""
+        if self.total_trades_20 == 0:
+            self.expectancy = 0.0
+            return
+        win_rate = self.win_rate_20
+        self.expectancy = (win_rate * self.avg_win) - ((1 - win_rate) * abs(self.avg_loss))
+
+
+@dataclass
+class BuyCandidate:
+    """Candidate for ranked buy selection (Phase 5)"""
+
+    symbol: str
+    confidence: float
+    trend_score: float  # EMA alignment, slope direction
+    chop_score: float  # Penalty for ranging conditions
+    coin_edge_score: float  # From CoinPerformance
+    volatility_penalty: float  # Too volatile = penalty
+    spread_penalty: float  # High spread = penalty
+    atr: float  # For sizing
+    current_price: float
+    decision_data: dict[str, Any] = field(default_factory=dict)
+    decision_id: str = ""  # For pipeline tracking
+    sleeve: str = "ACTIVE"  # Sleeve assignment: CORE | ACTIVE
+    price_structure_regime: str = "unknown"  # range_bound | trending | unknown (ADX vs PRICE_REGIME_ADX_THRESHOLD)
+    # Phase 3: adaptive score weights (advisory; bounded; never blocking)
+    adaptive_score_delta: float = 0.0
+    adaptive_components_used: dict[str, float] = field(default_factory=dict)
+    adaptive_components_missing: list[str] = field(default_factory=list)
+    adaptive_regime: str = "unknown"
+
+    @property
+    def composite_score(self) -> float:
+        """Per-coin model confidence is the ranking score.
+        No coin_priority multiplier, no trend/chop/edge blend.
+        Telemetry fields (trend, chop, etc.) are kept on the dataclass for observability."""
+        return max(0.0, min(1.0, self.confidence))
+
+    def rank_score(self) -> float:
+        """Bar-ranking score. When ENABLE_PRICE_REGIME_BEHAVIOR_SPLIT is set, tilts by regime:
+        range_bound → MR (chop + sub-threshold ADX); trending → TF (raw ema_alignment + momentum).
+
+        Phase 3: adds a bounded ``adaptive_score_delta`` (default range ±0.10)
+        learned from ``ai_strategy_score_weights``. Never blocks symbols.
+        """
+        base = max(0.0, min(1.0, self.confidence))
+        if os.getenv("ENABLE_BUY_MARGIN_RANK_WEIGHT", "true").strip().lower() in ("1", "true", "yes", "on"):
+            bm = resolve_buy_margin_from_payload(self.decision_data)
+            if bm is not None:
+                try:
+                    bm_v = float(bm)
+                    sleeve = str(getattr(self, "sleeve", "") or "").strip().upper() or Sleeve.ACTIVE.value
+                    bm_floor = buy_margin_threshold_core() if sleeve == Sleeve.CORE.value else buy_margin_threshold_active()
+                    bm_norm = max(-1.0, min(2.0, (bm_v - bm_floor) / max(1e-9, abs(bm_floor) + 0.05)))
+                    bm_w = float(os.getenv("BUY_MARGIN_RANK_WEIGHT", "0.12"))
+                    base = max(0.0, min(1.0, base + (bm_norm * bm_w)))
+                except (TypeError, ValueError):
+                    pass
+        if _price_regime_behavior_split_enabled() and self.price_structure_regime != "unknown":
+            align = _rank_align_for_price_regime(self)
+            base = max(0.0, min(1.0, base * (1.0 + PRICE_REGIME_RANK_TILT * align)))
+        try:
+            delta = float(self.adaptive_score_delta or 0.0)
+        except (TypeError, ValueError):
+            delta = 0.0
+        dmax = _adaptive_score_delta_max()
+        delta = max(-dmax, min(dmax, delta))
+        trust_delta = 0.0
+        try:
+            trust_delta = float((self.decision_data or {}).get("symbol_trust_score") or 0.0)
+        except (TypeError, ValueError):
+            trust_delta = 0.0
+        trust_delta = max(-0.18, min(0.18, trust_delta))
+        return max(0.0, min(1.0, base + delta + trust_delta))
+
+
+def _decision_float(decision_data: dict[str, Any], key: str, default: float) -> float:
+    raw = decision_data.get(key)
+    try:
+        if raw is None or str(raw).strip() == "":
+            return default
+        v = float(raw)
+        return v if math.isfinite(v) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _rank_align_for_price_regime(candidate: BuyCandidate) -> float:
+    """
+    Map candidate + regime to [-1, 1] for rank tilt.
+
+    Prior logic used (trend_score - 0.5) * 2 for trending; trend_score blends ema_alignment
+    and momentum_score such that ema_alignment=0.5 and price_momentum=0 → trend_score=0.5
+    → align=0 (rank == confidence). Range used chop alone; weak when ADX sat just below threshold.
+
+    Here:
+    - range_bound: MR from chop_score + sub-threshold ADX distance.
+    - trending: TF from raw ema_alignment and price_momentum (not blended trend_score).
+    """
+    dd = candidate.decision_data or {}
+    if candidate.price_structure_regime == "range_bound":
+        chop_align = (candidate.chop_score - 0.5) * 2.0
+        adx = _decision_float(dd, "adx", 0.0)
+        if adx > 0 and adx < PRICE_REGIME_ADX_THRESHOLD:
+            adx_align = (PRICE_REGIME_ADX_THRESHOLD - adx) / PRICE_REGIME_ADX_THRESHOLD
+            adx_align = (adx_align - 0.5) * 2.0
+        else:
+            adx_align = 0.0
+        align = 0.65 * chop_align + 0.35 * adx_align
+    else:
+        ema = _decision_float(dd, "ema_alignment", 0.5)
+        mom = _decision_float(dd, "price_momentum", 0.0)
+        ema_align = (ema - 0.5) * 2.0
+        mom_align = max(-1.0, min(1.0, mom / 5.0))
+        align = 0.55 * ema_align + 0.45 * mom_align
+    return max(-1.0, min(1.0, align))
+
+
+# =========================================================================
+# ADAPTIVE RANKING WEIGHTS
+# Consume per-(strategy, symbol, regime) component weights loaded from the
+# `ai_strategy_score_weights` table (updated by offline learning jobs). Pure
+# score adjustment — never blocks symbols, never forces trades.
+# =========================================================================
+
+# Bounds for raw component values before adaptive weighting.
+_ADAPTIVE_COMPONENT_BOUNDS: dict[str, tuple[float, float]] = {
+    "model_probability": (4.0, 80.0),
+    "buy_margin": (20.0, 260.0),
+    "relative_strength": (2.0, 30.0),
+    "volume": (2.0, 24.0),
+    "trend": (2.0, 26.0),
+    "momentum": (2.0, 24.0),
+    "spread_penalty": (-5000.0, -200.0),
+    "slippage_penalty": (-5000.0, -200.0),
+    "chop_penalty": (-40.0, -2.0),
+    "memory_bonus": (1.0, 30.0),
+    "memory_penalty": (-30.0, -1.0),
+    "symbol_expectancy": (2.0, 80.0),
+    "net_expected_value": (900.0, 5000.0),
+}
+
+
+def _adaptive_weights_enabled() -> bool:
+    return os.getenv("ADAPTIVE_SCORE_WEIGHT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _adaptive_score_delta_max() -> float:
+    try:
+        val = float(os.getenv("ADAPTIVE_SCORE_DELTA_MAX", "0.10"))
+    except (TypeError, ValueError):
+        val = 0.10
+    return max(0.0, min(0.30, val))
+
+
+def _adaptive_per_component_cap() -> float:
+    try:
+        val = float(os.getenv("ADAPTIVE_SCORE_PER_COMPONENT_CAP", "0.025"))
+    except (TypeError, ValueError):
+        val = 0.025
+    return max(0.0, min(0.10, val))
+
+
+def _normalize_regime(value: Any) -> str:
+    s = str(value or "unknown").strip().lower()
+    return s or "unknown"
+
+
+def _extract_component_value(component_name: str, decision_data: dict[str, Any], candidate: BuyCandidate) -> float | None:
+    """Best-effort extraction of the candidate's current component value in
+    the same coordinate system as ``_ADAPTIVE_COMPONENT_BOUNDS``.
+
+    Returns None when the value cannot be derived from the candidate; the
+    caller treats that as "missing" and skips this component (neutral).
+    """
+    bounds = _ADAPTIVE_COMPONENT_BOUNDS.get(component_name)
+    if not bounds:
+        return None
+    dd = decision_data or {}
+    bmin, bmax = bounds
+    bmid = (bmin + bmax) / 2.0
+    span = (bmax - bmin) / 2.0 or 1.0
+
+    def _opt(key: str) -> float | None:
+        raw = dd.get(key)
+        if raw is None or raw == "":
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    if component_name == "model_probability":
+        v = float(candidate.confidence)
+        # Map confidence [0..1] into bounded range [bmin..bmax] linearly so
+        # higher confidence maps closer to bmax.
+        return bmin + max(0.0, min(1.0, v)) * (bmax - bmin)
+    if component_name == "buy_margin":
+        bm = resolve_buy_margin_from_payload(dd)
+        if bm is None:
+            return None
+        try:
+            bm_v = float(bm)
+        except (TypeError, ValueError):
+            return None
+        # buy_margin is fractional; scale fractional [0..0.20] into bounds.
+        scaled = bmin + max(0.0, min(1.0, bm_v / 0.20)) * (bmax - bmin)
+        return scaled
+    if component_name == "relative_strength":
+        rs = _opt("ctx_rs_btc")
+        if rs is None:
+            return None
+        scaled = bmid + max(-1.0, min(1.0, rs / 5.0)) * span
+        return scaled
+    if component_name == "volume":
+        vx = _opt("relative_volume")
+        if vx is None:
+            vx = _opt("volume_expansion")
+        if vx is None:
+            return None
+        scaled = bmin + max(0.0, min(1.0, vx / 3.0)) * (bmax - bmin)
+        return scaled
+    if component_name == "trend":
+        ts = float(candidate.trend_score or 0.0)
+        scaled = bmin + max(0.0, min(1.0, ts)) * (bmax - bmin)
+        return scaled
+    if component_name == "momentum":
+        mom = _opt("price_momentum")
+        if mom is None:
+            return None
+        scaled = bmid + max(-1.0, min(1.0, mom / 5.0)) * span
+        return scaled
+    if component_name == "spread_penalty":
+        sp = _opt("spread_pct")
+        if sp is None:
+            return None
+        # spread_pct is positive fraction; mirror to negative-bound space.
+        # Higher spread → more negative penalty value (closer to bmin).
+        scaled = bmax - max(0.0, min(1.0, sp / 0.01)) * (bmax - bmin)
+        return scaled
+    if component_name == "slippage_penalty":
+        slip = _opt("estimated_slippage_pct")
+        if slip is None:
+            return None
+        scaled = bmax - max(0.0, min(1.0, slip / 0.01)) * (bmax - bmin)
+        return scaled
+    if component_name == "chop_penalty":
+        # Higher chop_score → larger penalty (closer to bmin).
+        cs = float(candidate.chop_score or 0.0)
+        scaled = bmax - max(0.0, min(1.0, cs)) * (bmax - bmin)
+        return scaled
+    if component_name == "memory_bonus":
+        good = _opt("good_pattern_similarity")
+        if good is None:
+            return None
+        scaled = bmin + max(0.0, min(1.0, good)) * (bmax - bmin)
+        return scaled
+    if component_name == "memory_penalty":
+        bad = _opt("bad_pattern_similarity")
+        if bad is None:
+            return None
+        scaled = bmax - max(0.0, min(1.0, bad)) * (bmax - bmin)
+        return scaled
+    if component_name == "symbol_expectancy":
+        ce = _opt("coin_expectancy")
+        if ce is None:
+            return None
+        scaled = bmid + max(-1.0, min(1.0, ce)) * span
+        return scaled
+    if component_name == "net_expected_value":
+        ev = _opt("net_expected_value")
+        if ev is None:
+            # Derive from estimated win/loss/fees/slippage when available.
+            ew = _opt("estimated_win_pct")
+            el = _opt("estimated_loss_pct")
+            ef = _opt("estimated_fees_pct")
+            es = _opt("estimated_slippage_pct")
+            wp = float(candidate.confidence or 0.0)
+            if ew is None or el is None:
+                return None
+            ev = wp * ew - (1.0 - wp) * el - (ef or 0.0) - (es or 0.0)
+        # net_expected_value bounds are scaled fractions; map fractional [0..0.005] linearly.
+        scaled = bmin + max(0.0, min(1.0, ev / 0.005)) * (bmax - bmin)
+        return scaled
+    return None
+
+
+def compute_adaptive_score_delta(
+    candidate: BuyCandidate,
+    weights: dict[str, float],
+    *,
+    per_component_cap: float | None = None,
+    delta_max: float | None = None,
+) -> tuple[float, dict[str, float], list[str]]:
+    """Return (delta, components_used, components_missing).
+
+    The delta is bounded by ``delta_max`` (default ``ADAPTIVE_SCORE_DELTA_MAX``)
+    and each component contributes at most ``per_component_cap`` to keep one
+    runaway weight from dominating ranking.
+    """
+    if not weights:
+        return 0.0, {}, []
+    cap = per_component_cap if per_component_cap is not None else _adaptive_per_component_cap()
+    dmax = delta_max if delta_max is not None else _adaptive_score_delta_max()
+    used: dict[str, float] = {}
+    missing: list[str] = []
+    total = 0.0
+    for component_name, weight in weights.items():
+        bounds = _ADAPTIVE_COMPONENT_BOUNDS.get(component_name)
+        if not bounds:
+            continue
+        bmin, bmax = bounds
+        mid = (bmin + bmax) / 2.0
+        half = (bmax - bmin) / 2.0 or 1.0
+        try:
+            w_norm = (float(weight) - mid) / half
+        except (TypeError, ValueError):
+            continue
+        w_norm = max(-1.0, min(1.0, w_norm))
+        current = _extract_component_value(component_name, candidate.decision_data or {}, candidate)
+        if current is None:
+            missing.append(component_name)
+            continue
+        v_norm = (float(current) - mid) / half
+        v_norm = max(-1.0, min(1.0, v_norm))
+        contribution = w_norm * v_norm * cap
+        contribution = max(-cap, min(cap, contribution))
+        used[component_name] = round(contribution, 6)
+        total += contribution
+    total = max(-dmax, min(dmax, total))
+    return round(total, 6), used, missing
+
+
+@dataclass
+class RegimeState:
+    """Current regime guardrail state (Item 4)"""
+
+    regime: str = "unknown"  # Market regime: BULL/BEAR/SIDEWAYS/unknown
+    confidence: float = 0.0  # Regime confidence score
+    risk_multiplier: float = 1.0  # Applied to risk_per_trade_pct
+    vol_spike_active: bool = False
+    vol_spike_until: float = 0.0  # Bar timestamp when expires
+    spread_blocked_symbols: dict[str, float] = field(default_factory=dict)  # symbol -> expire_bar
+    drawdown_guard_active: bool = False
+    churn_guard_active: bool = False
+    churn_guard_activated_at: float = 0.0
+    current_drawdown_pct: float = 0.0
+    rolling_peak_equity: float = 0.0
+    rolling_peak_timestamp: float = 0.0
+    churn_ratio: float = 0.0
+    last_updated: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "regime": getattr(self, "regime", "unknown"),
+            "confidence": getattr(self, "confidence", 0.0),
+            "risk_multiplier": self.risk_multiplier,
+            "vol_spike_active": self.vol_spike_active,
+            "vol_spike_until": self.vol_spike_until,
+            "spread_blocked_symbols": self.spread_blocked_symbols,
+            "drawdown_guard_active": self.drawdown_guard_active,
+            "churn_guard_active": self.churn_guard_active,
+            "current_drawdown_pct": self.current_drawdown_pct * 100,
+            "rolling_peak_equity": self.rolling_peak_equity,
+            "churn_ratio": self.churn_ratio,
+            "last_updated": self.last_updated,
+        }
+
+
+@dataclass
+class QualityFilterState:
+    """State for signal quality filters (Item 5)"""
+
+    recent_bar_signals: dict[str, list[str]] = field(default_factory=dict)  # symbol -> last N signals
+    symbol_cooldowns: dict[str, int] = field(default_factory=dict)  # symbol -> cooldown_until_bar
+    symbol_cooldown_wall: dict[str, float] = field(default_factory=dict)  # symbol -> wall-clock cooldown_until
+    global_cooldown_wall: float = 0.0  # wall-clock global cooldown
+    global_cooldown_until: int = 0  # Block ALL buys until this bar (after any sell)
+    buys_this_hour: int = 0
+    buys_today: int = 0
+    overflow_buys_this_hour: int = 0
+    last_hour_reset: float = field(default_factory=time.time)
+    last_day_reset: float = field(default_factory=time.time)
+    recent_exit_types: list[str] = field(default_factory=list)  # last N exit types for regime detection
+    recent_exit_pnls: list[float] = field(default_factory=list)  # last N exit PnLs for win-rate circuit breaker
+    loss_streak_pause_until: float = 0.0  # wall-clock time when loss-streak pause expires
+
+
+@dataclass
+class PendingOrder:
+    """Pending order for partial fill simulation (Item 6)"""
+
+    order_id: str
+    symbol: str
+    side: str
+    total_qty: float
+    filled_qty: float
+    remaining_qty: float
+    price: float
+    created_at: float
+    fill_chunks: int = 2  # Fill in N chunks
+    current_chunk: int = 0
+
+
+@dataclass
+class OpenPosition:
+    """In-memory position representation matching DB.
+
+    The `stop_price`, `take_profit_1_price`, `take_profit_2_price`,
+    `trailing_stop_price`, `tp1_hit` fields are persisted-schema columns
+    only. They are advisory metadata, not sell drivers. Sells are gated
+    exclusively by `_check_exit_conditions` (real net profit after costs).
+    """
+
+    symbol: str
+    quantity: float
+    entry_price: float
+    entry_time: float
+    trade_id: str
+    stop_price: float
+    take_profit_1_price: float
+    take_profit_2_price: float
+    trailing_stop_price: float | None = None
+    tp1_hit: bool = False
+    highest_price: float = 0.0
+    lowest_price: float = 0.0  # For MAE (max adverse excursion) diagnostics
+    atr_at_entry: float = 0.0
+    entry_bar_timestamp: int = 0
+    confidence_at_entry: float = 0.0
+    # === DUST_INVARIANT_LOCK ===
+    # DO NOT MODIFY. Binance.US produces dust leftovers; dust must not pause trading.
+    # DUST_PENDING positions are excluded from pause logic by design.
+    status: str = "ACTIVE"  # ACTIVE | DUST_PENDING
+    dust_detected_at: float = 0.0
+    dust_qty_canonical: float = 0.0
+    # === END DUST_INVARIANT_LOCK ===
+    entry_fee: float = 0.0  # Entry fee (USD) for true-net realized_pnl; backward compat default 0
+    sleeve: str = "ACTIVE"  # Sleeve assignment: CORE | ACTIVE
+    entry_strategy_id: str = ""  # From signal live_ai_strategy at BUY fill (runtime attribution)
+    add_count: int = 0  # Runtime anti-churn guard: max adds per open position
+    last_add_ts: float = 0.0  # Runtime anti-churn guard: last successful add timestamp
+    repair_add_count: int = 0
+    last_repair_add_ts: float = 0.0
+    repair_add_trade_ids: str = "[]"  # JSON list of repair-add paper trade_ids
+    average_entry_after_repair: float = 0.0
+    original_position_cost: float = 0.0  # First-buy cost basis cap for repair sizing
+
+    @property
+    def risk_usd(self) -> float:
+        """Advisory stop-distance risk in USD (sell gate is net-profit-only)."""
+        return compute_position_risk_usd(self.quantity, self.entry_price, self.stop_price)
+
+
+@dataclass
+class TradeExplainability:
+    """Full explainability payload per trade (Phase 9)"""
+
+    trade_id: str
+    symbol: str
+    side: str
+    timestamp: str
+
+    # Entry reasons
+    ai_confidence: float = 0.0
+    trend_score: float = 0.0
+    chop_score: float = 0.0
+    coin_edge_score: float = 0.0
+    composite_score: float = 0.0
+    regime: str = "unknown"
+
+    # Exit reasons (filled on exit)
+    exit_type: str | None = None
+    exit_r_multiple: float | None = None
+    exit_trigger: str | None = None
+
+    # ADX-based price structure at entry (when regime split enabled on rank)
+    price_structure_regime: str = "unknown"
+
+    # Performance snapshot at entry
+    coin_win_rate_20: float = 0.0
+    coin_expectancy: float = 0.0
+    portfolio_open_risk: float = 0.0
+
+    # Pipeline / cross-table join (data truth only; mirrors paper_trades columns)
+    decision_id: str = ""
+    entry_timestamp: str = ""
+    # Strategy / artifact attribution (signal → fill proof; persisted in explainability_json)
+    live_ai_strategy: str = ""
+    artifact_path: str = ""
+    artifact_sha256: str = ""
+    model_trained_at: str = ""
+    model_accuracy: float | None = None
+    feature_version: int = 0
+    feature_dim: int = 0
+    ctx_ts_utc: str = ""
+    ctx_age_sec: float = -1.0
+    context_fresh_flag: str = ""
+    context_audit_emit: str = ""
+    # Snapshot for Step 4 entry veto (must match Redis signal at enqueue time)
+    signal_rsi_1m: float = -1.0
+    signal_adx: float = 0.0
+    signal_ctx_rs_btc: float = 0.0
+    signal_spread_pct: float = 0.0
+    signal_ctx_depth_imbalance: float = 0.0
+    signal_regime_score: float = 0.0
+    signal_ema_alignment: float = 0.5
+    signal_regime_label: str = ""
+    # ai_signal hash content freshness (execution gate parity with Redis consume path)
+    signal_content_timestamp: str = ""
+    signal_content_fresh: str = ""
+    signal_content_age_sec: str = ""
+    signal_content_stale: str = "0"
+    rank_snapshot_id: int | None = None
+    selected_rank: int = 0
+    selected_score: float = 0.0
+    selected_net_expected_value: float = 0.0
+    peer_ranks_json: str = ""
+    arbiter_winner_reason: str = ""
+    arbiter_rejected_reason_json: str = ""
+    score_components_json: str = ""
+    ai_exit_scores: dict[str, Any] | None = None
+    # Dynamic sizing explainability
+    base_size: float = 0.0
+    final_size: float = 0.0
+    sizing_multiplier: float = 1.0
+    sizing_components_json: str = ""
+    cap_reason: str = ""
+    drawdown_factor: float = 1.0
+    memory_factor: float = 1.0
+    ev_factor: float = 1.0
+    # Observation: buy-margin at enqueue (logging / expectancy study only).
+    entry_buy_margin: float | None = None
+    # Entry cost telemetry for EV and post-trade learning joins.
+    entry_spread_pct: float = 0.0
+    entry_slippage_pct: float = 0.0
+    entry_fee_pct: float = 0.0
+    entry_spread_source: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for storage"""
+        sym = self.symbol or ""
+        return {
+            "trade_id": self.trade_id,
+            "symbol": self.symbol,
+            "symbol_canonical_no_slash": sym.replace("/", "").upper(),
+            "side": self.side,
+            "timestamp": self.timestamp,
+            "entry_timestamp": self.entry_timestamp or self.timestamp,
+            "decision_id": self.decision_id,
+            "ai_confidence": self.ai_confidence,
+            "trend_score": self.trend_score,
+            "chop_score": self.chop_score,
+            "coin_edge_score": self.coin_edge_score,
+            "composite_score": self.composite_score,
+            "regime": self.regime,
+            "price_structure_regime": self.price_structure_regime,
+            "exit_type": self.exit_type,
+            "exit_r_multiple": self.exit_r_multiple,
+            "exit_trigger": self.exit_trigger,
+            "coin_win_rate_20": self.coin_win_rate_20,
+            "coin_expectancy": self.coin_expectancy,
+            "portfolio_open_risk": self.portfolio_open_risk,
+            "live_ai_strategy": self.live_ai_strategy,
+            "artifact_path": self.artifact_path,
+            "artifact_sha256": self.artifact_sha256,
+            "model_trained_at": self.model_trained_at,
+            "model_accuracy": self.model_accuracy,
+            "feature_version": self.feature_version,
+            "feature_dim": self.feature_dim,
+            "ctx_ts_utc": self.ctx_ts_utc,
+            "ctx_age_sec": self.ctx_age_sec,
+            "context_fresh_flag": self.context_fresh_flag,
+            "context_audit_emit": self.context_audit_emit if self.context_audit_emit else "",
+            "signal_rsi_1m": self.signal_rsi_1m,
+            "signal_adx": self.signal_adx,
+            "signal_ctx_rs_btc": self.signal_ctx_rs_btc,
+            "signal_spread_pct": self.signal_spread_pct,
+            "signal_ctx_depth_imbalance": self.signal_ctx_depth_imbalance,
+            "signal_regime_score": self.signal_regime_score,
+            "signal_ema_alignment": self.signal_ema_alignment,
+            "signal_regime_label": self.signal_regime_label,
+            "signal_content_timestamp": self.signal_content_timestamp,
+            "signal_content_fresh": self.signal_content_fresh,
+            "signal_content_age_sec": self.signal_content_age_sec,
+            "signal_content_stale": self.signal_content_stale,
+            "rank_snapshot_id": self.rank_snapshot_id,
+            "selected_rank": self.selected_rank,
+            "selected_score": self.selected_score,
+            "selected_net_expected_value": self.selected_net_expected_value,
+            "peer_ranks_json": self.peer_ranks_json,
+            "arbiter_winner_reason": self.arbiter_winner_reason,
+            "arbiter_rejected_reason_json": self.arbiter_rejected_reason_json,
+            "score_components_json": self.score_components_json,
+            "ai_exit_scores": self.ai_exit_scores or {},
+            "base_size": self.base_size,
+            "final_size": self.final_size,
+            "sizing_multiplier": self.sizing_multiplier,
+            "sizing_components_json": self.sizing_components_json,
+            "cap_reason": self.cap_reason,
+            "drawdown_factor": self.drawdown_factor,
+            "memory_factor": self.memory_factor,
+            "ev_factor": self.ev_factor,
+            "entry_buy_margin": self.entry_buy_margin,
+            "entry_spread_pct": self.entry_spread_pct,
+            "entry_slippage_pct": self.entry_slippage_pct,
+            "entry_fee_pct": self.entry_fee_pct,
+            "entry_spread_source": self.entry_spread_source,
+            # compatibility aliases consumed by outcome/analytics paths
+            "spread_pct": self.entry_spread_pct,
+            "spread_cost_pct": self.entry_spread_pct,
+            "estimated_slippage_pct": self.entry_slippage_pct,
+            "estimated_fees_pct": self.entry_fee_pct,
+            "buy_margin": self.entry_buy_margin,
+        }
+
+
+def _exit_observation_family(exit_type: ExitType) -> str:
+    """Collapse ExitType enum to TP / MANUAL / DUST / OTHER for PnL observation logs."""
+    if exit_type in (ExitType.TAKE_PROFIT_1, ExitType.TAKE_PROFIT_FULL):
+        return "TP"
+    if exit_type == ExitType.MANUAL:
+        return "MANUAL"
+    if exit_type == ExitType.DUST_WRITEOFF:
+        return "DUST"
+    return "OTHER"
+
+
+# BUG #42: Memory Cache with TTL for portfolio data
+class CachedPortfolio:
+    """Simple TTL-based cache for portfolio data"""
+
+    def __init__(self, ttl_seconds: float = 30):
+        self._cache: dict[str, Any] = {}
+        self._cache_timestamps: dict[str, float] = {}
+        self._cache_ttl = ttl_seconds
+
+    def get(self, key: str) -> Any | None:
+        """Get cached value if not expired"""
+        if key in self._cache:
+            age = time.time() - self._cache_timestamps.get(key, 0)
+            if age < self._cache_ttl:
+                return self._cache[key]
+            else:
+                # Expired - remove
+                self._cache.pop(key, None)
+                self._cache_timestamps.pop(key, None)
+        return None
+
+    def set(self, key: str, value: Any) -> None:
+        """Set cache value with timestamp"""
+        self._cache[key] = value
+        self._cache_timestamps[key] = time.time()
+
+    def invalidate(self, key: str) -> None:
+        """Explicitly invalidate cache entry"""
+        self._cache.pop(key, None)
+        self._cache_timestamps.pop(key, None)
+
+    def clear(self) -> None:
+        """Clear all cache"""
+        self._cache.clear()
+        self._cache_timestamps.clear()
+
+
+# BUG #44: Price cache with TTL
+class PriceCache:
+    """Cache for market prices with TTL to reduce API calls"""
+
+    def __init__(self, ttl_seconds: float = 5):
+        self._prices: dict[str, float] = {}
+        self._timestamps: dict[str, float] = {}
+        self._ttl = ttl_seconds
+
+    def get(self, symbol: str) -> float | None:
+        """Get cached price if not expired"""
+        if symbol in self._prices:
+            age = time.time() - self._timestamps[symbol]
+            if age < self._ttl:
+                return self._prices[symbol]
+        return None
+
+    def get_with_age(self, symbol: str) -> tuple[float | None, float | None]:
+        """Get cached price and age in seconds (even when stale)."""
+        if symbol not in self._prices:
+            return (None, None)
+        age = max(0.0, time.time() - self._timestamps.get(symbol, 0.0))
+        val = self._prices.get(symbol)
+        if val is None:
+            return (None, age)
+        return (float(val), age)
+
+    def set(self, symbol: str, price: float) -> None:
+        """Set price cache with timestamp"""
+        self._prices[symbol] = price
+        self._timestamps[symbol] = time.time()
+
+    def invalidate(self, symbol: str) -> None:
+        """Explicitly invalidate price entry"""
+        self._prices.pop(symbol, None)
+        self._timestamps.pop(symbol, None)
+
+    def clear(self) -> None:
+        """Clear all cached prices"""
+        self._prices.clear()
+        self._timestamps.clear()
+
+
+class PortfolioEngine:
+    """
+    Mystic Pro Portfolio Engine
+
+    Central trading system implementing all 10 phases:
+    - Phase 1: DB source of truth with FIFO matching
+    - Phase 2: Portfolio discipline (max positions, no stacking)
+    - Phase 3: Continuous position monitoring (no skips)
+    - Phase 4: Risk-based sizing with ATR stops
+    - Phase 5: Ranked buy selection per bar
+    - Phase 6: Per-coin performance scoring and pauses
+    - Phase 7: Volatility-aware exits with R-multiples
+    - Phase 8: Fee/slippage realism
+    - Phase 9: Full observability and explainability
+    - Phase 10: Invariant enforcement
+    """
+
+    def __init__(self, db_path: str = DATABASE_PATH, principal: float | None = None, test_mode: bool = False):
+        self.db_path = db_path
+        self.test_mode = test_mode  # Test mode bypasses exchange constraints for deterministic unit tests
+
+        # =================================================================
+        # AUTHORITATIVE LEDGER (portfolio engine is the source of truth)
+        # =================================================================
+        # CANONICAL EQUITY: total_equity = cash_balance + positions_value (market).
+        # positions_value = market value; cost_basis = entry cost; unrealized_pnl = positions_value - cost_basis.
+        self.principal: float = principal if principal is not None else float(os.getenv("PAPER_TRADING_INITIAL_BALANCE", "10000.0"))
+        self.cash_balance: float = self.principal  # USDT on exchange (canonical)
+        self._positions_value: float = 0.0  # Market value: sum(qty * current_price)
+        self._cost_basis: float = 0.0  # Cost of open positions: sum(entry_price * qty)
+        self._realized_pnl: float = 0.0  # Sum of closed trades only (changes only on SELL)
+        self._unrealized_pnl: float = 0.0  # positions_value - cost_basis
+
+        # Derived: total_equity = cash_balance + positions_value (canonical)
+        self._total_equity: float = self.principal  # cash + positions
+        self._available_balance: float = self.principal  # Available for new buys
+        self._total_open_risk: float = 0.0
+
+        # Account status for trading gates
+        self._account_status: AccountStatus = AccountStatus.HEALTHY
+        self._trading_paused: bool = False
+        self._pause_reason: str = ""
+        self._last_governance_hold_reason: str | None = None  # From risk governor when buys held
+
+        # Startup timestamp retained for downstream age telemetry only.
+        self._startup_timestamp: float = time.time()
+
+        # Position tracking
+        self.open_positions: dict[str, OpenPosition] = {}
+        self.coin_performance: dict[str, CoinPerformance] = {}
+
+        # Bar-based decision buffer (Phase 5)
+        self.current_bar_candidates: list[BuyCandidate] = []
+        self.last_bar_timestamp: int = 0
+
+        # Phase 3: adaptive ranking weights cache. Loaded periodically from
+        # ai_strategy_score_weights; consumed by BuyCandidate.rank_score via
+        # adaptive_score_delta. Never used to block symbols.
+        self._adaptive_weights_cache: dict[tuple[str, str, str], dict[str, float]] = {}
+        self._adaptive_weights_loaded_at: float = 0.0
+        self._adaptive_weights_refresh_sec: float = float(os.getenv("ADAPTIVE_SCORE_WEIGHT_REFRESH_SEC", "60"))
+
+        # Trade explainability storage (Phase 9)
+        self.trade_explanations: dict[str, TradeExplainability] = {}
+
+        # Invariant violation counter
+        self.invariant_violations: int = 0
+
+        # === DUST_INVARIANT_LOCK ===
+        # DO NOT MODIFY. Dust metrics for reconciliation and monitoring.
+        self.dust_drift_events_total: int = 0
+        self.dust_reconcile_runs_total: int = 0
+        # === END DUST_INVARIANT_LOCK ===
+
+        # Canonical derived-state reconciliation (treat ledger as cache; self-heal from SQLite)
+        self._reconcile_derived_state_lock: asyncio.Lock = asyncio.Lock()
+        self._sqlite_writer_lock: asyncio.Lock = asyncio.Lock()
+        self._reconcile_derived_state_last_error_log: float = 0.0  # throttle error logs
+        # BUG #28: Position deletion race guard
+        self._deletion_lock: asyncio.Lock = asyncio.Lock()
+
+        # BUG #10 FIX: FIFO sell lock to prevent concurrent sells of same position
+        self._fifo_sell_lock: asyncio.Lock = asyncio.Lock()
+        # Single-flight buy lock per symbol — prevents paired duplicate paper_trades rows
+        self._buy_execution_locks: dict[str, asyncio.Lock] = {}
+
+        # Portfolio snapshot tracking (5-min throttle, 30-day retention)
+        self._last_snapshot_time: float = 0.0
+        self._snapshot_interval_sec: float = 300.0  # 5 minutes
+        self._snapshot_retention_days: int = 30
+        self._positions_initialized: bool = False  # Guard: no snapshots until positions loaded + recomputed
+
+        # Single-flight lock for corruption detection / recovery so these
+        # operations never run concurrently and never interleave with each other.
+        self._recovery_lock: asyncio.Lock = asyncio.Lock()
+
+        # BUG #44: Price cache for reducing API calls
+        self._price_cache: PriceCache = PriceCache(ttl_seconds=5)
+        # BUG #42: Portfolio value cache for positions_value/total_equity invalidation
+        self._portfolio_cache: CachedPortfolio = CachedPortfolio(ttl_seconds=30)
+        # Dashboard / sleeve summary: last mark prices and per-sleeve MTM (updated with _recompute_positions_values)
+        self._position_mark_prices: dict[str, float] = {}
+        self._sleeve_unrealized_cache: dict[str, float] = {
+            Sleeve.CORE.value: 0.0,
+            Sleeve.ACTIVE.value: 0.0,
+        }
+        self._sleeve_market_notional_cache: dict[str, float] = {
+            Sleeve.CORE.value: 0.0,
+            Sleeve.ACTIVE.value: 0.0,
+        }
+
+        # Live reconcile tracking (for harness / proof report)
+        self._last_live_reconcile_time: float | None = None
+        self._last_live_reconcile_actions: str = ""
+        # Cash sync skip reason rate-limit (reason -> last log time)
+        self._cash_sync_skip_last_log: dict[str, float] = {}
+        self._cash_sync_skip_interval: float = 300.0  # 5 min per reason
+        # Per-symbol INSUFFICIENT_BALANCE reconciliation cooldown (avoids log/API spam on intermittent -2010)
+        self._insufficient_balance_reconcile_cooldown: dict[str, float] = {}
+        self._insufficient_balance_cooldown_sec: float = 600.0  # 10 min
+
+        # Soft per-symbol buy cooldown (anti-thrash when signals flicker)
+        self._last_buy_ts: dict[str, float] = {}
+
+        # Throttle EXIT_SKELETON_EVAL audit rows (per symbol|strategy)
+        self._exit_skeleton_audit_last: dict[str, float] = {}
+
+        # Symbols added in last N seconds - exclude from sync removal (timing race: paper not yet updated)
+        self._recently_added_symbols: dict[str, float] = {}
+        self._recently_added_grace_sec: float = 90.0
+
+        # Cached reference to paper trading service (for position sync only)
+        self._paper_service: PaperTradingService | None = None
+
+        # Live trading service for REAL MONEY execution
+        self._live_service: LiveTradingService | None = None
+        self._live_execution_enabled = LIVE_EXECUTION
+
+        # Exchange time offset (ms) for stale-signal/signature correction
+        self.exchange_time_offset_ms: int = 0
+
+        # =================================================================
+        # ELITE HARDENING STATE (Items 1-7)
+        # =================================================================
+
+        # Item 1: Kill switch
+        self._kill_switch_mode: KillSwitchMode = KillSwitchMode.RESUME
+        self._kill_switch_reason: str = ""
+
+        # Item 4: Regime guardrails
+        self._regime_state = RegimeState()
+        self._atr_baseline: dict[str, float] = {}  # symbol -> 20-bar ATR baseline
+
+        # Item 5: Quality filter state
+        self._quality_filter_state = QualityFilterState()
+
+        # Item 6: Pending orders
+        self._pending_orders: dict[str, PendingOrder] = {}
+
+        # Item 7: Scoreboard
+        self._startup_timestamp = time.time()
+        self._total_fees_paid: float = 0.0
+        self._total_slippage_cost: float = 0.0
+
+        # Canonical bar interval (seconds) from integration; used for "N bars" cooldowns
+        self._bar_interval_seconds: int | None = 60
+        # Spot-check: one log per session for cooldown bar (set vs check)
+        self._cooldown_set_bar_logged: bool = False
+        self._cooldown_check_bar_logged: bool = False
+        # P3.5: Lightweight assertion logs (once per session, no exceptions in prod)
+        self._assert_canonical_qty_logged: bool = False
+        self._assert_min_notional_logged: bool = False
+
+        # P4.1: Metrics counters (read-only exposure for audits)
+        self._metrics_buys_attempted: int = 0
+        self._metrics_buys_executed: int = 0
+        self._metrics_cooldown_blocks: int = 0
+        self._metrics_quality_filter_blocks: int = 0
+        self._metrics_reconciliation_adjustments: int = 0
+
+        # Exchange constraints per symbol - will be updated dynamically on startup
+        # LOW #3 FIX: Hardcoded constraints now with dynamic fetching on initialization
+        self._symbol_constraints: dict[str, dict] = self._get_default_symbol_constraints()
+
+        # Item 8: Exit-in-progress state (one sell per symbol at a time)
+        self._exit_in_progress: set[str] = set()
+        self._sell_cost_stats_cache: dict[str, dict[str, Any]] = {}
+        self._sell_cost_stats_cache_ttl_sec: float = 20.0
+
+        # Unified execution adapter (paper or live) — fails closed if the
+        # operator did not configure MYSTIC_TRADING_MODE. We resolve lazily
+        # because some tests construct the engine without environment.
+        self._execution_adapter: Any | None = None
+
+        logger.info("PortfolioEngine initialized with principal=$%.2f", self.principal)
+
+    def get_execution_adapter(self) -> Any:
+        """
+        Return the singleton ExecutionAdapter bound to the configured
+        MYSTIC_TRADING_MODE. Used for unified, mode-agnostic operations
+        (current price reads, balance reads, dust reconciliation). The
+        massive legacy buy/sell pipeline keeps its existing wiring; this
+        is the shared entry point for new code that wants one interface.
+        """
+        if self._execution_adapter is None:
+            from backend.services.execution_adapter import (
+                get_execution_adapter as _ga,
+            )
+
+            self._execution_adapter = _ga()
+        return self._execution_adapter
+
+    def set_bar_interval_seconds(self, seconds: int) -> None:
+        """Set canonical bar interval from integration. Required for correct 'N bars' cooldown semantics."""
+        if seconds <= 0:
+            raise ValueError("bar_interval_seconds must be positive")
+        self._bar_interval_seconds = seconds
+        logger.info("BAR_INTERVAL: engine bar_interval_seconds=%d (from integration)", seconds)
+
+    # =========================================================================
+    # PHASE 1: CANONICAL SOURCE ADOPTION (positions + portfolios tables)
+    # =========================================================================
+
+    def _get_default_symbol_constraints(self) -> dict[str, dict]:
+        """Per-symbol order constraints for the DAY top-4 Binance.US universe."""
+        return {
+            "BTCUSDT": {"qty_step": 0.00001, "min_notional": 11.0},
+            "ETHUSDT": {"qty_step": 0.0001, "min_notional": 11.0},
+            "SOLUSDT": {"qty_step": 0.01, "min_notional": 11.0},
+            "XRPUSDT": {"qty_step": 0.1, "min_notional": 11.0},
+        }
+
+    async def initialize_from_canonical_sources(self) -> None:
+        """
+        Initialize portfolio engine - tries SQLite first, then falls back to Redis.
+
+        PRIORITY:
+        1. Load from SQLite (persisted authoritative ledger) - DETERMINISTIC
+        2. Fall back to adopting from PaperTradingService if no SQLite data (only in production mode)
+
+        TEST MODE: In test_mode, does NOT adopt from PaperTradingService to ensure test isolation.
+        Tests should use initialize_from_db() or set values directly for fresh state.
+
+        After initialization, ledger is persisted to SQLite for restart survival.
+        """
+        logger.info("=" * 60)
+        logger.info("PORTFOLIO ENGINE STARTUP")
+        logger.info("=" * 60)
+
+        # Ensure DB schema exists
+        self._ensure_db_schema()
+
+        # STEP 1: Try to load from SQLite (deterministic restart)
+        ledger_loaded = await self._load_ledger_from_sqlite()
+        await self._load_positions_from_sqlite()
+        self._load_constraints_from_sqlite()
+
+        if ledger_loaded:  # SQLite ledger exists (positions may be 0 after selling all)
+            # Successfully restored from SQLite
+            logger.info("STARTUP: Restored from SQLite (deterministic)")
+
+            # =================================================================
+            # CRITICAL: Initialize live trading service for LIVE_EXECUTION
+            # Must happen BEFORE any trading, regardless of startup path
+            # =================================================================
+            if self._live_execution_enabled and not self._live_service:
+                try:
+                    from backend.services.live_trading_service import LiveTradingService
+
+                    self._live_service = LiveTradingService()
+                    if self._live_service.binance_api_key and self._live_service.binance_secret:
+                        logger.warning("LIVE_SERVICE: API keys configured - REAL MONEY ACTIVE")
+                        # Cash/principal set by ongoing live reconcile loop (24/7), not here
+                    else:
+                        logger.error("LIVE_SERVICE: Missing API keys - LIVE DISABLED")
+                        self._live_execution_enabled = False
+                        self._live_service = None
+                except Exception as e:
+                    logger.exception(f"LIVE_SERVICE: Init failed: {e}")
+                    self._live_execution_enabled = False
+                    self._live_service = None
+
+            # LIVE_BOOTSTRAP_RECONCILE: Binance is canonical. Align DB to exchange before invariants.
+            if self._live_execution_enabled and self._live_service:
+                await self._live_bootstrap_reconcile()
+
+            # CRITICAL: Sync with PaperTradingService to remove stale/dead positions
+            await self._sync_positions_with_paper_service()
+
+            # CRITICAL: Recalculate positions_value and unrealized_pnl from loaded positions
+            await self._recompute_positions_values()
+
+            # Compute derived values
+            self._compute_total_open_risk()
+
+            # PHASE 6: Check for corruption and recover if needed
+            is_corrupted, corruption_details = await self._detect_corruption()
+            if is_corrupted:
+                logger.critical(f"STARTUP_CORRUPTION_DETECTED: {corruption_details}")
+                recovery_success = await self._rebuild_from_trade_ledger()
+                if recovery_success:
+                    logger.critical("STARTUP_RECOVERY: State rebuilt successfully from trade ledger")
+                    # Recompute after recovery
+                    await self._recompute_positions_values()
+                    self._compute_total_open_risk()
+                else:
+                    logger.critical("STARTUP_RECOVERY: FAILED - manual intervention required")
+                    self._trading_paused = True
+                    self._pause_reason = f"RECOVERY_FAILED: {corruption_details}"
+
+            # Validate invariants immediately
+            invariants_ok = await self._validate_invariants("startup_from_sqlite")
+
+            if invariants_ok:
+                logger.info("STARTUP: Invariants PASS - ledger valid")
+            else:
+                logger.error("STARTUP: Invariants FAIL - ledger may be corrupt")
+                # Don't auto-fix here, let the admin investigate
+        # No SQLite data - start fresh or adopt from PaperTradingService
+        elif self.test_mode:
+            # TEST MODE: Start fresh with principal from __init__ (no PaperTradingService adoption)
+            # This ensures test isolation and prevents contamination from singleton services
+            logger.info("STARTUP: Test mode - starting fresh with principal from __init__")
+            self.cash_balance = self.principal
+            self._positions_value = 0.0
+            self._cost_basis = 0.0
+            self._realized_pnl = 0.0
+            self._unrealized_pnl = 0.0
+            self._total_equity = self.principal
+            self._available_balance = self.principal
+            self.open_positions.clear()
+            self._compute_total_open_risk()
+
+            # Persist initial state to SQLite for restart tests
+            await self._persist_ledger_to_sqlite()
+            logger.info("STARTUP: Persisted fresh test state to SQLite")
+        else:
+            # PRODUCTION MODE: Adopt from PaperTradingService (first run or reset)
+            logger.info("STARTUP: No SQLite ledger found - adopting from PaperTradingService")
+
+            # Initialize live service first if needed
+            if self._live_execution_enabled and not self._live_service:
+                try:
+                    from backend.services.live_trading_service import LiveTradingService
+
+                    self._live_service = LiveTradingService()
+                    if self._live_service.binance_api_key and self._live_service.binance_secret:
+                        logger.warning("LIVE_SERVICE: API keys configured - REAL MONEY ACTIVE")
+                except Exception as e:
+                    logger.exception(f"LIVE_SERVICE: Init failed: {e}")
+
+            await self.adopt_from_portfolios_table()
+            await self.adopt_from_positions_table()
+            self._compute_total_open_risk()
+
+            # LIVE: Do not set cash from paper. Ongoing live reconcile loop sets cash/principal from Binance.
+            if self._live_execution_enabled:
+                self.cash_balance = 0.0
+                self._available_balance = 0.0
+
+            # Persist the newly adopted state to SQLite
+            await self._persist_ledger_to_sqlite()
+            for pos in self.open_positions.values():
+                await self._persist_position_to_sqlite(pos)
+
+            logger.info("STARTUP: Persisted initial state to SQLite")
+
+        # AUTO-FIX: Clear pause flags if ledger is healthy and no corruption
+        # This prevents stale pause states from blocking trading after restart
+        if self._account_status == AccountStatus.HEALTHY and not self._trading_paused:
+            try:
+                # MEDIUM #5 FIX: Wrap in transaction for atomicity
+                def _clear_pause_flags():
+                    def _op() -> int:
+                        with connect_rw(self.db_path) as conn:
+                            conn.execute("BEGIN IMMEDIATE")
+                            cursor = conn.cursor()
+                            cursor.execute("UPDATE coin_performance SET pause_until = NULL WHERE pause_until IS NOT NULL")
+                            cleared = cursor.rowcount
+                            conn.commit()
+                            return cleared
+
+                    return run_locked_retry(_op)
+
+                cleared_coins = await asyncio.to_thread(_clear_pause_flags)
+                if cleared_coins > 0:
+                    logger.info(f"AUTO_FIX: Cleared pause_until for {cleared_coins} coins on healthy startup")
+            except Exception as e:
+                logger.warning(f"AUTO_FIX: Could not clear pause flags: {e}")
+
+        # Log startup summary
+        adopted_symbols = list(self.open_positions.keys())
+        logger.info("=" * 60)
+        logger.info("STARTUP COMPLETE:")
+        logger.info(f"  account_status: {self._account_status.value}")
+        logger.info(f"  trading_paused: {self._trading_paused}")
+        logger.info(f"  cash_balance: ${self.cash_balance:.2f}")
+        logger.info(f"  positions_value: ${self._positions_value:.2f}")
+        logger.info(f"  total_equity: ${self._total_equity:.2f}")
+        logger.info(f"  positions_count: {len(self.open_positions)}")
+        logger.info(f"  symbols: {adopted_symbols}")
+        logger.info(f"  total_open_risk: ${self._total_open_risk:.2f}")
+        logger.info(f"  db_path: {os.path.abspath(self.db_path)}")
+        logger.info("=" * 60)
+
+        # CANONICAL FIX: Sync ledger with paper_trades to ensure realized_pnl is authoritative
+        await self._synchronize_realized_pnl_from_paper_trades()
+
+        # Final invariant check
+        await self._validate_invariants("initialize_from_canonical_sources")
+
+    async def _sync_principal_from_binance(self) -> bool:
+        """
+        Sync principal and cash from actual Binance US USDT balance.
+
+        LIVE ONLY: In live mode, Binance is the single source of truth for balances.
+        Paper balance is never used for live trading.
+
+        Returns True if cash/principal were updated from Binance; False if sync failed
+        or no live service. Caller must not use paper/env balance when live and False.
+        """
+        if not self._live_service:
+            logger.warning("PRINCIPAL_SYNC: No live service - cannot sync from Binance")
+            return False
+
+        try:
+            # Fetch actual balance from Binance US
+            balance_result = await self._live_service.get_balance("binanceus")
+
+            if balance_result.get("status") != "success":
+                logger.error(f"PRINCIPAL_SYNC: Failed to fetch Binance balance: {balance_result}")
+                return False
+
+            # Use FREE USDT for available/cash so governor and sizing match Binance "available to trade"
+            balance_data = balance_result.get("balance", {}) or {}
+            total_balances = balance_data.get("total", {}) or {}
+            free_balances = balance_data.get("free", {}) or {}
+            usdt_free = float(free_balances.get("USDT", 0) or 0)
+            usdt_balance = usdt_free  # Use free for cash/available; principal uses free + positions below
+
+            if usdt_balance <= 0:
+                # If no USDT, calculate from positions + any USDT
+                # Get total portfolio value
+                total_value = usdt_balance
+                for asset, amount in total_balances.items():
+                    if asset != "USDT" and float(amount or 0) > 0:
+                        # We have non-USDT assets, so account has value
+                        # Use current positions_value + cash as principal estimate
+                        total_value += self._positions_value
+                        break
+
+                if total_value <= 0:
+                    logger.warning("PRINCIPAL_SYNC: Binance USDT balance is 0 - keeping current principal")
+                    # Still treat as successful sync (we got a number from exchange)
+                    usdt_balance = 0.0
+
+            old_principal = self.principal
+            old_cash = self.cash_balance
+
+            # Calculate total account value: FREE USDT + positions value (available to trade)
+            new_principal = usdt_balance + self._positions_value
+
+            # CRITICAL: Use FREE USDT so free_usdt in governor matches Binance US "free" balance
+            self.cash_balance = usdt_balance
+            self._available_balance = usdt_balance
+
+            # Log cash balance update (always)
+            if abs(self.cash_balance - old_cash) > 0.01:
+                logger.info(f"CASH_BALANCE_SYNC: Updated from ${old_cash:.2f} → ${self.cash_balance:.2f}")
+
+            # Only update principal if significantly different (avoid micro-adjustments)
+            if abs(new_principal - old_principal) > 1.0:
+                logger.warning(
+                    f"PRINCIPAL_SYNC: Updated principal from Binance US old=${old_principal:.2f} → new=${new_principal:.2f} (USDT=${usdt_balance:.2f} + positions=${self._positions_value:.2f})"
+                )
+
+            # Recompute total_equity = cash + positions_value (do not leave stale)
+            await self._recompute_positions_values()
+            await self._persist_ledger_to_sqlite()
+
+            # Recheck account status after principal update
+            if self._total_equity <= self.principal * 1.01:  # Allow 1% buffer
+                if self._account_status == AccountStatus.OVERALLOCATED:
+                    self._account_status = AccountStatus.HEALTHY
+                    logger.info("PRINCIPAL_SYNC: Account status changed to HEALTHY after principal update")
+            else:
+                logger.info(f"PRINCIPAL_SYNC: Principal unchanged (Binance=${new_principal:.2f}, current=${old_principal:.2f})")
+
+            return True
+
+        except Exception as e:
+            logger.exception(f"PRINCIPAL_SYNC: Error syncing from Binance: {e}")
+            return False
+
+    async def _live_bootstrap_reconcile(self) -> None:
+        """
+        LIVE_BOOTSTRAP_RECONCILE: Binance is canonical. Run once at startup after loading DB.
+        Aligns engine + SQLite to exchange balances so no stale rows block buys and no qty mismatch pauses.
+        Validation: base_asset derived from API symbol (e.g. SOLUSDT -> SOL); snapshot from
+        LiveTradingService.get_balance("binanceus") exactly once; qty snapping uses LOT_SIZE.stepSize
+        (qty_step from exchange_symbol_constraints); DB rows updated via _persist_position_to_sqlite
+        or removed via _remove_dust_position_canonical_cleanup.
+        """
+        if not self._live_service:
+            return
+        try:
+            # One balance fetch per run (Binance canonical)
+            balance_result = await self._live_service.get_balance("binanceus")
+            logger.info("LIVE_BOOTSTRAP_RECONCILE: balance_fetch binanceus (one per run)")
+            if balance_result.get("status") != "success":
+                logger.warning("LIVE_BOOTSTRAP_RECONCILE: Could not fetch Binance balance, skipping")
+                return
+            balance_data = balance_result.get("balance", {}) or {}
+            total_balances = balance_data.get("total", {}) or {}
+            free_balances = balance_data.get("free", {}) or {}
+            await self._import_missing_exchange_positions(total_balances, free_balances)
+            qty_epsilon = 1e-10
+            positions_snapshot = list(self.open_positions.items())
+            cleared_pause_for_mismatch = False
+            for symbol, position in positions_snapshot:
+                api_sym = _to_api_symbol(symbol)
+                base_asset = api_sym[:-4] if api_sym.endswith("USDT") else api_sym  # SOLUSDT -> SOL
+                exchange_qty = float(total_balances.get(base_asset, 0) or 0)
+                db_qty = position.quantity
+                await self._ensure_symbol_constraints(symbol)
+                constraints = self._symbol_constraints.get(symbol) or {}
+                qty_step = float(constraints.get("qty_step") or 0)  # LOT_SIZE.stepSize
+                # Rule 1: Exchange 0 (or below epsilon) -> position vanished.
+                # DUST_PENDING -> dust writeoff (existing path).
+                # ACTIVE -> HUMAN_MANUAL_SELL (human closed on Binance.US);
+                # try to recover the actual fill, otherwise persist
+                # realized_profit_unknown=1. Cooldown is applied either way.
+                if exchange_qty <= qty_epsilon:
+                    logger.info("REMOVED:%s ex_qty=0 status=%s", symbol, getattr(position, "status", "ACTIVE"))
+                    await self._handle_vanished_exchange_position(symbol, position, source="bootstrap_reconcile")
+                    cleared_pause_for_mismatch = True
+                    continue
+                # Rule 2 & 3: Exchange > 0
+                snapped = self._floor_to_step(exchange_qty, qty_step) if qty_step > 0 else exchange_qty
+                # Rule 3: Dust -> DUST_PENDING (never pause for dust)
+                # BUG #12 FIX: Ensure pause logic does not apply to DUST_PENDING
+                # DUST_PENDING is excluded from all pause checks by design
+                price = getattr(position, "entry_price", 0) or 0
+                is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped, price)
+                if is_dust:
+                    position.quantity = snapped
+                    position.status = "DUST_PENDING"
+                    position.dust_qty_canonical = snapped
+                    position.dust_detected_at = time.time()
+                    await self._persist_position_to_sqlite(position)
+                    logger.info("DUST_PENDING:%s ex_qty=%.12g reason=%s", symbol, exchange_qty, dust_reason or "below min")
+                    # Coordinate: Skip pause logic for dust (continue without pause)
+                    continue
+                # Rule 2: DB differs -> set DB = exchange snapped, ACTIVE
+                if abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
+                    position.quantity = snapped
+                    position.status = "ACTIVE"
+                    position.dust_detected_at = 0.0
+                    position.dust_qty_canonical = 0.0
+                    await self._persist_position_to_sqlite(position)
+                    logger.info("UPDATED:%s db_qty=%.12g ex_qty=%.12g snapped=%.12g", symbol, db_qty, exchange_qty, snapped)
+                    cleared_pause_for_mismatch = True
+            if cleared_pause_for_mismatch and self._trading_paused and ("QUANTITY_MISMATCH" in (self._pause_reason or "") or "canonical" in (self._pause_reason or "").lower()):
+                self._trading_paused = False
+                self._pause_reason = ""
+                logger.info("LIVE_BOOTSTRAP_RECONCILE: Cleared trading_paused (was quantity/canonical mismatch)")
+            await self._recompute_positions_values()
+            # Set cash/available from FREE USDT so governor free_usdt matches Binance at startup
+            usdt_free = float(free_balances.get("USDT", 0) or 0)
+            self.cash_balance = usdt_free
+            self._available_balance = max(0.0, usdt_free)
+            # Recompute equity with fresh Binance cash (canonical: equity = cash + positions)
+            self._total_equity = self.cash_balance + self._positions_value
+            self.principal = self._total_equity
+            await self._persist_ledger_to_sqlite()
+            self._compute_total_open_risk()
+            self._last_live_reconcile_time = time.time()
+            self._last_live_reconcile_actions = "bootstrap"
+            self._write_reconcile_state_file("bootstrap")
+        except Exception as e:
+            logger.exception("LIVE_BOOTSTRAP_RECONCILE: %s", e)
+
+    async def _import_missing_exchange_positions(
+        self,
+        total_balances: dict[str, float],
+        free_balances: dict[str, float] | None = None,
+    ) -> None:
+        """
+        Import exchange balances that are not yet in engine positions.
+        For each non-USDT asset where free > dust: if symbol not in open_positions,
+        create position with qty and entry_price from market. Recompute positions_value
+        and total_equity after import. Never adjust realized_pnl (do not treat as loss).
+        """
+        if not self._live_execution_enabled or not self._live_service:
+            return
+        free = free_balances if free_balances is not None else total_balances
+        qty_epsilon = 1e-10
+        imported_any = False
+        for asset, total_qty in total_balances.items():
+            if asset == "USDT" or (float(total_qty or 0) <= qty_epsilon):
+                continue
+            symbol = normalize_symbol(f"{asset}/USDT")
+            if not self._symbol_in_fixed_universe(symbol):
+                continue
+            if symbol in self.open_positions:
+                continue
+            free_qty = float(free.get(asset, 0) or 0)
+            if free_qty <= qty_epsilon:
+                continue
+            try:
+                await self._ensure_symbol_constraints(symbol)
+                constraints = self._symbol_constraints.get(symbol) or {}
+                min_notional = float(constraints.get("min_notional") or MIN_POSITION_NOTIONAL)
+                price_resp = await self._live_service.get_market_price(symbol)
+                if not price_resp or not isinstance(price_resp.get("price"), (int, float)):
+                    logger.debug("LIVE_RECONCILE_IMPORT_SKIP: %s no price", symbol)
+                    continue
+                price = float(price_resp["price"])
+                if price <= 0:
+                    continue
+                notional = free_qty * price
+                if notional < min_notional:
+                    logger.debug(
+                        "LIVE_RECONCILE_IMPORT_SKIP: %s notional=%.2f < min=%.2f",
+                        symbol,
+                        notional,
+                        min_notional,
+                    )
+                    continue
+                qty_step = float(constraints.get("qty_step") or DEFAULT_QTY_STEP)
+                snapped = self._floor_to_step(free_qty, qty_step) if qty_step > 0 else free_qty
+                if snapped <= 0:
+                    continue
+                position = OpenPosition(
+                    symbol=symbol,
+                    quantity=snapped,
+                    entry_price=price,
+                    entry_time=time.time(),
+                    trade_id=f"reconcile_import_{symbol.replace('/', '_')}_{int(time.time())}",
+                    stop_price=price * 0.97,
+                    take_profit_1_price=price * 1.02,
+                    take_profit_2_price=price * 1.05,
+                    trailing_stop_price=price * 0.95,
+                    tp1_hit=False,
+                    highest_price=price,
+                    atr_at_entry=price * 0.015,
+                    entry_bar_timestamp=int(time.time()),
+                    confidence_at_entry=0.5,
+                )
+                self.open_positions[symbol] = position
+                await self._persist_position_to_sqlite(position)
+                imported_any = True
+                logger.info(
+                    "LIVE_RECONCILE_ASSET_IMPORTED symbol=%s qty=%s entry_price=%s notional=%.2f",
+                    symbol,
+                    snapped,
+                    price,
+                    snapped * price,
+                )
+            except Exception as e:
+                logger.warning("LIVE_RECONCILE_IMPORT_ERROR: %s %s", symbol, e)
+        if imported_any:
+            await self._recompute_positions_values()
+            await self._persist_ledger_to_sqlite()
+
+    async def run_live_reconcile(
+        self,
+        total_balances: dict[str, float],
+        free_balances: dict[str, float] | None = None,
+    ) -> None:
+        """
+        Periodic live reconcile: import missing exchange positions, then align
+        all open_positions to Binance snapshot. One balance fetch per run (caller passes snapshot).
+        """
+        if not self._live_execution_enabled:
+            return
+        await self._import_missing_exchange_positions(total_balances, free_balances)
+        if not self.open_positions:
+            self._last_live_reconcile_time = time.time()
+            self._last_live_reconcile_actions = "periodic"
+            self._write_reconcile_state_file("periodic")
+            return
+        qty_epsilon = 1e-10
+        positions_snapshot = list(self.open_positions.items())
+        for symbol, position in positions_snapshot:
+            api_sym = _to_api_symbol(symbol)
+            base_asset = api_sym[:-4] if api_sym.endswith("USDT") else api_sym  # SOLUSDT -> SOL
+            exchange_qty = float(total_balances.get(base_asset, 0) or 0)
+            db_qty = position.quantity
+            await self._ensure_symbol_constraints(symbol)
+            constraints = self._symbol_constraints.get(symbol) or {}
+            qty_step = float(constraints.get("qty_step") or 0)  # LOT_SIZE.stepSize
+            if exchange_qty <= qty_epsilon:
+                await self._handle_vanished_exchange_position(symbol, position, source="periodic_reconcile")
+                self._metrics_reconciliation_adjustments += 1
+                logger.info("REMOVED:%s ex_qty=0 status=%s", symbol, getattr(position, "status", "ACTIVE"))
+                continue
+            snapped = self._floor_to_step(exchange_qty, qty_step) if qty_step > 0 else exchange_qty
+            price = getattr(position, "entry_price", 0) or 0
+            is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped, price)
+            if is_dust:
+                position.quantity = snapped
+                position.status = "DUST_PENDING"
+                position.dust_qty_canonical = snapped
+                position.dust_detected_at = time.time()
+                await self._persist_position_to_sqlite(position)
+                self._metrics_reconciliation_adjustments += 1
+                logger.info("DUST_PENDING:%s ex_qty=%.12g reason=%s", symbol, exchange_qty, dust_reason or "below min")
+                continue
+            if abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
+                position.quantity = snapped
+                position.status = "ACTIVE"
+                position.dust_detected_at = 0.0
+                position.dust_qty_canonical = 0.0
+                await self._persist_position_to_sqlite(position)
+                self._metrics_reconciliation_adjustments += 1
+                logger.info("UPDATED:%s db_qty=%.12g ex_qty=%.12g snapped=%.12g", symbol, db_qty, exchange_qty, snapped)
+        await self._recompute_positions_values()
+        self._compute_total_open_risk()
+        self._last_live_reconcile_time = time.time()
+        self._last_live_reconcile_actions = "periodic"
+        self._write_reconcile_state_file("periodic")
+
+    def _cash_sync_skip_log(self, reason: str, **kwargs: object) -> None:
+        """Rate-limited INFO log when cash sync skips (visibility without spam)."""
+        now = time.time()
+        last = self._cash_sync_skip_last_log.get(reason, 0.0)
+        if now - last >= self._cash_sync_skip_interval:
+            self._cash_sync_skip_last_log[reason] = now
+            parts = " ".join(f"{k}={v}" for k, v in kwargs.items())
+            logger.info("CASH_SYNC_SKIP reason=%s %s", reason, parts)
+
+    async def sync_cash_from_exchange(self, exchange_usdt: float, source: str) -> bool:
+        """
+        Runtime auto cash sync: correct local cash_balance when it drifts from exchange.
+        Uses FREE USDT (available to trade). Persists to ledger so BINANCE_SYNC stops warning.
+        Returns True if cash was updated, False otherwise.
+        """
+        enabled = os.getenv("CASH_DRIFT_SYNC_ENABLED", "true").lower() == "true"
+        if not enabled:
+            self._cash_sync_skip_log("DISABLED")
+            return False
+        threshold = float(os.getenv("CASH_DRIFT_THRESHOLD_USD", "1.00"))
+        require_no_orders = os.getenv("CASH_SYNC_REQUIRE_NO_OPEN_ORDERS", "true").lower() == "true"
+
+        local_before = self.cash_balance
+        drift = abs(float(exchange_usdt) - local_before)
+        if drift < threshold:
+            self._cash_sync_skip_log("DRIFT_BELOW_THRESHOLD", drift=f"{drift:.2f}", threshold=f"{threshold:.2f}")
+            return False
+
+        open_orders_count = 0
+        if require_no_orders and self._live_service:
+            try:
+                result = await self._live_service.get_open_orders()
+                if result.get("status") == "success":
+                    orders_by_exchange = result.get("orders", {}) or {}
+                    open_orders_count = sum(len(v) for v in orders_by_exchange.values() if isinstance(v, list))
+                if open_orders_count > 0:
+                    self._cash_sync_skip_log("OPEN_ORDERS_PRESENT", open_orders=open_orders_count)
+                    return False
+            except Exception as e:
+                now = time.time()
+                last = self._cash_sync_skip_last_log.get("OPEN_ORDERS_CHECK_FAILED", 0.0)
+                if now - last >= self._cash_sync_skip_interval:
+                    self._cash_sync_skip_last_log["OPEN_ORDERS_CHECK_FAILED"] = now
+                    logger.warning("CASH_SYNC_SKIP reason=OPEN_ORDERS_CHECK_FAILED err=%s", e)
+                return False
+
+        self.cash_balance = float(exchange_usdt)
+        self._available_balance = max(0.0, self.cash_balance)
+        # Canonical: total_equity = cash + positions_value (market). Do not modify realized_pnl.
+        await self._recompute_positions_values()
+        # LIVE_RECONCILE: use same fetch for principal (no extra Binance call)
+        if source == "LIVE_RECONCILE":
+            self.principal = self.cash_balance + self._positions_value
+        await self._persist_ledger_to_sqlite()
+        logger.info(
+            "CASH_DRIFT_AUTOSYNC: source=%s exchange_usdt=%.2f local_before=%.2f local_after=%.2f drift=%.2f threshold=%.2f open_orders=%d",
+            source,
+            exchange_usdt,
+            local_before,
+            self.cash_balance,
+            drift,
+            threshold,
+            open_orders_count,
+        )
+        return True
+
+    def _write_reconcile_state_file(self, actions: str) -> None:
+        """Write last reconcile time/actions to a file for read-only harness (LIVE_RECONCILE_PROOF). Single known path."""
+        path = os.getenv("MYSTIC_RECONCILE_STATE_FILE", "/tmp/mystic_live_reconcile.json")
+        try:
+            now_utc = datetime.now(timezone.utc).isoformat()
+            payload = {
+                "time_epoch": time.time(),
+                "time_utc": now_utc,
+                "actions": actions,
+            }
+            with open(path, "w") as f:
+                json.dump(payload, f, indent=0)
+            logger.info("LIVE_RECONCILE_STATE_WRITTEN path=%s time=%s actions=%s", path, now_utc, actions)
+        except OSError as e:
+            logger.debug("Could not write reconcile state file %s: %s", path, e)
+
+    def _compute_realized_pnl_from_paper_trades(self) -> float:
+        """
+        CANONICAL SOURCE: Compute realized PnL directly from paper_trades table.
+        This ensures ledger.realized_pnl = SUM(paper_trades.pnl WHERE side='SELL')
+
+        This prevents stale cached values from overwriting actual executed trade outcomes.
+        """
+        try:
+            with connect_rw(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT COALESCE(SUM(pnl), 0.0)
+                    FROM paper_trades
+                    WHERE side='SELL' AND pnl IS NOT NULL
+                      AND COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR')
+                """)
+                result = cursor.fetchone()
+                realized = float(result[0]) if result and result[0] is not None else 0.0
+            logger.info(f"REALIZED_PNL_SYNC: Computed from paper_trades: ${realized:.2f}")
+            return realized
+        except Exception as e:
+            logger.exception(f"REALIZED_PNL_SYNC FAILED: {e}")
+            return 0.0
+
+    async def _synchronize_realized_pnl_from_paper_trades(self) -> None:
+        """
+        CANONICAL SYNC: Ensure portfolio_engine_ledger.realized_pnl matches paper_trades.
+
+        This runs once at initialization to heal any mismatch where ledger was not updated
+        when trades were executed and settled.
+        """
+        try:
+            computed = self._compute_realized_pnl_from_paper_trades()
+            if abs(computed - self._realized_pnl) > 0.01:
+                logger.warning(
+                    f"REALIZED_PNL_HEAL: Correcting ledger from {self._realized_pnl:.2f} to {computed:.2f} (diff={abs(computed - self._realized_pnl):.2f})",
+                )
+                self._realized_pnl = computed
+                self._total_equity = self.cash_balance + self._positions_value
+                await self._persist_ledger_to_sqlite()
+            else:
+                logger.info(f"REALIZED_PNL_SYNC: Ledger and paper_trades agree at ${computed:.2f}")
+        except Exception as e:
+            logger.exception(f"REALIZED_PNL_SYNC FAILED: {e}")
+
+    async def adopt_from_portfolios_table(self) -> None:
+        """
+        Initialize authoritative ledger from canonical sources.
+
+        CRITICAL: Portfolio engine maintains the authoritative cash ledger.
+        We adopt realized_pnl from SQLite, but enforce conservation of money.
+
+        INVARIANT: cash_balance + positions_value + unrealized_pnl == total_equity (±$1)
+        VIOLATION: triggers ACCOUNT_OVERALLOCATED status and auto-deleverage
+        """
+        logger.info("ADOPT_PORTFOLIOS: Initializing authoritative ledger...")
+
+        try:
+            # Get PaperTradingService instance for position sync
+            from backend.services.paper_trading_service import get_paper_trading_service
+
+            paper_service = get_paper_trading_service()
+            self._paper_service = paper_service
+
+            # Initialize live trading service if LIVE_EXECUTION is enabled
+            if self._live_execution_enabled:
+                try:
+                    from backend.services.live_trading_service import LiveTradingService
+
+                    self._live_service = LiveTradingService()
+                    # Check if API keys are configured (auth is lazy - happens on first trade)
+                    if self._live_service.binance_api_key and self._live_service.binance_secret:
+                        logger.warning("LIVE_SERVICE: API keys configured - REAL MONEY WILL BE USED")
+                    else:
+                        logger.error("LIVE_SERVICE: Missing API keys - LIVE EXECUTION DISABLED")
+                        self._live_execution_enabled = False
+                        self._live_service = None
+                except Exception as e:
+                    logger.exception(f"LIVE_SERVICE: Initialization failed: {e}")
+                    self._live_execution_enabled = False
+                    self._live_service = None
+
+            await paper_service._ensure_redis()
+            balance_data = await paper_service.get_account_balance()
+
+            # Principal is fixed starting capital
+            self.principal = float(balance_data.get("principal", paper_service.principal))
+
+            # CANONICAL FIX: Realized P&L from paper_trades (not from PaperTradingService cache)
+            # Paper_trades is the authoritative source for closed trades
+            self._realized_pnl = self._compute_realized_pnl_from_paper_trades()
+
+            # Calculate total equity: principal + realized P&L
+            # (unrealized P&L will be computed from positions)
+            self._total_equity = self.principal + self._realized_pnl
+
+            logger.info(f"ADOPT_PORTFOLIOS: principal=${self.principal:.2f}")
+            logger.info(f"ADOPT_PORTFOLIOS: realized_pnl=${self._realized_pnl:.2f} (from paper_trades)")
+            logger.info(f"ADOPT_PORTFOLIOS: base_equity=${self._total_equity:.2f} (before positions)")
+
+        except Exception as e:
+            logger.exception(f"ADOPT_PORTFOLIOS FAILED: {e}")
+            # Use defaults
+            self._realized_pnl = 0.0
+            self._total_equity = self.principal
+
+    async def adopt_from_positions_table(self) -> None:
+        """
+        Adopt open positions and compute authoritative cash balance.
+
+        CRITICAL: After adopting positions, we compute:
+        - positions_value = sum(entry_price * quantity) for all positions
+        - unrealized_pnl = sum(current_price - entry_price) * quantity
+        - cash_balance = total_equity - positions_value
+
+        If positions_value > total_equity: ACCOUNT_OVERALLOCATED, trigger auto-deleverage
+        """
+        logger.info("ADOPT_POSITIONS: Loading from PaperTradingService.positions...")
+
+        try:
+            # Get PaperTradingService instance
+            from backend.services.paper_trading_service import get_paper_trading_service
+
+            paper_service = get_paper_trading_service()
+
+            await paper_service._ensure_redis()
+            await paper_service._load_positions_from_redis()
+
+            # Clear existing positions
+            self.open_positions.clear()
+            total_cost_basis = 0.0
+            total_unrealized = 0.0
+
+            # Iterate over PaperTradingService.positions dict
+            for symbol, pos in paper_service.positions.items():
+                ccxt_symbol = normalize_symbol(symbol)
+
+                # Skip malformed symbols
+                if "//" in ccxt_symbol or ccxt_symbol.count("/") > 1:
+                    logger.warning(f"Skipping malformed symbol: {symbol} -> {ccxt_symbol}")
+                    continue
+
+                quantity = float(pos.quantity)
+                entry_price = float(pos.average_price)
+                current_price = float(pos.current_price)
+                highest_price = getattr(pos, "highest_price_since_entry", current_price)
+
+                if quantity <= 0:
+                    continue
+
+                # Accumulate cost basis and unrealized P&L
+                cost_basis = entry_price * quantity
+                unrealized = (current_price - entry_price) * quantity
+                total_cost_basis += cost_basis
+                total_unrealized += unrealized
+
+                # Calculate stop/TP levels
+                stop_distance = entry_price * 0.015
+                stop_price = entry_price - stop_distance
+                tp1_price = entry_price + (stop_distance * TP1_R_MULTIPLE)
+                tp2_price = entry_price + (stop_distance * TP2_R_MULTIPLE)
+
+                trade_id = f"adopted_{ccxt_symbol.replace('/', '_')}_{int(time.time())}"
+                entry_time = pos.created_at.timestamp() if hasattr(pos, "created_at") else time.time()
+
+                atr_infer = stop_distance / MAJOR_COIN_ATR_SL_MULT if ccxt_symbol in MAJOR_COINS else stop_distance / ATR_MULTIPLIER
+                position = OpenPosition(
+                    symbol=ccxt_symbol,
+                    quantity=quantity,
+                    entry_price=entry_price,
+                    entry_time=entry_time,
+                    trade_id=trade_id,
+                    stop_price=stop_price,
+                    take_profit_1_price=tp1_price,
+                    take_profit_2_price=tp2_price,
+                    highest_price=highest_price,
+                    atr_at_entry=atr_infer,
+                    entry_bar_timestamp=0,
+                    confidence_at_entry=0.5,
+                )
+
+                self.open_positions[ccxt_symbol] = position
+                logger.info(f"ADOPT_POSITIONS: {ccxt_symbol} qty={quantity:.6f} entry=${entry_price:.4f} cost=${cost_basis:.2f}")
+
+            # Canonical: positions_value = market value (cost_basis + unrealized), cost_basis = sum(entry*qty)
+            self._cost_basis = total_cost_basis
+            self._positions_value = total_cost_basis + total_unrealized  # market value
+            self._unrealized_pnl = total_unrealized
+
+            # total_equity = principal + realized_pnl + unrealized_pnl
+            self._total_equity = self.principal + self._realized_pnl + self._unrealized_pnl
+
+            # Derive cash so that total_equity = cash + positions_value
+            derived_cash = self._total_equity - self._positions_value
+
+            logger.info(f"ADOPT_POSITIONS: positions_count={len(self.open_positions)}")
+            logger.info(f"ADOPT_POSITIONS: positions_value (market)=${self._positions_value:.2f} cost_basis=${self._cost_basis:.2f}")
+            logger.info(f"ADOPT_POSITIONS: unrealized_pnl=${self._unrealized_pnl:.2f}")
+            logger.info(f"ADOPT_POSITIONS: total_equity=${self._total_equity:.2f}")
+            logger.info(f"ADOPT_POSITIONS: derived_cash=${derived_cash:.2f}")
+
+            # Check for overallocation - use same tolerance as invariants check (< 1.0)
+            equity_check = self.cash_balance + self._positions_value
+            equity_diff = abs(self._total_equity - equity_check)
+
+            if derived_cash < -1.0:
+                logger.error(f"ACCOUNT_OVERALLOCATED: positions_value=${self._positions_value:.2f} > equity=${self._total_equity:.2f} by ${-derived_cash:.2f}")
+                self._account_status = AccountStatus.OVERALLOCATED
+                self._trading_paused = True
+                self._pause_reason = f"Overallocated by ${-derived_cash:.2f}"
+                self.cash_balance = 0.0
+                self._available_balance = 0.0
+
+                # Trigger auto-deleverage
+                await self._auto_deleverage_to_restore_invariant()
+            elif equity_diff < 1.0:
+                # Equity check passes - account is healthy
+                self.cash_balance = max(0.0, derived_cash)
+                self._available_balance = self.cash_balance
+                self._account_status = AccountStatus.HEALTHY
+                self._trading_paused = False
+                self._pause_reason = ""
+                logger.info(f"ADOPT_POSITIONS: cash_balance=${self.cash_balance:.2f} (HEALTHY)")
+
+        except Exception as e:
+            logger.exception(f"ADOPT_POSITIONS FAILED: {e}")
+            self.open_positions.clear()
+            self._positions_value = 0.0
+            self._cost_basis = 0.0
+            self.cash_balance = self._total_equity
+            self._available_balance = self.cash_balance
+
+    def _compute_total_open_risk(self) -> None:
+        """Compute total open risk from positions"""
+        self._total_open_risk = sum(pos.risk_usd for pos in self.open_positions.values())
+        logger.info(f"COMPUTE_RISK: Total open risk = ${self._total_open_risk:.2f}")
+
+    async def _auto_deleverage_to_restore_invariant(self) -> None:
+        """
+        Auto-deleverage is DISABLED.
+
+        Mystic's only sell path is real-net-profit-after-costs confirmation
+        in ``_check_exit_conditions``. Even when an accounting invariant
+        (positions_value > equity) is detected, Mystic does NOT force-sell
+        positions. The account is paused for operator review instead.
+        """
+        logger.warning("INVARIANT_VIOLATION_DETECTED: Mystic will NOT force-sell. Trading paused for operator review.")
+        self._account_status = AccountStatus.OVERALLOCATED
+        self._trading_paused = True
+        self._pause_reason = "auto_deleverage_disabled_invariant_violation"
+
+    def _recompute_balances(self) -> None:
+        """Sync fallback: set positions_value to cost basis and total_equity = principal + realized + unrealized.
+        Prefer await _recompute_positions_values() for canonical (total_equity = cash + positions_value).
+        """
+        self._cost_basis = sum(pos.entry_price * pos.quantity for pos in self.open_positions.values())
+        self._positions_value = self._cost_basis  # fallback when no prices
+        self._unrealized_pnl = 0.0
+        self._total_equity = self.principal + self._realized_pnl + self._unrealized_pnl
+        self.cash_balance = self._total_equity - self._positions_value
+        self._available_balance = max(0.0, self.cash_balance)
+
+    async def _sync_positions_with_paper_service(self) -> None:
+        """
+        BIDIRECTIONAL sync positions with PaperTradingService.
+
+        CRITICAL FIX: In LIVE_EXECUTION mode, SQLite is the source of truth.
+        Do NOT remove positions just because they're not in paper trading.
+        """
+        try:
+            # =================================================================
+            # LIVE MODE: SQLite is authoritative - PUSH to Redis so canonical check passes
+            # =================================================================
+            if self._live_execution_enabled:
+                logger.info("SYNC: LIVE_EXECUTION mode - pushing SQLite positions to Redis as canonical source")
+                from backend.services.paper_trading_service import get_paper_trading_service
+
+                paper_service = get_paper_trading_service()
+                await paper_service._ensure_redis()
+
+                # Clear Redis positions and push current SQLite positions
+                paper_service.positions.clear()
+                from datetime import datetime, timezone
+
+                for symbol, pos in self.open_positions.items():
+                    # Create a compatible position object for paper_service
+                    from backend.services.paper_trading_service import PaperPosition
+
+                    now = datetime.now(timezone.utc)
+                    entry_dt = datetime.fromtimestamp(pos.entry_time, tz=timezone.utc) if pos.entry_time else now
+                    paper_pos = PaperPosition(
+                        symbol=symbol,
+                        quantity=pos.quantity,
+                        average_price=pos.entry_price,
+                        current_price=pos.entry_price,  # Will be updated on next tick
+                        unrealized_pnl=0.0,
+                        realized_pnl=0.0,
+                        created_at=entry_dt,
+                        last_updated=now,
+                    )
+                    paper_service.positions[symbol] = paper_pos
+                    logger.info(f"SYNC_TO_REDIS: Pushed {symbol} qty={pos.quantity:.6f}")
+
+                # Persist to Redis (if method exists)
+                try:
+                    await paper_service._save_positions_to_redis()
+                except AttributeError:
+                    logger.debug("paper_service._save_positions_to_redis not available")
+                logger.info(f"SYNC: Pushed {len(self.open_positions)} positions from SQLite to Redis")
+                # AUTO-CLEANUP: When cleared on Binance (0 positions), clear stale quarantines so buys can execute
+                if len(self.open_positions) == 0:
+                    cleared = await self._clear_all_quarantines()
+                    if cleared > 0:
+                        logger.info(f"SYNC: Account cleared - quarantines auto-cleaned ({cleared} keys)")
+                return
+
+            # PAPER MODE: SQLite portfolio_engine_positions is authoritative.
+            # Push engine→Redis; never adopt closed symbols from stale Paper/Redis cache.
+            await self._load_positions_from_sqlite()
+            await self._sync_paper_redis_from_sqlite_authoritative()
+            logger.debug(
+                "SYNC: Paper mode SQLite→Redis authoritative sync complete (%d positions)",
+                len(self.open_positions),
+            )
+
+        except Exception as e:
+            logger.exception(f"SYNC: Failed to sync with PaperTradingService: {e}")
+
+    async def _quarantine_symbol(self, symbol: str, reason: str, ttl_minutes: int = 30) -> None:
+        """
+        PHASE 5 FIX: Quarantine symbol to prevent immediate rebuy after removal/sync.
+        """
+        try:
+            from backend.config.redis_config import SharedRedisState
+
+            redis_client = SharedRedisState.get_async_client()
+            if redis_client:
+                quarantine_key = f"quarantine:{symbol}"
+                quarantine_data = {"reason": reason, "timestamp": time.time(), "ttl_minutes": ttl_minutes}
+                await redis_client.setex(quarantine_key, ttl_minutes * 60, json.dumps(quarantine_data))
+                logger.warning(f"QUARANTINE: {symbol} quarantined for {ttl_minutes} minutes | Reason: {reason}")
+        except Exception as e:
+            logger.warning(f"Failed to quarantine {symbol}: {e}")
+
+    async def _is_symbol_quarantined(self, symbol: str) -> tuple[bool, str]:
+        """
+        PHASE 5 FIX: Check if symbol is quarantined.
+        Returns (is_quarantined, reason)
+        """
+        try:
+            from backend.config.redis_config import SharedRedisState
+
+            redis_client = SharedRedisState.get_async_client()
+            if redis_client:
+                quarantine_key = f"quarantine:{symbol}"
+                quarantine_data_str = await redis_client.get(quarantine_key)
+                if quarantine_data_str:
+                    quarantine_data = json.loads(quarantine_data_str)
+                    return True, quarantine_data.get("reason", "unknown")
+            return False, ""
+        except Exception as e:
+            logger.warning(f"Failed to check quarantine for {symbol}: {e}")
+            return False, ""
+
+    async def _clear_all_quarantines(self) -> int:
+        """
+        AUTO-CLEANUP: Clear all quarantine keys when account is cleared (0 positions).
+        Ensures stale canonical_mismatch quarantines don't block new buys after sync.
+        Returns count of keys removed.
+        """
+        try:
+            from backend.config.redis_config import SharedRedisState
+
+            redis_client = SharedRedisState.get_async_client()
+            if not redis_client:
+                return 0
+            count = 0
+            async for key in redis_client.scan_iter(match="quarantine:*"):
+                await redis_client.delete(key)
+                count += 1
+            if count > 0:
+                logger.info(f"QUARANTINE_CLEANUP: Cleared {count} stale quarantine key(s) (account cleared)")
+            return count
+        except Exception as e:
+            logger.warning(f"Failed to clear quarantines: {e}")
+            return 0
+
+    async def _detect_corruption(self) -> tuple[bool, str]:
+        """
+        PHASE 6: Detect if state corruption exists that requires recovery.
+
+        AUTO-FIX: Automatically fixes common corruption patterns instead of just
+        detecting them. This prevents trading from being blocked.
+
+        Implementation detail:
+        All SQLite work is performed in a background thread when
+        RECOVERY_ASYNC_OFFLOAD is enabled so the event loop stays responsive.
+        """
+        start_ts = time.time()
+
+        async with self._recovery_lock:
+            try:
+                if RECOVERY_ASYNC_OFFLOAD:
+                    is_corrupted, details = await asyncio.to_thread(self._detect_corruption_sync)
+                else:
+                    is_corrupted, details = self._detect_corruption_sync()
+            except Exception as e:  # Defensive: should already be handled in sync helper
+                logger.exception(f"Corruption detection failed (wrapper): {e}")
+                is_corrupted, details = False, f"detection_failed:{e}"
+
+        duration = time.time() - start_ts
+        logger.info(
+            "RECOVERY_METRIC: detect_corruption duration=%.3fs details=%s",
+            duration,
+            details or "none",
+        )
+        # Recompute ledger after any orphan/corruption fixes (sync method can't call async)
+        if is_corrupted or details:
+            try:
+                await self._recompute_positions_values()
+                await self._persist_ledger_to_sqlite()
+            except Exception as e:
+                logger.warning("RECOVERY: post-fix recompute failed: %s", e)
+        return is_corrupted, details
+
+    def _detect_corruption_sync(self) -> tuple[bool, str]:
+        """
+        Synchronous implementation of corruption detection.
+
+        Runs entirely in a worker thread when RECOVERY_ASYNC_OFFLOAD is enabled.
+        """
+        try:
+
+            def _op() -> tuple[bool, str]:
+                corruption_issues: list[str] = []
+                with connect_rw(self.db_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.cursor()
+
+                    cursor.execute("SELECT COUNT(*) FROM paper_trades WHERE side='BUY' AND remaining_position < 0")
+                    negative_remaining = cursor.fetchone()[0]
+                    if negative_remaining > 0:
+                        cursor.execute("DELETE FROM paper_trades WHERE side='BUY' AND remaining_position < 0")
+                        conn.commit()
+                        logger.warning(
+                            "AUTO_FIX: Deleted %d corrupted paper_trades rows with negative remaining_position",
+                            negative_remaining,
+                        )
+
+                    if self.open_positions:
+                        engine_symbols = list(self.open_positions.keys())
+                        placeholders = ",".join("?" * len(engine_symbols))
+                        cursor.execute(
+                            f"""
+                            SELECT DISTINCT symbol
+                            FROM paper_trades
+                            WHERE symbol IN ({placeholders})
+                              AND side='BUY'
+                              AND remaining_position > 0
+                            """,
+                            engine_symbols,
+                        )
+                        paper_symbols = [row[0] for row in cursor.fetchall()]
+                        orphaned = set(engine_symbols) - set(paper_symbols)
+                        if orphaned:
+                            canonical_rows = {}
+                            try:
+                                orphan_placeholders = ",".join("?" * len(orphaned)) if orphaned else ""
+                                if orphan_placeholders:
+                                    for row in cursor.execute(
+                                        f"SELECT symbol FROM portfolio_engine_positions WHERE symbol IN ({orphan_placeholders})",
+                                        list(orphaned),
+                                    ):
+                                        canonical_rows[str(row[0])] = True
+                            except Exception:
+                                canonical_rows = {}
+
+                            for orphan_sym in orphaned:
+                                position = self.open_positions.get(orphan_sym)
+                                if position and orphan_sym not in canonical_rows:
+                                    logger.warning(
+                                        "ORPHAN_MEMORY_DROP: %s not in portfolio_engine_positions — drop from memory without ghost paper SELL",
+                                        orphan_sym,
+                                    )
+                                    del self.open_positions[orphan_sym]
+                                    continue
+                                if position and orphan_sym in canonical_rows:
+                                    logger.warning(
+                                        "ORPHAN_RECONCILE_SKIP: %s in portfolio_engine_positions but no paper FIFO lot — no ghost SELL",
+                                        orphan_sym,
+                                    )
+                                    continue
+                                if position:
+                                    del self.open_positions[orphan_sym]
+                            conn.commit()
+                            if orphaned:
+                                logger.warning(
+                                    "AUTO_FIX: Cleared %d orphaned in-memory positions (no ghost paper_trades SELL): %s",
+                                    len(orphaned),
+                                    sorted(orphaned),
+                                )
+
+                    cursor.execute(
+                        """
+                        SELECT symbol,
+                               SUM(CASE WHEN side='BUY' THEN quantity ELSE 0 END) as total_bought,
+                               SUM(CASE WHEN side='BUY' THEN remaining_position ELSE 0 END) as total_remaining
+                        FROM paper_trades
+                        GROUP BY symbol
+                        HAVING total_remaining > total_bought
+                        """,
+                    )
+                    arithmetic_errors = cursor.fetchall()
+                    if arithmetic_errors:
+                        corruption_issues.append(f"fifo_arithmetic_errors:{len(arithmetic_errors)}")
+
+                if corruption_issues:
+                    return True, ",".join(corruption_issues)
+                return False, ""
+
+            return run_locked_retry(_op)
+
+        except Exception as e:
+            logger.exception("Corruption detection failed: %s", e)
+            return False, f"detection_failed:{e}"
+
+    async def _rebuild_from_trade_ledger(self) -> bool:
+        """
+        PHASE 6: One-time recovery - rebuild positions/remaining_qty from authoritative trade ledger.
+
+        Strategy:
+        1. Clear current position state in SQLite tables
+        2. Replay all BUY trades chronologically to rebuild lots
+        3. Replay all SELL trades chronologically with FIFO matching
+        4. Read rebuilt state from SQLite and recreate in-memory positions
+        5. Clear stale Redis caches (locks and signal keys)
+
+        Implementation detail:
+        All SQLite-heavy work is performed in a background thread when
+        RECOVERY_ASYNC_OFFLOAD is enabled so the event loop stays responsive.
+        """
+        logger.critical("STATE_RECOVERY: Starting authoritative trade ledger replay")
+        start_ts = time.time()
+
+        async with self._recovery_lock:
+            try:
+                if RECOVERY_ASYNC_OFFLOAD:
+                    current_positions, metrics = await asyncio.to_thread(self._rebuild_from_trade_ledger_sqlite)
+                else:
+                    current_positions, metrics = self._rebuild_from_trade_ledger_sqlite()
+
+                # STEP 4: Rebuild in-memory positions and persist via canonical helper
+                self.open_positions.clear()
+                rebuilt_count = 0
+
+                for raw_symbol, total_qty, avg_price, earliest_entry in current_positions:
+                    symbol = normalize_symbol(raw_symbol)
+                    position = OpenPosition(
+                        symbol=symbol,
+                        quantity=total_qty,
+                        entry_price=avg_price,
+                        entry_time=earliest_entry,
+                        trade_id=f"recovery_{symbol}_{int(time.time())}",
+                        stop_price=avg_price * 0.97,  # Conservative 3% stop
+                        take_profit_1_price=avg_price * 1.02,
+                        take_profit_2_price=avg_price * 1.05,
+                        highest_price=avg_price,
+                        atr_at_entry=avg_price * 0.015,
+                        entry_bar_timestamp=int(earliest_entry),
+                        confidence_at_entry=0.5,
+                    )
+
+                    self.open_positions[symbol] = position
+                    await self._persist_position_to_sqlite(position)
+                    rebuilt_count += 1
+
+                # STEP 5: Clear stale Redis caches using async client + SCAN
+                redis_scanned, redis_deleted = await self._clear_recovery_redis_caches()
+
+                # Recompute derived values from rebuilt state
+                await self._recompute_positions_values()
+                self._compute_total_open_risk()
+
+                duration = time.time() - start_ts
+                logger.critical(
+                    "STATE_RECOVERY: COMPLETED - rebuilt_positions=%d buy_rows=%d sell_rows=%d duration=%.3fs redis_scanned=%d redis_deleted=%d equity=$%.2f",
+                    rebuilt_count,
+                    metrics.get("buy_trades", 0),
+                    metrics.get("sell_trades", 0),
+                    duration,
+                    redis_scanned,
+                    redis_deleted,
+                    self._total_equity,
+                )
+                return True
+
+            except Exception as e:
+                logger.exception("STATE_RECOVERY: FAILED - %s", e)
+                # Don't fail startup if sync fails - positions will be corrected on next adoption
+                return False
+
+    def _rebuild_from_trade_ledger_sqlite(self) -> tuple[list[tuple[str, float, float, float]], dict[str, int]]:
+        """
+        Synchronous portion of trade-ledger recovery.
+
+        Performs all SQLite work: clears state, replays BUY/SELL trades, and
+        returns the rebuilt current positions. Intended to run in a thread.
+        """
+        metrics: dict[str, int] = {"buy_trades": 0, "sell_trades": 0}
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                # STEP 1: Clear current state in SQLite
+                logger.info("STATE_RECOVERY: Clearing corrupted state (SQLite only)")
+                cursor.execute("DELETE FROM portfolio_engine_positions")
+                cursor.execute("UPDATE paper_trades SET remaining_position = 0")  # Reset all lots
+
+                # STEP 2: Replay BUY trades chronologically
+                cursor.execute(
+                    """
+                    SELECT trade_id, symbol, quantity, price, timestamp, explainability_json
+                    FROM paper_trades
+                    WHERE side = 'BUY' AND status = 'executed'
+                    ORDER BY timestamp ASC
+                    """,
+                )
+                buy_trades = cursor.fetchall()
+                metrics["buy_trades"] = len(buy_trades)
+
+                logger.info("STATE_RECOVERY: Replaying %d BUY trades", len(buy_trades))
+                for trade_id, symbol, quantity, _, _, _ in buy_trades:
+                    # Restore lot with full remaining quantity
+                    cursor.execute(
+                        """
+                        UPDATE paper_trades
+                        SET remaining_position = quantity
+                        WHERE trade_id = ?
+                        """,
+                        (trade_id,),
+                    )
+                    logger.debug("STATE_RECOVERY: Restored BUY lot %s %s qty=%s", trade_id, symbol, quantity)
+
+                # STEP 3: Replay SELL trades chronologically with FIFO matching
+                cursor.execute(
+                    """
+                    SELECT trade_id, symbol, quantity, timestamp
+                    FROM paper_trades
+                    WHERE side = 'SELL' AND status = 'executed'
+                    ORDER BY timestamp ASC
+                    """,
+                )
+                sell_trades = cursor.fetchall()
+                metrics["sell_trades"] = len(sell_trades)
+
+                logger.info("STATE_RECOVERY: Replaying %d SELL trades with FIFO", len(sell_trades))
+                for sell_trade_id, symbol, sell_qty, _ in sell_trades:
+                    # Apply FIFO matching against existing lots
+                    remaining_to_match = sell_qty
+
+                    cursor.execute(
+                        """
+                        SELECT trade_id, remaining_position
+                        FROM paper_trades
+                        WHERE symbol = ? AND side = 'BUY' AND remaining_position > 0
+                        ORDER BY timestamp ASC
+                        """,
+                        (symbol,),
+                    )
+                    buy_lots = cursor.fetchall()
+
+                    for buy_trade_id, buy_remaining in buy_lots:
+                        if remaining_to_match <= 0:
+                            break
+
+                        match_qty = min(remaining_to_match, buy_remaining)
+                        new_remaining = buy_remaining - match_qty
+
+                        cursor.execute(
+                            """
+                            UPDATE paper_trades
+                            SET remaining_position = ?
+                            WHERE trade_id = ?
+                            """,
+                            (new_remaining, buy_trade_id),
+                        )
+
+                        remaining_to_match -= match_qty
+
+                    if remaining_to_match > 0:
+                        logger.error(
+                            "STATE_RECOVERY: Could not fully match SELL %s (unmatched_qty=%s)",
+                            sell_trade_id,
+                            remaining_to_match,
+                        )
+                    else:
+                        logger.debug("STATE_RECOVERY: Matched SELL %s %s qty=%s", sell_trade_id, symbol, sell_qty)
+
+                # STEP 4 (SQLite side): Rebuild current positions from remaining lots
+                cursor.execute(
+                    """
+                    SELECT symbol,
+                           SUM(remaining_position) as total_qty,
+                           AVG(price) as avg_price,
+                           MIN(timestamp) as earliest_entry
+                    FROM paper_trades
+                    WHERE side = 'BUY' AND remaining_position > 0
+                    GROUP BY symbol
+                    HAVING total_qty > 0
+                    """,
+                )
+
+                current_positions = list(cursor.fetchall())
+                logger.info("STATE_RECOVERY: Rebuilt %d current positions in SQLite", len(current_positions))
+
+                conn.commit()
+
+            return current_positions, metrics
+
+        except Exception as e:
+            logger.exception("STATE_RECOVERY: SQLite replay failed: %s", e)
+            raise
+
+    async def _clear_recovery_redis_caches(self) -> tuple[int, int]:
+        """
+        Clear stale Redis keys used by recovery:
+        - exec_lock:*
+        - ai_decision:*
+        - ai_signal:*
+
+        Uses async SCAN and batched deletes to avoid blocking.
+        Returns (keys_scanned, keys_deleted).
+        """
+        keys_scanned = 0
+        keys_deleted = 0
+
+        try:
+            from backend.config.redis_config import get_shared_redis_async
+
+            redis_client = get_shared_redis_async()
+            if not redis_client:
+                return (0, 0)
+
+            scan_patterns = ["exec_lock:*", "ai_decision:*", "ai_signal:*"]
+            scan_batch_size = 300
+            delete_batch_size = 500
+            keys_to_delete: list[str] = []
+
+            for pattern in scan_patterns:
+                async for key in redis_client.scan_iter(match=pattern, count=scan_batch_size):
+                    keys_scanned += 1
+                    keys_to_delete.append(key)
+
+            for i in range(0, len(keys_to_delete), delete_batch_size):
+                batch = keys_to_delete[i : i + delete_batch_size]
+                # aioredis delete supports multiple keys in one round-trip
+                await redis_client.delete(*batch)
+                keys_deleted += len(batch)
+
+            if keys_deleted:
+                logger.info(
+                    "STATE_RECOVERY: Cleared Redis caches (patterns=%s scanned=%d deleted=%d)",
+                    ",".join(scan_patterns),
+                    keys_scanned,
+                    keys_deleted,
+                )
+
+        except Exception as e:
+            logger.warning("STATE_RECOVERY: Redis cache clear failed: %s", e)
+
+        return keys_scanned, keys_deleted
+
+    def _compute_positions_value_and_cost_basis(self, prices: dict[str, float] | None = None) -> tuple[float, float]:
+        """
+        Canonical: positions_value = sum(qty * current_price), cost_basis = sum(entry_price * qty).
+        Returns (positions_value_market, cost_basis). Uses prices dict if provided; else fetches from Redis.
+
+        Also refreshes _position_mark_prices and per-sleeve unrealized / market-notional caches so
+        get_sleeve_summary() matches the same marks as equity (no stale _price_cache TTL).
+        """
+        self._position_mark_prices = {}
+        self._sleeve_unrealized_cache = {Sleeve.CORE.value: 0.0, Sleeve.ACTIVE.value: 0.0}
+        self._sleeve_market_notional_cache = {Sleeve.CORE.value: 0.0, Sleeve.ACTIVE.value: 0.0}
+
+        cost_basis = sum(pos.entry_price * pos.quantity for pos in self.open_positions.values())
+        if not self.open_positions:
+            return (0.0, 0.0)
+
+        positions_value_market = 0.0
+
+        def _accumulate(symbol: str, pos: Any, current_price: float) -> None:
+            nonlocal positions_value_market
+            if current_price <= 0:
+                current_price = pos.entry_price
+            self._position_mark_prices[symbol] = current_price
+            positions_value_market += pos.quantity * current_price
+            slv = getattr(pos, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value
+            if slv not in self._sleeve_unrealized_cache:
+                slv = Sleeve.ACTIVE.value
+            self._sleeve_unrealized_cache[slv] += (current_price - pos.entry_price) * pos.quantity
+            self._sleeve_market_notional_cache[slv] += current_price * pos.quantity
+
+        if prices:
+            for symbol, pos in self.open_positions.items():
+                base = symbol.split("/")[0] if "/" in symbol else symbol.replace("USDT", "")
+                ns = normalize_symbol(symbol)
+                p = prices.get(symbol) or prices.get(ns) or prices.get(base)
+                cp = float(p) if p is not None and float(p) > 0 else pos.entry_price
+                _accumulate(symbol, pos, cp)
+            return (positions_value_market, cost_basis)
+
+        try:
+            from backend.config.redis_config import get_redis_client
+            from backend.utils.symbols import to_exchange_symbol
+
+            redis_client = get_redis_client()
+            if redis_client:
+                for symbol, pos in self.open_positions.items():
+                    base_symbol = to_exchange_symbol(symbol).replace("USDT", "")
+                    cache_key = f"market:{base_symbol}"
+                    current_price = pos.entry_price
+                    try:
+                        price_str = redis_client.get(cache_key)
+                        if price_str:
+                            if isinstance(price_str, str):
+                                price_json = json.loads(price_str)
+                                current_price = float(price_json["price"]) if isinstance(price_json, dict) and "price" in price_json else float(price_str)
+                            else:
+                                current_price = float(price_str)
+                            if current_price <= 0:
+                                current_price = pos.entry_price
+                        _accumulate(symbol, pos, current_price)
+                    except Exception as e:
+                        logger.debug("RECOMPUTE: price for %s: %s", symbol, e)
+                        _accumulate(symbol, pos, pos.entry_price)
+            else:
+                for symbol, pos in self.open_positions.items():
+                    _accumulate(symbol, pos, pos.entry_price)
+        except Exception as e:
+            logger.warning("RECOMPUTE: Redis for prices: %s", e)
+            for symbol, pos in self.open_positions.items():
+                _accumulate(symbol, pos, pos.entry_price)
+        return (positions_value_market, cost_basis)
+
+    async def _fetch_mtm_prices_for_open_positions(self) -> dict[str, float]:
+        """
+        Live marks for open positions — same sources as portfolio integration MTM persist:
+        integration.current_prices, then live_market_data_service ticker per symbol.
+        """
+        prices: dict[str, float] = {}
+        if not self.open_positions:
+            return prices
+
+        try:
+            from backend.services.portfolio_engine_integration import get_portfolio_integration
+
+            integration = get_portfolio_integration()
+            live = getattr(integration, "current_prices", None) or {}
+            for sym, px in live.items():
+                if px is None:
+                    continue
+                try:
+                    fpx = float(px)
+                except (TypeError, ValueError):
+                    continue
+                if fpx <= 0:
+                    continue
+                ns = normalize_symbol(sym)
+                prices[sym] = fpx
+                prices[ns] = fpx
+        except Exception:
+            pass
+
+        missing = [sym for sym in self.open_positions if not (prices.get(sym) or prices.get(normalize_symbol(sym)))]
+        if not missing:
+            return prices
+
+        try:
+            from backend.services.live_market_data import live_market_data_service
+            from backend.utils.symbols import to_exchange_symbol
+
+            for symbol in missing:
+                try:
+                    api_symbol = to_exchange_symbol(symbol)
+                    ticker = await live_market_data_service.get_ticker(api_symbol)
+                    last_px = float((ticker or {}).get("price") or (ticker or {}).get("last") or 0.0)
+                    if last_px <= 0:
+                        ohlcv = await live_market_data_service.get_ohlcv(api_symbol, "1m", limit=1)
+                        if ohlcv and len(ohlcv) > 0 and len(ohlcv[0]) >= 5:
+                            last_px = float(ohlcv[0][4])
+                    if last_px > 0:
+                        ns = normalize_symbol(symbol)
+                        prices[symbol] = last_px
+                        prices[ns] = last_px
+                except Exception as e:
+                    logger.debug("MTM_PRICE_FETCH: %s failed: %s", symbol, e)
+        except ImportError:
+            pass
+
+        return prices
+
+    def _resolve_mtm_prices(self, prices: dict[str, float] | None = None) -> dict[str, float] | None:
+        """Prefer caller/integration live marks over Redis market:* (often unset in paper)."""
+        if prices:
+            return prices
+        try:
+            from backend.services.portfolio_engine_integration import get_portfolio_integration
+
+            integration = get_portfolio_integration()
+            live = getattr(integration, "current_prices", None) or {}
+            if live:
+                return live
+        except Exception:
+            pass
+        return None
+
+    async def _recompute_positions_values(self, prices: dict[str, float] | None = None) -> None:
+        """
+        Canonical equity: positions_value = market value, total_equity = cash_balance + positions_value.
+        Does NOT change cash_balance (cash is from exchange or trade). Does NOT change realized_pnl.
+        """
+        resolved_prices = self._resolve_mtm_prices(prices)
+        if not resolved_prices and self.open_positions:
+            resolved_prices = await self._fetch_mtm_prices_for_open_positions()
+        positions_value_market, cost_basis = await asyncio.to_thread(self._compute_positions_value_and_cost_basis, resolved_prices)
+        self._positions_value = positions_value_market
+        self._cost_basis = cost_basis
+        self._unrealized_pnl = self._positions_value - self._cost_basis
+        self._total_equity = self.cash_balance + self._positions_value
+        self._available_balance = max(0.0, self.cash_balance)
+        self._positions_initialized = True
+
+        # BUG #42: Invalidate cache on position update
+        self._portfolio_cache.invalidate("positions_value")
+        self._portfolio_cache.invalidate("total_equity")
+
+        # Lightweight invariant check (DEBUG log only, no exception in prod)
+        eq_check = self.cash_balance + self._positions_value
+        diff = abs(self._total_equity - eq_check)
+        if diff > 0.01:
+            logger.warning(
+                "EQUITY_INVARIANT: total_equity=%.2f != cash+positions=%.2f (diff=%.4f)",
+                self._total_equity,
+                eq_check,
+                diff,
+            )
+        logger.debug(
+            "RECOMPUTE: cash=%.2f positions_value=%.2f cost_basis=%.2f unrealized_pnl=%.2f total_equity=%.2f",
+            self.cash_balance,
+            self._positions_value,
+            self._cost_basis,
+            self._unrealized_pnl,
+            self._total_equity,
+        )
+        await self._refresh_paper_redis_marks(resolved_prices)
+
+    async def _reconcile_derived_state_from_canonical(self) -> None:
+        """
+        Treat portfolio_engine_ledger as a cache; recompute derived fields from canonical
+        SQLite (trade_performance for realized_pnl, paper_trades fallback; positions from
+        engine + Redis prices). No Binance calls. Idempotent and safe to run frequently.
+        Updates in-memory state and persisted ledger row so status reflects current truth.
+
+        M3: In paper-only mode (not live, not test_mode), engine cash is driven by paper
+        cache (PaperTradingService). Paper cache is the authoritative source for cash.
+        """
+        async with self._reconcile_derived_state_lock:
+            try:
+                # Get paper_run_id for scoping paper_trades fallback (avoids mixing runs)
+                paper_run_id: str | None = None
+                if not self._live_execution_enabled and not self.test_mode:
+                    try:
+                        from backend.services.paper_trading_service import get_paper_trading_service
+
+                        paper = get_paper_trading_service()
+                        paper_run_id = getattr(paper, "paper_run_id", None)
+                    except Exception:
+                        pass
+
+                # ----- Canonical realized_pnl: trade_performance first, then paper_trades -----
+                def _sync_canonical_realized_pnl(run_id: str | None) -> float:
+                    def _op() -> float:
+                        with connect_rw(self.db_path) as conn:
+                            conn.execute("BEGIN IMMEDIATE")
+                            cur = conn.cursor()
+                            cur.execute("SELECT SUM(pnl) FROM trade_performance")
+                            row = cur.fetchone()
+                            total = float(row[0] or 0.0) if row and row[0] is not None else 0.0
+                            cur.execute("SELECT COUNT(*) FROM trade_performance")
+                            cnt = (cur.fetchone() or (0,))[0] or 0
+                            if cnt > 0:
+                                conn.commit()
+                                return total
+                            cur.execute("SELECT SUM(pnl) FROM paper_trades WHERE side='SELL' AND pnl IS NOT NULL AND COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR')")
+                            row = cur.fetchone()
+                            total = float(row[0] or 0.0) if row and row[0] is not None else 0.0
+                            conn.commit()
+                            return total
+
+                    return run_locked_retry(_op)
+
+                loop = asyncio.get_running_loop()
+                canonical_realized = await loop.run_in_executor(None, lambda: _sync_canonical_realized_pnl(paper_run_id))
+
+                # ----- Cash: from paper cache-only when not live (M3: paper is authoritative in paper mode) -----
+                # In paper-only mode, engine cash is driven by paper cache; single source of truth per mode.
+                # Cash: engine's own ledger is authoritative (execute_buy/sell maintain it).
+                # PaperTradingService does NOT track buy/sell cash flows, so reading from
+                # it would overwrite the correct deducted balance with the stale principal.
+                cash = self.cash_balance
+
+                # ----- Positions value from existing engine + Redis (no Binance) -----
+                await self._recompute_positions_values()
+                positions_value = self._positions_value
+                unrealized = self._positions_value - self._cost_basis
+
+                # ----- Primary invariant: total_equity = cash + positions_value -----
+                total_equity = cash + positions_value
+                self._realized_pnl = canonical_realized
+                self.cash_balance = cash
+                self._unrealized_pnl = unrealized
+                self._total_equity = total_equity
+                self._available_balance = max(0.0, cash)
+
+                await self._persist_ledger_to_sqlite()
+                if not self.test_mode and not self._live_execution_enabled:
+                    await self._sync_paper_redis_from_sqlite_authoritative()
+                logger.debug(
+                    "RECONCILE: realized=%.2f cash=%.2f positions=%.2f total_equity=%.2f",
+                    self._realized_pnl,
+                    self.cash_balance,
+                    self._positions_value,
+                    self._total_equity,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                now = time.time()
+                if now - self._reconcile_derived_state_last_error_log >= 60.0:
+                    self._reconcile_derived_state_last_error_log = now
+                    logger.warning("RECONCILE_DERIVED_STATE: %s", e, exc_info=True)
+                return
+
+    def _ensure_db_schema(self) -> None:
+        """Ensure database schema exists for recording trades (not as position source)"""
+        try:
+            # BUG #54 FIX: Use context manager for proper connection cleanup
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                self._ensure_schema(cursor)
+                conn.commit()  # CRITICAL: Commit the DDL statements (CREATE TABLE)
+
+                # MEDIUM #7 FIX: Validate dust_writeoffs table exists
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='dust_writeoffs'")
+                if not cursor.fetchone():
+                    logger.error("MEDIUM #7 CRITICAL: dust_writeoffs table NOT found - dust writeoff persistence at risk!")
+                else:
+                    logger.debug("MEDIUM #7 OK: dust_writeoffs table exists")
+        except Exception as e:
+            logger.warning(f"DB schema check failed: {e}")
+
+    # Legacy alias for backwards compatibility
+    async def initialize_from_db(self) -> None:
+        """
+        ISOLATED INIT: For tests and fresh starts without Redis.
+
+        Only uses SQLite, does not connect to PaperTradingService.
+        Starts with principal as total equity.
+
+        TEST MODE: In test_mode, ensures complete isolation - never adopts from PaperTradingService.
+        """
+        logger.info("=" * 60)
+        logger.info("PORTFOLIO ENGINE - Isolated DB Init (no Redis)")
+        logger.info("=" * 60)
+
+        # Ensure DB schema exists
+        self._ensure_db_schema()
+
+        # Try to load from SQLite first
+        ledger_loaded = await self._load_ledger_from_sqlite()
+        await self._load_positions_from_sqlite()
+        self._load_constraints_from_sqlite()
+
+        if ledger_loaded:
+            logger.info("ISOLATED_INIT: Restored ledger from SQLite")
+            self._compute_total_open_risk()
+        else:
+            # Fresh start - use principal as starting equity
+            # In test_mode, ensure cash_balance matches principal (test isolation)
+            logger.info("ISOLATED_INIT: Fresh start with principal")
+            if self.test_mode:
+                if self.cash_balance == self.principal:
+                    self.cash_balance = self.principal
+                self._available_balance = self.principal
+            elif self._live_execution_enabled:
+                self.cash_balance = 0.0
+                self._available_balance = 0.0
+                self.principal = 0.0
+            else:
+                self.cash_balance = self.principal
+                self._available_balance = self.principal
+
+            self._total_equity = self.principal
+            self._positions_value = 0.0
+            self._cost_basis = 0.0
+            self._realized_pnl = 0.0
+            self._unrealized_pnl = 0.0
+
+            # Persist initial state
+            await self._persist_ledger_to_sqlite()
+
+        logger.info("=" * 60)
+        logger.info(f"ISOLATED_INIT COMPLETE: cash=${self.cash_balance:.2f} equity=${self._total_equity:.2f} principal=${self.principal:.2f}")
+        logger.info("=" * 60)
+
+    async def initialize_from_canonical_sources_full(self) -> None:
+        """Alias for full canonical sources init (production use)"""
+        await self.initialize_from_canonical_sources()
+
+    def _ensure_schema(self, cursor: sqlite3.Cursor) -> None:
+        """Ensure database schema exists with all required tables and columns.
+        paper_trades: database_schema.create_paper_trades_table is authoritative;
+        engine only adds missing engine-specific columns via ALTER.
+        """
+        # Single source of truth: database_schema creates paper_trades with full base schema
+        create_paper_trades_table(self.db_path)
+
+        # Add any missing engine-specific columns to paper_trades
+        cursor.execute("PRAGMA table_info(paper_trades)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        new_columns = [
+            ("remaining_position", "REAL DEFAULT 0"),
+            ("stop_price", "REAL"),
+            ("take_profit_price", "REAL"),
+            ("atr_at_entry", "REAL"),
+            ("entry_bar_timestamp", "INTEGER"),
+            ("exit_type", "TEXT"),
+            ("exit_r_multiple", "REAL"),
+            ("fees_paid", "REAL DEFAULT 0"),
+            ("slippage_cost", "REAL DEFAULT 0"),
+            ("explainability_json", "TEXT"),
+            ("diagnostics_json", "TEXT"),
+            ("strategy_id", "TEXT"),
+        ]
+
+        for col_name, col_type in new_columns:
+            if col_name not in existing_columns:
+                try:
+                    cursor.execute(f"ALTER TABLE paper_trades ADD COLUMN {col_name} {col_type}")
+                    logger.info(f"SCHEMA: Added column {col_name} to paper_trades")
+                except Exception as e:
+                    logger.debug(f"Column {col_name} might already exist: {e}")
+
+        # Ensure portfolio_snapshots table exists (historical)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                cash_balance REAL NOT NULL,
+                principal REAL NOT NULL,
+                positions_value REAL NOT NULL,
+                total_equity REAL NOT NULL,
+                total_open_risk REAL NOT NULL,
+                open_positions_count INTEGER NOT NULL
+            )
+        """)
+
+        # AUTHORITATIVE LEDGER: Portfolio engine state (survives restarts)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_engine_ledger (
+                id INTEGER PRIMARY KEY CHECK (id = 1),  -- Singleton row
+                principal REAL NOT NULL,
+                cash_balance REAL NOT NULL,
+                positions_value REAL NOT NULL,
+                realized_pnl REAL NOT NULL,
+                unrealized_pnl REAL NOT NULL,
+                total_equity REAL NOT NULL,
+                account_status TEXT NOT NULL DEFAULT 'HEALTHY',
+                trading_paused INTEGER NOT NULL DEFAULT 0,
+                pause_reason TEXT,
+                last_updated TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+
+        # POSITION STATE: Per-position tracking (survives restarts)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_engine_positions (
+                symbol TEXT PRIMARY KEY,
+                quantity REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                entry_time REAL NOT NULL,
+                trade_id TEXT NOT NULL,
+                stop_price REAL NOT NULL,
+                take_profit_1_price REAL NOT NULL,
+                take_profit_2_price REAL NOT NULL,
+                trailing_stop_price REAL,
+                tp1_hit INTEGER NOT NULL DEFAULT 0,
+                highest_price REAL NOT NULL,
+                atr_at_entry REAL NOT NULL,
+                entry_bar_timestamp INTEGER NOT NULL DEFAULT 0,
+                confidence_at_entry REAL NOT NULL DEFAULT 0.5,
+                last_updated TEXT NOT NULL
+            )
+        """)
+
+        # Ensure coin_performance table exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS coin_performance (
+                symbol TEXT PRIMARY KEY,
+                trades_24h INTEGER DEFAULT 0,
+                pnl_24h REAL DEFAULT 0,
+                win_count_20 INTEGER DEFAULT 0,
+                loss_count_20 INTEGER DEFAULT 0,
+                total_trades_20 INTEGER DEFAULT 0,
+                avg_win REAL DEFAULT 0,
+                avg_loss REAL DEFAULT 0,
+                expectancy REAL DEFAULT 0,
+                stop_loss_hits_10 INTEGER DEFAULT 0,
+                current_drawdown REAL DEFAULT 0,
+                peak_value REAL DEFAULT 0,
+                pause_until REAL DEFAULT 0,
+                sizing_multiplier REAL DEFAULT 1.0,
+                last_updated REAL
+            )
+        """)
+        # COIN UNIVERSE RULES: per-coin daily metrics columns
+        cursor.execute("PRAGMA table_info(coin_performance)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        for col_name, col_type in [
+            ("profit_factor", "REAL DEFAULT 0"),
+            ("trades_last_30d", "INTEGER DEFAULT 0"),
+            ("avg_pnl", "REAL DEFAULT 0"),
+            ("confidence_to_pnl_correlation", "REAL DEFAULT 0"),
+        ]:
+            if col_name not in existing_cols:
+                try:
+                    cursor.execute(f"ALTER TABLE coin_performance ADD COLUMN {col_name} {col_type}")
+                    logger.info(f"SCHEMA: Added column {col_name} to coin_performance")
+                except Exception as e:
+                    logger.debug(f"Column {col_name} might already exist: {e}")
+
+        # Replace non-finite profit_factor values (historical compute used inf)
+        try:
+            cursor.execute(
+                """
+                UPDATE coin_performance
+                SET profit_factor = NULL
+                WHERE profit_factor IS NOT NULL
+                  AND (profit_factor != profit_factor OR ABS(profit_factor) > 1.0e99)
+                """
+            )
+        except Exception as e:
+            logger.debug("coin_performance profit_factor backfill sanitization skipped: %s", e)
+
+        # portfolio_engine_positions: entry_fee for true-net realized_pnl
+        cursor.execute("PRAGMA table_info(portfolio_engine_positions)")
+        pos_cols = {row[1] for row in cursor.fetchall()}
+        if "entry_fee" not in pos_cols:
+            try:
+                cursor.execute("ALTER TABLE portfolio_engine_positions ADD COLUMN entry_fee REAL DEFAULT 0")
+                logger.info("SCHEMA: Added column entry_fee to portfolio_engine_positions")
+            except Exception as e:
+                logger.debug(f"Column entry_fee might already exist: {e}")
+
+        # Sleeve column on portfolio_engine_positions (Phase-1 Multi-Sleeve)
+        if "sleeve" not in pos_cols:
+            try:
+                cursor.execute("ALTER TABLE portfolio_engine_positions ADD COLUMN sleeve TEXT DEFAULT 'ACTIVE'")
+                logger.info("SCHEMA: Added column sleeve to portfolio_engine_positions")
+            except Exception as e:
+                logger.debug(f"Column sleeve might already exist: {e}")
+
+        cursor.execute("PRAGMA table_info(portfolio_engine_positions)")
+        pos_cols = {row[1] for row in cursor.fetchall()}
+        if "entry_strategy_id" not in pos_cols:
+            try:
+                cursor.execute("ALTER TABLE portfolio_engine_positions ADD COLUMN entry_strategy_id TEXT DEFAULT ''")
+                logger.info("SCHEMA: Added column entry_strategy_id to portfolio_engine_positions")
+            except Exception as e:
+                logger.debug(f"Column entry_strategy_id might already exist: {e}")
+
+        cursor.execute("PRAGMA table_info(portfolio_engine_positions)")
+        pos_cols = {row[1] for row in cursor.fetchall()}
+        for col_name, col_type in [
+            ("repair_add_count", "INTEGER DEFAULT 0"),
+            ("last_repair_add_ts", "REAL DEFAULT 0"),
+            ("repair_add_trade_ids", "TEXT DEFAULT '[]'"),
+            ("average_entry_after_repair", "REAL DEFAULT 0"),
+            ("original_position_cost", "REAL DEFAULT 0"),
+        ]:
+            if col_name not in pos_cols:
+                try:
+                    cursor.execute(f"ALTER TABLE portfolio_engine_positions ADD COLUMN {col_name} {col_type}")
+                    logger.info("SCHEMA: Added column %s to portfolio_engine_positions", col_name)
+                except Exception as e:
+                    logger.debug("Column %s might already exist: %s", col_name, e)
+
+        try:
+            cursor.execute(
+                """
+                UPDATE portfolio_engine_positions
+                SET original_position_cost = quantity * entry_price
+                WHERE quantity > 0
+                  AND (original_position_cost IS NULL OR original_position_cost <= 0)
+                """
+            )
+        except Exception as e:
+            logger.debug("original_position_cost backfill skipped: %s", e)
+
+        # Sleeve column on paper_trades
+        cursor.execute("PRAGMA table_info(paper_trades)")
+        pt_cols = {row[1] for row in cursor.fetchall()}
+        if "sleeve" not in pt_cols:
+            try:
+                cursor.execute("ALTER TABLE paper_trades ADD COLUMN sleeve TEXT DEFAULT 'ACTIVE'")
+                logger.info("SCHEMA: Added column sleeve to paper_trades")
+            except Exception as e:
+                logger.debug(f"Column sleeve might already exist: {e}")
+
+        if "decision_id" not in pt_cols:
+            try:
+                cursor.execute("ALTER TABLE paper_trades ADD COLUMN decision_id TEXT")
+                logger.info("SCHEMA: Added column decision_id to paper_trades")
+            except Exception as e:
+                logger.debug(f"Column decision_id might already exist: {e}")
+
+        # =====================================================================
+        # NEW TABLES FOR ELITE HARDENING (Items 2, 3, 6, 7)
+        # =====================================================================
+
+        # Item 2: Rejects table for health pack
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_engine_rejects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                filter_name TEXT,
+                candidate_score_json TEXT,
+                ledger_snapshot_json TEXT,
+                bar_timestamp INTEGER
+            )
+        """)
+
+        # Item 3: Immutable audit trail (append-only)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_engine_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                action TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                qty REAL NOT NULL,
+                price REAL NOT NULL,
+                fees REAL DEFAULT 0,
+                slippage REAL DEFAULT 0,
+                decision_id TEXT,
+                trade_id TEXT,
+                ranked_candidates_json TEXT,
+                pre_ledger_json TEXT NOT NULL,
+                post_ledger_json TEXT NOT NULL,
+                pre_positions_digest TEXT,
+                post_positions_digest TEXT,
+                invariant_ok INTEGER NOT NULL DEFAULT 1,
+                invariant_diff REAL DEFAULT 0,
+                entry_reason TEXT,
+                exit_reason TEXT
+            )
+        """)
+
+        # Sleeve column on portfolio_engine_audit (Phase-1 Multi-Sleeve)
+        cursor.execute("PRAGMA table_info(portfolio_engine_audit)")
+        audit_cols = {row[1] for row in cursor.fetchall()}
+        if "sleeve" not in audit_cols:
+            try:
+                cursor.execute("ALTER TABLE portfolio_engine_audit ADD COLUMN sleeve TEXT DEFAULT 'ACTIVE'")
+                logger.info("SCHEMA: Added column sleeve to portfolio_engine_audit")
+            except Exception as e:
+                logger.debug(f"Column sleeve might already exist: {e}")
+
+        # Item 6: Pending orders for partial fill simulation
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_engine_orders (
+                order_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                total_qty REAL NOT NULL,
+                filled_qty REAL NOT NULL DEFAULT 0,
+                remaining_qty REAL NOT NULL,
+                price REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                fill_chunks INTEGER NOT NULL DEFAULT 2,
+                current_chunk INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        # Item 7: Daily scoreboard
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_engine_scoreboard_daily (
+                date TEXT PRIMARY KEY,
+                trades INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                win_rate REAL DEFAULT 0,
+                expectancy_r REAL DEFAULT 0,
+                avg_win_r REAL DEFAULT 0,
+                avg_loss_r REAL DEFAULT 0,
+                profit_factor REAL DEFAULT 0,
+                max_drawdown_pct REAL DEFAULT 0,
+                realized_pnl REAL DEFAULT 0,
+                unrealized_pnl REAL DEFAULT 0,
+                total_pnl REAL DEFAULT 0,
+                fees_paid REAL DEFAULT 0,
+                slippage_cost REAL DEFAULT 0,
+                churn_ratio REAL DEFAULT 0,
+                trades_per_hour REAL DEFAULT 0,
+                best_symbol TEXT,
+                worst_symbol TEXT,
+                pass_fail TEXT DEFAULT 'PENDING',
+                fail_reasons TEXT,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        # Item 8: Engine metrics daily (for persistence / G11)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS engine_metrics_daily (
+                date TEXT PRIMARY KEY,
+                buys_attempted INTEGER DEFAULT 0,
+                buys_executed INTEGER DEFAULT 0,
+                cooldown_blocks INTEGER DEFAULT 0,
+                quality_filter_blocks INTEGER DEFAULT 0,
+                reconcile_adjustments INTEGER DEFAULT 0,
+                ai_market_parse_errors INTEGER DEFAULT 0,
+                cash_balance REAL,
+                total_equity REAL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        # Phase 3: Exchange symbol constraints (min_qty, qty_step, min_notional, tick_size + TTL)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS exchange_symbol_constraints (
+                symbol TEXT PRIMARY KEY,
+                qty_step REAL NOT NULL,
+                min_qty REAL NOT NULL,
+                min_notional REAL NOT NULL,
+                tick_size REAL NOT NULL,
+                updated_at TEXT NOT NULL,
+                source TEXT NOT NULL
+            )
+        """)
+
+        # Phase 5: Dust writeoffs audit table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dust_writeoffs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                price_snapshot REAL NOT NULL,
+                est_notional REAL NOT NULL,
+                reason TEXT NOT NULL,
+                sell_trade_id TEXT
+            )
+        """)
+
+        # =========================================================================
+        # POSITION CLOSE LEDGER — single source of truth for post-sell cooldowns
+        #
+        # One row is written for every position closure regardless of source:
+        #   - AI net-profit sell  -> close_reason="AI_TAKE_PROFIT", manual_sell=0
+        #   - Operator MANUAL     -> close_reason="MANUAL", manual_sell=0
+        #   - Human exchange sell -> close_reason="HUMAN_MANUAL_SELL", manual_sell=1
+        #
+        # `cooldown_until` is the epoch-seconds gate that prevents an immediate
+        # rebuy on the same symbol (read by `_check_post_sell_cooldown_ledger`
+        # at every buy attempt). `realized_profit` is NULL with
+        # `realized_profit_unknown=1` when the engine cannot recover the fill
+        # from Binance.US.
+        # =========================================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS position_close_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                closed_at TEXT NOT NULL,
+                closed_at_epoch REAL NOT NULL,
+                close_reason TEXT NOT NULL,
+                manual_sell INTEGER NOT NULL DEFAULT 0,
+                realized_profit REAL,
+                realized_profit_unknown INTEGER NOT NULL DEFAULT 0,
+                cooldown_until REAL NOT NULL,
+                quantity REAL,
+                entry_price REAL,
+                exit_price REAL,
+                sell_trade_id TEXT,
+                detail TEXT
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_position_close_ledger_symbol ON position_close_ledger(symbol, closed_at_epoch DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_position_close_ledger_cooldown ON position_close_ledger(symbol, cooldown_until)")
+
+        # Add kill_switch_mode column to ledger if not exists
+        cursor.execute("PRAGMA table_info(portfolio_engine_ledger)")
+        ledger_cols = {row[1] for row in cursor.fetchall()}
+        if "kill_switch_mode" not in ledger_cols:
+            cursor.execute("ALTER TABLE portfolio_engine_ledger ADD COLUMN kill_switch_mode TEXT DEFAULT 'RESUME'")
+        if "kill_switch_reason" not in ledger_cols:
+            cursor.execute("ALTER TABLE portfolio_engine_ledger ADD COLUMN kill_switch_reason TEXT")
+        if "regime_state_json" not in ledger_cols:
+            cursor.execute("ALTER TABLE portfolio_engine_ledger ADD COLUMN regime_state_json TEXT")
+        if "startup_timestamp" not in ledger_cols:
+            cursor.execute("ALTER TABLE portfolio_engine_ledger ADD COLUMN startup_timestamp TEXT")
+
+        cursor.connection.commit()
+
+    # =========================================================================
+    # LEDGER PERSISTENCE (survives restarts)
+    # =========================================================================
+
+    async def _persist_ledger_to_sqlite(self) -> None:
+        """Persist authoritative ledger to SQLite (must be called after every trade)"""
+        now_epoch = time.time()
+        should_snapshot = self._positions_initialized and (now_epoch - self._last_snapshot_time) >= self._snapshot_interval_sec
+        snapshot_retention_days = self._snapshot_retention_days
+        open_count = len(self.open_positions)
+        total_risk = self._total_open_risk
+
+        def _sync_persist():
+            def _op():
+                with connect_rw(self.db_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.cursor()
+
+                    timestamp = datetime.now(timezone.utc).isoformat()
+
+                    cursor.execute(
+                        """
+                        INSERT OR REPLACE INTO portfolio_engine_ledger (
+                            id, principal, cash_balance, positions_value,
+                            realized_pnl, unrealized_pnl, total_equity,
+                            account_status, trading_paused, pause_reason,
+                            last_updated, version
+                        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            COALESCE((SELECT version FROM portfolio_engine_ledger WHERE id=1), 0) + 1)
+                    """,
+                        (
+                            self.principal,
+                            self.cash_balance,
+                            self._positions_value,
+                            self._realized_pnl,
+                            self._unrealized_pnl,
+                            self._total_equity,
+                            self._account_status.value,
+                            1 if self._trading_paused else 0,
+                            self._pause_reason,
+                            timestamp,
+                        ),
+                    )
+
+                    if should_snapshot:
+                        snapshot_equity = float(self._total_equity)
+                        snapshot_cash = float(self.cash_balance)
+                        snapshot_positions = float(self._positions_value)
+                        max_snapshot_equity = float(self.principal) * 1.15
+                        accounting_ok = abs(snapshot_equity - (snapshot_cash + snapshot_positions)) <= 0.05
+                        equity_bounds_ok = 0.5 * float(self.principal) <= snapshot_equity <= max_snapshot_equity
+                        if accounting_ok and equity_bounds_ok:
+                            cursor.execute(
+                                """INSERT INTO portfolio_snapshots
+                                   (timestamp, cash_balance, principal, positions_value,
+                                    total_equity, total_open_risk, open_positions_count)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    timestamp,
+                                    self.cash_balance,
+                                    self.principal,
+                                    self._positions_value,
+                                    self._total_equity,
+                                    total_risk,
+                                    open_count,
+                                ),
+                            )
+                        else:
+                            logger.warning(
+                                "SNAPSHOT_SKIP: equity=%.2f cash=%.2f positions=%.2f principal=%.2f accounting_ok=%s equity_bounds_ok=%s",
+                                snapshot_equity,
+                                snapshot_cash,
+                                snapshot_positions,
+                                float(self.principal),
+                                accounting_ok,
+                                equity_bounds_ok,
+                            )
+                        cursor.execute(
+                            "DELETE FROM portfolio_snapshots WHERE timestamp < datetime('now', ?)",
+                            (f"-{snapshot_retention_days} days",),
+                        )
+
+                    conn.commit()
+
+            run_locked_retry(_op)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _sync_persist)
+        if should_snapshot:
+            self._last_snapshot_time = now_epoch
+        logger.debug(f"PERSIST_LEDGER: cash=${self.cash_balance:.2f} positions=${self._positions_value:.2f}")
+
+    async def _persist_position_to_sqlite(self, pos: OpenPosition) -> None:
+        """Persist single position to SQLite"""
+
+        def _sync_persist():
+            def _op():
+                with connect_rw(self.db_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.cursor()
+
+                    timestamp = datetime.now(timezone.utc).isoformat()
+
+                    entry_fee = getattr(pos, "entry_fee", 0.0) or 0.0
+                    sleeve_val = getattr(pos, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value
+                    entry_sid = str(getattr(pos, "entry_strategy_id", "") or "")
+                    repair_cnt = int(getattr(pos, "repair_add_count", 0) or 0)
+                    last_repair_ts = float(getattr(pos, "last_repair_add_ts", 0.0) or 0.0)
+                    repair_ids = str(getattr(pos, "repair_add_trade_ids", "[]") or "[]")
+                    avg_after = float(getattr(pos, "average_entry_after_repair", 0.0) or 0.0)
+                    orig_cost = float(getattr(pos, "original_position_cost", 0.0) or 0.0)
+                    if orig_cost <= 0:
+                        orig_cost = float(pos.quantity or 0) * float(pos.entry_price or 0)
+                    cursor.execute(
+                        """
+                        INSERT OR REPLACE INTO portfolio_engine_positions (
+                            symbol, quantity, entry_price, entry_time, trade_id,
+                            stop_price, take_profit_1_price, take_profit_2_price,
+                            trailing_stop_price, tp1_hit, highest_price,
+                            atr_at_entry, entry_bar_timestamp, confidence_at_entry,
+                            entry_fee, sleeve, entry_strategy_id,
+                            repair_add_count, last_repair_add_ts, repair_add_trade_ids,
+                            average_entry_after_repair, original_position_cost, last_updated
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            pos.symbol,
+                            pos.quantity,
+                            pos.entry_price,
+                            pos.entry_time,
+                            pos.trade_id,
+                            pos.stop_price,
+                            pos.take_profit_1_price,
+                            pos.take_profit_2_price,
+                            pos.trailing_stop_price,
+                            1 if pos.tp1_hit else 0,
+                            pos.highest_price,
+                            pos.atr_at_entry,
+                            pos.entry_bar_timestamp,
+                            pos.confidence_at_entry,
+                            entry_fee,
+                            sleeve_val,
+                            entry_sid,
+                            repair_cnt,
+                            last_repair_ts,
+                            repair_ids,
+                            avg_after,
+                            orig_cost,
+                            timestamp,
+                        ),
+                    )
+
+                    conn.commit()
+
+            run_locked_retry(_op)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _sync_persist)
+
+    async def _delete_position_from_sqlite(self, symbol: str) -> None:
+        """Delete position from SQLite when closed"""
+
+        def _sync_delete():
+            def _op():
+                with connect_rw(self.db_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute("DELETE FROM portfolio_engine_positions WHERE symbol = ?", (symbol,))
+                    conn.commit()
+
+            run_locked_retry(_op)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _sync_delete)
+
+    # =========================================================================
+    # POSITION CLOSE LEDGER (single source of truth for post-sell cooldowns)
+    # =========================================================================
+
+    async def _record_position_close_ledger(
+        self,
+        symbol: str,
+        *,
+        close_reason: str,
+        manual_sell: bool,
+        cooldown_until: float,
+        realized_profit: float | None = None,
+        quantity: float | None = None,
+        entry_price: float | None = None,
+        exit_price: float | None = None,
+        sell_trade_id: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Persist a position close + cooldown row.
+
+        One row is written for every closure source (AI net-profit sell,
+        operator MANUAL, HUMAN_MANUAL_SELL). ``realized_profit`` may be None
+        when the engine cannot recover the fill from Binance.US — in that
+        case the row carries ``realized_profit_unknown=1`` and the cooldown
+        is still applied because the live position is gone.
+        """
+        sym = normalize_symbol(symbol)
+        now_epoch = time.time()
+        closed_at_iso = datetime.now(timezone.utc).isoformat()
+        rp_unknown = 1 if realized_profit is None else 0
+
+        def _sync_insert() -> None:
+            def _op() -> None:
+                with connect_rw(self.db_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(
+                        """
+                        INSERT INTO position_close_ledger (
+                            symbol, closed_at, closed_at_epoch, close_reason,
+                            manual_sell, realized_profit, realized_profit_unknown,
+                            cooldown_until, quantity, entry_price, exit_price,
+                            sell_trade_id, detail
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            sym,
+                            closed_at_iso,
+                            now_epoch,
+                            str(close_reason or "").strip().upper(),
+                            1 if manual_sell else 0,
+                            None if realized_profit is None else float(realized_profit),
+                            rp_unknown,
+                            float(cooldown_until),
+                            None if quantity is None else float(quantity),
+                            None if entry_price is None else float(entry_price),
+                            None if exit_price is None else float(exit_price),
+                            sell_trade_id,
+                            detail,
+                        ),
+                    )
+                    conn.commit()
+
+            run_locked_retry(_op)
+
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _sync_insert)
+        except Exception as e:
+            logger.warning(
+                "POSITION_CLOSE_LEDGER_WRITE_FAILED: symbol=%s reason=%s err=%s (in-memory cooldown still applied)",
+                sym,
+                close_reason,
+                e,
+            )
+
+        # Mirror to in-memory wall-clock cooldown so the buy filter blocks
+        # even if the ledger read fails later (defense in depth).
+        self._quality_filter_state.symbol_cooldown_wall[sym] = max(
+            float(self._quality_filter_state.symbol_cooldown_wall.get(sym, 0.0)),
+            float(cooldown_until),
+        )
+
+    def _lookup_position_close_cooldown(self, symbol: str) -> float:
+        """Return the most recent ``cooldown_until`` for ``symbol`` (epoch seconds).
+
+        Returns 0.0 when no row is found or on any DB error (fail-open for
+        startup); the in-memory wall-clock cooldown still blocks rebuys.
+        """
+        sym = normalize_symbol(symbol)
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT cooldown_until FROM position_close_ledger WHERE symbol = ? ORDER BY closed_at_epoch DESC LIMIT 1",
+                    (sym,),
+                ).fetchone()
+            if row and row[0] is not None:
+                return float(row[0])
+        except Exception as e:
+            logger.debug("POSITION_CLOSE_LEDGER_READ_FAILED: %s err=%s", sym, e)
+        return 0.0
+
+    def get_position_close_ledger(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return the most recent rows of ``position_close_ledger`` as dicts.
+
+        Read-only convenience for endpoints / diagnostics. Each row exposes
+        the canonical close fields: ``symbol``, ``closed_at``,
+        ``close_reason``, ``manual_sell``, ``realized_profit``,
+        ``realized_profit_unknown``, ``cooldown_until``.
+        """
+        out: list[dict[str, Any]] = []
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT symbol, closed_at, closed_at_epoch, close_reason,
+                           manual_sell, realized_profit, realized_profit_unknown,
+                           cooldown_until, quantity, entry_price, exit_price,
+                           sell_trade_id, detail
+                    FROM position_close_ledger
+                    ORDER BY closed_at_epoch DESC
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                ).fetchall()
+            for r in rows:
+                out.append(
+                    {
+                        "symbol": r[0],
+                        "closed_at": r[1],
+                        "closed_at_epoch": float(r[2] or 0.0),
+                        "close_reason": r[3],
+                        "manual_sell": bool(r[4]),
+                        "realized_profit": None if r[5] is None else float(r[5]),
+                        "realized_profit_unknown": bool(r[6]),
+                        "cooldown_until": float(r[7] or 0.0),
+                        "quantity": None if r[8] is None else float(r[8]),
+                        "entry_price": None if r[9] is None else float(r[9]),
+                        "exit_price": None if r[10] is None else float(r[10]),
+                        "sell_trade_id": r[11],
+                        "detail": r[12],
+                    }
+                )
+        except Exception as e:
+            logger.debug("POSITION_CLOSE_LEDGER_LIST_FAILED: err=%s", e)
+        return out
+
+    async def _detect_human_manual_sell_fill(
+        self,
+        symbol: str,
+        position: OpenPosition,
+        *,
+        lookback_sec: float = 3600.0,
+    ) -> dict[str, Any]:
+        """Best-effort recovery of the actual manual sell fill from Binance.US.
+
+        Returns a dict with the keys:
+          * ``found``: True iff a matching SELL trade was located.
+          * ``exit_price``: average fill price (None if not found).
+          * ``quantity``: SELL quantity reported by the exchange (None if not found).
+          * ``fee_usd``: fee paid in quote currency (best effort, None if not found).
+          * ``trade_id``: exchange trade id (None if not found).
+          * ``realized_profit``: realized USD pnl computed against the local
+            entry_price (None when no fill data is available — caller must
+            persist as ``realized_profit_unknown=1``).
+        """
+        result: dict[str, Any] = {
+            "found": False,
+            "exit_price": None,
+            "quantity": None,
+            "fee_usd": None,
+            "trade_id": None,
+            "realized_profit": None,
+        }
+        if not self._live_service:
+            return result
+        try:
+            hist = await self._live_service.get_trade_history(symbol=symbol, limit=50)
+        except Exception as e:
+            logger.debug("MANUAL_SELL_FETCH_FAILED: symbol=%s err=%s", symbol, e)
+            return result
+        if not isinstance(hist, dict) or hist.get("status") != "success":
+            return result
+        trades_by_ex = hist.get("trades", {}) or {}
+        flat: list[dict[str, Any]] = []
+        for v in trades_by_ex.values():
+            if isinstance(v, list):
+                flat.extend(t for t in v if isinstance(t, dict))
+        if not flat:
+            return result
+        now_ms = int(time.time() * 1000)
+        window_ms = int(lookback_sec * 1000)
+        entry_ms = int(float(getattr(position, "entry_time", 0.0) or 0.0) * 1000)
+        sells = [t for t in flat if str(t.get("side") or "").strip().lower() == "sell" and int(t.get("timestamp") or 0) >= max(entry_ms, now_ms - window_ms)]
+        if not sells:
+            return result
+        # Sum SELL fills since entry (handles partials).
+        total_qty = 0.0
+        notional = 0.0
+        fee_usd = 0.0
+        latest_id: str | None = None
+        latest_ts = 0
+        for t in sells:
+            try:
+                q = float(t.get("amount") or 0.0)
+                p = float(t.get("price") or 0.0)
+                c = float(t.get("cost") or (q * p))
+            except (TypeError, ValueError):
+                continue
+            if q <= 0 or p <= 0:
+                continue
+            total_qty += q
+            notional += c
+            fee = t.get("fee") or {}
+            if isinstance(fee, dict):
+                try:
+                    fee_usd += float(fee.get("cost") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+            ts = int(t.get("timestamp") or 0)
+            if ts > latest_ts:
+                latest_ts = ts
+                latest_id = str(t.get("id") or "") or None
+        if total_qty <= 0 or notional <= 0:
+            return result
+        avg_exit = notional / total_qty
+        entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
+        realized = None
+        if entry_price > 0:
+            realized = (avg_exit - entry_price) * total_qty - fee_usd
+        result.update(
+            found=True,
+            exit_price=avg_exit,
+            quantity=total_qty,
+            fee_usd=fee_usd,
+            trade_id=latest_id,
+            realized_profit=realized,
+        )
+        return result
+
+    def _record_learning_outcome(
+        self,
+        *,
+        symbol: str,
+        position: OpenPosition,
+        close_reason: str,
+        manual_sell: bool,
+        source: str,
+        exit_price: float | None,
+        realized_profit: float | None,
+        cooldown_until: float,
+        fill_found: bool,
+        dust_qty: float = 0.0,
+        dust_notional: float = 0.0,
+    ) -> None:
+        """
+        Unified learning sink for non-AI close events (HUMAN_MANUAL_SELL,
+        DUST_WRITEOFF). Routes through ``trade_learning_writer`` so paper
+        and live both write the same record shape with ``mode`` tagged.
+        Best-effort: never raises into the engine.
+        """
+        try:
+            from backend.services.trade_learning_writer import (
+                TradeLearningRecord,
+                record_trade_outcome,
+            )
+
+            entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
+            qty = float(getattr(position, "quantity", 0.0) or 0.0)
+            net_pct: float | None = None
+            if exit_price is not None and entry_price > 0 and qty > 0 and realized_profit is not None:
+                gross_pct = (float(exit_price) - entry_price) / entry_price
+                net_pct = gross_pct - ESTIMATED_ROUNDTRIP_COST
+            # Good/bad trade classification follows the user's contract:
+            #   * AI sell with realized net profit > 0   -> GOOD_TRADE
+            #   * HUMAN_MANUAL_SELL with negative/unknown profit -> BAD_TRADE
+            #     (AI failed to capture before the operator stepped in)
+            #   * DUST_WRITEOFF with no realized profit  -> BAD_TRADE
+            #     (capital trapped as dust, learning lesson is sizing/exit timing)
+            # Bad-trade memory is used to penalize similar future buys; it
+            # never triggers a forced-loss sell.
+            is_good_trade = close_reason == "AI_NET_PROFIT_SELL" and realized_profit is not None and float(realized_profit) > 0
+            is_bad_trade = (
+                (manual_sell and (realized_profit is None or float(realized_profit or 0.0) <= 0))
+                or (close_reason == "DUST_WRITEOFF" and (realized_profit is None or float(realized_profit or 0.0) <= 0))
+                or (close_reason == "AI_NET_PROFIT_SELL" and realized_profit is not None and float(realized_profit) <= 0)
+            )
+            lesson: str | None = None
+            if is_good_trade:
+                lesson = "ai_captured_net_profit"
+            elif manual_sell and not fill_found:
+                lesson = "ai_failed_to_act_human_sold_no_fill_recovered"
+            elif manual_sell:
+                lesson = "ai_failed_to_act_human_sold"
+            elif close_reason == "DUST_WRITEOFF":
+                lesson = "dust_only_close_lesson_size_or_timing"
+            elif is_bad_trade:
+                lesson = "ai_sell_did_not_realize_net_profit"
+            record = TradeLearningRecord(
+                symbol=symbol,
+                entry_timestamp=float(getattr(position, "entry_time", 0.0) or 0.0) or None,
+                exit_timestamp=time.time(),
+                entry_price=entry_price or None,
+                exit_price=float(exit_price) if exit_price is not None else None,
+                quantity=qty or None,
+                net_profit_usd=(float(realized_profit) if realized_profit is not None else None),
+                net_profit_pct=net_pct,
+                decision_reason=f"engine_close:{close_reason}:{source}",
+                manual_sell_flag=manual_sell,
+                close_reason=close_reason,
+                dust_remaining_qty=float(dust_qty or 0.0),
+                dust_remaining_notional_usdt=float(dust_notional or 0.0),
+                realized_profit_unknown=not fill_found and close_reason != "DUST_WRITEOFF" and realized_profit is None,
+                cooldown_state={
+                    "cooldown_until": cooldown_until,
+                    "post_sell_cooldown_wall_sec": POST_SELL_COOLDOWN_WALL_SEC,
+                },
+                extra={
+                    "source": source,
+                    "good_trade": bool(is_good_trade),
+                    "bad_trade": bool(is_bad_trade),
+                    "lesson": lesson,
+                },
+            )
+            record_trade_outcome(record, db_path=self.db_path)
+            with contextlib.suppress(Exception):
+                from backend.services.ai_outcome_training_writer import record_outcome_training_row
+
+                ex_payload: dict[str, Any] = {}
+                tid = getattr(position, "trade_id", "") or ""
+                if tid and tid in self.trade_explanations:
+                    ex_payload = self.trade_explanations[tid].to_dict()
+                entry_ts = float(getattr(position, "entry_time", 0.0) or 0.0)
+                opened_iso = datetime.fromtimestamp(entry_ts, tz=timezone.utc).isoformat() if entry_ts > 0 else None
+                closed_iso = datetime.now(timezone.utc).isoformat()
+                record_outcome_training_row(
+                    symbol=symbol,
+                    opened_at_utc=opened_iso or closed_iso,
+                    closed_at_utc=closed_iso,
+                    hold_seconds=record.hold_seconds,
+                    entry_price=entry_price or None,
+                    exit_price=float(exit_price) if exit_price is not None else None,
+                    net_profit_usd=float(realized_profit) if realized_profit is not None else None,
+                    net_profit_pct=net_pct,
+                    gross_pnl_pct=net_pct,
+                    close_reason=close_reason,
+                    strategy_id=str(getattr(position, "entry_strategy_id", "") or "day") or "day",
+                    explainability=ex_payload,
+                    manual_sell=manual_sell,
+                    db_path=self.db_path,
+                )
+            with contextlib.suppress(Exception):
+                from backend.services.ai_post_trade_feature_review import record_post_trade_feature_review
+
+                record_post_trade_feature_review(
+                    trade_id=str(tid or getattr(position, "trade_id", "") or ""),
+                    symbol=symbol,
+                    closed_at_utc=closed_iso,
+                    explainability=ex_payload,
+                    hold_seconds=record.hold_seconds,
+                    net_profit_usd=float(realized_profit) if realized_profit is not None else None,
+                    net_profit_pct=net_pct,
+                    repair_add_count=int(getattr(position, "repair_add_count", 0) or 0),
+                    db_path=self.db_path,
+                )
+        except Exception as e:
+            logger.debug(
+                "LEARNING_WRITER_SKIPPED symbol=%s reason=%s err=%s",
+                symbol,
+                close_reason,
+                e,
+            )
+
+    async def _handle_vanished_exchange_position(
+        self,
+        symbol: str,
+        position: OpenPosition,
+        *,
+        source: str,
+    ) -> None:
+        """Reconcile a local position that the exchange no longer holds.
+
+        Routes:
+          * ``status == "DUST_PENDING"`` -> existing dust-writeoff cleanup
+            (records ``DUST_WRITEOFF``, applies cooldown).
+          * otherwise -> HUMAN_MANUAL_SELL: tries to recover the actual
+            sell fill from Binance.US, persists a close-ledger row, applies
+            the standard post-sell cooldown, then removes the position.
+
+        Idempotent: if ``symbol`` is not present in ``open_positions`` the
+        function returns immediately.
+        """
+        if symbol not in self.open_positions:
+            return
+        pos_status = getattr(position, "status", "ACTIVE") or "ACTIVE"
+        now_epoch = time.time()
+        cooldown_until = now_epoch + float(POST_SELL_COOLDOWN_WALL_SEC)
+        if pos_status == "DUST_PENDING":
+            await self._remove_dust_position_canonical_cleanup(symbol, position)
+            await self._record_position_close_ledger(
+                symbol,
+                close_reason="DUST_WRITEOFF",
+                manual_sell=False,
+                cooldown_until=cooldown_until,
+                realized_profit=None,
+                quantity=float(position.quantity or 0.0),
+                entry_price=float(position.entry_price or 0.0),
+                exit_price=None,
+                sell_trade_id=None,
+                detail=f"source={source}",
+            )
+            self._record_learning_outcome(
+                symbol=symbol,
+                position=position,
+                close_reason="DUST_WRITEOFF",
+                manual_sell=False,
+                source=source,
+                exit_price=None,
+                realized_profit=None,
+                cooldown_until=cooldown_until,
+                fill_found=False,
+                dust_qty=float(position.quantity or 0.0),
+                dust_notional=(float(position.quantity or 0.0) * float(position.entry_price or 0.0)),
+            )
+            return
+
+        fill = await self._detect_human_manual_sell_fill(symbol, position)
+        realized_profit = fill.get("realized_profit")
+        exit_price = fill.get("exit_price")
+        sell_trade_id = fill.get("trade_id")
+        detail_bits = [f"source={source}"]
+        if fill["found"]:
+            detail_bits.append("fill_recovered=true")
+        else:
+            detail_bits.append("fill_recovered=false_realized_profit_unknown")
+        await self._record_position_close_ledger(
+            symbol,
+            close_reason="HUMAN_MANUAL_SELL",
+            manual_sell=True,
+            cooldown_until=cooldown_until,
+            realized_profit=realized_profit,
+            quantity=float(position.quantity or 0.0),
+            entry_price=float(position.entry_price or 0.0),
+            exit_price=exit_price,
+            sell_trade_id=sell_trade_id,
+            detail=";".join(detail_bits),
+        )
+        self._record_learning_outcome(
+            symbol=symbol,
+            position=position,
+            close_reason="HUMAN_MANUAL_SELL",
+            manual_sell=True,
+            source=source,
+            exit_price=exit_price,
+            realized_profit=realized_profit,
+            cooldown_until=cooldown_until,
+            fill_found=bool(fill["found"]),
+        )
+
+        sym_norm = normalize_symbol(symbol)
+        async with self._deletion_lock:
+            if sym_norm in self.open_positions:
+                del self.open_positions[sym_norm]
+            elif symbol in self.open_positions:
+                del self.open_positions[symbol]
+            await self._delete_position_from_sqlite(sym_norm)
+            try:
+                if self._paper_service and sym_norm in getattr(self._paper_service, "positions", {}):
+                    del self._paper_service.positions[sym_norm]
+                    await self._paper_service._delete_position_from_redis(sym_norm)
+            except Exception as e:
+                logger.debug("HUMAN_MANUAL_SELL: paper-cache cleanup %s err=%s", sym_norm, e)
+            await self._recompute_positions_values()
+            self._compute_total_open_risk()
+            await self._persist_ledger_to_sqlite()
+
+        if fill["found"]:
+            logger.info(
+                "HUMAN_MANUAL_SELL_DETECTED symbol=%s qty=%s entry=%s exit=%s realized=%s trade_id=%s cooldown_until=%.0f source=%s",
+                sym_norm,
+                f"{position.quantity:.8f}" if position.quantity else "?",
+                f"{position.entry_price:.8f}" if position.entry_price else "?",
+                f"{exit_price:.8f}" if exit_price else "?",
+                f"{realized_profit:.4f}" if realized_profit is not None else "?",
+                sell_trade_id or "?",
+                cooldown_until,
+                source,
+            )
+        else:
+            logger.info(
+                "HUMAN_MANUAL_SELL_DETECTED symbol=%s qty=%s entry=%s realized_profit_unknown=true cooldown_until=%.0f source=%s (live position vanished; no fill data on exchange)",
+                sym_norm,
+                f"{position.quantity:.8f}" if position.quantity else "?",
+                f"{position.entry_price:.8f}" if position.entry_price else "?",
+                cooldown_until,
+                source,
+            )
+
+    async def _remove_dust_position_canonical_cleanup(self, symbol: str, position: OpenPosition) -> None:
+        """
+        === DUST_INVARIANT_LOCK ===
+        Canonical cleanup when removing a DUST_PENDING position (qty<=0).
+        Removes from positions map, SQLite, paper service, Redis; updates ledger; recomputes risk.
+        ACCOUNTING: Writes a dust_writeoff SELL to paper_trades and zeroes remaining_position
+        on the matching BUY so every buy is accounted for.
+        Idempotent: safe to call twice; no-op if position already absent.
+        === END DUST_INVARIANT_LOCK ===
+        """
+        async with self._deletion_lock:
+            try:
+                if symbol not in self.open_positions:
+                    return  # Idempotent: already cleaned
+                dust_qty = position.quantity
+                dust_entry = position.entry_price
+                dust_notional = dust_qty * dust_entry if dust_qty > 0 and dust_entry > 0 else 0.0
+                hold_seconds = int(time.time() - position.entry_time) if position.entry_time else 0
+
+                del self.open_positions[symbol]
+                await self._recompute_positions_values()
+                self._compute_total_open_risk()
+                await self._delete_position_from_sqlite(symbol)
+
+                # Write dust_writeoff SELL to paper_trades so every BUY is accounted for
+                try:
+                    normalized = normalize_symbol(symbol)
+                    sell_trade_id = f"dust_writeoff_{normalized.replace('/', '_')}_{int(time.time() * 1000)}"
+                    timestamp = datetime.now(timezone.utc).isoformat()
+                    paper_service = get_paper_trading_service()
+                    paper_run_id = getattr(paper_service, "paper_run_id", None) or "default"
+                    mode = "live" if self._live_service else "paper"
+                    dust_sid = str(getattr(position, "entry_strategy_id", "") or "").strip() or None
+
+                    def _write_dust_sell() -> None:
+                        with sqlite3.connect(self.db_path) as conn:
+                            cur = conn.cursor()
+                            cur.execute(
+                                """INSERT INTO paper_trades (
+                                    trade_id, paper_run_id, mode, symbol, side, quantity, price,
+                                    entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
+                                    fees_paid, slippage_cost, exit_type, timestamp, status, strategy_id
+                                ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, 0, 0, 'DUST_WRITEOFF', ?, 'dust_writeoff', ?)""",
+                                (
+                                    sell_trade_id,
+                                    paper_run_id,
+                                    mode,
+                                    normalized,
+                                    dust_qty,
+                                    dust_entry,
+                                    dust_entry,
+                                    -dust_notional,
+                                    -1.0 if dust_notional > 0 else 0.0,
+                                    hold_seconds,
+                                    timestamp,
+                                    dust_sid,
+                                ),
+                            )
+                            # Zero out remaining_position on matching BUY(s)
+                            cur.execute(
+                                """UPDATE paper_trades
+                                   SET remaining_position = 0
+                                   WHERE symbol = ? AND side = 'BUY' AND remaining_position > 0""",
+                                (normalized,),
+                            )
+                            conn.commit()
+
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, _write_dust_sell)
+                    logger.info("DUST_SELL_RECORD: %s qty=%.8g entry=%.6f notional=%.4f trade_id=%s", symbol, dust_qty, dust_entry, dust_notional, sell_trade_id)
+                except Exception as e:
+                    logger.warning("DUST_SELL_RECORD_FAILED: %s - %s (position still cleaned)", symbol, e)
+
+                try:
+                    if self._paper_service and symbol in getattr(self._paper_service, "positions", {}):
+                        del self._paper_service.positions[symbol]
+                        await self._paper_service._delete_position_from_redis(symbol)
+                except Exception as e:
+                    logger.debug("_remove_dust_position_canonical_cleanup: paper delete %s - %s", symbol, e)
+                try:
+                    from backend.config.redis_config import SharedRedisState
+
+                    redis_client = SharedRedisState.get_async_client()
+                    if redis_client:
+                        await redis_client.delete(f"quarantine:{symbol}")
+                except Exception as e:
+                    logger.debug("_remove_dust_position_canonical_cleanup: quarantine clear %s - %s", symbol, e)
+                await self._persist_ledger_to_sqlite()
+                logger.info("DUST_CLEANUP: %s cleaned up atomically (SELL record written)", symbol)
+            except Exception as e:
+                logger.exception("DUST_CLEANUP_FAILED: %s: %s, state may be invalid", symbol, e)
+                raise
+
+    async def _paper_sync_corrective_task(self, symbol: str, quantity: float, price: float, confidence: float | None) -> None:
+        """Non-blocking corrective paper sync after live buy. Logs only; never blocks or escalates."""
+        try:
+            if self._paper_service:
+                await self._paper_service.create_buy_order(
+                    symbol=symbol,
+                    quantity=quantity,
+                    price=price,
+                    confidence=confidence,
+                )
+                logger.info("PAPER_SYNC_CORRECTIVE: %s synced after retry", symbol)
+        except Exception as e:
+            logger.warning("PAPER_SYNC_CORRECTIVE_FAILED: %s - %s", symbol, e)
+
+    async def _verify_order_fill(self, order: dict[str, Any], exchange_symbol: str, side: str) -> dict[str, Any]:
+        """
+        Bounded post-create verification: poll up to 2x if PARTIALLY_FILLED.
+        Returns updated order with filled/average from exchange. No blocking loops.
+        """
+        order_id = order.get("id")
+        if not order_id or not self._live_service:
+            return order
+        status = (order.get("status") or "").lower()
+        if status in ("closed", "filled", "canceled", "cancelled", "expired"):
+            return order
+        for _ in range(2):
+            await asyncio.sleep(0.2 + 0.2 * random.random())
+            res = await self._live_service.fetch_order("binanceus", str(order_id), exchange_symbol)
+            if res.get("status") != "success":
+                break
+            fetched = res.get("order", {})
+            new_status = (fetched.get("status") or "").lower()
+            order = fetched
+            if new_status in ("closed", "filled", "canceled", "cancelled", "expired"):
+                break
+        if (order.get("status") or "").lower() in ("partially_filled", "open"):
+            filled = order.get("filled") or 0
+            logger.warning(
+                "PARTIAL_ACCEPTED: %s %s order=%s filled=%.8f after 2 polls",
+                exchange_symbol,
+                side,
+                order_id,
+                float(filled) if filled else 0,
+            )
+        return order
+
+    def _prune_trade_explanations(self) -> None:
+        """Ring-buffer cap: keep last TRADE_EXPLANATIONS_MAX by timestamp."""
+        if len(self.trade_explanations) <= TRADE_EXPLANATIONS_MAX:
+            return
+        by_ts = sorted(
+            self.trade_explanations.items(),
+            key=lambda kv: kv[1].timestamp,
+        )
+        to_remove = by_ts[: len(by_ts) - TRADE_EXPLANATIONS_MAX]
+        for tid, _ in to_remove:
+            del self.trade_explanations[tid]
+
+    def _prune_coin_performance(self) -> None:
+        """Cap coin_performance to COIN_PERFORMANCE_MAX_SYMBOLS; never prune open positions."""
+        if len(self.coin_performance) <= COIN_PERFORMANCE_MAX_SYMBOLS:
+            return
+        open_syms = set(self.open_positions.keys())
+        candidates = [(s, p.last_updated) for s, p in self.coin_performance.items() if s not in open_syms]
+        if len(candidates) + len(open_syms) <= COIN_PERFORMANCE_MAX_SYMBOLS:
+            return
+        candidates.sort(key=lambda x: x[1])
+        to_remove = len(self.coin_performance) - COIN_PERFORMANCE_MAX_SYMBOLS
+        for s, _ in candidates[:to_remove]:
+            if s not in open_syms:
+                del self.coin_performance[s]
+
+    def _symbol_in_fixed_universe(self, symbol: str) -> bool:
+        """COIN UNIVERSE RULES: True if symbol is in the configured fixed universe (no auto-expansion)."""
+        try:
+            from backend.config.trading_universe import is_valid_symbol
+
+            s = (symbol or "").strip()
+            if not s:
+                return False
+            base = s.replace("USDT", "").replace("/", "").strip()
+            return is_valid_symbol(base) or is_valid_symbol(s)
+        except ImportError:
+            return False  # no config: reject symbol
+
+    def _load_constraints_from_sqlite(self) -> None:
+        """Phase 3: Load exchange symbol constraints from SQLite into self._symbol_constraints. COIN UNIVERSE: only load symbols in fixed universe."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT name FROM sqlite_master
+                    WHERE type='table' AND name='exchange_symbol_constraints'
+                """)
+                if not cursor.fetchone():
+                    return
+                cursor.execute("""
+                    SELECT symbol, qty_step, min_qty, min_notional, tick_size, updated_at, source
+                    FROM exchange_symbol_constraints
+                """)
+                for row in cursor.fetchall():
+                    sym = row[0]
+                    if not self._symbol_in_fixed_universe(sym):
+                        logger.debug("COIN_UNIVERSE: skip loading constraints for %s (not in fixed universe)", sym)
+                        continue
+                    self._symbol_constraints[sym] = {
+                        "qty_step": float(row[1]),
+                        "min_qty": float(row[2]),
+                        "min_notional": float(row[3]),
+                        "tick_size": float(row[4]),
+                        "updated_at": row[5],
+                        "source": row[6],
+                    }
+        except Exception as e:
+            logger.debug("_load_constraints_from_sqlite: %s", e)
+
+    # ================================================================
+    # PHASE 2 FIX #5: ADD SINGLE-SYMBOL SQLITE LOADER
+    # ================================================================
+    def _load_constraints_from_sqlite_single(self, symbol: str) -> dict | None:
+        """Load constraints for a single symbol from SQLite"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT symbol, qty_step, min_qty, min_notional, tick_size, updated_at, source
+                    FROM exchange_symbol_constraints
+                    WHERE symbol = ?
+                """,
+                    (symbol,),
+                )
+                row = cursor.fetchone()
+
+                if row:
+                    return {
+                        "qty_step": float(row[1]),
+                        "min_qty": float(row[2]),
+                        "min_notional": float(row[3]),
+                        "tick_size": float(row[4]),
+                        "updated_at": row[5],
+                        "source": row[6],
+                    }
+        except Exception as e:
+            logger.debug(f"_load_constraints_from_sqlite_single({symbol}): {e}")
+        return None
+
+    # ================================================================
+
+    def _upsert_constraints_to_sqlite(self, constraints: dict[str, dict], source: str) -> None:
+        """Phase 3: Upsert constraints into exchange_symbol_constraints (symbol, qty_step, min_qty, min_notional, tick_size, updated_at, source)."""
+        if not constraints:
+            return
+        try:
+            # BUG #53 FIX: Use context manager for proper connection cleanup
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                now = datetime.now(timezone.utc).isoformat()
+                for sym, c in constraints.items():
+                    qty_step = float(c.get("qty_step", 0))
+                    min_qty = float(c.get("min_qty", 0))
+                    min_notional = float(c.get("min_notional", 0))
+                    tick_size = float(c.get("tick_size", 0))
+                    updated_at = c.get("updated_at") or now
+                    src = c.get("source") or source
+                    cursor.execute(
+                        """
+                        INSERT OR REPLACE INTO exchange_symbol_constraints
+                        (symbol, qty_step, min_qty, min_notional, tick_size, updated_at, source)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (sym, qty_step, min_qty, min_notional, tick_size, updated_at, src),
+                    )
+                conn.commit()
+        except Exception as e:
+            logger.warning("_upsert_constraints_to_sqlite: %s", e)
+
+    def _constraints_fresh(self, symbol: str) -> bool:
+        """Phase 3: True if symbol has constraints and updated_at is within CONSTRAINTS_TTL_SECONDS."""
+        if symbol not in self._symbol_constraints:
+            return False
+        c = self._symbol_constraints[symbol]
+        updated_at = c.get("updated_at")
+        if not updated_at:
+            return False
+        try:
+            # Parse ISO timestamp (with or without Z)
+            ts_str = str(updated_at).replace("Z", "+00:00")
+            ts = datetime.fromisoformat(ts_str).timestamp()
+            return (time.time() - ts) < CONSTRAINTS_TTL_SECONDS
+        except (TypeError, ValueError):
+            return False
+
+    async def _ensure_symbol_constraints(self, symbol: str, force: bool = False) -> None:
+        """Phase 3: Ensure constraints for symbol are in memory and fresh; fetch from live service if needed and persist. COIN UNIVERSE: only fixed universe symbols."""
+        if not self._symbol_in_fixed_universe(symbol):
+            logger.warning("COIN_UNIVERSE: refusing to ensure constraints for %s (not in fixed universe)", symbol)
+            return
+        # BUG #M1 FIX: Check if fallback constraints have expired (TTL enforcement)
+        if symbol in self._symbol_constraints:
+            c = self._symbol_constraints[symbol]
+            if c.get("source") == "fallback" and c.get("fallback_expires_at"):
+                try:
+                    expires_str = str(c["fallback_expires_at"]).replace("Z", "+00:00")
+                    expires_ts = datetime.fromisoformat(expires_str).timestamp()
+                    if time.time() > expires_ts:
+                        logger.info(f"FALLBACK_EXPIRED: {symbol} - clearing expired fallback constraints")
+                        del self._symbol_constraints[symbol]
+                        force = True  # Force refresh from live service
+                except (TypeError, ValueError) as e:
+                    logger.debug(f"FALLBACK_EXPIRY_CHECK: {symbol} parse error: {e}")
+        if not force and symbol in self._symbol_constraints and self._constraints_fresh(symbol):
+            return
+        if self._live_service:
+            try:
+                constraints = await self._live_service.get_symbol_constraints("binanceus", [symbol], force_refresh=force)
+                if constraints:
+                    now = datetime.now(timezone.utc).isoformat()
+                    to_upsert: dict[str, dict] = {}
+                    for sym, c in constraints.items():
+                        rec = dict(c)
+                        rec["updated_at"] = now
+                        rec["source"] = "ccxt"
+                        self._symbol_constraints[sym] = rec
+                        to_upsert[sym] = rec
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self._upsert_constraints_to_sqlite(to_upsert, "ccxt"),
+                    )
+            except Exception as e:
+                logger.warning("_ensure_symbol_constraints %s: %s", symbol, e)
+        # Write-through: if symbol still missing (no live service or fetch failed), seed fallback and persist (C2 fix)
+        if symbol not in self._symbol_constraints:
+            # ================================================================
+            # PHASE 2 FIX #5: DON'T OVERWRITE LIVE CONSTRAINTS WITH FALLBACK
+            # ================================================================
+            # Check SQLite first - if ccxt version exists there, use it
+            # Only use fallback if no SQLite record exists
+            # ================================================================
+            try:
+                # Try to load from SQLite first (may have ccxt version)
+                sqlite_constraints = await asyncio.get_running_loop().run_in_executor(None, lambda: self._load_constraints_from_sqlite_single(symbol))
+                if sqlite_constraints:
+                    self._symbol_constraints[symbol] = sqlite_constraints
+                    logger.info(f"Loaded {symbol} constraints from SQLite (source={sqlite_constraints.get('source')})")
+                    return  # Use SQLite version, don't use fallback
+            except Exception as e:
+                logger.debug(f"Failed to load {symbol} from SQLite: {e}")
+
+            # Only use fallback if SQLite also doesn't have it
+            now = datetime.now(timezone.utc).isoformat()
+            fallback_rec = {
+                "qty_step": DEFAULT_QTY_STEP,
+                "min_qty": 0.0,
+                "min_notional": MIN_POSITION_NOTIONAL,
+                "tick_size": 0.0,
+                "updated_at": now,
+                "source": "fallback",
+                # BUG #M4 FIX: Add TTL for fallback constraints to force refresh after exchange recovery
+                "fallback_expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            }
+            self._symbol_constraints[symbol] = fallback_rec
+            # BUG #M4 FIX: Do NOT persist fallback to SQLite - keep it memory-only with TTL
+            # This ensures fresh constraints are fetched once ccxt/exchange is available
+            logger.warning(f"Using MEMORY-ONLY FALLBACK constraints for {symbol} (will refresh in 1h or on restart)")
+
+    def _now_ms(self) -> int:
+        """Timestamp in ms with exchange offset applied. Guard: does not apply if |offset| > 10s."""
+        offset = getattr(self, "exchange_time_offset_ms", 0)
+        if abs(offset) > 10_000:
+            logger.warning("EXCHANGE_TIME_OFFSET_SKIP: abs(offset)=%d ms > 10s, not applying", offset)
+            return int(time.time() * 1000)
+        return int(time.time() * 1000) + offset
+
+    async def _force_refresh_symbol_constraints(self, symbol: str) -> None:
+        """Refresh constraints for symbol immediately (e.g. after LOT_SIZE/MIN_NOTIONAL/PRICE_FILTER errors)."""
+        try:
+            await self._ensure_symbol_constraints(symbol, force=True)
+            logger.info("CONSTRAINTS_FORCE_REFRESH: %s", symbol)
+        except Exception as e:
+            logger.warning("CONSTRAINTS_FORCE_REFRESH_FAILED: %s %s", symbol, e)
+
+    async def _entry_ensure_constraints(self, symbol: str) -> None:
+        """
+        P3.3: Mandatory before any sizing/normalization. Call at start of every buy/sell entry point.
+        Guarantees decision and execution gates read from the same constraint source.
+        """
+        await self._ensure_symbol_constraints(symbol)
+
+    def _floor_to_step(self, qty: float, step: float) -> float:
+        """Phase 4: Decimal-safe floor to step (NO float rounding). Returns qty floored to step."""
+        if step <= 0:
+            return qty
+        try:
+            q = Decimal(str(qty))
+            s = Decimal(str(step))
+            if s <= 0:
+                return qty
+            # floor(qty / step) * step
+            n = (q / s).quantize(Decimal("1"), rounding=ROUND_FLOOR) * s
+            snapped = float(n)
+
+            # #region agent log MEDIUM #2 - Quantity snapping
+            if qty != snapped:
+                pass  # Snapped for LOT_SIZE
+
+            return snapped
+        except Exception as ex:
+            logger.debug("_floor_to_step failed for qty=%s: %s", qty, ex)
+            return qty
+
+    def _dust_check(self, symbol: str, qty: float, price: float) -> tuple[bool, float, str, float]:
+        """
+        Phase 4: Dust check using constraints. Returns (is_dust, qty_quantized, reason, est_notional).
+        Rules (MUST include minQty AND minNotional, not only qty_quantized==0):
+          - qty_quantized <= 0 -> dust
+          - qty < min_qty -> dust (raw qty below LOT_SIZE.minQty)
+          - (qty * price) < min_notional -> dust (raw notional below MIN_NOTIONAL)
+          - qty_quantized < min_qty -> dust
+          - (qty_quantized * price) < min_notional -> dust
+        """
+        constraints = self._symbol_constraints.get(symbol) or {}
+        qty_step = float(constraints.get("qty_step") or 0)
+        min_qty = float(constraints.get("min_qty") or 0)
+        min_notional = float(constraints.get("min_notional") or 0)
+        qty_quantized = self._floor_to_step(qty, qty_step) if qty_step > 0 else qty
+        est_notional = qty_quantized * price
+        raw_notional = qty * price if price > 0 else 0.0
+        if qty_quantized <= 0:
+            return (True, qty_quantized, "qty_quantized <= 0", est_notional)
+        if min_qty > 0 and qty < min_qty:
+            return (True, qty_quantized, "below min_qty (raw)", est_notional)
+        if min_notional > 0 and raw_notional < min_notional and raw_notional > 0:
+            return (True, qty_quantized, "below min_notional (raw)", est_notional)
+        if min_qty > 0 and qty_quantized < min_qty:
+            return (True, qty_quantized, "below min_qty", est_notional)
+        if min_notional > 0 and est_notional < min_notional:
+            return (True, qty_quantized, "below min_notional", est_notional)
+        return (False, qty_quantized, "", est_notional)
+
+    async def _load_ledger_from_sqlite(self) -> bool:
+        """Load authoritative ledger from SQLite. Returns True if found."""
+
+        def _sync_load():
+            with connect_rw(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                # Check if table exists
+                cursor.execute("""
+                    SELECT name FROM sqlite_master
+                    WHERE type='table' AND name='portfolio_engine_ledger'
+                """)
+                if not cursor.fetchone():
+                    return None
+
+                cursor.execute("""
+                    SELECT principal, cash_balance, positions_value,
+                           realized_pnl, unrealized_pnl, total_equity,
+                           account_status, trading_paused, pause_reason,
+                           last_updated, version
+                    FROM portfolio_engine_ledger WHERE id = 1
+                """)
+                row = cursor.fetchone()
+                return row
+
+        loop = asyncio.get_running_loop()
+        row = await loop.run_in_executor(None, _sync_load)
+
+        if row:
+            # In test_mode, preserve principal from __init__ to prevent contamination
+            # Only load ledger values if principal matches (prevents cross-test contamination)
+            loaded_principal = row[0]
+            if self.test_mode and abs(loaded_principal - self.principal) > 0.01:
+                # TEST MODE: Ledger has different principal - this is cross-test contamination
+                # Return False to start fresh with test principal instead
+                logger.warning(f"TEST_MODE: Ignoring SQLite ledger with principal=${loaded_principal:.2f} (test principal=${self.principal:.2f}) - starting fresh for isolation")
+                return False
+
+            self.principal = row[0]
+            # LIVE 24/7: Use ledger values as initial state (reconcile loop corrects from Binance).
+            # Do NOT force cash=0 - that manufactured guaranteed EQUITY_ALT_MISMATCH.
+            self.cash_balance = row[1]
+            self._available_balance = max(0.0, self.cash_balance)
+            self._positions_value = row[2]
+            self._realized_pnl = row[3]
+            self._unrealized_pnl = row[4]
+            self._total_equity = row[5]
+            self._account_status = AccountStatus(row[6]) if row[6] else AccountStatus.HEALTHY
+            self._trading_paused = bool(row[7])
+            self._pause_reason = row[8] or ""
+
+            # AUTO-CLEAR: Clear invariant/recovery pauses on restart - startup will re-evaluate
+            if self._trading_paused and any(tag in self._pause_reason for tag in ("RECOVERY_FAILED", "INVARIANT_VIOLATION", "EQUITY_MISMATCH")):
+                logger.warning("LOAD_LEDGER: Clearing stale pause '%s' (startup will re-evaluate)", self._pause_reason[:80])
+                self._trading_paused = False
+                self._pause_reason = ""
+                self._account_status = AccountStatus.HEALTHY
+
+            logger.info(f"LOAD_LEDGER: Restored from SQLite (version={row[10]})")
+            logger.info(f"LOAD_LEDGER: principal=${self.principal:.2f} cash=${self.cash_balance:.2f}")
+            logger.info(f"LOAD_LEDGER: positions=${self._positions_value:.2f} equity=${self._total_equity:.2f}")
+            logger.info(f"LOAD_LEDGER: status={self._account_status.value} paused={self._trading_paused}")
+            return True
+
+        return False
+
+    def _sync_paper_fifo_remaining_to_engine_positions_sync(self) -> None:
+        """
+        Reconcile ``paper_trades.remaining_position`` with authoritative ``portfolio_engine_positions``.
+
+        Drift happens when SQLite positions were removed (orphan/canonical fix, manual repair) or
+        FIFO rows were not updated, leaving ghost BUY lots with remaining > 0 while the engine
+        has no row or a single canonical ``trade_id`` + quantity.
+
+        - Symbols with no engine position: zero all BUY ``remaining_position``.
+        - Symbols with an engine position: zero all BUY lots for that symbol, then set
+          ``remaining_position = engine.quantity`` on the row matching ``trade_id``, or the latest BUY if missing.
+        """
+        try:
+
+            def _sync_once() -> None:
+                conn = connect_rw(self.db_path)
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.cursor()
+                    cursor.execute("PRAGMA table_info(paper_trades)")
+                    pt_cols = {row[1] for row in cursor.fetchall()}
+                    if "remaining_position" not in pt_cols or "trade_id" not in pt_cols:
+                        return
+
+                    open_syms = set(self.open_positions.keys())
+
+                    cursor.execute(
+                        """
+                        SELECT DISTINCT symbol FROM paper_trades
+                        WHERE side = 'BUY' AND COALESCE(remaining_position, 0) > 0
+                        """
+                    )
+                    paper_open_syms = [row[0] for row in cursor.fetchall()]
+
+                    for psym in paper_open_syms:
+                        ns = normalize_symbol(psym)
+                        if ns not in open_syms:
+                            cursor.execute(
+                                """
+                                UPDATE paper_trades SET remaining_position = 0
+                                WHERE symbol = ? AND side = 'BUY'
+                                """,
+                                (psym,),
+                            )
+                            logger.warning(
+                                "FIFO_RECONCILE: zeroed ghost BUY remaining for %s (no engine open position)",
+                                psym,
+                            )
+
+                    for sym, pos in self.open_positions.items():
+                        if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
+                            continue
+                        qty = float(pos.quantity or 0.0)
+                        if qty <= 0:
+                            continue
+                        tid = pos.trade_id or ""
+
+                        cursor.execute(
+                            """
+                            UPDATE paper_trades SET remaining_position = 0
+                            WHERE symbol = ? AND side = 'BUY'
+                            """,
+                            (sym,),
+                        )
+                        cursor.execute(
+                            """
+                            UPDATE paper_trades SET remaining_position = ?
+                            WHERE trade_id = ? AND side = 'BUY'
+                            """,
+                            (qty, tid),
+                        )
+                        if cursor.rowcount == 0 and tid:
+                            logger.debug(
+                                "FIFO_RECONCILE: no paper row for trade_id=%s symbol=%s — fallback latest BUY",
+                                tid,
+                                sym,
+                            )
+                        if cursor.rowcount == 0:
+                            cursor.execute(
+                                """
+                                UPDATE paper_trades SET remaining_position = ?
+                                WHERE id = (
+                                    SELECT id FROM paper_trades
+                                    WHERE symbol = ? AND side = 'BUY'
+                                    ORDER BY id DESC LIMIT 1
+                                )
+                                """,
+                                (qty, sym),
+                            )
+                        logger.info(
+                            "FIFO_RECONCILE: aligned paper BUY remaining for %s to qty=%.8f trade_id=%s",
+                            sym,
+                            qty,
+                            tid or "(latest BUY)",
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+            run_locked_retry(_sync_once)
+        except Exception as e:
+            logger.warning("FIFO_RECONCILE failed: %s", e, exc_info=True)
+
+    async def _load_positions_from_sqlite(self) -> int:
+        """Load positions from SQLite. Returns count loaded."""
+
+        def _sync_load():
+            with connect_rw(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                # Check if table exists
+                cursor.execute("""
+                    SELECT name FROM sqlite_master
+                    WHERE type='table' AND name='portfolio_engine_positions'
+                """)
+                if not cursor.fetchone():
+                    return []
+
+                cursor.execute("""
+                    SELECT symbol, quantity, entry_price, entry_time, trade_id,
+                           stop_price, take_profit_1_price, take_profit_2_price,
+                           trailing_stop_price, tp1_hit, highest_price,
+                           atr_at_entry, entry_bar_timestamp, confidence_at_entry,
+                           COALESCE(entry_fee, 0), COALESCE(sleeve, 'ACTIVE'),
+                           COALESCE(entry_strategy_id, ''),
+                           COALESCE(repair_add_count, 0), COALESCE(last_repair_add_ts, 0),
+                           COALESCE(repair_add_trade_ids, '[]'),
+                           COALESCE(average_entry_after_repair, 0),
+                           COALESCE(original_position_cost, 0)
+                    FROM portfolio_engine_positions
+                """)
+                rows = cursor.fetchall()
+                return rows
+
+        loop = asyncio.get_running_loop()
+        rows = await loop.run_in_executor(None, _sync_load)
+
+        self.open_positions.clear()
+        for row in rows:
+            raw_symbol = row[0]
+            normalized_symbol = normalize_symbol(raw_symbol)
+
+            # Clean up malformed symbols from database
+            if "//" in normalized_symbol or normalized_symbol.count("/") > 1:
+                logger.warning(f"Cleaning malformed symbol from SQLite: {raw_symbol} -> {normalized_symbol}")
+                await self._delete_position_from_sqlite(raw_symbol)
+                continue
+
+            entry_fee = float(row[14]) if len(row) > 14 else 0.0
+            sleeve_val = str(row[15]) if len(row) > 15 else Sleeve.ACTIVE.value
+            entry_sid = str(row[16]) if len(row) > 16 else ""
+            repair_cnt = int(row[17]) if len(row) > 17 else 0
+            last_repair_ts = float(row[18]) if len(row) > 18 else 0.0
+            repair_ids = str(row[19]) if len(row) > 19 else "[]"
+            avg_after = float(row[20]) if len(row) > 20 else 0.0
+            orig_cost = float(row[21]) if len(row) > 21 else 0.0
+            if orig_cost <= 0:
+                orig_cost = float(row[1] or 0) * float(row[2] or 0)
+            pos = OpenPosition(
+                symbol=normalized_symbol,
+                quantity=row[1],
+                entry_price=row[2],
+                entry_time=row[3],
+                trade_id=row[4],
+                stop_price=row[5],
+                take_profit_1_price=row[6],
+                take_profit_2_price=row[7],
+                trailing_stop_price=row[8],
+                tp1_hit=bool(row[9]),
+                highest_price=row[10],
+                atr_at_entry=row[11],
+                entry_bar_timestamp=row[12],
+                confidence_at_entry=row[13],
+                entry_fee=entry_fee,
+                sleeve=sleeve_val,
+                entry_strategy_id=entry_sid,
+                repair_add_count=repair_cnt,
+                last_repair_add_ts=last_repair_ts,
+                repair_add_trade_ids=repair_ids,
+                average_entry_after_repair=avg_after,
+                original_position_cost=orig_cost,
+                add_count=repair_cnt,
+                last_add_ts=last_repair_ts,
+            )
+            self.open_positions[pos.symbol] = pos
+            logger.debug(
+                "LOAD_POSITION: %s qty=%.6f entry=$%.4f (normalized from %s)",
+                pos.symbol,
+                pos.quantity,
+                pos.entry_price,
+                raw_symbol,
+            )
+
+        # Backfill entry_fee from paper_trades for positions with entry_fee=0 (join trade_id -> fees_paid)
+        await self._backfill_entry_fee_from_paper_trades()
+
+        await asyncio.to_thread(self._sync_paper_fifo_remaining_to_engine_positions_sync)
+
+        logger.info(f"LOAD_POSITIONS: Restored {len(self.open_positions)} positions from SQLite")
+        # EXIT_MONITOR calls this frequently; open_positions is replaced from SQLite but
+        # _total_open_risk must match or RISK_CAP_EXCEEDED can false-trigger (stale risk vs fresh equity).
+        self._compute_total_open_risk()
+        return len(self.open_positions)
+
+    async def _backfill_entry_fee_from_paper_trades(self) -> None:
+        """Backfill entry_fee for positions with entry_fee=0 by joining trade_id -> paper_trades.fees_paid"""
+        to_backfill = [p for p in self.open_positions.values() if (getattr(p, "entry_fee", 0) or 0) == 0 and p.trade_id]
+        if not to_backfill:
+            return
+
+        def _sync_backfill():
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute("PRAGMA table_info(paper_trades)")
+                    cols = {row[1] for row in cursor.fetchall()}
+                    if "trade_id" not in cols or "fees_paid" not in cols:
+                        return
+                except Exception as e:
+                    logger.debug("BACKFILL_ENTRY_FEE PRAGMA/cols: %s", e)
+                    return
+
+                for pos in to_backfill:
+                    try:
+                        cursor.execute(
+                            "SELECT fees_paid FROM paper_trades WHERE trade_id = ? AND side = 'BUY'",
+                            (pos.trade_id,),
+                        )
+                        row = cursor.fetchone()
+                        if row and row[0] is not None and float(row[0]) > 0:
+                            fee_val = float(row[0])
+                            pos.entry_fee = fee_val
+                            cursor.execute(
+                                "UPDATE portfolio_engine_positions SET entry_fee = ? WHERE symbol = ?",
+                                (fee_val, pos.symbol),
+                            )
+                            conn.commit()
+                            logger.info(f"BACKFILL_ENTRY_FEE: {pos.symbol} trade_id={pos.trade_id} entry_fee=${fee_val:.4f}")
+                    except Exception as e:
+                        logger.debug(f"BACKFILL_ENTRY_FEE skip {pos.symbol}: {e}")
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _sync_backfill)
+
+    # =========================================================================
+    # SIGNAL BRIDGE METHODS
+    # Thin wrappers used by paper-trading endpoints / signal routing.
+    # =========================================================================
+
+    async def execute_buy_from_signal(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        confidence: float,
+        decision: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        BRIDGE METHOD: Simple interface for legacy service to execute buys.
+
+        This method:
+        1. Calculates ATR from market data
+        2. Calculates stop price based on ATR
+        3. Creates explainability object
+        4. Calls the full execute_buy_fifo
+        5. Syncs with PaperTradingService
+
+        Args:
+            symbol: Trading pair in Binance.US API form (e.g., "BTCUSDT")
+            quantity: Quantity to buy
+            price: Current price
+            confidence: AI confidence score
+            decision: Optional decision dict with additional context
+
+        Returns:
+            Trade result dict or None if blocked
+        """
+        # Normalize symbol to CCXT format
+        ccxt_symbol = f"{symbol[:-4]}/USDT" if symbol.endswith("USDT") and "/" not in symbol else symbol
+
+        # Get ATR from market data (or use default)
+        atr = await self._get_atr_for_symbol(ccxt_symbol, price)
+
+        # Calculate stop price — major coins use volatility-based dynamic SL
+        profile = get_coin_profile(ccxt_symbol)
+        if ccxt_symbol in MAJOR_COINS:
+            dynamic_sl_pct = compute_entry_distance_pct(ccxt_symbol, atr, price)
+            stop_distance = price * dynamic_sl_pct
+            stop_price = price - stop_distance
+            logger.info(
+                "STOP_PLACEMENT_MAJOR: %s atr=%.8f atr_pct=%.4f%% dynamic_sl=%.4f%% (floor=%.2f%% ceil=%.2f%%) dist=%.6f stop=$%.4f",
+                ccxt_symbol,
+                atr,
+                (atr / price * 100) if price else 0,
+                dynamic_sl_pct * 100,
+                MAJOR_COIN_SL_BOUNDS.get(_to_api_symbol(ccxt_symbol), (0, 0))[0] * 100,
+                MAJOR_COIN_SL_BOUNDS.get(_to_api_symbol(ccxt_symbol), (0, 0))[1] * 100,
+                stop_distance,
+                stop_price,
+            )
+        else:
+            coin_sl = float(profile.get("sl", MIN_STOP_PCT))
+            stop_floor_pct = max(MIN_STOP_PCT, coin_sl)
+            atr_stop = atr * ATR_MULTIPLIER
+            floor_stop = price * stop_floor_pct
+            stop_distance = max(atr_stop, floor_stop)
+            stop_price = price - stop_distance
+            logger.info(
+                "STOP_PLACEMENT: %s atr=%.8f atr_stop=%.6f floor_pct=%.4f%% (coin_sl=%.4f%%) floor_stop=%.6f final_dist=%.6f stop=$%.4f",
+                ccxt_symbol,
+                atr,
+                atr_stop,
+                stop_floor_pct * 100,
+                coin_sl * 100,
+                floor_stop,
+                stop_distance,
+                stop_price,
+            )
+
+        # ================================================================
+        # PHASE 2 FIX #1: ALIGN BAR TIMESTAMP TO BAR BOUNDARIES
+        # ================================================================
+        # Current bar timestamp (aligned to bar boundary, not wall-clock)
+        current_time = time.time()
+        bar_timestamp = int(current_time / self._bar_interval_seconds) * self._bar_interval_seconds
+        # ================================================================
+
+        # Volatility metadata for logging
+        is_major = ccxt_symbol in MAJOR_COINS
+        atr_pct = (atr / price * 100) if price > 0 else 0
+        sl_pct_used = (stop_distance / price * 100) if price > 0 else 0
+        vol_tag = f" vol_adj=true atr%={atr_pct:.3f} sl%={sl_pct_used:.3f}" if is_major else ""
+        regime_str = f"AI signal confidence={confidence:.2f}{vol_tag}"
+
+        # Create explainability object (trade_id/timestamp set inside execute_buy_fifo)
+        explainability = TradeExplainability(
+            trade_id="",
+            symbol=ccxt_symbol,
+            side="BUY",
+            timestamp="",
+            regime=regime_str,
+            ai_confidence=confidence,
+            trend_score=decision.get("trend_strength", 0.5) if decision else 0.5,
+            chop_score=decision.get("chop_score", 0.5) if decision else 0.5,
+            coin_edge_score=0.0,
+            composite_score=confidence,
+        )
+        _sig_decision = decision if isinstance(decision, dict) else {}
+        _sid = str(_sig_decision.get("live_ai_strategy") or "").strip().lower()
+        if _sid:
+            explainability.live_ai_strategy = _sid
+        else:
+            with contextlib.suppress(Exception):
+                _fv_raw = _sig_decision.get("feature_version")
+                _fv_quick = int(float(_fv_raw)) if _fv_raw not in (None, "") else 0
+                if _fv_quick >= 2:
+                    explainability.live_ai_strategy = "day"
+        if _sig_decision.get("selected_net_expected_value") not in (None, ""):
+            _sig_decision["selected_net_expected_value_is_net"] = False
+        if _sig_decision.get("net_expected_value") not in (None, ""):
+            _sig_decision["net_expected_value_is_net"] = False
+        _costs_sig = self._hydrate_cost_telemetry(
+            symbol=ccxt_symbol,
+            strategy_id="day",
+            decision_data=_sig_decision,
+        )
+        explainability.entry_spread_pct = float(_costs_sig.get("entry_spread_pct") or 0.0)
+        explainability.entry_slippage_pct = float(_costs_sig.get("entry_slippage_pct") or 0.0)
+        explainability.entry_fee_pct = float(_costs_sig.get("entry_fee_pct") or 0.0)
+        explainability.entry_spread_source = str(_costs_sig.get("entry_spread_source") or "")
+        try:
+            _ebm_sig = _costs_sig.get("entry_buy_margin")
+            explainability.entry_buy_margin = float(_ebm_sig) if _ebm_sig is not None else None
+        except (TypeError, ValueError):
+            explainability.entry_buy_margin = None
+        # Preserve optional ranking attribution when the caller already has a
+        # concrete snapshot/leaderboard selection (e.g. controlled paper proof).
+        # This keeps the normal execution path while avoiding SQL-side patching.
+        with contextlib.suppress(Exception):
+            _rsid = _sig_decision.get("rank_snapshot_id")
+            if _rsid not in (None, ""):
+                explainability.rank_snapshot_id = int(_rsid)
+        with contextlib.suppress(Exception):
+            _sr = _sig_decision.get("selected_rank")
+            if _sr not in (None, ""):
+                explainability.selected_rank = int(_sr)
+        with contextlib.suppress(Exception):
+            _ss = _sig_decision.get("selected_score")
+            if _ss not in (None, ""):
+                explainability.selected_score = float(_ss)
+        with contextlib.suppress(Exception):
+            explainability.selected_net_expected_value = float(self._estimate_candidate_net_expected_value(_sig_decision))
+        if _sig_decision.get("peer_ranks_json") not in (None, ""):
+            if isinstance(_sig_decision.get("peer_ranks_json"), str):
+                explainability.peer_ranks_json = str(_sig_decision.get("peer_ranks_json"))
+            else:
+                with contextlib.suppress(Exception):
+                    explainability.peer_ranks_json = json.dumps(_sig_decision.get("peer_ranks_json"), separators=(",", ":"))
+        if _sig_decision.get("score_components_json") not in (None, ""):
+            if isinstance(_sig_decision.get("score_components_json"), str):
+                explainability.score_components_json = str(_sig_decision.get("score_components_json"))
+            else:
+                with contextlib.suppress(Exception):
+                    explainability.score_components_json = json.dumps(_sig_decision.get("score_components_json"), separators=(",", ":"))
+        # Optional artifact contract fields for direct/manual execution paths.
+        with contextlib.suppress(Exception):
+            _ap = _sig_decision.get("model_artifact_path") or _sig_decision.get("artifact_path")
+            if _ap not in (None, ""):
+                explainability.artifact_path = str(_ap)
+        with contextlib.suppress(Exception):
+            _ah = _sig_decision.get("artifact_sha256")
+            if _ah not in (None, ""):
+                explainability.artifact_sha256 = str(_ah)
+        with contextlib.suppress(Exception):
+            _fv = _sig_decision.get("feature_version")
+            if _fv not in (None, ""):
+                explainability.feature_version = int(_fv)
+        with contextlib.suppress(Exception):
+            _fd = _sig_decision.get("feature_dim")
+            if _fd not in (None, ""):
+                explainability.feature_dim = int(_fd)
+
+        # Entry context gate at execute_buy_fifo needs the same Redis audit trail as bar execution.
+        with contextlib.suppress(Exception):
+            _cts = (_sig_decision.get("ctx_ts_utc") or "").strip()
+            if _cts:
+                explainability.ctx_ts_utc = _cts[:64]
+        with contextlib.suppress(Exception):
+            if _sig_decision.get("ctx_age_sec") not in (None, ""):
+                explainability.ctx_age_sec = float(_sig_decision["ctx_age_sec"])
+        cfs = str(_sig_decision.get("context_fresh_str") or _sig_decision.get("context_fresh") or "").strip()
+        if cfs in ("0", "1"):
+            explainability.context_fresh_flag = cfs
+        cae_sig = (_sig_decision.get("context_audit_emit") or "").strip()
+        if cae_sig:
+            explainability.context_audit_emit = cae_sig
+        self._hydrate_explainability_entry_context_from_redis_if_missing(ccxt_symbol, explainability)
+
+        # Forward decision_id and sleeve from caller-supplied decision dict
+        _decision_id = (decision.get("decision_id", "") if decision else "") or ""
+        _sleeve = (decision.get("sleeve", "") if decision else "") or ""
+
+        # Execute through the full method
+        result = await self.execute_buy_fifo(
+            symbol=ccxt_symbol,
+            quantity=quantity,
+            price=price,
+            stop_price=stop_price,
+            atr=atr,
+            confidence=confidence,
+            bar_timestamp=bar_timestamp,
+            explainability=explainability,
+            decision_id=str(_decision_id),
+            sleeve=str(_sleeve),
+        )
+
+        # Paper sync done inside execute_buy_fifo (parity: immediate update)
+        return result
+
+    async def execute_sell_from_signal(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        exit_reason: str,
+    ) -> dict[str, Any] | None:
+        """
+        Bridge entry for external sell signals.
+
+        Mystic's automated sells are net-profit-only. This bridge REJECTS any
+        externally requested sell reason that is not a confirmed MANUAL sell
+        or a confirmed TAKE_PROFIT signal.
+        """
+        forbidden_reasons = {
+            "STOP_LOSS",
+            "TRAILING_STOP",
+            "TIME_EXIT",
+            "STALE_PROFIT",
+            "REPLACEMENT",
+            "ROTATION",
+            "PROTECTIVE_EXIT",
+            "MAX_HOLD",
+            "MIN_HOLD",
+            "VOLATILITY_STOP",
+        }
+        reason_norm = str(exit_reason or "").strip().upper()
+        if reason_norm in forbidden_reasons:
+            logger.warning(
+                "SELL_FROM_SIGNAL_REJECTED: symbol=%s reason=%s (forbidden: Mystic sells only on confirmed net profit)",
+                symbol,
+                exit_reason,
+            )
+            return None
+
+        api_symbol = _to_api_symbol(symbol)
+
+        exit_type_map = {
+            "TAKE_PROFIT": ExitType.TAKE_PROFIT_1,
+            "TAKE_PROFIT_FULL": ExitType.TAKE_PROFIT_FULL,
+            "MANUAL": ExitType.MANUAL,
+        }
+        exit_type = exit_type_map.get(reason_norm, ExitType.MANUAL)
+        force_sell = "force=true" in str(exit_reason or "").lower()
+
+        result = await self.execute_sell_fifo(
+            symbol=api_symbol,
+            quantity=quantity,
+            price=price,
+            exit_type=exit_type,
+            exit_trigger=exit_reason,
+            force_sell=force_sell,
+        )
+
+        # Sync with PaperTradingService if successful (use executed quantity, not requested)
+        if result is not None and self._paper_service:
+            try:
+                # BUG #M7 FIX: Use guarded access for external payload fields
+                exec_qty = result.get("quantity", quantity)
+                await self._paper_service.place_order(
+                    symbol=symbol,
+                    side="SELL",
+                    order_type="MARKET",
+                    quantity=exec_qty,
+                    exit_reason=exit_reason,
+                )
+                logger.info(f"BRIDGE_SELL_SYNCED: {symbol} synced to PaperTradingService")
+            except Exception as e:
+                logger.warning(f"BRIDGE_SELL_SYNC_FAILED: {symbol} - {e}")
+
+        return result
+
+    def _symbol_base_asset(self, symbol: str) -> str:
+        ns = normalize_symbol(symbol)
+        return ns.split("/", maxsplit=1)[0].upper() if "/" in ns else ns.upper().replace("USDT", "")
+
+    def _resolve_symbol_cost_defaults(self, symbol: str) -> dict[str, float]:
+        base = self._symbol_base_asset(symbol)
+        min_roundtrip_default = SYMBOL_MIN_ROUNDTRIP_DEFAULTS.get(base, DEFAULT_MIN_ROUNDTRIP_COST_PCT)
+        required_buffer_default = SYMBOL_REQUIRED_NET_BUFFER_DEFAULTS.get(base, DEFAULT_REQUIRED_NET_PROFIT_BUFFER_PCT)
+        min_roundtrip = float(os.getenv(f"{base}_MIN_ROUNDTRIP_COST_PCT", str(min_roundtrip_default)))
+        min_exit = float(os.getenv(f"{base}_MIN_EXIT_COST_PCT", str(DEFAULT_MIN_EXIT_COST_PCT)))
+        required_buffer = float(os.getenv(f"{base}_REQUIRED_NET_PROFIT_BUFFER_PCT", str(required_buffer_default)))
+        return {
+            "min_roundtrip_cost_pct": max(0.0, min_roundtrip),
+            "min_exit_cost_pct": max(0.0, min_exit),
+            "required_profit_buffer_pct": max(0.0, required_buffer),
+        }
+
+    def _compute_symbol_drag_stats(self, symbol: str) -> dict[str, float]:
+        """Rolling per-symbol realized drag stats from the latest closed SELLs."""
+        stats = {
+            "sample_count_20": 0,
+            "median_drag_pct_20": 0.0,
+            "p75_drag_pct_20": 0.0,
+            "p90_drag_pct_20": 0.0,
+            "avg_drag_pct_20": 0.0,
+            "exit_drag_pct_p75": 0.0,
+        }
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT price, entry_price, quantity, pnl, pnl_usd_net
+                FROM paper_trades
+                WHERE side='SELL' AND symbol = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (normalize_symbol(symbol), int(max(5, SELL_COST_SAMPLE_WINDOW))),
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+
+        drags: list[float] = []
+        for exit_price, entry_price, qty, pnl, pnl_usd_net in rows:
+            ep = float(entry_price or 0.0)
+            xp = float(exit_price or 0.0)
+            q = float(qty or 0.0)
+            if ep <= 0 or q <= 0:
+                continue
+            gross_pct = (xp - ep) / ep
+            entry_notional = ep * q
+            realized_val = pnl_usd_net if pnl_usd_net is not None else pnl
+            actual_realized_pct = float(realized_val or 0.0) / entry_notional if entry_notional > 0 else 0.0
+            drag_pct = max(0.0, gross_pct - actual_realized_pct)
+            drags.append(float(drag_pct))
+
+        if not drags:
+            return stats
+
+        stats["sample_count_20"] = len(drags)
+        stats["median_drag_pct_20"] = _pct(drags, 50)
+        stats["p75_drag_pct_20"] = _pct(drags, 75)
+        stats["p90_drag_pct_20"] = _pct(drags, 90)
+        stats["avg_drag_pct_20"] = float(sum(drags) / len(drags))
+        # Exit-only approximation unless dedicated entry/exit split telemetry is available.
+        stats["exit_drag_pct_p75"] = max(0.0, stats["p75_drag_pct_20"] / 2.0)
+        return stats
+
+    def _get_symbol_drag_stats(self, symbol: str) -> dict[str, float]:
+        ns = normalize_symbol(symbol)
+        now = time.time()
+        cached = self._sell_cost_stats_cache.get(ns)
+        if cached and (now - float(cached.get("cached_at", 0.0))) <= self._sell_cost_stats_cache_ttl_sec:
+            return dict(cached)
+        stats = self._compute_symbol_drag_stats(ns)
+        stats["cached_at"] = now
+        self._sell_cost_stats_cache[ns] = dict(stats)
+        return stats
+
+    async def _resolve_fresh_mark_for_sell(self, symbol: str) -> tuple[float | None, str, float | None, bool]:
+        """Resolve a fresh mark for sell approval; never falls back to entry price."""
+        ns = normalize_symbol(symbol)
+        cached_price, cached_age = self._price_cache.get_with_age(ns)
+        if cached_price is not None and cached_age is not None and cached_age <= SELL_MARK_MAX_AGE_SECONDS:
+            return (float(cached_price), "price_cache", float(cached_age), True)
+
+        if self._live_service is not None:
+            try:
+                m = await self._live_service.get_market_price(ns)
+                px = float((m or {}).get("price") or 0.0)
+                if px > 0:
+                    self._price_cache.set(ns, px)
+                    return (px, "live_ticker", 0.0, True)
+            except Exception:
+                logger.debug("SELL_MARK_REFRESH_FAILED: %s", ns, exc_info=True)
+
+        if cached_price is not None and cached_age is not None:
+            return (float(cached_price), "price_cache_stale", float(cached_age), False)
+        return (None, "missing", None, False)
+
+    def _is_emergency_sell(self, exit_type: ExitType, exit_trigger: str, force_sell: bool = False) -> bool:
+        if force_sell:
+            return True
+        trig = str(exit_trigger or "").strip().lower()
+        emergency_tags = (
+            "emergency",
+            "risk",
+            "liquidat",
+            "account_overallocated",
+            "safety",
+            "force=true",
+            "force_sell",
+            "panic",
+        )
+        return any(tag in trig for tag in emergency_tags)
+
+    def _is_profit_style_exit(self, exit_type: ExitType, emergency_flag: bool) -> bool:
+        if emergency_flag:
+            return False
+        return exit_type in (ExitType.TAKE_PROFIT_1, ExitType.TAKE_PROFIT_FULL)
+
+    async def _evaluate_sell_profitability(
+        self,
+        symbol: str,
+        position: OpenPosition,
+        exit_type: ExitType,
+        exit_trigger: str,
+        force_sell: bool = False,
+    ) -> dict[str, Any]:
+        ns = normalize_symbol(symbol)
+        defaults = self._resolve_symbol_cost_defaults(ns)
+        drag_stats = self._get_symbol_drag_stats(ns)
+        sample_count = int(drag_stats.get("sample_count_20", 0) or 0)
+        measured_roundtrip_p75 = float(drag_stats.get("p75_drag_pct_20", 0.0) or 0.0)
+
+        if sample_count >= SELL_COST_SAMPLE_MIN:
+            measured_roundtrip_cost_pct = measured_roundtrip_p75
+        else:
+            measured_roundtrip_cost_pct = defaults["min_roundtrip_cost_pct"]
+        effective_roundtrip_cost_pct = max(defaults["min_roundtrip_cost_pct"], measured_roundtrip_cost_pct)
+
+        # Exit-only drag estimate: measured when enough samples, else roundtrip/2 approximation.
+        if sample_count >= SELL_COST_SAMPLE_MIN:
+            measured_exit_drag_pct = float(drag_stats.get("exit_drag_pct_p75", 0.0) or 0.0)
+        else:
+            measured_exit_drag_pct = max(0.0, (effective_roundtrip_cost_pct / 2.0) - BINANCE_US_TAKER_FEE_PCT)
+
+        effective_exit_cost_pct = max(
+            defaults["min_exit_cost_pct"],
+            BINANCE_US_TAKER_FEE_PCT + measured_exit_drag_pct,
+        )
+        required_profit_buffer_pct = defaults["required_profit_buffer_pct"]
+
+        emergency_flag = self._is_emergency_sell(exit_type, exit_trigger, force_sell=force_sell)
+        profit_style = self._is_profit_style_exit(exit_type, emergency_flag=emergency_flag)
+        if STRICT_NO_NEGATIVE_SELLS:
+            # Test mode: enforce net-positive gate on every sell branch.
+            profit_style = True
+
+        mark_price, mark_source, mark_age_seconds, mark_fresh = await self._resolve_fresh_mark_for_sell(ns)
+        avg_entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
+        gross_pct = 0.0
+        net_exit_pct = -999.0
+        roundtrip_net_pct = -999.0
+        block_reason = ""
+        allowed = True
+        if avg_entry_price > 0 and mark_price is not None and mark_price > 0:
+            gross_pct = (float(mark_price) - avg_entry_price) / avg_entry_price
+            net_exit_pct = gross_pct - effective_exit_cost_pct
+            roundtrip_net_pct = gross_pct - effective_roundtrip_cost_pct
+        if profit_style:
+            if mark_price is None:
+                allowed = False
+                block_reason = "SELL_MARK_MISSING"
+            elif not mark_fresh:
+                allowed = False
+                block_reason = "SELL_MARK_STALE"
+            elif net_exit_pct <= required_profit_buffer_pct:
+                allowed = False
+                block_reason = "SELL_NET_EXIT_BELOW_BUFFER_STRICT" if STRICT_NO_NEGATIVE_SELLS else "SELL_NET_EXIT_BELOW_BUFFER"
+
+        # decision_tag normalizes the per-tick "what is the AI doing right
+        # now with this open position?" answer for observability and
+        # learning. It never overrides the strict ``allowed`` gate; it only
+        # labels the same decision in user-facing language.
+        if allowed:
+            decision_tag = "SELL_NET_PROFIT_CONFIRMED"
+        elif block_reason in ("SELL_MARK_MISSING", "SELL_MARK_STALE"):
+            decision_tag = "NO_ACTION_MISSING_DATA"
+        elif net_exit_pct <= 0.0:
+            decision_tag = "HOLD_WAITING_FOR_PROFIT"
+        else:
+            decision_tag = "HOLD_PROFIT_NOT_ENOUGH"
+
+        return {
+            "symbol": ns,
+            "reason": str(exit_trigger or ""),
+            "exit_branch": str(exit_type.value),
+            "avg_entry_price": avg_entry_price,
+            "mark_price": float(mark_price) if mark_price is not None else None,
+            "mark_source": mark_source,
+            "mark_age_seconds": float(mark_age_seconds) if mark_age_seconds is not None else None,
+            "gross_pct": float(gross_pct),
+            "effective_exit_cost_pct": float(effective_exit_cost_pct),
+            "effective_roundtrip_cost_pct": float(effective_roundtrip_cost_pct),
+            "net_exit_pct": float(net_exit_pct),
+            "roundtrip_net_pct": float(roundtrip_net_pct),
+            "required_profit_buffer_pct": float(required_profit_buffer_pct),
+            "allowed": bool(allowed),
+            "block_reason": block_reason,
+            "decision_tag": decision_tag,
+            "emergency_flag": bool(emergency_flag),
+            "measured_cost_sample_count": sample_count,
+            "measured_cost_p75": float(measured_roundtrip_p75),
+            "strict_no_negative_sells": bool(STRICT_NO_NEGATIVE_SELLS),
+        }
+
+    async def _get_atr_for_symbol(self, symbol: str, price: float) -> float:
+        """Get ATR for a symbol from market data cache, or calculate from price."""
+        try:
+            # Try to get from Redis cache
+            from backend.config.redis_config import get_shared_redis_async
+
+            redis = get_shared_redis_async()
+
+            from backend.utils.symbols import to_exchange_symbol
+
+            base_symbol = to_exchange_symbol(symbol).replace("USDT", "")
+            cache_key = f"market:{base_symbol}"
+            cached_data = await redis.get(cache_key)
+
+            if cached_data:
+                data = json.loads(cached_data)
+                # Check if ATR is available
+                atr = data.get("atr")
+                if atr and atr > 0:
+                    return float(atr)
+
+                # Calculate ATR proxy from 24h change
+                change_24h = abs(data.get("change_24h", 0)) / 100.0
+                if change_24h > 0:
+                    return price * change_24h * 0.5  # Half of 24h change as ATR proxy
+        except Exception as e:
+            logger.debug(f"Could not get ATR from cache for {symbol}: {e}")
+
+        # Default: 1.5% of price as ATR estimate
+        return price * 0.015
+
+    async def execute_buy_fifo(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        stop_price: float,
+        atr: float,
+        confidence: float,
+        bar_timestamp: int,
+        explainability: TradeExplainability,
+        decision_id: str = "",
+        sleeve: str = "",
+    ) -> dict[str, Any] | None:
+        """
+        SOLE EXECUTION POINT FOR BUYS
+
+        CRITICAL: This is the ONLY method that can execute buys.
+
+        Hard checks: kill switch, artifact attribution contract, execution-time context freshness,
+        buy_margin floor, exchange normalization, `_can_open_position` (cash, max positions, duplicate).
+
+        Updates authoritative ledger on success and persists to SQLite + audit.
+        """
+        # Capture pre-ledger for audit
+        pre_ledger = {
+            "cash_balance": self.cash_balance,
+            "positions_value": self._positions_value,
+            "total_equity": self._total_equity,
+        }
+
+        # =================================================================
+        # ITEM 1: KILL SWITCH CHECK
+        # =================================================================
+        can_buy, kill_reason = self._check_kill_switch_buy()
+        if not can_buy:
+            logger.warning(f"BUY_BLOCKED: {symbol} - {kill_reason}")
+            await self._record_reject(
+                symbol,
+                "BUY",
+                kill_reason,
+                "KILL_SWITCH",
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+
+            # PIPELINE TRACKING: Record EXECUTION stage failure
+            if decision_id:
+                await self._update_pipeline_decision(decision_id, {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"KILL_SWITCH: {kill_reason}"})
+            return None
+
+        # =================================================================
+        # ARTIFACT CONTRACT — fail-closed (Step 3); version/dim/hash/path/strategy
+        # =================================================================
+        from backend.services.ai_artifact_contract_gate import evaluate_explainability_artifact_contract
+
+        ok_ac, ac_code, ac_detail = evaluate_explainability_artifact_contract(explainability)
+        if not ok_ac:
+            logger.warning(
+                "BUY_BLOCKED_ARTIFACT_CONTRACT: %s code=%s detail=%s",
+                symbol,
+                ac_code,
+                ac_detail,
+            )
+            await self._record_reject(
+                symbol,
+                "BUY",
+                ac_code or "ARTIFACT_CONTRACT_BLOCKED",
+                ac_code or "ARTIFACT_CONTRACT_BLOCKED",
+                decision_id=decision_id,
+                explainability=explainability,
+                audit_context_extra={"artifact_contract_detail": ac_detail},
+            )
+            if decision_id:
+                await self._update_pipeline_decision(
+                    decision_id,
+                    {
+                        "stage": "EXECUTION",
+                        "execution_result": "NOT_EXECUTED",
+                        "execution_reason": f"ARTIFACT_CONTRACT:{ac_code}",
+                    },
+                )
+            return None
+
+        # =================================================================
+        # ENTRY CONTEXT — fail-closed (Step 2); re-check wall-clock vs ctx_ts_utc
+        # =================================================================
+        from backend.services.ai_entry_context_gate import evaluate_explainability_at_execution
+
+        self._hydrate_explainability_entry_context_from_redis_if_missing(normalize_symbol(symbol), explainability)
+        if not str(getattr(explainability, "ctx_ts_utc", "") or "").strip():
+            try:
+                _ctx_payload, _ctx_age = self._get_context_payload(symbol)
+                _ctx_ts = str(_ctx_payload.get("ts_utc") or _ctx_payload.get("timestamp") or "").strip()
+                if _ctx_ts:
+                    explainability.ctx_ts_utc = _ctx_ts
+                    explainability.ctx_age_sec = float(_ctx_age)
+                    explainability.context_fresh_flag = "1" if 0 <= float(_ctx_age) <= float(get_ctx_fresh_max_age_sec()) else "0"
+            except Exception:
+                pass
+
+        ok_ec, ec_code, ec_detail = evaluate_explainability_at_execution(explainability)
+        if not ok_ec:
+            redis_ctx_ts_utc = ""
+            try:
+                redis_ctx_payload, _redis_ctx_age = self._get_context_payload(symbol)
+                redis_ctx_ts_utc = str(redis_ctx_payload.get("ts_utc") or redis_ctx_payload.get("timestamp") or "")
+            except Exception:
+                redis_ctx_ts_utc = ""
+            logger.warning(
+                "BUY_BLOCKED_ENTRY_CONTEXT: %s code=%s detail=%s",
+                symbol,
+                ec_code,
+                ec_detail,
+            )
+            logger.warning(
+                "ENTRY_CONTEXT_NOT_FRESH_DEBUG symbol=%s ctx_ts_utc=%s context_fresh=%s ctx_age_sec=%s redis_ctx_ts_utc=%s",
+                symbol,
+                str(getattr(explainability, "ctx_ts_utc", "") or ""),
+                str(getattr(explainability, "context_fresh_flag", "") or ""),
+                str(getattr(explainability, "ctx_age_sec", -1.0)),
+                redis_ctx_ts_utc,
+            )
+            await self._record_reject(
+                symbol,
+                "BUY",
+                ec_code or "ENTRY_CONTEXT_BLOCKED",
+                ec_code or "ENTRY_CONTEXT_BLOCKED",
+                decision_id=decision_id,
+                explainability=explainability,
+                audit_context_extra={"entry_context_detail": ec_detail},
+            )
+            if decision_id:
+                await self._update_pipeline_decision(
+                    decision_id,
+                    {
+                        "stage": "EXECUTION",
+                        "execution_result": "NOT_EXECUTED",
+                        "execution_reason": f"ENTRY_CONTEXT:{ec_code}",
+                    },
+                )
+            return None
+
+        bm_payload = {"buy_margin": getattr(explainability, "entry_buy_margin", None)}
+        buy_margin_exec = resolve_buy_margin_from_payload(bm_payload)
+        effective_sleeve_for_margin = sleeve or assign_sleeve(normalize_symbol(symbol), confidence)
+        bm_threshold = buy_margin_threshold_core() if str(effective_sleeve_for_margin).strip().upper() == Sleeve.CORE.value else buy_margin_threshold_active()
+        if buy_margin_exec is None:
+            logger.info(
+                "BUY_MARGIN_TELEMETRY_EXEC symbol=%s status=missing threshold=%.6f -> penalty/sizing only",
+                symbol,
+                bm_threshold,
+            )
+            _entry_reasons = list(getattr(explainability, "entry_reasons", []) or [])
+            _entry_reasons.append("buy_margin_missing_penalty_only")
+            explainability.entry_reasons = _entry_reasons
+            explainability.entry_signal_penalty = float(getattr(explainability, "entry_signal_penalty", 0.0) or 0.0) + 4.0
+        if buy_margin_exec is not None and float(buy_margin_exec) < bm_threshold:
+            logger.info(
+                "BUY_MARGIN_TELEMETRY_EXEC symbol=%s status=below_threshold buy_margin=%.6f threshold=%.6f -> penalty/sizing only",
+                symbol,
+                float(buy_margin_exec),
+                bm_threshold,
+            )
+            _entry_reasons = list(getattr(explainability, "entry_reasons", []) or [])
+            _entry_reasons.append("buy_margin_below_threshold_penalty_only")
+            explainability.entry_reasons = _entry_reasons
+            explainability.entry_signal_penalty = float(getattr(explainability, "entry_signal_penalty", 0.0) or 0.0) + 4.0
+
+        # =================================================================
+        # QUARANTINE — controlled by ENABLE_QUARANTINE_ENFORCEMENT
+        # =================================================================
+        is_quarantined, quarantine_reason = await self._is_symbol_quarantined(symbol)
+        if is_quarantined:
+            logger.info("TELEMETRY_QUARANTINE symbol=%s reason=%s", symbol, quarantine_reason)
+
+        # =================================================================
+        # HARD FUSE: Block ALL buys if account is not healthy
+        # =================================================================
+        if self._account_status != AccountStatus.HEALTHY:
+            if self._account_status == AccountStatus.OVERALLOCATED and PORTFOLIO_LOCAL_SKIP_OVERALLOCATED_BLOCK:
+                logger.info(
+                    "QUALITY_TELEMETRY BUY_BLOCKED_HARD_FUSE would_block symbol=%s account_status=%s (PORTFOLIO_LOCAL_SKIP_OVERALLOCATED_BLOCK=true — not enforcing)",
+                    symbol,
+                    self._account_status.value,
+                )
+            else:
+                reason = f"account_status={self._account_status.value}"
+                logger.error(f"BUY_BLOCKED_HARD_FUSE: {symbol} - {reason}")
+                await self._record_reject(
+                    symbol,
+                    "BUY",
+                    reason,
+                    "HARD_FUSE",
+                    decision_id=decision_id,
+                    explainability=explainability,
+                )
+
+                # PIPELINE TRACKING: Record EXECUTION stage failure
+                if decision_id:
+                    await self._update_pipeline_decision(decision_id, {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"HARD_FUSE: {reason}"})
+                return None
+
+        if self._trading_paused:
+            reason = f"trading_paused: {self._pause_reason}"
+            logger.error(f"BUY_BLOCKED_HARD_FUSE: {symbol} - {reason}")
+            await self._record_reject(
+                symbol,
+                "BUY",
+                reason,
+                "HARD_FUSE",
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+
+            # PIPELINE TRACKING: Record EXECUTION stage failure
+            if decision_id:
+                await self._update_pipeline_decision(decision_id, {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"HARD_FUSE: {reason}"})
+            return None
+
+        # =================================================================
+        # ITEM 4: REGIME GUARDS — controlled by ENABLE_REGIME_ENFORCEMENT
+        # =================================================================
+        can_proceed, regime_reason = self._check_regime_guards(symbol, bar_timestamp)
+        if not can_proceed:
+            logger.info("TELEMETRY_REGIME_GUARD symbol=%s reason=%s", symbol, regime_reason)
+
+        # =================================================================
+        # ITEM 6: AUTHORITATIVE ORDER NORMALIZATION (canonical sizing gate)
+        # =================================================================
+        self._metrics_buys_attempted += 1
+        await self._entry_ensure_constraints(symbol)
+
+        qty_q, reason, est_notional = self._normalize_order_amount(
+            symbol=symbol,
+            raw_qty=quantity,
+            price=price,
+            side="BUY",
+        )
+
+        if reason != "ok" and reason == "below_min_notional" and PORTFOLIO_LOCAL_SKIP_EXCHANGE_MIN_NOTIONAL_BLOCK:
+            logger.info(
+                "QUALITY_TELEMETRY BUY_BLOCKED_EXCHANGE would_block symbol=%s raw_qty=%s qty_q=%s reason=%s est_notional=%s "
+                "(PORTFOLIO_LOCAL_SKIP_EXCHANGE_MIN_NOTIONAL_BLOCK=true — not enforcing; bumping to min-notional qty for paper)",
+                symbol,
+                quantity,
+                qty_q,
+                reason,
+                est_notional,
+            )
+            constraints = self._symbol_constraints.get(symbol) or {}
+            mn = float(constraints.get("min_notional", MIN_POSITION_NOTIONAL))
+            qs = float(constraints.get("qty_step", DEFAULT_QTY_STEP))
+            price_f = float(price)
+            if price_f > 0 and qs > 0:
+                need_qty = mn / price_f
+                bumped = max(float(quantity), float(qty_q), need_qty)
+                bumped = math.ceil(bumped / qs - 1e-12) * qs
+                qty_q, reason, est_notional = self._normalize_order_amount(
+                    symbol=symbol,
+                    raw_qty=bumped,
+                    price=price,
+                    side="BUY",
+                )
+
+        if reason != "ok":
+            logger.info(f"BUY_BLOCKED_EXCHANGE: {symbol} raw_qty={quantity} qty_q={qty_q} reason={reason} est_notional={est_notional}")
+            await self._record_reject(
+                symbol,
+                "BUY",
+                reason,
+                "EXCHANGE_CONSTRAINT",
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+
+            # PIPELINE TRACKING: Record EXECUTION stage failure
+            if decision_id:
+                await self._update_pipeline_decision(decision_id, {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"EXCHANGE_CONSTRAINT: {reason}"})
+            return None
+
+        quantity = qty_q
+
+        logger.debug(f"BUY_NORMALIZED: {symbol} qty={quantity} est_notional={est_notional}")
+
+        from backend.services.execution_mode_service import is_live_execution_allowed_sync
+
+        normalized_symbol = normalize_symbol(symbol)
+        if is_live_execution_allowed_sync():
+            from backend.config.live_test_mode import enforce_live_order_buy_gates
+
+            gate_ok, gate_reason, quantity = enforce_live_order_buy_gates(
+                symbol=normalized_symbol,
+                quantity=quantity,
+                price=price,
+                normalize_amount=self._normalize_order_amount,
+            )
+            if not gate_ok:
+                logger.warning("LIVE_TEST_BUY_BLOCKED: %s - %s", normalized_symbol, gate_reason)
+                await self._record_reject(
+                    normalized_symbol,
+                    "BUY",
+                    gate_reason,
+                    "LIVE_TEST_GATE",
+                    decision_id=decision_id,
+                    explainability=explainability,
+                )
+                if decision_id:
+                    await self._update_pipeline_decision(
+                        decision_id,
+                        {
+                            "stage": "EXECUTION",
+                            "execution_result": "NOT_EXECUTED",
+                            "execution_reason": f"LIVE_TEST_GATE:{gate_reason}",
+                        },
+                    )
+                return None
+
+        if normalized_symbol in self.open_positions and self.open_positions[normalized_symbol].quantity > 0:
+            logger.info(
+                "BUY_BLOCKED_ALREADY_OPEN: symbol=%s open_qty=%.8f (HOLD existing position)",
+                normalized_symbol,
+                float(self.open_positions[normalized_symbol].quantity),
+            )
+            await self._record_reject(
+                normalized_symbol,
+                "BUY",
+                "already_open_no_rebuy",
+                "POSITION_ALREADY_OPEN",
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+            if decision_id:
+                await self._update_pipeline_decision(
+                    decision_id,
+                    {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": "POSITION_ALREADY_OPEN"},
+                )
+            with contextlib.suppress(Exception):
+                from backend.services.ai_missed_opportunity_observer import record_missed_opportunity_observation
+
+                active_count = sum(1 for p in self.open_positions.values() if float(getattr(p, "quantity", 0) or 0) > 0)
+                record_missed_opportunity_observation(
+                    block_reason="POSITION_ALREADY_OPEN",
+                    attempted_symbol=normalized_symbol,
+                    active_positions=active_count,
+                    max_positions=MAX_OPEN_POSITIONS,
+                )
+            return None
+
+        # Persistent close-ledger cooldown (defense in depth: covers any
+        # buy path that skipped `_check_quality_filters`). Survives restart.
+        if not PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN:
+            persisted_until = self._lookup_position_close_cooldown(normalized_symbol)
+            now_wall = time.time()
+            if persisted_until and now_wall < persisted_until:
+                remaining = persisted_until - now_wall
+                logger.info(
+                    "BUY_BLOCKED_COOLDOWN_LEDGER: symbol=%s remaining=%.0fs (post-sell or HUMAN_MANUAL_SELL)",
+                    normalized_symbol,
+                    remaining,
+                )
+                await self._record_reject(
+                    normalized_symbol,
+                    "BUY",
+                    f"post_sell_cooldown_ledger_remaining={remaining:.0f}s",
+                    "POST_SELL_COOLDOWN_LEDGER",
+                    decision_id=decision_id,
+                    explainability=explainability,
+                )
+                if decision_id:
+                    await self._update_pipeline_decision(
+                        decision_id,
+                        {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": "POST_SELL_COOLDOWN_LEDGER"},
+                    )
+                with contextlib.suppress(Exception):
+                    from backend.services.ai_missed_opportunity_observer import record_missed_opportunity_observation
+
+                    record_missed_opportunity_observation(
+                        block_reason="POST_SELL_COOLDOWN_LEDGER",
+                        attempted_symbol=normalized_symbol,
+                    )
+                return None
+
+        from backend.config.live_test_mode import can_place_live_orders_sync
+        from backend.services.execution_mode_service import is_live_execution_allowed_sync
+        from backend.services.protected_limit_execution import execute_protected_limit_live, run_protected_preflight
+
+        live_capable = bool(self._live_execution_enabled and self._live_service and is_live_execution_allowed_sync() and can_place_live_orders_sync()[0])
+        preflight = await run_protected_preflight(
+            symbol=normalized_symbol,
+            side="BUY",
+            quantity=quantity,
+            reference_price=price,
+            live_capable=live_capable,
+        )
+        protected_audit = preflight.to_audit_dict()
+        if not preflight.passed:
+            await self._record_reject(
+                normalized_symbol,
+                "BUY",
+                preflight.reject_reason,
+                "PROTECTED_PREFLIGHT",
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+            if decision_id:
+                await self._update_pipeline_decision(
+                    decision_id,
+                    {
+                        "stage": "EXECUTION",
+                        "execution_result": "NOT_EXECUTED",
+                        "execution_reason": f"PROTECTED_PREFLIGHT:{preflight.reject_reason}",
+                    },
+                )
+            with contextlib.suppress(Exception):
+                from backend.services.ai_missed_opportunity_observer import record_missed_opportunity_observation
+
+                active_count = sum(1 for p in self.open_positions.values() if float(getattr(p, "quantity", 0) or 0) > 0)
+                record_missed_opportunity_observation(
+                    block_reason=f"PROTECTED_PREFLIGHT:{preflight.reject_reason}",
+                    attempted_symbol=normalized_symbol,
+                    active_positions=active_count,
+                    max_positions=MAX_OPEN_POSITIONS,
+                )
+            return None
+
+        if USE_PROTECTED_LIMIT_EXECUTION:
+            fill_price = float(preflight.expected_avg_fill)
+            exec_fee_rate = MAKER_FEE
+        else:
+            fill_price = price * (1 + SLIPPAGE_PCT)
+            exec_fee_rate = TAKER_FEE
+        fee = quantity * fill_price * exec_fee_rate
+        notional = quantity * fill_price
+        total_cost = notional + fee
+
+        # ACCOUNTING REPAIR: Calculate slippage as total cost (not price delta)
+        # This must be consistent across paper_trades, audit, and internal counters
+        slippage_cost = (fill_price - price) * quantity
+
+        # Apply regime risk multiplier
+        # (This affects sizing in process_bar_decisions, but we log it here)
+        if self._regime_state.risk_multiplier < 1.0:
+            logger.info(f"BUY: {symbol} - regime risk_multiplier={self._regime_state.risk_multiplier:.2f}")
+
+        # =================================================================
+        # SOLE EXECUTION GATE - all discipline checks
+        # =================================================================
+        can_open, block_reason = await self._can_open_position(symbol, total_cost)
+        if not can_open and block_reason == "MAX_POSITIONS_REACHED":
+            rotated = await self._rotate_weakest_position_for_capacity(
+                symbol,
+                confidence,
+                incoming_buy_margin=getattr(explainability, "entry_buy_margin", None),
+            )
+            if rotated:
+                can_open, block_reason = await self._can_open_position(symbol, total_cost)
+        if not can_open:
+            logger.warning(f"BUY_BLOCKED: {symbol} - {block_reason}")
+            await self._record_reject(
+                symbol,
+                "BUY",
+                block_reason,
+                "DISCIPLINE_GATE",
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+            if decision_id:
+                await self._update_pipeline_decision(
+                    decision_id,
+                    {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"DISCIPLINE_GATE:{block_reason}"},
+                )
+            with contextlib.suppress(Exception):
+                from backend.services.ai_missed_opportunity_observer import record_missed_opportunity_observation
+
+                active_count = sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING")
+                record_missed_opportunity_observation(
+                    block_reason=block_reason,
+                    attempted_symbol=symbol,
+                    active_positions=active_count,
+                    max_positions=MAX_OPEN_POSITIONS,
+                )
+            return None
+
+        # Resolve sleeve for position creation — controlled by ENABLE_SLEEVE_BLOCKING
+        effective_sleeve = sleeve or assign_sleeve(normalized_symbol, confidence)
+        sleeve_ok, sleeve_reason = self._check_sleeve_limits(effective_sleeve, total_cost)
+        if not sleeve_ok:
+            logger.info("TELEMETRY_SLEEVE_LIMIT symbol=%s sleeve=%s reason=%s", symbol, effective_sleeve, sleeve_reason)
+            if ENABLE_SLEEVE_BLOCKING:
+                await self._record_reject(
+                    symbol,
+                    "BUY",
+                    sleeve_reason,
+                    "SLEEVE_LIMIT",
+                    decision_id=decision_id,
+                    explainability=explainability,
+                )
+                if decision_id:
+                    await self._update_pipeline_decision(
+                        decision_id,
+                        {
+                            "stage": "EXECUTION",
+                            "execution_result": "NOT_EXECUTED",
+                            "execution_reason": f"SLEEVE_LIMIT:{sleeve_reason}",
+                        },
+                    )
+                return None
+
+        # Double-check cash (should be redundant but critical)
+        if total_cost > self._available_balance:
+            reason = f"total_cost=${total_cost:.2f} > available=${self._available_balance:.2f}"
+            logger.error(f"BUY_BLOCKED_CASH_INVARIANT: {symbol} - {reason}")
+            await self._record_reject(
+                symbol,
+                "BUY",
+                reason,
+                "CASH_INVARIANT",
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+
+            # PIPELINE TRACKING: Record EXECUTION stage failure
+            if decision_id:
+                await self._update_pipeline_decision(decision_id, {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"CASH_INVARIANT: {reason}"})
+            return None
+
+        # Calculate TP levels from PER-COIN volatility profile (day mode)
+        profile = get_coin_profile(symbol)
+        tp1_price = fill_price * (1 + profile["tp"])  # Per-coin take profit %
+        tp2_price = fill_price * (1 + profile["tp"] * 1.5)  # 1.5x TP for extended target
+
+        trade_id = f"mystic_{symbol}_{self._now_ms()}"
+        timestamp = datetime.now(timezone.utc).isoformat()
+        # Keep stored explainability in sync with this row
+        explainability.trade_id = trade_id
+        explainability.timestamp = timestamp
+        explainability.decision_id = decision_id or ""
+        explainability.entry_timestamp = timestamp
+
+        paper_service = get_paper_trading_service()
+        paper_run_id = getattr(paper_service, "paper_run_id", None) or "default"
+        buy_mode = "live" if is_live_execution_allowed_sync() else "paper"
+        buy_strategy_id = str(getattr(explainability, "live_ai_strategy", "") or "").strip() or None
+
+        def _sync_insert():
+            def _op() -> None:
+                with connect_rw(self.db_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        INSERT INTO paper_trades (
+                            trade_id, paper_run_id, mode, symbol, side, quantity, price,
+                            remaining_position, stop_price, take_profit_price,
+                            atr_at_entry, entry_bar_timestamp, confidence,
+                            fees_paid, slippage_cost, timestamp, status,
+                            explainability_json, diagnostics_json, sleeve,
+                            entry_timestamp, decision_id, strategy_id
+                        ) VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            trade_id,
+                            paper_run_id,
+                            buy_mode,
+                            symbol,
+                            quantity,
+                            fill_price,
+                            quantity,  # remaining_position = full quantity
+                            stop_price,
+                            tp1_price,
+                            atr,
+                            bar_timestamp,
+                            confidence,
+                            fee,
+                            slippage_cost,  # ACCOUNTING REPAIR: total cost, not price delta
+                            timestamp,
+                            json.dumps(explainability.to_dict()),
+                            json.dumps(protected_audit),
+                            effective_sleeve,
+                            timestamp,
+                            decision_id or None,
+                            buy_strategy_id,
+                        ),
+                    )
+                    conn.commit()
+
+            try:
+                run_locked_retry(_op)
+            except Exception as e:
+                logger.error(f"PAPER_TRADES_BUY_INSERT_FAILED: {symbol} - {e}", exc_info=True)
+
+        # =================================================================
+        # LIVE EXECUTION: Execute on Binance.US FIRST (C1 fix: never persist executed BUY before order success)
+        # LiveAdapter gate: refuse unless EXECUTION_MODE=live AND LIVE_TRADES_ALLOWED=true
+        # =================================================================
+        live_order_buy = None
+        if self._live_execution_enabled and self._live_service and can_place_live_orders_sync()[0]:
+            try:
+                exchange_symbol = symbol.replace("/", "")
+                logger.warning(
+                    "LIVE_BUY: Protected limit %s qty=%.6f limit=%.8f",
+                    exchange_symbol,
+                    quantity,
+                    preflight.protected_limit_price,
+                )
+
+                live_order_buy = await execute_protected_limit_live(
+                    self._live_service,
+                    symbol=exchange_symbol,
+                    side="buy",
+                    quantity=quantity,
+                    limit_price=preflight.protected_limit_price,
+                )
+
+                if not live_order_buy:
+                    error_msg = "PROTECTED_LIMIT_BUY_NOT_FILLED"
+                    logger.error("LIVE_BUY_FAILED: %s - %s", exchange_symbol, error_msg)
+                    await self._record_reject(
+                        symbol,
+                        "BUY",
+                        error_msg,
+                        "LIVE_BUY_FAILED",
+                        decision_id=decision_id,
+                        explainability=explainability,
+                    )
+                    if decision_id:
+                        await self._update_pipeline_decision(
+                            decision_id,
+                            {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"LIVE_BUY_FAILED:{error_msg}"},
+                        )
+                    return None
+
+                live_order_buy = live_order_buy if isinstance(live_order_buy, dict) else {}
+                live_order_buy = await self._verify_order_fill(live_order_buy, exchange_symbol, "buy")
+                filled_qty = live_order_buy.get("filled")
+                avg_price = live_order_buy.get("average")
+                if filled_qty and float(filled_qty) > 0:
+                    quantity = float(filled_qty)
+                if avg_price and float(avg_price) > 0:
+                    fill_price = float(avg_price)
+                fee = quantity * fill_price * exec_fee_rate
+                slippage_cost = (fill_price - price) * quantity  # Total cost, not price delta
+                total_cost = quantity * fill_price + fee
+                logger.warning(f"LIVE_BUY_SUCCESS: {exchange_symbol} | Order ID: {live_order_buy.get('id')} | Status: {live_order_buy.get('status')} | Filled: {quantity:.6f} @ {fill_price:.4f}")
+            except Exception as e:
+                logger.exception(f"LIVE_BUY_ERROR: {symbol} - {e}")
+                await self._record_reject(
+                    symbol,
+                    "BUY",
+                    str(e),
+                    "LIVE_BUY_ERROR",
+                    decision_id=decision_id,
+                    explainability=explainability,
+                )
+                if decision_id:
+                    await self._update_pipeline_decision(
+                        decision_id,
+                        {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"LIVE_BUY_ERROR:{e!s}"},
+                    )
+                return None
+
+        # Persist trade row only after live order success (or when not in LIVE mode)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _sync_insert)
+
+        try:
+            from backend.services.strategy_runtime_audit import EVT_BUY_EXECUTED, insert_audit_row_async
+
+            await insert_audit_row_async(
+                event_type=EVT_BUY_EXECUTED,
+                decision_id=(decision_id or None),
+                strategy_id=str(getattr(explainability, "live_ai_strategy", "") or "") or None,
+                symbol=symbol,
+                artifact_path=str(getattr(explainability, "artifact_path", "") or "") or None,
+                artifact_sha256=str(getattr(explainability, "artifact_sha256", "") or "") or None,
+                feature_version=int(getattr(explainability, "feature_version", 0) or 0) or None,
+                feature_dim=int(getattr(explainability, "feature_dim", 0) or 0) or None,
+                paper_trade_id=trade_id,
+                extra_json={
+                    "confidence": confidence,
+                    "ctx_age_sec": float(getattr(explainability, "ctx_age_sec", -1.0)),
+                    "ctx_ts_utc": str(getattr(explainability, "ctx_ts_utc", "") or ""),
+                },
+            )
+        except Exception:
+            logger.debug("strategy_runtime_audit BUY_EXECUTED skipped", exc_info=True)
+
+        # =================================================================
+        # UPDATE AUTHORITATIVE LEDGER (conservation of money)
+        # =================================================================
+        # Cash decreases by total cost (canonical: cash = USDT on exchange)
+        self.cash_balance -= total_cost
+        self._available_balance = max(0.0, self.cash_balance)
+
+        # BUY never changes realized_pnl. positions_value and total_equity recomputed below.
+
+        # Fee is a realized cost (reduces equity)
+        # Note: fee is part of total_cost, so equity decreases by fee amount
+
+        # Resolve sleeve: explicit param > assignment function > default
+        effective_sleeve = sleeve or assign_sleeve(normalized_symbol, confidence)
+
+        position = OpenPosition(
+            symbol=normalized_symbol,
+            quantity=quantity,
+            entry_price=fill_price,
+            entry_time=time.time(),
+            trade_id=trade_id,
+            stop_price=stop_price,
+            take_profit_1_price=tp1_price,
+            take_profit_2_price=tp2_price,
+            highest_price=fill_price,
+            lowest_price=fill_price,
+            atr_at_entry=atr,
+            entry_bar_timestamp=bar_timestamp,
+            confidence_at_entry=confidence,
+            entry_fee=fee,
+            sleeve=effective_sleeve,
+            entry_strategy_id=str(getattr(explainability, "live_ai_strategy", "") or ""),
+            original_position_cost=float(total_cost),
+        )
+        self.open_positions[normalized_symbol] = position
+        self._recently_added_symbols[normalized_symbol] = time.time()
+        self._last_buy_ts[symbol] = time.time()  # Cooldown in BOTH modes
+
+        # Store explainability
+        self.trade_explanations[trade_id] = explainability
+        self._prune_trade_explanations()
+
+        # Canonical: total_equity = cash_balance + positions_value (market)
+        await self._recompute_positions_values()
+
+        # Persist position to SQLite + paper Redis BEFORE invariant check so
+        # _get_canonical_positions() matches engine memory (avoids false CANONICAL_MISMATCH on every buy).
+        await self._persist_position_to_sqlite(position)
+        if self._paper_service:
+            try:
+                await self._paper_service.create_buy_order(
+                    symbol=normalized_symbol,
+                    quantity=quantity,
+                    price=fill_price,
+                    confidence=confidence,
+                    trade_id=trade_id,
+                    decision_id=decision_id or None,
+                    sleeve=effective_sleeve,
+                )
+                logger.debug(f"PAPER_SYNC_BUY: {symbol} qty={quantity:.6f} @ ${fill_price:.4f}")
+            except Exception as e:
+                logger.warning(f"PAPER_SYNC_BUY_FAILED: {symbol} - {e}")
+
+        # Validate invariants (must pass after every trade)
+        invariants_ok = await self._validate_invariants("execute_buy_fifo")
+        if not invariants_ok:
+            logger.error(f"BUY_INVARIANT_VIOLATION: {symbol} - ledger may be inconsistent")
+
+        # =================================================================
+        # PERSIST TO SQLITE (survive restarts)
+        # =================================================================
+        await self._persist_ledger_to_sqlite()
+        # =================================================================
+        # ITEM 3: RECORD IMMUTABLE AUDIT TRAIL
+        # =================================================================
+        post_ledger = {
+            "cash_balance": self.cash_balance,
+            "positions_value": self._positions_value,
+            "total_equity": self._total_equity,
+        }
+        await self._record_audit(
+            action="BUY",
+            symbol=symbol,
+            qty=quantity,
+            price=fill_price,
+            fees=fee,
+            slippage=slippage_cost,  # ACCOUNTING REPAIR: total cost, not price delta
+            trade_id=trade_id,
+            pre_ledger=pre_ledger,
+            post_ledger=post_ledger,
+            entry_reason=explainability.regime if explainability else "unknown",
+            sleeve=effective_sleeve,
+        )
+
+        # ITEM 5: Increment buy counters for pacing (overflow if this buy used hourly overflow slot)
+        self.increment_buy_counters(overflow=getattr(self, "_pending_overflow_buy", False))
+        self._pending_overflow_buy = False
+        await self._persist_quality_pacing()
+
+        # Track fees/slippage for scoreboard
+        self._total_fees_paid += fee
+        self._total_slippage_cost += slippage_cost  # ACCOUNTING REPAIR: use consistent variable
+
+        # PIPELINE TRACKING: Record EXECUTION stage
+        if decision_id:
+            await self._update_pipeline_decision(decision_id, {"stage": "EXECUTION", "execution_result": "EXECUTED_BUY", "execution_reason": None})
+
+        self._metrics_buys_executed += 1
+        logger.info(
+            f"BUY_EXECUTED: {symbol} [{effective_sleeve}] | qty={quantity:.6f} @ ${fill_price:.4f} | "
+            f"cost=${total_cost:.2f} | cash=${self.cash_balance:.2f} | "
+            f"SL=${stop_price:.4f} TP1=${tp1_price:.4f} | trade_id={trade_id}"
+        )
+        self._update_strategy_capital_sleeve(
+            strategy_id=str(buy_strategy_id or "day"),
+            realized_pnl_delta=0.0,
+            deployed_capital_delta=float(total_cost),
+            is_win=True,
+        )
+
+        out = {
+            "trade_id": trade_id,
+            "symbol": symbol,
+            "side": "BUY",
+            "quantity": quantity,
+            "price": fill_price,
+            "fee": fee,
+            "total_cost": total_cost,
+            "stop_price": stop_price,
+            "tp1_price": tp1_price,
+            "tp2_price": tp2_price,
+            "cash_after": self.cash_balance,
+            "positions_value_after": self._positions_value,
+            "rank_snapshot_id": getattr(explainability, "rank_snapshot_id", None),
+            "selected_rank": getattr(explainability, "selected_rank", 0),
+            "selected_score": getattr(explainability, "selected_score", 0.0),
+            "selected_net_expected_value": getattr(explainability, "selected_net_expected_value", 0.0),
+        }
+        if live_order_buy:
+            out["exchange_order_id"] = live_order_buy.get("id")
+            out["exchange_filled_qty"] = live_order_buy.get("filled") or quantity
+            out["exchange_avg_price"] = live_order_buy.get("average") or live_order_buy.get("price") or fill_price
+        return out
+
+    async def process_repair_adds_once(
+        self,
+        current_prices: dict[str, float],
+        *,
+        hold_day_bundles: dict[str, dict[str, Any]] | None = None,
+        hold_day_missing: dict[str, list[str]] | None = None,
+        symbols: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Evaluate and execute at most one repair add per eligible open top-4 position.
+        Part of the DAY engine — not a separate bridge; paper only.
+        """
+        from backend.config.repair_add_economics import REPAIR_ADD_ENABLED
+        from backend.services.day_repair_add import evaluate_repair_add
+        from backend.services.execution_mode_service import is_live_execution_allowed_sync
+        from backend.services.live_strategy_contracts import LiveStrategyId, redis_ai_signal_key
+        from backend.utils.symbols import to_exchange_symbol
+
+        if not REPAIR_ADD_ENABLED:
+            return []
+        if is_live_execution_allowed_sync() or self._live_execution_enabled:
+            return []
+
+        hold_bds = hold_day_bundles or {}
+        hold_ms = hold_day_missing or {}
+        target_symbols = symbols or set(self.open_positions.keys())
+        executed: list[dict[str, Any]] = []
+
+        import redis as sync_redis
+
+        rds = sync_redis.Redis(decode_responses=True)
+        current_bar = int(time.time() / self._bar_interval_seconds) * self._bar_interval_seconds
+
+        for sym_raw in list(target_symbols):
+            normalized = normalize_symbol(sym_raw)
+            pos = self.open_positions.get(normalized)
+            if pos is None or float(pos.quantity or 0) <= 0:
+                continue
+            api_sym = to_exchange_symbol(normalized)
+            if api_sym not in DAY_TRADE_SYMBOLS:
+                continue
+
+            mark = float(current_prices.get(normalized) or current_prices.get(sym_raw) or 0.0)
+            if mark <= 0:
+                logger.debug("REPAIR_ADD_SKIP %s missing_mark", normalized)
+                continue
+
+            try:
+                signal = rds.hgetall(redis_ai_signal_key(LiveStrategyId.DAY.value, api_sym)) or {}
+            except Exception as ex:
+                logger.warning("REPAIR_ADD_SKIP %s signal_read_failed: %s", normalized, ex)
+                continue
+
+            ev = evaluate_repair_add(
+                symbol=normalized,
+                quantity=float(pos.quantity),
+                entry_price=float(pos.entry_price),
+                repair_add_count=int(getattr(pos, "repair_add_count", 0) or 0),
+                last_repair_add_ts=float(getattr(pos, "last_repair_add_ts", 0.0) or 0.0),
+                original_position_cost=float(getattr(pos, "original_position_cost", 0.0) or 0.0),
+                mark_price=mark,
+                total_equity=float(self._total_equity or 0.0),
+                cash_balance=float(self.cash_balance or 0.0),
+                signal=signal,
+                day_bundle=hold_bds.get(sym_raw) or hold_bds.get(normalized),
+                day_missing=hold_ms.get(sym_raw) or hold_ms.get(normalized),
+            )
+
+            if not ev.eligible:
+                logger.debug(
+                    "REPAIR_ADD_BLOCKED %s blockers=%s net=%.4f",
+                    normalized,
+                    ";".join(ev.blockers[:6]),
+                    ev.net_pnl_pct,
+                )
+                continue
+
+            result = await self.execute_repair_add_fifo(
+                symbol=normalized,
+                quantity=ev.add_qty,
+                price=mark,
+                evaluation=ev,
+                signal=signal,
+                bar_timestamp=current_bar,
+            )
+            if result:
+                executed.append(result)
+
+        return executed
+
+    async def execute_repair_add_fifo(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        evaluation: Any,
+        signal: dict[str, str],
+        bar_timestamp: int,
+    ) -> dict[str, Any] | None:
+        """
+        Controlled one-time repair add to an existing open DAY top-4 position.
+        Paper only; updates weighted average entry; one paper BUY + one audit row.
+        """
+        from backend.services.day_repair_add import repair_add_trade_ids_json
+        from backend.services.execution_mode_service import is_live_execution_allowed_sync
+        from backend.utils.symbols import to_exchange_symbol
+
+        if is_live_execution_allowed_sync() or self._live_execution_enabled:
+            logger.warning("REPAIR_ADD_BLOCKED %s live_execution_disabled_path", symbol)
+            return None
+
+        normalized_symbol = normalize_symbol(symbol)
+        position = self.open_positions.get(normalized_symbol)
+        if position is None or float(position.quantity or 0) <= 0:
+            return None
+
+        pre_ledger = {
+            "cash_balance": self.cash_balance,
+            "positions_value": self._positions_value,
+            "total_equity": self._total_equity,
+        }
+        old_entry = float(position.entry_price)
+        old_qty = float(position.quantity)
+
+        can_buy, kill_reason = self._check_kill_switch_buy()
+        if not can_buy:
+            await self._record_reject(normalized_symbol, "BUY", kill_reason, "REPAIR_ADD_KILL_SWITCH")
+            return None
+        if self._account_status != AccountStatus.HEALTHY:
+            await self._record_reject(
+                normalized_symbol,
+                "BUY",
+                f"account_status={self._account_status.value}",
+                "REPAIR_ADD_HARD_FUSE",
+            )
+            return None
+        if self._trading_paused:
+            await self._record_reject(
+                normalized_symbol,
+                "BUY",
+                f"trading_paused={self._pause_reason}",
+                "REPAIR_ADD_HARD_FUSE",
+            )
+            return None
+
+        self._metrics_buys_attempted += 1
+        await self._entry_ensure_constraints(normalized_symbol)
+        qty_q, reason, _est_notional = self._normalize_order_amount(
+            symbol=normalized_symbol,
+            raw_qty=quantity,
+            price=price,
+            side="BUY",
+        )
+        if reason != "ok":
+            await self._record_reject(normalized_symbol, "BUY", reason, "REPAIR_ADD_EXCHANGE")
+            return None
+        quantity = qty_q
+
+        from backend.services.protected_limit_execution import run_protected_preflight
+
+        preflight = await run_protected_preflight(
+            symbol=normalized_symbol,
+            side="BUY",
+            quantity=quantity,
+            reference_price=price,
+            live_capable=False,
+        )
+        protected_audit = preflight.to_audit_dict()
+        if not preflight.passed:
+            await self._record_reject(
+                normalized_symbol,
+                "BUY",
+                preflight.reject_reason,
+                "REPAIR_ADD_PROTECTED_PREFLIGHT",
+            )
+            return None
+
+        if USE_PROTECTED_LIMIT_EXECUTION:
+            fill_price = float(preflight.expected_avg_fill)
+            exec_fee_rate = MAKER_FEE
+        else:
+            fill_price = price * (1 + SLIPPAGE_PCT)
+            exec_fee_rate = TAKER_FEE
+        fee = quantity * fill_price * exec_fee_rate
+        total_cost = quantity * fill_price + fee
+        slippage_cost = (fill_price - price) * quantity
+
+        if total_cost > self._available_balance:
+            await self._record_reject(
+                normalized_symbol,
+                "BUY",
+                f"total_cost={total_cost:.2f}>available={self._available_balance:.2f}",
+                "REPAIR_ADD_CASH",
+            )
+            return None
+
+        effective_sleeve = getattr(position, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value
+        sleeve_ok, sleeve_reason = self._check_sleeve_limits(effective_sleeve, total_cost)
+        if not sleeve_ok:
+            logger.info(
+                "REPAIR_ADD_SLEEVE_LIMIT symbol=%s sleeve=%s reason=%s",
+                normalized_symbol,
+                effective_sleeve,
+                sleeve_reason,
+            )
+            if ENABLE_SLEEVE_BLOCKING:
+                await self._record_reject(
+                    normalized_symbol,
+                    "BUY",
+                    sleeve_reason,
+                    "REPAIR_ADD_SLEEVE",
+                )
+                return None
+
+        try:
+            confidence = float(signal.get("confidence") or evaluation.signal_confidence or 0.0)
+        except (TypeError, ValueError):
+            confidence = float(evaluation.signal_confidence or 0.0)
+
+        trade_id = f"mystic_repair_{normalized_symbol}_{self._now_ms()}"
+        timestamp = datetime.now(timezone.utc).isoformat()
+        decision_id = f"repair_{to_exchange_symbol(normalized_symbol)}_{self._now_ms()}"
+
+        explainability = TradeExplainability(
+            trade_id=trade_id,
+            symbol=normalized_symbol,
+            side="BUY",
+            timestamp=timestamp,
+            ai_confidence=confidence,
+            live_ai_strategy="day",
+            feature_version=int(signal.get("feature_version") or 5),
+            feature_dim=int(signal.get("feature_dim") or 145),
+        )
+        explainability.decision_id = decision_id
+        explainability.entry_timestamp = timestamp
+        explainability.regime = "repair_add"
+        if signal.get("context_audit_emit"):
+            explainability.context_audit_emit = str(signal.get("context_audit_emit"))
+
+        paper_service = get_paper_trading_service()
+        paper_run_id = getattr(paper_service, "paper_run_id", None) or "default"
+        effective_sleeve = getattr(position, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value
+        stop_price = float(position.stop_price or 0.0)
+        tp1_price = float(position.take_profit_1_price or 0.0)
+        atr = float(position.atr_at_entry or 0.0)
+
+        repair_meta = {
+            "repair_add": True,
+            "old_entry_price": old_entry,
+            "old_quantity": old_qty,
+            "old_recovery_price": float(evaluation.old_recovery_price),
+            "new_recovery_price": float(evaluation.new_recovery_price),
+            "recovery_improvement_pct": float(evaluation.recovery_improvement_pct),
+            "original_position_cost": float(evaluation.original_cost),
+        }
+        exp_dict = explainability.to_dict()
+        exp_dict.update(repair_meta)
+
+        def _sync_insert():
+            def _op() -> None:
+                with connect_rw(self.db_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        INSERT INTO paper_trades (
+                            trade_id, paper_run_id, mode, symbol, side, quantity, price,
+                            remaining_position, stop_price, take_profit_price,
+                            atr_at_entry, entry_bar_timestamp, confidence,
+                            fees_paid, slippage_cost, timestamp, status,
+                            explainability_json, diagnostics_json, sleeve,
+                            entry_timestamp, decision_id, strategy_id
+                        ) VALUES (?, ?, 'paper', ?, 'BUY', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, 'day')
+                    """,
+                        (
+                            trade_id,
+                            paper_run_id,
+                            normalized_symbol,
+                            quantity,
+                            fill_price,
+                            stop_price,
+                            tp1_price,
+                            atr,
+                            bar_timestamp,
+                            confidence,
+                            fee,
+                            slippage_cost,
+                            timestamp,
+                            json.dumps(exp_dict),
+                            json.dumps({**repair_meta, **protected_audit}),
+                            effective_sleeve,
+                            timestamp,
+                            decision_id,
+                        ),
+                    )
+                    conn.commit()
+
+            run_locked_retry(_op)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _sync_insert)
+
+        new_qty = old_qty + quantity
+        new_entry = (old_entry * old_qty + fill_price * quantity) / new_qty if new_qty > 0 else old_entry
+        new_entry_fee = float(getattr(position, "entry_fee", 0.0) or 0.0) + fee
+
+        ids = repair_add_trade_ids_json(getattr(position, "repair_add_trade_ids", "[]"))
+        ids.append(trade_id)
+        now_ts = time.time()
+
+        position.quantity = new_qty
+        position.entry_price = new_entry
+        position.entry_fee = new_entry_fee
+        position.repair_add_count = int(getattr(position, "repair_add_count", 0) or 0) + 1
+        position.last_repair_add_ts = now_ts
+        position.repair_add_trade_ids = json.dumps(ids)
+        position.average_entry_after_repair = new_entry
+        position.add_count = position.repair_add_count
+        position.last_add_ts = now_ts
+        if float(getattr(position, "original_position_cost", 0.0) or 0.0) <= 0:
+            position.original_position_cost = float(evaluation.original_cost or old_entry * old_qty)
+
+        self.cash_balance -= total_cost
+        self._available_balance = max(0.0, self.cash_balance)
+        self.trade_explanations[trade_id] = explainability
+        self._prune_trade_explanations()
+
+        await self._recompute_positions_values()
+        await self._persist_position_to_sqlite(position)
+        await asyncio.to_thread(self._sync_paper_fifo_remaining_to_engine_positions_sync)
+        await self._persist_ledger_to_sqlite()
+
+        post_ledger = {
+            "cash_balance": self.cash_balance,
+            "positions_value": self._positions_value,
+            "total_equity": self._total_equity,
+        }
+        await self._record_audit(
+            action="BUY",
+            symbol=normalized_symbol,
+            qty=quantity,
+            price=fill_price,
+            fees=fee,
+            slippage=slippage_cost,
+            trade_id=trade_id,
+            pre_ledger=pre_ledger,
+            post_ledger=post_ledger,
+            entry_reason="repair_add",
+            sleeve=effective_sleeve,
+        )
+
+        self._metrics_buys_executed += 1
+        self._total_fees_paid += fee
+        self._total_slippage_cost += slippage_cost
+        await self._validate_invariants("execute_repair_add_fifo")
+
+        logger.warning(
+            "REPAIR_ADD_EXECUTED %s qty=%.8f @ %.4f old_entry=%.4f new_entry=%.4f old_recovery=%.4f new_recovery=%.4f improve=%.4f%% trade_id=%s",
+            normalized_symbol,
+            quantity,
+            fill_price,
+            old_entry,
+            new_entry,
+            float(evaluation.old_recovery_price),
+            float(evaluation.new_recovery_price),
+            float(evaluation.recovery_improvement_pct) * 100.0,
+            trade_id,
+        )
+
+        return {
+            "trade_id": trade_id,
+            "symbol": normalized_symbol,
+            "side": "REPAIR_ADD",
+            "quantity": quantity,
+            "price": fill_price,
+            "old_entry_price": old_entry,
+            "new_entry_price": new_entry,
+            "old_recovery_price": float(evaluation.old_recovery_price),
+            "new_recovery_price": float(evaluation.new_recovery_price),
+            "recovery_improvement_pct": float(evaluation.recovery_improvement_pct),
+            "repair_add_count": position.repair_add_count,
+            "total_cost": total_cost,
+        }
+
+    def _fetch_authoritative_open_position_sync(self, symbol: str) -> tuple[float, str, float] | None:
+        """Return (quantity, trade_id, entry_price) from portfolio_engine_positions or None."""
+        normalized = normalize_symbol(symbol)
+        try:
+            with connect_rw(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT quantity, trade_id, entry_price
+                    FROM portfolio_engine_positions
+                    WHERE symbol = ? AND quantity > 0
+                    LIMIT 1
+                    """,
+                    (normalized,),
+                ).fetchone()
+            if not row:
+                return None
+            qty, trade_id, entry_price = row
+            if float(qty or 0) <= 0:
+                return None
+            return float(qty), str(trade_id or ""), float(entry_price or 0)
+        except Exception as e:
+            logger.debug("_fetch_authoritative_open_position_sync failed %s: %s", normalized, e)
+            return None
+
+    def _entry_close_already_recorded_sync(self, symbol: str, entry_trade_id: str, quantity: float) -> bool:
+        """True when position_close_ledger already records a full close for this entry lot."""
+        if not entry_trade_id:
+            return False
+        try:
+            with connect_rw(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM position_close_ledger
+                    WHERE symbol = ? AND sell_trade_id = ? AND ABS(quantity - ?) < 1e-6
+                    LIMIT 1
+                    """,
+                    (normalize_symbol(symbol), entry_trade_id, float(quantity)),
+                ).fetchone()
+            return row is not None
+        except Exception:
+            return False
+
+    def _sell_idempotency_duplicate_sync(
+        self,
+        symbol: str,
+        entry_trade_id: str,
+        quantity: float,
+        exit_trigger: str,
+    ) -> bool:
+        """True when an identical full close was already persisted for this open lot."""
+        if self._entry_close_already_recorded_sync(symbol, entry_trade_id, quantity):
+            return True
+        try:
+            with connect_rw(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM paper_trades
+                    WHERE symbol = ? AND UPPER(side) = 'SELL' AND ABS(quantity - ?) < 1e-6
+                      AND exit_reason = ? AND status = 'executed'
+                      AND COALESCE(json_extract(explainability_json, '$.paper_entry_trade_id'), '') = ?
+                    LIMIT 1
+                    """,
+                    (
+                        normalize_symbol(symbol),
+                        float(quantity),
+                        str(exit_trigger or ""),
+                        str(entry_trade_id or ""),
+                    ),
+                ).fetchone()
+            return row is not None
+        except Exception:
+            return False
+
+    async def execute_sell_fifo(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        exit_type: ExitType,
+        exit_trigger: str,
+        current_bar: int | None = None,
+        force_sell: bool = False,
+    ) -> dict[str, Any] | None:
+        """
+        PHASE 1: Execute SELL with FIFO matching against BUY lots.
+        Decrements remaining_position on matched BUY rows.
+        current_bar: bar close timestamp (seconds) for cooldown; from integration when sell is from exit monitor.
+        Elite Hardening: Kill switch check + audit trail.
+        """
+        # Capture pre-ledger for audit
+        pre_ledger = {
+            "cash_balance": self.cash_balance,
+            "positions_value": self._positions_value,
+            "total_equity": self._total_equity,
+        }
+
+        # =================================================================
+        # ITEM 1: KILL SWITCH CHECK (only PAUSE_ALL blocks sells)
+        # =================================================================
+        can_sell, kill_reason = self._check_kill_switch_sell()
+        if not can_sell:
+            logger.warning(f"SELL_BLOCKED: {symbol} - {kill_reason}")
+            return None
+
+        # =================================================================
+        # EXIT-IN-PROGRESS GATE: Block repeated SELL attempts for same symbol
+        # =================================================================
+        normalized_symbol = normalize_symbol(symbol)
+        if normalized_symbol in self._exit_in_progress:
+            await self._record_reject(normalized_symbol, "SELL", "exit_already_in_progress", "EXECUTION_GATE")
+            return None
+
+        open_row = await asyncio.to_thread(self._fetch_authoritative_open_position_sync, normalized_symbol)
+        if not open_row:
+            logger.warning(
+                "SELL_IDEMPOTENCY_ALREADY_CLOSED: %s has no open row in portfolio_engine_positions",
+                normalized_symbol,
+            )
+            await self._record_reject(
+                normalized_symbol,
+                "SELL",
+                "SELL_IDEMPOTENCY_ALREADY_CLOSED",
+                "EXECUTION_GATE",
+            )
+            async with self._deletion_lock:
+                self.open_positions.pop(normalized_symbol, None)
+            return None
+
+        db_qty, db_trade_id, db_entry = open_row
+        position = self.open_positions.get(normalized_symbol)
+        if not position:
+            await self._load_positions_from_sqlite()
+            position = self.open_positions.get(normalized_symbol)
+        if not position:
+            logger.warning(
+                "SELL_REHYDRATE: sqlite open row for %s but engine memory empty after reload",
+                normalized_symbol,
+            )
+            return None
+        if abs(float(position.quantity) - db_qty) > 1e-6 or (position.trade_id or "") != db_trade_id:
+            position.quantity = db_qty
+            position.trade_id = db_trade_id
+            position.entry_price = db_entry
+
+        log_decision_trace(
+            "SELL",
+            symbol,
+            {"reason_code": exit_type.name, "exit_trigger": exit_trigger, "qty": quantity},
+        )
+
+        if quantity > position.quantity:
+            logger.error(f"SELL_ERROR: Quantity {quantity} > position {position.quantity} for {symbol}")
+            return None
+
+        sell_eval = await self._evaluate_sell_profitability(
+            symbol=normalized_symbol,
+            position=position,
+            exit_type=exit_type,
+            exit_trigger=exit_trigger,
+            force_sell=force_sell,
+        )
+        logger.info(
+            "SELL_PROFIT_EVAL %s",
+            json.dumps(
+                {
+                    "symbol": sell_eval["symbol"],
+                    "reason": sell_eval["reason"],
+                    "exit_branch": sell_eval["exit_branch"],
+                    "avg_entry_price": round(float(sell_eval["avg_entry_price"]), 8),
+                    "mark_price": sell_eval["mark_price"],
+                    "mark_source": sell_eval["mark_source"],
+                    "mark_age_seconds": sell_eval["mark_age_seconds"],
+                    "gross_pct": round(float(sell_eval["gross_pct"]), 6),
+                    "effective_exit_cost_pct": round(float(sell_eval["effective_exit_cost_pct"]), 6),
+                    "effective_roundtrip_cost_pct": round(float(sell_eval["effective_roundtrip_cost_pct"]), 6),
+                    "net_exit_pct": round(float(sell_eval["net_exit_pct"]), 6),
+                    "roundtrip_net_pct": round(float(sell_eval["roundtrip_net_pct"]), 6),
+                    "required_profit_buffer_pct": round(float(sell_eval["required_profit_buffer_pct"]), 6),
+                    "allowed": bool(sell_eval["allowed"]),
+                    "block_reason": sell_eval["block_reason"],
+                    "emergency_flag": bool(sell_eval["emergency_flag"]),
+                    "measured_cost_sample_count": int(sell_eval["measured_cost_sample_count"]),
+                    "measured_cost_p75": round(float(sell_eval["measured_cost_p75"]), 6),
+                },
+                separators=(",", ":"),
+            ),
+        )
+        # Fallback: when mark feed is temporarily unavailable, allow the
+        # explicitly provided execution price to act as sell mark so manual/proof
+        # exits can proceed through canonical FIFO+outcome paths.
+        if not bool(sell_eval["allowed"]) and str(sell_eval.get("block_reason") or "") in {"SELL_MARK_MISSING", "SELL_MARK_STALE"} and float(price or 0.0) > 0.0:
+            sell_eval["allowed"] = True
+            sell_eval["block_reason"] = ""
+            sell_eval["mark_price"] = float(price)
+            sell_eval["mark_source"] = "caller_price_fallback"
+            sell_eval["mark_age_seconds"] = 0.0
+        if not bool(sell_eval["allowed"]):
+            await self._record_reject(
+                normalized_symbol,
+                "SELL",
+                str(sell_eval["block_reason"] or "sell_profitability_block"),
+                "PROFITABILITY_GATE",
+            )
+            return None
+        if sell_eval.get("mark_price") is not None:
+            price = float(sell_eval["mark_price"])
+
+        # SELL PRECISION: Reuse same normalization as buy path (BUG-2 fix)
+        await self._entry_ensure_constraints(normalized_symbol)
+        qty_q, norm_reason, _ = self._normalize_order_amount(
+            symbol=normalized_symbol,
+            raw_qty=quantity,
+            price=price,
+            side="SELL",
+        )
+        if norm_reason != "ok":
+            logger.debug(f"SELL_NORMALIZE: {symbol} reason={norm_reason} qty_q={qty_q}")
+        quantity = max(0.0, qty_q)
+
+        from backend.services.execution_mode_service import is_live_execution_allowed_sync
+        from backend.services.protected_limit_execution import (
+            evaluate_executable_sell_profit,
+            execute_protected_limit_live,
+            run_protected_preflight,
+        )
+
+        sell_preflight_audit: dict[str, Any] = {}
+        sell_exec_fee_rate = TAKER_FEE
+
+        async def _protected_live_sell(qty: float) -> dict[str, Any] | None:
+            pf = await run_protected_preflight(
+                symbol=normalized_symbol,
+                side="SELL",
+                quantity=qty,
+                reference_price=price,
+                live_capable=True,
+            )
+            if not pf.passed:
+                logger.warning(
+                    "SELL_PROTECTED_PREFLIGHT_REJECT %s reason=%s qty=%.8f",
+                    normalized_symbol,
+                    pf.reject_reason,
+                    qty,
+                )
+                await self._record_reject(
+                    normalized_symbol,
+                    "SELL",
+                    pf.reject_reason,
+                    "PROTECTED_PREFLIGHT",
+                )
+                return None
+            exec_px = float(pf.expected_avg_fill) if USE_PROTECTED_LIMIT_EXECUTION else price * (1 - SLIPPAGE_PCT)
+            exec_fee = MAKER_FEE if USE_PROTECTED_LIMIT_EXECUTION else TAKER_FEE
+            exec_check = evaluate_executable_sell_profit(
+                entry_price=float(position.entry_price),
+                quantity=qty,
+                executable_sell_price=exec_px,
+                entry_fee=float(getattr(position, "entry_fee", 0) or 0),
+                sell_fee_rate=exec_fee,
+                position_qty=float(position.quantity),
+                mark_price=float(price),
+            )
+            if not exec_check.passed:
+                logger.warning(
+                    "SELL_EXECUTABLE_FILL_BLOCKED %s reason=%s exec_px=%.8f entry=%.8f mark=%.8f gross=%.6f net_pct=%.6f net_usd=%.4f",
+                    normalized_symbol,
+                    exec_check.reject_reason,
+                    exec_px,
+                    float(position.entry_price),
+                    float(price),
+                    exec_check.executable_gross_pct,
+                    exec_check.executable_net_pct,
+                    exec_check.executable_net_profit_usd,
+                )
+                await self._record_reject(
+                    normalized_symbol,
+                    "SELL",
+                    exec_check.reject_reason,
+                    "EXECUTABLE_FILL_GATE",
+                )
+                return None
+            return await execute_protected_limit_live(
+                self._live_service,
+                symbol=_to_api_symbol(symbol),
+                side="sell",
+                quantity=qty,
+                limit_price=pf.protected_limit_price,
+            )
+
+        hold_time_seconds = time.time() - position.entry_time
+        timestamp = datetime.now(timezone.utc).isoformat()
+        sell_trade_id = f"mystic_sell_{symbol}_{int(time.time() * 1000)}"
+        # Phase 5: dust writeoff metadata for _sync_fifo_sell (set in live block when dust)
+        dust_reason_str = ""
+        dust_est_notional_val = 0.0
+
+        def _sync_fifo_sell():
+            def _op():
+                with connect_rw(self.db_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.cursor()
+
+                    # PHASE 2 FIX: Use AUTHORITATIVE ledger (portfolio_engine_positions) not paper_trades
+                    # Since MAX_OPEN_PER_SYMBOL=1, there's exactly one position per symbol
+                    cursor.execute(
+                        """
+                        SELECT quantity, trade_id, entry_price
+                        FROM portfolio_engine_positions
+                        WHERE symbol = ?
+                    """,
+                        (normalized_symbol,),
+                    )
+
+                    position_row = cursor.fetchone()
+                    if not position_row:
+                        logger.warning(
+                            "POSITION_ALREADY_CLOSED: %s missing from portfolio_engine_positions inside sell txn",
+                            normalized_symbol,
+                        )
+                        conn.rollback()
+                        return False
+
+                    available_qty, position_trade_id, _ = position_row
+                    if float(available_qty or 0) <= 0:
+                        logger.warning("POSITION_ALREADY_CLOSED: %s authoritative qty=%s", normalized_symbol, available_qty)
+                        conn.rollback()
+                        return False
+
+                    if self._sell_idempotency_duplicate_sync(normalized_symbol, position_trade_id, quantity, exit_trigger):
+                        logger.warning(
+                            "SELL_IDEMPOTENCY_ALREADY_CLOSED: %s entry_trade_id=%s qty=%.8f exit=%s",
+                            normalized_symbol,
+                            position_trade_id,
+                            quantity,
+                            exit_trigger,
+                        )
+                        conn.rollback()
+                        return False
+
+                    if quantity > available_qty:
+                        logger.error(f"FIFO_ERROR: Sell quantity {quantity} > available {available_qty} for {normalized_symbol}")
+                        conn.rollback()
+                        return False
+
+                    # Update authoritative position quantity
+                    new_qty = available_qty - quantity
+                    if new_qty > 0:
+                        # Partial exit - update quantity
+                        cursor.execute(
+                            """
+                            UPDATE portfolio_engine_positions
+                            SET quantity = ?, last_updated = ?
+                            WHERE symbol = ?
+                        """,
+                            (new_qty, timestamp, normalized_symbol),
+                        )
+                        logger.debug(f"FIFO_MATCH: {normalized_symbol} partial exit | sold {quantity}, remaining {new_qty}")
+                    else:
+                        # Full exit - DELETE position in same transaction as SELL record (Phase 1)
+                        cursor.execute("DELETE FROM portfolio_engine_positions WHERE symbol = ?", (normalized_symbol,))
+                        logger.debug(f"FIFO_MATCH: {normalized_symbol} full exit | sold {quantity}")
+
+                    # Update paper_trades lot tracking by trade_id (Phase 1: trade_id-anchored, not ORDER BY/LIMIT)
+                    cursor.execute(
+                        """
+                        UPDATE paper_trades
+                        SET remaining_position = MAX(0, remaining_position - ?)
+                        WHERE trade_id = ?
+                    """,
+                        (quantity, position_trade_id),
+                    )
+
+                    entry_ts_bind = ""
+                    buy_decision_id = ""
+                    buy_row_strategy_id: str | None = None
+                    try:
+                        cursor.execute(
+                            """
+                            SELECT timestamp, entry_timestamp, decision_id, strategy_id
+                            FROM paper_trades
+                            WHERE trade_id = ? AND UPPER(side) = 'BUY'
+                            LIMIT 1
+                            """,
+                            (position_trade_id,),
+                        )
+                        br = cursor.fetchone()
+                        if br:
+                            buy_ts, buy_et, buy_did = br[0], br[1], br[2]
+                            entry_ts_bind = (buy_et or buy_ts or "") or ""
+                            buy_decision_id = (buy_did or "") or ""
+                            if len(br) > 3 and br[3]:
+                                buy_row_strategy_id = str(br[3]).strip() or None
+                    except sqlite3.Error:
+                        entry_ts_bind = ""
+                        buy_decision_id = ""
+                        buy_row_strategy_id = None
+                    if not entry_ts_bind and getattr(position, "entry_time", None):
+                        try:
+                            entry_ts_bind = datetime.fromtimestamp(float(position.entry_time), tz=timezone.utc).isoformat()
+                        except (TypeError, ValueError, OSError):
+                            entry_ts_bind = ""
+
+                    # Get explainability from original trade (must always persist exit_trigger for analysis)
+                    original_explain: dict[str, Any] = {}
+                    if position.trade_id in self.trade_explanations:
+                        explain = self.trade_explanations[position.trade_id]
+                        explain.exit_type = exit_type.value
+                        explain.exit_r_multiple = r_multiple
+                        explain.exit_trigger = exit_trigger
+                        original_explain = explain.to_dict()
+                    original_explain["model_trained_at"] = getattr(explain, "model_trained_at", "") or original_explain.get("model_trained_at", "")
+                    original_explain["model_accuracy"] = getattr(explain, "model_accuracy", None) or original_explain.get("model_accuracy")
+                    original_explain["signal_ts_utc"] = getattr(explain, "signal_content_timestamp", "") or original_explain.get("signal_content_timestamp", "")
+                    if not original_explain.get("feature_version"):
+                        original_explain["feature_version"] = 5
+                    if not original_explain.get("feature_dim"):
+                        original_explain["feature_dim"] = 145
+                    if not original_explain.get("live_ai_strategy"):
+                        original_explain["live_ai_strategy"] = str(getattr(position, "entry_strategy_id", "") or "day")
+                    original_explain["exit_trigger"] = exit_trigger
+                    original_explain["exit_type"] = exit_type.value
+                    if sell_preflight_audit:
+                        original_explain.update(sell_preflight_audit)
+
+                    # EXIT REPAIR 2026-04-08 (STEP 7): Add MFE/MAE and diagnostic fields for forensics
+                    _high = float(position.highest_price or 0.0)
+                    _low = float(getattr(position, "lowest_price", 0.0) or 0.0)
+                    _entry = position.entry_price
+                    mfe_pct = (_high - _entry) / _entry if _entry > 0 and _high > _entry else 0.0
+                    mae_pct = (_entry - _low) / _entry if _entry > 0 and _low > 0 and _low < _entry else 0.0
+                    was_green_before_red = mfe_pct > ESTIMATED_ROUNDTRIP_COST and pnl_pct < 0
+                    original_explain["mfe_pct"] = round(mfe_pct, 6)
+                    original_explain["mae_pct"] = round(mae_pct, 6)
+                    original_explain["high_since_entry"] = round(_high, 8)
+                    original_explain["low_since_entry"] = round(_low, 8)
+                    original_explain["was_green_before_red"] = was_green_before_red
+                    original_explain["sleeve"] = getattr(position, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value
+                    original_explain["entry_confidence"] = getattr(position, "confidence_at_entry", 0.0) or 0.0
+                    original_explain["hold_time_seconds"] = int(hold_time_seconds)
+                    original_explain["exit_reason_full"] = exit_trigger
+                    original_explain["paper_entry_trade_id"] = position_trade_id
+                    original_explain["paper_entry_timestamp"] = entry_ts_bind
+                    original_explain["entry_decision_id"] = buy_decision_id
+                    original_explain["decision_id"] = buy_decision_id
+                    original_explain["symbol_canonical_no_slash"] = (normalized_symbol or "").replace("/", "").upper()
+                    ai_exit_data = original_explain.get("ai_exit_scores") if isinstance(original_explain.get("ai_exit_scores"), dict) else {}
+                    if not ai_exit_data:
+                        latest_ai_exit = getattr(position, "latest_ai_exit_scores", None)
+                        if isinstance(latest_ai_exit, dict):
+                            ai_exit_data = dict(latest_ai_exit)
+                            original_explain["ai_exit_scores"] = ai_exit_data
+                    original_explain["ai_exit_recommended_action"] = str(ai_exit_data.get("recommended_action") or "")
+                    original_explain["ai_exit_hold_score"] = float(ai_exit_data.get("AI_EXIT_HOLD_SCORE") or 0.0)
+                    original_explain["ai_exit_take_profit_score"] = float(ai_exit_data.get("AI_EXIT_TAKE_PROFIT_SCORE") or 0.0)
+                    original_explain["ai_exit_cut_score"] = float(ai_exit_data.get("AI_EXIT_CUT_SCORE") or 0.0)
+                    original_explain["ai_exit_trail_score"] = float(ai_exit_data.get("AI_EXIT_TRAIL_SCORE") or 0.0)
+                    original_explain["ai_exit_confidence"] = float(ai_exit_data.get("confidence") or 0.0)
+                    original_explain["ai_exit_expected_value"] = float(ai_exit_data.get("exit_expected_value") or 0.0)
+                    original_explain["ai_exit_reason_json"] = ai_exit_data.get("reason_json") or {}
+                    original_explain["time_in_trade_sec"] = float(ai_exit_data.get("time_in_trade_sec") or hold_time_seconds or 0.0)
+                    original_explain["max_favorable_excursion"] = float(
+                        ai_exit_data.get("max_favorable_excursion") or original_explain.get("mfe_pct") or getattr(position, "max_favorable_excursion", 0.0) or 0.0
+                    )
+                    original_explain["max_adverse_excursion"] = float(
+                        ai_exit_data.get("max_adverse_excursion") or original_explain.get("mae_pct") or getattr(position, "max_adverse_excursion", 0.0) or 0.0
+                    )
+                    original_explain["mfe_giveback_pct"] = float(ai_exit_data.get("mfe_giveback_pct") or getattr(position, "mfe_giveback_pct", 0.0) or 0.0)
+                    original_explain["exit_quality_label"] = str(ai_exit_data.get("exit_quality_label") or getattr(position, "exit_quality_label", "neutral") or "neutral")
+
+                    et_full = str(exit_trigger or "")
+                    if et_full.startswith("day_sk_"):
+                        original_explain["exit_skeleton_owned"] = True
+                        original_explain["exit_skeleton_strategy"] = "day"
+                        original_explain["exit_skeleton_exit_tag"] = et_full[len("day_sk_") :]
+                    else:
+                        original_explain["exit_skeleton_owned"] = False
+                        original_explain["exit_skeleton_strategy"] = ""
+                        original_explain["exit_skeleton_exit_tag"] = ""
+
+                    # Phase 5: dust writeoff - exit_type, status, fees, slippage, price, explainability
+                    from backend.services.execution_mode_service import is_live_execution_allowed_sync
+
+                    sell_mode = "live" if is_live_execution_allowed_sync() else "paper"
+                    if dust_writeoff:
+                        exit_type_val = "DUST_WRITEOFF"
+                        sell_status = "dust_writeoff"
+                        fees_paid_val = 0.0
+                        slippage_cost_val = 0.0
+                        price_val = fill_price  # dust_price_snapshot
+                        original_explain["dust_writeoff"] = True
+                        original_explain["dust_reason"] = dust_reason_str
+                        original_explain["dust_est_notional"] = dust_est_notional_val
+                    else:
+                        exit_type_val = exit_type.value
+                        sell_status = "executed"
+                        fees_paid_val = fee
+                        # ACCOUNTING REPAIR: total slippage cost, not price delta
+                        slippage_cost_val = (price - fill_price) * quantity
+                        price_val = fill_price
+
+                    paper_service = get_paper_trading_service()
+                    paper_run_id = getattr(paper_service, "paper_run_id", None) or "default"
+
+                    pos_sleeve = getattr(position, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value
+                    sell_strategy_id = buy_row_strategy_id or str(getattr(position, "entry_strategy_id", "") or "").strip() or None
+                    original_explain["strategy_id"] = sell_strategy_id or ""
+
+                    cursor.execute(
+                        """
+                        INSERT INTO paper_trades (
+                            trade_id, paper_run_id, mode, symbol, side, quantity, price,
+                            entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
+                            fees_paid, slippage_cost, exit_type, exit_r_multiple,
+                            timestamp, status, explainability_json, diagnostics_json, sleeve,
+                            exit_reason, entry_timestamp, decision_id, strategy_id
+                        ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            sell_trade_id,
+                            paper_run_id,
+                            sell_mode,
+                            symbol,
+                            quantity,
+                            price_val,
+                            position.entry_price,
+                            realized_pnl,
+                            pnl_pct,
+                            int(hold_time_seconds),
+                            fees_paid_val,
+                            slippage_cost_val,
+                            exit_type_val,
+                            r_multiple,
+                            timestamp,
+                            sell_status,
+                            json.dumps(original_explain),
+                            json.dumps(sell_preflight_audit) if sell_preflight_audit else None,
+                            pos_sleeve,
+                            exit_trigger,
+                            entry_ts_bind or None,
+                            buy_decision_id or None,
+                            sell_strategy_id,
+                        ),
+                    )
+
+                    # Phase 5: dust writeoffs audit - insert row when dust writeoff
+                    if dust_writeoff:
+                        # BUG #2 FIX: Add retry logic for dust writeoff persistence
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                cursor.execute(
+                                    """
+                                    INSERT INTO dust_writeoffs
+                                    (timestamp, symbol, quantity, entry_price, price_snapshot, est_notional, reason, sell_trade_id)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (
+                                        timestamp,
+                                        symbol,
+                                        quantity,
+                                        position.entry_price,
+                                        fill_price,
+                                        dust_est_notional_val,
+                                        dust_reason_str,
+                                        sell_trade_id,
+                                    ),
+                                )
+                                break  # Success, exit retry loop
+                            except Exception as e:
+                                if attempt < max_retries - 1:
+                                    logger.warning(f"BUG #2: Dust writeoff insert failed (attempt {attempt + 1}), retrying: {e}")
+                                else:
+                                    logger.exception(f"BUG #2: Dust writeoff insert failed after {max_retries} attempts: {e}")
+                                    raise
+
+                    try:
+                        from backend.services.strategy_runtime_audit import EVT_SELL_EXECUTED, ensure_strategy_runtime_audit_table
+
+                        ensure_strategy_runtime_audit_table(self.db_path)
+                        cursor.execute(
+                            """
+                            INSERT INTO strategy_runtime_audit (
+                                ts_utc, event_type, decision_id, strategy_id, symbol, redis_signal_key,
+                                artifact_path, artifact_sha256, feature_version, feature_dim,
+                                context_fresh, context_age_sec, context_defaulted_json,
+                                reject_reason, paper_trade_id, buy_trade_id, sell_trade_id,
+                                exit_reason, exit_type, extra_json
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            (
+                                timestamp,
+                                EVT_SELL_EXECUTED,
+                                buy_decision_id or None,
+                                sell_strategy_id or str(getattr(position, "entry_strategy_id", "") or "") or None,
+                                str(symbol),
+                                None,
+                                original_explain.get("artifact_path") or None,
+                                original_explain.get("artifact_sha256") or None,
+                                int(original_explain.get("feature_version") or 0) or None,
+                                int(original_explain.get("feature_dim") or 0) or None,
+                                1,
+                                None,
+                                None,
+                                None,
+                                sell_trade_id,
+                                position_trade_id,
+                                sell_trade_id,
+                                str(exit_trigger),
+                                str(exit_type_val),
+                                json.dumps(
+                                    {
+                                        "realized_pnl": float(realized_pnl),
+                                        "pnl_pct": float(pnl_pct),
+                                        "r_multiple": float(r_multiple),
+                                        "sell_status": str(sell_status),
+                                        "dust_writeoff": bool(dust_writeoff),
+                                    },
+                                    separators=(",", ":"),
+                                ),
+                            ),
+                        )
+                    except Exception:
+                        logger.debug("strategy_runtime_audit SELL row skipped", exc_info=True)
+                        conn.rollback()
+                        return False
+
+                    conn.commit()
+                    return True
+
+            try:
+                return run_locked_retry(_op)
+            except Exception as e:
+                logger.error("FIFO_SELL_SQLITE_FAILED: %s - %s", normalized_symbol, e, exc_info=True)
+                return False
+
+        # =================================================================
+        # LIVE EXECUTION: Execute on Binance.US FIRST (before updating ledger)
+        # Phase 4: Dust gating - quantize, dust check; if dust, write off without place_order
+        # =================================================================
+        actual_sold_qty = quantity  # Default to requested quantity
+        dust_writeoff = False
+        live_order_sell = None
+
+        from backend.config.live_test_mode import can_place_live_orders_sync
+
+        if self._live_execution_enabled and self._live_service and can_place_live_orders_sync()[0]:
+            reconciled = False  # One-time INSUFFICIENT_BALANCE reconciliation
+            try:
+                exchange_symbol = _to_api_symbol(symbol)
+
+                try:
+                    balance = await self._live_service.get_balance("binanceus")
+                    if balance.get("status") == "success":
+                        free_balances = balance.get("balance", {}).get("free", {})
+                        base_coin = exchange_symbol[:-4] if exchange_symbol.endswith("USDT") else exchange_symbol
+                        free_balance = float(free_balances.get(base_coin, 0))
+                        if free_balance < quantity:
+                            logger.warning(f"LIVE_SELL_QTY_ADJUST: {symbol} requested={quantity:.8f} free_balance={free_balance:.8f}")
+                            actual_sold_qty = free_balance
+                except Exception as bal_err:
+                    logger.warning(f"LIVE_SELL_BALANCE_CHECK_FAILED: {symbol} - {bal_err}, using original qty")
+
+                if actual_sold_qty <= 0:
+                    logger.warning(f"LIVE_SELL_SKIP: {symbol} exchange balance is 0 or negative, not placing order; ledger unchanged")
+                    # === DUST_INVARIANT_LOCK ===
+                    # Mark as DUST_PENDING so invariants do not pause trading
+                    position.status = "DUST_PENDING"
+                    position.dust_detected_at = time.time()
+                    position.dust_qty_canonical = position.quantity
+                    logger.warning("DUST_PENDING_ENTER: %s exchange_balance=0 qty_canonical=%.12g", symbol, position.quantity)
+                    # === END DUST_INVARIANT_LOCK ===
+                    return None
+
+                # Phase 4: Ensure constraints, quantize, dust check
+                await self._ensure_symbol_constraints(symbol)
+                constraints = self._symbol_constraints.get(symbol) or {}
+                qty_step = float(constraints.get("qty_step") or 0)
+                if qty_step > 0:
+                    actual_sold_qty = self._floor_to_step(actual_sold_qty, qty_step)
+                is_dust, qty_quantized, dust_reason, est_notional = self._dust_check(symbol, actual_sold_qty, price)
+                if is_dust:
+                    dust_writeoff = True
+                    actual_sold_qty = qty_quantized
+                    dust_reason_str = dust_reason
+                    dust_est_notional_val = est_notional
+                    logger.warning(
+                        "LIVE_SELL_DUST_WRITEOFF symbol=%s qty=%s reason=%s est_notional=%s",
+                        symbol,
+                        actual_sold_qty,
+                        dust_reason,
+                        est_notional,
+                    )
+                    # === DUST_INVARIANT_LOCK ===
+                    # BUG #1 FIX: Acquire deletion lock to prevent reconciliation race
+                    # Position status update must be atomic with respect to reconciliation
+                    async with self._deletion_lock:
+                        # If qty quantizes to 0, mark DUST_PENDING so invariants do not pause trading
+                        if qty_quantized <= 0:
+                            position.status = "DUST_PENDING"
+                            position.dust_detected_at = time.time()
+                            position.dust_qty_canonical = position.quantity
+                        logger.warning("DUST_PENDING_ENTER: %s qty_quantized=0 reason=%s", symbol, dust_reason)
+                        # === END DUST_INVARIANT_LOCK ===
+                else:
+                    logger.warning(
+                        "LIVE_SELL: Protected limit %s qty=%.8f exit=%s",
+                        exchange_symbol,
+                        actual_sold_qty,
+                        exit_type.value,
+                    )
+                    live_order_sell = await _protected_live_sell(actual_sold_qty)
+                    if live_order_sell:
+                        live_order_sell = await self._verify_order_fill(live_order_sell, exchange_symbol, "sell")
+                        filled_qty = live_order_sell.get("filled", actual_sold_qty)
+                        if filled_qty and float(filled_qty) > 0:
+                            actual_sold_qty = float(filled_qty)
+                        logger.warning(
+                            "LIVE_SELL_SUCCESS: %s | Order ID: %s | Filled: %.8f",
+                            exchange_symbol,
+                            live_order_sell.get("id"),
+                            actual_sold_qty,
+                        )
+                    else:
+                        error_msg = "PROTECTED_LIMIT_SELL_NOT_FILLED"
+                        logger.error("LIVE_SELL_FAILED: %s - %s", exchange_symbol, error_msg)
+                        err_lower = (error_msg or "").lower()
+                        is_insufficient_balance = "insufficient" in err_lower or "-2010" in (error_msg or "")
+                        if is_insufficient_balance and not reconciled:
+                            # Cooldown: avoid repeated reconciliation on intermittent -2010
+                            now_ts = time.time()
+                            last = self._insufficient_balance_reconcile_cooldown.get(symbol, 0.0)
+                            if now_ts - last < self._insufficient_balance_cooldown_sec:
+                                logger.warning(
+                                    "INSUFFICIENT_BALANCE_COOLDOWN: %s reconciled %.0fs ago, skipping",
+                                    symbol,
+                                    now_ts - last,
+                                )
+                                return None
+                            reconciled = True
+                            # symbol is Binance.US API form (e.g. BTCUSDT); base_coin is the asset code (BTC).
+                            # Balance: FREE not total (Binance uses free for execution; total includes locked)
+                            bal_res = await self._live_service.get_balance("binanceus", force_refresh=True)
+                            base_coin = exchange_symbol[:-4] if exchange_symbol.endswith("USDT") else exchange_symbol
+                            free_bal = float(bal_res.get("balance", {}).get("free", {}).get(base_coin, 0))
+                            pos_status = getattr(position, "status", "ACTIVE")
+                            # Harden #1: DUST_PENDING needs stricter test - avoid false external-close on tiny dust
+                            if pos_status == "DUST_PENDING":
+                                await self._ensure_symbol_constraints(symbol, force=True)
+                                constraints = self._symbol_constraints.get(symbol) or {}
+                                min_qty = float(constraints.get("min_qty") or 0)
+                                eff_zero = min_qty if min_qty > 0 else 1e-10
+                                treat_as_external = free_bal <= eff_zero
+                            else:
+                                treat_as_external = free_bal < float(position.quantity) * 0.25
+                            if treat_as_external:
+                                # Harden #2: When open orders exist, skip external-close and quantize+retry instead.
+                                # Do NOT external-close (reserved balance can cause false positive).
+                                open_orders_res = await self._live_service.get_open_orders()
+                                orders_list = []
+                                if open_orders_res.get("status") == "success":
+                                    by_ex = open_orders_res.get("orders", {})
+                                    for v in by_ex.values():
+                                        if isinstance(v, list):
+                                            orders_list.extend(v)
+                                has_open_order = any((o.get("symbol") or "").replace("/", "") == exchange_symbol for o in orders_list if isinstance(o, dict))
+                                if has_open_order:
+                                    treat_as_external = False
+                                    logger.warning(
+                                        "RECONCILIATION_SKIP_EXTERNAL: %s open orders present, quantize retry instead",
+                                        symbol,
+                                    )
+                            if treat_as_external:
+                                logger.warning(
+                                    "RECONCILIATION_CLOSED_EXTERNAL: %s exchange_balance=%.12g; position closed externally (reason=CLOSED_EXTERNAL, no PnL recorded)",
+                                    symbol,
+                                    free_bal,
+                                )
+                                # Invariant: cleanup does NOT modify realized_pnl; no trade record; downstream treats as external only
+                                await self._remove_dust_position_canonical_cleanup(symbol, position)
+                                self._insufficient_balance_reconcile_cooldown[symbol] = time.time()
+                                return None
+                            self._insufficient_balance_reconcile_cooldown[symbol] = time.time()
+                            logger.info(
+                                "INSUFFICIENT_BALANCE_RECONCILIATION: %s balance=%.12g quantize_retry (max 1)",
+                                symbol,
+                                free_bal,
+                            )
+                            await self._ensure_symbol_constraints(symbol, force=True)
+                            constraints = self._symbol_constraints.get(symbol) or {}
+                            qty_step = float(constraints.get("qty_step") or 0)
+                            if qty_step > 0:
+                                actual_sold_qty = self._floor_to_step(actual_sold_qty, qty_step)
+                            live_order_sell = await _protected_live_sell(actual_sold_qty)
+                            if live_order_sell:
+                                live_order_sell = await self._verify_order_fill(live_order_sell, exchange_symbol, "sell")
+                                filled_qty = live_order_sell.get("filled", actual_sold_qty)
+                                if filled_qty and float(filled_qty) > 0:
+                                    actual_sold_qty = float(filled_qty)
+                                logger.warning(
+                                    "LIVE_SELL_SUCCESS (reconciliation retry): %s Filled: %.8f",
+                                    exchange_symbol,
+                                    actual_sold_qty,
+                                )
+                            else:
+                                logger.error(
+                                    "LIVE_SELL_ABORTED (reconciliation): %s - PROTECTED_LIMIT_SELL_NOT_FILLED",
+                                    exchange_symbol,
+                                )
+                                return None
+                        reconciliation_succeeded = reconciled and live_order_sell is not None
+                        is_filter_error = (
+                            "minimum" in err_lower
+                            or "lot_size" in err_lower
+                            or "min_notional" in err_lower
+                            or "filter failure" in err_lower
+                            or "precision" in err_lower
+                            or "amount" in err_lower
+                            or "-1013" in (error_msg or "")
+                        )
+                        if not reconciliation_succeeded and is_filter_error:
+                            try:
+                                await self._ensure_symbol_constraints(symbol, force=True)
+                                constraints = self._symbol_constraints.get(symbol) or {}
+                                qty_step = float(constraints.get("qty_step") or 0)
+                                if qty_step > 0:
+                                    actual_sold_qty = self._floor_to_step(actual_sold_qty, qty_step)
+                                is_dust, qty_quantized, dust_reason, est_notional = self._dust_check(symbol, actual_sold_qty, price)
+                                if is_dust:
+                                    dust_writeoff = True
+                                    actual_sold_qty = qty_quantized
+                                    dust_reason_str = dust_reason
+                                    dust_est_notional_val = est_notional
+                                    logger.warning(
+                                        "LIVE_SELL_DUST_WRITEOFF (after filter error) symbol=%s qty=%s reason=%s est_notional=%s",
+                                        symbol,
+                                        actual_sold_qty,
+                                        dust_reason,
+                                        est_notional,
+                                    )
+                                    if qty_quantized <= 0:
+                                        position.status = "DUST_PENDING"
+                                        position.dust_detected_at = time.time()
+                                        position.dust_qty_canonical = position.quantity
+                                        logger.warning("DUST_PENDING_ENTER: %s qty_quantized=0 (filter retry)", symbol)
+                                else:
+                                    live_order_sell = await _protected_live_sell(actual_sold_qty)
+                                    if live_order_sell:
+                                        live_order_sell = await self._verify_order_fill(live_order_sell, exchange_symbol, "sell")
+                                        filled_qty = live_order_sell.get("filled", actual_sold_qty)
+                                        if filled_qty and float(filled_qty) > 0:
+                                            actual_sold_qty = float(filled_qty)
+                                        logger.warning(
+                                            "LIVE_SELL_SUCCESS (retry): %s Filled: %.8f",
+                                            exchange_symbol,
+                                            actual_sold_qty,
+                                        )
+                                    else:
+                                        logger.error(
+                                            "LIVE_SELL_FAILED (retry): %s - PROTECTED_LIMIT_SELL_NOT_FILLED",
+                                            exchange_symbol,
+                                        )
+                                        logger.error(
+                                            "LIVE_SELL_ABORTED: %s - Ledger NOT updated, position preserved",
+                                            exchange_symbol,
+                                        )
+                                        return None
+                            except Exception as retry_e:
+                                logger.exception(f"LIVE_SELL_ABORTED (refresh/retry): {symbol} - {retry_e}")
+                                return None
+                        elif not reconciliation_succeeded:
+                            logger.error(f"LIVE_SELL_ABORTED: {exchange_symbol} - Ledger NOT updated, position preserved")
+                            return None
+
+            except Exception as e:
+                logger.exception(f"LIVE_SELL_ERROR: {symbol} - {e}")
+                logger.exception(f"LIVE_SELL_ABORTED: {symbol} - Ledger NOT updated, position preserved")
+                return None
+
+        else:
+            # =================================================================
+            # PAPER: Apply same balance/dust/quantize logic as live (parity)
+            # =================================================================
+            free_balance = position.quantity  # Paper owns full position; no locked
+            actual_sold_qty = min(quantity, free_balance)
+            if actual_sold_qty <= 0:
+                logger.warning("PAPER_SELL_SKIP: %s balance 0, ledger unchanged", symbol)
+                position.status = "DUST_PENDING"
+                position.dust_detected_at = time.time()
+                position.dust_qty_canonical = position.quantity
+                return None
+
+            await self._ensure_symbol_constraints(symbol)
+            constraints = self._symbol_constraints.get(symbol) or {}
+            qty_step = float(constraints.get("qty_step") or 0)
+            if qty_step > 0:
+                actual_sold_qty = self._floor_to_step(actual_sold_qty, qty_step)
+            is_dust, qty_quantized, dust_reason, est_notional = self._dust_check(symbol, actual_sold_qty, price)
+            if is_dust:
+                dust_writeoff = True
+                actual_sold_qty = qty_quantized
+                dust_reason_str = dust_reason
+                dust_est_notional_val = est_notional
+                logger.info(
+                    "PAPER_SELL_DUST_WRITEOFF symbol=%s qty=%s reason=%s est_notional=%s",
+                    symbol,
+                    actual_sold_qty,
+                    dust_reason,
+                    est_notional,
+                )
+                if qty_quantized <= 0:
+                    async with self._deletion_lock:
+                        position.status = "DUST_PENDING"
+                        position.dust_detected_at = time.time()
+                        position.dust_qty_canonical = position.quantity
+                    return None
+
+        # =================================================================
+        # Phase 4: Recompute all money math AFTER final quantity is known
+        # =================================================================
+        quantity = actual_sold_qty
+        if quantity <= 0:
+            return None
+
+        fill_price = price
+        r_multiple = 0.0
+        if not dust_writeoff:
+            if live_order_sell:
+                avg_px = live_order_sell.get("average") or live_order_sell.get("price")
+                if avg_px and float(avg_px) > 0:
+                    fill_price = float(avg_px)
+                elif USE_PROTECTED_LIMIT_EXECUTION:
+                    from backend.services.protected_limit_execution import get_last_execution_protection_state
+
+                    st = get_last_execution_protection_state(taker_fee=TAKER_FEE)
+                    if st.get("last_expected_avg_fill"):
+                        fill_price = float(st["last_expected_avg_fill"])
+                else:
+                    fill_price = price * (1 - SLIPPAGE_PCT)
+                sell_exec_fee_rate = MAKER_FEE if USE_PROTECTED_LIMIT_EXECUTION else TAKER_FEE
+            else:
+                pf = await run_protected_preflight(
+                    symbol=normalized_symbol,
+                    side="SELL",
+                    quantity=quantity,
+                    reference_price=price,
+                    live_capable=False,
+                )
+                sell_preflight_audit = pf.to_audit_dict()
+                if not pf.passed:
+                    await self._record_reject(
+                        normalized_symbol,
+                        "SELL",
+                        pf.reject_reason,
+                        "PROTECTED_PREFLIGHT",
+                    )
+                    return None
+                if USE_PROTECTED_LIMIT_EXECUTION:
+                    fill_price = float(pf.expected_avg_fill)
+                    sell_exec_fee_rate = MAKER_FEE
+                else:
+                    fill_price = price * (1 - SLIPPAGE_PCT)
+                    sell_exec_fee_rate = TAKER_FEE
+        else:
+            sell_exec_fee_rate = TAKER_FEE
+
+        stop_distance = abs(position.entry_price - position.stop_price)
+        r_multiple = (fill_price - position.entry_price) / stop_distance if stop_distance > 0 else 0
+
+        if not dust_writeoff:
+            exec_check = evaluate_executable_sell_profit(
+                entry_price=float(position.entry_price),
+                quantity=quantity,
+                executable_sell_price=float(fill_price),
+                entry_fee=float(getattr(position, "entry_fee", 0) or 0),
+                sell_fee_rate=sell_exec_fee_rate,
+                position_qty=float(position.quantity),
+                mark_price=float(price),
+            )
+            if sell_preflight_audit:
+                sell_preflight_audit.update(exec_check.to_audit_dict())
+            else:
+                sell_preflight_audit = exec_check.to_audit_dict()
+            if not exec_check.passed:
+                logger.warning(
+                    "SELL_EXECUTABLE_FILL_BLOCKED %s reason=%s exec_px=%.8f entry=%.8f mark=%.8f gross=%.6f net_pct=%.6f net_usd=%.4f",
+                    normalized_symbol,
+                    exec_check.reject_reason,
+                    fill_price,
+                    float(position.entry_price),
+                    float(price),
+                    exec_check.executable_gross_pct,
+                    exec_check.executable_net_pct,
+                    exec_check.executable_net_profit_usd,
+                )
+                await self._record_reject(
+                    normalized_symbol,
+                    "SELL",
+                    exec_check.reject_reason,
+                    "EXECUTABLE_FILL_GATE",
+                )
+                return None
+
+        if dust_writeoff:
+            fee = 0.0
+            proceeds = 0.0
+        else:
+            fee = quantity * fill_price * sell_exec_fee_rate
+            proceeds = (quantity * fill_price) - fee
+        entry_fee_pro_rata = (getattr(position, "entry_fee", 0) or 0) * (quantity / position.quantity) if position.quantity > 0 else 0
+        entry_cost = (quantity * position.entry_price) + entry_fee_pro_rata
+        realized_pnl = proceeds - entry_cost
+        pnl_pct = (realized_pnl / entry_cost) if entry_cost > 0 else 0.0
+
+        sell_sqlite_ok = False
+        self._exit_in_progress.add(normalized_symbol)
+        try:
+            # =================================================================
+            # BUG #10 FIX: Acquire FIFO sell lock to prevent concurrent sells of same position
+            async with self._fifo_sell_lock:
+                loop = asyncio.get_running_loop()
+                sell_sqlite_ok = await loop.run_in_executor(None, _sync_fifo_sell)
+
+            if not sell_sqlite_ok:
+                return None
+
+            try:
+                from backend.services.simplified_pnl_observation import record_trade_close
+
+                _exp = self.trade_explanations.get(position.trade_id)
+                _bm_at_entry = float(_exp.entry_buy_margin) if _exp is not None and getattr(_exp, "entry_buy_margin", None) is not None else None
+                record_trade_close(
+                    symbol=normalized_symbol,
+                    realized_pnl=float(realized_pnl),
+                    pnl_pct=float(pnl_pct),
+                    hold_time_sec=float(hold_time_seconds),
+                    exit_family=_exit_observation_family(exit_type),
+                    exit_type_code=str(exit_type.value),
+                    buy_margin_at_entry=_bm_at_entry,
+                    confidence_at_entry=float(getattr(position, "confidence_at_entry", 0.0) or 0.0),
+                )
+            except Exception:
+                logger.debug("simplified_pnl_observation trade_close skipped", exc_info=True)
+
+        except Exception as ex:
+            logger.warning("execute_sell_fifo failed for %s: %s", normalized_symbol, ex)
+            raise
+        finally:
+            if not sell_sqlite_ok:
+                self._exit_in_progress.discard(normalized_symbol)
+
+        # One-line JSON after DB commit: each EXIT_AUDIT matches a successful FIFO sell (grep EXIT_AUDIT)
+        _entry = position.entry_price
+        _prof = get_coin_profile(normalized_symbol)
+        _sd = abs(_entry - position.stop_price)
+        if _entry > 0 and _sd > 0:
+            _placed_sl_pct = _sd / _entry
+        else:
+            _placed_sl_pct = float(_prof.get("sl", MIN_STOP_PCT))
+        _high = float(position.highest_price or 0.0)
+        _low = float(getattr(position, "lowest_price", 0.0) or 0.0)
+        _mfe_pct = (_high - _entry) / _entry if _entry > 0 and _high > _entry else 0.0
+        _mae_pct = (_entry - _low) / _entry if _entry > 0 and _low > 0 and _low < _entry else 0.0
+        _pnl_exit_pct = (price - _entry) / _entry if _entry > 0 else 0.0
+        logger.info(
+            "EXIT_AUDIT %s",
+            json.dumps(
+                {
+                    "event": "EXIT_AUDIT",
+                    "symbol": normalized_symbol,
+                    "trade_id": position.trade_id,
+                    "sleeve": getattr(position, "sleeve", "") or "",
+                    "exit_type": exit_type.name,
+                    "exit_trigger": exit_trigger,
+                    "entry_price": round(_entry, 8),
+                    "exit_price": round(price, 8),
+                    "stop_price": round(position.stop_price, 8),
+                    "placed_sl_pct": round(_placed_sl_pct, 6),
+                    "pnl_pct_at_exit": round(_pnl_exit_pct, 6),
+                    "mfe_pct": round(_mfe_pct, 6),
+                    "mae_pct": round(_mae_pct, 6),
+                    "high_since_entry": round(_high, 8),
+                    "low_since_entry": round(_low, 8),
+                },
+                separators=(",", ":"),
+            ),
+        )
+
+        # =================================================================
+        # UPDATE AUTHORITATIVE LEDGER (conservation of money)
+        # =================================================================
+        # Cash increases by proceeds (canonical: cash = USDT on exchange)
+        self.cash_balance += proceeds
+        self._available_balance = max(0.0, self.cash_balance)
+
+        # Only SELL changes realized_pnl
+        self._realized_pnl += realized_pnl
+
+        # positions_value and total_equity recomputed after position update below
+
+        if quantity >= position.quantity:
+            # Full close - remove position
+            # BUG #28: Wrap deletion in lock
+            async with self._deletion_lock:
+                del self.open_positions[normalized_symbol]
+                await self._delete_position_from_sqlite(normalized_symbol)
+                # AUTO-CLEANUP: When account cleared (0 positions), clear stale quarantines
+                if len(self.open_positions) == 0:
+                    await self._clear_all_quarantines()
+        else:
+            # Partial close - update position
+            # Reduce entry_fee for remaining position (pro-rata allocation to sold portion)
+            position.entry_fee = (getattr(position, "entry_fee", 0) or 0) - entry_fee_pro_rata
+            position.entry_fee = max(0.0, position.entry_fee)
+            # === POSITION_QTY_SNAP_LOCK ===
+            # Do not remove. Prevent float remainder corruption after partial fills/sells.
+            # Quantity must be snapped to LOT_SIZE.stepSize before persistence/invariants.
+            # Load constraints BEFORE mutating position so a failure never leaves state mutated.
+            # === END POSITION_QTY_SNAP_LOCK ===
+            await self._ensure_symbol_constraints(symbol)
+            constraints = self._symbol_constraints.get(symbol) or {}
+            qty_step = float(constraints.get("qty_step") or 0)
+            min_qty = float(constraints.get("min_qty") or 0)
+            min_notional = float(constraints.get("min_notional") or 0)
+            expected_remainder = float(Decimal(str(position.quantity)) - Decimal(str(quantity)))
+            position.quantity -= quantity
+            position.quantity = self._floor_to_step(position.quantity, qty_step)
+            if position.quantity <= 0 and expected_remainder > 0 and qty_step > 0:
+                expected_snapped = self._floor_to_step(expected_remainder, qty_step)
+                if expected_snapped > 0:
+                    position.quantity = expected_snapped
+            is_dust = False
+            if position.quantity <= 0 or (min_qty > 0 and position.quantity < min_qty) or (min_notional > 0 and fill_price > 0 and (position.quantity * fill_price) < min_notional):
+                is_dust = True
+            if is_dust and position.quantity <= 0:
+                position.quantity = expected_remainder
+                await self._remove_dust_position_canonical_cleanup(symbol, position)
+            elif is_dust and position.quantity > 0:
+                position.status = "DUST_PENDING"
+                position.dust_detected_at = time.time()
+                position.dust_qty_canonical = position.quantity
+                await self._persist_position_to_sqlite(position)
+            else:
+                await self._persist_position_to_sqlite(position)
+
+        # Update coin performance (Phase 6). Live path produces only TP / MANUAL /
+        # DUST sells, none of which trigger the loss-streak counter.
+        await self._update_coin_performance(
+            symbol,
+            realized_pnl,
+            is_loss=(realized_pnl < 0),
+        )
+
+        # Canonical: total_equity = cash_balance + positions_value (market)
+        await self._recompute_positions_values()
+
+        # Validate invariants
+        await self._validate_invariants("execute_sell_fifo")
+
+        # =================================================================
+        # PERSIST TO SQLITE (survive restarts)
+        # =================================================================
+        await self._persist_ledger_to_sqlite()
+        # =================================================================
+
+        # =================================================================
+        # ITEM 3: RECORD IMMUTABLE AUDIT TRAIL
+        # =================================================================
+        post_ledger = {
+            "cash_balance": self.cash_balance,
+            "positions_value": self._positions_value,
+            "total_equity": self._total_equity,
+        }
+        slippage_cost = (price - fill_price) * quantity
+        await self._record_audit(
+            action="SELL",
+            symbol=symbol,
+            qty=quantity,
+            price=fill_price,
+            fees=fee,
+            slippage=slippage_cost,
+            trade_id=sell_trade_id,
+            pre_ledger=pre_ledger,
+            post_ledger=post_ledger,
+            exit_reason=exit_trigger,
+            realized_pnl=realized_pnl,
+            sleeve=getattr(position, "sleeve", Sleeve.ACTIVE.value),
+        )
+
+        with contextlib.suppress(Exception):
+            from backend.services.trade_performance_tracker import log_trade_performance
+
+            _tp_trade_id = int(time.time() * 1_000_000)
+            if sell_trade_id and str(sell_trade_id).isdigit():
+                _tp_trade_id = int(sell_trade_id)
+            asyncio.create_task(
+                log_trade_performance(
+                    trade_id=_tp_trade_id,
+                    symbol=normalized_symbol,
+                    side="sell",
+                    entry_price=float(position.entry_price or 0),
+                    exit_price=float(fill_price),
+                    quantity=float(quantity),
+                    pnl=float(realized_pnl),
+                    pnl_pct=float(pnl_pct * 100.0),
+                    is_win=1 if realized_pnl > 0 else (0 if realized_pnl < 0 else None),
+                    hold_time_seconds=int(hold_time_seconds) if hold_time_seconds > 0 else None,
+                    strategy=str(getattr(position, "entry_strategy_id", "") or "day") or "day",
+                    confidence=float(getattr(position, "confidence_at_entry", 0) or 0) or None,
+                    mode="paper",
+                )
+            )
+
+        # Loss-hold: extend cooldown if we were in recovery and just took another loss; clear on win (profit > 0 only).
+        if realized_pnl > 0:
+            await self._set_loss_hold_until(None)
+        elif realized_pnl < 0:
+            _, consec = await self.get_rolling_24h_risk_metrics()
+            if consec >= MAX_CONSEC_LOSSES:
+                loss_hold_until = await self._get_loss_hold_until()
+                now = time.time()
+                if loss_hold_until is not None and now >= loss_hold_until:
+                    await self._set_loss_hold_until(now + LOSS_HOLD_COOLDOWN_MIN * 60)
+
+        # ITEM 5: Record sell cooldown (FIX 3: always after success, persist, log)
+        bar_ts = current_bar if current_bar is not None else self.last_bar_timestamp
+        self.record_sell_cooldown(normalized_symbol, bar_ts, exit_type=exit_type.value, pnl=realized_pnl)
+        await self._persist_quality_cooldowns()
+        cooldown_until = self._quality_filter_state.symbol_cooldowns.get(normalized_symbol, bar_ts) if self._bar_interval_seconds else bar_ts
+        logger.info(
+            "COOLDOWN_SET symbol=%s current_bar=%s cooldown_until=%s reason=%s exit_type=%s",
+            symbol,
+            bar_ts,
+            cooldown_until,
+            exit_trigger,
+            exit_type.value,
+        )
+
+        # Persist a row in the canonical position_close_ledger so the
+        # cooldown survives process restarts and is observable next to
+        # HUMAN_MANUAL_SELL records.
+        is_manual = exit_type == ExitType.MANUAL
+        wall_cooldown_until = float(self._quality_filter_state.symbol_cooldown_wall.get(normalized_symbol, time.time() + float(POST_SELL_COOLDOWN_WALL_SEC)))
+        # ai_close_reason normalizes the user-facing learning label so AI
+        # sells, operator-MANUAL sells, and reconciled human sells share a
+        # single vocabulary. AI sells are categorically AI_NET_PROFIT_SELL
+        # (the engine refuses to exit unless net profit clears the buffer in
+        # ``_evaluate_sell_profitability``); we preserve the exit_type detail
+        # in ``extra`` for the trainer.
+        if is_manual:
+            ai_close_reason = "MANUAL"
+        elif float(realized_pnl) > 0 and float(pnl_pct) > 0:
+            ai_close_reason = "AI_NET_PROFIT_SELL"
+        else:
+            ai_close_reason = "SELL_NON_PROFITABLE_GUARD"
+        with contextlib.suppress(Exception):
+            await self._record_position_close_ledger(
+                normalized_symbol,
+                close_reason=ai_close_reason,
+                manual_sell=False,
+                cooldown_until=wall_cooldown_until,
+                realized_profit=float(realized_pnl),
+                quantity=float(quantity),
+                entry_price=float(position.entry_price or 0.0),
+                exit_price=float(price),
+                sell_trade_id=str(sell_trade_id) or None,
+                detail=f"exit_trigger={exit_trigger};exit_type={exit_type.value};buy_trade_id={position.trade_id or ''}",
+            )
+        with contextlib.suppress(Exception):
+            self._record_learning_outcome(
+                symbol=normalized_symbol,
+                position=position,
+                close_reason=ai_close_reason,
+                manual_sell=False,
+                source=exit_trigger or exit_type.value,
+                exit_price=float(price),
+                realized_profit=float(realized_pnl),
+                cooldown_until=wall_cooldown_until,
+                fill_found=True,
+            )
+
+        # Track fees/slippage for scoreboard
+        self._total_fees_paid += fee
+        self._total_slippage_cost += slippage_cost
+
+        logger.info(
+            f"SELL_EXECUTED: {symbol} [{getattr(position, 'sleeve', 'ACTIVE')}] | qty={quantity:.6f} @ ${fill_price:.4f} | "
+            f"PnL=${realized_pnl:.4f} ({pnl_pct * 100.0:.2f}%) | R={r_multiple:.2f} | "
+            f"exit={exit_type.value} | fee=${fee:.4f} | cash=${self.cash_balance:.2f}"
+        )
+        self._update_strategy_capital_sleeve(
+            strategy_id=str(getattr(position, "entry_strategy_id", "") or "day"),
+            realized_pnl_delta=float(realized_pnl),
+            deployed_capital_delta=-float(position.entry_price * quantity),
+            is_win=bool(realized_pnl > 0),
+        )
+
+        # Build result first; paper sync uses result["quantity"] only (canonical quantity rule)
+        result = {
+            "trade_id": sell_trade_id,
+            "symbol": symbol,
+            "side": "SELL",
+            "quantity": quantity,
+            "price": fill_price,
+            "fee": fee,
+            "realized_pnl": realized_pnl,
+            "pnl_pct": pnl_pct,
+            "r_multiple": r_multiple,
+            "exit_type": exit_type.value,
+            "hold_time_seconds": hold_time_seconds,
+            "cash_after": self.cash_balance,
+            "positions_value_after": self._positions_value,
+        }
+        if live_order_sell:
+            result["exchange_order_id"] = live_order_sell.get("id")
+            result["exchange_filled_qty"] = live_order_sell.get("filled") or quantity
+            result["exchange_avg_price"] = live_order_sell.get("average") or live_order_sell.get("price") or fill_price
+
+        # CRITICAL FIX: Sync sell with PaperTradingService using executed quantity from result only
+        if self._paper_service and result is not None:
+            try:
+                # BUG #M7 FIX: Use guarded access for external payload fields
+                exec_qty = result.get("quantity", quantity)
+                binance_symbol = symbol.replace("/", "")
+                await self._paper_service.place_order(
+                    symbol=binance_symbol,
+                    side="SELL",
+                    order_type="MARKET",
+                    quantity=exec_qty,
+                    price=fill_price,
+                )
+                logger.info(f"SELL_SYNCED: {symbol} synced to PaperTradingService qty={exec_qty:.6f}")
+                if not self._assert_canonical_qty_logged:
+                    logger.debug(
+                        "CANONICAL_QTY_ASSERT: paper sync qty=%.6f == result[quantity] (once per session)",
+                        exec_qty,
+                    )
+                    self._assert_canonical_qty_logged = True
+            except Exception as e:
+                logger.warning(f"SELL_SYNC_FAILED: {symbol} - {e}")
+
+        self._exit_in_progress.discard(normalized_symbol)
+        return result
+
+    # =========================================================================
+    # SLEEVE CAPITAL & POSITION ACCOUNTING
+    # =========================================================================
+
+    def _sleeve_position_count(self, sleeve: str) -> int:
+        """Count active (non-DUST_PENDING) positions in a given sleeve."""
+        return sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING" and (getattr(p, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value) == sleeve)
+
+    def _sleeve_notional(self, sleeve: str) -> float:
+        """Sum of entry_price * quantity for positions in a given sleeve."""
+        total = 0.0
+        for p in self.open_positions.values():
+            if getattr(p, "status", "ACTIVE") == "DUST_PENDING":
+                continue
+            pos_sleeve = getattr(p, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value
+            if pos_sleeve == sleeve:
+                total += p.quantity * p.entry_price
+        return total
+
+    def _sleeve_capital_budget(self, sleeve: str) -> float:
+        """Available capital budget for a sleeve (fraction of total equity)."""
+        equity = self.cash_balance + self._positions_value
+        if equity <= 0:
+            return 0.0
+        if sleeve == Sleeve.CORE.value:
+            budget = equity * SLEEVE_CORE_CAPITAL_FRACTION * SLEEVE_CORE_MAX_UTILIZATION
+        else:
+            budget = equity * SLEEVE_ACTIVE_CAPITAL_FRACTION * SLEEVE_ACTIVE_MAX_UTILIZATION
+        return max(0.0, budget)
+
+    def _sleeve_max_positions(self, sleeve: str) -> int:
+        if sleeve == Sleeve.CORE.value:
+            return SLEEVE_CORE_MAX_POSITIONS
+        return SLEEVE_ACTIVE_MAX_POSITIONS
+
+    def _check_sleeve_limits(self, sleeve: str, notional_usd: float) -> tuple[bool, str]:
+        """Check sleeve-level limits. Returns (allowed, reason)."""
+        if not SLEEVE_ENABLED:
+            return True, ""
+
+        max_pos = self._sleeve_max_positions(sleeve)
+        current_count = self._sleeve_position_count(sleeve)
+        if current_count >= max_pos:
+            return False, f"SLEEVE_{sleeve}_MAX_POSITIONS ({current_count}/{max_pos})"
+
+        budget = self._sleeve_capital_budget(sleeve)
+        current_notional = self._sleeve_notional(sleeve)
+        if current_notional + notional_usd > budget:
+            return False, f"SLEEVE_{sleeve}_CAPITAL_EXCEEDED (used=${current_notional:.0f}+${notional_usd:.0f} > budget=${budget:.0f})"
+
+        return True, ""
+
+    def get_sleeve_summary(self) -> dict[str, Any]:
+        """Sleeve-level metrics for reporting.
+
+        Deployed (notional_used) and unrealized use the same mark prices as _recompute_positions_values
+        (_sleeve_market_notional_cache / _sleeve_unrealized_cache). Call await _recompute_positions_values()
+        before this if marks may be stale.
+        """
+        summary = {}
+        for sleeve_val in (Sleeve.CORE.value, Sleeve.ACTIVE.value):
+            count = self._sleeve_position_count(sleeve_val)
+            cost_notional = self._sleeve_notional(sleeve_val)
+            budget = self._sleeve_capital_budget(sleeve_val)
+            mkt_notional = float(self._sleeve_market_notional_cache.get(sleeve_val, 0.0) or 0.0)
+            unrealized = float(self._sleeve_unrealized_cache.get(sleeve_val, 0.0) or 0.0)
+            util_base = mkt_notional if mkt_notional > 0 else cost_notional
+            summary[sleeve_val] = {
+                "positions": count,
+                "max_positions": self._sleeve_max_positions(sleeve_val),
+                "notional_used": round(mkt_notional, 2),
+                "notional_cost_basis": round(cost_notional, 2),
+                "capital_budget": round(budget, 2),
+                "utilization_pct": round((util_base / budget * 100) if budget > 0 else 0, 1),
+                "unrealized_pnl": round(unrealized, 4),
+            }
+        return summary
+
+    def get_sleeve_pnl(self) -> dict[str, Any]:
+        """Query realized PnL by sleeve from paper_trades."""
+        result = {Sleeve.CORE.value: {"realized_pnl": 0.0, "trades": 0, "wins": 0, "losses": 0}, Sleeve.ACTIVE.value: {"realized_pnl": 0.0, "trades": 0, "wins": 0, "losses": 0}}
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT COALESCE(sleeve, 'ACTIVE') as s,
+                           COALESCE(SUM(pnl), 0) as total_pnl,
+                           COUNT(*) as trade_count,
+                           SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                           SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losses
+                    FROM paper_trades
+                    WHERE side = 'SELL' AND pnl IS NOT NULL
+                    GROUP BY s
+                """)
+                for row in cursor.fetchall():
+                    s = row[0] if row[0] in (Sleeve.CORE.value, Sleeve.ACTIVE.value) else Sleeve.ACTIVE.value
+                    result[s] = {
+                        "realized_pnl": round(float(row[1]), 4),
+                        "trades": int(row[2]),
+                        "wins": int(row[3]),
+                        "losses": int(row[4]),
+                    }
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug(f"SLEEVE_PNL_QUERY: {e}")
+        return result
+
+    def get_sleeve_cutover(self) -> dict[str, Any] | None:
+        """Return the sleeve system cutover marker from operational_state, or None."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                row = conn.execute("SELECT value_json FROM operational_state WHERE key='sleeve_cutover'").fetchone()
+                if row:
+                    return json.loads(row[0])
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def is_post_sleeve_trade(trade_timestamp: str | float, cutover_epoch: int) -> bool:
+        """Return True if a trade occurred after the sleeve cutover."""
+        try:
+            if isinstance(trade_timestamp, (int, float)):
+                return trade_timestamp >= cutover_epoch
+            dt = datetime.fromisoformat(trade_timestamp.replace("Z", "+00:00"))
+            return dt.timestamp() >= cutover_epoch
+        except Exception:
+            return False
+
+    # =========================================================================
+    # PHASE 2: PORTFOLIO DISCIPLINE (SOLE EXECUTION GATE)
+    # =========================================================================
+
+    async def _can_open_position(self, symbol: str, notional_usd: float) -> tuple[bool, str]:
+        """
+        PHASE 2: Check if new position is allowed.
+
+        Returns (allowed: bool, reason: str)
+
+        BLOCKS if:
+        - Account is OVERALLOCATED or DELEVERAGING
+        - Trading is paused
+        - Portfolio full (>= MAX_OPEN_POSITIONS)
+        - Symbol already open (max 1 per symbol)
+        - Insufficient cash (notional > available_cash)
+        - Portfolio risk cap exceeded
+
+        This is the SOLE execution gate. All buys MUST pass through this.
+        """
+        symbol = normalize_symbol(symbol)
+        # CRITICAL: Check account status first
+        if self._account_status == AccountStatus.OVERALLOCATED:
+            if PORTFOLIO_LOCAL_SKIP_OVERALLOCATED_BLOCK:
+                logger.info(
+                    "QUALITY_TELEMETRY BUY_BLOCKED_OVERALLOCATED would_block symbol=%s (PORTFOLIO_LOCAL_SKIP_OVERALLOCATED_BLOCK=true — not enforcing)",
+                    symbol,
+                )
+            else:
+                logger.warning(f"BUY_BLOCKED_OVERALLOCATED: {symbol} - account overallocated, trading paused")
+                return False, "ACCOUNT_OVERALLOCATED"
+
+        if self._account_status == AccountStatus.DELEVERAGING:
+            logger.warning(f"BUY_BLOCKED_DELEVERAGING: {symbol} - auto-deleverage in progress")
+            return False, "DELEVERAGING_IN_PROGRESS"
+
+        if self._trading_paused:
+            logger.warning(f"BUY_BLOCKED_PAUSED: {symbol} - trading paused: {self._pause_reason}")
+            return False, f"TRADING_PAUSED: {self._pause_reason}"
+
+        # Check max positions (hard limit: 10)
+        # DUST_INVARIANT: Exclude DUST_PENDING from count - dust must not block new buys
+        active_count = sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING")
+        max_positions_limit = MAX_OPEN_POSITIONS
+        from backend.config.live_test_mode import live_test_max_open_positions_limit
+        from backend.services.execution_mode_service import is_live_execution_allowed_sync
+
+        if is_live_execution_allowed_sync():
+            live_cap = live_test_max_open_positions_limit()
+            if live_cap is not None:
+                max_positions_limit = live_cap
+        if active_count >= max_positions_limit:
+            if PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK:
+                logger.info(
+                    "QUALITY_TELEMETRY BUY_BLOCKED_MAX_POSITIONS would_block symbol=%s active=%s total_open=%s/%s (PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK=true — not enforcing)",
+                    symbol,
+                    active_count,
+                    len(self.open_positions),
+                    max_positions_limit,
+                )
+            else:
+                logger.info(f"BUY_BLOCKED_MAX_POSITIONS: {symbol} - portfolio full (active={active_count}, total={len(self.open_positions)}/{max_positions_limit})")
+                return False, "MAX_POSITIONS_REACHED"
+
+        # Check symbol not already open (max 1 per symbol)
+        # Dust/zero-size positions: cleanup and allow buy; never block on stale memory.
+        position = self.open_positions.get(symbol)
+        if position is not None:
+            await self._ensure_symbol_constraints(symbol)
+            constraints = self._symbol_constraints.get(symbol) or {}
+            qty_step = float(constraints.get("qty_step") or 0)
+            min_qty = float(constraints.get("min_qty") or 0)
+            qty_epsilon = qty_step if qty_step > 0 else 1e-10
+            # Use _dust_check for consistency (catches min_notional dust, not just min_qty)
+            price = getattr(position, "entry_price", 0) or 0
+            is_dust_from_check = False
+            if price > 0:
+                is_dust_from_check, _, _, _ = self._dust_check(symbol, position.quantity, price)
+            is_dust_or_zero = position.quantity <= qty_epsilon or (min_qty > 0 and position.quantity <= min_qty) or getattr(position, "status", "ACTIVE") == "DUST_PENDING" or is_dust_from_check
+            if is_dust_or_zero:
+                qty_log = position.quantity
+                await self._remove_dust_position_canonical_cleanup(symbol, position)
+                logger.info("AUTO_DUST_CLEANUP: symbol=%s qty=%s", symbol, qty_log)
+                # Treat as no position; fall through to cash/risk checks.
+            else:
+                # Safety: verify exchange free balance before blocking.
+                base_asset = symbol.split("/", maxsplit=1)[0]
+                try:
+                    if self._live_service:
+                        balance_result = await self._live_service.get_balance("binanceus")
+                        if balance_result.get("status") == "success":
+                            free_balances = balance_result.get("balance", {}).get("free", {}) or {}
+                            free_balance = float(free_balances.get(base_asset, 0) or 0)
+                            # DUST_INVARIANT: If exchange has 0 or dust (below min_notional), cleanup local position
+                            price_for_dust = getattr(position, "entry_price", 0) or 0
+                            if price_for_dust <= 0:
+                                price_for_dust = 1.0  # fallback for dust check
+                            ex_is_dust, _, _, _ = self._dust_check(symbol, free_balance, price_for_dust)
+                            if free_balance <= qty_epsilon or ex_is_dust:
+                                qty_log = position.quantity
+                                await self._remove_dust_position_canonical_cleanup(symbol, position)
+                                logger.info(
+                                    "AUTO_DUST_CLEANUP: symbol=%s qty=%s (exchange_free=%s dust=%s)",
+                                    symbol,
+                                    qty_log,
+                                    free_balance,
+                                    ex_is_dust,
+                                )
+                                # Treat as no position; fall through.
+                            elif PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK:
+                                logger.info(
+                                    "QUALITY_TELEMETRY BUY_BLOCKED_SYMBOL_EXISTS would_block symbol=%s (PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK=true — not enforcing)",
+                                    symbol,
+                                )
+                            else:
+                                logger.info(f"BUY_BLOCKED_SYMBOL_EXISTS: {symbol} - already has open position")
+                                return False, "POSITION_ALREADY_OPEN"
+                        elif PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK:
+                            logger.info(
+                                "QUALITY_TELEMETRY BUY_BLOCKED_SYMBOL_EXISTS would_block symbol=%s (PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK=true — not enforcing)",
+                                symbol,
+                            )
+                        else:
+                            logger.info(f"BUY_BLOCKED_SYMBOL_EXISTS: {symbol} - already has open position")
+                            return False, "POSITION_ALREADY_OPEN"
+                    elif PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK:
+                        logger.info(
+                            "QUALITY_TELEMETRY BUY_BLOCKED_SYMBOL_EXISTS would_block symbol=%s (PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK=true — not enforcing)",
+                            symbol,
+                        )
+                    else:
+                        logger.info(f"BUY_BLOCKED_SYMBOL_EXISTS: {symbol} - already has open position")
+                        return False, "POSITION_ALREADY_OPEN"
+                except Exception as e:
+                    logger.warning("BUY_GATE: exchange balance check failed for %s: %s", symbol, e)
+                    if PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK:
+                        logger.info(
+                            "QUALITY_TELEMETRY BUY_BLOCKED_SYMBOL_EXISTS would_block symbol=%s (PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK=true — not enforcing)",
+                            symbol,
+                        )
+                    else:
+                        logger.info(f"BUY_BLOCKED_SYMBOL_EXISTS: {symbol} - already has open position")
+                        return False, "POSITION_ALREADY_OPEN"
+
+        # CRITICAL: Check cash available (enforce conservation of money)
+        if self._available_balance <= 0:
+            logger.warning(f"BUY_BLOCKED_NO_CASH: {symbol} - available_balance=${self._available_balance:.2f}")
+            return False, "INSUFFICIENT_CASH"
+
+        if notional_usd > self._available_balance:
+            logger.info(f"BUY_BLOCKED_INSUFFICIENT_CASH: {symbol} - notional=${notional_usd:.2f} > available=${self._available_balance:.2f}")
+            return False, f"INSUFFICIENT_CASH: need ${notional_usd:.2f}, have ${self._available_balance:.2f}"
+
+        # Check portfolio risk cap
+        total_open_risk = self._calculate_total_open_risk()
+        equity = self._total_equity
+
+        if equity > 0:
+            open_risk_pct = total_open_risk / equity
+            if open_risk_pct >= MAX_TOTAL_OPEN_RISK_PCT:
+                logger.info(f"BUY_BLOCKED_RISK_CAP: {symbol} - risk {open_risk_pct:.2%} >= {MAX_TOTAL_OPEN_RISK_PCT:.2%}")
+                return False, f"RISK_CAP_EXCEEDED: {open_risk_pct:.2%}"
+
+        return True, "OK"
+
+    async def _rotate_weakest_position_for_capacity(
+        self,
+        incoming_symbol: str,
+        incoming_confidence: float,
+        incoming_buy_margin: float | None = None,
+    ) -> bool:
+        """No-op stub: Mystic does not force-exit an open position to free
+        capacity. Sells are gated exclusively by `_check_exit_conditions`.
+        """
+        return False
+
+    def _calculate_total_open_risk(self) -> float:
+        """Calculate total open risk across all positions in USD.
+        DUST_INVARIANT: Exclude DUST_PENDING - dust must not block buys via risk cap."""
+        total_risk = 0.0
+        for position in self.open_positions.values():
+            if getattr(position, "status", "ACTIVE") == "DUST_PENDING":
+                continue
+            total_risk += position.risk_usd
+        return total_risk
+
+    def _calculate_equity(self) -> float:
+        """Calculate total equity (cash + positions value)"""
+        positions_value = sum(
+            pos.quantity * pos.entry_price  # Use entry price as conservative estimate
+            for pos in self.open_positions.values()
+        )
+        return self.cash_balance + positions_value
+
+    # =========================================================================
+    # PHASE 3: SELL MONITORING (NO SKIPS)
+    # =========================================================================
+
+    async def monitor_all_positions(
+        self,
+        current_prices: dict[str, float],
+        current_bar: int,
+        symbols: set[str] | None = None,
+        *,
+        hold_day_bundles: dict[str, dict[str, Any]] | None = None,
+        hold_day_missing: dict[str, list[str]] | None = None,
+    ) -> list[dict]:
+        """
+        PHASE 3: Monitor ALL open positions for exit conditions.
+        No tracking-set skips - iterates actual open_positions from DB rebuild.
+        """
+        exits_executed = []
+
+        # CRITICAL: Iterate over actual positions, not a tracking set
+        # === DUST_INVARIANT_LOCK ===
+        # Skip DUST_PENDING - they are reconciled by dust_reconciliation_loop
+        # === END DUST_INVARIANT_LOCK ===
+        for symbol, position in list(self.open_positions.items()):
+            if symbols is not None and symbol not in symbols:
+                continue
+            if getattr(position, "status", "ACTIVE") == "DUST_PENDING":
+                continue
+            current_price = current_prices.get(symbol)
+            if not current_price:
+                logger.warning(f"MONITOR: No price for {symbol}, skipping")
+                continue
+
+            # Update high/low watermarks (for MFE/MAE diagnostics)
+            old_high = position.highest_price
+            position.highest_price = max(position.highest_price, current_price)
+            if not hasattr(position, "lowest_price") or position.lowest_price <= 0:
+                position.lowest_price = min(position.entry_price, current_price)
+            else:
+                position.lowest_price = min(position.lowest_price, current_price)
+
+            # Persist watermark changes so they survive restarts
+            if position.highest_price > old_high:
+                await self._persist_position_to_sqlite(position)
+
+            miss_kw: list[str] | None = None
+            if hold_day_missing is not None:
+                raw_m = hold_day_missing.get(symbol)
+                if raw_m is None:
+                    raw_m = hold_day_missing.get(normalize_symbol(symbol))
+                if isinstance(raw_m, list):
+                    miss_kw = list(raw_m)
+                elif raw_m is None:
+                    miss_kw = ["hold_missing_map_key_absent"]
+                else:
+                    miss_kw = [str(raw_m)]
+
+            day_bundle: dict[str, Any] | None = None
+            if hold_day_bundles is not None:
+                raw_bd = hold_day_bundles.get(symbol)
+                if raw_bd is None:
+                    raw_bd = hold_day_bundles.get(normalize_symbol(symbol))
+                if isinstance(raw_bd, dict):
+                    day_bundle = raw_bd
+
+            exit_result = await self._check_exit_conditions(
+                position,
+                current_price,
+                current_bar,
+                day_hold_bundle=day_bundle,
+                day_hold_missing=miss_kw,
+            )
+
+            if exit_result:
+                exits_executed.append(exit_result)
+
+        return exits_executed
+
+    async def _check_exit_conditions(
+        self,
+        position: OpenPosition,
+        current_price: float,
+        current_bar: int,
+        *,
+        day_hold_bundle: dict[str, Any] | None = None,
+        day_hold_missing: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Real-net-profit-only sell gate (DAY-only, top-4 Binance.US).
+
+        Mystic will sell an open position iff ALL of the following hold:
+
+          * ``position.symbol`` normalizes to a Binance.US API symbol that is
+            in ``DAY_TRADE_SYMBOLS`` (BTCUSDT / ETHUSDT / SOLUSDT / XRPUSDT).
+          * ``current_price`` is a valid live mark price (``> 0``).
+          * ``position.entry_price`` is a valid entry cost basis (``> 0``).
+          * ``position.quantity`` is a valid quantity (``> 0``).
+          * The fee/cost estimate is valid (``TAKER_FEE > 0`` and
+            ``SLIPPAGE_PCT >= 0``).
+          * Net P&L after the configured roundtrip cost
+            (``ESTIMATED_ROUNDTRIP_COST``) is greater than or equal to the
+            real-profit floor ``MIN_NET_PROFIT_TO_SELL``.
+
+        Missing live data => log the missing dependency and return ``None``
+        (no sell). Mystic keeps watching live price, candles, indicators,
+        and position state until a real net profit can be confirmed.
+        """
+        symbol = position.symbol
+
+        api_symbol = _to_api_symbol(symbol)
+        if api_symbol not in DAY_TRADE_SYMBOLS:
+            logger.warning(
+                "EXIT_SKIP_NON_DAY_SYMBOL: symbol=%s api=%s allowed=%s",
+                symbol,
+                api_symbol,
+                list(DAY_TRADE_SYMBOLS),
+            )
+            return None
+
+        entry_price = float(position.entry_price or 0.0)
+        quantity = float(position.quantity or 0.0)
+
+        if not isinstance(current_price, (int, float)) or current_price <= 0.0:
+            logger.warning(
+                "EXIT_SKIP_NO_LIVE_PRICE: symbol=%s current_price=%r (no live mark; no sell)",
+                symbol,
+                current_price,
+            )
+            return None
+        if entry_price <= 0.0:
+            logger.warning(
+                "EXIT_SKIP_BAD_ENTRY: symbol=%s entry_price=%r (no entry cost basis; no sell)",
+                symbol,
+                entry_price,
+            )
+            return None
+        if quantity <= 0.0:
+            logger.warning(
+                "EXIT_SKIP_BAD_QTY: symbol=%s quantity=%r (no quantity; no sell)",
+                symbol,
+                quantity,
+            )
+            return None
+        if TAKER_FEE <= 0.0 or SLIPPAGE_PCT < 0.0 or ESTIMATED_ROUNDTRIP_COST < 0.0:
+            logger.warning(
+                "EXIT_SKIP_BAD_FEE_ESTIMATE: taker=%r slippage=%r roundtrip=%r (no sell)",
+                TAKER_FEE,
+                SLIPPAGE_PCT,
+                ESTIMATED_ROUNDTRIP_COST,
+            )
+            return None
+
+        require_tf_ctx = os.getenv("DAY_EXIT_REQUIRE_FULL_TF_CONTEXT", "true").lower() in ("1", "true", "yes", "on")
+        bundle_obj = day_hold_bundle if isinstance(day_hold_bundle, dict) else None
+        missing_list = None if day_hold_missing is None else list(day_hold_missing)
+
+        if require_tf_ctx:
+            if day_hold_bundle is None or day_hold_missing is None:
+                logger.info(
+                    "EXIT_NO_ACTION_MISSING_DATA symbol=%s reason=monitor_context_payload_absent_requires_both_bundle_and_miss_map",
+                    symbol,
+                )
+                return None
+            if missing_list:
+                logger.info(
+                    "EXIT_NO_ACTION_MISSING_DATA symbol=%s reasons=%s",
+                    symbol,
+                    ";".join(str(x) for x in missing_list[:32]),
+                )
+                return None
+
+        pnl_pct = (current_price - entry_price) / entry_price
+        net_pnl_pct = pnl_pct - ESTIMATED_ROUNDTRIP_COST
+
+        if net_pnl_pct + 1e-12 < MIN_NET_PROFIT_TO_SELL:
+            logger.debug(
+                "HOLD_PROFIT_NOT_ENOUGH symbol=%s net_pct=%.6f floor=%.6f",
+                symbol,
+                net_pnl_pct,
+                MIN_NET_PROFIT_TO_SELL,
+            )
+            return None
+
+        from backend.services.day_spike_exit_hint import spike_profit_fading_from_bundle
+
+        fading = spike_profit_fading_from_bundle(bundle_obj) if bundle_obj else False
+
+        rationale = f"SPIKE_PROFIT_FADING_net_{net_pnl_pct * 100:.4f}pct" if fading else f"net_profit_confirmed_{net_pnl_pct * 100:.4f}pct"
+
+        logger.info(
+            "EXIT_NET_PROFIT_CONFIRMED: symbol=%s entry=%.8f mark=%.8f qty=%.8f pnl_pct=%.6f cost_pct=%.6f net_pct=%.6f floor=%.6f rationale=%s fading=%s",
+            symbol,
+            entry_price,
+            current_price,
+            quantity,
+            pnl_pct,
+            ESTIMATED_ROUNDTRIP_COST,
+            net_pnl_pct,
+            MIN_NET_PROFIT_TO_SELL,
+            rationale,
+            fading,
+        )
+        return await self.execute_sell_fifo(
+            symbol,
+            quantity,
+            current_price,
+            ExitType.TAKE_PROFIT_1,
+            rationale,
+            current_bar=current_bar,
+        )
+
+    # =========================================================================
+    # POSITION SIZING (capital allocation)
+    # =========================================================================
+
+    def _effective_min_notional(self) -> float:
+        """Single effective min notional including entry costs. notional_target must be >= this for entry."""
+        return MIN_POSITION_NOTIONAL * (1.0 + ENTRY_COST_PCT)
+
+    def _below_decision_min_notional(self, symbol: str, quantity: float, price: float) -> bool:
+        """True if quantity*price is below decision min notional. Call after every notional adjustment (step floor, governance cap)."""
+        if quantity <= 0 or price <= 0:
+            return True
+        effective_min = self._effective_min_notional()
+        constraints = self._symbol_constraints.get(symbol, {"min_notional": MIN_POSITION_NOTIONAL})
+        exchange_min = float(constraints.get("min_notional") or MIN_POSITION_NOTIONAL)
+        decision_min = max(effective_min, exchange_min)
+        return (quantity * price) < decision_min
+
+    async def _route_selected_open_position(
+        self,
+        *,
+        candidate: BuyCandidate,
+        explainability: TradeExplainability,
+        quantity: float,
+        stop_price: float,
+        atr: float,
+        confidence: float,
+        bar_timestamp: int,
+        decision_id: str = "",
+        sleeve: str = "",
+    ) -> dict[str, Any] | None:
+        symbol = normalize_symbol(candidate.symbol)
+        position = self.open_positions.get(symbol)
+        if position is None:
+            return None
+
+        # An open position exists for this symbol → HOLD. The only sell path
+        # is `_check_exit_conditions` (real net profit after costs).
+        logger.info(
+            "POSITION_MANAGEMENT_HOLD: symbol=%s reason=open_position_hold",
+            symbol,
+        )
+        return {
+            "handled": True,
+            "action": "HOLD",
+            "trade_result": None,
+            "reason": "POSITION_MANAGEMENT_HOLD_OPEN_POSITION",
+        }
+
+    def _refresh_adaptive_weights_cache(self, *, force: bool = False) -> None:
+        """Load the full ``ai_strategy_score_weights`` table into memory at
+        most every ``ADAPTIVE_SCORE_WEIGHT_REFRESH_SEC`` seconds. The table is
+        small (bounded by 13 components x n strategies x n symbols x n regimes)
+        so the entire load is cheap. Loader failure is non-fatal and treated
+        as "no learned weights" (neutral)."""
+        if not _adaptive_weights_enabled():
+            self._adaptive_weights_cache = {}
+            return
+        now = time.time()
+        if not force and (now - self._adaptive_weights_loaded_at) < self._adaptive_weights_refresh_sec and self._adaptive_weights_loaded_at > 0.0:
+            return
+        new_cache: dict[tuple[str, str, str], dict[str, float]] = {}
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.execute(
+                    """
+                    SELECT strategy_id, symbol, regime, component_name, weight
+                    FROM ai_strategy_score_weights
+                    """
+                )
+                for row in cur.fetchall():
+                    strategy_id = str(row[0] or "day").strip().lower()
+                    symbol = str(row[1] or "").upper().replace("/", "")
+                    regime = _normalize_regime(row[2])
+                    component_name = str(row[3] or "").strip()
+                    if not component_name or component_name not in _ADAPTIVE_COMPONENT_BOUNDS:
+                        continue
+                    try:
+                        weight = float(row[4])
+                    except (TypeError, ValueError):
+                        continue
+                    key = (strategy_id, symbol, regime)
+                    new_cache.setdefault(key, {})[component_name] = weight
+        except sqlite3.Error:
+            # Loader failure is non-fatal — treat as no weights (neutral).
+            new_cache = {}
+        self._adaptive_weights_cache = new_cache
+        self._adaptive_weights_loaded_at = now
+
+    def _load_adaptive_weights(self, strategy_id: str, symbol: str, regime: str) -> dict[str, float]:
+        """Return adaptive component weights for (strategy, symbol, regime).
+
+        Returns an empty dict when the table is empty, the row is missing, or
+        adaptive weighting is disabled — callers must treat empty as neutral.
+        """
+        if not _adaptive_weights_enabled():
+            return {}
+        self._refresh_adaptive_weights_cache()
+        sid = (strategy_id or "day").strip().lower()
+        sym = (symbol or "").upper().replace("/", "")
+        reg = _normalize_regime(regime)
+        exact_key = (sid, sym, reg)
+        exact = self._adaptive_weights_cache.get(exact_key, {})
+        if exact:
+            return dict(exact)
+
+        # Regime fallback: if the current market regime label is unavailable
+        # for this symbol/strategy, blend all known regimes for this pair so
+        # fast-learning still impacts next-cycle ranking.
+        by_pair: list[dict[str, float]] = []
+        for (k_sid, k_sym, _k_reg), comp_map in self._adaptive_weights_cache.items():
+            if k_sid == sid and k_sym == sym and comp_map:
+                by_pair.append(comp_map)
+        if not by_pair:
+            return {}
+
+        merged: dict[str, float] = {}
+        for comp in _ADAPTIVE_COMPONENT_BOUNDS:
+            vals: list[float] = []
+            for mp in by_pair:
+                if comp in mp:
+                    with contextlib.suppress(Exception):
+                        vals.append(float(mp[comp]))
+            if vals:
+                merged[comp] = float(sum(vals) / len(vals))
+        return merged
+
+    def _apply_adaptive_weights_to_candidate(self, candidate: BuyCandidate, strategy_id: str) -> dict[str, Any]:
+        """Compute and attach the adaptive score delta to a candidate.
+
+        Returns a diagnostics dict with ``delta``, ``components_used``,
+        ``components_missing``, ``regime``. Never raises.
+        """
+        regime = _normalize_regime(
+            (candidate.decision_data or {}).get("ctx_market_regime")
+            or (candidate.decision_data or {}).get("market_regime")
+            or (candidate.decision_data or {}).get("regime_label")
+            or (candidate.decision_data or {}).get("regime")
+        )
+        candidate.adaptive_regime = regime
+        try:
+            weights = self._load_adaptive_weights(strategy_id, candidate.symbol, regime)
+        except Exception:
+            weights = {}
+        if not weights:
+            candidate.adaptive_score_delta = 0.0
+            candidate.adaptive_components_used = {}
+            candidate.adaptive_components_missing = []
+            return {"delta": 0.0, "components_used": {}, "components_missing": [], "regime": regime, "weights_present": False}
+        delta, used, missing = compute_adaptive_score_delta(candidate, weights)
+        candidate.adaptive_score_delta = delta
+        candidate.adaptive_components_used = used
+        candidate.adaptive_components_missing = missing
+        return {"delta": delta, "components_used": used, "components_missing": missing, "regime": regime, "weights_present": True}
+
+    def _load_strategy_recent_performance(self, strategy_id: str, *, window: int = 120) -> dict[str, float]:
+        """Return rolling strategy performance for non-blocking rank/sizing pressure."""
+        sid = (strategy_id or "day").strip().lower()
+        w = max(20, min(400, int(window or 120)))
+        snapshot = {
+            "trades": 0.0,
+            "avg_net_pct": 0.0,
+            "win_rate": 0.5,
+            "sum_net_pct": 0.0,
+        }
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    WITH recent AS (
+                        SELECT COALESCE(net_pnl_pct, realized_pct, 0.0) AS n
+                        FROM ai_outcome_training_rows
+                        WHERE LOWER(strategy_id)=LOWER(?)
+                        ORDER BY id DESC
+                        LIMIT ?
+                    )
+                    SELECT
+                        COUNT(*),
+                        COALESCE(SUM(n), 0.0),
+                        COALESCE(AVG(n), 0.0),
+                        COALESCE(AVG(CASE WHEN n > 0 THEN 1.0 ELSE 0.0 END), 0.0)
+                    FROM recent
+                    """,
+                    (sid, w),
+                ).fetchone()
+            if row:
+                snapshot["trades"] = float(row[0] or 0.0)
+                snapshot["sum_net_pct"] = float(row[1] or 0.0)
+                snapshot["avg_net_pct"] = float(row[2] or 0.0)
+                snapshot["win_rate"] = float(row[3] or 0.0)
+        except Exception:
+            pass
+        return snapshot
+
+    def _load_symbol_strategy_trust_snapshot(self, symbol: str, strategy_id: str) -> dict[str, float]:
+        """Load symbol/strategy trust inputs from canonical learning tables.
+
+        Ranking/sizing only. Never used as an admission gate.
+        """
+        sym_slash = normalize_symbol(symbol).upper()
+        sym_noslash = sym_slash.replace("/", "")
+        sid = (strategy_id or "day").strip().lower()
+        snapshot = {
+            "expectancy": 0.0,
+            "expectancy_trades": 0.0,
+            "good_memory_count": 0.0,
+            "bad_memory_count": 0.0,
+            "bad_cut_count": 0.0,
+            "bad_cut_low_mfe_count": 0.0,
+            "bad_cut_low_mfe_ratio": 0.0,
+            "bad_cut_share_of_bad": 0.0,
+            "peer_outperf_ratio": 0.5,
+            "selected_wrong_ratio": 0.5,
+            "adaptive_symbol_bias": 0.0,
+        }
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                exp_row = conn.execute(
+                    """
+                    SELECT expectancy, good_count, bad_count
+                    FROM ai_symbol_strategy_expectancy
+                    WHERE (UPPER(symbol)=UPPER(?) OR UPPER(symbol)=UPPER(?))
+                      AND LOWER(strategy_id)=LOWER(?)
+                    LIMIT 1
+                    """,
+                    (sym_slash, sym_noslash, sid),
+                ).fetchone()
+                if exp_row:
+                    snapshot["expectancy"] = float(exp_row[0] or 0.0)
+                    snapshot["good_memory_count"] = float(exp_row[1] or 0.0)
+                    snapshot["bad_memory_count"] = float(exp_row[2] or 0.0)
+                    snapshot["expectancy_trades"] = float(snapshot["good_memory_count"] + snapshot["bad_memory_count"])
+                flow_row = conn.execute(
+                    """
+                    WITH recent AS (
+                        SELECT good_bad_memory_class, ai_exit_recommended_action, max_favorable_excursion
+                        FROM ai_outcome_training_rows
+                        WHERE (UPPER(symbol)=UPPER(?) OR UPPER(symbol)=UPPER(?))
+                          AND LOWER(strategy_id)=LOWER(?)
+                        ORDER BY id DESC
+                        LIMIT 240
+                    )
+                    SELECT
+                        SUM(CASE WHEN UPPER(COALESCE(good_bad_memory_class,''))='BAD' THEN 1 ELSE 0 END) AS bad_count_recent,
+                        SUM(CASE WHEN UPPER(COALESCE(good_bad_memory_class,''))='BAD'
+                                   AND UPPER(COALESCE(ai_exit_recommended_action,''))='CUT' THEN 1 ELSE 0 END) AS bad_cut_count,
+                        SUM(CASE WHEN UPPER(COALESCE(good_bad_memory_class,''))='BAD'
+                                   AND UPPER(COALESCE(ai_exit_recommended_action,''))='CUT'
+                                   AND COALESCE(max_favorable_excursion, 0.0) <= ? THEN 1 ELSE 0 END) AS bad_cut_low_mfe_count
+                    FROM recent
+                    """,
+                    (sym_slash, sym_noslash, sid, 0.0008),
+                ).fetchone()
+                if flow_row:
+                    bad_recent = float(flow_row[0] or 0.0)
+                    bad_cut_count = float(flow_row[1] or 0.0)
+                    bad_cut_low_mfe_count = float(flow_row[2] or 0.0)
+                    snapshot["bad_cut_count"] = bad_cut_count
+                    snapshot["bad_cut_low_mfe_count"] = bad_cut_low_mfe_count
+                    snapshot["bad_cut_low_mfe_ratio"] = (bad_cut_low_mfe_count / bad_cut_count) if bad_cut_count > 0 else 0.0
+                    snapshot["bad_cut_share_of_bad"] = (bad_cut_count / bad_recent) if bad_recent > 0 else 0.0
+        except Exception:
+            pass
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                peer_row = conn.execute(
+                    """
+                    SELECT
+                        SUM(CASE WHEN (UPPER(peer_symbol)=UPPER(?) OR UPPER(peer_symbol)=UPPER(?)) THEN 1 ELSE 0 END) AS peer_seen,
+                        SUM(CASE WHEN (UPPER(peer_symbol)=UPPER(?) OR UPPER(peer_symbol)=UPPER(?)) AND peer_outperformed_selected=1 THEN 1 ELSE 0 END) AS peer_outperf,
+                        SUM(CASE WHEN (UPPER(selected_symbol)=UPPER(?) OR UPPER(selected_symbol)=UPPER(?)) THEN 1 ELSE 0 END) AS selected_seen,
+                        SUM(CASE WHEN (UPPER(selected_symbol)=UPPER(?) OR UPPER(selected_symbol)=UPPER(?)) AND selected_was_wrong=1 THEN 1 ELSE 0 END) AS selected_wrong
+                    FROM ai_peer_shadow_outcomes
+                    WHERE LOWER(strategy_id)=LOWER(?)
+                    """,
+                    (sym_slash, sym_noslash, sym_slash, sym_noslash, sym_slash, sym_noslash, sym_slash, sym_noslash, sid),
+                ).fetchone()
+                if peer_row:
+                    peer_seen = float(peer_row[0] or 0.0)
+                    peer_out = float(peer_row[1] or 0.0)
+                    selected_seen = float(peer_row[2] or 0.0)
+                    selected_wrong = float(peer_row[3] or 0.0)
+                    snapshot["peer_outperf_ratio"] = (peer_out / peer_seen) if peer_seen > 0 else 0.5
+                    snapshot["selected_wrong_ratio"] = (selected_wrong / selected_seen) if selected_seen > 0 else 0.5
+        except Exception:
+            pass
+        try:
+            # Re-use existing adaptive weights cache as a soft signal for
+            # learned component bias for this symbol/strategy.
+            self._refresh_adaptive_weights_cache()
+            vals: list[float] = []
+            for rg in ("unknown", "trending", "range_bound"):
+                wm = self._load_adaptive_weights(sid, sym_noslash, rg)
+                for _k, w in wm.items():
+                    try:
+                        vals.append(float(w))
+                    except (TypeError, ValueError):
+                        continue
+            if vals:
+                snapshot["adaptive_symbol_bias"] = sum(vals) / max(1.0, float(len(vals)))
+        except Exception:
+            pass
+        return snapshot
+
+    def _compute_symbol_trust_components(self, candidate: BuyCandidate, strategy_id: str) -> dict[str, Any]:
+        """Compute non-blocking symbol trust components for rank and sizing."""
+        dd = candidate.decision_data or {}
+        symbol = normalize_symbol(candidate.symbol)
+        sid = (strategy_id or "day").strip().lower()
+        dd.setdefault("symbol", symbol)
+        dd.setdefault("live_ai_strategy", sid)
+        group = _symbol_group(symbol)
+        baseline = _symbol_group_baseline(group)
+        snap = self._load_symbol_strategy_trust_snapshot(symbol, sid)
+
+        rel_strength = _safe_float(dd.get("ctx_rs_btc"), _safe_float(dd.get("ctx_rs_eth"), 0.0))
+        rel_volume = _safe_float(dd.get("relative_volume"), _safe_float(dd.get("volume_expansion"), 0.0))
+        trend = float(candidate.trend_score or 0.0)
+        momentum = _safe_float(dd.get("price_momentum"), 0.0)
+        net_ev = self._estimate_candidate_net_expected_value(dd)
+
+        exp = _safe_float(snap.get("expectancy"), 0.0)
+        exp_trades = _safe_float(snap.get("expectancy_trades"), 0.0)
+        bad_count = _safe_float(snap.get("bad_memory_count"), 0.0)
+        good_count = _safe_float(snap.get("good_memory_count"), 0.0)
+        bad_ratio = (bad_count / max(1.0, bad_count + good_count)) if (bad_count + good_count) > 0 else 0.5
+        bad_cut_count = _safe_float(snap.get("bad_cut_count"), 0.0)
+        bad_cut_low_mfe_count = _safe_float(snap.get("bad_cut_low_mfe_count"), 0.0)
+        bad_cut_low_mfe_ratio = max(0.0, min(1.0, _safe_float(snap.get("bad_cut_low_mfe_ratio"), 0.0)))
+        bad_cut_share_of_bad = max(0.0, min(1.0, _safe_float(snap.get("bad_cut_share_of_bad"), 0.0)))
+        strategy_perf = self._load_strategy_recent_performance(sid, window=120)
+        strategy_trades = _safe_float(strategy_perf.get("trades"), 0.0)
+        strategy_avg_net = _safe_float(strategy_perf.get("avg_net_pct"), 0.0)
+        strategy_win_rate = max(0.0, min(1.0, _safe_float(strategy_perf.get("win_rate"), 0.5)))
+        repeated_bad_low_mfe_profile = bad_ratio >= 0.90 and bad_count >= 16 and bad_cut_count >= 14 and bad_cut_low_mfe_count >= 8 and bad_cut_low_mfe_ratio >= 0.70
+        setup_rs_min = 0.62 if repeated_bad_low_mfe_profile else 0.45
+        setup_rv_min = 1.70 if repeated_bad_low_mfe_profile else 1.35
+        setup_trend_min = 0.70 if repeated_bad_low_mfe_profile else 0.62
+        setup_mom_min = 0.42 if repeated_bad_low_mfe_profile else 0.30
+        setup_ev_min = 0.0018 if repeated_bad_low_mfe_profile else 0.0009
+        strong_setup = rel_strength >= setup_rs_min and rel_volume >= setup_rv_min and trend >= setup_trend_min and momentum >= setup_mom_min and net_ev > setup_ev_min
+        setup_credit = 0.0
+        if strong_setup:
+            setup_credit = 0.020 + min(0.040, 0.018 * (rel_volume - 1.0) + 0.012 * max(0.0, rel_strength))
+        exp_conf = max(0.15, min(1.0, exp_trades / 18.0))
+        symbol_expectancy_adjustment = max(-0.045, min(0.045, exp * 0.040 * exp_conf))
+
+        peer_outperf_ratio = _safe_float(snap.get("peer_outperf_ratio"), 0.5)
+        selected_wrong_ratio = _safe_float(snap.get("selected_wrong_ratio"), 0.5)
+        peer_adjust = max(-0.018, min(0.018, (peer_outperf_ratio - 0.5) * 0.05))
+        selected_adjust = max(-0.015, min(0.015, (0.5 - selected_wrong_ratio) * 0.03))
+
+        weak_symbol_penalty = 0.0
+        if group == "low_trust":
+            weak_symbol_penalty -= 0.035
+            if rel_strength < 0.25:
+                weak_symbol_penalty -= 0.012
+            if rel_volume < 1.05:
+                weak_symbol_penalty -= 0.010
+            if net_ev < 0.0010:
+                weak_symbol_penalty -= 0.014
+            if strong_setup:
+                weak_symbol_penalty += 0.032
+        elif group == "secondary":
+            if net_ev < 0.0008:
+                weak_symbol_penalty -= 0.006
+
+        if symbol == "SOLUSDT" and rel_strength >= 0.55 and rel_volume >= 1.35 and trend >= 0.63 and net_ev > 0.0011:
+            setup_credit += 0.018
+
+        if symbol == "XRPUSDT":
+            if rel_volume < 1.25 or momentum < 0.28 or net_ev < 0.0012:
+                weak_symbol_penalty -= 0.012
+            elif strong_setup:
+                setup_credit += 0.010
+        # Immediate post-outcome pressure for BAD-heavy symbol/strategy pairs.
+        bad_heavy_penalty = 0.0
+        if exp_trades >= 10 and bad_ratio >= 0.85:
+            bad_heavy_penalty -= 0.020 + min(0.025, (bad_ratio - 0.85) * 0.25)
+        if exp_trades >= 16 and bad_ratio >= 0.95:
+            bad_heavy_penalty -= 0.015
+        if exp_trades >= 12 and exp <= -0.03:
+            bad_heavy_penalty -= 0.010
+        weak_symbol_penalty += bad_heavy_penalty
+
+        strategy_pressure = 0.0
+        strategy_rank_penalty = 0.0
+        strategy_ev_penalty = 0.0
+        if strategy_trades >= 40 and strategy_avg_net < 0.0:
+            strategy_pressure = 0.65 * max(0.0, min(1.0, abs(strategy_avg_net) / 0.060)) + 0.35 * max(0.0, min(1.0, (0.45 - strategy_win_rate) / 0.45))
+            strategy_pressure = max(0.0, min(1.0, strategy_pressure))
+            strategy_rank_penalty = 0.010 + 0.040 * strategy_pressure
+            strategy_ev_penalty = 0.00025 + 0.00085 * strategy_pressure
+            weak_symbol_penalty -= strategy_rank_penalty
+
+        profile_pressure = 0.0
+        profile_rank_penalty = 0.0
+        profile_ev_penalty = 0.0
+        profile_requires_strong_setup = False
+        if repeated_bad_low_mfe_profile:
+            profile_requires_strong_setup = True
+            profile_pressure = (
+                0.30 * max(0.0, min(1.0, (bad_ratio - 0.90) / 0.10))
+                + 0.20 * max(0.0, min(1.0, (bad_count - 16.0) / 64.0))
+                + 0.20 * max(0.0, min(1.0, (bad_cut_count - 14.0) / 80.0))
+                + 0.20 * max(0.0, min(1.0, (bad_cut_low_mfe_ratio - 0.70) / 0.30))
+                + 0.10 * max(0.0, min(1.0, (bad_cut_share_of_bad - 0.30) / 0.50))
+            )
+            profile_pressure = max(0.0, min(1.0, profile_pressure))
+            profile_rank_penalty = 0.030 + 0.050 * profile_pressure
+            profile_ev_penalty = 0.00045 + 0.00135 * profile_pressure
+            if not strong_setup:
+                profile_rank_penalty += 0.020 + 0.030 * profile_pressure
+                profile_ev_penalty += 0.00035 + 0.00090 * profile_pressure
+            weak_symbol_penalty -= profile_rank_penalty
+
+        raw_trust = baseline + symbol_expectancy_adjustment + setup_credit + weak_symbol_penalty + peer_adjust + selected_adjust
+        symbol_trust_score = max(-0.16, min(0.16, raw_trust))
+
+        # Map trust into sizing factor; still bounded by dynamic sizing caps.
+        symbol_size_factor = 1.0 + symbol_trust_score * 2.2
+        symbol_size_factor = max(0.50, min(1.30, symbol_size_factor))
+        if group == "low_trust" and not strong_setup:
+            symbol_size_factor = min(symbol_size_factor, 0.82)
+        if group == "low_trust" and strong_setup and net_ev >= 0.0018:
+            symbol_size_factor = max(0.95, min(1.10, symbol_size_factor))
+        if exp_trades >= 10 and bad_ratio >= 0.85:
+            symbol_size_factor = min(symbol_size_factor, 0.70)
+        if exp_trades >= 16 and bad_ratio >= 0.95:
+            symbol_size_factor = min(symbol_size_factor, 0.55)
+        if repeated_bad_low_mfe_profile:
+            profile_size_cap = 0.44 - 0.12 * profile_pressure
+            if not strong_setup:
+                profile_size_cap -= 0.08
+            symbol_size_factor = min(symbol_size_factor, max(0.22, profile_size_cap))
+        if strategy_pressure > 0.0:
+            strategy_size_cap = 0.66 - 0.24 * strategy_pressure
+            symbol_size_factor = min(symbol_size_factor, max(0.30, strategy_size_cap))
+
+        return {
+            "symbol_group": group,
+            "symbol_group_baseline": float(baseline),
+            "setup_credit": float(max(-0.08, min(0.08, setup_credit))),
+            "weak_symbol_penalty": float(max(-0.12, min(0.02, weak_symbol_penalty))),
+            "symbol_expectancy_adjustment": float(symbol_expectancy_adjustment),
+            "symbol_trust_score": float(symbol_trust_score),
+            "symbol_size_factor": float(symbol_size_factor),
+            "symbol_trust_bad_ratio": float(bad_ratio),
+            "symbol_trust_bad_heavy_penalty": float(bad_heavy_penalty),
+            "symbol_trust_setup_strong": bool(strong_setup),
+            "symbol_trust_expectancy": float(exp),
+            "symbol_trust_expectancy_trades": float(exp_trades),
+            "symbol_trust_peer_outperf_ratio": float(peer_outperf_ratio),
+            "symbol_trust_selected_wrong_ratio": float(selected_wrong_ratio),
+            "symbol_profile_repeated_bad_low_mfe": bool(repeated_bad_low_mfe_profile),
+            "symbol_profile_pressure": float(profile_pressure),
+            "symbol_profile_rank_penalty": float(-profile_rank_penalty),
+            "symbol_profile_ev_penalty": float(max(0.0, profile_ev_penalty)),
+            "symbol_profile_bad_cut_count": float(bad_cut_count),
+            "symbol_profile_bad_cut_low_mfe_count": float(bad_cut_low_mfe_count),
+            "symbol_profile_bad_cut_low_mfe_ratio": float(bad_cut_low_mfe_ratio),
+            "symbol_profile_bad_cut_share_of_bad": float(bad_cut_share_of_bad),
+            "symbol_profile_setup_not_strong": bool(profile_requires_strong_setup and not strong_setup),
+            "symbol_profile_setup_ev_min": float(setup_ev_min),
+            "strategy_recent_trades": float(strategy_trades),
+            "strategy_recent_avg_net_pct": float(strategy_avg_net),
+            "strategy_recent_win_rate": float(strategy_win_rate),
+            "strategy_recent_pressure": float(strategy_pressure),
+            "strategy_recent_rank_penalty": float(-strategy_rank_penalty),
+            "strategy_recent_ev_penalty": float(max(0.0, strategy_ev_penalty)),
+        }
+
+    def _apply_symbol_trust_to_candidate(self, candidate: BuyCandidate, strategy_id: str) -> dict[str, Any]:
+        """Attach symbol trust components to candidate decision data."""
+        comps = self._compute_symbol_trust_components(candidate, strategy_id)
+        dd = dict(candidate.decision_data or {})
+        dd.update(comps)
+        candidate.decision_data = dd
+        return comps
+
+    def _compute_dynamic_sizing_multiplier(
+        self,
+        *,
+        symbol: str,
+        strategy_id: str,
+        final_profit_score: float,
+        net_expected_value: float,
+        confidence: float,
+        decision_data: dict[str, Any],
+    ) -> tuple[float, dict[str, float], str]:
+        """AI dynamic sizing with capped factors (Phase 4 — re-enabled).
+
+        Each factor is bounded so a single weak input cannot blow up sizing.
+        ``AI_DYNAMIC_SIZING_ENABLED=false`` reverts to neutral (1.0).
+        """
+        neutral = {
+            "drawdown_factor": 1.0,
+            "memory_factor": 1.0,
+            "expectancy_factor": 1.0,
+            "liquidity_factor": 1.0,
+            "ev_factor": 1.0,
+            "score_factor": 1.0,
+            "confidence_factor": 1.0,
+            "symbol_size_factor": 1.0,
+        }
+        enabled = os.getenv("AI_DYNAMIC_SIZING_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+        if not enabled:
+            return (1.0, neutral, "disabled")
+
+        def _envf(key: str, default: float) -> float:
+            try:
+                return float(os.getenv(key, str(default)))
+            except (TypeError, ValueError):
+                return default
+
+        min_mult = max(0.10, min(1.0, _envf("AI_DYNAMIC_SIZE_MIN_MULT", 0.35)))
+        max_mult = max(1.0, min(3.0, _envf("AI_DYNAMIC_SIZE_MAX_MULT", 1.50)))
+        max_mult = max(max_mult, min_mult)
+        sid = (strategy_id or "day").strip().lower()
+        strategy_max = _envf("AI_DYNAMIC_SIZE_DAY_MAX_MULT", 1.25)
+        strategy_max = max(min_mult, min(max_mult, strategy_max))
+        bad_memory_cap = max(min_mult, min(max_mult, _envf("AI_DYNAMIC_SIZE_BAD_MEMORY_CAP", 0.75)))
+        drawdown_cap = max(min_mult, min(max_mult, _envf("AI_DYNAMIC_SIZE_DRAWDOWN_CAP", 0.60)))
+        ev_high = _envf("AI_DYNAMIC_SIZE_EV_HIGH_WATERMARK", 0.0020)
+        ev_low = _envf("AI_DYNAMIC_SIZE_EV_LOW_WATERMARK", 0.0008)
+
+        dd = decision_data or {}
+        # Drawdown factor: shrink as drawdown grows. Active drawdown caps mult.
+        cur_dd = 0.0
+        try:
+            cur_dd = float(getattr(getattr(self, "_regime_state", None), "current_drawdown_pct", 0.0) or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            cur_dd = 0.0
+        if cur_dd <= 0.05:
+            drawdown_factor = 1.0
+        elif cur_dd <= 0.10:
+            drawdown_factor = 0.90
+        elif cur_dd <= 0.20:
+            drawdown_factor = 0.75
+        else:
+            drawdown_factor = 0.55
+        # Memory factor: more BAD memory → lower size; more GOOD memory → modest boost.
+        bad_sim = 0.0
+        good_sim = 0.0
+        try:
+            bad_sim = float(dd.get("bad_pattern_similarity") or 0.0)
+            good_sim = float(dd.get("good_pattern_similarity") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        memory_factor = 1.0 + 0.20 * max(-1.0, min(1.0, good_sim - bad_sim))
+        memory_factor = max(0.5, min(1.30, memory_factor))
+        # Expectancy factor: per-coin / strategy expectancy normalized to small range.
+        coin_exp = 0.0
+        try:
+            coin_exp = float(dd.get("coin_expectancy") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        expectancy_factor = max(0.6, min(1.30, 1.0 + max(-0.5, min(0.5, coin_exp / 5.0)) * 0.30))
+        # Liquidity factor: tighter spread → slight boost; wide spread → strong cut.
+        liquidity_factor = 1.0
+        try:
+            spread_pct = float(dd.get("spread_pct") or 0.0)
+        except (TypeError, ValueError):
+            spread_pct = 0.0
+        if spread_pct >= 0.0050:
+            liquidity_factor = 0.70
+        elif spread_pct >= 0.0030:
+            liquidity_factor = 0.85
+        elif spread_pct <= 0.0008 and spread_pct > 0:
+            liquidity_factor = 1.10
+        # EV factor: positive EV above high watermark scales up; below low watermark cuts.
+        ev = float(net_expected_value or 0.0)
+        if ev >= ev_high:
+            ev_factor = 1.20
+        elif ev >= ev_low:
+            ev_factor = 1.05
+        elif ev > 0:
+            ev_factor = 0.95
+        else:
+            ev_factor = 0.70
+        # Score factor: scale by final_profit_score relative to net_expected_value bound midpoint.
+        score_factor = 1.0
+        if final_profit_score > 0:
+            score_factor = max(0.85, min(1.20, 0.90 + (final_profit_score / 50.0)))
+        elif final_profit_score < 0:
+            score_factor = 0.85
+        # Confidence factor: scale by confidence in [0..1].
+        conf = max(0.0, min(1.0, float(confidence or 0.0)))
+        if conf >= 0.85:
+            confidence_factor = 1.15
+        elif conf >= 0.75:
+            confidence_factor = 1.05
+        elif conf >= 0.65:
+            confidence_factor = 0.95
+        else:
+            confidence_factor = 0.85
+        # Symbol trust factor (never admission). Group + expectancy logic
+        # is computed in candidate ranking path and carried in decision_data.
+        symbol_group = str(dd.get("symbol_group") or _symbol_group(symbol)).strip().lower()
+        try:
+            symbol_size_factor = float(dd.get("symbol_size_factor") or 1.0)
+        except (TypeError, ValueError):
+            symbol_size_factor = 1.0
+        symbol_size_factor = max(0.50, min(1.30, symbol_size_factor))
+        setup_strong = str(dd.get("symbol_trust_setup_strong") or "").strip().lower() in ("1", "true", "yes", "on")
+        if symbol_group == "low_trust" and not setup_strong:
+            symbol_size_factor = min(symbol_size_factor, 0.82)
+        if symbol_group == "low_trust" and setup_strong and ev >= ev_high:
+            symbol_size_factor = max(0.95, min(symbol_size_factor, 1.10))
+
+        components: dict[str, float] = {
+            "drawdown_factor": round(drawdown_factor, 4),
+            "memory_factor": round(memory_factor, 4),
+            "expectancy_factor": round(expectancy_factor, 4),
+            "liquidity_factor": round(liquidity_factor, 4),
+            "ev_factor": round(ev_factor, 4),
+            "score_factor": round(score_factor, 4),
+            "confidence_factor": round(confidence_factor, 4),
+            "symbol_size_factor": round(symbol_size_factor, 4),
+        }
+        raw_mult = drawdown_factor * memory_factor * expectancy_factor * liquidity_factor * ev_factor * score_factor * confidence_factor * symbol_size_factor
+        cap_reason = ""
+        mult = raw_mult
+        # Cap when sizing would grow size despite warning signals (rule 4 from spec).
+        bad_heavy = bad_sim >= 0.6 and good_sim < 0.4
+        adaptive_negative = False
+        try:
+            adaptive_negative = float(dd.get("adaptive_score_delta") or 0.0) < 0.0
+        except (TypeError, ValueError):
+            adaptive_negative = False
+        if mult > 1.0 and (bad_heavy or ev < ev_low or adaptive_negative or cur_dd >= 0.05):
+            mult = min(mult, 1.0)
+            cap_reason = "weak_edge_cap_to_one"
+        if symbol_group == "low_trust" and not setup_strong and mult > 1.0:
+            mult = 1.0
+            cap_reason = cap_reason or "low_trust_no_setup_cap"
+        bad_ratio = _safe_float(dd.get("symbol_trust_bad_ratio"), 0.5)
+        exp_trades = _safe_float(dd.get("symbol_trust_expectancy_trades"), 0.0)
+        bad_heavy_strategy_cap = max(min_mult, min(max_mult, _envf("AI_DYNAMIC_SIZE_BAD_HEAVY_STRAT_CAP", 0.55)))
+        if exp_trades >= 10 and bad_ratio >= 0.85 and mult > bad_heavy_strategy_cap:
+            mult = bad_heavy_strategy_cap
+            cap_reason = cap_reason or "bad_heavy_symbol_strategy_cap"
+        severe_bad_cap = max(min_mult, min(max_mult, _envf("AI_DYNAMIC_SIZE_SEVERE_BAD_STRAT_CAP", 0.45)))
+        if exp_trades >= 16 and bad_ratio >= 0.95 and mult > severe_bad_cap:
+            mult = severe_bad_cap
+            cap_reason = cap_reason or "severe_bad_symbol_strategy_cap"
+        profile_active = str(dd.get("symbol_profile_repeated_bad_low_mfe") or "").strip().lower() in ("1", "true", "yes", "on")
+        if profile_active:
+            profile_pressure = max(0.0, min(1.0, _safe_float(dd.get("symbol_profile_pressure"), 0.0)))
+            profile_setup_not_strong = str(dd.get("symbol_profile_setup_not_strong") or "").strip().lower() in ("1", "true", "yes", "on")
+            profile_cap = 0.42 - 0.12 * profile_pressure
+            if profile_setup_not_strong:
+                profile_cap -= 0.08
+            if ev < (_safe_float(dd.get("symbol_profile_setup_ev_min"), ev_high) + 0.0006):
+                profile_cap = min(profile_cap, 0.34 - 0.06 * profile_pressure)
+            profile_cap = max(min_mult, min(max_mult, profile_cap))
+            if mult > profile_cap:
+                mult = profile_cap
+                cap_reason = cap_reason or "repeated_bad_low_mfe_profile_cap"
+        strategy_recent_pressure = max(0.0, min(1.0, _safe_float(dd.get("strategy_recent_pressure"), 0.0)))
+        strategy_recent_trades = _safe_float(dd.get("strategy_recent_trades"), 0.0)
+        strategy_recent_avg_net = _safe_float(dd.get("strategy_recent_avg_net_pct"), 0.0)
+        if strategy_recent_trades >= 40 and strategy_recent_avg_net < 0.0:
+            weak_edge_cap = 0.70 - 0.26 * strategy_recent_pressure
+            if strategy_recent_avg_net <= -0.05:
+                weak_edge_cap -= 0.07
+            weak_edge_cap = max(min_mult, min(max_mult, weak_edge_cap))
+            if mult > weak_edge_cap:
+                mult = weak_edge_cap
+                cap_reason = cap_reason or "strategy_recent_negative_edge_cap"
+            strategy_max = min(strategy_max, max(min_mult, weak_edge_cap))
+        # Hard caps
+        if cur_dd >= 0.05 and mult > drawdown_cap:
+            mult = drawdown_cap
+            cap_reason = cap_reason or "drawdown_cap"
+        if bad_heavy and mult > bad_memory_cap:
+            mult = bad_memory_cap
+            cap_reason = cap_reason or "bad_memory_cap"
+        if mult > strategy_max:
+            mult = strategy_max
+            cap_reason = cap_reason or "strategy_max_cap"
+        mult = max(min_mult, min(max_mult, mult))
+        return (round(mult, 4), components, cap_reason)
+
+    def _update_strategy_capital_sleeve(
+        self,
+        *,
+        strategy_id: str,
+        realized_pnl_delta: float,
+        deployed_capital_delta: float,
+        is_win: bool,
+    ) -> None:
+        sid = (strategy_id or "day").strip().lower()
+        if sid != "day":
+            sid = "day"
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT allocated_capital, deployed_capital, available_capital, realized_pnl,
+                           unrealized_pnl, win_count, loss_count, net_expectancy, max_drawdown, current_drawdown, allocation_pct
+                    FROM ai_strategy_capital_sleeves
+                    WHERE strategy_id = ?
+                    LIMIT 1
+                    """,
+                    (sid,),
+                ).fetchone()
+                if row:
+                    allocated, deployed, available, realized, unrealized, wins, losses, expectancy, max_dd, cur_dd, alloc_pct = row
+                else:
+                    base_alloc = 0.6 if sid == "day" else 0.4
+                    allocated = self._total_equity * base_alloc
+                    deployed = 0.0
+                    available = allocated
+                    realized = unrealized = expectancy = max_dd = cur_dd = 0.0
+                    wins = losses = 0
+                    alloc_pct = base_alloc
+                deployed = max(0.0, float(deployed or 0.0) + deployed_capital_delta)
+                realized = float(realized or 0.0) + realized_pnl_delta
+                available = max(0.0, float(allocated or 0.0) - deployed)
+                wins = int(wins or 0) + (1 if is_win else 0)
+                losses = int(losses or 0) + (0 if is_win else 1)
+                trades = max(1, wins + losses)
+                expectancy = (float(expectancy or 0.0) * (trades - 1) + realized_pnl_delta) / trades
+                peak = max(float(allocated or 0.0), float(allocated or 0.0) + max(0.0, realized))
+                cur_dd = max(0.0, (peak - (float(allocated or 0.0) + realized)) / max(1e-9, peak))
+                max_dd = max(float(max_dd or 0.0), cur_dd)
+                if losses > wins + 3:
+                    alloc_pct = max(0.2, float(alloc_pct or 0.5) - 0.02)
+                elif wins > losses + 3:
+                    alloc_pct = min(0.8, float(alloc_pct or 0.5) + 0.02)
+                perf = self._load_strategy_recent_performance(sid, window=100)
+                perf_trades = float(perf.get("trades") or 0.0)
+                perf_avg = float(perf.get("avg_net_pct") or 0.0)
+                if perf_trades >= 40 and perf_avg < 0.0:
+                    perf_pressure = max(0.0, min(1.0, abs(perf_avg) / 0.06))
+                    target_cap = 0.42 - 0.20 * perf_pressure
+                    if perf_avg <= -0.05:
+                        target_cap -= 0.05
+                    alloc_pct = min(float(alloc_pct or 0.5), max(0.15, target_cap))
+                conn.execute(
+                    """
+                    INSERT INTO ai_strategy_capital_sleeves (
+                        strategy_id, allocated_capital, deployed_capital, available_capital,
+                        realized_pnl, unrealized_pnl, win_count, loss_count, net_expectancy,
+                        max_drawdown, current_drawdown, allocation_pct, last_rebalanced_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(strategy_id) DO UPDATE SET
+                        allocated_capital = excluded.allocated_capital,
+                        deployed_capital = excluded.deployed_capital,
+                        available_capital = excluded.available_capital,
+                        realized_pnl = excluded.realized_pnl,
+                        unrealized_pnl = excluded.unrealized_pnl,
+                        win_count = excluded.win_count,
+                        loss_count = excluded.loss_count,
+                        net_expectancy = excluded.net_expectancy,
+                        max_drawdown = excluded.max_drawdown,
+                        current_drawdown = excluded.current_drawdown,
+                        allocation_pct = excluded.allocation_pct,
+                        last_rebalanced_at = excluded.last_rebalanced_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        sid,
+                        float(allocated or 0.0),
+                        deployed,
+                        available,
+                        realized,
+                        float(unrealized or 0.0),
+                        wins,
+                        losses,
+                        expectancy,
+                        max_dd,
+                        cur_dd,
+                        alloc_pct,
+                        datetime.now(timezone.utc).isoformat(),
+                        datetime.now(timezone.utc).isoformat(),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                conn.commit()
+        except Exception:
+            logger.debug("strategy sleeve update skipped", exc_info=True)
+
+    def calculate_position_size(
+        self,
+        symbol: str,
+        equity: float,
+        atr: float,
+        current_price: float,
+        coin_sizing_mult: float = 1.0,
+        confidence: float = 1.0,
+    ) -> tuple[float, float, float]:
+        """
+        PHASE 4: Risk-based position sizing with confidence tiers and low-cash deploy.
+
+        Order: base risk -> clamp MAX -> clamp cash -> confidence tier mult -> floor to step
+        -> compare to effective_min_notional (skip if below).
+        Low-cash mode: when cash <= effective_min + band, target = cash * DEPLOY_PCT; final = min(target, tier_scaled).
+        """
+        effective_min = self._effective_min_notional()
+        cash = self._available_balance
+        constraints = self._symbol_constraints.get(symbol, {"qty_step": DEFAULT_QTY_STEP, "min_notional": MIN_POSITION_NOTIONAL})
+        exchange_min_notional = float(constraints.get("min_notional") or MIN_POSITION_NOTIONAL)
+        decision_min_notional = max(effective_min, exchange_min_notional)
+        if not self._assert_min_notional_logged:
+            logger.debug(
+                "MIN_NOTIONAL_ASSERT: decision_min_notional=%.2f >= exchange_min_notional=%.2f (once per session)",
+                decision_min_notional,
+                exchange_min_notional,
+            )
+            self._assert_min_notional_logged = True
+
+        low_cash_mode = LOW_CASH_MIN_DEPLOY_ENABLED and cash <= effective_min + LOW_CASH_DEPLOY_BAND_USD
+        # In low-cash mode, target at least decision_min_notional so we can still place one min-sized order
+        if low_cash_mode:
+            # BUG #7 FIX: Ensure target doesn't exceed available cash
+            low_cash_target = min(
+                cash,
+                max(cash * LOW_CASH_DEPLOY_PCT, min(decision_min_notional, cash)),
+            )
+        else:
+            low_cash_target = None
+
+        if symbol in MAJOR_COINS:
+            dynamic_sl_pct = compute_entry_distance_pct(symbol, atr, current_price)
+            stop_distance = current_price * dynamic_sl_pct
+        else:
+            profile_sl = float(get_coin_profile(symbol).get("sl", MIN_STOP_PCT))
+            stop_floor_pct = max(MIN_STOP_PCT, profile_sl)
+            stop_distance = max(atr * ATR_MULTIPLIER, current_price * stop_floor_pct)
+        stop_price = current_price - stop_distance
+
+        # Base risk size (wider SL → smaller position, constant dollar risk)
+        risk_usd = equity * RISK_PER_TRADE_PCT * coin_sizing_mult
+        quantity = risk_usd / stop_distance if stop_distance > 0 else 0
+        notional = quantity * current_price
+
+        # ================================================================
+        # BUG #16 FIX: APPLY SAFETY MULTIPLIER BEFORE CONFIDENCE
+        # ================================================================
+        # Apply safety multiplier to base position size BEFORE confidence scaling
+        # This ensures confidence scales the final result, not applied on top of safety reduction
+        notional *= LIVE_TRADING_SAFETY_MULTIPLIER
+        # ================================================================
+
+        # Size = base * confidence (ML authoritative — no hard zero on low confidence; scales down instead)
+        _conf_scale = 1.0
+        notional_after_conf = notional * _conf_scale
+        base_notional = notional
+
+        # ================================================================
+        # BUG #17 FIX: CLAMP CASH AFTER CONFIDENCE SCALING
+        # ================================================================
+        # Clamp to available cash AFTER all scaling, not before
+        # This ensures final size never exceeds available cash
+        notional_after_conf = min(notional_after_conf, cash)
+
+        MAX_CASH_PER_COIN_PCT = float(os.getenv("MAX_CASH_PER_COIN_PCT", "0.25"))
+        per_coin_cap_notional = cash * MAX_CASH_PER_COIN_PCT
+        notional_after_conf = min(notional_after_conf, per_coin_cap_notional)
+
+        # Allocation cap: ensure multi-coin universe can participate
+        _sizing_max_positions = int(os.getenv("MAX_OPEN_POSITIONS", str(_DEFAULT_MAX_OPEN_POSITIONS)))
+        per_position_equal_weight_cap = cash / max(1, _sizing_max_positions)
+        notional_after_conf = min(notional_after_conf, per_position_equal_weight_cap)
+        # ================================================================
+
+        target_notional = min(low_cash_target, notional_after_conf) if low_cash_mode and low_cash_target is not None else notional_after_conf
+
+        quantity_final = target_notional / current_price if current_price > 0 else 0
+
+        qty_step = float(constraints.get("qty_step") or DEFAULT_QTY_STEP)
+        floored_qty = self._floor_to_step(quantity_final, qty_step) if qty_step > 0 else quantity_final
+        final_notional = floored_qty * current_price
+
+        if self._below_decision_min_notional(symbol, floored_qty, current_price):
+            if PORTFOLIO_LOCAL_SKIP_DECISION_MIN_NOTIONAL_BLOCK and floored_qty > 0 and final_notional > 0:
+                logger.info(
+                    "QUALITY_TELEMETRY CONF_SIZE_SKIP would_skip symbol=%s conf=%.3f final=%.2f decision_min=%.2f (PORTFOLIO_LOCAL_SKIP_DECISION_MIN_NOTIONAL_BLOCK=true — not enforcing)",
+                    symbol,
+                    confidence,
+                    final_notional,
+                    decision_min_notional,
+                )
+            else:
+                logger.info(f"CONF_SIZE_SKIP: symbol={symbol} conf={confidence:.3f} final={final_notional:.2f} reason=below_decision_min_notional")
+                logger.info(
+                    f"BUY_SIZING: symbol={symbol} cash={cash:.2f} effective_min={effective_min:.2f} "
+                    f"low_cash_mode={str(low_cash_mode).lower()} target_notional={target_notional:.2f} "
+                    f"final_notional={final_notional:.2f} decision=SKIP reason=below_decision_min_notional"
+                )
+                return (0.0, 0.0, 0.0)
+
+        logger.info(f"CONF_SIZE: symbol={symbol} conf={confidence:.3f} base={base_notional:.2f} final={final_notional:.2f}")
+        logger.info(
+            f"BUY_SIZING: symbol={symbol} cash={cash:.2f} effective_min={effective_min:.2f} "
+            f"low_cash_mode={str(low_cash_mode).lower()} target_notional={target_notional:.2f} "
+            f"final_notional={final_notional:.2f} decision=BUY"
+        )
+
+        actual_risk = floored_qty * stop_distance
+        return (floored_qty, stop_price, actual_risk)
+
+    # =========================================================================
+    # PHASE 5: RANKED BUY SELECTION
+    # =========================================================================
+
+    async def _bar_pipeline_terminal(self, decision_id: str, execution_reason: str, pipeline_done: set[str]) -> None:
+        """One terminal NOT_EXECUTED attribution per decision_id per bar (avoids duplicate updates)."""
+        if not decision_id or decision_id in pipeline_done:
+            return
+        pipeline_done.add(decision_id)
+
+        await self._update_pipeline_decision(
+            decision_id,
+            {
+                "stage": "EXECUTION",
+                "execution_result": "NOT_EXECUTED",
+                "execution_reason": execution_reason,
+            },
+        )
+
+    async def _bar_pipeline_not_selected_others(self, snapshot: list, except_decision_id: str, pipeline_done: set[str]) -> None:
+        """No-op: bar path no longer terminalizes non-winner pipeline rows (avoids duplicate shadow attributions)."""
+        return
+
+    async def _bar_pipeline_fill_if_stage_gates(self, decision_id: str, execution_reason: str) -> None:
+        """If execute_buy_fifo exited without updating SQL, row may still be stage=GATES — patch once."""
+        if not decision_id:
+            return
+
+        def _still_gates() -> bool:
+            try:
+                with connect_rw(self.db_path) as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT stage FROM pipeline_decisions WHERE decision_id = ?",
+                        (decision_id,),
+                    )
+                    row = cur.fetchone()
+                    if not row or row[0] is None:
+                        return False
+                    return str(row[0]).upper() == "GATES"
+            except Exception:
+                return False
+
+        still = await asyncio.to_thread(_still_gates)
+        if still:
+            await self._update_pipeline_decision(
+                decision_id,
+                {
+                    "stage": "EXECUTION",
+                    "execution_result": "NOT_EXECUTED",
+                    "execution_reason": execution_reason,
+                },
+            )
+
+    def _candidate_strategy_id(self, candidate: BuyCandidate) -> str:
+        dd = candidate.decision_data or {}
+        return str(dd.get("live_ai_strategy") or "day").strip().lower()
+
+    def _find_buy_candidate_for_pair(self, symbol_bus_no_slash: str, strategy_id: str) -> BuyCandidate | None:
+        norm_bus = (symbol_bus_no_slash or "").replace("/", "").strip().upper()
+        sid_w = str(strategy_id or "day").strip().lower()
+        if not norm_bus:
+            return None
+        for cand in self.current_bar_candidates:
+            try:
+                cbus = normalize_symbol(cand.symbol).replace("/", "").strip().upper()
+            except Exception:
+                continue
+            if cbus != norm_bus:
+                continue
+            if self._candidate_strategy_id(cand) != sid_w:
+                continue
+            return cand
+        return None
+
+    def _fetch_redis_ai_signal_string_map(self, strategy_id: str, symbol_bus_no_slash: str) -> dict[str, str]:
+        """Sync HGETALL of canonical ai_signal:<strategy>:<BUS> Redis hash."""
+        dd: dict[str, str] = {}
+        try:
+            from backend.config.redis_config import get_redis_client
+
+            redis_client = get_redis_client()
+            sig_raw = redis_client.hgetall(redis_ai_signal_key(strategy_id, symbol_bus_no_slash)) if redis_client else {}
+            for k, v in (sig_raw or {}).items():
+                kk = k.decode("utf-8", errors="ignore") if isinstance(k, bytes) else str(k)
+                vv = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else str(v)
+                dd[kk] = vv
+        except Exception:
+            return {}
+        return dd
+
+    def _merge_redis_signal_entry_audit_into_decision_data(self, dd: dict[str, Any], sig: dict[str, str]) -> list[str]:
+        """Patch entry-gate/coherence fields from a live Redis signal hash onto decision_data."""
+        patched: list[str] = []
+        if not dd or not sig:
+            return patched
+        audit = (sig.get("context_audit_emit") or "").strip()
+        if audit:
+            dd["context_audit_emit"] = audit
+            patched.append("context_audit_emit")
+
+        ts = (sig.get("ctx_ts_utc") or "").strip()
+        if ts:
+            dd["ctx_ts_utc"] = ts[:64]
+            patched.append("ctx_ts_utc")
+
+        age_raw = (sig.get("ctx_age_sec") or "").strip()
+        if age_raw:
+            try:
+                dd["ctx_age_sec"] = float(age_raw)
+                patched.append("ctx_age_sec")
+            except (TypeError, ValueError):
+                pass
+
+        cf_raw = str(sig.get("context_fresh") or "").strip()
+        if cf_raw in ("0", "1"):
+            dd["context_fresh"] = cf_raw
+            dd["context_fresh_str"] = cf_raw
+            patched.append("context_fresh")
+
+        for key in ("timestamp", "content_fresh", "content_age_sec", "signal_content_stale"):
+            raw = sig.get(key)
+            if raw is None or str(raw).strip() == "":
+                continue
+            dd[key] = str(raw).strip()
+            if key not in patched:
+                patched.append(key)
+
+        for key in ("feature_version", "feature_dim"):
+            raw = sig.get(key)
+            if raw is None or str(raw).strip() == "":
+                continue
+            try:
+                dd[key] = int(float(raw))
+                patched.append(key)
+            except (TypeError, ValueError):
+                pass
+
+        return patched
+
+    def _reconstruct_context_audit_emit_from_live_ai_context(self, symbol: str) -> str | None:
+        """
+        Mirror ``ctx_defaulted_audit`` from ``ai_signal_generator`` using the same live
+        ``ai_context:*`` hash the generator reads. Used after ``ai_signal:day:*`` was
+        consumed (key deleted) or when the serialized blob is absent/unparseable.
+        """
+        try:
+            from backend.services.ai_decision_contract import MARKET_CONTEXT_FIELDS
+        except Exception:
+            return None
+
+        payload, ctx_age_raw = self._get_context_payload(symbol)
+        payload = payload if isinstance(payload, dict) else {}
+        ctx_ts_str = str(payload.get("ts_utc") or payload.get("timestamp") or "").strip()
+        try:
+            age_val = float(ctx_age_raw)
+            if not math.isfinite(age_val):
+                age_val = -1.0
+        except (TypeError, ValueError):
+            age_val = -1.0
+
+        _missing_cf = [f for f in MARKET_CONTEXT_FIELDS if f not in payload]
+        blob: dict[str, Any] = {
+            "redis_ai_context_present": bool(payload),
+            "redis_ctx_ts_utc": ctx_ts_str,
+            "ctx_age_sec_at_emit": age_val,
+            "payload_field_count": len(payload),
+            "live_ai_fail_closed_without_context": live_ai_fail_closed_without_context(),
+            "missing_contract_fields": _missing_cf,
+        }
+        raw = json.dumps(blob, separators=(",", ":"))
+        if len(raw) > 1800:
+            blob["missing_contract_fields"] = _missing_cf[:16]
+            raw = json.dumps(blob, separators=(",", ":"))
+        return raw[:1800]
+
+    def _patch_decision_data_context_audit_if_required(self, dd: dict[str, Any], symbol: str) -> bool:
+        """For fv>=2, ensure ``context_audit_emit`` is non-empty JSON when the entry gate requires it."""
+        fv_raw = dd.get("feature_version", 1)
+        try:
+            fv = int(float(fv_raw)) if fv_raw not in (None, "") else 1
+        except (TypeError, ValueError):
+            fv = 1
+
+        cur = dd.get("context_audit_emit")
+        if not needs_context_audit_emit_refresh(cur, fv):
+            return False
+
+        patched_labels: list[str] = []
+        strategy_id = str(dd.get("live_ai_strategy") or "day").strip().lower()
+
+        sym_bus_nf = normalize_symbol(symbol).replace("/", "").strip()
+        if sym_bus_nf:
+            sig = self._fetch_redis_ai_signal_string_map(strategy_id, sym_bus_nf)
+            if sig:
+                merged = self._merge_redis_signal_entry_audit_into_decision_data(dd, sig)
+                if merged:
+                    patched_labels.extend(merged)
+
+        if needs_context_audit_emit_refresh(dd.get("context_audit_emit"), fv):
+            recon = self._reconstruct_context_audit_emit_from_live_ai_context(symbol)
+            if recon:
+                dd["context_audit_emit"] = recon
+                patched_labels.append("context_audit_emit")
+
+        ok_final = not needs_context_audit_emit_refresh(dd.get("context_audit_emit"), fv)
+        if patched_labels:
+            logger.info(
+                "ENTRY_AUDIT_PATCH symbol=%s strategy=%s keys=%s ok=%s",
+                symbol,
+                strategy_id,
+                patched_labels,
+                ok_final,
+            )
+        if not ok_final:
+            logger.warning(
+                "ENTRY_AUDIT_STILL_INVALID symbol=%s strategy=%s fv=%s",
+                symbol,
+                strategy_id,
+                fv,
+            )
+        return ok_final
+
+    def _hydrate_buy_candidate_audit_from_redis_if_missing(self, candidate: BuyCandidate) -> bool:
+        """Ensure bar-ranked candidates carry a parseable ``context_audit_emit`` for fv>=2 (Redis or ai_context)."""
+        dd = dict(candidate.decision_data or {})
+        ok = self._patch_decision_data_context_audit_if_required(dd, candidate.symbol)
+        candidate.decision_data = dd
+        return ok
+
+    def _hydrate_explainability_entry_context_from_redis_if_missing(self, ccxt_symbol: str, explainability: TradeExplainability) -> bool:
+        """If TradeExplainability lacks a parseable audit blob, overlay Redis hash then live ai_context (bar path parity)."""
+        dd: dict[str, Any] = {
+            "live_ai_strategy": str(getattr(explainability, "live_ai_strategy", "") or "day"),
+            "feature_version": getattr(explainability, "feature_version", 1),
+            "context_audit_emit": str(getattr(explainability, "context_audit_emit", "") or ""),
+            "ctx_ts_utc": str(getattr(explainability, "ctx_ts_utc", "") or ""),
+        }
+        try:
+            c_age = getattr(explainability, "ctx_age_sec", None)
+            dd["ctx_age_sec"] = float(c_age) if c_age is not None and str(c_age).strip() != "" else -1.0
+        except (TypeError, ValueError):
+            dd["ctx_age_sec"] = -1.0
+        cf = str(getattr(explainability, "context_fresh_flag", "") or "").strip()
+        if cf in ("0", "1"):
+            dd["context_fresh_str"] = cf
+            dd["context_fresh"] = cf
+        try:
+            dd["feature_dim"] = int(getattr(explainability, "feature_dim", 0))
+        except (TypeError, ValueError):
+            dd["feature_dim"] = 0
+
+        sym_bus = normalize_symbol(ccxt_symbol).replace("/", "").strip()
+        strategy_id = str(dd.get("live_ai_strategy") or "day").strip().lower()
+        if sym_bus:
+            sig = self._fetch_redis_ai_signal_string_map(strategy_id, sym_bus)
+            if sig:
+                self._merge_redis_signal_entry_audit_into_decision_data(dd, sig)
+
+        ok = self._patch_decision_data_context_audit_if_required(dd, ccxt_symbol)
+
+        explainability.context_audit_emit = str(dd.get("context_audit_emit", ""))
+        if "ctx_ts_utc" in dd:
+            explainability.ctx_ts_utc = str(dd["ctx_ts_utc"])[:64]
+        if "ctx_age_sec" in dd:
+            try:
+                explainability.ctx_age_sec = float(dd["ctx_age_sec"])
+            except (TypeError, ValueError):
+                pass
+        cf_v = dd.get("context_fresh_str") or dd.get("context_fresh")
+        if cf_v is not None and str(cf_v).strip() in ("0", "1"):
+            explainability.context_fresh_flag = str(cf_v).strip()
+        if "feature_version" in dd:
+            try:
+                explainability.feature_version = int(dd["feature_version"])
+            except (TypeError, ValueError):
+                pass
+        if "feature_dim" in dd:
+            try:
+                explainability.feature_dim = int(dd["feature_dim"])
+            except (TypeError, ValueError):
+                pass
+        if dd.get("timestamp"):
+            explainability.signal_content_timestamp = str(dd["timestamp"])
+        if dd.get("content_fresh") in ("0", "1"):
+            explainability.signal_content_fresh = str(dd["content_fresh"])
+        if dd.get("content_age_sec") not in (None, ""):
+            explainability.signal_content_age_sec = str(dd["content_age_sec"])
+        if dd.get("signal_content_stale") in ("0", "1"):
+            explainability.signal_content_stale = str(dd["signal_content_stale"])
+        if ok:
+            logger.info(
+                "ENTRY_AUDIT_BRIDGE_REFRESH_FROM_REDIS symbol=%s strategy=%s",
+                ccxt_symbol,
+                str(dd.get("live_ai_strategy") or "day"),
+            )
+        return ok
+
+    def _latest_inference_fallback(self, symbol: str, strategy_id: str) -> dict[str, Any] | None:
+        symbol_bus = normalize_symbol(symbol).replace("/", "")
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT decision_id, prediction, argmax_action, prob_buy, prob_hold, prob_sell,
+                           winner_prob_raw, confidence, buy_margin, ctx_json, feature_version,
+                           features_json, model_artifact
+                    FROM ai_inference_log
+                    WHERE LOWER(strategy_id)=LOWER(?)
+                      AND UPPER(REPLACE(symbol, '/', ''))=UPPER(?)
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (strategy_id, symbol_bus),
+                ).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        ctx_payload: dict[str, Any] = {}
+        try:
+            raw_ctx = row[9]
+            if isinstance(raw_ctx, str) and raw_ctx.strip():
+                maybe = json.loads(raw_ctx)
+                if isinstance(maybe, dict):
+                    ctx_payload = maybe
+        except Exception:
+            ctx_payload = {}
+        feature_dim: int | None = None
+        try:
+            if isinstance(row[11], str) and row[11].strip():
+                parsed = json.loads(row[11])
+                if isinstance(parsed, list):
+                    feature_dim = len(parsed)
+        except Exception:
+            feature_dim = None
+        return {
+            "decision_id": str(row[0] or ""),
+            "prediction": str(row[1] or ""),
+            "argmax_action": str(row[2] or ""),
+            "prob_buy": _safe_float(row[3], 0.0),
+            "prob_hold": _safe_float(row[4], 0.0),
+            "prob_sell": _safe_float(row[5], 0.0),
+            "winner_probability_raw": _safe_float(row[6], 0.0),
+            "winner_probability": _safe_float(row[7], 0.0),
+            "confidence": _safe_float(row[7], 0.0),
+            "buy_margin": _safe_float(row[8], 0.0),
+            "feature_version": int(_safe_float(row[10], 0.0)) if row[10] is not None else None,
+            "feature_dim": feature_dim,
+            "ctx_json": ctx_payload,
+            "model_artifact_path": str(row[12] or ""),
+        }
+
+    def _get_cached_market_price(self, symbol: str) -> float:
+        try:
+            from backend.config.redis_config import get_redis_client
+            from backend.utils.symbols import to_exchange_symbol
+
+            redis_client = get_redis_client()
+            if not redis_client:
+                return 0.0
+            base_symbol = to_exchange_symbol(symbol).replace("USDT", "")
+            raw = redis_client.get(f"market:{base_symbol}")
+            if raw is None:
+                return 0.0
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="ignore")
+            if isinstance(raw, str):
+                txt = raw.strip()
+                if txt.startswith("{") and txt.endswith("}"):
+                    payload = json.loads(txt)
+                    return _safe_float(payload.get("price"), 0.0)
+                return _safe_float(txt, 0.0)
+            return _safe_float(raw, 0.0)
+        except Exception:
+            return 0.0
+
+    def _get_context_payload(self, symbol: str) -> tuple[dict[str, Any], float]:
+        symbol_bus = normalize_symbol(symbol).replace("/", "")
+        try:
+            from backend.config.redis_config import get_redis_client
+
+            redis_client = get_redis_client()
+            if not redis_client:
+                return {}, float("inf")
+            key = REDIS_KEY_AI_CONTEXT.format(symbol=symbol_bus)
+            raw = redis_client.hgetall(key) or {}
+            if not raw:
+                return {}, float("inf")
+            payload: dict[str, Any] = {}
+            for k, v in raw.items():
+                kk = k.decode("utf-8", errors="ignore") if isinstance(k, bytes) else str(k)
+                vv = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else v
+                payload[kk] = vv
+            ts = payload.get("ts_utc") or payload.get("timestamp")
+            age_sec = float("inf")
+            if ts:
+                try:
+                    dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                    age_sec = max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+                except Exception:
+                    age_sec = float("inf")
+            return payload, age_sec
+        except Exception:
+            return {}, float("inf")
+
+    def _normalize_spread_fraction(self, raw_spread: Any) -> tuple[float, str]:
+        """
+        Normalize spread values to fractional units.
+
+        Returns:
+            (spread_fraction, units_tag)
+
+        units_tag:
+            - "fraction"        : already fractional (e.g. 0.0012 = 0.12%)
+            - "percent_whole"   : converted from whole-percent units (e.g. 2.5 -> 0.025)
+            - "invalid"         : non-finite / negative input
+            - "missing"         : no input
+        """
+        if raw_spread is None or str(raw_spread).strip() == "":
+            return 0.0, "missing"
+        try:
+            val = float(raw_spread)
+        except (TypeError, ValueError):
+            return 0.0, "invalid"
+        if not math.isfinite(val) or val < 0.0:
+            return 0.0, "invalid"
+        # Some producers emit whole-percent values (e.g. 2.734 -> 2.734%).
+        if val > 1.0:
+            if val <= 100.0:
+                return val / 100.0, "percent_whole"
+            return 0.0, "invalid"
+        return val, "fraction"
+
+    def _resolve_spread_fraction_with_fallback(self, symbol: str, strategy_id: str, decision_data: dict[str, Any]) -> tuple[float, str]:
+        dd = decision_data or {}
+        for key in ("spread_cost_pct", "spread_pct", "signal_spread_pct"):
+            sp, units = self._normalize_spread_fraction(dd.get(key))
+            if sp > 0.0:
+                return float(sp), f"decision:{key}:{units}"
+
+        sym_bus = normalize_symbol(symbol).replace("/", "").upper() if symbol else ""
+        if sym_bus:
+            try:
+                from backend.config.redis_config import get_redis_client
+
+                r = get_redis_client()
+                if r:
+                    px = r.hgetall(f"price:{sym_bus.replace('USDT', '')}") or {}
+                    sp_raw = px.get("spread_pct")
+                    sp, units = self._normalize_spread_fraction(sp_raw)
+                    if sp > 0.0:
+                        return float(sp), f"redis_price_hash:spread_pct:{units}"
+
+                    bid = _safe_float(px.get("bid"), 0.0)
+                    ask = _safe_float(px.get("ask"), 0.0)
+                    if bid > 0.0 and ask > 0.0 and ask >= bid:
+                        mid = (bid + ask) / 2.0
+                        sp_live = ((ask - bid) / mid) if mid > 0 else 0.0
+                        if sp_live > 0.0:
+                            return float(sp_live), "redis_price_hash:bid_ask"
+
+                    mraw = r.get(f"market:{sym_bus.replace('USDT', '')}")
+                    if mraw:
+                        m = json.loads(mraw) if isinstance(mraw, str) else {}
+                        mb = _safe_float(m.get("bid"), 0.0)
+                        ma = _safe_float(m.get("ask"), 0.0)
+                        if mb > 0.0 and ma > 0.0 and ma >= mb:
+                            mmid = (mb + ma) / 2.0
+                            msp = ((ma - mb) / mmid) if mmid > 0 else 0.0
+                            if msp > 0.0:
+                                return float(msp), "redis_market:bid_ask"
+                        sp2, units2 = self._normalize_spread_fraction(m.get("spread_pct"))
+                        if sp2 > 0.0:
+                            return float(sp2), f"redis_market:spread_pct:{units2}"
+            except Exception:
+                pass
+
+        sid = (strategy_id or "day").strip().lower()
+        if sid != "day":
+            sid = "day"
+        fallback = 0.00040 if sid == "day" else 0.00070
+        return fallback, "conservative_fallback"
+
+    def _hydrate_cost_telemetry(self, *, symbol: str, strategy_id: str, decision_data: dict[str, Any]) -> dict[str, Any]:
+        dd = decision_data if isinstance(decision_data, dict) else {}
+        sid = (strategy_id or "day").strip().lower()
+        if sid != "day":
+            sid = "day"
+
+        # Conservative but not over-punitive defaults when live telemetry fields are absent.
+        fee_default = 0.00035
+        slip_default = 0.00020 if sid == "day" else 0.00035
+        spread, spread_source = self._resolve_spread_fraction_with_fallback(symbol, sid, dd)
+
+        est_fees = _safe_float(dd.get("estimated_fees_pct"), float("nan"))
+        if not math.isfinite(est_fees) or est_fees <= 0.0:
+            est_fees = fee_default
+        est_slip = _safe_float(dd.get("estimated_slippage_pct"), float("nan"))
+        if not math.isfinite(est_slip) or est_slip <= 0.0:
+            est_slip = slip_default
+
+        dd["estimated_fees_pct"] = float(est_fees)
+        dd["estimated_slippage_pct"] = float(est_slip)
+        dd["spread_pct"] = float(spread)
+        dd["spread_cost_pct"] = float(spread)
+        dd["spread_source"] = str(spread_source)
+
+        bm = resolve_buy_margin_from_payload(dd)
+        if bm is None:
+            p_buy = _safe_float(dd.get("prob_buy"), _safe_float(dd.get("winner_probability"), 0.5))
+            p_hold = _safe_float(dd.get("prob_hold"), 0.0)
+            p_sell = _safe_float(dd.get("prob_sell"), max(0.0, 1.0 - p_buy))
+            bm = max(0.0, p_buy - max(p_hold, p_sell))
+            dd["buy_margin"] = float(bm)
+
+        return {
+            "entry_spread_pct": float(spread),
+            "entry_slippage_pct": float(est_slip),
+            "entry_fee_pct": float(est_fees),
+            "entry_spread_source": str(spread_source),
+            "entry_buy_margin": float(bm) if bm is not None else None,
+        }
+
+    def _estimate_candidate_net_expected_value(self, decision_data: dict[str, Any]) -> float:
+        """
+        Estimate per-candidate net expected value as fractional return.
+        Uses model probabilities and estimated win/loss/cost components.
+        """
+        dd = decision_data or {}
+        sid = str(dd.get("live_ai_strategy") or "day").strip().lower()
+        if sid != "day":
+            sid = "day"
+        self._hydrate_cost_telemetry(
+            symbol=str(dd.get("symbol") or dd.get("symbol_bus") or ""),
+            strategy_id=sid,
+            decision_data=dd,
+        )
+        # If upstream computed EV, still apply explicit cost subtraction here.
+        explicit = _safe_float(dd.get("selected_net_expected_value"), float("nan"))
+        explicit2 = _safe_float(dd.get("net_expected_value"), float("nan"))
+
+        p_buy = _safe_float(dd.get("prob_buy"), _safe_float(dd.get("winner_probability"), 0.5))
+        p_sell = _safe_float(dd.get("prob_sell"), max(0.0, 1.0 - p_buy))
+        p_hold = _safe_float(dd.get("prob_hold"), 0.0)
+        ps = p_buy + p_sell + p_hold
+        if ps > 0:
+            p_buy /= ps
+            p_sell /= ps
+
+        est_win = max(0.0, _safe_float(dd.get("estimated_win_pct"), 0.0))
+        est_loss = max(0.0, _safe_float(dd.get("estimated_loss_pct"), 0.0))
+        if sid == "day":
+            est_win = min(est_win, 0.0300)
+            est_loss = min(est_loss, 0.0300)
+        else:
+            est_win = min(est_win, 0.0150)
+            est_loss = min(est_loss, 0.0200)
+        est_fees = max(0.0, _safe_float(dd.get("estimated_fees_pct"), 0.0))
+        est_slip = max(0.0, _safe_float(dd.get("estimated_slippage_pct"), 0.0))
+        spread_cost = max(0.0, _safe_float(dd.get("spread_cost_pct"), _safe_float(dd.get("spread_pct"), 0.0)))
+
+        # Conservative fallback for candidates where upstream expected-win/loss
+        # fields are absent: derive a small edge from buy_margin and confidence
+        # so EV stays informative (not forced to 0 by missing optional fields).
+        if est_win <= 0.0 and est_loss <= 0.0:
+            buy_margin = _safe_float(dd.get("buy_margin"), 0.0)
+            conf = _safe_float(dd.get("confidence"), _safe_float(dd.get("winner_probability"), p_buy))
+            conf = min(1.0, max(0.0, conf))
+            base_move = max(0.00025, abs(buy_margin) * 0.35)
+            est_win = max(0.0, buy_margin) * (0.55 + 0.45 * conf)
+            if est_win <= 0.0:
+                est_win = base_move * 0.35 * conf
+            est_loss = max(base_move * 0.75, spread_cost * 1.15 + 0.0002)
+
+        model_gross_ev = (p_buy * est_win) - (p_sell * est_loss)
+
+        if not math.isnan(explicit):
+            explicit_is_net = str(dd.get("selected_net_expected_value_is_net", "1")).strip().lower() not in ("0", "false", "no", "off")
+            if explicit_is_net and float(explicit) <= 0.05:
+                return float(explicit)
+            gross_ev = float(explicit)
+            if math.isfinite(model_gross_ev):
+                if gross_ev > 0.05 or (model_gross_ev > 0.0 and gross_ev > (model_gross_ev * 3.0)):
+                    gross_ev = float(model_gross_ev)
+                    dd["ev_outlier_clamped"] = True
+        elif not math.isnan(explicit2):
+            explicit2_is_net = str(dd.get("net_expected_value_is_net", "1")).strip().lower() not in ("0", "false", "no", "off")
+            if explicit2_is_net and float(explicit2) <= 0.05:
+                return float(explicit2)
+            gross_ev = float(explicit2)
+            if math.isfinite(model_gross_ev):
+                if gross_ev > 0.05 or (model_gross_ev > 0.0 and gross_ev > (model_gross_ev * 3.0)):
+                    gross_ev = float(model_gross_ev)
+                    dd["ev_outlier_clamped"] = True
+        else:
+            gross_ev = model_gross_ev
+        net_ev = gross_ev - est_fees - est_slip - spread_cost
+        profile_ev_penalty = max(0.0, _safe_float(dd.get("symbol_profile_ev_penalty"), 0.0))
+        if profile_ev_penalty > 0.0:
+            net_ev -= profile_ev_penalty
+            if str(dd.get("symbol_profile_setup_not_strong") or "").strip().lower() in ("1", "true", "yes", "on"):
+                net_ev -= min(0.0010, profile_ev_penalty * 0.50)
+        strategy_ev_penalty = max(0.0, _safe_float(dd.get("strategy_recent_ev_penalty"), 0.0))
+        if strategy_ev_penalty > 0.0:
+            net_ev -= strategy_ev_penalty
+        return float(net_ev)
+
+    def _persist_profit_cycle_state(self, payload: dict[str, Any]) -> None:
+        """Persist latest cycle diagnostics for API visibility across processes."""
+        try:
+            blob = json.dumps(payload, separators=(",", ":"))
+        except Exception:
+            return
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO operational_state(key, value_json, updated_ts)
+                    VALUES('profit_system_current_cycle', ?, strftime('%s','now'))
+                    ON CONFLICT(key) DO UPDATE SET
+                      value_json=excluded.value_json,
+                      updated_ts=excluded.updated_ts
+                    """,
+                    (blob,),
+                )
+                conn.commit()
+        except Exception:
+            logger.debug("Failed to persist profit cycle state", exc_info=True)
+
+    def _persist_rank_snapshot(
+        self,
+        *,
+        strategy_id: str,
+        selected_symbol: str,
+        selected_rank: int,
+        selected_score: float,
+        selected_net_expected_value: float,
+        leaderboard: list[dict[str, Any]],
+        score_components: dict[str, Any],
+        peer_ranks: list[dict[str, Any]],
+        winner_reason: str,
+        rejected_reason_json: dict[str, Any] | None = None,
+        market_regime: str = "unknown",
+    ) -> int | None:
+        """Persist one selection-time rank snapshot for downstream peer-shadow/outcome learning."""
+        try:
+            leaderboard_json = json.dumps(leaderboard or [], separators=(",", ":"))
+            score_components_json = json.dumps(score_components or {}, separators=(",", ":"))
+            peer_ranks_json = json.dumps(peer_ranks or [], separators=(",", ":"))
+            rejected_json = json.dumps(rejected_reason_json or {}, separators=(",", ":"))
+        except Exception:
+            return None
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.execute(
+                    """
+                    INSERT INTO ai_rank_snapshots(
+                        timestamp, strategy_id, selected_symbol, selected_rank,
+                        selected_score, selected_net_expected_value, leaderboard_json,
+                        score_components_json, peer_ranks_json, winner_reason,
+                        rejected_reason_json, market_regime, created_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        str(strategy_id or "day"),
+                        str(selected_symbol or ""),
+                        int(selected_rank or 0),
+                        float(selected_score or 0.0),
+                        float(selected_net_expected_value or 0.0),
+                        leaderboard_json,
+                        score_components_json,
+                        peer_ranks_json,
+                        str(winner_reason or ""),
+                        rejected_json,
+                        str(market_regime or "unknown"),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                conn.commit()
+                return int(cur.lastrowid)
+        except Exception:
+            logger.debug("Failed to persist ai_rank_snapshots row", exc_info=True)
+            return None
+
+    async def _augment_full_universe_candidates(self, bar_timestamp: int) -> dict[str, Any]:
+        diagnostics: dict[str, Any] = {
+            "active_universe_size": 0,
+            "safety_valid_universe_size": 0,
+            "missing_signal_count": 0,
+            "hold_sell_penalty_count": 0,
+            "missing_model_fallback_count": 0,
+            "excluded_by_safety": {},
+            "excluded_symbols": {},
+            "adaptive_weight_applied_count": 0,
+            "adaptive_weight_missing_count": 0,
+            "adaptive_weight_score_delta_sum": 0.0,
+            "adaptive_weight_top_components": {},
+        }
+        active_symbols = [normalize_symbol(s) for s in get_trading_symbols()]
+        if ENTRY_MAJOR_ONLY:
+            active_symbols = [s for s in active_symbols if s in ENTRY_ALLOWED_SYMBOLS]
+        active_strategies = ("day",)
+        diagnostics["active_universe_size"] = len(active_symbols) * len(active_strategies)
+
+        # Phase 3: ensure adaptive weights cache is fresh once per bar so all
+        # candidates in this bar use the same snapshot.
+        try:
+            self._refresh_adaptive_weights_cache()
+        except Exception:
+            pass
+
+        existing_pairs = {_full_universe_pair_key(c.symbol, self._candidate_strategy_id(c)) for c in self.current_bar_candidates}
+        context_max_age = float(get_ctx_fresh_max_age_sec())
+
+        for symbol in active_symbols:
+            symbol_bus = normalize_symbol(symbol).replace("/", "")
+            for strategy_id in active_strategies:
+                pair_key = _full_universe_pair_key(symbol_bus, strategy_id)
+                if pair_key in existing_pairs:
+                    diagnostics["safety_valid_universe_size"] += 1
+                    # Already enqueued candidates can miss context_audit_emit (e.g. inference fallback
+                    # snapshot) while Redis now holds an authoritative ML hash — refresh without
+                    # replacing the whole candidate or bypassing entry gate.
+                    _c_existing = self._find_buy_candidate_for_pair(symbol_bus, strategy_id)
+                    if _c_existing is not None:
+                        self._hydrate_buy_candidate_audit_from_redis_if_missing(_c_existing)
+                    continue
+
+                dd: dict[str, Any] = {}
+                source = "redis_signal"
+                try:
+                    from backend.config.redis_config import get_redis_client
+
+                    redis_client = get_redis_client()
+                    sig_raw = redis_client.hgetall(redis_ai_signal_key(strategy_id, symbol_bus)) if redis_client else {}
+                    for k, v in (sig_raw or {}).items():
+                        kk = k.decode("utf-8", errors="ignore") if isinstance(k, bytes) else str(k)
+                        vv = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else v
+                        dd[kk] = vv
+                except Exception:
+                    dd = {}
+
+                if not dd:
+                    diagnostics["missing_signal_count"] += 1
+                    source = "inference_fallback"
+                    fallback = self._latest_inference_fallback(symbol_bus, strategy_id)
+                    if not fallback:
+                        diagnostics["missing_model_fallback_count"] += 1
+                        reason = "FULL_UNIVERSE_BLOCK_MISSING_MODEL_PREDICTION"
+                        diagnostics["excluded_by_safety"][reason] = diagnostics["excluded_by_safety"].get(reason, 0) + 1
+                        diagnostics["excluded_symbols"][f"{symbol_bus}:{strategy_id}"] = reason
+                        continue
+                    dd.update(fallback)
+
+                dd["live_ai_strategy"] = strategy_id
+                dd["symbol"] = symbol_bus
+                dd["full_universe_source"] = source
+
+                context_payload, context_age = self._get_context_payload(symbol_bus)
+                context_payload = context_payload or {}
+                dd["ctx_age_sec"] = context_age
+                ctx_ts_utc = str(dd.get("ctx_ts_utc") or context_payload.get("ts_utc") or context_payload.get("timestamp") or "").strip()
+                dd["ctx_ts_utc"] = ctx_ts_utc
+                if str(dd.get("context_fresh") or "").strip() not in ("0", "1"):
+                    dd["context_fresh"] = "1" if context_age <= context_max_age else "0"
+
+                dd["ctx_market_regime"] = context_payload.get("market_regime", context_payload.get("regime", "unknown"))
+                dd["ctx_rs_btc"] = _safe_float(context_payload.get("rs_btc"), _safe_float(dd.get("ctx_rs_btc"), 0.0))
+                dd["ctx_rs_eth"] = _safe_float(context_payload.get("rs_eth"), _safe_float(dd.get("ctx_rs_eth"), 0.0))
+                _ctx_spread_raw = context_payload.get("spread_pct")
+                if _ctx_spread_raw in (None, "", 0, 0.0):
+                    _ctx_spread_raw = dd.get("spread_pct")
+                try:
+                    from backend.config.redis_config import get_redis_client
+
+                    _r = get_redis_client()
+                    _mraw = _r.get(f"market:{symbol_bus}") if _r else None
+                    if _mraw:
+                        _m = json.loads(_mraw) if isinstance(_mraw, str) else {}
+                        _bb = _safe_float(_m.get("bid"), 0.0)
+                        _ba = _safe_float(_m.get("ask"), 0.0)
+                        if _bb > 0.0 and _ba > 0.0 and _ba >= _bb:
+                            _mid = (_bb + _ba) / 2.0
+                            _ctx_spread_raw = (_ba - _bb) / _mid if _mid > 0.0 else _ctx_spread_raw
+                except Exception:
+                    pass
+                _ctx_spread_norm, _ctx_spread_units = self._normalize_spread_fraction(_ctx_spread_raw)
+                dd["spread_pct"] = _ctx_spread_norm
+                dd["spread_units"] = _ctx_spread_units
+                dd["volume_expansion"] = _safe_float(context_payload.get("relative_volume"), _safe_float(dd.get("volume_expansion"), 0.0))
+                dd["relative_volume"] = _safe_float(context_payload.get("relative_volume"), _safe_float(dd.get("relative_volume"), 0.0))
+                dd["entry_timing_quality"] = _safe_float(dd.get("entry_timing_quality"), 0.5)
+                dd["expected_hold_quality"] = _safe_float(dd.get("expected_hold_quality"), 0.5)
+                dd["estimated_win_pct"] = _safe_float(dd.get("estimated_win_pct"), 0.012 if strategy_id == "day" else 0.0045)
+                dd["estimated_loss_pct"] = _safe_float(dd.get("estimated_loss_pct"), 0.007 if strategy_id == "day" else 0.0035)
+                dd["estimated_fees_pct"] = _safe_float(dd.get("estimated_fees_pct"), 0.001)
+                dd["estimated_slippage_pct"] = _safe_float(dd.get("estimated_slippage_pct"), 0.0008 if strategy_id == "day" else 0.0012)
+                if dd.get("selected_net_expected_value") not in (None, ""):
+                    dd["selected_net_expected_value_is_net"] = False
+                if dd.get("net_expected_value") not in (None, ""):
+                    dd["net_expected_value_is_net"] = False
+                dd["coin_expectancy"] = _safe_float(getattr(self.coin_performance.get(symbol_bus), "expectancy", dd.get("coin_expectancy", 0.0)), 0.0)
+
+                self._patch_decision_data_context_audit_if_required(dd, symbol)
+
+                artifact_path = str(dd.get("model_artifact_path") or "").strip()
+                if not artifact_path:
+                    artifact_path = str(per_coin_artifact_file("models/active", strategy_id, symbol_bus))
+                    dd["model_artifact_path"] = artifact_path
+                ok_art, rej_art, _ = evaluate_signal_hash_artifact_contract(
+                    dd,
+                    redis_strategy_id=strategy_id,
+                    symbol_bus=symbol_bus,
+                )
+                if not ok_art:
+                    reason = f"FULL_UNIVERSE_BLOCK_{rej_art or 'ARTIFACT_FAILURE'}"
+                    diagnostics["excluded_by_safety"][reason] = diagnostics["excluded_by_safety"].get(reason, 0) + 1
+                    diagnostics["excluded_symbols"][f"{symbol_bus}:{strategy_id}"] = reason
+                    continue
+
+                side = str(dd.get("argmax_action") or dd.get("prediction") or "BUY").strip().upper()
+                side_penalty = 0.0
+                # Model is treated as BUY/HOLD for execution. SELL is folded into HOLD-like penalty.
+                if side in {"HOLD", "SELL"}:
+                    side_penalty = 4.0
+                if side_penalty > 0:
+                    diagnostics["hold_sell_penalty_count"] += 1
+                    dd["quality_opinion_penalty"] = _safe_float(dd.get("quality_opinion_penalty"), 0.0) + side_penalty
+                    dd["signal_side_penalty"] = side_penalty
+
+                confidence = _safe_float(
+                    dd.get("winner_probability"),
+                    _safe_float(dd.get("prob_buy"), _safe_float(dd.get("confidence"), 0.5)),
+                )
+                confidence = max(0.0, min(1.0, confidence))
+                dd.setdefault("winner_probability", confidence)
+                dd.setdefault("confidence", confidence)
+
+                current_price = self._get_cached_market_price(symbol_bus)
+                if current_price <= 0:
+                    reason = "FULL_UNIVERSE_BLOCK_EXCHANGE_API_FAILURE"
+                    diagnostics["excluded_by_safety"][reason] = diagnostics["excluded_by_safety"].get(reason, 0) + 1
+                    diagnostics["excluded_symbols"][f"{symbol_bus}:{strategy_id}"] = reason
+                    continue
+                atr = await self._get_atr_for_symbol(symbol_bus, current_price)
+                if atr <= 0:
+                    reason = "FULL_UNIVERSE_BLOCK_INVALID_SIZING_INPUT"
+                    diagnostics["excluded_by_safety"][reason] = diagnostics["excluded_by_safety"].get(reason, 0) + 1
+                    diagnostics["excluded_symbols"][f"{symbol_bus}:{strategy_id}"] = reason
+                    continue
+
+                decision_id = str(dd.get("decision_id") or f"fu_{strategy_id}_{symbol_bus}_{bar_timestamp}")
+                self.add_buy_candidate(symbol_bus, confidence, current_price, atr, dd, decision_id)
+                existing_pairs.add(pair_key)
+                diagnostics["safety_valid_universe_size"] += 1
+
+        return diagnostics
+
+    async def process_bar_candidates(self, bar_timestamp: int) -> dict[str, Any] | None:
+        """
+        PHASE 5: At bar close, rank all candidates and execute top 1.
+        """
+        if bar_timestamp <= self.last_bar_timestamp:
+            return None  # Already processed this bar
+
+        self.last_bar_timestamp = bar_timestamp
+
+        full_universe_diag = await self._augment_full_universe_candidates(bar_timestamp)
+
+        # Phase 3: aggregate adaptive-weight diagnostics over the bar so we can
+        # publish counts alongside FULL_UNIVERSE_DIAGNOSTICS.
+        applied_count = 0
+        missing_count = 0
+        delta_sum = 0.0
+        component_contrib: dict[str, float] = {}
+        for cand in self.current_bar_candidates:
+            try:
+                used = cand.adaptive_components_used or {}
+                missing = cand.adaptive_components_missing or []
+                if used:
+                    applied_count += 1
+                    delta_sum += float(cand.adaptive_score_delta or 0.0)
+                    for name, contrib in used.items():
+                        component_contrib[name] = component_contrib.get(name, 0.0) + abs(float(contrib or 0.0))
+                if missing:
+                    missing_count += len(missing)
+            except Exception:
+                continue
+        top_components = dict(sorted(component_contrib.items(), key=lambda kv: kv[1], reverse=True)[:5])
+        full_universe_diag["adaptive_weight_applied_count"] = applied_count
+        full_universe_diag["adaptive_weight_missing_count"] = missing_count
+        full_universe_diag["adaptive_weight_score_delta_sum"] = round(delta_sum, 6)
+        full_universe_diag["adaptive_weight_top_components"] = {k: round(v, 6) for k, v in top_components.items()}
+
+        logger.info(
+            "FULL_UNIVERSE_DIAGNOSTICS active=%s safety_valid=%s missing_signal=%s hold_sell_penalty=%s missing_model_fallback=%s excluded=%s",
+            full_universe_diag.get("active_universe_size"),
+            full_universe_diag.get("safety_valid_universe_size"),
+            full_universe_diag.get("missing_signal_count"),
+            full_universe_diag.get("hold_sell_penalty_count"),
+            full_universe_diag.get("missing_model_fallback_count"),
+            json.dumps(full_universe_diag.get("excluded_by_safety", {}), separators=(",", ":")),
+        )
+        logger.info(
+            "ADAPTIVE_WEIGHT_DIAGNOSTICS applied=%d missing=%d delta_sum=%.6f top=%s enabled=%s",
+            applied_count,
+            missing_count,
+            delta_sum,
+            json.dumps(top_components, separators=(",", ":")),
+            _adaptive_weights_enabled(),
+        )
+
+        if not self.current_bar_candidates:
+            logger.debug(f"BAR_CLOSE: No candidates for bar {bar_timestamp}")
+            self._persist_profit_cycle_state(
+                {
+                    "bar_timestamp": int(bar_timestamp),
+                    "full_universe_diagnostics": full_universe_diag,
+                    "adaptive_weight_diagnostics": {
+                        "adaptive_weight_applied_count": int(full_universe_diag.get("adaptive_weight_applied_count") or 0),
+                        "adaptive_weight_missing_count": int(full_universe_diag.get("adaptive_weight_missing_count") or 0),
+                        "adaptive_weight_score_delta_sum": float(full_universe_diag.get("adaptive_weight_score_delta_sum") or 0.0),
+                        "adaptive_weight_top_components": full_universe_diag.get("adaptive_weight_top_components") or {},
+                    },
+                    "current_cycle": {"leaderboard": [], "leaderboard_len": 0},
+                }
+            )
+            return None
+
+        bar_candidate_snapshot: list[BuyCandidate] = list(self.current_bar_candidates)
+        pipeline_done: set[str] = set()
+
+        # Filter candidates using hard safety gates.
+        valid_candidates = []
+        for candidate in self.current_bar_candidates:
+            if candidate.confidence < MIN_CONFIDENCE:
+                logger.info(
+                    "BAR_PRE_RANK_TELEMETRY low_conf symbol=%s conf=%.3f min=%.3f",
+                    candidate.symbol,
+                    candidate.confidence,
+                    MIN_CONFIDENCE,
+                )
+
+            perf = self.coin_performance.get(candidate.symbol)
+            if perf and perf.is_paused:
+                logger.warning(
+                    "BAR_PRE_RANK_TELEMETRY coin_paused symbol=%s until=%s (not blocking — ML authoritative)",
+                    candidate.symbol,
+                    perf.pause_until,
+                )
+            if perf:
+                min_trades = int(os.getenv("PNL_ADAPT_MIN_TRADES", "6"))
+                wr_floor = float(os.getenv("PNL_ADAPT_WR_FLOOR", "0.38"))
+                exp_floor = float(os.getenv("PNL_ADAPT_EXPECTANCY_FLOOR", "-0.20"))
+                if (
+                    os.getenv("ENABLE_PNL_ADAPTIVE_FILTER", "true").strip().lower() in ("1", "true", "yes", "on")
+                    and perf.total_trades_20 >= min_trades
+                    and perf.win_rate_20 < wr_floor
+                    and perf.expectancy < exp_floor
+                ):
+                    logger.info(
+                        "BAR_PNL_ADAPT_TELEMETRY symbol=%s wr=%.3f exp=%.4f trades=%s (not blocking ranking)",
+                        candidate.symbol,
+                        perf.win_rate_20,
+                        perf.expectancy,
+                        perf.total_trades_20,
+                    )
+                    ddp = dict(candidate.decision_data or {})
+                    ddp["pnl_adapt_penalty"] = float(ddp.get("pnl_adapt_penalty") or 0.0) + 2.0
+                    ddp["pnl_adapt_filter_status"] = "telemetry_penalty_only"
+                    candidate.decision_data = ddp
+
+            # Ensure symbol-trust components exist for all ranked candidates,
+            # including those enqueued by non-fallback paths.
+            try:
+                sid_for_trust = self._candidate_strategy_id(candidate)
+                self._apply_symbol_trust_to_candidate(candidate, sid_for_trust)
+            except Exception:
+                pass
+
+            valid_candidates.append(candidate)
+
+        if not valid_candidates:
+            logger.debug("BAR_CLOSE: No valid candidates after filtering")
+            for c in bar_candidate_snapshot:
+                await self._bar_pipeline_terminal(c.decision_id, "BAR_PRE_RANK_FILTERED", pipeline_done)
+            self.current_bar_candidates.clear()
+            return None
+
+        valid_ids = {id(c) for c in valid_candidates}
+        for c in bar_candidate_snapshot:
+            if id(c) not in valid_ids:
+                await self._bar_pipeline_terminal(c.decision_id, "BAR_PRE_RANK_FILTERED", pipeline_done)
+
+        # Rank by local score before arbiter. Prefer symbols without an open position so a fresh
+        # candidate can outrank a higher-score symbol that is already held (same-bar add-to logic
+        # still blocked later in _can_open_position; this only affects ordering/telemetry).
+        valid_candidates.sort(key=lambda c: (c.symbol in self.open_positions, -c.rank_score()))
+
+        unique_symbols = {c.symbol for c in valid_candidates}
+        logger.info("BAR_CANDIDATES: %d unique symbols from %d valid candidates", len(unique_symbols), len(valid_candidates))
+
+        # Log ranking (regime_align: [-1,1] input to rank tilt when split enabled)
+        for i, cand in enumerate(valid_candidates[:5]):
+            _ra = _rank_align_for_price_regime(cand) if _price_regime_behavior_split_enabled() else 0.0
+            logger.info(
+                "RANK #%d: %s | rank=%.3f conf=%.3f ps_regime=%s regime_align=%.3f trend=%.3f chop=%.3f edge=%.3f",
+                i + 1,
+                cand.symbol,
+                cand.rank_score(),
+                cand.confidence,
+                cand.price_structure_regime,
+                _ra,
+                cand.trend_score,
+                cand.chop_score,
+                cand.coin_edge_score,
+            )
+
+        # Execution sanity telemetry only: keep all ranked candidates unless data is truly broken.
+        execution_sane_candidates: list[BuyCandidate] = []
+        for _rank_idx, _cand in enumerate(valid_candidates):
+            _sym = _cand.symbol
+            # BUY margin is score/sizing influence only (not a ranking blocker).
+            _bm_raw = resolve_buy_margin_from_payload(_cand.decision_data)
+            _sleeve = str(getattr(_cand, "sleeve", "") or "").strip().upper() or assign_sleeve(normalize_symbol(_sym), float(_cand.confidence), _cand.decision_data)
+            _bm_thr = buy_margin_threshold_core() if _sleeve == Sleeve.CORE.value else buy_margin_threshold_active()
+            if _bm_raw is None:
+                logger.info(
+                    "BUY_MARGIN_TELEMETRY #%d: %s BUY_MARGIN missing (threshold=%.4f sleeve=%s) -> penalty only",
+                    _rank_idx + 1,
+                    _sym,
+                    _bm_thr,
+                    _sleeve or Sleeve.ACTIVE.value,
+                )
+                _cand.decision_data = dict(_cand.decision_data or {})
+                _cand.decision_data["buy_margin_exec_status"] = "missing_penalty_only"
+                _cand.decision_data["buy_margin_penalty_exec"] = 4.0
+            try:
+                _bm_val = float(_bm_raw)
+            except (TypeError, ValueError):
+                _bm_val = float("nan")
+            if not math.isfinite(_bm_val) or _bm_val < _bm_thr:
+                logger.info(
+                    "BUY_MARGIN_TELEMETRY #%d: %s BUY_MARGIN %.6f < %.6f (sleeve=%s) -> penalty only",
+                    _rank_idx + 1,
+                    _sym,
+                    _bm_val,
+                    _bm_thr,
+                    _sleeve or Sleeve.ACTIVE.value,
+                )
+                _cand.decision_data = dict(_cand.decision_data or {})
+                _cand.decision_data["buy_margin_exec_status"] = "below_threshold_penalty_only"
+                _cand.decision_data["buy_margin_penalty_exec"] = 4.0
+            _spread_raw = _cand.decision_data.get("spread_pct")
+            if _spread_raw in (None, ""):
+                _spread_raw = _cand.decision_data.get("spread")
+            _spread_val, _spread_units = self._normalize_spread_fraction(_spread_raw)
+            logger.debug(
+                "SPREAD_ENTRY_CHECK: symbol=%s spread_val=%.6f max_spread_pct=%.6f units=fractional",
+                _sym,
+                _spread_val,
+                MAX_SPREAD_PCT,
+            )
+            if _spread_units == "percent_whole":
+                logger.warning(
+                    "SPREAD_UNITS_NORMALIZED: symbol=%s spread_raw=%s spread_fraction=%.6f",
+                    _sym,
+                    str(_spread_raw),
+                    _spread_val,
+                )
+            if _spread_val > MAX_SPREAD_PCT:
+                logger.info(
+                    "SPREAD_TELEMETRY #%d: %s spread=%.4f%% > max=%.4f%% -> penalty only",
+                    _rank_idx + 1,
+                    _sym,
+                    _spread_val * 100.0,
+                    MAX_SPREAD_PCT * 100.0,
+                )
+                _cand.decision_data = dict(_cand.decision_data or {})
+                _cand.decision_data["spread_exec_status"] = "wide_penalty_only"
+                _cand.decision_data["spread_pct"] = _spread_val
+                _cand.decision_data["spread_units"] = _spread_units
+                _cand.decision_data["spread_penalty_exec"] = float(_cand.decision_data.get("spread_penalty_exec") or 0.0) + 4.0
+            if _cand.current_price > 0 and _cand.atr / _cand.current_price < MIN_ATR_RATIO:
+                if ENABLE_ATR_ENFORCEMENT:
+                    logger.info(
+                        "LOW_ATR_TELEMETRY #%d: %s atr_ratio=%.6f < %.6f -> penalty only",
+                        _rank_idx + 1,
+                        _sym,
+                        _cand.atr / _cand.current_price,
+                        MIN_ATR_RATIO,
+                    )
+                    _cand.decision_data = dict(_cand.decision_data or {})
+                    _cand.decision_data["atr_exec_status"] = "low_valid_penalty_only"
+                    _cand.decision_data["atr_penalty_exec"] = float(_cand.decision_data.get("atr_penalty_exec") or 0.0) + 2.5
+                else:
+                    logger.info(
+                        "TELEMETRY_LOW_ATR symbol=%s atr_ratio=%.6f min=%.6f (ENABLE_ATR_ENFORCEMENT=false)",
+                        _sym,
+                        _cand.atr / _cand.current_price,
+                        MIN_ATR_RATIO,
+                    )
+            execution_sane_candidates.append(_cand)
+
+        if not execution_sane_candidates:
+            logger.info("BAR_CLOSE: No candidates passed spread/ATR execution sanity (%d ranked)", len(valid_candidates))
+            self._persist_profit_cycle_state(
+                {
+                    "bar_timestamp": int(bar_timestamp),
+                    "full_universe_diagnostics": full_universe_diag,
+                    "adaptive_weight_diagnostics": {
+                        "adaptive_weight_applied_count": int(full_universe_diag.get("adaptive_weight_applied_count") or 0),
+                        "adaptive_weight_missing_count": int(full_universe_diag.get("adaptive_weight_missing_count") or 0),
+                        "adaptive_weight_score_delta_sum": float(full_universe_diag.get("adaptive_weight_score_delta_sum") or 0.0),
+                        "adaptive_weight_top_components": full_universe_diag.get("adaptive_weight_top_components") or {},
+                    },
+                    "current_cycle": {"leaderboard": [], "leaderboard_len": 0},
+                }
+            )
+            self.current_bar_candidates.clear()
+            return None
+
+        open_syms = set(self.open_positions.keys())
+        fresh_symbol_candidates = [c for c in execution_sane_candidates if c.symbol not in open_syms]
+        chosen = list(fresh_symbol_candidates or execution_sane_candidates)
+        if not chosen:
+            logger.info("BUY_SKIPPED: no valid candidates after spread/ATR filtering")
+            self._persist_profit_cycle_state(
+                {
+                    "bar_timestamp": int(bar_timestamp),
+                    "full_universe_diagnostics": full_universe_diag,
+                    "adaptive_weight_diagnostics": {
+                        "adaptive_weight_applied_count": int(full_universe_diag.get("adaptive_weight_applied_count") or 0),
+                        "adaptive_weight_missing_count": int(full_universe_diag.get("adaptive_weight_missing_count") or 0),
+                        "adaptive_weight_score_delta_sum": float(full_universe_diag.get("adaptive_weight_score_delta_sum") or 0.0),
+                        "adaptive_weight_top_components": full_universe_diag.get("adaptive_weight_top_components") or {},
+                    },
+                    "current_cycle": {"leaderboard": [], "leaderboard_len": 0},
+                }
+            )
+            self.current_bar_candidates.clear()
+            return None
+
+        logger.info(
+            "CANDIDATE_SELECTION_TRACE stage=execution_sane_rank chosen_count=%d first_symbol=%s first_decision_id=%s",
+            len(chosen),
+            chosen[0].symbol if chosen else "",
+            (chosen[0].decision_id or "") if chosen else "",
+        )
+
+        # Selection is ranking-only. Execution enforces buy_margin, capacity,
+        # and duplicate-symbol blocks. Skip candidates Mystic already holds
+        # (one open position per symbol).
+        top_candidate = chosen[0]
+        for cand in chosen:
+            if cand.symbol not in self.open_positions:
+                top_candidate = cand
+                break
+        top_meta: dict[str, Any] = {}
+        cycle_leaderboard: list[dict[str, Any]] = []
+        for _idx, _cand in enumerate(valid_candidates):
+            _dd = _cand.decision_data or {}
+            _net_ev = self._estimate_candidate_net_expected_value(_dd)
+            _spread_val, _spread_units = self._normalize_spread_fraction(_dd.get("spread_pct"))
+            _atr_ratio = (_cand.atr / _cand.current_price) if _cand.current_price > 0 else 0.0
+            cycle_leaderboard.append(
+                {
+                    "symbol": _cand.symbol,
+                    "strategy_id": str(_dd.get("live_ai_strategy") or "day"),
+                    "rank": _idx + 1,
+                    "signal_side": str(_dd.get("argmax_action") or _dd.get("prediction") or "BUY").strip().upper(),
+                    "confidence": float(_cand.confidence or 0.0),
+                    "buy_margin": resolve_buy_margin_from_payload(_dd),
+                    "spread_fraction": float(_spread_val),
+                    "spread_units": _spread_units,
+                    "spread_bps": float(_spread_val * 10000.0),
+                    "atr_ratio": float(_atr_ratio),
+                    "adaptive_score_delta": float(_cand.adaptive_score_delta or 0.0),
+                    "adaptive_components_used": dict(_cand.adaptive_components_used or {}),
+                    "adaptive_components_missing": list(_cand.adaptive_components_missing or []),
+                    "symbol_group": str(_dd.get("symbol_group") or ""),
+                    "symbol_group_baseline": float(_safe_float(_dd.get("symbol_group_baseline"), 0.0)),
+                    "setup_credit": float(_safe_float(_dd.get("setup_credit"), 0.0)),
+                    "weak_symbol_penalty": float(_safe_float(_dd.get("weak_symbol_penalty"), 0.0)),
+                    "symbol_expectancy_adjustment": float(_safe_float(_dd.get("symbol_expectancy_adjustment"), 0.0)),
+                    "symbol_trust_score": float(_safe_float(_dd.get("symbol_trust_score"), 0.0)),
+                    "symbol_size_factor": float(_safe_float(_dd.get("symbol_size_factor"), 1.0)),
+                    "rank_score": float(_cand.rank_score()),
+                    "selected_net_expected_value": float(_net_ev),
+                    "disposition": "ranked_only",
+                }
+            )
+
+        _tc_spread_raw = top_candidate.decision_data.get("spread_pct")
+        if _tc_spread_raw in (None, ""):
+            _tc_spread_raw = top_candidate.decision_data.get("spread")
+        _tc_spread_val, _tc_spread_units = self._normalize_spread_fraction(_tc_spread_raw)
+        _tc_atr_r = top_candidate.atr / top_candidate.current_price if top_candidate.current_price > 0 else 0
+        logger.info(
+            "CANDIDATE_SELECTED #%s conf=%.3f atr_ratio=%.6f spread_pct=%.4f%% spread_units=%s",
+            top_candidate.symbol,
+            top_candidate.confidence,
+            _tc_atr_r,
+            _tc_spread_val,
+            _tc_spread_units,
+        )
+        symbol = top_candidate.symbol
+        top_dd = top_candidate.decision_data or {}
+        top_net_ev = self._estimate_candidate_net_expected_value(top_dd)
+        top_meta["score"] = float(top_candidate.rank_score())
+        top_meta["net_expected_value"] = float(top_net_ev)
+
+        for c in execution_sane_candidates:
+            self.record_signal(c.symbol, "BUY")
+        await self._persist_quality_signals()
+
+        # Ensure symbol constraints before sizing so decision gate and execution gate use same source
+        await self._entry_ensure_constraints(symbol)
+
+        # Calculate position size (Phase 4)
+        equity = self._calculate_equity()
+        perf = self.coin_performance.get(symbol)
+        sizing_mult = perf.sizing_multiplier if perf else 1.0
+        strategy_id_for_size = str(top_candidate.decision_data.get("live_ai_strategy") or "day").strip().lower()
+        dyn_mult, dyn_components, dyn_cap_reason = self._compute_dynamic_sizing_multiplier(
+            symbol=symbol,
+            strategy_id=strategy_id_for_size,
+            final_profit_score=float(top_meta.get("score") or 0.0),
+            net_expected_value=float(top_meta.get("net_expected_value") or 0.0),
+            confidence=float(top_candidate.confidence or 0.0),
+            decision_data=top_candidate.decision_data or {},
+        )
+        sizing_mult *= dyn_mult
+
+        quantity, stop_price, _risk_usd = self.calculate_position_size(symbol, equity, top_candidate.atr, top_candidate.current_price, sizing_mult, top_candidate.confidence)
+
+        # Check if position size is valid (may be 0 due to cash clamp)
+        if quantity <= 0:
+            log_decision_trace(
+                "HOLD",
+                symbol,
+                {
+                    "reason_code": "BUY_SKIP_SIZING",
+                    "cash": self._available_balance,
+                    "equity": equity,
+                    "confidence": top_candidate.confidence,
+                    "threshold": MIN_CONFIDENCE,
+                },
+            )
+            logger.info(f"PROCESS_BAR: {symbol} - SKIPPED due to insufficient cash/min size")
+            await self._bar_pipeline_terminal(top_candidate.decision_id, "BAR_SIZING_ZERO", pipeline_done)
+            await self._bar_pipeline_not_selected_others(bar_candidate_snapshot, top_candidate.decision_id or "", pipeline_done)
+            self.current_bar_candidates.clear()
+            return None
+
+        # Align execution-time audit payload with the live Redis ML hash when the queued
+        # candidate lacks context_audit_emit (stale enqueue / stale existing_pairs shortcut).
+        self._hydrate_buy_candidate_audit_from_redis_if_missing(top_candidate)
+
+        # Build explainability (Phase 9)
+        explainability = TradeExplainability(
+            trade_id="",  # Will be set in execute_buy_fifo
+            symbol=symbol,
+            side="BUY",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            ai_confidence=top_candidate.confidence,
+            trend_score=top_candidate.trend_score,
+            chop_score=top_candidate.chop_score,
+            coin_edge_score=top_candidate.coin_edge_score,
+            composite_score=top_candidate.composite_score,
+            regime=top_candidate.decision_data.get("regime", "unknown"),
+            price_structure_regime=top_candidate.price_structure_regime,
+            coin_win_rate_20=perf.win_rate_20 if perf else 0.5,
+            coin_expectancy=perf.expectancy if perf else 0.0,
+            portfolio_open_risk=self._calculate_total_open_risk(),
+        )
+        _dd = top_candidate.decision_data or {}
+        selected_strategy = str(_dd.get("live_ai_strategy") or "day").strip().lower()
+        explainability.live_ai_strategy = str(_dd.get("live_ai_strategy") or "")
+        _costs_bar = self._hydrate_cost_telemetry(
+            symbol=symbol,
+            strategy_id=selected_strategy,
+            decision_data=_dd,
+        )
+        explainability.entry_spread_pct = float(_costs_bar.get("entry_spread_pct") or 0.0)
+        explainability.entry_slippage_pct = float(_costs_bar.get("entry_slippage_pct") or 0.0)
+        explainability.entry_fee_pct = float(_costs_bar.get("entry_fee_pct") or 0.0)
+        explainability.entry_spread_source = str(_costs_bar.get("entry_spread_source") or "")
+        explainability.artifact_path = str(_dd.get("model_artifact_path") or "")
+        explainability.artifact_sha256 = str(_dd.get("artifact_sha256") or "")
+        explainability.model_trained_at = str(_dd.get("model_trained_at") or "")
+        try:
+            explainability.model_accuracy = float(_dd.get("model_accuracy") or 0) or None
+        except (TypeError, ValueError):
+            explainability.model_accuracy = None
+        try:
+            explainability.feature_version = int(_dd.get("feature_version") or 5)
+        except (TypeError, ValueError):
+            explainability.feature_version = 5
+        try:
+            explainability.feature_dim = int(_dd.get("feature_dim") or 145)
+        except (TypeError, ValueError):
+            explainability.feature_dim = 145
+        explainability.ctx_ts_utc = str(_dd.get("ctx_ts_utc") or "")
+        try:
+            explainability.ctx_age_sec = float(_dd.get("ctx_age_sec") if _dd.get("ctx_age_sec") not in (None, "") else -1.0)
+        except (TypeError, ValueError):
+            explainability.ctx_age_sec = -1.0
+        explainability.context_fresh_flag = str(_dd.get("context_fresh_str") or _dd.get("context_fresh") or "")
+        explainability.context_audit_emit = str(_dd.get("context_audit_emit") or "")
+        explainability.signal_content_timestamp = str(_dd.get("timestamp") or "")
+        explainability.signal_content_fresh = str(_dd.get("content_fresh") or "")
+        explainability.signal_content_age_sec = str(_dd.get("content_age_sec") or "")
+        explainability.signal_content_stale = str(_dd.get("signal_content_stale") or "0")
+        try:
+            explainability.signal_rsi_1m = float(_dd.get("rsi")) if _dd.get("rsi") not in (None, "") else -1.0
+        except (TypeError, ValueError):
+            explainability.signal_rsi_1m = -1.0
+        try:
+            explainability.signal_adx = float(_dd.get("adx")) if _dd.get("adx") not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            explainability.signal_adx = 0.0
+        try:
+            explainability.signal_ctx_rs_btc = float(_dd.get("ctx_rs_btc") if _dd.get("ctx_rs_btc") not in (None, "") else 0.0)
+        except (TypeError, ValueError):
+            explainability.signal_ctx_rs_btc = 0.0
+        try:
+            _spv = _dd.get("spread_pct")
+            if _spv is not None and str(_spv).strip() != "":
+                _sp_norm, _sp_units = self._normalize_spread_fraction(_spv)
+                explainability.signal_spread_pct = float(_sp_norm)
+                _dd["spread_units"] = _sp_units
+            else:
+                explainability.signal_spread_pct = 0.0
+        except (TypeError, ValueError):
+            explainability.signal_spread_pct = 0.0
+        try:
+            explainability.signal_ctx_depth_imbalance = float(_dd.get("ctx_depth_imbalance") if _dd.get("ctx_depth_imbalance") not in (None, "") else 0.0)
+        except (TypeError, ValueError):
+            explainability.signal_ctx_depth_imbalance = 0.0
+        try:
+            explainability.signal_regime_score = float(_dd.get("regime_score") if _dd.get("regime_score") not in (None, "") else 0.0)
+        except (TypeError, ValueError):
+            explainability.signal_regime_score = 0.0
+        try:
+            explainability.signal_ema_alignment = float(_dd.get("ema_alignment") if _dd.get("ema_alignment") not in (None, "") else 0.5)
+        except (TypeError, ValueError):
+            explainability.signal_ema_alignment = 0.5
+        explainability.signal_regime_label = str(_dd.get("regime_label") or _dd.get("regime") or "")
+        selected_rank = 0
+        for _row in cycle_leaderboard:
+            if str(_row.get("symbol") or "") == symbol and str(_row.get("strategy_id") or "").strip().lower() == selected_strategy:
+                selected_rank = int(_row.get("rank") or 0)
+                break
+        peer_ranks_payload = [
+            {
+                "symbol": str(_row.get("symbol") or ""),
+                "strategy_id": str(_row.get("strategy_id") or ""),
+                "rank": int(_row.get("rank") or 0),
+                "rank_score": float(_safe_float(_row.get("rank_score"), 0.0)),
+                "selected_net_expected_value": float(_safe_float(_row.get("selected_net_expected_value"), 0.0)),
+            }
+            for _row in cycle_leaderboard
+            if str(_row.get("strategy_id") or "").strip().lower() == selected_strategy
+        ]
+        snapshot_score_components = {
+            "adaptive_score_delta": float(top_candidate.adaptive_score_delta or 0.0),
+            "adaptive_components_used": dict(top_candidate.adaptive_components_used or {}),
+            "adaptive_components_missing": list(top_candidate.adaptive_components_missing or []),
+            "adaptive_regime": top_candidate.adaptive_regime or "unknown",
+            "symbol_group": str(_dd.get("symbol_group") or ""),
+            "symbol_group_baseline": float(_safe_float(_dd.get("symbol_group_baseline"), 0.0)),
+            "setup_credit": float(_safe_float(_dd.get("setup_credit"), 0.0)),
+            "weak_symbol_penalty": float(_safe_float(_dd.get("weak_symbol_penalty"), 0.0)),
+            "symbol_expectancy_adjustment": float(_safe_float(_dd.get("symbol_expectancy_adjustment"), 0.0)),
+            "symbol_trust_score": float(_safe_float(_dd.get("symbol_trust_score"), 0.0)),
+            "symbol_size_factor": float(_safe_float(_dd.get("symbol_size_factor"), 1.0)),
+            "rank_score": float(top_meta.get("score") or 0.0),
+            "selected_net_expected_value": float(top_net_ev),
+        }
+        explainability.rank_snapshot_id = self._persist_rank_snapshot(
+            strategy_id=selected_strategy,
+            selected_symbol=symbol,
+            selected_rank=selected_rank,
+            selected_score=float(top_meta.get("score") or 0.0),
+            selected_net_expected_value=float(top_net_ev),
+            leaderboard=cycle_leaderboard,
+            score_components=snapshot_score_components,
+            peer_ranks=peer_ranks_payload,
+            winner_reason="highest_rank_score",
+            rejected_reason_json={},
+            market_regime=str(_dd.get("ctx_market_regime") or _dd.get("market_regime") or _dd.get("regime") or "unknown"),
+        )
+        explainability.selected_rank = int(selected_rank)
+        explainability.selected_score = float(top_meta.get("score") or 0.0)
+        explainability.selected_net_expected_value = float(top_net_ev)
+        explainability.peer_ranks_json = json.dumps(peer_ranks_payload, separators=(",", ":"))
+        explainability.arbiter_winner_reason = "highest_rank_score"
+        explainability.arbiter_rejected_reason_json = "{}"
+        # Phase 3: record adaptive ranking telemetry inside score_components_json so
+        # downstream learning (outcome bridge, peer-shadow) and operators can audit.
+        adaptive_payload = dict(snapshot_score_components)
+        try:
+            explainability.score_components_json = json.dumps(adaptive_payload, separators=(",", ":"))
+        except (TypeError, ValueError):
+            explainability.score_components_json = "{}"
+        explainability.base_size = float(max(0.0, quantity / max(1e-9, dyn_mult)))
+        explainability.final_size = float(quantity)
+        explainability.sizing_multiplier = float(dyn_mult)
+        explainability.sizing_components_json = json.dumps(dyn_components, separators=(",", ":"))
+        explainability.cap_reason = dyn_cap_reason
+        explainability.drawdown_factor = float(dyn_components.get("drawdown_factor", 1.0))
+        explainability.memory_factor = float(dyn_components.get("memory_factor", 1.0))
+        explainability.ev_factor = float(dyn_components.get("ev_factor", 1.0))
+
+        try:
+            _ebm_bar = _costs_bar.get("entry_buy_margin")
+            explainability.entry_buy_margin = float(_ebm_bar) if _ebm_bar is not None else None
+        except (TypeError, ValueError):
+            explainability.entry_buy_margin = None
+
+        if POSITION_FIRST_ROUTING_ENABLED and symbol in self.open_positions:
+            managed = await self._route_selected_open_position(
+                candidate=top_candidate,
+                explainability=explainability,
+                quantity=quantity,
+                stop_price=stop_price,
+                atr=top_candidate.atr,
+                confidence=top_candidate.confidence,
+                bar_timestamp=bar_timestamp,
+                decision_id=top_candidate.decision_id,
+                sleeve=getattr(top_candidate, "sleeve", "") or "",
+            )
+            if managed and managed.get("handled"):
+                managed_action = str(managed.get("action") or "HOLD").upper()
+                managed_result = managed.get("trade_result")
+                selected_disposition = "selected_position_managed_trade" if managed_result is not None else "selected_position_managed_hold"
+                for _row in cycle_leaderboard:
+                    if _row.get("symbol") == top_candidate.symbol and str(_row.get("strategy_id")) == str(top_candidate.decision_data.get("live_ai_strategy") or "day"):
+                        _row["disposition"] = selected_disposition
+                        _row["position_management_action"] = managed_action
+                        break
+                self._persist_profit_cycle_state(
+                    {
+                        "bar_timestamp": int(bar_timestamp),
+                        "full_universe_diagnostics": full_universe_diag,
+                        "adaptive_weight_diagnostics": {
+                            "adaptive_weight_applied_count": int(full_universe_diag.get("adaptive_weight_applied_count") or 0),
+                            "adaptive_weight_missing_count": int(full_universe_diag.get("adaptive_weight_missing_count") or 0),
+                            "adaptive_weight_score_delta_sum": float(full_universe_diag.get("adaptive_weight_score_delta_sum") or 0.0),
+                            "adaptive_weight_top_components": full_universe_diag.get("adaptive_weight_top_components") or {},
+                        },
+                        "current_cycle": {
+                            "leaderboard": cycle_leaderboard,
+                            "leaderboard_len": len(cycle_leaderboard),
+                            "selected_symbol": top_candidate.symbol,
+                            "selected_strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
+                            "selected_trade": bool(managed_result is not None),
+                            "selected_position_management_action": managed_action,
+                        },
+                    }
+                )
+                exc_id = top_candidate.decision_id or ""
+                if managed_result is None and top_candidate.decision_id:
+                    await self._bar_pipeline_fill_if_stage_gates(
+                        top_candidate.decision_id,
+                        str(managed.get("reason") or "POSITION_MANAGEMENT_HOLD"),
+                    )
+                await self._bar_pipeline_not_selected_others(bar_candidate_snapshot, exc_id, pipeline_done)
+                self.current_bar_candidates.clear()
+                if managed_result is not None and top_candidate.decision_id and isinstance(managed_result, dict):
+                    managed_result = dict(managed_result)
+                    managed_result["decision_id"] = top_candidate.decision_id
+                return managed_result
+
+        # Decision trace (optional, when DECISION_TRACE_ENABLED=true)
+        final_notional = quantity * top_candidate.current_price
+        log_decision_trace(
+            "BUY",
+            symbol,
+            {
+                "reason_code": "BUY_OK",
+                "signal_score": top_candidate.rank_score(),
+                "confidence": top_candidate.confidence,
+                "price_structure_regime": top_candidate.price_structure_regime,
+                "cash": self._available_balance,
+                "equity": equity,
+                "target_notional": final_notional,
+                "final_notional": final_notional,
+                "qty": quantity,
+            },
+        )
+
+        # Fresh price lookup to avoid executing on stale signal price (can be up to 60s old)
+        exec_price = top_candidate.current_price
+        try:
+            from backend.config.redis_config import get_redis_client
+            from backend.utils.symbols import to_exchange_symbol
+
+            redis_client = get_redis_client()
+            if redis_client:
+                base_symbol = to_exchange_symbol(symbol).replace("USDT", "")
+                price_str = redis_client.get(f"market:{base_symbol}")
+                if price_str:
+                    if isinstance(price_str, str):
+                        price_json = json.loads(price_str)
+                        fresh = float(price_json["price"]) if isinstance(price_json, dict) and "price" in price_json else float(price_str)
+                    else:
+                        fresh = float(price_str)
+                    if fresh > 0:
+                        exec_price = fresh
+        except Exception as e:
+            logger.debug("FRESH_PRICE_LOOKUP: %s fallback to candidate price: %s", symbol, e)
+
+        # Final EV discipline: selected candidate must have positive net expected value.
+        if float(top_net_ev) <= 0.0:
+            logger.info(
+                "BEST_CANDIDATE_NEGATIVE_EV: symbol=%s strategy=%s net_ev=%.6f -> no_trade",
+                symbol,
+                str((top_candidate.decision_data or {}).get("live_ai_strategy") or "day"),
+                float(top_net_ev),
+            )
+            await self._bar_pipeline_fill_if_stage_gates(
+                top_candidate.decision_id,
+                "BEST_CANDIDATE_NEGATIVE_EV",
+            )
+            await self._bar_pipeline_not_selected_others(bar_candidate_snapshot, top_candidate.decision_id or "", pipeline_done)
+            for _row in cycle_leaderboard:
+                if _row.get("symbol") == top_candidate.symbol and str(_row.get("strategy_id")) == str(top_candidate.decision_data.get("live_ai_strategy") or "day"):
+                    _row["disposition"] = "selected_no_trade_negative_ev"
+                    break
+            self._persist_profit_cycle_state(
+                {
+                    "bar_timestamp": int(bar_timestamp),
+                    "full_universe_diagnostics": full_universe_diag,
+                    "adaptive_weight_diagnostics": {
+                        "adaptive_weight_applied_count": int(full_universe_diag.get("adaptive_weight_applied_count") or 0),
+                        "adaptive_weight_missing_count": int(full_universe_diag.get("adaptive_weight_missing_count") or 0),
+                        "adaptive_weight_score_delta_sum": float(full_universe_diag.get("adaptive_weight_score_delta_sum") or 0.0),
+                        "adaptive_weight_top_components": full_universe_diag.get("adaptive_weight_top_components") or {},
+                    },
+                    "current_cycle": {
+                        "leaderboard": cycle_leaderboard,
+                        "leaderboard_len": len(cycle_leaderboard),
+                        "selected_symbol": top_candidate.symbol,
+                        "selected_strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
+                        "selected_trade": False,
+                    },
+                }
+            )
+            self.current_bar_candidates.clear()
+            return None
+
+        # Execute buy with sleeve from candidate
+        result = await self.execute_buy_fifo(
+            symbol=symbol,
+            quantity=quantity,
+            price=exec_price,
+            stop_price=stop_price,
+            atr=top_candidate.atr,
+            confidence=top_candidate.confidence,
+            bar_timestamp=bar_timestamp,
+            explainability=explainability,
+            decision_id=top_candidate.decision_id,
+            sleeve=getattr(top_candidate, "sleeve", "") or "",
+        )
+
+        # Paper Redis/cache sync is handled inside execute_buy_fifo (trade_id passed; no duplicate SQLite rows).
+
+        selected_disposition = "selected_trade" if result is not None else "selected_no_trade"
+        for _row in cycle_leaderboard:
+            if _row.get("symbol") == top_candidate.symbol and str(_row.get("strategy_id")) == str(top_candidate.decision_data.get("live_ai_strategy") or "day"):
+                _row["disposition"] = selected_disposition
+                break
+        self._persist_profit_cycle_state(
+            {
+                "bar_timestamp": int(bar_timestamp),
+                "full_universe_diagnostics": full_universe_diag,
+                "adaptive_weight_diagnostics": {
+                    "adaptive_weight_applied_count": int(full_universe_diag.get("adaptive_weight_applied_count") or 0),
+                    "adaptive_weight_missing_count": int(full_universe_diag.get("adaptive_weight_missing_count") or 0),
+                    "adaptive_weight_score_delta_sum": float(full_universe_diag.get("adaptive_weight_score_delta_sum") or 0.0),
+                    "adaptive_weight_top_components": full_universe_diag.get("adaptive_weight_top_components") or {},
+                },
+                "current_cycle": {
+                    "leaderboard": cycle_leaderboard,
+                    "leaderboard_len": len(cycle_leaderboard),
+                    "selected_symbol": top_candidate.symbol,
+                    "selected_strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
+                    "selected_trade": bool(result is not None),
+                },
+            }
+        )
+
+        exc_id = top_candidate.decision_id or ""
+        if result is None and top_candidate.decision_id:
+            await self._bar_pipeline_fill_if_stage_gates(
+                top_candidate.decision_id,
+                "BAR_EXECUTE_BUY_FIFO_UNSPECIFIED",
+            )
+        await self._bar_pipeline_not_selected_others(bar_candidate_snapshot, exc_id, pipeline_done)
+
+        # Clear candidates for next bar
+        self.current_bar_candidates.clear()
+
+        # Include decision_id for idempotency (integration sets executed:{decision_id} on actual execution)
+        if result is not None and top_candidate.decision_id:
+            result = dict(result)
+            result["decision_id"] = top_candidate.decision_id
+        return result
+
+    def add_buy_candidate(
+        self,
+        symbol: str,
+        confidence: float,
+        current_price: float,
+        atr: float,
+        decision_data: dict[str, Any],
+        decision_id: str = "",
+    ) -> tuple[bool, str | None]:
+        """
+        Enqueue or replace the per-symbol bar candidate.
+
+        Returns:
+            (enqueued_or_replaced, superseded_decision_id)
+            superseded_decision_id is set when an existing queued candidate was replaced; that id must be terminalized in SQL.
+        """
+        symbol = normalize_symbol(symbol)
+        if ENTRY_MAJOR_ONLY and symbol not in ENTRY_ALLOWED_SYMBOLS:
+            logger.debug(
+                "CANDIDATE_REJECTED_SYMBOL_NOT_ALLOWED: %s allowlist=%s",
+                symbol,
+                sorted(ENTRY_ALLOWED_SYMBOLS),
+            )
+            return (False, None)
+
+        # Calculate scores for ranking
+        trend_score = self._calculate_trend_score(decision_data)
+        chop_score = self._calculate_chop_score(decision_data)
+        vol_penalty = self._calculate_volatility_penalty(atr, current_price)
+        spread_penalty = _safe_float(decision_data.get("spread_penalty", 0.0), 0.0)
+        ps_regime = classify_price_structure_regime(decision_data)
+
+        # Get coin edge score from performance
+        perf = self.coin_performance.get(symbol)
+        coin_edge = perf.expectancy / 10.0 if perf else 0.0  # Normalize expectancy
+        coin_edge = max(-0.2, min(0.2, coin_edge))  # Clamp to reasonable range
+        if perf is not None:
+            decision_data = dict(decision_data)
+            decision_data["coin_expectancy"] = float(perf.expectancy)
+
+        candidate = BuyCandidate(
+            symbol=symbol,
+            confidence=confidence,
+            trend_score=trend_score,
+            chop_score=chop_score,
+            coin_edge_score=coin_edge,
+            volatility_penalty=vol_penalty,
+            spread_penalty=spread_penalty,
+            atr=atr,
+            current_price=current_price,
+            decision_data=decision_data,
+            decision_id=decision_id,
+            sleeve=assign_sleeve(symbol, confidence, decision_data),
+            price_structure_regime=ps_regime,
+        )
+
+        # Phase 3: attach adaptive ranking weight delta. Bounded, advisory.
+        strategy_for_weights = str((decision_data or {}).get("live_ai_strategy") or "day").strip().lower()
+        try:
+            self._apply_adaptive_weights_to_candidate(candidate, strategy_for_weights)
+        except Exception:
+            candidate.adaptive_score_delta = 0.0
+
+        try:
+            self._apply_symbol_trust_to_candidate(candidate, strategy_for_weights)
+        except Exception:
+            dd2 = dict(candidate.decision_data or {})
+            dd2.setdefault("symbol_group", _symbol_group(candidate.symbol))
+            dd2.setdefault("symbol_group_baseline", _symbol_group_baseline(dd2.get("symbol_group")))
+            dd2.setdefault("setup_credit", 0.0)
+            dd2.setdefault("weak_symbol_penalty", 0.0)
+            dd2.setdefault("symbol_expectancy_adjustment", 0.0)
+            dd2.setdefault("symbol_trust_score", 0.0)
+            dd2.setdefault("symbol_size_factor", 1.0)
+            candidate.decision_data = dd2
+
+        new_score = candidate.rank_score()
+
+        incoming_strategy = str((decision_data or {}).get("live_ai_strategy") or "day").strip().lower()
+        existing_idx = None
+        for i, existing in enumerate(self.current_bar_candidates):
+            existing_strategy = str((existing.decision_data or {}).get("live_ai_strategy") or "day").strip().lower()
+            if existing.symbol == symbol and existing_strategy == incoming_strategy:
+                existing_idx = i
+                break
+
+        if existing_idx is not None:
+            existing = self.current_bar_candidates[existing_idx]
+            old_score = existing.rank_score()
+            old_decision_id = (existing.decision_id or "").strip() or None
+            score_eps = float(os.getenv("CANDIDATE_REPLACE_SCORE_EPS", "0.03"))
+            if new_score > old_score:
+                self.current_bar_candidates[existing_idx] = candidate
+                logger.debug(
+                    "CANDIDATE_REPLACED: %s old=%.3f new=%.3f reason=higher_score",
+                    symbol,
+                    old_score,
+                    new_score,
+                )
+                return (True, old_decision_id)
+            if new_score == old_score:
+                self.current_bar_candidates[existing_idx] = candidate
+                logger.debug(
+                    "CANDIDATE_REPLACED: %s old=%.3f new=%.3f reason=newer_tiebreak",
+                    symbol,
+                    old_score,
+                    new_score,
+                )
+                return (True, old_decision_id)
+            if (old_score - new_score) <= score_eps:
+                new_bm = resolve_buy_margin_from_payload(candidate.decision_data)
+                old_bm = resolve_buy_margin_from_payload(existing.decision_data)
+                try:
+                    new_bm_f = float(new_bm) if new_bm is not None else float("-inf")
+                except (TypeError, ValueError):
+                    new_bm_f = float("-inf")
+                try:
+                    old_bm_f = float(old_bm) if old_bm is not None else float("-inf")
+                except (TypeError, ValueError):
+                    old_bm_f = float("-inf")
+                if new_bm_f > old_bm_f:
+                    self.current_bar_candidates[existing_idx] = candidate
+                    logger.debug(
+                        "CANDIDATE_REPLACED: %s old=%.3f new=%.3f reason=edge_tiebreak new_bm=%.4f old_bm=%.4f",
+                        symbol,
+                        old_score,
+                        new_score,
+                        new_bm_f,
+                        old_bm_f,
+                    )
+                    return (True, old_decision_id)
+            logger.debug(
+                "CANDIDATE_REPLACED: %s old=%.3f new=%.3f reason=latest_signal_wins",
+                symbol,
+                old_score,
+                new_score,
+            )
+            self.current_bar_candidates[existing_idx] = candidate
+            return (True, old_decision_id)
+
+        self.current_bar_candidates.append(candidate)
+        logger.debug(
+            "CANDIDATE_ADDED: %s rank=%.3f conf=%.3f ps_regime=%s",
+            symbol,
+            new_score,
+            candidate.confidence,
+            ps_regime,
+        )
+        return (True, None)
+
+    def _calculate_trend_score(self, decision_data: dict) -> float:
+        """Calculate trend strength score (0-1)"""
+        # Based on EMA alignment, price momentum, etc.
+        ema_alignment = _safe_float(decision_data.get("ema_alignment", 0.5), 0.5)
+        price_momentum = _safe_float(decision_data.get("price_momentum", 0.0), 0.0)
+
+        # Normalize momentum to 0-1 range
+        momentum_score = 0.5 + (price_momentum / 10.0)  # Assume momentum in [-5, 5]%
+        momentum_score = max(0.0, min(1.0, momentum_score))
+
+        return (ema_alignment * 0.6) + (momentum_score * 0.4)
+
+    def _calculate_chop_score(self, decision_data: dict) -> float:
+        """Calculate choppiness penalty (0-1, higher = more chop)"""
+        rsi = _safe_float(decision_data.get("rsi", 50), 50.0)
+        adx = _safe_float(decision_data.get("adx", 25), 25.0)
+
+        # RSI near 50 = choppy
+        rsi_chop = 1.0 - abs(rsi - 50.0) / 50.0
+
+        # Low ADX = choppy
+        adx_chop = 1.0 - min(adx / 40.0, 1.0)
+
+        return (rsi_chop * 0.5) + (adx_chop * 0.5)
+
+    def _calculate_volatility_penalty(self, atr: float, price: float) -> float:
+        """Calculate volatility penalty (0-1, higher = too volatile)"""
+        atr_pct = (atr / price) * 100 if price > 0 else 0
+
+        # Penalty increases exponentially above 1% ATR
+        if atr_pct <= 0.5:
+            return 0.0
+        elif atr_pct <= 1.0:
+            return (atr_pct - 0.5) * 0.2
+        else:
+            return min(1.0, 0.1 + (atr_pct - 1.0) * 0.3)
+
+    # =========================================================================
+    # PHASE 6: PER-COIN PERFORMANCE SCORING
+    # =========================================================================
+
+    async def _update_coin_performance(
+        self,
+        symbol: str,
+        realized_pnl: float,
+        is_loss: bool = False,
+    ) -> None:
+        """Update per-coin performance metrics and check pause rules"""
+        if symbol not in self.coin_performance:
+            self.coin_performance[symbol] = CoinPerformance(symbol=symbol)
+            self._prune_coin_performance()
+
+        perf = self.coin_performance[symbol]
+        current_time = time.time()
+
+        # Update 24h metrics
+        perf.trades_24h += 1
+        perf.pnl_24h += realized_pnl
+
+        # Update rolling 20-trade metrics using a bounded deque for correct window rollover
+        is_win = realized_pnl > 0
+        perf._outcome_history.append(is_win)
+        perf.win_count_20 = sum(1 for o in perf._outcome_history if o)
+        perf.loss_count_20 = sum(1 for o in perf._outcome_history if not o)
+        perf.total_trades_20 = len(perf._outcome_history)
+
+        if is_win:
+            # Update average win (exponential moving average)
+            if perf.avg_win == 0:
+                perf.avg_win = realized_pnl
+            else:
+                perf.avg_win = perf.avg_win * 0.9 + realized_pnl * 0.1
+        # Update average loss
+        elif perf.avg_loss == 0:
+            perf.avg_loss = abs(realized_pnl)
+        else:
+            perf.avg_loss = perf.avg_loss * 0.9 + abs(realized_pnl) * 0.1
+
+        # Rolling loss-hit counter (read by the per-coin pause rules below).
+        # Live path increments this only when a real net-negative sell is
+        # observed (e.g., a human-manual close or a dust write-off in the red).
+        if is_loss:
+            perf.stop_loss_hits_10 = min(10, perf.stop_loss_hits_10 + 1)
+
+        # Update expectancy
+        perf.update_expectancy()
+
+        # COIN UNIVERSE RULES: profit_factor from rolling 20
+        perf.profit_factor = perf.compute_profit_factor()
+
+        # Update sizing multiplier based on performance (per-coin only; never exceed global caps)
+        try:
+            from backend.config.coin_universe_rules import (
+                MIN_TRADES_FOR_RISK_SCALE,
+                PER_COIN_RISK_SCALE_MAX,
+                PER_COIN_RISK_SCALE_MIN,
+                WIN_RATE_DECREASE_THRESHOLD,
+                WIN_RATE_INCREASE_THRESHOLD,
+            )
+        except ImportError:
+            MIN_TRADES_FOR_RISK_SCALE = 20
+            PER_COIN_RISK_SCALE_MAX = 1.2
+            PER_COIN_RISK_SCALE_MIN = 0.5
+            WIN_RATE_DECREASE_THRESHOLD = 0.40
+            WIN_RATE_INCREASE_THRESHOLD = 0.60
+        enough_trades = perf.trades_last_30d >= MIN_TRADES_FOR_RISK_SCALE or perf.total_trades_20 >= MIN_TRADES_FOR_RISK_SCALE
+        if perf.total_trades_20 >= 5:
+            if perf.win_rate_20 >= WIN_RATE_INCREASE_THRESHOLD and perf.expectancy > 0 and enough_trades:
+                perf.sizing_multiplier = min(PER_COIN_RISK_SCALE_MAX, 1.0 + perf.expectancy / 50)
+            elif perf.win_rate_20 < WIN_RATE_DECREASE_THRESHOLD or perf.expectancy < 0:
+                perf.sizing_multiplier = max(PER_COIN_RISK_SCALE_MIN, 1.0 + perf.expectancy / 50)
+            else:
+                perf.sizing_multiplier = 1.0
+        if not enough_trades and perf.sizing_multiplier > 1.0:
+            perf.sizing_multiplier = 1.0
+
+        # CHECK PAUSE RULES
+        should_pause = False
+        pause_duration = 0
+        pause_reason = ""
+
+        # Rule 4 (COIN UNIVERSE): Temporary disable if profit_factor < 1.0 and trades >= 20 (30d lookback proxy)
+        try:
+            from backend.config.coin_universe_rules import (
+                DISABLE_DAYS_MAX,
+                DISABLE_DAYS_MIN,
+                MIN_TRADES_FOR_DISABLE,
+                PROFIT_FACTOR_DISABLE_THRESHOLD,
+            )
+        except ImportError:
+            DISABLE_DAYS_MIN = 7
+            DISABLE_DAYS_MAX = 14
+            MIN_TRADES_FOR_DISABLE = 20
+            PROFIT_FACTOR_DISABLE_THRESHOLD = 1.0
+        if perf.profit_factor is not None and perf.profit_factor < PROFIT_FACTOR_DISABLE_THRESHOLD and perf.total_trades_20 >= MIN_TRADES_FOR_DISABLE and current_time >= perf.pause_until:
+            import random
+
+            disable_days = random.uniform(DISABLE_DAYS_MIN, DISABLE_DAYS_MAX)
+            should_pause = True
+            pause_duration = disable_days * 86400
+            pause_reason = f"underperform: profit_factor={perf.profit_factor:.2f}, trades_20={perf.total_trades_20} (COIN_UNIVERSE_RULES)"
+
+        # Rule 1: High trades + negative PnL + low win rate
+        if not should_pause and perf.trades_24h >= PAUSE_THRESHOLD_TRADES_24H and perf.pnl_24h < 0 and perf.win_rate_20 < PAUSE_THRESHOLD_WIN_RATE:
+            should_pause = True
+            pause_duration = PAUSE_DURATION_UNDERPERFORM
+            pause_reason = f"underperform: {perf.trades_24h} trades, ${perf.pnl_24h:.2f} PnL, {perf.win_rate_20:.1%} WR"
+
+        # Rule 2: Too many recent losing closes — pause the coin to let the
+        # learning loop catch up before resuming buys.
+        elif perf.stop_loss_hits_10 >= PAUSE_THRESHOLD_STOP_HITS:
+            should_pause = True
+            pause_duration = PAUSE_DURATION_STOP_HEAVY
+            pause_reason = f"loss_heavy: {perf.stop_loss_hits_10} losing closes in last 10"
+
+        # Rule 3: Severe drawdown (not yet implemented - per-coin drawdown tracking planned for future release)
+        # Current implementation focuses on symbol-level pause logic only
+
+        if should_pause and current_time >= perf.pause_until:
+            perf.pause_until = current_time + pause_duration
+            logger.warning(f"PAUSE: {symbol} paused for {pause_duration / 3600:.1f}h | Reason: {pause_reason}")
+
+        perf.last_updated = current_time
+
+        # Persist to database
+        await self._persist_coin_performance(perf)
+
+    async def _persist_coin_performance(self, perf: CoinPerformance) -> None:
+        """Persist coin performance to database"""
+
+        def _sync_persist():
+            def _op() -> None:
+                with connect_rw(self.db_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        INSERT OR REPLACE INTO coin_performance (
+                            symbol, trades_24h, pnl_24h, win_count_20, loss_count_20,
+                            total_trades_20, avg_win, avg_loss, expectancy,
+                            stop_loss_hits_10, current_drawdown, peak_value,
+                            pause_until, sizing_multiplier, last_updated,
+                            profit_factor, trades_last_30d, avg_pnl, confidence_to_pnl_correlation
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            perf.symbol,
+                            perf.trades_24h,
+                            perf.pnl_24h,
+                            perf.win_count_20,
+                            perf.loss_count_20,
+                            perf.total_trades_20,
+                            perf.avg_win,
+                            perf.avg_loss,
+                            perf.expectancy,
+                            perf.stop_loss_hits_10,
+                            perf.current_drawdown,
+                            perf.peak_value,
+                            perf.pause_until,
+                            perf.sizing_multiplier,
+                            perf.last_updated,
+                            getattr(perf, "profit_factor", None),
+                            getattr(perf, "trades_last_30d", 0),
+                            getattr(perf, "avg_pnl", 0.0),
+                            getattr(perf, "confidence_to_pnl_correlation", 0.0),
+                        ),
+                    )
+                    conn.commit()
+
+            run_locked_retry(_op)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _sync_persist)
+
+    def _log_capital_concentration(self, total_equity: float) -> None:
+        """COIN UNIVERSE RULES: Log when any position exceeds 25% (warn) or 30% (error) of total capital."""
+        if total_equity <= 0:
+            return
+        try:
+            from backend.config.trading_universe import (
+                CONCENTRATION_WARN_PCT,
+                MAX_COIN_CONCENTRATION_PCT,
+            )
+        except ImportError:
+            CONCENTRATION_WARN_PCT = 25.0
+            MAX_COIN_CONCENTRATION_PCT = 30.0
+        for symbol, pos in self.open_positions.items():
+            pos_value = pos.quantity * (pos.entry_price or 0)
+            pct = (pos_value / total_equity) * 100
+            if pct >= MAX_COIN_CONCENTRATION_PCT:
+                logger.error(
+                    "CONCENTRATION_BREACH: %s = %.1f%% of total capital (max %.0f%%)",
+                    symbol,
+                    pct,
+                    MAX_COIN_CONCENTRATION_PCT,
+                )
+            elif pct >= CONCENTRATION_WARN_PCT:
+                logger.warning(
+                    "CONCENTRATION_APPROACHING: %s = %.1f%% of total capital (warn above %.0f%%)",
+                    symbol,
+                    pct,
+                    CONCENTRATION_WARN_PCT,
+                )
+
+    # =========================================================================
+    # PHASE 9: OBSERVABILITY ENDPOINTS
+    # =========================================================================
+
+    def build_open_position_api_row(self, symbol: str, pos: Any) -> dict[str, Any]:
+        """Unified open-position payload for /status, /positions, and dashboard-canonical."""
+        mark = float(self._position_mark_prices.get(symbol, pos.entry_price) or pos.entry_price)
+        q = float(pos.quantity or 0)
+        ep = float(pos.entry_price or 0)
+        u_pnl = (mark - ep) * q
+        stop = float(pos.stop_price or 0)
+        tp1 = float(pos.take_profit_1_price or 0)
+        tp2 = float(pos.take_profit_2_price or 0)
+        entry_ts = float(pos.entry_time or 0)
+        return {
+            "symbol": symbol,
+            "quantity": q,
+            "entry_price": ep,
+            "avg_entry_price": ep,
+            "average_price": ep,
+            "current_price": mark,
+            "highest_price": float(pos.highest_price or ep),
+            "unrealized_pnl": u_pnl,
+            "entry_time": pos.entry_time,
+            "entry_time_iso": datetime.fromtimestamp(entry_ts, tz=timezone.utc).isoformat() if entry_ts else None,
+            "trade_id": pos.trade_id,
+            "confidence_at_entry": pos.confidence_at_entry,
+            "atr_at_entry": pos.atr_at_entry,
+            "repair_add_count": int(getattr(pos, "repair_add_count", 0) or 0),
+            "stop_price": stop,
+            "stop_loss": stop,
+            "take_profit_1_price": tp1,
+            "take_profit_2_price": tp2,
+            "take_profit": tp1,
+            "exit_levels_are_advisory_metadata_only": True,
+            "sleeve": getattr(pos, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value,
+            "status": getattr(pos, "status", "ACTIVE"),
+            "entry_strategy_id": str(getattr(pos, "entry_strategy_id", "") or "day") or "day",
+            "strategy_id": str(getattr(pos, "entry_strategy_id", "") or "day") or "day",
+        }
+
+    def get_portfolio_status(self) -> dict[str, Any]:
+        """
+        Get full portfolio status for observability.
+
+        AUTHORITATIVE LEDGER: Portfolio engine is the source of truth.
+
+        ``total_equity`` / ``account_equity`` = cash_balance + positions_value (MTM),
+        aligned with ``self._total_equity`` after ``_recompute_positions_values``.
+
+        ``performance_equity`` / ``principal_based_equity`` = principal + realized_pnl + unrealized_pnl.
+
+        ``equity_invariant_ok``: operational ledger identity
+        (account_equity == cash_balance + positions_value).
+
+        ``performance_equity_consistency_ok`` tracks principal-based vs account view
+        as an auxiliary diagnostic only.
+        """
+        positions_list = []
+        for symbol, pos in self.open_positions.items():
+            if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
+                continue
+            positions_list.append(self.build_open_position_api_row(symbol, pos))
+
+        # Account equity: cash + MTM positions (matches engine._total_equity / persisted ledger row)
+        account_equity = self._total_equity
+        account_equity_check = self.cash_balance + self._positions_value
+        # Performance equity: principal + accumulated realized + mark-to-market unrealized
+        performance_equity = self.principal + self._realized_pnl + self._unrealized_pnl
+        # Canonical operational identity used by dashboard/risk endpoints.
+        equity_invariant_ok = abs(account_equity - account_equity_check) < 1.0
+        # Secondary books check (fees/slippage on open lots can separate the two views)
+        inv_tolerance = 5.0 + len(self.open_positions) * 3.0
+        performance_equity_consistency_ok = abs(account_equity - performance_equity) < inv_tolerance
+
+        total_risk = self._calculate_total_open_risk()
+        self._log_capital_concentration(account_equity)
+
+        from backend.config.live_test_mode import get_live_test_api_fields
+
+        return {
+            # ACCOUNT STATUS
+            "account_status": self._account_status.value,
+            "trading_paused": self._trading_paused,
+            "pause_reason": self._pause_reason if self._trading_paused else None,
+            # POSITION SUMMARY
+            "open_positions": positions_list,
+            "positions": positions_list,
+            "positions_count": len(self.open_positions),
+            "max_positions": MAX_OPEN_POSITIONS,
+            # AUTHORITATIVE LEDGER (single meaning: account / cash+marks)
+            "cash_balance": self.cash_balance,
+            "positions_value": self._positions_value,
+            "total_equity": account_equity,
+            "account_equity": account_equity,
+            "performance_equity": performance_equity,
+            "principal_based_equity": performance_equity,
+            "available_balance": self._available_balance,
+            # EQUITY: explicit aliases + books check
+            "operational_equity": account_equity,
+            "accounting_equity": performance_equity,
+            "equity_invariant_ok": equity_invariant_ok,
+            "performance_equity_consistency_ok": performance_equity_consistency_ok,
+            "equity_check": account_equity_check,
+            # P&L BREAKDOWN
+            "principal": self.principal,
+            "realized_pnl": self._realized_pnl,
+            "unrealized_pnl": self._unrealized_pnl,
+            # RISK METRICS
+            "total_open_risk": total_risk,
+            "open_risk_pct": (total_risk / account_equity * 100) if account_equity > 0 else 0,
+            "max_total_risk_pct": MAX_TOTAL_OPEN_RISK_PCT * 100,
+            # EXIT POLICY (metadata vs automated sells)
+            "position_exit_policy": {
+                "automated_sells_triggered_by": "executable_net_profit_after_costs_only",
+                "stop_tp_fields_are_advisory_metadata_only": True,
+                "stop_loss_sell_path_active": False,
+                "time_exit_sell_path_active": False,
+                "trailing_stop_sell_path_active": False,
+            },
+            # CONFIG
+            "risk_per_trade_pct": RISK_PER_TRADE_PCT * 100,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            # SLEEVE ARCHITECTURE
+            "sleeve_enabled": SLEEVE_ENABLED,
+            "sleeves": self.get_sleeve_summary() if SLEEVE_ENABLED else None,
+            "sleeve_cutover": self.get_sleeve_cutover() if SLEEVE_ENABLED else None,
+            **get_live_test_api_fields(),
+        }
+
+    async def get_ledger(self) -> dict[str, Any]:
+        """
+        Get authoritative ledger data - CANONICAL BALANCE SOURCE (BUG-002 Fix)
+
+        This is the single source of truth for all balance/equity data.
+        Dashboard and all services must use this, not PaperTradingService.
+
+        Returns ledger with:
+        - principal: Initial capital
+        - cash_balance: Available cash
+        - positions_value: Current value of all positions (cost basis)
+        - realized_pnl: Closed trade profits/losses
+        - unrealized_pnl: Open position mark-to-market
+        - total_equity: cash + positions (INVARIANT: must match)
+        - account_status: HEALTHY, OVERALLOCATED, etc.
+        """
+        # Canonical: total_equity = cash_balance + positions_value
+        total_equity = self._total_equity
+        equity_check_canonical = self.cash_balance + self._positions_value
+        equity_invariant_ok = abs(total_equity - equity_check_canonical) < 1.0
+        # Secondary: principal + realized_pnl + unrealized_pnl == total_equity
+        equity_alt = self.principal + self._realized_pnl + self._unrealized_pnl
+        equity_alt_ok = abs(total_equity - equity_alt) < 1.0
+        if not equity_invariant_ok:
+            logger.debug(
+                "GET_LEDGER: invariant cash+positions=%.2f != total_equity=%.2f (diff=%.4f)",
+                equity_check_canonical,
+                total_equity,
+                abs(total_equity - equity_check_canonical),
+            )
+
+        return {
+            # LEDGER STATE (canonical)
+            "principal": self.principal,
+            "cash_balance": self.cash_balance,
+            "positions_value": self._positions_value,
+            "realized_pnl": self._realized_pnl,
+            "unrealized_pnl": self._unrealized_pnl,
+            "total_equity": total_equity,
+            # ACCOUNT STATUS
+            "account_status": self._account_status.value,
+            "trading_paused": self._trading_paused,
+            "pause_reason": self._pause_reason if self._trading_paused else None,
+            # INVARIANT STATUS
+            "equity_invariant_ok": equity_invariant_ok,
+            "equity_check": equity_check_canonical,
+            "equity_diff": abs(total_equity - equity_check_canonical),
+            "equity_alt_ok": equity_alt_ok,
+            # METADATA
+            "open_positions_count": len(self.open_positions),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def get_coin_status(self, symbol: str) -> dict[str, Any]:
+        """Get per-coin status for observability"""
+        perf = self.coin_performance.get(symbol)
+        if not perf:
+            return {"symbol": symbol, "status": "no_data"}
+
+        return {
+            "symbol": symbol,
+            "is_paused": perf.is_paused,
+            "pause_until": perf.pause_until,
+            "trades_24h": perf.trades_24h,
+            "pnl_24h": perf.pnl_24h,
+            "win_rate_20": perf.win_rate_20,
+            "expectancy": perf.expectancy,
+            "avg_win": perf.avg_win,
+            "avg_loss": perf.avg_loss,
+            "stop_loss_hits_10": perf.stop_loss_hits_10,
+            "sizing_multiplier": perf.sizing_multiplier,
+            "last_updated": perf.last_updated,
+        }
+
+    def get_last_decisions(self, count: int = 10) -> list[dict[str, Any]]:
+        """Get last N decisions with full explainability"""
+        # Return most recent trade explanations
+        sorted_explains = sorted(
+            self.trade_explanations.values(),
+            key=lambda x: x.timestamp,
+            reverse=True,
+        )[:count]
+
+        return [e.to_dict() for e in sorted_explains]
+
+    # =========================================================================
+    # PHASE 10: INVARIANT VALIDATION
+    # =========================================================================
+
+    async def _validate_invariants(self, context: str) -> bool:
+        """
+        Validate all system invariants after every trade.
+        Returns True if all invariants pass.
+
+        CANONICAL SOURCE: PaperTradingService.positions (NOT paper_trades.remaining_position)
+        """
+        violations = []
+
+        # Invariant 1: Never more than MAX_OPEN_POSITIONS
+        filtered_open_positions_count = 0
+        for _sym, _pos in self.open_positions.items():
+            if getattr(_pos, "status", "ACTIVE") == "DUST_PENDING":
+                continue
+            _dust_price = float(getattr(_pos, "entry_price", 0.0) or 0.0)
+            _is_dust, _, _, _ = self._dust_check(_sym, float(getattr(_pos, "quantity", 0.0) or 0.0), _dust_price)
+            if _is_dust:
+                continue
+            filtered_open_positions_count += 1
+        logger.debug(
+            "OPEN_POSITION_COUNT_FILTERED: raw=%d filtered=%d max_open_positions=%d",
+            len(self.open_positions),
+            filtered_open_positions_count,
+            MAX_OPEN_POSITIONS,
+        )
+        if filtered_open_positions_count > MAX_OPEN_POSITIONS:
+            violations.append(f"POSITIONS_OVERFLOW: {filtered_open_positions_count} > {MAX_OPEN_POSITIONS}")
+
+        # Invariant 2: No symbol stacking
+        normalized_symbol_groups: dict[str, list[str]] = {}
+        for raw_symbol, pos in self.open_positions.items():
+            if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
+                continue
+            normalized = normalize_symbol(raw_symbol)
+            normalized_symbol_groups.setdefault(normalized, []).append(raw_symbol)
+        stacked_normalized = {k: v for k, v in normalized_symbol_groups.items() if len(v) > 1}
+        if stacked_normalized:
+            violations.append(f"SYMBOL_STACKING: normalized duplicates detected {stacked_normalized}")
+
+        # Invariant 3: Memory positions match canonical positions table (PaperTradingService)
+        # In test_mode, skip PaperTradingService checks for test isolation
+        if not self.test_mode:
+            canonical_positions = await self._get_canonical_positions()
+            # 1) Symbol set comparison uses FULL set (include DUST_PENDING) - dust must not cause false mismatch
+            memory_symbols_full = set(self.open_positions.keys())
+            canonical_symbols = set(canonical_positions.keys())
+
+            if memory_symbols_full != canonical_symbols:
+                missing_in_memory = canonical_symbols - memory_symbols_full
+                missing_in_engine = memory_symbols_full - canonical_symbols
+                logger.info(
+                    "CANONICAL_MISMATCH_SETS: memory_symbols_full=%s canonical_symbols=%s",
+                    memory_symbols_full,
+                    canonical_symbols,
+                )
+
+                # AUTO-FIX: Stale positions (in canonical/Redis but not in engine memory) - remove everywhere
+                if missing_in_memory:
+                    for stale_symbol in missing_in_memory:
+                        try:
+
+                            def _remove_stale(sym: str) -> None:
+                                def _op() -> None:
+                                    with connect_rw(self.db_path) as conn:
+                                        conn.execute("BEGIN IMMEDIATE")
+                                        conn.execute(
+                                            "DELETE FROM portfolio_engine_positions WHERE symbol = ?",
+                                            (sym,),
+                                        )
+                                        conn.commit()
+
+                                run_locked_retry(_op)
+
+                            await asyncio.to_thread(_remove_stale, stale_symbol)
+                            # Remove from PaperTradingService memory + Redis so it doesn't re-adopt
+                            try:
+                                from backend.services.paper_trading_service import get_paper_trading_service
+
+                                ps = get_paper_trading_service()
+                                if ps and stale_symbol in ps.positions:
+                                    del ps.positions[stale_symbol]
+                            except Exception:
+                                pass
+                            # Remove from Redis directly (paper:position:X + paper:positions:active set + quarantine)
+                            try:
+                                from backend.config.redis_config import SharedRedisState
+
+                                rc = SharedRedisState.get_async_client()
+                                if rc:
+                                    await rc.delete(f"paper:position:{stale_symbol}")
+                                    await rc.srem("paper:positions:active", stale_symbol)
+                                    await rc.delete(f"quarantine:{stale_symbol}")
+                            except Exception:
+                                pass
+                            logger.warning(f"CANONICAL_AUTO_FIX: Removed stale position {stale_symbol} from DB + Redis (not in engine memory)")
+                        except Exception as e:
+                            logger.error(f"CANONICAL_AUTO_FIX_FAILED: {stale_symbol} - {e}")
+                    # Un-pause trading since we fixed it
+                    if self._trading_paused and "CANONICAL_MISMATCH" in (self._pause_reason or ""):
+                        self._trading_paused = False
+                        self._pause_reason = ""
+                        self._account_status = AccountStatus.HEALTHY
+                        logger.warning("CANONICAL_AUTO_FIX: Cleared trading pause (stale positions removed)")
+                    try:
+                        await self._clear_all_quarantines()
+                    except Exception:
+                        pass
+                    # Skip remaining invariant checks - we just fixed the data
+                    return True
+
+                # Only flag as violation if engine has positions not in DB (real problem)
+                if missing_in_engine:
+                    violations.append(f"CANONICAL_MISMATCH: in_engine_not_positions={missing_in_engine}")
+
+            # 2) Quantity / invariant comparison EXCLUDES DUST_PENDING (they are reconciled separately)
+            # === DUST_INVARIANT_LOCK ===
+            # DO NOT MODIFY. Binance.US produces dust leftovers; dust must not pause trading.
+            # Invariants must be quantization-aware using stepSize/minQty tolerance.
+            # DUST_PENDING positions are excluded from pause logic by design.
+            # === END DUST_INVARIANT_LOCK ===
+            memory_positions_active = {s: p for s, p in self.open_positions.items() if getattr(p, "status", "ACTIVE") != "DUST_PENDING"}
+            for symbol in set(memory_positions_active.keys()) & canonical_symbols:
+                pos = self.open_positions[symbol]
+                mem_qty = pos.quantity
+                canonical_qty = canonical_positions[symbol]
+                # Derive epsilon from LOT_SIZE.stepSize (exchangeInfo) - same as order rounding
+                await self._ensure_symbol_constraints(symbol)
+                constraints = self._symbol_constraints.get(symbol) or {}
+                step_size = float(constraints.get("qty_step") or 0)  # LOT_SIZE.stepSize from exchangeInfo
+                min_qty = float(constraints.get("min_qty") or 0)
+                min_notional = float(constraints.get("min_notional") or 0)
+                step_source = "LOT_SIZE" if step_size > 0 else (constraints.get("source") or "fallback")
+                whether_constraints_missing = step_size <= 0
+
+                # Dust never pauses: both below min_qty or both below min_notional -> skip (do not add violation)
+                if min_qty > 0 and mem_qty < min_qty and canonical_qty < min_qty:
+                    continue
+                price = getattr(pos, "entry_price", 0) or 0
+                if min_notional > 0 and price > 0 and (mem_qty * price) < min_notional and (canonical_qty * price) < min_notional:
+                    continue
+
+                # SAFETY: When constraints missing, only allow DUST_DRIFT for trivially small quantities
+                if whether_constraints_missing:
+                    allow_drift = abs(mem_qty - canonical_qty) <= 1e-12 or (canonical_qty <= 1e-10 and mem_qty <= 1e-10)
+                    if not allow_drift:
+                        violations.append(f"QUANTITY_MISMATCH: {symbol} engine={mem_qty} canonical={canonical_qty} (constraints_missing_no_drift)")
+                        continue
+                    qty_epsilon = 1e-9  # covers both trivially-small cases
+                else:
+                    qty_epsilon = max(step_size / 2.0, 1e-12)
+
+                if abs(mem_qty - canonical_qty) <= qty_epsilon:
+                    # DUST_DRIFT: within quantization tolerance - do NOT pause trading
+                    self.dust_drift_events_total += 1
+                    logger.warning(
+                        "DUST_DRIFT: %s engine_qty=%.12g canonical_qty=%.12g step_size=%.12g epsilon=%.12g "
+                        "step_source=%s minQty=%.12g minNotional=%.2f whether_constraints_missing=%s status=%s (trading continues)",
+                        symbol,
+                        mem_qty,
+                        canonical_qty,
+                        step_size,
+                        qty_epsilon,
+                        step_source,
+                        min_qty,
+                        min_notional,
+                        whether_constraints_missing,
+                        getattr(pos, "status", "ACTIVE"),
+                    )
+                    continue
+                if abs(mem_qty - canonical_qty) > 0.0001:
+                    if await self._heal_paper_redis_qty_to_engine(symbol):
+                        canonical_after = (await self._get_canonical_positions()).get(symbol)
+                        if canonical_after is not None:
+                            canonical_qty = float(canonical_after)
+                        if abs(mem_qty - canonical_qty) <= qty_epsilon:
+                            continue
+                    violations.append(f"QUANTITY_MISMATCH: {symbol} engine={mem_qty} canonical={canonical_qty}")
+
+        # Invariant 5: Total open risk within cap
+        if self._total_open_risk > (self._total_equity * MAX_TOTAL_OPEN_RISK_PCT * 1.1):  # 10% tolerance
+            violations.append(f"RISK_CAP_EXCEEDED: open_risk=${self._total_open_risk:.2f} > cap=${self._total_equity * MAX_TOTAL_OPEN_RISK_PCT:.2f}")
+
+        # Invariant 6 (canonical): total_equity == cash_balance + positions_value (within $1)
+        calculated_equity = self.cash_balance + self._positions_value
+        equity_diff = abs(self._total_equity - calculated_equity)
+        if equity_diff > 1.0:
+            # Step 1: attempt reconcile from canonical SQLite
+            try:
+                await self._reconcile_derived_state_from_canonical()
+                calculated_equity = self.cash_balance + self._positions_value
+                equity_diff = abs(self._total_equity - calculated_equity)
+            except Exception as e:
+                logger.debug("INVARIANT: reconcile attempt failed: %s", e)
+            # Step 2: if still drifted, force canonical
+            if equity_diff > 1.0:
+                logger.warning(
+                    "EQUITY_HEAL: total_equity=%.2f drift from cash(%.2f)+positions(%.2f)=%.2f by %.2f - forcing canonical",
+                    self._total_equity,
+                    self.cash_balance,
+                    self._positions_value,
+                    calculated_equity,
+                    equity_diff,
+                )
+                self._total_equity = calculated_equity
+                await self._persist_ledger_to_sqlite()
+                # Recheck after forced assignment
+                calculated_equity = self.cash_balance + self._positions_value
+                equity_diff = abs(self._total_equity - calculated_equity)
+            if equity_diff > 1.0:
+                violations.append(f"EQUITY_MISMATCH: total_equity=${self._total_equity:.2f} != cash=${self.cash_balance:.2f} + positions_value=${self._positions_value:.2f} (diff=${equity_diff:.2f})")
+
+        account_equity = self.cash_balance + self._positions_value
+        performance_equity = self.principal + self._realized_pnl + self._unrealized_pnl
+        logger.debug(
+            "EQUITY_VIEWS [%s]: account_equity=%.2f (cash+positions) performance_equity=%.2f (principal+realized+unrealized) ledger_total_equity=%.2f",
+            context,
+            account_equity,
+            performance_equity,
+            self._total_equity,
+        )
+
+        if violations:
+            self.invariant_violations += len(violations)
+            for v in violations:
+                logger.error(f"INVARIANT_VIOLATION [{context}]: {v}")
+
+            # BUG #18 FIX: Ensure DUST_PENDING positions are never cause for pause
+            # Filter out any violations that would only apply to DUST_PENDING positions
+            non_dust_violations = []
+            for v in violations:
+                # Skip QUANTITY_MISMATCH for DUST_PENDING positions
+                if "QUANTITY_MISMATCH" in v and "DUST_PENDING" in str(v):
+                    logger.debug(f"BUG #18: Ignoring violation for DUST_PENDING: {v}")
+                    continue
+                non_dust_violations.append(v)
+
+            violations = non_dust_violations
+
+            if not violations:
+                logger.info("BUG #18: All violations were for DUST_PENDING positions, trading continues")
+                return True
+
+            # PHASE 5 FIX: More aggressive fail-closed behavior for CANONICAL_MISMATCH
+            recovered = False
+            canonical_violations = [v for v in violations if "CANONICAL_MISMATCH" in v]
+            if canonical_violations:
+                try:
+                    # Extract affected symbols from violation messages and quarantine them
+                    for violation in canonical_violations:
+                        # Parse symbols from "in_engine_not_positions={'SYM1', 'SYM2'}"
+                        import re
+
+                        engine_symbols = re.findall(r"in_engine_not_positions=\{([^}]+)\}", violation)
+                        position_symbols = re.findall(r"in_positions_not_engine=\{([^}]+)\}", violation)
+
+                        affected_symbols = set()
+                        for match in engine_symbols + position_symbols:
+                            # Clean up symbol names (remove quotes, split by comma)
+                            symbols = [s.strip().strip("'\"") for s in match.split(",") if s.strip().strip("'\"")]
+                            affected_symbols.update(symbols)
+
+                        # PHASE 5 FIX: Quarantine affected symbols to prevent immediate retrigger
+                        for symbol in affected_symbols:
+                            if symbol:  # Skip empty strings
+                                await self._quarantine_symbol(symbol, reason="canonical_mismatch", ttl_minutes=5)
+
+                    # CRITICAL: Pause trading globally during reconciliation
+                    logger.critical(f"CANONICAL_MISMATCH: Pausing all trading during reconciliation | Affected: {affected_symbols}")
+                    self._trading_paused = True
+                    self._pause_reason = f"CANONICAL_MISMATCH_RECONCILIATION: {len(canonical_violations)} violations"
+
+                    # Run reconciliation ONCE
+                    await self._sync_positions_with_paper_service()
+                    logger.info(f"INVARIANT_SYNC [{context}]: Ran bidirectional sync")
+
+                    # Validate reconciliation worked
+                    recovered = await self._recover_canonical_mismatch()
+                    if recovered:
+                        # Only resume if reconciliation fully succeeded
+                        self._trading_paused = False
+                        self._pause_reason = ""
+                        logger.info(f"INVARIANT_RECOVERY [{context}]: Canonical mismatch resolved, trading resumed")
+                        return True
+                    else:
+                        logger.critical(f"INVARIANT_RECOVERY [{context}]: Reconciliation FAILED - trading remains paused")
+
+                except Exception as e:
+                    logger.exception(f"INVARIANT_RECOVERY_FAILED [{context}]: {e}")
+                    # Ensure trading stays paused on recovery failure
+                    self._trading_paused = True
+
+            # BUG-020 Fix: Pause trading on invariant violation (CRITICAL)
+            # This prevents further damage if ledger is inconsistent
+            self._trading_paused = True
+            self._pause_reason = f"INVARIANT_VIOLATION: {violations[0]}"  # First violation
+            self._account_status = AccountStatus.OVERALLOCATED
+
+            logger.critical("TRADING_PAUSED: Invariant violation detected, pausing all trading until manual intervention")
+            logger.critical(f"PAUSE_REASON: {self._pause_reason}")
+
+            # Persist paused state to database so it survives restart
+            try:
+                await self._persist_ledger_to_sqlite()
+            except Exception as e:
+                logger.exception(f"Failed to persist paused state: {e}")
+
+            return False
+
+        logger.debug(f"INVARIANTS_OK [{context}]: {len(self.open_positions)} positions, ${self.cash_balance:.2f} cash, equity=${self._total_equity:.2f}")
+        return True
+
+    async def run_dust_reconciliation(self, current_prices: dict[str, float] | None = None) -> None:
+        """
+        === DUST_INVARIANT_LOCK ===
+        Cooldown-gated dust reconciliation. For each DUST_PENDING position:
+        - Pull canonical balance from Binance (or paper sync source)
+        - Recompute if still dust using stepSize/minNotional
+        - If still dust: keep DUST_PENDING (do NOT pause trading)
+        - If becomes tradable: restore to ACTIVE
+        DO NOT MODIFY. Binance.US dust must not block trading.
+        No Binance.US convert-dust; dust stays as base asset (6h cooldown). See LIVE_RECONCILE_PROOF.md.
+        === END DUST_INVARIANT_LOCK ===
+        """
+        if not self._live_execution_enabled or not self._live_service:
+            return
+        dust_pending = [(s, p) for s, p in self.open_positions.items() if getattr(p, "status", "ACTIVE") == "DUST_PENDING"]
+        if len(dust_pending) > 0:
+            self.dust_reconcile_runs_total += 1
+        if not dust_pending:
+            return
+        try:
+            # CRITICAL: Fetch balances ONCE per run (single API call), then reconcile all DUST_PENDING from snapshot
+            balance_result = await self._live_service.get_balance("binanceus")
+            if balance_result.get("status") != "success":
+                return
+            total_balances = balance_result.get("balance", {}).get("total") or {}
+            prices = current_prices or {}
+            for symbol, position in dust_pending:
+                base_coin = symbol.split("/")[0]
+                canonical_qty = float(total_balances.get(base_coin, 0) or 0)
+                price = float(prices.get(symbol, 0) or 0)
+                if price <= 0 and self._paper_service and symbol in getattr(self._paper_service, "positions", {}):
+                    price = float(getattr(self._paper_service.positions[symbol], "current_price", 0) or 0)
+                if price <= 0:
+                    # BUG #3 FIX: Log when falling back to entry price due to missing current price
+                    logger.warning(f"BUG #3: Missing price for {symbol} in dust reconciliation, using entry_price={position.entry_price}")
+                    price = position.entry_price
+                await self._ensure_symbol_constraints(symbol)
+                is_dust, _, _, _ = self._dust_check(symbol, canonical_qty, price)
+                if is_dust:
+                    position.dust_qty_canonical = canonical_qty
+                    if canonical_qty <= 0:
+                        await self._remove_dust_position_canonical_cleanup(symbol, position)
+                        logger.warning("DUST_PENDING_EXIT: %s balance=0 removed from engine", symbol)
+                    else:
+                        logger.debug("DUST_RECONCILE: %s still dust qty=%.12g (keep DUST_PENDING)", symbol, canonical_qty)
+                    continue
+                position.status = "ACTIVE"
+                position.dust_detected_at = 0.0
+                position.dust_qty_canonical = 0.0
+                position.quantity = canonical_qty  # Sync to canonical
+                logger.warning("DUST_PENDING_EXIT: %s qty=%.12g restored to ACTIVE (now tradable)", symbol, canonical_qty)
+        except Exception as e:
+            logger.warning("DUST_RECONCILE_ERROR: %s", e)
+
+    async def _recover_canonical_mismatch(self) -> bool:
+        """
+        Attempt to recover from canonical mismatch by syncing positions between
+        engine memory and paper service.
+        Returns True if recovery successful.
+        """
+        try:
+            # Get current canonical positions (snapshot to avoid race conditions)
+            canonical_positions = await self._get_canonical_positions()
+
+            # Find mismatches
+            memory_symbols = set(self.open_positions.keys())
+            canonical_symbols = set(canonical_positions.keys())
+
+            missing_in_memory = canonical_symbols - memory_symbols
+            missing_in_engine = memory_symbols - canonical_symbols
+
+            logger.info(f"CANONICAL_RECOVERY: missing_in_memory={missing_in_memory}, missing_in_engine={missing_in_engine}")
+
+            # If there are positions to adopt, do it
+            if missing_in_memory and self._paper_service:
+                for symbol in missing_in_memory:
+                    try:
+                        pos = self._paper_service.positions.get(symbol)
+                        if pos and pos.quantity > 0:
+                            # Check if position still exists and hasn't changed
+                            current_canonical = await self._get_canonical_positions()
+                            if symbol in current_canonical and abs(current_canonical[symbol] - pos.quantity) < 0.001:
+                                # Adopt this position into engine memory
+                                await self._adopt_single_position(symbol, pos)
+                                logger.info(f"CANONICAL_RECOVERY: Adopted {symbol} qty={pos.quantity} from paper service")
+                            else:
+                                logger.warning(f"CANONICAL_RECOVERY: Position {symbol} changed during recovery, skipping")
+                    except Exception as e:
+                        logger.exception(f"CANONICAL_RECOVERY: Failed to adopt {symbol}: {e}")
+                        return False
+
+            # NEVER remove positions that exist in engine but not in canonical
+            # This usually indicates the paper service hasn't recorded the trade yet
+            # These positions are pending sync and should not be removed
+            if missing_in_engine:
+                logger.info(f"CANONICAL_RECOVERY: Found {len(missing_in_engine)} positions pending canonical sync - will not remove")
+                # Keep these positions - they are likely legitimate trades pending paper service sync
+
+            # Re-validate after recovery - be more lenient
+            canonical_positions_after = await self._get_canonical_positions()
+            memory_after = set(self.open_positions.keys())
+            canonical_after = set(canonical_positions_after.keys())
+
+            # Check what we actually resolved
+            still_missing_in_memory = missing_in_memory - canonical_after  # Positions we tried to adopt but failed
+            still_pending_in_engine = missing_in_engine & memory_after  # Positions still waiting for canonical sync
+
+            if not still_missing_in_memory:
+                # Successfully adopted all missing positions
+                if still_pending_in_engine:
+                    logger.info(f"CANONICAL_RECOVERY: Adopted all missing positions, {len(still_pending_in_engine)} positions still pending canonical sync")
+                else:
+                    logger.info("CANONICAL_RECOVERY: All mismatches resolved")
+                return True
+            else:
+                logger.warning(f"CANONICAL_RECOVERY: Failed to adopt {len(still_missing_in_memory)} positions: {still_missing_in_memory}")
+                return False
+
+        except Exception as e:
+            logger.exception(f"CANONICAL_RECOVERY: Unexpected error: {e}")
+            return False
+
+    async def _adopt_single_position(self, symbol: str, paper_position) -> None:
+        """
+        Adopt a single position from paper service into engine memory.
+        Used for canonical mismatch recovery.
+        """
+        normalized_symbol = normalize_symbol(symbol)
+
+        open_row = await asyncio.to_thread(self._fetch_authoritative_open_position_sync, normalized_symbol)
+        if not open_row:
+            logger.warning(
+                "ADOPT_BLOCKED: %s not in portfolio_engine_positions — refusing stale paper/Redis resurrect",
+                normalized_symbol,
+            )
+            return
+
+        quantity, trade_id, entry_price = open_row
+        quantity = float(quantity)
+        entry_price = float(entry_price)
+        current_price = float(paper_position.current_price)
+        highest_price = getattr(paper_position, "highest_price_since_entry", current_price)
+
+        # Calculate stop/TP levels
+        stop_distance = entry_price * 0.015
+        stop_price = entry_price - stop_distance
+        tp1_price = entry_price + (stop_distance * TP1_R_MULTIPLE)
+        tp2_price = entry_price + (stop_distance * TP2_R_MULTIPLE)
+
+        entry_time = paper_position.created_at.timestamp() if hasattr(paper_position, "created_at") else time.time()
+
+        atr_infer = stop_distance / MAJOR_COIN_ATR_SL_MULT if normalized_symbol in MAJOR_COINS else stop_distance / ATR_MULTIPLIER
+        position = OpenPosition(
+            symbol=normalized_symbol,
+            quantity=quantity,
+            entry_price=entry_price,
+            entry_time=entry_time,
+            trade_id=trade_id,
+            stop_price=stop_price,
+            take_profit_1_price=tp1_price,
+            take_profit_2_price=tp2_price,
+            highest_price=highest_price,
+            atr_at_entry=atr_infer,
+            entry_bar_timestamp=0,
+            confidence_at_entry=0.5,
+        )
+
+        self.open_positions[normalized_symbol] = position
+        await self._persist_position_to_sqlite(position)
+        logger.info(f"POSITION_RECOVERED: {normalized_symbol} qty={quantity:.6f} entry=${entry_price:.4f}")
+
+    async def _refresh_paper_redis_marks(self, prices: dict[str, float] | None = None) -> None:
+        """Paper mode: mirror live marks + repair metadata to Redis after MTM recompute."""
+        if self.test_mode or self._live_execution_enabled or not self.open_positions:
+            return
+        try:
+            from datetime import datetime, timezone
+
+            from backend.services.paper_trading_service import PaperPosition, get_paper_trading_service
+
+            resolved = dict(prices or {})
+            if not resolved:
+                resolved = self._resolve_mtm_prices(None) or {}
+            if not resolved:
+                return
+
+            paper = self._paper_service or get_paper_trading_service()
+            self._paper_service = paper
+            await paper._ensure_redis()
+            now = datetime.now(timezone.utc)
+
+            for raw_sym, eng_pos in self.open_positions.items():
+                sym = normalize_symbol(str(raw_sym))
+                qty_f = float(eng_pos.quantity or 0)
+                entry_f = float(eng_pos.entry_price or 0)
+                if qty_f <= 0 or entry_f <= 0:
+                    continue
+                mark = float(resolved.get(sym) or resolved.get(raw_sym) or 0)
+                if mark <= 0:
+                    mark = entry_f
+                unreal = (mark - entry_f) * qty_f
+                repair_cnt = int(getattr(eng_pos, "repair_add_count", 0) or 0)
+                repair_ts = float(getattr(eng_pos, "last_repair_add_ts", 0) or 0)
+                strategy_id = str(getattr(eng_pos, "entry_strategy_id", "") or "day")
+                sleeve = str(getattr(eng_pos, "sleeve", "ACTIVE") or "ACTIVE")
+
+                ppos = paper.positions.get(sym)
+                if ppos:
+                    ppos.quantity = qty_f
+                    ppos.average_price = entry_f
+                    ppos.current_price = mark
+                    ppos.unrealized_pnl = unreal
+                    ppos.last_updated = now
+                    ppos.sleeve = sleeve
+                else:
+                    try:
+                        entry_dt = datetime.fromtimestamp(float(eng_pos.entry_time), tz=timezone.utc)
+                    except (TypeError, ValueError, OSError):
+                        entry_dt = now
+                    ppos = PaperPosition(
+                        symbol=sym,
+                        quantity=qty_f,
+                        average_price=entry_f,
+                        current_price=mark,
+                        unrealized_pnl=unreal,
+                        realized_pnl=0.0,
+                        created_at=entry_dt,
+                        last_updated=now,
+                        sleeve=sleeve,
+                    )
+                    paper.positions[sym] = ppos
+
+                ppos.repair_add_count = repair_cnt
+                ppos.last_repair_add_ts = repair_ts
+                ppos.entry_strategy_id = strategy_id
+                await paper._persist_position_to_redis(sym, ppos)
+        except Exception as exc:
+            logger.debug("PAPER_REDIS_MARK_REFRESH failed: %s", exc)
+
+    async def _sync_paper_redis_from_sqlite_authoritative(self) -> None:
+        """
+        Paper mode self-heal: SQLite ``portfolio_engine_positions`` and ``portfolio_engine_ledger``
+        are authoritative. Refresh PaperTradingService memory + Redis from SQLite so closed symbols,
+        cash, and realized PnL cannot linger after engine-direct writes (repair, idempotent sell reject).
+        """
+        if self.test_mode or self._live_execution_enabled:
+            return
+        try:
+            from datetime import datetime, timezone
+
+            from backend.services.paper_trading_service import PaperPosition, get_paper_trading_service
+
+            paper = self._paper_service or get_paper_trading_service()
+            self._paper_service = paper
+            await paper._ensure_redis()
+
+            def _load_authoritative() -> tuple[list[tuple], tuple[float, float] | None]:
+                with connect_rw(self.db_path) as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT symbol, quantity, entry_price, entry_time,
+                               COALESCE(repair_add_count, 0), COALESCE(last_repair_add_ts, 0),
+                               COALESCE(entry_strategy_id, 'day'), COALESCE(sleeve, 'ACTIVE')
+                        FROM portfolio_engine_positions
+                        WHERE quantity > 0
+                        ORDER BY symbol
+                        """
+                    ).fetchall()
+                    ledger = conn.execute("SELECT cash_balance, realized_pnl FROM portfolio_engine_ledger WHERE id = 1").fetchone()
+                return rows, ledger
+
+            rows, ledger_row = await asyncio.to_thread(_load_authoritative)
+            open_symbols: set[str] = set()
+            changes: list[str] = []
+            now = datetime.now(timezone.utc)
+            resolved = self._resolve_mtm_prices(None) or {}
+
+            for raw_sym, qty, entry, entry_time, repair_cnt, repair_ts, strategy_id, sleeve in rows:
+                sym = normalize_symbol(str(raw_sym))
+                open_symbols.add(sym)
+                qty_f = float(qty or 0)
+                entry_f = float(entry or 0)
+                if qty_f <= 0:
+                    continue
+                mark = float(resolved.get(sym) or 0)
+                if mark <= 0:
+                    mark = entry_f
+                unreal = (mark - entry_f) * qty_f
+                try:
+                    entry_dt = datetime.fromtimestamp(float(entry_time), tz=timezone.utc)
+                except (TypeError, ValueError, OSError):
+                    entry_dt = now
+                existing = paper.positions.get(sym)
+                if existing:
+                    drift = (
+                        abs(float(existing.quantity) - qty_f) > 1e-9
+                        or abs(float(existing.average_price) - entry_f) > 1e-6
+                        or abs(float(existing.current_price) - mark) > 1e-6
+                        or int(getattr(existing, "repair_add_count", -1)) != int(repair_cnt or 0)
+                    )
+                    existing.quantity = qty_f
+                    existing.average_price = entry_f
+                    existing.current_price = mark
+                    existing.unrealized_pnl = unreal
+                    existing.last_updated = now
+                    existing.sleeve = str(sleeve or "ACTIVE")
+                    existing.repair_add_count = int(repair_cnt or 0)
+                    existing.last_repair_add_ts = float(repair_ts or 0)
+                    existing.entry_strategy_id = str(strategy_id or "day")
+                    paper_pos = existing
+                else:
+                    drift = True
+                    paper_pos = PaperPosition(
+                        symbol=sym,
+                        quantity=qty_f,
+                        average_price=entry_f,
+                        current_price=mark,
+                        unrealized_pnl=unreal,
+                        realized_pnl=0.0,
+                        created_at=entry_dt,
+                        last_updated=now,
+                        sleeve=str(sleeve or "ACTIVE"),
+                    )
+                    paper_pos.repair_add_count = int(repair_cnt or 0)
+                    paper_pos.last_repair_add_ts = float(repair_ts or 0)
+                    paper_pos.entry_strategy_id = str(strategy_id or "day")
+                    paper.positions[sym] = paper_pos
+                await paper._persist_position_to_redis(sym, paper_pos)
+                if drift:
+                    changes.append(f"sync {sym} qty={qty_f:.8f} mark={mark:.4f}")
+
+            active_raw = await paper.redis_client.smembers("paper:positions:active") if paper.redis_client else set()
+            active_symbols = {(s.decode() if isinstance(s, (bytes, bytearray)) else str(s)) for s in (active_raw or [])}
+            for stale_sym in sorted(active_symbols - open_symbols):
+                paper.positions.pop(stale_sym, None)
+                await paper._delete_position_from_redis(stale_sym)
+                changes.append(f"removed stale {stale_sym}")
+
+            if ledger_row:
+                cash_f = float(ledger_row[0] or 0)
+                realized_f = float(ledger_row[1] or 0)
+                if abs(float(paper.current_balance) - cash_f) > 0.01:
+                    paper.current_balance = cash_f
+                    await paper._persist_cash_balance_to_redis()
+                    changes.append(f"cash={cash_f:.2f}")
+                if abs(float(paper.realized_pnl_total) - realized_f) > 0.01:
+                    paper.realized_pnl_total = realized_f
+                    await paper._persist_realized_pnl_total_to_redis()
+                    changes.append(f"realized={realized_f:.2f}")
+
+            if paper.redis_client and not self._live_execution_enabled:
+                cleared_live = 0
+                async for raw_key in paper.redis_client.scan_iter(match="live_position:*"):
+                    await paper.redis_client.delete(raw_key)
+                    cleared_live += 1
+                if cleared_live:
+                    await paper.redis_client.set("live_position_count", "0")
+                    changes.append(f"cleared {cleared_live} live_position keys")
+
+            if changes:
+                logger.info("PAPER_REDIS_HEAL: %s", "; ".join(changes))
+        except Exception as e:
+            logger.warning("PAPER_REDIS_HEAL failed: %s", e, exc_info=True)
+
+    async def _heal_paper_redis_qty_to_engine(self, symbol: str) -> bool:
+        """
+        Paper mode only: align PaperTradingService (Redis) quantity to engine when they drift.
+        FIFO reconcile updates SQLite ``paper_trades`` and engine positions but can leave Redis
+        stale; invariants then see QUANTITY_MISMATCH and pause buys.
+        """
+        if self.test_mode or self._live_execution_enabled:
+            return False
+        try:
+            from datetime import datetime, timezone
+
+            from backend.services.paper_trading_service import get_paper_trading_service
+
+            eng = self.open_positions.get(symbol)
+            if not eng or float(eng.quantity or 0) <= 0:
+                return False
+            ps = self._paper_service or get_paper_trading_service()
+            await ps._ensure_redis()
+            if not ps.positions:
+                await ps._load_positions_from_redis()
+            ppos = ps.positions.get(symbol)
+            if not ppos:
+                return False
+            target = float(eng.quantity)
+            if abs(float(ppos.quantity) - target) <= 1e-12:
+                return False
+            old = float(ppos.quantity)
+            ppos.quantity = target
+            ppos.average_price = float(eng.entry_price or ppos.average_price)
+            ppos.repair_add_count = int(getattr(eng, "repair_add_count", 0) or 0)
+            ppos.last_repair_add_ts = float(getattr(eng, "last_repair_add_ts", 0) or 0)
+            ppos.entry_strategy_id = str(getattr(eng, "entry_strategy_id", "") or "day")
+            ppos.last_updated = datetime.now(timezone.utc)
+            await ps._persist_position_to_redis(symbol, ppos)
+            logger.warning(
+                "HEAL_PAPER_QTY_MISMATCH: %s paper_redis_qty=%.8f -> engine_qty=%.8f",
+                symbol,
+                old,
+                target,
+            )
+            return True
+        except Exception as e:
+            logger.warning("HEAL_PAPER_QTY_MISMATCH failed %s: %s", symbol, e)
+            return False
+
+    async def _get_canonical_positions(self) -> dict[str, float]:
+        """
+        Get open positions from canonical source for invariants.
+        LIVE: canonical = engine state (exchange-aligned DB post-reconcile). Paper/Redis are sync-only, not canonical.
+        PAPER: canonical = portfolio_engine_positions SQLite (authoritative engine rows), with PaperTradingService fallback.
+        """
+        if self._live_execution_enabled:
+            # LIVE: invariants must not pause due to Paper/Redis drift. Canonical = engine (already reconciled to Binance).
+            return {s: float(p.quantity) for s, p in self.open_positions.items() if p.quantity > 0}
+
+        def _load_sqlite_positions() -> dict[str, float]:
+            try:
+                with connect_rw(self.db_path) as conn:
+                    rows = conn.execute("SELECT symbol, quantity FROM portfolio_engine_positions WHERE quantity > 0").fetchall()
+                return {str(sym): float(qty) for sym, qty in rows if float(qty) > 0}
+            except Exception as e:
+                logger.debug("canonical positions sqlite load failed: %s", e)
+                return {}
+
+        def _sqlite_positions_table_exists() -> bool:
+            try:
+                with connect_rw(self.db_path) as conn:
+                    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='portfolio_engine_positions' LIMIT 1").fetchone()
+                return row is not None
+            except Exception:
+                return False
+
+        sqlite_positions = await asyncio.to_thread(_load_sqlite_positions)
+        if await asyncio.to_thread(_sqlite_positions_table_exists):
+            return sqlite_positions
+
+        try:
+            from backend.services.paper_trading_service import get_paper_trading_service
+
+            paper_service = get_paper_trading_service()
+
+            # Ensure positions are loaded from Redis
+            if not paper_service.positions:
+                await paper_service._ensure_redis()
+                await paper_service._load_positions_from_redis()
+
+            # Extract symbol -> quantity mapping
+            result = {}
+            for symbol, pos in paper_service.positions.items():
+                qty = float(pos.quantity)
+                if qty > 0:
+                    result[symbol] = qty
+
+            return result
+
+        except Exception as e:
+            logger.warning(f"Failed to get canonical positions: {e}")
+            # Return empty if service unavailable (invariant will pass on empty)
+            return {}
+
+    def get_adoption_debug_info(self) -> dict[str, Any]:
+        """
+        Get debug info for /api/portfolio-engine/debug/adoption endpoint.
+        Returns snapshot of adopted portfolio and positions.
+
+        INVARIANT: total_equity = cash_balance + positions_value + unrealized_pnl
+        """
+        positions_snapshot = []
+        for symbol, pos in self.open_positions.items():
+            positions_snapshot.append(
+                {
+                    "symbol": symbol,
+                    "quantity": pos.quantity,
+                    "entry_price": pos.entry_price,
+                    "risk_usd": pos.risk_usd,
+                    "trade_id": pos.trade_id,
+                }
+            )
+
+        # Verify equity invariant: total_equity == cash + positions_value
+        equity_check = self.cash_balance + self._positions_value
+        equity_diff = abs(self._total_equity - equity_check)
+
+        return {
+            "portfolio": {
+                "cash_balance": self.cash_balance,
+                "positions_value": self._positions_value,  # EXPLICIT
+                "total_equity": self._total_equity,
+                "equity_invariant_ok": equity_diff < 1.0,
+                "equity_check": equity_check,
+                "principal": self.principal,
+                "available_balance": self._available_balance,
+                "realized_pnl": self._realized_pnl,
+                "unrealized_pnl": self._unrealized_pnl,
+                "total_open_risk": self._total_open_risk,
+            },
+            "positions": positions_snapshot,
+            "positions_count": len(self.open_positions),
+            "symbols": list(self.open_positions.keys()),
+            "db_path": os.path.abspath(self.db_path),
+            "invariant_violations": self.invariant_violations,
+        }
+
+    # =========================================================================
+    # ITEM 1: KILL SWITCH (instant stop)
+    # =========================================================================
+
+    async def set_kill_switch(self, mode: str, reason: str = "") -> dict[str, Any]:
+        """
+        Set kill switch mode (PAUSE_ALL, PAUSE_BUYS, or RESUME).
+        Persists to ledger for restart safety.
+        """
+        try:
+            new_mode = KillSwitchMode(mode)
+        except ValueError:
+            return {"success": False, "error": f"Invalid mode: {mode}"}
+
+        old_mode = self._kill_switch_mode
+        self._kill_switch_mode = new_mode
+        self._kill_switch_reason = reason
+
+        # Persist to SQLite
+        await self._persist_kill_switch()
+
+        logger.warning(f"KILL_SWITCH: {old_mode.value} -> {new_mode.value} | reason: {reason} | timestamp: {datetime.now(timezone.utc).isoformat()}")
+
+        return {
+            "success": True,
+            "old_mode": old_mode.value,
+            "new_mode": new_mode.value,
+            "reason": reason,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    async def _persist_kill_switch(self) -> None:
+        """Persist kill switch state to SQLite"""
+
+        def _sync_persist():
+            def _op() -> None:
+                with connect_rw(self.db_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        UPDATE portfolio_engine_ledger
+                        SET kill_switch_mode = ?, kill_switch_reason = ?, last_updated = ?
+                        WHERE id = 1
+                    """,
+                        (
+                            self._kill_switch_mode.value,
+                            self._kill_switch_reason,
+                            datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+                    conn.commit()
+
+            run_locked_retry(_op)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _sync_persist)
+
+    def _check_kill_switch_buy(self) -> tuple[bool, str]:
+        """Check if buy is blocked by kill switch"""
+        if self._kill_switch_mode == KillSwitchMode.PAUSE_ALL:
+            return False, f"KILL_SWITCH_PAUSE_ALL: {self._kill_switch_reason}"
+        if self._kill_switch_mode == KillSwitchMode.PAUSE_BUYS:
+            return False, f"KILL_SWITCH_PAUSE_BUYS: {self._kill_switch_reason}"
+        return True, ""
+
+    def _check_kill_switch_sell(self) -> tuple[bool, str]:
+        """Check if sell is blocked by kill switch"""
+        if self._kill_switch_mode == KillSwitchMode.PAUSE_ALL:
+            return False, f"KILL_SWITCH_PAUSE_ALL: {self._kill_switch_reason}"
+        return True, ""
+
+    def get_kill_switch_status(self) -> dict[str, Any]:
+        """Get current kill switch status"""
+        return {
+            "mode": self._kill_switch_mode.value,
+            "reason": self._kill_switch_reason,
+            "buys_blocked": self._kill_switch_mode != KillSwitchMode.RESUME,
+            "sells_blocked": self._kill_switch_mode == KillSwitchMode.PAUSE_ALL,
+        }
+
+    # =========================================================================
+    # ITEM 2: HEALTH PACK ENDPOINT
+    # =========================================================================
+
+    def get_execution_protection_state(self) -> dict[str, Any]:
+        from backend.config.live_test_mode import get_live_test_api_fields
+        from backend.services.protected_limit_execution import get_last_execution_protection_state
+
+        state = get_last_execution_protection_state(taker_fee=TAKER_FEE)
+        state.update(get_live_test_api_fields())
+        return state
+
+    async def get_health_pack(self, decisions: int = 50, rejects: int = 50, errors: int = 50) -> dict[str, Any]:
+        """
+        Get comprehensive health pack snapshot for daily monitoring.
+        """
+        # Ledger snapshot
+        ledger = {
+            "principal": self.principal,
+            "cash_balance": self.cash_balance,
+            "positions_value": self._positions_value,
+            "total_equity": self._total_equity,
+            "realized_pnl": self._realized_pnl,
+            "unrealized_pnl": self._unrealized_pnl,
+            "account_status": self._account_status.value,
+            "trading_paused": self._trading_paused,
+            "pause_reason": self._pause_reason,
+            "kill_switch_mode": self._kill_switch_mode.value,
+            "kill_switch_reason": self._kill_switch_reason,
+        }
+
+        # Open positions
+        positions = []
+        for sym, pos in self.open_positions.items():
+            positions.append(
+                {
+                    "symbol": sym,
+                    "quantity": pos.quantity,
+                    "entry_price": pos.entry_price,
+                    "highest_price": pos.highest_price,
+                    "risk_usd": pos.risk_usd,
+                    "entry_time": pos.entry_time,
+                    "trade_id": pos.trade_id,
+                }
+            )
+
+        # Risk metrics
+        equity_check = self.cash_balance + self._positions_value
+        equity_diff = abs(self._total_equity - equity_check)
+        risk_metrics = {
+            "total_open_risk": self._total_open_risk,
+            "max_risk_cap": self._total_equity * MAX_TOTAL_OPEN_RISK_PCT,
+            "risk_cap_pct_used": (self._total_open_risk / (self._total_equity * MAX_TOTAL_OPEN_RISK_PCT) * 100) if self._total_equity > 0 else 0,
+            "equity_invariant_ok": equity_diff < 1.0,
+            "equity_diff": equity_diff,
+            "overallocated": self._account_status == AccountStatus.OVERALLOCATED,
+        }
+
+        # Get last N decisions/rejects from DB
+        decisions_list = await self._get_recent_audit(decisions)
+        rejects_list = await self._get_recent_rejects(rejects)
+
+        # Uptime
+        uptime_seconds = time.time() - self._startup_timestamp
+
+        return {
+            "ledger": ledger,
+            "positions": positions,
+            "positions_count": len(positions),
+            "risk_metrics": risk_metrics,
+            "regime_state": self._regime_state.to_dict(),
+            "recent_decisions": decisions_list,
+            "recent_rejects": rejects_list,
+            "execution_protection": self.get_execution_protection_state(),
+            "uptime_seconds": uptime_seconds,
+            "uptime_formatted": f"{int(uptime_seconds // 3600)}h {int((uptime_seconds % 3600) // 60)}m",
+            "startup_timestamp": datetime.fromtimestamp(self._startup_timestamp, timezone.utc).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    async def _get_recent_rejects(self, limit: int) -> list[dict]:
+        """Get recent reject records from DB"""
+
+        def _sync_get():
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT ts, symbol, side, reason, filter_name, candidate_score_json
+                    FROM portfolio_engine_rejects
+                    ORDER BY id DESC LIMIT ?
+                """,
+                    (limit,),
+                )
+                rows = cursor.fetchall()
+                return rows
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        rows = await loop.run_in_executor(None, _sync_get)
+
+        return [
+            {
+                "ts": row[0],
+                "symbol": row[1],
+                "side": row[2],
+                "reason": row[3],
+                "filter_name": row[4],
+                "candidate_score": json.loads(row[5]) if row[5] else None,
+            }
+            for row in rows
+        ]
+
+    async def _record_reject(
+        self,
+        symbol: str,
+        side: str,
+        reason: str,
+        filter_name: str | None = None,
+        candidate: BuyCandidate | None = None,
+        *,
+        decision_id: str | None = None,
+        explainability: TradeExplainability | None = None,
+        audit_context_extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a rejected trade attempt"""
+
+        def _sync_insert():
+            def _op():
+                with connect_rw(self.db_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.cursor()
+
+                    candidate_json = None
+                    if candidate:
+                        candidate_json = json.dumps(
+                            {
+                                "confidence": candidate.confidence,
+                                "trend_score": candidate.trend_score,
+                                "chop_score": candidate.chop_score,
+                                "coin_edge_score": candidate.coin_edge_score,
+                                "composite_score": candidate.composite_score,
+                            }
+                        )
+
+                    ledger_json = json.dumps(
+                        {
+                            "cash_balance": self.cash_balance,
+                            "positions_value": self._positions_value,
+                            "total_equity": self._total_equity,
+                        }
+                    )
+
+                    cursor.execute(
+                        """
+                        INSERT INTO portfolio_engine_rejects
+                        (ts, symbol, side, reason, filter_name, candidate_score_json, ledger_snapshot_json, bar_timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            datetime.now(timezone.utc).isoformat(),
+                            symbol,
+                            side,
+                            reason,
+                            filter_name,
+                            candidate_json,
+                            ledger_json,
+                            self.last_bar_timestamp,
+                        ),
+                    )
+                    conn.commit()
+
+            run_locked_retry(_op)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _sync_insert)
+
+        if side.upper() == "BUY":
+            try:
+                from backend.services.strategy_runtime_audit import EVT_BUY_REJECT, insert_audit_row_async
+
+                rr = f"{filter_name}|{reason}" if filter_name else str(reason)
+                ex: dict[str, Any] = {
+                    "filter_name": filter_name,
+                    "reason_detail": reason,
+                }
+                if audit_context_extra:
+                    ex.update(audit_context_extra)
+                if explainability is not None:
+                    ex["ctx_ts_utc"] = str(getattr(explainability, "ctx_ts_utc", "") or "")
+                    ex["ctx_age_sec"] = float(getattr(explainability, "ctx_age_sec", -1.0))
+                _sid = _apath = _ahash = None
+                _fv = _fd = None
+                if explainability:
+                    _sid = str(getattr(explainability, "live_ai_strategy", "") or "") or None
+                    _apath = str(getattr(explainability, "artifact_path", "") or "") or None
+                    _ahash = str(getattr(explainability, "artifact_sha256", "") or "") or None
+                    _fv = int(getattr(explainability, "feature_version", 0) or 0) or None
+                    _fd = int(getattr(explainability, "feature_dim", 0) or 0) or None
+                await insert_audit_row_async(
+                    event_type=EVT_BUY_REJECT,
+                    decision_id=decision_id or None,
+                    strategy_id=_sid,
+                    symbol=symbol,
+                    reject_reason=rr,
+                    artifact_path=_apath,
+                    artifact_sha256=_ahash,
+                    feature_version=_fv,
+                    feature_dim=_fd,
+                    extra_json=ex,
+                )
+            except Exception:
+                logger.debug("strategy_runtime_audit BUY_REJECT skipped", exc_info=True)
+
+            with contextlib.suppress(Exception):
+                from backend.services.ai_missed_opportunity_observer import record_missed_opportunity_observation
+
+                block = str(filter_name or reason or "")
+                active_count = sum(1 for p in self.open_positions.values() if float(getattr(p, "quantity", 0) or 0) > 0)
+                record_missed_opportunity_observation(
+                    block_reason=block,
+                    attempted_symbol=symbol,
+                    active_positions=active_count,
+                    max_positions=MAX_OPEN_POSITIONS,
+                    db_path=self.db_path,
+                )
+
+    # =========================================================================
+    # ITEM 3: IMMUTABLE AUDIT TRAIL
+    # =========================================================================
+
+    def _audit_writes_allowed(self) -> bool:
+        """Production always audits; isolated test engines may audit copied DB only."""
+        if not getattr(self, "test_mode", False):
+            return True
+        try:
+            return os.path.realpath(self.db_path) != os.path.realpath(DATABASE_PATH)
+        except (OSError, ValueError):
+            return False
+
+    async def _record_audit(
+        self,
+        action: str,
+        symbol: str,
+        qty: float,
+        price: float,
+        fees: float,
+        slippage: float,
+        trade_id: str,
+        pre_ledger: dict,
+        post_ledger: dict,
+        ranked_candidates: list | None = None,
+        entry_reason: str | None = None,
+        exit_reason: str | None = None,
+        realized_pnl: float | None = None,
+        sleeve: str | None = None,
+    ) -> None:
+        """Record immutable audit entry (append-only)"""
+        if not self._audit_writes_allowed():
+            return
+
+        _pnl = realized_pnl
+
+        def _sync_insert():
+            def _op():
+                with connect_rw(self.db_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.cursor()
+
+                    existing = cursor.execute(
+                        "SELECT id FROM portfolio_engine_audit WHERE trade_id = ? AND action = ? LIMIT 1",
+                        (trade_id, action),
+                    ).fetchone()
+                    if existing:
+                        conn.commit()
+                        return
+
+                    pre_digest = self._compute_positions_digest()
+
+                    # For SELLs, store realized_pnl in invariant_diff for scoreboard win/loss tracking
+                    if action == "SELL" and _pnl is not None:
+                        invariant_ok = True
+                        invariant_diff = _pnl
+                    else:
+                        invariant_ok = abs(post_ledger["total_equity"] - (post_ledger["cash_balance"] + post_ledger["positions_value"] + post_ledger.get("unrealized_pnl", 0))) < 1.0
+                        invariant_diff = post_ledger["total_equity"] - (post_ledger["cash_balance"] + post_ledger["positions_value"] + post_ledger.get("unrealized_pnl", 0))
+
+                    _sleeve_val = sleeve or Sleeve.ACTIVE.value
+                    cursor.execute(
+                        """
+                        INSERT INTO portfolio_engine_audit (
+                            ts, action, symbol, qty, price, fees, slippage,
+                            decision_id, trade_id, ranked_candidates_json,
+                            pre_ledger_json, post_ledger_json,
+                            pre_positions_digest, post_positions_digest,
+                            invariant_ok, invariant_diff, entry_reason, exit_reason, sleeve
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            datetime.now(timezone.utc).isoformat(),
+                            action,
+                            symbol,
+                            qty,
+                            price,
+                            fees,
+                            slippage,
+                            None,  # decision_id
+                            trade_id,
+                            json.dumps(ranked_candidates[:10] if ranked_candidates else []),
+                            json.dumps(pre_ledger),
+                            json.dumps(post_ledger),
+                            pre_digest,
+                            self._compute_positions_digest(),  # post digest
+                            1 if invariant_ok else 0,
+                            invariant_diff,
+                            entry_reason,
+                            exit_reason,
+                            _sleeve_val,
+                        ),
+                    )
+                    conn.commit()
+
+            run_locked_retry(_op)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _sync_insert)
+
+    def _compute_positions_digest(self) -> str:
+        """Compute hash of open positions for audit"""
+        import hashlib
+
+        pos_str = json.dumps({s: p.quantity for s, p in sorted(self.open_positions.items())}, sort_keys=True)
+        return hashlib.md5(pos_str.encode()).hexdigest()[:16]
+
+    async def _get_recent_audit(self, limit: int) -> list[dict]:
+        """Get recent audit records"""
+
+        def _sync_get():
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT id, ts, action, symbol, qty, price, fees, slippage, trade_id,
+                           invariant_ok, invariant_diff, entry_reason, exit_reason
+                    FROM portfolio_engine_audit
+                    ORDER BY id DESC LIMIT ?
+                """,
+                    (limit,),
+                )
+                rows = cursor.fetchall()
+                return rows
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        rows = await loop.run_in_executor(None, _sync_get)
+
+        return [
+            {
+                "id": row[0],
+                "ts": row[1],
+                "action": row[2],
+                "symbol": row[3],
+                "qty": row[4],
+                "price": row[5],
+                "fees": row[6],
+                "slippage": row[7],
+                "trade_id": row[8],
+                "invariant_ok": bool(row[9]),
+                "invariant_diff": row[10],
+                "entry_reason": row[11],
+                "exit_reason": row[12],
+            }
+            for row in rows
+        ]
+
+    async def get_audit_by_id(self, audit_id: int) -> dict | None:
+        """Get single audit record by ID"""
+
+        def _sync_get():
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT * FROM portfolio_engine_audit WHERE id = ?
+                """,
+                    (audit_id,),
+                )
+                row = cursor.fetchone()
+                return row
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        row = await loop.run_in_executor(None, _sync_get)
+
+        if not row:
+            return None
+
+        return {
+            "id": row[0],
+            "ts": row[1],
+            "action": row[2],
+            "symbol": row[3],
+            "qty": row[4],
+            "price": row[5],
+            "fees": row[6],
+            "slippage": row[7],
+            "decision_id": row[8],
+            "trade_id": row[9],
+            "ranked_candidates": json.loads(row[10]) if row[10] else [],
+            "pre_ledger": json.loads(row[11]) if row[11] else {},
+            "post_ledger": json.loads(row[12]) if row[12] else {},
+            "pre_positions_digest": row[13],
+            "post_positions_digest": row[14],
+            "invariant_ok": bool(row[15]),
+            "invariant_diff": row[16],
+            "entry_reason": row[17],
+            "exit_reason": row[18],
+        }
+
+    # =========================================================================
+    # ITEM 4: REGIME GUARDRAILS
+    # =========================================================================
+
+    async def update_regime_state(self, symbol: str, atr: float, spread: float, current_bar: int) -> None:
+        """Update regime state based on market conditions"""
+        # Update ATR baseline
+        if symbol not in self._atr_baseline:
+            self._atr_baseline[symbol] = atr
+        else:
+            # Exponential moving average for baseline
+            self._atr_baseline[symbol] = 0.95 * self._atr_baseline[symbol] + 0.05 * atr
+
+        baseline = self._atr_baseline[symbol]
+
+        # VOL_SPIKE check (bar units: current_bar and vol_spike_until are bar-close timestamps)
+        if self._bar_interval_seconds is not None:
+            if baseline > 0 and atr > baseline * (1 + VOL_SPIKE_THRESHOLD):
+                if not self._regime_state.vol_spike_active:
+                    logger.warning(f"REGIME: VOL_SPIKE activated for {symbol} - ATR {atr:.4f} > baseline {baseline:.4f} * {1 + VOL_SPIKE_THRESHOLD}")
+                self._regime_state.vol_spike_active = True
+                self._regime_state.vol_spike_until = current_bar + VOL_SPIKE_COOLDOWN_BARS * self._bar_interval_seconds
+                self._regime_state.risk_multiplier = VOL_SPIKE_RISK_FACTOR
+            elif current_bar > self._regime_state.vol_spike_until:
+                if self._regime_state.vol_spike_active:
+                    logger.info("REGIME: VOL_SPIKE deactivated")
+                self._regime_state.vol_spike_active = False
+                self._regime_state.risk_multiplier = 1.0
+
+        # SPREAD_SPIKE check (bar units)
+        if self._bar_interval_seconds is not None:
+            if spread > SPREAD_SPIKE_THRESHOLD:
+                self._regime_state.spread_blocked_symbols[symbol] = current_bar + SPREAD_BLOCK_BARS * self._bar_interval_seconds
+                logger.warning(f"REGIME: SPREAD_SPIKE blocking {symbol} - spread {spread:.4f} > {SPREAD_SPIKE_THRESHOLD}")
+            elif symbol in self._regime_state.spread_blocked_symbols:
+                if current_bar > self._regime_state.spread_blocked_symbols[symbol]:
+                    del self._regime_state.spread_blocked_symbols[symbol]
+            await self._persist_regime_quality_state()
+
+        # DRAWDOWN_GUARD check
+        if self._total_equity > self._regime_state.rolling_peak_equity:
+            self._regime_state.rolling_peak_equity = self._total_equity
+            self._regime_state.rolling_peak_timestamp = time.time()
+
+        if self._regime_state.rolling_peak_equity > 0:
+            drawdown = (self._regime_state.rolling_peak_equity - self._total_equity) / self._regime_state.rolling_peak_equity
+            self._regime_state.current_drawdown_pct = drawdown
+
+            if drawdown > DRAWDOWN_LIMIT_PCT:
+                if not self._regime_state.drawdown_guard_active:
+                    logger.warning(f"REGIME: DRAWDOWN_GUARD activated - {drawdown * 100:.2f}% > {DRAWDOWN_LIMIT_PCT * 100:.2f}%")
+                self._regime_state.drawdown_guard_active = True
+                self._regime_state.risk_multiplier = min(self._regime_state.risk_multiplier, 0.5)
+            else:
+                if self._regime_state.drawdown_guard_active:
+                    logger.info("REGIME: DRAWDOWN_GUARD deactivated")
+                self._regime_state.drawdown_guard_active = False
+
+        self._regime_state.last_updated = time.time()
+
+    async def _classify_market_regime(self) -> None:
+        """Classify current market regime from the market_regime:global Redis key
+        (written every 5 min by MarketIntelligenceUpdater via market_regime.py)."""
+        now = time.time()
+        if not hasattr(self, "_last_regime_classify_ts"):
+            self._last_regime_classify_ts = 0
+        if now - self._last_regime_classify_ts < 300:
+            return
+        self._last_regime_classify_ts = now
+
+        try:
+            import json as _json
+
+            from backend.config.redis_config import get_shared_redis_async
+
+            redis_client = get_shared_redis_async()
+            raw = await redis_client.get("market_regime:global")
+            if not raw:
+                logger.debug("REGIME: no market_regime:global key in Redis")
+                return
+
+            data = _json.loads(raw)
+            regime = data.get("regime", "unknown")
+            score = data.get("score", 0.0)
+
+            regime_map = {
+                "bull": "BULL",
+                "bear": "BEAR",
+                "sideways": "SIDEWAYS",
+            }
+            mapped = regime_map.get(regime, "unknown")
+
+            old_regime = self._regime_state.regime
+            self._regime_state.regime = mapped
+            self._regime_state.confidence = abs(score)
+            self._regime_state.last_updated = now
+
+            if old_regime != mapped:
+                logger.info(f"REGIME: changed {old_regime} -> {mapped} (score={score:.3f})")
+
+        except Exception as e:
+            logger.warning(f"REGIME: Failed to classify market regime: {e}")
+
+    async def sync_regime_label_from_redis(self, force: bool = False) -> None:
+        """Refresh regime from ``market_regime:global`` (dashboard / ``GET /regime``)."""
+        if force:
+            self._last_regime_classify_ts = 0
+        await self._classify_market_regime()
+
+    async def _check_churn_guard(self) -> None:
+        """Check and update churn guard based on recent roundtrip cost vs gross profit"""
+
+        def _sync_get():
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT s.fees + COALESCE(b.fees, 0) as roundtrip_fees,
+                           s.slippage + COALESCE(b.slippage, 0) as roundtrip_slippage,
+                           CASE WHEN s.invariant_diff > 0 THEN s.invariant_diff ELSE 0 END as profit
+                    FROM (
+                        SELECT fees, slippage, invariant_diff, symbol, id
+                        FROM portfolio_engine_audit
+                        WHERE action = 'SELL'
+                        ORDER BY id DESC LIMIT ?
+                    ) s
+                    LEFT JOIN (
+                        SELECT fees, slippage, symbol,
+                               ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY id DESC) as rn
+                        FROM portfolio_engine_audit
+                        WHERE action = 'BUY'
+                    ) b ON b.symbol = s.symbol AND b.rn = 1
+                """,
+                    (CHURN_TRADE_WINDOW,),
+                )
+                rows = cursor.fetchall()
+                return rows
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        rows = await loop.run_in_executor(None, _sync_get)
+
+        if not rows:
+            return
+
+        total_fees = sum(r[0] or 0 for r in rows)
+        total_slippage = sum(r[1] or 0 for r in rows)
+        gross_profit = sum(r[2] or 0 for r in rows)
+
+        total_costs = total_fees + total_slippage
+        if len(rows) >= CHURN_GUARD_MIN_SAMPLES:
+            if gross_profit > 0:
+                churn_ratio = total_costs / gross_profit
+            else:
+                churn_ratio = float("inf")
+            self._regime_state.churn_ratio = churn_ratio
+
+            if churn_ratio > CHURN_RATIO_LIMIT:
+                if not self._regime_state.churn_guard_active:
+                    logger.warning(
+                        "REGIME: CHURN_GUARD activated - fees=%.2f profit=%.2f ratio=%.2f > %.2f (max %dh)",
+                        total_costs,
+                        gross_profit,
+                        churn_ratio,
+                        CHURN_RATIO_LIMIT,
+                        CHURN_GUARD_MAX_SEC // 3600,
+                    )
+                    self._regime_state.churn_guard_activated_at = time.time()
+                now = time.time()
+                elapsed = now - self._regime_state.churn_guard_activated_at if self._regime_state.churn_guard_activated_at > 0 else 0
+                if elapsed > CHURN_GUARD_MAX_SEC:
+                    logger.info(
+                        "REGIME: CHURN_GUARD auto-cleared after %.0fh (max=%dh) — allowing trades with tightened criteria",
+                        elapsed / 3600,
+                        CHURN_GUARD_MAX_SEC // 3600,
+                    )
+                    self._regime_state.churn_guard_active = False
+                    self._regime_state.churn_guard_activated_at = 0.0
+                else:
+                    self._regime_state.churn_guard_active = True
+            else:
+                self._regime_state.churn_guard_active = False
+                self._regime_state.churn_guard_activated_at = 0.0
+        else:
+            self._regime_state.churn_ratio = total_costs / gross_profit if gross_profit > 0 else 0.0
+            if self._regime_state.churn_guard_active:
+                logger.info(
+                    "REGIME: CHURN_GUARD cleared (samples=%s min=%s gross_profit=%.4f)",
+                    len(rows),
+                    CHURN_GUARD_MIN_SAMPLES,
+                    gross_profit,
+                )
+            self._regime_state.churn_guard_active = False
+
+    def _check_regime_guards(self, symbol: str, current_bar: int) -> tuple[bool, str]:
+        """Check if trade is blocked by regime guards"""
+        # Check spread block
+        if symbol in self._regime_state.spread_blocked_symbols and current_bar <= self._regime_state.spread_blocked_symbols[symbol]:
+            return False, f"SPREAD_SPIKE: symbol blocked until bar {self._regime_state.spread_blocked_symbols[symbol]}"
+
+        # Check drawdown guard (blocks buys)
+        if self._regime_state.drawdown_guard_active:
+            return False, f"DRAWDOWN_GUARD: equity drawdown {self._regime_state.current_drawdown_pct * 100:.2f}%"
+
+        return True, ""
+
+    def get_metrics(self) -> dict[str, Any]:
+        """P4.1: Expose counters for audits (buys_attempted, buys_executed, cooldown_blocks, etc.)."""
+        return {
+            "buys_attempted": self._metrics_buys_attempted,
+            "buys_executed": self._metrics_buys_executed,
+            "cooldown_blocks": self._metrics_cooldown_blocks,
+            "quality_filter_blocks": self._metrics_quality_filter_blocks,
+            "reconciliation_adjustments": self._metrics_reconciliation_adjustments,
+        }
+
+    def get_max_open_positions(self) -> int:
+        """F8: Return engine effective max open positions (same value used to block buys)."""
+        return MAX_OPEN_POSITIONS
+
+    def get_regime_status(self) -> dict[str, Any]:
+        """Get current regime guardrail status"""
+        return {
+            "state": self._regime_state.to_dict(),
+            "guards_active": {
+                "vol_spike": self._regime_state.vol_spike_active,
+                "spread_blocked_symbols": list(self._regime_state.spread_blocked_symbols.keys()),
+                "drawdown_guard": self._regime_state.drawdown_guard_active,
+                "churn_guard": self._regime_state.churn_guard_active,
+            },
+            "effective_risk_multiplier": self._regime_state.risk_multiplier,
+            "thresholds": {
+                "vol_spike_threshold": VOL_SPIKE_THRESHOLD,
+                "spread_threshold": SPREAD_SPIKE_THRESHOLD,
+                "drawdown_limit": DRAWDOWN_LIMIT_PCT,
+                "churn_ratio_limit": CHURN_RATIO_LIMIT,
+            },
+        }
+
+    # =========================================================================
+    # ITEM 5: SIGNAL QUALITY GATE
+    # =========================================================================
+
+    def _check_quality_filters(
+        self,
+        symbol: str,
+        candidate: BuyCandidate,
+        current_bar: int,
+        dynamic_min_confidence: float | None = None,
+    ) -> tuple[bool, str]:
+        """Pacing + safety cooldowns only. ML is authoritative — multi-bar/chop/loss-streak/churn are telemetry."""
+        if not ENABLE_COOLDOWN_ENFORCEMENT:
+            return True, ""
+        symbol = normalize_symbol(symbol)
+        # Telemetry: multi-bar (would have blocked)
+        if candidate.confidence < MULTI_BAR_BYPASS_CONFIDENCE:
+            signals = self._quality_filter_state.recent_bar_signals.get(symbol, [])
+            buy_count = sum(1 for s in signals[-MULTI_BAR_LOOKBACK:] if s == "BUY")
+            if buy_count < MULTI_BAR_CONFIRM_REQUIRED:
+                logger.info(
+                    "QUALITY_TELEMETRY MULTI_BAR_CONFIRM symbol=%s buys=%d/%d (not blocking)",
+                    symbol,
+                    buy_count,
+                    MULTI_BAR_CONFIRM_REQUIRED,
+                )
+
+        if candidate.trend_score < CHOP_TREND_THRESHOLD and candidate.confidence < CHOP_BYPASS_CONFIDENCE:
+            logger.info(
+                "QUALITY_TELEMETRY CHOP_FILTER symbol=%s trend=%.3f conf=%.3f (not blocking)",
+                symbol,
+                candidate.trend_score,
+                candidate.confidence,
+            )
+
+        # Filter 2b: Global cooldown - block ALL buys for N bars after any sell
+        if current_bar < self._quality_filter_state.global_cooldown_until:
+            if PORTFOLIO_LOCAL_SKIP_GLOBAL_SELL_COOLDOWN:
+                logger.info(
+                    "QUALITY_TELEMETRY GLOBAL_SELL_COOLDOWN would_block until bar %s (PORTFOLIO_LOCAL_SKIP_GLOBAL_SELL_COOLDOWN=true — not enforcing)",
+                    self._quality_filter_state.global_cooldown_until,
+                )
+            else:
+                self._metrics_quality_filter_blocks += 1
+                return False, f"GLOBAL_SELL_COOLDOWN: blocked until bar {self._quality_filter_state.global_cooldown_until}"
+
+        # Filter 2c: Wall-clock global cooldown (backup when bar timestamps are misaligned)
+        now_wall = time.time()
+        if now_wall < self._quality_filter_state.global_cooldown_wall:
+            remaining = self._quality_filter_state.global_cooldown_wall - now_wall
+            if PORTFOLIO_LOCAL_SKIP_GLOBAL_SELL_COOLDOWN:
+                logger.info(
+                    "QUALITY_TELEMETRY GLOBAL_SELL_COOLDOWN_WALL would_block for %.0fs (PORTFOLIO_LOCAL_SKIP_GLOBAL_SELL_COOLDOWN=true — not enforcing)",
+                    remaining,
+                )
+            else:
+                self._metrics_quality_filter_blocks += 1
+                return False, f"GLOBAL_SELL_COOLDOWN_WALL: blocked for {remaining:.0f}s"
+
+        now_wall = time.time()
+        if self._quality_filter_state.loss_streak_pause_until > now_wall:
+            remaining_min = (self._quality_filter_state.loss_streak_pause_until - now_wall) / 60
+            logger.info(
+                "QUALITY_TELEMETRY LOSS_STREAK_PAUSE symbol=%s remaining_min=%.0f (not blocking — use HOLD_CONSEC_LOSSES in governor)",
+                symbol,
+                remaining_min,
+            )
+
+        # Filter 3: Post-sell cooldown (same bar timestamp source as load pruning: bar-close time)
+        cooldown_until = self._quality_filter_state.symbol_cooldowns.get(symbol, 0)
+        if not self._cooldown_check_bar_logged:
+            logger.info(
+                "COOLDOWN_CHECK_BAR: current_bar=%s cooldown_until=%s symbol=%s (once per session)",
+                current_bar,
+                cooldown_until,
+                symbol,
+            )
+            self._cooldown_check_bar_logged = True
+        if current_bar < cooldown_until:
+            if PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN:
+                logger.info(
+                    "QUALITY_TELEMETRY POST_SELL_COOLDOWN would_block symbol=%s until bar %s (PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN=true — not enforcing)",
+                    symbol,
+                    cooldown_until,
+                )
+            else:
+                self._metrics_cooldown_blocks += 1
+                return False, f"POST_SELL_COOLDOWN: blocked until bar {cooldown_until}"
+
+        # Filter 3b: Wall-clock per-symbol cooldown (backup for bar timestamp mismatch)
+        sym_wall_until = self._quality_filter_state.symbol_cooldown_wall.get(symbol, 0.0)
+        if now_wall < sym_wall_until:
+            remaining = sym_wall_until - now_wall
+            if PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN:
+                logger.info(
+                    "QUALITY_TELEMETRY POST_SELL_COOLDOWN_WALL would_block symbol=%s for %.0fs (PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN=true — not enforcing)",
+                    symbol,
+                    remaining,
+                )
+            else:
+                self._metrics_cooldown_blocks += 1
+                return False, f"POST_SELL_COOLDOWN_WALL: {symbol} blocked for {remaining:.0f}s"
+
+        # Filter 3c: Persistent close-ledger cooldown (survives restart).
+        # Covers AI net-profit sells, operator MANUAL sells, and
+        # HUMAN_MANUAL_SELL events detected during live reconcile.
+        persisted_until = self._lookup_position_close_cooldown(symbol)
+        if persisted_until and now_wall < persisted_until:
+            remaining = persisted_until - now_wall
+            if PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN:
+                logger.info(
+                    "QUALITY_TELEMETRY POST_SELL_COOLDOWN_LEDGER would_block symbol=%s for %.0fs (PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN=true — not enforcing)",
+                    symbol,
+                    remaining,
+                )
+            else:
+                self._metrics_cooldown_blocks += 1
+                return False, f"POST_SELL_COOLDOWN_LEDGER: {symbol} blocked for {remaining:.0f}s"
+
+        # Filter 4: Portfolio pacing - hourly (with overflow throttle for A+ setups)
+        now = time.time()
+        if now - self._quality_filter_state.last_hour_reset > 3600:
+            self._quality_filter_state.buys_this_hour = 0
+            self._quality_filter_state.overflow_buys_this_hour = 0
+            self._quality_filter_state.last_hour_reset = now
+
+        if self._quality_filter_state.buys_this_hour >= MAX_BUYS_PER_HOUR:
+            if (
+                dynamic_min_confidence is not None
+                and candidate.confidence >= dynamic_min_confidence + HOURLY_OVERFLOW_CONF_DELTA
+                and self._quality_filter_state.overflow_buys_this_hour < MAX_OVERFLOW_BUYS_PER_HOUR
+            ):
+                return True, "HOURLY_OVERFLOW"
+            return False, f"HOURLY_LIMIT: {self._quality_filter_state.buys_this_hour}/{MAX_BUYS_PER_HOUR}"
+
+        # Filter 5: Portfolio pacing - daily
+        if now - self._quality_filter_state.last_day_reset > 86400:
+            self._quality_filter_state.buys_today = 0
+            self._quality_filter_state.last_day_reset = now
+
+        if self._quality_filter_state.buys_today >= MAX_BUYS_PER_DAY:
+            return False, f"DAILY_LIMIT: {self._quality_filter_state.buys_today}/{MAX_BUYS_PER_DAY}"
+
+        if self._regime_state.churn_guard_active:
+            bm_raw = resolve_buy_margin_from_payload(candidate.decision_data)
+            bmf: float | None = None
+            ml_hot = False
+            if bm_raw is not None:
+                try:
+                    bmf = float(bm_raw)
+                    if math.isfinite(bmf) and abs(bmf - _BAR_PRE_RANK_RULE_BUY_MARGIN_SENTINEL) > 1e-9:
+                        ml_hot = True
+                except (TypeError, ValueError):
+                    bmf = None
+            if ml_hot:
+                sle = (getattr(candidate, "sleeve", None) or "").strip().upper()
+                thr = buy_margin_threshold_core() if sle == Sleeve.CORE.value else buy_margin_threshold_active()
+                if bmf is None or not math.isfinite(bmf) or bmf < thr:
+                    logger.info(
+                        "QUALITY_TELEMETRY CHURN_GUARD bm=%s thr=%.4f sleeve=%s (not blocking)",
+                        bmf,
+                        thr,
+                        sle or Sleeve.ACTIVE.value,
+                    )
+            elif candidate.confidence < MIN_CONFIDENCE + 0.1:
+                logger.info(
+                    "QUALITY_TELEMETRY CHURN_GUARD conf=%.2f min=%.2f (not blocking)",
+                    candidate.confidence,
+                    MIN_CONFIDENCE + 0.1,
+                )
+
+        return True, ""
+
+    def record_signal(self, symbol: str, signal: str) -> None:
+        """Record signal for multi-bar confirmation"""
+        if symbol not in self._quality_filter_state.recent_bar_signals:
+            self._quality_filter_state.recent_bar_signals[symbol] = []
+
+        signals = self._quality_filter_state.recent_bar_signals[symbol]
+        signals.append(signal)
+
+        # Keep only last N
+        if len(signals) > MULTI_BAR_LOOKBACK + 2:
+            self._quality_filter_state.recent_bar_signals[symbol] = signals[-MULTI_BAR_LOOKBACK - 2 :]
+
+    def record_sell_cooldown(self, symbol: str, current_bar: int, exit_type: str = "", pnl: float = 0.0) -> None:
+        """Record cooldown after sell. current_bar is bar close timestamp (seconds); cooldown is N bars in same units."""
+        symbol = normalize_symbol(symbol)
+
+        # Track exit type for regime detection
+        if exit_type:
+            self._quality_filter_state.recent_exit_types.append(exit_type)
+            if len(self._quality_filter_state.recent_exit_types) > LOSS_STREAK_LOOKBACK + 2:
+                self._quality_filter_state.recent_exit_types = self._quality_filter_state.recent_exit_types[-(LOSS_STREAK_LOOKBACK + 2) :]
+
+        # Track PnL for win-rate circuit breaker
+        self._quality_filter_state.recent_exit_pnls.append(pnl)
+        max_keep = LOSS_STREAK_LOOKBACK + 2
+        if len(self._quality_filter_state.recent_exit_pnls) > max_keep:
+            self._quality_filter_state.recent_exit_pnls = self._quality_filter_state.recent_exit_pnls[-max_keep:]
+
+        # Win-rate circuit breaker: if last N trades have < 20% win rate, pause buying
+        recent_pnls = self._quality_filter_state.recent_exit_pnls[-LOSS_STREAK_LOOKBACK:]
+        if len(recent_pnls) >= LOSS_STREAK_LOOKBACK:
+            wins = sum(1 for p in recent_pnls if p > 0)
+            win_rate = wins / len(recent_pnls)
+            if win_rate < LOSS_STREAK_MIN_WIN_RATE:
+                now_wall = time.time()
+                self._quality_filter_state.loss_streak_pause_until = now_wall + LOSS_STREAK_PAUSE_SEC
+                logger.warning(
+                    "LOSS_STREAK_PAUSE: win_rate=%.0f%% (%d/%d) — pausing buys for %d min",
+                    win_rate * 100,
+                    wins,
+                    len(recent_pnls),
+                    LOSS_STREAK_PAUSE_SEC // 60,
+                )
+
+        # Scale cooldown for losing trades to prevent churn
+        loss_multiplier = 1.0
+        if pnl < 0:
+            loss_multiplier = 2.0
+
+        # Wall-clock cooldowns (always set, independent of bar timestamps)
+        now_wall = time.time()
+        wall_cd = POST_SELL_COOLDOWN_WALL_SEC * loss_multiplier
+        self._quality_filter_state.symbol_cooldown_wall[symbol] = now_wall + wall_cd
+        global_wall_cd = GLOBAL_SELL_COOLDOWN_WALL_SEC * loss_multiplier
+        self._quality_filter_state.global_cooldown_wall = max(
+            self._quality_filter_state.global_cooldown_wall,
+            now_wall + global_wall_cd,
+        )
+
+        if self._bar_interval_seconds is None:
+            logger.warning("BAR_INTERVAL: record_sell_cooldown bar-based skipped - bar_interval_seconds not set (wall-clock still active)")
+            return
+        cooldown_bars = int(POST_SELL_COOLDOWN_BARS * loss_multiplier)
+        cooldown_until = current_bar + cooldown_bars * self._bar_interval_seconds
+        self._quality_filter_state.symbol_cooldowns[symbol] = cooldown_until
+        global_bars = int(GLOBAL_SELL_COOLDOWN_BARS * loss_multiplier)
+        global_until = current_bar + global_bars * self._bar_interval_seconds
+        self._quality_filter_state.global_cooldown_until = max(self._quality_filter_state.global_cooldown_until, global_until)
+        if not self._cooldown_set_bar_logged:
+            logger.info(
+                "COOLDOWN_SET_BAR: current_bar=%s cooldown_until=%s wall_until=%.0f symbol=%s (once per session)",
+                current_bar,
+                cooldown_until,
+                self._quality_filter_state.symbol_cooldown_wall[symbol],
+                symbol,
+            )
+            self._cooldown_set_bar_logged = True
+
+    def increment_buy_counters(self, overflow: bool = False) -> None:
+        """Increment buy counters for pacing. If overflow=True, also count toward overflow-per-hour cap."""
+        self._quality_filter_state.buys_this_hour += 1
+        self._quality_filter_state.buys_today += 1
+        if overflow:
+            self._quality_filter_state.overflow_buys_this_hour += 1
+
+    # =========================================================================
+    # Phase 2: Quality/regime state persistence (restart safety)
+    # =========================================================================
+
+    async def _get_quality_redis(self):
+        """Return shared async Redis client for quality/regime state, or None if unavailable."""
+        try:
+            from backend.config.redis_config import SharedRedisState
+
+            return SharedRedisState.get_async_client()
+        except Exception as e:
+            logger.debug("Quality state Redis unavailable: %s", e)
+            return None
+
+    async def _get_loss_hold_until(self) -> float | None:
+        """Return loss-hold expiry timestamp (UTC) or None. Governor is read-only; engine is sole writer.
+        Verify: key exists when consec>=5 (hold window); hold_reason=HOLD_CONSEC_LOSSES during window;
+        after expiry Layer2+3 tier=C; key cleared when consec<MAX or on profitable sell (realized_pnl>0)."""
+        r = await self._get_quality_redis()
+        if not r:
+            return None
+        try:
+            raw = await r.get(GOVERNANCE_LOSS_HOLD_KEY)
+            if raw is None:
+                return None
+            return float(raw)
+        except (ValueError, TypeError):
+            return None
+
+    async def _set_loss_hold_until(self, until: float | None) -> None:
+        """Set or clear loss-hold expiry. Pass None to clear (e.g. after a win)."""
+        r = await self._get_quality_redis()
+        if not r:
+            return
+        try:
+            if until is None:
+                await r.delete(GOVERNANCE_LOSS_HOLD_KEY)
+            else:
+                await r.set(GOVERNANCE_LOSS_HOLD_KEY, str(until), ex=QUALITY_STATE_TTL_SECONDS)
+        except Exception as e:
+            logger.warning("_set_loss_hold_until Redis write failed: %s", e)
+
+    async def load_quality_state_from_redis(self) -> None:
+        """
+        Load quality filter and regime state from Redis; prune expired entries.
+        Call after set_bar_interval_seconds so current_bar is in correct units.
+        """
+        if self._bar_interval_seconds is None:
+            logger.debug("load_quality_state_from_redis: bar_interval_seconds not set, skip load")
+            return
+        r = await self._get_quality_redis()
+        if not r:
+            return
+        try:
+            current_bar = int(time.time() / self._bar_interval_seconds) * self._bar_interval_seconds
+            loaded_cooldowns = 0
+            pruned_cooldowns = 0
+            cooldown_key = f"{QUALITY_STATE_KEY_PREFIX}cooldowns"
+            raw = await r.hgetall(cooldown_key)
+            if raw:
+                for symbol, val in raw.items():
+                    if symbol == "__global__":
+                        try:
+                            until = int(float(val))
+                            if until > current_bar:
+                                self._quality_filter_state.global_cooldown_until = max(self._quality_filter_state.global_cooldown_until, until)
+                        except (ValueError, TypeError):
+                            pass
+                        continue
+                    try:
+                        until = int(float(val))
+                        if until > current_bar:
+                            self._quality_filter_state.symbol_cooldowns[symbol] = until
+                            loaded_cooldowns += 1
+                        else:
+                            pruned_cooldowns += 1
+                    except (ValueError, TypeError):
+                        pruned_cooldowns += 1
+            signals_raw = await r.hgetall(f"{QUALITY_STATE_KEY_PREFIX}signals")
+            if signals_raw:
+                bound = MULTI_BAR_LOOKBACK + 2
+                for symbol, val in signals_raw.items():
+                    try:
+                        lst = json.loads(val) if isinstance(val, str) else val
+                        if isinstance(lst, list):
+                            self._quality_filter_state.recent_bar_signals[symbol] = lst[-bound:]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            pacing_key = f"{QUALITY_STATE_KEY_PREFIX}pacing"
+            pacing_raw = await r.hgetall(pacing_key)
+            if pacing_raw:
+                try:
+                    self._quality_filter_state.buys_this_hour = int(float(pacing_raw.get("buys_this_hour", 0) or 0))
+                    self._quality_filter_state.buys_today = int(float(pacing_raw.get("buys_today", 0) or 0))
+                    self._quality_filter_state.overflow_buys_this_hour = int(float(pacing_raw.get("overflow_buys_this_hour", 0) or 0))
+                    self._quality_filter_state.last_hour_reset = float(pacing_raw.get("last_hour_reset", time.time()) or time.time())
+                    self._quality_filter_state.last_day_reset = float(pacing_raw.get("last_day_reset", time.time()) or time.time())
+                    now = time.time()
+                    # Fix bad pacing state: last_day_reset in future or >2 days ago -> reset day
+                    if self._quality_filter_state.last_day_reset > now or (now - self._quality_filter_state.last_day_reset) > 86400 * 2:
+                        self._quality_filter_state.buys_today = 0
+                        self._quality_filter_state.last_day_reset = now
+                        await r.hset(pacing_key, mapping={"buys_today": "0", "last_day_reset": str(now)})
+                        await r.expire(pacing_key, QUALITY_STATE_TTL_SECONDS)
+                        logger.info("QUALITY_PACING_RESET: last_day_reset invalid (future or stale), reset buys_today=0")
+                except (ValueError, TypeError):
+                    pass
+            vol_until = await r.get(f"{REGIME_STATE_KEY_PREFIX}vol_spike_until")
+            if vol_until is not None:
+                try:
+                    until_f = float(vol_until)
+                    self._regime_state.vol_spike_until = until_f
+                    self._regime_state.vol_spike_active = current_bar <= until_f
+                except (ValueError, TypeError):
+                    pass
+            spread_raw = await r.hgetall(f"{REGIME_STATE_KEY_PREFIX}spread_blocked")
+            if spread_raw:
+                for sym, val in spread_raw.items():
+                    try:
+                        until_f = float(val)
+                        if until_f > current_bar:
+                            self._regime_state.spread_blocked_symbols[sym] = until_f
+                    except (ValueError, TypeError):
+                        pass
+            logger.info(
+                "QUALITY_STATE_LOAD: cooldowns_loaded=%s pruned=%s signals_keys=%s",
+                loaded_cooldowns,
+                pruned_cooldowns,
+                len(signals_raw) if signals_raw else 0,
+            )
+        except Exception as e:
+            # BUG #L2 FIX: Log at warning level instead of silent suppression
+            logger.warning("QUALITY_STATE_LOAD failed: %s (quality filters may use defaults)", e)
+
+    async def _persist_quality_cooldowns(self) -> None:
+        """Write whole symbol_cooldowns map to Redis; TTL refreshed on each write (avoids mid-session expiry)."""
+        r = await self._get_quality_redis()
+        if not r:
+            return
+        try:
+            key = f"{QUALITY_STATE_KEY_PREFIX}cooldowns"
+            mapping = {s: str(until) for s, until in self._quality_filter_state.symbol_cooldowns.items()}
+            mapping["__global__"] = str(self._quality_filter_state.global_cooldown_until)
+            if mapping:
+                await r.hset(key, mapping=mapping)
+                await r.expire(key, QUALITY_STATE_TTL_SECONDS)
+            else:
+                await r.delete(key)
+        except Exception as e:
+            logger.debug("_persist_quality_cooldowns failed: %s", e)
+
+    async def _persist_quality_signals(self) -> None:
+        """Write recent_bar_signals to Redis (bounded window per symbol)."""
+        r = await self._get_quality_redis()
+        if not r:
+            return
+        try:
+            key = f"{QUALITY_STATE_KEY_PREFIX}signals"
+            bound = MULTI_BAR_LOOKBACK + 2
+            mapping = {}
+            for symbol, signals in self._quality_filter_state.recent_bar_signals.items():
+                if signals:
+                    mapping[symbol] = json.dumps(signals[-bound:])
+            if mapping:
+                await r.hset(key, mapping=mapping)
+                await r.expire(key, QUALITY_STATE_TTL_SECONDS)
+            elif await r.exists(key):
+                await r.delete(key)
+        except Exception as e:
+            logger.debug("_persist_quality_signals failed: %s", e)
+
+    async def _persist_quality_pacing(self) -> None:
+        """Write full pacing structure (4 fields) to Redis; TTL refreshed. Serialization: str(int/float)."""
+        r = await self._get_quality_redis()
+        if not r:
+            return
+        try:
+            key = f"{QUALITY_STATE_KEY_PREFIX}pacing"
+            await r.hset(
+                key,
+                mapping={
+                    "buys_this_hour": str(self._quality_filter_state.buys_this_hour),
+                    "buys_today": str(self._quality_filter_state.buys_today),
+                    "overflow_buys_this_hour": str(self._quality_filter_state.overflow_buys_this_hour),
+                    "last_hour_reset": str(self._quality_filter_state.last_hour_reset),
+                    "last_day_reset": str(self._quality_filter_state.last_day_reset),
+                },
+            )
+            await r.expire(key, QUALITY_STATE_TTL_SECONDS)
+        except Exception as e:
+            logger.debug("_persist_quality_pacing failed: %s", e)
+
+    async def _persist_regime_quality_state(self) -> None:
+        """Write whole vol_spike + spread_blocked state to Redis; TTL refreshed."""
+        r = await self._get_quality_redis()
+        if not r:
+            return
+        try:
+            await r.set(f"{REGIME_STATE_KEY_PREFIX}vol_spike_until", str(self._regime_state.vol_spike_until), ex=QUALITY_STATE_TTL_SECONDS)
+            await r.set(f"{REGIME_STATE_KEY_PREFIX}vol_spike_active", "1" if self._regime_state.vol_spike_active else "0", ex=QUALITY_STATE_TTL_SECONDS)
+            key = f"{REGIME_STATE_KEY_PREFIX}spread_blocked"
+            if self._regime_state.spread_blocked_symbols:
+                mapping = {s: str(until) for s, until in self._regime_state.spread_blocked_symbols.items()}
+                await r.hset(key, mapping=mapping)
+                await r.expire(key, QUALITY_STATE_TTL_SECONDS)
+            elif await r.exists(key):
+                await r.delete(key)
+        except Exception as e:
+            logger.debug("_persist_regime_quality_state failed: %s", e)
+
+    # =========================================================================
+    # ITEM 6: EXCHANGE CONSTRAINTS (rounding, min increments)
+    # =========================================================================
+
+    def _apply_exchange_constraints(self, symbol: str, qty: float, price: float) -> tuple[float, bool]:
+        """
+        Apply exchange constraints to quantity.
+        Returns (adjusted_qty, is_valid)
+
+        In test_mode, bypasses constraints for deterministic unit tests.
+        Real exchange constraints are tested in integration tests.
+        """
+        # Test mode: bypass exchange constraints for deterministic unit tests
+        if self.test_mode:
+            if qty <= 0:
+                return 0.0, False
+            return qty, True
+
+        constraints = self._symbol_constraints.get(
+            symbol,
+            {
+                "qty_step": DEFAULT_QTY_STEP,
+                "min_notional": MIN_POSITION_NOTIONAL,
+            },
+        )
+
+        qty_step = constraints.get("qty_step", DEFAULT_QTY_STEP)
+        min_notional = constraints.get("min_notional", MIN_POSITION_NOTIONAL)
+
+        # Round down to qty_step
+        import math
+
+        rounded_qty = math.floor(qty / qty_step) * qty_step
+
+        # Check notional after rounding
+        notional = rounded_qty * price
+        if notional < min_notional:
+            logger.debug(f"EXCHANGE_CONSTRAINT: {symbol} notional ${notional:.2f} < min ${min_notional}")
+            return 0.0, False
+
+        if rounded_qty <= 0:
+            return 0.0, False
+
+        return rounded_qty, True
+
+    def _normalize_order_amount(
+        self,
+        symbol: str,
+        raw_qty: float,
+        price: float,
+        side: str,  # "BUY" or "SELL"
+    ) -> tuple[float, str, float]:
+        """
+        CANONICAL ORDER NORMALIZATION GATE (uses Decimal for precision).
+
+        This is the AUTHORITATIVE sizing function - all buys and sells must use this.
+
+        Args:
+            symbol: Trading pair in Binance.US API form (e.g., "BTCUSDT")
+            raw_qty: Requested quantity (may have floating-point errors)
+            price: Current price
+            side: "BUY" or "SELL"
+
+        Returns:
+            (qty_quantized: float, reason: str, est_notional: float)
+            reason: "ok" or rejection reason (qty_quantized_to_zero, below_min_qty, below_min_notional)
+        """
+        if symbol not in self._symbol_constraints:
+            return 0.0, "symbol_not_in_constraints", 0.0
+
+        constraints = self._symbol_constraints[symbol]
+        qty_step = Decimal(str(constraints.get("qty_step", "0.00000001")))
+        min_qty = Decimal(str(constraints.get("min_qty", "0.00000001")))
+        min_notional = Decimal(str(constraints.get("min_notional", "10.0")))
+
+        # Quantize to step size (floor)
+        qty_decimal = Decimal(str(raw_qty))
+        qty_q = (qty_decimal / qty_step).quantize(Decimal("1"), rounding=ROUND_FLOOR) * qty_step
+
+        # Check quantized to zero
+        if qty_q == 0:
+            return 0.0, "qty_quantized_to_zero", 0.0
+
+        # Check min_qty
+        if qty_q < min_qty:
+            est_notional = float(qty_q * Decimal(str(price)))
+            return float(qty_q), "below_min_qty", est_notional
+
+        # Check min_notional
+        notional = qty_q * Decimal(str(price))
+        if notional < min_notional:
+            return float(qty_q), "below_min_notional", float(notional)
+
+        # Success
+        return float(qty_q), "ok", float(notional)
+
+    async def get_pending_orders(self) -> list[dict]:
+        """Get all pending orders"""
+
+        def _sync_get():
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT order_id, symbol, side, total_qty, filled_qty, remaining_qty,
+                           price, status, fill_chunks, current_chunk, created_at
+                    FROM portfolio_engine_orders
+                    WHERE status = 'pending'
+                """)
+                rows = cursor.fetchall()
+                return rows
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        rows = await loop.run_in_executor(None, _sync_get)
+
+        return [
+            {
+                "order_id": row[0],
+                "symbol": row[1],
+                "side": row[2],
+                "total_qty": row[3],
+                "filled_qty": row[4],
+                "remaining_qty": row[5],
+                "price": row[6],
+                "status": row[7],
+                "fill_chunks": row[8],
+                "current_chunk": row[9],
+                "created_at": row[10],
+            }
+            for row in rows
+        ]
+
+    # =========================================================================
+    # ITEM 7: SCOREBOARD
+    # =========================================================================
+
+    async def update_scoreboard(self) -> None:
+        """Update daily scoreboard metrics"""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        def _sync_update():
+            def _op() -> None:
+                with connect_rw(self.db_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.cursor()
+
+                    # UTC day bucket — trades timestamps are ISO UTC strings
+                    cursor.execute(
+                        """
+                        SELECT action, qty, price, fees, slippage, invariant_diff
+                        FROM portfolio_engine_audit
+                        WHERE date(ts) = ?
+                          AND action NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR')
+                        """,
+                        (today,),
+                    )
+                    trades = cursor.fetchall()
+
+                    cursor.execute(
+                        """
+                        SELECT unrealized_pnl FROM portfolio_engine_scoreboard_daily
+                        WHERE date < ?
+                        ORDER BY date DESC
+                        LIMIT 1
+                        """,
+                        (today,),
+                    )
+                    prior_unrealized_row = cursor.fetchone()
+                    current_unrealized = float(self._unrealized_pnl or 0.0)
+                    if prior_unrealized_row is not None:
+                        prior_unrealized = float(prior_unrealized_row[0] or 0.0)
+                    else:
+                        prior_unrealized = current_unrealized
+                    daily_unrealized_delta = current_unrealized - prior_unrealized
+
+                    sells = [t for t in trades if t[0] == "SELL"] if trades else []
+                    # `trades` counts AI/normal SELL audit rows only (not ADMIN_POSITION_CLEAR).
+                    wins = [t for t in sells if (t[5] or 0) > 0]
+                    losses = [t for t in sells if (t[5] or 0) <= 0]
+
+                    total_trades = len(sells)
+                    win_count = len(wins)
+                    loss_count = len(losses)
+                    win_rate = win_count / total_trades if total_trades > 0 else 0
+
+                    # R-multiples (using invariant_diff as P&L proxy)
+                    total_r = sum(t[5] or 0 for t in sells)
+                    expectancy_r = total_r / total_trades if total_trades > 0 else 0
+
+                    avg_win_r = sum(t[5] or 0 for t in wins) / len(wins) if wins else 0
+                    avg_loss_r = sum(abs(t[5] or 0) for t in losses) / len(losses) if losses else 0
+
+                    # Profit factor
+                    gross_profit = sum(t[5] or 0 for t in wins)
+                    gross_loss = sum(abs(t[5] or 0) for t in losses)
+                    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
+
+                    # Fees and slippage
+                    fees_paid = sum(t[3] or 0 for t in trades)
+                    slippage_cost = sum(t[4] or 0 for t in trades)
+
+                    # Churn ratio
+                    churn_ratio = (fees_paid + slippage_cost) / gross_profit if gross_profit > 0 else 0
+
+                    # Trades per hour
+                    uptime_hours = max(1, (time.time() - self._startup_timestamp) / 3600)
+                    trades_per_hour = total_trades / uptime_hours
+
+                    # Pass/fail determination (dashboard / ops only — does not gate new buys)
+                    fail_reasons = []
+                    # BUGFIX: expectancy_r is 0 when there are zero SELLs today (only BUY rows in audit);
+                    # old `<= 0` falsely flagged NEGATIVE_EXPECTANCY every day until a winning close.
+                    # Fail only on strictly negative average R after at least one closed trade today.
+                    min_sells_for_exp = int(os.getenv("SCOREBOARD_MIN_SELLS_FOR_EXPECTANCY", "1") or "1")
+                    if total_trades >= max(1, min_sells_for_exp) and expectancy_r < 0:
+                        fail_reasons.append("NEGATIVE_EXPECTANCY")
+                    if self._regime_state.current_drawdown_pct > DRAWDOWN_LIMIT_PCT:
+                        fail_reasons.append(f"DRAWDOWN_EXCEEDED_{self._regime_state.current_drawdown_pct * 100:.1f}%")
+                    # Skip churn check when < 5 trades (fees dominate small sample sizes)
+                    if total_trades >= 5 and churn_ratio > CHURN_RATIO_LIMIT:
+                        fail_reasons.append(f"CHURN_TOO_HIGH_{churn_ratio:.2f}")
+
+                    pass_fail = "PASS" if not fail_reasons else "FAIL"
+
+                    daily_realized_pnl = float(total_r)
+                    daily_total_pnl = daily_realized_pnl + daily_unrealized_delta
+
+                    cursor.execute(
+                        """
+                        INSERT OR REPLACE INTO portfolio_engine_scoreboard_daily (
+                            date, trades, wins, losses, win_rate, expectancy_r,
+                            avg_win_r, avg_loss_r, profit_factor, max_drawdown_pct,
+                            realized_pnl, unrealized_pnl, total_pnl,
+                            fees_paid, slippage_cost, churn_ratio, trades_per_hour,
+                            pass_fail, fail_reasons, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            today,
+                            total_trades,
+                            win_count,
+                            loss_count,
+                            win_rate,
+                            expectancy_r,
+                            avg_win_r,
+                            avg_loss_r,
+                            profit_factor,
+                            self._regime_state.current_drawdown_pct * 100,
+                            daily_realized_pnl,
+                            current_unrealized,
+                            daily_total_pnl,
+                            fees_paid,
+                            slippage_cost,
+                            churn_ratio,
+                            trades_per_hour,
+                            pass_fail,
+                            ",".join(fail_reasons) if fail_reasons else None,
+                            datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+
+                    conn.commit()
+
+            run_locked_retry(_op)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _sync_update)
+
+    async def get_scoreboard(self, days: int = 7) -> dict[str, Any]:
+        """Get scoreboard for last N days"""
+
+        def _sync_get():
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT * FROM portfolio_engine_scoreboard_daily
+                    ORDER BY date DESC LIMIT ?
+                """,
+                    (days,),
+                )
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                return rows, columns
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        rows, columns = await loop.run_in_executor(None, _sync_get)
+
+        daily_records = [dict(zip(columns, row, strict=False)) for row in rows]
+
+        # Aggregate metrics
+        if daily_records:
+            total_trades = sum(r["trades"] or 0 for r in daily_records)
+            total_wins = sum(r["wins"] or 0 for r in daily_records)
+            total_fees = sum(r["fees_paid"] or 0 for r in daily_records)
+            total_slippage = sum(r["slippage_cost"] or 0 for r in daily_records)
+            max_dd = max(r["max_drawdown_pct"] or 0 for r in daily_records)
+
+            overall_win_rate = total_wins / total_trades if total_trades > 0 else 0
+            avg_expectancy = sum(r["expectancy_r"] or 0 for r in daily_records) / len(daily_records)
+
+            # Overall pass/fail
+            fail_days = [r for r in daily_records if r["pass_fail"] == "FAIL"]
+            overall_status = "PASS" if not fail_days else f"FAIL ({len(fail_days)}/{len(daily_records)} days)"
+        else:
+            total_trades = 0
+            overall_win_rate = 0
+            avg_expectancy = 0
+            total_fees = 0
+            total_slippage = 0
+            max_dd = 0
+            overall_status = "NO_DATA"
+
+        return {
+            "period_days": days,
+            "daily_records": daily_records,
+            "aggregate": {
+                "total_trades": total_trades,
+                "overall_win_rate": overall_win_rate,
+                "avg_expectancy_r": avg_expectancy,
+                "total_fees": total_fees,
+                "total_slippage": total_slippage,
+                "max_drawdown_pct": max_dd,
+                "overall_status": overall_status,
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _scoreboard_activity_breakdown_sync(self, day: str) -> dict[str, Any]:
+        """Separate AI closes from admin/synthetic closes for operator clarity."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT action, COUNT(*), COALESCE(SUM(invariant_diff), 0)
+                FROM portfolio_engine_audit
+                WHERE date(ts) = ?
+                GROUP BY action
+                """,
+                (day,),
+            )
+            by_action = {str(row[0]): {"count": int(row[1]), "pnl": float(row[2] or 0)} for row in cur.fetchall()}
+            ai = by_action.get("SELL", {"count": 0, "pnl": 0.0})
+            admin = by_action.get("ADMIN_POSITION_CLEAR", {"count": 0, "pnl": 0.0})
+            stale = by_action.get("STALE_PRE_CORRECTION_POSITION_CLEAR", {"count": 0, "pnl": 0.0})
+            buys = by_action.get("BUY", {"count": 0, "pnl": 0.0})
+            return {
+                "ai_closed_trades": ai["count"],
+                "ai_closed_pnl": ai["pnl"],
+                "admin_synthetic_closes": admin["count"] + stale["count"],
+                "admin_synthetic_pnl": admin["pnl"] + stale["pnl"],
+                "stale_pre_correction_closes": stale["count"],
+                "stale_pre_correction_pnl": stale["pnl"],
+                "open_buys_today": buys["count"],
+                "scoreboard_trades_field_is_ai_closes_only": True,
+            }
+        finally:
+            conn.close()
+
+    async def get_scoreboard_today(self) -> dict[str, Any]:
+        """Get today's scoreboard only"""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        def _sync_get():
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT * FROM portfolio_engine_scoreboard_daily
+                    WHERE date = ?
+                """,
+                    (today,),
+                )
+                row = cursor.fetchone()
+                columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                return row, columns
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        row, columns = await loop.run_in_executor(None, _sync_get)
+
+        if not row:
+            base = {"date": today, "status": "NO_DATA"}
+            base.update(await asyncio.get_running_loop().run_in_executor(None, lambda: self._scoreboard_activity_breakdown_sync(today)))
+            return base
+
+        data = dict(zip(columns, row, strict=False))
+        breakdown = await asyncio.get_running_loop().run_in_executor(None, lambda: self._scoreboard_activity_breakdown_sync(today))
+        data.update(breakdown)
+        return data
+
+    # =========================================================================
+    # OPERATOR CONSOLE METHODS (Phase A)
+    # =========================================================================
+
+    async def get_operator_status(self) -> dict[str, Any]:
+        """
+        Single-glance operator status for dashboard.
+        Returns compact JSON with all critical metrics.
+        """
+        # Get last trade
+        last_trade = await self._get_last_trade()
+        time_since_last = 0
+        if last_trade and last_trade.get("ts"):
+            try:
+                last_ts = datetime.fromisoformat(last_trade["ts"].replace("Z", "+00:00"))
+                time_since_last = (datetime.now(timezone.utc) - last_ts).total_seconds()
+            except (ValueError, AttributeError):
+                pass
+
+        # Recalculate account_status using same logic as invariants
+        equity_check = self.cash_balance + self._positions_value
+        equity_diff = abs(self._total_equity - equity_check)
+        if equity_diff < 1.0:
+            current_account_status = AccountStatus.HEALTHY
+        elif self._account_status == AccountStatus.OVERALLOCATED:
+            current_account_status = AccountStatus.OVERALLOCATED
+        else:
+            current_account_status = self._account_status
+
+        # Calculate risk percentage
+        risk_pct = (self._total_open_risk / self._total_equity * 100) if self._total_equity > 0 else 0
+        risk_cap_pct = MAX_TOTAL_OPEN_RISK_PCT * 100
+
+        # F7: effective mode from runtime switch (EXECUTION_MODE + LIVE_TRADES_ALLOWED)
+        from backend.services.execution_mode_service import is_live_execution_allowed_sync
+
+        effective_live = self._live_service is not None and self._live_execution_enabled and is_live_execution_allowed_sync()
+        from backend.config.live_test_mode import get_live_test_api_fields
+
+        mode = "LIVE" if effective_live else "PAPER"
+        return {
+            "mode": mode,
+            "live_execution_enabled": bool(self._live_execution_enabled),
+            "live_service_connected": bool(self._live_service is not None),
+            "real_orders_enabled": effective_live,
+            "kill_switch": self._kill_switch_mode.value,
+            "account_status": current_account_status.value,
+            "trading_paused": self._trading_paused,
+            "pause_reason": self._pause_reason if self._trading_paused else None,
+            "cash_balance": round(self.cash_balance, 2),
+            "positions_value": round(self._positions_value, 2),
+            "total_equity": round(self._total_equity, 2),
+            "open_positions_count": len(self.open_positions),
+            "max_positions": MAX_OPEN_POSITIONS,
+            "total_open_risk": round(self._total_open_risk, 2),
+            "open_risk_pct": round(risk_pct, 2),
+            "risk_cap_pct": risk_cap_pct,
+            "last_trade": last_trade,
+            "time_since_last_trade_seconds": round(time_since_last, 1),
+            "regime_risk_multiplier": self._regime_state.risk_multiplier,
+            "guards_active": {
+                "vol_spike": self._regime_state.vol_spike_active,
+                "drawdown": self._regime_state.drawdown_guard_active,
+                "churn": self._regime_state.churn_guard_active,
+            },
+            "governance_hold_reason": self._last_governance_hold_reason,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **get_live_test_api_fields(),
+        }
+
+    async def _get_last_trade(self) -> dict | None:
+        """Get last executed trade from audit"""
+
+        def _sync_get():
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT ts, action, symbol, qty, price, fees,
+                           invariant_diff, entry_reason, exit_reason
+                    FROM portfolio_engine_audit
+                    ORDER BY id DESC LIMIT 1
+                """)
+                row = cursor.fetchone()
+                return row
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        row = await loop.run_in_executor(None, _sync_get)
+
+        if not row:
+            return None
+
+        return {
+            "ts": row[0],
+            "side": row[1],
+            "symbol": row[2],
+            "qty": row[3],
+            "price": row[4],
+            "fees": row[5],
+            "pnl": row[6],
+            "reason": row[8] if row[1] == "SELL" else row[7],
+        }
+
+    async def get_latency_metrics(self) -> dict[str, Any]:
+        """
+        Get latency and data freshness metrics.
+        Uses REDIS cached data only - no direct Binance API calls to respect rate limits (1200 weight/min).
+        """
+        from backend.config.trading_universe import TRADING_SYMBOLS
+
+        # Get market data freshness per symbol from REDIS CACHE ONLY (no API calls)
+        symbol_freshness = {}
+        try:
+            import json
+
+            from backend.config.redis_config import get_shared_redis_async
+
+            redis = get_shared_redis_async()
+
+            def _redis_field(mapping: dict, key: str) -> Any:
+                if not mapping:
+                    return None
+                if key in mapping:
+                    return mapping[key]
+                bkey = key.encode()
+                return mapping.get(bkey)
+
+            for symbol in TRADING_SYMBOLS:
+                base_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol.split("/")[0]
+                ccxt_symbol = f"{base_symbol}/USDT"
+
+                try:
+                    ts: float | None = None
+                    price: float | None = None
+                    spread = None
+                    spread_pct = None
+                    bid = None
+                    ask = None
+                    source = "no_redis_cache"
+
+                    cache_key = f"market:{base_symbol}"
+                    cached_data = await redis.get(cache_key)
+                    if cached_data:
+                        data = json.loads(cached_data)
+                        price_raw = data.get("price")
+                        price = float(price_raw) if price_raw is not None else None
+                        ts_str = data.get("timestamp")
+                        if ts_str:
+                            try:
+                                dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+                                ts = dt.timestamp()
+                            except (ValueError, AttributeError, TypeError):
+                                with contextlib.suppress(ValueError, TypeError):
+                                    ts = float(ts_str)
+                        spread = data.get("spread")
+                        spread_pct = data.get("spread_pct")
+                        bid = data.get("bid")
+                        ask = data.get("ask")
+                        source = "market_cache"
+
+                    if ts is None:
+                        price_hash = await redis.hgetall(f"price:{base_symbol}")
+                        if price_hash:
+                            ts_raw = _redis_field(price_hash, "timestamp")
+                            price_raw = _redis_field(price_hash, "v")
+                            if ts_raw is not None:
+                                with contextlib.suppress(ValueError, TypeError):
+                                    ts = float(ts_raw)
+                            if price_raw is not None:
+                                with contextlib.suppress(ValueError, TypeError):
+                                    price = float(price_raw)
+                            source = str(_redis_field(price_hash, "source") or "price_publisher")
+
+                    if ts is not None or price is not None:
+                        age = time.time() - ts if ts is not None else -1
+                        symbol_freshness[ccxt_symbol] = {
+                            "last_update_ts": ts,
+                            "age_seconds": round(age, 1) if age >= 0 else -1,
+                            "stale": age > 60 or age < 0,
+                            "price": price,
+                            "spread": spread,
+                            "spread_pct": round(spread_pct, 4) if spread_pct else None,
+                            "bid": bid,
+                            "ask": ask,
+                            "source": source,
+                        }
+                    else:
+                        symbol_freshness[ccxt_symbol] = {"age_seconds": -1, "stale": True, "error": "no_redis_cache"}
+                except Exception as e:
+                    symbol_freshness[ccxt_symbol] = {"age_seconds": -1, "stale": True, "error": str(e)[:50]}
+        except Exception as e:
+            logger.warning(f"Failed to get market data freshness from Redis: {e}")
+
+        # Get execution latency from audit (approximation)
+        decision_to_exec_ms = await self._get_execution_latency()
+
+        # Health flags
+        stale_count = sum(1 for s in symbol_freshness.values() if s.get("stale", True))
+        total_symbols = len(symbol_freshness) or len(TRADING_SYMBOLS)
+        health_flag = "OK"
+        if stale_count >= total_symbols > 0:
+            health_flag = "STALE_DATA"
+        elif stale_count > 0:
+            health_flag = "PARTIAL_STALE"
+
+        return {
+            "symbol_freshness": symbol_freshness,
+            "decision_to_execution_ms": decision_to_exec_ms,
+            "order_submit_to_fill_ms": {"avg": 0, "p95": 0},  # Paper mode - instant
+            "health_flag": health_flag,
+            "stale_symbol_count": stale_count,
+            "total_symbols": len(TRADING_SYMBOLS),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    async def _get_execution_latency(self) -> dict:
+        """Get rolling execution latency metrics"""
+        # In paper mode, execution is instant
+        # This is a placeholder for live mode metrics
+        return {"avg": 5, "p95": 15, "samples": 0}
+
+    async def get_audit_export(self, hours: int = 24) -> list[dict]:
+        """Export audit records for last N hours"""
+
+        def _sync_get():
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT * FROM portfolio_engine_audit
+                    WHERE ts >= datetime('now', '-' || ? || ' hours')
+                    ORDER BY id DESC
+                    """,
+                    (hours,),
+                )
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                return rows, columns
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        rows, columns = await loop.run_in_executor(None, _sync_get)
+
+        return [dict(zip(columns, row, strict=False)) for row in rows]
+
+    async def get_rolling_24h_risk_metrics(self) -> tuple[float, int]:
+        """
+        Compute rolling 24h drawdown (pct) and consecutive losses from audit.
+        Returns (drawdown_pct as 0.0-1.0, consec_losses count).
+        """
+        current_equity = self._total_equity
+
+        def _sync_metrics():
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT id, ts, action, pre_ledger_json, post_ledger_json
+                    FROM portfolio_engine_audit
+                    WHERE ts >= datetime('now', '-24 hours')
+                    ORDER BY id ASC
+                    """
+                )
+                rows = cursor.fetchall()
+
+                peak_equity = current_equity
+                diag_mode = os.getenv("DIAG_MODE", "false").lower() == "true"
+                peak_ts: str | None = None
+                trough_equity = current_equity
+                trough_ts: str | None = None
+                for row in rows:
+                    try:
+                        _, ts, _, _, post_j = row[0], row[1], row[2], row[3], row[4]
+                        post_parsed = json.loads(post_j or "{}")
+                        eq = float(post_parsed.get("total_equity", 0) or 0)
+                        if eq > peak_equity:
+                            peak_equity = eq
+                            if diag_mode:
+                                peak_ts = str(ts)
+                        if diag_mode and eq < trough_equity and eq > 0:
+                            trough_equity = eq
+                            trough_ts = str(ts)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        continue
+                drawdown_pct = 0.0
+                if peak_equity > 0 and current_equity < peak_equity:
+                    drawdown_pct = (peak_equity - current_equity) / peak_equity
+                if diag_mode:
+                    logger.info(
+                        "DRAWDOWN_24H_RAW: peak=%.2f peak_ts=%s trough=%.2f trough_ts=%s current=%.2f n=%s dd_pct=%.2f",
+                        peak_equity,
+                        peak_ts or "n/a",
+                        trough_equity,
+                        trough_ts or "n/a",
+                        current_equity,
+                        len(rows),
+                        drawdown_pct * 100.0,
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT action, pre_ledger_json, post_ledger_json
+                    FROM portfolio_engine_audit
+                    ORDER BY id DESC
+                    LIMIT 100
+                    """
+                )
+                sell_rows = cursor.fetchall()
+
+                consec = 0
+                for r in sell_rows:
+                    if r[0] != "SELL":
+                        continue
+                    try:
+                        pre_j = json.loads(r[1] or "{}")
+                        post_j = json.loads(r[2] or "{}")
+                        pre_eq = float(pre_j.get("total_equity", 0) or 0)
+                        post_eq = float(post_j.get("total_equity", 0) or 0)
+                        if post_eq < pre_eq:
+                            consec += 1
+                        else:
+                            break
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        break
+                return (drawdown_pct, consec)
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _sync_metrics)
+
+    async def build_dashboard_canonical_snapshot(self) -> dict[str, Any]:
+        """
+        Single coherent dashboard payload: reload SQLite → recompute marks → sleeves/risk/performance/trades.
+        Used by /api/portfolio-engine/dashboard-canonical so UI panels cannot diverge.
+        """
+        violations: list[str] = []
+        try:
+            await self._load_ledger_from_sqlite()
+        except Exception as e:
+            violations.append(f"ledger_load:{type(e).__name__}")
+            logger.warning("DASHBOARD_SNAPSHOT: ledger load failed: %s", e)
+        try:
+            await self._load_positions_from_sqlite()
+        except Exception as e:
+            violations.append(f"positions_load:{type(e).__name__}")
+            logger.warning("DASHBOARD_SNAPSHOT: positions load failed: %s", e)
+
+        await self._recompute_positions_values(await self._fetch_mtm_prices_for_open_positions() or None)
+
+        positions_rows: list[dict[str, Any]] = []
+        for symbol, pos in sorted(self.open_positions.items(), key=lambda x: x[0]):
+            if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
+                continue
+            row = self.build_open_position_api_row(symbol, pos)
+            entry_ts = float(pos.entry_time or 0)
+            created = datetime.fromtimestamp(entry_ts, tz=timezone.utc).isoformat() if entry_ts else datetime.now(timezone.utc).isoformat()
+            row.update(
+                {
+                    "realized_pnl": 0.0,
+                    "total_pnl": row["unrealized_pnl"],
+                    "market_value": row["quantity"] * row["current_price"],
+                    "created_at": created,
+                    "last_updated": created,
+                }
+            )
+            positions_rows.append(row)
+
+        n_open = len(positions_rows)
+        rows_u = sum(float(p["unrealized_pnl"]) for p in positions_rows)
+        if n_open > 0 and abs(rows_u - self._unrealized_pnl) > 0.05 + 0.001 * n_open:
+            violations.append(f"unrealized_row_sum_mismatch:sum_rows={rows_u:.4f}_engine={self._unrealized_pnl:.4f}")
+
+        sleeve_mkt_total = sum(self._sleeve_market_notional_cache.values())
+        if n_open > 0 and sleeve_mkt_total < 1e-6:
+            violations.append("open_positions_but_zero_sleeve_market_notional")
+
+        c_core = self._sleeve_position_count(Sleeve.CORE.value)
+        c_act = self._sleeve_position_count(Sleeve.ACTIVE.value)
+        if c_core + c_act != n_open:
+            violations.append(f"sleeve_position_count_mismatch:core={c_core}_active={c_act}_open_rows={n_open}")
+
+        ledger = await self.get_ledger()
+        unreal_ledger = float(ledger.get("unrealized_pnl", 0) or 0)
+        if n_open > 0 and abs(unreal_ledger - self._unrealized_pnl) > 0.05:
+            violations.append(f"ledger_unrealized_mismatch:ledger={unreal_ledger:.4f}_engine={self._unrealized_pnl:.4f}")
+
+        realized = float(ledger.get("realized_pnl", 0) or 0)
+        total_risk = self._calculate_total_open_risk()
+        eq_op = self.cash_balance + self._positions_value
+        equity_invariant_ok = abs(self._total_equity - eq_op) < 1.0
+        risk_pct = (total_risk / self._total_equity * 100) if self._total_equity > 0 else 0.0
+        position_risks: list[dict[str, Any]] = []
+        for sym, pos in self.open_positions.items():
+            if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
+                continue
+            r_usd = float(getattr(pos, "risk_usd", 0.0) or 0.0)
+            position_risks.append(
+                {
+                    "symbol": sym,
+                    "risk_usd": r_usd,
+                    "risk_pct": (r_usd / self._total_equity * 100) if self._total_equity > 0 else 0,
+                }
+            )
+
+        risk_block = {
+            "account_status": self._account_status.value,
+            "trading_paused": self._trading_paused,
+            "pause_reason": self._pause_reason if self._trading_paused else None,
+            "equity_invariant_ok": equity_invariant_ok,
+            "overallocated": self._account_status == AccountStatus.OVERALLOCATED,
+            "total_equity": self._total_equity,
+            "cash_balance": self.cash_balance,
+            "positions_value": self._positions_value,
+            "available_balance": self._available_balance,
+            "total_open_risk_usd": total_risk,
+            "total_open_risk_pct": risk_pct,
+            "max_risk_pct": MAX_TOTAL_OPEN_RISK_PCT * 100,
+            "risk_cap_remaining_pct": max(0, MAX_TOTAL_OPEN_RISK_PCT * 100 - risk_pct),
+            "position_risks": position_risks,
+        }
+
+        def _sync_trades() -> list[Any]:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cur = conn.cursor()
+                cur.execute("PRAGMA table_info(paper_trades)")
+                cols = {row[1] for row in cur.fetchall()}
+                sleeve_sql = "COALESCE(sleeve, 'ACTIVE')" if "sleeve" in cols else "'ACTIVE'"
+                cur.execute(
+                    f"""
+                    SELECT symbol, side, quantity, price, pnl, timestamp, {sleeve_sql}
+                    FROM paper_trades
+                    WHERE COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR')
+                    ORDER BY id DESC
+                    LIMIT 50
+                    """
+                )
+                return list(cur.fetchall())
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        trade_rows = await loop.run_in_executor(None, _sync_trades)
+        trades_data: list[dict[str, Any]] = []
+        for r in trade_rows:
+            trades_data.append(
+                {
+                    "symbol": r[0],
+                    "side": r[1],
+                    "quantity": r[2],
+                    "price": r[3],
+                    "pnl": float(r[4]) if r[4] is not None else None,
+                    "timestamp": r[5],
+                    "sleeve": r[6] if len(r) > 6 else Sleeve.ACTIVE.value,
+                }
+            )
+
+        sells = [t for t in trades_data if str(t.get("side", "")).upper() == "SELL" and t.get("pnl") is not None]
+        wins = sum(1 for t in sells if float(t["pnl"]) > 0)
+        losses = sum(1 for t in sells if float(t["pnl"]) < 0)
+        nt = len(sells)
+        win_rate = (wins / nt * 100) if nt > 0 else 0.0
+
+        principal_val = float(ledger.get("principal", self.principal) or 0)
+        account_return_pnl = float(self._total_equity) - principal_val
+        component_pnl_sum = realized + float(self._unrealized_pnl or 0)
+
+        perf_block = {
+            "realized_pnl": realized,
+            "unrealized_pnl": self._unrealized_pnl,
+            "total_pnl": account_return_pnl,
+            "component_pnl_sum": component_pnl_sum,
+            "total_trades": nt,
+            "winning_trades": wins,
+            "losing_trades": losses,
+            "win_rate": win_rate,
+            "total_equity": self._total_equity,
+            "principal": principal_val,
+            "cash_balance": self.cash_balance,
+            "positions_value": self._positions_value,
+        }
+
+        scoreboard_today = await self.get_scoreboard_today()
+
+        def _sync_daily() -> dict[str, Any]:
+            from backend.services.daily_performance_snapshot import compute_snapshot
+
+            return compute_snapshot(self.db_path)
+
+        daily_perf = await loop.run_in_executor(None, _sync_daily)
+        self._compute_total_open_risk()
+        operator = await self.get_operator_status()
+        sleeve_status = {
+            "sleeve_enabled": SLEEVE_ENABLED,
+            "sleeves": self.get_sleeve_summary() if SLEEVE_ENABLED else {},
+            "sleeve_cutover": self.get_sleeve_cutover() if SLEEVE_ENABLED else None,
+        }
+        inv = self.get_invariants_status()
+        inv["all_invariants_pass"] = bool(inv.get("all_ok", False))
+        inv["dashboard_cross_check_warnings"] = violations
+        inv["dashboard_consistency_ok"] = len(violations) == 0
+
+        await self.sync_regime_label_from_redis(force=True)
+        rs = self._regime_state
+        _raw_reg = getattr(rs, "regime", None) or "unknown"
+        regime_norm = str(_raw_reg).strip().lower() or "unknown"
+        regime_upstream: dict[str, Any] = {}
+        try:
+            import json as _json
+
+            from backend.config.redis_config import get_shared_redis_async
+
+            _redis = get_shared_redis_async()
+            _raw_regime = await _redis.get("market_regime:global")
+            if _raw_regime:
+                _reg_data = _json.loads(_raw_regime)
+                if _reg_data.get("regime"):
+                    regime_norm = str(_reg_data["regime"]).strip().lower()
+                regime_upstream = {
+                    "source": _reg_data.get("source"),
+                    "raw_value": _reg_data.get("raw_value"),
+                    "score": _reg_data.get("score"),
+                }
+        except Exception:
+            pass
+        regime_payload: dict[str, Any] = {
+            "regime": regime_norm,
+            "confidence": float(getattr(rs, "confidence", 0.0) or 0.0),
+            "effective_risk_multiplier": float(rs.risk_multiplier),
+            "label_source": "redis:market_regime:global" if regime_upstream else "engine_memory",
+            "upstream": regime_upstream,
+            "guards_active": {
+                "vol_spike": bool(rs.vol_spike_active),
+                "drawdown_guard": bool(rs.drawdown_guard_active),
+                "churn_guard": bool(rs.churn_guard_active),
+                "spread_blocked_count": len(rs.spread_blocked_symbols),
+            },
+        }
+
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "consistency_ok": len(violations) == 0,
+            "consistency_violations": violations,
+            "position_exit_policy": {
+                "automated_sells_triggered_by": "executable_net_profit_after_costs_only",
+                "stop_tp_fields_are_advisory_metadata_only": True,
+            },
+            "regime": regime_payload,
+            "positions": {"positions": positions_rows, "count": n_open, "source": "portfolio_engine_canonical"},
+            "performance": {"performance": perf_block, "trades": trades_data[:30]},
+            "sleeves": sleeve_status,
+            "risk": risk_block,
+            "scoreboard_today": scoreboard_today,
+            "daily_performance": daily_perf,
+            "operator": operator,
+            "invariants": inv,
+        }
+
+    async def get_snapshot(self) -> dict[str, Any]:
+        """
+        Get full snapshot for reporting (ledger + scoreboard + last trades).
+        """
+        # Ledger
+        ledger = {
+            "principal": self.principal,
+            "cash_balance": self.cash_balance,
+            "positions_value": self._positions_value,
+            "total_equity": self._total_equity,
+            "realized_pnl": self._realized_pnl,
+            "unrealized_pnl": self._unrealized_pnl,
+            "account_status": self._account_status.value,
+        }
+
+        # Positions
+        positions = []
+        for sym, pos in self.open_positions.items():
+            positions.append(
+                {
+                    "symbol": sym,
+                    "quantity": pos.quantity,
+                    "entry_price": pos.entry_price,
+                    "current_value": pos.quantity * pos.entry_price,
+                }
+            )
+
+        # Scoreboard
+        scoreboard = await self.get_scoreboard(7)
+
+        # Last 20 trades
+        last_trades = await self._get_recent_audit(20)
+
+        return {
+            "ledger": ledger,
+            "positions": positions,
+            "scoreboard": scoreboard,
+            "last_trades": last_trades,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def get_invariants_status(self) -> dict[str, Any]:
+        """Get detailed invariants status for dashboard"""
+        # Equity invariant: total_equity == cash_balance + positions_value
+        # positions_value is already at market (includes unrealized); do NOT add unrealized again
+        equity_check = self.cash_balance + self._positions_value
+        equity_diff = self._total_equity - equity_check
+        equity_ok = abs(equity_diff) < 1.0
+
+        # Position limit invariant
+        position_ok = len(self.open_positions) <= MAX_OPEN_POSITIONS
+
+        # Risk cap invariant
+        risk_cap = self._total_equity * MAX_TOTAL_OPEN_RISK_PCT
+        risk_ok = self._total_open_risk <= risk_cap * 1.1  # 10% tolerance
+
+        # Symbol stacking invariant
+        symbols = list(self.open_positions.keys())
+        stacking_ok = len(symbols) == len(set(symbols))
+
+        # Regime guards
+        # Note: "unknown" regime is acceptable at startup - don't fail readiness for it
+        regime_ok = True  # Allow any regime including "unknown" - regime detection is informational
+        vol_spike_ok = not self._regime_state.vol_spike_active
+        drawdown_ok = not self._regime_state.drawdown_guard_active
+        churn_ok = True  # churn guard tightens criteria but doesn't hard-block
+        spread_ok = len(self._regime_state.spread_blocked_symbols) == 0
+
+        all_ok = equity_ok and position_ok and risk_ok and stacking_ok and regime_ok and vol_spike_ok and drawdown_ok and churn_ok and spread_ok
+
+        named_checks: list[tuple[str, bool]] = [
+            ("equity_invariant", equity_ok),
+            ("position_limit", position_ok),
+            ("risk_cap", risk_ok),
+            ("no_stacking", stacking_ok),
+            ("regime_guard", regime_ok),
+            ("vol_spike_guard", vol_spike_ok),
+            ("drawdown_guard", drawdown_ok),
+            ("churn_guard", churn_ok),
+            ("spread_blocks", spread_ok),
+        ]
+        snapshot_failed_keys = [name for name, ok in named_checks if not ok]
+
+        # Reset violation counter if all checks pass
+        if all_ok:
+            self.invariant_violations = 0
+
+        return {
+            "all_ok": all_ok,
+            "equity_invariant": {
+                "ok": equity_ok,
+                "expected": self._total_equity,
+                "actual": equity_check,
+                "diff": round(equity_diff, 4),
+            },
+            "position_limit": {
+                "ok": position_ok,
+                "current": len(self.open_positions),
+                "max": MAX_OPEN_POSITIONS,
+            },
+            "risk_cap": {
+                "ok": risk_ok,
+                "current_risk": round(self._total_open_risk, 2),
+                "max_risk": round(risk_cap, 2),
+                "pct_used": round(self._total_open_risk / risk_cap * 100, 1) if risk_cap > 0 else 0,
+            },
+            "no_stacking": {
+                "ok": stacking_ok,
+                "symbols": symbols,
+            },
+            "regime_guard": {
+                "ok": regime_ok,
+                "regime": getattr(self._regime_state, "regime", "unknown"),
+            },
+            "vol_spike_guard": {
+                "ok": vol_spike_ok,
+                "active": self._regime_state.vol_spike_active,
+            },
+            "drawdown_guard": {
+                "ok": drawdown_ok,
+                "active": self._regime_state.drawdown_guard_active,
+                "drawdown_pct": round(self._regime_state.current_drawdown_pct * 100, 2),
+            },
+            "churn_guard": {
+                "ok": churn_ok,
+                "active": self._regime_state.churn_guard_active,
+            },
+            "spread_blocks": {
+                "ok": spread_ok,
+                "blocked_symbols": list(self._regime_state.spread_blocked_symbols.keys()),
+            },
+            "snapshot_failed_count": len(snapshot_failed_keys),
+            "snapshot_failed_keys": snapshot_failed_keys,
+            "invariant_events_total": self.invariant_violations,
+            "total_violations": self.invariant_violations,
+        }
+
+    # =========================================================================
+    # UTILITY METHODS
+    # =========================================================================
+
+    def _parse_timestamp(self, ts: str | float) -> float:
+        """Parse timestamp to float"""
+        if isinstance(ts, float):
+            return ts
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.timestamp()
+        except (ValueError, AttributeError):
+            return time.time()
+
+    async def _update_pipeline_decision(self, decision_id: str, updates: dict[str, Any]) -> None:
+        """Update existing pipeline decision with new stage data"""
+        try:
+
+            def _db_operation():
+                def _op() -> None:
+                    with connect_rw(DATABASE_PATH) as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        cursor = conn.cursor()
+
+                        update_fields = []
+                        update_values = []
+
+                        for key, value in updates.items():
+                            update_fields.append(f"{key} = ?")
+                            update_values.append(value)
+
+                        update_values.append(decision_id)
+
+                        cursor.execute(
+                            f"""
+                            UPDATE pipeline_decisions
+                            SET {", ".join(update_fields)}
+                            WHERE decision_id = ?
+                            """,
+                            update_values,
+                        )
+
+                        conn.commit()
+
+                run_locked_retry(_op)
+
+            await asyncio.to_thread(_db_operation)
+
+        except Exception as e:
+            logger.warning(f"Failed to update pipeline decision {decision_id}: {e}")
+
+
+# Singleton instance
+_portfolio_engine: PortfolioEngine | None = None
+_portfolio_engine_initialized: bool = False
+
+
+def get_portfolio_engine() -> PortfolioEngine:
+    """Get singleton portfolio engine instance. Uses DATABASE_PATH so engine and canonical tables (trade_performance, paper_trades) share the same DB."""
+    global _portfolio_engine
+    if _portfolio_engine is None:
+        _portfolio_engine = PortfolioEngine(db_path=DATABASE_PATH)
+    return _portfolio_engine
+
+
+async def initialize_portfolio_engine() -> PortfolioEngine:
+    """
+    Initialize portfolio engine from canonical sources.
+
+    CANONICAL SOURCES (paper mode):
+    - portfolio_engine_positions + portfolio_engine_ledger in SQLite
+    - PaperTradingService / Redis are refreshed from SQLite (cache only)
+
+    NOT from paper_trades.remaining_position alone.
+    """
+    global _portfolio_engine_initialized
+    engine = get_portfolio_engine()
+    await engine.initialize_from_canonical_sources()
+    _portfolio_engine_initialized = True
+    return engine
+
+
+def is_portfolio_engine_initialized() -> bool:
+    """Check if portfolio engine has been initialized from canonical sources"""
+    return _portfolio_engine_initialized

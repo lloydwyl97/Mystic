@@ -1,0 +1,758 @@
+[
+  {
+    "id": 4015,
+    "ts": "2026-03-25T15:11:00.032110+00:00",
+    "symbol": "ADA/USDT",
+    "side": "BUY",
+    "reason": "SPREAD_SPIKE: symbol blocked until bar 1774451700.0",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774451460
+  },
+  {
+    "id": 4016,
+    "ts": "2026-03-25T15:12:00.039385+00:00",
+    "symbol": "ADA/USDT",
+    "side": "BUY",
+    "reason": "SPREAD_SPIKE: symbol blocked until bar 1774451700.0",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774451520
+  },
+  {
+    "id": 4017,
+    "ts": "2026-03-25T15:17:00.031752+00:00",
+    "symbol": "LTC/USDT",
+    "side": "BUY",
+    "reason": "SPREAD_SPIKE: symbol blocked until bar 1774451820.0",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774451820
+  },
+  {
+    "id": 4018,
+    "ts": "2026-03-25T15:23:00.029783+00:00",
+    "symbol": "LINK/USDT",
+    "side": "BUY",
+    "reason": "SPREAD_SPIKE: symbol blocked until bar 1774452300",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774452180
+  },
+  {
+    "id": 4019,
+    "ts": "2026-03-25T15:24:00.027736+00:00",
+    "symbol": "LINK/USDT",
+    "side": "BUY",
+    "reason": "SPREAD_SPIKE: symbol blocked until bar 1774452300",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774452240
+  },
+  {
+    "id": 4020,
+    "ts": "2026-03-25T15:25:00.049728+00:00",
+    "symbol": "LINK/USDT",
+    "side": "BUY",
+    "reason": "SPREAD_SPIKE: symbol blocked until bar 1774452300",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774452300
+  },
+  {
+    "id": 4021,
+    "ts": "2026-03-25T15:37:00.016032+00:00",
+    "symbol": "ADA/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774453020
+  },
+  {
+    "id": 4022,
+    "ts": "2026-03-25T15:38:00.027655+00:00",
+    "symbol": "ADA/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774453080
+  },
+  {
+    "id": 4023,
+    "ts": "2026-03-25T15:39:00.030545+00:00",
+    "symbol": "ADA/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774453140
+  },
+  {
+    "id": 4024,
+    "ts": "2026-03-25T15:40:00.031895+00:00",
+    "symbol": "ADA/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774453200
+  },
+  {
+    "id": 4025,
+    "ts": "2026-03-25T15:42:00.028787+00:00",
+    "symbol": "ADA/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774453320
+  },
+  {
+    "id": 4026,
+    "ts": "2026-03-25T15:43:00.025669+00:00",
+    "symbol": "ADA/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774453380
+  },
+  {
+    "id": 4027,
+    "ts": "2026-03-25T15:44:00.015192+00:00",
+    "symbol": "ADA/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774453440
+  },
+  {
+    "id": 4028,
+    "ts": "2026-03-25T16:30:00.031848+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774456200
+  },
+  {
+    "id": 4029,
+    "ts": "2026-03-25T16:31:00.034850+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774456260
+  },
+  {
+    "id": 4030,
+    "ts": "2026-03-25T16:32:00.022497+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774456320
+  },
+  {
+    "id": 4031,
+    "ts": "2026-03-25T16:33:00.028585+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774456380
+  },
+  {
+    "id": 4032,
+    "ts": "2026-03-25T16:34:00.027358+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774456440
+  },
+  {
+    "id": 4033,
+    "ts": "2026-03-25T16:35:00.025351+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774456500
+  },
+  {
+    "id": 4034,
+    "ts": "2026-03-25T16:36:00.072782+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774456560
+  },
+  {
+    "id": 4035,
+    "ts": "2026-03-25T16:37:00.028285+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774456620
+  },
+  {
+    "id": 4036,
+    "ts": "2026-03-25T16:38:00.058887+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774456680
+  },
+  {
+    "id": 4037,
+    "ts": "2026-03-25T16:39:00.024034+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774456740
+  },
+  {
+    "id": 4038,
+    "ts": "2026-03-25T16:40:00.021719+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774456800
+  },
+  {
+    "id": 4039,
+    "ts": "2026-03-25T16:41:00.030999+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "quarantined: stale_position_removed",
+    "filter_name": "QUARANTINE",
+    "bar_timestamp": 1774456860
+  },
+  {
+    "id": 4040,
+    "ts": "2026-03-25T18:44:00.037686+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774464240
+  },
+  {
+    "id": 4041,
+    "ts": "2026-03-25T18:45:00.032197+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774464300
+  },
+  {
+    "id": 4042,
+    "ts": "2026-03-25T18:46:00.036306+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774464360
+  },
+  {
+    "id": 4043,
+    "ts": "2026-03-25T18:47:00.034392+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774464420
+  },
+  {
+    "id": 4044,
+    "ts": "2026-03-25T18:48:00.035040+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774464480
+  },
+  {
+    "id": 4045,
+    "ts": "2026-03-25T18:49:00.037088+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774464540
+  },
+  {
+    "id": 4046,
+    "ts": "2026-03-25T18:50:00.043372+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774464600
+  },
+  {
+    "id": 4047,
+    "ts": "2026-03-25T18:51:00.033270+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774464660
+  },
+  {
+    "id": 4048,
+    "ts": "2026-03-25T18:52:00.034243+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774464720
+  },
+  {
+    "id": 4049,
+    "ts": "2026-03-25T18:53:00.023473+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774464780
+  },
+  {
+    "id": 4050,
+    "ts": "2026-03-25T18:54:00.037025+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774464840
+  },
+  {
+    "id": 4051,
+    "ts": "2026-03-25T18:55:00.037896+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774464900
+  },
+  {
+    "id": 4052,
+    "ts": "2026-03-25T18:56:00.025242+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774464960
+  },
+  {
+    "id": 4053,
+    "ts": "2026-03-25T18:57:00.041541+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465020
+  },
+  {
+    "id": 4054,
+    "ts": "2026-03-25T18:58:00.032133+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465080
+  },
+  {
+    "id": 4055,
+    "ts": "2026-03-25T18:59:00.036973+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465140
+  },
+  {
+    "id": 4056,
+    "ts": "2026-03-25T19:00:00.036703+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465200
+  },
+  {
+    "id": 4057,
+    "ts": "2026-03-25T19:01:00.043027+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465260
+  },
+  {
+    "id": 4058,
+    "ts": "2026-03-25T19:02:00.032858+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465320
+  },
+  {
+    "id": 4059,
+    "ts": "2026-03-25T19:03:00.037425+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465380
+  },
+  {
+    "id": 4060,
+    "ts": "2026-03-25T19:04:00.033482+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465440
+  },
+  {
+    "id": 4061,
+    "ts": "2026-03-25T19:05:00.034344+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465500
+  },
+  {
+    "id": 4062,
+    "ts": "2026-03-25T19:06:00.037248+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465560
+  },
+  {
+    "id": 4063,
+    "ts": "2026-03-25T19:07:00.024420+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465620
+  },
+  {
+    "id": 4064,
+    "ts": "2026-03-25T19:08:00.033753+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465680
+  },
+  {
+    "id": 4065,
+    "ts": "2026-03-25T19:09:00.033379+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465740
+  },
+  {
+    "id": 4066,
+    "ts": "2026-03-25T19:10:00.023044+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465800
+  },
+  {
+    "id": 4067,
+    "ts": "2026-03-25T19:11:00.036424+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465860
+  },
+  {
+    "id": 4068,
+    "ts": "2026-03-25T19:12:00.037955+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465920
+  },
+  {
+    "id": 4069,
+    "ts": "2026-03-25T19:13:00.033416+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774465980
+  },
+  {
+    "id": 4070,
+    "ts": "2026-03-25T19:14:00.024661+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466040
+  },
+  {
+    "id": 4071,
+    "ts": "2026-03-25T19:15:00.042051+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466100
+  },
+  {
+    "id": 4072,
+    "ts": "2026-03-25T19:16:00.035754+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466160
+  },
+  {
+    "id": 4073,
+    "ts": "2026-03-25T19:17:00.037520+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466220
+  },
+  {
+    "id": 4074,
+    "ts": "2026-03-25T19:18:00.036781+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466280
+  },
+  {
+    "id": 4075,
+    "ts": "2026-03-25T19:19:00.040702+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466340
+  },
+  {
+    "id": 4076,
+    "ts": "2026-03-25T19:20:00.021310+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466400
+  },
+  {
+    "id": 4077,
+    "ts": "2026-03-25T19:21:00.038934+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466460
+  },
+  {
+    "id": 4078,
+    "ts": "2026-03-25T19:22:00.034155+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466520
+  },
+  {
+    "id": 4079,
+    "ts": "2026-03-25T19:23:00.022893+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466580
+  },
+  {
+    "id": 4080,
+    "ts": "2026-03-25T19:24:00.035658+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466640
+  },
+  {
+    "id": 4081,
+    "ts": "2026-03-25T19:25:00.035204+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466700
+  },
+  {
+    "id": 4082,
+    "ts": "2026-03-25T19:26:00.037430+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466760
+  },
+  {
+    "id": 4083,
+    "ts": "2026-03-25T19:27:00.023986+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466820
+  },
+  {
+    "id": 4084,
+    "ts": "2026-03-25T19:28:00.039876+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466880
+  },
+  {
+    "id": 4085,
+    "ts": "2026-03-25T19:29:00.034385+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774466940
+  },
+  {
+    "id": 4086,
+    "ts": "2026-03-25T19:30:00.034049+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774467000
+  },
+  {
+    "id": 4087,
+    "ts": "2026-03-25T19:31:00.032656+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774467060
+  },
+  {
+    "id": 4088,
+    "ts": "2026-03-25T19:32:00.032422+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774467120
+  },
+  {
+    "id": 4089,
+    "ts": "2026-03-25T19:33:00.036579+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774467180
+  },
+  {
+    "id": 4090,
+    "ts": "2026-03-25T19:34:00.033060+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774467240
+  },
+  {
+    "id": 4091,
+    "ts": "2026-03-25T19:35:00.032569+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774467300
+  },
+  {
+    "id": 4092,
+    "ts": "2026-03-25T19:36:00.034374+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774467360
+  },
+  {
+    "id": 4093,
+    "ts": "2026-03-25T19:37:00.037401+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774467420
+  },
+  {
+    "id": 4094,
+    "ts": "2026-03-25T19:38:00.034622+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774467480
+  },
+  {
+    "id": 4095,
+    "ts": "2026-03-25T19:39:00.035401+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774467540
+  },
+  {
+    "id": 4096,
+    "ts": "2026-03-25T19:40:00.031031+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774467600
+  },
+  {
+    "id": 4097,
+    "ts": "2026-03-25T19:41:00.036322+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774467660
+  },
+  {
+    "id": 4098,
+    "ts": "2026-03-25T19:42:00.044054+00:00",
+    "symbol": "ETH/USDT",
+    "side": "BUY",
+    "reason": "DRAWDOWN_GUARD: equity drawdown 13.63%",
+    "filter_name": "REGIME_GUARD",
+    "bar_timestamp": 1774467720
+  }
+]

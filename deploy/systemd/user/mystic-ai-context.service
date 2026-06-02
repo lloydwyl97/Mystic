@@ -1,0 +1,16 @@
+[Unit]
+Description=Mystic AI market context and sentiment collector
+After=network-online.target mystic-market-data.service
+PartOf=mystic.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mystic/mystic
+EnvironmentFile=-/home/mystic/mystic/.env
+ExecStart=/home/mystic/mystic/venv/bin/python /home/mystic/mystic/start_ai_market_context.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=mystic.target

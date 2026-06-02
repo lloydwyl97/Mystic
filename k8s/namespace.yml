@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mystic-trading
+  labels:
+    name: mystic-trading
+    app: mystic-trading-platform

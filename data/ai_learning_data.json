@@ -1,0 +1,23 @@
+{
+  "learning_metrics": {
+    "total_data_points": 2718600,
+    "last_updated": "2026-01-12T20:20:31.358688+00:00",
+    "patterns_discovered": 736,
+    "active_strategies": 3,
+    "accuracy_improvement": 0.5888,
+    "learning_progress": 100.0
+  },
+  "strategy_performance": {
+    "momentum_v1": {
+      "strategy_id": "momentum_v1",
+      "name": "Momentum Strategy",
+      "total_trades": 3,
+      "winning_trades": 0,
+      "losing_trades": 3,
+      "total_pnl": -4.391153366847956,
+      "win_rate": 0.0,
+      "sharpe_ratio": -10.0,
+      "last_updated": "2026-02-27T16:35:24.141131+00:00"
+    }
+  }
+}

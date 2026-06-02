@@ -1,0 +1,40 @@
+{
+  "_documentation": {
+    "description": "Symbols Configuration - All Live Data, No Fallback/Hardcoded Data",
+    "live_data_policy": "All symbols must match backend.config.trading_universe.TRADING_SYMBOLS (Binance.US Top-10 only)",
+    "source": "Live trading universe configuration - single source of truth",
+    "endpoint_references": {
+      "binance_us_api": "https://api.binance.us (live exchange API)",
+      "backend_api": "Port 8000 (for live trading operations)",
+      "all_connections": "Live endpoints - no fallback/hardcoded data"
+    },
+    "note": "This file contains ALL 10 Binance.US Top-10 symbols. Keep synchronized with trading_universe.py"
+  },
+  "exchanges": {
+    "binance_us": {
+      "name": "Binance US",
+      "base_url": "https://api.binance.us",
+      "symbols": [
+        "BTCUSDT",
+        "ETHUSDT",
+        "ADAUSDT",
+        "SOLUSDT",
+        "DOGEUSDT",
+        "XRPUSDT",
+        "BCHUSDT",
+        "LTCUSDT",
+        "AVAXUSDT",
+        "LINKUSDT"
+      ],
+      "_symbols_info": {
+        "count": 10,
+        "source": "backend.config.trading_universe.TRADING_SYMBOLS",
+        "all_binance_us_top10": true,
+        "live_configuration": true
+      },
+      "enabled": true,
+      "rate_limit": 5,
+      "priority": 1
+    }
+  }
+}

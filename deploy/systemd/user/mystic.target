@@ -1,0 +1,12 @@
+[Unit]
+Description=Mystic local trading stack (24/7)
+After=network-online.target
+Wants=mystic-uvicorn.service
+         mystic-market-data.service
+         mystic-ai-context.service
+         mystic-ai-signals.service
+         mystic-portfolio.service
+         mystic-ai-learning.service
+
+[Install]
+WantedBy=default.target

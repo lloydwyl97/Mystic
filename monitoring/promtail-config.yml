@@ -1,0 +1,86 @@
+# Promtail Configuration - Live Log Collection
+# Collects live logs from Mystic Trading backend (port 8000) and forwards to Loki
+# All log data is live - no fallback or hardcoded data
+
+server:
+  # Promtail HTTP server port (for health checks and metrics)
+  http_listen_port: 9080
+  # gRPC port disabled
+  grpc_listen_port: 0
+
+positions:
+  # Track read positions for live log files (ensures no log loss on restart)
+  filename: /tmp/positions.yaml
+
+clients:
+  # Send live logs to Loki (port 3100) - all data is live from backend
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  # Mystic Trading Application - Live logs from backend (port 8000)
+  # Backend writes live logs to /app/logs/*.log files
+  - job_name: mystic-trading
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: mystic-trading
+          # Live log files from backend application (running on port 8000)
+          __path__: /app/logs/*.log
+    pipeline_stages:
+      # Parse live log entries with structured parsing
+      - match:
+          selector: '{job="mystic-trading"}'
+          stages:
+            - regex:
+                # Parse live log format: timestamp [level] logger: message
+                expression: '^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) \[(?P<level>\w+)\] (?P<logger>[\w\.]+): (?P<message>.+)$'
+            - labels:
+                # Extract labels from live logs for filtering
+                level: level
+                logger: logger
+
+  # Nginx - Live access logs (proxies requests to backend on port 8000)
+  - job_name: nginx-access
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: nginx
+          # Live Nginx access logs (includes requests to backend port 8000)
+          __path__: /var/log/nginx/access.log
+    pipeline_stages:
+      # Parse live Nginx access log entries
+      - match:
+          selector: '{job="nginx"}'
+          stages:
+            - regex:
+                # Parse live Nginx log format with upstream times (to backend port 8000)
+                expression: '^(?P<remote_addr>\S+) - (?P<remote_user>\S+) \[(?P<time_local>[^\]]+)\] "(?P<request>[^"]+)" (?P<status>\d+) (?P<body_bytes_sent>\d+) "(?P<http_referer>[^"]+)" "(?P<http_user_agent>[^"]+)" "(?P<http_x_forwarded_for>[^"]+)" rt=(?P<request_time>[^ ]+) uct="(?P<upstream_connect_time>[^"]+)" uht="(?P<upstream_header_time>[^"]+)" urt="(?P<upstream_response_time>[^"]+)".*'
+            - labels:
+                # Extract method and endpoint from live requests
+                method: '{{ .request | regex_replace_all "^(\\w+) .*" "$1" }}'
+                endpoint: '{{ .request | regex_replace_all "\\w+ (\\S+).*" "$1" }}'
+                status: status
+
+  # System - Live system logs (includes backend process logs)
+  - job_name: system
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: system
+          # Live system logs (includes backend process running on port 8000)
+          __path__: /var/log/syslog
+    pipeline_stages:
+      # Parse live system log entries
+      - match:
+          selector: '{job="system"}'
+          stages:
+            - regex:
+                # Parse live syslog format
+                expression: '^(?P<timestamp>\w+ \d+ \d{2}:\d{2}:\d{2}) (?P<hostname>\w+) (?P<process>\w+)\[(?P<pid>\d+)\]: (?P<message>.+)$'
+            - labels:
+                # Extract hostname and process from live logs
+                hostname: hostname
+                process: process

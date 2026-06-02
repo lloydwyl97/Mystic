@@ -1,0 +1,19 @@
+# Ad# -----------------------------------------------------------------------------
+# Training data (JSON) - can be huge
+# -----------------------------------------------------------------------------
+models/training_data/**/*.json
+# Root-level training/signal artifacts (frequently large)
+.*signals*.json
+.*status*.json
+*signals*.json
+# -----------------------------------------------------------------------------
+# Large ML artifacts (binary)
+# -----------------------------------------------------------------------------
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npz
+*.npy
+*.bind directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)

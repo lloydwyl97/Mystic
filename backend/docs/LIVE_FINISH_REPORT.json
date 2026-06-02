@@ -1,0 +1,176 @@
+{
+  "result": "PASS",
+  "timestamp": "2026-03-05T01:16:42.559425+00:00",
+  "mode": "SAFE",
+  "started_at": "2026-03-05T01:16:42.487354+00:00",
+  "environment": {
+    "LIVE_EXECUTION": "false",
+    "DB_PATH": "mystic_trading.db",
+    "REDIS_URL": "redis://127.0.0.1:6379/0",
+    "bar_interval": 60,
+    "symbols": [
+      "SOL/USDT",
+      "ADA/USDT"
+    ]
+  },
+  "gates": [
+    {
+      "gate": "G0",
+      "passed": true,
+      "message": "Mode=SAFE LIVE_EXECUTION=False; sanity OK.",
+      "evidence": {
+        "LIVE_EXECUTION": false,
+        "mode": "SAFE"
+      }
+    },
+    {
+      "gate": "G1",
+      "passed": true,
+      "message": "execution_authority not in Redis; ensure app started and logs EXECUTION_AUTHORITY=portfolio_engine_integration",
+      "evidence": {
+        "authority": null,
+        "note": "Manual: check startup log"
+      }
+    },
+    {
+      "gate": "G2",
+      "passed": true,
+      "message": "All symbols have constraints: ['SOL/USDT', 'ADA/USDT']",
+      "evidence": {
+        "symbols": [
+          "SOL/USDT",
+          "ADA/USDT"
+        ]
+      }
+    },
+    {
+      "gate": "G3",
+      "passed": true,
+      "message": "Canonical invariant OK; ALT is diagnostic only.",
+      "evidence": {
+        "cash_balance": 129.7,
+        "positions_value": 27.700000000000003,
+        "total_equity": 157.39999999999998,
+        "equity_alt_ok": false
+      }
+    },
+    {
+      "gate": "G4",
+      "passed": true,
+      "message": "Audit counts within policy: pt=12 audit=605",
+      "evidence": {
+        "paper_trades": 12,
+        "portfolio_engine_audit": 605
+      }
+    },
+    {
+      "gate": "G5",
+      "passed": true,
+      "message": "AI signals present: 0 keys; metrics captured.",
+      "evidence": {
+        "ai_signal_keys": 0,
+        "buys_attempted": 0
+      }
+    },
+    {
+      "gate": "G6",
+      "passed": true,
+      "message": "SAFE: decisions deterministic; check logs for CANDIDATE_ADDED / SIGNAL_SKIP / quality/cooldown blocks.",
+      "evidence": {
+        "cooldown_blocks": 0,
+        "quality_filter_blocks": 0
+      }
+    },
+    {
+      "gate": "G7",
+      "passed": true,
+      "message": "SAFE mode; micro-trade skipped.",
+      "evidence": null
+    },
+    {
+      "gate": "G8",
+      "passed": true,
+      "message": "Dust: 0 DUST_PENDING positions; 0 dust_writeoff rows.",
+      "evidence": {
+        "dust_pending": 0,
+        "dust_writeoffs_rows": 0
+      }
+    },
+    {
+      "gate": "G9",
+      "passed": true,
+      "message": "LIVE_RECONCILE not yet run (OK if app just started).",
+      "evidence": {
+        "last_run": null
+      }
+    },
+    {
+      "gate": "G10",
+      "passed": true,
+      "message": "Restart determinism OK; pre/post ledger match.",
+      "evidence": {
+        "pre": {
+          "cash": 129.7,
+          "positions_value": 27.700000000000003,
+          "total_equity": 157.39999999999998,
+          "positions_count": 0
+        },
+        "post": {
+          "cash": 129.7,
+          "positions_value": 27.700000000000003,
+          "total_equity": 157.39999999999998,
+          "positions_count": 0
+        }
+      }
+    },
+    {
+      "gate": "G11",
+      "passed": true,
+      "message": "engine_metrics_daily exists with 0 row(s).",
+      "evidence": {
+        "rows": 0
+      }
+    }
+  ],
+  "ledger_snapshot": {
+    "principal": 88.80114355,
+    "cash_balance": 129.7,
+    "positions_value": 27.700000000000003,
+    "realized_pnl": 0.9197936715600168,
+    "unrealized_pnl": -12.32,
+    "total_equity": 157.39999999999998,
+    "account_status": "HEALTHY",
+    "trading_paused": false,
+    "pause_reason": null,
+    "equity_invariant_ok": true,
+    "equity_check": 157.39999999999998,
+    "equity_diff": 0.0,
+    "equity_alt_ok": false,
+    "open_positions_count": 0,
+    "timestamp": "2026-03-05T01:16:42.505888+00:00"
+  },
+  "metrics_snapshot": {
+    "buys_attempted": 0,
+    "buys_executed": 0,
+    "cooldown_blocks": 0,
+    "quality_filter_blocks": 0,
+    "reconciliation_adjustments": 0
+  },
+  "audit_counts": {
+    "paper_trades": 12,
+    "portfolio_engine_audit": 605
+  },
+  "restart_pre": {
+    "cash": 129.7,
+    "positions_value": 27.700000000000003,
+    "total_equity": 157.39999999999998,
+    "positions_count": 0
+  },
+  "restart_post": {
+    "cash": 129.7,
+    "positions_value": 27.700000000000003,
+    "total_equity": 157.39999999999998,
+    "positions_count": 0
+  },
+  "trade_proof": null
+}

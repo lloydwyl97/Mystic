@@ -1,0 +1,14 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mystic-trading-pdb
+  namespace: mystic-trading
+  labels:
+    app: mystic-trading
+    component: app
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: mystic-trading
+      component: app
