@@ -1,0 +1,2 @@
+# Mystic
+self trading app
