@@ -1,6 +1,6 @@
 # Mystic
 
-Paper-trading crypto stack: AI signals, portfolio engine, learning loop, and dashboard on port 8000.
+Self-trading paper stack: AI signals, portfolio engine, learning loop, and dashboard on port 8000.
 
 **Canonical local path:** `/home/mystic/mystic` (matches systemd units and `start_mystic.sh`).
 
