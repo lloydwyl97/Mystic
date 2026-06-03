@@ -1516,6 +1516,42 @@ async def set_execution_mode(request: Request, payload: dict[str, Any]) -> dict[
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@router.get("/operator-config")
+async def get_operator_config_endpoint() -> dict[str, Any]:
+    """Dashboard: read max positions, live caps, sizing, kill switch."""
+    try:
+        from backend.services.operator_config_service import get_operator_config
+
+        data = await get_operator_config()
+        return {"success": True, "data": data}
+    except Exception as e:
+        logger.exception("Error getting operator config: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/operator-config")
+async def set_operator_config_endpoint(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+    """Dashboard: update limits (ADMIN_TOKEN required)."""
+    try:
+        from backend.middleware.security import AdminAuthMiddleware
+        from backend.services.operator_config_service import set_operator_config
+
+        if not AdminAuthMiddleware.verify_admin_token(request):
+            raise HTTPException(
+                status_code=401,
+                detail="Unauthorized - ADMIN_TOKEN required to update operator config",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        data = await set_operator_config(payload)
+        return {"success": True, "data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error setting operator config: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.get("/operator-status")
 async def get_operator_status() -> dict[str, Any]:
     """

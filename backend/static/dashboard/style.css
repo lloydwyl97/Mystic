@@ -900,3 +900,78 @@ html {
     background: rgba(14, 203, 129, 0.3);
     color: var(--text-primary);
 }
+
+.operator-form {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.operator-form__grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px 16px;
+}
+
+.operator-form__field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.operator-form__field--wide {
+    grid-column: 1 / -1;
+}
+
+.operator-form__field--check {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+}
+
+.operator-form__field input,
+.operator-form__field select {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    padding: 8px 10px;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+}
+
+.operator-form__actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.operator-form__btn {
+    background: var(--green-subtle);
+    border: 1px solid var(--green);
+    color: var(--green);
+    border-radius: var(--radius);
+    padding: 8px 16px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.operator-form__btn:hover {
+    background: rgba(14, 203, 129, 0.25);
+}
+
+.operator-form__status {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.operator-form__status--ok {
+    color: var(--green);
+}
+
+.operator-form__status--err {
+    color: var(--red);
+}

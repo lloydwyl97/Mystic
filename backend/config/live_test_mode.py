@@ -106,16 +106,36 @@ def _normalize_exchange_symbol(symbol: str) -> str:
     return str(symbol or "").strip().upper().replace("/", "")
 
 
+def _runtime_symbol_allowlist() -> frozenset[str]:
+    raw = os.getenv("LIVE_TEST_SYMBOL_ALLOWLIST", "")
+    if raw.strip():
+        return _parse_symbol_allowlist(raw)
+    return LIVE_TEST_SYMBOL_ALLOWLIST
+
+
+def _runtime_live_test_max_open_positions() -> int:
+    return max(1, _env_int("LIVE_TEST_MAX_OPEN_POSITIONS", LIVE_TEST_MAX_OPEN_POSITIONS))
+
+
+def _runtime_live_test_max_notional() -> float:
+    return max(0.01, _env_float("LIVE_TEST_MAX_NOTIONAL", LIVE_TEST_MAX_NOTIONAL))
+
+
+def _runtime_live_test_manual_arm() -> bool:
+    return _env_bool("LIVE_TEST_MANUAL_ARM", LIVE_TEST_MANUAL_ARM)
+
+
 def is_symbol_allowed_for_live_test(symbol: str) -> bool:
-    if not LIVE_TEST_SYMBOL_ALLOWLIST:
+    allowlist = _runtime_symbol_allowlist()
+    if not allowlist:
         return True
-    return _normalize_exchange_symbol(symbol) in LIVE_TEST_SYMBOL_ALLOWLIST
+    return _normalize_exchange_symbol(symbol) in allowlist
 
 
 def live_test_max_open_positions_limit() -> int | None:
     if not is_live_test_mode_active():
         return None
-    return max(1, int(LIVE_TEST_MAX_OPEN_POSITIONS))
+    return _runtime_live_test_max_open_positions()
 
 
 def can_place_live_orders_sync() -> tuple[bool, str]:
@@ -129,7 +149,7 @@ def can_place_live_orders_sync() -> tuple[bool, str]:
         return False, "NOT_LIVE_EXECUTION_CONTEXT"
 
     if is_live_test_mode_active():
-        if LIVE_TEST_REQUIRE_MANUAL_ARM and not LIVE_TEST_MANUAL_ARM:
+        if LIVE_TEST_REQUIRE_MANUAL_ARM and not _runtime_live_test_manual_arm():
             return False, "LIVE_TEST_MANUAL_ARM_REQUIRED"
         return True, "LIVE_TEST_MODE"
 
@@ -147,11 +167,11 @@ def check_full_live_readiness_requirements() -> list[str]:
         return failures
 
     if LIVE_TEST_MODE:
-        if LIVE_TEST_MAX_NOTIONAL <= 0:
+        if _runtime_live_test_max_notional() <= 0:
             failures.append("LIVE_TEST_MAX_NOTIONAL must be > 0 when LIVE_TEST_MODE=true")
-        if LIVE_TEST_MAX_OPEN_POSITIONS < 1:
+        if _runtime_live_test_max_open_positions() < 1:
             failures.append("LIVE_TEST_MAX_OPEN_POSITIONS must be >= 1 when LIVE_TEST_MODE=true")
-        if not LIVE_TEST_SYMBOL_ALLOWLIST:
+        if not _runtime_symbol_allowlist():
             failures.append("LIVE_TEST_SYMBOL_ALLOWLIST must be non-empty when LIVE_TEST_MODE=true")
         return failures
 
@@ -175,13 +195,14 @@ def assert_full_live_safety_at_startup() -> None:
 
 def get_live_test_api_fields() -> dict[str, Any]:
     permitted, block_reason = can_place_live_orders_sync()
+    allowlist = _runtime_symbol_allowlist()
     return {
         "live_test_mode": LIVE_TEST_MODE,
-        "live_test_max_notional": LIVE_TEST_MAX_NOTIONAL,
-        "live_test_max_open_positions": LIVE_TEST_MAX_OPEN_POSITIONS,
-        "live_test_symbol_allowlist": sorted(LIVE_TEST_SYMBOL_ALLOWLIST),
+        "live_test_max_notional": _runtime_live_test_max_notional(),
+        "live_test_max_open_positions": _runtime_live_test_max_open_positions(),
+        "live_test_symbol_allowlist": sorted(allowlist),
         "live_test_require_manual_arm": LIVE_TEST_REQUIRE_MANUAL_ARM,
-        "live_test_manual_arm": LIVE_TEST_MANUAL_ARM,
+        "live_test_manual_arm": _runtime_live_test_manual_arm(),
         "full_live_confirmed": FULL_LIVE_CONFIRMED,
         "live_execution_context": is_live_execution_context(),
         "live_test_mode_active": is_live_test_mode_active(),
@@ -246,14 +267,14 @@ def enforce_live_order_buy_gates(
         return True, "", quantity
 
     if not is_symbol_allowed_for_live_test(symbol):
-        allow = ",".join(sorted(LIVE_TEST_SYMBOL_ALLOWLIST))
+        allow = ",".join(sorted(_runtime_symbol_allowlist()))
         return False, f"LIVE_TEST_SYMBOL_NOT_ALLOWED:{_normalize_exchange_symbol(symbol)} not in [{allow}]", quantity
 
     if price <= 0:
         return False, "LIVE_TEST_INVALID_PRICE", quantity
 
     est_notional = float(quantity) * float(price)
-    max_notional = float(LIVE_TEST_MAX_NOTIONAL)
+    max_notional = float(_runtime_live_test_max_notional())
     if est_notional > max_notional:
         capped_qty = max_notional / float(price)
         qty_q, norm_reason, _ = normalize_amount(symbol, capped_qty, price, "BUY")

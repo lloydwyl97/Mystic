@@ -473,6 +473,11 @@ async def lifespan(app: FastAPI):
         raise
 
     with contextlib.suppress(Exception):
+        from backend.services.operator_config_service import apply_runtime_config
+
+        apply_runtime_config()
+
+    with contextlib.suppress(Exception):
         from backend.services.ai_outcome_training_writer import (
             repair_mislabeled_profitable_ai_sells,
             repair_missing_sell_feature_versions,

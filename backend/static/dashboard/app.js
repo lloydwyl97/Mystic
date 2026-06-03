@@ -43,6 +43,7 @@ function init() {
     updateHeaderMeta();
     setInterval(updateHeaderMeta, 1000);
     initModeSwitch();
+    initOperatorControls();
     initRefreshButton();
 }
 
@@ -76,6 +77,95 @@ function initRefreshButton() {
             btn.disabled = false;
         });
     });
+}
+
+function initOperatorControls() {
+    const form = document.getElementById("operator-config-form");
+    if (!form) return;
+    loadOperatorConfig();
+    form.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        const statusEl = document.getElementById("op-config-status");
+        const token = prompt("Enter ADMIN_TOKEN to save operator settings:");
+        if (!token) return;
+        const payload = {
+            max_open_positions: Number(document.getElementById("op-max-positions").value),
+            live_test_max_open_positions: Number(document.getElementById("op-live-max-positions").value),
+            live_test_max_notional: Number(document.getElementById("op-live-max-notional").value),
+            risk_per_trade_pct: Number(document.getElementById("op-risk-pct").value),
+            max_cash_per_coin_pct: Number(document.getElementById("op-max-cash-coin").value),
+            live_test_symbol_allowlist: document.getElementById("op-live-allowlist").value,
+            live_test_manual_arm: document.getElementById("op-live-manual-arm").checked,
+            kill_switch: document.getElementById("op-kill-switch").value,
+            kill_switch_reason: "dashboard_operator_config",
+        };
+        if (statusEl) {
+            statusEl.textContent = "Saving…";
+            statusEl.className = "operator-form__status";
+        }
+        try {
+            const res = await fetch("/api/portfolio-engine/operator-config", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    Authorization: "Bearer " + token,
+                },
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json();
+            if (data.success && data.data) {
+                fillOperatorConfigForm(data.data);
+                if (statusEl) {
+                    statusEl.textContent = "Saved — limits active without restart.";
+                    statusEl.className = "operator-form__status operator-form__status--ok";
+                }
+                pollOne({ path: "/api/portfolio-engine/dashboard-canonical", key: "dashboardCanonical" });
+            } else {
+                const msg = data.error || data.detail || "Save failed";
+                if (statusEl) {
+                    statusEl.textContent = msg;
+                    statusEl.className = "operator-form__status operator-form__status--err";
+                }
+            }
+        } catch (e) {
+            if (statusEl) {
+                statusEl.textContent = e && e.message ? e.message : "Network error";
+                statusEl.className = "operator-form__status operator-form__status--err";
+            }
+        }
+    });
+}
+
+function fillOperatorConfigForm(d) {
+    if (!d) return;
+    const setVal = (id, val) => {
+        const el = document.getElementById(id);
+        if (el && val != null) el.value = val;
+    };
+    setVal("op-max-positions", d.max_open_positions);
+    setVal("op-live-max-positions", d.live_test_max_open_positions);
+    setVal("op-live-max-notional", d.live_test_max_notional);
+    setVal("op-risk-pct", d.risk_per_trade_pct);
+    setVal("op-max-cash-coin", d.max_cash_per_coin_pct);
+    if (Array.isArray(d.live_test_symbol_allowlist)) {
+        setVal("op-live-allowlist", d.live_test_symbol_allowlist.join(","));
+    } else if (d.live_test_symbol_allowlist) {
+        setVal("op-live-allowlist", d.live_test_symbol_allowlist);
+    }
+    const arm = document.getElementById("op-live-manual-arm");
+    if (arm) arm.checked = !!d.live_test_manual_arm;
+    const kill = document.getElementById("op-kill-switch");
+    if (kill && d.kill_switch) kill.value = d.kill_switch;
+}
+
+async function loadOperatorConfig() {
+    try {
+        const res = await fetch("/api/portfolio-engine/operator-config", { cache: "no-cache" });
+        const data = await res.json();
+        if (data.success && data.data) fillOperatorConfigForm(data.data);
+    } catch (e) {
+        console.warn("operator-config load failed:", e);
+    }
 }
 
 function initModeSwitch() {

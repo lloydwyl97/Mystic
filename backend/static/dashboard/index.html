@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=31">
+    <link rel="stylesheet" href="style.css?v=32">
 </head>
 <body>
     <header class="header">
@@ -39,6 +39,55 @@
         <div class="status-item" title="Data freshness (OK / STALE_DATA)"><span class="status-label">Latency</span><span class="status-value" id="status-latency">--</span></div>
         <div class="status-item" title="Redis market_data:last_update heartbeat (canonical lite)"><span class="status-label">Market heartbeat</span><span class="status-value" id="status-market-heartbeat">--</span></div>
     </section>
+
+    <section class="widget widget--full" aria-label="Live operator controls">
+            <h2 class="widget__title">Live operator controls</h2>
+            <p class="widget__subtitle">Max positions, live order caps, sizing, manual arm, and kill switch. Save requires ADMIN_TOKEN (same as LIVE toggle).</p>
+            <form id="operator-config-form" class="operator-form">
+                <div class="operator-form__grid">
+                    <label class="operator-form__field">
+                        <span>Max open positions (paper/engine)</span>
+                        <input type="number" id="op-max-positions" min="1" max="10" step="1" value="4" />
+                    </label>
+                    <label class="operator-form__field">
+                        <span>Live test max positions</span>
+                        <input type="number" id="op-live-max-positions" min="1" max="10" step="1" value="4" />
+                    </label>
+                    <label class="operator-form__field">
+                        <span>Live test max notional ($)</span>
+                        <input type="number" id="op-live-max-notional" min="1" step="1" value="25" />
+                    </label>
+                    <label class="operator-form__field">
+                        <span>Risk per trade (%)</span>
+                        <input type="number" id="op-risk-pct" min="0.1" max="20" step="0.1" value="4" />
+                    </label>
+                    <label class="operator-form__field">
+                        <span>Max cash per coin (%)</span>
+                        <input type="number" id="op-max-cash-coin" min="1" max="100" step="1" value="25" />
+                    </label>
+                    <label class="operator-form__field operator-form__field--wide">
+                        <span>Live symbol allowlist (comma-separated)</span>
+                        <input type="text" id="op-live-allowlist" value="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT" />
+                    </label>
+                    <label class="operator-form__field operator-form__field--check">
+                        <input type="checkbox" id="op-live-manual-arm" />
+                        <span>Live test manual arm (required for real orders)</span>
+                    </label>
+                    <label class="operator-form__field">
+                        <span>Kill switch</span>
+                        <select id="op-kill-switch">
+                            <option value="RESUME">RESUME</option>
+                            <option value="PAUSE_BUYS">PAUSE_BUYS</option>
+                            <option value="PAUSE_ALL">PAUSE_ALL</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="operator-form__actions">
+                    <button type="submit" class="operator-form__btn">Save operator settings</button>
+                    <span id="op-config-status" class="operator-form__status" aria-live="polite"></span>
+                </div>
+            </form>
+        </section>
 
     <section class="widget widget--full" aria-label="Live market readiness">
             <h2 class="widget__title">Market data readiness</h2>
@@ -285,6 +334,6 @@
     </main>
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-    <script src="app.js?v=31"></script>
+    <script src="app.js?v=32"></script>
 </body>
 </html>

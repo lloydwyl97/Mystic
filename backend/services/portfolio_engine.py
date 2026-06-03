@@ -14437,6 +14437,7 @@ class PortfolioEngine:
 
         effective_live = self._live_service is not None and self._live_execution_enabled and is_live_execution_allowed_sync()
         from backend.config.live_test_mode import get_live_test_api_fields
+        from backend.services.operator_config_service import get_max_open_positions
 
         mode = "LIVE" if effective_live else "PAPER"
         return {
@@ -14452,7 +14453,7 @@ class PortfolioEngine:
             "positions_value": round(self._positions_value, 2),
             "total_equity": round(self._total_equity, 2),
             "open_positions_count": len(self.open_positions),
-            "max_positions": MAX_OPEN_POSITIONS,
+            "max_positions": get_max_open_positions(),
             "total_open_risk": round(self._total_open_risk, 2),
             "open_risk_pct": round(risk_pct, 2),
             "risk_cap_pct": risk_cap_pct,
