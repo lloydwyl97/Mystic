@@ -6,9 +6,10 @@
 
 | Action | Command |
 |--------|---------|
-| **Start (use this)** | `cd /home/mystic/mystic && ./start_mystic.sh core` |
+| **Start (use this)** | `cd /home/mystic/mystic && ./start_mystic.sh full` |
+| DAY only | `./start_mystic.sh core` |
 | Stop | `cd /home/mystic/mystic && ./stop_mystic.sh` |
-| Desktop shortcut | `~/Desktop/Start Mystic.desktop` → runs **core** |
+| Desktop shortcut | `~/Desktop/Start Mystic.desktop` → runs **full** (DAY + scalp paper) |
 
 **Do not use** `./start_mystic.sh all` for normal 24/7 operation. It starts legacy agents, AI ML trading, MANDATORY_CLEANUP, and duplicate market-data paths.
 

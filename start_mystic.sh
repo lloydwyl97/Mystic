@@ -1,9 +1,10 @@
 #!/bin/bash
 # MYSTIC startup script
 # Modes:
-#   ./start_mystic.sh core      (recommended DAY stack — external supervisor, no duplicates)
-#   ./start_mystic.sh scalp     (backend + live_md + scalp paper runner — isolated from DAY portfolio)
-#   ./start_mystic.sh all       (full stack + cleanup; legacy)
+#   ./start_mystic.sh full      (recommended — DAY core + scalp paper; desktop shortcut)
+#   ./start_mystic.sh core      (DAY stack only — external supervisor, no duplicates)
+#   ./start_mystic.sh scalp     (scalp paper runner only — uses running backend/live_md if up)
+#   ./start_mystic.sh all       (legacy agents/cleanup — do not use for 24/7)
 #   ./start_mystic.sh backend|live_md|signal|portfolio|learning|collector|ai_context|...
 
 set -u
@@ -259,6 +260,49 @@ case "$MODE" in
         echo "Ensure .env has EXTERNAL_SUPERVISOR_MODE=true"
         echo "=========================================="
         ;;
+    full)
+        echo "Mode: full (DAY core + scalp paper)"
+        systemctl --user stop mystic.target 2>/dev/null || true
+        stop_scalp
+        stop_backend
+        stop_live_md
+        stop_signal
+        stop_collector
+        stop_portfolio
+        stop_learning
+        stop_ai_context
+        stop_ai_position_tracker
+        sleep 2
+
+        if ! pgrep -x "redis-server" >/dev/null; then
+            echo "Starting Redis..."
+            sudo service redis-server start || exit 1
+            sleep 2
+        fi
+
+        start_backend || exit 1
+        sleep 3
+        start_live_md || exit 1
+        sleep 2
+        start_signal || exit 1
+        sleep 2
+        start_portfolio truncate || exit 1
+        sleep 2
+        start_ai_context || exit 1
+        sleep 1
+        start_learning || exit 1
+        sleep 1
+        start_scalp || exit 1
+
+        echo ""
+        echo "=========================================="
+        echo "MYSTIC FULL STACK STARTED (DAY paper + scalp paper)"
+        echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
+        echo "DAY: Portfolio + Signal + Context + Learning"
+        echo "SCALP: paper runner — log /tmp/mystic_scalp.log"
+        echo "Ensure .env has EXTERNAL_SUPERVISOR_MODE=true"
+        echo "=========================================="
+        ;;
     all)
         echo "Mode: all"
 
@@ -437,7 +481,7 @@ PY
         echo "=========================================="
         ;;
     *)
-        echo "Usage: $0 [core|all|scalp|backend|live_md|signal|portfolio|learning|collector|ai_context|ai]"
+        echo "Usage: $0 [full|core|all|scalp|backend|live_md|signal|portfolio|learning|collector|ai_context|ai]"
         exit 1
         ;;
 esac
