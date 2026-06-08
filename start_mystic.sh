@@ -210,14 +210,12 @@ ensure_running_or_start() {
 }
 
 start_scalp() {
-    if [ "${SCALP_PAPER_ENABLED:-false}" != "true" ]; then
-        echo "WARN: SCALP_PAPER_ENABLED is not true — runner will idle (set in .env to enable paper)"
-    fi
-    if [ "${SCALP_FEE_MODEL_VERIFIED:-false}" != "true" ]; then
-        echo "WARN: SCALP_FEE_MODEL_VERIFIED is not true — runner will reject entries"
-    fi
-    echo "Starting Scalp Paper Runner..."
-    nohup "$PYTHON" -m backend.services.binance_scalp.runner > /tmp/mystic_scalp.log 2>&1 &
+    # Scalp mode enables paper on the runner child only (.env may keep false for core).
+    local scalp_paper="${SCALP_MODE_PAPER_ENABLED:-true}"
+    local scalp_fee="${SCALP_FEE_MODEL_VERIFIED:-true}"
+    echo "Starting Scalp Paper Runner (SCALP_PAPER_ENABLED=${scalp_paper})..."
+    nohup env SCALP_PAPER_ENABLED="${scalp_paper}" SCALP_FEE_MODEL_VERIFIED="${scalp_fee}" \
+        "$PYTHON" -m backend.services.binance_scalp.runner > /tmp/mystic_scalp.log 2>&1 &
     require_running "backend.services.binance_scalp.runner" "Scalp Paper Runner" "/tmp/mystic_scalp.log" 20 1 || return 1
 }
 
@@ -435,7 +433,7 @@ PY
         echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
         echo "API: /api/scalp/status  /api/scalp/strategies"
         echo "Log: /tmp/mystic_scalp.log"
-        echo "Requires SCALP_PAPER_ENABLED=true and SCALP_FEE_MODEL_VERIFIED=true in .env"
+        echo "Runner uses SCALP_MODE_PAPER_ENABLED (default true) — .env SCALP_PAPER_ENABLED unchanged"
         echo "=========================================="
         ;;
     *)

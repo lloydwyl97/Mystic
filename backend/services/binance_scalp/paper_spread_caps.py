@@ -20,8 +20,8 @@ def parse_paper_spread_caps_json(raw: str | None = None) -> dict[str, float]:
         return dict(DEFAULT_PAPER_SPREAD_CAPS)
     try:
         data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid SCALP_PAPER_SPREAD_CAPS_JSON: {exc}") from exc
+    except json.JSONDecodeError:
+        return dict(DEFAULT_PAPER_SPREAD_CAPS)
     if not isinstance(data, dict):
         raise ValueError("SCALP_PAPER_SPREAD_CAPS_JSON must be a JSON object")
     out: dict[str, float] = {}
