@@ -40,6 +40,38 @@
         <div class="status-item" title="Redis market_data:last_update heartbeat (canonical lite)"><span class="status-label">Market heartbeat</span><span class="status-value" id="status-market-heartbeat">--</span></div>
     </section>
 
+    <section class="widget widget--full" aria-label="DAY position health">
+            <h2 class="widget__title">DAY position health</h2>
+            <p class="widget__subtitle">Observation only — trapped holds, idle capital, RS basket, signal freshness. No auto-sell or rotation.</p>
+            <div class="readiness-grid" id="day-health-grid">
+                <div class="readiness-card"><span class="readiness-label">Positions used</span><span class="readiness-value" id="dh-slots">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Idle cash</span><span class="readiness-value" id="dh-idle-cash">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Idle reason</span><span class="readiness-value" id="dh-idle-reason">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Spread-passing</span><span class="readiness-value" id="dh-spread-passing">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Max trapped days</span><span class="readiness-value" id="dh-trapped-days">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Held symbol</span><span class="readiness-value" id="dh-held-symbol">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Held state</span><span class="readiness-value" id="dh-held-state">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Held RS rank</span><span class="readiness-value" id="dh-held-rank">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Held net %</span><span class="readiness-value" id="dh-held-net">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Best alternate</span><span class="readiness-value" id="dh-best-alt">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Signal blocks</span><span class="readiness-value" id="dh-signal-blocked">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Entry gates</span><span class="readiness-value" id="dh-gates-enforced">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">RS basket</span><span class="readiness-value" id="dh-rs-order">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Last bar eval</span><span class="readiness-value" id="dh-last-bar">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Last setup credit</span><span class="readiness-value" id="dh-last-setup">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Last bar skip</span><span class="readiness-value" id="dh-bar-skip">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Top BUY reject (7d)</span><span class="readiness-value" id="dh-top-reject">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Spread blocks (exec)</span><span class="readiness-value" id="dh-spread-blocked">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Paper spread cap</span><span class="readiness-value" id="dh-spread-cap">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Align spread w/ bar</span><span class="readiness-value" id="dh-spread-align">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Last exec block</span><span class="readiness-value" id="dh-last-exec-block">--</span></div>
+            </div>
+            <details class="observability-panel">
+                <summary>DAY health JSON</summary>
+                <pre id="panel-day-health-content" class="panel-pre">--</pre>
+            </details>
+        </section>
+
     <section class="widget widget--full" aria-label="Live operator controls">
             <h2 class="widget__title">Live operator controls</h2>
             <p class="widget__subtitle">Max positions, live order caps, sizing, manual arm, and kill switch. Save requires ADMIN_TOKEN (same as LIVE toggle).</p>
@@ -87,6 +119,50 @@
                     <span id="op-config-status" class="operator-form__status" aria-live="polite"></span>
                 </div>
             </form>
+        </section>
+
+    <section class="widget widget--full" aria-label="Live readiness">
+            <h2 class="widget__title">Live readiness</h2>
+            <p class="widget__subtitle">Read-only pre-flight for tiny live test. Does not enable live or place orders.</p>
+            <div class="readiness-grid" id="live-readiness-grid">
+                <div class="readiness-card"><span class="readiness-label">Mode</span><span class="readiness-value" id="lr-mode">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Live orders</span><span class="readiness-value" id="lr-live-orders">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Block reason</span><span class="readiness-value" id="lr-block-reason">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Tiny live ready</span><span class="readiness-value" id="lr-tiny-ready">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Full live ready</span><span class="readiness-value" id="lr-full-ready">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">USDT free</span><span class="readiness-value" id="lr-usdt">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">canTrade</span><span class="readiness-value" id="lr-can-trade">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">canWithdraw</span><span class="readiness-value" id="lr-can-withdraw">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Open orders</span><span class="readiness-value" id="lr-open-orders">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Time drift ms</span><span class="readiness-value" id="lr-drift">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Protected exec</span><span class="readiness-value" id="lr-protected">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Sleeve block</span><span class="readiness-value" id="lr-sleeve">--</span></div>
+            </div>
+            <details class="observability-panel">
+                <summary>Tiny live checklist &amp; blockers</summary>
+                <pre id="panel-live-readiness-content" class="panel-pre">--</pre>
+            </details>
+        </section>
+
+    <section class="widget widget--full" aria-label="Today's activity">
+            <h2 class="widget__title">Today&apos;s activity</h2>
+            <p class="widget__subtitle">Closed AI trades ≠ open buys. Admin/stale clears are excluded from AI win stats.</p>
+            <div class="analytics-row analytics-row--today" id="today-activity-row">
+                <div class="mini-card"><span class="mini-card__label">Closed AI trades</span><span class="mini-card__value" id="today-closed-ai">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Open buys today</span><span class="mini-card__value" id="today-open-buys">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">AI realized today</span><span class="mini-card__value" id="today-ai-pnl">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Admin/stale closes</span><span class="mini-card__value" id="today-admin-closes">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Open unrealized</span><span class="mini-card__value" id="today-unrealized">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Total equity</span><span class="mini-card__value" id="today-equity">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Paper trades today</span><span class="mini-card__value" id="today-paper-trades">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Live trades today</span><span class="mini-card__value" id="today-live-trades">--</span></div>
+            </div>
+        </section>
+
+    <section class="widget widget--full" aria-label="Model and learning">
+            <h2 class="widget__title">Model / learning (read-only)</h2>
+            <p class="widget__subtitle">Active models are kept unless a candidate beats promotion gates. No auto-promotion from this panel.</p>
+            <pre id="panel-model-content" class="panel-pre">--</pre>
         </section>
 
     <section class="widget widget--full" aria-label="Live market readiness">
@@ -200,9 +276,9 @@
         </section>
 
         <section class="analytics-row" aria-label="Canonical snapshot metrics">
-            <p class="widget__subtitle">Same API tick as Open Positions. Mini-cards: Total Trades / Win Rate = closed SELL stats. Realized / Unrealized = ledger components (may be negative). Total PnL = account return vs principal (equity − principal). Scoreboard = today&rsquo;s closed sells only.</p>
+            <p class="widget__subtitle">Same API tick as Open Positions. <strong>Scoreboard</strong> = closed AI SELLs only. <strong>Open buys</strong> shown separately below.</p>
             <div class="mini-card">
-                <span class="mini-card__label">Total Trades</span>
+                <span class="mini-card__label">Closed AI trades</span>
                 <span class="mini-card__value" id="analytics-trades">--</span>
             </div>
             <div class="mini-card">
@@ -237,7 +313,7 @@
 
         <section class="sleeve-summary-section" id="sleeve-summary-wrap">
             <h2 class="widget__title">Sleeve Allocation</h2>
-            <p class="widget__subtitle">Live sleeve budgets and utilization from canonical snapshot.</p>
+            <p class="widget__subtitle">Live sleeve budgets and utilization from canonical snapshot. Local: sleeve blocking OFF — utilization is informational; max positions, cash cap, and preflight remain hard controls.</p>
             <div class="sleeve-summary" id="sleeve-summary">
                 <span class="sleeve-disabled">Loading...</span>
             </div>
@@ -257,6 +333,7 @@
                             <th>Size</th>
                             <th>Price</th>
                             <th>PnL</th>
+                            <th>Detail</th>
                         </tr>
                     </thead>
                     <tbody id="trades-tbody"></tbody>
@@ -326,6 +403,14 @@
                     <pre id="panel-scoreboard7d-content" class="panel-pre">--</pre>
                 </details>
                 <details class="observability-panel">
+                    <summary>Missed opportunities</summary>
+                    <pre id="panel-missed-op-content" class="panel-pre">--</pre>
+                </details>
+                <details class="observability-panel">
+                    <summary>Feature health / freshness</summary>
+                    <pre id="panel-feature-health-content" class="panel-pre">--</pre>
+                </details>
+                <details class="observability-panel">
                     <summary>AI Learning</summary>
                     <pre id="panel-learning-status-content" class="panel-pre">--</pre>
                 </details>
@@ -334,6 +419,6 @@
     </main>
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-    <script src="app.js?v=32"></script>
+    <script src="app.js?v=33"></script>
 </body>
 </html>

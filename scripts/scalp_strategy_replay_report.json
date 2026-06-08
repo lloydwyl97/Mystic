@@ -1,0 +1,110 @@
+{
+  "replay_hours": 6,
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "XRPUSDT"
+  ],
+  "scalp_live": false,
+  "calibration_mode": true,
+  "replay_pass": true,
+  "disabled_strategies": [
+    "orderbook_tape_scalp",
+    "range_bounce_scalp",
+    "vwap_ema_reclaim"
+  ],
+  "enabled_strategies": [
+    "breakout_momentum"
+  ],
+  "negative_enabled_strategies": [],
+  "positive_strategies": [],
+  "stale_timeout_exits": 0,
+  "missed_profitable_windows": {
+    "BTCUSDT": 27,
+    "ETHUSDT": 64,
+    "SOLUSDT": 90,
+    "XRPUSDT": 95
+  },
+  "by_strategy": {
+    "breakout_momentum": {
+      "trades": 0,
+      "wins": 0,
+      "losses": 0,
+      "net_pnl_usd": 0.0,
+      "profit_target_exits": 0,
+      "setup_invalidated_exits": 0,
+      "momentum_failed_exits": 0,
+      "recovery_holds": 0,
+      "avg_hold_sec": 0.0,
+      "false_entries": 0
+    }
+  },
+  "by_strategy_symbol": {
+    "BTCUSDT": {
+      "breakout_momentum": {
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "net_pnl_usd": 0.0,
+        "profit_target_exits": 0,
+        "setup_invalidated_exits": 0,
+        "momentum_failed_exits": 0,
+        "recovery_holds": 0,
+        "avg_hold_sec": 0.0,
+        "false_entries": 0
+      }
+    },
+    "ETHUSDT": {
+      "breakout_momentum": {
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "net_pnl_usd": 0.0,
+        "profit_target_exits": 0,
+        "setup_invalidated_exits": 0,
+        "momentum_failed_exits": 0,
+        "recovery_holds": 0,
+        "avg_hold_sec": 0.0,
+        "false_entries": 0
+      }
+    },
+    "SOLUSDT": {
+      "breakout_momentum": {
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "net_pnl_usd": 0.0,
+        "profit_target_exits": 0,
+        "setup_invalidated_exits": 0,
+        "momentum_failed_exits": 0,
+        "recovery_holds": 0,
+        "avg_hold_sec": 0.0,
+        "false_entries": 0
+      }
+    },
+    "XRPUSDT": {
+      "breakout_momentum": {
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "net_pnl_usd": 0.0,
+        "profit_target_exits": 0,
+        "setup_invalidated_exits": 0,
+        "momentum_failed_exits": 0,
+        "recovery_holds": 0,
+        "avg_hold_sec": 0.0,
+        "false_entries": 0
+      }
+    }
+  },
+  "best_strategy_by_symbol": {
+    "BTCUSDT": "none",
+    "ETHUSDT": "none",
+    "SOLUSDT": "none",
+    "XRPUSDT": "none"
+  },
+  "trades": [],
+  "total_trades": 0,
+  "total_net_pnl_usd": 0
+}

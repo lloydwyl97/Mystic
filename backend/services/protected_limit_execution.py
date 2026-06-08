@@ -18,6 +18,7 @@ from backend.config.protected_execution import (
     EXECUTABLE_NET_PROFIT_BELOW_FLOOR,
     MAX_ORDERBOOK_PRICE_IMPACT_PCT,
     MAX_ORDERBOOK_SPREAD_PCT,
+    effective_max_orderbook_spread_pct,
     ORDERBOOK_DEPTH_LIMIT,
     ORDERBOOK_MAX_AGE_SEC,
     ORDERBOOK_MISSING,
@@ -346,7 +347,8 @@ async def run_protected_preflight(
 
     mid = (best_bid + best_ask) / 2.0
     spread_pct = (best_ask - best_bid) / mid if mid > 0 else 1.0
-    if spread_pct > MAX_ORDERBOOK_SPREAD_PCT + 1e-15:
+    max_spread = effective_max_orderbook_spread_pct(live_capable=live_capable)
+    if spread_pct > max_spread + 1e-15:
         return _fail(
             ns,
             side_u,
@@ -355,7 +357,7 @@ async def run_protected_preflight(
             reference_price=reference_price,
             quantity=quantity,
             spread_pct=spread_pct,
-            max_spread=MAX_ORDERBOOK_SPREAD_PCT,
+            max_spread=max_spread,
             best_bid=best_bid,
             best_ask=best_ask,
         )

@@ -3107,76 +3107,109 @@ class PortfolioEngine:
                 _accumulate(symbol, pos, pos.entry_price)
         return (positions_value_market, cost_basis)
 
-    async def _fetch_mtm_prices_for_open_positions(self) -> dict[str, float]:
+    async def _fetch_live_mark_for_open_position(self, symbol: str) -> float:
         """
-        Live marks for open positions — same sources as portfolio integration MTM persist:
-        integration.current_prices, then live_market_data_service ticker per symbol.
+        Fresh exchange mark for open-position MTM (/status, ledger persist).
+
+        Always hits live Binance.US ticker when available (same family as sell gate),
+        not bar-close or integration.current_prices snapshots.
         """
-        prices: dict[str, float] = {}
-        if not self.open_positions:
-            return prices
+        ns = normalize_symbol(symbol)
+        if self._live_execution_enabled and self._live_service is None:
+            try:
+                from backend.services.live_trading_service import LiveTradingService
 
-        try:
-            from backend.services.portfolio_engine_integration import get_portfolio_integration
+                self._live_service = LiveTradingService()
+                if not (self._live_service.binance_api_key and self._live_service.binance_secret):
+                    self._live_service = None
+            except Exception:
+                self._live_service = None
 
-            integration = get_portfolio_integration()
-            live = getattr(integration, "current_prices", None) or {}
-            for sym, px in live.items():
-                if px is None:
-                    continue
-                try:
-                    fpx = float(px)
-                except (TypeError, ValueError):
-                    continue
-                if fpx <= 0:
-                    continue
-                ns = normalize_symbol(sym)
-                prices[sym] = fpx
-                prices[ns] = fpx
-        except Exception:
-            pass
-
-        missing = [sym for sym in self.open_positions if not (prices.get(sym) or prices.get(normalize_symbol(sym)))]
-        if not missing:
-            return prices
+        if self._live_service is not None:
+            try:
+                m = await self._live_service.get_market_price(ns)
+                px = float((m or {}).get("price") or 0.0)
+                if px > 0:
+                    self._price_cache.set(ns, px)
+                    return px
+            except Exception:
+                logger.debug("MTM_LIVE_MARK_FAILED: %s", ns, exc_info=True)
 
         try:
             from backend.services.live_market_data import live_market_data_service
             from backend.utils.symbols import to_exchange_symbol
 
-            for symbol in missing:
+            api_symbol = to_exchange_symbol(symbol)
+            ticker = await live_market_data_service.get_ticker(api_symbol)
+            last_px = float((ticker or {}).get("price") or (ticker or {}).get("last") or 0.0)
+            if last_px <= 0:
+                ohlcv = await live_market_data_service.get_ohlcv(api_symbol, "1m", limit=1)
+                if ohlcv and len(ohlcv) > 0 and len(ohlcv[0]) >= 5:
+                    last_px = float(ohlcv[0][4])
+            if last_px > 0:
+                self._price_cache.set(ns, last_px)
+                return last_px
+        except Exception as e:
+            logger.debug("MTM_TICKER_MARK_FAILED: %s %s", symbol, e)
+
+        cached_price, _ = self._price_cache.get_with_age(ns)
+        if cached_price is not None and float(cached_price) > 0:
+            return float(cached_price)
+        return 0.0
+
+    async def _fetch_mtm_prices_for_open_positions(self) -> dict[str, float]:
+        """
+        Live marks for every open position — always refresh from exchange ticker first.
+
+        integration.current_prices and Redis market:* are last-resort fallbacks only.
+        """
+        prices: dict[str, float] = {}
+        if not self.open_positions:
+            return prices
+
+        for symbol in self.open_positions:
+            ns = normalize_symbol(symbol)
+            last_px = await self._fetch_live_mark_for_open_position(symbol)
+            if last_px <= 0:
                 try:
-                    api_symbol = to_exchange_symbol(symbol)
-                    ticker = await live_market_data_service.get_ticker(api_symbol)
-                    last_px = float((ticker or {}).get("price") or (ticker or {}).get("last") or 0.0)
-                    if last_px <= 0:
-                        ohlcv = await live_market_data_service.get_ohlcv(api_symbol, "1m", limit=1)
-                        if ohlcv and len(ohlcv) > 0 and len(ohlcv[0]) >= 5:
-                            last_px = float(ohlcv[0][4])
-                    if last_px > 0:
-                        ns = normalize_symbol(symbol)
-                        prices[symbol] = last_px
-                        prices[ns] = last_px
-                except Exception as e:
-                    logger.debug("MTM_PRICE_FETCH: %s failed: %s", symbol, e)
-        except ImportError:
-            pass
+                    from backend.services.portfolio_engine_integration import get_portfolio_integration
+
+                    integration = get_portfolio_integration()
+                    live = getattr(integration, "current_prices", None) or {}
+                    last_px = float(live.get(symbol) or live.get(ns) or 0.0)
+                except Exception:
+                    last_px = 0.0
+            if last_px <= 0:
+                try:
+                    from backend.config.redis_config import get_redis_client
+                    from backend.utils.symbols import to_exchange_symbol
+
+                    redis_client = get_redis_client()
+                    base_symbol = to_exchange_symbol(symbol).replace("USDT", "")
+                    if redis_client:
+                        price_str = redis_client.get(f"market:{base_symbol}")
+                        if price_str:
+                            if isinstance(price_str, str):
+                                price_json = json.loads(price_str)
+                                last_px = (
+                                    float(price_json["price"])
+                                    if isinstance(price_json, dict) and "price" in price_json
+                                    else float(price_str)
+                                )
+                            else:
+                                last_px = float(price_str)
+                except Exception:
+                    last_px = 0.0
+            if last_px > 0:
+                prices[symbol] = last_px
+                prices[ns] = last_px
 
         return prices
 
     def _resolve_mtm_prices(self, prices: dict[str, float] | None = None) -> dict[str, float] | None:
-        """Prefer caller/integration live marks over Redis market:* (often unset in paper)."""
+        """Prefer caller-supplied live marks; never substitute integration bar-close cache."""
         if prices:
             return prices
-        try:
-            from backend.services.portfolio_engine_integration import get_portfolio_integration
-
-            integration = get_portfolio_integration()
-            live = getattr(integration, "current_prices", None) or {}
-            if live:
-                return live
-        except Exception:
-            pass
         return None
 
     async def _recompute_positions_values(self, prices: dict[str, float] | None = None) -> None:
@@ -4281,7 +4314,9 @@ class PortfolioEngine:
                     "lesson": lesson,
                 },
             )
-            record_trade_outcome(record, db_path=self.db_path)
+            record_trade_outcome(record, db_path=self.db_path, mode_override=(
+                TradingMode.LIVE if self._live_execution_enabled else None
+            ))
             with contextlib.suppress(Exception):
                 from backend.services.ai_outcome_training_writer import record_outcome_training_row
 
@@ -4329,6 +4364,56 @@ class PortfolioEngine:
                 close_reason,
                 e,
             )
+
+    async def _persist_recovered_close_canonical_packet(
+        self,
+        *,
+        symbol: str,
+        position: OpenPosition,
+        fill: dict[str, Any],
+        source: str,
+        closed_at_iso: str,
+        closed_at_epoch: float,
+        close_ledger_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Write idempotent canonical rows for an exchange-recovered position close."""
+        from backend.services.live_recovered_close_writer import RecoveredCloseFill, persist_recovered_close
+
+        sym = normalize_symbol(symbol)
+        exchange_order_id = str(fill.get("trade_id") or "").strip()
+        if not exchange_order_id:
+            return {"skipped": True, "reason": "missing_exchange_order_id"}
+        exit_price = fill.get("exit_price")
+        if exit_price is None or float(exit_price) <= 0:
+            return {"skipped": True, "reason": "missing_exit_price"}
+
+        packet = RecoveredCloseFill(
+            buy_trade_id=str(getattr(position, "trade_id", "") or ""),
+            symbol=sym,
+            quantity=float(fill.get("quantity") or position.quantity or 0.0),
+            entry_price=float(position.entry_price or 0.0),
+            exit_price=float(exit_price),
+            exchange_sell_order_id=exchange_order_id,
+            closed_at_iso=closed_at_iso,
+            closed_at_epoch=float(closed_at_epoch),
+            source=str(source),
+            fill_recovered=bool(fill.get("found")),
+            realized_profit_usd=(
+                float(fill["realized_profit"]) if fill.get("realized_profit") is not None else None
+            ),
+            fee_usd=float(fill["fee_usd"]) if fill.get("fee_usd") is not None else None,
+            entry_time_epoch=float(getattr(position, "entry_time", 0.0) or 0.0) or None,
+            close_ledger_id=close_ledger_id,
+            sleeve=str(getattr(position, "sleeve", "") or "ACTIVE"),
+            strategy_id=str(getattr(position, "entry_strategy_id", "") or "day"),
+            confidence=float(getattr(position, "confidence_at_entry", 0) or 0) or None,
+            mode="live",
+        )
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: persist_recovered_close(packet, db_path=self.db_path),
+        )
 
     async def _handle_vanished_exchange_position(
         self,
@@ -4392,6 +4477,7 @@ class PortfolioEngine:
             detail_bits.append("fill_recovered=true")
         else:
             detail_bits.append("fill_recovered=false_realized_profit_unknown")
+        closed_at_iso = datetime.now(timezone.utc).isoformat()
         await self._record_position_close_ledger(
             symbol,
             close_reason="HUMAN_MANUAL_SELL",
@@ -4404,17 +4490,49 @@ class PortfolioEngine:
             sell_trade_id=sell_trade_id,
             detail=";".join(detail_bits),
         )
-        self._record_learning_outcome(
-            symbol=symbol,
-            position=position,
-            close_reason="HUMAN_MANUAL_SELL",
-            manual_sell=True,
-            source=source,
-            exit_price=exit_price,
-            realized_profit=realized_profit,
-            cooldown_until=cooldown_until,
-            fill_found=bool(fill["found"]),
-        )
+
+        close_ledger_id: int | None = None
+        if sell_trade_id:
+            def _lookup_ledger_id() -> int | None:
+                with sqlite3.connect(self.db_path) as conn:
+                    row = conn.execute(
+                        """
+                        SELECT id FROM position_close_ledger
+                        WHERE symbol = ? AND sell_trade_id = ?
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (normalize_symbol(symbol), str(sell_trade_id)),
+                    ).fetchone()
+                    return int(row[0]) if row else None
+
+            try:
+                loop = asyncio.get_running_loop()
+                close_ledger_id = await loop.run_in_executor(None, _lookup_ledger_id)
+            except Exception:
+                close_ledger_id = None
+
+        if fill["found"] and sell_trade_id and exit_price:
+            await self._persist_recovered_close_canonical_packet(
+                symbol=symbol,
+                position=position,
+                fill=fill,
+                source=source,
+                closed_at_iso=closed_at_iso,
+                closed_at_epoch=now_epoch,
+                close_ledger_id=close_ledger_id,
+            )
+        else:
+            self._record_learning_outcome(
+                symbol=symbol,
+                position=position,
+                close_reason="HUMAN_MANUAL_SELL",
+                manual_sell=True,
+                source=source,
+                exit_price=exit_price,
+                realized_profit=realized_profit,
+                cooldown_until=cooldown_until,
+                fill_found=bool(fill["found"]),
+            )
 
         sym_norm = normalize_symbol(symbol)
         async with self._deletion_lock:
@@ -5828,16 +5946,6 @@ class PortfolioEngine:
         from backend.services.ai_entry_context_gate import evaluate_explainability_at_execution
 
         self._hydrate_explainability_entry_context_from_redis_if_missing(normalize_symbol(symbol), explainability)
-        if not str(getattr(explainability, "ctx_ts_utc", "") or "").strip():
-            try:
-                _ctx_payload, _ctx_age = self._get_context_payload(symbol)
-                _ctx_ts = str(_ctx_payload.get("ts_utc") or _ctx_payload.get("timestamp") or "").strip()
-                if _ctx_ts:
-                    explainability.ctx_ts_utc = _ctx_ts
-                    explainability.ctx_age_sec = float(_ctx_age)
-                    explainability.context_fresh_flag = "1" if 0 <= float(_ctx_age) <= float(get_ctx_fresh_max_age_sec()) else "0"
-            except Exception:
-                pass
 
         ok_ec, ec_code, ec_detail = evaluate_explainability_at_execution(explainability)
         if not ok_ec:
@@ -6135,6 +6243,18 @@ class PortfolioEngine:
         )
         protected_audit = preflight.to_audit_dict()
         if not preflight.passed:
+            try:
+                from backend.services.day_position_health import persist_last_execution_block
+
+                persist_last_execution_block(
+                    symbol=normalized_symbol,
+                    reject_reason=str(preflight.reject_reason or "PROTECTED_PREFLIGHT"),
+                    filter_name="PROTECTED_PREFLIGHT",
+                    detail=preflight.to_audit_dict() if hasattr(preflight, "to_audit_dict") else {},
+                    db_path=str(self.db_path),
+                )
+            except Exception:
+                pass
             await self._record_reject(
                 normalized_symbol,
                 "BUY",
@@ -8625,6 +8745,19 @@ class PortfolioEngine:
         )
         return self.cash_balance + positions_value
 
+    async def _emit_day_health_telemetry(self, skip_reason: str | None = None) -> None:
+        """Observation-only trapped-position / idle-capital telemetry."""
+        try:
+            from backend.services.day_position_health import update_telemetry
+
+            prices = await self._fetch_mtm_prices_for_open_positions() or {}
+            for sym, pos in self.open_positions.items():
+                if sym not in prices and float(getattr(pos, "entry_price", 0) or 0) > 0:
+                    prices[sym] = float(pos.entry_price)
+            update_telemetry(self, prices, last_bar_skip_reason=skip_reason)
+        except Exception:
+            logger.debug("day_health_telemetry failed", exc_info=True)
+
     # =========================================================================
     # PHASE 3: SELL MONITORING (NO SKIPS)
     # =========================================================================
@@ -8700,6 +8833,8 @@ class PortfolioEngine:
 
             if exit_result:
                 exits_executed.append(exit_result)
+
+        await self._emit_day_health_telemetry()
 
         return exits_executed
 
@@ -9157,6 +9292,20 @@ class PortfolioEngine:
         momentum = _safe_float(dd.get("price_momentum"), 0.0)
         net_ev = self._estimate_candidate_net_expected_value(dd)
 
+        try:
+            from backend.services.day_entry_quality_gate import build_basket_rs_ranks
+
+            _, _basket_ranks = build_basket_rs_ranks()
+            _sym_bus = normalize_symbol(symbol).replace("/", "").strip().upper()
+            rs_rank = int(_basket_ranks.get(_sym_bus, 4))
+        except Exception:
+            rs_rank = 4
+        try:
+            rs_rank_max_strong = int(float(os.getenv("DAY_SETUP_RS_RANK_MAX", "2")))
+        except (TypeError, ValueError):
+            rs_rank_max_strong = 2
+        rs_component_ok = rs_rank <= max(1, min(4, rs_rank_max_strong))
+
         exp = _safe_float(snap.get("expectancy"), 0.0)
         exp_trades = _safe_float(snap.get("expectancy_trades"), 0.0)
         bad_count = _safe_float(snap.get("bad_memory_count"), 0.0)
@@ -9176,7 +9325,8 @@ class PortfolioEngine:
         setup_trend_min = 0.70 if repeated_bad_low_mfe_profile else 0.62
         setup_mom_min = 0.42 if repeated_bad_low_mfe_profile else 0.30
         setup_ev_min = 0.0018 if repeated_bad_low_mfe_profile else 0.0009
-        strong_setup = rel_strength >= setup_rs_min and rel_volume >= setup_rv_min and trend >= setup_trend_min and momentum >= setup_mom_min and net_ev > setup_ev_min
+        # RS leg uses basket rank (ctx_rs_btc is [-1,1]; legacy abs floor 0.45 never fired).
+        strong_setup = rs_component_ok and rel_volume >= setup_rv_min and trend >= setup_trend_min and momentum >= setup_mom_min and net_ev > setup_ev_min
         setup_credit = 0.0
         if strong_setup:
             setup_credit = 0.020 + min(0.040, 0.018 * (rel_volume - 1.0) + 0.012 * max(0.0, rel_strength))
@@ -9191,7 +9341,7 @@ class PortfolioEngine:
         weak_symbol_penalty = 0.0
         if group == "low_trust":
             weak_symbol_penalty -= 0.035
-            if rel_strength < 0.25:
+            if rs_rank >= 3 or rel_strength < 0.0:
                 weak_symbol_penalty -= 0.012
             if rel_volume < 1.05:
                 weak_symbol_penalty -= 0.010
@@ -9203,7 +9353,7 @@ class PortfolioEngine:
             if net_ev < 0.0008:
                 weak_symbol_penalty -= 0.006
 
-        if symbol == "SOLUSDT" and rel_strength >= 0.55 and rel_volume >= 1.35 and trend >= 0.63 and net_ev > 0.0011:
+        if symbol == "SOLUSDT" and rs_rank <= 2 and rel_volume >= 1.35 and trend >= 0.63 and net_ev > 0.0011:
             setup_credit += 0.018
 
         if symbol == "XRPUSDT":
@@ -9286,6 +9436,8 @@ class PortfolioEngine:
             "symbol_trust_bad_ratio": float(bad_ratio),
             "symbol_trust_bad_heavy_penalty": float(bad_heavy_penalty),
             "symbol_trust_setup_strong": bool(strong_setup),
+            "symbol_trust_rs_rank": int(rs_rank),
+            "symbol_trust_rs_rank_max_strong": int(rs_rank_max_strong),
             "symbol_trust_expectancy": float(exp),
             "symbol_trust_expectancy_trades": float(exp_trades),
             "symbol_trust_peer_outperf_ratio": float(peer_outperf_ratio),
@@ -9999,6 +10151,9 @@ class PortfolioEngine:
             if sig:
                 self._merge_redis_signal_entry_audit_into_decision_data(dd, sig)
 
+        from backend.services.ai_context_freshness_sync import apply_overlay_to_explainability, overlay_live_context_freshness
+
+        overlay_live_context_freshness(dd, sym_bus or ccxt_symbol)
         ok = self._patch_decision_data_context_audit_if_required(dd, ccxt_symbol)
 
         explainability.context_audit_emit = str(dd.get("context_audit_emit", ""))
@@ -10030,6 +10185,7 @@ class PortfolioEngine:
             explainability.signal_content_age_sec = str(dd["content_age_sec"])
         if dd.get("signal_content_stale") in ("0", "1"):
             explainability.signal_content_stale = str(dd["signal_content_stale"])
+        apply_overlay_to_explainability(explainability, dd)
         if ok:
             logger.info(
                 "ENTRY_AUDIT_BRIDGE_REFRESH_FROM_REDIS symbol=%s strategy=%s",
@@ -10455,7 +10611,6 @@ class PortfolioEngine:
             pass
 
         existing_pairs = {_full_universe_pair_key(c.symbol, self._candidate_strategy_id(c)) for c in self.current_bar_candidates}
-        context_max_age = float(get_ctx_fresh_max_age_sec())
 
         for symbol in active_symbols:
             symbol_bus = normalize_symbol(symbol).replace("/", "")
@@ -10501,17 +10656,21 @@ class PortfolioEngine:
                 dd["symbol"] = symbol_bus
                 dd["full_universe_source"] = source
 
+                from backend.services.ai_context_freshness_sync import overlay_live_context_freshness
+
+                overlay_live_context_freshness(dd, symbol_bus)
                 context_payload, context_age = self._get_context_payload(symbol_bus)
                 context_payload = context_payload or {}
-                dd["ctx_age_sec"] = context_age
-                ctx_ts_utc = str(dd.get("ctx_ts_utc") or context_payload.get("ts_utc") or context_payload.get("timestamp") or "").strip()
-                dd["ctx_ts_utc"] = ctx_ts_utc
-                if str(dd.get("context_fresh") or "").strip() not in ("0", "1"):
-                    dd["context_fresh"] = "1" if context_age <= context_max_age else "0"
 
                 dd["ctx_market_regime"] = context_payload.get("market_regime", context_payload.get("regime", "unknown"))
-                dd["ctx_rs_btc"] = _safe_float(context_payload.get("rs_btc"), _safe_float(dd.get("ctx_rs_btc"), 0.0))
-                dd["ctx_rs_eth"] = _safe_float(context_payload.get("rs_eth"), _safe_float(dd.get("ctx_rs_eth"), 0.0))
+                dd["ctx_rs_btc"] = _safe_float(
+                    context_payload.get("ctx_rs_btc") or context_payload.get("rs_btc"),
+                    _safe_float(dd.get("ctx_rs_btc"), 0.0),
+                )
+                dd["ctx_rs_eth"] = _safe_float(
+                    context_payload.get("ctx_rs_eth") or context_payload.get("rs_eth"),
+                    _safe_float(dd.get("ctx_rs_eth"), 0.0),
+                )
                 _ctx_spread_raw = context_payload.get("spread_pct")
                 if _ctx_spread_raw in (None, "", 0, 0.0):
                     _ctx_spread_raw = dd.get("spread_pct")
@@ -10532,8 +10691,9 @@ class PortfolioEngine:
                 _ctx_spread_norm, _ctx_spread_units = self._normalize_spread_fraction(_ctx_spread_raw)
                 dd["spread_pct"] = _ctx_spread_norm
                 dd["spread_units"] = _ctx_spread_units
-                dd["volume_expansion"] = _safe_float(context_payload.get("relative_volume"), _safe_float(dd.get("volume_expansion"), 0.0))
-                dd["relative_volume"] = _safe_float(context_payload.get("relative_volume"), _safe_float(dd.get("relative_volume"), 0.0))
+                _rel_vol = context_payload.get("ctx_relative_volume") or context_payload.get("relative_volume")
+                dd["volume_expansion"] = _safe_float(_rel_vol, _safe_float(dd.get("volume_expansion"), 0.0))
+                dd["relative_volume"] = _safe_float(_rel_vol, _safe_float(dd.get("relative_volume"), 0.0))
                 dd["entry_timing_quality"] = _safe_float(dd.get("entry_timing_quality"), 0.5)
                 dd["expected_hold_quality"] = _safe_float(dd.get("expected_hold_quality"), 0.5)
                 dd["estimated_win_pct"] = _safe_float(dd.get("estimated_win_pct"), 0.012 if strategy_id == "day" else 0.0045)
@@ -10657,6 +10817,7 @@ class PortfolioEngine:
 
         if not self.current_bar_candidates:
             logger.debug(f"BAR_CLOSE: No candidates for bar {bar_timestamp}")
+            await self._emit_day_health_telemetry("NO_BAR_CANDIDATES")
             self._persist_profit_cycle_state(
                 {
                     "bar_timestamp": int(bar_timestamp),
@@ -10727,6 +10888,7 @@ class PortfolioEngine:
 
         if not valid_candidates:
             logger.debug("BAR_CLOSE: No valid candidates after filtering")
+            await self._emit_day_health_telemetry("NO_VALID_CANDIDATES_AFTER_FILTER")
             for c in bar_candidate_snapshot:
                 await self._bar_pipeline_terminal(c.decision_id, "BAR_PRE_RANK_FILTERED", pipeline_done)
             self.current_bar_candidates.clear()
@@ -10848,6 +11010,7 @@ class PortfolioEngine:
             execution_sane_candidates.append(_cand)
 
         if not execution_sane_candidates:
+            await self._emit_day_health_telemetry("NO_EXECUTION_SANE_CANDIDATES")
             logger.info("BAR_CLOSE: No candidates passed spread/ATR execution sanity (%d ranked)", len(valid_candidates))
             self._persist_profit_cycle_state(
                 {
@@ -10869,6 +11032,7 @@ class PortfolioEngine:
         fresh_symbol_candidates = [c for c in execution_sane_candidates if c.symbol not in open_syms]
         chosen = list(fresh_symbol_candidates or execution_sane_candidates)
         if not chosen:
+            await self._emit_day_health_telemetry("BUY_SKIPPED_NO_CHOSEN_CANDIDATE")
             logger.info("BUY_SKIPPED: no valid candidates after spread/ATR filtering")
             self._persist_profit_cycle_state(
                 {
@@ -11257,8 +11421,70 @@ class PortfolioEngine:
         except Exception as e:
             logger.debug("FRESH_PRICE_LOOKUP: %s fallback to candidate price: %s", symbol, e)
 
+        # Optional entry quality gate (setup_credit / RS floor/rank) — default OFF.
+        from backend.config.day_entry_gates import day_entry_gates_enforced
+        from backend.services.day_entry_quality_gate import evaluate_entry_quality, persist_last_bar_evaluation
+
+        _eq_ok, _eq_code, _eq_detail = evaluate_entry_quality(top_dd, symbol=symbol)
+        try:
+            persist_last_bar_evaluation(
+                symbol=symbol,
+                bar_timestamp=int(bar_timestamp),
+                ok=_eq_ok,
+                reject_code=_eq_code,
+                detail=_eq_detail,
+                db_path=str(self.db_path),
+            )
+        except Exception:
+            pass
+        top_meta["entry_quality_ok"] = _eq_ok
+        top_meta["entry_quality_detail"] = _eq_detail
+        logger.info(
+            "ENTRY_QUALITY_CHECK symbol=%s ok=%s code=%s enforced=%s setup_credit=%.4f strong_setup=%s rs=%.4f rank=%s would_block=%s",
+            symbol,
+            _eq_ok,
+            _eq_code,
+            day_entry_gates_enforced(),
+            float(_eq_detail.get("setup_credit") or 0.0),
+            bool(_eq_detail.get("strong_setup")),
+            float(_eq_detail.get("ctx_rs_btc") or 0.0),
+            _eq_detail.get("rs_rank"),
+            _eq_detail.get("would_block"),
+        )
+        if not _eq_ok and day_entry_gates_enforced():
+            await self._emit_day_health_telemetry(f"ENTRY_QUALITY_{_eq_code}")
+            await self._bar_pipeline_fill_if_stage_gates(top_candidate.decision_id, _eq_code or "ENTRY_QUALITY_BLOCKED")
+            await self._bar_pipeline_not_selected_others(bar_candidate_snapshot, top_candidate.decision_id or "", pipeline_done)
+            for _row in cycle_leaderboard:
+                if _row.get("symbol") == top_candidate.symbol and str(_row.get("strategy_id")) == str(top_candidate.decision_data.get("live_ai_strategy") or "day"):
+                    _row["disposition"] = f"selected_no_trade_{(_eq_code or 'entry_quality').lower()}"
+                    break
+            self._persist_profit_cycle_state(
+                {
+                    "bar_timestamp": int(bar_timestamp),
+                    "full_universe_diagnostics": full_universe_diag,
+                    "adaptive_weight_diagnostics": {
+                        "adaptive_weight_applied_count": int(full_universe_diag.get("adaptive_weight_applied_count") or 0),
+                        "adaptive_weight_missing_count": int(full_universe_diag.get("adaptive_weight_missing_count") or 0),
+                        "adaptive_weight_score_delta_sum": float(full_universe_diag.get("adaptive_weight_score_delta_sum") or 0.0),
+                        "adaptive_weight_top_components": full_universe_diag.get("adaptive_weight_top_components") or {},
+                    },
+                    "current_cycle": {
+                        "leaderboard": cycle_leaderboard,
+                        "leaderboard_len": len(cycle_leaderboard),
+                        "selected_symbol": top_candidate.symbol,
+                        "selected_strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
+                        "selected_trade": False,
+                        "entry_quality_block": _eq_code,
+                    },
+                }
+            )
+            self.current_bar_candidates.clear()
+            return None
+
         # Final EV discipline: selected candidate must have positive net expected value.
         if float(top_net_ev) <= 0.0:
+            await self._emit_day_health_telemetry("BEST_CANDIDATE_NEGATIVE_EV")
             logger.info(
                 "BEST_CANDIDATE_NEGATIVE_EV: symbol=%s strategy=%s net_ev=%.6f -> no_trade",
                 symbol,
@@ -14351,16 +14577,96 @@ class PortfolioEngine:
             ai = by_action.get("SELL", {"count": 0, "pnl": 0.0})
             admin = by_action.get("ADMIN_POSITION_CLEAR", {"count": 0, "pnl": 0.0})
             stale = by_action.get("STALE_PRE_CORRECTION_POSITION_CLEAR", {"count": 0, "pnl": 0.0})
+            downtime = by_action.get("DOWNTIME_POSITION_CLEAR", {"count": 0, "pnl": 0.0})
             buys = by_action.get("BUY", {"count": 0, "pnl": 0.0})
+
+            cur.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(pnl), 0)
+                FROM paper_trades
+                WHERE date(timestamp) = ? AND UPPER(side) = 'SELL'
+                  AND COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR')
+                """,
+                (day,),
+            )
+            ai_sell_row = cur.fetchone()
+            ai_paper_closes = int(ai_sell_row[0] or 0) if ai_sell_row else 0
+            ai_paper_pnl = float(ai_sell_row[1] or 0) if ai_sell_row else 0.0
+
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM paper_trades
+                WHERE date(timestamp) = ? AND UPPER(side) = 'BUY'
+                """,
+                (day,),
+            )
+            open_buys = int(cur.fetchone()[0] or 0)
+
+            cur.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(pnl), 0)
+                FROM paper_trades
+                WHERE date(timestamp) = ? AND UPPER(side) = 'SELL'
+                  AND COALESCE(exit_type, '') IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR')
+                """,
+                (day,),
+            )
+            admin_row = cur.fetchone()
+            admin_paper_closes = int(admin_row[0] or 0) if admin_row else 0
+            admin_paper_pnl = float(admin_row[1] or 0) if admin_row else 0.0
+
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM paper_trades
+                WHERE date(timestamp) = ? AND mode = 'live'
+                """,
+                (day,),
+            )
+            live_trades_today = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM paper_trades
+                WHERE date(timestamp) = ? AND COALESCE(mode, 'paper') = 'paper'
+                """,
+                (day,),
+            )
+            paper_trades_today = int(cur.fetchone()[0] or 0)
+
+            cur.execute(
+                "SELECT total_equity, unrealized_pnl, realized_pnl FROM portfolio_engine_ledger WHERE id = 1"
+            )
+            ledger_row = cur.fetchone()
+            total_equity = float(ledger_row[0] or 0) if ledger_row else 0.0
+            open_unrealized = float(ledger_row[1] or 0) if ledger_row else 0.0
+            ledger_realized = float(ledger_row[2] or 0) if ledger_row else 0.0
+
+            closed_ai = ai["count"] if ai["count"] else ai_paper_closes
             return {
-                "ai_closed_trades": ai["count"],
-                "ai_closed_pnl": ai["pnl"],
-                "admin_synthetic_closes": admin["count"] + stale["count"],
-                "admin_synthetic_pnl": admin["pnl"] + stale["pnl"],
+                "ai_closed_trades": closed_ai,
+                "closed_ai_trades_today": closed_ai,
+                "ai_closed_pnl": ai_paper_pnl if ai_paper_pnl else ai["pnl"],
+                "ai_realized_pnl_today": ai_paper_pnl,
+                "admin_synthetic_closes": admin["count"] + stale["count"] + downtime["count"],
+                "admin_synthetic_pnl": admin["pnl"] + stale["pnl"] + downtime["pnl"],
+                "admin_stale_closes_today": admin_paper_closes,
+                "admin_stale_pnl_today": admin_paper_pnl,
                 "stale_pre_correction_closes": stale["count"],
                 "stale_pre_correction_pnl": stale["pnl"],
-                "open_buys_today": buys["count"],
+                "downtime_clears_today": downtime["count"],
+                "downtime_clear_pnl_today": downtime["pnl"],
+                "open_buys_today": open_buys if open_buys else buys["count"],
+                "closed_trades_today": closed_ai,
+                "open_unrealized_pnl": open_unrealized,
+                "total_equity": total_equity,
+                "ledger_realized_pnl": ledger_realized,
+                "live_trades_today": live_trades_today,
+                "paper_trades_today": paper_trades_today,
                 "scoreboard_trades_field_is_ai_closes_only": True,
+                "scoreboard_trades_label": "Closed AI trades today (SELL only; open buys excluded)",
+                "scoreboard_open_buys_label": "Open buys today (BUY rows; not counted in trades)",
             }
         finally:
             conn.close()
@@ -14945,6 +15251,16 @@ class PortfolioEngine:
             },
         }
 
+        day_position_health: dict[str, Any] | None = None
+        try:
+            from backend.services.day_position_health import load_health, update_telemetry
+
+            prices = await self._fetch_mtm_prices_for_open_positions() or {}
+            update_telemetry(self, prices)
+            day_position_health = await loop.run_in_executor(None, load_health)
+        except Exception:
+            day_position_health = None
+
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "consistency_ok": len(violations) == 0,
@@ -14962,6 +15278,7 @@ class PortfolioEngine:
             "daily_performance": daily_perf,
             "operator": operator,
             "invariants": inv,
+            "day_position_health": day_position_health,
         }
 
     async def get_snapshot(self) -> dict[str, Any]:

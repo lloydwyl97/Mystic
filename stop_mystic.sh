@@ -18,6 +18,7 @@ PATTERNS=(
   "start_ai_market_context.py"
   "start_ai_position_tracker.py"
   "start_ai_outcome_bridge.py"
+  "backend.services.binance_scalp.runner"
 )
 for pattern in "${PATTERNS[@]}"; do
   while read -r pid; do

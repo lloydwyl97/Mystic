@@ -642,6 +642,14 @@ class PortfolioEngineIntegration:
 
                     is_buy = side == "buy"
 
+                    if is_buy:
+                        try:
+                            from backend.services.ai_context_freshness_sync import overlay_live_context_freshness
+
+                            overlay_live_context_freshness(dd, symbol)
+                        except Exception as ctx_overlay_exc:
+                            logger.debug("SIGNAL_CONSUMER context overlay %s: %s", symbol, ctx_overlay_exc)
+
                     if side == "sell":
                         pass  # handled below after price check
                     elif not is_buy:

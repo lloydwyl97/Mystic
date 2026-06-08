@@ -113,7 +113,6 @@ def record_missed_opportunity_observation(
         "POST_SELL_COOLDOWN",
         "GLOBAL_SELL_COOLDOWN",
         "POSITION_ALREADY_OPEN",
-        "PROTECTED_PREFLIGHT",
         "DISCIPLINE_GATE",
         "SLEEVE_LIMIT",
         "CASH_INVARIANT",
@@ -124,6 +123,12 @@ def record_missed_opportunity_observation(
         "QUALITY_",
         "ENTRY_CONTEXT",
         "SIGNAL_CONTENT",
+        "DAY_CAPITAL_IDLE",
+        "DAY_OPPORTUNITY_COST",
+        "ENTRY_QUALITY",
+        "SETUP_CREDIT",
+        "PROTECTED_PREFLIGHT",
+        "SPREAD_TOO_WIDE",
     )
     if not any(reason.startswith(w) or w in reason for w in watch_prefixes):
         return

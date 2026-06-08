@@ -165,7 +165,8 @@ async def _ensure_engine_positions_match_sqlite(engine: Any) -> int:
         try:
             await engine._load_positions_from_sqlite()
             if hasattr(engine, "_recompute_positions_values"):
-                await engine._recompute_positions_values()
+                mtm = await engine._fetch_mtm_prices_for_open_positions()
+                await engine._recompute_positions_values(mtm or None)
         except Exception as e:
             logger.warning("POSITIONS_SQLITE_RESYNC failed: %s", e)
         engine_count = len(getattr(engine, "open_positions", {}) or {})
@@ -1529,6 +1530,130 @@ async def get_operator_config_endpoint() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@router.get("/live-readiness")
+async def get_live_readiness() -> dict[str, Any]:
+    """Read-only live readiness probe for operator dashboard (no secrets)."""
+    try:
+        from backend.services.live_readiness_service import build_live_readiness_report
+
+        data = await build_live_readiness_report()
+        return {
+            "success": True,
+            "data": data,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception("Error building live readiness report: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/trade/{trade_id:path}")
+async def get_trade_drilldown(trade_id: str) -> dict[str, Any]:
+    """Read-only single-trade drill-down packet."""
+    try:
+        from backend.services.trade_drilldown_service import build_trade_drilldown
+
+        data = build_trade_drilldown(trade_id)
+        if not data.get("found"):
+            raise HTTPException(status_code=404, detail=data.get("error") or "trade not found")
+        return {
+            "success": True,
+            "data": data,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error building trade drilldown for %s: %s", trade_id, e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/model-panel")
+async def get_model_panel() -> dict[str, Any]:
+    """Read-only model/learning visibility per top-4 symbol (no auto-promotion)."""
+    try:
+        from backend.database_schema import DATABASE_PATH
+        from backend.services.ai_model_behavior_diagnostics import build_model_behavior_report
+        from backend.services.ai_market_diagnostics import build_model_freshness_report
+
+        behavior = build_model_behavior_report(DATABASE_PATH)
+        freshness = build_model_freshness_report(DATABASE_PATH)
+        symbols = behavior.get("symbols") if isinstance(behavior, dict) else {}
+        promo_events: dict[str, dict[str, Any]] = {}
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(DATABASE_PATH)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT symbol, event_type, reason, created_at
+                    FROM ai_model_promotion_events
+                    ORDER BY id DESC
+                    LIMIT 40
+                    """
+                )
+                for sym, evt, reason, ts in cur.fetchall():
+                    key = str(sym or "").upper()
+                    if key not in promo_events:
+                        promo_events[key] = {"last_event_type": evt, "last_event_reason": reason, "last_event_at": ts}
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+        per_symbol = []
+        if isinstance(symbols, dict):
+            for sym, meta in symbols.items():
+                if not isinstance(meta, dict):
+                    continue
+                pe = promo_events.get(str(sym).upper(), {})
+                active_path = meta.get("active_path")
+                trained_at = None
+                if active_path:
+                    try:
+                        from pathlib import Path
+
+                        p = Path(str(active_path))
+                        if p.exists():
+                            trained_at = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat()
+                    except Exception:
+                        trained_at = None
+                per_symbol.append(
+                    {
+                        "symbol": sym,
+                        "active_model_path": active_path,
+                        "active_model_trained_at": trained_at,
+                        "active_accuracy": meta.get("active_artifact_accuracy_stored"),
+                        "candidate_accuracy": meta.get("candidate_artifact_accuracy_stored"),
+                        "holdout_sample_count": meta.get("holdout_sample_count"),
+                        "holdout_low_confidence": meta.get("holdout_low_confidence"),
+                        "candidate_always_buy": meta.get("candidate_always_buy"),
+                        "candidate_always_hold": meta.get("candidate_always_hold"),
+                        "promotion_rejection_reason": pe.get("last_event_reason") or meta.get("holdout_tie_explanation"),
+                        "active_holdout_pac": meta.get("active_holdout_pac"),
+                        "candidate_holdout_pac": meta.get("candidate_holdout_pac"),
+                        "feature_version": meta.get("feature_version"),
+                        "feature_dim": meta.get("feature_dim"),
+                        "last_promotion_event": pe.get("last_event_at") if pe.get("last_event_type") == "promoted" else None,
+                        "last_rejection_event": pe.get("last_event_at") if pe.get("last_event_type") == "rejected" else pe.get("last_event_at"),
+                    }
+                )
+        return {
+            "success": True,
+            "data": {
+                "per_symbol": per_symbol,
+                "model_freshness": freshness,
+                "model_behavior_summary": behavior.get("summary") if isinstance(behavior, dict) else None,
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception("Error building model panel: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.post("/operator-config")
 async def set_operator_config_endpoint(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
     """Dashboard: update limits (ADMIN_TOKEN required)."""
@@ -1586,6 +1711,15 @@ async def get_operator_status() -> dict[str, Any]:
         if sqlite_data:
             status.update(sqlite_data)
 
+        try:
+            from backend.services.day_position_health import load_health
+
+            day_health = await asyncio.to_thread(load_health)
+            if day_health:
+                status["day_position_health"] = day_health
+        except Exception:
+            pass
+
         # PAPER mode: Use SQLite-only path for consistency (no Redis override)
         # LIVE mode: Could add live balance cross-check here if needed
         if status.get("mode") == "PAPER":
@@ -1620,6 +1754,23 @@ async def get_daily_performance_snapshot() -> dict[str, Any]:
         return {"success": True, "data": snapshot}
     except Exception as e:
         logger.exception("Error getting daily performance snapshot: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/day-health")
+async def get_day_position_health() -> dict[str, Any]:
+    """
+    Trapped-position and idle-capital telemetry (observation only — no auto-sell/rotation).
+    """
+    try:
+        from backend.services.day_position_health import load_health
+
+        payload = await asyncio.to_thread(load_health)
+        if payload is None:
+            return {"success": True, "data": None, "note": "no_telemetry_yet"}
+        return {"success": True, "data": payload}
+    except Exception as e:
+        logger.exception("Error getting day position health: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

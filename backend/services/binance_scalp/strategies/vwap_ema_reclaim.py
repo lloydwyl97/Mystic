@@ -1,0 +1,92 @@
+"""VWAP/EMA reclaim scalp — pullback ends, price reclaims trend."""
+
+from __future__ import annotations
+
+from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, StrategyMarketContext
+from backend.services.binance_scalp.strategies.common import (
+    check_spread,
+    depth_check,
+    pass_signal,
+    reject_signal,
+    target_reachable,
+)
+
+
+def _vwap(bars: list[dict]) -> float:
+    num = den = 0.0
+    for b in bars:
+        tp = (b["high"] + b["low"] + b["close"]) / 3.0
+        v = b.get("volume", 0.0)
+        num += tp * v
+        den += v
+    return num / den if den > 0 else bars[-1]["close"]
+
+
+def _ema(values: list[float], period: int) -> float:
+    if not values:
+        return 0.0
+    k = 2.0 / (period + 1)
+    ema = values[0]
+    for v in values[1:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+
+class VwapEmaReclaimStrategy:
+    name = "vwap_ema_reclaim"
+
+    def evaluate(self, ctx: StrategyMarketContext) -> ScalpSetupSignal:
+        ok, reason = check_spread(ctx.snap, ctx.econ, ctx.config)
+        if not ok:
+            return reject_signal(ctx, self.name, reason or "SPREAD_TOO_WIDE")
+
+        depth_ok, impact, fill = depth_check(ctx.snap, ctx.notional_usd, ctx.econ)
+        if not depth_ok:
+            return reject_signal(ctx, self.name, "DEPTH_OR_IMPACT_FAIL", impact=impact)
+
+        bars = ctx.bars_1m
+        if len(bars) < 15:
+            return reject_signal(ctx, self.name, "INSUFFICIENT_BARS")
+
+        closes = [b["close"] for b in bars]
+        vwap = _vwap(bars[-15:])
+        ema_fast = _ema(closes[-8:], 5)
+        ema_slow = _ema(closes[-15:], 13)
+        cur = ctx.snap.mid
+        prior_low = min(b["low"] for b in bars[-5:])
+        higher_low = bars[-1]["low"] > prior_low
+
+        reclaimed_vwap = cur >= vwap * 0.9998
+        ema_reclaim = ema_fast >= ema_slow * 0.9995
+        if not (reclaimed_vwap and ema_reclaim):
+            return reject_signal(ctx, self.name, "NO_VWAP_EMA_RECLAIM")
+
+        mom = ctx.mom
+        if not (
+            mom.bid_change_15s > 0
+            and mom.mid_change_15s > 0
+            and mom.mid_change_30s > 0
+            and mom.momentum_confirmed
+            and higher_low
+        ):
+            return reject_signal(ctx, self.name, "NO_PULLBACK_RECOVERY")
+
+        expected = (vwap - prior_low) / cur if cur > 0 else 0.001
+        expected = min(max(expected, 0.001), 0.004)
+        reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
+        if not reachable:
+            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
+
+        score = 2.5 + (cur - vwap) / vwap * 500 + (ema_fast - ema_slow) / ema_slow * 300
+        return pass_signal(
+            ctx,
+            self.name,
+            score=score,
+            confidence=0.65,
+            entry_reason=f"vwap_reclaim vwap={vwap:.4f} ema_fast>{ema_slow:.4f}",
+            invalidation_reason="lost_vwap_or_ema_with_no_recovery",
+            expected_move_pct=expected,
+            impact_pct=impact,
+            limit_buy=fill,
+            setup_context={"vwap": vwap, "ema_fast": ema_fast, "ema_slow": ema_slow, "prior_low": prior_low},
+        )

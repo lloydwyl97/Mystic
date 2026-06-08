@@ -1,0 +1,14 @@
+[Unit]
+Description=Mystic Binance.US scalp paper engine (isolated from DAY portfolio)
+After=network-online.target mystic-market-data.service mystic-uvicorn.service
+PartOf=mystic.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mystic/mystic
+EnvironmentFile=-/home/mystic/mystic/.env
+ExecStart=/home/mystic/mystic/venv/bin/python -m backend.services.binance_scalp.runner
+Restart=no
+
+[Install]
+WantedBy=mystic.target

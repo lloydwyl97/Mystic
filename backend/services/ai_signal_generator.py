@@ -483,7 +483,7 @@ class RealTimeAISignalGenerator:
             # Content still within MAX_SIGNAL_AGE: refresh writer timestamp so entry gates
             # (SIGNAL_CONTENT_AGE_EXCEEDED / content_fresh) stay healthy on generation skips.
             now_ts = time.time()
-            fresh_patch = {
+            fresh_patch: dict[str, str] = {
                 "timestamp": str(now_ts),
                 "writer_timestamp": str(now_ts),
                 "content_fresh": "1",
@@ -491,6 +491,21 @@ class RealTimeAISignalGenerator:
                 "content_age_sec": "0",
                 "ttl_preserve_skip_reason": (skip_reason or "")[:240],
             }
+            # Keep context_fresh aligned with live ai_context (avoid ENTRY_CONTEXT_NOT_FRESH split-brain).
+            try:
+                from backend.services.ai_context_freshness_sync import overlay_live_context_freshness
+
+                overlay_dd: dict[str, str] = dict(dd)
+                try:
+                    overlay_dd["feature_version"] = str(int(float(dd.get("feature_version") or "1")))
+                except (TypeError, ValueError):
+                    overlay_dd["feature_version"] = "1"
+                overlay_live_context_freshness(overlay_dd, symbol)
+                for field in ("ctx_ts_utc", "ctx_age_sec", "context_fresh", "context_audit_emit"):
+                    if field in overlay_dd and overlay_dd[field] not in (None, ""):
+                        fresh_patch[field] = str(overlay_dd[field])
+            except Exception as ctx_exc:
+                logger.debug("SIGNAL_TTL_PRESERVE context overlay skipped %s: %s", key, ctx_exc)
             await self.redis.hset(key, mapping=fresh_patch)
             await self.redis.expire(key, AI_SIGNAL_REDIS_TTL_SEC)
             logger.debug(

@@ -2,6 +2,7 @@
 # MYSTIC startup script
 # Modes:
 #   ./start_mystic.sh core      (recommended DAY stack — external supervisor, no duplicates)
+#   ./start_mystic.sh scalp     (backend + live_md + scalp paper runner — isolated from DAY portfolio)
 #   ./start_mystic.sh all       (full stack + cleanup; legacy)
 #   ./start_mystic.sh backend|live_md|signal|portfolio|learning|collector|ai_context|...
 
@@ -191,6 +192,33 @@ stop_ai_position_tracker() {
 
 stop_ai_outcome_bridge() {
     stop_by_pattern "start_ai_outcome_bridge.py"
+}
+
+stop_scalp() {
+    stop_by_pattern "backend.services.binance_scalp.runner"
+}
+
+ensure_running_or_start() {
+    local pattern="$1"
+    local start_fn="$2"
+    local label="$3"
+    if pgrep -f "$pattern" >/dev/null 2>&1; then
+        echo "OK: $label already running"
+        return 0
+    fi
+    "$start_fn" || return 1
+}
+
+start_scalp() {
+    if [ "${SCALP_PAPER_ENABLED:-false}" != "true" ]; then
+        echo "WARN: SCALP_PAPER_ENABLED is not true — runner will idle (set in .env to enable paper)"
+    fi
+    if [ "${SCALP_FEE_MODEL_VERIFIED:-false}" != "true" ]; then
+        echo "WARN: SCALP_FEE_MODEL_VERIFIED is not true — runner will reject entries"
+    fi
+    echo "Starting Scalp Paper Runner..."
+    nohup "$PYTHON" -m backend.services.binance_scalp.runner > /tmp/mystic_scalp.log 2>&1 &
+    require_running "backend.services.binance_scalp.runner" "Scalp Paper Runner" "/tmp/mystic_scalp.log" 20 1 || return 1
 }
 
 case "$MODE" in
@@ -384,8 +412,34 @@ PY
         sleep 1
         start_backend || exit 1
         ;;
+    scalp)
+        echo "Mode: scalp (isolated — does not start/stop DAY portfolio stack)"
+        stop_scalp
+        sleep 1
+
+        if ! pgrep -x "redis-server" >/dev/null; then
+            echo "Starting Redis..."
+            sudo service redis-server start || exit 1
+            sleep 2
+        fi
+
+        ensure_running_or_start "uvicorn backend.main:app" start_backend "Backend API" || exit 1
+        sleep 2
+        ensure_running_or_start "start_live_market_data.py" start_live_md "Live Market Data" || exit 1
+        sleep 2
+        start_scalp || exit 1
+
+        echo ""
+        echo "=========================================="
+        echo "MYSTIC SCALP STACK STARTED"
+        echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
+        echo "API: /api/scalp/status  /api/scalp/strategies"
+        echo "Log: /tmp/mystic_scalp.log"
+        echo "Requires SCALP_PAPER_ENABLED=true and SCALP_FEE_MODEL_VERIFIED=true in .env"
+        echo "=========================================="
+        ;;
     *)
-        echo "Usage: $0 [core|all|backend|live_md|signal|portfolio|learning|collector|ai_context|ai]"
+        echo "Usage: $0 [core|all|scalp|backend|live_md|signal|portfolio|learning|collector|ai_context|ai]"
         exit 1
         ;;
 esac

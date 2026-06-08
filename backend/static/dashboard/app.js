@@ -23,6 +23,11 @@ const ENDPOINTS = [
     { path: "/api/system/health/comprehensive", key: "systemHealthFull" },
     { path: "/api/portfolio-engine/scoreboard?days=7", key: "scoreboard7d" },
     { path: "/api/portfolio-engine/learning-status?limit=20", key: "learningStatus" },
+    { path: "/api/portfolio-engine/live-readiness", key: "liveReadiness" },
+    { path: "/api/portfolio-engine/model-panel", key: "modelPanel" },
+    { path: "/api/ai-diagnostics/full", key: "aiDiagnosticsFull" },
+    { path: "/api/ai-diagnostics/missed-opportunities?limit=30", key: "missedOpportunities" },
+    { path: "/api/portfolio-engine/day-health", key: "dayHealth" },
 ];
 
 let chartPortfolio = null;
@@ -527,9 +532,94 @@ function updateUI(key, data) {
         case "learningStatus":
             updateLearningStatus(data);
             break;
+        case "liveReadiness":
+            updateLiveReadiness(data);
+            break;
+        case "modelPanel":
+            updateModelPanel(data);
+            break;
+        case "aiDiagnosticsFull":
+            updateFeatureHealthPanel(data);
+            break;
+        case "missedOpportunities":
+            updateMissedOpportunitiesPanel(data);
+            break;
         case "marketDataReadiness":
             updateMarketDataReadiness(data);
             break;
+        case "dayHealth":
+            updateDayHealth(data);
+            break;
+    }
+}
+
+function updateDayHealth(res) {
+    const wrap = res && typeof res === "object" ? res : {};
+    const d = wrap.data || wrap;
+    if (!d || typeof d !== "object") return;
+
+    const set = (id, text) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = text != null && text !== "" ? String(text) : "--";
+    };
+
+    set("dh-slots", d.slots_available != null ? `${d.open_positions_count || 0}/${d.max_open_positions || 4}` : "--");
+    set("dh-idle-cash", d.cash_balance != null ? "$" + Number(d.cash_balance).toFixed(2) : "--");
+    set("dh-idle-reason", d.capital_idle_reason || "--");
+    const diag = d.capital_idle_diagnosis || {};
+    set("dh-spread-passing", Array.isArray(diag.spread_passing_symbols) && diag.spread_passing_symbols.length
+        ? diag.spread_passing_symbols.join(", ")
+        : (diag.spread_passing_symbols ? String(diag.spread_passing_symbols) : "--"));
+    set("dh-trapped-days", d.trapped_position_days_max != null ? Number(d.trapped_position_days_max).toFixed(1) + "d" : "--");
+
+    const pos = Array.isArray(d.positions) && d.positions.length ? d.positions[0] : null;
+    if (pos) {
+        set("dh-held-symbol", pos.symbol || "--");
+        set("dh-held-state", pos.state || "--");
+        set("dh-held-rank", pos.rs_rank != null ? String(pos.rs_rank) : "--");
+        set("dh-held-net", pos.net_pct != null ? (Number(pos.net_pct) * 100).toFixed(2) + "%" : "--");
+        set("dh-best-alt", pos.best_alternate_symbol || "--");
+    }
+
+    const sf = d.signal_freshness || {};
+    set("dh-signal-blocked", sf.blocked_count != null ? String(sf.blocked_count) : "0");
+
+    const eq = d.entry_quality || {};
+    const gates = eq.gates || {};
+    set("dh-gates-enforced", gates.enforced ? "ON" : "OFF");
+    set("dh-rs-order", Array.isArray(eq.basket_rs_order) ? eq.basket_rs_order.join(" > ") : "--");
+
+    const last = eq.last_bar_evaluation || {};
+    const det = last.detail || {};
+    set("dh-last-bar", last.symbol ? `${last.symbol} ${last.gate_ok ? "ok" : last.reject_code || "blocked"}` : "--");
+    set("dh-last-setup", det.setup_credit != null ? Number(det.setup_credit).toFixed(3) : "--");
+    set("dh-bar-skip", d.last_bar_skip_reason || "--");
+
+    const rejects = Array.isArray(d.entry_reject_summary_7d) ? d.entry_reject_summary_7d : [];
+    set("dh-top-reject", rejects.length ? rejects[0].reject_reason + " (" + rejects[0].count + ")" : "--");
+
+    const sp = d.spread_preflight || {};
+    set("dh-spread-blocked", sp.blocked_by_exec_spread_count != null ? String(sp.blocked_by_exec_spread_count) : "--");
+    set("dh-spread-cap", sp.effective_paper_spread_pct != null ? (Number(sp.effective_paper_spread_pct) * 100).toFixed(3) + "%" : "--");
+    set("dh-spread-align", sp.paper_align_with_bar ? "ON" : "OFF");
+
+    const lastBlock = d.last_execution_block || {};
+    set("dh-last-exec-block", lastBlock.reject_reason ? String(lastBlock.reject_reason) + " @ " + (lastBlock.symbol || "?") : "--");
+
+    const pre = document.getElementById("panel-day-health-content");
+    if (pre) {
+        pre.textContent = JSON.stringify(
+            {
+                capital_idle_reason: d.capital_idle_reason,
+                positions: d.positions,
+                signal_freshness: { blocked_count: sf.blocked_count, blocked_codes: sf.blocked_codes },
+                entry_quality: { gates: eq.gates, last_bar: last, rs_order: eq.basket_rs_order },
+                spread_preflight: sp,
+                last_execution_block: lastBlock,
+            },
+            null,
+            2
+        );
     }
 }
 
@@ -653,6 +743,7 @@ function updateDashboardCanonical(res) {
     }
     if (d.scoreboard_today) {
         updateScoreboardToday({ data: d.scoreboard_today });
+        updateTodayActivity(d.scoreboard_today);
     }
     if (d.daily_performance) {
         updateDailyPerformanceSnapshot({ data: d.daily_performance });
@@ -672,6 +763,9 @@ function updateDashboardCanonical(res) {
     }
     if (d.regime && typeof d.regime === "object") {
         updateRegime({ success: true, data: d.regime });
+    }
+    if (d.day_position_health && typeof d.day_position_health === "object") {
+        updateDayHealth({ success: true, data: d.day_position_health });
     }
 
     const lite = d.market_data_readiness_dashboard;
@@ -770,22 +864,167 @@ function updateScoreboardToday(data) {
     if (!d) { el.textContent = "--"; return; }
     const status = d.status || d.pass_fail || (d.pass ? "PASS" : d.fail ? "FAIL" : null);
     const failReasons = d.fail_reasons || "";
+    const closedAi = d.closed_ai_trades_today != null ? d.closed_ai_trades_today : d.ai_closed_trades;
+    const openBuys = d.open_buys_today != null ? d.open_buys_today : 0;
     el.title =
-        "Today's closed-trade stats (SQLite). PASS/FAIL is diagnostic only — it does not block buys. " +
-        (failReasons || status || "");
+        "Today's closed AI SELL count: " + (closedAi != null ? closedAi : "?") +
+        ". Open buys today: " + openBuys +
+        " (not included in trades count). PASS/FAIL is diagnostic only.";
 
-    // Display status with fail reasons if present
     if (status && String(status).toUpperCase() === "FAIL" && failReasons) {
         el.textContent = `FAIL: ${failReasons}`;
     } else {
-        el.textContent = status ? String(status) : "--";
-        el.title = "Today's closed-trade stats (SQLite). Diagnostic only; does not block buys.";
+        el.textContent = (closedAi != null ? closedAi + " closed" : status ? String(status) : "--") +
+            (openBuys ? " / " + openBuys + " open buy" : "");
     }
 
     el.classList.remove("pnl-pos", "pnl-neg");
     if (status && (String(status).toUpperCase() === "PASS" || String(status).toUpperCase() === "OK")) el.classList.add("pnl-pos");
     else if (status && String(status).toUpperCase() === "FAIL") el.classList.add("pnl-neg");
     else if (status && String(status).toUpperCase() === "PENDING") el.classList.add("pnl-pos");
+}
+
+function updateTodayActivity(d) {
+    if (!d || typeof d !== "object") return;
+    function set(id, val, title) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = val != null ? String(val) : "--";
+        if (title) el.title = title;
+    }
+    set("today-closed-ai", d.closed_ai_trades_today != null ? d.closed_ai_trades_today : d.ai_closed_trades, "AI SELL closes today");
+    set("today-open-buys", d.open_buys_today, "BUY rows today — not counted as closed trades");
+    const aiPnl = d.ai_realized_pnl_today != null ? d.ai_realized_pnl_today : d.ai_closed_pnl;
+    const aiEl = document.getElementById("today-ai-pnl");
+    if (aiEl && aiPnl != null) {
+        aiEl.textContent = "$" + Number(aiPnl).toFixed(2);
+        aiEl.classList.remove("pnl-pos", "pnl-neg");
+        aiEl.classList.add(Number(aiPnl) >= 0 ? "pnl-pos" : "pnl-neg");
+    }
+    set("today-admin-closes", d.admin_stale_closes_today != null ? d.admin_stale_closes_today : d.admin_synthetic_closes, "Admin/stale synthetic closes");
+    const uEl = document.getElementById("today-unrealized");
+    if (uEl && d.open_unrealized_pnl != null) {
+        uEl.textContent = "$" + Number(d.open_unrealized_pnl).toFixed(2);
+        uEl.classList.remove("pnl-pos", "pnl-neg");
+        uEl.classList.add(Number(d.open_unrealized_pnl) >= 0 ? "pnl-pos" : "pnl-neg");
+    }
+    set("today-equity", d.total_equity != null ? "$" + Number(d.total_equity).toFixed(2) : "--", "Ledger total equity");
+    set("today-paper-trades", d.paper_trades_today, "All paper_trades rows today");
+    set("today-live-trades", d.live_trades_today, "paper_trades with mode=live today");
+}
+
+function updateLiveReadiness(res) {
+    const d = (res && res.data) ? res.data : res;
+    const pre = document.getElementById("panel-live-readiness-content");
+    if (!d) {
+        if (pre) pre.textContent = "No live readiness data.";
+        return;
+    }
+    function yn(v) { return v ? "yes" : "no"; }
+    function set(id, text, warn) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = text != null ? String(text) : "--";
+        el.classList.toggle("readiness-warn", !!warn);
+    }
+    set("lr-mode", d.current_local_mode || d.execution_mode);
+    set("lr-live-orders", d.live_orders_permitted ? "permitted" : "blocked");
+    set("lr-block-reason", d.live_orders_block_reason || (d.live_readiness_blockers || []).join("; ") || "none");
+    set("lr-tiny-ready", yn(d.ready_for_tiny_live_test), !d.ready_for_tiny_live_test);
+    set("lr-full-ready", yn(d.ready_for_full_live), !d.ready_for_full_live);
+    set("lr-usdt", d.usdt_free_balance != null ? Number(d.usdt_free_balance).toFixed(2) : "?", d.usdt_free_balance != null && Number(d.usdt_free_balance) <= 0);
+    set("lr-can-trade", d.can_trade != null ? yn(d.can_trade) : "?");
+    set("lr-can-withdraw", d.can_withdraw != null ? yn(d.can_withdraw) : "?", d.can_withdraw === true);
+    set("lr-open-orders", d.open_binance_orders_count != null ? d.open_binance_orders_count : "?");
+    set("lr-drift", d.exchange_time_drift_ms != null ? d.exchange_time_drift_ms : "?");
+    set("lr-protected", yn(d.protected_execution_enabled));
+    set("lr-sleeve", d.sleeve_telemetry_only ? "telemetry only" : (d.sleeve_blocking_enabled ? "blocking ON" : "off"));
+    if (pre) {
+        const lines = [];
+        lines.push("ready_for_tiny_live_test: " + yn(d.ready_for_tiny_live_test));
+        lines.push("ready_for_full_live: " + yn(d.ready_for_full_live));
+        if (Array.isArray(d.live_readiness_warnings) && d.live_readiness_warnings.length) {
+            lines.push("warnings:");
+            d.live_readiness_warnings.forEach(function (w) { lines.push("  - " + w); });
+        }
+        if (Array.isArray(d.live_readiness_blockers) && d.live_readiness_blockers.length) {
+            lines.push("blockers:");
+            d.live_readiness_blockers.forEach(function (b) { lines.push("  - " + b); });
+        }
+        if (Array.isArray(d.tiny_live_checklist)) {
+            lines.push("tiny_live_checklist:");
+            d.tiny_live_checklist.forEach(function (c) {
+                lines.push("  - " + c.item + (c.env != null ? " env=" + c.env : c.value != null ? " val=" + JSON.stringify(c.value) : ""));
+            });
+        }
+        pre.textContent = lines.join("\n");
+    }
+}
+
+function updateModelPanel(res) {
+    const el = document.getElementById("panel-model-content");
+    if (!el) return;
+    const d = (res && res.data) ? res.data : res;
+    if (!d || !Array.isArray(d.per_symbol)) {
+        el.textContent = "No model panel data.";
+        return;
+    }
+    const lines = [];
+    d.per_symbol.forEach(function (m) {
+        lines.push(m.symbol + ": fv=" + (m.feature_version != null ? m.feature_version : "?") +
+            " dim=" + (m.feature_dim != null ? m.feature_dim : "?") +
+            " active_acc=" + (m.active_accuracy != null ? m.active_accuracy : "?") +
+            " holdout_n=" + (m.holdout_sample_count != null ? m.holdout_sample_count : "?") +
+            " low_conf=" + (m.holdout_low_confidence ? "yes" : "no"));
+        if (m.candidate_always_buy) lines.push("  candidate ALWAYS_BUY");
+        if (m.candidate_always_hold) lines.push("  candidate ALWAYS_HOLD");
+        if (m.promotion_rejection_reason) lines.push("  reason: " + m.promotion_rejection_reason);
+    });
+    el.textContent = lines.join("\n") || "No symbols.";
+}
+
+function updateFeatureHealthPanel(res) {
+    const el = document.getElementById("panel-feature-health-content");
+    if (!el) return;
+    const d = (res && res.data) ? res.data : res;
+    if (!d) { el.textContent = "No diagnostics."; return; }
+    try {
+        el.textContent = JSON.stringify({
+            feature_completeness: d.feature_completeness,
+            feature_freshness: d.feature_freshness,
+            model_freshness: d.model_freshness,
+        }, null, 2).slice(0, 12000);
+    } catch (e) {
+        el.textContent = String(e);
+    }
+}
+
+function updateMissedOpportunitiesPanel(res) {
+    const el = document.getElementById("panel-missed-op-content");
+    if (!el) return;
+    const d = (res && res.data) ? res.data : res;
+    if (!d) { el.textContent = "No missed opportunity data."; return; }
+    try {
+        el.textContent = JSON.stringify(d, null, 2).slice(0, 8000);
+    } catch (e) {
+        el.textContent = String(e);
+    }
+}
+
+async function fetchTradeDrilldown(tradeId, targetEl) {
+    if (!tradeId || !targetEl) return;
+    targetEl.textContent = "Loading…";
+    try {
+        const r = await fetch("/api/portfolio-engine/trade/" + encodeURIComponent(tradeId));
+        const j = await r.json();
+        if (!j.success) {
+            targetEl.textContent = j.detail || j.error || "Failed";
+            return;
+        }
+        targetEl.textContent = JSON.stringify(j.data, null, 2).slice(0, 12000);
+    } catch (e) {
+        targetEl.textContent = String(e);
+    }
 }
 
 // portfolio-engine/invariants: { success, data: { all_invariants_pass, snapshot_failed_keys, ... } }
@@ -1430,6 +1669,7 @@ function updateTrades(data) {
         const pnlClass = pnl != null ? (pnl >= 0 ? "pnl-pos" : "pnl-neg") : "";
         const sleeve = t.sleeve || "ACTIVE";
         const badgeCls = "sleeve-badge sleeve-badge--" + sleeve.toLowerCase();
+        const tradeId = t.trade_id || t.id || "";
         const tr = document.createElement("tr");
         tr.innerHTML =
             "<td>" + timeStr + "</td>" +
@@ -1438,8 +1678,31 @@ function updateTrades(data) {
             "<td>" + (t.side || "").toLowerCase() + "</td>" +
             "<td>" + (t.quantity != null ? Number(t.quantity).toFixed(6) : "") + "</td>" +
             "<td>" + (t.price != null ? Number(t.price).toFixed(4) : t.fill_price != null ? Number(t.fill_price).toFixed(4) : "") + "</td>" +
-            "<td class='" + pnlClass + "'>" + pnlStr + "</td>";
+            "<td class='" + pnlClass + "'>" + pnlStr + "</td>" +
+            "<td><button type='button' class='trade-drill-btn' data-trade-id='" + String(tradeId).replace(/'/g, "") + "'>View</button></td>";
         tbody.appendChild(tr);
+        if (tradeId) {
+            const detailTr = document.createElement("tr");
+            detailTr.className = "trade-drill-row";
+            detailTr.style.display = "none";
+            const detailTd = document.createElement("td");
+            detailTd.colSpan = 8;
+            const pre = document.createElement("pre");
+            pre.className = "panel-pre trade-drill-pre";
+            detailTd.appendChild(pre);
+            detailTr.appendChild(detailTd);
+            tbody.appendChild(detailTr);
+            const btn = tr.querySelector(".trade-drill-btn");
+            if (btn) {
+                btn.addEventListener("click", function () {
+                    const open = detailTr.style.display !== "none";
+                    detailTr.style.display = open ? "none" : "table-row";
+                    if (!open && pre.textContent === "") {
+                        fetchTradeDrilldown(tradeId, pre);
+                    }
+                });
+            }
+        }
     });
 }
 

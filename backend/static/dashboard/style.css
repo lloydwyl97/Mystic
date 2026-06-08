@@ -968,6 +968,60 @@ html {
     color: var(--text-secondary);
 }
 
+.readiness-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.readiness-card {
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    padding: 10px;
+}
+
+.readiness-label {
+    display: block;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.readiness-value {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    margin-top: 4px;
+}
+
+.readiness-value.readiness-warn,
+.readiness-card .readiness-warn {
+    color: var(--red);
+}
+
+.trade-drill-btn {
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    border-radius: 4px;
+    padding: 2px 8px;
+    cursor: pointer;
+    font-size: 0.75rem;
+}
+
+.trade-drill-pre {
+    max-height: 320px;
+    overflow: auto;
+    font-size: 0.72rem;
+}
+
+.analytics-row--today {
+    margin-top: 8px;
+}
+
 .operator-form__status--ok {
     color: var(--green);
 }
