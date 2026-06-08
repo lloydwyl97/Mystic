@@ -1,6 +1,6 @@
 # Mystic Local Laptop Operations (canonical)
 
-**Environment:** `mystic-Virtual-Machine` — repo `/home/mystic/mystic` — **not** production Ocean.
+**Environment:** `mystic-Virtual-Machine` — repo `/home/mystic/mystic`.
 
 ## Start / stop
 

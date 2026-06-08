@@ -42,7 +42,7 @@ SPREAD_BLOCK_PCT_OF_TP = float(os.getenv("SPREAD_BLOCK_PCT_OF_TP", "0.15"))  # B
 GOVERNANCE_SHADOW_ONLY = os.getenv("GOVERNANCE_SHADOW_ONLY", "false").lower() == "true"
 # Explicit: when True, decide() runs for logs only; execute_buy_fifo + bar path both honor this flag.
 GOVERNANCE_ENFORCES = not GOVERNANCE_SHADOW_ONLY
-# Local staged testing only (set in deploy/core_only_local.env). Does not ship on production droplets.
+# Local staged testing only (set in deploy/core_only_local.env). Omit that file outside local VM.
 GOVERNANCE_LOCAL_SKIP_HOLD_CONSEC_LOSSES = os.getenv("GOVERNANCE_LOCAL_SKIP_HOLD_CONSEC_LOSSES", "false").lower() == "true"
 # Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
 GOVERNANCE_LOCAL_SKIP_TIER_D_RECOVERY_SYMBOL = os.getenv("GOVERNANCE_LOCAL_SKIP_TIER_D_RECOVERY_SYMBOL", "false").lower() == "true"

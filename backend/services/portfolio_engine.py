@@ -522,7 +522,7 @@ POST_SELL_COOLDOWN_BARS = int(os.getenv("POST_SELL_COOLDOWN_BARS", "40"))  # Blo
 GLOBAL_SELL_COOLDOWN_BARS = int(os.getenv("GLOBAL_SELL_COOLDOWN_BARS", "10"))  # Block ALL buys for N bars after any sell
 POST_SELL_COOLDOWN_WALL_SEC = int(os.getenv("POST_SELL_COOLDOWN_WALL_SEC", "2400"))  # 40 min wall-clock backup
 GLOBAL_SELL_COOLDOWN_WALL_SEC = int(os.getenv("GLOBAL_SELL_COOLDOWN_WALL_SEC", "600"))  # 10 min wall-clock backup
-# Local staged testing only (set in deploy/core_only_local.env). Production droplets omit that file — defaults false.
+# Local staged testing only (set in deploy/core_only_local.env). Omit that file outside local VM — defaults false.
 PORTFOLIO_LOCAL_SKIP_GLOBAL_SELL_COOLDOWN = os.getenv("PORTFOLIO_LOCAL_SKIP_GLOBAL_SELL_COOLDOWN", "false").lower() == "true"
 # Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
 PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN = os.getenv("PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN", "false").lower() == "true"

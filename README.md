@@ -65,6 +65,6 @@ Paper mode defaults: `PAPER_TRADING=true`, `LIVE_TRADES_ALLOWED=false`, top-4 DA
 
 See `LOCAL_OPERATIONS.md` for day-to-day commands, Redis key types, and design constraints.
 
-## Production (Ocean)
+## Local-only operation
 
-Production droplet uses repo root `/home/mystic` on `mystic-prod`. Deploy by pull + `systemctl restart mystic` — see project ops docs.
+This repo is developed and run on the local VM. See `LOCAL_OPERATIONS.md` for start/stop, stack layout, and constraints.
