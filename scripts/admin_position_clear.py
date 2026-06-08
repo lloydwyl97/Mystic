@@ -37,6 +37,10 @@ LESSON = (
     "position opened before corrected AI/model/training/feature path; "
     "admin-cleared so Mystic can start a fresh corrected-path DAY cycle"
 )
+LIVE_GHOST_REASON = "STALE_LIVE_GHOST_POSITION_CLEAR"
+LIVE_GHOST_LESSON = (
+    "stale live-era position not held in paper DAY; admin-cleared for flat paper state"
+)
 
 
 def _mystic_uvicorn_running() -> bool:
@@ -53,7 +57,22 @@ def _mystic_uvicorn_running() -> bool:
         return False
 
 
-def preflight_checks() -> dict:
+def _symbols_to_clear(requested: list[str] | None) -> list[str]:
+    if not requested:
+        return list(SYMBOLS)
+    out: list[str] = []
+    for raw in requested:
+        sym = raw.strip().upper()
+        if sym not in SYMBOLS:
+            if sym.endswith("USDT") and "/" not in sym:
+                sym = f"{sym[:-4]}/USDT"
+            if sym not in SYMBOLS:
+                raise SystemExit(f"ABORT: unknown symbol {raw!r} — allowed {SYMBOLS}")
+        out.append(sym)
+    return out
+
+
+def preflight_checks(symbols_to_clear: list[str]) -> dict:
     """Refuse unsafe or redundant admin clears."""
     mode = os.getenv("EXECUTION_MODE", "").lower()
     live = os.getenv("LIVE_TRADES_ALLOWED", "").lower()
@@ -92,8 +111,12 @@ def preflight_checks() -> dict:
                     f"ABORT: already flat with prior {CLOSE_REASON} rows — idempotent guard (nothing to clear)"
                 )
             raise SystemExit("ABORT: no open positions to clear")
-        if set(open_syms) != set(SYMBOLS):
-            raise SystemExit(f"ABORT: open positions {open_syms} != expected {SYMBOLS}")
+        missing = [s for s in symbols_to_clear if s not in open_syms]
+        if missing:
+            raise SystemExit(f"ABORT: requested clear {symbols_to_clear} but open are {open_syms}")
+        extra = [s for s in open_syms if s not in symbols_to_clear]
+        if extra:
+            REPORT["open_positions_left_after_clear"] = extra
         ledger = cur.execute(
             "SELECT cash_balance, positions_value, realized_pnl, unrealized_pnl, total_equity FROM portfolio_engine_ledger WHERE id=1"
         ).fetchone()
@@ -165,14 +188,19 @@ def fetch_reference_marks(conn: sqlite3.Connection | None = None) -> dict[str, f
     return marks
 
 
-def clear_redis_paper_state(cash_balance: float, realized_pnl: float) -> None:
+def clear_redis_paper_state(
+    cash_balance: float, realized_pnl: float, *, symbols: list[str] | None = None
+) -> None:
     try:
         import redis
 
         r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"), decode_responses=True)
-        for sym in SYMBOLS:
+        for sym in symbols or SYMBOLS:
             r.delete(f"paper:position:{sym}")
             r.srem("paper:positions:active", sym)
+            base = sym.split("/")[0]
+            r.delete(f"live_position:{base}")
+            r.delete(f"live_position:{sym}")
         r.set("paper:cash_balance", str(cash_balance))
         r.set("paper:realized_pnl_total", str(realized_pnl))
         REPORT["redis_paper_cleared"] = True
@@ -183,10 +211,16 @@ def clear_redis_paper_state(cash_balance: float, realized_pnl: float) -> None:
         REPORT["redis_error"] = str(ex)
 
 
-def run_clear() -> None:
+def run_clear(*, symbols: list[str] | None = None, live_ghost: bool = False) -> None:
     from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, TAKER_FEE
 
-    REPORT["preflight"] = preflight_checks()
+    symbols_to_clear = _symbols_to_clear(symbols)
+    close_reason = LIVE_GHOST_REASON if live_ghost else CLOSE_REASON
+    audit_action = LIVE_GHOST_REASON if live_ghost else AUDIT_ACTION
+    lesson = LIVE_GHOST_LESSON if live_ghost else LESSON
+    REPORT["symbols_to_clear"] = symbols_to_clear
+    REPORT["live_ghost_clear"] = live_ghost
+    REPORT["preflight"] = preflight_checks(symbols_to_clear)
     existing_backups = sorted(
         PROJECT_ROOT.glob("mystic_trading.db.backup_before_stale_corrected_path_position_clear_*")
     )
@@ -225,7 +259,7 @@ def run_clear() -> None:
     total_admin_realized = 0.0
     per_symbol_pnl: dict[str, float] = {}
 
-    for sym in SYMBOLS:
+    for sym in symbols_to_clear:
         if sym not in positions:
             continue
         pos = positions[sym]
@@ -255,27 +289,29 @@ def run_clear() -> None:
 
         sell_trade_id = f"stale_clear_{sym.replace('/', '')}_{int(now_epoch * 1000)}"
         explain = {
-            "close_reason": CLOSE_REASON,
+            "close_reason": close_reason,
             "closed_by": "USER_ADMIN_RESET",
             "admin_clear": True,
-            "stale_pre_correction_clear": True,
+            "stale_pre_correction_clear": not live_ghost,
+            "stale_live_ghost_clear": live_ghost,
             "not_ai_profit_sell": True,
             "not_ai_trade": True,
             "not_strategy_sell": True,
             "not_live_trade": True,
             "good_trade": False,
             "bad_trade": True,
-            "lesson": LESSON,
+            "lesson": lesson,
             "exit_is_reference_mark": True,
             "reference_mark": mark,
             "original_trade_id": pos.get("trade_id"),
         }
         diagnostics = {
             "source": "USER_ADMIN_RESET",
-            "reason": CLOSE_REASON,
+            "reason": close_reason,
             "is_synthetic": 1,
             "admin_clear": True,
-            "stale_pre_correction_clear": True,
+            "stale_pre_correction_clear": not live_ghost,
+            "stale_live_ghost_clear": live_ghost,
             "not_ai_trade": True,
             "not_ai_profit_sell": True,
             "not_strategy_sell": True,
@@ -304,11 +340,11 @@ def run_clear() -> None:
                 pnl_pct,
                 fee,
                 max(0.0, (entry - mark) * qty),
-                CLOSE_REASON,
+                close_reason,
                 now_iso,
                 json.dumps(explain),
                 json.dumps(diagnostics),
-                CLOSE_REASON,
+                close_reason,
                 "USER_ADMIN_RESET",
                 mark,
             ),
@@ -333,14 +369,14 @@ def run_clear() -> None:
                 sym,
                 now_iso,
                 now_epoch,
-                CLOSE_REASON,
+                close_reason,
                 float(realized_pnl),
                 float(cooldown_until),
                 qty,
                 entry,
                 mark,
                 sell_trade_id,
-                "closed_by=USER_ADMIN_RESET;admin_clear=true;stale_pre_correction_clear=true;not_ai_profit_sell=true;not_strategy_sell=true",
+                f"closed_by=USER_ADMIN_RESET;admin_clear=true;reason={close_reason};not_ai_profit_sell=true;not_strategy_sell=true",
             ),
         )
         admin_rows["close_ledger"].append({"id": cur.lastrowid, "symbol": sym, "cooldown_until": cooldown_until})
@@ -363,7 +399,7 @@ def run_clear() -> None:
             """,
             (
                 now_iso,
-                AUDIT_ACTION,
+                audit_action,
                 sym,
                 qty,
                 mark,
@@ -373,7 +409,7 @@ def run_clear() -> None:
                 json.dumps(pre_ledger),
                 json.dumps(post_ledger),
                 "USER_ADMIN_RESET",
-                CLOSE_REASON,
+                close_reason,
                 float(realized_pnl),
             ),
         )
@@ -401,20 +437,21 @@ def run_clear() -> None:
                 fee,
                 float(realized_pnl),
                 float(net_pct),
-                f"{CLOSE_REASON}:USER_ADMIN_RESET",
-                CLOSE_REASON,
+                f"{close_reason}:USER_ADMIN_RESET",
+                close_reason,
                 json.dumps(
                     {
                         "source": "USER_ADMIN_RESET",
                         "admin_clear": True,
-                        "stale_pre_correction_clear": True,
+                        "stale_pre_correction_clear": not live_ghost,
+                        "stale_live_ghost_clear": live_ghost,
                         "not_ai_profit_sell": True,
                         "not_ai_trade": True,
                         "not_strategy_sell": True,
                         "not_live_trade": True,
                         "good_trade": False,
                         "bad_trade": True,
-                        "lesson": LESSON,
+                        "lesson": lesson,
                         "exit_is_reference_mark": True,
                         "closed_by": "USER_ADMIN_RESET",
                     }
@@ -429,12 +466,22 @@ def run_clear() -> None:
             "wall_sec": POST_SELL_COOLDOWN_WALL_SEC,
         }
 
-    cur.execute("DELETE FROM portfolio_engine_positions")
+    placeholders = ",".join("?" * len(symbols_to_clear))
+    cur.execute(
+        f"DELETE FROM portfolio_engine_positions WHERE symbol IN ({placeholders})",
+        symbols_to_clear,
+    )
+    remaining_pos_val = float(
+        cur.execute(
+            "SELECT COALESCE(SUM(quantity * entry_price), 0) FROM portfolio_engine_positions"
+        ).fetchone()[0]
+        or 0.0
+    )
     cur.execute(
         """
         UPDATE portfolio_engine_ledger SET
             cash_balance=?,
-            positions_value=0,
+            positions_value=?,
             realized_pnl=?,
             unrealized_pnl=0,
             total_equity=?,
@@ -444,7 +491,7 @@ def run_clear() -> None:
             last_updated=?
         WHERE id=1
         """,
-        (cash_balance, realized_total, cash_balance, now_iso),
+        (cash_balance, remaining_pos_val, realized_total, cash_balance + remaining_pos_val, now_iso),
     )
     conn.commit()
     conn.close()
@@ -454,28 +501,39 @@ def run_clear() -> None:
     REPORT["total_admin_realized_pnl"] = total_admin_realized
     REPORT["ledger_after"] = {
         "cash_balance": cash_balance,
-        "positions_value": 0.0,
+        "positions_value": remaining_pos_val,
         "realized_pnl": realized_total,
         "unrealized_pnl": 0.0,
-        "total_equity": cash_balance,
-        "equity_delta_from_before": cash_balance - equity_before,
+        "total_equity": cash_balance + remaining_pos_val,
+        "equity_delta_from_before": (cash_balance + remaining_pos_val) - equity_before,
     }
     REPORT["labels"] = {
-        "close_reason": CLOSE_REASON,
+        "close_reason": close_reason,
         "closed_by": "USER_ADMIN_RESET",
         "source": "USER_ADMIN_RESET",
         "is_synthetic": 1,
         "admin_clear": True,
-        "stale_pre_correction_clear": True,
+        "stale_pre_correction_clear": not live_ghost,
+        "stale_live_ghost_clear": live_ghost,
         "not_ai_profit_sell": True,
         "not_strategy_sell": True,
         "not_live_trade": True,
         "good_trade": False,
         "bad_trade": True,
     }
-    clear_redis_paper_state(cash_balance, realized_total)
+    clear_redis_paper_state(cash_balance, realized_total, symbols=symbols_to_clear)
 
 
 if __name__ == "__main__":
-    run_clear()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Admin-clear stale paper positions")
+    parser.add_argument("--symbols", nargs="+", default=None, help="e.g. XRP/USDT (default: all four)")
+    parser.add_argument(
+        "--live-ghost",
+        action="store_true",
+        help="Label as stale live-era ghost (not a strategy sell)",
+    )
+    args = parser.parse_args()
+    run_clear(symbols=args.symbols, live_ghost=args.live_ghost)
     print(json.dumps(REPORT, indent=2, default=str))
