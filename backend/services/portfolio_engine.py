@@ -823,7 +823,13 @@ class BuyCandidate:
         except (TypeError, ValueError):
             trust_delta = 0.0
         trust_delta = max(-0.18, min(0.18, trust_delta))
-        return max(0.0, min(1.0, base + delta + trust_delta))
+        thesis_delta = 0.0
+        try:
+            thesis_delta = float((self.decision_data or {}).get("thesis_rank_delta") or 0.0)
+        except (TypeError, ValueError):
+            thesis_delta = 0.0
+        thesis_delta = max(-0.20, min(0.12, thesis_delta))
+        return max(0.0, min(1.0, base + delta + trust_delta + thesis_delta))
 
 
 def _decision_float(decision_data: dict[str, Any], key: str, default: float) -> float:
@@ -1196,6 +1202,12 @@ class OpenPosition:
     repair_add_trade_ids: str = "[]"  # JSON list of repair-add paper trade_ids
     average_entry_after_repair: float = 0.0
     original_position_cost: float = 0.0  # First-buy cost basis cap for repair sizing
+    entry_thesis: str = ""
+    thesis_score: float = 0.0
+    thesis_invalid_level: float = 0.0
+    thesis_target_level: float = 0.0
+    entry_vwap: float = 0.0
+    thesis_trend_tf: str = ""
 
     @property
     def risk_usd(self) -> float:
@@ -1287,6 +1299,13 @@ class TradeExplainability:
     entry_slippage_pct: float = 0.0
     entry_fee_pct: float = 0.0
     entry_spread_source: str = ""
+    setup_type: str = ""
+    entry_thesis: str = ""
+    thesis_score: float = 0.0
+    thesis_invalid_level: float = 0.0
+    thesis_target_level: float = 0.0
+    entry_vwap: float = 0.0
+    thesis_trend_tf: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for storage"""
@@ -1363,6 +1382,13 @@ class TradeExplainability:
             "estimated_slippage_pct": self.entry_slippage_pct,
             "estimated_fees_pct": self.entry_fee_pct,
             "buy_margin": self.entry_buy_margin,
+            "setup_type": self.setup_type or self.entry_thesis,
+            "entry_thesis": self.entry_thesis or self.setup_type,
+            "thesis_score": self.thesis_score,
+            "thesis_invalid_level": self.thesis_invalid_level,
+            "thesis_target_level": self.thesis_target_level,
+            "entry_vwap": self.entry_vwap,
+            "thesis_trend_tf": self.thesis_trend_tf,
         }
 
 
@@ -3587,6 +3613,7 @@ class PortfolioEngine:
             ("repair_add_trade_ids", "TEXT DEFAULT '[]'"),
             ("average_entry_after_repair", "REAL DEFAULT 0"),
             ("original_position_cost", "REAL DEFAULT 0"),
+            ("thesis_json", "TEXT DEFAULT ''"),
         ]:
             if col_name not in pos_cols:
                 try:
@@ -3930,6 +3957,17 @@ class PortfolioEngine:
                     orig_cost = float(getattr(pos, "original_position_cost", 0.0) or 0.0)
                     if orig_cost <= 0:
                         orig_cost = float(pos.quantity or 0) * float(pos.entry_price or 0)
+                    thesis_json = json.dumps(
+                        {
+                            "entry_thesis": str(getattr(pos, "entry_thesis", "") or ""),
+                            "thesis_score": float(getattr(pos, "thesis_score", 0.0) or 0.0),
+                            "thesis_invalid_level": float(getattr(pos, "thesis_invalid_level", 0.0) or 0.0),
+                            "thesis_target_level": float(getattr(pos, "thesis_target_level", 0.0) or 0.0),
+                            "entry_vwap": float(getattr(pos, "entry_vwap", 0.0) or 0.0),
+                            "thesis_trend_tf": str(getattr(pos, "thesis_trend_tf", "") or ""),
+                        },
+                        separators=(",", ":"),
+                    )
                     cursor.execute(
                         """
                         INSERT OR REPLACE INTO portfolio_engine_positions (
@@ -3939,8 +3977,8 @@ class PortfolioEngine:
                             atr_at_entry, entry_bar_timestamp, confidence_at_entry,
                             entry_fee, sleeve, entry_strategy_id,
                             repair_add_count, last_repair_add_ts, repair_add_trade_ids,
-                            average_entry_after_repair, original_position_cost, last_updated
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            average_entry_after_repair, original_position_cost, thesis_json, last_updated
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                         (
                             pos.symbol,
@@ -3965,6 +4003,7 @@ class PortfolioEngine:
                             repair_ids,
                             avg_after,
                             orig_cost,
+                            thesis_json,
                             timestamp,
                         ),
                     )
@@ -5201,7 +5240,8 @@ class PortfolioEngine:
                            COALESCE(repair_add_count, 0), COALESCE(last_repair_add_ts, 0),
                            COALESCE(repair_add_trade_ids, '[]'),
                            COALESCE(average_entry_after_repair, 0),
-                           COALESCE(original_position_cost, 0)
+                           COALESCE(original_position_cost, 0),
+                           COALESCE(thesis_json, '')
                     FROM portfolio_engine_positions
                 """)
                 rows = cursor.fetchall()
@@ -5231,6 +5271,14 @@ class PortfolioEngine:
             orig_cost = float(row[21]) if len(row) > 21 else 0.0
             if orig_cost <= 0:
                 orig_cost = float(row[1] or 0) * float(row[2] or 0)
+            thesis_payload: dict[str, Any] = {}
+            if len(row) > 22 and row[22]:
+                try:
+                    parsed_thesis = json.loads(str(row[22]))
+                    if isinstance(parsed_thesis, dict):
+                        thesis_payload = parsed_thesis
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    thesis_payload = {}
             pos = OpenPosition(
                 symbol=normalized_symbol,
                 quantity=row[1],
@@ -5256,6 +5304,12 @@ class PortfolioEngine:
                 original_position_cost=orig_cost,
                 add_count=repair_cnt,
                 last_add_ts=last_repair_ts,
+                entry_thesis=str(thesis_payload.get("entry_thesis") or ""),
+                thesis_score=float(thesis_payload.get("thesis_score") or 0.0),
+                thesis_invalid_level=float(thesis_payload.get("thesis_invalid_level") or 0.0),
+                thesis_target_level=float(thesis_payload.get("thesis_target_level") or 0.0),
+                entry_vwap=float(thesis_payload.get("entry_vwap") or 0.0),
+                thesis_trend_tf=str(thesis_payload.get("thesis_trend_tf") or ""),
             )
             self.open_positions[pos.symbol] = pos
             logger.debug(
@@ -6579,6 +6633,12 @@ class PortfolioEngine:
             sleeve=effective_sleeve,
             entry_strategy_id=str(getattr(explainability, "live_ai_strategy", "") or ""),
             original_position_cost=float(total_cost),
+            entry_thesis=str(getattr(explainability, "entry_thesis", "") or getattr(explainability, "setup_type", "") or ""),
+            thesis_score=float(getattr(explainability, "thesis_score", 0.0) or 0.0),
+            thesis_invalid_level=float(getattr(explainability, "thesis_invalid_level", 0.0) or 0.0),
+            thesis_target_level=float(getattr(explainability, "thesis_target_level", 0.0) or 0.0),
+            entry_vwap=float(getattr(explainability, "entry_vwap", 0.0) or 0.0),
+            thesis_trend_tf=str(getattr(explainability, "thesis_trend_tf", "") or ""),
         )
         self.open_positions[normalized_symbol] = position
         self._recently_added_symbols[normalized_symbol] = time.time()
@@ -8934,6 +8994,48 @@ class PortfolioEngine:
         pnl_pct = (current_price - entry_price) / entry_price
         net_pnl_pct = pnl_pct - ESTIMATED_ROUNDTRIP_COST
 
+        from backend.services.day_trade_thesis import evaluate_thesis_exit
+
+        thesis_eval = evaluate_thesis_exit(
+            entry_thesis=str(getattr(position, "entry_thesis", "") or ""),
+            thesis_score=float(getattr(position, "thesis_score", 0.0) or 0.0),
+            thesis_invalid_level=float(getattr(position, "thesis_invalid_level", 0.0) or 0.0),
+            thesis_target_level=float(getattr(position, "thesis_target_level", 0.0) or 0.0),
+            entry_vwap=float(getattr(position, "entry_vwap", 0.0) or 0.0),
+            entry_price=entry_price,
+            mark=current_price,
+            bundle=bundle_obj,
+        )
+        thesis_action = str(thesis_eval.get("action") or "default")
+        thesis_reason = str(thesis_eval.get("reason") or "")
+
+        if thesis_action == "sell" and thesis_reason.startswith("THESIS_INVALIDATION"):
+            rationale = thesis_reason
+            logger.info(
+                "THESIS_INVALIDATION_SELL symbol=%s reason=%s net_pct=%.6f invalid_level=%.8f",
+                symbol,
+                thesis_reason,
+                net_pnl_pct,
+                float(getattr(position, "thesis_invalid_level", 0.0) or 0.0),
+            )
+            return await self.execute_sell_fifo(
+                symbol,
+                quantity,
+                current_price,
+                ExitType.MANUAL,
+                rationale,
+                current_bar=current_bar,
+            )
+
+        if thesis_action == "hold":
+            logger.debug(
+                "THESIS_HOLD symbol=%s reason=%s net_pct=%.6f",
+                symbol,
+                thesis_reason,
+                net_pnl_pct,
+            )
+            return None
+
         if net_pnl_pct + 1e-12 < MIN_NET_PROFIT_TO_SELL:
             logger.debug(
                 "HOLD_PROFIT_NOT_ENOUGH symbol=%s net_pct=%.6f floor=%.6f",
@@ -8947,7 +9049,12 @@ class PortfolioEngine:
 
         fading = spike_profit_fading_from_bundle(bundle_obj) if bundle_obj else False
 
-        rationale = f"SPIKE_PROFIT_FADING_net_{net_pnl_pct * 100:.4f}pct" if fading else f"net_profit_confirmed_{net_pnl_pct * 100:.4f}pct"
+        if thesis_reason == "THESIS_TARGET_HIT":
+            rationale = f"THESIS_TARGET_HIT_net_{net_pnl_pct * 100:.4f}pct"
+        elif thesis_reason == "THESIS_PROFIT_PROTECTION":
+            rationale = f"THESIS_PROFIT_PROTECTION_net_{net_pnl_pct * 100:.4f}pct"
+        else:
+            rationale = f"SPIKE_PROFIT_FADING_net_{net_pnl_pct * 100:.4f}pct" if fading else f"net_profit_confirmed_{net_pnl_pct * 100:.4f}pct"
 
         logger.info(
             "EXIT_NET_PROFIT_CONFIRMED: symbol=%s entry=%.8f mark=%.8f qty=%.8f pnl_pct=%.6f cost_pct=%.6f net_pct=%.6f floor=%.6f rationale=%s fading=%s",
@@ -9007,11 +9114,45 @@ class PortfolioEngine:
         if position is None:
             return None
 
-        # An open position exists for this symbol → HOLD. The only sell path
-        # is `_check_exit_conditions` (real net profit after costs).
+        mark = float(candidate.current_price or position.entry_price or 0.0)
+        from backend.services.day_trade_thesis import evaluate_thesis_exit
+
+        thesis_eval = evaluate_thesis_exit(
+            entry_thesis=str(getattr(position, "entry_thesis", "") or ""),
+            thesis_score=float(getattr(position, "thesis_score", 0.0) or 0.0),
+            thesis_invalid_level=float(getattr(position, "thesis_invalid_level", 0.0) or 0.0),
+            thesis_target_level=float(getattr(position, "thesis_target_level", 0.0) or 0.0),
+            entry_vwap=float(getattr(position, "entry_vwap", 0.0) or 0.0),
+            entry_price=float(position.entry_price or 0.0),
+            mark=mark,
+            bundle=None,
+        )
+        if (
+            str(thesis_eval.get("action") or "") == "sell"
+            and str(thesis_eval.get("reason") or "").startswith("THESIS_INVALIDATION")
+            and float(position.quantity or 0.0) > 0
+            and mark > 0
+        ):
+            trade_result = await self.execute_sell_fifo(
+                symbol,
+                float(position.quantity or 0.0),
+                mark,
+                ExitType.MANUAL,
+                str(thesis_eval.get("reason") or "THESIS_INVALIDATION_POSITION_FIRST"),
+                current_bar=int(bar_timestamp or 0),
+            )
+            if trade_result is not None:
+                return {
+                    "handled": True,
+                    "action": "SELL",
+                    "trade_result": trade_result,
+                    "reason": str(thesis_eval.get("reason") or "THESIS_INVALIDATION_POSITION_FIRST"),
+                }
+
         logger.info(
-            "POSITION_MANAGEMENT_HOLD: symbol=%s reason=open_position_hold",
+            "POSITION_MANAGEMENT_HOLD: symbol=%s reason=open_position_hold thesis=%s",
             symbol,
+            getattr(position, "entry_thesis", "") or "none",
         )
         return {
             "handled": True,
@@ -9669,6 +9810,9 @@ class PortfolioEngine:
         if mult > strategy_max:
             mult = strategy_max
             cap_reason = cap_reason or "strategy_max_cap"
+        thesis_sf = max(0.15, min(1.05, _safe_float(dd.get("thesis_size_factor"), 1.0)))
+        mult *= thesis_sf
+        components["thesis_size_factor"] = round(thesis_sf, 4)
         mult = max(min_mult, min(max_mult, mult))
         return (round(mult, 4), components, cap_reason)
 
@@ -10502,7 +10646,8 @@ class PortfolioEngine:
         strategy_ev_penalty = max(0.0, _safe_float(dd.get("strategy_recent_ev_penalty"), 0.0))
         if strategy_ev_penalty > 0.0:
             net_ev -= strategy_ev_penalty
-        return float(net_ev)
+        thesis_ev = max(0.35, min(1.15, _safe_float(dd.get("thesis_ev_factor"), 1.0)))
+        return float(net_ev * thesis_ev)
 
     def _persist_profit_cycle_state(self, payload: dict[str, Any]) -> None:
         """Persist latest cycle diagnostics for API visibility across processes."""
@@ -10886,6 +11031,24 @@ class PortfolioEngine:
 
             valid_candidates.append(candidate)
 
+        try:
+            from backend.services.day_trade_thesis import apply_trade_thesis_to_candidate_fields
+
+            for _tc in valid_candidates:
+                _ctx_payload, _ = self._get_context_payload(_tc.symbol)
+                _sid_thesis = self._candidate_strategy_id(_tc)
+                _tc.decision_data = apply_trade_thesis_to_candidate_fields(
+                    _tc.decision_data or {},
+                    symbol=_tc.symbol,
+                    current_price=float(_tc.current_price or 0.0),
+                    atr=float(_tc.atr or 0.0),
+                    strategy_id=_sid_thesis,
+                    price_structure_regime=str(_tc.price_structure_regime or "unknown"),
+                    context_payload=_ctx_payload,
+                )
+        except Exception:
+            logger.debug("THESIS_CLASSIFY bar refresh skipped", exc_info=True)
+
         if not valid_candidates:
             logger.debug("BAR_CLOSE: No valid candidates after filtering")
             await self._emit_day_health_telemetry("NO_VALID_CANDIDATES_AFTER_FILTER")
@@ -11096,6 +11259,10 @@ class PortfolioEngine:
                     "symbol_size_factor": float(_safe_float(_dd.get("symbol_size_factor"), 1.0)),
                     "rank_score": float(_cand.rank_score()),
                     "selected_net_expected_value": float(_net_ev),
+                    "setup_type": str(_dd.get("setup_type") or _dd.get("entry_thesis") or ""),
+                    "thesis_score": float(_safe_float(_dd.get("thesis_score"), 0.0)),
+                    "thesis_rank_delta": float(_safe_float(_dd.get("thesis_rank_delta"), 0.0)),
+                    "thesis_size_factor": float(_safe_float(_dd.get("thesis_size_factor"), 1.0)),
                     "disposition": "ranked_only",
                 }
             )
@@ -11286,6 +11453,11 @@ class PortfolioEngine:
             "symbol_size_factor": float(_safe_float(_dd.get("symbol_size_factor"), 1.0)),
             "rank_score": float(top_meta.get("score") or 0.0),
             "selected_net_expected_value": float(top_net_ev),
+            "setup_type": str(_dd.get("setup_type") or _dd.get("entry_thesis") or ""),
+            "thesis_score": float(_safe_float(_dd.get("thesis_score"), 0.0)),
+            "thesis_rank_delta": float(_safe_float(_dd.get("thesis_rank_delta"), 0.0)),
+            "thesis_size_factor": float(_safe_float(_dd.get("thesis_size_factor"), 1.0)),
+            "thesis_ev_factor": float(_safe_float(_dd.get("thesis_ev_factor"), 1.0)),
         }
         explainability.rank_snapshot_id = self._persist_rank_snapshot(
             strategy_id=selected_strategy,
@@ -11321,6 +11493,13 @@ class PortfolioEngine:
         explainability.drawdown_factor = float(dyn_components.get("drawdown_factor", 1.0))
         explainability.memory_factor = float(dyn_components.get("memory_factor", 1.0))
         explainability.ev_factor = float(dyn_components.get("ev_factor", 1.0))
+        explainability.setup_type = str(_dd.get("setup_type") or _dd.get("entry_thesis") or "")
+        explainability.entry_thesis = str(_dd.get("entry_thesis") or explainability.setup_type)
+        explainability.thesis_score = float(_safe_float(_dd.get("thesis_score"), 0.0))
+        explainability.thesis_invalid_level = float(_safe_float(_dd.get("thesis_invalid_level"), 0.0))
+        explainability.thesis_target_level = float(_safe_float(_dd.get("thesis_target_level"), 0.0))
+        explainability.entry_vwap = float(_safe_float(_dd.get("entry_vwap"), 0.0))
+        explainability.thesis_trend_tf = str(_dd.get("thesis_trend_tf") or "")
 
         try:
             _ebm_bar = _costs_bar.get("entry_buy_margin")
@@ -11366,6 +11545,17 @@ class PortfolioEngine:
                             "selected_strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
                             "selected_trade": bool(managed_result is not None),
                             "selected_position_management_action": managed_action,
+                            "selected_candidate": {
+                                "symbol": top_candidate.symbol,
+                                "strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
+                                "setup_type": str(_dd.get("setup_type") or ""),
+                                "thesis_score": float(_safe_float(_dd.get("thesis_score"), 0.0)),
+                                "rank_score": float(top_candidate.rank_score()),
+                                "selected_net_expected_value": float(top_net_ev),
+                                "sizing_multiplier": float(dyn_mult),
+                                "symbol_trust_score": float(_safe_float(_dd.get("symbol_trust_score"), 0.0)),
+                                "thesis_size_factor": float(_safe_float(_dd.get("thesis_size_factor"), 1.0)),
+                            },
                         },
                     }
                 )
@@ -11559,6 +11749,17 @@ class PortfolioEngine:
                     "selected_symbol": top_candidate.symbol,
                     "selected_strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
                     "selected_trade": bool(result is not None),
+                    "selected_candidate": {
+                        "symbol": top_candidate.symbol,
+                        "strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
+                        "setup_type": str(_dd.get("setup_type") or ""),
+                        "thesis_score": float(_safe_float(_dd.get("thesis_score"), 0.0)),
+                        "rank_score": float(top_candidate.rank_score()),
+                        "selected_net_expected_value": float(top_net_ev),
+                        "sizing_multiplier": float(dyn_mult),
+                        "symbol_trust_score": float(_safe_float(_dd.get("symbol_trust_score"), 0.0)),
+                        "thesis_size_factor": float(_safe_float(_dd.get("thesis_size_factor"), 1.0)),
+                    },
                 },
             }
         )
@@ -11655,6 +11856,22 @@ class PortfolioEngine:
             dd2.setdefault("symbol_trust_score", 0.0)
             dd2.setdefault("symbol_size_factor", 1.0)
             candidate.decision_data = dd2
+
+        try:
+            from backend.services.day_trade_thesis import apply_trade_thesis_to_candidate_fields
+
+            ctx_payload, _ = self._get_context_payload(symbol)
+            candidate.decision_data = apply_trade_thesis_to_candidate_fields(
+                candidate.decision_data or {},
+                symbol=symbol,
+                current_price=float(current_price or 0.0),
+                atr=float(atr or 0.0),
+                strategy_id=strategy_for_weights,
+                price_structure_regime=str(candidate.price_structure_regime or "unknown"),
+                context_payload=ctx_payload,
+            )
+        except Exception:
+            logger.debug("THESIS_CLASSIFY enqueue skipped for %s", symbol, exc_info=True)
 
         new_score = candidate.rank_score()
 

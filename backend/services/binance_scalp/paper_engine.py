@@ -299,6 +299,9 @@ class BinanceScalpPaperEngine:
         pre = dict(ledger)
 
         ranking_meta = getattr(self, "_last_ranking_meta", {}) or {}
+        from backend.services.day_trade_thesis import scalp_strategy_to_thesis
+
+        thesis_fields = scalp_strategy_to_thesis(sig.setup_name, sig.setup_context or {})
         entry_diag = {
             "setup_name": sig.setup_name,
             "setup_context": sig.setup_context,
@@ -307,6 +310,7 @@ class BinanceScalpPaperEngine:
             "symbol_ranking": ranking_meta,
             "review_lows": [],
             "session_low_bid": limit_buy,
+            **thesis_fields,
         }
 
         conn.execute(
