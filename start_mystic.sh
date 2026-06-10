@@ -116,9 +116,8 @@ start_portfolio() {
 }
 
 start_collector() {
-    echo "Starting Data Collector..."
-    nohup "$PYTHON" live_data_collector.py > /tmp/mystic_collector.log 2>&1 &
-    require_running "live_data_collector.py" "Data Collector" "/tmp/mystic_collector.log" 20 1 || return 1
+    echo "DEPRECATED: live_data_collector skipped — OHLCV runs in start_live_market_data.py"
+    return 0
 }
 
 start_agents() {
@@ -211,11 +210,12 @@ ensure_running_or_start() {
 }
 
 start_scalp() {
-    # Scalp mode enables paper on the runner child only (.env may keep false for core).
-    local scalp_paper="${SCALP_MODE_PAPER_ENABLED:-true}"
+    local scalp_paper="${SCALP_PAPER_ENABLED:-true}"
+    local scalp_auto_arm="${SCALP_PAPER_AUTO_ARM:-true}"
     local scalp_fee="${SCALP_FEE_MODEL_VERIFIED:-true}"
-    echo "Starting Scalp Paper Runner (SCALP_PAPER_ENABLED=${scalp_paper})..."
-    nohup env SCALP_PAPER_ENABLED="${scalp_paper}" SCALP_FEE_MODEL_VERIFIED="${scalp_fee}" \
+    echo "Starting Scalp Paper Runner (SCALP_PAPER_ENABLED=${scalp_paper} AUTO_ARM=${scalp_auto_arm})..."
+    nohup env SCALP_PAPER_ENABLED="${scalp_paper}" SCALP_PAPER_AUTO_ARM="${scalp_auto_arm}" \
+        SCALP_FEE_MODEL_VERIFIED="${scalp_fee}" \
         "$PYTHON" -m backend.services.binance_scalp.runner > /tmp/mystic_scalp.log 2>&1 &
     require_running "backend.services.binance_scalp.runner" "Scalp Paper Runner" "/tmp/mystic_scalp.log" 20 1 || return 1
 }
@@ -223,6 +223,7 @@ start_scalp() {
 case "$MODE" in
     core)
         echo "Mode: core (external supervisor — no duplicate embedded services)"
+        stop_scalp
         stop_backend
         stop_live_md
         stop_signal
@@ -235,7 +236,7 @@ case "$MODE" in
 
         if ! pgrep -x "redis-server" >/dev/null; then
             echo "Starting Redis..."
-            sudo service redis-server start || exit 1
+            systemctl start redis-server 2>/dev/null || service redis-server start 2>/dev/null || true
             sleep 2
         fi
 
@@ -251,12 +252,13 @@ case "$MODE" in
         sleep 1
         start_learning || exit 1
         sleep 1
+        start_scalp || exit 1
 
         echo ""
         echo "=========================================="
         echo "MYSTIC CORE STACK STARTED"
         echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
-        echo "Services: Backend + LiveMD (incl. feature_ohlcv) + Signal + Portfolio + Context + Learning"
+        echo "Services: Backend + LiveMD + Signal + Portfolio + Context + Learning + Scalp Paper"
         echo "Ensure .env has EXTERNAL_SUPERVISOR_MODE=true"
         echo "=========================================="
         ;;
@@ -276,7 +278,7 @@ case "$MODE" in
 
         if ! pgrep -x "redis-server" >/dev/null; then
             echo "Starting Redis..."
-            sudo service redis-server start || exit 1
+            systemctl start redis-server 2>/dev/null || service redis-server start 2>/dev/null || true
             sleep 2
         fi
 
@@ -461,7 +463,7 @@ PY
 
         if ! pgrep -x "redis-server" >/dev/null; then
             echo "Starting Redis..."
-            sudo service redis-server start || exit 1
+            systemctl start redis-server 2>/dev/null || service redis-server start 2>/dev/null || true
             sleep 2
         fi
 

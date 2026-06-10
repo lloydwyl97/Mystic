@@ -36,10 +36,18 @@ class RetentionPolicy:
 
 
 RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
-    RetentionPolicy("ai_inference_log", "ts_utc", 30, "iso_utc"),
-    RetentionPolicy("ai_context_snapshots", "ts_utc", 30, "iso_utc"),
-    RetentionPolicy("strategy_runtime_audit", "ts_utc", 30, "iso_utc"),
-    RetentionPolicy("feature_ohlcv", "ts", 60, "feature_ohlcv"),
+    RetentionPolicy("ai_inference_log", "ts_utc", 14, "iso_utc"),
+    RetentionPolicy("ai_context_snapshots", "ts_utc", 14, "iso_utc"),
+    RetentionPolicy("strategy_runtime_audit", "ts_utc", 14, "iso_utc"),
+    RetentionPolicy("feature_ohlcv", "ts", 14, "feature_ohlcv"),
+    RetentionPolicy("paper_trades", "timestamp", 90, "iso_utc"),
+    # Append-only high-frequency logs (created_at tracks insert time). These were
+    # the largest uncovered tables driving DB bloat; ai_live_signals alone ~800k rows.
+    RetentionPolicy("ai_live_signals", "created_at", 14, "iso_utc"),
+    RetentionPolicy("pipeline_decisions", "created_at", 14, "iso_utc"),
+    RetentionPolicy("ai_rank_snapshots", "created_at", 30, "iso_utc"),
+    RetentionPolicy("scalp_rejects", "created_at", 30, "iso_utc"),
+    RetentionPolicy("ai_feature_samples", "created_at", 30, "iso_utc"),
 )
 
 

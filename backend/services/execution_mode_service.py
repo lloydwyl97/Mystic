@@ -79,10 +79,22 @@ async def set_execution_mode(mode: str) -> dict[str, Any]:
     normalized = (mode or "").strip().lower()
     if normalized not in {"paper", "live"}:
         raise ValueError("mode must be 'paper' or 'live'")
-    os.environ["EXECUTION_MODE"] = normalized
-    os.environ["TRADING_MODE"] = normalized
-    _write_env_file({"EXECUTION_MODE": normalized, "TRADING_MODE": normalized})
-    logger.info("Execution mode set to '%s' (TRADING_MODE synced)", normalized)
+    live_exec = "true" if normalized == "live" else "false"
+    env_updates = {
+        "MYSTIC_TRADING_MODE": normalized,
+        "EXECUTION_MODE": normalized,
+        "TRADING_MODE": normalized,
+        "LIVE_EXECUTION": live_exec,
+    }
+    if normalized == "paper":
+        env_updates["LIVE_TRADES_ALLOWED"] = "false"
+    for key, value in env_updates.items():
+        os.environ[key] = value
+    _write_env_file(env_updates)
+    logger.info(
+        "Execution mode set to '%s' (MYSTIC_TRADING_MODE, TRADING_MODE, LIVE_EXECUTION synced)",
+        normalized,
+    )
     return await get_execution_status()
 
 

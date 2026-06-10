@@ -72,9 +72,17 @@ class BinanceScalpPaperEngine:
         )
         self._redis = redis.from_url(self.config.redis_url, decode_responses=True)
         init_scalp_schema(self.config.database_path)
-        set_entry_armed(
-            self._redis, prefix=self.config.redis_key_prefix, armed=False
-        )
+        if self.config.scalp_paper_enabled and self.config.scalp_paper_auto_arm:
+            set_entry_armed(
+                self._redis,
+                prefix=self.config.redis_key_prefix,
+                armed=True,
+                persistent=True,
+            )
+        else:
+            set_entry_armed(
+                self._redis, prefix=self.config.redis_key_prefix, armed=False
+            )
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.config.database_path, timeout=10.0)
@@ -205,6 +213,8 @@ class BinanceScalpPaperEngine:
     def _entry_armed_ok(self) -> bool:
         """Calibration mode auto-arms paper entries; normal mode requires operator arm."""
         if self.config.calibration_mode:
+            return True
+        if self.config.scalp_paper_enabled and self.config.scalp_paper_auto_arm:
             return True
         return is_entry_armed(self._redis, prefix=self.config.redis_key_prefix)
 
@@ -716,6 +726,13 @@ class BinanceScalpPaperEngine:
 
     def tick(self) -> None:
         self.config.assert_no_live_trading()
+        if self.config.scalp_paper_enabled and self.config.scalp_paper_auto_arm:
+            set_entry_armed(
+                self._redis,
+                prefix=self.config.redis_key_prefix,
+                armed=True,
+                persistent=True,
+            )
         with self._conn() as conn:
             if not self.config.scalp_paper_enabled:
                 for sym in self.config.products:
@@ -752,11 +769,19 @@ class BinanceScalpPaperEngine:
 
     def run_loop(self, interval_sec: float = 5.0) -> None:
         if not self.config.scalp_paper_enabled:
-            logger.error("Scalp paper blocked: SCALP_PAPER_ENABLED=false")
-            raise SystemExit(2)
+            logger.error(
+                "Scalp paper loop idle: SCALP_PAPER_ENABLED=false (set true in .env and restart)"
+            )
+            while True:
+                time.sleep(max(interval_sec, 30.0))
+            return
         if not self.econ.is_fee_model_verified():
-            logger.error("Scalp paper blocked: SCALP_FEE_MODEL_VERIFIED=false")
-            raise SystemExit(3)
+            logger.error(
+                "Scalp paper loop idle: SCALP_FEE_MODEL_VERIFIED=false (set true in .env)"
+            )
+            while True:
+                time.sleep(max(interval_sec, 30.0))
+            return
         self.config.assert_no_live_trading()
         armed = is_entry_armed(self._redis, prefix=self.config.redis_key_prefix)
         logger.info(

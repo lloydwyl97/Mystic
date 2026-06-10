@@ -67,3 +67,4 @@ node_modules/
 
 # Jupyter
 .ipynb_checkpoints/
+.logrotate.state

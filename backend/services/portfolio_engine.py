@@ -3107,19 +3107,9 @@ class PortfolioEngine:
             redis_client = get_redis_client()
             if redis_client:
                 for symbol, pos in self.open_positions.items():
-                    base_symbol = to_exchange_symbol(symbol).replace("USDT", "")
-                    cache_key = f"market:{base_symbol}"
-                    current_price = pos.entry_price
                     try:
-                        price_str = redis_client.get(cache_key)
-                        if price_str:
-                            if isinstance(price_str, str):
-                                price_json = json.loads(price_str)
-                                current_price = float(price_json["price"]) if isinstance(price_json, dict) and "price" in price_json else float(price_str)
-                            else:
-                                current_price = float(price_str)
-                            if current_price <= 0:
-                                current_price = pos.entry_price
+                        px = self._get_cached_market_price(symbol)
+                        current_price = px if px > 0 else pos.entry_price
                         _accumulate(symbol, pos, current_price)
                     except Exception as e:
                         logger.debug("RECOMPUTE: price for %s: %s", symbol, e)
@@ -5654,6 +5644,7 @@ class PortfolioEngine:
                     order_type="MARKET",
                     quantity=exec_qty,
                     exit_reason=exit_reason,
+                    skip_sqlite_persist=True,
                 )
                 logger.info(f"BRIDGE_SELL_SYNCED: {symbol} synced to PaperTradingService")
             except Exception as e:
@@ -5776,6 +5767,7 @@ class PortfolioEngine:
             "force=true",
             "force_sell",
             "panic",
+            "thesis_invalidation",
         )
         return any(tag in trig for tag in emergency_tags)
 
@@ -5821,6 +5813,11 @@ class PortfolioEngine:
         if STRICT_NO_NEGATIVE_SELLS:
             # Test mode: enforce net-positive gate on every sell branch.
             profit_style = True
+
+        if emergency_flag:
+            # Thesis invalidation / risk cuts (and other emergency) must bypass the net-positive gate
+            # even under STRICT_NO_NEGATIVE_SELLS, so a thesis break can actually cut (XRP preexisting).
+            profit_style = False
 
         mark_price, mark_source, mark_age_seconds, mark_fresh = await self._resolve_fresh_mark_for_sell(ns)
         avg_entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
@@ -5881,35 +5878,88 @@ class PortfolioEngine:
         }
 
     async def _get_atr_for_symbol(self, symbol: str, price: float) -> float:
-        """Get ATR for a symbol from market data cache, or calculate from price."""
+        """Get ATR for a symbol from live data (feature or klines) or safe proxy.
+
+        Repairs reliance on dead market:{base} cache. Prefers:
+        - feature:{bus} "atr" if present and >0 (populated by signal/feature pipeline)
+        - real ATR estimate computed from recent klines (high/low/close true range)
+        - 24h change proxy if available in any context
+        - final 1.5% of price default (always >0 so sizing never hard-blocks on ATR=0)
+        """
+        bus = normalize_symbol(symbol).replace("/", "").upper().replace("USDT", "")
         try:
-            # Try to get from Redis cache
-            from backend.config.redis_config import get_shared_redis_async
+            from backend.config.redis_config import get_redis_client
+            redis = get_redis_client()
+            if redis:
+                # 1) feature: often has fresh atr from the ML feature builder
+                try:
+                    feat = redis.hgetall(f"feature:{bus}") or {}
+                    atr_raw = feat.get("atr") or feat.get(b"atr")
+                    atr = _safe_float(atr_raw, 0.0)
+                    if atr > 0:
+                        return float(atr)
+                except Exception:
+                    pass
 
-            redis = get_shared_redis_async()
+                # 2) compute from recent klines (1m preferred for responsiveness)
+                for tf in ("1m", "5m"):
+                    try:
+                        kl = redis.lrange(f"klines:{bus}USDT:{tf}", -20, -1) or []
+                        if not kl:
+                            kl = redis.lrange(f"klines:{bus}:{tf}", -20, -1) or []
+                        trs = []
+                        prev_close = None
+                        for item in kl:
+                            if isinstance(item, bytes):
+                                item = item.decode("utf-8", "ignore")
+                            bar = json.loads(item) if isinstance(item, (str, bytes)) else item
+                            if isinstance(bar, dict):
+                                h = _safe_float(bar.get("h") or bar.get("high"), 0)
+                                l = _safe_float(bar.get("l") or bar.get("low"), 0)
+                                c = _safe_float(bar.get("c") or bar.get("close"), 0)
+                            else:
+                                # list form: [ts, o, h, l, c, v, ...]
+                                if len(bar) >= 5:
+                                    h = _safe_float(bar[2], 0)
+                                    l = _safe_float(bar[3], 0)
+                                    c = _safe_float(bar[4], 0)
+                                else:
+                                    continue
+                            if h > 0 and l > 0:
+                                tr = h - l
+                                if prev_close is not None and prev_close > 0:
+                                    tr = max(tr, abs(h - prev_close), abs(l - prev_close))
+                                trs.append(tr)
+                                prev_close = c
+                        if len(trs) >= 5:
+                            # simple ATR approx: mean of true ranges (or ema would be better but mean is fine)
+                            atr_est = sum(trs) / len(trs)
+                            if atr_est > 0 and price > 0:
+                                # bound to reasonable % of price
+                                atr_est = min(atr_est, price * 0.05)
+                                return float(atr_est)
+                    except Exception:
+                        continue
 
-            from backend.utils.symbols import to_exchange_symbol
-
-            base_symbol = to_exchange_symbol(symbol).replace("USDT", "")
-            cache_key = f"market:{base_symbol}"
-            cached_data = await redis.get(cache_key)
-
-            if cached_data:
-                data = json.loads(cached_data)
-                # Check if ATR is available
-                atr = data.get("atr")
-                if atr and atr > 0:
-                    return float(atr)
-
-                # Calculate ATR proxy from 24h change
-                change_24h = abs(data.get("change_24h", 0)) / 100.0
-                if change_24h > 0:
-                    return price * change_24h * 0.5  # Half of 24h change as ATR proxy
+                # 3) any context with change_24h or atr (ai_context or signal)
+                for key in (f"ai_context:{bus}USDT", f"ai_signal:day:{bus}USDT"):
+                    try:
+                        snap = redis.hgetall(key) or {}
+                        for k in ("atr", "ctx_atr", "change_24h", "ctx_change_24h_pct"):
+                            v = snap.get(k) or snap.get(k.encode("utf-8")) if isinstance(k, str) else None
+                            if v:
+                                fv = _safe_float(v, 0)
+                                if "change" in k.lower() and fv != 0:
+                                    return abs(fv) * price * 0.5
+                                if fv > 0:
+                                    return float(fv)
+                    except Exception:
+                        pass
         except Exception as e:
-            logger.debug(f"Could not get ATR from cache for {symbol}: {e}")
+            logger.debug(f"Could not get ATR from live sources for {symbol}: {e}")
 
-        # Default: 1.5% of price as ATR estimate
-        return price * 0.015
+        # Final safe default (always positive to prevent INVALID_SIZING_INPUT blocks)
+        return price * 0.015 if price > 0 else 0.015
 
     async def execute_buy_fifo(
         self,
@@ -7341,6 +7391,12 @@ class PortfolioEngine:
         if sell_eval.get("mark_price") is not None:
             price = float(sell_eval["mark_price"])
 
+        # Emergency/forced exits (thesis invalidation, risk cuts, manual/reconcile)
+        # must bypass the executable-fill net-profit floor below, exactly like the
+        # profitability gate already does. Otherwise a forced loss-cut is re-blocked
+        # by EXECUTABLE_NET_PROFIT_BELOW_FLOOR and the position is held indefinitely.
+        emergency_sell = bool(sell_eval.get("emergency_flag")) or bool(force_sell)
+
         # SELL PRECISION: Reuse same normalization as buy path (BUG-2 fix)
         await self._entry_ensure_constraints(normalized_symbol)
         qty_q, norm_reason, _ = self._normalize_order_amount(
@@ -7396,7 +7452,7 @@ class PortfolioEngine:
                 position_qty=float(position.quantity),
                 mark_price=float(price),
             )
-            if not exec_check.passed:
+            if not exec_check.passed and not emergency_sell:
                 logger.warning(
                     "SELL_EXECUTABLE_FILL_BLOCKED %s reason=%s exec_px=%.8f entry=%.8f mark=%.8f gross=%.6f net_pct=%.6f net_usd=%.4f",
                     normalized_symbol,
@@ -7415,6 +7471,14 @@ class PortfolioEngine:
                     "EXECUTABLE_FILL_GATE",
                 )
                 return None
+            if not exec_check.passed and emergency_sell:
+                logger.warning(
+                    "SELL_EXECUTABLE_FILL_FORCED %s reason=%s exec_px=%.8f net_pct=%.6f (emergency bypass)",
+                    normalized_symbol,
+                    exec_check.reject_reason,
+                    exec_px,
+                    exec_check.executable_net_pct,
+                )
             return await execute_protected_limit_live(
                 self._live_service,
                 symbol=_to_api_symbol(symbol),
@@ -7537,16 +7601,16 @@ class PortfolioEngine:
                             entry_ts_bind = ""
 
                     # Get explainability from original trade (must always persist exit_trigger for analysis)
+                    explain_obj = self.trade_explanations.get(position.trade_id) if position.trade_id else None
                     original_explain: dict[str, Any] = {}
-                    if position.trade_id in self.trade_explanations:
-                        explain = self.trade_explanations[position.trade_id]
-                        explain.exit_type = exit_type.value
-                        explain.exit_r_multiple = r_multiple
-                        explain.exit_trigger = exit_trigger
-                        original_explain = explain.to_dict()
-                    original_explain["model_trained_at"] = getattr(explain, "model_trained_at", "") or original_explain.get("model_trained_at", "")
-                    original_explain["model_accuracy"] = getattr(explain, "model_accuracy", None) or original_explain.get("model_accuracy")
-                    original_explain["signal_ts_utc"] = getattr(explain, "signal_content_timestamp", "") or original_explain.get("signal_content_timestamp", "")
+                    if explain_obj is not None:
+                        explain_obj.exit_type = exit_type.value
+                        explain_obj.exit_r_multiple = r_multiple
+                        explain_obj.exit_trigger = exit_trigger
+                        original_explain = explain_obj.to_dict()
+                    original_explain["model_trained_at"] = getattr(explain_obj, "model_trained_at", "") or original_explain.get("model_trained_at", "")
+                    original_explain["model_accuracy"] = getattr(explain_obj, "model_accuracy", None) or original_explain.get("model_accuracy")
+                    original_explain["signal_ts_utc"] = getattr(explain_obj, "signal_content_timestamp", "") or original_explain.get("signal_content_timestamp", "")
                     if not original_explain.get("feature_version"):
                         original_explain["feature_version"] = 5
                     if not original_explain.get("feature_dim"):
@@ -8116,7 +8180,7 @@ class PortfolioEngine:
                 sell_preflight_audit.update(exec_check.to_audit_dict())
             else:
                 sell_preflight_audit = exec_check.to_audit_dict()
-            if not exec_check.passed:
+            if not exec_check.passed and not emergency_sell:
                 logger.warning(
                     "SELL_EXECUTABLE_FILL_BLOCKED %s reason=%s exec_px=%.8f entry=%.8f mark=%.8f gross=%.6f net_pct=%.6f net_usd=%.4f",
                     normalized_symbol,
@@ -8135,6 +8199,14 @@ class PortfolioEngine:
                     "EXECUTABLE_FILL_GATE",
                 )
                 return None
+            if not exec_check.passed and emergency_sell:
+                logger.warning(
+                    "SELL_EXECUTABLE_FILL_FORCED %s reason=%s exec_px=%.8f net_pct=%.6f (emergency bypass)",
+                    normalized_symbol,
+                    exec_check.reject_reason,
+                    fill_price,
+                    exec_check.executable_net_pct,
+                )
 
         if dust_writeoff:
             fee = 0.0
@@ -8463,6 +8535,7 @@ class PortfolioEngine:
                     order_type="MARKET",
                     quantity=exec_qty,
                     price=fill_price,
+                    skip_sqlite_persist=True,
                 )
                 logger.info(f"SELL_SYNCED: {symbol} synced to PaperTradingService qty={exec_qty:.6f}")
                 if not self._assert_canonical_qty_logged:
@@ -9025,6 +9098,7 @@ class PortfolioEngine:
                 ExitType.MANUAL,
                 rationale,
                 current_bar=current_bar,
+                force_sell=True,
             )
 
         if thesis_action == "hold":
@@ -9044,6 +9118,55 @@ class PortfolioEngine:
                 MIN_NET_PROFIT_TO_SELL,
             )
             return None
+
+        if USE_PROTECTED_LIMIT_EXECUTION:
+            from backend.services.execution_mode_service import is_live_execution_allowed_sync
+            from backend.services.protected_limit_execution import (
+                evaluate_executable_sell_profit,
+                run_protected_preflight,
+            )
+
+            live_capable = bool(
+                self._live_execution_enabled
+                and self._live_service
+                and is_live_execution_allowed_sync()[0]
+            )
+            pf = await run_protected_preflight(
+                symbol=symbol,
+                side="SELL",
+                quantity=quantity,
+                reference_price=current_price,
+                live_capable=live_capable,
+            )
+            if not pf.passed:
+                logger.debug(
+                    "EXIT_HOLD_EXECUTABLE_PREFLIGHT symbol=%s reason=%s mark=%.8f",
+                    symbol,
+                    pf.reject_reason,
+                    current_price,
+                )
+                return None
+            exec_px = float(pf.expected_avg_fill)
+            exec_check = evaluate_executable_sell_profit(
+                entry_price=entry_price,
+                quantity=quantity,
+                executable_sell_price=exec_px,
+                entry_fee=float(getattr(position, "entry_fee", 0) or 0),
+                sell_fee_rate=MAKER_FEE,
+                position_qty=quantity,
+                mark_price=current_price,
+            )
+            if not exec_check.passed:
+                logger.debug(
+                    "EXIT_HOLD_EXECUTABLE_NET_BELOW_FLOOR symbol=%s reason=%s mark_net=%.6f exec_net=%.6f exec_px=%.8f best_bid=%.8f",
+                    symbol,
+                    exec_check.reject_reason,
+                    net_pnl_pct,
+                    exec_check.executable_net_pct,
+                    exec_px,
+                    float(getattr(pf, "best_bid", 0) or 0),
+                )
+                return None
 
         from backend.services.day_spike_exit_hint import spike_profit_fading_from_bundle
 
@@ -9133,20 +9256,22 @@ class PortfolioEngine:
             and float(position.quantity or 0.0) > 0
             and mark > 0
         ):
+            thesis_r = str(thesis_eval.get("reason") or "THESIS_INVALIDATION")
             trade_result = await self.execute_sell_fifo(
                 symbol,
                 float(position.quantity or 0.0),
                 mark,
                 ExitType.MANUAL,
-                str(thesis_eval.get("reason") or "THESIS_INVALIDATION_POSITION_FIRST"),
+                thesis_r,
                 current_bar=int(bar_timestamp or 0),
+                force_sell=True,
             )
             if trade_result is not None:
                 return {
                     "handled": True,
                     "action": "SELL",
                     "trade_result": trade_result,
-                    "reason": str(thesis_eval.get("reason") or "THESIS_INVALIDATION_POSITION_FIRST"),
+                    "reason": thesis_r,
                 }
 
         logger.info(
@@ -10394,26 +10519,97 @@ class PortfolioEngine:
         }
 
     def _get_cached_market_price(self, symbol: str) -> float:
+        """Canonical price reader for entry decisions.
+
+        Tries the live publisher keys first (price:{base}, price:{bus}, price:{bus}USDT as hash with 'v'),
+        then legacy market:{base} (string or json), then integration.current_prices, then seeds the
+        internal PriceCache. Returns >0 when any fresh source has data; 0.0 only on complete miss.
+        This eliminates the EXCHANGE_API_FAILURE block when the price_publisher is healthy.
+        """
         try:
             from backend.config.redis_config import get_redis_client
-            from backend.utils.symbols import to_exchange_symbol
+            from backend.utils.symbols import normalize_symbol, to_exchange_symbol
+            from backend.config.mystic_api_schedule import SELL_MARK_MAX_AGE_SECONDS
 
             redis_client = get_redis_client()
             if not redis_client:
                 return 0.0
-            base_symbol = to_exchange_symbol(symbol).replace("USDT", "")
-            raw = redis_client.get(f"market:{base_symbol}")
-            if raw is None:
-                return 0.0
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="ignore")
-            if isinstance(raw, str):
-                txt = raw.strip()
-                if txt.startswith("{") and txt.endswith("}"):
-                    payload = json.loads(txt)
-                    return _safe_float(payload.get("price"), 0.0)
-                return _safe_float(txt, 0.0)
-            return _safe_float(raw, 0.0)
+
+            ns = normalize_symbol(symbol).replace("/", "").upper()
+            base = ns.replace("USDT", "").replace("/", "")
+            bus = base  # e.g. XRP, BTC
+
+            candidates = [
+                f"price:{bus}",
+                f"price:{ns}",
+                f"price:{bus}USDT",
+                f"market:{bus}",
+                f"market:{ns}",
+                f"market:{bus}USDT",
+            ]
+
+            max_age = float(SELL_MARK_MAX_AGE_SECONDS) * 3.0  # entry can tolerate a bit more staleness than sell gate
+
+            for key in candidates:
+                try:
+                    t = redis_client.type(key)
+                    if t == "hash":
+                        h = redis_client.hgetall(key) or {}
+                        # handle bytes or str keys
+                        def _hget(d, k):
+                            v = d.get(k)
+                            if v is None:
+                                v = d.get(k.encode("utf-8")) if isinstance(k, str) else d.get(k.decode("utf-8"))
+                            return v
+                        val = _hget(h, "v") or _hget(h, "price")
+                        ts_raw = _hget(h, "timestamp") or _hget(h, "ts")
+                        px = _safe_float(val, 0.0)
+                        if px > 0:
+                            age = 0.0
+                            if ts_raw:
+                                try:
+                                    age = max(0.0, time.time() - float(ts_raw))
+                                except Exception:
+                                    age = 0.0
+                            if age <= max_age:
+                                self._price_cache.set(ns, px)
+                                return px
+                    # string or legacy json
+                    raw = redis_client.get(key)
+                    if raw is not None:
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8", errors="ignore")
+                        txt = str(raw).strip()
+                        px = 0.0
+                        if txt.startswith("{") and txt.endswith("}"):
+                            try:
+                                payload = json.loads(txt)
+                                px = _safe_float(payload.get("price") or payload.get("v"), 0.0)
+                            except Exception:
+                                px = 0.0
+                        else:
+                            px = _safe_float(txt, 0.0)
+                        if px > 0:
+                            self._price_cache.set(ns, px)
+                            return px
+                except Exception:
+                    continue
+
+            # Fallback to integration's live current_prices (populated by price_publisher + ticker loops)
+            try:
+                from backend.services.portfolio_engine_integration import get_portfolio_integration
+                integ = get_portfolio_integration()
+                if integ is not None and hasattr(integ, "current_prices"):
+                    live = getattr(integ, "current_prices", {}) or {}
+                    for k in (ns, bus, f"{bus}/USDT", symbol):
+                        px = _safe_float(live.get(k), 0.0)
+                        if px > 0:
+                            self._price_cache.set(ns, px)
+                            return px
+            except Exception:
+                pass
+
+            return 0.0
         except Exception:
             return 0.0
 
@@ -11048,6 +11244,23 @@ class PortfolioEngine:
                 )
         except Exception:
             logger.debug("THESIS_CLASSIFY bar refresh skipped", exc_info=True)
+
+        # C2: do not OPEN a new DAY position without a real trade thesis. A
+        # NO_CLEAR_THESIS entry has no invalidation level, so it can never be
+        # cut on a loss (held net-profit-only forever). Drop such candidates for
+        # symbols not already held. Override with DAY_REQUIRE_THESIS_FOR_ENTRY=false.
+        if os.getenv("DAY_REQUIRE_THESIS_FOR_ENTRY", "true").strip().lower() in ("1", "true", "yes", "on"):
+            from backend.services.day_trade_thesis import SETUP_NO_CLEAR_THESIS
+
+            _thesis_kept: list[BuyCandidate] = []
+            for _tc in valid_candidates:
+                _entry_thesis = str((_tc.decision_data or {}).get("entry_thesis") or (_tc.decision_data or {}).get("setup_type") or "")
+                if _entry_thesis == SETUP_NO_CLEAR_THESIS and _tc.symbol not in self.open_positions:
+                    logger.info("THESIS_ENTRY_BLOCK: %s no clear thesis -> entry skipped", _tc.symbol)
+                    await self._bar_pipeline_terminal(_tc.decision_id, "BAR_PRE_RANK_FILTERED", pipeline_done)
+                    continue
+                _thesis_kept.append(_tc)
+            valid_candidates = _thesis_kept
 
         if not valid_candidates:
             logger.debug("BAR_CLOSE: No valid candidates after filtering")
@@ -15350,46 +15563,73 @@ class PortfolioEngine:
             "position_risks": position_risks,
         }
 
-        def _sync_trades() -> list[Any]:
+        def _sync_trades() -> tuple[list[Any], dict[str, int | float]]:
             conn = sqlite3.connect(self.db_path)
             try:
                 cur = conn.cursor()
                 cur.execute("PRAGMA table_info(paper_trades)")
                 cols = {row[1] for row in cur.fetchall()}
                 sleeve_sql = "COALESCE(sleeve, 'ACTIVE')" if "sleeve" in cols else "'ACTIVE'"
+                trade_id_sql = "trade_id" if "trade_id" in cols else "NULL"
+                id_sql = "id" if "id" in cols else "NULL"
+                admin_filter = (
+                    "COALESCE(exit_type, '') NOT IN "
+                    "('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR')"
+                )
                 cur.execute(
                     f"""
-                    SELECT symbol, side, quantity, price, pnl, timestamp, {sleeve_sql}
+                    SELECT {id_sql}, {trade_id_sql}, symbol, side, quantity, price, pnl, timestamp, {sleeve_sql}
                     FROM paper_trades
-                    WHERE COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR')
+                    WHERE {admin_filter}
                     ORDER BY id DESC
                     LIMIT 50
                     """
                 )
-                return list(cur.fetchall())
+                recent = list(cur.fetchall())
+                cur.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS total_trades,
+                        SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                        SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) AS losses
+                    FROM paper_trades
+                    WHERE UPPER(side) = 'SELL' AND pnl IS NOT NULL
+                      AND {admin_filter}
+                    """
+                )
+                agg = cur.fetchone() or (0, 0, 0)
+                stats = {
+                    "total_trades": int(agg[0] or 0),
+                    "wins": int(agg[1] or 0),
+                    "losses": int(agg[2] or 0),
+                }
+                return recent, stats
             finally:
                 conn.close()
 
         loop = asyncio.get_running_loop()
-        trade_rows = await loop.run_in_executor(None, _sync_trades)
+        trade_rows, sell_stats = await loop.run_in_executor(None, _sync_trades)
         trades_data: list[dict[str, Any]] = []
         for r in trade_rows:
+            row_id = r[0]
+            trade_id_val = r[1]
             trades_data.append(
                 {
-                    "symbol": r[0],
-                    "side": r[1],
-                    "quantity": r[2],
-                    "price": r[3],
-                    "pnl": float(r[4]) if r[4] is not None else None,
-                    "timestamp": r[5],
-                    "sleeve": r[6] if len(r) > 6 else Sleeve.ACTIVE.value,
+                    "id": row_id,
+                    "trade_id": trade_id_val or (str(row_id) if row_id is not None else None),
+                    "symbol": r[2],
+                    "side": r[3],
+                    "quantity": r[4],
+                    "price": r[5],
+                    "pnl": float(r[6]) if r[6] is not None else None,
+                    "timestamp": r[7],
+                    "sleeve": r[8] if len(r) > 8 else Sleeve.ACTIVE.value,
                 }
             )
 
-        sells = [t for t in trades_data if str(t.get("side", "")).upper() == "SELL" and t.get("pnl") is not None]
-        wins = sum(1 for t in sells if float(t["pnl"]) > 0)
-        losses = sum(1 for t in sells if float(t["pnl"]) < 0)
-        nt = len(sells)
+        nt = int(sell_stats.get("total_trades", 0))
+        wins = int(sell_stats.get("wins", 0))
+        losses = int(sell_stats.get("losses", 0))
         win_rate = (wins / nt * 100) if nt > 0 else 0.0
 
         principal_val = float(ledger.get("principal", self.principal) or 0)

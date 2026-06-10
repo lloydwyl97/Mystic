@@ -479,6 +479,7 @@ async def lifespan(app: FastAPI):
 
     with contextlib.suppress(Exception):
         from backend.services.ai_outcome_training_writer import (
+            backfill_all_symbol_strategy_expectancy,
             repair_mislabeled_profitable_ai_sells,
             repair_missing_sell_feature_versions,
         )
@@ -486,6 +487,9 @@ async def lifespan(app: FastAPI):
         repaired = repair_mislabeled_profitable_ai_sells()
         if repaired:
             logger.info("[LIFESPAN] Repaired %d mislabeled ai_outcome_training_rows: %s", len(repaired), repaired[:10])
+        backfilled = backfill_all_symbol_strategy_expectancy()
+        if backfilled:
+            logger.info("[LIFESPAN] Backfilled ai_symbol_strategy_expectancy for %d symbol/strategy pairs", backfilled)
         fv_repaired = repair_missing_sell_feature_versions()
         if fv_repaired:
             logger.info("[LIFESPAN] Backfilled feature_version on %d sell rows: %s", len(fv_repaired), fv_repaired[:10])

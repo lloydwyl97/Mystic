@@ -692,14 +692,35 @@ function updateMarketDataReadiness(res) {
 }
 
 // portfolio-engine/dashboard-canonical: one backend build for positions, sleeves, PnL, risk, trades, scoreboard, operator
+const CANONICAL_STALE_WIDGET_IDS = [
+    "analytics-trades",
+    "analytics-winrate",
+    "analytics-realized",
+    "analytics-unrealized",
+    "analytics-pnl",
+    "analytics-scoreboard",
+    "analytics-risk-status",
+    "analytics-invariants",
+    "analytics-xcheck",
+    "status-cash",
+    "status-equity",
+    "status-positions",
+    "status-health",
+];
+
+function markCanonicalSnapshotStale(reason) {
+    CANONICAL_STALE_WIDGET_IDS.forEach(function (id) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = "--";
+        el.title = reason || "Snapshot unavailable — showing stale data cleared";
+        el.classList.remove("pnl-pos", "pnl-neg");
+    });
+}
+
 function updateDashboardCanonical(res) {
     if (!res || res.success === false) {
-        const inv = document.getElementById("analytics-invariants");
-        if (inv) {
-            inv.textContent = "SNAPSHOT ERR";
-            inv.classList.remove("pnl-pos");
-            inv.classList.add("pnl-neg");
-        }
+        markCanonicalSnapshotStale(res && res.error ? String(res.error) : "Canonical snapshot failed");
         return;
     }
     const d = res.data || res;
@@ -751,16 +772,7 @@ function updateDashboardCanonical(res) {
     if (d.invariants) {
         updateInvariants({ success: true, data: d.invariants });
     }
-    if (d.consistency_ok === false) {
-        const el = document.getElementById("analytics-invariants");
-        if (el) {
-            const v = Array.isArray(d.consistency_violations) ? d.consistency_violations : [];
-            el.textContent = v.length ? "XCHECK" : "FAIL";
-            el.title = v.length ? v.join("; ") : "Snapshot cross-check failed";
-            el.classList.remove("pnl-pos");
-            el.classList.add("pnl-neg");
-        }
-    }
+    updateCrossCheck(d);
     if (d.regime && typeof d.regime === "object") {
         updateRegime({ success: true, data: d.regime });
     }
@@ -1047,6 +1059,29 @@ function updateInvariants(data) {
                   : "See Invariants Detail for guard status.";
         }
     }
+}
+
+function updateCrossCheck(d) {
+    const el = document.getElementById("analytics-xcheck");
+    if (!el) return;
+    if (!d || d.consistency_ok === undefined) {
+        el.textContent = "--";
+        el.title = "";
+        el.classList.remove("pnl-pos", "pnl-neg");
+        return;
+    }
+    if (d.consistency_ok === true) {
+        el.textContent = "OK";
+        el.title = "Snapshot internal cross-checks passed.";
+        el.classList.remove("pnl-neg");
+        el.classList.add("pnl-pos");
+        return;
+    }
+    const v = Array.isArray(d.consistency_violations) ? d.consistency_violations : [];
+    el.textContent = v.length ? "WARN" : "FAIL";
+    el.title = v.length ? v.join("; ") : "Snapshot cross-check failed";
+    el.classList.remove("pnl-pos");
+    el.classList.add("pnl-neg");
 }
 
 // portfolio-engine/invariants-detail: { success, data: { all_ok, equity_invariant, position_limit, risk_cap, ... } }
@@ -1382,11 +1417,11 @@ function updatePortfolioPerformance(data) {
     const pnlEl = document.getElementById("analytics-pnl");
     if (tradesEl && p.total_trades != null) {
         tradesEl.textContent = String(p.total_trades);
-        tradesEl.title = "All-time: total closed trades in engine performance bundle (not “today only”).";
+        tradesEl.title = "All-time closed SELL count (excludes admin clears).";
     }
     if (winrateEl && p.win_rate != null) {
         winrateEl.textContent = Number(p.win_rate).toFixed(1) + "%";
-        winrateEl.title = "All-time win rate from same performance bundle as Total Trades.";
+        winrateEl.title = "All-time win rate from closed SELL rows in paper_trades.";
     }
     const totalPnl = p.total_pnl != null ? Number(p.total_pnl) : null;
     const principal = p.principal != null ? Number(p.principal) : null;
@@ -1601,14 +1636,23 @@ function parseTradePnl(val) {
 // daily-returns: { returns: [{ timestamp, value }] } — collapse to one bar per calendar day (avoids duplicate x labels)
 function updateDailyReturnsChart(data) {
     if (!data || typeof data !== "object") return;
+    const src = data.data_source || "";
     const returns = Array.isArray(data.returns) ? data.returns : [];
+    const isBaseline =
+        src === "default_baseline" ||
+        src === "no_data" ||
+        (returns.length === 1 &&
+            (returns[0].timestamp || "").indexOf("2024-01-01") === 0 &&
+            Number(returns[0].value) === 0);
     const byDay = new Map();
-    for (let i = 0; i < returns.length; i++) {
-        const r = returns[i];
-        const ts = r.timestamp || r.date || "";
-        const day = ts.length >= 10 ? ts.slice(0, 10) : "";
-        if (!day) continue;
-        byDay.set(day, r);
+    if (!isBaseline) {
+        for (let i = 0; i < returns.length; i++) {
+            const r = returns[i];
+            const ts = r.timestamp || r.date || "";
+            const day = ts.length >= 10 ? ts.slice(0, 10) : "";
+            if (!day) continue;
+            byDay.set(day, r);
+        }
     }
     const sliceReturns = Array.from(byDay.entries())
         .sort((a, b) => a[0].localeCompare(b[0]))

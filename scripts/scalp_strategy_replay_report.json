@@ -21,10 +21,10 @@
   "positive_strategies": [],
   "stale_timeout_exits": 0,
   "missed_profitable_windows": {
-    "BTCUSDT": 27,
-    "ETHUSDT": 64,
-    "SOLUSDT": 90,
-    "XRPUSDT": 95
+    "BTCUSDT": 31,
+    "ETHUSDT": 69,
+    "SOLUSDT": 88,
+    "XRPUSDT": 102
   },
   "by_strategy": {
     "breakout_momentum": {

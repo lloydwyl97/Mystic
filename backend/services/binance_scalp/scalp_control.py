@@ -22,11 +22,18 @@ def is_entry_armed(client: redis.Redis, *, prefix: str = "scalp") -> bool:
 
 
 def set_entry_armed(
-    client: redis.Redis, *, prefix: str = "scalp", armed: bool
+    client: redis.Redis,
+    *,
+    prefix: str = "scalp",
+    armed: bool,
+    persistent: bool = False,
 ) -> None:
     key = control_key(prefix, ENTRY_ARMED_NAME)
     if armed:
-        client.setex(key, CONTROL_TTL_SEC, "1")
+        if persistent:
+            client.set(key, "1")
+        else:
+            client.setex(key, CONTROL_TTL_SEC, "1")
     else:
         client.set(key, "0")
 

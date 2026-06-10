@@ -187,40 +187,41 @@ def _safe_float(value: Any) -> float:
 
 
 def _get_live_trade_data(symbol: str, max_points: int) -> tuple[list[datetime], list[float], list[float]]:
-    """Get live trade data from mystic_trading.db."""
+    """Get live trade data from mystic_trading.db (trade_logs or paper_trades fallback)."""
     db_path = _get_live_database_path()
     _validate_database_connection(db_path)
 
     with sqlite3.connect(db_path, timeout=DB_TIMEOUT_SECONDS) as conn:
-        # Check if trade_logs table exists
-        cursor = conn.execute("""
+        has_trade_logs = conn.execute(
+            """
             SELECT name FROM sqlite_master
             WHERE type='table' AND name='trade_logs'
-        """)
-        if not cursor.fetchone():
-            msg = "Live trade_logs table not found in database"
-            raise ValueError(msg)
-
-        # Get table schema
-        cursor = conn.execute("PRAGMA table_info(trade_logs)")
-        # columns = {row[1]: row[2] for row in cursor.fetchall()}  # Unused
-
-        # Determine available columns - use live schema
-        timestamp_col = "timestamp"  # Always exists in live schema
-        price_col = "price"  # Always exists in live schema
-
-        # Live schema doesn't have profit columns - compute from trade data
-        query = f"""
-            SELECT {timestamp_col}, {price_col}, side, amount
-            FROM trade_logs
-            WHERE symbol = ?
-            ORDER BY {timestamp_col}
-            LIMIT ?
-        """
-        params = (symbol, max_points)
-
-        cursor = conn.execute(query, params)
-        rows = cursor.fetchall()
+            """
+        ).fetchone()
+        if has_trade_logs:
+            query = """
+                SELECT timestamp, price, side, amount
+                FROM trade_logs
+                WHERE symbol = ?
+                ORDER BY timestamp
+                LIMIT ?
+            """
+            params = (symbol, max_points)
+            cursor = conn.execute(query, params)
+            rows = cursor.fetchall()
+        else:
+            sym_ccxt = symbol if "/" in symbol else f"{symbol.replace('USDT', '')}/USDT"
+            cursor = conn.execute(
+                """
+                SELECT timestamp, price, side, quantity
+                FROM paper_trades
+                WHERE symbol IN (?, ?) AND UPPER(side) IN ('BUY', 'SELL')
+                ORDER BY timestamp
+                LIMIT ?
+                """,
+                (symbol, sym_ccxt, max_points),
+            )
+            rows = [(r[0], r[1], r[2], r[3]) for r in cursor.fetchall()]
 
     if not rows:
         msg = f"No trade data found for symbol {symbol}"

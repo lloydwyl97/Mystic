@@ -1737,6 +1737,13 @@ class PortfolioEngineIntegration:
                             for field, value in price_data.items():
                                 await self.redis_client.hset(price_key, field, value)
                             await self.redis_client.expire(price_key, 120)
+                            # Compatibility: also maintain legacy market:{base} string for any
+                            # readers still using the old key (recompute, older paths). Keeps
+                            # "all" price sources consistent until full migration.
+                            try:
+                                await self.redis_client.set(f"market:{base_symbol}", str(price), ex=120)
+                            except Exception:
+                                pass
                             published_count += 1
                             logger.debug(f"PRICE_PUBLISH: {base_symbol} = ${price:.2f}")
                     except Exception as e:
@@ -2020,11 +2027,12 @@ class PortfolioEngineIntegration:
 
     async def _paper_retention_loop(self) -> None:
         """
-        Rolling window: every 15 minutes delete paper_trades and trade_performance
-        rows older than 7 days. Pure SQLite; no Binance. Engine PnL is derived from
-        remaining rows via canonical reconcile. Optional VACUUM every 24 runs (~6h).
+        Rolling window: every 15 minutes delete trade_performance and portfolio_engine_audit
+        rows older than PAPER_RETENTION_DAYS (default 90). paper_trades retention is handled
+        by sqlite_large_table_retention (batched, same 90-day window). Pure SQLite; no Binance.
         """
-        logger.info("PAPER_RETENTION: Starting loop (every 15 min, keep 7 days)")
+        keep_days = int(os.getenv("PAPER_RETENTION_DAYS", "90") or "90")
+        logger.info("PAPER_RETENTION: Starting loop (every 15 min, keep %d days, paper_trades via large-table retention)", keep_days)
         await asyncio.sleep(120)  # 2 min before first run
         run_count = 0
         while self.is_running:
@@ -2037,18 +2045,15 @@ class PortfolioEngineIntegration:
                             with connect_rw(path) as conn:
                                 conn.execute("BEGIN IMMEDIATE")
                                 cur = conn.cursor()
-                                cur.execute("SELECT strftime('%Y-%m-%dT00:00:00', 'now', '-7 days')")
+                                cur.execute(
+                                    f"SELECT strftime('%Y-%m-%dT00:00:00', 'now', '-{keep_days} days')"
+                                )
                                 cutoff = (cur.fetchone() or ("",))[0]
                                 if not cutoff:
                                     return (0, 0, 0)
                                 deleted_paper = 0
                                 deleted_perf = 0
                                 deleted_audit = 0
-                                cur.execute(
-                                    "DELETE FROM paper_trades WHERE timestamp < ?",
-                                    (cutoff,),
-                                )
-                                deleted_paper = cur.rowcount
                                 cur.execute(
                                     "DELETE FROM trade_performance WHERE timestamp < ?",
                                     (cutoff,),
@@ -2059,6 +2064,11 @@ class PortfolioEngineIntegration:
                                     (cutoff,),
                                 )
                                 deleted_audit = cur.rowcount
+                                # Laptop 24/7 hygiene: passive WAL checkpoint to bound -wal file growth without blocking writers.
+                                try:
+                                    conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                                except Exception:
+                                    pass
                                 conn.commit()
                                 return (deleted_paper, deleted_perf, deleted_audit)
 
@@ -2068,7 +2078,11 @@ class PortfolioEngineIntegration:
                     deleted_paper, deleted_perf, deleted_audit = await loop.run_in_executor(None, _run_retention, db_path)
                     if deleted_paper or deleted_perf or deleted_audit:
                         logger.info(
-                            "PAPER_RETENTION: deleted paper_trades=%d trade_performance=%d portfolio_engine_audit=%d (older than 7 days)",
+                            "PAPER_RETENTION: deleted paper_trades=%d trade_performance=%d portfolio_engine_audit=%d (older than %d days)",
+                            deleted_paper,
+                            deleted_perf,
+                            deleted_audit,
+                            keep_days,
                             deleted_paper,
                             deleted_perf,
                             deleted_audit,
@@ -2118,6 +2132,12 @@ class PortfolioEngineIntegration:
                             "LARGE_TABLE_RETENTION: run complete nothing deleted elapsed=%ss",
                             summary.get("elapsed_sec"),
                         )
+                    # Laptop 24/7 hygiene: passive checkpoint after large retention.
+                    try:
+                        with connect_rw(db_path) as chk:
+                            chk.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                    except Exception:
+                        pass
             except asyncio.CancelledError:
                 break
             except Exception as e:

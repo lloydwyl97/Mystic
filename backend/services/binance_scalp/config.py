@@ -28,6 +28,7 @@ class ScalpConfig:
     redis_key_prefix: str
     products: tuple[str, ...]
     scalp_paper_enabled: bool
+    scalp_paper_auto_arm: bool
     scalp_live: bool
     fee_model_verified: bool
     max_open_positions: int
@@ -56,6 +57,10 @@ class ScalpConfig:
             redis_key_prefix=prefix,
             products=products,
             scalp_paper_enabled=_bool("SCALP_PAPER_ENABLED", False),
+            scalp_paper_auto_arm=_bool(
+                "SCALP_PAPER_AUTO_ARM",
+                _bool("SCALP_PAPER_ENABLED", False),
+            ),
             scalp_live=_bool("SCALP_LIVE", False),
             fee_model_verified=_bool("SCALP_FEE_MODEL_VERIFIED", False),
             max_open_positions=int(os.getenv("SCALP_MAX_OPEN_POSITIONS", "1")),

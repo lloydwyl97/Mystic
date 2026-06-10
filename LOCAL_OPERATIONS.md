@@ -13,7 +13,7 @@
 
 **Do not use** `./start_mystic.sh all` for normal 24/7 operation. It starts legacy agents, AI ML trading, MANDATORY_CLEANUP, and duplicate market-data paths.
 
-## Core stack processes
+## Full stack processes (`./start_mystic.sh full`)
 
 1. Backend API (uvicorn :8000)
 2. `start_live_market_data.py`
@@ -21,10 +21,13 @@
 4. `start_portfolio_engine_integration.py`
 5. `start_ai_market_context.py`
 6. `start_ai_learning.py`
+7. `backend.services.binance_scalp.runner` (scalp paper — isolated from DAY)
+
+**Core** (`./start_mystic.sh core`) is the same list minus scalp (DAY only).
 
 Requires: Redis running, `.env` with `EXTERNAL_SUPERVISOR_MODE=true`, paper mode unless explicitly switched.
 
-Note: `live_data_collector.py` is deprecated — SQLite `feature_ohlcv` + `market_data:last_update` run inside `start_live_market_data.py`.
+Note: `live_data_collector.py` is deprecated — OHLCV runs in `start_live_market_data.py`. The `all` mode collector start is a no-op stub.
 
 ## Trading design (do not drift)
 

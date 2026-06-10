@@ -61,6 +61,69 @@ def classify_outcome_label(
     return "BAD", 0, "LOSS"
 
 
+def _propagate_symbol_strategy_expectancy(conn: sqlite3.Connection, sym: str, strategy_id: str) -> None:
+    """
+    Recompute and upsert ai_symbol_strategy_expectancy for (symbol, strategy_id)
+    from ai_outcome_training_rows so learning actually feeds the next decision.
+
+    Schema-agnostic: the live table predates ai_canonical_storage's newer columns,
+    so only columns that actually exist are written.
+    """
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(ai_symbol_strategy_expectancy)").fetchall()}
+        if not cols:
+            return
+        agg = conn.execute(
+            """
+            SELECT
+                COALESCE(AVG(CASE WHEN net_pnl_pct IS NOT NULL THEN net_pnl_pct
+                                  WHEN realized_pct IS NOT NULL THEN realized_pct END), 0.0) AS expectancy,
+                SUM(CASE WHEN UPPER(COALESCE(good_bad_memory_class,''))='GOOD' THEN 1 ELSE 0 END) AS good_count,
+                SUM(CASE WHEN UPPER(COALESCE(good_bad_memory_class,''))='BAD'  THEN 1 ELSE 0 END) AS bad_count,
+                COUNT(*) AS total_trades
+            FROM ai_outcome_training_rows
+            WHERE (UPPER(symbol)=UPPER(?) OR UPPER(symbol)=UPPER(?))
+              AND LOWER(COALESCE(strategy_id,'day'))=LOWER(?)
+            """,
+            (sym, sym.replace("/", ""), strategy_id),
+        ).fetchone()
+        if not agg:
+            return
+        expectancy, good_count, bad_count, total_trades = (
+            float(agg[0] or 0.0), int(agg[1] or 0), int(agg[2] or 0), int(agg[3] or 0),
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        values: dict[str, Any] = {
+            "symbol": sym,
+            "strategy_id": strategy_id,
+            "expectancy": expectancy,
+            "good_count": good_count,
+            "bad_count": bad_count,
+        }
+        if "total_trades" in cols:
+            values["total_trades"] = total_trades
+        if "last_net_outcome" in cols:
+            values["last_net_outcome"] = expectancy
+        if "last_outcome_at_utc" in cols:
+            values["last_outcome_at_utc"] = now
+        if "updated_at_utc" in cols:
+            values["updated_at_utc"] = now
+        if "updated_at" in cols:
+            values["updated_at"] = now
+        ins_cols = [c for c in values if c in cols]
+        placeholders = ", ".join("?" for _ in ins_cols)
+        update_cols = [c for c in ins_cols if c not in ("symbol", "strategy_id")]
+        set_clause = ", ".join(f"{c}=excluded.{c}" for c in update_cols)
+        conn.execute(
+            f"INSERT INTO ai_symbol_strategy_expectancy ({', '.join(ins_cols)}) "
+            f"VALUES ({placeholders}) "
+            f"ON CONFLICT(symbol, strategy_id) DO UPDATE SET {set_clause}",
+            tuple(values[c] for c in ins_cols),
+        )
+    except Exception as exc:
+        logger.warning("propagate_symbol_strategy_expectancy failed symbol=%s: %s", sym, exc)
+
+
 def record_outcome_training_row(
     *,
     symbol: str,
@@ -144,6 +207,7 @@ def record_outcome_training_row(
                     ),
                 ),
             )
+            _propagate_symbol_strategy_expectancy(conn, sym, strategy_id or "day")
             conn.commit()
             return int(cur.lastrowid or 0) or None
     except Exception as exc:
@@ -258,10 +322,38 @@ def repair_mislabeled_profitable_ai_sells(db_path: str = DATABASE_PATH) -> list[
                     (gb, ol, oc, pnl_pct, datetime.now(timezone.utc).isoformat(), row["id"]),
                 )
                 changed.append(int(row["id"]))
+                strat_row = conn.execute(
+                    "SELECT COALESCE(strategy_id,'day') FROM ai_outcome_training_rows WHERE id=?",
+                    (row["id"],),
+                ).fetchone()
+                sid = str(strat_row[0] if strat_row else "day")
+                _propagate_symbol_strategy_expectancy(conn, sym, sid)
             conn.commit()
     except Exception as exc:
         logger.warning("repair_mislabeled_profitable_ai_sells failed: %s", exc)
     return changed
+
+
+def backfill_all_symbol_strategy_expectancy(db_path: str = DATABASE_PATH) -> int:
+    """Recompute ai_symbol_strategy_expectancy for every symbol/strategy in outcome rows."""
+    updated = 0
+    try:
+        ensure_ai_canonical_tables(db_path)
+        with sqlite3.connect(db_path) as conn:
+            pairs = conn.execute(
+                """
+                SELECT DISTINCT symbol, COALESCE(strategy_id, 'day')
+                FROM ai_outcome_training_rows
+                WHERE symbol IS NOT NULL AND TRIM(symbol) != ''
+                """
+            ).fetchall()
+            for sym, sid in pairs:
+                _propagate_symbol_strategy_expectancy(conn, str(sym), str(sid or "day"))
+                updated += 1
+            conn.commit()
+    except Exception as exc:
+        logger.warning("backfill_all_symbol_strategy_expectancy failed: %s", exc)
+    return updated
 
 
 def repair_missing_sell_feature_versions(

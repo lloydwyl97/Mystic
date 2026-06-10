@@ -811,6 +811,7 @@ class PaperTradingService:
         exit_reason: str | None = None,
         trade_id: str | None = None,  # CRITICAL FIX: Accept trade_id for BUY/SELL linking
         confidence: float | None = None,  # CRITICAL FIX: Accept confidence for database storage
+        skip_sqlite_persist: bool = False,  # Engine sync: portfolio_engine already wrote paper_trades
     ) -> dict[str, Any]:
         try:
             if not self.enabled:
@@ -874,6 +875,8 @@ class PaperTradingService:
                 order.linked_trade_id = trade_id  # type: ignore[attr-defined]
             if confidence is not None:
                 order.confidence = confidence  # type: ignore[attr-defined]
+            if skip_sqlite_persist:
+                order.skip_sqlite_persist = True  # type: ignore[attr-defined]
             self.orders[order_id] = order
 
             if type_u in ("MARKET", "LIMIT"):
@@ -1318,12 +1321,15 @@ class PaperTradingService:
         self.trade_history.append(trade_record)
         self._cleanup_trade_history()
 
+        skip_sqlite = bool(getattr(order, "skip_sqlite_persist", False))
+
         # Write to SQLite canonical storage (dual-write: SQLite canonical + Redis cache)
-        try:
-            await self._persist_trade_to_sqlite_canonical(trade_record)
-        except Exception as e:
-            logger.exception(f"Failed to persist trade to canonical SQLite: {e}")
-            # Continue execution - don't fail trade due to persistence issue
+        if not skip_sqlite:
+            try:
+                await self._persist_trade_to_sqlite_canonical(trade_record)
+            except Exception as e:
+                logger.exception(f"Failed to persist trade to canonical SQLite: {e}")
+                # Continue execution - don't fail trade due to persistence issue
 
         # Also persist to Redis cache
         await self._persist_trade_to_redis(trade_record)
@@ -1373,8 +1379,9 @@ class PaperTradingService:
         # Persist to Redis for cross-instance access and fast retrieval
         await self._persist_trade_to_redis(trade_record)
 
-        # NEW: Persist to SQLite database for permanent storage
-        await self._persist_trade_to_database(trade_record)
+        # Legacy trade_logs table (optional); portfolio_engine owns canonical paper_trades
+        if not skip_sqlite:
+            await self._persist_trade_to_database(trade_record)
 
         # RATE LIMIT FIX: Write status to Redis for dashboard (avoids API calls)
         await self._update_status_in_redis()
@@ -1529,14 +1536,21 @@ class PaperTradingService:
                 raise
 
     async def _persist_trade_to_database(self, trade_record: dict[str, Any]) -> None:
-        """Persist trade to SQLite database for permanent storage and analytics"""
+        """Persist trade to legacy trade_logs table when present (optional analytics sink)."""
         try:
             if SessionLocal is None or TradeLog is None:
-                logger.warning("Database persistence unavailable - imports failed")
                 return
 
             # Run database operations in thread pool to avoid blocking
             def _sync_persist():
+                import sqlite3
+
+                with sqlite3.connect(DATABASE_PATH) as probe:
+                    if not probe.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trade_logs'"
+                    ).fetchone():
+                        return "skipped"
+
                 with SessionLocal() as session:
                     # Convert trade record to TradeLog format
                     trade_log = TradeLog(
@@ -1556,10 +1570,11 @@ class PaperTradingService:
 
             # Execute in thread pool
             order_id = await asyncio.get_running_loop().run_in_executor(None, _sync_persist)
-            logger.debug(f"Persisted trade to database: {order_id}")
+            if order_id != "skipped":
+                logger.debug(f"Persisted trade to database: {order_id}")
 
         except Exception as e:
-            logger.exception(f"Failed to persist trade to database: {e}")
+            logger.debug(f"Legacy trade_logs persist skipped: {e}")
             # Don't raise exception - database failure shouldn't break trading
 
     async def _update_status_in_redis(self) -> None:
@@ -1598,57 +1613,57 @@ class PaperTradingService:
             # Don't raise - status update failure shouldn't break trading
 
     async def _persist_trade_to_sqlite_canonical(self, trade_record: dict[str, Any]) -> None:
-        """Persist trade to SQLite paper_trades table (canonical source)"""
+        """Persist trade to SQLite paper_trades table (schema-introspecting insert)."""
         import sqlite3
+
+        field_map: dict[str, Any] = {
+            "trade_id": trade_record.get("trade_id"),
+            "paper_run_id": trade_record.get("paper_run_id", self.paper_run_id),
+            "mode": trade_record.get("mode", "paper"),
+            "symbol": trade_record.get("symbol"),
+            "side": str(trade_record.get("side") or "").upper(),
+            "quantity": trade_record.get("quantity"),
+            "price": trade_record.get("price"),
+            "entry_price": trade_record.get("entry_price"),
+            "pnl": trade_record.get("pnl"),
+            "pnl_pct": trade_record.get("pnl_pct"),
+            "remaining_position": trade_record.get("remaining_position", 0),
+            "hold_time_seconds": trade_record.get("hold_time_seconds"),
+            "commission": trade_record.get("commission", 0),
+            "strategy": trade_record.get("strategy"),
+            "confidence": trade_record.get("confidence"),
+            "timestamp": trade_record.get("timestamp"),
+            "status": trade_record.get("status", "executed"),
+            "exit_reason": trade_record.get("exit_reason"),
+            "entry_timestamp": trade_record.get("entry_timestamp"),
+            "source": trade_record.get("source", "paper_engine"),
+            "decision_id": trade_record.get("decision_id"),
+            "sleeve": trade_record.get("sleeve") or "ACTIVE",
+            "spread_pct_used": trade_record.get("spread_pct_used"),
+            "regime": trade_record.get("regime"),
+        }
 
         def _sync_sqlite_persist():
             try:
-                # BUG #24 & #25 FIX: Use context manager for connection + explicit transaction
                 with sqlite3.connect(DATABASE_PATH) as conn:
                     cursor = conn.cursor()
+                    cursor.execute("PRAGMA table_info(paper_trades)")
+                    existing_cols = {row[1] for row in cursor.fetchall()}
+                    insert_cols = [c for c in field_map if c in existing_cols]
+                    if not insert_cols:
+                        logger.warning("paper_trades has no writable columns; skip persist")
+                        return
 
-                    # Normalize side to uppercase before inserting (prevents case drift)
-                    side = str(trade_record.get("side") or "").upper()
+                    values = [field_map[c] for c in insert_cols]
+                    col_sql = ", ".join(insert_cols)
+                    placeholders = ", ".join("?" for _ in insert_cols)
 
-                    # BUG #25 FIX: Explicit transaction boundaries
                     cursor.execute("BEGIN TRANSACTION")
                     try:
                         cursor.execute(
-                            """
-                            INSERT OR REPLACE INTO paper_trades (
-                                trade_id, paper_run_id, mode, symbol, side, quantity, price,
-                                entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
-                                commission, strategy, confidence, timestamp, order_id, status,
-                                exit_reason, entry_timestamp, source, decision_id, sleeve
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                            (
-                                trade_record.get("trade_id"),
-                                trade_record.get("paper_run_id", self.paper_run_id),
-                                trade_record.get("mode", "paper"),
-                                trade_record.get("symbol"),
-                                side,
-                                trade_record.get("quantity"),
-                                trade_record.get("price"),
-                                trade_record.get("entry_price"),
-                                trade_record.get("pnl"),
-                                trade_record.get("pnl_pct"),
-                                trade_record.get("remaining_position", 0),
-                                trade_record.get("hold_time_seconds"),
-                                trade_record.get("commission", 0),
-                                trade_record.get("strategy"),
-                                trade_record.get("confidence"),
-                                trade_record.get("timestamp"),
-                                trade_record.get("order_id"),
-                                trade_record.get("status", "executed"),
-                                trade_record.get("exit_reason"),
-                                trade_record.get("entry_timestamp"),
-                                trade_record.get("source", "paper_engine"),
-                                trade_record.get("decision_id"),
-                                trade_record.get("sleeve") or "ACTIVE",
-                            ),
+                            f"INSERT OR REPLACE INTO paper_trades ({col_sql}) VALUES ({placeholders})",
+                            values,
                         )
-
                         conn.commit()
                         logger.debug(f"Persisted trade to SQLite canonical: {trade_record.get('trade_id')}")
                     except Exception:
@@ -1659,9 +1674,7 @@ class PaperTradingService:
                 logger.exception(f"Failed to persist trade to SQLite canonical: {e}")
                 raise
 
-        # Execute in thread pool
         await asyncio.get_running_loop().run_in_executor(None, _sync_sqlite_persist)
-        # Trade is still available in Redis for recovery
 
     async def _persist_position_to_redis(self, symbol: str, position: PaperPosition) -> None:
         """Persist position to Redis for cross-instance access and persistence"""

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -401,10 +402,10 @@ async def daily_returns() -> Any:
         logger.warning("Failed to get daily returns from paper_trades/trade_performance fallbacks", exc_info=True)
 
     return {
-        "returns": [{"timestamp": "2024-01-01T00:00:00Z", "value": 0.0}],
+        "returns": [],
         "summary": {"average_daily_return": 0.0, "total_return": 0.0, "positive_days": 0, "negative_days": 0, "best_day": 0.0, "worst_day": 0.0, "volatility": 0.0},
-        "last_updated": "2024-01-01T00:00:00Z",
-        "data_source": "default_baseline",
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "data_source": "no_data",
     }
 
 

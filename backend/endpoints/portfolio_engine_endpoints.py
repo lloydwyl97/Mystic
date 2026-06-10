@@ -534,6 +534,34 @@ async def get_portfolio_status() -> dict[str, Any]:
                 positions,
             )
 
+        # C4: truthful degraded state. A position whose thesis is invalidated
+        # (mark below thesis_invalid_level) but still open means the exit path is
+        # blocked/degraded. Surface it instead of reporting plain HEALTHY/PASS.
+        try:
+            _mark_by_symbol = {
+                str(p.get("symbol")): float(p.get("current_price") or 0.0)
+                for p in (status.get("open_positions") or [])
+            }
+            _exit_blocked: list[dict[str, Any]] = []
+            for _sym, _pos in (engine.open_positions or {}).items():
+                _invalid = float(getattr(_pos, "thesis_invalid_level", 0.0) or 0.0)
+                _mark = _mark_by_symbol.get(_sym, 0.0)
+                if _invalid > 0.0 and 0.0 < _mark < _invalid:
+                    _exit_blocked.append({
+                        "symbol": _sym,
+                        "entry_thesis": str(getattr(_pos, "entry_thesis", "") or ""),
+                        "mark": _mark,
+                        "thesis_invalid_level": _invalid,
+                    })
+            status["exit_blocked_positions"] = _exit_blocked
+            if _exit_blocked:
+                status["degraded"] = True
+                status["degraded_reason"] = "THESIS_INVALIDATED_NOT_CLOSED"
+                if str(status.get("account_status") or "").upper() == "HEALTHY":
+                    status["account_status"] = "DEGRADED"
+        except Exception as e:
+            logger.debug("STATUS_DEGRADED_CHECK skipped: %s", e)
+
         # Ensure we show non-zero equity from adopted data
         return {
             "success": True,
