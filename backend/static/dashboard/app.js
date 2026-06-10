@@ -879,9 +879,9 @@ function updateScoreboardToday(data) {
     const closedAi = d.closed_ai_trades_today != null ? d.closed_ai_trades_today : d.ai_closed_trades;
     const openBuys = d.open_buys_today != null ? d.open_buys_today : 0;
     el.title =
-        "Today's closed AI SELL count: " + (closedAi != null ? closedAi : "?") +
+        "Strategy diagnostic (not infra health). Closed AI SELLs today: " + (closedAi != null ? closedAi : "?") +
         ". Open buys today: " + openBuys +
-        " (not included in trades count). PASS/FAIL is diagnostic only.";
+        ". FAIL reflects expectancy/PnL rules after AI closes — stack can still be HEALTHY.";
 
     if (status && String(status).toUpperCase() === "FAIL" && failReasons) {
         el.textContent = `FAIL: ${failReasons}`;

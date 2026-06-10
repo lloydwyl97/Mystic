@@ -12557,6 +12557,15 @@ class PortfolioEngine:
         # Secondary: principal + realized_pnl + unrealized_pnl == total_equity
         equity_alt = self.principal + self._realized_pnl + self._unrealized_pnl
         equity_alt_ok = abs(total_equity - equity_alt) < 1.0
+        computed_realized = self._compute_realized_pnl_from_paper_trades()
+        if abs(computed_realized - self._realized_pnl) > 0.01:
+            logger.warning(
+                "REALIZED_PNL_HEAL get_ledger: stored=%.4f paper_trades=%.4f",
+                self._realized_pnl,
+                computed_realized,
+            )
+            self._realized_pnl = computed_realized
+            await self._persist_ledger_to_sqlite()
         if not equity_invariant_ok:
             logger.debug(
                 "GET_LEDGER: invariant cash+positions=%.2f != total_equity=%.2f (diff=%.4f)",
@@ -15074,11 +15083,25 @@ class PortfolioEngine:
             ledger_realized = float(ledger_row[2] or 0) if ledger_row else 0.0
 
             closed_ai = ai["count"] if ai["count"] else ai_paper_closes
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(pnl), 0)
+                FROM paper_trades
+                WHERE date(timestamp) = ? AND UPPER(side) = 'SELL' AND pnl IS NOT NULL
+                  AND COALESCE(exit_type, '') NOT IN (
+                    'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
+                    'legacy_no_clear_position_clear', 'STALE_LIVE_GHOST_POSITION_CLEAR'
+                  )
+                """,
+                (day,),
+            )
+            strategy_paper_today = float((cur.fetchone() or (0,))[0] or 0.0)
             return {
                 "ai_closed_trades": closed_ai,
                 "closed_ai_trades_today": closed_ai,
                 "ai_closed_pnl": ai_paper_pnl if ai_paper_pnl else ai["pnl"],
                 "ai_realized_pnl_today": ai_paper_pnl,
+                "strategy_today_realized_pnl_paper": strategy_paper_today,
                 "admin_synthetic_closes": admin["count"] + stale["count"] + downtime["count"],
                 "admin_synthetic_pnl": admin["pnl"] + stale["pnl"] + downtime["pnl"],
                 "admin_stale_closes_today": admin_paper_closes,
@@ -15097,6 +15120,11 @@ class PortfolioEngine:
                 "scoreboard_trades_field_is_ai_closes_only": True,
                 "scoreboard_trades_label": "Closed AI trades today (SELL only; open buys excluded)",
                 "scoreboard_open_buys_label": "Open buys today (BUY rows; not counted in trades)",
+                "realized_pnl_scope_note": (
+                    "realized_pnl = audit AI SELL closes today (strategy scoreboard). "
+                    "ai_realized_pnl_today = all paper SELL pnl today incl. legacy ops. "
+                    "ledger_realized_pnl = all-time stored ledger (healed from paper_trades on read)."
+                ),
             }
         finally:
             conn.close()
