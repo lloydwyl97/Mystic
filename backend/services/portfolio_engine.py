@@ -9181,6 +9181,12 @@ class PortfolioEngine:
             if _aw.allweather_enabled():
                 _tgt = float(getattr(position, "thesis_target_level", 0.0) or 0.0)
                 _stp = float(getattr(position, "thesis_invalid_level", 0.0) or 0.0)
+                # Only govern positions whose bracket is a valid all-weather long
+                # (target above entry, stop below entry). Legacy/foreign positions
+                # carry thesis levels that do not follow this geometry; applying the
+                # ATR target/stop to them fires spurious exits, so let them fall
+                # through to the normal exit path instead.
+                _valid_bracket = _tgt > 0.0 and _stp > 0.0 and _tgt > entry_price > _stp
                 _entry_ts = float(getattr(position, "entry_time", 0.0) or 0.0)
                 _hold_h = max(0.0, (time.time() - _entry_ts) / 3600.0) if _entry_ts > 0 else 0.0
                 _aw_dec = _aw.exit_decision(
@@ -9190,7 +9196,7 @@ class PortfolioEngine:
                     target_level=_tgt,
                     stop_level=_stp,
                     hold_hours=_hold_h,
-                )
+                ) if _valid_bracket else None
                 if _aw_dec and _aw_dec.get("action") == "sell":
                     logger.warning(
                         "ALLWEATHER_EXIT symbol=%s reason=%s price=%.6f tgt=%.6f stop=%.6f hold_h=%.1f",
