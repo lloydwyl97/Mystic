@@ -6,14 +6,16 @@
 
 | Action | Command |
 |--------|---------|
-| **Start (use this)** | `cd /home/mystic/mystic && ./start_mystic.sh full` |
-| DAY only | `./start_mystic.sh core` |
+| **Start (use this)** | `cd /home/mystic/mystic && ./start_mystic.sh core` (DAY top-4 + scalp paper) |
+| Same as core | `./start_mystic.sh full` |
 | Stop | `cd /home/mystic/mystic && ./stop_mystic.sh` |
-| Desktop shortcut | `~/Desktop/Start Mystic.desktop` → runs **full** (DAY + scalp paper) |
+| Desktop shortcut | `~/Desktop/Start Mystic.desktop` → runs **core** |
 
-**Do not use** `./start_mystic.sh all` for normal 24/7 operation. It starts legacy agents, AI ML trading, MANDATORY_CLEANUP, and duplicate market-data paths.
+**Do not use** `./start_mystic.sh all` or `./start_mystic.sh ai` — both exit with error (retired legacy stack).
 
-## Full stack processes (`./start_mystic.sh full`)
+See **CANONICAL_SYSTEM.md** for the full active path, API honesty table, and quarantined legacy list.
+
+## Core stack processes (`./start_mystic.sh core`)
 
 1. Backend API (uvicorn :8000)
 2. `start_live_market_data.py`
@@ -23,7 +25,8 @@
 6. `start_ai_learning.py`
 7. `backend.services.binance_scalp.runner` (scalp paper — isolated from DAY)
 
-**Core** (`./start_mystic.sh core`) is the same list minus scalp (DAY only).
+DAY and scalp are **separate engines**. Dashboard shows them separately; PnL is not mixed.
+Scalp `NEAR_PASS` / spread blockers are scalp diagnostics only, not DAY faults.
 
 Requires: Redis running, `.env` with `EXTERNAL_SUPERVISOR_MODE=true`, paper mode unless explicitly switched.
 

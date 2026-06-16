@@ -282,8 +282,15 @@ def register_candidate_and_maybe_promote(
         promote = False
         reject_reason = "candidate_always_hold_on_holdout"
     elif promote and holdout_low_confidence and has_active:
-        promote = False
-        reject_reason = "holdout_low_confidence"
+        # Tiered fallback (learning starvation fix): when real closed-trade
+        # holdout is scarce, a Tier C synthetic holdout (labeled rejected /
+        # no-trade forward returns) may approve promotion. Real PnL metrics
+        # are never derived from the synthetic rows.
+        if bool(metrics.get("tiered_holdout_pass")):
+            metrics["promotion_path"] = "tiered_holdout_fallback"
+        else:
+            promote = False
+            reject_reason = "holdout_low_confidence"
     elif promote and has_active:
         tied = (
             abs(float(c_acc or 0.0) - float(a_acc or -1.0)) <= 0.0005

@@ -1,0 +1,48 @@
+{
+  "baseline_id": "day_baseline_all_pass_v1_size_1_5",
+  "parent_baseline_id": "day_baseline_all_pass_v1",
+  "candidate_id": "day_baseline_all_pass_v1_size_1_5_candidate",
+  "locked_at": "2026-06-13T12:00:00+00:00",
+  "live_applied": true,
+  "change_type": "sizing_only",
+  "notional_multiplier": 1.5,
+  "day_base_notional_per_slot_usd": 2500.0,
+  "day_target_notional_per_slot_usd": 3750.0,
+  "day_max_deployed_usd": 15000.0,
+  "day_max_open_slots": 4,
+  "min_net_profit_to_sell": 0.004,
+  "strategy_rules_unchanged": true,
+  "killed_buckets_unchanged": true,
+  "no_new_blockers": true,
+  "no_new_modes": true,
+  "replay_all_pass": true,
+  "stress_all_pass": true,
+  "live_config_match_expected": true,
+  "expected_monthly_pnl_usd_25k": 88.4,
+  "expected_trades_per_month": 6.67,
+  "max_drawdown_pct_90d": 0.484,
+  "worst_intrabar_mae_pct_90d": -0.03382,
+  "longest_hold_hours_90d": 57.5,
+  "red_thesis_sells_90d": 0,
+  "duplicate_attempts_90d": 0,
+  "repair_add_count_90d": 0,
+  "not_promoted": {
+    "min_net_profit_0.60pct": "future candidate only",
+    "min_net_profit_0.80pct": "failed fat-tail holds",
+    "min_net_profit_1.00pct": "failed fat-tail holds"
+  },
+  "artifacts": {
+    "candidate_review": "day_baseline_all_pass_v1_size_1_5_candidate_REVIEW.json",
+    "candidate_full": "day_baseline_all_pass_v1_size_1_5_candidate.json",
+    "parent": "day_baseline_all_pass_v1.json"
+  },
+  "live_modifications_forbidden": [
+    "no_revive_killed_buckets",
+    "no_new_blockers",
+    "no_new_modes",
+    "no_exit_floor_change_without_candidate",
+    "neutral_vwap_positive_buckets_only",
+    "range_vwap_btc_eth_xrp_killed",
+    "breakout_pullback_blocked_replay_negative"
+  ]
+}

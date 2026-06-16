@@ -1,17 +1,13 @@
 """
-Live Trading Endpoints - Core Live Trading API
+Live Trading Endpoints — read-only Binance.US account inspection (admin).
 
-Provides the essential live trading endpoints that were missing:
-- /api/trading/orders - Live order management
-- /api/trading/portfolio - Live portfolio tracking
-- /api/trading/balance - Live account balance
-
-All endpoints use existing services and require admin authentication.
+Order placement is NOT supported here. All DAY execution goes through
+portfolio_engine (execute_buy_fifo / execute_sell_fifo) in the external
+integration process. See CANONICAL_SYSTEM.md.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -156,126 +152,26 @@ async def get_live_balance(_: None = _require_admin_dep) -> dict[str, Any]:
 
 @router.post("/execute_live_market_buy")
 async def execute_live_market_buy(payload: dict[str, Any] = _request_body, _: None = _require_admin_dep) -> dict[str, Any]:
-    """
-    Execute a live market buy order on Binance.US.
-
-    Requires admin authentication and valid API keys.
-    """
-    trading_service = _get_trading_service()
-    symbol = str(payload.get("symbol") or "").upper()
-    quote_usd = float(payload.get("quote_usd") or 0)
-
-    if not symbol or quote_usd <= 0:
-        raise HTTPException(status_code=400, detail="symbol and positive quote_usd required")
-
-    try:
-        # Use Binance API directly with quoteOrderQty for market buy
-        if trading_service.binance:
-            pair = symbol.replace("USDT", "/USDT") if "USDT" in symbol else symbol + "/USDT"
-            order = await asyncio.to_thread(
-                trading_service.binance.create_order,
-                symbol=pair,
-                type="market",
-                side="buy",
-                amount=None,  # Not used with quoteOrderQty
-                price=None,
-                params={"quoteOrderQty": quote_usd},
-            )
-            order_result = {
-                "status": "success",
-                "order": {
-                    "id": order.get("id"),
-                    "symbol": order.get("symbol"),
-                    "type": order.get("type"),
-                    "side": order.get("side"),
-                    "amount": order.get("amount"),
-                    "price": order.get("price"),
-                    "clientOrderId": order.get("clientOrderId"),
-                    "status": order.get("status"),
-                    "timestamp": order.get("timestamp"),
-                },
-            }
-        else:
-            order_result = {"status": "error", "message": "Binance client not available"}
-
-        if order_result.get("status") == "success":
-            _audit_trade("live_market_buy", {"symbol": symbol, "quote_usd": quote_usd})
-            return {"status": "success", "order": order_result.get("order", {})}
-        else:
-            _raise_order_error(f"Order failed: {order_result.get('message', 'Unknown error')}")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        _audit_trade("live_market_buy_fail", {"symbol": symbol, "quote_usd": quote_usd, "error": str(e)}, success=False)
-        raise HTTPException(status_code=502, detail=f"order failed: {e}") from e
+    """Retired: live orders must not bypass portfolio_engine gates."""
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "POST /api/trading/execute_live_market_buy is retired. "
+            "Live DAY execution must go through portfolio_engine when LIVE mode is armed."
+        ),
+    )
 
 
 @router.post("/execute_live_market_sell")
 async def execute_live_market_sell(payload: dict[str, Any] = _request_body, _: None = _require_admin_dep) -> dict[str, Any]:
-    """
-    Execute a live market sell order on Binance.US.
-
-    Requires admin authentication and valid API keys.
-    """
-    trading_service = _get_trading_service()
-    symbol = str(payload.get("symbol") or "").upper()
-    quantity = float(payload.get("quantity") or 0)
-
-    if not symbol or quantity <= 0:
-        raise HTTPException(status_code=400, detail="symbol and positive quantity required")
-
-    try:
-        # Use Binance API directly for market sell
-        if trading_service.binance:
-            pair = symbol.replace("USDT", "/USDT") if "USDT" in symbol else symbol + "/USDT"
-            order = await asyncio.to_thread(
-                trading_service.binance.create_order,
-                symbol=pair,
-                type="market",
-                side="sell",
-                amount=quantity,  # For sell, amount is the quantity to sell
-                price=None,
-            )
-            order_result = {
-                "status": "success",
-                "order": {
-                    "id": order.get("id"),
-                    "symbol": order.get("symbol"),
-                    "type": order.get("type"),
-                    "side": order.get("side"),
-                    "amount": order.get("amount"),
-                    "price": order.get("price"),
-                    "clientOrderId": order.get("clientOrderId"),
-                    "status": order.get("status"),
-                    "timestamp": order.get("timestamp"),
-                },
-            }
-        else:
-            order_result = {"status": "error", "message": "Binance client not available"}
-
-        if order_result.get("status") == "success":
-            _audit_trade("live_market_sell", {"symbol": symbol, "quantity": quantity})
-            return {"status": "success", "order": order_result.get("order", {})}
-        else:
-            _raise_order_error(f"Order failed: {order_result.get('message', 'Unknown error')}")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        _audit_trade("live_market_sell_fail", {"symbol": symbol, "quantity": quantity, "error": str(e)}, success=False)
-        raise HTTPException(status_code=502, detail=f"order failed: {e}") from e
+    """Retired: live orders must not bypass portfolio_engine gates."""
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "POST /api/trading/execute_live_market_sell is retired. "
+            "Live DAY exits must go through portfolio_engine monitor loop."
+        ),
+    )
 
 
-def _raise_order_error(message: str) -> None:
-    """Raise HTTPException for order errors."""
-    raise HTTPException(status_code=502, detail=message)
-
-
-def _audit_trade(event: str, details: dict[str, Any], success: bool = True) -> None:
-    """Audit live trading events."""
-    try:
-        # Basic audit logging - could be enhanced with security middleware
-        logger.info(f"LIVE TRADE AUDIT: {event} - Success: {success} - Details: {details}")
-    except Exception as e:
-        logger.warning(f"Failed to audit trade event: {e}")
+logger = logging.getLogger(__name__)

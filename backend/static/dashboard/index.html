@@ -24,6 +24,7 @@
         <div class="hero__overlay"></div>
         <div class="hero__content">
             <h1 class="hero__title">Mystic Trading Dashboard</h1>
+            <p class="hero__subtitle">Read-only monitoring and operator controls. No buy/sell order buttons — DAY trades run via portfolio engine integration only.</p>
         </div>
     </section>
 
@@ -39,6 +40,44 @@
         <div class="status-item" title="Data freshness (OK / STALE_DATA)"><span class="status-label">Latency</span><span class="status-value" id="status-latency">--</span></div>
         <div class="status-item" title="Redis market_data:last_update heartbeat (canonical lite)"><span class="status-label">Market heartbeat</span><span class="status-value" id="status-market-heartbeat">--</span></div>
     </section>
+
+    <section class="widget widget--full" aria-label="Trading engines status">
+            <h2 class="widget__title">Trading engines</h2>
+            <p class="widget__subtitle">DAY top-four and scalp paper are separate engines. PnL and scoreboard are not mixed. Scalp NEAR_PASS / spread blockers are scalp diagnostics only.</p>
+            <div class="readiness-grid" id="engines-grid">
+                <div class="readiness-card"><span class="readiness-label">DAY engine</span><span class="readiness-value" id="eng-day-status">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">DAY today PnL</span><span class="readiness-value" id="eng-day-pnl">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">DAY scoreboard</span><span class="readiness-value" id="eng-day-scoreboard">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Scalp engine</span><span class="readiness-value" id="eng-scalp-status">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Scalp today PnL</span><span class="readiness-value" id="eng-scalp-pnl">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Scalp diagnostic</span><span class="readiness-value" id="eng-scalp-blocker">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Account equity (DAY ledger)</span><span class="readiness-value" id="eng-account-equity">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Account vs principal</span><span class="readiness-value" id="eng-account-pnl">--</span></div>
+            </div>
+        </section>
+
+    <section class="widget widget--full" aria-label="Trading economics">
+            <h2 class="widget__title">Trading economics (Binance.US)</h2>
+            <p class="widget__subtitle">Fee model shared by paper and live — maker/taker, slippage buffer, order-book spread estimate, roundtrip cost. Advanced Trading has no platform spread.</p>
+            <div class="readiness-grid" id="trading-economics-grid">
+                <div class="readiness-card"><span class="readiness-label">Exchange</span><span class="readiness-value" id="te-exchange">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Maker fee</span><span class="readiness-value" id="te-maker">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Taker fee</span><span class="readiness-value" id="te-taker">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Slippage buffer</span><span class="readiness-value" id="te-slippage">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Order-book half-spread</span><span class="readiness-value" id="te-half-spread">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Roundtrip est. cost</span><span class="readiness-value" id="te-roundtrip">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Fee source date</span><span class="readiness-value" id="te-fee-date">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">DAY notional mult</span><span class="readiness-value" id="te-notional-mult">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Per-slot target</span><span class="readiness-value" id="te-per-slot">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Max deployed (4 slots)</span><span class="readiness-value" id="te-max-deployed">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Baseline lock</span><span class="readiness-value" id="te-baseline-lock">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Top-four tier</span><span class="readiness-value" id="te-tier-note">--</span></div>
+            </div>
+            <details class="observability-panel">
+                <summary>Trading economics JSON</summary>
+                <pre id="panel-trading-economics-content" class="panel-pre">--</pre>
+            </details>
+        </section>
 
     <section class="widget widget--full" aria-label="DAY position health">
             <h2 class="widget__title">DAY position health</h2>
@@ -69,6 +108,33 @@
             <details class="observability-panel">
                 <summary>DAY health JSON</summary>
                 <pre id="panel-day-health-content" class="panel-pre">--</pre>
+            </details>
+        </section>
+
+    <section class="widget widget--full" aria-label="Learning ingestion health">
+            <h2 class="widget__title">Learning health (DAY top-4)</h2>
+            <p class="widget__subtitle">Continuous learning ingestion — execution stays selective, learning does not. Closed trades (Tier A), open-position heartbeats (Tier B), rejected/no-trade forward labels (Tier C), walk-forward anchors (Tier D).</p>
+            <div class="readiness-grid" id="learning-health-grid">
+                <div class="readiness-card"><span class="readiness-label">Closed outcome rows</span><span class="readiness-value" id="lh-closed">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Candidate snapshots</span><span class="readiness-value" id="lh-snapshots">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Forward labels done</span><span class="readiness-value" id="lh-labeled">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Forward labels pending</span><span class="readiness-value" id="lh-pending">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Position heartbeats</span><span class="readiness-value" id="lh-heartbeats">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Missed opportunities</span><span class="readiness-value" id="lh-missed">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Data starvation</span><span class="readiness-value" id="lh-starvation">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Warnings</span><span class="readiness-value" id="lh-warnings">--</span></div>
+            </div>
+            <div class="widget__table-wrap">
+                <table class="positions-table" aria-label="Per-symbol learning rows">
+                    <thead>
+                        <tr><th>Symbol</th><th>Closed</th><th>Snapshots</th><th>Labeled</th><th>Heartbeats</th><th>Model date</th><th>Promotion</th><th>Last event</th></tr>
+                    </thead>
+                    <tbody id="lh-symbol-rows"><tr><td colspan="8">--</td></tr></tbody>
+                </table>
+            </div>
+            <details class="observability-panel">
+                <summary>Learning health JSON</summary>
+                <pre id="panel-learning-health-content" class="panel-pre">--</pre>
             </details>
         </section>
 
@@ -302,7 +368,7 @@
                 <span class="mini-card__value" id="analytics-risk-status">--</span>
             </div>
             <div class="mini-card">
-                <span class="mini-card__label">Strategy scoreboard</span>
+                <span class="mini-card__label">DAY scoreboard (today)</span>
                 <span class="mini-card__value" id="analytics-scoreboard">--</span>
             </div>
             <div class="mini-card">

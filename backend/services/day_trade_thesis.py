@@ -12,6 +12,14 @@ from typing import Any
 
 from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_PROFIT_TO_SELL
 
+# Canonical DAY exit labels (reporting / paper_trades.exit_reason)
+EXIT_NET_PROFIT = "NET_PROFIT_EXIT"
+EXIT_EXTREME_PROTECTION = "EXTREME_PROTECTION_EXIT"
+EXIT_MANUAL = "MANUAL_EXIT"
+EXIT_ADMIN_CLEAR = "ADMIN_CLEAR"
+EXIT_LEGACY_INVENTORY_CLEANUP = "LEGACY_INVENTORY_CLEANUP_EXIT"
+EXIT_THESIS_WARNING = "THESIS_INVALIDATION_WARNING_ONLY"
+
 SETUP_HTF_TREND_PULLBACK = "HTF_TREND_PULLBACK"
 SETUP_VWAP_REVERSION = "VWAP_REVERSION"
 SETUP_BREAKOUT_CONTINUATION = "BREAKOUT_CONTINUATION"
@@ -31,7 +39,7 @@ BREAKOUT_ALT_SYMBOLS = frozenset({"SOLUSDT", "XRPUSDT", "DOGEUSDT", "SOL/USDT", 
 _RANK_DELTA = {
     SETUP_HTF_TREND_PULLBACK: 0.07,
     SETUP_VWAP_REVERSION: -0.02,
-    SETUP_BREAKOUT_CONTINUATION: 0.04,
+    SETUP_BREAKOUT_CONTINUATION: -0.06,
     SETUP_NO_CLEAR_THESIS: -0.14,
 }
 _RANK_DELTA_SCALP = {
@@ -43,7 +51,7 @@ _RANK_DELTA_SCALP = {
 _EV_FACTOR = {
     SETUP_HTF_TREND_PULLBACK: 1.08,
     SETUP_VWAP_REVERSION: 0.92,
-    SETUP_BREAKOUT_CONTINUATION: 1.02,
+    SETUP_BREAKOUT_CONTINUATION: 0.88,
     SETUP_NO_CLEAR_THESIS: 0.50,
 }
 _EV_FACTOR_SCALP = {
@@ -142,9 +150,45 @@ def enrich_decision_data_for_thesis(
                     vv = v.decode("utf-8") if isinstance(v, bytes) else v
                     if kk in ("vwap", "bb_position", "volume_ratio", "atr") and dd.get(kk) in (None, "", 0, 0.0):
                         dd[kk] = _safe_float(vv, 0.0)
+                # feature:* hashes (binance_ws_hydrator) never carry vwap, so
+                # without this fallback VWAP_REVERSION was unreachable for DAY
+                # (vwap always 0 -> score 0, entry_vwap 0 -> vwap invalidation dead).
+                if dd.get("vwap") in (None, "", 0, 0.0):
+                    vwap = _session_vwap_from_klines(r, sym_bus)
+                    if vwap > 0:
+                        dd["vwap"] = vwap
         except Exception:
             pass
     return dd
+
+
+def _session_vwap_from_klines(r: Any, sym_bus: str) -> float:
+    """Session (UTC day) VWAP from cached 1m klines; rolling 4h fallback."""
+    try:
+        raw = r.get(f"klines:{sym_bus}:1m")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        if not raw:
+            return 0.0
+        rows = json.loads(raw)
+        if not isinstance(rows, list) or not rows:
+            return 0.0
+        import time as _time
+
+        day_start = (int(_time.time()) // 86400) * 86400
+        session = [x for x in rows if isinstance(x, (list, tuple)) and len(x) >= 6 and float(x[0]) >= day_start]
+        if len(session) < 30:
+            session = [x for x in rows if isinstance(x, (list, tuple)) and len(x) >= 6][-240:]
+        num = den = 0.0
+        for b in session:
+            tp = (float(b[2]) + float(b[3]) + float(b[4])) / 3.0
+            v = float(b[5])
+            if v > 0:
+                num += tp * v
+                den += v
+        return num / den if den > 0 else 0.0
+    except Exception:
+        return 0.0
 
 
 def classify_buy_thesis(
@@ -185,6 +229,11 @@ def classify_buy_thesis(
     vwap_dist = 0.0
     if vwap > 0 and current_price > 0:
         vwap_dist = (current_price - vwap) / vwap
+        if abs(vwap_dist) > 0.08:
+            # Stale/mismatched vwap (e.g. old klines cache): don't classify or
+            # set levels off a reference that far from the live mark.
+            vwap = 0.0
+            vwap_dist = 0.0
 
     atr_pct = (atr / current_price) if current_price > 0 and atr > 0 else 0.01
 
@@ -277,6 +326,15 @@ def classify_buy_thesis(
         invalid_level = current_price * (1.0 - max(0.005, atr_pct * 0.95))
         target_level = current_price * (1.0 + max(0.014, atr_pct * 2.1))
 
+    spread_pct = _safe_float(dd.get("spread_pct"), _safe_float(dd.get("spread"), 0.0))
+    if current_price > 0:
+        invalid_level = floor_invalidation_level(
+            current_price,
+            invalid_level,
+            atr_pct=atr_pct,
+            spread_pct=spread_pct,
+        )
+
     return {
         "setup_type": setup_type,
         "entry_thesis": setup_type,
@@ -316,8 +374,111 @@ def apply_trade_thesis_to_candidate_fields(
         strategy_id=strategy_id,
         price_structure_regime=price_structure_regime,
     )
+    bear = bear_regime_entry_adjustment(
+        dd,
+        setup_type=str(thesis.get("setup_type") or ""),
+        context_payload=context_payload,
+    )
+    thesis["thesis_rank_delta"] = round(
+        float(thesis.get("thesis_rank_delta") or 0.0) + float(bear.get("bear_regime_rank_penalty") or 0.0),
+        4,
+    )
+    thesis["thesis_size_factor"] = round(
+        float(thesis.get("thesis_size_factor") or 1.0) * float(bear.get("bear_regime_size_factor") or 1.0),
+        4,
+    )
+    thesis.update(bear)
     dd.update(thesis)
     return dd
+
+
+def min_invalidation_distance_pct(atr_pct: float, spread_pct: float = 0.0) -> float:
+    """Minimum distance (fraction) below entry before invalidation may count."""
+    rt = float(ESTIMATED_ROUNDTRIP_COST)
+    spread = max(0.0, float(spread_pct or 0.0))
+    slippage_buf = rt * 0.5
+    atr_noise = max(0.008, float(atr_pct or 0.01) * 1.5)
+    return max(0.012, spread * 2.0 + rt + slippage_buf + atr_noise * 0.85)
+
+
+def floor_invalidation_level(
+    entry_price: float,
+    invalid_level: float,
+    *,
+    atr_pct: float,
+    spread_pct: float = 0.0,
+) -> float:
+    """Push invalidation below spread/fee/slippage/ATR noise band."""
+    if entry_price <= 0:
+        return invalid_level
+    min_dist = min_invalidation_distance_pct(atr_pct, spread_pct)
+    floor_level = entry_price * (1.0 - min_dist)
+    if invalid_level > 0:
+        return min(invalid_level, floor_level)
+    return floor_level
+
+
+def bear_regime_entry_adjustment(
+    decision_data: dict[str, Any],
+    *,
+    setup_type: str,
+    context_payload: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    """Penalize weak LTF bounces against 1h/4h bear unless breakout is strong."""
+    dd = decision_data or {}
+    mtf = parse_mtf_json(dd)
+    if context_payload and isinstance(context_payload.get("mtf"), dict):
+        mtf = {**mtf, **context_payload["mtf"]}
+
+    h1 = _tf_align(mtf, "1h") if isinstance(mtf.get("1h"), dict) else None
+    h4 = _tf_align(mtf, "4h") if isinstance(mtf.get("4h"), dict) else None
+    m5 = _tf_align(mtf, "5m") if isinstance(mtf.get("5m"), dict) else None
+    m15 = _tf_align(mtf, "15m") if isinstance(mtf.get("15m"), dict) else None
+
+    rank_pen = 0.0
+    size_mult = 1.0
+    htf_bear = (h1 is not None and h1 < 0.42) and (h4 is not None and h4 < 0.40)
+    ltf_bounce = (m5 is not None and m5 > 0.55) or (m15 is not None and m15 > 0.52)
+    strong_breakout = setup_type == SETUP_BREAKOUT_CONTINUATION and _safe_float(dd.get("thesis_score"), 0.0) >= 0.65
+
+    if htf_bear and ltf_bounce and not strong_breakout:
+        rank_pen = -0.10
+        size_mult = 0.55
+        if setup_type == SETUP_VWAP_REVERSION:
+            rank_pen = -0.14
+            size_mult = 0.40
+
+    return {
+        "bear_regime_rank_penalty": round(rank_pen, 4),
+        "bear_regime_size_factor": round(size_mult, 4),
+    }
+
+
+def canonical_day_exit_reason(exit_trigger: str, *, exit_type_name: str = "") -> str:
+    """Map internal triggers to canonical DAY exit_reason labels."""
+    trig = str(exit_trigger or "").strip().upper()
+    if trig.startswith("EXTREME_PROTECTION"):
+        return EXIT_EXTREME_PROTECTION
+    if trig.startswith("LEGACY_INVENTORY_CLEANUP"):
+        return EXIT_LEGACY_INVENTORY_CLEANUP
+    if trig.startswith(EXIT_NET_PROFIT):
+        return EXIT_NET_PROFIT
+    if "ADMIN" in trig and "CLEAR" in trig:
+        return EXIT_ADMIN_CLEAR
+    if trig.startswith("THESIS_INVALIDATION"):
+        return EXIT_THESIS_WARNING
+    if trig in (
+        EXIT_NET_PROFIT,
+        EXIT_MANUAL,
+        EXIT_ADMIN_CLEAR,
+        EXIT_EXTREME_PROTECTION,
+        EXIT_THESIS_WARNING,
+        EXIT_LEGACY_INVENTORY_CLEANUP,
+    ):
+        return trig
+    if trig == "MANUAL" or exit_type_name == "MANUAL":
+        return EXIT_MANUAL
+    return EXIT_NET_PROFIT
 
 
 def thesis_min_profit_floor(entry_thesis: str, thesis_score: float) -> float:
@@ -332,15 +493,50 @@ def thesis_min_profit_floor(entry_thesis: str, thesis_score: float) -> float:
     return base
 
 
+def _ema_last(closes: list[float], period: int) -> float:
+    if len(closes) < period:
+        return float(closes[-1]) if closes else 0.0
+    k = 2.0 / (period + 1.0)
+    ema = float(closes[0])
+    for v in closes[1:]:
+        ema = float(v) * k + ema * (1.0 - k)
+    return ema
+
+
+def _ohlcv_ema_alignment(rows: list[Any]) -> float | None:
+    """EMA-alignment from raw OHLCV rows; same semantics as
+    ai_market_context._ema_alignment_score: 1.0 EMA9>EMA21>EMA50 (uptrend),
+    0.0 reversed (downtrend), 0.5 chop. None when insufficient bars."""
+    try:
+        closes = [float(r[4]) for r in rows if isinstance(r, (list, tuple)) and len(r) >= 5]
+    except (TypeError, ValueError):
+        return None
+    if len(closes) < 50:
+        return None
+    e9 = _ema_last(closes, 9)
+    e21 = _ema_last(closes, 21)
+    e50 = _ema_last(closes, 50)
+    if e9 > e21 > e50:
+        return 1.0
+    if e9 < e21 < e50:
+        return 0.0
+    return 0.5
+
+
 def _bundle_tf_align(bundle: dict[str, Any] | None, tf: str) -> float | None:
     if not isinstance(bundle, dict):
         return None
     snap = bundle.get(tf)
-    if not isinstance(snap, dict):
-        return None
-    if snap.get("ema_align") not in (None, ""):
-        return _safe_float(snap.get("ema_align"), 0.5)
-    return _safe_float(snap.get("trend"), 0.5)
+    if isinstance(snap, dict):
+        if snap.get("ema_align") not in (None, ""):
+            return _safe_float(snap.get("ema_align"), 0.5)
+        return _safe_float(snap.get("trend"), 0.5)
+    # Day-active hold bundles store raw OHLCV candle lists per timeframe
+    # (see day_active_market_bundle). Without this branch every bundle-based
+    # thesis invalidation condition was unreachable (align always None).
+    if isinstance(snap, list) and snap:
+        return _ohlcv_ema_alignment(snap)
+    return None
 
 
 def thesis_invalidated_live(
@@ -350,10 +546,22 @@ def thesis_invalidated_live(
     invalid_level: float,
     bundle: dict[str, Any] | None,
     entry_vwap: float = 0.0,
+    entry_price: float = 0.0,
+    atr_pct: float = 0.01,
+    spread_pct: float = 0.0,
 ) -> bool:
     if mark <= 0:
         return False
-    if invalid_level > 0 and mark < invalid_level:
+    if entry_price > 0 and invalid_level > 0:
+        eff_invalid = floor_invalidation_level(
+            entry_price,
+            invalid_level,
+            atr_pct=atr_pct,
+            spread_pct=spread_pct,
+        )
+        if mark < eff_invalid:
+            return True
+    elif invalid_level > 0 and mark < invalid_level:
         return True
     if not isinstance(bundle, dict):
         return False
@@ -376,6 +584,41 @@ def thesis_invalidated_live(
     return False
 
 
+def evaluate_extreme_protection(
+    *,
+    entry_price: float,
+    mark: float,
+    net_pnl_pct: float,
+    atr_pct: float = 0.01,
+    bundle: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Catastrophic protection only — not normal candle/thesis noise."""
+    if entry_price <= 0 or mark <= 0:
+        return {"action": "hold", "reason": "no_extreme"}
+
+    loss_floor = max(0.025, float(atr_pct or 0.01) * 2.5)
+    flash_floor = max(0.04, float(atr_pct or 0.01) * 3.0)
+    gross_loss = (entry_price - mark) / entry_price
+
+    h1 = _bundle_tf_align(bundle, "1h") if bundle else None
+    h4 = _bundle_tf_align(bundle, "4h") if bundle else None
+    htf_collapse = h1 is not None and h4 is not None and h1 < 0.28 and h4 < 0.28
+
+    catastrophic = False
+    if net_pnl_pct <= -loss_floor and htf_collapse:
+        catastrophic = True
+    elif gross_loss >= flash_floor and htf_collapse:
+        catastrophic = True
+
+    if catastrophic:
+        return {
+            "action": "sell",
+            "reason": EXIT_EXTREME_PROTECTION,
+            "net_pnl_pct": net_pnl_pct,
+        }
+    return {"action": "hold", "reason": "no_extreme", "net_pnl_pct": net_pnl_pct}
+
+
 def evaluate_thesis_exit(
     *,
     entry_thesis: str,
@@ -396,16 +639,26 @@ def evaluate_thesis_exit(
 
     pnl_pct = (mark - entry_price) / entry_price
     net_pnl = pnl_pct - float(ESTIMATED_ROUNDTRIP_COST)
+    atr_pct = abs(entry_price - thesis_invalid_level) / entry_price if thesis_invalid_level > 0 and entry_price > 0 else 0.01
+    if thesis_invalid_level > 0 and entry_price > 0:
+        atr_pct = max(0.008, (entry_price - thesis_invalid_level) / entry_price)
+
     invalidated = thesis_invalidated_live(
         entry_thesis,
         mark=mark,
         invalid_level=thesis_invalid_level,
         bundle=bundle,
         entry_vwap=entry_vwap,
+        entry_price=entry_price,
+        atr_pct=atr_pct,
     )
 
     if invalidated:
-        return {"action": "sell", "reason": f"THESIS_INVALIDATION_{entry_thesis}", "net_pnl_pct": net_pnl}
+        return {
+            "action": "warn",
+            "reason": f"{EXIT_THESIS_WARNING}_{entry_thesis}",
+            "net_pnl_pct": net_pnl,
+        }
 
     if net_pnl < 0:
         return {"action": "hold", "reason": "THESIS_HOLD_NOISE", "net_pnl_pct": net_pnl}
@@ -413,12 +666,12 @@ def evaluate_thesis_exit(
     target_hit = thesis_target_level > 0 and mark >= thesis_target_level * 0.998
     min_floor = thesis_min_profit_floor(entry_thesis, thesis_score)
     if target_hit and net_pnl >= float(MIN_NET_PROFIT_TO_SELL) * 0.45:
-        return {"action": "sell", "reason": "THESIS_TARGET_HIT", "net_pnl_pct": net_pnl}
+        return {"action": "sell", "reason": EXIT_NET_PROFIT, "net_pnl_pct": net_pnl, "detail": "target_hit"}
 
     if net_pnl >= float(MIN_NET_PROFIT_TO_SELL):
         if thesis_target_level > 0 and mark < thesis_target_level * 0.992 and net_pnl < min_floor:
             return {"action": "hold", "reason": "THESIS_HOLD_AWAIT_TARGET", "net_pnl_pct": net_pnl}
-        return {"action": "sell", "reason": "THESIS_PROFIT_PROTECTION", "net_pnl_pct": net_pnl}
+        return {"action": "sell", "reason": EXIT_NET_PROFIT, "net_pnl_pct": net_pnl, "detail": "profit_floor"}
 
     return {"action": "hold", "reason": "THESIS_HOLD", "net_pnl_pct": net_pnl}
 

@@ -44,8 +44,9 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
-MAKER_FEE: Final[float] = _env_float("MAKER_FEE", 0.0)
-BINANCE_US_MAKER_FEE_PCT: Final[float] = _env_float("BINANCE_US_MAKER_FEE_PCT", MAKER_FEE)
+from backend.config.trading_economics import MAKER_FEE, TAKER_FEE
+
+BINANCE_US_MAKER_FEE_PCT: Final[float] = MAKER_FEE
 
 MAX_ORDERBOOK_SPREAD_PCT: Final[float] = _env_float("MAX_ORDERBOOK_SPREAD_PCT", 0.0005)
 

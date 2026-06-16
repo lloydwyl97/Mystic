@@ -296,13 +296,11 @@ def get_service_logger(service_name: str) -> logging.Logger:
     return setup_service_logging(service_name)
 
 
-# Common service loggers
-backend_logger = get_service_logger("backend")
-ai_logger = get_service_logger("ai_service")
-websocket_logger = get_service_logger("websocket")
-cache_logger = get_service_logger("cache")
-api_logger = get_service_logger("api")
-database_logger = get_service_logger("database")
+# NOTE: do not instantiate module-level service loggers here. A previous
+# `get_service_logger("backend")` call at import time attached a colored
+# StreamHandler to the "backend" logger namespace, so every backend.* record
+# was emitted twice (once via that handler, once via the root handler) in any
+# process that transitively imported this module.
 
 # Default logger for this module
 logger = logging.getLogger(__name__)

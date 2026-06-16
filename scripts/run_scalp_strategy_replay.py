@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import statistics
@@ -10,7 +11,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -20,13 +21,8 @@ sys.path.insert(0, str(REPO))
 os.environ.setdefault("SCALP_LIVE", "false")
 os.environ.setdefault("SCALP_CALIBRATION_MODE", "true")
 os.environ.setdefault("SCALP_PAPER_ENABLED", "true")
-os.environ.setdefault("SCALP_CALIBRATION_PROFILE", "moderate")
 os.environ.setdefault("SCALP_FEE_MODEL_VERIFIED", "true")
 os.environ.setdefault("SCALP_PRODUCTS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")
-os.environ.setdefault(
-    "SCALP_DISABLED_STRATEGIES",
-    "orderbook_tape_scalp,range_bounce_scalp,vwap_ema_reclaim",
-)
 
 from backend.services.binance_scalp.calibration_profiles import (  # noqa: E402
     apply_profile,
@@ -44,13 +40,50 @@ from backend.services.binance_scalp.exit_manager import (  # noqa: E402
 from backend.services.binance_scalp.market_reader import MarketSnapshot  # noqa: E402
 from backend.services.binance_scalp.momentum_tracker import MomentumTracker  # noqa: E402
 from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter  # noqa: E402
-from backend.services.binance_scalp.strategies import ALL_STRATEGIES, enabled_strategies  # noqa: E402
+from backend.services.binance_scalp.strategies import ALL_STRATEGIES, STRATEGY_NAMES, enabled_strategies  # noqa: E402
 
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
-HOURS = 6
 NOTIONAL = 25.0
 STEP_SEC = 60
 LOOKAHEAD_BARS = 8
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Isolated scalp strategy replay")
+    p.add_argument(
+        "--only-strategy",
+        choices=STRATEGY_NAMES,
+        default=None,
+        help="Enable exactly one strategy (ignores SCALP_DISABLED_STRATEGIES env leakage)",
+    )
+    p.add_argument(
+        "--profile",
+        choices=("strict", "moderate", "fast"),
+        default=os.getenv("SCALP_CALIBRATION_PROFILE", "moderate"),
+    )
+    p.add_argument("--hours", type=int, default=int(os.getenv("SCALP_REPLAY_HOURS", "168")))
+    p.add_argument(
+        "--spread-mult",
+        type=float,
+        default=float(os.getenv("SCALP_REPLAY_SPREAD_MULT", "1.0")),
+        help="Multiply synthetic spread estimate for sensitivity tests",
+    )
+    return p.parse_args()
+
+
+def _config_from_args(args: argparse.Namespace) -> ScalpConfig:
+    base = ScalpConfig.from_env()
+    disabled = base.disabled_strategies
+    if args.only_strategy:
+        disabled = frozenset(s for s in STRATEGY_NAMES if s != args.only_strategy)
+    return replace(
+        base,
+        disabled_strategies=disabled,
+        calibration_profile=args.profile,
+        calibration_mode=True,
+        scalp_live=False,
+        scalp_paper_enabled=True,
+    )
 
 
 def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
@@ -112,8 +145,8 @@ def synthetic_book(close: float, spread_pct: float) -> tuple[float, float, float
     return bid, ask, mid, bids, asks
 
 
-def make_snap(symbol: str, bar: dict) -> MarketSnapshot:
-    sp = spread_est(bar)
+def make_snap(symbol: str, bar: dict, *, spread_mult: float = 1.0) -> MarketSnapshot:
+    sp = spread_est(bar) * max(0.5, spread_mult)
     bid, ask, mid, bids, asks = synthetic_book(bar["close"], sp)
     imb = sum(b[1] for b in bids[:8]) / max(sum(a[1] for a in asks[:8]), 1e-9)
     return MarketSnapshot(
@@ -179,6 +212,7 @@ def replay_symbol(
     econ,
     router: ScalpStrategyRouter,
     momentum: MomentumTracker,
+    spread_mult: float = 1.0,
 ) -> tuple[list[dict], dict[str, StrategyStats], int]:
     trades: list[dict] = []
     stats: dict[str, StrategyStats] = {
@@ -191,7 +225,7 @@ def replay_symbol(
     for idx in range(20, len(bars) - LOOKAHEAD_BARS):
         bar = bars[idx]
         epoch = bar["epoch"]
-        snap = make_snap(symbol, bar)
+        snap = make_snap(symbol, bar, spread_mult=spread_mult)
 
         for sub in range(4):
             t = epoch - 45 + sub * 15
@@ -317,7 +351,7 @@ def replay_symbol(
 
     if open_pos is not None:
         bar = bars[-LOOKAHEAD_BARS]
-        snap = make_snap(symbol, bar)
+        snap = make_snap(symbol, bar, spread_mult=spread_mult)
         net_pct = net_pct_at_bid(
             open_pos.entry_price, snap.best_bid, snap.spread_pct, open_pos.impact_pct, econ
         )
@@ -339,12 +373,13 @@ def replay_symbol(
 
 
 def main() -> int:
+    args = _parse_args()
     end = datetime.now(timezone.utc)
-    start = end - timedelta(hours=HOURS)
+    start = end - timedelta(hours=args.hours)
     start_ms = int(start.timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
 
-    config = ScalpConfig.from_env()
+    config = _config_from_args(args)
     assert not config.scalp_live
     econ = economics_for_config(config)
     momentum = MomentumTracker()
@@ -364,7 +399,13 @@ def main() -> int:
         bars = fetch_klines(sym, start_ms, end_ms)
         symbol_bars[sym] = bars
         trades, stats, missed = replay_symbol(
-            sym, bars, config=config, econ=econ, router=router, momentum=momentum
+            sym,
+            bars,
+            config=config,
+            econ=econ,
+            router=router,
+            momentum=momentum,
+            spread_mult=args.spread_mult,
         )
         all_trades.extend(trades)
         by_strategy_symbol[sym] = stats
@@ -430,8 +471,11 @@ def main() -> int:
         }
 
     report = {
-        "replay_hours": HOURS,
+        "replay_hours": args.hours,
         "symbols": list(SYMBOLS),
+        "only_strategy": args.only_strategy,
+        "calibration_profile": args.profile,
+        "spread_mult": args.spread_mult,
         "scalp_live": config.scalp_live,
         "calibration_mode": config.calibration_mode,
         "replay_pass": replay_pass,

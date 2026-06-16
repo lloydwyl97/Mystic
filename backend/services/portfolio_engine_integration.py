@@ -77,7 +77,8 @@ _LEDGER_MTM_PERSIST_INITIAL_DELAY_SEC = 5.0
 # truth in ``backend.config.trading_universe``. Do not hardcode here.
 from backend.config.trading_universe import TOP4_BASE_COINS as _TRACKED_TRADE_BASE_SYMBOLS
 
-_AI_SIGNAL_SELL_ENABLED = os.getenv("AI_SIGNAL_SELL_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+# Canonical DAY sells: monitor_all_positions → _check_exit_conditions → execute_sell_fifo only.
+# Model SELL signals are ranking penalties, never direct execution (see CANONICAL_SYSTEM.md).
 _ENTRY_GATES_ENFORCED = os.getenv("ENTRY_GATES_ENFORCED", "false").strip().lower() in ("1", "true", "yes", "on")
 _ENTRY_MAJOR_ONLY = _ENTRY_GATES_ENFORCED and os.getenv("ENTRY_MAJOR_ONLY", "false").strip().lower() in ("1", "true", "yes", "on")
 _ENTRY_LIQUIDITY_GATE_ENABLED = _ENTRY_GATES_ENFORCED and os.getenv("ENTRY_LIQUIDITY_GATE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
@@ -856,65 +857,10 @@ class PortfolioEngineIntegration:
                             continue
 
                     if side == "sell":
-                        if not _AI_SIGNAL_SELL_ENABLED:
-                            logger.info(
-                                "MODEL_SELL_TELEMETRY: %s model-sell execution disabled -> retained_for_ranking penalty_only",
-                                ccxt_symbol,
-                            )
-                        else:
-                            pos = self.engine.open_positions.get(ccxt_symbol) if self.engine else None
-                            if pos is None or float(getattr(pos, "quantity", 0.0) or 0.0) <= 0:
-                                logger.info(
-                                    "MODEL_SELL_TELEMETRY: %s no open position -> retained_for_ranking penalty_only",
-                                    ccxt_symbol,
-                                )
-                            else:
-                                sell_result = await self.engine.execute_sell_from_signal(
-                                    symbol=ccxt_symbol,
-                                    quantity=float(pos.quantity),
-                                    price=current_price,
-                                    exit_reason="AI_SIGNAL",
-                                )
-                                if sell_result is not None:
-                                    await self._strategy_runtime_audit_row(
-                                        event_type=EVT_SELL_EXECUTED,
-                                        decision_id=decision_id,
-                                        strategy_id=live_ai_strategy,
-                                        symbol=ccxt_symbol,
-                                        redis_signal_key=ks,
-                                        sell_trade_id=str(sell_result.get("trade_id") or sell_result.get("sell_trade_id") or ""),
-                                        exit_reason="AI_SIGNAL",
-                                        exit_type="signal_exit",
-                                        extra_json={
-                                            "qty": float(pos.quantity),
-                                            "price": float(current_price),
-                                        },
-                                    )
-                                    await self._update_pipeline_decision(
-                                        decision_id,
-                                        {"stage": "EXECUTION", "execution_result": "EXECUTED", "execution_reason": "AI_SIGNAL_SELL"},
-                                    )
-                                    with contextlib.suppress(Exception):
-                                        await self.redis_client.set(f"executed:{decision_id}", "1", ex=86400)
-                                else:
-                                    await self._strategy_runtime_audit_row(
-                                        event_type=EVT_SIGNAL_CONSUME,
-                                        decision_id=decision_id,
-                                        reject_reason="AI_SIGNAL_SELL_FAILED",
-                                        strategy_id=live_ai_strategy,
-                                        symbol=ccxt_symbol,
-                                        redis_signal_key=ks,
-                                    )
-                                    await self._update_pipeline_decision(
-                                        decision_id,
-                                        {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": "AI_SIGNAL_SELL_FAILED"},
-                                    )
-                                try:
-                                    await self.redis_client.delete(claimed_key)
-                                except Exception as e:
-                                    logger.debug("SIGNAL_CONSUMER: failed to delete key/claim after SELL handling %s: %s", key, e, exc_info=True)
-                                self._consumed_signal_decision_by_key[ks] = decision_id
-                                continue
+                        logger.info(
+                            "MODEL_SELL_TELEMETRY: %s side=sell -> ranking_penalty_only (DAY exits via monitor loop only)",
+                            ccxt_symbol,
+                        )
 
                     # ARCHITECTURE v2: ML_124_VETO removed — model is authoritative, no re-check.
 

@@ -105,22 +105,35 @@ def test_noise_red_hold_when_thesis_valid():
     assert eval_hold["reason"] == "THESIS_HOLD_NOISE"
 
 
-def test_real_invalidation_cuts():
+def test_real_invalidation_warns_only_no_red_sell():
     eval_cut = evaluate_thesis_exit(
+        entry_thesis=SETUP_HTF_TREND_PULLBACK,
+        thesis_score=0.72,
+        thesis_invalid_level=98.0,
+        thesis_target_level=102.5,
+        entry_vwap=0.0,
+        entry_price=100.0,
+        mark=96.0,
+        bundle={"1h": {"ema_align": 0.7}, "4h": {"ema_align": 0.68}},
+    )
+    assert eval_cut["action"] == "warn"
+    assert "THESIS_INVALIDATION_WARNING_ONLY" in str(eval_cut["reason"])
+
+    eval_weak = evaluate_thesis_exit(
         entry_thesis=SETUP_HTF_TREND_PULLBACK,
         thesis_score=0.72,
         thesis_invalid_level=99.5,
         thesis_target_level=102.5,
         entry_vwap=0.0,
         entry_price=100.0,
-        mark=99.0,
-        bundle={"1h": {"ema_align": 0.7}, "4h": {"ema_align": 0.68}},
+        mark=99.2,
+        bundle={"1h": {"ema_align": 0.30}, "4h": {"ema_align": 0.32}},
     )
-    assert eval_cut["action"] == "sell"
-    assert str(eval_cut["reason"]).startswith("THESIS_INVALIDATION")
+    assert eval_weak["action"] == "warn"
+    assert "THESIS_INVALIDATION_WARNING_ONLY" in str(eval_weak["reason"])
 
 
-def test_profit_near_target_triggers_take_profit():
+def test_profit_near_target_triggers_net_profit_exit():
     target = 101.2
     mark = target
     entry = 100.0
@@ -137,7 +150,7 @@ def test_profit_near_target_triggers_take_profit():
         bundle={"1h": {"ema_align": 0.7}, "4h": {"ema_align": 0.68}},
     )
     assert eval_tp["action"] == "sell"
-    assert eval_tp["reason"] == "THESIS_TARGET_HIT"
+    assert eval_tp["reason"] == "NET_PROFIT_EXIT"
 
 
 def test_no_clear_thesis_ranks_poorly_and_sizes_tiny():

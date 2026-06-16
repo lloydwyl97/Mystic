@@ -1,0 +1,23 @@
+{
+  "baseline_id": "day_baseline_all_pass_v1_size_1_5",
+  "parent_baseline_id": "day_baseline_all_pass_v1",
+  "locked_at": "2026-06-13T12:00:00+00:00",
+  "all_pass": true,
+  "live_applied": true,
+  "change_summary": "Sizing only: 1.5× notional per slot ($3,750), max deployed $15,000 across 4 slots",
+  "rules_unchanged": true,
+  "economics_locked": true,
+  "notional_multiplier": 1.5,
+  "artifact": "day_baseline_all_pass_v1_size_1_5_LOCK.json",
+  "execution_replay": "day_baseline_all_pass_v1_size_1_5_candidate.json",
+  "parent_artifact": "day_baseline_all_pass_v1.json",
+  "live_modifications_forbidden": [
+    "no_revive_killed_buckets",
+    "no_new_blockers",
+    "no_new_modes",
+    "no_exit_floor_change_without_candidate",
+    "neutral_vwap_positive_buckets_only",
+    "range_vwap_btc_eth_xrp_killed",
+    "breakout_pullback_blocked_replay_negative"
+  ]
+}

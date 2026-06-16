@@ -280,40 +280,10 @@ AI_MODEL_REGISTRY: Final[tuple[ModelRegistryEntry, ...]] = (
         ),
     ),
     ModelRegistryEntry(
-        name="lstm_predictor",
-        artifact_filename="lstm_global.pt",
-        role="DEAD_CODE",
-        note=("Permanently non-canonical. Removed from the live decision path on v2 contract finalization. Kept on disk only for ad-hoc research; ai_signal_generator must not import or call it."),
-    ),
-    ModelRegistryEntry(
-        name="transformer_predictor",
-        artifact_filename="transformer_global.pt",
-        role="DEAD_CODE",
-        note="Permanently non-canonical. See lstm_predictor note.",
-    ),
-    ModelRegistryEntry(
-        name="chart_pattern_agent",
-        artifact_filename="(no artifact — heuristic agent)",
-        role="DEAD_CODE",
-        note="Permanently non-canonical. Replaced by ctx_depth_imbalance + MTF dims.",
-    ),
-    ModelRegistryEntry(
         name="fear_greed_predictor",
         artifact_filename="(no artifact — alternative.me API)",
         role="DIRECTIONAL_INPUT",
         note=("Real sentiment signal from alternative.me Fear/Greed Index. Wired into the canonical AI input as ctx_sentiment_fear_greed."),
-    ),
-    ModelRegistryEntry(
-        name="multi_timeframe_confirmation",
-        artifact_filename="(no artifact — heuristic)",
-        role="DEAD_CODE",
-        note="Replaced by mtf_*_trend / mtf_*_slope inputs in feature_v2.",
-    ),
-    ModelRegistryEntry(
-        name="correlation_signal",
-        artifact_filename="(no artifact — heuristic)",
-        role="DEAD_CODE",
-        note="Replaced by ctx_rs_btc / ctx_rs_eth inputs in feature_v2.",
     ),
 )
 

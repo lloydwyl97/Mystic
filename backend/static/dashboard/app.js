@@ -28,6 +28,9 @@ const ENDPOINTS = [
     { path: "/api/ai-diagnostics/full", key: "aiDiagnosticsFull" },
     { path: "/api/ai-diagnostics/missed-opportunities?limit=30", key: "missedOpportunities" },
     { path: "/api/portfolio-engine/day-health", key: "dayHealth" },
+    { path: "/api/ai-diagnostics/learning-health", key: "learningHealth" },
+    { path: "/api/portfolio-engine/trading-economics", key: "tradingEconomics" },
+    { path: "/api/scalp/status", key: "scalpStatus" },
 ];
 
 let chartPortfolio = null;
@@ -550,7 +553,165 @@ function updateUI(key, data) {
         case "dayHealth":
             updateDayHealth(data);
             break;
+        case "learningHealth":
+            updateLearningHealth(data);
+            break;
+        case "tradingEconomics":
+            updateTradingEconomics(data);
+            break;
+        case "scalpStatus":
+            updateScalpEngineStatus(data);
+            break;
     }
+}
+
+/** Scalp engine panel — never mixed into DAY scoreboard or DAY PnL. */
+function updateScalpEngineStatus(res) {
+    const d = res && typeof res === "object" ? res : {};
+    const set = (id, text) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = text != null && text !== "" ? String(text) : "--";
+    };
+    const active = d.runner_active === true;
+    set("eng-scalp-status", active ? "RUNNING" : "STOPPED");
+    const pnl = d.pnl_summary || {};
+    const today = pnl.today || {};
+    const todayPnl = today.realized_pnl_usd != null ? Number(today.realized_pnl_usd) : null;
+    const todayEl = document.getElementById("eng-scalp-pnl");
+    if (todayEl) {
+        todayEl.textContent = todayPnl != null ? "$" + todayPnl.toFixed(2) + " (" + (today.sells || 0) + " sells)" : "--";
+        todayEl.classList.remove("pnl-pos", "pnl-neg");
+        if (todayPnl != null) todayEl.classList.add(todayPnl >= 0 ? "pnl-pos" : "pnl-neg");
+    }
+    if (active) {
+        set("eng-scalp-blocker", (d.overall_decision || "--") + (d.top_blocker ? ": " + d.top_blocker : ""));
+    } else {
+        set("eng-scalp-blocker", d.note || "runner stopped");
+    }
+    window._lastScalpStatus = d;
+    refreshEnginesPanelFromCache();
+}
+
+/** DAY + account slice of engines panel (called from canonical + scoreboard). */
+function refreshEnginesPanelFromCache() {
+    const set = (id, text) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = text != null && text !== "" ? String(text) : "--";
+    };
+    set("eng-day-status", "RUNNING");
+    const canon = window._lastDashboardCanonical || {};
+    const perf = (canon.performance && canon.performance.performance) || {};
+    const risk = canon.risk || {};
+    const eq = perf.total_equity != null ? Number(perf.total_equity) : (risk.total_equity != null ? Number(risk.total_equity) : null);
+    const pr = perf.principal != null ? Number(perf.principal) : null;
+    const eqEl = document.getElementById("eng-account-equity");
+    if (eqEl && eq != null) eqEl.textContent = "$" + eq.toFixed(2);
+    const pnlEl = document.getElementById("eng-account-pnl");
+    if (pnlEl && eq != null && pr != null) {
+        const delta = eq - pr;
+        pnlEl.textContent = (delta >= 0 ? "+" : "") + "$" + delta.toFixed(2);
+        pnlEl.classList.remove("pnl-pos", "pnl-neg");
+        pnlEl.classList.add(delta >= 0 ? "pnl-pos" : "pnl-neg");
+    }
+    const sb = window._lastScoreboardToday || {};
+    const dayPnl = sb.realized_pnl != null ? Number(sb.realized_pnl) : null;
+    const dayEl = document.getElementById("eng-day-pnl");
+    if (dayEl) {
+        dayEl.textContent = dayPnl != null ? "$" + dayPnl.toFixed(2) + " (" + (sb.trades || 0) + " sells)" : "--";
+        dayEl.classList.remove("pnl-pos", "pnl-neg");
+        if (dayPnl != null) dayEl.classList.add(dayPnl >= 0 ? "pnl-pos" : "pnl-neg");
+    }
+    set("eng-day-scoreboard", sb.pass_fail || sb.status || "--");
+}
+
+function updateTradingEconomics(res) {
+    const wrap = res && typeof res === "object" ? res : {};
+    const d = wrap.data || wrap;
+    if (!d || typeof d !== "object") return;
+
+    const set = (id, text) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = text != null && text !== "" ? String(text) : "--";
+    };
+    const pct = (v) => (v != null && !Number.isNaN(Number(v)) ? (Number(v) * 100).toFixed(4) + "%" : "--");
+    const bps = (v) => (v != null && !Number.isNaN(Number(v)) ? Number(v).toFixed(2) + " bps" : "--");
+
+    set("te-exchange", d.exchange || "Binance.US");
+    set("te-maker", pct(d.maker_fee_pct) + " (" + bps(d.maker_fee_bps) + ")");
+    set("te-taker", pct(d.taker_fee_pct) + " (" + bps(d.taker_fee_bps) + ")");
+    set("te-slippage", pct(d.slippage_buffer_pct));
+    set("te-half-spread", pct(d.orderbook_half_spread_estimate_pct));
+    set("te-roundtrip", pct(d.roundtrip_estimated_cost_pct) + " (" + bps(d.roundtrip_estimated_cost_bps) + ")");
+    set("te-fee-date", d.fee_schedule_source_date || "--");
+    set("te-notional-mult", d.day_notional_mult != null ? String(d.day_notional_mult) + "×" : "--");
+    set("te-per-slot", d.day_target_notional_per_slot_usd != null ? "$" + Number(d.day_target_notional_per_slot_usd).toFixed(0) : "--");
+    set("te-max-deployed", d.day_max_deployed_usd != null ? "$" + Number(d.day_max_deployed_usd).toFixed(0) : "--");
+    set("te-baseline-lock", d.baseline_lock_id || "--");
+
+    const ver = d.binance_us_verification || {};
+    const conclusion = ver.conclusion || d.fee_schedule_note || "--";
+    set("te-tier-note", conclusion.length > 80 ? conclusion.slice(0, 77) + "…" : conclusion);
+
+    const pre = document.getElementById("panel-trading-economics-content");
+    if (pre) {
+        try {
+            pre.textContent = JSON.stringify(d, null, 2);
+        } catch (_e) {
+            pre.textContent = String(d);
+        }
+    }
+}
+
+function updateLearningHealth(res) {
+    const wrap = res && typeof res === "object" ? res : {};
+    const d = wrap.data || wrap;
+    if (!d || typeof d !== "object") return;
+
+    const set = (id, text) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = text != null && text !== "" ? String(text) : "--";
+    };
+
+    const t = d.totals || {};
+    set("lh-closed", t.closed_outcome_rows);
+    set("lh-snapshots", t.candidate_snapshots);
+    set("lh-labeled", t.candidate_snapshots_labeled);
+    set("lh-pending", t.candidate_snapshots_pending);
+    set("lh-heartbeats", t.position_heartbeats);
+    set("lh-missed", t.missed_opportunities);
+
+    const warnings = Array.isArray(d.warnings) ? d.warnings : [];
+    const starving = warnings.some((w) => String(w).indexOf("DATA_STARVATION") === 0);
+    set("lh-starvation", starving ? "STARVED" : "OK");
+    set("lh-warnings", warnings.length ? warnings.length + " — " + warnings[0] : "none");
+
+    const tbody = document.getElementById("lh-symbol-rows");
+    if (tbody) {
+        const perSym = d.per_symbol || {};
+        const syms = Object.keys(perSym).sort();
+        if (!syms.length) {
+            tbody.innerHTML = '<tr><td colspan="8">--</td></tr>';
+        } else {
+            tbody.innerHTML = syms
+                .map((sym) => {
+                    const s = perSym[sym] || {};
+                    const promo = s.promotion_ready ? "ready" : s.tiered_fallback_eligible ? "tiered-fallback" : "starved";
+                    return (
+                        "<tr><td>" + sym + "</td><td>" + (s.closed_outcomes ?? "--") +
+                        "</td><td>" + (s.snapshots ?? "--") +
+                        "</td><td>" + (s.labeled_snapshots ?? "--") +
+                        "</td><td>" + (s.heartbeats ?? "--") +
+                        "</td><td>" + (s.model_active_date ?? "--") +
+                        "</td><td>" + promo +
+                        "</td><td>" + (s.last_promotion_event ?? "--") + "</td></tr>"
+                    );
+                })
+                .join("");
+        }
+    }
+
+    const pre = document.getElementById("panel-learning-health-content");
+    if (pre) pre.textContent = JSON.stringify(d, null, 2);
 }
 
 function updateDayHealth(res) {
@@ -812,6 +973,8 @@ function updateDashboardCanonical(res) {
                 "</p>";
         }
     }
+    window._lastDashboardCanonical = d;
+    refreshEnginesPanelFromCache();
 }
 
 // system/health/quick: { status, memory_mb, cpu_percent }
@@ -879,7 +1042,7 @@ function updateScoreboardToday(data) {
     const closedAi = d.closed_ai_trades_today != null ? d.closed_ai_trades_today : d.ai_closed_trades;
     const openBuys = d.open_buys_today != null ? d.open_buys_today : 0;
     el.title =
-        "Strategy diagnostic (not infra health). Closed AI SELLs today: " + (closedAi != null ? closedAi : "?") +
+        "DAY engine scoreboard only (not scalp). Closed AI SELLs today: " + (closedAi != null ? closedAi : "?") +
         ". Open buys today: " + openBuys +
         ". FAIL reflects expectancy/PnL rules after AI closes — stack can still be HEALTHY.";
 
@@ -894,6 +1057,8 @@ function updateScoreboardToday(data) {
     if (status && (String(status).toUpperCase() === "PASS" || String(status).toUpperCase() === "OK")) el.classList.add("pnl-pos");
     else if (status && String(status).toUpperCase() === "FAIL") el.classList.add("pnl-neg");
     else if (status && String(status).toUpperCase() === "PENDING") el.classList.add("pnl-pos");
+    window._lastScoreboardToday = d;
+    refreshEnginesPanelFromCache();
 }
 
 function updateTodayActivity(d) {

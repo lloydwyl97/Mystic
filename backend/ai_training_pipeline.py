@@ -697,6 +697,25 @@ class AITrainingDataPipeline:
         while self.is_running:
             try:
                 await self.collect_training_data()
+
+                # LEARNING INGESTION (starvation fix): forward-label candidate
+                # snapshots (rejected/no-trade/buy) so the learning loop gets
+                # labels from decisions that never became closed trades.
+                try:
+                    from backend.services.ai_learning_ingestion import label_pending_snapshots
+
+                    label_counters = await asyncio.to_thread(label_pending_snapshots)
+                    if label_counters.get("labeled") or label_counters.get("partial"):
+                        logger.info(
+                            "SNAPSHOT_LABELER: scanned=%d labeled=%d partial=%d unlabelable=%d",
+                            label_counters.get("scanned", 0),
+                            label_counters.get("labeled", 0),
+                            label_counters.get("partial", 0),
+                            label_counters.get("unlabelable", 0),
+                        )
+                except Exception as lbl_e:
+                    logger.debug("snapshot labeler skipped: %s", lbl_e)
+
                 # [MYSTIC_CORE_TAG: TELEMETRY_ONLY] Empty-features call only refreshes
                 # ai_learning_stats publish; canonical retrain runs in
                 # _continuous_learning_loop with the populated training_batch.
@@ -1111,6 +1130,25 @@ class AITrainingDataPipeline:
         except (ImportError, ValueError, TypeError, AttributeError) as e:
             logger.exception(f"Error updating learning progress: {e}")
 
+    PER_COIN_CANDIDATE_RETENTION = 10
+
+    def _prune_per_coin_candidates(self, version_dir: Path, strat: str, sym: str) -> None:
+        """Keep only the newest N candidate artifacts per (strategy, symbol).
+
+        Candidates are written every training cycle; without retention the
+        versions dir grows unbounded (observed 11k+ files / 2.1 GB).
+        """
+        try:
+            files = sorted(
+                version_dir.glob(f"{strat}_{sym}_*.pkl"),
+                key=lambda p: p.name,
+                reverse=True,
+            )
+            for stale in files[self.PER_COIN_CANDIDATE_RETENTION :]:
+                stale.unlink(missing_ok=True)
+        except OSError as e:
+            logger.debug("PER_COIN_CANDIDATE_PRUNE failed for %s/%s: %s", strat, sym, e)
+
     async def _prune_old_models(self) -> None:
         """[MYSTIC_CORE_TAG: LEGACY_NOT_LIVE] Targets lightweight/ prefix globs; does not prune models/active/*_direction.pkl."""
         try:
@@ -1358,6 +1396,53 @@ class AITrainingDataPipeline:
                         X_train, X_val = X_sym[:split_idx], X_sym[split_idx:]
                         y_train, y_val = y_sym[:split_idx], y_sym[split_idx:]
                         w_train = w_sym[:split_idx]
+
+                        # Tiered learning ingestion (starvation fix): merge Tier B
+                        # (open-trade MFE/MAE path labels) and Tier C (rejected /
+                        # no-trade forward-return labels) into the TRAIN portion
+                        # only. Validation stays on the Tier A+D mix so accuracy
+                        # and PnL metrics are never contaminated by synthetic rows.
+                        if strat == "day":
+                            try:
+                                from backend.services.ai_learning_ingestion import (
+                                    MAX_TIER_BC_SHARE,
+                                    TIER_B_WEIGHT,
+                                    TIER_C_WEIGHT,
+                                    tier_b_training_rows,
+                                    tier_c_training_rows,
+                                )
+
+                                xb, yb = await asyncio.to_thread(
+                                    tier_b_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim
+                                )
+                                xc, yc = await asyncio.to_thread(
+                                    tier_c_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim
+                                )
+                                tier_x = [*xb, *xc]
+                                tier_y = [*[int(v) for v in yb], *[int(v) for v in yc]]
+                                tier_w = [*([TIER_B_WEIGHT] * len(yb)), *([TIER_C_WEIGHT] * len(yc))]
+                                if tier_x:
+                                    max_rows = int(len(X_train) * MAX_TIER_BC_SHARE / max(1e-9, 1.0 - MAX_TIER_BC_SHARE))
+                                    if len(tier_x) > max_rows > 0:
+                                        tier_x = tier_x[:max_rows]
+                                        tier_y = tier_y[:max_rows]
+                                        tier_w = tier_w[:max_rows]
+                                    if tier_x:
+                                        X_train = np.vstack([X_train, np.asarray(tier_x, dtype=np.float64)])
+                                        y_train = np.concatenate([y_train, np.asarray(tier_y, dtype=np.int64)])
+                                        w_train = np.concatenate([w_train, np.asarray(tier_w, dtype=np.float64)])
+                                        logger.info(
+                                            "TIERED_TRAIN_MERGE: [%s] %s tier_b=%d tier_c=%d merged=%d train_total=%d",
+                                            strat,
+                                            sym,
+                                            len(yb),
+                                            len(yc),
+                                            len(tier_x),
+                                            len(X_train),
+                                        )
+                            except Exception as tier_e:
+                                logger.debug("tiered train merge skipped for %s: %s", sym, tier_e)
+
                         if len(X_val) < 5:
                             logger.info(
                                 "PER_COIN_TRAIN: [%s] %s val set too small (%d), skipping",
@@ -1472,6 +1557,7 @@ class AITrainingDataPipeline:
                         ver_path = version_dir / f"{strat}_{sym}_{ts}.pkl"
                         with ver_path.open("wb") as f:
                             pickle.dump(artifact, f)
+                        promo_state = "promoted"
                         try:
                             from backend.services.ai_model_promotion import register_candidate_and_maybe_promote
                             from backend.services.ai_model_promotion_holdout import build_holdout_validation_metrics
@@ -1500,6 +1586,7 @@ class AITrainingDataPipeline:
                                 validation_metrics=validation_metrics,
                             )
                             if not promoted:
+                                promo_state = f"rejected:{promo_reason}"
                                 logger.info(
                                     "MODEL_PROMOTION_REJECTED: strategy=%s symbol=%s reason=%s",
                                     strat,
@@ -1507,21 +1594,26 @@ class AITrainingDataPipeline:
                                     promo_reason,
                                 )
                         except Exception as promote_err:
+                            promo_state = "fallback_direct_write"
                             logger.warning("MODEL_PROMOTION_FALLBACK: %s/%s (%s) — writing active directly", strat, sym, promote_err)
                             with coin_path.open("wb") as f:
                                 pickle.dump(artifact, f)
                             shutil.copy2(coin_path, ver_path)
+
+                        self._prune_per_coin_candidates(version_dir, strat, sym)
 
                         trained_count += 1
                         acc_sum += acc
                         best_acc = max(best_acc, acc)
                         best_acc_global = max(best_acc_global, acc)
                         logger.info(
-                            "PER_COIN_TRAINED: [%s] %s accuracy=%.4f samples=%d path=%s",
+                            "PER_COIN_TRAINED: [%s] %s accuracy=%.4f samples=%d candidate=%s promotion=%s active=%s",
                             strat,
                             sym,
                             acc,
                             len(X_train),
+                            ver_path.name,
+                            promo_state,
                             str(coin_path),
                         )
 

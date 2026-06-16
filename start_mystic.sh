@@ -1,10 +1,10 @@
 #!/bin/bash
 # MYSTIC startup script
 # Modes:
-#   ./start_mystic.sh full      (recommended — DAY core + scalp paper; desktop shortcut)
-#   ./start_mystic.sh core      (DAY stack only — external supervisor, no duplicates)
+#   ./start_mystic.sh core      (canonical 24/7 — DAY-only top-4, no scalp)
+#   ./start_mystic.sh full      (DAY core + scalp paper — scalp explicitly enabled)
 #   ./start_mystic.sh scalp     (scalp paper runner only — uses running backend/live_md if up)
-#   ./start_mystic.sh all       (legacy agents/cleanup — do not use for 24/7)
+#   ./start_mystic.sh all       (RETIRED — exits with error; use full)
 #   ./start_mystic.sh backend|live_md|signal|portfolio|learning|collector|ai_context|...
 
 set -u
@@ -128,7 +128,14 @@ start_agents() {
 
 start_learning() {
     echo "Starting AI Learning..."
-    nice -n 10 nohup "$PYTHON" start_ai_learning.py > /tmp/mystic_learning.log 2>&1 &
+    # Top-4 historical walk-forward backfill (Tier D depth): sweep all four
+    # coins per collection cycle across the full cached 4h bundle history.
+    nice -n 10 nohup env \
+        DAY_HISTORICAL_TRAIN_BASES="BTC,ETH,SOL,XRP" \
+        DAY_HISTORICAL_TAIL_4H_BARS="480" \
+        DAY_HISTORICAL_ANCHOR_STRIDE="2" \
+        DAY_HISTORICAL_ROWS_PER_COLLECT="160" \
+        "$PYTHON" start_ai_learning.py > /tmp/mystic_learning.log 2>&1 &
     require_running "start_ai_learning.py" "AI Learning" "/tmp/mystic_learning.log" 20 1 || return 1
 }
 
@@ -256,9 +263,10 @@ case "$MODE" in
 
         echo ""
         echo "=========================================="
-        echo "MYSTIC CORE STACK STARTED"
+        echo "MYSTIC CORE STACK STARTED (DAY top-4 + scalp paper)"
         echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
-        echo "Services: Backend + LiveMD + Signal + Portfolio + Context + Learning + Scalp Paper"
+        echo "Services: Backend + LiveMD + Signal + Portfolio + Context + Learning + Scalp"
+        echo "DAY and scalp are separate engines — PnL and scoreboard are not mixed."
         echo "Ensure .env has EXTERNAL_SUPERVISOR_MODE=true"
         echo "=========================================="
         ;;
@@ -306,103 +314,13 @@ case "$MODE" in
         echo "=========================================="
         ;;
     all)
-        echo "Mode: all"
-
-        # ── Pre-deployment correctness gate ───────────────────────────────
-        # Runs sell-path integration test (isolated SQLite, no live Redis).
-        # Aborts startup if trade_state correctness is broken.
-        if [ -f "scripts/run_predeploy_checks.sh" ]; then
-            bash scripts/run_predeploy_checks.sh || {
-                echo "ERROR: Pre-deployment checks failed — startup aborted."
-                exit 1
-            }
-        fi
-        # ─────────────────────────────────────────────────────────────────
-
-        stop_backend
-        stop_collector
-        stop_ai
-        stop_agents
-        stop_portfolio
-        stop_learning
-        stop_ai_context
-        stop_ai_position_tracker
-        stop_ai_outcome_bridge
-        sleep 2
-
-        # Run cleanup only for full restarts.
-        if [ -f "MANDATORY_CLEANUP.py" ]; then
-            echo "Running mandatory cleanup..."
-            "$PYTHON" MANDATORY_CLEANUP.py
-        fi
-
-        # Redis management only in full mode.
-        if ! pgrep -x "redis-server" >/dev/null; then
-            echo "Starting Redis..."
-            if ! sudo service redis-server start; then
-                echo "ERROR: Redis service start command failed"
-                exit 1
-            fi
-            sleep 2
-            if ! pgrep -x "redis-server" >/dev/null; then
-                echo "ERROR: Redis did not start"
-                exit 1
-            fi
-        fi
-
-        start_backend || exit 1
-        sleep 5
-        start_collector || exit 1
-        sleep 2
-        start_ai || exit 1
-        sleep 2
-        start_agents || exit 1
-        sleep 2
-        start_portfolio append || exit 1
-        sleep 2
-        start_learning || exit 1
-        sleep 1
-        start_ai_context || exit 1
-        sleep 1
-
-        # Canonical restart boundary for analysis / audits (LOCAL truth marker)
-        MARKER_JSON="${PWD}/.mystic_restart_marker.json"
-        TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        GIT_HEAD="$("$PYTHON" -c "import subprocess; r=subprocess.run(['git','rev-parse','--short=12','HEAD'],cwd='${PWD}',capture_output=True,text=True); print((r.stdout or 'unknown').strip())" 2>/dev/null || echo unknown)"
-        "$PYTHON" - "$MARKER_JSON" "$TS_UTC" "$GIT_HEAD" <<'PY'
-import json, os, subprocess, sys
-from pathlib import Path
-
-def pid(pat: str) -> int | None:
-    r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
-    if r.returncode != 0 or not (r.stdout or "").strip():
-        return None
-    return int((r.stdout or "").strip().splitlines()[0])
-
-path, ts_utc, git_commit = sys.argv[1], sys.argv[2], sys.argv[3]
-payload = {
-    "ts_utc": ts_utc,
-    "git_commit": git_commit,
-    "hostname": os.uname().nodename,
-    "stack_mode": "all",
-    "pids": {
-        "uvicorn": pid("uvicorn backend.main:app"),
-        "portfolio_engine_integration": pid("start_portfolio_engine_integration.py"),
-        "ai_ml_trading": pid("start_ai_ml_trading.py"),
-        "ai_learning": pid("start_ai_learning.py"),
-        "ai_market_context": pid("start_ai_market_context.py"),
-    },
-}
-Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-PY
-        echo "Restart marker written: ${MARKER_JSON}"
-
-        echo ""
-        echo "=========================================="
-        echo "MYSTIC STARTED SUCCESSFULLY"
-        echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
-        echo "Services: Backend + Collector + AI + Agents + Portfolio + Learning + AI Context"
-        echo "=========================================="
+        echo "ERROR: Mode 'all' is retired. Use './start_mystic.sh full' (recommended) or './start_mystic.sh core'."
+        echo "Legacy agents, start_ai_ml_trading, and MANDATORY_CLEANUP are not part of the supported DAY stack."
+        exit 1
+        ;;
+    ai)
+        echo "ERROR: Mode 'ai' (start_ai_ml_trading) is retired. DAY signals use start_ai_signal_generator.py via full/core stack."
+        exit 1
         ;;
     ai_context)
         echo "Mode: ai_context"
@@ -419,12 +337,6 @@ PY
         stop_portfolio
         sleep 1
         start_portfolio truncate || exit 1
-        ;;
-    ai)
-        echo "Mode: ai"
-        stop_ai
-        sleep 1
-        start_ai || exit 1
         ;;
     learning)
         echo "Mode: learning"
@@ -483,7 +395,7 @@ PY
         echo "=========================================="
         ;;
     *)
-        echo "Usage: $0 [full|core|all|scalp|backend|live_md|signal|portfolio|learning|collector|ai_context|ai]"
+        echo "Usage: $0 [full|core|scalp|backend|live_md|signal|portfolio|learning|collector|ai_context]"
         exit 1
         ;;
 esac

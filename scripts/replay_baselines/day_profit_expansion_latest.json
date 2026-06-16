@@ -1,0 +1,753 @@
+{
+  "generated_at": "2026-06-13T03:14:04.371835+00:00",
+  "active_buckets_only": [
+    [
+      "BTC/USDT",
+      "neutral",
+      "VWAP_REVERSION"
+    ],
+    [
+      "ETH/USDT",
+      "neutral",
+      "VWAP_REVERSION"
+    ],
+    [
+      "SOL/USDT",
+      "neutral",
+      "VWAP_REVERSION"
+    ],
+    [
+      "XRP/USDT",
+      "neutral",
+      "VWAP_REVERSION"
+    ]
+  ],
+  "killed_buckets_unchanged": [
+    [
+      "BTC/USDT",
+      "range",
+      "VWAP_REVERSION"
+    ],
+    [
+      "ETH/USDT",
+      "range",
+      "VWAP_REVERSION"
+    ],
+    [
+      "XRP/USDT",
+      "range",
+      "VWAP_REVERSION"
+    ]
+  ],
+  "live_min_net_profit_floor": 0.004,
+  "pnl_math_explanation": {
+    "principal_usd": 25000.0,
+    "notional_per_slot_usd": 2500.0,
+    "max_slots": 4,
+    "max_deployed_capital_usd": 10000.0,
+    "capital_utilization_note": "DAY uses up to 4\u00d7$2500 = $10k deployed (40% of $25k). Expectancy ~$8/trade is on ~$2500 notional (~0.35%/trade), NOT on full $25k.",
+    "baseline_90d_net_usd": 172.16,
+    "baseline_account_return_90d_pct": 0.6887,
+    "baseline_monthly_on_full_25k_usd": 57.39,
+    "baseline_monthly_if_fully_deployed_10k_usd": 143.47,
+    "trades_90d": 20,
+    "why_not_8_dollars_on_25k": "20 trades \u00d7 $8.61 \u2248 $172 on $25k account = 0.6887% / 90d \u2248 $57.39/month. Low frequency + partial capital deployment, not broken math."
+  },
+  "baseline": {
+    "label": "baseline",
+    "metrics_90d": {
+      "net_pnl_usd": 172.16,
+      "gross_pnl_usd": 183.88,
+      "max_drawdown_pct": 0.323,
+      "worst_intrabar_mae_pct": -0.03388,
+      "avg_intrabar_mae_pct": -0.00882,
+      "avg_hold_hours": 9.5,
+      "longest_hold_hours": 57.5,
+      "expectancy_per_trade_usd": 8.61,
+      "total_trades": 20,
+      "red_thesis_sell_count": 0,
+      "duplicate_attempts": 0
+    },
+    "metrics_30d": {
+      "net_pnl_usd": 75.11,
+      "gross_pnl_usd": 78.94,
+      "max_drawdown_pct": 0.256,
+      "worst_intrabar_mae_pct": -0.03388,
+      "avg_intrabar_mae_pct": -0.01052,
+      "avg_hold_hours": 13.17,
+      "longest_hold_hours": 57.5,
+      "expectancy_per_trade_usd": 12.52,
+      "total_trades": 6,
+      "red_thesis_sell_count": 0,
+      "duplicate_attempts": 0
+    },
+    "wf_test_expectancy_usd": 12.52,
+    "monthly_pnl_usd_on_25k": 57.39,
+    "account_return_90d_pct": 0.6887,
+    "pass": {
+      "30d_net_positive": true,
+      "90d_net_positive": true,
+      "wf_test_positive": true,
+      "no_red_thesis_sells": true,
+      "no_duplicates": true,
+      "max_dd_under_cap": true,
+      "no_fat_tail_holds": true,
+      "worst_mae_ok": true,
+      "all_pass": true
+    }
+  },
+  "sweeps": {
+    "position_size": [
+      {
+        "label": "notional_mult_0.72",
+        "metrics_90d": {
+          "net_pnl_usd": 123.96,
+          "gross_pnl_usd": 132.4,
+          "max_drawdown_pct": 0.232,
+          "worst_intrabar_mae_pct": -0.03388,
+          "avg_intrabar_mae_pct": -0.00882,
+          "avg_hold_hours": 9.5,
+          "longest_hold_hours": 57.5,
+          "expectancy_per_trade_usd": 6.2,
+          "total_trades": 20,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "deployed_notional_per_slot_usd": 1800.0,
+        "max_deployed_usd_4_slots": 7200.0,
+        "monthly_pnl_usd_on_25k": 41.32,
+        "account_return_90d_pct": 0.4958,
+        "pass": {
+          "all_pass": null,
+          "note": "90d-only quick sweep"
+        }
+      },
+      {
+        "label": "notional_mult_1.0",
+        "metrics_90d": {
+          "net_pnl_usd": 172.16,
+          "gross_pnl_usd": 183.88,
+          "max_drawdown_pct": 0.323,
+          "worst_intrabar_mae_pct": -0.03388,
+          "avg_intrabar_mae_pct": -0.00882,
+          "avg_hold_hours": 9.5,
+          "longest_hold_hours": 57.5,
+          "expectancy_per_trade_usd": 8.61,
+          "total_trades": 20,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "deployed_notional_per_slot_usd": 2500.0,
+        "max_deployed_usd_4_slots": 10000.0,
+        "monthly_pnl_usd_on_25k": 57.39,
+        "account_return_90d_pct": 0.6886,
+        "pass": {
+          "all_pass": null,
+          "note": "90d-only quick sweep"
+        }
+      },
+      {
+        "label": "notional_mult_1.25",
+        "metrics_90d": {
+          "net_pnl_usd": 215.2,
+          "gross_pnl_usd": 229.85,
+          "max_drawdown_pct": 0.403,
+          "worst_intrabar_mae_pct": -0.03388,
+          "avg_intrabar_mae_pct": -0.00882,
+          "avg_hold_hours": 9.5,
+          "longest_hold_hours": 57.5,
+          "expectancy_per_trade_usd": 10.76,
+          "total_trades": 20,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "deployed_notional_per_slot_usd": 3125.0,
+        "max_deployed_usd_4_slots": 12500.0,
+        "monthly_pnl_usd_on_25k": 71.73,
+        "account_return_90d_pct": 0.8608,
+        "pass": {
+          "all_pass": null,
+          "note": "90d-only quick sweep"
+        }
+      },
+      {
+        "label": "notional_mult_1.5",
+        "metrics_90d": {
+          "net_pnl_usd": 258.25,
+          "gross_pnl_usd": 275.83,
+          "max_drawdown_pct": 0.484,
+          "worst_intrabar_mae_pct": -0.03388,
+          "avg_intrabar_mae_pct": -0.00882,
+          "avg_hold_hours": 9.5,
+          "longest_hold_hours": 57.5,
+          "expectancy_per_trade_usd": 12.91,
+          "total_trades": 20,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "deployed_notional_per_slot_usd": 3750.0,
+        "max_deployed_usd_4_slots": 15000.0,
+        "monthly_pnl_usd_on_25k": 86.08,
+        "account_return_90d_pct": 1.033,
+        "pass": {
+          "30d_net_positive": true,
+          "90d_net_positive": true,
+          "wf_test_positive": true,
+          "no_red_thesis_sells": true,
+          "no_duplicates": true,
+          "max_dd_under_cap": true,
+          "no_fat_tail_holds": true,
+          "worst_mae_ok": true,
+          "all_pass": true
+        }
+      }
+    ],
+    "net_profit_floor": [
+      {
+        "label": "min_net_profit_0.15pct",
+        "metrics_90d": {
+          "net_pnl_usd": 162.43,
+          "gross_pnl_usd": 174.15,
+          "max_drawdown_pct": 0.323,
+          "worst_intrabar_mae_pct": -0.03388,
+          "avg_intrabar_mae_pct": -0.00882,
+          "avg_hold_hours": 9.2,
+          "longest_hold_hours": 57.5,
+          "expectancy_per_trade_usd": 8.12,
+          "total_trades": 20,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "monthly_pnl_usd_on_25k": 54.14,
+        "account_return_90d_pct": 0.6497,
+        "exits_too_early_signal": false,
+        "pass": {
+          "all_pass": null,
+          "note": "90d-only quick sweep"
+        }
+      },
+      {
+        "label": "min_net_profit_0.25pct",
+        "metrics_90d": {
+          "net_pnl_usd": 168.92,
+          "gross_pnl_usd": 180.64,
+          "max_drawdown_pct": 0.323,
+          "worst_intrabar_mae_pct": -0.03388,
+          "avg_intrabar_mae_pct": -0.00882,
+          "avg_hold_hours": 9.31,
+          "longest_hold_hours": 57.5,
+          "expectancy_per_trade_usd": 8.45,
+          "total_trades": 20,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "monthly_pnl_usd_on_25k": 56.31,
+        "account_return_90d_pct": 0.6757,
+        "exits_too_early_signal": false,
+        "pass": {
+          "all_pass": null,
+          "note": "90d-only quick sweep"
+        }
+      },
+      {
+        "label": "min_net_profit_0.40pct",
+        "metrics_90d": {
+          "net_pnl_usd": 172.16,
+          "gross_pnl_usd": 183.88,
+          "max_drawdown_pct": 0.323,
+          "worst_intrabar_mae_pct": -0.03388,
+          "avg_intrabar_mae_pct": -0.00882,
+          "avg_hold_hours": 9.5,
+          "longest_hold_hours": 57.5,
+          "expectancy_per_trade_usd": 8.61,
+          "total_trades": 20,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "monthly_pnl_usd_on_25k": 57.39,
+        "account_return_90d_pct": 0.6886,
+        "exits_too_early_signal": false,
+        "pass": {
+          "all_pass": null,
+          "note": "90d-only quick sweep"
+        }
+      },
+      {
+        "label": "min_net_profit_0.60pct",
+        "metrics_90d": {
+          "net_pnl_usd": 234.37,
+          "gross_pnl_usd": 245.32,
+          "max_drawdown_pct": 1.191,
+          "worst_intrabar_mae_pct": -0.03388,
+          "avg_intrabar_mae_pct": -0.00876,
+          "avg_hold_hours": 10.85,
+          "longest_hold_hours": 57.75,
+          "expectancy_per_trade_usd": 13.02,
+          "total_trades": 18,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "monthly_pnl_usd_on_25k": 78.12,
+        "account_return_90d_pct": 0.9375,
+        "exits_too_early_signal": true,
+        "pass": {
+          "30d_net_positive": true,
+          "90d_net_positive": true,
+          "wf_test_positive": true,
+          "no_red_thesis_sells": true,
+          "no_duplicates": true,
+          "max_dd_under_cap": true,
+          "no_fat_tail_holds": true,
+          "worst_mae_ok": true,
+          "all_pass": true
+        }
+      },
+      {
+        "label": "min_net_profit_0.80pct",
+        "metrics_90d": {
+          "net_pnl_usd": 235.4,
+          "gross_pnl_usd": 244.71,
+          "max_drawdown_pct": 1.501,
+          "worst_intrabar_mae_pct": -0.12433,
+          "avg_intrabar_mae_pct": -0.017,
+          "avg_hold_hours": 52.6,
+          "longest_hold_hours": 677.5,
+          "expectancy_per_trade_usd": 13.85,
+          "total_trades": 17,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "monthly_pnl_usd_on_25k": 78.47,
+        "account_return_90d_pct": 0.9416,
+        "exits_too_early_signal": true,
+        "pass": {
+          "30d_net_positive": true,
+          "90d_net_positive": true,
+          "wf_test_positive": true,
+          "no_red_thesis_sells": true,
+          "no_duplicates": true,
+          "max_dd_under_cap": true,
+          "no_fat_tail_holds": false,
+          "worst_mae_ok": true,
+          "all_pass": false
+        }
+      },
+      {
+        "label": "min_net_profit_1.00pct",
+        "metrics_90d": {
+          "net_pnl_usd": 259.72,
+          "gross_pnl_usd": 268.57,
+          "max_drawdown_pct": 1.552,
+          "worst_intrabar_mae_pct": -0.12433,
+          "avg_intrabar_mae_pct": -0.02274,
+          "avg_hold_hours": 93.67,
+          "longest_hold_hours": 677.5,
+          "expectancy_per_trade_usd": 16.23,
+          "total_trades": 16,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "monthly_pnl_usd_on_25k": 86.57,
+        "account_return_90d_pct": 1.0389,
+        "exits_too_early_signal": true,
+        "pass": {
+          "30d_net_positive": true,
+          "90d_net_positive": true,
+          "wf_test_positive": true,
+          "no_red_thesis_sells": true,
+          "no_duplicates": true,
+          "max_dd_under_cap": true,
+          "no_fat_tail_holds": false,
+          "worst_mae_ok": true,
+          "all_pass": false
+        }
+      }
+    ],
+    "profit_capture": [
+      {
+        "label": "immediate_exit",
+        "metrics_90d": {
+          "net_pnl_usd": 172.16,
+          "gross_pnl_usd": 183.88,
+          "max_drawdown_pct": 0.323,
+          "worst_intrabar_mae_pct": -0.03388,
+          "avg_intrabar_mae_pct": -0.00882,
+          "avg_hold_hours": 9.5,
+          "longest_hold_hours": 57.5,
+          "expectancy_per_trade_usd": 8.61,
+          "total_trades": 20,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "monthly_pnl_usd_on_25k": 57.39,
+        "account_return_90d_pct": 0.6886,
+        "pass": {
+          "all_pass": null,
+          "note": "90d-only quick sweep"
+        }
+      },
+      {
+        "label": "vwap_hold_after_floor",
+        "metrics_90d": {
+          "net_pnl_usd": 196.35,
+          "gross_pnl_usd": 207.29,
+          "max_drawdown_pct": 1.192,
+          "worst_intrabar_mae_pct": -0.03388,
+          "avg_intrabar_mae_pct": -0.00855,
+          "avg_hold_hours": 10.58,
+          "longest_hold_hours": 58.0,
+          "expectancy_per_trade_usd": 10.91,
+          "total_trades": 18,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "monthly_pnl_usd_on_25k": 65.45,
+        "account_return_90d_pct": 0.7854,
+        "pass": {
+          "all_pass": null,
+          "note": "90d-only quick sweep"
+        }
+      }
+    ],
+    "execution_style": [
+      {
+        "label": "taker_taker",
+        "metrics_90d": {
+          "net_pnl_usd": 172.16,
+          "gross_pnl_usd": 183.88,
+          "max_drawdown_pct": 0.323,
+          "worst_intrabar_mae_pct": -0.03388,
+          "avg_intrabar_mae_pct": -0.00882,
+          "avg_hold_hours": 9.5,
+          "longest_hold_hours": 57.5,
+          "expectancy_per_trade_usd": 8.61,
+          "total_trades": 20,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "monthly_pnl_usd_on_25k": 57.39,
+        "account_return_90d_pct": 0.6886,
+        "pass": {
+          "all_pass": null,
+          "note": "90d-only quick sweep"
+        }
+      },
+      {
+        "label": "maker_entry_taker_exit",
+        "metrics_90d": {
+          "net_pnl_usd": 176.68,
+          "gross_pnl_usd": 186.23,
+          "max_drawdown_pct": 0.323,
+          "worst_intrabar_mae_pct": -0.03388,
+          "avg_intrabar_mae_pct": -0.00875,
+          "avg_hold_hours": 9.5,
+          "longest_hold_hours": 57.5,
+          "expectancy_per_trade_usd": 8.83,
+          "total_trades": 20,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "monthly_pnl_usd_on_25k": 58.89,
+        "account_return_90d_pct": 0.7067,
+        "pass": {
+          "all_pass": null,
+          "note": "90d-only quick sweep"
+        }
+      },
+      {
+        "label": "maker_maker_when_calm",
+        "metrics_90d": {
+          "net_pnl_usd": 189.22,
+          "gross_pnl_usd": 192.9,
+          "max_drawdown_pct": 0.323,
+          "worst_intrabar_mae_pct": -0.03388,
+          "avg_intrabar_mae_pct": -0.00875,
+          "avg_hold_hours": 9.5,
+          "longest_hold_hours": 57.5,
+          "expectancy_per_trade_usd": 9.46,
+          "total_trades": 20,
+          "red_thesis_sell_count": 0,
+          "duplicate_attempts": 0
+        },
+        "monthly_pnl_usd_on_25k": 63.07,
+        "account_return_90d_pct": 0.7569,
+        "pass": {
+          "all_pass": null,
+          "note": "90d-only quick sweep"
+        }
+      }
+    ]
+  },
+  "extended_history": {
+    "days_available": 503,
+    "bull_bear_neutral_opportunities": [
+      {
+        "bucket": "SOL/USDT/range/VWAP_REVERSION",
+        "would_enter": 10,
+        "in_positive_allowlist": false,
+        "killed": false
+      }
+    ],
+    "positive_bucket_opportunities": [],
+    "note": "Non-allowlist opportunities are informational only \u2014 not enabled"
+  },
+  "scalp_and_combined": {
+    "day_baseline_monthly_usd": 57.39,
+    "scalp_90d_net_pnl_usd": 0.0,
+    "scalp_expected_monthly_usd": 0.0,
+    "scalp_max_drawdown_pct": 0.0,
+    "note": "scalp replay (6h calibration): ['breakout_momentum']",
+    "combined_expected_monthly_usd": 57.39,
+    "drawdowns_separate": true
+  },
+  "full_validation": {
+    "baseline": {
+      "label": "baseline",
+      "metrics_90d": {
+        "net_pnl_usd": 172.16,
+        "gross_pnl_usd": 183.88,
+        "max_drawdown_pct": 0.323,
+        "worst_intrabar_mae_pct": -0.03388,
+        "avg_intrabar_mae_pct": -0.00882,
+        "avg_hold_hours": 9.5,
+        "longest_hold_hours": 57.5,
+        "expectancy_per_trade_usd": 8.61,
+        "total_trades": 20,
+        "red_thesis_sell_count": 0,
+        "duplicate_attempts": 0
+      },
+      "metrics_30d": {
+        "net_pnl_usd": 75.11,
+        "gross_pnl_usd": 78.94,
+        "max_drawdown_pct": 0.256,
+        "worst_intrabar_mae_pct": -0.03388,
+        "avg_intrabar_mae_pct": -0.01052,
+        "avg_hold_hours": 13.17,
+        "longest_hold_hours": 57.5,
+        "expectancy_per_trade_usd": 12.52,
+        "total_trades": 6,
+        "red_thesis_sell_count": 0,
+        "duplicate_attempts": 0
+      },
+      "wf_test_expectancy_usd": 12.52,
+      "monthly_pnl_usd_on_25k": 57.39,
+      "account_return_90d_pct": 0.6887,
+      "pass": {
+        "30d_net_positive": true,
+        "90d_net_positive": true,
+        "wf_test_positive": true,
+        "no_red_thesis_sells": true,
+        "no_duplicates": true,
+        "max_dd_under_cap": true,
+        "no_fat_tail_holds": true,
+        "worst_mae_ok": true,
+        "all_pass": true
+      }
+    },
+    "min_net_profit_1.00pct": {
+      "label": "min_net_profit_1.00pct",
+      "metrics_90d": {
+        "net_pnl_usd": 259.72,
+        "gross_pnl_usd": 268.57,
+        "max_drawdown_pct": 1.552,
+        "worst_intrabar_mae_pct": -0.12433,
+        "avg_intrabar_mae_pct": -0.02274,
+        "avg_hold_hours": 93.67,
+        "longest_hold_hours": 677.5,
+        "expectancy_per_trade_usd": 16.23,
+        "total_trades": 16,
+        "red_thesis_sell_count": 0,
+        "duplicate_attempts": 0
+      },
+      "metrics_30d": {
+        "net_pnl_usd": 81.35,
+        "gross_pnl_usd": 84.39,
+        "max_drawdown_pct": 1.41,
+        "worst_intrabar_mae_pct": -0.03388,
+        "avg_intrabar_mae_pct": -0.01668,
+        "avg_hold_hours": 25.69,
+        "longest_hold_hours": 57.75,
+        "expectancy_per_trade_usd": 20.34,
+        "total_trades": 4,
+        "red_thesis_sell_count": 0,
+        "duplicate_attempts": 0
+      },
+      "wf_test_expectancy_usd": 20.34,
+      "monthly_pnl_usd_on_25k": 86.57,
+      "account_return_90d_pct": 1.0389,
+      "pass": {
+        "30d_net_positive": true,
+        "90d_net_positive": true,
+        "wf_test_positive": true,
+        "no_red_thesis_sells": true,
+        "no_duplicates": true,
+        "max_dd_under_cap": true,
+        "no_fat_tail_holds": false,
+        "worst_mae_ok": true,
+        "all_pass": false
+      }
+    },
+    "notional_mult_1.5": {
+      "label": "notional_mult_1.5",
+      "metrics_90d": {
+        "net_pnl_usd": 258.25,
+        "gross_pnl_usd": 275.83,
+        "max_drawdown_pct": 0.484,
+        "worst_intrabar_mae_pct": -0.03388,
+        "avg_intrabar_mae_pct": -0.00882,
+        "avg_hold_hours": 9.5,
+        "longest_hold_hours": 57.5,
+        "expectancy_per_trade_usd": 12.91,
+        "total_trades": 20,
+        "red_thesis_sell_count": 0,
+        "duplicate_attempts": 0
+      },
+      "metrics_30d": {
+        "net_pnl_usd": 112.67,
+        "gross_pnl_usd": 118.4,
+        "max_drawdown_pct": 0.383,
+        "worst_intrabar_mae_pct": -0.03388,
+        "avg_intrabar_mae_pct": -0.01052,
+        "avg_hold_hours": 13.17,
+        "longest_hold_hours": 57.5,
+        "expectancy_per_trade_usd": 18.78,
+        "total_trades": 6,
+        "red_thesis_sell_count": 0,
+        "duplicate_attempts": 0
+      },
+      "wf_test_expectancy_usd": 18.78,
+      "monthly_pnl_usd_on_25k": 86.08,
+      "account_return_90d_pct": 1.033,
+      "pass": {
+        "30d_net_positive": true,
+        "90d_net_positive": true,
+        "wf_test_positive": true,
+        "no_red_thesis_sells": true,
+        "no_duplicates": true,
+        "max_dd_under_cap": true,
+        "no_fat_tail_holds": true,
+        "worst_mae_ok": true,
+        "all_pass": true
+      }
+    },
+    "min_net_profit_0.80pct": {
+      "label": "min_net_profit_0.80pct",
+      "metrics_90d": {
+        "net_pnl_usd": 235.4,
+        "gross_pnl_usd": 244.71,
+        "max_drawdown_pct": 1.501,
+        "worst_intrabar_mae_pct": -0.12433,
+        "avg_intrabar_mae_pct": -0.017,
+        "avg_hold_hours": 52.6,
+        "longest_hold_hours": 677.5,
+        "expectancy_per_trade_usd": 13.85,
+        "total_trades": 17,
+        "red_thesis_sell_count": 0,
+        "duplicate_attempts": 0
+      },
+      "metrics_30d": {
+        "net_pnl_usd": 80.62,
+        "gross_pnl_usd": 83.66,
+        "max_drawdown_pct": 1.368,
+        "worst_intrabar_mae_pct": -0.03388,
+        "avg_intrabar_mae_pct": -0.01643,
+        "avg_hold_hours": 20.12,
+        "longest_hold_hours": 57.75,
+        "expectancy_per_trade_usd": 20.15,
+        "total_trades": 4,
+        "red_thesis_sell_count": 0,
+        "duplicate_attempts": 0
+      },
+      "wf_test_expectancy_usd": 20.15,
+      "monthly_pnl_usd_on_25k": 78.47,
+      "account_return_90d_pct": 0.9416,
+      "pass": {
+        "30d_net_positive": true,
+        "90d_net_positive": true,
+        "wf_test_positive": true,
+        "no_red_thesis_sells": true,
+        "no_duplicates": true,
+        "max_dd_under_cap": true,
+        "no_fat_tail_holds": false,
+        "worst_mae_ok": true,
+        "all_pass": false
+      }
+    },
+    "min_net_profit_0.60pct": {
+      "label": "min_net_profit_0.60pct",
+      "metrics_90d": {
+        "net_pnl_usd": 234.37,
+        "gross_pnl_usd": 245.32,
+        "max_drawdown_pct": 1.191,
+        "worst_intrabar_mae_pct": -0.03388,
+        "avg_intrabar_mae_pct": -0.00876,
+        "avg_hold_hours": 10.85,
+        "longest_hold_hours": 57.75,
+        "expectancy_per_trade_usd": 13.02,
+        "total_trades": 18,
+        "red_thesis_sell_count": 0,
+        "duplicate_attempts": 0
+      },
+      "metrics_30d": {
+        "net_pnl_usd": 74.31,
+        "gross_pnl_usd": 77.35,
+        "max_drawdown_pct": 1.198,
+        "worst_intrabar_mae_pct": -0.03388,
+        "avg_intrabar_mae_pct": -0.01012,
+        "avg_hold_hours": 15.75,
+        "longest_hold_hours": 57.75,
+        "expectancy_per_trade_usd": 18.58,
+        "total_trades": 4,
+        "red_thesis_sell_count": 0,
+        "duplicate_attempts": 0
+      },
+      "wf_test_expectancy_usd": 18.58,
+      "monthly_pnl_usd_on_25k": 78.12,
+      "account_return_90d_pct": 0.9375,
+      "pass": {
+        "30d_net_positive": true,
+        "90d_net_positive": true,
+        "wf_test_positive": true,
+        "no_red_thesis_sells": true,
+        "no_duplicates": true,
+        "max_dd_under_cap": true,
+        "no_fat_tail_holds": true,
+        "worst_mae_ok": true,
+        "all_pass": true
+      }
+    }
+  },
+  "best_passing_variant": {
+    "label": "notional_mult_1.5",
+    "metrics_90d": {
+      "net_pnl_usd": 258.25,
+      "gross_pnl_usd": 275.83,
+      "max_drawdown_pct": 0.484,
+      "worst_intrabar_mae_pct": -0.03388,
+      "avg_intrabar_mae_pct": -0.00882,
+      "avg_hold_hours": 9.5,
+      "longest_hold_hours": 57.5,
+      "expectancy_per_trade_usd": 12.91,
+      "total_trades": 20,
+      "red_thesis_sell_count": 0,
+      "duplicate_attempts": 0
+    },
+    "deployed_notional_per_slot_usd": 3750.0,
+    "max_deployed_usd_4_slots": 15000.0,
+    "monthly_pnl_usd_on_25k": 86.08,
+    "account_return_90d_pct": 1.033,
+    "pass": {
+      "30d_net_positive": true,
+      "90d_net_positive": true,
+      "wf_test_positive": true,
+      "no_red_thesis_sells": true,
+      "no_duplicates": true,
+      "max_dd_under_cap": true,
+      "no_fat_tail_holds": true,
+      "worst_mae_ok": true,
+      "all_pass": true
+    }
+  },
+  "passing_variant_count": 2,
+  "tracebacks": []
+}

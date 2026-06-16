@@ -40,6 +40,28 @@ async def feature_completeness() -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@router.get("/learning-health")
+async def learning_health() -> dict[str, Any]:
+    """Learning ingestion health: closed outcomes, candidate snapshots,
+    heartbeats, forward-label progress, per-symbol promotion readiness."""
+    try:
+        import asyncio
+
+        from backend.services.ai_learning_ingestion import learning_health_summary
+
+        data = await asyncio.to_thread(learning_health_summary)
+        per_sym = data.get("per_symbol") or {}
+        for sym, stats in per_sym.items():
+            closed = int(stats.get("closed_outcomes") or 0)
+            labeled = int(stats.get("labeled_snapshots") or 0)
+            stats["promotion_ready"] = closed >= 20
+            stats["tiered_fallback_eligible"] = labeled >= 40
+        return {"success": True, "data": data}
+    except Exception as exc:
+        logger.exception("learning-health failed: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @router.get("/feature-freshness")
 async def feature_freshness() -> dict[str, Any]:
     try:

@@ -20,8 +20,6 @@ from pydantic import BaseModel
 
 from backend.config.redis_config import get_redis_client, get_shared_redis_async
 from backend.database_schema import DATABASE_PATH
-from backend.services.confidence_normalizer import ConfidenceNormalizer
-from backend.services.live_strategy_contracts import REDIS_ML_SIGNAL_SCAN_PATTERN, parse_canonical_ml_signal_key
 from backend.services.paper_trading_service import get_paper_trading_service
 
 _sleeve_cutover_epoch_cache: int | None = None
@@ -55,12 +53,6 @@ def _ts_after_cutover(ts: str | None, cutover_epoch: int) -> bool:
 
 
 # Optional imports - services may not be available
-try:
-    from backend.utils.redis_helpers import WRITER_ROLES, verify_writer_payload
-except (ImportError, ModuleNotFoundError, AttributeError, ValueError, TypeError, RuntimeError):
-    verify_writer_payload = None  # type: ignore[assignment]
-    WRITER_ROLES = None  # type: ignore[assignment]
-
 try:
     from backend.services.portfolio_engine import (
         get_portfolio_engine,
@@ -418,150 +410,20 @@ async def get_paper_trading_status() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-async def _get_signal_keys_async() -> list[str]:
-    """BUG #4 FIX: Use async Redis client with SCAN instead of sync KEYS."""
-    try:
-        redis_async = get_shared_redis_async()
-        if not redis_async:
-            # Fall back to sync client if async not available (L1: use SCAN not KEYS)
-            def _sync_scan_keys() -> list[str]:
-                redis_sync = get_redis_client()
-                ai_decision_keys = list(redis_sync.scan_iter(match="ai_decision:*", count=100))
-                ai_signal_keys = list(redis_sync.scan_iter(match=REDIS_ML_SIGNAL_SCAN_PATTERN, count=100))
-                return ai_decision_keys + ai_signal_keys
-
-            return await asyncio.to_thread(_sync_scan_keys)
-
-        all_keys: list[str] = []
-
-        # Scan ai_decision:* pattern
-        async for key in redis_async.scan_iter(match="ai_decision:*", count=100):
-            all_keys.append(key)
-
-        # Scan ai_signal:* pattern
-        async for key in redis_async.scan_iter(match=REDIS_ML_SIGNAL_SCAN_PATTERN, count=100):
-            all_keys.append(key)
-
-        return all_keys
-    except Exception as e:
-        logger.warning("Failed to get signal keys with async SCAN: %s, falling back to sync SCAN", e)
-
-        def _sync_scan_keys_fallback() -> list[str]:
-            redis_client = get_redis_client()
-            ai_decision_keys = list(redis_client.scan_iter(match="ai_decision:*", count=100))
-            ai_signal_keys = list(redis_client.scan_iter(match=REDIS_ML_SIGNAL_SCAN_PATTERN, count=100))
-            return ai_decision_keys + ai_signal_keys
-
-        return await asyncio.to_thread(_sync_scan_keys_fallback)
 
 
 @router.post("/process-signals")
 async def process_signals() -> dict[str, Any]:
-    """Scan Redis signal keys only. BUY execution through this endpoint is retired (DAY bar path executes buys)."""
-    try:
-        # Get Redis client - prefer async if available
-        redis_async = get_shared_redis_async()
-        use_async = redis_async is not None
-        redis_client = redis_async if use_async else get_redis_client()
-
-        # Ensure portfolio engine is initialized (paper mode selected by existing config)
-        if get_portfolio_engine is not None and not is_portfolio_engine_initialized():
-            try:
-                from backend.services.portfolio_engine import initialize_portfolio_engine
-
-                await initialize_portfolio_engine()
-            except Exception as init_err:
-                logger.warning("Could not initialize portfolio engine for process-signals: %s", init_err)
-
-        # Process all pending signals from BOTH patterns:
-        # 1. ai_decision:* - Real AI engine decisions (primary)
-        # 2. ai_signal:* - Signal generator (fallback)
-        # BUG #4 FIX: Use async SCAN instead of blocking KEYS
-        all_keys = await _get_signal_keys_async()
-
-        processed = 0
-        trades_executed = 0
-        blocked_by_cooldown = 0
-        skipped_bridge_buy_signals = 0
-
-        for key in all_keys:
-            try:
-                # Extract symbol from either pattern (e.g., "ai_decision:BTCUSDT" -> "BTCUSDT")
-                if key.startswith("ai_decision:"):
-                    symbol = key.replace("ai_decision:", "", 1)
-                else:
-                    _sid, bus = parse_canonical_ml_signal_key(key)
-                    symbol = bus if bus else ""
-                    if not symbol:
-                        continue
-
-                # CRITICAL #3 FIX: Use async Redis client for hgetall
-                if use_async:
-                    signal_data = await redis_async.hgetall(key)
-                else:
-                    signal_data = await asyncio.to_thread(redis_client.hgetall, key)
-
-                # WRITER VALIDATION: Verify payload comes from expected writer
-                if signal_data and verify_writer_payload and WRITER_ROLES:
-                    expected_role = WRITER_ROLES["DECISION_ROUTER"] if key.startswith("ai_decision:") else WRITER_ROLES["AI_SIGNALS"]
-                    if use_async:
-                        valid = verify_writer_payload(expected_role, signal_data, redis_client)
-                    else:
-                        valid = await asyncio.to_thread(verify_writer_payload, expected_role, signal_data, redis_client)
-                    if not valid:
-                        logger.warning(f"[WRITER-VALIDATION] Rejected signal from {key} - invalid writer role")
-                        continue  # Skip this signal
-
-                # Extract decision_id for pipeline tracking
-                decision_id = signal_data.get("decision_id") if signal_data else None
-
-                # BUG #3 FIX: Use centralized MIN_CONFIDENCE threshold; normalize confidence (0-1 or 0-100)
-                min_confidence = float(os.getenv("MIN_CONFIDENCE", "0.50"))
-                raw_gate_conf = signal_data.get("confidence", 0) if signal_data else 0
-                gate_conf = ConfidenceNormalizer.normalize(float(raw_gate_conf) if raw_gate_conf is not None else 0.0)
-                if signal_data and signal_data.get("side") == "buy" and gate_conf >= min_confidence:
-                    # Redis buy bridge removed: PortfolioEngine DAY loop ranks bars and buys via execute_buy_fifo only.
-                    skipped_bridge_buy_signals += 1
-                    if decision_id:
-                        await _update_pipeline_decision(
-                            decision_id,
-                            {"stage": "EXECUTION", "execution_result": "SKIPPED_BRIDGE_DISABLED", "execution_reason": "DAY_ENGINE_BAR_PATH_EXCLUSIVE"},
-                        )
-                    processed += 1
-                    continue
-
-                processed += 1
-
-            except Exception as e:
-                logger.warning(f"Signal processing error for {key}: {e}")
-
-        return {
-            "status": "success",
-            "message": f"Processed {processed} signals, executed {trades_executed} trades, skipped {skipped_bridge_buy_signals} BUY bridge signals, blocked {blocked_by_cooldown} by cooldowns",
-            "signals_processed": processed,
-            "trades_executed": trades_executed,
-            "skipped_bridge_buy_signals": skipped_bridge_buy_signals,
-            "blocked_by_cooldown": blocked_by_cooldown,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    except Exception as e:
-        logger.exception(f"Signal processing failed: {e}")
-        return {
-            "status": "error",
-            "error": str(e),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+    """Retired: Redis buy bridge removed. DAY buys run only via portfolio_engine_integration bar path."""
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "POST /api/paper-trading/process-signals is retired. "
+            "DAY buys execute only through start_portfolio_engine_integration → process_bar_candidates → execute_buy_fifo."
+        ),
+    )
 
 
-async def _update_pipeline_decision(decision_id: str, updates: dict[str, Any]) -> None:
-    """
-    LOW #5 FIX: Update existing pipeline decision with new stage data.
-    Delegates to unified service to avoid code duplication.
-    """
-    from backend.services.pipeline_decision_service import update_pipeline_decision
-
-    await update_pipeline_decision(decision_id, updates)
 
 
 @router.get("/portfolio")
@@ -776,53 +638,16 @@ class PlaceOrderRequest(BaseModel):
 
 @router.post("/orders")
 async def place_paper_order(request: PlaceOrderRequest) -> dict[str, Any]:
-    """Paper SELL via Portfolio Engine. Paper BUY HTTP path is retired (DAY bar-ranked execute_buy_fifo only)."""
-    try:
-        side_upper = str(request.side).strip().upper()
-        symbol = request.symbol.strip()
-
-        if side_upper == "BUY":
-            raise HTTPException(
-                status_code=503,
-                detail="Paper BUY via /orders is disabled. Mystic buys only through the PortfolioEngine DAY bar path (execute_buy_fifo).",
-            )
-
-        if get_portfolio_engine is None or not is_portfolio_engine_initialized():
-            try:
-                from backend.services.portfolio_engine import initialize_portfolio_engine
-
-                await initialize_portfolio_engine()
-            except Exception as init_err:
-                logger.warning("Could not initialize portfolio engine for place_order: %s", init_err)
-
-        engine = get_portfolio_engine() if get_portfolio_engine else None
-        if engine is None:
-            raise HTTPException(status_code=503, detail="Portfolio engine not available")
-
-        price = float(request.price or 0)
-        if price <= 0:
-            raise HTTPException(status_code=400, detail="Price required and must be > 0")
-
-        if side_upper == "SELL":
-            result = await engine.execute_sell_from_signal(
-                symbol=symbol,
-                quantity=request.quantity,
-                price=price,
-                exit_reason=str(request.exit_reason or "MANUAL").strip().upper() or "MANUAL",
-            )
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported side: {request.side}")
-
-        return {
-            "status": "success" if result is not None else "error",
-            "result": result if result is not None else {"success": False, "reason": "ENGINE_BLOCKED"},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    except HTTPException:
-        raise
-    except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError) as e:
-        logger.exception(f"Error placing paper order: {e}")
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    """Retired: no HTTP order placement. DAY trades run only through portfolio_engine integration."""
+    side_upper = str(request.side).strip().upper()
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            f"POST /api/paper-trading/orders ({side_upper}) is retired. "
+            "Mystic does not accept dashboard or HTTP buy/sell orders. "
+            "BUY: bar-ranked execute_buy_fifo. SELL: exit monitor execute_sell_fifo."
+        ),
+    )
 
 
 @router.delete("/orders/{order_id}")

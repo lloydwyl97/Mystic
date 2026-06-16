@@ -534,31 +534,9 @@ async def get_portfolio_status() -> dict[str, Any]:
                 positions,
             )
 
-        # C4: truthful degraded state. A position whose thesis is invalidated
-        # (mark below thesis_invalid_level) but still open means the exit path is
-        # blocked/degraded. Surface it instead of reporting plain HEALTHY/PASS.
+        # C4: underwater thesis with profit-only hold is normal — not degraded.
         try:
-            _mark_by_symbol = {
-                str(p.get("symbol")): float(p.get("current_price") or 0.0)
-                for p in (status.get("open_positions") or [])
-            }
-            _exit_blocked: list[dict[str, Any]] = []
-            for _sym, _pos in (engine.open_positions or {}).items():
-                _invalid = float(getattr(_pos, "thesis_invalid_level", 0.0) or 0.0)
-                _mark = _mark_by_symbol.get(_sym, 0.0)
-                if _invalid > 0.0 and 0.0 < _mark < _invalid:
-                    _exit_blocked.append({
-                        "symbol": _sym,
-                        "entry_thesis": str(getattr(_pos, "entry_thesis", "") or ""),
-                        "mark": _mark,
-                        "thesis_invalid_level": _invalid,
-                    })
-            status["exit_blocked_positions"] = _exit_blocked
-            if _exit_blocked:
-                status["degraded"] = True
-                status["degraded_reason"] = "THESIS_INVALIDATED_NOT_CLOSED"
-                if str(status.get("account_status") or "").upper() == "HEALTHY":
-                    status["account_status"] = "DEGRADED"
+            status["exit_blocked_positions"] = []
         except Exception as e:
             logger.debug("STATUS_DEGRADED_CHECK skipped: %s", e)
 
@@ -1211,6 +1189,67 @@ async def get_execution_protection() -> dict[str, Any]:
         }
     except Exception as e:
         logger.exception("Error getting execution protection state: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/trading-economics")
+async def get_trading_economics_endpoint() -> dict[str, Any]:
+    """Canonical fee/cost model for dashboard (Binance.US Advanced Spot)."""
+    try:
+        from backend.config.binance_us_fee_schedule import verify_top_four_pairs
+        from backend.config.trading_economics import get_trading_economics_display
+        from backend.services.fill_fee_audit import bnb_fee_discount_status, config_fee_override_locations
+
+        display = get_trading_economics_display()
+        verification = await asyncio.to_thread(verify_top_four_pairs)
+        return {
+            "success": True,
+            "data": {
+                **display,
+                "bnb_fee_discount": bnb_fee_discount_status(),
+                "fee_override_locations": config_fee_override_locations(),
+                "binance_us_verification": verification,
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception("Error getting trading economics: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/fill-fee-audit")
+async def get_fill_fee_audit(limit: int = 25) -> dict[str, Any]:
+    """Recent fill-fee accounting audit rows (expected vs actual on SELL)."""
+    try:
+        from backend.services.fill_fee_audit import ensure_fill_fee_audit_table
+
+        ensure_fill_fee_audit_table()
+        lim = max(1, min(int(limit), 200))
+
+        def _fetch() -> list[dict[str, Any]]:
+            conn = sqlite3.connect(DATABASE_PATH, timeout=3)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT id, ts, trade_id, symbol, mode,
+                           expected_fee_usd, actual_fee_usd,
+                           expected_spread_slippage_usd, realized_slippage_usd,
+                           net_pnl_after_actual_fees, fee_delta_usd, slippage_delta_usd,
+                           fee_from_exchange, audit_json
+                    FROM portfolio_engine_fill_fee_audit
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (lim,),
+                ).fetchall()
+                return [dict(r) for r in rows]
+            finally:
+                conn.close()
+
+        data = await asyncio.to_thread(_fetch)
+        return {"success": True, "data": data, "count": len(data)}
+    except Exception as e:
+        logger.exception("Error getting fill-fee audit: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

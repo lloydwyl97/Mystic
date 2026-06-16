@@ -1,0 +1,671 @@
+{
+  "generated_at": "2026-06-13T11:26:04.721948+00:00",
+  "tracebacks": [],
+  "app_running": true,
+  "core_processes": {
+    "uvicorn": true,
+    "portfolio_engine_integration": true,
+    "live_market_data": true,
+    "ai_signal": true
+  },
+  "day_book_clean": true,
+  "day_book_detail": {
+    "open_positions": 0,
+    "duplicate_symbols": [],
+    "orphan_positions": 0
+  },
+  "duplicate_positions": [],
+  "economics_panel": {
+    "exchange": "Binance.US",
+    "maker_fee_pct": 0.0,
+    "taker_fee_pct": 0.0002,
+    "maker_fee_bps": 0.0,
+    "taker_fee_bps": 2.0,
+    "slippage_buffer_pct": 0.0001,
+    "orderbook_half_spread_estimate_pct": 6e-05,
+    "orderbook_full_spread_estimate_pct": 0.00012,
+    "roundtrip_estimated_cost_pct": 0.0006,
+    "roundtrip_estimated_cost_bps": 6.0,
+    "fee_schedule_source_date": "2026-04-21",
+    "fee_schedule_note": "Binance.US Advanced Spot: 0% maker / 0.02% taker universal (Apr 2026). No platform spread; order-book spread + slippage buffer only.",
+    "min_net_profit_to_sell_pct": 0.004,
+    "day_notional_mult": 1.5,
+    "day_base_notional_per_slot_usd": 2500.0,
+    "day_target_notional_per_slot_usd": 3750.0,
+    "day_max_deployed_usd": 15000.0,
+    "day_max_open_slots": 4,
+    "baseline_lock_id": "day_baseline_all_pass_v1_size_1_5",
+    "bnb_fee_discount": {
+      "bnb_fee_discount_enabled": false,
+      "bnb_fee_discount_env": "BINANCE_US_BNB_FEE_DISCOUNT",
+      "config_fee_override_from_account": false,
+      "note": "Mystic uses trading_economics MAKER_FEE/TAKER_FEE unless exchange fill reports actual fee. BNB discount is not wired unless BINANCE_US_BNB_FEE_DISCOUNT=true."
+    },
+    "fee_override_locations": [
+      "fill_fee_audit.record_sell_fill_fee_audit: actual_fee from live_order fee when present",
+      "portfolio_engine._recover_manual_sell_fill_from_exchange: fee_usd from trade history",
+      "live_recovered_close_writer: fee from exchange fill"
+    ],
+    "binance_us_verification": {
+      "exchange": "Binance.US",
+      "verified_at": "2026-06-13T11:26:06.074770+00:00",
+      "fee_schedule_effective_date": "2026-04-21",
+      "sources": [
+        "https://blog.binance.us/zero-fee-trading/ \u2014 Apr 2026: 0% maker / 0.02% taker on ALL Advanced Spot pairs",
+        "https://www.binance.us/fees \u2014 Tier 0 pairs: 0% maker / 0.01% taker (subset; select pairs e.g. BNB/USD)",
+        "GET https://api.binance.us/api/v3/exchangeInfo \u2014 pair status TRADING",
+        "GET https://api.binance.us/api/v3/ticker/bookTicker \u2014 live order-book spread"
+      ],
+      "tier0_rate": {
+        "maker": 0.0,
+        "taker": 0.0001
+      },
+      "universal_rate": {
+        "maker": 0.0,
+        "taker": 0.0002
+      },
+      "pairs": {
+        "BTC/USDT": {
+          "api_symbol": "BTCUSDT",
+          "status": "TRADING",
+          "fee_tier_label": "advanced_spot_universal",
+          "is_tier0_001_taker": false,
+          "maker_fee_pct": 0.0,
+          "taker_fee_pct": 0.0002,
+          "orderbook_half_spread_pct": 6.3e-05,
+          "orderbook_full_spread_pct": 0.000125,
+          "platform_spread": 0.0,
+          "notes": "Advanced Spot: no platform spread per Binance.US fees page. Universal 0.02% taker per Apr 2026 blog (not Tier-0 0.01%)."
+        },
+        "ETH/USDT": {
+          "api_symbol": "ETHUSDT",
+          "status": "TRADING",
+          "fee_tier_label": "advanced_spot_universal",
+          "is_tier0_001_taker": false,
+          "maker_fee_pct": 0.0,
+          "taker_fee_pct": 0.0002,
+          "orderbook_half_spread_pct": 8e-05,
+          "orderbook_full_spread_pct": 0.000161,
+          "platform_spread": 0.0,
+          "notes": "Advanced Spot: no platform spread per Binance.US fees page. Universal 0.02% taker per Apr 2026 blog (not Tier-0 0.01%)."
+        },
+        "SOL/USDT": {
+          "api_symbol": "SOLUSDT",
+          "status": "TRADING",
+          "fee_tier_label": "advanced_spot_universal",
+          "is_tier0_001_taker": false,
+          "maker_fee_pct": 0.0,
+          "taker_fee_pct": 0.0002,
+          "orderbook_half_spread_pct": 0.000147,
+          "orderbook_full_spread_pct": 0.000295,
+          "platform_spread": 0.0,
+          "notes": "Advanced Spot: no platform spread per Binance.US fees page. Universal 0.02% taker per Apr 2026 blog (not Tier-0 0.01%)."
+        },
+        "XRP/USDT": {
+          "api_symbol": "XRPUSDT",
+          "status": "TRADING",
+          "fee_tier_label": "advanced_spot_universal",
+          "is_tier0_001_taker": false,
+          "maker_fee_pct": 0.0,
+          "taker_fee_pct": 0.0002,
+          "orderbook_half_spread_pct": 0.000131,
+          "orderbook_full_spread_pct": 0.000261,
+          "platform_spread": 0.0,
+          "notes": "Advanced Spot: no platform spread per Binance.US fees page. Universal 0.02% taker per Apr 2026 blog (not Tier-0 0.01%)."
+        }
+      },
+      "conclusion": "BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT are Advanced Spot pairs on Binance.US. Under the Apr 2026 universal fee schedule they use 0% maker and 0.02% taker \u2014 NOT the legacy Tier-0 0.01% taker rate. Tier-0 0.01% remains for documented select pairs (e.g. BNB/USD per blog); top-four USDT are universal 0.02%."
+    }
+  },
+  "day_health": {
+    "updated_at_utc": "2026-06-13T11:25:45.565132+00:00",
+    "open_positions_count": 0,
+    "max_open_positions": 4,
+    "slots_available": 4,
+    "cash_balance": 10000.0,
+    "capital_deployable": true,
+    "capital_idle_reason": "CAPITAL_AVAILABLE_AWAITING_BAR_ENTRY",
+    "capital_idle_diagnosis": {
+      "spread_passing_symbols": [
+        "BTCUSDT",
+        "SOLUSDT",
+        "XRPUSDT"
+      ],
+      "spread_blocked_count": 0,
+      "spread_cap_bps": 100.0,
+      "paper_align_with_bar": true,
+      "last_execution_block": null,
+      "trapped_lagging": false
+    },
+    "trapped_position_days_max": 0.0,
+    "basket_signals": [
+      {
+        "symbol": "SOL/USDT",
+        "confidence": 0.7318351800814199,
+        "ctx_rs_btc": 0.05800000000000001,
+        "side": "HOLD",
+        "prob_buy": 0.2934222162349924
+      },
+      {
+        "symbol": "BTC/USDT",
+        "confidence": 0.5927683465040492,
+        "ctx_rs_btc": 0.011199999999999998,
+        "side": "BUY",
+        "prob_buy": 0.5768710293424469
+      },
+      {
+        "symbol": "XRP/USDT",
+        "confidence": 0.5696432236021514,
+        "ctx_rs_btc": 0.007150000000000002,
+        "side": "BUY",
+        "prob_buy": 0.5584393019566367
+      },
+      {
+        "symbol": "ETH/USDT",
+        "confidence": 0.5839832230558744,
+        "ctx_rs_btc": -0.011199999999999998,
+        "side": "HOLD",
+        "prob_buy": 0.43229380094810155
+      }
+    ],
+    "positions": [],
+    "signal_freshness": {
+      "updated_at_utc": "2026-06-13T11:25:45.555837+00:00",
+      "symbols": [
+        {
+          "symbol": "BTCUSDT",
+          "gate_ok": true,
+          "reject_code": null,
+          "context_fresh": "1",
+          "ctx_age_sec": 40.9886,
+          "live_ctx_age_sec": 40.99,
+          "live_ctx_ts_utc": "2026-06-13T11:25:04.565374+00:00",
+          "content_fresh": "1",
+          "max_ctx_age_sec": 180.0,
+          "max_signal_age_sec": 180,
+          "detail": {
+            "feature_version": 5,
+            "max_age_sec": 180.0,
+            "signal_content_age_sec": 0.2500600814819336,
+            "max_signal_age_sec": 180,
+            "audit_present": true
+          }
+        },
+        {
+          "symbol": "ETHUSDT",
+          "gate_ok": true,
+          "reject_code": null,
+          "context_fresh": "1",
+          "ctx_age_sec": 40.9838,
+          "live_ctx_age_sec": 40.98,
+          "live_ctx_ts_utc": "2026-06-13T11:25:04.570750+00:00",
+          "content_fresh": "1",
+          "max_ctx_age_sec": 180.0,
+          "max_signal_age_sec": 180,
+          "detail": {
+            "feature_version": 5,
+            "max_age_sec": 180.0,
+            "signal_content_age_sec": 47.25217056274414,
+            "max_signal_age_sec": 180,
+            "audit_present": true
+          }
+        },
+        {
+          "symbol": "SOLUSDT",
+          "gate_ok": true,
+          "reject_code": null,
+          "context_fresh": "1",
+          "ctx_age_sec": 40.9795,
+          "live_ctx_age_sec": 40.98,
+          "live_ctx_ts_utc": "2026-06-13T11:25:04.575618+00:00",
+          "content_fresh": "1",
+          "max_ctx_age_sec": 180.0,
+          "max_signal_age_sec": 180,
+          "detail": {
+            "feature_version": 5,
+            "max_age_sec": 180.0,
+            "signal_content_age_sec": 45.84584641456604,
+            "max_signal_age_sec": 180,
+            "audit_present": true
+          }
+        },
+        {
+          "symbol": "XRPUSDT",
+          "gate_ok": true,
+          "reject_code": null,
+          "context_fresh": "1",
+          "ctx_age_sec": 40.9962,
+          "live_ctx_age_sec": 41.0,
+          "live_ctx_ts_utc": "2026-06-13T11:25:04.559531+00:00",
+          "content_fresh": "1",
+          "max_ctx_age_sec": 180.0,
+          "max_signal_age_sec": 180,
+          "detail": {
+            "feature_version": 5,
+            "max_age_sec": 180.0,
+            "signal_content_age_sec": 44.16471266746521,
+            "max_signal_age_sec": 180,
+            "audit_present": true
+          }
+        }
+      ],
+      "blocked_count": 0,
+      "blocked_codes": {},
+      "telemetry_only": true
+    },
+    "entry_quality": {
+      "updated_at_utc": "2026-06-13T11:25:45.557553+00:00",
+      "gates": {
+        "require_setup_credit": false,
+        "rs_floor": null,
+        "rs_rank_max": null,
+        "enforced": false
+      },
+      "basket_rs_order": [
+        "SOLUSDT",
+        "XRPUSDT",
+        "BTCUSDT",
+        "ETHUSDT"
+      ],
+      "symbols": [
+        {
+          "symbol": "SOLUSDT",
+          "ctx_rs_btc": 0.05800000000000001,
+          "rs_rank": 1,
+          "rs_would_block": [],
+          "setup_credit_eval_at": "bar_rank"
+        },
+        {
+          "symbol": "XRPUSDT",
+          "ctx_rs_btc": 0.007150000000000002,
+          "rs_rank": 2,
+          "rs_would_block": [],
+          "setup_credit_eval_at": "bar_rank"
+        },
+        {
+          "symbol": "BTCUSDT",
+          "ctx_rs_btc": 0.0,
+          "rs_rank": 3,
+          "rs_would_block": [],
+          "setup_credit_eval_at": "bar_rank"
+        },
+        {
+          "symbol": "ETHUSDT",
+          "ctx_rs_btc": -0.011199999999999998,
+          "rs_rank": 4,
+          "rs_would_block": [],
+          "setup_credit_eval_at": "bar_rank"
+        }
+      ],
+      "rs_blocked_if_enforced_count": 0,
+      "last_bar_evaluation": {
+        "updated_at_utc": "2026-06-12T16:00:06.599435+00:00",
+        "bar_timestamp": 1781280000,
+        "symbol": "XRPUSDT",
+        "gate_ok": true,
+        "reject_code": null,
+        "detail": {
+          "gates": {
+            "require_setup_credit": false,
+            "rs_floor": null,
+            "rs_rank_max": null,
+            "enforced": false
+          },
+          "symbol": "XRPUSDT",
+          "setup_credit": 0.0,
+          "strong_setup": false,
+          "ctx_rs_btc": 0.035250000000000004,
+          "rs_rank": 2,
+          "would_block": [
+            "SETUP_CREDIT_REQUIRED"
+          ],
+          "enforced": false
+        }
+      },
+      "setup_credit_note": "setup_credit and strong_setup evaluated at bar rank on selected candidate",
+      "telemetry_only": true
+    },
+    "entry_reject_summary_7d": [
+      {
+        "reject_reason": "SIGNAL_CONTENT_AGE_EXCEEDED",
+        "count": 25
+      },
+      {
+        "reject_reason": "SIGNAL_CONTENT_TIMESTAMP_PARSE",
+        "count": 3
+      },
+      {
+        "reject_reason": "post_sell_cooldown_ledger_remaining=960s",
+        "count": 2
+      },
+      {
+        "reject_reason": "post_sell_cooldown_ledger_remaining=779s",
+        "count": 2
+      },
+      {
+        "reject_reason": "post_sell_cooldown_ledger_remaining=718s",
+        "count": 2
+      },
+      {
+        "reject_reason": "post_sell_cooldown_ledger_remaining=6s",
+        "count": 2
+      },
+      {
+        "reject_reason": "post_sell_cooldown_ledger_remaining=666s",
+        "count": 2
+      },
+      {
+        "reject_reason": "post_sell_cooldown_ledger_remaining=660s",
+        "count": 2
+      }
+    ],
+    "spread_preflight": {
+      "updated_at_utc": "2026-06-13T11:25:45.563081+00:00",
+      "max_orderbook_spread_pct": 0.0005,
+      "max_bar_spread_pct": 0.01,
+      "effective_paper_spread_pct": 0.01,
+      "effective_paper_spread_bps": 100.0,
+      "paper_align_with_bar": true,
+      "symbols": [
+        {
+          "symbol": "BTCUSDT",
+          "spread_pct": 0.000838,
+          "spread_bps": 8.38,
+          "best_bid": 0.0,
+          "best_ask": 0.0,
+          "source": "orderbook:BTC",
+          "preflight_ok_paper": true,
+          "bar_rank_ok": true
+        },
+        {
+          "symbol": "ETHUSDT",
+          "spread_pct": null,
+          "spread_bps": null,
+          "best_bid": 0.0,
+          "best_ask": 0.0,
+          "source": "missing",
+          "preflight_ok_paper": null,
+          "bar_rank_ok": null
+        },
+        {
+          "symbol": "SOLUSDT",
+          "spread_pct": 0.000442,
+          "spread_bps": 4.42,
+          "best_bid": 0.0,
+          "best_ask": 0.0,
+          "source": "orderbook:SOL",
+          "preflight_ok_paper": true,
+          "bar_rank_ok": true
+        },
+        {
+          "symbol": "XRPUSDT",
+          "spread_pct": 0.002093,
+          "spread_bps": 20.93,
+          "best_bid": 0.0,
+          "best_ask": 0.0,
+          "source": "orderbook:XRP",
+          "preflight_ok_paper": true,
+          "bar_rank_ok": true
+        }
+      ],
+      "spread_passing_symbols": [
+        "BTCUSDT",
+        "SOLUSDT",
+        "XRPUSDT"
+      ],
+      "spread_passing_count": 3,
+      "blocked_by_exec_spread_count": 0,
+      "blocked_by_bar_spread_count": 0,
+      "telemetry_only": false,
+      "note": "Bar rank uses penalty-only; execute_buy preflight hard-blocks on effective_paper_spread_pct"
+    },
+    "last_execution_block": null,
+    "last_bar_skip_reason": null,
+    "telemetry_only": true,
+    "no_auto_sell": true,
+    "no_rotation": true
+  },
+  "current_btc_eth_sol_xrp_ranking": [
+    "SOLUSDT",
+    "XRPUSDT",
+    "BTCUSDT",
+    "ETHUSDT"
+  ],
+  "symbol_signals": {
+    "SOL/USDT": {
+      "side": "HOLD",
+      "confidence": 0.7318351800814199,
+      "prob_buy": 0.2934222162349924
+    },
+    "BTC/USDT": {
+      "side": "BUY",
+      "confidence": 0.5927683465040492,
+      "prob_buy": 0.5768710293424469
+    },
+    "XRP/USDT": {
+      "side": "BUY",
+      "confidence": 0.5696432236021514,
+      "prob_buy": 0.5584393019566367
+    },
+    "ETH/USDT": {
+      "side": "HOLD",
+      "confidence": 0.5839832230558744,
+      "prob_buy": 0.43229380094810155
+    }
+  },
+  "allowed_blocked_per_symbol": {
+    "BTCUSDT": {
+      "gate_ok": true,
+      "reject_code": null,
+      "context_fresh": "1"
+    },
+    "ETHUSDT": {
+      "gate_ok": true,
+      "reject_code": null,
+      "context_fresh": "1"
+    },
+    "SOLUSDT": {
+      "gate_ok": true,
+      "reject_code": null,
+      "context_fresh": "1"
+    },
+    "XRPUSDT": {
+      "gate_ok": true,
+      "reject_code": null,
+      "context_fresh": "1"
+    }
+  },
+  "capital_idle_reason": "CAPITAL_AVAILABLE_AWAITING_BAR_ENTRY",
+  "last_bar_skip_reason": null,
+  "new_day_buys_allowed": true,
+  "dashboard_api_db_match": true,
+  "positions_api": 0,
+  "positions_db": 0,
+  "economics_match": true,
+  "live_sizing": {
+    "day_notional_mult": 1.5,
+    "day_target_notional_per_slot_usd": 3750.0,
+    "day_max_deployed_usd": 15000.0,
+    "baseline_lock_id": "day_baseline_all_pass_v1_size_1_5"
+  },
+  "live_config_matches_1_5_candidate": true,
+  "baseline_lock_active": true,
+  "baseline_lock_file_exists": true,
+  "repair_add_active": true,
+  "btc_range_vwap_blocked": true,
+  "old_red_sell_paths_active": false,
+  "killed_buckets_count": 3,
+  "scalp_isolated": true,
+  "baseline_final_status_exists": true,
+  "baseline_final_status": {
+    "generated_at": "2026-06-13T02:55:18.960568+00:00",
+    "baseline_name": "day_baseline_all_pass_v1",
+    "baseline_lock_file": "BASELINE_LOCK.json",
+    "strategy_rules_hash": "aad4c03529a454b245cc24de",
+    "economics_config": {
+      "exchange": "Binance.US",
+      "maker_fee_pct": 0.0,
+      "taker_fee_pct": 0.0002,
+      "maker_fee_bps": 0.0,
+      "taker_fee_bps": 2.0,
+      "slippage_buffer_pct": 0.0001,
+      "orderbook_half_spread_estimate_pct": 6e-05,
+      "orderbook_full_spread_estimate_pct": 0.00012,
+      "roundtrip_estimated_cost_pct": 0.00072,
+      "roundtrip_estimated_cost_bps": 7.2,
+      "fee_schedule_source_date": "2026-04-21",
+      "fee_schedule_note": "Binance.US Advanced Spot: 0% maker / 0.02% taker universal (Apr 2026). No platform spread; order-book spread + slippage buffer only.",
+      "min_net_profit_to_sell_pct": 0.004,
+      "live_measured_half_spread": {
+        "BTC/USDT": 3e-05,
+        "ETH/USDT": 7.2e-05,
+        "SOL/USDT": 7.5e-05,
+        "XRP/USDT": 0.000132
+      },
+      "top_four_tier0_001_taker": false,
+      "platform_spread": 0.0,
+      "bnb_fee_discount": {
+        "bnb_fee_discount_enabled": false,
+        "bnb_fee_discount_env": "BINANCE_US_BNB_FEE_DISCOUNT",
+        "config_fee_override_from_account": false,
+        "note": "Mystic uses trading_economics MAKER_FEE/TAKER_FEE unless exchange fill reports actual fee. BNB discount is not wired unless BINANCE_US_BNB_FEE_DISCOUNT=true."
+      },
+      "fee_override_locations": [
+        "fill_fee_audit.record_sell_fill_fee_audit: actual_fee from live_order fee when present",
+        "portfolio_engine._recover_manual_sell_fill_from_exchange: fee_usd from trade history",
+        "live_recovered_close_writer: fee from exchange fill"
+      ],
+      "live_config_matches_replay": true
+    },
+    "replay_math": {
+      "accepted_profile": "binance_us_taker",
+      "double_count_warning_active": false,
+      "current_math_path": "fill_based_exit_gate: net_pnl = qty*(sell_fill-entry) - entry_fee - exit_fee; buy_fill/sell_fill embed half-spread+slippage; fees subtracted once; gate uses net_pnl/notional >= MIN_NET_PROFIT_TO_SELL",
+      "legacy_old_replay_profile": "old_replay",
+      "legacy_profile_used_for_pass_criteria": false,
+      "legacy_double_count_removed_from_accepted_path": true,
+      "legacy_stress_gate_note": "old_replay subtracted roundtrip_cost again after fill-adjusted prices (path-dependent; not used for pass)"
+    },
+    "live_config_match": true,
+    "replay_all_pass": true,
+    "high_resolution_all_pass": true,
+    "stress_all_pass": true,
+    "expected_trades_per_month": 6.67,
+    "expected_monthly_pnl_usd_25k": 58.01,
+    "active_allowed_buckets": [
+      {
+        "symbol": "BTC/USDT",
+        "regime": "neutral",
+        "thesis": "VWAP_REVERSION",
+        "trades": 5,
+        "wins": 5,
+        "losses": 0,
+        "win_rate": 1.0,
+        "net_pnl_usd": 44.89,
+        "expectancy_usd": 8.98,
+        "avg_hold_hours": 16.9,
+        "max_hold_hours": 57.5,
+        "max_loss_usd": 0.0,
+        "max_drawdown_usd": 0.0,
+        "avg_mae_pct": 0.0,
+        "avg_mfe_pct": 0.0,
+        "trapped_capital_hours": 0.0,
+        "failed_profit_floor": 0
+      },
+      {
+        "symbol": "ETH/USDT",
+        "regime": "neutral",
+        "thesis": "VWAP_REVERSION",
+        "trades": 5,
+        "wins": 5,
+        "losses": 0,
+        "win_rate": 1.0,
+        "net_pnl_usd": 72.69,
+        "expectancy_usd": 14.54,
+        "avg_hold_hours": 9.3,
+        "max_hold_hours": 41.0,
+        "max_loss_usd": 0.0,
+        "max_drawdown_usd": 0.0,
+        "avg_mae_pct": 0.0,
+        "avg_mfe_pct": 0.0,
+        "trapped_capital_hours": 0.0,
+        "failed_profit_floor": 0
+      },
+      {
+        "symbol": "SOL/USDT",
+        "regime": "neutral",
+        "thesis": "VWAP_REVERSION",
+        "trades": 7,
+        "wins": 7,
+        "losses": 0,
+        "win_rate": 1.0,
+        "net_pnl_usd": 35.79,
+        "expectancy_usd": 5.11,
+        "avg_hold_hours": 4.9,
+        "max_hold_hours": 13.8,
+        "max_loss_usd": 0.0,
+        "max_drawdown_usd": 0.0,
+        "avg_mae_pct": 0.0,
+        "avg_mfe_pct": 0.0,
+        "trapped_capital_hours": 0.0,
+        "failed_profit_floor": 0
+      },
+      {
+        "symbol": "XRP/USDT",
+        "regime": "neutral",
+        "thesis": "VWAP_REVERSION",
+        "trades": 3,
+        "wins": 3,
+        "losses": 0,
+        "win_rate": 1.0,
+        "net_pnl_usd": 20.67,
+        "expectancy_usd": 6.89,
+        "avg_hold_hours": 8.2,
+        "max_hold_hours": 21.0,
+        "max_loss_usd": 0.0,
+        "max_drawdown_usd": 0.0,
+        "avg_mae_pct": 0.0,
+        "avg_mfe_pct": 0.0,
+        "trapped_capital_hours": 0.0,
+        "failed_profit_floor": 0
+      }
+    ],
+    "killed_buckets": [
+      [
+        "BTC/USDT",
+        "range",
+        "VWAP_REVERSION"
+      ],
+      [
+        "ETH/USDT",
+        "range",
+        "VWAP_REVERSION"
+      ],
+      [
+        "XRP/USDT",
+        "range",
+        "VWAP_REVERSION"
+      ]
+    ],
+    "no_red_thesis_sells": true,
+    "no_duplicates": true,
+    "no_repair_adds_baseline_rule": true,
+    "repair_add_enabled_in_code": true,
+    "no_new_blockers": true,
+    "no_new_modes": true,
+    "scalp_isolated": true,
+    "artifacts": {
+      "strategy_baseline": "day_baseline_all_pass_v1.json",
+      "execution_replay": "day_execution_replay_latest.json",
+      "bucket_discovery": "day_bucket_discovery_latest.json"
+    },
+    "90d_metrics_binance_us_taker": {
+      "gross_pnl_usd": 185.76,
+      "total_fees_usd": 11.72,
+      "spread_slippage_impact_usd": 11.42,
+      "net_pnl_usd": 174.0364223245185,
+      "max_drawdown_pct": 0.323
+    }
+  },
+  "all_ready": true
+}

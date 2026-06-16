@@ -48,6 +48,16 @@ except (ImportError, ModuleNotFoundError, AttributeError):
 router = APIRouter()
 logger = get_service_logger("orders")
 
+_ORDER_PLACEMENT_RETIRED_DETAIL = (
+    "HTTP order placement is retired. Mystic DAY trades execute only via "
+    "portfolio_engine integration (execute_buy_fifo / execute_sell_fifo). "
+    "Dashboard is read-only for orders."
+)
+
+
+def _reject_order_placement() -> None:
+    raise HTTPException(status_code=410, detail=_ORDER_PLACEMENT_RETIRED_DETAIL)
+
 
 def get_redis_client() -> Any:
     """Get Redis client."""
@@ -186,57 +196,8 @@ async def create_order(
         alias="Idempotency-Key",
     ),
 ) -> dict[str, Any]:
-    """Create a new order."""
-    t0 = time.perf_counter()
-    # Validate idempotency outside try to avoid TRY301
-    if idempotency_key:
-        key = f"idemp:orders:create:{idempotency_key}"
-        if not _idempotency_guard(redis_client, key, ttl_sec=300):
-            ORDERS_ERRORS_TOTAL.labels(operation="create_order_duplicate").inc()
-            raise HTTPException(status_code=409, detail="Duplicate order request")
-
-    try:
-        order = await order_service.create_order(order_data)
-
-        try:
-            sym = order.get("symbol") or order_data.get("symbol")
-            side = order.get("side") or order_data.get("side")
-            typ = order.get("type") or order_data.get("type")
-
-            if sym and side and typ:
-                ORDERS_CREATED_TOTAL.labels(
-                    symbol=str(sym),
-                    side=str(side).lower(),
-                    type=str(typ).lower(),
-                ).inc()
-        except Exception:
-            pass
-
-        ORDERS_CREATE_LATENCY_SECONDS.observe(time.perf_counter() - t0)
-        _log_info(
-            "Order created",
-            symbol=order.get("symbol"),
-            side=order.get("side"),
-            type=order.get("type"),
-        )
-        return {
-            "status": "success",
-            "order": order,
-            "message": "Order created successfully",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    except HTTPException:
-        ORDERS_CREATE_LATENCY_SECONDS.observe(time.perf_counter() - t0)
-        raise
-    except Exception as e:
-        ORDERS_ERRORS_TOTAL.labels(operation="create_order").inc()
-        ORDERS_CREATE_LATENCY_SECONDS.observe(time.perf_counter() - t0)
-        _log_error(
-            "Error creating order",
-            e,
-            payload_keys=list(order_data.keys()),
-        )
-        raise HTTPException(status_code=500, detail=f"Error creating order: {e}") from e
+    """Retired: order placement is not part of the supported Mystic surface."""
+    _reject_order_placement()
 
 
 @router.get("/api/orders/{order_id}")
@@ -309,49 +270,8 @@ async def place_advanced_order(
     ),
     redis_client: Any = _get_redis_client_dep,
 ) -> dict[str, Any]:
-    """Place an advanced order (OCO, bracket, etc.)."""
-    t0 = time.perf_counter()
-    # Validate idempotency outside try to avoid TRY301
-    if idempotency_key:
-        key = f"idemp:orders:advanced:{idempotency_key}"
-        if not _idempotency_guard(redis_client, key, ttl_sec=300):
-            ORDERS_ERRORS_TOTAL.labels(operation="advanced_order_duplicate").inc()
-            raise HTTPException(
-                status_code=409,
-                detail="Duplicate advanced order request",
-            )
-
-    try:
-        order_type = order_data.get("type", "market")
-        advanced_order = await order_service.create_advanced_order(order_data)
-
-        ADV_ORDERS_CREATE_LATENCY_SECONDS.observe(time.perf_counter() - t0)
-        _log_info(
-            "Advanced order created",
-            type=order_type,
-            symbol=advanced_order.get("symbol"),
-        )
-        return {
-            "status": "success",
-            "message": (f"Advanced {order_type} order placed successfully"),
-            "order": advanced_order,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    except HTTPException:
-        ADV_ORDERS_CREATE_LATENCY_SECONDS.observe(time.perf_counter() - t0)
-        raise
-    except Exception as e:
-        ORDERS_ERRORS_TOTAL.labels(operation="advanced_order").inc()
-        ADV_ORDERS_CREATE_LATENCY_SECONDS.observe(time.perf_counter() - t0)
-        _log_error(
-            "Error placing advanced order",
-            e,
-            payload_keys=list(order_data.keys()),
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error placing advanced order: {e}",
-        ) from e
+    """Retired: order placement is not part of the supported Mystic surface."""
+    _reject_order_placement()
 
 
 # ============================================================================
@@ -579,54 +499,5 @@ async def place_order(
         alias="Idempotency-Key",
     ),
 ) -> dict[str, Any]:
-    """Place order endpoint for dashboard UI."""
-    t0 = time.perf_counter()
-    # Validate idempotency outside try to avoid TRY301
-    if idempotency_key:
-        key = f"idemp:orders:place:{idempotency_key}"
-        if not _idempotency_guard(redis_client, key, ttl_sec=300):
-            ORDERS_ERRORS_TOTAL.labels(operation="place_order_duplicate").inc()
-            raise HTTPException(status_code=409, detail="Duplicate order request")
-
-    try:
-        order = await order_service.create_order(order_data)
-
-        try:
-            sym = order.get("symbol") or order_data.get("symbol")
-            side = order.get("side") or order_data.get("side")
-            typ = order.get("type") or order_data.get("type")
-
-            if sym and side and typ:
-                ORDERS_CREATED_TOTAL.labels(
-                    symbol=str(sym),
-                    side=str(side).lower(),
-                    type=str(typ).lower(),
-                ).inc()
-        except Exception:
-            pass
-
-        ORDERS_CREATE_LATENCY_SECONDS.observe(time.perf_counter() - t0)
-        _log_info(
-            "Order placed (compat)",
-            symbol=order.get("symbol"),
-            side=order.get("side"),
-            type=order.get("type"),
-        )
-        return {
-            "status": "success",
-            "order": order,
-            "message": "Order placed successfully",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    except HTTPException:
-        ORDERS_CREATE_LATENCY_SECONDS.observe(time.perf_counter() - t0)
-        raise
-    except Exception as e:
-        ORDERS_ERRORS_TOTAL.labels(operation="place_order").inc()
-        ORDERS_CREATE_LATENCY_SECONDS.observe(time.perf_counter() - t0)
-        _log_error(
-            "Error placing order",
-            e,
-            payload_keys=list(order_data.keys()),
-        )
-        raise HTTPException(status_code=500, detail=f"Error placing order: {e}") from e
+    """Retired: order placement is not part of the supported Mystic surface."""
+    _reject_order_placement()

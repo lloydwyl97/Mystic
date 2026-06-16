@@ -1,0 +1,61 @@
+{
+  "updated_at": "2026-06-14T23:30:00+00:00",
+  "live_floor": "day_baseline_all_pass_v1_size_1_5",
+  "live_promoted": false,
+  "target_monthly_usd": 500,
+  "breakthrough": {
+    "what": "all_weather_momentum_engine",
+    "lab": "scripts/run_allweather_strategy_lab.py",
+    "report": "scripts/replay_baselines/allweather_strategy_lab_latest.json",
+    "root_causes_fixed": [
+      "old edge was a hold-time artifact (held losers up to 483 days until market recovered); under honest <=72h hold it was -$229 over 3yr",
+      "old thesis engine only ever emitted VWAP mean-reversion; bull/breakout setups never fired",
+      "mean-reversion proven net-negative (18.5% win, -$26.78/trade) -> removed"
+    ],
+    "validated_result_verified_fee_0p02_taker": {
+      "1_5x_monthly_usd": 980.04,
+      "2_0x_monthly_usd": 1306.72,
+      "2_5x_monthly_usd": 1633.4,
+      "win_rate_pct": 52.0,
+      "months_positive_frac": 0.919,
+      "recent_12mo_all_positive": true,
+      "bounded_hold_hours": 72,
+      "long_only_spot_downtrend": "no longs, capital preserved"
+    },
+    "edge_setups": ["BREAKOUT (primary, 57.8% win)", "TREND_PULLBACK (secondary)"],
+    "fee_sensitivity_1_5x": {
+      "taker_2bp_verified": 980.04,
+      "taker_10bp": 624.95,
+      "taker_20bp": 181.0,
+      "taker_40bp_retail": -996.7,
+      "note": "Top-four USDT verified at 0.02% taker / 0% maker (binance_us_fee_schedule.py). Maker entries can cut entry cost further."
+    }
+  },
+  "exhausted_research_branches": [
+    "ltf_hand_coded_patterns",
+    "controlled_risk_bracket_exits",
+    "frequency_first_regime_remap",
+    "ai_label_proxy_buckets",
+    "universe_expansion_label_proxy",
+    "scalp_profit_contribution",
+    "hand_coded_replay_entry_filters_vwap_reclaim_15m_etc",
+    "neutral_vwap_mean_reversion_infinite_hold_illusion"
+  ],
+  "excluded_symbols": ["BNB/USD", "BNB/USDT"],
+  "active_research_path": "scripts/run_allweather_strategy_lab.py",
+  "promotion_gate": "backend/services/replay_promotion_gate.py",
+  "remaining_before_live": [
+    "formal walk-forward train/test split confirmation (low overfit risk: fixed rules, no fitted params)",
+    "paper-trading the all-weather engine alongside live baseline for confirmation",
+    "explicit user authorization to wire into portfolio_engine",
+    "decide maker-entry execution to cut entry taker cost"
+  ],
+  "rules": [
+    "execution replay required for any promotion",
+    "honest bounded hold (<=72h) required; no infinite-hold illusion",
+    "label proxy never promotes live",
+    "scalp isolated from profit expectation (loses under verified fees + 30m hold)",
+    "top-four remains live safety floor until promotion authorized",
+    "no new hand-coded pattern names beyond validated breakout/trend-pullback"
+  ]
+}

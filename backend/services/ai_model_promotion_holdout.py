@@ -241,6 +241,67 @@ def evaluate_artifact_on_holdout(
     }
 
 
+MIN_TIERED_HOLDOUT_SAMPLES = 40
+
+
+def _tiered_holdout_comparison(
+    *,
+    strategy_id: str,
+    symbol_bus: str,
+    candidate_path: Path,
+    active_path: Path | None,
+    feature_dim: int,
+    feature_version: int,
+    db_path: str = DATABASE_PATH,
+) -> dict[str, Any]:
+    """Tier C synthetic holdout (labeled candidate snapshots) for promotion fallback."""
+    out: dict[str, Any] = {"tiered_holdout": {}, "tiered_holdout_pass": False}
+    try:
+        from backend.services.ai_learning_ingestion import tiered_holdout_eval_rows
+
+        xs, ys = tiered_holdout_eval_rows(
+            strategy_id=strategy_id,
+            symbol=symbol_bus,
+            feature_dim=feature_dim,
+            min_feature_version=feature_version,
+            db_path=db_path,
+        )
+    except Exception:
+        return out
+    if len(xs) < MIN_TIERED_HOLDOUT_SAMPLES:
+        out["tiered_holdout"] = {"sample_count": len(xs), "status": "INSUFFICIENT"}
+        return out
+
+    X = np.asarray(xs, dtype=np.float64)
+    y = np.asarray(ys, dtype=np.int64)
+
+    def _acc(path: Path | None) -> float | None:
+        if path is None or not path.exists():
+            return None
+        art = _load_artifact(path)
+        if art is None:
+            return None
+        try:
+            preds = np.asarray(art["model"].predict(art["scaler"].transform(X)), dtype=np.int64).reshape(-1)
+            return float(np.mean(preds == y))
+        except Exception:
+            return None
+
+    c_acc = _acc(candidate_path)
+    a_acc = _acc(active_path)
+    out["tiered_holdout"] = {
+        "status": "OK",
+        "source": "ai_candidate_snapshots_tier_c",
+        "sample_count": int(len(y)),
+        "buy_label_count": int(np.sum(y == 1)),
+        "candidate_accuracy": round(c_acc, 6) if c_acc is not None else None,
+        "active_accuracy": round(a_acc, 6) if a_acc is not None else None,
+    }
+    if c_acc is not None and (a_acc is None or c_acc >= a_acc):
+        out["tiered_holdout_pass"] = True
+    return out
+
+
 def build_holdout_validation_metrics(
     *,
     strategy_id: str,
@@ -282,6 +343,22 @@ def build_holdout_validation_metrics(
     }
     if rf_val_samples is not None:
         base["rf_val_samples"] = int(rf_val_samples)
+
+    # Tiered fallback (Tier C): when real closed-trade holdout is too scarce,
+    # evaluate candidate vs active on labeled rejected/no-trade forward-return
+    # rows. Classification accuracy only — never mixed into real PnL metrics.
+    if holdout_low_confidence:
+        base.update(
+            _tiered_holdout_comparison(
+                strategy_id=sid,
+                symbol_bus=bus,
+                candidate_path=candidate_path,
+                active_path=active_path,
+                feature_dim=int(feature_dim),
+                feature_version=int(feature_version),
+                db_path=db_path,
+            )
+        )
 
     if holdout_count < MIN_HOLDOUT_SAMPLES:
         return base
