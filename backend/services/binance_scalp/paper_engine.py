@@ -226,7 +226,24 @@ class BinanceScalpPaperEngine:
 
         _, epoch = self._now()
         notional = min(self.config.max_notional_paper, float(self._ledger(conn)["cash_balance"]))
-        ranked = self._router.evaluate_all(epoch=epoch, notional_usd=notional)
+
+        # When the signal engine flag is on (default for paper), go through the
+        # clean facade. For v1 this still uses the router + existing gate/strategies
+        # but gives us a single place to swap in future lab-validated entry logic
+        # (exactly parallel to how the day all-weather engine replaced the old router
+        # when ALLWEATHER_ENGINE_ENABLED=true).
+        ranked: list[dict] = []
+        try:
+            from backend.services.binance_scalp import scalp_signal_engine as _se
+            if _se.scalp_signal_engine_enabled():
+                ranked = _se.entry_candidates(epoch=epoch, notional_usd=notional) or []
+                if ranked:
+                    logger.debug("SCALP_ENTRY via signal_engine (flag on)")
+        except Exception:
+            ranked = []
+
+        if not ranked:
+            ranked = self._router.evaluate_all(epoch=epoch, notional_usd=notional) or []
 
         for row in ranked:
             sym = row["symbol"]
@@ -666,21 +683,54 @@ class BinanceScalpPaperEngine:
             track.stale_review_count == 0
             or (epoch - last_review_epoch) >= review_interval
         )
-        review = evaluate_exit(
-            track=track,
-            snap=snap,
-            mom=mom,
-            econ=self.econ,
-            config=self.config,
-            trade_id=trade_id,
-            hold_sec=age,
-            executable_net_pct=net_pct,
-            profit_hit=profit_hit,
-            exit_spread_ok=exit_spread_ok,
-            perform_review=perform_review,
-        )
+        # Route exit decision through the signal engine when the flag is on.
+        # v1 delegates to the same evaluate_exit (strong bounded logic already present:
+        # profit target after costs, setup invalidation, momentum failed, hard max hold).
+        # Future lab-validated exit rules (or adjusted thresholds) can live in the engine.
+        review = None
+        try:
+            from backend.services.binance_scalp import scalp_signal_engine as _se
+            if _se.scalp_signal_engine_enabled():
+                ed = _se.exit_decision(
+                    track_row=row,
+                    snap=snap,
+                    mom=mom,
+                    hold_sec=age,
+                    executable_net_pct=net_pct,
+                    profit_hit=profit_hit,
+                    exit_spread_ok=exit_spread_ok,
+                    perform_review=perform_review,
+                )
+                if ed and ed.get("decision") == "SELL":
+                    # synthesize a minimal review object the rest of the method expects
+                    class _R: pass
+                    review = _R()
+                    review.decision = "SELL"
+                    review.reason = ed.get("reason") or "SIGNAL_ENGINE_SELL"
+                    review.exit_reason = ed.get("exit_reason") or review.reason
+                    review.diagnostics = ed.get("diagnostics") or {}
+                    review.updated_track = ed.get("updated_track") or track
+                else:
+                    review = None  # fall through to direct evaluate below if not sell
+        except Exception:
+            review = None
 
-        if perform_review or review.decision == DECISION_SELL:
+        if review is None:
+            review = evaluate_exit(
+                track=track,
+                snap=snap,
+                mom=mom,
+                econ=self.econ,
+                config=self.config,
+                trade_id=trade_id,
+                hold_sec=age,
+                executable_net_pct=net_pct,
+                profit_hit=profit_hit,
+                exit_spread_ok=exit_spread_ok,
+                perform_review=perform_review,
+            )
+
+        if perform_review or getattr(review, "decision", None) == DECISION_SELL:
             self._record_position_review(conn, trade_id=trade_id, sym=sym, review_diag=review.diagnostics)
 
         self._persist_position_track(
@@ -784,16 +834,44 @@ class BinanceScalpPaperEngine:
             return
         self.config.assert_no_live_trading()
         armed = is_entry_armed(self._redis, prefix=self.config.redis_key_prefix)
+        try:
+            from backend.services.binance_scalp import scalp_signal_engine as _se
+            engine_on = _se.scalp_signal_engine_enabled()
+        except Exception:
+            engine_on = False
         logger.info(
             "Binance scalp paper loop products=%s max_open=%s interval=%ss "
-            "paper_only=True live_blocked=True calibration=%s profile=%s entry_armed=%s",
+            "paper_only=True live_blocked=True calibration=%s profile=%s entry_armed=%s "
+            "signal_engine=%s",
             self.config.products,
             self.config.max_open_positions,
             interval_sec,
             self.config.calibration_mode,
             self.config.calibration_profile if self.config.calibration_mode else "strict",
             armed if not self.config.calibration_mode else "auto",
+            engine_on,
         )
+
+        # Warm the in-memory MomentumTracker so the first real ticks are not
+        # immediately rejected with MOMENTUM_DATA_INSUFFICIENT / history < 30s.
+        # Mirrors the explicit warm used by /api/scalp/status diagnostics.
+        # After this the engine can evaluate breakout_momentum (and other enabled
+        # strategies) with real 15/30/60s rising checks and the full entry gate.
+        warm_rounds = 12
+        warm_interval = 5.0
+        logger.info(
+            "SCALP_WARMING momentum for %s (~%ss history for confirmed checks)",
+            self.config.products,
+            int(warm_rounds * warm_interval),
+        )
+        for _ in range(warm_rounds):
+            for sym in self.config.products:
+                snap = self.reader.read(sym)
+                if snap:
+                    self._record_momentum(snap)
+            time.sleep(warm_interval)
+        logger.info("SCALP_WARM complete — now evaluating entries with bounded exits (net-profit / momentum-fail / setup-invalid / hard max-hold)")
+
         try:
             while True:
                 try:

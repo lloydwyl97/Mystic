@@ -80,7 +80,11 @@ class ScalpConfig:
                 for s in (
                     os.getenv(
                         "SCALP_DISABLED_STRATEGIES",
-                        "orderbook_tape_scalp,range_bounce_scalp,vwap_ema_reclaim",
+                        # Default empty for paper runs so all researched strategies
+                        # (breakout_momentum + the three others explored in phase3/4
+                        # replays) can participate. Set the env var explicitly to
+                        # disable any on this local paper instance if desired.
+                        "",
                     )
                     or ""
                 ).split(",")
