@@ -16,7 +16,7 @@ DB = REPO / "mystic_trading.db"
 API = "http://127.0.0.1:8000"
 
 sys.path.insert(0, str(REPO))
-from scripts.monitor_metrics import fetch_json  # noqa: E402
+from scripts.monitor_metrics import fetch_json
 
 
 def _parse_thesis(raw: str | None) -> dict:
@@ -94,9 +94,7 @@ def open_positions_from_db() -> list[dict]:
 def pnl_reconciliation() -> dict:
     conn = sqlite3.connect(DB)
     try:
-        ledger = conn.execute(
-            "SELECT realized_pnl FROM portfolio_engine_ledger WHERE id=1"
-        ).fetchone()
+        ledger = conn.execute("SELECT realized_pnl FROM portfolio_engine_ledger WHERE id=1").fetchone()
         ledger_r = float(ledger[0] or 0) if ledger else 0.0
         paper_all = float(
             conn.execute(

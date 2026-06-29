@@ -561,7 +561,10 @@ async def trade_pnl_hist() -> Any:
             try:
                 conn = sqlite3.connect(DATABASE_PATH)
                 cur = conn.execute(
-                    "SELECT pnl FROM paper_trades WHERE UPPER(side) = 'SELL' AND pnl IS NOT NULL AND COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR') ORDER BY timestamp DESC LIMIT 500"
+                    "SELECT pnl FROM paper_trades WHERE UPPER(side) = 'SELL' AND pnl IS NOT NULL "
+                    "AND COALESCE(exit_type, '') NOT IN "
+                    "('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR') "
+                    "ORDER BY timestamp DESC LIMIT 500"
                 )
                 for row in cur.fetchall():
                     if row[0] is not None:

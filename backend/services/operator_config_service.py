@@ -54,12 +54,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def get_max_open_positions() -> int:
     file_env = _read_env_file()
-    raw = (
-        os.getenv("MAX_OPEN_POSITIONS")
-        or os.getenv("MAX_POSITIONS")
-        or file_env.get("MAX_OPEN_POSITIONS")
-        or file_env.get("MAX_POSITIONS")
-    )
+    raw = os.getenv("MAX_OPEN_POSITIONS") or os.getenv("MAX_POSITIONS") or file_env.get("MAX_OPEN_POSITIONS") or file_env.get("MAX_POSITIONS")
     try:
         return max(1, int(raw)) if raw else _DEFAULT_MAX_OPEN
     except (TypeError, ValueError):

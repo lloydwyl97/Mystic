@@ -87,21 +87,9 @@ def compute_from_tick_changes(
         breakout = 0.0
 
     min_up = int(os.getenv("SCALP_MOMENTUM_MIN_UP_TICKS", "2"))
-    breakout_confirmed = (
-        trend_30 > 0
-        and trend_60 > 0
-        and up_tick_count >= min_up
-        and breakout >= trend_30 * 0.20
-    )
+    breakout_confirmed = trend_30 > 0 and trend_60 > 0 and up_tick_count >= min_up and breakout >= trend_30 * 0.20
 
-    momentum_gross = (
-        0.25 * trend_30
-        + 0.20 * trend_60
-        + 0.15 * trend_15
-        + 0.15 * breakout
-        + 0.10 * _positive(realized_volatility_pct)
-        + 0.15 * _positive(recent_range_pct)
-    )
+    momentum_gross = 0.25 * trend_30 + 0.20 * trend_60 + 0.15 * trend_15 + 0.15 * breakout + 0.10 * _positive(realized_volatility_pct) + 0.15 * _positive(recent_range_pct)
     if trend_60 > trend_30 > 0:
         momentum_gross += 0.10 * (trend_60 - trend_30)
 
@@ -237,14 +225,8 @@ def compute_from_1m_bars(
         p0, p1 = float(bars[j]["close"]), float(bars[j + 1]["close"])
         if p0 > 0:
             rets.append((p1 - p0) / p0)
-    realized_vol = (
-        (sum(r * r for r in rets) / len(rets)) ** 0.5 if rets else 0.0
-    )
-    up = sum(
-        1
-        for j in range(idx - 5, idx)
-        if float(bars[j + 1]["close"]) > float(bars[j]["close"])
-    )
+    realized_vol = (sum(r * r for r in rets) / len(rets)) ** 0.5 if rets else 0.0
+    up = sum(1 for j in range(idx - 5, idx) if float(bars[j + 1]["close"]) > float(bars[j]["close"]))
     return compute_from_tick_changes(
         mid=mid,
         bid_change_15s=mid15,

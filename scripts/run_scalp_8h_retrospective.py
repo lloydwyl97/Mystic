@@ -9,13 +9,13 @@ import statistics
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
+from backend.services.binance_scalp.economics import ScalpEconomics
 
 HOURS = 8
 THRESHOLDS = [0.0030, 0.0035, 0.0040, 0.0045]
@@ -26,10 +26,7 @@ def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
     bars: list[dict] = []
     cursor = start_ms
     while cursor < end_ms:
-        url = (
-            f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m"
-            f"&startTime={cursor}&endTime={end_ms}&limit=1000"
-        )
+        url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m&startTime={cursor}&endTime={end_ms}&limit=1000"
         proc = subprocess.run(
             ["curl", "-s", "--max-time", "30", url],
             capture_output=True,
@@ -79,19 +76,8 @@ def momentum_pass(bars: list[dict], idx: int) -> tuple[bool, dict]:
     mid15 = chg(b0["close"], b1["close"])
     mid30 = chg(b0["close"], b2["close"])
     bid15, bid30 = mid15, mid30
-    up = sum(
-        1
-        for j in range(idx - 5, idx)
-        if j >= 1 and bars[j]["close"] > bars[j - 1]["close"]
-    )
-    ok = (
-        bid15 >= 0.00003
-        and mid15 >= 0.00003
-        and bid30 > 0
-        and mid30 > 0
-        and up >= 3
-        and not (abs(mid15) <= 0.00002 and abs(bid15) <= 0.00002)
-    )
+    up = sum(1 for j in range(idx - 5, idx) if j >= 1 and bars[j]["close"] > bars[j - 1]["close"])
+    ok = bid15 >= 0.00003 and mid15 >= 0.00003 and bid30 > 0 and mid30 > 0 and up >= 3 and not (abs(mid15) <= 0.00002 and abs(bid15) <= 0.00002)
     return ok, {
         "mid_change_15s": mid15,
         "mid_change_30s": mid30,
@@ -164,7 +150,7 @@ def analyze_symbol(symbol: str, bars: list[dict], econ: ScalpEconomics) -> dict:
         s = sorted(favs)
         if not s:
             return 0.0
-        k = int(round((p / 100) * (len(s) - 1)))
+        k = round((p / 100) * (len(s) - 1))
         return s[k] * 100
 
     exceed = {f"{int(t * 10000) / 100}%": sum(1 for f in favs if f >= t) for t in THRESHOLDS}
@@ -185,21 +171,9 @@ def analyze_symbol(symbol: str, bars: list[dict], econ: ScalpEconomics) -> dict:
         "windows_exceeding_gross_threshold": exceed,
         "profit_target_reachable_windows": sum(1 for w in windows if w["profit_hit"]),
         "avg_spread_pct": statistics.mean(spreads) * 100 if spreads else 0,
-        "spread_cap_pass_pct": round(
-            100 * sum(1 for w in windows if w["spread_ok"]) / n, 1
-        )
-        if n
-        else 0,
-        "momentum_pass_pct": round(
-            100 * sum(1 for w in windows if w["mom_ok"]) / n, 1
-        )
-        if n
-        else 0,
-        "phase3d_gate_block_pct": round(
-            100 * sum(1 for w in windows if w["gate_block"]) / n, 1
-        )
-        if n
-        else 0,
+        "spread_cap_pass_pct": round(100 * sum(1 for w in windows if w["spread_ok"]) / n, 1) if n else 0,
+        "momentum_pass_pct": round(100 * sum(1 for w in windows if w["mom_ok"]) / n, 1) if n else 0,
+        "phase3d_gate_block_pct": round(100 * sum(1 for w in windows if w["gate_block"]) / n, 1) if n else 0,
         "gate_blocked_would_have_won": len(missed_profit),
         "best_window": best,
         "best_missed_scalp": missed_profit[0] if missed_profit else best,

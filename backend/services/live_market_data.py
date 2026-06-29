@@ -157,6 +157,9 @@ class LiveMarketDataService:
         self._ticker_cache: dict[str, dict] = {}  # key: "BTC/USDT"
         self._ohlcv_cache: dict[str, list] = {}  # key: "BTC/USDT" (1m loop cache)
         self._ohlcv_tf_cache: dict[tuple[str, str, int], tuple[float, list]] = {}
+        self._ohlcv_fetch_failures: int = 0
+        self._ohlcv_fetch_success: int = 0
+        self._ohlcv_stale_fallback_used: int = 0
         self._ticker_idx = 0
         self._ohlcv_idx = 0
         self._limiter: BinanceWeightLimiter | None = None
@@ -538,22 +541,64 @@ class LiveMarketDataService:
         *,
         end_time_ms: int | None = None,
     ) -> list | None:
+        meta = await self.get_ohlcv_with_meta(ccxt_symbol, timeframe, limit, end_time_ms=end_time_ms)
+        return meta.get("rows")
+
+    async def get_ohlcv_with_meta(
+        self,
+        ccxt_symbol: str,
+        timeframe: str = "1m",
+        limit: int = 300,
+        *,
+        end_time_ms: int | None = None,
+    ) -> dict[str, Any]:
         """
-        Return raw OHLCV (list of lists) for a ccxt symbol and timeframe.
-        Compatible with backtester & feature ingestor callers:
-            await service.get_ohlcv("BTC-USDT", "1m", limit=1)
+        Return OHLCV rows plus fetch diagnostics for observability / eval-error separation.
         """
         s = _to_ccxt_symbol(ccxt_symbol)
         cache_key = self._ohlcv_cache_key(s, timeframe, limit)
-        # Use httpx for direct Binance API calls instead of ccxt
+        symbol = ccxt_symbol.replace("/", "").replace("-", "")
+        url = f"{self.base_url}/klines"
+        endpoint = f"GET {url}"
+        retry_count = 0
+        error_type: str | None = None
+        used_cache = False
+        recovered = False
+
+        def _fail_payload(err: str | None = None) -> dict[str, Any]:
+            stale = self._stale_ohlcv_fallback(cache_key)
+            if stale is not None:
+                self._ohlcv_stale_fallback_used += 1
+                self._ohlcv_fetch_success += 1
+                return {
+                    "rows": stale,
+                    "used_cache": True,
+                    "retry_count": retry_count,
+                    "error_type": err,
+                    "endpoint": endpoint,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "recovered": True,
+                    "kline_fetch_failed": False,
+                }
+            self._ohlcv_fetch_failures += 1
+            return {
+                "rows": None,
+                "used_cache": False,
+                "retry_count": retry_count,
+                "error_type": err,
+                "endpoint": endpoint,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "recovered": False,
+                "kline_fetch_failed": True,
+            }
+
         try:
             if canonical_http_client is None:
                 logger.warning("canonical_http_client not available")
-                return self._stale_ohlcv_fallback(cache_key)
+                return _fail_payload("canonical_http_client_unavailable")
 
-            # Convert symbol format and make direct API call
-            symbol = ccxt_symbol.replace("/", "").replace("-", "")
-            url = f"{self.base_url}/klines"
             params: dict[str, Any] = {"symbol": symbol, "interval": timeframe, "limit": limit}
             if end_time_ms is not None:
                 params["endTime"] = max(0, int(end_time_ms))
@@ -567,36 +612,59 @@ class LiveMarketDataService:
             )
             data = await canonical_http_client.get_json(url, params=params)
 
-            # Convert to ccxt format
             ohlcv = []
             for kline in data:
                 ohlcv.append(
                     [
-                        int(kline[0]),  # timestamp
-                        float(kline[1]),  # open
-                        float(kline[2]),  # high
-                        float(kline[3]),  # low
-                        float(kline[4]),  # close
-                        float(kline[5]),  # volume
+                        int(kline[0]),
+                        float(kline[1]),
+                        float(kline[2]),
+                        float(kline[3]),
+                        float(kline[4]),
+                        float(kline[5]),
                     ],
                 )
         except (RateLimitedError, CircuitOpenError) as e:
-            stale = self._stale_ohlcv_fallback(cache_key)
-            if stale is not None:
-                return stale
+            error_type = type(e).__name__
             logger.warning("Rate limited getting ohlcv for %s: %s", s, e)
-            return None
+            return _fail_payload(error_type)
+        except (OSError, httpx.HTTPError) as e:
+            error_type = type(e).__name__
+            logger.warning("Network error getting ohlcv for %s %s: %s", s, timeframe, e)
+            return _fail_payload(error_type)
         except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError) as e:
-            # Handle API key errors gracefully
             if "Invalid Api-Key ID" in str(e) or "API-key format invalid" in str(e):
-                logger.warning(f"[WARNING] OHLCV data unavailable for {s}: API key issue - {e}")
+                logger.warning("[WARNING] OHLCV data unavailable for %s: API key issue - %s", s, e)
                 logger.info("[INFO] Note: OHLCV data requires valid Binance US API credentials")
             else:
-                logger.exception(f"get_ohlcv failed {s} {timeframe} limit={limit}: {e}")
-            return None
+                logger.exception("get_ohlcv failed %s %s limit=%s: %s", s, timeframe, limit, e)
+            return _fail_payload(type(e).__name__)
         else:
             self._store_ohlcv_cache(cache_key, ohlcv)
-            return ohlcv
+            self._ohlcv_fetch_success += 1
+            return {
+                "rows": ohlcv,
+                "used_cache": used_cache,
+                "retry_count": retry_count,
+                "error_type": None,
+                "endpoint": endpoint,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "recovered": recovered,
+                "kline_fetch_failed": False,
+            }
+
+    def get_ohlcv_fetch_stats(self) -> dict[str, Any]:
+        total = self._ohlcv_fetch_success + self._ohlcv_fetch_failures
+        fail_rate = (self._ohlcv_fetch_failures / total) if total else 0.0
+        alert = fail_rate > float(os.getenv("BINANCE_KLINE_FETCH_FAIL_ALERT_RATE", "0.05")) and total >= 20
+        return {
+            "fetch_success": self._ohlcv_fetch_success,
+            "fetch_failures": self._ohlcv_fetch_failures,
+            "stale_fallback_used": self._ohlcv_stale_fallback_used,
+            "failure_rate": round(fail_rate, 4),
+            "alert_threshold_exceeded": alert,
+        }
 
     # ---------------- used by other services / UI ----------------
 

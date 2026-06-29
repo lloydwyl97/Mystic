@@ -42,7 +42,12 @@
     "neutral_vwap_mean_reversion_infinite_hold_illusion"
   ],
   "excluded_symbols": ["BNB/USD", "BNB/USDT"],
-  "active_research_path": "scripts/run_allweather_strategy_lab.py",
+  "active_research_path": "spot_long_vs_short_research + regime_matrix + short_side_research_harness (research only, current-market waiting is not validation)",
+  "new_research_artifacts": [
+    "scripts/replay_baselines/spot_long_vs_short_research_latest.json (required hard decision report)",
+    "scripts/replay_baselines/run_short_side_research.py",
+    "scripts/replay_baselines/run_regime_matrix.py"
+  ],
   "promotion_gate": "backend/services/replay_promotion_gate.py",
   "remaining_before_live": [
     "formal walk-forward train/test split confirmation (low overfit risk: fixed rules, no fitted params)",

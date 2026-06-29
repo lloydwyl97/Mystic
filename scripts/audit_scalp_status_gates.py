@@ -11,15 +11,15 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.config import get_scalp_config  # noqa: E402
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
-from backend.services.binance_scalp.market_reader import ScalpMarketReader, fetch_depth_sync  # noqa: E402
-from backend.services.binance_scalp.momentum_tracker import MomentumTracker  # noqa: E402
-from backend.services.binance_scalp.momentum_gross_estimate import compute_momentum_gross_estimate  # noqa: E402
-from backend.services.binance_scalp.orderbook_book import walk_buy_notional, walk_sell_qty  # noqa: E402
-from backend.services.binance_scalp.protected_preflight import run_scalp_preflight  # noqa: E402
-from backend.services.binance_scalp.status_snapshot import build_scalp_status  # noqa: E402
-from scripts.watch_scalp_entry_opportunity import (  # noqa: E402
+from backend.services.binance_scalp.config import get_scalp_config
+from backend.services.binance_scalp.economics import ScalpEconomics
+from backend.services.binance_scalp.market_reader import ScalpMarketReader, fetch_depth_sync
+from backend.services.binance_scalp.momentum_gross_estimate import compute_momentum_gross_estimate
+from backend.services.binance_scalp.momentum_tracker import MomentumTracker
+from backend.services.binance_scalp.orderbook_book import walk_buy_notional, walk_sell_qty
+from backend.services.binance_scalp.protected_preflight import run_scalp_preflight
+from backend.services.binance_scalp.status_snapshot import build_scalp_status
+from scripts.watch_scalp_entry_opportunity import (
     evaluate_symbol,
     is_high_quality_near_pass,
     warm_momentum,
@@ -60,9 +60,7 @@ def _spread_audit(symbols: tuple[str, ...], config, econ) -> dict:
             "internal_reader": internal,
             "bid_match": abs((rest_bid or 0) - (snap.best_bid if snap else 0)) < 0.02 if snap and rest_bid else None,
             "ask_match": abs((rest_ask or 0) - (snap.best_ask if snap else 0)) < 0.02 if snap and rest_ask else None,
-            "spread_delta_pct": (
-                abs(rest_spread - snap.spread_pct) if rest_spread and snap else None
-            ),
+            "spread_delta_pct": (abs(rest_spread - snap.spread_pct) if rest_spread and snap else None),
             "spread_over_cap": rest_spread > econ.spread_cap_pct if rest_spread else None,
             "spread_cap_decimal": econ.spread_cap_pct,
             "spread_cap_display_pct": econ.spread_cap_pct * 100.0,
@@ -107,11 +105,17 @@ def _projection_audit(sym: str, reader, tracker, econ, config, warm: int) -> dic
     mom = tracker.diagnostics(sym, now, snap.best_bid, snap.mid)
     notional = config.max_notional_paper
     buy_walk = walk_buy_notional(snap.asks, notional, snap.best_ask)
-    sell_walk = walk_sell_qty(snap.bids, buy_walk.filled_qty or notional / snap.best_ask, snap.best_bid)
+    walk_sell_qty(snap.bids, buy_walk.filled_qty or notional / snap.best_ask, snap.best_bid)
     estimate = compute_momentum_gross_estimate(snap, mom, econ)
     pf = run_scalp_preflight(
-        snap, econ, config, side="BUY", notional_usd=notional,
-        check_paper_enabled=False, momentum=mom, apply_entry_gate=True,
+        snap,
+        econ,
+        config,
+        side="BUY",
+        notional_usd=notional,
+        check_paper_enabled=False,
+        momentum=mom,
+        apply_entry_gate=True,
     )
     return {
         "spread_pct": snap.spread_pct,
@@ -119,16 +123,14 @@ def _projection_audit(sym: str, reader, tracker, econ, config, warm: int) -> dic
         "gate_reachability": pf.reachability,
         "raw_estimate": estimate.as_dict(),
         "momentum": mom.as_dict(),
-        "projection_zeroed_by_spread_gate": (
-            pf.reject_reason == "SPREAD_TOO_WIDE" and not pf.reachability
-        ),
+        "projection_zeroed_by_spread_gate": (pf.reject_reason == "SPREAD_TOO_WIDE" and not pf.reachability),
     }
 
 
 def _parity(sym: str, reader, tracker, econ, config, warm: int) -> dict:
     warm_momentum(reader, tracker, config.products, rounds=warm, interval_sec=5.0)
     watch_row = evaluate_symbol(sym, reader, tracker, econ, config)
-    status_row = build_scalp_status(warm_rounds=0)["symbols"].get(sym, {})
+    build_scalp_status(warm_rounds=0)["symbols"].get(sym, {})
     # status warm=0 after shared warm above - rebuild single symbol eval
     tracker2 = MomentumTracker()
     warm_momentum(reader, tracker2, config.products, rounds=warm, interval_sec=5.0)
@@ -137,8 +139,14 @@ def _parity(sym: str, reader, tracker, econ, config, warm: int) -> dict:
     tracker2.record(sym, now, snap.best_bid, snap.mid)
     mom = tracker2.diagnostics(sym, now, snap.best_bid, snap.mid)
     pf = run_scalp_preflight(
-        snap, econ, config, side="BUY", notional_usd=config.max_notional_paper,
-        check_paper_enabled=False, momentum=mom, apply_entry_gate=True,
+        snap,
+        econ,
+        config,
+        side="BUY",
+        notional_usd=config.max_notional_paper,
+        check_paper_enabled=False,
+        momentum=mom,
+        apply_entry_gate=True,
     )
     eval_row = {
         "symbol": sym,
@@ -154,7 +162,7 @@ def _parity(sym: str, reader, tracker, econ, config, warm: int) -> dict:
         "preflight_pass": pf.passed,
         "distance_to_pass": {"distance_to_pass_pct": 0},
     }
-    from scripts.watch_scalp_entry_opportunity import _distance_to_pass  # noqa: E402
+    from scripts.watch_scalp_entry_opportunity import _distance_to_pass
 
     eval_row["distance_to_pass"] = _distance_to_pass(
         projected_gross=eval_row["projected_gross"],
@@ -190,14 +198,8 @@ def main() -> int:
         },
         "spread_audit": _spread_audit(symbols, config, econ),
         "warm_round_compare": _warm_compare([6, 12, 18]),
-        "projection_audit": {
-            sym: _projection_audit(sym, reader, MomentumTracker(), econ, config, 12)
-            for sym in symbols
-        },
-        "gate_order_note": (
-            "protected_preflight BUY: fee->paper->SPREAD(early return)->impact/depth->"
-            "momentum estimate->entry_gate. SPREAD_TOO_WIDE returns before projection."
-        ),
+        "projection_audit": {sym: _projection_audit(sym, reader, MomentumTracker(), econ, config, 12) for sym in symbols},
+        "gate_order_note": ("protected_preflight BUY: fee->paper->SPREAD(early return)->impact/depth->momentum estimate->entry_gate. SPREAD_TOO_WIDE returns before projection."),
         "parity_warm12": {sym: _parity(sym, reader, MomentumTracker(), econ, config, 12) for sym in symbols},
         "momentum_60s_requirement": {
             "rising_60_requires_sample_at_60s": True,

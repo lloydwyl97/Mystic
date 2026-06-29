@@ -1,4 +1,4 @@
-"""Resample CCXT-style OHLCV rows [ts_ms, o, h, l, c, v] onto a fixed bar size in seconds."""
+"""Resample CCXT-style OHLCV rows [ts_ms, o, h, low, c, v] onto a fixed bar size in seconds."""
 
 from __future__ import annotations
 
@@ -25,10 +25,10 @@ def resample_ohlcv_to_seconds(ohlcv_1m: list[list], bucket_seconds: int) -> list
         rows = buckets[b_ms]
         o = float(rows[0][1])
         h = max(float(r[2]) for r in rows)
-        l = min(float(r[3]) for r in rows)
+        low = min(float(r[3]) for r in rows)
         c = float(rows[-1][4])
         v = sum(float(r[5]) for r in rows)
-        out.append([b_ms, o, h, l, c, v])
+        out.append([b_ms, o, h, low, c, v])
     return out
 
 

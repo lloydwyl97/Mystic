@@ -10,18 +10,15 @@ import time
 from datetime import datetime, timezone
 
 import redis
-
 from backend.services.binance_scalp.calibration_profiles import economics_for_config
+from backend.services.binance_scalp.config import ScalpConfig, get_scalp_config
+from backend.services.binance_scalp.economics import ScalpEconomics
 from backend.services.binance_scalp.exit_manager import (
     DECISION_SELL,
     PositionTrack,
     evaluate_exit,
     track_from_row,
 )
-from backend.services.binance_scalp.config import ScalpConfig, get_scalp_config
-from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
-from backend.services.binance_scalp.strategies.kline_cache import KlineCache
-from backend.services.binance_scalp.economics import ScalpEconomics
 from backend.services.binance_scalp.market_reader import MarketSnapshot, ScalpMarketReader
 from backend.services.binance_scalp.momentum_tracker import MomentumTracker
 from backend.services.binance_scalp.protected_preflight import (
@@ -34,6 +31,7 @@ from backend.services.binance_scalp.redis_keys import (
     assert_key_allowed,
     market_key,
     position_key,
+    scan_key,
     signal_key,
 )
 from backend.services.binance_scalp.scalp_control import (
@@ -41,7 +39,13 @@ from backend.services.binance_scalp.scalp_control import (
     is_entry_armed,
     set_entry_armed,
 )
+from backend.services.binance_scalp.scalp_reject_throttle import (
+    ScalpRejectThrottle,
+    maybe_run_scalp_reject_retention,
+)
+from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
 from backend.services.binance_scalp.schema import init_scalp_schema
+from backend.services.binance_scalp.strategies.kline_cache import KlineCache
 
 logger = logging.getLogger(__name__)
 WOULD_ENTER_NOT_ARMED = "WOULD_ENTER_NOT_ARMED"
@@ -70,6 +74,7 @@ class BinanceScalpPaperEngine:
             momentum=self._momentum,
             klines=self._klines,
         )
+        self._reject_throttle = ScalpRejectThrottle()
         self._redis = redis.from_url(self.config.redis_url, decode_responses=True)
         init_scalp_schema(self.config.database_path)
         if self.config.scalp_paper_enabled and self.config.scalp_paper_auto_arm:
@@ -80,9 +85,7 @@ class BinanceScalpPaperEngine:
                 persistent=True,
             )
         else:
-            set_entry_armed(
-                self._redis, prefix=self.config.redis_key_prefix, armed=False
-            )
+            set_entry_armed(self._redis, prefix=self.config.redis_key_prefix, armed=False)
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.config.database_path, timeout=10.0)
@@ -101,9 +104,7 @@ class BinanceScalpPaperEngine:
         return row
 
     def _open_positions(self, conn: sqlite3.Connection) -> list[sqlite3.Row]:
-        return list(
-            conn.execute("SELECT * FROM scalp_paper_positions WHERE status = 'OPEN'")
-        )
+        return list(conn.execute("SELECT * FROM scalp_paper_positions WHERE status = 'OPEN'"))
 
     def _position_strategy_id(self, row: sqlite3.Row) -> str:
         try:
@@ -122,6 +123,8 @@ class BinanceScalpPaperEngine:
         reason: str,
         detail: str,
     ) -> None:
+        if not self._reject_throttle.should_log(symbol, side, reason):
+            return
         conn.execute(
             """
             INSERT INTO scalp_rejects (symbol, exchange, strategy_id, side, reason, detail)
@@ -133,7 +136,7 @@ class BinanceScalpPaperEngine:
                 self.config.strategy_id,
                 side,
                 reason,
-                detail,
+                detail[:2000] if detail else "",
             ),
         )
 
@@ -162,9 +165,54 @@ class BinanceScalpPaperEngine:
             ),
         )
 
-    def _write_position_cache(
-        self, symbol_bus: str, payload: dict | None
+    def _seed_scalp_market_memory(self, sym: str, snap: MarketSnapshot, *, micro_regime: str = "") -> None:
+        try:
+            from backend.services.scalp_market_memory import update_scalp_market_memory_on_candidate
+
+            update_scalp_market_memory_on_candidate(
+                self._redis,
+                sym,
+                {
+                    "spread_pct": snap.spread_pct,
+                    "orderbook_age_sec": snap.orderbook_age_sec,
+                    "micro_regime": micro_regime or "range",
+                    "mid_change_15s": 0.0,
+                },
+            )
+        except Exception:
+            pass
+
+    def _publish_scan_snapshot(
+        self,
+        sym: str,
+        snap: MarketSnapshot,
+        *,
+        micro_regime: str,
+        epoch: float,
     ) -> None:
+        try:
+            mom = self._momentum.diagnostics(sym, epoch, snap.best_bid, snap.mid)
+            key = scan_key(self.config.redis_key_prefix, sym)
+            self._redis.setex(
+                key,
+                90,
+                json.dumps(
+                    {
+                        "symbol": sym,
+                        "micro_regime": micro_regime,
+                        "momentum_confirmed": bool(mom.momentum_confirmed),
+                        "momentum_sample_count": int(mom.sample_count),
+                        "momentum_history_sec": float(mom.history_sec),
+                        "spread_pct": float(snap.spread_pct),
+                        "updated_at_epoch": epoch,
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        except Exception:
+            pass
+
+    def _write_position_cache(self, symbol_bus: str, payload: dict | None) -> None:
         key = position_key(self.config.redis_key_prefix, symbol_bus)
         assert_key_allowed(key, prefix=self.config.redis_key_prefix)
         if payload is None:
@@ -218,9 +266,7 @@ class BinanceScalpPaperEngine:
             return True
         return is_entry_armed(self._redis, prefix=self.config.redis_key_prefix)
 
-    def _entry_candidates(
-        self, conn: sqlite3.Connection
-    ) -> list[tuple[str, MarketSnapshot, object]]:
+    def _entry_candidates(self, conn: sqlite3.Connection) -> list[tuple[str, MarketSnapshot, object]]:
         if not self.config.scalp_paper_enabled:
             return []
 
@@ -235,6 +281,7 @@ class BinanceScalpPaperEngine:
         ranked: list[dict] = []
         try:
             from backend.services.binance_scalp import scalp_signal_engine as _se
+
             if _se.scalp_signal_engine_enabled():
                 ranked = _se.entry_candidates(epoch=epoch, notional_usd=notional) or []
                 if ranked:
@@ -244,6 +291,22 @@ class BinanceScalpPaperEngine:
 
         if not ranked:
             ranked = self._router.evaluate_all(epoch=epoch, notional_usd=notional) or []
+
+        for row in ranked:
+            sym = row["symbol"]
+            snap = row["snap"]
+            self._record_momentum(snap)
+            mom = self._momentum.diagnostics(sym, epoch, snap.best_bid, snap.mid)
+            row["mom"] = mom
+            bars = self._klines.get(sym)
+            row["micro_regime"] = self._router._current_regime(sym, epoch, bars)
+
+        try:
+            from backend.services.scalp_ai_rank_enrichment import enrich_scalp_ranked_candidates
+
+            ranked = enrich_scalp_ranked_candidates(ranked, redis_client=self._redis) or ranked
+        except Exception as exc:
+            logger.debug("SCALP intelligence enrich skipped: %s", exc)
 
         for row in ranked:
             sym = row["symbol"]
@@ -271,26 +334,34 @@ class BinanceScalpPaperEngine:
                 if snap is None:
                     continue
                 _, all_sigs = self._router.evaluate_symbol(sym, epoch=epoch, notional_usd=notional, snap=snap)
-                best_reject = next((s for s in all_sigs if not s.passed), None)
+                best_reject = next((s for s in all_sigs if not getattr(s, "passed", True)), None)
                 if best_reject:
                     self._record_reject(
-                        conn, sym, "BUY", best_reject.reject_reason or "NO_VALID_SETUP",
-                        json.dumps({"signals": [s.as_dict() for s in all_sigs]}),
+                        conn,
+                        sym,
+                        "BUY",
+                        getattr(best_reject, "reject_reason", None) or "NO_VALID_SETUP",
+                        json.dumps({"signals": [getattr(s, "as_dict", lambda: {})() for s in all_sigs]}),
                     )
             return []
 
         best = ranked[0]
         sym, snap, sig = best["symbol"], best["snap"], best["signal"]
+        entry_intel = dict(best.get("intelligence") or {})
         self._last_ranking_meta = {
             "selection_reason": f"{sig.setup_name} score={sig.score:.2f} {sig.entry_reason}",
             "selected_symbol": sym,
             "ranking": [r["signal"].as_dict() for r in ranked],
+            "scalp_intelligence": entry_intel,
         }
         logger.info("SCALP_STRATEGY_PICK %s", self._last_ranking_meta["selection_reason"])
 
         if not self._entry_armed_ok():
             self._record_reject(
-                conn, sym, "BUY", WOULD_ENTER_NOT_ARMED,
+                conn,
+                sym,
+                "BUY",
+                WOULD_ENTER_NOT_ARMED,
                 json.dumps({"setup": sig.as_dict(), "entry_armed": False}),
             )
             return []
@@ -298,9 +369,7 @@ class BinanceScalpPaperEngine:
         return [(sym, snap, sig)]
 
     def _try_entry(self, conn: sqlite3.Connection) -> None:
-        open_count = conn.execute(
-            "SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'"
-        ).fetchone()[0]
+        open_count = conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0]
         if open_count >= self.config.max_open_positions:
             return
 
@@ -312,9 +381,7 @@ class BinanceScalpPaperEngine:
         ledger = self._ledger(conn)
         notional = min(self.config.max_notional_paper, float(ledger["cash_balance"]))
         if notional < 1.0:
-            self._record_reject(
-                conn, sym, "BUY", "INSUFFICIENT_CASH", f"cash={ledger['cash_balance']}"
-            )
+            self._record_reject(conn, sym, "BUY", "INSUFFICIENT_CASH", f"cash={ledger['cash_balance']}")
             return
 
         limit_buy = sig.limit_buy_price
@@ -326,6 +393,7 @@ class BinanceScalpPaperEngine:
         pre = dict(ledger)
 
         ranking_meta = getattr(self, "_last_ranking_meta", {}) or {}
+        entry_intel = dict(ranking_meta.get("scalp_intelligence") or {})
         from backend.services.day_trade_thesis import scalp_strategy_to_thesis
 
         thesis_fields = scalp_strategy_to_thesis(sig.setup_name, sig.setup_context or {})
@@ -337,8 +405,17 @@ class BinanceScalpPaperEngine:
             "symbol_ranking": ranking_meta,
             "review_lows": [],
             "session_low_bid": limit_buy,
+            "entry_time": ts,
+            "spread_at_entry": float(snap.spread_pct),
             **thesis_fields,
+            **entry_intel,
         }
+        if entry_intel.get("feature_health_json") and "entry_scalp_vector" not in entry_diag:
+            entry_diag["entry_scalp_vector"] = entry_intel.get("entry_scalp_vector") or []
+        if entry_intel.get("scalp_setup"):
+            entry_diag["scalp_setup"] = entry_intel.get("scalp_setup")
+        if entry_intel.get("micro_regime"):
+            entry_diag["micro_regime"] = entry_intel.get("micro_regime")
 
         conn.execute(
             """
@@ -520,6 +597,8 @@ class BinanceScalpPaperEngine:
         reason: str,
         pf_dict: dict,
         exit_gate: dict,
+        hold_seconds: float = 0.0,
+        spread_at_exit: float = 0.0,
     ) -> None:
         trade_id = str(row["trade_id"])
         sell_tid = f"{trade_id}_SELL"
@@ -609,6 +688,103 @@ class BinanceScalpPaperEngine:
         self._write_position_cache(sym, None)
         logger.info("SCALP_PAPER_SELL %s pnl=%.4f reason=%s", sym, net_usd, reason)
 
+    def _record_scalp_close_intelligence(
+        self,
+        *,
+        trade_id: str,
+        sym: str,
+        entry_diag: dict,
+        entry: float,
+        qty: float,
+        exit_price: float,
+        net_usd: float,
+        net_pct: float,
+        hold_seconds: float,
+        spread_at_exit: float,
+        reason: str,
+        ts: str,
+    ) -> None:
+        """Post-close SCALP attribution, review, learning, and market memory (isolated from DAY)."""
+        notional = qty * exit_price
+        sell_fee = notional * self.econ.taker_fee_pct
+        buy_fee = entry * qty * self.econ.taker_fee_pct
+        fees = sell_fee + buy_fee
+        gross_pnl = (exit_price - entry) * qty
+        slip_usd = notional * self.econ.slippage_buffer_pct
+        realized_slip = slip_usd / notional if notional > 0 else 0.0
+
+        intel = dict(entry_diag or {})
+        intel.setdefault("spread_at_entry", float(entry_diag.get("spread_at_entry") or entry_diag.get("spread_pct") or 0.0))
+        intel["spread_at_exit"] = float(spread_at_exit)
+        intel["realized_slippage"] = float(realized_slip)
+        intel["entry_time"] = str(entry_diag.get("entry_time") or "")
+        intel["hold_seconds"] = float(hold_seconds)
+
+        try:
+            from backend.services.scalp_outcome_attribution import classify_scalp_outcome, record_scalp_outcome_attribution
+
+            intel["outcome_reason"] = classify_scalp_outcome(
+                intelligence=intel,
+                net_pnl=net_usd,
+                hold_seconds=hold_seconds,
+                exit_reason=reason,
+            )
+            record_scalp_outcome_attribution(
+                trade_id=trade_id,
+                symbol=sym,
+                intelligence=intel,
+                gross_pnl=gross_pnl,
+                fees=fees,
+                net_pnl=net_usd,
+                hold_seconds=hold_seconds,
+                exit_reason=reason,
+                db_path=self.config.database_path,
+            )
+        except Exception as exc:
+            logger.debug("SCALP_OUTCOME_ATTRIBUTION_SKIPPED %s", exc)
+
+        try:
+            from backend.services.scalp_post_trade_feature_review import record_scalp_post_trade_review
+
+            record_scalp_post_trade_review(
+                trade_id=trade_id,
+                symbol=sym,
+                closed_at_utc=ts,
+                intelligence=intel,
+                net_pnl=net_usd,
+                hold_seconds=hold_seconds,
+                db_path=self.config.database_path,
+            )
+        except Exception as exc:
+            logger.debug("SCALP_POST_TRADE_REVIEW_SKIPPED %s", exc)
+
+        try:
+            from backend.services.scalp_strategy_score_weight_writer import propagate_scalp_adaptive_weights_for_close
+
+            propagate_scalp_adaptive_weights_for_close(
+                symbol=sym,
+                intelligence=intel,
+                net_pnl=net_usd,
+                db_path=self.config.database_path,
+            )
+        except Exception as exc:
+            logger.debug("SCALP_ADAPTIVE_WEIGHTS_SKIPPED %s", exc)
+
+        try:
+            from backend.services.scalp_market_memory import update_scalp_market_memory_on_close_sync
+
+            setup = str(intel.get("scalp_setup") or intel.get("setup_name") or "")
+            update_scalp_market_memory_on_close_sync(
+                sym,
+                setup=setup,
+                net_pnl=net_usd,
+                hold_seconds=hold_seconds,
+                slippage=realized_slip,
+                redis_client=self._redis,
+            )
+        except Exception as exc:
+            logger.debug("SCALP_MARKET_MEMORY_CLOSE_SKIPPED %s", exc)
+
     def _try_exit(self, conn: sqlite3.Connection, row: sqlite3.Row) -> None:
         sym = str(row["symbol"])
         snap = self.reader.read(sym)
@@ -659,11 +835,7 @@ class BinanceScalpPaperEngine:
 
         exit_price = pf.expected_avg_fill if pf.expected_avg_fill > 0 else pf.limit_sell_price
         net_pct = pf.expected_net_edge_pct
-        net_usd = (exit_price - entry) * qty - (
-            exit_price * qty * self.econ.taker_fee_pct
-            + exit_price * qty * self.econ.slippage_buffer_pct
-            + entry * qty * self.econ.taker_fee_pct
-        )
+        net_usd = (exit_price - entry) * qty - (exit_price * qty * self.econ.taker_fee_pct + exit_price * qty * self.econ.slippage_buffer_pct + entry * qty * self.econ.taker_fee_pct)
         profit_hit = net_pct >= target_pct
         exit_spread_ok = pf.reject_reason != "SPREAD_TOO_WIDE"
 
@@ -679,10 +851,7 @@ class BinanceScalpPaperEngine:
         except (TypeError, ValueError):
             last_review_epoch = 0.0
         in_review_phase = age >= self.econ.stale_scalp_timeout_sec
-        perform_review = in_review_phase and (
-            track.stale_review_count == 0
-            or (epoch - last_review_epoch) >= review_interval
-        )
+        perform_review = in_review_phase and (track.stale_review_count == 0 or (epoch - last_review_epoch) >= review_interval)
         # Route exit decision through the signal engine when the flag is on.
         # v1 delegates to the same evaluate_exit (strong bounded logic already present:
         # profit target after costs, setup invalidation, momentum failed, hard max hold).
@@ -690,6 +859,7 @@ class BinanceScalpPaperEngine:
         review = None
         try:
             from backend.services.binance_scalp import scalp_signal_engine as _se
+
             if _se.scalp_signal_engine_enabled():
                 ed = _se.exit_decision(
                     track_row=row,
@@ -703,7 +873,9 @@ class BinanceScalpPaperEngine:
                 )
                 if ed and ed.get("decision") == "SELL":
                     # synthesize a minimal review object the rest of the method expects
-                    class _R: pass
+                    class _R:
+                        pass
+
                     review = _R()
                     review.decision = "SELL"
                     review.reason = ed.get("reason") or "SIGNAL_ENGINE_SELL"
@@ -772,7 +944,48 @@ class BinanceScalpPaperEngine:
             reason=review.exit_reason,
             pf_dict=pf.as_dict(),
             exit_gate=exit_gate,
+            hold_seconds=age,
+            spread_at_exit=float(snap.spread_pct),
         )
+
+        self._record_scalp_close_intelligence(
+            trade_id=trade_id,
+            sym=sym,
+            entry_diag=pos_diag,
+            entry=entry,
+            qty=qty,
+            exit_price=exit_price,
+            net_usd=net_usd,
+            net_pct=net_pct,
+            hold_seconds=age,
+            spread_at_exit=float(snap.spread_pct),
+            reason=str(review.exit_reason or ""),
+            ts=ts,
+        )
+
+        # Unified learning (paper mirrors live) so the system can improve from outcomes
+        try:
+            from backend.services.trade_learning_writer import TradeLearningRecord, record_trade_outcome
+
+            rec = TradeLearningRecord(
+                symbol=sym.replace("/", ""),
+                entry_timestamp=float(row["entry_time_epoch"]),
+                exit_timestamp=now_epoch,
+                entry_price=entry,
+                exit_price=exit_price,
+                quantity=qty,
+                fees_paid=abs(net_usd) * 0.0002 if net_usd else 0.0,
+                slippage_cost=0.0,
+                net_profit_usd=net_usd,
+                net_profit_pct=net_pct,
+                hold_seconds=age,
+                decision_reason=str(review.exit_reason or "SCALP_EXIT"),
+                close_reason=str(review.exit_reason or ""),
+                extra={"engine": "binance_scalp_paper", "setup": str(row.get("strategy_id", ""))},
+            )
+            record_trade_outcome(rec, db_path=self.config.database_path)
+        except Exception as _lw_exc:
+            logger.debug("SCALP_LEARNING_WRITE_SKIPPED %s", _lw_exc)
 
     def tick(self) -> None:
         self.config.assert_no_live_trading()
@@ -801,34 +1014,37 @@ class BinanceScalpPaperEngine:
 
             if not self.econ.is_fee_model_verified():
                 for sym in self.config.products:
-                    self._record_reject(
-                        conn, sym, "BUY", FEE_MODEL_UNVERIFIED, "fee model not verified"
-                    )
+                    self._record_reject(conn, sym, "BUY", FEE_MODEL_UNVERIFIED, "fee model not verified")
                 conn.commit()
                 return
+
+            _, epoch = self._now()
+            for sym in self.config.products:
+                snap = self.reader.read(sym)
+                if snap is None:
+                    continue
+                self._write_market_cache(snap)
+                bars = self._klines.get(sym)
+                regime = self._router._current_regime(sym, epoch, bars)
+                self._seed_scalp_market_memory(sym, snap, micro_regime=regime)
+                self._publish_scan_snapshot(sym, snap, micro_regime=regime, epoch=epoch)
 
             open_rows = self._open_positions(conn)
             if open_rows:
                 for row in open_rows:
                     self._try_exit(conn, row)
-            elif conn.execute(
-                "SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'"
-            ).fetchone()[0] < self.config.max_open_positions:
+            elif conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0] < self.config.max_open_positions:
                 self._try_entry(conn)
             conn.commit()
 
     def run_loop(self, interval_sec: float = 5.0) -> None:
         if not self.config.scalp_paper_enabled:
-            logger.error(
-                "Scalp paper loop idle: SCALP_PAPER_ENABLED=false (set true in .env and restart)"
-            )
+            logger.error("Scalp paper loop idle: SCALP_PAPER_ENABLED=false (set true in .env and restart)")
             while True:
                 time.sleep(max(interval_sec, 30.0))
             return
         if not self.econ.is_fee_model_verified():
-            logger.error(
-                "Scalp paper loop idle: SCALP_FEE_MODEL_VERIFIED=false (set true in .env)"
-            )
+            logger.error("Scalp paper loop idle: SCALP_FEE_MODEL_VERIFIED=false (set true in .env)")
             while True:
                 time.sleep(max(interval_sec, 30.0))
             return
@@ -836,13 +1052,12 @@ class BinanceScalpPaperEngine:
         armed = is_entry_armed(self._redis, prefix=self.config.redis_key_prefix)
         try:
             from backend.services.binance_scalp import scalp_signal_engine as _se
+
             engine_on = _se.scalp_signal_engine_enabled()
         except Exception:
             engine_on = False
         logger.info(
-            "Binance scalp paper loop products=%s max_open=%s interval=%ss "
-            "paper_only=True live_blocked=True calibration=%s profile=%s entry_armed=%s "
-            "signal_engine=%s",
+            "Binance scalp paper loop products=%s max_open=%s interval=%ss paper_only=True live_blocked=True calibration=%s profile=%s entry_armed=%s signal_engine=%s",
             self.config.products,
             self.config.max_open_positions,
             interval_sec,
@@ -872,10 +1087,13 @@ class BinanceScalpPaperEngine:
             time.sleep(warm_interval)
         logger.info("SCALP_WARM complete — now evaluating entries with bounded exits (net-profit / momentum-fail / setup-invalid / hard max-hold)")
 
+        maybe_run_scalp_reject_retention(self.config.database_path)
+
         try:
             while True:
                 try:
                     self.tick()
+                    maybe_run_scalp_reject_retention(self.config.database_path)
                 except Exception as exc:
                     logger.exception("scalp paper tick error: %s", exc)
                 time.sleep(interval_sec)

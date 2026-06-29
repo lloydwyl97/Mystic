@@ -146,14 +146,7 @@ class MomentumTracker:
         rising_15 = bid15 >= min_change and mid15 >= min_change
         rising_30 = bid30 > 0.0 and mid30 > 0.0
         rising_60 = bid60 > 0.0 and mid60 > 0.0
-        confirmed = (
-            has_history
-            and rising_15
-            and rising_30
-            and rising_60
-            and up_count >= min_up
-            and not flat
-        )
+        confirmed = has_history and rising_15 and rising_30 and rising_60 and up_count >= min_up and not flat
 
         return MomentumDiagnostics(
             mid_change_15s=mid15,

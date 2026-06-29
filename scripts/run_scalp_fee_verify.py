@@ -26,9 +26,7 @@ def main() -> int:
         "slippage_buffer_pct": fd["slippage_buffer_pct"],
         "min_net_edge_pct": fd["min_net_edge_pct"],
         "total_break_even_move_pct": fd["total_break_even_move_pct"],
-        "total_required_move_for_min_edge_pct": fd[
-            "total_required_move_for_min_edge_pct"
-        ],
+        "total_required_move_for_min_edge_pct": fd["total_required_move_for_min_edge_pct"],
         "fee_model_verified_env": econ.is_fee_model_verified(),
         "reference": "Binance.US spot defaults via SCALP_* / BINANCE_US_* env",
     }

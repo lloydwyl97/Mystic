@@ -24,8 +24,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Load .env before backend imports that read config
 _env = PROJECT_ROOT / ".env"
 if _env.exists():
-    for line in _env.read_text().splitlines():
-        line = line.strip()
+    for raw_line in _env.read_text().splitlines():
+        line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
@@ -276,7 +276,7 @@ async def run_test() -> None:
         "price_impact_pct": pf_state.get("last_price_impact_pct"),
     }
 
-    test_after_sell = baseline(TEST_DB)
+    baseline(TEST_DB)
     test_sells = int(_q1(TEST_DB, "SELECT COUNT(*) FROM paper_trades WHERE UPPER(side)='SELL'") or 0)
     REPORT["test_sell_executed"] = test_sells > test_before["paper_sells"]
 

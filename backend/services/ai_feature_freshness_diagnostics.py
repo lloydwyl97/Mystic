@@ -43,12 +43,12 @@ FEATURE_AGE_BLOCKS: tuple[str, ...] = (
 )
 
 IMPORTANCE_ROLLUP: dict[str, tuple[str, ...]] = {
-    "technical": ("basic_price", "technical_indicators", "advanced_ta", "momentum"),
-    "volatility": ("volatility",),
+    "technical": ("basic_price", "technical_indicators", "advanced_ta", "momentum", "market_structure"),
+    "volatility": ("volatility", "volatility_distribution"),
     "trend": ("trend",),
     "volume": ("volume_profile", "advanced_volume"),
     "time_features": ("time_based",),
-    "sentiment": ("market_sentiment",),
+    "sentiment": ("market_sentiment", "unsupported_options"),
     "orderbook_microstructure": ("microstructure",),
     "context": ("context_day_full",),
 }
@@ -63,8 +63,11 @@ FEATURE_BLOCKS: dict[str, tuple[int, int]] = {
     "market_sentiment": (78, 87),
     "time_based": (88, 97),
     "advanced_ta": (98, 105),
-    "advanced_volume": (106, 113),
-    "microstructure": (114, 121),
+    "advanced_volume": (106, 116),
+    "microstructure": (117, 121),
+    "market_structure": (122, 122),
+    "unsupported_options": (123, 123),
+    "volatility_distribution": (124, 124),
 }
 
 
@@ -300,7 +303,7 @@ def build_feature_health_score(
     optional_inactive_count: int = 0,
     missing_context_dims: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Aggregate freshness + completeness into a 0–100 health score."""
+    """Aggregate freshness + completeness into a 0-100 health score."""
     age_report = age_report or build_feature_age_by_block(symbol_bus)
     freshness = age_report.get("freshness_status") or {}
     fresh_blocks = [k for k, v in freshness.items() if v == "fresh"]

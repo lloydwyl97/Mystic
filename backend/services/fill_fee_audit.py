@@ -145,9 +145,7 @@ def build_sell_fill_fee_audit(
         "fee_from_exchange": fee_from_exchange,
         "entry_fee_usd": round(float(entry_fee_usd), 6),
         "economics_config": get_trading_economics_display(),
-        "note": (
-            "Accounting verification only. Config fee rates apply unless exchange fill fee is present."
-        ),
+        "note": ("Accounting verification only. Config fee rates apply unless exchange fill fee is present."),
     }
     return audit
 
@@ -244,10 +242,7 @@ def bnb_fee_discount_status() -> dict[str, Any]:
         "bnb_fee_discount_enabled": enabled,
         "bnb_fee_discount_env": "BINANCE_US_BNB_FEE_DISCOUNT",
         "config_fee_override_from_account": False,
-        "note": (
-            "Mystic uses trading_economics MAKER_FEE/TAKER_FEE unless exchange fill reports actual fee. "
-            "BNB discount is not wired unless BINANCE_US_BNB_FEE_DISCOUNT=true."
-        ),
+        "note": ("Mystic uses trading_economics MAKER_FEE/TAKER_FEE unless exchange fill reports actual fee. BNB discount is not wired unless BINANCE_US_BNB_FEE_DISCOUNT=true."),
     }
 
 

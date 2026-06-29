@@ -77,10 +77,7 @@ def verify_top_four_pairs() -> dict[str, Any]:
             "orderbook_half_spread_pct": round(half_spread, 6),
             "orderbook_full_spread_pct": round(half_spread * 2, 6),
             "platform_spread": 0.0,
-            "notes": (
-                "Advanced Spot: no platform spread per Binance.US fees page. "
-                "Universal 0.02% taker per Apr 2026 blog (not Tier-0 0.01%)."
-            ),
+            "notes": ("Advanced Spot: no platform spread per Binance.US fees page. Universal 0.02% taker per Apr 2026 blog (not Tier-0 0.01%)."),
         }
     return {
         "exchange": EXCHANGE_NAME,

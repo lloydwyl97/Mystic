@@ -7,6 +7,7 @@ Execution layer: 1m (7d), 5m (14d), 15m (30d/90d) for fills, intrabar MAE, exits
 
 Does NOT modify live trading rules.
 """
+
 from __future__ import annotations
 
 import json
@@ -17,7 +18,7 @@ import time
 import traceback
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ BASELINE_DIR = REPO / "scripts" / "replay_baselines"
 CACHE_DIR = BASELINE_DIR / "cache"
 BASELINE_ID = "day_baseline_all_pass_v1"
 
+from backend.config.binance_us_fee_schedule import verify_top_four_pairs
 from backend.config.trading_economics import (
     MAKER_FEE,
     MIN_NET_PROFIT_TO_SELL,
@@ -35,7 +37,6 @@ from backend.config.trading_economics import (
     TAKER_FEE,
     get_trading_economics_display,
 )
-from backend.config.binance_us_fee_schedule import verify_top_four_pairs
 from backend.services.day_bucket_quality import (
     GLOBAL_KILLED_REGIME_THESIS,
     REPLAY_KILLED_BUCKETS,
@@ -46,7 +47,6 @@ from backend.services.day_bucket_quality import (
     evaluate_bucket_entry,
     record_bucket_outcome,
 )
-from backend.services.day_regime_router import DAY_REGIME_BEAR, classify_day_regime, evaluate_day_entry_route
 from backend.services.day_controlled_exits import (
     EXIT_FAILED_RECLAIM,
     EXIT_TIME_STOP,
@@ -54,6 +54,7 @@ from backend.services.day_controlled_exits import (
     ControlledExitConfig,
     evaluate_controlled_bracket_exit,
 )
+from backend.services.day_regime_router import DAY_REGIME_BEAR, classify_day_regime, evaluate_day_entry_route
 from backend.services.day_trade_thesis import (
     EXIT_EXTREME_PROTECTION,
     EXIT_NET_PROFIT,
@@ -66,36 +67,38 @@ from backend.services.day_trade_thesis import (
     evaluate_thesis_exit,
 )
 from scripts.run_day_strategy_replay import (
-    SYMBOLS,
-    SYMBOL_API,
     MAX_POSITIONS,
     MIN_CONFIDENCE,
     MIN_VWAP_ADX,
     NOTIONAL_USD,
     PRINCIPAL,
+    SYMBOL_API,
+    SYMBOLS,
     ReplayPosition,
     ReplayState,
-    build_decision_data,
-    fetch_klines_1h,
-    selection_score,
     _atr_pct,
     _day_key,
     _resample_4h,
     _stats_from_report,
+    build_decision_data,
+    fetch_klines_1h,
+    selection_score,
 )
 
 WINDOWS_DAYS = [7, 14, 30, 90]
 EXEC_INTERVAL_BY_WINDOW = {7: "1m", 14: "5m", 30: "15m", 90: "15m"}
-INTERVAL_SEC = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+INTERVAL_SEC = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
 HOUR_SEC = 3600
 
 # Positive baseline buckets only (profit expansion replays)
-ALLOWED_POSITIVE_BUCKETS = frozenset({
-    ("BTC/USDT", "neutral", SETUP_VWAP_REVERSION),
-    ("ETH/USDT", "neutral", SETUP_VWAP_REVERSION),
-    ("SOL/USDT", "neutral", SETUP_VWAP_REVERSION),
-    ("XRP/USDT", "neutral", SETUP_VWAP_REVERSION),
-})
+ALLOWED_POSITIVE_BUCKETS = frozenset(
+    {
+        ("BTC/USDT", "neutral", SETUP_VWAP_REVERSION),
+        ("ETH/USDT", "neutral", SETUP_VWAP_REVERSION),
+        ("SOL/USDT", "neutral", SETUP_VWAP_REVERSION),
+        ("XRP/USDT", "neutral", SETUP_VWAP_REVERSION),
+    }
+)
 
 
 @dataclass
@@ -235,10 +238,7 @@ def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> list
     cursor = start_ms
     api = SYMBOL_API[symbol]
     while cursor < end_ms:
-        url = (
-            f"https://api.binance.us/api/v3/klines?symbol={api}&interval={interval}"
-            f"&startTime={cursor}&endTime={end_ms}&limit=1000"
-        )
+        url = f"https://api.binance.us/api/v3/klines?symbol={api}&interval={interval}&startTime={cursor}&endTime={end_ms}&limit=1000"
         proc = subprocess.run(
             ["curl", "-s", "--max-time", "45", url],
             capture_output=True,
@@ -251,14 +251,16 @@ def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> list
         if not isinstance(rows, list) or not rows:
             break
         for r in rows:
-            bars.append({
-                "ts": int(r[0]) // 1000,
-                "open": float(r[1]),
-                "high": float(r[2]),
-                "low": float(r[3]),
-                "close": float(r[4]),
-                "volume": float(r[5]),
-            })
+            bars.append(
+                {
+                    "ts": int(r[0]) // 1000,
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4]),
+                    "volume": float(r[5]),
+                }
+            )
         last_ms = int(rows[-1][0])
         if last_ms <= cursor:
             break
@@ -392,51 +394,19 @@ def _passes_replay_entry_filter(filter_name: str | None, dd: dict[str, Any], set
     ema_4h = float((mtf.get("4h") or {}).get("ema_align") or 0.5)
 
     checks = {
-        "vwap_reclaim_15m": (
-            setup == SETUP_VWAP_REVERSION and vwap > 0 and c > vwap and bb < 0.45 and ema_15 >= 0.52
-        ),
-        "vwap_reclaim_30m": (
-            setup == SETUP_VWAP_REVERSION and vwap > 0 and c > vwap * 0.998 and bb < 0.40 and ema_15 >= 0.50
-        ),
-        "pullback_reclaim_5m15m": (
-            setup == SETUP_VWAP_REVERSION and ema_5 >= 0.55 and ema_15 >= 0.52 and vwap > 0 and c > vwap
-        ),
-        "vol_compression_breakout": (
-            setup == SETUP_BREAKOUT_CONTINUATION and bb > 0.80 and rv >= 1.20
-        ),
-        "range_low_reclaim": (
-            setup == SETUP_VWAP_REVERSION and bb < 0.25 and vwap > 0 and c >= vwap * 0.997
-        ),
-        "high_relvol_reversal": (
-            setup == SETUP_VWAP_REVERSION and rv >= 1.50 and rsi < 45 and vwap > 0 and c >= vwap * 0.995
-        ),
-        "trend_continuation_confirmed": (
-            setup in (SETUP_BREAKOUT_CONTINUATION, SETUP_HTF_TREND_PULLBACK) and ema_4h >= 0.55
-        ),
+        "vwap_reclaim_15m": (setup == SETUP_VWAP_REVERSION and vwap > 0 and c > vwap and bb < 0.45 and ema_15 >= 0.52),
+        "vwap_reclaim_30m": (setup == SETUP_VWAP_REVERSION and vwap > 0 and c > vwap * 0.998 and bb < 0.40 and ema_15 >= 0.50),
+        "pullback_reclaim_5m15m": (setup == SETUP_VWAP_REVERSION and ema_5 >= 0.55 and ema_15 >= 0.52 and vwap > 0 and c > vwap),
+        "vol_compression_breakout": (setup == SETUP_BREAKOUT_CONTINUATION and bb > 0.80 and rv >= 1.20),
+        "range_low_reclaim": (setup == SETUP_VWAP_REVERSION and bb < 0.25 and vwap > 0 and c >= vwap * 0.997),
+        "high_relvol_reversal": (setup == SETUP_VWAP_REVERSION and rv >= 1.50 and rsi < 45 and vwap > 0 and c >= vwap * 0.995),
+        "trend_continuation_confirmed": (setup in (SETUP_BREAKOUT_CONTINUATION, SETUP_HTF_TREND_PULLBACK) and ema_4h >= 0.55),
         # Outcome-driven (AI discovery regions) — neutral VWAP only, no new pattern names
-        "outcome_neutral_relvol": (
-            setup == SETUP_VWAP_REVERSION and 0.90 <= rv <= 1.80 and 0.22 <= bb <= 0.58 and vwap > 0
-        ),
-        "outcome_neutral_vwap_near": (
-            setup == SETUP_VWAP_REVERSION and vwap > 0 and abs(c - vwap) / vwap <= 0.003 and rv >= 0.85
-        ),
-        "outcome_neutral_adx_calm": (
-            setup == SETUP_VWAP_REVERSION and 12.0 <= adx <= 28.0 and 38.0 <= rsi <= 58.0 and vwap > 0
-        ),
-        "outcome_neutral_slope_mild": (
-            setup == SETUP_VWAP_REVERSION
-            and vwap > 0
-            and -0.002 <= float(dd.get("price_momentum") or 0) <= 0.004
-            and rv >= 0.80
-        ),
-        "outcome_combined_strict": (
-            setup == SETUP_VWAP_REVERSION
-            and vwap > 0
-            and 0.90 <= rv <= 1.65
-            and abs(c - vwap) / vwap <= 0.004
-            and 12.0 <= adx <= 26.0
-            and 0.20 <= bb <= 0.52
-        ),
+        "outcome_neutral_relvol": (setup == SETUP_VWAP_REVERSION and 0.90 <= rv <= 1.80 and 0.22 <= bb <= 0.58 and vwap > 0),
+        "outcome_neutral_vwap_near": (setup == SETUP_VWAP_REVERSION and vwap > 0 and abs(c - vwap) / vwap <= 0.003 and rv >= 0.85),
+        "outcome_neutral_adx_calm": (setup == SETUP_VWAP_REVERSION and 12.0 <= adx <= 28.0 and 38.0 <= rsi <= 58.0 and vwap > 0),
+        "outcome_neutral_slope_mild": (setup == SETUP_VWAP_REVERSION and vwap > 0 and -0.002 <= float(dd.get("price_momentum") or 0) <= 0.004 and rv >= 0.80),
+        "outcome_combined_strict": (setup == SETUP_VWAP_REVERSION and vwap > 0 and 0.90 <= rv <= 1.65 and abs(c - vwap) / vwap <= 0.004 and 12.0 <= adx <= 26.0 and 0.20 <= bb <= 0.52),
     }
     return bool(checks.get(filter_name, False))
 
@@ -513,7 +483,11 @@ def _try_exit_exec(
     net_pct_fill = net_pnl_taker / pos.notional if pos.notional else 0.0
 
     extreme = evaluate_extreme_protection(
-        entry_price=entry, mark=mark_taker, net_pnl_pct=net_pct_taker, atr_pct=atr_pct, bundle=bundle,
+        entry_price=entry,
+        mark=mark_taker,
+        net_pnl_pct=net_pct_taker,
+        atr_pct=atr_pct,
+        bundle=bundle,
     )
     want_exit = False
     reason = EXIT_NET_PROFIT
@@ -557,9 +531,7 @@ def _try_exit_exec(
         if str(te.get("action")) not in ("warn", "hold"):
             gate_pct = net_pct_fill if config.use_fill_based_exit_gate else net_pct_taker
             if not config.use_fill_based_exit_gate:
-                legacy_rt = (2 * config.taker_fee) + 2 * (
-                    config.half_spread(sym) + config.platform_spread_one_way + config.effective_slippage(sym)
-                )
+                legacy_rt = (2 * config.taker_fee) + 2 * (config.half_spread(sym) + config.platform_spread_one_way + config.effective_slippage(sym))
                 gate_pct = (mark_taker - entry) / entry - legacy_rt
             floor = config.min_profit_floor()
             if gate_pct >= floor:
@@ -574,16 +546,8 @@ def _try_exit_exec(
                         pos._mfe_peak_at_arm = max(peak, pos.mfe_pct)  # type: ignore[attr-defined]
                         giveback = float(getattr(pos, "_mfe_peak_at_arm", 0)) - pos.mfe_pct
                         extra_h = (bar_ts - int(getattr(pos, "_armed_ts", bar_ts))) / 3600.0
-                        continuation = (
-                            mid >= entry
-                            and bar["close"] >= bar["open"]
-                            and pos.mfe_pct >= peak * 0.85
-                        )
-                        if (
-                            giveback >= config.profit_capture_mfe_giveback
-                            or extra_h >= config.profit_capture_max_extra_hours
-                            or not continuation
-                        ):
+                        continuation = mid >= entry and bar["close"] >= bar["open"] and pos.mfe_pct >= peak * 0.85
+                        if giveback >= config.profit_capture_mfe_giveback or extra_h >= config.profit_capture_max_extra_hours or not continuation:
                             want_exit = True
                 else:
                     want_exit = True
@@ -602,31 +566,35 @@ def _try_exit_exec(
         gross_mid = pos.quantity * (mid - entry_mid)
         net_pnl = gross_fill - entry_fee - exit_fee
         spread_slip = gross_mid - gross_fill
-        return ExecClosedTrade(
-            symbol=sym,
-            entry_ts=pos.entry_ts,
-            exit_ts=bar_ts,
-            entry_price=entry,
-            exit_price=exit_fill,
-            pnl_usd=net_pnl,
-            pnl_pct=(exit_fill - entry) / entry if entry else 0.0,
-            setup=pos.setup,
-            regime=pos.regime,
-            exit_reason=reason,
-            hold_sec=bar_ts - pos.entry_ts,
-            intrabar_mae_pct=pos.mae_pct,
-            intrabar_mfe_pct=pos.mfe_pct,
-            entry_mid=entry_mid,
-            exit_mid=mid,
-            quantity=pos.quantity,
-            notional=pos.notional,
-            exit_signal_ts=sig_ts,
-            gross_pnl_usd=gross_fill,
-            total_fees_usd=entry_fee + exit_fee,
-            spread_slippage_usd=spread_slip,
-            entry_is_maker=bool(getattr(pos, "entry_is_maker", False)),
-            exit_is_maker=as_maker,
-        ), False, 0
+        return (
+            ExecClosedTrade(
+                symbol=sym,
+                entry_ts=pos.entry_ts,
+                exit_ts=bar_ts,
+                entry_price=entry,
+                exit_price=exit_fill,
+                pnl_usd=net_pnl,
+                pnl_pct=(exit_fill - entry) / entry if entry else 0.0,
+                setup=pos.setup,
+                regime=pos.regime,
+                exit_reason=reason,
+                hold_sec=bar_ts - pos.entry_ts,
+                intrabar_mae_pct=pos.mae_pct,
+                intrabar_mfe_pct=pos.mfe_pct,
+                entry_mid=entry_mid,
+                exit_mid=mid,
+                quantity=pos.quantity,
+                notional=pos.notional,
+                exit_signal_ts=sig_ts,
+                gross_pnl_usd=gross_fill,
+                total_fees_usd=entry_fee + exit_fee,
+                spread_slippage_usd=spread_slip,
+                entry_is_maker=bool(getattr(pos, "entry_is_maker", False)),
+                exit_is_maker=as_maker,
+            ),
+            False,
+            0,
+        )
     return None, False, exit_signal_ts
 
 
@@ -643,7 +611,7 @@ def run_execution_replay(
     return_trades: bool = False,
 ) -> dict[str, Any]:
     merged_killed = REPLAY_KILLED_BUCKETS | (extra_killed or frozenset())
-    exec_sec = INTERVAL_SEC[exec_interval]
+    INTERVAL_SEC[exec_interval]
     state = ExecReplayState()
     exit_counts: dict[str, int] = defaultdict(int)
     pending_exit: dict[str, bool] = {}
@@ -651,8 +619,8 @@ def run_execution_replay(
     pending_entry: list[dict] = []
     warmup = 80
 
-    h1_idx = {s: 0 for s in SYMBOLS}
-    ex_idx = {s: 0 for s in SYMBOLS}
+    h1_idx = dict.fromkeys(SYMBOLS, 0)
+    ex_idx = dict.fromkeys(SYMBOLS, 0)
     for s in SYMBOLS:
         h1_idx[s] = _advance_to_ts(bars_1h[s], 0, start_ts)
         ex_idx[s] = _advance_to_ts(bars_exec[s], 0, start_ts)
@@ -692,10 +660,18 @@ def run_execution_replay(
                 continue
             bar = exec_bars_now[sym]
             _open_position(
-                state, sym=sym, bar_ts=bar_ts, mid=bar["close"], spend=pe["spend"],
-                config=config, setup=pe["setup"], regime=pe["regime"],
-                thesis_score=pe["thesis_score"], invalid_level=pe["invalid_level"],
-                target_level=pe["target_level"], relative_volume=float(pe.get("relative_volume") or 1.0),
+                state,
+                sym=sym,
+                bar_ts=bar_ts,
+                mid=bar["close"],
+                spend=pe["spend"],
+                config=config,
+                setup=pe["setup"],
+                regime=pe["regime"],
+                thesis_score=pe["thesis_score"],
+                invalid_level=pe["invalid_level"],
+                target_level=pe["target_level"],
+                relative_volume=float(pe.get("relative_volume") or 1.0),
             )
         pending_entry = still_pending
 
@@ -706,7 +682,11 @@ def run_execution_replay(
             pos = state.positions[sym]
             bar = exec_bars_now[sym]
             closed, new_pending, sig = _try_exit_exec(
-                pos, bar, bar_ts, config, bundle,
+                pos,
+                bar,
+                bar_ts,
+                config,
+                bundle,
                 pending_exit=pending_exit.get(sym, False),
                 exit_signal_ts=exit_signal_ts.get(sym, 0),
             )
@@ -771,10 +751,19 @@ def run_execution_replay(
             chop = 0.65 if dd["adx"] < 18 else 0.45
             ps = dd["price_structure_regime"]
             dd = apply_trade_thesis_to_candidate_fields(
-                dd, symbol=sym, current_price=mark, atr=atr, strategy_id="day", price_structure_regime=ps,
+                dd,
+                symbol=sym,
+                current_price=mark,
+                atr=atr,
+                strategy_id="day",
+                price_structure_regime=ps,
             )
             regime = classify_day_regime(
-                dd, context_payload=None, chop_score=chop, atr_ratio=_atr_pct(slice_1h), price_structure_regime=ps,
+                dd,
+                context_payload=None,
+                chop_score=chop,
+                atr_ratio=_atr_pct(slice_1h),
+                price_structure_regime=ps,
             )
             regime = _apply_regime_override(regime, dd, config)
             dd["day_route_regime"] = regime
@@ -800,9 +789,13 @@ def run_execution_replay(
                 continue
             xrp_churn = "XRP" in sym.upper() and state.xrp_day_losses.get(_day_key(bar_ts), 0) >= 2
             route = evaluate_day_entry_route(
-                setup_type=setup, day_regime=regime, decision_data=dd,
-                context_payload=None, current_price=mark,
-                thesis_score=float(dd.get("thesis_score") or 0), xrp_churn_active=xrp_churn,
+                setup_type=setup,
+                day_regime=regime,
+                decision_data=dd,
+                context_payload=None,
+                current_price=mark,
+                thesis_score=float(dd.get("thesis_score") or 0),
+                xrp_churn_active=xrp_churn,
             )
             if not route.get("allowed"):
                 continue
@@ -813,8 +806,11 @@ def run_execution_replay(
                 bucket = {"allowed": True, "bucket_size_factor": 1.0}
             else:
                 bucket = evaluate_bucket_entry(
-                    symbol=sym, regime=regime, setup=setup,
-                    bucket_stats=state.bucket_stats, extra_killed=merged_killed,
+                    symbol=sym,
+                    regime=regime,
+                    setup=setup,
+                    bucket_stats=state.bucket_stats,
+                    extra_killed=merged_killed,
                 )
             if not bucket.get("allowed"):
                 continue
@@ -841,7 +837,9 @@ def run_execution_replay(
                     if sym not in state.positions:
                         spend = NOTIONAL_USD * float(dd.get("bucket_size_factor") or 1.0) * config.notional_mult
                         pe = {
-                            "sym": sym, "signal_ts": bar_ts, "spend": spend,
+                            "sym": sym,
+                            "signal_ts": bar_ts,
+                            "spend": spend,
                             "setup": str(dd.get("setup_type") or ""),
                             "regime": regime,
                             "thesis_score": float(dd.get("thesis_score") or 0),
@@ -854,10 +852,18 @@ def run_execution_replay(
                             pending_entry.append(pe)
                         elif sym in exec_bars_now:
                             _open_position(
-                                state, sym=sym, bar_ts=bar_ts, mid=exec_bars_now[sym]["close"],
-                                spend=spend, config=config, setup=pe["setup"], regime=regime,
-                                thesis_score=pe["thesis_score"], invalid_level=pe["invalid_level"],
-                                target_level=pe["target_level"], relative_volume=pe["relative_volume"],
+                                state,
+                                sym=sym,
+                                bar_ts=bar_ts,
+                                mid=exec_bars_now[sym]["close"],
+                                spend=spend,
+                                config=config,
+                                setup=pe["setup"],
+                                regime=regime,
+                                thesis_score=pe["thesis_score"],
+                                invalid_level=pe["invalid_level"],
+                                target_level=pe["target_level"],
+                                relative_volume=pe["relative_volume"],
                             )
                         else:
                             pending_entry.append(pe)
@@ -877,21 +883,39 @@ def run_execution_replay(
             gross = pos.quantity * (exit_fill - pos.entry_price)
             pnl_usd = gross - entry_fee - exit_fee
             closed = ExecClosedTrade(
-                sym, pos.entry_ts, end_ts, pos.entry_price, exit_fill, pnl_usd,
-                (exit_fill - pos.entry_price) / pos.entry_price, pos.setup, pos.regime,
-                "REPLAY_MARK_TO_MARKET", end_ts - pos.entry_ts,
-                intrabar_mae_pct=pos.mae_pct, intrabar_mfe_pct=pos.mfe_pct,
-                entry_mid=float(getattr(pos, "entry_mid", mid)), exit_mid=mid,
-                quantity=pos.quantity, notional=pos.notional,
-                gross_pnl_usd=gross, total_fees_usd=entry_fee + exit_fee,
+                sym,
+                pos.entry_ts,
+                end_ts,
+                pos.entry_price,
+                exit_fill,
+                pnl_usd,
+                (exit_fill - pos.entry_price) / pos.entry_price,
+                pos.setup,
+                pos.regime,
+                "REPLAY_MARK_TO_MARKET",
+                end_ts - pos.entry_ts,
+                intrabar_mae_pct=pos.mae_pct,
+                intrabar_mfe_pct=pos.mfe_pct,
+                entry_mid=float(getattr(pos, "entry_mid", mid)),
+                exit_mid=mid,
+                quantity=pos.quantity,
+                notional=pos.notional,
+                gross_pnl_usd=gross,
+                total_fees_usd=entry_fee + exit_fee,
                 spread_slippage_usd=pos.quantity * (mid - float(getattr(pos, "entry_mid", mid))) - gross,
             )
             state.trades.append(closed)
             record_bucket_outcome(
-                state.bucket_stats, symbol=sym, regime=closed.regime, setup=closed.setup,
-                pnl_usd=closed.pnl_usd, hold_sec=closed.hold_sec,
-                mae_pct=closed.intrabar_mae_pct, mfe_pct=closed.intrabar_mfe_pct,
-                exit_reason=closed.exit_reason, notional_usd=pos.notional,
+                state.bucket_stats,
+                symbol=sym,
+                regime=closed.regime,
+                setup=closed.setup,
+                pnl_usd=closed.pnl_usd,
+                hold_sec=closed.hold_sec,
+                mae_pct=closed.intrabar_mae_pct,
+                mfe_pct=closed.intrabar_mfe_pct,
+                exit_reason=closed.exit_reason,
+                notional_usd=pos.notional,
             )
             state.cash += pos.notional + closed.pnl_usd
             del state.positions[sym]
@@ -962,9 +986,7 @@ def _summarize_exec(
     gross = sum(t.gross_pnl_usd for t in live_t)
     fees = sum(t.total_fees_usd for t in live_t)
     spread_slip = sum(t.spread_slippage_usd for t in live_t)
-    rt_est = (2 * config.taker_fee) + 2 * (
-        config.half_spread(SYMBOLS[0]) + config.platform_spread_one_way + config.slippage_buffer
-    )
+    rt_est = (2 * config.taker_fee) + 2 * (config.half_spread(SYMBOLS[0]) + config.platform_spread_one_way + config.slippage_buffer)
     exp = net / n if n else 0.0
     return {
         "window_days": window_days,
@@ -1014,9 +1036,7 @@ def _summarize_exec(
 def _compute_pass(windows: dict, wf: dict) -> dict[str, Any]:
     w7, w14, w30, w90 = windows.get("7d", {}), windows.get("14d", {}), windows.get("30d", {}), windows.get("90d", {})
     val, test = wf.get("validation", {}), wf.get("test", {})
-    range_pnl = sum(
-        v for k, v in (w90.get("per_bucket_pnl") or {}).items() if "/range/VWAP_REVERSION" in k
-    )
+    range_pnl = sum(v for k, v in (w90.get("per_bucket_pnl") or {}).items() if "/range/VWAP_REVERSION" in k)
     pc = {
         "7d_positive": (w7.get("expectancy_per_trade_usd") or 0) > 0,
         "14d_improved": (w14.get("expectancy_per_trade_usd") or 0) > 0 or (w14.get("net_pnl_usd", -999) > -400),
@@ -1044,9 +1064,13 @@ def _run_stress_90d(
     exec_bars = bars_exec_by_interval[interval]
     wstart = end_ts - 90 * 86400
     w90 = run_execution_replay(
-        bars_1h, exec_bars, window_days=90,
-        start_ts=max(wstart, start_data), end_ts=end_ts,
-        config=config, exec_interval=interval,
+        bars_1h,
+        exec_bars,
+        window_days=90,
+        start_ts=max(wstart, start_data),
+        end_ts=end_ts,
+        config=config,
+        exec_interval=interval,
     )
     return w90
 
@@ -1064,9 +1088,13 @@ def _run_suite(
         exec_bars = bars_exec_by_interval[interval]
         wstart = end_ts - wd * 86400
         windows[f"{wd}d"] = run_execution_replay(
-            bars_1h, exec_bars, window_days=wd,
-            start_ts=max(wstart, start_data), end_ts=end_ts,
-            config=config, exec_interval=interval,
+            bars_1h,
+            exec_bars,
+            window_days=wd,
+            start_ts=max(wstart, start_data),
+            end_ts=end_ts,
+            config=config,
+            exec_interval=interval,
         )
     span = end_ts - start_data
     t_end = start_data + int(span * 0.50)
@@ -1074,19 +1102,34 @@ def _run_suite(
     interval = EXEC_INTERVAL_BY_WINDOW[90]
     exec_bars = bars_exec_by_interval[interval]
     train = run_execution_replay(
-        bars_1h, exec_bars, window_days=int(span / 86400),
-        start_ts=start_data, end_ts=t_end, config=config, exec_interval=interval,
+        bars_1h,
+        exec_bars,
+        window_days=int(span / 86400),
+        start_ts=start_data,
+        end_ts=t_end,
+        config=config,
+        exec_interval=interval,
     )
     train_buckets = _stats_from_report(train.get("bucket_report", []))
     train_killed = buckets_negative(train_buckets, min_trades=3)
     val = run_execution_replay(
-        bars_1h, exec_bars, window_days=int((v_end - t_end) / 86400),
-        start_ts=t_end, end_ts=v_end, config=config, exec_interval=interval,
+        bars_1h,
+        exec_bars,
+        window_days=int((v_end - t_end) / 86400),
+        start_ts=t_end,
+        end_ts=v_end,
+        config=config,
+        exec_interval=interval,
         extra_killed=train_killed,
     )
     test = run_execution_replay(
-        bars_1h, exec_bars, window_days=int((end_ts - v_end) / 86400),
-        start_ts=v_end, end_ts=end_ts, config=config, exec_interval=interval,
+        bars_1h,
+        exec_bars,
+        window_days=int((end_ts - v_end) / 86400),
+        start_ts=v_end,
+        end_ts=end_ts,
+        config=config,
+        exec_interval=interval,
         extra_killed=train_killed,
     )
     wf = {"train": train, "validation": val, "test": test}
@@ -1103,17 +1146,13 @@ def verify_live_rules_match_baseline() -> dict[str, Any]:
         checks["replay_killed_buckets"] = [list(k) for k in sorted(REPLAY_KILLED_BUCKETS)]
         checks["global_killed_regime_thesis"] = [list(k) for k in sorted(GLOBAL_KILLED_REGIME_THESIS)]
         from backend.services import portfolio_engine as pe_mod
+
         checks["portfolio_engine_has_bucket_gate"] = hasattr(pe_mod.PortfolioEngine, "_apply_bucket_quality_gate")
         sample = evaluate_bucket_entry(symbol="BTC/USDT", regime="range", setup=SETUP_VWAP_REVERSION)
         checks["btc_range_vwap_blocked_live"] = not sample.get("allowed")
         sample2 = evaluate_bucket_entry(symbol="ETH/USDT", regime="neutral", setup=SETUP_VWAP_REVERSION)
         checks["eth_neutral_vwap_allowed"] = sample2.get("allowed")
-        checks["match"] = (
-            checks["baseline_file_exists"]
-            and checks["portfolio_engine_has_bucket_gate"]
-            and checks["btc_range_vwap_blocked_live"]
-            and checks["eth_neutral_vwap_allowed"]
-        )
+        checks["match"] = checks["baseline_file_exists"] and checks["portfolio_engine_has_bucket_gate"] and checks["btc_range_vwap_blocked_live"] and checks["eth_neutral_vwap_allowed"]
     except Exception as e:
         checks["match"] = False
         checks["error"] = str(e)
@@ -1122,7 +1161,7 @@ def verify_live_rules_match_baseline() -> dict[str, Any]:
 
 def extended_discovery(bars_1h: dict[str, list[dict]]) -> dict[str, Any]:
     """Scan longer 1h history for bull/bear opportunities (no live enablement)."""
-    from backend.services.day_regime_router import DAY_REGIME_BULL, DAY_REGIME_BEAR
+    from backend.services.day_regime_router import DAY_REGIME_BEAR, DAY_REGIME_BULL
     from scripts.run_day_bucket_discovery import _scan_opportunities
 
     end_ts = bars_1h[SYMBOLS[0]][-1]["ts"]
@@ -1137,14 +1176,19 @@ def extended_discovery(bars_1h: dict[str, list[dict]]) -> dict[str, Any]:
             (DAY_REGIME_BEAR, "BREAKOUT_CONTINUATION"),
         ):
             scan = _scan_opportunities(bars_1h, symbol=sym, regime=reg, thesis=thesis)
-            results["candidates"].append({
-                "id": f"{sym}/{reg}/{thesis}",
-                "would_enter_90d_equiv": scan.get("would_enter", 0),
-                "top_block_reason": max(
-                    ((k, v) for k, v in scan.items() if k != "would_enter"),
-                    key=lambda x: x[1], default=("none", 0),
-                )[0] if scan else "no_data",
-            })
+            results["candidates"].append(
+                {
+                    "id": f"{sym}/{reg}/{thesis}",
+                    "would_enter_90d_equiv": scan.get("would_enter", 0),
+                    "top_block_reason": max(
+                        ((k, v) for k, v in scan.items() if k != "would_enter"),
+                        key=lambda x: x[1],
+                        default=("none", 0),
+                    )[0]
+                    if scan
+                    else "no_data",
+                }
+            )
     return results
 
 
@@ -1236,10 +1280,7 @@ def main() -> int:
             "taker_fee": primary_cfg.taker_fee,
             "slippage_buffer": primary_cfg.slippage_buffer,
         }
-        live_check["economics_match_replay"] = (
-            abs(live_econ["taker_fee_pct"] - primary_cfg.taker_fee) < 1e-9
-            and abs(live_econ["maker_fee_pct"] - primary_cfg.maker_fee) < 1e-9
-        )
+        live_check["economics_match_replay"] = abs(live_econ["taker_fee_pct"] - primary_cfg.taker_fee) < 1e-9 and abs(live_econ["maker_fee_pct"] - primary_cfg.maker_fee) < 1e-9
         ext_discovery = extended_discovery(bars_1h_ext)
 
         w90 = hi_res.get("windows", {}).get("90d", {})
@@ -1264,9 +1305,7 @@ def main() -> int:
                     "buy_fill/sell_fill embed order-book half-spread + slippage buffer; "
                     "fees subtracted once; gate uses simulated fill net PnL / notional"
                 ),
-                "legacy_old_replay_math_path": (
-                    "old_replay only: subtracted roundtrip_cost again after fill-adjusted prices"
-                ),
+                "legacy_old_replay_math_path": ("old_replay only: subtracted roundtrip_cost again after fill-adjusted prices"),
                 "legacy_profile_used_for_pass_criteria": False,
                 "legacy_replay_math_path_removed_from_accepted": True,
             },
@@ -1280,9 +1319,7 @@ def main() -> int:
                 "all_pass": hi_res.get("pass_criteria", {}).get("all_pass"),
             },
             "stress_tests": stress,
-            "stress_all_pass": all(
-                v.get("stays_positive") for v in stress.values() if isinstance(v, dict) and "stays_positive" in v
-            ),
+            "stress_all_pass": all(v.get("stays_positive") for v in stress.values() if isinstance(v, dict) and "stays_positive" in v),
             "extended_history_days": ext_days,
             "extended_discovery": ext_discovery,
             "summary": {

@@ -293,14 +293,14 @@ FEATURE_QUALITY: dict[str, str] = {
     "volume_ma_20": "CALCULATED",
     "volume_ratio": "CALCULATED",
     "volume_price_trend": "CALCULATED",
-    "negative_volume_index": "FALLBACK",  # Not implemented - uses default
-    "positive_volume_index": "FALLBACK",  # Not implemented - uses default
+    "negative_volume_index": "CALCULATED",
+    "positive_volume_index": "CALCULATED",
     "volume_weighted_price": "CALCULATED",
     # Features 81-90: Market Sentiment - UPGRADED: Now using live APIs
     "fear_greed_index": "LIVE",  # ✅ UPGRADED: alternative.me API (free, no key)
     "social_sentiment": "LIVE",  # ✅ UPGRADED: Live sentiment from market_sentiment_agent
     "news_sentiment": "LIVE",  # ✅ UPGRADED: Live news via real_time_news_analyzer
-    "put_call_ratio": "FALLBACK",  # N/A for crypto (options data)
+    "put_call_ratio": "UNSUPPORTED_FOR_SPOT",  # N/A for crypto spot (options data)
     "vix": "CALCULATED",  # ✅ UPGRADED: Derived from BTC volatility
     "market_cap": "LIVE",  # ✅ UPGRADED: From CoinGecko/Binance
     "supply": "LIVE",  # ✅ UPGRADED: From exchange info
@@ -319,23 +319,23 @@ FEATURE_QUALITY: dict[str, str] = {
     "second": "LIVE",
     "seconds_since_midnight": "LIVE",
     # Features 101-108: Advanced Technical Analysis
-    "fibonacci_retracement_23.6": "FALLBACK",  # Falls back to current price
-    "fibonacci_retracement_38.2": "FALLBACK",
-    "fibonacci_retracement_61.8": "FALLBACK",
-    "pivot_point": "FALLBACK",
-    "resistance_1": "FALLBACK",
-    "resistance_2": "FALLBACK",
-    "support_1": "FALLBACK",
-    "support_2": "FALLBACK",
+    "fibonacci_retracement_23.6": "CALCULATED",
+    "fibonacci_retracement_38.2": "CALCULATED",
+    "fibonacci_retracement_61.8": "CALCULATED",
+    "pivot_point": "CALCULATED",
+    "resistance_1": "CALCULATED",
+    "resistance_2": "CALCULATED",
+    "support_1": "CALCULATED",
+    "support_2": "CALCULATED",
     # Features 109-116: Advanced Volume Analysis
     "volume_profile_poc": "CALCULATED",  # ✅ Binance historical data
     "volume_profile_vah": "CALCULATED",  # ✅ Binance historical data
     "volume_profile_val": "CALCULATED",  # ✅ Binance historical data
     "vwap": "CALCULATED",
     "twap": "CALCULATED",
-    "volume_imbalance": "FALLBACK",
-    "volume_delta": "FALLBACK",
-    "order_flow": "MISSING_DATA",
+    "volume_imbalance": "CALCULATED_PROXY",
+    "volume_delta": "CALCULATED_PROXY",
+    "order_flow": "CALCULATED_PROXY",
     # Features 117-124: Market Microstructure
     "bid_ask_spread": "LIVE",  # ✅ Binance WebSocket order book
     "order_book_imbalance": "LIVE",  # ✅ Binance WebSocket order book
@@ -343,8 +343,8 @@ FEATURE_QUALITY: dict[str, str] = {
     "liquidity_score": "CALCULATED",  # ✅ Derived from order book
     "price_impact": "CALCULATED",  # ✅ Derived from order book
     "market_efficiency": "CALCULATED",  # ✅ Derived from order book
-    "volatility_smile": "MISSING_DATA",  # Options data not available
-    "price_skewness": "FALLBACK",  # Not properly calculated
+    "volatility_smile": "UNSUPPORTED_FOR_SPOT",
+    "price_skewness": "CALCULATED",
 }
 
 QUALITY_CATEGORIES: dict[str, str] = {

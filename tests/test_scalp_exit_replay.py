@@ -8,9 +8,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.config import get_scalp_config  # noqa: E402
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
-from scripts.replay_scalp_exit_logic import (  # noqa: E402
+from backend.services.binance_scalp.config import get_scalp_config
+from backend.services.binance_scalp.economics import ScalpEconomics
+from scripts.replay_scalp_exit_logic import (
     LOOP_INTERVAL_SEC,
     _new_sell_gate,
     _snapshot_from_bid,

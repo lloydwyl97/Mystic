@@ -121,9 +121,7 @@ def message_matches_base(text: str, base: str) -> bool:
         if re.search(rf"\b{re.escape(alias)}\b", t):
             return True
     pair = f"{base.lower()}usdt"
-    if pair in t.replace("/", "").replace("-", ""):
-        return True
-    return False
+    return pair in t.replace("/", "").replace("-", "")
 
 
 def score_messages_for_base(messages: list[dict[str, Any]], base: str) -> tuple[float, int, int] | None:

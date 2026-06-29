@@ -7,9 +7,7 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
-_REPO_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..")
-)
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 load_dotenv(os.path.join(_REPO_ROOT, ".env"), override=False)
 
 
@@ -70,11 +68,7 @@ class ScalpConfig:
             strategy_id="scalp",
             exchange="binance_us",
             calibration_mode=_bool("SCALP_CALIBRATION_MODE", False),
-            calibration_profile=(
-                os.getenv("SCALP_CALIBRATION_PROFILE", "moderate") or "moderate"
-            )
-            .strip()
-            .lower(),
+            calibration_profile=(os.getenv("SCALP_CALIBRATION_PROFILE", "moderate") or "moderate").strip().lower(),
             disabled_strategies=frozenset(
                 s.strip().lower()
                 for s in (
@@ -94,9 +88,7 @@ class ScalpConfig:
 
     def assert_no_live_trading(self) -> None:
         if self.scalp_live:
-            raise RuntimeError(
-                "SCALP_LIVE must remain false in Phase 1. No scalp live orders."
-            )
+            raise RuntimeError("SCALP_LIVE must remain false in Phase 1. No scalp live orders.")
         if self.allow_market_orders:
             raise RuntimeError("SCALP_ALLOW_MARKET_ORDERS must remain false.")
         if self.calibration_mode and self.scalp_live:

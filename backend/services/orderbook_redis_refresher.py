@@ -38,6 +38,13 @@ class OrderbookRedisRefresher:
         self.is_running = True
         self._task = asyncio.create_task(self._loop(), name="orderbook_redis_refresher:loop")
         logger.info("OrderbookRedisRefresher started for %s", self.symbols)
+        try:
+            from backend.config.redis_config import get_shared_redis_async
+
+            r = await get_shared_redis_async()
+            await self.refresh_all(r, force=True)
+        except Exception as exc:
+            logger.debug("OrderbookRedisRefresher boot refresh failed: %s", exc)
 
     async def stop(self) -> None:
         self.is_running = False
@@ -48,36 +55,27 @@ class OrderbookRedisRefresher:
             self._task = None
 
     async def refresh_symbol(self, base: str, redis_client: Any) -> bool:
-        from backend.services.order_book_service import fetch_order_book_features_live
+        from backend.services.order_book_service import fetch_order_book_features_live, write_orderbook_redis_async
 
-        ccxt = f"{base}/USDT"
+        ccxt = f"{_base(base)}/USDT"
         feats = await fetch_order_book_features_live(ccxt)
         if not feats or float(feats.get("bid_ask_spread") or 0) <= 0:
             return False
-        if redis_client is None:
-            return True
-        key = f"orderbook:{base}"
-        ttl = max(8, int(os.getenv("ORDERBOOK_REDIS_TTL_SEC", "30")))
-        mapping = {k: str(v) for k, v in feats.items()}
-        mapping["ts_utc"] = str(time.time())
-        mapping["source"] = "rest_fallback"
-        pipe = redis_client.pipeline(transaction=True)
-        pipe.hset(key, mapping=mapping)
-        pipe.expire(key, ttl)
-        await pipe.execute()
-        self._last_fetch[base] = time.time()
-        return True
+        ok = await write_orderbook_redis_async(_base(base), feats, redis_client, source="rest_fallback")
+        if ok:
+            self._last_fetch[_base(base)] = time.time()
+        return ok
 
-    async def refresh_all(self, redis_client: Any) -> dict[str, bool]:
+    async def refresh_all(self, redis_client: Any, *, force: bool = False) -> dict[str, bool]:
         results: dict[str, bool] = {}
-        min_gap = max(5.0, float(os.getenv("ORDERBOOK_MIN_INTERVAL_SEC", "15")))
+        min_gap = max(5.0, float(os.getenv("ORDERBOOK_MIN_INTERVAL_SEC", "10")))
         now = time.time()
         for base in self.symbols:
-            if now - self._last_fetch.get(base, 0.0) < min_gap:
+            if not force and now - self._last_fetch.get(base, 0.0) < min_gap:
                 continue
             try:
                 results[base] = await self.refresh_symbol(base, redis_client)
-                await asyncio.sleep(0.35)
+                await asyncio.sleep(0.25)
             except Exception as exc:
                 logger.debug("orderbook refresh failed %s: %s", base, exc)
                 results[base] = False
@@ -88,7 +86,7 @@ class OrderbookRedisRefresher:
 
         from backend.config.redis_config import get_shared_redis_async
 
-        interval = max(15, int(os.getenv("ORDERBOOK_REFRESH_INTERVAL_SEC", "45")))
+        interval = max(15, int(os.getenv("ORDERBOOK_REFRESH_INTERVAL_SEC", "25")))
         while self.is_running:
             t0 = time.time()
             try:

@@ -155,10 +155,7 @@ async def execute_live_market_buy(payload: dict[str, Any] = _request_body, _: No
     """Retired: live orders must not bypass portfolio_engine gates."""
     raise HTTPException(
         status_code=410,
-        detail=(
-            "POST /api/trading/execute_live_market_buy is retired. "
-            "Live DAY execution must go through portfolio_engine when LIVE mode is armed."
-        ),
+        detail=("POST /api/trading/execute_live_market_buy is retired. Live DAY execution must go through portfolio_engine when LIVE mode is armed."),
     )
 
 
@@ -167,10 +164,7 @@ async def execute_live_market_sell(payload: dict[str, Any] = _request_body, _: N
     """Retired: live orders must not bypass portfolio_engine gates."""
     raise HTTPException(
         status_code=410,
-        detail=(
-            "POST /api/trading/execute_live_market_sell is retired. "
-            "Live DAY exits must go through portfolio_engine monitor loop."
-        ),
+        detail=("POST /api/trading/execute_live_market_sell is retired. Live DAY exits must go through portfolio_engine monitor loop."),
     )
 
 

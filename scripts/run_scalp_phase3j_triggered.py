@@ -15,16 +15,15 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-import redis  # noqa: E402
-
-from backend.services.binance_scalp.config import get_scalp_config  # noqa: E402
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
-from backend.services.binance_scalp.scalp_control import (  # noqa: E402
+import redis
+from backend.services.binance_scalp.config import get_scalp_config
+from backend.services.binance_scalp.economics import ScalpEconomics
+from backend.services.binance_scalp.scalp_control import (
     control_key,
     is_entry_armed,
     set_entry_armed,
 )
-from scripts.watch_scalp_entry_opportunity import watch_loop  # noqa: E402
+from scripts.watch_scalp_entry_opportunity import watch_loop
 
 OUT_DIR = Path("/tmp/scalp_phase3j")
 ENV_PATH = REPO / ".env"
@@ -37,12 +36,7 @@ WATCH_MAX_SEC = 7200.0
 def _set_paper_enabled(enabled: bool) -> None:
     text = ENV_PATH.read_text()
     flag = "true" if enabled else "false"
-    lines = [
-        f"SCALP_PAPER_ENABLED={flag}"
-        if line.startswith("SCALP_PAPER_ENABLED=")
-        else line
-        for line in text.splitlines()
-    ]
+    lines = [f"SCALP_PAPER_ENABLED={flag}" if line.startswith("SCALP_PAPER_ENABLED=") else line for line in text.splitlines()]
     if not any(line.startswith("SCALP_PAPER_ENABLED=") for line in lines):
         lines.append(f"SCALP_PAPER_ENABLED={flag}")
     ENV_PATH.write_text("\n".join(lines) + ("\n" if text.endswith("\n") else ""))
@@ -50,23 +44,11 @@ def _set_paper_enabled(enabled: bool) -> None:
 
 def _day_snapshot() -> dict:
     with sqlite3.connect(DB) as conn:
-        ledger = conn.execute(
-            "SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1"
-        ).fetchone()
-        xrp = conn.execute(
-            "SELECT symbol, quantity, entry_price FROM portfolio_engine_positions WHERE symbol LIKE '%XRP%'"
-        ).fetchall()
+        ledger = conn.execute("SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
+        xrp = conn.execute("SELECT symbol, quantity, entry_price FROM portfolio_engine_positions WHERE symbol LIKE '%XRP%'").fetchall()
         paper_n = conn.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0]
-    ai = sorted(
-        k
-        for k in subprocess.check_output(["redis-cli", "KEYS", "ai_signal:day:*"], text=True).split()
-        if k
-    )
-    scalp_keys = sorted(
-        k
-        for k in subprocess.check_output(["redis-cli", "KEYS", "scalp:*"], text=True).split()
-        if k
-    )
+    ai = sorted(k for k in subprocess.check_output(["redis-cli", "KEYS", "ai_signal:day:*"], text=True).split() if k)
+    scalp_keys = sorted(k for k in subprocess.check_output(["redis-cli", "KEYS", "scalp:*"], text=True).split() if k)
     try:
         with urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=5) as r:
             health = r.status
@@ -118,9 +100,7 @@ def _collect_trades(since: str) -> dict:
             "SELECT COUNT(*) FROM scalp_rejects WHERE reason='WOULD_ENTER_NOT_ARMED' AND created_at >= ?",
             (since,),
         ).fetchone()[0]
-        open_pos = conn.execute(
-            "SELECT * FROM scalp_paper_positions WHERE status='OPEN'"
-        ).fetchall()
+        open_pos = conn.execute("SELECT * FROM scalp_paper_positions WHERE status='OPEN'").fetchall()
 
     closes = []
     missed = []

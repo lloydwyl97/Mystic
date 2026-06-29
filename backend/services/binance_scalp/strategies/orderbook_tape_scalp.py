@@ -34,11 +34,7 @@ class OrderbookTapeScalpStrategy:
             return reject_signal(ctx, self.name, "ASK_LIQUIDITY_TOO_THICK")
 
         mom = ctx.mom
-        if not (
-            mom.bid_change_15s > 0
-            and mom.mid_change_15s > 0
-            and mom.mid_change_30s > 0
-        ):
+        if not (mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0):
             return reject_signal(ctx, self.name, "PRICE_NOT_CONFIRMING_IMBALANCE")
 
         expected = min(ctx.snap.spread_pct * 6 + imb * 0.002, 0.004)

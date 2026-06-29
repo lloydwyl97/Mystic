@@ -1,0 +1,26 @@
+{
+  "baseline_id": "allweather_breakout_pullback_paper_candidate",
+  "parent_rollback_baseline_id": "day_baseline_all_pass_v1_size_1_5",
+  "candidate_id": "allweather_breakout_pullback_lab_1_5x",
+  "strategy_family": "ALLWEATHER_BREAKOUT_PULLBACK",
+  "locked_at": "2026-06-18T02:30:00+00:00",
+  "live_applied": false,
+  "paper_applied": true,
+  "execution_mode_required": "paper",
+  "notional_multiplier": 1.5,
+  "day_base_notional_per_slot_usd": 2500.0,
+  "day_target_notional_per_slot_usd": 3750.0,
+  "day_max_deployed_usd": 15000.0,
+  "day_max_open_slots": 4,
+  "min_net_profit_to_sell": "not_applied_to_allweather_exits",
+  "exit_reasons": [
+    "ALLWEATHER_ATR_TARGET_EXIT",
+    "ALLWEATHER_ATR_STOP_EXIT",
+    "ALLWEATHER_TIME_STOP_EXIT"
+  ],
+  "active_day_family_exclusive": true,
+  "baseline_vwap_simultaneous_execution": false,
+  "replay_reference": "allweather_breakout_pullback_production_adapter_review_latest.json",
+  "expected_monthly_pnl_usd_25k_replay": 983.14,
+  "rollback_note": "Set DAY_BASELINE_LOCK_ID=day_baseline_all_pass_v1_size_1_5 and ALLWEATHER_BREAKOUT_PULLBACK_ENABLED=false to revert"
+}

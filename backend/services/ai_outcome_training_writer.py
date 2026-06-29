@@ -90,7 +90,10 @@ def _propagate_symbol_strategy_expectancy(conn: sqlite3.Connection, sym: str, st
         if not agg:
             return
         expectancy, good_count, bad_count, total_trades = (
-            float(agg[0] or 0.0), int(agg[1] or 0), int(agg[2] or 0), int(agg[3] or 0),
+            float(agg[0] or 0.0),
+            int(agg[1] or 0),
+            int(agg[2] or 0),
+            int(agg[3] or 0),
         )
         now = datetime.now(timezone.utc).isoformat()
         values: dict[str, Any] = {
@@ -115,9 +118,7 @@ def _propagate_symbol_strategy_expectancy(conn: sqlite3.Connection, sym: str, st
         update_cols = [c for c in ins_cols if c not in ("symbol", "strategy_id")]
         set_clause = ", ".join(f"{c}=excluded.{c}" for c in update_cols)
         conn.execute(
-            f"INSERT INTO ai_symbol_strategy_expectancy ({', '.join(ins_cols)}) "
-            f"VALUES ({placeholders}) "
-            f"ON CONFLICT(symbol, strategy_id) DO UPDATE SET {set_clause}",
+            f"INSERT INTO ai_symbol_strategy_expectancy ({', '.join(ins_cols)}) VALUES ({placeholders}) ON CONFLICT(symbol, strategy_id) DO UPDATE SET {set_clause}",
             tuple(values[c] for c in ins_cols),
         )
     except Exception as exc:
@@ -202,6 +203,27 @@ def record_outcome_training_row(
                             "model_trained_at": ex.get("model_trained_at"),
                             "model_accuracy": ex.get("model_accuracy"),
                             "close_reason": close_reason,
+                            "ai_confidence": ex.get("ai_confidence"),
+                            "confidence": ex.get("confidence"),
+                            "entry_buy_margin": ex.get("entry_buy_margin"),
+                            "buy_margin": ex.get("buy_margin"),
+                            "trend_score": ex.get("trend_score"),
+                            "chop_score": ex.get("chop_score"),
+                            "coin_expectancy": ex.get("coin_expectancy"),
+                            "signal_ctx_rs_btc": ex.get("signal_ctx_rs_btc"),
+                            "entry_spread_pct": ex.get("entry_spread_pct"),
+                            "selected_net_expected_value": ex.get("selected_net_expected_value"),
+                            "day_route_regime": ex.get("day_route_regime"),
+                            "setup_type": ex.get("setup_type") or ex.get("entry_thesis"),
+                            "final_selection_score": ex.get("final_selection_score"),
+                            "feature_health_pass": ex.get("feature_health_pass"),
+                            "feature_health_pct": ex.get("feature_health_pct"),
+                            "feature_health_bad_count": ex.get("feature_health_bad_count"),
+                            "setup_score": ex.get("setup_score"),
+                            "execution_quality_score": ex.get("execution_quality_score"),
+                            "feature_health_score": ex.get("feature_health_score"),
+                            "block_scores_json": ex.get("block_scores_json"),
+                            "intelligence_rank_delta": ex.get("intelligence_rank_delta"),
                         },
                         separators=(",", ":"),
                     ),
@@ -209,7 +231,26 @@ def record_outcome_training_row(
             )
             _propagate_symbol_strategy_expectancy(conn, sym, strategy_id or "day")
             conn.commit()
-            return int(cur.lastrowid or 0) or None
+            row_id = int(cur.lastrowid or 0) or None
+        try:
+            from backend.services.ai_strategy_score_weight_writer import propagate_adaptive_score_weights_for_close
+
+            ex_propagate = dict(ex)
+            ex_propagate["good_bad_memory_class"] = gb
+            ex_propagate["net_pnl_pct"] = net_profit_pct
+            propagate_adaptive_score_weights_for_close(
+                symbol=sym,
+                strategy_id=strategy_id or "day",
+                explainability=ex_propagate,
+                db_path=db_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                "propagate_adaptive_score_weights_for_close deferred failed symbol=%s: %s",
+                sym,
+                exc,
+            )
+        return row_id
     except Exception as exc:
         logger.warning("record_outcome_training_row failed symbol=%s: %s", symbol, exc)
         return None

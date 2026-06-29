@@ -410,20 +410,13 @@ async def get_paper_trading_status() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-
-
 @router.post("/process-signals")
 async def process_signals() -> dict[str, Any]:
     """Retired: Redis buy bridge removed. DAY buys run only via portfolio_engine_integration bar path."""
     raise HTTPException(
         status_code=410,
-        detail=(
-            "POST /api/paper-trading/process-signals is retired. "
-            "DAY buys execute only through start_portfolio_engine_integration → process_bar_candidates → execute_buy_fifo."
-        ),
+        detail=("POST /api/paper-trading/process-signals is retired. DAY buys execute only through start_portfolio_engine_integration → process_bar_candidates → execute_buy_fifo."),
     )
-
-
 
 
 @router.get("/portfolio")

@@ -22,11 +22,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _api_key_present() -> tuple[bool, str]:
-    key = (
-        os.getenv("BINANCE_US_API_KEY", "")
-        or os.getenv("BINANCEUS_API_KEY", "")
-        or os.getenv("BINANCE_API_KEY", "")
-    )
+    key = os.getenv("BINANCE_US_API_KEY", "") or os.getenv("BINANCEUS_API_KEY", "") or os.getenv("BINANCE_API_KEY", "")
     secret = (
         os.getenv("BINANCE_US_SECRET_KEY", "")
         or os.getenv("BINANCE_US_API_SECRET", "")
@@ -63,11 +59,7 @@ async def _fetch_exchange_account_auth() -> dict[str, Any]:
         out["errors"].append(key_msg)
         return out
 
-    api_key = (
-        os.getenv("BINANCE_US_API_KEY", "")
-        or os.getenv("BINANCEUS_API_KEY", "")
-        or os.getenv("BINANCE_API_KEY", "")
-    )
+    api_key = os.getenv("BINANCE_US_API_KEY", "") or os.getenv("BINANCEUS_API_KEY", "") or os.getenv("BINANCE_API_KEY", "")
     api_secret = (
         os.getenv("BINANCE_US_SECRET_KEY", "")
         or os.getenv("BINANCE_US_API_SECRET", "")
@@ -170,13 +162,13 @@ def _tiny_live_checklist() -> list[dict[str, Any]]:
 
 async def build_live_readiness_report() -> dict[str, Any]:
     """Single read-only live readiness packet."""
+    from backend.config.core_test_flags import ENABLE_SLEEVE_BLOCKING
     from backend.config.live_test_mode import can_place_live_orders_sync, get_live_test_api_fields
     from backend.config.protected_execution import (
         PROTECTED_LIMIT_ALLOW_PARTIAL,
         USE_PROTECTED_LIMIT_EXECUTION,
         get_protected_execution_snapshot,
     )
-    from backend.config.core_test_flags import ENABLE_SLEEVE_BLOCKING
     from backend.services.execution_mode_service import is_live_execution_allowed_sync
 
     execution_mode = (os.getenv("EXECUTION_MODE") or "paper").strip().lower()

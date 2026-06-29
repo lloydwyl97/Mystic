@@ -3,6 +3,7 @@ Universe-expansion labeled dataset — research only.
 
 Extends 145 base features with liquidity / cross-symbol context features.
 """
+
 from __future__ import annotations
 
 import bisect
@@ -13,8 +14,8 @@ import numpy as np
 
 from backend.services.ai_outcome_dataset import (
     Economics,
-    compute_forward_labels_at_idx,
     build_features_145,
+    compute_forward_labels_at_idx,
 )
 from backend.services.ltf_pattern_miner import resample_bars
 
@@ -159,29 +160,44 @@ def build_universe_dataset_rows(
         vec145, meta = feat
         meta.update(universe_meta)
         extra = build_universe_extra_features(
-            ts, bars_by_tf, meta=meta, btc_1h=btc_1h,
-            strength_ranks=strength_ranks, vol_ranks=vol_ranks, symbol=symbol,
+            ts,
+            bars_by_tf,
+            meta=meta,
+            btc_1h=btc_1h,
+            strength_ranks=strength_ranks,
+            vol_ranks=vol_ranks,
+            symbol=symbol,
         )
         full_vec = list(vec145) + extra
 
         idx_1m = bisect.bisect_right(ts_arr, ts) - 1
         labels = compute_forward_labels_at_idx(
-            idx_1m, ts, bar["close"], ts_arr, high_arr, low_arr, close_arr, econ, scalp=scalp,
+            idx_1m,
+            ts,
+            bar["close"],
+            ts_arr,
+            high_arr,
+            low_arr,
+            close_arr,
+            econ,
+            scalp=scalp,
         )
         if not labels:
             continue
 
-        rows.append({
-            "symbol": symbol,
-            "timestamp": ts,
-            "timeframe": "1m" if scalp else "1h",
-            "features": full_vec,
-            "feature_dim": len(full_vec),
-            "meta": meta,
-            "labels": labels,
-            "entry_price": bar["close"],
-            "half_spread": half_spread,
-        })
+        rows.append(
+            {
+                "symbol": symbol,
+                "timestamp": ts,
+                "timeframe": "1m" if scalp else "1h",
+                "features": full_vec,
+                "feature_dim": len(full_vec),
+                "meta": meta,
+                "labels": labels,
+                "entry_price": bar["close"],
+                "half_spread": half_spread,
+            }
+        )
     return rows
 
 
@@ -204,7 +220,7 @@ def compute_symbol_ranks(symbols_meta: list[dict], bars_1h_by_sym: dict[str, lis
         items = sorted(d.items(), key=lambda x: x[1])
         n = len(items)
         if n <= 1:
-            return {k: 0.5 for k in d}
+            return dict.fromkeys(d, 0.5)
         return {k: i / (n - 1) for i, (k, _) in enumerate(items)}
 
     return _rank(strength), _rank(volat)

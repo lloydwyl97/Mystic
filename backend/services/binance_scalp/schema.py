@@ -21,6 +21,9 @@ SCALP_TABLES = (
     "scalp_scoreboard_daily",
     "scalp_trade_audit",
     "scalp_position_reviews",
+    "scalp_outcome_attribution",
+    "scalp_post_trade_feature_reviews",
+    "scalp_strategy_score_weights",
 )
 
 SCHEMA_VERSION = 3
@@ -122,16 +125,12 @@ def migrate_scalp_positions_open_unique(conn: sqlite3.Connection) -> bool:
         WHERE status = 'OPEN'
         """
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_scalp_paper_positions_status ON scalp_paper_positions(status)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_scalp_paper_positions_status ON scalp_paper_positions(status)")
     return True
 
 
 def _current_schema_version(conn: sqlite3.Connection) -> int:
-    row = conn.execute(
-        "SELECT schema_version FROM scalp_meta WHERE id = 1"
-    ).fetchone()
+    row = conn.execute("SELECT schema_version FROM scalp_meta WHERE id = 1").fetchone()
     if row is None:
         return 0
     return int(row[0])
@@ -179,9 +178,7 @@ def migrate_exit_manager_v3(conn: sqlite3.Connection) -> bool:
         )
         """
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_scalp_position_reviews_trade ON scalp_position_reviews(trade_id)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_scalp_position_reviews_trade ON scalp_position_reviews(trade_id)")
     return added
 
 
@@ -292,9 +289,7 @@ def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list
             """
         )
         # Fresh installs: positions table without symbol UNIQUE + partial index.
-        if not conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scalp_paper_positions'"
-        ).fetchone():
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='scalp_paper_positions'").fetchone():
             conn.executescript(_positions_ddl(with_symbol_unique=False))
             conn.execute(
                 f"""
@@ -303,9 +298,7 @@ def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list
                 WHERE status = 'OPEN'
                 """
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_scalp_paper_positions_status ON scalp_paper_positions(status)"
-            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_scalp_paper_positions_status ON scalp_paper_positions(status)")
 
         row = conn.execute("SELECT 1 FROM scalp_meta WHERE id = 1").fetchone()
         if row is None:
@@ -325,6 +318,17 @@ def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list
                 (principal, principal, principal),
             )
         applied = apply_scalp_migrations(conn)
+        try:
+            from backend.services.scalp_outcome_attribution import ensure_scalp_outcome_attribution_table
+            from backend.services.scalp_post_trade_feature_review import ensure_scalp_post_trade_review_table
+            from backend.services.scalp_strategy_score_weight_writer import ensure_scalp_strategy_score_weights_table
+
+            ensure_scalp_outcome_attribution_table(str(path))
+            ensure_scalp_post_trade_review_table(str(path))
+            ensure_scalp_strategy_score_weights_table(str(path))
+            applied.append("ensure_scalp_intelligence_tables")
+        except Exception:
+            pass
         conn.commit()
         return applied
 
@@ -334,9 +338,7 @@ def assert_scalp_sql_only(statement: str) -> None:
     lower = statement.lower()
     for table in DAY_TABLES:
         if table in lower:
-            raise RuntimeError(
-                f"scalp engine blocked SQL touching DAY table {table!r}"
-            )
+            raise RuntimeError(f"scalp engine blocked SQL touching DAY table {table!r}")
 
 
 def verify_scalp_tables(db_path: str | Path) -> dict[str, int]:
@@ -369,16 +371,6 @@ def verify_open_position_constraints(db_path: str | Path) -> dict[str, object]:
             "has_partial_open_index": _has_open_symbol_unique_index(conn),
             "symbol_table_unique": _symbol_has_table_unique(conn),
             "indexes": indexes,
-            "open_rows": [
-                dict(r)
-                for r in conn.execute(
-                    "SELECT id, symbol, status FROM scalp_paper_positions WHERE status='OPEN'"
-                ).fetchall()
-            ],
-            "all_rows": [
-                dict(r)
-                for r in conn.execute(
-                    "SELECT id, symbol, status, trade_id FROM scalp_paper_positions ORDER BY id"
-                ).fetchall()
-            ],
+            "open_rows": [dict(r) for r in conn.execute("SELECT id, symbol, status FROM scalp_paper_positions WHERE status='OPEN'").fetchall()],
+            "all_rows": [dict(r) for r in conn.execute("SELECT id, symbol, status, trade_id FROM scalp_paper_positions ORDER BY id").fetchall()],
         }

@@ -5,13 +5,14 @@ Controlled-risk replay search — EXHAUSTED (diagnostic only).
 Set MYSTIC_FORCE_EXHAUSTED_RESEARCH=1 to re-run.
 Active path: scripts/run_topfour_profit_rebuild.py
 """
+
 from __future__ import annotations
 
 import json
 import sys
 import traceback
 from copy import deepcopy
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +24,8 @@ from backend.services.day_regime_router import DAY_REGIME_BULL
 from backend.services.day_trade_thesis import SETUP_BREAKOUT_CONTINUATION, SETUP_HTF_TREND_PULLBACK
 from scripts.run_day_execution_replay import (
     ALLOWED_POSITIVE_BUCKETS,
-    ExecutionConfig,
     STRESS_SCENARIOS,
+    ExecutionConfig,
     _build_fee_profiles,
     _run_stress_90d,
     _run_suite,
@@ -114,10 +115,7 @@ def _evaluate_strategy(
     monthly = round(net90 / 3.0, 2)
     longest = float(w90.get("longest_hold_hours") or 0)
     dd = float(w90.get("max_drawdown_pct") or 99)
-    stress_ok = all(
-        v.get("stays_positive") for v in stress.values()
-        if isinstance(v, dict) and "stays_positive" in v
-    )
+    stress_ok = all(v.get("stays_positive") for v in stress.values() if isinstance(v, dict) and "stays_positive" in v)
     fat_tail = longest > MAX_HOLD_H
     red_sells = int(w90.get("red_thesis_sell_count") or 0)
     pf = _profit_factor(w90)
@@ -185,10 +183,7 @@ def _run_scalp_controlled(name: str, strategy: str, profile: str, max_hold_min: 
     env["SCALP_REPLAY_HOURS"] = "168"
     env["SCALP_CALIBRATION_PROFILE"] = profile
     env["SCALP_MAX_HOLD_SEC"] = str(max_hold_min * 60)
-    env["SCALP_DISABLED_STRATEGIES"] = ",".join(
-        s for s in ("orderbook_tape_scalp", "range_bounce_scalp", "vwap_ema_reclaim", "breakout_momentum")
-        if s != strategy
-    )
+    env["SCALP_DISABLED_STRATEGIES"] = ",".join(s for s in ("orderbook_tape_scalp", "range_bounce_scalp", "vwap_ema_reclaim", "breakout_momentum") if s != strategy)
     proc = subprocess.run(
         [
             sys.executable,
@@ -217,18 +212,20 @@ def _run_scalp_controlled(name: str, strategy: str, profile: str, max_hold_min: 
         wr = round(100.0 * wins / max(1, wins + losses), 2)
         mo_tr = round(n * (730.0 / hours), 2)
         mo_pnl = round(net * (730.0 / hours) / 3.0, 2)
-        row.update({
-            "trades_per_month": mo_tr,
-            "monthly_pnl_usd_on_25k": mo_pnl,
-            "pct_per_month_on_25k": round(100.0 * mo_pnl / PRINCIPAL, 4),
-            "win_rate_pct": wr,
-            "expectancy_per_trade_usd": round(net / max(1, n), 4),
-            "all_pass": net >= 0 and n > 0,
-            "target_met_500": mo_pnl >= TARGET_500,
-            "verdict": "accepted" if net > 0 and n > 0 else "rejected",
-            "accept_or_reject_reason": "negative_expectancy" if net < 0 and n > 0 else ("no_trades" if n == 0 else "pass"),
-            "by_strategy": rep.get("by_strategy"),
-        })
+        row.update(
+            {
+                "trades_per_month": mo_tr,
+                "monthly_pnl_usd_on_25k": mo_pnl,
+                "pct_per_month_on_25k": round(100.0 * mo_pnl / PRINCIPAL, 4),
+                "win_rate_pct": wr,
+                "expectancy_per_trade_usd": round(net / max(1, n), 4),
+                "all_pass": net >= 0 and n > 0,
+                "target_met_500": mo_pnl >= TARGET_500,
+                "verdict": "accepted" if net > 0 and n > 0 else "rejected",
+                "accept_or_reject_reason": "negative_expectancy" if net < 0 and n > 0 else ("no_trades" if n == 0 else "pass"),
+                "by_strategy": rep.get("by_strategy"),
+            }
+        )
     except Exception:
         row["error"] = proc.stderr[-500:] if proc.stderr else "no report"
         row["all_pass"] = False
@@ -245,9 +242,7 @@ def main() -> int:
     profiles = _build_fee_profiles()
     bars_1h, bars_exec = _load_bars()
     results: list[dict] = []
-    bull_all = frozenset(
-        (s, DAY_REGIME_BULL, SETUP_HTF_TREND_PULLBACK) for s in SYMBOLS
-    ) | frozenset((s, DAY_REGIME_BULL, SETUP_BREAKOUT_CONTINUATION) for s in SYMBOLS)
+    bull_all = frozenset((s, DAY_REGIME_BULL, SETUP_HTF_TREND_PULLBACK) for s in SYMBOLS) | frozenset((s, DAY_REGIME_BULL, SETUP_BREAKOUT_CONTINUATION) for s in SYMBOLS)
 
     # Legacy baseline (profit-only)
     print("  legacy profit-only baseline...", flush=True)
@@ -310,9 +305,7 @@ def main() -> int:
                 "atr_stop_mult": 0.75,
                 "time_stop_hours": 48.0,
                 "min_net_profit_floor": 0.008,
-                "extra_allowed_buckets": frozenset(
-                    (s, DAY_REGIME_BULL, SETUP_BREAKOUT_CONTINUATION) for s in SYMBOLS
-                ),
+                "extra_allowed_buckets": frozenset((s, DAY_REGIME_BULL, SETUP_BREAKOUT_CONTINUATION) for s in SYMBOLS),
                 "regime_override_from_context": {"trending_up": DAY_REGIME_BULL},
             },
         ),

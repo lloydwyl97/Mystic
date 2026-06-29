@@ -1,11 +1,11 @@
 #!/bin/bash
 # MYSTIC startup script
 # Modes:
-#   ./start_mystic.sh core      (canonical 24/7 — DAY-only top-4, no scalp)
-#   ./start_mystic.sh full      (DAY core + scalp paper — scalp explicitly enabled)
-#   ./start_mystic.sh scalp     (scalp paper runner only — uses running backend/live_md if up)
-#   ./start_mystic.sh all       (RETIRED — exits with error; use full)
-#   ./start_mystic.sh backend|live_md|signal|portfolio|learning|collector|ai_context|...
+#   ./start_mystic.sh core|full  (canonical 24/7 — DAY top-4 + scalp paper, separate engines)
+#   ./start_mystic.sh scalp      (scalp runner only — starts backend/live_md if needed)
+#   ./start_mystic.sh backend|live_md|signal|portfolio|learning|ai_context|scalp
+#
+# Retired (exit 1): all, ai, collector, agents, ai_position_tracker, ai_outcome_bridge
 
 set -u
 
@@ -13,7 +13,6 @@ MODE="${1:-core}"
 
 cd /home/mystic/mystic || exit 1
 
-# Load .env then layered local-only flags (same order as scripts/phase1_local_core_stack.sh).
 set -a
 if [ -f ".env" ]; then
     # shellcheck disable=SC1091
@@ -36,6 +35,14 @@ export DATABASE_URL="${DATABASE_URL:-sqlite:////home/mystic/mystic/mystic_tradin
 export PAPER_TRADING_INITIAL_BALANCE="${PAPER_TRADING_INITIAL_BALANCE:-10000.0}"
 export RUN_ID="${RUN_ID:-run_$(date -u +%Y%m%dT%H%M%SZ)}"
 
+LEGACY_PATTERNS=(
+    "live_data_collector.py"
+    "start_ai_ml_trading.py"
+    "start_agent_orchestrator.py"
+    "start_ai_position_tracker.py"
+    "start_ai_outcome_bridge.py"
+)
+
 stop_by_pattern() {
     local pattern="$1"
     local pids
@@ -55,6 +62,13 @@ stop_by_pattern() {
         done
         sleep 1
     fi
+}
+
+stop_legacy_processes() {
+    local pattern
+    for pattern in "${LEGACY_PATTERNS[@]}"; do
+        stop_by_pattern "$pattern"
+    done
 }
 
 require_running() {
@@ -96,14 +110,6 @@ start_signal() {
     require_running "start_ai_signal_generator.py" "AI Signal Generator" "/tmp/mystic_signal.log" 20 1 || return 1
 }
 
-start_ai() {
-    echo "Starting AI ML Trading..."
-    nohup "$PYTHON" start_ai_ml_trading.py > /tmp/mystic_ai.log 2>&1 &
-    require_running "start_ai_ml_trading.py" "AI ML Trading" "/tmp/mystic_ai.log" 20 1 || return 1
-}
-
-# For explicit paper-engine test env (MYSTIC_* / MAX_SPREAD_PCT), use:
-#   ./scripts/start_portfolio_paper_test.sh
 start_portfolio() {
     local log_mode="${1:-append}"
     echo "Starting Portfolio Engine Integration..."
@@ -115,21 +121,8 @@ start_portfolio() {
     require_running "start_portfolio_engine_integration.py" "Portfolio Engine Integration" "/tmp/mystic_portfolio.log" 20 1 || return 1
 }
 
-start_collector() {
-    echo "DEPRECATED: live_data_collector skipped — OHLCV runs in start_live_market_data.py"
-    return 0
-}
-
-start_agents() {
-    echo "Starting Agent Orchestrator..."
-    nohup "$PYTHON" start_agent_orchestrator.py > /tmp/mystic_agents.log 2>&1 &
-    require_running "start_agent_orchestrator.py" "Agent Orchestrator" "/tmp/mystic_agents.log" 20 1 || return 1
-}
-
 start_learning() {
     echo "Starting AI Learning..."
-    # Top-4 historical walk-forward backfill (Tier D depth): sweep all four
-    # coins per collection cycle across the full cached 4h bundle history.
     nice -n 10 nohup env \
         DAY_HISTORICAL_TRAIN_BASES="BTC,ETH,SOL,XRP" \
         DAY_HISTORICAL_TAIL_4H_BARS="480" \
@@ -145,64 +138,42 @@ start_ai_context() {
     require_running "start_ai_market_context.py" "AI Market Context" "/tmp/mystic_ai_context.log" 20 1 || return 1
 }
 
-# DISABLED: backend/services/ai_position_tracker.py is not shipped; not part of DAY engine.
-start_ai_position_tracker() {
-    echo "SKIP: AI Position Tracker disabled (implementation not present; not part of DAY engine)"
-    return 0
+start_scalp() {
+    local scalp_paper="${SCALP_PAPER_ENABLED:-true}"
+    local scalp_auto_arm="${SCALP_PAPER_AUTO_ARM:-true}"
+    local scalp_fee="${SCALP_FEE_MODEL_VERIFIED:-true}"
+    echo "Starting Scalp Paper Runner (SCALP_PAPER_ENABLED=${scalp_paper} AUTO_ARM=${scalp_auto_arm})..."
+    nohup env SCALP_PAPER_ENABLED="${scalp_paper}" SCALP_PAPER_AUTO_ARM="${scalp_auto_arm}" \
+        SCALP_FEE_MODEL_VERIFIED="${scalp_fee}" \
+        "$PYTHON" -m backend.services.binance_scalp.runner > /tmp/mystic_scalp.log 2>&1 &
+    require_running "backend.services.binance_scalp.runner" "Scalp Paper Runner" "/tmp/mystic_scalp.log" 20 1 || return 1
 }
 
-# DISABLED: backend/services/ai_outcome_bridge.py is not shipped; not part of DAY engine.
-start_ai_outcome_bridge() {
-    echo "SKIP: AI Outcome Bridge disabled (implementation not present; not part of DAY engine)"
-    return 0
+stop_live_md() { stop_by_pattern "start_live_market_data.py"; }
+stop_signal() { stop_by_pattern "start_ai_signal_generator.py"; }
+stop_backend() { stop_by_pattern "uvicorn backend.main:app"; }
+stop_portfolio() { stop_by_pattern "start_portfolio_engine_integration.py"; }
+stop_learning() { stop_by_pattern "start_ai_learning.py"; }
+stop_ai_context() { stop_by_pattern "start_ai_market_context.py"; }
+stop_scalp() { stop_by_pattern "backend.services.binance_scalp.runner"; }
+
+stop_core_stack() {
+    stop_scalp
+    stop_backend
+    stop_live_md
+    stop_signal
+    stop_portfolio
+    stop_learning
+    stop_ai_context
+    stop_legacy_processes
 }
 
-stop_live_md() {
-    stop_by_pattern "start_live_market_data.py"
-}
-
-stop_signal() {
-    stop_by_pattern "start_ai_signal_generator.py"
-}
-
-stop_backend() {
-    stop_by_pattern "uvicorn backend.main:app"
-}
-
-stop_ai() {
-    stop_by_pattern "start_ai_ml_trading.py"
-}
-
-stop_portfolio() {
-    stop_by_pattern "start_portfolio_engine_integration.py"
-}
-
-stop_collector() {
-    stop_by_pattern "live_data_collector.py"
-}
-
-stop_agents() {
-    stop_by_pattern "start_agent_orchestrator.py"
-}
-
-stop_learning() {
-    stop_by_pattern "start_ai_learning.py"
-}
-
-stop_ai_context() {
-    stop_by_pattern "start_ai_market_context.py"
-}
-
-stop_ai_position_tracker() {
-    stop_by_pattern "start_ai_position_tracker.py"
-}
-
-stop_ai_outcome_bridge() {
-    stop_by_pattern "start_ai_outcome_bridge.py"
-}
-
-stop_scalp() {
-    stop_by_pattern "backend.services.binance_scalp.runner"
+ensure_redis() {
+    if ! pgrep -x "redis-server" >/dev/null; then
+        echo "Starting Redis..."
+        systemctl start redis-server 2>/dev/null || service redis-server start 2>/dev/null || true
+        sleep 2
+    fi
 }
 
 ensure_running_or_start() {
@@ -216,121 +187,61 @@ ensure_running_or_start() {
     "$start_fn" || return 1
 }
 
-start_scalp() {
-    local scalp_paper="${SCALP_PAPER_ENABLED:-true}"
-    local scalp_auto_arm="${SCALP_PAPER_AUTO_ARM:-true}"
-    local scalp_fee="${SCALP_FEE_MODEL_VERIFIED:-true}"
-    echo "Starting Scalp Paper Runner (SCALP_PAPER_ENABLED=${scalp_paper} AUTO_ARM=${scalp_auto_arm})..."
-    nohup env SCALP_PAPER_ENABLED="${scalp_paper}" SCALP_PAPER_AUTO_ARM="${scalp_auto_arm}" \
-        SCALP_FEE_MODEL_VERIFIED="${scalp_fee}" \
-        "$PYTHON" -m backend.services.binance_scalp.runner > /tmp/mystic_scalp.log 2>&1 &
-    require_running "backend.services.binance_scalp.runner" "Scalp Paper Runner" "/tmp/mystic_scalp.log" 20 1 || return 1
+run_core_stack() {
+    local label="$1"
+    stop_core_stack
+    sleep 2
+    ensure_redis
+
+    start_backend || return 1
+    sleep 3
+    start_live_md || return 1
+    sleep 2
+    start_signal || return 1
+    sleep 2
+    start_portfolio truncate || return 1
+    sleep 2
+    start_ai_context || return 1
+    sleep 1
+    start_learning || return 1
+    sleep 1
+    start_scalp || return 1
+
+    echo ""
+    echo "=========================================="
+    echo "MYSTIC ${label} STACK STARTED (DAY top-4 + scalp paper)"
+    echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
+    echo "Services: Backend + LiveMD + Signal + Portfolio + Context + Learning + Scalp"
+    echo "DAY and scalp are separate engines — PnL and scoreboard are not mixed."
+    echo "Ensure .env has EXTERNAL_SUPERVISOR_MODE=true"
+    echo "=========================================="
+}
+
+retired_mode() {
+    echo "ERROR: Mode '$1' is retired. Use './start_mystic.sh core'."
+    echo "Retired launchers: start_ai_ml_trading.py, live_data_collector.py, start_agent_orchestrator.py,"
+    echo "  start_ai_position_tracker.py, start_ai_outcome_bridge.py — see CANONICAL_SYSTEM.md"
+    exit 1
 }
 
 case "$MODE" in
     core)
-        echo "Mode: core (external supervisor — no duplicate embedded services)"
-        stop_scalp
-        stop_backend
-        stop_live_md
-        stop_signal
-        stop_collector
-        stop_portfolio
-        stop_learning
-        stop_ai_context
-        stop_ai_position_tracker
-        sleep 2
-
-        if ! pgrep -x "redis-server" >/dev/null; then
-            echo "Starting Redis..."
-            systemctl start redis-server 2>/dev/null || service redis-server start 2>/dev/null || true
-            sleep 2
-        fi
-
-        start_backend || exit 1
-        sleep 3
-        start_live_md || exit 1
-        sleep 2
-        start_signal || exit 1
-        sleep 2
-        start_portfolio truncate || exit 1
-        sleep 2
-        start_ai_context || exit 1
-        sleep 1
-        start_learning || exit 1
-        sleep 1
-        start_scalp || exit 1
-
-        echo ""
-        echo "=========================================="
-        echo "MYSTIC CORE STACK STARTED (DAY top-4 + scalp paper)"
-        echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
-        echo "Services: Backend + LiveMD + Signal + Portfolio + Context + Learning + Scalp"
-        echo "DAY and scalp are separate engines — PnL and scoreboard are not mixed."
-        echo "Ensure .env has EXTERNAL_SUPERVISOR_MODE=true"
-        echo "=========================================="
+        echo "Mode: core (canonical 24/7)"
+        run_core_stack "CORE" || exit 1
         ;;
     full)
-        echo "Mode: full (DAY core + scalp paper)"
+        echo "Mode: full (alias of core)"
         systemctl --user stop mystic.target 2>/dev/null || true
-        stop_scalp
-        stop_backend
-        stop_live_md
-        stop_signal
-        stop_collector
-        stop_portfolio
-        stop_learning
-        stop_ai_context
-        stop_ai_position_tracker
-        sleep 2
-
-        if ! pgrep -x "redis-server" >/dev/null; then
-            echo "Starting Redis..."
-            systemctl start redis-server 2>/dev/null || service redis-server start 2>/dev/null || true
-            sleep 2
-        fi
-
-        start_backend || exit 1
-        sleep 3
-        start_live_md || exit 1
-        sleep 2
-        start_signal || exit 1
-        sleep 2
-        start_portfolio truncate || exit 1
-        sleep 2
-        start_ai_context || exit 1
-        sleep 1
-        start_learning || exit 1
-        sleep 1
-        start_scalp || exit 1
-
-        echo ""
-        echo "=========================================="
-        echo "MYSTIC FULL STACK STARTED (DAY paper + scalp paper)"
-        echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
-        echo "DAY: Portfolio + Signal + Context + Learning"
-        echo "SCALP: paper runner — log /tmp/mystic_scalp.log"
-        echo "Ensure .env has EXTERNAL_SUPERVISOR_MODE=true"
-        echo "=========================================="
+        run_core_stack "FULL" || exit 1
         ;;
-    all)
-        echo "ERROR: Mode 'all' is retired. Use './start_mystic.sh full' (recommended) or './start_mystic.sh core'."
-        echo "Legacy agents, start_ai_ml_trading, and MANDATORY_CLEANUP are not part of the supported DAY stack."
-        exit 1
-        ;;
-    ai)
-        echo "ERROR: Mode 'ai' (start_ai_ml_trading) is retired. DAY signals use start_ai_signal_generator.py via full/core stack."
-        exit 1
+    all|ai|collector|agents|ai_position_tracker|ai_outcome_bridge)
+        retired_mode "$MODE"
         ;;
     ai_context)
         echo "Mode: ai_context"
         stop_ai_context
         sleep 1
         start_ai_context || exit 1
-        ;;
-    ai_position_tracker|ai_outcome_bridge)
-        echo "ERROR: Mode '$MODE' is disabled — implementation not present (not part of DAY engine)."
-        exit 1
         ;;
     portfolio)
         echo "Mode: portfolio"
@@ -343,12 +254,6 @@ case "$MODE" in
         stop_learning
         sleep 1
         start_learning || exit 1
-        ;;
-    collector)
-        echo "Mode: collector"
-        stop_collector
-        sleep 1
-        start_collector || exit 1
         ;;
     live_md)
         echo "Mode: live_md"
@@ -372,30 +277,22 @@ case "$MODE" in
         echo "Mode: scalp (isolated — does not start/stop DAY portfolio stack)"
         stop_scalp
         sleep 1
-
-        if ! pgrep -x "redis-server" >/dev/null; then
-            echo "Starting Redis..."
-            systemctl start redis-server 2>/dev/null || service redis-server start 2>/dev/null || true
-            sleep 2
-        fi
-
+        ensure_redis
         ensure_running_or_start "uvicorn backend.main:app" start_backend "Backend API" || exit 1
         sleep 2
         ensure_running_or_start "start_live_market_data.py" start_live_md "Live Market Data" || exit 1
         sleep 2
         start_scalp || exit 1
-
         echo ""
         echo "=========================================="
         echo "MYSTIC SCALP STACK STARTED"
         echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
         echo "API: /api/scalp/status  /api/scalp/strategies"
         echo "Log: /tmp/mystic_scalp.log"
-        echo "Runner uses SCALP_MODE_PAPER_ENABLED (default true) — .env SCALP_PAPER_ENABLED unchanged"
         echo "=========================================="
         ;;
     *)
-        echo "Usage: $0 [full|core|scalp|backend|live_md|signal|portfolio|learning|collector|ai_context]"
+        echo "Usage: $0 [core|full|scalp|backend|live_md|signal|portfolio|learning|ai_context]"
         exit 1
         ;;
 esac

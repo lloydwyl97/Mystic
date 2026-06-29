@@ -13,18 +13,15 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
-from backend.services.binance_scalp.orderbook_book import walk_sell_qty  # noqa: E402
+from backend.services.binance_scalp.economics import ScalpEconomics
+from backend.services.binance_scalp.orderbook_book import walk_sell_qty
 
 DB = REPO / "mystic_trading.db"
 SOAK_START = "2026-06-07 00:12:04"
 
 
 def _fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
-    url = (
-        "https://api.binance.us/api/v3/klines"
-        f"?symbol={symbol}&interval=1m&startTime={start_ms}&endTime={end_ms}&limit=1000"
-    )
+    url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m&startTime={start_ms}&endTime={end_ms}&limit=1000"
     proc = subprocess.run(
         ["curl", "-s", "--max-time", "20", url],
         capture_output=True,
@@ -129,7 +126,7 @@ def audit_exit_trade(buy: sqlite3.Row, sell: sqlite3.Row, econ: ScalpEconomics) 
         t = k["open_time_ms"] / 1000.0
         if t < entry_ts.timestamp() or t > exit_ts.timestamp():
             continue
-        hi, lo, close = k["high"], k["low"], k["close"]
+        hi, lo, _close = k["high"], k["low"], k["close"]
         best_high = max(best_high, hi)
         best_bid_live_proxy = max(best_bid_live_proxy, lo)  # conservative executable bid proxy
         best_ask_proxy = max(best_ask_proxy, hi)
@@ -142,13 +139,9 @@ def audit_exit_trade(buy: sqlite3.Row, sell: sqlite3.Row, econ: ScalpEconomics) 
         max_review_net = max(max_review_net, rev_net_hi)
 
         if eng_net_hi >= econ.net_profit_target_pct:
-            target_hit_engine_times.append(
-                datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            )
+            target_hit_engine_times.append(datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
         if rev_net_hi >= econ.net_profit_target_pct:
-            target_hit_review_times.append(
-                datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            )
+            target_hit_review_times.append(datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
 
     exit_pf_net = float(sell_pf.get("expected_net_edge_pct", 0))
     exit_reason = sell["exit_reason"]
@@ -211,21 +204,11 @@ def audit_exit_trade(buy: sqlite3.Row, sell: sqlite3.Row, econ: ScalpEconomics) 
 def audit_paper_retention() -> dict:
     with sqlite3.connect(DB) as conn:
         conn.row_factory = sqlite3.Row
-        cutoff = conn.execute(
-            "SELECT strftime('%Y-%m-%dT00:00:00', 'now', '-7 days')"
-        ).fetchone()[0]
-        remaining = conn.execute(
-            "SELECT id, timestamp, side, symbol FROM paper_trades ORDER BY id"
-        ).fetchall()
-        oldest = conn.execute(
-            "SELECT MIN(timestamp), MAX(timestamp), COUNT(*) FROM paper_trades"
-        ).fetchone()
-        ledger = conn.execute(
-            "SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1"
-        ).fetchone()
-        xrp = conn.execute(
-            "SELECT symbol, quantity, entry_price FROM portfolio_engine_positions"
-        ).fetchall()
+        cutoff = conn.execute("SELECT strftime('%Y-%m-%dT00:00:00', 'now', '-7 days')").fetchone()[0]
+        remaining = conn.execute("SELECT id, timestamp, side, symbol FROM paper_trades ORDER BY id").fetchall()
+        oldest = conn.execute("SELECT MIN(timestamp), MAX(timestamp), COUNT(*) FROM paper_trades").fetchone()
+        ledger = conn.execute("SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
+        xrp = conn.execute("SELECT symbol, quantity, entry_price FROM portfolio_engine_positions").fetchall()
 
     baseline_path = Path("/tmp/scalp_phase3f/baseline.json")
     baseline_count = None
@@ -237,9 +220,7 @@ def audit_paper_retention() -> dict:
     if cutoff:
         with sqlite3.connect(DB) as conn:
             # We cannot see deleted rows; infer from id gaps and cutoff
-            pruned_estimate = (
-                f"Rows with timestamp < {cutoff} removed by portfolio_engine PAPER_RETENTION loop"
-            )
+            pruned_estimate = f"Rows with timestamp < {cutoff} removed by portfolio_engine PAPER_RETENTION loop"
 
     return {
         "cutoff_7d": cutoff,
@@ -261,7 +242,7 @@ def main() -> int:
     econ = ScalpEconomics.from_env()
     with sqlite3.connect(DB) as conn:
         conn.row_factory = sqlite3.Row
-        pairs = conn.execute(
+        conn.execute(
             """
             SELECT b.*, s.created_at AS sell_time, s.exit_reason, s.pnl_usd AS sell_pnl
             FROM scalp_paper_trades b

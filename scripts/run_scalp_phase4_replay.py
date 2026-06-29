@@ -9,18 +9,18 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.calibration_profiles import (  # noqa: E402
+from backend.services.binance_scalp.calibration_profiles import (
     CALIBRATION_PROFILES,
     apply_profile,
 )
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
-from backend.services.binance_scalp.paper_spread_caps import (  # noqa: E402
+from backend.services.binance_scalp.economics import ScalpEconomics
+from backend.services.binance_scalp.paper_spread_caps import (
     DEFAULT_PAPER_SPREAD_CAPS,
     parse_paper_spread_caps_json,
 )
@@ -35,10 +35,7 @@ def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
     bars: list[dict] = []
     cursor = start_ms
     while cursor < end_ms:
-        url = (
-            f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m"
-            f"&startTime={cursor}&endTime={end_ms}&limit=1000"
-        )
+        url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m&startTime={cursor}&endTime={end_ms}&limit=1000"
         proc = subprocess.run(
             ["curl", "-s", "--max-time", "30", url],
             capture_output=True,
@@ -92,20 +89,10 @@ def bar_features(bars: list[dict], idx: int) -> dict:
 
     mid15 = chg(idx, idx - 1) if idx >= 1 else 0.0
     mid30 = chg(idx, idx - 2) if idx >= 2 else 0.0
-    up = sum(
-        1
-        for k in range(max(1, idx - 5), idx + 1)
-        if k >= 1 and bars[k]["close"] > bars[k - 1]["close"]
-    )
+    up = sum(1 for k in range(max(1, idx - 5), idx + 1) if k >= 1 and bars[k]["close"] > bars[k - 1]["close"])
     pos_in_range = (close - lo) / (hi - lo) if hi > lo else 0.0
     breakout = pos_in_range >= 0.7 and recent_range >= 0.0008
-    momentum = (
-        mid15 >= 0.00003
-        and mid30 > 0
-        and up >= 3
-        and abs(mid15) > 0.00002
-        and recent_range >= 0.0005
-    )
+    momentum = mid15 >= 0.00003 and mid30 > 0 and up >= 3 and abs(mid15) > 0.00002 and recent_range >= 0.0005
     sp = spread_est(b0)
     projected = max(recent_range * 0.45, mid15 * 2.5, sp * 0.5)
     return {
@@ -270,9 +257,7 @@ def simulate_config(
             "net_pnl_usd": round(sum(t["pnl_usd"] for t in sym_trades), 4),
             "profit_exits": sum(1 for t in sym_trades if t["exit_reason"] == "NET_PROFIT_TARGET"),
             "stale_exits": sum(1 for t in sym_trades if t["exit_reason"] == "STALE_SCALP_TIMEOUT"),
-            "avg_hold_sec": round(
-                statistics.mean(t["hold_sec"] for t in sym_trades) if sym_trades else 0, 1
-            ),
+            "avg_hold_sec": round(statistics.mean(t["hold_sec"] for t in sym_trades) if sym_trades else 0, 1),
         }
 
     profit_exits = sum(1 for t in trades if t["exit_reason"] == "NET_PROFIT_TARGET")
@@ -323,7 +308,7 @@ def main() -> int:
         series[sym] = fetch_klines(sym, start_ms, end_ms)
         idx_by_ts[sym] = {b["ts_ms"]: i for i, b in enumerate(series[sym])}
 
-    all_ts = sorted(set(ts for sym in SYMBOLS for ts in idx_by_ts[sym]))
+    all_ts = sorted({ts for sym in SYMBOLS for ts in idx_by_ts[sym]})
     aligned = [ts for ts in all_ts if ts >= start_ms + 360_000]
 
     strict = apply_profile(base, "strict")
@@ -335,24 +320,44 @@ def main() -> int:
 
     configs = {
         "A_strict_uniform": simulate_config(
-            aligned, series, idx_by_ts, strict,
-            per_symbol_cap=False, stale_sec=300, label="A_strict_uniform",
+            aligned,
+            series,
+            idx_by_ts,
+            strict,
+            per_symbol_cap=False,
+            stale_sec=300,
+            label="A_strict_uniform",
         ),
         "B_moderate_uniform": simulate_config(
-            aligned, series, idx_by_ts, moderate,
-            per_symbol_cap=False, stale_sec=300, label="B_moderate_uniform",
+            aligned,
+            series,
+            idx_by_ts,
+            moderate,
+            per_symbol_cap=False,
+            stale_sec=300,
+            label="B_moderate_uniform",
         ),
         "C_moderate_per_symbol_caps": simulate_config(
-            aligned, series, idx_by_ts, moderate_caps,
-            per_symbol_cap=True, stale_sec=300, label="C_moderate_per_symbol_caps",
+            aligned,
+            series,
+            idx_by_ts,
+            moderate_caps,
+            per_symbol_cap=True,
+            stale_sec=300,
+            label="C_moderate_per_symbol_caps",
         ),
     }
 
     stale_compare: dict[str, dict] = {}
     for stale in STALE_TIMEOUTS:
         stale_compare[f"{stale}s"] = simulate_config(
-            aligned, series, idx_by_ts, moderate_caps,
-            per_symbol_cap=True, stale_sec=stale, label=f"C_stale_{stale}s",
+            aligned,
+            series,
+            idx_by_ts,
+            moderate_caps,
+            per_symbol_cap=True,
+            stale_sec=stale,
+            label=f"C_stale_{stale}s",
         )
 
     best_stale = min(
@@ -360,8 +365,12 @@ def main() -> int:
         key=lambda s: -stale_compare[f"{s}s"]["net_pnl_usd"],
     )
     configs["D_moderate_caps_best_stale"] = simulate_config(
-        aligned, series, idx_by_ts, moderate_caps,
-        per_symbol_cap=True, stale_sec=best_stale,
+        aligned,
+        series,
+        idx_by_ts,
+        moderate_caps,
+        per_symbol_cap=True,
+        stale_sec=best_stale,
         label="D_moderate_caps_best_stale",
     )
 

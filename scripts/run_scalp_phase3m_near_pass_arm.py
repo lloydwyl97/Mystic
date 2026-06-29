@@ -16,12 +16,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-import redis  # noqa: E402
-
-from backend.services.binance_scalp.config import get_scalp_config  # noqa: E402
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
-from backend.services.binance_scalp.scalp_control import is_entry_armed, set_entry_armed  # noqa: E402
-from scripts.watch_scalp_entry_opportunity import watch_loop  # noqa: E402
+import redis
+from backend.services.binance_scalp.config import get_scalp_config
+from backend.services.binance_scalp.economics import ScalpEconomics
+from backend.services.binance_scalp.scalp_control import is_entry_armed, set_entry_armed
+from scripts.watch_scalp_entry_opportunity import watch_loop
 
 OUT = Path("/tmp/scalp_phase3m")
 ENV = REPO / ".env"
@@ -34,30 +33,19 @@ TOTAL_MAX_SEC = 1860.0  # warm + 30 min
 def _set_paper(on: bool) -> None:
     text = ENV.read_text()
     flag = "true" if on else "false"
-    lines = [
-        (f"SCALP_PAPER_ENABLED={flag}" if l.startswith("SCALP_PAPER_ENABLED=") else l)
-        for l in text.splitlines()
-    ]
-    if not any(l.startswith("SCALP_PAPER_ENABLED=") for l in lines):
+    lines = [(f"SCALP_PAPER_ENABLED={flag}" if line.startswith("SCALP_PAPER_ENABLED=") else line) for line in text.splitlines()]
+    if not any(line.startswith("SCALP_PAPER_ENABLED=") for line in lines):
         lines.append(f"SCALP_PAPER_ENABLED={flag}")
     ENV.write_text("\n".join(lines) + ("\n" if text.endswith("\n") else ""))
 
 
 def _day() -> dict:
     with sqlite3.connect(DB) as c:
-        led = c.execute(
-            "SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1"
-        ).fetchone()
-        xrp = c.execute(
-            "SELECT symbol, quantity, entry_price FROM portfolio_engine_positions WHERE symbol LIKE '%XRP%'"
-        ).fetchall()
+        led = c.execute("SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
+        xrp = c.execute("SELECT symbol, quantity, entry_price FROM portfolio_engine_positions WHERE symbol LIKE '%XRP%'").fetchall()
         pn = c.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0]
-        open_scalp = c.execute(
-            "SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'"
-        ).fetchone()[0]
-    ai = sorted(
-        k for k in subprocess.check_output(["redis-cli", "KEYS", "ai_signal:day:*"], text=True).split() if k
-    )
+        open_scalp = c.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0]
+    ai = sorted(k for k in subprocess.check_output(["redis-cli", "KEYS", "ai_signal:day:*"], text=True).split() if k)
     try:
         h = urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=5).status
     except Exception:
@@ -100,12 +88,8 @@ def _arm() -> str:
 def _collect(since: str, arm_iso: str | None = None) -> dict:
     with sqlite3.connect(DB) as c:
         c.row_factory = sqlite3.Row
-        buys = c.execute(
-            "SELECT * FROM scalp_paper_trades WHERE side='BUY' AND created_at>=?", (since,)
-        ).fetchall()
-        sells = c.execute(
-            "SELECT * FROM scalp_paper_trades WHERE side='SELL' AND created_at>=?", (since,)
-        ).fetchall()
+        buys = c.execute("SELECT * FROM scalp_paper_trades WHERE side='BUY' AND created_at>=?", (since,)).fetchall()
+        sells = c.execute("SELECT * FROM scalp_paper_trades WHERE side='SELL' AND created_at>=?", (since,)).fetchall()
         rejects = {
             r["reason"]: r["cnt"]
             for r in c.execute(
@@ -125,18 +109,12 @@ def _collect(since: str, arm_iso: str | None = None) -> dict:
         led = dict(
             zip(
                 ["cash", "pos", "realized", "equity"],
-                c.execute(
-                    "SELECT cash_balance, positions_value, realized_pnl, total_equity FROM scalp_paper_ledger WHERE id=1"
-                ).fetchone()
-                or (None, None, None, None),
+                c.execute("SELECT cash_balance, positions_value, realized_pnl, total_equity FROM scalp_paper_ledger WHERE id=1").fetchone() or (None, None, None, None),
+                strict=False,
             )
         )
-        sb = [dict(r) for r in c.execute(
-            "SELECT * FROM scalp_scoreboard_daily ORDER BY day DESC LIMIT 3"
-        ).fetchall()]
-        open_p = c.execute(
-            "SELECT * FROM scalp_paper_positions WHERE status='OPEN'"
-        ).fetchall()
+        sb = [dict(r) for r in c.execute("SELECT * FROM scalp_scoreboard_daily ORDER BY day DESC LIMIT 3").fetchall()]
+        open_p = c.execute("SELECT * FROM scalp_paper_positions WHERE status='OPEN'").fetchall()
 
     close = None
     missed = []
@@ -259,9 +237,7 @@ def main() -> int:
         "2_near_pass_arm_events": stats.arm_events,
         "2_hq_near_pass_arm_count": stats.hq_near_pass_arm_count,
         "2_near_pass_count": stats.near_pass_count,
-        "3_opportunity_pass_events": [
-            e for e in stats.events if e.get("event") == "OPPORTUNITY_PASS"
-        ],
+        "3_opportunity_pass_events": [e for e in stats.events if e.get("event") == "OPPORTUNITY_PASS"],
         "3_pass_count": stats.pass_count,
         "4_arm_event": arm_event,
         "4_arm_time_utc": arm_iso,
@@ -283,11 +259,7 @@ def main() -> int:
         },
         "13_memory_kb": mem,
         "14_safe_to_continue": (
-            after["health"] == 200
-            and not tr["open"]
-            and not is_entry_armed(r, prefix=cfg.redis_key_prefix)
-            and not after["SCALP_PAPER_ENABLED"]
-            and before["ledger"] == after["ledger"]
+            after["health"] == 200 and not tr["open"] and not is_entry_armed(r, prefix=cfg.redis_key_prefix) and not after["SCALP_PAPER_ENABLED"] and before["ledger"] == after["ledger"]
         ),
         "round_trip_complete": tr["buys"] > 0 and tr["sells"] > 0,
         "entry_armed_cleared": not is_entry_armed(r, prefix=cfg.redis_key_prefix),

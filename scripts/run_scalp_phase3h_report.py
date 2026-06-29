@@ -38,9 +38,7 @@ def build_report(*, soak_start: str, duration_sec: float) -> dict:
             "SELECT * FROM scalp_paper_trades WHERE side='SELL' AND created_at >= ? ORDER BY id",
             (soak_start,),
         ).fetchall()
-        open_pos = conn.execute(
-            "SELECT * FROM scalp_paper_positions WHERE status='OPEN'"
-        ).fetchall()
+        open_pos = conn.execute("SELECT * FROM scalp_paper_positions WHERE status='OPEN'").fetchall()
         rejects = {
             r["reason"]: r["cnt"]
             for r in conn.execute(
@@ -48,12 +46,8 @@ def build_report(*, soak_start: str, duration_sec: float) -> dict:
                 (soak_start,),
             )
         }
-        day_ledger = conn.execute(
-            "SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1"
-        ).fetchone()
-        xrp = conn.execute(
-            "SELECT symbol, quantity, entry_price FROM portfolio_engine_positions WHERE symbol LIKE '%XRP%'"
-        ).fetchall()
+        day_ledger = conn.execute("SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
+        xrp = conn.execute("SELECT symbol, quantity, entry_price FROM portfolio_engine_positions WHERE symbol LIKE '%XRP%'").fetchall()
         paper_n = conn.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0]
 
     baseline_path = Path("/tmp/scalp_phase3h/baseline.json")
@@ -78,9 +72,7 @@ def build_report(*, soak_start: str, duration_sec: float) -> dict:
         target = exit_gate.get("target_pct")
         if reason == "STALE_SCALP_TIMEOUT" and net_pct is not None and target is not None:
             if float(net_pct) >= float(target):
-                missed_target_notes.append(
-                    f"{sell['trade_id']}: stale but net_pct={net_pct} >= target at close"
-                )
+                missed_target_notes.append(f"{sell['trade_id']}: stale but net_pct={net_pct} >= target at close")
         closes.append(
             {
                 "trade_id": buy_tid,
@@ -110,14 +102,8 @@ def build_report(*, soak_start: str, duration_sec: float) -> dict:
     except Exception as exc:
         health = {"http_code": 0, "error": str(exc)}
 
-    ai = sorted(
-        k
-        for k in subprocess.check_output(["redis-cli", "KEYS", "ai_signal:day:*"], text=True).split()
-        if k
-    )
-    ai_before = baseline_path.exists() and json.loads(baseline_path.read_text()).get(
-        "ai_signal_day_keys", []
-    )
+    ai = sorted(k for k in subprocess.check_output(["redis-cli", "KEYS", "ai_signal:day:*"], text=True).split() if k)
+    ai_before = baseline_path.exists() and json.loads(baseline_path.read_text()).get("ai_signal_day_keys", [])
 
     phase3f_profit_rate = 1 / 8 if 8 else 0
     phase3h_profit_rate = profit_exits / len(sells) if sells else None
@@ -149,15 +135,14 @@ def build_report(*, soak_start: str, duration_sec: float) -> dict:
         "9_open_position_at_end": [dict(r) for r in open_pos],
         "10_day_untouched": {
             "health": health,
-            "ledger_unchanged": day_before.get("ledger") == {
+            "ledger_unchanged": day_before.get("ledger")
+            == {
                 "cash_balance": day_ledger[0],
                 "total_equity": day_ledger[1],
             }
             if day_ledger and day_before.get("ledger")
             else None,
-            "xrp": [
-                {"symbol": r[0], "quantity": r[1], "entry_price": r[2]} for r in xrp
-            ],
+            "xrp": [{"symbol": r[0], "quantity": r[1], "entry_price": r[2]} for r in xrp],
             "paper_trades_count": paper_n,
             "paper_trades_vs_baseline": paper_n == day_before.get("paper_trades_count"),
             "ai_signal_day_unchanged": ai == ai_before,
@@ -169,11 +154,7 @@ def build_report(*, soak_start: str, duration_sec: float) -> dict:
             "phase3f_total_closed": 8,
             "phase3f_profit_rate": phase3f_profit_rate,
             "phase3h_profit_rate": phase3h_profit_rate,
-            "improved": (
-                profit_exits > 1
-                if sells
-                else None
-            ),
+            "improved": (profit_exits > 1 if sells else None),
             "zero_trades": len(sells) == 0,
         },
         "soak_start": soak_start,

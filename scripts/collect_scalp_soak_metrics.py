@@ -46,15 +46,8 @@ def _day_health() -> dict:
 
 
 def _day_snapshot(conn: sqlite3.Connection) -> dict:
-    ledger = conn.execute(
-        "SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1"
-    ).fetchone()
-    positions = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT symbol, quantity, entry_price FROM portfolio_engine_positions"
-        )
-    ]
+    ledger = conn.execute("SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
+    positions = [dict(r) for r in conn.execute("SELECT symbol, quantity, entry_price FROM portfolio_engine_positions")]
     paper_count = conn.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0]
     return {
         "ledger": {"cash_balance": ledger[0], "total_equity": ledger[1]} if ledger else None,
@@ -67,9 +60,7 @@ def collect(*, since_ts: str | None = None) -> dict:
     with sqlite3.connect(DB) as conn:
         conn.row_factory = sqlite3.Row
         ledger = dict(conn.execute("SELECT * FROM scalp_paper_ledger WHERE id=1").fetchone())
-        scoreboard = [
-            dict(r) for r in conn.execute("SELECT * FROM scalp_scoreboard_daily ORDER BY day")
-        ]
+        scoreboard = [dict(r) for r in conn.execute("SELECT * FROM scalp_scoreboard_daily ORDER BY day")]
         positions = [dict(r) for r in conn.execute("SELECT * FROM scalp_paper_positions ORDER BY id")]
         trades = [dict(r) for r in conn.execute("SELECT * FROM scalp_paper_trades ORDER BY id")]
         open_pos = [dict(r) for r in conn.execute("SELECT * FROM scalp_paper_positions WHERE status='OPEN'")]
@@ -96,10 +87,7 @@ def collect(*, since_ts: str | None = None) -> dict:
     return {
         "collected_at": datetime.now(timezone.utc).isoformat(),
         "since_ts": since_ts,
-        "scalp_ledger": {
-            k: ledger[k]
-            for k in ("cash_balance", "positions_value", "realized_pnl", "total_equity")
-        },
+        "scalp_ledger": {k: ledger[k] for k in ("cash_balance", "positions_value", "realized_pnl", "total_equity")},
         "scoreboard": scoreboard,
         "open_positions": open_pos,
         "all_positions": positions,
@@ -120,7 +108,7 @@ def collect(*, since_ts: str | None = None) -> dict:
 def diff_report(before: dict, after: dict, *, duration_sec: float, scan_ticks: int) -> dict:
     b_trades = before["trades_detail"]
     a_trades = after["trades_detail"]
-    new_trades = a_trades[len(b_trades):]
+    new_trades = a_trades[len(b_trades) :]
 
     b_rejects_total = sum(before["rejects"].values())
     a_rejects_total = sum(after["rejects"].values())
@@ -156,8 +144,8 @@ def diff_report(before: dict, after: dict, *, duration_sec: float, scan_ticks: i
             if buy and buy.get("created_at") and t.get("created_at"):
                 try:
                     fmt = "%Y-%m-%d %H:%M:%S"
-                    t0 = datetime.strptime(buy["created_at"], fmt)
-                    t1 = datetime.strptime(t["created_at"], fmt)
+                    t0 = datetime.strptime(buy["created_at"], fmt).replace(tzinfo=timezone.utc)
+                    t1 = datetime.strptime(t["created_at"], fmt).replace(tzinfo=timezone.utc)
                     hold_times.append((t1 - t0).total_seconds())
                 except ValueError:
                     pass
@@ -169,10 +157,7 @@ def diff_report(before: dict, after: dict, *, duration_sec: float, scan_ticks: i
         "sells_new": len(sells),
         "rejects_new_total": a_rejects_total - b_rejects_total,
         "rejects_by_reason_delta": {r: reject_delta(r) for r in REJECT_REASONS},
-        "all_rejects_delta": {
-            k: after["rejects"].get(k, 0) - before["rejects"].get(v if False else k, 0)
-            for k in set(before["rejects"]) | set(after["rejects"])
-        },
+        "all_rejects_delta": {k: after["rejects"].get(k, 0) - before["rejects"].get(k, 0) for k in set(before["rejects"]) | set(after["rejects"])},
         "per_trade_pnl": pnls,
         "wins": wins,
         "losses": losses,

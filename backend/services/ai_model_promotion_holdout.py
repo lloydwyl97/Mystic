@@ -188,7 +188,7 @@ def evaluate_artifact_on_holdout(
             "avg_net_pnl_pct_if_followed": None,
             "win_rate_after_cost_if_followed": None,
             "bad_trade_rate_if_followed": None,
-            "sample_count": int(len(X)),
+            "sample_count": len(X),
             "buy_signal_count": 0,
             "hold_signal_count": 0,
             "artifact_ok": False,
@@ -202,7 +202,7 @@ def evaluate_artifact_on_holdout(
     y_arr = np.asarray(y, dtype=np.int64).reshape(-1)
     nets_arr = np.asarray(nets, dtype=np.float64).reshape(-1)
 
-    sample_count = int(len(y_arr))
+    sample_count = len(y_arr)
     accuracy = float(np.mean(preds == y_arr)) if sample_count else None
 
     followed_pnls: list[float] = []
@@ -210,7 +210,7 @@ def evaluate_artifact_on_holdout(
     bad = 0
     buy_count = 0
     hold_count = 0
-    for pred, net, gb in zip(preds, nets_arr, good_bad):
+    for pred, net, gb in zip(preds, nets_arr, good_bad, strict=False):
         gb_u = str(gb or "").strip().upper()
         if int(pred) == 1:
             buy_count += 1
@@ -292,7 +292,7 @@ def _tiered_holdout_comparison(
     out["tiered_holdout"] = {
         "status": "OK",
         "source": "ai_candidate_snapshots_tier_c",
-        "sample_count": int(len(y)),
+        "sample_count": len(y),
         "buy_label_count": int(np.sum(y == 1)),
         "candidate_accuracy": round(c_acc, 6) if c_acc is not None else None,
         "active_accuracy": round(a_acc, 6) if a_acc is not None else None,
@@ -323,7 +323,7 @@ def build_holdout_validation_metrics(
         feature_dim=feature_dim,
         db_path=db_path,
     )
-    holdout_count = int(len(y))
+    holdout_count = len(y)
     holdout_low_confidence = holdout_count < MIN_HOLDOUT_CONFIDENCE_SAMPLES
     holdout_buy_labels = int(np.sum(np.asarray(y, dtype=np.int64) == 1)) if holdout_count else 0
     base: dict[str, Any] = {

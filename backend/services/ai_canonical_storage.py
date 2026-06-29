@@ -157,6 +157,7 @@ _SCHEMA = [
         ctx_multiplier  REAL,
         ctx_json        TEXT,
         feature_version INTEGER DEFAULT 1,    -- 1=124, 2/3=145 (v3=primary-clock 5m/15m + context)
+        feature_dim     INTEGER,               -- 124 or 145; derived from features_json when null
         features_json   TEXT,                  -- exact model input vector used (JSON list)
         model_artifact  TEXT,
         label_version   TEXT,
@@ -366,6 +367,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("ai_inference_log", "feature_version", "ALTER TABLE ai_inference_log ADD COLUMN feature_version INTEGER DEFAULT 1"),
     ("ai_inference_log", "features_json", "ALTER TABLE ai_inference_log ADD COLUMN features_json TEXT"),
     ("ai_inference_log", "strategy_id", "ALTER TABLE ai_inference_log ADD COLUMN strategy_id TEXT DEFAULT 'day'"),
+    ("ai_inference_log", "feature_dim", "ALTER TABLE ai_inference_log ADD COLUMN feature_dim INTEGER"),
     ("ai_feature_samples", "feature_version", "ALTER TABLE ai_feature_samples ADD COLUMN feature_version INTEGER DEFAULT 2"),
     ("ai_feature_samples", "feature_dim", "ALTER TABLE ai_feature_samples ADD COLUMN feature_dim INTEGER DEFAULT 145"),
     ("ai_outcome_training_rows", "strategy_id", "ALTER TABLE ai_outcome_training_rows ADD COLUMN strategy_id TEXT"),
@@ -499,6 +501,46 @@ def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
         return set()
 
 
+def _backfill_inference_feature_dim(conn: sqlite3.Connection) -> None:
+    """Populate ai_inference_log.feature_dim from feature_version / features_json length."""
+    cols = _existing_columns(conn, "ai_inference_log")
+    if "feature_dim" not in cols:
+        return
+    try:
+        conn.execute(
+            """
+            UPDATE ai_inference_log
+            SET feature_dim = 145
+            WHERE feature_dim IS NULL AND COALESCE(feature_version, 1) >= 2
+            """
+        )
+        conn.execute(
+            """
+            UPDATE ai_inference_log
+            SET feature_dim = 124
+            WHERE feature_dim IS NULL AND COALESCE(feature_version, 1) < 2
+            """
+        )
+        rows = conn.execute(
+            """
+            SELECT id, features_json FROM ai_inference_log
+            WHERE feature_dim IS NULL AND features_json IS NOT NULL AND TRIM(features_json) != ''
+            """
+        ).fetchall()
+        for row_id, raw in rows:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list) and parsed:
+                    conn.execute(
+                        "UPDATE ai_inference_log SET feature_dim=? WHERE id=?",
+                        (len(parsed), row_id),
+                    )
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+    except sqlite3.Error as exc:
+        logger.debug("ai_inference_log feature_dim backfill skipped: %s", exc)
+
+
 def ensure_ai_canonical_tables(db_path: str | Path = DATABASE_PATH) -> None:
     """Idempotently create every AI-canonical SQLite table and apply migrations."""
     path = str(db_path)
@@ -514,7 +556,14 @@ def ensure_ai_canonical_tables(db_path: str | Path = DATABASE_PATH) -> None:
                         cur.execute(sql)
                 except sqlite3.Error as me:
                     logger.debug("ai_canonical migration skipped (%s.%s): %s", table, column, me)
+            _backfill_inference_feature_dim(conn)
             conn.commit()
+        try:
+            from backend.services.day_outcome_attribution import ensure_outcome_attribution_table
+
+            ensure_outcome_attribution_table(path)
+        except Exception as e:
+            logger.debug("ensure_outcome_attribution_table skipped: %s", e)
         # Step-1 instrumentation: unified audit trail (strategy / artifact / context proof)
         try:
             from backend.services.strategy_runtime_audit import ensure_strategy_runtime_audit_table

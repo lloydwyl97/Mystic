@@ -7,6 +7,7 @@ Mystic frequency diagnostic — replay only. No live rule changes.
 3. DAY frequency expansion candidates
 4. Summary growth table vs $500/mo target
 """
+
 from __future__ import annotations
 
 import json
@@ -17,7 +18,7 @@ import traceback
 from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +39,8 @@ from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRo
 from backend.services.binance_scalp.strategies import ALL_STRATEGIES, STRATEGY_NAMES
 from backend.services.day_bucket_quality import REPLAY_KILLED_BUCKETS, bucket_key
 from backend.services.day_regime_router import (
-    DAY_REGIME_BULL,
     DAY_REGIME_BEAR,
+    DAY_REGIME_BULL,
     DAY_REGIME_CHOP,
     DAY_REGIME_NEUTRAL,
     DAY_REGIME_RANGE,
@@ -55,8 +56,8 @@ from backend.services.day_trade_thesis import (
 )
 from scripts.run_day_execution_replay import (
     ALLOWED_POSITIVE_BUCKETS,
-    ExecutionConfig,
     STRESS_SCENARIOS,
+    ExecutionConfig,
     _apply_regime_override,
     _build_fee_profiles,
     _infer_context_regime_label,
@@ -138,7 +139,7 @@ def _replay_scalp_strategy(
     router = ScalpStrategyRouter(
         config=config,
         econ=econ,
-        reader=type("R", (), {"read": lambda _s, sym: None})(),
+        reader=type("R", (), {"read": lambda _s, _sym: None})(),
         momentum=momentum,
     )
     end = datetime.now(timezone.utc)
@@ -169,16 +170,17 @@ def _replay_scalp_strategy(
                 momentum.record(sym, t, bid, price)
             momentum.record(sym, epoch, snap.best_bid, snap.mid)
             window = bars[max(0, idx - 60) : idx + 1]
-            kline_window = [
-                {"high": b["high"], "low": b["low"], "close": b["close"], "volume": b["volume"]}
-                for b in window
-            ]
+            kline_window = [{"high": b["high"], "low": b["low"], "close": b["close"], "volume": b["volume"]} for b in window]
 
             if open_pos is not None:
                 hold = epoch - open_pos.entry_epoch
                 mom = momentum.diagnostics(sym, epoch, snap.best_bid, snap.mid)
                 net_pct = net_pct_at_bid(
-                    open_pos.entry_price, snap.best_bid, snap.spread_pct, open_pos.impact_pct, econ,
+                    open_pos.entry_price,
+                    snap.best_bid,
+                    snap.spread_pct,
+                    open_pos.impact_pct,
+                    econ,
                 )
                 profit_hit = net_pct >= econ.net_profit_target_pct
                 review = evaluate_exit(
@@ -208,13 +210,15 @@ def _replay_scalp_strategy(
                         stats.wins += 1
                     else:
                         stats.losses += 1
-                    all_trades.append({
-                        "symbol": sym,
-                        "pnl_usd": pnl,
-                        "hold_sec": hold,
-                        "win": win,
-                        "exit_reason": review.exit_reason,
-                    })
+                    all_trades.append(
+                        {
+                            "symbol": sym,
+                            "pnl_usd": pnl,
+                            "hold_sec": hold,
+                            "win": win,
+                            "exit_reason": review.exit_reason,
+                        }
+                    )
                     open_pos = None
                     cooldown_until = epoch + 120
                 continue
@@ -223,7 +227,11 @@ def _replay_scalp_strategy(
                 continue
 
             best, all_sigs = router.evaluate_symbol(
-                sym, epoch=epoch, notional_usd=NOTIONAL, snap=snap, bars=kline_window,
+                sym,
+                epoch=epoch,
+                notional_usd=NOTIONAL,
+                snap=snap,
+                bars=kline_window,
             )
             for sig in all_sigs:
                 if not sig.passed and sig.reject_reason:
@@ -305,13 +313,15 @@ def _scalp_profile_relaxation(strategy: str) -> dict[str, Any]:
     rows = []
     for profile in ("strict", "moderate", "fast"):
         r = _replay_scalp_strategy(strategy, profile=profile, hours=SCALP_HOURS)
-        rows.append({
-            "profile": profile,
-            "trades": r["total_trades"],
-            "net_pnl_usd": r["net_pnl_usd"],
-            "extrapolated_monthly_pnl_usd": r["extrapolated_monthly_pnl_usd"],
-            "dominant_gate": r["dominant_gate"],
-        })
+        rows.append(
+            {
+                "profile": profile,
+                "trades": r["total_trades"],
+                "net_pnl_usd": r["net_pnl_usd"],
+                "extrapolated_monthly_pnl_usd": r["extrapolated_monthly_pnl_usd"],
+                "dominant_gate": r["dominant_gate"],
+            }
+        )
     best = max(rows, key=lambda x: (x["net_pnl_usd"], x["trades"]))
     strict = next(x for x in rows if x["profile"] == "strict")
     improves = best["net_pnl_usd"] > strict["net_pnl_usd"] and best["trades"] >= strict["trades"]
@@ -321,10 +331,7 @@ def _scalp_profile_relaxation(strategy: str) -> dict[str, Any]:
         "profiles": rows,
         "relaxation_improves_replay": improves,
         "relaxation_creates_losses": creates_losses,
-        "note": (
-            "Gate relaxation via calibration profile only (replay). "
-            f"Best profile: {best['profile']} trades={best['trades']} net={best['net_pnl_usd']}"
-        ),
+        "note": (f"Gate relaxation via calibration profile only (replay). Best profile: {best['profile']} trades={best['trades']} net={best['net_pnl_usd']}"),
     }
 
 
@@ -358,11 +365,20 @@ def _regime_taxonomy_audit(bars_1h: dict[str, list]) -> dict[str, Any]:
             chop = 0.65 if dd["adx"] < 18 else 0.45
             ps = dd["price_structure_regime"]
             dd = apply_trade_thesis_to_candidate_fields(
-                dd, symbol=sym, current_price=mark, atr=atr, strategy_id="day", price_structure_regime=ps,
+                dd,
+                symbol=sym,
+                current_price=mark,
+                atr=atr,
+                strategy_id="day",
+                price_structure_regime=ps,
             )
             ctx = _infer_context_regime_label(dd)
             router = classify_day_regime(
-                dd, context_payload=None, chop_score=chop, atr_ratio=_atr_pct(slice_1h), price_structure_regime=ps,
+                dd,
+                context_payload=None,
+                chop_score=chop,
+                atr_ratio=_atr_pct(slice_1h),
+                price_structure_regime=ps,
             )
             setup = str(dd.get("setup_type") or SETUP_NO_CLEAR_THESIS)
             bars_total += 1
@@ -376,13 +392,19 @@ def _regime_taxonomy_audit(bars_1h: dict[str, list]) -> dict[str, Any]:
                 label_mismatch_only += 1
                 if setup == SETUP_HTF_TREND_PULLBACK:
                     route_neutral = evaluate_day_entry_route(
-                        setup_type=setup, day_regime=router, decision_data=dd,
-                        context_payload=None, current_price=mark,
+                        setup_type=setup,
+                        day_regime=router,
+                        decision_data=dd,
+                        context_payload=None,
+                        current_price=mark,
                         thesis_score=float(dd.get("thesis_score") or 0),
                     )
                     route_bull = evaluate_day_entry_route(
-                        setup_type=setup, day_regime=DAY_REGIME_BULL, decision_data=dd,
-                        context_payload=None, current_price=mark,
+                        setup_type=setup,
+                        day_regime=DAY_REGIME_BULL,
+                        decision_data=dd,
+                        context_payload=None,
+                        current_price=mark,
                         thesis_score=float(dd.get("thesis_score") or 0),
                     )
                     if not route_neutral.get("allowed") and route_bull.get("allowed"):
@@ -413,10 +435,7 @@ def _regime_taxonomy_audit(bars_1h: dict[str, list]) -> dict[str, Any]:
         "trending_up_labeled_but_not_bull": label_mismatch_only,
         "would_unlock_bull_pullback_if_mapped": mismatch_bull_pullback,
         "would_unlock_breakout_if_mapped": mismatch_breakout,
-        "note": (
-            "Live ai_context uses ctx_market_regime (trending_up/down). "
-            "Router uses bull/bear/neutral/range/chop from HTF alignment + ADX — not 1:1 with context labels."
-        ),
+        "note": ("Live ai_context uses ctx_market_regime (trending_up/down). Router uses bull/bear/neutral/range/chop from HTF alignment + ADX — not 1:1 with context labels."),
     }
 
 
@@ -474,7 +493,6 @@ def main() -> int:
     try:
         print("  scalp per-strategy audit...", flush=True)
         scalp_rows = []
-        scalp_relax = []
         for strat in SCALP_STRATEGIES:
             try:
                 row = _replay_scalp_strategy(strat, profile="moderate", hours=SCALP_HOURS)
@@ -496,39 +514,48 @@ def main() -> int:
         report["regime_taxonomy_audit"] = _regime_taxonomy_audit(bars_1h)
 
         print("  DAY frequency candidates...", flush=True)
-        bull_buckets = frozenset(
-            (sym, DAY_REGIME_BULL, SETUP_HTF_TREND_PULLBACK) for sym in SYMBOLS
-        ) | frozenset(
-            (sym, DAY_REGIME_BULL, SETUP_BREAKOUT_CONTINUATION) for sym in SYMBOLS
-        )
+        bull_buckets = frozenset((sym, DAY_REGIME_BULL, SETUP_HTF_TREND_PULLBACK) for sym in SYMBOLS) | frozenset((sym, DAY_REGIME_BULL, SETUP_BREAKOUT_CONTINUATION) for sym in SYMBOLS)
         profiles = _build_fee_profiles()
         day_candidates = [
             ("locked_baseline_1_5x", {"notional_mult": 1.5}),
             ("growth_candidate_2_5x_floor_0_60", {"notional_mult": 2.5, "min_net_profit_floor": 0.006}),
-            ("high_relvol_neutral_vwap", {
-                "notional_mult": 1.5,
-                "replay_min_relative_volume": 1.0,
-            }),
-            ("eth_priority_neutral_vwap", {
-                "notional_mult": 1.5,
-                "replay_symbols_allow": frozenset({"ETH/USDT"}),
-            }),
-            ("sol_only_neutral_vwap", {
-                "notional_mult": 1.5,
-                "replay_symbols_allow": frozenset({"SOL/USDT"}),
-            }),
-            ("trending_up_as_bull_pullback", {
-                "notional_mult": 1.5,
-                "regime_override_from_context": {"trending_up": DAY_REGIME_BULL},
-                "extra_allowed_buckets": bull_buckets,
-            }),
-            ("trending_up_bull_breakout", {
-                "notional_mult": 1.5,
-                "regime_override_from_context": {"trending_up": DAY_REGIME_BULL},
-                "extra_allowed_buckets": frozenset(
-                    (sym, DAY_REGIME_BULL, SETUP_BREAKOUT_CONTINUATION) for sym in SYMBOLS
-                ),
-            }),
+            (
+                "high_relvol_neutral_vwap",
+                {
+                    "notional_mult": 1.5,
+                    "replay_min_relative_volume": 1.0,
+                },
+            ),
+            (
+                "eth_priority_neutral_vwap",
+                {
+                    "notional_mult": 1.5,
+                    "replay_symbols_allow": frozenset({"ETH/USDT"}),
+                },
+            ),
+            (
+                "sol_only_neutral_vwap",
+                {
+                    "notional_mult": 1.5,
+                    "replay_symbols_allow": frozenset({"SOL/USDT"}),
+                },
+            ),
+            (
+                "trending_up_as_bull_pullback",
+                {
+                    "notional_mult": 1.5,
+                    "regime_override_from_context": {"trending_up": DAY_REGIME_BULL},
+                    "extra_allowed_buckets": bull_buckets,
+                },
+            ),
+            (
+                "trending_up_bull_breakout",
+                {
+                    "notional_mult": 1.5,
+                    "regime_override_from_context": {"trending_up": DAY_REGIME_BULL},
+                    "extra_allowed_buckets": frozenset((sym, DAY_REGIME_BULL, SETUP_BREAKOUT_CONTINUATION) for sym in SYMBOLS),
+                },
+            ),
         ]
         day_rows = []
         for label, spec in day_candidates:
@@ -543,9 +570,15 @@ def main() -> int:
             best_day,
         )
         best_bucket = max(
-            (r for r in day_rows if r.get("label") not in (
-                "locked_baseline_1_5x", "growth_candidate_2_5x_floor_0_60",
-            )),
+            (
+                r
+                for r in day_rows
+                if r.get("label")
+                not in (
+                    "locked_baseline_1_5x",
+                    "growth_candidate_2_5x_floor_0_60",
+                )
+            ),
             key=lambda x: float(x.get("monthly_pnl_usd_on_25k") or 0),
             default={},
         )
@@ -556,14 +589,11 @@ def main() -> int:
 
         def _summary_row(name: str, src: dict, is_scalp: bool = False) -> dict[str, Any]:
             if is_scalp:
-                m90 = {}
                 return {
                     "row": name,
                     "trades_per_month": src.get("extrapolated_trades_per_month"),
                     "monthly_pnl_usd_on_25k": src.get("extrapolated_monthly_pnl_usd"),
-                    "pct_per_month_on_25k": round(
-                        100.0 * float(src.get("extrapolated_monthly_pnl_usd") or 0) / PRINCIPAL, 4
-                    ),
+                    "pct_per_month_on_25k": round(100.0 * float(src.get("extrapolated_monthly_pnl_usd") or 0) / PRINCIPAL, 4),
                     "max_drawdown": src.get("max_drawdown_usd"),
                     "longest_hold": src.get("avg_hold_sec"),
                     "worst_mae": src.get("worst_loss_usd"),
@@ -573,7 +603,7 @@ def main() -> int:
                     "status": src.get("status"),
                     "dominant_gate": src.get("dominant_gate"),
                 }
-            m = (src.get("metrics_90d") or {})
+            m = src.get("metrics_90d") or {}
             return {
                 "row": name,
                 "label": src.get("label"),
@@ -598,23 +628,17 @@ def main() -> int:
                 "day_component": best_day.get("label"),
                 "scalp_component": best_scalp.get("strategy"),
                 "trades_per_month": round(
-                    float(best_day.get("trades_per_month") or 0)
-                    + float(best_scalp.get("extrapolated_trades_per_month") or 0),
+                    float(best_day.get("trades_per_month") or 0) + float(best_scalp.get("extrapolated_trades_per_month") or 0),
                     2,
                 ),
                 "monthly_pnl_usd_on_25k": combined_mo,
                 "pct_per_month_on_25k": round(100.0 * combined_mo / PRINCIPAL, 4),
-                "all_pass": bool(best_day.get("all_pass")) and (
-                    best_scalp.get("total_trades", 0) == 0
-                    or float(best_scalp.get("net_pnl_usd") or 0) >= 0
-                ),
+                "all_pass": bool(best_day.get("all_pass")) and (best_scalp.get("total_trades", 0) == 0 or float(best_scalp.get("net_pnl_usd") or 0) >= 0),
                 "target_met_500": combined_mo >= TARGET_500,
             },
             _summary_row("best_frequency_expansion_candidate", best_bucket),
         ]
-        report["any_target_met_500"] = any(
-            r.get("target_met_500") for r in report["summary_table"] if isinstance(r, dict)
-        )
+        report["any_target_met_500"] = any(r.get("target_met_500") for r in report["summary_table"] if isinstance(r, dict))
         report["tracebacks"] = tracebacks
 
         out = BASELINE_DIR / "mystic_frequency_diagnostic_latest.json"

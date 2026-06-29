@@ -1546,9 +1546,7 @@ class PaperTradingService:
                 import sqlite3
 
                 with sqlite3.connect(DATABASE_PATH) as probe:
-                    if not probe.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trade_logs'"
-                    ).fetchone():
+                    if not probe.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trade_logs'").fetchone():
                         return "skipped"
 
                 with SessionLocal() as session:

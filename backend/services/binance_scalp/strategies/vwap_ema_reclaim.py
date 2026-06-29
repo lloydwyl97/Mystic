@@ -62,13 +62,7 @@ class VwapEmaReclaimStrategy:
             return reject_signal(ctx, self.name, "NO_VWAP_EMA_RECLAIM")
 
         mom = ctx.mom
-        if not (
-            mom.bid_change_15s > 0
-            and mom.mid_change_15s > 0
-            and mom.mid_change_30s > 0
-            and mom.momentum_confirmed
-            and higher_low
-        ):
+        if not (mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0 and mom.momentum_confirmed and higher_low):
             return reject_signal(ctx, self.name, "NO_PULLBACK_RECOVERY")
 
         expected = (vwap - prior_low) / cur if cur > 0 else 0.001

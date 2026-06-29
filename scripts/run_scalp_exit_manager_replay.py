@@ -16,17 +16,17 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.calibration_profiles import apply_profile, economics_for_config  # noqa: E402
-from backend.services.binance_scalp.config import ScalpConfig, get_scalp_config  # noqa: E402
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
-from backend.services.binance_scalp.exit_manager import (  # noqa: E402
+from backend.services.binance_scalp.calibration_profiles import apply_profile, economics_for_config
+from backend.services.binance_scalp.config import ScalpConfig, get_scalp_config
+from backend.services.binance_scalp.economics import ScalpEconomics
+from backend.services.binance_scalp.exit_manager import (
     DECISION_SELL,
     EXIT_MOMENTUM_FAILED,
     EXIT_NET_PROFIT_TARGET,
     PositionTrack,
     evaluate_exit,
 )
-from backend.services.binance_scalp.momentum_tracker import MomentumTracker  # noqa: E402
+from backend.services.binance_scalp.momentum_tracker import MomentumTracker
 
 NOTIONAL = 25.0
 REVIEW_INTERVAL = 30
@@ -36,10 +36,7 @@ def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
     bars: list[dict] = []
     cursor = start_ms
     while cursor < end_ms:
-        url = (
-            f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m"
-            f"&startTime={cursor}&endTime={end_ms}&limit=1000"
-        )
+        url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m&startTime={cursor}&endTime={end_ms}&limit=1000"
         proc = subprocess.run(
             ["curl", "-s", "--max-time", "30", url],
             capture_output=True,
@@ -105,7 +102,7 @@ def simulate_new_manager(
     decision_at_stale = "HOLD"
     state_at_stale = "STALE_REVIEW"
 
-    for i, bar in enumerate(bars):
+    for _i, bar in enumerate(bars):
         ts_ms = bar["ts_ms"]
         hold_sec = (ts_ms - entry_ms) / 1000.0
         bid = bar["close"] * 0.9998
@@ -123,9 +120,7 @@ def simulate_new_manager(
         gross = (exit_px - entry_px) / entry_px
         net_pct = gross - rt
 
-        perform_review = hold_sec >= stale_sec and (
-            track.stale_review_count == 0 or (ts_ms - last_review_ms) >= REVIEW_INTERVAL * 1000
-        )
+        perform_review = hold_sec >= stale_sec and (track.stale_review_count == 0 or (ts_ms - last_review_ms) >= REVIEW_INTERVAL * 1000)
         if perform_review:
             last_review_ms = ts_ms
 
@@ -191,9 +186,7 @@ def main() -> int:
     config = get_scalp_config()
     econ = economics_for_config(config)
     econ = apply_profile(ScalpEconomics.from_env(), "moderate")
-    econ = replace(econ, paper_spread_caps=__import__(
-        "backend.services.binance_scalp.paper_spread_caps", fromlist=["parse_paper_spread_caps_json"]
-    ).parse_paper_spread_caps_json())
+    econ = replace(econ, paper_spread_caps=__import__("backend.services.binance_scalp.paper_spread_caps", fromlist=["parse_paper_spread_caps_json"]).parse_paper_spread_caps_json())
 
     with sqlite3.connect(db) as conn:
         stale_trades = conn.execute(
@@ -211,7 +204,7 @@ def main() -> int:
     by_sym: dict[str, dict] = defaultdict(lambda: {"n": 0, "old_pnl": 0.0, "new_pnl": 0.0, "hold_at_stale": 0, "momentum_fail": 0})
 
     for row in stale_trades:
-        tid, sym, entry_px, old_exit, old_pnl, exit_ts, entry_ts = row
+        tid, sym, entry_px, _old_exit, old_pnl, exit_ts, entry_ts = row
         entry_ms = parse_ts(entry_ts)
         exit_ms = parse_ts(exit_ts)
         bars = fetch_klines(sym, entry_ms - 60_000, exit_ms + 900_000)

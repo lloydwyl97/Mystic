@@ -15,13 +15,17 @@ from typing import Any
 from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_PROFIT_TO_SELL
 from backend.services.day_trade_thesis import (
     SETUP_BREAKOUT_CONTINUATION,
+    SETUP_FAILED_BREAKDOWN_REVERSAL,
     SETUP_HTF_TREND_PULLBACK,
     SETUP_NO_CLEAR_THESIS,
+    SETUP_RANGE_BOUNCE,
     SETUP_VWAP_REVERSION,
     _safe_float,
     _tf_align,
     parse_mtf_json,
 )
+
+STRATEGY_FAMILY_ALLWEATHER_BREAKOUT_PULLBACK = "ALLWEATHER_BREAKOUT_PULLBACK"
 
 DAY_REGIME_BULL = "bull"
 DAY_REGIME_RANGE = "range"
@@ -111,6 +115,13 @@ def htf_allows_day_long(
         return True, "htf_breakout_reversal_confirmed"
     if setup_type == SETUP_VWAP_REVERSION and rsi <= 35.0 and bb <= 0.28:
         return True, "htf_exhaustion_mr"
+    if setup_type == SETUP_FAILED_BREAKDOWN_REVERSAL:
+        # Reversal allowed on LTF reclaim signal even if HTF is weak (bear trap case)
+        if (m15 is not None and m15 > 0.42) or rsi < 40:
+            return True, "htf_reversal_ltf_reclaim"
+        return True, "htf_reversal_bear_allowed"  # permit for activity + learning in down regimes
+    if setup_type == SETUP_RANGE_BOUNCE and (bb <= 0.35 or rsi < 45):
+        return True, "htf_range_bounce_ltf"
     return False, "htf_structure_denied"
 
 
@@ -122,9 +133,7 @@ def _range_vwap_reclaim_ok(decision_data: dict[str, Any], current_price: float) 
         vwap_dist = (current_price - vwap) / vwap
         if vwap_dist <= -0.0008 and bb <= 0.55:
             return True
-    if bb <= 0.30 and _safe_float(dd.get("rsi"), 50.0) <= 38.0:
-        return True
-    return False
+    return bool(bb <= 0.3 and _safe_float(dd.get("rsi"), 50.0) <= 38.0)
 
 
 def _range_vwap_reclaim_strict(decision_data: dict[str, Any], current_price: float) -> bool:
@@ -183,6 +192,7 @@ def evaluate_day_entry_route(
     current_price: float = 0.0,
     thesis_score: float = 0.0,
     xrp_churn_active: bool = False,
+    strategy_family: str | None = None,
 ) -> dict[str, Any]:
     """
     Returns allowed, block_reason, rank_delta, size_factor, min_thesis_score.
@@ -194,6 +204,71 @@ def evaluate_day_entry_route(
     rank_delta = 0.0
     size_factor = 1.0
     min_thesis = 0.40
+    family = str(strategy_family or decision_data.get("strategy_family") or "").strip().upper()
+
+    if family == STRATEGY_FAMILY_ALLWEATHER_BREAKOUT_PULLBACK:
+        if regime == DAY_REGIME_CHOP:
+            return {
+                "allowed": False,
+                "block_reason": "REGIME_ROUTE_CHOP_NO_DAY",
+                "day_route_regime": regime,
+                "strategy_family": family,
+                "route_rank_delta": 0.0,
+                "route_size_factor": 0.0,
+                "route_min_thesis_score": 1.0,
+            }
+        if regime == DAY_REGIME_BULL:
+            if setup not in (SETUP_HTF_TREND_PULLBACK, SETUP_BREAKOUT_CONTINUATION):
+                return {
+                    "allowed": False,
+                    "block_reason": "ALLWEATHER_ROUTE_BULL_SETUP_MISMATCH",
+                    "day_route_regime": regime,
+                    "strategy_family": family,
+                    "route_rank_delta": 0.0,
+                    "route_size_factor": 0.0,
+                    "route_min_thesis_score": 1.0,
+                }
+        elif regime in (DAY_REGIME_NEUTRAL, DAY_REGIME_RANGE):
+            if setup not in (SETUP_BREAKOUT_CONTINUATION, SETUP_VWAP_REVERSION, SETUP_RANGE_BOUNCE):
+                return {
+                    "allowed": False,
+                    "block_reason": "ALLWEATHER_ROUTE_NEUTRAL_RANGE_ONLY",
+                    "day_route_regime": regime,
+                    "strategy_family": family,
+                    "route_rank_delta": 0.0,
+                    "route_size_factor": 0.0,
+                    "route_min_thesis_score": 1.0,
+                }
+        elif regime == DAY_REGIME_BEAR:
+            if setup not in (SETUP_FAILED_BREAKDOWN_REVERSAL, SETUP_VWAP_REVERSION):
+                return {
+                    "allowed": False,
+                    "block_reason": "ALLWEATHER_ROUTE_BEAR_REVERSAL_ONLY",
+                    "day_route_regime": regime,
+                    "strategy_family": family,
+                    "route_rank_delta": 0.0,
+                    "route_size_factor": 0.0,
+                    "route_min_thesis_score": 1.0,
+                }
+        else:
+            return {
+                "allowed": False,
+                "block_reason": "ALLWEATHER_ROUTE_REGIME_BLOCKED",
+                "day_route_regime": regime,
+                "strategy_family": family,
+                "route_rank_delta": 0.0,
+                "route_size_factor": 0.0,
+                "route_min_thesis_score": 1.0,
+            }
+        return {
+            "allowed": True,
+            "block_reason": "",
+            "day_route_regime": regime,
+            "strategy_family": family,
+            "route_rank_delta": 0.0,
+            "route_size_factor": 1.0,
+            "route_min_thesis_score": 0.40,
+        }
 
     if setup == SETUP_NO_CLEAR_THESIS:
         return {
@@ -244,7 +319,7 @@ def evaluate_day_entry_route(
             }
 
     elif regime == DAY_REGIME_RANGE:
-        if setup != SETUP_VWAP_REVERSION:
+        if setup not in (SETUP_VWAP_REVERSION, SETUP_RANGE_BOUNCE):
             return {
                 "allowed": False,
                 "block_reason": "REGIME_ROUTE_RANGE_MR_ONLY",
@@ -253,26 +328,42 @@ def evaluate_day_entry_route(
                 "route_size_factor": 0.0,
                 "route_min_thesis_score": 1.0,
             }
-        adx = _safe_float(decision_data.get("adx"), 20.0)
-        if adx > 24.0:
-            return {
-                "allowed": False,
-                "block_reason": "REGIME_ROUTE_VWAP_ADX_TOO_HIGH",
-                "day_route_regime": regime,
-                "route_rank_delta": 0.0,
-                "route_size_factor": 0.0,
-                "route_min_thesis_score": 1.0,
-            }
-        if not _range_vwap_reclaim_strict(decision_data, current_price):
-            return {
-                "allowed": False,
-                "block_reason": "REGIME_ROUTE_RANGE_NOT_AT_LOW",
-                "day_route_regime": regime,
-                "route_rank_delta": 0.0,
-                "route_size_factor": 0.0,
-                "route_min_thesis_score": 1.0,
-            }
-        if not _vwap_expected_mfe_after_fees_ok(decision_data, current_price):
+        if setup == SETUP_RANGE_BOUNCE:
+            adx = _safe_float(decision_data.get("adx"), 20.0)
+            if adx > 30:
+                return {"allowed": False, "block_reason": "RANGE_BOUNCE_ADX_TOO_HIGH", "day_route_regime": regime, "route_rank_delta": 0.0, "route_size_factor": 0.0, "route_min_thesis_score": 1.0}
+            size_factor = min(size_factor, 0.70)
+            rank_delta -= 0.02
+            min_thesis = 0.48
+            # Bounce is intentionally lighter — skip the full VWAP reclaim stricts
+        else:
+            # VWAP strict path
+            adx = _safe_float(decision_data.get("adx"), 20.0)
+            if adx > 24.0:
+                return {
+                    "allowed": False,
+                    "block_reason": "REGIME_ROUTE_VWAP_ADX_TOO_HIGH",
+                    "day_route_regime": regime,
+                    "route_rank_delta": 0.0,
+                    "route_size_factor": 0.0,
+                    "route_min_thesis_score": 1.0,
+                }
+            if not _range_vwap_reclaim_strict(decision_data, current_price):
+                return {"allowed": False, "block_reason": "REGIME_ROUTE_RANGE_NOT_AT_LOW", "day_route_regime": regime, "route_rank_delta": 0.0, "route_size_factor": 0.0, "route_min_thesis_score": 1.0}
+            if not _vwap_expected_mfe_after_fees_ok(decision_data, current_price):
+                return {
+                    "allowed": False,
+                    "block_reason": "REGIME_ROUTE_RANGE_VWAP_MFE_TOO_LOW",
+                    "day_route_regime": regime,
+                    "route_rank_delta": 0.0,
+                    "route_size_factor": 0.0,
+                    "route_min_thesis_score": 1.0,
+                }
+            min_thesis = max(min_thesis, 0.62)
+            size_factor = min(size_factor, 0.55)
+            rank_delta -= 0.06
+        # Only apply VWAP-specific MFE for the VWAP setup (bounce uses its own lighter thesis levels)
+        if setup == SETUP_VWAP_REVERSION and not _vwap_expected_mfe_after_fees_ok(decision_data, current_price):
             return {
                 "allowed": False,
                 "block_reason": "REGIME_ROUTE_RANGE_VWAP_MFE_TOO_LOW",
@@ -281,9 +372,11 @@ def evaluate_day_entry_route(
                 "route_size_factor": 0.0,
                 "route_min_thesis_score": 1.0,
             }
-        min_thesis = max(min_thesis, 0.62)
-        size_factor = min(size_factor, 0.55)
-        rank_delta -= 0.06
+        if setup == SETUP_VWAP_REVERSION:
+            min_thesis = max(min_thesis, 0.62)
+            size_factor = min(size_factor, 0.55)
+            rank_delta -= 0.06
+        # For RANGE_BOUNCE we keep the lighter min_thesis (0.48) and size we set earlier
 
     elif regime == DAY_REGIME_BEAR:
         if setup == SETUP_HTF_TREND_PULLBACK:
@@ -295,6 +388,11 @@ def evaluate_day_entry_route(
                 "route_size_factor": 0.0,
                 "route_min_thesis_score": 1.0,
             }
+        if setup == SETUP_FAILED_BREAKDOWN_REVERSAL:
+            # Allowed reversal in bear (paper mirrors live). Conservative size/min_thesis already applied upstream.
+            rank_delta -= 0.03
+            size_factor = 0.55
+            min_thesis = 0.58
         if setup == SETUP_BREAKOUT_CONTINUATION:
             if not _bear_reversal_breakout_ok(decision_data, score):
                 return {
@@ -323,8 +421,8 @@ def evaluate_day_entry_route(
             min_thesis = 0.62
 
     elif regime == DAY_REGIME_NEUTRAL:
-        # Neutral/range discipline: VWAP reversion only (replay-backed).
-        if setup != SETUP_VWAP_REVERSION:
+        # Neutral/range: VWAP or range bounce (to generate activity + learning in non-trend).
+        if setup not in (SETUP_VWAP_REVERSION, SETUP_RANGE_BOUNCE):
             return {
                 "allowed": False,
                 "block_reason": "REGIME_ROUTE_NEUTRAL_MR_ONLY",

@@ -7,18 +7,18 @@ import json
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
-from backend.services.binance_scalp.entry_gate import evaluate_buy_entry_gate  # noqa: E402
-from backend.services.binance_scalp.momentum_gross_estimate import (  # noqa: E402
+from backend.services.binance_scalp.economics import ScalpEconomics
+from backend.services.binance_scalp.entry_gate import evaluate_buy_entry_gate
+from backend.services.binance_scalp.momentum_gross_estimate import (
     compute_from_1m_bars,
 )
-from backend.services.binance_scalp.momentum_tracker import MomentumDiagnostics  # noqa: E402
+from backend.services.binance_scalp.momentum_tracker import MomentumDiagnostics
 
 HOURS = 8
 SYMBOLS = ("BTCUSDT", "ETHUSDT")
@@ -29,10 +29,7 @@ def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
     bars: list[dict] = []
     cursor = start_ms
     while cursor < end_ms:
-        url = (
-            f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m"
-            f"&startTime={cursor}&endTime={end_ms}&limit=1000"
-        )
+        url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m&startTime={cursor}&endTime={end_ms}&limit=1000"
         proc = subprocess.run(
             ["curl", "-s", "--max-time", "30", url],
             capture_output=True,
@@ -65,9 +62,7 @@ def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
 def momentum_from_bars(bars: list[dict], idx: int) -> MomentumDiagnostics:
     est = compute_from_1m_bars(bars, idx)
     if idx < 6:
-        return MomentumDiagnostics(
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, False, True
-        )
+        return MomentumDiagnostics(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, False, True)
 
     def chg(i0: int, i1: int) -> float:
         a, b = float(bars[i0]["close"]), float(bars[i1]["close"])
@@ -76,21 +71,9 @@ def momentum_from_bars(bars: list[dict], idx: int) -> MomentumDiagnostics:
     mid15 = chg(idx - 1, idx)
     mid30 = chg(idx - 2, idx) / 2.0
     mid60 = chg(idx - 4, idx) / 4.0
-    up = sum(
-        1
-        for j in range(idx - 5, idx)
-        if float(bars[j + 1]["close"]) > float(bars[j]["close"])
-    )
+    up = sum(1 for j in range(idx - 5, idx) if float(bars[j + 1]["close"]) > float(bars[j]["close"]))
     flat = abs(mid15) <= 0.00002 and abs(mid15) <= 0.00002
-    confirmed = (
-        est.data_sufficient
-        and est.breakout_confirmed
-        and mid30 > 0
-        and mid60 > 0
-        and mid15 >= 0.00003
-        and up >= 2
-        and not flat
-    )
+    confirmed = est.data_sufficient and est.breakout_confirmed and mid30 > 0 and mid60 > 0 and mid15 >= 0.00003 and up >= 2 and not flat
     return MomentumDiagnostics(
         mid_change_15s=mid15,
         mid_change_30s=mid30,
@@ -166,9 +149,7 @@ def analyze_symbol(symbol: str, bars: list[dict], econ: ScalpEconomics) -> dict:
         "true_positives": len(tp),
         "false_negatives": len(fn),
         "false_positives": len(fp),
-        "recall_on_reachable_pct": round(100 * len(tp) / len(reachable), 1)
-        if reachable
-        else 0.0,
+        "recall_on_reachable_pct": round(100 * len(tp) / len(reachable), 1) if reachable else 0.0,
         "false_positive_rate_pct": round(100 * len(fp) / n, 1) if n else 0.0,
         "best_true_positive": best_tp,
         "best_false_negative": best_missed,
@@ -192,9 +173,7 @@ def audit_passes(summary: dict) -> bool:
         return False
     if tp < 2:
         return False
-    if fp > max(tp * 3, 10):
-        return False
-    return True
+    return not fp > max(tp * 3, 10)
 
 
 def main() -> int:
@@ -217,10 +196,7 @@ def main() -> int:
         "total_false_positives": sum(s["false_positives"] for s in symbols_out.values()),
     }
     summary["audit_passes_for_paper_soak"] = audit_passes(summary)
-    summary["projected_gross_formula"] = (
-        "0.30*trend_30s + 0.25*trend_60s + 0.20*trend_15s + "
-        "0.15*breakout + 0.10*realized_vol + imbalance_boost(if trend_30s>0)"
-    )
+    summary["projected_gross_formula"] = "0.30*trend_30s + 0.25*trend_60s + 0.20*trend_15s + 0.15*breakout + 0.10*realized_vol + imbalance_boost(if trend_30s>0)"
 
     out = {
         "window_hours": HOURS,

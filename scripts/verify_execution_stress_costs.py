@@ -2,12 +2,13 @@
 """
 Verify execution stress replay cost math — per-trade decomposition, no live changes.
 """
+
 from __future__ import annotations
 
 import json
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -17,11 +18,11 @@ BASELINE_ID = "day_baseline_all_pass_v1"
 
 from scripts.run_day_execution_replay import (
     STRESS_SCENARIOS,
+    SYMBOLS,
     ExecutionConfig,
     fetch_klines_cached,
     run_execution_replay,
     verify_live_rules_match_baseline,
-    SYMBOLS,
 )
 
 
@@ -98,28 +99,30 @@ def compare_scenarios(
         hold_diff = st["hold_sec"] - nt["hold_sec"]
         if hold_diff > 0:
             later_exits += 1
-        rows.append({
-            "symbol": nt["symbol"],
-            "entry_ts": nt["entry_ts"],
-            "entry_time_utc": datetime.fromtimestamp(nt["entry_ts"], tz=timezone.utc).isoformat(),
-            "exit_ts_normal": nt["exit_ts"],
-            "exit_ts_stressed": st["exit_ts"],
-            "exit_time_normal_utc": datetime.fromtimestamp(nt["exit_ts"], tz=timezone.utc).isoformat(),
-            "exit_time_stressed_utc": datetime.fromtimestamp(st["exit_ts"], tz=timezone.utc).isoformat(),
-            "hold_diff_hours": round(hold_diff / 3600, 2),
-            "gross_pnl_normal": nd["gross_pnl_fill_usd"],
-            "gross_pnl_stressed": sd["gross_pnl_fill_usd"],
-            "costs_normal": nd["total_fees_usd"] + nd["total_slippage_spread_usd"],
-            "costs_stressed": sd["total_fees_usd"] + sd["total_slippage_spread_usd"],
-            "net_pnl_normal": nd["net_pnl_usd"],
-            "net_pnl_stressed": sd["net_pnl_usd"],
-            "net_diff_stressed_minus_normal": round(sd["net_pnl_usd"] - nd["net_pnl_usd"], 4),
-            "mae_normal_pct": nt["intrabar_mae_pct"],
-            "mae_stressed_pct": st["intrabar_mae_pct"],
-            "mae_diff_pct": round(st["intrabar_mae_pct"] - nt["intrabar_mae_pct"], 5),
-            "exit_reason_normal": nt["exit_reason"],
-            "exit_reason_stressed": st["exit_reason"],
-        })
+        rows.append(
+            {
+                "symbol": nt["symbol"],
+                "entry_ts": nt["entry_ts"],
+                "entry_time_utc": datetime.fromtimestamp(nt["entry_ts"], tz=timezone.utc).isoformat(),
+                "exit_ts_normal": nt["exit_ts"],
+                "exit_ts_stressed": st["exit_ts"],
+                "exit_time_normal_utc": datetime.fromtimestamp(nt["exit_ts"], tz=timezone.utc).isoformat(),
+                "exit_time_stressed_utc": datetime.fromtimestamp(st["exit_ts"], tz=timezone.utc).isoformat(),
+                "hold_diff_hours": round(hold_diff / 3600, 2),
+                "gross_pnl_normal": nd["gross_pnl_fill_usd"],
+                "gross_pnl_stressed": sd["gross_pnl_fill_usd"],
+                "costs_normal": nd["total_fees_usd"] + nd["total_slippage_spread_usd"],
+                "costs_stressed": sd["total_fees_usd"] + sd["total_slippage_spread_usd"],
+                "net_pnl_normal": nd["net_pnl_usd"],
+                "net_pnl_stressed": sd["net_pnl_usd"],
+                "net_diff_stressed_minus_normal": round(sd["net_pnl_usd"] - nd["net_pnl_usd"], 4),
+                "mae_normal_pct": nt["intrabar_mae_pct"],
+                "mae_stressed_pct": st["intrabar_mae_pct"],
+                "mae_diff_pct": round(st["intrabar_mae_pct"] - nt["intrabar_mae_pct"], 5),
+                "exit_reason_normal": nt["exit_reason"],
+                "exit_reason_stressed": st["exit_reason"],
+            }
+        )
 
     return {
         "stress_scenario": stress_name,
@@ -155,9 +158,13 @@ def main() -> int:
     aggregates: dict[str, dict] = {}
     for name, cfg in scenarios.items():
         r = run_execution_replay(
-            bars_1h, bars_15m, window_days=90,
-            start_ts=start_ts, end_ts=end_ts,
-            config=cfg, exec_interval="15m",
+            bars_1h,
+            bars_15m,
+            window_days=90,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            config=cfg,
+            exec_interval="15m",
             return_trades=True,
         )
         trades = r.get("trades_detail", [])
@@ -185,52 +192,64 @@ def main() -> int:
 
     math_warnings = []
     # Double-count check: exit gate subtracts roundtrip_cost from fill-adjusted pnl_pct
-    math_warnings.append({
-        "code": "EXIT_GATE_ROUNDTRIP_ON_FILL_ADJUSTED_PRICES",
-        "severity": "warning",
-        "detail": (
-            "Exit decision uses net_pct = (sell_fill-close - buy_fill-close)/entry - roundtrip_cost. "
-            "sell_fill/buy_fill already embed one_way_cost (spread+slippage). "
-            "Subtracting roundtrip_cost again double-counts spread/slippage in the gate (fees also overlap). "
-            "Effect: higher assumed costs delay net-profit exits; in uptrends later exits can show HIGHER net PnL "
-            "despite worse per-fill costs — path dependence, not lookahead."
-        ),
-    })
-    if aggregates["2x_slippage"]["net_pnl_usd"] > aggregates["normal"]["net_pnl_usd"]:
-        math_warnings.append({
-            "code": "STRESS_PNL_HIGHER_THAN_NORMAL",
-            "severity": "info",
+    math_warnings.append(
+        {
+            "code": "EXIT_GATE_ROUNDTRIP_ON_FILL_ADJUSTED_PRICES",
+            "severity": "warning",
             "detail": (
-                f"2x_slippage net ${aggregates['2x_slippage']['net_pnl_usd']:.2f} > normal "
-                f"${aggregates['normal']['net_pnl_usd']:.2f}. "
-                f"Matched trades with later stressed exits: "
-                f"{comparisons[0]['stressed_exits_later_count']}/{comparisons[0]['matched_trades']}. "
-                "Higher roundtrip gate threshold delays exits; gross at later bars can exceed extra costs."
+                "Exit decision uses net_pct = (sell_fill-close - buy_fill-close)/entry - roundtrip_cost. "
+                "sell_fill/buy_fill already embed one_way_cost (spread+slippage). "
+                "Subtracting roundtrip_cost again double-counts spread/slippage in the gate (fees also overlap). "
+                "Effect: higher assumed costs delay net-profit exits; in uptrends later exits can show HIGHER net PnL "
+                "despite worse per-fill costs — path dependence, not lookahead."
             ),
-        })
+        }
+    )
+    if aggregates["2x_slippage"]["net_pnl_usd"] > aggregates["normal"]["net_pnl_usd"]:
+        math_warnings.append(
+            {
+                "code": "STRESS_PNL_HIGHER_THAN_NORMAL",
+                "severity": "info",
+                "detail": (
+                    f"2x_slippage net ${aggregates['2x_slippage']['net_pnl_usd']:.2f} > normal "
+                    f"${aggregates['normal']['net_pnl_usd']:.2f}. "
+                    f"Matched trades with later stressed exits: "
+                    f"{comparisons[0]['stressed_exits_later_count']}/{comparisons[0]['matched_trades']}. "
+                    "Higher roundtrip gate threshold delays exits; gross at later bars can exceed extra costs."
+                ),
+            }
+        )
     if aggregates["normal"]["recompute_errors"] or aggregates["2x_slippage"]["recompute_errors"]:
-        math_warnings.append({
-            "code": "PNL_RECOMPUTE_MISMATCH",
-            "severity": "error",
-            "detail": "Net PnL does not recompute from mid/fill/fee components within tolerance.",
-        })
+        math_warnings.append(
+            {
+                "code": "PNL_RECOMPUTE_MISMATCH",
+                "severity": "error",
+                "detail": "Net PnL does not recompute from mid/fill/fee components within tolerance.",
+            }
+        )
 
     # Lookahead checks
-    math_warnings.append({
-        "code": "NO_LOOKAHEAD_ENTRY",
-        "severity": "ok",
-        "detail": "Entries fire at hour boundary using 1h slice [:i+1] only; no future bars in decision data.",
-    })
-    math_warnings.append({
-        "code": "MAE_USES_CURRENT_BAR_LOW",
-        "severity": "ok",
-        "detail": "Intrabar MAE updates from current exec bar low vs entry; no future bar highs/lows used for fills.",
-    })
-    math_warnings.append({
-        "code": "COST_SIGN",
-        "severity": "ok",
-        "detail": "Buy fill = mid*(1+owc), sell fill = mid*(1-owc); fees subtracted from PnL; all costs reduce net.",
-    })
+    math_warnings.append(
+        {
+            "code": "NO_LOOKAHEAD_ENTRY",
+            "severity": "ok",
+            "detail": "Entries fire at hour boundary using 1h slice [:i+1] only; no future bars in decision data.",
+        }
+    )
+    math_warnings.append(
+        {
+            "code": "MAE_USES_CURRENT_BAR_LOW",
+            "severity": "ok",
+            "detail": "Intrabar MAE updates from current exec bar low vs entry; no future bar highs/lows used for fills.",
+        }
+    )
+    math_warnings.append(
+        {
+            "code": "COST_SIGN",
+            "severity": "ok",
+            "detail": "Buy fill = mid*(1+owc), sell fill = mid*(1-owc); fees subtracted from PnL; all costs reduce net.",
+        }
+    )
 
     # Final baseline report from cached hi-res if available
     exec_path = BASELINE_DIR / "day_execution_replay_latest.json"
@@ -244,9 +263,13 @@ def main() -> int:
     baseline_locked = baseline_path.exists()
 
     normal_90 = run_execution_replay(
-        bars_1h, bars_15m, window_days=90,
-        start_ts=start_ts, end_ts=end_ts,
-        config=normal_cfg, exec_interval="15m",
+        bars_1h,
+        bars_15m,
+        window_days=90,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        config=normal_cfg,
+        exec_interval="15m",
     )
     w90 = normal_90
     br = w90.get("bucket_report") or []
@@ -276,9 +299,7 @@ def main() -> int:
         "final_baseline_report": {
             "live_rules_match_baseline": live_check.get("match", False),
             "high_res_all_pass": hi_res_all_pass,
-            "stress_all_pass": all(
-                (aggregates[s]["net_pnl_usd"] or 0) > 0 for s in ("normal", "2x_slippage", "wider_spread")
-            ),
+            "stress_all_pass": all((aggregates[s]["net_pnl_usd"] or 0) > 0 for s in ("normal", "2x_slippage", "wider_spread")),
             "no_red_thesis_sells": w90.get("red_thesis_sell_count", 0) == 0,
             "no_duplicates": w90.get("duplicate_attempts", 0) == 0,
             "no_repair_adds": True,

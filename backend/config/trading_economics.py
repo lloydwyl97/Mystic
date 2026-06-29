@@ -74,10 +74,8 @@ TAKER_FEE: Final[float] = _env_float("TAKER_FEE", BINANCE_US_TAKER_FEE_PCT)
 SLIPPAGE_BUFFER: Final[float] = _env_float("SLIPPAGE_BUFFER", 0.0001)
 # Default order-book half-spread estimate (live measured via bookTicker; override via env).
 ORDERBOOK_HALF_SPREAD_ESTIMATE: Final[float] = _env_float("ORDERBOOK_HALF_SPREAD_ESTIMATE", 0.00006)
-# Round-trip for sell gate: 2× taker fee + 2× half-spread + 2× slippage buffer (no platform spread).
-_DEFAULT_ROUNDTRIP_NO_SPREAD: Final[float] = (
-    (2.0 * TAKER_FEE) + (2.0 * ORDERBOOK_HALF_SPREAD_ESTIMATE) + (2.0 * SLIPPAGE_BUFFER)
-)
+# Round-trip for sell gate: 2x taker fee + 2x half-spread + 2x slippage buffer (no platform spread).
+_DEFAULT_ROUNDTRIP_NO_SPREAD: Final[float] = (2.0 * TAKER_FEE) + (2.0 * ORDERBOOK_HALF_SPREAD_ESTIMATE) + (2.0 * SLIPPAGE_BUFFER)
 # Round-trip cost for the sell gate (`_check_exit_conditions`): operator sets from
 # live Binance.US bid/ask (+fees+SLIPPAGE_BUFFER); default is fee+slippage only.
 ESTIMATED_ROUNDTRIP_COST: Final[float] = _env_float(
@@ -111,7 +109,7 @@ COOLDOWN_SECONDS_AFTER_HUMAN_SELL: Final[int] = _env_int(
 )
 
 # -- DAY sizing (replay-aligned per-slot notional) -----------------------------
-# Baseline replay uses $2,500/slot; 1.5× candidate → $3,750/slot, $15k max (4 slots).
+# Baseline replay uses $2,500/slot; 1.5x candidate → $3,750/slot, $15k max (4 slots).
 DAY_BASE_NOTIONAL_PER_SLOT_USD: Final[float] = _env_float("DAY_BASE_NOTIONAL_PER_SLOT_USD", 2500.0)
 DAY_NOTIONAL_MULT: Final[float] = _env_float("DAY_NOTIONAL_MULT", 1.0)
 DAY_TARGET_NOTIONAL_PER_SLOT_USD: Final[float] = _env_float(
@@ -178,10 +176,7 @@ def get_trading_economics_display() -> dict[str, Any]:
         "roundtrip_estimated_cost_pct": snap.estimated_roundtrip_cost,
         "roundtrip_estimated_cost_bps": round(snap.estimated_roundtrip_cost * 10000, 2),
         "fee_schedule_source_date": snap.fee_schedule_source_date,
-        "fee_schedule_note": (
-            "Binance.US Advanced Spot: 0% maker / 0.02% taker universal (Apr 2026). "
-            "No platform spread; order-book spread + slippage buffer only."
-        ),
+        "fee_schedule_note": ("Binance.US Advanced Spot: 0% maker / 0.02% taker universal (Apr 2026). No platform spread; order-book spread + slippage buffer only."),
         "min_net_profit_to_sell_pct": snap.min_net_profit_to_sell,
         "day_notional_mult": snap.day_notional_mult,
         "day_base_notional_per_slot_usd": DAY_BASE_NOTIONAL_PER_SLOT_USD,
@@ -203,9 +198,7 @@ def is_net_profit_acceptable(
     """
     if net_profit_pct < MIN_NET_PROFIT_TO_SELL:
         return False
-    if MIN_PROFIT_AFTER_COSTS_USD > 0.0 and net_profit_usd < MIN_PROFIT_AFTER_COSTS_USD:
-        return False
-    return True
+    return not (MIN_PROFIT_AFTER_COSTS_USD > 0.0 and net_profit_usd < MIN_PROFIT_AFTER_COSTS_USD)
 
 
 def log_trading_economics_at_startup() -> TradingEconomicsSnapshot:

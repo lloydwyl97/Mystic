@@ -15,7 +15,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
+from backend.services.binance_scalp.economics import ScalpEconomics
 
 DB = REPO / "mystic_trading.db"
 SOAK_SELL_IDS = {
@@ -29,10 +29,7 @@ SOAK_SELL_IDS = {
 
 def _fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
     base = "https://api.binance.us/api/v3/klines"
-    url = (
-        f"{base}?symbol={symbol}&interval=1m"
-        f"&startTime={start_ms}&endTime={end_ms}&limit=1000"
-    )
+    url = f"{base}?symbol={symbol}&interval=1m&startTime={start_ms}&endTime={end_ms}&limit=1000"
     proc = subprocess.run(
         ["curl", "-s", "--max-time", "20", url],
         capture_output=True,
@@ -117,7 +114,7 @@ def _hypothetical_exit(
     best_net_usd = -999.0
     exit_bid = entry
     hit_target = False
-    exit_at = entry_ts.timestamp()
+    entry_ts.timestamp()
 
     for k in klines:
         t = k["open_time_ms"] / 1000.0
@@ -127,24 +124,21 @@ def _hypothetical_exit(
             break
         bid_proxy = k["low"]  # conservative bid proxy
         net_pct, net_usd = _net_at_bid(entry, bid_proxy, qty, spread_assumption, 0.0, econ)
-        if bid_proxy > best_bid:
-            best_bid = bid_proxy
+        best_bid = max(best_bid, bid_proxy)
         if net_pct > best_net_pct:
             best_net_pct = net_pct
             best_net_usd = net_usd
         if net_pct >= econ.net_profit_target_pct and not hit_target:
             hit_target = True
         exit_bid = k["close"]
-        exit_at = t
 
     final_bid = exit_bid
     for k in klines:
         t = k["open_time_ms"] / 1000.0
         if entry_ts.timestamp() <= t <= end_ts:
             final_bid = k["close"]
-            exit_at = t
 
-    final_net_pct, final_net_usd = _net_at_bid(entry, final_bid, qty, spread_assumption, 0.0, econ)
+    _final_net_pct, final_net_usd = _net_at_bid(entry, final_bid, qty, spread_assumption, 0.0, econ)
     return {
         "timeout_sec": timeout_sec,
         "best_bid_proxy": best_bid,
@@ -159,12 +153,8 @@ def _hypothetical_exit(
 def analyze_trade(conn: sqlite3.Connection, sell_row: sqlite3.Row, econ: ScalpEconomics) -> dict:
     sell_tid = sell_row["trade_id"]
     buy_tid = sell_tid.replace("_SELL", "")
-    buy = conn.execute(
-        "SELECT * FROM scalp_paper_trades WHERE trade_id=?", (buy_tid,)
-    ).fetchone()
-    pos = conn.execute(
-        "SELECT * FROM scalp_paper_positions WHERE trade_id=?", (buy_tid,)
-    ).fetchone()
+    buy = conn.execute("SELECT * FROM scalp_paper_trades WHERE trade_id=?", (buy_tid,)).fetchone()
+    pos = conn.execute("SELECT * FROM scalp_paper_positions WHERE trade_id=?", (buy_tid,)).fetchone()
     if not buy:
         raise RuntimeError(f"missing buy for {sell_tid}")
 
@@ -218,10 +208,7 @@ def analyze_trade(conn: sqlite3.Connection, sell_row: sqlite3.Row, econ: ScalpEc
         post_hi = max(k["high"] for k in post_klines)
         post_recovery = (post_hi - exit_p) / exit_p
 
-    hypos = {
-        str(t): _hypothetical_exit(klines, entry, qty, entry_ts, t, econ, spread_e)
-        for t in (180, 300, 600)
-    }
+    hypos = {str(t): _hypothetical_exit(klines, entry, qty, entry_ts, t, econ, spread_e) for t in (180, 300, 600)}
 
     immediate_underwater = spread_e + econ.entry_fee_pct() + buy_i
 
@@ -259,9 +246,7 @@ def main() -> int:
     econ = ScalpEconomics.from_env()
     with sqlite3.connect(DB) as conn:
         conn.row_factory = sqlite3.Row
-        open_rows = conn.execute(
-            "SELECT id, symbol, status, entry_time, entry_price, trade_id FROM scalp_paper_positions WHERE status='OPEN'"
-        ).fetchall()
+        open_rows = conn.execute("SELECT id, symbol, status, entry_time, entry_price, trade_id FROM scalp_paper_positions WHERE status='OPEN'").fetchall()
 
         sells = conn.execute(
             """
@@ -276,10 +261,7 @@ def main() -> int:
 
     fav_moves = [t["max_favorable_move_pct"] for t in trades]
     req_gross = econ.net_profit_target_pct * 100
-    avg_costs = statistics.mean(
-        t["spread_at_entry_pct"] + t["impact_at_entry_pct"] * 2 + econ.roundtrip_fee_pct * 100
-        for t in trades
-    )
+    avg_costs = statistics.mean(t["spread_at_entry_pct"] + t["impact_at_entry_pct"] * 2 + econ.roundtrip_fee_pct * 100 for t in trades)
 
     report = {
         "open_positions_before_audit": [dict(r) for r in open_rows],
@@ -293,15 +275,9 @@ def main() -> int:
             "median_max_favorable_move_pct": statistics.median(fav_moves) if fav_moves else 0,
             "avg_hold_sec": statistics.mean([t["hold_seconds"] for t in trades]),
             "any_reached_target": any(t["price_reached_profit_target"] for t in trades),
-            "hypo_180_total_usd": sum(
-                t["hypothetical_timeouts"]["180"]["final_net_usd"] for t in trades
-            ),
-            "hypo_300_total_usd": sum(
-                t["hypothetical_timeouts"]["300"]["final_net_usd"] for t in trades
-            ),
-            "hypo_600_total_usd": sum(
-                t["hypothetical_timeouts"]["600"]["final_net_usd"] for t in trades
-            ),
+            "hypo_180_total_usd": sum(t["hypothetical_timeouts"]["180"]["final_net_usd"] for t in trades),
+            "hypo_300_total_usd": sum(t["hypothetical_timeouts"]["300"]["final_net_usd"] for t in trades),
+            "hypo_600_total_usd": sum(t["hypothetical_timeouts"]["600"]["final_net_usd"] for t in trades),
             "actual_total_usd": sum(t["net_pnl_usd"] for t in trades),
         },
     }

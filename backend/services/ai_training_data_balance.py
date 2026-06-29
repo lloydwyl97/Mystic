@@ -40,7 +40,7 @@ def resolve_combined_buy_rate_cap(
     max_cap: float = MAX_COMBINED_BUY_RATE,
     min_cap: float = MIN_COMBINED_BUY_RATE,
 ) -> float:
-    """Derive combined BUY cap from realized outcome priors (~5–9%) plus SS headroom."""
+    """Derive combined BUY cap from realized outcome priors (~5-9%) plus SS headroom."""
     if not raw_outcome:
         return max_cap
     buy = int(raw_outcome.get("BUY") or 0)
@@ -99,7 +99,7 @@ def enforce_combined_buy_rate_cap(
     """Downsample only self-supervised BUY rows until combined BUY rate <= cap."""
     Xs = np.asarray(X_ss, dtype=np.float64)
     ys = np.asarray(y_ss, dtype=np.int64).reshape(-1)
-    Xo = np.asarray(X_oc, dtype=np.float64)
+    np.asarray(X_oc, dtype=np.float64)
     yo = np.asarray(y_oc, dtype=np.int64).reshape(-1)
     meta: dict[str, Any] = {
         "combined_buy_rate_before": round(_buy_rate(np.concatenate([ys, yo])), 6) if len(ys) + len(yo) else None,
@@ -222,8 +222,8 @@ def prepare_outcome_weighted_training_arrays(
         "final_buy_rate": round(_buy_rate(y_all), 6),
         "outcome_row_weight": float(outcome_weight),
         "self_supervised_row_weight": float(self_supervised_weight),
-        "outcome_rows_kept": int(len(yo)),
-        "self_supervised_rows_kept": int(len(ys)),
+        "outcome_rows_kept": len(yo),
+        "self_supervised_rows_kept": len(ys),
     }
     return X_all, y_all, w_all, diag
 

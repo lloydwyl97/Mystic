@@ -19,17 +19,44 @@ EXIT_MANUAL = "MANUAL_EXIT"
 EXIT_ADMIN_CLEAR = "ADMIN_CLEAR"
 EXIT_LEGACY_INVENTORY_CLEANUP = "LEGACY_INVENTORY_CLEANUP_EXIT"
 EXIT_THESIS_WARNING = "THESIS_INVALIDATION_WARNING_ONLY"
+EXIT_THESIS_INVALIDATION = "THESIS_INVALIDATION_EXIT"
+EXIT_STOP_LOSS = "STOP_LOSS_EXIT"
+EXIT_TRAILING_STOP = "TRAILING_STOP_EXIT"
 
 SETUP_HTF_TREND_PULLBACK = "HTF_TREND_PULLBACK"
 SETUP_VWAP_REVERSION = "VWAP_REVERSION"
 SETUP_BREAKOUT_CONTINUATION = "BREAKOUT_CONTINUATION"
 SETUP_NO_CLEAR_THESIS = "NO_CLEAR_THESIS"
 
+# Active production reversal / range setups (paper + future live use same rules).
+# These were activated to generate trades and learnable outcomes in non-bull regimes.
+# Conservative sizing and ATR brackets apply; promotion still requires replay proof.
+SETUP_FAILED_BREAKDOWN_REVERSAL = "FAILED_BREAKDOWN_REVERSAL"
+SETUP_RANGE_BOUNCE = "RANGE_BOUNCE"
+
+# Research-only discovery setups (kept for historical replay compatibility).
+RESEARCH_FAILED_BREAKDOWN_REVERSAL = "RESEARCH_FAILED_BREAKDOWN_REVERSAL"
+RESEARCH_15M_30M_RECLAIM = "RESEARCH_15M_30M_RECLAIM"
+RESEARCH_VOLATILITY_EXPANSION = "RESEARCH_VOLATILITY_EXPANSION"
+RESEARCH_RANGE_RECLAIM = "RESEARCH_RANGE_RECLAIM"
+RESEARCH_TREND_RETEST = "RESEARCH_TREND_RETEST"
+RESEARCH_CAPITULATION_BOUNCE = "RESEARCH_CAPITULATION_BOUNCE"
+RESEARCH_SHORT_BEAR_CONTINUATION = "RESEARCH_SHORT_BEAR_CONTINUATION"
+
 ALL_SETUP_TYPES = (
     SETUP_HTF_TREND_PULLBACK,
     SETUP_VWAP_REVERSION,
     SETUP_BREAKOUT_CONTINUATION,
     SETUP_NO_CLEAR_THESIS,
+    SETUP_FAILED_BREAKDOWN_REVERSAL,
+    SETUP_RANGE_BOUNCE,
+    RESEARCH_FAILED_BREAKDOWN_REVERSAL,
+    RESEARCH_15M_30M_RECLAIM,
+    RESEARCH_VOLATILITY_EXPANSION,
+    RESEARCH_RANGE_RECLAIM,
+    RESEARCH_TREND_RETEST,
+    RESEARCH_CAPITULATION_BOUNCE,
+    RESEARCH_SHORT_BEAR_CONTINUATION,
 )
 
 HTF_TFS = ("15m", "30m", "1h", "4h")
@@ -41,36 +68,62 @@ _RANK_DELTA = {
     SETUP_VWAP_REVERSION: -0.02,
     SETUP_BREAKOUT_CONTINUATION: -0.06,
     SETUP_NO_CLEAR_THESIS: -0.14,
+    SETUP_FAILED_BREAKDOWN_REVERSAL: 0.03,  # mild boost in bear/range for learning data
+    SETUP_RANGE_BOUNCE: 0.01,
+    RESEARCH_FAILED_BREAKDOWN_REVERSAL: 0.0,
+    RESEARCH_15M_30M_RECLAIM: 0.0,
+    RESEARCH_VOLATILITY_EXPANSION: 0.0,
+    RESEARCH_RANGE_RECLAIM: 0.0,
+    RESEARCH_TREND_RETEST: 0.0,
+    RESEARCH_CAPITULATION_BOUNCE: 0.0,
+    RESEARCH_SHORT_BEAR_CONTINUATION: 0.0,
 }
 _RANK_DELTA_SCALP = {
     SETUP_HTF_TREND_PULLBACK: 0.02,
     SETUP_VWAP_REVERSION: 0.06,
     SETUP_BREAKOUT_CONTINUATION: 0.04,
     SETUP_NO_CLEAR_THESIS: -0.14,
+    SETUP_FAILED_BREAKDOWN_REVERSAL: 0.02,
+    SETUP_RANGE_BOUNCE: 0.01,
+    RESEARCH_FAILED_BREAKDOWN_REVERSAL: 0.0,
+    RESEARCH_15M_30M_RECLAIM: 0.0,
+    RESEARCH_VOLATILITY_EXPANSION: 0.0,
+    RESEARCH_RANGE_RECLAIM: 0.0,
+    RESEARCH_TREND_RETEST: 0.0,
+    RESEARCH_CAPITULATION_BOUNCE: 0.0,
+    RESEARCH_SHORT_BEAR_CONTINUATION: 0.0,
 }
 _EV_FACTOR = {
     SETUP_HTF_TREND_PULLBACK: 1.08,
     SETUP_VWAP_REVERSION: 0.92,
     SETUP_BREAKOUT_CONTINUATION: 0.88,
     SETUP_NO_CLEAR_THESIS: 0.50,
+    SETUP_FAILED_BREAKDOWN_REVERSAL: 0.95,
+    SETUP_RANGE_BOUNCE: 0.93,
 }
 _EV_FACTOR_SCALP = {
     SETUP_HTF_TREND_PULLBACK: 1.0,
     SETUP_VWAP_REVERSION: 1.05,
     SETUP_BREAKOUT_CONTINUATION: 1.02,
     SETUP_NO_CLEAR_THESIS: 0.50,
+    SETUP_FAILED_BREAKDOWN_REVERSAL: 0.96,
+    SETUP_RANGE_BOUNCE: 0.94,
 }
 _SIZE_FACTOR = {
     SETUP_HTF_TREND_PULLBACK: 1.0,
     SETUP_VWAP_REVERSION: 0.65,
     SETUP_BREAKOUT_CONTINUATION: 0.88,
     SETUP_NO_CLEAR_THESIS: 0.22,
+    SETUP_FAILED_BREAKDOWN_REVERSAL: 0.60,  # conservative in reversal (smaller size)
+    SETUP_RANGE_BOUNCE: 0.65,
 }
 _SIZE_FACTOR_SCALP = {
     SETUP_HTF_TREND_PULLBACK: 0.85,
     SETUP_VWAP_REVERSION: 1.0,
     SETUP_BREAKOUT_CONTINUATION: 0.90,
     SETUP_NO_CLEAR_THESIS: 0.22,
+    SETUP_FAILED_BREAKDOWN_REVERSAL: 0.55,
+    SETUP_RANGE_BOUNCE: 0.60,
 }
 
 
@@ -137,6 +190,16 @@ def enrich_decision_data_for_thesis(
         if dd.get("relative_volume") in (None, "", 0, 0.0):
             dd["relative_volume"] = _safe_float(ctx.get("ctx_relative_volume"), 0.0)
     dd["price_structure_regime"] = price_structure_regime or dd.get("price_structure_regime") or "unknown"
+
+    # Reversal / range activity indicators for AI features and learning (populated for new active setups)
+    aw = str(dd.get("allweather_setup") or dd.get("setup_type") or "").upper()
+    rsi = _safe_float(dd.get("rsi"), 50.0)
+    mom = _safe_float(dd.get("price_momentum"), 0.0)
+    adx = _safe_float(dd.get("adx"), 20.0)
+    bb = _safe_float(dd.get("bb_position"), 0.5)
+    dd["reversal_reclaim"] = 1.0 if ("FAILED_BREAKDOWN" in aw or (adx > 16 and rsi < 42 and mom > -0.01)) else 0.0
+    dd["range_bounce"] = 1.0 if ("RANGE_BOUNCE" in aw or (bb <= 0.35 and rsi < 48 and adx < 26)) else 0.0
+
     sym_bus = (symbol or dd.get("symbol") or "").replace("/", "").upper()
     if sym_bus and not dd.get("vwap"):
         try:
@@ -272,19 +335,49 @@ def classify_buy_thesis(
         if sym_norm in BREAKOUT_ALT_SYMBOLS:
             breakout += 0.06
 
+    # New active reversal / bounce scoring (paper mirrors live, conservative)
+    failed_rev = 0.0
+    # Trigger if AW stamped the reversal or classic bear-reclaim signals
+    aw_setup = str(dd.get("allweather_setup") or dd.get("setup_type") or "").upper()
+    if SETUP_FAILED_BREAKDOWN_REVERSAL in aw_setup or "FAILED_BREAKDOWN" in aw_setup or "RECL" in aw_setup:
+        # base from low rsi + reclaim momentum + not extreme adx
+        failed_rev = 0.48
+        if rsi < 42:
+            failed_rev += 0.18
+        if mom > -0.005:
+            failed_rev += 0.12
+        if adx >= 16 and adx < 45:
+            failed_rev += 0.08
+        failed_rev = min(0.92, failed_rev)
+
+    range_b = 0.0
+    if SETUP_RANGE_BOUNCE in aw_setup or "RANGE_BOUNCE" in aw_setup or (ps_regime in ("range", "range_bound", "neutral") and bb <= 0.35 and rsi < 48):
+        range_b = 0.42
+        if bb <= 0.30:
+            range_b += 0.15
+        if rsi < 40:
+            range_b += 0.12
+        if rel_vol > 0.9:
+            range_b += 0.08
+        if adx < 26:
+            range_b += 0.06
+        range_b = min(0.88, range_b)
+
     scores = {
         SETUP_HTF_TREND_PULLBACK: min(1.0, htf_pullback),
         SETUP_VWAP_REVERSION: min(1.0, vwap_rev),
         SETUP_BREAKOUT_CONTINUATION: min(1.0, breakout),
+        SETUP_FAILED_BREAKDOWN_REVERSAL: min(1.0, failed_rev),
+        SETUP_RANGE_BOUNCE: min(1.0, range_b),
     }
 
     if is_scalp:
-        pref = [SETUP_VWAP_REVERSION, SETUP_BREAKOUT_CONTINUATION, SETUP_HTF_TREND_PULLBACK]
+        pref = [SETUP_VWAP_REVERSION, SETUP_BREAKOUT_CONTINUATION, SETUP_HTF_TREND_PULLBACK, SETUP_FAILED_BREAKDOWN_REVERSAL, SETUP_RANGE_BOUNCE]
         rank_map = _RANK_DELTA_SCALP
         ev_map = _EV_FACTOR_SCALP
         size_map = _SIZE_FACTOR_SCALP
     else:
-        pref = [SETUP_HTF_TREND_PULLBACK, SETUP_BREAKOUT_CONTINUATION, SETUP_VWAP_REVERSION]
+        pref = [SETUP_HTF_TREND_PULLBACK, SETUP_BREAKOUT_CONTINUATION, SETUP_VWAP_REVERSION, SETUP_FAILED_BREAKDOWN_REVERSAL, SETUP_RANGE_BOUNCE]
         rank_map = _RANK_DELTA
         ev_map = _EV_FACTOR
         size_map = _SIZE_FACTOR
@@ -305,11 +398,28 @@ def classify_buy_thesis(
             setup_type = top_st
             best_score = top_sc * 0.82
 
-    thesis_score = (
-        min(1.0, max(0.0, best_score))
-        if setup_type != SETUP_NO_CLEAR_THESIS
-        else min(0.35, max(0.05, max(scores.values()) * 0.30))
-    )
+    # Research-only thesis discovery (no live promotion).
+    # "NO_CLEAR_THESIS" now explicitly means the engine recognized too few setup types.
+    # We probe additional patterns for future replay validation only.
+    if setup_type == SETUP_NO_CLEAR_THESIS:
+        ltf_map = {tf: mtf.get(tf, {}) for tf in LTF_TFS if isinstance(mtf.get(tf), dict)}
+        ema_stack = {"trend_up": ema >= 0.62 and adx >= 18, "trend_down": ema <= 0.38 and adx >= 18}
+        research_setup, research_score = _research_discover_setups(
+            mtf=mtf,
+            ltf=ltf_map,
+            vwap=vwap,
+            current_price=current_price,
+            atr_pct=atr_pct,
+            rsi_1h=rsi,
+            adx_1h=adx,
+            ema_stack=ema_stack,
+            symbol=symbol,
+        )
+        if research_setup and research_score > 0.25:
+            setup_type = research_setup
+            best_score = research_score
+
+    thesis_score = min(1.0, max(0.0, best_score)) if setup_type != SETUP_NO_CLEAR_THESIS else min(0.35, max(0.05, max(scores.values()) * 0.30))
 
     invalid_level = 0.0
     target_level = 0.0
@@ -325,6 +435,13 @@ def classify_buy_thesis(
     elif setup_type == SETUP_BREAKOUT_CONTINUATION and current_price > 0:
         invalid_level = current_price * (1.0 - max(0.005, atr_pct * 0.95))
         target_level = current_price * (1.0 + max(0.014, atr_pct * 2.1))
+    elif setup_type == SETUP_FAILED_BREAKDOWN_REVERSAL and current_price > 0:
+        # Conservative: invalid just below the sweep/reclaim area, target modest reclaim
+        invalid_level = current_price * (1.0 - max(0.006, atr_pct * 1.1))
+        target_level = current_price * (1.0 + max(0.009, atr_pct * 1.6))
+    elif setup_type == SETUP_RANGE_BOUNCE and current_price > 0:
+        invalid_level = current_price * (1.0 - max(0.004, atr_pct * 0.9))
+        target_level = current_price * (1.0 + max(0.008, atr_pct * 1.5))
 
     spread_pct = _safe_float(dd.get("spread_pct"), _safe_float(dd.get("spread"), 0.0))
     if current_price > 0:
@@ -348,6 +465,141 @@ def classify_buy_thesis(
         "thesis_size_factor": size_map.get(setup_type, 0.22),
         "thesis_components": {k: round(v, 4) for k, v in scores.items()},
     }
+
+
+def thesis_levels_for_setup(
+    setup_type: str,
+    *,
+    current_price: float,
+    atr: float,
+    decision_data: dict[str, Any] | None = None,
+    mtf: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compute invalid/target/vwap levels for a locked setup type."""
+    dd = decision_data or {}
+    mtf = mtf if isinstance(mtf, dict) else parse_mtf_json(dd)
+    vwap = _safe_float(dd.get("vwap"), 0.0)
+    atr_pct = (atr / current_price) if current_price > 0 and atr > 0 else 0.01
+    spread_pct = _safe_float(dd.get("spread_pct"), _safe_float(dd.get("spread"), 0.0))
+    htf_vals = [_tf_align(mtf, tf) for tf in HTF_TFS if isinstance(mtf.get(tf), dict)]
+    invalid_level = 0.0
+    target_level = 0.0
+    trend_tf = ""
+    st = str(setup_type or "")
+
+    if st == SETUP_HTF_TREND_PULLBACK and current_price > 0:
+        if htf_vals:
+            trend_tf = max(HTF_TFS, key=lambda tf: _tf_align(mtf, tf) if isinstance(mtf.get(tf), dict) else 0.0)
+        invalid_level = current_price * (1.0 - max(0.007, atr_pct * 1.25))
+        target_level = current_price * (1.0 + max(0.011, atr_pct * 1.75))
+    elif st == SETUP_VWAP_REVERSION:
+        invalid_level = vwap * 0.994 if vwap > 0 else (current_price * 0.991 if current_price > 0 else 0.0)
+        target_level = vwap * 1.002 if vwap > 0 else (current_price * 1.005 if current_price > 0 else 0.0)
+    elif st == SETUP_BREAKOUT_CONTINUATION and current_price > 0:
+        invalid_level = current_price * (1.0 - max(0.005, atr_pct * 0.95))
+        target_level = current_price * (1.0 + max(0.014, atr_pct * 2.1))
+    elif st == SETUP_FAILED_BREAKDOWN_REVERSAL and current_price > 0:
+        invalid_level = current_price * (1.0 - max(0.006, atr_pct * 1.1))
+        target_level = current_price * (1.0 + max(0.009, atr_pct * 1.6))
+    elif st == SETUP_RANGE_BOUNCE and current_price > 0:
+        invalid_level = current_price * (1.0 - max(0.004, atr_pct * 0.9))
+        target_level = current_price * (1.0 + max(0.008, atr_pct * 1.5))
+
+    if current_price > 0:
+        invalid_level = floor_invalidation_level(
+            current_price,
+            invalid_level,
+            atr_pct=atr_pct,
+            spread_pct=spread_pct,
+        )
+
+    return {
+        "thesis_invalid_level": round(invalid_level, 8) if invalid_level > 0 else 0.0,
+        "thesis_target_level": round(target_level, 8) if target_level > 0 else 0.0,
+        "entry_vwap": round(vwap, 8) if vwap > 0 else 0.0,
+        "thesis_trend_tf": trend_tf,
+    }
+
+
+def resolve_day_route_regime(decision_data: dict[str, Any]) -> str:
+    """Best-effort DAY route regime from router stamp or signal/context fields."""
+    dd = decision_data or {}
+    explicit = str(dd.get("day_route_regime") or "").strip().lower()
+    if explicit in ("bull", "bear", "range", "chop", "neutral"):
+        return explicit
+    for key in (
+        "regime",
+        "signal_regime_label",
+        "ctx_market_regime",
+        "market_regime",
+        "adaptive_regime",
+    ):
+        val = str(dd.get(key) or "").strip().lower()
+        if "bear" in val or "down" in val or "fear" in val:
+            return "bear"
+        if "bull" in val or "up" in val:
+            return "bull"
+        if "range" in val:
+            return "range"
+    ps = str(dd.get("price_structure_regime") or "").strip().lower()
+    if "range" in ps:
+        return "range"
+    return explicit or "neutral"
+
+
+def remap_setup_for_day_regime(setup: str, regime: str) -> str:
+    """Map trend/breakout labels to regime-appropriate setups for learning + exits."""
+    st = str(setup or SETUP_NO_CLEAR_THESIS)
+    reg = str(regime or "").strip().lower()
+    if reg == "bear":
+        if st in (SETUP_HTF_TREND_PULLBACK, SETUP_BREAKOUT_CONTINUATION):
+            return SETUP_FAILED_BREAKDOWN_REVERSAL
+        if st not in (SETUP_FAILED_BREAKDOWN_REVERSAL, SETUP_VWAP_REVERSION, SETUP_RANGE_BOUNCE):
+            return SETUP_FAILED_BREAKDOWN_REVERSAL
+    elif reg in ("range", "neutral"):
+        if st in (SETUP_HTF_TREND_PULLBACK, SETUP_BREAKOUT_CONTINUATION):
+            return SETUP_RANGE_BOUNCE
+        if st not in (SETUP_VWAP_REVERSION, SETUP_RANGE_BOUNCE):
+            return SETUP_RANGE_BOUNCE
+    elif reg == "bull":
+        if st in (SETUP_FAILED_BREAKDOWN_REVERSAL, SETUP_RANGE_BOUNCE):
+            return SETUP_HTF_TREND_PULLBACK
+    return st
+
+
+def apply_ml_locked_setup_override(
+    decision_data: dict[str, Any],
+    *,
+    current_price: float,
+    atr: float,
+) -> dict[str, Any]:
+    """Stamp regime-compatible setup/levels so entry labels match exit manager rules."""
+    dd = dict(decision_data or {})
+    route_regime = resolve_day_route_regime(dd)
+    dd["day_route_regime"] = route_regime
+
+    locked = str(dd.get("allweather_setup") or dd.get("setup_type") or dd.get("entry_thesis") or "")
+    if not locked or locked == SETUP_NO_CLEAR_THESIS:
+        if route_regime == "bear":
+            locked = SETUP_FAILED_BREAKDOWN_REVERSAL
+        elif route_regime in ("range", "neutral"):
+            locked = SETUP_RANGE_BOUNCE
+        else:
+            locked = SETUP_HTF_TREND_PULLBACK
+    elif "BREAKOUT_CONTINUATION" in locked and route_regime == "bear":
+        locked = SETUP_FAILED_BREAKDOWN_REVERSAL
+    elif "BREAKOUT_CONTINUATION" in locked and route_regime in ("range", "neutral"):
+        locked = SETUP_RANGE_BOUNCE
+
+    locked = remap_setup_for_day_regime(locked, route_regime)
+
+    levels = thesis_levels_for_setup(locked, current_price=current_price, atr=atr, decision_data=dd)
+    dd["setup_type"] = locked
+    dd["entry_thesis"] = locked
+    dd["allweather_setup"] = locked
+    dd["setup_regime_remapped_from"] = str(decision_data.get("setup_type") or decision_data.get("entry_thesis") or "")
+    dd.update(levels)
+    return dd
 
 
 def apply_trade_thesis_to_candidate_fields(
@@ -389,7 +641,7 @@ def apply_trade_thesis_to_candidate_fields(
     )
     thesis.update(bear)
     dd.update(thesis)
-    return dd
+    return apply_ml_locked_setup_override(dd, current_price=current_price, atr=atr)
 
 
 def min_invalidation_distance_pct(atr_pct: float, spread_pct: float = 0.0) -> float:
@@ -465,14 +717,29 @@ def canonical_day_exit_reason(exit_trigger: str, *, exit_type_name: str = "") ->
         return EXIT_NET_PROFIT
     if "ADMIN" in trig and "CLEAR" in trig:
         return EXIT_ADMIN_CLEAR
-    if trig.startswith("THESIS_INVALIDATION"):
+    if trig.startswith(EXIT_THESIS_INVALIDATION) or (trig.startswith("THESIS_INVALIDATION") and not trig.startswith(EXIT_THESIS_WARNING)):
+        return EXIT_THESIS_INVALIDATION
+    if trig.startswith(EXIT_THESIS_WARNING):
         return EXIT_THESIS_WARNING
+    if trig.startswith(EXIT_STOP_LOSS) or trig.startswith("STOP_LOSS"):
+        return EXIT_STOP_LOSS
+    if trig.startswith("TRAILING_STOP"):
+        return EXIT_TRAILING_STOP
+    if trig.startswith("TIME_STOP"):
+        return "TIME_STOP_EXIT"
+    if trig.startswith("VOLATILITY_STOP"):
+        return "VOLATILITY_STOP_EXIT"
+    if trig.startswith("FAILED_RECLAIM"):
+        return "FAILED_RECLAIM_EXIT"
     if trig in (
         EXIT_NET_PROFIT,
         EXIT_MANUAL,
         EXIT_ADMIN_CLEAR,
         EXIT_EXTREME_PROTECTION,
         EXIT_THESIS_WARNING,
+        EXIT_THESIS_INVALIDATION,
+        EXIT_STOP_LOSS,
+        EXIT_TRAILING_STOP,
         EXIT_LEGACY_INVENTORY_CLEANUP,
     ):
         return trig
@@ -605,9 +872,7 @@ def evaluate_extreme_protection(
     htf_collapse = h1 is not None and h4 is not None and h1 < 0.28 and h4 < 0.28
 
     catastrophic = False
-    if net_pnl_pct <= -loss_floor and htf_collapse:
-        catastrophic = True
-    elif gross_loss >= flash_floor and htf_collapse:
+    if (net_pnl_pct <= -loss_floor and htf_collapse) or (gross_loss >= flash_floor and htf_collapse):
         catastrophic = True
 
     if catastrophic:
@@ -677,27 +942,64 @@ def evaluate_thesis_exit(
 
 
 def scalp_strategy_to_thesis(setup_name: str, setup_context: dict[str, Any] | None) -> dict[str, Any]:
-    """Map scalp strategy signal to canonical thesis fields."""
+    """Map scalp strategy signal to canonical thesis fields (paper mirrors live)."""
     name = (setup_name or "").strip().lower()
     ctx = setup_context or {}
     vwap = _safe_float(ctx.get("vwap"), 0.0)
+    prior_low = _safe_float(ctx.get("prior_low") or ctx.get("sweep_low"), 0.0)
+    sweep = _safe_float(ctx.get("sweep_low"), 0.0)
+
     if "vwap" in name or "range_bounce" in name:
         setup_type = SETUP_VWAP_REVERSION
         thesis_score = 0.72
+    elif "failed_breakdown" in name or "reversal" in name:
+        setup_type = SETUP_FAILED_BREAKDOWN_REVERSAL
+        thesis_score = 0.65
+    elif "compression" in name or "volume_impulse" in name:
+        setup_type = SETUP_BREAKOUT_CONTINUATION
+        thesis_score = 0.60
+    elif "pullback_micro" in name or "trend_pullback" in name:
+        setup_type = SETUP_HTF_TREND_PULLBACK
+        thesis_score = 0.58
+    elif "failed_breakout" in name:
+        setup_type = SETUP_RANGE_BOUNCE
+        thesis_score = 0.55
     elif "breakout" in name or "momentum" in name or "tape" in name:
         setup_type = SETUP_BREAKOUT_CONTINUATION
         thesis_score = 0.68
     else:
         setup_type = SETUP_NO_CLEAR_THESIS
         thesis_score = 0.25
+
+    # Levels tuned per type (conservative, must clear realistic costs)
+    if setup_type == SETUP_FAILED_BREAKDOWN_REVERSAL:
+        inv = sweep or (prior_low * 0.998 if prior_low > 0 else 0.0) or (vwap * 0.994 if vwap > 0 else 0.0)
+        tgt = (vwap * 1.0025 if vwap > 0 else 0.0) or (prior_low * 1.008 if prior_low > 0 else 0.0)
+    elif setup_type == SETUP_RANGE_BOUNCE:
+        inv = prior_low * 0.996 if prior_low > 0 else (vwap * 0.993 if vwap > 0 else 0.0)
+        tgt = vwap * 1.002 if vwap > 0 else (prior_low * 1.006 if prior_low > 0 else 0.0)
+    elif setup_type == SETUP_VWAP_REVERSION:
+        inv = vwap * 0.994 if vwap > 0 else 0.0
+        tgt = vwap * 1.003 if vwap > 0 else 0.0
+    else:
+        inv = prior_low or (vwap * 0.994 if vwap > 0 else 0.0)
+        tgt = vwap * 1.003 if vwap > 0 else 0.0
+
+    rank_d = _RANK_DELTA_SCALP.get(setup_type, _RANK_DELTA_SCALP.get(SETUP_NO_CLEAR_THESIS, -0.14))
+    ev_f = _EV_FACTOR_SCALP.get(setup_type, 0.50)
+    sz_f = _SIZE_FACTOR_SCALP.get(setup_type, 0.22)
+
     return {
         "setup_type": setup_type,
         "entry_thesis": setup_type,
-        "thesis_score": thesis_score,
-        "entry_vwap": vwap,
+        "thesis_score": round(thesis_score, 4),
+        "entry_vwap": round(vwap, 8) if vwap > 0 else 0.0,
         "thesis_trend_tf": "",
-        "thesis_invalid_level": _safe_float(ctx.get("prior_low"), 0.0) or (vwap * 0.994 if vwap > 0 else 0.0),
-        "thesis_target_level": vwap * 1.003 if vwap > 0 and setup_type == SETUP_VWAP_REVERSION else 0.0,
+        "thesis_invalid_level": round(inv, 8) if inv > 0 else 0.0,
+        "thesis_target_level": round(tgt, 8) if tgt > 0 else 0.0,
+        "thesis_rank_delta": round(rank_d, 4),
+        "thesis_ev_factor": round(ev_f, 4),
+        "thesis_size_factor": round(sz_f, 4),
     }
 
 
@@ -719,3 +1021,57 @@ def attach_thesis_to_explainability_dict(payload: dict[str, Any], thesis: dict[s
         if key in thesis:
             out[key] = thesis[key]
     return out
+
+
+def _research_discover_setups(*, mtf: dict, ltf: dict, vwap: float, current_price: float, atr_pct: float, rsi_1h: float, adx_1h: float, ema_stack: dict, symbol: str) -> tuple[str | None, float]:
+    """
+    Research-only discovery for additional setup types.
+    These are NOT used for live promotion. They exist so that NO_CLEAR_THESIS
+    means "engine incomplete" rather than "no trade opportunity".
+    All results go only to research replays and diagnostics.
+    """
+    if current_price <= 0 or atr_pct <= 0:
+        return None, 0.0
+
+    # Basic regime from ema/rsi/adx already computed upstream
+    trend_up = bool(ema_stack.get("trend_up"))
+    trend_down = bool(ema_stack.get("trend_down"))
+    adx = float(adx_1h or 0)
+
+    # 1. Failed breakdown reversal (bear trap / reclaim after sweep low)
+    # Simple proxy: price above recent low, rsi recovering, adx not extreme
+    try:
+        ltf_1m = (ltf or {}).get("1m", {}) or {}
+        low_1m = float(ltf_1m.get("low", current_price))
+        if current_price > low_1m * 1.003 and 35 < rsi_1h < 55 and adx < 28 and not trend_down:
+            return RESEARCH_FAILED_BREAKDOWN_REVERSAL, 0.31
+    except Exception:
+        pass
+
+    # 2. 15m/30m reclaim (price reclaims a broken level on ltf)
+    try:
+        m15 = (mtf or {}).get("15m", {}) or {}
+        if m15.get("close", 0) > 0 and current_price > m15.get("close", current_price) * 0.998 and rsi_1h > 48:
+            return RESEARCH_15M_30M_RECLAIM, 0.29
+    except Exception:
+        pass
+
+    # 3. Volatility expansion (high adx + expanding range) - for breakout or short research
+    if adx > 30 and atr_pct > 0.012:
+        if trend_down:
+            return RESEARCH_SHORT_BEAR_CONTINUATION, 0.33
+        return RESEARCH_VOLATILITY_EXPANSION, 0.28
+
+    # 4. Range reclaim / capitulation bounce (low adx, rsi oversold then up)
+    if adx < 22 and rsi_1h < 40:
+        return RESEARCH_CAPITULATION_BOUNCE, 0.27
+
+    # 5. Trend retest (pullback to ema in uptrend)
+    if trend_up and rsi_1h > 45 and atr_pct < 0.02:
+        return RESEARCH_TREND_RETEST, 0.30
+
+    # 6. Range reclaim
+    if 22 < adx < 32 and 40 < rsi_1h < 60:
+        return RESEARCH_RANGE_RECLAIM, 0.26
+
+    return None, 0.0

@@ -5,6 +5,7 @@ Top-four capital scaling — execution replay only.
 Scales notional on locked neutral-VWAP baseline (no new entries, no BNB).
 Live floor unchanged until replay_promotion_gate passes.
 """
+
 from __future__ import annotations
 
 import json
@@ -76,10 +77,7 @@ def main() -> int:
         "live_unchanged": "day_baseline_all_pass_v1_size_1_5",
         "live_promoted": False,
         "target_monthly_usd": TARGET_500,
-        "research_note": (
-            "Linear notional scaling on locked neutral-VWAP only. "
-            "Top-four caps concurrent slots at 4 symbols; scaling is per-slot notional_mult."
-        ),
+        "research_note": ("Linear notional scaling on locked neutral-VWAP only. Top-four caps concurrent slots at 4 symbols; scaling is per-slot notional_mult."),
         "research_exhausted": sorted(RESEARCH_EXHAUSTED),
         "excluded_from_research": ["BNB/USD", "BNB/USDT", "scalp_profit_contribution"],
         "candidates": results,
@@ -106,17 +104,14 @@ def main() -> int:
             "best_monthly_usd": best.get("monthly_pnl_usd_on_25k"),
             "best_all_pass_label": best_pass.get("label") if best_pass else None,
             "best_all_pass_monthly_usd": best_pass.get("monthly_pnl_usd_on_25k") if best_pass else None,
-            "gap_to_500_usd": round(
-                TARGET_500 - float(best.get("monthly_pnl_usd_on_25k") or 0), 2
-            ),
+            "gap_to_500_usd": round(TARGET_500 - float(best.get("monthly_pnl_usd_on_25k") or 0), 2),
         },
     }
 
     OUT.write_text(json.dumps(report, indent=2))
     print(f"  wrote {OUT}", flush=True)
     print(
-        f"  locked={locked.get('monthly_pnl_usd_on_25k')} best={best.get('monthly_pnl_usd_on_25k')} "
-        f"target_met={report['verdict']['target_met_by_any']}",
+        f"  locked={locked.get('monthly_pnl_usd_on_25k')} best={best.get('monthly_pnl_usd_on_25k')} target_met={report['verdict']['target_met_by_any']}",
         flush=True,
     )
     return 0

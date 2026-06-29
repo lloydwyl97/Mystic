@@ -11,8 +11,7 @@ from __future__ import annotations
 import sys
 
 print(
-    "ERROR: start_ai_position_tracker.py is disabled "
-    "(backend.services.ai_position_tracker not present; not part of DAY engine).",
+    "ERROR: start_ai_position_tracker.py is disabled (backend.services.ai_position_tracker not present; not part of DAY engine).",
     file=sys.stderr,
 )
 sys.exit(1)

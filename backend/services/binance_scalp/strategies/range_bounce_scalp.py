@@ -41,11 +41,7 @@ class RangeBounceScalpStrategy:
             return reject_signal(ctx, self.name, "NO_REJECTION_WICK")
 
         mom = ctx.mom
-        if not (
-            mom.bid_change_15s > 0
-            and mom.mid_change_15s > 0
-            and mom.mid_change_30s > 0
-        ):
+        if not (mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0):
             return reject_signal(ctx, self.name, "MOMENTUM_NOT_FLIPPED")
 
         recovery = (cur - support) / cur if cur > 0 else 0

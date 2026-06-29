@@ -18,8 +18,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 _env = PROJECT_ROOT / ".env"
 if _env.exists():
-    for line in _env.read_text().splitlines():
-        line = line.strip()
+    for raw_line in _env.read_text().splitlines():
+        line = raw_line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
@@ -33,14 +33,9 @@ SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
 POST_SELL_COOLDOWN_WALL_SEC = int(os.getenv("POST_SELL_COOLDOWN_WALL_SEC", "2400"))
 CLOSE_REASON = "STALE_PRE_CORRECTION_POSITION_CLEAR"
 AUDIT_ACTION = "STALE_PRE_CORRECTION_POSITION_CLEAR"
-LESSON = (
-    "position opened before corrected AI/model/training/feature path; "
-    "admin-cleared so Mystic can start a fresh corrected-path DAY cycle"
-)
+LESSON = "position opened before corrected AI/model/training/feature path; admin-cleared so Mystic can start a fresh corrected-path DAY cycle"
 LIVE_GHOST_REASON = "STALE_LIVE_GHOST_POSITION_CLEAR"
-LIVE_GHOST_LESSON = (
-    "stale live-era position not held in paper DAY; admin-cleared for flat paper state"
-)
+LIVE_GHOST_LESSON = "stale live-era position not held in paper DAY; admin-cleared for flat paper state"
 
 
 def _mystic_uvicorn_running() -> bool:
@@ -107,9 +102,7 @@ def preflight_checks(symbols_to_clear: list[str]) -> dict:
                 (CLOSE_REASON,),
             ).fetchone()[0]
             if int(stale_cnt or 0) >= len(SYMBOLS):
-                raise SystemExit(
-                    f"ABORT: already flat with prior {CLOSE_REASON} rows — idempotent guard (nothing to clear)"
-                )
+                raise SystemExit(f"ABORT: already flat with prior {CLOSE_REASON} rows — idempotent guard (nothing to clear)")
             raise SystemExit("ABORT: no open positions to clear")
         missing = [s for s in symbols_to_clear if s not in open_syms]
         if missing:
@@ -117,9 +110,7 @@ def preflight_checks(symbols_to_clear: list[str]) -> dict:
         extra = [s for s in open_syms if s not in symbols_to_clear]
         if extra:
             REPORT["open_positions_left_after_clear"] = extra
-        ledger = cur.execute(
-            "SELECT cash_balance, positions_value, realized_pnl, unrealized_pnl, total_equity FROM portfolio_engine_ledger WHERE id=1"
-        ).fetchone()
+        ledger = cur.execute("SELECT cash_balance, positions_value, realized_pnl, unrealized_pnl, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
         REPORT["ledger_before"] = {
             "cash_balance": float(ledger[0]),
             "positions_value": float(ledger[1]),
@@ -188,9 +179,7 @@ def fetch_reference_marks(conn: sqlite3.Connection | None = None) -> dict[str, f
     return marks
 
 
-def clear_redis_paper_state(
-    cash_balance: float, realized_pnl: float, *, symbols: list[str] | None = None
-) -> None:
+def clear_redis_paper_state(cash_balance: float, realized_pnl: float, *, symbols: list[str] | None = None) -> None:
     try:
         import redis
 
@@ -221,9 +210,7 @@ def run_clear(*, symbols: list[str] | None = None, live_ghost: bool = False) -> 
     REPORT["symbols_to_clear"] = symbols_to_clear
     REPORT["live_ghost_clear"] = live_ghost
     REPORT["preflight"] = preflight_checks(symbols_to_clear)
-    existing_backups = sorted(
-        PROJECT_ROOT.glob("mystic_trading.db.backup_before_stale_corrected_path_position_clear_*")
-    )
+    existing_backups = sorted(PROJECT_ROOT.glob("mystic_trading.db.backup_before_stale_corrected_path_position_clear_*"))
     if existing_backups:
         REPORT["backup_path"] = str(existing_backups[-1])
         REPORT["backup_reused_existing"] = True
@@ -242,15 +229,10 @@ def run_clear(*, symbols: list[str] | None = None, live_ghost: bool = False) -> 
 
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    positions = {
-        r["symbol"]: dict(r)
-        for r in cur.execute("SELECT symbol, quantity, entry_price, trade_id, entry_fee FROM portfolio_engine_positions ORDER BY symbol")
-    }
+    positions = {r["symbol"]: dict(r) for r in cur.execute("SELECT symbol, quantity, entry_price, trade_id, entry_fee FROM portfolio_engine_positions ORDER BY symbol")}
     REPORT["positions_before"] = list(positions.keys())
 
-    ledger_row = cur.execute(
-        "SELECT cash_balance, realized_pnl, total_equity FROM portfolio_engine_ledger WHERE id=1"
-    ).fetchone()
+    ledger_row = cur.execute("SELECT cash_balance, realized_pnl, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
     cash_balance = float(ledger_row[0] or 0.0)
     realized_total = float(ledger_row[1] or 0.0)
     equity_before = float(ledger_row[2] or 0.0)
@@ -471,12 +453,7 @@ def run_clear(*, symbols: list[str] | None = None, live_ghost: bool = False) -> 
         f"DELETE FROM portfolio_engine_positions WHERE symbol IN ({placeholders})",
         symbols_to_clear,
     )
-    remaining_pos_val = float(
-        cur.execute(
-            "SELECT COALESCE(SUM(quantity * entry_price), 0) FROM portfolio_engine_positions"
-        ).fetchone()[0]
-        or 0.0
-    )
+    remaining_pos_val = float(cur.execute("SELECT COALESCE(SUM(quantity * entry_price), 0) FROM portfolio_engine_positions").fetchone()[0] or 0.0)
     cur.execute(
         """
         UPDATE portfolio_engine_ledger SET

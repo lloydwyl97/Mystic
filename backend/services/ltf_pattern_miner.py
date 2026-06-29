@@ -4,12 +4,14 @@ Lower-timeframe pattern mining — discovers entries from bar data directly.
 Does NOT use the DAY thesis engine for signal generation.
 HTF (1h/4h) is permission context only.
 """
+
 from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from backend.config.trading_economics import (
     MIN_NET_PROFIT_TO_SELL,
@@ -107,9 +109,9 @@ def _atr_pct(bars: list[Bar], period: int = 14) -> float:
         return 0.01
     trs = []
     for i in range(-period, 0):
-        h, l = bars[i]["high"], bars[i]["low"]
+        h, bar_low = bars[i]["high"], bars[i]["low"]
         pc = bars[i - 1]["close"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        trs.append(max(h - bar_low, abs(h - pc), abs(bar_low - pc)))
     atr = sum(trs) / len(trs)
     c = bars[-1]["close"]
     return atr / c if c > 0 else 0.01
@@ -149,26 +151,30 @@ def resample_bars(bars: list[Bar], minutes: int) -> list[Bar]:
         if bucket_start is None:
             bucket_start = bs
         if bs != bucket_start and cur:
-            out.append({
-                "ts": bucket_start,
+            out.append(
+                {
+                    "ts": bucket_start,
+                    "open": cur[0]["open"],
+                    "high": max(x["high"] for x in cur),
+                    "low": min(x["low"] for x in cur),
+                    "close": cur[-1]["close"],
+                    "volume": sum(x["volume"] for x in cur),
+                }
+            )
+            cur = []
+            bucket_start = bs
+        cur.append(b)
+    if cur:
+        out.append(
+            {
+                "ts": bucket_start or int(cur[0]["ts"]),
                 "open": cur[0]["open"],
                 "high": max(x["high"] for x in cur),
                 "low": min(x["low"] for x in cur),
                 "close": cur[-1]["close"],
                 "volume": sum(x["volume"] for x in cur),
-            })
-            cur = []
-            bucket_start = bs
-        cur.append(b)
-    if cur:
-        out.append({
-            "ts": bucket_start or int(cur[0]["ts"]),
-            "open": cur[0]["open"],
-            "high": max(x["high"] for x in cur),
-            "low": min(x["low"] for x in cur),
-            "close": cur[-1]["close"],
-            "volume": sum(x["volume"] for x in cur),
-        })
+            }
+        )
     return out
 
 
@@ -275,8 +281,9 @@ def _detect_vol_compression_breakout(sym: str, ltf: list[Bar], ctx: dict) -> boo
     closes = [b["close"] for b in ltf]
     _, _, pos, width = _bb_width(closes)
     widths = []
+    bb_period = 20
     for k in range(10, 2, -1):
-        if len(closes) >= period + k:
+        if len(closes) >= bb_period + k:
             _, _, _, w = _bb_width(closes[:-k])
             widths.append(w)
     squeeze = widths and width < min(widths) * 1.05
@@ -411,16 +418,11 @@ def make_pattern_catalog() -> list[PatternSpec]:
         add(f"{sym_tag.lower()}_vwap_reclaim_15m", 15, "day", sym_vwap, profit_target_pct=0.006)
 
     # Scalp 1m
-    add("scalp_compression_breakout_1m", 1, "scalp", _detect_scalp_compression_breakout,
-        profit_target_pct=0.0035, stop_atr_mult=0.75, time_stop_hours=0.5, notional_usd=25.0, scalp=True)
-    add("scalp_vwap_reclaim_1m", 1, "scalp", _detect_scalp_vwap_reclaim,
-        profit_target_pct=0.0035, stop_atr_mult=0.5, time_stop_hours=0.75, notional_usd=25.0, scalp=True)
-    add("scalp_range_bounce_1m", 1, "scalp", _detect_scalp_range_bounce,
-        profit_target_pct=0.003, stop_atr_mult=0.5, time_stop_hours=0.5, notional_usd=25.0, scalp=True)
-    add("scalp_volume_imbalance_1m", 1, "scalp", _detect_scalp_volume_imbalance,
-        profit_target_pct=0.0035, stop_atr_mult=0.5, time_stop_hours=0.5, notional_usd=25.0, scalp=True)
-    add("scalp_failed_breakdown_1m", 1, "scalp", _detect_scalp_failed_breakdown,
-        profit_target_pct=0.004, stop_atr_mult=0.6, time_stop_hours=0.75, notional_usd=25.0, scalp=True)
+    add("scalp_compression_breakout_1m", 1, "scalp", _detect_scalp_compression_breakout, profit_target_pct=0.0035, stop_atr_mult=0.75, time_stop_hours=0.5, notional_usd=25.0, scalp=True)
+    add("scalp_vwap_reclaim_1m", 1, "scalp", _detect_scalp_vwap_reclaim, profit_target_pct=0.0035, stop_atr_mult=0.5, time_stop_hours=0.75, notional_usd=25.0, scalp=True)
+    add("scalp_range_bounce_1m", 1, "scalp", _detect_scalp_range_bounce, profit_target_pct=0.003, stop_atr_mult=0.5, time_stop_hours=0.5, notional_usd=25.0, scalp=True)
+    add("scalp_volume_imbalance_1m", 1, "scalp", _detect_scalp_volume_imbalance, profit_target_pct=0.0035, stop_atr_mult=0.5, time_stop_hours=0.5, notional_usd=25.0, scalp=True)
+    add("scalp_failed_breakdown_1m", 1, "scalp", _detect_scalp_failed_breakdown, profit_target_pct=0.004, stop_atr_mult=0.6, time_stop_hours=0.75, notional_usd=25.0, scalp=True)
 
     return specs
 
@@ -441,14 +443,14 @@ def simulate_exit(
     if idx >= len(exec_bars):
         return None
 
-    slice_for_atr = exec_bars[max(0, idx - 20): idx]
+    slice_for_atr = exec_bars[max(0, idx - 20) : idx]
     if slice_for_atr:
         atr = _atr_pct(slice_for_atr)
 
     stop_pct = min(0.025, spec.stop_atr_mult * atr)
     target_net = spec.profit_target_pct
     time_stop = int(spec.time_stop_hours * 3600)
-    qty = notional / entry_price
+    notional / entry_price
     mae = 0.0
     mfe = 0.0
 
@@ -549,22 +551,24 @@ def mine_symbol_pattern(
         pnl_pct = pnl / spec.notional_usd
         regime = ctx.get("regime", "unknown")
 
-        trades.append(MinedTrade(
-            pattern_id=spec.pattern_id,
-            symbol=symbol,
-            entry_ts=ts,
-            exit_ts=exit_ts,
-            entry_price=entry_fill,
-            exit_price=exit_fill,
-            pnl_usd=pnl,
-            pnl_pct=pnl_pct,
-            hold_sec=exit_ts - ts,
-            exit_reason=reason,
-            mae_pct=mae,
-            mfe_pct=mfe,
-            regime=regime,
-            notional=spec.notional_usd,
-        ))
+        trades.append(
+            MinedTrade(
+                pattern_id=spec.pattern_id,
+                symbol=symbol,
+                entry_ts=ts,
+                exit_ts=exit_ts,
+                entry_price=entry_fill,
+                exit_price=exit_fill,
+                pnl_usd=pnl,
+                pnl_pct=pnl_pct,
+                hold_sec=exit_ts - ts,
+                exit_reason=reason,
+                mae_pct=mae,
+                mfe_pct=mfe,
+                regime=regime,
+                notional=spec.notional_usd,
+            )
+        )
         open_until = exit_ts + cooldown_sec
 
     return trades

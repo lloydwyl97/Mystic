@@ -1331,12 +1331,12 @@ class AITrainingDataPipeline:
                     if len(X_oc) > 0:
                         if len(X_self) > 0:
                             X_all = np.vstack([X_self, X_oc])
-                            y_all = np.concatenate([y_self, y_oc])
-                            sym_all = np.concatenate([sym_self, sym_oc])
+                            np.concatenate([y_self, y_oc])
+                            np.concatenate([sym_self, sym_oc])
                         else:
-                            X_all, y_all, sym_all = X_oc, y_oc, sym_oc
+                            X_all, _y_all, _sym_all = X_oc, y_oc, sym_oc
                     else:
-                        X_all, y_all, sym_all = X_self, y_self, sym_self
+                        X_all, _y_all, _sym_all = X_self, y_self, sym_self
 
                     if len(X_all) == 0:
                         logger.warning("PER_COIN_TRAIN: strategy=%s no labeled rows, skipping", strat)
@@ -1412,12 +1412,8 @@ class AITrainingDataPipeline:
                                     tier_c_training_rows,
                                 )
 
-                                xb, yb = await asyncio.to_thread(
-                                    tier_b_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim
-                                )
-                                xc, yc = await asyncio.to_thread(
-                                    tier_c_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim
-                                )
+                                xb, yb = await asyncio.to_thread(tier_b_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim)
+                                xc, yc = await asyncio.to_thread(tier_c_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim)
                                 tier_x = [*xb, *xc]
                                 tier_y = [*[int(v) for v in yb], *[int(v) for v in yc]]
                                 tier_w = [*([TIER_B_WEIGHT] * len(yb)), *([TIER_C_WEIGHT] * len(yc))]
@@ -1460,12 +1456,9 @@ class AITrainingDataPipeline:
                         from sklearn.utils.class_weight import compute_class_weight
 
                         balanced_w = compute_class_weight("balanced", classes=train_classes, y=y_train)
-                        effective_weights = {
-                            int(c): round(float(w), 4) for c, w in zip(train_classes, balanced_w)
-                        }
+                        effective_weights = {int(c): round(float(w), 4) for c, w in zip(train_classes, balanced_w, strict=False)}
                         logger.info(
-                            "PER_COIN_CLASS_BALANCE: [%s] %s train BUY=%d HOLD=%d val BUY=%d HOLD=%d "
-                            "class_weight=balanced effective=%s raw_ss=%s raw_oc=%s final_buy_rate=%s",
+                            "PER_COIN_CLASS_BALANCE: [%s] %s train BUY=%d HOLD=%d val BUY=%d HOLD=%d class_weight=balanced effective=%s raw_ss=%s raw_oc=%s final_buy_rate=%s",
                             strat,
                             sym,
                             buy_n,
@@ -1674,7 +1667,7 @@ class AITrainingDataPipeline:
             return
 
         try:
-            uptime = max(0.0, time.time() - self._start_time)
+            max(0.0, time.time() - self._start_time)
 
             # Get learning metrics from report generator (same data as ai_learning_report.py)
             learning_metrics = {}
@@ -2263,7 +2256,7 @@ class AITrainingDataPipeline:
                             "ai_clock_contract": "day_active_v5",
                             "label_anchor_close": label_anchor_close,
                             "label_anchor_4h_open_ms": anchor_open,
-                            "day_htf_bar_counts": {tf: len(trimmed.get(tf) or []) for tf in trimmed.keys() if isinstance(tf, str) and not tf.startswith("_")},
+                            "day_htf_bar_counts": {tf: len(trimmed.get(tf) or []) for tf in trimmed if isinstance(tf, str) and not tf.startswith("_")},
                         }
                         symbol_cache = self.training_cache.setdefault(cache_ck, [])
                         symbol_cache.append(feature_data_k)

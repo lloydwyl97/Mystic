@@ -16,7 +16,7 @@ _ADMIN_EXIT_TYPES = frozenset({"ADMIN_POSITION_CLEAR", "STALE_PRE_CORRECTION_POS
 def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
-    return {k: row[k] for k in row.keys()}
+    return {k: row[k] for k in row}
 
 
 def _parse_json_field(raw: Any) -> Any:
@@ -137,7 +137,7 @@ def build_trade_drilldown(trade_id: str, db_path: str = DATABASE_PATH) -> dict[s
             if learning is None and close_ledger:
                 cur.execute(
                     "SELECT * FROM trade_learning_outcomes WHERE symbol LIKE ? ORDER BY id DESC LIMIT 1",
-                    (f"%{symbol.split('/')[0]}%",),
+                    (f"%{symbol.split('/', maxsplit=1)[0]}%",),
                 )
                 learning = _row_to_dict(cur.fetchone())
 

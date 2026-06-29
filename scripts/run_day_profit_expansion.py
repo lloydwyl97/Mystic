@@ -4,13 +4,14 @@ DAY profit-expansion sweeps — replay-only on locked positive buckets.
 
 Does NOT modify live rules, revive killed buckets, or add blockers/modes.
 """
+
 from __future__ import annotations
 
 import json
 import sys
 import traceback
 from copy import deepcopy
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from backend.config.trading_economics import MIN_NET_PROFIT_TO_SELL
 from backend.services.day_bucket_quality import REPLAY_KILLED_BUCKETS
 from backend.services.day_regime_router import DAY_REGIME_BEAR, DAY_REGIME_BULL
 from backend.services.day_trade_thesis import SETUP_BREAKOUT_CONTINUATION, SETUP_HTF_TREND_PULLBACK, SETUP_VWAP_REVERSION
+from scripts.run_day_bucket_discovery import _scan_opportunities
 from scripts.run_day_execution_replay import (
     ALLOWED_POSITIVE_BUCKETS,
     ExecutionConfig,
@@ -32,7 +34,6 @@ from scripts.run_day_execution_replay import (
     run_execution_replay,
 )
 from scripts.run_day_strategy_replay import NOTIONAL_USD, PRINCIPAL, SYMBOLS, fetch_klines_1h
-from scripts.run_day_bucket_discovery import _scan_opportunities
 
 MAX_HOLD_HOURS_FAT_TAIL = 72.0
 MAX_DD_PCT = 8.0
@@ -105,19 +106,34 @@ def _run_suite(
     w30s = end_ts - 30 * 86400
     w90s = end_ts - 90 * 86400
     span = end_ts - start_ts
-    t_end = start_ts + int(span * 0.50)
+    start_ts + int(span * 0.50)
     v_end = start_ts + int(span * 0.75)
     w30 = run_execution_replay(
-        bars_1h, bars_exec, window_days=30, start_ts=max(w30s, start_ts), end_ts=end_ts,
-        config=cfg, exec_interval="15m",
+        bars_1h,
+        bars_exec,
+        window_days=30,
+        start_ts=max(w30s, start_ts),
+        end_ts=end_ts,
+        config=cfg,
+        exec_interval="15m",
     )
     w90 = run_execution_replay(
-        bars_1h, bars_exec, window_days=90, start_ts=max(w90s, start_ts), end_ts=end_ts,
-        config=cfg, exec_interval="15m",
+        bars_1h,
+        bars_exec,
+        window_days=90,
+        start_ts=max(w90s, start_ts),
+        end_ts=end_ts,
+        config=cfg,
+        exec_interval="15m",
     )
     test = run_execution_replay(
-        bars_1h, bars_exec, window_days=int((end_ts - v_end) / 86400),
-        start_ts=v_end, end_ts=end_ts, config=cfg, exec_interval="15m",
+        bars_1h,
+        bars_exec,
+        window_days=int((end_ts - v_end) / 86400),
+        start_ts=v_end,
+        end_ts=end_ts,
+        config=cfg,
+        exec_interval="15m",
     )
     return {"30d": w30, "90d": w90, "wf_test": test}
 
@@ -161,17 +177,20 @@ def _scan_extended_buckets(bars_1h: dict, cache_days: int) -> dict[str, Any]:
             ("range", SETUP_VWAP_REVERSION),
         ):
             scan = _scan_opportunities(bars_1h, symbol=sym, regime=reg, thesis=thesis)
-            out.append({
-                "bucket": f"{sym}/{reg}/{thesis}",
-                "would_enter": scan.get("would_enter", 0),
-                "in_positive_allowlist": (sym, reg, thesis) in ALLOWED_POSITIVE_BUCKETS,
-                "killed": (sym, reg, thesis) in REPLAY_KILLED_BUCKETS,
-            })
+            out.append(
+                {
+                    "bucket": f"{sym}/{reg}/{thesis}",
+                    "would_enter": scan.get("would_enter", 0),
+                    "in_positive_allowlist": (sym, reg, thesis) in ALLOWED_POSITIVE_BUCKETS,
+                    "killed": (sym, reg, thesis) in REPLAY_KILLED_BUCKETS,
+                }
+            )
     return {"cache_days": cache_days, "candidates": out}
 
 
 def _scalp_contribution() -> dict[str, Any]:
     import sqlite3
+
     from backend.database_schema import DATABASE_PATH
 
     scalp_monthly = 0.0
@@ -232,30 +251,34 @@ def main() -> int:
             print(f"  size sweep {mult}...", flush=True)
             m90 = _quick_90(cfg)
             net90 = m90["net_pnl_usd"]
-            size_results.append({
-                "label": f"notional_mult_{mult}",
-                "metrics_90d": m90,
-                "deployed_notional_per_slot_usd": round(NOTIONAL_USD * mult, 2),
-                "max_deployed_usd_4_slots": round(NOTIONAL_USD * mult * 4, 2),
-                "monthly_pnl_usd_on_25k": _monthly_pnl(net90),
-                "account_return_90d_pct": _account_return_pct(net90),
-            })
+            size_results.append(
+                {
+                    "label": f"notional_mult_{mult}",
+                    "metrics_90d": m90,
+                    "deployed_notional_per_slot_usd": round(NOTIONAL_USD * mult, 2),
+                    "max_deployed_usd_4_slots": round(NOTIONAL_USD * mult * 4, 2),
+                    "monthly_pnl_usd_on_25k": _monthly_pnl(net90),
+                    "account_return_90d_pct": _account_return_pct(net90),
+                }
+            )
 
         # 2. Net-profit floor
         floor_results: list[dict] = []
         for pct in (0.0015, 0.0025, 0.004, 0.006, 0.008, 0.010):
             cfg = _base_config(f"floor_{pct}", profiles)
             cfg.min_net_profit_floor = pct
-            print(f"  floor sweep {pct*100:.2f}%...", flush=True)
+            print(f"  floor sweep {pct * 100:.2f}%...", flush=True)
             m90 = _quick_90(cfg)
             net90 = m90["net_pnl_usd"]
-            floor_results.append({
-                "label": f"min_net_profit_{pct*100:.2f}pct",
-                "metrics_90d": m90,
-                "monthly_pnl_usd_on_25k": _monthly_pnl(net90),
-                "account_return_90d_pct": _account_return_pct(net90),
-                "exits_too_early_signal": net90 > baseline_sum["metrics_90d"]["net_pnl_usd"] and m90["longest_hold_hours"] > baseline_sum["metrics_90d"]["longest_hold_hours"],
-            })
+            floor_results.append(
+                {
+                    "label": f"min_net_profit_{pct * 100:.2f}pct",
+                    "metrics_90d": m90,
+                    "monthly_pnl_usd_on_25k": _monthly_pnl(net90),
+                    "account_return_90d_pct": _account_return_pct(net90),
+                    "exits_too_early_signal": net90 > baseline_sum["metrics_90d"]["net_pnl_usd"] and m90["longest_hold_hours"] > baseline_sum["metrics_90d"]["longest_hold_hours"],
+                }
+            )
 
         # 3. Profit capture
         capture_results: list[dict] = []
@@ -265,12 +288,14 @@ def main() -> int:
             print(f"  capture {label}...", flush=True)
             m90 = _quick_90(cfg)
             net90 = m90["net_pnl_usd"]
-            capture_results.append({
-                "label": label,
-                "metrics_90d": m90,
-                "monthly_pnl_usd_on_25k": _monthly_pnl(net90),
-                "account_return_90d_pct": _account_return_pct(net90),
-            })
+            capture_results.append(
+                {
+                    "label": label,
+                    "metrics_90d": m90,
+                    "monthly_pnl_usd_on_25k": _monthly_pnl(net90),
+                    "account_return_90d_pct": _account_return_pct(net90),
+                }
+            )
 
         # 4. Maker execution
         exec_results: list[dict] = []
@@ -285,12 +310,14 @@ def main() -> int:
             print(f"  execution {label}...", flush=True)
             m90 = _quick_90(cfg)
             net90 = m90["net_pnl_usd"]
-            exec_results.append({
-                "label": label,
-                "metrics_90d": m90,
-                "monthly_pnl_usd_on_25k": _monthly_pnl(net90),
-                "account_return_90d_pct": _account_return_pct(net90),
-            })
+            exec_results.append(
+                {
+                    "label": label,
+                    "metrics_90d": m90,
+                    "monthly_pnl_usd_on_25k": _monthly_pnl(net90),
+                    "account_return_90d_pct": _account_return_pct(net90),
+                }
+            )
 
         # Full validation on baseline + top 90d candidates
         quick_all = size_results + floor_results + capture_results + exec_results
@@ -345,17 +372,14 @@ def main() -> int:
             "notional_per_slot_usd": NOTIONAL_USD,
             "max_slots": 4,
             "max_deployed_capital_usd": NOTIONAL_USD * 4,
-            "capital_utilization_note": (
-                "DAY uses up to 4×$2500 = $10k deployed (40% of $25k). "
-                "Expectancy ~$8/trade is on ~$2500 notional (~0.35%/trade), NOT on full $25k."
-            ),
+            "capital_utilization_note": ("DAY uses up to 4x$2500 = $10k deployed (40% of $25k). Expectancy ~$8/trade is on ~$2500 notional (~0.35%/trade), NOT on full $25k."),
             "baseline_90d_net_usd": b90["net_pnl_usd"],
             "baseline_account_return_90d_pct": baseline_sum["account_return_90d_pct"],
             "baseline_monthly_on_full_25k_usd": day_monthly,
             "baseline_monthly_if_fully_deployed_10k_usd": round(b90["net_pnl_usd"] / 3.0 * (PRINCIPAL / (NOTIONAL_USD * 4)), 2),
             "trades_90d": b90["total_trades"],
             "why_not_8_dollars_on_25k": (
-                f"20 trades × ${b90['expectancy_per_trade_usd']:.2f} ≈ ${b90['net_pnl_usd']:.0f} on $25k account "
+                f"20 trades x ${b90['expectancy_per_trade_usd']:.2f} ≈ ${b90['net_pnl_usd']:.0f} on $25k account "
                 f"= {baseline_sum['account_return_90d_pct']}% / 90d ≈ ${day_monthly}/month. "
                 "Low frequency + partial capital deployment, not broken math."
             ),

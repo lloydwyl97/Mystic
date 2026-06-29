@@ -51,6 +51,19 @@ def position_key(prefix: str, symbol_bus: str) -> str:
     return key
 
 
+def scan_key(prefix: str, symbol_bus: str) -> str:
+    sym = symbol_bus.strip().upper()
+    key = f"{normalize_prefix(prefix)}:scan:{sym}"
+    assert_key_allowed(key, prefix=prefix)
+    return key
+
+
+def status_snapshot_key(prefix: str, warm_rounds: int = 0) -> str:
+    key = f"{normalize_prefix(prefix)}:status:snapshot:w{int(warm_rounds)}"
+    assert_key_allowed(key, prefix=prefix)
+    return key
+
+
 def assert_key_allowed(key: str, *, prefix: str = "scalp") -> None:
     expected = f"{normalize_prefix(prefix)}:"
     if not key.startswith(expected):

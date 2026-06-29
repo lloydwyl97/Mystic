@@ -5,13 +5,14 @@ AI outcome-driven entry discovery — replay only.
 Builds labeled dataset from all bars + 145 features, trains walk-forward models,
 discovers replay buckets from feature regions. Does NOT promote live.
 """
+
 from __future__ import annotations
 
 import json
 import pickle
 import sys
 import traceback
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -95,16 +96,12 @@ def _build_full_dataset(
     for sym in SYMBOLS:
         hs = half_spreads.get(sym, 0.00006)
         print(f"    DAY rows {sym}...", flush=True)
-        rows.extend(
-            build_dataset_rows(sym, all_bars[sym], start_ts, end_ts, sample_sec=3600, half_spread=hs, scalp=False)
-        )
-        print(f"      day={sum(1 for r in rows if r['symbol']==sym and r['timeframe']!='1m')} total={len(rows)}", flush=True)
+        rows.extend(build_dataset_rows(sym, all_bars[sym], start_ts, end_ts, sample_sec=3600, half_spread=hs, scalp=False))
+        print(f"      day={sum(1 for r in rows if r['symbol'] == sym and r['timeframe'] != '1m')} total={len(rows)}", flush=True)
         print(f"    SCALP rows {sym}...", flush=True)
         n0 = len(rows)
-        rows.extend(
-            build_dataset_rows(sym, all_bars[sym], scalp_start, end_ts, sample_sec=300, half_spread=hs, scalp=True)
-        )
-        print(f"      scalp={len(rows)-n0} total={len(rows)}", flush=True)
+        rows.extend(build_dataset_rows(sym, all_bars[sym], scalp_start, end_ts, sample_sec=300, half_spread=hs, scalp=True))
+        print(f"      scalp={len(rows) - n0} total={len(rows)}", flush=True)
 
     try:
         DATASET_CACHE.write_bytes(pickle.dumps({"version": 2, "rows": rows}))
@@ -229,10 +226,7 @@ def _top_features(importance: np.ndarray, k: int = 12) -> list[dict]:
     if importance is None or len(importance) != len(FEATURE_NAMES_145):
         return []
     idx = np.argsort(importance)[::-1][:k]
-    return [
-        {"feature": FEATURE_NAMES_145[i], "importance": round(float(importance[i]), 5)}
-        for i in idx
-    ]
+    return [{"feature": FEATURE_NAMES_145[i], "importance": round(float(importance[i]), 5)} for i in idx]
 
 
 def _discover_buckets(train_rows: list[dict], test_rows: list[dict], importance: np.ndarray) -> list[dict]:
@@ -241,7 +235,6 @@ def _discover_buckets(train_rows: list[dict], test_rows: list[dict], importance:
         return []
     top_idx = np.argsort(importance)[::-1][:8]
     buckets: list[dict] = []
-    sym_filter = None
     for sym in SYMBOLS:
         sym_train = [r for r in train_rows if r["symbol"] == sym]
         sym_test = [r for r in test_rows if r["symbol"] == sym]
@@ -264,16 +257,18 @@ def _discover_buckets(train_rows: list[dict], test_rows: list[dict], importance:
                 tem = _metrics_from_rows(te)
                 if tm.get("expectancy_per_trade", 0) <= 0:
                     continue
-                buckets.append({
-                    "bucket_id": f"{sym}_{fname}_q{qlo}_{qhi}",
-                    "symbol": sym,
-                    "feature": fname,
-                    "range": [round(lo, 6), round(hi, 6)],
-                    **meta_regime,
-                    "train_metrics": tm,
-                    "test_metrics": tem,
-                    "test_positive": tem.get("expectancy_per_trade", 0) > 0,
-                })
+                buckets.append(
+                    {
+                        "bucket_id": f"{sym}_{fname}_q{qlo}_{qhi}",
+                        "symbol": sym,
+                        "feature": fname,
+                        "range": [round(lo, 6), round(hi, 6)],
+                        **meta_regime,
+                        "train_metrics": tm,
+                        "test_metrics": tem,
+                        "test_positive": tem.get("expectancy_per_trade", 0) > 0,
+                    }
+                )
     buckets.sort(key=lambda b: float((b.get("test_metrics") or {}).get("monthly_pnl_usd") or -1e9), reverse=True)
     return buckets[:15]
 
@@ -282,7 +277,7 @@ def _threshold_replay(test_rows: list[dict], proba: np.ndarray, scaler, model, n
     results = []
     if len(test_rows) != len(proba):
         return results
-    ranked = sorted(zip(proba, test_rows), key=lambda x: -x[0])
+    ranked = sorted(zip(proba, test_rows, strict=False), key=lambda x: -x[0])
     n = len(ranked)
     for label, frac in [("top_1pct", 0.01), ("top_2pct", 0.02), ("top_5pct", 0.05), ("top_10pct", 0.10)]:
         k = max(1, int(n * frac))
@@ -301,7 +296,7 @@ def _threshold_replay(test_rows: list[dict], proba: np.ndarray, scaler, model, n
 
 
 def _stress_metrics(rows: list[dict], notional: float = NOTIONAL_DAY) -> dict[str, Any]:
-    """Spread ×1.5 stress on label proxy PnL."""
+    """Spread x1.5 stress on label proxy PnL."""
     stressed = []
     for r in rows:
         nr = dict(r)
@@ -369,7 +364,7 @@ def main() -> int:
     target_key = "hit_40bp_before_40bp"
     X_train, y_train, _ = _xy(train, target_key)
     X_val, y_val, _ = _xy(val, target_key)
-    X_test, y_test, _ = _xy(test, target_key)
+    X_test, _y_test, _ = _xy(test, target_key)
 
     print(f"  dataset rows={len(rows)} day={len(day_rows)} scalp={len(scalp_rows)} features=145", flush=True)
     print("  training models (walk-forward)...", flush=True)
@@ -393,11 +388,7 @@ def main() -> int:
     stress = _stress_metrics(test) if test else {"pass": False}
     if best_bucket and best_bucket.get("feature") in FEATURE_NAMES_145:
         fi = FEATURE_NAMES_145.index(best_bucket["feature"])
-        bucket_test_rows = [
-            r for r in test
-            if r["symbol"] == best_bucket.get("symbol")
-            and best_bucket["range"][0] <= r["features_145"][fi] <= best_bucket["range"][1]
-        ]
+        bucket_test_rows = [r for r in test if r["symbol"] == best_bucket.get("symbol") and best_bucket["range"][0] <= r["features_145"][fi] <= best_bucket["range"][1]]
         if bucket_test_rows:
             stress = _stress_metrics(bucket_test_rows)
 
@@ -406,7 +397,7 @@ def main() -> int:
         key=lambda x: float((x.get("metrics") or {}).get("monthly_pnl_usd") or -1e9),
         default={},
     )
-    best_test_metrics = (best_bucket.get("test_metrics") or best_thresh.get("metrics") or _metrics_from_rows(test))
+    best_test_metrics = best_bucket.get("test_metrics") or best_thresh.get("metrics") or _metrics_from_rows(test)
     wf_test_pos = float(best_test_metrics.get("expectancy_per_trade") or 0) > 0
     accepted, reject_reasons = _reject_bucket(best_test_metrics, wf_test_pos)
 
@@ -499,22 +490,23 @@ def main() -> int:
         ],
         "target_met_500": float(best_test_metrics.get("monthly_pnl_usd") or 0) >= TARGET_MONTHLY,
         "any_pattern_promoted": False,
-        "conclusion": (
-            "human_ltf_patterns_exhausted; ai_outcome_discovery_complete"
-            if not accepted
-            else "candidate_bucket_requires_execution_replay_validation"
-        ),
+        "conclusion": ("human_ltf_patterns_exhausted; ai_outcome_discovery_complete" if not accepted else "candidate_bucket_requires_execution_replay_validation"),
     }
 
     out = BASELINE_DIR / "ai_outcome_entry_discovery_latest.json"
     out.write_text(json.dumps(report, indent=2, default=str))
-    print(json.dumps({
-        "rows": len(rows),
-        "best_model": best,
-        "best_monthly": best_test_metrics.get("monthly_pnl_usd"),
-        "target_met_500": report["target_met_500"],
-        "out": str(out),
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "rows": len(rows),
+                "best_model": best,
+                "best_monthly": best_test_metrics.get("monthly_pnl_usd"),
+                "target_met_500": report["target_met_500"],
+                "out": str(out),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 

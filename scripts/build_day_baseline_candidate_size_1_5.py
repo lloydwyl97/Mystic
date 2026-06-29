@@ -5,13 +5,14 @@ Formal replay baseline candidate: day_baseline_all_pass_v1_size_1_5_candidate
 Replay-only notional_mult=1.5 on locked positive buckets.
 Does NOT change live trading rules or sizing.
 """
+
 from __future__ import annotations
 
 import json
 import sys
 import traceback
 from copy import deepcopy
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +30,9 @@ from backend.config.trading_economics import MIN_NET_PROFIT_TO_SELL
 from backend.services.day_bucket_quality import REPLAY_KILLED_BUCKETS, active_allowed_buckets
 from scripts.run_day_execution_replay import (
     ALLOWED_POSITIVE_BUCKETS,
-    ExecutionConfig,
     STRESS_SCENARIOS,
     WINDOWS_DAYS,
+    ExecutionConfig,
     _build_fee_profiles,
     _compute_pass,
     _run_stress_90d,
@@ -59,7 +60,7 @@ def _candidate_config(profiles: dict[str, ExecutionConfig]) -> ExecutionConfig:
 
 
 def _live_rules_match_candidate(live_check: dict[str, Any]) -> dict[str, Any]:
-    """Strategy rules match; live notional still 1.0× until promoted."""
+    """Strategy rules match; live notional still 1.0x until promoted."""
     return {
         "strategy_rules_match": bool(live_check.get("match")),
         "killed_buckets_unchanged": live_check.get("replay_killed_buckets") == [list(k) for k in sorted(REPLAY_KILLED_BUCKETS)],
@@ -69,7 +70,7 @@ def _live_rules_match_candidate(live_check: dict[str, Any]) -> dict[str, Any]:
         "live_min_net_profit_floor": MIN_NET_PROFIT_TO_SELL,
         "candidate_min_net_profit_floor": MIN_NET_PROFIT_TO_SELL,
         "match": bool(live_check.get("match")),
-        "note": "Live unchanged at 1.0× until candidate lock approved; strategy gates identical.",
+        "note": "Live unchanged at 1.0x until candidate lock approved; strategy gates identical.",
     }
 
 
@@ -81,12 +82,7 @@ def _candidate_pass_extensions(w90: dict, pass_criteria: dict) -> dict[str, Any]
     merged["repair_add_enabled_in_live_code"] = bool(REPAIR_ADD_ENABLED)
     merged["old_blocker_active"] = False
     merged["positive_buckets_only"] = True
-    merged["all_pass"] = (
-        bool(pass_criteria.get("all_pass"))
-        and merged["no_fat_tail_holds_72h"]
-        and merged["no_repair_adds_replay"]
-        and not merged["old_blocker_active"]
-    )
+    merged["all_pass"] = bool(pass_criteria.get("all_pass")) and merged["no_fat_tail_holds_72h"] and merged["no_repair_adds_replay"] and not merged["old_blocker_active"]
     return merged
 
 
@@ -126,9 +122,7 @@ def main() -> int:
         bars_1h = {sym: fetch_klines_cached(sym, "1h", start_ms, end_ms) for sym in SYMBOLS}
         bars_exec_by_interval: dict[str, dict] = {}
         for interval in ("1m", "5m", "15m"):
-            bars_exec_by_interval[interval] = {
-                sym: fetch_klines_cached(sym, interval, start_ms, end_ms) for sym in SYMBOLS
-            }
+            bars_exec_by_interval[interval] = {sym: fetch_klines_cached(sym, interval, start_ms, end_ms) for sym in SYMBOLS}
 
         profiles = _build_fee_profiles()
         cfg = _candidate_config(profiles)
@@ -181,10 +175,7 @@ def main() -> int:
 
         summary = _summary_metrics(w90)
         summary["parent_baseline_monthly_usd"] = parent_monthly
-        summary["uplift_vs_parent_monthly_usd"] = (
-            round(summary["expected_monthly_pnl_usd_25k"] - parent_monthly, 2)
-            if parent_monthly is not None else None
-        )
+        summary["uplift_vs_parent_monthly_usd"] = round(summary["expected_monthly_pnl_usd_25k"] - parent_monthly, 2) if parent_monthly is not None else None
 
         report = {
             "generated_at": end.isoformat(),
@@ -224,18 +215,24 @@ def main() -> int:
         artifact = BASELINE_DIR / f"{CANDIDATE_ID}.json"
         artifact.write_text(json.dumps(report, indent=2, default=str))
         review = BASELINE_DIR / f"{CANDIDATE_ID}_REVIEW.json"
-        review.write_text(json.dumps({
-            "candidate_id": CANDIDATE_ID,
-            "generated_at": report["generated_at"],
-            "all_pass": report["all_pass"],
-            "stress_all_pass": report["stress_all_pass"],
-            "live_changed": False,
-            "promotion_ready": bool(report["all_pass"] and report["stress_all_pass"]),
-            "summary": summary,
-            "pass_criteria": pass_ext,
-            "live_rules_match_candidate": candidate_live,
-            "artifact": artifact.name,
-        }, indent=2, default=str))
+        review.write_text(
+            json.dumps(
+                {
+                    "candidate_id": CANDIDATE_ID,
+                    "generated_at": report["generated_at"],
+                    "all_pass": report["all_pass"],
+                    "stress_all_pass": report["stress_all_pass"],
+                    "live_changed": False,
+                    "promotion_ready": bool(report["all_pass"] and report["stress_all_pass"]),
+                    "summary": summary,
+                    "pass_criteria": pass_ext,
+                    "live_rules_match_candidate": candidate_live,
+                    "artifact": artifact.name,
+                },
+                indent=2,
+                default=str,
+            )
+        )
 
         print(json.dumps(report, indent=2, default=str))
         return 0 if report["all_pass"] else 1

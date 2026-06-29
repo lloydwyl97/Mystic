@@ -3,12 +3,13 @@ Binance.US spot universe eligibility — research only, no live promotion.
 
 Scans exchangeInfo + ticker/24hr + bookTicker to build a liquid eligible universe.
 """
+
 from __future__ import annotations
 
 import json
 import subprocess
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -85,22 +86,21 @@ def fetch_klines(api_sym: str, interval: str, start_ms: int, end_ms: int) -> lis
     bars: list[dict] = []
     cursor = start_ms
     while cursor < end_ms:
-        url = (
-            f"{BASE_URL}/api/v3/klines?symbol={api_sym}&interval={interval}"
-            f"&startTime={cursor}&endTime={end_ms}&limit=1000"
-        )
+        url = f"{BASE_URL}/api/v3/klines?symbol={api_sym}&interval={interval}&startTime={cursor}&endTime={end_ms}&limit=1000"
         rows = _curl_json(url)
         if not isinstance(rows, list) or not rows:
             break
         for r in rows:
-            bars.append({
-                "ts": int(r[0]) // 1000,
-                "open": float(r[1]),
-                "high": float(r[2]),
-                "low": float(r[3]),
-                "close": float(r[4]),
-                "volume": float(r[5]),
-            })
+            bars.append(
+                {
+                    "ts": int(r[0]) // 1000,
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4]),
+                    "volume": float(r[5]),
+                }
+            )
         last_ms = int(rows[-1][0])
         if last_ms <= cursor:
             break
@@ -215,9 +215,7 @@ def scan_eligible_universe(
             accepted.append(row)
 
     accepted.sort(key=lambda x: -float(x.get("daily_volume_usd") or 0))
-    avg_spread = (
-        sum(float(a.get("half_spread_pct") or 0) for a in accepted) / max(len(accepted), 1)
-    )
+    avg_spread = sum(float(a.get("half_spread_pct") or 0) for a in accepted) / max(len(accepted), 1)
     avg_vol = sum(float(a.get("daily_volume_usd") or 0) for a in accepted) / max(len(accepted), 1)
     avg_cov = sum(float(a.get("candle_coverage_1h_90d") or 0) for a in accepted) / max(len(accepted), 1)
 

@@ -41,11 +41,7 @@ class BreakoutMomentumStrategy:
             return reject_signal(ctx, self.name, "NO_BREAKOUT")
 
         mom = ctx.mom
-        if not (
-            mom.bid_change_15s > 0
-            and mom.mid_change_15s > 0
-            and mom.mid_change_30s > 0
-        ):
+        if not (mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0):
             return reject_signal(ctx, self.name, "MOMENTUM_NOT_CONFIRMED")
 
         move_from_low = (cur - min(b["low"] for b in recent)) / cur if cur > 0 else 0

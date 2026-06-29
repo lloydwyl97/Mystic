@@ -9,7 +9,6 @@ import subprocess
 from dataclasses import dataclass
 
 import redis
-
 from backend.services.binance_scalp.config import ScalpConfig, get_scalp_config
 
 # Force IPv4 for Binance.US REST on this VM (same constraint as OrderBookCollector).
@@ -70,7 +69,7 @@ def fetch_depth_sync(symbol_bus: str, *, limit: int = 100) -> tuple[list[list[fl
             check=False,
         )
         if proc.returncode != 0 or not proc.stdout.strip():
-            raise RuntimeError(f"depth fetch failed for {sym}")
+            raise RuntimeError(f"depth fetch failed for {sym}") from None
         data = json.loads(proc.stdout)
     bids = [[float(p), float(q)] for p, q in data.get("bids") or []]
     asks = [[float(p), float(q)] for p, q in data.get("asks") or []]

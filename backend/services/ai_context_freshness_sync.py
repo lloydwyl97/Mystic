@@ -179,7 +179,7 @@ def build_freshness_snapshot(symbols: list[str]) -> dict[str, Any]:
                     dd[kk] = vv
             except Exception:
                 pass
-        payload, live_age, live_ts = read_live_context(bus)
+        _payload, live_age, live_ts = read_live_context(bus)
         overlay_live_context_freshness(dd, bus)
         ok, reject, detail = evaluate_signal_hash_for_entry(dd) if dd else (False, "NO_SIGNAL_HASH", {})
         rows.append(

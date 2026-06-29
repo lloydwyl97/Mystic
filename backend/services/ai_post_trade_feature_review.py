@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
@@ -70,7 +71,7 @@ def _strongest_entry_blocks(features: list[float] | None) -> list[dict[str, Any]
             v = abs(float(raw))
         except (TypeError, ValueError):
             continue
-        if not (v > 0 and v == v):
+        if not (v > 0 and math.isfinite(v)):
             continue
         block = _block_for_index(i)
         for rollup, members in IMPORTANCE_ROLLUP.items():

@@ -150,6 +150,7 @@ def _safe_float(raw: Any, default: float = 0.0) -> float:
 # Stream 1: candidate snapshots
 # =========================================================================
 
+
 def record_candidate_snapshot(
     *,
     symbol: str,
@@ -214,6 +215,7 @@ def record_candidate_snapshot(
 # Stream 3: position heartbeats
 # =========================================================================
 
+
 def record_position_heartbeat(
     *,
     symbol: str,
@@ -239,8 +241,7 @@ def record_position_heartbeat(
     try:
         with sqlite3.connect(db_path, timeout=10) as conn:
             row = conn.execute(
-                "SELECT highest_since_entry, lowest_since_entry FROM ai_position_heartbeats "
-                "WHERE trade_id = ? ORDER BY epoch_ms DESC LIMIT 1",
+                "SELECT highest_since_entry, lowest_since_entry FROM ai_position_heartbeats WHERE trade_id = ? ORDER BY epoch_ms DESC LIMIT 1",
                 (trade_id,),
             ).fetchone()
             prev_hi = float(row[0]) if row and row[0] else entry_price
@@ -265,11 +266,25 @@ def record_position_heartbeat(
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    _now_iso(), int(time.time() * 1000), symbol, trade_id, entry_price, mark,
-                    unrealized, net_unrealized, hi, lo, mfe, mae,
-                    dist_target, dist_invalid,
+                    _now_iso(),
+                    int(time.time() * 1000),
+                    symbol,
+                    trade_id,
+                    entry_price,
+                    mark,
+                    unrealized,
+                    net_unrealized,
+                    hi,
+                    lo,
+                    mfe,
+                    mae,
+                    dist_target,
+                    dist_invalid,
                     None if thesis_valid is None else int(bool(thesis_valid)),
-                    int(exit_allowed), would_sell_net_usd, hold_sec, entry_thesis or "",
+                    int(exit_allowed),
+                    would_sell_net_usd,
+                    hold_sec,
+                    entry_thesis or "",
                 ),
             )
             conn.commit()
@@ -280,6 +295,7 @@ def record_position_heartbeat(
 # =========================================================================
 # Stream 2: forward labeling of snapshots
 # =========================================================================
+
 
 def _bus(symbol: str) -> str:
     return (symbol or "").replace("/", "").upper()
@@ -471,8 +487,7 @@ def label_pending_snapshots(db_path: str = DATABASE_PATH) -> dict[str, int]:
                         verdict = "GOOD_BUY" if opportunity else "BAD_BUY"
                     else:
                         verdict = "MISSED_OPPORTUNITY" if opportunity else "CORRECT_REJECT"
-                set_parts = ["label_status='LABELED'", "labeled_at_utc=?", "mfe_pct=?", "mae_pct=?",
-                             "would_hit_target=?", "would_breach_invalidation=?", "verdict=?"]
+                set_parts = ["label_status='LABELED'", "labeled_at_utc=?", "mfe_pct=?", "mae_pct=?", "would_hit_target=?", "would_breach_invalidation=?", "verdict=?"]
                 params: list[Any] = [_now_iso(), mfe, mae, would_hit, breach, verdict]
                 for col, val in updates.items():
                     set_parts.append(f"{col}=?")
@@ -551,6 +566,7 @@ def _prune_old_rows(conn: sqlite3.Connection) -> None:
 # Stream 5: missed-move ranking adjustments (bounded; never opens trades)
 # =========================================================================
 
+
 def missed_move_rank_adjustments(
     lookback_days: int = 14,
     db_path: str = DATABASE_PATH,
@@ -592,6 +608,7 @@ def missed_move_rank_adjustments(
 # =========================================================================
 # Tier B / Tier C training row extraction
 # =========================================================================
+
 
 def _features_for_decision_ids(
     conn: sqlite3.Connection,
@@ -678,7 +695,7 @@ def tier_b_training_rows(
     hold time, label 1 if the path's MFE cleared the net-profit floor after
     costs. Features come from the BUY snapshot's inference-time vector."""
     ensure_learning_ingestion_tables(db_path)
-    sid = (strategy_id or "day").strip().lower()
+    (strategy_id or "day").strip().lower()
     xs: list[list[float]] = []
     ys: list[int] = []
     try:
@@ -695,7 +712,7 @@ def tier_b_training_rows(
                 """,
                 (symbol, _bus(symbol), float(min_hold_seconds)),
             ).fetchall()
-            for trade_id, mfe, _hold, first_ms, sym in rows:
+            for _trade_id, mfe, _hold, first_ms, sym in rows:
                 snap = conn.execute(
                     """
                     SELECT decision_id FROM ai_candidate_snapshots
@@ -742,6 +759,7 @@ def tiered_holdout_eval_rows(
 # Stream 8: learning health summary
 # =========================================================================
 
+
 def learning_health_summary(db_path: str = DATABASE_PATH) -> dict[str, Any]:
     ensure_learning_ingestion_tables(db_path)
     out: dict[str, Any] = {
@@ -767,24 +785,16 @@ def learning_health_summary(db_path: str = DATABASE_PATH) -> dict[str, Any]:
 
             per_sym = out["per_symbol"]
             with contextlib.suppress(sqlite3.Error):
-                for sym, cnt in conn.execute(
-                    "SELECT symbol, COUNT(*) FROM ai_candidate_snapshots GROUP BY symbol"
-                ).fetchall():
+                for sym, cnt in conn.execute("SELECT symbol, COUNT(*) FROM ai_candidate_snapshots GROUP BY symbol").fetchall():
                     per_sym.setdefault(str(sym), {})["snapshots"] = int(cnt)
             with contextlib.suppress(sqlite3.Error):
-                for sym, cnt in conn.execute(
-                    "SELECT symbol, COUNT(*) FROM ai_candidate_snapshots WHERE label_status='LABELED' GROUP BY symbol"
-                ).fetchall():
+                for sym, cnt in conn.execute("SELECT symbol, COUNT(*) FROM ai_candidate_snapshots WHERE label_status='LABELED' GROUP BY symbol").fetchall():
                     per_sym.setdefault(str(sym), {})["labeled_snapshots"] = int(cnt)
             with contextlib.suppress(sqlite3.Error):
-                for sym, cnt in conn.execute(
-                    "SELECT symbol, COUNT(*) FROM ai_position_heartbeats GROUP BY symbol"
-                ).fetchall():
+                for sym, cnt in conn.execute("SELECT symbol, COUNT(*) FROM ai_position_heartbeats GROUP BY symbol").fetchall():
                     per_sym.setdefault(str(sym), {})["heartbeats"] = int(cnt)
             with contextlib.suppress(sqlite3.Error):
-                for sym, cnt in conn.execute(
-                    "SELECT symbol, COUNT(*) FROM ai_outcome_training_rows WHERE strategy_id='day' GROUP BY symbol"
-                ).fetchall():
+                for sym, cnt in conn.execute("SELECT symbol, COUNT(*) FROM ai_outcome_training_rows WHERE strategy_id='day' GROUP BY symbol").fetchall():
                     per_sym.setdefault(str(sym), {})["closed_outcomes"] = int(cnt)
             with contextlib.suppress(sqlite3.Error):
                 for sym, reason, at in conn.execute(
@@ -823,6 +833,9 @@ def learning_health_summary(db_path: str = DATABASE_PATH) -> dict[str, Any]:
 
 
 __all__ = [
+    "MAX_TIER_BC_SHARE",
+    "TIER_B_WEIGHT",
+    "TIER_C_WEIGHT",
     "ensure_learning_ingestion_tables",
     "label_pending_snapshots",
     "learning_health_summary",
@@ -832,7 +845,4 @@ __all__ = [
     "tier_b_training_rows",
     "tier_c_training_rows",
     "tiered_holdout_eval_rows",
-    "TIER_B_WEIGHT",
-    "TIER_C_WEIGHT",
-    "MAX_TIER_BC_SHARE",
 ]

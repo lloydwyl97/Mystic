@@ -12,14 +12,18 @@ top-four pairs (verified Binance.US 0% maker / 0.02% taker):
 Enable with ALLWEATHER_ENGINE_ENABLED=true. When disabled every public helper
 is a no-op signal so the live engine keeps its existing behavior unchanged.
 """
+
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 SETUP_BREAKOUT = "BREAKOUT"
 SETUP_TREND_PULLBACK = "TREND_PULLBACK"
+SETUP_FAILED_BREAKDOWN_REVERSAL = "FAILED_BREAKDOWN_REVERSAL"
+SETUP_RANGE_BOUNCE = "RANGE_BOUNCE"
 
 REG_TREND_UP = "trend_up"
 REG_TREND_DOWN = "trend_down"
@@ -66,8 +70,8 @@ def _atr(bars: list[dict], period: int = 14) -> float:
         return 0.0
     trs = []
     for i in range(-period, 0):
-        h, l, pc = bars[i]["high"], bars[i]["low"], bars[i - 1]["close"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        h, low, pc = bars[i]["high"], bars[i]["low"], bars[i - 1]["close"]
+        trs.append(max(h - low, abs(h - pc), abs(low - pc)))
     return sum(trs) / len(trs)
 
 
@@ -76,11 +80,11 @@ def _adx(bars: list[dict], period: int = 14) -> float:
         return 0.0
     trs, pdm, mdm = [], [], []
     for i in range(-period - 1, 0):
-        h, l = bars[i]["high"], bars[i]["low"]
+        h, bar_low = bars[i]["high"], bars[i]["low"]
         ph, pl, pc = bars[i - 1]["high"], bars[i - 1]["low"], bars[i - 1]["close"]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
+        tr = max(h - bar_low, abs(h - pc), abs(bar_low - pc))
         up = h - ph
-        dn = pl - l
+        dn = pl - bar_low
         trs.append(tr or 1e-9)
         pdm.append(up if (up > dn and up > 0) else 0.0)
         mdm.append(dn if (dn > up and dn > 0) else 0.0)
@@ -113,20 +117,29 @@ def normalize_bars(raw: Any) -> list[dict]:
         return out
     for r in raw:
         if isinstance(r, dict):
-            out.append({
-                "ts": int(r.get("ts") or r.get("timestamp") or 0),
-                "open": float(r["open"]), "high": float(r["high"]),
-                "low": float(r["low"]), "close": float(r["close"]),
-            })
+            out.append(
+                {
+                    "ts": int(r.get("ts") or r.get("timestamp") or 0),
+                    "open": float(r["open"]),
+                    "high": float(r["high"]),
+                    "low": float(r["low"]),
+                    "close": float(r["close"]),
+                }
+            )
         elif isinstance(r, (list, tuple)) and len(r) >= 5:
-            out.append({
-                "ts": int(r[0]) // 1000, "open": float(r[1]), "high": float(r[2]),
-                "low": float(r[3]), "close": float(r[4]),
-            })
+            out.append(
+                {
+                    "ts": int(r[0]) // 1000,
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4]),
+                }
+            )
     return out
 
 
-def compute_state(bars_1h: list[dict], don: int = DONCHIAN) -> Optional[AWState]:
+def compute_state(bars_1h: list[dict], don: int = DONCHIAN) -> AWState | None:
     """Compute latest indicator/regime state from >=206 hourly bars."""
     if not bars_1h or len(bars_1h) < 206:
         return None
@@ -137,7 +150,7 @@ def compute_state(bars_1h: list[dict], don: int = DONCHIAN) -> Optional[AWState]
     adx = _adx(bars_1h)
     atr = _atr(bars_1h)
     rsi = _rsi(closes)
-    prior = bars_1h[-don - 1:-1]
+    prior = bars_1h[-don - 1 : -1]
     dhigh = max(b["high"] for b in prior) if prior else bars_1h[-1]["high"]
     dlow = min(b["low"] for b in prior) if prior else bars_1h[-1]["low"]
     c = closes[-1]
@@ -152,10 +165,116 @@ def compute_state(bars_1h: list[dict], don: int = DONCHIAN) -> Optional[AWState]
     return AWState(c, closes[-2], e21, e55, e200, adx, atr, rsi, dhigh, dlow, regime)
 
 
-def entry_signal(state: AWState) -> Optional[dict[str, Any]]:
+def diagnose_entry_state(
+    state: AWState | None,
+    *,
+    bar_count: int = 0,
+    kline_fetch_failed: bool = False,
+    timestamp: str | None = None,
+    symbol: str | None = None,
+) -> dict[str, Any]:
+    """Structured no-signal / diagnostics payload — does not change entry_signal rules."""
+    ts = timestamp or datetime.now(timezone.utc).isoformat()
+    base: dict[str, Any] = {
+        "symbol": symbol,
+        "timestamp": ts,
+        "regime": None,
+        "setup_checked": "BREAKOUT,TREND_PULLBACK,RANGE_BOUNCE,FAILED_BREAKDOWN_REVERSAL,CONTINUATION",
+        "close": None,
+        "donchian_high": None,
+        "donchian_high_distance_pct": None,
+        "ema21": None,
+        "ema55": None,
+        "ema200": None,
+        "ema21_gt_55_gt_200": False,
+        "adx": None,
+        "rsi": None,
+        "pullback_band_low": None,
+        "pullback_band_high": None,
+        "pullback_band_status": "unknown",
+        "resuming_up": None,
+        "breakout_condition": False,
+        "trend_pullback_condition": False,
+        "insufficient_bars": bar_count < 206 if bar_count else state is None,
+        "kline_fetch_failed": bool(kline_fetch_failed),
+    }
+    if kline_fetch_failed:
+        base["pullback_band_status"] = "kline_fetch_failed"
+        return base
+    if state is None or bar_count < 206:
+        base["insufficient_bars"] = True
+        base["pullback_band_status"] = "insufficient_bars"
+        return base
+
+    c = state.close
+    atr_pct = state.atr / c if c > 0 else 0.0
+    near_lo = state.ema21 * (1.0 - 1.2 * atr_pct) if atr_pct > 0 else state.ema21
+    near_hi = state.ema21 * (1.0 + 0.35 * atr_pct) if atr_pct > 0 else state.ema21
+    resuming = c > state.prev_close
+    near_ema = (c <= near_hi) and (c >= near_lo)
+    ema_stack_up = state.ema21 > state.ema55 > state.ema200
+    don_dist = ((c - state.don_high) / state.don_high * 100.0) if state.don_high > 0 else None
+
+    breakout = False
+    trend_pullback = False
+    range_bounce = False
+    failed_breakdown = False
+    if atr_pct > 0 and state.regime == REG_TREND_UP:
+        trend_pullback = bool(near_ema and resuming and 35.0 <= state.rsi <= 62.0)
+        breakout = bool(c > state.don_high and state.rsi <= 78.0)
+    elif state.regime == REG_NEUTRAL:
+        breakout = bool(c > state.don_high and c > state.ema55 and state.adx >= 18 and state.rsi <= 75.0)
+    elif state.regime == REG_RANGE:
+        recent_low = state.don_low
+        range_bounce = bool(c > recent_low * 1.001 and state.rsi < 45 and c > state.prev_close)
+    elif state.regime == REG_TREND_DOWN:
+        swept = (c - state.don_low) / max(state.don_low, 1e-9) > -0.012
+        reclaim = c > state.prev_close and state.rsi < 40
+        failed_breakdown = bool(swept and reclaim)
+
+    if near_ema:
+        band_status = "inside_band"
+    elif c > near_hi:
+        band_status = "above_band"
+    elif c < near_lo:
+        band_status = "below_band"
+    else:
+        band_status = "outside_band"
+
+    base.update(
+        {
+            "regime": state.regime,
+            "close": round(c, 8),
+            "donchian_high": round(state.don_high, 8),
+            "donchian_high_distance_pct": round(don_dist, 4) if don_dist is not None else None,
+            "ema21": round(state.ema21, 8),
+            "ema55": round(state.ema55, 8),
+            "ema200": round(state.ema200, 8),
+            "ema21_gt_55_gt_200": ema_stack_up,
+            "adx": round(state.adx, 2),
+            "rsi": round(state.rsi, 2),
+            "pullback_band_low": round(near_lo, 8),
+            "pullback_band_high": round(near_hi, 8),
+            "pullback_band_status": band_status,
+            "resuming_up": resuming,
+            "breakout_condition": breakout,
+            "trend_pullback_condition": trend_pullback,
+            "range_bounce_condition": range_bounce,
+            "failed_breakdown_reversal_condition": failed_breakdown,
+            "insufficient_bars": False,
+        }
+    )
+    return base
+
+
+def entry_signal(state: AWState) -> dict[str, Any] | None:
     """Return {setup, regime, target_atr, stop_atr} for a long entry, else None.
 
-    Identical rules to the validated lab. Mean-reversion intentionally absent.
+    To generate activity for learning in all regimes (paper mirrors live):
+    - trend_up: original breakout / pullback
+    - neutral: limited breakout
+    - range and trend_down: reversal / bounce setups so the system trades and learns
+      instead of sitting idle for days. Conservative ATR brackets, same risk rules.
     """
     c = state.close
     atr_pct = state.atr / c if c > 0 else 0.0
@@ -169,12 +288,33 @@ def entry_signal(state: AWState) -> Optional[dict[str, Any]]:
             return {"setup": SETUP_TREND_PULLBACK, "regime": state.regime, "target_atr": 2.2, "stop_atr": 1.3}
         if c > state.don_high and state.rsi <= 78.0:
             return {"setup": SETUP_BREAKOUT, "regime": state.regime, "target_atr": 2.6, "stop_atr": 1.5}
+        # Continuation while trend intact (emas stacked + adx + not overbought + up tick).
+        # Lets the app trade "up" regimes that are grinding without a fresh donchian break or deep band pullback on this exact bar.
+        # Conservative brackets. Generates outcomes for learning instead of idling.
+        if state.ema21 > state.ema55 > state.ema200 and state.adx >= 18 and state.rsi < 72 and c > state.prev_close:
+            return {"setup": SETUP_TREND_PULLBACK, "regime": state.regime, "target_atr": 2.0, "stop_atr": 1.2}
 
     if state.regime == REG_NEUTRAL:
         if c > state.don_high and c > state.ema55 and state.adx >= 18 and state.rsi <= 75.0:
             return {"setup": SETUP_BREAKOUT, "regime": state.regime, "target_atr": 2.4, "stop_atr": 1.5}
 
-    # range -> no longs; trend_down -> no longs (spot long-only, capital preserved)
+    # RANGE: bounce from lows when oversold-ish and showing rejection
+    if state.regime == REG_RANGE:
+        # simple range bounce proxy: price near or below recent low band + rsi depressed + up tick
+        recent_low = state.don_low
+        bounced = c > recent_low * 1.001 and state.rsi < 45 and c > state.prev_close
+        if bounced:
+            return {"setup": SETUP_RANGE_BOUNCE, "regime": state.regime, "target_atr": 1.8, "stop_atr": 0.9}
+
+    # TREND_DOWN: failed breakdown / reversal when sweep low + reclaim + momentum flip
+    if state.regime == REG_TREND_DOWN:
+        # proxy for failed breakdown: made a low then reclaimed with positive close change + low rsi
+        recent = 0.008  # ~0.8% sweep tolerance relative
+        swept_low = (c - state.don_low) / max(state.don_low, 1e-9) > -0.012  # within recent low area
+        reclaim = c > state.prev_close and state.rsi < 40
+        if swept_low and reclaim:
+            return {"setup": SETUP_FAILED_BREAKDOWN_REVERSAL, "regime": state.regime, "target_atr": 1.6, "stop_atr": 0.85}
+
     return None
 
 
@@ -188,6 +328,11 @@ def entry_levels(current_price: float, atr: float, target_atr: float, stop_atr: 
     return round(target, 8), round(stop, 8)
 
 
+EXIT_ATR_STOP = "ALLWEATHER_ATR_STOP_EXIT"
+EXIT_ATR_TARGET = "ALLWEATHER_ATR_TARGET_EXIT"
+EXIT_TIME_STOP = "ALLWEATHER_TIME_STOP_EXIT"
+
+
 def exit_decision(
     *,
     current_price: float,
@@ -196,26 +341,30 @@ def exit_decision(
     target_level: float,
     stop_level: float,
     hold_hours: float,
-) -> Optional[dict[str, str]]:
+) -> dict[str, str] | None:
     """Bounded exit: ATR stop, ATR target, hard <=72h time-stop. None = hold."""
     if stop_level > 0 and (bar_low <= stop_level or current_price <= stop_level):
-        return {"action": "sell", "reason": "ALLWEATHER_STOP"}
+        return {"action": "sell", "reason": EXIT_ATR_STOP}
     if target_level > 0 and (bar_high >= target_level or current_price >= target_level):
-        return {"action": "sell", "reason": "ALLWEATHER_TARGET"}
+        return {"action": "sell", "reason": EXIT_ATR_TARGET}
     if hold_hours >= TIME_STOP_HOURS:
-        return {"action": "sell", "reason": "ALLWEATHER_TIME_STOP"}
+        return {"action": "sell", "reason": EXIT_TIME_STOP}
     return None
 
 
 __all__ = [
-    "allweather_enabled",
-    "compute_state",
-    "entry_signal",
-    "entry_levels",
-    "exit_decision",
-    "normalize_bars",
-    "AWState",
+    "EXIT_ATR_STOP",
+    "EXIT_ATR_TARGET",
+    "EXIT_TIME_STOP",
     "SETUP_BREAKOUT",
     "SETUP_TREND_PULLBACK",
     "TIME_STOP_HOURS",
+    "AWState",
+    "allweather_enabled",
+    "compute_state",
+    "diagnose_entry_state",
+    "entry_levels",
+    "entry_signal",
+    "exit_decision",
+    "normalize_bars",
 ]

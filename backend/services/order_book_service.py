@@ -8,6 +8,7 @@ All data from Binance US only - Production ready
 import contextlib
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,6 +17,8 @@ import redis.asyncio as redis
 from backend.services.redis_service import get_redis_service
 
 logger = logging.getLogger(__name__)
+
+ORDERBOOK_REDIS_META_KEYS = frozenset({"ts_utc", "updated_at", "source", "age_seconds"})
 
 
 def order_book_features_from_bids_asks(
@@ -46,7 +49,15 @@ def order_book_features_from_bids_asks(
         if best_bid <= 0 or best_ask <= 0:
             return features
 
-        features["bid_ask_spread"] = (best_ask - best_bid) / best_bid
+        spread_abs = best_ask - best_bid
+        mid = (best_bid + best_ask) / 2.0
+        features["bid"] = best_bid
+        features["ask"] = best_ask
+        features["bid_price"] = best_bid
+        features["ask_price"] = best_ask
+        features["spread"] = spread_abs
+        features["spread_pct"] = spread_abs / mid if mid > 0 else 0.0
+        features["bid_ask_spread"] = spread_abs / best_bid
 
         bid_volume = sum(float(b[1]) for b in bids[:depth_levels])
         ask_volume = sum(float(a[1]) for a in asks[:depth_levels])
@@ -105,10 +116,98 @@ async def fetch_order_book_features_live(ccxt_symbol: str, *, depth_levels: int 
         asks = ob.get("asks") or []
         if not bids or not asks:
             return None
-        return order_book_features_from_bids_asks(bids, asks, depth_levels=dl)
+        feats = order_book_features_from_bids_asks(bids, asks, depth_levels=dl)
+        if float(feats.get("bid_ask_spread") or 0) <= 0:
+            return None
+        return feats
     except Exception as e:
         logger.debug("fetch_order_book_features_live failed for %s: %s", ccxt_symbol, e)
         return None
+
+
+def _base_symbol(symbol_bus: str) -> str:
+    s = (symbol_bus or "BTCUSDT").upper().replace("/", "").replace("USDT", "").strip()
+    return s or "BTC"
+
+
+def orderbook_age_from_meta(ts_utc: Any = None, updated_at: Any = None) -> float | None:
+    ts = ts_utc if ts_utc not in (None, "") else updated_at
+    if ts in (None, ""):
+        return None
+    with contextlib.suppress(Exception):
+        return max(0.0, time.time() - float(ts))
+    return None
+
+
+def parse_orderbook_redis_hash(raw: dict[Any, Any] | None) -> tuple[dict[str, Any] | None, float | None]:
+    """Parse ``orderbook:{BASE}`` hash; skip non-numeric metadata fields safely."""
+    if not raw:
+        return None, None
+    orderbook: dict[str, Any] = {}
+    ts_utc: Any = None
+    updated_at: Any = None
+    for k, v in raw.items():
+        key = k.decode() if isinstance(k, bytes) else str(k)
+        val = v.decode() if isinstance(v, bytes) else v
+        if key in ORDERBOOK_REDIS_META_KEYS:
+            if key == "ts_utc":
+                ts_utc = val
+            elif key == "updated_at":
+                updated_at = val
+            continue
+        with contextlib.suppress(Exception):
+            orderbook[key] = float(val)
+    if ts_utc not in (None, ""):
+        with contextlib.suppress(Exception):
+            orderbook["ts_utc"] = float(ts_utc)
+    if updated_at not in (None, ""):
+        with contextlib.suppress(Exception):
+            orderbook["updated_at"] = float(updated_at)
+    if not orderbook:
+        return None, orderbook_age_from_meta(ts_utc, updated_at)
+    age = orderbook_age_from_meta(orderbook.get("ts_utc"), orderbook.get("updated_at"))
+    if orderbook.get("ts_utc") is None and ts_utc not in (None, ""):
+        age = orderbook_age_from_meta(ts_utc, updated_at)
+    return orderbook, age
+
+
+def build_orderbook_redis_mapping(
+    features: dict[str, float],
+    *,
+    source: str,
+    ts: float | None = None,
+) -> dict[str, str]:
+    now = float(ts if ts is not None else time.time())
+    mapping: dict[str, str] = {}
+    for key, value in features.items():
+        with contextlib.suppress(Exception):
+            mapping[key] = str(float(value))
+    mapping["updated_at"] = str(now)
+    mapping["ts_utc"] = str(now)
+    mapping["source"] = str(source)
+    return mapping
+
+
+async def write_orderbook_redis_async(
+    base: str,
+    features: dict[str, float],
+    redis_client: Any,
+    *,
+    source: str = "rest_fallback",
+    ttl_sec: int | None = None,
+) -> bool:
+    if not features or float(features.get("bid_ask_spread") or 0) <= 0:
+        return False
+    if redis_client is None:
+        return True
+    key = f"orderbook:{_base_symbol(base)}"
+    ttl = ttl_sec if ttl_sec is not None else max(30, int(os.getenv("ORDERBOOK_REDIS_TTL_SEC", "60")))
+    mapping = build_orderbook_redis_mapping(features, source=source)
+    pipe = redis_client.pipeline(transaction=True)
+    pipe.hset(key, mapping=mapping)
+    pipe.expire(key, ttl)
+    await pipe.execute()
+    return True
 
 
 class OrderBookService:
@@ -193,14 +292,15 @@ class OrderBookService:
             }
             self.last_update[symbol] = datetime.now(timezone.utc)
 
-            # Calculate features (all live from Binance)
             features = self._calculate_features(symbol, bids, asks)
+            if float(features.get("bid_ask_spread") or 0) <= 0:
+                return
 
-            # Store in Redis (TTL: 5 seconds - very short-lived) - Convert mapping to individual hset calls for compatibility
-            order_book_key = f"orderbook:{symbol}"
-            for field, value in features.items():
-                await self.redis.hset(order_book_key, field, str(value))
-            await self.redis.expire(order_book_key, 5)
+            order_book_key = f"orderbook:{_base_symbol(symbol)}"
+            ttl = max(30, int(os.getenv("ORDERBOOK_REDIS_TTL_SEC", "60")))
+            mapping = build_orderbook_redis_mapping(features, source="websocket")
+            await self.redis.hset(order_book_key, mapping=mapping)
+            await self.redis.expire(order_book_key, ttl)
 
             self.stats["updates_processed"] += 1
             self.stats["features_calculated"] += 1

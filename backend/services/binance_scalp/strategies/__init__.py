@@ -6,8 +6,13 @@ from typing import TYPE_CHECKING
 
 from backend.services.binance_scalp.strategies.base import ScalpSetupSignal
 from backend.services.binance_scalp.strategies.breakout_momentum import BreakoutMomentumStrategy
+from backend.services.binance_scalp.strategies.compression_breakout import CompressionBreakoutStrategy
+from backend.services.binance_scalp.strategies.failed_breakdown_reversal import FailedBreakdownReversalStrategy
+from backend.services.binance_scalp.strategies.failed_breakout_reversal import FailedBreakoutReversalStrategy
 from backend.services.binance_scalp.strategies.orderbook_tape_scalp import OrderbookTapeScalpStrategy
 from backend.services.binance_scalp.strategies.range_bounce_scalp import RangeBounceScalpStrategy
+from backend.services.binance_scalp.strategies.trend_pullback_micro import TrendPullbackMicroStrategy
+from backend.services.binance_scalp.strategies.volume_impulse_continuation import VolumeImpulseContinuationStrategy
 from backend.services.binance_scalp.strategies.vwap_ema_reclaim import VwapEmaReclaimStrategy
 
 if TYPE_CHECKING:
@@ -18,6 +23,11 @@ ALL_STRATEGIES = (
     VwapEmaReclaimStrategy(),
     OrderbookTapeScalpStrategy(),
     RangeBounceScalpStrategy(),
+    FailedBreakdownReversalStrategy(),
+    CompressionBreakoutStrategy(),
+    VolumeImpulseContinuationStrategy(),
+    TrendPullbackMicroStrategy(),
+    FailedBreakoutReversalStrategy(),
 )
 
 STRATEGY_NAMES = tuple(s.name for s in ALL_STRATEGIES)
@@ -29,12 +39,12 @@ def enabled_strategies(config: ScalpConfig) -> tuple:
 
 
 __all__ = [
-    "ScalpSetupSignal",
     "ALL_STRATEGIES",
     "STRATEGY_NAMES",
-    "enabled_strategies",
     "BreakoutMomentumStrategy",
-    "VwapEmaReclaimStrategy",
     "OrderbookTapeScalpStrategy",
     "RangeBounceScalpStrategy",
+    "ScalpSetupSignal",
+    "VwapEmaReclaimStrategy",
+    "enabled_strategies",
 ]

@@ -14,11 +14,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.config import get_scalp_config  # noqa: E402
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
-from backend.services.binance_scalp.market_reader import ScalpMarketReader  # noqa: E402
-from backend.services.binance_scalp.momentum_tracker import MomentumTracker  # noqa: E402
-from backend.services.binance_scalp.protected_preflight import (  # noqa: E402
+from backend.services.binance_scalp.config import get_scalp_config
+from backend.services.binance_scalp.economics import ScalpEconomics
+from backend.services.binance_scalp.market_reader import ScalpMarketReader
+from backend.services.binance_scalp.momentum_tracker import MomentumTracker
+from backend.services.binance_scalp.protected_preflight import (
     DEPTH_INSUFFICIENT,
     PRICE_IMPACT_TOO_HIGH,
     SPREAD_TOO_WIDE,
@@ -26,9 +26,7 @@ from backend.services.binance_scalp.protected_preflight import (  # noqa: E402
 )
 
 NEAR_PASS_THRESHOLD = 0.0005  # 0.05% from passing
-HQ_NEAR_PASS_DISALLOWED = frozenset(
-    {SPREAD_TOO_WIDE, DEPTH_INSUFFICIENT, PRICE_IMPACT_TOO_HIGH}
-)
+HQ_NEAR_PASS_DISALLOWED = frozenset({SPREAD_TOO_WIDE, DEPTH_INSUFFICIENT, PRICE_IMPACT_TOO_HIGH})
 LOG = logging.getLogger("scalp_opportunity_watch")
 
 
@@ -51,6 +49,7 @@ def is_high_quality_near_pass(row: dict, econ: ScalpEconomics) -> bool:
     reject = row.get("reject_reason") or ""
     if reject in HQ_NEAR_PASS_DISALLOWED:
         return False
+
     def _pct(key: str, default: float = 999.0) -> float:
         val = row.get(key)
         return float(val) if val is not None else default
@@ -71,17 +70,13 @@ def is_high_quality_near_pass(row: dict, econ: ScalpEconomics) -> bool:
     if float(row.get("projected_surplus") or -1.0) < 0.0:
         return False
     dist = float((row.get("distance_to_pass") or {}).get("distance_to_pass_pct") or 999.0)
-    if dist > NEAR_PASS_THRESHOLD:
-        return False
-    return True
+    return not dist > NEAR_PASS_THRESHOLD
 
 
 def build_arm_event(row: dict, *, arm_reason: str) -> dict:
     dist = row.get("distance_to_pass") or {}
     return {
-        "event": "HIGH_QUALITY_NEAR_PASS_ARMED"
-        if arm_reason == "HIGH_QUALITY_NEAR_PASS"
-        else arm_reason,
+        "event": "HIGH_QUALITY_NEAR_PASS_ARMED" if arm_reason == "HIGH_QUALITY_NEAR_PASS" else arm_reason,
         "arm_reason": arm_reason,
         "arm_symbol": row.get("symbol"),
         "arm_distance_to_pass": dist.get("distance_to_pass_pct"),
@@ -203,11 +198,7 @@ def _update_best(stats: WatchStats, row: dict) -> None:
     if current is None:
         setattr(stats, key, row)
         return
-    cur_dist = (
-        -1.0
-        if current.get("preflight_pass")
-        else float(current["distance_to_pass"]["distance_to_pass_pct"])
-    )
+    cur_dist = -1.0 if current.get("preflight_pass") else float(current["distance_to_pass"]["distance_to_pass_pct"])
     if dist < cur_dist:
         setattr(stats, key, row)
 
@@ -260,11 +251,7 @@ def watch_loop(
                     )
                     if log_file:
                         log_file.write(json.dumps(event, default=str) + "\n")
-                    if (
-                        arm_on_high_quality_near_pass
-                        and arm_this_tick is None
-                        and is_high_quality_near_pass(row, econ)
-                    ):
+                    if arm_on_high_quality_near_pass and arm_this_tick is None and is_high_quality_near_pass(row, econ):
                         arm_this_tick = build_arm_event(row, arm_reason="HIGH_QUALITY_NEAR_PASS")
                         stats.hq_near_pass_arm_count += 1
                 elif opp == "OPPORTUNITY_PASS":

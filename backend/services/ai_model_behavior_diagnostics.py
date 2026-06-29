@@ -87,7 +87,7 @@ def _avg_confidence_by_class(
 ) -> dict[str, float | None]:
     buckets: dict[str, list[float]] = {"BUY": [], "HOLD": [], "SELL": []}
     if proba is None:
-        return {k: None for k in buckets}
+        return dict.fromkeys(buckets)
     for i, pred in enumerate(preds):
         action = _action_from_pred(int(pred), n_classes)
         idx = int(pred)
@@ -95,10 +95,7 @@ def _avg_confidence_by_class(
             idx = 1 if int(pred) == 1 else 0
         if 0 <= idx < proba.shape[1]:
             buckets[action].append(float(proba[i, idx]))
-    return {
-        k: round(sum(v) / len(v), 6) if v else None
-        for k, v in buckets.items()
-    }
+    return {k: round(sum(v) / len(v), 6) if v else None for k, v in buckets.items()}
 
 
 def _row_follow_pnl(pred: int, net: float, n_classes: int) -> float:
@@ -120,7 +117,7 @@ def _compare_rows(
     pac_improved = 0
     pac_worsened = 0
     disagreement = 0
-    for a_p, c_p, label, net in zip(active_preds, candidate_preds, y, nets):
+    for a_p, c_p, label, net in zip(active_preds, candidate_preds, y, nets, strict=False):
         if int(a_p) != int(c_p):
             disagreement += 1
         a_ok = int(a_p) == int(label)
@@ -204,7 +201,7 @@ def _simulate_thresholds(
         missed_good = int(np.sum((preds == 0) & (y_arr == 1)))
         followed: list[float] = []
         bad = 0
-        for pred, net in zip(preds, nets_arr):
+        for pred, net in zip(preds, nets_arr, strict=False):
             if int(pred) == 1:
                 followed.append(float(net))
                 if float(net) <= 0:
@@ -233,7 +230,7 @@ def _class_balance_summary(y: np.ndarray) -> dict[str, Any]:
     y_arr = np.asarray(y, dtype=np.int64).reshape(-1)
     buy = int(np.sum(y_arr == 1))
     hold = int(np.sum(y_arr == 0))
-    total = int(len(y_arr))
+    total = len(y_arr)
     return {
         "BUY": buy,
         "HOLD": hold,
@@ -305,7 +302,7 @@ def build_symbol_model_behavior(
         feature_dim=FEATURE_DIM_V2,
         db_path=db_path,
     )
-    sample_count = int(len(y))
+    sample_count = len(y)
     holdout_low_confidence = sample_count < MIN_HOLDOUT_CONFIDENCE_SAMPLES
     active_path = per_coin_artifact_file(models_dir, sid, sym)
     cand_path = _latest_candidate_path(Path(version_dir), sym)
@@ -318,9 +315,7 @@ def build_symbol_model_behavior(
         "holdout_eligible_rows": int(eligible),
         "holdout_sample_count": sample_count,
         "holdout_low_confidence": holdout_low_confidence,
-        "holdout_confidence_status": (
-            "low_confidence" if holdout_low_confidence else "adequate"
-        ),
+        "holdout_confidence_status": ("low_confidence" if holdout_low_confidence else "adequate"),
         "holdout_target_samples": 20,
         "holdout_buy_label_count": int(np.sum(y == 1)) if sample_count else 0,
         "min_holdout_confidence_samples": MIN_HOLDOUT_CONFIDENCE_SAMPLES,
@@ -352,8 +347,6 @@ def build_symbol_model_behavior(
         "candidate_always_buy": False,
         "candidate_always_hold": False,
         "candidate_not_always_hold": False,
-        "holdout_target_samples": 20,
-        "holdout_buy_label_count": 0,
         "candidate_class_weight_mode": None,
         "candidate_train_class_distribution": None,
         "training_data_balance": None,
@@ -404,7 +397,7 @@ def build_symbol_model_behavior(
     cand_conf = _avg_confidence_by_class(cand_preds, cand_proba, cand_classes)
     cand_bias = _buy_bias_status(cand_dist, sample_count)
     cand_false = _false_buy_stats(cand_preds, y)
-    always_buy = cand_dist["BUY"] >= sample_count and sample_count > 0
+    always_buy = cand_dist["BUY"] >= sample_count > 0
     compare = _compare_rows(active_preds, cand_preds, y, nets, n_classes)
 
     from backend.services.ai_model_promotion_holdout import build_holdout_validation_metrics
@@ -430,14 +423,12 @@ def build_symbol_model_behavior(
             "candidate_threshold_simulation": _simulate_thresholds(cand_proba, y, nets, cand_classes),
             "candidate_not_always_buy": not always_buy,
             "candidate_always_buy": always_buy,
-            "candidate_always_hold": cand_dist["HOLD"] >= sample_count and sample_count > 0,
-            "candidate_not_always_hold": not (cand_dist["HOLD"] >= sample_count and sample_count > 0),
+            "candidate_always_hold": cand_dist["HOLD"] >= sample_count > 0,
+            "candidate_not_always_hold": not (cand_dist["HOLD"] >= sample_count > 0),
             "candidate_class_weight_mode": candidate_art.get("class_weight_mode"),
             "candidate_train_class_distribution": candidate_art.get("train_class_distribution"),
             "training_data_balance": candidate_art.get("training_balance"),
-            "raw_self_supervised_class_distribution": (candidate_art.get("training_balance") or {}).get(
-                "raw_self_supervised"
-            ),
+            "raw_self_supervised_class_distribution": (candidate_art.get("training_balance") or {}).get("raw_self_supervised"),
             "raw_outcome_class_distribution": (candidate_art.get("training_balance") or {}).get("raw_outcome"),
             "final_training_class_distribution": (candidate_art.get("training_balance") or {}).get("final_training"),
             "effective_sample_weights": {
@@ -497,13 +488,7 @@ def build_model_behavior_report(
     cand_always_buy = [s for s, d in symbols.items() if d.get("candidate_always_buy")]
     cand_always_hold = [s for s, d in symbols.items() if d.get("candidate_always_hold")]
     cand_not_always_buy = [s for s, d in symbols.items() if d.get("candidate_not_always_buy")]
-    tied = [
-        s
-        for s, d in symbols.items()
-        if d.get("disagreement_count") == 0
-        and d.get("diagnostics_ok")
-        and d.get("candidate_path")
-    ]
+    tied = [s for s, d in symbols.items() if d.get("disagreement_count") == 0 and d.get("diagnostics_ok") and d.get("candidate_path")]
     return {
         "strategy": "day",
         "feature_version": FEATURE_VERSION_DAY_HTF,

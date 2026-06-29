@@ -223,7 +223,7 @@ def context_vector_day_full_mtf(
     sentiment = _clip(_safe_float(ctx.get("ctx_sentiment_fear_greed"), 0.0), -1.0, 1.0)
     regime_sent_blend = _clip((regime_signed + sentiment) / 2.0, -1.0, 1.0)
 
-    out = front + [mon0, mon1, _clip(mean_ema, 0.0, 1.0)] + [chg_24, vol_24_log, rel_vol, spread, depth, rs_mean, btc_dom, regime_sent_blend]
+    out = [*front, mon0, mon1, _clip(mean_ema, 0.0, 1.0), chg_24, vol_24_log, rel_vol, spread, depth, rs_mean, btc_dom, regime_sent_blend]
     assert len(out) == len(CONTEXT_DIMS_DAY_FULL), f"context_vector_day_full_mtf produced {len(out)} dims != {CONTEXT_DIMS_DAY_FULL}"
     return out
 

@@ -9,14 +9,14 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.calibration_profiles import apply_profile  # noqa: E402
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
+from backend.services.binance_scalp.calibration_profiles import apply_profile
+from backend.services.binance_scalp.economics import ScalpEconomics
 
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 HOURS = 6
@@ -31,10 +31,7 @@ def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
     bars: list[dict] = []
     cursor = start_ms
     while cursor < end_ms:
-        url = (
-            f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m"
-            f"&startTime={cursor}&endTime={end_ms}&limit=1000"
-        )
+        url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m&startTime={cursor}&endTime={end_ms}&limit=1000"
         proc = subprocess.run(
             ["curl", "-s", "--max-time", "30", url],
             capture_output=True,
@@ -115,9 +112,7 @@ def entry_pass(symbol: str, feat: dict, econ: ScalpEconomics) -> bool:
         return False
     req = econ.entry_required_gross_edge_pct(feat["spread_pct"], 0.0, 0.0)
     surplus = feat["projected_gross"] - req
-    if feat["projected_gross"] < req or surplus < econ.min_projected_surplus_pct:
-        return False
-    return True
+    return not (feat["projected_gross"] < req or surplus < econ.min_projected_surplus_pct)
 
 
 def rank_score_v2(symbol: str, feat: dict, econ: ScalpEconomics) -> float:
@@ -238,19 +233,17 @@ def main() -> int:
         r["xrp_cap_pct"] = cap
         r["blocks_losing_xrp_0945"] = cap < 0.000945
         r["allows_winning_xrp_0603"] = cap >= 0.000603
-        xrp_cap_compare[f"{cap*100:.2f}%"] = r
+        xrp_cap_compare[f"{cap * 100:.2f}%"] = r
 
     best_xrp_cap = max(
         XRP_CAPS,
-        key=lambda c: xrp_cap_compare[f"{c*100:.2f}%"]["net_pnl_usd"],
+        key=lambda c: xrp_cap_compare[f"{c * 100:.2f}%"]["net_pnl_usd"],
     )
     best_econ = replace(base, paper_spread_caps=caps_with_xrp(best_xrp_cap))
 
     stale_compare: dict[str, dict] = {}
     for stale in STALE_TIMEOUTS:
-        stale_compare[f"{stale}s"] = simulate(
-            aligned, series, idx_by_ts, best_econ, stale_sec=stale
-        )
+        stale_compare[f"{stale}s"] = simulate(aligned, series, idx_by_ts, best_econ, stale_sec=stale)
         stale_compare[f"{stale}s"]["stale_timeout_sec"] = stale
 
     best_stale = max(STALE_TIMEOUTS, key=lambda s: stale_compare[f"{s}s"]["net_pnl_usd"])

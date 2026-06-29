@@ -1,6 +1,6 @@
 """
 DAY trading model input — **124 dims** from real **native 1m** OHLCV (named FEATURE_MAPPING
-indicators) + **21 dims** CONTEXT_DIMS_DAY_FULL (slopes × every DAY_ACTIVE_TF, month-from-daily
+indicators) + **21 dims** CONTEXT_DIMS_DAY_FULL (slopes x every DAY_ACTIVE_TF, month-from-daily
 scalars, macro tail from Redis ai_context).
 
 This replaces the retired v4 “stack four 31-block HTFs into 124” layout.
@@ -114,7 +114,7 @@ def compact_htf_block_31(ohlcv: list[list]) -> list[float]:
     out[12] = _safe(float(dd), 0.0)
 
     rng = float(hi[-1] - lo[-1]) + 1e-12
-    body = abs(float(c[-1] - op[-1]))
+    abs(float(c[-1] - op[-1]))
     out[13] = _safe((float(hi[-1]) - max(float(c[-1]), float(op[-1]))) / rng, 0.0)
     out[14] = _safe((min(float(c[-1]), float(op[-1])) - float(lo[-1])) / rng, 0.0)
 
@@ -165,6 +165,8 @@ def build_day_htf_feature_vector_145(
     orderbook: dict[str, Any] | None,
     sentiment: dict[str, Any] | None,
     ai_context: dict[str, Any] | None,
+    tech_provenance: dict[str, dict[str, Any]] | None = None,
+    orderbook_age_sec: float | None = None,
 ) -> list[float]:
     """
     145 dims — v5 day: FEATURE_MAPPING technicals on native **1m** + CONTEXT_DIMS_DAY_FULL (21).
@@ -181,6 +183,8 @@ def build_day_htf_feature_vector_145(
         orderbook=orderbook,
         ohlcv_1d=ohlcv_1d,
         sentiment=sentiment,
+        provenance=tech_provenance,
+        orderbook_age_sec=orderbook_age_sec,
     )
     if len(tech124) != AI_FEATURE_DIM_V1:
         raise ValueError(f"day tech block expected {AI_FEATURE_DIM_V1}, got {len(tech124)}")

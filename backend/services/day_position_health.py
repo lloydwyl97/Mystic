@@ -59,22 +59,22 @@ def _redis_prices_and_signals() -> tuple[dict[str, float], list[dict[str, Any]]]
             raw_px = r.hget(f"price:{base}", "v")
             if raw_px:
                 try:
-                    prices[_api_to_ccxt(sym)] = float(
-                        raw_px.decode() if isinstance(raw_px, bytes) else raw_px
-                    )
+                    prices[_api_to_ccxt(sym)] = float(raw_px.decode() if isinstance(raw_px, bytes) else raw_px)
                 except (TypeError, ValueError):
                     pass
             raw_sig = r.hgetall(f"ai_signal:day:{sym}") or {}
             if not raw_sig:
                 continue
-            def _f(k: str) -> float:
-                v = raw_sig.get(k) or raw_sig.get(k.encode() if isinstance(k, str) else k)
+
+            def _f(k: str, _sig: dict = raw_sig) -> float:
+                v = _sig.get(k) or _sig.get(k.encode() if isinstance(k, str) else k)
                 if v is None:
                     return 0.0
                 try:
                     return float(v.decode() if isinstance(v, bytes) else v)
                 except (TypeError, ValueError):
                     return 0.0
+
             conf = _f("winner_probability") or _f("confidence")
             rs = _f("ctx_rs_btc") or _f("ctx_rs_eth")
             side = str(raw_sig.get("prediction") or raw_sig.get("argmax_action") or "").upper()
@@ -247,10 +247,7 @@ def build_portfolio_health(
     last_bar_skip_reason: str | None = None,
 ) -> dict[str, Any]:
     _, signals = _redis_prices_and_signals()
-    active = [
-        p for p in open_positions.values()
-        if getattr(p, "status", "ACTIVE") != "DUST_PENDING"
-    ]
+    active = [p for p in open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING"]
     open_count = len(active)
     slots_free = max(0, int(max_open_positions) - open_count)
     deployable = cash_balance >= min_notional and slots_free > 0
@@ -325,11 +322,7 @@ def build_portfolio_health(
             "last_execution_block": (last_execution_block or {}).get("reject_reason"),
             "trapped_lagging": any(p.get("state") == STATE_LAGGING for p in positions_health),
         }
-        if (
-            idle_reason == "CAPITAL_AVAILABLE_AWAITING_BAR_ENTRY"
-            and spread_blocked >= 3
-            and len(spread_passing) <= 1
-        ):
+        if idle_reason == "CAPITAL_AVAILABLE_AWAITING_BAR_ENTRY" and spread_blocked >= 3 and len(spread_passing) <= 1:
             if spread_passing:
                 idle_reason = f"SPREAD_PREFLIGHT_TIGHT_CAP_ONLY_{spread_passing[0]}_PASSES"
             else:
@@ -501,10 +494,7 @@ def _record_lagging_opportunity_cost(payload: dict[str, Any], *, db_path: str = 
             from backend.services.ai_missed_opportunity_observer import record_missed_opportunity_observation
 
             record_missed_opportunity_observation(
-                block_reason=(
-                    f"DAY_OPPORTUNITY_COST:LAGGING_VS_BASKET:"
-                    f"{pos.get('symbol')} rank={pos.get('rs_rank')} alt={alt}"
-                ),
+                block_reason=(f"DAY_OPPORTUNITY_COST:LAGGING_VS_BASKET:{pos.get('symbol')} rank={pos.get('rs_rank')} alt={alt}"),
                 attempted_symbol=str(alt or pos.get("symbol") or ""),
                 active_positions=payload.get("open_positions_count"),
                 max_positions=payload.get("max_open_positions"),

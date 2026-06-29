@@ -44,7 +44,7 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
-REPAIR_ADD_ENABLED: Final[bool] = _env_bool("REPAIR_ADD_ENABLED", True)
+REPAIR_ADD_ENABLED: Final[bool] = _env_bool("REPAIR_ADD_ENABLED", False)
 MAX_REPAIR_ADDS_PER_POSITION: Final[int] = _env_int("MAX_REPAIR_ADDS_PER_POSITION", 1)
 REPAIR_ADD_TRIGGER_NET_PNL: Final[float] = _env_float("REPAIR_ADD_TRIGGER_NET_PNL", -0.015)
 REPAIR_ADD_MIN_CONFIDENCE: Final[float] = _env_float("REPAIR_ADD_MIN_CONFIDENCE", 0.80)

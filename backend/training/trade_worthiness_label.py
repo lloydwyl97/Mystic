@@ -7,9 +7,8 @@ economics and is not a dead / no-traction loser at the early check.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 import os
+from collections.abc import Sequence
 
 import numpy as np
 

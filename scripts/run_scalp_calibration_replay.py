@@ -9,17 +9,17 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.calibration_profiles import (  # noqa: E402
+from backend.services.binance_scalp.calibration_profiles import (
     CALIBRATION_PROFILES,
     apply_profile,
 )
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
+from backend.services.binance_scalp.economics import ScalpEconomics
 
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 HOURS = 4
@@ -31,10 +31,7 @@ def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
     bars: list[dict] = []
     cursor = start_ms
     while cursor < end_ms:
-        url = (
-            f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m"
-            f"&startTime={cursor}&endTime={end_ms}&limit=1000"
-        )
+        url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m&startTime={cursor}&endTime={end_ms}&limit=1000"
         proc = subprocess.run(
             ["curl", "-s", "--max-time", "30", url],
             capture_output=True,
@@ -81,17 +78,8 @@ def momentum_pass(bars: list[dict], idx: int) -> bool:
 
     mid15 = chg(b0["close"], b1["close"])
     mid30 = chg(b0["close"], b2["close"])
-    up = sum(
-        1
-        for j in range(idx - 5, idx)
-        if j >= 1 and bars[j]["close"] > bars[j - 1]["close"]
-    )
-    return (
-        mid15 >= 0.00003
-        and mid30 > 0
-        and up >= 3
-        and not (abs(mid15) <= 0.00002)
-    )
+    up = sum(1 for j in range(idx - 5, idx) if j >= 1 and bars[j]["close"] > bars[j - 1]["close"])
+    return mid15 >= 0.00003 and mid30 > 0 and up >= 3 and not (abs(mid15) <= 0.00002)
 
 
 def gate_pass(
@@ -114,9 +102,7 @@ def gate_pass(
     return True, "PASS"
 
 
-def analyze_symbol_profile(
-    symbol: str, bars: list[dict], econ: ScalpEconomics, profile: str
-) -> dict:
+def analyze_symbol_profile(symbol: str, bars: list[dict], econ: ScalpEconomics, profile: str) -> dict:
     if len(bars) < 10:
         return {"symbol": symbol, "profile": profile, "error": "insufficient_bars"}
 
@@ -152,15 +138,10 @@ def analyze_symbol_profile(
         )
 
     n = len(windows)
-    move_counts = {
-        f"+{int(t * 10000) / 100}%": sum(1 for w in windows if w["max_fav_pct"] >= t)
-        for t in MOVE_THRESHOLDS
-    }
+    move_counts = {f"+{int(t * 10000) / 100}%": sum(1 for w in windows if w["max_fav_pct"] >= t) for t in MOVE_THRESHOLDS}
     profitable = sum(1 for w in windows if w["profit_hit"])
     gate_pass_n = sum(1 for w in windows if w["gate_pass"])
-    gate_blocked_profitable = sum(
-        1 for w in windows if w["profit_hit"] and not w["gate_pass"]
-    )
+    gate_blocked_profitable = sum(1 for w in windows if w["profit_hit"] and not w["gate_pass"])
 
     sim = _simulate_trades(bars, econ)
     return {
@@ -175,11 +156,7 @@ def analyze_symbol_profile(
         "gate_blocked_profitable_windows": gate_blocked_profitable,
         "avg_spread_pct": round(statistics.mean(spreads) * 100, 4) if spreads else 0,
         "median_spread_pct": round(statistics.median(spreads) * 100, 4) if spreads else 0,
-        "spread_cap_pass_pct": round(
-            100 * sum(1 for w in windows if w["spread_pct"] <= econ.spread_cap_pct) / n, 2
-        )
-        if n
-        else 0,
+        "spread_cap_pass_pct": round(100 * sum(1 for w in windows if w["spread_pct"] <= econ.spread_cap_pct) / n, 2) if n else 0,
         "top_gate_blocks": _top_blocks(windows),
         "simulated_trades": sim,
     }
@@ -264,9 +241,7 @@ def main() -> int:
         econ = apply_profile(base, profile)
         sym_results = []
         for sym in SYMBOLS:
-            sym_results.append(
-                analyze_symbol_profile(sym, klines[sym], econ, profile)
-            )
+            sym_results.append(analyze_symbol_profile(sym, klines[sym], econ, profile))
         out["profiles"][profile] = sym_results
         total_pass = sum(r.get("gate_pass_windows", 0) for r in sym_results)
         total_prof = sum(r.get("profitable_after_fees_windows", 0) for r in sym_results)

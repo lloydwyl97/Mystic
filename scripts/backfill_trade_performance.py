@@ -13,7 +13,6 @@ if str(ROOT) not in sys.path:
 
 from backend.services.trade_performance_tracker import backfill_trade_performance_from_paper_trades
 
-
 if __name__ == "__main__":
     result = backfill_trade_performance_from_paper_trades()
     print(json.dumps(result, indent=2))

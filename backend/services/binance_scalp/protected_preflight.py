@@ -111,12 +111,7 @@ def run_scalp_preflight(
             limit_sell,
         )
 
-    spread_cap = (
-        econ.spread_cap_for_symbol(snap.symbol)
-        if not config.scalp_live
-        and (config.calibration_mode or config.scalp_paper_enabled)
-        else econ.spread_cap_pct
-    )
+    spread_cap = econ.spread_cap_for_symbol(snap.symbol) if not config.scalp_live and (config.calibration_mode or config.scalp_paper_enabled) else econ.spread_cap_pct
     if spread > spread_cap:
         return ScalpPreflightResult(
             False,
@@ -133,9 +128,7 @@ def run_scalp_preflight(
 
     buy_walk = walk_buy_notional(snap.asks, notional, snap.best_ask)
     buy_impact = buy_walk.impact_pct
-    sell_qty = buy_walk.filled_qty if buy_walk.filled_qty > 0 else (
-        notional / limit_buy if limit_buy > 0 else 0.0
-    )
+    sell_qty = buy_walk.filled_qty if buy_walk.filled_qty > 0 else (notional / limit_buy if limit_buy > 0 else 0.0)
     sell_walk = walk_sell_qty(snap.bids, sell_qty, snap.best_bid)
     sell_impact = sell_walk.impact_pct
 
@@ -173,7 +166,6 @@ def run_scalp_preflight(
                 expected_avg_fill=buy_walk.expected_avg_fill,
                 levels_consumed=buy_walk.levels_consumed,
             )
-        imb = snap.order_book_imbalance if snap.order_book_imbalance is not None else 0.0
         estimate = compute_momentum_gross_estimate(snap, momentum, econ)
         projected = estimate.projected_gross_move_pct
         costs = econ.roundtrip_cost_pct(spread, buy_impact, sell_impact)
@@ -207,9 +199,7 @@ def run_scalp_preflight(
                 reachability=reach,
             )
 
-        if not apply_entry_gate and (
-            expected_net <= 0 or expected_net < econ.min_net_edge_pct
-        ):
+        if not apply_entry_gate and (expected_net <= 0 or expected_net < econ.min_net_edge_pct):
             return ScalpPreflightResult(
                 False,
                 NET_EDGE_BELOW_MIN,
@@ -286,11 +276,7 @@ def run_scalp_preflight(
                 limit_buy,
                 limit_sell,
             )
-        entry_buy_i = (
-            float(entry_buy_impact_pct)
-            if entry_buy_impact_pct is not None
-            else buy_impact
-        )
+        entry_buy_i = float(entry_buy_impact_pct) if entry_buy_impact_pct is not None else buy_impact
         sell_fill = sw.expected_avg_fill if sw.expected_avg_fill > 0 else limit_sell
         expected_net = 0.0
         if entry_price and entry_price > 0:

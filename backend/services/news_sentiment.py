@@ -96,9 +96,7 @@ def article_matches_base(text: str, base: str) -> bool:
     for alias in aliases:
         if re.search(rf"\b{re.escape(alias)}\b", t):
             return True
-    if f"{coin.lower()}usdt" in t.replace("/", "").replace("-", ""):
-        return True
-    return False
+    return f"{coin.lower()}usdt" in t.replace("/", "").replace("-", "")
 
 
 @dataclass

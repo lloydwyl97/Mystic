@@ -421,6 +421,21 @@ class AIMarketContextService:
                     ask_qty = sum(float(a[1]) for a in asks[:10])
                     denom = bid_qty + ask_qty
                     imb = (bid_qty - ask_qty) / denom if denom > 0 else 0.0
+                    if self.redis is not None and spread_pct > 0:
+                        with contextlib.suppress(Exception):
+                            from backend.services.order_book_service import (
+                                order_book_features_from_bids_asks,
+                                write_orderbook_redis_async,
+                            )
+                            from backend.utils.canonical_symbol_formatter import CanonicalSymbolFormatter
+
+                            feats = order_book_features_from_bids_asks(bids, asks, depth_levels=10)
+                            await write_orderbook_redis_async(
+                                CanonicalSymbolFormatter.to_base(symbol),
+                                feats,
+                                self.redis,
+                                source="rest_depth",
+                            )
                     return spread_pct, max(-1.0, min(1.0, imb))
         return 0.0, 0.0
 
@@ -434,7 +449,7 @@ class AIMarketContextService:
             for sym in self.symbols:
                 pipe.hget(REDIS_KEY_AI_CONTEXT.format(symbol=sym), "ts_utc")
             vals = await pipe.execute()
-            for sym, raw in zip(self.symbols, vals):
+            for sym, raw in zip(self.symbols, vals, strict=False):
                 if raw is None or str(raw).strip() == "":
                     out[sym] = None
                 else:
@@ -496,7 +511,7 @@ class AIMarketContextService:
         rest_24 = [sym for sym in self.symbols if sym not in all_24h]
         if rest_24:
             chunks = await asyncio.gather(*[self._fetch_24h(s) for s in rest_24], return_exceptions=True)
-            for sym, result in zip(rest_24, chunks):
+            for sym, result in zip(rest_24, chunks, strict=False):
                 if isinstance(result, dict):
                     all_24h[sym] = result
                 else:
@@ -747,7 +762,7 @@ async def hydrate_ai_context_payload(symbol_pair: str, payload: dict[str, str] |
             syms = get_trading_symbols()
             parts = await asyncio.gather(*[svc._fetch_24h(s) for s in syms], return_exceptions=True)
             merged: dict[str, dict[str, float]] = {}
-            for s, p in zip(syms, parts):
+            for s, p in zip(syms, parts, strict=False):
                 if isinstance(p, dict):
                     merged[s] = p
                 else:

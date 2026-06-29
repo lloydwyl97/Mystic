@@ -50,21 +50,11 @@ class ScalpEconomics:
             paper_spread_caps=None,
             impact_cap_pct=float(os.getenv("SCALP_IMPACT_CAP_PCT", "0.0005")),
             min_net_edge_pct=float(os.getenv("SCALP_MIN_NET_EDGE_PCT", "0.0015")),
-            net_profit_target_pct=float(
-                os.getenv("SCALP_NET_PROFIT_TARGET_PCT", "0.0025")
-            ),
-            entry_edge_buffer_pct=float(
-                os.getenv("SCALP_ENTRY_EDGE_BUFFER_PCT", "0.001")
-            ),
-            entry_required_gross_edge_pct_env=_optional_float(
-                "SCALP_ENTRY_REQUIRED_GROSS_EDGE_PCT"
-            ),
-            min_projected_surplus_pct=float(
-                os.getenv("SCALP_MIN_PROJECTED_SURPLUS_PCT", "0.0005")
-            ),
-            stale_scalp_timeout_sec=int(
-                os.getenv("SCALP_STALE_TIMEOUT_SEC", "300")
-            ),
+            net_profit_target_pct=float(os.getenv("SCALP_NET_PROFIT_TARGET_PCT", "0.0025")),
+            entry_edge_buffer_pct=float(os.getenv("SCALP_ENTRY_EDGE_BUFFER_PCT", "0.001")),
+            entry_required_gross_edge_pct_env=_optional_float("SCALP_ENTRY_REQUIRED_GROSS_EDGE_PCT"),
+            min_projected_surplus_pct=float(os.getenv("SCALP_MIN_PROJECTED_SURPLUS_PCT", "0.0005")),
+            stale_scalp_timeout_sec=int(os.getenv("SCALP_STALE_TIMEOUT_SEC", "300")),
             fee_model_verified=_bool("SCALP_FEE_MODEL_VERIFIED", False),
             use_maker_only=_bool("SCALP_USE_MAKER_ONLY", False),
         )
@@ -84,9 +74,7 @@ class ScalpEconomics:
         return self.maker_fee_pct if exit_maker else self.taker_fee_pct
 
     def roundtrip_fee_for_mode(self, *, entry_maker: bool, exit_maker: bool) -> float:
-        return self.entry_fee_pct(entry_maker=entry_maker) + self.exit_fee_pct(
-            exit_maker=exit_maker
-        )
+        return self.entry_fee_pct(entry_maker=entry_maker) + self.exit_fee_pct(exit_maker=exit_maker)
 
     def break_even_move_pct(
         self,
@@ -101,13 +89,7 @@ class ScalpEconomics:
             entry_maker = self.use_maker_only
         if exit_maker is None:
             exit_maker = self.use_maker_only
-        return (
-            self.roundtrip_fee_for_mode(entry_maker=entry_maker, exit_maker=exit_maker)
-            + spread_pct
-            + buy_impact_pct
-            + sell_impact_pct
-            + self.slippage_buffer_pct
-        )
+        return self.roundtrip_fee_for_mode(entry_maker=entry_maker, exit_maker=exit_maker) + spread_pct + buy_impact_pct + sell_impact_pct + self.slippage_buffer_pct
 
     def required_gross_move_for_min_edge_pct(
         self,
@@ -118,13 +100,16 @@ class ScalpEconomics:
         entry_maker: bool | None = None,
         exit_maker: bool | None = None,
     ) -> float:
-        return self.break_even_move_pct(
-            spread_pct,
-            buy_impact_pct,
-            sell_impact_pct,
-            entry_maker=entry_maker,
-            exit_maker=exit_maker,
-        ) + self.min_net_edge_pct
+        return (
+            self.break_even_move_pct(
+                spread_pct,
+                buy_impact_pct,
+                sell_impact_pct,
+                entry_maker=entry_maker,
+                exit_maker=exit_maker,
+            )
+            + self.min_net_edge_pct
+        )
 
     def is_fee_model_verified(self) -> bool:
         return self.fee_model_verified
@@ -143,11 +128,7 @@ class ScalpEconomics:
         sell_impact_pct: float,
     ) -> float:
         """net_profit_target + roundtrip costs + buffer (Phase 3c entry gate)."""
-        computed = (
-            self.net_profit_target_pct
-            + self.roundtrip_cost_pct(spread_pct, buy_impact_pct, sell_impact_pct)
-            + self.entry_edge_buffer_pct
-        )
+        computed = self.net_profit_target_pct + self.roundtrip_cost_pct(spread_pct, buy_impact_pct, sell_impact_pct) + self.entry_edge_buffer_pct
         if self.entry_required_gross_edge_pct_env is not None:
             return max(computed, self.entry_required_gross_edge_pct_env)
         return computed
@@ -193,18 +174,10 @@ class ScalpEconomics:
         if entry_price <= 0:
             return -1.0
         gross = (sell_fill_price - entry_price) / entry_price
-        costs = (
-            self.entry_fee_pct()
-            + self.exit_fee_pct()
-            + self.slippage_buffer_pct * 2.0
-            + entry_buy_impact_pct
-            + exit_sell_impact_pct
-        )
+        costs = self.entry_fee_pct() + self.exit_fee_pct() + self.slippage_buffer_pct * 2.0 + entry_buy_impact_pct + exit_sell_impact_pct
         return gross - costs
 
-    def projected_entry_edge_pct(
-        self, spread_pct: float, order_book_imbalance: float
-    ) -> float:
+    def projected_entry_edge_pct(self, spread_pct: float, order_book_imbalance: float) -> float:
         """Rule-based scalp edge proxy — no ML; uses book imbalance only."""
         imb = max(0.0, float(order_book_imbalance))
         projected = imb * spread_pct * 8.0

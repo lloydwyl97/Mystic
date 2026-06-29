@@ -106,9 +106,9 @@ def rank_entry_candidates(
     top = scored[0][0] if scored else {}
     reason = (
         f"ranked {top.get('symbol')}: score={top.get('score')} "
-        f"surplus={top.get('projected_surplus_pct', 0)*100:.4f}% reach={top.get('target_reachability')} "
-        f"spread={top.get('spread_pct', 0)*100:.4f}% cap_util={top.get('spread_cap_util')} "
-        f"range={top.get('recent_range_pct', 0)*100:.4f}% "
+        f"surplus={top.get('projected_surplus_pct', 0) * 100:.4f}% reach={top.get('target_reachability')} "
+        f"spread={top.get('spread_pct', 0) * 100:.4f}% cap_util={top.get('spread_cap_util')} "
+        f"range={top.get('recent_range_pct', 0) * 100:.4f}% "
         f"momentum={top.get('momentum_confirmed')} breakout={top.get('breakout_confirmed')} "
         f"barely_over={top.get('barely_over_required')}"
         if top

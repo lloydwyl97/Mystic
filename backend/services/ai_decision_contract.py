@@ -37,7 +37,7 @@ FEATURE_VERSION_CURRENT: Final[int] = 5
 # v2: 124 technical + 21 context (145).
 # v3: day — primary-clock OHLCV + v2-shaped context (145).
 # v4: day — stacked HTF 31-blocks + legacy CONTEXT_DIMS_V2 (145).
-# v5: day — 124 named indicators from **native 1m** + 21-dim CONTEXT_DIMS_DAY_FULL (slopes×10 TF + month + macro tail); still 145.
+# v5: day — 124 named indicators from **native 1m** + 21-dim CONTEXT_DIMS_DAY_FULL (slopesx10 TF + month + macro tail); still 145.
 FEATURE_VERSION_DAY_HTF: Final[int] = 5
 FEATURE_VERSION_DAY_FULL_MTF: Final[int] = 5
 AI_FEATURE_DIM_V1: Final[int] = 124
@@ -202,7 +202,7 @@ def _fear_greed_fetch_interval_sec() -> int:
 AI_SENTIMENT_LOOP_SEC: Final[int] = _fear_greed_fetch_interval_sec()
 
 
-# Fundamental / sentiment slots in the **first 124 dims** (FEATURE_MAPPING 81–90).
+# Fundamental / sentiment slots in the **first 124 dims** (FEATURE_MAPPING 81-90).
 # Wired by ``backend.services.ai_feature_fundamentals`` into the sentiment dict consumed by
 # ``build_feature_vector_124`` — same inputs are used for v2 (145 = 124 base + 21 context).
 LEGACY_SENTIMENT_FEATURE_NAMES: Final[tuple[str, ...]] = (
@@ -218,7 +218,7 @@ LEGACY_SENTIMENT_FEATURE_NAMES: Final[tuple[str, ...]] = (
     "market_dominance",
 )
 
-# Vector indices 80–89 (0-based) == FEATURE_MAPPING 81–90 (1-based). Same block as LEGACY_SENTIMENT_*.
+# Vector indices 80-89 (0-based) == FEATURE_MAPPING 81-90 (1-based). Same block as LEGACY_SENTIMENT_*.
 SENTIMENT_BLOCK_ZERO_BASE_START: Final[int] = 80
 SENTIMENT_BLOCK_ZERO_BASE_END: Final[int] = 89  # inclusive
 

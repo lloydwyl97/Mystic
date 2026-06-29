@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay paper scalp strategies over recent Binance.US 1m klines (4–8h, all symbols)."""
+"""Replay paper scalp strategies over recent Binance.US 1m klines (4-8h, all symbols)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -24,23 +24,23 @@ os.environ.setdefault("SCALP_PAPER_ENABLED", "true")
 os.environ.setdefault("SCALP_FEE_MODEL_VERIFIED", "true")
 os.environ.setdefault("SCALP_PRODUCTS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")
 
-from backend.services.binance_scalp.calibration_profiles import (  # noqa: E402
+from backend.services.binance_scalp.calibration_profiles import (
     apply_profile,
     economics_for_config,
 )
-from backend.services.binance_scalp.config import ScalpConfig  # noqa: E402
-from backend.services.binance_scalp.exit_manager import (  # noqa: E402
+from backend.services.binance_scalp.config import ScalpConfig
+from backend.services.binance_scalp.exit_manager import (
+    DECISION_SELL,
     EXIT_MOMENTUM_FAILED,
     EXIT_NET_PROFIT_TARGET,
     EXIT_SETUP_INVALIDATED,
-    DECISION_SELL,
     PositionTrack,
     evaluate_exit,
 )
-from backend.services.binance_scalp.market_reader import MarketSnapshot  # noqa: E402
-from backend.services.binance_scalp.momentum_tracker import MomentumTracker  # noqa: E402
-from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter  # noqa: E402
-from backend.services.binance_scalp.strategies import ALL_STRATEGIES, STRATEGY_NAMES, enabled_strategies  # noqa: E402
+from backend.services.binance_scalp.market_reader import MarketSnapshot
+from backend.services.binance_scalp.momentum_tracker import MomentumTracker
+from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
+from backend.services.binance_scalp.strategies import ALL_STRATEGIES, STRATEGY_NAMES, enabled_strategies
 
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 NOTIONAL = 25.0
@@ -90,10 +90,7 @@ def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
     bars: list[dict] = []
     cursor = start_ms
     while cursor < end_ms:
-        url = (
-            f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m"
-            f"&startTime={cursor}&endTime={end_ms}&limit=1000"
-        )
+        url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m&startTime={cursor}&endTime={end_ms}&limit=1000"
         proc = subprocess.run(
             ["curl", "-s", "--max-time", "30", url],
             capture_output=True,
@@ -141,7 +138,7 @@ def synthetic_book(close: float, spread_pct: float) -> tuple[float, float, float
     qty = 2.0
     bids = [[bid - i * tick, qty] for i in range(25)]
     asks = [[ask + i * tick, qty] for i in range(25)]
-    imb = sum(b[1] for b in bids[:10]) / max(sum(a[1] for a in asks[:10]), 1e-9)
+    sum(b[1] for b in bids[:10]) / max(sum(a[1] for a in asks[:10]), 1e-9)
     return bid, ask, mid, bids, asks
 
 
@@ -215,9 +212,7 @@ def replay_symbol(
     spread_mult: float = 1.0,
 ) -> tuple[list[dict], dict[str, StrategyStats], int]:
     trades: list[dict] = []
-    stats: dict[str, StrategyStats] = {
-        s.name: StrategyStats() for s in enabled_strategies(config)
-    }
+    stats: dict[str, StrategyStats] = {s.name: StrategyStats() for s in enabled_strategies(config)}
     missed = 0
     open_pos: OpenTrade | None = None
     cooldown_until = 0.0
@@ -237,10 +232,7 @@ def replay_symbol(
         momentum.record(symbol, epoch, snap.best_bid, snap.mid)
 
         window = bars[max(0, idx - 60) : idx + 1]
-        kline_window = [
-            {"high": b["high"], "low": b["low"], "close": b["close"], "volume": b["volume"]}
-            for b in window
-        ]
+        kline_window = [{"high": b["high"], "low": b["low"], "close": b["close"], "volume": b["volume"]} for b in window]
 
         if open_pos is not None:
             hold = epoch - open_pos.entry_epoch
@@ -352,9 +344,7 @@ def replay_symbol(
     if open_pos is not None:
         bar = bars[-LOOKAHEAD_BARS]
         snap = make_snap(symbol, bar, spread_mult=spread_mult)
-        net_pct = net_pct_at_bid(
-            open_pos.entry_price, snap.best_bid, snap.spread_pct, open_pos.impact_pct, econ
-        )
+        net_pct = net_pct_at_bid(open_pos.entry_price, snap.best_bid, snap.spread_pct, open_pos.impact_pct, econ)
         trades.append(
             {
                 "symbol": symbol,
@@ -386,7 +376,7 @@ def main() -> int:
     router = ScalpStrategyRouter(
         config=config,
         econ=econ,
-        reader=type("R", (), {"read": lambda _s, sym: None})(),  # unused in replay
+        reader=type("R", (), {"read": lambda _s, _sym: None})(),  # unused in replay
         momentum=momentum,
     )
 
@@ -443,16 +433,8 @@ def main() -> int:
 
     stale_exits = sum(1 for t in all_trades if t.get("exit_reason") == "STALE_SCALP_TIMEOUT")
     total_net = round(sum(t["pnl_usd"] for t in all_trades), 4)
-    positive_strategies = [
-        name
-        for name, st in agg.items()
-        if name in enabled_names and st.trades > 0 and st.net_pnl_usd > 0
-    ]
-    negative_enabled = [
-        name
-        for name, st in agg.items()
-        if name in enabled_names and st.trades > 0 and st.net_pnl_usd < 0
-    ]
+    positive_strategies = [name for name, st in agg.items() if name in enabled_names and st.trades > 0 and st.net_pnl_usd > 0]
+    negative_enabled = [name for name, st in agg.items() if name in enabled_names and st.trades > 0 and st.net_pnl_usd < 0]
     replay_pass = total_net >= 0 and not negative_enabled
 
     def _fmt_stats(st: StrategyStats) -> dict:
@@ -486,10 +468,7 @@ def main() -> int:
         "stale_timeout_exits": stale_exits,
         "missed_profitable_windows": missed_by_symbol,
         "by_strategy": {k: _fmt_stats(v) for k, v in agg.items()},
-        "by_strategy_symbol": {
-            sym: {k: _fmt_stats(v) for k, v in stats.items()}
-            for sym, stats in by_strategy_symbol.items()
-        },
+        "by_strategy_symbol": {sym: {k: _fmt_stats(v) for k, v in stats.items()} for sym, stats in by_strategy_symbol.items()},
         "best_strategy_by_symbol": best_by_symbol,
         "trades": all_trades,
         "total_trades": len(all_trades),

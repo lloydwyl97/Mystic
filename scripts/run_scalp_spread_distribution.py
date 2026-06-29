@@ -14,8 +14,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.config import get_scalp_config  # noqa: E402
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
+from backend.services.binance_scalp.config import get_scalp_config
+from backend.services.binance_scalp.economics import ScalpEconomics
 
 SAMPLES = 24
 INTERVAL_SEC = 3.0
@@ -78,9 +78,7 @@ def main() -> int:
             "min_pct": round(min(vals) * 100, 4),
             "median_pct": round(statistics.median(vals) * 100, 4),
             "mean_pct": round(statistics.mean(vals) * 100, 4),
-            "p75_pct": round(statistics.quantiles(vals, n=4)[2] * 100, 4)
-            if len(vals) >= 4
-            else round(max(vals) * 100, 4),
+            "p75_pct": round(statistics.quantiles(vals, n=4)[2] * 100, 4) if len(vals) >= 4 else round(max(vals) * 100, 4),
             "max_pct": round(max(vals) * 100, 4),
             "under_cap_pct": round(100 * under / len(vals), 1),
             "cap_realistic": under >= len(vals) * 0.5,

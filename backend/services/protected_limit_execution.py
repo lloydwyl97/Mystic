@@ -18,7 +18,6 @@ from backend.config.protected_execution import (
     EXECUTABLE_NET_PROFIT_BELOW_FLOOR,
     MAX_ORDERBOOK_PRICE_IMPACT_PCT,
     MAX_ORDERBOOK_SPREAD_PCT,
-    effective_max_orderbook_spread_pct,
     ORDERBOOK_DEPTH_LIMIT,
     ORDERBOOK_MAX_AGE_SEC,
     ORDERBOOK_MISSING,
@@ -29,6 +28,7 @@ from backend.config.protected_execution import (
     PROTECTED_LIMIT_ORDER_TIMEOUT_SEC,
     SPREAD_TOO_WIDE,
     USE_PROTECTED_LIMIT_EXECUTION,
+    effective_max_orderbook_spread_pct,
 )
 from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_PROFIT_TO_SELL, TAKER_FEE
 from backend.utils.symbols import normalize_symbol

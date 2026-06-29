@@ -5,6 +5,7 @@ Frequency-first strategy rebuild — EXHAUSTED (diagnostic only).
 Set MYSTIC_FORCE_EXHAUSTED_RESEARCH=1 to re-run.
 Active path: scripts/run_topfour_profit_rebuild.py
 """
+
 from __future__ import annotations
 
 import json
@@ -16,7 +17,7 @@ import traceback
 from collections import Counter
 from copy import deepcopy
 from dataclasses import replace
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -30,13 +31,13 @@ os.environ.setdefault("SCALP_PAPER_ENABLED", "true")
 os.environ.setdefault("SCALP_FEE_MODEL_VERIFIED", "true")
 os.environ.setdefault("SCALP_PRODUCTS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")
 
-from backend.services.binance_scalp.exit_manager import DECISION_SELL, PositionTrack
 from backend.services.binance_scalp.calibration_profiles import economics_for_config
 from backend.services.binance_scalp.config import ScalpConfig
+from backend.services.binance_scalp.exit_manager import DECISION_SELL, PositionTrack
 from backend.services.binance_scalp.momentum_tracker import MomentumTracker
 from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
 from backend.services.binance_scalp.strategies import STRATEGY_NAMES
-from backend.services.day_regime_router import DAY_REGIME_BULL, DAY_REGIME_BEAR
+from backend.services.day_regime_router import DAY_REGIME_BEAR, DAY_REGIME_BULL
 from backend.services.day_trade_thesis import (
     SETUP_BREAKOUT_CONTINUATION,
     SETUP_HTF_TREND_PULLBACK,
@@ -115,7 +116,7 @@ def _replay_scalp_isolated(
     router = ScalpStrategyRouter(
         config=config,
         econ=econ,
-        reader=type("R", (), {"read": lambda _s, sym: None})(),
+        reader=type("R", (), {"read": lambda _s, _sym: None})(),
         momentum=momentum,
     )
     end = datetime.now(timezone.utc)
@@ -146,16 +147,17 @@ def _replay_scalp_isolated(
                 momentum.record(sym, t, bid, price)
             momentum.record(sym, epoch, snap.best_bid, snap.mid)
             window = bars[max(0, idx - 60) : idx + 1]
-            kline_window = [
-                {"high": b["high"], "low": b["low"], "close": b["close"], "volume": b["volume"]}
-                for b in window
-            ]
+            kline_window = [{"high": b["high"], "low": b["low"], "close": b["close"], "volume": b["volume"]} for b in window]
 
             if open_pos is not None:
                 hold = epoch - open_pos.entry_epoch
                 mom = momentum.diagnostics(sym, epoch, snap.best_bid, snap.mid)
                 net_pct = net_pct_at_bid(
-                    open_pos.entry_price, snap.best_bid, snap.spread_pct, open_pos.impact_pct, econ,
+                    open_pos.entry_price,
+                    snap.best_bid,
+                    snap.spread_pct,
+                    open_pos.impact_pct,
+                    econ,
                 )
                 profit_hit = net_pct >= econ.net_profit_target_pct
                 review = evaluate_exit(
@@ -193,7 +195,11 @@ def _replay_scalp_isolated(
                 continue
 
             best, all_sigs = router.evaluate_symbol(
-                sym, epoch=epoch, notional_usd=NOTIONAL, snap=snap, bars=kline_window,
+                sym,
+                epoch=epoch,
+                notional_usd=NOTIONAL,
+                snap=snap,
+                bars=kline_window,
             )
             for sig in all_sigs:
                 if sig.setup_name == strategy and not sig.passed and sig.reject_reason:
@@ -257,11 +263,13 @@ def _replay_scalp_isolated(
                 spread_rows.append({"spread_mult": sm, "net_pnl_usd": net, "trades": n})
             else:
                 sr = _replay_scalp_isolated(strategy, profile=profile, hours=hours, spread_mult=sm)
-                spread_rows.append({
-                    "spread_mult": sm,
-                    "net_pnl_usd": sr["net_pnl_usd"],
-                    "trades": sr["total_trades"],
-                })
+                spread_rows.append(
+                    {
+                        "spread_mult": sm,
+                        "net_pnl_usd": sr["net_pnl_usd"],
+                        "trades": sr["total_trades"],
+                    }
+                )
 
     loss_profile = next((x for x in relax.get("profiles", []) if x["profile"] == "fast"), {})
     loss_gate = "negative_expectancy_when_gates_loosened" if relax.get("relaxation_creates_losses") else "n/a"
@@ -400,10 +408,7 @@ def _row_from_scalp(name: str, src: dict[str, Any]) -> dict[str, Any]:
         "worst_mae_usd": src.get("avg_loss_usd"),
         "all_pass": src.get("contributing", False),
         "target_met_500": mo >= TARGET_500,
-        "accept_or_reject_reason": (
-            "positive_isolated_replay" if src.get("contributing")
-            else ("no_trades" if src.get("total_trades", 0) == 0 else "negative_expectancy")
-        ),
+        "accept_or_reject_reason": ("positive_isolated_replay" if src.get("contributing") else ("no_trades" if src.get("total_trades", 0) == 0 else "negative_expectancy")),
         "dominant_entry_gate": src.get("dominant_entry_gate"),
         "loss_gate_when_loosened": src.get("loss_gate_when_loosened"),
         "spread_sensitivity": src.get("spread_sensitivity"),
@@ -435,49 +440,76 @@ def main() -> int:
     print("  lower-TF DAY entry candidates...", flush=True)
     ltf_candidates = [
         ("locked_live_baseline_1_5x", {"notional_mult": 1.5}),
-        ("ltf_vwap_reclaim_15m", {
-            "notional_mult": 1.5,
-            "replay_entry_filter": "vwap_reclaim_15m",
-            "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
-        }),
-        ("ltf_vwap_reclaim_30m", {
-            "notional_mult": 1.5,
-            "replay_entry_filter": "vwap_reclaim_30m",
-            "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
-        }),
-        ("ltf_pullback_reclaim_5m15m", {
-            "notional_mult": 1.5,
-            "replay_entry_filter": "pullback_reclaim_5m15m",
-            "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
-        }),
-        ("ltf_vol_compression_breakout", {
-            "notional_mult": 1.5,
-            "replay_entry_filter": "vol_compression_breakout",
-            "extra_allowed_buckets": bull_breakout,
-        }),
-        ("ltf_range_low_reclaim", {
-            "notional_mult": 1.5,
-            "replay_entry_filter": "range_low_reclaim",
-            "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
-        }),
-        ("ltf_high_relvol_reversal", {
-            "notional_mult": 1.5,
-            "replay_entry_filter": "high_relvol_reversal",
-            "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
-        }),
-        ("ltf_eth_neutral_vwap_priority", {
-            "notional_mult": 1.5,
-            "replay_symbols_allow": frozenset({"ETH/USDT"}),
-        }),
-        ("ltf_sol_neutral_vwap", {
-            "notional_mult": 1.5,
-            "replay_symbols_allow": frozenset({"SOL/USDT"}),
-        }),
-        ("ltf_trend_continuation_confirmed", {
-            "notional_mult": 1.5,
-            "replay_entry_filter": "trend_continuation_confirmed",
-            "extra_allowed_buckets": bull_all,
-        }),
+        (
+            "ltf_vwap_reclaim_15m",
+            {
+                "notional_mult": 1.5,
+                "replay_entry_filter": "vwap_reclaim_15m",
+                "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
+            },
+        ),
+        (
+            "ltf_vwap_reclaim_30m",
+            {
+                "notional_mult": 1.5,
+                "replay_entry_filter": "vwap_reclaim_30m",
+                "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
+            },
+        ),
+        (
+            "ltf_pullback_reclaim_5m15m",
+            {
+                "notional_mult": 1.5,
+                "replay_entry_filter": "pullback_reclaim_5m15m",
+                "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
+            },
+        ),
+        (
+            "ltf_vol_compression_breakout",
+            {
+                "notional_mult": 1.5,
+                "replay_entry_filter": "vol_compression_breakout",
+                "extra_allowed_buckets": bull_breakout,
+            },
+        ),
+        (
+            "ltf_range_low_reclaim",
+            {
+                "notional_mult": 1.5,
+                "replay_entry_filter": "range_low_reclaim",
+                "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
+            },
+        ),
+        (
+            "ltf_high_relvol_reversal",
+            {
+                "notional_mult": 1.5,
+                "replay_entry_filter": "high_relvol_reversal",
+                "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
+            },
+        ),
+        (
+            "ltf_eth_neutral_vwap_priority",
+            {
+                "notional_mult": 1.5,
+                "replay_symbols_allow": frozenset({"ETH/USDT"}),
+            },
+        ),
+        (
+            "ltf_sol_neutral_vwap",
+            {
+                "notional_mult": 1.5,
+                "replay_symbols_allow": frozenset({"SOL/USDT"}),
+            },
+        ),
+        (
+            "ltf_trend_continuation_confirmed",
+            {
+                "notional_mult": 1.5,
+                "replay_entry_filter": "trend_continuation_confirmed",
+                "extra_allowed_buckets": bull_all,
+            },
+        ),
     ]
     ltf_rows = []
     for label, spec in ltf_candidates:
@@ -490,35 +522,50 @@ def main() -> int:
 
     print("  safer regime-mapping candidates...", flush=True)
     regime_candidates = [
-        ("map_trending_up_bull_pullback_only", {
-            "notional_mult": 1.5,
-            "regime_override_from_context": {"trending_up": DAY_REGIME_BULL},
-            "extra_allowed_buckets": bull_pullback,
-            "replay_min_adx": 22.0,
-        }),
-        ("map_trending_up_bull_eth_only", {
-            "notional_mult": 1.5,
-            "regime_override_from_context": {"trending_up": DAY_REGIME_BULL},
-            "extra_allowed_buckets": bull_pullback,
-            "replay_symbols_allow": frozenset({"ETH/USDT"}),
-            "replay_min_thesis_score": 0.55,
-        }),
-        ("map_trending_up_bull_high_thesis", {
-            "notional_mult": 1.5,
-            "regime_override_from_context": {"trending_up": DAY_REGIME_BULL},
-            "extra_allowed_buckets": bull_pullback,
-            "replay_min_thesis_score": 0.65,
-            "replay_min_adx": 25.0,
-        }),
-        ("map_trending_down_bear_block_longs", {
-            "notional_mult": 1.5,
-            "regime_override_from_context": {"trending_down": DAY_REGIME_BEAR},
-        }),
-        ("map_naive_trending_up_all_bull", {
-            "notional_mult": 1.5,
-            "regime_override_from_context": {"trending_up": DAY_REGIME_BULL},
-            "extra_allowed_buckets": bull_all,
-        }),
+        (
+            "map_trending_up_bull_pullback_only",
+            {
+                "notional_mult": 1.5,
+                "regime_override_from_context": {"trending_up": DAY_REGIME_BULL},
+                "extra_allowed_buckets": bull_pullback,
+                "replay_min_adx": 22.0,
+            },
+        ),
+        (
+            "map_trending_up_bull_eth_only",
+            {
+                "notional_mult": 1.5,
+                "regime_override_from_context": {"trending_up": DAY_REGIME_BULL},
+                "extra_allowed_buckets": bull_pullback,
+                "replay_symbols_allow": frozenset({"ETH/USDT"}),
+                "replay_min_thesis_score": 0.55,
+            },
+        ),
+        (
+            "map_trending_up_bull_high_thesis",
+            {
+                "notional_mult": 1.5,
+                "regime_override_from_context": {"trending_up": DAY_REGIME_BULL},
+                "extra_allowed_buckets": bull_pullback,
+                "replay_min_thesis_score": 0.65,
+                "replay_min_adx": 25.0,
+            },
+        ),
+        (
+            "map_trending_down_bear_block_longs",
+            {
+                "notional_mult": 1.5,
+                "regime_override_from_context": {"trending_down": DAY_REGIME_BEAR},
+            },
+        ),
+        (
+            "map_naive_trending_up_all_bull",
+            {
+                "notional_mult": 1.5,
+                "regime_override_from_context": {"trending_up": DAY_REGIME_BULL},
+                "extra_allowed_buckets": bull_all,
+            },
+        ),
     ]
     regime_rows = []
     for label, spec in regime_candidates:
@@ -526,11 +573,10 @@ def main() -> int:
         regime_rows.append(_run_day_candidate(label, spec, bars_1h, bars_exec, profiles))
     best_regime = max(regime_rows, key=lambda x: float(x.get("monthly_pnl_usd_on_25k") or -1e9), default={})
 
-    day_mo = float(best_ltf.get("monthly_pnl_usd_on_25k") or locked.get("monthly_pnl_usd_on_25k") or 0)
+    float(best_ltf.get("monthly_pnl_usd_on_25k") or locked.get("monthly_pnl_usd_on_25k") or 0)
     scalp_mo = float(best_scalp.get("extrapolated_monthly_pnl_usd") or 0) if scalp_contributing else 0.0
     combined_mo = round(
-        float(locked.get("monthly_pnl_usd_on_25k") or 0)
-        + (scalp_mo if scalp_contributing else 0),
+        float(locked.get("monthly_pnl_usd_on_25k") or 0) + (scalp_mo if scalp_contributing else 0),
         2,
     )
 
@@ -542,8 +588,7 @@ def main() -> int:
         {
             "strategy_name": "best_combined_DAY_plus_scalp",
             "trades_per_month": round(
-                float(locked.get("trades_per_month") or 0)
-                + (float(best_scalp.get("extrapolated_trades_per_month") or 0) if scalp_contributing else 0),
+                float(locked.get("trades_per_month") or 0) + (float(best_scalp.get("extrapolated_trades_per_month") or 0) if scalp_contributing else 0),
                 2,
             ),
             "monthly_pnl_usd_on_25k": combined_mo,
@@ -558,9 +603,7 @@ def main() -> int:
             "worst_mae_pct": locked.get("metrics_90d", {}).get("worst_intrabar_mae_pct"),
             "all_pass": bool(locked.get("all_pass")) and (scalp_contributing or scalp_mo == 0),
             "target_met_500": combined_mo >= TARGET_500,
-            "accept_or_reject_reason": (
-                "below_500_mo" if combined_mo < TARGET_500 else "pass"
-            ),
+            "accept_or_reject_reason": ("below_500_mo" if combined_mo < TARGET_500 else "pass"),
             "day_component": locked.get("label"),
             "scalp_component": best_scalp.get("strategy") if scalp_contributing else "none_contributing",
         },
@@ -584,11 +627,7 @@ def main() -> int:
         "regime_mapping_candidates": regime_rows,
         "summary_table": summary_table,
         "any_target_met_500": any(r.get("target_met_500") for r in summary_table),
-        "next_step": (
-            "entry_frequency_repair"
-            if not any(r.get("target_met_500") for r in summary_table)
-            else "validate_winner_before_live"
-        ),
+        "next_step": ("entry_frequency_repair" if not any(r.get("target_met_500") for r in summary_table) else "validate_winner_before_live"),
     }
     out = BASELINE_DIR / "frequency_first_rebuild_latest.json"
     out.write_text(json.dumps(report, indent=2, default=str))

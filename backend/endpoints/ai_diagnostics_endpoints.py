@@ -12,7 +12,6 @@ from backend.services.ai_feature_freshness_diagnostics import (
     build_feature_freshness_report,
     build_feature_importance_by_block,
 )
-from backend.services.ai_model_behavior_diagnostics import build_model_behavior_report
 from backend.services.ai_market_diagnostics import (
     build_feature_completeness_report,
     build_feature_importance_report,
@@ -23,6 +22,7 @@ from backend.services.ai_market_diagnostics import (
     build_sentiment_slot_status,
 )
 from backend.services.ai_missed_opportunity_observer import get_missed_opportunity_report
+from backend.services.ai_model_behavior_diagnostics import build_model_behavior_report
 from backend.services.ai_post_trade_feature_review import get_post_trade_feature_review_report
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ async def learning_health() -> dict[str, Any]:
 
         data = await asyncio.to_thread(learning_health_summary)
         per_sym = data.get("per_symbol") or {}
-        for sym, stats in per_sym.items():
+        for _sym, stats in per_sym.items():
             closed = int(stats.get("closed_outcomes") or 0)
             labeled = int(stats.get("labeled_snapshots") or 0)
             stats["promotion_ready"] = closed >= 20

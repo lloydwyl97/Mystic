@@ -1,5 +1,5 @@
 """
-Canonical wiring for legacy 124-block “fundamental” slots (FEATURE_MAPPING 81–90, 0-based 80–89).
+Canonical wiring for legacy 124-block “fundamental” slots (FEATURE_MAPPING 81-90, 0-based 80-89).
 
 These are merged into the ``sentiment`` dict passed to ``build_feature_vector_124`` so live inference,
 training collection, and persistence see the **same** population logic.
@@ -102,7 +102,7 @@ def _vix_proxy_from_ohlcv(ohlcv: list[list] | None) -> float | None:
         if px <= 0:
             return None
         atr_pct = atr / px
-        # Map to a VIX-like scale ~10–80 for typical crypto intraday ATR%
+        # Map to a VIX-like scale ~10-80 for typical crypto intraday ATR%
         vix_like = float(min(90.0, max(8.0, atr_pct * 8500.0)))
         return vix_like
     except Exception:
@@ -364,16 +364,10 @@ async def build_canonical_fundamental_sentiment(
     # 3) ai_context cross-fill
     dom = _ctx_float(ctx_for_overlay, "ctx_btc_dominance_proxy")
     if dom is not None and "market_dominance" not in merged:
-        # Same 0–1 scale as v2 ctx_btc_dominance_proxy (exchange-volume proxy, not CoinGecko global %).
+        # Same 0-1 scale as v2 ctx_btc_dominance_proxy (exchange-volume proxy, not CoinGecko global %).
         merged["market_dominance"] = float(min(1.0, max(0.0, dom)))
 
-    if _truthy(os.getenv("MYSTIC_AI_PUT_CALL_USE_DEPTH_PROXY", "true")):
-        depth = _ctx_float(ctx_for_overlay, "ctx_depth_imbalance")
-        if depth is not None and "put_call_ratio" not in merged:
-            # Map bid-heavy (+1) / ask-heavy (-1) to a ratio-like scalar centered ~1.0
-            merged["put_call_ratio"] = float(max(0.2, min(3.0, 1.0 - 0.35 * depth)))
-
-    # 4) CoinGecko (market cap + supplies)
+    # put_call_ratio: no synthetic depth proxy on crypto spot (audit marks UNSUPPORTED_FOR_SPOT).
     if _truthy(os.getenv("MYSTIC_AI_COINGECKO_ENABLE", "true")):
         rows = await _fetch_coingecko_markets_rows()
         row = _coingecko_row_for_base(rows, base)

@@ -54,10 +54,7 @@ def build_basket_rs_ranks() -> tuple[list[dict[str, Any]], dict[str, int]]:
         for sym in DAY_TRADE_SYMBOLS:
             bus = _norm_bus(sym)
             raw = r.hgetall(redis_ai_signal_key("day", bus)) or {}
-            dd = {
-                (k.decode() if isinstance(k, bytes) else str(k)): (v.decode() if isinstance(v, bytes) else str(v))
-                for k, v in raw.items()
-            }
+            dd = {(k.decode() if isinstance(k, bytes) else str(k)): (v.decode() if isinstance(v, bytes) else str(v)) for k, v in raw.items()}
             rs = _safe_float(dd.get("ctx_rs_btc"), _safe_float(dd.get("ctx_rs_eth"), 0.0))
             conf = _safe_float(dd.get("winner_probability"), _safe_float(dd.get("confidence"), 0.0))
             rows.append({"symbol": bus, "ctx_rs_btc": rs, "confidence": conf})
@@ -100,7 +97,9 @@ def evaluate_entry_quality(
     detail["rs_rank"] = rs_rank
 
     would_block: list[str] = []
-    if setup_credit <= 0.0 and not strong_setup:
+    # ML_EDGE or explicit ml_enriched signals (positive model edge) are allowed to trade for learning even without classic strong_setup credit.
+    is_ml_edge = bool(dd.get("ml_enriched") or str(dd.get("strategy_family", "")).upper() == "ML_EDGE" or str(dd.get("live_ai_strategy", "")).lower() == "day")
+    if setup_credit <= 0.0 and not strong_setup and not is_ml_edge:
         would_block.append(REJECT_SETUP_CREDIT_REQUIRED)
 
     rs_floor = day_entry_rs_floor()

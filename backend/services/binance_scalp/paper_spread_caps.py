@@ -23,7 +23,7 @@ def parse_paper_spread_caps_json(raw: str | None = None) -> dict[str, float]:
     except json.JSONDecodeError:
         return dict(DEFAULT_PAPER_SPREAD_CAPS)
     if not isinstance(data, dict):
-        raise ValueError("SCALP_PAPER_SPREAD_CAPS_JSON must be a JSON object")
+        raise TypeError("SCALP_PAPER_SPREAD_CAPS_JSON must be a JSON object")
     out: dict[str, float] = {}
     for key, val in data.items():
         sym = str(key).strip().upper()

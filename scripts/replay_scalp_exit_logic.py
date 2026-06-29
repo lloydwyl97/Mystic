@@ -16,11 +16,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.config import get_scalp_config  # noqa: E402
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
-from backend.services.binance_scalp.market_reader import MarketSnapshot  # noqa: E402
-from backend.services.binance_scalp.orderbook_book import walk_buy_notional, walk_sell_qty  # noqa: E402
-from backend.services.binance_scalp.protected_preflight import run_scalp_preflight  # noqa: E402
+from backend.services.binance_scalp.config import get_scalp_config
+from backend.services.binance_scalp.economics import ScalpEconomics
+from backend.services.binance_scalp.market_reader import MarketSnapshot
+from backend.services.binance_scalp.orderbook_book import walk_buy_notional, walk_sell_qty
+from backend.services.binance_scalp.protected_preflight import run_scalp_preflight
 
 DB = REPO / "mystic_trading.db"
 PHASE3F_REPORT = Path("/tmp/scalp_phase3f/final_report.json")
@@ -28,9 +28,7 @@ PHASE3G_AUDIT = Path("/tmp/scalp_phase3g_audit.json")
 OUT_DEFAULT = Path("/tmp/scalp_phase3l_replay.json")
 SOAK_START = "2026-06-07 00:12:04"
 LOOP_INTERVAL_SEC = 5.0
-KLINE_PROXY_WARNING = (
-    "1m kline HIGH used as best_bid proxy — optimistic; live depth not persisted per tick"
-)
+KLINE_PROXY_WARNING = "1m kline HIGH used as best_bid proxy — optimistic; live depth not persisted per tick"
 
 
 @dataclass(frozen=True)
@@ -95,10 +93,7 @@ def _parse_ts(s: str) -> datetime:
 
 
 def _fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
-    url = (
-        "https://api.binance.us/api/v3/klines"
-        f"?symbol={symbol}&interval=1m&startTime={start_ms}&endTime={end_ms}&limit=1000"
-    )
+    url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m&startTime={start_ms}&endTime={end_ms}&limit=1000"
     try:
         with urllib.request.urlopen(url, timeout=20) as resp:
             rows = json.loads(resp.read().decode())
@@ -134,9 +129,7 @@ def _load_trade_context(buy: sqlite3.Row, sell: sqlite3.Row, conn: sqlite3.Conne
         (buy["trade_id"],),
     ).fetchone()
     pos_raw = json.loads(pos["diagnostics_json"] or "{}") if pos else {}
-    buy_pf = (pos_raw or {}).get("entry_preflight") or json.loads(
-        buy["diagnostics_json"] or "{}"
-    ).get("preflight", {})
+    buy_pf = (pos_raw or {}).get("entry_preflight") or json.loads(buy["diagnostics_json"] or "{}").get("preflight", {})
     spread_e = float(buy_pf.get("spread_pct", sell_pf.get("spread_pct", 0)))
     buy_i = float(buy_pf.get("buy_impact_pct", 0))
     sell_i = float(buy_pf.get("sell_impact_pct", 0))
@@ -185,13 +178,7 @@ def _target_bid_new(
     """Minimum sell fill for executable_exit_net_pct >= target."""
     if entry <= 0:
         return 0.0
-    fixed_costs = (
-        econ.entry_fee_pct()
-        + econ.exit_fee_pct()
-        + econ.slippage_buffer_pct * 2.0
-        + entry_buy_impact
-        + sell_impact
-    )
+    fixed_costs = econ.entry_fee_pct() + econ.exit_fee_pct() + econ.slippage_buffer_pct * 2.0 + entry_buy_impact + sell_impact
     return entry * (1.0 + econ.net_profit_target_pct + fixed_costs)
 
 
@@ -304,11 +291,19 @@ def replay_trade(
             best_bid = max(best_bid, bid)
             snap = _snapshot_from_bid(sym, bid, spread_e, qty)
             new_pass, new_net, new_fill = _new_sell_gate(
-                snap, econ, config,
-                entry_price=entry, qty=qty, entry_buy_impact_pct=entry_buy_i,
+                snap,
+                econ,
+                config,
+                entry_price=entry,
+                qty=qty,
+                entry_buy_impact_pct=entry_buy_i,
             )
             old_pass, old_net, old_fill = _old_sell_gate(
-                snap, econ, entry_price=entry, qty=qty, notional_usd=notional,
+                snap,
+                econ,
+                entry_price=entry,
+                qty=qty,
+                notional_usd=notional,
             )
             max_new = max(max_new, new_net)
             max_old = max(max_old, old_net)
@@ -316,16 +311,12 @@ def replay_trade(
             stale = age >= econ.stale_scalp_timeout_sec
 
             if new_pass and new_exit_time is None:
-                new_exit_time = datetime.fromtimestamp(t, tz=timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
+                new_exit_time = datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 replay_exit_reason = "NET_PROFIT_TARGET"
                 replay_pnl = _replay_pnl_usd(entry, new_fill, qty, econ)
                 break
             if old_pass and old_exit_time is None:
-                old_exit_time = datetime.fromtimestamp(t, tz=timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
+                old_exit_time = datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             if stale and not new_pass:
                 replay_pnl = _replay_pnl_usd(
                     entry,
@@ -339,11 +330,7 @@ def replay_trade(
 
     orig_reason = str(sell["exit_reason"])
     p3g = phase3g_by_id.get(str(buy["trade_id"]), {})
-    old_missed = (
-        orig_reason == "STALE_SCALP_TIMEOUT"
-        and replay_exit_reason == "NET_PROFIT_TARGET"
-        and p3g.get("classification") == "true_missed_exit_bug"
-    )
+    old_missed = orig_reason == "STALE_SCALP_TIMEOUT" and replay_exit_reason == "NET_PROFIT_TARGET" and p3g.get("classification") == "true_missed_exit_bug"
     stale_still = replay_exit_reason == "STALE_SCALP_TIMEOUT"
 
     return ReplayResult(
@@ -387,8 +374,12 @@ def run_synthetic_tests(econ: ScalpEconomics, config) -> dict:
     for bid in cross_bids:
         snap = _snapshot_from_bid("ETHUSDT", bid, spread, qty)
         passed, net, fill = _new_sell_gate(
-            snap, econ, config,
-            entry_price=entry, qty=qty, entry_buy_impact_pct=entry_buy_i,
+            snap,
+            econ,
+            config,
+            entry_price=entry,
+            qty=qty,
+            entry_buy_impact_pct=entry_buy_i,
         )
         if passed:
             cross_exit = {"bid": bid, "net_pct": net, "fill": fill, "reason": "NET_PROFIT_TARGET"}
@@ -397,12 +388,15 @@ def run_synthetic_tests(econ: ScalpEconomics, config) -> dict:
     # Path stays below target until stale
     below_bids = [entry * 0.9995] * 80
     below_exit = None
-    entry_epoch = 0.0
     for i, bid in enumerate(below_bids):
         snap = _snapshot_from_bid("ETHUSDT", bid, spread, qty)
         passed, net, _ = _new_sell_gate(
-            snap, econ, config,
-            entry_price=entry, qty=qty, entry_buy_impact_pct=entry_buy_i,
+            snap,
+            econ,
+            config,
+            entry_price=entry,
+            qty=qty,
+            entry_buy_impact_pct=entry_buy_i,
         )
         age = (i + 1) * LOOP_INTERVAL_SEC
         if passed:
@@ -429,18 +423,10 @@ def run_synthetic_tests(econ: ScalpEconomics, config) -> dict:
 
 def _day_snapshot() -> dict:
     with sqlite3.connect(DB) as c:
-        led = c.execute(
-            "SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1"
-        ).fetchone()
-        xrp = c.execute(
-            "SELECT symbol, quantity, entry_price FROM portfolio_engine_positions WHERE symbol LIKE '%XRP%'"
-        ).fetchall()
+        led = c.execute("SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
+        xrp = c.execute("SELECT symbol, quantity, entry_price FROM portfolio_engine_positions WHERE symbol LIKE '%XRP%'").fetchall()
         pn = c.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0]
-    ai = sorted(
-        k
-        for k in subprocess.check_output(["redis-cli", "KEYS", "ai_signal:day:*"], text=True).split()
-        if k
-    )
+    ai = sorted(k for k in subprocess.check_output(["redis-cli", "KEYS", "ai_signal:day:*"], text=True).split() if k)
     try:
         health = urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=5).status
     except Exception:
@@ -503,9 +489,7 @@ def main() -> int:
             if not sell:
                 continue
             ctx = _load_trade_context(buy, sell, conn)
-            results.append(
-                replay_trade(buy, sell, ctx, econ, config, phase3g_by_id=phase3g_map)
-            )
+            results.append(replay_trade(buy, sell, ctx, econ, config, phase3g_by_id=phase3g_map))
 
     synthetic = run_synthetic_tests(econ, config)
     day_after = _day_snapshot()
@@ -519,18 +503,8 @@ def main() -> int:
         None,
     )
 
-    missed_fixed = sum(
-        1 for r in results
-        if r.original_exit_reason == "STALE_SCALP_TIMEOUT"
-        and r.new_exit_reason == "NET_PROFIT_TARGET"
-    )
-    validated = (
-        synthetic["all_passed"]
-        and eth_0514 is not None
-        and eth_0628 is not None
-        and eth_0514.new_exit_reason == "NET_PROFIT_TARGET"
-        and eth_0628.new_exit_reason == "NET_PROFIT_TARGET"
-    )
+    missed_fixed = sum(1 for r in results if r.original_exit_reason == "STALE_SCALP_TIMEOUT" and r.new_exit_reason == "NET_PROFIT_TARGET")
+    validated = synthetic["all_passed"] and eth_0514 is not None and eth_0628 is not None and eth_0514.new_exit_reason == "NET_PROFIT_TARGET" and eth_0628.new_exit_reason == "NET_PROFIT_TARGET"
 
     report = {
         "phase": "3l",
@@ -558,7 +532,9 @@ def main() -> int:
             "phase3f_summary": {
                 "trades_closed": phase3f.get("2_trades_closed") if phase3f else None,
                 "pnl_usd": phase3f.get("4_pnl_usd") if phase3f else None,
-            } if phase3f else None,
+            }
+            if phase3f
+            else None,
         },
         "synthetic_tests": synthetic,
         "phase3g_exit_fix_validated": validated,

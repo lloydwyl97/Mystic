@@ -8,9 +8,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
-from backend.services.binance_scalp.protected_preflight import SPREAD_TOO_WIDE  # noqa: E402
-from scripts.watch_scalp_entry_opportunity import is_high_quality_near_pass  # noqa: E402
+from backend.services.binance_scalp.economics import ScalpEconomics
+from backend.services.binance_scalp.protected_preflight import SPREAD_TOO_WIDE
+from scripts.watch_scalp_entry_opportunity import is_high_quality_near_pass
 
 
 def _row(**kwargs) -> dict:

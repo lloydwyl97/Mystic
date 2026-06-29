@@ -61,11 +61,20 @@ def test_fat_tail_bucket_killed_after_stats():
     stats = {}
     for _ in range(5):
         record_bucket_outcome(
-            stats, symbol="SOL/USDT", regime="neutral", setup=SETUP_VWAP_REVERSION,
-            pnl_usd=-80, hold_sec=200 * 3600, mae_pct=-0.06, exit_reason="REPLAY_MARK",
+            stats,
+            symbol="SOL/USDT",
+            regime="neutral",
+            setup=SETUP_VWAP_REVERSION,
+            pnl_usd=-80,
+            hold_sec=200 * 3600,
+            mae_pct=-0.06,
+            exit_reason="REPLAY_MARK",
         )
     r = evaluate_bucket_entry(
-        symbol="SOL/USDT", regime="neutral", setup=SETUP_VWAP_REVERSION, bucket_stats=stats,
+        symbol="SOL/USDT",
+        regime="neutral",
+        setup=SETUP_VWAP_REVERSION,
+        bucket_stats=stats,
     )
     assert r["allowed"] is False
     assert "BUCKET_KILL" in r["block_reason"]

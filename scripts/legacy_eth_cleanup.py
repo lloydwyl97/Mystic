@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """One-shot: close ETH legacy inventory with LEGACY_INVENTORY_CLEANUP_EXIT."""
+
 from __future__ import annotations
 
 import asyncio

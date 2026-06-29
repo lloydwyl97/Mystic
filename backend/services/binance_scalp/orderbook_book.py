@@ -16,9 +16,7 @@ class BookWalkResult:
     filled_qty: float
 
 
-def walk_book(
-    levels: list[list[float]], qty_needed: float
-) -> tuple[float, float, bool, int]:
+def walk_book(levels: list[list[float]], qty_needed: float) -> tuple[float, float, bool, int]:
     remaining = float(qty_needed)
     cost = 0.0
     filled = 0.0
@@ -46,9 +44,7 @@ def walk_book(
     return avg, last_price, fully, levels_used
 
 
-def walk_buy_notional(
-    asks: list[list[float]], notional_usd: float, best_ask: float
-) -> BookWalkResult:
+def walk_buy_notional(asks: list[list[float]], notional_usd: float, best_ask: float) -> BookWalkResult:
     if notional_usd <= 0 or not asks or best_ask <= 0:
         return BookWalkResult(False, 0.0, 0.0, 1.0, 0, 0.0, 0.0)
     remaining = notional_usd
@@ -70,27 +66,17 @@ def walk_buy_notional(
         if remaining <= 1e-12:
             break
     if remaining > 1e-8 or total_qty <= 0:
-        return BookWalkResult(
-            False, 0.0, last_price, 1.0, levels, total_cost, total_qty
-        )
+        return BookWalkResult(False, 0.0, last_price, 1.0, levels, total_cost, total_qty)
     avg = total_cost / total_qty
     impact = abs(avg - best_ask) / best_ask if best_ask > 0 else 1.0
-    return BookWalkResult(
-        True, avg, last_price, impact, levels, total_cost, total_qty
-    )
+    return BookWalkResult(True, avg, last_price, impact, levels, total_cost, total_qty)
 
 
-def walk_sell_qty(
-    bids: list[list[float]], qty: float, best_bid: float
-) -> BookWalkResult:
+def walk_sell_qty(bids: list[list[float]], qty: float, best_bid: float) -> BookWalkResult:
     if qty <= 0 or not bids or best_bid <= 0:
         return BookWalkResult(False, 0.0, 0.0, 1.0, 0, 0.0, 0.0)
     avg, last_price, fully, levels = walk_book(bids, qty)
     if not fully or avg <= 0:
-        return BookWalkResult(
-            False, avg, last_price, 1.0, levels, avg * qty if avg else 0.0, qty
-        )
+        return BookWalkResult(False, avg, last_price, 1.0, levels, avg * qty if avg else 0.0, qty)
     impact = abs(best_bid - avg) / best_bid if best_bid > 0 else 1.0
-    return BookWalkResult(
-        True, avg, last_price, impact, levels, avg * qty, qty
-    )
+    return BookWalkResult(True, avg, last_price, impact, levels, avg * qty, qty)

@@ -11,11 +11,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.config import get_scalp_config  # noqa: E402
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
-from backend.services.binance_scalp.market_reader import ScalpMarketReader  # noqa: E402
-from backend.services.binance_scalp.momentum_tracker import MomentumTracker  # noqa: E402
-from backend.services.binance_scalp.protected_preflight import run_scalp_preflight  # noqa: E402
+from backend.services.binance_scalp.config import get_scalp_config
+from backend.services.binance_scalp.economics import ScalpEconomics
+from backend.services.binance_scalp.market_reader import ScalpMarketReader
+from backend.services.binance_scalp.momentum_tracker import MomentumTracker
+from backend.services.binance_scalp.protected_preflight import run_scalp_preflight
 
 
 def _warm_momentum(reader: ScalpMarketReader, tracker: MomentumTracker, symbols: tuple[str, ...]) -> None:
@@ -99,20 +99,10 @@ def main() -> int:
 
     out = {
         "economics": econ.as_dict(),
-        "computed_entry_required_formula": (
-            "net_profit_target + roundtrip_cost(spread,impact) + entry_edge_buffer"
-        ),
+        "computed_entry_required_formula": ("net_profit_target + roundtrip_cost(spread,impact) + entry_edge_buffer"),
         "products": results,
         "stronger_momentum_15s": stronger,
-        "btc_priority_would_select": selected or (
-            "NONE"
-            if not any(r.get("entry_decision") == "ENTER" for r in results)
-            else next(
-                r["symbol"]
-                for r in results
-                if r.get("entry_decision") == "ENTER"
-            )
-        ),
+        "btc_priority_would_select": selected or ("NONE" if not any(r.get("entry_decision") == "ENTER" for r in results) else next(r["symbol"] for r in results if r.get("entry_decision") == "ENTER")),
     }
     print(json.dumps(out, indent=2, default=str))
     return 0

@@ -19,17 +19,13 @@ def _mode_viable(
     entry_maker: bool,
     exit_maker: bool,
 ) -> dict[str, Any]:
-    break_even = econ.break_even_move_pct(
-        spread, buy_impact, sell_impact, entry_maker=entry_maker, exit_maker=exit_maker
-    )
+    break_even = econ.break_even_move_pct(spread, buy_impact, sell_impact, entry_maker=entry_maker, exit_maker=exit_maker)
     required = break_even + econ.min_net_edge_pct
     immediate = spread + buy_impact + sell_impact
     return {
         "entry_maker": entry_maker,
         "exit_maker": exit_maker,
-        "roundtrip_fee_pct": econ.roundtrip_fee_for_mode(
-            entry_maker=entry_maker, exit_maker=exit_maker
-        ),
+        "roundtrip_fee_pct": econ.roundtrip_fee_for_mode(entry_maker=entry_maker, exit_maker=exit_maker),
         "break_even_move_pct": break_even,
         "required_gross_move_for_min_edge_pct": required,
         "immediate_microstructure_edge_pct": immediate,
@@ -51,9 +47,7 @@ def build_fee_diagnostic(
         "buy_impact_pct_observed": buy_impact_pct,
         "sell_impact_pct_observed": sell_impact_pct,
         "total_break_even_move_pct": break_even,
-        "total_required_move_for_min_edge_pct": econ.required_gross_move_for_min_edge_pct(
-            spread_pct, buy_impact_pct, sell_impact_pct
-        ),
+        "total_required_move_for_min_edge_pct": econ.required_gross_move_for_min_edge_pct(spread_pct, buy_impact_pct, sell_impact_pct),
         "env_knobs": {
             "SCALP_MAKER_FEE_PCT": econ.maker_fee_pct,
             "SCALP_TAKER_FEE_PCT": econ.taker_fee_pct,
@@ -80,9 +74,7 @@ def build_pair_book_walk(
         return {"symbol": symbol, "error": "NO_MARKET_DATA"}
 
     notional = cfg.max_notional_paper
-    buy_pf = run_scalp_preflight(
-        snap, economics, cfg, side="BUY", notional_usd=notional, check_paper_enabled=False
-    )
+    buy_pf = run_scalp_preflight(snap, economics, cfg, side="BUY", notional_usd=notional, check_paper_enabled=False)
     sell_qty = notional / snap.mid if snap.mid > 0 else 0.0
     sell_pf = run_scalp_preflight(
         snap,
@@ -198,9 +190,7 @@ def build_economics_audit(
                 buy_impact_pct=pf.buy_impact_pct,
                 sell_impact_pct=spf.sell_impact_pct,
             ),
-            "mode_comparison": build_pair_book_walk(sym, cfg, economics).get(
-                "mode_comparison", {}
-            ),
+            "mode_comparison": build_pair_book_walk(sym, cfg, economics).get("mode_comparison", {}),
             "preflight_buy": pf.as_dict(),
         }
 
@@ -212,23 +202,14 @@ def build_economics_audit(
         sell_impact_pct=sum(sell_imps) / n,
     )
     any_viable = any(
-        products[s].get("mode_comparison", {}).get(mode, {}).get("economically_viable")
-        for s in products
-        if "error" not in products[s]
-        for mode in ("taker_taker", "maker_maker", "maker_taker")
+        products[s].get("mode_comparison", {}).get(mode, {}).get("economically_viable") for s in products if "error" not in products[s] for mode in ("taker_taker", "maker_maker", "maker_taker")
     )
     return {
         "summary": {
             "fee_model_verified": economics.is_fee_model_verified(),
             "scalp_paper_enabled": cfg.scalp_paper_enabled,
             "scalp_live": cfg.scalp_live,
-            "paper_scalper_blocked_reason": (
-                "FEE_MODEL_UNVERIFIED"
-                if not economics.is_fee_model_verified()
-                else "SCALP_PAPER_DISABLED"
-                if not cfg.scalp_paper_enabled
-                else None
-            ),
+            "paper_scalper_blocked_reason": ("FEE_MODEL_UNVERIFIED" if not economics.is_fee_model_verified() else "SCALP_PAPER_DISABLED" if not cfg.scalp_paper_enabled else None),
             "scalping_viable_under_current_fees": any_viable,
             "global_fee_diagnostic": summary,
         },
@@ -244,7 +225,5 @@ def build_book_walk_report(config: ScalpConfig | None = None) -> dict[str, Any]:
         "spread_cap_pct": econ.spread_cap_pct,
         "max_notional_paper": cfg.max_notional_paper,
         "fee_model_verified": econ.is_fee_model_verified(),
-        "products": {
-            sym: build_pair_book_walk(sym, cfg, econ) for sym in cfg.products
-        },
+        "products": {sym: build_pair_book_walk(sym, cfg, econ) for sym in cfg.products},
     }

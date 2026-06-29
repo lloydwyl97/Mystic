@@ -2,15 +2,16 @@
 """
 DAY profit-growth search — replay-only. Does NOT modify live rules or promote variants.
 
-1.5× baseline remains the locked safety floor; this script searches for replay-proven growth.
+1.5x baseline remains the locked safety floor; this script searches for replay-proven growth.
 """
+
 from __future__ import annotations
 
 import json
 import sys
 import traceback
 from copy import deepcopy
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,10 +26,11 @@ from backend.services.day_trade_thesis import (
     SETUP_HTF_TREND_PULLBACK,
     SETUP_VWAP_REVERSION,
 )
+from scripts.run_day_bucket_discovery import _scan_opportunities
 from scripts.run_day_execution_replay import (
     ALLOWED_POSITIVE_BUCKETS,
-    ExecutionConfig,
     STRESS_SCENARIOS,
+    ExecutionConfig,
     _build_fee_profiles,
     _compute_pass,
     _run_stress_90d,
@@ -37,7 +39,6 @@ from scripts.run_day_execution_replay import (
     fetch_klines_cached,
 )
 from scripts.run_day_strategy_replay import NOTIONAL_USD, PRINCIPAL, SYMBOLS
-from scripts.run_day_bucket_discovery import _scan_opportunities
 
 MAX_HOLD_HOURS = 72.0
 TARGET_MONTHLY = {"2pct": 500.0, "3pct": 750.0, "5pct": 1250.0}
@@ -120,8 +121,7 @@ def _run_stress_battery(
                 "90d_net_pnl_usd": w90.get("net_pnl_usd"),
                 "90d_expectancy_usd": w90.get("expectancy_per_trade_usd"),
                 "90d_max_drawdown_pct": w90.get("max_drawdown_pct"),
-                "stays_positive": (w90.get("net_pnl_usd") or 0) > 0
-                and (w90.get("expectancy_per_trade_usd") or 0) > 0,
+                "stays_positive": (w90.get("net_pnl_usd") or 0) > 0 and (w90.get("expectancy_per_trade_usd") or 0) > 0,
             }
         except Exception:
             out[sc.name] = {"error": traceback.format_exc(), "stays_positive": False}
@@ -153,11 +153,7 @@ def _evaluate(label: str, spec: dict, suite: dict, stress: dict) -> dict[str, An
     trades_mo = round(float(m["total_trades"] or 0) / 3.0, 2)
     longest = float(m["longest_hold_hours"] or 0)
     mult = float(spec.get("notional_mult") or 1.0)
-    stress_pass = all(
-        v.get("stays_positive")
-        for v in stress.values()
-        if isinstance(v, dict) and "stays_positive" in v
-    )
+    stress_pass = all(v.get("stays_positive") for v in stress.values() if isinstance(v, dict) and "stays_positive" in v)
     fat_tail = longest > MAX_HOLD_HOURS
     dd_ok = (m.get("max_drawdown_pct") or 99) < MAX_DD_CAP
     all_pass = bool(pc.get("all_pass")) and stress_pass and not fat_tail and dd_ok
@@ -210,9 +206,7 @@ def _load_bars() -> tuple[dict, dict, dict]:
     bars_1h = {sym: fetch_klines_cached(sym, "1h", start_ms, end_ms) for sym in SYMBOLS}
     bars_exec_by_interval: dict[str, dict] = {}
     for interval in ("1m", "5m", "15m"):
-        bars_exec_by_interval[interval] = {
-            sym: fetch_klines_cached(sym, interval, start_ms, end_ms) for sym in SYMBOLS
-        }
+        bars_exec_by_interval[interval] = {sym: fetch_klines_cached(sym, interval, start_ms, end_ms) for sym in SYMBOLS}
     ext_start_ms = int((end - timedelta(days=185)).timestamp() * 1000)
     bars_ext = {sym: fetch_klines_cached(sym, "1h", ext_start_ms, end_ms) for sym in SYMBOLS}
     return bars_1h, bars_exec_by_interval, bars_ext
@@ -220,14 +214,6 @@ def _load_bars() -> tuple[dict, dict, dict]:
 
 def _bucket_candidates(bars_ext: dict) -> list[dict[str, Any]]:
     cands: list[dict[str, Any]] = []
-    scans = [
-        ("bull_trend_pullback", DAY_REGIME_BULL, SETUP_HTF_TREND_PULLBACK),
-        ("bull_breakout_continuation", DAY_REGIME_BULL, SETUP_BREAKOUT_CONTINUATION),
-        ("bear_exhaustion_vwap", DAY_REGIME_BEAR, SETUP_VWAP_REVERSION),
-        ("bear_reversal_breakout", DAY_REGIME_BEAR, SETUP_BREAKOUT_CONTINUATION),
-        ("neutral_breakout", "neutral", SETUP_BREAKOUT_CONTINUATION),
-        ("range_vwap_sol", "SOL/USDT", "range", SETUP_VWAP_REVERSION),
-    ]
     for sym in SYMBOLS:
         for reg, thesis in (
             (DAY_REGIME_BULL, SETUP_HTF_TREND_PULLBACK),
@@ -237,25 +223,29 @@ def _bucket_candidates(bars_ext: dict) -> list[dict[str, Any]]:
         ):
             scan = _scan_opportunities(bars_ext, symbol=sym, regime=reg, thesis=thesis)
             bk = bucket_key(sym, reg, thesis)
-            cands.append({
-                "id": f"{sym}/{reg}/{thesis}",
-                "bucket": bk,
-                "scan_90d": scan,
-                "killed": bk in REPLAY_KILLED_BUCKETS,
-                "in_allowlist": bk in ALLOWED_POSITIVE_BUCKETS,
-            })
+            cands.append(
+                {
+                    "id": f"{sym}/{reg}/{thesis}",
+                    "bucket": bk,
+                    "scan_90d": scan,
+                    "killed": bk in REPLAY_KILLED_BUCKETS,
+                    "in_allowlist": bk in ALLOWED_POSITIVE_BUCKETS,
+                }
+            )
     for seg_id, sym, reg, thesis in [
         ("sol_range_vwap", "SOL/USDT", "range", SETUP_VWAP_REVERSION),
     ]:
         scan = _scan_opportunities(bars_ext, symbol=sym, regime=reg, thesis=thesis)
         bk = bucket_key(sym, reg, thesis)
-        cands.append({
-            "id": seg_id,
-            "bucket": bk,
-            "scan_90d": scan,
-            "killed": bk in REPLAY_KILLED_BUCKETS,
-            "in_allowlist": bk in ALLOWED_POSITIVE_BUCKETS,
-        })
+        cands.append(
+            {
+                "id": seg_id,
+                "bucket": bk,
+                "scan_90d": scan,
+                "killed": bk in REPLAY_KILLED_BUCKETS,
+                "in_allowlist": bk in ALLOWED_POSITIVE_BUCKETS,
+            }
+        )
     return cands
 
 
@@ -286,25 +276,24 @@ def _scalp_extended() -> dict[str, Any]:
         trades_mo = round(n * (730.0 / max(1.0, hours_f)), 2)
         monthly = round(total * (730.0 / max(1.0, hours_f)) / 3.0, 2)
         exp = round(total / max(1, n), 4)
-        out.update({
-            "total_trades": n,
-            "win_rate_pct": wr,
-            "net_pnl_replay_usd": round(total, 4),
-            "expectancy_per_trade_usd": exp,
-            "extrapolated_trades_per_month": trades_mo,
-            "extrapolated_monthly_pnl_usd": monthly,
-            "replay_pass": rep.get("replay_pass"),
-            "enabled_strategies": rep.get("enabled_strategies"),
-            "disabled_strategies": rep.get("disabled_strategies"),
-            "negative_enabled_strategies": rep.get("negative_enabled_strategies"),
-            "positive_strategies": rep.get("positive_strategies"),
-            "missed_profitable_windows": rep.get("missed_profitable_windows"),
-            "by_strategy": rep.get("by_strategy"),
-            "blocker_note": (
-                "Scalp uses 1m replay; extrapolation assumes steady opportunity density. "
-                "Check missed_profitable_windows and disabled_strategies for blockers."
-            ),
-        })
+        out.update(
+            {
+                "total_trades": n,
+                "win_rate_pct": wr,
+                "net_pnl_replay_usd": round(total, 4),
+                "expectancy_per_trade_usd": exp,
+                "extrapolated_trades_per_month": trades_mo,
+                "extrapolated_monthly_pnl_usd": monthly,
+                "replay_pass": rep.get("replay_pass"),
+                "enabled_strategies": rep.get("enabled_strategies"),
+                "disabled_strategies": rep.get("disabled_strategies"),
+                "negative_enabled_strategies": rep.get("negative_enabled_strategies"),
+                "positive_strategies": rep.get("positive_strategies"),
+                "missed_profitable_windows": rep.get("missed_profitable_windows"),
+                "by_strategy": rep.get("by_strategy"),
+                "blocker_note": ("Scalp uses 1m replay; extrapolation assumes steady opportunity density. Check missed_profitable_windows and disabled_strategies for blockers."),
+            }
+        )
     except Exception:
         out["error"] = proc.stderr[-2000:] if proc.stderr else "no report"
     return out
@@ -352,27 +341,33 @@ def main() -> int:
             scan = cand["scan_90d"]
             we = int(scan.get("would_enter") or 0)
             if cand["killed"] and not cand["in_allowlist"]:
-                bucket_rows.append({
-                    "id": bid,
-                    "verdict": "rejected",
-                    "reason": "replay_negative_killed_bucket",
-                    "would_enter_90d": we,
-                })
+                bucket_rows.append(
+                    {
+                        "id": bid,
+                        "verdict": "rejected",
+                        "reason": "replay_negative_killed_bucket",
+                        "would_enter_90d": we,
+                    }
+                )
                 continue
             if cand["in_allowlist"]:
-                bucket_rows.append({
-                    "id": bid,
-                    "verdict": "already_active",
-                    "would_enter_90d": we,
-                })
+                bucket_rows.append(
+                    {
+                        "id": bid,
+                        "verdict": "already_active",
+                        "would_enter_90d": we,
+                    }
+                )
                 continue
             if we < 3:
-                bucket_rows.append({
-                    "id": bid,
-                    "verdict": "rejected",
-                    "reason": f"insufficient_opportunities_{we}",
-                    "would_enter_90d": we,
-                })
+                bucket_rows.append(
+                    {
+                        "id": bid,
+                        "verdict": "rejected",
+                        "reason": f"insufficient_opportunities_{we}",
+                        "would_enter_90d": we,
+                    }
+                )
                 continue
             print(f"  bucket expansion exec replay: {bid}...", flush=True)
             try:
@@ -383,12 +378,9 @@ def main() -> int:
                 row = _evaluate(f"bucket_{bid}", spec, suite, stress)
                 row["bucket"] = list(cand["bucket"])
                 row["would_enter_90d"] = we
-                row["trades_added_vs_locked_floor"] = (
-                    row["metrics_90d"]["total_trades"]
-                    - next(
-                        (r["metrics_90d"]["total_trades"] for r in results if r.get("label") == "locked_floor_1_5x"),
-                        0,
-                    )
+                row["trades_added_vs_locked_floor"] = row["metrics_90d"]["total_trades"] - next(
+                    (r["metrics_90d"]["total_trades"] for r in results if r.get("label") == "locked_floor_1_5x"),
+                    0,
                 )
                 bucket_rows.append(row)
             except Exception:
@@ -423,40 +415,84 @@ def main() -> int:
         growth_table = [
             {
                 "row": "locked_safety_floor_1_5x",
-                **{k: locked.get(k) for k in (
-                    "monthly_pnl_usd_on_25k", "pct_per_month_on_25k", "trades_per_month",
-                    "metrics_90d", "all_pass", "verdict", "accept_or_reject_reason",
-                )},
+                **{
+                    k: locked.get(k)
+                    for k in (
+                        "monthly_pnl_usd_on_25k",
+                        "pct_per_month_on_25k",
+                        "trades_per_month",
+                        "metrics_90d",
+                        "all_pass",
+                        "verdict",
+                        "accept_or_reject_reason",
+                    )
+                },
                 "note": "Live fallback floor — too small to call finished",
             },
             {
                 "row": "best_full_capital_variant",
-                **{k: best_cap.get(k) for k in (
-                    "label", "monthly_pnl_usd_on_25k", "pct_per_month_on_25k", "trades_per_month",
-                    "metrics_90d", "cash_safety", "all_pass", "verdict", "accept_or_reject_reason",
-                )},
+                **{
+                    k: best_cap.get(k)
+                    for k in (
+                        "label",
+                        "monthly_pnl_usd_on_25k",
+                        "pct_per_month_on_25k",
+                        "trades_per_month",
+                        "metrics_90d",
+                        "cash_safety",
+                        "all_pass",
+                        "verdict",
+                        "accept_or_reject_reason",
+                    )
+                },
             },
             {
                 "row": "best_profit_floor_variant",
-                **{k: best_floor.get(k) for k in (
-                    "label", "monthly_pnl_usd_on_25k", "pct_per_month_on_25k", "trades_per_month",
-                    "metrics_90d", "all_pass", "verdict", "accept_or_reject_reason",
-                )},
+                **{
+                    k: best_floor.get(k)
+                    for k in (
+                        "label",
+                        "monthly_pnl_usd_on_25k",
+                        "pct_per_month_on_25k",
+                        "trades_per_month",
+                        "metrics_90d",
+                        "all_pass",
+                        "verdict",
+                        "accept_or_reject_reason",
+                    )
+                },
             },
             {
                 "row": "best_combined_all_pass",
-                **{k: best_combo.get(k) for k in (
-                    "label", "monthly_pnl_usd_on_25k", "pct_per_month_on_25k", "trades_per_month",
-                    "metrics_90d", "all_pass", "verdict", "accept_or_reject_reason",
-                )},
+                **{
+                    k: best_combo.get(k)
+                    for k in (
+                        "label",
+                        "monthly_pnl_usd_on_25k",
+                        "pct_per_month_on_25k",
+                        "trades_per_month",
+                        "metrics_90d",
+                        "all_pass",
+                        "verdict",
+                        "accept_or_reject_reason",
+                    )
+                },
             },
             {
                 "row": "best_new_bucket_expansion",
                 **(
-                    {k: best_bucket.get(k) for k in (
-                        "id", "monthly_pnl_usd_on_25k", "trades_per_month", "metrics_90d",
-                        "all_pass", "verdict", "accept_or_reject_reason",
-                    )}
+                    {
+                        k: best_bucket.get(k)
+                        for k in (
+                            "id",
+                            "monthly_pnl_usd_on_25k",
+                            "trades_per_month",
+                            "metrics_90d",
+                            "all_pass",
+                            "verdict",
+                            "accept_or_reject_reason",
+                        )
+                    }
                     if best_bucket
                     else {"note": "none passed"}
                 ),

@@ -15,8 +15,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
-from scripts.run_scalp_phase3b_audit import analyze_trade  # noqa: E402
+from backend.services.binance_scalp.economics import ScalpEconomics
+from scripts.run_scalp_phase3b_audit import analyze_trade
 
 DB = REPO / "mystic_trading.db"
 REJECT_REASONS = (
@@ -55,15 +55,8 @@ def _redis_mem() -> dict:
 
 
 def _day_snapshot(conn: sqlite3.Connection) -> dict:
-    ledger = conn.execute(
-        "SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1"
-    ).fetchone()
-    positions = [
-        dict(zip(["symbol", "quantity", "entry_price"], r))
-        for r in conn.execute(
-            "SELECT symbol, quantity, entry_price FROM portfolio_engine_positions"
-        ).fetchall()
-    ]
+    ledger = conn.execute("SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
+    positions = [dict(zip(["symbol", "quantity", "entry_price"], r, strict=False)) for r in conn.execute("SELECT symbol, quantity, entry_price FROM portfolio_engine_positions").fetchall()]
     paper_count = conn.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0]
     return {
         "ledger": {"cash_balance": ledger[0], "total_equity": ledger[1]} if ledger else None,
@@ -132,9 +125,7 @@ def build_report(
             "SELECT * FROM scalp_paper_trades WHERE side='SELL' AND created_at >= ? ORDER BY id",
             (soak_start,),
         ).fetchall()
-        open_pos = conn.execute(
-            "SELECT * FROM scalp_paper_positions WHERE status='OPEN'"
-        ).fetchall()
+        open_pos = conn.execute("SELECT * FROM scalp_paper_positions WHERE status='OPEN'").fetchall()
         reject_rows = conn.execute(
             """
             SELECT reason, COUNT(*) as cnt FROM scalp_rejects
@@ -203,10 +194,7 @@ def build_report(
     mem_stable = mem_avail_after >= mem_avail_before * 0.85 if mem_avail_before else True
 
     safe = (
-        day_untouched
-        and after.get("day_health", {}).get("http_code") == 200
-        and not journal_errors.strip()
-        and baseline.get("scalp_ledger") != {}  # sanity
+        day_untouched and after.get("day_health", {}).get("http_code") == 200 and not journal_errors.strip() and baseline.get("scalp_ledger") != {}  # sanity
     )
 
     return {

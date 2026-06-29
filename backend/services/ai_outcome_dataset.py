@@ -3,6 +3,7 @@ AI outcome-driven labeled dataset — replay only, no live I/O.
 
 Builds 145-dim feature rows + forward MFE/MAE / target-before-adverse labels from historical bars.
 """
+
 from __future__ import annotations
 
 import bisect
@@ -63,13 +64,13 @@ def _bar_index_up_to(bars: list[Bar], ts: int) -> int:
 
 
 def _candle_structure(bar: Bar) -> dict[str, float]:
-    o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
-    rng = max(h - l, 1e-12)
+    o, h, low, c = bar["open"], bar["high"], bar["low"], bar["close"]
+    rng = max(h - low, 1e-12)
     body = abs(c - o)
     return {
         "body_pct": body / max(c, 1e-12),
         "upper_wick_pct": (h - max(o, c)) / rng,
-        "lower_wick_pct": (min(o, c) - l) / rng,
+        "lower_wick_pct": (min(o, c) - low) / rng,
         "bullish": 1.0 if c > o else 0.0,
     }
 
@@ -122,9 +123,7 @@ def build_features_145(
     ctx_raw = htf_context(h1, h4, ts)
     vol_avg = sum(b["volume"] for b in h1[-24:]) / max(len(h1[-24:]), 1)
     rel_vol = h1[-1]["volume"] / max(vol_avg, 1e-9)
-    vwap = sum((b["high"] + b["low"] + b["close"]) / 3 * b["volume"] for b in h1[-24:]) / max(
-        sum(b["volume"] for b in h1[-24:]), 1e-9
-    )
+    vwap = sum((b["high"] + b["low"] + b["close"]) / 3 * b["volume"] for b in h1[-24:]) / max(sum(b["volume"] for b in h1[-24:]), 1e-9)
     price = bars_1m[idx_1m]["close"]
 
     ai_context = {
@@ -319,21 +318,21 @@ def build_dataset_rows(
                 continue
             vec, meta = feat
             entry_price = bar["close"]
-            labels = compute_forward_labels_at_idx(
-                idx_1m, ts, entry_price, ts_arr, high_arr, low_arr, close_arr, econ, scalp=scalp
-            )
+            labels = compute_forward_labels_at_idx(idx_1m, ts, entry_price, ts_arr, high_arr, low_arr, close_arr, econ, scalp=scalp)
             if not labels:
                 continue
 
-            rows.append({
-                "symbol": symbol,
-                "timestamp": ts,
-                "timeframe": tf if not scalp else "1m",
-                "features_145": vec,
-                "meta": meta,
-                "labels": labels,
-                "entry_price": entry_price,
-            })
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "timestamp": ts,
+                    "timeframe": tf if not scalp else "1m",
+                    "features_145": vec,
+                    "meta": meta,
+                    "labels": labels,
+                    "entry_price": entry_price,
+                }
+            )
             built += 1
             if built % 200 == 0:
                 print(f"      {symbol} {tf}: {built} rows", flush=True)

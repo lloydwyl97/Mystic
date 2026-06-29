@@ -4,13 +4,14 @@ DAY bucket discovery — expansion testing on top of locked all_pass baseline.
 
 Does NOT modify live rules. Tests candidate buckets additively via replay only.
 """
+
 from __future__ import annotations
 
 import json
 import sys
 import traceback
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 BASELINE_DIR = REPO / "scripts" / "replay_baselines"
 
-from backend.services.day_bucket_quality import REPLAY_KILLED_BUCKETS, bucket_key, evaluate_bucket_entry
+from backend.services.day_bucket_quality import REPLAY_KILLED_BUCKETS, bucket_key, buckets_negative, evaluate_bucket_entry
 from backend.services.day_regime_router import (
     DAY_REGIME_BEAR,
     DAY_REGIME_BULL,
@@ -37,14 +38,13 @@ from backend.services.day_trade_thesis import (
 from scripts.run_day_strategy_replay import (
     SYMBOLS,
     WINDOWS_DAYS,
-    build_decision_data,
-    fetch_klines_1h,
-    run_replay,
     _atr_pct,
     _resample_4h,
     _stats_from_report,
+    build_decision_data,
+    fetch_klines_1h,
+    run_replay,
 )
-from backend.services.day_bucket_quality import buckets_negative
 
 PRINCIPAL = 25000.0
 
@@ -95,13 +95,19 @@ def _run_full_suite(all_bars: dict, discovery_allow: frozenset | None = None) ->
     train_buckets = _stats_from_report(train.get("bucket_report", []))
     train_killed = buckets_negative(train_buckets, min_trades=3)
     val = run_replay(
-        all_bars, start_ts=t_end, end_ts=v_end,
-        extra_killed=train_killed, train_bucket_stats=train_buckets,
+        all_bars,
+        start_ts=t_end,
+        end_ts=v_end,
+        extra_killed=train_killed,
+        train_bucket_stats=train_buckets,
         discovery_allow_buckets=discovery_allow,
     )
     test = run_replay(
-        all_bars, start_ts=v_end, end_ts=end_ts,
-        extra_killed=train_killed, train_bucket_stats=train_buckets,
+        all_bars,
+        start_ts=v_end,
+        end_ts=end_ts,
+        extra_killed=train_killed,
+        train_bucket_stats=train_buckets,
         discovery_allow_buckets=discovery_allow,
     )
     wf = {"train": train, "validation": val, "test": test, "train_killed_buckets": [list(k) for k in train_killed]}
@@ -111,7 +117,7 @@ def _run_full_suite(all_bars: dict, discovery_allow: frozenset | None = None) ->
 def _band(val: float, edges: list[float]) -> str:
     for i in range(len(edges) - 1):
         if edges[i] <= val < edges[i + 1]:
-            return f"{edges[i]}-{edges[i+1]}"
+            return f"{edges[i]}-{edges[i + 1]}"
     return f">={edges[-1]}"
 
 
@@ -141,15 +147,17 @@ def _segment_baseline_trades(trade_details: list[dict]) -> list[dict]:
     rows = []
     for k, v in sorted(segments.items()):
         n = v["trades"]
-        rows.append({
-            "segment": k,
-            "trades": n,
-            "net_pnl_usd": round(v["net_pnl"], 2),
-            "expectancy_usd": round(v["net_pnl"] / n, 2) if n else 0,
-            "avg_hold_hours": round(sum(v["holds"]) / n, 1) if n else 0,
-            "avg_mae_pct": round(sum(v["mae"]) / n, 5) if n else 0,
-            "avg_mfe_pct": round(sum(v["mfe"]) / n, 5) if n else 0,
-        })
+        rows.append(
+            {
+                "segment": k,
+                "trades": n,
+                "net_pnl_usd": round(v["net_pnl"], 2),
+                "expectancy_usd": round(v["net_pnl"] / n, 2) if n else 0,
+                "avg_hold_hours": round(sum(v["holds"]) / n, 1) if n else 0,
+                "avg_mae_pct": round(sum(v["mae"]) / n, 5) if n else 0,
+                "avg_mfe_pct": round(sum(v["mfe"]) / n, 5) if n else 0,
+            }
+        )
     return rows
 
 
@@ -157,13 +165,11 @@ def _scan_opportunities(all_bars: dict, *, symbol: str | None, regime: str | Non
     end_ts = all_bars[SYMBOLS[0]][-1]["ts"]
     start_ts = end_ts - 90 * 86400
     counts: dict[str, int] = defaultdict(int)
-    idx_map = {s: 0 for s in SYMBOLS}
+    idx_map = dict.fromkeys(SYMBOLS, 0)
     for s in SYMBOLS:
         while idx_map[s] < len(all_bars[s]) and all_bars[s][idx_map[s]]["ts"] < start_ts:
             idx_map[s] += 1
-    timeline = sorted(
-        {all_bars[s][i]["ts"] for s in SYMBOLS for i in range(idx_map[s], len(all_bars[s])) if all_bars[s][i]["ts"] >= start_ts}
-    )
+    timeline = sorted({all_bars[s][i]["ts"] for s in SYMBOLS for i in range(idx_map[s], len(all_bars[s])) if all_bars[s][i]["ts"] >= start_ts})
     warmup = 80
     for bar_ts in timeline:
         for sym in SYMBOLS:
@@ -183,7 +189,12 @@ def _scan_opportunities(all_bars: dict, *, symbol: str | None, regime: str | Non
             chop = 0.65 if dd["adx"] < 18 else 0.45
             ps = dd["price_structure_regime"]
             dd = apply_trade_thesis_to_candidate_fields(
-                dd, symbol=sym, current_price=mark, atr=atr, strategy_id="day", price_structure_regime=ps,
+                dd,
+                symbol=sym,
+                current_price=mark,
+                atr=atr,
+                strategy_id="day",
+                price_structure_regime=ps,
             )
             reg = classify_day_regime(dd, context_payload=None, chop_score=chop, atr_ratio=_atr_pct(slice_1h), price_structure_regime=ps)
             setup = str(dd.get("setup_type") or SETUP_NO_CLEAR_THESIS)
@@ -197,8 +208,12 @@ def _scan_opportunities(all_bars: dict, *, symbol: str | None, regime: str | Non
                 counts["no_clear_thesis"] += 1
                 continue
             route = evaluate_day_entry_route(
-                setup_type=setup, day_regime=reg, decision_data=dd,
-                context_payload=None, current_price=mark, thesis_score=float(dd.get("thesis_score") or 0),
+                setup_type=setup,
+                day_regime=reg,
+                decision_data=dd,
+                context_payload=None,
+                current_price=mark,
+                thesis_score=float(dd.get("thesis_score") or 0),
             )
             if not route.get("allowed"):
                 counts[str(route.get("block_reason") or "route_block")] += 1
@@ -214,24 +229,34 @@ def _scan_opportunities(all_bars: dict, *, symbol: str | None, regime: str | Non
 def _candidate_list() -> list[dict[str, Any]]:
     cands: list[dict[str, Any]] = []
     for seg in [
-        "adx_12-18", "adx_18-22", "adx_22-28",
-        "rsi_32-36", "bb_0-0.15", "bb_0.15-0.25",
-        "relvol_0.8-1.0", "relvol_1.0-1.3", "htf4h_0.45-0.55",
+        "adx_12-18",
+        "adx_18-22",
+        "adx_22-28",
+        "rsi_32-36",
+        "bb_0-0.15",
+        "bb_0.15-0.25",
+        "relvol_0.8-1.0",
+        "relvol_1.0-1.3",
+        "htf4h_0.45-0.55",
     ]:
         cands.append({"id": f"baseline_segment/{seg}", "type": "segment", "segment": seg})
 
-    cands.append({
-        "id": "SOL/USDT/range/VWAP_REVERSION",
-        "type": "expansion_bucket",
-        "bucket": bucket_key("SOL/USDT", DAY_REGIME_RANGE, SETUP_VWAP_REVERSION),
-    })
+    cands.append(
+        {
+            "id": "SOL/USDT/range/VWAP_REVERSION",
+            "type": "expansion_bucket",
+            "bucket": bucket_key("SOL/USDT", DAY_REGIME_RANGE, SETUP_VWAP_REVERSION),
+        }
+    )
 
     for sym in ("BTC/USDT", "ETH/USDT", "XRP/USDT"):
-        cands.append({
-            "id": f"{sym}/range/VWAP_REVERSION",
-            "type": "forbidden_revive",
-            "bucket": bucket_key(sym, DAY_REGIME_RANGE, SETUP_VWAP_REVERSION),
-        })
+        cands.append(
+            {
+                "id": f"{sym}/range/VWAP_REVERSION",
+                "type": "forbidden_revive",
+                "bucket": bucket_key(sym, DAY_REGIME_RANGE, SETUP_VWAP_REVERSION),
+            }
+        )
 
     for thesis in (SETUP_BREAKOUT_CONTINUATION, SETUP_HTF_TREND_PULLBACK):
         for reg in (DAY_REGIME_NEUTRAL, DAY_REGIME_RANGE):
@@ -288,12 +313,14 @@ def main() -> int:
                     continue
 
                 if cand["type"] == "forbidden_revive":
-                    evaluated.append({
-                        "id": cid,
-                        "status": "rejected",
-                        "reason": "baseline_locked_replay_proven_negative",
-                        "all_pass_after_add": False,
-                    })
+                    evaluated.append(
+                        {
+                            "id": cid,
+                            "status": "rejected",
+                            "reason": "baseline_locked_replay_proven_negative",
+                            "all_pass_after_add": False,
+                        }
+                    )
                     continue
 
                 if cand["type"] == "expansion_bucket":
@@ -313,33 +340,37 @@ def main() -> int:
                         and (test.get("expectancy_per_trade_usd") or 0) > 0
                         and scan.get("would_enter", 0) >= 3
                     )
-                    evaluated.append({
-                        "id": cid,
-                        "status": "accepted" if accepted else "rejected",
-                        "reason": "" if accepted else _reject_reason(pc, val, test, scan, baseline_trades_90, new_trades),
-                        "opportunity_scan_90d": scan,
-                        "all_pass_after_add": pc["all_pass"],
-                        "90d_net_pnl_usd": w90.get("net_pnl_usd"),
-                        "90d_expectancy_usd": w90.get("expectancy_per_trade_usd"),
-                        "90d_max_drawdown_pct": w90.get("max_drawdown_pct"),
-                        "90d_longest_hold_hours": w90.get("longest_hold_hours"),
-                        "wf_validation_exp": val.get("expectancy_per_trade_usd"),
-                        "wf_test_exp": test.get("expectancy_per_trade_usd"),
-                        "expected_trades_per_month": round(new_trades / 3, 2),
-                        "expected_monthly_pnl_usd_25k": round((w90.get("net_pnl_usd") or 0) / 3, 2),
-                        "trades_added_vs_baseline": new_trades - baseline_trades_90,
-                        "duplicate_attempts": w90.get("duplicate_attempts"),
-                        "red_thesis_sells": w90.get("red_thesis_sell_count"),
-                    })
+                    evaluated.append(
+                        {
+                            "id": cid,
+                            "status": "accepted" if accepted else "rejected",
+                            "reason": "" if accepted else _reject_reason(pc, val, test, scan, baseline_trades_90, new_trades),
+                            "opportunity_scan_90d": scan,
+                            "all_pass_after_add": pc["all_pass"],
+                            "90d_net_pnl_usd": w90.get("net_pnl_usd"),
+                            "90d_expectancy_usd": w90.get("expectancy_per_trade_usd"),
+                            "90d_max_drawdown_pct": w90.get("max_drawdown_pct"),
+                            "90d_longest_hold_hours": w90.get("longest_hold_hours"),
+                            "wf_validation_exp": val.get("expectancy_per_trade_usd"),
+                            "wf_test_exp": test.get("expectancy_per_trade_usd"),
+                            "expected_trades_per_month": round(new_trades / 3, 2),
+                            "expected_monthly_pnl_usd_25k": round((w90.get("net_pnl_usd") or 0) / 3, 2),
+                            "trades_added_vs_baseline": new_trades - baseline_trades_90,
+                            "duplicate_attempts": w90.get("duplicate_attempts"),
+                            "red_thesis_sells": w90.get("red_thesis_sell_count"),
+                        }
+                    )
                     continue
 
                 # natural bull/bear
                 scan = _scan_opportunities(
-                    all_bars, symbol=cand["symbol"], regime=cand["regime"], thesis=cand["thesis"],
+                    all_bars,
+                    symbol=cand["symbol"],
+                    regime=cand["regime"],
+                    thesis=cand["thesis"],
                 )
                 br = next(
-                    (r for r in baseline["windows"]["90d"].get("bucket_report", [])
-                     if r.get("symbol") == cand["symbol"] and r.get("regime") == cand["regime"] and r.get("thesis") == cand["thesis"]),
+                    (r for r in baseline["windows"]["90d"].get("bucket_report", []) if r.get("symbol") == cand["symbol"] and r.get("regime") == cand["regime"] and r.get("thesis") == cand["thesis"]),
                     {},
                 )
                 trades = int(br.get("trades") or 0)
@@ -362,18 +393,20 @@ def main() -> int:
                 else:
                     reason = ""
                     accepted = True
-                evaluated.append({
-                    "id": cid,
-                    "status": "accepted" if accepted else "rejected",
-                    "reason": reason if not accepted else "",
-                    "opportunity_scan_90d": scan,
-                    "bucket_stats_90d": br,
-                    "all_pass_after_add": pc["all_pass"],
-                    "expected_trades_per_month": round(trades / 3, 2) if trades else 0,
-                    "expected_monthly_pnl_usd_25k": round(float(br.get("net_pnl_usd") or 0) / 3, 2),
-                    "90d_max_drawdown_pct": baseline["windows"]["90d"].get("max_drawdown_pct"),
-                    "90d_longest_hold_hours": baseline["windows"]["90d"].get("longest_hold_hours"),
-                })
+                evaluated.append(
+                    {
+                        "id": cid,
+                        "status": "accepted" if accepted else "rejected",
+                        "reason": reason if not accepted else "",
+                        "opportunity_scan_90d": scan,
+                        "bucket_stats_90d": br,
+                        "all_pass_after_add": pc["all_pass"],
+                        "expected_trades_per_month": round(trades / 3, 2) if trades else 0,
+                        "expected_monthly_pnl_usd_25k": round(float(br.get("net_pnl_usd") or 0) / 3, 2),
+                        "90d_max_drawdown_pct": baseline["windows"]["90d"].get("max_drawdown_pct"),
+                        "90d_longest_hold_hours": baseline["windows"]["90d"].get("longest_hold_hours"),
+                    }
+                )
             except Exception:
                 evaluated.append({"id": cid, "status": "error", "error": traceback.format_exc()})
                 tracebacks.append(traceback.format_exc())
@@ -409,10 +442,7 @@ def main() -> int:
                 }
                 for ph in ("train", "validation", "test")
             },
-            "baseline_active_buckets": [
-                r for r in baseline["windows"]["90d"].get("bucket_report", [])
-                if float(r.get("expectancy_usd") or 0) > 0
-            ],
+            "baseline_active_buckets": [r for r in baseline["windows"]["90d"].get("bucket_report", []) if float(r.get("expectancy_usd") or 0) > 0],
             "baseline_segments": baseline["baseline_segments"],
             "discovered_candidate_buckets": evaluated,
             "accepted_new_buckets": [e for e in evaluated if e.get("status") == "accepted"],

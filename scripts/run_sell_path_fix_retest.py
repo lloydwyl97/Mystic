@@ -20,8 +20,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 _env = PROJECT_ROOT / ".env"
 if _env.exists():
-    for line in _env.read_text().splitlines():
-        line = line.strip()
+    for raw_line in _env.read_text().splitlines():
+        line = raw_line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
@@ -83,7 +83,7 @@ async def _run_xrp_sell_attempt(
         return {"error": "no_xrp_position"}
 
     entry = float(pos.entry_price)
-    qty = float(pos.quantity)
+    float(pos.quantity)
     test_mark = entry * (1.0 + ESTIMATED_ROUNDTRIP_COST + MIN_NET_PROFIT_TO_SELL + 0.001)
     engine._price_cache.set(ns, test_mark)
 

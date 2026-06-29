@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Build final DAY baseline status package — economics locked with baseline v1."""
+
 from __future__ import annotations
 
 import hashlib
@@ -21,7 +22,6 @@ from backend.services.day_bucket_quality import REPLAY_KILLED_BUCKETS, active_al
 from backend.services.fill_fee_audit import bnb_fee_discount_status, config_fee_override_locations
 from scripts.run_day_execution_replay import _build_fee_profiles
 from scripts.run_day_strategy_replay import _stats_from_report
-
 
 ACCEPTED_REPLAY_PROFILE = "binance_us_taker"
 
@@ -53,7 +53,7 @@ def _load_json(name: str) -> dict[str, Any]:
 def build_status() -> dict[str, Any]:
     baseline = _load_json(f"{BASELINE_ID}.json")
     exec_rep = _load_json("day_execution_replay_latest.json")
-    lock = _load_json("BASELINE_LOCK.json")
+    _load_json("BASELINE_LOCK.json")
 
     live_econ = get_trading_economics_display()
     verified = verify_top_four_pairs()
@@ -83,17 +83,12 @@ def build_status() -> dict[str, Any]:
         "legacy_old_replay_profile": "old_replay",
         "legacy_profile_used_for_pass_criteria": False,
         "legacy_double_count_removed_from_accepted_path": True,
-        "legacy_stress_gate_note": (
-            "old_replay subtracted roundtrip_cost again after fill-adjusted prices (path-dependent; not used for pass)"
-        ),
+        "legacy_stress_gate_note": ("old_replay subtracted roundtrip_cost again after fill-adjusted prices (path-dependent; not used for pass)"),
     }
 
     economics = {
         **live_econ,
-        "live_measured_half_spread": {
-            k: v.get("orderbook_half_spread_pct")
-            for k, v in verified.get("pairs", {}).items()
-        },
+        "live_measured_half_spread": {k: v.get("orderbook_half_spread_pct") for k, v in verified.get("pairs", {}).items()},
         "top_four_tier0_001_taker": False,
         "platform_spread": 0.0,
         "bnb_fee_discount": bnb_fee_discount_status(),
@@ -146,24 +141,27 @@ def main() -> int:
 
     lock_path = BASELINE_DIR / "BASELINE_LOCK.json"
     lock = _load_json("BASELINE_LOCK.json") if lock_path.exists() else {}
-    lock.update({
-        "baseline_id": BASELINE_ID,
-        "locked_at": datetime.now(timezone.utc).isoformat(),
-        "all_pass": status["replay_all_pass"] and status["high_resolution_all_pass"],
-        "economics_locked": True,
-        "accepted_replay_profile": ACCEPTED_REPLAY_PROFILE,
-        "economics": status["economics_config"],
-        "final_status_file": "DAY_BASELINE_FINAL_STATUS.json",
-        "rules_unchanged": True,
-        "live_modifications_forbidden": lock.get("live_modifications_forbidden") or [
-            "no_revive_killed_buckets",
-            "no_new_blockers",
-            "no_new_modes",
-            "neutral_vwap_positive_buckets_only",
-            "range_vwap_btc_eth_xrp_killed",
-            "breakout_pullback_blocked_replay_negative",
-        ],
-    })
+    lock.update(
+        {
+            "baseline_id": BASELINE_ID,
+            "locked_at": datetime.now(timezone.utc).isoformat(),
+            "all_pass": status["replay_all_pass"] and status["high_resolution_all_pass"],
+            "economics_locked": True,
+            "accepted_replay_profile": ACCEPTED_REPLAY_PROFILE,
+            "economics": status["economics_config"],
+            "final_status_file": "DAY_BASELINE_FINAL_STATUS.json",
+            "rules_unchanged": True,
+            "live_modifications_forbidden": lock.get("live_modifications_forbidden")
+            or [
+                "no_revive_killed_buckets",
+                "no_new_blockers",
+                "no_new_modes",
+                "neutral_vwap_positive_buckets_only",
+                "range_vwap_btc_eth_xrp_killed",
+                "breakout_pullback_blocked_replay_negative",
+            ],
+        }
+    )
     lock_path.write_text(json.dumps(lock, indent=2, default=str))
     print(json.dumps(status, indent=2, default=str))
     return 0

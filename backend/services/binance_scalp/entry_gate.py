@@ -28,9 +28,7 @@ def build_reachability_diagnostics(
     selected_symbol: str | None = None,
     reject_reason: str | None = None,
 ) -> dict:
-    required = econ.entry_required_gross_edge_pct(
-        spread_pct, buy_impact_pct, sell_impact_pct
-    )
+    required = econ.entry_required_gross_edge_pct(spread_pct, buy_impact_pct, sell_impact_pct)
     projected = estimate.projected_gross_move_pct
     surplus = projected - required
     reach = {
@@ -44,9 +42,7 @@ def build_reachability_diagnostics(
         "fee_cost_pct": econ.entry_fee_pct() + econ.exit_fee_pct(),
         "slippage_pct": econ.slippage_buffer_pct,
         "impact_pct": buy_impact_pct + sell_impact_pct,
-        "roundtrip_cost_pct": econ.roundtrip_cost_pct(
-            spread_pct, buy_impact_pct, sell_impact_pct
-        ),
+        "roundtrip_cost_pct": econ.roundtrip_cost_pct(spread_pct, buy_impact_pct, sell_impact_pct),
         "net_profit_target_pct": econ.net_profit_target_pct,
         "entry_edge_buffer_pct": econ.entry_edge_buffer_pct,
         "entry_required_gross_edge_pct_env": econ.entry_required_gross_edge_pct_env,
@@ -75,9 +71,7 @@ def evaluate_buy_entry_gate(
     selected_symbol: str | None = None,
 ) -> tuple[bool, str, dict]:
     """Return (passed, reject_reason, reachability_diagnostics)."""
-    required = econ.entry_required_gross_edge_pct(
-        spread_pct, buy_impact_pct, sell_impact_pct
-    )
+    required = econ.entry_required_gross_edge_pct(spread_pct, buy_impact_pct, sell_impact_pct)
     projected = estimate.projected_gross_move_pct
     surplus = projected - required
 

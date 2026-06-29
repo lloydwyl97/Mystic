@@ -1640,8 +1640,8 @@ async def get_model_panel() -> dict[str, Any]:
     """Read-only model/learning visibility per top-4 symbol (no auto-promotion)."""
     try:
         from backend.database_schema import DATABASE_PATH
-        from backend.services.ai_model_behavior_diagnostics import build_model_behavior_report
         from backend.services.ai_market_diagnostics import build_model_freshness_report
+        from backend.services.ai_model_behavior_diagnostics import build_model_behavior_report
 
         behavior = build_model_behavior_report(DATABASE_PATH)
         freshness = build_model_freshness_report(DATABASE_PATH)
@@ -1704,7 +1704,7 @@ async def get_model_panel() -> dict[str, Any]:
                         "feature_version": meta.get("feature_version"),
                         "feature_dim": meta.get("feature_dim"),
                         "last_promotion_event": pe.get("last_event_at") if pe.get("last_event_type") == "promoted" else None,
-                        "last_rejection_event": pe.get("last_event_at") if pe.get("last_event_type") == "rejected" else pe.get("last_event_at"),
+                        "last_rejection_event": pe.get("last_event_at") if pe.get("last_event_type") == "rejected" else None,
                     }
                 )
         return {

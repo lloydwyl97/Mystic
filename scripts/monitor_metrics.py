@@ -31,7 +31,7 @@ def fetch_json(url: str, timeout: float = 20.0) -> tuple[dict[str, Any] | None, 
         return None, f"URL error for {url}: {exc.reason}"
     except TimeoutError:
         return None, f"timeout fetching {url}"
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return None, f"fetch failed for {url}: {exc}"
 
 

@@ -142,7 +142,6 @@ def _service_active() -> bool:
 def clear_entry_armed(redis_url: str | None = None, *, prefix: str | None = None) -> bool:
     try:
         import redis
-
         from backend.services.binance_scalp.config import get_scalp_config
         from backend.services.binance_scalp.scalp_control import clear_entry_armed as _clear
 
@@ -159,9 +158,7 @@ def clear_entry_armed(redis_url: str | None = None, *, prefix: str | None = None
 def open_positions(db_path: str) -> list[dict[str, Any]]:
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT * FROM scalp_paper_positions WHERE status='OPEN'"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM scalp_paper_positions WHERE status='OPEN'").fetchall()
     return [dict(r) for r in rows]
 
 
@@ -176,15 +173,10 @@ def close_open_positions(
     closed: list[dict[str, Any]] = []
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT * FROM scalp_paper_positions WHERE status='OPEN'"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM scalp_paper_positions WHERE status='OPEN'").fetchall()
         if not rows:
             return closed
-        ledger = conn.execute(
-            "SELECT cash_balance, positions_value, realized_pnl, total_equity "
-            "FROM scalp_paper_ledger WHERE id=1"
-        ).fetchone()
+        ledger = conn.execute("SELECT cash_balance, positions_value, realized_pnl, total_equity FROM scalp_paper_ledger WHERE id=1").fetchone()
         pre = dict(ledger) if ledger else {}
 
         for row in rows:
@@ -277,11 +269,7 @@ def verify_safe_state(db_path: str) -> dict[str, Any]:
         [
             str(_venv_python()),
             "-c",
-            (
-                "import redis; "
-                "r=redis.from_url('redis://127.0.0.1:6379/0', decode_responses=True); "
-                "print(r.get('scalp:control:entry_armed') or '0')"
-            ),
+            ("import redis; r=redis.from_url('redis://127.0.0.1:6379/0', decode_responses=True); print(r.get('scalp:control:entry_armed') or '0')"),
         ],
         capture_output=True,
         text=True,

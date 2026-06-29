@@ -13,8 +13,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.calibration_profiles import apply_profile  # noqa: E402
-from backend.services.binance_scalp.economics import ScalpEconomics  # noqa: E402
+from backend.services.binance_scalp.calibration_profiles import apply_profile
+from backend.services.binance_scalp.economics import ScalpEconomics
 
 TRADE_IDS = (
     "scalp_paper_XRPUSDT_1780927511905",
@@ -25,10 +25,7 @@ STALE_OPTS = (180, 210, 240, 300)
 
 
 def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
-    url = (
-        f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m"
-        f"&startTime={start_ms}&endTime={end_ms}&limit=1000"
-    )
+    url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m&startTime={start_ms}&endTime={end_ms}&limit=1000"
     proc = subprocess.run(
         ["curl", "-s", "--max-time", "30", url],
         capture_output=True,
@@ -150,11 +147,7 @@ def main() -> int:
 
             stale_why = None
             if exit_reason == "STALE_SCALP_TIMEOUT":
-                stale_why = (
-                    f"held {(exit_ms - entry_ms)/1000:.0f}s without net target; "
-                    f"max_fav={max_fav*100:.3f}% max_adv={max_adv*100:.3f}% "
-                    f"target_px={target_px:.6f} max_hi={max_hi:.6f}"
-                )
+                stale_why = f"held {(exit_ms - entry_ms) / 1000:.0f}s without net target; max_fav={max_fav * 100:.3f}% max_adv={max_adv * 100:.3f}% target_px={target_px:.6f} max_hi={max_hi:.6f}"
 
             report.append(
                 {
@@ -188,9 +181,7 @@ def main() -> int:
                     "max_adverse_move_pct": round(max_adv * 100, 4),
                     "hit_target_during_hold": hit_target_during,
                     "stale_exit_reason": stale_why,
-                    "stale_timeout_what_if": simulate_stale_outcomes(
-                        bars, entry_ms, float(entry_px), spread, econ
-                    ),
+                    "stale_timeout_what_if": simulate_stale_outcomes(bars, entry_ms, float(entry_px), spread, econ),
                     "xrp_cap_would_block": {
                         "0.10%": spread > 0.001,
                         "0.09%": spread > 0.0009,

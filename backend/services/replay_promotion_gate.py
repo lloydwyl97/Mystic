@@ -4,6 +4,7 @@ Unified replay promotion gate — research only.
 No live promotion unless execution replay passes all gates.
 Label-proxy / train-only metrics never satisfy promotion.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -73,20 +74,24 @@ def evaluate_scalp_promotion(metrics: dict[str, Any], *, execution_replay_verifi
     return False, reasons  # scalp never auto-promotes until explicitly re-enabled
 
 
-RESEARCH_EXHAUSTED = frozenset({
-    "ltf_hand_coded_patterns",
-    "controlled_risk_bracket_exits",
-    "frequency_first_regime_remap",
-    "ai_label_proxy_buckets",
-    "universe_expansion_without_execution_replay",
-    "scalp_profit_contribution",
-})
+RESEARCH_EXHAUSTED = frozenset(
+    {
+        "ltf_hand_coded_patterns",
+        "controlled_risk_bracket_exits",
+        "frequency_first_regime_remap",
+        "ai_label_proxy_buckets",
+        "universe_expansion_without_execution_replay",
+        "scalp_profit_contribution",
+    }
+)
 
-RESEARCH_EXCLUDED_SYMBOLS = frozenset({
-    "BNB/USD",
-    "BNB/USDT",
-    "BNB/USDC",
-})
+RESEARCH_EXCLUDED_SYMBOLS = frozenset(
+    {
+        "BNB/USD",
+        "BNB/USDT",
+        "BNB/USDC",
+    }
+)
 
 
 def block_exhausted_branch(branch_name: str) -> None:

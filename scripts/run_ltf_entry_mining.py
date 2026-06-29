@@ -4,13 +4,14 @@ LTF entry mining — EXHAUSTED research branch (diagnostic only).
 
 Set MYSTIC_FORCE_EXHAUSTED_RESEARCH=1 to re-run. Use run_topfour_profit_rebuild.py for active research.
 """
+
 from __future__ import annotations
 
 import json
 import sys
 import traceback
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,8 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 BASELINE_DIR = REPO / "scripts" / "replay_baselines"
 
-from backend.config.trading_economics import ORDERBOOK_HALF_SPREAD_ESTIMATE
 from backend.config.binance_us_fee_schedule import verify_top_four_pairs
+from backend.config.trading_economics import ORDERBOOK_HALF_SPREAD_ESTIMATE
 from backend.services.ltf_pattern_miner import (
     Economics,
     MinedTrade,
@@ -27,13 +28,13 @@ from backend.services.ltf_pattern_miner import (
     aggregate_metrics,
     make_pattern_catalog,
     mine_symbol_pattern,
-    reject_candidate,
     regime_bucket_report,
+    reject_candidate,
     resample_bars,
     walk_forward_split,
 )
 from scripts.run_day_execution_replay import fetch_klines_cached
-from scripts.run_day_strategy_replay import PRINCIPAL, SYMBOLS, SYMBOL_API
+from scripts.run_day_strategy_replay import PRINCIPAL, SYMBOL_API, SYMBOLS
 
 TARGET_MONTHLY = 500.0
 MIN_PCT_MONTH = 2.0
@@ -118,10 +119,7 @@ def _evaluate_pattern(
     accepted, reasons = reject_candidate(metrics, wf, spread_ok=spread_ok)
 
     entry_cond = f"LTF {spec.timeframe_min}m pattern {spec.pattern_id}"
-    exit_cond = (
-        f"net>={spec.profit_target_pct:.2%} | stop={spec.stop_atr_mult}ATR | "
-        f"time={spec.time_stop_hours}h | max72h"
-    )
+    exit_cond = f"net>={spec.profit_target_pct:.2%} | stop={spec.stop_atr_mult}ATR | time={spec.time_stop_hours}h | max72h"
 
     return {
         "pattern_id": spec.pattern_id,
@@ -155,7 +153,7 @@ def main() -> int:
 
     results: list[dict[str, Any]] = []
     for i, spec in enumerate(catalog):
-        print(f"  [{i+1}/{len(catalog)}] {spec.pattern_id} ({spec.category})...", flush=True)
+        print(f"  [{i + 1}/{len(catalog)}] {spec.pattern_id} ({spec.category})...", flush=True)
         try:
             mine_start = scalp_start_ts if spec.scalp else start_ts
             mine_days = SCALP_DAYS if spec.scalp else DAYS
@@ -163,12 +161,14 @@ def main() -> int:
             row.pop("trades", None)  # keep report lean; full trades in accepted only
             results.append(row)
         except Exception:
-            results.append({
-                "pattern_id": spec.pattern_id,
-                "accepted": False,
-                "reject_reasons": ["mining_error"],
-                "error": traceback.format_exc(),
-            })
+            results.append(
+                {
+                    "pattern_id": spec.pattern_id,
+                    "accepted": False,
+                    "reject_reasons": ["mining_error"],
+                    "error": traceback.format_exc(),
+                }
+            )
 
     accepted = [r for r in results if r.get("accepted")]
     day_accepted = [r for r in accepted if r.get("category") == "day"]
@@ -285,26 +285,25 @@ def main() -> int:
             }
             for r in by_monthly[:15]
         ],
-        "accepted_patterns": [
-            {k: v for k, v in r.items() if k != "trades"}
-            for r in accepted
-        ],
-        "all_results": [
-            {k: v for k, v in r.items() if k not in ("trades",)}
-            for r in results
-        ],
+        "accepted_patterns": [{k: v for k, v in r.items() if k != "trades"} for r in accepted],
+        "all_results": [{k: v for k, v in r.items() if k not in ("trades",)} for r in results],
     }
 
     out = BASELINE_DIR / "ltf_entry_mining_latest.json"
     out.write_text(json.dumps(report, indent=2, default=str))
-    print(json.dumps({
-        "accepted": len(accepted),
-        "target_met_500": combined_target,
-        "best_pattern": by_monthly[0].get("pattern_id") if by_monthly else None,
-        "best_monthly": (by_monthly[0].get("metrics_90d") or {}).get("monthly_pnl_usd") if by_monthly else 0,
-        "combined_monthly": combined_metrics.get("monthly_pnl_usd"),
-        "out": str(out),
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "accepted": len(accepted),
+                "target_met_500": combined_target,
+                "best_pattern": by_monthly[0].get("pattern_id") if by_monthly else None,
+                "best_monthly": (by_monthly[0].get("metrics_90d") or {}).get("monthly_pnl_usd") if by_monthly else 0,
+                "combined_monthly": combined_metrics.get("monthly_pnl_usd"),
+                "out": str(out),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 

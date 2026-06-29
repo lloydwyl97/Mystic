@@ -93,9 +93,7 @@ def _row_passes_filters(row: sqlite3.Row, *, symbol_bus: str, min_fv: int, min_d
         return False
     if _row_feature_version(row) < min_fv:
         return False
-    if _row_net_pnl(row) is None:
-        return False
-    return True
+    return _row_net_pnl(row) is not None
 
 
 def build_pac_validation_metrics(

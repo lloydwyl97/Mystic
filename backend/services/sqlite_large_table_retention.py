@@ -46,7 +46,7 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     RetentionPolicy("ai_live_signals", "created_at", 14, "iso_utc"),
     RetentionPolicy("pipeline_decisions", "created_at", 14, "iso_utc"),
     RetentionPolicy("ai_rank_snapshots", "created_at", 30, "iso_utc"),
-    RetentionPolicy("scalp_rejects", "created_at", 30, "iso_utc"),
+    RetentionPolicy("scalp_rejects", "created_at", 7, "iso_utc"),
     RetentionPolicy("ai_feature_samples", "created_at", 30, "iso_utc"),
 )
 

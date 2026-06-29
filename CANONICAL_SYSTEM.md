@@ -10,7 +10,7 @@ Single source of truth for what is **active**, **supported**, and **honest** in 
 | `./start_mystic.sh full` | Same stack as core (DAY + scalp paper) |
 | `./stop_mystic.sh` | Stop all Mystic processes |
 
-**Retired (exit with error):** `./start_mystic.sh all`, `./start_mystic.sh ai`, `start_ai_ml_trading.py`, `start_ai_position_tracker.py`, `start_ai_outcome_bridge.py`
+**Retired (exit with error):** `./start_mystic.sh all|ai|collector|agents|ai_position_tracker|ai_outcome_bridge`, `start_ai_ml_trading.py`, `start_agent_orchestrator.py`, `live_data_collector.py`, `start_ai_position_tracker.py`, `start_ai_outcome_bridge.py`. Legacy systemd units live under `systemd/*.service.disabled`.
 
 Requires: Redis, `.env` with `EXTERNAL_SUPERVISOR_MODE=true`, paper mode unless explicitly switched live.
 

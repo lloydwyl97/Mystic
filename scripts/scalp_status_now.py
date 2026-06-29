@@ -11,7 +11,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.status_snapshot import build_scalp_status  # noqa: E402
+from backend.services.binance_scalp.status_snapshot import build_scalp_status
 
 
 def main() -> int:

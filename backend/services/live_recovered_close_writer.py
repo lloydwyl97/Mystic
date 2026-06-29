@@ -90,7 +90,7 @@ def _learning_exists(conn: sqlite3.Connection, fill: RecoveredCloseFill) -> bool
         WHERE extra_json LIKE ? AND close_reason IN ('HUMAN_MANUAL_SELL', '{RECOVERED_CLOSE_REASON}')
         LIMIT 1
         """,
-        (f'%{needle}%',),
+        (f"%{needle}%",),
     ).fetchone()
     return row is not None
 
@@ -173,9 +173,7 @@ def persist_recovered_close(
     entry_epoch = float(fill.entry_time_epoch or 0.0)
     if entry_epoch <= 0:
         try:
-            entry_epoch = datetime.fromisoformat(
-                str(fill.closed_at_iso).replace("Z", "+00:00")
-            ).timestamp() - 1161.0
+            entry_epoch = datetime.fromisoformat(str(fill.closed_at_iso).replace("Z", "+00:00")).timestamp() - 1161.0
         except Exception:
             entry_epoch = float(fill.closed_at_epoch) - 1161.0
     hold_seconds = max(0, int(float(fill.closed_at_epoch) - entry_epoch))
@@ -429,9 +427,8 @@ def persist_recovered_close(
         except Exception as exc:
             result["errors"].append(f"trade_performance:{exc}")
             logger.warning("RECOVERED_CLOSE_PERF_FAILED buy=%s err=%s", fill.buy_trade_id, exc)
-    else:
-        if perf_exists:
-            result["existing"]["trade_performance"] = fill.exchange_sell_order_id
+    elif perf_exists:
+        result["existing"]["trade_performance"] = fill.exchange_sell_order_id
 
     try:
         from backend.services.ai_post_trade_feature_review import record_post_trade_feature_review

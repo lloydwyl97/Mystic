@@ -88,9 +88,8 @@ class OrderBookCollector:
     async def _connect_and_listen(self) -> None:
         """Connect to Binance WebSocket and listen for order book updates"""
         try:
-            # Build subscription message for all symbols
-            # Subscribe to depth@100ms stream (order book updates every 100ms)
-            streams = [f"{symbol.lower()}usdt@depth@100ms" for symbol in self.symbols]
+            # Partial book depth snapshots (top 20) — not incremental deltas
+            streams = [f"{symbol.lower()}usdt@depth20@100ms" for symbol in self.symbols]
 
             # Connect to WebSocket with explicit timeout
             async with websockets.connect(self.ws_url, open_timeout=30, ping_interval=20, ping_timeout=20) as websocket:
@@ -154,19 +153,22 @@ class OrderBookCollector:
             # Extract symbol from stream name (btcusdt@depth@100ms -> BTC)
             symbol = stream.split("@")[0].replace("usdt", "").upper()
 
-            # Extract bids and asks
+            # Partial depth snapshot: full top-N bids/asks each tick
             bids = update.get("b", [])
             asks = update.get("a", [])
 
             if not bids or not asks:
                 return
 
+            top_bids = [[float(b[0]), float(b[1])] for b in bids]
+            top_asks = [[float(a[0]), float(a[1])] for a in asks]
+
             # Forward to order book service for processing
             # Ensure service is started before processing
             if not order_book_service.is_running:
                 logger.info(f"Starting OrderBookService for first message from {symbol}")
                 await order_book_service.start()
-            await order_book_service.process_order_book(symbol, bids, asks)
+            await order_book_service.process_order_book(symbol, top_bids, top_asks)
 
             self.stats["messages_received"] += 1
             self.stats["order_books_processed"] += 1
@@ -179,7 +181,7 @@ class OrderBookCollector:
             logger.warning(f"Failed to parse WebSocket message: {e}")
             self.stats["errors"] += 1
         except Exception as e:
-            logger.warning(f"Error processing order book message for {symbol}: {e}")
+            logger.warning(f"Error processing order book message: {e}")
             self.stats["errors"] += 1
 
     async def get_stats(self) -> dict[str, Any]:

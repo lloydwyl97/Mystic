@@ -35,8 +35,8 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-from backend.services.binance_scalp.config import get_scalp_config
 from backend.services.binance_scalp.calibration_profiles import economics_for_config
+from backend.services.binance_scalp.config import get_scalp_config
 from backend.services.binance_scalp.exit_manager import (
     DECISION_SELL,
     evaluate_exit,
@@ -91,7 +91,7 @@ def _ensure_components():
         )
 
 
-def get_router() -> Optional[ScalpStrategyRouter]:
+def get_router() -> ScalpStrategyRouter | None:
     """Return the strategy router (or None if engine disabled / not initialized)."""
     if not scalp_signal_engine_enabled():
         return None
@@ -142,6 +142,7 @@ def exit_decision(
         raw = getattr(track_row, "diagnostics_json", None) or (track_row.get("diagnostics_json") if isinstance(track_row, dict) else None)
         if raw:
             import json
+
             pos_diag = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
 
         track = track_from_row(track_row, pos_diag)
@@ -170,12 +171,12 @@ def exit_decision(
 
 
 __all__ = [
-    "scalp_signal_engine_enabled",
-    "get_router",
-    "entry_candidates",
-    "exit_decision",
+    "EXIT_MAX_HOLD_HARD_LIMIT",
+    "EXIT_MOMENTUM_FAILED",
     "EXIT_NET_PROFIT_TARGET",
     "EXIT_SETUP_INVALIDATED",
-    "EXIT_MOMENTUM_FAILED",
-    "EXIT_MAX_HOLD_HARD_LIMIT",
+    "entry_candidates",
+    "exit_decision",
+    "get_router",
+    "scalp_signal_engine_enabled",
 ]

@@ -43,11 +43,7 @@ def day_entry_rs_rank_max() -> int | None:
 
 def day_entry_gates_enforced() -> bool:
     """True when any hard entry-quality gate is active."""
-    return (
-        day_require_setup_credit_enabled()
-        or day_entry_rs_floor() is not None
-        or day_entry_rs_rank_max() is not None
-    )
+    return day_require_setup_credit_enabled() or day_entry_rs_floor() is not None or day_entry_rs_rank_max() is not None
 
 
 def day_entry_gates_config_snapshot() -> dict[str, object]:

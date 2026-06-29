@@ -89,9 +89,7 @@ def build_spread_preflight_snapshot() -> dict[str, Any]:
                         mtxt = mraw.decode() if isinstance(mraw, bytes) else str(mraw)
                         mdata = json.loads(mtxt) if mtxt.strip().startswith("{") else {}
                         if isinstance(mdata, dict):
-                            parsed = _spread_from_fields(
-                                {k: str(v) for k, v in mdata.items()}
-                            )
+                            parsed = _spread_from_fields({k: str(v) for k, v in mdata.items()})
                             if parsed:
                                 bid, ask, spread_pct = parsed
                                 source = f"market:{bus}"

@@ -333,7 +333,7 @@ async def probe_market_data_readiness() -> dict[str, Any]:
         row["feature_version_day_contract"] = FEATURE_VERSION_DAY_FULL_MTF
         row["indicator_ok"] = bool(vec145) and len(vec145) == 145 and finite >= 143
         row["technical_124_consumer_path"] = "feature_builder.build_feature_vector_124@native_1m"
-        row["context_21_consumer_path"] = "ai_feature_v2.context_vector_day_full_mtf(slopes × all_TF + month + redis_macro)"
+        row["context_21_consumer_path"] = "ai_feature_v2.context_vector_day_full_mtf(slopes x all_TF + month + redis_macro)"
         row["tf_actively_consumed_buy_context"] = tf_used_buy
 
         refresh_path_px = 0.0

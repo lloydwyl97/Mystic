@@ -68,3 +68,9 @@ node_modules/
 # Jupyter
 .ipynb_checkpoints/
 .logrotate.state
+
+# Generated replay/audit artifacts and temp (local only, large, machine specific)
+scripts/replay_baselines/cache/
+scripts/replay_baselines/*_latest*.json
+last_shutdown.txt
+get-pip.py

@@ -6,6 +6,7 @@ Tests outcome-driven entry filters on locked neutral-VWAP baseline.
 No BNB, no scalp profit, no controlled exits, no regime remaps, no LTF patterns.
 Live floor unchanged until a candidate passes replay_promotion_gate.
 """
+
 from __future__ import annotations
 
 import json
@@ -37,31 +38,46 @@ TARGET_500 = TARGET_MONTHLY["2pct"]
 CANDIDATES = [
     ("locked_live_baseline_1_5x", {"notional_mult": 1.5}),
     ("maker_preferred_1_5x", {"notional_mult": 1.5, "execution_style": "maker_preferred"}),
-    ("outcome_neutral_relvol_1_5x", {
-        "notional_mult": 1.5,
-        "replay_entry_filter": "outcome_neutral_relvol",
-        "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
-    }),
-    ("outcome_neutral_vwap_near_1_5x", {
-        "notional_mult": 1.5,
-        "replay_entry_filter": "outcome_neutral_vwap_near",
-        "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
-    }),
-    ("outcome_neutral_adx_calm_1_5x", {
-        "notional_mult": 1.5,
-        "replay_entry_filter": "outcome_neutral_adx_calm",
-        "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
-    }),
-    ("outcome_neutral_slope_mild_1_5x", {
-        "notional_mult": 1.5,
-        "replay_entry_filter": "outcome_neutral_slope_mild",
-        "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
-    }),
-    ("outcome_combined_strict_1_5x", {
-        "notional_mult": 1.5,
-        "replay_entry_filter": "outcome_combined_strict",
-        "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
-    }),
+    (
+        "outcome_neutral_relvol_1_5x",
+        {
+            "notional_mult": 1.5,
+            "replay_entry_filter": "outcome_neutral_relvol",
+            "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
+        },
+    ),
+    (
+        "outcome_neutral_vwap_near_1_5x",
+        {
+            "notional_mult": 1.5,
+            "replay_entry_filter": "outcome_neutral_vwap_near",
+            "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
+        },
+    ),
+    (
+        "outcome_neutral_adx_calm_1_5x",
+        {
+            "notional_mult": 1.5,
+            "replay_entry_filter": "outcome_neutral_adx_calm",
+            "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
+        },
+    ),
+    (
+        "outcome_neutral_slope_mild_1_5x",
+        {
+            "notional_mult": 1.5,
+            "replay_entry_filter": "outcome_neutral_slope_mild",
+            "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
+        },
+    ),
+    (
+        "outcome_combined_strict_1_5x",
+        {
+            "notional_mult": 1.5,
+            "replay_entry_filter": "outcome_combined_strict",
+            "replay_setup_allow": frozenset({SETUP_VWAP_REVERSION}),
+        },
+    ),
 ]
 
 
@@ -126,20 +142,21 @@ def main() -> int:
         ],
         "target_met_500": bool(best.get("target_met_500")),
         "any_promoted": any(r.get("promotion_accepted") for r in results),
-        "conclusion": (
-            "topfour_outcome_filters_exhausted_no_promotion"
-            if not any(r.get("promotion_accepted") for r in results)
-            else "candidate_requires_explicit_live_authorization"
-        ),
+        "conclusion": ("topfour_outcome_filters_exhausted_no_promotion" if not any(r.get("promotion_accepted") for r in results) else "candidate_requires_explicit_live_authorization"),
     }
 
     OUT.write_text(json.dumps(report, indent=2, default=str))
-    print(json.dumps({
-        "best": best.get("label"),
-        "monthly": best.get("monthly_pnl_usd_on_25k"),
-        "target_met_500": report["target_met_500"],
-        "out": str(OUT),
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "best": best.get("label"),
+                "monthly": best.get("monthly_pnl_usd_on_25k"),
+                "target_met_500": report["target_met_500"],
+                "out": str(OUT),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 

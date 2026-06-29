@@ -85,8 +85,8 @@ def _ensure_table(db_path: str = DATABASE_PATH) -> None:
         with connect_rw(db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             cursor = conn.cursor()
-            for stmt in _SCHEMA.strip().split(";\n"):
-                stmt = stmt.strip()
+            for raw_stmt in _SCHEMA.strip().split(";\n"):
+                stmt = raw_stmt.strip()
                 if stmt:
                     cursor.execute(stmt)
             conn.commit()

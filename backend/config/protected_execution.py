@@ -65,6 +65,8 @@ def effective_max_orderbook_spread_pct(*, live_capable: bool) -> float:
     if not live_capable and day_paper_align_spread_with_bar_enabled():
         return max(MAX_ORDERBOOK_SPREAD_PCT, bar_rank_max_spread_fraction())
     return MAX_ORDERBOOK_SPREAD_PCT
+
+
 MAX_ORDERBOOK_PRICE_IMPACT_PCT: Final[float] = _env_float("MAX_ORDERBOOK_PRICE_IMPACT_PCT", 0.0005)
 PROTECTED_LIMIT_ORDER_TIMEOUT_SEC: Final[int] = _env_int("PROTECTED_LIMIT_ORDER_TIMEOUT_SEC", 8)
 PROTECTED_LIMIT_ALLOW_PARTIAL: Final[bool] = _env_bool("PROTECTED_LIMIT_ALLOW_PARTIAL", False)

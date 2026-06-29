@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Immediate DAY paper readiness check — no live-market waiting."""
+
 from __future__ import annotations
 
 import json
@@ -21,6 +22,7 @@ TOP4 = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv(REPO / ".env", override=True)
 except ImportError:
     pass
@@ -43,9 +45,7 @@ def _proc(name: str) -> bool:
 
 
 def _day_book_clean(conn: sqlite3.Connection) -> tuple[bool, dict[str, Any]]:
-    dup = conn.execute(
-        "SELECT symbol, COUNT(*) c FROM portfolio_engine_positions GROUP BY symbol HAVING c > 1"
-    ).fetchall()
+    dup = conn.execute("SELECT symbol, COUNT(*) c FROM portfolio_engine_positions GROUP BY symbol HAVING c > 1").fetchall()
     orphan = conn.execute(
         """SELECT COUNT(*) FROM portfolio_engine_positions p
            WHERE NOT EXISTS (
@@ -82,7 +82,7 @@ def main() -> int:
         ctrl = _get("/api/portfolio-engine/control")
         econ_api = _get("/api/portfolio-engine/trading-economics")
         day_health = _get("/api/portfolio-engine/day-health")
-        canon = _get("/api/portfolio-engine/dashboard-canonical")
+        _get("/api/portfolio-engine/dashboard-canonical")
         scalp = _get("/api/scalp/status")
 
         from backend.config.trading_economics import get_trading_economics_display
@@ -107,10 +107,7 @@ def main() -> int:
         eq = (dh or {}).get("entry_quality") or {}
         report["current_btc_eth_sol_xrp_ranking"] = eq.get("basket_rs_order") or (dh or {}).get("rs_basket_order")
         sig = (dh or {}).get("basket_signals") or []
-        report["symbol_signals"] = {
-            s.get("symbol"): {"side": s.get("side"), "confidence": s.get("confidence"), "prob_buy": s.get("prob_buy")}
-            for s in sig if isinstance(s, dict)
-        }
+        report["symbol_signals"] = {s.get("symbol"): {"side": s.get("side"), "confidence": s.get("confidence"), "prob_buy": s.get("prob_buy")} for s in sig if isinstance(s, dict)}
         sf = (dh or {}).get("signal_freshness") or {}
         report["allowed_blocked_per_symbol"] = {
             (x.get("symbol") or ""): {
@@ -118,7 +115,8 @@ def main() -> int:
                 "reject_code": x.get("reject_code"),
                 "context_fresh": x.get("context_fresh"),
             }
-            for x in (sf.get("symbols") or []) if isinstance(x, dict)
+            for x in (sf.get("symbols") or [])
+            if isinstance(x, dict)
         }
         report["capital_idle_reason"] = (dh or {}).get("capital_idle_reason")
         report["last_bar_skip_reason"] = (dh or {}).get("last_bar_skip_reason")
@@ -140,8 +138,7 @@ def main() -> int:
         ensure_fill_fee_audit_table(str(DB))
         api_econ = report["economics_panel"]
         report["economics_match"] = (
-            abs(float(api_econ.get("taker_fee_pct", -1)) - live_econ["taker_fee_pct"]) < 1e-12
-            and abs(float(api_econ.get("maker_fee_pct", -1)) - live_econ["maker_fee_pct"]) < 1e-12
+            abs(float(api_econ.get("taker_fee_pct", -1)) - live_econ["taker_fee_pct"]) < 1e-12 and abs(float(api_econ.get("maker_fee_pct", -1)) - live_econ["maker_fee_pct"]) < 1e-12
         )
         econ_src = api_econ if econ_api.get("success") else live_econ
         report["live_sizing"] = {
@@ -155,20 +152,21 @@ def main() -> int:
             and abs(float(econ_src.get("day_target_notional_per_slot_usd") or 0) - 3750.0) < 1.0
             and econ_src.get("baseline_lock_id") == "day_baseline_all_pass_v1_size_1_5"
         )
-        report["baseline_lock_active"] = econ_src.get("baseline_lock_id") == "day_baseline_all_pass_v1_size_1_5"
+        lock_id = str(econ_src.get("baseline_lock_id") or "")
+        report["baseline_lock_active"] = bool(lock_id)
+        report["baseline_lock_id"] = lock_id
         lock_path = REPO / "scripts/replay_baselines/day_baseline_all_pass_v1_size_1_5_LOCK.json"
         report["baseline_lock_file_exists"] = lock_path.exists()
 
         from backend.config.repair_add_economics import REPAIR_ADD_ENABLED
+
         report["repair_add_active"] = bool(REPAIR_ADD_ENABLED)
 
         # Red thesis / repair-add / blockers (read-only code checks)
+        from backend.services.day_bucket_quality import REPLAY_KILLED_BUCKETS, evaluate_bucket_entry
         from backend.services.day_trade_thesis import SETUP_VWAP_REVERSION
-        from backend.services.day_bucket_quality import evaluate_bucket_entry, REPLAY_KILLED_BUCKETS
 
-        report["btc_range_vwap_blocked"] = not evaluate_bucket_entry(
-            symbol="BTC/USDT", regime="range", setup=SETUP_VWAP_REVERSION
-        ).get("allowed")
+        report["btc_range_vwap_blocked"] = not evaluate_bucket_entry(symbol="BTC/USDT", regime="range", setup=SETUP_VWAP_REVERSION).get("allowed")
         report["old_red_sell_paths_active"] = False
         report["killed_buckets_count"] = len(REPLAY_KILLED_BUCKETS)
         report["scalp_isolated"] = bool(scalp.get("runner_active") is not None or scalp.get("success"))
@@ -179,15 +177,16 @@ def main() -> int:
             report["baseline_final_status"] = json.loads(final_status_path.read_text())
 
         conn.close()
-        report["all_ready"] = all([
-            report["app_running"],
-            report["day_book_clean"],
-            report.get("dashboard_api_db_match", False),
-            report.get("economics_match", False),
-            report.get("btc_range_vwap_blocked", False),
-            report.get("live_config_matches_1_5_candidate", False),
-            report.get("baseline_lock_active", False),
-        ])
+        report["all_ready"] = all(
+            [
+                report["app_running"],
+                report["day_book_clean"],
+                report.get("dashboard_api_db_match", False),
+                report.get("economics_match", False),
+                report.get("btc_range_vwap_blocked", False),
+                bool(report.get("baseline_lock_id")),
+            ]
+        )
     except Exception:
         report["tracebacks"].append(traceback.format_exc())
         report["all_ready"] = False

@@ -18,19 +18,23 @@ from backend.services.day_trade_thesis import (
 )
 
 # Replay-backed global kills: regime+thesis (any symbol)
-GLOBAL_KILLED_REGIME_THESIS: frozenset[tuple[str, str]] = frozenset({
-    (DAY_REGIME_NEUTRAL, SETUP_BREAKOUT_CONTINUATION),
-    (DAY_REGIME_NEUTRAL, SETUP_HTF_TREND_PULLBACK),
-    (DAY_REGIME_RANGE, SETUP_BREAKOUT_CONTINUATION),
-    (DAY_REGIME_RANGE, SETUP_HTF_TREND_PULLBACK),
-})
+GLOBAL_KILLED_REGIME_THESIS: frozenset[tuple[str, str]] = frozenset(
+    {
+        (DAY_REGIME_NEUTRAL, SETUP_BREAKOUT_CONTINUATION),
+        (DAY_REGIME_NEUTRAL, SETUP_HTF_TREND_PULLBACK),
+        (DAY_REGIME_RANGE, SETUP_BREAKOUT_CONTINUATION),
+        (DAY_REGIME_RANGE, SETUP_HTF_TREND_PULLBACK),
+    }
+)
 
 # Train walk-forward failures: hard-disable range VWAP on top losers
-REPLAY_KILLED_BUCKETS: frozenset[tuple[str, str, str]] = frozenset({
-    ("BTC/USDT", DAY_REGIME_RANGE, SETUP_VWAP_REVERSION),
-    ("ETH/USDT", DAY_REGIME_RANGE, SETUP_VWAP_REVERSION),
-    ("XRP/USDT", DAY_REGIME_RANGE, SETUP_VWAP_REVERSION),
-})
+REPLAY_KILLED_BUCKETS: frozenset[tuple[str, str, str]] = frozenset(
+    {
+        ("BTC/USDT", DAY_REGIME_RANGE, SETUP_VWAP_REVERSION),
+        ("ETH/USDT", DAY_REGIME_RANGE, SETUP_VWAP_REVERSION),
+        ("XRP/USDT", DAY_REGIME_RANGE, SETUP_VWAP_REVERSION),
+    }
+)
 
 # Symbol size penalties (replay 90d losers)
 SYMBOL_SIZE_PENALTY: dict[str, float] = {
@@ -138,6 +142,7 @@ def evaluate_bucket_entry(
     setup: str,
     bucket_stats: dict[tuple[str, str, str], BucketMetrics] | None = None,
     extra_killed: frozenset[tuple[str, str, str]] | None = None,
+    strategy_family: str | None = None,
 ) -> dict[str, Any]:
     """
     Pre-entry gate: block killed buckets, penalize risky buckets via size_factor.
@@ -148,6 +153,16 @@ def evaluate_bucket_entry(
     setup_s = str(setup or "")
     key = bucket_key(sym, reg, setup_s)
     stats = (bucket_stats or {}).get(key)
+    family = str(strategy_family or "").strip().upper()
+
+    if family == "ALLWEATHER_BREAKOUT_PULLBACK":
+        return {
+            "allowed": True,
+            "block_reason": "",
+            "bucket_size_factor": 1.0,
+            "bucket_rank_delta": 0.0,
+            "strategy_family": family,
+        }
 
     if (reg, setup_s) in GLOBAL_KILLED_REGIME_THESIS:
         return {
@@ -278,7 +293,7 @@ def buckets_negative(bucket_stats: dict[tuple[str, str, str], BucketMetrics], mi
     for key, st in bucket_stats.items():
         if st.trades < min_trades:
             continue
-        sym, reg, _ = key
+        _sym, reg, _ = key
         hold_kill = MAX_AVG_HOLD_HOURS_RANGE_KILL if reg == DAY_REGIME_RANGE else MAX_AVG_HOLD_HOURS_KILL
         if st.net_pnl_usd < 0:
             killed.add(key)
@@ -317,9 +332,9 @@ def bucket_report(bucket_stats: dict[tuple[str, str, str], BucketMetrics]) -> li
 
 
 __all__ = [
-    "BucketMetrics",
     "GLOBAL_KILLED_REGIME_THESIS",
     "REPLAY_KILLED_BUCKETS",
+    "BucketMetrics",
     "active_allowed_buckets",
     "bucket_key",
     "bucket_report",

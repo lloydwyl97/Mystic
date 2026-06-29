@@ -14,8 +14,7 @@ from __future__ import annotations
 import sys
 
 print(
-    "ERROR: start_ai_ml_trading.py is retired. "
-    "Use ./start_mystic.sh full (start_ai_signal_generator + portfolio integration).",
+    "ERROR: start_ai_ml_trading.py is retired. Use ./start_mystic.sh full (start_ai_signal_generator + portfolio integration).",
     file=sys.stderr,
 )
 sys.exit(1)

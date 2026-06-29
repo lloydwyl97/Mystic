@@ -24,10 +24,7 @@ def apply_legacy_tags_from_thesis(pos: Any, thesis_payload: dict[str, Any]) -> N
     if opened:
         pos.opened_under_router = True
         pos.legacy_pre_regime_router = False
-    elif legacy:
-        pos.legacy_pre_regime_router = True
-        pos.opened_under_router = False
-    elif is_day_top4_symbol(getattr(pos, "symbol", "")):
+    elif legacy or is_day_top4_symbol(getattr(pos, "symbol", "")):
         pos.legacy_pre_regime_router = True
         pos.opened_under_router = False
 
@@ -41,6 +38,9 @@ def thesis_json_for_position(pos: Any) -> dict[str, Any]:
         "entry_vwap": float(getattr(pos, "entry_vwap", 0.0) or 0.0),
         "thesis_trend_tf": str(getattr(pos, "thesis_trend_tf", "") or ""),
         "day_route_regime_at_entry": str(getattr(pos, "day_route_regime_at_entry", "") or ""),
+        "price_structure_regime_at_entry": str(getattr(pos, "price_structure_regime_at_entry", "") or ""),
+        "max_hold_min": int(getattr(pos, "max_hold_min", 0) or 0),
+        "trail_pct": float(getattr(pos, "trail_pct", 0.0) or 0.0),
         "legacy_pre_regime_router": bool(getattr(pos, "legacy_pre_regime_router", False)),
         "opened_under_router": bool(getattr(pos, "opened_under_router", False)),
     }

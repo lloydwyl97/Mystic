@@ -23,7 +23,7 @@ REPO = Path(__file__).resolve().parents[1]
 ENV_PATH = REPO / ".env"
 sys.path.insert(0, str(REPO))
 
-from backend.services.binance_scalp.session_cleanup import (  # noqa: E402
+from backend.services.binance_scalp.session_cleanup import (
     clear_entry_armed,
     close_open_positions,
     read_env,
@@ -39,12 +39,8 @@ def _scalp_summary(db_path: str) -> dict:
     if not Path(db_path).exists():
         return {"error": "no_db"}
     with sqlite3.connect(db_path) as conn:
-        open_n = conn.execute(
-            "SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'"
-        ).fetchone()[0]
-        trades = conn.execute(
-            "SELECT COUNT(*) FROM scalp_paper_trades WHERE created_at >= datetime('now','-2 hours')"
-        ).fetchone()[0]
+        open_n = conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0]
+        trades = conn.execute("SELECT COUNT(*) FROM scalp_paper_trades WHERE created_at >= datetime('now','-2 hours')").fetchone()[0]
         sells = conn.execute(
             """
             SELECT COUNT(*), COALESCE(SUM(pnl_usd),0)
@@ -140,9 +136,7 @@ def main() -> int:
     replay_gate_result = "unknown"
     if replay_report.exists():
         try:
-            replay_gate_result = (
-                "pass" if json.loads(replay_report.read_text()).get("replay_pass") else "fail"
-            )
+            replay_gate_result = "pass" if json.loads(replay_report.read_text()).get("replay_pass") else "fail"
         except (json.JSONDecodeError, OSError):
             replay_gate_result = "unreadable"
 
@@ -156,15 +150,9 @@ def main() -> int:
             "paper_session_started": False,
             "paper_session_reason": paper_session_reason,
             "replay_gate_result": replay_gate_result,
-            "runner_stopped": verify_safe_state(
-                os.getenv("DATABASE_PATH", str(REPO / "mystic_trading.db"))
-            ).get("runner_stopped"),
-            "open_positions_end": verify_safe_state(
-                os.getenv("DATABASE_PATH", str(REPO / "mystic_trading.db"))
-            ).get("open_positions_end"),
-            "safe_state_verified": verify_safe_state(
-                os.getenv("DATABASE_PATH", str(REPO / "mystic_trading.db"))
-            ).get("safe_state_verified"),
+            "runner_stopped": verify_safe_state(os.getenv("DATABASE_PATH", str(REPO / "mystic_trading.db"))).get("runner_stopped"),
+            "open_positions_end": verify_safe_state(os.getenv("DATABASE_PATH", str(REPO / "mystic_trading.db"))).get("open_positions_end"),
+            "safe_state_verified": verify_safe_state(os.getenv("DATABASE_PATH", str(REPO / "mystic_trading.db"))).get("safe_state_verified"),
         }
         print(json.dumps(summary, indent=2, default=str))
         return 0

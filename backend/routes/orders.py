@@ -49,9 +49,7 @@ router = APIRouter()
 logger = get_service_logger("orders")
 
 _ORDER_PLACEMENT_RETIRED_DETAIL = (
-    "HTTP order placement is retired. Mystic DAY trades execute only via "
-    "portfolio_engine integration (execute_buy_fifo / execute_sell_fifo). "
-    "Dashboard is read-only for orders."
+    "HTTP order placement is retired. Mystic DAY trades execute only via portfolio_engine integration (execute_buy_fifo / execute_sell_fifo). Dashboard is read-only for orders."
 )
 
 

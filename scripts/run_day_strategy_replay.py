@@ -6,6 +6,7 @@ Uses current rules: regime router, HTF permission, thesis classification,
 selection_score proxy, net-profit-only exit, extreme protection, no thesis sells.
 Bar interval: 1h (HTF-aligned; live uses 1m but decisions are HTF-gated).
 """
+
 from __future__ import annotations
 
 import json
@@ -18,7 +19,7 @@ import traceback
 import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,12 +32,6 @@ from backend.config.trading_economics import (
     MIN_NET_PROFIT_TO_SELL,
     TAKER_FEE,
 )
-from backend.services.day_regime_router import (
-    DAY_REGIME_BEAR,
-    classify_day_regime,
-    compute_hist_expectancy_pct,
-    evaluate_day_entry_route,
-)
 from backend.services.day_bucket_quality import (
     REPLAY_KILLED_BUCKETS,
     active_allowed_buckets,
@@ -45,6 +40,12 @@ from backend.services.day_bucket_quality import (
     buckets_negative,
     evaluate_bucket_entry,
     record_bucket_outcome,
+)
+from backend.services.day_regime_router import (
+    DAY_REGIME_BEAR,
+    classify_day_regime,
+    compute_hist_expectancy_pct,
+    evaluate_day_entry_route,
 )
 from backend.services.day_trade_thesis import (
     EXIT_EXTREME_PROTECTION,
@@ -72,10 +73,7 @@ def fetch_klines_1h(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
     cursor = start_ms
     api = SYMBOL_API[symbol]
     while cursor < end_ms:
-        url = (
-            f"https://api.binance.us/api/v3/klines?symbol={api}&interval=1h"
-            f"&startTime={cursor}&endTime={end_ms}&limit=1000"
-        )
+        url = f"https://api.binance.us/api/v3/klines?symbol={api}&interval=1h&startTime={cursor}&endTime={end_ms}&limit=1000"
         proc = subprocess.run(
             ["curl", "-s", "--max-time", "45", url],
             capture_output=True,
@@ -137,9 +135,9 @@ def _atr_pct(bars: list[dict], period: int = 14) -> float:
         return 0.01
     trs = []
     for i in range(-period, 0):
-        h, l = bars[i]["high"], bars[i]["low"]
+        h, bar_low = bars[i]["high"], bars[i]["low"]
         pc = bars[i - 1]["close"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        trs.append(max(h - bar_low, abs(h - pc), abs(bar_low - pc)))
     atr = sum(trs) / len(trs)
     c = bars[-1]["close"]
     return atr / c if c > 0 else 0.01
@@ -150,11 +148,11 @@ def _adx(bars: list[dict], period: int = 14) -> float:
         return 20.0
     trs, pdm, mdm = [], [], []
     for i in range(-period - 1, 0):
-        h, l = bars[i]["high"], bars[i]["low"]
+        h, bar_low = bars[i]["high"], bars[i]["low"]
         ph, pl, pc = bars[i - 1]["high"], bars[i - 1]["low"], bars[i - 1]["close"]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
+        tr = max(h - bar_low, abs(h - pc), abs(bar_low - pc))
         up = h - ph
-        down = pl - l
+        down = pl - bar_low
         trs.append(tr)
         pdm.append(up if up > down and up > 0 else 0)
         mdm.append(down if down > up and down > 0 else 0)
@@ -358,7 +356,11 @@ def try_exit(pos: ReplayPosition, mark: float, bar_ts: int, bundle: dict) -> Clo
 
     atr_pct = max(0.008, (entry - pos.invalid_level) / entry) if pos.invalid_level < entry else 0.01
     extreme = evaluate_extreme_protection(
-        entry_price=entry, mark=mark, net_pnl_pct=net_pct, atr_pct=atr_pct, bundle=bundle,
+        entry_price=entry,
+        mark=mark,
+        net_pnl_pct=net_pct,
+        atr_pct=atr_pct,
+        bundle=bundle,
     )
     if str(extreme.get("action")) == "sell":
         reason = EXIT_EXTREME_PROTECTION
@@ -423,14 +425,12 @@ def run_replay(
     warmup = 80
 
     # align indices per symbol
-    idx_map = {s: 0 for s in SYMBOLS}
+    idx_map = dict.fromkeys(SYMBOLS, 0)
     for s in SYMBOLS:
         while idx_map[s] < len(all_bars[s]) and all_bars[s][idx_map[s]]["ts"] < start_ts:
             idx_map[s] += 1
 
-    timeline = sorted(
-        {all_bars[s][i]["ts"] for s in SYMBOLS for i in range(idx_map[s], len(all_bars[s])) if all_bars[s][i]["ts"] >= start_ts}
-    )
+    timeline = sorted({all_bars[s][i]["ts"] for s in SYMBOLS for i in range(idx_map[s], len(all_bars[s])) if all_bars[s][i]["ts"] >= start_ts})
 
     for bar_ts in timeline:
         marks: dict[str, float] = {}
@@ -457,10 +457,19 @@ def run_replay(
             ps = dd["price_structure_regime"]
 
             dd = apply_trade_thesis_to_candidate_fields(
-                dd, symbol=sym, current_price=mark, atr=atr, strategy_id="day", price_structure_regime=ps,
+                dd,
+                symbol=sym,
+                current_price=mark,
+                atr=atr,
+                strategy_id="day",
+                price_structure_regime=ps,
             )
             regime = classify_day_regime(
-                dd, context_payload=None, chop_score=chop, atr_ratio=_atr_pct(slice_1h), price_structure_regime=ps,
+                dd,
+                context_payload=None,
+                chop_score=chop,
+                atr_ratio=_atr_pct(slice_1h),
+                price_structure_regime=ps,
             )
             dd["day_route_regime"] = regime
             setup = str(dd.get("setup_type") or SETUP_NO_CLEAR_THESIS)
@@ -537,17 +546,19 @@ def run_replay(
             if closed:
                 state.cash += pos.quantity * marks[sym] * (1 - TAKER_FEE)
                 state.trades.append(closed)
-                state.entry_tag_log.append({
-                    "symbol": closed.symbol,
-                    "regime": closed.regime,
-                    "setup": closed.setup,
-                    "pnl_usd": closed.pnl_usd,
-                    "hold_hours": closed.hold_sec / 3600.0,
-                    "exit_reason": closed.exit_reason,
-                    "mae_pct": pos.mae_pct,
-                    "mfe_pct": pos.mfe_pct,
-                    "entry_tags": dict(pos.entry_tags),
-                })
+                state.entry_tag_log.append(
+                    {
+                        "symbol": closed.symbol,
+                        "regime": closed.regime,
+                        "setup": closed.setup,
+                        "pnl_usd": closed.pnl_usd,
+                        "hold_hours": closed.hold_sec / 3600.0,
+                        "exit_reason": closed.exit_reason,
+                        "mae_pct": pos.mae_pct,
+                        "mfe_pct": pos.mfe_pct,
+                        "entry_tags": dict(pos.entry_tags),
+                    }
+                )
                 exit_counts[closed.exit_reason] += 1
                 record_bucket_outcome(
                     state.bucket_stats,
@@ -577,7 +588,7 @@ def run_replay(
 
         bear = state.is_bear_regime(btc_slice or candidates[0][2])
         if bear and state.open_day_top4_count() >= 1:
-            for _, sym, _, _, _ in candidates:
+            for _, _sym, _, _, _ in candidates:
                 state.blocked["BEAR_REGIME_MAX_ONE"] += 1
             state.equity_curve.append(state.equity(marks))
             continue
@@ -637,22 +648,32 @@ def run_replay(
         if not closed:
             pnl_usd = pos.quantity * (mark - pos.entry_price) - pos.notional * TAKER_FEE * 2
             closed = ClosedTrade(
-                sym, pos.entry_ts, end_ts, pos.entry_price, mark, pnl_usd,
-                (mark - pos.entry_price) / pos.entry_price, pos.setup, pos.regime,
-                "REPLAY_MARK_TO_MARKET", end_ts - pos.entry_ts,
+                sym,
+                pos.entry_ts,
+                end_ts,
+                pos.entry_price,
+                mark,
+                pnl_usd,
+                (mark - pos.entry_price) / pos.entry_price,
+                pos.setup,
+                pos.regime,
+                "REPLAY_MARK_TO_MARKET",
+                end_ts - pos.entry_ts,
             )
         state.trades.append(closed)
-        state.entry_tag_log.append({
-            "symbol": closed.symbol,
-            "regime": closed.regime,
-            "setup": closed.setup,
-            "pnl_usd": closed.pnl_usd,
-            "hold_hours": closed.hold_sec / 3600.0,
-            "exit_reason": closed.exit_reason,
-            "mae_pct": pos.mae_pct,
-            "mfe_pct": pos.mfe_pct,
-            "entry_tags": dict(pos.entry_tags),
-        })
+        state.entry_tag_log.append(
+            {
+                "symbol": closed.symbol,
+                "regime": closed.regime,
+                "setup": closed.setup,
+                "pnl_usd": closed.pnl_usd,
+                "hold_hours": closed.hold_sec / 3600.0,
+                "exit_reason": closed.exit_reason,
+                "mae_pct": pos.mae_pct,
+                "mfe_pct": pos.mfe_pct,
+                "entry_tags": dict(pos.entry_tags),
+            }
+        )
         record_bucket_outcome(
             state.bucket_stats,
             symbol=sym,
@@ -680,7 +701,7 @@ def _day_key(ts: int) -> str:
 
 
 def _summarize(state: ReplayState, window_days: int, exit_counts: dict, start_ts: int = 0, end_ts: int = 0) -> dict[str, Any]:
-    trades = [t for t in state.trades if t.exit_reason != "REPLAY_MARK_TO_MARKET" or window_days >= 90]
+    [t for t in state.trades if t.exit_reason != "REPLAY_MARK_TO_MARKET" or window_days >= 90]
     # include all closed for stats
     all_t = state.trades
     wins = [t for t in all_t if t.pnl_usd > 0]
@@ -746,14 +767,12 @@ def verify_live_state() -> dict[str, Any]:
         with urllib.request.urlopen("http://localhost:8000/api/portfolio-engine/status", timeout=10) as r:
             st = json.loads(r.read()).get("data", {})
         import sqlite3
+
         db = sqlite3.connect(REPO / "mystic_trading.db")
         led = db.execute("SELECT cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
         open_n = db.execute("SELECT COUNT(*) FROM portfolio_engine_positions").fetchone()[0]
         db.close()
-        out["dashboard_api_db_match"] = (
-            abs(float(st.get("cash_balance", 0)) - float(led[0])) < 0.05
-            and int(st.get("positions_count", 0)) == open_n
-        )
+        out["dashboard_api_db_match"] = abs(float(st.get("cash_balance", 0)) - float(led[0])) < 0.05 and int(st.get("positions_count", 0)) == open_n
         out["eth_flat"] = open_n == 0 or not any("ETH" in str(x) for x in (st.get("open_positions") or []))
         out["duplicate_positions"] = False
     except Exception as e:
@@ -790,11 +809,22 @@ def main() -> int:
         "bar_interval": "1h",
         "symbols": SYMBOLS,
         "rules": [
-            "top_four_only", "regime_router", "neutral_vwap_only", "range_vwap_strict",
-            "replay_killed_range_vwap_btc_eth_xrp", "htf_permission",
-            "selection_score", "bucket_kill_list", "fat_tail_entry_gate", "risk_sizing",
-            "no_duplicate", "no_repair_add", "no_avg_down", "no_thesis_sells",
-            "net_profit_exit", "extreme_protection_separate",
+            "top_four_only",
+            "regime_router",
+            "neutral_vwap_only",
+            "range_vwap_strict",
+            "replay_killed_range_vwap_btc_eth_xrp",
+            "htf_permission",
+            "selection_score",
+            "bucket_kill_list",
+            "fat_tail_entry_gate",
+            "risk_sizing",
+            "no_duplicate",
+            "no_repair_add",
+            "no_avg_down",
+            "no_thesis_sells",
+            "net_profit_exit",
+            "extreme_protection_separate",
         ],
         "candle_cache_days_available": cache_days,
         "windows": {},
@@ -885,12 +915,19 @@ def main() -> int:
         "all_pass": False,
     }
     pc = results["pass_criteria"]
-    pc["all_pass"] = all([
-        pc["7d_positive"], pc["14d_improved"], pc["30d_improved"],
-        pc["walk_forward_val_positive"], pc["walk_forward_test_positive"],
-        pc["neutral_not_losing"], pc["range_vwap_not_losing"],
-        pc["breakout_not_primary_loser"], pc["90d_no_fat_tail"],
-    ])
+    pc["all_pass"] = all(
+        [
+            pc["7d_positive"],
+            pc["14d_improved"],
+            pc["30d_improved"],
+            pc["walk_forward_val_positive"],
+            pc["walk_forward_test_positive"],
+            pc["neutral_not_losing"],
+            pc["range_vwap_not_losing"],
+            pc["breakout_not_primary_loser"],
+            pc["90d_no_fat_tail"],
+        ]
+    )
 
     print(json.dumps(results, indent=2, default=str))
     return 0 if pc["all_pass"] else 1

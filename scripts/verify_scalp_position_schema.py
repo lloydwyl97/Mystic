@@ -47,9 +47,7 @@ def main() -> int:
                         datetime('now'), 0, 'dryrun_btc_open_test', 'OPEN')
                 """
             )
-            conn.execute(
-                "DELETE FROM scalp_paper_positions WHERE trade_id='dryrun_btc_open_test'"
-            )
+            conn.execute("DELETE FROM scalp_paper_positions WHERE trade_id='dryrun_btc_open_test'")
             results["tests"]["btc_reentry_after_closed"] = "PASS"
         except sqlite3.IntegrityError as exc:
             results["tests"]["btc_reentry_after_closed"] = f"FAIL: {exc}"
@@ -65,9 +63,7 @@ def main() -> int:
                         datetime('now'), 0, 'dryrun_eth_dup_test', 'OPEN')
                 """
             )
-            conn.execute(
-                "DELETE FROM scalp_paper_positions WHERE trade_id='dryrun_eth_dup_test'"
-            )
+            conn.execute("DELETE FROM scalp_paper_positions WHERE trade_id='dryrun_eth_dup_test'")
             results["tests"]["duplicate_open_same_symbol"] = "FAIL: allowed duplicate OPEN"
         except sqlite3.IntegrityError:
             results["tests"]["duplicate_open_same_symbol"] = "PASS"
@@ -83,9 +79,7 @@ def main() -> int:
                         datetime('now'), 0, 'dryrun_btc_closed2', 'CLOSED')
                 """
             )
-            conn.execute(
-                "DELETE FROM scalp_paper_positions WHERE trade_id='dryrun_btc_closed2'"
-            )
+            conn.execute("DELETE FROM scalp_paper_positions WHERE trade_id='dryrun_btc_closed2'")
             results["tests"]["multiple_closed_same_symbol"] = "PASS"
         except sqlite3.IntegrityError as exc:
             results["tests"]["multiple_closed_same_symbol"] = f"FAIL: {exc}"

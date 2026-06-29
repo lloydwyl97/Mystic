@@ -20,6 +20,7 @@ the SAME verified Binance.US constants as the validated baseline.
 
 No live change. Live stays on day_baseline_all_pass_v1_size_1_5.
 """
+
 from __future__ import annotations
 
 import json
@@ -27,7 +28,7 @@ import os
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,12 +38,12 @@ BASELINE_DIR = REPO / "scripts" / "replay_baselines"
 OUT = BASELINE_DIR / "allweather_strategy_lab_latest.json"
 
 from backend.config.trading_economics import (
-    TAKER_FEE,
-    SLIPPAGE_BUFFER,
     ORDERBOOK_HALF_SPREAD_ESTIMATE,
+    SLIPPAGE_BUFFER,
+    TAKER_FEE,
 )
 from scripts.run_day_execution_replay import fetch_klines_cached
-from scripts.run_day_strategy_replay import SYMBOLS, NOTIONAL_USD, PRINCIPAL
+from scripts.run_day_strategy_replay import NOTIONAL_USD, PRINCIPAL, SYMBOLS
 
 TARGET_500 = 500.0
 SPAN_DAYS = int(os.getenv("LAB_SPAN_DAYS", "1095"))
@@ -97,8 +98,8 @@ def _atr(bars: list[dict], period: int = 14) -> float:
         return 0.0
     trs = []
     for i in range(-period, 0):
-        h, l, pc = bars[i]["high"], bars[i]["low"], bars[i - 1]["close"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        h, low, pc = bars[i]["high"], bars[i]["low"], bars[i - 1]["close"]
+        trs.append(max(h - low, abs(h - pc), abs(low - pc)))
     return sum(trs) / len(trs)
 
 
@@ -107,11 +108,11 @@ def _adx(bars: list[dict], period: int = 14) -> float:
         return 0.0
     trs, pdm, mdm = [], [], []
     for i in range(-period - 1, 0):
-        h, l = bars[i]["high"], bars[i]["low"]
+        h, bar_low = bars[i]["high"], bars[i]["low"]
         ph, pl, pc = bars[i - 1]["high"], bars[i - 1]["low"], bars[i - 1]["close"]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
+        tr = max(h - bar_low, abs(h - pc), abs(bar_low - pc))
         up = h - ph
-        dn = pl - l
+        dn = pl - bar_low
         trs.append(tr or 1e-9)
         pdm.append(up if (up > dn and up > 0) else 0.0)
         mdm.append(dn if (dn > up and dn > 0) else 0.0)
@@ -132,7 +133,7 @@ class Indi:
     adx: float
     atr: float
     rsi: float
-    don_high: float   # prior N-bar high (excl current)
+    don_high: float  # prior N-bar high (excl current)
     don_low: float
     regime: str
 
@@ -150,7 +151,7 @@ def _precompute(bars_1h: list[dict], don: int = 20) -> list[Indi]:
         adx = _adx(window)
         atr = _atr(window)
         rsi = _rsi([b["close"] for b in window])
-        prior = bars_1h[i - don:i]
+        prior = bars_1h[i - don : i]
         dhigh = max(b["high"] for b in prior) if prior else bars_1h[i]["high"]
         dlow = min(b["low"] for b in prior) if prior else bars_1h[i]["low"]
         c = closes[i]
@@ -238,7 +239,7 @@ def _backtest(
 
     # 15m execution index per symbol
     ex = {sym: bars_15m[sym] for sym in indis}
-    ex_idx = {sym: 0 for sym in indis}
+    ex_idx = dict.fromkeys(indis, 0)
 
     # union 15m timeline
     ts_set: set[int] = set()
@@ -282,16 +283,24 @@ def _backtest(
                 reason = "time_stop"
             if exit_fill is not None:
                 pnl = p.qty * exit_fill - p.notional
-                trades.append(Trade(
-                    sym, p.setup, p.regime, p.entry_ts, ts, pnl,
-                    (ts - p.entry_ts) / 3600.0, reason,
-                ))
+                trades.append(
+                    Trade(
+                        sym,
+                        p.setup,
+                        p.regime,
+                        p.entry_ts,
+                        ts,
+                        pnl,
+                        (ts - p.entry_ts) / 3600.0,
+                        reason,
+                    )
+                )
                 del positions[sym]
                 cooldown[sym] = ts + 3600
 
         # pending entries fill at this 15m open
         still: list = []
-        for (sym, setup, regime, tgt_atr, stop_atr) in pending:
+        for sym, setup, regime, tgt_atr, stop_atr in pending:
             if sym in positions or len(positions) >= MAX_SLOTS:
                 continue
             b = cur_bar(sym, ts)
@@ -306,14 +315,22 @@ def _backtest(
             target = fill * (1.0 + tgt_atr * (atr / b["open"]))
             stop = fill * (1.0 - stop_atr * (atr / b["open"]))
             positions[sym] = Pos(
-                sym, setup, regime, ts, fill, qty, spend, target, stop,
+                sym,
+                setup,
+                regime,
+                ts,
+                fill,
+                qty,
+                spend,
+                target,
+                stop,
                 ts + int(TIME_STOP_HOURS * 3600),
             )
         pending = still
 
         # 1h signal generation on the hour
         if ts % 3600 == 0 and ts in sig_by_ts:
-            for (sym, prev, cur) in sig_by_ts[ts]:
+            for sym, prev, cur in sig_by_ts[ts]:
                 if sym in positions:
                     continue
                 if cooldown.get(sym, 0) > ts:
@@ -371,9 +388,7 @@ def _seg(trades: list[Trade]) -> dict[str, Any]:
 
 def main() -> int:
     print("=== ALL-WEATHER STRATEGY LAB (honest, fee-accurate) ===", flush=True)
-    print(f"  one-way cost={ONE_WAY_COST*100:.4f}% roundtrip={ROUNDTRIP_COST*100:.4f}% "
-          f"(taker={_TAKER*100:.4f}% half_spread={_HALF_SPREAD*100:.4f}% "
-          f"slip={_SLIP*100:.4f}%)", flush=True)
+    print(f"  one-way cost={ONE_WAY_COST * 100:.4f}% roundtrip={ROUNDTRIP_COST * 100:.4f}% (taker={_TAKER * 100:.4f}% half_spread={_HALF_SPREAD * 100:.4f}% slip={_SLIP * 100:.4f}%)", flush=True)
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=SPAN_DAYS + 5)
     start_ms = int(start.timestamp() * 1000)
@@ -435,9 +450,7 @@ def main() -> int:
         trades = _backtest(indis, bars_15m, mult, ONE_WAY_COST)
         p = _profile(trades, mult)
         profiles.append(p)
-        print(f"    {mult}x: trades={p['total_trades']} net=${p['net_pnl_usd']} "
-              f"monthly=${p['monthly_pnl_usd']} win%={p['overall']['win_rate_pct']} "
-              f"month+={p['month_positive_frac']}", flush=True)
+        print(f"    {mult}x: trades={p['total_trades']} net=${p['net_pnl_usd']} monthly=${p['monthly_pnl_usd']} win%={p['overall']['win_rate_pct']} month+={p['month_positive_frac']}", flush=True)
 
     # Fee sensitivity: the existential test. Higher taker tiers / spreads.
     # one_way = taker + half_spread + slippage.
@@ -453,21 +466,22 @@ def main() -> int:
         net = sum(t.pnl_usd for t in trades)
         wins = [t for t in trades if t.pnl_usd > 0]
         monthly = round(net / months, 2)
-        fee_stress.append({
-            "scenario": name,
-            "one_way_cost_pct": round(owc * 100, 4),
-            "roundtrip_pct": round(owc * 200, 4),
-            "notional_mult": 1.5,
-            "trades": len(trades),
-            "net_pnl_usd": round(net, 2),
-            "monthly_pnl_usd": monthly,
-            "win_rate_pct": round(100.0 * len(wins) / len(trades), 1) if trades else 0.0,
-            "expectancy_per_trade_usd": round(net / len(trades), 2) if trades else 0.0,
-            "target_met_500": monthly >= TARGET_500,
-            "stays_positive": net > 0,
-        })
-        print(f"    fee[{name}] rt={round(owc*200,3)}%: monthly=${monthly} "
-              f"target_met={monthly>=TARGET_500}", flush=True)
+        fee_stress.append(
+            {
+                "scenario": name,
+                "one_way_cost_pct": round(owc * 100, 4),
+                "roundtrip_pct": round(owc * 200, 4),
+                "notional_mult": 1.5,
+                "trades": len(trades),
+                "net_pnl_usd": round(net, 2),
+                "monthly_pnl_usd": monthly,
+                "win_rate_pct": round(100.0 * len(wins) / len(trades), 1) if trades else 0.0,
+                "expectancy_per_trade_usd": round(net / len(trades), 2) if trades else 0.0,
+                "target_met_500": monthly >= TARGET_500,
+                "stays_positive": net > 0,
+            }
+        )
+        print(f"    fee[{name}] rt={round(owc * 200, 3)}%: monthly=${monthly} target_met={monthly >= TARGET_500}", flush=True)
 
     best = max(profiles, key=lambda p: p["monthly_pnl_usd"])
     report = {
@@ -484,8 +498,7 @@ def main() -> int:
             "slippage_pct": round(_SLIP * 100, 4),
             "roundtrip_pct": round(ROUNDTRIP_COST * 100, 4),
         },
-        "exit_model": {"time_stop_hours": TIME_STOP_HOURS, "max_slots": MAX_SLOTS,
-                       "bounded": True, "long_only_spot": True},
+        "exit_model": {"time_stop_hours": TIME_STOP_HOURS, "max_slots": MAX_SLOTS, "bounded": True, "long_only_spot": True},
         "regime_bar_counts": dict(regime_counts),
         "profiles": profiles,
         "fee_sensitivity_1_5x": fee_stress,
@@ -497,10 +510,7 @@ def main() -> int:
             "gap_to_500_usd": round(TARGET_500 - best["monthly_pnl_usd"], 2),
             "month_positive_frac": best["month_positive_frac"],
             "honest_bounded_exit": True,
-            "fee_breakeven_note": (
-                "See fee_sensitivity_1_5x: edge is real at verified cost; check at which "
-                "taker tier it falls below $500/mo or turns negative."
-            ),
+            "fee_breakeven_note": ("See fee_sensitivity_1_5x: edge is real at verified cost; check at which taker tier it falls below $500/mo or turns negative."),
             "note": (
                 "Real per-regime entries with <=72h bounded exits and verified costs. "
                 "Downtrend = no longs (spot). Mean-reversion removed (proven loser). "
@@ -511,8 +521,7 @@ def main() -> int:
     }
     OUT.write_text(json.dumps(report, indent=2))
     print(f"  wrote {OUT}", flush=True)
-    print(f"  BEST {best['notional_mult']}x monthly=${best['monthly_pnl_usd']} "
-          f"target_met={best['target_met_500']} month+frac={best['month_positive_frac']}", flush=True)
+    print(f"  BEST {best['notional_mult']}x monthly=${best['monthly_pnl_usd']} target_met={best['target_met_500']} month+frac={best['month_positive_frac']}", flush=True)
     return 0
 
 

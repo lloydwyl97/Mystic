@@ -373,9 +373,9 @@ def build_feature_importance_report() -> dict[str, Any]:
                     pass
             if model is not None and hasattr(model, "feature_importances_"):
                 imp = list(model.feature_importances_)
-                dim = len(imp)
+                len(imp)
                 pairs = []
-                block_totals: dict[str, float] = dict.fromkeys(list(FEATURE_BLOCKS) + ["context_day_full"], 0.0)
+                block_totals: dict[str, float] = dict.fromkeys([*list(FEATURE_BLOCKS), "context_day_full"], 0.0)
                 for i, val in enumerate(imp):
                     nm = names[i] if i < len(names) else f"dim_{i}"
                     pairs.append((nm, float(val)))
@@ -618,7 +618,7 @@ def build_outcome_quality_audit(db_path: str = DATABASE_PATH, limit: int = 50) -
                     explain = json.loads(s["explainability_json"] or "{}")
                 except (json.JSONDecodeError, TypeError):
                     pass
-                entry_ts = s["entry_timestamp"]
+                s["entry_timestamp"]
                 oc = conn.execute(
                     """
                     SELECT id, features_json, context_json, good_bad_memory_class, strategy_id

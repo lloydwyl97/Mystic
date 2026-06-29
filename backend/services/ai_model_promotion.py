@@ -235,18 +235,8 @@ def register_candidate_and_maybe_promote(
         bad_ok = holdout_ok and c_bad is not None
     else:
         accuracy_ok = holdout_ok and c_acc is not None and a_acc is not None and c_acc >= a_acc
-        pac_ok = (
-            holdout_ok
-            and c_profit is not None
-            and a_profit is not None
-            and c_profit >= (a_profit - 0.0005)
-        )
-        bad_ok = (
-            holdout_ok
-            and c_bad is not None
-            and a_bad is not None
-            and c_bad <= (a_bad + 0.0005)
-        )
+        pac_ok = holdout_ok and c_profit is not None and a_profit is not None and c_profit >= (a_profit - 0.0005)
+        bad_ok = holdout_ok and c_bad is not None and a_bad is not None and c_bad <= (a_bad + 0.0005)
 
     promote = holdout_ok and accuracy_ok and pac_ok and bad_ok
     holdout_count = int(metrics.get("holdout_sample_count") or metrics.get("sample_count") or 0)

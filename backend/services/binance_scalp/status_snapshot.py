@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -9,26 +10,61 @@ from pathlib import Path
 from typing import Any
 
 import redis
-
 from backend.services.binance_scalp.calibration_profiles import economics_for_config
 from backend.services.binance_scalp.config import ScalpConfig, get_scalp_config
 from backend.services.binance_scalp.economics import ScalpEconomics
 from backend.services.binance_scalp.market_reader import ScalpMarketReader, symbol_base
-from backend.services.binance_scalp.momentum_tracker import MomentumDiagnostics, MomentumTracker
-from backend.services.binance_scalp.scalp_control import is_entry_armed
 from backend.services.binance_scalp.momentum_gross_estimate import (
     compute_momentum_gross_estimate,
 )
+from backend.services.binance_scalp.momentum_tracker import MomentumDiagnostics, MomentumTracker
 from backend.services.binance_scalp.orderbook_book import walk_buy_notional, walk_sell_qty
 from backend.services.binance_scalp.protected_preflight import run_scalp_preflight
+from backend.services.binance_scalp.redis_keys import scan_key
+from backend.services.binance_scalp.scalp_control import is_entry_armed
 from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
 from backend.services.binance_scalp.strategies.kline_cache import KlineCache
-from scripts.watch_scalp_entry_opportunity import (  # noqa: PLC0415 — shared gate helpers
+from scripts.watch_scalp_entry_opportunity import (
     NEAR_PASS_THRESHOLD,
     _distance_to_pass,
     is_high_quality_near_pass,
     warm_momentum,
 )
+
+
+def _overlay_runner_scan(
+    symbol_rows: list[dict[str, Any]],
+    rclient: redis.Redis,
+    *,
+    prefix: str,
+) -> dict[str, str]:
+    """Merge live runner scan snapshots (momentum/regime) into status rows."""
+    regimes: dict[str, str] = {}
+    for row in symbol_rows:
+        sym = str(row.get("symbol") or "")
+        if not sym or row.get("error"):
+            continue
+        try:
+            raw = rclient.get(scan_key(prefix, sym))
+            if not raw:
+                continue
+            scan = json.loads(raw)
+        except Exception:
+            continue
+        regime = str(scan.get("micro_regime") or "")
+        if regime:
+            regimes[sym] = regime
+            row["micro_regime"] = regime
+            row["runner_micro_regime"] = regime
+        samples = int(scan.get("momentum_sample_count") or 0)
+        hist = float(scan.get("momentum_history_sec") or 0.0)
+        if samples > int(row.get("momentum_samples") or 0):
+            row["momentum_samples"] = samples
+            row["momentum_history_sec"] = hist
+            row["momentum_confirmed"] = bool(scan.get("momentum_confirmed"))
+            row["runner_momentum_overlay"] = True
+        row["runner_scan_age_sec"] = max(0.0, time.time() - float(scan.get("updated_at_epoch") or 0))
+    return regimes
 
 
 def _read_mem_kb() -> dict[str, int]:
@@ -85,11 +121,7 @@ def _redis_orderbook_freshness(
             "redis_spread_decimal": redis_spread,
             "redis_spread_note": "orderbook service uses (ask-bid)/bid; scalp uses (ask-bid)/mid",
             "rest_spread_decimal": rest_spread,
-            "redis_rest_spread_delta": (
-                abs(redis_spread - rest_spread)
-                if redis_spread is not None and rest_spread is not None
-                else None
-            ),
+            "redis_rest_spread_delta": (abs(redis_spread - rest_spread) if redis_spread is not None and rest_spread is not None else None),
         }
     return out
 
@@ -104,13 +136,9 @@ def _shadow_projection(
     estimate = compute_momentum_gross_estimate(snap, mom, econ)
     notional = config.max_notional_paper
     buy_walk = walk_buy_notional(snap.asks, notional, snap.best_ask)
-    sell_qty = buy_walk.filled_qty if buy_walk.filled_qty > 0 else (
-        notional / snap.best_ask if snap.best_ask > 0 else 0.0
-    )
+    sell_qty = buy_walk.filled_qty if buy_walk.filled_qty > 0 else (notional / snap.best_ask if snap.best_ask > 0 else 0.0)
     sell_walk = walk_sell_qty(snap.bids, sell_qty, snap.best_bid)
-    required = econ.entry_required_gross_edge_pct(
-        snap.spread_pct, buy_walk.impact_pct, sell_walk.impact_pct
-    )
+    required = econ.entry_required_gross_edge_pct(snap.spread_pct, buy_walk.impact_pct, sell_walk.impact_pct)
     projected = estimate.projected_gross_move_pct
     return {
         "projected_gross_pct": projected,
@@ -226,14 +254,9 @@ def _evaluate_symbol_status(
         "best_bid": snap.best_bid,
         "best_ask": snap.best_ask,
         "spread_pct": snap.spread_pct,
-        "spread_cap_pct": econ.spread_cap_for_symbol(sym)
-        if not config.scalp_live
-        and (config.calibration_mode or config.scalp_paper_enabled)
-        else econ.spread_cap_pct,
+        "spread_cap_pct": econ.spread_cap_for_symbol(sym) if not config.scalp_live and (config.calibration_mode or config.scalp_paper_enabled) else econ.spread_cap_pct,
         "uniform_spread_cap_pct": econ.spread_cap_pct,
-        "paper_spread_cap_pct": econ.spread_cap_for_symbol(sym)
-        if econ.paper_spread_caps
-        else None,
+        "paper_spread_cap_pct": econ.spread_cap_for_symbol(sym) if econ.paper_spread_caps else None,
         "impact_pct_for_notional": impact_pct,
         "impact_notional_usd": config.max_notional_paper,
         "buy_impact_pct": float(pf.buy_impact_pct),
@@ -338,24 +361,16 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
     if warm_rounds > 0:
         warm_momentum(reader, tracker, symbols, rounds=warm_rounds, interval_sec=warm_interval_sec)
 
-    symbol_rows = [
-        _evaluate_symbol_status(sym, reader, tracker, econ, config) for sym in symbols
-    ]
+    symbol_rows = [_evaluate_symbol_status(sym, reader, tracker, econ, config) for sym in symbols]
 
     db_path = Path(config.database_path)
     open_positions = 0
     if db_path.exists():
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
-            open_positions = conn.execute(
-                "SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'"
-            ).fetchone()[0]
+            open_positions = conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0]
 
     rclient = redis.from_url(config.redis_url, decode_responses=True)
-    rest_spreads = {
-        row["symbol"]: row.get("spread_pct")
-        for row in symbol_rows
-        if not row.get("error")
-    }
+    rest_spreads = {row["symbol"]: row.get("spread_pct") for row in symbol_rows if not row.get("error")}
     freshness = _redis_orderbook_freshness(rclient, symbols, rest_spreads=rest_spreads)
 
     strategy_router = _evaluate_strategy_router(
@@ -366,15 +381,14 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
         warm_rounds=warm_rounds,
     )
 
+    micro_regimes = _overlay_runner_scan(symbol_rows, rclient, prefix=config.redis_key_prefix)
+
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "overall_decision": _overall_decision(symbol_rows),
         "top_blocker": _top_blocker(symbol_rows),
         "warm_rounds_recommended": 12,
-        "warm_rounds_note": (
-            "momentum_confirmed requires ~60s history and 60s trend; "
-            "warm_rounds=6 (~35s) under-warms 60s checks"
-        ),
+        "warm_rounds_note": ("momentum_confirmed requires ~60s history and 60s trend; warm_rounds=6 (~35s) under-warms 60s checks"),
         "fee_model_verified": econ.is_fee_model_verified(),
         "calibration_mode": config.calibration_mode,
         "calibration_profile": config.calibration_profile if config.calibration_mode else "strict",
@@ -384,6 +398,7 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
         "entry_armed": is_entry_armed(rclient, prefix=config.redis_key_prefix),
         "open_scalp_positions": open_positions,
         "warm_rounds_used": warm_rounds,
+        "micro_regimes": micro_regimes,
         "symbols": {row["symbol"]: row for row in symbol_rows},
         "redis_orderbook_freshness": freshness,
         "memory_kb": _read_mem_kb(),

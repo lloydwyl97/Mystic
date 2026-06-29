@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend.ai_training_pipeline import FEATURE_VERSION_DAY_HTF, _FEATURE_DIM_V2, _infer_outcome_feature_version
+from backend.ai_training_pipeline import _FEATURE_DIM_V2, FEATURE_VERSION_DAY_HTF, _infer_outcome_feature_version
 from backend.database_schema import DATABASE_PATH
 
 

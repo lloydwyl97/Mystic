@@ -524,31 +524,36 @@ class RealTimeAISignalGenerator:
         symbol: str,
         bundle: dict[str, list],
         ctx_h: dict[str, Any],
-    ) -> list[float]:
+    ) -> tuple[list[float], dict[str, Any]]:
         from backend.services.ai_day_htf_features import build_day_htf_feature_vector_145
         from backend.services.ai_feature_fundamentals import merge_canonical_sentiment_payload
+        from backend.services.day_feature_audit import build_context_provenance
+        from backend.services.day_feature_health import build_compact_health_sidecar
         from backend.utils.canonical_symbol_formatter import CanonicalSymbolFormatter
 
         base = CanonicalSymbolFormatter.to_base(symbol)
         orderbook = None
         vp = None
+        ob_age: float | None = None
         if self.redis:
             with contextlib.suppress(Exception):
                 raw_ob = await self.redis.hgetall(f"orderbook:{base}")
-                if raw_ob:
-                    orderbook = {(k.decode() if isinstance(k, bytes) else k): float(v.decode() if isinstance(v, bytes) else v) for k, v in raw_ob.items()}
+                from backend.services.order_book_service import parse_orderbook_redis_hash
+
+                orderbook, ob_age = parse_orderbook_redis_hash(raw_ob)
             with contextlib.suppress(Exception):
                 raw_vp = await self.redis.hgetall(f"volume_profile:{base}")
                 if raw_vp:
                     vp = {(k.decode() if isinstance(k, bytes) else k): float(v.decode() if isinstance(v, bytes) else v) for k, v in raw_vp.items()}
         ob_live = orderbook
-        if ob_live is None or (isinstance(ob_live, dict) and not ob_live):
+        if ob_live is None or float((ob_live or {}).get("bid_ask_spread") or 0.0) <= 0.0:
             with contextlib.suppress(Exception):
                 from backend.services.order_book_service import fetch_order_book_features_live
 
                 lo = await fetch_order_book_features_live(ccxt_symbol)
-                if lo:
+                if lo and float(lo.get("bid_ask_spread") or 0) > 0:
                     ob_live = lo
+                    ob_age = 0.0
 
         sentiment: dict[str, Any] | None = None
         if self.redis:
@@ -566,14 +571,38 @@ class RealTimeAISignalGenerator:
             existing=sentiment,
         )
 
-        return build_day_htf_feature_vector_145(
+        ctx_age: float | None = None
+        if isinstance(ctx_h, dict):
+            ctx_ts = ctx_h.get("ctx_ts_utc") or ctx_h.get("updated_at_utc")
+            if ctx_ts:
+                with contextlib.suppress(Exception):
+                    from datetime import datetime, timezone
+
+                    t_parse = datetime.fromisoformat(str(ctx_ts).replace("Z", "+00:00"))
+                    ctx_age = max(0.0, (datetime.now(timezone.utc) - t_parse.astimezone(timezone.utc)).total_seconds())
+
+        tech_prov: dict[str, dict[str, Any]] = {}
+        vector = build_day_htf_feature_vector_145(
             symbol_ccxt=ccxt_symbol,
             day_bundle=bundle,
             volume_profile=vp,
             orderbook=ob_live,
             sentiment=sentiment,
             ai_context=ctx_h,
+            tech_provenance=tech_prov,
+            orderbook_age_sec=ob_age,
         )
+        ctx_prov = build_context_provenance(
+            {
+                "ctx_h": ctx_h,
+                "ctx_age_sec": ctx_age,
+                "bundle_age_sec": 0.0,
+                "orderbook_age_sec": ob_age,
+            },
+            bundle,
+        )
+        sidecar = build_compact_health_sidecar(vector, tech_prov, ctx_prov)
+        return vector, sidecar
 
     async def _generate_signal_for_symbol(self, strategy_id: str, symbol: str) -> None:
         """Generate AI signal for (live strategy, symbol) using that strategy's per-coin RF artifact."""
@@ -716,13 +745,14 @@ class RealTimeAISignalGenerator:
                 from backend.services.ai_market_context import hydrate_ai_context_payload
 
                 ctx_payload = await hydrate_ai_context_payload(symbol, ctx_payload)
-                features = await self._assemble_day_live_features(
+                features, feature_health_sidecar = await self._assemble_day_live_features(
                     _to_ccxt_symbol(symbol),
                     symbol,
                     bundle,
                     ctx_payload,
                 )
             else:
+                feature_health_sidecar = {}
                 base_features = await self._calculate_features(
                     market_primary,
                     market_1m_exec,
@@ -955,6 +985,10 @@ class RealTimeAISignalGenerator:
                 "ttl_preserve_skip_reason": "",
                 "context_audit_emit": json.dumps(ctx_defaulted_audit, separators=(",", ":")),
             }
+            if sid0 == "day" and feature_health_sidecar:
+                from backend.services.day_feature_health import sidecar_redis_fields
+
+                signal_data.update(sidecar_redis_fields(feature_health_sidecar))
             try:
                 await self._log_inference(
                     decision_id=signal_decision_id,
@@ -1296,7 +1330,7 @@ class RealTimeAISignalGenerator:
 
             ctx_payload, _, _ = await self._read_ai_context(bus)
             ctx_payload = await hydrate_ai_context_payload(bus, ctx_payload)
-            features = await self._assemble_day_live_features(ccxt_sym, bus, bundle, ctx_payload)
+            features, _health = await self._assemble_day_live_features(ccxt_sym, bus, bundle, ctx_payload)
         else:
             m_primary, m_1m = await self._get_market_data(bus, sid)
             min_b = min_primary_bars_for_strategy(sid)
@@ -1359,7 +1393,9 @@ class RealTimeAISignalGenerator:
             if self.redis:
                 raw_ob = await self.redis.hgetall(ob_key)
                 if raw_ob:
-                    orderbook = {k.decode() if isinstance(k, bytes) else k: float(v.decode() if isinstance(v, bytes) else v) for k, v in raw_ob.items()}
+                    from backend.services.order_book_service import parse_orderbook_redis_hash
+
+                    orderbook, _ob_age = parse_orderbook_redis_hash(raw_ob)
 
             sentiment: dict[str, Any] | None = None
             ctx_for_overlay: dict[str, Any] = {}
@@ -1380,7 +1416,7 @@ class RealTimeAISignalGenerator:
                         sentiment = sentiment or {}
                         sentiment["fear_greed_index"] = float(raw_fg)
 
-            # Canonical fundamentals (81–90 / env / Redis news+social / CoinGecko / ctx / ATR proxy)
+            # Canonical fundamentals (81-90 / env / Redis news+social / CoinGecko / ctx / ATR proxy)
             try:
                 from backend.services.ai_feature_fundamentals import merge_canonical_sentiment_payload
                 from backend.utils.canonical_symbol_formatter import CanonicalSymbolFormatter
@@ -1425,7 +1461,7 @@ class RealTimeAISignalGenerator:
                 if raw_vp:
                     volume_profile = {k.decode() if isinstance(k, bytes) else k: float(v.decode() if isinstance(v, bytes) else v) for k, v in raw_vp.items()}
 
-            # Sentiment block (124 slots 81–90): merged via ai_feature_fundamentals + Redis F&G above.
+            # Sentiment block (124 slots 81-90): merged via ai_feature_fundamentals + Redis F&G above.
 
             # Convert symbol to ccxt format
             ccxt_symbol = _to_ccxt_symbol(symbol)
@@ -1973,9 +2009,9 @@ class RealTimeAISignalGenerator:
                     INSERT INTO ai_inference_log (
                         decision_id, strategy_id, symbol, ts_utc, prediction, argmax_action,
                         prob_buy, prob_hold, prob_sell, winner_prob_raw, confidence,
-                        buy_margin, ctx_multiplier, ctx_json, feature_version,
+                        buy_margin, ctx_multiplier, ctx_json, feature_version, feature_dim,
                         features_json, model_artifact, label_version, label_horizon_bars
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         decision_id,
@@ -1993,6 +2029,7 @@ class RealTimeAISignalGenerator:
                         float(ctx_multiplier),
                         json.dumps(ctx_audit, separators=(",", ":")),
                         int(feature_version),
+                        int(len(features)) if features else (145 if int(feature_version) >= 2 else 124),
                         feats_json,
                         self.model_artifact_paths.get(model_slot, "unknown"),
                         str(self.model_label_versions.get(model_slot, "")),

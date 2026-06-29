@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 from datetime import datetime, timezone
@@ -16,6 +17,124 @@ try:
 except Exception as ex:
     logging.getLogger(__name__).debug("talib not available: %s", ex)
     talib = None
+
+# Trust scores for feature health metadata (audit / learning guardrails).
+FEATURE_TRUST_SCORES: dict[str, float] = {
+    "LIVE": 1.0,
+    "CALCULATED": 0.92,
+    "CALCULATED_PROXY": 0.62,
+    "WARMUP": 0.15,
+    "FALLBACK": 0.10,
+    "MISSING": 0.0,
+    "STALE": 0.10,
+    "UNSUPPORTED_FOR_SPOT": 0.0,
+    "ZERO_DEFAULT": 0.0,
+    "LOW_IMPORTANCE_TIME_FIELD_NORMAL": 0.35,
+}
+
+LEARNING_ALLOWED_STATUSES: frozenset[str] = frozenset({"LIVE", "CALCULATED"})
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, float(v)))
+
+
+def _volume_price_trend_rolling(cl: np.ndarray, vo: np.ndarray, *, window: int = 50) -> float:
+    """Rolling VPT sum over last ``window`` bars, volume-normalized and clipped."""
+    if cl.size < 3 or vo.size < 3:
+        return 0.0
+    n = min(int(window), int(cl.size) - 1)
+    if n < 2:
+        return 0.0
+    start = cl.size - n
+    acc = 0.0
+    for i in range(start, cl.size):
+        if i <= 0 or cl[i - 1] == 0:
+            continue
+        acc += float((cl[i] - cl[i - 1]) / cl[i - 1]) * float(vo[i])
+    vol_scale = float(np.mean(vo[start:cl.size]))
+    if vol_scale <= 1e-12:
+        return 0.0
+    return _clamp(acc / vol_scale, -5.0, 5.0)
+
+
+def _orderbook_freshness_meta(
+    orderbook: dict[str, Any] | None,
+    orderbook_age_sec: float | None,
+    *,
+    threshold_sec: float = 45.0,
+) -> dict[str, Any]:
+    age = orderbook_age_sec
+    updated_at = None
+    if orderbook:
+        updated_at = orderbook.get("updated_at") or orderbook.get("ts_utc")
+        if age is None and updated_at is not None:
+            import time
+
+            with contextlib.suppress(Exception):
+                age = max(0.0, time.time() - float(updated_at))
+    stale = age is not None and age > threshold_sec
+    return {
+        "age_seconds": age,
+        "orderbook_updated_at": updated_at,
+        "freshness_status": "STALE" if stale else ("FRESH" if age is not None else "UNKNOWN"),
+        "freshness_trust_modifier": 0.25 if stale else 1.0,
+    }
+
+
+def _record_feature_provenance(
+    provenance: dict[str, dict[str, Any]] | None,
+    name: str,
+    status: str,
+    source: str,
+    *,
+    age_seconds: float | None = None,
+    trust_score: float | None = None,
+    learning_allowed: bool | None = None,
+    orderbook_updated_at: Any = None,
+    freshness_status: str | None = None,
+    freshness_trust_modifier: float | None = None,
+) -> None:
+    if provenance is None:
+        return
+    ts = float(trust_score if trust_score is not None else FEATURE_TRUST_SCORES.get(status, 0.5))
+    la = bool(learning_allowed if learning_allowed is not None else status in LEARNING_ALLOWED_STATUSES)
+    row: dict[str, Any] = {
+        "status": status,
+        "source": source,
+        "age_seconds": age_seconds,
+        "trust_score": round(ts, 4),
+        "learning_allowed": la,
+    }
+    if orderbook_updated_at is not None:
+        row["orderbook_updated_at"] = orderbook_updated_at
+    if freshness_status is not None:
+        row["freshness_status"] = freshness_status
+    if freshness_trust_modifier is not None:
+        row["freshness_trust_modifier"] = round(float(freshness_trust_modifier), 4)
+    provenance[name] = row
+
+
+def _swing_range_levels(hi: np.ndarray, lo: np.ndarray, lookback: int) -> tuple[float, float, float] | None:
+    n = min(int(lookback), int(hi.size), int(lo.size))
+    if n < 5:
+        return None
+    high_n = float(np.max(hi[-n:]))
+    low_n = float(np.min(lo[-n:]))
+    rng = high_n - low_n
+    if rng <= 0:
+        return None
+    return low_n + rng * 0.236, low_n + rng * 0.382, low_n + rng * 0.618
+
+
+def _ichimoku_from_ohlcv(hi: np.ndarray, lo: np.ndarray) -> tuple[float, float, float, float]:
+    n = int(hi.size)
+    w9, w26, w52 = min(9, n), min(26, n), min(52, n)
+    tenkan = (float(np.max(hi[-w9:])) + float(np.min(lo[-w9:]))) / 2.0
+    kijun = (float(np.max(hi[-w26:])) + float(np.min(lo[-w26:]))) / 2.0
+    senkou_a = (tenkan + kijun) / 2.0
+    senkou_b = (float(np.max(hi[-w52:])) + float(np.min(lo[-w52:]))) / 2.0
+    return tenkan, kijun, senkou_a, senkou_b
 
 
 def _safe(v: Any, default: float = 0.0) -> float:
@@ -95,14 +214,14 @@ def _volume_profile_proxy_poc_vah_val(hi: np.ndarray, lo: np.ndarray, cl: np.nda
         return 0.0, 0.0, 0.0
     sl = slice(-n, None)
     h = hi[sl]
-    l = lo[sl]
+    lows = lo[sl]
     c = cl[sl]
     v = vo[sl]
-    typ = (h + l + c) / 3.0
+    typ = (h + lows + c) / 3.0
     w = np.maximum(v, 1e-18)
     poc = float(np.average(typ, weights=w))
     vah = float(np.max(h))
-    val = float(np.min(l))
+    val = float(np.min(lows))
     return poc, vah, val
 
 
@@ -138,6 +257,8 @@ def build_feature_dict_from_ohlcv(
     orderbook: dict[str, Any] | None,
     sentiment: dict[str, Any] | None,
     ohlcv_1d: list[list] | None = None,
+    provenance: dict[str, dict[str, Any]] | None = None,
+    orderbook_age_sec: float | None = None,
 ) -> dict[str, float]:
     """
     Return a flat dict keyed by FEATURE_MAPPING names (124 keys).
@@ -151,9 +272,13 @@ def build_feature_dict_from_ohlcv(
     out: dict[str, float] = dict.fromkeys(FEATURE_MAPPING.keys(), 0.0)
 
     if not ohlcv:
+        for name in FEATURE_MAPPING:
+            _record_feature_provenance(provenance, name, "MISSING", "no_1m_ohlcv", learning_allowed=False)
         return out
 
     ts, op, hi, lo, cl, vo = _ohlcv_arrays(ohlcv)
+    n_bars = int(cl.size)
+    ob_stale = orderbook_age_sec is not None and orderbook_age_sec > 45.0
 
     # -------------------------
     # Basic (1-10)
@@ -355,8 +480,9 @@ def build_feature_dict_from_ohlcv(
         # Accumulation/Distribution Line
         if cl.size >= 2:
             hl_diff = hi - lo
-            clv = np.where(hl_diff == 0, 0.0, ((cl - lo) - (hi - cl)) / hl_diff)
-            out["ad_line"] = float(np.sum(clv * vo))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                clv = np.where(hl_diff == 0, 0.0, ((cl - lo) - (hi - cl)) / hl_diff)
+            out["ad_line"] = float(np.nansum(clv * vo))
         else:
             out["ad_line"] = 0.0
 
@@ -437,7 +563,7 @@ def build_feature_dict_from_ohlcv(
         out["trix"] = _safe(talib.TRIX(cl, timeperiod=15)[-1], 0.0)
         out["ultimate_oscillator"] = _safe(talib.ULTOSC(hi, lo, cl, timeperiod1=7, timeperiod2=14, timeperiod3=28)[-1], 50.0)
         bop_ser = talib.BOP(op, hi, lo, cl)
-        out["balance_of_power"] = _safe(float(np.nanmean(bop_ser[-min(5, len(bop_ser)) :])), 0.0)
+        out["balance_of_power"] = _clamp(float(np.nanmean(bop_ser[-min(5, len(bop_ser)) :])), -1.0, 1.0)
     else:
         # Numpy fallbacks for talib-specific momentum indicators
         if cl.size >= 11:
@@ -462,9 +588,17 @@ def build_feature_dict_from_ohlcv(
         out["ultimate_oscillator"] = 50.0
         if cl.size >= 2:
             hl = hi[-1] - lo[-1]
-            out["balance_of_power"] = float((cl[-1] - op[-1]) / hl) if hl > 0 else 0.0
+            out["balance_of_power"] = _clamp(float((cl[-1] - op[-1]) / hl) if hl > 0 else 0.0, -1.0, 1.0)
         else:
             out["balance_of_power"] = 0.0
+
+    _record_feature_provenance(
+        provenance,
+        "balance_of_power",
+        "CALCULATED",
+        "talib BOP or (close-open)/(high-low) on real OHLCV; clamped [-1,1]; near-zero valid when balanced",
+        learning_allowed=True,
+    )
 
     # Numpy-native momentum indicators (always computed)
     median = (hi + lo) / 2.0
@@ -563,21 +697,16 @@ def build_feature_dict_from_ohlcv(
         out["di_minus"] = 25.0
         out["aroon_oscillator"] = 0.0
 
-    # Ichimoku
-    if cl.size >= 52:
-        tenkan = (float(np.max(hi[-9:])) + float(np.min(lo[-9:]))) / 2.0
-        kijun = (float(np.max(hi[-26:])) + float(np.min(lo[-26:]))) / 2.0
-        senkou_a = (tenkan + kijun) / 2.0
-        senkou_b = (float(np.max(hi[-52:])) + float(np.min(lo[-52:]))) / 2.0
-        out["ichimoku_tenkan"] = tenkan
-        out["ichimoku_kijun"] = kijun
-        out["ichimoku_senkou_a"] = senkou_a
-        out["ichimoku_senkou_b"] = senkou_b
-    else:
-        out["ichimoku_tenkan"] = out["price"]
-        out["ichimoku_kijun"] = out["price"]
-        out["ichimoku_senkou_a"] = out["price"]
-        out["ichimoku_senkou_b"] = out["price"]
+    # Ichimoku — partial windows when fewer than 52 bars (never substitute price)
+    tenkan, kijun, senkou_a, senkou_b = _ichimoku_from_ohlcv(hi, lo)
+    out["ichimoku_tenkan"] = tenkan
+    out["ichimoku_kijun"] = kijun
+    out["ichimoku_senkou_a"] = senkou_a
+    out["ichimoku_senkou_b"] = senkou_b
+    ichi_status = "CALCULATED" if n_bars >= 52 else ("WARMUP" if n_bars >= 9 else "WARMUP")
+    ichi_src = f"ichimoku native ohlcv bars={n_bars}"
+    for iname in ("ichimoku_tenkan", "ichimoku_kijun", "ichimoku_senkou_a", "ichimoku_senkou_b"):
+        _record_feature_provenance(provenance, iname, ichi_status, ichi_src, learning_allowed=ichi_status == "CALCULATED")
 
     out["psar"] = out["parabolic_sar"]
     out["trend_strength"] = float(out["adx"] / 100.0)  # deterministic scaling
@@ -590,20 +719,37 @@ def build_feature_dict_from_ohlcv(
     out["volume_ma_20"] = _rolling_mean(vo, 20)
     out["volume_ratio"] = 1.0 if vo.size < 2 or vo[-2] == 0 else float(vo[-1] / vo[-2])
 
-    # volume_price_trend: (Δprice/price)*volume
-    if cl.size >= 2 and cl[-2] != 0:
-        out["volume_price_trend"] = float(((cl[-1] - cl[-2]) / cl[-2]) * vo[-1])
-    else:
-        out["volume_price_trend"] = 0.0
+    out["volume_price_trend"] = _volume_price_trend_rolling(cl, vo, window=50)
+    _record_feature_provenance(
+        provenance,
+        "volume_price_trend",
+        "CALCULATED",
+        "rolling 50-bar VPT sum volume-normalized; not single-bar reset",
+        learning_allowed=True,
+    )
 
     nvi_v, pvi_v = _nvi_pvi_from_ohlcv(cl, vo)
     out["negative_volume_index"] = float(nvi_v)
     out["positive_volume_index"] = float(pvi_v)
-    # volume_weighted_price (VWAP over last 10)
-    if cl.size >= 10 and float(np.sum(vo[-10:])) != 0.0:
+    # volume_weighted_price (10-bar VWAP); WARMUP until enough history+volume (v6 may dedupe vs vwap slot)
+    if cl.size >= 10 and float(np.sum(vo[-10:])) > 1e-12:
         out["volume_weighted_price"] = float(np.average(cl[-10:], weights=vo[-10:]))
+        _record_feature_provenance(
+            provenance,
+            "volume_weighted_price",
+            "CALCULATED",
+            "10-bar volume-weighted price on 1m OHLCV",
+            learning_allowed=True,
+        )
     else:
         out["volume_weighted_price"] = out["price"]
+        _record_feature_provenance(
+            provenance,
+            "volume_weighted_price",
+            "WARMUP",
+            "needs>=10 bars with volume; clears when history sufficient; v6 dedupe candidate vs vwap",
+            learning_allowed=False,
+        )
 
     # -------------------------
     # Sentiment (81-90) — use ``is not None`` so an empty dict still applies explicit zeros from merge
@@ -612,7 +758,7 @@ def build_feature_dict_from_ohlcv(
         out["fear_greed_index"] = _safe(sentiment.get("fear_greed_index"), 0.0)
         out["social_sentiment"] = _safe(sentiment.get("social_sentiment"), 0.0)
         out["news_sentiment"] = _safe(sentiment.get("news_sentiment"), 0.0)
-        out["put_call_ratio"] = _safe(sentiment.get("put_call_ratio"), 0.0)
+        # put_call_ratio handled after microstructure block (UNSUPPORTED unless options source)
         out["vix"] = _safe(sentiment.get("vix"), 0.0)
         out["market_cap"] = _safe(sentiment.get("market_cap"), 0.0)
         out["supply"] = _safe(sentiment.get("supply"), 0.0)
@@ -636,28 +782,46 @@ def build_feature_dict_from_ohlcv(
     out["minute"] = float(dt.minute)
     out["second"] = float(dt.second)
     out["seconds_since_midnight"] = float(dt.hour * 3600 + dt.minute * 60 + dt.second)
+    _record_feature_provenance(
+        provenance,
+        "second",
+        "LOW_IMPORTANCE_TIME_FIELD_NORMAL",
+        "bar-close alignment; near-zero at minute boundaries; rank/learning neutral",
+        trust_score=FEATURE_TRUST_SCORES["LOW_IMPORTANCE_TIME_FIELD_NORMAL"],
+        learning_allowed=False,
+    )
 
     # -------------------------
-    # Advanced technical (101-108)
+    # Advanced technical (101-108) — swing range / classic pivot (never price fallback)
     # -------------------------
-    if cl.size >= 20:
-        high_20 = float(np.max(hi[-20:]))
-        low_20 = float(np.min(lo[-20:]))
-        r20 = high_20 - low_20
-        out["fibonacci_retracement_23.6"] = low_20 + r20 * 0.236
-        out["fibonacci_retracement_38.2"] = low_20 + r20 * 0.382
-        out["fibonacci_retracement_61.8"] = low_20 + r20 * 0.618
+    look = min(20, n_bars)
+    fibs = _swing_range_levels(hi, lo, look)
+    if fibs:
+        out["fibonacci_retracement_23.6"], out["fibonacci_retracement_38.2"], out["fibonacci_retracement_61.8"] = fibs
+        fib_status = "CALCULATED" if look >= 20 else "WARMUP"
+        fib_src = f"swing_high_low lookback={look} 1m"
+        for fname in ("fibonacci_retracement_23.6", "fibonacci_retracement_38.2", "fibonacci_retracement_61.8"):
+            _record_feature_provenance(
+                provenance,
+                fname,
+                fib_status,
+                fib_src,
+                learning_allowed=fib_status == "CALCULATED",
+            )
     else:
-        out["fibonacci_retracement_23.6"] = out["price"]
-        out["fibonacci_retracement_38.2"] = out["price"]
-        out["fibonacci_retracement_61.8"] = out["price"]
+        for fname in ("fibonacci_retracement_23.6", "fibonacci_retracement_38.2", "fibonacci_retracement_61.8"):
+            out[fname] = 0.0
+            _record_feature_provenance(provenance, fname, "WARMUP", "insufficient bars for swing range", learning_allowed=False)
 
     pivot = float((out["high"] + out["low"] + out["price"]) / 3.0)
+    hl_rng = float(out["high"] - out["low"])
     out["pivot_point"] = pivot
-    out["resistance_1"] = float(pivot + (out["high"] - out["low"]) * 0.382)
-    out["resistance_2"] = float(pivot + (out["high"] - out["low"]) * 0.618)
-    out["support_1"] = float(pivot - (out["high"] - out["low"]) * 0.382)
-    out["support_2"] = float(pivot - (out["high"] - out["low"]) * 0.618)
+    out["resistance_1"] = float(pivot + hl_rng * 0.382)
+    out["resistance_2"] = float(pivot + hl_rng * 0.618)
+    out["support_1"] = float(pivot - hl_rng * 0.382)
+    out["support_2"] = float(pivot - hl_rng * 0.618)
+    for fname in ("pivot_point", "resistance_1", "resistance_2", "support_1", "support_2"):
+        _record_feature_provenance(provenance, fname, "CALCULATED", "classic pivot from session H/L/C 1m")
 
     # -------------------------
     # Advanced volume (109-116)
@@ -666,11 +830,29 @@ def build_feature_dict_from_ohlcv(
         out["volume_profile_poc"] = _safe(volume_profile.get("poc"), 0.0)
         out["volume_profile_vah"] = _safe(volume_profile.get("vah"), 0.0)
         out["volume_profile_val"] = _safe(volume_profile.get("val"), 0.0)
+        for fname in ("volume_profile_poc", "volume_profile_vah", "volume_profile_val"):
+            _record_feature_provenance(
+                provenance,
+                fname,
+                "CALCULATED_PROXY",
+                "redis volume_profile hash proxy",
+                trust_score=0.75,
+                learning_allowed=False,
+            )
     elif cl.size >= 20:
         poc_p, vah_p, val_p = _volume_profile_proxy_poc_vah_val(hi, lo, cl, vo, lookback=50)
         out["volume_profile_poc"] = poc_p
         out["volume_profile_vah"] = vah_p
         out["volume_profile_val"] = val_p
+        for fname in ("volume_profile_poc", "volume_profile_vah", "volume_profile_val"):
+            _record_feature_provenance(
+                provenance,
+                fname,
+                "CALCULATED_PROXY",
+                "ohlcv volume-by-price proxy; not live trade tape",
+                trust_score=0.62,
+                learning_allowed=False,
+            )
 
     # vwap/twap over last 50 bars
     n = 50 if cl.size >= 50 else int(cl.size)
@@ -680,16 +862,26 @@ def build_feature_dict_from_ohlcv(
             out["vwap"] = float(np.average(cl[-n:], weights=voln))
         out["twap"] = float(np.mean(cl[-n:]))
 
-        # volume delta / order_flow: volume * sign(close-open)
+        # volume delta / order_flow: volume * sign(close-open) — OHLCV proxy only
         sign = np.sign(cl[-n:] - op[-n:])
         delta = float(np.sum(voln * sign))
         out["volume_delta"] = delta
         out["volume_imbalance"] = 0.0 if float(np.sum(voln)) == 0.0 else float(delta / float(np.sum(voln)))
         out["order_flow"] = out["volume_imbalance"]
+        for fname in ("volume_delta", "volume_imbalance", "order_flow"):
+            _record_feature_provenance(
+                provenance,
+                fname,
+                "CALCULATED_PROXY",
+                f"ohlcv signed-volume proxy n={n}; not live trade tape",
+                trust_score=0.62,
+                learning_allowed=False,
+            )
 
     # -------------------------
     # Microstructure (117-124)
     # -------------------------
+    ob_fresh = _orderbook_freshness_meta(orderbook, orderbook_age_sec)
     if orderbook:
         for k in (
             "bid_ask_spread",
@@ -698,24 +890,198 @@ def build_feature_dict_from_ohlcv(
             "liquidity_score",
             "price_impact",
             "market_efficiency",
-            "volatility_smile",
-            "price_skewness",
         ):
             if k in orderbook:
                 out[k] = _safe(orderbook.get(k), out[k])
+                ob_status = "STALE" if ob_stale else "LIVE"
+                base_trust = FEATURE_TRUST_SCORES["STALE" if ob_stale else "LIVE"]
+                mod = float(ob_fresh.get("freshness_trust_modifier") or 1.0)
+                _record_feature_provenance(
+                    provenance,
+                    k,
+                    ob_status,
+                    "redis/live orderbook",
+                    age_seconds=ob_fresh.get("age_seconds"),
+                    trust_score=base_trust * mod,
+                    learning_allowed=not ob_stale,
+                    orderbook_updated_at=ob_fresh.get("orderbook_updated_at"),
+                    freshness_status=str(ob_fresh.get("freshness_status") or "UNKNOWN"),
+                    freshness_trust_modifier=mod,
+                )
 
-    # Always compute volatility_smile and price_skewness proxies from returns if not already set
+    # price_skewness from returns (real calculation)
     r = _returns(cl)
     if out["price_skewness"] == 0.0:
         out["price_skewness"] = float(_skewness(r))
-    if out["volatility_smile"] == 0.0:
-        # volatility_smile proxy: vol(5) - 2*vol(20) + vol(60)
+    if r.size >= 3:
+        _record_feature_provenance(provenance, "price_skewness", "CALCULATED", "log-return skewness 1m", learning_allowed=True)
+    else:
+        _record_feature_provenance(provenance, "price_skewness", "WARMUP", "insufficient returns", learning_allowed=False)
+
+    # volatility_smile: NOT options surface — explicit proxy only
+    if out["volatility_smile"] == 0.0 and r.size >= 20:
         v5p = _rolling_std(r, 5)
         v20p = _rolling_std(r, 20)
         v60p = _rolling_std(r, 60)
         out["volatility_smile"] = float(v5p - 2.0 * v20p + v60p)
+    _record_feature_provenance(
+        provenance,
+        "volatility_smile",
+        "UNSUPPORTED_FOR_SPOT",
+        "vol term-structure proxy; not options smile — spot unsupported",
+        trust_score=0.0,
+        learning_allowed=False,
+    )
+
+    # put_call_ratio: no crypto spot options chain unless explicitly env-wired
+    pcr_explicit = sentiment is not None and str(sentiment.get("_put_call_source") or "") == "options"
+    if pcr_explicit and sentiment is not None:
+        out["put_call_ratio"] = _safe(sentiment.get("put_call_ratio"), 0.0)
+        _record_feature_provenance(provenance, "put_call_ratio", "LIVE", "explicit options source")
+    else:
+        out["put_call_ratio"] = 0.0
+        _record_feature_provenance(
+            provenance,
+            "put_call_ratio",
+            "UNSUPPORTED_FOR_SPOT",
+            "no spot options chain wired",
+            trust_score=0.0,
+            learning_allowed=False,
+        )
+
+    _finalize_feature_provenance(
+        out,
+        provenance,
+        n_bars=n_bars,
+        sentiment=sentiment,
+        volume_profile=volume_profile,
+        orderbook=orderbook,
+        orderbook_age_sec=orderbook_age_sec,
+        ohlcv_1d=ohlcv_1d,
+    )
 
     return out
+
+
+def _finalize_feature_provenance(
+    out: dict[str, float],
+    provenance: dict[str, dict[str, Any]] | None,
+    *,
+    n_bars: int,
+    sentiment: dict[str, Any] | None,
+    volume_profile: dict[str, Any] | None,
+    orderbook: dict[str, Any] | None,
+    orderbook_age_sec: float | None,
+    ohlcv_1d: list[list] | None,
+) -> None:
+    """Fill provenance for features not explicitly tagged during build."""
+    if provenance is None:
+        return
+    price = float(out.get("price") or 0.0)
+    ob_stale = orderbook_age_sec is not None and orderbook_age_sec > 45.0
+
+    basic = ("price", "high", "low", "open", "volume", "change_24h", "change_7d", "change_30d", "price_range", "typical_price")
+    for name in basic:
+        if name in provenance:
+            continue
+        val = float(out.get(name) or 0.0)
+        if name == "price" and val <= 0:
+            _record_feature_provenance(provenance, name, "MISSING", "no close price", learning_allowed=False)
+        elif name in ("change_24h", "change_7d", "change_30d") and val == 0.0 and not ohlcv_1d:
+            _record_feature_provenance(provenance, name, "WARMUP", "needs 1d series or sufficient 1m depth", learning_allowed=False)
+        elif val == 0.0 and name not in ("change_24h", "change_7d", "change_30d"):
+            _record_feature_provenance(provenance, name, "ZERO_DEFAULT", "zero after build", learning_allowed=False)
+        else:
+            src = "1m ohlcv live" if name in ("price", "high", "low", "open", "volume", "price_range", "typical_price") else "1d/1m change calc"
+            _record_feature_provenance(provenance, name, "LIVE" if "1m" in src else "CALCULATED", src)
+
+    tech_names = [n for n, i in FEATURE_MAPPING.items() if 11 <= i <= 72]
+    for name in tech_names:
+        if name in provenance:
+            continue
+        val = float(out.get(name) or 0.0)
+        min_bars = {
+            "ma_200": 200, "ma_100": 100, "ma_50": 50, "ema_50": 50, "rsi": 15, "adx": 29,
+            "aroon_up": 25, "mass_index": 35, "trix": 45, "ppo": 26,
+        }.get(name, 20)
+        if n_bars < min_bars:
+            _record_feature_provenance(provenance, name, "WARMUP", f"needs>={min_bars} bars have {n_bars}", learning_allowed=False)
+        else:
+            engine = "talib" if talib is not None else "numpy"
+            _record_feature_provenance(provenance, name, "CALCULATED", f"{engine} on 1m ohlcv (zero ok)")
+
+    vol_names = [n for n, i in FEATURE_MAPPING.items() if 38 <= i <= 47]
+    for name in vol_names:
+        if name in provenance:
+            continue
+        if name == "parabolic_sar" and abs(float(out.get(name) or 0) - price) < 1e-9 and n_bars < 15:
+            _record_feature_provenance(provenance, name, "WARMUP", "SAR needs more bars", learning_allowed=False)
+        elif float(out.get(name) or 0) == 0.0:
+            _record_feature_provenance(provenance, name, "WARMUP" if n_bars < 15 else "ZERO_DEFAULT", "atr/vol block", learning_allowed=n_bars >= 15)
+        else:
+            _record_feature_provenance(provenance, name, "CALCULATED", "volatility from 1m ohlcv")
+
+    vol_prof = [n for n, i in FEATURE_MAPPING.items() if 70 <= i <= 80]
+    for name in vol_prof:
+        if name in provenance:
+            continue
+        if name in ("negative_volume_index", "positive_volume_index"):
+            _record_feature_provenance(provenance, name, "CALCULATED", "NVI/PVI classic rules on 1m ohlcv")
+        elif name == "volume_weighted_price" and name in provenance:
+            pass
+        elif name == "volume_weighted_price" and abs(float(out.get(name) or 0) - price) < 1e-9:
+            _record_feature_provenance(provenance, name, "WARMUP", "vwap needs volume", learning_allowed=False)
+        else:
+            _record_feature_provenance(provenance, name, "CALCULATED", "volume block 1m")
+
+    sent_names = [n for n, i in FEATURE_MAPPING.items() if 78 <= i <= 90]
+    for name in sent_names:
+        if name in provenance or name == "put_call_ratio":
+            continue
+        val = float(out.get(name) or 0.0)
+        if sentiment is None:
+            _record_feature_provenance(provenance, name, "MISSING", "no sentiment payload", learning_allowed=False)
+        elif val == 0.0:
+            if name in ("social_sentiment", "news_sentiment") and sentiment is not None:
+                _record_feature_provenance(
+                    provenance,
+                    name,
+                    "CALCULATED",
+                    "sentiment neutral/zero from live pipeline",
+                    trust_score=0.75,
+                )
+            else:
+                _record_feature_provenance(provenance, name, "MISSING", "sentiment key unset", learning_allowed=False)
+        else:
+            _record_feature_provenance(provenance, name, "LIVE", "sentiment/redis/api")
+
+    time_names = [n for n, i in FEATURE_MAPPING.items() if 88 <= i <= 100]
+    for name in time_names:
+        if name in provenance:
+            continue
+        _record_feature_provenance(provenance, name, "CALCULATED", "candle timestamp utc")
+
+    adv_vol = [n for n, i in FEATURE_MAPPING.items() if 106 <= i <= 116]
+    for name in adv_vol:
+        if name in provenance:
+            continue
+        if name in ("volume_profile_poc", "volume_profile_vah", "volume_profile_val"):
+            continue
+        elif name in ("vwap", "twap"):
+            _record_feature_provenance(provenance, name, "CALCULATED", "rolling vwap/twap 1m")
+        else:
+            _record_feature_provenance(provenance, name, "MISSING", "not computed", learning_allowed=False)
+
+    micro = [n for n, i in FEATURE_MAPPING.items() if 114 <= i <= 124]
+    for name in micro:
+        if name in provenance:
+            continue
+        if not orderbook:
+            _record_feature_provenance(provenance, name, "MISSING", "no orderbook", learning_allowed=False)
+        elif ob_stale:
+            _record_feature_provenance(provenance, name, "STALE", "orderbook age exceeded", age_seconds=orderbook_age_sec, learning_allowed=False)
+        else:
+            _record_feature_provenance(provenance, name, "MISSING", "orderbook key absent", learning_allowed=False)
 
 
 def build_feature_vector_124(
@@ -726,6 +1092,8 @@ def build_feature_vector_124(
     orderbook: dict[str, Any] | None,
     ohlcv_1d: list[list] | None = None,
     sentiment: dict[str, Any] | None = None,
+    provenance: dict[str, dict[str, Any]] | None = None,
+    orderbook_age_sec: float | None = None,
 ) -> list[float]:
     """
     Canonical 124-feature vector for training and live inference.
@@ -744,5 +1112,7 @@ def build_feature_vector_124(
         orderbook=orderbook,
         sentiment=sentiment,
         ohlcv_1d=ohlcv_1d,
+        provenance=provenance,
+        orderbook_age_sec=orderbook_age_sec,
     )
     return dict_to_feature_vector(feature_dict)

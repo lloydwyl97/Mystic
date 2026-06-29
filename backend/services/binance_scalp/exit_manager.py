@@ -140,8 +140,15 @@ def evaluate_exit(
             None,
             d,
             PositionTrack(
-                entry, state, max_fav, max_adv, session_low, stale_review_count,
-                tuple(review_lows), track.setup_name, track.setup_context,
+                entry,
+                state,
+                max_fav,
+                max_adv,
+                session_low,
+                stale_review_count,
+                tuple(review_lows),
+                track.setup_name,
+                track.setup_context,
             ),
         )
 
@@ -154,8 +161,15 @@ def evaluate_exit(
             exit_reason,
             d,
             PositionTrack(
-                entry, state, max_fav, max_adv, session_low, stale_review_count,
-                tuple(review_lows), track.setup_name, track.setup_context,
+                entry,
+                state,
+                max_fav,
+                max_adv,
+                session_low,
+                stale_review_count,
+                tuple(review_lows),
+                track.setup_name,
+                track.setup_context,
             ),
         )
 

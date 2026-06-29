@@ -118,9 +118,7 @@ def ensure_strategy_runtime_audit_table(db_path: str | Path = DATABASE_PATH) -> 
 
         def _op() -> None:
             with connect_rw(db_path) as conn:
-                row = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='strategy_runtime_audit'"
-                ).fetchone()
+                row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='strategy_runtime_audit'").fetchone()
                 if row:
                     return
                 conn.execute("BEGIN IMMEDIATE")

@@ -5,13 +5,14 @@ Universe-expansion entry discovery — research only, no live promotion.
 Scans all Binance.US liquid spot pairs, builds labeled dataset, mines symbol-specific
 buckets, ranks symbols, tests scalp on liquid subset. Live top-four floor unchanged.
 """
+
 from __future__ import annotations
 
 import json
 import os
 import pickle
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +27,8 @@ DATASET_CACHE = BASELINE_DIR / "universe_expansion_dataset_cache.pkl"
 OUT_PATH = BASELINE_DIR / "universe_expansion_entry_discovery_latest.json"
 
 from backend.services.ai_outcome_dataset import FEATURE_NAMES_145
-from backend.services.universe_eligibility import scan_eligible_universe
 from backend.services.replay_promotion_gate import RESEARCH_EXCLUDED_SYMBOLS
+from backend.services.universe_eligibility import scan_eligible_universe
 from backend.services.universe_outcome_dataset import (
     UNIVERSE_EXTRA_NAMES,
     build_universe_dataset_rows,
@@ -121,7 +122,7 @@ def _train_per_symbol(train: list, val: list, dim: int) -> dict[str, Any]:
     if not SKLEARN_OK:
         return {}
     out: dict[str, Any] = {}
-    for sym in sorted(set(r["symbol"] for r in train)):
+    for sym in sorted({r["symbol"] for r in train}):
         tr = [r for r in train if r["symbol"] == sym]
         va = [r for r in val if r["symbol"] == sym]
         if len(tr) < 60:
@@ -202,21 +203,23 @@ def _discover_symbol_buckets(
             reasons.append("stress_fail")
         if not hold_ok:
             reasons.append("fat_tail_hold")
-        buckets.append({
-            "symbol": symbol,
-            "setup_name": setup,
-            "filter": fname,
-            "train_metrics": tm,
-            "validation_metrics": vm,
-            "test_metrics": tem,
-            "stress_metrics": stress_m,
-            "walk_forward_validation_pass": wf_val_pos,
-            "walk_forward_test_pass": wf_test_pos,
-            "spread_stress_pass": stress_m.get("expectancy_per_trade", 0) > 0,
-            "all_pass": len(reasons) == 0,
-            "target_met_500": tem.get("monthly_pnl_usd", 0) >= TARGET_MONTHLY,
-            "accept_or_reject_reason": reasons if reasons else "pass",
-        })
+        buckets.append(
+            {
+                "symbol": symbol,
+                "setup_name": setup,
+                "filter": fname,
+                "train_metrics": tm,
+                "validation_metrics": vm,
+                "test_metrics": tem,
+                "stress_metrics": stress_m,
+                "walk_forward_validation_pass": wf_val_pos,
+                "walk_forward_test_pass": wf_test_pos,
+                "spread_stress_pass": stress_m.get("expectancy_per_trade", 0) > 0,
+                "all_pass": len(reasons) == 0,
+                "target_met_500": tem.get("monthly_pnl_usd", 0) >= TARGET_MONTHLY,
+                "accept_or_reject_reason": reasons if reasons else "pass",
+            }
+        )
     buckets.sort(key=lambda b: float((b.get("test_metrics") or {}).get("monthly_pnl_usd") or -1e9), reverse=True)
     return buckets[:5]
 
@@ -240,19 +243,21 @@ def _rank_symbols(
             default={},
         )
         mi = per_sym_models.get(sym, {})
-        ranked.append({
-            "symbol": sym,
-            "daily_volume_usd": m.get("daily_volume_usd"),
-            "half_spread_pct": m.get("half_spread_pct"),
-            "recent_test_expectancy": sym_m.get("expectancy_per_trade"),
-            "walk_forward_test_monthly_pnl": (best_b.get("test_metrics") or {}).get("monthly_pnl_usd"),
-            "liquidity_score": round(min(1.0, __import__("math").log10(max(float(m.get("daily_volume_usd") or 1), 1)) / 7.0), 4),
-            "spread_score": round(1.0 - min(1.0, float(m.get("half_spread_pct") or 0) / 0.0015), 4),
-            "model_val_auc": mi.get("val_auc"),
-            "best_setup": best_b.get("setup_name"),
-            "fat_tail_hold_hours": sym_m.get("longest_hold_hours"),
-            "trade_frequency_per_month": sym_m.get("trades_per_month"),
-        })
+        ranked.append(
+            {
+                "symbol": sym,
+                "daily_volume_usd": m.get("daily_volume_usd"),
+                "half_spread_pct": m.get("half_spread_pct"),
+                "recent_test_expectancy": sym_m.get("expectancy_per_trade"),
+                "walk_forward_test_monthly_pnl": (best_b.get("test_metrics") or {}).get("monthly_pnl_usd"),
+                "liquidity_score": round(min(1.0, __import__("math").log10(max(float(m.get("daily_volume_usd") or 1), 1)) / 7.0), 4),
+                "spread_score": round(1.0 - min(1.0, float(m.get("half_spread_pct") or 0) / 0.0015), 4),
+                "model_val_auc": mi.get("val_auc"),
+                "best_setup": best_b.get("setup_name"),
+                "fat_tail_hold_hours": sym_m.get("longest_hold_hours"),
+                "trade_frequency_per_month": sym_m.get("trades_per_month"),
+            }
+        )
     ranked.sort(
         key=lambda x: float(x.get("walk_forward_test_monthly_pnl") or x.get("recent_test_expectancy") or -1e9),
         reverse=True,
@@ -263,12 +268,7 @@ def _rank_symbols(
 
 
 def _scalp_candidates(accepted: list[dict]) -> list[dict]:
-    cands = [
-        a for a in accepted
-        if a.get("ccxt_symbol") in TOP_FOUR_CCXT
-        and float(a.get("half_spread_pct") or 1) <= 0.001
-        and float(a.get("daily_volume_usd") or 0) >= 100_000
-    ]
+    cands = [a for a in accepted if a.get("ccxt_symbol") in TOP_FOUR_CCXT and float(a.get("half_spread_pct") or 1) <= 0.001 and float(a.get("daily_volume_usd") or 0) >= 100_000]
     cands.sort(key=lambda x: (-float(x.get("daily_volume_usd") or 0), float(x.get("half_spread_pct") or 0)))
     return cands[:MAX_SCALP_SYMBOLS]
 
@@ -366,22 +366,49 @@ def main() -> int:
             print(f"    DAY {ccxt}...", flush=True)
             bars = load_symbol_bars(api, ccxt, start_ms, end_ms, CACHE_DIR)
             umeta = {"daily_volume_usd": m.get("daily_volume_usd"), "half_spread_pct": hs}
-            rows.extend(build_universe_dataset_rows(
-                ccxt, bars, start_ts, end_ts, sample_sec=3600, half_spread=hs,
-                universe_meta=umeta, btc_1h=btc_1h, strength_ranks=strength_ranks,
-                vol_ranks=vol_ranks, scalp=False,
-            ))
+            rows.extend(
+                build_universe_dataset_rows(
+                    ccxt,
+                    bars,
+                    start_ts,
+                    end_ts,
+                    sample_sec=3600,
+                    half_spread=hs,
+                    universe_meta=umeta,
+                    btc_1h=btc_1h,
+                    strength_ranks=strength_ranks,
+                    vol_ranks=vol_ranks,
+                    scalp=False,
+                )
+            )
             if ccxt in scalp_meta_by_ccxt:
                 print(f"    SCALP {ccxt}...", flush=True)
-                rows.extend(build_universe_dataset_rows(
-                    ccxt, bars, scalp_start, end_ts, sample_sec=SCALP_SAMPLE_SEC, half_spread=hs,
-                    universe_meta=umeta, btc_1h=btc_1h, strength_ranks=strength_ranks,
-                    vol_ranks=vol_ranks, scalp=True,
-                ))
+                rows.extend(
+                    build_universe_dataset_rows(
+                        ccxt,
+                        bars,
+                        scalp_start,
+                        end_ts,
+                        sample_sec=SCALP_SAMPLE_SEC,
+                        half_spread=hs,
+                        universe_meta=umeta,
+                        btc_1h=btc_1h,
+                        strength_ranks=strength_ranks,
+                        vol_ranks=vol_ranks,
+                        scalp=True,
+                    )
+                )
             done_syms.add(ccxt)
-            DATASET_CACHE.write_bytes(pickle.dumps({
-                "version": 1, "rows": rows, "symbols": ccxt_list, "done_symbols": sorted(done_syms),
-            }))
+            DATASET_CACHE.write_bytes(
+                pickle.dumps(
+                    {
+                        "version": 1,
+                        "rows": rows,
+                        "symbols": ccxt_list,
+                        "done_symbols": sorted(done_syms),
+                    }
+                )
+            )
 
         DATASET_CACHE.write_bytes(pickle.dumps({"version": 1, "rows": rows, "symbols": ccxt_list}))
 
@@ -395,7 +422,7 @@ def main() -> int:
     per_sym = _train_per_symbol(train, val, len(FEATURE_NAMES))
 
     all_buckets: list[dict] = []
-    for sym in sorted(set(r["symbol"] for r in train)):
+    for sym in sorted({r["symbol"] for r in train}):
         all_buckets.extend(_discover_symbol_buckets(sym, train, val, test, per_sym.get(sym)))
 
     symbol_rankings = _rank_symbols(accepted, per_sym, all_buckets, day_rows, start_ts)
@@ -413,7 +440,10 @@ def main() -> int:
     wf_test = float(best_day_m.get("expectancy_per_trade") or 0) > 0
     stress_ok = bool((best_day.get("stress_metrics") or {}).get("expectancy_per_trade", 0) > 0)
     accepted_flag, reject_reasons = _reject_combined(
-        best_day_m, wf_test, stress_ok, float(best_day_m.get("longest_hold_hours") or 0),
+        best_day_m,
+        wf_test,
+        stress_ok,
+        float(best_day_m.get("longest_hold_hours") or 0),
     )
 
     reject_summary: dict[str, int] = {}
@@ -499,22 +529,23 @@ def main() -> int:
         ],
         "target_met_500": combined_m.get("monthly_pnl_usd", 0) >= TARGET_MONTHLY,
         "any_pattern_promoted": False,
-        "conclusion": (
-            "top_four_exhausted; universe_expansion_research_complete_no_promotable_edge"
-            if not accepted_flag
-            else "candidate_requires_full_execution_replay_validation"
-        ),
+        "conclusion": ("top_four_exhausted; universe_expansion_research_complete_no_promotable_edge" if not accepted_flag else "candidate_requires_full_execution_replay_validation"),
     }
 
     OUT_PATH.write_text(json.dumps(report, indent=2, default=str))
-    print(json.dumps({
-        "scanned": universe.get("total_pairs_scanned"),
-        "accepted": universe.get("pairs_accepted"),
-        "rows": len(rows),
-        "best_day_monthly": best_day_m.get("monthly_pnl_usd"),
-        "target_met_500": report["target_met_500"],
-        "out": str(OUT_PATH),
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "scanned": universe.get("total_pairs_scanned"),
+                "accepted": universe.get("pairs_accepted"),
+                "rows": len(rows),
+                "best_day_monthly": best_day_m.get("monthly_pnl_usd"),
+                "target_met_500": report["target_met_500"],
+                "out": str(OUT_PATH),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
