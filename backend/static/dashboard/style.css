@@ -68,10 +68,17 @@ body {
 
 .header__logo { 
     height: 44px; 
-    width: auto; 
-    max-width: 160px; 
+    width: 44px; 
     object-fit: contain; 
     filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3));
+}
+
+.header__title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    letter-spacing: 0.02em;
+    margin-right: auto;
 }
 
 .header__mode {
@@ -1030,3 +1037,113 @@ html {
 .operator-form__status--err {
     color: var(--red);
 }
+
+/* Operator console tabs */
+.console-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 10px 24px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-subtle);
+    position: sticky;
+    top: 62px;
+    z-index: 90;
+}
+
+.console-tabs__btn {
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    padding: 8px 14px;
+    border-radius: var(--radius);
+    font-family: var(--font-sans);
+    font-size: 0.78rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+.console-tabs__btn:hover {
+    color: var(--text-primary);
+    border-color: var(--border);
+    background: var(--card-bg);
+}
+
+.console-tabs__btn--active {
+    color: var(--green);
+    border-color: rgba(14, 203, 129, 0.45);
+    background: var(--green-subtle);
+}
+
+.tab-panel {
+    padding: 16px 24px 48px;
+    max-width: 1600px;
+    margin: 0 auto;
+}
+
+.tab-panel[hidden] {
+    display: none !important;
+}
+
+.hero--strip {
+    min-height: 72px;
+    max-height: 88px;
+}
+
+.hero--strip .hero__img {
+    object-fit: cover;
+    max-height: 88px;
+}
+
+.hero__content--compact {
+    padding: 12px 24px;
+}
+
+.hero__content--compact .hero__title {
+    font-size: 1.1rem;
+    margin-bottom: 2px;
+}
+
+.hero__content--compact .hero__subtitle {
+    font-size: 0.78rem;
+}
+
+.engine-label {
+    margin: 0 24px 12px;
+    padding: 8px 12px;
+    border-radius: var(--radius);
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+}
+
+.engine-label--day {
+    background: rgba(14, 203, 129, 0.08);
+    color: var(--green);
+    border: 1px solid rgba(14, 203, 129, 0.25);
+}
+
+.filter-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 18px;
+    align-items: center;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.filter-bar label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+}
+
+.filter-bar__sep {
+    color: var(--border);
+}
+
+.readiness-value.status-up { color: var(--green); }
+.readiness-value.status-down { color: var(--red); }

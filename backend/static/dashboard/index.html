@@ -3,15 +3,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mystic Trading Dashboard</title>
+    <title>Mystic Operator Console</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=32">
+    <link rel="stylesheet" href="style.css?v=34">
 </head>
 <body>
     <header class="header">
-        <img class="header__logo" src="assets/mystic-logo.png" alt="Mystic" loading="eager" />
+        <img class="header__logo" src="assets/mystic-logo.svg" alt="Mystic" loading="eager" width="44" height="44" />
+        <span class="header__title">Mystic Operator Console</span>
         <button type="button" class="header__mode header__mode--clickable header__tooltip" id="mode-badge" data-tooltip="Click to switch PAPER/LIVE" title="Click to switch PAPER/LIVE">--</button>
         <span class="header__regime header__regime--neutral header__tooltip" id="regime-badge" role="status" aria-live="polite" aria-atomic="true" data-tooltip="Crypto Fear &amp; Greed index (alternative.me), not price-trend ML" title="Fear &amp; Greed label (see hover)">Fear &amp; Greed: --</span>
         <span class="header__system header__system--unknown header__tooltip" id="system-badge" data-tooltip="OK / Warning / Critical from memory thresholds" title="System health">--</span>
@@ -19,69 +20,118 @@
         <button type="button" class="header__refresh" id="refresh-btn" title="Refresh now" aria-label="Refresh data">↻</button>
     </header>
 
-    <section class="hero">
-        <img class="hero__img" src="assets/hero-banner.png" alt="" loading="eager" aria-hidden="true" />
+    <section class="hero hero--strip">
+        <img class="hero__img" src="assets/hero-banner.svg" alt="" loading="eager" aria-hidden="true" />
         <div class="hero__overlay"></div>
-        <div class="hero__content">
-            <h1 class="hero__title">Mystic Trading Dashboard</h1>
-            <p class="hero__subtitle">Read-only monitoring and operator controls. No buy/sell order buttons — DAY trades run via portfolio engine integration only.</p>
+        <div class="hero__content hero__content--compact">
+            <h1 class="hero__title">Dual-Engine Command Center</h1>
+            <p class="hero__subtitle">DAY + SCALP visibility — read-only monitoring. Operator controls in Settings tab only.</p>
         </div>
     </section>
 
-    <section class="status-bar" aria-label="Account metrics from canonical snapshot" title="Cash, equity, positions, and health from the same portfolio snapshot as Open Positions">
-        <div class="status-item" title="Available cash balance"><span class="status-label">Cash</span><span class="status-value" id="status-cash">--</span></div>
-        <div class="status-item" title="Total equity (cash + positions)"><span class="status-label">Equity</span><span class="status-value" id="status-equity">--</span></div>
-        <div class="status-item" title="Open position count"><span class="status-label">Positions</span><span class="status-value" id="status-positions">--</span></div>
-        <div class="status-item" title="Infrastructure: processes, API, ledger invariant (HEALTHY / OVERALLOCATED)"><span class="status-label">Infra</span><span class="status-value" id="status-health">--</span></div>
-    </section>
-    <section class="status-bar status-bar--secondary" title="Risk % from canonical snapshot; Memory and Latency from separate system endpoints">
-        <div class="status-item" title="Total open risk % (canonical snapshot)"><span class="status-label">Risk</span><span class="status-value" id="status-risk">--</span></div>
-        <div class="status-item" title="Backend process memory"><span class="status-label">Memory</span><span class="status-value" id="status-memory">--</span></div>
-        <div class="status-item" title="Data freshness (OK / STALE_DATA)"><span class="status-label">Latency</span><span class="status-value" id="status-latency">--</span></div>
-        <div class="status-item" title="Redis market_data:last_update heartbeat (canonical lite)"><span class="status-label">Market heartbeat</span><span class="status-value" id="status-market-heartbeat">--</span></div>
-    </section>
+    <nav class="console-tabs" aria-label="Operator console tabs">
+        <button type="button" class="console-tabs__btn console-tabs__btn--active" data-tab="command">Command Center</button>
+        <button type="button" class="console-tabs__btn" data-tab="day">DAY Engine</button>
+        <button type="button" class="console-tabs__btn" data-tab="scalp">SCALP Engine</button>
+        <button type="button" class="console-tabs__btn" data-tab="positions">Positions &amp; Trades</button>
+        <button type="button" class="console-tabs__btn" data-tab="learning">Learning / AI Memory</button>
+        <button type="button" class="console-tabs__btn" data-tab="performance">Performance</button>
+        <button type="button" class="console-tabs__btn" data-tab="marketlens">MarketLens Bridge</button>
+        <button type="button" class="console-tabs__btn" data-tab="settings">Settings</button>
+    </nav>
 
-    <section class="widget widget--full" aria-label="Trading engines status">
+    <!-- TAB 1: Command Center -->
+    <div class="tab-panel tab-panel--active" id="tab-command" role="tabpanel">
+        <section class="status-bar" aria-label="DAY ledger metrics">
+            <div class="status-item"><span class="status-label">DAY Cash</span><span class="status-value" id="status-cash">--</span></div>
+            <div class="status-item"><span class="status-label">DAY Equity</span><span class="status-value" id="status-equity">--</span></div>
+            <div class="status-item"><span class="status-label">DAY Positions</span><span class="status-value" id="status-positions">--</span></div>
+            <div class="status-item"><span class="status-label">Infra</span><span class="status-value" id="status-health">--</span></div>
+        </section>
+        <section class="status-bar status-bar--secondary">
+            <div class="status-item"><span class="status-label">Risk</span><span class="status-value" id="status-risk">--</span></div>
+            <div class="status-item"><span class="status-label">Memory</span><span class="status-value" id="status-memory">--</span></div>
+            <div class="status-item"><span class="status-label">Latency</span><span class="status-value" id="status-latency">--</span></div>
+            <div class="status-item"><span class="status-label">Market heartbeat</span><span class="status-value" id="status-market-heartbeat">--</span></div>
+        </section>
+
+        <section class="widget widget--full">
+            <h2 class="widget__title">System health</h2>
+            <p class="widget__subtitle">Process heartbeats via pgrep — not hardcoded. Redis separate check.</p>
+            <div class="readiness-grid" id="process-health-grid">
+                <div class="readiness-card"><span class="readiness-label">API / uvicorn</span><span class="readiness-value" id="ph-uvicorn">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Redis</span><span class="readiness-value" id="ph-redis">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Market data</span><span class="readiness-value" id="ph-live-md">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Signal engine</span><span class="readiness-value" id="ph-signal">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Portfolio engine</span><span class="readiness-value" id="ph-portfolio">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Context engine</span><span class="readiness-value" id="ph-context">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Learning engine</span><span class="readiness-value" id="ph-learning">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">SCALP runner</span><span class="readiness-value" id="ph-scalp">--</span></div>
+            </div>
+        </section>
+
+        <section class="widget widget--full">
             <h2 class="widget__title">Trading engines</h2>
-            <p class="widget__subtitle">DAY top-four and scalp paper are separate engines. PnL and scoreboard are not mixed. Scalp NEAR_PASS / spread blockers are scalp diagnostics only.</p>
+            <p class="widget__subtitle">DAY and SCALP PnL are labeled separately — never mixed.</p>
             <div class="readiness-grid" id="engines-grid">
                 <div class="readiness-card"><span class="readiness-label">DAY engine</span><span class="readiness-value" id="eng-day-status">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">DAY today PnL</span><span class="readiness-value" id="eng-day-pnl">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">DAY scoreboard</span><span class="readiness-value" id="eng-day-scoreboard">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Scalp engine</span><span class="readiness-value" id="eng-scalp-status">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Scalp today PnL</span><span class="readiness-value" id="eng-scalp-pnl">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Scalp diagnostic</span><span class="readiness-value" id="eng-scalp-blocker">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Account equity (DAY ledger)</span><span class="readiness-value" id="eng-account-equity">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Account vs principal</span><span class="readiness-value" id="eng-account-pnl">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">DAY open positions</span><span class="readiness-value" id="cc-day-positions">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">SCALP engine</span><span class="readiness-value" id="eng-scalp-status">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">SCALP today PnL</span><span class="readiness-value" id="eng-scalp-pnl">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">SCALP open positions</span><span class="readiness-value" id="cc-scalp-positions">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">SCALP diagnostic</span><span class="readiness-value" id="eng-scalp-blocker">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">DAY equity (ledger)</span><span class="readiness-value" id="eng-account-equity">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">DAY vs principal</span><span class="readiness-value" id="eng-account-pnl">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Kill switch</span><span class="readiness-value" id="cc-kill-switch">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Live readiness</span><span class="readiness-value" id="cc-live-ready">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Latest DAY decision</span><span class="readiness-value" id="cc-day-decision">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Latest SCALP decision</span><span class="readiness-value" id="cc-scalp-decision">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Unrealized (DAY)</span><span class="readiness-value" id="cc-day-unrealized">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Unrealized (SCALP)</span><span class="readiness-value" id="cc-scalp-unrealized">--</span></div>
             </div>
         </section>
 
-    <section class="widget widget--full" aria-label="Trading economics">
-            <h2 class="widget__title">Trading economics (Binance.US)</h2>
-            <p class="widget__subtitle">Fee model shared by paper and live — maker/taker, slippage buffer, order-book spread estimate, roundtrip cost. Advanced Trading has no platform spread.</p>
-            <div class="readiness-grid" id="trading-economics-grid">
-                <div class="readiness-card"><span class="readiness-label">Exchange</span><span class="readiness-value" id="te-exchange">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Maker fee</span><span class="readiness-value" id="te-maker">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Taker fee</span><span class="readiness-value" id="te-taker">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Slippage buffer</span><span class="readiness-value" id="te-slippage">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Order-book half-spread</span><span class="readiness-value" id="te-half-spread">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Roundtrip est. cost</span><span class="readiness-value" id="te-roundtrip">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Fee source date</span><span class="readiness-value" id="te-fee-date">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">DAY notional mult</span><span class="readiness-value" id="te-notional-mult">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Per-slot target</span><span class="readiness-value" id="te-per-slot">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Max deployed (4 slots)</span><span class="readiness-value" id="te-max-deployed">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Baseline lock</span><span class="readiness-value" id="te-baseline-lock">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Top-four tier</span><span class="readiness-value" id="te-tier-note">--</span></div>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Today&apos;s activity (DAY ledger)</h2>
+            <div class="analytics-row analytics-row--today" id="today-activity-row">
+                <div class="mini-card"><span class="mini-card__label">Closed AI trades</span><span class="mini-card__value" id="today-closed-ai">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Open buys today</span><span class="mini-card__value" id="today-open-buys">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">AI realized today</span><span class="mini-card__value" id="today-ai-pnl">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Admin/stale closes</span><span class="mini-card__value" id="today-admin-closes">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Open unrealized</span><span class="mini-card__value" id="today-unrealized">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Total equity</span><span class="mini-card__value" id="today-equity">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Paper trades today</span><span class="mini-card__value" id="today-paper-trades">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Live trades today</span><span class="mini-card__value" id="today-live-trades">--</span></div>
             </div>
-            <details class="observability-panel">
-                <summary>Trading economics JSON</summary>
-                <pre id="panel-trading-economics-content" class="panel-pre">--</pre>
-            </details>
         </section>
+    </div>
 
-    <section class="widget widget--full" aria-label="DAY position health">
+    <!-- TAB 2: DAY Engine -->
+    <div class="tab-panel" id="tab-day" role="tabpanel" hidden>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Top-4 basket signals</h2>
+            <p class="widget__subtitle">BTC / ETH / SOL / XRP — from /api/portfolio-engine/day-health basket_signals</p>
+            <div class="widget__table-wrap">
+                <table class="positions-table">
+                    <thead><tr><th>Symbol</th><th>Action</th><th>Confidence</th><th>Thesis</th><th>Fresh</th></tr></thead>
+                    <tbody id="day-basket-tbody"><tr><td colspan="5">--</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">DAY open positions</h2>
+            <div class="widget__table-wrap">
+                <table class="positions-table">
+                    <thead><tr><th>Symbol</th><th>State</th><th>RS rank</th><th>Net %</th><th>Best alt</th></tr></thead>
+                    <tbody id="day-positions-tbody"><tr><td colspan="5">--</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+        <section class="widget widget--full" aria-label="DAY position health">
             <h2 class="widget__title">DAY position health</h2>
-            <p class="widget__subtitle">Observation only — trapped holds, idle capital, RS basket, signal freshness. No auto-sell or rotation.</p>
+            <p class="widget__subtitle">Observation only — no auto-sell or rotation.</p>
             <div class="readiness-grid" id="day-health-grid">
                 <div class="readiness-card"><span class="readiness-label">Positions used</span><span class="readiness-value" id="dh-slots">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Idle cash</span><span class="readiness-value" id="dh-idle-cash">--</span></div>
@@ -105,15 +155,171 @@
                 <div class="readiness-card"><span class="readiness-label">Align spread w/ bar</span><span class="readiness-value" id="dh-spread-align">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Last exec block</span><span class="readiness-value" id="dh-last-exec-block">--</span></div>
             </div>
-            <details class="observability-panel">
-                <summary>DAY health JSON</summary>
-                <pre id="panel-day-health-content" class="panel-pre">--</pre>
-            </details>
+            <details class="observability-panel"><summary>DAY health JSON</summary><pre id="panel-day-health-content" class="panel-pre">--</pre></details>
         </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Trading economics (DAY)</h2>
+            <div class="readiness-grid" id="trading-economics-grid">
+                <div class="readiness-card"><span class="readiness-label">Exchange</span><span class="readiness-value" id="te-exchange">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Maker fee</span><span class="readiness-value" id="te-maker">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Taker fee</span><span class="readiness-value" id="te-taker">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Slippage buffer</span><span class="readiness-value" id="te-slippage">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Order-book half-spread</span><span class="readiness-value" id="te-half-spread">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Roundtrip est. cost</span><span class="readiness-value" id="te-roundtrip">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Fee source date</span><span class="readiness-value" id="te-fee-date">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">DAY notional mult</span><span class="readiness-value" id="te-notional-mult">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Per-slot target</span><span class="readiness-value" id="te-per-slot">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Max deployed (4 slots)</span><span class="readiness-value" id="te-max-deployed">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Baseline lock</span><span class="readiness-value" id="te-baseline-lock">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Top-four tier</span><span class="readiness-value" id="te-tier-note">--</span></div>
+            </div>
+            <details class="observability-panel"><summary>Trading economics JSON</summary><pre id="panel-trading-economics-content" class="panel-pre">--</pre></details>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Model panel (DAY)</h2>
+            <pre id="panel-model-content" class="panel-pre">--</pre>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Market data readiness</h2>
+            <div id="market-readiness-lite" class="market-readiness-lite" aria-live="polite"></div>
+            <div class="widget__table-wrap widget__table-wrap--scroll">
+                <table class="positions-table" id="market-readiness-table">
+                    <thead><tr><th>Symbol</th><th>price</th><th>vol</th><th>spread</th><th>DAY gate</th><th>bundle</th><th>month</th><th>145 vec</th><th>buy ctx</th><th>hold ctx</th><th>sell ctx</th><th>missing</th></tr></thead>
+                    <tbody id="market-readiness-tbody"></tbody>
+                </table>
+                <p class="widget__no-data" id="market-readiness-loading">Loading readiness probe…</p>
+                <p class="widget__subtitle" id="market-readiness-summary"></p>
+            </div>
+        </section>
+    </div>
 
-    <section class="widget widget--full" aria-label="Learning ingestion health">
+    <!-- TAB 3: SCALP Engine -->
+    <div class="tab-panel" id="tab-scalp" role="tabpanel" hidden>
+        <section class="widget widget--full">
+            <h2 class="widget__title">SCALP engine status</h2>
+            <div class="readiness-grid" id="scalp-summary-grid">
+                <div class="readiness-card"><span class="readiness-label">Runner</span><span class="readiness-value" id="scalp-runner">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Overall decision</span><span class="readiness-value" id="scalp-overall">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Top blocker</span><span class="readiness-value" id="scalp-top-blocker">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Entry armed</span><span class="readiness-value" id="scalp-entry-armed">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Open positions</span><span class="readiness-value" id="scalp-open-count">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Today PnL</span><span class="readiness-value" id="scalp-today-pnl">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Today sells</span><span class="readiness-value" id="scalp-today-sells">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Calibration</span><span class="readiness-value" id="scalp-calibration">--</span></div>
+            </div>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">SCALP open positions</h2>
+            <div class="widget__table-wrap">
+                <table class="positions-table">
+                    <thead><tr><th>Symbol</th><th>Setup</th><th>Entry</th><th>Size</th><th>Hold (s)</th><th>State</th></tr></thead>
+                    <tbody id="scalp-positions-tbody"><tr><td colspan="6">--</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Per-symbol diagnostics (BTC / ETH / SOL / XRP)</h2>
+            <div class="widget__table-wrap widget__table-wrap--scroll">
+                <table class="positions-table">
+                    <thead><tr><th>Symbol</th><th>Decision</th><th>Reject</th><th>Micro regime</th><th>Dist to pass</th><th>Spread</th><th>Momentum</th></tr></thead>
+                    <tbody id="scalp-symbols-tbody"><tr><td colspan="7">--</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Strategy router / ranked candidates</h2>
+            <pre id="scalp-router-pre" class="panel-pre">--</pre>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Strategy inventory</h2>
+            <pre id="scalp-strategies-pre" class="panel-pre">--</pre>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">SCALP recent trades</h2>
+            <div class="widget__table-wrap widget__table-wrap--scroll">
+                <table class="positions-table">
+                    <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Price</th><th>PnL</th><th>Exit</th></tr></thead>
+                    <tbody id="scalp-trades-tbody"><tr><td colspan="6">--</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">SCALP scoreboard (daily)</h2>
+            <div class="widget__table-wrap">
+                <table class="positions-table">
+                    <thead><tr><th>Day</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Net PnL</th></tr></thead>
+                    <tbody id="scalp-scoreboard-tbody"><tr><td colspan="5">--</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+    </div>
+
+    <!-- TAB 4: Positions & Trades -->
+    <div class="tab-panel" id="tab-positions" role="tabpanel" hidden>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Filters</h2>
+            <div class="filter-bar" id="trade-filters">
+                <label><input type="radio" name="engine-filter" value="all" checked /> All engines</label>
+                <label><input type="radio" name="engine-filter" value="day" /> DAY</label>
+                <label><input type="radio" name="engine-filter" value="scalp" /> SCALP</label>
+                <span class="filter-bar__sep">|</span>
+                <label><input type="radio" name="time-filter" value="all" checked /> All time</label>
+                <label><input type="radio" name="time-filter" value="today" /> Today</label>
+                <label><input type="radio" name="time-filter" value="7d" /> 7 days</label>
+            </div>
+        </section>
+        <section class="widget-row">
+            <div class="widget widget--half">
+                <h2 class="widget__title">Open DAY positions</h2>
+                <p class="widget__subtitle">DAY ledger only — canonical snapshot.</p>
+                <div class="widget__table-wrap">
+                    <table class="positions-table">
+                        <thead><tr><th>Symbol</th><th>Sleeve</th><th>Size</th><th>Entry</th><th>Current</th><th>Unrealized</th></tr></thead>
+                        <tbody id="positions-tbody"></tbody>
+                    </table>
+                    <p class="widget__no-data" id="positions-no-data">No open DAY positions</p>
+                </div>
+            </div>
+            <div class="widget widget--half">
+                <h2 class="widget__title">Open SCALP positions</h2>
+                <p class="widget__subtitle">SCALP paper ledger — separate from DAY.</p>
+                <div class="widget__table-wrap">
+                    <table class="positions-table">
+                        <thead><tr><th>Symbol</th><th>Setup</th><th>Entry</th><th>Qty</th><th>Hold (s)</th></tr></thead>
+                        <tbody id="pt-scalp-open-tbody"><tr><td colspan="5">--</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Closed DAY trades</h2>
+            <div class="widget__table-wrap">
+                <table class="positions-table">
+                    <thead><tr><th>Time</th><th>Symbol</th><th>Sleeve</th><th>Side</th><th>Size</th><th>Price</th><th>PnL</th><th>Detail</th></tr></thead>
+                    <tbody id="trades-tbody"></tbody>
+                </table>
+                <p class="widget__no-data" id="trades-no-data">No DAY trades yet</p>
+            </div>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Closed SCALP trades</h2>
+            <div class="widget__table-wrap widget__table-wrap--scroll">
+                <table class="positions-table">
+                    <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Price</th><th>PnL</th><th>Exit</th></tr></thead>
+                    <tbody id="pt-scalp-closed-tbody"><tr><td colspan="6">--</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+        <section class="sleeve-summary-section" id="sleeve-summary-wrap">
+            <h2 class="widget__title">Sleeve Allocation (DAY)</h2>
+            <div class="sleeve-summary" id="sleeve-summary"><span class="sleeve-disabled">Loading...</span></div>
+        </section>
+    </div>
+
+    <!-- TAB 5: Learning -->
+    <div class="tab-panel" id="tab-learning" role="tabpanel" hidden>
+        <section class="widget widget--full">
             <h2 class="widget__title">Learning health (DAY top-4)</h2>
-            <p class="widget__subtitle">Continuous learning ingestion — execution stays selective, learning does not. Closed trades (Tier A), open-position heartbeats (Tier B), rejected/no-trade forward labels (Tier C), walk-forward anchors (Tier D).</p>
             <div class="readiness-grid" id="learning-health-grid">
                 <div class="readiness-card"><span class="readiness-label">Closed outcome rows</span><span class="readiness-value" id="lh-closed">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Candidate snapshots</span><span class="readiness-value" id="lh-snapshots">--</span></div>
@@ -125,71 +331,118 @@
                 <div class="readiness-card"><span class="readiness-label">Warnings</span><span class="readiness-value" id="lh-warnings">--</span></div>
             </div>
             <div class="widget__table-wrap">
-                <table class="positions-table" aria-label="Per-symbol learning rows">
-                    <thead>
-                        <tr><th>Symbol</th><th>Closed</th><th>Snapshots</th><th>Labeled</th><th>Heartbeats</th><th>Model date</th><th>Promotion</th><th>Last event</th></tr>
-                    </thead>
+                <table class="positions-table">
+                    <thead><tr><th>Symbol</th><th>Closed</th><th>Snapshots</th><th>Labeled</th><th>Heartbeats</th><th>Model date</th><th>Promotion</th><th>Last event</th></tr></thead>
                     <tbody id="lh-symbol-rows"><tr><td colspan="8">--</td></tr></tbody>
                 </table>
             </div>
-            <details class="observability-panel">
-                <summary>Learning health JSON</summary>
-                <pre id="panel-learning-health-content" class="panel-pre">--</pre>
-            </details>
+            <details class="observability-panel"><summary>Learning health JSON</summary><pre id="panel-learning-health-content" class="panel-pre">--</pre></details>
         </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">DAY learning status</h2>
+            <pre id="panel-learning-status-content" class="panel-pre">--</pre>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">SCALP learning</h2>
+            <p class="widget__subtitle">Outcome attribution, post-trade reviews, strategy score weights — requires closed SCALP roundtrips.</p>
+            <div class="readiness-grid">
+                <div class="readiness-card"><span class="readiness-label">Closed SCALP sells</span><span class="readiness-value" id="sl-closed-sells">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">First-close ready</span><span class="readiness-value" id="sl-first-close">--</span></div>
+            </div>
+            <h3 class="widget__subtitle">Outcome attribution</h3>
+            <pre id="sl-attribution-pre" class="panel-pre">--</pre>
+            <h3 class="widget__subtitle">Post-trade feature reviews</h3>
+            <pre id="sl-reviews-pre" class="panel-pre">--</pre>
+            <h3 class="widget__subtitle">Strategy score weights</h3>
+            <pre id="sl-weights-pre" class="panel-pre">--</pre>
+        </section>
+    </div>
 
-    <section class="widget widget--full" aria-label="Live operator controls">
+    <!-- TAB 6: Performance -->
+    <div class="tab-panel" id="tab-performance" role="tabpanel" hidden>
+        <p class="engine-label engine-label--day">All charts below: DAY ledger only (paper_trades). SCALP excluded.</p>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Portfolio Value (DAY ledger only)</h2>
+            <div class="widget__chart-wrap"><canvas id="chart-portfolio-value"></canvas><p class="widget__no-data" id="portfolio-no-data">No data</p></div>
+        </section>
+        <section class="widget-row">
+            <div class="widget widget--half">
+                <h2 class="widget__title">Daily Returns (DAY)</h2>
+                <div class="widget__chart-wrap"><canvas id="chart-daily-returns"></canvas><p class="widget__no-data" id="daily-returns-no-data">No data</p></div>
+            </div>
+            <div class="widget widget--half">
+                <h2 class="widget__title">Cumulative Returns (DAY)</h2>
+                <div class="widget__chart-wrap"><canvas id="chart-cumulative-returns"></canvas><p class="widget__no-data" id="cumulative-no-data">No data</p></div>
+            </div>
+        </section>
+        <section class="widget-row">
+            <div class="widget widget--half">
+                <h2 class="widget__title">Trade PnL Histogram (DAY)</h2>
+                <div class="widget__chart-wrap"><canvas id="chart-pnl-histogram"></canvas><p class="widget__no-data" id="pnl-histogram-no-data">No data</p></div>
+            </div>
+            <div class="widget widget--half">
+                <h2 class="widget__title">Trade Duration (DAY)</h2>
+                <div class="widget__chart-wrap"><canvas id="chart-trade-duration"></canvas><p class="widget__no-data" id="trade-duration-no-data">No data</p></div>
+            </div>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Strategy Performance (DAY)</h2>
+            <div class="widget__chart-wrap"><canvas id="chart-strategy-performance"></canvas><p class="widget__no-data" id="strategy-performance-no-data">No data</p></div>
+        </section>
+        <section class="analytics-row" aria-label="DAY canonical metrics">
+            <div class="mini-card"><span class="mini-card__label">Closed AI trades</span><span class="mini-card__value" id="analytics-trades">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Win Rate</span><span class="mini-card__value" id="analytics-winrate">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Realized PnL</span><span class="mini-card__value" id="analytics-realized">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Unrealized PnL</span><span class="mini-card__value" id="analytics-unrealized">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Total PnL (vs principal)</span><span class="mini-card__value" id="analytics-pnl">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Infra health</span><span class="mini-card__value" id="analytics-risk-status">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">DAY scoreboard (today)</span><span class="mini-card__value" id="analytics-scoreboard">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Invariants</span><span class="mini-card__value" id="analytics-invariants">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Cross-check</span><span class="mini-card__value" id="analytics-xcheck">--</span></div>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">Daily Performance Snapshot (DAY)</h2>
+            <div class="snapshot-grid" id="snapshot-container">
+                <div class="snapshot-section"><h3 class="snapshot-subtitle">Trade counts</h3><pre id="snapshot-counts" class="snapshot-pre">--</pre></div>
+                <div class="snapshot-section"><h3 class="snapshot-subtitle">SELL performance</h3><pre id="snapshot-sell" class="snapshot-pre">--</pre></div>
+                <div class="snapshot-section"><h3 class="snapshot-subtitle">Exit types</h3><pre id="snapshot-exit-types" class="snapshot-pre">--</pre></div>
+                <div class="snapshot-section"><h3 class="snapshot-subtitle">Churn &amp; mode gate</h3><pre id="snapshot-churn" class="snapshot-pre">--</pre></div>
+                <div class="snapshot-section"><h3 class="snapshot-subtitle">Top symbols</h3><pre id="snapshot-top-symbols" class="snapshot-pre">--</pre></div>
+            </div>
+            <p class="widget__no-data" id="snapshot-no-data">No snapshot data</p>
+        </section>
+    </div>
+
+    <!-- TAB 7: MarketLens Bridge -->
+    <div class="tab-panel" id="tab-marketlens" role="tabpanel" hidden>
+        <section class="widget widget--full">
+            <h2 class="widget__title">MarketLens Bridge (read-only)</h2>
+            <p class="widget__subtitle">Public-safe Mystic feed — no operator controls, no secrets, no private balances.</p>
+            <pre id="ml-feed-pre" class="panel-pre">Loading public feed…</pre>
+        </section>
+    </div>
+
+    <!-- TAB 8: Settings -->
+    <div class="tab-panel" id="tab-settings" role="tabpanel" hidden>
+        <section class="widget widget--full">
             <h2 class="widget__title">Live operator controls</h2>
-            <p class="widget__subtitle">Max positions, live order caps, sizing, manual arm, and kill switch. Save requires ADMIN_TOKEN (same as LIVE toggle).</p>
+            <p class="widget__subtitle">Save requires ADMIN_TOKEN (same as LIVE toggle).</p>
             <form id="operator-config-form" class="operator-form">
                 <div class="operator-form__grid">
-                    <label class="operator-form__field">
-                        <span>Max open positions (paper/engine)</span>
-                        <input type="number" id="op-max-positions" min="1" max="10" step="1" value="4" />
-                    </label>
-                    <label class="operator-form__field">
-                        <span>Live test max positions</span>
-                        <input type="number" id="op-live-max-positions" min="1" max="10" step="1" value="4" />
-                    </label>
-                    <label class="operator-form__field">
-                        <span>Live test max notional ($)</span>
-                        <input type="number" id="op-live-max-notional" min="1" step="1" value="25" />
-                    </label>
-                    <label class="operator-form__field">
-                        <span>Risk per trade (%)</span>
-                        <input type="number" id="op-risk-pct" min="0.1" max="20" step="0.1" value="4" />
-                    </label>
-                    <label class="operator-form__field">
-                        <span>Max cash per coin (%)</span>
-                        <input type="number" id="op-max-cash-coin" min="1" max="100" step="1" value="25" />
-                    </label>
-                    <label class="operator-form__field operator-form__field--wide">
-                        <span>Live symbol allowlist (comma-separated)</span>
-                        <input type="text" id="op-live-allowlist" value="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT" />
-                    </label>
-                    <label class="operator-form__field operator-form__field--check">
-                        <input type="checkbox" id="op-live-manual-arm" />
-                        <span>Live test manual arm (required for real orders)</span>
-                    </label>
-                    <label class="operator-form__field">
-                        <span>Kill switch</span>
-                        <select id="op-kill-switch">
-                            <option value="RESUME">RESUME</option>
-                            <option value="PAUSE_BUYS">PAUSE_BUYS</option>
-                            <option value="PAUSE_ALL">PAUSE_ALL</option>
-                        </select>
-                    </label>
+                    <label class="operator-form__field"><span>Max open positions (paper/engine)</span><input type="number" id="op-max-positions" min="1" max="10" step="1" value="4" /></label>
+                    <label class="operator-form__field"><span>Live test max positions</span><input type="number" id="op-live-max-positions" min="1" max="10" step="1" value="4" /></label>
+                    <label class="operator-form__field"><span>Live test max notional ($)</span><input type="number" id="op-live-max-notional" min="1" step="1" value="25" /></label>
+                    <label class="operator-form__field"><span>Risk per trade (%)</span><input type="number" id="op-risk-pct" min="0.1" max="20" step="0.1" value="4" /></label>
+                    <label class="operator-form__field"><span>Max cash per coin (%)</span><input type="number" id="op-max-cash-coin" min="1" max="100" step="1" value="25" /></label>
+                    <label class="operator-form__field operator-form__field--wide"><span>Live symbol allowlist</span><input type="text" id="op-live-allowlist" value="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT" /></label>
+                    <label class="operator-form__field operator-form__field--check"><input type="checkbox" id="op-live-manual-arm" /><span>Live test manual arm</span></label>
+                    <label class="operator-form__field"><span>Kill switch</span><select id="op-kill-switch"><option value="RESUME">RESUME</option><option value="PAUSE_BUYS">PAUSE_BUYS</option><option value="PAUSE_ALL">PAUSE_ALL</option></select></label>
                 </div>
-                <div class="operator-form__actions">
-                    <button type="submit" class="operator-form__btn">Save operator settings</button>
-                    <span id="op-config-status" class="operator-form__status" aria-live="polite"></span>
-                </div>
+                <div class="operator-form__actions"><button type="submit" class="operator-form__btn">Save operator settings</button><span id="op-config-status" class="operator-form__status" aria-live="polite"></span></div>
             </form>
         </section>
-
-    <section class="widget widget--full" aria-label="Live readiness">
+        <section class="widget widget--full">
             <h2 class="widget__title">Live readiness</h2>
-            <p class="widget__subtitle">Read-only pre-flight for tiny live test. Does not enable live or place orders.</p>
             <div class="readiness-grid" id="live-readiness-grid">
                 <div class="readiness-card"><span class="readiness-label">Mode</span><span class="readiness-value" id="lr-mode">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Live orders</span><span class="readiness-value" id="lr-live-orders">--</span></div>
@@ -204,291 +457,25 @@
                 <div class="readiness-card"><span class="readiness-label">Protected exec</span><span class="readiness-value" id="lr-protected">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Sleeve block</span><span class="readiness-value" id="lr-sleeve">--</span></div>
             </div>
-            <details class="observability-panel">
-                <summary>Tiny live checklist &amp; blockers</summary>
-                <pre id="panel-live-readiness-content" class="panel-pre">--</pre>
-            </details>
+            <details class="observability-panel"><summary>Tiny live checklist</summary><pre id="panel-live-readiness-content" class="panel-pre">--</pre></details>
         </section>
-
-    <section class="widget widget--full" aria-label="Today's activity">
-            <h2 class="widget__title">Today&apos;s activity</h2>
-            <p class="widget__subtitle">Closed AI trades ≠ open buys. Admin/stale clears are excluded from AI win stats.</p>
-            <div class="analytics-row analytics-row--today" id="today-activity-row">
-                <div class="mini-card"><span class="mini-card__label">Closed AI trades</span><span class="mini-card__value" id="today-closed-ai">--</span></div>
-                <div class="mini-card"><span class="mini-card__label">Open buys today</span><span class="mini-card__value" id="today-open-buys">--</span></div>
-                <div class="mini-card"><span class="mini-card__label">AI realized today</span><span class="mini-card__value" id="today-ai-pnl">--</span></div>
-                <div class="mini-card"><span class="mini-card__label">Admin/stale closes</span><span class="mini-card__value" id="today-admin-closes">--</span></div>
-                <div class="mini-card"><span class="mini-card__label">Open unrealized</span><span class="mini-card__value" id="today-unrealized">--</span></div>
-                <div class="mini-card"><span class="mini-card__label">Total equity</span><span class="mini-card__value" id="today-equity">--</span></div>
-                <div class="mini-card"><span class="mini-card__label">Paper trades today</span><span class="mini-card__value" id="today-paper-trades">--</span></div>
-                <div class="mini-card"><span class="mini-card__label">Live trades today</span><span class="mini-card__value" id="today-live-trades">--</span></div>
-            </div>
-        </section>
-
-    <section class="widget widget--full" aria-label="Model and learning">
-            <h2 class="widget__title">Model / learning (read-only)</h2>
-            <p class="widget__subtitle">Active models are kept unless a candidate beats promotion gates. No auto-promotion from this panel.</p>
-            <pre id="panel-model-content" class="panel-pre">--</pre>
-        </section>
-
-    <section class="widget widget--full" aria-label="Live market readiness">
-            <h2 class="widget__title">Market data readiness</h2>
-            <p class="widget__subtitle">
-                Symbols: BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT — live probes from Binance.US (heavy; refreshes ~90s).
-                Full row uses <code>/api/portfolio-engine/market-data-readiness</code>. Lite Redis heartbeat ships in canonical snapshot.
-            </p>
-            <div id="market-readiness-lite" class="market-readiness-lite" aria-live="polite"></div>
-            <div class="widget__table-wrap widget__table-wrap--scroll">
-                <table class="positions-table" id="market-readiness-table">
-                    <thead>
-                        <tr>
-                            <th>Symbol</th>
-                            <th>price</th>
-                            <th>vol</th>
-                            <th>spread</th>
-                            <th>DAY gate</th>
-                            <th>bundle</th>
-                            <th>month</th>
-                            <th>145 vec</th>
-                            <th>buy ctx</th>
-                            <th>hold ctx</th>
-                            <th>sell ctx</th>
-                            <th>missing</th>
-                        </tr>
-                    </thead>
-                    <tbody id="market-readiness-tbody"></tbody>
-                </table>
-                <p class="widget__no-data" id="market-readiness-loading">Loading readiness probe…</p>
-                <p class="widget__subtitle" id="market-readiness-summary"></p>
-            </div>
-        </section>
-
-    <main class="main">
-        <section class="widget widget--full">
-            <h2 class="widget__title">Portfolio Value</h2>
-            <p class="widget__subtitle">Historical time series (snapshots + ledger via /api/performance/portfolio-value). Last point tracks ledger total equity; poll timing can differ slightly from the status bar.</p>
-            <div class="widget__chart-wrap">
-                <canvas id="chart-portfolio-value"></canvas>
-                <p class="widget__no-data" id="portfolio-no-data">No data</p>
-            </div>
-        </section>
-
-        <section class="widget-row">
-            <div class="widget widget--half">
-                <h2 class="widget__title">Open Positions</h2>
-                <p class="widget__subtitle">Live book from canonical snapshot (/api/portfolio-engine/dashboard-canonical).</p>
-                <div class="widget__table-wrap">
-                    <table class="positions-table">
-                        <thead>
-                            <tr>
-                                <th>Symbol</th>
-                                <th>Sleeve</th>
-                                <th>Size</th>
-                                <th>Entry</th>
-                                <th>Current</th>
-                                <th>Unrealized PnL</th>
-                            </tr>
-                        </thead>
-                        <tbody id="positions-tbody"></tbody>
-                    </table>
-                    <p class="widget__no-data" id="positions-no-data">No open positions</p>
-                </div>
-            </div>
-            <div class="widget widget--half">
-                <h2 class="widget__title">Daily Returns</h2>
-                <p class="widget__subtitle">Historical: day-to-day % moves between portfolio-value points (/api/performance/daily-returns). Not intraday snapshot PnL.</p>
-                <div class="widget__chart-wrap">
-                    <canvas id="chart-daily-returns"></canvas>
-                    <p class="widget__no-data" id="daily-returns-no-data">No data</p>
-                </div>
-            </div>
-        </section>
-
-        <section class="widget widget--full">
-            <h2 class="widget__title">Cumulative Returns (%)</h2>
-            <p class="widget__subtitle">Historical: cumulative % vs first point in the performance series (/api/performance/cumulative-returns). Different metric from the Total PnL tile.</p>
-            <div class="widget__chart-wrap">
-                <canvas id="chart-cumulative-returns"></canvas>
-                <p class="widget__no-data" id="cumulative-no-data">No data</p>
-            </div>
-        </section>
-
-        <section class="widget-row">
-            <div class="widget widget--half">
-                <h2 class="widget__title">Trade PnL Histogram (USD)</h2>
-                <p class="widget__subtitle">Historical: distribution of closed-trade PnL (/api/performance/trade-pnl).</p>
-                <div class="widget__chart-wrap">
-                    <canvas id="chart-pnl-histogram"></canvas>
-                    <p class="widget__no-data" id="pnl-histogram-no-data">No data</p>
-                </div>
-            </div>
-            <div class="widget widget--half">
-                <h2 class="widget__title">Trade Duration Histogram</h2>
-                <p class="widget__subtitle">Historical: closed-trade hold durations (/api/performance/trade-duration).</p>
-                <div class="widget__chart-wrap">
-                    <canvas id="chart-trade-duration"></canvas>
-                    <p class="widget__no-data" id="trade-duration-no-data">No data</p>
-                </div>
-            </div>
-        </section>
-
-        <section class="widget widget--full">
-            <h2 class="widget__title">Strategy Performance (PnL $)</h2>
-            <p class="widget__subtitle">Analytics rollup by strategy (/api/performance/strategy-performance), not live ledger totals.</p>
-            <div class="widget__chart-wrap">
-                <canvas id="chart-strategy-performance"></canvas>
-                <p class="widget__no-data" id="strategy-performance-no-data">No data</p>
-            </div>
-        </section>
-
-        <section class="analytics-row" aria-label="Canonical snapshot metrics">
-            <p class="widget__subtitle">Same API tick as Open Positions. <strong>Scoreboard</strong> = closed AI SELLs only. <strong>Open buys</strong> shown separately below.</p>
-            <div class="mini-card">
-                <span class="mini-card__label">Closed AI trades</span>
-                <span class="mini-card__value" id="analytics-trades">--</span>
-            </div>
-            <div class="mini-card">
-                <span class="mini-card__label">Win Rate</span>
-                <span class="mini-card__value" id="analytics-winrate">--</span>
-            </div>
-            <div class="mini-card">
-                <span class="mini-card__label">Realized PnL</span>
-                <span class="mini-card__value" id="analytics-realized">--</span>
-            </div>
-            <div class="mini-card">
-                <span class="mini-card__label">Unrealized PnL</span>
-                <span class="mini-card__value" id="analytics-unrealized">--</span>
-            </div>
-            <div class="mini-card">
-                <span class="mini-card__label">Total PnL (vs principal)</span>
-                <span class="mini-card__value" id="analytics-pnl">--</span>
-            </div>
-            <div class="mini-card">
-                <span class="mini-card__label">Infra health</span>
-                <span class="mini-card__value" id="analytics-risk-status">--</span>
-            </div>
-            <div class="mini-card">
-                <span class="mini-card__label">DAY scoreboard (today)</span>
-                <span class="mini-card__value" id="analytics-scoreboard">--</span>
-            </div>
-            <div class="mini-card">
-                <span class="mini-card__label">Invariants</span>
-                <span class="mini-card__value" id="analytics-invariants">--</span>
-            </div>
-            <div class="mini-card">
-                <span class="mini-card__label">Cross-check</span>
-                <span class="mini-card__value" id="analytics-xcheck">--</span>
-            </div>
-        </section>
-
-        <section class="sleeve-summary-section" id="sleeve-summary-wrap">
-            <h2 class="widget__title">Sleeve Allocation</h2>
-            <p class="widget__subtitle">Live sleeve budgets and utilization from canonical snapshot. Local: sleeve blocking OFF — utilization is informational; max positions, cash cap, and preflight remain hard controls.</p>
-            <div class="sleeve-summary" id="sleeve-summary">
-                <span class="sleeve-disabled">Loading...</span>
-            </div>
-        </section>
-
-        <section class="widget widget--full">
-            <h2 class="widget__title">Recent Trades</h2>
-            <p class="widget__subtitle">Latest fills from canonical snapshot (same tick as snapshot row and open positions).</p>
-            <div class="widget__table-wrap">
-                <table class="positions-table">
-                    <thead>
-                        <tr>
-                            <th>Time</th>
-                            <th>Symbol</th>
-                            <th>Sleeve</th>
-                            <th>Side</th>
-                            <th>Size</th>
-                            <th>Price</th>
-                            <th>PnL</th>
-                            <th>Detail</th>
-                        </tr>
-                    </thead>
-                    <tbody id="trades-tbody"></tbody>
-                </table>
-                <p class="widget__no-data" id="trades-no-data">No trades yet</p>
-            </div>
-        </section>
-
-        <section class="widget widget--full">
-            <h2 class="widget__title">Daily Performance Snapshot</h2>
-            <p class="widget__subtitle">SQLite daily rollup included in canonical snapshot (today’s trade stats, not the historical return charts).</p>
-            <div class="snapshot-grid" id="snapshot-container">
-                <div class="snapshot-section">
-                    <h3 class="snapshot-subtitle">Trade counts</h3>
-                    <pre id="snapshot-counts" class="snapshot-pre">--</pre>
-                </div>
-                <div class="snapshot-section">
-                    <h3 class="snapshot-subtitle">SELL performance</h3>
-                    <pre id="snapshot-sell" class="snapshot-pre">--</pre>
-                </div>
-                <div class="snapshot-section">
-                    <h3 class="snapshot-subtitle">Exit types</h3>
-                    <pre id="snapshot-exit-types" class="snapshot-pre">--</pre>
-                </div>
-                <div class="snapshot-section">
-                    <h3 class="snapshot-subtitle">Churn &amp; mode gate</h3>
-                    <pre id="snapshot-churn" class="snapshot-pre">--</pre>
-                </div>
-                <div class="snapshot-section">
-                    <h3 class="snapshot-subtitle">Top symbols by SELL count</h3>
-                    <pre id="snapshot-top-symbols" class="snapshot-pre">--</pre>
-                </div>
-            </div>
-            <p class="widget__no-data" id="snapshot-no-data">No snapshot data</p>
-        </section>
-
         <section class="widget widget--full">
             <h2 class="widget__title">Observability</h2>
-            <p class="widget__subtitle">Diagnostics from individual APIs (invariants detail, rejects, health, …) — timing may differ from the canonical snapshot.</p>
             <div class="observability-panels">
-                <details class="observability-panel">
-                    <summary>Invariants Detail</summary>
-                    <pre id="panel-invariants-content" class="panel-pre">--</pre>
-                </details>
-                <details class="observability-panel">
-                    <summary>Risk Detail</summary>
-                    <pre id="panel-risk-content" class="panel-pre">--</pre>
-                </details>
-                <details class="observability-panel">
-                    <summary>Latency Detail</summary>
-                    <pre id="panel-latency-content" class="panel-pre">--</pre>
-                </details>
-                <details class="observability-panel">
-                    <summary>Recent Rejects</summary>
-                    <pre id="panel-rejects-content" class="panel-pre">--</pre>
-                </details>
-                <details class="observability-panel">
-                    <summary>Decisions</summary>
-                    <pre id="panel-decisions-content" class="panel-pre">--</pre>
-                </details>
-                <details class="observability-panel">
-                    <summary>System Health</summary>
-                    <pre id="panel-system-health-content" class="panel-pre">--</pre>
-                </details>
-                <details class="observability-panel">
-                    <summary>Scoreboard 7d</summary>
-                    <pre id="panel-scoreboard7d-content" class="panel-pre">--</pre>
-                </details>
-                <details class="observability-panel">
-                    <summary>Missed opportunities</summary>
-                    <pre id="panel-missed-op-content" class="panel-pre">--</pre>
-                </details>
-                <details class="observability-panel">
-                    <summary>Feature health / freshness</summary>
-                    <pre id="panel-feature-health-content" class="panel-pre">--</pre>
-                </details>
-                <details class="observability-panel">
-                    <summary>AI Learning</summary>
-                    <pre id="panel-learning-status-content" class="panel-pre">--</pre>
-                </details>
+                <details class="observability-panel"><summary>Invariants Detail</summary><pre id="panel-invariants-content" class="panel-pre">--</pre></details>
+                <details class="observability-panel"><summary>Risk Detail</summary><pre id="panel-risk-content" class="panel-pre">--</pre></details>
+                <details class="observability-panel"><summary>Latency Detail</summary><pre id="panel-latency-content" class="panel-pre">--</pre></details>
+                <details class="observability-panel"><summary>Recent Rejects</summary><pre id="panel-rejects-content" class="panel-pre">--</pre></details>
+                <details class="observability-panel"><summary>Decisions</summary><pre id="panel-decisions-content" class="panel-pre">--</pre></details>
+                <details class="observability-panel"><summary>System Health</summary><pre id="panel-system-health-content" class="panel-pre">--</pre></details>
+                <details class="observability-panel"><summary>Scoreboard 7d</summary><pre id="panel-scoreboard7d-content" class="panel-pre">--</pre></details>
+                <details class="observability-panel"><summary>Missed opportunities</summary><pre id="panel-missed-op-content" class="panel-pre">--</pre></details>
+                <details class="observability-panel"><summary>Feature health</summary><pre id="panel-feature-health-content" class="panel-pre">--</pre></details>
             </div>
         </section>
-    </main>
+    </div>
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-    <script src="app.js?v=33"></script>
+    <script src="app.js?v=34"></script>
 </body>
 </html>

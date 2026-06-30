@@ -259,6 +259,51 @@ def get_health_recommendations(memory_mb: float, cpu_percent: float) -> list:
     return recommendations
 
 
+def _process_running(pattern: str) -> bool:
+    import subprocess
+
+    try:
+        res = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+@router.get("/process-health")
+async def get_process_health() -> dict[str, Any]:
+    """Read-only Mystic core process heartbeat (pgrep-based)."""
+    checks = {
+        "uvicorn": _process_running("uvicorn"),
+        "live_market_data": _process_running("start_live_market_data.py"),
+        "ai_signal_generator": _process_running("start_ai_signal_generator.py"),
+        "portfolio_engine": _process_running("start_portfolio_engine_integration.py"),
+        "ai_market_context": _process_running("start_ai_market_context.py"),
+        "ai_learning": _process_running("start_ai_learning.py"),
+        "scalp_runner": _process_running("backend.services.binance_scalp.runner"),
+        "live_data_collector": _process_running("live_data_collector.py"),
+    }
+    redis_ok = False
+    if get_shared_redis_sync:
+        try:
+            client = get_shared_redis_sync()
+            redis_ok = client is not None and client.ping()
+        except Exception:
+            redis_ok = False
+    core_ok = checks["uvicorn"] and checks["portfolio_engine"]
+    all_ok = core_ok and checks["live_market_data"] and checks["ai_signal_generator"]
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": "healthy" if all_ok else ("degraded" if core_ok else "critical"),
+        "redis": "ok" if redis_ok else "down",
+        "processes": checks,
+    }
+
+
 @router.get("/topology")
 async def get_topology_report() -> dict[str, Any]:
     """

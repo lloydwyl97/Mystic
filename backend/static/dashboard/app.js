@@ -1,14 +1,10 @@
-// Mystic Trading Dashboard - Live data in widgets only
-// No raw JSON. Fetches APIs and populates charts, tables, and status.
-
-const REFRESH_MS = 15000; // 15s for snappier dashboard updates
-// All Mystic dashboard data is driven by live backend endpoints below.
+// Mystic Operator Console — dual-engine DAY + SCALP dashboard
+const DASHBOARD_VERSION = 34;
+const REFRESH_MS = 15000;
 const ENDPOINTS = [
-    // Single canonical portfolio snapshot (positions, sleeves, PnL, risk, trades, scoreboard, daily snapshot, operator, regime, invariants summary)
     { path: "/api/portfolio-engine/dashboard-canonical", key: "dashboardCanonical" },
-    // Mode badge: owned by dashboard-canonical operator + POST /execution-mode after toggle (avoid fighting execution-mode GET poll)
-    // Regime is included in dashboard-canonical (same tick as positions/risk) — no separate poll
     { path: "/api/system/health/quick", key: "systemHealth" },
+    { path: "/api/system/process-health", key: "processHealth" },
     { path: "/api/portfolio-engine/latency", key: "latency" },
     { path: "/api/portfolio-engine/invariants-detail", key: "invariantsDetail" },
     { path: "/api/performance/portfolio-value", key: "portfolioValue" },
@@ -17,7 +13,6 @@ const ENDPOINTS = [
     { path: "/api/performance/trade-pnl", key: "tradePnl" },
     { path: "/api/performance/trade-duration", key: "tradeDuration" },
     { path: "/api/performance/strategy-performance", key: "strategyPerformance" },
-    { path: "/api/performance/analytics", key: "analytics" },
     { path: "/api/portfolio-engine/rejects", key: "rejects" },
     { path: "/api/portfolio-engine/decisions", key: "decisions" },
     { path: "/api/system/health/comprehensive", key: "systemHealthFull" },
@@ -31,7 +26,17 @@ const ENDPOINTS = [
     { path: "/api/ai-diagnostics/learning-health", key: "learningHealth" },
     { path: "/api/portfolio-engine/trading-economics", key: "tradingEconomics" },
     { path: "/api/scalp/status", key: "scalpStatus" },
+    { path: "/api/scalp/strategies", key: "scalpStrategies" },
+    { path: "/api/scalp/positions", key: "scalpPositions" },
+    { path: "/api/scalp/trades?limit=100", key: "scalpTrades" },
+    { path: "/api/scalp/scoreboard?days=14", key: "scalpScoreboard" },
+    { path: "/api/scalp/learning-summary", key: "scalpLearning" },
+    { path: "/api/public/mystic-marketlens-feed", key: "marketlensFeed" },
 ];
+
+window._lastProcessHealth = null;
+window._lastScalpPositions = null;
+window._lastScalpTrades = null;
 
 let chartPortfolio = null;
 let chartDailyReturns = null;
@@ -46,6 +51,7 @@ function init() {
     } catch (e) {
         console.error("Chart.js init failed:", e);
     }
+    initTabs();
     startPolling();
     startMarketReadinessPolling();
     updateHeaderMeta();
@@ -53,6 +59,43 @@ function init() {
     initModeSwitch();
     initOperatorControls();
     initRefreshButton();
+    initTradeFilters();
+}
+
+function initTabs() {
+    const buttons = document.querySelectorAll(".console-tabs__btn");
+    buttons.forEach(function (btn) {
+        btn.addEventListener("click", function () {
+            const tab = btn.getAttribute("data-tab");
+            if (!tab) return;
+            buttons.forEach(function (b) {
+                b.classList.toggle("console-tabs__btn--active", b === btn);
+            });
+            document.querySelectorAll(".tab-panel").forEach(function (panel) {
+                const active = panel.id === "tab-" + tab;
+                panel.classList.toggle("tab-panel--active", active);
+                if (active) panel.removeAttribute("hidden");
+                else panel.setAttribute("hidden", "hidden");
+            });
+        });
+    });
+}
+
+function initTradeFilters() {
+    const bar = document.getElementById("trade-filters");
+    if (!bar) return;
+    bar.addEventListener("change", function () {
+        applyTradeFilters();
+    });
+}
+
+function applyTradeFilters() {
+    const engine = (document.querySelector('input[name="engine-filter"]:checked') || {}).value || "all";
+    const time = (document.querySelector('input[name="time-filter"]:checked') || {}).value || "all";
+    if (window._lastScalpTrades) updateScalpTradesTable(window._lastScalpTrades, time);
+    if (window._lastDashboardCanonical && window._lastDashboardCanonical.trades) {
+        updateTrades({ trades: window._lastDayTrades || (window._lastDashboardCanonical && window._lastDashboardCanonical.performance && window._lastDashboardCanonical.performance.trades) || [] });
+    }
 }
 
 const MARKET_READINESS_REFRESH_MS = 90000;
@@ -517,9 +560,6 @@ function updateUI(key, data) {
         case "strategyPerformance":
             updateStrategyPerformanceChart(data);
             break;
-        case "analytics":
-            updateAnalytics(data);
-            break;
         case "rejects":
             updateRejects(data);
             break;
@@ -562,6 +602,27 @@ function updateUI(key, data) {
         case "scalpStatus":
             updateScalpEngineStatus(data);
             break;
+        case "scalpStrategies":
+            updateScalpStrategies(data);
+            break;
+        case "scalpPositions":
+            updateScalpPositions(data);
+            break;
+        case "scalpTrades":
+            updateScalpTrades(data);
+            break;
+        case "scalpScoreboard":
+            updateScalpScoreboard(data);
+            break;
+        case "scalpLearning":
+            updateScalpLearning(data);
+            break;
+        case "processHealth":
+            updateProcessHealth(data);
+            break;
+        case "marketlensFeed":
+            updateMarketLensFeed(data);
+            break;
     }
 }
 
@@ -574,6 +635,7 @@ function updateScalpEngineStatus(res) {
     };
     const active = d.runner_active === true;
     set("eng-scalp-status", active ? "RUNNING" : "STOPPED");
+    set("scalp-runner", active ? "RUNNING" : "STOPPED");
     const pnl = d.pnl_summary || {};
     const today = pnl.today || {};
     const todayPnl = today.realized_pnl_usd != null ? Number(today.realized_pnl_usd) : null;
@@ -583,13 +645,251 @@ function updateScalpEngineStatus(res) {
         todayEl.classList.remove("pnl-pos", "pnl-neg");
         if (todayPnl != null) todayEl.classList.add(todayPnl >= 0 ? "pnl-pos" : "pnl-neg");
     }
+    const scalpPnlEl = document.getElementById("scalp-today-pnl");
+    if (scalpPnlEl) {
+        scalpPnlEl.textContent = todayPnl != null ? "$" + todayPnl.toFixed(2) : "--";
+        scalpPnlEl.classList.remove("pnl-pos", "pnl-neg");
+        if (todayPnl != null) scalpPnlEl.classList.add(todayPnl >= 0 ? "pnl-pos" : "pnl-neg");
+    }
+    set("scalp-today-sells", today.sells != null ? String(today.sells) : "--");
     if (active) {
-        set("eng-scalp-blocker", (d.overall_decision || "--") + (d.top_blocker ? ": " + d.top_blocker : ""));
+        const diag = (d.overall_decision || "--") + (d.top_blocker ? ": " + d.top_blocker : "");
+        set("eng-scalp-blocker", diag);
+        set("scalp-overall", d.overall_decision || "--");
+        set("scalp-top-blocker", d.top_blocker || "--");
+        set("cc-scalp-decision", diag);
     } else {
         set("eng-scalp-blocker", d.note || "runner stopped");
+        set("scalp-overall", "STOPPED");
+        set("scalp-top-blocker", d.note || "--");
+        set("cc-scalp-decision", d.note || "runner stopped");
     }
+    set("scalp-entry-armed", d.entry_armed === true ? "ARMED" : d.entry_armed === false ? "DISARMED" : "--");
+    set("scalp-open-count", d.open_scalp_positions != null ? String(d.open_scalp_positions) : "--");
+    set("cc-scalp-positions", d.open_scalp_positions != null ? String(d.open_scalp_positions) : "--");
+    set("scalp-calibration", d.calibration_profile || (d.calibration_mode ? "calibration" : "strict"));
     window._lastScalpStatus = d;
+    updateScalpSymbolDiagnostics(d);
+    updateScalpRouter(d);
     refreshEnginesPanelFromCache();
+    refreshCommandCenter();
+}
+
+function updateScalpSymbolDiagnostics(d) {
+    const tbody = document.getElementById("scalp-symbols-tbody");
+    if (!tbody) return;
+    const symbols = d.symbols || {};
+    const micro = d.micro_regimes || {};
+    const keys = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"].filter(function (k) {
+        return symbols[k] || micro[k];
+    });
+    if (!keys.length) {
+        keys.push.apply(keys, Object.keys(symbols).sort());
+    }
+    if (!keys.length) {
+        tbody.innerHTML = "<tr><td colspan=\"7\">--</td></tr>";
+        return;
+    }
+    tbody.innerHTML = keys.map(function (sym) {
+        const row = symbols[sym] || {};
+        const mr = micro[sym] || {};
+        const dist = row.distance_to_pass || {};
+        const distPct = dist.distance_to_pass_pct != null ? Number(dist.distance_to_pass_pct).toFixed(3) + "%" : "--";
+        return "<tr><td>" + sym + "</td><td>" + (row.decision || "--") + "</td><td>" + (row.reject_reason || "--") +
+            "</td><td>" + (mr.micro_regime || mr.regime || "--") + "</td><td>" + distPct + "</td><td>" +
+            (row.spread_pct != null ? (Number(row.spread_pct) * 100).toFixed(3) + "%" : "--") + "</td><td>" +
+            (row.momentum_confirmed ? "yes" : "no") + "</td></tr>";
+    }).join("");
+}
+
+function updateScalpRouter(d) {
+    const pre = document.getElementById("scalp-router-pre");
+    if (!pre) return;
+    try {
+        pre.textContent = JSON.stringify(d.strategy_router || {}, null, 2);
+    } catch (_e) {
+        pre.textContent = "--";
+    }
+}
+
+function updateScalpStrategies(res) {
+    const pre = document.getElementById("scalp-strategies-pre");
+    if (!pre) return;
+    try {
+        pre.textContent = JSON.stringify(res || {}, null, 2);
+    } catch (_e) {
+        pre.textContent = "--";
+    }
+}
+
+function updateScalpPositions(res) {
+    window._lastScalpPositions = res;
+    const positions = (res && res.positions) || [];
+    const ledger = res && res.ledger;
+    const renderRow = function (pos) {
+        return "<tr><td>" + (pos.symbol || "") + "</td><td>" + (pos.setup || "--") + "</td><td>" +
+            (pos.entry_price != null ? Number(pos.entry_price).toFixed(4) : "--") + "</td><td>" +
+            (pos.quantity != null ? Number(pos.quantity).toFixed(6) : "--") + "</td><td>" +
+            (pos.hold_seconds != null ? Number(pos.hold_seconds).toFixed(0) : "--") + "</td><td>" +
+            (pos.state || pos.status || "--") + "</td></tr>";
+    };
+    ["scalp-positions-tbody", "pt-scalp-open-tbody"].forEach(function (id) {
+        const tbody = document.getElementById(id);
+        if (!tbody) return;
+        if (!positions.length) {
+            tbody.innerHTML = "<tr><td colspan=\"6\">No open SCALP positions</td></tr>";
+        } else {
+            tbody.innerHTML = positions.map(renderRow).join("");
+        }
+    });
+    if (ledger && ledger.unrealized_pnl != null) {
+        const el = document.getElementById("cc-scalp-unrealized");
+        if (el) {
+            const u = Number(ledger.unrealized_pnl);
+            el.textContent = "$" + u.toFixed(2);
+            el.classList.remove("pnl-pos", "pnl-neg");
+            el.classList.add(u >= 0 ? "pnl-pos" : "pnl-neg");
+        }
+    }
+    setCcScalpPositions(positions.length);
+}
+
+function setCcScalpPositions(n) {
+    const el = document.getElementById("cc-scalp-positions");
+    if (el) el.textContent = String(n);
+}
+
+function updateScalpTrades(res) {
+    window._lastScalpTrades = res;
+    const time = (document.querySelector('input[name="time-filter"]:checked') || {}).value || "all";
+    updateScalpTradesTable(res, time);
+}
+
+function updateScalpTradesTable(res, timeFilter) {
+    const trades = (res && res.trades) || [];
+    const now = new Date();
+    const filtered = trades.filter(function (t) {
+        if (timeFilter === "all") return true;
+        if (!t.created_at) return false;
+        const dt = new Date(t.created_at.replace(" ", "T") + "Z");
+        if (timeFilter === "today") {
+            return dt.toDateString() === now.toDateString();
+        }
+        if (timeFilter === "7d") {
+            return now - dt < 7 * 86400000;
+        }
+        return true;
+    });
+    const html = filtered.length ? filtered.map(function (t) {
+        const pnl = t.pnl_usd != null ? Number(t.pnl_usd) : null;
+        const pnlCls = pnl != null ? (pnl >= 0 ? "pnl-pos" : "pnl-neg") : "";
+        return "<tr><td>" + (t.created_at || "") + "</td><td>" + (t.symbol || "") + "</td><td>" + (t.side || "") +
+            "</td><td>" + (t.price != null ? Number(t.price).toFixed(4) : "") + "</td><td class=\"" + pnlCls + "\">" +
+            (pnl != null ? pnl.toFixed(2) : "--") + "</td><td>" + (t.exit_reason || "") + "</td></tr>";
+    }).join("") : "<tr><td colspan=\"6\">No SCALP trades</td></tr>";
+    ["scalp-trades-tbody", "pt-scalp-closed-tbody"].forEach(function (id) {
+        const tbody = document.getElementById(id);
+        if (tbody) tbody.innerHTML = html;
+    });
+}
+
+function updateScalpScoreboard(res) {
+    const tbody = document.getElementById("scalp-scoreboard-tbody");
+    if (!tbody) return;
+    const rows = (res && res.rows) || [];
+    if (!rows.length) {
+        tbody.innerHTML = "<tr><td colspan=\"5\">No SCALP scoreboard rows yet</td></tr>";
+        return;
+    }
+    tbody.innerHTML = rows.map(function (r) {
+        return "<tr><td>" + (r.day || "") + "</td><td>" + (r.trades || 0) + "</td><td>" + (r.wins || 0) +
+            "</td><td>" + (r.losses || 0) + "</td><td>" + (r.net_pnl != null ? Number(r.net_pnl).toFixed(2) : "--") + "</td></tr>";
+    }).join("");
+}
+
+function updateScalpLearning(res) {
+    const d = res || {};
+    const set = (id, text) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = text != null ? String(text) : "--";
+    };
+    set("sl-closed-sells", d.closed_sells);
+    set("sl-first-close", d.first_close_ready ? "YES" : "waiting for first close");
+    const fmt = function (arr) {
+        try {
+            return JSON.stringify(arr || [], null, 2);
+        } catch (_e) {
+            return "--";
+        }
+    };
+    const att = document.getElementById("sl-attribution-pre");
+    if (att) att.textContent = fmt(d.outcome_attribution);
+    const rev = document.getElementById("sl-reviews-pre");
+    if (rev) rev.textContent = fmt(d.post_trade_reviews);
+    const w = document.getElementById("sl-weights-pre");
+    if (w) w.textContent = fmt(d.strategy_score_weights);
+}
+
+function updateProcessHealth(res) {
+    window._lastProcessHealth = res;
+    const procs = (res && res.processes) || {};
+    const setStatus = function (id, ok) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = ok ? "UP" : "DOWN";
+        el.classList.remove("status-up", "status-down");
+        el.classList.add(ok ? "status-up" : "status-down");
+    };
+    setStatus("ph-uvicorn", procs.uvicorn);
+    setStatus("ph-live-md", procs.live_market_data);
+    setStatus("ph-signal", procs.ai_signal_generator);
+    setStatus("ph-portfolio", procs.portfolio_engine);
+    setStatus("ph-context", procs.ai_market_context);
+    setStatus("ph-learning", procs.ai_learning);
+    setStatus("ph-scalp", procs.scalp_runner);
+    const redisEl = document.getElementById("ph-redis");
+    if (redisEl) {
+        const ok = res && res.redis === "ok";
+        redisEl.textContent = ok ? "OK" : "DOWN";
+        redisEl.classList.remove("status-up", "status-down");
+        redisEl.classList.add(ok ? "status-up" : "status-down");
+    }
+    refreshEnginesPanelFromCache();
+}
+
+function updateMarketLensFeed(res) {
+    const pre = document.getElementById("ml-feed-pre");
+    if (!pre) return;
+    try {
+        pre.textContent = JSON.stringify(res || {}, null, 2);
+    } catch (_e) {
+        pre.textContent = "--";
+    }
+}
+
+function refreshCommandCenter() {
+    const set = (id, text) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = text != null && text !== "" ? String(text) : "--";
+    };
+    const dh = window._lastDayHealth || {};
+    set("cc-day-decision", dh.capital_idle_reason || "--");
+    set("cc-day-positions", dh.open_positions_count != null ? String(dh.open_positions_count) : "--");
+    const canon = window._lastDashboardCanonical || {};
+    const risk = canon.risk || {};
+    if (risk.unrealized_pnl != null) {
+        const u = Number(risk.unrealized_pnl);
+        const el = document.getElementById("cc-day-unrealized");
+        if (el) {
+            el.textContent = "$" + u.toFixed(2);
+            el.classList.remove("pnl-pos", "pnl-neg");
+            el.classList.add(u >= 0 ? "pnl-pos" : "pnl-neg");
+        }
+    }
+    const op = canon.operator || {};
+    set("cc-kill-switch", op.kill_switch || "--");
+    const lr = window._lastLiveReadiness || {};
+    set("cc-live-ready", lr.tiny_live_ready === true ? "READY" : lr.block_reason || "--");
 }
 
 /** DAY + account slice of engines panel (called from canonical + scoreboard). */
@@ -598,7 +898,10 @@ function refreshEnginesPanelFromCache() {
         const el = document.getElementById(id);
         if (el) el.textContent = text != null && text !== "" ? String(text) : "--";
     };
-    set("eng-day-status", "RUNNING");
+    const ph = window._lastProcessHealth || {};
+    const procs = ph.processes || {};
+    const dayUp = procs.portfolio_engine === true;
+    set("eng-day-status", dayUp ? "RUNNING" : (ph.status ? ph.status.toUpperCase() : "UNKNOWN"));
     const canon = window._lastDashboardCanonical || {};
     const perf = (canon.performance && canon.performance.performance) || {};
     const risk = canon.risk || {};
@@ -622,6 +925,7 @@ function refreshEnginesPanelFromCache() {
         if (dayPnl != null) dayEl.classList.add(dayPnl >= 0 ? "pnl-pos" : "pnl-neg");
     }
     set("eng-day-scoreboard", sb.pass_fail || sb.status || "--");
+    refreshCommandCenter();
 }
 
 function updateTradingEconomics(res) {
@@ -718,6 +1022,7 @@ function updateDayHealth(res) {
     const wrap = res && typeof res === "object" ? res : {};
     const d = wrap.data || wrap;
     if (!d || typeof d !== "object") return;
+    window._lastDayHealth = d;
 
     const set = (id, text) => {
         const el = document.getElementById(id);
@@ -727,6 +1032,8 @@ function updateDayHealth(res) {
     set("dh-slots", d.slots_available != null ? `${d.open_positions_count || 0}/${d.max_open_positions || 4}` : "--");
     set("dh-idle-cash", d.cash_balance != null ? "$" + Number(d.cash_balance).toFixed(2) : "--");
     set("dh-idle-reason", d.capital_idle_reason || "--");
+    set("cc-day-decision", d.capital_idle_reason || "--");
+    set("cc-day-positions", d.open_positions_count != null ? String(d.open_positions_count) : "--");
     const diag = d.capital_idle_diagnosis || {};
     set("dh-spread-passing", Array.isArray(diag.spread_passing_symbols) && diag.spread_passing_symbols.length
         ? diag.spread_passing_symbols.join(", ")
@@ -767,6 +1074,9 @@ function updateDayHealth(res) {
     const lastBlock = d.last_execution_block || {};
     set("dh-last-exec-block", lastBlock.reject_reason ? String(lastBlock.reject_reason) + " @ " + (lastBlock.symbol || "?") : "--");
 
+    updateDayBasketSignals(d.basket_signals);
+    updateDayPositionsTable(d.positions);
+
     const pre = document.getElementById("panel-day-health-content");
     if (pre) {
         pre.textContent = JSON.stringify(
@@ -782,6 +1092,41 @@ function updateDayHealth(res) {
             2
         );
     }
+    refreshCommandCenter();
+}
+
+function updateDayBasketSignals(signals) {
+    const tbody = document.getElementById("day-basket-tbody");
+    if (!tbody) return;
+    const rows = Array.isArray(signals) ? signals : [];
+    if (!rows.length) {
+        tbody.innerHTML = "<tr><td colspan=\"5\">No basket signals in Redis</td></tr>";
+        return;
+    }
+    tbody.innerHTML = rows.map(function (s) {
+        const conf = s.confidence != null ? (Number(s.confidence) * 100).toFixed(1) + "%" : "--";
+        const action = s.action || s.signal || s.recommendation || "--";
+        const thesis = s.thesis || s.reason || s.setup || "--";
+        const fresh = s.stale === true ? "stale" : s.fresh === false ? "stale" : "ok";
+        return "<tr><td>" + (s.symbol || s.pair || "--") + "</td><td>" + action + "</td><td>" + conf +
+            "</td><td>" + String(thesis).slice(0, 80) + "</td><td>" + fresh + "</td></tr>";
+    }).join("");
+}
+
+function updateDayPositionsTable(positions) {
+    const tbody = document.getElementById("day-positions-tbody");
+    if (!tbody) return;
+    const rows = Array.isArray(positions) ? positions : [];
+    if (!rows.length) {
+        tbody.innerHTML = "<tr><td colspan=\"5\">No open DAY positions</td></tr>";
+        return;
+    }
+    tbody.innerHTML = rows.map(function (p) {
+        return "<tr><td>" + (p.symbol || "") + "</td><td>" + (p.state || "--") + "</td><td>" +
+            (p.rs_rank != null ? String(p.rs_rank) : "--") + "</td><td>" +
+            (p.net_pct != null ? (Number(p.net_pct) * 100).toFixed(2) + "%" : "--") + "</td><td>" +
+            (p.best_alternate_symbol || "--") + "</td></tr>";
+    }).join("");
 }
 
 /** Full live Binance probe (slow path). Payload: `{ success, data }` where `data.rows` lists per-symbol flags. */
@@ -1136,6 +1481,8 @@ function updateLiveReadiness(res) {
         }
         pre.textContent = lines.join("\n");
     }
+    window._lastLiveReadiness = d;
+    refreshCommandCenter();
 }
 
 function updateModelPanel(res) {
@@ -1531,15 +1878,6 @@ function updateOperator(data) {
     if (health && d.account_status) health.textContent = d.account_status;
 }
 
-// paper-trading/portfolio: { portfolio: { total_balance_usd, cash_balance, ... } }
-// Dashboard fix: Do NOT touch status-cash or status-equity. operator-status is the single source
-// (reads from SQLite). Avoids "wrong then correct then wrong" flicker from competing endpoints.
-function updatePaperPortfolio(data) {
-    const p = data.portfolio || data;
-    if (!p) return;
-    // Previously filled cash/equity when "--"; now operator-status owns those exclusively.
-}
-
 // positions: { positions: [...] }
 function updatePositions(data) {
     if (!data || typeof data !== "object") return;
@@ -1614,24 +1952,7 @@ function updatePortfolioPerformance(data) {
         unrealizedEl.title = "Open positions mark-to-market vs entry (not total account return).";
     }
     updateTrades({ trades });
-}
-
-// paper-trading/performance: { performance: { total_trades, win_rate, total_pnl } }
-// Dashboard fix: Do NOT update analytics-trades/winrate/pnl. portfolio-engine/performance
-// is the canonical source. Prevents multiple endpoints fighting over the same DOM.
-function updatePaperPerformance(data) {
-    const p = data.performance || data;
-    if (!p) return;
-    // Trades/winrate/PnL widgets: owned by updatePortfolioPerformance only.
-}
-
-// performance/analytics: { current_metrics: { total_trades, win_rate, total_pnl } }
-// Dashboard fix: Do NOT update analytics-trades/winrate/pnl. portfolio-engine/performance
-// is the canonical source. Prevents multiple endpoints fighting over the same DOM.
-function updateAnalytics(data) {
-    const m = data.current_metrics || data.performance || data;
-    if (!m) return;
-    // Trades/winrate/PnL widgets: owned by updatePortfolioPerformance only.
+    window._lastDayTrades = trades;
 }
 
 // performance/strategy-performance: { strategies: [{ name, data: [{ timestamp, value }] }] } or 204
@@ -1848,7 +2169,7 @@ function normalizeTs(ts) {
     return isNaN(d.getTime()) ? 0 : d.getTime();
 }
 
-// paper-trading/trades or portfolio-engine/performance: { trades: [{ symbol, side, quantity, price, pnl, timestamp }] }
+// paper-trading/trades or portfolio-engine/performance: { trades: [...] } — DAY ledger only
 function updateTrades(data) {
     if (!data || typeof data !== "object") return;
     const trades = Array.isArray(data.trades) ? data.trades : [];

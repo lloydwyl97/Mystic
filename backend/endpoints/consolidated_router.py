@@ -92,6 +92,7 @@ def load_all_endpoints() -> None:
         ("backend.endpoints.ai_diagnostics_endpoints", (None,), "ai diagnostics endpoints", False),
         ("backend.endpoints.paper_trading_endpoints", (None,), "paper trading endpoints (GET read-only; POST order routes retired)", False),
         ("backend.endpoints.scalp_status_endpoints", (None,), "scalp status endpoints", False),
+        ("backend.endpoints.public_mystic_endpoints", (None,), "public mystic endpoints", False),
         ("backend.routes.orders", (None,), "orders routes (GET only; POST placement returns 410)", False),
         ("backend.routes.system_health", (None,), "system health routes", True),
     ]
