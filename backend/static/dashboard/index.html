@@ -4,10 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mystic Operator Console</title>
+    <link rel="icon" href="assets/mystic-logo.svg" type="image/svg+xml" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=34">
+    <link rel="stylesheet" href="style.css?v=40">
 </head>
 <body>
     <header class="header">
@@ -81,13 +82,13 @@
                 <div class="readiness-card"><span class="readiness-label">SCALP engine</span><span class="readiness-value" id="eng-scalp-status">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">SCALP today PnL</span><span class="readiness-value" id="eng-scalp-pnl">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">SCALP open positions</span><span class="readiness-value" id="cc-scalp-positions">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">SCALP diagnostic</span><span class="readiness-value" id="eng-scalp-blocker">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">SCALP diagnostic</span><span class="readiness-value" id="eng-scalp-blocker">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">DAY equity (ledger)</span><span class="readiness-value" id="eng-account-equity">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">DAY vs principal</span><span class="readiness-value" id="eng-account-pnl">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Kill switch</span><span class="readiness-value" id="cc-kill-switch">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Live readiness</span><span class="readiness-value" id="cc-live-ready">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Latest DAY decision</span><span class="readiness-value" id="cc-day-decision">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Latest SCALP decision</span><span class="readiness-value" id="cc-scalp-decision">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Latest DAY decision</span><span class="readiness-value" id="cc-day-decision">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Latest SCALP decision</span><span class="readiness-value" id="cc-scalp-decision">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Unrealized (DAY)</span><span class="readiness-value" id="cc-day-unrealized">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Unrealized (SCALP)</span><span class="readiness-value" id="cc-scalp-unrealized">--</span></div>
             </div>
@@ -113,9 +114,9 @@
         <section class="widget widget--full">
             <h2 class="widget__title">Top-4 basket signals</h2>
             <p class="widget__subtitle">BTC / ETH / SOL / XRP — from /api/portfolio-engine/day-health basket_signals</p>
-            <div class="widget__table-wrap">
+            <div class="widget__table-wrap widget__table-wrap--scroll">
                 <table class="positions-table">
-                    <thead><tr><th>Symbol</th><th>Action</th><th>Confidence</th><th>Thesis</th><th>Fresh</th></tr></thead>
+                    <thead><tr><th>Symbol</th><th>Action</th><th>Conf</th><th>Thesis</th><th>Fresh</th></tr></thead>
                     <tbody id="day-basket-tbody"><tr><td colspan="5">--</td></tr></tbody>
                 </table>
             </div>
@@ -135,7 +136,7 @@
             <div class="readiness-grid" id="day-health-grid">
                 <div class="readiness-card"><span class="readiness-label">Positions used</span><span class="readiness-value" id="dh-slots">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Idle cash</span><span class="readiness-value" id="dh-idle-cash">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Idle reason</span><span class="readiness-value" id="dh-idle-reason">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Idle reason</span><span class="readiness-value" id="dh-idle-reason">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Spread-passing</span><span class="readiness-value" id="dh-spread-passing">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Max trapped days</span><span class="readiness-value" id="dh-trapped-days">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Held symbol</span><span class="readiness-value" id="dh-held-symbol">--</span></div>
@@ -149,11 +150,11 @@
                 <div class="readiness-card"><span class="readiness-label">Last bar eval</span><span class="readiness-value" id="dh-last-bar">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Last setup credit</span><span class="readiness-value" id="dh-last-setup">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Last bar skip</span><span class="readiness-value" id="dh-bar-skip">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Top BUY reject (7d)</span><span class="readiness-value" id="dh-top-reject">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Top BUY reject (7d)</span><span class="readiness-value" id="dh-top-reject">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Spread blocks (exec)</span><span class="readiness-value" id="dh-spread-blocked">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Paper spread cap</span><span class="readiness-value" id="dh-spread-cap">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Align spread w/ bar</span><span class="readiness-value" id="dh-spread-align">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Last exec block</span><span class="readiness-value" id="dh-last-exec-block">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Last exec block</span><span class="readiness-value" id="dh-last-exec-block">--</span></div>
             </div>
             <details class="observability-panel"><summary>DAY health JSON</summary><pre id="panel-day-health-content" class="panel-pre">--</pre></details>
         </section>
@@ -170,14 +171,14 @@
                 <div class="readiness-card"><span class="readiness-label">DAY notional mult</span><span class="readiness-value" id="te-notional-mult">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Per-slot target</span><span class="readiness-value" id="te-per-slot">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Max deployed (4 slots)</span><span class="readiness-value" id="te-max-deployed">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Baseline lock</span><span class="readiness-value" id="te-baseline-lock">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Top-four tier</span><span class="readiness-value" id="te-tier-note">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Baseline lock</span><span class="readiness-value" id="te-baseline-lock">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Top-four tier</span><span class="readiness-value" id="te-tier-note">--</span></div>
             </div>
             <details class="observability-panel"><summary>Trading economics JSON</summary><pre id="panel-trading-economics-content" class="panel-pre">--</pre></details>
         </section>
         <section class="widget widget--full">
             <h2 class="widget__title">Model panel (DAY)</h2>
-            <pre id="panel-model-content" class="panel-pre">--</pre>
+            <pre id="panel-model-content" class="panel-pre panel-pre--tall">--</pre>
         </section>
         <section class="widget widget--full">
             <h2 class="widget__title">Market data readiness</h2>
@@ -200,12 +201,18 @@
             <div class="readiness-grid" id="scalp-summary-grid">
                 <div class="readiness-card"><span class="readiness-label">Runner</span><span class="readiness-value" id="scalp-runner">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Overall decision</span><span class="readiness-value" id="scalp-overall">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Top blocker</span><span class="readiness-value" id="scalp-top-blocker">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Top blocker</span><span class="readiness-value" id="scalp-top-blocker">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Entry armed</span><span class="readiness-value" id="scalp-entry-armed">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Open positions</span><span class="readiness-value" id="scalp-open-count">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Today PnL</span><span class="readiness-value" id="scalp-today-pnl">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Today sells</span><span class="readiness-value" id="scalp-today-sells">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Calibration</span><span class="readiness-value" id="scalp-calibration">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">All-time PnL</span><span class="readiness-value" id="scalp-alltime-pnl">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">All-time sells</span><span class="readiness-value" id="scalp-alltime-sells">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Mode</span><span class="readiness-value" id="scalp-mode">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Fee model ok</span><span class="readiness-value" id="scalp-fee-ok">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Warm rounds</span><span class="readiness-value" id="scalp-warm-rounds">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Warm note</span><span class="readiness-value" id="scalp-warm-note">--</span></div>
             </div>
         </section>
         <section class="widget widget--full">
@@ -293,7 +300,7 @@
         </section>
         <section class="widget widget--full">
             <h2 class="widget__title">Closed DAY trades</h2>
-            <div class="widget__table-wrap">
+            <div class="widget__table-wrap widget__table-wrap--scroll">
                 <table class="positions-table">
                     <thead><tr><th>Time</th><th>Symbol</th><th>Sleeve</th><th>Side</th><th>Size</th><th>Price</th><th>PnL</th><th>Detail</th></tr></thead>
                     <tbody id="trades-tbody"></tbody>
@@ -330,9 +337,9 @@
                 <div class="readiness-card"><span class="readiness-label">Data starvation</span><span class="readiness-value" id="lh-starvation">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Warnings</span><span class="readiness-value" id="lh-warnings">--</span></div>
             </div>
-            <div class="widget__table-wrap">
+            <div class="widget__table-wrap widget__table-wrap--scroll">
                 <table class="positions-table">
-                    <thead><tr><th>Symbol</th><th>Closed</th><th>Snapshots</th><th>Labeled</th><th>Heartbeats</th><th>Model date</th><th>Promotion</th><th>Last event</th></tr></thead>
+                    <thead><tr><th>Symbol</th><th>Closed</th><th>Snaps</th><th>Labeled</th><th>HB</th><th>Model date</th><th>Promo</th><th>Last event</th></tr></thead>
                     <tbody id="lh-symbol-rows"><tr><td colspan="8">--</td></tr></tbody>
                 </table>
             </div>
@@ -340,7 +347,7 @@
         </section>
         <section class="widget widget--full">
             <h2 class="widget__title">DAY learning status</h2>
-            <pre id="panel-learning-status-content" class="panel-pre">--</pre>
+            <pre id="panel-learning-status-content" class="panel-pre panel-pre--tall">--</pre>
         </section>
         <section class="widget widget--full">
             <h2 class="widget__title">SCALP learning</h2>
@@ -396,7 +403,7 @@
             <div class="mini-card"><span class="mini-card__label">Unrealized PnL</span><span class="mini-card__value" id="analytics-unrealized">--</span></div>
             <div class="mini-card"><span class="mini-card__label">Total PnL (vs principal)</span><span class="mini-card__value" id="analytics-pnl">--</span></div>
             <div class="mini-card"><span class="mini-card__label">Infra health</span><span class="mini-card__value" id="analytics-risk-status">--</span></div>
-            <div class="mini-card"><span class="mini-card__label">DAY scoreboard (today)</span><span class="mini-card__value" id="analytics-scoreboard">--</span></div>
+            <div class="mini-card mini-card--span2"><span class="mini-card__label">DAY scoreboard (today)</span><span class="mini-card__value" id="analytics-scoreboard">--</span></div>
             <div class="mini-card"><span class="mini-card__label">Invariants</span><span class="mini-card__value" id="analytics-invariants">--</span></div>
             <div class="mini-card"><span class="mini-card__label">Cross-check</span><span class="mini-card__value" id="analytics-xcheck">--</span></div>
         </section>
@@ -418,7 +425,7 @@
         <section class="widget widget--full">
             <h2 class="widget__title">MarketLens Bridge (read-only)</h2>
             <p class="widget__subtitle">Public-safe Mystic feed — no operator controls, no secrets, no private balances.</p>
-            <pre id="ml-feed-pre" class="panel-pre">Loading public feed…</pre>
+            <pre id="ml-feed-pre" class="panel-pre panel-pre--tall">Loading public feed…</pre>
         </section>
     </div>
 
@@ -446,7 +453,7 @@
             <div class="readiness-grid" id="live-readiness-grid">
                 <div class="readiness-card"><span class="readiness-label">Mode</span><span class="readiness-value" id="lr-mode">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Live orders</span><span class="readiness-value" id="lr-live-orders">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Block reason</span><span class="readiness-value" id="lr-block-reason">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Block reason</span><span class="readiness-value" id="lr-block-reason">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Tiny live ready</span><span class="readiness-value" id="lr-tiny-ready">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Full live ready</span><span class="readiness-value" id="lr-full-ready">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">USDT free</span><span class="readiness-value" id="lr-usdt">--</span></div>
@@ -455,7 +462,7 @@
                 <div class="readiness-card"><span class="readiness-label">Open orders</span><span class="readiness-value" id="lr-open-orders">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Time drift ms</span><span class="readiness-value" id="lr-drift">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Protected exec</span><span class="readiness-value" id="lr-protected">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Sleeve block</span><span class="readiness-value" id="lr-sleeve">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Sleeve block</span><span class="readiness-value" id="lr-sleeve">--</span></div>
             </div>
             <details class="observability-panel"><summary>Tiny live checklist</summary><pre id="panel-live-readiness-content" class="panel-pre">--</pre></details>
         </section>
@@ -475,7 +482,7 @@
         </section>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-    <script src="app.js?v=34"></script>
+    <script src="vendor/chart.umd.min.js?v=4.4.1"></script>
+    <script src="app.js?v=40"></script>
 </body>
 </html>

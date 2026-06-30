@@ -1,8 +1,11 @@
 // Mystic Operator Console — dual-engine DAY + SCALP dashboard
-const DASHBOARD_VERSION = 34;
+const DASHBOARD_VERSION = 40;
 const REFRESH_MS = 15000;
+const SCALP_STATUS_TIMEOUT_MS = 30000;
+const CANONICAL_TIMEOUT_MS = 45000;
+const SLOW_ENDPOINT_TIMEOUT_MS = 90000;
 const ENDPOINTS = [
-    { path: "/api/portfolio-engine/dashboard-canonical", key: "dashboardCanonical" },
+    { path: "/api/portfolio-engine/dashboard-canonical", key: "dashboardCanonical", timeoutMs: CANONICAL_TIMEOUT_MS },
     { path: "/api/system/health/quick", key: "systemHealth" },
     { path: "/api/system/process-health", key: "processHealth" },
     { path: "/api/portfolio-engine/latency", key: "latency" },
@@ -20,12 +23,12 @@ const ENDPOINTS = [
     { path: "/api/portfolio-engine/learning-status?limit=20", key: "learningStatus" },
     { path: "/api/portfolio-engine/live-readiness", key: "liveReadiness" },
     { path: "/api/portfolio-engine/model-panel", key: "modelPanel" },
-    { path: "/api/ai-diagnostics/full", key: "aiDiagnosticsFull" },
+    { path: "/api/ai-diagnostics/full", key: "aiDiagnosticsFull", timeoutMs: SLOW_ENDPOINT_TIMEOUT_MS },
     { path: "/api/ai-diagnostics/missed-opportunities?limit=30", key: "missedOpportunities" },
     { path: "/api/portfolio-engine/day-health", key: "dayHealth" },
     { path: "/api/ai-diagnostics/learning-health", key: "learningHealth" },
     { path: "/api/portfolio-engine/trading-economics", key: "tradingEconomics" },
-    { path: "/api/scalp/status", key: "scalpStatus" },
+    { path: "/api/scalp/status", key: "scalpStatus", timeoutMs: SCALP_STATUS_TIMEOUT_MS },
     { path: "/api/scalp/strategies", key: "scalpStrategies" },
     { path: "/api/scalp/positions", key: "scalpPositions" },
     { path: "/api/scalp/trades?limit=100", key: "scalpTrades" },
@@ -37,6 +40,54 @@ const ENDPOINTS = [
 window._lastProcessHealth = null;
 window._lastScalpPositions = null;
 window._lastScalpTrades = null;
+
+function setCardText(id, text, opts) {
+    opts = opts || {};
+    const el = typeof id === "string" ? document.getElementById(id) : id;
+    if (!el) return;
+    const s = text != null && text !== "" ? String(text) : "--";
+    el.textContent = s;
+    if (opts.title != null) {
+        el.title = String(opts.title);
+    } else if (s !== "--" && s.length > 14) {
+        el.title = s;
+    } else if (!opts.keepTitle) {
+        el.title = "";
+    }
+    if (s !== "--" && s.length > 14) {
+        el.classList.add("has-long-text");
+        el.classList.toggle("has-very-long-text", s.length > 32);
+    } else {
+        el.classList.remove("has-long-text", "has-very-long-text");
+    }
+    if (opts.warn != null) {
+        el.classList.toggle("readiness-warn", !!opts.warn);
+    }
+}
+
+function formatPnlWithSells(pnl, sells) {
+    if (pnl == null || Number.isNaN(Number(pnl))) return null;
+    const amt = "$" + Number(pnl).toFixed(2);
+    const n = sells != null ? Number(sells) : 0;
+    return amt + "\n(" + n + " sell" + (n === 1 ? "" : "s") + ")";
+}
+
+function formatScalpDecision(decision, blocker) {
+    if (!decision && !blocker) return "--";
+    if (blocker) return String(decision || "BLOCKED") + "\n" + String(blocker);
+    return String(decision);
+}
+
+function setPnlCard(id, pnl, sells) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const formatted = formatPnlWithSells(pnl, sells);
+    setCardText(el, formatted != null ? formatted : "--");
+    el.classList.remove("pnl-pos", "pnl-neg");
+    if (pnl != null && !Number.isNaN(Number(pnl))) {
+        el.classList.add(Number(pnl) >= 0 ? "pnl-pos" : "pnl-neg");
+    }
+}
 
 let chartPortfolio = null;
 let chartDailyReturns = null;
@@ -471,18 +522,33 @@ function initCharts() {
     }
 }
 
-async function fetchEndpoint(path) {
+async function fetchEndpoint(path, timeoutOverride) {
     try {
         const controller = new AbortController();
-        const t = setTimeout(() => controller.abort(), 15000);
+        const isScalpStatus = path.indexOf("/api/scalp/status") === 0;
+        const isCanonical = path.indexOf("/api/portfolio-engine/dashboard-canonical") === 0;
+        const isSlow = path.indexOf("/api/ai-diagnostics/full") === 0
+            || path.indexOf("/api/portfolio-engine/market-data-readiness") === 0;
+        const timeoutMs = timeoutOverride
+            || (isScalpStatus ? SCALP_STATUS_TIMEOUT_MS
+                : isCanonical ? CANONICAL_TIMEOUT_MS
+                : isSlow ? SLOW_ENDPOINT_TIMEOUT_MS
+                : 15000);
+        const t = setTimeout(() => controller.abort(), timeoutMs);
         const res = await fetch(path, { method: "GET", signal: controller.signal, cache: "no-cache" });
         clearTimeout(t);
         if (res.status === 204) {
             return { ok: true, data: {} };
         }
         const data = await res.json();
+        if (!res.ok && isScalpStatus && window._lastScalpStatus) {
+            return { ok: true, data: window._lastScalpStatus, stale: true };
+        }
         return { ok: res.ok, data };
     } catch (e) {
+        if (path.indexOf("/api/scalp/status") === 0 && window._lastScalpStatus) {
+            return { ok: true, data: window._lastScalpStatus, stale: true };
+        }
         return { ok: false, data: null };
     }
 }
@@ -497,7 +563,7 @@ function startPolling() {
 let lastUpdateTime = null;
 
 async function pollOne(ep) {
-    const result = await fetchEndpoint(ep.path);
+    const result = await fetchEndpoint(ep.path, ep.timeoutMs);
     if (!result.ok) {
         if (ep.key === "dashboardCanonical") {
             updateDashboardCanonical({ success: false });
@@ -629,31 +695,23 @@ function updateUI(key, data) {
 /** Scalp engine panel — never mixed into DAY scoreboard or DAY PnL. */
 function updateScalpEngineStatus(res) {
     const d = res && typeof res === "object" ? res : {};
-    const set = (id, text) => {
-        const el = document.getElementById(id);
-        if (el) el.textContent = text != null && text !== "" ? String(text) : "--";
-    };
+    const set = setCardText;
     const active = d.runner_active === true;
     set("eng-scalp-status", active ? "RUNNING" : "STOPPED");
     set("scalp-runner", active ? "RUNNING" : "STOPPED");
     const pnl = d.pnl_summary || {};
     const today = pnl.today || {};
     const todayPnl = today.realized_pnl_usd != null ? Number(today.realized_pnl_usd) : null;
-    const todayEl = document.getElementById("eng-scalp-pnl");
-    if (todayEl) {
-        todayEl.textContent = todayPnl != null ? "$" + todayPnl.toFixed(2) + " (" + (today.sells || 0) + " sells)" : "--";
-        todayEl.classList.remove("pnl-pos", "pnl-neg");
-        if (todayPnl != null) todayEl.classList.add(todayPnl >= 0 ? "pnl-pos" : "pnl-neg");
-    }
+    setPnlCard("eng-scalp-pnl", todayPnl, today.sells);
     const scalpPnlEl = document.getElementById("scalp-today-pnl");
     if (scalpPnlEl) {
         scalpPnlEl.textContent = todayPnl != null ? "$" + todayPnl.toFixed(2) : "--";
-        scalpPnlEl.classList.remove("pnl-pos", "pnl-neg");
+        scalpPnlEl.classList.remove("pnl-pos", "pnl-neg", "has-long-text", "has-very-long-text");
         if (todayPnl != null) scalpPnlEl.classList.add(todayPnl >= 0 ? "pnl-pos" : "pnl-neg");
     }
     set("scalp-today-sells", today.sells != null ? String(today.sells) : "--");
     if (active) {
-        const diag = (d.overall_decision || "--") + (d.top_blocker ? ": " + d.top_blocker : "");
+        const diag = formatScalpDecision(d.overall_decision, d.top_blocker);
         set("eng-scalp-blocker", diag);
         set("scalp-overall", d.overall_decision || "--");
         set("scalp-top-blocker", d.top_blocker || "--");
@@ -665,9 +723,39 @@ function updateScalpEngineStatus(res) {
         set("cc-scalp-decision", d.note || "runner stopped");
     }
     set("scalp-entry-armed", d.entry_armed === true ? "ARMED" : d.entry_armed === false ? "DISARMED" : "--");
-    set("scalp-open-count", d.open_scalp_positions != null ? String(d.open_scalp_positions) : "--");
-    set("cc-scalp-positions", d.open_scalp_positions != null ? String(d.open_scalp_positions) : "--");
+    set("scalp-open-count", d.open_scalp_positions != null ? String(d.open_scalp_positions)
+        : (pnl.open_positions != null ? String(pnl.open_positions) : "--"));
+    set("cc-scalp-positions", d.open_scalp_positions != null ? String(d.open_scalp_positions)
+        : (pnl.open_positions != null ? String(pnl.open_positions) : "--"));
     set("scalp-calibration", d.calibration_profile || (d.calibration_mode ? "calibration" : "strict"));
+
+    // All-time summary
+    const allTime = pnl.all_time || {};
+    const allTimePnl = allTime.realized_pnl_usd != null ? Number(allTime.realized_pnl_usd) : null;
+    const allTimePnlEl = document.getElementById("scalp-alltime-pnl");
+    if (allTimePnlEl) {
+        allTimePnlEl.textContent = allTimePnl != null ? "$" + allTimePnl.toFixed(2) : "--";
+        allTimePnlEl.classList.remove("pnl-pos", "pnl-neg");
+        if (allTimePnl != null) allTimePnlEl.classList.add(allTimePnl >= 0 ? "pnl-pos" : "pnl-neg");
+    }
+    set("scalp-alltime-sells", allTime.sells != null ? String(allTime.sells) : "--");
+
+    // Mode flags
+    const modeParts = [];
+    if (d.scalp_live === true) modeParts.push("LIVE");
+    else if (d.scalp_paper_enabled === true) modeParts.push("paper");
+    else modeParts.push("--");
+    set("scalp-mode", modeParts.join(", "));
+
+    // Fee model and warm rounds
+    set("scalp-fee-ok", d.fee_model_verified === true ? "yes" : d.fee_model_verified === false ? "no" : "--");
+    const warmUsed = d.warm_rounds_used != null ? d.warm_rounds_used : null;
+    const warmRec = d.warm_rounds_recommended != null ? d.warm_rounds_recommended : null;
+    set("scalp-warm-rounds", warmUsed != null || warmRec != null
+        ? (warmUsed != null ? warmUsed : "?") + " / " + (warmRec != null ? warmRec : "?")
+        : "--");
+    set("scalp-warm-note", d.warm_rounds_note || "--");
+
     window._lastScalpStatus = d;
     updateScalpSymbolDiagnostics(d);
     updateScalpRouter(d);
@@ -695,7 +783,10 @@ function updateScalpSymbolDiagnostics(d) {
         const mr = micro[sym] || {};
         const dist = row.distance_to_pass || {};
         const distPct = dist.distance_to_pass_pct != null ? Number(dist.distance_to_pass_pct).toFixed(3) + "%" : "--";
-        return "<tr><td>" + sym + "</td><td>" + (row.decision || "--") + "</td><td>" + (row.reject_reason || "--") +
+        const rejectRaw = String(row.reject_reason || "--");
+        const rejectShort = rejectRaw.length > 28 ? rejectRaw.slice(0, 26) + "…" : rejectRaw;
+        return "<tr><td>" + sym + "</td><td>" + (row.decision || "--") +
+            "</td><td class=\"td-wrap\" title=\"" + rejectRaw.replace(/"/g, "&quot;") + "\">" + rejectShort +
             "</td><td>" + (mr.micro_regime || mr.regime || "--") + "</td><td>" + distPct + "</td><td>" +
             (row.spread_pct != null ? (Number(row.spread_pct) * 100).toFixed(3) + "%" : "--") + "</td><td>" +
             (row.momentum_confirmed ? "yes" : "no") + "</td></tr>";
@@ -727,7 +818,9 @@ function updateScalpPositions(res) {
     const positions = (res && res.positions) || [];
     const ledger = res && res.ledger;
     const renderRow = function (pos) {
-        return "<tr><td>" + (pos.symbol || "") + "</td><td>" + (pos.setup || "--") + "</td><td>" +
+        const setupRaw = String(pos.setup || "--");
+        const setupShort = setupRaw.length > 22 ? setupRaw.slice(0, 20) + "…" : setupRaw;
+        return "<tr><td>" + (pos.symbol || "") + "</td><td class=\"td-wrap\" title=\"" + setupRaw.replace(/"/g, "&quot;") + "\">" + setupShort + "</td><td>" +
             (pos.entry_price != null ? Number(pos.entry_price).toFixed(4) : "--") + "</td><td>" +
             (pos.quantity != null ? Number(pos.quantity).toFixed(6) : "--") + "</td><td>" +
             (pos.hold_seconds != null ? Number(pos.hold_seconds).toFixed(0) : "--") + "</td><td>" +
@@ -783,9 +876,13 @@ function updateScalpTradesTable(res, timeFilter) {
     const html = filtered.length ? filtered.map(function (t) {
         const pnl = t.pnl_usd != null ? Number(t.pnl_usd) : null;
         const pnlCls = pnl != null ? (pnl >= 0 ? "pnl-pos" : "pnl-neg") : "";
-        return "<tr><td>" + (t.created_at || "") + "</td><td>" + (t.symbol || "") + "</td><td>" + (t.side || "") +
+        const ts = t.created_at || "";
+        const timeStr = typeof ts === "string" ? ts.slice(11, 19) : ts;
+        const exitRaw = String(t.exit_reason || "");
+        const exitShort = exitRaw.length > 20 ? exitRaw.slice(0, 18) + "…" : exitRaw;
+        return "<tr><td class=\"td-compact\">" + timeStr + "</td><td>" + (t.symbol || "") + "</td><td>" + (t.side || "") +
             "</td><td>" + (t.price != null ? Number(t.price).toFixed(4) : "") + "</td><td class=\"" + pnlCls + "\">" +
-            (pnl != null ? pnl.toFixed(2) : "--") + "</td><td>" + (t.exit_reason || "") + "</td></tr>";
+            (pnl != null ? pnl.toFixed(2) : "--") + "</td><td class=\"td-wrap\" title=\"" + exitRaw.replace(/"/g, "&quot;") + "\">" + exitShort + "</td></tr>";
     }).join("") : "<tr><td colspan=\"6\">No SCALP trades</td></tr>";
     ["scalp-trades-tbody", "pt-scalp-closed-tbody"].forEach(function (id) {
         const tbody = document.getElementById(id);
@@ -809,10 +906,7 @@ function updateScalpScoreboard(res) {
 
 function updateScalpLearning(res) {
     const d = res || {};
-    const set = (id, text) => {
-        const el = document.getElementById(id);
-        if (el) el.textContent = text != null ? String(text) : "--";
-    };
+    const set = setCardText;
     set("sl-closed-sells", d.closed_sells);
     set("sl-first-close", d.first_close_ready ? "YES" : "waiting for first close");
     const fmt = function (arr) {
@@ -868,10 +962,7 @@ function updateMarketLensFeed(res) {
 }
 
 function refreshCommandCenter() {
-    const set = (id, text) => {
-        const el = document.getElementById(id);
-        if (el) el.textContent = text != null && text !== "" ? String(text) : "--";
-    };
+    const set = setCardText;
     const dh = window._lastDayHealth || {};
     set("cc-day-decision", dh.capital_idle_reason || "--");
     set("cc-day-positions", dh.open_positions_count != null ? String(dh.open_positions_count) : "--");
@@ -894,10 +985,7 @@ function refreshCommandCenter() {
 
 /** DAY + account slice of engines panel (called from canonical + scoreboard). */
 function refreshEnginesPanelFromCache() {
-    const set = (id, text) => {
-        const el = document.getElementById(id);
-        if (el) el.textContent = text != null && text !== "" ? String(text) : "--";
-    };
+    const set = setCardText;
     const ph = window._lastProcessHealth || {};
     const procs = ph.processes || {};
     const dayUp = procs.portfolio_engine === true;
@@ -918,12 +1006,7 @@ function refreshEnginesPanelFromCache() {
     }
     const sb = window._lastScoreboardToday || {};
     const dayPnl = sb.realized_pnl != null ? Number(sb.realized_pnl) : null;
-    const dayEl = document.getElementById("eng-day-pnl");
-    if (dayEl) {
-        dayEl.textContent = dayPnl != null ? "$" + dayPnl.toFixed(2) + " (" + (sb.trades || 0) + " sells)" : "--";
-        dayEl.classList.remove("pnl-pos", "pnl-neg");
-        if (dayPnl != null) dayEl.classList.add(dayPnl >= 0 ? "pnl-pos" : "pnl-neg");
-    }
+    setPnlCard("eng-day-pnl", dayPnl, sb.trades);
     set("eng-day-scoreboard", sb.pass_fail || sb.status || "--");
     refreshCommandCenter();
 }
@@ -933,19 +1016,16 @@ function updateTradingEconomics(res) {
     const d = wrap.data || wrap;
     if (!d || typeof d !== "object") return;
 
-    const set = (id, text) => {
-        const el = document.getElementById(id);
-        if (el) el.textContent = text != null && text !== "" ? String(text) : "--";
-    };
+    const set = setCardText;
     const pct = (v) => (v != null && !Number.isNaN(Number(v)) ? (Number(v) * 100).toFixed(4) + "%" : "--");
     const bps = (v) => (v != null && !Number.isNaN(Number(v)) ? Number(v).toFixed(2) + " bps" : "--");
 
     set("te-exchange", d.exchange || "Binance.US");
-    set("te-maker", pct(d.maker_fee_pct) + " (" + bps(d.maker_fee_bps) + ")");
-    set("te-taker", pct(d.taker_fee_pct) + " (" + bps(d.taker_fee_bps) + ")");
+    set("te-maker", pct(d.maker_fee_pct) + "\n(" + bps(d.maker_fee_bps) + ")");
+    set("te-taker", pct(d.taker_fee_pct) + "\n(" + bps(d.taker_fee_bps) + ")");
     set("te-slippage", pct(d.slippage_buffer_pct));
     set("te-half-spread", pct(d.orderbook_half_spread_estimate_pct));
-    set("te-roundtrip", pct(d.roundtrip_estimated_cost_pct) + " (" + bps(d.roundtrip_estimated_cost_bps) + ")");
+    set("te-roundtrip", pct(d.roundtrip_estimated_cost_pct) + "\n(" + bps(d.roundtrip_estimated_cost_bps) + ")");
     set("te-fee-date", d.fee_schedule_source_date || "--");
     set("te-notional-mult", d.day_notional_mult != null ? String(d.day_notional_mult) + "×" : "--");
     set("te-per-slot", d.day_target_notional_per_slot_usd != null ? "$" + Number(d.day_target_notional_per_slot_usd).toFixed(0) : "--");
@@ -954,7 +1034,7 @@ function updateTradingEconomics(res) {
 
     const ver = d.binance_us_verification || {};
     const conclusion = ver.conclusion || d.fee_schedule_note || "--";
-    set("te-tier-note", conclusion.length > 80 ? conclusion.slice(0, 77) + "…" : conclusion);
+    set("te-tier-note", "BTC, ETH, SOL, XRP · Adv. Spot (0.02% taker)", { title: conclusion });
 
     const pre = document.getElementById("panel-trading-economics-content");
     if (pre) {
@@ -971,12 +1051,7 @@ function updateLearningHealth(res) {
     const d = wrap.data || wrap;
     if (!d || typeof d !== "object") return;
 
-    const set = (id, text) => {
-        const el = document.getElementById(id);
-        if (el) el.textContent = text != null && text !== "" ? String(text) : "--";
-    };
-
-    const t = d.totals || {};
+    const set = setCardText;
     set("lh-closed", t.closed_outcome_rows);
     set("lh-snapshots", t.candidate_snapshots);
     set("lh-labeled", t.candidate_snapshots_labeled);
@@ -1024,11 +1099,7 @@ function updateDayHealth(res) {
     if (!d || typeof d !== "object") return;
     window._lastDayHealth = d;
 
-    const set = (id, text) => {
-        const el = document.getElementById(id);
-        if (el) el.textContent = text != null && text !== "" ? String(text) : "--";
-    };
-
+    const set = setCardText;
     set("dh-slots", d.slots_available != null ? `${d.open_positions_count || 0}/${d.max_open_positions || 4}` : "--");
     set("dh-idle-cash", d.cash_balance != null ? "$" + Number(d.cash_balance).toFixed(2) : "--");
     set("dh-idle-reason", d.capital_idle_reason || "--");
@@ -1106,10 +1177,12 @@ function updateDayBasketSignals(signals) {
     tbody.innerHTML = rows.map(function (s) {
         const conf = s.confidence != null ? (Number(s.confidence) * 100).toFixed(1) + "%" : "--";
         const action = s.action || s.signal || s.recommendation || "--";
-        const thesis = s.thesis || s.reason || s.setup || "--";
+        const thesis = String(s.thesis || s.reason || s.setup || "--");
         const fresh = s.stale === true ? "stale" : s.fresh === false ? "stale" : "ok";
         return "<tr><td>" + (s.symbol || s.pair || "--") + "</td><td>" + action + "</td><td>" + conf +
-            "</td><td>" + String(thesis).slice(0, 80) + "</td><td>" + fresh + "</td></tr>";
+            "</td><td class=\"td-wrap\" title=\"" + thesis.replace(/"/g, "&quot;") + "\">" +
+            (thesis.length > 60 ? thesis.slice(0, 58) + "…" : thesis) +
+            "</td><td>" + fresh + "</td></tr>";
     }).join("");
 }
 
@@ -1392,10 +1465,11 @@ function updateScoreboardToday(data) {
         ". FAIL reflects expectancy/PnL rules after AI closes — stack can still be HEALTHY.";
 
     if (status && String(status).toUpperCase() === "FAIL" && failReasons) {
-        el.textContent = `FAIL: ${failReasons}`;
+        setCardText(el, "FAIL:\n" + failReasons, { title: el.title, keepTitle: true });
     } else {
-        el.textContent = (closedAi != null ? closedAi + " closed" : status ? String(status) : "--") +
+        const display = (closedAi != null ? closedAi + " closed" : status ? String(status) : "--") +
             (openBuys ? " / " + openBuys + " open buy" : "");
+        setCardText(el, display, { title: el.title, keepTitle: true });
     }
 
     el.classList.remove("pnl-pos", "pnl-neg");
@@ -1444,10 +1518,7 @@ function updateLiveReadiness(res) {
     }
     function yn(v) { return v ? "yes" : "no"; }
     function set(id, text, warn) {
-        const el = document.getElementById(id);
-        if (!el) return;
-        el.textContent = text != null ? String(text) : "--";
-        el.classList.toggle("readiness-warn", !!warn);
+        setCardText(id, text, { warn: !!warn });
     }
     set("lr-mode", d.current_local_mode || d.execution_mode);
     set("lr-live-orders", d.live_orders_permitted ? "permitted" : "blocked");
@@ -1616,7 +1687,7 @@ function updateInvariantsDetail(data) {
     lines.push(
         "invariant_events_total (cumulative): " + (d.invariant_events_total != null ? d.invariant_events_total : "--"),
     );
-    lines.push("(legacy total_violations = same as invariant_events_total; not # of failing checks now)");
+    lines.push("(invariant_events_total = cumulative event counter, not # currently failing)");
 
     const eq = d.equity_invariant || {};
     if (Object.keys(eq).length) {
@@ -2169,7 +2240,7 @@ function normalizeTs(ts) {
     return isNaN(d.getTime()) ? 0 : d.getTime();
 }
 
-// paper-trading/trades or portfolio-engine/performance: { trades: [...] } — DAY ledger only
+// portfolio-engine/performance: { trades: [...] } — DAY ledger only
 function updateTrades(data) {
     if (!data || typeof data !== "object") return;
     const trades = Array.isArray(data.trades) ? data.trades : [];

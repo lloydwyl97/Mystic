@@ -63,7 +63,7 @@ except Exception as e:
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -1099,6 +1099,13 @@ def create_app() -> FastAPI:
     @app.get("/", include_in_schema=False)
     async def root_redirect():
         return RedirectResponse(url="/dashboard/", status_code=302)
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        logo = Path(__file__).parent / "static" / "dashboard" / "assets" / "mystic-logo.svg"
+        if logo.exists():
+            return FileResponse(logo, media_type="image/svg+xml")
+        return RedirectResponse(url="/dashboard/assets/mystic-logo.svg", status_code=302)
 
     # ========================================================================
     # PHASE 1 FIX #1: PAUSE/RESUME TRADING ENDPOINTS

@@ -375,12 +375,16 @@ body {
 
 .status-value { 
     font-family: var(--font-mono); 
-    font-size: 1.15rem;
+    font-size: clamp(0.82rem, 1.8vw, 1.05rem);
     font-weight: 800;
     color: var(--text-primary);
     letter-spacing: -0.02em;
     font-variant-numeric: tabular-nums;
     text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 16ch;
 }
 
 .main { padding: 20px; max-width: 100%; }
@@ -424,13 +428,15 @@ body {
     max-width: 52rem;
 }
 
-.widget__chart-wrap { position: relative; height: 220px; min-height: 220px; }
+.widget__chart-wrap { position: relative; height: 220px; min-height: 220px; overflow: hidden; }
 
 .widget__table-wrap {
     position: relative;
     min-height: 80px;
     max-height: 320px;
     overflow-y: auto;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
 }
 
 @keyframes skeleton-loading {
@@ -475,10 +481,11 @@ body {
 .widget-row { display: flex; flex-wrap: wrap; gap: var(--padding); margin-bottom: var(--padding); }
 
 .positions-table { 
-    width: 100%; 
+    width: 100%;
+    min-width: max-content;
     border-collapse: separate;
     border-spacing: 0;
-    font-size: 0.85rem; 
+    font-size: 0.82rem; 
 }
 
 .positions-table thead {
@@ -489,24 +496,44 @@ body {
 }
 
 .positions-table th, .positions-table td { 
-    padding: 12px 16px; 
+    padding: 8px 12px; 
     text-align: left; 
-    border-bottom: 1px solid rgba(43, 49, 57, 0.4); 
+    border-bottom: 1px solid rgba(43, 49, 57, 0.4);
+    white-space: nowrap;
+    vertical-align: top;
 }
 
 .positions-table th { 
     color: rgba(139, 148, 158, 0.9); 
     font-weight: 600; 
-    font-size: 0.7rem;
-    letter-spacing: 0.08em;
+    font-size: 0.68rem;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
     border-bottom: 2px solid rgba(43, 49, 57, 0.8);
+    white-space: nowrap;
 }
 
 .positions-table td { 
     font-family: var(--font-mono); 
     color: var(--text-primary); 
     font-variant-numeric: tabular-nums;
+    font-size: 0.78rem;
+}
+
+/* Allow long-text table cells to wrap */
+.positions-table td.td-wrap {
+    white-space: normal;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    min-width: 120px;
+    max-width: 280px;
+}
+
+/* Compact cell for timestamps/short values */
+.positions-table td.td-compact {
+    padding: 8px 8px;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
 }
 
 .positions-table tbody tr {
@@ -526,7 +553,7 @@ body {
 
 .analytics-row { 
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(155px, 1fr));
     gap: var(--padding); 
     margin-bottom: var(--padding); 
 }
@@ -541,10 +568,15 @@ body {
     border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: var(--padding);
-    min-width: 120px;
+    min-width: 0;
     position: relative;
     transition: all var(--transition-base);
     cursor: default;
+    overflow: hidden;
+}
+
+.mini-card--span2 {
+    grid-column: span 2;
 }
 
 .mini-card::after {
@@ -572,24 +604,36 @@ body {
 
 .mini-card__label { 
     display: block; 
-    font-size: 0.75rem; 
+    font-size: 0.68rem; 
     color: var(--text-secondary); 
     margin-bottom: 6px;
     letter-spacing: 0.02em;
+    line-height: 1.25;
+    word-break: break-word;
 }
 
 .mini-card__value { 
     font-family: var(--font-mono); 
-    font-size: 1rem; 
+    font-size: clamp(0.72rem, 1.6vw, 0.88rem);
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
-    letter-spacing: -0.02em;
+    letter-spacing: -0.01em;
     text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
-    white-space: normal;
+    white-space: pre-line;
     word-break: break-word;
     overflow-wrap: anywhere;
-    line-height: 1.3;
+    line-height: 1.35;
     max-width: 100%;
+    min-width: 0;
+}
+
+.mini-card__value.has-long-text {
+    font-size: clamp(0.64rem, 1.4vw, 0.76rem);
+}
+
+.mini-card__value.has-very-long-text {
+    font-size: clamp(0.58rem, 1.2vw, 0.68rem);
+    line-height: 1.4;
 }
 
 .mini-card__value.pnl-pos { color: var(--green); }
@@ -626,14 +670,28 @@ body {
 .panel-pre {
     padding: 12px 16px;
     margin: 0;
-    font-size: 0.8rem;
+    font-size: 0.78rem;
     font-family: var(--font-mono);
     color: var(--text-secondary);
     white-space: pre-wrap;
     word-break: break-word;
-    max-height: 200px;
+    overflow-wrap: anywhere;
+    max-height: 280px;
     overflow-y: auto;
+    overflow-x: auto;
     background: rgba(0, 0, 0, 0.2);
+    -webkit-overflow-scrolling: touch;
+}
+
+/* Larger pre for main content panels (model panel, marketlens, learning status) */
+.panel-pre--tall {
+    max-height: 500px;
+}
+
+/* Inline JSON inside collapsible details — keep compact */
+.observability-panel .panel-pre {
+    max-height: 240px;
+    font-size: 0.74rem;
 }
 
 .snapshot-grid {
@@ -655,11 +713,14 @@ body {
 }
 .snapshot-pre {
     font-family: var(--font-mono);
-    font-size: 0.78rem;
+    font-size: 0.76rem;
     color: var(--text-primary);
     white-space: pre-wrap;
     word-break: break-word;
+    overflow-wrap: anywhere;
     margin: 0;
+    max-height: 260px;
+    overflow-y: auto;
 }
 
 /* Responsive: desktop large */
@@ -678,9 +739,12 @@ body {
     .widget--half { min-width: 100%; }
     .analytics-row { 
         gap: 8px;
-        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+        grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
     }
-    .mini-card { min-width: 100px; }
+    .mini-card--span2,
+    .readiness-card--span2 {
+        grid-column: span 1;
+    }
     .snapshot-grid { grid-template-columns: 1fr; }
     .widget__chart-wrap { height: 240px; min-height: 240px; }
     .status-bar {
@@ -715,21 +779,31 @@ body {
     .status-item {
         padding: 10px 12px;
     }
-    .status-value { font-size: 1rem; }
+    .status-value { font-size: 0.88rem; max-width: 12ch; }
     .main { padding: 12px; }
     .widget { padding: 12px; }
     .widget__chart-wrap { height: 180px; min-height: 180px; }
     .mini-card { 
         padding: 10px; 
-        min-width: 90px; 
+        min-width: 0; 
     }
-    .mini-card__value { font-size: 0.9rem; }
+    .mini-card__value { font-size: clamp(0.68rem, 2.5vw, 0.82rem); }
+    .readiness-grid {
+        grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    }
     .panel-pre { 
-        font-size: 0.75rem; 
-        max-height: 160px; 
+        font-size: 0.72rem; 
+        max-height: 180px; 
     }
     .analytics-row {
-        grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+        grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    }
+    .positions-table th, .positions-table td {
+        padding: 6px 8px;
+        font-size: 0.72rem;
+    }
+    .tab-panel {
+        padding: 12px 14px 36px;
     }
 }
 
@@ -891,6 +965,7 @@ html {
 .widget__table-wrap--scroll {
     max-height: 360px;
     overflow: auto;
+    -webkit-overflow-scrolling: touch;
 }
 
 .positions-table .mono {
@@ -978,7 +1053,7 @@ html {
 
 .readiness-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
     gap: 10px;
     margin-bottom: 12px;
 }
@@ -988,21 +1063,44 @@ html {
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius);
     padding: 10px;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.readiness-card--span2 {
+    grid-column: span 2;
 }
 
 .readiness-label {
     display: block;
-    font-size: 0.72rem;
+    font-size: 0.66rem;
     color: var(--text-secondary);
     text-transform: uppercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.03em;
+    line-height: 1.25;
+    word-break: break-word;
 }
 
 .readiness-value {
     display: block;
     font-family: var(--font-mono);
-    font-size: 0.9rem;
+    font-size: clamp(0.68rem, 1.8vw, 0.8rem);
     margin-top: 4px;
+    line-height: 1.35;
+    white-space: pre-line;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.readiness-value.has-long-text {
+    font-size: clamp(0.62rem, 1.5vw, 0.72rem);
+}
+
+.readiness-value.has-very-long-text {
+    font-size: clamp(0.56rem, 1.3vw, 0.66rem);
+    line-height: 1.45;
 }
 
 .readiness-value.readiness-warn,
@@ -1147,3 +1245,62 @@ html {
 
 .readiness-value.status-up { color: var(--green); }
 .readiness-value.status-down { color: var(--red); }
+
+/* ===== GLOBAL UTILITY CLASSES ===== */
+
+/* Wrap text safely in any container */
+.u-wrap {
+    white-space: normal;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+}
+
+/* Monospace compact value */
+.u-mono {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+}
+
+/* Scrollable horizontal container */
+.u-scroll-x {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+/* Scrollable container both axes */
+.u-scroll {
+    overflow: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+/* Status badge — compact, no wrapping */
+.u-badge {
+    display: inline-block;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    white-space: nowrap;
+    vertical-align: middle;
+}
+.u-badge--ok { background: var(--green-subtle); color: var(--green); }
+.u-badge--warn { background: var(--gold-subtle); color: var(--gold); }
+.u-badge--err { background: var(--red-subtle); color: var(--red); }
+
+/* Compact text — use in dense tables */
+.u-text-sm { font-size: 0.72rem !important; }
+.u-text-xs { font-size: 0.66rem !important; }
+
+/* Full width but won't break layout */
+.u-full { width: 100%; min-width: 0; max-width: 100%; }
+
+/* Truncate with ellipsis — requires title attribute for full value */
+.u-ellipsis {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+}
