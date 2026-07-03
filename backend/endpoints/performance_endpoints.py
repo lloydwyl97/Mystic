@@ -92,6 +92,34 @@ def _row_ts(row: Any) -> Any:
     return _get_field(row, "timestamp") or _get_field(row, "date")
 
 
+def _load_forward_dashboard_sells(*, limit: int = 500) -> list[dict[str, Any]]:
+    """Closed SELL rows for dashboard/charts: non-synthetic, non-admin, forward epoch when set."""
+    import sqlite3
+
+    from backend.database_schema import DATABASE_PATH
+    from backend.services.allweather_paper_accounting import forward_sell_filter_sql, get_forward_epoch
+
+    epoch = get_forward_epoch(DATABASE_PATH)
+    epoch_start = str((epoch or {}).get("epoch_started_at") or "") or None
+    where_sql, where_params = forward_sell_filter_sql(epoch_start=epoch_start)
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT pnl, hold_time_seconds, exit_type, timestamp, symbol, side
+            FROM paper_trades
+            WHERE {where_sql}
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (*where_params, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 # ---------- Endpoints (200 / 204 / 503 policy) ----------
 
 
@@ -144,7 +172,24 @@ async def get_analytics() -> Any:
         trade_data = get_trade_performance_summary(since_timestamp=None)
         last_updated = trade_data.get("timestamp", "2024-01-01T00:00:00Z")
 
-        # 1) paper_trades (all - paper+live, canonical source from portfolio_engine)
+        # 1) paper_trades forward-epoch strategy closes (canonical dashboard scope)
+        forward_rows = _load_forward_dashboard_sells(limit=5000)
+        computed = _analytics_from_paper_trades(forward_rows)
+        if computed:
+            current_metrics = {
+                "total_trades": computed["total_trades"],
+                "win_rate": computed["win_rate"],
+                "total_pnl": computed["total_pnl"],
+                "avg_win": computed["avg_pnl"],
+                "avg_loss": computed["avg_pnl"],
+                "largest_win": computed["best_trade"],
+                "largest_loss": computed["worst_trade"],
+                "sharpe_ratio": 0.0,
+                "max_drawdown": 0.0,
+                "profit_factor": 0.0,
+            }
+            return _analytics_response(current_metrics, last_updated, "paper_trades_forward_epoch")
+
         paper_service = get_paper_trading_service()
         paper_trades = await _maybe_await(paper_service.get_trade_history, None, None, None, True)
         computed = _analytics_from_paper_trades(paper_trades or [])
@@ -535,49 +580,31 @@ async def trade_pnl_hist() -> Any:
     """
     try:
         values: list[float] = []
-        try:
-            svc = _get_svc()
-            trades = await _maybe_await(svc.get_trade_history, 1000)
-            for t in trades:
-                raw = _get_field(t, "pnl")
-                if raw is None:
-                    continue
-                exit_type = str(_get_field(t, "exit_type") or "").upper()
-                if exit_type in ("ADMIN_POSITION_CLEAR", "STALE_PRE_CORRECTION_POSITION_CLEAR"):
-                    continue
+        for row in _load_forward_dashboard_sells(limit=500):
+            raw = row.get("pnl")
+            if raw is not None:
                 try:
                     values.append(float(raw))
-                except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
-                    continue
-        except HTTPException:
-            pass  # Fall through to paper_trades fallback
+                except (ValueError, TypeError):
+                    pass
 
         if not values:
-            import sqlite3
-
-            from backend.database_schema import DATABASE_PATH
-
-            conn = None
             try:
-                conn = sqlite3.connect(DATABASE_PATH)
-                cur = conn.execute(
-                    "SELECT pnl FROM paper_trades WHERE UPPER(side) = 'SELL' AND pnl IS NOT NULL "
-                    "AND COALESCE(exit_type, '') NOT IN "
-                    "('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR') "
-                    "ORDER BY timestamp DESC LIMIT 500"
-                )
-                for row in cur.fetchall():
-                    if row[0] is not None:
-                        try:
-                            values.append(float(row[0]))
-                        except (ValueError, TypeError):
-                            pass
-            except Exception:
-                logger.warning("Failed to load trade PnL from paper_trades fallback", exc_info=True)
+                svc = _get_svc()
+                trades = await _maybe_await(svc.get_trade_history, 1000)
+                for t in trades:
+                    raw = _get_field(t, "pnl")
+                    if raw is None:
+                        continue
+                    exit_type = str(_get_field(t, "exit_type") or "").upper()
+                    if exit_type in ("ADMIN_POSITION_CLEAR", "STALE_PRE_CORRECTION_POSITION_CLEAR"):
+                        continue
+                    try:
+                        values.append(float(raw))
+                    except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
+                        continue
+            except HTTPException:
                 pass
-            finally:
-                if conn:
-                    conn.close()
 
         if not values:
             return Response(status_code=204)
@@ -599,47 +626,34 @@ async def trade_duration_hist() -> Any:
     """
     try:
         values: list[float] = []
-        try:
-            svc = _get_svc()
-            trades = await _maybe_await(svc.get_trade_history, 1000)
-            for t in trades:
-                raw = _get_field(t, "duration_minutes")
-                if raw is not None:
-                    try:
-                        values.append(float(raw))
-                    except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
-                        pass
-                    continue
-                raw = _get_field(t, "hold_time_seconds")
-                if raw is not None:
-                    try:
-                        values.append(float(raw) / 60.0)
-                    except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
-                        pass
-        except HTTPException:
-            pass  # Fall through to paper_trades fallback
+        for row in _load_forward_dashboard_sells(limit=500):
+            raw = row.get("hold_time_seconds")
+            if raw is not None:
+                try:
+                    values.append(float(raw) / 60.0)
+                except (ValueError, TypeError):
+                    pass
 
         if not values:
-            import sqlite3
-
-            from backend.database_schema import DATABASE_PATH
-
-            conn = None
             try:
-                conn = sqlite3.connect(DATABASE_PATH)
-                cur = conn.execute("SELECT hold_time_seconds FROM paper_trades WHERE UPPER(side) = 'SELL' AND hold_time_seconds IS NOT NULL ORDER BY timestamp DESC LIMIT 500")
-                for row in cur.fetchall():
-                    if row[0] is not None:
+                svc = _get_svc()
+                trades = await _maybe_await(svc.get_trade_history, 1000)
+                for t in trades:
+                    raw = _get_field(t, "duration_minutes")
+                    if raw is not None:
                         try:
-                            values.append(float(row[0]) / 60.0)
-                        except (ValueError, TypeError):
+                            values.append(float(raw))
+                        except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
                             pass
-            except Exception:
-                logger.warning("Failed to load trade duration from paper_trades fallback", exc_info=True)
+                        continue
+                    raw = _get_field(t, "hold_time_seconds")
+                    if raw is not None:
+                        try:
+                            values.append(float(raw) / 60.0)
+                        except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
+                            pass
+            except HTTPException:
                 pass
-            finally:
-                if conn:
-                    conn.close()
 
         if not values:
             return Response(status_code=204)

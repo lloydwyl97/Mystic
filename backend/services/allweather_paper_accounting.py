@@ -15,6 +15,109 @@ FORWARD_PRINCIPAL_USD = 25_000.0
 SYNTHETIC_WHERE = "COALESCE(is_synthetic, 0) = 1 OR COALESCE(paper_run_id, '') LIKE 'PAPER_LIFECYCLE_SMOKE%'"
 NON_SYNTHETIC_WHERE = f"NOT ({SYNTHETIC_WHERE})"
 
+ADMIN_EXIT_SQL = (
+    "COALESCE(exit_type, '') NOT IN ("
+    "'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT'"
+    ")"
+)
+
+
+def forward_sell_filter_sql(*, epoch_start: str | None = None) -> tuple[str, tuple[Any, ...]]:
+    """SQL WHERE clause for dashboard/strategy closed trades (non-synthetic, non-admin)."""
+    parts = [
+        "UPPER(side) = 'SELL'",
+        "pnl IS NOT NULL",
+        ADMIN_EXIT_SQL,
+        NON_SYNTHETIC_WHERE,
+    ]
+    params: list[Any] = []
+    if epoch_start:
+        parts.append("timestamp >= ?")
+        params.append(epoch_start)
+    return " AND ".join(parts), tuple(params)
+
+
+def reconcile_forward_ledger(
+    db_path: str | Path,
+    *,
+    positions_value: float,
+    unrealized_pnl: float,
+    force: bool = False,
+) -> dict[str, Any]:
+    """
+    Heal portfolio_engine_ledger cash/equity from forward-epoch strategy PnL.
+
+    INVARIANT: total_equity = forward_principal + forward_realized + unrealized
+               cash_balance = total_equity - positions_value
+    """
+    epoch = get_forward_epoch(db_path)
+    if not epoch or not epoch.get("epoch_started_at"):
+        return {"skipped": True, "reason": "no_forward_epoch"}
+
+    bd = compute_pnl_breakdown(db_path, epoch=epoch)
+    principal = float(bd.get("forward_principal_usd") or FORWARD_PRINCIPAL_USD)
+    fwd_realized = float(bd.get("realized_pnl_forward_usd") or 0.0)
+    pos_val = float(positions_value or 0.0)
+    unreal = float(unrealized_pnl or 0.0)
+    total_equity = principal + fwd_realized + unreal
+    cash = total_equity - pos_val
+
+    if not force:
+        conn_check = sqlite3.connect(str(db_path))
+        try:
+            row = conn_check.execute(
+                "SELECT cash_balance, total_equity, realized_pnl, positions_value, unrealized_pnl FROM portfolio_engine_ledger WHERE id=1"
+            ).fetchone()
+            if row:
+                if (
+                    abs(float(row[0] or 0) - cash) < 0.05
+                    and abs(float(row[1] or 0) - total_equity) < 0.05
+                    and abs(float(row[2] or 0) - fwd_realized) < 0.05
+                    and abs(float(row[3] or 0) - pos_val) < 0.05
+                    and abs(float(row[4] or 0) - unreal) < 0.05
+                ):
+                    return {
+                        "skipped": True,
+                        "reason": "already_aligned",
+                        "forward_epoch_started_at": bd.get("forward_epoch_started_at"),
+                        "total_equity_usd": round(total_equity, 4),
+                    }
+        finally:
+            conn_check.close()
+
+    ts = _utc_now()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            UPDATE portfolio_engine_ledger SET
+                principal = ?,
+                cash_balance = ?,
+                positions_value = ?,
+                realized_pnl = ?,
+                unrealized_pnl = ?,
+                total_equity = ?,
+                last_updated = ?
+            WHERE id = 1
+            """,
+            (principal, cash, pos_val, fwd_realized, unreal, total_equity, ts),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "success": True,
+        "forward_epoch_started_at": bd.get("forward_epoch_started_at"),
+        "principal_usd": principal,
+        "realized_pnl_forward_usd": fwd_realized,
+        "cash_usd": round(cash, 4),
+        "total_equity_usd": round(total_equity, 4),
+        "positions_value_usd": pos_val,
+        "unrealized_pnl_usd": unreal,
+    }
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -232,9 +335,13 @@ def reset_forward_paper_baseline(
 
 
 __all__ = [
+    "ADMIN_EXIT_SQL",
     "FORWARD_EPOCH_KEY",
     "FORWARD_PRINCIPAL_USD",
+    "NON_SYNTHETIC_WHERE",
     "compute_pnl_breakdown",
+    "forward_sell_filter_sql",
     "get_forward_epoch",
+    "reconcile_forward_ledger",
     "reset_forward_paper_baseline",
 ]

@@ -47,6 +47,7 @@ def _sanitize_exit_type_for_dashboard(raw: str | None) -> str:
 def compute_snapshot(db_path: str | None = None) -> dict[str, Any]:
     """
     Compute daily performance snapshot from paper_trades.
+    When forward paper epoch is set, stats are scoped to post-epoch non-synthetic SELLs only.
     Returns structured dict for API and script output.
     """
     db = db_path or DATABASE_PATH
@@ -54,27 +55,41 @@ def compute_snapshot(db_path: str | None = None) -> dict[str, Any]:
         db = os.path.abspath(db)
 
     now = datetime.now(timezone.utc)
+    from backend.services.allweather_paper_accounting import forward_sell_filter_sql, get_forward_epoch
+
+    epoch = get_forward_epoch(db)
+    epoch_start = str((epoch or {}).get("epoch_started_at") or "") or None
+    sell_where, sell_params = forward_sell_filter_sql(epoch_start=epoch_start)
+    sell_scope = "forward_epoch" if epoch_start else "all_time_non_synthetic"
+
     conn = sqlite3.connect(db)
     conn.row_factory = sqlite3.Row
     try:
-        # Basic counts (all-time)
+        # Basic counts (forward-scoped SELL modes when epoch active)
         counts = [
             {"side": r["side"], "mode": r["mode"], "count": int(r["c"])}
-            for r in conn.execute("""
+            for r in conn.execute(
+                f"""
                 SELECT side, mode, COUNT(*) AS c
                 FROM paper_trades
+                WHERE {sell_where}
                 GROUP BY side, mode
                 ORDER BY side, mode
-            """)
+                """,
+                sell_params,
+            )
         ]
 
-        # Recent SELL stats (all-time)
+        # Recent SELL stats (forward-scoped when epoch active)
         rows = list(
-            conn.execute("""
+            conn.execute(
+                f"""
                 SELECT pnl_pct, exit_type, hold_time_seconds, symbol
                 FROM paper_trades
-                WHERE side='SELL'
-            """)
+                WHERE {sell_where}
+                """,
+                sell_params,
+            )
         )
         sell_n = len(rows)
         pnl = [float(r["pnl_pct"]) for r in rows if r["pnl_pct"] is not None]
@@ -89,13 +104,16 @@ def compute_snapshot(db_path: str | None = None) -> dict[str, Any]:
         # Exit type breakdown
         exit_types = [
             {"exit_type": _sanitize_exit_type_for_dashboard(r["exit_type"]), "count": int(r["c"])}
-            for r in conn.execute("""
+            for r in conn.execute(
+                f"""
                 SELECT COALESCE(exit_type,'(null)') AS exit_type, COUNT(*) AS c
                 FROM paper_trades
-                WHERE side='SELL'
+                WHERE {sell_where}
                 GROUP BY COALESCE(exit_type,'(null)')
                 ORDER BY c DESC, exit_type ASC
-            """)
+                """,
+                sell_params,
+            )
         ]
 
         # Churn indicator
@@ -112,17 +130,20 @@ def compute_snapshot(db_path: str | None = None) -> dict[str, Any]:
                 "winrate": round(r["wins"] / r["sells"], 3) if r["sells"] else 0,
                 "avg_pnl_pct": float(r["avg_pnl"]) if r["avg_pnl"] is not None else None,
             }
-            for r in conn.execute("""
+            for r in conn.execute(
+                f"""
                 SELECT symbol,
                        COUNT(*) AS sells,
                        AVG(pnl_pct) AS avg_pnl,
                        SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) AS wins
                 FROM paper_trades
-                WHERE side='SELL'
+                WHERE {sell_where}
                 GROUP BY symbol
                 ORDER BY sells DESC, avg_pnl DESC
                 LIMIT 15
-            """)
+                """,
+                sell_params,
+            )
         ]
 
         # Mode gate sanity
@@ -152,6 +173,8 @@ def compute_snapshot(db_path: str | None = None) -> dict[str, Any]:
     return {
         "db_path": db,
         "snapshot_utc": now.isoformat(timespec="seconds"),
+        "scope": sell_scope,
+        "forward_epoch_started_at": epoch_start,
         "trade_counts": counts,
         "sell": {
             "count": sell_n,
