@@ -58,7 +58,7 @@ def _artifact_path_matches_contract(path: str, strategy_id: str, symbol_bus: str
     if not raw or raw.lower() in ("unknown", "none"):
         return False
     sid = strategy_id.strip().lower()
-    if sid not in ("day", "day"):
+    if sid != "day":
         return False
     sym = _norm_bus(symbol_bus)
     p = raw.replace("\\", "/").lower()
@@ -180,14 +180,22 @@ def evaluate_signal_hash_artifact_contract(
 
 
 def evaluate_explainability_artifact_contract(explainability: Any) -> tuple[bool, str | None, dict[str, Any]]:
-    """Re-check artifact contract at BUY execution (same rules as Redis hash)."""
+    """Re-check artifact contract at BUY execution (same rules as Redis hash).
+
+    The per-strategy artifact contract (version/dim/hash/path) only exists for
+    the canonical live ML "day" strategy — see live_strategy_contracts.py
+    (LiveStrategyId is DAY-only; models/active/<subdir> is only populated for
+    "day"). Other strategy families (e.g. AllWeather sub-strategies) stamp
+    ``live_ai_strategy`` with their own family name for attribution/weighting
+    purposes elsewhere in the codebase, not to claim a "day" ML artifact.
+    ``feature_version`` also defaults to 5 for every candidate regardless of
+    strategy (see BUY explainability construction), so it cannot be used to
+    distinguish genuine ML-artifact-backed decisions. Gate strictly on the
+    strategy label instead: only "day" is subject to this contract.
+    """
     strat = str(getattr(explainability, "live_ai_strategy", "") or "").strip()
-    try:
-        fv_skip = int(getattr(explainability, "feature_version", 0) or 0)
-    except (TypeError, ValueError):
-        fv_skip = 0
-    if not strat and fv_skip <= 0:
-        return True, None, {"skipped": "non_ml_buy_path"}
+    if strat.lower() != "day":
+        return True, None, {"skipped": "non_day_strategy_label", "live_ai_strategy": strat}
 
     sym_ccxt = str(getattr(explainability, "symbol", "") or "")
     symbol_bus = _norm_bus(sym_ccxt)
