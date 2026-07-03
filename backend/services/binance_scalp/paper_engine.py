@@ -379,25 +379,91 @@ class BinanceScalpPaperEngine:
                 snap = self.reader.read(sym)
                 if snap is None:
                     continue
-                _, all_sigs = self._router.evaluate_symbol(sym, epoch=epoch, notional_usd=notional, snap=snap)
-                best_reject = next((s for s in all_sigs if not getattr(s, "passed", True)), None)
-                if best_reject:
-                    self._record_reject(
-                        conn,
-                        sym,
-                        "BUY",
-                        getattr(best_reject, "reject_reason", None) or "NO_VALID_SETUP",
-                        json.dumps({"signals": [getattr(s, "as_dict", lambda: {})() for s in all_sigs]}),
-                    )
+                _, all_sigs, meta = self._router.evaluate_symbol(
+                    sym, epoch=epoch, notional_usd=notional, snap=snap
+                )
+                reason = (
+                    meta.get("hard_block")
+                    or meta.get("soft_reason")
+                    or f"RANK_BELOW_MIN:{meta.get('best_rank_score')}"
+                )
+                self._record_reject(
+                    conn,
+                    sym,
+                    "BUY",
+                    reason,
+                    json.dumps({"rank_meta": meta, "signals": [s.as_dict() for s in all_sigs]}),
+                )
             return []
 
-        best = ranked[0]
+        eligible = [r for r in ranked if r.get("entry_eligible")]
+        if not eligible:
+            top = ranked[0]
+            meta = top.get("rank_meta") or {}
+            reason = (
+                top.get("hard_block")
+                or meta.get("hard_block")
+                or top.get("soft_reason")
+                or meta.get("soft_reason")
+                or f"RANK_BELOW_MIN:{top.get('rank_score')}"
+            )
+            self._record_reject(
+                conn,
+                top["symbol"],
+                "BUY",
+                reason,
+                json.dumps(
+                    {
+                        "rank_meta": meta,
+                        "best_global": {
+                            "symbol": top.get("symbol"),
+                            "setup": top.get("best_setup"),
+                            "rank_score": top.get("rank_score"),
+                            "hard_block": top.get("hard_block"),
+                        },
+                        "all_symbols": [
+                            {
+                                "symbol": r["symbol"],
+                                "rank_score": r.get("rank_score"),
+                                "entry_eligible": r.get("entry_eligible"),
+                                "best_setup": r.get("best_setup"),
+                                "hard_block": r.get("hard_block"),
+                            }
+                            for r in ranked
+                        ],
+                    }
+                ),
+            )
+            return []
+
+        best = eligible[0]
         sym, snap, sig = best["symbol"], best["snap"], best["signal"]
+        if not getattr(sig, "passed", False):
+            self._record_reject(
+                conn,
+                sym,
+                "BUY",
+                "RANKED_NOT_EXECUTABLE",
+                json.dumps({"setup": sig.as_dict(), "rank_score": best.get("rank_score")}),
+            )
+            return []
         entry_intel = dict(best.get("intelligence") or {})
         self._last_ranking_meta = {
-            "selection_reason": f"{sig.setup_name} score={sig.score:.2f} {sig.entry_reason}",
+            "selection_reason": f"{sig.setup_name} rank={best.get('rank_score')} score={sig.score:.2f} {sig.entry_reason}",
             "selected_symbol": sym,
+            "rank_score": best.get("rank_score"),
+            "entry_eligible": True,
             "ranking": [r["signal"].as_dict() for r in ranked],
+            "ranked_summary": [
+                {
+                    "symbol": r["symbol"],
+                    "rank_score": r.get("rank_score"),
+                    "entry_eligible": r.get("entry_eligible"),
+                    "best_setup": r.get("best_setup"),
+                    "hard_block": r.get("hard_block"),
+                }
+                for r in ranked
+            ],
             "scalp_intelligence": entry_intel,
         }
         logger.info("SCALP_STRATEGY_PICK %s", self._last_ranking_meta["selection_reason"])

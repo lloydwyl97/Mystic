@@ -78,18 +78,26 @@ def _overlay_runner_scan(
             row["momentum_insufficient_cleared_by_runner"] = True
             sym_router = router_symbols.get(sym) or {}
             best = sym_router.get("best_setup") or {}
-            router_reject = best.get("reject_reason") if isinstance(best, dict) else None
-            if router_reject:
-                row["reject_reason"] = router_reject
-            elif sym_router.get("router_entry_ready"):
+            router_reject = sym_router.get("hard_block") or sym_router.get("soft_reason")
+            if not router_reject and isinstance(best, dict):
+                router_reject = best.get("reject_reason")
+            rank_score = sym_router.get("rank_score")
+            if sym_router.get("router_entry_ready"):
                 row["reject_reason"] = None
                 row["preflight_pass"] = True
                 row["would_enter_if_armed"] = True
                 row["would_enter"] = True
                 row["decision"] = "PASS"
+            elif router_reject:
+                row["reject_reason"] = router_reject
+                row["rank_score"] = rank_score
+                row["best_setup_name"] = sym_router.get("best_setup_name")
+            elif rank_score is not None:
+                row["reject_reason"] = f"RANK_BELOW_MIN:{rank_score}"
+                row["rank_score"] = rank_score
             else:
-                row["reject_reason"] = router_reject or "STRATEGY_NO_VALID_SETUP"
-                row["decision"] = _symbol_decision(row)
+                row["reject_reason"] = "STRATEGY_NO_VALID_SETUP"
+            row["decision"] = _symbol_decision(row)
     return regimes
 
 
@@ -392,40 +400,54 @@ def _evaluate_strategy_router(
     ranked_entries: list[dict[str, Any]] = []
 
     for sym in config.products:
-        best, all_sigs = router.evaluate_symbol(
+        best, all_sigs, meta = router.evaluate_symbol(
             sym,
             epoch=now,
             notional_usd=config.max_notional_paper,
         )
+        ranked_for_sym = meta.get("ranked") or []
+        best_ranked_row = max(ranked_for_sym, key=lambda r: float(r.get("rank_score") or 0.0), default=None)
         sym_row = {
             "best_setup": best.as_dict() if best else None,
-            "router_entry_ready": best is not None and best.passed,
+            "router_entry_ready": bool(meta.get("entry_eligible")),
+            "rank_score": meta.get("best_rank_score"),
+            "best_setup_name": meta.get("best_setup"),
+            "hard_block": meta.get("hard_block"),
+            "soft_reason": meta.get("soft_reason"),
+            "regime": meta.get("regime"),
             "strategies": [s.as_dict() for s in all_sigs],
+            "ranked": ranked_for_sym,
         }
         per_symbol[sym] = sym_row
-        if best is not None and best.passed:
-            ranked_entries.append(
-                {
-                    "symbol": sym,
-                    "setup_name": best.setup_name,
-                    "score": best.score,
-                    "spread_pct": best.spread_pct,
-                    "reject_reason": best.reject_reason,
-                }
-            )
+        ranked_entries.append(
+            {
+                "symbol": sym,
+                "setup_name": meta.get("best_setup") or (best.setup_name if best else None),
+                "score": meta.get("best_rank_score") or (best.score if best else 0.0),
+                "rank_score": meta.get("best_rank_score"),
+                "spread_pct": best.spread_pct if best else 0.0,
+                "reject_reason": meta.get("hard_block") or meta.get("soft_reason"),
+                "entry_eligible": bool(meta.get("entry_eligible")),
+                "hard_block": meta.get("hard_block"),
+            }
+        )
 
-    ranked_entries.sort(key=lambda r: (-r["score"], r["spread_pct"]))
+    ranked_entries.sort(key=lambda r: (-int(bool(r.get("entry_eligible"))), -float(r.get("rank_score") or r.get("score") or 0), float(r.get("spread_pct") or 0)))
     inventory = router.strategy_inventory()
-    best_overall = ranked_entries[0] if ranked_entries else None
+    eligible = [r for r in ranked_entries if r.get("entry_eligible")]
+    best_overall = eligible[0] if eligible else (ranked_entries[0] if ranked_entries else None)
+    global_hard_block = None if eligible else (best_overall.get("hard_block") if best_overall else "NO_CANDIDATES")
 
     return {
         "inventory": inventory,
-        "overall_entry_ready": best_overall is not None,
+        "overall_entry_ready": bool(eligible),
         "best_candidate": best_overall,
+        "best_global_candidate": best_overall,
         "ranked_candidates": ranked_entries,
+        "global_hard_block": global_hard_block,
         "symbols": per_symbol,
         "warm_rounds_used": warm_rounds,
-        "note": "router uses enabled strategies; legacy /status symbols block uses momentum preflight",
+        "note": "ranking engine: soft setup misses score; hard safety blocks trade",
     }
 
 
