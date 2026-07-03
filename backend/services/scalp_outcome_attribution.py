@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     spread_at_entry REAL,
     spread_at_exit REAL,
     attribution_json TEXT NOT NULL DEFAULT '{{}}',
+    exit_diagnostics_json TEXT NOT NULL DEFAULT '{{}}',
+    exit_trigger_detail TEXT NOT NULL DEFAULT '',
+    exit_stale_review_count INTEGER,
     created_at TEXT NOT NULL DEFAULT ''
 )
 """
@@ -52,6 +55,15 @@ _INDEXES = (
     f"CREATE INDEX IF NOT EXISTS ix_scalp_outcome_trade ON {TABLE}(trade_id)",
     f"CREATE INDEX IF NOT EXISTS ix_scalp_outcome_symbol ON {TABLE}(symbol, created_at)",
     f"CREATE INDEX IF NOT EXISTS ix_scalp_outcome_setup ON {TABLE}(micro_regime, scalp_setup)",
+    f"CREATE INDEX IF NOT EXISTS ix_scalp_outcome_exit_trigger ON {TABLE}(exit_trigger_detail)",
+)
+
+# Columns added after initial release — ALTER TABLE ADD COLUMN is safe/idempotent
+# in SQLite and preserves existing rows (NULL/default for pre-existing data).
+_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("exit_diagnostics_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ("exit_trigger_detail", "TEXT NOT NULL DEFAULT ''"),
+    ("exit_stale_review_count", "INTEGER"),
 )
 
 OUTCOME_REASONS: tuple[str, ...] = (
@@ -77,6 +89,10 @@ def ensure_scalp_outcome_attribution_table(db_path: str | None = None) -> None:
     path = db_path or get_scalp_config().database_path
     with sqlite3.connect(path) as conn:
         conn.execute(_CREATE)
+        existing_cols = {r[1] for r in conn.execute(f"PRAGMA table_info({TABLE})").fetchall()}
+        for col_name, col_def in _MIGRATION_COLUMNS:
+            if col_name not in existing_cols:
+                conn.execute(f"ALTER TABLE {TABLE} ADD COLUMN {col_name} {col_def}")
         for stmt in _INDEXES:
             conn.execute(stmt)
         conn.commit()
@@ -171,6 +187,16 @@ def build_attribution_payload(
         "realized_slippage": float(ex.get("realized_slippage") or 0.0),
         "spread_at_entry": float(ex.get("spread_at_entry") or ex.get("spread_pct") or 0.0),
         "spread_at_exit": float(ex.get("spread_at_exit") or 0.0),
+        "exit_diagnostics": ex.get("exit_diagnostics") or {},
+        "exit_trigger_detail": str(ex.get("exit_trigger_detail") or ""),
+        "exit_stale_review_count": ex.get("exit_stale_review_count"),
+        "exit_max_favorable_pct": ex.get("exit_max_favorable_pct"),
+        "exit_recovery_from_low_pct": ex.get("exit_recovery_from_low_pct"),
+        "exit_bid_change_15s": ex.get("exit_bid_change_15s"),
+        "exit_bid_change_30s": ex.get("exit_bid_change_30s"),
+        "scratch_target_progress_pct": ex.get("scratch_target_progress_pct"),
+        "scratch_momentum_weak": ex.get("scratch_momentum_weak"),
+        "scratch_flat_or_slight_neg": ex.get("scratch_flat_or_slight_neg"),
     }
 
 
@@ -202,7 +228,8 @@ def record_scalp_outcome_attribution(
             exit_reason=exit_reason,
         )
         created = payload.get("exit_time") or datetime.now(timezone.utc).isoformat()
-        with sqlite3.connect(path) as conn:
+        with sqlite3.connect(path, timeout=15.0) as conn:
+            conn.execute("PRAGMA busy_timeout=10000")
             cur = conn.execute(
                 f"""
                 INSERT INTO {TABLE} (
@@ -212,12 +239,16 @@ def record_scalp_outcome_attribution(
                     setup_score, execution_quality_score, model_probabilities_json,
                     final_scalp_selection_score, feature_health_pass,
                     slippage_estimate, realized_slippage, spread_at_entry, spread_at_exit,
-                    attribution_json, created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    attribution_json, exit_diagnostics_json, exit_trigger_detail,
+                    exit_stale_review_count, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(trade_id) DO UPDATE SET
                     net_pnl_after_fees=excluded.net_pnl_after_fees,
                     outcome_reason=excluded.outcome_reason,
-                    attribution_json=excluded.attribution_json
+                    attribution_json=excluded.attribution_json,
+                    exit_diagnostics_json=excluded.exit_diagnostics_json,
+                    exit_trigger_detail=excluded.exit_trigger_detail,
+                    exit_stale_review_count=excluded.exit_stale_review_count
                 """,
                 (
                     trade_id,
@@ -245,6 +276,9 @@ def record_scalp_outcome_attribution(
                     payload["spread_at_entry"],
                     payload["spread_at_exit"],
                     json.dumps(payload, separators=(",", ":")),
+                    json.dumps(payload.get("exit_diagnostics") or {}, separators=(",", ":")),
+                    payload["exit_trigger_detail"],
+                    payload["exit_stale_review_count"],
                     created,
                 ),
             )

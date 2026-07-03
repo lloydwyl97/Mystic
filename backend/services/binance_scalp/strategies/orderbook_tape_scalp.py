@@ -25,7 +25,8 @@ class OrderbookTapeScalpStrategy:
             return reject_signal(ctx, self.name, "DEPTH_OR_IMPACT_FAIL", impact=impact)
 
         imb = ctx.snap.order_book_imbalance
-        if imb is None or imb < 0.10:
+        imb_min = 0.08 if ctx.config.scalp_paper_enabled else 0.10
+        if imb is None or imb < imb_min:
             return reject_signal(ctx, self.name, "IMBALANCE_ALONE_INSUFFICIENT")
 
         bid_qty = sum(q for _, q in ctx.snap.bids[:5])
@@ -34,7 +35,9 @@ class OrderbookTapeScalpStrategy:
             return reject_signal(ctx, self.name, "ASK_LIQUIDITY_TOO_THICK")
 
         mom = ctx.mom
-        if not (mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0):
+        if not (mom.bid_change_15s > 0 and mom.mid_change_15s > 0):
+            return reject_signal(ctx, self.name, "PRICE_NOT_CONFIRMING_IMBALANCE")
+        if not ctx.config.scalp_paper_enabled and not (mom.mid_change_30s > 0):
             return reject_signal(ctx, self.name, "PRICE_NOT_CONFIRMING_IMBALANCE")
 
         expected = min(ctx.snap.spread_pct * 6 + imb * 0.002, 0.004)

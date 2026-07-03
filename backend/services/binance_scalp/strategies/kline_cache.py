@@ -3,9 +3,19 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import socket
 import time
 from datetime import datetime, timedelta, timezone
+
+# Force IPv4 for Binance.US REST (same as ScalpMarketReader).
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_getaddrinfo
 
 # Regime classifier needs >=31 completed 1h bars (~31h of history).
 MIN_REGIME_1H_BARS = 31
@@ -21,15 +31,15 @@ def fetch_bars(symbol: str, interval: str, *, minutes: int = 30) -> list[dict]:
     start_ms = int(start.timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
     url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval={interval}&startTime={start_ms}&endTime={end_ms}&limit=1000"
-    proc = subprocess.run(
-        ["curl", "-s", "--max-time", "20", url],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0 or not proc.stdout.strip():
+    try:
+        import httpx
+
+        with httpx.Client(timeout=20.0) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            rows = resp.json()
+    except Exception:
         return []
-    rows = json.loads(proc.stdout)
     if not isinstance(rows, list):
         return []
     return [

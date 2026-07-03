@@ -20,7 +20,7 @@ from backend.services.binance_scalp.momentum_gross_estimate import (
 from backend.services.binance_scalp.momentum_tracker import MomentumDiagnostics, MomentumTracker
 from backend.services.binance_scalp.orderbook_book import walk_buy_notional, walk_sell_qty
 from backend.services.binance_scalp.protected_preflight import run_scalp_preflight
-from backend.services.binance_scalp.redis_keys import scan_key
+from backend.services.binance_scalp.redis_keys import scan_key, runner_state_key
 from backend.services.binance_scalp.scalp_control import is_entry_armed
 from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
 from backend.services.binance_scalp.strategies.kline_cache import KlineCache
@@ -37,9 +37,11 @@ def _overlay_runner_scan(
     rclient: redis.Redis,
     *,
     prefix: str,
+    strategy_router: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Merge live runner scan snapshots (momentum/regime) into status rows."""
     regimes: dict[str, str] = {}
+    router_symbols = (strategy_router or {}).get("symbols") or {}
     for row in symbol_rows:
         sym = str(row.get("symbol") or "")
         if not sym or row.get("error"):
@@ -58,13 +60,80 @@ def _overlay_runner_scan(
             row["runner_micro_regime"] = regime
         samples = int(scan.get("momentum_sample_count") or 0)
         hist = float(scan.get("momentum_history_sec") or 0.0)
+        runner_warmed = samples >= 4 and hist >= 30.0
         if samples > int(row.get("momentum_samples") or 0):
             row["momentum_samples"] = samples
             row["momentum_history_sec"] = hist
             row["momentum_confirmed"] = bool(scan.get("momentum_confirmed"))
             row["runner_momentum_overlay"] = True
+        elif runner_warmed:
+            row["momentum_samples"] = max(samples, int(row.get("momentum_samples") or 0))
+            row["momentum_history_sec"] = max(hist, float(row.get("momentum_history_sec") or 0.0))
+            row["momentum_confirmed"] = bool(scan.get("momentum_confirmed"))
+            row["runner_momentum_overlay"] = True
         row["runner_scan_age_sec"] = max(0.0, time.time() - float(scan.get("updated_at_epoch") or 0))
+
+        if runner_warmed and row.get("reject_reason") == "MOMENTUM_DATA_INSUFFICIENT":
+            row["reject_reason"] = None
+            row["momentum_insufficient_cleared_by_runner"] = True
+            sym_router = router_symbols.get(sym) or {}
+            best = sym_router.get("best_setup") or {}
+            router_reject = best.get("reject_reason") if isinstance(best, dict) else None
+            if router_reject:
+                row["reject_reason"] = router_reject
+            elif sym_router.get("router_entry_ready"):
+                row["reject_reason"] = None
+                row["preflight_pass"] = True
+                row["would_enter_if_armed"] = True
+                row["would_enter"] = True
+                row["decision"] = "PASS"
+            else:
+                row["reject_reason"] = router_reject or "STRATEGY_NO_VALID_SETUP"
+                row["decision"] = _symbol_decision(row)
     return regimes
+
+
+def _load_runner_state(rclient: redis.Redis, *, prefix: str) -> dict[str, Any] | None:
+    try:
+        raw = rclient.get(runner_state_key(prefix))
+        if not raw:
+            return None
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _derive_operational_summary(
+    *,
+    runner_state: dict[str, Any] | None,
+    open_positions: int,
+    config: ScalpConfig,
+    runner_active: bool,
+) -> dict[str, Any]:
+    max_open = int(config.max_open_positions)
+    rs = runner_state or {}
+    age = max(0.0, time.time() - float(rs.get("updated_at_epoch") or 0.0)) if rs else None
+    mode = str(rs.get("operational_mode") or "")
+    if not runner_active:
+        mode = "runner_dead"
+    elif not mode:
+        if open_positions >= max_open:
+            mode = "max_open_positions_reached"
+        elif open_positions > 0:
+            mode = "exit_watch_active"
+        else:
+            mode = "entry_scan_active"
+    return {
+        "operational_mode": mode,
+        "runner_state_age_sec": round(age, 1) if age is not None else None,
+        "open_count": open_positions,
+        "max_open_positions": max_open,
+        "open_symbols": rs.get("open_symbols") or [],
+        "products_scanned": rs.get("products_scanned") or list(config.products),
+        "entry_blocked_reason": rs.get("entry_blocked_reason"),
+        "momentum_warmed": rs.get("momentum_warmed"),
+    }
 
 
 def _read_mem_kb() -> dict[str, int]:
@@ -182,8 +251,18 @@ def _overall_decision(rows: list[dict]) -> str:
     return "BLOCKED"
 
 
-def _top_blocker(rows: list[dict]) -> str | None:
-    reasons = [r.get("reject_reason") for r in rows if r.get("reject_reason")]
+def _top_blocker(rows: list[dict], *, operational: dict[str, Any] | None = None) -> str | None:
+    mode = str((operational or {}).get("operational_mode") or "")
+    if mode in {"max_open_positions_reached", "exit_watch_active"}:
+        blocked = (operational or {}).get("entry_blocked_reason")
+        return str(blocked) if blocked else None
+    reasons = [
+        r.get("reject_reason")
+        for r in rows
+        if r.get("reject_reason")
+        and not r.get("momentum_insufficient_cleared_by_runner")
+        and r.get("reject_reason") != "MOMENTUM_DATA_INSUFFICIENT"
+    ]
     if not reasons:
         return None
     return max(set(reasons), key=reasons.count)
@@ -381,12 +460,37 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
         warm_rounds=warm_rounds,
     )
 
-    micro_regimes = _overlay_runner_scan(symbol_rows, rclient, prefix=config.redis_key_prefix)
+    micro_regimes = _overlay_runner_scan(
+        symbol_rows,
+        rclient,
+        prefix=config.redis_key_prefix,
+        strategy_router=strategy_router,
+    )
+    for row in symbol_rows:
+        if not row.get("error"):
+            row["decision"] = _symbol_decision(row)
+    runner_state = _load_runner_state(rclient, prefix=config.redis_key_prefix)
+    operational = _derive_operational_summary(
+        runner_state=runner_state,
+        open_positions=open_positions,
+        config=config,
+        runner_active=True,
+    )
+
+    overall = _overall_decision(symbol_rows)
+    if operational["operational_mode"] == "max_open_positions_reached":
+        overall = "WAITING_FOR_EXIT"
+    elif operational["operational_mode"] == "exit_watch_active":
+        overall = "EXIT_WATCH"
+
+    top_blocker = _top_blocker(symbol_rows, operational=operational)
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "overall_decision": _overall_decision(symbol_rows),
-        "top_blocker": _top_blocker(symbol_rows),
+        "overall_decision": overall,
+        "top_blocker": top_blocker,
+        "operational_summary": operational,
+        "runner_state": runner_state,
         "warm_rounds_recommended": 12,
         "warm_rounds_note": ("momentum_confirmed requires ~60s history and 60s trend; warm_rounds=6 (~35s) under-warms 60s checks"),
         "fee_model_verified": econ.is_fee_model_verified(),

@@ -42,9 +42,10 @@ STRATEGY_NATIVE_REGIMES: dict[str, frozenset[str]] = {
     "compression_breakout": frozenset({REGIME_VOL_CRUSH, REGIME_VOL_EXPANSION, REGIME_HIGH_VOL_BREAKOUT}),
     "volume_impulse_continuation": frozenset({REGIME_BULL_TREND, REGIME_PUMP_CONTINUATION, REGIME_HIGH_VOL_BREAKOUT}),
     "trend_pullback_micro": frozenset({REGIME_BULL_TREND, REGIME_PUMP_CONTINUATION}),
-    "range_bounce_scalp": frozenset({REGIME_RANGE, REGIME_CHOP, REGIME_LOW_VOL_DEAD}),
-    "vwap_ema_reclaim": frozenset({REGIME_RANGE, REGIME_CHOP, REGIME_DUMP_REVERSAL}),
-    "failed_breakdown_reversal": frozenset({REGIME_DUMP_REVERSAL, REGIME_BEAR_TREND, REGIME_RANGE}),
+    # Tightened: true range / low-vol only — chop and vol_expansion produced weak bounces.
+    "range_bounce_scalp": frozenset({REGIME_RANGE, REGIME_LOW_VOL_DEAD}),
+    "vwap_ema_reclaim": frozenset({REGIME_RANGE, REGIME_CHOP, REGIME_DUMP_REVERSAL, REGIME_VOL_EXPANSION}),
+    "failed_breakdown_reversal": frozenset({REGIME_DUMP_REVERSAL, REGIME_BEAR_TREND, REGIME_RANGE, REGIME_VOL_EXPANSION}),
     "failed_breakout_reversal": frozenset({REGIME_RANGE, REGIME_CHOP, REGIME_DUMP_CONTINUATION}),
     "orderbook_tape_scalp": frozenset({REGIME_VOL_EXPANSION, REGIME_HIGH_VOL_BREAKOUT, REGIME_PUMP_CONTINUATION}),
 }

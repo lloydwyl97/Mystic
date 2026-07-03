@@ -12,6 +12,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
+_build_lock = threading.Lock()
 _mem_cache: dict[str, Any] = {"payload": None, "built_at": 0.0, "warm_rounds": -1}
 
 
@@ -90,7 +91,53 @@ def get_cached_scalp_status(*, warm_rounds: int = 0, force_refresh: bool = False
                 payload["cache_age_sec"] = round(now - float(_mem_cache["built_at"]), 2)
                 return payload
 
-    payload = build_scalp_status(warm_rounds=wr)
+    def _stale_fallback(exc: Exception) -> dict[str, Any] | None:
+        logger.warning("scalp status build failed (warm=%s): %s", wr, exc)
+        with _lock:
+            stale_src = _mem_cache.get("payload")
+        if stale_src:
+            stale = dict(stale_src)
+            stale["cache_hit"] = True
+            stale["cache_stale"] = True
+            stale["cache_backend"] = "memory_stale"
+            stale["status_error"] = str(exc)[:240]
+            stale.pop("_cached_at", None)
+            return stale
+        redis_stale = _load_redis_cache(wr)
+        if redis_stale:
+            stale = dict(redis_stale)
+            stale["cache_hit"] = True
+            stale["cache_stale"] = True
+            stale["cache_backend"] = "redis_stale"
+            stale["status_error"] = str(exc)[:240]
+            stale.pop("_cached_at", None)
+            return stale
+        return None
+
+    with _build_lock:
+        # Re-check cache after waiting — another thread may have refreshed.
+        now = time.time()
+        if not force_refresh:
+            with _lock:
+                if (
+                    _mem_cache.get("payload") is not None
+                    and int(_mem_cache.get("warm_rounds") or -1) == wr
+                    and (now - float(_mem_cache.get("built_at") or 0)) < ttl
+                ):
+                    payload = dict(_mem_cache["payload"])
+                    payload["cache_hit"] = True
+                    payload["cache_backend"] = "memory"
+                    payload["cache_age_sec"] = round(now - float(_mem_cache["built_at"]), 2)
+                    return payload
+
+        try:
+            payload = build_scalp_status(warm_rounds=wr)
+        except Exception as exc:
+            fallback = _stale_fallback(exc)
+            if fallback is not None:
+                return fallback
+            raise
+
     payload["cache_hit"] = False
     payload["cache_age_sec"] = 0.0
     payload["cache_ttl_sec"] = ttl

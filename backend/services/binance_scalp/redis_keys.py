@@ -58,6 +58,12 @@ def scan_key(prefix: str, symbol_bus: str) -> str:
     return key
 
 
+def runner_state_key(prefix: str) -> str:
+    key = f"{normalize_prefix(prefix)}:runner:state"
+    assert_key_allowed(key, prefix=prefix)
+    return key
+
+
 def status_snapshot_key(prefix: str, warm_rounds: int = 0) -> str:
     key = f"{normalize_prefix(prefix)}:status:snapshot:w{int(warm_rounds)}"
     assert_key_allowed(key, prefix=prefix)

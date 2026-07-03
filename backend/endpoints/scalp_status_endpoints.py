@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -14,6 +15,7 @@ from backend.services.binance_scalp.config import get_scalp_config
 from backend.services.binance_scalp.pnl_summary import build_scalp_pnl_summary
 from backend.services.binance_scalp.strategies import STRATEGY_NAMES, enabled_strategies
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/scalp", tags=["scalp"])
 
 
@@ -58,24 +60,44 @@ def scalp_status(*, warm: int = 0) -> dict:
     Pass warm=12 for a full cold momentum warm (~60s, diagnostics only).
     """
     active = _scalp_runner_active()
-    pnl = build_scalp_pnl_summary()
+    try:
+        pnl = build_scalp_pnl_summary()
+    except Exception as exc:
+        logger.warning("scalp pnl summary failed: %s", exc)
+        pnl = {"engine": "scalp", "today": {}, "all_time": {}, "pnl_error": str(exc)[:200]}
+
     if not active:
         return {
             "runner_active": False,
             "engine": "scalp",
             "scalp_engaged": False,
+            "operational_summary": {"operational_mode": "runner_dead"},
             "pnl_summary": pnl,
             "note": "Scalp paper runner is not running. Start with './start_mystic.sh core' or 'scalp'.",
         }
-    from backend.services.binance_scalp.scalp_status_cache import get_cached_scalp_status
 
     warm_rounds = max(0, min(int(warm), 12))
-    return {
-        "runner_active": True,
-        "engine": "scalp",
-        "pnl_summary": pnl,
-        **get_cached_scalp_status(warm_rounds=warm_rounds),
-    }
+    try:
+        from backend.services.binance_scalp.scalp_status_cache import get_cached_scalp_status
+
+        snapshot = get_cached_scalp_status(warm_rounds=warm_rounds)
+        return {
+            "runner_active": True,
+            "engine": "scalp",
+            "pnl_summary": pnl,
+            **snapshot,
+        }
+    except Exception as exc:
+        logger.exception("scalp_status failed warm=%s: %s", warm_rounds, exc)
+        return {
+            "runner_active": True,
+            "engine": "scalp",
+            "pnl_summary": pnl,
+            "overall_decision": "DEGRADED",
+            "top_blocker": "STATUS_BUILD_FAILED",
+            "status_error": str(exc)[:240],
+            "note": "Scalp status snapshot unavailable — retry shortly. Other /api/scalp/* endpoints may still work.",
+        }
 
 
 @router.get("/strategies")
@@ -92,14 +114,15 @@ def scalp_strategies() -> dict:
 
 @router.get("/positions")
 def scalp_positions() -> dict[str, Any]:
-    """Open scalp paper positions (read-only)."""
+    """Open scalp paper positions (read-only) with live lifecycle fields."""
     try:
         with _ro_conn() as conn:
             open_rows = _rows(
                 conn,
                 """
                 SELECT symbol, quantity, entry_price, entry_time, entry_time_epoch,
-                       trade_id, status, state, diagnostics_json, last_state_reason
+                       trade_id, status, state, diagnostics_json, last_state_reason,
+                       max_favorable_pct, stale_review_count, session_low_bid
                 FROM scalp_paper_positions
                 WHERE status = 'OPEN'
                 ORDER BY entry_time_epoch DESC
@@ -117,18 +140,24 @@ def scalp_positions() -> dict[str, Any]:
         for row in open_rows:
             epoch = float(row.get("entry_time_epoch") or 0)
             row["hold_seconds"] = round(max(0.0, now - epoch), 1) if epoch else None
-            diag_raw = row.pop("diagnostics_json", None)
+            diag_raw = row.get("diagnostics_json")
             if diag_raw:
                 try:
-                    row["setup"] = json.loads(diag_raw).get("setup_name") or json.loads(diag_raw).get("setup")
+                    diag = json.loads(diag_raw)
+                    row["setup"] = diag.get("setup_name") or diag.get("setup")
                 except (json.JSONDecodeError, TypeError):
                     row["setup"] = None
             else:
                 row["setup"] = None
+        from backend.services.binance_scalp.scalp_position_lifecycle import enrich_open_scalp_positions
+
+        enriched = enrich_open_scalp_positions(open_rows)
+        for row in enriched:
+            row.pop("diagnostics_json", None)
         return {
             "engine": "scalp",
-            "open_count": len(open_rows),
-            "positions": open_rows,
+            "open_count": len(enriched),
+            "positions": enriched,
             "ledger": ledger[0] if ledger else None,
         }
     except FileNotFoundError as exc:
@@ -191,6 +220,14 @@ def scalp_scoreboard(days: int = Query(7, ge=1, le=90)) -> dict[str, Any]:
         return {"engine": "scalp", "days": days, "rows": rows}
     except FileNotFoundError as exc:
         return {"engine": "scalp", "days": days, "rows": [], "note": str(exc)}
+
+
+@router.get("/attribution")
+def scalp_attribution(days: int | None = Query(None, ge=1, le=365)) -> dict[str, Any]:
+    """Closed scalp PnL attribution by symbol, setup, regime, exit, hold, and cost burden."""
+    from backend.services.binance_scalp.scalp_attribution_report import build_scalp_attribution_report
+
+    return build_scalp_attribution_report(days=days)
 
 
 @router.get("/learning-summary")

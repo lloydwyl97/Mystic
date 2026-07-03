@@ -32,30 +32,40 @@ class RangeBounceScalpStrategy:
         support = min(b["low"] for b in support_window)
         cur = ctx.snap.mid
         dist_to_support = (cur - support) / cur if cur > 0 else 1.0
-        if dist_to_support > 0.0018:
+        support_cap = 0.002 if ctx.config.scalp_paper_enabled else 0.0015
+        if dist_to_support > support_cap:
             return reject_signal(ctx, self.name, "NOT_NEAR_SUPPORT")
+
+        hi = max(b["high"] for b in support_window)
+        range_pct = (hi - support) / cur if cur > 0 else 1.0
+        if range_pct > 0.008:
+            return reject_signal(ctx, self.name, "RANGE_TOO_WIDE")
 
         last = bars[-1]
         wick_rejection = (last["close"] - last["low"]) / last["close"] if last["close"] > 0 else 0
-        if wick_rejection < 0.0002 and ctx.mom.bid_change_15s <= 0:
+        min_wick = 0.00035
+        if wick_rejection < min_wick:
             return reject_signal(ctx, self.name, "NO_REJECTION_WICK")
 
         mom = ctx.mom
         if not (mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0):
             return reject_signal(ctx, self.name, "MOMENTUM_NOT_FLIPPED")
+        if mom.bid_change_60s < -0.0001:
+            return reject_signal(ctx, self.name, "MOMENTUM_NOT_SUSTAINED")
 
         recovery = (cur - support) / cur if cur > 0 else 0
-        expected = min(recovery + 0.001, 0.0035)
+        expected = min(recovery + 0.0008, 0.0025)
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
 
-        score = 2.2 + wick_rejection * 400 + recovery * 300
+        score = 2.5 + wick_rejection * 500 + recovery * 400
+        confidence = min(0.72, 0.55 + wick_rejection * 200)
         return pass_signal(
             ctx,
             self.name,
             score=score,
-            confidence=0.6,
+            confidence=confidence,
             entry_reason=f"support_bounce_{support:.6f}_wick={wick_rejection:.4f}",
             invalidation_reason="support_break_no_recovery",
             expected_move_pct=expected,

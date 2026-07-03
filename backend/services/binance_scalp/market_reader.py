@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import socket
-import subprocess
 from dataclasses import dataclass
 
 import redis
@@ -61,16 +60,8 @@ def fetch_depth_sync(symbol_bus: str, *, limit: int = 100) -> tuple[list[list[fl
             resp = client.get(url)
             resp.raise_for_status()
             data = resp.json()
-    except Exception:
-        proc = subprocess.run(
-            ["curl", "-s", "--max-time", "15", url],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if proc.returncode != 0 or not proc.stdout.strip():
-            raise RuntimeError(f"depth fetch failed for {sym}") from None
-        data = json.loads(proc.stdout)
+    except Exception as exc:
+        raise RuntimeError(f"depth fetch failed for {sym}: {exc}") from exc
     bids = [[float(p), float(q)] for p, q in data.get("bids") or []]
     asks = [[float(p), float(q)] for p, q in data.get("asks") or []]
     return bids, asks

@@ -22,6 +22,14 @@ def _int_env(name: str, default: int) -> int:
     return int(raw)
 
 
+def _paper_relax_momentum() -> bool:
+    """Paper runs: allow 15/30s rising without strict 60s trend in chop (learning path)."""
+    raw = os.getenv("SCALP_PAPER_RELAX_MOMENTUM")
+    if raw is not None:
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    return str(os.getenv("SCALP_PAPER_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class MomentumDiagnostics:
     mid_change_15s: float
@@ -146,7 +154,11 @@ class MomentumTracker:
         rising_15 = bid15 >= min_change and mid15 >= min_change
         rising_30 = bid30 > 0.0 and mid30 > 0.0
         rising_60 = bid60 > 0.0 and mid60 > 0.0
-        confirmed = has_history and rising_15 and rising_30 and rising_60 and up_count >= min_up and not flat
+        if _paper_relax_momentum() and has_history:
+            min_up_paper = max(2, min_up - 1)
+            confirmed = rising_15 and rising_30 and up_count >= min_up_paper and not flat
+        else:
+            confirmed = has_history and rising_15 and rising_30 and rising_60 and up_count >= min_up and not flat
 
         return MomentumDiagnostics(
             mid_change_15s=mid15,

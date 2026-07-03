@@ -42,6 +42,8 @@ def setup_invalidated(
 
     if name == "range_bounce_scalp":
         support = float(setup_context.get("support_level") or entry_price * 0.998)
+        if bid < support * 0.9998 and mom.bid_change_15s <= 0:
+            return True, "support_broken_no_bid_recovery"
         if bid < support * 0.9995 and mom.bid_change_30s < 0:
             return True, "support_broken"
         return False, ""

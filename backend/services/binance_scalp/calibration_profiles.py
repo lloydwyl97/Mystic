@@ -55,9 +55,14 @@ def _attach_paper_spread_caps(econ: ScalpEconomics, config: ScalpConfig) -> Scal
 def economics_for_config(config: ScalpConfig) -> ScalpEconomics:
     base = ScalpEconomics.from_env()
     econ = base
-    if config.calibration_mode:
-        if config.scalp_live:
+    if config.scalp_live:
+        if config.calibration_mode:
             raise RuntimeError("SCALP_CALIBRATION_MODE cannot be enabled with SCALP_LIVE=true")
+    elif config.scalp_paper_enabled:
+        # Paper learning default: moderate economics unless calibration_mode picks another profile.
+        profile = config.calibration_profile if config.calibration_mode else "moderate"
+        econ = apply_profile(base, profile)
+    elif config.calibration_mode:
         econ = apply_profile(base, config.calibration_profile)
     econ = _attach_paper_spread_caps(econ, config)
     return econ

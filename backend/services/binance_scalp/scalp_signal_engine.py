@@ -51,6 +51,7 @@ from backend.services.binance_scalp.strategies.kline_cache import KlineCache
 EXIT_NET_PROFIT_TARGET = "NET_PROFIT_TARGET"
 EXIT_SETUP_INVALIDATED = "SETUP_INVALIDATED_EXIT"
 EXIT_MOMENTUM_FAILED = "MOMENTUM_FAILED_EXIT"
+EXIT_EARLY_SCRATCH = "EARLY_SCRATCH_EXIT"
 EXIT_MAX_HOLD_HARD_LIMIT = "MAX_HOLD_HARD_LIMIT"
 
 
@@ -74,8 +75,34 @@ _klines = None
 _router = None
 
 
+def bind_paper_engine(
+    *,
+    router: ScalpStrategyRouter,
+    momentum: MomentumTracker,
+    klines: KlineCache | None = None,
+) -> None:
+    """Share the warmed paper-engine router/momentum — avoids a cold duplicate tracker."""
+    global _router, _momentum, _klines, _config, _econ, _reader
+    _router = router
+    _momentum = momentum
+    if klines is not None:
+        _klines = klines
+    if _config is None:
+        _config = get_scalp_config()
+        _econ = economics_for_config(_config)
+        _reader = ScalpMarketReader(_config)
+
+
 def _ensure_components():
     global _config, _econ, _reader, _momentum, _klines, _router
+    if _router is not None and _momentum is not None:
+        if _config is None:
+            _config = get_scalp_config()
+            _econ = economics_for_config(_config)
+            _reader = ScalpMarketReader(_config)
+        if _klines is None:
+            _klines = KlineCache()
+        return
     if _config is None:
         _config = get_scalp_config()
         _econ = economics_for_config(_config)
@@ -171,10 +198,12 @@ def exit_decision(
 
 
 __all__ = [
+    "EXIT_EARLY_SCRATCH",
     "EXIT_MAX_HOLD_HARD_LIMIT",
     "EXIT_MOMENTUM_FAILED",
     "EXIT_NET_PROFIT_TARGET",
     "EXIT_SETUP_INVALIDATED",
+    "bind_paper_engine",
     "entry_candidates",
     "exit_decision",
     "get_router",
