@@ -2388,22 +2388,21 @@ class PortfolioEngine:
         if forward_epoch_only is None:
             forward_epoch_only = bool(epoch_start)
         try:
+            from backend.services.allweather_paper_accounting import forward_sell_filter_sql
+
             with connect_rw(self.db_path) as conn:
                 cursor = conn.cursor()
-                sql = """
+                where_sql, where_params = forward_sell_filter_sql(
+                    epoch_start=self._forward_paper_epoch_start() if forward_epoch_only else None,
+                )
+                if forward_epoch_only is False:
+                    where_sql, where_params = forward_sell_filter_sql(epoch_start=None)
+                sql = f"""
                     SELECT COALESCE(SUM(pnl), 0.0)
                     FROM paper_trades
-                    WHERE side='SELL' AND pnl IS NOT NULL
-                      AND COALESCE(exit_type, '') NOT IN (
-                        'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT'
-                      )
-                      AND COALESCE(is_synthetic, 0) = 0
+                    WHERE {where_sql}
                 """
-                params: tuple[Any, ...] = ()
-                if forward_epoch_only and epoch_start:
-                    sql += " AND timestamp >= ?"
-                    params = (epoch_start,)
-                cursor.execute(sql, params)
+                cursor.execute(sql, where_params)
                 result = cursor.fetchone()
                 realized = float(result[0]) if result and result[0] is not None else 0.0
             scope = "forward_epoch" if forward_epoch_only and epoch_start else "all_time_non_synthetic"
@@ -2432,8 +2431,18 @@ class PortfolioEngine:
                 )
                 self._realized_pnl = computed
                 if epoch_start:
+                    from backend.services.allweather_paper_accounting import reconcile_forward_ledger
+
+                    reconcile_forward_ledger(
+                        self.db_path,
+                        positions_value=self._positions_value,
+                        unrealized_pnl=self._unrealized_pnl,
+                        force=True,
+                    )
+                    await self._load_ledger_from_sqlite()
+                else:
                     self._total_equity = self.cash_balance + self._positions_value
-                await self._persist_ledger_to_sqlite()
+                    await self._persist_ledger_to_sqlite()
             elif not epoch_start and abs(computed - self._realized_pnl) > 0.01:
                 logger.warning(
                     "REALIZED_PNL_HEAL: Correcting ledger from %.2f to %.2f (diff=%.2f)",
@@ -2446,6 +2455,15 @@ class PortfolioEngine:
                 await self._persist_ledger_to_sqlite()
             else:
                 logger.info("REALIZED_PNL_SYNC: Ledger and paper_trades agree at $%.2f", computed)
+            if epoch_start:
+                from backend.services.allweather_paper_accounting import reconcile_forward_ledger
+
+                reconcile_forward_ledger(
+                    self.db_path,
+                    positions_value=self._positions_value,
+                    unrealized_pnl=self._unrealized_pnl,
+                )
+                await self._load_ledger_from_sqlite()
         except Exception as e:
             logger.exception(f"REALIZED_PNL_SYNC FAILED: {e}")
 
@@ -8269,14 +8287,15 @@ class PortfolioEngine:
 
                     if self._sell_idempotency_duplicate_sync(normalized_symbol, position_trade_id, quantity, exit_trigger):
                         logger.warning(
-                            "SELL_IDEMPOTENCY_ALREADY_CLOSED: %s entry_trade_id=%s qty=%.8f exit=%s",
+                            "SELL_IDEMPOTENCY_ALREADY_CLOSED: %s entry_trade_id=%s qty=%.8f exit=%s — reconciling ghost position row",
                             normalized_symbol,
                             position_trade_id,
                             quantity,
                             exit_trigger,
                         )
-                        conn.rollback()
-                        return False
+                        cursor.execute("DELETE FROM portfolio_engine_positions WHERE symbol = ?", (normalized_symbol,))
+                        conn.commit()
+                        return "reconciled"
 
                     if quantity > available_qty:
                         logger.error(f"FIFO_ERROR: Sell quantity {quantity} > available {available_qty} for {normalized_symbol}")
@@ -8984,6 +9003,14 @@ class PortfolioEngine:
             async with self._fifo_sell_lock:
                 loop = asyncio.get_running_loop()
                 sell_sqlite_ok = await loop.run_in_executor(None, _sync_fifo_sell)
+                if sell_sqlite_ok == "reconciled":
+                    async with self._deletion_lock:
+                        self.open_positions.pop(normalized_symbol, None)
+                    mtm = await self._fetch_mtm_prices_for_open_positions()
+                    await self._recompute_positions_values(mtm or None)
+                    await self._persist_ledger_to_sqlite()
+                    logger.info("GHOST_POSITION_RECONCILED symbol=%s", normalized_symbol)
+                    return None
                 if not sell_sqlite_ok:
                     return None
                 # Credit cash under the same lock immediately after SQLite commit so
@@ -9014,7 +9041,7 @@ class PortfolioEngine:
             logger.warning("execute_sell_fifo failed for %s: %s", normalized_symbol, ex)
             raise
         finally:
-            if not sell_sqlite_ok:
+            if sell_sqlite_ok is not True:
                 self._exit_in_progress.discard(normalized_symbol)
 
         # One-line JSON after DB commit: each EXIT_AUDIT matches a successful FIFO sell (grep EXIT_AUDIT)
@@ -16896,6 +16923,24 @@ class PortfolioEngine:
 
         await self._recompute_positions_values(await self._fetch_mtm_prices_for_open_positions() or None)
 
+        from backend.services.allweather_paper_accounting import compute_pnl_breakdown, reconcile_forward_ledger
+
+        loop = asyncio.get_running_loop()
+        forward_acct = await loop.run_in_executor(None, lambda: compute_pnl_breakdown(self.db_path))
+        epoch_start = forward_acct.get("forward_epoch_started_at")
+        if epoch_start:
+            await loop.run_in_executor(
+                None,
+                lambda: reconcile_forward_ledger(
+                    self.db_path,
+                    positions_value=self._positions_value,
+                    unrealized_pnl=self._unrealized_pnl,
+                    force=False,
+                ),
+            )
+            await self._load_ledger_from_sqlite()
+            forward_acct = await loop.run_in_executor(None, lambda: compute_pnl_breakdown(self.db_path))
+
         positions_rows: list[dict[str, Any]] = []
         for symbol, pos in sorted(self.open_positions.items(), key=lambda x: x[0]):
             if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
@@ -16969,6 +17014,8 @@ class PortfolioEngine:
         }
 
         def _sync_trades() -> tuple[list[Any], dict[str, int | float]]:
+            from backend.services.allweather_paper_accounting import forward_sell_filter_sql
+
             conn = sqlite3.connect(self.db_path)
             try:
                 cur = conn.cursor()
@@ -16977,15 +17024,19 @@ class PortfolioEngine:
                 sleeve_sql = "COALESCE(sleeve, 'ACTIVE')" if "sleeve" in cols else "'ACTIVE'"
                 trade_id_sql = "trade_id" if "trade_id" in cols else "NULL"
                 id_sql = "id" if "id" in cols else "NULL"
-                admin_filter = "COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT') AND COALESCE(is_synthetic, 0) = 0"
+                exit_reason_sql = "exit_reason" if "exit_reason" in cols else "NULL"
+                where_sql, where_params = forward_sell_filter_sql(
+                    epoch_start=str(epoch_start) if epoch_start else None,
+                )
                 cur.execute(
                     f"""
-                    SELECT {id_sql}, {trade_id_sql}, symbol, side, quantity, price, pnl, timestamp, {sleeve_sql}
+                    SELECT {id_sql}, {trade_id_sql}, symbol, side, quantity, price, pnl, timestamp, {sleeve_sql}, {exit_reason_sql}
                     FROM paper_trades
-                    WHERE {admin_filter}
+                    WHERE {where_sql}
                     ORDER BY id DESC
                     LIMIT 50
-                    """
+                    """,
+                    where_params,
                 )
                 recent = list(cur.fetchall())
                 cur.execute(
@@ -16995,9 +17046,9 @@ class PortfolioEngine:
                         SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
                         SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) AS losses
                     FROM paper_trades
-                    WHERE UPPER(side) = 'SELL' AND pnl IS NOT NULL
-                      AND {admin_filter}
-                    """
+                    WHERE {where_sql}
+                    """,
+                    where_params,
                 )
                 agg = cur.fetchone() or (0, 0, 0)
                 stats = {
@@ -17009,7 +17060,6 @@ class PortfolioEngine:
             finally:
                 conn.close()
 
-        loop = asyncio.get_running_loop()
         trade_rows, sell_stats = await loop.run_in_executor(None, _sync_trades)
         trades_data: list[dict[str, Any]] = []
         for r in trade_rows:
@@ -17026,6 +17076,7 @@ class PortfolioEngine:
                     "pnl": float(r[6]) if r[6] is not None else None,
                     "timestamp": r[7],
                     "sleeve": r[8] if len(r) > 8 else Sleeve.ACTIVE.value,
+                    "exit_reason": r[9] if len(r) > 9 else None,
                 }
             )
 
@@ -17034,8 +17085,16 @@ class PortfolioEngine:
         losses = int(sell_stats.get("losses", 0))
         win_rate = (wins / nt * 100) if nt > 0 else 0.0
 
-        principal_val = float(ledger.get("principal", self.principal) or 0)
-        account_return_pnl = float(self._total_equity) - principal_val
+        if epoch_start:
+            principal_val = float(forward_acct.get("forward_principal_usd") or self.principal)
+            realized = float(forward_acct.get("realized_pnl_forward_usd") or 0.0)
+            display_equity = float(forward_acct.get("forward_equity_usd") or self._total_equity)
+            account_return_pnl = display_equity - principal_val
+        else:
+            principal_val = float(ledger.get("principal", self.principal) or 0)
+            realized = float(ledger.get("realized_pnl", 0) or 0)
+            display_equity = float(self._total_equity)
+            account_return_pnl = display_equity - principal_val
         component_pnl_sum = realized + float(self._unrealized_pnl or 0)
 
         perf_block = {
@@ -17047,10 +17106,13 @@ class PortfolioEngine:
             "winning_trades": wins,
             "losing_trades": losses,
             "win_rate": win_rate,
-            "total_equity": self._total_equity,
+            "total_equity": display_equity,
             "principal": principal_val,
             "cash_balance": self.cash_balance,
             "positions_value": self._positions_value,
+            "scope": "forward_epoch" if epoch_start else "all_time",
+            "forward_epoch_started_at": epoch_start,
+            "synthetic_smoke_pnl_excluded_usd": float(forward_acct.get("synthetic_smoke_pnl_usd") or 0.0),
         }
 
         scoreboard_today = await self.get_scoreboard_today()
@@ -17073,7 +17135,7 @@ class PortfolioEngine:
         inv["dashboard_cross_check_warnings"] = violations
         inv["dashboard_consistency_ok"] = len(violations) == 0
 
-        await self.sync_regime_label_from_redis(force=True)
+        await self.sync_regime_label_from_redis(force=False)
         rs = self._regime_state
         _raw_reg = getattr(rs, "regime", None) or "unknown"
         regime_norm = str(_raw_reg).strip().lower() or "unknown"
@@ -17111,14 +17173,15 @@ class PortfolioEngine:
         }
 
         day_position_health: dict[str, Any] | None = None
-        try:
-            from backend.services.day_position_health import load_health, update_telemetry
+        if n_open > 0:
+            try:
+                from backend.services.day_position_health import load_health, update_telemetry
 
-            prices = await self._fetch_mtm_prices_for_open_positions() or {}
-            update_telemetry(self, prices)
-            day_position_health = await loop.run_in_executor(None, load_health)
-        except Exception:
-            day_position_health = None
+                prices = await self._fetch_mtm_prices_for_open_positions() or {}
+                update_telemetry(self, prices)
+                day_position_health = await loop.run_in_executor(None, load_health)
+            except Exception:
+                day_position_health = None
 
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -17131,7 +17194,7 @@ class PortfolioEngine:
             },
             "regime": regime_payload,
             "positions": {"positions": positions_rows, "count": n_open, "source": "portfolio_engine_canonical"},
-            "performance": {"performance": perf_block, "trades": trades_data[:30]},
+            "performance": {"performance": perf_block, "trades": trades_data[:50], "forward_paper_accounting": forward_acct},
             "sleeves": sleeve_status,
             "risk": risk_block,
             "scoreboard_today": scoreboard_today,

@@ -1536,7 +1536,18 @@ class PortfolioEngineIntegration:
                             await eng._load_positions_from_sqlite()
                             mtm_prices = await eng._fetch_mtm_prices_for_open_positions()
                             await eng._recompute_positions_values(mtm_prices or self.current_prices or None)
-                            await eng._persist_ledger_to_sqlite()
+                            if eng._forward_paper_epoch_start():
+                                from backend.services.allweather_paper_accounting import reconcile_forward_ledger
+
+                                reconcile_forward_ledger(
+                                    eng.db_path,
+                                    positions_value=eng._positions_value,
+                                    unrealized_pnl=eng._unrealized_pnl,
+                                    force=True,
+                                )
+                                await eng._load_ledger_from_sqlite()
+                            else:
+                                await eng._persist_ledger_to_sqlite()
                             await eng._sync_paper_redis_from_sqlite_authoritative()
                     except Exception as reload_err:
                         logger.warning("LEDGER_MTM_PERSIST reload from SQLite failed: %s", reload_err)
