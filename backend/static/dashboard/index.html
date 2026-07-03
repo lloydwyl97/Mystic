@@ -199,6 +199,8 @@
         <section class="widget widget--full">
             <h2 class="widget__title">SCALP engine status</h2>
             <div class="readiness-grid" id="scalp-summary-grid">
+                <div class="readiness-card"><span class="readiness-label">Operational mode</span><span class="readiness-value" id="scalp-operational-mode">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Entry blocked</span><span class="readiness-value" id="scalp-entry-blocked">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Runner</span><span class="readiness-value" id="scalp-runner">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Overall decision</span><span class="readiness-value" id="scalp-overall">--</span></div>
                 <div class="readiness-card readiness-card--span2"><span class="readiness-label">Top blocker</span><span class="readiness-value" id="scalp-top-blocker">--</span></div>
@@ -219,8 +221,8 @@
             <h2 class="widget__title">SCALP open positions</h2>
             <div class="widget__table-wrap">
                 <table class="positions-table">
-                    <thead><tr><th>Symbol</th><th>Setup</th><th>Entry</th><th>Size</th><th>Hold (s)</th><th>State</th></tr></thead>
-                    <tbody id="scalp-positions-tbody"><tr><td colspan="6">--</td></tr></tbody>
+                    <thead><tr><th>Symbol</th><th>Setup</th><th>Entry</th><th>Net PnL</th><th>Net %</th><th>Target gap</th><th>Hold (s)</th><th>State</th><th>Reason</th><th>Next exit</th></tr></thead>
+                    <tbody id="scalp-positions-tbody"><tr><td colspan="10">--</td></tr></tbody>
                 </table>
             </div>
         </section>
@@ -247,6 +249,16 @@
                 <table class="positions-table">
                     <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Price</th><th>PnL</th><th>Exit</th></tr></thead>
                     <tbody id="scalp-trades-tbody"><tr><td colspan="6">--</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+        <section class="widget widget--full">
+            <h2 class="widget__title">SCALP attribution (closed PnL)</h2>
+            <p class="widget__subtitle">Total: <span id="scalp-attribution-total">--</span></p>
+            <div class="widget__table-wrap widget__table-wrap--scroll">
+                <table class="positions-table">
+                    <thead><tr><th>Group</th><th>Key</th><th>Trades</th><th>W/L</th><th>Net PnL</th><th>Avg PnL</th></tr></thead>
+                    <tbody id="scalp-attribution-tbody"><tr><td colspan="6">--</td></tr></tbody>
                 </table>
             </div>
         </section>
@@ -292,8 +304,8 @@
                 <p class="widget__subtitle">SCALP paper ledger — separate from DAY.</p>
                 <div class="widget__table-wrap">
                     <table class="positions-table">
-                        <thead><tr><th>Symbol</th><th>Setup</th><th>Entry</th><th>Qty</th><th>Hold (s)</th></tr></thead>
-                        <tbody id="pt-scalp-open-tbody"><tr><td colspan="5">--</td></tr></tbody>
+                        <thead><tr><th>Symbol</th><th>Setup</th><th>Entry</th><th>Net PnL</th><th>Hold (s)</th><th>State</th><th>Next exit</th></tr></thead>
+                        <tbody id="pt-scalp-open-tbody"><tr><td colspan="7">--</td></tr></tbody>
                     </table>
                 </div>
             </div>
@@ -483,6 +495,6 @@
     </div>
 
     <script src="vendor/chart.umd.min.js?v=4.4.1"></script>
-    <script src="app.js?v=40"></script>
+    <script src="app.js?v=47"></script>
 </body>
 </html>
