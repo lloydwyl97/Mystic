@@ -17,7 +17,6 @@ import contextlib
 import logging
 import os
 import sqlite3
-import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -1122,21 +1121,6 @@ async def sync_from_paper_trading() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-_dashboard_canonical_cache: dict[str, Any] = {"ts": 0.0, "payload": None}
-_dashboard_canonical_lock = asyncio.Lock()
-_DASHBOARD_CANONICAL_CACHE_SEC = 45.0
-
-
-def _dashboard_canonical_cache_hit() -> dict[str, Any] | None:
-    cached = _dashboard_canonical_cache.get("payload")
-    if not cached:
-        return None
-    age = time.time() - float(_dashboard_canonical_cache.get("ts") or 0.0)
-    if age < _DASHBOARD_CANONICAL_CACHE_SEC:
-        return cached
-    return None
-
-
 @router.get("/dashboard-canonical")
 async def get_dashboard_canonical() -> dict[str, Any]:
     """
@@ -1144,43 +1128,29 @@ async def get_dashboard_canonical() -> dict[str, Any]:
     All panels should use this path to avoid split-brain between SQLite rows and empty engine memory.
     """
     try:
-        hit = _dashboard_canonical_cache_hit()
-        if hit is not None:
-            return hit
+        engine = get_portfolio_engine()
+        from backend.services.portfolio_engine import is_portfolio_engine_initialized
 
-        async with _dashboard_canonical_lock:
-            hit = _dashboard_canonical_cache_hit()
-            if hit is not None:
-                return hit
+        if not is_portfolio_engine_initialized():
+            await initialize_portfolio_engine()
 
-            engine = get_portfolio_engine()
-            from backend.services.portfolio_engine import is_portfolio_engine_initialized
+        await _ensure_engine_positions_match_sqlite(engine)
+        payload = await engine.build_dashboard_canonical_snapshot()
+        from backend.services.market_data_readiness_probe import market_data_dashboard_meta_async
 
-            if not is_portfolio_engine_initialized():
-                await initialize_portfolio_engine()
+        md_meta = await market_data_dashboard_meta_async()
+        md_meta_readiness_fields = md_meta.copy()
+        md_meta_readiness_fields["ai_can_act"] = None  # Lite meta only; probe endpoint authorizes counts
+        md_meta_readiness_fields["dashboard_note"] = "Call GET /api/portfolio-engine/market-data-readiness for full live Binance checks."
 
-            sqlite_open = await asyncio.to_thread(_sqlite_open_positions_count_sync)
-            if sqlite_open > 0:
-                await _ensure_engine_positions_match_sqlite(engine)
-            payload = await engine.build_dashboard_canonical_snapshot()
-            from backend.services.market_data_readiness_probe import market_data_dashboard_meta_async
+        merged = dict(payload)
+        merged["market_data_readiness_dashboard"] = md_meta_readiness_fields
 
-            md_meta = await market_data_dashboard_meta_async()
-            md_meta_readiness_fields = md_meta.copy()
-            md_meta_readiness_fields["ai_can_act"] = None  # Lite meta only; probe endpoint authorizes counts
-            md_meta_readiness_fields["dashboard_note"] = "Call GET /api/portfolio-engine/market-data-readiness for full live Binance checks."
-
-            merged = dict(payload)
-            merged["market_data_readiness_dashboard"] = md_meta_readiness_fields
-
-            result = {
-                "success": True,
-                "data": merged,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-            _dashboard_canonical_cache["ts"] = time.time()
-            _dashboard_canonical_cache["payload"] = result
-            return result
+        return {
+            "success": True,
+            "data": merged,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
     except Exception as e:
         logger.exception("Error building dashboard canonical snapshot: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
