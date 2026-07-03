@@ -44,6 +44,11 @@ except ImportError:
     to_str = None
     WRITER_ROLES = None
 
+try:
+    from backend.config.redis_config import get_shared_redis_async
+except ImportError:
+    get_shared_redis_async = None
+
 router = APIRouter(prefix="/api/system", tags=["system"])
 
 
@@ -302,6 +307,28 @@ async def get_process_health() -> dict[str, Any]:
         "redis": "ok" if redis_ok else "down",
         "processes": checks,
     }
+
+
+@router.get("/task-health")
+async def get_task_health_report() -> dict[str, Any]:
+    """Internal task-level heartbeats — catches a process that is technically
+    running (pgrep-alive) but whose actual work loop has silently stalled.
+
+    This is distinct from /api/system/process-health, which only checks OS
+    process liveness. On 2026-07-02 the order_book_collector WebSocket loop
+    stopped processing messages for ~8 hours with the OS process, socket
+    connection, and pgrep check all showing healthy — only a heartbeat from
+    inside the loop doing real work would have caught it.
+    """
+    if get_shared_redis_async is None:
+        return {"overall_status": "UNKNOWN", "error": "redis client unavailable"}
+    try:
+        from backend.services.task_health_monitor import get_task_health
+
+        return await get_task_health(get_shared_redis_async())
+    except Exception as e:
+        logger.warning("task-health report failed: %s", e)
+        return {"overall_status": "ERROR", "error": str(e)}
 
 
 @router.get("/topology")

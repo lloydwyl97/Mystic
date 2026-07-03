@@ -41,6 +41,7 @@ class OrderBookCollector:
         self.ws_url = "wss://stream.binance.us:9443/stream"
         self.symbols = []
         self.websocket = None
+        self._last_heartbeat_ts = 0.0
 
         # Top-4 Binance.US trading symbols only (Mystic day-trade scope)
         symbols_str = os.getenv("TRADING_SYMBOLS", "BTC,ETH,SOL,XRP")
@@ -123,19 +124,19 @@ class OrderBookCollector:
         """
         Process order book update message from Binance
 
-        Message format:
+        Message format (partial book depth snapshot, e.g. btcusdt@depth20@100ms):
         {
-            "stream": "btcusdt@depth@100ms",
+            "stream": "btcusdt@depth20@100ms",
             "data": {
-                "e": "depthUpdate",
-                "E": 1234567890,
-                "s": "BTCUSDT",
-                "U": 157,
-                "u": 160,
-                "b": [["9168.00", "1.00"], ...],  # bids
-                "a": [["9169.00", "1.00"], ...]   # asks
+                "lastUpdateId": 160,
+                "bids": [["9168.00", "1.00"], ...],  # full top-N bids
+                "asks": [["9169.00", "1.00"], ...]   # full top-N asks
             }
         }
+
+        Note: this is NOT the incremental diff-depth stream (which uses
+        abbreviated "b"/"a" keys). Partial-depth snapshot streams always use
+        the full "bids"/"asks" key names.
         """
         try:
             data = json.loads(message)
@@ -150,12 +151,12 @@ class OrderBookCollector:
             stream = data["stream"]
             update = data["data"]
 
-            # Extract symbol from stream name (btcusdt@depth@100ms -> BTC)
+            # Extract symbol from stream name (btcusdt@depth20@100ms -> BTC)
             symbol = stream.split("@")[0].replace("usdt", "").upper()
 
             # Partial depth snapshot: full top-N bids/asks each tick
-            bids = update.get("b", [])
-            asks = update.get("a", [])
+            bids = update.get("bids", [])
+            asks = update.get("asks", [])
 
             if not bids or not asks:
                 return
@@ -172,6 +173,7 @@ class OrderBookCollector:
 
             self.stats["messages_received"] += 1
             self.stats["order_books_processed"] += 1
+            await self._heartbeat_throttled(symbol)
 
             # Log first successful processing per symbol
             if self.stats["order_books_processed"] == 1:
@@ -191,6 +193,24 @@ class OrderBookCollector:
             "symbols": self.symbols,
             "stats": self.stats,
         }
+
+    async def _heartbeat_throttled(self, symbol: str) -> None:
+        """Emit a task-health heartbeat at most once every 10s (avoid Redis spam at ~40 msg/s)."""
+        now = asyncio.get_event_loop().time()
+        if now - self._last_heartbeat_ts < 10.0:
+            return
+        self._last_heartbeat_ts = now
+        try:
+            from backend.config.redis_config import get_shared_redis_async
+            from backend.services.task_health_monitor import beat
+
+            await beat(
+                "order_book_collector:ws_messages",
+                get_shared_redis_async(),
+                extra={"last_symbol": symbol, "messages_received": self.stats["messages_received"]},
+            )
+        except Exception:
+            pass
 
 
 # Singleton instance

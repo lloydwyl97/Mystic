@@ -435,6 +435,16 @@ class LiveMarketDataService:
                 await asyncio.gather(*tasks)
                 if persisted_any:
                     await self._mark_market_heartbeat()
+                try:
+                    from backend.services.task_health_monitor import beat
+
+                    await beat(
+                        "live_market_data:ohlcv_loop",
+                        self._cache_guard.r if self._cache_guard else None,
+                        extra={"batch_size": len(batch), "persisted_any": persisted_any},
+                    )
+                except Exception:
+                    pass
             finally:
                 elapsed = max(0.0, time.time() - t0)
                 await asyncio.sleep(max(0.0, self.ohlcv_interval - elapsed))
