@@ -239,7 +239,7 @@ class BinanceScalpPaperEngine:
             if open_count >= max_open:
                 mode = "max_open_positions_reached"
             elif open_count > 0:
-                mode = "exit_watch_active"
+                mode = "entry_scan_active"
             elif entry_blocked_reason:
                 mode = "entry_rejected_by_strategy"
             else:
@@ -317,6 +317,8 @@ class BinanceScalpPaperEngine:
         if not self.config.scalp_paper_enabled:
             return []
 
+        open_symbols = {str(r[0]).upper() for r in conn.execute("SELECT symbol FROM scalp_paper_positions WHERE status='OPEN'")}
+
         _, epoch = self._now()
         notional = min(self.config.max_notional_paper, float(self._ledger(conn)["cash_balance"]))
 
@@ -337,6 +339,9 @@ class BinanceScalpPaperEngine:
 
         if not ranked:
             ranked = self._router.evaluate_all(epoch=epoch, notional_usd=notional) or []
+
+        if open_symbols:
+            ranked = [r for r in ranked if str(r.get("symbol") or "").upper() not in open_symbols]
 
         for row in ranked:
             sym = row["symbol"]
@@ -379,14 +384,8 @@ class BinanceScalpPaperEngine:
                 snap = self.reader.read(sym)
                 if snap is None:
                     continue
-                _, all_sigs, meta = self._router.evaluate_symbol(
-                    sym, epoch=epoch, notional_usd=notional, snap=snap
-                )
-                reason = (
-                    meta.get("hard_block")
-                    or meta.get("soft_reason")
-                    or f"RANK_BELOW_MIN:{meta.get('best_rank_score')}"
-                )
+                _, all_sigs, meta = self._router.evaluate_symbol(sym, epoch=epoch, notional_usd=notional, snap=snap)
+                reason = meta.get("hard_block") or meta.get("soft_reason") or f"RANK_BELOW_MIN:{meta.get('best_rank_score')}"
                 self._record_reject(
                     conn,
                     sym,
@@ -396,20 +395,23 @@ class BinanceScalpPaperEngine:
                 )
             return []
 
-        eligible = [r for r in ranked if r.get("entry_eligible")]
-        if not eligible:
-            top = ranked[0]
+        from backend.services.binance_scalp.scalp_candidate_ranking import pick_best_global_candidate
+
+        best = pick_best_global_candidate(ranked)
+        if best is None:
+            top = ranked[0] if ranked else {}
             meta = top.get("rank_meta") or {}
+            eligible_rows = [r for r in ranked if r.get("entry_eligible")]
+            top_score = float(top.get("rank_score") or 0)
+            second_score = float(eligible_rows[1].get("rank_score") or 0) if len(eligible_rows) > 1 else 0.0
             reason = (
-                top.get("hard_block")
-                or meta.get("hard_block")
-                or top.get("soft_reason")
-                or meta.get("soft_reason")
-                or f"RANK_BELOW_MIN:{top.get('rank_score')}"
+                "RANK_LOW_CONFIDENCE_TIE"
+                if eligible_rows and top_score < float(os.getenv("SCALP_MIN_CONFIDENT_RANK", "1.55"))
+                else top.get("hard_block") or meta.get("hard_block") or top.get("soft_reason") or meta.get("soft_reason") or f"RANK_BELOW_MIN:{top.get('rank_score')}"
             )
             self._record_reject(
                 conn,
-                top["symbol"],
+                top.get("symbol") or (self.config.products[0] if self.config.products else "UNKNOWN"),
                 "BUY",
                 reason,
                 json.dumps(
@@ -420,6 +422,7 @@ class BinanceScalpPaperEngine:
                             "setup": top.get("best_setup"),
                             "rank_score": top.get("rank_score"),
                             "hard_block": top.get("hard_block"),
+                            "rank_margin": round(top_score - second_score, 4),
                         },
                         "all_symbols": [
                             {
@@ -428,6 +431,7 @@ class BinanceScalpPaperEngine:
                                 "entry_eligible": r.get("entry_eligible"),
                                 "best_setup": r.get("best_setup"),
                                 "hard_block": r.get("hard_block"),
+                                "soft_reason": r.get("soft_reason"),
                             }
                             for r in ranked
                         ],
@@ -435,8 +439,6 @@ class BinanceScalpPaperEngine:
                 ),
             )
             return []
-
-        best = eligible[0]
         sym, snap, sig = best["symbol"], best["snap"], best["signal"]
         if not getattr(sig, "passed", False):
             self._record_reject(
@@ -490,6 +492,13 @@ class BinanceScalpPaperEngine:
             return
 
         sym, snap, sig = candidates[0]
+        if conn.execute(
+            "SELECT 1 FROM scalp_paper_positions WHERE symbol = ? AND status = 'OPEN' LIMIT 1",
+            (sym,),
+        ).fetchone():
+            self._record_reject(conn, sym, "BUY", "SYMBOL_ALREADY_OPEN", json.dumps({"symbol": sym}))
+            return
+
         ledger = self._ledger(conn)
         notional = min(self.config.max_notional_paper, float(ledger["cash_balance"]))
         if notional < 1.0:
@@ -1214,22 +1223,20 @@ class BinanceScalpPaperEngine:
 
             open_rows = self._open_positions(conn)
             entry_blocked: str | None = None
-            if open_rows:
-                for row in open_rows:
-                    self._try_exit(conn, row, post_commit=post_commit)
-            elif conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0] < self.config.max_open_positions:
+            for row in open_rows:
+                self._try_exit(conn, row, post_commit=post_commit)
+            open_count = conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0]
+            if open_count < self.config.max_open_positions:
                 before_rejects = conn.execute("SELECT COUNT(*) FROM scalp_rejects").fetchone()[0]
                 self._try_entry(conn)
                 after_rejects = conn.execute("SELECT COUNT(*) FROM scalp_rejects").fetchone()[0]
                 if after_rejects > before_rejects:
-                    last = conn.execute(
-                        "SELECT reason FROM scalp_rejects ORDER BY id DESC LIMIT 1"
-                    ).fetchone()
+                    last = conn.execute("SELECT reason FROM scalp_rejects ORDER BY id DESC LIMIT 1").fetchone()
                     if last:
                         entry_blocked = str(last[0] or "")
             else:
                 entry_blocked = "MAX_OPEN_POSITIONS"
-            self._publish_runner_state(conn, open_rows=open_rows, epoch=epoch, entry_blocked_reason=entry_blocked)
+            self._publish_runner_state(conn, open_rows=self._open_positions(conn), epoch=epoch, entry_blocked_reason=entry_blocked)
             conn.commit()
             for fn in post_commit:
                 try:

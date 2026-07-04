@@ -129,7 +129,7 @@ def _derive_operational_summary(
         if open_positions >= max_open:
             mode = "max_open_positions_reached"
         elif open_positions > 0:
-            mode = "exit_watch_active"
+            mode = "entry_scan_active"
         else:
             mode = "entry_scan_active"
     return {
@@ -264,13 +264,7 @@ def _top_blocker(rows: list[dict], *, operational: dict[str, Any] | None = None)
     if mode in {"max_open_positions_reached", "exit_watch_active"}:
         blocked = (operational or {}).get("entry_blocked_reason")
         return str(blocked) if blocked else None
-    reasons = [
-        r.get("reject_reason")
-        for r in rows
-        if r.get("reject_reason")
-        and not r.get("momentum_insufficient_cleared_by_runner")
-        and r.get("reject_reason") != "MOMENTUM_DATA_INSUFFICIENT"
-    ]
+    reasons = [r.get("reject_reason") for r in rows if r.get("reject_reason") and not r.get("momentum_insufficient_cleared_by_runner") and r.get("reject_reason") != "MOMENTUM_DATA_INSUFFICIENT"]
     if not reasons:
         return None
     return max(set(reasons), key=reasons.count)

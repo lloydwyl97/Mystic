@@ -123,6 +123,8 @@ class ScalpStrategyRouter:
                 "soft_reason": r.soft_reason,
                 "passed": r.signal.passed,
                 "regime_native": r.regime_native,
+                "reachability_surplus": r.reachability_surplus,
+                "selection_confidence": r.selection_confidence,
             }
             for r in ranked_list
         ]
@@ -132,6 +134,8 @@ class ScalpStrategyRouter:
             meta["hard_block"] = "NO_CANDIDATES"
             return None, signals, meta
 
+        meta["reachability_surplus"] = best_ranked.reachability_surplus
+        meta["selection_confidence"] = best_ranked.selection_confidence
         meta["best_rank_score"] = best_ranked.rank_score
         meta["best_setup"] = best_ranked.signal.setup_name
         meta["entry_eligible"] = best_ranked.entry_eligible
@@ -185,6 +189,8 @@ class ScalpStrategyRouter:
                 "hard_block": meta.get("hard_block"),
                 "best_setup": meta.get("best_setup"),
                 "soft_reason": meta.get("soft_reason"),
+                "reachability_surplus": meta.get("reachability_surplus"),
+                "selection_confidence": meta.get("selection_confidence"),
             }
             rows.append(row)
 
@@ -192,7 +198,7 @@ class ScalpStrategyRouter:
             key=lambda r: (
                 -int(bool(r.get("entry_eligible"))),
                 -float(r.get("rank_score") or 0.0),
-                float(getattr(r.get("signal"), "spread_pct", 0) or 0),
+                -float((r.get("rank_meta") or {}).get("reachability_surplus") or 0.0),
             )
         )
         return rows
