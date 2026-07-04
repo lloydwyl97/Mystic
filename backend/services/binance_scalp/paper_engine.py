@@ -664,11 +664,15 @@ class BinanceScalpPaperEngine:
         ts: str,
         reason: str,
         review_lows: tuple[float, ...],
+        touch_review_ts: bool = False,
     ) -> None:
         raw_diag = row["diagnostics_json"]
         diag = json.loads(raw_diag) if raw_diag else {}
         diag["review_lows"] = list(review_lows)
         diag["session_low_bid"] = track.session_low_bid
+        # Only advance last_review_ts when a timed review actually ran; updating every
+        # tick prevented SCALP_REVIEW_INTERVAL_SEC from ever elapsing (stale_review_count stuck at 1).
+        last_review_ts = ts if touch_review_ts else (row["last_review_ts"] or ts)
         conn.execute(
             """
             UPDATE scalp_paper_positions SET
@@ -688,7 +692,7 @@ class BinanceScalpPaperEngine:
                 track.max_adverse_pct,
                 track.stale_review_count,
                 track.session_low_bid,
-                ts,
+                last_review_ts,
                 reason,
                 json.dumps(diag),
                 row["id"],
@@ -1064,6 +1068,7 @@ class BinanceScalpPaperEngine:
             ts=ts,
             reason=review.reason,
             review_lows=review.updated_track.review_lows,
+            touch_review_ts=perform_review,
         )
 
         exit_gate = {

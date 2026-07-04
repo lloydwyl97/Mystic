@@ -73,7 +73,33 @@ def _scratch_deep_loss_pct() -> float:
 
 
 def _scratch_min_reviews() -> int:
-    return int(os.getenv("SCALP_SCRATCH_MIN_REVIEWS", "2"))
+    return int(os.getenv("SCALP_SCRATCH_MIN_REVIEWS", "1"))
+
+
+def _stall_exit_hold_frac() -> float:
+    return float(os.getenv("SCALP_STALL_EXIT_HOLD_FRAC", "0.75"))
+
+
+def _stall_exit_min_sec(hard: int) -> int:
+    raw = os.getenv("SCALP_STALL_EXIT_MIN_SEC", "")
+    if raw and str(raw).strip():
+        return int(raw)
+    return int(hard * _stall_exit_hold_frac())
+
+
+def _momentum_stalled(mom: MomentumDiagnostics) -> bool:
+    """Flat/choppy or negative — not a live recovery push toward target."""
+    if mom.flat_regime:
+        return True
+    if mom.bid_change_15s < 0 and mom.bid_change_30s < 0 and mom.mid_change_30s <= 0:
+        return True
+    return mom.bid_change_15s <= 0 and mom.bid_change_30s <= 0 and mom.mid_change_30s <= 0
+
+
+def _scratchable_net(executable_net_pct: float, econ: ScalpEconomics) -> bool:
+    """Flat, tiny green, or small loss — not a deep drawdown worth holding for recovery."""
+    upper = max(_scratch_flat_upper_pct(), econ.net_profit_target_pct * 0.45)
+    return _scratch_deep_loss_pct() < executable_net_pct <= upper
 
 
 def _early_scratch_exit(
@@ -96,17 +122,9 @@ def _early_scratch_exit(
     no_progress = max_fav < target_progress
     if not no_progress:
         return False, ""
-    momentum_weak = (
-        mom.bid_change_15s < 0
-        and mom.bid_change_30s < 0
-        and mom.mid_change_30s <= 0
-    )
-    if not momentum_weak:
+    if not _momentum_stalled(mom):
         return False, ""
-    flat_or_slight_neg = (
-        _scratch_deep_loss_pct() < executable_net_pct <= _scratch_flat_upper_pct()
-    )
-    if not flat_or_slight_neg:
+    if not _scratchable_net(executable_net_pct, econ):
         return False, ""
     min_reviews = _scratch_min_reviews()
     trigger = _review_trigger_sec(econ)
@@ -114,6 +132,37 @@ def _early_scratch_exit(
         return True, "stalled_no_progress_review_scratch"
     if hold_sec >= _scratch_min_hold_sec() + 90 and stale_review_count >= min_reviews:
         return True, "stalled_no_progress_early_scratch"
+    return False, ""
+
+
+def _stall_before_max_hold(
+    *,
+    hold_sec: float,
+    hard: int,
+    max_fav: float,
+    executable_net_pct: float,
+    mom: MomentumDiagnostics,
+    recovery: float,
+    econ: ScalpEconomics,
+    stale_review_count: int,
+) -> tuple[bool, str]:
+    """Cut prolonged no-progress holds before the hard ceiling."""
+    if hold_sec >= hard:
+        return False, ""
+    stall_at = _stall_exit_min_sec(hard)
+    if hold_sec < stall_at:
+        return False, ""
+    target_progress = econ.net_profit_target_pct * _scratch_progress_frac()
+    if max_fav >= target_progress:
+        return False, ""
+    if _meaningful_recovery(recovery, max_fav, econ):
+        return False, ""
+    if not _scratchable_net(executable_net_pct, econ):
+        return False, ""
+    if not _momentum_stalled(mom):
+        return False, ""
+    if stale_review_count >= _scratch_min_reviews():
+        return True, "stall_before_max_hold_no_progress"
     return False, ""
 
 
@@ -269,13 +318,24 @@ def evaluate_exit(
         diag_base["scratch_target_progress_pct"] = target_progress
         diag_base["scratch_min_reviews"] = _scratch_min_reviews()
         diag_base["scratch_min_hold_sec"] = _scratch_min_hold_sec()
-        diag_base["scratch_momentum_weak"] = (
-            mom.bid_change_15s < 0 and mom.bid_change_30s < 0 and mom.mid_change_30s <= 0
-        )
-        diag_base["scratch_flat_or_slight_neg"] = (
-            _scratch_deep_loss_pct() < executable_net_pct <= _scratch_flat_upper_pct()
-        )
+        diag_base["scratch_momentum_stalled"] = _momentum_stalled(mom)
+        diag_base["scratch_flat_or_slight_neg"] = _scratchable_net(executable_net_pct, econ)
         return _sell(STATE_RECOVERY_HOLD, scratch_reason, EXIT_EARLY_SCRATCH)
+
+    stall, stall_reason = _stall_before_max_hold(
+        hold_sec=hold_sec,
+        hard=hard,
+        max_fav=max_fav,
+        executable_net_pct=executable_net_pct,
+        mom=mom,
+        recovery=recovery,
+        econ=econ,
+        stale_review_count=stale_review_count,
+    )
+    if stall:
+        diag_base["scratch_trigger_detail"] = stall_reason
+        diag_base["stall_exit_min_sec"] = _stall_exit_min_sec(hard)
+        return _sell(STATE_RECOVERY_HOLD, stall_reason, EXIT_EARLY_SCRATCH)
 
     if hold_sec >= hard:
         return _sell(STATE_MAX_HOLD_REVIEW, f"max_hold_hard_limit_{hard}s", EXIT_MAX_HOLD_HARD_LIMIT)
@@ -306,9 +366,21 @@ def evaluate_exit(
 
     spread_ok = snap.spread_pct <= cap and exit_spread_ok
     momentum_negative = mom.bid_change_15s < 0 and mom.bid_change_30s <= 0
+    momentum_stalled = _momentum_stalled(mom)
     momentum_rising = mom.bid_change_15s > 0 or mom.mid_change_15s > 0
     below_entry = executable_net_pct < 0
     meaningful_rec = _meaningful_recovery(recovery, max_fav, econ)
+    target_progress = econ.net_profit_target_pct * _scratch_progress_frac()
+
+    if (
+        stale_review_count >= _scratch_min_reviews()
+        and max_fav < target_progress
+        and _scratchable_net(executable_net_pct, econ)
+        and momentum_stalled
+        and not meaningful_rec
+    ):
+        diag_base["scratch_trigger_detail"] = "review_stall_no_progress"
+        return _sell(STATE_RECOVERY_HOLD, "review_stall_no_progress", EXIT_EARLY_SCRATCH)
 
     if not spread_ok and not (invalidated and momentum_negative and below_entry):
         return _hold(STATE_RECOVERY_HOLD, "spread_too_wide_for_exit_wait")
@@ -322,7 +394,7 @@ def evaluate_exit(
     if invalidated and below_entry and momentum_negative and not meaningful_rec:
         return _sell(EXIT_SETUP_INVALIDATED, inv_reason or "setup_invalidated", EXIT_SETUP_INVALIDATED)
 
-    if below_entry and momentum_negative and not hl and not meaningful_rec and stale_review_count >= 1:
+    if below_entry and momentum_stalled and not hl and not meaningful_rec and stale_review_count >= 1:
         return _sell(EXIT_MOMENTUM_FAILED, "no_recovery_negative_momentum", EXIT_MOMENTUM_FAILED)
 
     if not below_entry:
