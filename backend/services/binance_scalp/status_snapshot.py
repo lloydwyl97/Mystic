@@ -24,6 +24,11 @@ from backend.services.binance_scalp.redis_keys import scan_key, runner_state_key
 from backend.services.binance_scalp.scalp_control import is_entry_armed
 from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
 from backend.services.binance_scalp.strategies.kline_cache import KlineCache
+from backend.services.binance_scalp.scalp_candidate_ranking import (
+    _min_tradeable_score,
+    _min_confident_rank,
+    _rank_tie_margin,
+)
 from scripts.watch_scalp_entry_opportunity import (
     NEAR_PASS_THRESHOLD,
     _distance_to_pass,
@@ -413,6 +418,8 @@ def _evaluate_strategy_router(
             "ranked": ranked_for_sym,
         }
         per_symbol[sym] = sym_row
+        # Enrich with full diagnostics from the best ranked row (or meta)
+        best_row = best_ranked_row or {}
         ranked_entries.append(
             {
                 "symbol": sym,
@@ -423,6 +430,27 @@ def _evaluate_strategy_router(
                 "reject_reason": meta.get("hard_block") or meta.get("soft_reason"),
                 "entry_eligible": bool(meta.get("entry_eligible")),
                 "hard_block": meta.get("hard_block"),
+                # Additional ranking diagnostics (existing values; null if not applicable)
+                "soft_reason": meta.get("soft_reason"),
+                "base_score": best_row.get("base_score"),
+                "momentum_boost": best_row.get("momentum_boost"),
+                "reachability_multiplier": best_row.get("reachability_multiplier"),
+                "reachability_surplus_pct": meta.get("reachability_surplus"),
+                "expected_move_pct": best_row.get("expected_move_pct"),
+                "required_target_pct": best_row.get("required_target_pct"),
+                "target_gap_pct": best_row.get("target_gap_pct"),
+                "regime": meta.get("regime"),
+                "regime_native": (best_row.get("regime_native") if best_row else None),
+                "memory_delta": best_row.get("memory_delta"),
+                "recent_win_rate": best_row.get("recent_win_rate"),
+                "m15": best_row.get("m15"),
+                "m30": best_row.get("m30"),
+                "m60": best_row.get("m60"),
+                "impact_pct": None,  # available via depth check in router ctx if needed later
+                "tie_margin": _rank_tie_margin(),
+                "rank_floor": _min_tradeable_score(),
+                "min_confident_rank": _min_confident_rank(),
+                "final_below_floor_reason": (None if meta.get("entry_eligible") else (meta.get("hard_block") or meta.get("soft_reason") or "BELOW_MIN_SCORE")),
             }
         )
 

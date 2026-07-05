@@ -20,6 +20,41 @@ from backend.services.strategy_runtime_audit import get_ctx_fresh_max_age_sec
 logger = logging.getLogger(__name__)
 
 
+def _coerce_to_epoch(raw: Any) -> float | None:
+    """Robustly convert various timestamp representations to epoch seconds (float).
+
+    Supports:
+      - numeric epoch (seconds or milliseconds as int/float/str)
+      - ISO strings (with Z, +00:00, without tz)
+      - common key variants are tried by the caller
+    Returns None if unparsable.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    # numeric epoch (or ms)
+    try:
+        f = float(s)
+        if f > 1e11:  # milliseconds
+            return f / 1000.0
+        if f > 0:
+            return f
+    except (ValueError, TypeError):
+        pass
+    # ISO family
+    for candidate in (s, s.replace("Z", "+00:00")):
+        try:
+            dt = datetime.fromisoformat(candidate)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).timestamp()
+        except Exception:
+            continue
+    return None
+
+
 def entry_context_gate_enabled() -> bool:
     return os.getenv("ENTRY_CONTEXT_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
@@ -89,17 +124,59 @@ def evaluate_signal_hash_for_entry(dd: dict[str, str]) -> tuple[bool, str | None
         detail["content_age_sec"] = dd.get("content_age_sec")
         return False, "SIGNAL_CONTENT_NOT_FRESH", detail
 
-    try:
-        sig_ts = float(dd.get("timestamp") or "")
-        if sig_ts > 0:
-            sig_age = time.time() - sig_ts
-            detail["signal_content_age_sec"] = sig_age
-            detail["max_signal_age_sec"] = MAX_SIGNAL_AGE_SEC
-            if sig_age > float(MAX_SIGNAL_AGE_SEC):
-                return False, "SIGNAL_CONTENT_AGE_EXCEEDED", detail
-    except (TypeError, ValueError):
-        detail["timestamp_raw"] = dd.get("timestamp")
-        return False, "SIGNAL_CONTENT_TIMESTAMP_PARSE", detail
+    # Robust signal content timestamp parsing (multiple keys + formats).
+    # We try common keys that producers actually emit.
+    ts_raw = None
+    for k in (
+        "signal_content_timestamp",
+        "timestamp",
+        "ts",
+        "ts_utc",
+        "content_timestamp",
+        "signal_ts",
+        "generated_at",
+        "created_at",
+        "asof",
+    ):
+        val = dd.get(k)
+        if val is not None and str(val).strip() != "":
+            ts_raw = val
+            break
+
+    parsed_ts = _coerce_to_epoch(ts_raw) if ts_raw is not None else None
+
+    if parsed_ts is not None and parsed_ts > 0:
+        sig_age = time.time() - parsed_ts
+        detail["signal_content_age_sec"] = sig_age
+        detail["max_signal_age_sec"] = MAX_SIGNAL_AGE_SEC
+        if sig_age > float(MAX_SIGNAL_AGE_SEC):
+            return False, "SIGNAL_CONTENT_AGE_EXCEEDED", detail
+    else:
+        # Fallback: if no usable absolute ts, but a direct age field is present and valid, use it.
+        age_val = None
+        for k in ("signal_content_age_sec", "content_age_sec", "signal_age_sec", "age_sec"):
+            v = dd.get(k)
+            if v is not None and str(v).strip() != "":
+                age_val = v
+                break
+        if age_val is not None:
+            try:
+                age = float(age_val)
+                detail["signal_content_age_sec"] = age
+                if age > float(MAX_SIGNAL_AGE_SEC):
+                    return False, "SIGNAL_CONTENT_AGE_EXCEEDED", detail
+                # age present and within limit → treat as usable, do not fail the timestamp gate
+            except (TypeError, ValueError):
+                # fall through to missing/parse decision
+                pass
+
+        # Distinguish missing vs unparsable
+        if ts_raw is None or str(ts_raw).strip() == "":
+            detail["timestamp_raw"] = None
+            return False, "SIGNAL_CONTENT_TIMESTAMP_MISSING", detail
+        else:
+            detail["timestamp_raw"] = ts_raw
+            return False, "SIGNAL_CONTENT_TIMESTAMP_PARSE", detail
 
     cf = (dd.get("context_fresh") or "").strip()
     if cf != "1":

@@ -125,6 +125,11 @@ class RankedCandidate:
     soft_reason: str | None = None
     reachability_surplus: float = 0.0
     selection_confidence: str = "normal"
+    # Diagnostics (computed during scoring; may be None for hard-blocked or passed cases)
+    base_score: float | None = None
+    momentum_boost: float | None = None
+    reachability_multiplier: float | None = None
+    target_gap_pct: float | None = None
 
 
 def rank_setup_signal(
@@ -163,6 +168,10 @@ def rank_setup_signal(
     regime_mult = _regime_mismatch_mult(sig.setup_name, regime)
     native = regime in STRATEGY_NATIVE_REGIMES.get(sig.setup_name, frozenset())
     confidence = "normal"
+    base_score: float | None = None
+    mom_boost: float | None = None
+    reach_mult_val: float | None = None
+    target_gap_val: float | None = None
 
     if sig.passed:
         rank_score = float(sig.score) * regime_mult
@@ -191,23 +200,26 @@ def rank_setup_signal(
                 soft_reason=reason,
                 selection_confidence="blocked",
             )
-        base = _soft_base_score(reason)
+        base_score = _soft_base_score(reason)
         mom_boost = _soft_momentum_boost(ctx)
-        rank_score = (base + mom_boost) * regime_mult
+        rank_score = (base_score + mom_boost) * regime_mult
         hard_block = None
 
     expected = float(sig.expected_move_pct or 0.0)
     reach_surplus = 0.0
+    reach_mult_val = 1.0
+    target_gap_val = 0.0
     if expected > 0:
-        reach_mult, reach_surplus = _reachability_soft_mult(
+        reach_mult_val, reach_surplus = _reachability_soft_mult(
             ctx.econ,
             spread_pct=ctx.snap.spread_pct,
             impact_pct=impact,
             expected_move_pct=expected,
             soft_entry=not sig.passed,
         )
-        rank_score *= reach_mult
-        reachable = reach_mult > 0.5 and reach_surplus >= float(ctx.econ.min_projected_surplus_pct)
+        rank_score *= reach_mult_val
+        target_gap_val = reach_surplus
+        reachable = reach_mult_val > 0.5 and reach_surplus >= float(ctx.econ.min_projected_surplus_pct)
         if not reachable and not sig.passed:
             return RankedCandidate(
                 signal=sig,
@@ -219,6 +231,10 @@ def rank_setup_signal(
                 soft_reason=sig.reject_reason or "TARGET_NOT_REACHABLE",
                 reachability_surplus=reach_surplus,
                 selection_confidence="low_reachability",
+                base_score=base_score,
+                momentum_boost=mom_boost,
+                reachability_multiplier=reach_mult_val,
+                target_gap_pct=target_gap_val,
             )
 
     min_score = _min_tradeable_score()
@@ -236,6 +252,10 @@ def rank_setup_signal(
         soft_reason=None if sig.passed else sig.reject_reason,
         reachability_surplus=reach_surplus,
         selection_confidence=confidence,
+        base_score=base_score,
+        momentum_boost=mom_boost,
+        reachability_multiplier=reach_mult_val,
+        target_gap_pct=target_gap_val if target_gap_val is not None else reach_surplus,
     )
 
 

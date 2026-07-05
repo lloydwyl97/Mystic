@@ -125,6 +125,19 @@ class ScalpStrategyRouter:
                 "regime_native": r.regime_native,
                 "reachability_surplus": r.reachability_surplus,
                 "selection_confidence": r.selection_confidence,
+                # Diagnostics (existing values computed in rank_setup_signal)
+                "base_score": getattr(r, "base_score", None),
+                "momentum_boost": getattr(r, "momentum_boost", None),
+                "reachability_multiplier": getattr(r, "reachability_multiplier", None),
+                "expected_move_pct": getattr(r.signal, "expected_move_pct", None),
+                "required_target_pct": getattr(r.signal, "required_target_pct", None),
+                "target_gap_pct": getattr(r, "target_gap_pct", None),
+                "regime": regime,
+                "memory_delta": None,  # filled by enrichment in evaluate_all for global pick
+                "recent_win_rate": None,
+                "m15": None,
+                "m30": None,
+                "m60": None,
             }
             for r in ranked_list
         ]
