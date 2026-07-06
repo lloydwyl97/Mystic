@@ -9789,6 +9789,8 @@ class PortfolioEngine:
                         entry_thesis=str(getattr(position, "entry_thesis", "") or ""),
                         quantity=float(position.quantity or 0.0),
                         entry_fee=float(getattr(position, "entry_fee", 0.0) or 0.0),
+                        thesis_score=float(getattr(position, "thesis_score", 0.0) or 0.0),
+                        entry_vwap=float(getattr(position, "entry_vwap", 0.0) or 0.0),
                     )
             except Exception:
                 logger.debug("learning heartbeat skipped for %s", symbol, exc_info=True)

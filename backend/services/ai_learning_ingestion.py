@@ -34,7 +34,11 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_PROFIT_TO_SELL
+from backend.config.trading_economics import (
+    ESTIMATED_ROUNDTRIP_COST,
+    MIN_NET_PROFIT_TO_SELL,
+    TAKER_FEE,
+)
 from backend.database_schema import DATABASE_PATH
 
 logger = logging.getLogger(__name__)
@@ -216,6 +220,62 @@ def record_candidate_snapshot(
 # =========================================================================
 
 
+def _compute_mark_sell_net_usd(
+    *,
+    entry_price: float,
+    mark: float,
+    quantity: float,
+    entry_fee: float = 0.0,
+    sell_fee_rate: float | None = None,
+) -> float:
+    """Dollar net if sold at mark (entry cost basis + sell-side fee)."""
+    if entry_price <= 0 or mark <= 0 or quantity <= 0:
+        return 0.0
+    rate = float(TAKER_FEE if sell_fee_rate is None else sell_fee_rate)
+    entry_cost = (quantity * entry_price) + float(entry_fee or 0.0)
+    sell_fee = quantity * mark * rate
+    proceeds = (quantity * mark) - sell_fee
+    return proceeds - entry_cost
+
+
+def _resolve_thesis_valid(
+    *,
+    thesis_valid: bool | None,
+    entry_thesis: str,
+    thesis_score: float,
+    thesis_invalid_level: float,
+    thesis_target_level: float,
+    entry_vwap: float,
+    entry_price: float,
+    mark: float,
+) -> bool | None:
+    if thesis_valid is not None:
+        return thesis_valid
+    from backend.services.day_trade_thesis import EXIT_THESIS_WARNING, evaluate_thesis_exit
+
+    thesis_eval = evaluate_thesis_exit(
+        entry_thesis=entry_thesis,
+        thesis_score=float(thesis_score or 0.0),
+        thesis_invalid_level=float(thesis_invalid_level or 0.0),
+        thesis_target_level=float(thesis_target_level or 0.0),
+        entry_vwap=float(entry_vwap or 0.0),
+        entry_price=entry_price,
+        mark=mark,
+        bundle=None,
+    )
+    action = str(thesis_eval.get("action") or "")
+    reason = str(thesis_eval.get("reason") or "")
+    if action == "default" and reason == "no_thesis":
+        return None
+    if action == "warn" or reason.startswith(EXIT_THESIS_WARNING):
+        return False
+    if thesis_invalid_level > 0 and entry_price > 0:
+        return mark >= thesis_invalid_level
+    if action in ("hold", "sell"):
+        return True
+    return None
+
+
 def record_position_heartbeat(
     *,
     symbol: str,
@@ -229,6 +289,8 @@ def record_position_heartbeat(
     quantity: float = 0.0,
     entry_fee: float = 0.0,
     thesis_valid: bool | None = None,
+    thesis_score: float = 0.0,
+    entry_vwap: float = 0.0,
     db_path: str = DATABASE_PATH,
 ) -> None:
     """Persist one open-position learning heartbeat (sync)."""
@@ -253,9 +315,22 @@ def record_position_heartbeat(
             dist_target = ((thesis_target_level - mark) / mark) if thesis_target_level > 0 else None
             dist_invalid = ((mark - thesis_invalid_level) / mark) if thesis_invalid_level > 0 else None
             exit_allowed = net_unrealized >= float(MIN_NET_PROFIT_TO_SELL)
-            would_sell_net_usd = (mark * quantity) * net_unrealized - float(entry_fee or 0.0)
-            if thesis_valid is None and thesis_invalid_level > 0:
-                thesis_valid = mark >= thesis_invalid_level
+            would_sell_net_usd = _compute_mark_sell_net_usd(
+                entry_price=entry_price,
+                mark=mark,
+                quantity=quantity,
+                entry_fee=entry_fee,
+            )
+            thesis_valid = _resolve_thesis_valid(
+                thesis_valid=thesis_valid,
+                entry_thesis=entry_thesis,
+                thesis_score=thesis_score,
+                thesis_invalid_level=thesis_invalid_level,
+                thesis_target_level=thesis_target_level,
+                entry_vwap=entry_vwap,
+                entry_price=entry_price,
+                mark=mark,
+            )
             conn.execute(
                 """
                 INSERT INTO ai_position_heartbeats (
