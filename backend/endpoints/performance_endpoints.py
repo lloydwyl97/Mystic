@@ -12,7 +12,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 
 from backend.services.performance_analytics_service import (
@@ -22,6 +22,18 @@ from backend.services.performance_analytics_service import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/performance", tags=["performance"])
+
+_HISTORICAL_DIAGNOSTIC_SCOPE = "historical_diagnostic"
+
+# Exit types excluded from operator performance counts (admin/research/reconcile noise).
+_EXCLUDED_EXIT_TYPES = (
+    "ADMIN_POSITION_CLEAR",
+    "STALE_PRE_CORRECTION_POSITION_CLEAR",
+    "STALE_LIVE_GHOST_POSITION_CLEAR",
+    "RESEARCH_RESET_EXIT",
+    "legacy_no_clear_position_clear",
+    "EXCHANGE_RECONCILE_CLOSE",
+)
 
 # ---------- Service Resolver ----------
 
@@ -90,6 +102,194 @@ def _get_field(item: Any, field: str) -> Any:
 def _row_ts(row: Any) -> Any:
     """Portfolio rows may use ``date`` or ``timestamp`` depending on source."""
     return _get_field(row, "timestamp") or _get_field(row, "date")
+
+
+def _historical_scope_blocked(scope: str) -> Response | None:
+    """Live operator dashboard must not pull all-time chart data unless explicitly requested."""
+    if scope != _HISTORICAL_DIAGNOSTIC_SCOPE:
+        return Response(status_code=204)
+    return None
+
+
+def _load_ledger_row() -> dict[str, Any] | None:
+    import sqlite3
+
+    from backend.database_schema import DATABASE_PATH
+
+    conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT principal, cash_balance, positions_value, realized_pnl, unrealized_pnl,
+                   total_equity, last_updated, startup_timestamp
+            FROM portfolio_engine_ledger WHERE id=1
+            """
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "principal": float(row[0] or 0),
+            "cash_balance": float(row[1] or 0),
+            "positions_value": float(row[2] or 0),
+            "realized_pnl": float(row[3] or 0),
+            "unrealized_pnl": float(row[4] or 0),
+            "total_equity": float(row[5] or 0),
+            "last_updated": row[6],
+            "startup_timestamp": row[7],
+        }
+    finally:
+        conn.close()
+
+
+def _today_utc_start() -> datetime:
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _today_day_trade_stats() -> dict[str, Any]:
+    import sqlite3
+
+    from backend.database_schema import DATABASE_PATH
+
+    today_start = _today_utc_start()
+    placeholders = ",".join("?" for _ in _EXCLUDED_EXIT_TYPES)
+    conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT pnl FROM paper_trades
+            WHERE side='SELL' AND timestamp >= ?
+              AND (exit_type IS NULL OR exit_type NOT IN ({placeholders}))
+            """,
+            (today_start.isoformat(), *_EXCLUDED_EXIT_TYPES),
+        )
+        pnls = [float(r[0]) for r in cur.fetchall() if r[0] is not None]
+    finally:
+        conn.close()
+    sells = len(pnls)
+    wins = sum(1 for p in pnls if p > 0)
+    win_rate = (wins / sells * 100.0) if sells else 0.0
+    return {
+        "today_start": today_start.isoformat(),
+        "today_closed_sells": sells,
+        "today_win_rate_pct": round(win_rate, 1),
+    }
+
+
+def _performance_display_context() -> dict[str, Any]:
+    """Current ledger + today (UTC) DAY stats only — no all-time figures."""
+    ledger = _load_ledger_row()
+    today = _today_day_trade_stats()
+    if not ledger:
+        return {
+            "success": True,
+            "data": {
+                "ledger_principal": 25000.0,
+                "total_equity": 0.0,
+                "cash_balance": 0.0,
+                "positions_value": 0.0,
+                "account_return_usd": -25000.0,
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "last_updated": None,
+                "today_start": today["today_start"],
+                "today_closed_sells": today["today_closed_sells"],
+                "today_win_rate_pct": today["today_win_rate_pct"],
+                "current_run_available": False,
+                "current_run_start": None,
+                "current_run_note": (
+                    "Current-run trade metrics unavailable — no explicit run start marker recorded."
+                ),
+                "scope": "current",
+                "note": (
+                    "Current ledger state + today (UTC calendar day) only. "
+                    "No all-time/lifetime data. SCALP excluded."
+                ),
+            },
+        }
+    principal = float(ledger.get("principal") or 25000.0)
+    equity = float(ledger.get("total_equity") or 0)
+    startup_ts = ledger.get("startup_timestamp")
+    current_run_available = bool(startup_ts)
+    return {
+        "success": True,
+        "data": {
+            "ledger_principal": round(principal, 2),
+            "total_equity": round(equity, 2),
+            "cash_balance": round(float(ledger.get("cash_balance") or 0), 2),
+            "positions_value": round(float(ledger.get("positions_value") or 0), 2),
+            "account_return_usd": round(equity - principal, 2),
+            "realized_pnl": round(float(ledger.get("realized_pnl") or 0), 2),
+            "unrealized_pnl": round(float(ledger.get("unrealized_pnl") or 0), 2),
+            "last_updated": ledger.get("last_updated"),
+            "today_start": today["today_start"],
+            "today_closed_sells": today["today_closed_sells"],
+            "today_win_rate_pct": today["today_win_rate_pct"],
+            "current_run_available": current_run_available,
+            "current_run_start": startup_ts,
+            "current_run_note": (
+                "Current-run trade metrics unavailable — no explicit run start marker recorded."
+                if not current_run_available
+                else None
+            ),
+            "scope": "current",
+            "note": (
+                "Current ledger state + today (UTC calendar day) only. "
+                "No all-time/lifetime data in this object. SCALP excluded. "
+                "Admin/research exits excluded from today trade-stat counts."
+            ),
+        },
+    }
+
+
+def _historical_diagnostic_context() -> dict[str, Any]:
+    """Extends current context with all-time trade stats for collapsed diagnostics only."""
+    import sqlite3
+
+    from backend.database_schema import DATABASE_PATH
+
+    base = _performance_display_context()
+    data = dict(base.get("data") or {})
+    placeholders = ",".join("?" for _ in _EXCLUDED_EXIT_TYPES)
+    conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT pnl FROM paper_trades
+            WHERE side='SELL'
+              AND (exit_type IS NULL OR exit_type NOT IN ({placeholders}))
+            """,
+            _EXCLUDED_EXIT_TYPES,
+        )
+        pnls = [float(r[0]) for r in cur.fetchall() if r[0] is not None]
+    finally:
+        conn.close()
+    all_sells = len(pnls)
+    all_wins = sum(1 for p in pnls if p > 0)
+    all_win_rate = (all_wins / all_sells * 100.0) if all_sells else 0.0
+    data.update(
+        {
+            "scope": _HISTORICAL_DIAGNOSTIC_SCOPE,
+            "all_time_closed_sells": all_sells,
+            "all_time_win_rate_pct": round(all_win_rate, 1),
+            "note": "HISTORICAL DIAGNOSTIC ONLY — not current operator performance.",
+        }
+    )
+    return {"success": True, "data": data}
+
+
+@router.get("/display-context")
+async def performance_display_context(
+    scope: str = Query("current"),
+) -> Any:
+    """Fast current-account source: ledger snapshot + today UTC DAY stats."""
+    if scope == _HISTORICAL_DIAGNOSTIC_SCOPE:
+        return _historical_diagnostic_context()
+    return _performance_display_context()
 
 
 # ---------- Endpoints (200 / 204 / 503 policy) ----------
@@ -265,14 +465,19 @@ def _append_live_equity_point(series: list[dict[str, Any]]) -> list[dict[str, An
 
 
 @router.get("/portfolio-value")
-async def portfolio_value() -> Any:
+async def portfolio_value(scope: str = Query("current")) -> Any:
     """
     Return portfolio value time series from portfolio_snapshots (5-min intervals, 30-day retention).
     Falls back to single current ledger point when no snapshots exist yet.
 
     CANONICAL SOURCE: portfolio_snapshots + portfolio_engine_ledger
     Formula: total_equity = cash_balance + positions_value
+
+    Requires scope=historical_diagnostic for live dashboard chart use.
     """
+    blocked = _historical_scope_blocked(scope)
+    if blocked is not None:
+        return blocked
     try:
         import sqlite3
         from datetime import datetime, timezone
@@ -341,12 +546,17 @@ async def portfolio_value() -> Any:
 
 
 @router.get("/daily-returns")
-async def daily_returns() -> Any:
+async def daily_returns(scope: str = Query("current")) -> Any:
     """
     Return daily returns data for portfolio performance.
     - Always returns meaningful data (baseline for empty portfolios)
     - Never returns 204 or 503 errors
+
+    Requires scope=historical_diagnostic for live dashboard chart use.
     """
+    blocked = _historical_scope_blocked(scope)
+    if blocked is not None:
+        return blocked
     try:
         svc = _get_svc()
         data = await _maybe_await(svc.get_performance_summary)
@@ -426,7 +636,11 @@ async def drawdown_series() -> Any:
 
 
 @router.get("/cumulative-returns")
-async def cumulative_returns() -> Any:
+async def cumulative_returns(scope: str = Query("current")) -> Any:
+    """Requires scope=historical_diagnostic for live dashboard chart use."""
+    blocked = _historical_scope_blocked(scope)
+    if blocked is not None:
+        return blocked
     """
     Cumulative % returns vs first point in portfolio_value.
     - 204 if insufficient data
@@ -526,7 +740,11 @@ async def rolling_sharpe() -> Any:
 
 
 @router.get("/trade-pnl")
-async def trade_pnl_hist() -> Any:
+async def trade_pnl_hist(scope: str = Query("current")) -> Any:
+    """Requires scope=historical_diagnostic for live dashboard chart use."""
+    blocked = _historical_scope_blocked(scope)
+    if blocked is not None:
+        return blocked
     """
     Histogram input array of per-trade PnL values.
     - 204 if no trades
@@ -590,7 +808,11 @@ async def trade_pnl_hist() -> Any:
 
 
 @router.get("/trade-duration")
-async def trade_duration_hist() -> Any:
+async def trade_duration_hist(scope: str = Query("current")) -> Any:
+    """Requires scope=historical_diagnostic for live dashboard chart use."""
+    blocked = _historical_scope_blocked(scope)
+    if blocked is not None:
+        return blocked
     """
     Histogram input array of per-trade durations (minutes).
     - 204 if no trades
@@ -652,7 +874,11 @@ async def trade_duration_hist() -> Any:
 
 
 @router.get("/strategy-performance")
-async def strategy_performance() -> Any:
+async def strategy_performance(scope: str = Query("current")) -> Any:
+    """Requires scope=historical_diagnostic for live dashboard chart use."""
+    blocked = _historical_scope_blocked(scope)
+    if blocked is not None:
+        return blocked
     """
     Map strategy totals to {name, data:[{timestamp,value}]} for multi-line charts.
     - 204 if empty

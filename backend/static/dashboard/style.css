@@ -563,6 +563,33 @@ body {
     margin-bottom: 4px;
 }
 
+.widget__title--row {
+    grid-column: 1 / -1;
+    margin-bottom: 0;
+}
+
+.widget__subtitle--row {
+    grid-column: 1 / -1;
+    margin: -4px 0 4px 0;
+    font-size: 0.72rem;
+}
+
+.widget__subtitle--row.source-fresh { color: var(--green); }
+.widget__subtitle--row.source-stale { color: #f0b429; }
+.widget__subtitle--row.source-failed { color: var(--red); }
+
+#hist-diag-panel > summary {
+    cursor: pointer;
+    font-weight: 600;
+    padding: 8px 0;
+}
+
+#hist-diag-panel[open] {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--padding);
+}
+
 .mini-card {
     background: linear-gradient(135deg, rgba(26, 31, 38, 1) 0%, rgba(22, 27, 34, 1) 100%);
     border: 1px solid var(--border);

@@ -1,5 +1,5 @@
 // Mystic Operator Console — dual-engine DAY + SCALP dashboard
-const DASHBOARD_VERSION = 46;
+const DASHBOARD_VERSION = 50;
 const REFRESH_MS = 90000;
 const CANONICAL_REFRESH_MS = 30000;
 const SECONDARY_POLL_MS = 3000;
@@ -17,14 +17,7 @@ const LAZY_TAB_ENDPOINTS = {
         { path: "/api/ai-diagnostics/full", key: "aiDiagnosticsFull", timeoutMs: SLOW_ENDPOINT_TIMEOUT_MS },
         { path: "/api/ai-diagnostics/learning-health", key: "learningHealth" },
     ],
-    performance: [
-        { path: "/api/performance/portfolio-value", key: "portfolioValue" },
-        { path: "/api/performance/trade-pnl", key: "tradePnl" },
-        { path: "/api/performance/daily-returns", key: "dailyReturns" },
-        { path: "/api/performance/cumulative-returns", key: "cumulativeReturns" },
-        { path: "/api/performance/trade-duration", key: "tradeDuration" },
-        { path: "/api/performance/strategy-performance", key: "strategyPerformance" },
-    ],
+    performance: [],
     day: [
         { path: "/api/portfolio-engine/day-health", key: "dayHealth" },
         { path: "/api/portfolio-engine/decisions", key: "decisions" },
@@ -44,6 +37,7 @@ const LAZY_TAB_ENDPOINTS = {
     ],
 };
 const BACKGROUND_ENDPOINTS = [
+    { path: "/api/performance/display-context", key: "perfDisplayContext" },
     { path: "/api/system/health/quick", key: "systemHealth" },
     { path: "/api/system/process-health", key: "processHealth" },
     { path: "/api/portfolio-engine/latency", key: "latency" },
@@ -68,18 +62,9 @@ window._lastScalpPositions = null;
 window._lastScalpTrades = null;
 
 const CANONICAL_STALE_WIDGET_IDS = [
-    "analytics-trades",
-    "analytics-winrate",
-    "analytics-realized",
-    "analytics-unrealized",
-    "analytics-pnl",
-    "analytics-scoreboard",
     "analytics-risk-status",
     "analytics-invariants",
     "analytics-xcheck",
-    "status-cash",
-    "status-equity",
-    "status-positions",
     "status-health",
 ];
 
@@ -174,6 +159,30 @@ function init() {
     initOperatorControls();
     initRefreshButton();
     initTradeFilters();
+    setupHistoricalDiagnosticsToggle();
+}
+
+const ENDPOINT_FRESHNESS = {};
+
+function recordEndpointFreshness(key, ok, payloadTs) {
+    ENDPOINT_FRESHNESS[key] = {
+        ok: !!ok,
+        at: Date.now(),
+        payloadTs: payloadTs || null,
+    };
+}
+
+function getDisplayContextFreshness() {
+    const st = ENDPOINT_FRESHNESS.perfDisplayContext;
+    if (!st) return "Loading";
+    if (!st.ok) return "Failed";
+    const age = Date.now() - st.at;
+    if (age > REFRESH_MS * 2) return "Stale";
+    return "Fresh";
+}
+
+function todayUtcDateStr() {
+    return new Date().toISOString().slice(0, 10);
 }
 
 function markDashboardLoading(loading) {
@@ -650,15 +659,12 @@ function startPolling() {
 
     async function bootstrap() {
         markDashboardLoading(true);
+        await pollOne({ path: "/api/performance/display-context", key: "perfDisplayContext" });
         await pollOne(CANONICAL_ENDPOINT);
         bootstrapDone = true;
         pollOne({ path: "/api/system/health/quick", key: "systemHealth" });
         pollOne({ path: "/api/system/process-health", key: "processHealth" });
         pollOne(LAZY_TAB_ENDPOINTS.scalp[0]);
-        setTimeout(function () {
-            pollOne({ path: "/api/performance/portfolio-value", key: "portfolioValue" });
-            pollOne({ path: "/api/performance/trade-pnl", key: "tradePnl" });
-        }, 8000);
     }
     bootstrap();
 
@@ -679,6 +685,10 @@ let lastUpdateTime = null;
 async function pollOne(ep) {
     const result = await fetchEndpoint(ep.path, ep.timeoutMs);
     if (!result.ok) {
+        if (ep.key === "perfDisplayContext") {
+            recordEndpointFreshness("perfDisplayContext", false);
+            updateCurrentAccountSourceLabel(window._perfDisplayContext);
+        }
         if (ep.key === "dashboardCanonical") {
             if (window._lastDashboardCanonical) {
                 return;
@@ -692,6 +702,10 @@ async function pollOne(ep) {
     if (ep.key === "dashboardCanonical") {
         window._lastDashboardCanonical = data;
     }
+    if (ep.key === "perfDisplayContext") {
+        const ctx = (data.data && data.data.ledger_principal != null) ? data.data : data;
+        recordEndpointFreshness("perfDisplayContext", true, ctx && ctx.last_updated);
+    }
     lastUpdateTime = new Date();
     try {
         updateUI(ep.key, typeof data === "object" ? data : {});
@@ -703,6 +717,7 @@ async function pollOne(ep) {
 function updateHeaderMeta() {
     const meta = document.getElementById("header-meta");
     if (meta) meta.textContent = "Last update: " + (lastUpdateTime ? lastUpdateTime.toLocaleTimeString() : "--");
+    updateCurrentAccountSourceLabel(window._perfDisplayContext);
 }
 
 function updateUI(key, data) {
@@ -745,6 +760,9 @@ function updateUI(key, data) {
             break;
         case "strategyPerformance":
             updateStrategyPerformanceChart(data);
+            break;
+        case "perfDisplayContext":
+            capturePerfDisplayContext(data);
             break;
         case "rejects":
             updateRejects(data);
@@ -1463,8 +1481,10 @@ function markCanonicalSnapshotStale(reason) {
     CANONICAL_STALE_WIDGET_IDS.forEach(function (id) {
         const el = document.getElementById(id);
         if (!el) return;
-        el.textContent = "--";
-        el.title = reason || "Snapshot unavailable — showing stale data cleared";
+        el.title = (reason || "Canonical snapshot stale") + " — supplemental widget only";
+        if (!el.dataset.lastGood) {
+            el.textContent = "Unavailable";
+        }
         el.classList.remove("pnl-pos", "pnl-neg");
     });
 }
@@ -1602,6 +1622,7 @@ function updateRiskMetrics(data) {
     if (statusEl) {
         const s = d.account_status || "";
         statusEl.textContent = s || "--";
+        if (s) statusEl.dataset.lastGood = s;
         statusEl.classList.remove("pnl-pos", "pnl-neg");
         if (s && s.toUpperCase() === "HEALTHY") statusEl.classList.add("pnl-pos");
         else if (s && (s.toUpperCase().includes("OVERALLOCATED") || s.toUpperCase().includes("DELEVERAGING"))) statusEl.classList.add("pnl-neg");
@@ -2014,21 +2035,39 @@ function updateLearningStatus(data) {
 function updateScoreboard7d(data) {
     const d = data.data || data;
     const el = document.getElementById("panel-scoreboard7d-content");
-    if (!el) return;
-    if (!d || typeof d !== "object") {
-        el.textContent = "No scoreboard data.";
-        return;
+    if (el) {
+        if (!d || typeof d !== "object") {
+            el.textContent = "No scoreboard data.";
+        } else {
+            const agg = d.aggregate || d;
+            const lines = [
+                "period_days: " + (d.period_days != null ? d.period_days : "7"),
+                "total_trades: " + (agg.total_trades != null ? agg.total_trades : "--"),
+                "overall_win_rate: " + (agg.overall_win_rate != null ? (agg.overall_win_rate * 100).toFixed(1) + "%" : "--"),
+                "avg_expectancy_r: " + (agg.avg_expectancy_r != null ? agg.avg_expectancy_r.toFixed(3) : "--"),
+                "max_drawdown_pct: " + (agg.max_drawdown_pct != null ? agg.max_drawdown_pct.toFixed(2) + "%" : "--"),
+                "overall_status: " + (agg.overall_status || d.overall_status || "--"),
+            ];
+            el.textContent = lines.join("\n");
+        }
     }
-    const agg = d.aggregate || d;
-    const lines = [
-        "period_days: " + (d.period_days != null ? d.period_days : "7"),
-        "total_trades: " + (agg.total_trades != null ? agg.total_trades : "--"),
-        "overall_win_rate: " + (agg.overall_win_rate != null ? (agg.overall_win_rate * 100).toFixed(1) + "%" : "--"),
-        "avg_expectancy_r: " + (agg.avg_expectancy_r != null ? agg.avg_expectancy_r.toFixed(3) : "--"),
-        "max_drawdown_pct: " + (agg.max_drawdown_pct != null ? agg.max_drawdown_pct.toFixed(2) + "%" : "--"),
-        "overall_status: " + (agg.overall_status || d.overall_status || "--"),
-    ];
-    el.textContent = lines.join("\n");
+    const scoreEl = document.getElementById("analytics-scoreboard");
+    if (scoreEl) {
+        const records = (d && d.daily_records) || [];
+        const todayRow = records.find(function (r) {
+            return r.day === todayUtcDateStr() || r.date === todayUtcDateStr();
+        });
+        if (todayRow) {
+            const wr = todayRow.win_rate != null ? (Number(todayRow.win_rate) * 100).toFixed(1) + "%" : "--";
+            const pnl = todayRow.total_pnl != null ? Number(todayRow.total_pnl) : (todayRow.realized_pnl != null ? Number(todayRow.realized_pnl) : null);
+            const pnlStr = pnl != null ? ((pnl >= 0 ? "+" : "") + "$" + pnl.toFixed(2)) : "--";
+            scoreEl.textContent = (todayRow.trades || 0) + " sells · " + wr + " · " + pnlStr + " · " + (todayRow.pass_fail || "--");
+            scoreEl.dataset.lastGood = scoreEl.textContent;
+            scoreEl.title = "DAY scoreboard today (UTC), via scoreboard?days=7 — not canonical-dependent.";
+        } else if (!scoreEl.dataset.lastGood) {
+            scoreEl.textContent = "0 sells today";
+        }
+    }
 }
 
 // regime: canonical or /regime — { regime, confidence, effective_risk_multiplier, guards_active }
@@ -2157,9 +2196,143 @@ function updatePositions(data) {
     });
 }
 
-// portfolio-engine/performance: canonical P&L for monitoring (realized, unrealized, trades)
+function capturePerfDisplayContext(data) {
+    const ctx = (data && data.ledger_principal != null) ? data
+        : (data && data.data && data.data.ledger_principal != null ? data.data : null);
+    if (ctx && typeof ctx === "object" && ctx.ledger_principal != null) {
+        window._perfDisplayContext = ctx;
+        applyPerfDisplayContext(ctx);
+    }
+}
+
+function applyPerfDisplayContext(ctx) {
+    if (!ctx || typeof ctx !== "object") return;
+    const banner = document.getElementById("perf-context-banner");
+    if (banner) {
+        banner.textContent =
+            "DAY · Current · Principal $" + Number(ctx.ledger_principal || 0).toFixed(0) +
+            " · Equity $" + Number(ctx.total_equity || 0).toFixed(2) +
+            " · Today UTC " + (ctx.today_start ? String(ctx.today_start).slice(0, 10) : "") +
+            " · SCALP excluded";
+    }
+    function setMetric(id, text, title) {
+        const el = document.getElementById(id);
+        if (!el || text == null) return;
+        el.textContent = text;
+        el.dataset.lastGood = text;
+        if (title) el.title = title;
+    }
+    setMetric("analytics-principal", "$" + Number(ctx.ledger_principal).toFixed(0), "Ledger principal via display-context");
+    setMetric("analytics-equity", "$" + Number(ctx.total_equity).toFixed(2), "Ledger total equity via display-context");
+    setMetric("analytics-cash", "$" + Number(ctx.cash_balance).toFixed(2), "Ledger cash via display-context");
+    setMetric("status-cash", "$" + Number(ctx.cash_balance).toFixed(2), "DAY cash via display-context");
+    setMetric("status-equity", "$" + Number(ctx.total_equity).toFixed(2), "DAY equity via display-context");
+    setMetric("analytics-trades", String(ctx.today_closed_sells), "Closed SELLs today (UTC) via display-context");
+    setMetric("analytics-winrate", Number(ctx.today_win_rate_pct).toFixed(1) + "%", "Win rate today (UTC) via display-context");
+    const ret = Number(ctx.account_return_usd);
+    const pnlEl = document.getElementById("analytics-pnl");
+    if (pnlEl && ctx.account_return_usd != null) {
+        pnlEl.textContent = (ret >= 0 ? "+" : "") + "$" + ret.toFixed(2);
+        pnlEl.dataset.lastGood = pnlEl.textContent;
+        pnlEl.classList.remove("pnl-pos", "pnl-neg");
+        pnlEl.classList.add(ret >= 0 ? "pnl-pos" : "pnl-neg");
+    }
+    const realizedEl = document.getElementById("analytics-realized");
+    if (realizedEl && ctx.realized_pnl != null) {
+        const r = Number(ctx.realized_pnl);
+        realizedEl.textContent = "$" + r.toFixed(2);
+        realizedEl.dataset.lastGood = realizedEl.textContent;
+        realizedEl.classList.remove("pnl-pos", "pnl-neg");
+        realizedEl.classList.add(r >= 0 ? "pnl-pos" : "pnl-neg");
+    }
+    const unrealizedEl = document.getElementById("analytics-unrealized");
+    if (unrealizedEl && ctx.unrealized_pnl != null) {
+        const u = Number(ctx.unrealized_pnl);
+        unrealizedEl.textContent = "$" + u.toFixed(2);
+        unrealizedEl.dataset.lastGood = unrealizedEl.textContent;
+        unrealizedEl.classList.remove("pnl-pos", "pnl-neg");
+        unrealizedEl.classList.add(u >= 0 ? "pnl-pos" : "pnl-neg");
+    }
+    const runEl = document.getElementById("current-run-metrics-note");
+    if (runEl) {
+        runEl.textContent = ctx.current_run_available
+            ? "Current-run start: " + ctx.current_run_start
+            : (ctx.current_run_note || "Current-run trade metrics unavailable — no explicit run start marker recorded.");
+    }
+    updateCurrentAccountSourceLabel(ctx);
+}
+
+function updateCurrentAccountSourceLabel(ctx) {
+    const el = document.getElementById("current-account-source");
+    if (!el) return;
+    const state = getDisplayContextFreshness();
+    el.classList.remove("source-fresh", "source-stale", "source-failed");
+    if (state === "Fresh") el.classList.add("source-fresh");
+    else if (state === "Stale") el.classList.add("source-stale");
+    else if (state === "Failed") el.classList.add("source-failed");
+    const ts = (ctx && ctx.last_updated) || (ENDPOINT_FRESHNESS.perfDisplayContext && ENDPOINT_FRESHNESS.perfDisplayContext.payloadTs) || null;
+    el.textContent = "Source: current ledger (display-context) · Freshness: " + state + (ts ? " · " + ts : "");
+}
+
+function applyHistoricalDiagnosticContext(ctx) {
+    if (!ctx || typeof ctx !== "object") return;
+    const allTimeTradesEl = document.getElementById("analytics-trades-alltime");
+    if (allTimeTradesEl && ctx.all_time_closed_sells != null) {
+        allTimeTradesEl.textContent = String(ctx.all_time_closed_sells);
+    }
+    const allTimeWinrateEl = document.getElementById("analytics-winrate-alltime");
+    if (allTimeWinrateEl && ctx.all_time_win_rate_pct != null) {
+        allTimeWinrateEl.textContent = Number(ctx.all_time_win_rate_pct).toFixed(1) + "%";
+    }
+}
+
+let _historicalDiagnosticsLoaded = false;
+const HIST_SCOPE = "?scope=historical_diagnostic";
+
+function loadHistoricalDiagnostics() {
+    if (_historicalDiagnosticsLoaded) return;
+    _historicalDiagnosticsLoaded = true;
+    const statusEl = document.getElementById("hist-diag-status");
+    if (statusEl) statusEl.textContent = "Loading historical diagnostics…";
+    const endpoints = [
+        { path: "/api/performance/portfolio-value" + HIST_SCOPE, key: "portfolioValue" },
+        { path: "/api/performance/daily-returns" + HIST_SCOPE, key: "dailyReturns" },
+        { path: "/api/performance/cumulative-returns" + HIST_SCOPE, key: "cumulativeReturns" },
+        { path: "/api/performance/trade-pnl" + HIST_SCOPE, key: "tradePnl" },
+        { path: "/api/performance/trade-duration" + HIST_SCOPE, key: "tradeDuration" },
+        { path: "/api/performance/strategy-performance" + HIST_SCOPE, key: "strategyPerformance" },
+    ];
+    endpoints.forEach(function (ep, i) {
+        setTimeout(function () { pollOne(ep); }, i * 300);
+    });
+    fetchEndpoint("/api/performance/display-context?scope=historical_diagnostic").then(function (result) {
+        if (result.ok && result.data) {
+            const ctx = (result.data.data && result.data.data.all_time_closed_sells != null) ? result.data.data : null;
+            if (ctx) applyHistoricalDiagnosticContext(ctx);
+        }
+        if (statusEl) statusEl.textContent = "Loaded " + new Date().toLocaleTimeString() + " — all-time data, not current performance.";
+        [chartPortfolio, chartDailyReturns, chartCumulativeReturns, chartPnlHistogram, chartTradeDuration, chartStrategyPerformance].forEach(function (c) {
+            if (c && typeof c.resize === "function") c.resize();
+        });
+    });
+}
+
+function setupHistoricalDiagnosticsToggle() {
+    const panel = document.getElementById("hist-diag-panel");
+    if (!panel) return;
+    panel.addEventListener("toggle", function () {
+        if (panel.open) loadHistoricalDiagnostics();
+    });
+}
+
+// portfolio-engine/performance: canonical P&L — supplemental only when display-context not loaded
 function updatePortfolioPerformance(data) {
     if (!data || !data.success) return;
+    if (window._perfDisplayContext && window._perfDisplayContext.ledger_principal != null) {
+        updateTrades({ trades: data.trades || [] });
+        window._lastDayTrades = data.trades || [];
+        return;
+    }
     const p = data.performance || {};
     const trades = data.trades || [];
     const tradesEl = document.getElementById("analytics-trades");

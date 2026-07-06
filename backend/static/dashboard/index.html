@@ -379,57 +379,79 @@
 
     <!-- TAB 6: Performance -->
     <div class="tab-panel" id="tab-performance" role="tabpanel" hidden>
-        <p class="engine-label engine-label--day">All charts below: DAY ledger only (paper_trades). SCALP excluded.</p>
-        <section class="widget widget--full">
-            <h2 class="widget__title">Portfolio Value (DAY ledger only)</h2>
-            <div class="widget__chart-wrap"><canvas id="chart-portfolio-value"></canvas><p class="widget__no-data" id="portfolio-no-data">No data</p></div>
-        </section>
-        <section class="widget-row">
-            <div class="widget widget--half">
-                <h2 class="widget__title">Daily Returns (DAY)</h2>
-                <div class="widget__chart-wrap"><canvas id="chart-daily-returns"></canvas><p class="widget__no-data" id="daily-returns-no-data">No data</p></div>
-            </div>
-            <div class="widget widget--half">
-                <h2 class="widget__title">Cumulative Returns (DAY)</h2>
-                <div class="widget__chart-wrap"><canvas id="chart-cumulative-returns"></canvas><p class="widget__no-data" id="cumulative-no-data">No data</p></div>
-            </div>
-        </section>
-        <section class="widget-row">
-            <div class="widget widget--half">
-                <h2 class="widget__title">Trade PnL Histogram (DAY)</h2>
-                <div class="widget__chart-wrap"><canvas id="chart-pnl-histogram"></canvas><p class="widget__no-data" id="pnl-histogram-no-data">No data</p></div>
-            </div>
-            <div class="widget widget--half">
-                <h2 class="widget__title">Trade Duration (DAY)</h2>
-                <div class="widget__chart-wrap"><canvas id="chart-trade-duration"></canvas><p class="widget__no-data" id="trade-duration-no-data">No data</p></div>
-            </div>
-        </section>
-        <section class="widget widget--full">
-            <h2 class="widget__title">Strategy Performance (DAY)</h2>
-            <div class="widget__chart-wrap"><canvas id="chart-strategy-performance"></canvas><p class="widget__no-data" id="strategy-performance-no-data">No data</p></div>
-        </section>
-        <section class="analytics-row" aria-label="DAY canonical metrics">
-            <div class="mini-card"><span class="mini-card__label">Closed AI trades</span><span class="mini-card__value" id="analytics-trades">--</span></div>
-            <div class="mini-card"><span class="mini-card__label">Win Rate</span><span class="mini-card__value" id="analytics-winrate">--</span></div>
+        <p class="engine-label engine-label--day" id="perf-context-banner">DAY · Current ledger + today (UTC) only · SCALP excluded</p>
+
+        <section class="analytics-row" aria-label="Current Account — current ledger only">
+            <h2 class="widget__title widget__title--row">Current Account</h2>
+            <p class="widget__subtitle widget__subtitle--row" id="current-account-source">Source: current ledger (display-context) · Freshness: loading…</p>
+            <div class="mini-card"><span class="mini-card__label">Principal</span><span class="mini-card__value" id="analytics-principal">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Current Equity</span><span class="mini-card__value" id="analytics-equity">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Cash</span><span class="mini-card__value" id="analytics-cash">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Total PnL vs Principal</span><span class="mini-card__value" id="analytics-pnl">--</span></div>
             <div class="mini-card"><span class="mini-card__label">Realized PnL</span><span class="mini-card__value" id="analytics-realized">--</span></div>
             <div class="mini-card"><span class="mini-card__label">Unrealized PnL</span><span class="mini-card__value" id="analytics-unrealized">--</span></div>
-            <div class="mini-card"><span class="mini-card__label">Total PnL (vs principal)</span><span class="mini-card__value" id="analytics-pnl">--</span></div>
-            <div class="mini-card"><span class="mini-card__label">Infra health</span><span class="mini-card__value" id="analytics-risk-status">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Infra health (canonical)</span><span class="mini-card__value" id="analytics-risk-status">--</span></div>
+        </section>
+
+        <section class="analytics-row" aria-label="Today Performance — UTC calendar day only">
+            <h2 class="widget__title widget__title--row">Today Performance (UTC)</h2>
+            <div class="mini-card"><span class="mini-card__label">DAY closed SELLs (today)</span><span class="mini-card__value" id="analytics-trades">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">DAY win rate (today)</span><span class="mini-card__value" id="analytics-winrate">--</span></div>
             <div class="mini-card mini-card--span2"><span class="mini-card__label">DAY scoreboard (today)</span><span class="mini-card__value" id="analytics-scoreboard">--</span></div>
+        </section>
+
+        <section class="widget widget--full">
+            <h2 class="widget__title">Current-Run Metrics</h2>
+            <p class="widget__subtitle" id="current-run-metrics-note">Current-run trade metrics unavailable — no explicit run start marker recorded.</p>
+        </section>
+
+        <details class="widget widget--full" id="hist-diag-panel">
+            <summary>Historical diagnostics — old/all-time data, not current operator performance</summary>
+            <div class="mini-card"><span class="mini-card__label">Closed SELLs (all-time)</span><span class="mini-card__value" id="analytics-trades-alltime">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Win rate (all-time)</span><span class="mini-card__value" id="analytics-winrate-alltime">--</span></div>
+            <section class="widget widget--full">
+                <h2 class="widget__title">Portfolio Value — All-Time</h2>
+                <div class="widget__chart-wrap"><canvas id="chart-portfolio-value"></canvas><p class="widget__no-data" id="portfolio-no-data">No data</p></div>
+            </section>
+            <section class="widget-row">
+                <div class="widget widget--half">
+                    <h2 class="widget__title">Daily Returns — All-Time (DAY)</h2>
+                    <div class="widget__chart-wrap"><canvas id="chart-daily-returns"></canvas><p class="widget__no-data" id="daily-returns-no-data">No data</p></div>
+                </div>
+                <div class="widget widget--half">
+                    <h2 class="widget__title">Cumulative Returns — All-Time vs $25,000 principal (DAY)</h2>
+                    <div class="widget__chart-wrap"><canvas id="chart-cumulative-returns"></canvas><p class="widget__no-data" id="cumulative-no-data">No data</p></div>
+                </div>
+            </section>
+            <section class="widget-row">
+                <div class="widget widget--half">
+                    <h2 class="widget__title">Trade PnL Histogram — All-Time (DAY)</h2>
+                    <div class="widget__chart-wrap"><canvas id="chart-pnl-histogram"></canvas><p class="widget__no-data" id="pnl-histogram-no-data">No data</p></div>
+                </div>
+                <div class="widget widget--half">
+                    <h2 class="widget__title">Trade Duration — All-Time (DAY)</h2>
+                    <div class="widget__chart-wrap"><canvas id="chart-trade-duration"></canvas><p class="widget__no-data" id="trade-duration-no-data">No data</p></div>
+                </div>
+            </section>
+            <section class="widget widget--full">
+                <h2 class="widget__title">Strategy Performance (DAY) — All-Time</h2>
+                <div class="widget__chart-wrap"><canvas id="chart-strategy-performance"></canvas><p class="widget__no-data" id="strategy-performance-no-data">No data</p></div>
+            </section>
+            <section class="widget widget--full">
+                <h2 class="widget__title">Daily Performance Snapshot — All-Time SELL/exit diagnostic (not today, not current)</h2>
+                <div class="snapshot-grid" id="snapshot-container">
+                    <div class="snapshot-section"><h3 class="snapshot-subtitle">Trade counts</h3><pre id="snapshot-counts" class="snapshot-pre">--</pre></div>
+                    <div class="snapshot-section"><h3 class="snapshot-subtitle">SELL performance</h3><pre id="snapshot-sell" class="snapshot-pre">--</pre></div>
+                    <div class="snapshot-section"><h3 class="snapshot-subtitle">Exit types</h3><pre id="snapshot-exit-types" class="snapshot-pre">--</pre></div>
+                    <div class="snapshot-section"><h3 class="snapshot-subtitle">Churn &amp; mode gate</h3><pre id="snapshot-churn" class="snapshot-pre">--</pre></div>
+                    <div class="snapshot-section"><h3 class="snapshot-subtitle">Top symbols</h3><pre id="snapshot-top-symbols" class="snapshot-pre">--</pre></div>
+                </div>
+                <p class="widget__no-data" id="snapshot-no-data">No snapshot data</p>
+            </section>
             <div class="mini-card"><span class="mini-card__label">Invariants</span><span class="mini-card__value" id="analytics-invariants">--</span></div>
             <div class="mini-card"><span class="mini-card__label">Cross-check</span><span class="mini-card__value" id="analytics-xcheck">--</span></div>
-        </section>
-        <section class="widget widget--full">
-            <h2 class="widget__title">Daily Performance Snapshot (DAY)</h2>
-            <div class="snapshot-grid" id="snapshot-container">
-                <div class="snapshot-section"><h3 class="snapshot-subtitle">Trade counts</h3><pre id="snapshot-counts" class="snapshot-pre">--</pre></div>
-                <div class="snapshot-section"><h3 class="snapshot-subtitle">SELL performance</h3><pre id="snapshot-sell" class="snapshot-pre">--</pre></div>
-                <div class="snapshot-section"><h3 class="snapshot-subtitle">Exit types</h3><pre id="snapshot-exit-types" class="snapshot-pre">--</pre></div>
-                <div class="snapshot-section"><h3 class="snapshot-subtitle">Churn &amp; mode gate</h3><pre id="snapshot-churn" class="snapshot-pre">--</pre></div>
-                <div class="snapshot-section"><h3 class="snapshot-subtitle">Top symbols</h3><pre id="snapshot-top-symbols" class="snapshot-pre">--</pre></div>
-            </div>
-            <p class="widget__no-data" id="snapshot-no-data">No snapshot data</p>
-        </section>
+            <p class="widget__subtitle" id="hist-diag-status"></p>
+        </details>
     </div>
 
     <!-- TAB 7: MarketLens Bridge -->
@@ -495,6 +517,6 @@
     </div>
 
     <script src="vendor/chart.umd.min.js?v=4.4.1"></script>
-    <script src="app.js?v=47"></script>
+    <script src="app.js?v=50"></script>
 </body>
 </html>
