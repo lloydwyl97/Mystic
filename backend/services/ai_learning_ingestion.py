@@ -114,11 +114,26 @@ CREATE TABLE IF NOT EXISTS ai_position_heartbeats (
     exit_allowed INTEGER,
     would_sell_now_net_usd REAL DEFAULT 0,
     hold_seconds REAL DEFAULT 0,
-    entry_thesis TEXT
+    entry_thesis TEXT,
+    quantity REAL DEFAULT 0,
+    gross_unrealized_pnl REAL DEFAULT 0,
+    net_unrealized_pnl REAL DEFAULT 0,
+    fee_estimate REAL DEFAULT 0,
+    heartbeat_calc_version INTEGER DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS ix_pos_hb_trade ON ai_position_heartbeats(trade_id, epoch_ms);
 CREATE INDEX IF NOT EXISTS ix_pos_hb_sym ON ai_position_heartbeats(symbol, epoch_ms);
 """
+
+HEARTBEAT_CALC_VERSION = 2
+
+_HEARTBEAT_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("quantity", "REAL DEFAULT 0"),
+    ("gross_unrealized_pnl", "REAL DEFAULT 0"),
+    ("net_unrealized_pnl", "REAL DEFAULT 0"),
+    ("fee_estimate", "REAL DEFAULT 0"),
+    ("heartbeat_calc_version", "INTEGER DEFAULT 1"),
+)
 
 _tables_ready = False
 
@@ -127,15 +142,22 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _migrate_heartbeat_columns(conn: sqlite3.Connection) -> None:
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(ai_position_heartbeats)").fetchall()}
+    for col_name, col_def in _HEARTBEAT_MIGRATION_COLUMNS:
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE ai_position_heartbeats ADD COLUMN {col_name} {col_def}")
+
+
 def ensure_learning_ingestion_tables(db_path: str = DATABASE_PATH) -> None:
     global _tables_ready
-    if _tables_ready:
-        return
     with sqlite3.connect(db_path) as conn:
+        # CREATE IF NOT EXISTS is idempotent — always run so alternate db_path works in tests.
         for stmt in _SCHEMA.strip().split(";"):
             s = stmt.strip()
             if s:
                 conn.execute(s)
+        _migrate_heartbeat_columns(conn)
         conn.commit()
     _tables_ready = True
 
@@ -220,6 +242,33 @@ def record_candidate_snapshot(
 # =========================================================================
 
 
+def _compute_gross_unrealized_pct(*, entry_price: float, mark: float) -> float:
+    """Mark-based gross move fraction for long positions (0.0025 = +0.25%)."""
+    if entry_price <= 0 or mark <= 0:
+        return 0.0
+    return (mark - entry_price) / entry_price
+
+
+def _compute_gross_unrealized_usd(*, entry_price: float, mark: float, quantity: float) -> float:
+    if entry_price <= 0 or mark <= 0 or quantity <= 0:
+        return 0.0
+    return quantity * (mark - entry_price)
+
+
+def _compute_fee_estimate(
+    *,
+    mark: float,
+    quantity: float,
+    entry_fee: float = 0.0,
+    sell_fee_rate: float | None = None,
+) -> float:
+    """Entry fee plus estimated sell-side fee at mark."""
+    if mark <= 0 or quantity <= 0:
+        return float(entry_fee or 0.0)
+    rate = float(TAKER_FEE if sell_fee_rate is None else sell_fee_rate)
+    return float(entry_fee or 0.0) + (quantity * mark * rate)
+
+
 def _compute_mark_sell_net_usd(
     *,
     entry_price: float,
@@ -231,11 +280,13 @@ def _compute_mark_sell_net_usd(
     """Dollar net if sold at mark (entry cost basis + sell-side fee)."""
     if entry_price <= 0 or mark <= 0 or quantity <= 0:
         return 0.0
-    rate = float(TAKER_FEE if sell_fee_rate is None else sell_fee_rate)
-    entry_cost = (quantity * entry_price) + float(entry_fee or 0.0)
-    sell_fee = quantity * mark * rate
-    proceeds = (quantity * mark) - sell_fee
-    return proceeds - entry_cost
+    gross_pnl = _compute_gross_unrealized_usd(entry_price=entry_price, mark=mark, quantity=quantity)
+    return gross_pnl - _compute_fee_estimate(
+        mark=mark,
+        quantity=quantity,
+        entry_fee=entry_fee,
+        sell_fee_rate=sell_fee_rate,
+    )
 
 
 def _resolve_thesis_valid(
@@ -297,7 +348,7 @@ def record_position_heartbeat(
     ensure_learning_ingestion_tables(db_path)
     if entry_price <= 0 or mark <= 0:
         return
-    unrealized = (mark - entry_price) / entry_price
+    unrealized = _compute_gross_unrealized_pct(entry_price=entry_price, mark=mark)
     net_unrealized = unrealized - float(ESTIMATED_ROUNDTRIP_COST)
     hold_sec = max(0.0, time.time() - float(entry_time_epoch or time.time()))
     try:
@@ -315,12 +366,23 @@ def record_position_heartbeat(
             dist_target = ((thesis_target_level - mark) / mark) if thesis_target_level > 0 else None
             dist_invalid = ((mark - thesis_invalid_level) / mark) if thesis_invalid_level > 0 else None
             exit_allowed = net_unrealized >= float(MIN_NET_PROFIT_TO_SELL)
-            would_sell_net_usd = _compute_mark_sell_net_usd(
+            gross_unrealized_pnl = _compute_gross_unrealized_usd(
+                entry_price=entry_price,
+                mark=mark,
+                quantity=quantity,
+            )
+            fee_estimate = _compute_fee_estimate(
+                mark=mark,
+                quantity=quantity,
+                entry_fee=entry_fee,
+            )
+            net_unrealized_pnl = _compute_mark_sell_net_usd(
                 entry_price=entry_price,
                 mark=mark,
                 quantity=quantity,
                 entry_fee=entry_fee,
             )
+            would_sell_net_usd = net_unrealized_pnl
             thesis_valid = _resolve_thesis_valid(
                 thesis_valid=thesis_valid,
                 entry_thesis=entry_thesis,
@@ -337,8 +399,10 @@ def record_position_heartbeat(
                     ts_utc, epoch_ms, symbol, trade_id, entry_price, mark, unrealized_pct,
                     net_unrealized_pct, highest_since_entry, lowest_since_entry, mfe_pct, mae_pct,
                     dist_to_target_pct, dist_to_invalid_pct, thesis_valid, exit_allowed,
-                    would_sell_now_net_usd, hold_seconds, entry_thesis
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    would_sell_now_net_usd, hold_seconds, entry_thesis,
+                    quantity, gross_unrealized_pnl, net_unrealized_pnl, fee_estimate,
+                    heartbeat_calc_version
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     _now_iso(),
@@ -360,6 +424,11 @@ def record_position_heartbeat(
                     would_sell_net_usd,
                     hold_sec,
                     entry_thesis or "",
+                    float(quantity or 0.0),
+                    gross_unrealized_pnl,
+                    net_unrealized_pnl,
+                    fee_estimate,
+                    HEARTBEAT_CALC_VERSION,
                 ),
             )
             conn.commit()
