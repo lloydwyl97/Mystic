@@ -193,9 +193,31 @@ class CircuitBreakerService:
         return {name: breaker.get_stats() for name, breaker in self.breakers.items()}
 
 
+# A persisted "active" hard-kill flag older than this is not trusted blindly
+# on cold start. Daily loss freeze is inherently a per-trading-day mechanism;
+# anything older than a day is almost certainly from a prior session/crash,
+# not the current one. Override via CIRCUIT_BREAKER_STALE_STATE_MAX_AGE_SEC.
+def _stale_state_max_age_sec() -> float:
+    import os
+
+    try:
+        return float(os.getenv("CIRCUIT_BREAKER_STALE_STATE_MAX_AGE_SEC", "86400"))
+    except (TypeError, ValueError):
+        return 86400.0
+
+
 class TradingCircuitBreaker:
     """
-    Hard kill protection for trading system - overrides all other logic
+    Hard kill protection for trading system - overrides all other logic.
+
+    Cold-start contract: a persisted "active" hard-kill flag is only trusted
+    as *currently* active if its timestamp is recent (see
+    _stale_state_max_age_sec). Older persisted "active" state is loaded as
+    pending revalidation — never silently either (a) treated as still active
+    forever, or (b) blindly cleared. The first live equity/pnl check after
+    startup (revalidate_from_live_data / check_all_hard_kills) confirms or
+    clears it, and the transition is logged and observable via
+    get_cold_start_status().
     """
 
     def __init__(self):
@@ -204,6 +226,13 @@ class TradingCircuitBreaker:
         self.account_failsafe_active = False
         self.session_high_equity = 0.0
         self.last_daily_reset = None
+
+        # Cold-start observability (see get_cold_start_status()).
+        self.needs_revalidation: set[str] = set()
+        self.persisted_state_timestamp: str | None = None
+        self.persisted_state_age_sec: float | None = None
+        self.startup_changed_state: bool = False
+        self.last_dependency_check_at: float | None = None
 
         # Load state from SQLite on initialization
         self._load_circuit_state()
@@ -300,6 +329,134 @@ class TradingCircuitBreaker:
         await self.persist_circuit_state_async()
         return result
 
+    def _apply_loaded_circuit_data(self, circuit_data: dict[str, Any]) -> None:
+        """
+        Shared cold-start validation for both sync and async load paths.
+
+        A persisted flag of True is only adopted as currently-active if its
+        `updated_at` timestamp is within _stale_state_max_age_sec(). Otherwise
+        the flag starts False (does not silently pause a healthy new runtime
+        forever) but is recorded in `needs_revalidation` so the next live
+        equity/pnl check re-confirms or clears it explicitly and observably —
+        it is never simply discarded.
+        """
+        from datetime import datetime, timezone
+
+        updated_at_raw = circuit_data.get("updated_at")
+        self.persisted_state_timestamp = updated_at_raw
+        age_sec: float | None = None
+        if updated_at_raw:
+            try:
+                ts = datetime.fromisoformat(str(updated_at_raw).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                age_sec = (datetime.now(timezone.utc) - ts).total_seconds()
+            except (ValueError, TypeError):
+                age_sec = None
+        self.persisted_state_age_sec = age_sec
+        stale = age_sec is None or age_sec > _stale_state_max_age_sec()
+
+        persisted = {
+            "daily_loss_freeze_active": bool(circuit_data.get("daily_loss_freeze_active", False)),
+            "equity_circuit_breaker_active": bool(circuit_data.get("equity_circuit_breaker_active", False)),
+            "account_failsafe_active": bool(circuit_data.get("account_failsafe_active", False)),
+        }
+        self.session_high_equity = float(circuit_data.get("session_high_equity", 0.0) or 0.0)
+
+        for flag_name, persisted_value in persisted.items():
+            if not persisted_value:
+                setattr(self, flag_name, False)
+                continue
+            if stale:
+                # Do not adopt a stale "active" flag as current truth. Flag it
+                # for immediate revalidation against live data instead.
+                setattr(self, flag_name, False)
+                self.needs_revalidation.add(flag_name)
+                self.startup_changed_state = True
+                logger.warning(
+                    "[CIRCUIT BREAKER] COLD_START_STALE_STATE flag=%s persisted_at=%s age_sec=%s "
+                    "max_age_sec=%.0f -> NOT trusted as active; pending live revalidation",
+                    flag_name,
+                    updated_at_raw,
+                    round(age_sec, 1) if age_sec is not None else "unknown",
+                    _stale_state_max_age_sec(),
+                )
+            else:
+                setattr(self, flag_name, True)
+                logger.info(
+                    "[CIRCUIT BREAKER] COLD_START_RECENT_STATE flag=%s persisted_at=%s age_sec=%.1f -> adopted as active",
+                    flag_name,
+                    updated_at_raw,
+                    age_sec,
+                )
+
+    def revalidate_from_live_data(self, portfolio_data: dict[str, Any]) -> dict[str, Any]:
+        """
+        Confirm or clear any flags pending cold-start revalidation using current
+        live equity/pnl. Safe to call repeatedly — a no-op once needs_revalidation
+        is empty. Records an explicit, observable transition either way.
+        """
+        import time as _time
+
+        self.last_dependency_check_at = _time.time()
+        if not self.needs_revalidation:
+            return {"revalidated": [], "confirmed_active": [], "cleared": []}
+
+        current_equity = float(portfolio_data.get("total_equity", 0.0) or 0.0)
+        principal = float(portfolio_data.get("principal", 0.0) or 0.0)
+        realized_pnl_today = float(portfolio_data.get("realized_pnl_today", 0.0) or 0.0)
+
+        pending = set(self.needs_revalidation)
+        confirmed: list[str] = []
+        cleared: list[str] = []
+
+        if "daily_loss_freeze_active" in pending:
+            threshold = current_equity * -0.025
+            if realized_pnl_today <= threshold:
+                self.daily_loss_freeze_active = True
+                confirmed.append("daily_loss_freeze_active")
+            else:
+                self.daily_loss_freeze_active = False
+                cleared.append("daily_loss_freeze_active")
+        if "equity_circuit_breaker_active" in pending:
+            if self.session_high_equity > 0 and current_equity <= self.session_high_equity * 0.93:
+                self.equity_circuit_breaker_active = True
+                confirmed.append("equity_circuit_breaker_active")
+            else:
+                self.equity_circuit_breaker_active = False
+                cleared.append("equity_circuit_breaker_active")
+        if "account_failsafe_active" in pending:
+            if principal > 0 and current_equity <= principal * 0.90:
+                self.account_failsafe_active = True
+                confirmed.append("account_failsafe_active")
+            else:
+                self.account_failsafe_active = False
+                cleared.append("account_failsafe_active")
+
+        self.needs_revalidation.clear()
+        logger.warning(
+            "[CIRCUIT BREAKER] COLD_START_REVALIDATION_COMPLETE confirmed_active=%s cleared=%s equity=%.2f",
+            confirmed,
+            cleared,
+            current_equity,
+        )
+        return {"revalidated": list(pending), "confirmed_active": confirmed, "cleared": cleared}
+
+    def get_cold_start_status(self) -> dict[str, Any]:
+        """Observable cold-start/circuit-breaker state for status endpoints/dashboards."""
+        return {
+            "daily_loss_freeze_active": self.daily_loss_freeze_active,
+            "equity_circuit_breaker_active": self.equity_circuit_breaker_active,
+            "account_failsafe_active": self.account_failsafe_active,
+            "session_high_equity": self.session_high_equity,
+            "persisted_state_timestamp": self.persisted_state_timestamp,
+            "persisted_state_age_sec": round(self.persisted_state_age_sec, 1) if self.persisted_state_age_sec is not None else None,
+            "stale_state_max_age_sec": _stale_state_max_age_sec(),
+            "needs_revalidation": sorted(self.needs_revalidation),
+            "startup_changed_state": self.startup_changed_state,
+            "last_dependency_check_at": self.last_dependency_check_at,
+        }
+
     def _load_circuit_state(self) -> None:
         """Load circuit breaker state from SQLite (authoritative source)"""
         try:
@@ -322,21 +479,17 @@ class TradingCircuitBreaker:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
 
-            # Load circuit breaker states
+            # Load circuit breaker states (with cold-start staleness validation)
             circuit_data = loop.run_until_complete(get_state("risk:circuit_breakers"))
             if circuit_data:
-                self.daily_loss_freeze_active = circuit_data.get("daily_loss_freeze_active", False)
-                self.equity_circuit_breaker_active = circuit_data.get("equity_circuit_breaker_active", False)
-                self.account_failsafe_active = circuit_data.get("account_failsafe_active", False)
-                self.session_high_equity = circuit_data.get("session_high_equity", 0.0)
-                logger.info(
-                    f"[CIRCUIT BREAKER] Loaded state from SQLite: freeze={self.daily_loss_freeze_active}, equity_cb={self.equity_circuit_breaker_active}, failsafe={self.account_failsafe_active}"
-                )
+                self._apply_loaded_circuit_data(circuit_data)
 
-            # Load trading paused state
+            # Load trading paused state (diagnostic only — not authoritative;
+            # daily_loss_freeze_active/equity_circuit_breaker_active/account_failsafe_active
+            # above are the source of truth after cold-start validation).
             paused_data = loop.run_until_complete(get_state("risk:trading_paused"))
             if paused_data:
-                logger.info(f"[CIRCUIT BREAKER] Trading paused state: {paused_data}")
+                logger.info(f"[CIRCUIT BREAKER] Persisted trading_paused snapshot: {paused_data}")
 
         except Exception as e:
             logger.warning(f"[CIRCUIT BREAKER] Failed to load state from SQLite: {e}")
@@ -368,11 +521,16 @@ class TradingCircuitBreaker:
             }
             loop.run_until_complete(set_state("risk:circuit_breakers", circuit_data))
 
-            # Persist trading paused state if any circuit is active
+            # Always persist current trading_paused truth (true AND false) —
+            # previously only written when active, so a resolved condition
+            # left a stale "trading_paused: true" row forever.
             any_active = any([self.daily_loss_freeze_active, self.equity_circuit_breaker_active, self.account_failsafe_active])
-            if any_active:
-                paused_data = {"trading_paused": True, "pause_reason": "circuit_breaker_active", "updated_at": datetime.now(timezone.utc).isoformat()}
-                loop.run_until_complete(set_state("risk:trading_paused", paused_data))
+            paused_data = {
+                "trading_paused": any_active,
+                "pause_reason": "circuit_breaker_active" if any_active else "",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            loop.run_until_complete(set_state("risk:trading_paused", paused_data))
 
         except Exception as e:
             logger.warning(f"[CIRCUIT BREAKER] Failed to persist state to SQLite: {e}")
@@ -383,14 +541,10 @@ class TradingCircuitBreaker:
         try:
             circuit_data = await get_state("risk:circuit_breakers")
             if circuit_data:
-                self.daily_loss_freeze_active = circuit_data.get("daily_loss_freeze_active", False)
-                self.equity_circuit_breaker_active = circuit_data.get("equity_circuit_breaker_active", False)
-                self.account_failsafe_active = circuit_data.get("account_failsafe_active", False)
-                self.session_high_equity = circuit_data.get("session_high_equity", 0.0)
-                logger.info(f"[CIRCUIT BREAKER] Loaded state (async): freeze={self.daily_loss_freeze_active}, equity_cb={self.equity_circuit_breaker_active}, failsafe={self.account_failsafe_active}")
+                self._apply_loaded_circuit_data(circuit_data)
             paused_data = await get_state("risk:trading_paused")
             if paused_data:
-                logger.info(f"[CIRCUIT BREAKER] Trading paused state (async): {paused_data}")
+                logger.info(f"[CIRCUIT BREAKER] Persisted trading_paused snapshot (async): {paused_data}")
         except Exception as e:
             logger.warning(f"[CIRCUIT BREAKER] Failed to load state (async): {e}")
 
@@ -408,9 +562,12 @@ class TradingCircuitBreaker:
             }
             await set_state("risk:circuit_breakers", circuit_data)
             any_active = any([self.daily_loss_freeze_active, self.equity_circuit_breaker_active, self.account_failsafe_active])
-            if any_active:
-                paused_data = {"trading_paused": True, "pause_reason": "circuit_breaker_active", "updated_at": datetime.now(timezone.utc).isoformat()}
-                await set_state("risk:trading_paused", paused_data)
+            paused_data = {
+                "trading_paused": any_active,
+                "pause_reason": "circuit_breaker_active" if any_active else "",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            await set_state("risk:trading_paused", paused_data)
             logger.debug("[CIRCUIT BREAKER] State persisted (async)")
         except Exception as e:
             logger.warning(f"[CIRCUIT BREAKER] Failed to persist state (async): {e}")

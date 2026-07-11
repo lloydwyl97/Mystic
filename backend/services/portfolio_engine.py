@@ -6533,6 +6533,50 @@ class PortfolioEngine:
         sleeve: str = "",
     ) -> dict[str, Any] | None:
         """
+        SOLE EXECUTION POINT FOR BUYS — thin locking wrapper.
+
+        Serializes all buy attempts for the same symbol through the per-symbol
+        `_buy_execution_locks` lock (previously declared but never acquired —
+        confirmed root cause of a real duplicate-buy incident: two independent
+        BUYs for the same symbol executed ~60s apart across two bar cycles,
+        each debiting cash, with the second INSERT OR REPLACE silently
+        overwriting the first position's row and losing its cost basis while
+        its cash had already been spent). Holding this lock for the entire
+        buy attempt — including the "already open" duplicate check, cash
+        debit, and position persist — makes that check-then-act sequence
+        atomic with respect to any other concurrent buy attempt for the same
+        symbol, regardless of unrelated async scheduling/reload timing.
+        """
+        normalized_symbol_for_lock = normalize_symbol(symbol)
+        lock = self._buy_execution_locks.setdefault(normalized_symbol_for_lock, asyncio.Lock())
+        async with lock:
+            return await self._execute_buy_fifo_locked(
+                symbol,
+                quantity,
+                price,
+                stop_price,
+                atr,
+                confidence,
+                bar_timestamp,
+                explainability,
+                decision_id=decision_id,
+                sleeve=sleeve,
+            )
+
+    async def _execute_buy_fifo_locked(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        stop_price: float,
+        atr: float,
+        confidence: float,
+        bar_timestamp: int,
+        explainability: TradeExplainability,
+        decision_id: str = "",
+        sleeve: str = "",
+    ) -> dict[str, Any] | None:
+        """
         SOLE EXECUTION POINT FOR BUYS
 
         CRITICAL: This is the ONLY method that can execute buys.
@@ -6962,12 +7006,37 @@ class PortfolioEngine:
                     )
                 return None
 
-        if normalized_symbol in self.open_positions and self.open_positions[normalized_symbol].quantity > 0:
+        # Duplicate-symbol guard: check BOTH in-memory state and a fresh
+        # authoritative SQLite read. self.open_positions can lag reality
+        # (e.g. a periodic _load_positions_from_sqlite() reload racing a
+        # not-yet-committed position write) — confirmed root cause of a real
+        # incident where two independent BUYs for the same symbol executed
+        # across consecutive bar cycles, the second silently overwriting the
+        # first position's row via INSERT OR REPLACE and losing its cost
+        # basis while its cash had already been spent. The execute_buy_fifo
+        # per-symbol lock now serializes concurrent attempts; this fresh read
+        # additionally catches the case where memory itself is stale.
+        already_open_in_memory = normalized_symbol in self.open_positions and self.open_positions[normalized_symbol].quantity > 0
+        already_open_in_db = False
+        if not already_open_in_memory:
+            db_row = await asyncio.to_thread(self._fetch_authoritative_open_position_sync, normalized_symbol)
+            already_open_in_db = db_row is not None
+        if already_open_in_memory or already_open_in_db:
+            open_qty = float(self.open_positions[normalized_symbol].quantity) if already_open_in_memory else float(db_row[0])
             logger.info(
-                "BUY_BLOCKED_ALREADY_OPEN: symbol=%s open_qty=%.8f (HOLD existing position)",
+                "BUY_BLOCKED_ALREADY_OPEN: symbol=%s open_qty=%.8f source=%s (HOLD existing position)",
                 normalized_symbol,
-                float(self.open_positions[normalized_symbol].quantity),
+                open_qty,
+                "memory" if already_open_in_memory else "sqlite_authoritative_fresh_read",
             )
+            if already_open_in_db and not already_open_in_memory:
+                logger.error(
+                    "BUY_DUPLICATE_RACE_PREVENTED: symbol=%s was open in SQLite but missing from in-memory "
+                    "open_positions — reloading memory instead of allowing a duplicate buy",
+                    normalized_symbol,
+                )
+                with contextlib.suppress(Exception):
+                    await self._load_positions_from_sqlite()
             await self._record_reject(
                 normalized_symbol,
                 "BUY",
@@ -12542,16 +12611,32 @@ class PortfolioEngine:
                         )
                     _route = self._apply_day_regime_router(_tc)
                 if not _route.get("allowed"):
+                    # NON-BLOCKING BY DESIGN (continuation repair): every regime-router
+                    # outcome (setup/regime mismatch, projected-MFE-after-fees "too low",
+                    # HTF denial, thesis-score floor, chop/no-clear-thesis, XRP churn
+                    # confirmation) is a trade-opinion / expected-value judgment, not a
+                    # measured execution-safety fact. It must not drop an otherwise
+                    # executable ranked candidate. Apply the router's own rank/size
+                    # penalty (same fields used on the allowed path) and keep the
+                    # candidate in the pipeline instead of `continue`-ing past it.
                     logger.info(
-                        "REGIME_ROUTE_BLOCK symbol=%s regime=%s setup=%s reason=%s",
+                        "REGIME_ROUTE_ADVISORY symbol=%s regime=%s setup=%s reason=%s (not enforced — penalty only)",
                         _tc.symbol,
                         _route.get("day_route_regime"),
                         (_tc.decision_data or {}).get("setup_type"),
                         _route.get("block_reason"),
                     )
-                    await self._bar_pipeline_terminal(_tc.decision_id, "REGIME_ROUTE_BLOCKED", pipeline_done)
-                    await self._record_learning_snapshot(_tc, "BLOCK", str(_route.get("block_reason") or "REGIME_ROUTE"))
-                    continue
+                    _ddr_pen = dict(_tc.decision_data or {})
+                    _ddr_pen["thesis_rank_delta"] = round(
+                        float(_ddr_pen.get("thesis_rank_delta") or 0.0) + float(_route.get("route_rank_delta") or 0.0),
+                        4,
+                    )
+                    _ddr_pen["thesis_size_factor"] = round(
+                        float(_ddr_pen.get("thesis_size_factor") or 1.0) * float(_route.get("route_size_factor") or 1.0),
+                        4,
+                    )
+                    _tc.decision_data = _ddr_pen
+                    await self._record_learning_snapshot(_tc, "REGIME_ROUTE_ADVISORY", str(_route.get("block_reason") or "REGIME_ROUTE"))
             try:
                 from backend.services.day_trade_thesis import apply_ml_locked_setup_override
 

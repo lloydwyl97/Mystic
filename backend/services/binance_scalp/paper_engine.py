@@ -259,6 +259,41 @@ class BinanceScalpPaperEngine:
         except Exception:
             pass
 
+    def _publish_last_decision(
+        self,
+        *,
+        decision: str,
+        reason: str = "",
+        selected_symbol: str | None = None,
+        rank_score: float | None = None,
+        entry_armed: bool | None = None,
+        ranked_summary: list[dict] | None = None,
+    ) -> None:
+        """
+        Publish the ACTUAL canonical pre-order decision from this tick.
+
+        This is the single source of truth for "would the engine enter right
+        now" — status_snapshot.py reads this instead of running its own
+        independent ranking/momentum simulation, so the dashboard can never
+        disagree with what the paper engine itself just decided.
+        """
+        try:
+            from backend.services.binance_scalp.redis_keys import last_decision_key
+
+            payload = {
+                "updated_at_epoch": time.time(),
+                "decision": decision,
+                "reason": reason,
+                "selected_symbol": selected_symbol,
+                "rank_score": rank_score,
+                "entry_armed": entry_armed,
+                "ranked_summary": ranked_summary or [],
+            }
+            key = last_decision_key(self.config.redis_key_prefix)
+            self._redis.setex(key, 90, json.dumps(payload, separators=(",", ":")))
+        except Exception:
+            pass
+
     def _write_position_cache(self, symbol_bus: str, payload: dict | None) -> None:
         key = position_key(self.config.redis_key_prefix, symbol_bus)
         assert_key_allowed(key, prefix=self.config.redis_key_prefix)
@@ -315,6 +350,7 @@ class BinanceScalpPaperEngine:
 
     def _entry_candidates(self, conn: sqlite3.Connection) -> list[tuple[str, MarketSnapshot, object]]:
         if not self.config.scalp_paper_enabled:
+            self._publish_last_decision(decision="BLOCKED", reason=SCALP_PAPER_DISABLED)
             return []
 
         open_symbols = {str(r[0]).upper() for r in conn.execute("SELECT symbol FROM scalp_paper_positions WHERE status='OPEN'")}
@@ -393,6 +429,7 @@ class BinanceScalpPaperEngine:
                     reason,
                     json.dumps({"rank_meta": meta, "signals": [s.as_dict() for s in all_sigs]}),
                 )
+            self._publish_last_decision(decision="NO_SIGNAL", reason="NO_RANKED_CANDIDATE", entry_armed=self._entry_armed_ok())
             return []
 
         from backend.services.binance_scalp.scalp_candidate_ranking import pick_best_global_candidate
@@ -438,8 +475,24 @@ class BinanceScalpPaperEngine:
                     }
                 ),
             )
+            ranked_summary = [
+                {"symbol": r["symbol"], "rank_score": r.get("rank_score"), "entry_eligible": r.get("entry_eligible"), "hard_block": r.get("hard_block")}
+                for r in ranked
+            ]
+            self._publish_last_decision(
+                decision="NO_SIGNAL",
+                reason=reason,
+                selected_symbol=top.get("symbol"),
+                rank_score=top.get("rank_score"),
+                entry_armed=self._entry_armed_ok(),
+                ranked_summary=ranked_summary,
+            )
             return []
         sym, snap, sig = best["symbol"], best["snap"], best["signal"]
+        ranked_summary = [
+            {"symbol": r["symbol"], "rank_score": r.get("rank_score"), "entry_eligible": r.get("entry_eligible"), "hard_block": r.get("hard_block")}
+            for r in ranked
+        ]
         if not getattr(sig, "passed", False):
             self._record_reject(
                 conn,
@@ -447,6 +500,17 @@ class BinanceScalpPaperEngine:
                 "BUY",
                 "RANKED_NOT_EXECUTABLE",
                 json.dumps({"setup": sig.as_dict(), "rank_score": best.get("rank_score")}),
+            )
+            # The top-ranked candidate itself failed its preflight (spread/impact/
+            # net-edge/depth) — a genuine operational failure for this attempt,
+            # not an ordinary "nothing ranked" outcome.
+            self._publish_last_decision(
+                decision="BLOCKED",
+                reason="RANKED_NOT_EXECUTABLE",
+                selected_symbol=sym,
+                rank_score=best.get("rank_score"),
+                entry_armed=self._entry_armed_ok(),
+                ranked_summary=ranked_summary,
             )
             return []
         entry_intel = dict(best.get("intelligence") or {})
@@ -478,8 +542,24 @@ class BinanceScalpPaperEngine:
                 WOULD_ENTER_NOT_ARMED,
                 json.dumps({"setup": sig.as_dict(), "entry_armed": False}),
             )
+            self._publish_last_decision(
+                decision="PASS_NOT_ARMED",
+                reason=WOULD_ENTER_NOT_ARMED,
+                selected_symbol=sym,
+                rank_score=best.get("rank_score"),
+                entry_armed=False,
+                ranked_summary=ranked_summary,
+            )
             return []
 
+        self._publish_last_decision(
+            decision="WOULD_ENTER",
+            reason="",
+            selected_symbol=sym,
+            rank_score=best.get("rank_score"),
+            entry_armed=True,
+            ranked_summary=ranked_summary,
+        )
         return [(sym, snap, sig)]
 
     def _try_entry(self, conn: sqlite3.Connection) -> None:
@@ -1200,12 +1280,14 @@ class BinanceScalpPaperEngine:
                             "reject_reason": SCALP_PAPER_DISABLED,
                         },
                     )
+                self._publish_last_decision(decision="BLOCKED", reason=SCALP_PAPER_DISABLED)
                 conn.commit()
                 return
 
             if not self.econ.is_fee_model_verified():
                 for sym in self.config.products:
                     self._record_reject(conn, sym, "BUY", FEE_MODEL_UNVERIFIED, "fee model not verified")
+                self._publish_last_decision(decision="BLOCKED", reason=FEE_MODEL_UNVERIFIED)
                 conn.commit()
                 return
 
@@ -1236,6 +1318,7 @@ class BinanceScalpPaperEngine:
                         entry_blocked = str(last[0] or "")
             else:
                 entry_blocked = "MAX_OPEN_POSITIONS"
+                self._publish_last_decision(decision="BLOCKED", reason="MAX_OPEN_POSITIONS")
             self._publish_runner_state(conn, open_rows=self._open_positions(conn), epoch=epoch, entry_blocked_reason=entry_blocked)
             conn.commit()
             for fn in post_commit:

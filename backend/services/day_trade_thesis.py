@@ -544,7 +544,15 @@ def resolve_day_route_regime(decision_data: dict[str, Any]) -> str:
     ps = str(dd.get("price_structure_regime") or "").strip().lower()
     if "range" in ps:
         return "range"
-    return explicit or "neutral"
+    # No real regime evidence (no explicit stamp, no regime/market_regime field,
+    # price_structure_regime not "range"-like). Previously defaulted to "neutral",
+    # which apply_ml_locked_setup_override/remap_setup_for_day_regime treats the
+    # same as a genuinely classified range/neutral market — silently downgrading
+    # an otherwise-correct HTF_TREND_PULLBACK/BREAKOUT_CONTINUATION classification
+    # to RANGE_BOUNCE with no supporting evidence. "unknown" intentionally does
+    # not match any branch in remap_setup_for_day_regime, so it leaves the
+    # classifier's own setup_type unchanged instead of inventing a regime opinion.
+    return explicit or "unknown"
 
 
 def remap_setup_for_day_regime(setup: str, regime: str) -> str:

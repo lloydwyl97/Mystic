@@ -110,6 +110,30 @@ def _overlay_runner_scan(
     return regimes
 
 
+_ENGINE_DECISION_TO_STATUS = {
+    "WOULD_ENTER": "PASS",
+    "PASS_NOT_ARMED": "READY_TO_WATCH",
+    "NO_SIGNAL": "NO_SIGNAL",
+    "BLOCKED": "BLOCKED",
+}
+
+
+def _load_last_decision(rclient: redis.Redis, *, prefix: str) -> dict[str, Any] | None:
+    """Read the canonical pre-order decision the live paper engine published on
+    its last tick (see BinanceScalpPaperEngine._publish_last_decision). This is
+    the actual engine truth — never re-derived from a second simulation."""
+    try:
+        from backend.services.binance_scalp.redis_keys import last_decision_key
+
+        raw = rclient.get(last_decision_key(prefix))
+        if not raw:
+            return None
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def _load_runner_state(rclient: redis.Redis, *, prefix: str) -> dict[str, Any] | None:
     try:
         raw = rclient.get(runner_state_key(prefix))
@@ -557,7 +581,17 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
         runner_active=True,
     )
 
-    overall = _overall_decision(symbol_rows)
+    # Canonical parity: prefer the engine's own last-tick decision over this
+    # endpoint's independent preflight simulation. Only fall back to the local
+    # simulation when the canonical publish is missing/stale (engine not
+    # running this tick cycle) — and say so explicitly via `decision_source`.
+    last_decision = _load_last_decision(rclient, prefix=config.redis_key_prefix)
+    decision_source = "engine_canonical"
+    if last_decision and last_decision.get("decision") in _ENGINE_DECISION_TO_STATUS:
+        overall = _ENGINE_DECISION_TO_STATUS[str(last_decision["decision"])]
+    else:
+        decision_source = "status_simulation_fallback"
+        overall = _overall_decision(symbol_rows)
     if operational["operational_mode"] == "max_open_positions_reached":
         overall = "WAITING_FOR_EXIT"
     elif operational["operational_mode"] == "exit_watch_active":
@@ -568,6 +602,8 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "overall_decision": overall,
+        "decision_source": decision_source,
+        "canonical_engine_decision": last_decision,
         "top_blocker": top_blocker,
         "operational_summary": operational,
         "runner_state": runner_state,

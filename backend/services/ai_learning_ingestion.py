@@ -482,6 +482,81 @@ def _load_series(r: Any, sym_bus: str) -> dict[str, list[list[float]]]:
     return out
 
 
+def _fetch_historical_klines_rest(
+    sym_bus: str,
+    interval: str,
+    start_ms: float,
+    end_ms: float,
+    *,
+    timeout_sec: float = 10.0,
+) -> list[list[float]]:
+    """
+    Durable fallback: fetch a bounded historical OHLCV window directly from
+    Binance.US public REST (no auth, no rate-limit risk at this call volume).
+
+    Used only when Redis-cached series (day_active_bundle/klines:*, TTL on
+    the order of ~2-4 minutes for the live bundle) do not cover a labeling
+    window that a snapshot needs — e.g. after a Redis restart/flush or a
+    service-downtime gap. Binance.US retains kline history indefinitely, so
+    this makes forward labeling resilient to Redis cache TTL/continuity
+    without ever persisting a second copy of full market data.
+    """
+    try:
+        import httpx
+
+        url = (
+            "https://api.binance.us/api/v3/klines"
+            f"?symbol={sym_bus}&interval={interval}&startTime={int(start_ms)}&endTime={int(end_ms)}&limit=1000"
+        )
+        with httpx.Client(timeout=timeout_sec) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            rows = resp.json()
+        if not isinstance(rows, list):
+            return []
+        # Binance kline row: [open_time_ms, open, high, low, close, volume, ...]
+        return [[float(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])] for x in rows if isinstance(x, (list, tuple)) and len(x) >= 6]
+    except Exception as exc:
+        logger.debug("FORWARD_LABEL_REST_FALLBACK_FAILED %s %s: %s", sym_bus, interval, exc)
+        return []
+
+
+def _ensure_series_covers_window(
+    series: dict[str, list[list[float]]],
+    *,
+    sym_bus: str,
+    t0_ms: float,
+    end_ms: float,
+) -> dict[str, list[list[float]]]:
+    """
+    If the Redis-derived series does not cover [t0_ms, end_ms] for any of the
+    timeframes used by the labeler, fetch the missing window directly from
+    Binance.US REST (durable fallback) and merge it in-memory for this run
+    only. Never writes the fetched rows back to Redis or a new table.
+    """
+    for tf in ("1h", "15m", "5m"):
+        rows = series.get(tf) or []
+        covers_start = bool(rows) and float(rows[0][0]) <= t0_ms
+        covers_end = bool(rows) and float(rows[-1][0]) >= end_ms
+        if covers_start and covers_end:
+            continue
+        # Pad the request window slightly so boundary bars are included.
+        pad_ms = 3 * 3600 * 1000.0 if tf == "1h" else 15 * 60 * 1000.0
+        fetched = _fetch_historical_klines_rest(sym_bus, tf, t0_ms - pad_ms, end_ms + pad_ms)
+        if fetched:
+            merged = {row[0]: row for row in rows}
+            for row in fetched:
+                merged[row[0]] = row
+            series[tf] = sorted(merged.values(), key=lambda x: x[0])
+            logger.info(
+                "FORWARD_LABEL_REST_FALLBACK_USED symbol=%s tf=%s fetched_rows=%d reason=redis_series_gap",
+                sym_bus,
+                tf,
+                len(fetched),
+            )
+    return series
+
+
 def _close_at(series: list[list[float]], target_ms: float) -> float | None:
     """Close of the last bar opening at/before target_ms (None outside coverage)."""
     if not series:
@@ -591,18 +666,46 @@ def label_pending_snapshots(db_path: str = DATABASE_PATH) -> dict[str, int]:
                 counters["unlabelable"] += 1
                 continue
 
+            def _missing_horizon_cols() -> list[tuple[str, int]]:
+                return [(col, horizon_sec) for col, horizon_sec in _HORIZONS if row[col] is None and age_sec >= horizon_sec]
+
             updates: dict[str, float] = {}
-            for col, horizon_sec in _HORIZONS:
-                if row[col] is not None or age_sec < horizon_sec:
-                    continue
-                target = t0 + horizon_sec * 1000.0
-                px = None
-                for tf in ("1m", "5m", "15m", "1h"):
-                    px = _close_at(series.get(tf) or [], target)
-                    if px is not None:
-                        break
-                if px is not None and px > 0:
-                    updates[col] = (px - p0) / p0
+            still_missing = _missing_horizon_cols()
+            if still_missing:
+                for col, horizon_sec in still_missing:
+                    target = t0 + horizon_sec * 1000.0
+                    px = None
+                    for tf in ("1m", "5m", "15m", "1h"):
+                        px = _close_at(series.get(tf) or [], target)
+                        if px is not None:
+                            break
+                    if px is not None and px > 0:
+                        updates[col] = (px - p0) / p0
+                # Durable REST fallback: only fire once redis-derived coverage
+                # genuinely fails a needed lookup AND the row is old enough that
+                # routine retry-next-cycle is unlikely to help (avoids hammering
+                # the public REST endpoint every ~2min for ordinary in-flight rows).
+                remaining_missing = [c for c, h in still_missing if c not in updates]
+                if remaining_missing and age_sec >= (LABEL_GIVEUP_AGE_SEC * 0.5):
+                    max_needed_horizon = max(h for _, h in still_missing)
+                    series = _ensure_series_covers_window(
+                        series,
+                        sym_bus=sym_bus,
+                        t0_ms=t0,
+                        end_ms=t0 + max_needed_horizon * 1000.0,
+                    )
+                    series_cache[sym_bus] = series
+                    for col, horizon_sec in still_missing:
+                        if col in updates:
+                            continue
+                        target = t0 + horizon_sec * 1000.0
+                        px = None
+                        for tf in ("1h", "15m", "5m", "1m"):
+                            px = _close_at(series.get(tf) or [], target)
+                            if px is not None:
+                                break
+                        if px is not None and px > 0:
+                            updates[col] = (px - p0) / p0
 
             full_done = age_sec >= LABEL_FINAL_HORIZON_SEC
             mfe = mae = None
@@ -614,6 +717,17 @@ def label_pending_snapshots(db_path: str = DATABASE_PATH) -> dict[str, int]:
                         mfe = (ext[0] - p0) / p0
                         mae = (p0 - ext[1]) / p0
                         break
+                if mfe is None and age_sec >= (LABEL_GIVEUP_AGE_SEC * 0.5):
+                    # Same durable REST fallback for the MFE/MAE window as used
+                    # above for point-in-time forward returns.
+                    series = _ensure_series_covers_window(series, sym_bus=sym_bus, t0_ms=t0, end_ms=window_end)
+                    series_cache[sym_bus] = series
+                    for tf in ("5m", "15m", "1h"):
+                        ext = _window_extremes(series.get(tf) or [], t0, window_end)
+                        if ext:
+                            mfe = (ext[0] - p0) / p0
+                            mae = (p0 - ext[1]) / p0
+                            break
 
             have_24h = updates.get("fwd_ret_24h") is not None or row["fwd_ret_24h"] is not None
             if full_done and (mfe is not None or have_24h):
@@ -971,9 +1085,59 @@ def learning_health_summary(db_path: str = DATABASE_PATH) -> dict[str, Any]:
         labeled = int(out["totals"].get("candidate_snapshots_labeled") or 0)
         if closed < 200 and labeled < 200:
             out["warnings"].append("DATA_STARVATION: closed outcomes and labeled snapshots both sparse")
+
+        out["heartbeat_schema"] = _heartbeat_schema_health(db_path)
     except sqlite3.Error as e:
         out["error"] = str(e)
     return out
+
+
+def _heartbeat_schema_health(db_path: str = DATABASE_PATH) -> dict[str, Any]:
+    """
+    Heartbeat telemetry schema observability (repair-all continuation, Phase 3).
+
+    record_position_heartbeat() is the sole producer of ai_position_heartbeats
+    and always stamps HEARTBEAT_CALC_VERSION on every write, so there is
+    exactly one *active* writer schema at any time. Older rows (a lower
+    heartbeat_calc_version) are retained for history but must never be
+    reported as current runtime evidence — "active" freshness here is
+    computed only from the current-version rows.
+    """
+    health: dict[str, Any] = {
+        "current_version": HEARTBEAT_CALC_VERSION,
+        "version_counts": {},
+        "current_version_row_count": 0,
+        "historical_row_count": 0,
+        "latest_current_version_heartbeat_utc": None,
+        "latest_current_version_age_sec": None,
+        "active_health": "UNKNOWN",
+    }
+    try:
+        with sqlite3.connect(db_path, timeout=10) as conn:
+            for ver, cnt in conn.execute("SELECT heartbeat_calc_version, COUNT(*) FROM ai_position_heartbeats GROUP BY heartbeat_calc_version").fetchall():
+                health["version_counts"][str(ver)] = int(cnt)
+            health["current_version_row_count"] = int(health["version_counts"].get(str(HEARTBEAT_CALC_VERSION), 0))
+            health["historical_row_count"] = sum(health["version_counts"].values()) - health["current_version_row_count"]
+
+            latest = conn.execute(
+                "SELECT ts_utc, epoch_ms FROM ai_position_heartbeats WHERE heartbeat_calc_version = ? ORDER BY epoch_ms DESC LIMIT 1",
+                (HEARTBEAT_CALC_VERSION,),
+            ).fetchone()
+            if latest:
+                health["latest_current_version_heartbeat_utc"] = latest[0]
+                age_sec = max(0.0, time.time() - float(latest[1] or 0) / 1000.0)
+                health["latest_current_version_age_sec"] = round(age_sec, 1)
+                # Positions heartbeat while genuinely open; a healthy runtime with
+                # open positions emits one roughly every few minutes. No open
+                # positions -> no recent heartbeat is expected and not unhealthy.
+                health["active_health"] = "FRESH" if age_sec <= 900 else "STALE"
+            elif health["historical_row_count"] > 0:
+                health["active_health"] = "NO_CURRENT_VERSION_DATA"
+            else:
+                health["active_health"] = "NO_DATA_YET"
+    except sqlite3.Error as e:
+        health["error"] = str(e)
+    return health
 
 
 __all__ = [

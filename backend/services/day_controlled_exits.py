@@ -711,28 +711,22 @@ def evaluate_pre_buy_exit_consistency(
     result["checks"]["route_block_reason"] = str(route.get("block_reason") or "")
     if not route.get("allowed"):
         route_reason = str(route.get("block_reason") or "REGIME_ROUTE")
-        # Executable-edge failures (no net profit after fees at the thesis target)
-        # are genuine operational conditions and remain hard-blocked. Every other
-        # router outcome is a setup/regime *label* mismatch — a ranking/scoring
-        # opinion, not a permission decision — and must not reject the trade.
-        # Mystic is a ranking-and-trading engine: regime incompatibility is
-        # surfaced as advisory penalty info only (route_rank_delta/route_size_factor
-        # are still available to the caller for sizing/scoring).
-        if "MFE_TOO_LOW" in route_reason:
-            result.update(
-                {
-                    "allowed": False,
-                    "block_reason": f"SETUP_REGIME_INCOMPATIBLE:{route_reason}",
-                    "setup_regime_compatible": False,
-                    "entry_exit_state_consistent": False,
-                }
-            )
-            return result
+        # NON-BLOCKING BY DESIGN (continuation repair): every router outcome,
+        # including "*_MFE_TOO_LOW", is an *expectation* about the trade's own
+        # thesis target, not a measured execution fact. _vwap_expected_mfe_after_fees_ok
+        # compares a PROJECTED move to the strategy's own thesis_target_level
+        # against a constant ESTIMATED_ROUNDTRIP_COST — it is "expected favorable
+        # excursion is insufficient", i.e. a trade-opinion/expected-value gate,
+        # not a real-time spread/impact/liquidity safety fact (contrast with
+        # SCALP's NET_EDGE_BELOW_MIN, which uses live order-book data and stays
+        # a hard block there). Mystic is a ranking-and-trading engine: every
+        # router outcome is surfaced as advisory penalty info only
+        # (route_rank_delta/route_size_factor remain available for sizing/scoring).
         result["checks"]["route_regime_mismatch_advisory"] = route_reason
         result["checks"]["route_rank_delta"] = route.get("route_rank_delta", 0.0)
         result["checks"]["route_size_factor"] = route.get("route_size_factor", 1.0)
-        # Fall through: continue with the remaining (non-regime-opinion) entry/exit
-        # state checks below instead of rejecting on regime-label mismatch alone.
+        # Fall through: continue with the remaining (non-opinion) entry/exit
+        # state checks below instead of rejecting on the router's opinion alone.
 
     invalid_level = float(thesis_invalid_level or 0.0)
     atr_pct = 0.01

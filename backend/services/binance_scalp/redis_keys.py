@@ -64,6 +64,15 @@ def runner_state_key(prefix: str) -> str:
     return key
 
 
+def last_decision_key(prefix: str) -> str:
+    """Canonical pre-order decision snapshot — the single source of truth the
+    status/dashboard endpoint must read instead of running its own independent
+    ranking simulation."""
+    key = f"{normalize_prefix(prefix)}:runner:last_decision"
+    assert_key_allowed(key, prefix=prefix)
+    return key
+
+
 def status_snapshot_key(prefix: str, warm_rounds: int = 0) -> str:
     key = f"{normalize_prefix(prefix)}:status:snapshot:w{int(warm_rounds)}"
     assert_key_allowed(key, prefix=prefix)
