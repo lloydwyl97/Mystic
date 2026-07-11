@@ -135,6 +135,17 @@ def _norm_sym(symbol: str) -> str:
     return symbol
 
 
+# Non-blocking design (continuation repair, final pre-push audit item 3):
+# historical bucket quality is a trade-opinion/expected-value signal, not a
+# real-time safety fact (contrast with SCALP's live spread/impact/net-edge
+# checks). None of these branches may remove an otherwise-executable
+# candidate outright anymore — they only express *how strongly* to shrink
+# size and penalize rank. BUCKET_SIZE_FLOOR keeps that shrink meaningful
+# (a real, much-smaller position) rather than zeroing size to a de facto
+# hard block through the back door.
+BUCKET_SIZE_FLOOR = 0.22
+
+
 def evaluate_bucket_entry(
     *,
     symbol: str,
@@ -145,8 +156,11 @@ def evaluate_bucket_entry(
     strategy_family: str | None = None,
 ) -> dict[str, Any]:
     """
-    Pre-entry gate: block killed buckets, penalize risky buckets via size_factor.
-    Returns allowed, block_reason, bucket_size_factor, bucket_rank_delta.
+    Pre-entry advisory: historical bucket quality influences size/rank only.
+    `allowed` is always True — kept in the return shape for backward-
+    compatible logging/diagnostics, not as a permission gate. Returns
+    allowed, block_reason (advisory label when a kill condition matched),
+    bucket_size_factor, bucket_rank_delta.
     """
     sym = _norm_sym(symbol)
     reg = str(regime or "neutral").lower()
@@ -166,57 +180,57 @@ def evaluate_bucket_entry(
 
     if (reg, setup_s) in GLOBAL_KILLED_REGIME_THESIS:
         return {
-            "allowed": False,
+            "allowed": True,
             "block_reason": "BUCKET_KILL_REGIME_THESIS",
-            "bucket_size_factor": 0.0,
+            "bucket_size_factor": BUCKET_SIZE_FLOOR,
             "bucket_rank_delta": -0.20,
         }
 
     if key in REPLAY_KILLED_BUCKETS:
         return {
-            "allowed": False,
+            "allowed": True,
             "block_reason": "BUCKET_KILL_REPLAY_RANGE_VWAP",
-            "bucket_size_factor": 0.0,
+            "bucket_size_factor": BUCKET_SIZE_FLOOR,
             "bucket_rank_delta": -0.20,
         }
 
     if extra_killed and key in extra_killed:
         return {
-            "allowed": False,
+            "allowed": True,
             "block_reason": "BUCKET_KILL_WALKFORWARD",
-            "bucket_size_factor": 0.0,
+            "bucket_size_factor": BUCKET_SIZE_FLOOR,
             "bucket_rank_delta": -0.20,
         }
 
     if stats and stats.trades >= MIN_TRADES_FOR_KILL:
         if stats.net_pnl_usd <= MIN_BUCKET_NET_PNL_KILL:
             return {
-                "allowed": False,
+                "allowed": True,
                 "block_reason": "BUCKET_KILL_NEGATIVE_EXPECTANCY",
-                "bucket_size_factor": 0.0,
+                "bucket_size_factor": BUCKET_SIZE_FLOOR,
                 "bucket_rank_delta": -0.15,
             }
         hold_kill = MAX_AVG_HOLD_HOURS_RANGE_KILL if reg == DAY_REGIME_RANGE else MAX_AVG_HOLD_HOURS_KILL
         if stats.avg_hold_hours >= hold_kill and stats.net_pnl_usd < 0:
             return {
-                "allowed": False,
+                "allowed": True,
                 "block_reason": "BUCKET_KILL_FAT_TAIL_HOLD",
-                "bucket_size_factor": 0.0,
+                "bucket_size_factor": BUCKET_SIZE_FLOOR,
                 "bucket_rank_delta": -0.12,
             }
         if stats.failed_profit_floor >= MIN_FAILED_PROFIT_FLOOR_KILL and stats.net_pnl_usd < 0:
             return {
-                "allowed": False,
+                "allowed": True,
                 "block_reason": "BUCKET_KILL_FAILED_PROFIT_FLOOR",
-                "bucket_size_factor": 0.0,
+                "bucket_size_factor": BUCKET_SIZE_FLOOR,
                 "bucket_rank_delta": -0.12,
             }
         if stats.avg_mfe_pct > 0 and stats.avg_mae_pct < 0 and abs(stats.avg_mae_pct) > stats.avg_mfe_pct * 1.5:
             if stats.net_pnl_usd < 0 and stats.trades >= MIN_TRADES_FOR_KILL:
                 return {
-                    "allowed": False,
+                    "allowed": True,
                     "block_reason": "BUCKET_KILL_HIGH_MAE_LOW_MFE",
-                    "bucket_size_factor": 0.0,
+                    "bucket_size_factor": BUCKET_SIZE_FLOOR,
                     "bucket_rank_delta": -0.10,
                 }
 

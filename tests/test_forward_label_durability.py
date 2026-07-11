@@ -129,6 +129,32 @@ def test_missing_durable_evidence_is_a_specific_unrecoverable_reason_not_silent(
         assert row[1] is not None, "the row must record when/that it was given up on, not disappear silently"
 
 
+def test_rest_outage_before_giveup_horizon_stays_retryable_not_destroyed():
+    """
+    Scenario (explicit final pre-push audit requirement): a temporary REST
+    outage while Redis coverage is also empty, but the row has NOT yet
+    reached LABEL_GIVEUP_AGE_SEC, must leave the row retryable (PENDING or
+    PARTIAL) so a later cycle can still complete it — never prematurely
+    mark it UNLABELABLE just because one cycle's REST call failed.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "learn5.db"
+        ensure_learning_ingestion_tables(str(db_path))
+        # Past the 50% REST-trigger threshold, but well before the full giveup age.
+        old_epoch_ms = (time.time() - LABEL_GIVEUP_AGE_SEC * 0.6) * 1000.0
+        _seed_snapshot(db_path, epoch_ms=old_epoch_ms)
+
+        with patch("backend.config.redis_config.get_redis_client", return_value=_FakeRedisEmpty()), patch(
+            "backend.services.ai_learning_ingestion._fetch_historical_klines_rest", return_value=[]
+        ):
+            counters = label_pending_snapshots(str(db_path))
+
+        assert counters["unlabelable"] == 0, "a transient REST outage must not destroy labelability before giveup age"
+        with sqlite3.connect(str(db_path)) as conn:
+            row = conn.execute("SELECT label_status FROM ai_candidate_snapshots").fetchone()
+        assert row[0] in ("PENDING", "PARTIAL"), f"row must remain retryable, got {row[0]!r}"
+
+
 def test_rest_fallback_does_not_fire_for_ordinary_in_flight_rows():
     """REST fallback must be a last resort, not fire on every routine ~2min cycle
     for rows that simply haven't reached their horizon yet."""

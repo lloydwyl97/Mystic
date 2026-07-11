@@ -42,10 +42,17 @@ class RangeBounceScalpStrategy:
             return reject_signal(ctx, self.name, "RANGE_TOO_WIDE")
 
         last = bars[-1]
+        # wick_rejection is mathematically >= 0 (close >= low always) and is a
+        # continuous measure of how strongly the last bar rejected support,
+        # not a binary safety fact. It is NOT a hard gate: whether the wick is
+        # small, absent, or large, it flows directly into `score` below
+        # (score = 2.5 + wick_rejection * 500 + recovery * 400) as a
+        # score/rank contribution. A missing rejection wick alone must never
+        # remove an otherwise-executable candidate (Mystic rule: no
+        # rejection-wick trade-opinion entry blocker) — real bounce evidence
+        # is still required via the momentum-flip checks immediately below,
+        # which use live 15s/30s/60s order-book momentum, not candle shape.
         wick_rejection = (last["close"] - last["low"]) / last["close"] if last["close"] > 0 else 0
-        min_wick = 0.00035
-        if wick_rejection < min_wick:
-            return reject_signal(ctx, self.name, "NO_REJECTION_WICK")
 
         mom = ctx.mom
         if not (mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0):

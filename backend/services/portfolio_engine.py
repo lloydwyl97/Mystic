@@ -11344,22 +11344,37 @@ class PortfolioEngine:
             return cand
         return None
 
+    # Bounded retry backoff schedule (seconds) for _fetch_redis_ai_signal_string_map.
+    # A real, observed incident (13 consecutive SIGNAL_CONTENT_TIMESTAMP_MISSING
+    # rejects for one symbol immediately after a process restart, self-resolving
+    # ~13 minutes later with no further occurrences) is consistent with a
+    # cold sync-Redis-client connection-pool establishment race outlasting a
+    # single 50ms retry, not a genuinely absent/expired hash (the atomic
+    # HMSET+EXPIRE writer pipeline was confirmed still succeeding every cycle
+    # throughout that same window). Widening the bounded retry budget gives a
+    # freshly-created connection pool room to finish connecting without
+    # broadly changing the Redis client architecture.
+    _SIGNAL_FETCH_RETRY_BACKOFF_SEC: tuple[float, ...] = (0.05, 0.15, 0.3)
+
     def _fetch_redis_ai_signal_string_map(self, strategy_id: str, symbol_bus_no_slash: str) -> dict[str, str]:
         """
         Sync HGETALL of canonical ai_signal:<strategy>:<BUS> Redis hash.
 
-        Retries once on empty/exception before giving up: this call runs from
-        inside the async execution path, and a single transient sync-client
-        hiccup here previously produced a silent {} -> the caller then had no
-        "timestamp" field to hydrate, and the BUY execution's entry-context
-        re-check failed closed with SIGNAL_CONTENT_TIMESTAMP_MISSING even
-        though the live signal hash was fresh and present in Redis.
+        Retries with bounded backoff on empty/exception before giving up:
+        this call runs from inside the async execution path, and a transient
+        sync-client hiccup here (including cold connection-pool
+        establishment right after process start) previously produced a
+        silent {} -> the caller then had no "timestamp" field to hydrate, and
+        the BUY execution's entry-context re-check failed closed with
+        SIGNAL_CONTENT_TIMESTAMP_MISSING even though the live signal hash was
+        fresh and present in Redis.
         """
         from backend.config.redis_config import get_redis_client
 
         key = redis_ai_signal_key(strategy_id, symbol_bus_no_slash)
         last_exc: Exception | None = None
-        for attempt in range(2):
+        attempts = len(self._SIGNAL_FETCH_RETRY_BACKOFF_SEC) + 1
+        for attempt in range(attempts):
             dd: dict[str, str] = {}
             try:
                 redis_client = get_redis_client()
@@ -11372,12 +11387,12 @@ class PortfolioEngine:
                     return dd
             except Exception as exc:
                 last_exc = exc
-            if attempt == 0:
-                time.sleep(0.05)
+            if attempt < len(self._SIGNAL_FETCH_RETRY_BACKOFF_SEC):
+                time.sleep(self._SIGNAL_FETCH_RETRY_BACKOFF_SEC[attempt])
         if last_exc is not None:
-            logger.warning("AI_SIGNAL_HASH_FETCH_FAILED key=%s err=%s", key, last_exc)
+            logger.warning("AI_SIGNAL_HASH_FETCH_FAILED key=%s err=%s attempts=%d", key, last_exc, attempts)
         else:
-            logger.debug("AI_SIGNAL_HASH_FETCH_EMPTY key=%s (no exception, hash absent/expired)", key)
+            logger.warning("AI_SIGNAL_HASH_FETCH_EMPTY key=%s attempts=%d (no exception, hash absent/expired)", key, attempts)
         return {}
 
     def _merge_redis_signal_entry_audit_into_decision_data(self, dd: dict[str, Any], sig: dict[str, str]) -> list[str]:
@@ -12649,27 +12664,27 @@ class PortfolioEngine:
             except Exception:
                 pass
             _bucket = self._apply_bucket_quality_gate(_tc)
-            if not _bucket.get("allowed"):
+            # NON-BLOCKING BY DESIGN (continuation repair, final pre-push audit
+            # item 3): historical bucket-quality "kill" conditions
+            # (BUCKET_KILL_*) reflect this setup/regime/symbol combo's own
+            # *past* trade-opinion/expected-value performance, not a
+            # real-time execution-safety fact — evaluate_bucket_entry() now
+            # always returns allowed=True and expresses the penalty purely
+            # through bucket_size_factor (shrunk, floored, never zero) and
+            # bucket_rank_delta (already applied inside
+            # _apply_bucket_quality_gate). A poor historical bucket may no
+            # longer remove an otherwise-executable candidate outright.
+            if _bucket.get("block_reason"):
                 _ddb = _tc.decision_data or {}
-                _bmb = 0.0
-                try:
-                    _bmb = float(_ddb.get("buy_margin") or _ddb.get("redis_buy_margin_key") or 0)
-                except Exception:
-                    pass
-                _is_mlb = bool(_ddb.get("ml_enriched") or str(_ddb.get("strategy_family", "")).upper() == "ML_EDGE")
-                if _is_mlb and _bmb > 0.02:
-                    logger.info("ML_BUCKET_BYPASS symbol=%s bm=%.4f (model edge allowed)", _tc.symbol, _bmb)
-                else:
-                    logger.info(
-                        "BUCKET_QUALITY_BLOCK symbol=%s regime=%s setup=%s reason=%s",
-                        _tc.symbol,
-                        _ddb.get("day_route_regime"),
-                        _ddb.get("setup_type"),
-                        _bucket.get("block_reason"),
-                    )
-                    await self._bar_pipeline_terminal(_tc.decision_id, "BUCKET_QUALITY_BLOCKED", pipeline_done)
-                    await self._record_learning_snapshot(_tc, "BLOCK", str(_bucket.get("block_reason") or "BUCKET"))
-                    continue
+                logger.info(
+                    "BUCKET_QUALITY_ADVISORY symbol=%s regime=%s setup=%s reason=%s size_factor=%s",
+                    _tc.symbol,
+                    _ddb.get("day_route_regime"),
+                    _ddb.get("setup_type"),
+                    _bucket.get("block_reason"),
+                    _bucket.get("bucket_size_factor"),
+                )
+                await self._record_learning_snapshot(_tc, "BUCKET_QUALITY_ADVISORY", str(_bucket.get("block_reason") or "BUCKET"))
             _routed.append(_tc)
         valid_candidates = _routed
 
