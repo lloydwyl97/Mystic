@@ -29,7 +29,7 @@ from backend.services.binance_scalp.scalp_candidate_ranking import (
     _min_confident_rank,
     _rank_tie_margin,
 )
-from scripts.watch_scalp_entry_opportunity import (
+from backend.services.binance_scalp.near_pass import (
     NEAR_PASS_THRESHOLD,
     _distance_to_pass,
     is_high_quality_near_pass,
@@ -90,9 +90,13 @@ def _overlay_runner_scan(
             if sym_router.get("router_entry_ready"):
                 row["reject_reason"] = None
                 row["preflight_pass"] = True
+                # Honest naming: PASS only if preflight-ready AND entry is armed.
+                armed = bool(is_entry_armed(rclient, prefix=prefix))
                 row["would_enter_if_armed"] = True
-                row["would_enter"] = True
-                row["decision"] = "PASS"
+                row["would_enter"] = bool(armed)
+                row["entry_armed"] = armed
+                row["decision"] = "PASS" if armed else "READY_TO_WATCH"
+                continue
             elif router_reject:
                 row["reject_reason"] = router_reject
                 row["rank_score"] = rank_score
@@ -240,6 +244,34 @@ def _shadow_projection(
     }
 
 
+# Genuine operational/safety preflight failures only (stale/invalid data, excessive
+# spread, excessive price impact, insufficient depth, no executable net edge, fee
+# model unverified, paper execution disabled). Anything else (no candidate ranked
+# this tick, setup/quality scoring below floor, momentum not yet confirmed) is an
+# ordinary ranking outcome, not an operational block — see status_snapshot honesty
+# repair: "BLOCKED" must be reserved for real safety/operational conditions.
+_GENUINE_SAFETY_REJECT_REASONS = frozenset(
+    {
+        "SPREAD_TOO_WIDE",
+        "PRICE_IMPACT_TOO_HIGH",
+        "DEPTH_INSUFFICIENT",
+        "NET_EDGE_BELOW_MIN",
+        "NET_PROFIT_TARGET_NOT_MET",
+        "ORDERBOOK_MISSING",
+        "FEE_MODEL_UNVERIFIED",
+        "SCALP_PAPER_DISABLED",
+        "NO_MARKET_DATA",
+    }
+)
+
+
+def _is_genuine_safety_block(reject_reason: str | None) -> bool:
+    if not reject_reason:
+        return False
+    code = str(reject_reason).split(":", 1)[0].strip().upper()
+    return code in _GENUINE_SAFETY_REJECT_REASONS
+
+
 def _symbol_decision(row: dict) -> str:
     if row.get("error"):
         return "BLOCKED"
@@ -250,18 +282,21 @@ def _symbol_decision(row: dict) -> str:
     dist = float((row.get("distance_to_pass") or {}).get("distance_to_pass_pct") or 999.0)
     if dist <= NEAR_PASS_THRESHOLD:
         return "NEAR_PASS"
-    return "BLOCKED"
+    if _is_genuine_safety_block(row.get("reject_reason")):
+        return "BLOCKED"
+    # No candidate ranked/eligible this tick — an ordinary ranking outcome, not a block.
+    return "NO_SIGNAL"
 
 
 def _overall_decision(rows: list[dict]) -> str:
     decisions = [_symbol_decision(r) for r in rows if not r.get("error")]
     if not decisions:
-        return "BLOCKED"
-    priority = ("PASS", "READY_TO_WATCH", "NEAR_PASS", "BLOCKED")
+        return "NO_SIGNAL"
+    priority = ("PASS", "READY_TO_WATCH", "NEAR_PASS", "BLOCKED", "NO_SIGNAL")
     for d in priority:
         if d in decisions:
             return d
-    return "BLOCKED"
+    return "NO_SIGNAL"
 
 
 def _top_blocker(rows: list[dict], *, operational: dict[str, Any] | None = None) -> str | None:
@@ -372,6 +407,7 @@ def _evaluate_symbol_status(
                 "would_enter_if_armed": would_enter,
                 "would_arm_high_quality_near_pass": would_arm,
                 "distance_to_pass": dist,
+                "reject_reason": pf.reject_reason or None,
             }
         ),
     }

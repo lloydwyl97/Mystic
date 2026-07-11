@@ -45,6 +45,14 @@ SOFT_REJECT_SCORE: dict[str, float] = {
 
 
 def _min_tradeable_score() -> float:
+    # Evidence review (repair-all Phase 8): entry rank score at the time of
+    # buy showed no meaningful separation between winners and losers in 184
+    # matched SCALP paper trades (NET_PROFIT_TARGET avg entry score 1.48 vs
+    # EARLY_SCRATCH_EXIT avg 1.47, MOMENTUM_FAILED_EXIT avg 1.43) — score does
+    # not discriminate outcome in the observed population, and a 1.45->1.35
+    # floor trim had never actually been deployed (no "after" data exists to
+    # justify it). Reverted to the last measured-good floor rather than
+    # keeping an untested change. Override via SCALP_MIN_TRADEABLE_SCORE.
     return float(os.getenv("SCALP_MIN_TRADEABLE_SCORE", "1.45"))
 
 
@@ -53,6 +61,9 @@ def _rank_tie_margin() -> float:
 
 
 def _min_confident_rank() -> float:
+    # See _min_tradeable_score: reverted 1.45->1.55 for the same reason (no
+    # measured evidence the trimmed floor improves net expectancy). Override
+    # via SCALP_MIN_CONFIDENT_RANK.
     return float(os.getenv("SCALP_MIN_CONFIDENT_RANK", "1.55"))
 
 

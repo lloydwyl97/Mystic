@@ -8,6 +8,7 @@ Net-profit exit remains one path among several — never the only sell path.
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -29,12 +30,14 @@ from backend.services.day_trade_thesis import (
 EXIT_VOLATILITY_STOP = "VOLATILITY_STOP_EXIT"
 EXIT_TIME_STOP = "TIME_STOP_EXIT"
 EXIT_FAILED_RECLAIM = "FAILED_RECLAIM_EXIT"
+EXIT_STALL = "STALL_EXIT"
 
 ALLOWED_DAY_EXIT_REASONS = frozenset(
     {
         EXIT_NET_PROFIT,
         EXIT_VOLATILITY_STOP,
         EXIT_TIME_STOP,
+        EXIT_STALL,
         EXIT_FAILED_RECLAIM,
         EXIT_EXTREME_PROTECTION,
         EXIT_THESIS_INVALIDATION,
@@ -51,12 +54,70 @@ ENGINE_RISK_EXIT_PREFIXES = (
     EXIT_STOP_LOSS,
     EXIT_VOLATILITY_STOP,
     EXIT_TIME_STOP,
+    EXIT_STALL,
     EXIT_TRAILING_STOP,
     EXIT_THESIS_INVALIDATION,
     EXIT_FAILED_RECLAIM,
     EXIT_EXTREME_PROTECTION,
     "ALLWEATHER",
 )
+
+
+def _stall_exit_enabled() -> bool:
+    return os.getenv("DAY_STALL_EXIT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+
+def _stall_min_hold_min() -> float:
+    return float(os.getenv("DAY_STALL_MIN_HOLD_MIN", "30"))
+
+
+def _stall_max_mfe_pct() -> float:
+    """Max mark MFE (fraction) allowed for a stall cut. Default 0.15%."""
+    return float(os.getenv("DAY_STALL_MAX_MFE_PCT", "0.0015"))
+
+
+def evaluate_stall_exit(
+    *,
+    entry_price: float,
+    highest_price: float,
+    net_pnl_pct: float,
+    hold_minutes: float,
+    max_hold_min: int,
+) -> dict[str, Any] | None:
+    """
+    Cut dead DAY holds that never make meaningful progress before hard time-stop.
+
+    Evidence: MANUAL/time-stop losers typically show no TP1 progress by 15–30m
+    and then bleed until 75–90m. This is exit-only — no entry/ranking changes.
+    """
+    if not _stall_exit_enabled():
+        return None
+    entry = float(entry_price or 0.0)
+    if entry <= 0:
+        return None
+    stall_min = _stall_min_hold_min()
+    if hold_minutes < stall_min:
+        return None
+    # Never replace the hard ceiling — time-stop still owns max_hold.
+    if hold_minutes + 1e-9 >= float(max_hold_min):
+        return None
+    # Only cut flat/losing paths — never scratch small greens before TP.
+    if net_pnl_pct + 1e-12 >= 0.0:
+        return None
+    # Only cut when still below the net-profit floor (same eligibility as time-stop).
+    if net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL):
+        return None
+    highest = float(highest_price or entry)
+    mfe_pct = max(0.0, (highest - entry) / entry)
+    if mfe_pct >= _stall_max_mfe_pct():
+        return None
+    return {
+        "action": "sell",
+        "reason": EXIT_STALL,
+        "net_pnl_pct": net_pnl_pct,
+        "hold_minutes": hold_minutes,
+        "detail": f"stall_min={stall_min:.0f}m mfe={mfe_pct:.6f} max_mfe={_stall_max_mfe_pct():.6f}",
+    }
 
 
 @dataclass(frozen=True)
@@ -227,9 +288,19 @@ def preview_next_engine_exit(
     trail = float(getattr(position, "trailing_stop_price", 0) or 0)
     thesis = str(getattr(position, "entry_thesis", "") or "")
 
+    highest = float(getattr(position, "highest_price", entry) or entry)
+    mfe_pct = max(0.0, (highest - entry) / entry) if entry > 0 else 0.0
+    stall_ready = bool(
+        _stall_exit_enabled()
+        and hold_minutes >= _stall_min_hold_min()
+        and hold_minutes + 1e-9 < float(max_hold)
+        and net_pnl_pct + 1e-12 < 0.0
+        and mfe_pct < _stall_max_mfe_pct()
+    )
     checks = {
         "stop_loss": bool(stop > 0 and current_price <= stop),
-        "trailing_stop": bool(trail > 0 and current_price <= trail and float(getattr(position, "highest_price", entry) or entry) >= entry * (1 + float(coin_profile.get("trail") or 0.005))),
+        "trailing_stop": bool(trail > 0 and current_price <= trail and highest >= entry * (1 + float(coin_profile.get("trail") or 0.005))),
+        "stall_exit": stall_ready,
         "time_stop": bool(hold_minutes >= max_hold and net_pnl_pct + 1e-12 < float(MIN_NET_PROFIT_TO_SELL)),
         "profit_target": bool(target > 0 and current_price >= target and net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL) * 0.45),
         "net_profit": bool(net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL)),
@@ -239,6 +310,7 @@ def preview_next_engine_exit(
     priority = [
         ("stop_loss", EXIT_STOP_LOSS),
         ("trailing_stop", EXIT_TRAILING_STOP),
+        ("stall_exit", EXIT_STALL),
         ("time_stop", EXIT_TIME_STOP),
         ("profit_target", EXIT_NET_PROFIT),
         ("net_profit", EXIT_NET_PROFIT),
@@ -372,6 +444,16 @@ def evaluate_engine_managed_exit(
             }
 
     max_hold = int(getattr(position, "max_hold_min", 0) or coin_profile.get("max_hold_min") or 75)
+    stall = evaluate_stall_exit(
+        entry_price=entry,
+        highest_price=float(getattr(position, "highest_price", entry) or entry),
+        net_pnl_pct=net_pnl_pct,
+        hold_minutes=hold_minutes,
+        max_hold_min=max_hold,
+    )
+    if stall is not None:
+        return stall
+
     if hold_minutes >= max_hold and net_pnl_pct + 1e-12 < float(MIN_NET_PROFIT_TO_SELL):
         return {
             "action": "sell",
@@ -628,15 +710,29 @@ def evaluate_pre_buy_exit_consistency(
     result["checks"]["route_allowed"] = bool(route.get("allowed"))
     result["checks"]["route_block_reason"] = str(route.get("block_reason") or "")
     if not route.get("allowed"):
-        result.update(
-            {
-                "allowed": False,
-                "block_reason": f"SETUP_REGIME_INCOMPATIBLE:{route.get('block_reason') or 'REGIME_ROUTE'}",
-                "setup_regime_compatible": False,
-                "entry_exit_state_consistent": False,
-            }
-        )
-        return result
+        route_reason = str(route.get("block_reason") or "REGIME_ROUTE")
+        # Executable-edge failures (no net profit after fees at the thesis target)
+        # are genuine operational conditions and remain hard-blocked. Every other
+        # router outcome is a setup/regime *label* mismatch — a ranking/scoring
+        # opinion, not a permission decision — and must not reject the trade.
+        # Mystic is a ranking-and-trading engine: regime incompatibility is
+        # surfaced as advisory penalty info only (route_rank_delta/route_size_factor
+        # are still available to the caller for sizing/scoring).
+        if "MFE_TOO_LOW" in route_reason:
+            result.update(
+                {
+                    "allowed": False,
+                    "block_reason": f"SETUP_REGIME_INCOMPATIBLE:{route_reason}",
+                    "setup_regime_compatible": False,
+                    "entry_exit_state_consistent": False,
+                }
+            )
+            return result
+        result["checks"]["route_regime_mismatch_advisory"] = route_reason
+        result["checks"]["route_rank_delta"] = route.get("route_rank_delta", 0.0)
+        result["checks"]["route_size_factor"] = route.get("route_size_factor", 1.0)
+        # Fall through: continue with the remaining (non-regime-opinion) entry/exit
+        # state checks below instead of rejecting on regime-label mismatch alone.
 
     invalid_level = float(thesis_invalid_level or 0.0)
     atr_pct = 0.01

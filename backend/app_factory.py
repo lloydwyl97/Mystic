@@ -12,21 +12,17 @@ import asyncio
 import contextlib
 import logging
 import os
-import socket as _socket
 import sys
 import tracemalloc
 
 # CRITICAL FIX: Force IPv4 for ALL connections (Binance US requirement)
 # Binance US returns error: {"code":-71012,"msg":"IPv6 not supported"}
-# Must be applied BEFORE any other imports that might create socket connections
+# Must be applied BEFORE any other imports that might create socket connections.
+# Shared, idempotent patch — see backend/utils/network_ipv4.py.
 try:
-    _original_getaddrinfo = _socket.getaddrinfo
+    from backend.utils.network_ipv4 import ensure_ipv4_only
 
-    def _force_ipv4_getaddrinfo(host, port, family=0, sock_type=0, proto=0, flags=0):
-        """Force all connections to use IPv4 (AF_INET) to avoid Binance US IPv6 errors"""
-        return _original_getaddrinfo(host, port, _socket.AF_INET, sock_type, proto, flags)
-
-    _socket.getaddrinfo = _force_ipv4_getaddrinfo
+    ensure_ipv4_only()
     print("[OK] IPv4-only mode enabled (Binance US requirement)")
 except Exception as e:
     print(f"[WARNING] Could not force IPv4 mode: {e}")
@@ -38,7 +34,6 @@ if sys.platform == "win32":
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from dotenv import load_dotenv
 
@@ -342,46 +337,10 @@ except (ImportError, ModuleNotFoundError, AttributeError, ValueError, TypeError,
 # along with their underlying modules. Do not re-add per-router try/except
 # blocks here — add new endpoints to the consolidated essentials list instead.
 
-# --- IPv4 networking configuration ---
-# IPv4 patch state - using dict to avoid global keyword
-_ipv4_patch_state: dict[str, Any] = {
-    "orig_getaddrinfo": None,
-    "patch_applied": False,
-}
-
-
-def apply_ipv4_patch() -> None:
-    """Apply IPv4-only networking patch if FORCE_IPV4 env var is set"""
-    if os.getenv("FORCE_IPV4", "0").lower() not in ("1", "true", "yes"):
-        return
-
-    try:
-        _ipv4_patch_state["orig_getaddrinfo"] = getattr(_socket, "getaddrinfo", None)
-
-        def _ipv4_getaddrinfo(host, port, family=0, sock_type=0, proto=0, flags=0):  # type: ignore[override]
-            try:
-                return _ipv4_patch_state["orig_getaddrinfo"](host, port, _socket.AF_INET, sock_type, proto, flags)  # type: ignore[misc]
-            except (OSError, _socket.gaierror, _socket.herror) as e:
-                logger.debug(f"IPv4 fallback for {host}:{port}: {e}")
-                return _ipv4_patch_state["orig_getaddrinfo"](host, port, family, sock_type, proto, flags)  # type: ignore[misc]
-
-        if callable(_ipv4_patch_state["orig_getaddrinfo"]):
-            _socket.getaddrinfo = _ipv4_getaddrinfo  # type: ignore[assignment]
-            _ipv4_patch_state["patch_applied"] = True
-            logger.info("[INFO] IPv4-only networking patch applied (FORCE_IPV4=1)")
-    except (AttributeError, OSError, TypeError) as e:
-        logger.exception(f"[WARN] Failed to apply IPv4 patch: {e}")
-    except (ValueError, KeyError, IndexError, RuntimeError) as e:
-        logger.exception(f"[ERROR] Unexpected error applying IPv4 patch: {e}")
-
-
-def restore_ipv4_patch() -> None:
-    """Restore original networking if IPv4 patch was applied"""
-    if _ipv4_patch_state["patch_applied"] and _ipv4_patch_state["orig_getaddrinfo"]:
-        _socket.getaddrinfo = _ipv4_patch_state["orig_getaddrinfo"]  # type: ignore[assignment]
-        _ipv4_patch_state["patch_applied"] = False
-        logger.info("[INFO] IPv4 networking patch restored")
-
+# IPv4-only DNS patching lives in backend/utils/network_ipv4.py (applied once,
+# unconditionally, above) — removed a second dead/unused gated implementation
+# (apply_ipv4_patch/restore_ipv4_patch, never called anywhere) that duplicated
+# the same monkey-patch with different fallback semantics.
 
 # Ensure UTF-8 stdout/stderr to avoid Windows console Unicode crashes
 try:

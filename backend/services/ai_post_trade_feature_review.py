@@ -82,19 +82,63 @@ def _strongest_entry_blocks(features: list[float] | None) -> list[dict[str, Any]
     return [{"block": k, "strength": round(v, 6)} for k, v in ranked if v > 1e-9][:8]
 
 
-def _lookup_entry_features(db_path: str, *, decision_id: str, symbol: str) -> list[float] | None:
-    if not decision_id:
-        return None
+def _lookup_entry_features(
+    db_path: str,
+    *,
+    decision_id: str,
+    symbol: str,
+    opened_at_utc: str | None = None,
+    window_sec: int = 900,
+) -> list[float] | None:
     try:
         with sqlite3.connect(db_path) as conn:
-            row = conn.execute(
-                """
-                SELECT features_json FROM ai_inference_log
-                WHERE decision_id=? AND symbol=? AND features_json IS NOT NULL
-                ORDER BY id DESC LIMIT 1
-                """,
-                (decision_id, symbol),
-            ).fetchone()
+            row = None
+            bus = str(symbol or "").replace("/", "").upper()
+            if decision_id:
+                row = conn.execute(
+                    """
+                    SELECT features_json FROM ai_inference_log
+                    WHERE decision_id=? AND features_json IS NOT NULL
+                      AND (
+                        UPPER(REPLACE(symbol, '/', '')) = ?
+                        OR UPPER(symbol) = ?
+                        OR symbol = ?
+                      )
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (decision_id, bus, bus, symbol),
+                ).fetchone()
+                if not row:
+                    row = conn.execute(
+                        """
+                        SELECT features_json FROM ai_inference_log
+                        WHERE decision_id=? AND features_json IS NOT NULL
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (decision_id,),
+                    ).fetchone()
+            if (not row or not row[0]) and opened_at_utc:
+                row = conn.execute(
+                    """
+                    SELECT features_json FROM ai_inference_log
+                    WHERE features_json IS NOT NULL AND length(features_json) > 2
+                      AND (
+                        UPPER(REPLACE(symbol, '/', '')) = ?
+                        OR UPPER(symbol) = ?
+                        OR symbol = ?
+                      )
+                      AND ABS(
+                        (julianday(REPLACE(SUBSTR(ts_utc, 1, 19), 'T', ' ')) -
+                         julianday(REPLACE(SUBSTR(?, 1, 19), 'T', ' '))) * 86400.0
+                      ) <= ?
+                    ORDER BY ABS(
+                      (julianday(REPLACE(SUBSTR(ts_utc, 1, 19), 'T', ' ')) -
+                       julianday(REPLACE(SUBSTR(?, 1, 19), 'T', ' '))) * 86400.0
+                    ) ASC
+                    LIMIT 1
+                    """,
+                    (bus, bus, symbol, opened_at_utc, float(window_sec), opened_at_utc),
+                ).fetchone()
             if not row or not row[0]:
                 return None
             parsed = json.loads(row[0])

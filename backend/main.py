@@ -1,17 +1,9 @@
-# CRITICAL: Force IPv4 BEFORE any other imports (Binance US requirement)
-import socket as _socket
+# CRITICAL: Force IPv4 BEFORE any other imports (Binance US requirement).
+# Shared, idempotent patch — see backend/utils/network_ipv4.py for why this is
+# a single bootstrap location instead of a per-module monkey-patch.
+from backend.utils.network_ipv4 import ensure_ipv4_only
 
-_original_getaddrinfo = _socket.getaddrinfo
-
-
-def _force_ipv4_getaddrinfo(*args, **kwargs):
-    """Filter to only return IPv4 addresses."""
-    responses = _original_getaddrinfo(*args, **kwargs)
-    ipv4_responses = [r for r in responses if r[0] == _socket.AF_INET]
-    return ipv4_responses if ipv4_responses else responses
-
-
-_socket.getaddrinfo = _force_ipv4_getaddrinfo
+ensure_ipv4_only()
 
 from backend.app_factory import create_app
 

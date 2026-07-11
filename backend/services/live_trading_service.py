@@ -31,21 +31,12 @@ except (ImportError, ModuleNotFoundError, AttributeError, ValueError, TypeError,
 # Load environment variables
 load_dotenv()
 
-# Force IPv4 only for all connections (Binance US requirement)
+# Force IPv4 only for all connections (Binance US requirement) — shared bootstrap patch.
 try:
-    import socket as _socket
+    from backend.utils.network_ipv4 import ensure_ipv4_only
 
-    _orig_getaddrinfo = getattr(_socket, "getaddrinfo", None)
-
-    def _ipv4_getaddrinfo(host, port, family=0, sock_type=0, proto=0, flags=0):
-        try:
-            return _orig_getaddrinfo(host, port, _socket.AF_INET, sock_type, proto, flags)
-        except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
-            return _orig_getaddrinfo(host, port, family, sock_type, proto, flags)
-
-    if callable(_orig_getaddrinfo):
-        _socket.getaddrinfo = _ipv4_getaddrinfo
-except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
+    ensure_ipv4_only()
+except ImportError:
     pass
 
 # Configure logging (guard to avoid duplicate handlers)

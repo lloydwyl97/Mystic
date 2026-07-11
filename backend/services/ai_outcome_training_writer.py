@@ -174,6 +174,9 @@ def record_outcome_training_row(
                     net_pnl_pct=excluded.net_pnl_pct,
                     gross_pnl_pct=excluded.gross_pnl_pct,
                     trade_was_worth_taking=excluded.trade_was_worth_taking,
+                    features_json=COALESCE(excluded.features_json, ai_outcome_training_rows.features_json),
+                    context_json=COALESCE(excluded.context_json, ai_outcome_training_rows.context_json),
+                    score_components_json=COALESCE(excluded.score_components_json, ai_outcome_training_rows.score_components_json),
                     ingested_at_utc=excluded.ingested_at_utc
                 """,
                 (
@@ -444,9 +447,81 @@ def repair_missing_sell_feature_versions(
     return changed
 
 
+def backfill_outcome_features_from_inference(db_path: str = DATABASE_PATH, *, window_sec: int = 900) -> int:
+    """
+    Fill NULL features_json on ai_outcome_training_rows from nearest ai_inference_log row.
+    Matches by normalized symbol within ±window_sec of opened_at_utc.
+    Returns number of rows updated.
+    """
+    updated = 0
+    try:
+        ensure_ai_canonical_tables(db_path)
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT id, symbol, opened_at_utc, strategy_id
+                FROM ai_outcome_training_rows
+                WHERE features_json IS NULL OR features_json = '' OR features_json = 'null'
+                """
+            ).fetchall()
+            for row in rows:
+                sym = str(row["symbol"] or "")
+                bus = sym.replace("/", "").upper()
+                opened = str(row["opened_at_utc"] or "")
+                if not opened:
+                    continue
+                # Prefer inference near open; allow either BTCUSDT or BTC/USDT forms.
+                inf = conn.execute(
+                    """
+                    SELECT features_json, feature_version, feature_dim, decision_id, strategy_id
+                    FROM ai_inference_log
+                    WHERE features_json IS NOT NULL AND length(features_json) > 2
+                      AND (
+                        UPPER(REPLACE(symbol, '/', '')) = ?
+                        OR UPPER(symbol) = ?
+                        OR UPPER(symbol) = ?
+                      )
+                      AND ABS(
+                        (julianday(REPLACE(SUBSTR(ts_utc, 1, 19), 'T', ' ')) -
+                         julianday(REPLACE(SUBSTR(?, 1, 19), 'T', ' '))) * 86400.0
+                      ) <= ?
+                    ORDER BY ABS(
+                      (julianday(REPLACE(SUBSTR(ts_utc, 1, 19), 'T', ' ')) -
+                       julianday(REPLACE(SUBSTR(?, 1, 19), 'T', ' '))) * 86400.0
+                    ) ASC
+                    LIMIT 1
+                    """,
+                    (bus, bus, sym.upper(), opened, float(window_sec), opened),
+                ).fetchone()
+                if not inf or not inf["features_json"]:
+                    continue
+                ctx = json.dumps(
+                    {
+                        "_feature_version": int(inf["feature_version"] or 5),
+                        "feature_version": int(inf["feature_version"] or 5),
+                        "feature_dim": int(inf["feature_dim"] or 0) or None,
+                        "decision_id": inf["decision_id"],
+                        "_live_ai_strategy": str(inf["strategy_id"] or row["strategy_id"] or "day"),
+                        "backfilled_from_inference": True,
+                    },
+                    separators=(",", ":"),
+                )
+                conn.execute(
+                    "UPDATE ai_outcome_training_rows SET features_json=?, context_json=COALESCE(context_json, ?) WHERE id=?",
+                    (inf["features_json"], ctx, int(row["id"])),
+                )
+                updated += 1
+            conn.commit()
+    except Exception as exc:
+        logger.warning("backfill_outcome_features_from_inference failed: %s", exc)
+    return updated
+
+
 __all__ = [
     "classify_outcome_label",
     "record_outcome_training_row",
     "repair_mislabeled_profitable_ai_sells",
     "repair_missing_sell_feature_versions",
+    "backfill_outcome_features_from_inference",
 ]

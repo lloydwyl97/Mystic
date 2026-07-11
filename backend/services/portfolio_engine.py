@@ -51,7 +51,6 @@ from backend.config.buy_admission import (
 )
 from backend.config.core_test_flags import (
     ENABLE_ATR_ENFORCEMENT,
-    ENABLE_COOLDOWN_ENFORCEMENT,
     ENABLE_OVERFLOW_SIZING,
     ENABLE_SLEEVE_BLOCKING,
     log_effective_flags_once,
@@ -237,9 +236,6 @@ MAJOR_COIN_SL_BOUNDS: dict[str, tuple[float, float]] = {
 # Phase 3: Exchange symbol constraints TTL (6-12h recommended; Binance filter drift)
 CONSTRAINTS_TTL_SECONDS = int(os.getenv("CONSTRAINTS_TTL_HOURS", "12")) * 3600
 
-# Soft per-symbol buy cooldown (anti-thrash when signals flicker)
-BUY_COOLDOWN_SEC = int(os.getenv("BUY_COOLDOWN_SEC", "90"))
-
 # =============================================================================
 # RECOVERY / CORRUPTION DETECTION FEATURE FLAGS
 # =============================================================================
@@ -327,17 +323,19 @@ def _symbol_group_baseline(group: str) -> float:
 # these via evaluate_engine_managed_exit (see _check_exit_conditions).
 # =============================================================================
 COIN_PROFILES = {
-    "BTCUSDT": {"tp": 0.012, "sl": 0.008, "trail": 0.0040, "max_hold_min": 90},
-    "ETHUSDT": {"tp": 0.013, "sl": 0.009, "trail": 0.0045, "max_hold_min": 90},
-    "SOLUSDT": {"tp": 0.015, "sl": 0.010, "trail": 0.0055, "max_hold_min": 75},
-    "XRPUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0050, "max_hold_min": 75},
+    # Shorter max-hold: MANUAL/time-stop losers avg ~80m and wipe TP1 edge.
+    # New positions pick these up at stamp; open positions keep stamped max_hold_min.
+    "BTCUSDT": {"tp": 0.012, "sl": 0.008, "trail": 0.0040, "max_hold_min": 60},
+    "ETHUSDT": {"tp": 0.013, "sl": 0.009, "trail": 0.0045, "max_hold_min": 60},
+    "SOLUSDT": {"tp": 0.015, "sl": 0.010, "trail": 0.0055, "max_hold_min": 50},
+    "XRPUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0050, "max_hold_min": 50},
 }
 
 DEFAULT_COIN_PROFILE = {
     "tp": 0.014,
     "sl": 0.010,
     "trail": 0.005,
-    "max_hold_min": 75,
+    "max_hold_min": 50,
 }
 
 
@@ -523,10 +521,9 @@ POST_SELL_COOLDOWN_BARS = int(os.getenv("POST_SELL_COOLDOWN_BARS", "40"))  # Blo
 GLOBAL_SELL_COOLDOWN_BARS = int(os.getenv("GLOBAL_SELL_COOLDOWN_BARS", "10"))  # Block ALL buys for N bars after any sell
 POST_SELL_COOLDOWN_WALL_SEC = int(os.getenv("POST_SELL_COOLDOWN_WALL_SEC", "2400"))  # 40 min wall-clock backup
 GLOBAL_SELL_COOLDOWN_WALL_SEC = int(os.getenv("GLOBAL_SELL_COOLDOWN_WALL_SEC", "600"))  # 10 min wall-clock backup
-# Local staged testing only (set in deploy/core_only_local.env). Omit that file outside local VM — defaults false.
-PORTFOLIO_LOCAL_SKIP_GLOBAL_SELL_COOLDOWN = os.getenv("PORTFOLIO_LOCAL_SKIP_GLOBAL_SELL_COOLDOWN", "false").lower() == "true"
-# Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
-PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN = os.getenv("PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN", "false").lower() == "true"
+# PORTFOLIO_LOCAL_SKIP_GLOBAL_SELL_COOLDOWN / PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN removed:
+# sell-cooldown enforcement itself was removed from _can_open_position and execute_buy_fifo
+# (prior-trade-outcome blockers are not permitted — see Mystic ranking-engine rules).
 # Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
 PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK = os.getenv("PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK", "false").lower() == "true"
 # Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
@@ -1677,7 +1674,6 @@ class PortfolioEngine:
         self._insufficient_balance_cooldown_sec: float = 600.0  # 10 min
 
         # Soft per-symbol buy cooldown (anti-thrash when signals flicker)
-        self._last_buy_ts: dict[str, float] = {}
 
         # Thesis invalidation churn: temporary rank/size penalty per symbol (not permanent block)
         self._thesis_invalidation_strikes: dict[str, list[float]] = {}
@@ -3590,6 +3586,20 @@ class PortfolioEngine:
         except Exception as e:
             logger.warning(f"DB schema check failed: {e}")
 
+        # Create strategy_runtime_audit up front, outside of any BUY/SELL write
+        # transaction. execute_sell_fifo's _op() opens its own BEGIN IMMEDIATE and
+        # then (on a fresh DB) calls ensure_strategy_runtime_audit_table(), which
+        # opens a second connection and also needs BEGIN IMMEDIATE — a same-thread
+        # writer-vs-writer self-contention that can stall a SELL for the full
+        # busy-timeout*retries window on a brand-new database. Ensuring it here
+        # (before any trade executes) makes the in-trade call a fast no-op read.
+        try:
+            from backend.services.strategy_runtime_audit import ensure_strategy_runtime_audit_table
+
+            ensure_strategy_runtime_audit_table(self.db_path)
+        except Exception as e:
+            logger.warning("ensure_strategy_runtime_audit_table (startup) failed: %s", e)
+
     # Legacy alias for backwards compatibility
     async def initialize_from_db(self) -> None:
         """
@@ -4522,11 +4532,22 @@ class PortfolioEngine:
             return EXIT_NET_PROFIT
 
         # If trigger itself carries a full canonical _EXIT label, use it (prevents MANUAL leakage)
-        for canon in ("TIME_STOP_EXIT", "NET_PROFIT_EXIT", "STOP_LOSS_EXIT", "TRAILING_STOP_EXIT", "THESIS_INVALIDATION_EXIT", "FAILED_RECLAIM_EXIT", "EXTREME_PROTECTION_EXIT"):
+        for canon in (
+            "TIME_STOP_EXIT",
+            "STALL_EXIT",
+            "NET_PROFIT_EXIT",
+            "STOP_LOSS_EXIT",
+            "TRAILING_STOP_EXIT",
+            "THESIS_INVALIDATION_EXIT",
+            "FAILED_RECLAIM_EXIT",
+            "EXTREME_PROTECTION_EXIT",
+        ):
             if canon in trig:
                 return canon
 
         # Trigger-first for engine risk exits: always canonical even if exit_type is MANUAL
+        if "STALL" in trig:
+            return "STALL_EXIT"
         if "TIME_STOP" in trig:
             return "TIME_STOP_EXIT"
         if "STOP_LOSS" in trig or "VOLATILITY_STOP" in trig:
@@ -4656,12 +4677,14 @@ class PortfolioEngine:
                 cooldown_state={
                     "cooldown_until": cooldown_until,
                     "post_sell_cooldown_wall_sec": POST_SELL_COOLDOWN_WALL_SEC,
+                    "enforced": False,  # diagnostic-only timer; does not gate re-buys (no prior-outcome blockers)
                 },
                 extra=extra_payload,
             )
             record_trade_outcome(record, db_path=self.db_path, mode_override=(TradingMode.LIVE if self._live_execution_enabled else None))
             with contextlib.suppress(Exception):
                 from backend.services.ai_outcome_training_writer import record_outcome_training_row
+                from backend.services.ai_post_trade_feature_review import _lookup_entry_features
 
                 ex_payload: dict[str, Any] = {}
                 tid = getattr(position, "trade_id", "") or ""
@@ -4670,6 +4693,32 @@ class PortfolioEngine:
                 entry_ts = float(getattr(position, "entry_time", 0.0) or 0.0)
                 opened_iso = datetime.fromtimestamp(entry_ts, tz=timezone.utc).isoformat() if entry_ts > 0 else None
                 closed_iso = datetime.now(timezone.utc).isoformat()
+                decision_id = str(ex_payload.get("decision_id") or ex_payload.get("entry_decision_id") or "")
+                bus = normalize_symbol(symbol).replace("/", "").upper()
+                entry_feats = _lookup_entry_features(
+                    self.db_path,
+                    decision_id=decision_id,
+                    symbol=bus,
+                    opened_at_utc=opened_iso,
+                )
+                if entry_feats is None:
+                    entry_feats = _lookup_entry_features(
+                        self.db_path,
+                        decision_id=decision_id,
+                        symbol=normalize_symbol(symbol),
+                        opened_at_utc=opened_iso,
+                    )
+                feats_json = json.dumps(entry_feats) if entry_feats else None
+                ctx_json = None
+                if entry_feats is not None:
+                    ctx_json = json.dumps(
+                        {
+                            "_feature_version": int(ex_payload.get("feature_version") or 5),
+                            "feature_version": int(ex_payload.get("feature_version") or 5),
+                            "_live_ai_strategy": "day",
+                            "decision_id": decision_id,
+                        }
+                    )
                 record_outcome_training_row(
                     symbol=symbol,
                     opened_at_utc=opened_iso or closed_iso,
@@ -4682,6 +4731,8 @@ class PortfolioEngine:
                     gross_pnl_pct=net_pct,
                     close_reason=close_reason,
                     strategy_id=str(getattr(position, "entry_strategy_id", "") or "day") or "day",
+                    features_json=feats_json,
+                    context_json=ctx_json,
                     explainability=ex_payload,
                     manual_sell=manual_sell,
                     db_path=self.db_path,
@@ -4708,6 +4759,7 @@ class PortfolioEngine:
                     self.db_path,
                     decision_id=str(ex_payload.get("decision_id") or ""),
                     symbol=symbol,
+                    opened_at_utc=opened_iso,
                 )
                 record_outcome_attribution(
                     trade_id=str(tid or getattr(position, "trade_id", "") or ""),
@@ -6544,22 +6596,16 @@ class PortfolioEngine:
         # =================================================================
         from backend.services.ai_artifact_contract_gate import evaluate_explainability_artifact_contract
 
-        # ML / positive edge bypass: allow model-driven buys (even without perfect AW artifact match) so the system trades and learns on current market moves.
-        # This is paper-only path; live will still have stricter contract if desired.
+        # Narrow ML-edge bypass only — never bypass for generic strategy_id "day".
         _ml_bypass_artifact = False
         try:
             _dd_local = (top_candidate.decision_data if "top_candidate" in dir() else None) or {}
-            if _dd_local.get("ml_enriched") or _dd_local.get("strategy_family") == "ML_EDGE" or float(_dd_local.get("buy_margin") or _dd_local.get("redis_buy_margin_key") or 0) > 0.05:
+            _family = str(_dd_local.get("strategy_family") or getattr(explainability, "strategy_family", "") or "")
+            _margin = float(_dd_local.get("buy_margin") or _dd_local.get("redis_buy_margin_key") or 0)
+            if _dd_local.get("ml_enriched") or _family == "ML_EDGE" or (_family.startswith("ML") and _margin > 0.05):
                 _ml_bypass_artifact = True
         except Exception:
             pass
-        if not _ml_bypass_artifact:
-            # Also check explainability for stamped fields
-            try:
-                if getattr(explainability, "live_ai_strategy", "") == "day" or "ML" in str(getattr(explainability, "strategy_family", "")):
-                    _ml_bypass_artifact = True
-            except Exception:
-                pass
 
         if _ml_bypass_artifact:
             ok_ac, ac_code, ac_detail = True, None, {"ml_edge_bypass": True}
@@ -6947,39 +6993,19 @@ class PortfolioEngine:
                 )
             return None
 
-        # Persistent close-ledger cooldown (defense in depth: covers any
-        # Persistent close-ledger cooldown (survives restart).
-        if not PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN:
-            persisted_until = self._lookup_position_close_cooldown(normalized_symbol)
-            now_wall = time.time()
-            if persisted_until and now_wall < persisted_until:
-                remaining = persisted_until - now_wall
-                logger.info(
-                    "BUY_BLOCKED_COOLDOWN_LEDGER: symbol=%s remaining=%.0fs (post-sell or HUMAN_MANUAL_SELL)",
-                    normalized_symbol,
-                    remaining,
-                )
-                await self._record_reject(
-                    normalized_symbol,
-                    "BUY",
-                    f"post_sell_cooldown_ledger_remaining={remaining:.0f}s",
-                    "POST_SELL_COOLDOWN_LEDGER",
-                    decision_id=decision_id,
-                    explainability=explainability,
-                )
-                if decision_id:
-                    await self._update_pipeline_decision(
-                        decision_id,
-                        {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": "POST_SELL_COOLDOWN_LEDGER"},
-                    )
-                with contextlib.suppress(Exception):
-                    from backend.services.ai_missed_opportunity_observer import record_missed_opportunity_observation
-
-                    record_missed_opportunity_observation(
-                        block_reason="POST_SELL_COOLDOWN_LEDGER",
-                        attempted_symbol=normalized_symbol,
-                    )
-                return None
+        # NON-BLOCKING BY DESIGN: a post-sell cooldown ("you just sold this symbol,
+        # therefore wait before rebuying") is a prior-trade-outcome opinion gate,
+        # not a genuine operational/safety condition. It is surfaced as a
+        # diagnostic only — logged, never enforced. Duplicate-position protection
+        # (one open lot per symbol) remains enforced separately above.
+        persisted_until = self._lookup_position_close_cooldown(normalized_symbol)
+        now_wall = time.time()
+        if persisted_until and now_wall < persisted_until:
+            logger.debug(
+                "QUALITY_TELEMETRY POST_SELL_COOLDOWN_LEDGER_ACTIVE would_block symbol=%s remaining=%.0fs (not enforced — diagnostic only)",
+                normalized_symbol,
+                persisted_until - now_wall,
+            )
 
         from backend.config.live_test_mode import can_place_live_orders_sync
         from backend.services.execution_mode_service import is_live_execution_allowed_sync
@@ -7296,6 +7322,12 @@ class PortfolioEngine:
         # Cash decreases by total cost (canonical: cash = USDT on exchange)
         self.cash_balance -= total_cost
         self._available_balance = max(0.0, self.cash_balance)
+        # Persist cash debit immediately so MTM loop cannot reload pre-buy cash.
+        try:
+            async with self._sqlite_writer_lock:
+                await self._persist_ledger_to_sqlite()
+        except Exception:
+            logger.warning("BUY_CASH_PERSIST_EARLY_FAILED symbol=%s — will retry after position stamp", symbol, exc_info=True)
 
         # BUY never changes realized_pnl. positions_value and total_equity recomputed below.
 
@@ -7388,7 +7420,6 @@ class PortfolioEngine:
         mark_new_regime_entry(position)
         self.open_positions[normalized_symbol] = position
         self._recently_added_symbols[normalized_symbol] = time.time()
-        self._last_buy_ts[symbol] = time.time()  # Cooldown in BOTH modes
 
         # Store explainability
         self.trade_explanations[trade_id] = explainability
@@ -9536,6 +9567,35 @@ class PortfolioEngine:
             logger.warning(f"BUY_BLOCKED_PAUSED: {symbol} - trading paused: {self._pause_reason}")
             return False, f"TRADING_PAUSED: {self._pause_reason}"
 
+        # NON-BLOCKING BY DESIGN: loss-streak pause and sell-cooldown timers are
+        # trade-opinion / prior-outcome signals ("we just lost, so stop buying").
+        # Mystic is a ranking-and-trading engine, not a permission bot — these are
+        # surfaced as diagnostics only and MUST NOT gate _can_open_position. Only
+        # genuine operational/safety conditions (above and below) may return False.
+        now_wall = time.time()
+        pause_until = float(getattr(self._quality_filter_state, "loss_streak_pause_until", 0.0) or 0.0)
+        if pause_until > now_wall:
+            logger.debug(
+                "QUALITY_TELEMETRY LOSS_STREAK_PAUSE_ACTIVE would_block symbol=%s remaining=%.0fs (not enforced — diagnostic only)",
+                symbol,
+                pause_until - now_wall,
+            )
+
+        g_wall = float(getattr(self._quality_filter_state, "global_cooldown_wall", 0.0) or 0.0)
+        if g_wall > now_wall:
+            logger.debug(
+                "QUALITY_TELEMETRY GLOBAL_SELL_COOLDOWN_ACTIVE would_block symbol=%s remaining=%.0fs (not enforced — diagnostic only)",
+                symbol,
+                g_wall - now_wall,
+            )
+        sym_wall = float(self._quality_filter_state.symbol_cooldown_wall.get(symbol, 0.0) or 0.0)
+        if sym_wall > now_wall:
+            logger.debug(
+                "QUALITY_TELEMETRY SYMBOL_SELL_COOLDOWN_ACTIVE would_block symbol=%s remaining=%.0fs (not enforced — diagnostic only)",
+                symbol,
+                sym_wall - now_wall,
+            )
+
         # Check max positions (hard limit: 10)
         # DUST_INVARIANT: Exclude DUST_PENDING from count - dust must not block new buys
         active_count = sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING")
@@ -9560,14 +9620,16 @@ class PortfolioEngine:
                 logger.info(f"BUY_BLOCKED_MAX_POSITIONS: {symbol} - portfolio full (active={active_count}, total={len(self.open_positions)}/{max_positions_limit})")
                 return False, "MAX_POSITIONS_REACHED"
 
-        # Bear regime: top-four DAY symbols are correlated — max one open long.
-        if self._is_bear_day_regime() and symbol not in self.open_positions:
-            if _to_api_symbol(symbol) in DAY_TRADE_SYMBOLS and self._count_open_day_top4_positions() >= 1:
-                logger.info(
-                    "BUY_BLOCKED_BEAR_CORRELATION: %s — bear regime allows max 1 DAY top-4 position",
-                    symbol,
-                )
-                return False, "BEAR_REGIME_MAX_ONE_DAY_POSITION"
+        # NON-BLOCKING BY DESIGN: bear regime is advisory context for ranking/sizing,
+        # not a hard entry blocker — Mystic does not gate trades on regime opinion.
+        # The genuine safety control is MAX_OPEN_POSITIONS (enforced above) and the
+        # one-position-per-symbol check (enforced below).
+        if self._is_bear_day_regime() and symbol not in self.open_positions and _to_api_symbol(symbol) in DAY_TRADE_SYMBOLS and self._count_open_day_top4_positions() >= 1:
+            logger.debug(
+                "QUALITY_TELEMETRY BEAR_REGIME_CORRELATION_CONTEXT symbol=%s open_day_top4=%s (not enforced — advisory only)",
+                symbol,
+                self._count_open_day_top4_positions(),
+            )
 
         # Check symbol not already open (max 1 per symbol)
         # Dust/zero-size positions: cleanup and allow buy; never block on stale memory.
@@ -9680,14 +9742,6 @@ class PortfolioEngine:
             total_risk += position.risk_usd
         return total_risk
 
-    def _calculate_equity(self) -> float:
-        """Calculate total equity (cash + positions value)"""
-        positions_value = sum(
-            pos.quantity * pos.entry_price  # Use entry price as conservative estimate
-            for pos in self.open_positions.values()
-        )
-        return self.cash_balance + positions_value
-
     async def _emit_day_health_telemetry(self, skip_reason: str | None = None) -> None:
         """Observation-only trapped-position / idle-capital telemetry."""
         try:
@@ -9737,15 +9791,15 @@ class PortfolioEngine:
 
             if mark_info.get("price_source_stale"):
                 any_stale_marks = True
+                # Still allow risk exits on last known mark — do not skip stop/stall/time.
                 logger.warning(
-                    "EXIT_SKIP_STALE_MARK: symbol=%s — risk exits blocked until fresh MTM available",
+                    "EXIT_STALE_MARK_RISK_ONLY: symbol=%s — using last mark for risk exits",
                     symbol,
                 )
-                continue
 
             current_price = float(mark_info.get("mark_used") or 0.0)
             if current_price <= 0:
-                logger.warning(f"MONITOR: No fresh price for {symbol}, skipping")
+                logger.warning(f"MONITOR: No usable price for {symbol}, skipping")
                 any_stale_marks = True
                 continue
 
@@ -9906,8 +9960,16 @@ class PortfolioEngine:
             _awbp_pos = _awbp.is_allweather_position(position)
             _legacy_aw = _aw.allweather_enabled() and _valid_bracket
             if (_awbp_pos or _legacy_aw) and (_awbp.execution_enabled() or _legacy_aw or _awbp_pos):
-                _bar_low = float(getattr(current_bar, "low", current_price) if current_bar else current_price)
-                _bar_high = float(getattr(current_bar, "high", current_price) if current_bar else current_price)
+                if current_bar is not None and not isinstance(current_bar, (int, float)) and hasattr(current_bar, "low"):
+                    _bar_low = float(getattr(current_bar, "low", current_price) or current_price)
+                    _bar_high = float(getattr(current_bar, "high", current_price) or current_price)
+                else:
+                    _bar_low = float(getattr(position, "lowest_price", 0.0) or current_price)
+                    _bar_high = float(getattr(position, "highest_price", 0.0) or current_price)
+                    if _bar_low <= 0:
+                        _bar_low = float(current_price)
+                    if _bar_high <= 0:
+                        _bar_high = float(current_price)
                 _aw_dec = _awbp.bracket_exit_decision(
                     current_price=current_price,
                     bar_low=_bar_low,
@@ -9936,8 +9998,7 @@ class PortfolioEngine:
                         current_bar=current_bar,
                         force_sell=True,
                     )
-                if _awbp_pos:
-                    return None
+                # Fall through to engine-managed exits (stall/stop/time) — do not trap AW holds.
         except Exception:
             logger.debug("ALLWEATHER_BP_EXIT eval skipped", exc_info=True)
 
@@ -9947,7 +10008,13 @@ class PortfolioEngine:
         hold_minutes = max(0.0, (time.time() - entry_ts) / 60.0) if entry_ts > 0 else 0.0
         coin_profile = get_coin_profile(symbol)
         bundle_obj = day_hold_bundle if isinstance(day_hold_bundle, dict) else None
-        bar_low = float(getattr(current_bar, "low", current_price) if current_bar else current_price)
+        # current_bar is often an int timestamp — use session low watermark for wick stops.
+        if current_bar is not None and not isinstance(current_bar, (int, float)) and hasattr(current_bar, "low"):
+            bar_low = float(getattr(current_bar, "low", current_price) or current_price)
+        else:
+            bar_low = float(getattr(position, "lowest_price", 0.0) or current_price)
+            if bar_low <= 0:
+                bar_low = float(current_price)
 
         from backend.services.day_controlled_exits import evaluate_engine_managed_exit
         from backend.services.day_trade_thesis import EXIT_NET_PROFIT
@@ -11209,20 +11276,40 @@ class PortfolioEngine:
         return None
 
     def _fetch_redis_ai_signal_string_map(self, strategy_id: str, symbol_bus_no_slash: str) -> dict[str, str]:
-        """Sync HGETALL of canonical ai_signal:<strategy>:<BUS> Redis hash."""
-        dd: dict[str, str] = {}
-        try:
-            from backend.config.redis_config import get_redis_client
+        """
+        Sync HGETALL of canonical ai_signal:<strategy>:<BUS> Redis hash.
 
-            redis_client = get_redis_client()
-            sig_raw = redis_client.hgetall(redis_ai_signal_key(strategy_id, symbol_bus_no_slash)) if redis_client else {}
-            for k, v in (sig_raw or {}).items():
-                kk = k.decode("utf-8", errors="ignore") if isinstance(k, bytes) else str(k)
-                vv = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else str(v)
-                dd[kk] = vv
-        except Exception:
-            return {}
-        return dd
+        Retries once on empty/exception before giving up: this call runs from
+        inside the async execution path, and a single transient sync-client
+        hiccup here previously produced a silent {} -> the caller then had no
+        "timestamp" field to hydrate, and the BUY execution's entry-context
+        re-check failed closed with SIGNAL_CONTENT_TIMESTAMP_MISSING even
+        though the live signal hash was fresh and present in Redis.
+        """
+        from backend.config.redis_config import get_redis_client
+
+        key = redis_ai_signal_key(strategy_id, symbol_bus_no_slash)
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            dd: dict[str, str] = {}
+            try:
+                redis_client = get_redis_client()
+                sig_raw = redis_client.hgetall(key) if redis_client else {}
+                for k, v in (sig_raw or {}).items():
+                    kk = k.decode("utf-8", errors="ignore") if isinstance(k, bytes) else str(k)
+                    vv = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else str(v)
+                    dd[kk] = vv
+                if dd:
+                    return dd
+            except Exception as exc:
+                last_exc = exc
+            if attempt == 0:
+                time.sleep(0.05)
+        if last_exc is not None:
+            logger.warning("AI_SIGNAL_HASH_FETCH_FAILED key=%s err=%s", key, last_exc)
+        else:
+            logger.debug("AI_SIGNAL_HASH_FETCH_EMPTY key=%s (no exception, hash absent/expired)", key)
+        return {}
 
     def _merge_redis_signal_entry_audit_into_decision_data(self, dd: dict[str, Any], sig: dict[str, str]) -> list[str]:
         """Patch entry-gate/coherence fields from a live Redis signal hash onto decision_data."""
@@ -12862,7 +12949,10 @@ class PortfolioEngine:
         await self._entry_ensure_constraints(symbol)
 
         # Calculate position size (Phase 4)
-        equity = self._calculate_equity()
+        # Canonical equity (cash + live-marked positions_value) — _calculate_equity()
+        # used entry_price instead of current mark, systematically under/over-sizing
+        # new positions whenever open positions carry unrealized P&L.
+        equity = self._total_equity
         perf = self.coin_performance.get(symbol)
         sizing_mult = perf.sizing_multiplier if perf else 1.0
         strategy_id_for_size = str(top_candidate.decision_data.get("live_ai_strategy") or "day").strip().lower()
@@ -14225,45 +14315,85 @@ class PortfolioEngine:
                     canonical_symbols,
                 )
 
-                # AUTO-FIX: Stale positions (in canonical/Redis but not in engine memory) - remove everywhere
+                # RECONCILE: canonical (portfolio_engine_positions SQLite, in paper mode)
+                # has a row that engine memory (self.open_positions) lost track of.
+                # Canonical is the authoritative store here — deleting it to match a
+                # possibly-stale in-memory dict would silently destroy real open
+                # inventory. Only remove the row when there is deterministic evidence
+                # it is actually closed (a completed SELL after the position's entry
+                # time exists in paper_trades). Otherwise adopt it back into memory.
                 if missing_in_memory:
                     for stale_symbol in missing_in_memory:
                         try:
 
-                            def _remove_stale(sym: str) -> None:
-                                def _op() -> None:
+                            def _check_closed_and_maybe_purge(sym: str) -> tuple[bool, dict[str, Any] | None]:
+                                def _op() -> tuple[bool, dict[str, Any] | None]:
                                     with connect_rw(self.db_path) as conn:
-                                        conn.execute("BEGIN IMMEDIATE")
-                                        conn.execute(
-                                            "DELETE FROM portfolio_engine_positions WHERE symbol = ?",
+                                        conn.row_factory = sqlite3.Row
+                                        pos_row = conn.execute(
+                                            "SELECT * FROM portfolio_engine_positions WHERE symbol = ?",
                                             (sym,),
-                                        )
-                                        conn.commit()
+                                        ).fetchone()
+                                        if not pos_row:
+                                            return True, None
+                                        entry_time = float(pos_row["entry_time"] or 0.0)
+                                        sell_after = conn.execute(
+                                            "SELECT 1 FROM paper_trades WHERE symbol = ? AND side = 'SELL' "
+                                            "AND (strftime('%s', timestamp) > ? OR timestamp > ?) LIMIT 1",
+                                            (sym, entry_time, str(entry_time)),
+                                        ).fetchone()
+                                        if sell_after:
+                                            conn.execute("BEGIN IMMEDIATE")
+                                            conn.execute("DELETE FROM portfolio_engine_positions WHERE symbol = ?", (sym,))
+                                            conn.commit()
+                                            return True, None
+                                        return False, dict(pos_row)
 
-                                run_locked_retry(_op)
+                                return run_locked_retry(_op)
 
-                            await asyncio.to_thread(_remove_stale, stale_symbol)
-                            # Remove from PaperTradingService memory + Redis so it doesn't re-adopt
-                            try:
-                                from backend.services.paper_trading_service import get_paper_trading_service
+                            deterministically_closed, pos_row = await asyncio.to_thread(_check_closed_and_maybe_purge, stale_symbol)
 
-                                ps = get_paper_trading_service()
-                                if ps and stale_symbol in ps.positions:
-                                    del ps.positions[stale_symbol]
-                            except Exception:
-                                pass
-                            # Remove from Redis directly (paper:position:X + paper:positions:active set + quarantine)
-                            try:
-                                from backend.config.redis_config import SharedRedisState
+                            if deterministically_closed:
+                                # Confirmed via a completed SELL row after entry — genuinely stale, safe to purge.
+                                try:
+                                    from backend.services.paper_trading_service import get_paper_trading_service
 
-                                rc = SharedRedisState.get_async_client()
-                                if rc:
-                                    await rc.delete(f"paper:position:{stale_symbol}")
-                                    await rc.srem("paper:positions:active", stale_symbol)
-                                    await rc.delete(f"quarantine:{stale_symbol}")
-                            except Exception:
-                                pass
-                            logger.warning(f"CANONICAL_AUTO_FIX: Removed stale position {stale_symbol} from DB + Redis (not in engine memory)")
+                                    ps = get_paper_trading_service()
+                                    if ps and stale_symbol in ps.positions:
+                                        del ps.positions[stale_symbol]
+                                except Exception:
+                                    pass
+                                try:
+                                    from backend.config.redis_config import SharedRedisState
+
+                                    rc = SharedRedisState.get_async_client()
+                                    if rc:
+                                        await rc.delete(f"paper:position:{stale_symbol}")
+                                        await rc.srem("paper:positions:active", stale_symbol)
+                                        await rc.delete(f"quarantine:{stale_symbol}")
+                                except Exception:
+                                    pass
+                                logger.warning(
+                                    "CANONICAL_AUTO_FIX: Purged %s — completed SELL evidence found after entry (genuinely closed)",
+                                    stale_symbol,
+                                )
+                            elif pos_row is not None:
+                                # No sell evidence: canonical still shows a genuinely open position that
+                                # engine memory dropped. Preserve inventory — adopt it back into memory
+                                # instead of deleting real data to match the in-memory cache.
+                                logger.error(
+                                    "CANONICAL_MISMATCH_HIGH_SEVERITY: %s present in canonical portfolio_engine_positions "
+                                    "but missing from engine memory, with NO completed SELL evidence — reloading into "
+                                    "memory rather than deleting. qty=%s entry_price=%s entry_time=%s",
+                                    stale_symbol,
+                                    pos_row.get("quantity"),
+                                    pos_row.get("entry_price"),
+                                    pos_row.get("entry_time"),
+                                )
+                                try:
+                                    await self._load_positions_from_sqlite()
+                                except Exception as reload_err:
+                                    logger.error("CANONICAL_MISMATCH_RELOAD_FAILED: %s err=%s", stale_symbol, reload_err)
                         except Exception as e:
                             logger.error(f"CANONICAL_AUTO_FIX_FAILED: {stale_symbol} - {e}")
                     # Un-pause trading since we fixed it

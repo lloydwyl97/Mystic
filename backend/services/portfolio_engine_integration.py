@@ -808,7 +808,7 @@ class PortfolioEngineIntegration:
                     if is_buy:
                         from backend.services.ai_artifact_contract_gate import evaluate_signal_hash_artifact_contract
 
-                        # Bypass artifact contract for clear ML edge (positive buy_margin or high conf) so good model signals reach execution and learning.
+                        # Narrow ML-edge bypass — never bypass for generic strategy_id "day".
                         _bm_for_art = 0.0
                         for _k in ("buy_margin", "redis_buy_margin_key"):
                             try:
@@ -817,7 +817,13 @@ class PortfolioEngineIntegration:
                                     break
                             except Exception:
                                 pass
-                        _is_ml_edge_early = _bm_for_art > 0.05 or confidence >= 0.58 or str(live_ai_strategy).lower() == "day"
+                        _family = str(dd.get("strategy_family") or "").upper()
+                        _is_ml_edge_early = bool(
+                            dd.get("ml_enriched")
+                            or _family == "ML_EDGE"
+                            or (_family.startswith("ML") and _bm_for_art > 0.05)
+                            or (_bm_for_art > 0.05 and confidence >= 0.58)
+                        )
 
                         dd["live_ai_strategy"] = str(dd.get("live_ai_strategy") or live_ai_strategy).strip().lower()
                         if not str(dd.get("model_artifact_path") or "").strip():
@@ -1526,13 +1532,18 @@ class PortfolioEngineIntegration:
         Keeps SQLite positions_value / total_equity / unrealized_pnl within one interval of live API truth.
         """
         await asyncio.sleep(_LEDGER_MTM_PERSIST_INITIAL_DELAY_SEC)
+        _reconcile_every_n = max(1, int(300 / max(1.0, _LEDGER_MTM_PERSIST_INTERVAL_SEC)))
+        _loop_count = 0
         while self.is_running:
             try:
                 eng = self.engine
                 if eng is not None:
                     try:
                         async with eng._sqlite_writer_lock:
-                            await eng._load_ledger_from_sqlite()
+                            # Do NOT reload ledger cash/realized from SQLite here.
+                            # In-memory ledger is authoritative between buy/sell commits;
+                            # reloading mid-buy races and restores pre-debit cash while the
+                            # new position is already visible → double-counted equity.
                             await eng._load_positions_from_sqlite()
                             mtm_prices = await eng._fetch_mtm_prices_for_open_positions()
                             await eng._recompute_positions_values(mtm_prices or self.current_prices or None)
@@ -1540,6 +1551,25 @@ class PortfolioEngineIntegration:
                             await eng._sync_paper_redis_from_sqlite_authoritative()
                     except Exception as reload_err:
                         logger.warning("LEDGER_MTM_PERSIST reload from SQLite failed: %s", reload_err)
+
+                    # Diagnostic-only reconciliation (read-only, never mutates state):
+                    # proves cash derived from transaction evidence still matches the
+                    # stored ledger. Runs roughly every 5 minutes, not every tick.
+                    _loop_count += 1
+                    if _loop_count % _reconcile_every_n == 0:
+                        try:
+                            from backend.services.portfolio_ledger_reconciliation import reconcile_ledger_cash
+
+                            recon = await asyncio.to_thread(reconcile_ledger_cash, eng.db_path)
+                            if not recon.within_tolerance:
+                                logger.warning(
+                                    "LEDGER_RECONCILIATION_DRIFT %s",
+                                    recon.to_dict(),
+                                )
+                            else:
+                                logger.debug("LEDGER_RECONCILIATION_OK %s", recon.to_dict())
+                        except Exception as recon_err:
+                            logger.debug("LEDGER_RECONCILIATION_SKIPPED: %s", recon_err)
             except asyncio.CancelledError:
                 break
             except Exception as e:

@@ -3,19 +3,13 @@
 from __future__ import annotations
 
 import json
-import socket
 import time
 from datetime import datetime, timedelta, timezone
 
-# Force IPv4 for Binance.US REST (same as ScalpMarketReader).
-_orig_getaddrinfo = socket.getaddrinfo
+# Force IPv4 for Binance.US REST — shared bootstrap patch.
+from backend.utils.network_ipv4 import ensure_ipv4_only
 
-
-def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
-
-
-socket.getaddrinfo = _ipv4_getaddrinfo
+ensure_ipv4_only()
 
 # Regime classifier needs >=31 completed 1h bars (~31h of history).
 MIN_REGIME_1H_BARS = 31

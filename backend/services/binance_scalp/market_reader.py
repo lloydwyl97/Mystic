@@ -10,15 +10,10 @@ from dataclasses import dataclass
 import redis
 from backend.services.binance_scalp.config import ScalpConfig, get_scalp_config
 
-# Force IPv4 for Binance.US REST on this VM (same constraint as OrderBookCollector).
-_orig_getaddrinfo = socket.getaddrinfo
+# Force IPv4 for Binance.US REST on this VM — shared bootstrap patch.
+from backend.utils.network_ipv4 import ensure_ipv4_only
 
-
-def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
-
-
-socket.getaddrinfo = _ipv4_getaddrinfo
+ensure_ipv4_only()
 
 
 @dataclass(frozen=True)
