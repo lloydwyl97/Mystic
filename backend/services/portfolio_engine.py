@@ -16918,22 +16918,31 @@ class PortfolioEngine:
                     cache_key = f"market:{base_symbol}"
                     cached_data = await redis.get(cache_key)
                     if cached_data:
-                        data = json.loads(cached_data)
-                        price_raw = data.get("price")
-                        price = float(price_raw) if price_raw is not None else None
-                        ts_str = data.get("timestamp")
-                        if ts_str:
-                            try:
-                                dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
-                                ts = dt.timestamp()
-                            except (ValueError, AttributeError, TypeError):
-                                with contextlib.suppress(ValueError, TypeError):
-                                    ts = float(ts_str)
-                        spread = data.get("spread")
-                        spread_pct = data.get("spread_pct")
-                        bid = data.get("bid")
-                        ask = data.get("ask")
-                        source = "market_cache"
+                        parsed = json.loads(cached_data)
+                        if isinstance(parsed, dict):
+                            data = parsed
+                            price_raw = data.get("price")
+                            price = float(price_raw) if price_raw is not None else None
+                            ts_str = data.get("timestamp")
+                            if ts_str:
+                                try:
+                                    dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+                                    ts = dt.timestamp()
+                                except (ValueError, AttributeError, TypeError):
+                                    with contextlib.suppress(ValueError, TypeError):
+                                        ts = float(ts_str)
+                            spread = data.get("spread")
+                            spread_pct = data.get("spread_pct")
+                            bid = data.get("bid")
+                            ask = data.get("ask")
+                            source = "market_cache"
+                        else:
+                            # Legacy writer (portfolio_engine_integration) stores a bare
+                            # price number under this key with no timestamp/spread — fall
+                            # through to the price:{symbol} hash below for freshness.
+                            with contextlib.suppress(ValueError, TypeError):
+                                price = float(parsed)
+                            source = "market_cache_bare_price"
 
                     if ts is None:
                         price_hash = await redis.hgetall(f"price:{base_symbol}")

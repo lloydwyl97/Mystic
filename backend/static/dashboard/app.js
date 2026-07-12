@@ -1,5 +1,5 @@
 // Mystic Operator Console — dual-engine DAY + SCALP dashboard
-const DASHBOARD_VERSION = 50;
+const DASHBOARD_VERSION = 51;
 const REFRESH_MS = 90000;
 const CANONICAL_REFRESH_MS = 30000;
 const SECONDARY_POLL_MS = 3000;
@@ -39,6 +39,7 @@ const LAZY_TAB_ENDPOINTS = {
 const BACKGROUND_ENDPOINTS = [
     { path: "/api/performance/display-context", key: "perfDisplayContext" },
     { path: "/api/system/health/quick", key: "systemHealth" },
+    { path: "/api/system/health/comprehensive", key: "systemHealthFull" },
     { path: "/api/system/process-health", key: "processHealth" },
     { path: "/api/portfolio-engine/latency", key: "latency" },
     { path: "/api/portfolio-engine/invariants-detail", key: "invariantsDetail" },
@@ -1146,6 +1147,7 @@ function updateProcessHealth(res) {
     setStatus("ph-context", procs.ai_market_context);
     setStatus("ph-learning", procs.ai_learning);
     setStatus("ph-scalp", procs.scalp_runner);
+    setStatus("ph-live-data-collector", procs.live_data_collector);
     const redisEl = document.getElementById("ph-redis");
     if (redisEl) {
         const ok = res && res.redis === "ok";
@@ -1172,9 +1174,10 @@ function refreshCommandCenter() {
     set("cc-day-decision", dh.capital_idle_reason || "--");
     set("cc-day-positions", dh.open_positions_count != null ? String(dh.open_positions_count) : "--");
     const canon = window._lastDashboardCanonical || {};
-    const risk = canon.risk || {};
-    if (risk.unrealized_pnl != null) {
-        const u = Number(risk.unrealized_pnl);
+    const perfBlock = (canon.performance && canon.performance.performance) || {};
+    const unrealized = perfBlock.unrealized_pnl != null ? perfBlock.unrealized_pnl : (canon.risk || {}).unrealized_pnl;
+    if (unrealized != null) {
+        const u = Number(unrealized);
         const el = document.getElementById("cc-day-unrealized");
         if (el) {
             el.textContent = "$" + u.toFixed(2);
@@ -1185,7 +1188,7 @@ function refreshCommandCenter() {
     const op = canon.operator || {};
     set("cc-kill-switch", op.kill_switch || "--");
     const lr = window._lastLiveReadiness || {};
-    set("cc-live-ready", lr.tiny_live_ready === true ? "READY" : lr.block_reason || "--");
+    set("cc-live-ready", lr.ready_for_tiny_live_test === true ? "READY" : (lr.live_orders_block_reason || (lr.live_readiness_blockers || [])[0] || "--"));
 }
 
 /** DAY + account slice of engines panel (called from canonical + scoreboard). */
