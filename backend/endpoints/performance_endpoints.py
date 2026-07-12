@@ -212,8 +212,27 @@ def _performance_display_context() -> dict[str, Any]:
         }
     principal = float(ledger.get("principal") or 25000.0)
     equity = float(ledger.get("total_equity") or 0)
+    realized = float(ledger.get("realized_pnl") or 0)
+    unrealized = float(ledger.get("unrealized_pnl") or 0)
+    lifetime_account_pnl = equity - principal
+    performance_equity = principal + realized + unrealized
+    # Same auxiliary tolerance used by portfolio status (fees/open lots + truncated history).
+    inv_tolerance = 5.0
+    history_incomplete = abs(equity - performance_equity) > inv_tolerance
     startup_ts = ledger.get("startup_timestamp")
     current_run_available = bool(startup_ts)
+    note = (
+        "Current ledger state + today (UTC calendar day) only. "
+        "No all-time/lifetime data in this object. SCALP excluded. "
+        "Admin/research exits excluded from today trade-stat counts."
+    )
+    if history_incomplete:
+        note += (
+            " History incomplete: retained closed-trade realized PnL does not reconcile to "
+            "lifetime account PnL (Current Equity − Principal) because older trade history "
+            "is unavailable after paper_trades prune/rotation. Do not treat visible Realized "
+            "as an explanation of Total PnL vs Principal."
+        )
     return {
         "success": True,
         "data": {
@@ -221,9 +240,14 @@ def _performance_display_context() -> dict[str, Any]:
             "total_equity": round(equity, 2),
             "cash_balance": round(float(ledger.get("cash_balance") or 0), 2),
             "positions_value": round(float(ledger.get("positions_value") or 0), 2),
-            "account_return_usd": round(equity - principal, 2),
-            "realized_pnl": round(float(ledger.get("realized_pnl") or 0), 2),
-            "unrealized_pnl": round(float(ledger.get("unrealized_pnl") or 0), 2),
+            "account_return_usd": round(lifetime_account_pnl, 2),
+            "lifetime_account_pnl_usd": round(lifetime_account_pnl, 2),
+            "realized_pnl": round(realized, 2),
+            "visible_history_realized_pnl": round(realized, 2),
+            "unrealized_pnl": round(unrealized, 2),
+            "history_incomplete": history_incomplete,
+            "performance_equity_usd": round(performance_equity, 2),
+            "accounting_books_gap_usd": round(equity - performance_equity, 2),
             "last_updated": ledger.get("last_updated"),
             "today_start": today["today_start"],
             "today_closed_sells": today["today_closed_sells"],
@@ -236,11 +260,7 @@ def _performance_display_context() -> dict[str, Any]:
                 else None
             ),
             "scope": "current",
-            "note": (
-                "Current ledger state + today (UTC calendar day) only. "
-                "No all-time/lifetime data in this object. SCALP excluded. "
-                "Admin/research exits excluded from today trade-stat counts."
-            ),
+            "note": note,
         },
     }
 

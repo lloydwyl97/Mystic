@@ -68,7 +68,7 @@
                 <div class="readiness-card"><span class="readiness-label">Context engine</span><span class="readiness-value" id="ph-context">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Learning engine</span><span class="readiness-value" id="ph-learning">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">SCALP runner</span><span class="readiness-value" id="ph-scalp">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Live data collector</span><span class="readiness-value" id="ph-live-data-collector">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Live data collector (retired)</span><span class="readiness-value" id="ph-live-data-collector">--</span></div>
             </div>
         </section>
 
@@ -385,12 +385,14 @@
         <section class="analytics-row" aria-label="Current Account — current ledger only">
             <h2 class="widget__title widget__title--row">Current Account</h2>
             <p class="widget__subtitle widget__subtitle--row" id="current-account-source">Source: current ledger (display-context) · Freshness: loading…</p>
+            <p class="widget__subtitle widget__subtitle--row" id="accounting-history-note" hidden></p>
             <div class="mini-card"><span class="mini-card__label">Principal</span><span class="mini-card__value" id="analytics-principal">--</span></div>
             <div class="mini-card"><span class="mini-card__label">Current Equity</span><span class="mini-card__value" id="analytics-equity">--</span></div>
             <div class="mini-card"><span class="mini-card__label">Cash</span><span class="mini-card__value" id="analytics-cash">--</span></div>
-            <div class="mini-card"><span class="mini-card__label">Total PnL vs Principal</span><span class="mini-card__value" id="analytics-pnl">--</span></div>
-            <div class="mini-card"><span class="mini-card__label">Realized PnL</span><span class="mini-card__value" id="analytics-realized">--</span></div>
-            <div class="mini-card"><span class="mini-card__label">Unrealized PnL</span><span class="mini-card__value" id="analytics-unrealized">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Lifetime account PnL (Equity − Principal)</span><span class="mini-card__value" id="analytics-pnl">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Visible-history Realized</span><span class="mini-card__value" id="analytics-realized">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Unrealized (open positions)</span><span class="mini-card__value" id="analytics-unrealized">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Accounting history</span><span class="mini-card__value" id="analytics-history-status">--</span></div>
             <div class="mini-card"><span class="mini-card__label">Infra health (canonical)</span><span class="mini-card__value" id="analytics-risk-status">--</span></div>
         </section>
 
@@ -398,6 +400,9 @@
             <h2 class="widget__title widget__title--row">Today Performance (UTC)</h2>
             <div class="mini-card"><span class="mini-card__label">DAY closed SELLs (today)</span><span class="mini-card__value" id="analytics-trades">--</span></div>
             <div class="mini-card"><span class="mini-card__label">DAY win rate (today)</span><span class="mini-card__value" id="analytics-winrate">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Realized today</span><span class="mini-card__value" id="analytics-today-realized">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Unrealized today</span><span class="mini-card__value" id="analytics-today-unrealized">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Total today</span><span class="mini-card__value" id="analytics-today-total">--</span></div>
             <div class="mini-card mini-card--span2"><span class="mini-card__label">DAY scoreboard (today)</span><span class="mini-card__value" id="analytics-scoreboard">--</span></div>
         </section>
 
@@ -518,6 +523,6 @@
     </div>
 
     <script src="vendor/chart.umd.min.js?v=4.4.1"></script>
-    <script src="app.js?v=51"></script>
+    <script src="app.js?v=52"></script>
 </body>
 </html>

@@ -30,7 +30,7 @@ Scalp `NEAR_PASS` / spread blockers are scalp diagnostics only, not DAY faults.
 
 Requires: Redis running, `.env` with `EXTERNAL_SUPERVISOR_MODE=true`, paper mode unless explicitly switched.
 
-Note: `live_data_collector.py`, `start_ai_ml_trading.py`, and `start_agent_orchestrator.py` are retired stubs — OHLCV runs in `start_live_market_data.py`.
+Note: `live_data_collector.py`, `start_ai_ml_trading.py`, and `start_agent_orchestrator.py` are retired stubs — OHLCV runs in `start_live_market_data.py`. Process-health reports `live_data_collector` under `optional_processes` as `retired_optional`; it is not required for a healthy core stack.
 
 ## Trading design (do not drift)
 

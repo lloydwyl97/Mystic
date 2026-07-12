@@ -281,7 +281,11 @@ def _process_running(pattern: str) -> bool:
 
 @router.get("/process-health")
 async def get_process_health() -> dict[str, Any]:
-    """Read-only Mystic core process heartbeat (pgrep-based)."""
+    """Read-only Mystic core process heartbeat (pgrep-based).
+
+    Core processes match ``./start_mystic.sh core`` (7 processes).
+    ``live_data_collector`` is retired/optional — OHLCV lives in live_market_data.
+    """
     checks = {
         "uvicorn": _process_running("uvicorn"),
         "live_market_data": _process_running("start_live_market_data.py"),
@@ -290,7 +294,13 @@ async def get_process_health() -> dict[str, Any]:
         "ai_market_context": _process_running("start_ai_market_context.py"),
         "ai_learning": _process_running("start_ai_learning.py"),
         "scalp_runner": _process_running("backend.services.binance_scalp.runner"),
-        "live_data_collector": _process_running("live_data_collector.py"),
+    }
+    optional = {
+        "live_data_collector": {
+            "running": _process_running("live_data_collector.py"),
+            "classification": "retired_optional",
+            "note": "Not launched by start_mystic.sh core; OHLCV is provided by start_live_market_data.py.",
+        },
     }
     redis_ok = False
     if get_shared_redis_sync:
@@ -300,12 +310,21 @@ async def get_process_health() -> dict[str, Any]:
         except Exception:
             redis_ok = False
     core_ok = checks["uvicorn"] and checks["portfolio_engine"]
-    all_ok = core_ok and checks["live_market_data"] and checks["ai_signal_generator"]
+    all_ok = (
+        core_ok
+        and checks["live_market_data"]
+        and checks["ai_signal_generator"]
+        and checks["ai_market_context"]
+        and checks["ai_learning"]
+        and checks["scalp_runner"]
+    )
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "status": "healthy" if all_ok else ("degraded" if core_ok else "critical"),
         "redis": "ok" if redis_ok else "down",
         "processes": checks,
+        "optional_processes": optional,
+        "core_process_count_expected": 7,
     }
 
 

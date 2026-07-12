@@ -1,5 +1,5 @@
 // Mystic Operator Console — dual-engine DAY + SCALP dashboard
-const DASHBOARD_VERSION = 51;
+const DASHBOARD_VERSION = 52;
 const REFRESH_MS = 90000;
 const CANONICAL_REFRESH_MS = 30000;
 const SECONDARY_POLL_MS = 3000;
@@ -1133,6 +1133,7 @@ function updateScalpLearning(res) {
 function updateProcessHealth(res) {
     window._lastProcessHealth = res;
     const procs = (res && res.processes) || {};
+    const optional = (res && res.optional_processes) || {};
     const setStatus = function (id, ok) {
         const el = document.getElementById(id);
         if (!el) return;
@@ -1147,7 +1148,15 @@ function updateProcessHealth(res) {
     setStatus("ph-context", procs.ai_market_context);
     setStatus("ph-learning", procs.ai_learning);
     setStatus("ph-scalp", procs.scalp_runner);
-    setStatus("ph-live-data-collector", procs.live_data_collector);
+    const ldcEl = document.getElementById("ph-live-data-collector");
+    if (ldcEl) {
+        const ldc = optional.live_data_collector || {};
+        const running = ldc.running === true || procs.live_data_collector === true;
+        ldcEl.textContent = running ? "UP (optional)" : "RETIRED";
+        ldcEl.title = ldc.note || "Retired/optional — not part of start_mystic.sh core; OHLCV via live_market_data.";
+        ldcEl.classList.remove("status-up", "status-down");
+        ldcEl.classList.add(running ? "status-up" : "status-down");
+    }
     const redisEl = document.getElementById("ph-redis");
     if (redisEl) {
         const ok = res && res.redis === "ok";
@@ -1649,28 +1658,60 @@ function updateRiskMetrics(data) {
     }
 }
 
+function formatScoreboardPassFail(passFail, failReasons, expectancyR) {
+    const status = passFail != null ? String(passFail).toUpperCase() : "--";
+    const reasons = failReasons != null ? String(failReasons) : "";
+    const expStr = expectancyR != null && !Number.isNaN(Number(expectancyR))
+        ? " · expectancy_r=" + Number(expectancyR).toFixed(2)
+        : "";
+    if (status === "FAIL") {
+        if (reasons.indexOf("NEGATIVE_EXPECTANCY") >= 0) {
+            return "FAIL — negative expectancy" + expStr;
+        }
+        return "FAIL" + (reasons ? " — " + reasons : "") + expStr;
+    }
+    if (status === "PASS" || status === "OK" || status === "PENDING") {
+        return status + expStr;
+    }
+    return status;
+}
+
+function applyTodayScoreboardMetrics(d) {
+    if (!d || typeof d !== "object") return;
+    function setPnl(id, val) {
+        const el = document.getElementById(id);
+        if (!el || val == null) return;
+        const n = Number(val);
+        el.textContent = (n >= 0 ? "+" : "") + "$" + n.toFixed(2);
+        el.classList.remove("pnl-pos", "pnl-neg");
+        el.classList.add(n >= 0 ? "pnl-pos" : "pnl-neg");
+    }
+    setPnl("analytics-today-realized", d.realized_pnl);
+    setPnl("analytics-today-unrealized", d.unrealized_pnl != null ? d.unrealized_pnl : d.open_unrealized_pnl);
+    setPnl("analytics-today-total", d.total_pnl);
+}
+
 // portfolio-engine/scoreboard/today: { success, data: { status, pass, ... } }
 function updateScoreboardToday(data) {
     const d = data.data || data;
     const el = document.getElementById("analytics-scoreboard");
     if (!el) return;
     if (!d) { el.textContent = "--"; return; }
+    applyTodayScoreboardMetrics(d);
     const status = d.status || d.pass_fail || (d.pass ? "PASS" : d.fail ? "FAIL" : null);
     const failReasons = d.fail_reasons || "";
     const closedAi = d.closed_ai_trades_today != null ? d.closed_ai_trades_today : d.ai_closed_trades;
     const openBuys = d.open_buys_today != null ? d.open_buys_today : 0;
+    const pfLabel = formatScoreboardPassFail(status, failReasons, d.expectancy_r);
     el.title =
         "DAY engine scoreboard only (not scalp). Closed AI SELLs today: " + (closedAi != null ? closedAi : "?") +
         ". Open buys today: " + openBuys +
-        ". FAIL reflects expectancy/PnL rules after AI closes — stack can still be HEALTHY.";
-
-    if (status && String(status).toUpperCase() === "FAIL" && failReasons) {
-        setCardText(el, "FAIL:\n" + failReasons, { title: el.title, keepTitle: true });
-    } else {
-        const display = (closedAi != null ? closedAi + " closed" : status ? String(status) : "--") +
-            (openBuys ? " / " + openBuys + " open buy" : "");
-        setCardText(el, display, { title: el.title, keepTitle: true });
-    }
+        ". FAIL is strategy-quality (expectancy), not dollar total today. Stack can still be HEALTHY.";
+    const sells = closedAi != null ? closedAi : (d.trades != null ? d.trades : "?");
+    const wr = d.win_rate != null ? (Number(d.win_rate) <= 1 ? (Number(d.win_rate) * 100).toFixed(1) : Number(d.win_rate).toFixed(1)) + "%" : "--";
+    const total = d.total_pnl != null ? Number(d.total_pnl) : null;
+    const totalStr = total != null ? ((total >= 0 ? "+" : "") + "$" + total.toFixed(2)) : "--";
+    setCardText(el, sells + " sells · " + wr + " · total " + totalStr + " · " + pfLabel, { title: el.title, keepTitle: true });
 
     el.classList.remove("pnl-pos", "pnl-neg");
     if (status && (String(status).toUpperCase() === "PASS" || String(status).toUpperCase() === "OK")) el.classList.add("pnl-pos");
@@ -2061,12 +2102,17 @@ function updateScoreboard7d(data) {
             return r.day === todayUtcDateStr() || r.date === todayUtcDateStr();
         });
         if (todayRow) {
+            applyTodayScoreboardMetrics(todayRow);
             const wr = todayRow.win_rate != null ? (Number(todayRow.win_rate) * 100).toFixed(1) + "%" : "--";
             const pnl = todayRow.total_pnl != null ? Number(todayRow.total_pnl) : (todayRow.realized_pnl != null ? Number(todayRow.realized_pnl) : null);
             const pnlStr = pnl != null ? ((pnl >= 0 ? "+" : "") + "$" + pnl.toFixed(2)) : "--";
-            scoreEl.textContent = (todayRow.trades || 0) + " sells · " + wr + " · " + pnlStr + " · " + (todayRow.pass_fail || "--");
+            const pfLabel = formatScoreboardPassFail(todayRow.pass_fail, todayRow.fail_reasons, todayRow.expectancy_r);
+            scoreEl.textContent = (todayRow.trades || 0) + " sells · " + wr + " · total " + pnlStr + " · " + pfLabel;
             scoreEl.dataset.lastGood = scoreEl.textContent;
-            scoreEl.title = "DAY scoreboard today (UTC), via scoreboard?days=7 — not canonical-dependent.";
+            scoreEl.title = "DAY scoreboard today (UTC). FAIL is expectancy quality, not dollar total.";
+            scoreEl.classList.remove("pnl-pos", "pnl-neg");
+            if (String(todayRow.pass_fail || "").toUpperCase() === "FAIL") scoreEl.classList.add("pnl-neg");
+            else if (String(todayRow.pass_fail || "").toUpperCase() === "PASS") scoreEl.classList.add("pnl-pos");
         } else if (!scoreEl.dataset.lastGood) {
             scoreEl.textContent = "0 sells today";
         }
@@ -2232,21 +2278,23 @@ function applyPerfDisplayContext(ctx) {
     setMetric("status-equity", "$" + Number(ctx.total_equity).toFixed(2), "DAY equity via display-context");
     setMetric("analytics-trades", String(ctx.today_closed_sells), "Closed SELLs today (UTC) via display-context");
     setMetric("analytics-winrate", Number(ctx.today_win_rate_pct).toFixed(1) + "%", "Win rate today (UTC) via display-context");
-    const ret = Number(ctx.account_return_usd);
+    const ret = Number(ctx.lifetime_account_pnl_usd != null ? ctx.lifetime_account_pnl_usd : ctx.account_return_usd);
     const pnlEl = document.getElementById("analytics-pnl");
-    if (pnlEl && ctx.account_return_usd != null) {
+    if (pnlEl && (ctx.lifetime_account_pnl_usd != null || ctx.account_return_usd != null)) {
         pnlEl.textContent = (ret >= 0 ? "+" : "") + "$" + ret.toFixed(2);
         pnlEl.dataset.lastGood = pnlEl.textContent;
         pnlEl.classList.remove("pnl-pos", "pnl-neg");
         pnlEl.classList.add(ret >= 0 ? "pnl-pos" : "pnl-neg");
+        pnlEl.title = "Lifetime account PnL = Current Equity − Principal (authoritative economic result)";
     }
     const realizedEl = document.getElementById("analytics-realized");
-    if (realizedEl && ctx.realized_pnl != null) {
-        const r = Number(ctx.realized_pnl);
+    if (realizedEl && (ctx.visible_history_realized_pnl != null || ctx.realized_pnl != null)) {
+        const r = Number(ctx.visible_history_realized_pnl != null ? ctx.visible_history_realized_pnl : ctx.realized_pnl);
         realizedEl.textContent = "$" + r.toFixed(2);
         realizedEl.dataset.lastGood = realizedEl.textContent;
         realizedEl.classList.remove("pnl-pos", "pnl-neg");
         realizedEl.classList.add(r >= 0 ? "pnl-pos" : "pnl-neg");
+        realizedEl.title = "Sum of retained closed trades only — may not explain lifetime account PnL when history is incomplete";
     }
     const unrealizedEl = document.getElementById("analytics-unrealized");
     if (unrealizedEl && ctx.unrealized_pnl != null) {
@@ -2255,6 +2303,33 @@ function applyPerfDisplayContext(ctx) {
         unrealizedEl.dataset.lastGood = unrealizedEl.textContent;
         unrealizedEl.classList.remove("pnl-pos", "pnl-neg");
         unrealizedEl.classList.add(u >= 0 ? "pnl-pos" : "pnl-neg");
+        unrealizedEl.title = "Current open-position mark-to-market PnL";
+    }
+    const histStatus = document.getElementById("analytics-history-status");
+    const histNote = document.getElementById("accounting-history-note");
+    if (histStatus) {
+        if (ctx.history_incomplete === true) {
+            histStatus.textContent = "INCOMPLETE";
+            histStatus.classList.remove("pnl-pos");
+            histStatus.classList.add("pnl-neg");
+            histStatus.title = ctx.note || "Retained realized history does not reconcile to lifetime account PnL";
+        } else {
+            histStatus.textContent = "OK";
+            histStatus.classList.remove("pnl-neg");
+            histStatus.classList.add("pnl-pos");
+            histStatus.title = "Visible realized + unrealized reconcile to lifetime account PnL within tolerance";
+        }
+    }
+    if (histNote) {
+        if (ctx.history_incomplete === true) {
+            histNote.hidden = false;
+            histNote.textContent =
+                "History incomplete — Lifetime account PnL uses Equity − Principal. " +
+                "Visible-history Realized is the sum of retained closed trades only and does not reconcile to lifetime PnL because older trade history is unavailable.";
+        } else {
+            histNote.hidden = true;
+            histNote.textContent = "";
+        }
     }
     const runEl = document.getElementById("current-run-metrics-note");
     if (runEl) {
