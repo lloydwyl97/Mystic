@@ -249,7 +249,14 @@ def rank_setup_signal(
             )
 
     min_score = _min_tradeable_score()
-    entry_eligible = rank_score >= min_score and hard_block is None
+    # Lever-4 fix (evidence: 188/188 observed SCALP entries over 8 days were
+    # soft-rank promotions of setups the strategy itself REJECTED — never a
+    # genuine sig.passed setup — net -$4.35, 15.3% win rate. Prior review
+    # already found rank_score does not discriminate winners from losers for
+    # these soft entries. Soft-rejected setups may still rank/score for
+    # status/diagnostics display, but must never be promoted to an executable
+    # trade. Only a strategy's own confirmed pass_signal() may enter live.
+    entry_eligible = sig.passed and rank_score >= min_score and hard_block is None
     if not entry_eligible and hard_block is None:
         confidence = "below_min"
 
