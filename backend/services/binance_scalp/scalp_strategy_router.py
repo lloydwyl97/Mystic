@@ -185,10 +185,16 @@ class ScalpStrategyRouter:
         """Evaluate all products; return ranked entry candidates (eligible first)."""
         rows: list[dict[str, Any]] = []
         for sym in self.config.products:
-            best, all_sigs, meta = self.evaluate_symbol(sym, epoch=epoch, notional_usd=notional_usd)
+            # Fetch snapshot once and pass it through — evaluate_symbol() would
+            # otherwise independently re-fetch the same symbol's depth via
+            # self.reader.read(sym) internally (snap = snap or self.reader.read(sym)),
+            # doubling Binance /api/v3/depth calls per symbol per cycle for no
+            # benefit (same 5s cycle, no ranking/scoring logic depends on which
+            # fetch is used). Pure duplicate-call elimination; no logic change.
             snap = self.reader.read(sym)
             if snap is None:
                 continue
+            best, all_sigs, meta = self.evaluate_symbol(sym, epoch=epoch, notional_usd=notional_usd, snap=snap)
             if best is None and not meta.get("ranked"):
                 continue
             row = {

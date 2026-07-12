@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -15,9 +16,82 @@ ensure_ipv4_only()
 MIN_REGIME_1H_BARS = 31
 DEFAULT_1H_LOOKBACK_MINUTES = 2880  # 48h -> ~48 bars
 
+# Cross-process Redis cache for fetch_bars(), keyed by (symbol, interval, minutes).
+# KlineCache's own in-process TTL cache only helps a single long-lived instance
+# (e.g. paper_engine's shared instance); callers that construct a *fresh*
+# KlineCache per invocation (e.g. status_snapshot.py on every rebuild) or run
+# in a different process previously got zero cache benefit and refetched from
+# Binance every time. This mirrors the same short-TTL Redis-backed pattern
+# already used for SCALP depth (market_reader.py) and the DAY bundle.
+_BARS_CACHE_KEY_PREFIX = "scalp:bars_cache:"
+_BARS_CACHE_TTL_SEC: dict[str, float] = {
+    "1m": float(os.getenv("SCALP_BARS_CACHE_TTL_1M_SEC", "20")),
+    "5m": float(os.getenv("SCALP_BARS_CACHE_TTL_5M_SEC", "45")),
+    "15m": float(os.getenv("SCALP_BARS_CACHE_TTL_15M_SEC", "45")),
+    "1h": float(os.getenv("SCALP_BARS_CACHE_TTL_1H_SEC", "300")),
+}
+
+
+def _bars_cache_ttl(interval: str) -> float:
+    return _BARS_CACHE_TTL_SEC.get(interval, 30.0)
+
+
+def _bars_cache_key(symbol: str, interval: str, minutes: int) -> str:
+    return f"{_BARS_CACHE_KEY_PREFIX}{symbol.upper()}:{interval}:{minutes}"
+
+
+def _read_bars_cache(symbol: str, interval: str, minutes: int) -> list[dict] | None:
+    try:
+        from backend.config.redis_config import get_shared_redis_sync
+
+        r = get_shared_redis_sync()
+        if not r:
+            return None
+        raw = r.get(_bars_cache_key(symbol, interval, minutes))
+        if not raw:
+            return None
+        payload = json.loads(raw)
+        fetched_at = float(payload.get("fetched_at") or 0)
+        if time.time() - fetched_at > _bars_cache_ttl(interval):
+            return None
+        bars = payload.get("bars")
+        return bars if isinstance(bars, list) else None
+    except Exception:
+        return None
+
+
+def _write_bars_cache(symbol: str, interval: str, minutes: int, bars: list[dict]) -> None:
+    try:
+        from backend.config.redis_config import get_shared_redis_sync
+
+        r = get_shared_redis_sync()
+        if not r:
+            return
+        payload = json.dumps({"fetched_at": time.time(), "bars": bars})
+        r.set(_bars_cache_key(symbol, interval, minutes), payload, ex=max(30, int(_bars_cache_ttl(interval) * 2)))
+    except Exception:
+        pass
+
 
 def fetch_bars(symbol: str, interval: str, *, minutes: int = 30) -> list[dict]:
-    """Fetch OHLCV bars for symbol/interval from Binance.US public REST."""
+    """Fetch OHLCV bars for symbol/interval from Binance.US public REST.
+
+    Cross-process cached with a short TTL (see ``_BARS_CACHE_TTL_SEC``) so
+    repeated callers — including a freshly-constructed ``KlineCache`` in a
+    different process — reuse the same recent fetch instead of hitting
+    Binance again for data that hasn't meaningfully changed.
+    """
+    cached = _read_bars_cache(symbol, interval, minutes)
+    if cached is not None:
+        return cached
+    bars = _fetch_bars_live(symbol, interval, minutes=minutes)
+    if bars:
+        _write_bars_cache(symbol, interval, minutes, bars)
+    return bars
+
+
+def _fetch_bars_live(symbol: str, interval: str, *, minutes: int = 30) -> list[dict]:
+    """Live Binance.US REST fetch — no caching (internal; use fetch_bars())."""
     if interval == "1h":
         minutes = max(int(minutes), MIN_REGIME_1H_BARS * 60)
     end = datetime.now(timezone.utc)

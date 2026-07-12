@@ -28,6 +28,33 @@ _stagger_applied: set[str] = set()
 _fetch_locks: dict[str, asyncio.Lock] = {}
 _lock_dict_guard = asyncio.Lock()
 
+# Tiered per-timeframe refresh intervals (seconds).
+#
+# The bundle used to be refetched wholesale (all 10 TFs) every ~60s, gated by a
+# single DAY_BUNDLE_CACHE_TTL_SEC. Slower timeframes cannot possibly change
+# faster than their own candle-close cadence (a 1d candle closes once/day, a
+# 1w candle once/week) — refetching them on the same cadence as 1m wasted the
+# large majority of DAY's own klines weight budget for zero freshness benefit.
+# 1m/5m keep their original fast cadence; slower TFs get progressively longer
+# tiers, all still far fresher than each TF's own candle-close rate. Configurable
+# per-TF via env for operational tuning without a code change.
+_TF_REFRESH_TIER_SEC: dict[str, float] = {
+    "1m": float(os.getenv("DAY_TF_REFRESH_1M_SEC", str(DAY_BUNDLE_CACHE_TTL_SEC))),
+    "5m": float(os.getenv("DAY_TF_REFRESH_5M_SEC", "120")),
+    "15m": float(os.getenv("DAY_TF_REFRESH_15M_SEC", "300")),
+    "30m": float(os.getenv("DAY_TF_REFRESH_30M_SEC", "600")),
+    "1h": float(os.getenv("DAY_TF_REFRESH_1H_SEC", "900")),
+    "4h": float(os.getenv("DAY_TF_REFRESH_4H_SEC", "1800")),
+    "8h": float(os.getenv("DAY_TF_REFRESH_8H_SEC", "3600")),
+    "12h": float(os.getenv("DAY_TF_REFRESH_12H_SEC", "3600")),
+    "1d": float(os.getenv("DAY_TF_REFRESH_1D_SEC", "3600")),
+    "1w": float(os.getenv("DAY_TF_REFRESH_1W_SEC", "3600")),
+}
+
+
+def _tf_refresh_interval_sec(tf: str) -> float:
+    return _TF_REFRESH_TIER_SEC.get(tf, DAY_BUNDLE_CACHE_TTL_SEC)
+
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
@@ -89,7 +116,14 @@ def _bundle_cache_usable(bundle: dict[str, list[list]], fetched_at: float) -> bo
     return True
 
 
-async def _read_bundle_cache(ccxt_symbol: str) -> dict[str, list[list]] | None:
+async def _read_bundle_cache_full(
+    ccxt_symbol: str,
+) -> tuple[dict[str, list[list]], dict[str, float], float] | None:
+    """Internal: returns (bundle, tf_fetched_at, fetched_at) or None.
+
+    Used by the fetch path to determine which timeframes are still within
+    their own refresh tier and can be reused without hitting Binance again.
+    """
     try:
         from backend.config.redis_config import get_shared_redis_async
 
@@ -108,33 +142,54 @@ async def _read_bundle_cache(ccxt_symbol: str) -> dict[str, list[list]] | None:
             bundle[tf] = list(rows) if isinstance(rows, list) else []
         if "_month_vec" in bundle_raw and isinstance(bundle_raw.get("_month_vec"), list):
             bundle["_month_vec"] = list(bundle_raw["_month_vec"])
-        validate_day_active_bundle(bundle)
-        if not _bundle_cache_usable(bundle, fetched_at):
-            return None
-        logger.debug("DAY_BUNDLE_CACHE_HIT %s age=%.1fs", _normalize_ccxt_symbol(ccxt_symbol), time.time() - fetched_at)
-        return bundle
+        tf_fetched_at_raw = payload.get("tf_fetched_at") or {}
+        tf_fetched_at = {tf: float(tf_fetched_at_raw.get(tf, fetched_at)) for tf in DAY_ACTIVE_TIMEFRAMES}
+        return bundle, tf_fetched_at, fetched_at
     except Exception as exc:
         logger.debug("DAY_BUNDLE_CACHE_READ_FAIL %s: %s", ccxt_symbol, exc)
         return None
 
 
-async def _write_bundle_cache(ccxt_symbol: str, bundle: dict[str, list[list]]) -> None:
+async def _read_bundle_cache(ccxt_symbol: str) -> dict[str, list[list]] | None:
+    full = await _read_bundle_cache_full(ccxt_symbol)
+    if full is None:
+        return None
+    bundle, _tf_fetched_at, fetched_at = full
+    validate_day_active_bundle(bundle)
+    if not _bundle_cache_usable(bundle, fetched_at):
+        return None
+    logger.debug("DAY_BUNDLE_CACHE_HIT %s age=%.1fs", _normalize_ccxt_symbol(ccxt_symbol), time.time() - fetched_at)
+    return bundle
+
+
+async def _write_bundle_cache(
+    ccxt_symbol: str,
+    bundle: dict[str, list[list]],
+    *,
+    tf_fetched_at: dict[str, float] | None = None,
+) -> None:
     try:
         from backend.config.redis_config import get_shared_redis_async
 
+        now = time.time()
         serializable = {tf: bundle.get(tf) or [] for tf in DAY_ACTIVE_TIMEFRAMES if isinstance(bundle.get(tf), list)}
         validate_day_active_bundle(bundle)
         if bundle.get("_month_vec"):
             serializable["_month_vec"] = bundle["_month_vec"]
+        tf_ts = {tf: float((tf_fetched_at or {}).get(tf, now)) for tf in DAY_ACTIVE_TIMEFRAMES}
         payload = json.dumps(
             {
-                "fetched_at": time.time(),
+                "fetched_at": now,
                 "ccxt_symbol": _normalize_ccxt_symbol(ccxt_symbol),
                 "bundle": serializable,
+                "tf_fetched_at": tf_ts,
             }
         )
         r = await get_shared_redis_async()
-        await r.set(_bundle_cache_key(ccxt_symbol), payload, ex=max(DAY_BUNDLE_CACHE_TTL_SEC * 2, 120))
+        # Key TTL must safely outlive the longest per-TF refresh tier (up to
+        # 3600s) or slow-TF cache entries would be evicted before their
+        # intended lifetime, forcing an unnecessary refetch anyway.
+        await r.set(_bundle_cache_key(ccxt_symbol), payload, ex=max(DAY_BUNDLE_CACHE_TTL_SEC * 2, 7200))
     except Exception as exc:
         logger.debug("DAY_BUNDLE_CACHE_WRITE_FAIL %s: %s", ccxt_symbol, exc)
 
@@ -205,12 +260,40 @@ def validate_day_active_bundle(bundle: dict[str, list[list]]) -> tuple[bool, lis
     return len(missing) == 0, missing
 
 
-async def _fetch_day_active_ohlcv_bundle_raw(svc: Any, ccxt_symbol: str) -> dict[str, list[list]]:
-    """Pull every DAY_ACTIVE_TF from the live service (exchange-native only)."""
+async def _fetch_day_active_ohlcv_bundle_raw(
+    svc: Any,
+    ccxt_symbol: str,
+    *,
+    prior_bundle: dict[str, list[list]] | None = None,
+    prior_tf_fetched_at: dict[str, float] | None = None,
+) -> tuple[dict[str, list[list]], dict[str, float]]:
+    """Pull DAY_ACTIVE_TF from the live service (exchange-native only).
+
+    Timeframes still within their own tiered refresh interval
+    (``_TF_REFRESH_TIER_SEC``) are reused from ``prior_bundle`` instead of
+    being refetched — slower TFs cannot change faster than their own
+    candle-close cadence, so this eliminates redundant Binance calls with no
+    freshness loss. Returns (bundle, tf_fetched_at) for the caller to persist.
+    """
     sym = _normalize_ccxt_symbol(ccxt_symbol)
     out: dict[str, list[list]] = {}
+    tf_fetched_at: dict[str, float] = {}
+    now = time.time()
     critical_tfs = {"1m", "5m", "15m"}
+    prior_bundle = prior_bundle or {}
+    prior_tf_fetched_at = prior_tf_fetched_at or {}
     for tf in DAY_ACTIVE_TIMEFRAMES:
+        prior_rows = prior_bundle.get(tf)
+        prior_ts = prior_tf_fetched_at.get(tf, 0.0)
+        still_fresh = (
+            isinstance(prior_rows, list)
+            and len(prior_rows) >= min_bars_for_day_tf(tf)
+            and (now - prior_ts) < _tf_refresh_interval_sec(tf)
+        )
+        if still_fresh:
+            out[tf] = prior_rows
+            tf_fetched_at[tf] = prior_ts
+            continue
         lim = fetch_limit_for_day_tf(tf)
         rows: list[list] = []
         for attempt in range(2):
@@ -224,7 +307,8 @@ async def _fetch_day_active_ohlcv_bundle_raw(svc: Any, ccxt_symbol: str) -> dict
                 break
             await asyncio.sleep(1.5)
         out[tf] = rows
-    return out
+        tf_fetched_at[tf] = now
+    return out, tf_fetched_at
 
 
 async def async_fetch_day_active_ohlcv_bundle(
@@ -252,11 +336,24 @@ async def async_fetch_day_active_ohlcv_bundle(
             if cached is not None:
                 return cached
 
+        # Even on force_refresh (primary writer, called every DAY_AI_SIGNAL_LOOP_SEC),
+        # still consult per-TF timestamps so slow timeframes within their own tier
+        # are reused rather than unconditionally refetched — force_refresh only
+        # means "don't trust the overall fast-tier cache gate", not "refetch everything".
+        prior_full = await _read_bundle_cache_full(sym)
+        prior_bundle = prior_full[0] if prior_full else None
+        prior_tf_fetched_at = prior_full[1] if prior_full else None
+
         logger.debug("DAY_BUNDLE_FETCH %s force=%s", sym, force_refresh)
-        bundle = await _fetch_day_active_ohlcv_bundle_raw(svc, sym)
+        bundle, tf_fetched_at = await _fetch_day_active_ohlcv_bundle_raw(
+            svc,
+            sym,
+            prior_bundle=prior_bundle,
+            prior_tf_fetched_at=prior_tf_fetched_at,
+        )
         ok, _ = validate_day_active_bundle(dict(bundle))
         if ok or len(bundle.get("1m") or []) >= 30:
-            await _write_bundle_cache(sym, bundle)
+            await _write_bundle_cache(sym, bundle, tf_fetched_at=tf_fetched_at)
         return bundle
 
 

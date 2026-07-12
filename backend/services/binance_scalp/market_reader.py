@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import time
 from dataclasses import dataclass
 
 import redis
@@ -14,6 +15,21 @@ from backend.services.binance_scalp.config import ScalpConfig, get_scalp_config
 from backend.utils.network_ipv4 import ensure_ipv4_only
 
 ensure_ipv4_only()
+
+# Short-lived, cross-process depth cache (Redis-backed, same pattern as
+# day_active_bundle.py / orderbook:{BASE} elsewhere in this codebase).
+#
+# /api/v3/depth was previously fetched fresh on *every* read() call from *every*
+# caller (paper_engine tick, strategy router evaluate_symbol + evaluate_all,
+# position lifecycle exit checks, dashboard status_snapshot, diagnostics) with
+# zero caching and zero weight-limiter visibility — confirmed via Binance's own
+# X-MBX-USED-WEIGHT-1M header bursting to 235-386/min per host. This TTL keeps
+# depth data effectively real-time (far fresher than the 5s SCALP tick cadence)
+# while eliminating redundant duplicate Binance calls within the same window.
+# Does not change any entry/exit/ranking/scoring/sizing/learning logic.
+SCALP_DEPTH_CACHE_TTL_SEC: float = float(os.getenv("SCALP_DEPTH_CACHE_TTL_SEC", "2.5"))
+_DEPTH_CACHE_KEY_PREFIX = "scalp:depth_cache:"
+_DEPTH_ENDPOINT_WEIGHT = 5  # Binance.US weight for GET /api/v3/depth?limit=100
 
 
 @dataclass(frozen=True)
@@ -62,6 +78,47 @@ def fetch_depth_sync(symbol_bus: str, *, limit: int = 100) -> tuple[list[list[fl
     return bids, asks
 
 
+def _read_depth_cache(r: redis.Redis, sym: str) -> tuple[list[list[float]], list[list[float]], float] | None:
+    """Cross-process cache read. Returns (bids, asks, age_sec) or None on miss/stale/error."""
+    try:
+        raw = r.get(f"{_DEPTH_CACHE_KEY_PREFIX}{sym}")
+        if not raw:
+            return None
+        payload = json.loads(raw)
+        fetched_at = float(payload.get("fetched_at") or 0)
+        age = time.time() - fetched_at
+        if age > SCALP_DEPTH_CACHE_TTL_SEC or age < 0:
+            return None
+        bids = payload.get("bids") or []
+        asks = payload.get("asks") or []
+        if not bids or not asks:
+            return None
+        return bids, asks, age
+    except Exception:
+        return None
+
+
+def _write_depth_cache(r: redis.Redis, sym: str, bids: list[list[float]], asks: list[list[float]]) -> None:
+    try:
+        payload = json.dumps({"fetched_at": time.time(), "bids": bids, "asks": asks})
+        r.set(f"{_DEPTH_CACHE_KEY_PREFIX}{sym}", payload, ex=max(5, int(SCALP_DEPTH_CACHE_TTL_SEC * 2)))
+    except Exception:
+        pass
+
+
+def _record_depth_weight_usage(r: redis.Redis) -> None:
+    """Mirror BinanceWeightLimiter's usage counters for visibility (bwl:usage:*, bwl:req:*).
+
+    Best-effort only — never gates/blocks a request; this is metrics, not enforcement.
+    Existing async limiter behavior for other endpoints is unchanged.
+    """
+    try:
+        r.incrby("bwl:usage:/api/v3/depth", _DEPTH_ENDPOINT_WEIGHT)
+        r.incr("bwl:req:/api/v3/depth")
+    except Exception:
+        pass
+
+
 class ScalpMarketReader:
     """Read-only: Redis orderbook:{BASE} features + public REST depth for walks."""
 
@@ -91,10 +148,22 @@ class ScalpMarketReader:
         bus = symbol_bus(symbol)
         base = symbol_base(bus)
         redis_spread, imbalance = self._read_redis_features(base)
-        try:
-            bids, asks = fetch_depth_sync(bus)
-        except Exception:
-            return None
+
+        cached = _read_depth_cache(self._redis, bus)
+        if cached is not None:
+            bids, asks, age_sec = cached
+            book_source = "binance_us_public_depth_readonly_cached"
+        else:
+            try:
+                bids, asks = fetch_depth_sync(bus)
+            except Exception:
+                return None
+            age_sec = 0.0
+            book_source = "binance_us_public_depth_readonly"
+            if bids and asks:
+                _write_depth_cache(self._redis, bus, bids, asks)
+                _record_depth_weight_usage(self._redis)
+
         if not bids or not asks:
             return None
         best_bid = float(bids[0][0])
@@ -114,6 +183,6 @@ class ScalpMarketReader:
             asks=asks,
             redis_spread_pct=redis_spread,
             order_book_imbalance=imbalance,
-            book_source="binance_us_public_depth_readonly",
-            orderbook_age_sec=0.0,
+            book_source=book_source,
+            orderbook_age_sec=age_sec,
         )

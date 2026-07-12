@@ -45,7 +45,10 @@ ENDPOINT_WEIGHTS: dict[str, int] = {
     "/api/v3/ticker/price": 1,
     "/api/v3/ticker/24hr": 1,
     "/api/v3/klines": 1,
-    "/api/v3/depth": 1,
+    # weight=5 for limit<=100 (Binance.US); accounted for separately in
+    # backend/services/binance_scalp/market_reader.py since that path is a
+    # synchronous cross-process caller and doesn't go through this async limiter.
+    "/api/v3/depth": 5,
     "/api/v3/trades": 1,
     "/api/v3/order": 1,
     "/api/v3/order/test": 1,
