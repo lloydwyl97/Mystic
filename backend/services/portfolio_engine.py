@@ -7031,8 +7031,7 @@ class PortfolioEngine:
             )
             if already_open_in_db and not already_open_in_memory:
                 logger.error(
-                    "BUY_DUPLICATE_RACE_PREVENTED: symbol=%s was open in SQLite but missing from in-memory "
-                    "open_positions — reloading memory instead of allowing a duplicate buy",
+                    "BUY_DUPLICATE_RACE_PREVENTED: symbol=%s was open in SQLite but missing from in-memory open_positions — reloading memory instead of allowing a duplicate buy",
                     normalized_symbol,
                 )
                 with contextlib.suppress(Exception):
@@ -9841,6 +9840,11 @@ class PortfolioEngine:
         PHASE 3: Monitor ALL open positions for exit conditions.
         No tracking-set skips - iterates actual open_positions from DB rebuild.
         """
+        try:
+            await self.run_trading_circuit_breaker_check()
+        except Exception:
+            logger.warning("CIRCUIT_BREAKER_CHECK_FAILED: continuing position monitoring", exc_info=True)
+
         exits_executed = []
 
         # CRITICAL: Iterate over actual positions, not a tracking set
@@ -10390,11 +10394,7 @@ class PortfolioEngine:
             or (candidate.decision_data or {}).get("regime_label")
             or (candidate.decision_data or {}).get("regime")
         )
-        setup = str(
-            (candidate.decision_data or {}).get("setup_type")
-            or (candidate.decision_data or {}).get("entry_thesis")
-            or "NO_CLEAR_THESIS"
-        ).strip().upper()
+        setup = str((candidate.decision_data or {}).get("setup_type") or (candidate.decision_data or {}).get("entry_thesis") or "NO_CLEAR_THESIS").strip().upper()
         from backend.services.ai_strategy_score_weight_writer import setup_regime_bucket
 
         bucket = setup_regime_bucket(regime, setup)
@@ -14438,8 +14438,7 @@ class PortfolioEngine:
                                             return True, None
                                         entry_time = float(pos_row["entry_time"] or 0.0)
                                         sell_after = conn.execute(
-                                            "SELECT 1 FROM paper_trades WHERE symbol = ? AND side = 'SELL' "
-                                            "AND (strftime('%s', timestamp) > ? OR timestamp > ?) LIMIT 1",
+                                            "SELECT 1 FROM paper_trades WHERE symbol = ? AND side = 'SELL' AND (strftime('%s', timestamp) > ? OR timestamp > ?) LIMIT 1",
                                             (sym, entry_time, str(entry_time)),
                                         ).fetchone()
                                         if sell_after:
@@ -15297,6 +15296,86 @@ class PortfolioEngine:
             "buys_blocked": self._kill_switch_mode != KillSwitchMode.RESUME,
             "sells_blocked": self._kill_switch_mode == KillSwitchMode.PAUSE_ALL,
         }
+
+    _CIRCUIT_BREAKER_REASON_PREFIX = "CIRCUIT_BREAKER:"
+
+    async def _realized_pnl_today_sync_free(self) -> float:
+        """Realized DAY PnL for today (UTC), same query as the scoreboard breakdown."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        def _sync_get() -> float:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(pnl), 0)
+                    FROM paper_trades
+                    WHERE date(timestamp) = ? AND UPPER(side) = 'SELL'
+                      AND COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT')
+                      AND COALESCE(is_synthetic, 0) = 0
+                    """,
+                    (today,),
+                )
+                row = cur.fetchone()
+                return float(row[0] or 0.0) if row else 0.0
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _sync_get)
+
+    async def run_trading_circuit_breaker_check(self) -> dict[str, Any]:
+        """
+        Evaluate hard-kill conditions (daily loss freeze, equity drawdown,
+        account failsafe) against live portfolio state and enforce them via
+        the existing kill switch. Previously defined but never invoked —
+        conditions were computed nowhere, so live trading had no automatic
+        stop. Safe by design: only ever engages PAUSE_BUYS (blocks new
+        entries), never auto-blocks or force-sells existing positions —
+        account_failsafe additionally raises a CRITICAL log requiring manual
+        review/closure rather than issuing unattended live sell orders.
+        """
+        try:
+            from backend.services.circuit_breaker_service import trading_circuit_breaker
+        except Exception:
+            logger.warning("CIRCUIT_BREAKER_CHECK: service unavailable, skipping")
+            return {"skipped": True}
+
+        realized_pnl_today = await self._realized_pnl_today_sync_free()
+        portfolio_data = {
+            "total_equity": float(self._total_equity),
+            "principal": float(self.principal),
+            "realized_pnl_today": realized_pnl_today,
+        }
+
+        result = await trading_circuit_breaker.check_all_hard_kills_async(portfolio_data)
+        actions = result.get("actions", {})
+        conditions = result.get("conditions", {})
+        prefix = self._CIRCUIT_BREAKER_REASON_PREFIX
+        set_by_cb = str(self._kill_switch_reason or "").startswith(prefix)
+
+        if actions.get("close_all_positions"):
+            reason = f"{prefix}ACCOUNT_FAILSAFE equity=${portfolio_data['total_equity']:.2f} principal=${portfolio_data['principal']:.2f} — MANUAL POSITION REVIEW REQUIRED"
+            if self._kill_switch_mode != KillSwitchMode.PAUSE_BUYS or not set_by_cb:
+                await self.set_kill_switch("PAUSE_BUYS", reason=reason)
+            logger.critical(
+                "[HARD KILL] ACCOUNT_FAILSAFE_ACTIVE: new entries blocked. Existing open positions were "
+                "NOT auto-closed (no unattended live liquidation) — review open_positions and close manually. "
+                "equity=$%.2f principal=$%.2f",
+                portfolio_data["total_equity"],
+                portfolio_data["principal"],
+            )
+        elif actions.get("block_new_entries"):
+            which = "DAILY_LOSS_FREEZE" if conditions.get("daily_loss_freeze") else "EQUITY_CIRCUIT_BREAKER"
+            reason = f"{prefix}{which} equity=${portfolio_data['total_equity']:.2f} realized_pnl_today=${realized_pnl_today:.2f}"
+            if self._kill_switch_mode != KillSwitchMode.PAUSE_BUYS or not set_by_cb:
+                await self.set_kill_switch("PAUSE_BUYS", reason=reason)
+        elif set_by_cb and self._kill_switch_mode != KillSwitchMode.RESUME:
+            # Conditions cleared and this pause was set by us (not an operator) — lift it.
+            await self.set_kill_switch("RESUME", reason=f"{prefix}cleared")
+
+        return result
 
     # =========================================================================
     # ITEM 2: HEALTH PACK ENDPOINT

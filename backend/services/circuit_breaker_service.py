@@ -288,10 +288,15 @@ class TradingCircuitBreaker:
             return True
         return self.account_failsafe_active
 
-    def check_all_hard_kills(self, portfolio_data: dict, market_data: dict | None = None) -> dict:
+    def check_all_hard_kills(self, portfolio_data: dict, market_data: dict | None = None, *, skip_sync_persist: bool = False) -> dict:
         """
         Check all hard kill conditions - returns actions to take
         Note: market_data parameter reserved for future use
+
+        skip_sync_persist: set True when the caller (e.g.
+        check_all_hard_kills_async) will persist via the async path right
+        after — avoids the harmless-but-noisy "cannot persist synchronously
+        in async context" warning on every call from an async trading loop.
         """
         # Prevent unused parameter warning - parameter kept for future API compatibility
         _ = market_data
@@ -318,14 +323,14 @@ class TradingCircuitBreaker:
         }
 
         # Persist state changes to SQLite (sync path - bails if in async context)
-        self._persist_circuit_state()
+        if not skip_sync_persist:
+            self._persist_circuit_state()
 
         return {"conditions": results, "actions": actions, "any_active": any(results.values())}
 
     async def check_all_hard_kills_async(self, portfolio_data: dict, market_data: dict | None = None) -> dict:
         """Async variant: check conditions and persist via async (use from async context)."""
-        result = self.check_all_hard_kills(portfolio_data, market_data)
-        # Re-persist via async path since sync _persist may have bailed in async context
+        result = self.check_all_hard_kills(portfolio_data, market_data, skip_sync_persist=True)
         await self.persist_circuit_state_async()
         return result
 
@@ -374,8 +379,7 @@ class TradingCircuitBreaker:
                 self.needs_revalidation.add(flag_name)
                 self.startup_changed_state = True
                 logger.warning(
-                    "[CIRCUIT BREAKER] COLD_START_STALE_STATE flag=%s persisted_at=%s age_sec=%s "
-                    "max_age_sec=%.0f -> NOT trusted as active; pending live revalidation",
+                    "[CIRCUIT BREAKER] COLD_START_STALE_STATE flag=%s persisted_at=%s age_sec=%s max_age_sec=%.0f -> NOT trusted as active; pending live revalidation",
                     flag_name,
                     updated_at_raw,
                     round(age_sec, 1) if age_sec is not None else "unknown",
