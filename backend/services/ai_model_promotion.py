@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
 import pickle
 import shutil
 import sqlite3
@@ -12,6 +14,26 @@ from typing import Any
 from backend.database_schema import DATABASE_PATH
 from backend.services.ai_artifact_contract_gate import evaluate_signal_hash_artifact_contract
 from backend.services.ai_canonical_storage import ensure_ai_canonical_tables
+
+
+def _accuracy_margin(holdout_count: int) -> float:
+    """
+    Statistical tolerance for the candidate-vs-active accuracy comparison.
+
+    A raw `c_acc >= a_acc` test with zero tolerance blocks genuinely-improved
+    candidates whenever the (often tiny) real holdout set draws unlucky —
+    e.g. SOL/XRP validation sets run ~20-22 rows, where a couple of flipped
+    predictions swings measured accuracy by >=10 points. Use a one-standard-
+    error band on a proportion estimate (p=0.5, max variance, conservative)
+    so the gate isn't rejecting on pure sampling noise, floored/ceilinged so
+    it's never a no-op and never absurdly loose for very small n.
+    """
+    n = max(int(holdout_count or 0), 1)
+    z = float(os.getenv("MODEL_PROMOTION_ACCURACY_MARGIN_Z", "1.0") or "1.0")
+    se_band = z * math.sqrt(0.25 / n)
+    min_margin = float(os.getenv("MODEL_PROMOTION_ACCURACY_MIN_MARGIN", "0.01") or "0.01")
+    max_margin = float(os.getenv("MODEL_PROMOTION_ACCURACY_MAX_MARGIN", "0.15") or "0.15")
+    return max(min_margin, min(se_band, max_margin))
 
 
 def _hash_file(path: Path) -> str:
@@ -108,12 +130,13 @@ def _compose_promotion_reason(
     bad_ok: bool,
     c_bad: float | None,
     a_bad: float | None,
+    accuracy_margin: float = 0.0,
 ) -> str:
     parts: list[str] = []
     if holdout_status == "HOLDOUT_PAC_UNAVAILABLE":
         parts.append("HOLDOUT_PAC_UNAVAILABLE")
     if not accuracy_ok:
-        parts.append(f"candidate_accuracy_below_active:{c_acc:.4f}<{a_acc:.4f}")
+        parts.append(f"candidate_accuracy_below_active:{c_acc:.4f}<{a_acc:.4f}-{accuracy_margin:.4f}margin")
     if c_profit is not None and a_profit is not None and c_profit < (a_profit - 0.0005):
         parts.append(f"candidate_profit_after_cost_below_active:{c_profit:.6f}<{a_profit:.6f}")
     if not bad_ok and c_bad is not None and a_bad is not None:
@@ -229,17 +252,19 @@ def register_candidate_and_maybe_promote(
 
     has_active = active_path.exists()
     holdout_ok = holdout_status == "OK"
+    holdout_count = int(metrics.get("holdout_sample_count") or metrics.get("sample_count") or 0)
+    accuracy_margin = _accuracy_margin(holdout_count)
+    metrics["accuracy_margin_applied"] = round(accuracy_margin, 6)
     if not has_active:
         accuracy_ok = True
         pac_ok = holdout_ok and c_profit is not None
         bad_ok = holdout_ok and c_bad is not None
     else:
-        accuracy_ok = holdout_ok and c_acc is not None and a_acc is not None and c_acc >= a_acc
+        accuracy_ok = holdout_ok and c_acc is not None and a_acc is not None and c_acc >= (a_acc - accuracy_margin)
         pac_ok = holdout_ok and c_profit is not None and a_profit is not None and c_profit >= (a_profit - 0.0005)
         bad_ok = holdout_ok and c_bad is not None and a_bad is not None and c_bad <= (a_bad + 0.0005)
 
     promote = holdout_ok and accuracy_ok and pac_ok and bad_ok
-    holdout_count = int(metrics.get("holdout_sample_count") or metrics.get("sample_count") or 0)
     holdout_low_confidence = bool(metrics.get("holdout_low_confidence")) or holdout_count < 20
     metrics["holdout_low_confidence"] = holdout_low_confidence
     cand_holdout = metrics.get("candidate_holdout")
@@ -264,6 +289,7 @@ def register_candidate_and_maybe_promote(
         bad_ok=bad_ok,
         c_bad=c_bad,
         a_bad=a_bad,
+        accuracy_margin=accuracy_margin,
     )
     if promote and candidate_always_buy:
         promote = False

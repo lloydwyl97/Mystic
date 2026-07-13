@@ -2415,31 +2415,37 @@ class PortfolioEngine:
 
         This runs once at initialization to heal any mismatch where ledger was not updated
         when trades were executed and settled.
+
+        ONE-DIRECTIONAL FIX: `paper_trades` is subject to retention pruning (old rows get
+        deleted). `_compute_realized_pnl_from_paper_trades()` re-sums whatever rows currently
+        survive, so once history is pruned this heal used to silently overwrite a correct,
+        higher stored realized_pnl with a smaller, wrong one — permanently destroying the
+        pre-prune history every time this ran (every process start). Never heal downward:
+        only correct upward (catches genuinely missed/late-settled trades), never let a
+        pruned table erase previously-recorded history.
         """
         try:
             computed = self._compute_realized_pnl_from_paper_trades()
             epoch_start = self._forward_paper_epoch_start()
-            if epoch_start and abs(computed - self._realized_pnl) > 0.01:
+            healed = max(computed, self._realized_pnl)
+            if abs(healed - self._realized_pnl) > 0.01:
                 logger.warning(
-                    "REALIZED_PNL_HEAL: Correcting ledger from %.2f to %.2f (forward_epoch diff=%.2f)",
+                    "REALIZED_PNL_HEAL: Correcting ledger from %.2f to %.2f (paper_trades=%.2f, forward_epoch=%s, never-decrease)",
                     self._realized_pnl,
+                    healed,
                     computed,
-                    abs(computed - self._realized_pnl),
+                    bool(epoch_start),
                 )
-                self._realized_pnl = computed
-                if epoch_start:
-                    self._total_equity = self.cash_balance + self._positions_value
-                await self._persist_ledger_to_sqlite()
-            elif not epoch_start and abs(computed - self._realized_pnl) > 0.01:
-                logger.warning(
-                    "REALIZED_PNL_HEAL: Correcting ledger from %.2f to %.2f (diff=%.2f)",
-                    self._realized_pnl,
-                    computed,
-                    abs(computed - self._realized_pnl),
-                )
-                self._realized_pnl = computed
+                self._realized_pnl = healed
                 self._total_equity = self.cash_balance + self._positions_value
                 await self._persist_ledger_to_sqlite()
+            elif computed < self._realized_pnl - 0.01:
+                logger.info(
+                    "REALIZED_PNL_SYNC: paper_trades sum ($%.2f) is below stored ledger ($%.2f) — "
+                    "likely retention-pruned history, keeping stored value (no heal-down).",
+                    computed,
+                    self._realized_pnl,
+                )
             else:
                 logger.info("REALIZED_PNL_SYNC: Ledger and paper_trades agree at $%.2f", computed)
         except Exception as e:
@@ -3543,7 +3549,19 @@ class PortfolioEngine:
 
                 # ----- Primary invariant: total_equity = cash + positions_value -----
                 total_equity = cash + positions_value
-                self._realized_pnl = canonical_realized
+                # NEVER heal downward: paper_trades is retention-pruned, so a lower
+                # canonical_realized means old rows fell off, not that stored is wrong.
+                # This reconcile loop runs frequently (bar boundaries) — heal-down here
+                # is what silently destroyed pre-prune realized_pnl history in the past.
+                if canonical_realized < self._realized_pnl - 0.01:
+                    logger.info(
+                        "RECONCILE: paper_trades realized ($%.2f) below stored ledger ($%.2f) — "
+                        "retention-pruned history, keeping stored value (no heal-down).",
+                        canonical_realized,
+                        self._realized_pnl,
+                    )
+                else:
+                    self._realized_pnl = max(canonical_realized, self._realized_pnl)
                 self.cash_balance = cash
                 self._unrealized_pnl = unrealized
                 self._total_equity = total_equity
@@ -14285,13 +14303,19 @@ class PortfolioEngine:
         equity_alt = self.principal + self._realized_pnl + self._unrealized_pnl
         equity_alt_ok = abs(total_equity - equity_alt) < 1.0
         computed_realized = self._compute_realized_pnl_from_paper_trades()
-        if abs(computed_realized - self._realized_pnl) > 0.01:
+        # NEVER heal downward: `paper_trades` is retention-pruned, so a lower recomputed
+        # sum means old rows fell off, not that the stored value is wrong. Healing down
+        # here (this runs on ~every read) is what silently destroyed pre-prune realized_pnl
+        # history in the past. Only correct upward (genuinely missed/late-settled trades).
+        healed_realized = max(computed_realized, self._realized_pnl)
+        if abs(healed_realized - self._realized_pnl) > 0.01:
             logger.warning(
-                "REALIZED_PNL_HEAL get_ledger: stored=%.4f paper_trades=%.4f",
+                "REALIZED_PNL_HEAL get_ledger: stored=%.4f paper_trades=%.4f -> %.4f (never-decrease)",
                 self._realized_pnl,
                 computed_realized,
+                healed_realized,
             )
-            self._realized_pnl = computed_realized
+            self._realized_pnl = healed_realized
             await self._persist_ledger_to_sqlite()
         if not equity_invariant_ok:
             logger.debug(
@@ -16569,7 +16593,30 @@ class PortfolioEngine:
                     # old `<= 0` falsely flagged NEGATIVE_EXPECTANCY every day until a winning close.
                     # Fail only on strictly negative average R after at least one closed trade today.
                     min_sells_for_exp = int(os.getenv("SCOREBOARD_MIN_SELLS_FOR_EXPECTANCY", "1") or "1")
-                    if total_trades >= max(1, min_sells_for_exp) and expectancy_r < 0:
+                    # ANTI-FLAP FIX: this recomputes from ALL of today's closed trades every bar
+                    # (~30x/day). A running daily average this close to $0/trade flips sign on
+                    # nearly every close, so a strict `< 0` test made pass_fail chatter PASS/FAIL
+                    # dozens of times a day on pure noise instead of reflecting a real trend.
+                    # Require the average to clear a small hysteresis band before flipping, and
+                    # hold today's last real decision while inside the band (Schmitt trigger).
+                    hysteresis_usd = float(os.getenv("SCOREBOARD_EXPECTANCY_HYSTERESIS_USD", "0.15") or "0.15")
+                    cursor.execute(
+                        "SELECT pass_fail, fail_reasons FROM portfolio_engine_scoreboard_daily WHERE date = ?",
+                        (today,),
+                    )
+                    prev_row = cursor.fetchone()
+                    prev_had_negative_expectancy = bool(prev_row) and "NEGATIVE_EXPECTANCY" in (prev_row[1] or "")
+
+                    negative_expectancy = False
+                    if total_trades >= max(1, min_sells_for_exp):
+                        if expectancy_r < -hysteresis_usd:
+                            negative_expectancy = True
+                        elif expectancy_r > hysteresis_usd:
+                            negative_expectancy = False
+                        else:
+                            # Inside the dead-zone: don't flip on noise, keep today's last verdict.
+                            negative_expectancy = prev_had_negative_expectancy
+                    if negative_expectancy:
                         fail_reasons.append("NEGATIVE_EXPECTANCY")
                     if self._regime_state.current_drawdown_pct > DRAWDOWN_LIMIT_PCT:
                         fail_reasons.append(f"DRAWDOWN_EXCEEDED_{self._regime_state.current_drawdown_pct * 100:.1f}%")
