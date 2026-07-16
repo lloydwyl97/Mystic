@@ -5526,8 +5526,20 @@ class PortfolioEngine:
         - Symbols with no engine position: zero all BUY ``remaining_position``.
         - Symbols with an engine position: zero all BUY lots for that symbol, then set
           ``remaining_position = engine.quantity`` on the row matching ``trade_id``, or the latest BUY if missing.
+
+        RACE-CONDITION FIX: this runs concurrently with other symbols' buy execution
+        (called mid-flight from the repair-add path). A brand-new fresh BUY inserts its
+        paper_trades row (remaining_position=qty) several awaits *before* it registers
+        itself in ``self.open_positions`` — if this reconcile's ``open_syms`` snapshot is
+        taken in that window, it saw "no engine position" for the still-registering
+        symbol and permanently zeroed its remaining_position, orphaning real spent cash
+        with no compensating position or realized_pnl entry (silent capital leak).
+        A grace period exempts BUY rows younger than
+        ``FIFO_RECONCILE_GRACE_SEC`` from the no-engine-position cleanup so an in-flight
+        buy always has time to finish registering before being treated as a ghost lot.
         """
         try:
+            grace_sec = float(os.getenv("FIFO_RECONCILE_GRACE_SEC", "60") or "60")
 
             def _sync_once() -> None:
                 conn = connect_rw(self.db_path)
@@ -5540,12 +5552,15 @@ class PortfolioEngine:
                         return
 
                     open_syms = set(self.open_positions.keys())
+                    cutoff_iso = (datetime.now(timezone.utc) - timedelta(seconds=grace_sec)).isoformat()
 
                     cursor.execute(
                         """
                         SELECT DISTINCT symbol FROM paper_trades
                         WHERE side = 'BUY' AND COALESCE(remaining_position, 0) > 0
-                        """
+                          AND timestamp < ?
+                        """,
+                        (cutoff_iso,),
                     )
                     paper_open_syms = [row[0] for row in cursor.fetchall()]
 
@@ -5555,13 +5570,14 @@ class PortfolioEngine:
                             cursor.execute(
                                 """
                                 UPDATE paper_trades SET remaining_position = 0
-                                WHERE symbol = ? AND side = 'BUY'
+                                WHERE symbol = ? AND side = 'BUY' AND timestamp < ?
                                 """,
-                                (psym,),
+                                (psym, cutoff_iso),
                             )
                             logger.warning(
-                                "FIFO_RECONCILE: zeroed ghost BUY remaining for %s (no engine open position)",
+                                "FIFO_RECONCILE: zeroed ghost BUY remaining for %s (no engine open position, age>%.0fs)",
                                 psym,
+                                grace_sec,
                             )
 
                     for sym, pos in self.open_positions.items():
