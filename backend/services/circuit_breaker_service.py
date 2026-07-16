@@ -237,8 +237,39 @@ class TradingCircuitBreaker:
         # Load state from SQLite on initialization
         self._load_circuit_state()
 
+    def _maybe_reset_daily_session_high(self, current_equity: float) -> None:
+        """
+        Reset session_high_equity to today's equity once per new UTC day.
+
+        Without this, session_high_equity is a permanent all-time watermark
+        that only ever increases (see update_session_high). Any equity dip of
+        >7% from that peak — from a real drawdown OR a transient bug — then
+        latches PAUSE_BUYS until equity fully recovers to within 7% of the
+        highest point the account has EVER reached, with no way to clear on
+        its own (evidence: a 2026-07-13 bookkeeping bug depressed equity by
+        ~$3,750, and the resulting PAUSE_BUYS stayed engaged for 2.5 days
+        straight because equity could never climb back above the stale
+        pre-bug peak). A daily reset bounds this to "one bad day", not
+        "however long it takes to beat an old high-water mark forever".
+        """
+        from datetime import datetime, timezone
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.last_daily_reset != today:
+            if self.last_daily_reset is not None and current_equity > 0:
+                logger.info(
+                    "[CIRCUIT BREAKER] DAILY_SESSION_HIGH_RESET %s -> %s | session_high %.2f -> %.2f",
+                    self.last_daily_reset,
+                    today,
+                    self.session_high_equity,
+                    current_equity,
+                )
+            self.session_high_equity = current_equity
+            self.last_daily_reset = today
+
     def update_session_high(self, current_equity: float) -> None:
         """Update session high equity for circuit breaker calculations"""
+        self._maybe_reset_daily_session_high(current_equity)
         self.session_high_equity = max(self.session_high_equity, current_equity)
 
     def check_daily_loss_freeze(self, realized_pnl_today: float, equity: float) -> bool:
@@ -367,6 +398,7 @@ class TradingCircuitBreaker:
             "account_failsafe_active": bool(circuit_data.get("account_failsafe_active", False)),
         }
         self.session_high_equity = float(circuit_data.get("session_high_equity", 0.0) or 0.0)
+        self.last_daily_reset = circuit_data.get("last_daily_reset") or None
 
         for flag_name, persisted_value in persisted.items():
             if not persisted_value:
@@ -423,6 +455,7 @@ class TradingCircuitBreaker:
                 self.daily_loss_freeze_active = False
                 cleared.append("daily_loss_freeze_active")
         if "equity_circuit_breaker_active" in pending:
+            self._maybe_reset_daily_session_high(current_equity)
             if self.session_high_equity > 0 and current_equity <= self.session_high_equity * 0.93:
                 self.equity_circuit_breaker_active = True
                 confirmed.append("equity_circuit_breaker_active")
@@ -453,6 +486,7 @@ class TradingCircuitBreaker:
             "equity_circuit_breaker_active": self.equity_circuit_breaker_active,
             "account_failsafe_active": self.account_failsafe_active,
             "session_high_equity": self.session_high_equity,
+            "last_daily_reset": self.last_daily_reset,
             "persisted_state_timestamp": self.persisted_state_timestamp,
             "persisted_state_age_sec": round(self.persisted_state_age_sec, 1) if self.persisted_state_age_sec is not None else None,
             "stale_state_max_age_sec": _stale_state_max_age_sec(),
@@ -521,6 +555,7 @@ class TradingCircuitBreaker:
                 "equity_circuit_breaker_active": self.equity_circuit_breaker_active,
                 "account_failsafe_active": self.account_failsafe_active,
                 "session_high_equity": self.session_high_equity,
+                "last_daily_reset": self.last_daily_reset,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             loop.run_until_complete(set_state("risk:circuit_breakers", circuit_data))
@@ -562,6 +597,7 @@ class TradingCircuitBreaker:
                 "equity_circuit_breaker_active": self.equity_circuit_breaker_active,
                 "account_failsafe_active": self.account_failsafe_active,
                 "session_high_equity": self.session_high_equity,
+                "last_daily_reset": self.last_daily_reset,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             await set_state("risk:circuit_breakers", circuit_data)
