@@ -6,6 +6,7 @@ from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, Str
 from backend.services.binance_scalp.strategies.common import (
     check_spread,
     depth_check,
+    estimate_expected_move_pct,
     pass_signal,
     reject_signal,
     target_reachable,
@@ -40,7 +41,10 @@ class OrderbookTapeScalpStrategy:
         if not ctx.config.scalp_paper_enabled and not (mom.mid_change_30s > 0):
             return reject_signal(ctx, self.name, "PRICE_NOT_CONFIRMING_IMBALANCE")
 
-        expected = min(ctx.snap.spread_pct * 6 + imb * 0.002, 0.004)
+        structural = min(ctx.snap.spread_pct * 6 + imb * 0.002, 0.004)
+        expected = estimate_expected_move_pct(
+            ctx.bars_1m, structural=structural, atr_mult=0.50, cap_pct=0.006
+        )
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)

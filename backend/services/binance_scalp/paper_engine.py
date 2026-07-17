@@ -395,6 +395,13 @@ class BinanceScalpPaperEngine:
         except Exception as exc:
             logger.debug("SCALP intelligence enrich skipped: %s", exc)
 
+        try:
+            from backend.services.binance_scalp.scalp_entry_telemetry import publish_entry_telemetry
+
+            publish_entry_telemetry(self._redis, ranked, prefix=self.config.redis_key_prefix)
+        except Exception as exc:
+            logger.debug("SCALP entry telemetry skipped: %s", exc)
+
         for row in ranked:
             sym = row["symbol"]
             snap = row["snap"]
@@ -475,10 +482,7 @@ class BinanceScalpPaperEngine:
                     }
                 ),
             )
-            ranked_summary = [
-                {"symbol": r["symbol"], "rank_score": r.get("rank_score"), "entry_eligible": r.get("entry_eligible"), "hard_block": r.get("hard_block")}
-                for r in ranked
-            ]
+            ranked_summary = [{"symbol": r["symbol"], "rank_score": r.get("rank_score"), "entry_eligible": r.get("entry_eligible"), "hard_block": r.get("hard_block")} for r in ranked]
             self._publish_last_decision(
                 decision="NO_SIGNAL",
                 reason=reason,
@@ -489,10 +493,7 @@ class BinanceScalpPaperEngine:
             )
             return []
         sym, snap, sig = best["symbol"], best["snap"], best["signal"]
-        ranked_summary = [
-            {"symbol": r["symbol"], "rank_score": r.get("rank_score"), "entry_eligible": r.get("entry_eligible"), "hard_block": r.get("hard_block")}
-            for r in ranked
-        ]
+        ranked_summary = [{"symbol": r["symbol"], "rank_score": r.get("rank_score"), "entry_eligible": r.get("entry_eligible"), "hard_block": r.get("hard_block")} for r in ranked]
         if not getattr(sig, "passed", False):
             self._record_reject(
                 conn,

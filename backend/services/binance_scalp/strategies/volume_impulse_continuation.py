@@ -9,6 +9,7 @@ from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, Str
 from backend.services.binance_scalp.strategies.common import (
     check_spread,
     depth_check,
+    estimate_expected_move_pct,
     pass_signal,
     reject_signal,
     target_reachable,
@@ -40,7 +41,7 @@ class VolumeImpulseContinuationStrategy:
         if not (impulse and price_up):
             return reject_signal(ctx, self.name, "NO_VOLUME_IMPULSE")
 
-        expected = 0.0026
+        expected = estimate_expected_move_pct(bars, structural=0.0026, atr_mult=0.70, cap_pct=0.006)
         reachable, _ = target_reachable(
             ctx.econ,
             spread_pct=ctx.snap.spread_pct,

@@ -6,6 +6,7 @@ from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, Str
 from backend.services.binance_scalp.strategies.common import (
     check_spread,
     depth_check,
+    estimate_expected_move_pct,
     pass_signal,
     reject_signal,
     target_reachable,
@@ -61,7 +62,11 @@ class RangeBounceScalpStrategy:
             return reject_signal(ctx, self.name, "MOMENTUM_NOT_SUSTAINED")
 
         recovery = (cur - support) / cur if cur > 0 else 0
-        expected = min(recovery + 0.0008, 0.0025)
+        # Project toward range high (bounce target), not a hard 0.25% micro-cap
+        # that sits at/below net_profit_target and always fails reachability.
+        to_high = (hi - cur) / cur if cur > 0 else 0.0
+        structural = max(to_high, recovery + 0.0008)
+        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.55, cap_pct=0.006)
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)

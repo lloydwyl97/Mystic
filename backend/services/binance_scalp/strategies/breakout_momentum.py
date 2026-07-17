@@ -6,6 +6,7 @@ from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, Str
 from backend.services.binance_scalp.strategies.common import (
     check_spread,
     depth_check,
+    estimate_expected_move_pct,
     pass_signal,
     reject_signal,
     target_reachable,
@@ -48,7 +49,9 @@ class BreakoutMomentumStrategy:
         if move_from_low > 0.006:
             return reject_signal(ctx, self.name, "MOVE_EXHAUSTED_CHASE")
 
-        expected = min(range_pct * 0.55, 0.005)
+        expected = estimate_expected_move_pct(
+            bars, structural=min(range_pct * 0.55, 0.005), atr_mult=0.65, cap_pct=0.006
+        )
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)

@@ -74,6 +74,16 @@ def _regime_mismatch_mult(setup_name: str, regime: str) -> float:
     return float(os.getenv("SCALP_REGIME_MISMATCH_MULT", "0.82"))
 
 
+def _require_regime_native() -> bool:
+    """When true (default), only regime-native strategies may become entry_eligible."""
+    return str(os.getenv("SCALP_REQUIRE_REGIME_NATIVE", "true")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _soft_base_score(reject_reason: str | None) -> float:
     if not reject_reason:
         return 0.0
@@ -257,7 +267,15 @@ def rank_setup_signal(
     # status/diagnostics display, but must never be promoted to an executable
     # trade. Only a strategy's own confirmed pass_signal() may enter live.
     entry_eligible = sig.passed and rank_score >= min_score and hard_block is None
-    if not entry_eligible and hard_block is None:
+    soft_reason = None if sig.passed else sig.reject_reason
+    if entry_eligible and not native and _require_regime_native():
+        # Regime focus: STRATEGY_NATIVE_REGIMES was advisory (score mult only).
+        # Non-native confirmed setups still rank for diagnostics but cannot buy —
+        # keeps range/chop markets from executing breakout/impulse strategies.
+        entry_eligible = False
+        confidence = "regime_mismatch"
+        soft_reason = f"REGIME_BLOCKED:{regime}"
+    elif not entry_eligible and hard_block is None:
         confidence = "below_min"
 
     return RankedCandidate(
@@ -267,7 +285,7 @@ def rank_setup_signal(
         hard_block=hard_block,
         regime=regime,
         regime_native=native,
-        soft_reason=None if sig.passed else sig.reject_reason,
+        soft_reason=soft_reason,
         reachability_surplus=reach_surplus,
         selection_confidence=confidence,
         base_score=base_score,

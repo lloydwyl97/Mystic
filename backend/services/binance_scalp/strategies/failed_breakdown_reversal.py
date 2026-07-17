@@ -9,6 +9,7 @@ from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, Str
 from backend.services.binance_scalp.strategies.common import (
     check_spread,
     depth_check,
+    estimate_expected_move_pct,
     pass_signal,
     reject_signal,
     target_reachable,
@@ -47,8 +48,7 @@ class FailedBreakdownReversalStrategy:
         if not (reclaimed and vol_ok and mom_ok):
             return reject_signal(ctx, self.name, "NO_REVERSAL_CONFIRM")
 
-        # project a conservative expected move based on intended target
-        expected = 0.0028
+        expected = estimate_expected_move_pct(bars, structural=0.0028, atr_mult=0.65, cap_pct=0.006)
         reachable, _ = target_reachable(
             ctx.econ,
             spread_pct=ctx.snap.spread_pct,

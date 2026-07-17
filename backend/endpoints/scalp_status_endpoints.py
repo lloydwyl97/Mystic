@@ -112,6 +112,28 @@ def scalp_strategies() -> dict:
     }
 
 
+@router.get("/telemetry")
+def scalp_entry_telemetry() -> dict:
+    """Latest genuine-pass / reject histogram from the paper runner (Redis)."""
+    try:
+        import redis as redis_lib
+
+        from backend.services.binance_scalp.scalp_entry_telemetry import read_entry_telemetry
+
+        cfg = get_scalp_config()
+        r = redis_lib.Redis(host="127.0.0.1", port=6379, db=0, decode_responses=True)
+        payload = read_entry_telemetry(r, prefix=cfg.redis_key_prefix)
+        if not payload:
+            return {
+                "engine": "scalp",
+                "available": False,
+                "note": "No telemetry yet — wait one paper-runner cycle (~5s) after start.",
+            }
+        return {"engine": "scalp", "available": True, **payload}
+    except Exception as exc:
+        return {"engine": "scalp", "available": False, "error": str(exc)[:240]}
+
+
 @router.get("/positions")
 def scalp_positions() -> dict[str, Any]:
     """Open scalp paper positions (read-only) with live lifecycle fields."""
@@ -266,9 +288,7 @@ def scalp_learning_summary(limit: int = Query(20, ge=1, le=200)) -> dict[str, An
                 """,
                 (limit,),
             )
-            sell_count = conn.execute(
-                "SELECT COUNT(*) FROM scalp_paper_trades WHERE side='SELL'"
-            ).fetchone()[0]
+            sell_count = conn.execute("SELECT COUNT(*) FROM scalp_paper_trades WHERE side='SELL'").fetchone()[0]
         return {
             "engine": "scalp",
             "closed_sells": int(sell_count),

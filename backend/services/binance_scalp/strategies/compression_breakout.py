@@ -9,6 +9,7 @@ from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, Str
 from backend.services.binance_scalp.strategies.common import (
     check_spread,
     depth_check,
+    estimate_expected_move_pct,
     pass_signal,
     reject_signal,
     target_reachable,
@@ -42,7 +43,7 @@ class CompressionBreakoutStrategy:
         if not expansion:
             return reject_signal(ctx, self.name, "NO_COMPRESSION_BREAK")
 
-        expected = 0.0030
+        expected = estimate_expected_move_pct(bars, structural=0.0030, atr_mult=0.70, cap_pct=0.006)
         reachable, _ = target_reachable(
             ctx.econ,
             spread_pct=ctx.snap.spread_pct,

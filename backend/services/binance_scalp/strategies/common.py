@@ -10,6 +10,46 @@ from backend.services.binance_scalp.paper_spread_caps import uses_paper_spread_c
 from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, StrategyMarketContext
 
 
+def _atr_pct(bars: list[dict] | None, period: int = 14) -> float:
+    """Recent ATR as a fraction of last close (0 if insufficient bars)."""
+    if not bars or len(bars) < period + 1:
+        return 0.0
+    trs: list[float] = []
+    for i in range(-period, 0):
+        h = float(bars[i]["high"])
+        low = float(bars[i]["low"])
+        pc = float(bars[i - 1]["close"])
+        trs.append(max(h - low, abs(h - pc), abs(low - pc)))
+    atr = sum(trs) / len(trs) if trs else 0.0
+    mid = float(bars[-1]["close"] or 0.0)
+    return atr / mid if mid > 0 else 0.0
+
+
+def estimate_expected_move_pct(
+    bars: list[dict] | None,
+    *,
+    structural: float,
+    atr_mult: float = 0.65,
+    floor_pct: float | None = None,
+    cap_pct: float = 0.006,
+) -> float:
+    """
+    Honest expected-move for TARGET_NOT_REACHABLE.
+
+    Many strategies previously hard-capped expected move at ~0.22%-0.28%, which
+    is at or below SCALP_NET_PROFIT_TARGET_PCT (0.25%) *before* fees/spread/
+    entry buffer — so confirmed patterns were systematically rejected as
+    TARGET_NOT_REACHABLE even when the setup was real. Blend the strategy's
+    structural projection with recent ATR so the gate tests economics against
+    a realistic short-horizon move, not an artificial micro-cap.
+    """
+    atr_based = _atr_pct(bars) * float(atr_mult)
+    raw = max(float(structural or 0.0), atr_based)
+    if floor_pct is not None:
+        raw = max(raw, float(floor_pct))
+    return min(max(raw, 0.0), float(cap_pct))
+
+
 def spread_cap(econ: ScalpEconomics, config: ScalpConfig, symbol: str) -> float:
     if uses_paper_spread_caps(
         scalp_live=config.scalp_live,

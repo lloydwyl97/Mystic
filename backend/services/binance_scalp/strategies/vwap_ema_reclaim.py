@@ -6,6 +6,7 @@ from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, Str
 from backend.services.binance_scalp.strategies.common import (
     check_spread,
     depth_check,
+    estimate_expected_move_pct,
     pass_signal,
     reject_signal,
     target_reachable,
@@ -65,18 +66,13 @@ class VwapEmaReclaimStrategy:
         if ctx.config.scalp_paper_enabled:
             mom_ok = mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0
         else:
-            mom_ok = (
-                mom.bid_change_15s > 0
-                and mom.mid_change_15s > 0
-                and mom.mid_change_30s > 0
-                and mom.momentum_confirmed
-                and higher_low
-            )
+            mom_ok = mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0 and mom.momentum_confirmed and higher_low
         if not mom_ok:
             return reject_signal(ctx, self.name, "NO_PULLBACK_RECOVERY")
 
-        expected = (vwap - prior_low) / cur if cur > 0 else 0.001
-        expected = min(max(expected, 0.001), 0.004)
+        structural = (vwap - prior_low) / cur if cur > 0 else 0.001
+        structural = max(structural, 0.001)
+        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.60, cap_pct=0.006)
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
