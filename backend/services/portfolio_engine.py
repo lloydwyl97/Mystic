@@ -2441,8 +2441,7 @@ class PortfolioEngine:
                 await self._persist_ledger_to_sqlite()
             elif computed < self._realized_pnl - 0.01:
                 logger.info(
-                    "REALIZED_PNL_SYNC: paper_trades sum ($%.2f) is below stored ledger ($%.2f) — "
-                    "likely retention-pruned history, keeping stored value (no heal-down).",
+                    "REALIZED_PNL_SYNC: paper_trades sum ($%.2f) is below stored ledger ($%.2f) — likely retention-pruned history, keeping stored value (no heal-down).",
                     computed,
                     self._realized_pnl,
                 )
@@ -3555,8 +3554,7 @@ class PortfolioEngine:
                 # is what silently destroyed pre-prune realized_pnl history in the past.
                 if canonical_realized < self._realized_pnl - 0.01:
                     logger.info(
-                        "RECONCILE: paper_trades realized ($%.2f) below stored ledger ($%.2f) — "
-                        "retention-pruned history, keeping stored value (no heal-down).",
+                        "RECONCILE: paper_trades realized ($%.2f) below stored ledger ($%.2f) — retention-pruned history, keeping stored value (no heal-down).",
                         canonical_realized,
                         self._realized_pnl,
                     )
@@ -4553,6 +4551,7 @@ class PortfolioEngine:
         for canon in (
             "TIME_STOP_EXIT",
             "STALL_EXIT",
+            "GIVEBACK_EXIT",
             "NET_PROFIT_EXIT",
             "STOP_LOSS_EXIT",
             "TRAILING_STOP_EXIT",
@@ -4564,6 +4563,8 @@ class PortfolioEngine:
                 return canon
 
         # Trigger-first for engine risk exits: always canonical even if exit_type is MANUAL
+        if "GIVEBACK" in trig:
+            return "GIVEBACK_EXIT"
         if "STALL" in trig:
             return "STALL_EXIT"
         if "TIME_STOP" in trig:
@@ -10823,6 +10824,8 @@ class PortfolioEngine:
         net_expected_value: float,
         confidence: float,
         decision_data: dict[str, Any],
+        chop_score: float | None = None,
+        coin_edge_score: float | None = None,
     ) -> tuple[float, dict[str, float], str]:
         """AI dynamic sizing with capped factors (Phase 4 — re-enabled).
 
@@ -10838,6 +10841,7 @@ class PortfolioEngine:
             "score_factor": 1.0,
             "confidence_factor": 1.0,
             "symbol_size_factor": 1.0,
+            "stall_risk_factor": 1.0,
         }
         enabled = os.getenv("AI_DYNAMIC_SIZING_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
         if not enabled:
@@ -10944,6 +10948,35 @@ class PortfolioEngine:
         if symbol_group == "low_trust" and setup_strong and ev >= ev_high:
             symbol_size_factor = max(0.95, min(symbol_size_factor, 1.10))
 
+        # Stall-risk factor: reduce size for entries statistically prone to the
+        # "never-green" no-follow-through pattern (weak trend + choppy price action)
+        # rather than trying to pick winners within it (entry-time features carry no
+        # signal for final win/loss there — cross-validated AUC ~0.5). What IS
+        # predictable (leak-free 30m-horizon backtest, CV AUC ~0.62-0.68) is whether
+        # a trade shows *any* early follow-through (MFE>=0.15% in first 30m) — that
+        # bucket split is ~76% win rate vs ~26% for the no-follow-through bucket.
+        # Out-of-fold economic check: predicted-high-risk tercile averaged -$3.09/trade
+        # vs +$0.88/trade for predicted-low-risk. This factor only trims size — it
+        # never blocks entry, since the risk score is probabilistic, not a hard filter.
+        stall_risk_enabled = os.getenv("DAY_STALL_RISK_SIZE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+        stall_risk_factor = 1.0
+        if stall_risk_enabled:
+            adx_val = _safe_float(dd.get("adx"), 0.0)
+            adx_severe = _envf("DAY_STALL_RISK_ADX_SEVERE", 15.0)
+            adx_moderate = _envf("DAY_STALL_RISK_ADX_MODERATE", 20.0)
+            if adx_val > 0 and adx_val < adx_severe:
+                stall_risk_factor *= _envf("DAY_STALL_RISK_ADX_SEVERE_MULT", 0.80)
+            elif adx_val > 0 and adx_val < adx_moderate:
+                stall_risk_factor *= _envf("DAY_STALL_RISK_ADX_MODERATE_MULT", 0.90)
+            chop_thresh = _envf("DAY_STALL_RISK_CHOP_THRESH", 0.75)
+            if chop_score is not None and float(chop_score) >= chop_thresh:
+                stall_risk_factor *= _envf("DAY_STALL_RISK_CHOP_MULT", 0.88)
+            edge_thresh = _envf("DAY_STALL_RISK_EDGE_THRESH", -0.15)
+            if coin_edge_score is not None and float(coin_edge_score) <= edge_thresh:
+                stall_risk_factor *= _envf("DAY_STALL_RISK_EDGE_MULT", 0.92)
+            stall_risk_floor = max(0.30, min(1.0, _envf("DAY_STALL_RISK_FACTOR_MIN", 0.55)))
+            stall_risk_factor = max(stall_risk_floor, min(1.0, stall_risk_factor))
+
         components: dict[str, float] = {
             "drawdown_factor": round(drawdown_factor, 4),
             "memory_factor": round(memory_factor, 4),
@@ -10953,8 +10986,9 @@ class PortfolioEngine:
             "score_factor": round(score_factor, 4),
             "confidence_factor": round(confidence_factor, 4),
             "symbol_size_factor": round(symbol_size_factor, 4),
+            "stall_risk_factor": round(stall_risk_factor, 4),
         }
-        raw_mult = drawdown_factor * memory_factor * expectancy_factor * liquidity_factor * ev_factor * score_factor * confidence_factor * symbol_size_factor
+        raw_mult = drawdown_factor * memory_factor * expectancy_factor * liquidity_factor * ev_factor * score_factor * confidence_factor * symbol_size_factor * stall_risk_factor
         cap_reason = ""
         mult = raw_mult
         # Cap when sizing would grow size despite warning signals (rule 4 from spec).
@@ -13097,6 +13131,8 @@ class PortfolioEngine:
             net_expected_value=float(top_meta.get("net_expected_value") or 0.0),
             confidence=float(top_candidate.confidence or 0.0),
             decision_data=top_candidate.decision_data or {},
+            chop_score=float(top_candidate.chop_score) if top_candidate.chop_score is not None else None,
+            coin_edge_score=float(top_candidate.coin_edge_score) if top_candidate.coin_edge_score is not None else None,
         )
         sizing_mult *= dyn_mult
 
@@ -14272,6 +14308,8 @@ class PortfolioEngine:
                     "STOP_LOSS_EXIT",
                     "TRAILING_STOP_EXIT",
                     "THESIS_INVALIDATION_EXIT",
+                    "GIVEBACK_EXIT",
+                    "STALL_EXIT",
                     "TIME_STOP_EXIT",
                     "FAILED_RECLAIM_EXIT",
                     "EXTREME_PROTECTION_EXIT",

@@ -737,6 +737,8 @@ def canonical_day_exit_reason(exit_trigger: str, *, exit_type_name: str = "") ->
         return "TIME_STOP_EXIT"
     if trig.startswith("STALL_EXIT") or trig.startswith("STALL"):
         return "STALL_EXIT"
+    if trig.startswith("GIVEBACK_EXIT") or trig.startswith("GIVEBACK"):
+        return "GIVEBACK_EXIT"
     if trig.startswith("VOLATILITY_STOP"):
         return "VOLATILITY_STOP_EXIT"
     if trig.startswith("FAILED_RECLAIM"):

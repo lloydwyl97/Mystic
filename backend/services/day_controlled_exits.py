@@ -31,6 +31,7 @@ EXIT_VOLATILITY_STOP = "VOLATILITY_STOP_EXIT"
 EXIT_TIME_STOP = "TIME_STOP_EXIT"
 EXIT_FAILED_RECLAIM = "FAILED_RECLAIM_EXIT"
 EXIT_STALL = "STALL_EXIT"
+EXIT_GIVEBACK = "GIVEBACK_EXIT"
 
 ALLOWED_DAY_EXIT_REASONS = frozenset(
     {
@@ -38,6 +39,7 @@ ALLOWED_DAY_EXIT_REASONS = frozenset(
         EXIT_VOLATILITY_STOP,
         EXIT_TIME_STOP,
         EXIT_STALL,
+        EXIT_GIVEBACK,
         EXIT_FAILED_RECLAIM,
         EXIT_EXTREME_PROTECTION,
         EXIT_THESIS_INVALIDATION,
@@ -55,6 +57,7 @@ ENGINE_RISK_EXIT_PREFIXES = (
     EXIT_VOLATILITY_STOP,
     EXIT_TIME_STOP,
     EXIT_STALL,
+    EXIT_GIVEBACK,
     EXIT_TRAILING_STOP,
     EXIT_THESIS_INVALIDATION,
     EXIT_FAILED_RECLAIM,
@@ -117,6 +120,66 @@ def evaluate_stall_exit(
         "net_pnl_pct": net_pnl_pct,
         "hold_minutes": hold_minutes,
         "detail": f"stall_min={stall_min:.0f}m mfe={mfe_pct:.6f} max_mfe={_stall_max_mfe_pct():.6f}",
+    }
+
+
+def _giveback_exit_enabled() -> bool:
+    return os.getenv("DAY_GIVEBACK_EXIT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+
+def _giveback_min_hold_min() -> float:
+    return float(os.getenv("DAY_GIVEBACK_MIN_HOLD_MIN", "3"))
+
+
+def _giveback_min_mfe_pct() -> float:
+    """Min favorable excursion (fraction) that must have been reached before a reversal counts as a giveback."""
+    return float(os.getenv("DAY_GIVEBACK_MIN_MFE_PCT", "0.0008"))
+
+
+def _giveback_trigger_pnl_pct() -> float:
+    """Net pnl pct (negative fraction) that, once breached after MFE was reached, triggers an early cut."""
+    return float(os.getenv("DAY_GIVEBACK_TRIGGER_PNL_PCT", "-0.0005"))
+
+
+def evaluate_giveback_exit(
+    *,
+    entry_price: float,
+    highest_price: float,
+    net_pnl_pct: float,
+    hold_minutes: float,
+) -> dict[str, Any] | None:
+    """
+    Cut DAY holds that reached meaningful favorable excursion and then reversed
+    back to net-negative, instead of waiting for the 30m stall floor to book a
+    deeper loss.
+
+    Evidence (7-day sample): STALL_EXIT trades that had gone green (MFE > 0)
+    before reversing were losers 24/24 times (100%), averaging -$6.16, because
+    the stall floor let the position drift further negative for up to ~30
+    minutes after the reversal before cutting it. This exit has no minimum
+    hold tied to the stall floor and no dependency on stop/trailing levels —
+    it fires as soon as a confirmed giveback is observed.
+    """
+    if not _giveback_exit_enabled():
+        return None
+    entry = float(entry_price or 0.0)
+    if entry <= 0:
+        return None
+    if hold_minutes < _giveback_min_hold_min():
+        return None
+    highest = float(highest_price or entry)
+    mfe_pct = max(0.0, (highest - entry) / entry)
+    if mfe_pct < _giveback_min_mfe_pct():
+        return None
+    trigger = _giveback_trigger_pnl_pct()
+    if net_pnl_pct + 1e-12 > trigger:
+        return None
+    return {
+        "action": "sell",
+        "reason": EXIT_GIVEBACK,
+        "net_pnl_pct": net_pnl_pct,
+        "hold_minutes": hold_minutes,
+        "detail": f"mfe={mfe_pct:.6f} trigger={trigger:.6f}",
     }
 
 
@@ -290,16 +353,12 @@ def preview_next_engine_exit(
 
     highest = float(getattr(position, "highest_price", entry) or entry)
     mfe_pct = max(0.0, (highest - entry) / entry) if entry > 0 else 0.0
-    stall_ready = bool(
-        _stall_exit_enabled()
-        and hold_minutes >= _stall_min_hold_min()
-        and hold_minutes + 1e-9 < float(max_hold)
-        and net_pnl_pct + 1e-12 < 0.0
-        and mfe_pct < _stall_max_mfe_pct()
-    )
+    stall_ready = bool(_stall_exit_enabled() and hold_minutes >= _stall_min_hold_min() and hold_minutes + 1e-9 < float(max_hold) and net_pnl_pct + 1e-12 < 0.0 and mfe_pct < _stall_max_mfe_pct())
+    giveback_ready = bool(_giveback_exit_enabled() and hold_minutes >= _giveback_min_hold_min() and mfe_pct >= _giveback_min_mfe_pct() and net_pnl_pct + 1e-12 <= _giveback_trigger_pnl_pct())
     checks = {
         "stop_loss": bool(stop > 0 and current_price <= stop),
         "trailing_stop": bool(trail > 0 and current_price <= trail and highest >= entry * (1 + float(coin_profile.get("trail") or 0.005))),
+        "giveback_exit": giveback_ready,
         "stall_exit": stall_ready,
         "time_stop": bool(hold_minutes >= max_hold and net_pnl_pct + 1e-12 < float(MIN_NET_PROFIT_TO_SELL)),
         "profit_target": bool(target > 0 and current_price >= target and net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL) * 0.45),
@@ -310,6 +369,7 @@ def preview_next_engine_exit(
     priority = [
         ("stop_loss", EXIT_STOP_LOSS),
         ("trailing_stop", EXIT_TRAILING_STOP),
+        ("giveback_exit", EXIT_GIVEBACK),
         ("stall_exit", EXIT_STALL),
         ("time_stop", EXIT_TIME_STOP),
         ("profit_target", EXIT_NET_PROFIT),
@@ -442,6 +502,15 @@ def evaluate_engine_managed_exit(
                 "net_pnl_pct": net_pnl_pct,
                 "hold_minutes": hold_minutes,
             }
+
+    giveback = evaluate_giveback_exit(
+        entry_price=entry,
+        highest_price=float(getattr(position, "highest_price", entry) or entry),
+        net_pnl_pct=net_pnl_pct,
+        hold_minutes=hold_minutes,
+    )
+    if giveback is not None:
+        return giveback
 
     max_hold = int(getattr(position, "max_hold_min", 0) or coin_profile.get("max_hold_min") or 75)
     stall = evaluate_stall_exit(
