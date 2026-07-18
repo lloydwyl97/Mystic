@@ -74,6 +74,32 @@ def _regime_mismatch_mult(setup_name: str, regime: str) -> float:
     return float(os.getenv("SCALP_REGIME_MISMATCH_MULT", "0.82"))
 
 
+def _symbol_stall_risk_blocklist() -> frozenset[str]:
+    """Evidence (139 genuine-pass trades across 2 independently-running hosts
+    since the 07-12 entry_eligible fix): no entry-time feature (rank_score,
+    confidence, spread_pct, impact_pct, wick_rejection_pct, expected_move_pct)
+    discriminates winners from losers on this population (correlations all
+    <0.15) — but symbol identity does, consistently on both hosts:
+      ETHUSDT: 45 trades, ~13% win rate, -$5.95 combined (worst)
+      XRPUSDT: 32 trades, ~22% win rate, -$2.55 combined
+      SOLUSDT: 37 trades, ~32% win rate, -$1.68 combined
+      BTCUSDT: 21 trades, ~38% win rate, +$0.16 combined (only net-positive)
+    Override via SCALP_STALL_RISK_SYMBOL_BLOCKLIST (comma-separated) or
+    disable via SCALP_STALL_RISK_SYMBOL_GATE_ENABLED=false.
+    """
+    raw = os.getenv("SCALP_STALL_RISK_SYMBOL_BLOCKLIST", "ETHUSDT,XRPUSDT")
+    return frozenset(s.strip().upper() for s in raw.split(",") if s.strip())
+
+
+def _symbol_stall_risk_gate_enabled() -> bool:
+    return str(os.getenv("SCALP_STALL_RISK_SYMBOL_GATE_ENABLED", "true")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _require_regime_native() -> bool:
     """When true (default), only regime-native strategies may become entry_eligible."""
     return str(os.getenv("SCALP_REQUIRE_REGIME_NATIVE", "true")).strip().lower() in (
@@ -277,6 +303,11 @@ def rank_setup_signal(
         soft_reason = f"REGIME_BLOCKED:{regime}"
     elif not entry_eligible and hard_block is None:
         confidence = "below_min"
+
+    if entry_eligible and _symbol_stall_risk_gate_enabled() and sig.symbol.upper() in _symbol_stall_risk_blocklist():
+        entry_eligible = False
+        confidence = "symbol_stall_risk_blocked"
+        soft_reason = f"SYMBOL_STALL_RISK_GATE:{sig.symbol}"
 
     return RankedCandidate(
         signal=sig,
