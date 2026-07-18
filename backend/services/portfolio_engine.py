@@ -474,6 +474,12 @@ CHURN_GUARD_MIN_SAMPLES = int(os.getenv("CHURN_GUARD_MIN_SAMPLES", "5"))
 # Sum of winning sell PnL (audit invariant_diff > 0) must exceed this before churn ratio can arm guard
 CHURN_GUARD_MIN_GROSS_WIN_SUM = float(os.getenv("CHURN_GUARD_MIN_GROSS_WIN_SUM", "15.0"))
 
+# Enforce _check_regime_guards() (spread-spike / drawdown / churn) by actually
+# aborting the buy, not just logging TELEMETRY_REGIME_GUARD. Previously this
+# was decorative-only for all three guards. Kill-switch left in place in case
+# enforcement needs to be rolled back quickly on either host.
+ENABLE_REGIME_ENFORCEMENT = os.getenv("ENABLE_REGIME_ENFORCEMENT", "true").strip().lower() in ("1", "true", "yes", "on")
+
 # =============================================================================
 # SIGNAL QUALITY GATE CONSTANTS (Item 5)
 # =============================================================================
@@ -4809,6 +4815,50 @@ class PortfolioEngine:
                 e,
             )
 
+    def _record_trade_pattern_memory(
+        self,
+        *,
+        symbol: str,
+        position: OpenPosition,
+        net_pnl: float,
+        net_outcome_pct: float,
+        hold_seconds: float,
+        reason: str,
+    ) -> None:
+        """Write this closed trade's entry-time feature vector into the AI
+        good/bad pattern memory tables, so future candidates for this
+        symbol/strategy get a real (non-neutral) ``memory_factor`` in sizing.
+
+        Best-effort: never raises into the engine (see ai_pattern_memory.py).
+        """
+        from backend.services.ai_pattern_memory import build_pattern_vector, record_trade_pattern
+
+        tid = str(getattr(position, "trade_id", "") or "")
+        ex_payload: dict[str, Any] = {}
+        if tid and tid in self.trade_explanations:
+            ex_payload = self.trade_explanations[tid].to_dict()
+        strategy_id = str(getattr(position, "entry_strategy_id", "") or "day") or "day"
+        entry_ts = float(getattr(position, "entry_time", 0.0) or 0.0)
+        entry_iso = datetime.fromtimestamp(entry_ts, tz=timezone.utc).isoformat() if entry_ts > 0 else ""
+        vector = build_pattern_vector(
+            chop_score=ex_payload.get("chop_score"),
+            coin_edge_score=ex_payload.get("coin_edge_score"),
+            trend_score=ex_payload.get("trend_score"),
+            confidence=ex_payload.get("ai_confidence"),
+        )
+        record_trade_pattern(
+            db_path=self.db_path,
+            symbol=symbol,
+            strategy_id=strategy_id,
+            vector=vector,
+            net_outcome_pct=net_outcome_pct,
+            net_pnl=net_pnl,
+            hold_seconds=hold_seconds,
+            reason=reason,
+            trade_id=tid,
+            entry_time_iso=entry_iso,
+        )
+
     async def _persist_recovered_close_canonical_packet(
         self,
         *,
@@ -6949,6 +6999,19 @@ class PortfolioEngine:
         can_proceed, regime_reason = self._check_regime_guards(symbol, bar_timestamp)
         if not can_proceed:
             logger.info("TELEMETRY_REGIME_GUARD symbol=%s reason=%s", symbol, regime_reason)
+            if ENABLE_REGIME_ENFORCEMENT:
+                logger.warning("BUY_BLOCKED_REGIME_GUARD: %s - %s", symbol, regime_reason)
+                await self._record_reject(
+                    symbol,
+                    "BUY",
+                    regime_reason,
+                    "REGIME_GUARD",
+                    decision_id=decision_id,
+                    explainability=explainability,
+                )
+                if decision_id:
+                    await self._update_pipeline_decision(decision_id, {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"REGIME_GUARD: {regime_reason}"})
+                return None
 
         # =================================================================
         # ITEM 6: AUTHORITATIVE ORDER NORMALIZATION (canonical sizing gate)
@@ -9404,6 +9467,16 @@ class PortfolioEngine:
                 exit_reporting=exit_reporting,
             )
 
+        with contextlib.suppress(Exception):
+            self._record_trade_pattern_memory(
+                symbol=normalized_symbol,
+                position=position,
+                net_pnl=float(realized_pnl),
+                net_outcome_pct=float(pnl_pct),
+                hold_seconds=float(hold_time_seconds or 0.0),
+                reason=ai_close_reason,
+            )
+
         # Track fees/slippage for scoreboard
         self._total_fees_paid += fee
         self._total_slippage_cost += slippage_cost
@@ -10865,6 +10938,33 @@ class PortfolioEngine:
         ev_low = _envf("AI_DYNAMIC_SIZE_EV_LOW_WATERMARK", 0.0008)
 
         dd = decision_data or {}
+
+        # Upstream hard gate: block entry entirely (mult=0.0) when ANY raw
+        # signal is in its severe zone, rather than waiting for the soft
+        # multiplicative discounts below to compound low enough to matter.
+        # Backtested on 279 closed DAY trades (2026-07 window): the severe
+        # union (adx<15 OR chop>=0.75 OR edge<=-0.15) flags 169/279 trades
+        # that combined for -$364.28, while the surviving 110 combined for
+        # +$314.87 (net swing from -$49.42 to +$314.87 had this been active).
+        # Uses the SAME thresholds already live as soft discounts below —
+        # this only escalates the severe tier from "discount" to "block".
+        stall_hard_gate_enabled = os.getenv("DAY_STALL_RISK_HARD_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+        if stall_hard_gate_enabled and os.getenv("DAY_STALL_RISK_SIZE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on"):
+            _adx_val = _safe_float(dd.get("adx"), 0.0)
+            _adx_severe = _envf("DAY_STALL_RISK_ADX_SEVERE", 15.0)
+            _chop_thresh = _envf("DAY_STALL_RISK_CHOP_THRESH", 0.75)
+            _edge_thresh = _envf("DAY_STALL_RISK_EDGE_THRESH", -0.15)
+            _severe_adx = _adx_val > 0 and _adx_val < _adx_severe
+            _severe_chop = chop_score is not None and float(chop_score) >= _chop_thresh
+            _severe_edge = coin_edge_score is not None and float(coin_edge_score) <= _edge_thresh
+            if _severe_adx or _severe_chop or _severe_edge:
+                blocked = dict(neutral)
+                blocked["stall_risk_factor"] = 0.0
+                blocked["adx_raw"] = round(_adx_val, 4)
+                blocked["chop_score_raw"] = round(float(chop_score), 4) if chop_score is not None else 0.0
+                blocked["coin_edge_score_raw"] = round(float(coin_edge_score), 4) if coin_edge_score is not None else 0.0
+                return (0.0, blocked, "REJECTED_STALL_RISK_GATE")
+
         # Drawdown factor: shrink as drawdown grows. Active drawdown caps mult.
         cur_dd = 0.0
         try:
@@ -13124,6 +13224,23 @@ class PortfolioEngine:
         perf = self.coin_performance.get(symbol)
         sizing_mult = perf.sizing_multiplier if perf else 1.0
         strategy_id_for_size = str(top_candidate.decision_data.get("live_ai_strategy") or "day").strip().lower()
+        with contextlib.suppress(Exception):
+            from backend.services.ai_pattern_memory import build_pattern_vector, compute_pattern_memory_similarity
+
+            _candidate_vector = build_pattern_vector(
+                chop_score=top_candidate.chop_score,
+                coin_edge_score=top_candidate.coin_edge_score,
+                trend_score=top_candidate.trend_score,
+                confidence=top_candidate.confidence,
+            )
+            _good_sim, _bad_sim = compute_pattern_memory_similarity(
+                db_path=self.db_path,
+                symbol=symbol,
+                strategy_id=strategy_id_for_size,
+                vector=_candidate_vector,
+            )
+            top_candidate.decision_data["good_pattern_similarity"] = _good_sim
+            top_candidate.decision_data["bad_pattern_similarity"] = _bad_sim
         dyn_mult, dyn_components, dyn_cap_reason = self._compute_dynamic_sizing_multiplier(
             symbol=symbol,
             strategy_id=strategy_id_for_size,
@@ -13138,20 +13255,23 @@ class PortfolioEngine:
 
         quantity, stop_price, _risk_usd = self.calculate_position_size(symbol, equity, top_candidate.atr, top_candidate.current_price, sizing_mult, top_candidate.confidence)
 
-        # Check if position size is valid (may be 0 due to cash clamp)
+        # Check if position size is valid (may be 0 due to cash clamp, or the
+        # dynamic sizing multiplier hard-blocking entry, e.g. REJECTED_STALL_RISK_GATE)
         if quantity <= 0:
             log_decision_trace(
                 "HOLD",
                 symbol,
                 {
-                    "reason_code": "BUY_SKIP_SIZING",
+                    "reason_code": "REJECTED_STALL_RISK_GATE" if dyn_cap_reason == "REJECTED_STALL_RISK_GATE" else "BUY_SKIP_SIZING",
                     "cash": self._available_balance,
                     "equity": equity,
                     "confidence": top_candidate.confidence,
                     "threshold": MIN_CONFIDENCE,
+                    "dyn_mult": dyn_mult,
+                    "dyn_cap_reason": dyn_cap_reason,
                 },
             )
-            logger.info(f"PROCESS_BAR: {symbol} - SKIPPED due to insufficient cash/min size")
+            logger.info(f"PROCESS_BAR: {symbol} - SKIPPED due to insufficient cash/min size (dyn_cap_reason={dyn_cap_reason})")
             await self._bar_pipeline_terminal(top_candidate.decision_id, "BAR_SIZING_ZERO", pipeline_done)
             await self._bar_pipeline_not_selected_others(bar_candidate_snapshot, top_candidate.decision_id or "", pipeline_done)
             self.current_bar_candidates.clear()
@@ -16090,7 +16210,10 @@ class PortfolioEngine:
             self._regime_state.churn_guard_active = False
 
     def _check_regime_guards(self, symbol: str, current_bar: int) -> tuple[bool, str]:
-        """Check if trade is blocked by regime guards"""
+        """Check if trade is blocked by regime guards.
+
+        Returns (can_proceed, reason) — False means BLOCKED (matches call-site contract).
+        """
         # Check spread block
         if symbol in self._regime_state.spread_blocked_symbols and current_bar <= self._regime_state.spread_blocked_symbols[symbol]:
             return False, f"SPREAD_SPIKE: symbol blocked until bar {self._regime_state.spread_blocked_symbols[symbol]}"
@@ -16098,6 +16221,13 @@ class PortfolioEngine:
         # Check drawdown guard (blocks buys)
         if self._regime_state.drawdown_guard_active:
             return False, f"DRAWDOWN_GUARD: equity drawdown {self._regime_state.current_drawdown_pct * 100:.2f}%"
+
+        # Check churn guard (blocks buys when cost/gross-profit ratio has been
+        # sustained above CHURN_RATIO_LIMIT — previously computed by
+        # _update_churn_guard() but never enforced here, only surfaced on
+        # dashboards. This was silently allowing over-trading on choppy days.)
+        if getattr(self._regime_state, "churn_guard_active", False):
+            return False, f"CHURN_GUARD: cost/gross-profit ratio {self._regime_state.churn_ratio:.2f} exceeded limit"
 
         return True, ""
 
