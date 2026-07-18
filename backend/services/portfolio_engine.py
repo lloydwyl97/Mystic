@@ -480,6 +480,12 @@ CHURN_GUARD_MIN_GROSS_WIN_SUM = float(os.getenv("CHURN_GUARD_MIN_GROSS_WIN_SUM",
 # enforcement needs to be rolled back quickly on either host.
 ENABLE_REGIME_ENFORCEMENT = os.getenv("ENABLE_REGIME_ENFORCEMENT", "true").strip().lower() in ("1", "true", "yes", "on")
 
+# Same issue as ENABLE_REGIME_ENFORCEMENT: _is_symbol_quarantined() was
+# computed (5-min quarantine set on canonical_mismatch removals to prevent an
+# immediate rebuy racing the sync) but only ever logged as TELEMETRY_QUARANTINE
+# — never enforced. Now actually aborts the buy while quarantined.
+ENABLE_QUARANTINE_ENFORCEMENT = os.getenv("ENABLE_QUARANTINE_ENFORCEMENT", "true").strip().lower() in ("1", "true", "yes", "on")
+
 # =============================================================================
 # SIGNAL QUALITY GATE CONSTANTS (Item 5)
 # =============================================================================
@@ -6948,6 +6954,19 @@ class PortfolioEngine:
         is_quarantined, quarantine_reason = await self._is_symbol_quarantined(symbol)
         if is_quarantined:
             logger.info("TELEMETRY_QUARANTINE symbol=%s reason=%s", symbol, quarantine_reason)
+            if ENABLE_QUARANTINE_ENFORCEMENT:
+                logger.warning("BUY_BLOCKED_QUARANTINE: %s - %s", symbol, quarantine_reason)
+                await self._record_reject(
+                    symbol,
+                    "BUY",
+                    quarantine_reason,
+                    "QUARANTINE",
+                    decision_id=decision_id,
+                    explainability=explainability,
+                )
+                if decision_id:
+                    await self._update_pipeline_decision(decision_id, {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"QUARANTINE: {quarantine_reason}"})
+                return None
 
         # =================================================================
         # HARD FUSE: Block ALL buys if account is not healthy
