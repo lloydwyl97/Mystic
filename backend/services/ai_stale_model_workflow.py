@@ -18,7 +18,7 @@ from backend.services.live_strategy_contracts import per_coin_artifact_file
 
 logger = logging.getLogger(__name__)
 
-STALE_EVAL_SYMBOLS = ("BTCUSDT", "SOLUSDT", "XRPUSDT")
+STALE_EVAL_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 STRATEGY_ID = "day"
 
 

@@ -925,13 +925,28 @@ class RealTimeAISignalGenerator:
             ranking["spread_penalty"] = min(spread_pct_raw / 0.25, 1.0) if spread_pct_raw > 0 else 0.0
 
             regime_label, regime_score_val = "sideways", 0.0
+            regime_snapshot_label, regime_snapshot_score = "", 0.0
             if REGIME_SCORE_AVAILABLE and get_regime_snapshot_for_signal is not None:
                 try:
                     snap = await get_regime_snapshot_for_signal(self.redis)
-                    regime_label = str(snap.get("regime_label", "sideways"))
-                    regime_score_val = float(snap.get("regime_score", 0.0))
+                    regime_snapshot_label = str(snap.get("regime_label", "sideways"))
+                    regime_snapshot_score = float(snap.get("regime_score", 0.0))
+                    regime_label = regime_snapshot_label
+                    regime_score_val = regime_snapshot_score
                 except Exception as re_err:
                     logger.debug("Regime snapshot for signal failed: %s", re_err)
+            # Prefer per-coin AI market context so Redis signal regime matches
+            # what the model already consumed in the 145-dim feature vector.
+            ctx_regime = str(ctx_payload.get("ctx_market_regime") or "").strip().lower()
+            if ctx_regime and ctx_regime not in ("unknown", "none", ""):
+                if ctx_regime in ("trending_up", "bull", "uptrend"):
+                    regime_label, regime_score_val = "bull", 0.5
+                elif ctx_regime in ("trending_down", "bear", "downtrend"):
+                    regime_label, regime_score_val = "bear", -0.5
+                elif ctx_regime in ("chop", "ranging", "range", "sideways"):
+                    regime_label, regime_score_val = "sideways", 0.0
+                else:
+                    regime_label = ctx_regime
 
             # Store signal in Redis
             # Canonical "side" field - use signal_action for single source of truth
@@ -989,6 +1004,8 @@ class RealTimeAISignalGenerator:
                 "regime": regime_label,
                 "regime_label": regime_label,
                 "regime_score": regime_score_val,
+                "regime_snapshot_label": regime_snapshot_label,
+                "regime_snapshot_score": str(regime_snapshot_score),
                 # Canonical AI market context inputs (real, not telemetry)
                 "ctx_multiplier": str(float(ctx_multiplier)),
                 "ctx_change_24h_pct": ctx_payload.get("ctx_change_24h_pct", "0.0"),

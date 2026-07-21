@@ -7,6 +7,7 @@ import os
 import pickle
 import shutil
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,29 @@ from typing import Any
 from backend.database_schema import DATABASE_PATH
 from backend.services.ai_artifact_contract_gate import evaluate_signal_hash_artifact_contract
 from backend.services.ai_canonical_storage import ensure_ai_canonical_tables
+
+
+def _active_age_hours(path: Path) -> float | None:
+    """Age of active artifact in hours (max of mtime and embedded trained_at)."""
+    if not path.exists():
+        return None
+    ages: list[float] = [(time.time() - path.stat().st_mtime) / 3600.0]
+    try:
+        payload = pickle.loads(path.read_bytes())
+        if isinstance(payload, dict):
+            trained_at = str(payload.get("trained_at") or "").strip()
+            if trained_at:
+                dt = datetime.fromisoformat(trained_at.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                ages.append((datetime.now(timezone.utc) - dt).total_seconds() / 3600.0)
+    except Exception:
+        pass
+    return max(ages) if ages else None
+
+
+def _stale_hours_threshold() -> float:
+    return float(os.getenv("MODEL_STALE_HOURS", "72") or "72")
 
 
 def _accuracy_margin(holdout_count: int) -> float:
@@ -318,8 +342,18 @@ def register_candidate_and_maybe_promote(
             and abs(c_bad - a_bad) <= 0.0005
         )
         if tied:
-            promote = False
-            reject_reason = "candidate_not_improved_over_active"
+            age_h = _active_age_hours(active_path)
+            stale_h = _stale_hours_threshold()
+            metrics["active_age_hours"] = round(float(age_h), 3) if age_h is not None else None
+            # Tied candidates are normally rejected to avoid churn — but when the
+            # active model is stale, promote so live inference keeps absorbing
+            # recent coin/market structure from outcome-weighted retrains.
+            if age_h is not None and age_h >= stale_h:
+                metrics["promotion_path"] = "stale_refresh_tie"
+                metrics["stale_hours_threshold"] = stale_h
+            else:
+                promote = False
+                reject_reason = "candidate_not_improved_over_active"
     model_id = f"{sid}:{sym}:{c_hash[:16]}"
     active_model_id = f"{sid}:{sym}:{_hash_file(active_path)[:16]}" if active_path.exists() else None
     status = "candidate"
@@ -328,7 +362,7 @@ def register_candidate_and_maybe_promote(
         active_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(candidate_path, active_path)
         status = "active"
-        reason = "promoted"
+        reason = str(metrics.get("promotion_path") or "promoted")
     else:
         reason = reject_reason
 

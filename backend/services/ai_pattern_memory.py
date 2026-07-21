@@ -149,8 +149,7 @@ def _fetch_recent_vectors(conn: sqlite3.Connection, table: str, symbol: str, str
         rows = [
             r[0]
             for r in conn.execute(
-                f"SELECT pattern_vector_json FROM {table} WHERE symbol=? AND strategy_id=? "
-                f"AND pattern_vector_json IS NOT NULL ORDER BY id DESC LIMIT ?",
+                f"SELECT pattern_vector_json FROM {table} WHERE symbol=? AND strategy_id=? AND pattern_vector_json IS NOT NULL ORDER BY id DESC LIMIT ?",
                 (symbol, strategy_id, limit),
             ).fetchall()
         ]
@@ -159,8 +158,7 @@ def _fetch_recent_vectors(conn: sqlite3.Connection, table: str, symbol: str, str
             rows = [
                 r[0]
                 for r in conn.execute(
-                    f"SELECT pattern_vector_json FROM {table} WHERE strategy_id=? "
-                    f"AND pattern_vector_json IS NOT NULL ORDER BY id DESC LIMIT ?",
+                    f"SELECT pattern_vector_json FROM {table} WHERE strategy_id=? AND pattern_vector_json IS NOT NULL ORDER BY id DESC LIMIT ?",
                     (strategy_id, limit),
                 ).fetchall()
             ]
@@ -216,6 +214,110 @@ def _upsert_memory_score(
             f"INSERT INTO ai_trade_memory_scores ({', '.join(col_names)}) VALUES ({placeholders})",
             [use[c] for c in col_names],
         )
+
+
+def backfill_pattern_memory_from_outcomes(
+    *,
+    db_path: str = DATABASE_PATH,
+    limit: int = 250,
+) -> dict[str, int]:
+    """Seed good/bad pattern tables from recent ``ai_outcome_training_rows``.
+
+    Pattern memory was empty on hosts that never closed trades after the writer
+    shipped; without history, sizing ``memory_factor`` stays neutral. Idempotent
+    via ``trade_id`` / closed_at uniqueness best-effort (duplicates are harmless).
+    """
+    stats = {"scanned": 0, "written_good": 0, "written_bad": 0, "skipped": 0}
+    if not PATTERN_MEMORY_ENABLED:
+        return stats
+    try:
+        with sqlite3.connect(db_path, timeout=10.0) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, symbol, strategy_id, closed_at_utc, opened_at_utc,
+                       hold_seconds, net_pnl_pct, score_components_json
+                FROM ai_outcome_training_rows
+                WHERE score_components_json IS NOT NULL
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+    except Exception:
+        logger.debug("PATTERN_MEMORY_BACKFILL_READ_FAILED", exc_info=True)
+        return stats
+
+    for row in rows:
+        stats["scanned"] += 1
+        try:
+            (
+                row_id,
+                symbol,
+                strategy_id,
+                closed_at,
+                opened_at,
+                hold_seconds,
+                net_pnl_pct,
+                score_raw,
+            ) = row
+            comps = json.loads(score_raw) if isinstance(score_raw, str) else {}
+            if not isinstance(comps, dict):
+                stats["skipped"] += 1
+                continue
+            trend = comps.get("trend_score")
+            chop = comps.get("chop_score")
+            edge = comps.get("coin_edge_score")
+            if edge is None:
+                edge = comps.get("coin_expectancy")
+            conf = comps.get("confidence")
+            if conf is None:
+                conf = comps.get("ai_confidence")
+            if trend is None and chop is None and edge is None and conf is None:
+                stats["skipped"] += 1
+                continue
+            vector = build_pattern_vector(
+                chop_score=float(chop or 0.0),
+                coin_edge_score=float(edge or 0.0),
+                trend_score=float(trend or 0.0),
+                confidence=float(conf or 0.0),
+            )
+            net_pct = float(net_pnl_pct or 0.0)
+            # Signed pct is enough for good/bad split (>0).
+            net_pnl = net_pct
+            sym = str(symbol or "").replace("/", "").replace("-", "").upper()
+            if sym.endswith("USDT") is False and sym:
+                sym = f"{sym}USDT" if not sym.endswith("USD") else sym
+            ok = record_trade_pattern(
+                db_path=db_path,
+                symbol=sym,
+                strategy_id=str(strategy_id or "day").strip().lower() or "day",
+                vector=vector,
+                net_outcome_pct=net_pct,
+                net_pnl=net_pnl,
+                hold_seconds=float(hold_seconds or 0.0),
+                reason="backfill_outcome_row",
+                trade_id=f"outcome:{row_id}",
+                entry_time_iso=str(opened_at or ""),
+                exit_time_iso=str(closed_at or ""),
+            )
+            if ok:
+                if net_pnl > 0:
+                    stats["written_good"] += 1
+                else:
+                    stats["written_bad"] += 1
+            else:
+                stats["skipped"] += 1
+        except Exception:
+            stats["skipped"] += 1
+            continue
+    logger.info(
+        "PATTERN_MEMORY_BACKFILL scanned=%d good=%d bad=%d skipped=%d",
+        stats["scanned"],
+        stats["written_good"],
+        stats["written_bad"],
+        stats["skipped"],
+    )
+    return stats
 
 
 def compute_pattern_memory_similarity(

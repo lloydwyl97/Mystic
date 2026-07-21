@@ -675,6 +675,16 @@ class AITrainingDataPipeline:
         self.is_running = True
         self._start_time = time.time()
         try:
+            # Seed pattern memory from recent closed outcomes so sizing can learn
+            # from coin history even after a cold start / empty pattern tables.
+            try:
+                from backend.services.ai_pattern_memory import backfill_pattern_memory_from_outcomes
+
+                bf = await asyncio.to_thread(backfill_pattern_memory_from_outcomes)
+                logger.info("PATTERN_MEMORY_BACKFILL_ON_START %s", bf)
+            except Exception as bf_err:
+                logger.warning("PATTERN_MEMORY_BACKFILL_ON_START failed: %s", bf_err)
+
             # Start background tasks with proper exception handling
             task1 = await task_manager.create_task(self._collection_loop(), name="ai_training_pipeline:collection_loop")
             self._tasks.append(task1)
@@ -807,6 +817,24 @@ class AITrainingDataPipeline:
 
                             # MODEL PRUNING: Keep only best N models to prevent disk bloat
                             await self._prune_old_models()
+
+                            # Stale-refresh pass: re-evaluate latest candidates for coins
+                            # whose active artifacts aged out (tie-or-better promote path).
+                            try:
+                                from backend.services.ai_stale_model_workflow import run_stale_model_workflow
+
+                                stale_summary = await asyncio.to_thread(run_stale_model_workflow)
+                                logger.info(
+                                    "STALE_MODEL_WORKFLOW: evaluated=%s promoted=%s",
+                                    stale_summary.get("symbols_evaluated"),
+                                    [
+                                        r.get("symbol")
+                                        for r in (stale_summary.get("results") or [])
+                                        if r.get("promoted")
+                                    ],
+                                )
+                            except Exception as stale_err:
+                                logger.warning("STALE_MODEL_WORKFLOW failed: %s", stale_err)
 
                             # DISK USAGE MONITORING: Emergency cleanup at 90%
                             disk_stats = smart_training_data_manager.get_disk_usage_stats()
