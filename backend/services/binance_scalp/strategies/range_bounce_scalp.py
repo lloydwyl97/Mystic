@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, StrategyMarketContext
 from backend.services.binance_scalp.strategies.common import (
     check_spread,
@@ -60,10 +62,21 @@ class RangeBounceScalpStrategy:
         # Legacy close-above-low / close (kept for audit joins against older trades).
         wick_close_above_low_pct = (_bar_close - _bar_low) / _bar_close if _bar_close > 0 else 0.0
 
+        # Optional wick floor (default off). Set SCALP_RANGE_MIN_WICK_FRAC>0 in
+        # paper profile to drop the weakest rejection candles; zero-wick must
+        # remain admissible when unset (score/rank still use wick_rejection).
+        min_wick = float(os.getenv("SCALP_RANGE_MIN_WICK_FRAC", "0") or "0")
+        if min_wick > 0.0 and wick_rejection < min_wick:
+            return reject_signal(ctx, self.name, "WEAK_REJECTION_WICK")
+
         mom = ctx.mom
         if not (mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0):
             return reject_signal(ctx, self.name, "MOMENTUM_NOT_FLIPPED")
         if mom.bid_change_60s < -0.0001:
+            return reject_signal(ctx, self.name, "MOMENTUM_NOT_SUSTAINED")
+        # Prefer sustained 60s mid lift so we don't enter pure 15s blips that
+        # get early-scratched before the bounce develops.
+        if float(getattr(mom, "mid_change_60s", 0.0) or 0.0) < 0.0:
             return reject_signal(ctx, self.name, "MOMENTUM_NOT_SUSTAINED")
 
         recovery = (cur - support) / cur if cur > 0 else 0
