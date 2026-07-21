@@ -118,8 +118,11 @@ def _decode(b: bytes | None) -> str | None:
 
 
 # RF: per-symbol StandardScaler + one shared RandomForest (see ai_signal_generator inference).
-MIN_RF_TRAIN_SAMPLES = 100
+MIN_RF_TRAIN_SAMPLES = int(os.getenv("MIN_RF_TRAIN_SAMPLES", "100") or "100")
 MIN_SCALER_ROWS_PER_SYMBOL = 5
+# Need enough Tier-A rows for a clean validation split even when Tier B/C
+# relieve train-set starvation.
+MIN_RF_TIER_A_ROWS = int(os.getenv("MIN_RF_TIER_A_ROWS", "40") or "40")
 
 # CANONICAL feature contract — kept here as integer constants to avoid circular imports.
 # Source of truth (with names): backend.services.ai_decision_contract.
@@ -1410,26 +1413,15 @@ class AITrainingDataPipeline:
                             X_oc_sym,
                             y_oc_sym,
                         )
-                        if len(X_sym) < MIN_RF_TRAIN_SAMPLES:
-                            logger.info(
-                                "PER_COIN_TRAIN: [%s] %s only %d rows after balance (need %d), skipping",
-                                strat,
-                                sym,
-                                len(X_sym),
-                                MIN_RF_TRAIN_SAMPLES,
-                            )
-                            continue
 
-                        split_idx = int(len(X_sym) * 0.8)
-                        X_train, X_val = X_sym[:split_idx], X_sym[split_idx:]
-                        y_train, y_val = y_sym[:split_idx], y_sym[split_idx:]
-                        w_train = w_sym[:split_idx]
-
-                        # Tiered learning ingestion (starvation fix): merge Tier B
-                        # (open-trade MFE/MAE path labels) and Tier C (rejected /
-                        # no-trade forward-return labels) into the TRAIN portion
-                        # only. Validation stays on the Tier A+D mix so accuracy
-                        # and PnL metrics are never contaminated by synthetic rows.
+                        # Fetch Tier B/C BEFORE the min-sample gate so starvation
+                        # relief can actually rescue symbols just under the floor
+                        # (e.g. ETH 93 after balance). Validation stays Tier A-only.
+                        tier_x: list = []
+                        tier_y: list = []
+                        tier_w: list = []
+                        tier_b_n = 0
+                        tier_c_n = 0
                         if strat == "day":
                             try:
                                 from backend.services.ai_learning_ingestion import (
@@ -1440,32 +1432,78 @@ class AITrainingDataPipeline:
                                     tier_c_training_rows,
                                 )
 
-                                xb, yb = await asyncio.to_thread(tier_b_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim)
-                                xc, yc = await asyncio.to_thread(tier_c_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim)
+                                xb, yb = await asyncio.to_thread(
+                                    tier_b_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim
+                                )
+                                xc, yc = await asyncio.to_thread(
+                                    tier_c_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim
+                                )
+                                tier_b_n, tier_c_n = len(yb), len(yc)
                                 tier_x = [*xb, *xc]
                                 tier_y = [*[int(v) for v in yb], *[int(v) for v in yc]]
                                 tier_w = [*([TIER_B_WEIGHT] * len(yb)), *([TIER_C_WEIGHT] * len(yc))]
-                                if tier_x:
-                                    max_rows = int(len(X_train) * MAX_TIER_BC_SHARE / max(1e-9, 1.0 - MAX_TIER_BC_SHARE))
-                                    if len(tier_x) > max_rows > 0:
-                                        tier_x = tier_x[:max_rows]
-                                        tier_y = tier_y[:max_rows]
-                                        tier_w = tier_w[:max_rows]
-                                    if tier_x:
-                                        X_train = np.vstack([X_train, np.asarray(tier_x, dtype=np.float64)])
-                                        y_train = np.concatenate([y_train, np.asarray(tier_y, dtype=np.int64)])
-                                        w_train = np.concatenate([w_train, np.asarray(tier_w, dtype=np.float64)])
-                                        logger.info(
-                                            "TIERED_TRAIN_MERGE: [%s] %s tier_b=%d tier_c=%d merged=%d train_total=%d",
-                                            strat,
-                                            sym,
-                                            len(yb),
-                                            len(yc),
-                                            len(tier_x),
-                                            len(X_train),
-                                        )
+                            except Exception as tier_e:
+                                logger.debug("tiered train prefetch skipped for %s: %s", sym, tier_e)
+
+                        min_samples = MIN_RF_TRAIN_SAMPLES
+                        effective_n = len(X_sym) + len(tier_x)
+                        if len(X_sym) < MIN_RF_TIER_A_ROWS or (
+                            len(X_sym) < min_samples and effective_n < min_samples
+                        ):
+                            logger.info(
+                                "PER_COIN_TRAIN: [%s] %s only %d rows after balance "
+                                "(tier_bc=%d effective=%d need=%d tier_a_floor=%d) diag=%s, skipping",
+                                strat,
+                                sym,
+                                len(X_sym),
+                                len(tier_x),
+                                effective_n,
+                                min_samples,
+                                MIN_RF_TIER_A_ROWS,
+                                balance_diag,
+                            )
+                            continue
+
+                        split_idx = int(len(X_sym) * 0.8)
+                        X_train, X_val = X_sym[:split_idx], X_sym[split_idx:]
+                        y_train, y_val = y_sym[:split_idx], y_sym[split_idx:]
+                        w_train = w_sym[:split_idx]
+
+                        # Merge Tier B/C into TRAIN only (val stays Tier A/outcome).
+                        if tier_x:
+                            try:
+                                from backend.services.ai_learning_ingestion import MAX_TIER_BC_SHARE
+
+                                max_rows = int(len(X_train) * MAX_TIER_BC_SHARE / max(1e-9, 1.0 - MAX_TIER_BC_SHARE))
+                                use_x, use_y, use_w = tier_x, tier_y, tier_w
+                                if len(use_x) > max_rows > 0:
+                                    use_x = use_x[:max_rows]
+                                    use_y = use_y[:max_rows]
+                                    use_w = use_w[:max_rows]
+                                if use_x:
+                                    X_train = np.vstack([X_train, np.asarray(use_x, dtype=np.float64)])
+                                    y_train = np.concatenate([y_train, np.asarray(use_y, dtype=np.int64)])
+                                    w_train = np.concatenate([w_train, np.asarray(use_w, dtype=np.float64)])
+                                    logger.info(
+                                        "TIERED_TRAIN_MERGE: [%s] %s tier_b=%d tier_c=%d merged=%d train_total=%d",
+                                        strat,
+                                        sym,
+                                        tier_b_n,
+                                        tier_c_n,
+                                        len(use_x),
+                                        len(X_train),
+                                    )
                             except Exception as tier_e:
                                 logger.debug("tiered train merge skipped for %s: %s", sym, tier_e)
+
+                        if len(X_train) < max(20, int(min_samples * 0.6)):
+                            logger.info(
+                                "PER_COIN_TRAIN: [%s] %s train too small after tier merge (%d), skipping",
+                                strat,
+                                sym,
+                                len(X_train),
+                            )
+                            continue
 
                         if len(X_val) < 5:
                             logger.info(

@@ -521,6 +521,11 @@ class BinanceScalpPaperEngine:
             "rank_score": best.get("rank_score"),
             "entry_eligible": True,
             "ranking": [r["signal"].as_dict() for r in ranked],
+            # Selected symbol's full per-symbol diagnostics (regime, mtf_5m_trend_pct,
+            # mtf_5m_aligned, etc.) so these survive into the persisted trade's
+            # symbol_ranking for later analysis — previously only the summary below
+            # (rank_score/entry_eligible/best_setup/hard_block) was kept.
+            "rank_meta": best.get("rank_meta"),
             "ranked_summary": [
                 {
                     "symbol": r["symbol"],
@@ -636,7 +641,21 @@ class BinanceScalpPaperEngine:
                 notional,
                 fee,
                 slip,
-                json.dumps({"setup": sig.as_dict(), "paper_limit": True, "selected_symbol": sym}),
+                json.dumps(
+                    {
+                        "setup": sig.as_dict(),
+                        "paper_limit": True,
+                        "selected_symbol": sym,
+                        # Persist pass/soft-rank tags on the BUY row so closed-trade
+                        # analytics do not depend on open-position diagnostics alone.
+                        "passed": bool(sig.passed),
+                        "soft_rank_entry": bool((sig.setup_context or {}).get("soft_rank_entry", False)),
+                        "entry_eligible": True,
+                        "setup_name": sig.setup_name,
+                        "rank_score": ranking_meta.get("rank_score"),
+                        "selection_confidence": ranking_meta.get("selection_confidence"),
+                    }
+                ),
             ),
         )
         conn.execute(
@@ -815,6 +834,29 @@ class BinanceScalpPaperEngine:
         ledger = self._ledger(conn)
         pre = dict(ledger)
 
+        entry_diag: dict = {}
+        try:
+            raw_entry_diag = row["diagnostics_json"]
+            entry_diag = json.loads(raw_entry_diag) if raw_entry_diag else {}
+        except Exception:
+            entry_diag = {}
+        setup_signal = entry_diag.get("setup_signal") if isinstance(entry_diag, dict) else None
+        if not isinstance(setup_signal, dict):
+            setup_signal = {}
+        sell_diag = {
+            "preflight": pf_dict,
+            "paper_limit": True,
+            "exit_gate": exit_gate,
+            "passed": bool(setup_signal.get("passed", entry_diag.get("passed", False))),
+            "soft_rank_entry": bool(
+                setup_signal.get("soft_rank_entry", entry_diag.get("soft_rank_entry", False))
+            ),
+            "setup_name": entry_diag.get("setup_name") or strategy_id,
+            "entry_setup_signal": setup_signal,
+            "scalp_setup": entry_diag.get("scalp_setup"),
+            "micro_regime": entry_diag.get("micro_regime"),
+        }
+
         conn.execute(
             """
             INSERT INTO scalp_paper_trades
@@ -836,13 +878,7 @@ class BinanceScalpPaperEngine:
                 net_pct,
                 entry,
                 reason,
-                json.dumps(
-                    {
-                        "preflight": pf_dict,
-                        "paper_limit": True,
-                        "exit_gate": exit_gate,
-                    }
-                ),
+                json.dumps(sell_diag),
             ),
         )
         conn.execute(
