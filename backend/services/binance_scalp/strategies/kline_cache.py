@@ -16,6 +16,18 @@ ensure_ipv4_only()
 MIN_REGIME_1H_BARS = 31
 DEFAULT_1H_LOOKBACK_MINUTES = 2880  # 48h -> ~48 bars
 
+# Every strategy in strategies/*.py reads bars_1m through fixed tail slices
+# (bars[-N:], range(-period, 0), etc.) or through common.py's _atr_pct — none
+# scan the full list length-dependently — so widening this window is pure
+# extra headroom, not a behavior change for any existing setup. Previously
+# capped at 30 bars/30 min, which left no room for anything needing to look
+# back further (e.g. candle-shape pattern matching in the spirit of the DAY
+# AI pattern memory work). Configurable so it can be tuned without a redeploy.
+# Default 120m (~120 1m bars). Strategies still slice bars[-N:] so widening is
+# headroom for MTF confirmation / future candle-shape matching, not a silent
+# behavior change for existing setup window logic.
+DEFAULT_1M_LOOKBACK_MINUTES = int(os.getenv("SCALP_1M_BARS_LOOKBACK_MINUTES", "120"))
+
 # Cross-process Redis cache for fetch_bars(), keyed by (symbol, interval, minutes).
 # KlineCache's own in-process TTL cache only helps a single long-lived instance
 # (e.g. paper_engine's shared instance); callers that construct a *fresh*
@@ -153,7 +165,7 @@ class KlineCache:
         self._cache[key] = (now, bars)
         return bars
 
-    def get(self, symbol: str, *, minutes: int = 30) -> list[dict]:
+    def get(self, symbol: str, *, minutes: int = DEFAULT_1M_LOOKBACK_MINUTES) -> list[dict]:
         return self._get_interval(symbol, "1m", minutes=minutes)
 
     def get_5m(self, symbol: str, *, minutes: int = 240) -> list[dict]:

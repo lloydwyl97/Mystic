@@ -10,9 +10,23 @@ from backend.services.ai_decision_contract import AI_FEATURE_DIM_V1, AI_FEATURE_
 from backend.services.day_feature_audit import BAD_STATUSES, build_context_provenance, build_symbol_feature_audit
 from backend.services.feature_builder import FEATURE_TRUST_SCORES
 
+# volume_delta / order_flow are computed as volume * sign(close - open) — an OHLCV
+# proxy for real trade-tape order flow, not the real thing (see feature_builder.py
+# comment at their construction site). They carry the same "explicit proxy, not the
+# real signal" caveat as put_call_ratio/volatility_smile below, so they're excluded
+# from learning eligibility on the same basis, even though CALCULATED_PROXY status
+# alone does not fail the entry feature-health gate (that's intentional — DAY has no
+# real tape access, so the proxy is still the best available value to trade on).
 LEARNING_BLOCKED_FEATURE_NAMES: frozenset[str] = frozenset(
-    {"put_call_ratio", "volatility_smile"}
+    {"put_call_ratio", "volatility_smile", "volume_delta", "order_flow", "volume_imbalance"}
 )
+
+# Sidecar display aliases — RF index names stay unchanged; audits/UI see the proxy label.
+PROXY_DISPLAY_NAMES: dict[str, str] = {
+    "volume_delta": "volume_delta_ohlcv_proxy",
+    "order_flow": "order_flow_ohlcv_proxy",
+    "volume_imbalance": "volume_imbalance_ohlcv_proxy",
+}
 
 _BAD_FOR_PASS: frozenset[str] = frozenset({"FALLBACK", "MISSING", "STALE", "ZERO_DEFAULT"})
 
@@ -61,10 +75,12 @@ def build_compact_health_sidecar(
             proxy += 1
         if status in _BAD_FOR_PASS or (status == "WARMUP" and abs(float(vector[idx0])) < 1e-12):
             bad.append(name)
+        display_name = PROXY_DISPLAY_NAMES.get(name, name)
         rows.append(
             {
                 "index": idx0 + 1,
-                "name": name,
+                "name": display_name,
+                "canonical_name": name,
                 "block": _block_for_index(idx0),
                 "value": round(float(vector[idx0]), 8),
                 "status": status,

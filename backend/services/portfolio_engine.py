@@ -1313,6 +1313,17 @@ class TradeExplainability:
     signal_regime_score: float = 0.0
     signal_ema_alignment: float = 0.5
     signal_regime_label: str = ""
+    # Which candle timeframe actually produced adx/rsi/ema_alignment/price_momentum
+    # above (e.g. "4h" for DAY, "{primary_bar_seconds}s_primary" for others). DAY's
+    # RF feature vector runs on native 1m while these ranking indicators can come
+    # from a coarser TF — this makes that dual-clock explicit per trade instead of
+    # silently assumed during audits.
+    signal_ranking_tf: str = ""
+    # Native 1m candle-shape fractions (live path). Separate from ranking_tf.
+    candle_shape_tf: str = ""
+    candle_upper_wick_pct: float = 0.0
+    candle_lower_wick_pct: float = 0.0
+    candle_body_pct: float = 0.0
     # ai_signal hash content freshness (execution gate parity with Redis consume path)
     signal_content_timestamp: str = ""
     signal_content_fresh: str = ""
@@ -1417,6 +1428,11 @@ class TradeExplainability:
             "signal_regime_score": self.signal_regime_score,
             "signal_ema_alignment": self.signal_ema_alignment,
             "signal_regime_label": self.signal_regime_label,
+            "signal_ranking_tf": self.signal_ranking_tf,
+            "candle_shape_tf": self.candle_shape_tf,
+            "candle_upper_wick_pct": self.candle_upper_wick_pct,
+            "candle_lower_wick_pct": self.candle_lower_wick_pct,
+            "candle_body_pct": self.candle_body_pct,
             "signal_content_timestamp": self.signal_content_timestamp,
             "signal_content_fresh": self.signal_content_fresh,
             "signal_content_age_sec": self.signal_content_age_sec,
@@ -13428,6 +13444,26 @@ class PortfolioEngine:
         except (TypeError, ValueError):
             explainability.signal_ema_alignment = 0.5
         explainability.signal_regime_label = str(_dd.get("regime_label") or _dd.get("regime") or "")
+        explainability.signal_ranking_tf = str(_dd.get("ranking_tf") or "")
+        explainability.candle_shape_tf = str(_dd.get("candle_shape_tf") or "")
+        try:
+            explainability.candle_upper_wick_pct = float(
+                _dd.get("candle_upper_wick_pct") if _dd.get("candle_upper_wick_pct") not in (None, "") else 0.0
+            )
+        except (TypeError, ValueError):
+            explainability.candle_upper_wick_pct = 0.0
+        try:
+            explainability.candle_lower_wick_pct = float(
+                _dd.get("candle_lower_wick_pct") if _dd.get("candle_lower_wick_pct") not in (None, "") else 0.0
+            )
+        except (TypeError, ValueError):
+            explainability.candle_lower_wick_pct = 0.0
+        try:
+            explainability.candle_body_pct = float(
+                _dd.get("candle_body_pct") if _dd.get("candle_body_pct") not in (None, "") else 0.0
+            )
+        except (TypeError, ValueError):
+            explainability.candle_body_pct = 0.0
         selected_rank = 0
         for _row in cycle_leaderboard:
             if str(_row.get("symbol") or "") == symbol and str(_row.get("strategy_id") or "").strip().lower() == selected_strategy:

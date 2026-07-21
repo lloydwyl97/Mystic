@@ -30,8 +30,9 @@ from backend.services.binance_scalp.config import get_scalp_config
 
 
 def _bars(*, low: float, high: float, closes: list[float]) -> list[dict]:
-    bars = [{"low": low, "high": high, "close": low + 0.1} for _ in range(14)]
-    bars.append({"low": low, "high": high, "close": closes[-1]})
+    # Include open so true range-normalized wick fraction can be computed.
+    bars = [{"open": low + 0.1, "low": low, "high": high, "close": low + 0.1} for _ in range(14)]
+    bars.append({"open": closes[-1], "low": low, "high": high, "close": closes[-1]})
     return bars
 
 

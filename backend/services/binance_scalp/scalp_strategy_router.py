@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from backend.services.binance_scalp.config import ScalpConfig
@@ -24,6 +25,19 @@ from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, Str
 from backend.services.binance_scalp.strategies.kline_cache import KlineCache, MIN_REGIME_1H_BARS
 
 logger = logging.getLogger(__name__)
+
+
+def _mtf_confirmation_gate_enabled() -> bool:
+    """When true (default), long SCALP entries require non-down 5m (and 15m) trend."""
+    return str(os.getenv("SCALP_MTF_CONFIRMATION_GATE_ENABLED", "true")).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _mtf_require_15m() -> bool:
+    return str(os.getenv("SCALP_MTF_REQUIRE_15M", "true")).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 
 class ScalpStrategyRouter:
@@ -83,6 +97,15 @@ class ScalpStrategyRouter:
 
         regime = self._current_regime(sym, epoch, bars)
         meta["regime"] = regime
+        # Multi-timeframe confirmation between 1m setups and 1h regime.
+        # When SCALP_MTF_CONFIRMATION_GATE_ENABLED (default true), a down 5m/15m
+        # trend blocks entry_eligible. Missing history (None) does not block.
+        mtf_5m_trend_pct, mtf_5m_aligned = self._mtf_trend_confirmation(sym, "5m")
+        mtf_15m_trend_pct, mtf_15m_aligned = self._mtf_trend_confirmation(sym, "15m")
+        meta["mtf_5m_trend_pct"] = mtf_5m_trend_pct
+        meta["mtf_5m_aligned"] = mtf_5m_aligned
+        meta["mtf_15m_trend_pct"] = mtf_15m_trend_pct
+        meta["mtf_15m_aligned"] = mtf_15m_aligned
 
         signals: list[ScalpSetupSignal] = []
         ranked_list: list[RankedCandidate] = []
@@ -151,17 +174,61 @@ class ScalpStrategyRouter:
         meta["selection_confidence"] = best_ranked.selection_confidence
         meta["best_rank_score"] = best_ranked.rank_score
         meta["best_setup"] = best_ranked.signal.setup_name
-        meta["entry_eligible"] = best_ranked.entry_eligible
-        meta["hard_block"] = best_ranked.hard_block
-        meta["soft_reason"] = best_ranked.soft_reason
+        entry_eligible = bool(best_ranked.entry_eligible)
+        soft_reason = best_ranked.soft_reason
+        hard_block = best_ranked.hard_block
+        selection_confidence = best_ranked.selection_confidence
 
-        if best_ranked.entry_eligible:
+        if entry_eligible and _mtf_confirmation_gate_enabled():
+            if mtf_5m_aligned is False:
+                entry_eligible = False
+                soft_reason = "MTF_5M_NOT_ALIGNED"
+                selection_confidence = "mtf_confirmation_blocked"
+            elif _mtf_require_15m() and mtf_15m_aligned is False:
+                entry_eligible = False
+                soft_reason = "MTF_15M_NOT_ALIGNED"
+                selection_confidence = "mtf_confirmation_blocked"
+
+        meta["entry_eligible"] = entry_eligible
+        meta["hard_block"] = hard_block
+        meta["soft_reason"] = soft_reason
+        meta["selection_confidence"] = selection_confidence
+
+        if entry_eligible:
             entry_sig = prepare_entry_signal(best_ranked, ctx)
             return entry_sig, signals, meta
 
         # No trade — return best scored signal for status/diagnostics only.
         display_sig = best_ranked.signal
         return display_sig, signals, meta
+
+    def _mtf_trend_confirmation(self, symbol: str, interval: str) -> tuple[float | None, bool | None]:
+        """Best-effort higher-TF trend confirmation for long-only SCALP.
+
+        Compares mean close of the last 3 bars vs the 3 before them.
+        "Aligned" means trend_pct > 0. Returns (None, None) when history is
+        insufficient — callers must not treat that as flat/down.
+        """
+        try:
+            sym = symbol.strip().upper()
+            if interval == "5m":
+                bars = self.klines.get_5m(sym) or []
+            elif interval == "15m":
+                bars = self.klines.get_15m(sym) or []
+            else:
+                return None, None
+            if len(bars) < 6:
+                return None, None
+            recent = bars[-3:]
+            prior = bars[-6:-3]
+            recent_mean = sum(float(b["close"]) for b in recent) / 3.0
+            prior_mean = sum(float(b["close"]) for b in prior) / 3.0
+            if prior_mean <= 0:
+                return None, None
+            trend_pct = (recent_mean - prior_mean) / prior_mean
+            return trend_pct, trend_pct > 0.0
+        except Exception:
+            return None, None
 
     def _current_regime(self, symbol: str, epoch: float, bars: list[dict] | None) -> str:
         """Best-effort 1h regime from kline cache (falls back to range)."""

@@ -818,12 +818,7 @@ class PortfolioEngineIntegration:
                             except Exception:
                                 pass
                         _family = str(dd.get("strategy_family") or "").upper()
-                        _is_ml_edge_early = bool(
-                            dd.get("ml_enriched")
-                            or _family == "ML_EDGE"
-                            or (_family.startswith("ML") and _bm_for_art > 0.05)
-                            or (_bm_for_art > 0.05 and confidence >= 0.58)
-                        )
+                        _is_ml_edge_early = bool(dd.get("ml_enriched") or _family == "ML_EDGE" or (_family.startswith("ML") and _bm_for_art > 0.05) or (_bm_for_art > 0.05 and confidence >= 0.58))
 
                         dd["live_ai_strategy"] = str(dd.get("live_ai_strategy") or live_ai_strategy).strip().lower()
                         if not str(dd.get("model_artifact_path") or "").strip():
@@ -962,6 +957,12 @@ class PortfolioEngineIntegration:
                         "veto_opinion_penalty": float((ve_det or {}).get("penalty_total") or 0.0),
                         "quality_opinion_reasons": json.dumps((q_det or {}).get("opinion_reasons", []), separators=(",", ":")),
                         "veto_opinion_reasons": json.dumps((ve_det or {}).get("opinion_reasons", []), separators=(",", ":")),
+                        # Dual-clock + live candle-shape (from ai_signal Redis hash)
+                        "ranking_tf": str(dd.get("ranking_tf") or ""),
+                        "candle_shape_tf": str(dd.get("candle_shape_tf") or ""),
+                        "candle_upper_wick_pct": _dig_float(dd, "candle_upper_wick_pct", 0.0),
+                        "candle_lower_wick_pct": _dig_float(dd, "candle_lower_wick_pct", 0.0),
+                        "candle_body_pct": _dig_float(dd, "candle_body_pct", 0.0),
                     }
 
                     # If Mystic already holds this symbol, drop the candidate.

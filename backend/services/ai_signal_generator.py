@@ -622,6 +622,11 @@ class RealTimeAISignalGenerator:
             market_1m_exec: list[list] = []
             ranking_source: list[list] = []
             bundle: dict[str, list] = {}
+            # DAY reads native 1m for the RF feature vector but ranking indicators
+            # (ADX/RSI/ema_alignment/momentum -> trend_score/chop_score) come from a
+            # separate, coarser timeframe. Track which TF actually fed ranking so this
+            # dual-clock isn't silently assumed downstream (explainability, audits).
+            ranking_tf_label = "1m"
 
             if sid0 == "day":
                 from backend.config.day_active_timeframes import DAY_ACTIVE_TIMEFRAMES
@@ -654,6 +659,12 @@ class RealTimeAISignalGenerator:
                 market_primary = bundle.get("4h") or bundle.get("1h") or bundle.get("1m") or []
                 ranking_source = bundle.get("4h") or market_primary
                 market_1m_exec = bundle.get("1m") or []
+                if bundle.get("4h"):
+                    ranking_tf_label = "4h"
+                elif bundle.get("1h"):
+                    ranking_tf_label = "1h"
+                else:
+                    ranking_tf_label = "1m"
                 logger.info(
                     "DAY_ACTIVE_OHLCV %s bars=%s (1m_rows=%s)",
                     symbol,
@@ -696,6 +707,7 @@ class RealTimeAISignalGenerator:
                     symbol,
                 )
                 ranking_source = market_primary
+                ranking_tf_label = f"{int(primary_bar_seconds_for_strategy(strategy_id))}s_primary"
 
             # CANONICAL: read ai_context BEFORE feature building so v2 artifacts
             # can incorporate context dims directly into the model input.
@@ -860,6 +872,27 @@ class RealTimeAISignalGenerator:
             _rank_in = ranking_source if len(ranking_source) >= 20 else market_primary
             ranking = self._extract_ranking_indicators(_rank_in)
 
+            # Live candle-shape from native 1m (separate clock from ranking_tf ADX/RSI).
+            # Upper/lower wick fractions feed explainability + decision_data so DAY
+            # actually reads bar shape on the live path (not only in diagnostics HTF helpers).
+            candle_upper_wick_pct = 0.0
+            candle_lower_wick_pct = 0.0
+            candle_body_pct = 0.0
+            candle_shape_tf = "1m" if sid0 == "day" else ranking_tf_label
+            _shape_bars = market_1m_exec if sid0 == "day" and market_1m_exec else (_rank_in or market_primary)
+            try:
+                if _shape_bars and len(_shape_bars) >= 1:
+                    _b = _shape_bars[-1]
+                    # row = [ts, o, h, l, c, v]
+                    _o = float(_b[1]); _h = float(_b[2]); _l = float(_b[3]); _c = float(_b[4])
+                    _rng = _h - _l
+                    if _rng > 0:
+                        candle_upper_wick_pct = (_h - max(_c, _o)) / _rng
+                        candle_lower_wick_pct = (min(_c, _o) - _l) / _rng
+                        candle_body_pct = abs(_c - _o) / _rng
+            except Exception:
+                candle_upper_wick_pct = candle_lower_wick_pct = candle_body_pct = 0.0
+
             # Compute spread_penalty from live bid/ask data in Redis
             spread_pct_raw = 0.0
             try:
@@ -970,8 +1003,17 @@ class RealTimeAISignalGenerator:
                 "ctx_sentiment_fear_greed": ctx_payload.get("ctx_sentiment_fear_greed", "0.0"),
                 "feature_version": str(feat_version),
                 "primary_signal_bar_seconds": str(int(day_label_grid_seconds()) if sid0 == "day" else int(primary_bar_seconds_for_strategy(strategy_id))),
-                "ai_clock_contract": ("day_htf_v4" if sid0 == "day" else ("v3" if int(feat_version) >= 3 else "v2")),
-                "day_htf_contract": "1h+4h+1d+1w+ctx21" if sid0 == "day" else "",
+                # RF features (adx/rsi/ema_alignment/momentum below) come from ranking_tf,
+                # NOT necessarily the same clock as the model's native feature vector (DAY
+                # feature_builder runs on native 1m). Kept explicit so explainability/audits
+                # never have to assume which candle timeframe produced these numbers.
+                "ranking_tf": ranking_tf_label,
+                "candle_shape_tf": candle_shape_tf,
+                "candle_upper_wick_pct": str(round(candle_upper_wick_pct, 6)),
+                "candle_lower_wick_pct": str(round(candle_lower_wick_pct, 6)),
+                "candle_body_pct": str(round(candle_body_pct, 6)),
+                "ai_clock_contract": ("day_htf_v5_1m_ctx10tf" if sid0 == "day" else ("v3" if int(feat_version) >= 3 else "v2")),
+                "day_htf_contract": "1m_native+ctx_1m_5m_15m_30m_1h_4h_8h_12h_1d_1w" if sid0 == "day" else "",
                 "day_htf_bars_json": (json.dumps(day_tf_audit, separators=(",", ":")) if sid0 == "day" and day_tf_audit else ""),
                 "day_label_grid_seconds": (str(int(day_label_grid_seconds())) if sid0 == "day" else ""),
                 "artifact_sha256": artifact_sha,

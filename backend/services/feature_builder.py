@@ -52,7 +52,7 @@ def _volume_price_trend_rolling(cl: np.ndarray, vo: np.ndarray, *, window: int =
         if i <= 0 or cl[i - 1] == 0:
             continue
         acc += float((cl[i] - cl[i - 1]) / cl[i - 1]) * float(vo[i])
-    vol_scale = float(np.mean(vo[start:cl.size]))
+    vol_scale = float(np.mean(vo[start : cl.size]))
     if vol_scale <= 1e-12:
         return 0.0
     return _clamp(acc / vol_scale, -5.0, 5.0)
@@ -862,18 +862,29 @@ def build_feature_dict_from_ohlcv(
             out["vwap"] = float(np.average(cl[-n:], weights=voln))
         out["twap"] = float(np.mean(cl[-n:]))
 
-        # volume delta / order_flow: volume * sign(close-open) — OHLCV proxy only
+        # OHLCV signed-volume proxies — NOT live trade-tape order flow.
+        # RF vector keys stay volume_delta/order_flow/volume_imbalance (fixed
+        # feature indices); provenance + sidecar aliases make the proxy nature
+        # unambiguous so pattern-memory / audits never treat these as tape.
         sign = np.sign(cl[-n:] - op[-n:])
         delta = float(np.sum(voln * sign))
         out["volume_delta"] = delta
         out["volume_imbalance"] = 0.0 if float(np.sum(voln)) == 0.0 else float(delta / float(np.sum(voln)))
         out["order_flow"] = out["volume_imbalance"]
+        _proxy_alias = {
+            "volume_delta": "ohlcv_signed_volume_delta",
+            "volume_imbalance": "ohlcv_signed_volume_imbalance",
+            "order_flow": "ohlcv_signed_order_flow_proxy",
+        }
         for fname in ("volume_delta", "volume_imbalance", "order_flow"):
             _record_feature_provenance(
                 provenance,
                 fname,
                 "CALCULATED_PROXY",
-                f"ohlcv signed-volume proxy n={n}; not live trade tape",
+                (
+                    f"alias={_proxy_alias[fname]}; ohlcv signed-volume proxy n={n}; "
+                    "NOT live aggTrade/tape order flow"
+                ),
                 trust_score=0.62,
                 learning_allowed=False,
             )
@@ -1001,8 +1012,16 @@ def _finalize_feature_provenance(
             continue
         val = float(out.get(name) or 0.0)
         min_bars = {
-            "ma_200": 200, "ma_100": 100, "ma_50": 50, "ema_50": 50, "rsi": 15, "adx": 29,
-            "aroon_up": 25, "mass_index": 35, "trix": 45, "ppo": 26,
+            "ma_200": 200,
+            "ma_100": 100,
+            "ma_50": 50,
+            "ema_50": 50,
+            "rsi": 15,
+            "adx": 29,
+            "aroon_up": 25,
+            "mass_index": 35,
+            "trix": 45,
+            "ppo": 26,
         }.get(name, 20)
         if n_bars < min_bars:
             _record_feature_provenance(provenance, name, "WARMUP", f"needs>={min_bars} bars have {n_bars}", learning_allowed=False)

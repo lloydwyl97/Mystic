@@ -333,6 +333,7 @@ FEATURE_QUALITY: dict[str, str] = {
     "volume_profile_val": "CALCULATED",  # ✅ Binance historical data
     "vwap": "CALCULATED",
     "twap": "CALCULATED",
+    # OHLCV signed-volume proxies (alias: ohlcv_signed_*); NOT live tape.
     "volume_imbalance": "CALCULATED_PROXY",
     "volume_delta": "CALCULATED_PROXY",
     "order_flow": "CALCULATED_PROXY",

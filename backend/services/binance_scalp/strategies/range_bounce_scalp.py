@@ -43,17 +43,22 @@ class RangeBounceScalpStrategy:
             return reject_signal(ctx, self.name, "RANGE_TOO_WIDE")
 
         last = bars[-1]
-        # wick_rejection is mathematically >= 0 (close >= low always) and is a
-        # continuous measure of how strongly the last bar rejected support,
-        # not a binary safety fact. It is NOT a hard gate: whether the wick is
-        # small, absent, or large, it flows directly into `score` below
-        # (score = 2.5 + wick_rejection * 500 + recovery * 400) as a
-        # score/rank contribution. A missing rejection wick alone must never
-        # remove an otherwise-executable candidate (Mystic rule: no
-        # rejection-wick trade-opinion entry blocker) — real bounce evidence
-        # is still required via the momentum-flip checks immediately below,
-        # which use live 15s/30s/60s order-book momentum, not candle shape.
-        wick_rejection = (last["close"] - last["low"]) / last["close"] if last["close"] > 0 else 0
+        # True lower-wick fraction: (min(open, close) - low) / (high - low).
+        # Replaces the old (close - low) / close measure, which ignored the high
+        # and was not range-normalized. Still NOT a hard gate — continuous
+        # score/rank contribution only. Zero/absent wick must never remove an
+        # otherwise-executable candidate; bounce evidence comes from the
+        # momentum-flip checks below (live 15s/30s/60s order-book momentum).
+        _bar_open = float(last.get("open", last["close"]))
+        _bar_close = float(last["close"])
+        _bar_high = float(last["high"])
+        _bar_low = float(last["low"])
+        _bar_range = _bar_high - _bar_low
+        wick_rejection = (
+            (min(_bar_open, _bar_close) - _bar_low) / _bar_range if _bar_range > 0 else 0.0
+        )
+        # Legacy close-above-low / close (kept for audit joins against older trades).
+        wick_close_above_low_pct = (_bar_close - _bar_low) / _bar_close if _bar_close > 0 else 0.0
 
         mom = ctx.mom
         if not (mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0):
@@ -71,8 +76,11 @@ class RangeBounceScalpStrategy:
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
 
-        score = 2.5 + wick_rejection * 500 + recovery * 400
-        confidence = min(0.72, 0.55 + wick_rejection * 200)
+        # Weights rescaled for [0, 1] wick fraction (old formula used ~0.001–0.005
+        # close-above-low ratios with *500 / *200 multipliers). Target similar
+        # contribution magnitude: ~0.5–1.5 score points for a typical bounce wick.
+        score = 2.5 + wick_rejection * 1.5 + recovery * 400
+        confidence = min(0.72, 0.55 + wick_rejection * 0.25)
         return pass_signal(
             ctx,
             self.name,
@@ -83,5 +91,10 @@ class RangeBounceScalpStrategy:
             expected_move_pct=expected,
             impact_pct=impact,
             limit_buy=fill,
-            setup_context={"support_level": support, "wick_rejection_pct": wick_rejection},
+            setup_context={
+                "support_level": support,
+                "wick_rejection_pct": wick_rejection,
+                "wick_rejection_range_pct": wick_rejection,
+                "wick_close_above_low_pct": wick_close_above_low_pct,
+            },
         )
