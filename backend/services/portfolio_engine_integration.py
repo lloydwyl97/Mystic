@@ -329,6 +329,10 @@ class PortfolioEngineIntegration:
             except Exception:
                 logger.info("RUNTIME: DAY_MODE_ENABLED=unknown (import failed)")
             try:
+                from backend.config.core_test_flags import (
+                    ENABLE_GOVERNANCE_ENFORCEMENT,
+                    governance_risk_governor_shadow_only,
+                )
                 from backend.services.risk_governor import (
                     CHOP_BLOCK_THRESHOLD,
                     DRAWDOWN_TIER_D_PCT,
@@ -337,8 +341,10 @@ class PortfolioEngineIntegration:
                 )
 
                 logger.info(
-                    "GOV_CONFIG: shadow_only=%s tier_d_pct=%.2f chop_block=%.2f min_conf_regime=%.2f",
+                    "GOV_CONFIG: shadow_only=%s effective_shadow=%s ENABLE_GOVERNANCE=%s tier_d_pct=%.2f chop_block=%.2f min_conf_regime=%.2f wired=true",
                     GOVERNANCE_SHADOW_ONLY,
+                    governance_risk_governor_shadow_only(),
+                    ENABLE_GOVERNANCE_ENFORCEMENT,
                     DRAWDOWN_TIER_D_PCT,
                     CHOP_BLOCK_THRESHOLD,
                     MIN_CONFIDENCE_REGIME,

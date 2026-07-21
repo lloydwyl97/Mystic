@@ -51,8 +51,15 @@ from backend.config.buy_admission import (
 )
 from backend.config.core_test_flags import (
     ENABLE_ATR_ENFORCEMENT,
+    ENABLE_COOLDOWN_ENFORCEMENT,
+    ENABLE_GOVERNANCE_ENFORCEMENT,
     ENABLE_OVERFLOW_SIZING,
+    ENABLE_PROFITABILITY_ENFORCEMENT,
+    ENABLE_QUARANTINE_ENFORCEMENT,
+    ENABLE_REGIME_ENFORCEMENT,
     ENABLE_SLEEVE_BLOCKING,
+    ENABLE_TRADE_STATE_ENTRY_BLOCKING,
+    governance_risk_governor_shadow_only,
     log_effective_flags_once,
 )
 from backend.config.live_test_mode import assert_full_live_safety_at_startup as _assert_full_live_safety_at_startup
@@ -95,8 +102,11 @@ from backend.services.live_strategy_contracts import (
 )
 from backend.services.paper_trading_service import get_paper_trading_service
 from backend.services.risk_governor import (
+    AccountSnapshot,
+    CandidateInfo,
     LOSS_HOLD_COOLDOWN_MIN,
     MAX_CONSEC_LOSSES,
+    RiskGovernor,
 )
 from backend.utils.sqlite_runtime import connect_rw, run_locked_retry
 from backend.utils.symbols import normalize_symbol
@@ -474,17 +484,8 @@ CHURN_GUARD_MIN_SAMPLES = int(os.getenv("CHURN_GUARD_MIN_SAMPLES", "5"))
 # Sum of winning sell PnL (audit invariant_diff > 0) must exceed this before churn ratio can arm guard
 CHURN_GUARD_MIN_GROSS_WIN_SUM = float(os.getenv("CHURN_GUARD_MIN_GROSS_WIN_SUM", "15.0"))
 
-# Enforce _check_regime_guards() (spread-spike / drawdown / churn) by actually
-# aborting the buy, not just logging TELEMETRY_REGIME_GUARD. Previously this
-# was decorative-only for all three guards. Kill-switch left in place in case
-# enforcement needs to be rolled back quickly on either host.
-ENABLE_REGIME_ENFORCEMENT = os.getenv("ENABLE_REGIME_ENFORCEMENT", "true").strip().lower() in ("1", "true", "yes", "on")
-
-# Same issue as ENABLE_REGIME_ENFORCEMENT: _is_symbol_quarantined() was
-# computed (5-min quarantine set on canonical_mismatch removals to prevent an
-# immediate rebuy racing the sync) but only ever logged as TELEMETRY_QUARANTINE
-# — never enforced. Now actually aborts the buy while quarantined.
-ENABLE_QUARANTINE_ENFORCEMENT = os.getenv("ENABLE_QUARANTINE_ENFORCEMENT", "true").strip().lower() in ("1", "true", "yes", "on")
+# ENABLE_REGIME_ENFORCEMENT / ENABLE_QUARANTINE_ENFORCEMENT imported from
+# core_test_flags (single source of truth with CORE_TEST_FLAGS telemetry).
 
 # =============================================================================
 # SIGNAL QUALITY GATE CONSTANTS (Item 5)
@@ -533,9 +534,8 @@ POST_SELL_COOLDOWN_BARS = int(os.getenv("POST_SELL_COOLDOWN_BARS", "40"))  # Blo
 GLOBAL_SELL_COOLDOWN_BARS = int(os.getenv("GLOBAL_SELL_COOLDOWN_BARS", "10"))  # Block ALL buys for N bars after any sell
 POST_SELL_COOLDOWN_WALL_SEC = int(os.getenv("POST_SELL_COOLDOWN_WALL_SEC", "2400"))  # 40 min wall-clock backup
 GLOBAL_SELL_COOLDOWN_WALL_SEC = int(os.getenv("GLOBAL_SELL_COOLDOWN_WALL_SEC", "600"))  # 10 min wall-clock backup
-# PORTFOLIO_LOCAL_SKIP_GLOBAL_SELL_COOLDOWN / PORTFOLIO_LOCAL_SKIP_POST_SELL_COOLDOWN removed:
-# sell-cooldown enforcement itself was removed from _can_open_position and execute_buy_fifo
-# (prior-trade-outcome blockers are not permitted — see Mystic ranking-engine rules).
+# Sell/loss-streak cooldowns enforce when ENABLE_COOLDOWN_ENFORCEMENT=true
+# (prod default via core_test_flags). Kill-switch: ENABLE_COOLDOWN_ENFORCEMENT=false.
 # Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
 PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK = os.getenv("PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK", "false").lower() == "true"
 # Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
@@ -1742,6 +1742,10 @@ class PortfolioEngine:
 
         # Item 5: Quality filter state
         self._quality_filter_state = QualityFilterState()
+
+        # RiskGovernor — was defined + logged at startup but never called (decorative).
+        # shadow_only follows ENABLE_GOVERNANCE_ENFORCEMENT + GOVERNANCE_SHADOW_ONLY.
+        self._risk_governor = RiskGovernor(shadow_only=governance_risk_governor_shadow_only())
 
         # Item 6: Pending orders
         self._pending_orders: dict[str, PendingOrder] = {}
@@ -7194,16 +7198,37 @@ class PortfolioEngine:
                 )
             return None
 
-        # NON-BLOCKING BY DESIGN: a post-sell cooldown ("you just sold this symbol,
-        # therefore wait before rebuying") is a prior-trade-outcome opinion gate,
-        # not a genuine operational/safety condition. It is surfaced as a
-        # diagnostic only — logged, never enforced. Duplicate-position protection
-        # (one open lot per symbol) remains enforced separately above.
+        # Post-sell ledger cooldown — enforce when ENABLE_COOLDOWN_ENFORCEMENT.
         persisted_until = self._lookup_position_close_cooldown(normalized_symbol)
         now_wall = time.time()
         if persisted_until and now_wall < persisted_until:
+            if ENABLE_COOLDOWN_ENFORCEMENT:
+                self._metrics_cooldown_blocks += 1
+                logger.warning(
+                    "BUY_BLOCKED_POST_SELL_COOLDOWN_LEDGER symbol=%s remaining=%.0fs",
+                    normalized_symbol,
+                    persisted_until - now_wall,
+                )
+                await self._record_reject(
+                    normalized_symbol,
+                    "BUY",
+                    f"POST_SELL_COOLDOWN_LEDGER remaining={persisted_until - now_wall:.0f}s",
+                    "POST_SELL_COOLDOWN_LEDGER",
+                    decision_id=decision_id,
+                    explainability=explainability,
+                )
+                if decision_id:
+                    await self._update_pipeline_decision(
+                        decision_id,
+                        {
+                            "stage": "EXECUTION",
+                            "execution_result": "NOT_EXECUTED",
+                            "execution_reason": "POST_SELL_COOLDOWN_LEDGER",
+                        },
+                    )
+                return None
             logger.debug(
-                "QUALITY_TELEMETRY POST_SELL_COOLDOWN_LEDGER_ACTIVE would_block symbol=%s remaining=%.0fs (not enforced — diagnostic only)",
+                "QUALITY_TELEMETRY POST_SELL_COOLDOWN_LEDGER_ACTIVE would_block symbol=%s remaining=%.0fs (ENABLE_COOLDOWN_ENFORCEMENT=false)",
                 normalized_symbol,
                 persisted_until - now_wall,
             )
@@ -7697,6 +7722,11 @@ class PortfolioEngine:
             f"cost=${total_cost:.2f} | cash=${self.cash_balance:.2f} | "
             f"SL=${stop_price:.4f} TP1=${tp1_price:.4f} | trade_id={trade_id}"
         )
+        if ENABLE_TRADE_STATE_ENTRY_BLOCKING:
+            with contextlib.suppress(Exception):
+                from backend.services.trade_state import get_trade_state_store
+
+                get_trade_state_store().on_entry_fill(symbol, float(fill_price), float(atr or 0.0))
         self._update_strategy_capital_sleeve(
             strategy_id=str(buy_strategy_id or "day"),
             realized_pnl_delta=0.0,
@@ -9426,7 +9456,8 @@ class PortfolioEngine:
                 )
             )
 
-        # Loss-hold: extend cooldown if we were in recovery and just took another loss; clear on win (profit > 0 only).
+        # Loss-hold: arm (or re-arm after expiry) when consecutive losses hit the cap; clear on win.
+        # Previously only extended an *existing* expired key — the hold was never initially armed.
         if realized_pnl > 0:
             await self._set_loss_hold_until(None)
         elif realized_pnl < 0:
@@ -9434,12 +9465,29 @@ class PortfolioEngine:
             if consec >= MAX_CONSEC_LOSSES:
                 loss_hold_until = await self._get_loss_hold_until()
                 now = time.time()
-                if loss_hold_until is not None and now >= loss_hold_until:
-                    await self._set_loss_hold_until(now + LOSS_HOLD_COOLDOWN_MIN * 60)
+                if loss_hold_until is None or now >= loss_hold_until:
+                    until = now + LOSS_HOLD_COOLDOWN_MIN * 60
+                    await self._set_loss_hold_until(until)
+                    logger.warning(
+                        "HOLD_CONSEC_LOSSES_ARMED consec=%s>=%s hold_until=%.0f cooldown_min=%s",
+                        consec,
+                        MAX_CONSEC_LOSSES,
+                        until,
+                        LOSS_HOLD_COOLDOWN_MIN,
+                    )
 
         # ITEM 5: Record sell cooldown (FIX 3: always after success, persist, log)
         bar_ts = current_bar if current_bar is not None else self.last_bar_timestamp
         self.record_sell_cooldown(normalized_symbol, bar_ts, exit_type=exit_type.value, pnl=realized_pnl)
+        if ENABLE_TRADE_STATE_ENTRY_BLOCKING:
+            with contextlib.suppress(Exception):
+                from backend.services.trade_state import notify_exit
+
+                notify_exit(
+                    normalized_symbol,
+                    float(fill_price),
+                    str(exit_trigger or exit_type.value or "SELL"),
+                )
         await self._persist_quality_cooldowns()
         cooldown_until = self._quality_filter_state.symbol_cooldowns.get(normalized_symbol, bar_ts) if self._bar_interval_seconds else bar_ts
         logger.info(
@@ -9742,6 +9790,122 @@ class PortfolioEngine:
     # PHASE 2: PORTFOLIO DISCIPLINE (SOLE EXECUTION GATE)
     # =========================================================================
 
+    async def _apply_risk_governor(
+        self, candidates: list[BuyCandidate]
+    ) -> tuple[list[BuyCandidate], str | None]:
+        """Run RiskGovernor.decide on ranked buy candidates.
+
+        Returns (allowed_candidates, account_hold_reason).
+        When shadow_only / ENABLE_GOVERNANCE_ENFORCEMENT=false: logs only, returns all candidates.
+        Previously RiskGovernor existed and logged GOV_CONFIG at startup but was never called.
+        """
+        if not candidates:
+            return [], None
+        shadow = bool(getattr(self._risk_governor, "shadow_only", True))
+        try:
+            dd_pct, consec = await self.get_rolling_24h_risk_metrics()
+        except Exception:
+            dd_pct, consec = 0.0, 0
+        try:
+            loss_hold_until = await self._get_loss_hold_until()
+        except Exception:
+            loss_hold_until = None
+
+        exposure: dict[str, float] = {}
+        for sym, pos in self.open_positions.items():
+            if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
+                continue
+            qty = float(getattr(pos, "quantity", 0) or 0)
+            px = float(getattr(pos, "current_price", 0) or getattr(pos, "entry_price", 0) or 0)
+            if qty > 0 and px > 0:
+                exposure[normalize_symbol(sym)] = qty * px
+
+        account = AccountSnapshot(
+            equity=float(self._total_equity or 0.0),
+            free_usdt=float(self._available_balance or self.cash_balance or 0.0),
+            positions_value=float(self._positions_value or 0.0),
+            open_positions_count=sum(
+                1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING"
+            ),
+            exposure_per_coin=exposure,
+            rolling_24h_drawdown_pct=float(dd_pct or 0.0),
+            consecutive_losses=int(consec or 0),
+            max_positions=int(MAX_OPEN_POSITIONS),
+            loss_hold_until=float(loss_hold_until) if loss_hold_until is not None else None,
+            current_time_utc=time.time(),
+        )
+
+        infos: list[CandidateInfo] = []
+        by_sym: dict[str, BuyCandidate] = {}
+        for c in candidates:
+            sym = normalize_symbol(c.symbol)
+            by_sym[sym] = c
+            dd = c.decision_data or {}
+            constraints = self._symbol_constraints.get(sym) or {}
+            min_notional = float(constraints.get("min_notional") or 11.0)
+            infos.append(
+                CandidateInfo(
+                    symbol=sym,
+                    composite_score=float(getattr(c, "composite_score", 0) or c.rank_score()),
+                    confidence=float(c.confidence or 0.0),
+                    trend_score=float(c.trend_score or 0.0),
+                    chop_score=float(c.chop_score or 0.0),
+                    current_price=float(c.current_price or 0.0),
+                    atr=float(c.atr or 0.0),
+                    effective_min_notional=min_notional,
+                    sleeve=str(getattr(c, "sleeve", "") or "ACTIVE"),
+                    buy_margin=resolve_buy_margin_from_payload(dd),
+                )
+            )
+
+        result = self._risk_governor.decide(account, infos)
+        hold = result.account_hold_reason or None
+        self._last_governance_hold_reason = hold
+
+        if shadow or not ENABLE_GOVERNANCE_ENFORCEMENT:
+            logger.info(
+                "GOVERNANCE_SHADOW tier=%s hold=%s allowed=%s rejected=%s (not enforcing)",
+                result.drawdown_tier,
+                hold or "",
+                [c.symbol for c in result.allowed_candidates],
+                [(r.symbol, r.reason_code) for r in result.rejections],
+            )
+            return list(candidates), None
+
+        if hold:
+            logger.warning(
+                "BUY_BLOCKED_GOVERNANCE hold_reason=%s tier=%s consec=%s dd_pct=%.2f",
+                hold,
+                result.drawdown_tier,
+                consec,
+                float(dd_pct or 0.0) * 100.0,
+            )
+            return [], hold
+
+        allowed: list[BuyCandidate] = []
+        for info in result.allowed_candidates:
+            cand = by_sym.get(normalize_symbol(info.symbol))
+            if cand is None:
+                continue
+            alloc = float(result.allocation_plan.get(info.symbol) or 0.0)
+            if alloc > 0:
+                dd2 = dict(cand.decision_data or {})
+                dd2["governance_allocation_usd"] = alloc
+                dd2["governance_tier"] = result.drawdown_tier
+                dd2["governance_min_conf"] = result.dynamic_min_confidence
+                cand.decision_data = dd2
+            allowed.append(cand)
+
+        rejected_syms = {normalize_symbol(r.symbol) for r in result.rejections if r.symbol}
+        if rejected_syms:
+            logger.info(
+                "GOVERNANCE_FILTERED tier=%s kept=%s rejected=%s",
+                result.drawdown_tier,
+                [c.symbol for c in allowed],
+                [(r.symbol, r.reason_code) for r in result.rejections],
+            )
+        return allowed, None
+
     async def _can_open_position(self, symbol: str, notional_usd: float) -> tuple[bool, str]:
         """
         PHASE 2: Check if new position is allowed.
@@ -9778,34 +9942,92 @@ class PortfolioEngine:
             logger.warning(f"BUY_BLOCKED_PAUSED: {symbol} - trading paused: {self._pause_reason}")
             return False, f"TRADING_PAUSED: {self._pause_reason}"
 
-        # NON-BLOCKING BY DESIGN: loss-streak pause and sell-cooldown timers are
-        # trade-opinion / prior-outcome signals ("we just lost, so stop buying").
-        # Mystic is a ranking-and-trading engine, not a permission bot — these are
-        # surfaced as diagnostics only and MUST NOT gate _can_open_position. Only
-        # genuine operational/safety conditions (above and below) may return False.
+        # Loss-streak / sell cooldowns: enforce when ENABLE_COOLDOWN_ENFORCEMENT
+        # (prod default true). Kill-switch: ENABLE_COOLDOWN_ENFORCEMENT=false.
         now_wall = time.time()
         pause_until = float(getattr(self._quality_filter_state, "loss_streak_pause_until", 0.0) or 0.0)
         if pause_until > now_wall:
+            if ENABLE_COOLDOWN_ENFORCEMENT:
+                self._metrics_cooldown_blocks += 1
+                logger.warning(
+                    "BUY_BLOCKED_LOSS_STREAK_PAUSE symbol=%s remaining=%.0fs",
+                    symbol,
+                    pause_until - now_wall,
+                )
+                return False, "LOSS_STREAK_PAUSE"
             logger.debug(
-                "QUALITY_TELEMETRY LOSS_STREAK_PAUSE_ACTIVE would_block symbol=%s remaining=%.0fs (not enforced — diagnostic only)",
+                "QUALITY_TELEMETRY LOSS_STREAK_PAUSE_ACTIVE would_block symbol=%s remaining=%.0fs (ENABLE_COOLDOWN_ENFORCEMENT=false)",
                 symbol,
                 pause_until - now_wall,
             )
 
         g_wall = float(getattr(self._quality_filter_state, "global_cooldown_wall", 0.0) or 0.0)
         if g_wall > now_wall:
+            if ENABLE_COOLDOWN_ENFORCEMENT:
+                self._metrics_cooldown_blocks += 1
+                logger.warning(
+                    "BUY_BLOCKED_GLOBAL_SELL_COOLDOWN symbol=%s remaining=%.0fs",
+                    symbol,
+                    g_wall - now_wall,
+                )
+                return False, "GLOBAL_SELL_COOLDOWN"
             logger.debug(
-                "QUALITY_TELEMETRY GLOBAL_SELL_COOLDOWN_ACTIVE would_block symbol=%s remaining=%.0fs (not enforced — diagnostic only)",
+                "QUALITY_TELEMETRY GLOBAL_SELL_COOLDOWN_ACTIVE would_block symbol=%s remaining=%.0fs (ENABLE_COOLDOWN_ENFORCEMENT=false)",
                 symbol,
                 g_wall - now_wall,
             )
         sym_wall = float(self._quality_filter_state.symbol_cooldown_wall.get(symbol, 0.0) or 0.0)
         if sym_wall > now_wall:
+            if ENABLE_COOLDOWN_ENFORCEMENT:
+                self._metrics_cooldown_blocks += 1
+                logger.warning(
+                    "BUY_BLOCKED_SYMBOL_SELL_COOLDOWN symbol=%s remaining=%.0fs",
+                    symbol,
+                    sym_wall - now_wall,
+                )
+                return False, "SYMBOL_SELL_COOLDOWN"
             logger.debug(
-                "QUALITY_TELEMETRY SYMBOL_SELL_COOLDOWN_ACTIVE would_block symbol=%s remaining=%.0fs (not enforced — diagnostic only)",
+                "QUALITY_TELEMETRY SYMBOL_SELL_COOLDOWN_ACTIVE would_block symbol=%s remaining=%.0fs (ENABLE_COOLDOWN_ENFORCEMENT=false)",
                 symbol,
                 sym_wall - now_wall,
             )
+
+        # Governance consec-loss hold (Redis). Defense-in-depth alongside RiskGovernor.decide().
+        if ENABLE_GOVERNANCE_ENFORCEMENT and not governance_risk_governor_shadow_only():
+            try:
+                loss_hold_until = await self._get_loss_hold_until()
+                if loss_hold_until is not None and now_wall < float(loss_hold_until):
+                    _, consec = await self.get_rolling_24h_risk_metrics()
+                    if consec >= MAX_CONSEC_LOSSES:
+                        self._last_governance_hold_reason = "HOLD_CONSEC_LOSSES"
+                        logger.warning(
+                            "BUY_BLOCKED_HOLD_CONSEC_LOSSES symbol=%s consec=%s remaining=%.0fs",
+                            symbol,
+                            consec,
+                            float(loss_hold_until) - now_wall,
+                        )
+                        return False, "HOLD_CONSEC_LOSSES"
+            except Exception as _lh_err:
+                logger.debug("loss_hold check skipped: %s", _lh_err)
+
+        # TradeStateStore entry gate (IDLE / IN_TRADE / COOLDOWN). Was never called from PE.
+        if ENABLE_TRADE_STATE_ENTRY_BLOCKING:
+            try:
+                from backend.services.trade_state import get_trade_state_store
+
+                _ts_ok, _ts_reason = await get_trade_state_store().allow_new_entry_async(
+                    symbol, "buy", now_wall
+                )
+                if not _ts_ok:
+                    logger.warning(
+                        "BUY_BLOCKED_TRADE_STATE symbol=%s reason=%s",
+                        symbol,
+                        _ts_reason,
+                    )
+                    return False, f"TRADE_STATE:{_ts_reason}"
+            except Exception as _ts_err:
+                logger.warning("trade_state gate error for %s: %s — fail-closed", symbol, _ts_err)
+                return False, "TRADE_STATE_GATE_ERROR"
 
         # Check max positions (hard limit: 10)
         # DUST_INVARIANT: Exclude DUST_PENDING from count - dust must not block new buys
@@ -13039,33 +13261,47 @@ class PortfolioEngine:
             _bm_raw = resolve_buy_margin_from_payload(_cand.decision_data)
             _sleeve = str(getattr(_cand, "sleeve", "") or "").strip().upper() or assign_sleeve(normalize_symbol(_sym), float(_cand.confidence), _cand.decision_data)
             _bm_thr = buy_margin_threshold_core() if _sleeve == Sleeve.CORE.value else buy_margin_threshold_active()
+            _bm_fail = False
             if _bm_raw is None:
                 logger.info(
-                    "BUY_MARGIN_TELEMETRY #%d: %s BUY_MARGIN missing (threshold=%.4f sleeve=%s) -> penalty only",
+                    "BUY_MARGIN_TELEMETRY #%d: %s BUY_MARGIN missing (threshold=%.4f sleeve=%s)%s",
                     _rank_idx + 1,
                     _sym,
                     _bm_thr,
                     _sleeve or Sleeve.ACTIVE.value,
+                    " -> BLOCKED" if ENABLE_PROFITABILITY_ENFORCEMENT else " -> penalty only",
                 )
                 _cand.decision_data = dict(_cand.decision_data or {})
-                _cand.decision_data["buy_margin_exec_status"] = "missing_penalty_only"
-                _cand.decision_data["buy_margin_penalty_exec"] = 4.0
+                if ENABLE_PROFITABILITY_ENFORCEMENT:
+                    _cand.decision_data["buy_margin_exec_status"] = "missing_blocked"
+                    _bm_fail = True
+                else:
+                    _cand.decision_data["buy_margin_exec_status"] = "missing_penalty_only"
+                    _cand.decision_data["buy_margin_penalty_exec"] = 4.0
             try:
-                _bm_val = float(_bm_raw)
+                _bm_val = float(_bm_raw) if _bm_raw is not None else float("nan")
             except (TypeError, ValueError):
                 _bm_val = float("nan")
-            if not math.isfinite(_bm_val) or _bm_val < _bm_thr:
+            if not _bm_fail and (not math.isfinite(_bm_val) or _bm_val < _bm_thr):
                 logger.info(
-                    "BUY_MARGIN_TELEMETRY #%d: %s BUY_MARGIN %.6f < %.6f (sleeve=%s) -> penalty only",
+                    "BUY_MARGIN_TELEMETRY #%d: %s BUY_MARGIN %.6f < %.6f (sleeve=%s)%s",
                     _rank_idx + 1,
                     _sym,
                     _bm_val,
                     _bm_thr,
                     _sleeve or Sleeve.ACTIVE.value,
+                    " -> BLOCKED" if ENABLE_PROFITABILITY_ENFORCEMENT else " -> penalty only",
                 )
                 _cand.decision_data = dict(_cand.decision_data or {})
-                _cand.decision_data["buy_margin_exec_status"] = "below_threshold_penalty_only"
-                _cand.decision_data["buy_margin_penalty_exec"] = 4.0
+                if ENABLE_PROFITABILITY_ENFORCEMENT:
+                    _cand.decision_data["buy_margin_exec_status"] = "below_threshold_blocked"
+                    _bm_fail = True
+                else:
+                    _cand.decision_data["buy_margin_exec_status"] = "below_threshold_penalty_only"
+                    _cand.decision_data["buy_margin_penalty_exec"] = 4.0
+            if _bm_fail:
+                await self._bar_pipeline_terminal(_cand.decision_id, "BAR_BUY_MARGIN_BLOCKED", pipeline_done)
+                continue
             _spread_raw = _cand.decision_data.get("spread_pct")
             if _spread_raw in (None, ""):
                 _spread_raw = _cand.decision_data.get("spread")
@@ -13098,23 +13334,23 @@ class PortfolioEngine:
                 _cand.decision_data["spread_penalty_exec"] = float(_cand.decision_data.get("spread_penalty_exec") or 0.0) + 4.0
             if _cand.current_price > 0 and _cand.atr / _cand.current_price < MIN_ATR_RATIO:
                 if ENABLE_ATR_ENFORCEMENT:
-                    logger.info(
-                        "LOW_ATR_TELEMETRY #%d: %s atr_ratio=%.6f < %.6f -> penalty only",
+                    logger.warning(
+                        "BUY_BLOCKED_LOW_ATR #%d: %s atr_ratio=%.6f < %.6f",
                         _rank_idx + 1,
                         _sym,
                         _cand.atr / _cand.current_price,
                         MIN_ATR_RATIO,
                     )
                     _cand.decision_data = dict(_cand.decision_data or {})
-                    _cand.decision_data["atr_exec_status"] = "low_valid_penalty_only"
-                    _cand.decision_data["atr_penalty_exec"] = float(_cand.decision_data.get("atr_penalty_exec") or 0.0) + 2.5
-                else:
-                    logger.info(
-                        "TELEMETRY_LOW_ATR symbol=%s atr_ratio=%.6f min=%.6f (ENABLE_ATR_ENFORCEMENT=false)",
-                        _sym,
-                        _cand.atr / _cand.current_price,
-                        MIN_ATR_RATIO,
-                    )
+                    _cand.decision_data["atr_exec_status"] = "low_atr_blocked"
+                    await self._bar_pipeline_terminal(_cand.decision_id, "BAR_LOW_ATR_BLOCKED", pipeline_done)
+                    continue
+                logger.info(
+                    "TELEMETRY_LOW_ATR symbol=%s atr_ratio=%.6f min=%.6f (ENABLE_ATR_ENFORCEMENT=false)",
+                    _sym,
+                    _cand.atr / _cand.current_price,
+                    MIN_ATR_RATIO,
+                )
             execution_sane_candidates.append(_cand)
 
         if not execution_sane_candidates:
@@ -13164,6 +13400,22 @@ class PortfolioEngine:
             chosen[0].symbol if chosen else "",
             (chosen[0].decision_id or "") if chosen else "",
         )
+
+        # RiskGovernor (was never called — GOV_CONFIG logged at startup as if live).
+        chosen, gov_hold = await self._apply_risk_governor(chosen)
+        if gov_hold:
+            await self._emit_day_health_telemetry(f"BUY_BLOCKED_GOVERNANCE:{gov_hold}")
+            for c in bar_candidate_snapshot:
+                await self._bar_pipeline_terminal(c.decision_id, f"GOVERNANCE:{gov_hold}", pipeline_done)
+            self.current_bar_candidates.clear()
+            return None
+        if not chosen:
+            await self._emit_day_health_telemetry("BUY_SKIPPED_GOVERNANCE_FILTERED")
+            logger.info("BUY_SKIPPED: RiskGovernor rejected all candidates this bar")
+            for c in bar_candidate_snapshot:
+                await self._bar_pipeline_terminal(c.decision_id, "GOVERNANCE_FILTERED", pipeline_done)
+            self.current_bar_candidates.clear()
+            return None
 
         # Selection is ranking-only. Execution enforces buy_margin, capacity,
         # and duplicate-symbol blocks. Skip candidates Mystic already holds
