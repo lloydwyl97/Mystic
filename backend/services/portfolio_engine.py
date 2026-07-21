@@ -1743,7 +1743,7 @@ class PortfolioEngine:
         # Item 5: Quality filter state
         self._quality_filter_state = QualityFilterState()
 
-        # RiskGovernor — was defined + logged at startup but never called (decorative).
+        # RiskGovernor — wired into process_bar_candidates via _apply_risk_governor.
         # shadow_only follows ENABLE_GOVERNANCE_ENFORCEMENT + GOVERNANCE_SHADOW_ONLY.
         self._risk_governor = RiskGovernor(shadow_only=governance_risk_governor_shadow_only())
 
@@ -9797,7 +9797,6 @@ class PortfolioEngine:
 
         Returns (allowed_candidates, account_hold_reason).
         When shadow_only / ENABLE_GOVERNANCE_ENFORCEMENT=false: logs only, returns all candidates.
-        Previously RiskGovernor existed and logged GOV_CONFIG at startup but was never called.
         """
         if not candidates:
             return [], None
@@ -10010,7 +10009,7 @@ class PortfolioEngine:
             except Exception as _lh_err:
                 logger.debug("loss_hold check skipped: %s", _lh_err)
 
-        # TradeStateStore entry gate (IDLE / IN_TRADE / COOLDOWN). Was never called from PE.
+        # TradeStateStore entry gate (IDLE / IN_TRADE / COOLDOWN) — live when ENABLE_TRADE_STATE_ENTRY_BLOCKING.
         if ENABLE_TRADE_STATE_ENTRY_BLOCKING:
             try:
                 from backend.services.trade_state import get_trade_state_store
@@ -13401,7 +13400,7 @@ class PortfolioEngine:
             (chosen[0].decision_id or "") if chosen else "",
         )
 
-        # RiskGovernor (was never called — GOV_CONFIG logged at startup as if live).
+        # RiskGovernor hard/soft account gates (env-gated; live when ENABLE_GOVERNANCE_ENFORCEMENT).
         chosen, gov_hold = await self._apply_risk_governor(chosen)
         if gov_hold:
             await self._emit_day_health_telemetry(f"BUY_BLOCKED_GOVERNANCE:{gov_hold}")

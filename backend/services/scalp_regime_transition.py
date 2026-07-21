@@ -41,12 +41,7 @@ def compute_scalp_regime_transition_scores(data: dict[str, Any], memory: dict[st
         "liquidity_sweep_score": round(_c01(1.0 if sweep else 0.0), 4),
         "spread_widening_risk_score": round(_c01(spread_wide), 4),
         "scalp_regime_transition_score": round(
-            _c01(
-                0.2 * (1.0 if breakout else 0.0)
-                + 0.2 * (1.0 if sweep else 0.0)
-                - 0.15 * spread_wide
-                - 0.15 * (1.0 if chop else 0.0)
-            ),
+            _c01(0.2 * (1.0 if breakout else 0.0) + 0.2 * (1.0 if sweep else 0.0) - 0.15 * spread_wide - 0.15 * (1.0 if chop else 0.0)),
             4,
         ),
     }

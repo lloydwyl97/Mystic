@@ -43,16 +43,7 @@ def compute_execution_ranking_scores(decision_data: dict[str, Any]) -> dict[str,
     orderbook_freshness_score = round(ob_fresh, 4)
 
     execution_quality_score = round(
-        _clamp01(
-            (
-                0.30 * spread_score
-                + 0.20 * depth_score
-                + 0.20 * slippage_score
-                + 0.15 * price_impact_score
-                + 0.15 * orderbook_freshness_score
-            )
-            * fresh_mod
-        ),
+        _clamp01((0.30 * spread_score + 0.20 * depth_score + 0.20 * slippage_score + 0.15 * price_impact_score + 0.15 * orderbook_freshness_score) * fresh_mod),
         4,
     )
 

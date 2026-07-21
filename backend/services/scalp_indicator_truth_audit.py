@@ -19,9 +19,7 @@ SYMBOL_TO_LABEL = {
 DEFAULT_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 
 MODEL_FEATURES = frozenset(SCALP_FEATURE_NAMES)
-EXEC_FEATURES = frozenset(
-    {"spread_pct", "order_book_imbalance", "orderbook_age_sec", "impact_pct", "depth_sufficient_flag"}
-)
+EXEC_FEATURES = frozenset({"spread_pct", "order_book_imbalance", "orderbook_age_sec", "impact_pct", "depth_sufficient_flag"})
 SETUP_FEATURES = frozenset({"mid_change_30s", "kline_volume_ratio", "kline_rsi_proxy", "kline_vwap_distance", "signal_score"})
 
 

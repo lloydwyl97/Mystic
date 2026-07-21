@@ -21,11 +21,7 @@ def _print_feature_table(coin: dict) -> None:
         return
     print(f"\n--- {coin.get('symbol')} feature table (index name block BTC-val status source) ---")
     for f in feats:
-        print(
-            f"{f['index']:3d} {f['name'][:28]:28s} {f['block'][:22]:22s} "
-            f"{f['value']:+.6f} {f['status']:22s} trust={f['trust_score']:.2f} "
-            f"learn={f['learning_allowed']} | {f['source'][:50]}"
-        )
+        print(f"{f['index']:3d} {f['name'][:28]:28s} {f['block'][:22]:22s} {f['value']:+.6f} {f['status']:22s} trust={f['trust_score']:.2f} learn={f['learning_allowed']} | {f['source'][:50]}")
 
 
 async def main() -> int:

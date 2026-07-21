@@ -21,9 +21,7 @@ def main() -> int:
     with sqlite3.connect(db) as conn:
         open_n = conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0]
         closed_n = conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='CLOSED'").fetchone()[0]
-        ledger = conn.execute(
-            "SELECT cash_balance, positions_value, realized_pnl, total_equity FROM scalp_paper_ledger WHERE id=1"
-        ).fetchone()
+        ledger = conn.execute("SELECT cash_balance, positions_value, realized_pnl, total_equity FROM scalp_paper_ledger WHERE id=1").fetchone()
         deleted = 0
         if closed_n > 0:
             deleted = conn.execute("DELETE FROM scalp_paper_positions WHERE status='CLOSED'").rowcount

@@ -34,9 +34,7 @@ async def main() -> int:
                 b["calculated"] += 1
             elif st == "CALCULATED_PROXY":
                 b["proxy"] += 1
-            if st in ("FALLBACK", "MISSING", "STALE", "ZERO_DEFAULT") or (
-                st == "WARMUP" and f.get("is_placeholder")
-            ):
+            if st in ("FALLBACK", "MISSING", "STALE", "ZERO_DEFAULT") or (st == "WARMUP" and f.get("is_placeholder")):
                 b["bad"] += 1
                 b["symbols"].add(sym)
 
@@ -45,10 +43,7 @@ async def main() -> int:
         b = blocks[blk]
         syms = sorted(b["symbols"]) if b["symbols"] else []
         health = round(100.0 * (b["live"] + b["calculated"] + b["proxy"]) / max(1, b["features"]), 1)
-        print(
-            f"{blk:24s} n={b['features']:4d} live={b['live']:4d} calc={b['calculated']:4d} "
-            f"proxy={b['proxy']:4d} bad={b['bad']:4d} health={health}% issues={syms}"
-        )
+        print(f"{blk:24s} n={b['features']:4d} live={b['live']:4d} calc={b['calculated']:4d} proxy={b['proxy']:4d} bad={b['bad']:4d} health={health}% issues={syms}")
     return 0 if report.get("pass") else 1
 
 

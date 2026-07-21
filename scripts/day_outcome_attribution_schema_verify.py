@@ -63,9 +63,7 @@ def main() -> int:
         weight_count = conn.execute("SELECT COUNT(*) FROM ai_strategy_score_weights").fetchone()[0]
         feature_dim_present = "feature_dim" in infer_cols
         if feature_dim_present:
-            sample_dim = conn.execute(
-                "SELECT feature_dim, feature_version FROM ai_inference_log WHERE feature_dim IS NOT NULL ORDER BY id DESC LIMIT 1"
-            ).fetchone()
+            sample_dim = conn.execute("SELECT feature_dim, feature_version FROM ai_inference_log WHERE feature_dim IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
         else:
             sample_dim = None
 

@@ -29,10 +29,7 @@ async def main() -> int:
         print(f"\n=== {sym} context pass={sym_pass} bundle_age={coin.get('bundle_age_sec')} ctx_age={coin.get('ctx_age_sec')} ===")
         for f in ctx_feats:
             flag = "OK" if f["status"] in ("LIVE", "CALCULATED") else f["status"]
-            print(
-                f"  {f['index']:3d} {f['name']:28s} {f['value']:+.6f} {flag:18s} "
-                f"trust={f['trust_score']:.2f} age={f.get('age_seconds')}"
-            )
+            print(f"  {f['index']:3d} {f['name']:28s} {f['value']:+.6f} {flag:18s} trust={f['trust_score']:.2f} age={f.get('age_seconds')}")
     print(f"\nCONTEXT PASS/FAIL: {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 

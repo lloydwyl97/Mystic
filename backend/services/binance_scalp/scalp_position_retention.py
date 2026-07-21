@@ -27,9 +27,7 @@ def purge_closed_scalp_positions(
     """
     keep = max(10, keep_closed if keep_closed is not None else _DEFAULT_KEEP_CLOSED)
     with connect_rw(db_path) as conn:
-        closed_n = int(
-            conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='CLOSED'").fetchone()[0] or 0
-        )
+        closed_n = int(conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='CLOSED'").fetchone()[0] or 0)
         if closed_n <= keep:
             return {"deleted": 0, "remaining_closed": closed_n, "keep_closed": keep}
 
@@ -52,9 +50,7 @@ def purge_closed_scalp_positions(
         )
         deleted = int(cur.rowcount or 0)
         conn.commit()
-        remaining = int(
-            conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='CLOSED'").fetchone()[0] or 0
-        )
+        remaining = int(conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='CLOSED'").fetchone()[0] or 0)
         logger.info(
             "SCALP_POSITION_RETENTION: deleted=%s remaining_closed=%s keep=%s cutoff_id=%s",
             deleted,
@@ -73,9 +69,7 @@ def purge_closed_scalp_positions(
 def reconcile_scalp_ledger_equity(db_path: str) -> dict[str, Any]:
     """Heal scalp_paper_ledger.total_equity = cash_balance + positions_value."""
     with connect_rw(db_path) as conn:
-        row = conn.execute(
-            "SELECT cash_balance, positions_value, total_equity FROM scalp_paper_ledger WHERE id=1"
-        ).fetchone()
+        row = conn.execute("SELECT cash_balance, positions_value, total_equity FROM scalp_paper_ledger WHERE id=1").fetchone()
         if not row:
             return {"skipped": True, "reason": "no_ledger_row"}
         cash, pos_val, equity = float(row[0] or 0), float(row[1] or 0), float(row[2] or 0)

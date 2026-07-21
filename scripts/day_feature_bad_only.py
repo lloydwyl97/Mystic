@@ -24,10 +24,7 @@ async def main() -> int:
             unsupported.append({"symbol": sym, "name": name, "status": "UNSUPPORTED_FOR_SPOT"})
     print(json.dumps({"pass": report.get("pass"), "bad_count": len(rows), "unsupported_count": len(unsupported)}, indent=2))
     for bf in rows:
-        print(
-            f"{bf.get('symbol'):8s} idx={bf.get('index'):3d} {bf.get('name'):32s} "
-            f"{bf.get('status'):20s} val={bf.get('value')} | {bf.get('repair_recommendation')}"
-        )
+        print(f"{bf.get('symbol'):8s} idx={bf.get('index'):3d} {bf.get('name'):32s} {bf.get('status'):20s} val={bf.get('value')} | {bf.get('repair_recommendation')}")
     if unsupported:
         print("\n--- UNSUPPORTED_FOR_SPOT (excluded from learning) ---")
         for u in unsupported:

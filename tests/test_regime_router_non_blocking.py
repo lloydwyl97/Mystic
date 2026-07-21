@@ -81,7 +81,5 @@ def test_no_setup_regime_incompatible_block_reason_remains_possible():
     """SETUP_REGIME_INCOMPATIBLE must never appear as a hard block_reason anymore —
     confirms the MFE_TOO_LOW exception carve-out was fully removed, not just narrowed."""
     for target in (100.05, 100.5, 110.0, 90.0):
-        result = evaluate_pre_buy_exit_consistency(
-            **_base_kwargs(setup="VWAP_REVERSION", day_regime="range", thesis_target_level=target)
-        )
+        result = evaluate_pre_buy_exit_consistency(**_base_kwargs(setup="VWAP_REVERSION", day_regime="range", thesis_target_level=target))
         assert not result["block_reason"].startswith("SETUP_REGIME_INCOMPATIBLE"), result

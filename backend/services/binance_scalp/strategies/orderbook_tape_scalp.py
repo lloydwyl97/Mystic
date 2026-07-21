@@ -42,9 +42,7 @@ class OrderbookTapeScalpStrategy:
             return reject_signal(ctx, self.name, "PRICE_NOT_CONFIRMING_IMBALANCE")
 
         structural = min(ctx.snap.spread_pct * 6 + imb * 0.002, 0.004)
-        expected = estimate_expected_move_pct(
-            ctx.bars_1m, structural=structural, atr_mult=0.50, cap_pct=0.006
-        )
+        expected = estimate_expected_move_pct(ctx.bars_1m, structural=structural, atr_mult=0.50, cap_pct=0.006)
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)

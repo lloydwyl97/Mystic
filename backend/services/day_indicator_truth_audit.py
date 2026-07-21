@@ -113,9 +113,7 @@ MICROSTRUCTURE_NAMES: frozenset[str] = frozenset(
 
 SENTIMENT_UNSUPPORTED: frozenset[str] = frozenset({"put_call_ratio", "volatility_smile"})
 
-INTENTIONAL_NEAR_ZERO: frozenset[str] = frozenset(
-    {"balance_of_power", "second", "volume_price_trend", "volume_weighted_price"}
-)
+INTENTIONAL_NEAR_ZERO: frozenset[str] = frozenset({"balance_of_power", "second", "volume_price_trend", "volume_weighted_price"})
 PROXY_FEATURES: frozenset[str] = frozenset(
     {
         "volume_profile_poc",
@@ -199,9 +197,7 @@ def _usage_flags(name: str, block: str, status: str) -> dict[str, bool]:
     used_block_rank = block not in ("unknown",)
     used_setup = name in SETUP_DIRECT_FEATURES or used_block_rank
     used_exec = name in EXECUTION_DIRECT_FEATURES or block == "microstructure" or name == "ctx_spread_pct"
-    used_learning = (
-        name in LEARNING_DIRECT_FEATURES or used_block_rank
-    ) and status not in ("UNSUPPORTED_FOR_SPOT", "FALLBACK", "MISSING", "STALE", "ZERO_DEFAULT", "PLACEHOLDER")
+    used_learning = (name in LEARNING_DIRECT_FEATURES or used_block_rank) and status not in ("UNSUPPORTED_FOR_SPOT", "FALLBACK", "MISSING", "STALE", "ZERO_DEFAULT", "PLACEHOLDER")
     if name in LEARNING_BLOCKED_FEATURE_NAMES or name in SENTIMENT_UNSUPPORTED:
         used_learning = False
     used_rank = used_block_rank or name in SETUP_DIRECT_FEATURES or name in LEARNING_DIRECT_FEATURES or name in EXECUTION_DIRECT_FEATURES
@@ -371,9 +367,7 @@ async def run_indicator_truth_audit(symbols: list[str] | None = None) -> dict[st
         can_exec = usage["used_by_execution_score"]
         can_learn_pos = _can_positive_learning(consensus_status, learning, name)
 
-        needs_fix, needs_adj, reason = _needs_fix(
-            consensus_status, trust, learning, name, bounded, coin_values, block=block
-        )
+        needs_fix, needs_adj, reason = _needs_fix(consensus_status, trust, learning, name, bounded, coin_values, block=block)
 
         # Pass/fail checks
         if not all(len((per_coin.get(s) or {}).get("features") or []) == AI_FEATURE_DIM_V2 for s in syms):
@@ -440,14 +434,7 @@ async def run_indicator_truth_audit(symbols: list[str] | None = None) -> dict[st
 
     needs_fix_rows = [r for r in rows if r["needs_fix"]]
     needs_adj_rows = [r for r in rows if r["needs_adjustment"] and not r["needs_fix"]]
-    unsupported_safe = [
-        r
-        for r in rows
-        if r["status"] == "UNSUPPORTED_FOR_SPOT"
-        and r["trust_score"] == 0.0
-        and not r["learning_allowed"]
-        and not r["needs_fix"]
-    ]
+    unsupported_safe = [r for r in rows if r["status"] == "UNSUPPORTED_FOR_SPOT" and r["trust_score"] == 0.0 and not r["learning_allowed"] and not r["needs_fix"]]
     rank_impact = [r for r in rows if r["used_by_ranker"]]
     learning_impact = [r for r in rows if r["used_by_learning"]]
     execution_impact = [r for r in rows if r["used_by_execution_score"]]
@@ -477,22 +464,11 @@ async def run_indicator_truth_audit(symbols: list[str] | None = None) -> dict[st
     all_145 = all(len((per_coin.get(s) or {}).get("features") or []) == AI_FEATURE_DIM_V2 for s in syms)
     meta_ok = all(r.get("trust_score") is not None and r.get("learning_allowed") is not None for r in rows)
     rank_caps_ok = all(r["rank_delta_cap"] is not None for r in rank_impact)
-    unsupported_ok = all(
-        r["trust_score"] == 0.0 and not r["learning_allowed"] for r in rows if r["feature_name"] in SENTIMENT_UNSUPPORTED
-    )
+    unsupported_ok = all(r["trust_score"] == 0.0 and not r["learning_allowed"] for r in rows if r["feature_name"] in SENTIMENT_UNSUPPORTED)
     no_bad_learning = not any(r["can_receive_positive_learning_credit"] for r in rows if r["status"] in BAD_STATUSES)
     max_rank_domination = INTELLIGENCE_DELTA_CAP <= 0.10 and block_scores_rank_delta({"feature_health_score": 1.0}) <= 0.06
 
-    passed = (
-        all_145
-        and meta_ok
-        and rank_caps_ok
-        and unsupported_ok
-        and no_bad_learning
-        and max_rank_domination
-        and len(needs_fix_rows) == 0
-        and not fail_reasons
-    )
+    passed = all_145 and meta_ok and rank_caps_ok and unsupported_ok and no_bad_learning and max_rank_domination and len(needs_fix_rows) == 0 and not fail_reasons
 
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),

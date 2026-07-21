@@ -92,9 +92,7 @@ def test_scenario_2_buy_no_fee():
         db_path = Path(tmp) / "s2.db"
         _init_ledger(db_path, cash=25_000.0, principal=25_000.0)
         _insert_trade(db_path, side="BUY", symbol="BTC/USDT", qty=0.1, price=40_000.0)  # $4,000 notional
-        expected_cash, buy_debits, sell_credits, buy_count, sell_count = compute_expected_cash(
-            str(db_path), principal=25_000.0
-        )
+        expected_cash, buy_debits, sell_credits, buy_count, sell_count = compute_expected_cash(str(db_path), principal=25_000.0)
         assert buy_debits == pytest.approx(4_000.0, abs=0.01)
         assert expected_cash == pytest.approx(21_000.0, abs=0.01)
         assert buy_count == 1 and sell_count == 0
@@ -177,9 +175,7 @@ def test_scenario_5_6_sell_profit_and_loss_single_credit(sell_price, expect_prof
         _insert_trade(db_path, side="BUY", symbol="BTC/USDT", qty=qty, price=entry)
         _insert_trade(db_path, side="SELL", symbol="BTC/USDT", qty=qty, price=sell_price)
 
-        expected_cash, buy_debits, sell_credits, buy_count, sell_count = compute_expected_cash(
-            str(db_path), principal=25_000.0
-        )
+        expected_cash, buy_debits, sell_credits, buy_count, sell_count = compute_expected_cash(str(db_path), principal=25_000.0)
         assert buy_count == 1 and sell_count == 1
         proceeds = qty * sell_price
         assert sell_credits == pytest.approx(proceeds, abs=0.01)
@@ -218,9 +214,7 @@ async def test_scenario_7_restart_does_not_restore_pre_buy_cash():
         await engine.initialize_from_db()
 
         assert engine.cash_balance == pytest.approx(cash_after_buy, abs=0.01)
-        assert engine.cash_balance != pytest.approx(principal, abs=0.01), (
-            "restart must not silently restore pre-buy principal as cash while a position is open"
-        )
+        assert engine.cash_balance != pytest.approx(principal, abs=0.01), "restart must not silently restore pre-buy principal as cash while a position is open"
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +232,7 @@ def test_scenario_8_partial_exit_reconciles():
         _insert_trade(db_path, side="BUY", symbol="BTC/USDT", qty=qty_total, price=entry)
         _insert_trade(db_path, side="SELL", symbol="BTC/USDT", qty=sell_qty, price=sell_price)
 
-        expected_cash, buy_debits, sell_credits, buy_count, sell_count = compute_expected_cash(
-            str(db_path), principal=25_000.0
-        )
+        expected_cash, buy_debits, sell_credits, buy_count, sell_count = compute_expected_cash(str(db_path), principal=25_000.0)
         remaining_qty = qty_total - sell_qty
         remaining_cost_basis = remaining_qty * entry
         realized = (sell_price - entry) * sell_qty

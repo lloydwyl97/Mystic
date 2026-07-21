@@ -31,12 +31,8 @@ from backend.services.feature_mapping import FEATURE_MAPPING, get_feature_name
 
 CONTEXT_BLOCK = "context_125_145"
 
-BAD_STATUSES: frozenset[str] = frozenset(
-    {"FALLBACK", "MISSING", "STALE", "ZERO_DEFAULT", "UNSUPPORTED_FOR_SPOT"}
-)
-PASS_STATUSES: frozenset[str] = frozenset(
-    {"LIVE", "CALCULATED", "CALCULATED_PROXY", "WARMUP", "LOW_IMPORTANCE_TIME_FIELD_NORMAL"}
-)
+BAD_STATUSES: frozenset[str] = frozenset({"FALLBACK", "MISSING", "STALE", "ZERO_DEFAULT", "UNSUPPORTED_FOR_SPOT"})
+PASS_STATUSES: frozenset[str] = frozenset({"LIVE", "CALCULATED", "CALCULATED_PROXY", "WARMUP", "LOW_IMPORTANCE_TIME_FIELD_NORMAL"})
 
 
 def _ccxt_symbol(bus: str) -> str:
@@ -326,22 +322,12 @@ async def build_symbol_feature_audit(symbol_bus: str) -> dict[str, Any]:
 
     summary = _summarize_features(features)
     summary["health_pct"] = round(
-        100.0 * (summary["live_count"] + summary["calculated_count"] + summary.get("calculated_proxy_count", 0))
-        / max(1, summary["total_features"]),
+        100.0 * (summary["live_count"] + summary["calculated_count"] + summary.get("calculated_proxy_count", 0)) / max(1, summary["total_features"]),
         2,
     )
-    bad = [
-        f
-        for f in features
-        if f["status"] in ("FALLBACK", "MISSING", "STALE", "ZERO_DEFAULT")
-        or (f["status"] == "WARMUP" and f["is_placeholder"])
-    ]
+    bad = [f for f in features if f["status"] in ("FALLBACK", "MISSING", "STALE", "ZERO_DEFAULT") or (f["status"] == "WARMUP" and f["is_placeholder"])]
     allowed_unsupported = {f["name"] for f in features if f["status"] == "UNSUPPORTED_FOR_SPOT"}
-    strict_pass = (
-        len(bad) == 0
-        and summary["total_features"] == AI_FEATURE_DIM_V2
-        and summary.get("fallback_count", 0) == 0
-    )
+    strict_pass = len(bad) == 0 and summary["total_features"] == AI_FEATURE_DIM_V2 and summary.get("fallback_count", 0) == 0
 
     return {
         "symbol": symbol_bus,

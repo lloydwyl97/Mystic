@@ -144,12 +144,7 @@ def extract_scaled_components(explain: dict[str, Any]) -> dict[str, float]:
 
 
 def _regime_from_explain(explain: dict[str, Any]) -> str:
-    regime = _normalize_regime(
-        explain.get("day_route_regime")
-        or explain.get("signal_regime_label")
-        or explain.get("regime")
-        or explain.get("price_structure_regime")
-    )
+    regime = _normalize_regime(explain.get("day_route_regime") or explain.get("signal_regime_label") or explain.get("regime") or explain.get("price_structure_regime"))
     setup = str(explain.get("setup_type") or explain.get("entry_thesis") or "NO_CLEAR_THESIS").strip().upper()
     return setup_regime_bucket(regime, setup)
 
@@ -364,9 +359,7 @@ def propagate_adaptive_score_weights_for_close(
                 samples = _load_training_samples(conn, strategy_id=sid, symbol_bus=sym_bus)
                 if len(samples) < MIN_BUCKET_SAMPLES:
                     return 0
-                touched = recompute_bucket_weights(
-                    conn, strategy_id=sid, symbol_bus=sym_bus, regime=regime, samples=samples
-                )
+                touched = recompute_bucket_weights(conn, strategy_id=sid, symbol_bus=sym_bus, regime=regime, samples=samples)
                 conn.commit()
                 if touched:
                     logger.info(

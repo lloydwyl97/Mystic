@@ -44,9 +44,7 @@ def build_candidate_explanation(decision_data: dict[str, Any], *, symbol: str = 
         "relative_strength_rank": dd.get("relative_strength_rank"),
         "execution_quality_score": dd.get("execution_quality_score"),
         "regime_transition_scores": {
-            k: dd.get(k)
-            for k in dd
-            if k.endswith("_score") and k.startswith(("trend_to_", "range_to_", "bear_", "compression_", "bull_", "panic_", "liquidity_", "regime_transition"))
+            k: dd.get(k) for k in dd if k.endswith("_score") and k.startswith(("trend_to_", "range_to_", "bear_", "compression_", "bull_", "panic_", "liquidity_", "regime_transition"))
         },
         "adaptive_learning": {
             "adaptive_score_delta": dd.get("adaptive_score_delta"),
@@ -73,19 +71,16 @@ def format_explanation_narrative(snap: dict[str, Any]) -> str:
     sym = snap.get("symbol") or "?"
     rank = snap.get("relative_strength_rank") or "?"
     fh = snap.get("feature_health_score")
-    fh_pct = f"{float(fh)*100:.0f}%" if fh is not None else "n/a"
+    fh_pct = f"{float(fh) * 100:.0f}%" if fh is not None else "n/a"
     setup = snap.get("setup_thesis") or "unknown"
     regime = snap.get("regime") or "unknown"
     exec_q = snap.get("execution_quality_score")
-    exec_s = f"{float(exec_q)*100:.0f}%" if exec_q is not None else "n/a"
+    exec_s = f"{float(exec_q) * 100:.0f}%" if exec_q is not None else "n/a"
     final = snap.get("final_selection_score")
     final_s = f"{float(final):.4f}" if final is not None else "n/a"
     over = snap.get("selected_over_symbol") or ""
     why = snap.get("why_selected") or ""
-    base = (
-        f"{sym} ranked #{rank} with setup {setup} in {regime} regime; "
-        f"feature health {fh_pct}, execution {exec_s}, final_selection_score {final_s}."
-    )
+    base = f"{sym} ranked #{rank} with setup {setup} in {regime} regime; feature health {fh_pct}, execution {exec_s}, final_selection_score {final_s}."
     if over and why:
         return f"{base} Selected over {over}: {why}."
     return base

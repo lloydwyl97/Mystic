@@ -22,9 +22,7 @@ from backend.services.scalp_feature_contract import (
     build_scalp_feature_vector,
 )
 
-BAD_STATUSES: frozenset[str] = frozenset(
-    {"FALLBACK", "MISSING", "STALE", "ZERO_DEFAULT", "UNSUPPORTED_FOR_SPOT", "PLACEHOLDER"}
-)
+BAD_STATUSES: frozenset[str] = frozenset({"FALLBACK", "MISSING", "STALE", "ZERO_DEFAULT", "UNSUPPORTED_FOR_SPOT", "PLACEHOLDER"})
 PASS_STATUSES: frozenset[str] = frozenset({"LIVE", "CALCULATED", "CALCULATED_PROXY", "WARMUP"})
 
 ORDERBOOK_FRESH_SEC = 45.0
@@ -59,13 +57,18 @@ def _feature_status(name: str, value: float, *, ob_age: float | None, kline_bars
         if ob_age is not None and ob_age > ORDERBOOK_FRESH_SEC:
             return "STALE", "stale orderbook overlay", SCALP_TRUST_SCORES["STALE"], False
         return "LIVE", "orderbook:{BASE} read-only", SCALP_TRUST_SCORES["LIVE"], True
-    if name.startswith("mid_change") or name.startswith("bid_change") or name in (
-        "momentum_confirmed",
-        "flat_regime",
-        "recent_range_pct",
-        "realized_volatility_pct",
-        "last_n_ticks_up_count",
-        "momentum_sample_count",
+    if (
+        name.startswith("mid_change")
+        or name.startswith("bid_change")
+        or name
+        in (
+            "momentum_confirmed",
+            "flat_regime",
+            "recent_range_pct",
+            "realized_volatility_pct",
+            "last_n_ticks_up_count",
+            "momentum_sample_count",
+        )
     ):
         if value == 0.0 and name == "momentum_sample_count":
             return "WARMUP", "momentum tracker warming", SCALP_TRUST_SCORES["WARMUP"], False

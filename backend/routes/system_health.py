@@ -310,14 +310,7 @@ async def get_process_health() -> dict[str, Any]:
         except Exception:
             redis_ok = False
     core_ok = checks["uvicorn"] and checks["portfolio_engine"]
-    all_ok = (
-        core_ok
-        and checks["live_market_data"]
-        and checks["ai_signal_generator"]
-        and checks["ai_market_context"]
-        and checks["ai_learning"]
-        and checks["scalp_runner"]
-    )
+    all_ok = core_ok and checks["live_market_data"] and checks["ai_signal_generator"] and checks["ai_market_context"] and checks["ai_learning"] and checks["scalp_runner"]
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "status": "healthy" if all_ok else ("degraded" if core_ok else "critical"),

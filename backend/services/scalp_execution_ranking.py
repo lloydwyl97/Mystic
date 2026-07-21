@@ -38,16 +38,7 @@ def compute_scalp_execution_scores(data: dict[str, Any]) -> dict[str, float]:
     scalp_fill_quality_score = round(_c01(0.5 * scalp_spread_score + 0.5 * scalp_depth_score), 4)
 
     scalp_execution_quality_score = round(
-        _c01(
-            (
-                0.35 * scalp_spread_score
-                + 0.20 * scalp_depth_score
-                + 0.15 * scalp_slippage_score
-                + 0.15 * scalp_price_impact_score
-                + 0.15 * scalp_orderbook_freshness_score
-            )
-            * min(1.0, fresh_mod)
-        ),
+        _c01((0.35 * scalp_spread_score + 0.20 * scalp_depth_score + 0.15 * scalp_slippage_score + 0.15 * scalp_price_impact_score + 0.15 * scalp_orderbook_freshness_score) * min(1.0, fresh_mod)),
         4,
     )
 

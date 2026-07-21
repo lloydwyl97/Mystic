@@ -74,15 +74,7 @@ def enrich_basket_relative_strength(candidates: list[Any]) -> None:
         sym = _norm_symbol(getattr(cand, "symbol", "") or "")
         dd = dict(getattr(cand, "decision_data", None) or {})
         rr = rs_rank.get(sym, n)
-        composite = (
-            rs_rank.get(sym, n)
-            + trend_rank.get(sym, n)
-            + mom_rank.get(sym, n)
-            + vol_rank.get(sym, n)
-            + exec_rank.get(sym, n)
-            + fh_rank.get(sym, n)
-            + setup_rank.get(sym, n)
-        ) / 7.0
+        composite = (rs_rank.get(sym, n) + trend_rank.get(sym, n) + mom_rank.get(sym, n) + vol_rank.get(sym, n) + exec_rank.get(sym, n) + fh_rank.get(sym, n) + setup_rank.get(sym, n)) / 7.0
         dd["rs_rank"] = rr
         dd["trend_rank"] = trend_rank.get(sym, n)
         dd["momentum_rank"] = mom_rank.get(sym, n)

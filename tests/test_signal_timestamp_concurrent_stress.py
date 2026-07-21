@@ -118,10 +118,7 @@ def test_concurrent_reads_never_see_missing_timestamp_under_writer_churn(engine_
     assert not write_errors, f"writer thread errors: {write_errors}"
     assert len(results) == 24
     missing = [r for r in results if not r.get("timestamp")]
-    assert not missing, (
-        f"{len(missing)}/24 concurrent reads got no signal-content timestamp under writer churn "
-        "— the bounded retry budget must survive delete-then-rewrite race windows"
-    )
+    assert not missing, f"{len(missing)}/24 concurrent reads got no signal-content timestamp under writer churn — the bounded retry budget must survive delete-then-rewrite race windows"
 
 
 def test_fetch_survives_cold_connection_establishment_latency(monkeypatch):

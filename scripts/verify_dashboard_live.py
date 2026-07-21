@@ -30,7 +30,14 @@ def main() -> int:
     html = (DASH / "index.html").read_text(encoding="utf-8")
     tabs = re.findall(r'data-tab="([^"]+)"', html)
     expected_tabs = [
-        "command", "day", "scalp", "positions", "learning", "performance", "marketlens", "settings",
+        "command",
+        "day",
+        "scalp",
+        "positions",
+        "learning",
+        "performance",
+        "marketlens",
+        "settings",
     ]
     for t in expected_tabs:
         if t not in tabs:
@@ -44,8 +51,15 @@ def main() -> int:
             failures.append(f"asset {asset} HTTP {code}")
 
     required_ids = [
-        "status-cash", "eng-day-status", "eng-scalp-status", "ph-uvicorn", "day-basket-tbody",
-        "scalp-symbols-tbody", "scalp-positions-tbody", "ml-feed-pre", "operator-config-form",
+        "status-cash",
+        "eng-day-status",
+        "eng-scalp-status",
+        "ph-uvicorn",
+        "day-basket-tbody",
+        "scalp-symbols-tbody",
+        "scalp-positions-tbody",
+        "ml-feed-pre",
+        "operator-config-form",
     ]
     for rid in required_ids:
         if f'id="{rid}"' not in html:

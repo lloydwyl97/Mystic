@@ -53,9 +53,7 @@ def main() -> int:
     tables = {
         row[0]: 1
         for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ("
-            "'day_outcome_attribution','ai_post_trade_feature_reviews','ai_strategy_score_weights',"
-            "'paper_trades','scalp_paper_trades')"
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('day_outcome_attribution','ai_post_trade_feature_reviews','ai_strategy_score_weights','paper_trades','scalp_paper_trades')"
         ).fetchall()
     }
     for t in (
@@ -160,10 +158,7 @@ def main() -> int:
         print(f"{'PASS' if ok else 'FAIL'} {name}: {note}")
         if not ok:
             failed += 1
-    print(
-        f"attribution_rows={attr} post_trade_reviews={reviews} "
-        f"weight_rows={weights} paper_trades={day_trades}"
-    )
+    print(f"attribution_rows={attr} post_trade_reviews={reviews} weight_rows={weights} paper_trades={day_trades}")
     print("PASS" if failed == 0 else f"FAIL ({failed} checks)")
     return 0 if failed == 0 else 1
 

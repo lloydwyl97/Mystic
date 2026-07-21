@@ -285,11 +285,7 @@ async def _fetch_day_active_ohlcv_bundle_raw(
     for tf in DAY_ACTIVE_TIMEFRAMES:
         prior_rows = prior_bundle.get(tf)
         prior_ts = prior_tf_fetched_at.get(tf, 0.0)
-        still_fresh = (
-            isinstance(prior_rows, list)
-            and len(prior_rows) >= min_bars_for_day_tf(tf)
-            and (now - prior_ts) < _tf_refresh_interval_sec(tf)
-        )
+        still_fresh = isinstance(prior_rows, list) and len(prior_rows) >= min_bars_for_day_tf(tf) and (now - prior_ts) < _tf_refresh_interval_sec(tf)
         if still_fresh:
             out[tf] = prior_rows
             tf_fetched_at[tf] = prior_ts

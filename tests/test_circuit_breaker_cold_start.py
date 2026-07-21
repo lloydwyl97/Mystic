@@ -133,9 +133,7 @@ def test_missing_timestamp_is_treated_as_stale_not_trusted():
 def test_cold_start_status_is_observable():
     tcb = _fresh_breaker()
     stale_ts = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()
-    tcb._apply_loaded_circuit_data(
-        {"equity_circuit_breaker_active": True, "session_high_equity": 10_000.0, "updated_at": stale_ts}
-    )
+    tcb._apply_loaded_circuit_data({"equity_circuit_breaker_active": True, "session_high_equity": 10_000.0, "updated_at": stale_ts})
     status = tcb.get_cold_start_status()
     assert status["needs_revalidation"] == ["equity_circuit_breaker_active"]
     assert status["startup_changed_state"] is True

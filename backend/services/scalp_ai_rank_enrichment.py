@@ -103,7 +103,9 @@ def build_scalp_intelligence(
         + float(data.get("scalp_adaptive_rank_delta") or 0)
     )
     data["intelligence_rank_delta"] = round(max(-INTELLIGENCE_DELTA_CAP, min(INTELLIGENCE_DELTA_CAP, intel)), 4)
-    data["final_scalp_selection_score"] = round(max(0.0, min(1.0, base * 0.7 + float(data.get("setup_score") or 0) * 0.2 + float(data.get("scalp_execution_quality_score") or 0) * 0.1 + data["intelligence_rank_delta"])), 4)
+    data["final_scalp_selection_score"] = round(
+        max(0.0, min(1.0, base * 0.7 + float(data.get("setup_score") or 0) * 0.2 + float(data.get("scalp_execution_quality_score") or 0) * 0.1 + data["intelligence_rank_delta"])), 4
+    )
 
     try:
         snap_ex = build_scalp_candidate_explanation(data, symbol=symbol)

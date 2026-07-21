@@ -80,11 +80,7 @@ def get_cached_scalp_status(*, warm_rounds: int = 0, force_refresh: bool = False
             return payload
 
         with _lock:
-            if (
-                _mem_cache.get("payload") is not None
-                and int(_mem_cache.get("warm_rounds") or -1) == wr
-                and (now - float(_mem_cache.get("built_at") or 0)) < ttl
-            ):
+            if _mem_cache.get("payload") is not None and int(_mem_cache.get("warm_rounds") or -1) == wr and (now - float(_mem_cache.get("built_at") or 0)) < ttl:
                 payload = dict(_mem_cache["payload"])
                 payload["cache_hit"] = True
                 payload["cache_backend"] = "memory"
@@ -119,11 +115,7 @@ def get_cached_scalp_status(*, warm_rounds: int = 0, force_refresh: bool = False
         now = time.time()
         if not force_refresh:
             with _lock:
-                if (
-                    _mem_cache.get("payload") is not None
-                    and int(_mem_cache.get("warm_rounds") or -1) == wr
-                    and (now - float(_mem_cache.get("built_at") or 0)) < ttl
-                ):
+                if _mem_cache.get("payload") is not None and int(_mem_cache.get("warm_rounds") or -1) == wr and (now - float(_mem_cache.get("built_at") or 0)) < ttl:
                     payload = dict(_mem_cache["payload"])
                     payload["cache_hit"] = True
                     payload["cache_backend"] = "memory"

@@ -146,9 +146,7 @@ async def mystic_learning_summary() -> dict[str, Any]:
         sp = Path(path)
         if sp.exists():
             with sqlite3.connect(f"file:{sp}?mode=ro", uri=True) as conn:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM scalp_paper_trades WHERE side='SELL'"
-                ).fetchone()
+                row = conn.execute("SELECT COUNT(*) FROM scalp_paper_trades WHERE side='SELL'").fetchone()
                 scalp_closed = int(row[0]) if row else 0
     except Exception:
         pass

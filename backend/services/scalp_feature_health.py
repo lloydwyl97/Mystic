@@ -37,9 +37,7 @@ def stamp_feature_health(intelligence: dict[str, Any], audit: dict[str, Any]) ->
     out["feature_health_pass"] = side.get("pass", False)
     out["feature_version"] = side.get("feature_version")
     out["feature_dim"] = SCALP_FEATURE_DIM
-    out["entry_scalp_vector"] = [
-        float(f.get("value") or 0.0) for f in (audit.get("features") or [])[:SCALP_FEATURE_DIM]
-    ]
+    out["entry_scalp_vector"] = [float(f.get("value") or 0.0) for f in (audit.get("features") or [])[:SCALP_FEATURE_DIM]]
     return out
 
 

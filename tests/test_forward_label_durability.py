@@ -77,9 +77,7 @@ def test_prediction_written_and_redis_available_completes_normally():
                 bundle = {"1h": _synthetic_klines(start, end)}
                 return json.dumps(bundle)
 
-        with patch("backend.config.redis_config.get_redis_client", return_value=_FakeRedisFresh()), patch(
-            "backend.services.ai_learning_ingestion._fetch_historical_klines_rest"
-        ) as mock_rest:
+        with patch("backend.config.redis_config.get_redis_client", return_value=_FakeRedisFresh()), patch("backend.services.ai_learning_ingestion._fetch_historical_klines_rest") as mock_rest:
             counters = label_pending_snapshots(str(db_path))
 
         assert counters["labeled"] + counters["partial"] >= 1
@@ -97,9 +95,10 @@ def test_redis_bundle_expired_before_label_horizon_completes_via_rest_fallback()
         def _fake_rest(sym_bus, interval, start_ms, end_ms, **_kw):
             return _synthetic_klines(start_ms, end_ms)
 
-        with patch("backend.config.redis_config.get_redis_client", return_value=_FakeRedisEmpty()), patch(
-            "backend.services.ai_learning_ingestion._fetch_historical_klines_rest", side_effect=_fake_rest
-        ) as mock_rest:
+        with (
+            patch("backend.config.redis_config.get_redis_client", return_value=_FakeRedisEmpty()),
+            patch("backend.services.ai_learning_ingestion._fetch_historical_klines_rest", side_effect=_fake_rest) as mock_rest,
+        ):
             counters = label_pending_snapshots(str(db_path))
 
         assert mock_rest.called, "REST fallback must fire once Redis coverage is empty and the row is old enough"
@@ -117,9 +116,7 @@ def test_missing_durable_evidence_is_a_specific_unrecoverable_reason_not_silent(
         very_old_epoch_ms = (time.time() - LABEL_GIVEUP_AGE_SEC - 3600) * 1000.0  # past giveup age
         _seed_snapshot(db_path, epoch_ms=very_old_epoch_ms)
 
-        with patch("backend.config.redis_config.get_redis_client", return_value=_FakeRedisEmpty()), patch(
-            "backend.services.ai_learning_ingestion._fetch_historical_klines_rest", return_value=[]
-        ):
+        with patch("backend.config.redis_config.get_redis_client", return_value=_FakeRedisEmpty()), patch("backend.services.ai_learning_ingestion._fetch_historical_klines_rest", return_value=[]):
             counters = label_pending_snapshots(str(db_path))
 
         assert counters["unlabelable"] == 1
@@ -144,9 +141,7 @@ def test_rest_outage_before_giveup_horizon_stays_retryable_not_destroyed():
         old_epoch_ms = (time.time() - LABEL_GIVEUP_AGE_SEC * 0.6) * 1000.0
         _seed_snapshot(db_path, epoch_ms=old_epoch_ms)
 
-        with patch("backend.config.redis_config.get_redis_client", return_value=_FakeRedisEmpty()), patch(
-            "backend.services.ai_learning_ingestion._fetch_historical_klines_rest", return_value=[]
-        ):
+        with patch("backend.config.redis_config.get_redis_client", return_value=_FakeRedisEmpty()), patch("backend.services.ai_learning_ingestion._fetch_historical_klines_rest", return_value=[]):
             counters = label_pending_snapshots(str(db_path))
 
         assert counters["unlabelable"] == 0, "a transient REST outage must not destroy labelability before giveup age"
@@ -164,9 +159,7 @@ def test_rest_fallback_does_not_fire_for_ordinary_in_flight_rows():
         recent_epoch_ms = (time.time() - 20 * 60) * 1000.0  # 20 minutes old — normal in-flight row
         _seed_snapshot(db_path, epoch_ms=recent_epoch_ms)
 
-        with patch("backend.config.redis_config.get_redis_client", return_value=_FakeRedisEmpty()), patch(
-            "backend.services.ai_learning_ingestion._fetch_historical_klines_rest"
-        ) as mock_rest:
+        with patch("backend.config.redis_config.get_redis_client", return_value=_FakeRedisEmpty()), patch("backend.services.ai_learning_ingestion._fetch_historical_klines_rest") as mock_rest:
             label_pending_snapshots(str(db_path))
 
         mock_rest.assert_not_called()

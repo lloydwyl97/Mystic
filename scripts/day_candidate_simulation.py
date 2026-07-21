@@ -88,7 +88,7 @@ async def main() -> int:
             dd = enrich_day_candidate_decision_data(dd, symbol=sym, current_price=float(dd["current_price"]))
             candidates.append(_FakeCandidate(sym, dd))
         enrich_basket_relative_strength(candidates)
-        for cand in candidates[:1 if cycle % 10 else 4]:
+        for cand in candidates[: 1 if cycle % 10 else 4]:
             snap = build_candidate_explanation(cand.decision_data, symbol=cand.symbol)
             narratives.append(str(snap.get("narrative") or ""))
 

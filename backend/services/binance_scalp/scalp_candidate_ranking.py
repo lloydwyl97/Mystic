@@ -330,43 +330,25 @@ def prepare_entry_signal(
     ranked: RankedCandidate,
     ctx: StrategyMarketContext,
 ) -> ScalpSetupSignal:
-    """Promote a soft-ranked candidate to an executable entry signal."""
+    """Return an executable entry signal only for genuine strategy passes.
+
+    Soft-rank promotion (forcing ``passed=True`` on rejects) is permanently
+    disabled — ``entry_eligible`` already requires ``sig.passed``, so this
+    path must never resurrect rejected setups into paper/live trades.
+    """
+    del ctx  # reserved for future genuine-pass enrichment; unused by design
     sig = ranked.signal
-    if sig.passed:
-        return sig
+    if not sig.passed:
+        import logging
 
-    _, impact, fill = depth_check(ctx.snap, ctx.notional_usd, ctx.econ)
-    expected = float(sig.expected_move_pct or 0.0)
-    if expected <= 0:
-        expected = max(
-            ctx.econ.net_profit_target_pct + ctx.econ.entry_edge_buffer_pct,
-            ctx.snap.spread_pct + impact + ctx.econ.min_projected_surplus_pct,
+        logging.getLogger(__name__).warning(
+            "SOFT_RANK_PROMOTION_BLOCKED setup=%s symbol=%s soft_reason=%s — refusing entry",
+            sig.setup_name,
+            sig.symbol,
+            ranked.soft_reason,
         )
-
-    ctx_extra = dict(sig.setup_context or {})
-    ctx_extra["soft_rank_entry"] = True
-    ctx_extra["soft_reason"] = ranked.soft_reason
-    ctx_extra["rank_score"] = ranked.rank_score
-    ctx_extra["reachability_surplus"] = ranked.reachability_surplus
-
-    return ScalpSetupSignal(
-        symbol=sig.symbol,
-        side=sig.side,
-        score=ranked.rank_score,
-        setup_name=sig.setup_name,
-        confidence=max(sig.confidence, min(0.55, ranked.rank_score / 4.0)),
-        entry_reason=f"ranked_soft:{ranked.soft_reason or 'setup'} score={ranked.rank_score:.2f}",
-        invalidation_reason=sig.invalidation_reason or "soft_rank_invalidation",
-        required_target_pct=ctx.econ.net_profit_target_pct,
-        expected_move_pct=expected,
-        spread_pct=ctx.snap.spread_pct,
-        impact_pct=impact,
-        depth_sufficient=True,
-        limit_buy_price=fill,
-        passed=True,
-        reject_reason=None,
-        setup_context=ctx_extra,
-    )
+        return sig
+    return sig
 
 
 def pick_best_ranked(candidates: list[RankedCandidate]) -> RankedCandidate | None:

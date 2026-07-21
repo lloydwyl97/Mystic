@@ -200,14 +200,9 @@ def _performance_display_context() -> dict[str, Any]:
                 "today_win_rate_pct": today["today_win_rate_pct"],
                 "current_run_available": False,
                 "current_run_start": None,
-                "current_run_note": (
-                    "Current-run trade metrics unavailable — no explicit run start marker recorded."
-                ),
+                "current_run_note": ("Current-run trade metrics unavailable — no explicit run start marker recorded."),
                 "scope": "current",
-                "note": (
-                    "Current ledger state + today (UTC calendar day) only. "
-                    "No all-time/lifetime data. SCALP excluded."
-                ),
+                "note": ("Current ledger state + today (UTC calendar day) only. No all-time/lifetime data. SCALP excluded."),
             },
         }
     principal = float(ledger.get("principal") or 25000.0)
@@ -221,11 +216,7 @@ def _performance_display_context() -> dict[str, Any]:
     history_incomplete = abs(equity - performance_equity) > inv_tolerance
     startup_ts = ledger.get("startup_timestamp")
     current_run_available = bool(startup_ts)
-    note = (
-        "Current ledger state + today (UTC calendar day) only. "
-        "No all-time/lifetime data in this object. SCALP excluded. "
-        "Admin/research exits excluded from today trade-stat counts."
-    )
+    note = "Current ledger state + today (UTC calendar day) only. No all-time/lifetime data in this object. SCALP excluded. Admin/research exits excluded from today trade-stat counts."
     if history_incomplete:
         note += (
             " History incomplete: retained closed-trade realized PnL does not reconcile to "
@@ -254,11 +245,7 @@ def _performance_display_context() -> dict[str, Any]:
             "today_win_rate_pct": today["today_win_rate_pct"],
             "current_run_available": current_run_available,
             "current_run_start": startup_ts,
-            "current_run_note": (
-                "Current-run trade metrics unavailable — no explicit run start marker recorded."
-                if not current_run_available
-                else None
-            ),
+            "current_run_note": ("Current-run trade metrics unavailable — no explicit run start marker recorded." if not current_run_available else None),
             "scope": "current",
             "note": note,
         },

@@ -157,9 +157,7 @@ def _open_position_cost_basis(db_path: str) -> float:
             conn.row_factory = sqlite3.Row
             cols = {r[1] for r in conn.execute("PRAGMA table_info(portfolio_engine_positions)")}
             if "original_position_cost" in cols:
-                rows = conn.execute(
-                    "SELECT quantity, entry_price, original_position_cost FROM portfolio_engine_positions"
-                ).fetchall()
+                rows = conn.execute("SELECT quantity, entry_price, original_position_cost FROM portfolio_engine_positions").fetchall()
                 total = 0.0
                 for r in rows:
                     cost = r["original_position_cost"]
@@ -197,10 +195,7 @@ def reconcile_ledger_cash(
     try:
         with sqlite3.connect(db_path) as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT principal, cash_balance, positions_value, realized_pnl, total_equity "
-                "FROM portfolio_engine_ledger WHERE id = 1"
-            ).fetchone()
+            row = conn.execute("SELECT principal, cash_balance, positions_value, realized_pnl, total_equity FROM portfolio_engine_ledger WHERE id = 1").fetchone()
             if row:
                 stored_principal = float(row["principal"])
                 stored_cash = float(row["cash_balance"])
@@ -213,9 +208,7 @@ def reconcile_ledger_cash(
         notes.append(f"ledger read failed: {exc}")
 
     principal = stored_principal if stored_principal is not None else 25000.0
-    expected_cash, buy_debits, sell_credits, buy_count, sell_count = compute_expected_cash(
-        db_path, principal=principal, paper_run_id=paper_run_id
-    )
+    expected_cash, buy_debits, sell_credits, buy_count, sell_count = compute_expected_cash(db_path, principal=principal, paper_run_id=paper_run_id)
     open_cost_basis = _open_position_cost_basis(db_path)
     expected_equity_at_cost = expected_cash + open_cost_basis
 
@@ -273,10 +266,7 @@ def reconcile_ledger_cash(
                 f"buy_count={buy_count} sell_count={sell_count})"
             )
     if equity_discrepancy is not None and abs(equity_discrepancy) > tolerance_usd:
-        notes.append(
-            f"EQUITY_INVARIANT_BROKEN: stored_total_equity={stored_total_equity:.2f} != "
-            f"cash+positions_value={(stored_cash or 0.0) + (stored_positions_value or 0.0):.2f}"
-        )
+        notes.append(f"EQUITY_INVARIANT_BROKEN: stored_total_equity={stored_total_equity:.2f} != cash+positions_value={(stored_cash or 0.0) + (stored_positions_value or 0.0):.2f}")
 
     if truncated_history:
         # The principal-anchored cash formula is known not to apply (truncated
@@ -495,8 +485,7 @@ def repair_orphaned_buy_lot_via_position_merge(
             # — normal exit management, including time-stop, applies from here
             # exactly as it would for any other open position).
             earliest = conn.execute(
-                "SELECT trade_id, quantity, price, timestamp FROM paper_trades "
-                "WHERE mode='paper' AND (symbol = ? OR symbol = ?) AND side='BUY' ORDER BY id ASC LIMIT 1",
+                "SELECT trade_id, quantity, price, timestamp FROM paper_trades WHERE mode='paper' AND (symbol = ? OR symbol = ?) AND side='BUY' ORDER BY id ASC LIMIT 1",
                 sym_variants,
             ).fetchone()
             entry_epoch = time.time()

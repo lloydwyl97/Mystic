@@ -85,8 +85,7 @@ def build_entry_telemetry(ranked: list[dict[str, Any]]) -> dict[str, Any]:
         "strategy_pass_counts": dict(strategy_pass),
         "symbols": symbols,
         "soft_rank_entry_allowed": False,
-        "note": "genuine_pass_setups = strategies that returned passed=True this cycle; "
-        "entry_eligible_count requires passed + score + regime_native (when enabled).",
+        "note": "genuine_pass_setups = strategies that returned passed=True this cycle; entry_eligible_count requires passed + score + regime_native (when enabled).",
     }
 
 

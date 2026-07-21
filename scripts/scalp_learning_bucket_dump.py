@@ -34,9 +34,7 @@ def main() -> int:
                 (sym,),
             ).fetchall()
         else:
-            rows = conn.execute(
-                f"SELECT symbol, regime, component_name, weight, sample_count, updated_at FROM {TABLE} ORDER BY symbol, regime, component_name"
-            ).fetchall()
+            rows = conn.execute(f"SELECT symbol, regime, component_name, weight, sample_count, updated_at FROM {TABLE} ORDER BY symbol, regime, component_name").fetchall()
     buckets: dict[str, dict[str, list]] = {}
     for row in rows:
         sym = row["symbol"]

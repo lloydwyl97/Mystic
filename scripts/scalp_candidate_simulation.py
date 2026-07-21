@@ -68,9 +68,7 @@ def main() -> int:
         if not ranked:
             continue
         enriched = enrich_scalp_ranked_candidates(ranked, redis_client=None)
-        basket = enrich_scalp_basket_relative_strength(
-            [{"symbol": r["symbol"], **(r.get("intelligence") or {})} for r in enriched]
-        )
+        basket = enrich_scalp_basket_relative_strength([{"symbol": r["symbol"], **(r.get("intelligence") or {})} for r in enriched])
         top = basket[0] if basket else {}
         narrative = top.get("scalp_candidate_explanation_narrative") or (enriched[0].get("intelligence") or {}).get("scalp_candidate_explanation_narrative")
         if narrative:

@@ -114,7 +114,7 @@ async def get_task_health(redis_client: Any, *, task_names: tuple[str, ...] | No
                 cursor, batch = await redis_client.scan(cursor=cursor, match=f"{_HEARTBEAT_KEY_PREFIX}*", count=100)
                 for k in batch:
                     ks = k.decode() if isinstance(k, bytes) else str(k)
-                    discovered_keys.add(ks[len(_HEARTBEAT_KEY_PREFIX):])
+                    discovered_keys.add(ks[len(_HEARTBEAT_KEY_PREFIX) :])
                 if cursor == 0:
                     break
             for n in discovered_keys:

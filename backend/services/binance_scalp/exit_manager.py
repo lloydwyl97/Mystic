@@ -372,13 +372,7 @@ def evaluate_exit(
     meaningful_rec = _meaningful_recovery(recovery, max_fav, econ)
     target_progress = econ.net_profit_target_pct * _scratch_progress_frac()
 
-    if (
-        stale_review_count >= _scratch_min_reviews()
-        and max_fav < target_progress
-        and _scratchable_net(executable_net_pct, econ)
-        and momentum_stalled
-        and not meaningful_rec
-    ):
+    if stale_review_count >= _scratch_min_reviews() and max_fav < target_progress and _scratchable_net(executable_net_pct, econ) and momentum_stalled and not meaningful_rec:
         diag_base["scratch_trigger_detail"] = "review_stall_no_progress"
         return _sell(STATE_RECOVERY_HOLD, "review_stall_no_progress", EXIT_EARLY_SCRATCH)
 

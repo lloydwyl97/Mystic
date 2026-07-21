@@ -85,9 +85,19 @@ def _insert_position(db_path: Path, *, symbol: str, qty: float, entry_price: flo
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, 'ACTIVE', 'day', 0, 0, '[]', 0, ?, '{}', datetime('now'))
             """,
             (
-                symbol, qty, entry_price, time.time(), trade_id,
-                entry_price * 0.98, entry_price * 1.02, 0.0, 0.0,
-                entry_price, entry_price * 0.01, int(time.time()), 0.5,
+                symbol,
+                qty,
+                entry_price,
+                time.time(),
+                trade_id,
+                entry_price * 0.98,
+                entry_price * 1.02,
+                0.0,
+                0.0,
+                entry_price,
+                entry_price * 0.01,
+                int(time.time()),
+                0.5,
                 qty * entry_price,
             ),
         )
@@ -191,8 +201,8 @@ def test_pooled_average_replay_not_confused_by_clean_round_trips():
         _insert_trade(db_path, side="SELL", symbol="ETH/USDT", qty=2.0941, price=1795.13, ts="2026-07-11T03:26:44", trade_id="sell1")
         # Several subsequent clean round trips of a similar size.
         for i in range(5):
-            _insert_trade(db_path, side="BUY", symbol="ETH/USDT", qty=2.09, price=1795.0 + i, ts=f"2026-07-11T0{4+i}:00:00", trade_id=f"rt_buy_{i}")
-            _insert_trade(db_path, side="SELL", symbol="ETH/USDT", qty=2.09, price=1796.0 + i, ts=f"2026-07-11T0{4+i}:30:00", trade_id=f"rt_sell_{i}")
+            _insert_trade(db_path, side="BUY", symbol="ETH/USDT", qty=2.09, price=1795.0 + i, ts=f"2026-07-11T0{4 + i}:00:00", trade_id=f"rt_buy_{i}")
+            _insert_trade(db_path, side="SELL", symbol="ETH/USDT", qty=2.09, price=1796.0 + i, ts=f"2026-07-11T0{4 + i}:30:00", trade_id=f"rt_sell_{i}")
         # Only the most recent lot is tracked in the position table.
         _insert_position(db_path, symbol="ETH/USDT", qty=2.0946, entry_price=1790.86, trade_id="orig_buy")
 

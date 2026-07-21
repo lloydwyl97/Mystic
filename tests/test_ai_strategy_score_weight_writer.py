@@ -79,7 +79,5 @@ def test_propagate_writes_current_regime_bucket_not_unknown():
     if touched <= 0:
         pytest.skip("insufficient SOL outcome samples in dev db")
     with sqlite3.connect(DATABASE_PATH) as conn:
-        bull_rows = conn.execute(
-            "SELECT COUNT(*) FROM ai_strategy_score_weights WHERE symbol='SOLUSDT' AND LOWER(regime)='bull'"
-        ).fetchone()[0]
+        bull_rows = conn.execute("SELECT COUNT(*) FROM ai_strategy_score_weights WHERE symbol='SOLUSDT' AND LOWER(regime)='bull'").fetchone()[0]
         assert bull_rows >= 1
