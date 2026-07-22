@@ -30,7 +30,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DATABASE_PATH = os.getenv("MYSTIC_DB_PATH", "mystic_trading.db")
+try:
+    from backend.database_schema import DATABASE_PATH as _CANONICAL_DB_PATH
+
+    DATABASE_PATH = os.getenv("MYSTIC_DB_PATH") or _CANONICAL_DB_PATH
+except Exception:
+    DATABASE_PATH = os.getenv("MYSTIC_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
 
 # Feature keys used for the pattern vector — all already computed at entry
 # time on TradeExplainability, so no extra feature engineering is required.

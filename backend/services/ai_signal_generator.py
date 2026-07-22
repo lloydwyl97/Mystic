@@ -659,6 +659,11 @@ class RealTimeAISignalGenerator:
                 market_primary = bundle.get("4h") or bundle.get("1h") or bundle.get("1m") or []
                 ranking_source = bundle.get("4h") or market_primary
                 market_1m_exec = bundle.get("1m") or []
+                day_tf_audit = {
+                    tf: len(bundle.get(tf) or [])
+                    for tf in DAY_ACTIVE_TIMEFRAMES
+                    if isinstance(bundle.get(tf), list) or bundle.get(tf) is None
+                }
                 if bundle.get("4h"):
                     ranking_tf_label = "4h"
                 elif bundle.get("1h"):

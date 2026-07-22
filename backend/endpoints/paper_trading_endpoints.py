@@ -99,13 +99,40 @@ def _validate_data_integrity_sync(positions_value: float, principal: float, real
 
         # Use ledger realized (never-decrease / prune-aware), not raw paper Σpnl.
         # Paper prune can leave sqlite_sum << ledger realized without a cash bug.
+        # Flat book: cash ≈ principal + realized.
+        # Open book: cash ≈ principal + realized − open cost basis.
         if float(positions_value or 0.0) == 0.0:
             expected_cash = float(principal or 0.0) + ledger_realized
             data_integrity_diff = float(cash_balance or 0.0) - expected_cash
             data_integrity_ok = abs(data_integrity_diff) < 0.05
         else:
-            data_integrity_diff = books_gap
-            data_integrity_ok = True
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(
+                    quantity * entry_price + COALESCE(entry_fee, 0)
+                ), 0)
+                FROM portfolio_engine_positions
+                WHERE quantity > 0
+                """
+            )
+            open_cost = float(cursor.fetchone()[0] or 0.0)
+            cursor.execute(
+                """
+                SELECT COALESCE(total_equity, 0), COALESCE(unrealized_pnl, 0)
+                FROM portfolio_engine_ledger WHERE id = 1
+                """
+            )
+            eq_row = cursor.fetchone() or (0.0, 0.0)
+            ledger_equity = float(eq_row[0] or 0.0)
+            # Ghost MTM (value with no persisted cost) is a real integrity fail.
+            if open_cost <= 0 and float(positions_value or 0.0) > 1.0:
+                data_integrity_diff = float(positions_value or 0.0)
+                data_integrity_ok = False
+            else:
+                # Open-book identity that must hold: cash + MTM positions = ledger equity.
+                composed = float(cash_balance or 0.0) + float(positions_value or 0.0)
+                data_integrity_diff = composed - ledger_equity
+                data_integrity_ok = abs(data_integrity_diff) < 0.05
 
         if abs(books_gap) > 1.0:
             logger.info(

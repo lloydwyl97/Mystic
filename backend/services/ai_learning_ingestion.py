@@ -637,8 +637,8 @@ def label_pending_snapshots(db_path: str = DATABASE_PATH) -> dict[str, int]:
             FROM ai_candidate_snapshots
             WHERE label_status IN ('PENDING', 'PARTIAL')
               AND epoch_ms <= ?
-            ORDER BY CASE WHEN label_status='PENDING' THEN 0 ELSE 1 END,
-                     CASE WHEN label_status='PENDING' THEN epoch_ms ELSE -epoch_ms END ASC
+            ORDER BY CASE WHEN label_status='PARTIAL' THEN 0 ELSE 1 END,
+                     epoch_ms DESC
             LIMIT ?
             """,
             (now_ms - 15 * 60 * 1000, LABEL_BATCH_LIMIT),
@@ -767,6 +767,10 @@ def label_pending_snapshots(db_path: str = DATABASE_PATH) -> dict[str, int]:
                 params.append(row["id"])
                 conn.execute(f"UPDATE ai_candidate_snapshots SET {', '.join(set_parts)} WHERE id=?", params)
                 counters["partial"] += 1
+            else:
+                # No progress this pass — leave status, but do not let ancient
+                # no-progress PENDING monopolize the next ORDER BY batch forever.
+                counters["deferred"] = int(counters.get("deferred") or 0) + 1
         _prune_old_rows(conn)
         conn.commit()
     counters["reconciled"] = _reconcile_verdict_batch(db_path, limit=100)
@@ -894,7 +898,12 @@ def _features_for_decision_ids(
                     continue
                 feats = json.loads(fj)
                 if isinstance(feats, list) and len(feats) == feature_dim:
-                    out[str(did)] = [float(x) for x in feats]
+                    try:
+                        from backend.services.day_feature_health import zero_learning_blocked_feature_dims
+
+                        out[str(did)] = zero_learning_blocked_feature_dims([float(x) for x in feats])
+                    except Exception:
+                        out[str(did)] = [float(x) for x in feats]
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
     return out

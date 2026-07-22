@@ -86,7 +86,8 @@ def update_scalp_market_memory_on_candidate(
         mem["current_micro_regime"] = cur
     setup = str(intelligence.get("scalp_setup") or intelligence.get("setup_name") or "")
     if setup:
-        mem["last_scalp_setup_seen"] = setup
+        # Candidate polls must not overwrite close-path same_* key.
+        mem["last_scalp_setup_candidate"] = setup
     spread = float(intelligence.get("spread_pct") or 0.0)
     mem["spread_state"] = "tight" if spread < 0.0015 else ("wide" if spread > 0.003 else "normal")
     ob_age = intelligence.get("orderbook_age_sec")
@@ -127,12 +128,14 @@ def update_scalp_market_memory_on_close_sync(
                 mem.pop(k, None)
     setup_l = (setup or "").strip().lower()
     if setup_l:
-        if str(mem.get("last_scalp_setup_seen") or "").strip().lower() == setup_l:
+        last_closed = str(mem.get("last_closed_scalp_setup") or mem.get("last_scalp_setup_seen") or "").strip().lower()
+        if last_closed == setup_l:
             mem["same_scalp_setup_today_count"] = int(mem.get("same_scalp_setup_today_count") or 0) + 1
             mem["same_scalp_setup_today_net_pnl"] = float(mem.get("same_scalp_setup_today_net_pnl") or 0) + float(net_pnl)
         else:
             mem["same_scalp_setup_today_count"] = 1
             mem["same_scalp_setup_today_net_pnl"] = float(net_pnl)
+        mem["last_closed_scalp_setup"] = setup_l
         mem["last_scalp_setup_seen"] = setup_l
     mem["last_scalp_setup_result"] = "win" if net_pnl > 0 else "loss"
     wins = float(mem.get("_recent_wins") or 0)
@@ -164,7 +167,8 @@ def memory_rank_delta(memory: dict[str, Any], setup: str) -> float:
     setup_n = int(memory.get(f"setup_n::{setup_l}") or 0)
     delta = 0.0
     # same_* only applies when scoring the setup that earned those closes today.
-    if setup_l and str(memory.get("last_scalp_setup_seen") or "").strip().lower() == setup_l:
+    last_closed = str(memory.get("last_closed_scalp_setup") or memory.get("last_scalp_setup_seen") or "").strip().lower()
+    if setup_l and last_closed == setup_l:
         if same_pnl > 0.5:
             delta += 0.025
         elif same_pnl < -0.5:

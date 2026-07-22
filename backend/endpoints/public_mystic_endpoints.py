@@ -38,7 +38,7 @@ def _redis_ping() -> bool:
 
 def _system_state() -> str:
     core = [
-        _pgrep("uvicorn"),
+        _pgrep("uvicorn backend.main:app") or _pgrep("backend.main:app"),
         _pgrep("start_portfolio_engine_integration.py"),
         _pgrep("backend.services.binance_scalp.runner"),
     ]

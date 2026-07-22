@@ -56,7 +56,7 @@ Active keys to preserve: all four `ai_signal:day:*` and `ai_context:*` for top-4
 
 ## Logs and dashboard
 
-- Logs: `/tmp/mystic_*.log` (backend, live_md, signal, portfolio, learning, collector, ai_context)
+- Logs: `/home/mystic/mystic/logs/mystic_*.log` (backend, live_md, signal, portfolio, learning, ai_context, scalp)
 - Dashboard: `http://127.0.0.1:8000/dashboard/`
 
 ## API timing

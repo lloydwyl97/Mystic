@@ -443,9 +443,10 @@ class BinanceScalpPaperEngine:
 
         best = pick_best_global_candidate(ranked)
         if best is None:
-            top = ranked[0] if ranked else {}
-            meta = top.get("rank_meta") or {}
             eligible_rows = [r for r in ranked if r.get("entry_eligible")]
+            # Prefer an eligible row for reject reason; fall back to rank leader.
+            top = eligible_rows[0] if eligible_rows else (ranked[0] if ranked else {})
+            meta = top.get("rank_meta") or {}
             top_score = float(top.get("rank_score") or 0)
             second_score = float(eligible_rows[1].get("rank_score") or 0) if len(eligible_rows) > 1 else 0.0
             reason = (
@@ -453,6 +454,8 @@ class BinanceScalpPaperEngine:
                 if eligible_rows and top_score < float(os.getenv("SCALP_MIN_CONFIDENT_RANK", "1.55"))
                 else top.get("hard_block") or meta.get("hard_block") or top.get("soft_reason") or meta.get("soft_reason") or f"RANK_BELOW_MIN:{top.get('rank_score')}"
             )
+            if not eligible_rows and ranked:
+                reason = top.get("hard_block") or meta.get("hard_block") or top.get("soft_reason") or meta.get("soft_reason") or "NO_ENTRY_ELIGIBLE"
             self._record_reject(
                 conn,
                 top.get("symbol") or (self.config.products[0] if self.config.products else "UNKNOWN"),
@@ -466,6 +469,7 @@ class BinanceScalpPaperEngine:
                             "setup": top.get("best_setup"),
                             "rank_score": top.get("rank_score"),
                             "hard_block": top.get("hard_block"),
+                            "entry_eligible": bool(top.get("entry_eligible")),
                             "rank_margin": round(top_score - second_score, 4),
                         },
                         "all_symbols": [

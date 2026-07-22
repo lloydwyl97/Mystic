@@ -2382,8 +2382,14 @@ class PortfolioEngine:
 
     def _write_reconcile_state_file(self, actions: str) -> None:
         """Write last reconcile time/actions to a file for read-only harness (LIVE_RECONCILE_PROOF). Single known path."""
-        path = os.getenv("MYSTIC_RECONCILE_STATE_FILE", "/tmp/mystic_live_reconcile.json")
+        path = os.getenv(
+            "MYSTIC_RECONCILE_STATE_FILE",
+            "/home/mystic/mystic/logs/mystic_live_reconcile.json",
+        )
         try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             now_utc = datetime.now(timezone.utc).isoformat()
             payload = {
                 "time_epoch": time.time(),
@@ -3879,6 +3885,7 @@ class PortfolioEngine:
             ("average_entry_after_repair", "REAL DEFAULT 0"),
             ("original_position_cost", "REAL DEFAULT 0"),
             ("thesis_json", "TEXT DEFAULT ''"),
+            ("lowest_price", "REAL DEFAULT 0"),
         ]:
             if col_name not in pos_cols:
                 try:
@@ -4261,12 +4268,12 @@ class PortfolioEngine:
                         INSERT OR REPLACE INTO portfolio_engine_positions (
                             symbol, quantity, entry_price, entry_time, trade_id,
                             stop_price, take_profit_1_price, take_profit_2_price,
-                            trailing_stop_price, tp1_hit, highest_price,
+                            trailing_stop_price, tp1_hit, highest_price, lowest_price,
                             atr_at_entry, entry_bar_timestamp, confidence_at_entry,
                             entry_fee, sleeve, entry_strategy_id,
                             repair_add_count, last_repair_add_ts, repair_add_trade_ids,
                             average_entry_after_repair, original_position_cost, thesis_json, last_updated
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                         (
                             pos.symbol,
@@ -4280,6 +4287,7 @@ class PortfolioEngine:
                             pos.trailing_stop_price,
                             1 if pos.tp1_hit else 0,
                             pos.highest_price,
+                            float(getattr(pos, "lowest_price", 0.0) or 0.0),
                             pos.atr_at_entry,
                             pos.entry_bar_timestamp,
                             pos.confidence_at_entry,
@@ -5737,7 +5745,8 @@ class PortfolioEngine:
                            COALESCE(repair_add_trade_ids, '[]'),
                            COALESCE(average_entry_after_repair, 0),
                            COALESCE(original_position_cost, 0),
-                           COALESCE(thesis_json, '')
+                           COALESCE(thesis_json, ''),
+                           COALESCE(lowest_price, 0)
                     FROM portfolio_engine_positions
                 """)
                 rows = cursor.fetchall()
@@ -5775,6 +5784,9 @@ class PortfolioEngine:
                         thesis_payload = parsed_thesis
                 except (json.JSONDecodeError, TypeError, ValueError):
                     thesis_payload = {}
+            lowest_px = float(row[23]) if len(row) > 23 else 0.0
+            if lowest_px <= 0:
+                lowest_px = float(row[2] or 0.0)
             pos = OpenPosition(
                 symbol=normalized_symbol,
                 quantity=row[1],
@@ -5800,6 +5812,7 @@ class PortfolioEngine:
                 original_position_cost=orig_cost,
                 add_count=repair_cnt,
                 last_add_ts=last_repair_ts,
+                lowest_price=lowest_px,
                 entry_thesis=str(thesis_payload.get("entry_thesis") or ""),
                 thesis_score=float(thesis_payload.get("thesis_score") or 0.0),
                 thesis_invalid_level=float(thesis_payload.get("thesis_invalid_level") or 0.0),
