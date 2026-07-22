@@ -43,10 +43,12 @@ def main() -> int:
         if t not in tabs:
             failures.append(f"missing tab: {t}")
 
-    for asset in ("assets/mystic-logo.svg", "assets/hero-banner.svg", "vendor/chart.umd.min.js", "app.js?v=45"):
-        if "app.js" in asset and "app.js?v=" not in html:
-            failures.append(f"index.html missing script app.js?v=")
-        code, _ = get(f"/dashboard/{asset.split('?')[0]}")
+    if "app.js?v=" not in html:
+        failures.append("index.html missing script app.js?v=")
+    elif "app.js?v=53" not in html:
+        failures.append("index.html app.js cache-bust version expected v=53")
+    for asset in ("assets/mystic-logo.svg", "assets/hero-banner.svg", "vendor/chart.umd.min.js", "app.js"):
+        code, _ = get(f"/dashboard/{asset}")
         if code != 200:
             failures.append(f"asset {asset} HTTP {code}")
 

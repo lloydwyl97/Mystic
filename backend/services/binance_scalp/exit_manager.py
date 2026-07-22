@@ -55,8 +55,13 @@ def _meaningful_recovery(recovery: float, max_fav: float, econ: ScalpEconomics) 
     return recovery >= RECOVERY_MIN_PCT and max_fav >= target_progress * 0.4
 
 
-def _scratch_min_hold_sec() -> int:
-    return int(os.getenv("SCALP_SCRATCH_MIN_HOLD_SEC", "180"))
+def _scratch_min_hold_sec(setup_name: str | None = None) -> int:
+    base = int(os.getenv("SCALP_SCRATCH_MIN_HOLD_SEC", "180"))
+    name = (setup_name or "").strip().lower()
+    # range_bounce winners need longer to develop; early scratch was the loss driver.
+    if name == "range_bounce_scalp":
+        return int(os.getenv("SCALP_RANGE_SCRATCH_MIN_HOLD_SEC", str(max(base, 600))))
+    return base
 
 
 def _scratch_flat_upper_pct() -> float:
@@ -72,8 +77,12 @@ def _scratch_deep_loss_pct() -> float:
     return float(os.getenv("SCALP_SCRATCH_DEEP_LOSS_PCT", "-0.006"))
 
 
-def _scratch_min_reviews() -> int:
-    return int(os.getenv("SCALP_SCRATCH_MIN_REVIEWS", "1"))
+def _scratch_min_reviews(setup_name: str | None = None) -> int:
+    base = int(os.getenv("SCALP_SCRATCH_MIN_REVIEWS", "1"))
+    name = (setup_name or "").strip().lower()
+    if name == "range_bounce_scalp":
+        return int(os.getenv("SCALP_RANGE_SCRATCH_MIN_REVIEWS", str(max(base, 3))))
+    return base
 
 
 def _stall_exit_hold_frac() -> float:
@@ -112,9 +121,11 @@ def _early_scratch_exit(
     recovery: float,
     econ: ScalpEconomics,
     stale_review_count: int,
+    setup_name: str | None = None,
 ) -> tuple[bool, str]:
     """Exit flat/slightly-negative scalps that stall before hard max-hold."""
-    if hold_sec < _scratch_min_hold_sec() or hold_sec >= hard:
+    min_hold = _scratch_min_hold_sec(setup_name)
+    if hold_sec < min_hold or hold_sec >= hard:
         return False, ""
     if _meaningful_recovery(recovery, max_fav, econ):
         return False, ""
@@ -126,11 +137,11 @@ def _early_scratch_exit(
         return False, ""
     if not _scratchable_net(executable_net_pct, econ):
         return False, ""
-    min_reviews = _scratch_min_reviews()
+    min_reviews = _scratch_min_reviews(setup_name)
     trigger = _review_trigger_sec(econ)
     if hold_sec >= trigger and stale_review_count >= min_reviews:
         return True, "stalled_no_progress_review_scratch"
-    if hold_sec >= _scratch_min_hold_sec() + 90 and stale_review_count >= min_reviews:
+    if hold_sec >= min_hold + 90 and stale_review_count >= min_reviews:
         return True, "stalled_no_progress_early_scratch"
     return False, ""
 
@@ -145,6 +156,7 @@ def _stall_before_max_hold(
     recovery: float,
     econ: ScalpEconomics,
     stale_review_count: int,
+    setup_name: str | None = None,
 ) -> tuple[bool, str]:
     """Cut prolonged no-progress holds before the hard ceiling."""
     if hold_sec >= hard:
@@ -161,7 +173,7 @@ def _stall_before_max_hold(
         return False, ""
     if not _momentum_stalled(mom):
         return False, ""
-    if stale_review_count >= _scratch_min_reviews():
+    if stale_review_count >= _scratch_min_reviews(setup_name):
         return True, "stall_before_max_hold_no_progress"
     return False, ""
 
@@ -311,13 +323,14 @@ def evaluate_exit(
         recovery=recovery,
         econ=econ,
         stale_review_count=stale_review_count,
+        setup_name=track.setup_name,
     )
     if scratch:
         target_progress = econ.net_profit_target_pct * _scratch_progress_frac()
         diag_base["scratch_trigger_detail"] = scratch_reason
         diag_base["scratch_target_progress_pct"] = target_progress
-        diag_base["scratch_min_reviews"] = _scratch_min_reviews()
-        diag_base["scratch_min_hold_sec"] = _scratch_min_hold_sec()
+        diag_base["scratch_min_reviews"] = _scratch_min_reviews(track.setup_name)
+        diag_base["scratch_min_hold_sec"] = _scratch_min_hold_sec(track.setup_name)
         diag_base["scratch_momentum_stalled"] = _momentum_stalled(mom)
         diag_base["scratch_flat_or_slight_neg"] = _scratchable_net(executable_net_pct, econ)
         return _sell(STATE_RECOVERY_HOLD, scratch_reason, EXIT_EARLY_SCRATCH)
@@ -331,6 +344,7 @@ def evaluate_exit(
         recovery=recovery,
         econ=econ,
         stale_review_count=stale_review_count,
+        setup_name=track.setup_name,
     )
     if stall:
         diag_base["scratch_trigger_detail"] = stall_reason
@@ -372,7 +386,7 @@ def evaluate_exit(
     meaningful_rec = _meaningful_recovery(recovery, max_fav, econ)
     target_progress = econ.net_profit_target_pct * _scratch_progress_frac()
 
-    if stale_review_count >= _scratch_min_reviews() and max_fav < target_progress and _scratchable_net(executable_net_pct, econ) and momentum_stalled and not meaningful_rec:
+    if stale_review_count >= _scratch_min_reviews(track.setup_name) and max_fav < target_progress and _scratchable_net(executable_net_pct, econ) and momentum_stalled and not meaningful_rec:
         diag_base["scratch_trigger_detail"] = "review_stall_no_progress"
         return _sell(STATE_RECOVERY_HOLD, "review_stall_no_progress", EXIT_EARLY_SCRATCH)
 

@@ -76,7 +76,8 @@ class RangeBounceScalpStrategy:
             return reject_signal(ctx, self.name, "MOMENTUM_NOT_SUSTAINED")
         # Prefer sustained 60s mid lift so we don't enter pure 15s blips that
         # get early-scratched before the bounce develops.
-        if float(getattr(mom, "mid_change_60s", 0.0) or 0.0) < 0.0:
+        min_mid_60 = float(os.getenv("SCALP_RANGE_MIN_MID_CHANGE_60S", "0.0") or "0.0")
+        if float(getattr(mom, "mid_change_60s", 0.0) or 0.0) < min_mid_60:
             return reject_signal(ctx, self.name, "MOMENTUM_NOT_SUSTAINED")
 
         recovery = (cur - support) / cur if cur > 0 else 0

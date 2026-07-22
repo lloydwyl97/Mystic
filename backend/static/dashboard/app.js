@@ -1,5 +1,5 @@
 // Mystic Operator Console — dual-engine DAY + SCALP dashboard
-const DASHBOARD_VERSION = 52;
+const DASHBOARD_VERSION = 53;
 const REFRESH_MS = 90000;
 const CANONICAL_REFRESH_MS = 30000;
 const SECONDARY_POLL_MS = 3000;
@@ -16,6 +16,10 @@ const LAZY_TAB_ENDPOINTS = {
     learning: [
         { path: "/api/ai-diagnostics/full", key: "aiDiagnosticsFull", timeoutMs: SLOW_ENDPOINT_TIMEOUT_MS },
         { path: "/api/ai-diagnostics/learning-health", key: "learningHealth" },
+    ],
+    // Feature health panel lives under Settings — load diagnostics when that tab opens.
+    settings: [
+        { path: "/api/ai-diagnostics/full", key: "aiDiagnosticsFull", timeoutMs: SLOW_ENDPOINT_TIMEOUT_MS },
     ],
     performance: [],
     day: [
@@ -240,6 +244,10 @@ function initTradeFilters() {
 function applyTradeFilters() {
     const engine = (document.querySelector('input[name="engine-filter"]:checked') || {}).value || "all";
     const time = (document.querySelector('input[name="time-filter"]:checked') || {}).value || "all";
+    document.querySelectorAll("#tab-positions [data-engine]").forEach(function (el) {
+        const eng = el.getAttribute("data-engine");
+        el.hidden = engine !== "all" && eng !== engine;
+    });
     if (window._lastScalpTrades) updateScalpTradesTable(window._lastScalpTrades, time);
     if (window._lastDashboardCanonical && window._lastDashboardCanonical.performance) {
         updateTrades({ trades: window._lastDayTrades || window._lastDashboardCanonical.performance.trades || [] });
@@ -709,7 +717,7 @@ async function pollOne(ep) {
     }
     lastUpdateTime = new Date();
     try {
-        updateUI(ep.key, typeof data === "object" ? data : {});
+        updateUI(ep.key, typeof data === "object" ? data : {}, !!result.stale);
     } catch (err) {
         console.warn("Dashboard updateUI error for", ep.key, err);
     }
@@ -721,7 +729,7 @@ function updateHeaderMeta() {
     updateCurrentAccountSourceLabel(window._perfDisplayContext);
 }
 
-function updateUI(key, data) {
+function updateUI(key, data, stale) {
     switch (key) {
         case "dashboardCanonical":
             updateDashboardCanonical(data);
@@ -805,7 +813,7 @@ function updateUI(key, data) {
             updateTradingEconomics(data);
             break;
         case "scalpStatus":
-            updateScalpEngineStatus(data);
+            updateScalpEngineStatus(data, stale);
             break;
         case "scalpStrategies":
             updateScalpStrategies(data);
@@ -835,12 +843,19 @@ function updateUI(key, data) {
 }
 
 /** Scalp engine panel — never mixed into DAY scoreboard or DAY PnL. */
-function updateScalpEngineStatus(res) {
+function updateScalpEngineStatus(res, stale) {
     const d = res && typeof res === "object" ? res : {};
     const set = setCardText;
     const active = d.runner_active === true;
-    set("eng-scalp-status", active ? "RUNNING" : "STOPPED");
-    set("scalp-runner", active ? "RUNNING" : "STOPPED");
+    const statusLabel = stale ? (active ? "RUNNING (stale)" : "STOPPED (stale)") : (active ? "RUNNING" : "STOPPED");
+    set("eng-scalp-status", statusLabel);
+    set("scalp-runner", statusLabel);
+    ["eng-scalp-status", "scalp-runner"].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.title = stale ? "Showing last good SCALP status — live poll failed/timed out" : "";
+        el.classList.toggle("pnl-neg", !!stale);
+    });
     const pnl = d.pnl_summary || {};
     const today = pnl.today || {};
     const todayPnl = today.realized_pnl_usd != null ? Number(today.realized_pnl_usd) : null;
@@ -1013,7 +1028,10 @@ function updateScalpPositions(res) {
             el.classList.add(u >= 0 ? "pnl-pos" : "pnl-neg");
         }
     }
-    setCcScalpPositions(positions.length);
+    // Prefer open count from /api/scalp/status when available (authoritative).
+    if (!(window._lastScalpStatus && window._lastScalpStatus.open_scalp_positions != null)) {
+        setCcScalpPositions(positions.length);
+    }
 }
 
 function setCcScalpPositions(n) {
@@ -1035,7 +1053,12 @@ function updateScalpTradesTable(res, timeFilter) {
         if (!t.created_at) return false;
         const dt = new Date(t.created_at.replace(" ", "T") + "Z");
         if (timeFilter === "today") {
-            return dt.toDateString() === now.toDateString();
+            // Match DAY scoreboard: UTC calendar day, not local browser day.
+            const utcToday = todayUtcDateStr();
+            const y = dt.getUTCFullYear();
+            const m = String(dt.getUTCMonth() + 1).padStart(2, "0");
+            const day = String(dt.getUTCDate()).padStart(2, "0");
+            return (y + "-" + m + "-" + day) === utcToday;
         }
         if (timeFilter === "7d") {
             return now - dt < 7 * 86400000;
@@ -1389,18 +1412,26 @@ function updateDayBasketSignals(signals) {
     if (!tbody) return;
     const rows = Array.isArray(signals) ? signals : [];
     if (!rows.length) {
-        tbody.innerHTML = "<tr><td colspan=\"5\">No basket signals in Redis</td></tr>";
+        tbody.innerHTML = "<tr><td colspan=\"6\">No basket signals in Redis</td></tr>";
         return;
     }
     tbody.innerHTML = rows.map(function (s) {
-        const conf = s.confidence != null ? (Number(s.confidence) * 100).toFixed(1) + "%" : "--";
-        const action = s.action || s.signal || s.recommendation || "--";
-        const thesis = String(s.thesis || s.reason || s.setup || "--");
-        const fresh = s.stale === true ? "stale" : s.fresh === false ? "stale" : "ok";
-        return "<tr><td>" + (s.symbol || s.pair || "--") + "</td><td>" + action + "</td><td>" + conf +
-            "</td><td class=\"td-wrap\" title=\"" + thesis.replace(/"/g, "&quot;") + "\">" +
-            (thesis.length > 60 ? thesis.slice(0, 58) + "…" : thesis) +
-            "</td><td>" + fresh + "</td></tr>";
+        const conf = s.winner_probability != null || s.confidence != null
+            ? (Number(s.winner_probability != null ? s.winner_probability : s.confidence) * 100).toFixed(1) + "%"
+            : "--";
+        const bm = s.buy_margin != null ? Number(s.buy_margin) : null;
+        const margin = bm != null ? bm.toFixed(3) : "--";
+        const action = s.side || s.action || s.signal || s.recommendation || "--";
+        const regime = String(s.regime || s.ctx_market_regime || "--");
+        let fresh = "--";
+        if (s.stale === true || s.fresh === false) fresh = "stale";
+        else if (s.signal_age_sec != null) fresh = Number(s.signal_age_sec).toFixed(0) + "s";
+        else if (s.fresh === true) fresh = "ok";
+        const tip = "P(win)=" + conf + " buy_margin=" + margin +
+            " (buys need margin≥threshold; HOLD can have high P(win))";
+        return "<tr title=\"" + tip.replace(/"/g, "&quot;") + "\"><td>" + (s.symbol || s.pair || "--") +
+            "</td><td>" + action + "</td><td>" + conf + "</td><td>" + margin +
+            "</td><td>" + regime + "</td><td>" + fresh + "</td></tr>";
     }).join("");
 }
 
@@ -1717,6 +1748,8 @@ function updateScoreboardToday(data) {
     if (status && (String(status).toUpperCase() === "PASS" || String(status).toUpperCase() === "OK")) el.classList.add("pnl-pos");
     else if (status && String(status).toUpperCase() === "FAIL") el.classList.add("pnl-neg");
     else if (status && String(status).toUpperCase() === "PENDING") el.classList.add("pnl-pos");
+    el.dataset.fromCanonical = "1";
+    el.dataset.lastGood = el.textContent;
     window._lastScoreboardToday = d;
     refreshEnginesPanelFromCache();
 }
@@ -2096,6 +2129,10 @@ function updateScoreboard7d(data) {
         }
     }
     const scoreEl = document.getElementById("analytics-scoreboard");
+    // Prefer canonical scoreboard/today — do not let the 7d aggregate race overwrite it.
+    if (scoreEl && scoreEl.dataset.fromCanonical === "1") {
+        return;
+    }
     if (scoreEl) {
         const records = (d && d.daily_records) || [];
         const todayRow = records.find(function (r) {
@@ -2272,6 +2309,13 @@ function applyPerfDisplayContext(ctx) {
         if (title) el.title = title;
     }
     setMetric("analytics-principal", "$" + Number(ctx.ledger_principal).toFixed(0), "Ledger principal via display-context");
+    const cumTitle = document.getElementById("chart-cumulative-title");
+    if (cumTitle) {
+        cumTitle.textContent =
+            "Cumulative Returns — All-Time vs $" +
+            Number(ctx.ledger_principal).toLocaleString("en-US", { maximumFractionDigits: 0 }) +
+            " principal (DAY)";
+    }
     setMetric("analytics-equity", "$" + Number(ctx.total_equity).toFixed(2), "Ledger total equity via display-context");
     setMetric("analytics-cash", "$" + Number(ctx.cash_balance).toFixed(2), "Ledger cash via display-context");
     setMetric("status-cash", "$" + Number(ctx.cash_balance).toFixed(2), "DAY cash via display-context");

@@ -130,6 +130,7 @@ def evaluate_signal_hash_for_entry(dd: dict[str, str]) -> tuple[bool, str | None
     for k in (
         "signal_content_timestamp",
         "timestamp",
+        "writer_timestamp",
         "ts",
         "ts_utc",
         "content_timestamp",
@@ -144,15 +145,18 @@ def evaluate_signal_hash_for_entry(dd: dict[str, str]) -> tuple[bool, str | None
             break
 
     parsed_ts = _coerce_to_epoch(ts_raw) if ts_raw is not None else None
+    detail["max_signal_age_sec"] = MAX_SIGNAL_AGE_SEC
 
     if parsed_ts is not None and parsed_ts > 0:
         sig_age = time.time() - parsed_ts
         detail["signal_content_age_sec"] = sig_age
-        detail["max_signal_age_sec"] = MAX_SIGNAL_AGE_SEC
         if sig_age > float(MAX_SIGNAL_AGE_SEC):
             return False, "SIGNAL_CONTENT_AGE_EXCEEDED", detail
     else:
         # Fallback: if no usable absolute ts, but a direct age field is present and valid, use it.
+        # IMPORTANT: a valid in-limit age must continue to context checks — do not fall through
+        # to SIGNAL_CONTENT_TIMESTAMP_MISSING (live hashes often carry content_age_sec=0).
+        age_ok = False
         age_val = None
         for k in ("signal_content_age_sec", "content_age_sec", "signal_age_sec", "age_sec"):
             v = dd.get(k)
@@ -165,16 +169,17 @@ def evaluate_signal_hash_for_entry(dd: dict[str, str]) -> tuple[bool, str | None
                 detail["signal_content_age_sec"] = age
                 if age > float(MAX_SIGNAL_AGE_SEC):
                     return False, "SIGNAL_CONTENT_AGE_EXCEEDED", detail
-                # age present and within limit → treat as usable, do not fail the timestamp gate
+                if age >= 0.0:
+                    age_ok = True
+                    detail["timestamp_via"] = "content_age_fallback"
             except (TypeError, ValueError):
-                # fall through to missing/parse decision
-                pass
+                age_ok = False
 
-        # Distinguish missing vs unparsable
-        if ts_raw is None or str(ts_raw).strip() == "":
-            detail["timestamp_raw"] = None
-            return False, "SIGNAL_CONTENT_TIMESTAMP_MISSING", detail
-        else:
+        if not age_ok:
+            # Distinguish missing vs unparsable
+            if ts_raw is None or str(ts_raw).strip() == "":
+                detail["timestamp_raw"] = None
+                return False, "SIGNAL_CONTENT_TIMESTAMP_MISSING", detail
             detail["timestamp_raw"] = ts_raw
             return False, "SIGNAL_CONTENT_TIMESTAMP_PARSE", detail
 

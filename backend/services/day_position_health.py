@@ -45,6 +45,18 @@ def _api_to_ccxt(sym: str) -> str:
     return f"{s[:-4]}/USDT" if s.endswith("USDT") else sym
 
 
+def _decode_sig_str(raw_sig: dict, key: str) -> str:
+    v = raw_sig.get(key) or raw_sig.get(key.encode() if isinstance(key, str) else key)
+    if v is None:
+        return ""
+    if isinstance(v, bytes):
+        try:
+            return v.decode()
+        except Exception:
+            return ""
+    return str(v)
+
+
 def _redis_prices_and_signals() -> tuple[dict[str, float], list[dict[str, Any]]]:
     prices: dict[str, float] = {}
     signals: list[dict[str, Any]] = []
@@ -77,14 +89,33 @@ def _redis_prices_and_signals() -> tuple[dict[str, float], list[dict[str, Any]]]
 
             conf = _f("winner_probability") or _f("confidence")
             rs = _f("ctx_rs_btc") or _f("ctx_rs_eth")
-            side = str(raw_sig.get("prediction") or raw_sig.get("argmax_action") or "").upper()
+            side = _decode_sig_str(raw_sig, "side") or _decode_sig_str(raw_sig, "prediction") or _decode_sig_str(raw_sig, "argmax_action")
+            side = str(side).upper()
+            # buy_margin is the execution gate; winner_probability alone is often P(HOLD).
+            buy_margin = _f("buy_margin")
+            if buy_margin == 0.0 and (_f("prob_buy") or _f("prob_hold") or _f("prob_sell")):
+                buy_margin = _f("prob_buy") - max(_f("prob_hold"), _f("prob_sell"))
+            ts = _f("timestamp")
+            age_sec = max(0.0, time.time() - ts) if ts > 0 else None
+            ctx_age = _f("ctx_age_sec")
             signals.append(
                 {
                     "symbol": _api_to_ccxt(sym),
                     "confidence": conf,
+                    "winner_probability": conf,
+                    "buy_margin": buy_margin,
                     "ctx_rs_btc": rs,
                     "side": side,
+                    "action": side,
                     "prob_buy": _f("prob_buy"),
+                    "prob_hold": _f("prob_hold"),
+                    "prob_sell": _f("prob_sell"),
+                    "regime": _decode_sig_str(raw_sig, "regime_label") or _decode_sig_str(raw_sig, "regime"),
+                    "ctx_market_regime": _decode_sig_str(raw_sig, "ctx_market_regime"),
+                    "signal_age_sec": age_sec,
+                    "ctx_age_sec": ctx_age if ctx_age else None,
+                    "stale": bool(age_sec is not None and age_sec > 180.0),
+                    "fresh": bool(age_sec is None or age_sec <= 180.0),
                 }
             )
         signals.sort(key=lambda x: (x.get("ctx_rs_btc", 0), x.get("confidence", 0)), reverse=True)

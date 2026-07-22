@@ -11778,7 +11778,7 @@ class PortfolioEngine:
     # throughout that same window). Widening the bounded retry budget gives a
     # freshly-created connection pool room to finish connecting without
     # broadly changing the Redis client architecture.
-    _SIGNAL_FETCH_RETRY_BACKOFF_SEC: tuple[float, ...] = (0.05, 0.15, 0.3)
+    _SIGNAL_FETCH_RETRY_BACKOFF_SEC: tuple[float, ...] = (0.05, 0.15, 0.3, 0.6, 1.0)
 
     def _fetch_redis_ai_signal_string_map(self, strategy_id: str, symbol_bus_no_slash: str) -> dict[str, str]:
         """
@@ -11848,13 +11848,17 @@ class PortfolioEngine:
             dd["context_fresh_str"] = cf_raw
             patched.append("context_fresh")
 
-        for key in ("timestamp", "content_fresh", "content_age_sec", "signal_content_stale"):
+        for key in ("timestamp", "writer_timestamp", "content_fresh", "content_age_sec", "signal_content_stale"):
             raw = sig.get(key)
             if raw is None or str(raw).strip() == "":
                 continue
             dd[key] = str(raw).strip()
             if key not in patched:
                 patched.append(key)
+        # Prefer canonical timestamp; writer_timestamp is a cold-start/TTL fallback.
+        if not str(dd.get("timestamp") or "").strip() and str(dd.get("writer_timestamp") or "").strip():
+            dd["timestamp"] = str(dd["writer_timestamp"]).strip()
+            patched.append("timestamp")
 
         for key in ("feature_version", "feature_dim"):
             raw = sig.get(key)
@@ -11986,6 +11990,14 @@ class PortfolioEngine:
             sig = self._fetch_redis_ai_signal_string_map(strategy_id, sym_bus)
             if sig:
                 self._merge_redis_signal_entry_audit_into_decision_data(dd, sig)
+            # Redis TTL/delete race: hash briefly empty even though inference just ran.
+            # Fall back to latest ai_inference_log row for signal-content timestamp only.
+            if not str(dd.get("timestamp") or "").strip():
+                fb = self._latest_inference_fallback(ccxt_symbol, strategy_id)
+                if isinstance(fb, dict):
+                    for key in ("timestamp", "writer_timestamp", "content_age_sec", "content_fresh"):
+                        if not str(dd.get(key) or "").strip() and fb.get(key) not in (None, ""):
+                            dd[key] = str(fb[key])
 
         from backend.services.ai_context_freshness_sync import apply_overlay_to_explainability, overlay_live_context_freshness
 
@@ -12013,8 +12025,9 @@ class PortfolioEngine:
                 explainability.feature_dim = int(dd["feature_dim"])
             except (TypeError, ValueError):
                 pass
-        if dd.get("timestamp"):
-            explainability.signal_content_timestamp = str(dd["timestamp"])
+        ts_val = dd.get("timestamp") or dd.get("writer_timestamp")
+        if ts_val:
+            explainability.signal_content_timestamp = str(ts_val)
         if dd.get("content_fresh") in ("0", "1"):
             explainability.signal_content_fresh = str(dd["content_fresh"])
         if dd.get("content_age_sec") not in (None, ""):
@@ -12038,7 +12051,7 @@ class PortfolioEngine:
                     """
                     SELECT decision_id, prediction, argmax_action, prob_buy, prob_hold, prob_sell,
                            winner_prob_raw, confidence, buy_margin, ctx_json, feature_version,
-                           features_json, model_artifact
+                           features_json, model_artifact, ts_utc
                     FROM ai_inference_log
                     WHERE LOWER(strategy_id)=LOWER(?)
                       AND UPPER(REPLACE(symbol, '/', ''))=UPPER(?)
@@ -12068,7 +12081,8 @@ class PortfolioEngine:
                     feature_dim = len(parsed)
         except Exception:
             feature_dim = None
-        return {
+        ts_utc = str(row[13] or "").strip() if len(row) > 13 else ""
+        out = {
             "decision_id": str(row[0] or ""),
             "prediction": str(row[1] or ""),
             "argmax_action": str(row[2] or ""),
@@ -12084,6 +12098,11 @@ class PortfolioEngine:
             "ctx_json": ctx_payload,
             "model_artifact_path": str(row[12] or ""),
         }
+        if ts_utc:
+            out["timestamp"] = ts_utc
+            out["writer_timestamp"] = ts_utc
+            out["content_fresh"] = "1"
+        return out
 
     def _get_cached_market_price(self, symbol: str) -> float:
         """Canonical price reader for entry decisions.

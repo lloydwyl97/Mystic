@@ -47,7 +47,7 @@
             <div class="status-item"><span class="status-label">DAY Cash</span><span class="status-value" id="status-cash">--</span></div>
             <div class="status-item"><span class="status-label">DAY Equity</span><span class="status-value" id="status-equity">--</span></div>
             <div class="status-item"><span class="status-label">DAY Positions</span><span class="status-value" id="status-positions">--</span></div>
-            <div class="status-item"><span class="status-label">Infra</span><span class="status-value" id="status-health">--</span></div>
+            <div class="status-item"><span class="status-label">Account</span><span class="status-value" id="status-health">--</span></div>
         </section>
         <section class="status-bar status-bar--secondary">
             <div class="status-item"><span class="status-label">Risk</span><span class="status-value" id="status-risk">--</span></div>
@@ -88,7 +88,7 @@
                 <div class="readiness-card"><span class="readiness-label">DAY vs principal</span><span class="readiness-value" id="eng-account-pnl">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Kill switch</span><span class="readiness-value" id="cc-kill-switch">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Live readiness</span><span class="readiness-value" id="cc-live-ready">--</span></div>
-                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Latest DAY decision</span><span class="readiness-value" id="cc-day-decision">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">DAY capital idle reason</span><span class="readiness-value" id="cc-day-decision">--</span></div>
                 <div class="readiness-card readiness-card--span2"><span class="readiness-label">Latest SCALP decision</span><span class="readiness-value" id="cc-scalp-decision">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Unrealized (DAY)</span><span class="readiness-value" id="cc-day-unrealized">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Unrealized (SCALP)</span><span class="readiness-value" id="cc-scalp-unrealized">--</span></div>
@@ -114,11 +114,11 @@
     <div class="tab-panel" id="tab-day" role="tabpanel" hidden>
         <section class="widget widget--full">
             <h2 class="widget__title">Top-4 basket signals</h2>
-            <p class="widget__subtitle">BTC / ETH / SOL / XRP — from /api/portfolio-engine/day-health basket_signals</p>
+            <p class="widget__subtitle">BTC / ETH / SOL / XRP — Redis ai_signal:day:* (Action=side; P(win)≠buy edge; Margin=P_buy−max(P_hold,P_sell))</p>
             <div class="widget__table-wrap widget__table-wrap--scroll">
                 <table class="positions-table">
-                    <thead><tr><th>Symbol</th><th>Action</th><th>Conf</th><th>Thesis</th><th>Fresh</th></tr></thead>
-                    <tbody id="day-basket-tbody"><tr><td colspan="5">--</td></tr></tbody>
+                    <thead><tr><th>Symbol</th><th>Action</th><th>P(win)</th><th>Margin</th><th>Regime</th><th>Fresh</th></tr></thead>
+                    <tbody id="day-basket-tbody"><tr><td colspan="6">--</td></tr></tbody>
                 </table>
             </div>
         </section>
@@ -289,7 +289,7 @@
             </div>
         </section>
         <section class="widget-row">
-            <div class="widget widget--half">
+            <div class="widget widget--half" data-engine="day">
                 <h2 class="widget__title">Open DAY positions</h2>
                 <p class="widget__subtitle">DAY ledger only — canonical snapshot.</p>
                 <div class="widget__table-wrap">
@@ -300,7 +300,7 @@
                     <p class="widget__no-data" id="positions-no-data">No open DAY positions</p>
                 </div>
             </div>
-            <div class="widget widget--half">
+            <div class="widget widget--half" data-engine="scalp">
                 <h2 class="widget__title">Open SCALP positions</h2>
                 <p class="widget__subtitle">SCALP paper ledger — separate from DAY.</p>
                 <div class="widget__table-wrap">
@@ -311,7 +311,7 @@
                 </div>
             </div>
         </section>
-        <section class="widget widget--full">
+        <section class="widget widget--full" data-engine="day">
             <h2 class="widget__title">Closed DAY trades</h2>
             <div class="widget__table-wrap widget__table-wrap--scroll">
                 <table class="positions-table">
@@ -321,7 +321,7 @@
                 <p class="widget__no-data" id="trades-no-data">No DAY trades yet</p>
             </div>
         </section>
-        <section class="widget widget--full">
+        <section class="widget widget--full" data-engine="scalp">
             <h2 class="widget__title">Closed SCALP trades</h2>
             <div class="widget__table-wrap widget__table-wrap--scroll">
                 <table class="positions-table">
@@ -393,7 +393,7 @@
             <div class="mini-card"><span class="mini-card__label">Visible-history Realized</span><span class="mini-card__value" id="analytics-realized">--</span></div>
             <div class="mini-card"><span class="mini-card__label">Unrealized (open positions)</span><span class="mini-card__value" id="analytics-unrealized">--</span></div>
             <div class="mini-card"><span class="mini-card__label">Accounting history</span><span class="mini-card__value" id="analytics-history-status">--</span></div>
-            <div class="mini-card"><span class="mini-card__label">Infra health (canonical)</span><span class="mini-card__value" id="analytics-risk-status">--</span></div>
+            <div class="mini-card"><span class="mini-card__label">Account status (canonical)</span><span class="mini-card__value" id="analytics-risk-status">--</span></div>
         </section>
 
         <section class="analytics-row" aria-label="Today Performance — UTC calendar day only">
@@ -425,7 +425,7 @@
                     <div class="widget__chart-wrap"><canvas id="chart-daily-returns"></canvas><p class="widget__no-data" id="daily-returns-no-data">No data</p></div>
                 </div>
                 <div class="widget widget--half">
-                    <h2 class="widget__title">Cumulative Returns — All-Time vs $25,000 principal (DAY)</h2>
+                    <h2 class="widget__title" id="chart-cumulative-title">Cumulative Returns — All-Time vs ledger principal (DAY)</h2>
                     <div class="widget__chart-wrap"><canvas id="chart-cumulative-returns"></canvas><p class="widget__no-data" id="cumulative-no-data">No data</p></div>
                 </div>
             </section>
@@ -523,6 +523,6 @@
     </div>
 
     <script src="vendor/chart.umd.min.js?v=4.4.1"></script>
-    <script src="app.js?v=52"></script>
+    <script src="app.js?v=53"></script>
 </body>
 </html>

@@ -39,10 +39,35 @@ def test_coerce_nested_explain_like():
 
 
 def test_fallback_to_age_when_no_ts():
-    dd = {"content_fresh": "1", "signal_content_age_sec": "10"}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    dd = {
+        "content_fresh": "1",
+        "signal_content_age_sec": "10",
+        "context_fresh": "1",
+        "ctx_age_sec": "5",
+        "ctx_ts_utc": now_iso,
+        "feature_version": "1",
+    }
     ok, reason, detail = evaluate_signal_hash_for_entry(dd)
-    # age 10s is well under max; should not fail on timestamp
-    assert ok is True or reason != "SIGNAL_CONTENT_TIMESTAMP_PARSE"
+    # age 10s is well under max; must not fail closed on timestamp missing/parse
+    assert reason not in ("SIGNAL_CONTENT_TIMESTAMP_MISSING", "SIGNAL_CONTENT_TIMESTAMP_PARSE")
+    assert ok is True
+
+
+def test_fallback_to_zero_content_age_when_no_ts():
+    """Live Redis hashes often emit content_age_sec=0; that must not mean MISSING."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    dd = {
+        "content_fresh": "1",
+        "content_age_sec": "0",
+        "context_fresh": "1",
+        "ctx_age_sec": "5",
+        "ctx_ts_utc": now_iso,
+        "feature_version": "1",
+    }
+    ok, reason, detail = evaluate_signal_hash_for_entry(dd)
+    assert reason != "SIGNAL_CONTENT_TIMESTAMP_MISSING"
+    assert ok is True
 
 
 def test_missing_ts_gives_missing():

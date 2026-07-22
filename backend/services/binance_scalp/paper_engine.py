@@ -604,10 +604,14 @@ class BinanceScalpPaperEngine:
         from backend.services.day_trade_thesis import scalp_strategy_to_thesis
 
         thesis_fields = scalp_strategy_to_thesis(sig.setup_name, sig.setup_context or {})
+        soft_rank_entry = bool((sig.setup_context or {}).get("soft_rank_entry", False))
         entry_diag = {
             "setup_name": sig.setup_name,
             "setup_context": sig.setup_context,
             "setup_signal": sig.as_dict(),
+            "passed": bool(sig.passed),
+            "soft_rank_entry": soft_rank_entry,
+            "entry_eligible": bool(sig.passed) and not soft_rank_entry,
             "selected_symbol": sym,
             "symbol_ranking": ranking_meta,
             "review_lows": [],
@@ -644,13 +648,14 @@ class BinanceScalpPaperEngine:
                 json.dumps(
                     {
                         "setup": sig.as_dict(),
+                        "setup_signal": sig.as_dict(),
                         "paper_limit": True,
                         "selected_symbol": sym,
                         # Persist pass/soft-rank tags on the BUY row so closed-trade
                         # analytics do not depend on open-position diagnostics alone.
                         "passed": bool(sig.passed),
-                        "soft_rank_entry": bool((sig.setup_context or {}).get("soft_rank_entry", False)),
-                        "entry_eligible": True,
+                        "soft_rank_entry": soft_rank_entry,
+                        "entry_eligible": bool(sig.passed) and not soft_rank_entry,
                         "setup_name": sig.setup_name,
                         "rank_score": ranking_meta.get("rank_score"),
                         "selection_confidence": ranking_meta.get("selection_confidence"),
@@ -842,16 +847,39 @@ class BinanceScalpPaperEngine:
             entry_diag = {}
         setup_signal = entry_diag.get("setup_signal") if isinstance(entry_diag, dict) else None
         if not isinstance(setup_signal, dict):
+            setup_signal = entry_diag.get("setup") if isinstance(entry_diag, dict) else None
+        if not isinstance(setup_signal, dict):
             setup_signal = {}
+        # Backfill tags from matching BUY row when older position diags omit them.
+        buy_diag: dict = {}
+        try:
+            buy_row = conn.execute(
+                "SELECT diagnostics_json FROM scalp_paper_trades WHERE trade_id = ? AND upper(side) = 'BUY' LIMIT 1",
+                (trade_id,),
+            ).fetchone()
+            if buy_row and buy_row[0]:
+                buy_diag = json.loads(buy_row[0]) if isinstance(buy_row[0], str) else {}
+        except Exception:
+            buy_diag = {}
+        if not isinstance(buy_diag, dict):
+            buy_diag = {}
+        passed = bool(
+            setup_signal.get("passed", entry_diag.get("passed", buy_diag.get("passed", False)))
+        )
+        soft_rank_entry = bool(
+            setup_signal.get(
+                "soft_rank_entry",
+                entry_diag.get("soft_rank_entry", buy_diag.get("soft_rank_entry", False)),
+            )
+        )
         sell_diag = {
             "preflight": pf_dict,
             "paper_limit": True,
             "exit_gate": exit_gate,
-            "passed": bool(setup_signal.get("passed", entry_diag.get("passed", False))),
-            "soft_rank_entry": bool(
-                setup_signal.get("soft_rank_entry", entry_diag.get("soft_rank_entry", False))
-            ),
-            "setup_name": entry_diag.get("setup_name") or strategy_id,
+            "passed": passed,
+            "soft_rank_entry": soft_rank_entry,
+            "entry_eligible": bool(passed) and not soft_rank_entry,
+            "setup_name": entry_diag.get("setup_name") or buy_diag.get("setup_name") or strategy_id,
             "entry_setup_signal": setup_signal,
             "scalp_setup": entry_diag.get("scalp_setup"),
             "micro_regime": entry_diag.get("micro_regime"),
