@@ -62,7 +62,7 @@ class ScalpConfig:
             scalp_live=_bool("SCALP_LIVE", False),
             fee_model_verified=_bool("SCALP_FEE_MODEL_VERIFIED", False),
             max_open_positions=int(os.getenv("SCALP_MAX_OPEN_POSITIONS", "1")),
-            max_notional_paper=float(os.getenv("SCALP_MAX_NOTIONAL_PAPER", "25")),
+            max_notional_paper=float(os.getenv("SCALP_MAX_NOTIONAL_PAPER", "150")),
             allow_repair_add=_bool("SCALP_ALLOW_REPAIR_ADD", False),
             allow_market_orders=_bool("SCALP_ALLOW_MARKET_ORDERS", False),
             strategy_id="scalp",

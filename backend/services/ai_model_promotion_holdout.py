@@ -134,7 +134,12 @@ def load_symbol_holdout_rows(
         net = _row_net_pnl(row)
         if net is None:
             continue
-        xs.append([float(x) for x in feats])
+        try:
+            from backend.services.day_feature_health import zero_learning_blocked_feature_dims
+
+            xs.append(zero_learning_blocked_feature_dims([float(x) for x in feats]))
+        except Exception:
+            xs.append([float(x) for x in feats])
         ys.append(_outcome_label(row))
         nets.append(float(net))
         gbs.append(str(row["good_bad_memory_class"] or "").strip().upper())

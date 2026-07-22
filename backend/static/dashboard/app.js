@@ -1,5 +1,5 @@
 // Mystic Operator Console — dual-engine DAY + SCALP dashboard
-const DASHBOARD_VERSION = 53;
+const DASHBOARD_VERSION = 54;
 const REFRESH_MS = 90000;
 const CANONICAL_REFRESH_MS = 30000;
 const SECONDARY_POLL_MS = 3000;
@@ -1178,7 +1178,8 @@ function updateProcessHealth(res) {
         ldcEl.textContent = running ? "UP (optional)" : "RETIRED";
         ldcEl.title = ldc.note || "Retired/optional — not part of start_mystic.sh core; OHLCV via live_market_data.";
         ldcEl.classList.remove("status-up", "status-down");
-        ldcEl.classList.add(running ? "status-up" : "status-down");
+        // Retired is expected — do not paint as DOWN/red.
+        if (running) ldcEl.classList.add("status-up");
     }
     const redisEl = document.getElementById("ph-redis");
     if (redisEl) {

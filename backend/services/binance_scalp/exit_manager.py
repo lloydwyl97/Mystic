@@ -386,7 +386,15 @@ def evaluate_exit(
     meaningful_rec = _meaningful_recovery(recovery, max_fav, econ)
     target_progress = econ.net_profit_target_pct * _scratch_progress_frac()
 
-    if stale_review_count >= _scratch_min_reviews(track.setup_name) and max_fav < target_progress and _scratchable_net(executable_net_pct, econ) and momentum_stalled and not meaningful_rec:
+    scratch_ready = hold_sec >= _scratch_min_hold_sec(track.setup_name)
+    if (
+        scratch_ready
+        and stale_review_count >= _scratch_min_reviews(track.setup_name)
+        and max_fav < target_progress
+        and _scratchable_net(executable_net_pct, econ)
+        and momentum_stalled
+        and not meaningful_rec
+    ):
         diag_base["scratch_trigger_detail"] = "review_stall_no_progress"
         return _sell(STATE_RECOVERY_HOLD, "review_stall_no_progress", EXIT_EARLY_SCRATCH)
 
@@ -402,7 +410,14 @@ def evaluate_exit(
     if invalidated and below_entry and momentum_negative and not meaningful_rec:
         return _sell(EXIT_SETUP_INVALIDATED, inv_reason or "setup_invalidated", EXIT_SETUP_INVALIDATED)
 
-    if below_entry and momentum_stalled and not hl and not meaningful_rec and stale_review_count >= 1:
+    if (
+        scratch_ready
+        and below_entry
+        and momentum_stalled
+        and not hl
+        and not meaningful_rec
+        and stale_review_count >= 1
+    ):
         return _sell(EXIT_MOMENTUM_FAILED, "no_recovery_negative_momentum", EXIT_MOMENTUM_FAILED)
 
     if not below_entry:

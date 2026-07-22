@@ -134,6 +134,20 @@ def feature_allows_learning(feature_name: str, meta: dict[str, Any] | None = Non
     return bool(meta.get("learning_allowed", True))
 
 
+def zero_learning_blocked_feature_dims(feats: list[float] | tuple[float, ...]) -> list[float]:
+    """Zero proxy/unsupported dims so train, serve, and holdout share one contract."""
+    out = [float(x) for x in feats]
+    for i in range(len(out)):
+        try:
+            name = _feature_name_at(i)
+        except Exception:
+            continue
+        base = str(name or "").replace("_ohlcv_proxy", "")
+        if base in LEARNING_BLOCKED_FEATURE_NAMES or name in LEARNING_BLOCKED_FEATURE_NAMES:
+            out[i] = 0.0
+    return out
+
+
 def entry_feature_health_pass(explainability: dict[str, Any] | None) -> bool:
     """True when entry signal carried a passing feature health sidecar."""
     if not explainability:
@@ -154,4 +168,5 @@ __all__ = [
     "entry_feature_health_pass",
     "feature_allows_learning",
     "sidecar_redis_fields",
+    "zero_learning_blocked_feature_dims",
 ]

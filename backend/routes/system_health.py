@@ -287,7 +287,7 @@ async def get_process_health() -> dict[str, Any]:
     ``live_data_collector`` is retired/optional — OHLCV lives in live_market_data.
     """
     checks = {
-        "uvicorn": _process_running("uvicorn"),
+        "uvicorn": _process_running("uvicorn backend.main:app") or _process_running("backend.main:app"),
         "live_market_data": _process_running("start_live_market_data.py"),
         "ai_signal_generator": _process_running("start_ai_signal_generator.py"),
         "portfolio_engine": _process_running("start_portfolio_engine_integration.py"),

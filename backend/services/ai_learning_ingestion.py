@@ -637,7 +637,8 @@ def label_pending_snapshots(db_path: str = DATABASE_PATH) -> dict[str, int]:
             FROM ai_candidate_snapshots
             WHERE label_status IN ('PENDING', 'PARTIAL')
               AND epoch_ms <= ?
-            ORDER BY epoch_ms ASC
+            ORDER BY CASE WHEN label_status='PENDING' THEN 0 ELSE 1 END,
+                     CASE WHEN label_status='PENDING' THEN epoch_ms ELSE -epoch_ms END ASC
             LIMIT ?
             """,
             (now_ms - 15 * 60 * 1000, LABEL_BATCH_LIMIT),

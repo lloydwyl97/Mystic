@@ -142,9 +142,15 @@ def enrich_scalp_ranked_candidates(
         merged = dict(row)
         merged["intelligence"] = intel
         merged["final_scalp_selection_score"] = intel.get("final_scalp_selection_score")
+        # Apply intelligence into the score pick_best_global_candidate actually uses.
+        base_rank = float(merged.get("rank_score") or 0.0)
+        intel_delta = float(intel.get("intelligence_rank_delta") or 0.0)
+        merged["rank_score_raw"] = base_rank
+        merged["rank_score"] = round(base_rank + intel_delta, 6)
         enriched.append(merged)
     enriched.sort(
         key=lambda r: (
+            -float(r.get("rank_score") or 0),
             -float((r.get("intelligence") or {}).get("final_scalp_selection_score") or 0),
             float(getattr(r.get("snap"), "spread_pct", 1.0) or 1.0),
         )

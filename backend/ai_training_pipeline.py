@@ -338,20 +338,11 @@ def _live_strategy_from_outcome_row(strategy_id_val: str | None, context_json_va
 def _zero_learning_blocked_feature_dims(feats: list[float]) -> list[float]:
     """Zero proxy/unsupported dims so RF cannot learn from dishonest tape features."""
     try:
-        from backend.services.day_feature_health import LEARNING_BLOCKED_FEATURE_NAMES, _feature_name_at
+        from backend.services.day_feature_health import zero_learning_blocked_feature_dims
+
+        return zero_learning_blocked_feature_dims(feats)
     except Exception:
-        return feats
-    out = list(feats)
-    for i in range(len(out)):
-        try:
-            name = _feature_name_at(i)
-        except Exception:
-            continue
-        # Strip proxy display suffix for membership check.
-        base = str(name or "").replace("_ohlcv_proxy", "")
-        if base in LEARNING_BLOCKED_FEATURE_NAMES or name in LEARNING_BLOCKED_FEATURE_NAMES:
-            out[i] = 0.0
-    return out
+        return list(feats)
 
 
 def _outcome_exit_class_multiplier(row: dict[str, Any], y_label: int) -> float:

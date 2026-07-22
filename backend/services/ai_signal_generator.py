@@ -805,6 +805,12 @@ class RealTimeAISignalGenerator:
             )
 
             # Scale features
+            try:
+                from backend.services.day_feature_health import zero_learning_blocked_feature_dims
+
+                features = zero_learning_blocked_feature_dims(features)
+            except Exception:
+                pass
             features_scaled = self.scalers[slot].transform([features])
 
             # Make prediction

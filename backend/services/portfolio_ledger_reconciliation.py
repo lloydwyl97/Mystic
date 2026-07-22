@@ -30,7 +30,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-DATABASE_PATH = "mystic_trading.db"
+try:
+    from backend.database_schema import DATABASE_PATH as _CANONICAL_DB_PATH
+
+    DATABASE_PATH = _CANONICAL_DB_PATH
+except Exception:
+    DATABASE_PATH = "/home/mystic/mystic/mystic_trading.db"
 
 
 @dataclass

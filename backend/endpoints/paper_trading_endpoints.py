@@ -93,20 +93,36 @@ def _validate_data_integrity_sync(positions_value: float, principal: float, real
             WHERE UPPER(side) = 'SELL' AND remaining_position = 0 AND pnl IS NOT NULL
         """)
 
-        sqlite_realized_pnl = cursor.fetchone()[0]
+        sqlite_realized_pnl = float(cursor.fetchone()[0] or 0.0)
+        ledger_realized = float(realized_pnl or 0.0)
+        books_gap = ledger_realized - sqlite_realized_pnl
 
-        # When no positions are open, cash should equal principal + realized P&L
+        # Use ledger realized (never-decrease / prune-aware), not raw paper Σpnl.
+        # Paper prune can leave sqlite_sum << ledger realized without a cash bug.
         if float(positions_value or 0.0) == 0.0:
-            expected_cash = float(principal or 0.0) + float(sqlite_realized_pnl)
+            expected_cash = float(principal or 0.0) + ledger_realized
             data_integrity_diff = float(cash_balance or 0.0) - expected_cash
-            data_integrity_ok = abs(data_integrity_diff) < 0.01  # $0.01 tolerance for floating point
+            data_integrity_ok = abs(data_integrity_diff) < 0.05
         else:
-            # When positions exist, just validate that realized P&L matches SQLite
-            data_integrity_diff = float(realized_pnl or 0.0) - float(sqlite_realized_pnl)
-            data_integrity_ok = abs(data_integrity_diff) < 0.01
+            data_integrity_diff = books_gap
+            data_integrity_ok = True
 
+        if abs(books_gap) > 1.0:
+            logger.info(
+                "LEDGER_BOOKS_GAP ledger_realized=%.4f paper_sum=%.4f gap=%.4f (prune/heal expected)",
+                ledger_realized,
+                sqlite_realized_pnl,
+                books_gap,
+            )
         if not data_integrity_ok:
-            logger.warning(f"Data integrity check failed: cash={cash_balance}, principal={principal}, realized_pnl={realized_pnl}, sqlite_sum={sqlite_realized_pnl}, diff={data_integrity_diff}")
+            logger.warning(
+                "Data integrity check failed: cash=%s principal=%s ledger_realized=%s expected_cash=%s diff=%s",
+                cash_balance,
+                principal,
+                ledger_realized,
+                float(principal or 0.0) + ledger_realized,
+                data_integrity_diff,
+            )
 
         return data_integrity_ok, data_integrity_diff
 

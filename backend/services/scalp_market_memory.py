@@ -121,9 +121,19 @@ def update_scalp_market_memory_on_close_sync(
         mem["same_scalp_setup_today_count"] = 0
         mem["same_scalp_setup_today_net_pnl"] = 0.0
         mem["_memory_day"] = day
-    if str(mem.get("last_scalp_setup_seen") or "") == setup:
-        mem["same_scalp_setup_today_count"] = int(mem.get("same_scalp_setup_today_count") or 0) + 1
-        mem["same_scalp_setup_today_net_pnl"] = float(mem.get("same_scalp_setup_today_net_pnl") or 0) + float(net_pnl)
+        # Daily window for per-setup expectancy (was unbounded).
+        for k in list(mem.keys()):
+            if str(k).startswith("setup_pnl::") or str(k).startswith("setup_n::"):
+                mem.pop(k, None)
+    setup_l = (setup or "").strip().lower()
+    if setup_l:
+        if str(mem.get("last_scalp_setup_seen") or "").strip().lower() == setup_l:
+            mem["same_scalp_setup_today_count"] = int(mem.get("same_scalp_setup_today_count") or 0) + 1
+            mem["same_scalp_setup_today_net_pnl"] = float(mem.get("same_scalp_setup_today_net_pnl") or 0) + float(net_pnl)
+        else:
+            mem["same_scalp_setup_today_count"] = 1
+            mem["same_scalp_setup_today_net_pnl"] = float(net_pnl)
+        mem["last_scalp_setup_seen"] = setup_l
     mem["last_scalp_setup_result"] = "win" if net_pnl > 0 else "loss"
     wins = float(mem.get("_recent_wins") or 0)
     total = float(mem.get("_recent_total") or 0) + 1
@@ -135,7 +145,6 @@ def update_scalp_market_memory_on_close_sync(
     prev_avg = float(mem.get("recent_scalp_avg_hold_time") or 0)
     mem["recent_scalp_avg_hold_time"] = round((prev_avg * (total - 1) + hold_seconds) / total, 1) if total else hold_seconds
     mem["recent_scalp_slippage"] = round(slippage, 6)
-    setup_l = (setup or "").strip().lower()
     if setup_l:
         pnl_key = f"setup_pnl::{setup_l}"
         n_key = f"setup_n::{setup_l}"
@@ -147,21 +156,24 @@ def update_scalp_market_memory_on_close_sync(
 def memory_rank_delta(memory: dict[str, Any], setup: str) -> float:
     if not memory:
         return 0.0
+    setup_l = (setup or "").strip().lower()
     same_pnl = float(memory.get("same_scalp_setup_today_net_pnl") or 0.0)
     win_rate = float(memory.get("recent_scalp_win_rate") or 0.0)
-    setup_key = f"setup_pnl::{(setup or '').strip().lower()}"
+    setup_key = f"setup_pnl::{setup_l}"
     setup_pnl = float(memory.get(setup_key) or 0.0)
-    setup_n = int(memory.get(f"setup_n::{(setup or '').strip().lower()}") or 0)
+    setup_n = int(memory.get(f"setup_n::{setup_l}") or 0)
     delta = 0.0
-    if same_pnl > 0.5:
-        delta += 0.025
-    elif same_pnl < -0.5:
-        delta -= 0.03
+    # same_* only applies when scoring the setup that earned those closes today.
+    if setup_l and str(memory.get("last_scalp_setup_seen") or "").strip().lower() == setup_l:
+        if same_pnl > 0.5:
+            delta += 0.025
+        elif same_pnl < -0.5:
+            delta -= 0.03
     if win_rate > 0.55:
         delta += 0.015
-    elif win_rate < 0.35 and win_rate > 0:
+    elif 0 < win_rate < 0.35:
         delta -= 0.02
-    # Per-setup expectancy from recent closes (range_bounce was the loss driver).
+    # Per-setup expectancy from today's closes (range_bounce was the loss driver).
     if setup_n >= 3:
         if setup_pnl <= -1.0:
             delta -= 0.04

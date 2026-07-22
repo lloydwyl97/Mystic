@@ -375,7 +375,15 @@ def _global_tie_key(row: dict[str, Any]) -> tuple:
     soft_tier = _soft_base_score(soft.split(":")[0] if soft else None)
     intel = row.get("intelligence") or {}
     mem_delta = float(intel.get("memory_rank_delta") or 0)
-    win_rate = float(intel.get("recent_scalp_win_rate") or intel.get("same_scalp_setup_today_net_pnl") or 0)
+    # Do not treat win_rate=0.0 as missing (falsy) and fall through to dollar PnL.
+    _wr = intel.get("recent_scalp_win_rate")
+    if _wr is None:
+        win_rate = float(intel.get("same_scalp_setup_today_net_pnl") or 0)
+    else:
+        try:
+            win_rate = float(_wr)
+        except (TypeError, ValueError):
+            win_rate = 0.0
     regime_native = 1 if meta.get("regime_native") else 0
     mom = row.get("mom")
     m15 = float(getattr(mom, "mid_change_15s", 0) or 0) if mom else 0.0

@@ -10242,14 +10242,15 @@ class PortfolioEngine:
 
             # Update high/low watermarks (for MFE/MAE diagnostics)
             old_high = position.highest_price
+            old_low = float(getattr(position, "lowest_price", 0.0) or 0.0)
             position.highest_price = max(position.highest_price, current_price)
             if not hasattr(position, "lowest_price") or position.lowest_price <= 0:
                 position.lowest_price = min(position.entry_price, current_price)
             else:
                 position.lowest_price = min(position.lowest_price, current_price)
 
-            # Persist watermark changes so they survive restarts
-            if position.highest_price > old_high:
+            # Persist either watermark so MAE/wick-stop memory survives restarts
+            if position.highest_price > old_high or float(position.lowest_price or 0.0) < old_low or old_low <= 0:
                 profile = get_coin_profile(symbol)
                 from backend.services.day_controlled_exits import refresh_trailing_stop
 
@@ -10528,7 +10529,7 @@ class PortfolioEngine:
                 run_protected_preflight,
             )
 
-            live_capable = bool(self._live_execution_enabled and self._live_service and is_live_execution_allowed_sync()[0])
+            live_capable = bool(self._live_execution_enabled and self._live_service and is_live_execution_allowed_sync())
             pf = await run_protected_preflight(
                 symbol=symbol,
                 side="SELL",
@@ -13300,14 +13301,19 @@ class PortfolioEngine:
                 _bm_val = float(_bm_raw) if _bm_raw is not None else float("nan")
             except (TypeError, ValueError):
                 _bm_val = float("nan")
-            if not _bm_fail and (not math.isfinite(_bm_val) or _bm_val < _bm_thr):
+            # Wire BAR_EXEC_* absolute floor (was env-loaded but unused).
+            _bm_thr_eff = float(_bm_thr)
+            if BAR_EXEC_ENFORCE_BUY_MARGIN:
+                _bm_thr_eff = max(_bm_thr_eff, float(BAR_EXEC_ABSOLUTE_MIN_BUY_MARGIN))
+            if not _bm_fail and (not math.isfinite(_bm_val) or _bm_val < _bm_thr_eff):
                 logger.info(
-                    "BUY_MARGIN_TELEMETRY #%d: %s BUY_MARGIN %.6f < %.6f (sleeve=%s)%s",
+                    "BUY_MARGIN_TELEMETRY #%d: %s BUY_MARGIN %.6f < %.6f (sleeve=%s abs_floor=%.4f)%s",
                     _rank_idx + 1,
                     _sym,
                     _bm_val,
-                    _bm_thr,
+                    _bm_thr_eff,
                     _sleeve or Sleeve.ACTIVE.value,
+                    float(BAR_EXEC_ABSOLUTE_MIN_BUY_MARGIN),
                     " -> BLOCKED" if ENABLE_PROFITABILITY_ENFORCEMENT else " -> penalty only",
                 )
                 _cand.decision_data = dict(_cand.decision_data or {})

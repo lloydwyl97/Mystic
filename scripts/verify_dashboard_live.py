@@ -45,8 +45,8 @@ def main() -> int:
 
     if "app.js?v=" not in html:
         failures.append("index.html missing script app.js?v=")
-    elif "app.js?v=53" not in html:
-        failures.append("index.html app.js cache-bust version expected v=53")
+    elif "app.js?v=54" not in html:
+        failures.append("index.html app.js cache-bust version expected v=54")
     for asset in ("assets/mystic-logo.svg", "assets/hero-banner.svg", "vendor/chart.umd.min.js", "app.js"):
         code, _ = get(f"/dashboard/{asset}")
         if code != 200:
