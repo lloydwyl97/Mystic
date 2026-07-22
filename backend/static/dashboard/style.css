@@ -123,6 +123,13 @@ body {
     border-color: rgba(43, 49, 57, 0.6); 
 }
 
+.header__mode.live-test {
+    color: #f59e0b;
+    border-color: rgba(245, 158, 11, 0.6);
+    background: linear-gradient(135deg, rgba(245, 158, 11, 0.15) 0%, rgba(245, 158, 11, 0.08) 100%);
+    box-shadow: 0 0 20px rgba(245, 158, 11, 0.2);
+}
+
 .header__mode--clickable {
     cursor: pointer;
     transition: all var(--transition-base);

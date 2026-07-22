@@ -11,6 +11,13 @@
     <link rel="stylesheet" href="style.css?v=40">
 </head>
 <body>
+    <!-- Feature 4: Restart Required Banner -->
+    <div id="restart-banner" style="display:none;background:#f59e0b;color:#000;padding:12px;text-align:center;font-weight:bold;position:relative;z-index:1000">
+        ⚠️ Live flags written. Service restart required to activate real orders.
+        <button id="btn-trigger-restart" style="margin-left:16px;padding:4px 12px;border:1px solid #000;background:rgba(0,0,0,0.15);cursor:pointer;font-weight:bold">Restart Now</button>
+        <span id="restart-countdown" style="margin-left:12px;font-size:13px"></span>
+    </div>
+
     <header class="header">
         <img class="header__logo" src="assets/mystic-logo.svg" alt="Mystic" loading="eager" width="44" height="44" />
         <span class="header__title">Mystic Operator Console</span>
@@ -55,6 +62,15 @@
             <div class="status-item"><span class="status-label">Latency</span><span class="status-value" id="status-latency">--</span></div>
             <div class="status-item"><span class="status-label">Market heartbeat</span><span class="status-value" id="status-market-heartbeat">--</span></div>
         </section>
+
+        <!-- Feature 1: Live Binance Balance Widget (visible in LIVE / LIVE-TEST mode only) -->
+        <div id="live-balance-section" style="display:none">
+            <section class="status-bar" aria-label="Live Binance balance">
+                <div class="status-item"><span class="status-label">Binance USDT (free)</span><span class="status-value" id="live-binance-usdt">--</span></div>
+                <div class="status-item"><span class="status-label">Last Sync</span><span class="status-value" id="live-balance-sync-time">--</span></div>
+                <div class="status-item"><button id="btn-sync-binance" class="operator-form__btn" style="font-size:12px;padding:4px 10px">Sync Now</button></div>
+            </section>
+        </div>
 
         <section class="widget widget--full">
             <h2 class="widget__title">System health</h2>
@@ -488,6 +504,23 @@
                 <div class="operator-form__actions"><button type="submit" class="operator-form__btn">Save operator settings</button><span id="op-config-status" class="operator-form__status" aria-live="polite"></span></div>
             </form>
         </section>
+        <!-- Feature 2: Live-Test Mode Card -->
+        <section class="widget widget--full" id="live-test-card">
+            <h2 class="widget__title">Live-Test Mode</h2>
+            <p class="widget__subtitle">Safety caps for tiny live orders. Changes take effect on next buy attempt (no restart needed for notional/position caps). Enabling LIVE_TEST_MODE itself requires .env change + restart.</p>
+            <div class="operator-form__grid">
+                <label class="operator-form__field operator-form__field--check"><input type="checkbox" id="lt-enabled" disabled /><span>Live-Test Active (runtime read-only — set LIVE_TEST_MODE=true in .env)</span></label>
+                <label class="operator-form__field"><span>Max Notional ($)</span><input type="number" id="lt-max-notional" value="25" min="10" max="500" step="1" /></label>
+                <label class="operator-form__field"><span>Max Open Positions</span><input type="number" id="lt-max-positions" value="4" min="1" max="4" step="1" /></label>
+                <label class="operator-form__field operator-form__field--check"><input type="checkbox" id="lt-require-arm" checked disabled /><span>Require Manual Arm (set via LIVE_TEST_REQUIRE_MANUAL_ARM)</span></label>
+                <label class="operator-form__field operator-form__field--check" id="lt-arm-row"><input type="checkbox" id="lt-manual-arm" /><span>Arm for This Session (live_test_manual_arm)</span></label>
+            </div>
+            <div class="operator-form__actions">
+                <button type="button" id="btn-save-live-test" class="operator-form__btn">Save Live-Test Config</button>
+                <span id="lt-save-status" class="operator-form__status" style="margin-left:10px" aria-live="polite"></span>
+            </div>
+        </section>
+
         <section class="widget widget--full">
             <h2 class="widget__title">Live readiness</h2>
             <div class="readiness-grid" id="live-readiness-grid">

@@ -172,6 +172,9 @@ function init() {
     initRefreshButton();
     initTradeFilters();
     setupHistoricalDiagnosticsToggle();
+    initLiveBalanceWidget();
+    initLiveTestCard();
+    initRestartBanner();
 }
 
 const ENDPOINT_FRESHNESS = {};
@@ -251,6 +254,9 @@ function initTabs() {
                 lazy.forEach(function (ep, i) {
                     setTimeout(function () { pollOne(ep); }, i * 400);
                 });
+            }
+            if (tab === "settings") {
+                setTimeout(loadLiveTestConfig, 200);
             }
         });
     });
@@ -437,6 +443,10 @@ function initModeSwitch() {
             if (data.success && data.data) {
                 updateExecutionMode(data);
                 pollOne(CANONICAL_ENDPOINT);
+                const status = data.data.status || data.status || "";
+                if (status === "restart_required") {
+                    showRestartBanner();
+                }
             } else {
                 const reason = responseErrorMessage(data, "unknown");
                 const failures = (data.readiness && data.readiness.failures) ? data.readiness.failures.join(", ") : "";
@@ -445,6 +455,49 @@ function initModeSwitch() {
         } catch (e) {
             alert("Error: " + (e && e.message ? e.message : "network error"));
         }
+    });
+}
+
+function showRestartBanner() {
+    const banner = document.getElementById("restart-banner");
+    if (banner) banner.style.display = "block";
+}
+
+function hideRestartBanner() {
+    const banner = document.getElementById("restart-banner");
+    if (banner) banner.style.display = "none";
+}
+
+function initRestartBanner() {
+    const btn = document.getElementById("btn-trigger-restart");
+    if (!btn) return;
+    btn.addEventListener("click", async function () {
+        if (!confirm("Restart the backend service now? The dashboard will auto-reload in ~15 seconds.")) return;
+        const token = prompt("Enter ADMIN_TOKEN to restart:");
+        if (!token) return;
+        btn.disabled = true;
+        const countdown = document.getElementById("restart-countdown");
+        if (countdown) countdown.textContent = "Restarting…";
+        try {
+            await fetch("/api/system/restart", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    Authorization: "Bearer " + token,
+                },
+            });
+        } catch (_) {
+            // Expected — service restarts and connection drops
+        }
+        let secs = 15;
+        const tick = setInterval(function () {
+            secs -= 1;
+            if (countdown) countdown.textContent = "Reconnecting in " + secs + "s…";
+            if (secs <= 0) {
+                clearInterval(tick);
+                window.location.reload();
+            }
+        }, 1000);
     });
 }
 
@@ -2255,33 +2308,63 @@ function updateRegime(data) {
     badge.className = "header__regime header__regime--" + (regime === "bull" ? "bull" : regime === "bear" ? "bear" : "neutral");
 }
 
-// execution-mode: { success, data: { execution_mode, live_trades_allowed, effective_mode, real_orders_enabled } }
+// execution-mode: { success, data: { execution_mode, live_trades_allowed, effective_mode, real_orders_enabled, live_test_mode_active } }
 function updateExecutionMode(data) {
     const d = data.data || data;
     if (!d) return;
     const effective = (d.effective_mode || d.execution_mode || "PAPER").toLowerCase();
+    const liveTestActive = !!(d.live_test_mode_active);
     const badge = document.getElementById("mode-badge");
     if (badge) {
-        badge.textContent = effective === "live" ? "LIVE" : "PAPER";
-        badge.className = "header__mode header__mode--clickable " + effective;
-        badge.dataset.effectiveMode = effective;
+        if (liveTestActive) {
+            badge.textContent = "LIVE-TEST";
+            badge.className = "header__mode header__mode--clickable live-test";
+            badge.dataset.effectiveMode = "live-test";
+        } else if (effective === "live") {
+            badge.textContent = "LIVE";
+            badge.className = "header__mode header__mode--clickable live";
+            badge.dataset.effectiveMode = "live";
+        } else {
+            badge.textContent = "PAPER";
+            badge.className = "header__mode header__mode--clickable paper";
+            badge.dataset.effectiveMode = "paper";
+        }
         badge.dataset.realOrdersEnabled = d.real_orders_enabled ? "1" : "0";
+    }
+    const liveSection = document.getElementById("live-balance-section");
+    if (liveSection) {
+        liveSection.style.display = (effective === "live" || liveTestActive) ? "block" : "none";
     }
 }
 
-// operator-status: { success, data: { mode, cash_balance, total_equity, open_positions_count, account_status } }
+// operator-status: { success, data: { mode, cash_balance, total_equity, open_positions_count, account_status, live_test_mode_active } }
 // NOTE: Open Positions table is driven by dashboard-canonical; operator count fills in when canonical is still loading.
 function updateOperator(data) {
     const d = data.data || data;
     const mode = (d.mode || "PAPER").toLowerCase();
+    const liveTestActive = !!(d.live_test_mode_active);
     const badge = document.getElementById("mode-badge");
     if (badge) {
-        badge.textContent = mode === "live" ? "LIVE" : "PAPER";
-        badge.className = "header__mode header__mode--clickable " + mode;
-        badge.dataset.effectiveMode = mode;
+        if (liveTestActive) {
+            badge.textContent = "LIVE-TEST";
+            badge.className = "header__mode header__mode--clickable live-test";
+            badge.dataset.effectiveMode = "live-test";
+        } else if (mode === "live") {
+            badge.textContent = "LIVE";
+            badge.className = "header__mode header__mode--clickable live";
+            badge.dataset.effectiveMode = "live";
+        } else {
+            badge.textContent = "PAPER";
+            badge.className = "header__mode header__mode--clickable paper";
+            badge.dataset.effectiveMode = "paper";
+        }
         if (d.real_orders_enabled !== undefined) {
             badge.dataset.realOrdersEnabled = d.real_orders_enabled ? "1" : "0";
         }
+    }
+    const liveSection = document.getElementById("live-balance-section");
+    if (liveSection) {
+        liveSection.style.display = (mode === "live" || liveTestActive) ? "block" : "none";
     }
     const cash = document.getElementById("status-cash");
     if (cash && d.cash_balance != null) cash.textContent = "$" + Number(d.cash_balance).toFixed(2);
@@ -2942,6 +3025,147 @@ function updateSleeveStatus(data) {
             '</div>';
     }
     container.innerHTML = html;
+}
+
+// ─── Feature 1: Live Binance Balance ─────────────────────────────────────────
+
+async function fetchLiveBalance() {
+    const btn = document.getElementById("btn-sync-binance");
+    const usdtEl = document.getElementById("live-binance-usdt");
+    const timeEl = document.getElementById("live-balance-sync-time");
+    let token = localStorage.getItem("mystic_admin_token");
+    if (!token) {
+        token = prompt("Enter ADMIN_TOKEN to sync from Binance:");
+        if (!token) return;
+        localStorage.setItem("mystic_admin_token", token);
+    }
+    if (btn) btn.disabled = true;
+    try {
+        const res = await fetch("/api/portfolio-engine/sync-from-binance", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: "Bearer " + token,
+            },
+        });
+        const data = await res.json();
+        if (data.success) {
+            const after = data.after || {};
+            if (usdtEl) usdtEl.textContent = after.cash != null ? "$" + Number(after.cash).toFixed(2) : "--";
+            if (timeEl) timeEl.textContent = new Date().toLocaleTimeString();
+        } else {
+            const msg = responseErrorMessage(data, "Sync failed");
+            if (usdtEl) usdtEl.textContent = msg;
+            if (msg.includes("401") || msg.includes("Unauthorized")) {
+                localStorage.removeItem("mystic_admin_token");
+            }
+        }
+    } catch (e) {
+        if (usdtEl) usdtEl.textContent = e && e.message ? e.message : "Error";
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+function initLiveBalanceWidget() {
+    const btn = document.getElementById("btn-sync-binance");
+    if (btn) btn.addEventListener("click", fetchLiveBalance);
+}
+
+// ─── Feature 2: Live-Test Mode Controls ──────────────────────────────────────
+
+function fillLiveTestConfigForm(d) {
+    if (!d) return;
+    const ltEnabled = document.getElementById("lt-enabled");
+    const ltNotional = document.getElementById("lt-max-notional");
+    const ltPositions = document.getElementById("lt-max-positions");
+    const ltRequireArm = document.getElementById("lt-require-arm");
+    const ltManualArm = document.getElementById("lt-manual-arm");
+    if (ltEnabled) ltEnabled.checked = !!(d.live_test_mode || d.live_test_mode_active);
+    if (ltNotional && d.live_test_max_notional != null) ltNotional.value = d.live_test_max_notional;
+    if (ltPositions && d.live_test_max_open_positions != null) ltPositions.value = d.live_test_max_open_positions;
+    if (ltRequireArm) ltRequireArm.checked = d.live_test_require_manual_arm !== false;
+    if (ltManualArm) ltManualArm.checked = !!(d.live_test_manual_arm);
+    const armRow = document.getElementById("lt-arm-row");
+    if (armRow) armRow.style.display = (d.live_test_require_manual_arm !== false) ? "flex" : "none";
+}
+
+async function loadLiveTestConfig() {
+    try {
+        const [cfgRes, modeRes] = await Promise.all([
+            fetch("/api/portfolio-engine/operator-config", { cache: "no-cache" }),
+            fetch("/api/portfolio-engine/execution-mode", { cache: "no-cache" }),
+        ]);
+        const cfg = await cfgRes.json();
+        const mode = await modeRes.json();
+        const merged = Object.assign({}, (cfg.success && cfg.data) ? cfg.data : {}, (mode.success && mode.data) ? mode.data : {});
+        fillLiveTestConfigForm(merged);
+    } catch (e) {
+        console.warn("loadLiveTestConfig failed:", e);
+    }
+}
+
+async function saveLiveTestConfig() {
+    const statusEl = document.getElementById("lt-save-status");
+    let token = localStorage.getItem("mystic_admin_token");
+    if (!token) {
+        token = prompt("Enter ADMIN_TOKEN to save Live-Test config:");
+        if (!token) return;
+        localStorage.setItem("mystic_admin_token", token);
+    }
+    const payload = {
+        live_test_max_notional: Number(document.getElementById("lt-max-notional").value),
+        live_test_max_open_positions: Number(document.getElementById("lt-max-positions").value),
+        live_test_manual_arm: !!(document.getElementById("lt-manual-arm").checked),
+    };
+    if (statusEl) {
+        statusEl.textContent = "Saving…";
+        statusEl.className = "operator-form__status";
+    }
+    try {
+        const res = await fetch("/api/portfolio-engine/operator-config", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: "Bearer " + token,
+            },
+            body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (data.success && data.data) {
+            fillLiveTestConfigForm(data.data);
+            fillOperatorConfigForm(data.data);
+            if (statusEl) {
+                statusEl.textContent = "Saved — active without restart.";
+                statusEl.className = "operator-form__status operator-form__status--ok";
+            }
+        } else {
+            const msg = responseErrorMessage(data, "Save failed");
+            if (statusEl) {
+                statusEl.textContent = msg;
+                statusEl.className = "operator-form__status operator-form__status--err";
+            }
+            if (res.status === 401) localStorage.removeItem("mystic_admin_token");
+        }
+    } catch (e) {
+        if (statusEl) {
+            statusEl.textContent = e && e.message ? e.message : "Network error";
+            statusEl.className = "operator-form__status operator-form__status--err";
+        }
+    }
+}
+
+function initLiveTestCard() {
+    const saveBtn = document.getElementById("btn-save-live-test");
+    if (saveBtn) saveBtn.addEventListener("click", saveLiveTestConfig);
+
+    const requireArm = document.getElementById("lt-require-arm");
+    const armRow = document.getElementById("lt-arm-row");
+    if (requireArm && armRow) {
+        requireArm.addEventListener("change", function () {
+            armRow.style.display = requireArm.checked ? "flex" : "none";
+        });
+    }
 }
 
 if (document.readyState === "loading") {

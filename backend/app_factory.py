@@ -1091,6 +1091,28 @@ def create_app() -> FastAPI:
         resume_trading()
         return {"status": "resumed", "message": "Live trading is now RESUMED - trades can execute", "timestamp": datetime.now(timezone.utc).isoformat()}
 
+    @app.post("/api/system/restart")
+    async def restart_service_endpoint(_: None = Depends(require_admin_key)):
+        """
+        Restart the Mystic service in the background.
+        Used after writing new env flags (e.g. paper→live flip) to apply changes.
+        Returns immediately; the subprocess runs detached so this response can be delivered.
+        """
+        import subprocess
+        repo_root = Path(__file__).resolve().parent.parent
+        script = str(repo_root / "stop_mystic.sh")
+        start_script = str(repo_root / "start_mystic.sh")
+        subprocess.Popen(
+            f"bash -c 'sleep 1 && {script} && sleep 2 && {start_script} core'",
+            shell=True,
+            cwd=str(repo_root),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        logger.info("[RESTART] Service restart triggered via /api/system/restart")
+        return {"success": True, "message": "Service restarting in background"}
+
     @app.get("/api/system/trading-status")
     async def get_trading_status():
         """Check if trading is paused or active"""

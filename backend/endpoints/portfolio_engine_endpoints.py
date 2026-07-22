@@ -1553,30 +1553,51 @@ async def get_execution_mode_status() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def _write_env_vars(updates: dict) -> None:
+    """Read .env, update/append key=value lines, write back."""
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env")
+    try:
+        with open(env_path) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+    result = []
+    found: set[str] = set()
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            result.append(line)
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key in updates:
+            result.append(f"{key}={updates[key]}\n")
+            found.add(key)
+        else:
+            result.append(line)
+    for key, val in updates.items():
+        if key not in found:
+            result.append(f"{key}={val}\n")
+    with open(env_path, "w") as f:
+        f.writelines(result)
+
+
 @router.post("/execution-mode")
 async def set_execution_mode(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
     """
     Set execution mode. Body: { "mode": "paper"|"live", "live_trades_allowed": bool }.
-    - mode=paper: simulation only
-    - mode=live + live_trades_allowed=false: live pipeline, no real orders
-    - mode=live + live_trades_allowed=true: real orders (human flip)
+
+    - mode=paper: write paper flags to .env, return restart_required
+    - mode=live: validate API keys, write live flags to .env, return restart_required
 
     Switching TO live requires ADMIN_TOKEN authentication.
-    Switching to paper is always allowed.
+    The upfront check_live_readiness() gate is intentionally removed — it required
+    LIVE_EXECUTION=true at process start, creating a chicken-and-egg deadlock when
+    starting from a paper boot.  Env flags are validated here directly instead.
     """
     try:
-        from backend.services.execution_mode_service import (
-            get_execution_status,
-            set_live_trades_allowed,
-        )
-        from backend.services.execution_mode_service import (
-            set_execution_mode as svc_set_mode,
-        )
-
         mode = (payload.get("mode") or "").strip().lower()
-        allowed = payload.get("live_trades_allowed")
 
-        going_live = (mode == "live") or (allowed is True)
+        going_live = mode == "live"
         if going_live:
             from backend.middleware.security import AdminAuthMiddleware
 
@@ -1587,23 +1608,59 @@ async def set_execution_mode(request: Request, payload: dict[str, Any]) -> dict[
                     headers={"WWW-Authenticate": "Bearer"},
                 )
 
-            from backend.services.execution_mode_service import check_live_readiness
-
-            readiness = await check_live_readiness()
-            if not readiness["ready"]:
+            # Validate required secrets exist in the environment
+            missing = [k for k in ("BINANCE_API_KEY", "BINANCE_SECRET_KEY", "ADMIN_TOKEN") if not os.getenv(k)]
+            if missing:
                 return {
                     "success": False,
-                    "error": "Live readiness check failed",
-                    "readiness": readiness,
+                    "error": f"Missing required env vars: {', '.join(missing)}",
+                    "status": "validation_failed",
                 }
 
-        if mode and mode in ("paper", "live"):
-            await svc_set_mode(mode)
-        if allowed is not None:
-            await set_live_trades_allowed(bool(allowed))
-        status = await get_execution_status()
-        logger.info("Execution mode changed: %s (by %s)", status, "admin" if going_live else "user")
-        return {"success": True, "data": status}
+            _write_env_vars(
+                {
+                    "TRADING_MODE": "live",
+                    "MYSTIC_TRADING_MODE": "live",
+                    "LIVE_EXECUTION": "true",
+                    "LIVE_TRADES_ALLOWED": "true",
+                    "FULL_LIVE_CONFIRMED": "true",
+                    "EXECUTION_MODE": "live",
+                }
+            )
+            logger.info("Execution mode: live flags written to .env (restart required)")
+            return {
+                "success": True,
+                "status": "restart_required",
+                "message": (
+                    "Live flags written to .env. Service must restart to activate real order placement. "
+                    "Use /api/system/restart to apply."
+                ),
+            }
+
+        if mode == "paper":
+            _write_env_vars(
+                {
+                    "TRADING_MODE": "paper",
+                    "MYSTIC_TRADING_MODE": "paper",
+                    "LIVE_EXECUTION": "false",
+                    "LIVE_TRADES_ALLOWED": "false",
+                    "FULL_LIVE_CONFIRMED": "false",
+                    "EXECUTION_MODE": "paper",
+                }
+            )
+            logger.info("Execution mode: paper flags written to .env (restart required)")
+            return {
+                "success": True,
+                "status": "restart_required",
+                "message": (
+                    "Paper flags written to .env. Service must restart to deactivate live orders. "
+                    "Use /api/system/restart to apply."
+                ),
+            }
+
+        # Fallback: unknown mode
+        return {"success": False, "error": f"Unknown mode '{mode}'. Use 'paper' or 'live'."}
+
     except HTTPException:
         raise
     except Exception as e:

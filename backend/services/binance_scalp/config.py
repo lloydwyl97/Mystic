@@ -40,6 +40,9 @@ class ScalpConfig:
     disabled_strategies: frozenset[str]
     daily_loss_limit_pct: float
     max_consecutive_losses: int
+    scalp_live_armed: bool
+    scalp_live_max_notional: float
+    scalp_live_max_open: int
 
     @classmethod
     def from_env(cls) -> ScalpConfig:
@@ -88,13 +91,25 @@ class ScalpConfig:
             ),
             daily_loss_limit_pct=float(os.getenv("SCALP_DAILY_LOSS_LIMIT_PCT", "0.05")),
             max_consecutive_losses=int(os.getenv("SCALP_MAX_CONSECUTIVE_LOSSES", "5")),
+            scalp_live_armed=_bool("SCALP_LIVE_ARMED", False),
+            scalp_live_max_notional=float(os.getenv("SCALP_LIVE_MAX_NOTIONAL", "50.0")),
+            scalp_live_max_open=int(os.getenv("SCALP_LIVE_MAX_OPEN", "2")),
         )
 
     def assert_no_live_trading(self) -> None:
-        if self.scalp_live:
-            raise RuntimeError("SCALP_LIVE must remain false in Phase 1. No scalp live orders.")
-        if self.allow_market_orders:
-            raise RuntimeError("SCALP_ALLOW_MARKET_ORDERS must remain false.")
+        """Hard block: raises if live trading attempted without proper arming.
+
+        - SCALP_LIVE=false  →  always safe (paper mode, no-op).
+        - SCALP_LIVE=true + SCALP_LIVE_ARMED=false  →  raises (misconfigured live attempt).
+        - SCALP_LIVE=true + SCALP_LIVE_ARMED=true   →  passes (engine was explicitly armed).
+        """
+        if self.scalp_live and not os.getenv("SCALP_LIVE_ARMED", "false").lower() == "true":
+            raise RuntimeError(
+                "SCALP_LIVE=true but SCALP_LIVE_ARMED is not set. "
+                "Set SCALP_LIVE_ARMED=true and arm the engine explicitly before live trading."
+            )
+        if self.allow_market_orders and not self.scalp_live:
+            raise RuntimeError("SCALP_ALLOW_MARKET_ORDERS must remain false in paper mode.")
         if self.calibration_mode and self.scalp_live:
             raise RuntimeError("SCALP_CALIBRATION_MODE requires SCALP_LIVE=false")
 

@@ -188,6 +188,7 @@ logger_bootstrap.info(
 logger_bootstrap.warning(f"🚨 LIVE TRADING SAFETY MODE ENABLED: position_multiplier={LIVE_TRADING_SAFETY_MULTIPLIER}, max_positions={MAX_OPEN_POSITIONS}")
 # =========================================================================
 MIN_POSITION_NOTIONAL = float(os.getenv("MIN_POSITION_NOTIONAL", "11.0"))  # Binance US min=10, use 11 for safety
+MAX_POSITION_SIZE_USD = float(os.getenv("MAX_POSITION_SIZE_USD", "0"))  # 0 = disabled; set >0 to cap any single buy
 # Entry/roundtrip cost buffers for effective min notional (buy-side only uses ENTRY_COST_PCT)
 ENTRY_COST_PCT = float(os.getenv("ENTRY_COST_PCT", "0.0018"))  # Buy-side buffer
 # Low-cash deploy-to-min mode (avoids dead-zone when cash ~ min notional)
@@ -7300,6 +7301,15 @@ class PortfolioEngine:
         notional = quantity * fill_price
         total_cost = notional + fee
 
+        # Hard per-position size cap — respects MAX_POSITION_SIZE_USD env var (0 = disabled)
+        if MAX_POSITION_SIZE_USD > 0 and total_cost > MAX_POSITION_SIZE_USD:
+            total_cost = MAX_POSITION_SIZE_USD
+            qty = total_cost / fill_price
+            quantity = qty
+            fee = quantity * fill_price * exec_fee_rate
+            total_cost = quantity * fill_price + fee
+            logger.info(f"[SIZE_CAP] {symbol} capped to MAX_POSITION_SIZE_USD=${MAX_POSITION_SIZE_USD:.2f} qty={quantity:.6f}")
+
         # ACCOUNTING REPAIR: Calculate slippage as total cost (not price delta)
         # This must be consistent across paper_trades, audit, and internal counters
         slippage_cost = (fill_price - price) * quantity
@@ -10144,6 +10154,15 @@ class PortfolioEngine:
                         return False, "HOLD_CONSEC_LOSSES"
             except Exception as _lh_err:
                 logger.debug("loss_hold check skipped: %s", _lh_err)
+
+        # Informational: log if position would be capped by MAX_POSITION_SIZE_USD
+        if MAX_POSITION_SIZE_USD > 0 and notional_usd > MAX_POSITION_SIZE_USD:
+            logger.info(
+                "[SIZE_CAP_PREVIEW] %s notional=$%.2f would be capped to MAX_POSITION_SIZE_USD=$%.2f",
+                symbol,
+                notional_usd,
+                MAX_POSITION_SIZE_USD,
+            )
 
         return True, "OK"
 
