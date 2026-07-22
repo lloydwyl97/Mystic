@@ -135,6 +135,12 @@ def update_scalp_market_memory_on_close_sync(
     prev_avg = float(mem.get("recent_scalp_avg_hold_time") or 0)
     mem["recent_scalp_avg_hold_time"] = round((prev_avg * (total - 1) + hold_seconds) / total, 1) if total else hold_seconds
     mem["recent_scalp_slippage"] = round(slippage, 6)
+    setup_l = (setup or "").strip().lower()
+    if setup_l:
+        pnl_key = f"setup_pnl::{setup_l}"
+        n_key = f"setup_n::{setup_l}"
+        mem[pnl_key] = float(mem.get(pnl_key) or 0.0) + float(net_pnl)
+        mem[n_key] = int(mem.get(n_key) or 0) + 1
     save_scalp_market_memory_sync(redis_client, symbol, mem)
 
 
@@ -143,16 +149,27 @@ def memory_rank_delta(memory: dict[str, Any], setup: str) -> float:
         return 0.0
     same_pnl = float(memory.get("same_scalp_setup_today_net_pnl") or 0.0)
     win_rate = float(memory.get("recent_scalp_win_rate") or 0.0)
+    setup_key = f"setup_pnl::{(setup or '').strip().lower()}"
+    setup_pnl = float(memory.get(setup_key) or 0.0)
+    setup_n = int(memory.get(f"setup_n::{(setup or '').strip().lower()}") or 0)
     delta = 0.0
     if same_pnl > 0.5:
-        delta += 0.02
+        delta += 0.025
     elif same_pnl < -0.5:
-        delta -= 0.02
+        delta -= 0.03
     if win_rate > 0.55:
-        delta += 0.01
+        delta += 0.015
     elif win_rate < 0.35 and win_rate > 0:
-        delta -= 0.01
-    return round(max(-0.04, min(0.04, delta)), 4)
+        delta -= 0.02
+    # Per-setup expectancy from recent closes (range_bounce was the loss driver).
+    if setup_n >= 3:
+        if setup_pnl <= -1.0:
+            delta -= 0.04
+        elif setup_pnl <= -0.3:
+            delta -= 0.025
+        elif setup_pnl >= 0.8:
+            delta += 0.02
+    return round(max(-0.06, min(0.05, delta)), 4)
 
 
 __all__ = [

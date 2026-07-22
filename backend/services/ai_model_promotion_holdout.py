@@ -226,6 +226,8 @@ def evaluate_artifact_on_holdout(
     profit = sum(followed_pnls) / sample_count if sample_count else None
     win_rate = wins / sample_count if sample_count else None
     bad_rate = bad / sample_count if sample_count else None
+    # Precision among predicted BUYs (what matters for buy_margin edge).
+    buy_precision = (wins / buy_count) if buy_count > 0 else None
 
     return {
         "accuracy": round(accuracy, 6) if accuracy is not None else None,
@@ -233,6 +235,7 @@ def evaluate_artifact_on_holdout(
         "avg_net_pnl_pct_if_followed": round(profit, 6) if profit is not None else None,
         "win_rate_after_cost_if_followed": round(win_rate, 6) if win_rate is not None else None,
         "bad_trade_rate_if_followed": round(bad_rate, 6) if bad_rate is not None else None,
+        "buy_precision_if_followed": round(buy_precision, 6) if buy_precision is not None else None,
         "sample_count": sample_count,
         "buy_signal_count": int(buy_count),
         "hold_signal_count": int(hold_count),

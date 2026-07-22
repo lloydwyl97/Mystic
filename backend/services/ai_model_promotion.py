@@ -292,6 +292,7 @@ def register_candidate_and_maybe_promote(
     holdout_low_confidence = bool(metrics.get("holdout_low_confidence")) or holdout_count < 20
     metrics["holdout_low_confidence"] = holdout_low_confidence
     cand_holdout = metrics.get("candidate_holdout")
+    buy_sig = 0
     if isinstance(cand_holdout, dict):
         buy_sig = int(cand_holdout.get("buy_signal_count") or 0)
         candidate_always_buy = holdout_count > 0 and buy_sig >= holdout_count
@@ -352,8 +353,48 @@ def register_candidate_and_maybe_promote(
                 metrics["promotion_path"] = "stale_refresh_tie"
                 metrics["stale_hours_threshold"] = stale_h
             else:
-                promote = False
-                reject_reason = "candidate_not_improved_over_active"
+                # Buy-coverage edge: only when active holdout proves always-HOLD
+                # and candidate emits a healthy non-zero BUY share.
+                active_holdout = metrics.get("active_holdout")
+                active_always_hold = False
+                if isinstance(active_holdout, dict):
+                    a_buy = int(active_holdout.get("buy_signal_count") or 0)
+                    a_hold = int(active_holdout.get("hold_signal_count") or 0)
+                    active_always_hold = a_buy == 0 and a_hold > 0
+                if active_always_hold and 0 < buy_sig < max(1, int(holdout_count * 0.55)):
+                    metrics["promotion_path"] = "buy_coverage_edge"
+                else:
+                    promote = False
+                    reject_reason = "candidate_not_improved_over_active"
+    # Soft promote: accuracy within margin already (accuracy_ok), but PAC/precision
+    # clearly better — prefer tradable buy edge over pure accuracy ties.
+    if (not promote) and holdout_ok and has_active and accuracy_ok and pac_ok and bad_ok:
+        cand_h = metrics.get("candidate_holdout") if isinstance(metrics.get("candidate_holdout"), dict) else {}
+        act_h = metrics.get("active_holdout") if isinstance(metrics.get("active_holdout"), dict) else {}
+        c_bp = cand_h.get("buy_precision_if_followed")
+        a_bp = act_h.get("buy_precision_if_followed")
+        try:
+            c_bp_f = float(c_bp) if c_bp is not None else None
+            a_bp_f = float(a_bp) if a_bp is not None else None
+        except (TypeError, ValueError):
+            c_bp_f = a_bp_f = None
+        precision_edge = (
+            c_bp_f is not None
+            and a_bp_f is not None
+            and buy_sig >= 3
+            and c_bp_f >= (a_bp_f + 0.02)
+        )
+        pac_edge = (
+            c_profit is not None
+            and a_profit is not None
+            and float(c_profit) >= (float(a_profit) + 0.0002)
+        )
+        if (precision_edge or pac_edge) and not candidate_always_buy and not candidate_always_hold:
+            promote = True
+            reject_reason = "validation_pass"
+            metrics["promotion_path"] = "buy_precision_or_pac_edge"
+            metrics["candidate_buy_precision"] = c_bp_f
+            metrics["active_buy_precision"] = a_bp_f
     model_id = f"{sid}:{sym}:{c_hash[:16]}"
     active_model_id = f"{sid}:{sym}:{_hash_file(active_path)[:16]}" if active_path.exists() else None
     status = "candidate"

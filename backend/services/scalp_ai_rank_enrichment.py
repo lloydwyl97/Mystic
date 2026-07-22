@@ -20,7 +20,7 @@ from backend.services.scalp_strategy_score_weight_writer import scalp_adaptive_r
 
 logger = logging.getLogger(__name__)
 
-INTELLIGENCE_DELTA_CAP = 0.12
+INTELLIGENCE_DELTA_CAP = 0.16
 
 
 def _flatten_momentum(mom: Any) -> dict[str, Any]:

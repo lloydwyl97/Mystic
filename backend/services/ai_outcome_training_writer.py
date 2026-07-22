@@ -38,25 +38,32 @@ def classify_outcome_label(
 ) -> tuple[str, int, str]:
     """
     Returns (good_bad_memory_class, outcome_label, outcome_class).
+
+    ``outcome_class`` is exit-conditioned (STALL_LOSS / GIVEBACK_LOSS / …) so
+    trainers can up-weight structural losers vs NET_PROFIT wins.
     """
     reason = (close_reason or "").upper()
     if reason in ("ADMIN_POSITION_CLEAR", "ADMIN_CLEAR", "STALE_PRE_CORRECTION_POSITION_CLEAR"):
         return "BAD", 0, "ADMIN"
     if manual_sell or reason == "HUMAN_MANUAL_SELL":
         if net_profit_usd is not None and float(net_profit_usd) > 0:
-            return "GOOD", 1, "WIN"
-        return "BAD", 0, "LOSS"
+            return "GOOD", 1, "MANUAL_WIN"
+        return "BAD", 0, "MANUAL_LOSS"
     if reason == "DUST_WRITEOFF":
         return "BAD", 0, "DUST"
     profitable = net_profit_usd is not None and float(net_profit_usd) > 0
     pct_ok = net_profit_pct is not None and float(net_profit_pct) >= float(MIN_NET_PROFIT_TO_SELL)
     if reason == "AI_NET_PROFIT_SELL" or "NET_PROFIT" in reason or reason.startswith("TP"):
-        if profitable and pct_ok:
-            return "GOOD", 1, "WIN"
         if profitable:
-            return "GOOD", 1, "WIN"
-        return "BAD", 0, "LOSS"
-    if net_profit_usd is not None and float(net_profit_usd) > 0:
+            return "GOOD", 1, "NET_PROFIT_WIN"
+        return "BAD", 0, "NET_PROFIT_FAIL"
+    if "STALL" in reason:
+        return ("GOOD", 1, "STALL_WIN") if profitable else ("BAD", 0, "STALL_LOSS")
+    if "GIVEBACK" in reason:
+        return ("GOOD", 1, "GIVEBACK_WIN") if profitable else ("BAD", 0, "GIVEBACK_LOSS")
+    if "TIME_STOP" in reason:
+        return ("GOOD", 1, "TIME_STOP_WIN") if profitable else ("BAD", 0, "TIME_STOP_LOSS")
+    if profitable:
         return "GOOD", 1, "WIN"
     return "BAD", 0, "LOSS"
 

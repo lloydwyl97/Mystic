@@ -269,7 +269,7 @@ def build_xy_arrays_for_live_strategy(
             )
             if lab is None:
                 continue
-            keep_x.append(xs[i])
+            keep_x.append(_zero_learning_blocked_feature_dims([float(v) for v in xs[i]]))
             keep_y.append(lab)
         if len(keep_x) < 10:
             continue
@@ -335,27 +335,64 @@ def _live_strategy_from_outcome_row(strategy_id_val: str | None, context_json_va
     return None
 
 
+def _zero_learning_blocked_feature_dims(feats: list[float]) -> list[float]:
+    """Zero proxy/unsupported dims so RF cannot learn from dishonest tape features."""
+    try:
+        from backend.services.day_feature_health import LEARNING_BLOCKED_FEATURE_NAMES, _feature_name_at
+    except Exception:
+        return feats
+    out = list(feats)
+    for i in range(len(out)):
+        try:
+            name = _feature_name_at(i)
+        except Exception:
+            continue
+        # Strip proxy display suffix for membership check.
+        base = str(name or "").replace("_ohlcv_proxy", "")
+        if base in LEARNING_BLOCKED_FEATURE_NAMES or name in LEARNING_BLOCKED_FEATURE_NAMES:
+            out[i] = 0.0
+    return out
+
+
+def _outcome_exit_class_multiplier(row: dict[str, Any], y_label: int) -> float:
+    """Weight NET_PROFIT wins and STALL/GIVEBACK losses higher than flat noise exits."""
+    reason = str(row.get("close_reason") or row.get("outcome_class") or "").upper()
+    if y_label == 1 and ("NET_PROFIT" in reason or reason.startswith("TP")):
+        return 2.0
+    if y_label == 0 and ("STALL" in reason or "GIVEBACK" in reason):
+        return 1.8
+    if y_label == 0 and "TIME_STOP" in reason:
+        return 1.35
+    if y_label == 1:
+        return 1.25
+    return 1.0
+
+
 def _outcome_rows_to_xy_for_strategy(
     outcome_rows: list[dict[str, Any]],
     live_strategy_id: str,
     target_dim: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Realized outcomes filtered to one live strategy (distinct supervision).
 
     Logs a single ``OUTCOME_XY_FILTER`` diagnostic line per call so operators
     can verify that DAY v4 training is not silently fed v3 (day) rows or
     missing feature vectors. The counters are intentionally cheap.
+
+    Returns X, y, symbols, exit_class_multipliers (aligned with y).
     """
     want = (live_strategy_id or "day").strip().lower()
+    empty = (np.array([]), np.array([]), np.array([]), np.array([]))
     if not outcome_rows:
         logger.info(
             "OUTCOME_XY_FILTER strategy=%s total=0 eligible=0 reason=no_outcome_rows",
             want,
         )
-        return np.array([]), np.array([]), np.array([])
+        return empty
     Xs: list[list[float]] = []
     ys: list[int] = []
     syms: list[str] = []
+    w_mults: list[float] = []
     skipped_strategy_mismatch = 0
     skipped_feature_version = 0
     skipped_missing_features = 0
@@ -389,7 +426,7 @@ def _outcome_rows_to_xy_for_strategy(
             if not sym:
                 skipped_missing_symbol += 1
                 continue
-            Xs.append([float(x) for x in feats])
+            Xs.append(_zero_learning_blocked_feature_dims([float(x) for x in feats]))
             y_label = int(r.get("outcome_label") or 0)
             mem_class = str(r.get("good_bad_memory_class") or "").strip().upper()
             if mem_class == "BAD":
@@ -403,6 +440,7 @@ def _outcome_rows_to_xy_for_strategy(
                 pass
             ys.append(y_label)
             syms.append(sym)
+            w_mults.append(_outcome_exit_class_multiplier(r, y_label))
         except (ValueError, TypeError, json.JSONDecodeError):
             skipped_parse_error += 1
             continue
@@ -424,8 +462,13 @@ def _outcome_rows_to_xy_for_strategy(
         FEATURE_VERSION_DAY_HTF if want == "day" else "n/a",
     )
     if not Xs:
-        return np.array([]), np.array([]), np.array([])
-    return np.asarray(Xs, dtype=np.float64), np.asarray(ys, dtype=np.int64), np.asarray(syms, dtype=object)
+        return empty
+    return (
+        np.asarray(Xs, dtype=np.float64),
+        np.asarray(ys, dtype=np.int64),
+        np.asarray(syms, dtype=object),
+        np.asarray(w_mults, dtype=np.float64),
+    )
 
 
 def transform_rows_per_symbol_scalers(
@@ -715,16 +758,23 @@ class AITrainingDataPipeline:
                 # snapshots (rejected/no-trade/buy) so the learning loop gets
                 # labels from decisions that never became closed trades.
                 try:
-                    from backend.services.ai_learning_ingestion import label_pending_snapshots
+                    from backend.services.ai_learning_ingestion import LABEL_BATCH_LIMIT, label_pending_snapshots
 
-                    label_counters = await asyncio.to_thread(label_pending_snapshots)
-                    if label_counters.get("labeled") or label_counters.get("partial"):
+                    # Drain pending backlog in short bursts (was capping at one 400-row batch).
+                    total_lbl = {"scanned": 0, "labeled": 0, "partial": 0, "unlabelable": 0}
+                    for _pass in range(4):
+                        label_counters = await asyncio.to_thread(label_pending_snapshots)
+                        for k in total_lbl:
+                            total_lbl[k] += int(label_counters.get(k, 0) or 0)
+                        if int(label_counters.get("scanned", 0) or 0) < int(LABEL_BATCH_LIMIT):
+                            break
+                    if total_lbl.get("labeled") or total_lbl.get("partial") or total_lbl.get("scanned"):
                         logger.info(
                             "SNAPSHOT_LABELER: scanned=%d labeled=%d partial=%d unlabelable=%d",
-                            label_counters.get("scanned", 0),
-                            label_counters.get("labeled", 0),
-                            label_counters.get("partial", 0),
-                            label_counters.get("unlabelable", 0),
+                            total_lbl.get("scanned", 0),
+                            total_lbl.get("labeled", 0),
+                            total_lbl.get("partial", 0),
+                            total_lbl.get("unlabelable", 0),
                         )
                 except Exception as lbl_e:
                     logger.debug("snapshot labeler skipped: %s", lbl_e)
@@ -1349,8 +1399,11 @@ class AITrainingDataPipeline:
                         )
 
                     X_oc = y_oc = sym_oc = np.array([])
+                    w_oc = np.array([])
                     if outcome_rows:
-                        X_oc, y_oc, sym_oc = _outcome_rows_to_xy_for_strategy(outcome_rows, strat, target_dim=target_dim)
+                        X_oc, y_oc, sym_oc, w_oc = _outcome_rows_to_xy_for_strategy(
+                            outcome_rows, strat, target_dim=target_dim
+                        )
                         if len(X_oc) > 0:
                             logger.info(
                                 "AI_OUTCOME_TRAIN: strategy=%s merging %d realized-outcome rows (dim=%d)",
@@ -1403,15 +1456,18 @@ class AITrainingDataPipeline:
                             oc_mask = sym_oc == sym
                             X_oc_sym = X_oc[oc_mask]
                             y_oc_sym = y_oc[oc_mask]
+                            w_oc_sym = w_oc[oc_mask] if len(w_oc) == len(sym_oc) else None
                         else:
                             X_oc_sym = np.empty((0, target_dim), dtype=np.float64)
                             y_oc_sym = np.array([], dtype=np.int64)
+                            w_oc_sym = None
 
                         X_sym, y_sym, w_sym, balance_diag = prepare_outcome_weighted_training_arrays(
                             X_ss,
                             y_ss,
                             X_oc_sym,
                             y_oc_sym,
+                            outcome_row_multipliers=w_oc_sym,
                         )
 
                         # Fetch Tier B/C BEFORE the min-sample gate so starvation

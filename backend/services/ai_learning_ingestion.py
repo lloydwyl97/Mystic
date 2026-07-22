@@ -29,6 +29,7 @@ import contextlib
 import json
 import logging
 import math
+import os
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -47,7 +48,7 @@ SNAPSHOT_RETENTION_DAYS = 45
 HEARTBEAT_RETENTION_DAYS = 45
 LABEL_FINAL_HORIZON_SEC = 24 * 3600
 LABEL_GIVEUP_AGE_SEC = 72 * 3600
-LABEL_BATCH_LIMIT = 400
+LABEL_BATCH_LIMIT = int(os.getenv("AI_SNAPSHOT_LABEL_BATCH_LIMIT", "1000") or "1000")
 
 # Tier weights (Tier A = OUTCOME_ROW_WEIGHT 5.0, Tier D = SELF_SUPERVISED 1.0 live elsewhere)
 TIER_B_WEIGHT = 2.0
@@ -823,13 +824,13 @@ def _prune_old_rows(conn: sqlite3.Connection) -> None:
 
 
 def missed_move_rank_adjustments(
-    lookback_days: int = 14,
+    lookback_days: int = 21,
     db_path: str = DATABASE_PATH,
 ) -> dict[str, float]:
     """Per-symbol bounded rank delta from labeled non-BUY snapshots.
 
-    High missed-opportunity rate nudges rank up (max +0.03); a symbol whose
-    rejections keep proving correct gets a small negative nudge (max -0.02).
+    High missed-opportunity rate nudges rank up (max +0.06); a symbol whose
+    rejections keep proving correct gets a small negative nudge (max -0.04).
     Execution gates are unchanged — this only reorders ranking among top-4.
     """
     ensure_learning_ingestion_tables(db_path)
@@ -850,11 +851,12 @@ def missed_move_rank_adjustments(
             ).fetchall()
         for sym, missed, correct in rows:
             total = int(missed or 0) + int(correct or 0)
-            if total < 10:
+            if total < 5:
                 continue
             rate = float(missed or 0) / total
-            delta = (rate - 0.30) * 0.12
-            out[str(sym)] = max(-0.02, min(0.03, round(delta, 5)))
+            # Stronger feedback so missed-ops actually move top-4 ranking.
+            delta = (rate - 0.28) * 0.18
+            out[str(sym)] = max(-0.04, min(0.06, round(delta, 5)))
     except sqlite3.Error as e:
         logger.debug("missed_move_rank_adjustments failed: %s", e)
     return out
@@ -1138,6 +1140,7 @@ def _heartbeat_schema_health(db_path: str = DATABASE_PATH) -> dict[str, Any]:
 
 
 __all__ = [
+    "LABEL_BATCH_LIMIT",
     "MAX_TIER_BC_SHARE",
     "TIER_B_WEIGHT",
     "TIER_C_WEIGHT",

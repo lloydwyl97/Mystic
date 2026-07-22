@@ -11,13 +11,17 @@ from typing import Any
 
 import numpy as np
 
-OUTCOME_ROW_WEIGHT = 5.0
+OUTCOME_ROW_WEIGHT = 8.0
 SELF_SUPERVISED_ROW_WEIGHT = 1.0
 MAX_SELF_SUPERVISED_BUY_RATIO = 0.50
-MAX_COMBINED_BUY_RATE = 0.35
-MIN_COMBINED_BUY_RATE = 0.15
-OUTCOME_BUY_RATE_HEADROOM = 3.0
-OUTCOME_BUY_RATE_BUFFER = 0.08
+MAX_COMBINED_BUY_RATE = 0.38
+MIN_COMBINED_BUY_RATE = 0.18
+OUTCOME_BUY_RATE_HEADROOM = 4.0
+OUTCOME_BUY_RATE_BUFFER = 0.10
+# Extra multiplier on BUY-labeled outcome rows when realized BUY rate is scarce
+# so RF does not collapse to always-HOLD (high P(HOLD) / negative buy_margin).
+SCARCE_BUY_OUTCOME_BOOST = 1.75
+SCARCE_BUY_RATE_THRESHOLD = 0.12
 
 
 def _count_labels(y: np.ndarray) -> dict[str, int]:
@@ -149,6 +153,7 @@ def prepare_outcome_weighted_training_arrays(
     max_self_supervised_buy_ratio: float = MAX_SELF_SUPERVISED_BUY_RATIO,
     max_combined_buy_rate: float = MAX_COMBINED_BUY_RATE,
     random_state: int = 42,
+    outcome_row_multipliers: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """
     Build per-symbol training matrices with SS BUY cap, combined BUY cap, and source weights.
@@ -159,10 +164,17 @@ def prepare_outcome_weighted_training_arrays(
     ys = np.asarray(y_self, dtype=np.int64).reshape(-1) if len(y_self) else np.array([], dtype=np.int64)
     Xo = np.asarray(X_outcome, dtype=np.float64) if len(X_outcome) else np.empty((0, 0))
     yo = np.asarray(y_outcome, dtype=np.int64).reshape(-1) if len(y_outcome) else np.array([], dtype=np.int64)
+    oc_mult = None
+    if outcome_row_multipliers is not None and len(yo) > 0:
+        oc_mult = np.asarray(outcome_row_multipliers, dtype=np.float64).reshape(-1)
+        if len(oc_mult) != len(yo):
+            oc_mult = None
 
     raw_ss = _count_labels(ys)
     raw_oc = _count_labels(yo)
     combined_cap = resolve_combined_buy_rate_cap(raw_oc)
+    oc_buy_rate = _buy_rate(yo) if len(yo) else 0.0
+    scarce_buy = bool(len(yo) > 0 and oc_buy_rate < SCARCE_BUY_RATE_THRESHOLD)
 
     ss_cap_meta: dict[str, Any] = {"before": raw_ss, "after": raw_ss, "rows_removed": 0}
     if len(ys) > 0:
@@ -202,7 +214,15 @@ def prepare_outcome_weighted_training_arrays(
     if len(yo) > 0:
         parts_x.append(Xo)
         parts_y.append(yo)
-        parts_w.append(np.full(len(yo), float(outcome_weight), dtype=np.float64))
+        base_w = np.full(len(yo), float(outcome_weight), dtype=np.float64)
+        if oc_mult is not None:
+            base_w = base_w * np.clip(oc_mult, 0.5, 3.0)
+        if scarce_buy:
+            # Emphasize rare BUY outcomes so P(buy) can clear admission margins.
+            buy_mask = yo == 1
+            base_w = base_w.copy()
+            base_w[buy_mask] *= SCARCE_BUY_OUTCOME_BOOST
+        parts_w.append(base_w)
 
     if not parts_x:
         return np.array([]), np.array([]), np.array([]), {}
@@ -224,6 +244,9 @@ def prepare_outcome_weighted_training_arrays(
         "self_supervised_row_weight": float(self_supervised_weight),
         "outcome_rows_kept": len(yo),
         "self_supervised_rows_kept": len(ys),
+        "scarce_buy_boost_applied": scarce_buy,
+        "outcome_buy_rate": round(oc_buy_rate, 6),
+        "exit_class_multipliers_applied": oc_mult is not None,
     }
     return X_all, y_all, w_all, diag
 
