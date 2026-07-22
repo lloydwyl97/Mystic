@@ -131,6 +131,11 @@ class LiveTradingService:
                         "fetchOHLCV": "public",
                         "fetchTicker": "public",
                         "fetchTickers": "public",
+                        # Fetching open orders without a symbol is intentional here (see
+                        # get_open_orders): one call across all pairs instead of one per
+                        # symbol, at the cost of stricter exchange-side rate limits. Without
+                        # this ack, ccxt raises ExchangeError instead of just warning.
+                        "warnOnFetchOpenOrdersWithoutSymbol": False,
                     },
                 },
             )
