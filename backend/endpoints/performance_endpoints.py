@@ -310,14 +310,20 @@ def _analytics_from_paper_trades(trades: list[dict[str, Any]]) -> dict[str, Any]
     total_trades = len(with_pnl)
     pnls = [float(t["pnl"]) for t in with_pnl]
     total_pnl = sum(pnls)
-    winning = sum(1 for p in pnls if p > 0)
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    winning = len(wins)
     win_rate = (winning / total_trades * 100.0) if total_trades else 0.0
     avg_pnl = total_pnl / total_trades if total_trades else 0.0
+    avg_win_pnl = (sum(wins) / len(wins)) if wins else 0.0
+    avg_loss_pnl = (sum(losses) / len(losses)) if losses else 0.0
     return {
         "total_trades": total_trades,
         "win_rate": win_rate,
         "total_pnl": total_pnl,
         "avg_pnl": avg_pnl,
+        "avg_win_pnl": avg_win_pnl,
+        "avg_loss_pnl": avg_loss_pnl,
         "best_trade": max(pnls),
         "worst_trade": min(pnls),
     }
@@ -360,8 +366,8 @@ async def get_analytics() -> Any:
                 "total_trades": computed["total_trades"],
                 "win_rate": computed["win_rate"],
                 "total_pnl": computed["total_pnl"],
-                "avg_win": computed["avg_pnl"],
-                "avg_loss": computed["avg_pnl"],
+                "avg_win": computed["avg_win_pnl"],
+                "avg_loss": computed["avg_loss_pnl"],
                 "largest_win": computed["best_trade"],
                 "largest_loss": computed["worst_trade"],
                 "sharpe_ratio": 0.0,
@@ -377,8 +383,8 @@ async def get_analytics() -> Any:
                 "total_trades": total,
                 "win_rate": trade_data.get("win_rate", 0.0),
                 "total_pnl": trade_data.get("total_pnl", 0.0),
-                "avg_win": trade_data.get("avg_pnl", 0.0),
-                "avg_loss": trade_data.get("avg_pnl", 0.0),
+                "avg_win": trade_data.get("avg_win_pnl", 0.0),
+                "avg_loss": trade_data.get("avg_loss_pnl", 0.0),
                 "largest_win": trade_data.get("best_trade", 0.0),
                 "largest_loss": trade_data.get("worst_trade", 0.0),
                 "sharpe_ratio": 0.0,

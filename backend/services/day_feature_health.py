@@ -17,9 +17,7 @@ from backend.services.feature_builder import FEATURE_TRUST_SCORES
 # from learning eligibility on the same basis, even though CALCULATED_PROXY status
 # alone does not fail the entry feature-health gate (that's intentional — DAY has no
 # real tape access, so the proxy is still the best available value to trade on).
-LEARNING_BLOCKED_FEATURE_NAMES: frozenset[str] = frozenset(
-    {"put_call_ratio", "volatility_smile", "volume_delta", "order_flow", "volume_imbalance"}
-)
+LEARNING_BLOCKED_FEATURE_NAMES: frozenset[str] = frozenset({"put_call_ratio", "volatility_smile", "volume_delta", "order_flow", "volume_imbalance"})
 
 # Sidecar display aliases — RF index names stay unchanged; audits/UI see the proxy label.
 PROXY_DISPLAY_NAMES: dict[str, str] = {

@@ -197,7 +197,8 @@ def evaluate_repair_add(
             # Underwater repair adds may exceed entry allocation cap; still cash-limited.
             add_notional = min(target_add_notional, float(cash_balance))
         else:
-            blockers.append(f"allocation_at_cap={current_cost / total_equity * 100:.1f}%")
+            _alloc_pct = (current_cost / total_equity * 100) if total_equity > 0 else 0.0
+            blockers.append(f"allocation_at_cap={_alloc_pct:.1f}%")
             add_notional = 0.0
     else:
         add_notional = min(target_add_notional, headroom, float(cash_balance))

@@ -6767,7 +6767,7 @@ class PortfolioEngine:
         # Narrow ML-edge bypass only — never bypass for generic strategy_id "day".
         _ml_bypass_artifact = False
         try:
-            _dd_local = (top_candidate.decision_data if "top_candidate" in dir() else None) or {}
+            _dd_local = {}
             _family = str(_dd_local.get("strategy_family") or getattr(explainability, "strategy_family", "") or "")
             _margin = float(_dd_local.get("buy_margin") or _dd_local.get("redis_buy_margin_key") or 0)
             if _dd_local.get("ml_enriched") or _family == "ML_EDGE" or (_family.startswith("ML") and _margin > 0.05):
@@ -9803,9 +9803,7 @@ class PortfolioEngine:
     # PHASE 2: PORTFOLIO DISCIPLINE (SOLE EXECUTION GATE)
     # =========================================================================
 
-    async def _apply_risk_governor(
-        self, candidates: list[BuyCandidate]
-    ) -> tuple[list[BuyCandidate], str | None]:
+    async def _apply_risk_governor(self, candidates: list[BuyCandidate]) -> tuple[list[BuyCandidate], str | None]:
         """Run RiskGovernor.decide on ranked buy candidates.
 
         Returns (allowed_candidates, account_hold_reason).
@@ -9836,9 +9834,7 @@ class PortfolioEngine:
             equity=float(self._total_equity or 0.0),
             free_usdt=float(self._available_balance or self.cash_balance or 0.0),
             positions_value=float(self._positions_value or 0.0),
-            open_positions_count=sum(
-                1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING"
-            ),
+            open_positions_count=sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING"),
             exposure_per_coin=exposure,
             rolling_24h_drawdown_pct=float(dd_pct or 0.0),
             consecutive_losses=int(consec or 0),
@@ -10027,9 +10023,7 @@ class PortfolioEngine:
             try:
                 from backend.services.trade_state import get_trade_state_store
 
-                _ts_ok, _ts_reason = await get_trade_state_store().allow_new_entry_async(
-                    symbol, "buy", now_wall
-                )
+                _ts_ok, _ts_reason = await get_trade_state_store().allow_new_entry_async(symbol, "buy", now_wall)
                 if not _ts_ok:
                     logger.warning(
                         "BUY_BLOCKED_TRADE_STATE symbol=%s reason=%s",
@@ -11199,8 +11193,8 @@ class PortfolioEngine:
         min_mult = max(0.10, min(1.0, _envf("AI_DYNAMIC_SIZE_MIN_MULT", 0.35)))
         max_mult = max(1.0, min(3.0, _envf("AI_DYNAMIC_SIZE_MAX_MULT", 1.50)))
         max_mult = max(max_mult, min_mult)
-        (strategy_id or "day").strip().lower()
-        strategy_max = _envf("AI_DYNAMIC_SIZE_DAY_MAX_MULT", 1.25)
+        sid = (strategy_id or "day").strip().lower()
+        strategy_max = _envf(f"AI_DYNAMIC_SIZE_{sid.upper()}_MAX_MULT", 1.25)
         strategy_max = max(min_mult, min(max_mult, strategy_max))
         bad_memory_cap = max(min_mult, min(max_mult, _envf("AI_DYNAMIC_SIZE_BAD_MEMORY_CAP", 0.75)))
         drawdown_cap = max(min_mult, min(max_mult, _envf("AI_DYNAMIC_SIZE_DRAWDOWN_CAP", 0.60)))
@@ -13036,7 +13030,7 @@ class PortfolioEngine:
                 _bml = 0.0
                 try:
                     _bml = float(_dml.get("buy_margin") or _dml.get("redis_buy_margin_key") or 0)
-                except:
+                except Exception:
                     pass
                 _isml = bool(_dml.get("ml_enriched") or str(_dml.get("strategy_family", "")).upper() == "ML_EDGE")
                 if not (_isml and _bml > 0.02):
@@ -13736,21 +13730,15 @@ class PortfolioEngine:
         explainability.signal_ranking_tf = str(_dd.get("ranking_tf") or "")
         explainability.candle_shape_tf = str(_dd.get("candle_shape_tf") or "")
         try:
-            explainability.candle_upper_wick_pct = float(
-                _dd.get("candle_upper_wick_pct") if _dd.get("candle_upper_wick_pct") not in (None, "") else 0.0
-            )
+            explainability.candle_upper_wick_pct = float(_dd.get("candle_upper_wick_pct") if _dd.get("candle_upper_wick_pct") not in (None, "") else 0.0)
         except (TypeError, ValueError):
             explainability.candle_upper_wick_pct = 0.0
         try:
-            explainability.candle_lower_wick_pct = float(
-                _dd.get("candle_lower_wick_pct") if _dd.get("candle_lower_wick_pct") not in (None, "") else 0.0
-            )
+            explainability.candle_lower_wick_pct = float(_dd.get("candle_lower_wick_pct") if _dd.get("candle_lower_wick_pct") not in (None, "") else 0.0)
         except (TypeError, ValueError):
             explainability.candle_lower_wick_pct = 0.0
         try:
-            explainability.candle_body_pct = float(
-                _dd.get("candle_body_pct") if _dd.get("candle_body_pct") not in (None, "") else 0.0
-            )
+            explainability.candle_body_pct = float(_dd.get("candle_body_pct") if _dd.get("candle_body_pct") not in (None, "") else 0.0)
         except (TypeError, ValueError):
             explainability.candle_body_pct = 0.0
         selected_rank = 0
@@ -14661,12 +14649,10 @@ class PortfolioEngine:
             "status": getattr(pos, "status", "ACTIVE"),
             "entry_strategy_id": str(getattr(pos, "entry_strategy_id", "") or "day") or "day",
             "strategy_id": str(getattr(pos, "entry_strategy_id", "") or "day") or "day",
-            "entry_thesis": str(getattr(pos, "entry_thesis", "") or ""),
             "setup": str(getattr(pos, "entry_thesis", "") or ""),
             "day_route_regime_at_entry": str(getattr(pos, "day_route_regime_at_entry", "") or ""),
             "price_structure_regime_at_entry": str(getattr(pos, "price_structure_regime_at_entry", "") or ""),
             "regime": str(getattr(pos, "day_route_regime_at_entry", None) or getattr(pos, "price_structure_regime_at_entry", None) or ""),
-            "max_hold_min": int(getattr(pos, "max_hold_min", 0) or 0),
             "trail_pct": float(getattr(pos, "trail_pct", 0.0) or 0.0),
         }
 

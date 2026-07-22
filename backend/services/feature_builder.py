@@ -881,10 +881,7 @@ def build_feature_dict_from_ohlcv(
                 provenance,
                 fname,
                 "CALCULATED_PROXY",
-                (
-                    f"alias={_proxy_alias[fname]}; ohlcv signed-volume proxy n={n}; "
-                    "NOT live aggTrade/tape order flow"
-                ),
+                (f"alias={_proxy_alias[fname]}; ohlcv signed-volume proxy n={n}; NOT live aggTrade/tape order flow"),
                 trust_score=0.62,
                 learning_allowed=False,
             )

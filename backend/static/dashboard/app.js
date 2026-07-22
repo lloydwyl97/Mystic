@@ -124,6 +124,7 @@ function formatScalpDecision(decision, blocker, operationalMode) {
         if (operationalMode === "max_open_positions_reached" || operationalMode === "exit_watch_active") {
             return op;
         }
+        if (!decision && !blocker) return op;
     }
     if (!decision && !blocker) return "--";
     if (blocker) return String(decision || "BLOCKED") + "\n" + String(blocker);
@@ -191,19 +192,27 @@ function todayUtcDateStr() {
 }
 
 function markDashboardLoading(loading) {
-    const label = loading ? "Loading…" : null;
-    if (!loading) return;
-    CANONICAL_STALE_WIDGET_IDS.forEach(function (id) {
-        const el = document.getElementById(id);
-        if (!el || el.textContent !== "--") return;
-        el.textContent = label;
-        el.title = "Fetching live snapshot (first load can take ~20s)";
-    });
-    ["status-cash", "status-equity", "status-positions"].forEach(function (id) {
-        const el = document.getElementById(id);
-        if (el && el.textContent === "--") {
-            el.textContent = label;
+    if (loading) {
+        CANONICAL_STALE_WIDGET_IDS.forEach(function (id) {
+            const el = document.getElementById(id);
+            if (!el || el.textContent !== "--") return;
+            el.textContent = "Loading…";
             el.title = "Fetching live snapshot (first load can take ~20s)";
+        });
+        ["status-cash", "status-equity", "status-positions"].forEach(function (id) {
+            const el = document.getElementById(id);
+            if (el && el.textContent === "--") {
+                el.textContent = "Loading…";
+                el.title = "Fetching live snapshot (first load can take ~20s)";
+            }
+        });
+        return;
+    }
+    CANONICAL_STALE_WIDGET_IDS.concat(["status-cash", "status-equity", "status-positions"]).forEach(function (id) {
+        const el = document.getElementById(id);
+        if (el && el.textContent === "Loading…") {
+            el.textContent = "--";
+            el.removeAttribute("title");
         }
     });
 }
@@ -1342,7 +1351,7 @@ function updateDayHealth(res) {
     window._lastDayHealth = d;
 
     const set = setCardText;
-    set("dh-slots", d.slots_available != null ? `${d.open_positions_count || 0}/${d.max_open_positions || 4}` : "--");
+    set("dh-slots", d.open_positions_count != null || d.max_open_positions != null ? `${d.open_positions_count || 0}/${d.max_open_positions || 4}` : "--");
     set("dh-idle-cash", d.cash_balance != null ? "$" + Number(d.cash_balance).toFixed(2) : "--");
     set("dh-idle-reason", d.capital_idle_reason || "--");
     set("cc-day-decision", d.capital_idle_reason || "--");

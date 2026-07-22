@@ -659,11 +659,7 @@ class RealTimeAISignalGenerator:
                 market_primary = bundle.get("4h") or bundle.get("1h") or bundle.get("1m") or []
                 ranking_source = bundle.get("4h") or market_primary
                 market_1m_exec = bundle.get("1m") or []
-                day_tf_audit = {
-                    tf: len(bundle.get(tf) or [])
-                    for tf in DAY_ACTIVE_TIMEFRAMES
-                    if isinstance(bundle.get(tf), list) or bundle.get(tf) is None
-                }
+                day_tf_audit = {tf: len(bundle.get(tf) or []) for tf in DAY_ACTIVE_TIMEFRAMES if isinstance(bundle.get(tf), list) or bundle.get(tf) is None}
                 if bundle.get("4h"):
                     ranking_tf_label = "4h"
                 elif bundle.get("1h"):
@@ -895,7 +891,10 @@ class RealTimeAISignalGenerator:
                 if _shape_bars and len(_shape_bars) >= 1:
                     _b = _shape_bars[-1]
                     # row = [ts, o, h, l, c, v]
-                    _o = float(_b[1]); _h = float(_b[2]); _l = float(_b[3]); _c = float(_b[4])
+                    _o = float(_b[1])
+                    _h = float(_b[2])
+                    _l = float(_b[3])
+                    _c = float(_b[4])
                     _rng = _h - _l
                     if _rng > 0:
                         candle_upper_wick_pct = (_h - max(_c, _o)) / _rng

@@ -56,9 +56,7 @@ class RangeBounceScalpStrategy:
         _bar_high = float(last["high"])
         _bar_low = float(last["low"])
         _bar_range = _bar_high - _bar_low
-        wick_rejection = (
-            (min(_bar_open, _bar_close) - _bar_low) / _bar_range if _bar_range > 0 else 0.0
-        )
+        wick_rejection = (min(_bar_open, _bar_close) - _bar_low) / _bar_range if _bar_range > 0 else 0.0
         # Legacy close-above-low / close (kept for audit joins against older trades).
         wick_close_above_low_pct = (_bar_close - _bar_low) / _bar_close if _bar_close > 0 else 0.0
 

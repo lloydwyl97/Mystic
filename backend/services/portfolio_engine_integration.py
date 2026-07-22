@@ -2218,9 +2218,6 @@ class PortfolioEngineIntegration:
                             deleted_perf,
                             deleted_audit,
                             keep_days,
-                            deleted_paper,
-                            deleted_perf,
-                            deleted_audit,
                         )
                     run_count += 1
                     # Skip online VACUUM: exclusive SQLite lock blocks LEDGER_MTM / FIFO / bar writes.

@@ -117,16 +117,12 @@ def test_mtf_gate_blocks_when_5m_down():
         klines = MagicMock()
         # Down 5m: recent mean < prior mean
         down_5m = [{"close": 110.0}] * 3 + [{"close": 100.0}] * 3
-        klines.get.return_value = [
-            {"open": 100.0, "high": 100.2, "low": 99.8, "close": 100.0} for _ in range(20)
-        ]
+        klines.get.return_value = [{"open": 100.0, "high": 100.2, "low": 99.8, "close": 100.0} for _ in range(20)]
         klines.get_5m.return_value = down_5m
         klines.get_15m.return_value = [{"close": 100.0}] * 6
         klines.get_1h.return_value = []
 
-        router = ScalpStrategyRouter(
-            config=config, econ=econ, reader=reader, momentum=momentum, klines=klines
-        )
+        router = ScalpStrategyRouter(config=config, econ=econ, reader=reader, momentum=momentum, klines=klines)
         # Force a passed ranked candidate by stubbing rank path: call confirmation directly
         trend, aligned = router._mtf_trend_confirmation("BTCUSDT", "5m")
         assert aligned is False

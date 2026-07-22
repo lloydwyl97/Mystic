@@ -867,9 +867,7 @@ class BinanceScalpPaperEngine:
             buy_diag = {}
         if not isinstance(buy_diag, dict):
             buy_diag = {}
-        passed = bool(
-            setup_signal.get("passed", entry_diag.get("passed", buy_diag.get("passed", False)))
-        )
+        passed = bool(setup_signal.get("passed", entry_diag.get("passed", buy_diag.get("passed", False))))
         soft_rank_entry = bool(
             setup_signal.get(
                 "soft_rank_entry",
@@ -1136,7 +1134,12 @@ class BinanceScalpPaperEngine:
 
         exit_price = pf.expected_avg_fill if pf.expected_avg_fill > 0 else pf.limit_sell_price
         net_pct = pf.expected_net_edge_pct
-        net_usd = (exit_price - entry) * qty - (exit_price * qty * self.econ.taker_fee_pct + exit_price * qty * self.econ.slippage_buffer_pct + entry * qty * self.econ.taker_fee_pct)
+        net_usd = (exit_price - entry) * qty - (
+            exit_price * qty * self.econ.taker_fee_pct
+            + exit_price * qty * self.econ.slippage_buffer_pct
+            + entry * qty * self.econ.taker_fee_pct
+            + entry * qty * self.econ.slippage_buffer_pct
+        )
         profit_hit = net_pct >= target_pct
         exit_spread_ok = pf.reject_reason != "SPREAD_TOO_WIDE"
 

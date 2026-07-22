@@ -871,11 +871,7 @@ class AITrainingDataPipeline:
                                 logger.info(
                                     "STALE_MODEL_WORKFLOW: evaluated=%s promoted=%s",
                                     stale_summary.get("symbols_evaluated"),
-                                    [
-                                        r.get("symbol")
-                                        for r in (stale_summary.get("results") or [])
-                                        if r.get("promoted")
-                                    ],
+                                    [r.get("symbol") for r in (stale_summary.get("results") or []) if r.get("promoted")],
                                 )
                             except Exception as stale_err:
                                 logger.warning("STALE_MODEL_WORKFLOW failed: %s", stale_err)
@@ -1392,9 +1388,7 @@ class AITrainingDataPipeline:
                     X_oc = y_oc = sym_oc = np.array([])
                     w_oc = np.array([])
                     if outcome_rows:
-                        X_oc, y_oc, sym_oc, w_oc = _outcome_rows_to_xy_for_strategy(
-                            outcome_rows, strat, target_dim=target_dim
-                        )
+                        X_oc, y_oc, sym_oc, w_oc = _outcome_rows_to_xy_for_strategy(outcome_rows, strat, target_dim=target_dim)
                         if len(X_oc) > 0:
                             logger.info(
                                 "AI_OUTCOME_TRAIN: strategy=%s merging %d realized-outcome rows (dim=%d)",
@@ -1406,8 +1400,8 @@ class AITrainingDataPipeline:
                     if len(X_oc) > 0:
                         if len(X_self) > 0:
                             X_all = np.vstack([X_self, X_oc])
-                            np.concatenate([y_self, y_oc])
-                            np.concatenate([sym_self, sym_oc])
+                            _y_all = np.concatenate([y_self, y_oc])
+                            _sym_all = np.concatenate([sym_self, sym_oc])
                         else:
                             X_all, _y_all, _sym_all = X_oc, y_oc, sym_oc
                     else:
@@ -1479,12 +1473,8 @@ class AITrainingDataPipeline:
                                     tier_c_training_rows,
                                 )
 
-                                xb, yb = await asyncio.to_thread(
-                                    tier_b_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim
-                                )
-                                xc, yc = await asyncio.to_thread(
-                                    tier_c_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim
-                                )
+                                xb, yb = await asyncio.to_thread(tier_b_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim)
+                                xc, yc = await asyncio.to_thread(tier_c_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim)
                                 tier_b_n, tier_c_n = len(yb), len(yc)
                                 tier_x = [*xb, *xc]
                                 tier_y = [*[int(v) for v in yb], *[int(v) for v in yc]]
@@ -1494,12 +1484,9 @@ class AITrainingDataPipeline:
 
                         min_samples = MIN_RF_TRAIN_SAMPLES
                         effective_n = len(X_sym) + len(tier_x)
-                        if len(X_sym) < MIN_RF_TIER_A_ROWS or (
-                            len(X_sym) < min_samples and effective_n < min_samples
-                        ):
+                        if len(X_sym) < MIN_RF_TIER_A_ROWS or (len(X_sym) < min_samples and effective_n < min_samples):
                             logger.info(
-                                "PER_COIN_TRAIN: [%s] %s only %d rows after balance "
-                                "(tier_bc=%d effective=%d need=%d tier_a_floor=%d) diag=%s, skipping",
+                                "PER_COIN_TRAIN: [%s] %s only %d rows after balance (tier_bc=%d effective=%d need=%d tier_a_floor=%d) diag=%s, skipping",
                                 strat,
                                 sym,
                                 len(X_sym),

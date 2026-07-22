@@ -1344,6 +1344,31 @@ async def get_audit_trail(limit: int = 200) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@router.get("/audit/export")
+async def export_audit(hours: int = 24) -> dict[str, Any]:
+    """
+    Export audit records for last N hours (for download/reporting).
+    """
+    try:
+        if hours < 1:
+            hours = 24
+        hours = min(hours, 168)
+
+        engine = get_portfolio_engine()
+        records = await engine.get_audit_export(hours)
+
+        return {
+            "success": True,
+            "hours": hours,
+            "records": records,
+            "count": len(records),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception(f"Error exporting audit: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.get("/audit/{audit_id}")
 async def get_audit_record(audit_id: int) -> dict[str, Any]:
     """Get single audit record by ID with full details"""
@@ -1899,31 +1924,6 @@ async def get_invariants_detail() -> dict[str, Any]:
         }
     except Exception as e:
         logger.exception(f"Error getting invariants detail: {e}")
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@router.get("/audit/export")
-async def export_audit(hours: int = 24) -> dict[str, Any]:
-    """
-    Export audit records for last N hours (for download/reporting).
-    """
-    try:
-        if hours < 1:
-            hours = 24
-        hours = min(hours, 168)
-
-        engine = get_portfolio_engine()
-        records = await engine.get_audit_export(hours)
-
-        return {
-            "success": True,
-            "hours": hours,
-            "records": records,
-            "count": len(records),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    except Exception as e:
-        logger.exception(f"Error exporting audit: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

@@ -637,7 +637,7 @@ def build_outcome_quality_audit(db_path: str = DATABASE_PATH, limit: int = 50) -
                     SELECT id, close_reason, extra_json FROM trade_learning_outcomes
                     WHERE symbol=? ORDER BY id DESC LIMIT 1
                     """,
-                    (sym.replace("/", "") if False else sym,),
+                    (sym,),
                 ).fetchone()
 
                 pnl = float(s["pnl"] or 0)

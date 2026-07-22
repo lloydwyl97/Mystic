@@ -410,14 +410,7 @@ def evaluate_exit(
     if invalidated and below_entry and momentum_negative and not meaningful_rec:
         return _sell(EXIT_SETUP_INVALIDATED, inv_reason or "setup_invalidated", EXIT_SETUP_INVALIDATED)
 
-    if (
-        scratch_ready
-        and below_entry
-        and momentum_stalled
-        and not hl
-        and not meaningful_rec
-        and stale_review_count >= 1
-    ):
+    if scratch_ready and below_entry and momentum_stalled and not hl and not meaningful_rec and stale_review_count >= 1:
         return _sell(EXIT_MOMENTUM_FAILED, "no_recovery_negative_momentum", EXIT_MOMENTUM_FAILED)
 
     if not below_entry:

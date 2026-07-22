@@ -113,7 +113,12 @@ def enrich_open_scalp_positions(
         )
         exit_price = pf.expected_avg_fill if pf.expected_avg_fill > 0 else pf.limit_sell_price
         net_pct = pf.expected_net_edge_pct
-        net_usd = (exit_price - entry) * qty - (exit_price * qty * econ.taker_fee_pct + exit_price * qty * econ.slippage_buffer_pct + entry * qty * econ.taker_fee_pct)
+        net_usd = (exit_price - entry) * qty - (
+            exit_price * qty * econ.taker_fee_pct
+            + exit_price * qty * econ.slippage_buffer_pct
+            + entry * qty * econ.taker_fee_pct
+            + entry * qty * econ.slippage_buffer_pct
+        )
         profit_hit = net_pct >= target_pct
         exit_spread_ok = pf.reject_reason != "SPREAD_TOO_WIDE"
         track = track_from_row(row, pos_diag)

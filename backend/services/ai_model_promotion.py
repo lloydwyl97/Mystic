@@ -378,17 +378,8 @@ def register_candidate_and_maybe_promote(
             a_bp_f = float(a_bp) if a_bp is not None else None
         except (TypeError, ValueError):
             c_bp_f = a_bp_f = None
-        precision_edge = (
-            c_bp_f is not None
-            and a_bp_f is not None
-            and buy_sig >= 3
-            and c_bp_f >= (a_bp_f + 0.02)
-        )
-        pac_edge = (
-            c_profit is not None
-            and a_profit is not None
-            and float(c_profit) >= (float(a_profit) + 0.0002)
-        )
+        precision_edge = c_bp_f is not None and a_bp_f is not None and buy_sig >= 3 and c_bp_f >= (a_bp_f + 0.02)
+        pac_edge = c_profit is not None and a_profit is not None and float(c_profit) >= (float(a_profit) + 0.0002)
         if (precision_edge or pac_edge) and not candidate_always_buy and not candidate_always_hold:
             promote = True
             reject_reason = "validation_pass"

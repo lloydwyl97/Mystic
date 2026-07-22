@@ -15,8 +15,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
 
-import pandas as pd
-
 try:
     import numpy as np  # type: ignore[import-untyped]
 

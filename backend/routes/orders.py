@@ -198,6 +198,51 @@ async def create_order(
     _reject_order_placement()
 
 
+@router.get("/api/orders/active")
+async def get_active_orders(
+    symbol: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Get active orders for dashboard UI."""
+    t0 = time.perf_counter()
+    try:
+        logger.info(f"Starting get_active_orders: symbol={symbol}, limit={limit}, offset={offset}")
+
+        orders = await order_service.get_orders(
+            status="active",
+            symbol=symbol,
+            limit=limit,
+            offset=offset,
+        )
+        logger.info(f"Got {len(orders) if isinstance(orders, list) else 'non-list'} orders from service")
+
+        try:
+            if isinstance(orders, list):
+                ACTIVE_ORDERS_GAUGE.set(len(orders))
+        except Exception as gauge_error:
+            logger.warning(f"Failed to set gauge: {gauge_error}")
+
+        ORDERS_GET_LATENCY_SECONDS.observe(time.perf_counter() - t0)
+        order_list = orders if isinstance(orders, list) else []
+
+        response: dict[str, Any] = {
+            "orders": order_list,
+            "count": len(order_list),
+            "timestamp": time.time(),
+            "status": "success",
+        }
+        logger.info(f"Returning response with {len(order_list)} orders")
+
+    except Exception as e:
+        ORDERS_ERRORS_TOTAL.labels(operation="get_active_orders").inc()
+        ORDERS_GET_LATENCY_SECONDS.observe(time.perf_counter() - t0)
+        logger.exception(f"ERROR in get_active_orders: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting active orders: {e}") from e
+    else:
+        return response
+
+
 @router.get("/api/orders/{order_id}")
 async def get_order(order_id: str) -> dict[str, Any]:
     """Get a specific order by ID."""
@@ -434,51 +479,6 @@ async def calculate_position_size(
         ) from e
     else:
         return result
-
-
-@router.get("/api/orders/active")
-async def get_active_orders(
-    symbol: str | None = None,
-    limit: int = 100,
-    offset: int = 0,
-) -> dict[str, Any]:
-    """Get active orders for dashboard UI."""
-    t0 = time.perf_counter()
-    try:
-        logger.info(f"Starting get_active_orders: symbol={symbol}, limit={limit}, offset={offset}")
-
-        orders = await order_service.get_orders(
-            status="active",
-            symbol=symbol,
-            limit=limit,
-            offset=offset,
-        )
-        logger.info(f"Got {len(orders) if isinstance(orders, list) else 'non-list'} orders from service")
-
-        try:
-            if isinstance(orders, list):
-                ACTIVE_ORDERS_GAUGE.set(len(orders))
-        except Exception as gauge_error:
-            logger.warning(f"Failed to set gauge: {gauge_error}")
-
-        ORDERS_GET_LATENCY_SECONDS.observe(time.perf_counter() - t0)
-        order_list = orders if isinstance(orders, list) else []
-
-        response: dict[str, Any] = {
-            "orders": order_list,
-            "count": len(order_list),
-            "timestamp": time.time(),
-            "status": "success",
-        }
-        logger.info(f"Returning response with {len(order_list)} orders")
-
-    except Exception as e:
-        ORDERS_ERRORS_TOTAL.labels(operation="get_active_orders").inc()
-        ORDERS_GET_LATENCY_SECONDS.observe(time.perf_counter() - t0)
-        logger.exception(f"ERROR in get_active_orders: {e}")
-        raise HTTPException(status_code=500, detail=f"Error getting active orders: {e}") from e
-    else:
-        return response
 
 
 @router.get("/test-simple")

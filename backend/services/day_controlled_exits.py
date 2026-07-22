@@ -131,10 +131,7 @@ def evaluate_stall_exit(
         "reason": EXIT_STALL,
         "net_pnl_pct": net_pnl_pct,
         "hold_minutes": hold_minutes,
-        "detail": (
-            f"stall_min={stall_min:.0f}m mfe={mfe_pct:.6f} max_mfe={_stall_max_mfe_pct():.6f} "
-            f"min_adverse={_stall_min_adverse_pct():.6f}"
-        ),
+        "detail": (f"stall_min={stall_min:.0f}m mfe={mfe_pct:.6f} max_mfe={_stall_max_mfe_pct():.6f} min_adverse={_stall_min_adverse_pct():.6f}"),
     }
 
 
@@ -644,9 +641,8 @@ def evaluate_controlled_bracket_exit(
         )
         if str(te.get("action")) == "warn":
             return {"action": "hold", "reason": EXIT_THESIS_WARNING, "net_pnl_pct": gate}
-        if str(te.get("action")) == "sell" or gate >= cfg.profit_floor_pct:
-            if gate >= cfg.profit_floor_pct:
-                return {"action": "sell", "reason": EXIT_NET_PROFIT, "net_pnl_pct": gate, "hold_hours": hold_h}
+        if gate >= cfg.profit_floor_pct:
+            return {"action": "sell", "reason": EXIT_NET_PROFIT, "net_pnl_pct": gate, "hold_hours": hold_h}
         return {"action": "hold", "reason": "profit_only_hold", "net_pnl_pct": gate}
 
     stop_dist = cfg.atr_stop_mult * atr

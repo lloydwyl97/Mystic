@@ -152,6 +152,7 @@ try:
     from backend.services.social_trading_service import SocialTradingService, set_social_trading_service
 except (ImportError, ModuleNotFoundError, AttributeError, ValueError, TypeError, RuntimeError):
     SocialTradingService = None  # type: ignore[assignment, misc]
+    set_social_trading_service = None  # type: ignore[assignment, misc]
 
 try:
     from backend.services.social_trading_manager import social_trading_manager
@@ -162,7 +163,6 @@ try:
     from backend.services.service_manager import service_manager
 except (ImportError, ModuleNotFoundError, AttributeError, ValueError, TypeError, RuntimeError):
     service_manager = None  # type: ignore[assignment, misc]
-    set_social_trading_service = None  # type: ignore[assignment, misc]
 
 try:
     from backend.utils.unicode_safe_logging import configure_unicode_safe_logging

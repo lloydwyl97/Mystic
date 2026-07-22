@@ -30,13 +30,19 @@ logger = logging.getLogger(__name__)
 def _mtf_confirmation_gate_enabled() -> bool:
     """When true (default), long SCALP entries require non-down 5m (and 15m) trend."""
     return str(os.getenv("SCALP_MTF_CONFIRMATION_GATE_ENABLED", "true")).strip().lower() in (
-        "1", "true", "yes", "on",
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 
 def _mtf_require_15m() -> bool:
     return str(os.getenv("SCALP_MTF_REQUIRE_15M", "true")).strip().lower() in (
-        "1", "true", "yes", "on",
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 
