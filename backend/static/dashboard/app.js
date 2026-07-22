@@ -35,9 +35,14 @@ const LAZY_TAB_ENDPOINTS = {
         { path: "/api/scalp/scoreboard?days=14", key: "scalpScoreboard" },
         { path: "/api/scalp/attribution", key: "scalpAttribution" },
         { path: "/api/scalp/learning-summary", key: "scalpLearning" },
+        { path: "/api/scalp/telemetry", key: "scalpTelemetry" },
     ],
     marketlens: [
         { path: "/api/public/mystic-marketlens-feed", key: "marketlensFeed" },
+    ],
+    positions: [
+        { path: "/api/scalp/positions", key: "scalpPositions" },
+        { path: "/api/scalp/trades?limit=100", key: "scalpTrades" },
     ],
 };
 const BACKGROUND_ENDPOINTS = [
@@ -53,6 +58,7 @@ const BACKGROUND_ENDPOINTS = [
     { path: "/api/ai-diagnostics/missed-opportunities?limit=30", key: "missedOpportunities" },
     { path: "/api/portfolio-engine/trading-economics", key: "tradingEconomics" },
     { path: "/api/portfolio-engine/scoreboard?days=7", key: "scoreboard7d" },
+    { path: "/api/scalp/status", key: "scalpStatus", timeoutMs: SCALP_STATUS_TIMEOUT_MS },
 ];
 // Legacy alias — refresh button iterates this list
 const ENDPOINTS = BACKGROUND_ENDPOINTS.concat(
@@ -302,6 +308,9 @@ function initRefreshButton() {
             }),
         ]);
         Promise.all(promises).then(function () {
+            btn.textContent = "↻";
+            btn.disabled = false;
+        }).catch(function () {
             btn.textContent = "↻";
             btn.disabled = false;
         });
@@ -851,6 +860,9 @@ function updateUI(key, data, stale) {
         case "scalpAttribution":
             updateScalpAttribution(data);
             break;
+        case "scalpTelemetry":
+            updateScalpTelemetry(data);
+            break;
         case "processHealth":
             updateProcessHealth(data);
             break;
@@ -948,6 +960,7 @@ function updateScalpSymbolDiagnostics(d) {
     if (!tbody) return;
     const symbols = d.symbols || {};
     const micro = d.micro_regimes || {};
+    const telemetry = (window._lastScalpTelemetry && window._lastScalpTelemetry.per_symbol_entry_eligible) || {};
     const keys = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"].filter(function (k) {
         return symbols[k] || micro[k];
     });
@@ -955,21 +968,24 @@ function updateScalpSymbolDiagnostics(d) {
         keys.push.apply(keys, Object.keys(symbols).sort());
     }
     if (!keys.length) {
-        tbody.innerHTML = "<tr><td colspan=\"7\">--</td></tr>";
+        tbody.innerHTML = "<tr><td colspan=\"8\">--</td></tr>";
         return;
     }
     tbody.innerHTML = keys.map(function (sym) {
         const row = symbols[sym] || {};
-        const mr = micro[sym] || {};
+        const mrRaw = micro[sym];
+        const mrStr = typeof mrRaw === "string" ? mrRaw : (mrRaw && (mrRaw.micro_regime || mrRaw.regime)) || "--";
         const dist = row.distance_to_pass || {};
         const distPct = dist.distance_to_pass_pct != null ? Number(dist.distance_to_pass_pct).toFixed(3) + "%" : "--";
         const rejectRaw = String(row.reject_reason || "--");
         const rejectShort = rejectRaw.length > 28 ? rejectRaw.slice(0, 26) + "…" : rejectRaw;
+        const eligible = telemetry[sym];
+        const eligibleStr = eligible === true ? "✓" : eligible === false ? "✗" : "--";
         return "<tr><td>" + sym + "</td><td>" + (row.decision || "--") +
             "</td><td class=\"td-wrap\" title=\"" + rejectRaw.replace(/"/g, "&quot;") + "\">" + rejectShort +
-            "</td><td>" + (mr.micro_regime || mr.regime || "--") + "</td><td>" + distPct + "</td><td>" +
+            "</td><td>" + mrStr + "</td><td>" + distPct + "</td><td>" +
             (row.spread_pct != null ? (Number(row.spread_pct) * 100).toFixed(3) + "%" : "--") + "</td><td>" +
-            (row.momentum_confirmed ? "yes" : "no") + "</td></tr>";
+            (row.momentum_confirmed ? "yes" : "no") + "</td><td>" + eligibleStr + "</td></tr>";
     }).join("");
 }
 
@@ -980,6 +996,15 @@ function updateScalpRouter(d) {
         pre.textContent = JSON.stringify(d.strategy_router || {}, null, 2);
     } catch (_e) {
         pre.textContent = "--";
+    }
+}
+
+function updateScalpTelemetry(res) {
+    const d = (res && typeof res === "object") ? (res.data || res) : {};
+    window._lastScalpTelemetry = d;
+    // Re-render symbol diagnostics if already populated so Eligible column reflects fresh data
+    if (window._lastScalpStatus) {
+        updateScalpSymbolDiagnostics(window._lastScalpStatus);
     }
 }
 
@@ -1483,13 +1508,13 @@ function updateMarketDataReadiness(res) {
         tbody.innerHTML = "";
         if (loadingEl) {
             loadingEl.textContent = "Readiness probe failed or timed out.";
-            loadingEl.style.display = "block";
+            loadingEl.classList.add("is-visible");
         }
         if (sumEl) sumEl.textContent = "";
         return;
     }
 
-    if (loadingEl) loadingEl.style.display = "none";
+    if (loadingEl) loadingEl.classList.remove("is-visible");
 
     const rows = Array.isArray(d.rows) ? d.rows : [];
     tbody.innerHTML = rows

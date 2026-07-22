@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
 from backend.config.redis_config import get_redis_client as get_actual_redis_client
+from backend.services.admin_auth import require_admin_key
 from backend.observability.order_metrics import (
     ACTIVE_ORDERS_GAUGE,
     ADV_ORDERS_CREATE_LATENCY_SECONDS,
@@ -277,7 +278,7 @@ async def get_order(order_id: str) -> dict[str, Any]:
 
 
 @router.post("/api/orders/{order_id}/cancel")
-async def cancel_order(order_id: str) -> dict[str, Any]:
+async def cancel_order(order_id: str, _: None = Depends(require_admin_key)) -> dict[str, Any]:
     """Cancel a specific order."""
     t0 = time.perf_counter()
     try:

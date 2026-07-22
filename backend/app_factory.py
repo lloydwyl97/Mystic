@@ -56,7 +56,7 @@ except Exception as e:
     except Exception as e2:
         print(f"[ERROR] Fallback .env loading also failed: {e2}")
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -293,6 +293,7 @@ if not os.getenv("REDIS_URL"):
 
 # Now import settings after .env is loaded
 from backend.config.settings import settings
+from backend.services.admin_auth import require_admin_key
 from backend.utils.safe_encoder import decycle
 
 # Additional imports for background hydration
@@ -828,15 +829,18 @@ def create_app() -> FastAPI:
 
     # Add CORS middleware if configured; default to allow all during development
     try:
-        allow_origins = getattr(settings, "allowed_origins", None)
-        if allow_origins:
-            origins: list[str] = [str(x) for x in allow_origins] if isinstance(allow_origins, (list, tuple)) else [str(allow_origins)]  # type: ignore[misc]
+        _raw_origins = (
+            getattr(settings, "ui_origins", None)
+            or getattr(settings, "allowed_origins", None)
+        )
+        if _raw_origins:
+            origins: list[str] = [str(x) for x in _raw_origins] if isinstance(_raw_origins, (list, tuple)) else [str(_raw_origins)]  # type: ignore[misc]
         else:
-            origins = ["*"]
+            origins = ["http://localhost:8000"]
         app.add_middleware(
             CORSMiddleware,
             allow_origins=origins,
-            allow_credentials=True,
+            allow_credentials=(origins != ["*"]),
             allow_methods=["*"],
             allow_headers=["*"],
         )
@@ -845,7 +849,7 @@ def create_app() -> FastAPI:
 
     # Trusted hosts middleware if configured
     try:
-        trusted_hosts = getattr(settings, "trusted_hosts", None)
+        trusted_hosts = getattr(settings, "allowed_hosts", None) or getattr(settings, "trusted_hosts", None)
         if trusted_hosts:
             hosts: list[str] = [str(x) for x in trusted_hosts] if isinstance(trusted_hosts, (list, tuple)) else [str(trusted_hosts)]  # type: ignore[misc]
             app.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
@@ -1070,7 +1074,7 @@ def create_app() -> FastAPI:
     # PHASE 1 FIX #1: PAUSE/RESUME TRADING ENDPOINTS
     # ========================================================================
     @app.post("/api/system/pause-trading")
-    async def pause_trading_endpoint():
+    async def pause_trading_endpoint(_: None = Depends(require_admin_key)):
         """
         Emergency endpoint to pause all live trading.
         Used when critical bugs or issues are detected.
@@ -1079,7 +1083,7 @@ def create_app() -> FastAPI:
         return {"status": "paused", "message": "Live trading is now PAUSED - no new trades will execute", "timestamp": datetime.now(timezone.utc).isoformat()}
 
     @app.post("/api/system/resume-trading")
-    async def resume_trading_endpoint():
+    async def resume_trading_endpoint(_: None = Depends(require_admin_key)):
         """
         Resume live trading after being paused.
         Should only be called after critical issues are resolved.

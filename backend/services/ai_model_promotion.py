@@ -275,7 +275,7 @@ def register_candidate_and_maybe_promote(
             metrics["active_bad_trade_rate"] = round(a_bad, 6)
 
     has_active = active_path.exists()
-    holdout_ok = holdout_status == "OK"
+    holdout_ok = holdout_status in ("OK", "STALE_EVAL_BYPASS")
     holdout_count = int(metrics.get("holdout_sample_count") or metrics.get("sample_count") or 0)
     accuracy_margin = _accuracy_margin(holdout_count)
     metrics["accuracy_margin_applied"] = round(accuracy_margin, 6)
@@ -467,7 +467,7 @@ def maybe_rollback_underperforming_model(
             return False, "no_rollback_needed"
         active = conn.execute(
             """
-            SELECT model_id FROM ai_model_versions
+            SELECT model_id, path FROM ai_model_versions
             WHERE strategy_id = ? AND symbol = ? AND status = 'active'
             ORDER BY id DESC
             LIMIT 1
@@ -476,7 +476,7 @@ def maybe_rollback_underperforming_model(
         ).fetchone()
         prev = conn.execute(
             """
-            SELECT model_id FROM ai_model_versions
+            SELECT model_id, path FROM ai_model_versions
             WHERE strategy_id = ? AND symbol = ? AND status IN ('archived', 'rollback')
             ORDER BY id DESC
             LIMIT 1
@@ -495,4 +495,14 @@ def maybe_rollback_underperforming_model(
             (sid, sym, active[0], prev[0], "live_underperformance", json.dumps({"avg_recent_net_pnl_pct": avg_net}, separators=(",", ":"))),
         )
         conn.commit()
+    # Restore previous model artifact to the live active path on disk.
+    from backend.services.live_strategy_contracts import per_coin_artifact_file  # local import to avoid circular
+    prev_artifact_path = prev[1] if prev and len(prev) > 1 else None
+    active_pkl_path = per_coin_artifact_file(Path("models/active"), sid, sym)
+    if prev_artifact_path and os.path.exists(prev_artifact_path):
+        active_pkl_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(prev_artifact_path, active_pkl_path)
+        logger.info("[ROLLBACK] Restored artifact %s -> %s", prev_artifact_path, active_pkl_path)
+    else:
+        logger.warning("[ROLLBACK] Previous artifact not found: %s", prev_artifact_path)
     return True, "rollback_executed"

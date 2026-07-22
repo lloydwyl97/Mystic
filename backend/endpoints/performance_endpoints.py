@@ -187,11 +187,11 @@ def _performance_display_context() -> dict[str, Any]:
         return {
             "success": True,
             "data": {
-                "ledger_principal": 25000.0,
+                "ledger_principal": 10000.0,
                 "total_equity": 0.0,
                 "cash_balance": 0.0,
                 "positions_value": 0.0,
-                "account_return_usd": -25000.0,
+                "account_return_usd": -10000.0,
                 "realized_pnl": 0.0,
                 "unrealized_pnl": 0.0,
                 "last_updated": None,
@@ -205,7 +205,7 @@ def _performance_display_context() -> dict[str, Any]:
                 "note": ("Current ledger state + today (UTC calendar day) only. No all-time/lifetime data. SCALP excluded."),
             },
         }
-    principal = float(ledger.get("principal") or 25000.0)
+    principal = float(ledger.get("principal") or 10000.0)
     equity = float(ledger.get("total_equity") or 0)
     realized = float(ledger.get("realized_pnl") or 0)
     unrealized = float(ledger.get("unrealized_pnl") or 0)

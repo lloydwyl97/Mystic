@@ -755,6 +755,13 @@ def canonical_day_exit_reason(exit_trigger: str, *, exit_type_name: str = "") ->
         EXIT_LEGACY_INVENTORY_CLEANUP,
     ):
         return trig
+    # AW-specific reasons must be resolved before the generic MANUAL catch-all
+    if "ALLWEATHER_ATR_STOP" in trig:
+        return "ALLWEATHER_ATR_STOP_EXIT"
+    if "ALLWEATHER_ATR_TARGET" in trig:
+        return "ALLWEATHER_ATR_TARGET_EXIT"
+    if "ALLWEATHER_TIME_STOP" in trig:
+        return "ALLWEATHER_TIME_STOP_EXIT"
     if trig == "MANUAL" or exit_type_name == "MANUAL":
         return EXIT_MANUAL
     return EXIT_NET_PROFIT

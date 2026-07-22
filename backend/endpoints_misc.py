@@ -1,9 +1,10 @@
 import logging
 import os
+import sqlite3
 from typing import Any
 
 from backend.config.trading_universe import TRADING_SYMBOLS as TOP10
-from backend.services.ai_live_models_store import AILiveSignal, SessionLocal  # type: ignore[import-not-found]
+from backend.database_schema import DATABASE_PATH
 
 from .app_factory import app
 
@@ -22,9 +23,12 @@ def _hget_redis(redis_obj: Any, key: str, field: str) -> str | None:
 
 def _count_ai_signals_pending() -> int:
     try:
-        with SessionLocal() as s:  # type: ignore[misc]
-            return int(s.query(AILiveSignal).filter_by(consumed=False).count())
-    except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
+        with sqlite3.connect(DATABASE_PATH, timeout=3) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM ai_live_signals WHERE consumed = 0"
+            ).fetchone()
+            return int(row[0]) if row else 0
+    except Exception:
         return 0
 
 

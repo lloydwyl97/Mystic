@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger(__name__)
 
 # Force IPv4 for Binance.US REST — shared bootstrap patch.
 from backend.utils.network_ipv4 import ensure_ipv4_only
@@ -118,7 +121,8 @@ def _fetch_bars_live(symbol: str, interval: str, *, minutes: int = 30) -> list[d
             resp = client.get(url)
             resp.raise_for_status()
             rows = resp.json()
-    except Exception:
+    except Exception as e:
+        logger.warning("[KLINE_CACHE] Failed to fetch bars for %s/%s: %s", symbol, interval, e)
         return []
     if not isinstance(rows, list):
         return []

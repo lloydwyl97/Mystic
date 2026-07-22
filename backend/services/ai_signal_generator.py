@@ -573,7 +573,7 @@ class RealTimeAISignalGenerator:
 
         ctx_age: float | None = None
         if isinstance(ctx_h, dict):
-            ctx_ts = ctx_h.get("ctx_ts_utc") or ctx_h.get("updated_at_utc")
+            ctx_ts = ctx_h.get("ts_utc") or ctx_h.get("ctx_ts_utc") or ctx_h.get("updated_at_utc")
             if ctx_ts:
                 with contextlib.suppress(Exception):
                     from datetime import datetime, timezone

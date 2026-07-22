@@ -14,6 +14,7 @@ from backend.database_schema import DATABASE_PATH
 from backend.services.ai_canonical_storage import ensure_ai_canonical_tables
 from backend.services.ai_market_diagnostics import MODEL_STALE_HOURS
 from backend.services.ai_model_promotion import register_candidate_and_maybe_promote
+from backend.services.ai_model_promotion_holdout import build_holdout_validation_metrics
 from backend.services.live_strategy_contracts import per_coin_artifact_file
 
 logger = logging.getLogger(__name__)
@@ -113,13 +114,25 @@ def evaluate_stale_symbol(
             pass
 
     profit_proxy = _avg_outcome_profit_pct(strategy_id, sym, db_path=db_path)
-    validation_metrics: dict[str, Any] = {
+    try:
+        validation_metrics = build_holdout_validation_metrics(
+            strategy_id=strategy_id,
+            symbol_bus=sym,
+            candidate_path=candidate,
+            active_path=active if active.exists() else None,
+            db_path=db_path,
+        )
+    except Exception as _hv_exc:
+        logger.warning("STALE_EVAL: holdout metrics unavailable for %s: %s", sym, _hv_exc)
+        validation_metrics = {}
+    validation_metrics.setdefault("holdout_status", "STALE_EVAL_BYPASS")
+    validation_metrics.update({
         "accuracy": cand_acc,
         "active_accuracy": active_acc,
         "profit_after_cost": profit_proxy,
         "avg_net_pnl_pct": profit_proxy,
         "evaluation": "stale_model_workflow",
-    }
+    })
     result["validation_metrics"] = validation_metrics
 
     if not promote:

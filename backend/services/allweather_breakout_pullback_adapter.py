@@ -477,6 +477,13 @@ async def evaluate_breakout_pullback_candidate(
             out = AllweatherBpEvalOutcome(no_signal_diag=diag)
             record_eval_outcome(out, symbol=symbol)
             return out
+        else:
+            # Signal found but klines are stale — shadow-only, must not execute
+            logger.debug(f"[AW_BP] {symbol} stale kline cache — signal present but not executable")
+            diag["shadow_signal"] = sig
+            out = AllweatherBpEvalOutcome(no_signal_diag=diag)
+            record_eval_outcome(out, symbol=symbol)
+            return out
 
     if not sig:
         diag = diagnose_entry_state(state, bar_count=len(bars), symbol=symbol, timestamp=ts)

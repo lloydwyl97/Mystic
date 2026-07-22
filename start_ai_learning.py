@@ -38,6 +38,23 @@ if __name__ == "__main__":
     sys.path.insert(0, ".")
 
 
+_SCALP_INGEST_INTERVAL_SEC = 300  # ingest scalp outcomes every 5 minutes
+
+
+async def _scalp_ingest_loop() -> None:
+    """Periodic background ingestion of closed SCALP outcomes into scalp_learning_outcomes."""
+    while True:
+        try:
+            from backend.services.ai_learning_ingestion import ingest_scalp_outcomes
+
+            result = ingest_scalp_outcomes()
+            if result.get("ingested", 0) > 0:
+                logger.info("SCALP_OUTCOME_INGEST ingested=%d skipped=%d errors=%d", result.get("ingested", 0), result.get("skipped", 0), result.get("errors", 0))
+        except Exception as exc:
+            logger.debug("SCALP_OUTCOME_INGEST_SKIPPED %s", exc)
+        await asyncio.sleep(_SCALP_INGEST_INTERVAL_SEC)
+
+
 async def main() -> None:
     pipeline = None
     try:
@@ -49,6 +66,7 @@ async def main() -> None:
             return
         await pipeline.start()
         logger.info("TRAINING LOOP STARTED")
+        asyncio.ensure_future(_scalp_ingest_loop())
         while True:
             await asyncio.sleep(60)
     except KeyboardInterrupt:

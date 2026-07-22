@@ -38,6 +38,8 @@ class ScalpConfig:
     calibration_mode: bool
     calibration_profile: str
     disabled_strategies: frozenset[str]
+    daily_loss_limit_pct: float
+    max_consecutive_losses: int
 
     @classmethod
     def from_env(cls) -> ScalpConfig:
@@ -84,6 +86,8 @@ class ScalpConfig:
                 ).split(",")
                 if s.strip()
             ),
+            daily_loss_limit_pct=float(os.getenv("SCALP_DAILY_LOSS_LIMIT_PCT", "0.05")),
+            max_consecutive_losses=int(os.getenv("SCALP_MAX_CONSECUTIVE_LOSSES", "5")),
         )
 
     def assert_no_live_trading(self) -> None:

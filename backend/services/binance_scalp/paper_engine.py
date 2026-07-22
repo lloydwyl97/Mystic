@@ -371,6 +371,61 @@ class BinanceScalpPaperEngine:
             return True
         return is_entry_armed(self._redis, prefix=self.config.redis_key_prefix)
 
+    def _check_scalp_circuit_breaker(self) -> bool:
+        """Check SCALP-specific circuit breaker. Returns True if circuit is open (halt new entries).
+
+        Two conditions trigger the breaker:
+        1. Today's closed-trade PnL is worse than -SCALP_DAILY_LOSS_LIMIT_PCT * principal.
+        2. The last SCALP_MAX_CONSECUTIVE_LOSSES closed trades are all losses.
+        """
+        try:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            with self._conn() as conn:
+                ledger = self._ledger(conn)
+                principal = float(ledger["principal"])
+
+                # Daily loss check
+                row = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(pnl_usd), 0) AS today_pnl
+                    FROM scalp_paper_trades
+                    WHERE upper(side) = 'SELL'
+                      AND pnl_usd IS NOT NULL
+                      AND date(created_at) = ?
+                    """,
+                    (today,),
+                ).fetchone()
+                today_pnl = float(row[0]) if row else 0.0
+                daily_limit = self.config.daily_loss_limit_pct * principal
+                if today_pnl <= -daily_limit:
+                    logger.warning(
+                        "[SCALP_CIRCUIT_BREAKER] Daily loss limit hit: today_pnl=%.4f limit=-%.4f principal=%.2f halt=True",
+                        today_pnl,
+                        daily_limit,
+                        principal,
+                    )
+                    return True
+
+                # Consecutive loss check
+                max_consec = self.config.max_consecutive_losses
+                recent_rows = conn.execute(
+                    """
+                    SELECT pnl_usd FROM scalp_paper_trades
+                    WHERE upper(side) = 'SELL' AND pnl_usd IS NOT NULL
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (max_consec,),
+                ).fetchall()
+                if len(recent_rows) >= max_consec and all(float(r[0]) <= 0.0 for r in recent_rows):
+                    logger.warning(
+                        "[SCALP_CIRCUIT_BREAKER] %d consecutive losses, halt=True",
+                        max_consec,
+                    )
+                    return True
+        except Exception as e:
+            logger.warning("[SCALP_CIRCUIT_BREAKER] Check failed (non-blocking): %s", e)
+        return False
+
     def _entry_candidates(self, conn: sqlite3.Connection) -> list[tuple[str, MarketSnapshot, object]]:
         if not self.config.scalp_paper_enabled:
             self._publish_last_decision(decision="BLOCKED", reason=SCALP_PAPER_DISABLED)
@@ -598,6 +653,10 @@ class BinanceScalpPaperEngine:
     def _try_entry(self, conn: sqlite3.Connection) -> None:
         open_count = conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0]
         if open_count >= self.config.max_open_positions:
+            return
+
+        if self._check_scalp_circuit_breaker():
+            self._publish_last_decision(decision="BLOCKED", reason="SCALP_CIRCUIT_BREAKER_OPEN")
             return
 
         candidates = self._entry_candidates(conn)

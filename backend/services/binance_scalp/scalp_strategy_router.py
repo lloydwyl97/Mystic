@@ -17,6 +17,7 @@ from backend.services.binance_scalp.scalp_candidate_ranking import (
     rank_setup_signal,
 )
 from backend.services.binance_scalp.scalp_regime_classifier import (
+    REGIME_DATA_MISSING,
     REGIME_RANGE,
     classify_scalp_regime,
 )
@@ -103,6 +104,9 @@ class ScalpStrategyRouter:
 
         regime = self._current_regime(sym, epoch, bars)
         meta["regime"] = regime
+        if regime == REGIME_DATA_MISSING:
+            meta["hard_block"] = "REGIME_DATA_MISSING"
+            return None, [], meta
         # Multi-timeframe confirmation between 1m setups and 1h regime.
         # When SCALP_MTF_CONFIRMATION_GATE_ENABLED (default true), a down 5m/15m
         # trend blocks entry_eligible. Missing history (None) does not block.
@@ -237,7 +241,7 @@ class ScalpStrategyRouter:
             return None, None
 
     def _current_regime(self, symbol: str, epoch: float, bars: list[dict] | None) -> str:
-        """Best-effort 1h regime from kline cache (falls back to range)."""
+        """1h regime from kline cache. Returns REGIME_DATA_MISSING on fetch failure (hard-blocks entry)."""
         sym = symbol.strip().upper()
         try:
             bars_1h = self.klines.get_1h(sym) or []
@@ -245,8 +249,9 @@ class ScalpStrategyRouter:
                 st = classify_scalp_regime(bars_1h, len(bars_1h) - 1)
                 if st and st.regime:
                     return st.regime
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[SCALP_REGIME] Failed to determine regime for %s: %s", sym, e)
+            return REGIME_DATA_MISSING
         return REGIME_RANGE
 
     def evaluate_all(

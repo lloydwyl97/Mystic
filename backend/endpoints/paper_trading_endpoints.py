@@ -15,7 +15,9 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+
+from backend.services.admin_auth import require_admin_key
 from pydantic import BaseModel
 
 from backend.config.redis_config import get_redis_client, get_shared_redis_async
@@ -732,7 +734,7 @@ async def get_paper_trading_trades(limit: int | None = None, run_id: str | None 
 
 
 @router.post("/reset")
-async def reset_paper_account() -> dict[str, Any]:
+async def reset_paper_account(_: None = Depends(require_admin_key)) -> dict[str, Any]:
     """Reset paper trading account"""
     try:
         paper_service = get_paper_trading_service()
@@ -749,7 +751,7 @@ async def reset_paper_account() -> dict[str, Any]:
 
 
 @router.post("/enable")
-async def enable_paper_trading() -> dict[str, Any]:
+async def enable_paper_trading(_: None = Depends(require_admin_key)) -> dict[str, Any]:
     """Enable paper trading"""
     try:
         paper_service = get_paper_trading_service()
@@ -766,7 +768,7 @@ async def enable_paper_trading() -> dict[str, Any]:
 
 
 @router.post("/disable")
-async def disable_paper_trading() -> dict[str, Any]:
+async def disable_paper_trading(_: None = Depends(require_admin_key)) -> dict[str, Any]:
     """Disable paper trading"""
     try:
         paper_service = get_paper_trading_service()

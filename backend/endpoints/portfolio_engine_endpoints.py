@@ -20,7 +20,9 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from backend.services.admin_auth import require_admin_key
 
 from backend.config.trading_universe import TRADING_SYMBOLS
 from backend.database_schema import DATABASE_PATH
@@ -856,7 +858,7 @@ async def check_invariants() -> dict[str, Any]:
 
 
 @router.post("/initialize")
-async def initialize_engine() -> dict[str, Any]:
+async def initialize_engine(_: None = Depends(require_admin_key)) -> dict[str, Any]:
     """
     Initialize or re-initialize the portfolio engine from database.
     Call this after restarts or to recover from errors.
@@ -954,7 +956,7 @@ async def get_adoption_debug_info() -> dict[str, Any]:
 
 
 @router.post("/control")
-async def set_kill_switch(mode: str, reason: str = "") -> dict[str, Any]:
+async def set_kill_switch(mode: str, reason: str = "", _: None = Depends(require_admin_key)) -> dict[str, Any]:
     """
     ITEM 1: Kill switch control endpoint.
 

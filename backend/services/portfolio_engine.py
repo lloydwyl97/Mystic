@@ -1663,6 +1663,8 @@ class PortfolioEngine:
         self._fifo_sell_lock: asyncio.Lock = asyncio.Lock()
         # Single-flight buy lock per symbol — prevents paired duplicate paper_trades rows
         self._buy_execution_locks: dict[str, asyncio.Lock] = {}
+        # Global cash lock — prevents cross-symbol overdraw (two symbols passing cash check then both debiting)
+        self._global_cash_lock: asyncio.Lock = asyncio.Lock()
 
         # Portfolio snapshot tracking (5-min throttle, 30-day retention)
         self._last_snapshot_time: float = 0.0
@@ -4619,6 +4621,13 @@ class PortfolioEngine:
             return "FAILED_RECLAIM_EXIT"
         if "EXTREME_PROTECTION" in trig:
             return "EXTREME_PROTECTION_EXIT"
+        # AW-specific exits must be resolved before MANUAL fallback in canonical_day_exit_reason
+        if "ALLWEATHER_ATR_STOP" in trig:
+            return "ALLWEATHER_ATR_STOP_EXIT"
+        if "ALLWEATHER_ATR_TARGET" in trig:
+            return "ALLWEATHER_ATR_TARGET_EXIT"
+        if "ALLWEATHER_TIME_STOP" in trig:
+            return "ALLWEATHER_TIME_STOP_EXIT"
 
         canonical = canonical_day_exit_reason(exit_trigger, exit_type_name=exit_type.name)
         if canonical in ALLOWED_DAY_EXIT_REASONS:
@@ -6672,6 +6681,10 @@ class PortfolioEngine:
         symbol, regardless of unrelated async scheduling/reload timing.
         """
         normalized_symbol_for_lock = normalize_symbol(symbol)
+        # PE-3: Hard-gate — only DAY_TRADE_SYMBOLS may execute buys.
+        if _to_api_symbol(symbol) not in DAY_TRADE_SYMBOLS:
+            logger.debug("[BUY_GATE] %s not in trading universe, rejecting from execute_buy_fifo", symbol)
+            return None
         lock = self._buy_execution_locks.setdefault(normalized_symbol_for_lock, asyncio.Lock())
         async with lock:
             return await self._execute_buy_fifo_locked(
@@ -7352,23 +7365,7 @@ class PortfolioEngine:
                     )
                 return None
 
-        # Double-check cash (should be redundant but critical)
-        if total_cost > self._available_balance:
-            reason = f"total_cost=${total_cost:.2f} > available=${self._available_balance:.2f}"
-            logger.error(f"BUY_BLOCKED_CASH_INVARIANT: {symbol} - {reason}")
-            await self._record_reject(
-                symbol,
-                "BUY",
-                reason,
-                "CASH_INVARIANT",
-                decision_id=decision_id,
-                explainability=explainability,
-            )
-
-            # PIPELINE TRACKING: Record EXECUTION stage failure
-            if decision_id:
-                await self._update_pipeline_decision(decision_id, {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"CASH_INVARIANT: {reason}"})
-            return None
+        # Cash double-check moved to just before debit, inside _global_cash_lock (PE-1).
 
         # Calculate TP levels from PER-COIN volatility profile (day mode)
         profile = get_coin_profile(symbol)
@@ -7434,6 +7431,7 @@ class PortfolioEngine:
                 run_locked_retry(_op)
             except Exception as e:
                 logger.error(f"PAPER_TRADES_BUY_INSERT_FAILED: {symbol} - {e}", exc_info=True)
+                raise  # PE-2: fail-closed — propagate so cash is NOT debited
 
         # =================================================================
         # LIVE EXECUTION: Execute on Binance.US FIRST (C1 fix: never persist executed BUY before order success)
@@ -7507,7 +7505,12 @@ class PortfolioEngine:
 
         # Persist trade row only after live order success (or when not in LIVE mode)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _sync_insert)
+        try:
+            await loop.run_in_executor(None, _sync_insert)
+        except Exception:
+            # PE-2: INSERT failed — abort before any cash debit (fail-closed)
+            logger.error("BUY_ABORTED: paper_trades INSERT failed for %s — aborting, cash NOT debited", symbol)
+            return None
 
         try:
             from backend.services.strategy_runtime_audit import EVT_BUY_EXECUTED, insert_audit_row_async
@@ -7534,9 +7537,25 @@ class PortfolioEngine:
         # =================================================================
         # UPDATE AUTHORITATIVE LEDGER (conservation of money)
         # =================================================================
-        # Cash decreases by total cost (canonical: cash = USDT on exchange)
-        self.cash_balance -= total_cost
-        self._available_balance = max(0.0, self.cash_balance)
+        # Global cash lock: final atomic check-then-debit across all concurrent symbol buys (PE-1).
+        async with self._global_cash_lock:
+            if total_cost > self._available_balance:
+                reason = f"total_cost=${total_cost:.2f} > available=${self._available_balance:.2f}"
+                logger.error(f"BUY_BLOCKED_CASH_INVARIANT: {symbol} - {reason}")
+                await self._record_reject(
+                    symbol,
+                    "BUY",
+                    reason,
+                    "CASH_INVARIANT",
+                    decision_id=decision_id,
+                    explainability=explainability,
+                )
+                if decision_id:
+                    await self._update_pipeline_decision(decision_id, {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"CASH_INVARIANT: {reason}"})
+                return None
+            # Cash decreases by total cost (canonical: cash = USDT on exchange)
+            self.cash_balance -= total_cost
+            self._available_balance = max(0.0, self.cash_balance)
         # Persist cash debit immediately so MTM loop cannot reload pre-buy cash.
         try:
             async with self._sqlite_writer_lock:
@@ -7934,14 +7953,7 @@ class PortfolioEngine:
         total_cost = quantity * fill_price + fee
         slippage_cost = (fill_price - price) * quantity
 
-        if total_cost > self._available_balance:
-            await self._record_reject(
-                normalized_symbol,
-                "BUY",
-                f"total_cost={total_cost:.2f}>available={self._available_balance:.2f}",
-                "REPAIR_ADD_CASH",
-            )
-            return None
+        # Cash check moved to just before debit, inside _global_cash_lock (PE-1).
 
         effective_sleeve = getattr(position, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value
         sleeve_ok, sleeve_reason = self._check_sleeve_limits(effective_sleeve, total_cost)
@@ -8069,8 +8081,18 @@ class PortfolioEngine:
         if float(getattr(position, "original_position_cost", 0.0) or 0.0) <= 0:
             position.original_position_cost = float(evaluation.original_cost or old_entry * old_qty)
 
-        self.cash_balance -= total_cost
-        self._available_balance = max(0.0, self.cash_balance)
+        # Global cash lock: final atomic check-then-debit (PE-1).
+        async with self._global_cash_lock:
+            if total_cost > self._available_balance:
+                await self._record_reject(
+                    normalized_symbol,
+                    "BUY",
+                    f"total_cost={total_cost:.2f}>available={self._available_balance:.2f}",
+                    "REPAIR_ADD_CASH",
+                )
+                return None
+            self.cash_balance -= total_cost
+            self._available_balance = max(0.0, self.cash_balance)
         self.trade_explanations[trade_id] = explainability
         self._prune_trade_explanations()
 
@@ -8369,7 +8391,8 @@ class PortfolioEngine:
         # Fallback: when mark feed is temporarily unavailable, allow the
         # explicitly provided execution price to act as sell mark so manual/proof
         # exits can proceed through canonical FIFO+outcome paths.
-        if not bool(sell_eval["allowed"]) and str(sell_eval.get("block_reason") or "") in {"SELL_MARK_MISSING", "SELL_MARK_STALE"} and float(price or 0.0) > 0.0:
+        # PE-4: caller_price fallback only permitted when force_sell=True (emergency/manual exits).
+        if not bool(sell_eval["allowed"]) and str(sell_eval.get("block_reason") or "") in {"SELL_MARK_MISSING", "SELL_MARK_STALE"} and float(price or 0.0) > 0.0 and force_sell:
             sell_eval["allowed"] = True
             sell_eval["block_reason"] = ""
             sell_eval["mark_price"] = float(price)
@@ -14119,6 +14142,10 @@ class PortfolioEngine:
             superseded_decision_id is set when an existing queued candidate was replaced; that id must be terminalized in SQL.
         """
         symbol = normalize_symbol(symbol)
+        # PE-3: Hard-gate — only DAY_TRADE_SYMBOLS may enter the buy pipeline.
+        if _to_api_symbol(symbol) not in DAY_TRADE_SYMBOLS:
+            logger.debug("[BUY_GATE] %s not in trading universe, rejecting", symbol)
+            return (False, None)
         if ENTRY_MAJOR_ONLY and symbol not in ENTRY_ALLOWED_SYMBOLS:
             logger.debug(
                 "CANDIDATE_REJECTED_SYMBOL_NOT_ALLOWED: %s allowlist=%s",

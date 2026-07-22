@@ -13,6 +13,8 @@ from typing import Any
 REGIME_BULL_TREND = "bull_trend"
 REGIME_BEAR_TREND = "bear_trend"
 REGIME_RANGE = "range"
+# Sentinel: kline fetch failed — not a real regime; hard-blocks all entries.
+REGIME_DATA_MISSING = "regime_data_missing"
 REGIME_CHOP = "chop"
 REGIME_VOL_EXPANSION = "vol_expansion"
 REGIME_VOL_CRUSH = "vol_crush"

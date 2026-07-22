@@ -1193,17 +1193,182 @@ def _heartbeat_schema_health(db_path: str = DATABASE_PATH) -> dict[str, Any]:
     return health
 
 
+_SCALP_OUTCOMES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS scalp_learning_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ingested_at TEXT NOT NULL,
+    source_id INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    setup_name TEXT,
+    entry_timestamp REAL,
+    exit_timestamp REAL,
+    entry_price REAL,
+    exit_price REAL,
+    quantity REAL,
+    fees_paid REAL,
+    slippage_cost REAL,
+    net_pnl_usd REAL,
+    net_pnl_pct REAL,
+    hold_seconds REAL,
+    exit_reason TEXT,
+    UNIQUE(source_id)
+);
+CREATE INDEX IF NOT EXISTS ix_scalp_lo_symbol ON scalp_learning_outcomes(symbol, exit_timestamp);
+CREATE INDEX IF NOT EXISTS ix_scalp_lo_setup ON scalp_learning_outcomes(setup_name, exit_timestamp);
+"""
+
+_scalp_outcomes_tables_ready = False
+
+
+def _ensure_scalp_outcomes_table(db_path: str) -> None:
+    global _scalp_outcomes_tables_ready
+    if _scalp_outcomes_tables_ready:
+        return
+    with sqlite3.connect(db_path) as conn:
+        for stmt in _SCALP_OUTCOMES_SCHEMA.strip().split(";"):
+            s = stmt.strip()
+            if s:
+                conn.execute(s)
+        conn.commit()
+    _scalp_outcomes_tables_ready = True
+
+
+def ingest_scalp_outcomes(db_path: str = DATABASE_PATH) -> dict[str, int]:
+    """Ingest closed SCALP paper trade outcomes into scalp_learning_outcomes.
+
+    Reads from trade_learning_outcomes (rows written by paper_engine._after_commit
+    with engine='binance_scalp_paper' in extra_json) and normalizes them into a
+    separate scalp_learning_outcomes table so the AI training pipeline can consume
+    SCALP outcomes without mixing the DAY and SCALP datasets.
+
+    Returns counters: {"ingested": N, "skipped": N, "errors": N}
+    """
+    _ensure_scalp_outcomes_table(db_path)
+    counters = {"ingested": 0, "skipped": 0, "errors": 0}
+    try:
+        with sqlite3.connect(db_path, timeout=15) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT id, symbol, entry_timestamp, exit_timestamp,
+                       entry_price, exit_price, quantity,
+                       fees_paid, slippage_cost,
+                       net_profit_usd, net_profit_pct,
+                       hold_seconds, close_reason, extra_json
+                FROM trade_learning_outcomes
+                WHERE extra_json LIKE '%binance_scalp_paper%'
+                  AND exit_timestamp IS NOT NULL
+                ORDER BY id ASC
+                """
+            ).fetchall()
+
+            existing_ids = {
+                r[0]
+                for r in conn.execute("SELECT source_id FROM scalp_learning_outcomes").fetchall()
+            }
+
+            for row in rows:
+                source_id = int(row["id"])
+                if source_id in existing_ids:
+                    counters["skipped"] += 1
+                    continue
+                try:
+                    extra: dict = {}
+                    with contextlib.suppress(Exception):
+                        raw = row["extra_json"]
+                        if raw:
+                            extra = json.loads(raw) if isinstance(raw, str) else {}
+                    setup_name = str(extra.get("setup") or "")
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO scalp_learning_outcomes
+                        (ingested_at, source_id, symbol, setup_name,
+                         entry_timestamp, exit_timestamp, entry_price, exit_price,
+                         quantity, fees_paid, slippage_cost,
+                         net_pnl_usd, net_pnl_pct, hold_seconds, exit_reason)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            _now_iso(),
+                            source_id,
+                            str(row["symbol"] or ""),
+                            setup_name,
+                            float(row["entry_timestamp"] or 0),
+                            float(row["exit_timestamp"] or 0),
+                            float(row["entry_price"] or 0),
+                            float(row["exit_price"] or 0),
+                            float(row["quantity"] or 0),
+                            float(row["fees_paid"] or 0),
+                            float(row["slippage_cost"] or 0),
+                            float(row["net_profit_usd"] or 0),
+                            float(row["net_profit_pct"] or 0),
+                            float(row["hold_seconds"] or 0),
+                            str(row["close_reason"] or ""),
+                        ),
+                    )
+                    counters["ingested"] += 1
+                except Exception as e:
+                    logger.debug("ingest_scalp_outcomes row %s failed: %s", source_id, e)
+                    counters["errors"] += 1
+            conn.commit()
+    except sqlite3.Error as e:
+        logger.debug("ingest_scalp_outcomes failed: %s", e)
+    return counters
+
+
+def scalp_outcomes_summary(db_path: str = DATABASE_PATH) -> dict[str, Any]:
+    """Return basic stats from scalp_learning_outcomes for health reporting."""
+    _ensure_scalp_outcomes_table(db_path)
+    out: dict[str, Any] = {"total": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "per_setup": {}}
+    try:
+        with sqlite3.connect(db_path, timeout=10) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*),
+                       SUM(CASE WHEN net_pnl_usd > 0 THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN net_pnl_usd <= 0 THEN 1 ELSE 0 END),
+                       COALESCE(SUM(net_pnl_usd), 0)
+                FROM scalp_learning_outcomes
+                """
+            ).fetchone()
+            if row:
+                out["total"] = int(row[0] or 0)
+                out["wins"] = int(row[1] or 0)
+                out["losses"] = int(row[2] or 0)
+                out["net_pnl"] = float(row[3] or 0)
+            for setup, cnt, wins, pnl in conn.execute(
+                """
+                SELECT setup_name,
+                       COUNT(*),
+                       SUM(CASE WHEN net_pnl_usd > 0 THEN 1 ELSE 0 END),
+                       COALESCE(SUM(net_pnl_usd), 0)
+                FROM scalp_learning_outcomes
+                GROUP BY setup_name
+                """
+            ).fetchall():
+                out["per_setup"][str(setup or "")] = {
+                    "count": int(cnt or 0),
+                    "wins": int(wins or 0),
+                    "net_pnl": float(pnl or 0),
+                }
+    except sqlite3.Error as e:
+        logger.debug("scalp_outcomes_summary failed: %s", e)
+    return out
+
+
 __all__ = [
     "LABEL_BATCH_LIMIT",
     "MAX_TIER_BC_SHARE",
     "TIER_B_WEIGHT",
     "TIER_C_WEIGHT",
     "ensure_learning_ingestion_tables",
+    "ingest_scalp_outcomes",
     "label_pending_snapshots",
     "learning_health_summary",
     "missed_move_rank_adjustments",
     "record_candidate_snapshot",
     "record_position_heartbeat",
+    "scalp_outcomes_summary",
     "tier_b_training_rows",
     "tier_c_training_rows",
     "tiered_holdout_eval_rows",
