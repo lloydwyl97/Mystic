@@ -191,6 +191,14 @@ function todayUtcDateStr() {
     return new Date().toISOString().slice(0, 10);
 }
 
+function responseErrorMessage(data, fallback) {
+    if (!data || typeof data !== "object") return fallback;
+    for (const key of ["message", "detail", "error"]) {
+        if (typeof data[key] === "string" && data[key].trim()) return data[key];
+    }
+    return fallback;
+}
+
 function markDashboardLoading(loading) {
     if (loading) {
         CANONICAL_STALE_WIDGET_IDS.forEach(function (id) {
@@ -252,14 +260,15 @@ function initTradeFilters() {
 
 function applyTradeFilters() {
     const engine = (document.querySelector('input[name="engine-filter"]:checked') || {}).value || "all";
-    const time = (document.querySelector('input[name="time-filter"]:checked') || {}).value || "all";
+    const time = getSelectedTradeTimeFilter();
     document.querySelectorAll("#tab-positions [data-engine]").forEach(function (el) {
         const eng = el.getAttribute("data-engine");
         el.hidden = engine !== "all" && eng !== engine;
     });
     if (window._lastScalpTrades) updateScalpTradesTable(window._lastScalpTrades, time);
-    if (window._lastDashboardCanonical && window._lastDashboardCanonical.performance) {
-        updateTrades({ trades: window._lastDayTrades || window._lastDashboardCanonical.performance.trades || [] });
+    const canonicalPerformance = window._lastDashboardCanonical && window._lastDashboardCanonical.performance;
+    if (window._lastDayTrades || canonicalPerformance) {
+        updateTrades({ trades: window._lastDayTrades || canonicalPerformance.trades || [] }, time);
     }
 }
 
@@ -341,7 +350,7 @@ function initOperatorControls() {
                 }
                 pollOne(CANONICAL_ENDPOINT);
             } else {
-                const msg = data.error || data.detail || "Save failed";
+                const msg = responseErrorMessage(data, "Save failed");
                 if (statusEl) {
                     statusEl.textContent = msg;
                     statusEl.className = "operator-form__status operator-form__status--err";
@@ -420,7 +429,7 @@ function initModeSwitch() {
                 updateExecutionMode(data);
                 pollOne(CANONICAL_ENDPOINT);
             } else {
-                const reason = data.error || data.detail || "unknown";
+                const reason = responseErrorMessage(data, "unknown");
                 const failures = (data.readiness && data.readiness.failures) ? data.readiness.failures.join(", ") : "";
                 alert("Mode switch failed: " + reason + (failures ? "\n\n" + failures : ""));
             }
@@ -438,13 +447,13 @@ function initCharts() {
 
     const gridColor = "rgba(43, 49, 57, 0.3)";
     const textColor = "rgba(139, 148, 158, 0.8)";
-    
+
     const commonChartOptions = {
         responsive: true,
         maintainAspectRatio: false,
-        animation: { 
-            duration: 750, 
-            easing: 'easeInOutQuart' 
+        animation: {
+            duration: 750,
+            easing: 'easeInOutQuart'
         },
         interaction: {
             intersect: false,
@@ -499,7 +508,7 @@ function initCharts() {
         const gradientFill = ctx.createLinearGradient(0, 0, 0, 220);
         gradientFill.addColorStop(0, 'rgba(14, 203, 129, 0.2)');
         gradientFill.addColorStop(1, 'rgba(14, 203, 129, 0)');
-        
+
         chartPortfolio = new Chart(pvCtx, {
             type: "line",
             data: {
@@ -548,7 +557,7 @@ function initCharts() {
         const gradientFill = ctx.createLinearGradient(0, 0, 0, 220);
         gradientFill.addColorStop(0, 'rgba(14, 203, 129, 0.2)');
         gradientFill.addColorStop(1, 'rgba(14, 203, 129, 0)');
-        
+
         chartCumulativeReturns = new Chart(crCtx, {
             type: "line",
             data: {
@@ -1897,7 +1906,7 @@ async function fetchTradeDrilldown(tradeId, targetEl) {
         const r = await fetch("/api/portfolio-engine/trade/" + encodeURIComponent(tradeId));
         const j = await r.json();
         if (!j.success) {
-            targetEl.textContent = j.detail || j.error || "Failed";
+            targetEl.textContent = responseErrorMessage(j, "Failed");
             return;
         }
         targetEl.textContent = JSON.stringify(j.data, null, 2).slice(0, 12000);
@@ -2460,8 +2469,9 @@ function setupHistoricalDiagnosticsToggle() {
 // portfolio-engine/performance: canonical P&L — supplemental only when display-context not loaded
 function updatePortfolioPerformance(data) {
     if (!data || !data.success) return;
+    const timeFilter = getSelectedTradeTimeFilter();
     if (window._perfDisplayContext && window._perfDisplayContext.ledger_principal != null) {
-        updateTrades({ trades: data.trades || [] });
+        updateTrades({ trades: data.trades || [] }, timeFilter);
         window._lastDayTrades = data.trades || [];
         return;
     }
@@ -2504,7 +2514,7 @@ function updatePortfolioPerformance(data) {
         unrealizedEl.classList.add(Number(p.unrealized_pnl) >= 0 ? "pnl-pos" : "pnl-neg");
         unrealizedEl.title = "Open positions mark-to-market vs entry (not total account return).";
     }
-    updateTrades({ trades });
+    updateTrades({ trades }, timeFilter);
     window._lastDayTrades = trades;
 }
 
@@ -2635,17 +2645,17 @@ function updatePortfolioChart(data) {
     const portfolio = Array.isArray(data.portfolio) ? data.portfolio : [];
     const noData = document.getElementById("portfolio-no-data");
     const canvas = document.getElementById("chart-portfolio-value");
-    
+
     if (portfolio.length === 0) {
         // No data - show message
         if (noData) noData.classList.add("is-visible");
         if (canvas) canvas.style.display = "none";
         return;
     }
-    
+
     // Has data
     if (canvas) canvas.style.display = "block";
-    
+
     if (chartPortfolio) {
         // Chart available - render it
         if (noData) noData.classList.remove("is-visible");
@@ -2718,25 +2728,47 @@ function updateDailyReturnsChart(data) {
 function normalizeTs(ts) {
     if (ts == null) return 0;
     if (typeof ts === "number") return ts > 1e12 ? ts : ts * 1000;
-    const d = new Date(ts);
+    const value = typeof ts === "string" && /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(ts) && !/[zZ]|[+-]\d{2}:?\d{2}$/.test(ts)
+        ? ts.replace(" ", "T") + "Z"
+        : ts;
+    const d = new Date(value);
     return isNaN(d.getTime()) ? 0 : d.getTime();
 }
 
+function getSelectedTradeTimeFilter() {
+    return (document.querySelector('input[name="time-filter"]:checked') || {}).value || "all";
+}
+
+function filterTradesByTime(trades, timeFilter, nowMs) {
+    const filter = timeFilter || "all";
+    if (filter === "all") return trades;
+    const now = nowMs == null ? Date.now() : nowMs;
+    const today = new Date(now).toISOString().slice(0, 10);
+    return trades.filter(function (trade) {
+        const ts = normalizeTs(trade.timestamp || trade.created_at || trade.time);
+        if (!ts) return false;
+        if (filter === "today") return new Date(ts).toISOString().slice(0, 10) === today;
+        if (filter === "7d") return ts >= now - 7 * 86400000 && ts <= now;
+        return true;
+    });
+}
+
 // portfolio-engine/performance: { trades: [...] } — DAY ledger only
-function updateTrades(data) {
+function updateTrades(data, timeFilter) {
     if (!data || typeof data !== "object") return;
     const trades = Array.isArray(data.trades) ? data.trades : [];
     const tbody = document.getElementById("trades-tbody");
     const noData = document.getElementById("trades-no-data");
     if (!tbody) return;
     tbody.innerHTML = "";
-    if (trades.length === 0) {
+    const filtered = filterTradesByTime(trades, timeFilter);
+    if (filtered.length === 0) {
         if (noData) noData.classList.add("is-visible");
         return;
     }
     if (noData) noData.classList.remove("is-visible");
     // Newest first (chronological), then SELL before BUY at same second
-    const sorted = [...trades].sort((a, b) => {
+    const sorted = [...filtered].sort((a, b) => {
         const ta = normalizeTs(a.timestamp || a.created_at || a.time);
         const tb = normalizeTs(b.timestamp || b.created_at || b.time);
         if (tb !== ta) return tb - ta;

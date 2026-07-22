@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from backend.services.binance_scalp.scalp_candidate_ranking import (
     _min_tradeable_score,
     _min_confident_rank,
     _rank_tie_margin,
+    pick_best_global_candidate,
 )
 from backend.services.binance_scalp.near_pass import (
     NEAR_PASS_THRESHOLD,
@@ -300,7 +302,7 @@ def _symbol_decision(row: dict) -> str:
     if row.get("error"):
         return "BLOCKED"
     if row.get("would_enter_if_armed"):
-        return "PASS"
+        return "READY_TO_WATCH" if row.get("entry_armed") is False else "PASS"
     if row.get("would_arm_high_quality_near_pass"):
         return "READY_TO_WATCH"
     dist = float((row.get("distance_to_pass") or {}).get("distance_to_pass_pct") or 999.0)
@@ -310,6 +312,24 @@ def _symbol_decision(row: dict) -> str:
         return "BLOCKED"
     # No candidate ranked/eligible this tick — an ordinary ranking outcome, not a block.
     return "NO_SIGNAL"
+
+
+def _json_safe(value: Any) -> Any:
+    """Reduce router/runtime objects to strict JSON-compatible diagnostics."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "as_dict"):
+        try:
+            return _json_safe(value.as_dict())
+        except Exception:
+            return str(value)
+    return str(value)
 
 
 def _overall_decision(rows: list[dict]) -> str:
@@ -444,6 +464,7 @@ def _evaluate_strategy_router(
     tracker: MomentumTracker,
     *,
     warm_rounds: int,
+    redis_client: Any = None,
 ) -> dict[str, Any]:
     """Multi-strategy router view — complements legacy momentum preflight."""
     klines = KlineCache()
@@ -455,76 +476,98 @@ def _evaluate_strategy_router(
         klines=klines,
     )
     now = time.time()
+    ranked = router.evaluate_all(epoch=now, notional_usd=config.max_notional_paper) or []
+    for row in ranked:
+        sym = str(row.get("symbol") or "")
+        snap = row.get("snap")
+        if snap is None:
+            continue
+        tracker.record(sym, now, snap.best_bid, snap.mid)
+        row["mom"] = tracker.diagnostics(sym, now, snap.best_bid, snap.mid)
+        row["micro_regime"] = router._current_regime(sym, now, klines.get(sym))
+
+    try:
+        from backend.services.scalp_ai_rank_enrichment import enrich_scalp_ranked_candidates
+
+        ranked = enrich_scalp_ranked_candidates(ranked, redis_client=redis_client) or ranked
+    except Exception:
+        pass
+
+    best = pick_best_global_candidate(ranked)
+    selected_symbol = str(best.get("symbol") or "") if best else ""
     per_symbol: dict[str, Any] = {}
     ranked_entries: list[dict[str, Any]] = []
-
-    for sym in config.products:
-        best, all_sigs, meta = router.evaluate_symbol(
-            sym,
-            epoch=now,
-            notional_usd=config.max_notional_paper,
-        )
+    for row in ranked:
+        sym = str(row.get("symbol") or "")
+        meta = row.get("rank_meta") or {}
+        sig = row.get("signal")
         ranked_for_sym = meta.get("ranked") or []
-        best_ranked_row = max(ranked_for_sym, key=lambda r: float(r.get("rank_score") or 0.0), default=None)
-        sym_row = {
-            "best_setup": best.as_dict() if best else None,
-            "router_entry_ready": bool(meta.get("entry_eligible")),
-            "rank_score": meta.get("best_rank_score"),
-            "best_setup_name": meta.get("best_setup"),
-            "hard_block": meta.get("hard_block"),
-            "soft_reason": meta.get("soft_reason"),
+        best_ranked_row = max(ranked_for_sym, key=lambda r: float(r.get("rank_score") or 0.0), default={})
+        globally_selected = bool(selected_symbol and sym == selected_symbol)
+        per_symbol[sym] = {
+            "best_setup": _json_safe(sig),
+            "router_entry_ready": globally_selected,
+            "per_symbol_entry_eligible": bool(row.get("entry_eligible")),
+            "rank_score": row.get("rank_score"),
+            "rank_score_raw": row.get("rank_score_raw"),
+            "best_setup_name": row.get("best_setup"),
+            "hard_block": row.get("hard_block"),
+            "soft_reason": row.get("soft_reason"),
             "regime": meta.get("regime"),
-            "strategies": [s.as_dict() for s in all_sigs],
-            "ranked": ranked_for_sym,
+            "strategies": _json_safe(row.get("all_signals") or []),
+            "ranked": _json_safe(ranked_for_sym),
+            "intelligence": _json_safe(row.get("intelligence") or {}),
+            "globally_selected": globally_selected,
         }
-        per_symbol[sym] = sym_row
-        # Enrich with full diagnostics from the best ranked row (or meta)
-        best_row = best_ranked_row or {}
         ranked_entries.append(
             {
                 "symbol": sym,
-                "setup_name": meta.get("best_setup") or (best.setup_name if best else None),
-                "score": meta.get("best_rank_score") or (best.score if best else 0.0),
-                "rank_score": meta.get("best_rank_score"),
-                "spread_pct": best.spread_pct if best else 0.0,
-                "reject_reason": meta.get("hard_block") or meta.get("soft_reason"),
-                "entry_eligible": bool(meta.get("entry_eligible")),
-                "hard_block": meta.get("hard_block"),
-                # Additional ranking diagnostics (existing values; null if not applicable)
-                "soft_reason": meta.get("soft_reason"),
-                "base_score": best_row.get("base_score"),
-                "momentum_boost": best_row.get("momentum_boost"),
-                "reachability_multiplier": best_row.get("reachability_multiplier"),
+                "setup_name": row.get("best_setup") or getattr(sig, "setup_name", None),
+                "score": getattr(sig, "score", 0.0),
+                "rank_score": row.get("rank_score"),
+                "rank_score_raw": row.get("rank_score_raw"),
+                "spread_pct": getattr(row.get("snap"), "spread_pct", 0.0),
+                "reject_reason": row.get("hard_block") or row.get("soft_reason"),
+                "entry_eligible": bool(row.get("entry_eligible")),
+                "globally_selected": globally_selected,
+                "hard_block": row.get("hard_block"),
+                "soft_reason": row.get("soft_reason"),
+                "base_score": best_ranked_row.get("base_score"),
+                "momentum_boost": best_ranked_row.get("momentum_boost"),
+                "reachability_multiplier": best_ranked_row.get("reachability_multiplier"),
                 "reachability_surplus_pct": meta.get("reachability_surplus"),
-                "expected_move_pct": best_row.get("expected_move_pct"),
-                "required_target_pct": best_row.get("required_target_pct"),
-                "target_gap_pct": best_row.get("target_gap_pct"),
+                "expected_move_pct": best_ranked_row.get("expected_move_pct"),
+                "required_target_pct": best_ranked_row.get("required_target_pct"),
+                "target_gap_pct": best_ranked_row.get("target_gap_pct"),
                 "regime": meta.get("regime"),
-                "regime_native": (best_row.get("regime_native") if best_row else None),
-                "memory_delta": best_row.get("memory_delta"),
-                "recent_win_rate": best_row.get("recent_win_rate"),
-                "m15": best_row.get("m15"),
-                "m30": best_row.get("m30"),
-                "m60": best_row.get("m60"),
-                "impact_pct": None,  # available via depth check in router ctx if needed later
+                "regime_native": best_ranked_row.get("regime_native"),
+                "intelligence": _json_safe(row.get("intelligence") or {}),
                 "tie_margin": _rank_tie_margin(),
                 "rank_floor": _min_tradeable_score(),
                 "min_confident_rank": _min_confident_rank(),
-                "final_below_floor_reason": (None if meta.get("entry_eligible") else (meta.get("hard_block") or meta.get("soft_reason") or "BELOW_MIN_SCORE")),
+                "final_below_floor_reason": (
+                    None
+                    if globally_selected
+                    else row.get("hard_block") or row.get("soft_reason") or "GLOBAL_CONFIDENCE_OR_TIE_GATE"
+                ),
             }
         )
 
-    ranked_entries.sort(key=lambda r: (-int(bool(r.get("entry_eligible"))), -float(r.get("rank_score") or r.get("score") or 0), float(r.get("spread_pct") or 0)))
+    ranked_entries.sort(key=lambda r: (-int(bool(r.get("globally_selected"))), -float(r.get("rank_score") or 0), float(r.get("spread_pct") or 0)))
     inventory = router.strategy_inventory()
-    eligible = [r for r in ranked_entries if r.get("entry_eligible")]
-    best_overall = eligible[0] if eligible else (ranked_entries[0] if ranked_entries else None)
-    global_hard_block = None if eligible else (best_overall.get("hard_block") if best_overall else "NO_CANDIDATES")
+    selected = next((r for r in ranked_entries if r.get("globally_selected")), None)
+    rank_leader = ranked_entries[0] if ranked_entries else None
+    global_hard_block = None if selected else (
+        (rank_leader or {}).get("hard_block")
+        or (rank_leader or {}).get("soft_reason")
+        or ("RANK_LOW_CONFIDENCE_TIE" if ranked_entries else "NO_CANDIDATES")
+    )
 
     return {
         "inventory": inventory,
-        "overall_entry_ready": bool(eligible),
-        "best_candidate": best_overall,
-        "best_global_candidate": best_overall,
+        "overall_entry_ready": selected is not None,
+        "best_candidate": selected,
+        "best_global_candidate": selected,
         "ranked_candidates": ranked_entries,
         "global_hard_block": global_hard_block,
         "symbols": per_symbol,
@@ -562,6 +605,7 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
         reader,
         tracker,
         warm_rounds=warm_rounds,
+        redis_client=rclient,
     )
 
     micro_regimes = _overlay_runner_scan(
@@ -570,8 +614,14 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
         prefix=config.redis_key_prefix,
         strategy_router=strategy_router,
     )
+    selected_symbol = str((strategy_router.get("best_global_candidate") or {}).get("symbol") or "")
+    entry_armed = bool(is_entry_armed(rclient, prefix=config.redis_key_prefix))
     for row in symbol_rows:
         if not row.get("error"):
+            selected = bool(selected_symbol and row.get("symbol") == selected_symbol)
+            row["would_enter_if_armed"] = selected
+            row["would_enter"] = selected and entry_armed
+            row["entry_armed"] = entry_armed
             row["decision"] = _symbol_decision(row)
     runner_state = _load_runner_state(rclient, prefix=config.redis_key_prefix)
     operational = _derive_operational_summary(
@@ -615,7 +665,7 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
         "products": list(config.products),
         "scalp_live": config.scalp_live,
         "scalp_paper_enabled": config.scalp_paper_enabled,
-        "entry_armed": is_entry_armed(rclient, prefix=config.redis_key_prefix),
+        "entry_armed": entry_armed,
         "open_scalp_positions": open_positions,
         "warm_rounds_used": warm_rounds,
         "micro_regimes": micro_regimes,

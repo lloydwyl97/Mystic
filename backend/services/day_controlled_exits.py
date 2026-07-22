@@ -79,15 +79,6 @@ def _stall_max_mfe_pct() -> float:
     return float(os.getenv("DAY_STALL_MAX_MFE_PCT", "0.0015"))
 
 
-def _stall_min_adverse_pct() -> float:
-    """Require at least this much net loss (negative fraction) before stall cuts.
-
-    Default -0.08%: skips micro-noise red that often recovers into TIME_STOP /
-    NET_PROFIT winners. Override via DAY_STALL_MIN_ADVERSE_PCT.
-    """
-    return float(os.getenv("DAY_STALL_MIN_ADVERSE_PCT", "-0.0008"))
-
-
 def evaluate_stall_exit(
     *,
     entry_price: float,
@@ -114,10 +105,7 @@ def evaluate_stall_exit(
     if hold_minutes + 1e-9 >= float(max_hold_min):
         return None
     # Only cut flat/losing paths — never scratch small greens before TP.
-    if net_pnl_pct + 1e-12 >= 0.0:
-        return None
-    # Skip shallow red noise; require meaningful adverse before stall.
-    if net_pnl_pct > _stall_min_adverse_pct() + 1e-12:
+    if net_pnl_pct >= 0.0:
         return None
     # Only cut when still below the net-profit floor (same eligibility as time-stop).
     if net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL):
@@ -131,7 +119,7 @@ def evaluate_stall_exit(
         "reason": EXIT_STALL,
         "net_pnl_pct": net_pnl_pct,
         "hold_minutes": hold_minutes,
-        "detail": (f"stall_min={stall_min:.0f}m mfe={mfe_pct:.6f} max_mfe={_stall_max_mfe_pct():.6f} min_adverse={_stall_min_adverse_pct():.6f}"),
+        "detail": f"stall_min={stall_min:.0f}m mfe={mfe_pct:.6f} max_mfe={_stall_max_mfe_pct():.6f}",
     }
 
 
@@ -369,8 +357,7 @@ def preview_next_engine_exit(
         _stall_exit_enabled()
         and hold_minutes >= _stall_min_hold_min()
         and hold_minutes + 1e-9 < float(max_hold)
-        and net_pnl_pct + 1e-12 < 0.0
-        and net_pnl_pct <= _stall_min_adverse_pct() + 1e-12
+        and net_pnl_pct < 0.0
         and mfe_pct < _stall_max_mfe_pct()
     )
     giveback_ready = bool(_giveback_exit_enabled() and hold_minutes >= _giveback_min_hold_min() and mfe_pct >= _giveback_min_mfe_pct() and net_pnl_pct + 1e-12 <= _giveback_trigger_pnl_pct())

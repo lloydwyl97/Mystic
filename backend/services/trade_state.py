@@ -143,11 +143,11 @@ class TradeStateStore:
 
         except Exception as e:
             logger.warning(
-                "allow_new_entry_async error for %s: %s - BLOCKING (fail-closed)",
+                "allow_new_entry_async error for %s: %s - allowing entry (fail-open)",
                 symbol,
                 e,
             )
-            return False, f"GATE_ERROR_FAIL_CLOSED:{type(e).__name__}"
+            return True, f"GATE_ERROR_FAIL_OPEN:{type(e).__name__}"
 
     def on_entry_fill(self, symbol: str, price: float, atr: float = 0.0) -> None:
         """Record entry fill: IDLE -> IN_TRADE"""

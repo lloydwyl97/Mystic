@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from backend.services.canonical_http_client import get_http_client
+from backend.services.execution_mode_service import is_live_execution_allowed_sync
 from backend.services.redis_service import get_redis_service
 from backend.services.task_manager import task_manager
 
@@ -80,9 +81,11 @@ class BinanceUserStreamWorker:
             logger.info("Binance user stream disabled: API keys not configured")
             return
 
-        # Require a live trading client to be available
-        if getattr(trading_service, "binance", None) is None:
-            logger.info("Binance user stream disabled: trading service not available")
+        # The trading service initializes its Binance client lazily. Do not
+        # mistake that initial None for missing credentials, but never open a
+        # private user stream while the application is in paper mode.
+        if not is_live_execution_allowed_sync():
+            logger.info("Binance user stream disabled: live execution is not allowed")
             return
 
         self._running = True

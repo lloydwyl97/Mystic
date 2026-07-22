@@ -55,11 +55,11 @@ def test_early_scratch_on_stalled_flat_position():
     track = PositionTrack(
         entry_price=entry,
         state=STATE_OPEN,
-        max_favorable_pct=0.0001,
+        max_favorable_pct=0.00001,
         max_adverse_pct=0.0002,
         session_low_bid=bid,
-        stale_review_count=1,
-        review_lows=(bid,),
+        stale_review_count=2,
+        review_lows=(bid, bid),
         setup_name="range_bounce_scalp",
         setup_context={},
     )
@@ -70,11 +70,11 @@ def test_early_scratch_on_stalled_flat_position():
         econ=econ,
         config=config,
         trade_id="t1",
-        hold_sec=float(econ.stale_scalp_timeout_sec + 30),
+        hold_sec=max(float(econ.stale_scalp_timeout_sec + 30), 610.0),
         executable_net_pct=-0.0003,
         profit_hit=False,
         exit_spread_ok=True,
-        perform_review=False,
+        perform_review=True,
     )
     assert review.decision == "SELL", review.reason
     assert review.exit_reason == EXIT_EARLY_SCRATCH
@@ -107,7 +107,7 @@ def test_stall_before_max_hold_not_at_hard_ceiling():
         executable_net_pct=-0.0004,
         profit_hit=False,
         exit_spread_ok=True,
-        perform_review=False,
+        perform_review=True,
     )
     assert review.decision == "SELL", review.reason
     assert review.exit_reason == EXIT_EARLY_SCRATCH

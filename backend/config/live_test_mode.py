@@ -90,7 +90,7 @@ def _live_trades_allowed_value() -> bool:
 
 
 def _live_execution_flag_value() -> bool:
-    return _env_bool(os.getenv("LIVE_EXECUTION", "false"), default=False)
+    return _env_bool("LIVE_EXECUTION", default=False)
 
 
 def is_live_execution_context() -> bool:

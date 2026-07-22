@@ -91,3 +91,55 @@ async def test_genuine_safety_blocks_still_enforced():
     allowed2, reason2 = await engine2._can_open_position("BTC/USDT", 5_000.0)
     assert allowed2 is False
     assert "CASH" in reason2 or "INSUFFICIENT" in reason2
+
+
+@pytest.mark.asyncio
+async def test_portfolio_trade_state_exception_fails_open(monkeypatch):
+    import backend.services.portfolio_engine as pe
+    import backend.services.trade_state as trade_state
+
+    class _BrokenStore:
+        async def allow_new_entry_async(self, *_args, **_kwargs):
+            raise RuntimeError("state backend unavailable")
+
+    monkeypatch.setattr(pe, "ENABLE_TRADE_STATE_ENTRY_BLOCKING", True)
+    monkeypatch.setattr(pe, "ENABLE_GOVERNANCE_ENFORCEMENT", False)
+    monkeypatch.setattr(trade_state, "get_trade_state_store", lambda: _BrokenStore())
+
+    allowed, reason = await _base_engine()._can_open_position("BTC/USDT", 100.0)
+
+    assert allowed is True, reason
+
+
+@pytest.mark.asyncio
+async def test_trade_state_store_read_exception_fails_open():
+    from backend.services.trade_state import TradeStateStore
+
+    class _BrokenRedis:
+        def hgetall(self, _key):
+            raise RuntimeError("redis unavailable")
+
+    allowed, reason = await TradeStateStore(_BrokenRedis()).allow_new_entry_async("ETH/USDT", "buy", time.time())
+
+    assert allowed is True
+    assert reason.startswith("GATE_ERROR_FAIL_OPEN:")
+
+
+@pytest.mark.asyncio
+async def test_loss_hold_does_not_preempt_operational_cash_check(monkeypatch):
+    import backend.services.portfolio_engine as pe
+
+    monkeypatch.setattr(pe, "ENABLE_TRADE_STATE_ENTRY_BLOCKING", False)
+    monkeypatch.setattr(pe, "ENABLE_GOVERNANCE_ENFORCEMENT", True)
+    monkeypatch.setattr(pe, "governance_risk_governor_shadow_only", lambda: False)
+    engine = _base_engine()
+    engine._available_balance = 0.0
+    engine.cash_balance = 0.0
+    engine._get_loss_hold_until = AsyncMock(return_value=time.time() + 600.0)
+    engine.get_rolling_24h_risk_metrics = AsyncMock(return_value=(0.0, pe.MAX_CONSEC_LOSSES))
+
+    allowed, reason = await engine._can_open_position("XRP/USDT", 100.0)
+
+    assert allowed is False
+    assert reason == "INSUFFICIENT_CASH"
+    engine.get_rolling_24h_risk_metrics.assert_not_awaited()

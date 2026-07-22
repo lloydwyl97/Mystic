@@ -57,6 +57,29 @@ logger = logging.getLogger(__name__)
 WOULD_ENTER_NOT_ARMED = "WOULD_ENTER_NOT_ARMED"
 
 
+def _round_trip_execution_costs(
+    *,
+    entry_notional: float,
+    exit_notional: float,
+    econ: ScalpEconomics,
+    persisted_entry_fee: float | None = None,
+    persisted_entry_slippage: float | None = None,
+) -> tuple[float, float]:
+    entry_fee = (
+        float(persisted_entry_fee)
+        if persisted_entry_fee is not None
+        else entry_notional * econ.taker_fee_pct
+    )
+    entry_slippage = (
+        float(persisted_entry_slippage)
+        if persisted_entry_slippage is not None
+        else entry_notional * econ.slippage_buffer_pct
+    )
+    fees = entry_fee + exit_notional * econ.taker_fee_pct
+    slippage = entry_slippage + exit_notional * econ.slippage_buffer_pct
+    return fees, slippage
+
+
 class BinanceScalpPaperEngine:
     """Paper-only scalp loop — isolated from Mystic DAY portfolio_engine."""
 
@@ -1250,6 +1273,31 @@ class BinanceScalpPaperEngine:
         if review.decision != DECISION_SELL or not review.exit_reason:
             return
 
+        entry_notional = entry * qty
+        persisted_entry_fee: float | None = None
+        persisted_entry_slippage: float | None = None
+        buy_cost_row = conn.execute(
+            """
+            SELECT notional, fee_usd, slippage_usd
+            FROM scalp_paper_trades
+            WHERE trade_id = ? AND upper(side) = 'BUY'
+            LIMIT 1
+            """,
+            (trade_id,),
+        ).fetchone()
+        if buy_cost_row is not None:
+            entry_notional = float(buy_cost_row["notional"])
+            persisted_entry_fee = float(buy_cost_row["fee_usd"])
+            persisted_entry_slippage = float(buy_cost_row["slippage_usd"])
+        exit_notional = exit_price * qty
+        round_trip_fees, round_trip_slippage = _round_trip_execution_costs(
+            entry_notional=entry_notional,
+            exit_notional=exit_notional,
+            econ=self.econ,
+            persisted_entry_fee=persisted_entry_fee,
+            persisted_entry_slippage=persisted_entry_slippage,
+        )
+
         self._execute_sell(
             conn,
             row,
@@ -1283,6 +1331,10 @@ class BinanceScalpPaperEngine:
             "row": dict(row),
             "now_epoch": now_epoch,
             "review_exit_reason": str(review.exit_reason or "SCALP_EXIT"),
+            "entry_notional": entry_notional,
+            "exit_notional": exit_notional,
+            "fees_paid": round_trip_fees,
+            "slippage_cost": round_trip_slippage,
         }
 
         def _after_commit() -> None:
@@ -1311,14 +1363,19 @@ class BinanceScalpPaperEngine:
                     entry_price=close_payload["entry"],
                     exit_price=close_payload["exit_price"],
                     quantity=close_payload["qty"],
-                    fees_paid=abs(close_payload["net_usd"]) * 0.0002 if close_payload["net_usd"] else 0.0,
-                    slippage_cost=0.0,
+                    fees_paid=close_payload["fees_paid"],
+                    slippage_cost=close_payload["slippage_cost"],
                     net_profit_usd=close_payload["net_usd"],
                     net_profit_pct=close_payload["net_pct"],
                     hold_seconds=close_payload["hold_seconds"],
                     decision_reason=close_payload["review_exit_reason"],
                     close_reason=close_payload["review_exit_reason"],
-                    extra={"engine": "binance_scalp_paper", "setup": str(close_payload["row"].get("strategy_id", ""))},
+                    extra={
+                        "engine": "binance_scalp_paper",
+                        "setup": str(close_payload["row"].get("strategy_id", "")),
+                        "entry_notional": close_payload["entry_notional"],
+                        "exit_notional": close_payload["exit_notional"],
+                    },
                 )
                 record_trade_outcome(rec, db_path=self.config.database_path)
             except Exception as _lw_exc:

@@ -19,6 +19,7 @@ import logging
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import create_engine, event, text
@@ -42,7 +43,12 @@ def _database_url() -> str:
         if url.startswith("postgres://"):
             url = "postgresql://" + url[len("postgres://") :]
         return url
-    db_file = os.getenv("MYSTIC_DB_PATH", "mystic_trading.db")
+    configured_path = (os.getenv("MYSTIC_DB_PATH") or "").strip()
+    if configured_path:
+        db_file = configured_path
+    else:
+        # Match backend.database_schema.DATABASE_PATH without depending on CWD.
+        db_file = str(Path(__file__).resolve().parents[2] / "mystic_trading.db")
     return f"sqlite:///{db_file}"
 
 
@@ -119,16 +125,15 @@ def get_engine() -> Engine:
     Create (once) and return a SQLAlchemy Engine based on env configuration.
     Backward compatible signature.
     """
-    # Engine state - using dict to avoid global keyword
-    _engine_state: dict[str, Any | None] = {"instance": None}
-    if _engine_state["instance"] is not None:
-        return _engine_state["instance"]
+    global _engine
+    if _engine is not None:
+        return _engine
 
     url = _database_url()
     kwargs = _engine_kwargs(url)
-    _engine_state["instance"] = create_engine(url, **kwargs)
-    _apply_sqlite_pragmas(_engine_state["instance"])
-    return _engine_state["instance"]
+    _engine = create_engine(url, **kwargs)
+    _apply_sqlite_pragmas(_engine)
+    return _engine
 
 
 # Session maker state - using dict to avoid global keyword

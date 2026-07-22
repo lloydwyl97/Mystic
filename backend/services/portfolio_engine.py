@@ -7211,37 +7211,13 @@ class PortfolioEngine:
                 )
             return None
 
-        # Post-sell ledger cooldown — enforce when ENABLE_COOLDOWN_ENFORCEMENT.
+        # Post-sell ledger cooldown is advisory telemetry only. Operational
+        # execution checks below remain authoritative.
         persisted_until = self._lookup_position_close_cooldown(normalized_symbol)
         now_wall = time.time()
         if persisted_until and now_wall < persisted_until:
-            if ENABLE_COOLDOWN_ENFORCEMENT:
-                self._metrics_cooldown_blocks += 1
-                logger.warning(
-                    "BUY_BLOCKED_POST_SELL_COOLDOWN_LEDGER symbol=%s remaining=%.0fs",
-                    normalized_symbol,
-                    persisted_until - now_wall,
-                )
-                await self._record_reject(
-                    normalized_symbol,
-                    "BUY",
-                    f"POST_SELL_COOLDOWN_LEDGER remaining={persisted_until - now_wall:.0f}s",
-                    "POST_SELL_COOLDOWN_LEDGER",
-                    decision_id=decision_id,
-                    explainability=explainability,
-                )
-                if decision_id:
-                    await self._update_pipeline_decision(
-                        decision_id,
-                        {
-                            "stage": "EXECUTION",
-                            "execution_result": "NOT_EXECUTED",
-                            "execution_reason": "POST_SELL_COOLDOWN_LEDGER",
-                        },
-                    )
-                return None
             logger.debug(
-                "QUALITY_TELEMETRY POST_SELL_COOLDOWN_LEDGER_ACTIVE would_block symbol=%s remaining=%.0fs (ENABLE_COOLDOWN_ENFORCEMENT=false)",
+                "QUALITY_TELEMETRY POST_SELL_COOLDOWN_LEDGER_ACTIVE symbol=%s remaining=%.0fs (not enforced)",
                 normalized_symbol,
                 persisted_until - now_wall,
             )
@@ -9950,73 +9926,31 @@ class PortfolioEngine:
             logger.warning(f"BUY_BLOCKED_PAUSED: {symbol} - trading paused: {self._pause_reason}")
             return False, f"TRADING_PAUSED: {self._pause_reason}"
 
-        # Loss-streak / sell cooldowns: enforce when ENABLE_COOLDOWN_ENFORCEMENT
-        # (prod default true). Kill-switch: ENABLE_COOLDOWN_ENFORCEMENT=false.
+        # Loss-streak / sell cooldowns are advisory telemetry only. They must
+        # never override the operational checks below.
         now_wall = time.time()
         pause_until = float(getattr(self._quality_filter_state, "loss_streak_pause_until", 0.0) or 0.0)
         if pause_until > now_wall:
-            if ENABLE_COOLDOWN_ENFORCEMENT:
-                self._metrics_cooldown_blocks += 1
-                logger.warning(
-                    "BUY_BLOCKED_LOSS_STREAK_PAUSE symbol=%s remaining=%.0fs",
-                    symbol,
-                    pause_until - now_wall,
-                )
-                return False, "LOSS_STREAK_PAUSE"
             logger.debug(
-                "QUALITY_TELEMETRY LOSS_STREAK_PAUSE_ACTIVE would_block symbol=%s remaining=%.0fs (ENABLE_COOLDOWN_ENFORCEMENT=false)",
+                "QUALITY_TELEMETRY LOSS_STREAK_PAUSE_ACTIVE symbol=%s remaining=%.0fs (not enforced)",
                 symbol,
                 pause_until - now_wall,
             )
 
         g_wall = float(getattr(self._quality_filter_state, "global_cooldown_wall", 0.0) or 0.0)
         if g_wall > now_wall:
-            if ENABLE_COOLDOWN_ENFORCEMENT:
-                self._metrics_cooldown_blocks += 1
-                logger.warning(
-                    "BUY_BLOCKED_GLOBAL_SELL_COOLDOWN symbol=%s remaining=%.0fs",
-                    symbol,
-                    g_wall - now_wall,
-                )
-                return False, "GLOBAL_SELL_COOLDOWN"
             logger.debug(
-                "QUALITY_TELEMETRY GLOBAL_SELL_COOLDOWN_ACTIVE would_block symbol=%s remaining=%.0fs (ENABLE_COOLDOWN_ENFORCEMENT=false)",
+                "QUALITY_TELEMETRY GLOBAL_SELL_COOLDOWN_ACTIVE symbol=%s remaining=%.0fs (not enforced)",
                 symbol,
                 g_wall - now_wall,
             )
         sym_wall = float(self._quality_filter_state.symbol_cooldown_wall.get(symbol, 0.0) or 0.0)
         if sym_wall > now_wall:
-            if ENABLE_COOLDOWN_ENFORCEMENT:
-                self._metrics_cooldown_blocks += 1
-                logger.warning(
-                    "BUY_BLOCKED_SYMBOL_SELL_COOLDOWN symbol=%s remaining=%.0fs",
-                    symbol,
-                    sym_wall - now_wall,
-                )
-                return False, "SYMBOL_SELL_COOLDOWN"
             logger.debug(
-                "QUALITY_TELEMETRY SYMBOL_SELL_COOLDOWN_ACTIVE would_block symbol=%s remaining=%.0fs (ENABLE_COOLDOWN_ENFORCEMENT=false)",
+                "QUALITY_TELEMETRY SYMBOL_SELL_COOLDOWN_ACTIVE symbol=%s remaining=%.0fs (not enforced)",
                 symbol,
                 sym_wall - now_wall,
             )
-
-        # Governance consec-loss hold (Redis). Defense-in-depth alongside RiskGovernor.decide().
-        if ENABLE_GOVERNANCE_ENFORCEMENT and not governance_risk_governor_shadow_only():
-            try:
-                loss_hold_until = await self._get_loss_hold_until()
-                if loss_hold_until is not None and now_wall < float(loss_hold_until):
-                    _, consec = await self.get_rolling_24h_risk_metrics()
-                    if consec >= MAX_CONSEC_LOSSES:
-                        self._last_governance_hold_reason = "HOLD_CONSEC_LOSSES"
-                        logger.warning(
-                            "BUY_BLOCKED_HOLD_CONSEC_LOSSES symbol=%s consec=%s remaining=%.0fs",
-                            symbol,
-                            consec,
-                            float(loss_hold_until) - now_wall,
-                        )
-                        return False, "HOLD_CONSEC_LOSSES"
-            except Exception as _lh_err:
-                logger.debug("loss_hold check skipped: %s", _lh_err)
 
         # TradeStateStore entry gate (IDLE / IN_TRADE / COOLDOWN) — live when ENABLE_TRADE_STATE_ENTRY_BLOCKING.
         if ENABLE_TRADE_STATE_ENTRY_BLOCKING:
@@ -10032,8 +9966,7 @@ class PortfolioEngine:
                     )
                     return False, f"TRADE_STATE:{_ts_reason}"
             except Exception as _ts_err:
-                logger.warning("trade_state gate error for %s: %s — fail-closed", symbol, _ts_err)
-                return False, "TRADE_STATE_GATE_ERROR"
+                logger.warning("trade_state gate error for %s: %s — allowing entry (fail-open)", symbol, _ts_err)
 
         # Check max positions (hard limit: 10)
         # DUST_INVARIANT: Exclude DUST_PENDING from count - dust must not block new buys
@@ -10168,6 +10101,26 @@ class PortfolioEngine:
             if open_risk_pct >= MAX_TOTAL_OPEN_RISK_PCT:
                 logger.info(f"BUY_BLOCKED_RISK_CAP: {symbol} - risk {open_risk_pct:.2%} >= {MAX_TOTAL_OPEN_RISK_PCT:.2%}")
                 return False, f"RISK_CAP_EXCEEDED: {open_risk_pct:.2%}"
+
+        # Governance consecutive-loss hold runs only after genuine operational
+        # checks, so malformed/stale advisory data cannot mask an actionable
+        # account, position, cash, or risk rejection.
+        if ENABLE_GOVERNANCE_ENFORCEMENT and not governance_risk_governor_shadow_only():
+            try:
+                loss_hold_until = await self._get_loss_hold_until()
+                if loss_hold_until is not None and now_wall < float(loss_hold_until):
+                    _, consec = await self.get_rolling_24h_risk_metrics()
+                    if consec >= MAX_CONSEC_LOSSES:
+                        self._last_governance_hold_reason = "HOLD_CONSEC_LOSSES"
+                        logger.warning(
+                            "BUY_BLOCKED_HOLD_CONSEC_LOSSES symbol=%s consec=%s remaining=%.0fs",
+                            symbol,
+                            consec,
+                            float(loss_hold_until) - now_wall,
+                        )
+                        return False, "HOLD_CONSEC_LOSSES"
+            except Exception as _lh_err:
+                logger.debug("loss_hold check skipped: %s", _lh_err)
 
         return True, "OK"
 
@@ -17730,7 +17683,9 @@ class PortfolioEngine:
                     """
                     SELECT action, pre_ledger_json, post_ledger_json
                     FROM portfolio_engine_audit
-                    ORDER BY id DESC
+                    WHERE action = 'SELL'
+                      AND julianday(ts) >= julianday('now', '-24 hours')
+                    ORDER BY julianday(ts) DESC, id DESC
                     LIMIT 100
                     """
                 )
@@ -17738,8 +17693,6 @@ class PortfolioEngine:
 
                 consec = 0
                 for r in sell_rows:
-                    if r[0] != "SELL":
-                        continue
                     try:
                         pre_j = json.loads(r[1] or "{}")
                         post_j = json.loads(r[2] or "{}")

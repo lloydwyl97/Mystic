@@ -85,6 +85,18 @@ def test_flat_at_exactly_zero_net_after_fees_never_stalled():
     assert out is None
 
 
+def test_any_strictly_net_negative_flat_loss_can_stall():
+    out = evaluate_stall_exit(
+        entry_price=ENTRY,
+        highest_price=ENTRY,
+        net_pnl_pct=-1e-13,
+        hold_minutes=STALL_ELIGIBLE_HOLD_MIN,
+        max_hold_min=60,
+    )
+    assert out is not None
+    assert out["reason"] == EXIT_STALL
+
+
 def test_clearly_profitable_position_never_stalled():
     current_price = ENTRY * 1.01  # +1% gross, well net-positive after 0.072% cost
     net = _net_pnl_pct(current_price)

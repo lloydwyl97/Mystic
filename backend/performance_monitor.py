@@ -11,6 +11,7 @@ from typing import Any
 
 # Direct imports for production
 import psutil
+from sqlalchemy import text
 
 # Redis service for storing metrics
 try:
@@ -29,9 +30,11 @@ except ImportError:
 
 # External API imports
 try:
-    from backend.services.binance_rest_client import BinanceRestClient
+    from backend.services.binance_rest_client import BinanceREST
+    from backend.utils.binance_weight_limiter import BinanceWeightLimiter
 except ImportError:
-    BinanceRestClient = None
+    BinanceREST = None
+    BinanceWeightLimiter = None
 
 from backend.services.task_manager import task_manager
 
@@ -339,7 +342,7 @@ class PerformanceMonitor:
                 return False
 
             with SessionLocal() as session:
-                session.execute("SELECT 1")
+                session.execute(text("SELECT 1"))
         except Exception as ex:
             logger.debug("_check_database_connectivity failed: %s", ex)
             return False
@@ -349,25 +352,31 @@ class PerformanceMonitor:
     async def _check_external_api_status(self) -> dict[str, bool]:
         """Check external API connectivity"""
         try:
-            if BinanceRestClient is None:
+            if BinanceREST is None or BinanceWeightLimiter is None:
                 return {"binance_api": False}
 
-            client = BinanceRestClient()
+            limiter = await BinanceWeightLimiter.create()
+            client = BinanceREST(limiter)
             # Try a lightweight API call
-            await client.get_server_time()
+            response = await client.get_server_time()
+            if not response or "serverTime" not in response:
+                return {"binance_api": False}
         except Exception as ex:
             logger.debug("_check_external_api_status failed: %s", ex)
             return {"binance_api": False}
         else:
             return {"binance_api": True}
 
-    def _get_redis_trading_stats_sync(self) -> dict[str, Any]:
-        """Get trading statistics from Redis (sync worker for run_in_executor)."""
-        r = None
+    async def _get_redis_trading_stats(self) -> dict[str, Any]:
+        """Get trading statistics from the shared async Redis client."""
+        if not REDIS_AVAILABLE:
+            return {}
         try:
             r = get_redis_service()
+            if r is None:
+                return {}
             stats = {}
-            paper_stats_raw = r.get("paper_trading:stats")
+            paper_stats_raw = await r.get("paper_trading:stats")
             if paper_stats_raw:
                 try:
                     paper_stats = json.loads(paper_stats_raw)
@@ -384,7 +393,7 @@ class PerformanceMonitor:
                     logger.debug("paper_stats parse failed: %s", ex)
             position_keys = []
             try:
-                for key in r.scan_iter(match="paper:position:*", count=100):
+                async for key in r.scan_iter(match="paper:position:*", count=100):
                     position_keys.append(key)
             except Exception as scan_err:
                 logger.debug("SCAN failed for paper:position: %s", scan_err)
@@ -393,7 +402,7 @@ class PerformanceMonitor:
             portfolio_value = 0.0
             for key in position_keys or []:
                 try:
-                    pos_data = r.hgetall(key)
+                    pos_data = await r.hgetall(key)
                     if pos_data:
                         quantity = float(pos_data.get("quantity", 0))
                         current_price = float(pos_data.get("current_price", 0))
@@ -405,26 +414,17 @@ class PerformanceMonitor:
         except Exception as e:
             logger.warning(f"Error getting Redis trading stats: {e}")
             return {}
-        finally:
-            if r is not None:
-                with contextlib.suppress(Exception):
-                    r.close()
 
-    async def _get_redis_trading_stats(self) -> dict[str, Any]:
-        """Get trading statistics from Redis (non-blocking)."""
+    async def _get_redis_ai_stats(self) -> dict[str, Any]:
+        """Get AI performance statistics from the shared async Redis client."""
         if not REDIS_AVAILABLE:
             return {}
-        # BUG #M2 FIX: Run sync Redis in executor to avoid blocking event loop
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._get_redis_trading_stats_sync)
-
-    def _get_redis_ai_stats_sync(self) -> dict[str, Any]:
-        """Get AI performance statistics from Redis (sync worker)."""
-        r = None
         try:
             r = get_redis_service()
+            if r is None:
+                return {}
             stats = {}
-            orchestrator_raw = r.get("orchestrator:status")
+            orchestrator_raw = await r.get("orchestrator:status")
             if orchestrator_raw:
                 try:
                     orchestrator_data = json.loads(orchestrator_raw)
@@ -441,7 +441,7 @@ class PerformanceMonitor:
             decision_keys = []
             try:
                 count = 0
-                for key in r.scan_iter(match="ai_decision:*", count=100):
+                async for key in r.scan_iter(match="ai_decision:*", count=100):
                     decision_keys.append(key)
                     count += 1
                     if count >= 10:
@@ -453,7 +453,7 @@ class PerformanceMonitor:
                 confidences = []
                 for key in decision_keys:
                     try:
-                        decision_data = r.hgetall(key)
+                        decision_data = await r.hgetall(key)
                         if decision_data and "confidence" in decision_data:
                             raw = float(decision_data["confidence"])
                             try:
@@ -471,25 +471,17 @@ class PerformanceMonitor:
         except Exception as e:
             logger.warning(f"Error getting Redis AI stats: {e}")
             return {}
-        finally:
-            if r is not None:
-                with contextlib.suppress(Exception):
-                    r.close()
 
-    async def _get_redis_ai_stats(self) -> dict[str, Any]:
-        """Get AI performance statistics from Redis (non-blocking)."""
+    async def _get_redis_risk_stats(self) -> dict[str, Any]:
+        """Get risk statistics from the shared async Redis client."""
         if not REDIS_AVAILABLE:
             return {}
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._get_redis_ai_stats_sync)
-
-    def _get_redis_risk_stats_sync(self) -> dict[str, Any]:
-        """Get risk statistics from Redis (sync worker)."""
-        r = None
         try:
             r = get_redis_service()
+            if r is None:
+                return {}
             stats = {}
-            risk_raw = r.get("risk_data")
+            risk_raw = await r.get("risk_data")
             if risk_raw:
                 try:
                     risk_data = json.loads(risk_raw)
@@ -509,17 +501,6 @@ class PerformanceMonitor:
         except Exception as e:
             logger.warning(f"Error getting Redis risk stats: {e}")
             return {}
-        finally:
-            if r is not None:
-                with contextlib.suppress(Exception):
-                    r.close()
-
-    async def _get_redis_risk_stats(self) -> dict[str, Any]:
-        """Get risk statistics from Redis (non-blocking)."""
-        if not REDIS_AVAILABLE:
-            return {}
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._get_redis_risk_stats_sync)
 
     async def _cache_performance_report(self, report: dict[str, Any]) -> None:
         """Cache performance report in Redis"""

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime
 from typing import Any
 
 from backend.services.binance_scalp.calibration_profiles import economics_for_config
@@ -19,6 +20,28 @@ from backend.services.binance_scalp.exit_manager import (
 from backend.services.binance_scalp.market_reader import ScalpMarketReader
 from backend.services.binance_scalp.momentum_tracker import MomentumTracker
 from backend.services.binance_scalp.protected_preflight import run_scalp_preflight
+
+
+def _stale_review_due(
+    *,
+    hold_sec: float,
+    stale_timeout_sec: float,
+    stale_review_count: int,
+    last_review_ts: Any,
+    now_epoch: float,
+    review_interval_sec: int,
+) -> bool:
+    if hold_sec < stale_timeout_sec:
+        return False
+    if stale_review_count == 0:
+        return True
+    last_review_epoch = 0.0
+    try:
+        if last_review_ts:
+            last_review_epoch = datetime.fromisoformat(str(last_review_ts).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        last_review_epoch = 0.0
+    return (now_epoch - last_review_epoch) >= review_interval_sec
 
 
 def _next_exit_trigger(
@@ -55,7 +78,6 @@ def enrich_open_scalp_positions(
     econ = economics_for_config(config)
     reader = ScalpMarketReader(config)
     tracker = MomentumTracker()
-    import time
 
     now = time.time()
     out: list[dict[str, Any]] = []
@@ -123,8 +145,14 @@ def enrich_open_scalp_positions(
         exit_spread_ok = pf.reject_reason != "SPREAD_TOO_WIDE"
         track = track_from_row(row, pos_diag)
         review_interval = int(os.getenv("SCALP_REVIEW_INTERVAL_SEC", "30"))
-        in_review_phase = hold_sec >= econ.stale_scalp_timeout_sec
-        perform_review = in_review_phase
+        perform_review = _stale_review_due(
+            hold_sec=hold_sec,
+            stale_timeout_sec=econ.stale_scalp_timeout_sec,
+            stale_review_count=track.stale_review_count,
+            last_review_ts=row.get("last_review_ts"),
+            now_epoch=now,
+            review_interval_sec=review_interval,
+        )
         review = evaluate_exit(
             track=track,
             snap=snap,

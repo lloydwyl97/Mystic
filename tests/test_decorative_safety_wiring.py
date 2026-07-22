@@ -27,7 +27,7 @@ def test_governance_enforcement_defaults_on_when_shadow_false(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_can_open_position_blocks_on_symbol_cooldown_when_enabled(monkeypatch):
+async def test_can_open_position_keeps_symbol_cooldown_telemetry_only_when_enabled(monkeypatch):
     monkeypatch.setenv("ENABLE_COOLDOWN_ENFORCEMENT", "true")
     # Reload flag by patching the name used inside portfolio_engine
     import backend.services.portfolio_engine as pe
@@ -47,10 +47,17 @@ async def test_can_open_position_blocks_on_symbol_cooldown_when_enabled(monkeypa
 
     sym = pe.normalize_symbol("BTCUSDT")
     engine._quality_filter_state.symbol_cooldown_wall[sym] = time.time() + 600
+    engine._available_balance = 10000.0
+    engine.cash_balance = 10000.0
+    engine._total_equity = 10000.0
+    engine._total_open_risk = 0.0
+    engine._symbol_constraints = {}
+    engine._is_bear_day_regime = lambda: False
+    engine._count_open_day_top4_positions = lambda: 0
 
     ok, reason = await engine._can_open_position("BTCUSDT", 100.0)
-    assert ok is False, reason
-    assert reason == "SYMBOL_SELL_COOLDOWN"
+    assert ok is True, reason
+    assert reason == "OK"
 
 
 @pytest.mark.asyncio
