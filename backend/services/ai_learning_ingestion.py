@@ -628,22 +628,66 @@ def label_pending_snapshots(db_path: str = DATABASE_PATH) -> dict[str, int]:
         return counters
 
     now_ms = time.time() * 1000.0
+    cutoff_ms = now_ms - 15 * 60 * 1000
     with sqlite3.connect(db_path, timeout=15) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT id, symbol, epoch_ms, price, decision, thesis_invalid_level, thesis_target_level,
-                   fwd_ret_15m, fwd_ret_30m, fwd_ret_1h, fwd_ret_4h, fwd_ret_24h
+        # Split the batch so PARTIAL completion work cannot starve first-horizon PENDING.
+        half = max(1, int(LABEL_BATCH_LIMIT) // 2)
+        _cols = (
+            "id, symbol, epoch_ms, price, decision, thesis_invalid_level, thesis_target_level, "
+            "fwd_ret_15m, fwd_ret_30m, fwd_ret_1h, fwd_ret_4h, fwd_ret_24h"
+        )
+        pending_rows = conn.execute(
+            f"""
+            SELECT {_cols}
             FROM ai_candidate_snapshots
-            WHERE label_status IN ('PENDING', 'PARTIAL')
-              AND epoch_ms <= ?
-            ORDER BY CASE WHEN label_status='PARTIAL' THEN 0 ELSE 1 END,
-                     epoch_ms DESC
+            WHERE label_status='PENDING' AND epoch_ms <= ?
+            ORDER BY epoch_ms ASC
             LIMIT ?
             """,
-            (now_ms - 15 * 60 * 1000, LABEL_BATCH_LIMIT),
+            (cutoff_ms, half),
         ).fetchall()
+        remain = max(0, int(LABEL_BATCH_LIMIT) - len(pending_rows))
+        partial_rows = conn.execute(
+            f"""
+            SELECT {_cols}
+            FROM ai_candidate_snapshots
+            WHERE label_status='PARTIAL' AND epoch_ms <= ?
+            ORDER BY epoch_ms DESC
+            LIMIT ?
+            """,
+            (cutoff_ms, remain),
+        ).fetchall()
+        if len(pending_rows) + len(partial_rows) < int(LABEL_BATCH_LIMIT):
+            need = int(LABEL_BATCH_LIMIT) - len(pending_rows) - len(partial_rows)
+            if len(pending_rows) < half:
+                extra = conn.execute(
+                    f"""
+                    SELECT {_cols}
+                    FROM ai_candidate_snapshots
+                    WHERE label_status='PARTIAL' AND epoch_ms <= ?
+                    ORDER BY epoch_ms DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (cutoff_ms, need, len(partial_rows)),
+                ).fetchall()
+                partial_rows = list(partial_rows) + list(extra)
+            else:
+                extra = conn.execute(
+                    f"""
+                    SELECT {_cols}
+                    FROM ai_candidate_snapshots
+                    WHERE label_status='PENDING' AND epoch_ms <= ?
+                    ORDER BY epoch_ms ASC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (cutoff_ms, need, len(pending_rows)),
+                ).fetchall()
+                pending_rows = list(pending_rows) + list(extra)
+        rows = list(pending_rows) + list(partial_rows)
         counters["scanned"] = len(rows)
+        counters["scanned_pending"] = len(pending_rows)
+        counters["scanned_partial"] = len(partial_rows)
         if not rows:
             _prune_old_rows(conn)
             return counters

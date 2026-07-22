@@ -72,6 +72,7 @@ def build_memory_patch_from_decision_data(decision_data: dict[str, Any]) -> dict
     cur = str(dd.get("day_route_regime") or dd.get("regime") or "neutral")
     prev = str(dd.get("previous_regime") or "")
     trans = float(dd.get("regime_transition_score") or 0.0)
+    # Candidate polls must not overwrite close-path same-setup counters.
     return {
         "last_30m_state": str(dd.get("market_state_30m") or cur),
         "last_2h_state": str(dd.get("market_state_2h") or cur),
@@ -83,12 +84,7 @@ def build_memory_patch_from_decision_data(decision_data: dict[str, Any]) -> dict
         "volatility_state": str(dd.get("volatility_state") or "normal"),
         "liquidity_state": str(dd.get("liquidity_state") or "normal"),
         "relative_strength_rank": int(float(dd.get("relative_strength_rank") or 0)),
-        "last_setup_seen": str(dd.get("setup_type") or dd.get("entry_thesis") or ""),
-        "last_setup_result": str(dd.get("last_setup_result") or ""),
-        "last_trade_result": str(dd.get("last_trade_result") or ""),
-        "last_trade_failure_reason": str(dd.get("last_trade_failure_reason") or ""),
-        "same_setup_today_count": int(float(dd.get("same_setup_today_count") or 0)),
-        "same_setup_today_net_pnl": float(dd.get("same_setup_today_net_pnl") or 0.0),
+        "last_setup_candidate": str(dd.get("setup_type") or dd.get("entry_thesis") or ""),
     }
 
 
@@ -127,13 +123,15 @@ def update_market_memory_on_close_sync(
         setup_u = str(setup or "").upper()
         same_count = int(existing.get("same_setup_today_count") or 0)
         same_pnl = float(existing.get("same_setup_today_net_pnl") or 0.0)
-        if str(existing.get("last_setup_seen") or "").upper() == setup_u:
+        last_closed = str(existing.get("last_closed_setup") or existing.get("last_setup_seen") or "").upper()
+        if last_closed == setup_u:
             same_count += 1
             same_pnl += pnl
         else:
             same_count = 1
             same_pnl = pnl
         patch = {
+            "last_closed_setup": setup_u,
             "last_setup_seen": setup_u,
             "last_setup_result": result,
             "last_trade_result": result,
@@ -163,13 +161,15 @@ async def update_market_memory_on_close(
     setup_u = str(setup or "").upper()
     same_count = int(existing.get("same_setup_today_count") or 0)
     same_pnl = float(existing.get("same_setup_today_net_pnl") or 0.0)
-    if str(existing.get("last_setup_seen") or "").upper() == setup_u:
+    last_closed = str(existing.get("last_closed_setup") or existing.get("last_setup_seen") or "").upper()
+    if last_closed == setup_u:
         same_count += 1
         same_pnl += pnl
     else:
         same_count = 1
         same_pnl = pnl
     patch = {
+        "last_closed_setup": setup_u,
         "last_setup_seen": setup_u,
         "last_setup_result": result,
         "last_trade_result": result,
@@ -183,7 +183,8 @@ async def update_market_memory_on_close(
 def memory_rank_delta(memory: dict[str, Any], setup: str) -> float:
     mem = memory or {}
     setup_u = str(setup or "").upper()
-    if str(mem.get("last_setup_seen") or "").upper() != setup_u:
+    last_closed = str(mem.get("last_closed_setup") or mem.get("last_setup_seen") or "").upper()
+    if last_closed != setup_u:
         return 0.0
     same_pnl = float(mem.get("same_setup_today_net_pnl") or 0.0)
     same_count = int(mem.get("same_setup_today_count") or 0)
