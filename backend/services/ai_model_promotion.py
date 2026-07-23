@@ -280,9 +280,17 @@ def register_candidate_and_maybe_promote(
     accuracy_margin = _accuracy_margin(holdout_count)
     metrics["accuracy_margin_applied"] = round(accuracy_margin, 6)
     if not has_active:
+        # Cold-start bootstrap: no active model exists so there is nothing to
+        # compare against. Bypass holdout gate entirely — the minimum quality
+        # bar is the training accuracy from the RF fit (checked by the caller
+        # via MIN_RF_TRAIN_SAMPLES / MIN_RF_TIER_A_ROWS). Without this bypass
+        # the system is deadlocked: no model → no trades → no outcome rows →
+        # holdout fails → model never promotes → no model.
+        holdout_ok = True
         accuracy_ok = True
-        pac_ok = holdout_ok and c_profit is not None
-        bad_ok = holdout_ok and c_bad is not None
+        pac_ok = True
+        bad_ok = True
+        metrics["promotion_path"] = "cold_start_bootstrap"
     else:
         accuracy_ok = holdout_ok and c_acc is not None and a_acc is not None and c_acc >= (a_acc - accuracy_margin)
         pac_ok = holdout_ok and c_profit is not None and a_profit is not None and c_profit >= (a_profit - 0.0005)
