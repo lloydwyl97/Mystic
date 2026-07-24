@@ -300,6 +300,7 @@ def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_scalp_paper_positions_status ON scalp_paper_positions(status)")
 
+        applied: list[str] = []
         row = conn.execute("SELECT 1 FROM scalp_meta WHERE id = 1").fetchone()
         if row is None:
             conn.execute(
@@ -317,7 +318,45 @@ def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list
                 """,
                 (principal, principal, principal),
             )
-        applied = apply_scalp_migrations(conn)
+        else:
+            ledger_row = conn.execute(
+                """
+                SELECT principal, cash_balance, positions_value, realized_pnl,
+                       unrealized_pnl, total_equity
+                FROM scalp_paper_ledger WHERE id = 1
+                """
+            ).fetchone()
+            trade_count = int(conn.execute("SELECT COUNT(*) FROM scalp_paper_trades").fetchone()[0] or 0)
+            position_count = int(conn.execute("SELECT COUNT(*) FROM scalp_paper_positions").fetchone()[0] or 0)
+            if ledger_row is not None and trade_count == 0 and position_count == 0:
+                stored_principal = float(ledger_row[0] or 0)
+                canonical_principal = stored_principal if stored_principal > 0 else float(principal)
+                cash = float(ledger_row[1] or 0)
+                positions_value = float(ledger_row[2] or 0)
+                realized_pnl = float(ledger_row[3] or 0)
+                unrealized_pnl = float(ledger_row[4] or 0)
+                total_equity = float(ledger_row[5] or 0)
+                clean_empty = all(
+                    abs(value) < 0.01
+                    for value in (positions_value, realized_pnl, unrealized_pnl)
+                )
+                basis_mismatch = (
+                    abs(cash - canonical_principal) >= 0.01
+                    or abs(total_equity - canonical_principal) >= 0.01
+                )
+                if clean_empty and basis_mismatch:
+                    conn.execute(
+                        """
+                        UPDATE scalp_paper_ledger
+                        SET principal=?, cash_balance=?, positions_value=0,
+                            realized_pnl=0, unrealized_pnl=0, total_equity=?,
+                            updated_at=datetime('now')
+                        WHERE id=1
+                        """,
+                        (canonical_principal, canonical_principal, canonical_principal),
+                    )
+                    applied.append("repair_empty_ledger_basis")
+        applied.extend(apply_scalp_migrations(conn))
         try:
             from backend.services.scalp_outcome_attribution import ensure_scalp_outcome_attribution_table
             from backend.services.scalp_post_trade_feature_review import ensure_scalp_post_trade_review_table

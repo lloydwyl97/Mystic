@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +11,7 @@ import pytest
 from backend.services.binance_scalp.paper_engine import _round_trip_execution_costs
 from backend.services.binance_scalp.scalp_position_lifecycle import _stale_review_due
 from backend.services.binance_scalp import status_snapshot
+from backend.services.binance_scalp.schema import init_scalp_schema
 
 
 class _Signal:
@@ -147,3 +150,22 @@ def test_learning_costs_use_persisted_entry_and_exit_economics():
 
     assert fees == pytest.approx(0.17 + 153.0 * 0.001)
     assert slippage == pytest.approx(0.08 + 153.0 * 0.0005)
+
+
+def test_empty_scalp_ledger_repairs_cash_basis_mismatch(tmp_path: Path):
+    db_path = tmp_path / "scalp.db"
+    init_scalp_schema(db_path, principal=1000.0)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE scalp_paper_ledger SET cash_balance=10000, total_equity=10000 WHERE id=1"
+        )
+        conn.commit()
+
+    applied = init_scalp_schema(db_path, principal=1000.0)
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT principal, cash_balance, total_equity FROM scalp_paper_ledger WHERE id=1"
+        ).fetchone()
+    assert "repair_empty_ledger_basis" in applied
+    assert row == (1000.0, 1000.0, 1000.0)

@@ -106,6 +106,36 @@ def test_redis_bundle_expired_before_label_horizon_completes_via_rest_fallback()
         assert counters["unlabelable"] == 0
 
 
+def test_old_partial_rows_are_not_starved_by_newer_partial_backlog():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "partial_order.db"
+        ensure_learning_ingestion_tables(str(db_path))
+        old_epoch_ms = (time.time() - LABEL_GIVEUP_AGE_SEC * 0.6) * 1000.0
+        _seed_snapshot(db_path, epoch_ms=old_epoch_ms, decision_id="old_due")
+        _seed_snapshot(db_path, epoch_ms=(time.time() - 30 * 60) * 1000.0, decision_id="recent_1")
+        _seed_snapshot(db_path, epoch_ms=(time.time() - 20 * 60) * 1000.0, decision_id="recent_2")
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("UPDATE ai_candidate_snapshots SET label_status='PARTIAL'")
+            conn.commit()
+
+        def _fake_rest(sym_bus, interval, start_ms, end_ms, **_kw):
+            return _synthetic_klines(start_ms, end_ms)
+
+        with (
+            patch("backend.config.redis_config.get_redis_client", return_value=_FakeRedisEmpty()),
+            patch("backend.services.ai_learning_ingestion.LABEL_BATCH_LIMIT", 2),
+            patch("backend.services.ai_learning_ingestion._fetch_historical_klines_rest", side_effect=_fake_rest),
+        ):
+            counters = label_pending_snapshots(str(db_path))
+
+        with sqlite3.connect(str(db_path)) as conn:
+            status = conn.execute(
+                "SELECT label_status FROM ai_candidate_snapshots WHERE decision_id='old_due'"
+            ).fetchone()[0]
+        assert counters["labeled"] >= 1
+        assert status == "LABELED"
+
+
 def test_missing_durable_evidence_is_a_specific_unrecoverable_reason_not_silent():
     """Scenario 6: Redis empty AND REST fallback also fails -> row eventually goes UNLABELABLE
     only after the giveup age, with a clear, queryable reason (label_status + labeled_at_utc set),

@@ -26,6 +26,7 @@ def _base_engine() -> PortfolioEngine:
     engine._last_bar_timestamp = int(time.time())
     engine._bar_interval_seconds = 60
     engine._lookup_position_close_cooldown = MagicMock(return_value=0.0)
+    engine._get_loss_hold_until = AsyncMock(return_value=None)
     engine._ensure_symbol_constraints = AsyncMock()
     return engine
 

@@ -653,7 +653,7 @@ def label_pending_snapshots(db_path: str = DATABASE_PATH) -> dict[str, int]:
             SELECT {_cols}
             FROM ai_candidate_snapshots
             WHERE label_status='PARTIAL' AND epoch_ms <= ?
-            ORDER BY epoch_ms DESC
+            ORDER BY epoch_ms ASC
             LIMIT ?
             """,
             (cutoff_ms, remain),
@@ -666,7 +666,7 @@ def label_pending_snapshots(db_path: str = DATABASE_PATH) -> dict[str, int]:
                     SELECT {_cols}
                     FROM ai_candidate_snapshots
                     WHERE label_status='PARTIAL' AND epoch_ms <= ?
-                    ORDER BY epoch_ms DESC
+                    ORDER BY epoch_ms ASC
                     LIMIT ? OFFSET ?
                     """,
                     (cutoff_ms, need, len(partial_rows)),
