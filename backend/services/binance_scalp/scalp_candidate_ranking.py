@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from backend.services.binance_scalp.scalp_regime_classifier import STRATEGY_NATIVE_REGIMES
@@ -165,7 +165,7 @@ def _reachability_soft_mult(
 @dataclass(frozen=True)
 class RankedCandidate:
     signal: ScalpSetupSignal
-    rank_score: float
+    rank_score: float                      # final score (base + context adjustments)
     entry_eligible: bool
     hard_block: str | None
     regime: str
@@ -178,6 +178,12 @@ class RankedCandidate:
     momentum_boost: float | None = None
     reachability_multiplier: float | None = None
     target_gap_pct: float | None = None
+    # Market-role context breakdown (live + learned, never a gate)
+    raw_rank_score: float = 0.0            # score before context adjustments
+    live_context_adjustment: float = 0.0  # bounded ±0.04 from live market-role data
+    learned_adjustment: float = 0.0       # bounded ±0.02 from outcome history
+    role_sample_count: int = 0
+    role_confidence: str = "insufficient_data"
 
 
 def rank_setup_signal(
@@ -296,9 +302,6 @@ def rank_setup_signal(
     entry_eligible = sig.passed and rank_score >= min_score and hard_block is None
     soft_reason = None if sig.passed else sig.reject_reason
     if entry_eligible and not native and _require_regime_native():
-        # Regime focus: STRATEGY_NATIVE_REGIMES was advisory (score mult only).
-        # Non-native confirmed setups still rank for diagnostics but cannot buy —
-        # keeps range/chop markets from executing breakout/impulse strategies.
         entry_eligible = False
         confidence = "regime_mismatch"
         soft_reason = f"REGIME_BLOCKED:{regime}"
@@ -310,9 +313,39 @@ def rank_setup_signal(
         confidence = "symbol_stall_risk_blocked"
         soft_reason = f"SYMBOL_STALL_RISK_GATE:{sig.symbol}"
 
+    # ------------------------------------------------------------------
+    # Market-role context adjustment — direct bounded addition to score.
+    # Never changes eligibility, never blocks, never adds a gate.
+    # live_adj ±0.04  (scaled from ±0.06 DAY range; SCALP scores are higher)
+    # learned_adj ±0.02 from outcome history
+    # ------------------------------------------------------------------
+    raw_rank_score = rank_score
+    live_ctx_adj = 0.0
+    learned_adj = 0.0
+    role_samples = 0
+    role_conf_status = "insufficient_data"
+    with contextlib.suppress(Exception):
+        from backend.services.market_role_intelligence import get_cached_role_context as _gcrc
+        from backend.services.market_role_outcome_learner import get_learning_stats as _gls
+
+        _rctx = _gcrc(sig.symbol)
+        if _rctx is not None:
+            # Scale live delta: SCALP base scores are 1.0–2.0+, so we use a
+            # proportional fraction of the ±0.06 DAY delta (target ±0.04 here).
+            _raw_delta = _rctx.live_ranking_delta()
+            live_ctx_adj = round(max(-0.04, min(0.04, _raw_delta * (0.04 / 0.06))), 5)
+
+        _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
+        _stats = _gls(_db, sig.symbol, "scalp")
+        role_samples = _stats.sample_count
+        role_conf_status = _stats.confidence_status
+        learned_adj = round(max(-0.02, min(0.02, _stats.learned_adjustment)), 5)
+
+    rank_score = round(rank_score + live_ctx_adj + learned_adj, 4)
+
     return RankedCandidate(
         signal=sig,
-        rank_score=round(rank_score, 4),
+        rank_score=rank_score,
         entry_eligible=entry_eligible,
         hard_block=hard_block,
         regime=regime,
@@ -324,6 +357,11 @@ def rank_setup_signal(
         momentum_boost=mom_boost,
         reachability_multiplier=reach_mult_val,
         target_gap_pct=target_gap_val if target_gap_val is not None else reach_surplus,
+        raw_rank_score=round(raw_rank_score, 4),
+        live_context_adjustment=live_ctx_adj,
+        learned_adjustment=learned_adj,
+        role_sample_count=role_samples,
+        role_confidence=role_conf_status,
     )
 
 

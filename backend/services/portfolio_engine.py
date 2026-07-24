@@ -847,14 +847,38 @@ class BuyCandidate:
         except (TypeError, ValueError):
             missed_delta = 0.0
         missed_delta = max(-0.02, min(0.03, missed_delta))
-        # Market-role intelligence delta (soft ranking signal, never a gate; range ±0.06)
-        role_delta = 0.0
+        # Market-role intelligence: live context adjustment (data-driven, never a gate; ±0.06)
+        live_role_delta = 0.0
         try:
-            role_delta = float((self.decision_data or {}).get("ctx_role_ranking_delta") or 0.0)
+            live_role_delta = float((self.decision_data or {}).get("ctx_role_ranking_delta") or 0.0)
         except (TypeError, ValueError):
-            role_delta = 0.0
-        role_delta = max(-0.06, min(0.06, role_delta))
-        return max(0.0, min(1.0, base + delta + trust_delta + thesis_delta + missed_delta + role_delta))
+            live_role_delta = 0.0
+        live_role_delta = max(-0.06, min(0.06, live_role_delta))
+        # Market-role learned adjustment from outcome history (additional ±0.02)
+        learned_role_delta = 0.0
+        try:
+            sym = str((self.decision_data or {}).get("symbol") or getattr(self, "symbol", "") or "")
+            strat = str((self.decision_data or {}).get("strategy_id") or "day")
+            if sym:
+                import os as _os
+                _db = _os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
+                from backend.services.market_role_outcome_learner import get_learned_adjustment as _gla
+                learned_role_delta = _gla(_db, sym, strat)
+        except Exception:
+            learned_role_delta = 0.0
+        learned_role_delta = max(-0.02, min(0.02, learned_role_delta))
+        # Store breakdown in decision_data for API/dashboard visibility (best-effort)
+        _base_before_role = max(0.0, min(1.0, base + delta + trust_delta + thesis_delta + missed_delta))
+        _final = max(0.0, min(1.0, _base_before_role + live_role_delta + learned_role_delta))
+        try:
+            if isinstance(self.decision_data, dict):
+                self.decision_data["_role_base_rank"] = round(_base_before_role, 6)
+                self.decision_data["_role_live_adj"] = round(live_role_delta, 6)
+                self.decision_data["_role_learned_adj"] = round(learned_role_delta, 6)
+                self.decision_data["_role_final_rank"] = round(_final, 6)
+        except Exception:
+            pass
+        return _final
 
 
 def _decision_float(decision_data: dict[str, Any], key: str, default: float) -> float:
@@ -8045,6 +8069,15 @@ class PortfolioEngine:
         exp_dict = explainability.to_dict()
         exp_dict.update(repair_meta)
 
+        # Snapshot role context at repair-add entry time
+        try:
+            from backend.services.market_role_intelligence import get_cached_role_context as _gcrc_ra
+
+            _rctx = _gcrc_ra(normalized_symbol) or _gcrc_ra(normalized_symbol.replace("/", "").upper())
+            _repair_ctx_snap = json.dumps(_rctx.to_dict(), separators=(",", ":"), default=str) if _rctx else "{}"
+        except Exception:
+            _repair_ctx_snap = "{}"
+
         def _sync_insert():
             def _op() -> None:
                 with connect_rw(self.db_path) as conn:
@@ -8058,8 +8091,8 @@ class PortfolioEngine:
                             atr_at_entry, entry_bar_timestamp, confidence,
                             fees_paid, slippage_cost, timestamp, status,
                             explainability_json, diagnostics_json, sleeve,
-                            entry_timestamp, decision_id, strategy_id
-                        ) VALUES (?, ?, 'paper', ?, 'BUY', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, 'day')
+                            entry_timestamp, decision_id, strategy_id, context_snapshot_json
+                        ) VALUES (?, ?, 'paper', ?, 'BUY', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, 'day', ?)
                     """,
                         (
                             trade_id,
@@ -8080,6 +8113,7 @@ class PortfolioEngine:
                             effective_sleeve,
                             timestamp,
                             decision_id,
+                            _repair_ctx_snap,
                         ),
                     )
                     conn.commit()
@@ -8883,7 +8917,50 @@ class PortfolioEngine:
                             (float(proceeds), float(realized_pnl), timestamp),
                         )
 
+                    # Fetch context_snapshot_json from the BUY row so learning can
+                    # confirm context came from entry time, not regenerated at exit.
+                    _ctx_snap_for_learning: str | None = None
+                    try:
+                        cursor.execute(
+                            "SELECT context_snapshot_json FROM paper_trades WHERE trade_id = ? AND UPPER(side) = 'BUY' LIMIT 1",
+                            (position_trade_id,),
+                        )
+                        _csrow = cursor.fetchone()
+                        if _csrow and _csrow[0]:
+                            _ctx_snap_for_learning = str(_csrow[0])
+                    except Exception:
+                        pass
+
                     conn.commit()
+
+                    # Fire-and-forget learning update (non-blocking, after commit)
+                    if _ctx_snap_for_learning:
+                        try:
+                            from backend.services.market_role_outcome_learner import record_trade_outcome as _record_outcome
+
+                            _hold_sec = int(hold_time_seconds) if hold_time_seconds else 0
+                            _pnl_pct_val = float(pnl_pct) if pnl_pct is not None else 0.0
+                            _mfe_val = float(mfe_pct) if mfe_pct is not None else None
+                            _mae_val = float(mae_pct) if mae_pct is not None else None
+                            _strat = str(sell_strategy_id or buy_row_strategy_id or "day")
+                            _regime = str(original_explain.get("market_regime") or "unknown")
+                            _record_outcome(
+                                self.db_path,
+                                trade_id=sell_trade_id,
+                                buy_trade_id=position_trade_id,
+                                symbol=normalized_symbol,
+                                strategy=_strat,
+                                realized_pnl_pct=_pnl_pct_val,
+                                hold_seconds=_hold_sec,
+                                exit_reason=str(exit_trigger or ""),
+                                mfe_pct=_mfe_val,
+                                mae_pct=_mae_val,
+                                market_regime=_regime,
+                                context_snapshot_json=_ctx_snap_for_learning,
+                            )
+                        except Exception as _le:
+                            logger.debug("market_role learning update skipped: %s", _le)
+
                     return True
 
             try:

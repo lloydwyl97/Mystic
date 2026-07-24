@@ -1,16 +1,19 @@
 """
 Market-Role Context API endpoints.
 
-GET /api/context/market-role          — all four coins' live role context
-GET /api/context/market-role/{symbol} — one symbol's live role context
-GET /api/context/market-role/summary  — compact summary for dashboard widget
+GET /api/context/market-role                   — all four coins' live role context
+GET /api/context/market-role/summary           — compact summary for dashboard widget
+GET /api/context/market-role/ranking-breakdown — DAY + SCALP score breakdown for all four coins
+GET /api/context/market-role/{symbol}          — one symbol's live role context
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import redis.asyncio as redis_async
@@ -28,6 +31,20 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 _WATCHED_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+_DB_PATH = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
+
+
+def _freshness_sec(ts_raw: str) -> float | None:
+    if not ts_raw:
+        return None
+    try:
+        tnorm = str(ts_raw).replace("Z", "+00:00")
+        t = datetime.fromisoformat(tnorm)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return round(max(0.0, (datetime.now(timezone.utc) - t.astimezone(timezone.utc)).total_seconds()), 1)
+    except Exception:
+        return None
 
 
 async def _read_role_context_from_redis(symbol: str, redis_client: redis_async.Redis) -> dict[str, Any]:
@@ -55,22 +72,10 @@ async def _read_role_context_from_redis(symbol: str, redis_client: redis_async.R
             for k, v in raw.items()
         }
 
-        # Compute freshness
         ts_raw = payload.get("ts_utc", "")
-        freshness_sec: float | None = None
-        if ts_raw:
-            try:
-                from datetime import datetime, timezone
+        fresh_sec = _freshness_sec(ts_raw)
 
-                tnorm = str(ts_raw).replace("Z", "+00:00")
-                t = datetime.fromisoformat(tnorm)
-                if t.tzinfo is None:
-                    t = t.replace(tzinfo=timezone.utc)
-                freshness_sec = round(max(0.0, (datetime.now(timezone.utc) - t.astimezone(timezone.utc)).total_seconds()), 1)
-            except Exception:
-                pass
-
-        # Parse role_intel_json if present
+        # Parse role_intel_json
         role_intel: dict[str, Any] = {}
         raw_role = payload.get("ctx_role_intel_json", "{}")
         if raw_role and raw_role != "{}":
@@ -91,42 +96,34 @@ async def _read_role_context_from_redis(symbol: str, redis_client: redis_async.R
         result.update({
             "market_role": role_intel.get("market_role") or MARKET_ROLES.get(sym, "unknown"),
             "role_code": role_intel.get("role_code"),
-            # Relative strength
             "rs_btc_24h": _f("ctx_rs_btc"),
             "rs_eth_24h": _f("ctx_rs_eth"),
             "rs_short_1h": role_intel.get("rs_short_1h"),
             "rs_medium_4h": role_intel.get("rs_medium_4h"),
-            # Cross-asset
             "btc_correlation": role_intel.get("btc_correlation"),
             "btc_beta": role_intel.get("btc_beta"),
-            # Composite scores
             "momentum_score": role_intel.get("momentum_score"),
             "volatility_score": role_intel.get("volatility_score"),
             "volume_accel": role_intel.get("volume_accel"),
-            # Catalyst
             "catalyst_score": role_intel.get("catalyst_score"),
             "catalyst_source": role_intel.get("catalyst_source", "unavailable"),
             "catalyst_category": role_intel.get("catalyst_category"),
-            # Market conditions
             "market_regime": payload.get("ctx_market_regime", "unknown"),
             "risk_regime": role_intel.get("risk_regime", "neutral"),
             "fear_greed": _f("ctx_sentiment_fear_greed"),
             "btc_dominance_proxy": _f("ctx_btc_dominance_proxy"),
-            # Microstructure
             "spread_pct": _f("ctx_spread_pct"),
             "depth_imbalance": _f("ctx_depth_imbalance"),
             "volume_24h_usd": _f("ctx_volume_24h_usd"),
             "liquidity_tier": payload.get("ctx_liquidity_tier"),
-            # Ranking
+            "live_context_adjustment": role_intel.get("live_context_adjustment", _f("ctx_role_ranking_delta", 0.0)),
             "role_ranking_delta": _f("ctx_role_ranking_delta", 0.0),
             "ctx_multiplier": _f("ctx_multiplier", 1.0),
-            # Source / freshness
             "source_status": role_intel.get("source_status", "live") if role_intel else "partial",
-            "freshness_seconds": freshness_sec,
+            "freshness_seconds": fresh_sec,
             "context_ts_utc": ts_raw,
-            # Consumer confirmation
-            "day_consumed": freshness_sec is not None and freshness_sec < 300,
-            "scalp_consumed": freshness_sec is not None and freshness_sec < 120,
+            "day_consumed": fresh_sec is not None and fresh_sec < 300,
+            "scalp_consumed": fresh_sec is not None and fresh_sec < 120,
         })
 
     except Exception as exc:
@@ -134,6 +131,88 @@ async def _read_role_context_from_redis(symbol: str, redis_client: redis_async.R
         result["error"] = str(exc)[:120]
 
     return result
+
+
+def _build_day_breakdown(sym: str, ctx: dict[str, Any]) -> dict[str, Any]:
+    """
+    Build DAY ranking breakdown from decision_data injected fields.
+    Falls back to live context if no in-flight candidate is available.
+    """
+    # Fetch learned stats
+    day_stats = {"sample_count": 0, "learned_adjustment": 0.0, "confidence": 0.0, "confidence_status": "insufficient_data"}
+    try:
+        from backend.services.market_role_outcome_learner import get_learning_stats as _gls
+        s = _gls(_DB_PATH, sym, "day")
+        day_stats = {
+            "sample_count": s.sample_count,
+            "learned_adjustment": s.learned_adjustment,
+            "confidence": s.confidence,
+            "confidence_status": s.confidence_status,
+        }
+    except Exception:
+        pass
+
+    live_adj = float(ctx.get("live_context_adjustment") or ctx.get("role_ranking_delta") or 0.0)
+    learned_adj = day_stats["learned_adjustment"] if day_stats["sample_count"] >= 10 else 0.0
+
+    # Base rank is not known without a live candidate; report "N/A" and components only
+    return {
+        "symbol": sym,
+        "strategy": "day",
+        "base_rank_score": "N/A (no active candidate)",
+        "live_context_adjustment": round(live_adj, 6),
+        "learned_adjustment": round(learned_adj, 6),
+        "final_rank_score": "base + live_adj + learned_adj (resolved at trade time)",
+        "learning_sample_count": day_stats["sample_count"],
+        "learning_confidence": round(day_stats["confidence"], 4),
+        "learning_confidence_status": day_stats["confidence_status"],
+        "note": "final DAY rank_score = BuyCandidate.rank_score() which fuses base, live, and learned at selection time",
+    }
+
+
+def _build_scalp_breakdown(sym: str) -> dict[str, Any]:
+    """
+    Build SCALP ranking breakdown using cached role context + learned stats.
+    """
+    scalp_stats = {"sample_count": 0, "learned_adjustment": 0.0, "confidence": 0.0, "confidence_status": "insufficient_data"}
+    try:
+        from backend.services.market_role_outcome_learner import get_learning_stats as _gls
+        s = _gls(_DB_PATH, sym, "scalp")
+        scalp_stats = {
+            "sample_count": s.sample_count,
+            "learned_adjustment": s.learned_adjustment,
+            "confidence": s.confidence,
+            "confidence_status": s.confidence_status,
+        }
+    except Exception:
+        pass
+
+    live_adj = 0.0
+    raw_delta = 0.0
+    try:
+        from backend.services.market_role_intelligence import get_cached_role_context as _gcrc
+        _rctx = _gcrc(sym)
+        if _rctx is not None:
+            raw_delta = _rctx.live_ranking_delta()
+            live_adj = round(max(-0.04, min(0.04, raw_delta * (0.04 / 0.06))), 5)
+    except Exception:
+        pass
+
+    learned_adj = scalp_stats["learned_adjustment"] if scalp_stats["sample_count"] >= 10 else 0.0
+
+    return {
+        "symbol": sym,
+        "strategy": "scalp",
+        "base_candidate_score": "N/A (resolved per setup signal at execution time)",
+        "live_context_adjustment": round(live_adj, 5),
+        "learned_adjustment": round(learned_adj, 5),
+        "final_candidate_score": "base + live_adj + learned_adj (resolved per tick in rank_setup_signal)",
+        "learning_sample_count": scalp_stats["sample_count"],
+        "learning_confidence": round(scalp_stats["confidence"], 4),
+        "learning_confidence_status": scalp_stats["confidence_status"],
+        "raw_live_delta_before_scale": round(raw_delta, 6),
+        "note": "SCALP adjustments are capped: live ±0.04, learned ±0.02, combined ±0.06",
+    }
 
 
 @router.get("/api/context/market-role")
@@ -145,14 +224,11 @@ async def get_all_market_role_contexts() -> dict[str, Any]:
     except Exception:
         pass
 
-    symbols = _WATCHED_SYMBOLS
     results: list[dict[str, Any]] = []
-
-    for sym in symbols:
+    for sym in _WATCHED_SYMBOLS:
         if redis_client is not None:
             ctx = await _read_role_context_from_redis(sym, redis_client)
         else:
-            # Fall back to in-process cache
             cached = get_cached_role_context(sym)
             if cached:
                 ctx = cached.to_dict()
@@ -162,7 +238,6 @@ async def get_all_market_role_contexts() -> dict[str, Any]:
                 ctx = {"symbol": sym, "market_role": MARKET_ROLES.get(sym, "unknown"), "source_status": "unavailable"}
         results.append(ctx)
 
-    # Global regime from BTC context
     btc_ctx = next((r for r in results if r.get("symbol") == "BTCUSDT"), {})
     global_regime = btc_ctx.get("market_regime", "unknown")
 
@@ -171,16 +246,13 @@ async def get_all_market_role_contexts() -> dict[str, Any]:
         "global_market_regime": global_regime,
         "symbols": {r["symbol"]: r for r in results},
         "generated_at": time.time(),
-        "watched_symbols": symbols,
+        "watched_symbols": _WATCHED_SYMBOLS,
     }
 
 
 @router.get("/api/context/market-role/summary")
 async def get_market_role_summary() -> dict[str, Any]:
-    """
-    Compact summary for the dashboard widget.
-    Returns only the most relevant fields for display.
-    """
+    """Compact summary for the dashboard widget."""
     redis_client = None
     try:
         redis_client = await get_shared_redis_async()
@@ -207,6 +279,7 @@ async def get_market_role_summary() -> dict[str, Any]:
             "role": ctx.get("market_role", "unknown"),
             "regime": ctx.get("market_regime", "unknown"),
             "rs_btc": _fmt(ctx.get("rs_btc_24h")),
+            "rs_short_1h": _fmt(ctx.get("rs_short_1h")),
             "momentum": _fmt(ctx.get("momentum_score")),
             "volatility": _fmt(ctx.get("volatility_score")),
             "btc_corr": _fmt(ctx.get("btc_correlation")),
@@ -214,6 +287,7 @@ async def get_market_role_summary() -> dict[str, Any]:
             "catalyst": _fmt(ctx.get("catalyst_score")),
             "catalyst_src": ctx.get("catalyst_source", "unavailable"),
             "rank_delta": _fmt(ctx.get("role_ranking_delta"), 4),
+            "live_context_adj": _fmt(ctx.get("live_context_adjustment"), 4),
             "freshness_s": ctx.get("freshness_seconds"),
             "source": ctx.get("source_status", "unavailable"),
         })
@@ -224,6 +298,74 @@ async def get_market_role_summary() -> dict[str, Any]:
         "global_regime": btc_item.get("regime", "unknown"),
         "coins": summary,
         "ts": time.time(),
+    }
+
+
+@router.get("/api/context/market-role/ranking-breakdown")
+async def get_ranking_breakdown() -> dict[str, Any]:
+    """
+    DAY and SCALP ranking score breakdown for all four coins.
+
+    Returns per-symbol:
+      - base_rank_score / base_candidate_score
+      - live_context_adjustment  (data-driven, ±0.06 DAY / ±0.04 SCALP)
+      - learned_adjustment       (±0.02 from outcome history; 0 until MIN_SAMPLES=10)
+      - final_rank_score / final_candidate_score
+      - learning_sample_count
+      - learning_confidence
+      - learning_confidence_status  ("insufficient_data" / "low_confidence" / "confident")
+
+    Note: base scores are resolved per-candidate at trade selection time.
+    This endpoint shows the context adjustment components that are always present.
+    """
+    redis_client = None
+    try:
+        redis_client = await get_shared_redis_async()
+    except Exception:
+        pass
+
+    breakdown: dict[str, Any] = {}
+    for sym in _WATCHED_SYMBOLS:
+        ctx: dict[str, Any] = {}
+        if redis_client is not None:
+            ctx = await _read_role_context_from_redis(sym, redis_client)
+        else:
+            cached = get_cached_role_context(sym)
+            if cached:
+                ctx = cached.to_dict()
+
+        breakdown[sym] = {
+            "day": _build_day_breakdown(sym, ctx),
+            "scalp": _build_scalp_breakdown(sym),
+            "live_context": {
+                "rs_short_1h": ctx.get("rs_short_1h"),
+                "rs_medium_4h": ctx.get("rs_medium_4h"),
+                "momentum_score": ctx.get("momentum_score"),
+                "volatility_score": ctx.get("volatility_score"),
+                "volume_accel": ctx.get("volume_accel"),
+                "btc_correlation": ctx.get("btc_correlation"),
+                "btc_beta": ctx.get("btc_beta"),
+                "catalyst_score": ctx.get("catalyst_score"),
+                "market_regime": ctx.get("market_regime"),
+                "freshness_seconds": ctx.get("freshness_seconds"),
+                "source_status": ctx.get("source_status"),
+            },
+        }
+
+    return {
+        "ok": True,
+        "symbols": breakdown,
+        "note": "base scores resolved at candidate selection; adjustment components shown here",
+        "bounds": {
+            "day_live_context_adjustment": "±0.06",
+            "day_learned_adjustment": "±0.02",
+            "day_combined_cap": "±0.08",
+            "scalp_live_context_adjustment": "±0.04",
+            "scalp_learned_adjustment": "±0.02",
+            "scalp_combined_cap": "±0.06",
+        },
+        "min_samples_for_learning": 10,
+        "generated_at": time.time(),
     }
 
 
@@ -247,6 +389,12 @@ async def get_single_market_role_context(symbol: str) -> dict[str, Any]:
     else:
         cached = get_cached_role_context(sym)
         ctx = cached.to_dict() if cached else {"symbol": sym, "source_status": "unavailable"}
+
+    # Append ranking breakdown inline
+    ctx["ranking_breakdown"] = {
+        "day": _build_day_breakdown(sym, ctx),
+        "scalp": _build_scalp_breakdown(sym),
+    }
 
     return {"ok": True, **ctx}
 
