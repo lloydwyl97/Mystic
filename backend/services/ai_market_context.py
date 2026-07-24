@@ -61,6 +61,7 @@ from backend.services.ai_decision_contract import (
     REDIS_KEY_AI_SENTIMENT,
     REDIS_TTL_AI_CONTEXT_SEC,
 )
+from backend.services.catalyst_provider import get_default_provider
 from backend.services.day_active_market_bundle import (
     apply_day_bundle_stagger,
     async_fetch_day_active_ohlcv_bundle,
@@ -69,8 +70,27 @@ from backend.services.day_active_market_bundle import (
 )
 from backend.services.live_market_data import live_market_data_service
 from backend.services.market_regime import regime_score
+from backend.services.market_role_intelligence import (
+    MARKET_ROLES,
+    cache_role_context,
+    compute_market_role_context,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_role_intel_column() -> None:
+    """Idempotent migration: add role_intel_json column to ai_context_snapshots."""
+    from backend.database_schema import DATABASE_PATH
+    try:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(ai_context_snapshots)")]
+            if "role_intel_json" not in cols:
+                conn.execute("ALTER TABLE ai_context_snapshots ADD COLUMN role_intel_json TEXT")
+                conn.commit()
+                logger.info("AI_CONTEXT: added role_intel_json column to ai_context_snapshots")
+    except Exception as exc:
+        logger.debug("_ensure_role_intel_column: %s", exc)
 
 
 def _to_ccxt(symbol: str) -> str:
@@ -276,7 +296,9 @@ class AIMarketContextService:
         self._sentiment_last_fetch_ts: float = 0.0
         self._sentiment_collector = None
         self._orderbook_refresher = None
+        self._catalyst_provider = None
         ensure_ai_canonical_tables()
+        _ensure_role_intel_column()
 
     async def _refresh_sentiment_if_due(self) -> None:
         now = time.time()
@@ -297,6 +319,7 @@ class AIMarketContextService:
             return
         self.redis = await get_shared_redis_async()
         self.is_running = True
+        self._catalyst_provider = get_default_provider()
         try:
             from backend.services.ai_active_sentiment_collector import get_active_sentiment_collector
 
@@ -584,6 +607,14 @@ class AIMarketContextService:
         published = 0
         per_sym_dt: list[tuple[str, float, float]] = []  # symbol, secs, age_pre
 
+        # Pre-extract 1h OHLCV rows for BTC (needed for role correlation/beta)
+        btc_bundle_raw: dict = {}
+        with contextlib.suppress(Exception):
+            ccxt_btc = _to_ccxt("BTCUSDT")
+            btc_bundle_raw = await async_read_cached_day_active_bundle(ccxt_btc) or {}
+        btc_rows_1h: list | None = btc_bundle_raw.get("1h") if btc_bundle_raw else None
+        btc_rows_4h: list | None = btc_bundle_raw.get("4h") if btc_bundle_raw else None
+
         for symbol in ordered_symbols:
             sym_t0 = time.perf_counter()
             try:
@@ -607,6 +638,45 @@ class AIMarketContextService:
                     market_regime=market_regime,
                 )
 
+                # ------------------------------------------------------------------
+                # Market-role intelligence (new — appended to payload, no gates)
+                # ------------------------------------------------------------------
+                role_intel_json = "{}"
+                role_ranking_delta = 0.0
+                if symbol in MARKET_ROLES or symbol.upper() in MARKET_ROLES:
+                    try:
+                        # Extract 1h / 4h rows for this symbol from cache
+                        sym_bundle_raw: dict = {}
+                        with contextlib.suppress(Exception):
+                            sym_bundle_raw = await async_read_cached_day_active_bundle(_to_ccxt(symbol)) or {}
+                        sym_rows_1h = sym_bundle_raw.get("1h") if sym_bundle_raw else None
+                        sym_rows_4h = sym_bundle_raw.get("4h") if sym_bundle_raw else None
+
+                        # Approximate 2h notional volume from last ~120 1m bars
+                        vol_2h = 0.0
+                        rows_1m = sym_bundle_raw.get("1m") if sym_bundle_raw else None
+                        if rows_1m and len(rows_1m) >= 30:
+                            for r in rows_1m[-120:]:
+                                vol_2h += float(r[4]) * float(r[5])
+
+                        role_ctx = await compute_market_role_context(
+                            symbol,
+                            btc_rows_1h=btc_rows_1h,
+                            sym_rows_1h=sym_rows_1h,
+                            btc_rows_4h=btc_rows_4h,
+                            sym_rows_4h=sym_rows_4h,
+                            mtf_data=own_mtf,
+                            market_regime=market_regime,
+                            volume_24h_usd=float(t24.get("volume_24h_usd", 0.0)),
+                            volume_2h_usd=vol_2h,
+                            catalyst_provider=self._catalyst_provider,
+                        )
+                        cache_role_context(role_ctx)
+                        role_intel_json = json.dumps(role_ctx.to_dict(), separators=(",", ":"), default=str)
+                        role_ranking_delta = role_ctx.ranking_delta()
+                    except Exception as role_exc:
+                        logger.debug("AI_CONTEXT role_intel %s failed: %s", symbol, role_exc)
+
                 ts_utc = datetime.now(timezone.utc).isoformat()
                 payload: dict[str, Any] = {
                     "symbol": symbol,
@@ -625,6 +695,9 @@ class AIMarketContextService:
                     "ctx_multiplier": float(multiplier),
                     "mtf_json": json.dumps(own_mtf, separators=(",", ":")),
                     "ctx_audit_json": json.dumps(audit, separators=(",", ":")),
+                    # New role-intelligence fields (append-only; existing consumers unaffected)
+                    "ctx_role_intel_json": role_intel_json,
+                    "ctx_role_ranking_delta": float(role_ranking_delta),
                 }
 
                 if self.redis is not None:
@@ -686,8 +759,8 @@ class AIMarketContextService:
                         symbol, ts_utc, change_24h_pct, volume_24h_usd, relative_volume,
                         liquidity_tier, spread_pct, depth_imbalance, rs_btc, rs_eth,
                         btc_dominance_proxy, market_regime, sentiment_fear_greed,
-                        mtf_json, ctx_multiplier
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        mtf_json, ctx_multiplier, role_intel_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         payload["symbol"],
@@ -705,6 +778,7 @@ class AIMarketContextService:
                         payload["ctx_sentiment_fear_greed"],
                         payload["mtf_json"],
                         payload["ctx_multiplier"],
+                        payload.get("ctx_role_intel_json", "{}"),
                     ),
                 )
                 conn.commit()

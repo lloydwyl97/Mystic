@@ -1028,6 +1028,9 @@ class RealTimeAISignalGenerator:
                 "ctx_btc_dominance_proxy": ctx_payload.get("ctx_btc_dominance_proxy", "0.0"),
                 "ctx_market_regime": ctx_payload.get("ctx_market_regime", "unknown"),
                 "ctx_sentiment_fear_greed": ctx_payload.get("ctx_sentiment_fear_greed", "0.0"),
+                # Market-role intelligence (new — ranking soft-delta, not a gate)
+                "ctx_role_ranking_delta": ctx_payload.get("ctx_role_ranking_delta", "0.0"),
+                "ctx_role_intel_json": ctx_payload.get("ctx_role_intel_json", "{}"),
                 "feature_version": str(feat_version),
                 "primary_signal_bar_seconds": str(int(day_label_grid_seconds()) if sid0 == "day" else int(primary_bar_seconds_for_strategy(strategy_id))),
                 # RF features (adx/rsi/ema_alignment/momentum below) come from ranking_tf,

@@ -847,7 +847,14 @@ class BuyCandidate:
         except (TypeError, ValueError):
             missed_delta = 0.0
         missed_delta = max(-0.02, min(0.03, missed_delta))
-        return max(0.0, min(1.0, base + delta + trust_delta + thesis_delta + missed_delta))
+        # Market-role intelligence delta (soft ranking signal, never a gate; range ±0.06)
+        role_delta = 0.0
+        try:
+            role_delta = float((self.decision_data or {}).get("ctx_role_ranking_delta") or 0.0)
+        except (TypeError, ValueError):
+            role_delta = 0.0
+        role_delta = max(-0.06, min(0.06, role_delta))
+        return max(0.0, min(1.0, base + delta + trust_delta + thesis_delta + missed_delta + role_delta))
 
 
 def _decision_float(decision_data: dict[str, Any], key: str, default: float) -> float:
@@ -3740,6 +3747,7 @@ class PortfolioEngine:
             ("explainability_json", "TEXT"),
             ("diagnostics_json", "TEXT"),
             ("strategy_id", "TEXT"),
+            ("context_snapshot_json", "TEXT"),
         ]
 
         for col_name, col_type in new_columns:
@@ -7395,6 +7403,15 @@ class PortfolioEngine:
         buy_mode = "live" if is_live_execution_allowed_sync() else "paper"
         buy_strategy_id = str(getattr(explainability, "live_ai_strategy", "") or "").strip() or None
 
+        # Snapshot role context at entry time for learning attribution
+        try:
+            from backend.services.market_role_intelligence import get_cached_role_context as _get_role_ctx
+
+            _role_ctx = _get_role_ctx(symbol) or _get_role_ctx(symbol.replace("/", "").upper())
+            _ctx_snapshot = json.dumps(_role_ctx.to_dict(), separators=(",", ":"), default=str) if _role_ctx else "{}"
+        except Exception:
+            _ctx_snapshot = "{}"
+
         def _sync_insert():
             def _op() -> None:
                 with connect_rw(self.db_path) as conn:
@@ -7408,8 +7425,8 @@ class PortfolioEngine:
                             atr_at_entry, entry_bar_timestamp, confidence,
                             fees_paid, slippage_cost, timestamp, status,
                             explainability_json, diagnostics_json, sleeve,
-                            entry_timestamp, decision_id, strategy_id
-                        ) VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?)
+                            entry_timestamp, decision_id, strategy_id, context_snapshot_json
+                        ) VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?)
                     """,
                         (
                             trade_id,
@@ -7433,6 +7450,7 @@ class PortfolioEngine:
                             timestamp,
                             decision_id or None,
                             buy_strategy_id,
+                            _ctx_snapshot,
                         ),
                     )
                     conn.commit()

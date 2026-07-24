@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -368,6 +369,25 @@ def pick_best_ranked(candidates: list[RankedCandidate]) -> RankedCandidate | Non
     )
 
 
+def _role_ranking_delta(row: dict[str, Any]) -> float:
+    """
+    Market-role intelligence delta for SCALP tie-breaking.
+    Reads from the signal's ctx_role_ranking_delta field (published by ai_market_context).
+    Range: ±0.06.  Never used as a gate.
+    """
+    sym = str(row.get("symbol") or "")
+    # Try signal fields first
+    sig = row.get("signal")
+    sig_delta = None
+    if sig is not None:
+        with contextlib.suppress(Exception):
+            from backend.services.market_role_intelligence import get_role_ranking_delta
+            sig_delta = get_role_ranking_delta(sym)
+    if sig_delta is not None:
+        return max(-0.06, min(0.06, sig_delta))
+    return 0.0
+
+
 def _global_tie_key(row: dict[str, Any]) -> tuple:
     """Secondary sort when rank scores cluster — not spread/BTC order."""
     meta = row.get("rank_meta") or {}
@@ -394,6 +414,8 @@ def _global_tie_key(row: dict[str, Any]) -> tuple:
     sym = str(row.get("symbol") or "")
     # Deprioritize BTC on pure weak ties (tight spread was winning every coin flip).
     sym_penalty = -0.002 if sym == "BTCUSDT" else 0.0
+    # Market-role intelligence soft delta (affects tie-breaking only, not eligibility)
+    role_delta = _role_ranking_delta(row)
     return (
         passed,
         regime_native,
@@ -404,6 +426,7 @@ def _global_tie_key(row: dict[str, Any]) -> tuple:
         m30,
         m15,
         sym_penalty,
+        role_delta,
         float(row.get("rank_score") or 0),
     )
 

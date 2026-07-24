@@ -59,6 +59,7 @@ const BACKGROUND_ENDPOINTS = [
     { path: "/api/portfolio-engine/trading-economics", key: "tradingEconomics" },
     { path: "/api/portfolio-engine/scoreboard?days=7", key: "scoreboard7d" },
     { path: "/api/scalp/status", key: "scalpStatus", timeoutMs: SCALP_STATUS_TIMEOUT_MS },
+    { path: "/api/context/market-role/summary", key: "marketRoleSummary" },
 ];
 // Legacy alias — refresh button iterates this list
 const ENDPOINTS = BACKGROUND_ENDPOINTS.concat(
@@ -921,6 +922,9 @@ function updateUI(key, data, stale) {
             break;
         case "marketlensFeed":
             updateMarketLensFeed(data);
+            break;
+        case "marketRoleSummary":
+            renderMarketRoleWidget(data);
             break;
     }
 }
@@ -3153,6 +3157,114 @@ async function saveLiveTestConfig() {
             statusEl.className = "operator-form__status operator-form__status--err";
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Market-role intelligence widget
+// ---------------------------------------------------------------------------
+function renderMarketRoleWidget(data) {
+    const tbody = document.getElementById("market-role-tbody");
+    const regimeBadge = document.getElementById("market-role-regime-badge");
+    if (!tbody) return;
+
+    if (!data || data.ok === false || !data.coins) {
+        tbody.innerHTML = '<tr><td colspan="12">Unavailable</td></tr>';
+        return;
+    }
+
+    const coins = data.coins || [];
+    const globalRegime = (data.global_regime || "unknown").toLowerCase();
+
+    if (regimeBadge) {
+        regimeBadge.textContent = globalRegime.replace(/_/g, " ");
+        regimeBadge.className = "readiness-value " + (
+            globalRegime === "trending_up" ? "pnl-pos" :
+            globalRegime === "trending_down" ? "pnl-neg" : ""
+        );
+    }
+
+    const ROLE_LABELS = {
+        "market_leader": "Leader",
+        "infrastructure_leader": "Infra",
+        "high_beta_momentum": "High-β",
+        "catalyst_driven": "Catalyst",
+        "unknown": "?"
+    };
+
+    function fmtNum(v, decimals) {
+        if (v == null) return '<span style="color:#666">—</span>';
+        const n = Number(v);
+        if (!isFinite(n)) return '<span style="color:#666">—</span>';
+        return n.toFixed(decimals != null ? decimals : 3);
+    }
+
+    function fmtRs(v) {
+        if (v == null) return '<span style="color:#666">—</span>';
+        const n = Number(v);
+        if (!isFinite(n)) return '<span style="color:#666">—</span>';
+        const cls = n > 0.005 ? "pnl-pos" : n < -0.005 ? "pnl-neg" : "";
+        return '<span class="' + cls + '">' + (n >= 0 ? "+" : "") + (n * 100).toFixed(2) + "%</span>";
+    }
+
+    function fmtDelta(v) {
+        if (v == null) return '<span style="color:#666">—</span>';
+        const n = Number(v);
+        if (!isFinite(n)) return '<span style="color:#666">—</span>';
+        if (Math.abs(n) < 0.001) return '<span style="color:#888">0</span>';
+        const cls = n > 0 ? "pnl-pos" : "pnl-neg";
+        return '<span class="' + cls + '">' + (n >= 0 ? "+" : "") + n.toFixed(4) + "</span>";
+    }
+
+    function fmtFresh(v) {
+        if (v == null) return '<span style="color:#666">—</span>';
+        const s = Number(v);
+        if (!isFinite(s)) return '<span style="color:#666">—</span>';
+        if (s < 60) return '<span class="pnl-pos">' + s.toFixed(0) + "s</span>";
+        if (s < 300) return '<span>' + (s / 60).toFixed(1) + "m</span>";
+        return '<span class="pnl-neg">' + (s / 60).toFixed(1) + "m (stale)</span>";
+    }
+
+    function fmtSource(v) {
+        if (!v || v === "unavailable") return '<span style="color:#888">—</span>';
+        if (v === "live") return '<span class="pnl-pos">live</span>';
+        if (v === "partial") return '<span style="color:#fa0">partial</span>';
+        return '<span style="color:#666">' + v + "</span>";
+    }
+
+    function fmtRegime(v) {
+        if (!v) return "—";
+        if (v === "trending_up") return '<span class="pnl-pos">▲ up</span>';
+        if (v === "trending_down") return '<span class="pnl-neg">▼ dn</span>';
+        return "chop";
+    }
+
+    function fmtCatalyst(score, src) {
+        if (score == null && (!src || src === "unavailable")) return '<span style="color:#666">—</span>';
+        if (score == null) return '<span style="color:#666">—</span>';
+        const n = Number(score);
+        const cls = n > 0.6 ? "pnl-pos" : n > 0.4 ? "" : "";
+        return '<span class="' + cls + '">' + n.toFixed(2) + '</span>';
+    }
+
+    const rows = coins.map(function (coin) {
+        const role = ROLE_LABELS[coin.role] || coin.role || "?";
+        return "<tr>" +
+            "<td><b>" + (coin.symbol || "?").replace("USDT", "") + "/USDT</b></td>" +
+            "<td>" + role + "</td>" +
+            "<td>" + fmtRegime(coin.regime) + "</td>" +
+            "<td>" + fmtRs(coin.rs_btc) + "</td>" +
+            "<td>" + fmtNum(coin.momentum, 3) + "</td>" +
+            "<td>" + fmtNum(coin.volatility, 3) + "</td>" +
+            "<td>" + fmtNum(coin.btc_corr, 3) + "</td>" +
+            "<td>" + fmtNum(coin.btc_beta, 3) + "</td>" +
+            "<td>" + fmtCatalyst(coin.catalyst, coin.catalyst_src) + "</td>" +
+            "<td>" + fmtDelta(coin.rank_delta) + "</td>" +
+            "<td>" + fmtFresh(coin.freshness_s) + "</td>" +
+            "<td>" + fmtSource(coin.source) + "</td>" +
+            "</tr>";
+    });
+
+    tbody.innerHTML = rows.join("") || '<tr><td colspan="12">No data</td></tr>';
 }
 
 function initLiveTestCard() {
