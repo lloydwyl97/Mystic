@@ -16501,6 +16501,12 @@ class PortfolioEngine:
                 churn_ratio = float("inf")
             self._regime_state.churn_ratio = churn_ratio
 
+            # Cold-start / clean-slate guard: require at least one real winning
+            # trade before the ratio can block new entries. Without this, a fresh
+            # start with all-loser history produces ratio=inf and deadlocks entry.
+            if gross_profit < CHURN_GUARD_MIN_GROSS_WIN_SUM:
+                return
+
             if churn_ratio > CHURN_RATIO_LIMIT:
                 if not self._regime_state.churn_guard_active:
                     logger.warning(
