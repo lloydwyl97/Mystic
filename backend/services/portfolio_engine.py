@@ -11929,6 +11929,12 @@ class PortfolioEngine:
         sym_bus_nf = normalize_symbol(symbol).replace("/", "").strip()
         if sym_bus_nf:
             sig = self._fetch_redis_ai_signal_string_map(strategy_id, sym_bus_nf)
+            # allweather_breakout_pullback overwrites live_ai_strategy in decision_data
+            # (via apply_signal_to_decision_data) but its own Redis key is never written.
+            # Fall back to the base "day" key so entry-context validation can find the
+            # timestamp and context fields that are always present in ai_signal:day:<SYM>.
+            if not sig and strategy_id != "day":
+                sig = self._fetch_redis_ai_signal_string_map("day", sym_bus_nf)
             if sig:
                 merged = self._merge_redis_signal_entry_audit_into_decision_data(dd, sig)
                 if merged:
@@ -11991,6 +11997,8 @@ class PortfolioEngine:
         strategy_id = str(dd.get("live_ai_strategy") or "day").strip().lower()
         if sym_bus:
             sig = self._fetch_redis_ai_signal_string_map(strategy_id, sym_bus)
+            if not sig and strategy_id != "day":
+                sig = self._fetch_redis_ai_signal_string_map("day", sym_bus)
             if sig:
                 self._merge_redis_signal_entry_audit_into_decision_data(dd, sig)
             # Redis TTL/delete race: hash briefly empty even though inference just ran.
