@@ -334,19 +334,20 @@ def _symbol_group_baseline(group: str) -> float:
 # these via evaluate_engine_managed_exit (see _check_exit_conditions).
 # =============================================================================
 COIN_PROFILES = {
-    # Shorter max-hold: MANUAL/time-stop losers avg ~80m and wipe TP1 edge.
-    # New positions pick these up at stamp; open positions keep stamped max_hold_min.
-    "BTCUSDT": {"tp": 0.012, "sl": 0.008, "trail": 0.0040, "max_hold_min": 60},
-    "ETHUSDT": {"tp": 0.013, "sl": 0.009, "trail": 0.0045, "max_hold_min": 60},
-    "SOLUSDT": {"tp": 0.015, "sl": 0.010, "trail": 0.0055, "max_hold_min": 50},
-    "XRPUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0050, "max_hold_min": 50},
+    # Session day-trade ceilings (hours, not sub-hour churn).
+    # New stamps use these; evaluate_engine_managed_exit also floors open holds
+    # to the current profile so restarts pick up longer day-trade horizons.
+    "BTCUSDT": {"tp": 0.012, "sl": 0.008, "trail": 0.0040, "max_hold_min": 360},
+    "ETHUSDT": {"tp": 0.013, "sl": 0.009, "trail": 0.0045, "max_hold_min": 360},
+    "SOLUSDT": {"tp": 0.015, "sl": 0.010, "trail": 0.0055, "max_hold_min": 300},
+    "XRPUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0050, "max_hold_min": 300},
 }
 
 DEFAULT_COIN_PROFILE = {
     "tp": 0.014,
     "sl": 0.010,
     "trail": 0.005,
-    "max_hold_min": 50,
+    "max_hold_min": 300,
 }
 
 

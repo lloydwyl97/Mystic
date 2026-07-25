@@ -173,9 +173,11 @@ class PortfolioEngineIntegration:
         self._bar_processor_task: asyncio.Task | None = None
         self._ledger_mtm_task: asyncio.Task | None = None
 
-        # Bar timing
-        self.bar_interval = 60  # 1-minute bars
+        # Bar timing: 1m keeps cooldown/"N bars" semantics; entries decide on 15m closes.
+        self.bar_interval = 60  # 1-minute bars (cooldown units)
+        self.entry_decision_interval = max(60, int(os.getenv("DAY_ENTRY_BAR_SEC", "900")))
         self.last_bar_processed = 0
+        self.last_entry_bar_processed = 0
         self._exit_monitor_interval = max(5, EXIT_MONITOR_INTERVAL_SEC)
         self._price_publisher_interval = max(5, PRICE_PUBLISHER_INTERVAL_SEC)
         self._signal_consumer_interval = max(1, SIGNAL_CONSUMER_INTERVAL_SEC)
@@ -1277,22 +1279,38 @@ class PortfolioEngineIntegration:
                         # checks on cached bundles/prices only before BUY processing.
                         await self._monitor_positions_once(refresh_market_data=False)
 
-                        result = await self.engine.process_bar_candidates(current_bar)
+                        entry_bar = int(current_time / self.entry_decision_interval) * self.entry_decision_interval
+                        result = None
+                        if entry_bar > self.last_entry_bar_processed:
+                            # 15m (default) entry decisions; pass 1m current_bar for cooldown math.
+                            logger.info(
+                                "BAR_PROCESS: DAY entry decision bar=%s (interval=%ss)",
+                                entry_bar,
+                                self.entry_decision_interval,
+                            )
+                            result = await self.engine.process_bar_candidates(current_bar)
+                            self.last_entry_bar_processed = entry_bar
 
-                        if self.redis_client and cand_buses:
-                            for b in set(cand_buses):
-                                try:
-                                    await self.redis_client.delete(pe_buy_candidate_redis_key(b))
-                                except Exception as rd_e:
-                                    logger.debug("PE_PENDING_CLEAR: %s: %s", b, rd_e, exc_info=True)
+                            if self.redis_client and cand_buses:
+                                for b in set(cand_buses):
+                                    try:
+                                        await self.redis_client.delete(pe_buy_candidate_redis_key(b))
+                                    except Exception as rd_e:
+                                        logger.debug("PE_PENDING_CLEAR: %s: %s", b, rd_e, exc_info=True)
 
-                        if result:
-                            logger.info(f"BAR_EXECUTION: {result['symbol']} | qty={result['quantity']:.6f} @ ${result['price']:.4f}")
-                            decision_id = result.get("decision_id")
-                            if decision_id and self.redis_client:
-                                await self.redis_client.set(f"executed:{decision_id}", "1", ex=86400)
+                            if result:
+                                logger.info(f"BAR_EXECUTION: {result['symbol']} | qty={result['quantity']:.6f} @ ${result['price']:.4f}")
+                                decision_id = result.get("decision_id")
+                                if decision_id and self.redis_client:
+                                    await self.redis_client.set(f"executed:{decision_id}", "1", ex=86400)
+                            else:
+                                logger.info("BAR_PROCESS: No trade executed this entry bar")
                         else:
-                            logger.info("BAR_PROCESS: No trade executed this bar")
+                            logger.debug(
+                                "BAR_PROCESS: skip buys until next entry bar (last=%s interval=%ss)",
+                                self.last_entry_bar_processed,
+                                self.entry_decision_interval,
+                            )
 
                 # Sleep until next bar
                 next_bar = current_bar + self.bar_interval
@@ -2292,6 +2310,8 @@ class PortfolioEngineIntegration:
             "open_positions": len(self.engine.open_positions) if self.engine else 0,
             "current_candidates": len(self.engine.current_bar_candidates) if self.engine else 0,
             "last_bar_processed": self.last_bar_processed,
+            "entry_decision_interval": self.entry_decision_interval,
+            "last_entry_bar_processed": self.last_entry_bar_processed,
             "price_cache_size": len(self.current_prices),
             "dust_pending_positions_current": dust_pending,
             "dust_drift_events_total": dust_drift,

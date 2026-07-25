@@ -33,6 +33,15 @@ EXIT_FAILED_RECLAIM = "FAILED_RECLAIM_EXIT"
 EXIT_STALL = "STALL_EXIT"
 EXIT_GIVEBACK = "GIVEBACK_EXIT"
 
+
+def effective_max_hold_min(position: Any, coin_profile: dict[str, Any] | None = None) -> int:
+    """Session ceiling: prefer current profile when stamped hold is shorter (day-trade upgrade)."""
+    profile_hold = int((coin_profile or {}).get("max_hold_min") or 0)
+    stamped = int(getattr(position, "max_hold_min", 0) or 0)
+    if profile_hold > 0 and stamped > 0:
+        return max(stamped, profile_hold)
+    return stamped or profile_hold or 300
+
 ALLOWED_DAY_EXIT_REASONS = frozenset(
     {
         EXIT_NET_PROFIT,
@@ -74,12 +83,13 @@ def _stall_exit_enabled() -> bool:
 
 
 def _stall_min_hold_min() -> float:
-    return float(os.getenv("DAY_STALL_MIN_HOLD_MIN", "30"))
+    # Day-trade style: do not cut "dead" holds until the idea has had hours.
+    return float(os.getenv("DAY_STALL_MIN_HOLD_MIN", "120"))
 
 
 def _stall_max_mfe_pct() -> float:
-    """Max mark MFE (fraction) allowed for a stall cut. Default 0.15%."""
-    return float(os.getenv("DAY_STALL_MAX_MFE_PCT", "0.0015"))
+    """Max mark MFE (fraction) allowed for a stall cut. Default 0.20%."""
+    return float(os.getenv("DAY_STALL_MAX_MFE_PCT", "0.0020"))
 
 
 def evaluate_stall_exit(
@@ -93,8 +103,8 @@ def evaluate_stall_exit(
     """
     Cut dead DAY holds that never make meaningful progress before hard time-stop.
 
-    Evidence: MANUAL/time-stop losers typically show no TP1 progress by 15–30m
-    and then bleed until 75–90m. This is exit-only — no entry/ranking changes.
+    Day-trade defaults wait ~2h before stall eligibility so normal multi-hour
+    swings are not treated as dead inventory. Exit-only — no entry/ranking changes.
     """
     if not _stall_exit_enabled():
         return None
@@ -131,17 +141,18 @@ def _giveback_exit_enabled() -> bool:
 
 
 def _giveback_min_hold_min() -> float:
-    return float(os.getenv("DAY_GIVEBACK_MIN_HOLD_MIN", "3"))
+    # Avoid 3-minute noise cuts; require a real day-trade development window.
+    return float(os.getenv("DAY_GIVEBACK_MIN_HOLD_MIN", "20"))
 
 
 def _giveback_min_mfe_pct() -> float:
     """Min favorable excursion (fraction) that must have been reached before a reversal counts as a giveback."""
-    return float(os.getenv("DAY_GIVEBACK_MIN_MFE_PCT", "0.0008"))
+    return float(os.getenv("DAY_GIVEBACK_MIN_MFE_PCT", "0.0025"))
 
 
 def _giveback_trigger_pnl_pct() -> float:
     """Net pnl pct (negative fraction) that, once breached after MFE was reached, triggers an early cut."""
-    return float(os.getenv("DAY_GIVEBACK_TRIGGER_PNL_PCT", "-0.0005"))
+    return float(os.getenv("DAY_GIVEBACK_TRIGGER_PNL_PCT", "-0.0015"))
 
 
 def evaluate_giveback_exit(
@@ -153,15 +164,11 @@ def evaluate_giveback_exit(
 ) -> dict[str, Any] | None:
     """
     Cut DAY holds that reached meaningful favorable excursion and then reversed
-    back to net-negative, instead of waiting for the 30m stall floor to book a
+    back to net-negative, instead of waiting for the stall floor to book a
     deeper loss.
 
-    Evidence (7-day sample): STALL_EXIT trades that had gone green (MFE > 0)
-    before reversing were losers 24/24 times (100%), averaging -$6.16, because
-    the stall floor let the position drift further negative for up to ~30
-    minutes after the reversal before cutting it. This exit has no minimum
-    hold tied to the stall floor and no dependency on stop/trailing levels —
-    it fires as soon as a confirmed giveback is observed.
+    Defaults require ~20m development and a clearer MFE/giveback so 1–3m noise
+    does not churn day trades. Exit-only — no entry/ranking changes.
     """
     if not _giveback_exit_enabled():
         return None
@@ -303,7 +310,8 @@ def backfill_position_exit_metadata(position: Any, coin_profile: dict[str, Any])
         position.trailing_stop_price = entry * (1.0 - sl_pct)
         added.append(f"trailing_stop_price={position.trailing_stop_price:.8f}")
 
-    if not getattr(position, "max_hold_min", 0):
+    stamped_hold = int(getattr(position, "max_hold_min", 0) or 0)
+    if stamped_hold <= 0 or stamped_hold < max_hold_min:
         position.max_hold_min = max_hold_min
         added.append(f"max_hold_min={max_hold_min}")
 
@@ -350,7 +358,9 @@ def preview_next_engine_exit(
     entry = float(getattr(position, "entry_price", 0.0) or 0.0)
     stop = effective_stop_price(entry, float(getattr(position, "stop_price", 0) or 0), float(getattr(position, "thesis_invalid_level", 0) or 0))
     target = effective_target_price(entry, float(getattr(position, "take_profit_1_price", 0) or 0), float(getattr(position, "thesis_target_level", 0) or 0))
-    max_hold = int(getattr(position, "max_hold_min", 0) or coin_profile.get("max_hold_min") or 75)
+    max_hold = effective_max_hold_min(position, coin_profile)
+    if int(getattr(position, "max_hold_min", 0) or 0) < max_hold:
+        position.max_hold_min = max_hold
     trail = float(getattr(position, "trailing_stop_price", 0) or 0)
     thesis = str(getattr(position, "entry_thesis", "") or "")
 
@@ -521,7 +531,9 @@ def evaluate_engine_managed_exit(
     if giveback is not None:
         return giveback
 
-    max_hold = int(getattr(position, "max_hold_min", 0) or coin_profile.get("max_hold_min") or 75)
+    max_hold = effective_max_hold_min(position, coin_profile)
+    if int(getattr(position, "max_hold_min", 0) or 0) < max_hold:
+        position.max_hold_min = max_hold
     stall = evaluate_stall_exit(
         entry_price=entry,
         highest_price=float(getattr(position, "highest_price", entry) or entry),

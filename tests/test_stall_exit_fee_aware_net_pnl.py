@@ -24,8 +24,8 @@ from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_P
 from backend.services.day_controlled_exits import EXIT_STALL, evaluate_stall_exit
 
 ENTRY = 100.0
-STALL_ELIGIBLE_HOLD_MIN = 35.0  # > default 30m min hold, < default 60m max hold
-LOW_MFE_HIGH = ENTRY * 1.0005  # 0.05% MFE, below the 0.15% default stall MFE ceiling
+STALL_ELIGIBLE_HOLD_MIN = 125.0  # > default 120m min hold, < default 360m max hold
+LOW_MFE_HIGH = ENTRY * 1.0005  # 0.05% MFE, below the 0.20% default stall MFE ceiling
 
 
 def _net_pnl_pct(current_price: float) -> float:
@@ -46,7 +46,7 @@ def test_tiny_gross_green_but_net_red_after_fees_can_stall():
         highest_price=LOW_MFE_HIGH,
         net_pnl_pct=net,
         hold_minutes=STALL_ELIGIBLE_HOLD_MIN,
-        max_hold_min=60,
+        max_hold_min=360,
     )
     assert out is not None
     assert out["action"] == "sell"
@@ -65,7 +65,7 @@ def test_tiny_net_green_never_stalled():
         highest_price=current_price,
         net_pnl_pct=net,
         hold_minutes=STALL_ELIGIBLE_HOLD_MIN,
-        max_hold_min=60,
+        max_hold_min=360,
     )
     assert out is None, "must never stall a net-positive position regardless of elapsed time"
 
@@ -80,7 +80,7 @@ def test_flat_at_exactly_zero_net_after_fees_never_stalled():
         highest_price=current_price,
         net_pnl_pct=net,
         hold_minutes=STALL_ELIGIBLE_HOLD_MIN,
-        max_hold_min=60,
+        max_hold_min=360,
     )
     assert out is None
 
@@ -91,7 +91,7 @@ def test_any_strictly_net_negative_flat_loss_can_stall():
         highest_price=ENTRY,
         net_pnl_pct=-1e-13,
         hold_minutes=STALL_ELIGIBLE_HOLD_MIN,
-        max_hold_min=60,
+        max_hold_min=360,
     )
     assert out is not None
     assert out["reason"] == EXIT_STALL
@@ -106,7 +106,7 @@ def test_clearly_profitable_position_never_stalled():
         highest_price=current_price,
         net_pnl_pct=net,
         hold_minutes=STALL_ELIGIBLE_HOLD_MIN,
-        max_hold_min=60,
+        max_hold_min=360,
     )
     assert out is None
 
@@ -121,7 +121,7 @@ def test_deteriorating_red_position_with_no_progress_can_stall():
         highest_price=LOW_MFE_HIGH,  # never moved favorably
         net_pnl_pct=net,
         hold_minutes=STALL_ELIGIBLE_HOLD_MIN,
-        max_hold_min=60,
+        max_hold_min=360,
     )
     assert out is not None
     assert out["reason"] == EXIT_STALL
@@ -134,13 +134,13 @@ def test_improving_red_position_with_real_mfe_progress_is_not_stalled():
     current_price = ENTRY * 0.999  # currently slightly net red after fees
     net = _net_pnl_pct(current_price)
     assert net < 0.0
-    strong_mfe_high = ENTRY * 1.005  # 0.5% MFE, well above the 0.15% stall ceiling
+    strong_mfe_high = ENTRY * 1.005  # 0.5% MFE, well above the 0.20% stall ceiling
     out = evaluate_stall_exit(
         entry_price=ENTRY,
         highest_price=strong_mfe_high,
         net_pnl_pct=net,
         hold_minutes=STALL_ELIGIBLE_HOLD_MIN,
-        max_hold_min=60,
+        max_hold_min=360,
     )
     assert out is None, "a position with real prior favorable excursion must not be treated as a dead stall"
 

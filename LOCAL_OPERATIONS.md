@@ -36,10 +36,11 @@ Note: `live_data_collector.py`, `start_ai_ml_trading.py`, and `start_agent_orche
 
 - **Paper mode** default; `LIVE_TRADES_ALLOWED=false` unless explicitly changed
 - **Top-4 DAY only:** BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT
-- **Buy:** `PortfolioEngine.process_bar_candidates` → `execute_buy_fifo`
-- **Sell:** exit loop → `monitor_all_positions` → `_check_exit_conditions` (net profit after costs only)
-- **Learning:** `trade_learning_outcomes` from real closed trades
-- **No:** scalping, stop loss, time exit, replacement churn, bridge BUY, fallback buys
+- **Buy:** 15m entry decisions (`DAY_ENTRY_BAR_SEC=900`) → `process_bar_candidates` → `execute_buy_fifo` (AI signal + context + role ranking)
+- **Sell:** exit loop → `monitor_all_positions` → `_check_exit_conditions` via `day_controlled_exits` (net profit, stop/trail, stall, giveback, time-stop, thesis/extreme)
+- **Hold ceilings:** BTC/ETH ~6h, SOL/XRP ~5h (`COIN_PROFILES.max_hold_min`); stall/giveback retuned for multi-hour day trades
+- **Learning:** `trade_learning_outcomes` + market-role outcome learner from closed trades
+- **No:** soft-rank SCALP entries, replacement churn, bridge BUY, fallback buys
 
 ## Dead services (removed / disabled — do not rebuild)
 
