@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,8 +11,6 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_POS = ("moon", "bull", "bullish", "pump", "surge", "rally", "gain", "long", "buy")
-_NEG = ("bear", "bearish", "crash", "dump", "drop", "fall", "short", "sell", "rekt")
 _REDDIT_BASES = ("BTC", "ETH", "SOL", "XRP")
 
 
@@ -23,12 +20,9 @@ def _base(symbol: str) -> str:
 
 
 def _score_title(title: str) -> float:
-    t = (title or "").lower()
-    p = sum(1 for w in _POS if re.search(rf"\b{re.escape(w)}\b", t))
-    n = sum(1 for w in _NEG if re.search(rf"\b{re.escape(w)}\b", t))
-    if p == 0 and n == 0:
-        return 0.0
-    return max(-1.0, min(1.0, (p - n) / max(1, p + n)))
+    from backend.services.crypto_sentiment_vader import score_crypto_text
+
+    return score_crypto_text(title)
 
 
 def _reddit_enabled() -> bool:

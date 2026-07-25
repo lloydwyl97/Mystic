@@ -24,6 +24,11 @@ Local dataset check (2026-07-25): global regime="bull" showed win_rate_1h
 return. That is the concrete evidence this module encodes: until day-router
 "bull" specifically proves an edge with real samples, its bonuses are only
 partially trusted, not eliminated (paper trading still explores the tuning).
+
+Same validated-edge contract is reused for chart_pattern_label (added by
+day_chart_pattern_detector.py's ranking nudge, 2026-07-25) — a detected
+pattern's forward-return record is checked exactly like a regime label before
+its ranking nudge is trusted at full strength.
 """
 
 from __future__ import annotations
@@ -42,9 +47,12 @@ _CACHE_TTL_SEC = 1800.0
 _cache: dict[tuple[str, str], tuple[float, float, dict[str, Any]]] = {}
 
 
+_VALID_COLUMNS = ("regime", "day_route_regime", "chart_pattern_label")
+
+
 def _query_regime_forward_stats(column: str, label: str, db_path: str = DATABASE_PATH) -> dict[str, Any]:
     """Return {n, win_rate_1h, avg_ret_1h, avg_ret_4h} for LABELED snapshots matching label."""
-    if column not in ("regime", "day_route_regime"):
+    if column not in _VALID_COLUMNS:
         raise ValueError(f"unsupported regime column: {column}")
     empty = {"n": 0, "win_rate_1h": None, "avg_ret_1h": None, "avg_ret_4h": None}
     if not label:
@@ -145,6 +153,42 @@ def get_regime_validated_scalar(
     return scalar, detail
 
 
+def get_pattern_validated_scalar(
+    chart_pattern_label: str,
+    *,
+    min_samples: int = MIN_VALIDATION_SAMPLES,
+    db_path: str = DATABASE_PATH,
+) -> tuple[float, dict[str, Any]]:
+    """Validated-edge trust scalar for a chart_pattern_label ranking nudge (e.g.
+    "DOUBLE_BOTTOM", "RESISTANCE_BREAKOUT"). No global-column fallback exists for
+    chart patterns (unlike regime's Fear&Greed fallback) — defaults to full trust
+    (1.0) until the label itself accumulates min_samples, same neutral-until-proven
+    contract as get_regime_validated_scalar. Cached in-process for _CACHE_TTL_SEC."""
+    label = (chart_pattern_label or "").strip().upper()
+    if not label:
+        return 1.0, {"source": "none"}
+
+    now = time.time()
+    cache_key = ("chart_pattern_label", label)
+    cached = _cache.get(cache_key)
+    if cached and (now - cached[1]) < _CACHE_TTL_SEC:
+        return cached[0], cached[2]
+
+    stats = _query_regime_forward_stats("chart_pattern_label", label, db_path=db_path)
+    scalar = _scalar_from_stats(stats, min_samples=min_samples)
+    detail = {"source": "chart_pattern_label", **stats, "scalar": scalar}
+    _cache[cache_key] = (scalar, now, detail)
+    logger.info(
+        "PATTERN_VALIDATED_SCALAR: label=%s n=%d win_rate_1h=%s avg_ret_1h=%s -> scalar=%.2f",
+        label,
+        stats["n"],
+        stats.get("win_rate_1h"),
+        stats.get("avg_ret_1h"),
+        scalar,
+    )
+    return scalar, detail
+
+
 def blend_by_scalar(base: float, bonus_value: float, scalar: float) -> float:
     """Linear-interpolate between 'no bonus' (base, scalar=0) and 'full bonus' (bonus_value, scalar=1)."""
     s = max(0.0, min(1.0, float(scalar)))
@@ -154,5 +198,6 @@ def blend_by_scalar(base: float, bonus_value: float, scalar: float) -> float:
 __all__ = [
     "MIN_VALIDATION_SAMPLES",
     "blend_by_scalar",
+    "get_pattern_validated_scalar",
     "get_regime_validated_scalar",
 ]

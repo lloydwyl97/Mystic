@@ -276,6 +276,7 @@ uuid_utils==0.14.0
 uvicorn==0.40.0
 uvloop==0.22.1
 vaderSentiment==3.3.2
+vaderSentiment==3.3.2
 vine==5.1.0
 watchdog==6.0.0
 watchfiles==1.1.1

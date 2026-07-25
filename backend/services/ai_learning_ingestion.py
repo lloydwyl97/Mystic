@@ -142,8 +142,17 @@ _HEARTBEAT_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
 # gates day_controlled_exits.py bull-regime bonuses — capturing it here lets
 # ai_regime_validation.py check whether that specific label predicts the
 # fwd_ret_* columns already computed for every snapshot.
+#
+# chart_pattern_score/chart_pattern_label = day_chart_pattern_detector.py's
+# rule-based swing-point pattern read (double top/bottom, trend structure,
+# triangle/wedge, breakout) captured at decision time. Same validation
+# contract as day_route_regime — ai_regime_validation.get_pattern_validated_scalar
+# checks the label against the fwd_ret_* columns already computed for every
+# snapshot before its ranking nudge is trusted at full strength.
 _SNAPSHOT_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("day_route_regime", "TEXT"),
+    ("chart_pattern_score", "REAL"),
+    ("chart_pattern_label", "TEXT"),
 )
 
 _tables_ready = False
@@ -224,8 +233,8 @@ def record_candidate_snapshot(
                     rank, rank_score, confidence, side, entry_thesis, thesis_score,
                     thesis_invalid_level, thesis_target_level, regime, trend_state,
                     relative_volume, spread_pct, cost_estimate_pct, price, open_position_json,
-                    day_route_regime
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    day_route_regime, chart_pattern_score, chart_pattern_label
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     _now_iso(),
@@ -251,6 +260,8 @@ def record_candidate_snapshot(
                     _safe_float(price),
                     json.dumps(open_position_state or {}, separators=(",", ":")) if open_position_state else None,
                     str(dd.get("day_route_regime") or ""),
+                    _safe_float(dd.get("chart_pattern_score")) if dd.get("chart_pattern_score") is not None else None,
+                    str(dd.get("chart_pattern_label") or ""),
                 ),
             )
             conn.commit()

@@ -19,8 +19,6 @@ REDIS_NEWS_CORPUS_KEY = "news_sentiment:corpus"
 REDIS_NEWS_COOLDOWN_KEY = "news_sentiment:rate_limit_until"
 REDIS_NEWS_STATUS_KEY = "news_sentiment:status"
 _NEWS_BASES = ("BTC", "ETH", "SOL", "XRP")
-_NEWS_POS = ("surge", "rally", "bull", "gain", "rise", "breakout", "record", "soar", "jump")
-_NEWS_NEG = ("crash", "drop", "fall", "bear", "plunge", "dump", "decline", "loss", "sink", "slump")
 _SYMBOL_ALIASES: dict[str, tuple[str, ...]] = {
     "BTC": ("btc", "bitcoin"),
     "ETH": ("eth", "ethereum"),
@@ -34,12 +32,9 @@ _DEFAULT_RSS_FEEDS: tuple[str, ...] = (
 
 
 def _score_text(text: str) -> float:
-    t = (text or "").lower()
-    p = sum(1 for w in _NEWS_POS if w in t)
-    n = sum(1 for w in _NEWS_NEG if w in t)
-    if p == 0 and n == 0:
-        return 0.0
-    return max(-1.0, min(1.0, (p - n) / max(1, p + n)))
+    from backend.services.crypto_sentiment_vader import score_crypto_text
+
+    return score_crypto_text(text)
 
 
 def _base_from_symbol(symbol: str) -> str:

@@ -199,6 +199,34 @@ async def async_read_cached_day_active_bundle(ccxt_symbol: str) -> dict[str, lis
     return await _read_bundle_cache(ccxt_symbol)
 
 
+def read_cached_day_active_bundle_sync(ccxt_symbol: str) -> dict[str, list[list]] | None:
+    """Sync read-only cache lookup for callers in non-async contexts (e.g. the DAY
+    candidate ranking path in portfolio_engine.py). No Binance fetch, no freshness
+    validation beyond raw TTL — callers needing strict staleness checks should use
+    the async path instead."""
+    try:
+        from backend.config.redis_config import get_shared_redis_sync
+
+        r = get_shared_redis_sync()
+        if not r:
+            return None
+        raw = r.get(_bundle_cache_key(ccxt_symbol))
+        if not raw:
+            return None
+        payload = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        bundle_raw = payload.get("bundle")
+        if not isinstance(bundle_raw, dict):
+            return None
+        bundle: dict[str, list[list]] = {}
+        for tf in DAY_ACTIVE_TIMEFRAMES:
+            rows = bundle_raw.get(tf)
+            bundle[tf] = list(rows) if isinstance(rows, list) else []
+        return bundle
+    except Exception as exc:
+        logger.debug("DAY_BUNDLE_CACHE_SYNC_READ_FAIL %s: %s", ccxt_symbol, exc)
+        return None
+
+
 def month_context_four_from_daily(ohlcv_1d: list[list]) -> tuple[list[float] | None, str | None]:
     """
     Calendar-month-style context derived **only** from real native **1d** candles.
@@ -382,5 +410,6 @@ __all__ = [
     "async_fetch_day_active_ohlcv_bundle_asof",
     "async_read_cached_day_active_bundle",
     "month_context_four_from_daily",
+    "read_cached_day_active_bundle_sync",
     "validate_day_active_bundle",
 ]

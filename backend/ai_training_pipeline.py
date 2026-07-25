@@ -1628,18 +1628,41 @@ class AITrainingDataPipeline:
                         model.fit(X_train_s, y_train, sample_weight=w_train)
                         acc = model.score(X_val_s, y_val)
 
-                        # CONFIDENCE CALIBRATION: raw RF predict_proba is not a
+                        # MODEL DIVERSITY: blend the RF with a HistGradientBoostingClassifier
+                        # fit on the same data — a real second algorithm family (gradient-boosted
+                        # trees vs RF's bagged trees), not a stub. Falls back to pure RF on thin
+                        # data or fit failure. See ai_blended_classifier.py for the full rationale.
+                        try:
+                            from backend.services.ai_blended_classifier import build_blended_classifier
+
+                            final_model, blend_telemetry = build_blended_classifier(
+                                model, X_train_s, y_train, w_train, X_val_s, y_val
+                            )
+                        except Exception as blend_e:
+                            logger.debug("BLENDED_CLASSIFIER_SKIPPED: [%s] %s (%s)", strat, sym, blend_e)
+                            final_model, blend_telemetry = model, {
+                                "rf_val_acc": round(float(acc), 4),
+                                "gbm_val_acc": None,
+                                "blend_w_rf": 1.0,
+                                "blend_w_gbm": 0.0,
+                                "blend_status": "rf_only_exception",
+                            }
+                        if blend_telemetry.get("blend_status") == "blended":
+                            acc = float(final_model.score(X_val_s, y_val))
+
+                        # CONFIDENCE CALIBRATION: raw model predict_proba is not a
                         # reliable win-rate estimate (never checked against actual
                         # outcomes before). Fit isotonic regression mapping raw
                         # BUY-class probability -> empirical val-set accuracy, so
-                        # live "confidence" means something sizing can trust.
+                        # live "confidence" means something sizing can trust. Fits on
+                        # the final (possibly blended) model's probabilities, not raw RF.
                         calibrator = None
                         try:
-                            if len(X_val_s) >= 10 and len(np.unique(y_val)) > 1 and 1 in model.classes_:
+                            if len(X_val_s) >= 10 and len(np.unique(y_val)) > 1 and 1 in final_model.classes_:
                                 from sklearn.isotonic import IsotonicRegression
 
-                                buy_col = list(model.classes_).index(1)
-                                raw_buy_probs = model.predict_proba(X_val_s)[:, buy_col]
+                                buy_col = list(final_model.classes_).index(1)
+                                raw_buy_probs = final_model.predict_proba(X_val_s)[:, buy_col]
                                 calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
                                 calibrator.fit(raw_buy_probs, y_val)
                                 logger.info(
@@ -1670,10 +1693,15 @@ class AITrainingDataPipeline:
                         prim_sig_sec = int(day_label_grid_seconds()) if strat == "day" else int(primary_bar_seconds_for_strategy(strat))
 
                         artifact: dict[str, Any] = {
-                            "model": model,
+                            "model": final_model,
                             "scaler": scaler,
                             "confidence_calibrator": calibrator,
                             "accuracy": acc,
+                            "rf_val_acc": blend_telemetry.get("rf_val_acc"),
+                            "gbm_val_acc": blend_telemetry.get("gbm_val_acc"),
+                            "blend_w_rf": blend_telemetry.get("blend_w_rf"),
+                            "blend_w_gbm": blend_telemetry.get("blend_w_gbm"),
+                            "blend_status": blend_telemetry.get("blend_status"),
                             "symbol": sym,
                             "feature_version": art_fv,
                             "feature_dim": int(target_dim),
