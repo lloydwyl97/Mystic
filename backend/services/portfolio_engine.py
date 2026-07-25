@@ -11829,8 +11829,16 @@ class PortfolioEngine:
         notional *= LIVE_TRADING_SAFETY_MULTIPLIER
         # ================================================================
 
-        # Size = base * confidence (ML authoritative — no hard zero on low confidence; scales down instead)
-        _conf_scale = 1.0
+        # Size scales linearly with ML confidence between a floor and 1.0.
+        # conf_floor (default 0.70) → 0.70x size; conf=1.0 → 1.0x size.
+        # Prevents full-size entries on marginal signals while still trading them.
+        _conf_floor = float(os.getenv("DAY_CONF_SIZE_FLOOR", "0.70"))
+        _conf_clipped = max(0.0, min(1.0, float(confidence or 0.5)))
+        if _conf_clipped >= 0.5:
+            _conf_scale = _conf_floor + (1.0 - _conf_floor) * (_conf_clipped - 0.5) / 0.5
+        else:
+            _conf_scale = _conf_floor * (_conf_clipped / 0.5)
+        _conf_scale = max(0.0, min(1.0, _conf_scale))
         notional_after_conf = notional * _conf_scale
         base_notional = notional
 

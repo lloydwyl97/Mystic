@@ -112,8 +112,13 @@ def _stall_min_hold_min() -> float:
 
 
 def _stall_max_mfe_pct() -> float:
-    """Max mark MFE (fraction) allowed for a stall cut. Default 0.20%."""
-    return float(os.getenv("DAY_STALL_MAX_MFE_PCT", "0.0020"))
+    """Max mark MFE (fraction) allowed for a stall cut. Default 0.50%.
+
+    Raised from 0.20% — positions that reached 0.20-0.50% favorable and came back
+    are not dead inventory; they may still resolve toward target on the next leg.
+    Only truly flat/dead positions (< 0.50% MFE ever seen) should be stall-cut.
+    """
+    return float(os.getenv("DAY_STALL_MAX_MFE_PCT", "0.0050"))
 
 
 def evaluate_stall_exit(
@@ -588,21 +593,24 @@ def evaluate_engine_managed_exit(
     max_hold = effective_max_hold_min(position, coin_profile)
     if int(getattr(position, "max_hold_min", 0) or 0) < max_hold:
         position.max_hold_min = max_hold
-    stall = evaluate_stall_exit(
-        entry_price=entry,
-        highest_price=float(getattr(position, "highest_price", entry) or entry),
-        net_pnl_pct=net_pnl_pct,
-        hold_minutes=hold_minutes,
-        max_hold_min=max_hold,
-    )
-    if stall is not None:
-        return stall
+    _stall_regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
+    if _stall_regime != "bull":
+        stall = evaluate_stall_exit(
+            entry_price=entry,
+            highest_price=float(getattr(position, "highest_price", entry) or entry),
+            net_pnl_pct=net_pnl_pct,
+            hold_minutes=hold_minutes,
+            max_hold_min=max_hold,
+        )
+        if stall is not None:
+            return stall
+    # Bull regime: stall is suppressed — price consolidating before next leg is normal.
 
     if hold_minutes >= max_hold and net_pnl_pct + 1e-12 < float(MIN_NET_PROFIT_TO_SELL):
-        regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
-        if regime == "bull" and net_pnl_pct >= 0.0:
-            # Bull regime: position is green but below profit floor — hold for target rather than
-            # time-stopping a winning trade. Stop-loss and trailing stop remain active.
+        if net_pnl_pct >= 0.0:
+            # Position is net-positive but below profit floor — let stop-loss / trailing stop /
+            # target exit it cleanly rather than clocking out a winning trade. Applies in all
+            # regimes: a profitable position should never be forcibly exited by a timer.
             pass
         else:
             return {
