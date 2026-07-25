@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import sqlite3
@@ -649,6 +650,12 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
 
     top_blocker = _top_blocker(symbol_rows, operational=operational)
 
+    entry_telemetry: dict[str, Any] | None = None
+    with contextlib.suppress(Exception):
+        from backend.services.binance_scalp.scalp_entry_telemetry import read_entry_telemetry
+
+        entry_telemetry = read_entry_telemetry(rclient, prefix=config.redis_key_prefix)
+
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "overall_decision": overall,
@@ -674,4 +681,5 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
         "memory_kb": _read_mem_kb(),
         "strategy_router": strategy_router,
         "disabled_strategies": sorted(config.disabled_strategies),
+        "entry_telemetry": entry_telemetry,
     }

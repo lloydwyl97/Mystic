@@ -1063,6 +1063,75 @@ function updateScalpTelemetry(res) {
     if (window._lastScalpStatus) {
         updateScalpSymbolDiagnostics(window._lastScalpStatus);
     }
+    renderScalpPassTelemetry(d);
+}
+
+function _fmtPct(v) {
+    if (v == null || v === "" || Number.isNaN(Number(v))) return "--";
+    return (Number(v) * 100).toFixed(1) + "%";
+}
+
+function renderScalpPassTelemetry(d) {
+    if (!d || d.available === false) {
+        const set = typeof setCardText === "function" ? setCardText : function (id, v) {
+            const el = document.getElementById(id);
+            if (el) el.textContent = v;
+        };
+        set("scalp-tel-pass", "--");
+        set("scalp-tel-elig", "--");
+        return;
+    }
+    const roll = d.rolling || {};
+    const set = typeof setCardText === "function" ? setCardText : function (id, v) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = v;
+    };
+    set("scalp-tel-pass", d.genuine_pass_setups != null ? String(d.genuine_pass_setups) : "--");
+    set("scalp-tel-elig", d.entry_eligible_count != null ? String(d.entry_eligible_count) : "--");
+    set("scalp-tel-cycles", roll.cycles != null ? String(roll.cycles) : "--");
+    set("scalp-tel-pass-rate", _fmtPct(roll.pass_rate_overall));
+    set("scalp-tel-pct-pass", _fmtPct(roll.pct_cycles_with_pass));
+    set("scalp-tel-pct-elig", _fmtPct(roll.pct_cycles_with_eligible));
+    set("scalp-tel-regime-native", roll.regime_native_pass_count != null ? String(roll.regime_native_pass_count) : "--");
+    set("scalp-tel-regime-mismatch", roll.regime_mismatch_pass_count != null ? String(roll.regime_mismatch_pass_count) : "--");
+
+    const rejects = Object.entries(roll.top_reject_reasons || d.reject_reasons || {}).slice(0, 8);
+    const ppb = Object.entries(roll.top_post_pass_blockers || d.post_pass_blockers || {}).slice(0, 8);
+    const maxRows = Math.max(rejects.length, ppb.length, 1);
+    const tbody = document.getElementById("scalp-tel-blockers-tbody");
+    if (tbody) {
+        if (!rejects.length && !ppb.length) {
+            tbody.innerHTML = "<tr><td colspan=\"4\">No rejects yet this window</td></tr>";
+        } else {
+            let html = "";
+            for (let i = 0; i < maxRows; i++) {
+                const r = rejects[i] || ["", ""];
+                const p = ppb[i] || ["", ""];
+                html += "<tr><td>" + (r[0] || "") + "</td><td>" + (r[1] !== "" ? r[1] : "") + "</td><td>" +
+                    (p[0] || "") + "</td><td>" + (p[1] !== "" ? p[1] : "") + "</td></tr>";
+            }
+            tbody.innerHTML = html;
+        }
+    }
+
+    const rates = roll.strategy_pass_rate || d.strategy_pass_rate || {};
+    const evals = (d.rolling_full && d.rolling_full.strategy_eval_counts) || d.strategy_eval_counts || {};
+    const passes = (d.rolling_full && d.rolling_full.strategy_pass_counts) || d.strategy_pass_counts || {};
+    const names = Object.keys(evals).length ? Object.keys(evals) : Object.keys(rates);
+    names.sort(function (a, b) { return (Number(evals[b] || 0) - Number(evals[a] || 0)); });
+    const stBody = document.getElementById("scalp-tel-strategy-tbody");
+    if (stBody) {
+        if (!names.length) {
+            stBody.innerHTML = "<tr><td colspan=\"4\">Waiting for strategy evals...</td></tr>";
+        } else {
+            stBody.innerHTML = names.slice(0, 12).map(function (name) {
+                const ev = evals[name] != null ? evals[name] : "--";
+                const pa = passes[name] != null ? passes[name] : "--";
+                const pr = rates[name] != null ? _fmtPct(rates[name]) : "--";
+                return "<tr><td>" + name + "</td><td>" + ev + "</td><td>" + pa + "</td><td>" + pr + "</td></tr>";
+            }).join("");
+        }
+    }
 }
 
 function updateScalpStrategies(res) {

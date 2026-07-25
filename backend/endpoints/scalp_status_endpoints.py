@@ -114,22 +114,53 @@ def scalp_strategies() -> dict:
 
 @router.get("/telemetry")
 def scalp_entry_telemetry() -> dict:
-    """Latest genuine-pass / reject histogram from the paper runner (Redis)."""
+    """Latest genuine-pass / reject / post-pass-blocker telemetry + rolling window."""
     try:
         import redis as redis_lib
 
-        from backend.services.binance_scalp.scalp_entry_telemetry import read_entry_telemetry
+        from backend.services.binance_scalp.scalp_entry_telemetry import (
+            read_entry_telemetry,
+            read_rolling_telemetry,
+        )
 
         cfg = get_scalp_config()
         r = redis_lib.Redis(host="127.0.0.1", port=6379, db=0, decode_responses=True)
         payload = read_entry_telemetry(r, prefix=cfg.redis_key_prefix)
-        if not payload:
+        rolling_full = read_rolling_telemetry(r, prefix=cfg.redis_key_prefix)
+        if not payload and not rolling_full:
             return {
                 "engine": "scalp",
                 "available": False,
                 "note": "No telemetry yet — wait one paper-runner cycle (~5s) after start.",
             }
-        return {"engine": "scalp", "available": True, **payload}
+        out: dict = {"engine": "scalp", "available": True}
+        if payload:
+            out.update(payload)
+        if rolling_full and "rolling" not in out:
+            out["rolling"] = {
+                "cycles": rolling_full.get("cycles"),
+                "pass_rate_overall": rolling_full.get("pass_rate_overall"),
+                "pct_cycles_with_pass": rolling_full.get("pct_cycles_with_pass"),
+                "pct_cycles_with_eligible": rolling_full.get("pct_cycles_with_eligible"),
+                "top_reject_reasons": rolling_full.get("top_reject_reasons"),
+                "top_post_pass_blockers": rolling_full.get("top_post_pass_blockers"),
+                "strategy_pass_rate": rolling_full.get("strategy_pass_rate"),
+                "regime_native_pass_count": rolling_full.get("regime_native_pass_count"),
+                "regime_mismatch_pass_count": rolling_full.get("regime_mismatch_pass_count"),
+                "genuine_pass_setups": rolling_full.get("genuine_pass_setups"),
+                "entry_eligible_count": rolling_full.get("entry_eligible_count"),
+                "updated_at_epoch": rolling_full.get("updated_at_epoch"),
+            }
+        if rolling_full:
+            out["rolling_full"] = {
+                "cycles": rolling_full.get("cycles"),
+                "started_at_epoch": rolling_full.get("started_at_epoch"),
+                "strategy_pass_rate": rolling_full.get("strategy_pass_rate"),
+                "strategy_eval_counts": rolling_full.get("strategy_eval_counts"),
+                "strategy_pass_counts": rolling_full.get("strategy_pass_counts"),
+                "recent_cycle_digest": (rolling_full.get("recent_cycle_digest") or [])[-20:],
+            }
+        return out
     except Exception as exc:
         return {"engine": "scalp", "available": False, "error": str(exc)[:240]}
 

@@ -261,6 +261,32 @@
                 <div class="readiness-card readiness-card--span2"><span class="readiness-label">Warm note</span><span class="readiness-value" id="scalp-warm-note">--</span></div>
             </div>
         </section>
+        <section class="widget widget--full" id="scalp-pass-telemetry-widget" aria-label="SCALP pass-rate telemetry">
+            <h2 class="widget__title">SCALP pass-rate telemetry</h2>
+            <p class="widget__subtitle">Genuine <code>sig.passed</code> only — soft rejects never enter. Rolling window + last cycle. Does not loosen entry gates.</p>
+            <div class="readiness-grid">
+                <div class="readiness-card"><span class="readiness-label">Last cycle passes</span><span class="readiness-value" id="scalp-tel-pass">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Last cycle eligible</span><span class="readiness-value" id="scalp-tel-elig">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Rolling cycles</span><span class="readiness-value" id="scalp-tel-cycles">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Overall pass rate</span><span class="readiness-value" id="scalp-tel-pass-rate">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">% cycles w/ pass</span><span class="readiness-value" id="scalp-tel-pct-pass">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">% cycles w/ eligible</span><span class="readiness-value" id="scalp-tel-pct-elig">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Regime native passes</span><span class="readiness-value" id="scalp-tel-regime-native">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Regime mismatch passes</span><span class="readiness-value" id="scalp-tel-regime-mismatch">--</span></div>
+            </div>
+            <div class="widget__table-wrap widget__table-wrap--scroll" style="margin-top:12px;">
+                <table class="positions-table">
+                    <thead><tr><th>Top reject reasons (rolling)</th><th>Count</th><th>Post-pass blockers (rolling)</th><th>Count</th></tr></thead>
+                    <tbody id="scalp-tel-blockers-tbody"><tr><td colspan="4">Loading...</td></tr></tbody>
+                </table>
+            </div>
+            <div class="widget__table-wrap widget__table-wrap--scroll" style="margin-top:12px;">
+                <table class="positions-table">
+                    <thead><tr><th>Strategy</th><th>Eval</th><th>Pass</th><th>Pass rate</th></tr></thead>
+                    <tbody id="scalp-tel-strategy-tbody"><tr><td colspan="4">Loading...</td></tr></tbody>
+                </table>
+            </div>
+        </section>
         <section class="widget widget--full">
             <h2 class="widget__title">SCALP open positions</h2>
             <div class="widget__table-wrap">
