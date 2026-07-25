@@ -336,7 +336,6 @@ def publish_entry_telemetry(
     try:
         payload = build_entry_telemetry(ranked)
         key = telemetry_key(prefix)
-        redis_client.setex(key, _TELEMETRY_TTL_SEC, json.dumps(payload, separators=(",", ":")))
         rolling = update_rolling_telemetry(redis_client, payload, prefix=prefix)
         if rolling is not None:
             payload["rolling"] = {
@@ -353,6 +352,7 @@ def publish_entry_telemetry(
                 "entry_eligible_count": rolling.get("entry_eligible_count"),
                 "updated_at_epoch": rolling.get("updated_at_epoch"),
             }
+        redis_client.setex(key, _TELEMETRY_TTL_SEC, json.dumps(payload, separators=(",", ":")))
         return payload
     except Exception as exc:
         logger.debug("SCALP entry telemetry publish skipped: %s", exc)
