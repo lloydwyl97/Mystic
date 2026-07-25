@@ -34,13 +34,37 @@ EXIT_STALL = "STALL_EXIT"
 EXIT_GIVEBACK = "GIVEBACK_EXIT"
 
 
+def _bull_hold_extension_min() -> int:
+    """Extra minutes granted to bull-regime positions beyond the coin profile ceiling."""
+    return int(os.getenv("DAY_BULL_HOLD_EXTENSION_MIN", "120"))
+
+
+def _bull_trail_multiplier() -> float:
+    """Trail-pct multiplier applied when a bull position is trending strongly."""
+    return float(os.getenv("DAY_BULL_TRAIL_MULTIPLIER", "2.0"))
+
+
+def _bull_trail_mfe_threshold() -> float:
+    """Minimum MFE fraction before bull trail widening activates (default 1.5%)."""
+    return float(os.getenv("DAY_BULL_TRAIL_MFE_THRESHOLD", "0.015"))
+
+
 def effective_max_hold_min(position: Any, coin_profile: dict[str, Any] | None = None) -> int:
-    """Session ceiling: prefer current profile when stamped hold is shorter (day-trade upgrade)."""
+    """Session ceiling: prefer current profile when stamped hold is shorter (day-trade upgrade).
+
+    Bull-regime positions receive an extra DAY_BULL_HOLD_EXTENSION_MIN (default +120 min)
+    so a trending position is not timed out before its target can be reached.
+    """
     profile_hold = int((coin_profile or {}).get("max_hold_min") or 0)
     stamped = int(getattr(position, "max_hold_min", 0) or 0)
     if profile_hold > 0 and stamped > 0:
-        return max(stamped, profile_hold)
-    return stamped or profile_hold or 300
+        base = max(stamped, profile_hold)
+    else:
+        base = stamped or profile_hold or 300
+    regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
+    if regime == "bull":
+        base += _bull_hold_extension_min()
+    return base
 
 ALLOWED_DAY_EXIT_REASONS = frozenset(
     {
@@ -323,7 +347,12 @@ def backfill_position_exit_metadata(position: Any, coin_profile: dict[str, Any])
 
 
 def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dict[str, Any] | None = None) -> bool:
-    """Ratchet trailing stop when price makes new highs; returns True if level changed."""
+    """Ratchet trailing stop when price makes new highs; returns True if level changed.
+
+    In bull regime, once price has moved DAY_BULL_TRAIL_MFE_THRESHOLD (default 1.5%)
+    in our favour, the trail distance is widened by DAY_BULL_TRAIL_MULTIPLIER (default 2x)
+    so normal intraday noise does not shake out a strongly trending position.
+    """
     entry = float(getattr(position, "entry_price", 0.0) or 0.0)
     if entry <= 0 or current_price <= 0:
         return False
@@ -331,6 +360,12 @@ def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dic
     profile = coin_profile or {}
     trail_pct = float(getattr(position, "trail_pct", 0.0) or profile.get("trail") or 0.005)
     highest = float(getattr(position, "highest_price", 0.0) or entry)
+    mfe_pct = max(0.0, (highest - entry) / entry) if entry > 0 else 0.0
+
+    regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
+    if regime == "bull" and mfe_pct >= _bull_trail_mfe_threshold():
+        trail_pct = min(trail_pct * _bull_trail_multiplier(), 0.025)
+
     activation = entry * (1.0 + trail_pct)
     if highest < activation:
         return False
@@ -522,12 +557,31 @@ def evaluate_engine_managed_exit(
                 "hold_minutes": hold_minutes,
             }
 
-    giveback = evaluate_giveback_exit(
-        entry_price=entry,
-        highest_price=float(getattr(position, "highest_price", entry) or entry),
-        net_pnl_pct=net_pnl_pct,
-        hold_minutes=hold_minutes,
-    )
+    _pos_regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
+    if _pos_regime == "bull":
+        # In bull regime require a deeper reversal before treating a pullback as a giveback —
+        # normal bull noise can easily exceed the default -0.15% trigger on the way to target.
+        _highest = float(getattr(position, "highest_price", entry) or entry)
+        _mfe = max(0.0, (_highest - entry) / entry) if entry > 0 else 0.0
+        _bull_mfe_thresh = float(os.getenv("DAY_BULL_GIVEBACK_MIN_MFE", "0.005"))
+        _bull_trigger = float(os.getenv("DAY_BULL_GIVEBACK_TRIGGER", "-0.003"))
+        if _mfe >= _bull_mfe_thresh and net_pnl_pct + 1e-12 <= _bull_trigger:
+            giveback = {
+                "action": "sell",
+                "reason": EXIT_GIVEBACK,
+                "net_pnl_pct": net_pnl_pct,
+                "hold_minutes": hold_minutes,
+                "detail": f"bull_giveback mfe={_mfe:.6f} trigger={_bull_trigger}",
+            }
+        else:
+            giveback = None
+    else:
+        giveback = evaluate_giveback_exit(
+            entry_price=entry,
+            highest_price=float(getattr(position, "highest_price", entry) or entry),
+            net_pnl_pct=net_pnl_pct,
+            hold_minutes=hold_minutes,
+        )
     if giveback is not None:
         return giveback
 
@@ -545,13 +599,19 @@ def evaluate_engine_managed_exit(
         return stall
 
     if hold_minutes >= max_hold and net_pnl_pct + 1e-12 < float(MIN_NET_PROFIT_TO_SELL):
-        return {
-            "action": "sell",
-            "reason": EXIT_TIME_STOP,
-            "net_pnl_pct": net_pnl_pct,
-            "hold_minutes": hold_minutes,
-            "detail": f"max_hold_min={max_hold}",
-        }
+        regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
+        if regime == "bull" and net_pnl_pct >= 0.0:
+            # Bull regime: position is green but below profit floor — hold for target rather than
+            # time-stopping a winning trade. Stop-loss and trailing stop remain active.
+            pass
+        else:
+            return {
+                "action": "sell",
+                "reason": EXIT_TIME_STOP,
+                "net_pnl_pct": net_pnl_pct,
+                "hold_minutes": hold_minutes,
+                "detail": f"max_hold_min={max_hold}",
+            }
 
     target = effective_target_price(entry, float(getattr(position, "take_profit_1_price", 0) or 0), target_level)
     if target > 0 and current_price >= target and net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL) * 0.45:
