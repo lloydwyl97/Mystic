@@ -71,6 +71,20 @@ class BlendedClassifier:
         preds = self.predict(X)
         return float(np.mean(np.asarray(preds) == np.asarray(y)))
 
+    def disagreement(self, X: Any) -> np.ndarray:
+        """Total-variation distance between the RF and GBM class-probability
+        vectors, in [0, 1] per row. 0 = the two algorithm families fully agree
+        on this instance; 1 = maximally split. Free — both models are already
+        fit and scored every training cycle, this just surfaces the spread
+        between them at inference time instead of throwing it away after
+        blending. See compute_disagreement() for the safe wrapper used by
+        callers that may be holding a plain (non-blended) fallback model."""
+        if self.w_gbm <= 0.0:
+            return np.zeros(len(X) if hasattr(X, "__len__") else X.shape[0])
+        rf_proba = self.rf.predict_proba(X)
+        gbm_proba = self._gbm_proba_aligned(X)
+        return np.sum(np.abs(rf_proba - gbm_proba), axis=1) / 2.0
+
 
 def build_blended_classifier(
     rf: Any,
@@ -148,4 +162,19 @@ def build_blended_classifier(
     return blended, telemetry
 
 
-__all__ = ["BlendedClassifier", "build_blended_classifier"]
+def compute_disagreement(model: Any, X: Any) -> np.ndarray:
+    """Safe wrapper: returns model.disagreement(X) for a BlendedClassifier, or
+    an all-zero array (perfect agreement / no discount) for any other model —
+    e.g. a plain RandomForestClassifier fallback from build_blended_classifier's
+    safe-degradation path, or an older pickled artifact predating this feature."""
+    n = len(X) if hasattr(X, "__len__") else X.shape[0]
+    if isinstance(model, BlendedClassifier):
+        try:
+            return model.disagreement(X)
+        except Exception as exc:
+            logger.debug("BLENDED_CLASSIFIER_DISAGREEMENT_FAILED: %s", exc)
+            return np.zeros(n)
+    return np.zeros(n)
+
+
+__all__ = ["BlendedClassifier", "build_blended_classifier", "compute_disagreement"]

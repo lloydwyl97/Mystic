@@ -857,6 +857,32 @@ class RealTimeAISignalGenerator:
                 except Exception as cal_e:
                     logger.debug("CONFIDENCE_CALIBRATION_APPLY_FAILED: %s %s", slot, cal_e)
 
+            # MODEL DISAGREEMENT DISCOUNT: RF and GBM (blended this training cycle,
+            # see ai_blended_classifier.py) can and do split on individual instances
+            # even when their averaged probability looks confident. High disagreement
+            # means the two algorithm families read this setup differently — discount
+            # confidence proportionally instead of trusting the blended average blindly.
+            # Free signal: both models are already fit every cycle, this was previously
+            # computed and thrown away at blend time.
+            model_disagreement = 0.0
+            if prediction == "BUY":
+                try:
+                    from backend.services.ai_blended_classifier import compute_disagreement
+
+                    model_disagreement = float(compute_disagreement(self.models[slot], features_scaled)[0])
+                    disagreement_floor = float(os.getenv("DAY_DISAGREEMENT_CONF_FLOOR", "0.75"))
+                    disagreement_discount = max(disagreement_floor, 1.0 - model_disagreement * (1.0 - disagreement_floor) * 2.0)
+                    confidence = max(0.0, min(1.0, confidence * disagreement_discount))
+                except Exception as dis_e:
+                    logger.debug("MODEL_DISAGREEMENT_DISCOUNT_FAILED: %s %s", slot, dis_e)
+                    model_disagreement = 0.0
+
+            # NOTE: meta-labeling trust discount is applied later in the pipeline
+            # (portfolio_engine.py, right after day_ai_rank_enrichment.py) — that
+            # is where chart_pattern_score/setup_score/cross_sectional_rank_delta/
+            # execution_rank_delta actually exist. Applying it here would starve
+            # it of the exact signals it was built to use. See ai_meta_labeling.py.
+
             signal_decision_id = f"{strategy_id}_{symbol}_{int(time.time() * 1000)}"
 
             # buy_margin computed for telemetry only — does NOT gate direction
@@ -1024,6 +1050,7 @@ class RealTimeAISignalGenerator:
                 "prob_buy": str(pb),
                 "prob_hold": str(ph),
                 "prob_sell": str(ps),
+                "model_disagreement": str(round(model_disagreement, 4)),
                 "atr": ranking["atr"],
                 "rsi": ranking["rsi"],
                 "adx": ranking["adx"],

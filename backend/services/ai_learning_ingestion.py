@@ -149,10 +149,24 @@ _HEARTBEAT_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
 # contract as day_route_regime — ai_regime_validation.get_pattern_validated_scalar
 # checks the label against the fwd_ret_* columns already computed for every
 # snapshot before its ranking nudge is trusted at full strength.
+#
+# model_disagreement/cross_sectional_rank_delta/setup_score/execution_rank_delta =
+# the remaining bounded-nudge/diagnostic signals added this session that live in
+# decision_data but were deliberately kept OUT of the 145-dim ML feature vector
+# (would force a breaking dimension bump). Capturing them here is what lets
+# ai_meta_labeling.py train a genuine second-stage model on exactly the signals
+# the primary model never gets to see, instead of re-deriving the primary
+# model's own job. NULL on historical rows predating this migration — the meta
+# feature builder treats that as 0.0, same graceful-degradation pattern as
+# day_route_regime's early empty rows.
 _SNAPSHOT_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("day_route_regime", "TEXT"),
     ("chart_pattern_score", "REAL"),
     ("chart_pattern_label", "TEXT"),
+    ("model_disagreement", "REAL"),
+    ("cross_sectional_rank_delta", "REAL"),
+    ("setup_score", "REAL"),
+    ("execution_rank_delta", "REAL"),
 )
 
 _tables_ready = False
@@ -233,8 +247,9 @@ def record_candidate_snapshot(
                     rank, rank_score, confidence, side, entry_thesis, thesis_score,
                     thesis_invalid_level, thesis_target_level, regime, trend_state,
                     relative_volume, spread_pct, cost_estimate_pct, price, open_position_json,
-                    day_route_regime, chart_pattern_score, chart_pattern_label
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    day_route_regime, chart_pattern_score, chart_pattern_label,
+                    model_disagreement, cross_sectional_rank_delta, setup_score, execution_rank_delta
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     _now_iso(),
@@ -262,6 +277,10 @@ def record_candidate_snapshot(
                     str(dd.get("day_route_regime") or ""),
                     _safe_float(dd.get("chart_pattern_score")) if dd.get("chart_pattern_score") is not None else None,
                     str(dd.get("chart_pattern_label") or ""),
+                    _safe_float(dd.get("model_disagreement")) if dd.get("model_disagreement") is not None else None,
+                    _safe_float(dd.get("cross_sectional_rank_delta")) if dd.get("cross_sectional_rank_delta") is not None else None,
+                    _safe_float(dd.get("setup_score")) if dd.get("setup_score") is not None else None,
+                    _safe_float(dd.get("execution_rank_delta")) if dd.get("execution_rank_delta") is not None else None,
                 ),
             )
             conn.commit()

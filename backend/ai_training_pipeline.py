@@ -1650,6 +1650,28 @@ class AITrainingDataPipeline:
                         if blend_telemetry.get("blend_status") == "blended":
                             acc = float(final_model.score(X_val_s, y_val))
 
+                        # FEATURE IMPORTANCE DIAGNOSTIC: surfaces dead-weight dims from
+                        # both algorithm families without touching the live 145-dim
+                        # contract — see ai_feature_importance_diagnostics.py.
+                        try:
+                            from backend.services.ai_feature_importance_diagnostics import (
+                                compute_and_record_feature_importance,
+                            )
+
+                            gbm_for_importance = getattr(final_model, "gbm", None)
+                            feature_importance_summary = compute_and_record_feature_importance(
+                                strategy_id=strat,
+                                symbol=sym,
+                                rf_model=model,
+                                gbm_model=gbm_for_importance,
+                                X_val_s=X_val_s,
+                                y_val=y_val,
+                                feature_dim=int(target_dim),
+                            )
+                        except Exception as fi_e:
+                            logger.debug("FEATURE_IMPORTANCE_DIAGNOSTIC_SKIPPED: [%s] %s (%s)", strat, sym, fi_e)
+                            feature_importance_summary = {}
+
                         # CONFIDENCE CALIBRATION: raw model predict_proba is not a
                         # reliable win-rate estimate (never checked against actual
                         # outcomes before). Fit isotonic regression mapping raw
@@ -1702,6 +1724,7 @@ class AITrainingDataPipeline:
                             "blend_w_rf": blend_telemetry.get("blend_w_rf"),
                             "blend_w_gbm": blend_telemetry.get("blend_w_gbm"),
                             "blend_status": blend_telemetry.get("blend_status"),
+                            "feature_importance_weakest": feature_importance_summary.get("combined_top_weak"),
                             "symbol": sym,
                             "feature_version": art_fv,
                             "feature_dim": int(target_dim),
@@ -1826,6 +1849,22 @@ class AITrainingDataPipeline:
                             feature_version_used,
                             target_dim,
                         )
+                        try:
+                            from backend.services.ai_feature_importance_diagnostics import (
+                                log_cross_symbol_weak_features,
+                            )
+
+                            log_cross_symbol_weak_features(strat, feature_dim=int(target_dim))
+                        except Exception as fi_agg_e:
+                            logger.debug("CROSS_SYMBOL_FEATURE_IMPORTANCE_SKIPPED: strategy=%s (%s)", strat, fi_agg_e)
+
+                        try:
+                            from backend.services.ai_meta_labeling import train_meta_label_model
+
+                            meta_result = train_meta_label_model(strategy_id=strat)
+                            logger.info("META_LABEL_TRAIN_RESULT: strategy=%s result=%s", strat, meta_result)
+                        except Exception as meta_e:
+                            logger.debug("META_LABEL_TRAIN_SKIPPED: strategy=%s (%s)", strat, meta_e)
 
                     total_trained += trained_count
 

@@ -9,6 +9,12 @@ from typing import Any
 from backend.services.day_block_scores import block_scores_rank_delta, compute_block_scores_from_decision_data
 from backend.services.day_candidate_explanation import build_candidate_explanation, explanation_json
 from backend.services.day_chart_pattern_detector import chart_pattern_rank_delta, get_chart_pattern_signal
+from backend.services.day_cross_sectional_ranking import (
+    combined_attractiveness_score,
+    cross_sectional_rank_delta,
+    publish_cross_sectional_score,
+    read_peer_scores,
+)
 from backend.services.day_execution_ranking import compute_execution_ranking_scores, execution_rank_delta
 from backend.services.day_market_memory import load_market_memory, memory_rank_delta, update_market_memory_on_candidate
 from backend.services.day_regime_transition import compute_regime_transition_scores, regime_transition_rank_delta
@@ -56,6 +62,18 @@ def enrich_day_candidate_decision_data(
         pattern_info = {"chart_pattern_score": 0.0, "chart_pattern_label": ""}
     dd.update(pattern_info)
 
+    try:
+        own_score = combined_attractiveness_score(dd)
+        publish_cross_sectional_score(symbol, own_score)
+        peer_scores = read_peer_scores(symbol)
+        dd["cross_sectional_own_score"] = round(own_score, 4)
+        dd["cross_sectional_peer_scores_json"] = json.dumps(peer_scores, separators=(",", ":"))
+        cross_sectional_delta = cross_sectional_rank_delta(own_score, peer_scores)
+    except Exception as exc:
+        logger.debug("cross sectional ranking skipped %s: %s", symbol, exc)
+        cross_sectional_delta = 0.0
+    dd["cross_sectional_rank_delta"] = cross_sectional_delta
+
     dd["block_score_rank_delta"] = block_scores_rank_delta(block_scores)
     dd["setup_score_rank_delta"] = setup_score_rank_delta(setup, setup_scores)
     dd["execution_rank_delta"] = execution_rank_delta(exec_scores)
@@ -70,6 +88,7 @@ def enrich_day_candidate_decision_data(
         + float(dd.get("regime_transition_rank_delta") or 0.0)
         + float(dd.get("memory_rank_delta") or 0.0)
         + float(dd.get("chart_pattern_rank_delta") or 0.0)
+        + float(dd.get("cross_sectional_rank_delta") or 0.0)
     )
     dd["intelligence_rank_delta"] = round(max(-INTELLIGENCE_DELTA_CAP, min(INTELLIGENCE_DELTA_CAP, intel_delta)), 4)
 

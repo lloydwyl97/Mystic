@@ -14555,6 +14555,29 @@ class PortfolioEngine:
                     memory=mem,
                 )
                 apply_intelligence_rank_delta_to_candidate(candidate)
+
+                # META-LABELING TRUST DISCOUNT: applied here, not in ai_signal_generator.py,
+                # because this is the first point in the pipeline where chart_pattern_score,
+                # setup_score, cross_sectional_rank_delta, execution_rank_delta, and
+                # day_route_regime all actually exist on this candidate — those are exactly
+                # the signals the meta-model was built to use (see ai_meta_labeling.py).
+                # Mutates candidate.confidence directly (not just decision_data) so the
+                # discount flows through to BOTH rank_score() and calculate_position_size()
+                # — a real sizing effect, not merely a ranking nudge. Bounded [0.5, 1.0]:
+                # can only ever discount, never veto a trade or boost beyond the primary
+                # model's own confidence.
+                try:
+                    from backend.services.ai_meta_labeling import score_meta_trust
+
+                    meta_trust_mult, meta_trust_detail = score_meta_trust(candidate.decision_data or {}, symbol)
+                    if meta_trust_mult < 1.0:
+                        candidate.confidence = max(0.0, min(1.0, float(candidate.confidence or 0.0) * meta_trust_mult))
+                    dd_meta = dict(candidate.decision_data or {})
+                    dd_meta["meta_trust_multiplier"] = meta_trust_mult
+                    dd_meta["meta_trust_detail_json"] = json.dumps(meta_trust_detail, separators=(",", ":"))
+                    candidate.decision_data = dd_meta
+                except Exception:
+                    logger.debug("META_LABEL_TRUST enqueue skipped for %s", symbol, exc_info=True)
             except Exception:
                 logger.debug("DAY_AI_INTELLIGENCE enqueue skipped for %s", symbol, exc_info=True)
 
