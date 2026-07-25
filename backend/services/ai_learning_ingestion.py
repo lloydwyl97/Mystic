@@ -136,6 +136,16 @@ _HEARTBEAT_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("heartbeat_calc_version", "INTEGER DEFAULT 1"),
 )
 
+# day_route_regime = the DAY router's per-symbol classify_day_regime() label
+# (bull/range/bear/chop/neutral) captured at decision time, distinct from the
+# `regime` column (global Fear&Greed bull/bear/sideways). This is what actually
+# gates day_controlled_exits.py bull-regime bonuses — capturing it here lets
+# ai_regime_validation.py check whether that specific label predicts the
+# fwd_ret_* columns already computed for every snapshot.
+_SNAPSHOT_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("day_route_regime", "TEXT"),
+)
+
 _tables_ready = False
 
 
@@ -150,6 +160,13 @@ def _migrate_heartbeat_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE ai_position_heartbeats ADD COLUMN {col_name} {col_def}")
 
 
+def _migrate_snapshot_columns(conn: sqlite3.Connection) -> None:
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(ai_candidate_snapshots)").fetchall()}
+    for col_name, col_def in _SNAPSHOT_MIGRATION_COLUMNS:
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE ai_candidate_snapshots ADD COLUMN {col_name} {col_def}")
+
+
 def ensure_learning_ingestion_tables(db_path: str = DATABASE_PATH) -> None:
     global _tables_ready
     with sqlite3.connect(db_path) as conn:
@@ -159,6 +176,7 @@ def ensure_learning_ingestion_tables(db_path: str = DATABASE_PATH) -> None:
             if s:
                 conn.execute(s)
         _migrate_heartbeat_columns(conn)
+        _migrate_snapshot_columns(conn)
         conn.commit()
     _tables_ready = True
 
@@ -205,8 +223,9 @@ def record_candidate_snapshot(
                     ts_utc, epoch_ms, symbol, strategy_id, decision_id, decision, reason_code,
                     rank, rank_score, confidence, side, entry_thesis, thesis_score,
                     thesis_invalid_level, thesis_target_level, regime, trend_state,
-                    relative_volume, spread_pct, cost_estimate_pct, price, open_position_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    relative_volume, spread_pct, cost_estimate_pct, price, open_position_json,
+                    day_route_regime
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     _now_iso(),
@@ -231,6 +250,7 @@ def record_candidate_snapshot(
                     float(ESTIMATED_ROUNDTRIP_COST),
                     _safe_float(price),
                     json.dumps(open_position_state or {}, separators=(",", ":")) if open_position_state else None,
+                    str(dd.get("day_route_regime") or ""),
                 ),
             )
             conn.commit()

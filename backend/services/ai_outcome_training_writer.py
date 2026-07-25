@@ -163,6 +163,25 @@ def record_outcome_training_row(
         )
         ex = explainability or {}
         ingested = datetime.now(timezone.utc).isoformat()
+
+        # ROOT-CAUSE ATTRIBUTION FOR TRAINING: reuse day_outcome_attribution's
+        # classifier (already computed at close time for human/ops review) so the
+        # RF trainer can differentiate "bad setup" (learnable, up-weight) from
+        # "regime shift" / "feature health weak" (not an entry-quality lesson,
+        # down-weight) instead of treating every loss as the same binary signal.
+        # See ai_training_pipeline._outcome_exit_class_multiplier.
+        attribution_reason = ""
+        try:
+            from backend.services.day_outcome_attribution import classify_outcome_reason
+
+            attribution_reason = classify_outcome_reason(
+                explainability=ex,
+                net_profit_pct=net_profit_pct,
+                close_reason=close_reason,
+                hold_seconds=hold_seconds,
+            )
+        except Exception as attr_exc:
+            logger.debug("outcome_attribution_reason skipped symbol=%s: %s", symbol, attr_exc)
         with sqlite3.connect(db_path) as conn:
             cur = conn.execute(
                 """
@@ -234,6 +253,7 @@ def record_outcome_training_row(
                             "feature_health_score": ex.get("feature_health_score"),
                             "block_scores_json": ex.get("block_scores_json"),
                             "intelligence_rank_delta": ex.get("intelligence_rank_delta"),
+                            "outcome_attribution_reason": attribution_reason,
                         },
                         separators=(",", ":"),
                     ),

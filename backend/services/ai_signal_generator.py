@@ -181,6 +181,7 @@ class RealTimeAISignalGenerator:
         # Slot key = "<strategy_id>:<SYMBOL>" — two-strategy live path only (no generic artifact).
         self.models: dict[str, RandomForestClassifier] = {}
         self.scalers: dict[str, StandardScaler] = {}
+        self.calibrators: dict[str, Any] = {}
         self.model_artifact_paths: dict[str, str] = {}
         self.model_label_versions: dict[str, str] = {}
         self.model_label_horizons: dict[str, int] = {}
@@ -278,6 +279,7 @@ class RealTimeAISignalGenerator:
         logger.info("Loading per-strategy per-coin AI models from disk...")
         self.models.clear()
         self.scalers.clear()
+        self.calibrators.clear()
         self.model_artifact_paths.clear()
         self.model_label_versions.clear()
         self.model_label_horizons.clear()
@@ -347,6 +349,11 @@ class RealTimeAISignalGenerator:
 
                     self.models[slot] = coin_model
                     self.scalers[slot] = coin_scaler
+                    calibrator = model_data.get("confidence_calibrator")
+                    if calibrator is not None:
+                        self.calibrators[slot] = calibrator
+                    else:
+                        self.calibrators.pop(slot, None)
                     self.model_artifact_paths[slot] = str(model_path.resolve())
                     self.model_artifact_sha256[slot] = sha256_file(model_path)
                     self.model_label_versions[slot] = str(model_data.get("label_version", ""))
@@ -836,6 +843,19 @@ class RealTimeAISignalGenerator:
             prediction_idx = int(np.argmax(probs_list))
             prediction = ("SELL", "HOLD", "BUY")[prediction_idx]
             confidence = float(probs_list[prediction_idx])
+
+            # CONFIDENCE CALIBRATION: raw RF probability was never checked against
+            # actual win-rate. Replace BUY-side confidence with the isotonic mapping
+            # fit at train time on held-out validation accuracy, so a "0.75" means
+            # roughly a 75% historical hit-rate rather than an arbitrary tree vote.
+            calibrator = self.calibrators.get(slot)
+            if calibrator is not None and prediction == "BUY":
+                try:
+                    raw_buy_prob = float(model_probs.get("buy", confidence))
+                    calibrated_confidence = float(calibrator.predict([raw_buy_prob])[0])
+                    confidence = max(0.0, min(1.0, calibrated_confidence))
+                except Exception as cal_e:
+                    logger.debug("CONFIDENCE_CALIBRATION_APPLY_FAILED: %s %s", slot, cal_e)
 
             signal_decision_id = f"{strategy_id}_{symbol}_{int(time.time() * 1000)}"
 

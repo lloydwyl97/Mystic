@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_PROFIT_TO_SELL
+from backend.services.ai_regime_validation import blend_by_scalar, get_regime_validated_scalar
 from backend.services.day_trade_thesis import (
     EXIT_EXTREME_PROTECTION,
     EXIT_NET_PROFIT,
@@ -63,7 +64,8 @@ def effective_max_hold_min(position: Any, coin_profile: dict[str, Any] | None = 
         base = stamped or profile_hold or 300
     regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
     if regime == "bull":
-        base += _bull_hold_extension_min()
+        scalar, _ = get_regime_validated_scalar(regime)
+        base += int(round(_bull_hold_extension_min() * scalar))
     return base
 
 ALLOWED_DAY_EXIT_REASONS = frozenset(
@@ -369,7 +371,9 @@ def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dic
 
     regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
     if regime == "bull" and mfe_pct >= _bull_trail_mfe_threshold():
-        trail_pct = min(trail_pct * _bull_trail_multiplier(), 0.025)
+        scalar, _ = get_regime_validated_scalar(regime)
+        widened_trail_pct = min(trail_pct * _bull_trail_multiplier(), 0.025)
+        trail_pct = blend_by_scalar(trail_pct, widened_trail_pct, scalar)
 
     activation = entry * (1.0 + trail_pct)
     if highest < activation:
@@ -566,10 +570,17 @@ def evaluate_engine_managed_exit(
     if _pos_regime == "bull":
         # In bull regime require a deeper reversal before treating a pullback as a giveback —
         # normal bull noise can easily exceed the default -0.15% trigger on the way to target.
+        # Leniency is scaled by validated edge: if "bull" hasn't shown a real forward-return
+        # edge yet, blend back toward the standard (tighter) giveback thresholds.
         _highest = float(getattr(position, "highest_price", entry) or entry)
         _mfe = max(0.0, (_highest - entry) / entry) if entry > 0 else 0.0
-        _bull_mfe_thresh = float(os.getenv("DAY_BULL_GIVEBACK_MIN_MFE", "0.005"))
-        _bull_trigger = float(os.getenv("DAY_BULL_GIVEBACK_TRIGGER", "-0.003"))
+        _bull_scalar, _ = get_regime_validated_scalar(_pos_regime)
+        _bull_mfe_thresh = blend_by_scalar(
+            _giveback_min_mfe_pct(), float(os.getenv("DAY_BULL_GIVEBACK_MIN_MFE", "0.005")), _bull_scalar
+        )
+        _bull_trigger = blend_by_scalar(
+            _giveback_trigger_pnl_pct(), float(os.getenv("DAY_BULL_GIVEBACK_TRIGGER", "-0.003")), _bull_scalar
+        )
         if _mfe >= _bull_mfe_thresh and net_pnl_pct + 1e-12 <= _bull_trigger:
             giveback = {
                 "action": "sell",
@@ -594,7 +605,15 @@ def evaluate_engine_managed_exit(
     if int(getattr(position, "max_hold_min", 0) or 0) < max_hold:
         position.max_hold_min = max_hold
     _stall_regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
-    if _stall_regime != "bull":
+    # Full stall suppression is the strongest bull-regime bonus, so it requires the
+    # strongest evidence bar: only skip the stall check once the label has shown a
+    # real validated forward-return edge (scalar >= 0.7), not merely "not enough
+    # data yet" (scalar defaults to 1.0 pre-data — see AI_REGIME_VALIDATION_MIN_SAMPLES).
+    _stall_suppressed = False
+    if _stall_regime == "bull":
+        _stall_scalar, _ = get_regime_validated_scalar(_stall_regime)
+        _stall_suppressed = _stall_scalar >= 0.7
+    if not _stall_suppressed:
         stall = evaluate_stall_exit(
             entry_price=entry,
             highest_price=float(getattr(position, "highest_price", entry) or entry),
@@ -604,7 +623,8 @@ def evaluate_engine_managed_exit(
         )
         if stall is not None:
             return stall
-    # Bull regime: stall is suppressed — price consolidating before next leg is normal.
+    # Bull regime with validated edge: stall is suppressed — price consolidating
+    # before next leg is normal. Without validated edge, stall check still applies.
 
     if hold_minutes >= max_hold and net_pnl_pct + 1e-12 < float(MIN_NET_PROFIT_TO_SELL):
         if net_pnl_pct >= 0.0:

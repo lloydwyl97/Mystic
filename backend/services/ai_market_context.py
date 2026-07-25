@@ -13,6 +13,10 @@ for every traded symbol + BTC + ETH, fetches order book depth, and publishes:
        -- Liquidity tier (1..3) from notional volume
        -- Spread % and L10 depth imbalance
        -- Relative strength vs BTC and ETH (24h)
+       -- ``ctx_btc_dominance_proxy``: composite market-structure signal — TOP4
+          (BTC/ETH/SOL/XRP) green-breadth + real correlation-to-BTC + residual
+          volume-share, so a single symbol's context reflects whether the whole
+          traded universe agrees, not just BTC's volume share (2026-07-25).
        -- A coarse market regime label ("trending_up"/"trending_down"/"chop")
        -- A combined ctx_multiplier in [1 - CTX_TOTAL_CAP, 1 + CTX_TOTAL_CAP]
           that ai_signal_generator.py applies to winner_probability_raw.
@@ -45,7 +49,7 @@ from backend.config.day_active_timeframes import (
     DAY_ACTIVE_TIMEFRAMES,
 )
 from backend.config.redis_config import get_shared_redis_async
-from backend.config.trading_universe import TRADING_SYMBOLS, get_trading_symbols
+from backend.config.trading_universe import TOP4_BASE_COINS, TRADING_SYMBOLS, get_trading_symbols
 from backend.database_schema import DATABASE_PATH
 from backend.services.ai_canonical_storage import ensure_ai_canonical_tables
 from backend.services.ai_decision_contract import (
@@ -541,7 +545,16 @@ class AIMarketContextService:
                     logger.debug("AI_CONTEXT _fetch_24h %s failed: %s", sym, result)
                     all_24h[sym] = {"change_24h_pct": 0.0, "volume_24h_usd": 0.0}
         total_vol = sum(v.get("volume_24h_usd", 0.0) for v in all_24h.values()) or 1.0
-        btc_dom_proxy = all_24h["BTCUSDT"].get("volume_24h_usd", 0.0) / total_vol
+        btc_vol_share = all_24h["BTCUSDT"].get("volume_24h_usd", 0.0) / total_vol
+
+        # TOP4 MARKET BREADTH: fraction of the four DAY-traded coins (BTC/ETH/SOL/XRP)
+        # green on the day, in [0,1]. Real cross-coin structure, not a BTC-only proxy —
+        # closes the gap where a single BTC-derived regime label got stamped onto every
+        # symbol even when e.g. SOL is diverging from BTC (see ai_regime_validation.py /
+        # bull-regime tuning audit, 2026-07-25).
+        _top4_usdt = [f"{c}USDT" for c in TOP4_BASE_COINS]
+        _top4_changes = [all_24h[s]["change_24h_pct"] for s in _top4_usdt if s in all_24h]
+        top4_breadth = (sum(1.0 for c in _top4_changes if c > 0) / len(_top4_changes)) if _top4_changes else 0.5
 
         # Compute per-symbol relative volume baseline using BTC/ETH 24h volumes as anchor
         # (relative_volume here = symbol_vol / median_universe_vol)
@@ -630,6 +643,37 @@ class AIMarketContextService:
                 rel_vol = t24["volume_24h_usd"] / median_vol if median_vol > 0 else 0.0
                 liq_tier = _liquidity_tier(t24["volume_24h_usd"])
 
+                # TOP4 CORRELATION: real Pearson correlation of this symbol's 1h returns
+                # vs BTC's 1h returns over the recent window — genuine co-movement,
+                # distinct from relative strength (relative performance, not correlation).
+                corr_to_btc = 1.0
+                if symbol != "BTCUSDT" and btc_rows_1h and len(btc_rows_1h) >= 20:
+                    try:
+                        own_bundle_for_corr = await async_read_cached_day_active_bundle(_to_ccxt(symbol)) or {}
+                        own_rows_1h = own_bundle_for_corr.get("1h")
+                        if own_rows_1h and len(own_rows_1h) >= 20:
+                            n = min(len(own_rows_1h), len(btc_rows_1h), 60)
+                            own_closes = np.array([float(r[4]) for r in own_rows_1h[-n:]])
+                            btc_closes_corr = np.array([float(r[4]) for r in btc_rows_1h[-n:]])
+                            own_rets = np.diff(own_closes) / own_closes[:-1]
+                            btc_rets = np.diff(btc_closes_corr) / btc_closes_corr[:-1]
+                            if len(own_rets) >= 10 and np.std(own_rets) > 1e-12 and np.std(btc_rets) > 1e-12:
+                                corr_to_btc = float(np.corrcoef(own_rets, btc_rets)[0, 1])
+                                if not math.isfinite(corr_to_btc):
+                                    corr_to_btc = 0.0
+                    except Exception as corr_exc:
+                        logger.debug("AI_CONTEXT corr_to_btc %s failed: %s", symbol, corr_exc)
+                        corr_to_btc = 0.0
+
+                # Composite replacing the old pure-volume-share proxy: breadth (cross-coin
+                # agreement) + real correlation-to-BTC + a residual volume-share term for
+                # continuity. Same [0,1] range and field name as before — no feature-vector
+                # schema change, just a materially richer signal in the same slot.
+                market_structure_signal = max(
+                    0.0,
+                    min(1.0, 0.45 * top4_breadth + 0.30 * ((corr_to_btc + 1.0) / 2.0) + 0.25 * btc_vol_share),
+                )
+
                 multiplier, audit = _ctx_multiplier(
                     own_mtf=own_mtf,
                     rs_btc=rs_btc,
@@ -689,7 +733,9 @@ class AIMarketContextService:
                     "ctx_depth_imbalance": float(depth_imb),
                     "ctx_rs_btc": float(rs_btc),
                     "ctx_rs_eth": float(rs_eth),
-                    "ctx_btc_dominance_proxy": float(btc_dom_proxy),
+                    "ctx_btc_dominance_proxy": float(market_structure_signal),
+                    "ctx_top4_breadth": float(top4_breadth),
+                    "ctx_corr_to_btc": float(corr_to_btc),
                     "ctx_market_regime": str(market_regime),
                     "ctx_sentiment_fear_greed": float(self._sentiment_value),
                     "ctx_multiplier": float(multiplier),

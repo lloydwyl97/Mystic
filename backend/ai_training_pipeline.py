@@ -345,8 +345,50 @@ def _zero_learning_blocked_feature_dims(feats: list[float]) -> list[float]:
         return list(feats)
 
 
+# Root-cause -> training weight multiplier. Distinguishes a genuinely
+# learnable entry-quality lesson (bad setup, weak volume/volatility confirmation)
+# from noise the model should not blame on entry features (regime shift, a
+# market-wide reversal, or an entry that was already flagged unhealthy at the
+# time — training on that just teaches garbage-in). See day_outcome_attribution
+# .classify_outcome_reason for the source classification.
+_ATTRIBUTION_WEIGHT: dict[str, float] = {
+    "BAD_SETUP": 2.0,
+    "GOOD_SETUP_BAD_ENTRY": 1.8,
+    "VOLATILITY_EXPANSION_AGAINST_TRADE": 1.5,
+    "VOLUME_CONFIRMATION_FAILED": 1.5,
+    "SETUP_HISTORY_WEAK": 1.3,
+    "EXIT_TOO_LATE": 1.1,
+    "EXECUTION_COST_TOO_HIGH": 0.7,
+    "REGIME_SHIFT_AGAINST_TRADE": 0.6,
+    "MARKET_WIDE_REVERSAL": 0.6,
+    "FEATURE_HEALTH_WEAK": 0.4,
+}
+
+
+def _outcome_attribution_multiplier(row: dict[str, Any]) -> float | None:
+    """Look up the root-cause weight for a row's outcome_attribution_reason, if present."""
+    raw = row.get("score_components_json")
+    if not raw:
+        return None
+    try:
+        comps = json.loads(raw) if isinstance(raw, str) else raw
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(comps, dict):
+        return None
+    reason = str(comps.get("outcome_attribution_reason") or "").strip().upper()
+    return _ATTRIBUTION_WEIGHT.get(reason)
+
+
 def _outcome_exit_class_multiplier(row: dict[str, Any], y_label: int) -> float:
-    """Weight NET_PROFIT wins and STALL/GIVEBACK losses higher than flat noise exits."""
+    """Weight NET_PROFIT wins and STALL/GIVEBACK losses higher than flat noise exits.
+
+    Prefers the root-cause attribution weight when available (finer-grained than
+    the close_reason string alone); falls back to the original exit-reason rule.
+    """
+    attribution_mult = _outcome_attribution_multiplier(row)
+    if attribution_mult is not None:
+        return attribution_mult
     reason = str(row.get("close_reason") or row.get("outcome_class") or "").upper()
     if y_label == 1 and ("NET_PROFIT" in reason or reason.startswith("TP")):
         return 2.0
@@ -1586,6 +1628,32 @@ class AITrainingDataPipeline:
                         model.fit(X_train_s, y_train, sample_weight=w_train)
                         acc = model.score(X_val_s, y_val)
 
+                        # CONFIDENCE CALIBRATION: raw RF predict_proba is not a
+                        # reliable win-rate estimate (never checked against actual
+                        # outcomes before). Fit isotonic regression mapping raw
+                        # BUY-class probability -> empirical val-set accuracy, so
+                        # live "confidence" means something sizing can trust.
+                        calibrator = None
+                        try:
+                            if len(X_val_s) >= 10 and len(np.unique(y_val)) > 1 and 1 in model.classes_:
+                                from sklearn.isotonic import IsotonicRegression
+
+                                buy_col = list(model.classes_).index(1)
+                                raw_buy_probs = model.predict_proba(X_val_s)[:, buy_col]
+                                calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+                                calibrator.fit(raw_buy_probs, y_val)
+                                logger.info(
+                                    "CONFIDENCE_CALIBRATION_FIT: [%s] %s val_n=%d raw_mean=%.3f cal_mean=%.3f",
+                                    strat,
+                                    sym,
+                                    len(y_val),
+                                    float(np.mean(raw_buy_probs)),
+                                    float(np.mean(calibrator.predict(raw_buy_probs))),
+                                )
+                        except Exception as cal_e:
+                            logger.debug("CONFIDENCE_CALIBRATION_SKIPPED: [%s] %s (%s)", strat, sym, cal_e)
+                            calibrator = None
+
                         req_snap = required_edge_pct_for_strategy(strat)
                         t_frac, t_mfe = traction_params_for_strategy(strat)
                         _lah = label_horizon_bars_for_strategy(strat, sym)
@@ -1604,6 +1672,7 @@ class AITrainingDataPipeline:
                         artifact: dict[str, Any] = {
                             "model": model,
                             "scaler": scaler,
+                            "confidence_calibrator": calibrator,
                             "accuracy": acc,
                             "symbol": sym,
                             "feature_version": art_fv,
