@@ -180,33 +180,75 @@ class NewsDataIoCatalystProvider(CatalystProvider):
     """
     NewsData.io catalyst provider.
 
-    Uses the /api/1/crypto endpoint with the `coin` parameter.
+    Uses the /api/1/crypto endpoint with the `coin` parameter (free plan).
     Requires NEWSDATA_API_KEY in environment.
 
-    Daily limit management:
-      - Default cache TTL: 60 min per symbol (4 coins × 24 refreshes = 96 calls/day)
-      - Override via NEWSDATA_CACHE_TTL_SEC env var
-      - Graceful degradation on rate-limit (429) or network errors
+    Daily limit management (free plan = 200 calls/day):
+      - Cache TTL: 3600s (1h) per symbol
+      - 4 coins × 24 refreshes/day = 96 calls/day — safely within limit
+      - Override via NEWSDATA_CACHE_TTL_SEC
+      - Graceful 429 backoff with 1h rate-limit guard using stale cache
 
-    Scoring:
-      - Counts positive / negative / neutral article sentiments in the result set
-      - score = (positive - negative * 0.7) / max(total, 1), normalised to [0, 1]
+    Scoring (sentiment field requires paid plan — not available on free tier):
+      - Filter out duplicate articles (duplicate=true)
+      - Filter to articles actually tagged with this coin in their `coin` array
+      - Score titles using bullish/bearish keyword lists
+      - Weigh high-priority sources (lower source_priority number) more heavily
+      - score = (bullish_weighted - bearish_weighted * 0.7) / total_weight → [0, 1]
       - score > 0.55 → constructive catalyst lift in ranking_delta()
+
+    Category inference:
+      - Keyword matching on title + description + keywords array
+      - Per-coin category hint tables (regulatory for XRP, institutional for BTC, etc.)
     """
 
-    _COIN_CODES: dict[str, str] = {
-        "BTCUSDT": "bitcoin",
-        "ETHUSDT": "ethereum",
-        "SOLUSDT": "solana",
+    # NewsData.io `coin` parameter values (lowercase coin code)
+    _COIN_PARAMS: dict[str, str] = {
+        "BTCUSDT": "btc",
+        "ETHUSDT": "eth",
+        "SOLUSDT": "sol",
         "XRPUSDT": "xrp",
     }
-    _CATEGORY_HINTS: dict[str, dict[str, str]] = {
-        "XRPUSDT": {"regulatory": ["sec", "ripple", "lawsuit", "ruling", "etf", "approval"]},
-        "BTCUSDT": {"institutional": ["etf", "blackrock", "fidelity", "microstrategy", "institutional"]},
-        "ETHUSDT": {"protocol_upgrade": ["upgrade", "pectra", "dencun", "eip", "staking"]},
-        "SOLUSDT": {"partnership": ["solana", "sol", "meme", "memecoin", "nft"]},
+    # Uppercase coin codes as they appear in the article `coin` array
+    _COIN_TAGS: dict[str, str] = {
+        "BTCUSDT": "BTC",
+        "ETHUSDT": "ETH",
+        "SOLUSDT": "SOL",
+        "XRPUSDT": "XRP",
     }
-    # Shared class-level cache: {symbol: (result, cached_at_timestamp)}
+    _BULLISH_WORDS: frozenset[str] = frozenset({
+        "surge", "rally", "breakout", "bullish", "gains", "gained", "high", "target",
+        "approval", "approved", "etf", "institutional", "inflow", "inflows", "buy",
+        "bought", "accumulate", "launch", "upgrade", "partnership", "milestone",
+        "record", "adoption", "outperform", "strong", "support", "recover", "reclaim",
+        "positive", "optimistic", "growth", "rise", "rising", "jumped", "explode",
+        "moon", "upside", "momentum", "demand", "interest", "listing",
+    })
+    _BEARISH_WORDS: frozenset[str] = frozenset({
+        "crash", "drop", "fall", "fell", "sell", "bearish", "concern", "risk",
+        "warning", "exploit", "hack", "breach", "loss", "lose", "lawsuit", "ban",
+        "rejected", "decline", "dump", "plunge", "collapse", "vulnerability", "fraud",
+        "scam", "fear", "panic", "outflow", "outflows", "withdraw", "negative",
+        "pessimistic", "weak", "resistance", "struggle", "failed", "failure",
+    })
+    _CATEGORY_HINTS: dict[str, list[tuple[str, list[str]]]] = {
+        "XRPUSDT": [
+            ("regulatory", ["sec", "ripple", "lawsuit", "ruling", "etf", "approval", "rlusd", "regulatory"]),
+            ("etf_flow", ["etf", "inflow", "fund", "approval"]),
+        ],
+        "BTCUSDT": [
+            ("institutional", ["etf", "blackrock", "fidelity", "microstrategy", "institutional", "saylor", "strategy"]),
+            ("macro_event", ["fed", "interest rate", "inflation", "macro", "treasury", "reserve"]),
+        ],
+        "ETHUSDT": [
+            ("protocol_upgrade", ["upgrade", "pectra", "dencun", "eip", "staking", "merge", "layer"]),
+            ("etf_flow", ["etf", "inflow", "fund"]),
+        ],
+        "SOLUSDT": [
+            ("protocol_upgrade", ["upgrade", "v2", "network", "congestion", "validator"]),
+            ("partnership", ["partnership", "integration", "launch", "nft", "defi", "meme"]),
+        ],
+    }
     _CACHE: dict[str, tuple[CatalystResult, float]] = {}
     _RATE_LIMITED_UNTIL: float = 0.0
 
@@ -215,10 +257,24 @@ class NewsDataIoCatalystProvider(CatalystProvider):
         return "newsdata_io"
 
     def _cache_ttl(self) -> float:
-        return float(os.getenv("NEWSDATA_CACHE_TTL_SEC", "3600"))  # 60 min default
+        return float(os.getenv("NEWSDATA_CACHE_TTL_SEC", "3600"))
 
     async def is_available(self) -> bool:
         return bool(os.getenv("NEWSDATA_API_KEY"))
+
+    def _score_title(self, text: str) -> tuple[float, float]:
+        """Return (bullish_weight, bearish_weight) for a title string."""
+        words = set(text.lower().split())
+        bull = sum(1.0 for w in words if w in self._BULLISH_WORDS)
+        bear = sum(1.0 for w in words if w in self._BEARISH_WORDS)
+        return bull, bear
+
+    def _infer_category(self, sym: str, title: str, desc: str, keywords: list) -> str | None:
+        combined = " ".join(filter(None, [title, desc, " ".join(keywords or [])])).lower()
+        for cat_name, kw_list in self._CATEGORY_HINTS.get(sym, []):
+            if any(kw in combined for kw in kw_list):
+                return cat_name
+        return "unknown"
 
     async def get_catalyst_score(self, symbol: str) -> CatalystResult | None:
         sym = symbol.upper().replace("/", "")
@@ -226,122 +282,137 @@ class NewsDataIoCatalystProvider(CatalystProvider):
         if not api_key:
             return None
 
-        # Respect rate-limit backoff
+        # Rate-limit backoff: return stale cache or None
         if time.time() < self._RATE_LIMITED_UNTIL:
             cached = self._CACHE.get(sym)
             if cached:
                 r, _ = cached
                 return CatalystResult(
                     symbol=r.symbol, score=r.score, source=r.source,
-                    freshness_sec=int(time.time() - r.expires_at + self._cache_ttl()),
-                    confidence=r.confidence * 0.6,
+                    freshness_sec=int(time.time() - cached[1]),
+                    confidence=round(r.confidence * 0.5, 4),
                     category=r.category, direction=r.direction, headline=r.headline,
                     expires_at=r.expires_at, is_stale=True,
                 )
             return None
 
-        # Check in-memory cache
+        # In-memory cache hit
         cached = self._CACHE.get(sym)
         if cached and (time.time() - cached[1]) < self._cache_ttl():
-            result, _ = cached
-            freshness = int(time.time() - cached[1])
+            r, cached_at = cached
             return CatalystResult(
-                symbol=result.symbol, score=result.score, source=result.source,
-                freshness_sec=freshness, confidence=result.confidence,
-                category=result.category, direction=result.direction, headline=result.headline,
-                expires_at=result.expires_at, is_stale=False,
+                symbol=r.symbol, score=r.score, source=r.source,
+                freshness_sec=int(time.time() - cached_at),
+                confidence=r.confidence, category=r.category,
+                direction=r.direction, headline=r.headline,
+                expires_at=r.expires_at, is_stale=False,
             )
 
-        coin_code = self._COIN_CODES.get(sym)
-        if not coin_code:
+        coin_param = self._COIN_PARAMS.get(sym)
+        coin_tag = self._COIN_TAGS.get(sym)
+        if not coin_param:
             return None
 
-        # Fetch from NewsData.io crypto endpoint
         score: float | None = None
         direction: str | None = None
         headline: str | None = None
         category: str | None = None
-        confidence = 0.75
-        freshness = 0
+        freshness = 600
 
         try:
             import aiohttp
 
             params = {
                 "apikey": api_key,
-                "coin": coin_code,
-                "language": "english",
-                "timeframe": "48",
+                "coin": coin_param,
+                "language": "en",
+                "timezone": "America/Chicago",
             }
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                 async with session.get(
                     "https://newsdata.io/api/1/crypto",
                     params=params,
                     headers={"User-Agent": "Mystic/1.0"},
                 ) as resp:
                     if resp.status == 429:
-                        # Back off for 1 hour
                         NewsDataIoCatalystProvider._RATE_LIMITED_UNTIL = time.time() + 3600
-                        logger.warning("NEWSDATA_IO rate limited — backing off 1h")
+                        logger.warning("NEWSDATA_IO rate limited — backoff 1h, sym=%s", sym)
                         return None
                     if resp.status != 200:
                         logger.debug("NEWSDATA_IO %s HTTP %s", sym, resp.status)
                         return None
                     data = await resp.json()
 
-            articles: list[dict] = data.get("results", []) or []
-            if not articles:
-                return None
+            all_articles: list[dict] = data.get("results", []) or []
 
-            # Score from sentiment field (NewsData.io returns sentiment per article on paid plans)
-            pos = neg = neu = 0
+            # Filter: non-duplicate only
+            non_dup = [a for a in all_articles[:60] if not a.get("duplicate")]
+
+            # Sort by coin specificity: articles with fewer coins in their `coin` array
+            # are more specifically about this coin → surface them first
+            def _coin_specificity(art: dict) -> float:
+                tagged = a.get("coin") or []
+                if coin_tag not in tagged:
+                    return 999.0   # deprioritize articles not tagged with this coin
+                return float(len(tagged))   # fewer coins = more specific = lower score = sorts first
+
+            articles_tagged = [a for a in non_dup if coin_tag in (a.get("coin") or [])]
+            articles_tagged.sort(key=lambda a: len(a.get("coin") or []))
+
+            # Fall back to all non-dup if coin-tag filter is too strict (e.g., SOL)
+            articles = articles_tagged if articles_tagged else non_dup[:20]
+            if not articles:
+                articles = all_articles[:20]
+
+            # Source priority weighting: lower source_priority = higher authority
+            # Scale: priority 1000 → weight 2.0, priority 5_000_000 → weight 0.5
+            def _source_weight(art: dict) -> float:
+                prio = int(art.get("source_priority") or 5_000_000)
+                return max(0.5, min(2.0, 5_000_000 / max(prio, 1_000)))
+
+            total_bull = total_bear = total_w = 0.0
             top_headline: str | None = None
             top_pub_date: str | None = None
-            for art in articles[:20]:
-                sent = str(art.get("sentiment") or "").lower()
-                if sent == "positive":
-                    pos += 1
-                elif sent == "negative":
-                    neg += 1
-                else:
-                    neu += 1
-                if top_headline is None and art.get("title"):
-                    top_headline = str(art["title"])[:120]
-                    top_pub_date = art.get("pubDate") or art.get("publishedAt")
 
-            total = pos + neg + neu
-            if total == 0:
-                # No sentiment data — score by article count (proxy for interest level)
-                # Normalise: 0 articles = 0.5, 10+ = 0.65
-                score = min(0.65, 0.5 + len(articles) * 0.015)
-                direction = "neutral"
-                confidence = 0.4
-            else:
-                # Weighted: negative counts 0.7× (false alarms common)
-                raw_score = (pos - neg * 0.7) / total
-                score = round(max(0.0, min(1.0, 0.5 + raw_score * 0.5)), 4)
-                direction = "positive" if raw_score > 0.1 else ("negative" if raw_score < -0.1 else "neutral")
+            for art in articles:
+                title = str(art.get("title") or "")
+                w = _source_weight(art)
+                bull, bear = self._score_title(title)
+                total_bull += bull * w
+                total_bear += bear * w
+                total_w += w
+                if top_headline is None and title:
+                    top_headline = title[:120]
+                    top_pub_date = art.get("pubDate")
 
             headline = top_headline
 
-            # Category inference from headline keywords
-            hint_map = self._CATEGORY_HINTS.get(sym, {})
-            if headline:
-                hl_lower = headline.lower()
-                for cat_name, keywords in hint_map.items():
-                    if any(kw in hl_lower for kw in keywords):
-                        category = cat_name
-                        break
+            if total_w == 0:
+                score = 0.5
+                direction = "neutral"
+                confidence = 0.3
+            else:
+                raw = (total_bull - total_bear * 0.7) / total_w
+                score = round(max(0.0, min(1.0, 0.5 + raw * 0.25)), 4)
+                direction = "positive" if raw > 0.15 else ("negative" if raw < -0.15 else "neutral")
+                # Confidence scales with article count (more coverage = more reliable)
+                confidence = round(min(0.85, 0.55 + len(articles) * 0.005), 4)
 
-            if category is None:
-                category = "unknown"
+            # Category inference
+            if top_headline:
+                first_art = articles[0] if articles else {}
+                category = self._infer_category(
+                    sym,
+                    top_headline,
+                    str(first_art.get("description") or ""),
+                    first_art.get("keywords") or [],
+                )
 
-            # Freshness: age of most recent article (approximate)
-            freshness = 600  # default 10 min if pub_date unavailable
+            # Freshness from most recent article
             if top_pub_date:
                 with contextlib.suppress(Exception):
                     from datetime import datetime, timezone
-                    tnorm = str(top_pub_date).replace("Z", "+00:00").replace(" ", "T")
+                    tnorm = str(top_pub_date).replace(" ", "T")
                     t = datetime.fromisoformat(tnorm)
                     if t.tzinfo is None:
                         t = t.replace(tzinfo=timezone.utc)
@@ -360,7 +431,7 @@ class NewsDataIoCatalystProvider(CatalystProvider):
             source=self.name,
             freshness_sec=freshness,
             confidence=confidence,
-            category=category,
+            category=category or "unknown",
             direction=direction,
             headline=headline,
             expires_at=time.time() + self._cache_ttl(),
@@ -368,8 +439,8 @@ class NewsDataIoCatalystProvider(CatalystProvider):
         )
         NewsDataIoCatalystProvider._CACHE[sym] = (result_obj, time.time())
         logger.info(
-            "NEWSDATA_IO %s score=%.3f dir=%s cat=%s articles=%d pos=%d neg=%d",
-            sym, score, direction, category, len(articles), pos, neg,
+            "NEWSDATA_IO %s score=%.3f dir=%s cat=%s articles=%d bull=%.2f bear=%.2f fresh=%ds",
+            sym, score, direction, category, len(articles), total_bull, total_bear, freshness,
         )
         return result_obj
 
