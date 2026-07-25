@@ -1427,6 +1427,26 @@ class BinanceScalpPaperEngine:
             try:
                 from backend.services.trade_learning_writer import TradeLearningRecord, record_trade_outcome
 
+                _entry_diag = close_payload.get("entry_diag") or {}
+                if not isinstance(_entry_diag, dict):
+                    _entry_diag = {}
+                _exit_diag = close_payload.get("exit_diag") or {}
+                if not isinstance(_exit_diag, dict):
+                    _exit_diag = {}
+                _ctx_raw = _entry_diag.get("context_snapshot_json") or _entry_diag.get("context_snapshot")
+                _ctx_obj = None
+                if isinstance(_ctx_raw, dict):
+                    _ctx_obj = _ctx_raw
+                elif isinstance(_ctx_raw, str) and _ctx_raw.startswith("{"):
+                    with contextlib.suppress(Exception):
+                        _ctx_obj = json.loads(_ctx_raw)
+                _rank = {
+                    "strategy_id": str(close_payload["row"].get("strategy_id", "")),
+                    "setup": str(close_payload["row"].get("strategy_id", "")),
+                    "entry_score": _entry_diag.get("score") or _entry_diag.get("rank_score") or _entry_diag.get("selected_score"),
+                    "sig_passed": _entry_diag.get("sig_passed") if "sig_passed" in _entry_diag else _entry_diag.get("passed"),
+                    "regime": (_ctx_obj or {}).get("market_regime") if isinstance(_ctx_obj, dict) else None,
+                }
                 rec = TradeLearningRecord(
                     symbol=close_payload["sym"].replace("/", ""),
                     entry_timestamp=float(close_payload["row"].get("entry_time_epoch") or 0),
@@ -1441,11 +1461,28 @@ class BinanceScalpPaperEngine:
                     hold_seconds=close_payload["hold_seconds"],
                     decision_reason=close_payload["review_exit_reason"],
                     close_reason=close_payload["review_exit_reason"],
+                    confidence=float(_entry_diag.get("confidence") or 0.0) or None,
+                    rank_data=_rank,
+                    indicators_at_entry={
+                        "entry_diag": {k: _entry_diag.get(k) for k in list(_entry_diag)[:40]},
+                        "context_snapshot": _ctx_obj,
+                    },
+                    indicators_while_holding={
+                        "max_favorable_pct": _exit_diag.get("max_favorable_pct") or close_payload["row"].get("max_favorable_pct"),
+                        "max_adverse_pct": _exit_diag.get("max_adverse_pct") or close_payload["row"].get("max_adverse_pct"),
+                    },
+                    indicators_at_sell={
+                        "exit_diag": {k: _exit_diag.get(k) for k in list(_exit_diag)[:40]},
+                        "reason": close_payload.get("reason"),
+                        "spread_at_exit": close_payload.get("spread_at_exit"),
+                    },
+                    timeframes_used=["1m", "5m"],
                     extra={
                         "engine": "binance_scalp_paper",
                         "setup": str(close_payload["row"].get("strategy_id", "")),
                         "entry_notional": close_payload["entry_notional"],
                         "exit_notional": close_payload["exit_notional"],
+                        "context_snapshot": _ctx_obj,
                     },
                 )
                 record_trade_outcome(rec, db_path=self.config.database_path)

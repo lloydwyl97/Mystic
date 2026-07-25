@@ -4781,6 +4781,135 @@ class PortfolioEngine:
             }
             if legacy_close_reason:
                 extra_payload["legacy_close_reason"] = legacy_close_reason
+
+            # Enrich AI learning payload (rank + indicators). Previously only cooldown/extra
+            # were written, which left trade_learning_outcomes feature columns empty.
+            rank_data: dict[str, Any] | None = None
+            indicators_at_entry: dict[str, Any] | None = None
+            indicators_while_holding: dict[str, Any] | None = None
+            indicators_at_sell: dict[str, Any] | None = None
+            timeframes_used: list[str] | None = None
+            confidence_val: float | None = float(getattr(position, "confidence_at_entry", 0.0) or 0.0) or None
+            try:
+                tid = str(getattr(position, "trade_id", "") or "")
+                ex_payload: dict[str, Any] = {}
+                if tid and tid in self.trade_explanations:
+                    ex_payload = self.trade_explanations[tid].to_dict()
+                ctx_snap_obj: dict[str, Any] | None = None
+                buy_explain: dict[str, Any] | None = None
+                if tid:
+                    try:
+                        with sqlite3.connect(self.db_path) as _lc:
+                            _row = _lc.execute(
+                                """
+                                SELECT explainability_json, context_snapshot_json, decision_id, confidence
+                                FROM paper_trades
+                                WHERE trade_id = ? AND UPPER(side) = 'BUY'
+                                ORDER BY id DESC LIMIT 1
+                                """,
+                                (tid,),
+                            ).fetchone()
+                        if _row:
+                            if _row[0]:
+                                with contextlib.suppress(Exception):
+                                    buy_explain = json.loads(_row[0]) if isinstance(_row[0], str) else dict(_row[0] or {})
+                            if _row[1]:
+                                with contextlib.suppress(Exception):
+                                    ctx_snap_obj = json.loads(_row[1]) if isinstance(_row[1], str) else dict(_row[1] or {})
+                                    if isinstance(ctx_snap_obj, dict):
+                                        extra_payload["context_snapshot"] = ctx_snap_obj
+                            if not ex_payload and isinstance(buy_explain, dict):
+                                ex_payload = buy_explain
+                            if confidence_val is None and _row[3] is not None:
+                                confidence_val = float(_row[3])
+                            if _row[2] and not ex_payload.get("decision_id"):
+                                ex_payload = dict(ex_payload or {})
+                                ex_payload["decision_id"] = str(_row[2])
+                    except Exception:
+                        logger.debug("LEARNING_ENRICH_BUY_LOOKUP_FAILED symbol=%s", symbol, exc_info=True)
+
+                if ex_payload:
+                    rank_data = {
+                        "selected_rank": ex_payload.get("selected_rank") or ex_payload.get("final_selected_rank"),
+                        "selected_score": ex_payload.get("selected_score") or ex_payload.get("final_selection_score"),
+                        "raw_score": ex_payload.get("raw_score"),
+                        "adjusted_score": ex_payload.get("adjusted_score"),
+                        "composite_score": ex_payload.get("composite_score"),
+                        "ai_confidence": ex_payload.get("ai_confidence"),
+                        "net_expected_value": ex_payload.get("selected_net_expected_value"),
+                        "regime": ex_payload.get("regime"),
+                        "price_structure_regime": ex_payload.get("price_structure_regime"),
+                        "live_ai_strategy": ex_payload.get("live_ai_strategy") or "day",
+                        "why_selected": ex_payload.get("why_selected"),
+                        "score_components_json": ex_payload.get("score_components_json"),
+                        "peer_ranks_json": ex_payload.get("peer_ranks_json"),
+                        "intelligence_rank_delta": ex_payload.get("intelligence_rank_delta"),
+                        "decision_id": ex_payload.get("decision_id"),
+                    }
+                    if confidence_val is None and ex_payload.get("ai_confidence") is not None:
+                        confidence_val = float(ex_payload.get("ai_confidence") or 0.0) or None
+
+                entry_ts = float(getattr(position, "entry_time", 0.0) or 0.0)
+                opened_iso = datetime.fromtimestamp(entry_ts, tz=timezone.utc).isoformat() if entry_ts > 0 else None
+                decision_id = str((ex_payload or {}).get("decision_id") or getattr(position, "entry_decision_id", "") or "")
+                bus = normalize_symbol(symbol).replace("/", "").upper()
+                entry_feats = None
+                with contextlib.suppress(Exception):
+                    from backend.services.ai_post_trade_feature_review import _lookup_entry_features
+
+                    entry_feats = _lookup_entry_features(
+                        self.db_path,
+                        decision_id=decision_id,
+                        symbol=bus,
+                        opened_at_utc=opened_iso,
+                    )
+                    if entry_feats is None:
+                        entry_feats = _lookup_entry_features(
+                            self.db_path,
+                            decision_id=decision_id,
+                            symbol=normalize_symbol(symbol),
+                            opened_at_utc=opened_iso,
+                        )
+
+                indicators_at_entry = {
+                    "atr_at_entry": float(getattr(position, "atr_at_entry", 0.0) or 0.0) or None,
+                    "confidence_at_entry": float(getattr(position, "confidence_at_entry", 0.0) or 0.0) or None,
+                    "entry_thesis": str(getattr(position, "entry_thesis", "") or (ex_payload or {}).get("entry_thesis") or ""),
+                    "thesis_score": float(getattr(position, "thesis_score", 0.0) or (ex_payload or {}).get("thesis_score") or 0.0) or None,
+                    "entry_vwap": float(getattr(position, "entry_vwap", 0.0) or 0.0) or None,
+                    "day_route_regime_at_entry": str(getattr(position, "day_route_regime_at_entry", "") or ""),
+                    "price_structure_regime_at_entry": str(getattr(position, "price_structure_regime_at_entry", "") or ""),
+                    "signal_rsi_1m": (ex_payload or {}).get("signal_rsi_1m"),
+                    "signal_adx": (ex_payload or {}).get("signal_adx"),
+                    "signal_ranking_tf": (ex_payload or {}).get("signal_ranking_tf"),
+                    "features": entry_feats,
+                    "context_snapshot": ctx_snap_obj,
+                }
+                entry_px = float(entry_price or 0.0)
+                hi = float(getattr(position, "highest_price", 0.0) or 0.0)
+                lo = float(getattr(position, "lowest_price", 0.0) or 0.0)
+                indicators_while_holding = {
+                    "highest_price": hi or None,
+                    "lowest_price": lo or None,
+                    "mfe_pct": ((hi - entry_px) / entry_px) if entry_px > 0 and hi > 0 else None,
+                    "mae_pct": ((lo - entry_px) / entry_px) if entry_px > 0 and lo > 0 else None,
+                    "max_hold_min": int(getattr(position, "max_hold_min", 0) or 0) or None,
+                }
+                indicators_at_sell = {
+                    "exit_price": float(exit_price) if exit_price is not None else None,
+                    "close_reason": close_reason,
+                    "decision_mark_price": reporting.get("decision_mark_price"),
+                    "decision_mark_pnl_pct": reporting.get("decision_mark_pnl_pct"),
+                    "fees_usd": reporting.get("fees_usd"),
+                    "slippage_usd": reporting.get("slippage_usd"),
+                }
+                tf = str((ex_payload or {}).get("signal_ranking_tf") or getattr(position, "thesis_trend_tf", "") or "")
+                timeframes_used = ["1m", "5m", "15m", "1h", "4h"]
+                if tf and tf not in timeframes_used:
+                    timeframes_used = [tf, *timeframes_used]
+            except Exception:
+                logger.debug("LEARNING_ENRICH_FAILED symbol=%s", symbol, exc_info=True)
+
             record = TradeLearningRecord(
                 symbol=symbol,
                 entry_timestamp=float(getattr(position, "entry_time", 0.0) or 0.0) or None,
@@ -4788,9 +4917,17 @@ class PortfolioEngine:
                 entry_price=entry_price or None,
                 exit_price=float(exit_price) if exit_price is not None else None,
                 quantity=qty or None,
+                fees_paid=(float(reporting["fees_usd"]) if reporting.get("fees_usd") is not None else None),
+                slippage_cost=(float(reporting["slippage_usd"]) if reporting.get("slippage_usd") is not None else None),
                 net_profit_usd=(float(realized_profit) if realized_profit is not None else None),
                 net_profit_pct=net_pct,
                 decision_reason=dec_reason,
+                confidence=confidence_val,
+                rank_data=rank_data,
+                indicators_at_entry=indicators_at_entry,
+                indicators_while_holding=indicators_while_holding,
+                indicators_at_sell=indicators_at_sell,
+                timeframes_used=timeframes_used,
                 manual_sell_flag=manual_sell,
                 close_reason=close_reason,
                 dust_remaining_qty=float(dust_qty or 0.0),
