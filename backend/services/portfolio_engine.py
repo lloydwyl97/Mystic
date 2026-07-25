@@ -10766,6 +10766,32 @@ class PortfolioEngine:
         except Exception:
             pass
 
+        # TP1 PARTIAL EXIT: sell DAY_TP1_PARTIAL_PCT (default 50%) when price first
+        # reaches take_profit_1_price. The remaining half rides to TP2 / trailing stop.
+        # Allweather positions are already excluded above — only engine-managed positions.
+        _tp1_enabled = os.getenv("DAY_TP1_PARTIAL_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+        _tp1_pct = float(os.getenv("DAY_TP1_PARTIAL_PCT", "0.50"))
+        if _tp1_enabled and not getattr(position, "tp1_hit", False):
+            _tp1_price = float(getattr(position, "take_profit_1_price", 0) or 0)
+            if _tp1_price > 0 and current_price >= _tp1_price and net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL) * 0.45:
+                _partial_qty = quantity * _tp1_pct
+                if _partial_qty > 0:
+                    position.tp1_hit = True
+                    await self._persist_position_to_sqlite(position)
+                    logger.info(
+                        "TP1_PARTIAL_EXIT: %s price=%.6f tp1=%.6f partial_pct=%.0f%% net_pct=%.4f",
+                        symbol, current_price, _tp1_price, _tp1_pct * 100, net_pnl_pct,
+                    )
+                    return await self.execute_sell_fifo(
+                        symbol,
+                        _partial_qty,
+                        current_price,
+                        ExitType.TAKE_PROFIT_1,
+                        "TP1_PARTIAL_EXIT",
+                        current_bar=current_bar,
+                        force_sell=False,
+                    )
+
         if net_pnl_pct + 1e-12 < MIN_NET_PROFIT_TO_SELL:
             logger.debug(
                 "HOLD_PROFIT_NOT_ENOUGH symbol=%s net_pct=%.6f floor=%.6f",
