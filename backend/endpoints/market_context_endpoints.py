@@ -190,11 +190,9 @@ def _build_scalp_breakdown(sym: str) -> dict[str, Any]:
     live_adj = 0.0
     raw_delta = 0.0
     try:
-        from backend.services.market_role_intelligence import get_cached_role_context as _gcrc
-        _rctx = _gcrc(sym)
-        if _rctx is not None:
-            raw_delta = _rctx.live_ranking_delta()
-            live_adj = round(max(-0.04, min(0.04, raw_delta * (0.04 / 0.06))), 5)
+        from backend.services.market_role_intelligence import fetch_role_ranking_delta_from_redis as _frrd
+        raw_delta = _frrd(sym)
+        live_adj = round(max(-0.04, min(0.04, raw_delta * (0.04 / 0.06))), 5)
     except Exception:
         pass
 

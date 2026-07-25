@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -714,6 +715,16 @@ class BinanceScalpPaperEngine:
         if entry_intel.get("micro_regime"):
             entry_diag["micro_regime"] = entry_intel.get("micro_regime")
 
+        # Entry-time market-role context (Redis — cross-process; for learning attribution)
+        _role_ctx_snap = "{}"
+        try:
+            from backend.services.market_role_intelligence import get_role_context_snapshot_json
+
+            _role_ctx_snap = get_role_context_snapshot_json(sym) or "{}"
+        except Exception:
+            _role_ctx_snap = "{}"
+        entry_diag["context_snapshot_json"] = _role_ctx_snap
+
         conn.execute(
             """
             INSERT INTO scalp_paper_trades
@@ -745,6 +756,7 @@ class BinanceScalpPaperEngine:
                         "setup_name": sig.setup_name,
                         "rank_score": ranking_meta.get("rank_score"),
                         "selection_confidence": ranking_meta.get("selection_confidence"),
+                        "context_snapshot_json": _role_ctx_snap,
                     }
                 ),
             ),
@@ -1439,6 +1451,62 @@ class BinanceScalpPaperEngine:
                 record_trade_outcome(rec, db_path=self.config.database_path)
             except Exception as _lw_exc:
                 logger.debug("SCALP_LEARNING_WRITE_SKIPPED %s", _lw_exc)
+
+            # Market-role outcome learner (strategy=scalp) — uses BUY entry snapshot
+            try:
+                from backend.services.market_role_outcome_learner import record_trade_outcome as _role_learn
+
+                _entry_diag = close_payload.get("entry_diag") or {}
+                if not isinstance(_entry_diag, dict):
+                    _entry_diag = {}
+                _ctx_snap = _entry_diag.get("context_snapshot_json") or "{}"
+                if isinstance(_ctx_snap, dict):
+                    _ctx_snap = json.dumps(_ctx_snap, separators=(",", ":"), default=str)
+                _mfe = None
+                _mae = None
+                _exit_diag = close_payload.get("exit_diag") or {}
+                _row = close_payload.get("row") or {}
+                with contextlib.suppress(Exception):
+                    _mfe = float(
+                        (_exit_diag.get("max_favorable_pct") if isinstance(_exit_diag, dict) else None)
+                        or (_row.get("max_favorable_pct") if isinstance(_row, dict) else None)
+                        or _entry_diag.get("max_favorable_pct")
+                        or 0
+                    )
+                with contextlib.suppress(Exception):
+                    _mae = float(
+                        (_exit_diag.get("max_adverse_pct") if isinstance(_exit_diag, dict) else None)
+                        or (_row.get("max_adverse_pct") if isinstance(_row, dict) else None)
+                        or _entry_diag.get("max_adverse_pct")
+                        or 0
+                    )
+                _regime = "unknown"
+                with contextlib.suppress(Exception):
+                    _intel = json.loads(_ctx_snap) if isinstance(_ctx_snap, str) and _ctx_snap.startswith("{") else {}
+                    if isinstance(_intel, dict):
+                        _regime = str(_intel.get("market_regime") or "unknown")
+                # Prefer BUY trade_id from position row when available
+                _buy_tid = str(
+                    (_row.get("trade_id") if isinstance(_row, dict) else None)
+                    or close_payload.get("trade_id")
+                    or ""
+                )
+                _role_learn(
+                    self.config.database_path,
+                    trade_id=str(close_payload.get("trade_id") or "") + "_sell",
+                    buy_trade_id=_buy_tid,
+                    symbol=str(close_payload["sym"]).replace("/", ""),
+                    strategy="scalp",
+                    realized_pnl_pct=float(close_payload.get("net_pct") or 0.0),
+                    hold_seconds=int(close_payload.get("hold_seconds") or 0),
+                    exit_reason=str(close_payload.get("review_exit_reason") or close_payload.get("reason") or ""),
+                    mfe_pct=_mfe,
+                    mae_pct=_mae,
+                    market_regime=_regime,
+                    context_snapshot_json=str(_ctx_snap or "{}"),
+                )
+            except Exception as _role_exc:
+                logger.debug("SCALP_ROLE_LEARNING_SKIPPED %s", _role_exc)
 
         if post_commit is not None:
             post_commit.append(_after_commit)

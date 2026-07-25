@@ -433,7 +433,7 @@ async def compute_market_role_context(
 
 
 # ---------------------------------------------------------------------------
-# In-process cache (AI context loop → ranking reads without extra Redis round-trip)
+# In-process cache + Redis cross-process read
 # ---------------------------------------------------------------------------
 
 _role_cache: dict[str, MarketRoleContext] = {}
@@ -447,6 +447,7 @@ def cache_role_context(ctx: MarketRoleContext) -> None:
 
 
 def get_cached_role_context(symbol: str) -> MarketRoleContext | None:
+    """In-process cache only (same process as ai_market_context writer)."""
     sym = symbol.upper().replace("/", "")
     ctx = _role_cache.get(sym)
     if ctx is None:
@@ -457,17 +458,100 @@ def get_cached_role_context(symbol: str) -> MarketRoleContext | None:
     return ctx
 
 
-def get_role_ranking_delta(symbol: str, learned_adjustment: float = 0.0) -> float:
+def fetch_role_context_dict_from_redis(symbol: str) -> dict[str, Any] | None:
     """
-    Safe accessor for ranking code — returns 0.0 if context is unavailable or stale.
-    Optionally applies a learned_adjustment on top.
+    Cross-process safe: read ctx_role_intel_json from Redis ai_context:{symbol}.
+    Used by portfolio BUY snapshots and SCALP ranking (separate processes).
     Never raises.
     """
+    import json as _json
+
     try:
+        from backend.config.redis_config import get_shared_redis_sync
+        from backend.services.ai_decision_contract import REDIS_KEY_AI_CONTEXT
+
+        sym = symbol.upper().replace("/", "")
+        r = get_shared_redis_sync()
+        raw = r.hget(REDIS_KEY_AI_CONTEXT.format(symbol=sym), "ctx_role_intel_json")
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        if not raw or raw == "{}":
+            return None
+        data = _json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def fetch_role_ranking_delta_from_redis(symbol: str) -> float:
+    """
+    Read live ranking delta from Redis. Prefers top-level ctx_role_ranking_delta,
+    falls back to live_context_adjustment inside ctx_role_intel_json.
+    Never raises; returns 0.0 on miss.
+    """
+    try:
+        from backend.config.redis_config import get_shared_redis_sync
+        from backend.services.ai_decision_contract import REDIS_KEY_AI_CONTEXT
+
+        sym = symbol.upper().replace("/", "")
+        r = get_shared_redis_sync()
+        key = REDIS_KEY_AI_CONTEXT.format(symbol=sym)
+        top = r.hget(key, "ctx_role_ranking_delta")
+        if top is not None:
+            if isinstance(top, bytes):
+                top = top.decode("utf-8", errors="replace")
+            try:
+                v = float(top)
+                if abs(v) > 1e-12:
+                    return max(-0.06, min(0.06, v))
+            except (TypeError, ValueError):
+                pass
+        intel = fetch_role_context_dict_from_redis(sym)
+        if intel:
+            try:
+                v = float(intel.get("live_context_adjustment") or 0.0)
+                return max(-0.06, min(0.06, v))
+            except (TypeError, ValueError):
+                pass
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def get_role_context_snapshot_json(symbol: str) -> str:
+    """
+    Entry-time snapshot for BUY attribution.
+    Prefer Redis (cross-process), then in-process cache. Returns "{}" if unavailable.
+    """
+    import json as _json
+
+    try:
+        data = fetch_role_context_dict_from_redis(symbol)
+        if data:
+            return _json.dumps(data, separators=(",", ":"), default=str)
         ctx = get_cached_role_context(symbol)
-        if ctx is None:
-            return 0.0
-        return ctx.full_ranking_delta(learned_adjustment)
+        if ctx is not None:
+            return _json.dumps(ctx.to_dict(), separators=(",", ":"), default=str)
+    except Exception:
+        pass
+    return "{}"
+
+
+def get_role_ranking_delta(symbol: str, learned_adjustment: float = 0.0) -> float:
+    """
+    Safe accessor for ranking code — Redis first, then in-process cache.
+    Optionally applies a learned_adjustment on top. Never raises.
+    """
+    try:
+        live = fetch_role_ranking_delta_from_redis(symbol)
+        if abs(live) < 1e-12:
+            ctx = get_cached_role_context(symbol)
+            if ctx is not None:
+                live = ctx.live_ranking_delta()
+        total = live + float(learned_adjustment or 0.0)
+        return round(max(-0.08, min(0.08, total)), 4)
     except Exception:
         return 0.0
 
@@ -479,6 +563,9 @@ __all__ = [
     "_align_candles",
     "cache_role_context",
     "compute_market_role_context",
+    "fetch_role_context_dict_from_redis",
+    "fetch_role_ranking_delta_from_redis",
     "get_cached_role_context",
+    "get_role_context_snapshot_json",
     "get_role_ranking_delta",
 ]

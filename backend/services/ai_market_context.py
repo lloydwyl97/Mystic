@@ -673,7 +673,7 @@ class AIMarketContextService:
                         )
                         cache_role_context(role_ctx)
                         role_intel_json = json.dumps(role_ctx.to_dict(), separators=(",", ":"), default=str)
-                        role_ranking_delta = role_ctx.ranking_delta()
+                        role_ranking_delta = role_ctx.live_ranking_delta()
                     except Exception as role_exc:
                         logger.debug("AI_CONTEXT role_intel %s failed: %s", symbol, role_exc)
 

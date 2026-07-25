@@ -345,17 +345,8 @@ class NewsDataIoCatalystProvider(CatalystProvider):
 
             all_articles: list[dict] = data.get("results", []) or []
 
-            # Filter: non-duplicate only
+            # Filter: non-duplicate only; sort by coin specificity (fewer tags = more on-topic)
             non_dup = [a for a in all_articles[:60] if not a.get("duplicate")]
-
-            # Sort by coin specificity: articles with fewer coins in their `coin` array
-            # are more specifically about this coin → surface them first
-            def _coin_specificity(art: dict) -> float:
-                tagged = a.get("coin") or []
-                if coin_tag not in tagged:
-                    return 999.0   # deprioritize articles not tagged with this coin
-                return float(len(tagged))   # fewer coins = more specific = lower score = sorts first
-
             articles_tagged = [a for a in non_dup if coin_tag in (a.get("coin") or [])]
             articles_tagged.sort(key=lambda a: len(a.get("coin") or []))
 

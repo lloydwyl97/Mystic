@@ -325,15 +325,12 @@ def rank_setup_signal(
     role_samples = 0
     role_conf_status = "insufficient_data"
     with contextlib.suppress(Exception):
-        from backend.services.market_role_intelligence import get_cached_role_context as _gcrc
+        from backend.services.market_role_intelligence import fetch_role_ranking_delta_from_redis as _frrd
         from backend.services.market_role_outcome_learner import get_learning_stats as _gls
 
-        _rctx = _gcrc(sig.symbol)
-        if _rctx is not None:
-            # Scale live delta: SCALP base scores are 1.0–2.0+, so we use a
-            # proportional fraction of the ±0.06 DAY delta (target ±0.04 here).
-            _raw_delta = _rctx.live_ranking_delta()
-            live_ctx_adj = round(max(-0.04, min(0.04, _raw_delta * (0.04 / 0.06))), 5)
+        # Redis is cross-process (ai_market_context writes; scalp runner reads)
+        _raw_delta = _frrd(sig.symbol)
+        live_ctx_adj = round(max(-0.04, min(0.04, _raw_delta * (0.04 / 0.06))), 5)
 
         _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
         _stats = _gls(_db, sig.symbol, "scalp")
@@ -410,19 +407,13 @@ def pick_best_ranked(candidates: list[RankedCandidate]) -> RankedCandidate | Non
 def _role_ranking_delta(row: dict[str, Any]) -> float:
     """
     Market-role intelligence delta for SCALP tie-breaking.
-    Reads from the signal's ctx_role_ranking_delta field (published by ai_market_context).
-    Range: ±0.06.  Never used as a gate.
+    Reads Redis ai_context (cross-process). Range ±0.06. Never a gate.
     """
     sym = str(row.get("symbol") or "")
-    # Try signal fields first
-    sig = row.get("signal")
-    sig_delta = None
-    if sig is not None:
-        with contextlib.suppress(Exception):
-            from backend.services.market_role_intelligence import get_role_ranking_delta
-            sig_delta = get_role_ranking_delta(sym)
-    if sig_delta is not None:
-        return max(-0.06, min(0.06, sig_delta))
+    with contextlib.suppress(Exception):
+        from backend.services.market_role_intelligence import fetch_role_ranking_delta_from_redis
+
+        return max(-0.06, min(0.06, fetch_role_ranking_delta_from_redis(sym)))
     return 0.0
 
 

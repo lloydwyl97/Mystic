@@ -853,6 +853,26 @@ class BuyCandidate:
             live_role_delta = float((self.decision_data or {}).get("ctx_role_ranking_delta") or 0.0)
         except (TypeError, ValueError):
             live_role_delta = 0.0
+        # Fallback: nested intel JSON (covers stale zero top-level delta)
+        if abs(live_role_delta) < 1e-12:
+            try:
+                raw_intel = (self.decision_data or {}).get("ctx_role_intel_json")
+                if isinstance(raw_intel, str) and raw_intel and raw_intel != "{}":
+                    _intel = json.loads(raw_intel)
+                    live_role_delta = float(_intel.get("live_context_adjustment") or 0.0)
+                elif isinstance(raw_intel, dict):
+                    live_role_delta = float(raw_intel.get("live_context_adjustment") or 0.0)
+            except Exception:
+                pass
+        if abs(live_role_delta) < 1e-12:
+            try:
+                from backend.services.market_role_intelligence import fetch_role_ranking_delta_from_redis as _frrd
+
+                _sym_r = str((self.decision_data or {}).get("symbol") or getattr(self, "symbol", "") or "")
+                if _sym_r:
+                    live_role_delta = _frrd(_sym_r)
+            except Exception:
+                pass
         live_role_delta = max(-0.06, min(0.06, live_role_delta))
         # Market-role learned adjustment from outcome history (additional ±0.02)
         learned_role_delta = 0.0
@@ -7427,12 +7447,11 @@ class PortfolioEngine:
         buy_mode = "live" if is_live_execution_allowed_sync() else "paper"
         buy_strategy_id = str(getattr(explainability, "live_ai_strategy", "") or "").strip() or None
 
-        # Snapshot role context at entry time for learning attribution
+        # Snapshot role context at entry time (Redis — cross-process safe)
         try:
-            from backend.services.market_role_intelligence import get_cached_role_context as _get_role_ctx
+            from backend.services.market_role_intelligence import get_role_context_snapshot_json as _role_snap
 
-            _role_ctx = _get_role_ctx(symbol) or _get_role_ctx(symbol.replace("/", "").upper())
-            _ctx_snapshot = json.dumps(_role_ctx.to_dict(), separators=(",", ":"), default=str) if _role_ctx else "{}"
+            _ctx_snapshot = _role_snap(symbol) or "{}"
         except Exception:
             _ctx_snapshot = "{}"
 
@@ -8069,12 +8088,11 @@ class PortfolioEngine:
         exp_dict = explainability.to_dict()
         exp_dict.update(repair_meta)
 
-        # Snapshot role context at repair-add entry time
+        # Snapshot role context at repair-add entry time (Redis — cross-process safe)
         try:
-            from backend.services.market_role_intelligence import get_cached_role_context as _gcrc_ra
+            from backend.services.market_role_intelligence import get_role_context_snapshot_json as _role_snap_ra
 
-            _rctx = _gcrc_ra(normalized_symbol) or _gcrc_ra(normalized_symbol.replace("/", "").upper())
-            _repair_ctx_snap = json.dumps(_rctx.to_dict(), separators=(",", ":"), default=str) if _rctx else "{}"
+            _repair_ctx_snap = _role_snap_ra(normalized_symbol) or "{}"
         except Exception:
             _repair_ctx_snap = "{}"
 
