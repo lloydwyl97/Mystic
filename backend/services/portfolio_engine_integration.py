@@ -971,6 +971,11 @@ class PortfolioEngineIntegration:
                         "candle_upper_wick_pct": _dig_float(dd, "candle_upper_wick_pct", 0.0),
                         "candle_lower_wick_pct": _dig_float(dd, "candle_lower_wick_pct", 0.0),
                         "candle_body_pct": _dig_float(dd, "candle_body_pct", 0.0),
+                        # RF/GBM disagreement computed in ai_signal_generator.py — was missing
+                        # from this whitelist so it never reached candidate.decision_data,
+                        # ai_candidate_snapshots, the AI ranking dashboard panel, or the
+                        # meta-labeling feature vector (see 2026-07-26 recheck).
+                        "model_disagreement": _dig_float(dd, "model_disagreement", 0.0),
                     }
 
                     # If Mystic already holds this symbol, drop the candidate.
