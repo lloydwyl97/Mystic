@@ -214,9 +214,19 @@ def _liquidity_tier(volume_usd: float) -> int:
     return 0
 
 
-def _market_regime_from_btc(btc_mtf: dict[str, dict[str, float]]) -> str:
-    h1 = btc_mtf.get("1h", {})
-    h4 = btc_mtf.get("4h", {})
+def _market_regime_from_mtf(mtf: dict[str, dict[str, float]]) -> str:
+    """Classify trend regime (trending_up/trending_down/chop) from a 1h+4h MTF pack.
+
+    Works on ANY symbol's own MTF snapshot — originally BTC-only (hence the old
+    name), which meant every symbol inherited BTC's regime label even when its
+    own chart was clearly breaking out independently of BTC (e.g. ETH running
+    while BTC chops). Now called once per symbol with that symbol's own_mtf so
+    each coin is judged on its own trend (see 2026-07-26 "misses breakouts"
+    investigation). Still called with btc_mtf for the broad/BTC-wide regime used
+    by market-role classification, where a BTC-wide view is the correct input.
+    """
+    h1 = mtf.get("1h", {})
+    h4 = mtf.get("4h", {})
     score = 0
     for snap in (h1, h4):
         t = snap.get("trend", 0.5)
@@ -531,7 +541,10 @@ class AIMarketContextService:
             self._fetch_24h("BTCUSDT"),
             self._fetch_24h("ETHUSDT"),
         )
-        market_regime = _market_regime_from_btc(btc_mtf)
+        # Broad/BTC-wide regime — kept for market-role classification, which needs a
+        # market-wide reference point to judge whether a coin is leading/lagging.
+        broad_market_regime = _market_regime_from_mtf(btc_mtf)
+        market_regime = broad_market_regime  # back-compat local name used below
 
         # Universe 24h: parallel for remaining symbols (BTC/ETH already fetched)
         all_24h: dict[str, dict[str, float]] = {"BTCUSDT": btc_24h, "ETHUSDT": eth_24h}
@@ -632,6 +645,10 @@ class AIMarketContextService:
             sym_t0 = time.perf_counter()
             try:
                 own_mtf = mtf_by_sym[symbol]
+                # Per-symbol regime: this coin's own 1h/4h trend, not a copy of BTC's.
+                # BTC's own regime is reused as-is here (own_mtf IS btc_mtf for BTCUSDT),
+                # so this is a superset of the old behavior, not a divergence for BTC itself.
+                symbol_regime = broad_market_regime if symbol == "BTCUSDT" else _market_regime_from_mtf(own_mtf)
                 t24 = all_24h.get(symbol, {"change_24h_pct": 0.0, "volume_24h_usd": 0.0})
                 spread_pct, depth_imb = depth_by_sym[symbol]
 
@@ -679,7 +696,7 @@ class AIMarketContextService:
                     rs_btc=rs_btc,
                     rs_eth=rs_eth,
                     depth_imbalance=depth_imb,
-                    market_regime=market_regime,
+                    market_regime=symbol_regime,
                 )
 
                 # ------------------------------------------------------------------
@@ -736,7 +753,8 @@ class AIMarketContextService:
                     "ctx_btc_dominance_proxy": float(market_structure_signal),
                     "ctx_top4_breadth": float(top4_breadth),
                     "ctx_corr_to_btc": float(corr_to_btc),
-                    "ctx_market_regime": str(market_regime),
+                    "ctx_market_regime": str(symbol_regime),
+                    "ctx_broad_market_regime": str(broad_market_regime),
                     "ctx_sentiment_fear_greed": float(self._sentiment_value),
                     "ctx_multiplier": float(multiplier),
                     "mtf_json": json.dumps(own_mtf, separators=(",", ":")),
