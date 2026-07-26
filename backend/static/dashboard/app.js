@@ -1,5 +1,5 @@
 // Mystic Operator Console — dual-engine DAY + SCALP dashboard
-const DASHBOARD_VERSION = 54;
+const DASHBOARD_VERSION = 55;
 const REFRESH_MS = 90000;
 const CANONICAL_REFRESH_MS = 30000;
 const SECONDARY_POLL_MS = 3000;
@@ -16,6 +16,10 @@ const LAZY_TAB_ENDPOINTS = {
     learning: [
         { path: "/api/ai-diagnostics/full", key: "aiDiagnosticsFull", timeoutMs: SLOW_ENDPOINT_TIMEOUT_MS },
         { path: "/api/ai-diagnostics/learning-health", key: "learningHealth" },
+        // SCALP learning summary card's markup lives in the Learning tab, but it was
+        // only ever fetched via LAZY_TAB_ENDPOINTS.scalp — opening Learning before
+        // ever visiting SCALP left the card permanently empty. Fetch it here too.
+        { path: "/api/scalp/learning-summary", key: "scalpLearning" },
     ],
     // Feature health panel lives under Settings — load diagnostics when that tab opens.
     settings: [
@@ -26,6 +30,7 @@ const LAZY_TAB_ENDPOINTS = {
         { path: "/api/portfolio-engine/day-health", key: "dayHealth" },
         { path: "/api/portfolio-engine/decisions", key: "decisions" },
         { path: "/api/portfolio-engine/rejects", key: "rejects" },
+        { path: "/api/portfolio-engine/ai-signals-panel", key: "aiSignalsPanel" },
     ],
     scalp: [
         { path: "/api/scalp/status", key: "scalpStatus", timeoutMs: SCALP_STATUS_TIMEOUT_MS },
@@ -166,6 +171,7 @@ function init() {
     initTabs();
     startPolling();
     startMarketReadinessPolling();
+    startActiveTabRefresh();
     updateHeaderMeta();
     setInterval(updateHeaderMeta, 1000);
     initModeSwitch();
@@ -235,12 +241,19 @@ function markDashboardLoading(loading) {
     });
 }
 
+// Tracks whichever tab is currently open so its lazy endpoints (only fetched once
+// on click, see below) can be kept fresh by a repeating interval instead of going
+// stale the moment the initial poll ages out.
+let activeLazyTab = "command";
+const ACTIVE_TAB_REFRESH_MS = 20000;
+
 function initTabs() {
     const buttons = document.querySelectorAll(".console-tabs__btn");
     buttons.forEach(function (btn) {
         btn.addEventListener("click", function () {
             const tab = btn.getAttribute("data-tab");
             if (!tab) return;
+            activeLazyTab = tab;
             buttons.forEach(function (b) {
                 b.classList.toggle("console-tabs__btn--active", b === btn);
             });
@@ -261,6 +274,20 @@ function initTabs() {
             }
         });
     });
+}
+
+// Lazy tab endpoints only fire once, at the moment a tab is opened — a user who
+// leaves e.g. SCALP Engine or Learning open for several minutes would otherwise
+// keep looking at an increasingly stale first snapshot. Re-poll whichever tab's
+// endpoints are currently on screen on a fixed cadence for as long as it stays open.
+function startActiveTabRefresh() {
+    setInterval(function () {
+        const lazy = LAZY_TAB_ENDPOINTS[activeLazyTab];
+        if (!lazy || !lazy.length) return;
+        lazy.forEach(function (ep, i) {
+            setTimeout(function () { pollOne(ep); }, i * 400);
+        });
+    }, ACTIVE_TAB_REFRESH_MS);
 }
 
 function initTradeFilters() {
@@ -775,8 +802,12 @@ let lastUpdateTime = null;
 async function pollOne(ep) {
     const result = await fetchEndpoint(ep.path, ep.timeoutMs);
     if (!result.ok) {
+        // Generic freshness tracking for every polled endpoint (was previously only
+        // recorded for perfDisplayContext) — feeds the header "Data" health badge so
+        // silent background-poll failures are visible instead of just leaving a card
+        // stuck on its last-good value with no indication anything is wrong.
+        recordEndpointFreshness(ep.key, false);
         if (ep.key === "perfDisplayContext") {
-            recordEndpointFreshness("perfDisplayContext", false);
             updateCurrentAccountSourceLabel(window._perfDisplayContext);
         }
         if (ep.key === "dashboardCanonical") {
@@ -795,6 +826,8 @@ async function pollOne(ep) {
     if (ep.key === "perfDisplayContext") {
         const ctx = (data.data && data.data.ledger_principal != null) ? data.data : data;
         recordEndpointFreshness("perfDisplayContext", true, ctx && ctx.last_updated);
+    } else {
+        recordEndpointFreshness(ep.key, true);
     }
     lastUpdateTime = new Date();
     try {
@@ -804,10 +837,67 @@ async function pollOne(ep) {
     }
 }
 
+// Endpoints polled continuously in the background with no visible loading state —
+// exactly the ones where a silent failure would otherwise be invisible to the
+// operator. Lazy tab-click endpoints are excluded: those already show "--"/"Loading…"
+// placeholders when empty, which is itself a (weaker) visible signal.
+const DATA_HEALTH_TRACKED_KEYS = BACKGROUND_ENDPOINTS.map(function (e) { return e.key; }).concat([CANONICAL_ENDPOINT.key]);
+
+function computeDataHealth() {
+    const now = Date.now();
+    let failed = 0;
+    let stale = 0;
+    let fresh = 0;
+    const badKeys = [];
+    DATA_HEALTH_TRACKED_KEYS.forEach(function (key) {
+        const st = ENDPOINT_FRESHNESS[key];
+        if (!st) return; // not polled yet (startup) — don't count against health
+        if (!st.ok) {
+            failed += 1;
+            badKeys.push(key + ": failing");
+            return;
+        }
+        const maxAge = key === CANONICAL_ENDPOINT.key ? CANONICAL_REFRESH_MS * 3 : SECONDARY_POLL_MS * DATA_HEALTH_TRACKED_KEYS.length * 3;
+        const age = now - st.at;
+        if (age > maxAge) {
+            stale += 1;
+            badKeys.push(key + ": stale " + Math.round(age / 1000) + "s");
+            return;
+        }
+        fresh += 1;
+    });
+    return { failed: failed, stale: stale, fresh: fresh, badKeys: badKeys, total: DATA_HEALTH_TRACKED_KEYS.length };
+}
+
+function updateDataHealthBadge() {
+    const el = document.getElementById("data-health-badge");
+    if (!el) return;
+    const h = computeDataHealth();
+    el.classList.remove("header__system--ok", "header__system--warning", "header__system--critical", "header__system--unknown");
+    if (h.failed === 0 && h.stale === 0 && h.fresh === 0) {
+        el.classList.add("header__system--unknown");
+        el.textContent = "Data: --";
+        el.title = "Background feeds not polled yet";
+        return;
+    }
+    if (h.failed > 0) {
+        el.classList.add("header__system--critical");
+        el.textContent = "Data: " + h.failed + " failing";
+    } else if (h.stale > 0) {
+        el.classList.add("header__system--warning");
+        el.textContent = "Data: " + h.stale + " stale";
+    } else {
+        el.classList.add("header__system--ok");
+        el.textContent = "Data: OK (" + h.fresh + "/" + h.total + ")";
+    }
+    el.title = h.badKeys.length ? h.badKeys.join(" | ") : "All " + h.total + " background feeds fresh";
+}
+
 function updateHeaderMeta() {
     const meta = document.getElementById("header-meta");
     if (meta) meta.textContent = "Last update: " + (lastUpdateTime ? lastUpdateTime.toLocaleTimeString() : "--");
     updateCurrentAccountSourceLabel(window._perfDisplayContext);
+    updateDataHealthBadge();
 }
 
 function updateUI(key, data, stale) {
@@ -859,6 +949,9 @@ function updateUI(key, data, stale) {
             break;
         case "decisions":
             updateDecisions(data);
+            break;
+        case "aiSignalsPanel":
+            updateAiSignalsPanel(data);
             break;
         case "systemHealthFull":
             updateSystemHealthFull(data);
@@ -1360,14 +1453,38 @@ function updateProcessHealth(res) {
     refreshEnginesPanelFromCache();
 }
 
+// Public read-only feed for the MarketLens education platform (see
+// public_mystic_endpoints.py). Was a raw JSON dump; now surfaced as readable cards
+// with the raw payload still available in a collapsible details panel.
 function updateMarketLensFeed(res) {
     const pre = document.getElementById("ml-feed-pre");
-    if (!pre) return;
-    try {
-        pre.textContent = JSON.stringify(res || {}, null, 2);
-    } catch (_e) {
-        pre.textContent = "--";
+    if (pre) {
+        try {
+            pre.textContent = JSON.stringify(res || {}, null, 2);
+        } catch (_e) {
+            pre.textContent = "--";
+        }
     }
+    const d = res || {};
+    const summary = d.summary || {};
+    const regime = d.regime || {};
+    const decisions = d.decisions || {};
+    const learning = d.learning || {};
+    const engines = summary.engines || {};
+    const dayDecision = decisions.day || {};
+    const scalpDecision = decisions.scalp || {};
+    const set = setCardText;
+    set("ml-system-state", summary.system_state || "--");
+    set("ml-day-engine", engines.day || "--");
+    set("ml-scalp-engine", engines.scalp || "--");
+    set("ml-redis", summary.redis || "--");
+    set("ml-fear-greed", regime.fear_greed_label || "--");
+    set("ml-day-idle", dayDecision.idle_reason || "--");
+    set("ml-day-open", dayDecision.open_positions != null ? String(dayDecision.open_positions) : "--");
+    set("ml-scalp-blocker", scalpDecision.top_blocker || "--");
+    set("ml-day-learning", learning.day_learning_rows != null ? String(learning.day_learning_rows) : "--");
+    set("ml-scalp-learning", learning.scalp_closed_roundtrips != null ? String(learning.scalp_closed_roundtrips) : "--");
+    set("ml-feed-ts", d.timestamp ? String(d.timestamp).replace("T", " ").slice(0, 19) + " UTC" : "--");
 }
 
 function refreshCommandCenter() {
@@ -1443,8 +1560,13 @@ function updateTradingEconomics(res) {
     set("te-baseline-lock", d.baseline_lock_id || "--");
 
     const ver = d.binance_us_verification || {};
-    const conclusion = ver.conclusion || d.fee_schedule_note || "--";
-    set("te-tier-note", "BTC, ETH, SOL, XRP · Adv. Spot (0.02% taker)", { title: conclusion });
+    const conclusion = ver.conclusion || d.fee_schedule_note || "";
+    // Was always showing a hardcoded "Adv. Spot (0.02% taker)" string and burying the
+    // live-verified conclusion in a hover title. Show the live conclusion when the
+    // backend has one; fall back to the static description only when it doesn't.
+    set("te-tier-note", conclusion || "BTC, ETH, SOL, XRP · Adv. Spot (0.02% taker)", {
+        title: conclusion ? "BTC, ETH, SOL, XRP · Adv. Spot (0.02% taker)" : "No live fee-tier verification available",
+    });
 
     const pre = document.getElementById("panel-trading-economics-content");
     if (pre) {
@@ -1618,6 +1740,36 @@ function updateDayPositionsTable(positions) {
             (p.rs_rank != null ? String(p.rs_rank) : "--") + "</td><td>" +
             (p.net_pct != null ? (Number(p.net_pct) * 100).toFixed(2) + "%" : "--") + "</td><td>" +
             (p.best_alternate_symbol || "--") + "</td></tr>";
+    }).join("");
+}
+
+/** Live per-symbol AI ranking signals — model disagreement, chart pattern, cross-sectional
+ * rank delta, setup score, meta-labeling trust — from ai_candidate_snapshots (most recent
+ * row per symbol). See ai_blended_classifier.py, day_chart_pattern_detector.py,
+ * day_cross_sectional_ranking.py, ai_meta_labeling.py. Advisory-only nudges, not gates. */
+function updateAiSignalsPanel(res) {
+    const tbody = document.getElementById("ai-signals-tbody");
+    if (!tbody) return;
+    const d = (res && res.data) ? res.data : res;
+    const rows = d && Array.isArray(d.per_symbol) ? d.per_symbol : [];
+    if (!rows.length) {
+        tbody.innerHTML = "<tr><td colspan=\"10\">No AI signal data.</td></tr>";
+        return;
+    }
+    tbody.innerHTML = rows.map(function (r) {
+        if (!r.available) {
+            return "<tr><td>" + (r.symbol || "") + "</td><td colspan=\"9\">No snapshot yet</td></tr>";
+        }
+        const disagreement = r.model_disagreement != null ? Number(r.model_disagreement).toFixed(3) : "--";
+        const pattern = r.chart_pattern_label ? r.chart_pattern_label + " (" + Number(r.chart_pattern_score || 0).toFixed(2) + ")" : "--";
+        const crossRank = r.cross_sectional_rank_delta != null ? Number(r.cross_sectional_rank_delta).toFixed(3) : "--";
+        const setup = r.setup_score != null ? Number(r.setup_score).toFixed(3) : "--";
+        const metaTrust = r.meta_trust_multiplier != null ? Number(r.meta_trust_multiplier).toFixed(3) : "--";
+        const conf = r.confidence != null ? Number(r.confidence).toFixed(3) : "--";
+        const asOf = r.as_of ? String(r.as_of).replace("T", " ").slice(0, 19) : "--";
+        return "<tr><td>" + r.symbol + "</td><td>" + (r.decision || "--") + "</td><td>" + conf + "</td><td>" +
+            (r.day_route_regime || "--") + "</td><td>" + disagreement + "</td><td>" + pattern + "</td><td>" +
+            crossRank + "</td><td>" + setup + "</td><td>" + metaTrust + "</td><td class='mono'>" + asOf + "</td></tr>";
     }).join("");
 }
 
@@ -2000,6 +2152,12 @@ function updateLiveReadiness(res) {
     refreshCommandCenter();
 }
 
+function _fmtModelNum(v) {
+    if (v == null) return "?";
+    const n = Number(v);
+    return isFinite(n) ? n.toFixed(3) : "?";
+}
+
 function updateModelPanel(res) {
     const el = document.getElementById("panel-model-content");
     if (!el) return;
@@ -2015,6 +2173,20 @@ function updateModelPanel(res) {
             " active_acc=" + (m.active_accuracy != null ? m.active_accuracy : "?") +
             " holdout_n=" + (m.holdout_sample_count != null ? m.holdout_sample_count : "?") +
             " low_conf=" + (m.holdout_low_confidence ? "yes" : "no"));
+        // Model diversity + calibration provenance (see ai_blended_classifier.py,
+        // ai_training_pipeline.py). blend_status "rf_only" means GBM training was
+        // skipped or failed (thin data) and the active model fell back to pure RF.
+        const blendStatus = m.blend_status || "unknown";
+        let blendLine = "  blend=" + blendStatus;
+        if (blendStatus === "blended") {
+            blendLine += " (rf_acc=" + _fmtModelNum(m.rf_val_acc) + " w=" + _fmtModelNum(m.blend_w_rf) +
+                ", gbm_acc=" + _fmtModelNum(m.gbm_val_acc) + " w=" + _fmtModelNum(m.blend_w_gbm) + ")";
+        }
+        blendLine += " | calibrated=" + (m.confidence_calibrated ? "yes" : "no");
+        lines.push(blendLine);
+        if (Array.isArray(m.feature_importance_weakest) && m.feature_importance_weakest.length) {
+            lines.push("  weak_features: " + m.feature_importance_weakest.slice(0, 8).join(", "));
+        }
         if (m.candidate_always_buy) lines.push("  candidate ALWAYS_BUY");
         if (m.candidate_always_hold) lines.push("  candidate ALWAYS_HOLD");
         if (m.promotion_rejection_reason) lines.push("  reason: " + m.promotion_rejection_reason);
@@ -2028,11 +2200,20 @@ function updateFeatureHealthPanel(res) {
     const d = (res && res.data) ? res.data : res;
     if (!d) { el.textContent = "No diagnostics."; return; }
     try {
+        // Was silently discarding everything but 3 keys from /api/ai-diagnostics/full —
+        // sentiment, feature importance, regime performance, and outcome quality were
+        // already fetched and computed but never shown anywhere on the dashboard.
         el.textContent = JSON.stringify({
             feature_completeness: d.feature_completeness,
             feature_freshness: d.feature_freshness,
             model_freshness: d.model_freshness,
-        }, null, 2).slice(0, 12000);
+            sentiment_status: d.sentiment_status,
+            feature_importance: d.feature_importance,
+            feature_importance_by_block: d.feature_importance_by_block,
+            regime_performance: d.regime_performance,
+            outcome_quality: d.outcome_quality,
+            post_trade_feature_reviews: d.post_trade_feature_reviews,
+        }, null, 2).slice(0, 20000);
     } catch (e) {
         el.textContent = String(e);
     }
@@ -2471,13 +2652,25 @@ function updatePositions(data) {
         const sleeve = pos.sleeve || "ACTIVE";
         const badgeCls = "sleeve-badge sleeve-badge--" + sleeve.toLowerCase();
         const tr = document.createElement("tr");
+        const stopTxt = pos.stop_price ? Number(pos.stop_price).toFixed(4) : "--";
+        const tp1Txt = pos.take_profit_1_price
+            ? Number(pos.take_profit_1_price).toFixed(4) + (pos.tp1_hit ? " ✓hit" : "")
+            : "--";
+        const tp2Txt = pos.take_profit_2_price ? Number(pos.take_profit_2_price).toFixed(4) : "--";
+        const preview = pos.engine_exit_preview || {};
+        const nextExit = preview.next_engine_exit && preview.next_engine_exit !== "none" ? preview.next_engine_exit : "--";
+        const remainMin = preview.hold_remaining_min != null ? " (" + Number(preview.hold_remaining_min).toFixed(0) + "m left)" : "";
         tr.innerHTML =
             "<td>" + (pos.symbol || "") + "</td>" +
             "<td><span class='" + badgeCls + "'>" + sleeve + "</span></td>" +
             "<td>" + (pos.quantity != null ? Number(pos.quantity).toFixed(6) : "") + "</td>" +
             "<td>" + (pos.average_price != null ? Number(pos.average_price).toFixed(4) : pos.entry_price != null ? Number(pos.entry_price).toFixed(4) : "") + "</td>" +
             "<td>" + (pos.current_price != null ? Number(pos.current_price).toFixed(4) : pos.average_price != null ? Number(pos.average_price).toFixed(4) : "") + "</td>" +
-            "<td class='" + (pnl >= 0 ? "pnl-pos" : "pnl-neg") + "'>" + (pnl !== 0 ? pnl.toFixed(2) : "0.00") + "</td>";
+            "<td class='" + (pnl >= 0 ? "pnl-pos" : "pnl-neg") + "'>" + (pnl !== 0 ? pnl.toFixed(2) : "0.00") + "</td>" +
+            "<td class='mono'>" + stopTxt + "</td>" +
+            "<td class='mono'>" + tp1Txt + "</td>" +
+            "<td class='mono'>" + tp2Txt + "</td>" +
+            "<td class='mono' title='" + (nextExit !== "--" ? nextExit + remainMin : "") + "'>" + nextExit + remainMin + "</td>";
         tbody.appendChild(tr);
     });
 }

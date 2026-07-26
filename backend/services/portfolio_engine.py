@@ -14958,6 +14958,7 @@ class PortfolioEngine:
             "take_profit_1_price": tp1,
             "take_profit_2_price": tp2,
             "take_profit": tp1,
+            "tp1_hit": bool(getattr(pos, "tp1_hit", False)),
             "exit_levels_are_advisory_metadata_only": False,
             "engine_exit_preview": exit_preview,
             "sleeve": getattr(pos, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value,

@@ -1789,6 +1789,15 @@ async def get_model_panel() -> dict[str, Any]:
                         "feature_dim": meta.get("feature_dim"),
                         "last_promotion_event": pe.get("last_event_at") if pe.get("last_event_type") == "promoted" else None,
                         "last_rejection_event": pe.get("last_event_at") if pe.get("last_event_type") == "rejected" else None,
+                        # Model diversity / calibration provenance (see ai_blended_classifier.py,
+                        # ai_training_pipeline.py, ai_feature_importance_diagnostics.py).
+                        "blend_status": meta.get("active_blend_status"),
+                        "rf_val_acc": meta.get("active_rf_val_acc"),
+                        "gbm_val_acc": meta.get("active_gbm_val_acc"),
+                        "blend_w_rf": meta.get("active_blend_w_rf"),
+                        "blend_w_gbm": meta.get("active_blend_w_gbm"),
+                        "confidence_calibrated": meta.get("active_confidence_calibrated"),
+                        "feature_importance_weakest": meta.get("active_feature_importance_weakest"),
                     }
                 )
         return {
@@ -1802,6 +1811,66 @@ async def get_model_panel() -> dict[str, Any]:
         }
     except Exception as e:
         logger.exception("Error building model panel: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/ai-signals-panel")
+async def get_ai_signals_panel() -> dict[str, Any]:
+    """Read-only per-symbol snapshot of the live DAY ranking/trust signals added
+    this session — model disagreement, chart pattern, cross-sectional standing,
+    setup/execution nudges, meta-labeling trust — sourced from each symbol's most
+    recent ai_candidate_snapshots row. These are decision-cycle signals (recomputed
+    every DAY signal loop), distinct from /model-panel's per-artifact training
+    diagnostics. Advisory/diagnostic only — never gates a trade."""
+    try:
+        per_symbol: list[dict[str, Any]] = []
+        with sqlite3.connect(DATABASE_PATH, timeout=5) as conn:
+            conn.row_factory = sqlite3.Row
+            for sym in TRADING_SYMBOLS:
+                # ai_candidate_snapshots.symbol is stored in CCXT format ("BTC/USDT"),
+                # while TRADING_SYMBOLS is bus format ("BTCUSDT") — same mismatch
+                # handled by ai_market_context._to_ccxt elsewhere in the pipeline.
+                ccxt_sym = sym if "/" in sym else (f"{sym[:-4]}/USDT" if sym.endswith("USDT") else sym)
+                row = conn.execute(
+                    """
+                    SELECT symbol, ts_utc, decision, confidence, day_route_regime,
+                           chart_pattern_label, chart_pattern_score, model_disagreement,
+                           cross_sectional_rank_delta, setup_score, execution_rank_delta,
+                           meta_trust_multiplier
+                    FROM ai_candidate_snapshots
+                    WHERE strategy_id = 'day' AND symbol IN (?, ?)
+                    ORDER BY epoch_ms DESC
+                    LIMIT 1
+                    """,
+                    (sym, ccxt_sym),
+                ).fetchone()
+                if row is None:
+                    per_symbol.append({"symbol": sym, "available": False})
+                    continue
+                per_symbol.append(
+                    {
+                        "symbol": sym,
+                        "available": True,
+                        "as_of": row["ts_utc"],
+                        "decision": row["decision"],
+                        "confidence": row["confidence"],
+                        "day_route_regime": row["day_route_regime"] or None,
+                        "chart_pattern_label": row["chart_pattern_label"] or None,
+                        "chart_pattern_score": row["chart_pattern_score"],
+                        "model_disagreement": row["model_disagreement"],
+                        "cross_sectional_rank_delta": row["cross_sectional_rank_delta"],
+                        "setup_score": row["setup_score"],
+                        "execution_rank_delta": row["execution_rank_delta"],
+                        "meta_trust_multiplier": row["meta_trust_multiplier"],
+                    }
+                )
+        return {
+            "success": True,
+            "data": {"per_symbol": per_symbol},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception("Error building AI signals panel: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

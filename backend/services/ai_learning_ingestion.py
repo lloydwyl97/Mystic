@@ -167,6 +167,7 @@ _SNAPSHOT_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("cross_sectional_rank_delta", "REAL"),
     ("setup_score", "REAL"),
     ("execution_rank_delta", "REAL"),
+    ("meta_trust_multiplier", "REAL"),
 )
 
 _tables_ready = False
@@ -248,8 +249,9 @@ def record_candidate_snapshot(
                     thesis_invalid_level, thesis_target_level, regime, trend_state,
                     relative_volume, spread_pct, cost_estimate_pct, price, open_position_json,
                     day_route_regime, chart_pattern_score, chart_pattern_label,
-                    model_disagreement, cross_sectional_rank_delta, setup_score, execution_rank_delta
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    model_disagreement, cross_sectional_rank_delta, setup_score, execution_rank_delta,
+                    meta_trust_multiplier
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     _now_iso(),
@@ -281,6 +283,7 @@ def record_candidate_snapshot(
                     _safe_float(dd.get("cross_sectional_rank_delta")) if dd.get("cross_sectional_rank_delta") is not None else None,
                     _safe_float(dd.get("setup_score")) if dd.get("setup_score") is not None else None,
                     _safe_float(dd.get("execution_rank_delta")) if dd.get("execution_rank_delta") is not None else None,
+                    _safe_float(dd.get("meta_trust_multiplier")) if dd.get("meta_trust_multiplier") is not None else None,
                 ),
             )
             conn.commit()

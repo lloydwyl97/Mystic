@@ -361,10 +361,34 @@ def build_symbol_model_behavior(
         "diagnostics_ok": False,
     }
 
+    # MODEL DIVERSITY / CALIBRATION PROVENANCE: surfaces what's actually inside the
+    # active artifact — RF-only vs RF+GBM blended, each algorithm's own val accuracy
+    # and blend weight, whether a confidence calibrator was fit, and which feature
+    # dims came back weakest in this artifact's training run. Purely descriptive of
+    # what ai_training_pipeline.py already computed and stored; no new computation.
+    # Populated unconditionally (before the holdout-sample gate below) so the model
+    # panel still shows this even for symbols with zero eligible holdout rows.
+    base["active_blend_status"] = None
+    base["active_rf_val_acc"] = None
+    base["active_gbm_val_acc"] = None
+    base["active_blend_w_rf"] = None
+    base["active_blend_w_gbm"] = None
+    base["active_confidence_calibrated"] = None
+    base["active_feature_importance_weakest"] = None
+    provenance_art = _load_artifact(active_path)
+    if provenance_art is not None:
+        base["active_blend_status"] = provenance_art.get("blend_status") or "rf_only"
+        base["active_rf_val_acc"] = provenance_art.get("rf_val_acc")
+        base["active_gbm_val_acc"] = provenance_art.get("gbm_val_acc")
+        base["active_blend_w_rf"] = provenance_art.get("blend_w_rf")
+        base["active_blend_w_gbm"] = provenance_art.get("blend_w_gbm")
+        base["active_confidence_calibrated"] = provenance_art.get("confidence_calibrator") is not None
+        base["active_feature_importance_weakest"] = provenance_art.get("feature_importance_weakest")
+
     if sample_count == 0:
         return base
 
-    active_art = _load_artifact(active_path)
+    active_art = provenance_art if provenance_art is not None else _load_artifact(active_path)
     candidate_art = _load_artifact(cand_path) if cand_path else None
     if active_art is None:
         base["error"] = "active_artifact_missing_or_invalid"
@@ -449,6 +473,8 @@ def build_symbol_model_behavior(
                 "sample_count": cand_h.get("sample_count"),
             },
             "candidate_artifact_accuracy_stored": round(float(candidate_art.get("accuracy") or 0.0), 6),
+            "candidate_blend_status": candidate_art.get("blend_status") or ("rf_only" if candidate_art.get("blend_status") is None else None),
+            "candidate_confidence_calibrated": candidate_art.get("confidence_calibrator") is not None,
             "disagreement_count": compare["disagreement_count"],
             "rows_candidate_improved": compare["rows_candidate_improved"],
             "rows_candidate_worsened": compare["rows_candidate_worsened"],

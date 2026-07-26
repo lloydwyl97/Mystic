@@ -24,6 +24,7 @@
         <button type="button" class="header__mode header__mode--clickable header__tooltip" id="mode-badge" data-tooltip="Click to switch PAPER/LIVE" title="Click to switch PAPER/LIVE">--</button>
         <span class="header__regime header__regime--neutral header__tooltip" id="regime-badge" role="status" aria-live="polite" aria-atomic="true" data-tooltip="Crypto Fear &amp; Greed index (alternative.me), not price-trend ML" title="Fear &amp; Greed label (see hover)">Fear &amp; Greed: --</span>
         <span class="header__system header__system--unknown header__tooltip" id="system-badge" data-tooltip="OK / Warning / Critical from memory thresholds" title="System health">--</span>
+        <span class="header__system header__system--unknown header__tooltip" id="data-health-badge" data-tooltip="Background API polls: how many are currently failing or returning stale/old data. Hover for the list." title="Data freshness">Data: --</span>
         <span class="header__meta" id="header-meta">Last update: --</span>
         <button type="button" class="header__refresh" id="refresh-btn" title="Refresh now" aria-label="Refresh data">↻</button>
     </header>
@@ -166,6 +167,16 @@
             </div>
         </section>
         <section class="widget widget--full">
+            <h2 class="widget__title">AI ranking signals (live)</h2>
+            <p class="widget__subtitle">Per-symbol nudges applied this cycle — advisory only, never gates a trade. Disagreement: RF vs GBM split (higher = less trustworthy). Pattern/Cross-rank/Meta-trust: bounded rank/confidence adjustments.</p>
+            <div class="widget__table-wrap widget__table-wrap--scroll">
+                <table class="positions-table">
+                    <thead><tr><th>Symbol</th><th>Decision</th><th>Confidence</th><th>Regime</th><th>Disagreement</th><th>Chart pattern</th><th>Cross-rank Δ</th><th>Setup score</th><th>Meta-trust</th><th>As of</th></tr></thead>
+                    <tbody id="ai-signals-tbody"><tr><td colspan="10">--</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+        <section class="widget widget--full">
             <h2 class="widget__title">DAY open positions</h2>
             <div class="widget__table-wrap">
                 <table class="positions-table">
@@ -183,10 +194,10 @@
                 <div class="readiness-card readiness-card--span2"><span class="readiness-label">Idle reason</span><span class="readiness-value" id="dh-idle-reason">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Spread-passing</span><span class="readiness-value" id="dh-spread-passing">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Max trapped days</span><span class="readiness-value" id="dh-trapped-days">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Held symbol</span><span class="readiness-value" id="dh-held-symbol">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Held state</span><span class="readiness-value" id="dh-held-state">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Held RS rank</span><span class="readiness-value" id="dh-held-rank">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Held net %</span><span class="readiness-value" id="dh-held-net">--</span></div>
+                <div class="readiness-card header__tooltip" data-tooltip="Shows only the first of possibly several held DAY positions — see the full 'DAY open positions' table above for all of them" title="First held position only — see table above for all"><span class="readiness-label">Held symbol (1st)</span><span class="readiness-value" id="dh-held-symbol">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Held state (1st)</span><span class="readiness-value" id="dh-held-state">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Held RS rank (1st)</span><span class="readiness-value" id="dh-held-rank">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Held net % (1st)</span><span class="readiness-value" id="dh-held-net">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Best alternate</span><span class="readiness-value" id="dh-best-alt">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Signal blocks</span><span class="readiness-value" id="dh-signal-blocked">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Entry gates</span><span class="readiness-value" id="dh-gates-enforced">--</span></div>
@@ -252,7 +263,7 @@
                 <div class="readiness-card"><span class="readiness-label">Open positions</span><span class="readiness-value" id="scalp-open-count">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Today PnL</span><span class="readiness-value" id="scalp-today-pnl">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Today sells</span><span class="readiness-value" id="scalp-today-sells">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Calibration</span><span class="readiness-value" id="scalp-calibration">--</span></div>
+                <div class="readiness-card header__tooltip" data-tooltip="SCALP entry-gate strictness profile (strict/calibration mode) — unrelated to the ML confidence calibrator shown in the Model panel" title="SCALP gate profile, not ML confidence calibration"><span class="readiness-label">Gate profile</span><span class="readiness-value" id="scalp-calibration">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">All-time PnL</span><span class="readiness-value" id="scalp-alltime-pnl">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">All-time sells</span><span class="readiness-value" id="scalp-alltime-sells">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Mode</span><span class="readiness-value" id="scalp-mode">--</span></div>
@@ -361,9 +372,9 @@
             <div class="widget widget--half" data-engine="day">
                 <h2 class="widget__title">Open DAY positions</h2>
                 <p class="widget__subtitle">DAY ledger only — canonical snapshot.</p>
-                <div class="widget__table-wrap">
+                <div class="widget__table-wrap widget__table-wrap--scroll">
                     <table class="positions-table">
-                        <thead><tr><th>Symbol</th><th>Sleeve</th><th>Size</th><th>Entry</th><th>Current</th><th>Unrealized</th></tr></thead>
+                        <thead><tr><th>Symbol</th><th>Sleeve</th><th>Size</th><th>Entry</th><th>Current</th><th>Unrealized</th><th>Stop</th><th>TP1</th><th>TP2</th><th>Next exit</th></tr></thead>
                         <tbody id="positions-tbody"></tbody>
                     </table>
                     <p class="widget__no-data" id="positions-no-data">No open DAY positions</p>
@@ -533,8 +544,21 @@
     <div class="tab-panel" id="tab-marketlens" role="tabpanel" hidden>
         <section class="widget widget--full">
             <h2 class="widget__title">MarketLens Bridge (read-only)</h2>
-            <p class="widget__subtitle">Public-safe Mystic feed — no operator controls, no secrets, no private balances.</p>
-            <pre id="ml-feed-pre" class="panel-pre panel-pre--tall">Loading public feed…</pre>
+            <p class="widget__subtitle">Public-safe Mystic feed consumed by the MarketLens education platform — no operator controls, no secrets, no private balances. Served by <code>/api/public/mystic-marketlens-feed</code>.</p>
+            <div class="readiness-grid" id="ml-feed-grid">
+                <div class="readiness-card"><span class="readiness-label">System state</span><span class="readiness-value" id="ml-system-state">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">DAY engine</span><span class="readiness-value" id="ml-day-engine">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">SCALP engine</span><span class="readiness-value" id="ml-scalp-engine">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Redis</span><span class="readiness-value" id="ml-redis">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Fear &amp; Greed</span><span class="readiness-value" id="ml-fear-greed">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">DAY idle reason</span><span class="readiness-value" id="ml-day-idle">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">DAY open positions</span><span class="readiness-value" id="ml-day-open">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">SCALP top blocker</span><span class="readiness-value" id="ml-scalp-blocker">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">DAY learning rows</span><span class="readiness-value" id="ml-day-learning">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">SCALP closed roundtrips</span><span class="readiness-value" id="ml-scalp-learning">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Feed timestamp</span><span class="readiness-value" id="ml-feed-ts">--</span></div>
+            </div>
+            <details class="observability-panel"><summary>Raw feed JSON</summary><pre id="ml-feed-pre" class="panel-pre panel-pre--tall">Loading public feed…</pre></details>
         </section>
     </div>
 
@@ -609,6 +633,6 @@
     </div>
 
     <script src="vendor/chart.umd.min.js?v=4.4.1"></script>
-    <script src="app.js?v=54"></script>
+    <script src="app.js?v=55"></script>
 </body>
 </html>
