@@ -279,6 +279,27 @@ def register_candidate_and_maybe_promote(
     holdout_count = int(metrics.get("holdout_sample_count") or metrics.get("sample_count") or 0)
     accuracy_margin = _accuracy_margin(holdout_count)
     metrics["accuracy_margin_applied"] = round(accuracy_margin, 6)
+
+    # TIER C FALLBACK ELIGIBILITY: real closed-trade holdout requires
+    # MIN_HOLDOUT_SAMPLES actual closed trades per symbol, which this system
+    # rarely has (holdout_status stays "HOLDOUT_PAC_UNAVAILABLE" indefinitely
+    # for thin-data symbols). build_holdout_validation_metrics already computes
+    # a synthetic Tier C comparison (ai_candidate_snapshots, MIN_TIERED_HOLDOUT_
+    # SAMPLES=40 floor, candidate vs active classification accuracy, degeneracy-
+    # guarded — see ai_model_promotion_holdout._tiered_holdout_comparison) for
+    # exactly this case, but until now that result was computed and discarded:
+    # the `else` branch below unconditionally required holdout_ok, so a
+    # candidate scoring e.g. 77% vs active's 44% was rejected every cycle for
+    # days purely because holdout_status wasn't "OK" — never because the
+    # candidate was actually worse. See 2026-07-26 stale-model audit.
+    tiered_info = metrics.get("tiered_holdout")
+    tiered_fallback_eligible = (
+        not holdout_ok
+        and isinstance(tiered_info, dict)
+        and tiered_info.get("status") == "OK"
+        and bool(metrics.get("tiered_holdout_pass"))
+    )
+
     if not has_active:
         # Cold-start bootstrap: no active model exists so there is nothing to
         # compare against. Bypass holdout gate entirely — the minimum quality
@@ -291,12 +312,17 @@ def register_candidate_and_maybe_promote(
         pac_ok = True
         bad_ok = True
         metrics["promotion_path"] = "cold_start_bootstrap"
+    elif tiered_fallback_eligible:
+        accuracy_ok = True
+        pac_ok = True
+        bad_ok = True
+        metrics["promotion_path"] = "tiered_holdout_fallback"
     else:
         accuracy_ok = holdout_ok and c_acc is not None and a_acc is not None and c_acc >= (a_acc - accuracy_margin)
         pac_ok = holdout_ok and c_profit is not None and a_profit is not None and c_profit >= (a_profit - 0.0005)
         bad_ok = holdout_ok and c_bad is not None and a_bad is not None and c_bad <= (a_bad + 0.0005)
 
-    promote = holdout_ok and accuracy_ok and pac_ok and bad_ok
+    promote = accuracy_ok and pac_ok and bad_ok
     holdout_low_confidence = bool(metrics.get("holdout_low_confidence")) or holdout_count < 20
     metrics["holdout_low_confidence"] = holdout_low_confidence
     cand_holdout = metrics.get("candidate_holdout")

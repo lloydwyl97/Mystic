@@ -499,6 +499,27 @@ def _bus(symbol: str) -> str:
     return (symbol or "").replace("/", "").upper()
 
 
+def _ccxt(symbol: str) -> str:
+    """Bus (BTCUSDT) -> ccxt (BTC/USDT) form. Inverse of _bus().
+
+    tier_b_training_rows/tier_c_training_rows are called from the training
+    pipeline with TRADING_SYMBOLS entries (bus form, no slash). _bus() on an
+    already-slash-free string is a no-op, so the old `symbol IN (?, ?)` param
+    pair `(symbol, _bus(symbol))` collapsed to two identical bus-form strings
+    — which never matched ai_candidate_snapshots/ai_position_heartbeats, both
+    of which store symbol in ccxt form only. That silently zeroed the Tier
+    B/C rescue for every symbol, every cycle (see 2026-07-26 stale-model
+    audit: BTC/XRP fell under the 90-row training floor with zero rescue
+    rows and were skipped for ~2 days straight).
+    """
+    s = (symbol or "").strip().upper()
+    if "/" in s:
+        return s
+    if s.endswith("USDT"):
+        return f"{s[:-4]}/USDT"
+    return f"{s}/USDT"
+
+
 def _load_series(r: Any, sym_bus: str) -> dict[str, list[list[float]]]:
     """Load cached OHLCV series (epoch SECONDS or MS in col 0 normalized to ms).
 
@@ -1030,7 +1051,7 @@ def tier_c_training_rows(
                   AND decision_id != '' AND would_hit_target IS NOT NULL
                 ORDER BY epoch_ms DESC LIMIT 3000
                 """,
-                (sid, symbol, _bus(symbol)),
+                (sid, symbol, _ccxt(symbol)),
             ).fetchall()
             dids = [str(r[0]) for r in rows]
             feats_map = _features_for_decision_ids(conn, dids, feature_dim, min_feature_version)
@@ -1074,7 +1095,7 @@ def tier_b_training_rows(
                 HAVING hold_sec >= ?
                 ORDER BY first_ms DESC LIMIT 500
                 """,
-                (symbol, _bus(symbol), float(min_hold_seconds)),
+                (symbol, _ccxt(symbol), float(min_hold_seconds)),
             ).fetchall()
             for _trade_id, mfe, _hold, first_ms, sym in rows:
                 snap = conn.execute(
@@ -1084,7 +1105,7 @@ def tier_b_training_rows(
                       AND ABS(epoch_ms - ?) < 1800000
                     ORDER BY ABS(epoch_ms - ?) ASC LIMIT 1
                     """,
-                    (sym, _bus(sym), float(first_ms or 0), float(first_ms or 0)),
+                    (sym, _ccxt(sym), float(first_ms or 0), float(first_ms or 0)),
                 ).fetchone()
                 if not snap:
                     continue

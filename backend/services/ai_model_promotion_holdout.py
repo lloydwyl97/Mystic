@@ -283,20 +283,33 @@ def _tiered_holdout_comparison(
     X = np.asarray(xs, dtype=np.float64)
     y = np.asarray(ys, dtype=np.int64)
 
-    def _acc(path: Path | None) -> float | None:
+    def _preds(path: Path | None) -> np.ndarray | None:
         if path is None or not path.exists():
             return None
         art = _load_artifact(path)
         if art is None:
             return None
         try:
-            preds = np.asarray(art["model"].predict(art["scaler"].transform(X)), dtype=np.int64).reshape(-1)
-            return float(np.mean(preds == y))
+            return np.asarray(art["model"].predict(art["scaler"].transform(X)), dtype=np.int64).reshape(-1)
         except Exception:
             return None
 
-    c_acc = _acc(candidate_path)
-    a_acc = _acc(active_path)
+    c_preds = _preds(candidate_path)
+    a_preds = _preds(active_path)
+    c_acc = float(np.mean(c_preds == y)) if c_preds is not None else None
+    a_acc = float(np.mean(a_preds == y)) if a_preds is not None else None
+
+    # Degeneracy guard: a constant-output classifier can score deceptively high
+    # accuracy on the tiered set purely because HOLD (or BUY) happens to be the
+    # majority label — that is not a model that learned anything, and this
+    # tiered path was built to be trusted as a promotion signal (see
+    # register_candidate_and_maybe_promote's tiered_holdout_fallback), so it
+    # must not pass a candidate that never varies its output. Mirrors the
+    # candidate_always_buy/candidate_always_hold guard already applied to the
+    # real-holdout path.
+    c_buy_rate = float(np.mean(c_preds == 1)) if c_preds is not None else None
+    candidate_degenerate = c_buy_rate is not None and (c_buy_rate <= 0.0 or c_buy_rate >= 1.0)
+
     out["tiered_holdout"] = {
         "status": "OK",
         "source": "ai_candidate_snapshots_tier_c",
@@ -304,8 +317,10 @@ def _tiered_holdout_comparison(
         "buy_label_count": int(np.sum(y == 1)),
         "candidate_accuracy": round(c_acc, 6) if c_acc is not None else None,
         "active_accuracy": round(a_acc, 6) if a_acc is not None else None,
+        "candidate_buy_rate": round(c_buy_rate, 6) if c_buy_rate is not None else None,
+        "candidate_degenerate": candidate_degenerate,
     }
-    if c_acc is not None and (a_acc is None or c_acc >= a_acc):
+    if c_acc is not None and not candidate_degenerate and (a_acc is None or c_acc >= a_acc):
         out["tiered_holdout_pass"] = True
     return out
 
