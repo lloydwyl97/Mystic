@@ -20,6 +20,7 @@ from backend.metrics import (
 )
 from backend.services.canonical_http_client import get_http_client
 from backend.services.circuit_breaker_service import get_api_breaker
+from backend.utils.binance_credentials import get_binance_us_api_key, get_binance_us_secret_key
 from backend.utils.binance_weight_limiter import (
     ENDPOINT_WEIGHTS,
     BinanceWeightLimiter,
@@ -50,8 +51,9 @@ Binance.US REST client (LIVE ONLY)
 """
 
 BINANCEUS_BASE = os.getenv("BINANCEUS_BASE", "https://api.binance.us")
-API_KEY = os.getenv("BINANCEUS_API_KEY", "")
-API_SECRET = os.getenv("BINANCEUS_API_SECRET", "")
+# Canonical: BINANCE_US_*; BINANCEUS_* kept as legacy fallback inside helper.
+API_KEY = get_binance_us_api_key()
+API_SECRET = get_binance_us_secret_key()
 
 DEFAULT_TIMEOUT = float(os.getenv("BINANCE_HTTP_TIMEOUT", "20"))  # Increased for personal network
 MAX_RETRIES = int(os.getenv("BINANCE_HTTP_MAX_RETRIES", "3"))

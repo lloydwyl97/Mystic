@@ -5,7 +5,12 @@ Ensures all components can access API keys regardless of variable name variation
 """
 
 import logging
-import os
+
+from backend.utils.binance_credentials import (
+    get_binance_us_api_key as _resolve_api_key,
+    get_binance_us_secret_key as _resolve_secret_key,
+    sync_binance_us_env_aliases,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +18,7 @@ logger = logging.getLogger(__name__)
 class APIKeyBridge:
     """
     Provides standardized access to API keys across different naming conventions.
-    This bridge ensures backward compatibility while standardizing access.
+    Canonical env names: BINANCE_US_API_KEY / BINANCE_US_SECRET_KEY.
     """
 
     def __init__(self) -> None:
@@ -23,19 +28,14 @@ class APIKeyBridge:
     def _load_keys(self) -> None:
         """Load and standardize all API keys from environment variables"""
 
-        # Binance US API Key - try all possible variations
-        binance_us_key = os.getenv("BINANCE_US_API_KEY") or os.getenv("BINANCEUS_API_KEY") or os.getenv("BINANCE_API_KEY")
+        binance_us_key = _resolve_api_key() or None
+        binance_us_secret = _resolve_secret_key() or None
 
-        # Binance US Secret Key - try all possible variations
-        binance_us_secret = os.getenv("BINANCE_US_SECRET_KEY") or os.getenv("BINANCEUS_API_SECRET") or os.getenv("BINANCE_SECRET_KEY")
-
-        # Store in standardized format
         self._keys_cache = {
             "binance_us_api_key": binance_us_key,
             "binance_us_secret_key": binance_us_secret,
         }
 
-        # Log which keys were found (without exposing the keys)
         found_keys = [k for k, v in self._keys_cache.items() if v]
         if found_keys:
             logger.info("[OK] API Key Bridge loaded keys for: %s", ", ".join(found_keys))
@@ -55,23 +55,8 @@ class APIKeyBridge:
         return bool(self.get_binance_us_api_key() and self.get_binance_us_secret_key())
 
     def set_environment_variables(self) -> None:
-        """
-        Set standardized environment variables for backward compatibility.
-        This ensures all existing code continues to work.
-        """
-
-        # Set Binance US variables in all formats for compatibility
-        api_key = self.get_binance_us_api_key()
-        if api_key:
-            os.environ["BINANCE_US_API_KEY"] = api_key
-            os.environ["BINANCEUS_API_KEY"] = api_key
-            os.environ["BINANCE_API_KEY"] = api_key
-
-        secret_key = self.get_binance_us_secret_key()
-        if secret_key:
-            os.environ["BINANCE_US_SECRET_KEY"] = secret_key
-            os.environ["BINANCEUS_API_SECRET"] = secret_key
-            os.environ["BINANCE_SECRET_KEY"] = secret_key
+        """Publish canonical credentials into legacy alias env vars for old readers."""
+        sync_binance_us_env_aliases()
 
 
 # Global instance

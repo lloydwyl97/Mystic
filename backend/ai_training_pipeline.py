@@ -1914,17 +1914,35 @@ class AITrainingDataPipeline:
             except Exception as e:
                 logger.debug(f"Could not get learning metrics: {e}")
 
+            # Prefer last published / average when in-memory current was reset to 0 between cycles
+            avg_acc = float(self.performance_metrics.get("average_accuracy", 0.0) or 0.0)
+            cur_acc = float(self._current_accuracy or 0.0)
+            if cur_acc <= 0.0 and avg_acc > 0.0:
+                cur_acc = avg_acc
+                self._current_accuracy = cur_acc
+            if cur_acc <= 0.0:
+                try:
+                    raw = await redis_client.get("ai_model_accuracy:day")
+                    if raw is None:
+                        raw = await redis_client.get("ai_model_accuracy")
+                    if raw:
+                        cur_acc = float(_decode(raw) or "0.0")
+                        if cur_acc > 0.0:
+                            self._current_accuracy = cur_acc
+                except Exception:
+                    pass
+
             # Format data for downstream consumers
             training_stats = {
                 # Basic training status
                 "status": "active" if self.is_running else "inactive",
                 "pipeline_running": self.is_running,
-                "current_accuracy": float(self._current_accuracy),
+                "current_accuracy": float(cur_acc),
                 "sessions": int(self.performance_metrics.get("total_training_sessions", 0)),
                 "successful_trainings": int(self.performance_metrics.get("successful_trainings", 0)),
                 "failed_trainings": int(self.performance_metrics.get("failed_trainings", 0)),
                 "best_accuracy": float(self.performance_metrics.get("best_accuracy", 0.0)),
-                "average_accuracy": float(self.performance_metrics.get("average_accuracy", 0.0)),
+                "average_accuracy": float(avg_acc if avg_acc > 0.0 else cur_acc),
                 "last_training_time": self.performance_metrics.get("last_training_time"),
                 "models_trained": int(self.performance_metrics.get("models_trained", 0)),
                 "timestamp": _now_iso(),

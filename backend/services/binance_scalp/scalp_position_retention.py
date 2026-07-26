@@ -67,28 +67,77 @@ def purge_closed_scalp_positions(
 
 
 def reconcile_scalp_ledger_equity(db_path: str) -> dict[str, Any]:
-    """Heal scalp_paper_ledger.total_equity = cash_balance + positions_value."""
+    """Heal scalp ledger from closed trades when flat; always align total_equity."""
     with connect_rw(db_path) as conn:
-        row = conn.execute("SELECT cash_balance, positions_value, total_equity FROM scalp_paper_ledger WHERE id=1").fetchone()
+        row = conn.execute(
+            "SELECT principal, cash_balance, positions_value, realized_pnl, total_equity "
+            "FROM scalp_paper_ledger WHERE id=1"
+        ).fetchone()
         if not row:
             return {"skipped": True, "reason": "no_ledger_row"}
-        cash, pos_val, equity = float(row[0] or 0), float(row[1] or 0), float(row[2] or 0)
-        expected = cash + pos_val
-        if abs(equity - expected) < 0.01:
-            return {"skipped": True, "reason": "already_aligned", "total_equity": equity}
+        principal = float(row[0] or 0)
+        cash = float(row[1] or 0)
+        pos_val = float(row[2] or 0)
+        realized = float(row[3] or 0)
+        equity = float(row[4] or 0)
+        open_n = int(conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0] or 0)
+        sell_pnl = float(
+            conn.execute(
+                "SELECT COALESCE(SUM(pnl_usd), 0) FROM scalp_paper_trades WHERE UPPER(side)='SELL'"
+            ).fetchone()[0]
+            or 0.0
+        )
+        out: dict[str, Any] = {"open_positions": open_n, "sell_pnl": sell_pnl}
+        if open_n == 0 and principal > 0:
+            expected_cash = principal + sell_pnl
+            expected_realized = sell_pnl
+            if abs(cash - expected_cash) >= 0.01 or abs(realized - expected_realized) >= 0.01 or abs(pos_val) >= 0.01:
+                conn.execute(
+                    """
+                    UPDATE scalp_paper_ledger SET
+                        cash_balance=?, positions_value=0, realized_pnl=?, unrealized_pnl=0,
+                        total_equity=?, updated_at=datetime('now')
+                    WHERE id=1
+                    """,
+                    (expected_cash, expected_realized, expected_cash),
+                )
+                conn.commit()
+                logger.warning(
+                    "SCALP_LEDGER_HEAL: flat-book cash %.4f->%.4f realized %.4f->%.4f (principal=%.4f sell_pnl=%.4f)",
+                    cash,
+                    expected_cash,
+                    realized,
+                    expected_realized,
+                    principal,
+                    sell_pnl,
+                )
+                out.update(
+                    {
+                        "healed": True,
+                        "mode": "flat_book_from_trades",
+                        "before": {"cash": cash, "realized": realized, "equity": equity},
+                        "after": {"cash": expected_cash, "realized": expected_realized, "equity": expected_cash},
+                    }
+                )
+                return out
+        expected_equity = cash + pos_val
+        if abs(equity - expected_equity) < 0.01:
+            out.update({"skipped": True, "reason": "already_aligned", "total_equity": equity})
+            return out
         conn.execute(
             "UPDATE scalp_paper_ledger SET total_equity=?, updated_at=datetime('now') WHERE id=1",
-            (expected,),
+            (expected_equity,),
         )
         conn.commit()
         logger.warning(
             "SCALP_LEDGER_HEAL: total_equity %.4f -> %.4f (cash=%.4f pos=%.4f)",
             equity,
-            expected,
+            expected_equity,
             cash,
             pos_val,
         )
-        return {"healed": True, "before": equity, "after": expected}
+        out.update({"healed": True, "mode": "equity_only", "before": equity, "after": expected_equity})
+        return out
 
 
 def maybe_run_scalp_position_housekeeping(
@@ -104,6 +153,7 @@ def maybe_run_scalp_position_housekeeping(
     out: dict[str, Any] = {}
     try:
         out["purge"] = purge_closed_scalp_positions(db_path)
+        # Flat-book trade reconciliation first, then equity identity.
         out["ledger"] = reconcile_scalp_ledger_equity(db_path)
         _LAST_PURGE_AT = now
         return out

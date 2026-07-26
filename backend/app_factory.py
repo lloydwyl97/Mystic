@@ -720,6 +720,12 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     logger.info("CREATE_APP FUNCTION CALLED")
+    try:
+        from backend.utils.secret_log_filter import install_secret_redacting_filter
+
+        install_secret_redacting_filter()
+    except Exception:
+        logger.debug("secret log filter install skipped", exc_info=True)
     # Initialize ServiceManager before creating the app
 
     # Force start AI Signal Generator here as backup

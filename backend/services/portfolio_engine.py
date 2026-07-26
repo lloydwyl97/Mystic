@@ -676,14 +676,32 @@ class ExitType(Enum):
 
     `_check_exit_conditions` emits profit exits as `TAKE_PROFIT_1` / `TAKE_PROFIT_FULL`
     and risk/thesis/time exits as `MANUAL` with canonical `exit_trigger` labels
-    (STOP_LOSS, TIME_STOP, THESIS_INVALIDATION, etc.). Human manual sells also use
-    `MANUAL`. `DUST_WRITEOFF` clears sub-threshold residuals without an exchange order.
+    (STOP_LOSS, TIME_STOP, THESIS_INVALIDATION, STALL_EXIT, etc.). Human manual sells
+    also use `MANUAL`. `paper_trades.exit_type` stores the canonical trigger label via
+    ``paper_trades_exit_type_label`` so stall/stop exits are not reported as MANUAL.
+    `DUST_WRITEOFF` clears sub-threshold residuals without an exchange order.
     """
 
     TAKE_PROFIT_1 = "TP1"
     TAKE_PROFIT_FULL = "take_profit_full"
     MANUAL = "MANUAL"
     DUST_WRITEOFF = "DUST_WRITEOFF"
+
+
+def paper_trades_exit_type_label(exit_type: ExitType, exit_trigger: str) -> str:
+    """DB/report label for paper_trades.exit_type — prefer engine trigger over MANUAL."""
+    from backend.services.day_trade_thesis import EXIT_MANUAL, canonical_day_exit_reason
+
+    if exit_type == ExitType.DUST_WRITEOFF:
+        return ExitType.DUST_WRITEOFF.value
+    if exit_type == ExitType.TAKE_PROFIT_1:
+        return ExitType.TAKE_PROFIT_1.value
+    if exit_type == ExitType.TAKE_PROFIT_FULL:
+        return ExitType.TAKE_PROFIT_FULL.value
+    canon = canonical_day_exit_reason(str(exit_trigger or ""), exit_type_name=exit_type.name)
+    if canon and canon not in (EXIT_MANUAL, "MANUAL", ""):
+        return str(canon)
+    return ExitType.MANUAL.value
 
 
 class AccountStatus(Enum):
@@ -8836,8 +8854,9 @@ class PortfolioEngine:
                     # Get explainability from original trade (must always persist exit_trigger for analysis)
                     explain_obj = self.trade_explanations.get(position.trade_id) if position.trade_id else None
                     original_explain: dict[str, Any] = {}
+                    exit_type_label = paper_trades_exit_type_label(exit_type, str(exit_trigger or ""))
                     if explain_obj is not None:
-                        explain_obj.exit_type = exit_type.value
+                        explain_obj.exit_type = exit_type_label
                         explain_obj.exit_r_multiple = r_multiple
                         explain_obj.exit_trigger = exit_trigger
                         original_explain = explain_obj.to_dict()
@@ -8851,7 +8870,7 @@ class PortfolioEngine:
                     if not original_explain.get("live_ai_strategy"):
                         original_explain["live_ai_strategy"] = str(getattr(position, "entry_strategy_id", "") or "day")
                     original_explain["exit_trigger"] = exit_trigger
-                    original_explain["exit_type"] = exit_type.value
+                    original_explain["exit_type"] = exit_type_label
                     if sell_preflight_audit:
                         original_explain.update(sell_preflight_audit)
 
@@ -8929,7 +8948,7 @@ class PortfolioEngine:
                         original_explain["dust_reason"] = dust_reason_str
                         original_explain["dust_est_notional"] = dust_est_notional_val
                     else:
-                        exit_type_val = exit_type.value
+                        exit_type_val = exit_type_label
                         sell_status = "executed"
                         fees_paid_val = fee
                         # ACCOUNTING REPAIR: total slippage cost, not price delta

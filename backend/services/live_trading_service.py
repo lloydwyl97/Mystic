@@ -86,8 +86,9 @@ class LiveTradingService:
 
         # Prefer Binance US keys; fall back to generic if not set
         # Strip any trailing \r or whitespace from Windows line endings in .env
-        raw_api_key = os.getenv("BINANCE_US_API_KEY") or os.getenv("BINANCE_API_KEY") or ""
-        raw_secret = os.getenv("BINANCE_US_SECRET_KEY") or os.getenv("BINANCE_SECRET") or ""
+        from backend.utils.binance_credentials import get_binance_us_credentials
+
+        raw_api_key, raw_secret = get_binance_us_credentials()
         self.binance_api_key = raw_api_key.strip().rstrip("\r") if raw_api_key else None
         self.binance_secret = raw_secret.strip().rstrip("\r") if raw_secret else None
 

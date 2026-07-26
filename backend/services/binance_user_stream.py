@@ -74,8 +74,9 @@ class BinanceUserStreamWorker:
             return
 
         # Check if API keys are configured
-        api_key = os.getenv("BINANCE_US_API_KEY") or os.getenv("BINANCE_API_KEY", "")
-        secret_key = os.getenv("BINANCE_US_SECRET_KEY") or os.getenv("BINANCE_SECRET_KEY", "")
+        from backend.utils.binance_credentials import get_binance_us_credentials
+
+        api_key, secret_key = get_binance_us_credentials()
 
         if not api_key or not secret_key:
             logger.info("Binance user stream disabled: API keys not configured")
@@ -137,7 +138,9 @@ class BinanceUserStreamWorker:
 
     async def _ensure_listen_key(self) -> None:
         """Create a fresh listenKey and persist minimal metadata."""
-        api_key = os.getenv("BINANCE_US_API_KEY") or os.getenv("BINANCE_API_KEY", "")
+        from backend.utils.binance_credentials import get_binance_us_api_key
+
+        api_key = get_binance_us_api_key()
 
         if not api_key:
             msg = "API key not configured for user stream"
@@ -174,7 +177,9 @@ class BinanceUserStreamWorker:
                 if not self._listen_key or not self._client:
                     await self._ensure_listen_key()
                     continue
-                headers = {"X-MBX-APIKEY": os.getenv("BINANCE_US_API_KEY") or os.getenv("BINANCE_API_KEY", "")}
+                from backend.utils.binance_credentials import get_binance_us_api_key
+
+                headers = {"X-MBX-APIKEY": get_binance_us_api_key()}
                 url = f"{BINANCE_US_API}/api/v3/userDataStream?listenKey={self._listen_key}"
                 resp = await self._client.put(url, headers=headers, timeout=10)
 
@@ -322,7 +327,9 @@ class BinanceUserStreamWorker:
         try:
             # Use HTTP client to test connection health by keeping listen key alive
             if self._listen_key:
-                headers = {"X-MBX-APIKEY": os.getenv("BINANCE_US_API_KEY") or os.getenv("BINANCE_API_KEY", "")}
+                from backend.utils.binance_credentials import get_binance_us_api_key
+
+                headers = {"X-MBX-APIKEY": get_binance_us_api_key()}
                 url = f"{BINANCE_US_API}/api/v3/userDataStream?listenKey={self._listen_key}"
 
                 # Use PUT request to keep listen key alive (this is the proper health check)

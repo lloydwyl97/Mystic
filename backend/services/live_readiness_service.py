@@ -22,18 +22,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _api_key_present() -> tuple[bool, str]:
-    key = os.getenv("BINANCE_US_API_KEY", "") or os.getenv("BINANCEUS_API_KEY", "") or os.getenv("BINANCE_API_KEY", "")
-    secret = (
-        os.getenv("BINANCE_US_SECRET_KEY", "")
-        or os.getenv("BINANCE_US_API_SECRET", "")
-        or os.getenv("BINANCEUS_API_SECRET", "")
-        or os.getenv("BINANCE_SECRET", "")
-        or os.getenv("BINANCE_SECRET_KEY", "")
-    )
+    from backend.utils.binance_credentials import get_binance_us_credentials
+
+    key, secret = get_binance_us_credentials()
     if not key or len(key) < 10:
-        return False, "Binance API key missing or too short (BINANCE_US_API_KEY / BINANCEUS_API_KEY / BINANCE_API_KEY)"
+        return False, "Binance API key missing or too short (BINANCE_US_API_KEY)"
     if not secret or len(secret) < 10:
-        return False, "Binance API secret missing or too short (BINANCE_US_SECRET_KEY / BINANCEUS_API_SECRET / BINANCE_SECRET)"
+        return False, "Binance API secret missing or too short (BINANCE_US_SECRET_KEY)"
     return True, "configured"
 
 
@@ -59,14 +54,9 @@ async def _fetch_exchange_account_auth() -> dict[str, Any]:
         out["errors"].append(key_msg)
         return out
 
-    api_key = os.getenv("BINANCE_US_API_KEY", "") or os.getenv("BINANCEUS_API_KEY", "") or os.getenv("BINANCE_API_KEY", "")
-    api_secret = (
-        os.getenv("BINANCE_US_SECRET_KEY", "")
-        or os.getenv("BINANCE_US_API_SECRET", "")
-        or os.getenv("BINANCEUS_API_SECRET", "")
-        or os.getenv("BINANCE_SECRET", "")
-        or os.getenv("BINANCE_SECRET_KEY", "")
-    )
+    from backend.utils.binance_credentials import get_binance_us_credentials
+
+    api_key, api_secret = get_binance_us_credentials()
 
     try:
         async with httpx.AsyncClient(timeout=12.0) as client:

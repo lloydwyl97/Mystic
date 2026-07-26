@@ -454,7 +454,9 @@ class LiveBinanceUSExecutionAdapter(ExecutionAdapter):
 
     def __init__(self) -> None:
         self._live_service: Any | None = None
-        if not os.getenv("BINANCE_US_API_KEY") and not os.getenv("BINANCEUS_API_KEY"):
+        from backend.utils.binance_credentials import get_binance_us_api_key
+
+        if not get_binance_us_api_key():
             logger.warning("LIVE_ADAPTER_INIT api keys not detected — live adapter will still fail closed on order placement")
 
     def _service(self) -> Any:

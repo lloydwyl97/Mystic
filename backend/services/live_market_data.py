@@ -98,8 +98,9 @@ class LiveMarketDataService:
     """Binance.US-only live market data service."""
 
     def __init__(self) -> None:
-        api_key = os.getenv("BINANCE_US_API_KEY") or os.getenv("BINANCE_API_KEY") or ""
-        secret = os.getenv("BINANCE_US_SECRET_KEY") or os.getenv("BINANCE_SECRET") or ""
+        from backend.utils.binance_credentials import get_binance_us_credentials
+
+        api_key, secret = get_binance_us_credentials()
 
         # Use CCXT for Binance US API calls (recommended for trading platforms)
         self.base_url = "https://api.binance.us/api/v3"

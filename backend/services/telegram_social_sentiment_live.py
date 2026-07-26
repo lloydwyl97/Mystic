@@ -11,7 +11,10 @@ from typing import Any
 
 import httpx
 
+from backend.utils.secret_log_filter import install_secret_redacting_filter
+
 logger = logging.getLogger(__name__)
+install_secret_redacting_filter()
 
 REDIS_OFFSET_KEY = "telegram_sentiment:update_offset"
 REDIS_CACHE_KEY = "telegram_sentiment:message_cache"

@@ -129,8 +129,9 @@ async def check_live_readiness() -> dict[str, Any]:
 
     failures: list[str] = []
 
-    api_key = os.getenv("BINANCE_US_API_KEY", "") or os.getenv("BINANCEUS_API_KEY", "")
-    api_secret = os.getenv("BINANCE_US_SECRET_KEY", "") or os.getenv("BINANCE_US_API_SECRET", "") or os.getenv("BINANCEUS_API_SECRET", "")
+    from backend.utils.binance_credentials import get_binance_us_credentials
+
+    api_key, api_secret = get_binance_us_credentials()
     if not api_key or len(api_key) < 10:
         failures.append("BINANCE_US_API_KEY missing or too short")
     if not api_secret or len(api_secret) < 10:
