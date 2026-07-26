@@ -33,9 +33,24 @@ REG_NEUTRAL = "neutral"
 TIME_STOP_HOURS = float(os.getenv("ALLWEATHER_TIME_STOP_HOURS", "72"))
 DONCHIAN = int(os.getenv("ALLWEATHER_DONCHIAN", "20"))
 
+# Momentum breakouts often print with elevated RSI; prior caps (78/75) blocked real
+# Donchian breaks (e.g. ETH RSI~91 with close above donchian). Env-overridable.
+BREAKOUT_RSI_MAX_TREND = float(os.getenv("ALLWEATHER_BREAKOUT_RSI_MAX_TREND", "92"))
+BREAKOUT_RSI_MAX_NEUTRAL = float(os.getenv("ALLWEATHER_BREAKOUT_RSI_MAX_NEUTRAL", "88"))
+# Above this RSI, use tighter ATR brackets (chase less extension).
+BREAKOUT_RSI_HOT = float(os.getenv("ALLWEATHER_BREAKOUT_RSI_HOT", "78"))
+CONTINUATION_RSI_MAX = float(os.getenv("ALLWEATHER_CONTINUATION_RSI_MAX", "85"))
+
 
 def allweather_enabled() -> bool:
     return os.getenv("ALLWEATHER_ENGINE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _breakout_brackets(rsi: float, *, trend: bool) -> tuple[float, float]:
+    """Return (target_atr, stop_atr). Hot RSI → slightly tighter risk."""
+    if float(rsi) > BREAKOUT_RSI_HOT:
+        return (2.0, 1.2) if trend else (1.9, 1.2)
+    return (2.6, 1.5) if trend else (2.4, 1.5)
 
 
 # --------------------------- indicators (pure python) ---------------------------
@@ -221,9 +236,11 @@ def diagnose_entry_state(
     failed_breakdown = False
     if atr_pct > 0 and state.regime == REG_TREND_UP:
         trend_pullback = bool(near_ema and resuming and 35.0 <= state.rsi <= 62.0)
-        breakout = bool(c > state.don_high and state.rsi <= 78.0)
+        breakout = bool(c > state.don_high and state.rsi <= BREAKOUT_RSI_MAX_TREND)
     elif state.regime == REG_NEUTRAL:
-        breakout = bool(c > state.don_high and c > state.ema55 and state.adx >= 18 and state.rsi <= 75.0)
+        breakout = bool(
+            c > state.don_high and c > state.ema55 and state.adx >= 18 and state.rsi <= BREAKOUT_RSI_MAX_NEUTRAL
+        )
     elif state.regime == REG_RANGE:
         recent_low = state.don_low
         range_bounce = bool(c > recent_low * 1.001 and state.rsi < 45 and c > state.prev_close)
@@ -286,17 +303,24 @@ def entry_signal(state: AWState) -> dict[str, Any] | None:
         resuming = c > state.prev_close
         if near_ema and resuming and 35.0 <= state.rsi <= 62.0:
             return {"setup": SETUP_TREND_PULLBACK, "regime": state.regime, "target_atr": 2.2, "stop_atr": 1.3}
-        if c > state.don_high and state.rsi <= 78.0:
-            return {"setup": SETUP_BREAKOUT, "regime": state.regime, "target_atr": 2.6, "stop_atr": 1.5}
-        # Continuation while trend intact (emas stacked + adx + not overbought + up tick).
+        if c > state.don_high and state.rsi <= BREAKOUT_RSI_MAX_TREND:
+            t_atr, s_atr = _breakout_brackets(state.rsi, trend=True)
+            return {"setup": SETUP_BREAKOUT, "regime": state.regime, "target_atr": t_atr, "stop_atr": s_atr}
+        # Continuation while trend intact (emas stacked + adx + not blown-out + up tick).
         # Lets the app trade "up" regimes that are grinding without a fresh donchian break or deep band pullback on this exact bar.
         # Conservative brackets. Generates outcomes for learning instead of idling.
-        if state.ema21 > state.ema55 > state.ema200 and state.adx >= 18 and state.rsi < 72 and c > state.prev_close:
+        if (
+            state.ema21 > state.ema55 > state.ema200
+            and state.adx >= 18
+            and state.rsi < CONTINUATION_RSI_MAX
+            and c > state.prev_close
+        ):
             return {"setup": SETUP_TREND_PULLBACK, "regime": state.regime, "target_atr": 2.0, "stop_atr": 1.2}
 
     if state.regime == REG_NEUTRAL:
-        if c > state.don_high and c > state.ema55 and state.adx >= 18 and state.rsi <= 75.0:
-            return {"setup": SETUP_BREAKOUT, "regime": state.regime, "target_atr": 2.4, "stop_atr": 1.5}
+        if c > state.don_high and c > state.ema55 and state.adx >= 18 and state.rsi <= BREAKOUT_RSI_MAX_NEUTRAL:
+            t_atr, s_atr = _breakout_brackets(state.rsi, trend=False)
+            return {"setup": SETUP_BREAKOUT, "regime": state.regime, "target_atr": t_atr, "stop_atr": s_atr}
 
     # RANGE: bounce from lows when oversold-ish and showing rejection
     if state.regime == REG_RANGE:
@@ -353,6 +377,10 @@ def exit_decision(
 
 
 __all__ = [
+    "BREAKOUT_RSI_MAX_NEUTRAL",
+    "BREAKOUT_RSI_MAX_TREND",
+    "BREAKOUT_RSI_HOT",
+    "CONTINUATION_RSI_MAX",
     "EXIT_ATR_STOP",
     "EXIT_ATR_TARGET",
     "EXIT_TIME_STOP",

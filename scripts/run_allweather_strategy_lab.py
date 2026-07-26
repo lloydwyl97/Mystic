@@ -182,14 +182,18 @@ def _signal(prev: Indi, cur: Indi) -> tuple[str, float, float] | None:
         resuming = cur.close > prev.close
         if near_ema and resuming and 35.0 <= cur.rsi <= 62.0:
             return ("TREND_PULLBACK", 2.2, 1.3)
-        # BREAKOUT: new high break with trend behind it.
-        if cur.close > cur.don_high and cur.rsi <= 78.0:
-            return ("BREAKOUT", 2.6, 1.5)
+        # BREAKOUT: new high break with trend behind it (RSI caps match production engine).
+        _rsi_trend = float(os.getenv("ALLWEATHER_BREAKOUT_RSI_MAX_TREND", "92"))
+        _rsi_hot = float(os.getenv("ALLWEATHER_BREAKOUT_RSI_HOT", "78"))
+        if cur.close > cur.don_high and cur.rsi <= _rsi_trend:
+            return ("BREAKOUT", 2.0, 1.2) if cur.rsi > _rsi_hot else ("BREAKOUT", 2.6, 1.5)
 
     # BREAKOUT in neutral with momentum confirmation.
     if cur.regime == REG_NEUTRAL:
-        if cur.close > cur.don_high and cur.close > cur.ema55 and cur.adx >= 18 and cur.rsi <= 75.0:
-            return ("BREAKOUT", 2.4, 1.5)
+        _rsi_neu = float(os.getenv("ALLWEATHER_BREAKOUT_RSI_MAX_NEUTRAL", "88"))
+        _rsi_hot = float(os.getenv("ALLWEATHER_BREAKOUT_RSI_HOT", "78"))
+        if cur.close > cur.don_high and cur.close > cur.ema55 and cur.adx >= 18 and cur.rsi <= _rsi_neu:
+            return ("BREAKOUT", 1.9, 1.2) if cur.rsi > _rsi_hot else ("BREAKOUT", 2.4, 1.5)
 
     # MEAN_REVERSION removed: proven net-negative (18.5% win, -$26.78/trade) over
     # 3 years. Range regime now produces no longs.
