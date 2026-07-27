@@ -572,6 +572,61 @@ async def get_engine_metrics() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@router.get("/gates/today")
+async def get_day_gates_today(date: str | None = None) -> dict[str, Any]:
+    """DAY gate counters for today (or YYYY-MM-DD) — top blockers by hard_blocked."""
+    try:
+        from backend.services.day_gate_registry import registry_snapshot
+        from backend.services.day_gate_telemetry import counters_today, ensure_day_gate_schema
+
+        ensure_day_gate_schema(DATABASE_PATH)
+        rows = counters_today(DATABASE_PATH, date=date)
+        return {
+            "success": True,
+            "date": date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "data": {"gates": rows, "top_blockers": rows[:15]},
+            "registry": {
+                "decision_policy_version": registry_snapshot().get("decision_policy_version"),
+                "threshold_freeze_active": registry_snapshot().get("threshold_freeze_active"),
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception("Error getting day gate counters: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/gates/registry")
+async def get_day_gate_registry() -> dict[str, Any]:
+    """Versioned DAY gate registry snapshot."""
+    try:
+        from backend.services.day_gate_registry import registry_snapshot
+
+        return {"success": True, "data": registry_snapshot(), "timestamp": datetime.now(timezone.utc).isoformat()}
+    except Exception as e:
+        logger.exception("Error getting day gate registry: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/attribution/today")
+async def get_day_attribution_today(date: str | None = None) -> dict[str, Any]:
+    """Executed PnL + gate opportunity (shadow rejects) for DAY measurement window."""
+    try:
+        from backend.services.day_gate_telemetry import attribution_report, ensure_day_gate_schema, shadow_rejects_summary
+
+        ensure_day_gate_schema(DATABASE_PATH)
+        report = attribution_report(DATABASE_PATH, date=date)
+        shadows = shadow_rejects_summary(DATABASE_PATH, limit=30)
+        return {
+            "success": True,
+            "data": {**report, "shadow_summary": shadows},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception("Error getting day attribution: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.get("/positions")
 async def get_open_positions() -> dict[str, Any]:
     """

@@ -6,6 +6,7 @@ import json
 import logging
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +111,61 @@ def scalp_strategies() -> dict:
         "disabled": sorted(config.disabled_strategies),
         "disabled_env": "SCALP_DISABLED_STRATEGIES",
     }
+
+
+@router.get("/gates/today")
+def scalp_gates_today(date: str | None = None) -> dict[str, Any]:
+    """SCALP gate counters for today — top blockers by hard_blocked."""
+    try:
+        from backend.services.scalp_gate_registry import registry_snapshot
+        from backend.services.scalp_gate_telemetry import counters_today, ensure_scalp_gate_schema
+
+        cfg = get_scalp_config()
+        ensure_scalp_gate_schema(cfg.database_path)
+        rows = counters_today(cfg.database_path, date=date)
+        snap = registry_snapshot()
+        return {
+            "success": True,
+            "engine": "scalp",
+            "date": date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "data": {"gates": rows, "top_blockers": rows[:15]},
+            "registry": {
+                "decision_policy_version": snap.get("decision_policy_version"),
+                "threshold_freeze_active": snap.get("threshold_freeze_active"),
+            },
+        }
+    except Exception as exc:
+        return {"success": False, "engine": "scalp", "error": str(exc)[:240]}
+
+
+@router.get("/gates/registry")
+def scalp_gates_registry() -> dict[str, Any]:
+    """Versioned SCALP gate registry snapshot."""
+    try:
+        from backend.services.scalp_gate_registry import registry_snapshot
+
+        return {"success": True, "engine": "scalp", "data": registry_snapshot()}
+    except Exception as exc:
+        return {"success": False, "engine": "scalp", "error": str(exc)[:240]}
+
+
+@router.get("/attribution/today")
+def scalp_attribution_today(date: str | None = None) -> dict[str, Any]:
+    """Executed SCALP PnL + gate opportunity (shadow rejects) for measurement window."""
+    try:
+        from backend.services.scalp_gate_telemetry import (
+            attribution_report,
+            ensure_scalp_gate_schema,
+            shadow_rejects_summary,
+        )
+
+        cfg = get_scalp_config()
+        ensure_scalp_gate_schema(cfg.database_path)
+        report = attribution_report(cfg.database_path, date=date)
+        shadows = shadow_rejects_summary(cfg.database_path, limit=30)
+        return {"success": True, "engine": "scalp", "data": {**report, "shadow_summary": shadows}}
+    except Exception as exc:
+        return {"success": False, "engine": "scalp", "error": str(exc)[:240]}
 
 
 @router.get("/telemetry")

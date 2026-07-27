@@ -198,11 +198,39 @@ class ScalpStrategyRouter:
                 entry_eligible = False
                 soft_reason = "MTF_15M_NOT_ALIGNED"
                 selection_confidence = "mtf_confirmation_blocked"
+            if not entry_eligible and soft_reason and "MTF_" in str(soft_reason):
+                try:
+                    import os
+
+                    from backend.services.scalp_gate_telemetry import record_gate_event, record_shadow_reject
+
+                    _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
+                    record_gate_event(
+                        _db,
+                        gate_id="MTF_NOT_ALIGNED",
+                        symbol=sym,
+                        outcome="hard_blocked",
+                        setup=best_ranked.signal.setup_name,
+                        detail=str(soft_reason),
+                    )
+                    record_shadow_reject(
+                        _db,
+                        symbol=sym,
+                        gate_id="MTF_NOT_ALIGNED",
+                        setup=best_ranked.signal.setup_name,
+                        entry_price=float(getattr(best_ranked.signal, "limit_buy_price", 0.0) or 0.0),
+                        detail=str(soft_reason),
+                    )
+                except Exception:
+                    pass
 
         meta["entry_eligible"] = entry_eligible
         meta["hard_block"] = hard_block
         meta["soft_reason"] = soft_reason
         meta["selection_confidence"] = selection_confidence
+        meta["entry_owner"] = "strategy"
+        meta["ml_role"] = "rank_size"
+        meta["decision_policy_version"] = "scalp_strategy_owner_v1"
 
         if entry_eligible:
             entry_sig = prepare_entry_signal(best_ranked, ctx)

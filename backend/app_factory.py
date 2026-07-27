@@ -432,6 +432,15 @@ async def lifespan(app: FastAPI):
         logger.exception("[LIFESPAN] Live safety startup check failed: %s", e)
         raise
 
+    try:
+        from backend.services.day_gate_registry import warn_or_fail_day_ml_bypass
+
+        warn_or_fail_day_ml_bypass(fail_in_live=True)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        logger.warning("[LIFESPAN] DAY ML bypass safety check skipped: %s", e)
+
     with contextlib.suppress(Exception):
         from backend.services.operator_config_service import apply_runtime_config
 

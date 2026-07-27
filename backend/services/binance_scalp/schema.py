@@ -24,6 +24,8 @@ SCALP_TABLES = (
     "scalp_outcome_attribution",
     "scalp_post_trade_feature_reviews",
     "scalp_strategy_score_weights",
+    "scalp_gate_counters",
+    "scalp_shadow_rejects",
 )
 
 SCHEMA_VERSION = 3
@@ -366,6 +368,13 @@ def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list
             ensure_scalp_post_trade_review_table(str(path))
             ensure_scalp_strategy_score_weights_table(str(path))
             applied.append("ensure_scalp_intelligence_tables")
+        except Exception:
+            pass
+        try:
+            from backend.services.scalp_gate_telemetry import ensure_scalp_gate_schema
+
+            ensure_scalp_gate_schema(str(path))
+            applied.append("ensure_scalp_gate_tables")
         except Exception:
             pass
         conn.commit()

@@ -715,11 +715,30 @@ class AccountStatus(Enum):
 
 
 class KillSwitchMode(Enum):
-    """Kill switch modes for instant trading control"""
+    """Kill switch modes for instant trading control.
+
+    Semantics (day_aw_owner_v1 / measurement-first):
+
+    - RESUME: buys and sells allowed (subject to other gates).
+    - PAUSE_BUYS / PAUSE_ALL_ENTRIES: block new entries only; all sells allowed
+      (including discretionary, protective, AW ATR, thesis invalidation).
+    - PAUSE_ALL: block new entries; block *discretionary* sells only.
+      Protective/emergency exits remain available: STOP_LOSS, ALLWEATHER_ATR_STOP,
+      EXTREME_PROTECTION, STALL_*, FORCE_FLATTEN, thesis invalidation, force_sell.
+      This is an intentional change from a total operational freeze — entry pause
+      must never trap open risk.
+    - EMERGENCY_FLATTEN: block buys; all sells allowed (flatten path).
+
+    Exchange-side stops (if any) are outside this enum and are never cancelled
+    by these modes. Manual operator halt should use PAUSE_BUYS or EMERGENCY_FLATTEN
+    unless a true total freeze is explicitly required.
+    """
 
     RESUME = "RESUME"  # Normal operation
-    PAUSE_BUYS = "PAUSE_BUYS"  # Block BUYs only, allow SELLs
-    PAUSE_ALL = "PAUSE_ALL"  # Block all BUYs and SELLs
+    PAUSE_BUYS = "PAUSE_BUYS"  # Block BUYs only, allow SELLs (incl. protective)
+    PAUSE_ALL_ENTRIES = "PAUSE_ALL_ENTRIES"  # Alias of PAUSE_BUYS — entries only
+    PAUSE_ALL = "PAUSE_ALL"  # Block BUYs; block non-protective SELLs only
+    EMERGENCY_FLATTEN = "EMERGENCY_FLATTEN"  # Block BUYs; always allow SELLs
 
 
 class RegimeGuard(Enum):
@@ -1822,6 +1841,8 @@ class PortfolioEngine:
 
         # Item 6: Pending orders
         self._pending_orders: dict[str, PendingOrder] = {}
+        # Atomic entry reservations (cash/slot/symbol) held until fill or release
+        self._entry_reservations: dict[str, dict[str, Any]] = {}
 
         # Item 7: Scoreboard
         self._startup_timestamp = time.time()
@@ -6945,6 +6966,10 @@ class PortfolioEngine:
         can_buy, kill_reason = self._check_kill_switch_buy()
         if not can_buy:
             logger.warning(f"BUY_BLOCKED: {symbol} - {kill_reason}")
+            with contextlib.suppress(Exception):
+                from backend.services.day_gate_telemetry import record_gate_event
+
+                record_gate_event(self.db_path, gate_id="KILL_SWITCH_BUY", symbol=symbol, outcome="hard_blocked", detail=kill_reason, decision_id=str(decision_id or ""))
             await self._record_reject(
                 symbol,
                 "BUY",
@@ -6986,21 +7011,8 @@ class PortfolioEngine:
         # =================================================================
         from backend.services.ai_artifact_contract_gate import evaluate_explainability_artifact_contract
 
-        # Narrow ML-edge bypass only — never bypass for generic strategy_id "day".
-        _ml_bypass_artifact = False
-        try:
-            _dd_local = {}
-            _family = str(_dd_local.get("strategy_family") or getattr(explainability, "strategy_family", "") or "")
-            _margin = float(_dd_local.get("buy_margin") or _dd_local.get("redis_buy_margin_key") or 0)
-            if _dd_local.get("ml_enriched") or _family == "ML_EDGE" or (_family.startswith("ML") and _margin > 0.05):
-                _ml_bypass_artifact = True
-        except Exception:
-            pass
-
-        if _ml_bypass_artifact:
-            ok_ac, ac_code, ac_detail = True, None, {"ml_edge_bypass": True}
-        else:
-            ok_ac, ac_code, ac_detail = evaluate_explainability_artifact_contract(explainability)
+        # Fail-closed for all DAY paths — no ML artifact bypass (day_aw_owner_v1).
+        ok_ac, ac_code, ac_detail = evaluate_explainability_artifact_contract(explainability)
         if not ok_ac:
             logger.warning(
                 "BUY_BLOCKED_ARTIFACT_CONTRACT: %s code=%s detail=%s",
@@ -7008,6 +7020,17 @@ class PortfolioEngine:
                 ac_code,
                 ac_detail,
             )
+            with contextlib.suppress(Exception):
+                from backend.services.day_gate_telemetry import record_gate_event
+
+                record_gate_event(
+                    self.db_path,
+                    gate_id="ARTIFACT_CONTRACT",
+                    symbol=symbol,
+                    outcome="hard_blocked",
+                    detail=str(ac_code or ""),
+                    decision_id=str(decision_id or ""),
+                )
             await self._record_reject(
                 symbol,
                 "BUY",
@@ -7057,6 +7080,17 @@ class PortfolioEngine:
                 str(getattr(explainability, "ctx_age_sec", -1.0)),
                 redis_ctx_ts_utc,
             )
+            with contextlib.suppress(Exception):
+                from backend.services.day_gate_telemetry import record_gate_event
+
+                record_gate_event(
+                    self.db_path,
+                    gate_id="ENTRY_CONTEXT",
+                    symbol=symbol,
+                    outcome="hard_blocked",
+                    detail=str(ec_code or ""),
+                    decision_id=str(decision_id or ""),
+                )
             await self._record_reject(
                 symbol,
                 "BUY",
@@ -7470,6 +7504,17 @@ class PortfolioEngine:
                 )
             except Exception:
                 pass
+            with contextlib.suppress(Exception):
+                from backend.services.day_gate_telemetry import record_gate_event
+
+                record_gate_event(
+                    self.db_path,
+                    gate_id="ORDERBOOK_PREFLIGHT",
+                    symbol=normalized_symbol,
+                    outcome="hard_blocked",
+                    detail=str(preflight.reject_reason or ""),
+                    decision_id=str(decision_id or ""),
+                )
             await self._record_reject(
                 normalized_symbol,
                 "BUY",
@@ -7533,6 +7578,21 @@ class PortfolioEngine:
         can_open, block_reason = await self._can_open_position(symbol, total_cost)
         if not can_open:
             logger.warning(f"BUY_BLOCKED: {symbol} - {block_reason}")
+            _gate_id = "CASH_OR_SLOTS"
+            _br_u = str(block_reason or "").upper()
+            if "POSITION_ALREADY" in _br_u or "DUPLICATE" in _br_u:
+                _gate_id = "DUPLICATE_SYMBOL"
+            with contextlib.suppress(Exception):
+                from backend.services.day_gate_telemetry import record_gate_event
+
+                record_gate_event(
+                    self.db_path,
+                    gate_id=_gate_id,
+                    symbol=symbol,
+                    outcome="hard_blocked",
+                    detail=str(block_reason or ""),
+                    decision_id=str(decision_id or ""),
+                )
             await self._record_reject(
                 symbol,
                 "BUY",
@@ -7558,6 +7618,34 @@ class PortfolioEngine:
                 )
             return None
 
+        # Atomic cash/slot/symbol/risk/sleeve reservation before order submit (day_aw_owner_v1 safety)
+        _entry_reserved = False
+        _reserve_sleeve = sleeve or assign_sleeve(normalized_symbol, confidence)
+        async with self._global_cash_lock:
+            _ok_res, _res_reason = self._try_reserve_entry(
+                symbol,
+                total_cost,
+                decision_id=str(decision_id or ""),
+                risk_usd=float(total_cost) * 0.02,
+                sleeve=str(_reserve_sleeve or ""),
+            )
+            if not _ok_res:
+                logger.warning(f"BUY_BLOCKED_RESERVATION: {symbol} - {_res_reason}")
+                with contextlib.suppress(Exception):
+                    from backend.services.day_gate_telemetry import record_gate_event
+
+                    record_gate_event(
+                        self.db_path,
+                        gate_id="CASH_OR_SLOTS",
+                        symbol=symbol,
+                        outcome="hard_blocked",
+                        detail=str(_res_reason or ""),
+                        decision_id=str(decision_id or ""),
+                    )
+                await self._record_reject(symbol, "BUY", _res_reason, "ENTRY_RESERVATION", decision_id=decision_id, explainability=explainability)
+                return None
+            _entry_reserved = True
+
         # Resolve sleeve for position creation — controlled by ENABLE_SLEEVE_BLOCKING
         effective_sleeve = sleeve or assign_sleeve(normalized_symbol, confidence)
         sleeve_ok, sleeve_reason = self._check_sleeve_limits(effective_sleeve, total_cost)
@@ -7581,6 +7669,9 @@ class PortfolioEngine:
                             "execution_reason": f"SLEEVE_LIMIT:{sleeve_reason}",
                         },
                     )
+                if _entry_reserved:
+                    self._release_entry_reservation(symbol, decision_id=str(decision_id or ""), reason="SLEEVE_REJECT")
+                    _entry_reserved = False
                 return None
 
         # Cash double-check moved to just before debit, inside _global_cash_lock (PE-1).
@@ -7699,6 +7790,9 @@ class PortfolioEngine:
                             decision_id,
                             {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"LIVE_BUY_FAILED:{error_msg}"},
                         )
+                    if _entry_reserved:
+                        self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
+                        _entry_reserved = False
                     return None
 
                 live_order_buy = live_order_buy if isinstance(live_order_buy, dict) else {}
@@ -7728,6 +7822,9 @@ class PortfolioEngine:
                         decision_id,
                         {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"LIVE_BUY_ERROR:{e!s}"},
                     )
+                if _entry_reserved:
+                    self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
+                    _entry_reserved = False
                 return None
 
         # Persist trade row only after live order success (or when not in LIVE mode)
@@ -7737,6 +7834,9 @@ class PortfolioEngine:
         except Exception:
             # PE-2: INSERT failed — abort before any cash debit (fail-closed)
             logger.error("BUY_ABORTED: paper_trades INSERT failed for %s — aborting, cash NOT debited", symbol)
+            if _entry_reserved:
+                self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
+                _entry_reserved = False
             return None
 
         try:
@@ -7766,8 +7866,13 @@ class PortfolioEngine:
         # =================================================================
         # Global cash lock: final atomic check-then-debit across all concurrent symbol buys (PE-1).
         async with self._global_cash_lock:
-            if total_cost > self._available_balance:
-                reason = f"total_cost=${total_cost:.2f} > available=${self._available_balance:.2f}"
+            # Convert reservation → cash debit (release reserved notional first).
+            self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
+            _entry_reserved = False
+            pending_other = self._pending_buy_notional()
+            free_cash = float(self._available_balance) - pending_other
+            if total_cost > free_cash:
+                reason = f"total_cost=${total_cost:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_other:.2f})"
                 logger.error(f"BUY_BLOCKED_CASH_INVARIANT: {symbol} - {reason}")
                 await self._record_reject(
                     symbol,
@@ -8530,9 +8635,9 @@ class PortfolioEngine:
         }
 
         # =================================================================
-        # ITEM 1: KILL SWITCH CHECK (only PAUSE_ALL blocks sells)
+        # ITEM 1: KILL SWITCH CHECK (protective exits bypass entry pauses)
         # =================================================================
-        can_sell, kill_reason = self._check_kill_switch_sell()
+        can_sell, kill_reason = self._check_kill_switch_sell(exit_trigger=exit_trigger, force_sell=force_sell, exit_type=exit_type)
         if not can_sell:
             logger.warning(f"SELL_BLOCKED: {symbol} - {kill_reason}")
             return None
@@ -10193,6 +10298,149 @@ class PortfolioEngine:
             )
         return allowed, None
 
+    def _pending_buy_order_symbols(self) -> set[str]:
+        out: set[str] = set()
+        for p in (getattr(self, "_pending_orders", None) or {}).values():
+            if str(getattr(p, "side", "") or "").upper() == "BUY":
+                out.add(normalize_symbol(getattr(p, "symbol", "") or ""))
+        out.discard("")
+        return out
+
+    def _pending_buy_symbols(self) -> set[str]:
+        reservations = getattr(self, "_entry_reservations", None) or {}
+        return set(reservations.keys()) | self._pending_buy_order_symbols()
+
+    def _pending_buy_notional(self, *, exclude_symbol: str = "") -> float:
+        ex = normalize_symbol(exclude_symbol) if exclude_symbol else ""
+        n = 0.0
+        for sym, r in (getattr(self, "_entry_reservations", None) or {}).items():
+            if ex and normalize_symbol(sym) == ex:
+                continue
+            n += float((r or {}).get("notional") or 0.0)
+        for p in (getattr(self, "_pending_orders", None) or {}).values():
+            if str(getattr(p, "side", "") or "").upper() != "BUY":
+                continue
+            if ex and normalize_symbol(getattr(p, "symbol", "") or "") == ex:
+                continue
+            n += float(getattr(p, "remaining_qty", 0.0) or 0.0) * float(getattr(p, "price", 0.0) or 0.0)
+        return n
+
+    def _try_reserve_entry(
+        self,
+        symbol: str,
+        notional_usd: float,
+        *,
+        decision_id: str = "",
+        risk_usd: float = 0.0,
+        sleeve: str = "",
+    ) -> tuple[bool, str]:
+        """Reserve cash/slot/symbol/risk/sleeve under caller-held `_global_cash_lock`.
+
+        Persists to SQLite for restart recovery; idempotent on decision_id.
+        """
+        ns = normalize_symbol(symbol)
+        if not ns:
+            return False, "INVALID_SYMBOL"
+        did = str(decision_id or "").strip()
+        # Idempotent: same decision_id already reserved
+        if did:
+            for sym, r in (self._entry_reservations or {}).items():
+                if str((r or {}).get("decision_id") or "") == did:
+                    return True, "IDEMPOTENT_EXISTING"
+        if ns in self._entry_reservations:
+            existing = self._entry_reservations[ns]
+            if did and str((existing or {}).get("decision_id") or "") == did:
+                return True, "IDEMPOTENT_EXISTING"
+            return False, "ENTRY_ALREADY_RESERVED"
+        if ns in self._pending_buy_order_symbols():
+            return False, "ENTRY_PENDING_ORDER"
+        active_count = sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING")
+        pending_slots = len(self._pending_buy_symbols() - {normalize_symbol(s) for s in self.open_positions.keys()})
+        max_positions_limit = MAX_OPEN_POSITIONS
+        if active_count + pending_slots >= max_positions_limit:
+            return False, "MAX_POSITIONS_WITH_PENDING"
+        pending_n = self._pending_buy_notional()
+        if float(notional_usd) > float(self._available_balance) - pending_n + 1e-9:
+            return False, f"INSUFFICIENT_CASH_WITH_PENDING: need ${float(notional_usd):.2f}, free=${max(0.0, float(self._available_balance) - pending_n):.2f}"
+        # Sleeve capacity including pending reserved notional for same sleeve
+        if sleeve and ENABLE_SLEEVE_BLOCKING:
+            sleeve_pending = sum(
+                float((r or {}).get("notional") or 0.0)
+                for r in (self._entry_reservations or {}).values()
+                if str((r or {}).get("sleeve") or "") == str(sleeve)
+            )
+            sleeve_ok, sleeve_reason = self._check_sleeve_limits(str(sleeve), float(notional_usd) + sleeve_pending)
+            if not sleeve_ok:
+                return False, f"SLEEVE_CAPACITY:{sleeve_reason}"
+        reservation_id = ""
+        if did:
+            try:
+                from backend.services.day_entry_reservations import create_reservation
+
+                ok_p, reason_p, reservation_id = create_reservation(
+                    self.db_path,
+                    decision_id=did,
+                    symbol=ns,
+                    notional_usd=float(notional_usd),
+                    risk_usd=float(risk_usd or 0.0),
+                    sleeve=str(sleeve or ""),
+                )
+                if not ok_p:
+                    return False, reason_p
+                if reason_p == "IDEMPOTENT_EXISTING":
+                    self._entry_reservations[ns] = {
+                        "notional": float(notional_usd),
+                        "risk_usd": float(risk_usd or 0.0),
+                        "decision_id": did,
+                        "reservation_id": reservation_id,
+                        "sleeve": str(sleeve or ""),
+                        "ts": time.time(),
+                    }
+                    return True, "IDEMPOTENT_EXISTING"
+            except Exception as exc:
+                logger.warning("persistent reservation failed (in-memory only): %s", exc)
+        self._entry_reservations[ns] = {
+            "notional": float(notional_usd),
+            "risk_usd": float(risk_usd or 0.0),
+            "decision_id": did,
+            "reservation_id": reservation_id,
+            "sleeve": str(sleeve or ""),
+            "ts": time.time(),
+        }
+        return True, "OK"
+
+    def _release_entry_reservation(self, symbol: str, *, decision_id: str = "", reason: str = "RELEASED") -> None:
+        ns = normalize_symbol(symbol)
+        meta = self._entry_reservations.pop(ns, None) or {}
+        did = str(decision_id or meta.get("decision_id") or "")
+        rid = str(meta.get("reservation_id") or "")
+        with contextlib.suppress(Exception):
+            from backend.services.day_entry_reservations import release_reservation
+
+            release_reservation(self.db_path, reservation_id=rid, decision_id=did, symbol=ns, reason=reason)
+
+    def _reload_entry_reservations_from_db(self) -> None:
+        """Restart recovery for active entry reservations."""
+        with contextlib.suppress(Exception):
+            from backend.services.day_entry_reservations import expire_stale, load_active_reservations
+
+            expire_stale(self.db_path)
+            rows = load_active_reservations(self.db_path)
+            for r in rows:
+                ns = normalize_symbol(str(r.get("symbol") or ""))
+                if not ns:
+                    continue
+                self._entry_reservations[ns] = {
+                    "notional": float(r.get("notional_usd") or 0.0),
+                    "risk_usd": float(r.get("risk_usd") or 0.0),
+                    "decision_id": str(r.get("decision_id") or ""),
+                    "reservation_id": str(r.get("reservation_id") or ""),
+                    "sleeve": str(r.get("sleeve") or ""),
+                    "ts": float(r.get("created_at") or time.time()),
+                }
+            if rows:
+                logger.info("DAY_RESERVATIONS_RECOVERED count=%s", len(rows))
+
     async def _can_open_position(self, symbol: str, notional_usd: float) -> tuple[bool, str]:
         """
         PHASE 2: Check if new position is allowed.
@@ -10273,7 +10521,10 @@ class PortfolioEngine:
 
         # Check max positions (hard limit: 10)
         # DUST_INVARIANT: Exclude DUST_PENDING from count - dust must not block new buys
+        # Count pending entry reservations / pending BUY orders toward slot exposure.
         active_count = sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING")
+        pending_slot_symbols = self._pending_buy_symbols() - {normalize_symbol(s) for s in self.open_positions.keys()}
+        pending_slots = len(pending_slot_symbols)
         max_positions_limit = MAX_OPEN_POSITIONS
         from backend.config.live_test_mode import live_test_max_open_positions_limit
         from backend.services.execution_mode_service import is_live_execution_allowed_sync
@@ -10282,17 +10533,23 @@ class PortfolioEngine:
             live_cap = live_test_max_open_positions_limit()
             if live_cap is not None:
                 max_positions_limit = live_cap
-        if active_count >= max_positions_limit:
+        if symbol in self._pending_buy_symbols():
+            logger.info(f"BUY_BLOCKED_PENDING_ENTRY: {symbol} - reservation or pending buy already exists")
+            return False, "ENTRY_RESERVED_OR_PENDING"
+        if active_count + pending_slots >= max_positions_limit:
             if PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK:
                 logger.info(
-                    "QUALITY_TELEMETRY BUY_BLOCKED_MAX_POSITIONS would_block symbol=%s active=%s total_open=%s/%s (PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK=true — not enforcing)",
+                    "QUALITY_TELEMETRY BUY_BLOCKED_MAX_POSITIONS would_block symbol=%s active=%s pending_slots=%s total_open=%s/%s (PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK=true — not enforcing)",
                     symbol,
                     active_count,
+                    pending_slots,
                     len(self.open_positions),
                     max_positions_limit,
                 )
             else:
-                logger.info(f"BUY_BLOCKED_MAX_POSITIONS: {symbol} - portfolio full (active={active_count}, total={len(self.open_positions)}/{max_positions_limit})")
+                logger.info(
+                    f"BUY_BLOCKED_MAX_POSITIONS: {symbol} - portfolio full (active={active_count}, pending_slots={pending_slots}, total={len(self.open_positions)}/{max_positions_limit})"
+                )
                 return False, "MAX_POSITIONS_REACHED"
 
         # NON-BLOCKING BY DESIGN: bear regime is advisory context for ranking/sizing,
@@ -10387,20 +10644,28 @@ class PortfolioEngine:
                         return False, "POSITION_ALREADY_OPEN"
 
         # CRITICAL: Check cash available (enforce conservation of money)
-        if self._available_balance <= 0:
-            logger.warning(f"BUY_BLOCKED_NO_CASH: {symbol} - available_balance=${self._available_balance:.2f}")
+        # Pending entry reservations and in-flight BUY orders reduce free cash.
+        pending_notional = self._pending_buy_notional()
+        free_cash = float(self._available_balance) - pending_notional
+        if free_cash <= 0:
+            logger.warning(
+                f"BUY_BLOCKED_NO_CASH: {symbol} - available_balance=${self._available_balance:.2f} pending=${pending_notional:.2f}"
+            )
             return False, "INSUFFICIENT_CASH"
 
-        if notional_usd > self._available_balance:
-            logger.info(f"BUY_BLOCKED_INSUFFICIENT_CASH: {symbol} - notional=${notional_usd:.2f} > available=${self._available_balance:.2f}")
-            return False, f"INSUFFICIENT_CASH: need ${notional_usd:.2f}, have ${self._available_balance:.2f}"
+        if notional_usd > free_cash:
+            logger.info(
+                f"BUY_BLOCKED_INSUFFICIENT_CASH: {symbol} - notional=${notional_usd:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_notional:.2f})"
+            )
+            return False, f"INSUFFICIENT_CASH: need ${notional_usd:.2f}, have ${free_cash:.2f}"
 
-        # Check portfolio risk cap
+        # Check portfolio risk cap (include reserved entry risk when present)
         total_open_risk = self._calculate_total_open_risk()
+        reserved_risk = sum(float((r or {}).get("risk_usd") or 0.0) for r in (getattr(self, "_entry_reservations", None) or {}).values())
         equity = self._total_equity
 
         if equity > 0:
-            open_risk_pct = total_open_risk / equity
+            open_risk_pct = (total_open_risk + reserved_risk) / equity
             if open_risk_pct >= MAX_TOTAL_OPEN_RISK_PCT:
                 logger.info(f"BUY_BLOCKED_RISK_CAP: {symbol} - risk {open_risk_pct:.2%} >= {MAX_TOTAL_OPEN_RISK_PCT:.2%}")
                 return False, f"RISK_CAP_EXCEEDED: {open_risk_pct:.2%}"
@@ -13222,16 +13487,24 @@ class PortfolioEngine:
             _thesis_kept: list[BuyCandidate] = []
             for _tc in valid_candidates:
                 _entry_thesis = str((_tc.decision_data or {}).get("entry_thesis") or (_tc.decision_data or {}).get("setup_type") or "")
-                _bmt = 0.0
-                try:
-                    _bmt = float((_tc.decision_data or {}).get("buy_margin") or (_tc.decision_data or {}).get("redis_buy_margin_key") or 0)
-                except Exception:
-                    pass
-                _mlt = bool((_tc.decision_data or {}).get("ml_enriched") or str((_tc.decision_data or {}).get("strategy_family", "")).upper() == "ML_EDGE")
-                if _entry_thesis == SETUP_NO_CLEAR_THESIS and _tc.symbol not in self.open_positions and not (_mlt and _bmt > 0.02):
+                # No ML buy_margin bypass — thesis required for new opens (day_aw_owner_v1).
+                if _entry_thesis == SETUP_NO_CLEAR_THESIS and _tc.symbol not in self.open_positions:
                     logger.info("THESIS_ENTRY_BLOCK: %s no clear thesis -> entry skipped", _tc.symbol)
                     await self._bar_pipeline_terminal(_tc.decision_id, "BAR_PRE_RANK_FILTERED", pipeline_done)
                     await self._record_learning_snapshot(_tc, "BLOCK", "NO_CLEAR_THESIS")
+                    try:
+                        from backend.services.day_gate_telemetry import record_gate_event
+
+                        record_gate_event(
+                            self.db_path,
+                            gate_id="THESIS_NO_CLEAR",
+                            symbol=_tc.symbol,
+                            outcome="hard_blocked",
+                            setup=_entry_thesis,
+                            decision_id=str(_tc.decision_id or ""),
+                        )
+                    except Exception:
+                        pass
                     continue
                 _thesis_kept.append(_tc)
             valid_candidates = _thesis_kept
@@ -13244,9 +13517,11 @@ class PortfolioEngine:
         _awbp_exec = False
         try:
             from backend.services import allweather_breakout_pullback_adapter as _awbp_mod
+            from backend.services.day_gate_registry import day_aw_owner_enabled
 
             _awbp_active = _awbp_mod.adapter_active()
-            _awbp_exec = _awbp_mod.execution_enabled()
+            # Authority: DAY_AW_OWNER_ENABLED (default true) makes AW sole qualifier.
+            _awbp_exec = bool(_awbp_mod.execution_enabled() or day_aw_owner_enabled())
         except Exception:
             _awbp_active = False
             _awbp_exec = False
@@ -13285,12 +13560,57 @@ class PortfolioEngine:
                     )
                     await self._bar_pipeline_terminal(_tc.decision_id, "ALLWEATHER_BP_EVAL_ERROR", pipeline_done)
                     await self._record_learning_snapshot(_tc, "HOLD", "ALLWEATHER_BP_EVAL_ERROR")
+                    try:
+                        from backend.services.day_gate_telemetry import record_gate_event, record_shadow_reject
+
+                        record_gate_event(
+                            self.db_path,
+                            gate_id="AW_EVAL_ERROR",
+                            symbol=_tc.symbol,
+                            outcome="hard_blocked",
+                            decision_id=str(_tc.decision_id or ""),
+                        )
+                        record_shadow_reject(
+                            self.db_path,
+                            candidate=_tc,
+                            gate_id="AW_EVAL_ERROR",
+                            bar_timestamp=int(bar_timestamp),
+                        )
+                    except Exception:
+                        pass
                     continue
                 if getattr(_awbp_outcome, "ok", False):
                     _gates = self._apply_allweather_production_gates(_tc)
                     if _gates.get("allowed"):
+                        _dd_stamp = dict(_tc.decision_data or {})
+                        _dd_stamp.setdefault("entry_owner", "allweather")
+                        _dd_stamp.setdefault("ml_role", "rank_size")
+                        _dd_stamp.setdefault("decision_policy_version", "day_aw_owner_v1")
+                        _dd_stamp["bar_closed"] = bool(getattr(_awbp_outcome, "bar_closed", True))
+                        if getattr(_awbp_outcome, "closed_bar_ts", 0):
+                            _dd_stamp["closed_bar_ts"] = int(_awbp_outcome.closed_bar_ts)
+                        _tc.decision_data = _dd_stamp
                         _routed.append(_tc)
+                        try:
+                            from backend.services.day_gate_telemetry import record_gate_event
+
+                            record_gate_event(
+                                self.db_path,
+                                gate_id="AW_SETUP_PASS",
+                                symbol=_tc.symbol,
+                                outcome="passed",
+                                setup=str(_dd_stamp.get("setup_type") or ""),
+                                regime=str(_dd_stamp.get("allweather_regime") or _dd_stamp.get("aw_regime") or ""),
+                                decision_id=str(_tc.decision_id or ""),
+                            )
+                        except Exception:
+                            pass
                     else:
+                        _block_r = str(
+                            (_gates.get("route") or {}).get("block_reason")
+                            or (_gates.get("bucket") or {}).get("block_reason")
+                            or "ALLWEATHER_BP"
+                        )
                         logger.info(
                             "ALLWEATHER_BP_BLOCK symbol=%s route=%s bucket=%s",
                             _tc.symbol,
@@ -13298,11 +13618,27 @@ class PortfolioEngine:
                             (_gates.get("bucket") or {}).get("block_reason"),
                         )
                         await self._bar_pipeline_terminal(_tc.decision_id, "ALLWEATHER_BP_BLOCKED", pipeline_done)
-                        await self._record_learning_snapshot(
-                            _tc,
-                            "BLOCK",
-                            str((_gates.get("route") or {}).get("block_reason") or (_gates.get("bucket") or {}).get("block_reason") or "ALLWEATHER_BP"),
-                        )
+                        await self._record_learning_snapshot(_tc, "BLOCK", _block_r)
+                        try:
+                            from backend.services.day_gate_telemetry import record_gate_event, record_shadow_reject
+
+                            record_gate_event(
+                                self.db_path,
+                                gate_id="AW_ROUTE_BLOCK",
+                                symbol=_tc.symbol,
+                                outcome="hard_blocked",
+                                decision_id=str(_tc.decision_id or ""),
+                                detail=_block_r,
+                            )
+                            record_shadow_reject(
+                                self.db_path,
+                                candidate=_tc,
+                                gate_id="AW_ROUTE_BLOCK",
+                                bar_timestamp=int(bar_timestamp),
+                                detail=_block_r,
+                            )
+                        except Exception:
+                            pass
                 else:
                     _diag = getattr(_awbp_outcome, "no_signal_diag", None) or {}
                     logger.info(
@@ -13333,15 +13669,29 @@ class PortfolioEngine:
                     )
                     await self._bar_pipeline_terminal(_tc.decision_id, "ALLWEATHER_BP_NO_SIGNAL", pipeline_done)
                     await self._record_learning_snapshot(_tc, "HOLD", "ALLWEATHER_BP_NO_SIGNAL")
-                _dml = _tc.decision_data or {}
-                _bml = 0.0
-                try:
-                    _bml = float(_dml.get("buy_margin") or _dml.get("redis_buy_margin_key") or 0)
-                except Exception:
-                    pass
-                _isml = bool(_dml.get("ml_enriched") or str(_dml.get("strategy_family", "")).upper() == "ML_EDGE")
-                if not (_isml and _bml > 0.02):
-                    continue
+                    try:
+                        from backend.services.day_gate_telemetry import record_gate_event, record_shadow_reject
+
+                        _aw_gate = "CLOSED_BAR" if _diag.get("closed_bar_defer") else "AW_NO_SIGNAL"
+                        record_gate_event(
+                            self.db_path,
+                            gate_id=_aw_gate,
+                            symbol=_tc.symbol,
+                            outcome="hard_blocked",
+                            regime=str(_diag.get("regime") or ""),
+                            decision_id=str(_tc.decision_id or ""),
+                        )
+                        record_shadow_reject(
+                            self.db_path,
+                            candidate=_tc,
+                            gate_id=_aw_gate,
+                            bar_timestamp=int(bar_timestamp),
+                            diag=_diag,
+                        )
+                    except Exception:
+                        pass
+                # AW execution path is terminal — no ML margin fall-through (day_aw_owner_v1).
+                continue
             if _awbp_active:
                 _awbp_outcome = await self._apply_allweather_breakout_pullback_candidate(_tc)
                 if getattr(_awbp_outcome, "ok", False) and not _awbp_exec:
@@ -13447,26 +13797,37 @@ class PortfolioEngine:
         valid_candidates = _routed
 
         # Re-apply buy-intent priority on the *final* routed list (after AW / route pruning).
-        # Ensures that if XRP etc survived to _routed, they lead and ETH/holds don't.
-        try:
+        # When AW owns entry, do not drop AW-passed candidates on ML hold/margin.
+        # ML buy_margin is rank preference only (day_aw_owner_v1).
+        if not _awbp_exec:
+            try:
 
-            def _is_positive_buy_intent(cc):
-                d = (getattr(cc, "decision_data", None) or {}) if cc else {}
-                bm = 0.0
-                try:
-                    bm = float(d.get("buy_margin") or d.get("redis_buy_margin_key") or d.get("buy_margin_raw") or 0)
-                except Exception:
+                def _is_positive_buy_intent(cc):
+                    d = (getattr(cc, "decision_data", None) or {}) if cc else {}
                     bm = 0.0
-                is_ml = bool(d.get("ml_enriched") or str(d.get("strategy_family", "")).upper() == "ML_EDGE" or str(d.get("live_ai_strategy", "")).lower() == "day")
-                side = str(d.get("side") or d.get("argmax_action") or d.get("prediction") or "").strip().lower()
-                return (bm > 0.015) or (is_ml and bm > 0.0) or (side == "buy" and bm > 0.0)
+                    try:
+                        bm = float(d.get("buy_margin") or d.get("redis_buy_margin_key") or d.get("buy_margin_raw") or 0)
+                    except Exception:
+                        bm = 0.0
+                    is_ml = bool(
+                        d.get("ml_enriched")
+                        or str(d.get("strategy_family", "")).upper() == "ML_EDGE"
+                        or str(d.get("live_ai_strategy", "")).lower() == "day"
+                    )
+                    side = str(d.get("side") or d.get("argmax_action") or d.get("prediction") or "").strip().lower()
+                    return (bm > 0.015) or (is_ml and bm > 0.0) or (side == "buy" and bm > 0.0)
 
-            bi = [c for c in valid_candidates if _is_positive_buy_intent(c)]
-            if bi:
-                valid_candidates = bi
-                logger.info("ML_BUY_PRIORITY: using %d buy-intent candidates (holds excluded from buy exec this bar)", len(bi))
-        except Exception:
-            pass
+                bi = [c for c in valid_candidates if _is_positive_buy_intent(c)]
+                if bi:
+                    valid_candidates = bi
+                    logger.info("ML_BUY_PRIORITY: using %d buy-intent candidates (holds excluded from buy exec this bar)", len(bi))
+            except Exception:
+                pass
+        else:
+            logger.info(
+                "ML_RANK_SIZE_ONLY: %d AW-passed candidates (ML margin used for rank/size only)",
+                len(valid_candidates),
+            )
 
         if _awbp_exec or _awbp_active:
             try:
@@ -13532,36 +13893,46 @@ class PortfolioEngine:
         # still blocked later in _can_open_position; this only affects ordering/telemetry).
         # Rank by net expectancy after fees (primary), not confidence alone.
 
-        # ML/edge buy prioritization: if positive buy_margin or ML stamped buys exist, restrict the list
-        # to them. This ensures a real model buy (XRP +0.37 margin, conf 0.68) wins selection over hold signals
-        # with higher raw conf. Without this the app adds candidates + stamps but never executes.
-        try:
+        # Second pass: when AW owns entry, keep all AW-passed; ML margin is sort key only.
+        if not _awbp_exec:
+            try:
 
-            def _is_positive_buy_intent(cc):
-                d = (getattr(cc, "decision_data", None) or {}) if cc else {}
-                bm = 0.0
-                try:
-                    bm = float(d.get("buy_margin") or d.get("redis_buy_margin_key") or d.get("buy_margin_raw") or 0)
-                except Exception:
+                def _is_positive_buy_intent2(cc):
+                    d = (getattr(cc, "decision_data", None) or {}) if cc else {}
                     bm = 0.0
-                is_ml = bool(d.get("ml_enriched") or str(d.get("strategy_family", "")).upper() == "ML_EDGE" or str(d.get("live_ai_strategy", "")).lower() == "day")
-                side = str(d.get("side") or d.get("argmax_action") or d.get("prediction") or "").strip().lower()
-                return (bm > 0.015) or (is_ml and bm > 0.0) or (side == "buy" and bm > 0.0)
+                    try:
+                        bm = float(d.get("buy_margin") or d.get("redis_buy_margin_key") or d.get("buy_margin_raw") or 0)
+                    except Exception:
+                        bm = 0.0
+                    is_ml = bool(
+                        d.get("ml_enriched")
+                        or str(d.get("strategy_family", "")).upper() == "ML_EDGE"
+                        or str(d.get("live_ai_strategy", "")).lower() == "day"
+                    )
+                    side = str(d.get("side") or d.get("argmax_action") or d.get("prediction") or "").strip().lower()
+                    return (bm > 0.015) or (is_ml and bm > 0.0) or (side == "buy" and bm > 0.0)
 
-            bi = [c for c in valid_candidates if _is_positive_buy_intent(c)]
-            if bi:
-                valid_candidates = bi
-                logger.info("ML_BUY_PRIORITY: using %d buy-intent candidates (holds excluded from buy exec this bar)", len(bi))
-        except Exception:
-            pass
+                bi = [c for c in valid_candidates if _is_positive_buy_intent2(c)]
+                if bi:
+                    valid_candidates = bi
+                    logger.info("ML_BUY_PRIORITY: using %d buy-intent candidates (holds excluded from buy exec this bar)", len(bi))
+            except Exception:
+                pass
 
-        valid_candidates.sort(
-            key=lambda c: (
+        def _ml_rank_key(c):
+            d = c.decision_data or {}
+            try:
+                bm = float(d.get("buy_margin") or d.get("redis_buy_margin_key") or 0.0)
+            except Exception:
+                bm = 0.0
+            return (
                 c.symbol in self.open_positions,
-                -float((c.decision_data or {}).get("final_selection_score") or (c.decision_data or {}).get("selection_score") or 0.0),
-                -float((c.decision_data or {}).get("outcome_adjusted_rank_score") or c.rank_score()),
+                -float(d.get("final_selection_score") or d.get("selection_score") or 0.0),
+                -bm,  # ML rank preference among AW-passed
+                -float(d.get("outcome_adjusted_rank_score") or c.rank_score()),
             )
-        )
+
+        valid_candidates.sort(key=_ml_rank_key)
 
         from backend.services.symbol_setup_outcome_penalty import assign_v3_selection_ranks
 
@@ -13638,6 +14009,22 @@ class PortfolioEngine:
                     _cand.decision_data["buy_margin_exec_status"] = "below_threshold_penalty_only"
                     _cand.decision_data["buy_margin_penalty_exec"] = 4.0
             if _bm_fail:
+                with contextlib.suppress(Exception):
+                    from backend.services.day_gate_telemetry import record_gate_event, record_shadow_reject
+
+                    record_gate_event(
+                        self.db_path,
+                        gate_id="BUY_MARGIN_FLOOR",
+                        symbol=str(_sym),
+                        outcome="hard_blocked",
+                        decision_id=str(getattr(_cand, "decision_id", "") or ""),
+                    )
+                    record_shadow_reject(
+                        self.db_path,
+                        candidate=_cand,
+                        gate_id="BUY_MARGIN_FLOOR",
+                        bar_timestamp=int(bar_timestamp or 0),
+                    )
                 await self._bar_pipeline_terminal(_cand.decision_id, "BAR_BUY_MARGIN_BLOCKED", pipeline_done)
                 continue
             _spread_raw = _cand.decision_data.get("spread_pct")
@@ -13897,6 +14284,23 @@ class PortfolioEngine:
                 },
             )
             logger.info(f"PROCESS_BAR: {symbol} - SKIPPED due to insufficient cash/min size (dyn_cap_reason={dyn_cap_reason})")
+            if dyn_cap_reason == "REJECTED_STALL_RISK_GATE":
+                with contextlib.suppress(Exception):
+                    from backend.services.day_gate_telemetry import record_gate_event, record_shadow_reject
+
+                    record_gate_event(
+                        self.db_path,
+                        gate_id="STALL_RISK_HARD",
+                        symbol=symbol,
+                        outcome="hard_blocked",
+                        decision_id=str(getattr(top_candidate, "decision_id", "") or ""),
+                    )
+                    record_shadow_reject(
+                        self.db_path,
+                        candidate=top_candidate,
+                        gate_id="STALL_RISK_HARD",
+                        bar_timestamp=int(bar_timestamp or 0),
+                    )
             await self._bar_pipeline_terminal(top_candidate.decision_id, "BAR_SIZING_ZERO", pipeline_done)
             await self._bar_pipeline_not_selected_others(bar_candidate_snapshot, top_candidate.decision_id or "", pipeline_done)
             self.current_bar_candidates.clear()
@@ -14324,56 +14728,79 @@ class PortfolioEngine:
             return None
 
         # Final EV discipline: selected candidate must have positive net expected value.
-        if float(top_net_ev) <= 0.0:
-            # ML / positive buy_margin bypass for paper+learning: model has edge, allow small/forced positive so it trades and produces outcomes to learn from.
-            _dd_ev = top_candidate.decision_data or {}
-            _bm_ev = 0.0
+        # Default: no ML_EV_BYPASS (day_aw_owner_v1). Rollback only if DAY_ML_BYPASS_ENABLED=true.
+        _ml_ev_bypass = False
+        try:
+            from backend.services.day_gate_registry import day_ml_bypass_enabled
+
+            _dd_ev = dict(getattr(top_candidate, "decision_data", None) or {})
+            _bm_ev = float(_dd_ev.get("buy_margin") or 0.0)
+            if day_ml_bypass_enabled() and bool(_dd_ev.get("ml_enriched")) and _bm_ev > 0.01:
+                _ml_ev_bypass = True
+                logger.warning(
+                    "ML_EV_BYPASS_ACTIVE (rollback flag DAY_ML_BYPASS_ENABLED) symbol=%s bm=%.4f",
+                    symbol,
+                    _bm_ev,
+                )
+        except Exception:
+            _ml_ev_bypass = False
+        if float(top_net_ev) <= 0.0 and not _ml_ev_bypass:
+            await self._emit_day_health_telemetry("BEST_CANDIDATE_NEGATIVE_EV")
+            logger.info(
+                "BEST_CANDIDATE_NEGATIVE_EV: symbol=%s strategy=%s net_ev=%.6f -> no_trade",
+                symbol,
+                str((top_candidate.decision_data or {}).get("live_ai_strategy") or "day"),
+                float(top_net_ev),
+            )
             try:
-                _bm_ev = float(_dd_ev.get("buy_margin") or _dd_ev.get("redis_buy_margin_key") or 0)
+                from backend.services.day_gate_telemetry import record_gate_event, record_shadow_reject
+
+                record_gate_event(
+                    self.db_path,
+                    gate_id="NEGATIVE_EV",
+                    symbol=str(symbol),
+                    outcome="hard_blocked",
+                    setup=str((top_candidate.decision_data or {}).get("setup_type") or ""),
+                    decision_id=str(top_candidate.decision_id or ""),
+                )
+                record_shadow_reject(
+                    self.db_path,
+                    candidate=top_candidate,
+                    gate_id="NEGATIVE_EV",
+                    bar_timestamp=int(bar_timestamp),
+                )
             except Exception:
                 pass
-            _is_ml_ev = bool(_dd_ev.get("ml_enriched") or str(_dd_ev.get("strategy_family", "")).upper() == "ML_EDGE")
-            if _is_ml_ev and _bm_ev > 0.01:
-                top_net_ev = max(0.0008, float(_dd_ev.get("net_ev") or 0.0008))
-                logger.info("ML_EV_BYPASS: symbol=%s bm=%.4f forcing positive_ev=%.6f for learning", symbol, _bm_ev, top_net_ev)
-            else:
-                await self._emit_day_health_telemetry("BEST_CANDIDATE_NEGATIVE_EV")
-                logger.info(
-                    "BEST_CANDIDATE_NEGATIVE_EV: symbol=%s strategy=%s net_ev=%.6f -> no_trade",
-                    symbol,
-                    str((top_candidate.decision_data or {}).get("live_ai_strategy") or "day"),
-                    float(top_net_ev),
-                )
-                await self._bar_pipeline_fill_if_stage_gates(
-                    top_candidate.decision_id,
-                    "BEST_CANDIDATE_NEGATIVE_EV",
-                )
-                await self._bar_pipeline_not_selected_others(bar_candidate_snapshot, top_candidate.decision_id or "", pipeline_done)
-                for _row in cycle_leaderboard:
-                    if _row.get("symbol") == top_candidate.symbol and str(_row.get("strategy_id")) == str(top_candidate.decision_data.get("live_ai_strategy") or "day"):
-                        _row["disposition"] = "selected_no_trade_negative_ev"
-                        break
-                self._persist_profit_cycle_state(
-                    {
-                        "bar_timestamp": int(bar_timestamp),
-                        "full_universe_diagnostics": full_universe_diag,
-                        "adaptive_weight_diagnostics": {
-                            "adaptive_weight_applied_count": int(full_universe_diag.get("adaptive_weight_applied_count") or 0),
-                            "adaptive_weight_missing_count": int(full_universe_diag.get("adaptive_weight_missing_count") or 0),
-                            "adaptive_weight_score_delta_sum": float(full_universe_diag.get("adaptive_weight_score_delta_sum") or 0.0),
-                            "adaptive_weight_top_components": full_universe_diag.get("adaptive_weight_top_components") or {},
-                        },
-                        "current_cycle": {
-                            "leaderboard": cycle_leaderboard,
-                            "leaderboard_len": len(cycle_leaderboard),
-                            "selected_symbol": top_candidate.symbol,
-                            "selected_strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
-                            "selected_trade": False,
-                        },
-                    }
-                )
-                self.current_bar_candidates.clear()
-                return None
+            await self._bar_pipeline_fill_if_stage_gates(
+                top_candidate.decision_id,
+                "BEST_CANDIDATE_NEGATIVE_EV",
+            )
+            await self._bar_pipeline_not_selected_others(bar_candidate_snapshot, top_candidate.decision_id or "", pipeline_done)
+            for _row in cycle_leaderboard:
+                if _row.get("symbol") == top_candidate.symbol and str(_row.get("strategy_id")) == str(top_candidate.decision_data.get("live_ai_strategy") or "day"):
+                    _row["disposition"] = "selected_no_trade_negative_ev"
+                    break
+            self._persist_profit_cycle_state(
+                {
+                    "bar_timestamp": int(bar_timestamp),
+                    "full_universe_diagnostics": full_universe_diag,
+                    "adaptive_weight_diagnostics": {
+                        "adaptive_weight_applied_count": int(full_universe_diag.get("adaptive_weight_applied_count") or 0),
+                        "adaptive_weight_missing_count": int(full_universe_diag.get("adaptive_weight_missing_count") or 0),
+                        "adaptive_weight_score_delta_sum": float(full_universe_diag.get("adaptive_weight_score_delta_sum") or 0.0),
+                        "adaptive_weight_top_components": full_universe_diag.get("adaptive_weight_top_components") or {},
+                    },
+                    "current_cycle": {
+                        "leaderboard": cycle_leaderboard,
+                        "leaderboard_len": len(cycle_leaderboard),
+                        "selected_symbol": top_candidate.symbol,
+                        "selected_strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
+                        "selected_trade": False,
+                    },
+                }
+            )
+            self.current_bar_candidates.clear()
+            return None
 
         # Execute buy with sleeve from candidate
         result = await self.execute_buy_fifo(
@@ -14454,6 +14881,45 @@ class PortfolioEngine:
         if result is not None and top_candidate.decision_id:
             result = dict(result)
             result["decision_id"] = top_candidate.decision_id
+
+        # Structured DAY decision record (authority + measurement)
+        with contextlib.suppress(Exception):
+            from backend.services.day_gate_telemetry import record_day_decision
+
+            _dd_final = dict(getattr(top_candidate, "decision_data", None) or {})
+            _gates_eval = list(_dd_final.get("gates_evaluated") or [])
+            if result is not None:
+                _final = "execute"
+                _first = ""
+            else:
+                _final = "reject"
+                _first = str(_dd_final.get("first_hard_block") or "EXECUTION_GATE")
+            record_day_decision(
+                self.db_path,
+                decision_id=str(top_candidate.decision_id or f"bar_{bar_timestamp}_{top_candidate.symbol}"),
+                symbol=str(top_candidate.symbol),
+                aw_valid=str(_dd_final.get("entry_owner") or "") == "allweather" or bool(_dd_final.get("allweather_setup")),
+                setup=str(_dd_final.get("setup_type") or _dd_final.get("allweather_setup") or ""),
+                regime=str(_dd_final.get("allweather_regime") or _dd_final.get("aw_regime") or ""),
+                gates=_gates_eval,
+                first_hard_block=_first,
+                ml_score=float(_dd_final.get("buy_margin") or _dd_final.get("ml_score") or 0.0) or None,
+                ml_rank_adjustment=float(_dd_final.get("ml_rank_adjustment") or 0.0) or None,
+                ml_size_adjustment=float(dyn_mult),
+                requested_size=float(quantity),
+                approved_size=(
+                    float(result.get("quantity"))
+                    if isinstance(result, dict) and result.get("quantity") is not None
+                    else (0.0 if result is None else None)
+                ),
+                final_decision=_final,
+                strategy_version=str(_dd_final.get("decision_policy_version") or "day_aw_owner_v1"),
+                model_version=str(_dd_final.get("artifact_sha256") or _dd_final.get("model_version") or "")[:64],
+                feature_version=str(_dd_final.get("feature_version") or ""),
+                artifact_version=str(_dd_final.get("artifact_path") or "")[:128],
+                mode="paper",
+                detail={"bar_timestamp": int(bar_timestamp), "net_ev": float(top_net_ev)},
+            )
         return result
 
     def add_buy_candidate(
@@ -16137,17 +16603,67 @@ class PortfolioEngine:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _sync_persist)
 
+    def _entries_paused_by_kill_switch(self) -> bool:
+        return self._kill_switch_mode in (
+            KillSwitchMode.PAUSE_BUYS,
+            KillSwitchMode.PAUSE_ALL_ENTRIES,
+            KillSwitchMode.PAUSE_ALL,
+            KillSwitchMode.EMERGENCY_FLATTEN,
+        )
+
+    def _is_protective_sell_for_kill_switch(
+        self,
+        exit_trigger: str = "",
+        force_sell: bool = False,
+        exit_type: ExitType | None = None,
+    ) -> bool:
+        if force_sell:
+            return True
+        if self._kill_switch_mode == KillSwitchMode.EMERGENCY_FLATTEN:
+            return True
+        et = exit_type if exit_type is not None else ExitType.MANUAL
+        if self._is_emergency_sell(et, exit_trigger, force_sell=force_sell):
+            return True
+        trig = str(exit_trigger or "").strip().upper()
+        protective_prefixes = (
+            "STOP_LOSS",
+            "STOP_",
+            "ALLWEATHER_ATR_STOP",
+            "ALLWEATHER_STOP",
+            "EXTREME_PROTECTION",
+            "STALL_EXIT",
+            "STALL_",
+            "FORCE_FLATTEN",
+            "FLATTEN",
+            "EMERGENCY",
+            "RISK_",
+            "THESIS_INVALID",
+        )
+        return any(trig.startswith(p) for p in protective_prefixes)
+
     def _check_kill_switch_buy(self) -> tuple[bool, str]:
         """Check if buy is blocked by kill switch"""
-        if self._kill_switch_mode == KillSwitchMode.PAUSE_ALL:
-            return False, f"KILL_SWITCH_PAUSE_ALL: {self._kill_switch_reason}"
-        if self._kill_switch_mode == KillSwitchMode.PAUSE_BUYS:
-            return False, f"KILL_SWITCH_PAUSE_BUYS: {self._kill_switch_reason}"
+        if self._entries_paused_by_kill_switch():
+            return False, f"KILL_SWITCH_{self._kill_switch_mode.value}: {self._kill_switch_reason}"
         return True, ""
 
-    def _check_kill_switch_sell(self) -> tuple[bool, str]:
-        """Check if sell is blocked by kill switch"""
+    def _check_kill_switch_sell(
+        self,
+        exit_trigger: str = "",
+        force_sell: bool = False,
+        exit_type: ExitType | None = None,
+    ) -> tuple[bool, str]:
+        """Check if sell is blocked by kill switch.
+
+        PAUSE_BUYS / PAUSE_ALL_ENTRIES never block sells.
+        PAUSE_ALL blocks discretionary sells only — protective/emergency exits still sell.
+        EMERGENCY_FLATTEN always allows sells.
+        """
+        if self._kill_switch_mode in (KillSwitchMode.PAUSE_BUYS, KillSwitchMode.PAUSE_ALL_ENTRIES, KillSwitchMode.EMERGENCY_FLATTEN, KillSwitchMode.RESUME):
+            return True, ""
         if self._kill_switch_mode == KillSwitchMode.PAUSE_ALL:
+            if self._is_protective_sell_for_kill_switch(exit_trigger, force_sell=force_sell, exit_type=exit_type):
+                return True, ""
             return False, f"KILL_SWITCH_PAUSE_ALL: {self._kill_switch_reason}"
         return True, ""
 
@@ -16156,8 +16672,9 @@ class PortfolioEngine:
         return {
             "mode": self._kill_switch_mode.value,
             "reason": self._kill_switch_reason,
-            "buys_blocked": self._kill_switch_mode != KillSwitchMode.RESUME,
+            "buys_blocked": self._entries_paused_by_kill_switch(),
             "sells_blocked": self._kill_switch_mode == KillSwitchMode.PAUSE_ALL,
+            "protective_sells_allowed": True,
         }
 
     _CIRCUIT_BREAKER_REASON_PREFIX = "CIRCUIT_BREAKER:"
@@ -18577,7 +19094,17 @@ async def initialize_portfolio_engine() -> PortfolioEngine:
     """
     global _portfolio_engine_initialized
     engine = get_portfolio_engine()
+    with contextlib.suppress(Exception):
+        from backend.services.day_gate_telemetry import ensure_day_gate_schema
+
+        ensure_day_gate_schema(engine.db_path)
+    with contextlib.suppress(Exception):
+        from backend.services.day_entry_reservations import ensure_reservation_schema
+
+        ensure_reservation_schema(engine.db_path)
     await engine.initialize_from_canonical_sources()
+    with contextlib.suppress(Exception):
+        engine._reload_entry_reservations_from_db()
     _portfolio_engine_initialized = True
     return engine
 

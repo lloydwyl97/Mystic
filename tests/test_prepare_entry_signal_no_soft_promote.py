@@ -43,8 +43,14 @@ def test_prepare_entry_signal_passes_through_genuine_pass():
         reachability_surplus=0.001,
     )
     out = prepare_entry_signal(ranked, ctx=SimpleNamespace())
-    assert out is sig
     assert out.passed is True
+    assert out.symbol == sig.symbol
+    assert out.setup_name == sig.setup_name
+    # Authority stamps (strategy owns entry; ML ranks only)
+    assert (out.setup_context or {}).get("entry_owner") == "strategy"
+    assert (out.setup_context or {}).get("ml_role") == "rank_size"
+    assert (out.setup_context or {}).get("soft_rank_entry") is False
+    assert (out.setup_context or {}).get("bar_closed") is True
 
 
 def test_prepare_entry_signal_refuses_soft_promotion():

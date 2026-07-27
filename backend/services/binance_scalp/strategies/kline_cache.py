@@ -88,21 +88,42 @@ def _write_bars_cache(symbol: str, interval: str, minutes: int, bars: list[dict]
         pass
 
 
-def fetch_bars(symbol: str, interval: str, *, minutes: int = 30) -> list[dict]:
+_INTERVAL_SEC = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+
+
+def closed_bars_only(bars: list[dict], *, interval_sec: int = 60) -> list[dict]:
+    """Drop the forming (incomplete) candle — measurement and strategy use closed bars only."""
+    if not bars:
+        return bars
+    now = time.time()
+    last_ts = int(bars[-1].get("ts") or 0)
+    if last_ts <= 0:
+        return bars
+    if last_ts + int(interval_sec) > now + 2:
+        return bars[:-1]
+    return bars
+
+
+def fetch_bars(symbol: str, interval: str, *, minutes: int = 30, include_forming: bool = False) -> list[dict]:
     """Fetch OHLCV bars for symbol/interval from Binance.US public REST.
 
     Cross-process cached with a short TTL (see ``_BARS_CACHE_TTL_SEC``) so
     repeated callers — including a freshly-constructed ``KlineCache`` in a
     different process — reuse the same recent fetch instead of hitting
     Binance again for data that hasn't meaningfully changed.
+
+    By default drops the forming candle (closed-bar enforcement).
     """
     cached = _read_bars_cache(symbol, interval, minutes)
     if cached is not None:
-        return cached
-    bars = _fetch_bars_live(symbol, interval, minutes=minutes)
-    if bars:
-        _write_bars_cache(symbol, interval, minutes, bars)
-    return bars
+        bars = cached
+    else:
+        bars = _fetch_bars_live(symbol, interval, minutes=minutes)
+        if bars:
+            _write_bars_cache(symbol, interval, minutes, bars)
+    if include_forming or not bars:
+        return bars
+    return closed_bars_only(bars, interval_sec=_INTERVAL_SEC.get(interval, 60))
 
 
 def _fetch_bars_live(symbol: str, interval: str, *, minutes: int = 30) -> list[dict]:

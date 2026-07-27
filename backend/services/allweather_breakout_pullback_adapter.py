@@ -12,12 +12,15 @@ See sleeve_characteristics() for regimes traded / flat, expected frequency and i
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 from backend.services.allweather_signal_engine import (
     REG_NEUTRAL,
@@ -107,6 +110,18 @@ class AllweatherBpEvalOutcome:
     target: float = 0.0
     current_price: float = 0.0
     atr: float = 0.0
+    bar_closed: bool = False
+    closed_bar_ts: int = 0
+
+
+PRIMARY_BAR_SECONDS = 3600
+
+
+def _closed_primary_bars(bars: list[dict], *, interval_sec: int = PRIMARY_BAR_SECONDS) -> tuple[list[dict], bool, int]:
+    """Drop the forming (incomplete) primary candle. Returns (bars, dropped_forming, last_closed_ts)."""
+    from backend.services.day_bar_integrity import drop_forming_candle
+
+    return drop_forming_candle(bars, interval_sec=interval_sec)
 
 
 def _env_bool(name: str, default: str) -> bool:
@@ -114,7 +129,26 @@ def _env_bool(name: str, default: str) -> bool:
 
 
 def execution_enabled() -> bool:
-    """Real entries/exits — default OFF."""
+    """Whether AllWeather may *qualify* DAY entry candidates this cycle.
+
+    Naming note — this is the sleeve qualifier switch, not a global kill for
+    the portfolio engine:
+
+    - DAY_AW_OWNER_ENABLED=true (default): always qualify-via-AW (ML cannot
+      create entries alone). Portfolio loop still runs; AW NO_SIGNAL ⇒ no buy.
+    - DAY_AW_OWNER_ENABLED=false: fall back to ALLWEATHER_BREAKOUT_PULLBACK_ENABLED
+      only (legacy). Turning owner off does **not** freeze DAY; it restores
+      ML fall-through when the sleeve flag is also off.
+
+    Alias concept: ``allweather_qualifies_day_entries()`` in day_gate_registry.
+    """
+    try:
+        from backend.services.day_gate_registry import day_aw_owner_enabled
+
+        if day_aw_owner_enabled():
+            return True
+    except Exception:
+        pass
     return _env_bool("ALLWEATHER_BREAKOUT_PULLBACK_ENABLED", "false")
 
 
@@ -206,6 +240,14 @@ def apply_signal_to_decision_data(
     out["allweather_bracket_exit"] = True
     out["profit_floor_applies"] = False
     out["min_net_profit_floor_bypass"] = True
+    # Authority policy: AllWeather owns entry qualification; ML only ranks/sizes.
+    out["entry_owner"] = "allweather"
+    out["ml_role"] = "rank_size"
+    out["decision_policy_version"] = "day_aw_owner_v1"
+    out["aw_regime"] = aw_regime
+    out["bar_closed"] = bool(sig.get("bar_closed", True))
+    if sig.get("closed_bar_ts"):
+        out["closed_bar_ts"] = int(sig["closed_bar_ts"])
     return out
 
 
@@ -460,12 +502,52 @@ async def evaluate_breakout_pullback_candidate(
         return err
 
     raw = fetch_meta.get("rows")
-    bars = normalize_bars(raw)
-    state = compute_state(bars)
+    bars_raw = normalize_bars(raw)
     ts = datetime.now(timezone.utc).isoformat()
+    from backend.services.day_bar_integrity import validate_exchange_bars
+
+    integrity = validate_exchange_bars(
+        bars_raw,
+        interval_sec=PRIMARY_BAR_SECONDS,
+        min_bars=206,
+        max_stale_sec=float(os.getenv("DAY_AW_MAX_STALE_BAR_SEC", "7200")),
+        allow_forming=False,
+    )
+    if not integrity.ok:
+        err_code = str(integrity.error_code or "BAR_INTEGRITY")
+        if err_code in ("FORMING_CANDLE_ONLY", "INSUFFICIENT_CLOSED_BARS") or integrity.dropped_forming:
+            diag = diagnose_entry_state(None, bar_count=len(integrity.closed_bars), symbol=symbol, timestamp=ts)
+            diag["bar_closed"] = False
+            diag["closed_bar_defer"] = True
+            diag["bar_integrity_error"] = err_code
+            diag["bar_integrity_detail"] = integrity.detail
+            out = AllweatherBpEvalOutcome(no_signal_diag=diag, bar_closed=False)
+            record_eval_outcome(out, symbol=symbol)
+            return out
+        out = AllweatherBpEvalOutcome(
+            eval_error=True,
+            error_meta={
+                "error_type": err_code,
+                "endpoint": "bar_integrity",
+                "symbol": api_symbol,
+                "timeframe": "1h",
+                "detail": integrity.detail,
+            },
+            bar_closed=False,
+        )
+        record_eval_outcome(out, symbol=symbol)
+        return out
+
+    bars = integrity.closed_bars
+    closed_bar_ts = integrity.closed_bar_ts
+    dropped_forming = integrity.dropped_forming
+    del dropped_forming  # used implicitly via integrity
+
+    state = compute_state(bars)
     if state is None:
         diag = diagnose_entry_state(None, bar_count=len(bars), symbol=symbol, timestamp=ts)
-        out = AllweatherBpEvalOutcome(no_signal_diag=diag)
+        diag["bar_closed"] = True
+        out = AllweatherBpEvalOutcome(no_signal_diag=diag, bar_closed=True, closed_bar_ts=closed_bar_ts)
         record_eval_outcome(out, symbol=symbol)
         return out
 
@@ -473,21 +555,23 @@ async def evaluate_breakout_pullback_candidate(
     if fetch_meta.get("used_cache"):
         diag = diagnose_entry_state(state, bar_count=len(bars), symbol=symbol, timestamp=ts)
         diag["used_stale_kline_cache"] = True
+        diag["bar_closed"] = True
         if not sig:
-            out = AllweatherBpEvalOutcome(no_signal_diag=diag)
+            out = AllweatherBpEvalOutcome(no_signal_diag=diag, bar_closed=True, closed_bar_ts=closed_bar_ts)
             record_eval_outcome(out, symbol=symbol)
             return out
         else:
             # Signal found but klines are stale — shadow-only, must not execute
             logger.debug(f"[AW_BP] {symbol} stale kline cache — signal present but not executable")
             diag["shadow_signal"] = sig
-            out = AllweatherBpEvalOutcome(no_signal_diag=diag)
+            out = AllweatherBpEvalOutcome(no_signal_diag=diag, bar_closed=True, closed_bar_ts=closed_bar_ts)
             record_eval_outcome(out, symbol=symbol)
             return out
 
     if not sig:
         diag = diagnose_entry_state(state, bar_count=len(bars), symbol=symbol, timestamp=ts)
-        out = AllweatherBpEvalOutcome(no_signal_diag=diag)
+        diag["bar_closed"] = True
+        out = AllweatherBpEvalOutcome(no_signal_diag=diag, bar_closed=True, closed_bar_ts=closed_bar_ts)
         record_eval_outcome(out, symbol=symbol)
         return out
 
@@ -496,11 +580,24 @@ async def evaluate_breakout_pullback_candidate(
     if target <= 0 or stop <= 0:
         diag = diagnose_entry_state(state, bar_count=len(bars), symbol=symbol, timestamp=ts)
         diag["invalid_bracket_levels"] = True
-        out = AllweatherBpEvalOutcome(no_signal_diag=diag)
+        diag["bar_closed"] = True
+        out = AllweatherBpEvalOutcome(no_signal_diag=diag, bar_closed=True, closed_bar_ts=closed_bar_ts)
         record_eval_outcome(out, symbol=symbol)
         return out
 
-    out = AllweatherBpEvalOutcome(ok=True, signal=sig, stop=stop, target=target, current_price=cur, atr=state.atr)
+    sig = dict(sig)
+    sig["bar_closed"] = True
+    sig["closed_bar_ts"] = int(closed_bar_ts or 0)
+    out = AllweatherBpEvalOutcome(
+        ok=True,
+        signal=sig,
+        stop=stop,
+        target=target,
+        current_price=cur,
+        atr=state.atr,
+        bar_closed=True,
+        closed_bar_ts=int(closed_bar_ts or 0),
+    )
     record_eval_outcome(out, symbol=symbol)
     return out
 

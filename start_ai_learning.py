@@ -39,6 +39,7 @@ if __name__ == "__main__":
 
 
 _SCALP_INGEST_INTERVAL_SEC = 300  # ingest scalp outcomes every 5 minutes
+_DAY_SHADOW_RESOLVE_INTERVAL_SEC = 300  # resolve DAY shadow rejects on closed bars
 
 
 async def _scalp_ingest_loop() -> None:
@@ -55,6 +56,47 @@ async def _scalp_ingest_loop() -> None:
         await asyncio.sleep(_SCALP_INGEST_INTERVAL_SEC)
 
 
+async def _day_shadow_resolve_loop() -> None:
+    """Periodic closed-bar resolution of DAY gate shadow rejects (no orders)."""
+    while True:
+        try:
+            from backend.database_schema import DATABASE_PATH
+            from backend.services.day_gate_telemetry import resolve_shadow_rejects_async
+
+            result = await resolve_shadow_rejects_async(DATABASE_PATH, max_rows=40)
+            if int(result.get("resolved") or 0) > 0:
+                logger.info(
+                    "DAY_SHADOW_RESOLVE resolved=%s scanned=%s expired=%s",
+                    result.get("resolved"),
+                    result.get("scanned"),
+                    result.get("expired"),
+                )
+        except Exception as exc:
+            logger.debug("DAY_SHADOW_RESOLVE_SKIPPED %s", exc)
+        await asyncio.sleep(_DAY_SHADOW_RESOLVE_INTERVAL_SEC)
+
+
+async def _scalp_shadow_resolve_loop() -> None:
+    """Periodic closed-bar resolution of SCALP gate shadow rejects (no orders)."""
+    while True:
+        try:
+            from backend.services.binance_scalp.config import get_scalp_config
+            from backend.services.scalp_gate_telemetry import resolve_shadow_rejects_async
+
+            db = get_scalp_config().database_path
+            result = await resolve_shadow_rejects_async(db, max_rows=40)
+            if int(result.get("resolved") or 0) > 0:
+                logger.info(
+                    "SCALP_SHADOW_RESOLVE resolved=%s scanned=%s expired=%s",
+                    result.get("resolved"),
+                    result.get("scanned"),
+                    result.get("expired"),
+                )
+        except Exception as exc:
+            logger.debug("SCALP_SHADOW_RESOLVE_SKIPPED %s", exc)
+        await asyncio.sleep(_DAY_SHADOW_RESOLVE_INTERVAL_SEC)
+
+
 async def main() -> None:
     pipeline = None
     try:
@@ -67,6 +109,8 @@ async def main() -> None:
         await pipeline.start()
         logger.info("TRAINING LOOP STARTED")
         asyncio.ensure_future(_scalp_ingest_loop())
+        asyncio.ensure_future(_day_shadow_resolve_loop())
+        asyncio.ensure_future(_scalp_shadow_resolve_loop())
         while True:
             await asyncio.sleep(60)
     except KeyboardInterrupt:

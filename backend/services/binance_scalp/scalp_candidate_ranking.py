@@ -340,6 +340,78 @@ def rank_setup_signal(
 
     rank_score = round(rank_score + live_ctx_adj + learned_adj, 4)
 
+    # Measurement: counters only — never flips eligibility (scalp_strategy_owner_v1).
+    with contextlib.suppress(Exception):
+        from backend.services.scalp_gate_telemetry import record_gate_event
+
+        _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
+        if sig.passed and entry_eligible:
+            record_gate_event(
+                _db,
+                gate_id="STRATEGY_PASS",
+                symbol=sig.symbol,
+                outcome="passed",
+                setup=sig.setup_name,
+                regime=regime,
+            )
+        elif not sig.passed:
+            record_gate_event(
+                _db,
+                gate_id="STRATEGY_NO_SIGNAL",
+                reason=str(sig.reject_reason or soft_reason or ""),
+                symbol=sig.symbol,
+                outcome="hard_blocked",
+                setup=sig.setup_name,
+                regime=regime,
+                detail="soft_rank_diagnostic_only",
+            )
+            record_gate_event(
+                _db,
+                gate_id="SOFT_RANK_BLOCKED",
+                symbol=sig.symbol,
+                outcome="hard_blocked",
+                setup=sig.setup_name,
+                regime=regime,
+            )
+        elif hard_block:
+            record_gate_event(
+                _db,
+                reason=str(hard_block),
+                symbol=sig.symbol,
+                outcome="hard_blocked",
+                setup=sig.setup_name,
+                regime=regime,
+            )
+        elif soft_reason and "REGIME" in str(soft_reason).upper():
+            record_gate_event(
+                _db,
+                gate_id="REGIME_MISMATCH",
+                symbol=sig.symbol,
+                outcome="hard_blocked",
+                setup=sig.setup_name,
+                regime=regime,
+                detail=str(soft_reason),
+            )
+        elif soft_reason and "STALL_RISK" in str(soft_reason).upper():
+            record_gate_event(
+                _db,
+                gate_id="SYMBOL_STALL_RISK",
+                symbol=sig.symbol,
+                outcome="hard_blocked",
+                setup=sig.setup_name,
+                regime=regime,
+            )
+        elif not entry_eligible:
+            record_gate_event(
+                _db,
+                gate_id="RANK_BELOW_MIN",
+                symbol=sig.symbol,
+                outcome="hard_blocked",
+                setup=sig.setup_name,
+                regime=regime,
+                detail=str(soft_reason or confidence or ""),
+            )
+
     return RankedCandidate(
         signal=sig,
         rank_score=rank_score,
@@ -383,8 +455,37 @@ def prepare_entry_signal(
             sig.symbol,
             ranked.soft_reason,
         )
+        with contextlib.suppress(Exception):
+            from backend.services.scalp_gate_telemetry import record_gate_event, record_shadow_reject
+
+            _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
+            record_gate_event(
+                _db,
+                gate_id="SOFT_RANK_BLOCKED",
+                symbol=sig.symbol,
+                outcome="hard_blocked",
+                setup=sig.setup_name,
+                detail=str(ranked.soft_reason or ""),
+            )
+            record_shadow_reject(
+                _db,
+                symbol=sig.symbol,
+                gate_id="SOFT_RANK_BLOCKED",
+                setup=sig.setup_name,
+                entry_price=float(getattr(sig, "limit_buy_price", 0.0) or 0.0),
+                detail=str(ranked.soft_reason or ""),
+            )
         return sig
-    return sig
+    # Authority stamp — strategy owns entry; intel/ML only ranked among passed.
+    from dataclasses import replace
+
+    ctx_map = dict(sig.setup_context or {})
+    ctx_map["entry_owner"] = "strategy"
+    ctx_map["ml_role"] = "rank_size"
+    ctx_map["decision_policy_version"] = "scalp_strategy_owner_v1"
+    ctx_map["soft_rank_entry"] = False
+    ctx_map["bar_closed"] = True
+    return replace(sig, setup_context=ctx_map)
 
 
 def pick_best_ranked(candidates: list[RankedCandidate]) -> RankedCandidate | None:

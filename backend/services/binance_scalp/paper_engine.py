@@ -112,7 +112,12 @@ class BinanceScalpPaperEngine:
             pass
         self._reject_throttle = ScalpRejectThrottle()
         self._redis = redis.from_url(self.config.redis_url, decode_responses=True)
+        self._entry_reservations: dict[str, dict] = {}
         init_scalp_schema(self.config.database_path)
+        with contextlib.suppress(Exception):
+            from backend.services.scalp_gate_telemetry import ensure_scalp_gate_schema
+
+            ensure_scalp_gate_schema(self.config.database_path)
         if self.config.scalp_paper_enabled and self.config.scalp_paper_auto_arm:
             set_entry_armed(
                 self._redis,
@@ -151,6 +156,49 @@ class BinanceScalpPaperEngine:
             pass
         return self.config.strategy_id
 
+    def _record_gate(
+        self,
+        *,
+        reason: str = "",
+        gate_id: str = "",
+        symbol: str = "",
+        outcome: str = "hard_blocked",
+        setup: str = "",
+        entry_price: float = 0.0,
+        stop_price: float = 0.0,
+        target_price: float = 0.0,
+        shadow: bool = True,
+        detail: str = "",
+        diag: dict | None = None,
+    ) -> None:
+        """Always count gate events (independent of reject throttle)."""
+        with contextlib.suppress(Exception):
+            from backend.services.scalp_gate_telemetry import record_gate_event, record_shadow_reject
+
+            db = self.config.database_path
+            record_gate_event(
+                db,
+                gate_id=gate_id,
+                reason=reason,
+                symbol=symbol,
+                outcome=outcome,
+                setup=setup,
+                detail=detail or reason,
+            )
+            if shadow and outcome == "hard_blocked" and symbol:
+                record_shadow_reject(
+                    db,
+                    symbol=symbol,
+                    gate_id=gate_id,
+                    reason=reason,
+                    setup=setup,
+                    entry_price=entry_price,
+                    stop_price=stop_price,
+                    target_price=target_price,
+                    detail=detail or reason,
+                    diag=diag,
+                )
+
     def _record_reject(
         self,
         conn: sqlite3.Connection,
@@ -159,6 +207,8 @@ class BinanceScalpPaperEngine:
         reason: str,
         detail: str,
     ) -> None:
+        if str(side).upper() == "BUY":
+            self._record_gate(reason=reason, symbol=symbol, detail=detail[:500] if detail else "")
         if not self._reject_throttle.should_log(symbol, side, reason):
             return
         conn.execute(
@@ -653,11 +703,14 @@ class BinanceScalpPaperEngine:
 
     def _try_entry(self, conn: sqlite3.Connection) -> None:
         open_count = conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0]
-        if open_count >= self.config.max_open_positions:
+        pending_slots = len(self._entry_reservations)
+        if open_count + pending_slots >= self.config.max_open_positions:
+            self._record_gate(gate_id="CASH_OR_SLOTS", reason="MAX_OPEN_POSITIONS", detail=f"open={open_count} reserved={pending_slots}")
             return
 
         if self._check_scalp_circuit_breaker():
             self._publish_last_decision(decision="BLOCKED", reason="SCALP_CIRCUIT_BREAKER_OPEN")
+            self._record_gate(gate_id="SCALP_CIRCUIT_BREAKER", reason="SCALP_CIRCUIT_BREAKER_OPEN")
             return
 
         candidates = self._entry_candidates(conn)
@@ -665,6 +718,29 @@ class BinanceScalpPaperEngine:
             return
 
         sym, snap, sig = candidates[0]
+        # Authority: never fill soft-rank or non-passed setups (scalp_strategy_owner_v1).
+        soft_rank_entry = bool((sig.setup_context or {}).get("soft_rank_entry", False))
+        if soft_rank_entry or not bool(sig.passed):
+            self._record_reject(
+                conn,
+                sym,
+                "BUY",
+                "SOFT_RANK_PROMOTION_BLOCKED",
+                json.dumps({"passed": bool(sig.passed), "soft_rank_entry": soft_rank_entry, "setup": sig.setup_name}),
+            )
+            self._record_gate(
+                gate_id="SOFT_RANK_BLOCKED",
+                symbol=sym,
+                setup=sig.setup_name,
+                entry_price=float(getattr(sig, "limit_buy_price", 0.0) or 0.0),
+                detail="execute_path_authority_block",
+            )
+            return
+
+        if sym.upper() in self._entry_reservations:
+            self._record_reject(conn, sym, "BUY", "ENTRY_RESERVED", json.dumps({"symbol": sym}))
+            return
+
         if conn.execute(
             "SELECT 1 FROM scalp_paper_positions WHERE symbol = ? AND status = 'OPEN' LIMIT 1",
             (sym,),
@@ -673,9 +749,11 @@ class BinanceScalpPaperEngine:
             return
 
         ledger = self._ledger(conn)
-        notional = min(self.config.max_notional_paper, float(ledger["cash_balance"]))
+        reserved_n = sum(float((r or {}).get("notional") or 0.0) for r in self._entry_reservations.values())
+        free_cash = float(ledger["cash_balance"]) - reserved_n
+        notional = min(self.config.max_notional_paper, free_cash)
         if notional < 1.0:
-            self._record_reject(conn, sym, "BUY", "INSUFFICIENT_CASH", f"cash={ledger['cash_balance']}")
+            self._record_reject(conn, sym, "BUY", "INSUFFICIENT_CASH", f"cash={ledger['cash_balance']} reserved={reserved_n}")
             return
 
         limit_buy = sig.limit_buy_price
@@ -686,19 +764,26 @@ class BinanceScalpPaperEngine:
         ts, epoch = self._now()
         pre = dict(ledger)
 
+        # Atomic cash/slot/symbol reservation before paper fill
+        self._entry_reservations[sym.upper()] = {"notional": float(notional + fee + slip), "ts": time.time(), "trade_id": trade_id}
+
         ranking_meta = getattr(self, "_last_ranking_meta", {}) or {}
         entry_intel = dict(ranking_meta.get("scalp_intelligence") or {})
         from backend.services.day_trade_thesis import scalp_strategy_to_thesis
 
         thesis_fields = scalp_strategy_to_thesis(sig.setup_name, sig.setup_context or {})
-        soft_rank_entry = bool((sig.setup_context or {}).get("soft_rank_entry", False))
+        soft_rank_entry = False
         entry_diag = {
             "setup_name": sig.setup_name,
             "setup_context": sig.setup_context,
             "setup_signal": sig.as_dict(),
-            "passed": bool(sig.passed),
-            "soft_rank_entry": soft_rank_entry,
-            "entry_eligible": bool(sig.passed) and not soft_rank_entry,
+            "passed": True,
+            "soft_rank_entry": False,
+            "entry_eligible": True,
+            "entry_owner": "strategy",
+            "ml_role": "rank_size",
+            "decision_policy_version": "scalp_strategy_owner_v1",
+            "bar_closed": True,
             "selected_symbol": sym,
             "symbol_ranking": ranking_meta,
             "review_lows": [],
@@ -725,104 +810,120 @@ class BinanceScalpPaperEngine:
             _role_ctx_snap = "{}"
         entry_diag["context_snapshot_json"] = _role_ctx_snap
 
-        conn.execute(
-            """
-            INSERT INTO scalp_paper_trades
-            (trade_id, symbol, exchange, strategy_id, side, quantity, price, notional,
-             fee_usd, slippage_usd, diagnostics_json)
-            VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                trade_id,
-                sym,
-                self.config.exchange,
-                sig.setup_name,
-                qty,
-                limit_buy,
-                notional,
-                fee,
-                slip,
-                json.dumps(
-                    {
-                        "setup": sig.as_dict(),
-                        "setup_signal": sig.as_dict(),
-                        "paper_limit": True,
-                        "selected_symbol": sym,
-                        # Persist pass/soft-rank tags on the BUY row so closed-trade
-                        # analytics do not depend on open-position diagnostics alone.
-                        "passed": bool(sig.passed),
-                        "soft_rank_entry": soft_rank_entry,
-                        "entry_eligible": bool(sig.passed) and not soft_rank_entry,
-                        "setup_name": sig.setup_name,
-                        "rank_score": ranking_meta.get("rank_score"),
-                        "selection_confidence": ranking_meta.get("selection_confidence"),
-                        "context_snapshot_json": _role_ctx_snap,
-                    }
+        try:
+            conn.execute(
+                """
+                INSERT INTO scalp_paper_trades
+                (trade_id, symbol, exchange, strategy_id, side, quantity, price, notional,
+                 fee_usd, slippage_usd, diagnostics_json)
+                VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_id,
+                    sym,
+                    self.config.exchange,
+                    sig.setup_name,
+                    qty,
+                    limit_buy,
+                    notional,
+                    fee,
+                    slip,
+                    json.dumps(
+                        {
+                            "setup": sig.as_dict(),
+                            "setup_signal": sig.as_dict(),
+                            "paper_limit": True,
+                            "selected_symbol": sym,
+                            "passed": True,
+                            "soft_rank_entry": False,
+                            "entry_eligible": True,
+                            "entry_owner": "strategy",
+                            "ml_role": "rank_size",
+                            "decision_policy_version": "scalp_strategy_owner_v1",
+                            "bar_closed": True,
+                            "setup_name": sig.setup_name,
+                            "rank_score": ranking_meta.get("rank_score"),
+                            "selection_confidence": ranking_meta.get("selection_confidence"),
+                            "context_snapshot_json": _role_ctx_snap,
+                        }
+                    ),
                 ),
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO scalp_paper_positions
-            (symbol, exchange, strategy_id, quantity, entry_price, entry_time,
-             entry_time_epoch, trade_id, paper_order_id, status, state,
-             max_favorable_pct, max_adverse_pct, stale_review_count,
-             session_low_bid, diagnostics_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 'OPEN', 0, 0, 0, ?, ?)
-            """,
-            (
+            )
+            conn.execute(
+                """
+                INSERT INTO scalp_paper_positions
+                (symbol, exchange, strategy_id, quantity, entry_price, entry_time,
+                 entry_time_epoch, trade_id, paper_order_id, status, state,
+                 max_favorable_pct, max_adverse_pct, stale_review_count,
+                 session_low_bid, diagnostics_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 'OPEN', 0, 0, 0, ?, ?)
+                """,
+                (
+                    sym,
+                    self.config.exchange,
+                    sig.setup_name,
+                    qty,
+                    limit_buy,
+                    ts,
+                    epoch,
+                    trade_id,
+                    f"paper_order_{trade_id}",
+                    limit_buy,
+                    json.dumps(entry_diag),
+                ),
+            )
+            new_cash = float(ledger["cash_balance"]) - notional - fee - slip
+            pos_val = qty * limit_buy
+            conn.execute(
+                """
+                UPDATE scalp_paper_ledger SET
+                  cash_balance = ?,
+                  positions_value = positions_value + ?,
+                  total_equity = ? + positions_value + ?,
+                  updated_at = datetime('now')
+                WHERE id = 1
+                """,
+                (new_cash, pos_val, new_cash, pos_val),
+            )
+            post = dict(self._ledger(conn))
+            self._audit(
+                conn,
+                trade_id=trade_id,
+                action="BUY",
+                symbol=sym,
+                qty=qty,
+                price=limit_buy,
+                pre=pre,
+                post=post,
+                reason=f"SCALP_PAPER_ENTRY_{sig.setup_name}",
+            )
+            self._write_position_cache(
                 sym,
-                self.config.exchange,
-                sig.setup_name,
-                qty,
-                limit_buy,
-                ts,
-                epoch,
-                trade_id,
-                f"paper_order_{trade_id}",
-                limit_buy,
-                json.dumps(entry_diag),
-            ),
-        )
-        new_cash = float(ledger["cash_balance"]) - notional - fee - slip
-        pos_val = qty * limit_buy
-        conn.execute(
-            """
-            UPDATE scalp_paper_ledger SET
-              cash_balance = ?,
-              positions_value = positions_value + ?,
-              total_equity = ? + positions_value + ?,
-              updated_at = datetime('now')
-            WHERE id = 1
-            """,
-            (new_cash, pos_val, new_cash, pos_val),
-        )
-        post = dict(self._ledger(conn))
-        self._audit(
-            conn,
-            trade_id=trade_id,
-            action="BUY",
-            symbol=sym,
-            qty=qty,
-            price=limit_buy,
-            pre=pre,
-            post=post,
-            reason=f"SCALP_PAPER_ENTRY_{sig.setup_name}",
-        )
-        self._write_position_cache(
-            sym,
-            {
-                "symbol": sym,
-                "quantity": qty,
-                "entry_price": limit_buy,
-                "setup_name": sig.setup_name,
-                "trade_id": trade_id,
-                "strategy_id": sig.setup_name,
-                "paper_only": True,
-            },
-        )
-        logger.info("SCALP_PAPER_BUY %s setup=%s qty=%.8f price=%.4f", sym, sig.setup_name, qty, limit_buy)
-        set_entry_armed(self._redis, prefix=self.config.redis_key_prefix, armed=False)
+                {
+                    "symbol": sym,
+                    "quantity": qty,
+                    "entry_price": limit_buy,
+                    "setup_name": sig.setup_name,
+                    "trade_id": trade_id,
+                    "strategy_id": sig.setup_name,
+                    "paper_only": True,
+                },
+            )
+            logger.info("SCALP_PAPER_BUY %s setup=%s qty=%.8f price=%.4f", sym, sig.setup_name, qty, limit_buy)
+            set_entry_armed(self._redis, prefix=self.config.redis_key_prefix, armed=False)
+            with contextlib.suppress(Exception):
+                from backend.services.scalp_gate_telemetry import record_gate_event
+
+                record_gate_event(
+                    self.config.database_path,
+                    gate_id="STRATEGY_PASS",
+                    symbol=sym,
+                    outcome="passed",
+                    setup=sig.setup_name,
+                    detail="paper_fill",
+                )
+        finally:
+            self._entry_reservations.pop(sym.upper(), None)
 
     def shutdown(self) -> None:
         clear_entry_armed(self._redis, prefix=self.config.redis_key_prefix)
