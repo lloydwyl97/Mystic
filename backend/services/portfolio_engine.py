@@ -424,7 +424,8 @@ _BAR_PRE_RANK_RULE_BUY_MARGIN_SENTINEL = 1.0
 # Bar-close hard filters (in addition to signal-consumer gates).
 BAR_EXEC_ENFORCE_BUY_MARGIN = os.getenv("BAR_EXEC_ENFORCE_BUY_MARGIN", "true").lower() in ("1", "true", "yes", "on")
 MIN_BUY_MARGIN = 0.02
-BAR_EXEC_ABSOLUTE_MIN_BUY_MARGIN = max(MIN_BUY_MARGIN, float(os.getenv("BAR_EXEC_ABSOLUTE_MIN_BUY_MARGIN", "0.02")))
+# Honor env floor as-written (was clamped to MIN_BUY_MARGIN=0.02, so 0.005 never took effect).
+BAR_EXEC_ABSOLUTE_MIN_BUY_MARGIN = float(os.getenv("BAR_EXEC_ABSOLUTE_MIN_BUY_MARGIN", str(MIN_BUY_MARGIN)))
 
 
 def _full_universe_pair_key(symbol: str, strategy_id: str) -> tuple[str, str]:
@@ -13271,9 +13272,189 @@ class PortfolioEngine:
 
         return diagnostics
 
+    async def _execute_additional_bar_buys(
+        self,
+        *,
+        bar_timestamp: int,
+        bar_candidate_snapshot: list,
+        pipeline_done: set[str],
+    ) -> int:
+        """Fill remaining open DAY slots with other buy-intent symbols on the same bar.
+
+        Primary selection still ranks; this only executes extras already queued in
+        ``self._bar_extra_buy_candidates`` (unheld, buy-intent, ranked). Returns
+        how many additional buys executed.
+        """
+        extras = list(getattr(self, "_bar_extra_buy_candidates", None) or [])
+        self._bar_extra_buy_candidates = []
+        if not extras:
+            return 0
+        try:
+            max_pos = int(os.getenv("MAX_OPEN_POSITIONS", str(getattr(self, "max_positions", 4) or 4)))
+        except Exception:
+            max_pos = 4
+        filled = 0
+        for cand in extras:
+            if len(self.open_positions) >= max_pos:
+                break
+            if cand.symbol in self.open_positions:
+                continue
+            symbol = cand.symbol
+            try:
+                await self._entry_ensure_constraints(symbol)
+                equity = self._total_equity
+                perf = self.coin_performance.get(symbol)
+                sizing_mult = perf.sizing_multiplier if perf else 1.0
+                strategy_id_for_size = str((cand.decision_data or {}).get("live_ai_strategy") or "day").strip().lower()
+                top_meta_score = float(
+                    (cand.decision_data or {}).get("final_selection_score")
+                    or (cand.decision_data or {}).get("selection_score")
+                    or cand.rank_score()
+                )
+                top_net_ev = self._estimate_candidate_net_expected_value(cand.decision_data or {})
+                if float(top_net_ev) <= 0.0:
+                    logger.info("MULTI_BUY_SKIP_NEGATIVE_EV symbol=%s net_ev=%.6f", symbol, float(top_net_ev))
+                    continue
+                dyn_mult, _dyn_components, dyn_cap_reason = self._compute_dynamic_sizing_multiplier(
+                    symbol=symbol,
+                    strategy_id=strategy_id_for_size,
+                    final_profit_score=top_meta_score,
+                    net_expected_value=float(top_net_ev),
+                    confidence=float(cand.confidence or 0.0),
+                    decision_data=cand.decision_data or {},
+                    chop_score=float(cand.chop_score) if cand.chop_score is not None else None,
+                    coin_edge_score=float(cand.coin_edge_score) if cand.coin_edge_score is not None else None,
+                )
+                sizing_mult *= dyn_mult
+                quantity, stop_price, _risk_usd = self.calculate_position_size(
+                    symbol, equity, cand.atr, cand.current_price, sizing_mult, cand.confidence
+                )
+                if quantity <= 0:
+                    logger.info(
+                        "MULTI_BUY_SKIP_SIZE symbol=%s dyn_cap_reason=%s",
+                        symbol,
+                        dyn_cap_reason,
+                    )
+                    continue
+                self._hydrate_buy_candidate_audit_from_redis_if_missing(cand)
+                explainability = TradeExplainability(
+                    trade_id="",
+                    symbol=symbol,
+                    side="BUY",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    ai_confidence=cand.confidence,
+                    trend_score=cand.trend_score,
+                    chop_score=cand.chop_score,
+                    coin_edge_score=cand.coin_edge_score,
+                    composite_score=cand.composite_score,
+                    regime=(cand.decision_data or {}).get("regime", "unknown"),
+                    price_structure_regime=cand.price_structure_regime,
+                    coin_win_rate_20=perf.win_rate_20 if perf else 0.5,
+                    coin_expectancy=perf.expectancy if perf else 0.0,
+                    portfolio_open_risk=self._calculate_total_open_risk(),
+                )
+                _dd = cand.decision_data or {}
+                # Keep Redis/artifact namespace on canonical day ML — AW family labels are
+                # attribution/shadow only when DAY_AW_OWNER is off (multi-buy was fetching
+                # ai_signal:allweather_breakout_pullback:* and missing setup stamps).
+                _sid = str(_dd.get("live_ai_strategy") or "day").strip().lower() or "day"
+                _aw_owner = os.getenv("DAY_AW_OWNER_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+                if (not _aw_owner) and _sid in (
+                    "allweather_breakout_pullback",
+                    "allweather",
+                    "aw",
+                ):
+                    _sid = "day"
+                explainability.live_ai_strategy = _sid
+                # Same artifact + thesis stamps as primary bar buy — without these,
+                # ARTIFACT_CONTRACT / ENTRY_EXIT_MISSING_PRICE_OR_SETUP fail closed.
+                explainability.artifact_path = str(_dd.get("model_artifact_path") or "")
+                explainability.artifact_sha256 = str(_dd.get("artifact_sha256") or "")
+                explainability.model_trained_at = str(_dd.get("model_trained_at") or "")
+                try:
+                    explainability.feature_version = int(_dd.get("feature_version") or 5)
+                except (TypeError, ValueError):
+                    explainability.feature_version = 5
+                try:
+                    explainability.feature_dim = int(_dd.get("feature_dim") or 145)
+                except (TypeError, ValueError):
+                    explainability.feature_dim = 145
+                explainability.setup_type = str(_dd.get("setup_type") or _dd.get("entry_thesis") or "")
+                explainability.entry_thesis = str(_dd.get("entry_thesis") or explainability.setup_type)
+                explainability.thesis_score = float(_safe_float(_dd.get("thesis_score"), 0.0))
+                explainability.thesis_invalid_level = float(_safe_float(_dd.get("thesis_invalid_level"), 0.0))
+                explainability.thesis_target_level = float(_safe_float(_dd.get("thesis_target_level"), 0.0))
+                explainability.entry_vwap = float(_safe_float(_dd.get("entry_vwap"), 0.0))
+                explainability.day_route_regime = str(_dd.get("day_route_regime") or _dd.get("regime") or "")
+                explainability.strategy_family = str(_dd.get("strategy_family") or "")
+                explainability.price_structure_regime = str(
+                    _dd.get("price_structure_regime") or getattr(cand, "price_structure_regime", "") or ""
+                )
+                try:
+                    _ebm = _dd.get("buy_margin")
+                    explainability.entry_buy_margin = float(_ebm) if _ebm not in (None, "") else None
+                except (TypeError, ValueError):
+                    explainability.entry_buy_margin = None
+                if not explainability.entry_thesis:
+                    logger.warning(
+                        "MULTI_BUY_MISSING_SETUP symbol=%s decision_id=%s dd_keys=%s",
+                        symbol,
+                        cand.decision_id,
+                        sorted(list(_dd.keys()))[:40],
+                    )
+                exec_price = float(cand.current_price or 0.0)
+                with contextlib.suppress(Exception):
+                    from backend.config.redis_config import get_redis_client
+                    from backend.utils.symbols import to_exchange_symbol
+
+                    redis_client = get_redis_client()
+                    if redis_client:
+                        base_symbol = to_exchange_symbol(symbol).replace("USDT", "")
+                        price_str = redis_client.get(f"market:{base_symbol}")
+                        if price_str:
+                            if isinstance(price_str, str):
+                                price_json = json.loads(price_str)
+                                fresh = float(price_json["price"]) if isinstance(price_json, dict) and "price" in price_json else float(price_str)
+                            else:
+                                fresh = float(price_str)
+                            if fresh > 0:
+                                exec_price = fresh
+                extra_result = await self.execute_buy_fifo(
+                    symbol=symbol,
+                    quantity=quantity,
+                    price=exec_price,
+                    stop_price=stop_price,
+                    atr=cand.atr,
+                    confidence=cand.confidence,
+                    bar_timestamp=bar_timestamp,
+                    explainability=explainability,
+                    decision_id=cand.decision_id,
+                    sleeve=getattr(cand, "sleeve", "") or "",
+                )
+                if extra_result is not None:
+                    filled += 1
+                    if cand.decision_id:
+                        pipeline_done.add(str(cand.decision_id))
+                    logger.info(
+                        "MULTI_BUY_EXECUTED symbol=%s qty=%.6f price=%.4f decision_id=%s",
+                        symbol,
+                        float(quantity),
+                        float(exec_price),
+                        cand.decision_id,
+                    )
+                else:
+                    logger.info("MULTI_BUY_BLOCKED symbol=%s decision_id=%s", symbol, cand.decision_id)
+            except Exception:
+                logger.exception("MULTI_BUY_ERROR symbol=%s", symbol)
+        if filled:
+            logger.info("MULTI_BUY_DONE filled=%d open_positions=%d", filled, len(self.open_positions))
+        return filled
+
     async def process_bar_candidates(self, bar_timestamp: int) -> dict[str, Any] | None:
         """
-        PHASE 5: At bar close, rank all candidates and execute top 1.
+        PHASE 5: At bar close, rank buy-intent candidates and execute up to
+        DAY_MAX_BUYS_PER_BAR (default 4) unheld symbols — filling open slots
+        across the top-4 basket instead of only rank #1.
         """
         if bar_timestamp <= self.last_bar_timestamp:
             return None  # Already processed this bar
@@ -14098,11 +14279,16 @@ class PortfolioEngine:
             return None
 
         open_syms = set(self.open_positions.keys())
-        fresh_symbol_candidates = [c for c in execution_sane_candidates if c.symbol not in open_syms]
-        chosen = list(fresh_symbol_candidates or execution_sane_candidates)
+        # Never fall back to already-held symbols — that only produced
+        # BUY_BLOCKED_EXPOSURE_CAP and starved the multi-buy queue for ETH/SOL/XRP.
+        chosen = [c for c in execution_sane_candidates if c.symbol not in open_syms]
         if not chosen:
             await self._emit_day_health_telemetry("BUY_SKIPPED_NO_CHOSEN_CANDIDATE")
-            logger.info("BUY_SKIPPED: no valid candidates after spread/ATR filtering")
+            logger.info(
+                "BUY_SKIPPED: no unheld candidates after spread/ATR/margin filters (held=%s sane=%s)",
+                sorted(open_syms),
+                [c.symbol for c in execution_sane_candidates],
+            )
             self._persist_profit_cycle_state(
                 {
                     "bar_timestamp": int(bar_timestamp),
@@ -14145,11 +14331,38 @@ class PortfolioEngine:
         # Selection is ranking-only. Execution enforces buy_margin, capacity,
         # and duplicate-symbol blocks. Skip candidates Mystic already holds
         # (one open position per symbol).
-        top_candidate = chosen[0]
+        # Fill multiple open slots per bar when several symbols have buy intent
+        # (was hard-capped at top-1, so BTC often starved ETH/SOL/XRP).
+        _max_buys_per_bar = max(1, int(os.getenv("DAY_MAX_BUYS_PER_BAR", "4")))
+        try:
+            _max_pos_bar = int(os.getenv("MAX_OPEN_POSITIONS", str(getattr(self, "max_positions", 4) or 4)))
+        except Exception:
+            _max_pos_bar = 4
+        _slots_left = max(0, _max_pos_bar - len(self.open_positions))
+        _buy_budget = min(_max_buys_per_bar, _slots_left) if _slots_left > 0 else 0
+        _buy_queue: list[BuyCandidate] = []
         for cand in chosen:
-            if cand.symbol not in self.open_positions:
-                top_candidate = cand
+            if cand.symbol in self.open_positions:
+                continue
+            if any(x.symbol == cand.symbol for x in _buy_queue):
+                continue
+            _buy_queue.append(cand)
+            if _buy_budget > 0 and len(_buy_queue) >= _buy_budget:
                 break
+        if not _buy_queue:
+            top_candidate = chosen[0]
+            self._bar_extra_buy_candidates = []
+        else:
+            top_candidate = _buy_queue[0]
+            self._bar_extra_buy_candidates = list(_buy_queue[1:])
+            if self._bar_extra_buy_candidates:
+                logger.info(
+                    "MULTI_BUY_QUEUE primary=%s extras=%s budget=%d slots_left=%d",
+                    top_candidate.symbol,
+                    [c.symbol for c in self._bar_extra_buy_candidates],
+                    _buy_budget,
+                    _slots_left,
+                )
         top_meta: dict[str, Any] = {}
         cycle_leaderboard: list[dict[str, Any]] = []
         for _idx, _cand in enumerate(valid_candidates):
@@ -14302,8 +14515,16 @@ class PortfolioEngine:
                         bar_timestamp=int(bar_timestamp or 0),
                     )
             await self._bar_pipeline_terminal(top_candidate.decision_id, "BAR_SIZING_ZERO", pipeline_done)
+            # Primary sized to zero — still try other buy-intent symbols this bar.
+            with contextlib.suppress(Exception):
+                await self._execute_additional_bar_buys(
+                    bar_timestamp=int(bar_timestamp),
+                    bar_candidate_snapshot=bar_candidate_snapshot,
+                    pipeline_done=pipeline_done,
+                )
             await self._bar_pipeline_not_selected_others(bar_candidate_snapshot, top_candidate.decision_id or "", pipeline_done)
             self.current_bar_candidates.clear()
+            self._bar_extra_buy_candidates = []
             return None
 
         # Align execution-time audit payload with the live Redis ML hash when the queued
@@ -14553,8 +14774,17 @@ class PortfolioEngine:
         explainability.thesis_trend_tf = str(_dd.get("thesis_trend_tf") or "")
         explainability.day_route_regime = str(_dd.get("day_route_regime") or "")
         explainability.strategy_family = str(_dd.get("strategy_family") or "")
-        if explainability.strategy_family == "ALLWEATHER_BREAKOUT_PULLBACK":
+        # Only bind live_ai_strategy to the AW family when AW owns entries; otherwise
+        # Redis/artifact gates expect the canonical day signal hash.
+        _aw_owner_primary = os.getenv("DAY_AW_OWNER_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+        if _aw_owner_primary and explainability.strategy_family == "ALLWEATHER_BREAKOUT_PULLBACK":
             explainability.live_ai_strategy = explainability.strategy_family
+        elif (not _aw_owner_primary) and str(explainability.live_ai_strategy or "").strip().lower() in (
+            "allweather_breakout_pullback",
+            "allweather",
+            "aw",
+        ):
+            explainability.live_ai_strategy = "day"
 
         try:
             _ebm_bar = _costs_bar.get("entry_buy_margin")
@@ -14872,10 +15102,21 @@ class PortfolioEngine:
                 top_candidate.decision_id,
                 "BAR_EXECUTE_BUY_FIFO_UNSPECIFIED",
             )
+
+        # After primary fill, attempt remaining buy-intent symbols this same bar.
+        if result is not None:
+            with contextlib.suppress(Exception):
+                await self._execute_additional_bar_buys(
+                    bar_timestamp=int(bar_timestamp),
+                    bar_candidate_snapshot=bar_candidate_snapshot,
+                    pipeline_done=pipeline_done,
+                )
+
         await self._bar_pipeline_not_selected_others(bar_candidate_snapshot, exc_id, pipeline_done)
 
         # Clear candidates for next bar
         self.current_bar_candidates.clear()
+        self._bar_extra_buy_candidates = []
 
         # Include decision_id for idempotency (integration sets executed:{decision_id} on actual execution)
         if result is not None and top_candidate.decision_id:
