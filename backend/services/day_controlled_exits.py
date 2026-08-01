@@ -32,7 +32,16 @@ EXIT_VOLATILITY_STOP = "VOLATILITY_STOP_EXIT"
 EXIT_TIME_STOP = "TIME_STOP_EXIT"
 EXIT_FAILED_RECLAIM = "FAILED_RECLAIM_EXIT"
 EXIT_STALL = "STALL_EXIT"
+EXIT_STALL_DEAD = "STALL_EXIT_DEAD_NO_MFE"
 EXIT_GIVEBACK = "GIVEBACK_EXIT"
+
+# Telemetry hold reasons (action=hold; never force-sell).
+STALL_HOLD_TOO_YOUNG = "STALL_HOLD_TOO_YOUNG"
+STALL_HOLD_NOT_RED = "STALL_HOLD_NOT_RED"
+STALL_HOLD_MFE_TOO_HIGH = "STALL_HOLD_MFE_TOO_HIGH"
+STALL_HOLD_RECOVERY_PRESENT = "STALL_HOLD_RECOVERY_PRESENT"
+STALL_HOLD_FLAT_NOT_DEAD = "STALL_HOLD_FLAT_NOT_DEAD"
+STALL_HOLD_NET_PROFIT_ELIGIBLE = "STALL_HOLD_NET_PROFIT_ELIGIBLE"
 
 
 def _bull_hold_extension_min() -> int:
@@ -74,6 +83,7 @@ ALLOWED_DAY_EXIT_REASONS = frozenset(
         EXIT_VOLATILITY_STOP,
         EXIT_TIME_STOP,
         EXIT_STALL,
+        EXIT_STALL_DEAD,
         EXIT_GIVEBACK,
         EXIT_FAILED_RECLAIM,
         EXIT_EXTREME_PROTECTION,
@@ -95,6 +105,7 @@ ENGINE_RISK_EXIT_PREFIXES = (
     EXIT_VOLATILITY_STOP,
     EXIT_TIME_STOP,
     EXIT_STALL,
+    EXIT_STALL_DEAD,
     EXIT_GIVEBACK,
     EXIT_TRAILING_STOP,
     EXIT_THESIS_INVALIDATION,
@@ -123,6 +134,19 @@ def _stall_max_mfe_pct() -> float:
     return float(os.getenv("DAY_STALL_MAX_MFE_PCT", "0.0050"))
 
 
+def _stall_min_adverse_pct() -> float:
+    """Min MAE (fraction below entry) required to confirm a dead/worsening stall cut.
+
+    Flat red trades with tiny adverse are not force-sold; TIME_STOP still owns the ceiling.
+    """
+    return float(os.getenv("DAY_STALL_MIN_ADVERSE_PCT", "0.0025"))
+
+
+def _stall_recovery_pct() -> float:
+    """If mark has reclaimed within this fraction of entry (from below), treat as recovery."""
+    return float(os.getenv("DAY_STALL_RECOVERY_PCT", "0.0010"))
+
+
 def evaluate_stall_exit(
     *,
     entry_price: float,
@@ -130,12 +154,18 @@ def evaluate_stall_exit(
     net_pnl_pct: float,
     hold_minutes: float,
     max_hold_min: int,
+    current_price: float = 0.0,
+    lowest_price: float = 0.0,
 ) -> dict[str, Any] | None:
     """
-    Cut dead DAY holds that never make meaningful progress before hard time-stop.
+    Cut only *dead/worsening* DAY holds before hard time-stop.
 
-    Day-trade defaults wait ~2h before stall eligibility so normal multi-hour
-    swings are not treated as dead inventory. Exit-only — no entry/ranking changes.
+    Low-MFE alone after 120m is not enough — Ocean evidence showed that pattern
+    was the default losing disposal path. Require red + low MFE + confirmed
+    adverse deterioration, and hold when recovery/improvement is present.
+
+    Exit-only — no entry/ranking changes. Returns None to continue the exit
+    chain, or a sell/hold telemetry dict (hold reasons never force-sell).
     """
     if not _stall_exit_enabled():
         return None
@@ -143,27 +173,82 @@ def evaluate_stall_exit(
     if entry <= 0:
         return None
     stall_min = _stall_min_hold_min()
+    mark = float(current_price or 0.0)
+    highest = float(highest_price or entry)
+    lowest = float(lowest_price or 0.0)
+    # Unit tests / older call sites may omit mark; approximate from fee-aware net.
+    if mark <= 0 and net_pnl_pct is not None:
+        mark = entry * (1.0 + float(net_pnl_pct))
+    if lowest <= 0:
+        lowest = min(mark, entry) if mark > 0 else entry
+    mfe_pct = max(0.0, (highest - entry) / entry)
+    mae_pct = max(0.0, (entry - lowest) / entry) if entry > 0 else 0.0
+    max_mfe = _stall_max_mfe_pct()
+    min_adverse = _stall_min_adverse_pct()
+    recovery_band = _stall_recovery_pct()
+
+    def _hold(reason: str, **extra: Any) -> dict[str, Any]:
+        payload = {
+            "action": "hold",
+            "reason": reason,
+            "net_pnl_pct": net_pnl_pct,
+            "hold_minutes": hold_minutes,
+            "mfe_pct": round(mfe_pct, 6),
+            "mae_pct": round(mae_pct, 6),
+            "detail": (
+                f"stall_min={stall_min:.0f}m mfe={mfe_pct:.6f} mae={mae_pct:.6f} "
+                f"max_mfe={max_mfe:.6f} min_adverse={min_adverse:.6f}"
+            ),
+        }
+        payload.update(extra)
+        return payload
+
     if hold_minutes < stall_min:
-        return None
+        return _hold(STALL_HOLD_TOO_YOUNG)
     # Never replace the hard ceiling — time-stop still owns max_hold.
     if hold_minutes + 1e-9 >= float(max_hold_min):
         return None
-    # Only cut flat/losing paths — never scratch small greens before TP.
-    if net_pnl_pct >= 0.0:
-        return None
-    # Only cut when still below the net-profit floor (same eligibility as time-stop).
+    # Never scratch greens / net-profit-eligible paths — profit exits own those.
     if net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL):
-        return None
-    highest = float(highest_price or entry)
-    mfe_pct = max(0.0, (highest - entry) / entry)
-    if mfe_pct >= _stall_max_mfe_pct():
-        return None
+        return _hold(STALL_HOLD_NET_PROFIT_ELIGIBLE)
+    if net_pnl_pct >= 0.0:
+        return _hold(STALL_HOLD_NOT_RED)
+    if mfe_pct >= max_mfe:
+        return _hold(STALL_HOLD_MFE_TOO_HIGH)
+
+    # Never deteriorated enough — flat/chop inventory, not a dead disposal.
+    if mae_pct < min_adverse:
+        return _hold(STALL_HOLD_FLAT_NOT_DEAD)
+
+    # Recovery / improvement after a real adverse print: reclaim toward entry
+    # or lift off the low. Requires prior MAE so near-entry flats stay FLAT_NOT_DEAD.
+    if mark > 0:
+        near_entry_reclaim = mark >= entry * (1.0 - recovery_band)
+        lifted_from_low = lowest > 0 and mark >= lowest * (1.0 + recovery_band)
+        improving_vs_mid = lowest > 0 and highest > lowest and mark >= (lowest + entry) / 2.0
+        if near_entry_reclaim or (lifted_from_low and improving_vs_mid):
+            return _hold(
+                STALL_HOLD_RECOVERY_PRESENT,
+                near_entry_reclaim=near_entry_reclaim,
+                lifted_from_low=lifted_from_low,
+            )
+
+    # Dead/worsening confirmation: adverse excursion still in force at the mark.
+    still_adverse = mark > 0 and mark <= entry * (1.0 - min_adverse * 0.5)
+    if not still_adverse:
+        return _hold(STALL_HOLD_FLAT_NOT_DEAD)
+
     return {
         "action": "sell",
-        "reason": EXIT_STALL,
+        "reason": EXIT_STALL_DEAD,
         "net_pnl_pct": net_pnl_pct,
         "hold_minutes": hold_minutes,
-        "detail": f"stall_min={stall_min:.0f}m mfe={mfe_pct:.6f} max_mfe={_stall_max_mfe_pct():.6f}",
+        "mfe_pct": round(mfe_pct, 6),
+        "mae_pct": round(mae_pct, 6),
+        "detail": (
+            f"stall_min={stall_min:.0f}m mfe={mfe_pct:.6f} mae={mae_pct:.6f} "
+            f"max_mfe={max_mfe:.6f} min_adverse={min_adverse:.6f}"
+        ),
     }
 
 
@@ -410,13 +495,16 @@ def preview_next_engine_exit(
 
     highest = float(getattr(position, "highest_price", entry) or entry)
     mfe_pct = max(0.0, (highest - entry) / entry) if entry > 0 else 0.0
-    stall_ready = bool(
-        _stall_exit_enabled()
-        and hold_minutes >= _stall_min_hold_min()
-        and hold_minutes + 1e-9 < float(max_hold)
-        and net_pnl_pct < 0.0
-        and mfe_pct < _stall_max_mfe_pct()
+    _stall_preview = evaluate_stall_exit(
+        entry_price=entry,
+        highest_price=highest,
+        net_pnl_pct=net_pnl_pct,
+        hold_minutes=hold_minutes,
+        max_hold_min=max_hold,
+        current_price=float(current_price or 0.0),
+        lowest_price=float(getattr(position, "lowest_price", 0.0) or 0.0),
     )
+    stall_ready = bool(_stall_preview is not None and str(_stall_preview.get("action") or "") == "sell")
     giveback_ready = bool(_giveback_exit_enabled() and hold_minutes >= _giveback_min_hold_min() and mfe_pct >= _giveback_min_mfe_pct() and net_pnl_pct + 1e-12 <= _giveback_trigger_pnl_pct())
     checks = {
         "stop_loss": bool(stop > 0 and current_price <= stop),
@@ -433,7 +521,7 @@ def preview_next_engine_exit(
         ("stop_loss", EXIT_STOP_LOSS),
         ("trailing_stop", EXIT_TRAILING_STOP),
         ("giveback_exit", EXIT_GIVEBACK),
-        ("stall_exit", EXIT_STALL),
+        ("stall_exit", EXIT_STALL_DEAD),
         ("time_stop", EXIT_TIME_STOP),
         ("profit_target", EXIT_NET_PROFIT),
         ("net_profit", EXIT_NET_PROFIT),
@@ -620,9 +708,12 @@ def evaluate_engine_managed_exit(
             net_pnl_pct=net_pnl_pct,
             hold_minutes=hold_minutes,
             max_hold_min=max_hold,
+            current_price=float(current_price or 0.0),
+            lowest_price=float(getattr(position, "lowest_price", 0.0) or 0.0),
         )
-        if stall is not None:
+        if stall is not None and str(stall.get("action") or "") == "sell":
             return stall
+        # Hold telemetry reasons (STALL_HOLD_*) continue the exit chain — do not force-sell.
     # Bull regime with validated edge: stall is suppressed — price consolidating
     # before next leg is normal. Without validated edge, stall check still applies.
 

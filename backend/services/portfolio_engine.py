@@ -1495,6 +1495,16 @@ class TradeExplainability:
     selected_over_symbol: str = ""
     selected_over_score: float = 0.0
     why_selected: str = ""
+    # Model direction / ranking telemetry (P1B measurement stamps)
+    prob_buy: float | None = None
+    prob_hold: float | None = None
+    prob_sell: float | None = None
+    quality_opinion_penalty: float = 0.0
+    signal_side_penalty: float = 0.0
+    rank_score: float = 0.0
+    argmax_action: str = ""
+    prediction: str = ""
+    side_signal: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for storage"""
@@ -1606,6 +1616,15 @@ class TradeExplainability:
             "selected_over_symbol": self.selected_over_symbol,
             "selected_over_score": self.selected_over_score,
             "why_selected": self.why_selected,
+            "prob_buy": self.prob_buy,
+            "prob_hold": self.prob_hold,
+            "prob_sell": self.prob_sell,
+            "quality_opinion_penalty": self.quality_opinion_penalty,
+            "signal_side_penalty": self.signal_side_penalty,
+            "rank_score": self.rank_score,
+            "argmax_action": self.argmax_action,
+            "prediction": self.prediction,
+            "side_signal": self.side_signal,
         }
 
 
@@ -4727,6 +4746,7 @@ class PortfolioEngine:
         # If trigger itself carries a full canonical _EXIT label, use it (prevents MANUAL leakage)
         for canon in (
             "TIME_STOP_EXIT",
+            "STALL_EXIT_DEAD_NO_MFE",
             "STALL_EXIT",
             "GIVEBACK_EXIT",
             "NET_PROFIT_EXIT",
@@ -4742,6 +4762,8 @@ class PortfolioEngine:
         # Trigger-first for engine risk exits: always canonical even if exit_type is MANUAL
         if "GIVEBACK" in trig:
             return "GIVEBACK_EXIT"
+        if "STALL_EXIT_DEAD" in trig or "STALL_EXIT_DEAD_NO_MFE" in trig:
+            return "STALL_EXIT_DEAD_NO_MFE"
         if "STALL" in trig:
             return "STALL_EXIT"
         if "TIME_STOP" in trig:
@@ -4910,14 +4932,31 @@ class PortfolioEngine:
                         logger.debug("LEARNING_ENRICH_BUY_LOOKUP_FAILED symbol=%s", symbol, exc_info=True)
 
                 if ex_payload:
+                    _sel = (
+                        ex_payload.get("selected_score")
+                        or ex_payload.get("final_selection_score")
+                        or ex_payload.get("rank_score")
+                    )
                     rank_data = {
                         "selected_rank": ex_payload.get("selected_rank") or ex_payload.get("final_selected_rank"),
-                        "selected_score": ex_payload.get("selected_score") or ex_payload.get("final_selection_score"),
+                        "selected_score": _sel,
+                        "entry_score": _sel,
+                        "rank_score": ex_payload.get("rank_score") or _sel,
+                        "final_selection_score": ex_payload.get("final_selection_score") or _sel,
+                        "buy_margin": ex_payload.get("buy_margin")
+                        if ex_payload.get("buy_margin") is not None
+                        else ex_payload.get("entry_buy_margin"),
                         "raw_score": ex_payload.get("raw_score"),
                         "adjusted_score": ex_payload.get("adjusted_score"),
                         "composite_score": ex_payload.get("composite_score"),
                         "ai_confidence": ex_payload.get("ai_confidence"),
                         "net_expected_value": ex_payload.get("selected_net_expected_value"),
+                        "selected_net_expected_value": ex_payload.get("selected_net_expected_value"),
+                        "prob_buy": ex_payload.get("prob_buy"),
+                        "prob_hold": ex_payload.get("prob_hold"),
+                        "prob_sell": ex_payload.get("prob_sell"),
+                        "quality_opinion_penalty": ex_payload.get("quality_opinion_penalty"),
+                        "signal_side_penalty": ex_payload.get("signal_side_penalty"),
                         "regime": ex_payload.get("regime"),
                         "price_structure_regime": ex_payload.get("price_structure_regime"),
                         "live_ai_strategy": ex_payload.get("live_ai_strategy") or "day",
@@ -13509,6 +13548,36 @@ class PortfolioEngine:
                     explainability.entry_buy_margin = float(_ebm) if _ebm not in (None, "") else None
                 except (TypeError, ValueError):
                     explainability.entry_buy_margin = None
+                # P1B measurement stamps (multi-buy path)
+                for _attr, _key in (
+                    ("prob_buy", "prob_buy"),
+                    ("prob_hold", "prob_hold"),
+                    ("prob_sell", "prob_sell"),
+                ):
+                    try:
+                        _raw = _dd.get(_key)
+                        setattr(
+                            explainability,
+                            _attr,
+                            float(_raw) if _raw not in (None, "") else None,
+                        )
+                    except (TypeError, ValueError):
+                        setattr(explainability, _attr, None)
+                explainability.quality_opinion_penalty = float(_safe_float(_dd.get("quality_opinion_penalty"), 0.0))
+                explainability.signal_side_penalty = float(_safe_float(_dd.get("signal_side_penalty"), 0.0))
+                explainability.rank_score = float(
+                    _safe_float(_dd.get("rank_score"), cand.rank_score())
+                )
+                explainability.final_selection_score = float(
+                    _safe_float(_dd.get("final_selection_score"), explainability.rank_score)
+                )
+                explainability.selected_score = explainability.final_selection_score
+                explainability.selected_net_expected_value = float(
+                    _safe_float(_dd.get("selected_net_expected_value"), _safe_float(_dd.get("adjusted_ev"), 0.0))
+                )
+                explainability.argmax_action = str(_dd.get("argmax_action") or "")
+                explainability.prediction = str(_dd.get("prediction") or _dd.get("argmax_action") or "")
+                explainability.side_signal = str(_dd.get("side") or _dd.get("action") or "")
                 if not explainability.entry_thesis:
                     logger.warning(
                         "MULTI_BUY_MISSING_SETUP symbol=%s decision_id=%s dd_keys=%s",
@@ -14870,6 +14939,29 @@ class PortfolioEngine:
         explainability.selected_over_symbol = str(_dd.get("selected_over_symbol") or "")
         explainability.selected_over_score = float(_safe_float(_dd.get("selected_over_score"), 0.0))
         explainability.why_selected = str(_dd.get("why_selected") or "")
+        # P1B: persist model probs / opinion penalties / rank for post-trade measurement.
+        for _attr, _key in (
+            ("prob_buy", "prob_buy"),
+            ("prob_hold", "prob_hold"),
+            ("prob_sell", "prob_sell"),
+        ):
+            try:
+                _raw = _dd.get(_key)
+                setattr(
+                    explainability,
+                    _attr,
+                    float(_raw) if _raw not in (None, "") else None,
+                )
+            except (TypeError, ValueError):
+                setattr(explainability, _attr, None)
+        explainability.quality_opinion_penalty = float(_safe_float(_dd.get("quality_opinion_penalty"), 0.0))
+        explainability.signal_side_penalty = float(_safe_float(_dd.get("signal_side_penalty"), 0.0))
+        explainability.rank_score = float(
+            _safe_float(_dd.get("rank_score"), _safe_float(top_meta.get("rank_score"), top_candidate.rank_score()))
+        )
+        explainability.argmax_action = str(_dd.get("argmax_action") or "")
+        explainability.prediction = str(_dd.get("prediction") or _dd.get("argmax_action") or "")
+        explainability.side_signal = str(_dd.get("side") or _dd.get("action") or "")
         # Phase 3: record adaptive ranking telemetry inside score_components_json so
         # downstream learning (outcome bridge, peer-shadow) and operators can audit.
         adaptive_payload = dict(snapshot_score_components)
@@ -15922,6 +16014,7 @@ class PortfolioEngine:
                     "THESIS_INVALIDATION_EXIT",
                     "GIVEBACK_EXIT",
                     "STALL_EXIT",
+                    "STALL_EXIT_DEAD_NO_MFE",
                     "TIME_STOP_EXIT",
                     "FAILED_RECLAIM_EXIT",
                     "EXTREME_PROTECTION_EXIT",
