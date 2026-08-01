@@ -58,10 +58,12 @@ class FailedBreakdownReversalStrategy:
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
 
+        # Align pass score with working strategies (~2.0–3.0+ vs floor 1.45).
+        score = 2.45 + max(0.0, (cur - sweep_low) / max(sweep_low, 1e-12)) * 350.0 + (vol_recent / vol_prior) * 0.12
         return pass_signal(
             ctx,
             self.name,
-            score=0.65,
+            score=score,
             confidence=0.60,
             entry_reason=f"failed_breakdown_reclaim_{sweep_low:.6f}",
             invalidation_reason="reclaim_fails_or_momentum_fades",

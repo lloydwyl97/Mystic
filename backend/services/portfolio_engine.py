@@ -886,6 +886,32 @@ class BuyCandidate:
         except (TypeError, ValueError):
             missed_delta = 0.0
         missed_delta = max(-0.02, min(0.03, missed_delta))
+        # Soft quality / side / pnl penalties (telemetry units ~2-8 → rank units).
+        # Never hard-blocks; only demotes weak HOLD/SELL/low-quality vs BUY.
+        opinion_units = 0.0
+        try:
+            opinion_units = float((self.decision_data or {}).get("quality_opinion_penalty") or 0.0)
+        except (TypeError, ValueError):
+            opinion_units = 0.0
+        if opinion_units <= 0.0:
+            try:
+                opinion_units = float((self.decision_data or {}).get("signal_side_penalty") or 0.0)
+            except (TypeError, ValueError):
+                opinion_units = 0.0
+        try:
+            opinion_units += float((self.decision_data or {}).get("pnl_adapt_penalty") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            opinion_units += float((self.decision_data or {}).get("veto_opinion_penalty") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        opinion_delta = -min(0.25, max(0.0, opinion_units) * 0.025)
+        conf_floor_delta = 0.0
+        try:
+            conf_floor_delta = -min(0.15, max(0.0, float((self.decision_data or {}).get("confidence_floor_penalty") or 0.0)))
+        except (TypeError, ValueError):
+            conf_floor_delta = 0.0
         # Market-role intelligence: live context adjustment (data-driven, never a gate; ±0.06)
         live_role_delta = 0.0
         try:
@@ -927,7 +953,10 @@ class BuyCandidate:
             learned_role_delta = 0.0
         learned_role_delta = max(-0.02, min(0.02, learned_role_delta))
         # Store breakdown in decision_data for API/dashboard visibility (best-effort)
-        _base_before_role = max(0.0, min(1.0, base + delta + trust_delta + thesis_delta + missed_delta))
+        _base_before_role = max(
+            0.0,
+            min(1.0, base + delta + trust_delta + thesis_delta + missed_delta + opinion_delta + conf_floor_delta),
+        )
         _final = max(0.0, min(1.0, _base_before_role + live_role_delta + learned_role_delta))
         try:
             if isinstance(self.decision_data, dict):
@@ -935,6 +964,8 @@ class BuyCandidate:
                 self.decision_data["_role_live_adj"] = round(live_role_delta, 6)
                 self.decision_data["_role_learned_adj"] = round(learned_role_delta, 6)
                 self.decision_data["_role_final_rank"] = round(_final, 6)
+                self.decision_data["_opinion_rank_delta"] = round(opinion_delta, 6)
+                self.decision_data["_confidence_floor_rank_delta"] = round(conf_floor_delta, 6)
         except Exception:
             pass
         return _final
@@ -3982,6 +4013,9 @@ class PortfolioEngine:
             ("original_position_cost", "REAL DEFAULT 0"),
             ("thesis_json", "TEXT DEFAULT ''"),
             ("lowest_price", "REAL DEFAULT 0"),
+            ("status", "TEXT DEFAULT 'ACTIVE'"),
+            ("dust_detected_at", "REAL DEFAULT 0"),
+            ("dust_qty_canonical", "REAL DEFAULT 0"),
         ]:
             if col_name not in pos_cols:
                 try:
@@ -4359,6 +4393,9 @@ class PortfolioEngine:
                         thesis_json_for_position(pos),
                         separators=(",", ":"),
                     )
+                    status_val = str(getattr(pos, "status", "ACTIVE") or "ACTIVE")
+                    dust_at = float(getattr(pos, "dust_detected_at", 0.0) or 0.0)
+                    dust_qty = float(getattr(pos, "dust_qty_canonical", 0.0) or 0.0)
                     cursor.execute(
                         """
                         INSERT OR REPLACE INTO portfolio_engine_positions (
@@ -4368,8 +4405,9 @@ class PortfolioEngine:
                             atr_at_entry, entry_bar_timestamp, confidence_at_entry,
                             entry_fee, sleeve, entry_strategy_id,
                             repair_add_count, last_repair_add_ts, repair_add_trade_ids,
-                            average_entry_after_repair, original_position_cost, thesis_json, last_updated
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            average_entry_after_repair, original_position_cost, thesis_json,
+                            status, dust_detected_at, dust_qty_canonical, last_updated
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                         (
                             pos.symbol,
@@ -4396,6 +4434,9 @@ class PortfolioEngine:
                             avg_after,
                             orig_cost,
                             thesis_json,
+                            status_val,
+                            dust_at,
+                            dust_qty,
                             timestamp,
                         ),
                     )
@@ -5986,7 +6027,10 @@ class PortfolioEngine:
                            COALESCE(average_entry_after_repair, 0),
                            COALESCE(original_position_cost, 0),
                            COALESCE(thesis_json, ''),
-                           COALESCE(lowest_price, 0)
+                           COALESCE(lowest_price, 0),
+                           COALESCE(status, 'ACTIVE'),
+                           COALESCE(dust_detected_at, 0),
+                           COALESCE(dust_qty_canonical, 0)
                     FROM portfolio_engine_positions
                 """)
                 rows = cursor.fetchall()
@@ -6027,6 +6071,9 @@ class PortfolioEngine:
             lowest_px = float(row[23]) if len(row) > 23 else 0.0
             if lowest_px <= 0:
                 lowest_px = float(row[2] or 0.0)
+            status_val = str(row[24]) if len(row) > 24 and row[24] else "ACTIVE"
+            dust_at = float(row[25]) if len(row) > 25 else 0.0
+            dust_qty = float(row[26]) if len(row) > 26 else 0.0
             pos = OpenPosition(
                 symbol=normalized_symbol,
                 quantity=row[1],
@@ -6053,6 +6100,9 @@ class PortfolioEngine:
                 add_count=repair_cnt,
                 last_add_ts=last_repair_ts,
                 lowest_price=lowest_px,
+                status=status_val,
+                dust_detected_at=dust_at,
+                dust_qty_canonical=dust_qty,
                 entry_thesis=str(thesis_payload.get("entry_thesis") or ""),
                 thesis_score=float(thesis_payload.get("thesis_score") or 0.0),
                 thesis_invalid_level=float(thesis_payload.get("thesis_invalid_level") or 0.0),
@@ -6061,6 +6111,8 @@ class PortfolioEngine:
                 thesis_trend_tf=str(thesis_payload.get("thesis_trend_tf") or ""),
                 day_route_regime_at_entry=str(thesis_payload.get("day_route_regime_at_entry") or ""),
                 price_structure_regime_at_entry=str(thesis_payload.get("price_structure_regime_at_entry") or ""),
+                max_hold_min=int(thesis_payload.get("max_hold_min") or 0),
+                trail_pct=float(thesis_payload.get("trail_pct") or 0.0),
             )
             from backend.services.day_inventory_recovery import apply_legacy_tags_from_thesis
 
@@ -9525,6 +9577,7 @@ class PortfolioEngine:
                 position.status = "DUST_PENDING"
                 position.dust_detected_at = time.time()
                 position.dust_qty_canonical = position.quantity
+                await self._persist_position_to_sqlite(position)
                 return None
 
             await self._ensure_symbol_constraints(symbol)
@@ -9550,6 +9603,7 @@ class PortfolioEngine:
                         position.status = "DUST_PENDING"
                         position.dust_detected_at = time.time()
                         position.dust_qty_canonical = position.quantity
+                    await self._persist_position_to_sqlite(position)
                     return None
 
         # =================================================================
@@ -11999,9 +12053,20 @@ class PortfolioEngine:
             cap_reason = cap_reason or "strategy_max_cap"
         thesis_sf = max(0.15, min(1.05, _safe_float(dd.get("thesis_size_factor"), 1.0)))
         bucket_sf = max(0.22, min(1.05, _safe_float(dd.get("bucket_size_factor"), 1.0)))
-        mult *= thesis_sf * bucket_sf
+        # Soft size discount from quality/side penalties (same units as rank demotion).
+        opinion_units = max(
+            0.0,
+            _safe_float(dd.get("quality_opinion_penalty"), 0.0)
+            + _safe_float(dd.get("pnl_adapt_penalty"), 0.0)
+            + _safe_float(dd.get("confidence_floor_penalty"), 0.0) * 8.0,
+        )
+        opinion_sf = max(0.55, 1.0 - min(0.40, opinion_units * 0.04))
+        mult *= thesis_sf * bucket_sf * opinion_sf
         components["thesis_size_factor"] = round(thesis_sf, 4)
         components["bucket_size_factor"] = round(bucket_sf, 4)
+        components["quality_opinion_size_factor"] = round(opinion_sf, 4)
+        if opinion_sf < 0.999 and not cap_reason:
+            cap_reason = "quality_opinion_size_discount"
         mult = max(min_mult, min(max_mult, mult))
         return (round(mult, 4), components, cap_reason)
 
@@ -13574,12 +13639,18 @@ class PortfolioEngine:
             except Exception:
                 pass
             if candidate.confidence < _eff_min:
+                shortfall = float(_eff_min) - float(candidate.confidence or 0.0)
+                soft_pen = min(0.15, max(0.0, shortfall) * 0.5)
+                ddp_conf = dict(candidate.decision_data or {})
+                ddp_conf["confidence_floor_penalty"] = soft_pen
+                ddp_conf["confidence_floor_status"] = "soft_rank_penalty"
+                candidate.decision_data = ddp_conf
                 logger.info(
-                    "BAR_PRE_RANK_TELEMETRY low_conf symbol=%s conf=%.3f min=%.3f (effective_for_edge=%.3f)",
+                    "BAR_PRE_RANK_TELEMETRY low_conf symbol=%s conf=%.3f min=%.3f soft_pen=%.3f (not blocking)",
                     candidate.symbol,
                     candidate.confidence,
-                    MIN_CONFIDENCE,
                     _eff_min,
+                    soft_pen,
                 )
 
             perf = self.coin_performance.get(candidate.symbol)
@@ -15389,14 +15460,14 @@ class PortfolioEngine:
                         old_bm_f,
                     )
                     return (True, old_decision_id)
+            # Lower-score arrivals must not wipe a better candidate.
             logger.debug(
-                "CANDIDATE_REPLACED: %s old=%.3f new=%.3f reason=latest_signal_wins",
+                "CANDIDATE_KEPT: %s old=%.3f new=%.3f reason=higher_score_retained",
                 symbol,
                 old_score,
                 new_score,
             )
-            self.current_bar_candidates[existing_idx] = candidate
-            return (True, old_decision_id)
+            return (False, None)
 
         self.current_bar_candidates.append(candidate)
         logger.debug(

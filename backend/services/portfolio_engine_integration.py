@@ -668,14 +668,10 @@ class PortfolioEngineIntegration:
                         except Exception as ctx_overlay_exc:
                             logger.debug("SIGNAL_CONSUMER context overlay %s: %s", symbol, ctx_overlay_exc)
 
-                    if side == "sell":
-                        pass  # handled below after price check
-                    elif not is_buy:
-                        # Keep non-BUY (typically HOLD) candidates in the ranked board.
-                        # HOLD/SELL must influence score via penalties, not pre-rank admission.
-                        side_penalty = 4.0
-                        if str(side).strip().lower() == "sell":
-                            side_penalty = 8.0
+                    if not is_buy:
+                        # Keep non-BUY (HOLD/SELL) candidates in the ranked board.
+                        # They must influence score via penalties, not pre-rank admission.
+                        side_penalty = 8.0 if str(side).strip().lower() == "sell" else 4.0
                         logger.info(
                             "SIGNAL_SIDE_TELEMETRY: %s side=%s retained_for_ranking penalty=%.2f",
                             symbol,
@@ -940,7 +936,34 @@ class PortfolioEngineIntegration:
                         except (TypeError, ValueError):
                             return default
 
+                    def _prob_float(key: str, default: float = 0.0) -> float:
+                        try:
+                            raw = dd.get(key)
+                            if raw is None or str(raw).strip() == "":
+                                return default
+                            v = float(raw)
+                            return v if math.isfinite(v) else default
+                        except (TypeError, ValueError):
+                            return default
+
+                    # Prefer penalties accumulated on dd (side/spread/liquidity). q_det/ve_det
+                    # are often empty stubs in this path and previously wiped those values.
+                    _q_pen = float(dd.get("quality_opinion_penalty") or 0.0)
+                    if _q_pen <= 0.0 and (q_det or {}).get("penalty_total") not in (None, ""):
+                        try:
+                            _q_pen = float((q_det or {}).get("penalty_total") or 0.0)
+                        except (TypeError, ValueError):
+                            _q_pen = 0.0
+                    _v_pen = float(dd.get("veto_opinion_penalty") or 0.0)
+                    if _v_pen <= 0.0 and (ve_det or {}).get("penalty_total") not in (None, ""):
+                        try:
+                            _v_pen = float((ve_det or {}).get("penalty_total") or 0.0)
+                        except (TypeError, ValueError):
+                            _v_pen = 0.0
+                    _side_pen = float(dd.get("signal_side_penalty") or 0.0)
+
                     decision_data_parsed = {
+                        "symbol": ccxt_symbol,
                         "ema_alignment": ema_alignment,
                         "price_momentum": price_momentum,
                         "rsi": rsi,
@@ -952,7 +975,14 @@ class PortfolioEngineIntegration:
                         "spread_pct": float(_sp) if _sp is not None else None,
                         "buy_margin": bm_for_bar,
                         "winner_probability": confidence,
+                        # Model direction + full probability triple — required for EV / side penalties.
+                        "side": str(side or dd.get("side") or ""),
+                        "action": str(dd.get("action") or side or ""),
+                        "prediction": str(dd.get("prediction") or dd.get("argmax_action") or side or ""),
                         "argmax_action": dd.get("argmax_action", ""),
+                        "prob_buy": _prob_float("prob_buy"),
+                        "prob_hold": _prob_float("prob_hold"),
+                        "prob_sell": _prob_float("prob_sell"),
                         "live_ai_strategy": live_ai_strategy,
                         "artifact_sha256": (dd.get("artifact_sha256") or "")[:128],
                         "model_artifact_path": (dd.get("model_artifact_path") or "")[:512],
@@ -968,9 +998,15 @@ class PortfolioEngineIntegration:
                         "context_audit_emit": (dd.get("context_audit_emit") or ""),
                         "ctx_rs_btc": _dig_float(dd, "ctx_rs_btc", 0.0),
                         "ctx_depth_imbalance": _dig_float(dd, "ctx_depth_imbalance", 0.0),
-                        "quality_opinion_penalty": float((q_det or {}).get("penalty_total") or 0.0),
-                        "veto_opinion_penalty": float((ve_det or {}).get("penalty_total") or 0.0),
-                        "quality_opinion_reasons": json.dumps((q_det or {}).get("opinion_reasons", []), separators=(",", ":")),
+                        "quality_opinion_penalty": _q_pen,
+                        "veto_opinion_penalty": _v_pen,
+                        "signal_side_penalty": _side_pen,
+                        "symbol_identity_penalty": float(dd.get("symbol_identity_penalty") or 0.0),
+                        "quality_opinion_reasons": json.dumps(
+                            (q_det or {}).get("opinion_reasons")
+                            or (["signal_side_penalty"] if _side_pen > 0 else []),
+                            separators=(",", ":"),
+                        ),
                         "veto_opinion_reasons": json.dumps((ve_det or {}).get("opinion_reasons", []), separators=(",", ":")),
                         # Dual-clock + live candle-shape (from ai_signal Redis hash)
                         "ranking_tf": str(dd.get("ranking_tf") or ""),

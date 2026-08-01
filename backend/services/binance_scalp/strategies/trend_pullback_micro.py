@@ -53,10 +53,12 @@ class TrendPullbackMicroStrategy:
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
 
+        cur = ctx.snap.mid
+        score = 2.25 + max(0.0, mom.mid_change_15s) * 4000.0 + abs(cur - ema5) / max(ema5, 1e-12) * 200.0
         return pass_signal(
             ctx,
             self.name,
-            score=0.55,
+            score=score,
             confidence=0.50,
             entry_reason=f"micro_pullback_ema5_{ema5:.6f}",
             invalidation_reason="pullback_fails_to_resume",

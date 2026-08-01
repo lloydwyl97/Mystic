@@ -51,15 +51,18 @@ class VolumeImpulseContinuationStrategy:
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
 
+        vol_ratio = vol_recent / max(vol_prior, 1e-12)
+        mom = ctx.mom
+        score = 2.40 + min(0.8, vol_ratio * 0.15) + max(0.0, mom.mid_change_15s) * 3000.0
         return pass_signal(
             ctx,
             self.name,
-            score=0.58,
+            score=score,
             confidence=0.52,
-            entry_reason=f"volume_impulse_{vol_recent / vol_prior:.2f}x",
+            entry_reason=f"volume_impulse_{vol_ratio:.2f}x",
             invalidation_reason="impulse_fails_to_continue",
             expected_move_pct=expected,
             impact_pct=impact,
             limit_buy=fill,
-            setup_context={"vol_ratio": vol_recent / vol_prior},
+            setup_context={"vol_ratio": vol_ratio},
         )

@@ -53,10 +53,11 @@ class CompressionBreakoutStrategy:
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
 
+        score = 2.50 + max(0.0, 1.4 - range_pct * 200.0) * 0.15 + (vol_recent / max(vol_prior, 1e-12)) * 0.08
         return pass_signal(
             ctx,
             self.name,
-            score=0.6,
+            score=score,
             confidence=0.55,
             entry_reason=f"compression_break_range_{range_pct:.5f}",
             invalidation_reason="no_follow_through_or_vol_fades",
