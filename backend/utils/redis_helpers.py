@@ -470,5 +470,18 @@ def verify_writer_payload(expected_role: str, payload: dict[str, Any], redis_cli
         return False
 
 
-# Predefined writer roles for the canonical topology
-WRITER_ROLES = {"MARKET_DATA": "market_data_writer", "AI_SIGNALS": "ai_signal_writer", "DECISION_ROUTER": "decision_router", "RATE_LIMITER": "rate_limiter_owner"}
+# Exclusive canonical writers. Each role must hold a WriterLock for its process
+# lifetime and is therefore expected under the ``writer:*`` Redis keyspace.
+WRITER_ROLES = {
+    "MARKET_DATA": "market_data_writer",
+    "AI_SIGNALS": "ai_signal_writer",
+    "DECISION_ROUTER": "decision_router",
+}
+
+# The Binance weight limiter is deliberately multi-process. Its token updates use
+# Redis WATCH/MULTI transactions, so representing it as an exclusive writer would
+# either block legitimate consumers or make topology report a permanently missing
+# lock.
+SHARED_ATOMIC_WRITER_ROLES = {
+    "RATE_LIMITER": "binance_weight_limiter",
+}

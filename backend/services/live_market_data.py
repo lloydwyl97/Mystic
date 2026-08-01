@@ -166,6 +166,7 @@ class LiveMarketDataService:
         self._limiter: BinanceWeightLimiter | None = None
         self._limiter_lock = asyncio.Lock()
         self._cache_guard: Any | None = None
+        self._writer_lock: Any | None = None
 
     async def _persist_latest_1m_candle(self, ccxt_symbol: str, ohlcv: list) -> bool:
         """Write latest 1m bar to feature_ohlcv (replaces standalone live_data_collector)."""
@@ -204,7 +205,6 @@ class LiveMarketDataService:
     async def start(self) -> None:
         if self._running:
             return
-        self._running = True
         try:
             # Skip load_markets for Binance.US as it doesn't support margin endpoints
             # and causes 404 errors on /sapi/v1/margin/allAssets
@@ -219,6 +219,16 @@ class LiveMarketDataService:
         except Exception as exc:
             logger.warning("CacheGuard init failed (heartbeat disabled): %s", exc)
             self._cache_guard = None
+
+        from backend.config.redis_config import get_shared_redis_async
+        from backend.utils.redis_helpers import WRITER_ROLES, WriterLock
+
+        redis_client = get_shared_redis_async()
+        if redis_client is None:
+            raise RuntimeError("Redis unavailable for market-data writer lock")
+        self._writer_lock = WriterLock(WRITER_ROLES["MARKET_DATA"], redis_client)
+        await self._writer_lock.acquire()
+        self._running = True
 
         self._tasks = [
             await task_manager.create_task(self._ticker_loop(), name="live_market_data:ticker_loop"),
@@ -267,6 +277,9 @@ class LiveMarketDataService:
             if not t.done():
                 t.cancel()
         self._tasks.clear()
+        if self._writer_lock is not None:
+            await self._writer_lock.release()
+            self._writer_lock = None
         logger.info("LiveMarketDataService stopped")
 
     # ---------------- loops ----------------

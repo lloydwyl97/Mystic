@@ -453,11 +453,13 @@ function initModeSwitch() {
             : "Enable LIVE trading? Real money orders will be placed.";
         if (!confirm(msg)) return;
         const headers = { "Content-Type": "application/json" };
-        if (goingLive) {
-            const token = prompt("Enter ADMIN_TOKEN to enable live trading:");
+        let token = localStorage.getItem("mystic_admin_token");
+        if (!token) {
+            token = prompt("Enter ADMIN_TOKEN to change execution mode:");
             if (!token) return;
-            headers["Authorization"] = "Bearer " + token;
+            localStorage.setItem("mystic_admin_token", token);
         }
+        headers["Authorization"] = "Bearer " + token;
         try {
             const res = await fetch("/api/portfolio-engine/execution-mode", {
                 method: "POST",

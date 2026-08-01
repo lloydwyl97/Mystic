@@ -7828,7 +7828,43 @@ class PortfolioEngine:
                     _entry_reserved = False
                 return None
 
+        # Final cash invariant must pass before any executed trade row is committed.
+        # Keep this entry's reservation active so concurrent buys cannot consume its cash
+        # between this check and the debit below.
+        async with self._global_cash_lock:
+            pending_other = self._pending_buy_notional(exclude_symbol=symbol)
+            free_cash = float(self._available_balance) - pending_other
+            if total_cost > free_cash:
+                reason = f"total_cost=${total_cost:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_other:.2f})"
+                logger.error(f"BUY_BLOCKED_CASH_INVARIANT: {symbol} - {reason}")
+                await self._record_reject(
+                    symbol,
+                    "BUY",
+                    reason,
+                    "CASH_INVARIANT",
+                    decision_id=decision_id,
+                    explainability=explainability,
+                )
+                if decision_id:
+                    await self._update_pipeline_decision(
+                        decision_id,
+                        {
+                            "stage": "EXECUTION",
+                            "execution_result": "NOT_EXECUTED",
+                            "execution_reason": f"CASH_INVARIANT: {reason}",
+                        },
+                    )
+                if _entry_reserved:
+                    self._release_entry_reservation(
+                        symbol,
+                        decision_id=str(decision_id or ""),
+                        reason="CASH_INVARIANT",
+                    )
+                    _entry_reserved = False
+                return None
+
         # Persist trade row only after live order success (or when not in LIVE mode)
+        # and after the final cash invariant has passed.
         loop = asyncio.get_running_loop()
         try:
             await loop.run_in_executor(None, _sync_insert)
@@ -7865,27 +7901,12 @@ class PortfolioEngine:
         # =================================================================
         # UPDATE AUTHORITATIVE LEDGER (conservation of money)
         # =================================================================
-        # Global cash lock: final atomic check-then-debit across all concurrent symbol buys (PE-1).
+        # Convert the still-active reservation into the cash debit. The final cash
+        # invariant passed before the trade-row commit, and the reservation prevented
+        # concurrent entries from consuming these funds in the interim.
         async with self._global_cash_lock:
-            # Convert reservation → cash debit (release reserved notional first).
             self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
             _entry_reserved = False
-            pending_other = self._pending_buy_notional()
-            free_cash = float(self._available_balance) - pending_other
-            if total_cost > free_cash:
-                reason = f"total_cost=${total_cost:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_other:.2f})"
-                logger.error(f"BUY_BLOCKED_CASH_INVARIANT: {symbol} - {reason}")
-                await self._record_reject(
-                    symbol,
-                    "BUY",
-                    reason,
-                    "CASH_INVARIANT",
-                    decision_id=decision_id,
-                    explainability=explainability,
-                )
-                if decision_id:
-                    await self._update_pipeline_decision(decision_id, {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": f"CASH_INVARIANT: {reason}"})
-                return None
             # Cash decreases by total cost (canonical: cash = USDT on exchange)
             self.cash_balance -= total_cost
             self._available_balance = max(0.0, self.cash_balance)
@@ -11061,13 +11082,11 @@ class PortfolioEngine:
             if _tp1_price > 0 and current_price >= _tp1_price and net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL) * 0.45:
                 _partial_qty = quantity * _tp1_pct
                 if _partial_qty > 0:
-                    position.tp1_hit = True
-                    await self._persist_position_to_sqlite(position)
                     logger.info(
                         "TP1_PARTIAL_EXIT: %s price=%.6f tp1=%.6f partial_pct=%.0f%% net_pct=%.4f",
                         symbol, current_price, _tp1_price, _tp1_pct * 100, net_pnl_pct,
                     )
-                    return await self.execute_sell_fifo(
+                    _tp1_result = await self.execute_sell_fifo(
                         symbol,
                         _partial_qty,
                         current_price,
@@ -11076,6 +11095,14 @@ class PortfolioEngine:
                         current_bar=current_bar,
                         force_sell=False,
                     )
+                    if _tp1_result is not None:
+                        # Latch TP1 only after the sell has committed. Failed preflight,
+                        # rejected execution, and exceptions leave TP1 eligible to retry.
+                        remaining_position = self.open_positions.get(normalize_symbol(symbol))
+                        if remaining_position is not None:
+                            remaining_position.tp1_hit = True
+                            await self._persist_position_to_sqlite(remaining_position)
+                    return _tp1_result
 
         if net_pnl_pct + 1e-12 < MIN_NET_PROFIT_TO_SELL:
             logger.debug(
@@ -15849,20 +15876,14 @@ class PortfolioEngine:
         equity_alt = self.principal + self._realized_pnl + self._unrealized_pnl
         equity_alt_ok = abs(total_equity - equity_alt) < 1.0
         computed_realized = self._compute_realized_pnl_from_paper_trades()
-        # NEVER heal downward: `paper_trades` is retention-pruned, so a lower recomputed
-        # sum means old rows fell off, not that the stored value is wrong. Healing down
-        # here (this runs on ~every read) is what silently destroyed pre-prune realized_pnl
-        # history in the past. Only correct upward (genuinely missed/late-settled trades).
-        healed_realized = max(computed_realized, self._realized_pnl)
-        if abs(healed_realized - self._realized_pnl) > 0.01:
+        # Read routes must never heal or persist canonical accounting state. Report a
+        # mismatch for operators; reconciliation belongs to an explicit mutation path.
+        if computed_realized > self._realized_pnl + 0.01:
             logger.warning(
-                "REALIZED_PNL_HEAL get_ledger: stored=%.4f paper_trades=%.4f -> %.4f (never-decrease)",
+                "REALIZED_PNL_MISMATCH get_ledger: stored=%.4f paper_trades=%.4f (read-only)",
                 self._realized_pnl,
                 computed_realized,
-                healed_realized,
             )
-            self._realized_pnl = healed_realized
-            await self._persist_ledger_to_sqlite()
         if not equity_invariant_ok:
             logger.debug(
                 "GET_LEDGER: invariant cash+positions=%.2f != total_equity=%.2f (diff=%.4f)",

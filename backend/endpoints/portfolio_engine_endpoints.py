@@ -1054,7 +1054,7 @@ async def get_kill_switch_status() -> dict[str, Any]:
 
 
 @router.post("/sync-from-binance")
-async def force_sync_from_binance() -> dict[str, Any]:
+async def force_sync_from_binance(_: None = Depends(require_admin_key)) -> dict[str, Any]:
     """
     Force re-sync from Binance US (LIVE mode only).
     Use when dashboard shows wrong balance/positions after a clear or disconnect.
@@ -1109,7 +1109,7 @@ async def force_sync_from_binance() -> dict[str, Any]:
 
 
 @router.post("/sync")
-async def sync_from_paper_trading() -> dict[str, Any]:
+async def sync_from_paper_trading(_: None = Depends(require_admin_key)) -> dict[str, Any]:
     """
     Force re-sync portfolio engine from Paper Trading Service.
 
@@ -1637,7 +1637,11 @@ def _write_env_vars(updates: dict) -> None:
 
 
 @router.post("/execution-mode")
-async def set_execution_mode(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+async def set_execution_mode(
+    request: Request,
+    payload: dict[str, Any],
+    _: None = Depends(require_admin_key),
+) -> dict[str, Any]:
     """
     Set execution mode. Body: { "mode": "paper"|"live", "live_trades_allowed": bool }.
 

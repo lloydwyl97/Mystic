@@ -689,7 +689,10 @@ async def place_paper_order(request: PlaceOrderRequest) -> dict[str, Any]:
 
 
 @router.delete("/orders/{order_id}")
-async def cancel_paper_order(order_id: str) -> dict[str, Any]:
+async def cancel_paper_order(
+    order_id: str,
+    _: None = Depends(require_admin_key),
+) -> dict[str, Any]:
     """Cancel a paper trading order"""
     try:
         paper_service = get_paper_trading_service()

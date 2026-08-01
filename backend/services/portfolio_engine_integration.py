@@ -60,7 +60,7 @@ from backend.services.strategy_runtime_audit import (
     EVT_SIGNAL_CONSUME,
     insert_audit_row_async,
 )
-from backend.utils.redis_helpers import WRITER_ROLES, verify_writer_payload
+from backend.utils.redis_helpers import WRITER_ROLES, WriterLock, verify_writer_payload
 from backend.utils.sqlite_runtime import connect_rw, run_locked_retry
 
 logger = logging.getLogger(__name__)
@@ -194,6 +194,7 @@ class PortfolioEngineIntegration:
 
         # Redis client for distributed locking (INVARIANT-007: Single Execution Authority)
         self.redis_client: redis.Redis | None = None
+        self._writer_lock: WriterLock | None = None
         self.redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         # LIVE DB-path self-correction: ensure engine always uses DATABASE_PATH (no restart)
         self._db_align_lock = asyncio.Lock()
@@ -255,6 +256,9 @@ class PortfolioEngineIntegration:
                 else:
                     logger.exception(f"Failed to connect to Redis after {max_attempts} attempts: {e}")
                     raise RuntimeError("Redis connection required for single execution authority") from e
+
+        self._writer_lock = WriterLock(WRITER_ROLES["DECISION_ROUTER"], self.redis_client)
+        await self._writer_lock.acquire()
 
         # Initialize portfolio engine with live trading service
         from backend.services.portfolio_engine import initialize_portfolio_engine, is_portfolio_engine_initialized
@@ -432,6 +436,9 @@ class PortfolioEngineIntegration:
         # ================================================================
         # Ensure Redis connection is always closed, even on error
         try:
+            if self._writer_lock is not None:
+                await self._writer_lock.release()
+                self._writer_lock = None
             if self.redis_client:
                 try:
                     await self.redis_client.aclose()

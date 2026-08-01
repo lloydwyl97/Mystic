@@ -39,10 +39,11 @@ except ImportError:
     get_shared_redis_sync = None
 
 try:
-    from backend.utils.redis_helpers import WRITER_ROLES, to_str
+    from backend.utils.redis_helpers import SHARED_ATOMIC_WRITER_ROLES, WRITER_ROLES, to_str
 except ImportError:
     to_str = None
     WRITER_ROLES = None
+    SHARED_ATOMIC_WRITER_ROLES = None
 
 try:
     from backend.config.redis_config import get_shared_redis_async
@@ -397,7 +398,13 @@ async def get_topology_report() -> dict[str, Any]:
                 "report_generated_at": datetime.now(timezone.utc).isoformat(),
                 "status": status,
                 "status_reason": reason,
-                "topology": {"expected_writers": expected_writers, "active_writers": active_writers, "missing_writers": missing_writers, "writer_count": len(active_writers)},
+                "topology": {
+                    "expected_writers": expected_writers,
+                    "active_writers": active_writers,
+                    "missing_writers": missing_writers,
+                    "writer_count": len(active_writers),
+                    "shared_atomic_writers": dict(SHARED_ATOMIC_WRITER_ROLES or {}),
+                },
                 "health_check": {
                     "total_locks": len(active_writers),
                     "expected_locks": len(expected_writers),
