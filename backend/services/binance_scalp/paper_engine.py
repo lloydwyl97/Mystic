@@ -786,6 +786,11 @@ class BinanceScalpPaperEngine:
             "bar_closed": True,
             "selected_symbol": sym,
             "symbol_ranking": ranking_meta,
+            # Top-level rank_score for learning writer (not only nested under symbol_ranking).
+            "rank_score": ranking_meta.get("rank_score")
+            if ranking_meta.get("rank_score") is not None
+            else ranking_meta.get("best_rank_score"),
+            "selection_confidence": ranking_meta.get("selection_confidence"),
             "review_lows": [],
             "session_low_bid": limit_buy,
             "entry_time": ts,
@@ -1541,10 +1546,19 @@ class BinanceScalpPaperEngine:
                 elif isinstance(_ctx_raw, str) and _ctx_raw.startswith("{"):
                     with contextlib.suppress(Exception):
                         _ctx_obj = json.loads(_ctx_raw)
+                _sr = _entry_diag.get("symbol_ranking") if isinstance(_entry_diag.get("symbol_ranking"), dict) else {}
+                _entry_score = (
+                    _entry_diag.get("score")
+                    or _entry_diag.get("rank_score")
+                    or _entry_diag.get("selected_score")
+                    or _sr.get("rank_score")
+                    or _sr.get("best_rank_score")
+                )
                 _rank = {
                     "strategy_id": str(close_payload["row"].get("strategy_id", "")),
                     "setup": str(close_payload["row"].get("strategy_id", "")),
-                    "entry_score": _entry_diag.get("score") or _entry_diag.get("rank_score") or _entry_diag.get("selected_score"),
+                    "entry_score": _entry_score,
+                    "rank_score": _entry_score,
                     "sig_passed": _entry_diag.get("sig_passed") if "sig_passed" in _entry_diag else _entry_diag.get("passed"),
                     "regime": (_ctx_obj or {}).get("market_regime") if isinstance(_ctx_obj, dict) else None,
                 }

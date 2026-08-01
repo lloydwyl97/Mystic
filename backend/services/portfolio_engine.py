@@ -5051,14 +5051,20 @@ class PortfolioEngine:
                 feats_json = json.dumps(entry_feats) if entry_feats else None
                 ctx_json = None
                 if entry_feats is not None:
-                    ctx_json = json.dumps(
-                        {
-                            "_feature_version": int(ex_payload.get("feature_version") or 5),
-                            "feature_version": int(ex_payload.get("feature_version") or 5),
-                            "_live_ai_strategy": "day",
-                            "decision_id": decision_id,
-                        }
-                    )
+                    # Only stamp known feature_version from the trade; do not invent HTF-v5=5.
+                    _fv_raw = ex_payload.get("feature_version")
+                    try:
+                        _fv_i = int(_fv_raw) if _fv_raw not in (None, "") else 0
+                    except (TypeError, ValueError):
+                        _fv_i = 0
+                    _ctx: dict[str, Any] = {
+                        "_live_ai_strategy": "day",
+                        "decision_id": decision_id,
+                    }
+                    if _fv_i > 0:
+                        _ctx["_feature_version"] = _fv_i
+                        _ctx["feature_version"] = _fv_i
+                    ctx_json = json.dumps(_ctx)
                 record_outcome_training_row(
                     symbol=symbol,
                     opened_at_utc=opened_iso or closed_iso,
@@ -8395,8 +8401,14 @@ class PortfolioEngine:
             timestamp=timestamp,
             ai_confidence=confidence,
             live_ai_strategy="day",
-            feature_version=int(signal.get("feature_version") or 5),
-            feature_dim=int(signal.get("feature_dim") or 145),
+            feature_version=(
+                int(signal["feature_version"])
+                if signal.get("feature_version") not in (None, "")
+                else 0
+            ),
+            feature_dim=(
+                int(signal["feature_dim"]) if signal.get("feature_dim") not in (None, "") else 0
+            ),
         )
         explainability.decision_id = decision_id
         explainability.entry_timestamp = timestamp
@@ -9042,10 +9054,20 @@ class PortfolioEngine:
                     original_explain["model_trained_at"] = getattr(explain_obj, "model_trained_at", "") or original_explain.get("model_trained_at", "")
                     original_explain["model_accuracy"] = getattr(explain_obj, "model_accuracy", None) or original_explain.get("model_accuracy")
                     original_explain["signal_ts_utc"] = getattr(explain_obj, "signal_content_timestamp", "") or original_explain.get("signal_content_timestamp", "")
+                    # Do not invent feature_version=5 / dim=145 when unknown — that
+                    # poisons PAC/holdout provenance. Keep 0 / omit as unknown.
                     if not original_explain.get("feature_version"):
-                        original_explain["feature_version"] = 5
+                        try:
+                            original_explain["feature_version"] = int(
+                                getattr(explain_obj, "feature_version", 0) or 0
+                            )
+                        except (TypeError, ValueError):
+                            original_explain["feature_version"] = 0
                     if not original_explain.get("feature_dim"):
-                        original_explain["feature_dim"] = 145
+                        try:
+                            original_explain["feature_dim"] = int(getattr(explain_obj, "feature_dim", 0) or 0)
+                        except (TypeError, ValueError):
+                            original_explain["feature_dim"] = 0
                     if not original_explain.get("live_ai_strategy"):
                         original_explain["live_ai_strategy"] = str(getattr(position, "entry_strategy_id", "") or "day")
                     original_explain["exit_trigger"] = exit_trigger
@@ -13464,13 +13486,13 @@ class PortfolioEngine:
                 explainability.artifact_sha256 = str(_dd.get("artifact_sha256") or "")
                 explainability.model_trained_at = str(_dd.get("model_trained_at") or "")
                 try:
-                    explainability.feature_version = int(_dd.get("feature_version") or 5)
+                    explainability.feature_version = int(_dd.get("feature_version") or 0)
                 except (TypeError, ValueError):
-                    explainability.feature_version = 5
+                    explainability.feature_version = 0
                 try:
-                    explainability.feature_dim = int(_dd.get("feature_dim") or 145)
+                    explainability.feature_dim = int(_dd.get("feature_dim") or 0)
                 except (TypeError, ValueError):
-                    explainability.feature_dim = 145
+                    explainability.feature_dim = 0
                 explainability.setup_type = str(_dd.get("setup_type") or _dd.get("entry_thesis") or "")
                 explainability.entry_thesis = str(_dd.get("entry_thesis") or explainability.setup_type)
                 explainability.thesis_score = float(_safe_float(_dd.get("thesis_score"), 0.0))
@@ -14666,13 +14688,13 @@ class PortfolioEngine:
         except (TypeError, ValueError):
             explainability.model_accuracy = None
         try:
-            explainability.feature_version = int(_dd.get("feature_version") or 5)
+            explainability.feature_version = int(_dd.get("feature_version") or 0)
         except (TypeError, ValueError):
-            explainability.feature_version = 5
+            explainability.feature_version = 0
         try:
-            explainability.feature_dim = int(_dd.get("feature_dim") or 145)
+            explainability.feature_dim = int(_dd.get("feature_dim") or 0)
         except (TypeError, ValueError):
-            explainability.feature_dim = 145
+            explainability.feature_dim = 0
         explainability.feature_health_pass = str(_dd.get("feature_health_pass") or "1")
         try:
             explainability.feature_health_pct = float(_dd.get("feature_health_pct") if _dd.get("feature_health_pct") not in (None, "") else 100.0)

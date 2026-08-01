@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import pickle
@@ -15,6 +16,9 @@ from typing import Any
 from backend.database_schema import DATABASE_PATH
 from backend.services.ai_artifact_contract_gate import evaluate_signal_hash_artifact_contract
 from backend.services.ai_canonical_storage import ensure_ai_canonical_tables
+from backend.services.ai_model_promotion_pac import _symbol_forms
+
+logger = logging.getLogger(__name__)
 
 
 def _active_age_hours(path: Path) -> float | None:
@@ -420,8 +424,9 @@ def register_candidate_and_maybe_promote(
             metrics["promotion_path"] = "buy_precision_or_pac_edge"
             metrics["candidate_buy_precision"] = c_bp_f
             metrics["active_buy_precision"] = a_bp_f
-    model_id = f"{sid}:{sym}:{c_hash[:16]}"
-    active_model_id = f"{sid}:{sym}:{_hash_file(active_path)[:16]}" if active_path.exists() else None
+    bus_sym, ccxt_sym = _symbol_forms(sym)
+    model_id = f"{sid}:{bus_sym}:{c_hash[:16]}"
+    active_model_id = f"{sid}:{bus_sym}:{_hash_file(active_path)[:16]}" if active_path.exists() else None
     status = "candidate"
     reason = "validation_pass"
     if promote:
@@ -432,7 +437,24 @@ def register_candidate_and_maybe_promote(
     else:
         reason = reject_reason
 
+    # Always persist the immutable candidate path so rollback can restore bytes
+    # even after models/active/... is overwritten by a later promote.
+    registry_path = str(candidate_path)
+
     with sqlite3.connect(db_path) as conn:
+        if promote:
+            # Single-active invariant: archive every prior active for this pair.
+            conn.execute(
+                """
+                UPDATE ai_model_versions
+                SET status = 'archived',
+                    retired_at = datetime('now')
+                WHERE strategy_id = ?
+                  AND symbol IN (?, ?)
+                  AND status = 'active'
+                """,
+                (sid, bus_sym, ccxt_sym),
+            )
         conn.execute(
             """
             INSERT OR REPLACE INTO ai_model_versions (
@@ -443,10 +465,10 @@ def register_candidate_and_maybe_promote(
             (
                 model_id,
                 sid,
-                sym,
+                bus_sym,
                 int(c_meta.get("feature_version") or 0),
                 c_hash,
-                str(active_path if promote else candidate_path),
+                registry_path,
                 status,
                 (datetime.now(timezone.utc).isoformat() if promote else None),
                 json.dumps(metrics, separators=(",", ":")),
@@ -460,7 +482,7 @@ def register_candidate_and_maybe_promote(
             """,
             (
                 sid,
-                sym,
+                bus_sym,
                 active_model_id,
                 model_id,
                 ("promote" if promote else "reject"),
@@ -482,17 +504,18 @@ def maybe_rollback_underperforming_model(
     """Rollback active model when recent live net outcomes materially degrade."""
     ensure_ai_canonical_tables(db_path)
     sid = strategy_id.strip().lower()
-    sym = symbol.strip().upper()
+    bus_sym, ccxt_sym = _symbol_forms(symbol)
     with sqlite3.connect(db_path) as conn:
         rows = conn.execute(
             """
             SELECT net_pnl_pct
             FROM ai_outcome_training_rows
-            WHERE strategy_id = ? AND UPPER(symbol) = UPPER(?)
+            WHERE strategy_id = ?
+              AND UPPER(symbol) IN (?, ?)
             ORDER BY id DESC
             LIMIT ?
             """,
-            (sid, sym, int(min_samples)),
+            (sid, bus_sym.upper(), ccxt_sym.upper(), int(min_samples)),
         ).fetchall()
         if len(rows) < min_samples:
             return False, "insufficient_live_samples"
@@ -502,41 +525,54 @@ def maybe_rollback_underperforming_model(
         active = conn.execute(
             """
             SELECT model_id, path FROM ai_model_versions
-            WHERE strategy_id = ? AND symbol = ? AND status = 'active'
+            WHERE strategy_id = ? AND symbol IN (?, ?) AND status = 'active'
             ORDER BY id DESC
             LIMIT 1
             """,
-            (sid, sym),
+            (sid, bus_sym, ccxt_sym),
         ).fetchone()
         prev = conn.execute(
             """
             SELECT model_id, path FROM ai_model_versions
-            WHERE strategy_id = ? AND symbol = ? AND status IN ('archived', 'rollback')
-            ORDER BY id DESC
+            WHERE strategy_id = ? AND symbol IN (?, ?) AND status IN ('archived', 'rollback')
+            ORDER BY COALESCE(retired_at, promoted_at, created_at) DESC, id DESC
             LIMIT 1
             """,
-            (sid, sym),
+            (sid, bus_sym, ccxt_sym),
         ).fetchone()
         if not active or not prev:
             return False, "no_previous_model"
-        conn.execute("UPDATE ai_model_versions SET status='rollback', rollback_reason=?, retired_at=datetime('now') WHERE model_id=?", (f"avg_net={avg_net:.6f}", active[0]))
-        conn.execute("UPDATE ai_model_versions SET status='active', promoted_at=datetime('now') WHERE model_id=?", (prev[0],))
+        prev_path = str(prev[1] or "")
+        if not prev_path or not os.path.exists(prev_path):
+            return False, "previous_artifact_missing"
+        conn.execute(
+            "UPDATE ai_model_versions SET status='rollback', rollback_reason=?, retired_at=datetime('now') WHERE model_id=?",
+            (f"avg_net={avg_net:.6f}", active[0]),
+        )
+        conn.execute(
+            "UPDATE ai_model_versions SET status='active', promoted_at=datetime('now'), retired_at=NULL WHERE model_id=?",
+            (prev[0],),
+        )
         conn.execute(
             """
             INSERT INTO ai_model_promotion_events (strategy_id, symbol, from_model_id, to_model_id, event_type, reason, metrics_json, created_at)
             VALUES (?, ?, ?, ?, 'rollback', ?, ?, datetime('now'))
             """,
-            (sid, sym, active[0], prev[0], "live_underperformance", json.dumps({"avg_recent_net_pnl_pct": avg_net}, separators=(",", ":"))),
+            (
+                sid,
+                bus_sym,
+                active[0],
+                prev[0],
+                "live_underperformance",
+                json.dumps({"avg_recent_net_pnl_pct": avg_net}, separators=(",", ":")),
+            ),
         )
         conn.commit()
     # Restore previous model artifact to the live active path on disk.
     from backend.services.live_strategy_contracts import per_coin_artifact_file  # local import to avoid circular
-    prev_artifact_path = prev[1] if prev and len(prev) > 1 else None
-    active_pkl_path = per_coin_artifact_file(Path("models/active"), sid, sym)
-    if prev_artifact_path and os.path.exists(prev_artifact_path):
-        active_pkl_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(prev_artifact_path, active_pkl_path)
-        logger.info("[ROLLBACK] Restored artifact %s -> %s", prev_artifact_path, active_pkl_path)
-    else:
-        logger.warning("[ROLLBACK] Previous artifact not found: %s", prev_artifact_path)
+
+    active_pkl_path = per_coin_artifact_file(Path("models/active"), sid, bus_sym)
+    active_pkl_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(prev_path, active_pkl_path)
+    logger.info("[ROLLBACK] Restored artifact %s -> %s", prev_path, active_pkl_path)
     return True, "rollback_executed"

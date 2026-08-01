@@ -1846,8 +1846,12 @@ async def get_model_panel() -> dict[str, Any]:
                         "candidate_holdout_pac": meta.get("candidate_holdout_pac"),
                         "feature_version": meta.get("feature_version"),
                         "feature_dim": meta.get("feature_dim"),
-                        "last_promotion_event": pe.get("last_event_at") if pe.get("last_event_type") == "promoted" else None,
-                        "last_rejection_event": pe.get("last_event_at") if pe.get("last_event_type") == "rejected" else None,
+                        "last_promotion_event": pe.get("last_event_at")
+                        if pe.get("last_event_type") in ("promote", "promoted")
+                        else None,
+                        "last_rejection_event": pe.get("last_event_at")
+                        if pe.get("last_event_type") in ("reject", "rejected")
+                        else None,
                         # Model diversity / calibration provenance (see ai_blended_classifier.py,
                         # ai_training_pipeline.py, ai_feature_importance_diagnostics.py).
                         "blend_status": meta.get("active_blend_status"),

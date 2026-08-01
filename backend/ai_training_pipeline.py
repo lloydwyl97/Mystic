@@ -10,6 +10,7 @@ import logging
 import os
 import pickle
 import shutil
+import sqlite3
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -1247,6 +1248,8 @@ class AITrainingDataPipeline:
 
         Candidates are written every training cycle; without retention the
         versions dir grows unbounded (observed 11k+ files / 2.1 GB).
+        Also retires matching ai_model_versions rows so the registry does not
+        keep dangling candidate paths after files are deleted.
         """
         try:
             files = sorted(
@@ -1255,7 +1258,30 @@ class AITrainingDataPipeline:
                 reverse=True,
             )
             for stale in files[self.PER_COIN_CANDIDATE_RETENTION :]:
+                path_variants = {str(stale), str(stale.resolve()) if stale.exists() else str(stale)}
                 stale.unlink(missing_ok=True)
+                try:
+                    from backend.database_schema import DATABASE_PATH
+
+                    with sqlite3.connect(DATABASE_PATH) as conn:
+                        for p in path_variants:
+                            conn.execute(
+                                """
+                                UPDATE ai_model_versions
+                                SET status = 'retired',
+                                    retired_at = datetime('now')
+                                WHERE path = ?
+                                  AND status = 'candidate'
+                                """,
+                                (p,),
+                            )
+                        conn.commit()
+                except Exception as db_err:
+                    logger.debug(
+                        "PER_COIN_CANDIDATE_PRUNE registry retire failed for %s: %s",
+                        stale,
+                        db_err,
+                    )
         except OSError as e:
             logger.debug("PER_COIN_CANDIDATE_PRUNE failed for %s/%s: %s", strat, sym, e)
 
@@ -1807,11 +1833,16 @@ class AITrainingDataPipeline:
                                     promo_reason,
                                 )
                         except Exception as promote_err:
-                            promo_state = "fallback_direct_write"
-                            logger.warning("MODEL_PROMOTION_FALLBACK: %s/%s (%s) — writing active directly", strat, sym, promote_err)
-                            with coin_path.open("wb") as f:
-                                pickle.dump(artifact, f)
-                            shutil.copy2(coin_path, ver_path)
+                            # Fail-closed: never bypass the promotion gate by writing
+                            # directly to models/active. Candidate stays on disk for retry.
+                            promo_state = f"promotion_error:{type(promote_err).__name__}"
+                            logger.warning(
+                                "MODEL_PROMOTION_ERROR: %s/%s (%s) — active unchanged; candidate kept at %s",
+                                strat,
+                                sym,
+                                promote_err,
+                                ver_path,
+                            )
 
                         self._prune_per_coin_candidates(version_dir, strat, sym)
 
