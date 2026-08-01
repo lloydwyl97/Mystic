@@ -130,6 +130,42 @@ def test_missing_timestamp_is_treated_as_stale_not_trusted():
     assert "daily_loss_freeze_active" in tcb.needs_revalidation
 
 
+def test_account_failsafe_clears_when_equity_recovers():
+    """Regression: Jul 31 Ocean latch — transient low equity must not freeze buys forever."""
+    tcb = _fresh_breaker()
+    # Trip on cash-only / depressed equity reading.
+    assert tcb.check_account_failsafe(current_equity=3711.39, principal=10_000.0) is True
+    assert tcb.account_failsafe_active is True
+    # Book healed (cash+positions / total equity back near principal).
+    assert tcb.check_account_failsafe(current_equity=9904.00, principal=10_000.0) is False
+    assert tcb.account_failsafe_active is False
+    # Healthy checks stay clear.
+    assert tcb.check_account_failsafe(current_equity=9904.00, principal=10_000.0) is False
+
+
+def test_account_failsafe_stays_active_while_equity_genuinely_depressed():
+    tcb = _fresh_breaker()
+    assert tcb.check_account_failsafe(current_equity=8000.0, principal=10_000.0) is True
+    assert tcb.check_account_failsafe(current_equity=8500.0, principal=10_000.0) is True
+    assert tcb.account_failsafe_active is True
+    # Cross back above 90% of principal.
+    assert tcb.check_account_failsafe(current_equity=9100.0, principal=10_000.0) is False
+    assert tcb.account_failsafe_active is False
+
+
+def test_check_all_hard_kills_clears_failsafe_action_on_recovery():
+    tcb = _fresh_breaker()
+    tcb.account_failsafe_active = True
+    out = tcb.check_all_hard_kills(
+        {"total_equity": 9904.0, "principal": 10_000.0, "realized_pnl_today": 0.0},
+        skip_sync_persist=True,
+    )
+    assert out["conditions"]["account_failsafe"] is False
+    assert out["actions"]["close_all_positions"] is False
+    assert out["actions"]["pause_trading"] is False
+    assert tcb.account_failsafe_active is False
+
+
 def test_cold_start_status_is_observable():
     tcb = _fresh_breaker()
     stale_ts = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()

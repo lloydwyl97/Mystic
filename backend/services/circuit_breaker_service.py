@@ -309,15 +309,37 @@ class TradingCircuitBreaker:
 
     def check_account_failsafe(self, current_equity: float, principal: float) -> bool:
         """
-        ACCOUNT FAILSAFE: Close all positions and pause trading
-        if equity <= principal * 0.90: close_all_positions(), pause_trading = True
+        ACCOUNT FAILSAFE: pause new entries when equity collapses vs principal.
+
+        if equity <= principal * 0.90: engage failsafe (PAUSE_BUYS via caller).
+        Clears automatically when equity recovers above the threshold — previously
+        this flag latched forever, so a single bad/transient equity reading
+        (e.g. cash-only mid-mark while positions still open) froze buys for days
+        after the book had already healed.
         """
-        threshold = principal * 0.90  # 10% loss from starting capital
-        if current_equity <= threshold and not self.account_failsafe_active:
-            self.account_failsafe_active = True
-            logger.critical(f"[HARD KILL] ACCOUNT FAILSAFE ACTIVATED | Equity: ${current_equity:.2f} <= ${threshold:.2f} (10% from principal ${principal:.2f})")
+        if principal <= 0:
+            return bool(self.account_failsafe_active)
+        threshold = float(principal) * 0.90  # 10% loss from starting capital
+        eq = float(current_equity or 0.0)
+        if eq <= threshold:
+            if not self.account_failsafe_active:
+                self.account_failsafe_active = True
+                logger.critical(
+                    "[HARD KILL] ACCOUNT FAILSAFE ACTIVATED | Equity: $%.2f <= $%.2f (10%% from principal $%.2f)",
+                    eq,
+                    threshold,
+                    float(principal),
+                )
             return True
-        return self.account_failsafe_active
+        if self.account_failsafe_active:
+            self.account_failsafe_active = False
+            logger.info(
+                "[HARD KILL] ACCOUNT FAILSAFE DEACTIVATED | Equity recovered to $%.2f > $%.2f (principal $%.2f)",
+                eq,
+                threshold,
+                float(principal),
+            )
+        return False
 
     def check_all_hard_kills(self, portfolio_data: dict, market_data: dict | None = None, *, skip_sync_persist: bool = False) -> dict:
         """

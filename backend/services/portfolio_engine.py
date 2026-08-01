@@ -16964,8 +16964,23 @@ class PortfolioEngine:
             return {"skipped": True}
 
         realized_pnl_today = await self._realized_pnl_today_sync_free()
+        # Canonical account equity is cash + mark-to-market positions. Never trip
+        # ACCOUNT_FAILSAFE on a stale/low ledger total while cash+positions is healthy
+        # (Jul 31 incident: cash-only ~$3711 while book equity was ~$9900 → permanent PAUSE_BUYS).
+        account_equity = float(self.cash_balance or 0.0) + float(self._positions_value or 0.0)
+        ledger_equity = float(self._total_equity or 0.0)
+        if account_equity > 0:
+            total_equity = account_equity
+            if abs(account_equity - ledger_equity) > 1.0:
+                logger.warning(
+                    "CIRCUIT_BREAKER_EQUITY_SOURCE account=%.2f ledger=%.2f using_account=true",
+                    account_equity,
+                    ledger_equity,
+                )
+        else:
+            total_equity = ledger_equity
         portfolio_data = {
-            "total_equity": float(self._total_equity),
+            "total_equity": total_equity,
             "principal": float(self.principal),
             "realized_pnl_today": realized_pnl_today,
         }
@@ -16995,6 +17010,13 @@ class PortfolioEngine:
         elif set_by_cb and self._kill_switch_mode != KillSwitchMode.RESUME:
             # Conditions cleared and this pause was set by us (not an operator) — lift it.
             await self.set_kill_switch("RESUME", reason=f"{prefix}cleared")
+        elif (
+            self._kill_switch_mode == KillSwitchMode.PAUSE_BUYS
+            and "ACCOUNT_FAILSAFE" in str(self._kill_switch_reason or "")
+            and not conditions.get("account_failsafe")
+        ):
+            # Recover from stale PAUSE_BUYS left after failsafe healed (DB/memory drift).
+            await self.set_kill_switch("RESUME", reason=f"{prefix}ACCOUNT_FAILSAFE_cleared_stale")
 
         return result
 
