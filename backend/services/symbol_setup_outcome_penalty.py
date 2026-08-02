@@ -893,16 +893,8 @@ def build_truthful_selection_reason(
     if higher_skipped:
         # Best unavailable peer is the score leader we could not execute.
         runner = higher_skipped[0]
-        selection_key = (
-            "open_symbol_skipped_capacity"
-            if runner["skipped_reason"] == "same_symbol_already_open"
-            else "best_available_after_skip"
-        )
-        why = (
-            f"{selection_key}: selected {sel_sym} final_selection_score={win_score:.6f}; "
-            f"higher_score {runner['symbol']}={runner['final_selection_score']:.6f} "
-            f"skipped ({runner['skipped_reason']})"
-        )
+        selection_key = "open_symbol_skipped_capacity" if runner["skipped_reason"] == "same_symbol_already_open" else "best_available_after_skip"
+        why = f"{selection_key}: selected {sel_sym} final_selection_score={win_score:.6f}; higher_score {runner['symbol']}={runner['final_selection_score']:.6f} skipped ({runner['skipped_reason']})"
         skipped_reason = runner["skipped_reason"]
         runner_up_symbol = str(runner["symbol"])
         runner_up_score = float(runner["final_selection_score"])
@@ -931,10 +923,7 @@ def build_truthful_selection_reason(
             # Selected has materially lower score without an explained skip — do not lie.
             selection_key = "best_available_after_skip"
             skipped_reason = "unexplained_lower_score_selection"
-            why = (
-                f"best_available_after_skip: selected {sel_sym} final_selection_score={win_score:.6f}; "
-                f"peer {peer_sym}={peer_score:.6f} not selected"
-            )
+            why = f"best_available_after_skip: selected {sel_sym} final_selection_score={win_score:.6f}; peer {peer_sym}={peer_score:.6f} not selected"
     else:
         selection_key = "solo_candidate_no_peer"
         why = "solo_candidate_no_peer"
@@ -962,29 +951,48 @@ def assign_v3_selection_ranks(
     *,
     open_symbols: set[str] | frozenset[str] | None = None,
     selected: Any | None = None,
+    selected_list: list[Any] | None = None,
 ) -> None:
     """Stamp rank / peer / truthful why on candidates after score-primary sort.
 
-    If ``selected`` is provided (executable winner after open/capacity filter),
-    stamp why_selected on that candidate. Otherwise stamp on score leader (#1).
+    If ``selected`` / ``selected_list`` is provided (executable fills after
+    open/capacity filter), stamp why_selected on each fill — including multi-buy
+    extras. Otherwise stamp on score leader (#1) only.
     """
     open_symbols = set(open_symbols or ())
+    targets: list[Any] = []
+    if selected_list:
+        targets = [t for t in selected_list if t is not None]
+    elif selected is not None:
+        targets = [selected]
+
+    target_ids = {id(t) for t in targets}
     for i, cand in enumerate(candidates):
         dd = dict(getattr(cand, "decision_data", None) or {})
         dd["final_selected_rank"] = i + 1
-        # Clear stale why text on non-selected rows.
-        if selected is None and i != 0:
+        # Clear stale why text on non-executable rows.
+        if not targets and i != 0:
             dd.pop("why_selected", None)
+        elif targets and id(cand) not in target_ids:
+            dd.pop("why_selected", None)
+            dd.pop("selection_key_used", None)
         setattr(cand, "decision_data", dd)
 
-    target = selected if selected is not None else (candidates[0] if candidates else None)
-    if target is None:
+    if not targets:
+        targets = [candidates[0]] if candidates else []
+    if not targets:
         return
 
-    reason = build_truthful_selection_reason(target, candidates, open_symbols=open_symbols)
-    dd = dict(getattr(target, "decision_data", None) or {})
-    dd.update(reason)
-    setattr(target, "decision_data", dd)
+    for idx, target in enumerate(targets):
+        reason = build_truthful_selection_reason(target, candidates, open_symbols=open_symbols)
+        dd = dict(getattr(target, "decision_data", None) or {})
+        dd.update(reason)
+        if idx > 0:
+            # Secondary same-bar fills: keep truthful peer compare, mark multi-buy.
+            base_why = str(dd.get("why_selected") or "")
+            dd["selection_key_used"] = "multi_buy_capacity_fill"
+            dd["why_selected"] = f"multi_buy_capacity_fill: {base_why}" if base_why else "multi_buy_capacity_fill"
+        setattr(target, "decision_data", dd)
 
 
 def evaluate_outcome_penalty_for_candidate(decision_data: dict[str, Any], symbol: str) -> dict[str, Any]:

@@ -21,15 +21,37 @@ LEGACY_PATTERNS=(
   "start_ai_outcome_bridge.py"
 )
 
+# Only real app PIDs — never ssh/bash wrappers that merely mention the pattern.
+list_app_pids() {
+  local pattern=$1
+  local pid cmd
+  while read -r pid; do
+    [ -z "$pid" ] && continue
+    [ "$pid" = "$$" ] && continue
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    [ -z "$cmd" ] && continue
+    case "$cmd" in
+      *bash*|*ssh*|*sudo\ -u*) continue ;;
+    esac
+    case "$cmd" in
+      *python*|*uvicorn*) ;;
+      *) continue ;;
+    esac
+    case "$cmd" in
+      *"$pattern"*) echo "$pid" ;;
+    esac
+  done < <(pgrep -f "$pattern" 2>/dev/null)
+}
+
 stop_patterns() {
-  local pattern
+  local pattern pid
   for pattern in "$@"; do
     while read -r pid; do
       [ -z "$pid" ] && continue
       if kill -0 "$pid" 2>/dev/null; then
         kill -TERM "$pid" 2>/dev/null || true
       fi
-    done < <(pgrep -f "$pattern" 2>/dev/null)
+    done < <(list_app_pids "$pattern")
   done
 }
 
@@ -39,15 +61,18 @@ sleep 5
 
 FAILED=0
 for pattern in "${ACTIVE_PATTERNS[@]}" "${LEGACY_PATTERNS[@]}"; do
-  pids=$(pgrep -f "$pattern" 2>/dev/null)
+  pids=$(list_app_pids "$pattern")
   if [ -n "$pids" ]; then
     for pid in $pids; do
       kill -KILL "$pid" 2>/dev/null || true
     done
     sleep 2
-    if pgrep -f "$pattern" >/dev/null 2>&1; then
+    leftover=$(list_app_pids "$pattern")
+    if [ -n "$leftover" ]; then
       echo "WARNING: Process still running after TERM+KILL: $pattern"
-      pgrep -af "$pattern" || true
+      for pid in $leftover; do
+        ps -p "$pid" -o pid=,args= 2>/dev/null || true
+      done
       FAILED=1
     fi
   fi

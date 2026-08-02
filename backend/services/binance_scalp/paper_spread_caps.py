@@ -13,6 +13,16 @@ DEFAULT_PAPER_SPREAD_CAPS: dict[str, float] = {
 }
 
 
+def _repair_bash_stripped_json_object(text: str) -> str:
+    """Recover `{BTCUSDT:0.0008}` after bash `source` strips JSON key quotes."""
+    import re
+
+    s = str(text or "").strip()
+    if not s.startswith("{") or '"' in s:
+        return s
+    return re.sub(r"([A-Za-z0-9_/]+)\s*:", r'"\1":', s)
+
+
 def parse_paper_spread_caps_json(raw: str | None = None) -> dict[str, float]:
     """Parse SCALP_PAPER_SPREAD_CAPS_JSON; fall back to Phase 4 defaults."""
     text = raw if raw is not None else os.getenv("SCALP_PAPER_SPREAD_CAPS_JSON", "")
@@ -21,7 +31,10 @@ def parse_paper_spread_caps_json(raw: str | None = None) -> dict[str, float]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        return dict(DEFAULT_PAPER_SPREAD_CAPS)
+        try:
+            data = json.loads(_repair_bash_stripped_json_object(text))
+        except json.JSONDecodeError:
+            return dict(DEFAULT_PAPER_SPREAD_CAPS)
     if not isinstance(data, dict):
         raise TypeError("SCALP_PAPER_SPREAD_CAPS_JSON must be a JSON object")
     out: dict[str, float] = {}

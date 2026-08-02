@@ -567,7 +567,10 @@ def remap_setup_for_day_regime(setup: str, regime: str) -> str:
     elif reg in ("range", "neutral"):
         if st in (SETUP_HTF_TREND_PULLBACK, SETUP_BREAKOUT_CONTINUATION):
             return SETUP_RANGE_BOUNCE
-        if st not in (SETUP_VWAP_REVERSION, SETUP_RANGE_BOUNCE):
+        # Preserve explicit FBR — do not collapse into RANGE_BOUNCE (learning pollution).
+        if st == SETUP_FAILED_BREAKDOWN_REVERSAL:
+            return st
+        if st not in (SETUP_VWAP_REVERSION, SETUP_RANGE_BOUNCE, SETUP_FAILED_BREAKDOWN_REVERSAL):
             return SETUP_RANGE_BOUNCE
     elif reg == "bull":
         if st in (SETUP_FAILED_BREAKDOWN_REVERSAL, SETUP_RANGE_BOUNCE):
@@ -586,6 +589,7 @@ def apply_ml_locked_setup_override(
     route_regime = resolve_day_route_regime(dd)
     dd["day_route_regime"] = route_regime
 
+    prior_setup = str(decision_data.get("setup_type") or decision_data.get("entry_thesis") or decision_data.get("allweather_setup") or "")
     locked = str(dd.get("allweather_setup") or dd.get("setup_type") or dd.get("entry_thesis") or "")
     if not locked or locked == SETUP_NO_CLEAR_THESIS:
         if route_regime == "bear":
@@ -605,7 +609,19 @@ def apply_ml_locked_setup_override(
     dd["setup_type"] = locked
     dd["entry_thesis"] = locked
     dd["allweather_setup"] = locked
-    dd["setup_regime_remapped_from"] = str(decision_data.get("setup_type") or decision_data.get("entry_thesis") or "")
+    dd["setup_regime_remapped_from"] = prior_setup
+    # Keep narrative / adaptive labels aligned with final locked setup identity.
+    narr = str(dd.get("candidate_explanation_narrative") or "")
+    if prior_setup and prior_setup != locked:
+        prefix = f"setup={locked} (remapped from {prior_setup}; regime={route_regime}). "
+        if f"setup={locked}" not in narr:
+            dd["candidate_explanation_narrative"] = (prefix + narr).strip()
+        dd["setup_identity_unified"] = True
+    elif narr and f"setup={locked}" not in narr and locked:
+        dd["candidate_explanation_narrative"] = f"setup={locked}. {narr}".strip()
+        dd["setup_identity_unified"] = True
+    if route_regime and route_regime != "unknown":
+        dd["adaptive_regime"] = str(dd.get("adaptive_regime") or route_regime)
     dd.update(levels)
     return dd
 

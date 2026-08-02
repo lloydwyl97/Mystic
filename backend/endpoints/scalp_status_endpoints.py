@@ -216,6 +216,20 @@ def scalp_entry_telemetry() -> dict:
                 "strategy_pass_counts": rolling_full.get("strategy_pass_counts"),
                 "recent_cycle_digest": (rolling_full.get("recent_cycle_digest") or [])[-20:],
             }
+            # Dashboard cards read top-level pass/eligible — promote rolling when cycle TTL expired.
+            for _k in ("genuine_pass_setups", "entry_eligible_count", "regime_native_pass_count", "regime_mismatch_pass_count"):
+                if out.get(_k) is None and rolling_full.get(_k) is not None:
+                    out[_k] = rolling_full.get(_k)
+            if not out.get("reject_reasons") and rolling_full.get("top_reject_reasons"):
+                out["reject_reasons"] = rolling_full.get("top_reject_reasons")
+        # Eligible map for dashboard symbol table (status router uses the same shape).
+        if "per_symbol_entry_eligible" not in out:
+            elig_map: dict[str, bool] = {}
+            for row in out.get("symbols") or []:
+                if isinstance(row, dict) and row.get("symbol") is not None:
+                    elig_map[str(row.get("symbol"))] = bool(row.get("entry_eligible"))
+            if elig_map:
+                out["per_symbol_entry_eligible"] = elig_map
         return out
     except Exception as exc:
         return {"engine": "scalp", "available": False, "error": str(exc)[:240]}

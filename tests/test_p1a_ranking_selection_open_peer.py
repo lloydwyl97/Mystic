@@ -131,3 +131,17 @@ def test_nev_tiebreak_when_scores_equal():
     assert ordered[0].symbol == "ETH/USDT"
     reason = build_truthful_selection_reason(ordered[0], ordered, open_symbols=set())
     assert reason["selection_key_used"] == "higher_nev_tiebreak"
+
+
+def test_multi_buy_selected_list_stamps_extras():
+    """Secondary same-bar fills must get why_selected (not empty)."""
+    btc = _cand("BTC/USDT", 0.40, nev=0.10)
+    sol = _cand("SOL/USDT", 0.30, nev=0.08)
+    eth = _cand("ETH/USDT", 0.20, nev=0.05)
+    ordered = [btc, sol, eth]
+    assign_v3_selection_ranks(ordered, open_symbols=set(), selected_list=[btc, sol])
+    assert btc.decision_data.get("why_selected")
+    assert sol.decision_data.get("why_selected")
+    assert sol.decision_data["selection_key_used"] == "multi_buy_capacity_fill"
+    assert "multi_buy_capacity_fill" in sol.decision_data["why_selected"]
+    assert not eth.decision_data.get("why_selected")

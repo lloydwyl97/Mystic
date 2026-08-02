@@ -946,8 +946,10 @@ class BuyCandidate:
             strat = str((self.decision_data or {}).get("strategy_id") or "day")
             if sym:
                 import os as _os
+
                 _db = _os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
                 from backend.services.market_role_outcome_learner import get_learned_adjustment as _gla
+
                 learned_role_delta = _gla(_db, sym, strat)
         except Exception:
             learned_role_delta = 0.0
@@ -4947,20 +4949,14 @@ class PortfolioEngine:
                         logger.debug("LEARNING_ENRICH_BUY_LOOKUP_FAILED symbol=%s", symbol, exc_info=True)
 
                 if ex_payload:
-                    _sel = (
-                        ex_payload.get("selected_score")
-                        or ex_payload.get("final_selection_score")
-                        or ex_payload.get("rank_score")
-                    )
+                    _sel = ex_payload.get("selected_score") or ex_payload.get("final_selection_score") or ex_payload.get("rank_score")
                     rank_data = {
                         "selected_rank": ex_payload.get("selected_rank") or ex_payload.get("final_selected_rank"),
                         "selected_score": _sel,
                         "entry_score": _sel,
                         "rank_score": ex_payload.get("rank_score") or _sel,
                         "final_selection_score": ex_payload.get("final_selection_score") or _sel,
-                        "buy_margin": ex_payload.get("buy_margin")
-                        if ex_payload.get("buy_margin") is not None
-                        else ex_payload.get("entry_buy_margin"),
+                        "buy_margin": ex_payload.get("buy_margin") if ex_payload.get("buy_margin") is not None else ex_payload.get("entry_buy_margin"),
                         "raw_score": ex_payload.get("raw_score"),
                         "adjusted_score": ex_payload.get("adjusted_score"),
                         "composite_score": ex_payload.get("composite_score"),
@@ -8455,14 +8451,8 @@ class PortfolioEngine:
             timestamp=timestamp,
             ai_confidence=confidence,
             live_ai_strategy="day",
-            feature_version=(
-                int(signal["feature_version"])
-                if signal.get("feature_version") not in (None, "")
-                else 0
-            ),
-            feature_dim=(
-                int(signal["feature_dim"]) if signal.get("feature_dim") not in (None, "") else 0
-            ),
+            feature_version=(int(signal["feature_version"]) if signal.get("feature_version") not in (None, "") else 0),
+            feature_dim=(int(signal["feature_dim"]) if signal.get("feature_dim") not in (None, "") else 0),
         )
         explainability.decision_id = decision_id
         explainability.entry_timestamp = timestamp
@@ -9112,9 +9102,7 @@ class PortfolioEngine:
                     # poisons PAC/holdout provenance. Keep 0 / omit as unknown.
                     if not original_explain.get("feature_version"):
                         try:
-                            original_explain["feature_version"] = int(
-                                getattr(explain_obj, "feature_version", 0) or 0
-                            )
+                            original_explain["feature_version"] = int(getattr(explain_obj, "feature_version", 0) or 0)
                         except (TypeError, ValueError):
                             original_explain["feature_version"] = 0
                     if not original_explain.get("feature_dim"):
@@ -10516,11 +10504,7 @@ class PortfolioEngine:
             return False, f"INSUFFICIENT_CASH_WITH_PENDING: need ${float(notional_usd):.2f}, free=${max(0.0, float(self._available_balance) - pending_n):.2f}"
         # Sleeve capacity including pending reserved notional for same sleeve
         if sleeve and ENABLE_SLEEVE_BLOCKING:
-            sleeve_pending = sum(
-                float((r or {}).get("notional") or 0.0)
-                for r in (self._entry_reservations or {}).values()
-                if str((r or {}).get("sleeve") or "") == str(sleeve)
-            )
+            sleeve_pending = sum(float((r or {}).get("notional") or 0.0) for r in (self._entry_reservations or {}).values() if str((r or {}).get("sleeve") or "") == str(sleeve))
             sleeve_ok, sleeve_reason = self._check_sleeve_limits(str(sleeve), float(notional_usd) + sleeve_pending)
             if not sleeve_ok:
                 return False, f"SLEEVE_CAPACITY:{sleeve_reason}"
@@ -10699,9 +10683,7 @@ class PortfolioEngine:
                     max_positions_limit,
                 )
             else:
-                logger.info(
-                    f"BUY_BLOCKED_MAX_POSITIONS: {symbol} - portfolio full (active={active_count}, pending_slots={pending_slots}, total={len(self.open_positions)}/{max_positions_limit})"
-                )
+                logger.info(f"BUY_BLOCKED_MAX_POSITIONS: {symbol} - portfolio full (active={active_count}, pending_slots={pending_slots}, total={len(self.open_positions)}/{max_positions_limit})")
                 return False, "MAX_POSITIONS_REACHED"
 
         # NON-BLOCKING BY DESIGN: bear regime is advisory context for ranking/sizing,
@@ -10800,15 +10782,11 @@ class PortfolioEngine:
         pending_notional = self._pending_buy_notional()
         free_cash = float(self._available_balance) - pending_notional
         if free_cash <= 0:
-            logger.warning(
-                f"BUY_BLOCKED_NO_CASH: {symbol} - available_balance=${self._available_balance:.2f} pending=${pending_notional:.2f}"
-            )
+            logger.warning(f"BUY_BLOCKED_NO_CASH: {symbol} - available_balance=${self._available_balance:.2f} pending=${pending_notional:.2f}")
             return False, "INSUFFICIENT_CASH"
 
         if notional_usd > free_cash:
-            logger.info(
-                f"BUY_BLOCKED_INSUFFICIENT_CASH: {symbol} - notional=${notional_usd:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_notional:.2f})"
-            )
+            logger.info(f"BUY_BLOCKED_INSUFFICIENT_CASH: {symbol} - notional=${notional_usd:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_notional:.2f})")
             return False, f"INSUFFICIENT_CASH: need ${notional_usd:.2f}, have ${free_cash:.2f}"
 
         # Check portfolio risk cap (include reserved entry risk when present)
@@ -11214,7 +11192,11 @@ class PortfolioEngine:
                 if _partial_qty > 0:
                     logger.info(
                         "TP1_PARTIAL_EXIT: %s price=%.6f tp1=%.6f partial_pct=%.0f%% net_pct=%.4f",
-                        symbol, current_price, _tp1_price, _tp1_pct * 100, net_pnl_pct,
+                        symbol,
+                        current_price,
+                        _tp1_price,
+                        _tp1_pct * 100,
+                        net_pnl_pct,
                     )
                     _tp1_result = await self.execute_sell_fifo(
                         symbol,
@@ -12132,9 +12114,7 @@ class PortfolioEngine:
         # Soft size discount from quality/side penalties (same units as rank demotion).
         opinion_units = max(
             0.0,
-            _safe_float(dd.get("quality_opinion_penalty"), 0.0)
-            + _safe_float(dd.get("pnl_adapt_penalty"), 0.0)
-            + _safe_float(dd.get("confidence_floor_penalty"), 0.0) * 8.0,
+            _safe_float(dd.get("quality_opinion_penalty"), 0.0) + _safe_float(dd.get("pnl_adapt_penalty"), 0.0) + _safe_float(dd.get("confidence_floor_penalty"), 0.0) * 8.0,
         )
         opinion_sf = max(0.55, 1.0 - min(0.40, opinion_units * 0.04))
         mult *= thesis_sf * bucket_sf * opinion_sf
@@ -13474,11 +13454,7 @@ class PortfolioEngine:
                 perf = self.coin_performance.get(symbol)
                 sizing_mult = perf.sizing_multiplier if perf else 1.0
                 strategy_id_for_size = str((cand.decision_data or {}).get("live_ai_strategy") or "day").strip().lower()
-                top_meta_score = float(
-                    (cand.decision_data or {}).get("final_selection_score")
-                    or (cand.decision_data or {}).get("selection_score")
-                    or cand.rank_score()
-                )
+                top_meta_score = float((cand.decision_data or {}).get("final_selection_score") or (cand.decision_data or {}).get("selection_score") or cand.rank_score())
                 top_net_ev = self._estimate_candidate_net_expected_value(cand.decision_data or {})
                 if float(top_net_ev) <= 0.0:
                     logger.info("MULTI_BUY_SKIP_NEGATIVE_EV symbol=%s net_ev=%.6f", symbol, float(top_net_ev))
@@ -13494,9 +13470,7 @@ class PortfolioEngine:
                     coin_edge_score=float(cand.coin_edge_score) if cand.coin_edge_score is not None else None,
                 )
                 sizing_mult *= dyn_mult
-                quantity, stop_price, _risk_usd = self.calculate_position_size(
-                    symbol, equity, cand.atr, cand.current_price, sizing_mult, cand.confidence
-                )
+                quantity, stop_price, _risk_usd = self.calculate_position_size(symbol, equity, cand.atr, cand.current_price, sizing_mult, cand.confidence)
                 if quantity <= 0:
                     logger.info(
                         "MULTI_BUY_SKIP_SIZE symbol=%s dyn_cap_reason=%s",
@@ -13555,9 +13529,7 @@ class PortfolioEngine:
                 explainability.entry_vwap = float(_safe_float(_dd.get("entry_vwap"), 0.0))
                 explainability.day_route_regime = str(_dd.get("day_route_regime") or _dd.get("regime") or "")
                 explainability.strategy_family = str(_dd.get("strategy_family") or "")
-                explainability.price_structure_regime = str(
-                    _dd.get("price_structure_regime") or getattr(cand, "price_structure_regime", "") or ""
-                )
+                explainability.price_structure_regime = str(_dd.get("price_structure_regime") or getattr(cand, "price_structure_regime", "") or "")
                 try:
                     _ebm = _dd.get("buy_margin")
                     explainability.entry_buy_margin = float(_ebm) if _ebm not in (None, "") else None
@@ -13580,16 +13552,18 @@ class PortfolioEngine:
                         setattr(explainability, _attr, None)
                 explainability.quality_opinion_penalty = float(_safe_float(_dd.get("quality_opinion_penalty"), 0.0))
                 explainability.signal_side_penalty = float(_safe_float(_dd.get("signal_side_penalty"), 0.0))
-                explainability.rank_score = float(
-                    _safe_float(_dd.get("rank_score"), cand.rank_score())
-                )
-                explainability.final_selection_score = float(
-                    _safe_float(_dd.get("final_selection_score"), explainability.rank_score)
-                )
+                explainability.rank_score = float(_safe_float(_dd.get("rank_score"), cand.rank_score()))
+                explainability.final_selection_score = float(_safe_float(_dd.get("final_selection_score"), explainability.rank_score))
                 explainability.selected_score = explainability.final_selection_score
-                explainability.selected_net_expected_value = float(
-                    _safe_float(_dd.get("selected_net_expected_value"), _safe_float(_dd.get("adjusted_ev"), 0.0))
-                )
+                explainability.selected_net_expected_value = float(_safe_float(_dd.get("selected_net_expected_value"), _safe_float(_dd.get("adjusted_ev"), 0.0)))
+                explainability.why_selected = str(_dd.get("why_selected") or "")
+                explainability.selection_key_used = str(_dd.get("selection_key_used") or "")
+                explainability.arbiter_winner_reason = str(_dd.get("why_selected") or _dd.get("arbiter_winner_reason") or "multi_buy_capacity_fill")
+                explainability.winner_symbol = str(_dd.get("winner_symbol") or symbol or "")
+                explainability.winner_score = float(_safe_float(_dd.get("winner_score"), explainability.final_selection_score))
+                explainability.runner_up_symbol = str(_dd.get("runner_up_symbol") or "")
+                explainability.runner_up_score = float(_safe_float(_dd.get("runner_up_score"), 0.0))
+                explainability.skipped_reason = str(_dd.get("skipped_reason") or "")
                 explainability.argmax_action = str(_dd.get("argmax_action") or "")
                 explainability.prediction = str(_dd.get("prediction") or _dd.get("argmax_action") or "")
                 explainability.side_signal = str(_dd.get("side") or _dd.get("action") or "")
@@ -13991,11 +13965,7 @@ class PortfolioEngine:
                         except Exception:
                             pass
                     else:
-                        _block_r = str(
-                            (_gates.get("route") or {}).get("block_reason")
-                            or (_gates.get("bucket") or {}).get("block_reason")
-                            or "ALLWEATHER_BP"
-                        )
+                        _block_r = str((_gates.get("route") or {}).get("block_reason") or (_gates.get("bucket") or {}).get("block_reason") or "ALLWEATHER_BP")
                         logger.info(
                             "ALLWEATHER_BP_BLOCK symbol=%s route=%s bucket=%s",
                             _tc.symbol,
@@ -14194,11 +14164,7 @@ class PortfolioEngine:
                         bm = float(d.get("buy_margin") or d.get("redis_buy_margin_key") or d.get("buy_margin_raw") or 0)
                     except Exception:
                         bm = 0.0
-                    is_ml = bool(
-                        d.get("ml_enriched")
-                        or str(d.get("strategy_family", "")).upper() == "ML_EDGE"
-                        or str(d.get("live_ai_strategy", "")).lower() == "day"
-                    )
+                    is_ml = bool(d.get("ml_enriched") or str(d.get("strategy_family", "")).upper() == "ML_EDGE" or str(d.get("live_ai_strategy", "")).lower() == "day")
                     side = str(d.get("side") or d.get("argmax_action") or d.get("prediction") or "").strip().lower()
                     return (bm > 0.015) or (is_ml and bm > 0.0) or (side == "buy" and bm > 0.0)
 
@@ -14289,11 +14255,7 @@ class PortfolioEngine:
                         bm = float(d.get("buy_margin") or d.get("redis_buy_margin_key") or d.get("buy_margin_raw") or 0)
                     except Exception:
                         bm = 0.0
-                    is_ml = bool(
-                        d.get("ml_enriched")
-                        or str(d.get("strategy_family", "")).upper() == "ML_EDGE"
-                        or str(d.get("live_ai_strategy", "")).lower() == "day"
-                    )
+                    is_ml = bool(d.get("ml_enriched") or str(d.get("strategy_family", "")).upper() == "ML_EDGE" or str(d.get("live_ai_strategy", "")).lower() == "day")
                     side = str(d.get("side") or d.get("argmax_action") or d.get("prediction") or "").strip().lower()
                     return (bm > 0.015) or (is_ml and bm > 0.0) or (side == "buy" and bm > 0.0)
 
@@ -14317,12 +14279,7 @@ class PortfolioEngine:
             except Exception:
                 bm = 0.0
             try:
-                nev = float(
-                    d.get("selected_net_expected_value")
-                    or d.get("adjusted_ev")
-                    or d.get("raw_ev")
-                    or 0.0
-                )
+                nev = float(d.get("selected_net_expected_value") or d.get("adjusted_ev") or d.get("raw_ev") or 0.0)
             except Exception:
                 nev = 0.0
             try:
@@ -14595,16 +14552,17 @@ class PortfolioEngine:
                     _buy_budget,
                     _slots_left,
                 )
-        # Re-stamp truthful why_selected on the executable winner. Score-ordered
-        # #1 may be an already-open peer that was skipped for capacity — never
-        # claim a false final_selection_score victory for the unheld runner-up.
+        # Re-stamp truthful why_selected on every executable fill this bar
+        # (primary + multi-buy extras). Score-ordered #1 may be an already-open
+        # peer skipped for capacity — never claim a false score victory.
         try:
             from backend.services.symbol_setup_outcome_penalty import assign_v3_selection_ranks
 
+            _exe_fills = [top_candidate] + list(getattr(self, "_bar_extra_buy_candidates", None) or [])
             assign_v3_selection_ranks(
                 valid_candidates,
                 open_symbols=set(self.open_positions.keys()),
-                selected=top_candidate,
+                selected_list=_exe_fills,
             )
         except Exception as _why_err:
             logger.warning("truthful why_selected stamp failed: %s", _why_err)
@@ -15026,9 +14984,7 @@ class PortfolioEngine:
                 setattr(explainability, _attr, None)
         explainability.quality_opinion_penalty = float(_safe_float(_dd.get("quality_opinion_penalty"), 0.0))
         explainability.signal_side_penalty = float(_safe_float(_dd.get("signal_side_penalty"), 0.0))
-        explainability.rank_score = float(
-            _safe_float(_dd.get("rank_score"), _safe_float(top_meta.get("rank_score"), top_candidate.rank_score()))
-        )
+        explainability.rank_score = float(_safe_float(_dd.get("rank_score"), _safe_float(top_meta.get("rank_score"), top_candidate.rank_score())))
         explainability.argmax_action = str(_dd.get("argmax_action") or "")
         explainability.prediction = str(_dd.get("prediction") or _dd.get("argmax_action") or "")
         explainability.side_signal = str(_dd.get("side") or _dd.get("action") or "")
@@ -15430,11 +15386,7 @@ class PortfolioEngine:
                 ml_rank_adjustment=float(_dd_final.get("ml_rank_adjustment") or 0.0) or None,
                 ml_size_adjustment=float(dyn_mult),
                 requested_size=float(quantity),
-                approved_size=(
-                    float(result.get("quantity"))
-                    if isinstance(result, dict) and result.get("quantity") is not None
-                    else (0.0 if result is None else None)
-                ),
+                approved_size=(float(result.get("quantity")) if isinstance(result, dict) and result.get("quantity") is not None else (0.0 if result is None else None)),
                 final_decision=_final,
                 strategy_version=str(_dd_final.get("decision_policy_version") or "day_aw_owner_v1"),
                 model_version=str(_dd_final.get("artifact_sha256") or _dd_final.get("model_version") or "")[:64],
@@ -15949,7 +15901,7 @@ class PortfolioEngine:
         tid = str(getattr(pos, "trade_id", "") or "")
         if tid and tid in self.trade_explanations:
             ex = self.trade_explanations[tid]
-            why_selected = str(getattr(ex, "why_selected", "") or "")
+            why_selected = str(getattr(ex, "why_selected", "") or getattr(ex, "arbiter_winner_reason", "") or "")
             selection_key_used = str(getattr(ex, "selection_key_used", "") or "")
             final_selection_score = float(getattr(ex, "final_selection_score", 0.0) or 0.0) or None
             winner_score = float(getattr(ex, "winner_score", 0.0) or 0.0) or None
@@ -16279,9 +16231,7 @@ class PortfolioEngine:
                         "runner_up_score": ex.get("runner_up_score"),
                         "mfe_pct": ex.get("mfe_pct"),
                         "mae_pct": ex.get("mae_pct"),
-                        "entry_reason": (
-                            f"qty={row['quantity']} @ {row['price']}" if row["quantity"] is not None else ""
-                        ),
+                        "entry_reason": (f"qty={row['quantity']} @ {row['price']}" if row["quantity"] is not None else ""),
                     }
                 )
         except Exception:
@@ -17373,11 +17323,7 @@ class PortfolioEngine:
         elif set_by_cb and self._kill_switch_mode != KillSwitchMode.RESUME:
             # Conditions cleared and this pause was set by us (not an operator) — lift it.
             await self.set_kill_switch("RESUME", reason=f"{prefix}cleared")
-        elif (
-            self._kill_switch_mode == KillSwitchMode.PAUSE_BUYS
-            and "ACCOUNT_FAILSAFE" in str(self._kill_switch_reason or "")
-            and not conditions.get("account_failsafe")
-        ):
+        elif self._kill_switch_mode == KillSwitchMode.PAUSE_BUYS and "ACCOUNT_FAILSAFE" in str(self._kill_switch_reason or "") and not conditions.get("account_failsafe"):
             # Recover from stale PAUSE_BUYS left after failsafe healed (DB/memory drift).
             await self.set_kill_switch("RESUME", reason=f"{prefix}ACCOUNT_FAILSAFE_cleared_stale")
 
@@ -19279,12 +19225,8 @@ class PortfolioEngine:
             )
             positions_rows.append(row)
 
-        # After restart, trade_explanations may be empty — fill selection audit from BUY rows.
-        missing_tids = [
-            str(r.get("trade_id") or "")
-            for r in positions_rows
-            if r.get("trade_id") and not r.get("why_selected") and not r.get("selection_key_used")
-        ]
+        # After restart / multi-buy gaps — fill selection audit from BUY rows whenever why is empty.
+        missing_tids = [str(r.get("trade_id") or "") for r in positions_rows if r.get("trade_id") and not str(r.get("why_selected") or "").strip()]
         if missing_tids:
             try:
                 with sqlite3.connect(self.db_path) as _conn:
@@ -19310,8 +19252,12 @@ class PortfolioEngine:
                     ex = by_tid.get(tid)
                     if not ex:
                         continue
-                    r["why_selected"] = str(ex.get("why_selected") or "")
-                    r["selection_key_used"] = str(ex.get("selection_key_used") or "")
+                    why = str(ex.get("why_selected") or ex.get("arbiter_winner_reason") or "")
+                    if why:
+                        r["why_selected"] = why
+                    key = str(ex.get("selection_key_used") or "")
+                    if key:
+                        r["selection_key_used"] = key
                     if ex.get("final_selection_score") is not None:
                         r["final_selection_score"] = ex.get("final_selection_score")
                     if ex.get("winner_score") is not None:

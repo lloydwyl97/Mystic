@@ -1,5 +1,5 @@
 // Mystic Operator Console — dual-engine DAY + SCALP dashboard
-const DASHBOARD_VERSION = 56;
+const DASHBOARD_VERSION = 57;
 const REFRESH_MS = 90000;
 const CANONICAL_REFRESH_MS = 30000;
 const SECONDARY_POLL_MS = 3000;
@@ -1131,7 +1131,13 @@ function updateScalpEngineStatus(res, stale) {
 function updateScalpSymbolDiagnostics(d) {
     const tbody = document.getElementById("scalp-symbols-tbody");
     if (!tbody) return;
-    const symbols = d.symbols || {};
+    const symbolsRaw = d.symbols || {};
+    const symbols = Array.isArray(symbolsRaw)
+        ? symbolsRaw.reduce(function (acc, row) {
+            if (row && row.symbol) acc[String(row.symbol)] = row;
+            return acc;
+        }, {})
+        : symbolsRaw;
     const micro = d.micro_regimes || {};
     const telemetry = (window._lastScalpTelemetry && window._lastScalpTelemetry.per_symbol_entry_eligible) || {};
     const keys = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"].filter(function (k) {
@@ -1202,14 +1208,18 @@ function renderScalpPassTelemetry(d) {
         const el = document.getElementById(id);
         if (el) el.textContent = v;
     };
-    set("scalp-tel-pass", d.genuine_pass_setups != null ? String(d.genuine_pass_setups) : "--");
-    set("scalp-tel-elig", d.entry_eligible_count != null ? String(d.entry_eligible_count) : "--");
+    const passN = d.genuine_pass_setups != null ? d.genuine_pass_setups : roll.genuine_pass_setups;
+    const eligN = d.entry_eligible_count != null ? d.entry_eligible_count : roll.entry_eligible_count;
+    set("scalp-tel-pass", passN != null ? String(passN) : "--");
+    set("scalp-tel-elig", eligN != null ? String(eligN) : "--");
     set("scalp-tel-cycles", roll.cycles != null ? String(roll.cycles) : "--");
     set("scalp-tel-pass-rate", _fmtPct(roll.pass_rate_overall));
     set("scalp-tel-pct-pass", _fmtPct(roll.pct_cycles_with_pass));
     set("scalp-tel-pct-elig", _fmtPct(roll.pct_cycles_with_eligible));
-    set("scalp-tel-regime-native", roll.regime_native_pass_count != null ? String(roll.regime_native_pass_count) : "--");
-    set("scalp-tel-regime-mismatch", roll.regime_mismatch_pass_count != null ? String(roll.regime_mismatch_pass_count) : "--");
+    const nativeN = roll.regime_native_pass_count != null ? roll.regime_native_pass_count : d.regime_native_pass_count;
+    const mismatchN = roll.regime_mismatch_pass_count != null ? roll.regime_mismatch_pass_count : d.regime_mismatch_pass_count;
+    set("scalp-tel-regime-native", nativeN != null ? String(nativeN) : "--");
+    set("scalp-tel-regime-mismatch", mismatchN != null ? String(mismatchN) : "--");
 
     const rejects = Object.entries(roll.top_reject_reasons || d.reject_reasons || {}).slice(0, 8);
     const ppb = Object.entries(roll.top_post_pass_blockers || d.post_pass_blockers || {}).slice(0, 8);

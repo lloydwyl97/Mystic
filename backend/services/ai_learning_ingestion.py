@@ -707,10 +707,7 @@ def label_pending_snapshots(db_path: str = DATABASE_PATH) -> dict[str, int]:
         conn.row_factory = sqlite3.Row
         # Split the batch so PARTIAL completion work cannot starve first-horizon PENDING.
         half = max(1, int(LABEL_BATCH_LIMIT) // 2)
-        _cols = (
-            "id, symbol, epoch_ms, price, decision, thesis_invalid_level, thesis_target_level, "
-            "fwd_ret_15m, fwd_ret_30m, fwd_ret_1h, fwd_ret_4h, fwd_ret_24h"
-        )
+        _cols = "id, symbol, epoch_ms, price, decision, thesis_invalid_level, thesis_target_level, fwd_ret_15m, fwd_ret_30m, fwd_ret_1h, fwd_ret_4h, fwd_ret_24h"
         pending_rows = conn.execute(
             f"""
             SELECT {_cols}
@@ -1168,19 +1165,22 @@ def learning_health_summary(db_path: str = DATABASE_PATH) -> dict[str, Any]:
                 with contextlib.suppress(sqlite3.Error):
                     t[name] = int(conn.execute(q).fetchone()[0])
 
+            def _canon_sym(sym: object) -> str:
+                return str(sym or "").replace("/", "").strip().upper()
+
             per_sym = out["per_symbol"]
             with contextlib.suppress(sqlite3.Error):
                 for sym, cnt in conn.execute("SELECT symbol, COUNT(*) FROM ai_candidate_snapshots GROUP BY symbol").fetchall():
-                    per_sym.setdefault(str(sym), {})["snapshots"] = int(cnt)
+                    per_sym.setdefault(_canon_sym(sym), {})["snapshots"] = int(cnt)
             with contextlib.suppress(sqlite3.Error):
                 for sym, cnt in conn.execute("SELECT symbol, COUNT(*) FROM ai_candidate_snapshots WHERE label_status='LABELED' GROUP BY symbol").fetchall():
-                    per_sym.setdefault(str(sym), {})["labeled_snapshots"] = int(cnt)
+                    per_sym.setdefault(_canon_sym(sym), {})["labeled_snapshots"] = int(cnt)
             with contextlib.suppress(sqlite3.Error):
                 for sym, cnt in conn.execute("SELECT symbol, COUNT(*) FROM ai_position_heartbeats GROUP BY symbol").fetchall():
-                    per_sym.setdefault(str(sym), {})["heartbeats"] = int(cnt)
+                    per_sym.setdefault(_canon_sym(sym), {})["heartbeats"] = int(cnt)
             with contextlib.suppress(sqlite3.Error):
                 for sym, cnt in conn.execute("SELECT symbol, COUNT(*) FROM ai_outcome_training_rows WHERE strategy_id='day' GROUP BY symbol").fetchall():
-                    per_sym.setdefault(str(sym), {})["closed_outcomes"] = int(cnt)
+                    per_sym.setdefault(_canon_sym(sym), {})["closed_outcomes"] = int(cnt)
             with contextlib.suppress(sqlite3.Error):
                 for sym, reason, at in conn.execute(
                     """
@@ -1188,7 +1188,7 @@ def learning_health_summary(db_path: str = DATABASE_PATH) -> dict[str, Any]:
                     WHERE event_type IN ('reject','promote') GROUP BY symbol
                     """
                 ).fetchall():
-                    per_sym.setdefault(str(sym), {})["last_promotion_event"] = f"{reason} @ {at}"
+                    per_sym.setdefault(_canon_sym(sym), {})["last_promotion_event"] = f"{reason} @ {at}"
 
         # Model artifact freshness
         with contextlib.suppress(Exception):
@@ -1199,14 +1199,15 @@ def learning_health_summary(db_path: str = DATABASE_PATH) -> dict[str, Any]:
 
             active = Path(ensure_model_directories()["active"]) / "day"
             for sym in TRADING_SYMBOLS:
-                p = active / f"{sym}_direction.pkl"
+                canon = str(sym or "").replace("/", "").strip().upper()
+                p = active / f"{canon}_direction.pkl"
                 if p.exists():
                     age_days = (time.time() - p.stat().st_mtime) / 86400.0
-                    per = out["per_symbol"].setdefault(sym, {})
+                    per = out["per_symbol"].setdefault(canon, {})
                     per["model_active_date"] = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d")
                     per["model_age_days"] = round(age_days, 1)
                     if age_days > 7:
-                        out["warnings"].append(f"{sym}: active model {age_days:.0f}d old")
+                        out["warnings"].append(f"{canon}: active model {age_days:.0f}d old")
 
         closed = int(out["totals"].get("closed_outcome_rows") or 0)
         labeled = int(out["totals"].get("candidate_snapshots_labeled") or 0)
@@ -1336,10 +1337,7 @@ def ingest_scalp_outcomes(db_path: str = DATABASE_PATH) -> dict[str, int]:
                 """
             ).fetchall()
 
-            existing_ids = {
-                r[0]
-                for r in conn.execute("SELECT source_id FROM scalp_learning_outcomes").fetchall()
-            }
+            existing_ids = {r[0] for r in conn.execute("SELECT source_id FROM scalp_learning_outcomes").fetchall()}
 
             for row in rows:
                 source_id = int(row["id"])
