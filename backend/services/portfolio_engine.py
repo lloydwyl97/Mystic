@@ -1495,6 +1495,14 @@ class TradeExplainability:
     selected_over_symbol: str = ""
     selected_over_score: float = 0.0
     why_selected: str = ""
+    # P1A truthful selection audit (score-primary ranking)
+    selection_key_used: str = ""
+    winner_symbol: str = ""
+    winner_score: float = 0.0
+    runner_up_symbol: str = ""
+    runner_up_score: float = 0.0
+    skipped_reason: str = ""
+    higher_score_skipped_json: str = "[]"
     # Model direction / ranking telemetry (P1B measurement stamps)
     prob_buy: float | None = None
     prob_hold: float | None = None
@@ -1616,6 +1624,13 @@ class TradeExplainability:
             "selected_over_symbol": self.selected_over_symbol,
             "selected_over_score": self.selected_over_score,
             "why_selected": self.why_selected,
+            "selection_key_used": self.selection_key_used,
+            "winner_symbol": self.winner_symbol,
+            "winner_score": self.winner_score,
+            "runner_up_symbol": self.runner_up_symbol,
+            "runner_up_score": self.runner_up_score,
+            "skipped_reason": self.skipped_reason,
+            "higher_score_skipped_json": self.higher_score_skipped_json,
             "prob_buy": self.prob_buy,
             "prob_hold": self.prob_hold,
             "prob_sell": self.prob_sell,
@@ -14980,6 +14995,20 @@ class PortfolioEngine:
         explainability.selected_over_symbol = str(_dd.get("selected_over_symbol") or "")
         explainability.selected_over_score = float(_safe_float(_dd.get("selected_over_score"), 0.0))
         explainability.why_selected = str(_dd.get("why_selected") or "")
+        explainability.selection_key_used = str(_dd.get("selection_key_used") or "")
+        explainability.winner_symbol = str(_dd.get("winner_symbol") or symbol or "")
+        explainability.winner_score = float(_safe_float(_dd.get("winner_score"), explainability.final_selection_score))
+        explainability.runner_up_symbol = str(_dd.get("runner_up_symbol") or explainability.selected_over_symbol or "")
+        explainability.runner_up_score = float(_safe_float(_dd.get("runner_up_score"), explainability.selected_over_score))
+        explainability.skipped_reason = str(_dd.get("skipped_reason") or "")
+        try:
+            _skipped = _dd.get("higher_score_skipped")
+            if isinstance(_skipped, str):
+                explainability.higher_score_skipped_json = _skipped
+            else:
+                explainability.higher_score_skipped_json = json.dumps(_skipped or [], separators=(",", ":"))
+        except Exception:
+            explainability.higher_score_skipped_json = "[]"
         # P1B: persist model probs / opinion penalties / rank for post-trade measurement.
         for _attr, _key in (
             ("prob_buy", "prob_buy"),
