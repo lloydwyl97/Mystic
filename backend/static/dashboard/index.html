@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=40">
+    <link rel="stylesheet" href="style.css?v=41">
 </head>
 <body>
     <!-- Feature 4: Restart Required Banner -->
@@ -152,6 +152,22 @@
                 <div class="mini-card"><span class="mini-card__label">Live trades today</span><span class="mini-card__value" id="today-live-trades">--</span></div>
             </div>
         </section>
+
+        <section class="widget widget--full" aria-label="Last DAY decisions">
+            <h2 class="widget__title">Last DAY decisions</h2>
+            <p class="widget__subtitle">Buy/sell audit trail — setup, why selected, selection key, MFE/MAE, exit.</p>
+            <div class="widget__table-wrap widget__table-wrap--scroll">
+                <table class="positions-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th><th>Symbol</th><th>Side</th><th>Setup</th><th>Score</th>
+                            <th>Selection key</th><th>Why selected</th><th>MFE</th><th>MAE</th><th>Exit</th><th>PnL</th>
+                        </tr>
+                    </thead>
+                    <tbody id="cc-decisions-tbody"><tr><td colspan="11">Loading…</td></tr></tbody>
+                </table>
+            </div>
+        </section>
     </div>
 
     <!-- TAB 2: DAY Engine -->
@@ -178,10 +194,40 @@
         </section>
         <section class="widget widget--full">
             <h2 class="widget__title">DAY open positions</h2>
-            <div class="widget__table-wrap">
+            <p class="widget__subtitle">Health state + setup / MFE / MAE / hold — observation only.</p>
+            <div class="widget__table-wrap widget__table-wrap--scroll">
                 <table class="positions-table">
-                    <thead><tr><th>Symbol</th><th>State</th><th>RS rank</th><th>Net %</th><th>Best alt</th></tr></thead>
-                    <tbody id="day-positions-tbody"><tr><td colspan="5">--</td></tr></tbody>
+                    <thead>
+                        <tr>
+                            <th>Symbol</th><th>Setup</th><th>State</th><th>RS rank</th><th>Net %</th>
+                            <th>MFE</th><th>MAE</th><th>Hold</th><th>Best alt</th>
+                        </tr>
+                    </thead>
+                    <tbody id="day-positions-tbody"><tr><td colspan="9">--</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+        <section class="widget widget--full" aria-label="DAY decisions">
+            <h2 class="widget__title">DAY decision trail</h2>
+            <p class="widget__subtitle">Same audit fields as Command Center — refreshed with DAY tab.</p>
+            <div class="widget__table-wrap widget__table-wrap--scroll">
+                <table class="positions-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th><th>Symbol</th><th>Side</th><th>Setup</th><th>Score</th>
+                            <th>Selection key</th><th>Why selected</th><th>MFE</th><th>MAE</th><th>Exit</th><th>PnL</th>
+                        </tr>
+                    </thead>
+                    <tbody id="day-decisions-tbody"><tr><td colspan="11">Loading…</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+        <section class="widget widget--full" aria-label="DAY rejects">
+            <h2 class="widget__title">Recent DAY rejects</h2>
+            <div class="widget__table-wrap widget__table-wrap--scroll">
+                <table class="positions-table">
+                    <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Filter</th><th>Reason</th></tr></thead>
+                    <tbody id="day-rejects-tbody"><tr><td colspan="5">Loading…</td></tr></tbody>
                 </table>
             </div>
         </section>
@@ -371,10 +417,16 @@
         <section class="widget-row">
             <div class="widget widget--half" data-engine="day">
                 <h2 class="widget__title">Open DAY positions</h2>
-                <p class="widget__subtitle">DAY ledger only — canonical snapshot.</p>
+                <p class="widget__subtitle">DAY ledger only — setup, excursion, selection, next exit.</p>
                 <div class="widget__table-wrap widget__table-wrap--scroll">
                     <table class="positions-table">
-                        <thead><tr><th>Symbol</th><th>Sleeve</th><th>Size</th><th>Entry</th><th>Current</th><th>Unrealized</th><th>Stop</th><th>TP1</th><th>TP2</th><th>Next exit</th></tr></thead>
+                        <thead>
+                            <tr>
+                                <th>Symbol</th><th>Setup</th><th>Sleeve</th><th>Size</th><th>Entry</th><th>Current</th>
+                                <th>Unrealized</th><th>Net %</th><th>MFE</th><th>MAE</th><th>Hold</th>
+                                <th>Why / key</th><th>Next exit</th>
+                            </tr>
+                        </thead>
                         <tbody id="positions-tbody"></tbody>
                     </table>
                     <p class="widget__no-data" id="positions-no-data">No open DAY positions</p>
@@ -395,7 +447,13 @@
             <h2 class="widget__title">Closed DAY trades</h2>
             <div class="widget__table-wrap widget__table-wrap--scroll">
                 <table class="positions-table">
-                    <thead><tr><th>Time</th><th>Symbol</th><th>Sleeve</th><th>Side</th><th>Size</th><th>Price</th><th>PnL</th><th>Detail</th></tr></thead>
+                    <thead>
+                        <tr>
+                            <th>Time</th><th>Symbol</th><th>Sleeve</th><th>Side</th><th>Setup</th>
+                            <th>Size</th><th>Price</th><th>PnL</th><th>Exit</th><th>MFE</th><th>MAE</th>
+                            <th>Why selected</th><th>Detail</th>
+                        </tr>
+                    </thead>
                     <tbody id="trades-tbody"></tbody>
                 </table>
                 <p class="widget__no-data" id="trades-no-data">No DAY trades yet</p>
@@ -633,6 +691,6 @@
     </div>
 
     <script src="vendor/chart.umd.min.js?v=4.4.1"></script>
-    <script src="app.js?v=55"></script>
+    <script src="app.js?v=56"></script>
 </body>
 </html>

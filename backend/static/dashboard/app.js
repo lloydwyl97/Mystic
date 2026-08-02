@@ -1,5 +1,5 @@
 // Mystic Operator Console — dual-engine DAY + SCALP dashboard
-const DASHBOARD_VERSION = 55;
+const DASHBOARD_VERSION = 56;
 const REFRESH_MS = 90000;
 const CANONICAL_REFRESH_MS = 30000;
 const SECONDARY_POLL_MS = 3000;
@@ -84,6 +84,27 @@ const CANONICAL_STALE_WIDGET_IDS = [
     "analytics-xcheck",
     "status-health",
 ];
+
+function escapeHtml(s) {
+    return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+function fmtPctSigned(v, digits) {
+    if (v == null || v === "" || Number.isNaN(Number(v))) return "--";
+    const n = Number(v) * 100;
+    const d = digits != null ? digits : 2;
+    return (n >= 0 ? "+" : "") + n.toFixed(d) + "%";
+}
+
+function fmtScore(v) {
+    if (v == null || v === "" || Number.isNaN(Number(v))) return "--";
+    return Number(v).toFixed(4);
+}
 
 function setCardText(id, text, opts) {
     opts = opts || {};
@@ -1734,14 +1755,68 @@ function updateDayPositionsTable(positions) {
     if (!tbody) return;
     const rows = Array.isArray(positions) ? positions : [];
     if (!rows.length) {
-        tbody.innerHTML = "<tr><td colspan=\"5\">No open DAY positions</td></tr>";
+        tbody.innerHTML = "<tr><td colspan=\"9\">No open DAY positions</td></tr>";
         return;
     }
     tbody.innerHTML = rows.map(function (p) {
-        return "<tr><td>" + (p.symbol || "") + "</td><td>" + (p.state || "--") + "</td><td>" +
-            (p.rs_rank != null ? String(p.rs_rank) : "--") + "</td><td>" +
+        const setup = p.setup || p.setup_type || p.entry_thesis || "--";
+        const hold = p.hold_minutes != null
+            ? Number(p.hold_minutes).toFixed(0) + "m"
+            : (p.hold_days != null ? Number(p.hold_days).toFixed(2) + "d" : "--");
+        return "<tr><td>" + escapeHtml(p.symbol || "") + "</td><td class=\"td-wrap\" title=\"" +
+            escapeHtml(setup) + "\">" + escapeHtml(setup) + "</td><td>" + escapeHtml(p.state || "--") +
+            "</td><td>" + (p.rs_rank != null ? String(p.rs_rank) : "--") + "</td><td>" +
             (p.net_pct != null ? (Number(p.net_pct) * 100).toFixed(2) + "%" : "--") + "</td><td>" +
-            (p.best_alternate_symbol || "--") + "</td></tr>";
+            fmtPctSigned(p.mfe_pct) + "</td><td>" + fmtPctSigned(p.mae_pct) + "</td><td>" + hold +
+            "</td><td>" + escapeHtml(p.best_alternate_symbol || "--") + "</td></tr>";
+    }).join("");
+}
+
+function renderDecisionsTable(list, tbodyId) {
+    const tbody = document.getElementById(tbodyId);
+    if (!tbody) return;
+    const rows = Array.isArray(list) ? list : [];
+    if (!rows.length) {
+        tbody.innerHTML = "<tr><td colspan=\"11\">No recent decisions</td></tr>";
+        return;
+    }
+    tbody.innerHTML = rows.slice(0, 20).map(function (d) {
+        const ts = d.timestamp || d.entry_timestamp || "";
+        const timeStr = typeof ts === "string" ? ts.replace("T", " ").slice(0, 19) : "--";
+        const setup = d.setup_type || d.entry_thesis || "--";
+        const why = d.why_selected || d.arbiter_winner_reason || "--";
+        const key = d.selection_key_used || "--";
+        const exit = d.exit_reason || d.exit_trigger || d.exit_type || "--";
+        const pnl = d.pnl != null ? Number(d.pnl) : null;
+        const pnlCls = pnl != null ? (pnl >= 0 ? "pnl-pos" : "pnl-neg") : "";
+        const pnlStr = pnl != null ? "$" + pnl.toFixed(2) : "--";
+        return "<tr><td class=\"mono\">" + escapeHtml(timeStr) + "</td><td>" + escapeHtml(d.symbol || "?") +
+            "</td><td>" + escapeHtml(d.side || "") + "</td><td class=\"td-wrap\" title=\"" + escapeHtml(setup) +
+            "\">" + escapeHtml(setup) + "</td><td class=\"mono\">" + fmtScore(d.final_selection_score) +
+            "</td><td class=\"td-wrap\" title=\"" + escapeHtml(key) + "\">" + escapeHtml(key) +
+            "</td><td class=\"td-wrap\" title=\"" + escapeHtml(why) + "\">" + escapeHtml(why) +
+            "</td><td>" + fmtPctSigned(d.mfe_pct) + "</td><td>" + fmtPctSigned(d.mae_pct) +
+            "</td><td class=\"td-wrap\" title=\"" + escapeHtml(exit) + "\">" + escapeHtml(exit) +
+            "</td><td class=\"" + pnlCls + "\">" + pnlStr + "</td></tr>";
+    }).join("");
+}
+
+function renderRejectsTable(list, tbodyId) {
+    const tbody = document.getElementById(tbodyId);
+    if (!tbody) return;
+    const rows = Array.isArray(list) ? list : [];
+    if (!rows.length) {
+        tbody.innerHTML = "<tr><td colspan=\"5\">No recent rejects</td></tr>";
+        return;
+    }
+    tbody.innerHTML = rows.slice(0, 25).map(function (r) {
+        const ts = r.ts || r.timestamp || "";
+        const timeStr = typeof ts === "string" ? ts.replace("T", " ").slice(0, 19) : "--";
+        const reason = r.reason || "--";
+        return "<tr><td class=\"mono\">" + escapeHtml(timeStr) + "</td><td>" + escapeHtml(r.symbol || "?") +
+            "</td><td>" + escapeHtml(r.side || "") + "</td><td>" + escapeHtml(r.filter_name || "--") +
+            "</td><td class=\"td-wrap\" title=\"" + escapeHtml(reason) + "\">" + escapeHtml(reason) +
+            "</td></tr>";
     }).join("");
 }
 
@@ -1919,6 +1994,9 @@ function updateDashboardCanonical(res) {
     }
     if (d.day_position_health && typeof d.day_position_health === "object") {
         updateDayHealth({ success: true, data: d.day_position_health });
+    }
+    if (Array.isArray(d.last_decisions)) {
+        updateDecisions({ success: true, decisions: d.last_decisions });
     }
 
     const lite = d.market_data_readiness_dashboard;
@@ -2366,6 +2444,7 @@ function updateLatency(data) {
 function updateRejects(data) {
     if (!data || typeof data !== "object") return;
     const list = Array.isArray(data.rejects) ? data.rejects : [];
+    renderRejectsTable(list, "day-rejects-tbody");
     const el = document.getElementById("panel-rejects-content");
     if (!el) return;
     if (list.length === 0) {
@@ -2381,18 +2460,24 @@ function updateRejects(data) {
 // portfolio-engine/decisions: { success, decisions: [...] }
 function updateDecisions(data) {
     if (!data || typeof data !== "object") return;
-    const list = Array.isArray(data.decisions) ? data.decisions : [];
+    const list = Array.isArray(data.decisions) ? data.decisions : (Array.isArray(data) ? data : []);
+    renderDecisionsTable(list, "cc-decisions-tbody");
+    renderDecisionsTable(list, "day-decisions-tbody");
     const el = document.getElementById("panel-decisions-content");
     if (!el) return;
     if (list.length === 0) {
         el.textContent = "No recent decisions.";
         return;
     }
-    const lines = list.slice(0, 10).map(function (d, i) {
+    const lines = list.slice(0, 12).map(function (d, i) {
         const sym = d.symbol || d.trade_id || "?";
-        const entry = d.regime || d.entry_reason || "";
+        const setup = d.setup_type || d.entry_thesis || "";
+        const why = d.why_selected || "";
         const exit = d.exit_type || d.exit_trigger || d.exit_reason || "";
-        return (i + 1) + ". " + sym + " " + (d.side || "") + " regime=" + entry + " exit=" + exit;
+        return (i + 1) + ". " + sym + " " + (d.side || "") +
+            (setup ? " setup=" + setup : "") +
+            (why ? " why=" + why : "") +
+            (exit ? " exit=" + exit : "");
     });
     el.textContent = lines.join("\n");
 }
@@ -2654,25 +2739,28 @@ function updatePositions(data) {
         const sleeve = pos.sleeve || "ACTIVE";
         const badgeCls = "sleeve-badge sleeve-badge--" + sleeve.toLowerCase();
         const tr = document.createElement("tr");
-        const stopTxt = pos.stop_price ? Number(pos.stop_price).toFixed(4) : "--";
-        const tp1Txt = pos.take_profit_1_price
-            ? Number(pos.take_profit_1_price).toFixed(4) + (pos.tp1_hit ? " ✓hit" : "")
-            : "--";
-        const tp2Txt = pos.take_profit_2_price ? Number(pos.take_profit_2_price).toFixed(4) : "--";
         const preview = pos.engine_exit_preview || {};
         const nextExit = preview.next_engine_exit && preview.next_engine_exit !== "none" ? preview.next_engine_exit : "--";
         const remainMin = preview.hold_remaining_min != null ? " (" + Number(preview.hold_remaining_min).toFixed(0) + "m left)" : "";
+        const setup = pos.setup || pos.setup_type || pos.entry_thesis || "--";
+        const whyBits = [pos.selection_key_used, pos.why_selected].filter(Boolean).join(" · ") || "--";
+        const hold = pos.hold_minutes != null ? Number(pos.hold_minutes).toFixed(0) + "m" : "--";
+        const netPct = pos.net_pnl_pct != null ? (Number(pos.net_pnl_pct) * 100).toFixed(2) + "%" : "--";
         tr.innerHTML =
-            "<td>" + (pos.symbol || "") + "</td>" +
-            "<td><span class='" + badgeCls + "'>" + sleeve + "</span></td>" +
+            "<td>" + escapeHtml(pos.symbol || "") + "</td>" +
+            "<td class='td-wrap' title='" + escapeHtml(setup) + "'>" + escapeHtml(setup) + "</td>" +
+            "<td><span class='" + badgeCls + "'>" + escapeHtml(sleeve) + "</span></td>" +
             "<td>" + (pos.quantity != null ? Number(pos.quantity).toFixed(6) : "") + "</td>" +
             "<td>" + (pos.average_price != null ? Number(pos.average_price).toFixed(4) : pos.entry_price != null ? Number(pos.entry_price).toFixed(4) : "") + "</td>" +
             "<td>" + (pos.current_price != null ? Number(pos.current_price).toFixed(4) : pos.average_price != null ? Number(pos.average_price).toFixed(4) : "") + "</td>" +
             "<td class='" + (pnl >= 0 ? "pnl-pos" : "pnl-neg") + "'>" + (pnl !== 0 ? pnl.toFixed(2) : "0.00") + "</td>" +
-            "<td class='mono'>" + stopTxt + "</td>" +
-            "<td class='mono'>" + tp1Txt + "</td>" +
-            "<td class='mono'>" + tp2Txt + "</td>" +
-            "<td class='mono' title='" + (nextExit !== "--" ? nextExit + remainMin : "") + "'>" + nextExit + remainMin + "</td>";
+            "<td>" + netPct + "</td>" +
+            "<td>" + fmtPctSigned(pos.mfe_pct) + "</td>" +
+            "<td>" + fmtPctSigned(pos.mae_pct) + "</td>" +
+            "<td>" + hold + "</td>" +
+            "<td class='td-wrap' title='" + escapeHtml(whyBits) + "'>" + escapeHtml(whyBits) + "</td>" +
+            "<td class='mono' title='" + escapeHtml(nextExit !== "--" ? nextExit + remainMin : "") + "'>" +
+            escapeHtml(nextExit) + remainMin + "</td>";
         tbody.appendChild(tr);
     });
 }
@@ -3161,15 +3249,23 @@ function updateTrades(data, timeFilter) {
         const sleeve = t.sleeve || "ACTIVE";
         const badgeCls = "sleeve-badge sleeve-badge--" + sleeve.toLowerCase();
         const tradeId = t.trade_id || t.id || "";
+        const setup = t.setup_type || t.entry_thesis || "--";
+        const exit = t.exit_reason || t.exit_type || "--";
+        const why = t.why_selected || "--";
         const tr = document.createElement("tr");
         tr.innerHTML =
-            "<td>" + timeStr + "</td>" +
-            "<td>" + (t.symbol || "") + "</td>" +
-            "<td><span class='" + badgeCls + "'>" + sleeve + "</span></td>" +
-            "<td>" + (t.side || "").toLowerCase() + "</td>" +
+            "<td>" + escapeHtml(timeStr) + "</td>" +
+            "<td>" + escapeHtml(t.symbol || "") + "</td>" +
+            "<td><span class='" + badgeCls + "'>" + escapeHtml(sleeve) + "</span></td>" +
+            "<td>" + escapeHtml((t.side || "").toLowerCase()) + "</td>" +
+            "<td class='td-wrap' title='" + escapeHtml(setup) + "'>" + escapeHtml(setup) + "</td>" +
             "<td>" + (t.quantity != null ? Number(t.quantity).toFixed(6) : "") + "</td>" +
             "<td>" + (t.price != null ? Number(t.price).toFixed(4) : t.fill_price != null ? Number(t.fill_price).toFixed(4) : "") + "</td>" +
             "<td class='" + pnlClass + "'>" + pnlStr + "</td>" +
+            "<td class='td-wrap' title='" + escapeHtml(exit) + "'>" + escapeHtml(exit) + "</td>" +
+            "<td>" + fmtPctSigned(t.mfe_pct) + "</td>" +
+            "<td>" + fmtPctSigned(t.mae_pct) + "</td>" +
+            "<td class='td-wrap' title='" + escapeHtml(why) + "'>" + escapeHtml(why) + "</td>" +
             "<td><button type='button' class='trade-drill-btn' data-trade-id='" + String(tradeId).replace(/'/g, "") + "'>View</button></td>";
         tbody.appendChild(tr);
         if (tradeId) {
@@ -3177,7 +3273,7 @@ function updateTrades(data, timeFilter) {
             detailTr.className = "trade-drill-row";
             detailTr.style.display = "none";
             const detailTd = document.createElement("td");
-            detailTd.colSpan = 8;
+            detailTd.colSpan = 13;
             const pre = document.createElement("pre");
             pre.className = "panel-pre trade-drill-pre";
             detailTd.appendChild(pre);

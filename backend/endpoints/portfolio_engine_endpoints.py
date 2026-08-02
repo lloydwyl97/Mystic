@@ -751,38 +751,6 @@ async def get_last_decisions(count: int = 10) -> dict[str, Any]:
         engine = get_portfolio_engine()
         decisions = engine.get_last_decisions(count)
 
-        if not decisions:
-            try:
-                from backend.database_schema import DATABASE_PATH
-
-                db_path = getattr(engine, "db_path", DATABASE_PATH)
-                with sqlite3.connect(db_path) as conn:
-                    conn.row_factory = sqlite3.Row
-                    cur = conn.execute(
-                        """
-                        SELECT symbol, side, quantity, price, timestamp
-                        FROM paper_trades
-                        WHERE status IN ('executed', 'filled')
-                        ORDER BY timestamp DESC
-                        LIMIT ?
-                        """,
-                        (count,),
-                    )
-                    rows = cur.fetchall()
-                for row in rows:
-                    decisions.append(
-                        {
-                            "symbol": row["symbol"] or "?",
-                            "side": (row["side"] or "").upper(),
-                            "regime": "",
-                            "entry_reason": f"qty={row['quantity']} @ {row['price']}" if row["quantity"] else "",
-                            "exit_type": "",
-                            "timestamp": row["timestamp"] or "",
-                        }
-                    )
-            except Exception as fallback_err:
-                logger.debug("decisions fallback from paper_trades failed: %s", fallback_err)
-
         return {
             "success": True,
             "decisions": decisions,

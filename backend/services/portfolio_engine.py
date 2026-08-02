@@ -15936,6 +15936,25 @@ class PortfolioEngine:
             coin_profile=profile,
             bundle=None,
         )
+        hi = float(pos.highest_price or ep or 0.0)
+        lo = float(getattr(pos, "lowest_price", 0.0) or 0.0)
+        mfe_pct = ((hi - ep) / ep) if ep > 0 and hi > 0 else None
+        mae_pct = ((lo - ep) / ep) if ep > 0 and lo > 0 else None
+        why_selected = ""
+        selection_key_used = ""
+        final_selection_score = None
+        winner_score = None
+        runner_up_score = None
+        setup_type = str(getattr(pos, "entry_thesis", "") or "")
+        tid = str(getattr(pos, "trade_id", "") or "")
+        if tid and tid in self.trade_explanations:
+            ex = self.trade_explanations[tid]
+            why_selected = str(getattr(ex, "why_selected", "") or "")
+            selection_key_used = str(getattr(ex, "selection_key_used", "") or "")
+            final_selection_score = float(getattr(ex, "final_selection_score", 0.0) or 0.0) or None
+            winner_score = float(getattr(ex, "winner_score", 0.0) or 0.0) or None
+            runner_up_score = float(getattr(ex, "runner_up_score", 0.0) or 0.0) or None
+            setup_type = str(getattr(ex, "setup_type", "") or getattr(ex, "entry_thesis", "") or setup_type)
         return {
             "symbol": symbol,
             "quantity": q,
@@ -15943,7 +15962,11 @@ class PortfolioEngine:
             "avg_entry_price": ep,
             "average_price": ep,
             "current_price": mark,
-            "highest_price": float(pos.highest_price or ep),
+            "highest_price": hi if hi > 0 else float(pos.highest_price or ep),
+            "lowest_price": lo if lo > 0 else None,
+            "mfe_pct": round(mfe_pct, 6) if mfe_pct is not None else None,
+            "mae_pct": round(mae_pct, 6) if mae_pct is not None else None,
+            "hold_minutes": round(hold_min, 2),
             "unrealized_pnl": u_pnl,
             "net_pnl_pct": round(net_pct, 6),
             "entry_time": pos.entry_time,
@@ -15955,6 +15978,12 @@ class PortfolioEngine:
             "legacy_pre_regime_router": legacy,
             "opened_under_router": opened_router,
             "entry_thesis": str(getattr(pos, "entry_thesis", "") or ""),
+            "setup_type": setup_type,
+            "why_selected": why_selected,
+            "selection_key_used": selection_key_used,
+            "final_selection_score": final_selection_score,
+            "winner_score": winner_score,
+            "runner_up_score": runner_up_score,
             "thesis_invalid_level": float(getattr(pos, "thesis_invalid_level", 0.0) or 0.0),
             "thesis_target_level": float(getattr(pos, "thesis_target_level", 0.0) or 0.0),
             "max_hold_min": int(getattr(pos, "max_hold_min", 0) or profile.get("max_hold_min") or 75),
@@ -15973,7 +16002,7 @@ class PortfolioEngine:
             "status": getattr(pos, "status", "ACTIVE"),
             "entry_strategy_id": str(getattr(pos, "entry_strategy_id", "") or "day") or "day",
             "strategy_id": str(getattr(pos, "entry_strategy_id", "") or "day") or "day",
-            "setup": str(getattr(pos, "entry_thesis", "") or ""),
+            "setup": setup_type or str(getattr(pos, "entry_thesis", "") or ""),
             "day_route_regime_at_entry": str(getattr(pos, "day_route_regime_at_entry", "") or ""),
             "price_structure_regime_at_entry": str(getattr(pos, "price_structure_regime_at_entry", "") or ""),
             "regime": str(getattr(pos, "day_route_regime_at_entry", None) or getattr(pos, "price_structure_regime_at_entry", None) or ""),
@@ -16192,15 +16221,72 @@ class PortfolioEngine:
         }
 
     def get_last_decisions(self, count: int = 10) -> list[dict[str, Any]]:
-        """Get last N decisions with full explainability"""
-        # Return most recent trade explanations
+        """Get last N decisions with full explainability (memory, else paper_trades)."""
         sorted_explains = sorted(
             self.trade_explanations.values(),
             key=lambda x: x.timestamp,
             reverse=True,
         )[:count]
+        if sorted_explains:
+            return [e.to_dict() for e in sorted_explains]
 
-        return [e.to_dict() for e in sorted_explains]
+        # Persist across restarts: pull compact decision fields from recent trades.
+        out: list[dict[str, Any]] = []
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT trade_id, symbol, side, quantity, price, pnl, timestamp,
+                           exit_reason, exit_type, explainability_json
+                    FROM paper_trades
+                    WHERE COALESCE(status, 'executed') IN ('executed', 'filled', '')
+                      AND COALESCE(exit_type, '') NOT IN (
+                          'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT'
+                      )
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (max(1, min(int(count), 100)),),
+                ).fetchall()
+            for row in rows:
+                ex: dict[str, Any] = {}
+                raw = row["explainability_json"]
+                if raw:
+                    with contextlib.suppress(Exception):
+                        parsed = json.loads(raw) if isinstance(raw, str) else raw
+                        if isinstance(parsed, dict):
+                            ex = parsed
+                out.append(
+                    {
+                        "trade_id": row["trade_id"],
+                        "symbol": row["symbol"] or "?",
+                        "side": (row["side"] or "").upper(),
+                        "quantity": row["quantity"],
+                        "price": row["price"],
+                        "pnl": row["pnl"],
+                        "timestamp": row["timestamp"] or "",
+                        "exit_reason": row["exit_reason"] or ex.get("exit_trigger") or "",
+                        "exit_type": row["exit_type"] or ex.get("exit_type") or "",
+                        "exit_trigger": ex.get("exit_trigger") or row["exit_reason"] or "",
+                        "regime": ex.get("day_route_regime") or ex.get("regime") or "",
+                        "setup_type": ex.get("setup_type") or ex.get("entry_thesis") or "",
+                        "entry_thesis": ex.get("entry_thesis") or ex.get("setup_type") or "",
+                        "why_selected": ex.get("why_selected") or "",
+                        "selection_key_used": ex.get("selection_key_used") or "",
+                        "final_selection_score": ex.get("final_selection_score"),
+                        "winner_score": ex.get("winner_score"),
+                        "runner_up_score": ex.get("runner_up_score"),
+                        "mfe_pct": ex.get("mfe_pct"),
+                        "mae_pct": ex.get("mae_pct"),
+                        "entry_reason": (
+                            f"qty={row['quantity']} @ {row['price']}" if row["quantity"] is not None else ""
+                        ),
+                    }
+                )
+        except Exception:
+            logger.debug("get_last_decisions paper_trades fallback failed", exc_info=True)
+        return out
 
     # =========================================================================
     # PHASE 10: INVARIANT VALIDATION
@@ -19193,6 +19279,52 @@ class PortfolioEngine:
             )
             positions_rows.append(row)
 
+        # After restart, trade_explanations may be empty — fill selection audit from BUY rows.
+        missing_tids = [
+            str(r.get("trade_id") or "")
+            for r in positions_rows
+            if r.get("trade_id") and not r.get("why_selected") and not r.get("selection_key_used")
+        ]
+        if missing_tids:
+            try:
+                with sqlite3.connect(self.db_path) as _conn:
+                    qmarks = ",".join("?" for _ in missing_tids)
+                    buy_rows = _conn.execute(
+                        f"""
+                        SELECT trade_id, explainability_json
+                        FROM paper_trades
+                        WHERE trade_id IN ({qmarks}) AND UPPER(side) = 'BUY'
+                        """,
+                        missing_tids,
+                    ).fetchall()
+                by_tid: dict[str, dict[str, Any]] = {}
+                for tid, raw in buy_rows:
+                    if not raw:
+                        continue
+                    with contextlib.suppress(Exception):
+                        parsed = json.loads(raw) if isinstance(raw, str) else raw
+                        if isinstance(parsed, dict):
+                            by_tid[str(tid)] = parsed
+                for r in positions_rows:
+                    tid = str(r.get("trade_id") or "")
+                    ex = by_tid.get(tid)
+                    if not ex:
+                        continue
+                    r["why_selected"] = str(ex.get("why_selected") or "")
+                    r["selection_key_used"] = str(ex.get("selection_key_used") or "")
+                    if ex.get("final_selection_score") is not None:
+                        r["final_selection_score"] = ex.get("final_selection_score")
+                    if ex.get("winner_score") is not None:
+                        r["winner_score"] = ex.get("winner_score")
+                    if ex.get("runner_up_score") is not None:
+                        r["runner_up_score"] = ex.get("runner_up_score")
+                    setup = str(ex.get("setup_type") or ex.get("entry_thesis") or "")
+                    if setup:
+                        r["setup_type"] = setup
+                        r["setup"] = setup
+            except Exception:
+                logger.debug("dashboard open-position explain enrich failed", exc_info=True)
+
         n_open = len(positions_rows)
         rows_u = sum(float(p["unrealized_pnl"]) for p in positions_rows)
         if n_open > 0 and abs(rows_u - self._unrealized_pnl) > 0.05 + 0.001 * n_open:
@@ -19256,10 +19388,14 @@ class PortfolioEngine:
                 sleeve_sql = "COALESCE(sleeve, 'ACTIVE')" if "sleeve" in cols else "'ACTIVE'"
                 trade_id_sql = "trade_id" if "trade_id" in cols else "NULL"
                 id_sql = "id" if "id" in cols else "NULL"
+                exit_reason_sql = "exit_reason" if "exit_reason" in cols else "NULL"
+                exit_type_sql = "exit_type" if "exit_type" in cols else "NULL"
+                expl_sql = "explainability_json" if "explainability_json" in cols else "NULL"
                 admin_filter = "COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT') AND COALESCE(is_synthetic, 0) = 0"
                 cur.execute(
                     f"""
-                    SELECT {id_sql}, {trade_id_sql}, symbol, side, quantity, price, pnl, timestamp, {sleeve_sql}
+                    SELECT {id_sql}, {trade_id_sql}, symbol, side, quantity, price, pnl, timestamp, {sleeve_sql},
+                           {exit_reason_sql}, {exit_type_sql}, {expl_sql}
                     FROM paper_trades
                     WHERE {admin_filter}
                     ORDER BY id DESC
@@ -19294,6 +19430,13 @@ class PortfolioEngine:
         for r in trade_rows:
             row_id = r[0]
             trade_id_val = r[1]
+            ex: dict[str, Any] = {}
+            raw_ex = r[11] if len(r) > 11 else None
+            if raw_ex:
+                with contextlib.suppress(Exception):
+                    parsed = json.loads(raw_ex) if isinstance(raw_ex, str) else raw_ex
+                    if isinstance(parsed, dict):
+                        ex = parsed
             trades_data.append(
                 {
                     "id": row_id,
@@ -19305,6 +19448,16 @@ class PortfolioEngine:
                     "pnl": float(r[6]) if r[6] is not None else None,
                     "timestamp": r[7],
                     "sleeve": r[8] if len(r) > 8 else Sleeve.ACTIVE.value,
+                    "exit_reason": (r[9] if len(r) > 9 else None) or ex.get("exit_trigger") or "",
+                    "exit_type": (r[10] if len(r) > 10 else None) or ex.get("exit_type") or "",
+                    "setup_type": ex.get("setup_type") or ex.get("entry_thesis") or "",
+                    "entry_thesis": ex.get("entry_thesis") or ex.get("setup_type") or "",
+                    "why_selected": ex.get("why_selected") or "",
+                    "selection_key_used": ex.get("selection_key_used") or "",
+                    "final_selection_score": ex.get("final_selection_score"),
+                    "mfe_pct": ex.get("mfe_pct"),
+                    "mae_pct": ex.get("mae_pct"),
+                    "day_route_regime": ex.get("day_route_regime") or ex.get("regime") or "",
                 }
             )
 
@@ -19399,6 +19552,8 @@ class PortfolioEngine:
         except Exception:
             day_position_health = None
 
+        last_decisions = self.get_last_decisions(12)
+
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "consistency_ok": len(violations) == 0,
@@ -19418,6 +19573,7 @@ class PortfolioEngine:
             "operator": operator,
             "invariants": inv,
             "day_position_health": day_position_health,
+            "last_decisions": last_decisions,
         }
 
     async def get_snapshot(self) -> dict[str, Any]:

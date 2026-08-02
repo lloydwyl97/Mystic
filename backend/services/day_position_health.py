@@ -299,6 +299,14 @@ def build_portfolio_health(
             mark=mark,
             signals=signals,
         )
+        ep = float(getattr(pos, "entry_price", 0) or 0)
+        hi = float(getattr(pos, "highest_price", 0) or 0)
+        lo = float(getattr(pos, "lowest_price", 0) or 0)
+        ph["setup"] = str(getattr(pos, "entry_thesis", "") or "")
+        ph["setup_type"] = ph["setup"]
+        ph["hold_minutes"] = round(max(0.0, (time.time() - float(getattr(pos, "entry_time", 0) or time.time())) / 60.0), 2)
+        ph["mfe_pct"] = round((hi - ep) / ep, 6) if ep > 0 and hi > 0 else None
+        ph["mae_pct"] = round((lo - ep) / ep, 6) if ep > 0 and lo > 0 else None
         positions_health.append(ph)
         if ph.get("trapped"):
             trapped_days = max(trapped_days, float(ph.get("hold_days") or 0))
