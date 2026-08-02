@@ -51,11 +51,11 @@ class ScalpEconomics:
             impact_cap_pct=float(os.getenv("SCALP_IMPACT_CAP_PCT", "0.0005")),
             min_net_edge_pct=float(os.getenv("SCALP_MIN_NET_EDGE_PCT", "0.0015")),
             net_profit_target_pct=float(os.getenv("SCALP_NET_PROFIT_TARGET_PCT", "0.0025")),
-            # Default 0.0005 (was 0.001): keep net_profit_target high; trim only
-            # the entry padding wall that stacked with costs to block reachable setups.
-            entry_edge_buffer_pct=float(os.getenv("SCALP_ENTRY_EDGE_BUFFER_PCT", "0.0005")),
+            # Trim entry padding so TARGET_NOT_REACHABLE does not starve genuine
+            # passes; NET_PROFIT_TARGET stays the exit economic floor.
+            entry_edge_buffer_pct=float(os.getenv("SCALP_ENTRY_EDGE_BUFFER_PCT", "0.00025")),
             entry_required_gross_edge_pct_env=_optional_float("SCALP_ENTRY_REQUIRED_GROSS_EDGE_PCT"),
-            min_projected_surplus_pct=float(os.getenv("SCALP_MIN_PROJECTED_SURPLUS_PCT", "0.0003")),
+            min_projected_surplus_pct=float(os.getenv("SCALP_MIN_PROJECTED_SURPLUS_PCT", "0.00015")),
             stale_scalp_timeout_sec=int(os.getenv("SCALP_STALE_TIMEOUT_SEC", "300")),
             fee_model_verified=_bool("SCALP_FEE_MODEL_VERIFIED", False),
             use_maker_only=_bool("SCALP_USE_MAKER_ONLY", False),

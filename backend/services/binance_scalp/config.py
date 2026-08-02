@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
@@ -43,6 +44,7 @@ class ScalpConfig:
     scalp_live_armed: bool
     scalp_live_max_notional: float
     scalp_live_max_open: int
+    symbol_notional_caps: dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> ScalpConfig:
@@ -53,6 +55,22 @@ class ScalpConfig:
             "DATABASE_PATH",
             os.path.join(_REPO_ROOT, "mystic_trading.db"),
         )
+        symbol_caps: dict[str, float] = {}
+        raw_caps = (os.getenv("SCALP_SYMBOL_NOTIONAL_CAPS_JSON") or "").strip()
+        if raw_caps:
+            try:
+                parsed = json.loads(raw_caps)
+                if isinstance(parsed, dict):
+                    for k, v in parsed.items():
+                        sym = str(k or "").strip().upper().replace("/", "")
+                        try:
+                            cap = float(v)
+                        except (TypeError, ValueError):
+                            continue
+                        if sym and cap > 0:
+                            symbol_caps[sym] = cap
+            except Exception:
+                symbol_caps = {}
         return cls(
             repo_root=_REPO_ROOT,
             database_path=db,
@@ -94,7 +112,16 @@ class ScalpConfig:
             scalp_live_armed=_bool("SCALP_LIVE_ARMED", False),
             scalp_live_max_notional=float(os.getenv("SCALP_LIVE_MAX_NOTIONAL", "50.0")),
             scalp_live_max_open=int(os.getenv("SCALP_LIVE_MAX_OPEN", "2")),
+            symbol_notional_caps=symbol_caps,
         )
+
+    def notional_cap_for_symbol(self, symbol: str) -> float:
+        """Global paper notional capped by optional per-symbol override."""
+        sym = (symbol or "").strip().upper().replace("/", "")
+        per = float(self.symbol_notional_caps.get(sym) or 0.0)
+        if per > 0:
+            return min(float(self.max_notional_paper), per)
+        return float(self.max_notional_paper)
 
     def assert_no_live_trading(self) -> None:
         """Hard block: raises if live trading attempted without proper arming.

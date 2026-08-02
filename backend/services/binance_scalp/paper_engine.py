@@ -751,7 +751,8 @@ class BinanceScalpPaperEngine:
         ledger = self._ledger(conn)
         reserved_n = sum(float((r or {}).get("notional") or 0.0) for r in self._entry_reservations.values())
         free_cash = float(ledger["cash_balance"]) - reserved_n
-        notional = min(self.config.max_notional_paper, free_cash)
+        # Per-symbol caps (e.g. SOLUSDT:50) cut concentration without blocking samples.
+        notional = min(self.config.notional_cap_for_symbol(sym), free_cash)
         if notional < 1.0:
             self._record_reject(conn, sym, "BUY", "INSUFFICIENT_CASH", f"cash={ledger['cash_balance']} reserved={reserved_n}")
             return

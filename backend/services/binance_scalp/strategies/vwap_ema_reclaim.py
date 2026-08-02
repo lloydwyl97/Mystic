@@ -57,32 +57,40 @@ class VwapEmaReclaimStrategy:
         prior_low = min(b["low"] for b in bars[-5:])
         higher_low = bars[-1]["low"] > prior_low
 
-        reclaimed_vwap = cur >= vwap * 0.9998
-        ema_reclaim = ema_fast >= ema_slow * 0.9995
+        # Slightly tighter reclaim bands — paper soft reclaim was producing
+        # max-hold losers without a real reclaim impulse.
+        reclaimed_vwap = cur >= vwap * 0.9999
+        ema_reclaim = ema_fast >= ema_slow * 0.9997
         if not (reclaimed_vwap and ema_reclaim):
             return reject_signal(ctx, self.name, "NO_VWAP_EMA_RECLAIM")
 
         mom = ctx.mom
-        if ctx.config.scalp_paper_enabled:
-            mom_ok = mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0
-        else:
-            mom_ok = mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0 and mom.momentum_confirmed and higher_low
+        # Require higher_low + 60s mid lift in paper too (was paper-loosened).
+        mom_ok = (
+            mom.bid_change_15s > 0
+            and mom.mid_change_15s > 0
+            and mom.mid_change_30s > 0
+            and mom.mid_change_60s > 0
+            and higher_low
+        )
+        if not ctx.config.scalp_paper_enabled:
+            mom_ok = mom_ok and mom.momentum_confirmed
         if not mom_ok:
             return reject_signal(ctx, self.name, "NO_PULLBACK_RECOVERY")
 
         structural = (vwap - prior_low) / cur if cur > 0 else 0.001
-        structural = max(structural, 0.001)
-        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.60, cap_pct=0.006)
+        structural = max(structural, 0.0012)
+        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.70, cap_pct=0.006)
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
 
-        score = 2.5 + (cur - vwap) / vwap * 500 + (ema_fast - ema_slow) / ema_slow * 300
+        score = 2.35 + (cur - vwap) / vwap * 450 + (ema_fast - ema_slow) / ema_slow * 280
         return pass_signal(
             ctx,
             self.name,
             score=score,
-            confidence=0.65,
+            confidence=0.62,
             entry_reason=f"vwap_reclaim vwap={vwap:.4f} ema_fast>{ema_slow:.4f}",
             invalidation_reason="lost_vwap_or_ema_with_no_recovery",
             expected_move_pct=expected,

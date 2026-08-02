@@ -58,9 +58,10 @@ def _meaningful_recovery(recovery: float, max_fav: float, econ: ScalpEconomics) 
 def _scratch_min_hold_sec(setup_name: str | None = None) -> int:
     base = int(os.getenv("SCALP_SCRATCH_MIN_HOLD_SEC", "180"))
     name = (setup_name or "").strip().lower()
-    # range_bounce winners need longer to develop; early scratch was the loss driver.
+    # Range bounce gets a slightly longer floor, but must still scratch before
+    # MAX_HOLD (post soft-rank paper: delayed range scratch → max-hold bleed).
     if name == "range_bounce_scalp":
-        return int(os.getenv("SCALP_RANGE_SCRATCH_MIN_HOLD_SEC", str(max(base, 600))))
+        return int(os.getenv("SCALP_RANGE_SCRATCH_MIN_HOLD_SEC", str(max(base, 300))))
     return base
 
 
@@ -70,7 +71,8 @@ def _scratch_flat_upper_pct() -> float:
 
 
 def _scratch_progress_frac() -> float:
-    return float(os.getenv("SCALP_SCRATCH_PROGRESS_FRAC", "0.35"))
+    # Higher = require more MFE toward target before treating a hold as "progress".
+    return float(os.getenv("SCALP_SCRATCH_PROGRESS_FRAC", "0.40"))
 
 
 def _scratch_deep_loss_pct() -> float:
@@ -86,7 +88,8 @@ def _scratch_min_reviews(setup_name: str | None = None) -> int:
 
 
 def _stall_exit_hold_frac() -> float:
-    return float(os.getenv("SCALP_STALL_EXIT_HOLD_FRAC", "0.75"))
+    # Default 50% of hard max-hold so stalled paper scalps exit ~10m, not 15–20m.
+    return float(os.getenv("SCALP_STALL_EXIT_HOLD_FRAC", "0.50"))
 
 
 def _stall_exit_min_sec(hard: int) -> int:

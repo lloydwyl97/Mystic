@@ -83,16 +83,15 @@ class RangeBounceScalpStrategy:
         # that sits at/below net_profit_target and always fails reachability.
         to_high = (hi - cur) / cur if cur > 0 else 0.0
         structural = max(to_high, recovery + 0.0008)
-        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.55, cap_pct=0.006)
+        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.65, cap_pct=0.006)
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
             return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
 
-        # Weights rescaled for [0, 1] wick fraction (old formula used ~0.001–0.005
-        # close-above-low ratios with *500 / *200 multipliers). Target similar
-        # contribution magnitude: ~0.5–1.5 score points for a typical bounce wick.
-        score = 2.5 + wick_rejection * 1.5 + recovery * 400
-        confidence = min(0.72, 0.55 + wick_rejection * 0.25)
+        # Deweight vs other setups (paper: range bounce net-negative vs peers).
+        # Still entry-eligible when sig.passed — lower rank only.
+        score = (2.15 + wick_rejection * 1.2 + recovery * 320) * 0.88
+        confidence = min(0.68, 0.52 + wick_rejection * 0.22)
         return pass_signal(
             ctx,
             self.name,
