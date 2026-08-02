@@ -15961,6 +15961,62 @@ class PortfolioEngine:
             "trail_pct": float(getattr(pos, "trail_pct", 0.0) or 0.0),
         }
 
+    def enrich_open_position_rows_from_buy_explain(self, positions_rows: list[dict[str, Any]]) -> None:
+        """Fill empty why_selected / selection audit from paper_trades BUY explainability_json.
+
+        Needed after restart (trade_explanations memory empty) and for multi-buy extras
+        that were stamped in SQLite but not on the in-memory Position object.
+        """
+        missing_tids = [
+            str(r.get("trade_id") or "")
+            for r in positions_rows
+            if r.get("trade_id") and not str(r.get("why_selected") or "").strip()
+        ]
+        if not missing_tids:
+            return
+        try:
+            with sqlite3.connect(self.db_path) as _conn:
+                qmarks = ",".join("?" for _ in missing_tids)
+                buy_rows = _conn.execute(
+                    f"""
+                    SELECT trade_id, explainability_json
+                    FROM paper_trades
+                    WHERE trade_id IN ({qmarks}) AND UPPER(side) = 'BUY'
+                    """,
+                    missing_tids,
+                ).fetchall()
+            by_tid: dict[str, dict[str, Any]] = {}
+            for tid, raw in buy_rows:
+                if not raw:
+                    continue
+                with contextlib.suppress(Exception):
+                    parsed = json.loads(raw) if isinstance(raw, str) else raw
+                    if isinstance(parsed, dict):
+                        by_tid[str(tid)] = parsed
+            for r in positions_rows:
+                tid = str(r.get("trade_id") or "")
+                ex = by_tid.get(tid)
+                if not ex:
+                    continue
+                why = str(ex.get("why_selected") or ex.get("arbiter_winner_reason") or "")
+                if why:
+                    r["why_selected"] = why
+                key = str(ex.get("selection_key_used") or "")
+                if key:
+                    r["selection_key_used"] = key
+                if ex.get("final_selection_score") is not None:
+                    r["final_selection_score"] = ex.get("final_selection_score")
+                if ex.get("winner_score") is not None:
+                    r["winner_score"] = ex.get("winner_score")
+                if ex.get("runner_up_score") is not None:
+                    r["runner_up_score"] = ex.get("runner_up_score")
+                setup = str(ex.get("setup_type") or ex.get("entry_thesis") or "")
+                if setup:
+                    r["setup_type"] = setup
+                    r["setup"] = setup
+        except Exception:
+            logger.debug("open-position explain enrich failed", exc_info=True)
+
     def get_portfolio_status(self) -> dict[str, Any]:
         """
         Get full portfolio status for observability.
@@ -15983,6 +16039,7 @@ class PortfolioEngine:
             if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
                 continue
             positions_list.append(self.build_open_position_api_row(symbol, pos))
+        self.enrich_open_position_rows_from_buy_explain(positions_list)
 
         # Account equity: cash + MTM positions (matches engine._total_equity / persisted ledger row)
         account_equity = self._total_equity
@@ -19226,50 +19283,7 @@ class PortfolioEngine:
             positions_rows.append(row)
 
         # After restart / multi-buy gaps — fill selection audit from BUY rows whenever why is empty.
-        missing_tids = [str(r.get("trade_id") or "") for r in positions_rows if r.get("trade_id") and not str(r.get("why_selected") or "").strip()]
-        if missing_tids:
-            try:
-                with sqlite3.connect(self.db_path) as _conn:
-                    qmarks = ",".join("?" for _ in missing_tids)
-                    buy_rows = _conn.execute(
-                        f"""
-                        SELECT trade_id, explainability_json
-                        FROM paper_trades
-                        WHERE trade_id IN ({qmarks}) AND UPPER(side) = 'BUY'
-                        """,
-                        missing_tids,
-                    ).fetchall()
-                by_tid: dict[str, dict[str, Any]] = {}
-                for tid, raw in buy_rows:
-                    if not raw:
-                        continue
-                    with contextlib.suppress(Exception):
-                        parsed = json.loads(raw) if isinstance(raw, str) else raw
-                        if isinstance(parsed, dict):
-                            by_tid[str(tid)] = parsed
-                for r in positions_rows:
-                    tid = str(r.get("trade_id") or "")
-                    ex = by_tid.get(tid)
-                    if not ex:
-                        continue
-                    why = str(ex.get("why_selected") or ex.get("arbiter_winner_reason") or "")
-                    if why:
-                        r["why_selected"] = why
-                    key = str(ex.get("selection_key_used") or "")
-                    if key:
-                        r["selection_key_used"] = key
-                    if ex.get("final_selection_score") is not None:
-                        r["final_selection_score"] = ex.get("final_selection_score")
-                    if ex.get("winner_score") is not None:
-                        r["winner_score"] = ex.get("winner_score")
-                    if ex.get("runner_up_score") is not None:
-                        r["runner_up_score"] = ex.get("runner_up_score")
-                    setup = str(ex.get("setup_type") or ex.get("entry_thesis") or "")
-                    if setup:
-                        r["setup_type"] = setup
-                        r["setup"] = setup
-            except Exception:
-                logger.debug("dashboard open-position explain enrich failed", exc_info=True)
+        self.enrich_open_position_rows_from_buy_explain(positions_rows)
 
         n_open = len(positions_rows)
         rows_u = sum(float(p["unrealized_pnl"]) for p in positions_rows)

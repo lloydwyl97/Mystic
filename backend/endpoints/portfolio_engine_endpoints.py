@@ -654,6 +654,7 @@ async def get_open_positions() -> dict[str, Any]:
             if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
                 continue
             positions.append(engine.build_open_position_api_row(symbol, pos))
+        engine.enrich_open_position_rows_from_buy_explain(positions)
 
         return {
             "success": True,
