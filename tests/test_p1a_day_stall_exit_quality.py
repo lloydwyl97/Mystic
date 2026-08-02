@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from backend.config.trading_economics import MIN_NET_PROFIT_TO_SELL
@@ -16,6 +18,24 @@ from backend.services.day_controlled_exits import (
     evaluate_engine_managed_exit,
     evaluate_stall_exit,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CORE_ONLY_LOCAL_ENV = REPO_ROOT / "deploy" / "core_only_local.env"
+
+
+def test_core_only_local_env_stall_adverse_floor_not_below_p1a():
+    """deploy/core_only_local.env is sourced after .env and must not disable the MAE floor."""
+    text = CORE_ONLY_LOCAL_ENV.read_text(encoding="utf-8")
+    value = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("DAY_STALL_MIN_ADVERSE_PCT="):
+            value = float(line.split("=", 1)[1].strip().strip('"').strip("'"))
+            break
+    assert value is not None, "DAY_STALL_MIN_ADVERSE_PCT must be set explicitly in core_only_local.env"
+    assert value >= 0.0025, f"DAY_STALL_MIN_ADVERSE_PCT={value} disables P1A MAE floor (need >= 0.0025)"
 
 
 @pytest.fixture(autouse=True)
