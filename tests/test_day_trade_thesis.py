@@ -153,9 +153,23 @@ def test_profit_near_target_triggers_net_profit_exit():
     assert eval_tp["reason"] == "NET_PROFIT_EXIT"
 
 
-def test_no_clear_thesis_ranks_poorly_and_sizes_tiny():
+def test_no_clear_thesis_ranks_poorly_and_sizes_tiny(monkeypatch):
+    # Live Redis feature/klines VWAP must not pollute unit classification.
+    monkeypatch.setattr(
+        "backend.config.redis_config.get_redis_client",
+        lambda: None,
+    )
     dd = classify_buy_thesis(
-        {"ema_alignment": 0.51, "adx": 14, "rsi": 50, "bb_position": 0.5, "price_momentum": 0.0},
+        {
+            "ema_alignment": 0.51,
+            "adx": 14,
+            "rsi": 50,
+            "bb_position": 0.5,
+            "price_momentum": 0.0,
+            "vwap": 0.0,
+            "relative_volume": 0.0,
+            "volume_ratio": 0.0,
+        },
         symbol="XRP/USDT",
         current_price=1.0,
         atr=0.01,

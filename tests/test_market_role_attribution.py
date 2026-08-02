@@ -312,7 +312,8 @@ def test_btc_self_comparison() -> None:
         ts = ts_base + i * 3600_000
         btc_rows.append([ts, price * 0.999, price * 1.001, price * 0.998, price, 1000.0])
 
-    ctx = asyncio.get_event_loop().run_until_complete(
+    # Python 3.12+: no default loop on MainThread; asyncio.run is suite-safe.
+    ctx = asyncio.run(
         compute_market_role_context(
             "BTCUSDT",
             btc_rows_1h=btc_rows,
