@@ -14290,23 +14290,51 @@ class PortfolioEngine:
                 pass
 
         def _ml_rank_key(c):
+            """Score-primary peer ranking. Open-position is only a final tie-break.
+
+            Already-open symbols are filtered from execution later (one position per
+            symbol). They must not be demoted before final_selection_score, or a
+            weaker unheld peer can win with a false score-victory reason.
+            """
             d = c.decision_data or {}
             try:
                 bm = float(d.get("buy_margin") or d.get("redis_buy_margin_key") or 0.0)
             except Exception:
                 bm = 0.0
+            try:
+                nev = float(
+                    d.get("selected_net_expected_value")
+                    or d.get("adjusted_ev")
+                    or d.get("raw_ev")
+                    or 0.0
+                )
+            except Exception:
+                nev = 0.0
+            try:
+                conf = float(getattr(c, "confidence", None) or d.get("ai_confidence") or 0.0)
+            except Exception:
+                conf = 0.0
+            try:
+                ts = float(d.get("signal_timestamp") or d.get("bar_timestamp") or getattr(c, "bar_timestamp", 0) or 0.0)
+            except Exception:
+                ts = 0.0
             return (
-                c.symbol in self.open_positions,
                 -float(d.get("final_selection_score") or d.get("selection_score") or 0.0),
-                -bm,  # ML rank preference among AW-passed
+                -nev,
                 -float(d.get("outcome_adjusted_rank_score") or c.rank_score()),
+                -bm,
+                -conf,
+                -ts,  # fresher / later bar wins equal ties
+                # Prefer non-open only when all score/NEV/rank/margin/conf/ts ties.
+                c.symbol in self.open_positions,
+                str(c.symbol or ""),
             )
 
         valid_candidates.sort(key=_ml_rank_key)
 
         from backend.services.symbol_setup_outcome_penalty import assign_v3_selection_ranks
 
-        assign_v3_selection_ranks(valid_candidates)
+        assign_v3_selection_ranks(valid_candidates, open_symbols=set(self.open_positions.keys()))
 
         unique_symbols = {c.symbol for c in valid_candidates}
         logger.info("BAR_CANDIDATES: %d unique symbols from %d valid candidates", len(unique_symbols), len(valid_candidates))
@@ -14552,6 +14580,19 @@ class PortfolioEngine:
                     _buy_budget,
                     _slots_left,
                 )
+        # Re-stamp truthful why_selected on the executable winner. Score-ordered
+        # #1 may be an already-open peer that was skipped for capacity — never
+        # claim a false final_selection_score victory for the unheld runner-up.
+        try:
+            from backend.services.symbol_setup_outcome_penalty import assign_v3_selection_ranks
+
+            assign_v3_selection_ranks(
+                valid_candidates,
+                open_symbols=set(self.open_positions.keys()),
+                selected=top_candidate,
+            )
+        except Exception as _why_err:
+            logger.warning("truthful why_selected stamp failed: %s", _why_err)
         top_meta: dict[str, Any] = {}
         cycle_leaderboard: list[dict[str, Any]] = []
         for _idx, _cand in enumerate(valid_candidates):

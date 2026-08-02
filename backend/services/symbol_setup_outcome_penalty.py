@@ -813,28 +813,178 @@ def compute_final_selection_score(
     return round(score, 8)
 
 
-def assign_v3_selection_ranks(candidates: list[Any]) -> None:
-    """After sort by final_selection_score, stamp rank / peer / why on each candidate."""
+def _candidate_final_selection_score(cand: Any) -> float:
+    dd = dict(getattr(cand, "decision_data", None) or {})
+    try:
+        return float(dd.get("final_selection_score") or dd.get("selection_score") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _candidate_nev(cand: Any) -> float:
+    dd = dict(getattr(cand, "decision_data", None) or {})
+    for key in ("selected_net_expected_value", "adjusted_ev", "raw_ev", "net_expected_value"):
+        if dd.get(key) not in (None, ""):
+            try:
+                return float(dd[key])
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def _candidate_rank_score(cand: Any) -> float:
+    dd = dict(getattr(cand, "decision_data", None) or {})
+    try:
+        if dd.get("rank_score") not in (None, ""):
+            return float(dd["rank_score"])
+    except (TypeError, ValueError):
+        pass
+    rank_fn = getattr(cand, "rank_score", None)
+    if callable(rank_fn):
+        try:
+            return float(rank_fn())
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def _score_eps() -> float:
+    return 1e-9
+
+
+def build_truthful_selection_reason(
+    selected: Any,
+    ordered_candidates: list[Any],
+    *,
+    open_symbols: set[str] | frozenset[str] | None = None,
+) -> dict[str, Any]:
+    """Build honest why_selected / structured audit fields for the executable winner.
+
+    ``ordered_candidates`` must already be sorted by the primary ranking key
+    (final_selection_score descending). Open/capacity unavailability is reported
+    explicitly — never as a false score victory.
+    """
+    open_symbols = set(open_symbols or ())
+    sel_sym = str(getattr(selected, "symbol", "") or "")
+    win_score = _candidate_final_selection_score(selected)
+    win_nev = _candidate_nev(selected)
+    win_rank = _candidate_rank_score(selected)
+
+    higher_skipped: list[dict[str, Any]] = []
+    score_peers: list[Any] = []
+    for cand in ordered_candidates:
+        sym = str(getattr(cand, "symbol", "") or "")
+        if not sym or sym == sel_sym:
+            continue
+        score_peers.append(cand)
+        c_score = _candidate_final_selection_score(cand)
+        if c_score > win_score + _score_eps():
+            reason = "same_symbol_already_open" if sym in open_symbols else "unavailable"
+            higher_skipped.append(
+                {
+                    "symbol": sym,
+                    "final_selection_score": round(c_score, 8),
+                    "selected_net_expected_value": round(_candidate_nev(cand), 8),
+                    "skipped_reason": reason,
+                }
+            )
+
+    runner = None
+    if higher_skipped:
+        # Best unavailable peer is the score leader we could not execute.
+        runner = higher_skipped[0]
+        selection_key = (
+            "open_symbol_skipped_capacity"
+            if runner["skipped_reason"] == "same_symbol_already_open"
+            else "best_available_after_skip"
+        )
+        why = (
+            f"{selection_key}: selected {sel_sym} final_selection_score={win_score:.6f}; "
+            f"higher_score {runner['symbol']}={runner['final_selection_score']:.6f} "
+            f"skipped ({runner['skipped_reason']})"
+        )
+        skipped_reason = runner["skipped_reason"]
+        runner_up_symbol = str(runner["symbol"])
+        runner_up_score = float(runner["final_selection_score"])
+    elif score_peers:
+        peer = score_peers[0]
+        peer_sym = str(getattr(peer, "symbol", "") or "")
+        peer_score = _candidate_final_selection_score(peer)
+        peer_nev = _candidate_nev(peer)
+        peer_rank = _candidate_rank_score(peer)
+        runner_up_symbol = peer_sym
+        runner_up_score = peer_score
+        skipped_reason = ""
+        if win_score > peer_score + _score_eps():
+            selection_key = "highest_final_selection_score"
+            why = f"highest_final_selection_score: {sel_sym} {win_score:.6f} > {peer_sym} {peer_score:.6f}"
+        elif abs(win_score - peer_score) <= _score_eps() and win_nev > peer_nev + _score_eps():
+            selection_key = "higher_nev_tiebreak"
+            why = f"higher_nev_tiebreak: {sel_sym} nev={win_nev:.6f} > {peer_sym} nev={peer_nev:.6f}"
+        elif abs(win_score - peer_score) <= _score_eps() and abs(win_nev - peer_nev) <= _score_eps() and win_rank > peer_rank + _score_eps():
+            selection_key = "higher_rank_score_tiebreak"
+            why = f"higher_rank_score_tiebreak: {sel_sym} rank={win_rank:.6f} > {peer_sym} rank={peer_rank:.6f}"
+        elif abs(win_score - peer_score) <= _score_eps():
+            selection_key = "deterministic_tiebreak"
+            why = f"deterministic_tiebreak: {sel_sym} vs {peer_sym} equal_final_selection_score={win_score:.6f}"
+        else:
+            # Selected has materially lower score without an explained skip — do not lie.
+            selection_key = "best_available_after_skip"
+            skipped_reason = "unexplained_lower_score_selection"
+            why = (
+                f"best_available_after_skip: selected {sel_sym} final_selection_score={win_score:.6f}; "
+                f"peer {peer_sym}={peer_score:.6f} not selected"
+            )
+    else:
+        selection_key = "solo_candidate_no_peer"
+        why = "solo_candidate_no_peer"
+        runner_up_symbol = ""
+        runner_up_score = 0.0
+        skipped_reason = ""
+
+    return {
+        "why_selected": why,
+        "selection_key_used": selection_key,
+        "winner_symbol": sel_sym,
+        "winner_score": round(win_score, 8),
+        "runner_up_symbol": runner_up_symbol,
+        "runner_up_score": round(float(runner_up_score or 0.0), 8),
+        "skipped_reason": skipped_reason,
+        "higher_score_skipped": higher_skipped,
+        "best_rejected_peer": runner_up_symbol,
+        "selected_over_symbol": runner_up_symbol,
+        "selected_over_score": round(float(runner_up_score or 0.0), 8),
+    }
+
+
+def assign_v3_selection_ranks(
+    candidates: list[Any],
+    *,
+    open_symbols: set[str] | frozenset[str] | None = None,
+    selected: Any | None = None,
+) -> None:
+    """Stamp rank / peer / truthful why on candidates after score-primary sort.
+
+    If ``selected`` is provided (executable winner after open/capacity filter),
+    stamp why_selected on that candidate. Otherwise stamp on score leader (#1).
+    """
+    open_symbols = set(open_symbols or ())
     for i, cand in enumerate(candidates):
         dd = dict(getattr(cand, "decision_data", None) or {})
         dd["final_selected_rank"] = i + 1
-        if i == 0:
-            if len(candidates) > 1:
-                peer = candidates[1]
-                peer_dd = dict(getattr(peer, "decision_data", None) or {})
-                peer_sym = str(getattr(peer, "symbol", "") or peer_dd.get("symbol") or "")
-                peer_score = float(peer_dd.get("final_selection_score") or peer_dd.get("selection_score") or 0.0)
-                win_score = float(dd.get("final_selection_score") or dd.get("selection_score") or 0.0)
-                dd["best_rejected_peer"] = peer_sym
-                dd["selected_over_symbol"] = peer_sym
-                dd["selected_over_score"] = round(peer_score, 8)
-                dd["why_selected"] = f"final_selection_score {win_score:.6f} > {peer_sym} {peer_score:.6f}"
-            else:
-                dd["best_rejected_peer"] = ""
-                dd["selected_over_symbol"] = ""
-                dd["selected_over_score"] = 0.0
-                dd["why_selected"] = "solo_candidate_no_peer"
+        # Clear stale why text on non-selected rows.
+        if selected is None and i != 0:
+            dd.pop("why_selected", None)
         setattr(cand, "decision_data", dd)
+
+    target = selected if selected is not None else (candidates[0] if candidates else None)
+    if target is None:
+        return
+
+    reason = build_truthful_selection_reason(target, candidates, open_symbols=open_symbols)
+    dd = dict(getattr(target, "decision_data", None) or {})
+    dd.update(reason)
+    setattr(target, "decision_data", dd)
 
 
 def evaluate_outcome_penalty_for_candidate(decision_data: dict[str, Any], symbol: str) -> dict[str, Any]:
