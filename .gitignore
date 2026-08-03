@@ -53,6 +53,9 @@ models/cache/
 !models/active/
 !models/active/**
 
+# Runtime learning rewrite (not a promotion artifact) — keep on disk, out of git
+models/active/meta/day_meta_label.pkl
+
 # IDE / OS
 .idea/
 .vscode/

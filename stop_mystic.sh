@@ -21,15 +21,21 @@ LEGACY_PATTERNS=(
   "start_ai_outcome_bridge.py"
 )
 
-# Only real app PIDs — never ssh/bash wrappers that merely mention the pattern.
+# Only real app PIDs — never ssh/bash wrappers, and never this stop script itself.
 list_app_pids() {
   local pattern=$1
   local pid cmd
+  local self_pid=$$
+  local parent_pid=${PPID:-}
   while read -r pid; do
     [ -z "$pid" ] && continue
-    [ "$pid" = "$$" ] && continue
+    [ "$pid" = "$self_pid" ] && continue
+    [ -n "$parent_pid" ] && [ "$pid" = "$parent_pid" ] && continue
     cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
     [ -z "$cmd" ] && continue
+    case "$cmd" in
+      *stop_mystic.sh*) continue ;;
+    esac
     case "$cmd" in
       *bash*|*ssh*|*sudo\ -u*) continue ;;
     esac
