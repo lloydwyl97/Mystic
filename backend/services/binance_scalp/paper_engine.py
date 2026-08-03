@@ -1843,6 +1843,11 @@ class BinanceScalpPaperEngine:
                     self._record_momentum(snap)
             time.sleep(warm_interval)
         logger.info("SCALP_WARM complete — now evaluating entries with bounded exits (net-profit / momentum-fail / setup-invalid / hard max-hold)")
+        # Publish immediately so GET /api/scalp/status is never missing during first heavy tick.
+        try:
+            self._publish_api_status_snapshot(open_rows=[], epoch=time.time(), entry_blocked_reason="WARM_COMPLETE")
+        except Exception:
+            pass
 
         maybe_run_scalp_reject_retention(self.config.database_path)
         maybe_run_scalp_position_housekeeping(self.config.database_path)
@@ -1855,6 +1860,12 @@ class BinanceScalpPaperEngine:
                     maybe_run_scalp_position_housekeeping(self.config.database_path)
                 except Exception as exc:
                     logger.exception("scalp paper tick error: %s", exc)
+                    with contextlib.suppress(Exception):
+                        self._publish_api_status_snapshot(
+                            open_rows=[],
+                            epoch=time.time(),
+                            entry_blocked_reason=f"TICK_ERROR:{type(exc).__name__}",
+                        )
                 try:
                     from backend.services.task_health_monitor import beat_sync
 
