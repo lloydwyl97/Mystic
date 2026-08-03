@@ -405,6 +405,8 @@ class RealTimeAISignalGenerator:
             try:
                 loop_count += 1
                 now = time.time()
+                # Refresh top-4 DAY hashes every outer tick so slow OHLCV cannot expire them.
+                await self._heartbeat_all_day_signal_hashes(reason="OUTER_LOOP_HEARTBEAT")
                 for strategy_id in self.enabled_strategies:
                     c = contract_for(strategy_id)
                     last = self._strategy_last_tick.get(strategy_id, 0.0)
@@ -417,8 +419,16 @@ class RealTimeAISignalGenerator:
                         strategy_id,
                         len(self.symbols),
                     )
+                    # Seed/refresh all symbols before the slow per-symbol OHLCV work.
+                    if (strategy_id or "").strip().lower() == "day":
+                        await self._heartbeat_all_day_signal_hashes(reason="PRE_CYCLE_HEARTBEAT")
                     for symbol in self.symbols:
                         await self._generate_signal_for_symbol(strategy_id, symbol)
+                        if (strategy_id or "").strip().lower() == "day":
+                            # Keep peers alive while this symbol's REST work runs.
+                            await self._heartbeat_all_day_signal_hashes(
+                                reason=f"MID_CYCLE_HEARTBEAT:{symbol}"
+                            )
                     # Persistence heartbeat: top-4 DAY hashes must never flap to HLEN=0.
                     if (strategy_id or "").strip().lower() == "day" and self.redis:
                         for symbol in self.symbols:
@@ -460,12 +470,44 @@ class RealTimeAISignalGenerator:
                 await asyncio.sleep(5)
 
     def _signal_redis_ttl_sec(self) -> int:
-        """TTL must outlive the publish loop enough that top-4 hashes never flap to HLEN=0."""
+        """TTL must outlive slow multi-symbol OHLCV cycles so top-4 hashes never flap to HLEN=0."""
         try:
             loop_sec = int(contract_for("day").redis_signal_loop_seconds)
         except Exception:
             loop_sec = 120
-        return max(int(AI_SIGNAL_REDIS_TTL_SEC), int(MAX_SIGNAL_AGE_SEC) * 2, loop_sec * 4, 600)
+        # Ocean DAY cycles can take several minutes per symbol when Binance REST is slow.
+        return max(int(AI_SIGNAL_REDIS_TTL_SEC), int(MAX_SIGNAL_AGE_SEC) * 4, loop_sec * 10, 1800)
+
+    async def _heartbeat_all_day_signal_hashes(self, *, reason: str = "LOOP_HEARTBEAT") -> None:
+        """Keep all top-4 DAY hashes alive even while a long symbol generation is in progress."""
+        if not self.redis:
+            return
+        if "day" not in {(s or "").strip().lower() for s in self.enabled_strategies}:
+            return
+        for symbol in self.symbols:
+            bus = str(symbol or "").strip().upper().replace("/", "")
+            if not bus:
+                continue
+            key = redis_ai_signal_key("day", bus)
+            try:
+                hlen = int(await self.redis.hlen(key) or 0)
+            except Exception:
+                hlen = 0
+            if hlen <= 0:
+                await self._publish_degraded_day_signal_hash("day", bus, reason=reason)
+                continue
+            try:
+                # TTL-only touch — do not rewrite signal timestamp/freshness (trading semantics).
+                await self.redis.hset(
+                    key,
+                    mapping={
+                        "loop_heartbeat_epoch": str(time.time()),
+                        "loop_heartbeat_reason": reason[:120],
+                    },
+                )
+                await self.redis.expire(key, self._signal_redis_ttl_sec())
+            except Exception:
+                await self._publish_degraded_day_signal_hash("day", bus, reason=f"{reason}_TOUCH_FAIL")
 
     async def _publish_degraded_day_signal_hash(
         self,

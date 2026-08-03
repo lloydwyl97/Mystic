@@ -168,10 +168,22 @@ async def test_ttl_exceeds_expected_publish_interval() -> None:
     with patch("backend.services.ai_signal_generator.AI_SIGNAL_REDIS_TTL_SEC", 300):
         with patch("backend.services.ai_signal_generator.MAX_SIGNAL_AGE_SEC", 180):
             ttl = gen._signal_redis_ttl_sec()
-    assert ttl >= 600
+    assert ttl >= 1800
     await gen._publish_degraded_day_signal_hash("day", "BTCUSDT", reason="HOLD")
     key = redis_ai_signal_key("day", "BTCUSDT")
     assert fake.ttls[key] >= 180
+
+
+@pytest.mark.asyncio
+async def test_loop_heartbeat_keeps_all_four_alive() -> None:
+    fake = _FakeRedis()
+    gen = _make_generator(fake)
+    # Only one symbol seeded — heartbeat must fill the rest.
+    await gen._publish_degraded_day_signal_hash("day", "BTCUSDT", reason="SEED")
+    await gen._heartbeat_all_day_signal_hashes(reason="OUTER_LOOP_HEARTBEAT")
+    for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]:
+        assert await fake.hlen(redis_ai_signal_key("day", sym)) > 0
+    assert fake.ttls[redis_ai_signal_key("day", "BTCUSDT")] >= 1800
 
 
 @pytest.mark.asyncio
