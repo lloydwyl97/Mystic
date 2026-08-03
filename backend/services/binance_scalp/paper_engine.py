@@ -113,6 +113,9 @@ class BinanceScalpPaperEngine:
         self._reject_throttle = ScalpRejectThrottle()
         self._redis = redis.from_url(self.config.redis_url, decode_responses=True)
         self._entry_reservations: dict[str, dict] = {}
+        self._heartbeat_stop = False
+        self._heartbeat_thread = None
+        self._cached_open_symbols: list[str] = []
         init_scalp_schema(self.config.database_path)
         with contextlib.suppress(Exception):
             from backend.services.scalp_gate_telemetry import ensure_scalp_gate_schema
@@ -301,9 +304,11 @@ class BinanceScalpPaperEngine:
     def _publish_api_status_snapshot(
         self,
         *,
-        open_rows: list[sqlite3.Row],
-        epoch: float,
+        open_rows: list[sqlite3.Row] | None = None,
+        epoch: float | None = None,
         entry_blocked_reason: str | None = None,
+        snapshot_source: str = "runner_tick",
+        include_pnl: bool = False,
     ) -> None:
         """Publish lightweight Redis snapshot for GET /api/scalp/status (no REST rebuild)."""
         try:
@@ -314,38 +319,103 @@ class BinanceScalpPaperEngine:
                 status_cache_ttl_sec,
             )
 
+            epoch = float(epoch if epoch is not None else time.time())
+            if open_rows is None:
+                open_syms = list(self._cached_open_symbols)
+                open_count = len(open_syms)
+            else:
+                open_syms = [str(r["symbol"]) for r in open_rows]
+                open_count = len(open_syms)
+                self._cached_open_symbols = list(open_syms)
+
             rs_raw = self._redis.get(runner_state_key(self.config.redis_key_prefix))
             ld_raw = self._redis.get(last_decision_key(self.config.redis_key_prefix))
             runner_state = json.loads(rs_raw) if rs_raw else {
                 "updated_at_epoch": epoch,
-                "operational_mode": "entry_scan_active",
-                "open_count": len(open_rows),
+                "operational_mode": (
+                    "max_open_positions_reached"
+                    if entry_blocked_reason == "MAX_OPEN_POSITIONS"
+                    else "entry_scan_active"
+                ),
+                "open_count": open_count,
                 "max_open_positions": int(self.config.max_open_positions),
-                "open_symbols": [str(r["symbol"]) for r in open_rows],
+                "open_symbols": open_syms,
                 "entry_blocked_reason": entry_blocked_reason,
             }
+            if isinstance(runner_state, dict):
+                runner_state = dict(runner_state)
+                runner_state["updated_at_epoch"] = epoch
+                runner_state["open_count"] = open_count
+                runner_state["open_symbols"] = open_syms
+                if entry_blocked_reason:
+                    runner_state["entry_blocked_reason"] = entry_blocked_reason
             last_decision = json.loads(ld_raw) if ld_raw else {}
-            # Tiny PnL read with short timeout — never blocks API; runner-only.
-            pnl: dict = {"engine": "scalp"}
-            try:
-                from backend.services.binance_scalp.pnl_summary import build_scalp_pnl_summary
+            # Never block heartbeat on SQLite PnL — optional and skippable.
+            pnl: dict = {"engine": "scalp", "note": "pnl_omitted_on_fast_path"}
+            if include_pnl:
+                try:
+                    from backend.services.binance_scalp.pnl_summary import build_scalp_pnl_summary
 
-                pnl = build_scalp_pnl_summary(self.config.database_path)
-            except Exception:
-                pnl = {"engine": "scalp", "note": "pnl_unavailable"}
+                    pnl = build_scalp_pnl_summary(self.config.database_path)
+                except Exception:
+                    pnl = {"engine": "scalp", "note": "pnl_unavailable"}
             payload = build_runner_api_status_payload(
                 runner_state=runner_state if isinstance(runner_state, dict) else {},
                 last_decision=last_decision if isinstance(last_decision, dict) else {},
                 entry_armed=bool(self._entry_armed_ok()),
-                open_count=len(open_rows),
+                open_count=open_count,
                 products=list(self.config.products),
                 scalp_live=bool(self.config.scalp_live),
                 scalp_paper_enabled=bool(self.config.scalp_paper_enabled),
                 pnl_summary=pnl,
+                snapshot_source=snapshot_source,
+                open_symbols=open_syms,
             )
             publish_status_snapshot(payload, ttl_sec=status_cache_ttl_sec())
+            with contextlib.suppress(Exception):
+                from backend.services.binance_scalp.scalp_entry_telemetry import (
+                    touch_rolling_telemetry_heartbeat,
+                )
+
+                touch_rolling_telemetry_heartbeat(self._redis, prefix=self.config.redis_key_prefix)
         except Exception as exc:
-            logger.debug("SCALP_API_STATUS_PUBLISH_SKIPPED %s", exc)
+            logger.warning("SCALP_API_STATUS_PUBLISH_SKIPPED %s", exc)
+
+    def _start_status_heartbeat(self, interval_sec: float = 30.0) -> None:
+        """Keep snapshot TTL alive even when tick is blocked on REST/klines."""
+        import threading
+
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_stop = False
+
+        def _loop() -> None:
+            while not self._heartbeat_stop:
+                try:
+                    from backend.services.binance_scalp.scalp_status_cache import (
+                        refresh_status_snapshot_heartbeat,
+                    )
+
+                    refresh_status_snapshot_heartbeat(reason="runner_heartbeat")
+                    with contextlib.suppress(Exception):
+                        from backend.services.binance_scalp.scalp_entry_telemetry import (
+                            touch_rolling_telemetry_heartbeat,
+                        )
+
+                        touch_rolling_telemetry_heartbeat(
+                            self._redis, prefix=self.config.redis_key_prefix
+                        )
+                except Exception as exc:
+                    logger.debug("SCALP_STATUS_HEARTBEAT_SKIPPED %s", exc)
+                for _ in range(int(max(5.0, interval_sec) * 10)):
+                    if self._heartbeat_stop:
+                        break
+                    time.sleep(0.1)
+
+        self._heartbeat_thread = threading.Thread(
+            target=_loop, name="scalp-status-heartbeat", daemon=True
+        )
+        self._heartbeat_thread.start()
 
     def _publish_runner_state(
         self,
@@ -1725,6 +1795,21 @@ class BinanceScalpPaperEngine:
                 armed=True,
                 persistent=True,
             )
+        # Publish before heavy REST/klines so snapshot cannot go missing mid-tick.
+        with contextlib.suppress(Exception):
+            pre_open: list[sqlite3.Row] = []
+            try:
+                with self._conn() as _c:
+                    pre_open = self._open_positions(_c)
+            except Exception:
+                pre_open = []
+            blocked = "MAX_OPEN_POSITIONS" if pre_open and len(pre_open) >= int(self.config.max_open_positions) else None
+            self._publish_api_status_snapshot(
+                open_rows=pre_open,
+                epoch=time.time(),
+                entry_blocked_reason=blocked,
+                snapshot_source="runner_tick_start",
+            )
         with self._conn() as conn:
             post_commit: list = []
             if not self.config.scalp_paper_enabled:
@@ -1792,7 +1877,13 @@ class BinanceScalpPaperEngine:
                 except Exception as exc:
                     logger.warning("SCALP_POST_COMMIT_HOOK_FAILED %s", exc)
             # Fast /api/scalp/status reads this Redis snapshot — never rebuilds on GET.
-            self._publish_api_status_snapshot(open_rows=open_after, epoch=epoch, entry_blocked_reason=entry_blocked)
+            self._publish_api_status_snapshot(
+                open_rows=open_after,
+                epoch=epoch,
+                entry_blocked_reason=entry_blocked,
+                snapshot_source="runner_tick",
+                include_pnl=True,
+            )
 
     def run_loop(self, interval_sec: float = 5.0) -> None:
         if not self.config.scalp_paper_enabled:
@@ -1843,11 +1934,18 @@ class BinanceScalpPaperEngine:
                     self._record_momentum(snap)
             time.sleep(warm_interval)
         logger.info("SCALP_WARM complete — now evaluating entries with bounded exits (net-profit / momentum-fail / setup-invalid / hard max-hold)")
-        # Publish immediately so GET /api/scalp/status is never missing during first heavy tick.
-        try:
-            self._publish_api_status_snapshot(open_rows=[], epoch=time.time(), entry_blocked_reason="WARM_COMPLETE")
-        except Exception:
-            pass
+        # Seed open-symbol cache so heartbeat reports held slots honestly during first tick.
+        with contextlib.suppress(Exception):
+            with self._conn() as _c:
+                rows = self._open_positions(_c)
+                self._cached_open_symbols = [str(r["symbol"]) for r in rows]
+                self._publish_api_status_snapshot(
+                    open_rows=rows,
+                    epoch=time.time(),
+                    entry_blocked_reason=("MAX_OPEN_POSITIONS" if rows and len(rows) >= int(self.config.max_open_positions) else "WARM_COMPLETE"),
+                    snapshot_source="runner_warm",
+                )
+        self._start_status_heartbeat(interval_sec=30.0)
 
         maybe_run_scalp_reject_retention(self.config.database_path)
         maybe_run_scalp_position_housekeeping(self.config.database_path)
@@ -1862,9 +1960,10 @@ class BinanceScalpPaperEngine:
                     logger.exception("scalp paper tick error: %s", exc)
                     with contextlib.suppress(Exception):
                         self._publish_api_status_snapshot(
-                            open_rows=[],
+                            open_rows=None,
                             epoch=time.time(),
                             entry_blocked_reason=f"TICK_ERROR:{type(exc).__name__}",
+                            snapshot_source="runner_error",
                         )
                 try:
                     from backend.services.task_health_monitor import beat_sync
@@ -1874,4 +1973,5 @@ class BinanceScalpPaperEngine:
                     pass
                 time.sleep(interval_sec)
         finally:
+            self._heartbeat_stop = True
             self.shutdown()

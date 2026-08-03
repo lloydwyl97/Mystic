@@ -419,6 +419,21 @@ class RealTimeAISignalGenerator:
                     )
                     for symbol in self.symbols:
                         await self._generate_signal_for_symbol(strategy_id, symbol)
+                    # Persistence heartbeat: top-4 DAY hashes must never flap to HLEN=0.
+                    if (strategy_id or "").strip().lower() == "day" and self.redis:
+                        for symbol in self.symbols:
+                            bus = str(symbol or "").strip().upper().replace("/", "")
+                            key = redis_ai_signal_key(strategy_id, bus)
+                            try:
+                                hlen = int(await self.redis.hlen(key) or 0)
+                            except Exception:
+                                hlen = 0
+                            if hlen <= 0:
+                                await self._publish_degraded_day_signal_hash(
+                                    strategy_id,
+                                    bus,
+                                    reason="POST_CYCLE_EMPTY_HASH_HEARTBEAT",
+                                )
 
                 if now - self._last_model_check_time >= self._model_reload_check_interval:
                     self._last_model_check_time = now
@@ -444,26 +459,97 @@ class RealTimeAISignalGenerator:
                 logger.exception(f"Error in signal generation loop: {e}")
                 await asyncio.sleep(5)
 
+    def _signal_redis_ttl_sec(self) -> int:
+        """TTL must outlive the publish loop enough that top-4 hashes never flap to HLEN=0."""
+        try:
+            loop_sec = int(contract_for("day").redis_signal_loop_seconds)
+        except Exception:
+            loop_sec = 120
+        return max(int(AI_SIGNAL_REDIS_TTL_SEC), int(MAX_SIGNAL_AGE_SEC) * 2, loop_sec * 4, 600)
+
+    async def _publish_degraded_day_signal_hash(
+        self,
+        strategy_id: str,
+        symbol: str,
+        *,
+        reason: str = "",
+        existing: dict[str, str] | None = None,
+    ) -> None:
+        """Ensure ai_signal:day:<SYM> stays a non-empty hash (HOLD/degraded) — never delete."""
+        if not self.redis:
+            return
+        bus = str(symbol or "").strip().upper().replace("/", "")
+        if not bus:
+            return
+        key = redis_ai_signal_key(strategy_id, bus)
+        now_ts = time.time()
+        base = dict(existing or {})
+        mapping: dict[str, str] = {
+            "symbol": bus,
+            "signal": str(base.get("signal") or base.get("side") or "HOLD"),
+            "side": str(base.get("side") or base.get("signal") or "HOLD"),
+            "action": str(base.get("action") or base.get("side") or "HOLD"),
+            "confidence": str(base.get("confidence") or "0"),
+            "timestamp": str(now_ts),
+            "writer_timestamp": str(now_ts),
+            "updated_at": str(now_ts),
+            "content_fresh": "0",
+            "signal_content_stale": "1",
+            "stale": "1",
+            "content_age_sec": str(base.get("content_age_sec") or "0"),
+            "reason": (reason or base.get("reason") or "DEGRADED_HEARTBEAT")[:240],
+            "reject_reason": (reason or base.get("reject_reason") or "")[:240],
+            "ttl_preserve_skip_reason": (reason or "")[:240],
+            "source": "ai_signal_generator_heartbeat",
+            "signal_source": str(base.get("signal_source") or "degraded_heartbeat"),
+            "persistence_degraded": str(base.get("persistence_degraded") or "0"),
+            "strategy_id": str(strategy_id or "day").strip().lower(),
+        }
+        # Preserve useful model fields when refreshing a stale existing hash.
+        for field in (
+            "feature_version",
+            "feature_dim",
+            "artifact_sha256",
+            "ctx_ts_utc",
+            "ctx_age_sec",
+            "context_fresh",
+            "context_audit_emit",
+            "model_used",
+        ):
+            if base.get(field) not in (None, ""):
+                mapping[field] = str(base[field])
+        try:
+            await self.redis.hset(key, mapping=mapping)
+            await self.redis.expire(key, self._signal_redis_ttl_sec())
+        except Exception as exc:
+            logger.warning("DEGRADED_DAY_SIGNAL_PUBLISH_FAILED key=%s err=%s", key, exc)
+
     async def _preserve_existing_signal_ttl(self, strategy_id: str, symbol: str, *, skip_reason: str = "") -> None:
         """
-        On generation skip: never extend TTL indefinitely while hash timestamp stays old.
+        On generation skip: keep a non-empty Redis DAY hash alive.
 
-        Short grace may refresh Redis TTL but always stamps content staleness on the hash.
-        Beyond MAX_SIGNAL_AGE_SEC the key is deleted so TTL alone cannot masquerade as fresh.
+        Never delete ai_signal:day:* — publish/refresh a degraded HOLD heartbeat instead
+        so top-4 HLEN cannot flap to 0 between cycles.
         """
         if not self.redis:
             return
-        key = redis_ai_signal_key(strategy_id, symbol)
+        bus = str(symbol or "").strip().upper().replace("/", "")
+        key = redis_ai_signal_key(strategy_id, bus)
         try:
             raw = await self.redis.hgetall(key)
-            if not raw:
-                return
-
             dd: dict[str, str] = {}
-            for k, v in raw.items():
+            for k, v in (raw or {}).items():
                 kk = k.decode() if isinstance(k, bytes) else str(k)
                 vv = v.decode() if isinstance(v, bytes) else str(v)
                 dd[kk] = vv
+
+            if not dd:
+                await self._publish_degraded_day_signal_hash(
+                    strategy_id,
+                    bus,
+                    reason=skip_reason or "SIGNAL_MISSING_HEARTBEAT",
+                )
+                return
 
             content_age: float | None = None
             for field in ("timestamp", "writer_timestamp"):
@@ -476,10 +562,17 @@ class RealTimeAISignalGenerator:
                 except (TypeError, ValueError):
                     continue
 
+            # Stale content: keep hash populated with degraded flags (no DELETE).
             if content_age is not None and content_age > float(MAX_SIGNAL_AGE_SEC):
-                await self.redis.delete(key)
+                dd["content_age_sec"] = str(round(content_age, 1))
+                await self._publish_degraded_day_signal_hash(
+                    strategy_id,
+                    bus,
+                    reason=skip_reason or "SIGNAL_CONTENT_STALE_HEARTBEAT",
+                    existing=dd,
+                )
                 logger.warning(
-                    "SIGNAL_TTL_PRESERVE_DELETE key=%s content_age_sec=%.1f max=%s reason=%s",
+                    "SIGNAL_TTL_PRESERVE_DEGRADED key=%s content_age_sec=%.1f max=%s reason=%s",
                     key,
                     content_age,
                     MAX_SIGNAL_AGE_SEC,
@@ -491,10 +584,13 @@ class RealTimeAISignalGenerator:
             # (SIGNAL_CONTENT_AGE_EXCEEDED / content_fresh) stay healthy on generation skips.
             now_ts = time.time()
             fresh_patch: dict[str, str] = {
+                "symbol": bus,
                 "timestamp": str(now_ts),
                 "writer_timestamp": str(now_ts),
+                "updated_at": str(now_ts),
                 "content_fresh": "1",
                 "signal_content_stale": "0",
+                "stale": "0",
                 "content_age_sec": "0",
                 "ttl_preserve_skip_reason": (skip_reason or "")[:240],
             }
@@ -507,14 +603,14 @@ class RealTimeAISignalGenerator:
                     overlay_dd["feature_version"] = str(int(float(dd.get("feature_version") or "1")))
                 except (TypeError, ValueError):
                     overlay_dd["feature_version"] = "1"
-                overlay_live_context_freshness(overlay_dd, symbol)
+                overlay_live_context_freshness(overlay_dd, bus)
                 for field in ("ctx_ts_utc", "ctx_age_sec", "context_fresh", "context_audit_emit"):
                     if field in overlay_dd and overlay_dd[field] not in (None, ""):
                         fresh_patch[field] = str(overlay_dd[field])
             except Exception as ctx_exc:
                 logger.debug("SIGNAL_TTL_PRESERVE context overlay skipped %s: %s", key, ctx_exc)
             await self.redis.hset(key, mapping=fresh_patch)
-            await self.redis.expire(key, AI_SIGNAL_REDIS_TTL_SEC)
+            await self.redis.expire(key, self._signal_redis_ttl_sec())
             logger.debug(
                 "SIGNAL_TTL_PRESERVE_REFRESH key=%s prior_content_age_sec=%s reason=%s",
                 key,
@@ -524,6 +620,12 @@ class RealTimeAISignalGenerator:
             return
         except Exception as exc:
             logger.debug("SIGNAL_TTL_PRESERVE skipped %s: %s", key, exc)
+            with contextlib.suppress(Exception):
+                await self._publish_degraded_day_signal_hash(
+                    strategy_id,
+                    bus,
+                    reason=f"PRESERVE_ERROR:{type(exc).__name__}",
+                )
 
     async def _assemble_day_live_features(
         self,
@@ -1137,7 +1239,7 @@ class RealTimeAISignalGenerator:
                 # Atomic pipeline: hmset + expire in one round-trip
                 async with self.redis.pipeline(transaction=True) as pipe:
                     pipe.hmset(key, {field: str(value) for field, value in enhanced_signal_data.items()})
-                    pipe.expire(key, AI_SIGNAL_REDIS_TTL_SEC)
+                    pipe.expire(key, self._signal_redis_ttl_sec())
                     await pipe.execute()
 
                 if sid0 == "day":

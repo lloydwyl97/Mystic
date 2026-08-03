@@ -79,6 +79,15 @@ def status_snapshot_key(prefix: str, warm_rounds: int = 0) -> str:
     return key
 
 
+# Canonical API key the runner publishes and GET /api/scalp/status reads (warm=0).
+API_STATUS_SNAPSHOT_KEY = "scalp:status:snapshot:w0"
+
+
+def api_status_snapshot_key(prefix: str = "scalp") -> str:
+    """Shared read/write key for /api/scalp/status — never diverge runner vs API."""
+    return status_snapshot_key(prefix, 0)
+
+
 def assert_key_allowed(key: str, *, prefix: str = "scalp") -> None:
     expected = f"{normalize_prefix(prefix)}:"
     if not key.startswith(expected):

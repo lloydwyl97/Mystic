@@ -324,6 +324,33 @@ def update_rolling_telemetry(redis_client: Any, cycle: dict[str, Any], *, prefix
         return None
 
 
+def touch_rolling_telemetry_heartbeat(redis_client: Any, *, prefix: str = "scalp") -> None:
+    """Refresh rolling telemetry updated_at even when no entry evaluate ran this tick."""
+    if redis_client is None:
+        return
+    try:
+        key = rolling_key(prefix)
+        raw = redis_client.get(key)
+        if raw:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            rolling = json.loads(raw)
+            if not isinstance(rolling, dict):
+                rolling = _empty_rolling()
+        else:
+            rolling = _empty_rolling()
+        now = time.time()
+        rolling["updated_at_epoch"] = now
+        rolling["heartbeat_epoch"] = now
+        rolling.setdefault("cycles", int(rolling.get("cycles") or 0))
+        rolling.setdefault("window_max_cycles", _rolling_max_cycles())
+        if not rolling.get("started_at_epoch"):
+            rolling["started_at_epoch"] = now
+        redis_client.setex(key, _ROLLING_TTL_SEC, json.dumps(rolling, separators=(",", ":")))
+    except Exception as exc:
+        logger.debug("SCALP rolling telemetry heartbeat skipped: %s", exc)
+
+
 def publish_entry_telemetry(
     redis_client: Any,
     ranked: list[dict[str, Any]],
