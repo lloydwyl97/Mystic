@@ -1548,10 +1548,20 @@ class PortfolioEngineIntegration:
                             await self.redis_client.delete(f"alerts:exit_hard_paused:{symbol}")
 
         except Exception as e:
-            logger.exception(f"EXIT_MONITORING_ERROR: {e}")
-            for symbol in filtered_positions:
-                await self._handle_exit_failure(symbol, str(e))
-            exits = []
+            from backend.utils.sqlite_runtime import is_locked_error
+
+            # Transient SQLite lock: do not apply long exit cooldowns — retry next cycle.
+            if is_locked_error(e) or "database is locked" in str(e).lower():
+                logger.warning(
+                    "EXIT_MONITORING_SQLITE_BUSY: %s — skip EXIT_FAILED cooldown; retry next cycle",
+                    e,
+                )
+                exits = []
+            else:
+                logger.exception(f"EXIT_MONITORING_ERROR: {e}")
+                for symbol in filtered_positions:
+                    await self._handle_exit_failure(symbol, str(e))
+                exits = []
 
         for exit_result in exits:
             logger.info(
@@ -1613,15 +1623,12 @@ class PortfolioEngineIntegration:
                 eng = self.engine
                 if eng is not None:
                     try:
+                        # Network/Redis marks OUTSIDE the writer lock — never hold
+                        # BEGIN IMMEDIATE / asyncio SQLite lock across Binance REST.
+                        await eng._load_positions_from_sqlite(allow_mutations=False)
+                        mtm_prices = await eng._fetch_mtm_prices_for_open_positions()
+                        await eng._recompute_positions_values(mtm_prices or self.current_prices or None)
                         async with eng._sqlite_writer_lock:
-                            # Do NOT reload ledger cash/realized from SQLite here.
-                            # In-memory ledger is authoritative between buy/sell commits;
-                            # reloading mid-buy races and restores pre-debit cash while the
-                            # new position is already visible → double-counted equity.
-                            # Positions SELECT only here; FIFO is throttled separately.
-                            await eng._load_positions_from_sqlite(allow_mutations=False)
-                            mtm_prices = await eng._fetch_mtm_prices_for_open_positions()
-                            await eng._recompute_positions_values(mtm_prices or self.current_prices or None)
                             await eng._persist_ledger_to_sqlite()
                             await eng._sync_paper_redis_from_sqlite_authoritative()
                     except Exception as reload_err:
@@ -1693,7 +1700,17 @@ class PortfolioEngineIntegration:
         - 2nd failure: 120 second cooldown
         - 3rd failure: 300 second cooldown
         - 4th+ failure: Hard-pause symbol (permanent until manual intervention)
+
+        Transient ``database is locked`` must not enter this path (caller filters).
         """
+        if "database is locked" in str(error_msg).lower() or "database table is locked" in str(error_msg).lower():
+            logger.warning(
+                "EXIT_FAILED_SKIPPED_SQLITE_BUSY: %s — no cooldown applied; err=%s",
+                symbol,
+                error_msg[:200],
+            )
+            return
+
         current_time = time.time()
 
         # Increment failure count

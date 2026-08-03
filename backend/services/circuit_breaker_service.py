@@ -610,9 +610,36 @@ class TradingCircuitBreaker:
             logger.warning(f"[CIRCUIT BREAKER] Failed to load state (async): {e}")
 
     async def persist_circuit_state_async(self) -> None:
-        """Async version of _persist_circuit_state - use from async context."""
+        """Async version of _persist_circuit_state - use from async context.
+
+        Throttled: skip SQLite write when breaker flags/session values are unchanged
+        unless CIRCUIT_BREAKER_PERSIST_MIN_INTERVAL_SEC has elapsed (heartbeat).
+        """
         try:
+            import os
+            import time
             from datetime import datetime, timezone
+
+            any_active = any(
+                [self.daily_loss_freeze_active, self.equity_circuit_breaker_active, self.account_failsafe_active]
+            )
+            fingerprint = (
+                bool(self.daily_loss_freeze_active),
+                bool(self.equity_circuit_breaker_active),
+                bool(self.account_failsafe_active),
+                float(self.session_high_equity or 0.0),
+                str(self.last_daily_reset or ""),
+                bool(any_active),
+            )
+            now = time.time()
+            try:
+                min_interval = float(os.getenv("CIRCUIT_BREAKER_PERSIST_MIN_INTERVAL_SEC", "60") or "60")
+            except (TypeError, ValueError):
+                min_interval = 60.0
+            last_fp = getattr(self, "_last_persist_fingerprint", None)
+            last_ts = float(getattr(self, "_last_persist_ts", 0.0) or 0.0)
+            if last_fp == fingerprint and (now - last_ts) < max(5.0, min_interval):
+                return
 
             circuit_data = {
                 "daily_loss_freeze_active": self.daily_loss_freeze_active,
@@ -623,13 +650,14 @@ class TradingCircuitBreaker:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             await set_state("risk:circuit_breakers", circuit_data)
-            any_active = any([self.daily_loss_freeze_active, self.equity_circuit_breaker_active, self.account_failsafe_active])
             paused_data = {
                 "trading_paused": any_active,
                 "pause_reason": "circuit_breaker_active" if any_active else "",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             await set_state("risk:trading_paused", paused_data)
+            self._last_persist_fingerprint = fingerprint
+            self._last_persist_ts = now
             logger.debug("[CIRCUIT BREAKER] State persisted (async)")
         except Exception as e:
             logger.warning(f"[CIRCUIT BREAKER] Failed to persist state (async): {e}")

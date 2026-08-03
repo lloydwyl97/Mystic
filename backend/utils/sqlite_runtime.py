@@ -112,3 +112,25 @@ def run_locked_retry(
             time.sleep(sleep_s)
     # Defensive: loop always returns or raises above.
     return op()
+
+
+@contextlib.contextmanager
+def short_write_txn(db_path: str | Path):
+    """Short IMMEDIATE write transaction with busy_timeout + bounded retry on connect."""
+
+    def _open():
+        conn = connect_rw(db_path)
+        conn.execute("BEGIN IMMEDIATE")
+        return conn
+
+    conn = run_locked_retry(_open)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        with contextlib.suppress(Exception):
+            conn.rollback()
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()

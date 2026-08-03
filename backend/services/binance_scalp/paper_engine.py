@@ -298,6 +298,55 @@ class BinanceScalpPaperEngine:
         except Exception:
             pass
 
+    def _publish_api_status_snapshot(
+        self,
+        *,
+        open_rows: list[sqlite3.Row],
+        epoch: float,
+        entry_blocked_reason: str | None = None,
+    ) -> None:
+        """Publish lightweight Redis snapshot for GET /api/scalp/status (no REST rebuild)."""
+        try:
+            from backend.services.binance_scalp.redis_keys import last_decision_key, runner_state_key
+            from backend.services.binance_scalp.scalp_status_cache import (
+                build_runner_api_status_payload,
+                publish_status_snapshot,
+                status_cache_ttl_sec,
+            )
+
+            rs_raw = self._redis.get(runner_state_key(self.config.redis_key_prefix))
+            ld_raw = self._redis.get(last_decision_key(self.config.redis_key_prefix))
+            runner_state = json.loads(rs_raw) if rs_raw else {
+                "updated_at_epoch": epoch,
+                "operational_mode": "entry_scan_active",
+                "open_count": len(open_rows),
+                "max_open_positions": int(self.config.max_open_positions),
+                "open_symbols": [str(r["symbol"]) for r in open_rows],
+                "entry_blocked_reason": entry_blocked_reason,
+            }
+            last_decision = json.loads(ld_raw) if ld_raw else {}
+            # Tiny PnL read with short timeout — never blocks API; runner-only.
+            pnl: dict = {"engine": "scalp"}
+            try:
+                from backend.services.binance_scalp.pnl_summary import build_scalp_pnl_summary
+
+                pnl = build_scalp_pnl_summary(self.config.database_path)
+            except Exception:
+                pnl = {"engine": "scalp", "note": "pnl_unavailable"}
+            payload = build_runner_api_status_payload(
+                runner_state=runner_state if isinstance(runner_state, dict) else {},
+                last_decision=last_decision if isinstance(last_decision, dict) else {},
+                entry_armed=bool(self._entry_armed_ok()),
+                open_count=len(open_rows),
+                products=list(self.config.products),
+                scalp_live=bool(self.config.scalp_live),
+                scalp_paper_enabled=bool(self.config.scalp_paper_enabled),
+                pnl_summary=pnl,
+            )
+            publish_status_snapshot(payload, ttl_sec=status_cache_ttl_sec())
+        except Exception as exc:
+            logger.debug("SCALP_API_STATUS_PUBLISH_SKIPPED %s", exc)
+
     def _publish_runner_state(
         self,
         conn: sqlite3.Connection,
@@ -1161,7 +1210,8 @@ class BinanceScalpPaperEngine:
             reason=reason,
         )
         self._write_position_cache(sym, None)
-        logger.info("SCALP_PAPER_SELL %s pnl=%.4f reason=%s", sym, net_usd, reason)
+        # Log only after caller commits — avoid false SCALP_PAPER_SELL when txn rolls back.
+        self._pending_sell_log = (sym, float(net_usd), str(reason))
 
     def _record_scalp_close_intelligence(
         self,
@@ -1728,13 +1778,21 @@ class BinanceScalpPaperEngine:
             else:
                 entry_blocked = "MAX_OPEN_POSITIONS"
                 self._publish_last_decision(decision="BLOCKED", reason="MAX_OPEN_POSITIONS")
-            self._publish_runner_state(conn, open_rows=self._open_positions(conn), epoch=epoch, entry_blocked_reason=entry_blocked)
+            open_after = self._open_positions(conn)
+            self._publish_runner_state(conn, open_rows=open_after, epoch=epoch, entry_blocked_reason=entry_blocked)
+            pending_sell = getattr(self, "_pending_sell_log", None)
+            self._pending_sell_log = None
             conn.commit()
+            if pending_sell:
+                sym, net_usd, reason = pending_sell
+                logger.info("SCALP_PAPER_SELL %s pnl=%.4f reason=%s", sym, net_usd, reason)
             for fn in post_commit:
                 try:
                     fn()
                 except Exception as exc:
                     logger.warning("SCALP_POST_COMMIT_HOOK_FAILED %s", exc)
+            # Fast /api/scalp/status reads this Redis snapshot — never rebuilds on GET.
+            self._publish_api_status_snapshot(open_rows=open_after, epoch=epoch, entry_blocked_reason=entry_blocked)
 
     def run_loop(self, interval_sec: float = 5.0) -> None:
         if not self.config.scalp_paper_enabled:

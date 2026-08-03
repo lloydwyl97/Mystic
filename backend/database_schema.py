@@ -8,6 +8,7 @@ BUG-004 Fix: Provides serialized SQLite write access with WAL mode + busy_timeou
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import sqlite3
@@ -38,34 +39,14 @@ def get_db_connection(timeout: float = 5.0) -> sqlite3.Connection:
     """
     Get a properly configured SQLite connection (BUG-004 Fix).
 
-    Configuration:
-    - WAL mode for better concurrency
-    - NORMAL synchronous for safety without huge performance hit
-    - busy_timeout to wait for locks instead of failing
-
-    Args:
-        timeout: Maximum seconds to wait for database lock
-
-    Returns:
-        Configured SQLite connection
-
-    Note:
-        Caller must call conn.close() or use the connection as a context manager
-        (e.g., ``with get_db_connection() as conn: ...``). Failure to close leaks
-        the connection.
+    Uses sqlite_runtime.connect_rw (WAL once-per-process + busy_timeout).
     """
-    conn = sqlite3.connect(DATABASE_PATH, timeout=timeout)
-    conn.row_factory = sqlite3.Row  # Enable dict-like access
+    from backend.utils.sqlite_runtime import connect_rw
 
-    # Enable WAL mode for better concurrency (readers don't block writers)
-    conn.execute("PRAGMA journal_mode=WAL")
-
-    # NORMAL synchronous is safe and faster than FULL
-    conn.execute("PRAGMA synchronous=NORMAL")
-
-    # Enforce foreign keys
-    conn.execute("PRAGMA foreign_keys=ON")
-
+    conn = connect_rw(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    with contextlib.suppress(Exception):
+        conn.execute(f"PRAGMA busy_timeout={int(max(0.1, float(timeout)) * 1000)}")
     return conn
 
 
@@ -96,41 +77,46 @@ def _execute_write_sync(query: str, params: tuple | dict | None = None, fetch: b
     """
     Synchronous implementation of write execution.
     Called from execute_write via asyncio.to_thread.
+    Uses bounded lock retries + busy_timeout (sqlite_runtime).
     """
-    conn = None
-    try:
-        ensure_paper_trading_schema_initialized()
-        conn = get_db_connection(timeout=5.0)
-        cursor = conn.cursor()
+    from backend.utils.sqlite_runtime import is_locked_error, run_locked_retry
 
-        # Begin transaction with IMMEDIATE to acquire write lock
-        cursor.execute("BEGIN IMMEDIATE")
+    ensure_paper_trading_schema_initialized()
 
-        if params:
-            cursor.execute(query, params)
-        else:
-            cursor.execute(query)
-
-        conn.commit()
-
-        if fetch:
-            return cursor.fetchall()
-        else:
+    def _once() -> Any:
+        conn = None
+        try:
+            conn = get_db_connection(timeout=5.0)
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            conn.commit()
+            if fetch:
+                return cursor.fetchall()
             return cursor.lastrowid
+        except Exception:
+            if conn:
+                with contextlib.suppress(Exception):
+                    conn.rollback()
+            raise
+        finally:
+            if conn:
+                conn.close()
 
+    try:
+        return run_locked_retry(_once)
     except sqlite3.OperationalError as e:
-        if conn:
-            conn.rollback()
-        logger.exception(f"Database locked during write: {e}")
+        if is_locked_error(e):
+            logger.warning("Database locked during write after retries: %s", e)
+        else:
+            logger.exception("Database write error: %s", e)
         raise
     except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.exception(f"Database write error: {e}")
+        logger.exception("Database write error: %s", e)
         raise
-    finally:
-        if conn:
-            conn.close()
 
 
 async def execute_read(query: str, params: tuple | dict | None = None, fetchone: bool = False) -> Any:

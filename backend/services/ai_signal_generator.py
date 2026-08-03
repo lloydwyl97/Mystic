@@ -1161,10 +1161,16 @@ class RealTimeAISignalGenerator:
                 )
 
                 # SAVE TO DATABASE FOR HISTORICAL ANALYSIS - LIVE PRODUCTION PERSISTENCE
+                # Redis hash above is primary/live; DB failure must NOT delete or empty it.
                 try:
                     await self._save_signal_to_database(symbol, canonical_side, winner_probability, signal_data)
                 except Exception as db_e:
-                    logger.exception(f"DATABASE SAVE FAILED: {symbol} - {db_e}")
+                    logger.warning(
+                        "DATABASE SAVE FAILED (redis signal preserved): %s key=%s err=%s",
+                        symbol,
+                        key,
+                        db_e,
+                    )
 
                 try:
                     await insert_audit_row_async(
@@ -1309,10 +1315,13 @@ class RealTimeAISignalGenerator:
             if result:
                 logger.info(f"SIGNAL SAVED TO DB: {symbol} -> {side.upper()} (confidence: {confidence:.3f})")
             else:
-                logger.error(f"Failed to save signal to database: {symbol}")
+                logger.warning(
+                    "Failed to save signal to database (redis signal preserved): %s",
+                    symbol,
+                )
 
         except Exception as e:
-            logger.exception(f"Error saving signal to database: {e}")
+            logger.warning("Error saving signal to database (redis signal preserved): %s — %s", symbol, e)
 
     async def _ensure_signal_table_exists(self) -> None:
         """Ensure ai_live_signals table exists - LIVE PRODUCTION"""

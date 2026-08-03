@@ -24,7 +24,8 @@ DEFAULT_BATCH_SIZE = int(os.getenv("LARGE_TABLE_RETENTION_BATCH_SIZE", "500") or
 DEFAULT_MAX_BATCHES_PER_TABLE = int(os.getenv("LARGE_TABLE_RETENTION_MAX_BATCHES", "100") or "100")
 DEFAULT_MAX_RUN_SECONDS = float(os.getenv("LARGE_TABLE_RETENTION_MAX_RUN_SEC", "45") or "45")
 DEFAULT_INTERVAL_SEC = float(os.getenv("LARGE_TABLE_RETENTION_INTERVAL_SEC", "21600") or "21600")  # 6h
-DEFAULT_INITIAL_DELAY_SEC = float(os.getenv("LARGE_TABLE_RETENTION_INITIAL_DELAY_SEC", "300") or "300")
+# Long initial delay so retention never competes with post-restart exit/bar writes.
+DEFAULT_INITIAL_DELAY_SEC = float(os.getenv("LARGE_TABLE_RETENTION_INITIAL_DELAY_SEC", "900") or "900")
 
 
 @dataclass(frozen=True)

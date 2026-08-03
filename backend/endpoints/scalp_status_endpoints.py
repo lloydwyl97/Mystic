@@ -13,7 +13,6 @@ from typing import Any
 from fastapi import APIRouter, Query
 
 from backend.services.binance_scalp.config import get_scalp_config
-from backend.services.binance_scalp.pnl_summary import build_scalp_pnl_summary
 from backend.services.binance_scalp.strategies import STRATEGY_NAMES, enabled_strategies
 
 logger = logging.getLogger(__name__)
@@ -57,31 +56,31 @@ def _scalp_runner_active() -> bool:
 def scalp_status(*, warm: int = 0) -> dict:
     """Read-only scalp engine status — isolated from DAY top-four.
 
-    Default warm=0 returns a cached/fast snapshot (runner scan overlays momentum).
-    Pass warm=12 for a full cold momentum warm (~60s, diagnostics only).
+    Fast path only: reads the Redis snapshot published by the paper runner.
+    Never rebuilds via REST depth / klines / strategy router / long SQLite.
+    ``warm`` is accepted for API compatibility but does not trigger a rebuild.
     """
+    _ = warm  # ignored — GET must not cold-build
     active = _scalp_runner_active()
-    try:
-        pnl = build_scalp_pnl_summary()
-    except Exception as exc:
-        logger.warning("scalp pnl summary failed: %s", exc)
-        pnl = {"engine": "scalp", "today": {}, "all_time": {}, "pnl_error": str(exc)[:200]}
-
     if not active:
         return {
             "runner_active": False,
             "engine": "scalp",
             "scalp_engaged": False,
+            "snapshot_available": False,
+            "stale": True,
+            "reason": "RUNNER_INACTIVE",
             "operational_summary": {"operational_mode": "runner_dead"},
-            "pnl_summary": pnl,
+            "pnl_summary": {"engine": "scalp"},
             "note": "Scalp paper runner is not running. Start with './start_mystic.sh core' or 'scalp'.",
         }
 
-    warm_rounds = max(0, min(int(warm), 12))
     try:
         from backend.services.binance_scalp.scalp_status_cache import get_cached_scalp_status
 
-        snapshot = get_cached_scalp_status(warm_rounds=warm_rounds)
+        # Read-only Redis snapshot — never rebuilds market state on GET.
+        snapshot = get_cached_scalp_status(warm_rounds=0)
+        pnl = snapshot.pop("pnl_summary", None) or {"engine": "scalp"}
         return {
             "runner_active": True,
             "engine": "scalp",
@@ -89,13 +88,16 @@ def scalp_status(*, warm: int = 0) -> dict:
             **snapshot,
         }
     except Exception as exc:
-        logger.exception("scalp_status failed warm=%s: %s", warm_rounds, exc)
+        logger.exception("scalp_status fast-path failed: %s", exc)
         return {
             "runner_active": True,
             "engine": "scalp",
-            "pnl_summary": pnl,
+            "snapshot_available": False,
+            "stale": True,
+            "reason": "SCALP_STATUS_SNAPSHOT_MISSING",
+            "pnl_summary": {"engine": "scalp"},
             "overall_decision": "DEGRADED",
-            "top_blocker": "STATUS_BUILD_FAILED",
+            "top_blocker": "STATUS_READ_FAILED",
             "status_error": str(exc)[:240],
             "note": "Scalp status snapshot unavailable — retry shortly. Other /api/scalp/* endpoints may still work.",
         }
