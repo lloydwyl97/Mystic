@@ -6,6 +6,7 @@ Scope: runtime stability only (no schema/strategy changes).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import random
 import sqlite3
@@ -52,12 +53,45 @@ def is_locked_error(exc: BaseException) -> bool:
     return "database is locked" in msg or "database table is locked" in msg
 
 
+_wal_ready: set[str] = set()
+
+
+def ensure_wal(db_path: str | Path) -> None:
+    """Set WAL once per process — avoid journal_mode churn on every hot connect."""
+    key = str(db_path)
+    if key in _wal_ready:
+        return
+    conn = sqlite3.connect(key, timeout=_db_timeout_sec())
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute(f"PRAGMA busy_timeout={_busy_timeout_ms()};")
+        _wal_ready.add(key)
+    finally:
+        conn.close()
+
+
 def connect_rw(db_path: str | Path) -> sqlite3.Connection:
+    """Read-write connection for portfolio writer / mutation paths."""
+    ensure_wal(db_path)
     conn = sqlite3.connect(str(db_path), timeout=_db_timeout_sec())
-    conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute(f"PRAGMA busy_timeout={_busy_timeout_ms()};")
+    return conn
+
+
+def connect_ro(db_path: str | Path, *, timeout_sec: float | None = None) -> sqlite3.Connection:
+    """Short-lived read connection for GET/dashboard routes — no write txn, no WAL rewrite."""
+    timeout = _db_timeout_sec() if timeout_sec is None else max(0.1, float(timeout_sec))
+    path = str(db_path)
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+    except sqlite3.OperationalError:
+        conn = sqlite3.connect(path, timeout=timeout)
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("PRAGMA query_only=ON;")
+    conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)};")
     return conn
 
 

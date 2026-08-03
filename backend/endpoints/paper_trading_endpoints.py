@@ -336,7 +336,7 @@ async def _positions_from_portfolio_engine() -> list[dict[str, Any]] | None:
         engine = get_portfolio_engine()
         # LIVE mode: refresh from SQLite (integration may run in external process)
         if getattr(engine, "_live_execution_enabled", False) and hasattr(engine, "_load_positions_from_sqlite"):
-            await engine._load_positions_from_sqlite()
+            await engine._load_positions_from_sqlite(allow_mutations=False)
         if not engine.open_positions:
             return []
         out: list[dict[str, Any]] = []

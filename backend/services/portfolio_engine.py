@@ -108,7 +108,7 @@ from backend.services.risk_governor import (
     MAX_CONSEC_LOSSES,
     RiskGovernor,
 )
-from backend.utils.sqlite_runtime import connect_rw, run_locked_retry
+from backend.utils.sqlite_runtime import connect_ro, connect_rw, is_locked_error, run_locked_retry
 from backend.utils.symbols import normalize_symbol
 
 if TYPE_CHECKING:
@@ -5871,11 +5871,17 @@ class PortfolioEngine:
             return (True, qty_quantized, "below min_notional", est_notional)
         return (False, qty_quantized, "", est_notional)
 
-    async def _load_ledger_from_sqlite(self) -> bool:
-        """Load authoritative ledger from SQLite. Returns True if found."""
+    async def _load_ledger_from_sqlite(self, *, allow_mutations: bool = True) -> bool:
+        """Load authoritative ledger from SQLite. Returns True if found.
+
+        When ``allow_mutations=False`` (GET/read routes): use a read-only connection and
+        do not clear pause flags in memory — leave writer/startup paths to heal.
+        """
 
         def _sync_load():
-            with connect_rw(self.db_path) as conn:
+            opener = connect_rw if allow_mutations else connect_ro
+            kwargs = {} if allow_mutations else {"timeout_sec": 3.0}
+            with opener(self.db_path, **kwargs) as conn:
                 cursor = conn.cursor()
 
                 # Check if table exists
@@ -5923,7 +5929,12 @@ class PortfolioEngine:
             self._pause_reason = row[8] or ""
 
             # AUTO-CLEAR: Clear invariant/recovery pauses on restart - startup will re-evaluate
-            if self._trading_paused and any(tag in self._pause_reason for tag in ("RECOVERY_FAILED", "INVARIANT_VIOLATION", "EQUITY_MISMATCH")):
+            # Writer/init only — never from GET/status read paths.
+            if (
+                allow_mutations
+                and self._trading_paused
+                and any(tag in self._pause_reason for tag in ("RECOVERY_FAILED", "INVARIANT_VIOLATION", "EQUITY_MISMATCH"))
+            ):
                 logger.warning("LOAD_LEDGER: Clearing stale pause '%s' (startup will re-evaluate)", self._pause_reason[:80])
                 self._trading_paused = False
                 self._pause_reason = ""
@@ -6056,11 +6067,17 @@ class PortfolioEngine:
         except Exception as e:
             logger.warning("FIFO_RECONCILE failed: %s", e, exc_info=True)
 
-    async def _load_positions_from_sqlite(self) -> int:
-        """Load positions from SQLite. Returns count loaded."""
+    async def _load_positions_from_sqlite(self, *, allow_mutations: bool = True) -> int:
+        """Load positions from SQLite. Returns count loaded.
+
+        When ``allow_mutations=False`` (GET/status/dashboard reads): SELECT only —
+        no FIFO_RECONCILE, no delete/persist/backfill writes.
+        """
 
         def _sync_load():
-            with connect_rw(self.db_path) as conn:
+            opener = connect_rw if allow_mutations else connect_ro
+            kwargs = {} if allow_mutations else {"timeout_sec": 3.0}
+            with opener(self.db_path, **kwargs) as conn:
                 cursor = conn.cursor()
 
                 # Check if table exists
@@ -6100,10 +6117,11 @@ class PortfolioEngine:
             raw_symbol = row[0]
             normalized_symbol = normalize_symbol(raw_symbol)
 
-            # Clean up malformed symbols from database
+            # Clean up malformed symbols from database (writer/init only)
             if "//" in normalized_symbol or normalized_symbol.count("/") > 1:
                 logger.warning(f"Cleaning malformed symbol from SQLite: {raw_symbol} -> {normalized_symbol}")
-                await self._delete_position_from_sqlite(raw_symbol)
+                if allow_mutations:
+                    await self._delete_position_from_sqlite(raw_symbol)
                 continue
 
             entry_fee = float(row[14]) if len(row) > 14 else 0.0
@@ -6197,7 +6215,8 @@ class PortfolioEngine:
                     normalized_symbol,
                     ";".join(backfill_added),
                 )
-                await self._persist_position_to_sqlite(pos)
+                if allow_mutations:
+                    await self._persist_position_to_sqlite(pos)
             self.open_positions[pos.symbol] = pos
             logger.debug(
                 "LOAD_POSITION: %s qty=%.6f entry=$%.4f (normalized from %s)",
@@ -6207,13 +6226,18 @@ class PortfolioEngine:
                 raw_symbol,
             )
 
-        # Backfill entry_fee from paper_trades for positions with entry_fee=0 (join trade_id -> fees_paid)
-        await self._backfill_entry_fee_from_paper_trades()
+        if allow_mutations:
+            # Backfill entry_fee from paper_trades for positions with entry_fee=0 (join trade_id -> fees_paid)
+            await self._backfill_entry_fee_from_paper_trades()
+            # Writer-owned FIFO heal — never from GET/status (BEGIN IMMEDIATE contention).
+            await asyncio.to_thread(self._sync_paper_fifo_remaining_to_engine_positions_sync)
+            await self._ensure_legacy_inventory_tags()
 
-        await asyncio.to_thread(self._sync_paper_fifo_remaining_to_engine_positions_sync)
-
-        logger.info(f"LOAD_POSITIONS: Restored {len(self.open_positions)} positions from SQLite")
-        await self._ensure_legacy_inventory_tags()
+        logger.info(
+            "LOAD_POSITIONS: Restored %s positions from SQLite (mutations=%s)",
+            len(self.open_positions),
+            allow_mutations,
+        )
         # EXIT_MONITOR calls this frequently; open_positions is replaced from SQLite but
         # _total_open_risk must match or RISK_CAP_EXCEEDED can false-trigger (stale risk vs fresh equity).
         self._compute_total_open_risk()
@@ -18736,7 +18760,7 @@ class PortfolioEngine:
 
     def _scoreboard_activity_breakdown_sync(self, day: str) -> dict[str, Any]:
         """Separate AI closes from admin/synthetic closes for operator clarity."""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_ro(self.db_path, timeout_sec=3.0)
         try:
             cur = conn.cursor()
             cur.execute(
@@ -18866,11 +18890,11 @@ class PortfolioEngine:
             conn.close()
 
     async def get_scoreboard_today(self) -> dict[str, Any]:
-        """Get today's scoreboard only"""
+        """Get today's scoreboard only (read-only — never writes scoreboard rows)."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         def _sync_get():
-            conn = sqlite3.connect(self.db_path)
+            conn = connect_ro(self.db_path, timeout_sec=3.0)
             try:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -18887,16 +18911,46 @@ class PortfolioEngine:
                 conn.close()
 
         loop = asyncio.get_running_loop()
-        row, columns = await loop.run_in_executor(None, _sync_get)
+        try:
+            row, columns = await loop.run_in_executor(None, _sync_get)
+        except sqlite3.OperationalError as exc:
+            if is_locked_error(exc):
+                return {
+                    "date": today,
+                    "status": "SQLITE_BUSY",
+                    "degraded": True,
+                    "error": "database is locked",
+                }
+            raise
 
         if not row:
             base = {"date": today, "status": "NO_DATA"}
-            base.update(await asyncio.get_running_loop().run_in_executor(None, lambda: self._scoreboard_activity_breakdown_sync(today)))
+            try:
+                base.update(
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: self._scoreboard_activity_breakdown_sync(today)
+                    )
+                )
+            except sqlite3.OperationalError as exc:
+                if is_locked_error(exc):
+                    base["degraded"] = True
+                    base["error"] = "database is locked"
+                else:
+                    raise
             return base
 
         data = dict(zip(columns, row, strict=False))
-        breakdown = await asyncio.get_running_loop().run_in_executor(None, lambda: self._scoreboard_activity_breakdown_sync(today))
-        data.update(breakdown)
+        try:
+            breakdown = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._scoreboard_activity_breakdown_sync(today)
+            )
+            data.update(breakdown)
+        except sqlite3.OperationalError as exc:
+            if is_locked_error(exc):
+                data["degraded"] = True
+                data["error"] = "database is locked"
+            else:
+                raise
         return data
 
     # =========================================================================

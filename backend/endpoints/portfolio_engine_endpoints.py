@@ -33,6 +33,7 @@ from backend.services.portfolio_engine import (
     initialize_portfolio_engine,
 )
 from backend.services.portfolio_engine_integration import get_portfolio_integration
+from backend.utils.sqlite_runtime import connect_ro, is_locked_error
 
 _sleeve_cutover_epoch_cache: int | None = None
 
@@ -106,7 +107,7 @@ def _validate_accounting_identity(cash: float, positions: float, equity: float, 
     }
 
 
-async def _refresh_engine_from_sqlite_for_live(engine: Any) -> bool:
+async def _refresh_engine_from_sqlite_for_live(engine: Any, *, allow_mutations: bool = False) -> bool:
     """
     Refresh endpoint snapshot from SQLite when portfolio state can be mutated outside
     this process.
@@ -124,9 +125,9 @@ async def _refresh_engine_from_sqlite_for_live(engine: Any) -> bool:
         return False
     try:
         if hasattr(engine, "_load_ledger_from_sqlite"):
-            await engine._load_ledger_from_sqlite()
+            await engine._load_ledger_from_sqlite(allow_mutations=allow_mutations)
         if hasattr(engine, "_load_positions_from_sqlite"):
-            await engine._load_positions_from_sqlite()
+            await engine._load_positions_from_sqlite(allow_mutations=allow_mutations)
     except Exception as e:
         logger.warning("LIVE_STATUS_REFRESH: SQLite refresh failed: %s", e)
         return False
@@ -137,7 +138,7 @@ def _sqlite_open_positions_count_sync() -> int:
     """Count open rows in portfolio_engine_positions (quantity > 0)."""
     conn = None
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
+        conn = connect_ro(DATABASE_PATH, timeout_sec=2.0)
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='portfolio_engine_positions'")
         if not cursor.fetchone():
@@ -153,19 +154,22 @@ def _sqlite_open_positions_count_sync() -> int:
             conn.close()
 
 
-async def _ensure_engine_positions_match_sqlite(engine: Any) -> int:
+async def _ensure_engine_positions_match_sqlite(engine: Any, *, allow_mutations: bool = False) -> int:
     """
     Ensure in-process engine memory matches SQLite before API responses.
 
     Under EXTERNAL_SUPERVISOR_MODE the integration worker writes positions to SQLite;
     this FastAPI worker must reload or dashboard/status/positions diverge.
+
+    Read paths default to ``allow_mutations=False`` so GET/status never runs
+    FIFO_RECONCILE / persist / delete side effects.
     """
-    await _refresh_engine_from_sqlite_for_live(engine)
+    await _refresh_engine_from_sqlite_for_live(engine, allow_mutations=allow_mutations)
     sqlite_count = await asyncio.to_thread(_sqlite_open_positions_count_sync)
     engine_count = len(getattr(engine, "open_positions", {}) or {})
     if engine_count != sqlite_count and hasattr(engine, "_load_positions_from_sqlite"):
         try:
-            await engine._load_positions_from_sqlite()
+            await engine._load_positions_from_sqlite(allow_mutations=allow_mutations)
             if hasattr(engine, "_recompute_positions_values"):
                 mtm = await engine._fetch_mtm_prices_for_open_positions()
                 await engine._recompute_positions_values(mtm or None)
@@ -479,6 +483,8 @@ async def get_portfolio_status() -> dict[str, Any]:
     Mystic sells only on confirmed real net profit after costs.
 
     CANONICAL SOURCE: Adopted from PaperTradingService (not paper_trades)
+
+    Read-only: no write txn, no FIFO reconcile, no SQLite mutations.
     """
     try:
         engine = get_portfolio_engine()
@@ -494,10 +500,18 @@ async def get_portfolio_status() -> dict[str, Any]:
 
         # Live multi-process: pull ledger/positions from SQLite (see _ensure_engine_positions_match_sqlite).
         # Paper / single-process: skip reload unless external supervisor or live worker is active.
-        await _ensure_engine_positions_match_sqlite(engine)
+        # Always mutation-free on GET — writer owns FIFO reconcile / heals.
+        await _ensure_engine_positions_match_sqlite(engine, allow_mutations=False)
         try:
-            await engine._load_ledger_from_sqlite()
-            await engine._load_positions_from_sqlite()
+            await engine._load_ledger_from_sqlite(allow_mutations=False)
+            await engine._load_positions_from_sqlite(allow_mutations=False)
+        except sqlite3.OperationalError as e:
+            if is_locked_error(e):
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "sqlite_busy", "message": "database is locked"},
+                ) from e
+            raise
         except Exception as e:
             logger.warning("STATUS_SQLITE_RELOAD failed: %s", e)
         await engine._recompute_positions_values(await engine._fetch_mtm_prices_for_open_positions() or None)
@@ -556,6 +570,8 @@ async def get_portfolio_status() -> dict[str, Any]:
             "accounting_check": "total_equity=account_equity=cash_balance+positions_value; performance_equity=principal_based_equity=principal+realized_pnl+unrealized_pnl",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Error getting portfolio status: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -641,10 +657,10 @@ async def get_open_positions() -> dict[str, Any]:
         if not is_portfolio_engine_initialized():
             await initialize_portfolio_engine()
 
-        await _ensure_engine_positions_match_sqlite(engine)
+        await _ensure_engine_positions_match_sqlite(engine, allow_mutations=False)
         try:
-            await engine._load_ledger_from_sqlite()
-            await engine._load_positions_from_sqlite()
+            await engine._load_ledger_from_sqlite(allow_mutations=False)
+            await engine._load_positions_from_sqlite(allow_mutations=False)
         except Exception as e:
             logger.warning("POSITIONS_SQLITE_RELOAD failed: %s", e)
         await engine._recompute_positions_values(await engine._fetch_mtm_prices_for_open_positions() or None)
@@ -1160,7 +1176,7 @@ async def get_dashboard_canonical() -> dict[str, Any]:
         if not is_portfolio_engine_initialized():
             await initialize_portfolio_engine()
 
-        await _ensure_engine_positions_match_sqlite(engine)
+        await _ensure_engine_positions_match_sqlite(engine, allow_mutations=False)
         payload = await engine.build_dashboard_canonical_snapshot()
         from backend.services.market_data_readiness_probe import market_data_dashboard_meta_async
 
@@ -1508,20 +1524,33 @@ async def get_scoreboard(days: int = 7) -> dict[str, Any]:
 
 @router.get("/scoreboard/today")
 async def get_scoreboard_today() -> dict[str, Any]:
-    """Get today's scoreboard only"""
+    """Get today's scoreboard only (read-only — writer updates rows in integration loop)."""
     try:
         engine = get_portfolio_engine()
 
-        # Ensure scoreboard is updated
-        await engine.update_scoreboard()
-
+        # Writer owns scoreboard upserts; GET is SELECT-only.
         today = await engine.get_scoreboard_today()
+        if isinstance(today, dict) and today.get("status") == "SQLITE_BUSY":
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "sqlite_busy", "message": "database is locked"},
+            )
 
         return {
             "success": True,
             "data": today,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+    except HTTPException:
+        raise
+    except sqlite3.OperationalError as e:
+        if is_locked_error(e):
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "sqlite_busy", "message": "database is locked"},
+            ) from e
+        logger.exception("Error getting today's scoreboard: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
     except Exception as e:
         logger.exception(f"Error getting today's scoreboard: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
