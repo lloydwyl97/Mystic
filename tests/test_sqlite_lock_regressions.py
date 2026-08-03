@@ -27,6 +27,8 @@ def test_status_route_loads_without_mutations() -> None:
     source = inspect.getsource(portfolio_engine_endpoints.get_portfolio_status)
     assert "allow_mutations=False" in source
     assert "BEGIN IMMEDIATE" not in source
+    assert "ensure_portfolio_engine_readable" in source
+    assert "initialize_portfolio_engine" not in source
 
 
 @pytest.mark.asyncio
@@ -77,10 +79,9 @@ async def test_get_status_does_not_mutate_db(tmp_path: Path, monkeypatch: pytest
 
     fifo_spy = MagicMock()
     engine._sync_paper_fifo_remaining_to_engine_positions_sync = fifo_spy
-    monkeypatch.setattr(portfolio_engine_endpoints, "get_portfolio_engine", lambda: engine)
     monkeypatch.setattr(
-        "backend.services.portfolio_engine.is_portfolio_engine_initialized",
-        lambda: True,
+        "backend.services.portfolio_engine.ensure_portfolio_engine_readable",
+        AsyncMock(return_value=engine),
     )
     monkeypatch.setenv("EXTERNAL_SUPERVISOR_MODE", "false")
     engine._live_execution_enabled = False
@@ -103,7 +104,6 @@ async def test_get_status_does_not_mutate_db(tmp_path: Path, monkeypatch: pytest
         lambda: 0,
     )
 
-    engine._fetch_mtm_prices_for_open_positions = AsyncMock(return_value={})
     result = await portfolio_engine_endpoints.get_portfolio_status()
     assert result["success"] is True
     engine._fetch_mtm_prices_for_open_positions.assert_not_awaited()
@@ -158,10 +158,9 @@ async def test_locked_db_status_endpoint_bounded(tmp_path: Path, monkeypatch: py
     db_path = tmp_path / "lock_status.db"
     engine = PortfolioEngine(db_path=str(db_path), principal=10_000.0, test_mode=True)
     engine._ensure_db_schema()
-    monkeypatch.setattr(portfolio_engine_endpoints, "get_portfolio_engine", lambda: engine)
     monkeypatch.setattr(
-        "backend.services.portfolio_engine.is_portfolio_engine_initialized",
-        lambda: True,
+        "backend.services.portfolio_engine.ensure_portfolio_engine_readable",
+        AsyncMock(return_value=engine),
     )
     monkeypatch.setenv("EXTERNAL_SUPERVISOR_MODE", "true")
     engine._live_execution_enabled = False

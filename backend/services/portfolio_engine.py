@@ -16013,7 +16013,8 @@ class PortfolioEngine:
         if not missing_tids:
             return
         try:
-            with sqlite3.connect(self.db_path) as _conn:
+            # Short RO timeout — never block /status on writer locks (default connect hangs).
+            with connect_ro(self.db_path, timeout_sec=2.0) as _conn:
                 qmarks = ",".join("?" for _ in missing_tids)
                 buy_rows = _conn.execute(
                     f"""
@@ -19815,6 +19816,8 @@ async def initialize_portfolio_engine() -> PortfolioEngine:
     - PaperTradingService / Redis are refreshed from SQLite (cache only)
 
     NOT from paper_trades.remaining_position alone.
+
+    Writer/startup only — GET/status must use ``ensure_portfolio_engine_readable``.
     """
     global _portfolio_engine_initialized
     engine = get_portfolio_engine()
@@ -19829,6 +19832,24 @@ async def initialize_portfolio_engine() -> PortfolioEngine:
     await engine.initialize_from_canonical_sources()
     with contextlib.suppress(Exception):
         engine._reload_entry_reservations_from_db()
+    _portfolio_engine_initialized = True
+    return engine
+
+
+async def ensure_portfolio_engine_readable() -> PortfolioEngine:
+    """
+    API-process bootstrap: SELECT-only ledger/positions load.
+
+    Never runs FIFO_RECONCILE, Binance MTM, corruption repair, or schema DDL.
+    Safe for GET /status /positions /scoreboard under EXTERNAL_SUPERVISOR_MODE.
+    """
+    global _portfolio_engine_initialized
+    engine = get_portfolio_engine()
+    if _portfolio_engine_initialized:
+        return engine
+    await engine._load_ledger_from_sqlite(allow_mutations=False)
+    await engine._load_positions_from_sqlite(allow_mutations=False)
+    await engine._recompute_positions_values(None, allow_network_mtm=False)
     _portfolio_engine_initialized = True
     return engine
 

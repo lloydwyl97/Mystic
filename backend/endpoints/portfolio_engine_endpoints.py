@@ -490,16 +490,10 @@ async def get_portfolio_status() -> dict[str, Any]:
     Read-only: no write txn, no FIFO reconcile, no SQLite mutations.
     """
     try:
-        engine = get_portfolio_engine()
+        from backend.services.portfolio_engine import ensure_portfolio_engine_readable
 
-        # Check if engine has been initialized from canonical sources
-        from backend.services.portfolio_engine import is_portfolio_engine_initialized
-
-        if not is_portfolio_engine_initialized():
-            # Auto-initialize from canonical sources
-            from backend.services.portfolio_engine import initialize_portfolio_engine
-
-            await initialize_portfolio_engine()
+        # Read-only bootstrap — never full initialize_from_canonical_sources (FIFO/Binance).
+        engine = await ensure_portfolio_engine_readable()
 
         # Live multi-process: pull ledger/positions from SQLite (see _ensure_engine_positions_match_sqlite).
         # Paper / single-process: skip reload unless external supervisor or live worker is active.
@@ -655,11 +649,9 @@ async def get_open_positions() -> dict[str, Any]:
     Mystic sells ONLY when real net profit after costs is confirmed.
     """
     try:
-        engine = get_portfolio_engine()
-        from backend.services.portfolio_engine import is_portfolio_engine_initialized
+        from backend.services.portfolio_engine import ensure_portfolio_engine_readable
 
-        if not is_portfolio_engine_initialized():
-            await initialize_portfolio_engine()
+        engine = await ensure_portfolio_engine_readable()
 
         await _ensure_engine_positions_match_sqlite(engine, allow_mutations=False)
         try:
@@ -1174,11 +1166,9 @@ async def get_dashboard_canonical() -> dict[str, Any]:
     All panels should use this path to avoid split-brain between SQLite rows and empty engine memory.
     """
     try:
-        engine = get_portfolio_engine()
-        from backend.services.portfolio_engine import is_portfolio_engine_initialized
+        from backend.services.portfolio_engine import ensure_portfolio_engine_readable
 
-        if not is_portfolio_engine_initialized():
-            await initialize_portfolio_engine()
+        engine = await ensure_portfolio_engine_readable()
 
         await _ensure_engine_positions_match_sqlite(engine, allow_mutations=False)
         payload = await engine.build_dashboard_canonical_snapshot()
