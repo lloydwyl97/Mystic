@@ -1418,7 +1418,8 @@ class PortfolioEngineIntegration:
         # monitor_all_positions match persisted open rows (same truth as /api/.../status).
         try:
             if hasattr(self.engine, "_load_positions_from_sqlite"):
-                await self.engine._load_positions_from_sqlite()
+                # SELECT-only rehydrate — FIFO reconcile is throttled on writer mutation loads.
+                await self.engine._load_positions_from_sqlite(allow_mutations=False)
         except Exception as e:
             logger.warning("EXIT_MONITOR_REHYDRATE failed: %s", e)
 
@@ -1617,7 +1618,8 @@ class PortfolioEngineIntegration:
                             # In-memory ledger is authoritative between buy/sell commits;
                             # reloading mid-buy races and restores pre-debit cash while the
                             # new position is already visible → double-counted equity.
-                            await eng._load_positions_from_sqlite()
+                            # Positions SELECT only here; FIFO is throttled separately.
+                            await eng._load_positions_from_sqlite(allow_mutations=False)
                             mtm_prices = await eng._fetch_mtm_prices_for_open_positions()
                             await eng._recompute_positions_values(mtm_prices or self.current_prices or None)
                             await eng._persist_ledger_to_sqlite()

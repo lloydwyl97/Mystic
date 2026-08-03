@@ -103,8 +103,10 @@ async def test_get_status_does_not_mutate_db(tmp_path: Path, monkeypatch: pytest
         lambda: 0,
     )
 
+    engine._fetch_mtm_prices_for_open_positions = AsyncMock(return_value={})
     result = await portfolio_engine_endpoints.get_portfolio_status()
     assert result["success"] is True
+    engine._fetch_mtm_prices_for_open_positions.assert_not_awaited()
 
     with sqlite3.connect(db_path) as conn:
         after = {

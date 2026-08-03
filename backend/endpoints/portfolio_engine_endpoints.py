@@ -171,8 +171,11 @@ async def _ensure_engine_positions_match_sqlite(engine: Any, *, allow_mutations:
         try:
             await engine._load_positions_from_sqlite(allow_mutations=allow_mutations)
             if hasattr(engine, "_recompute_positions_values"):
-                mtm = await engine._fetch_mtm_prices_for_open_positions()
-                await engine._recompute_positions_values(mtm or None)
+                if allow_mutations:
+                    mtm = await engine._fetch_mtm_prices_for_open_positions()
+                    await engine._recompute_positions_values(mtm or None)
+                else:
+                    await engine._recompute_positions_values(None, allow_network_mtm=False)
         except Exception as e:
             logger.warning("POSITIONS_SQLITE_RESYNC failed: %s", e)
         engine_count = len(getattr(engine, "open_positions", {}) or {})
@@ -514,7 +517,8 @@ async def get_portfolio_status() -> dict[str, Any]:
             raise
         except Exception as e:
             logger.warning("STATUS_SQLITE_RELOAD failed: %s", e)
-        await engine._recompute_positions_values(await engine._fetch_mtm_prices_for_open_positions() or None)
+        # Redis/cache marks only — never Binance REST on GET (was hanging status under load).
+        await engine._recompute_positions_values(None, allow_network_mtm=False)
         status = engine.get_portfolio_status()
         # Align top-level unrealized with recomputed engine marks (same as ledger MTM persist).
         status["unrealized_pnl"] = engine._unrealized_pnl
@@ -663,7 +667,7 @@ async def get_open_positions() -> dict[str, Any]:
             await engine._load_positions_from_sqlite(allow_mutations=False)
         except Exception as e:
             logger.warning("POSITIONS_SQLITE_RELOAD failed: %s", e)
-        await engine._recompute_positions_values(await engine._fetch_mtm_prices_for_open_positions() or None)
+        await engine._recompute_positions_values(None, allow_network_mtm=False)
         positions = []
 
         for symbol, pos in engine.open_positions.items():

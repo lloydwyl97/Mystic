@@ -3646,13 +3646,21 @@ class PortfolioEngine:
             return prices
         return None
 
-    async def _recompute_positions_values(self, prices: dict[str, float] | None = None) -> None:
+    async def _recompute_positions_values(
+        self,
+        prices: dict[str, float] | None = None,
+        *,
+        allow_network_mtm: bool = True,
+    ) -> None:
         """
         Canonical equity: positions_value = market value, total_equity = cash_balance + positions_value.
         Does NOT change cash_balance (cash is from exchange or trade). Does NOT change realized_pnl.
+
+        GET/read routes should pass ``allow_network_mtm=False`` so status never blocks on
+        Binance REST; Redis/cache marks are used instead (writer owns live MTM persist).
         """
         resolved_prices = self._resolve_mtm_prices(prices)
-        if not resolved_prices and self.open_positions:
+        if not resolved_prices and self.open_positions and allow_network_mtm:
             resolved_prices = await self._fetch_mtm_prices_for_open_positions()
         positions_value_market, cost_basis = await asyncio.to_thread(self._compute_positions_value_and_cost_basis, resolved_prices)
         self._positions_value = positions_value_market
@@ -6229,8 +6237,14 @@ class PortfolioEngine:
         if allow_mutations:
             # Backfill entry_fee from paper_trades for positions with entry_fee=0 (join trade_id -> fees_paid)
             await self._backfill_entry_fee_from_paper_trades()
-            # Writer-owned FIFO heal — never from GET/status (BEGIN IMMEDIATE contention).
-            await asyncio.to_thread(self._sync_paper_fifo_remaining_to_engine_positions_sync)
+            # Writer-owned FIFO heal — throttled so exit-monitor/MTM reloads do not
+            # BEGIN IMMEDIATE on every tick (was locking uvicorn + bar processor).
+            min_interval = float(os.getenv("FIFO_RECONCILE_MIN_INTERVAL_SEC", "60") or "60")
+            now_ts = time.time()
+            last_fifo = float(getattr(self, "_fifo_reconcile_last_ts", 0.0) or 0.0)
+            if now_ts - last_fifo >= max(5.0, min_interval):
+                await asyncio.to_thread(self._sync_paper_fifo_remaining_to_engine_positions_sync)
+                self._fifo_reconcile_last_ts = now_ts
             await self._ensure_legacy_inventory_tags()
 
         logger.info(
