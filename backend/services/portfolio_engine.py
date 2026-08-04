@@ -4956,6 +4956,51 @@ class PortfolioEngine:
                     except Exception:
                         logger.debug("LEARNING_ENRICH_BUY_LOOKUP_FAILED symbol=%s", symbol, exc_info=True)
 
+                # Unify setup identity + exit raw/canonical on the close payload.
+                with contextlib.suppress(Exception):
+                    from backend.services.day_trade_thesis import resolve_setup_identity, split_day_exit_reasons
+
+                    if not isinstance(ex_payload, dict):
+                        ex_payload = {}
+                    _ident = resolve_setup_identity(ex_payload)
+                    if _ident.get("setup_type_canonical"):
+                        ex_payload["setup_type_canonical"] = _ident["setup_type_canonical"]
+                        ex_payload["setup_type_raw"] = _ident["setup_type_raw"]
+                        ex_payload["setup_type"] = _ident["setup_type_canonical"]
+                        ex_payload["entry_thesis"] = _ident["entry_thesis"] or _ident["setup_type_canonical"]
+                        ex_payload["day_route_regime"] = _ident["day_route_regime"]
+                        ex_payload["adaptive_regime"] = _ident["adaptive_regime"]
+                    _eparts = split_day_exit_reasons(
+                        str(
+                            reporting.get("raw_exit_reason")
+                            or getattr(position, "_learning_raw_exit_reason", None)
+                            or close_reason
+                            or ""
+                        )
+                    )
+                    ex_payload["raw_exit_reason"] = reporting.get("raw_exit_reason") or _eparts["raw_exit_reason"]
+                    ex_payload["canonical_exit_reason"] = (
+                        reporting.get("canonical_exit_reason") or _eparts["canonical_exit_reason"]
+                    )
+                    if reporting.get("dead_trade_reason") or _eparts.get("dead_trade_reason"):
+                        ex_payload["dead_trade_reason"] = (
+                            reporting.get("dead_trade_reason") or _eparts.get("dead_trade_reason")
+                        )
+
+                entry_px = float(entry_price or 0.0)
+                hi = float(getattr(position, "highest_price", 0.0) or 0.0)
+                lo = float(getattr(position, "lowest_price", 0.0) or 0.0)
+                mfe_pct = ((hi - entry_px) / entry_px) if entry_px > 0 and hi > 0 else None
+                mae_pct_signed = ((lo - entry_px) / entry_px) if entry_px > 0 and lo > 0 else None
+                mae_pct_abs = abs(mae_pct_signed) if mae_pct_signed is not None else None
+                if isinstance(ex_payload, dict):
+                    if mfe_pct is not None:
+                        ex_payload["mfe_pct"] = mfe_pct
+                        ex_payload["max_favorable_excursion"] = mfe_pct
+                    if mae_pct_abs is not None:
+                        ex_payload["mae_pct"] = mae_pct_abs
+                        ex_payload["max_adverse_excursion"] = mae_pct_abs
+
                 if ex_payload:
                     _sel = ex_payload.get("selected_score") or ex_payload.get("final_selection_score") or ex_payload.get("rank_score")
                     rank_data = {
@@ -4969,6 +5014,7 @@ class PortfolioEngine:
                         "adjusted_score": ex_payload.get("adjusted_score"),
                         "composite_score": ex_payload.get("composite_score"),
                         "ai_confidence": ex_payload.get("ai_confidence"),
+                        "confidence": ex_payload.get("ai_confidence") or ex_payload.get("confidence"),
                         "net_expected_value": ex_payload.get("selected_net_expected_value"),
                         "selected_net_expected_value": ex_payload.get("selected_net_expected_value"),
                         "prob_buy": ex_payload.get("prob_buy"),
@@ -4976,7 +5022,9 @@ class PortfolioEngine:
                         "prob_sell": ex_payload.get("prob_sell"),
                         "quality_opinion_penalty": ex_payload.get("quality_opinion_penalty"),
                         "signal_side_penalty": ex_payload.get("signal_side_penalty"),
-                        "regime": ex_payload.get("regime"),
+                        "regime": ex_payload.get("day_route_regime") or ex_payload.get("regime"),
+                        "day_route_regime": ex_payload.get("day_route_regime"),
+                        "adaptive_regime": ex_payload.get("adaptive_regime"),
                         "price_structure_regime": ex_payload.get("price_structure_regime"),
                         "live_ai_strategy": ex_payload.get("live_ai_strategy") or "day",
                         "why_selected": ex_payload.get("why_selected"),
@@ -4984,6 +5032,16 @@ class PortfolioEngine:
                         "peer_ranks_json": ex_payload.get("peer_ranks_json"),
                         "intelligence_rank_delta": ex_payload.get("intelligence_rank_delta"),
                         "decision_id": ex_payload.get("decision_id"),
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": mae_pct_abs,
+                        "raw_exit_reason": ex_payload.get("raw_exit_reason"),
+                        "canonical_exit_reason": ex_payload.get("canonical_exit_reason"),
+                        "dead_trade_reason": ex_payload.get("dead_trade_reason"),
+                        "setup_type": ex_payload.get("setup_type"),
+                        "setup_type_canonical": ex_payload.get("setup_type_canonical"),
+                        "setup_type_raw": ex_payload.get("setup_type_raw"),
+                        "entry_thesis": ex_payload.get("entry_thesis"),
+                        "outcome_penalty_applied": ex_payload.get("outcome_penalty_applied"),
                     }
                     if confidence_val is None and ex_payload.get("ai_confidence") is not None:
                         confidence_val = float(ex_payload.get("ai_confidence") or 0.0) or None
@@ -5024,14 +5082,11 @@ class PortfolioEngine:
                     "features": entry_feats,
                     "context_snapshot": ctx_snap_obj,
                 }
-                entry_px = float(entry_price or 0.0)
-                hi = float(getattr(position, "highest_price", 0.0) or 0.0)
-                lo = float(getattr(position, "lowest_price", 0.0) or 0.0)
                 indicators_while_holding = {
                     "highest_price": hi or None,
                     "lowest_price": lo or None,
-                    "mfe_pct": ((hi - entry_px) / entry_px) if entry_px > 0 and hi > 0 else None,
-                    "mae_pct": ((lo - entry_px) / entry_px) if entry_px > 0 and lo > 0 else None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": mae_pct_signed,
                     "max_hold_min": int(getattr(position, "max_hold_min", 0) or 0) or None,
                 }
                 indicators_at_sell = {
@@ -5083,14 +5138,64 @@ class PortfolioEngine:
             with contextlib.suppress(Exception):
                 from backend.services.ai_outcome_training_writer import record_outcome_training_row
                 from backend.services.ai_post_trade_feature_review import _lookup_entry_features
+                from backend.services.day_trade_thesis import resolve_setup_identity, split_day_exit_reasons
 
                 ex_payload: dict[str, Any] = {}
                 tid = getattr(position, "trade_id", "") or ""
                 if tid and tid in self.trade_explanations:
                     ex_payload = self.trade_explanations[tid].to_dict()
+                # Merge BUY explainability when in-memory payload is thin (empty probs/setup).
+                if tid and (not ex_payload.get("prob_buy") or not ex_payload.get("setup_type")):
+                    try:
+                        with sqlite3.connect(self.db_path) as _lc:
+                            _row = _lc.execute(
+                                """
+                                SELECT explainability_json FROM paper_trades
+                                WHERE trade_id = ? AND UPPER(side) = 'BUY'
+                                ORDER BY id DESC LIMIT 1
+                                """,
+                                (tid,),
+                            ).fetchone()
+                        if _row and _row[0]:
+                            _buy_ex = json.loads(_row[0]) if isinstance(_row[0], str) else dict(_row[0] or {})
+                            if isinstance(_buy_ex, dict):
+                                merged = dict(_buy_ex)
+                                merged.update({k: v for k, v in ex_payload.items() if v not in (None, "", [], {})})
+                                ex_payload = merged
+                    except Exception:
+                        pass
                 entry_ts = float(getattr(position, "entry_time", 0.0) or 0.0)
                 opened_iso = datetime.fromtimestamp(entry_ts, tz=timezone.utc).isoformat() if entry_ts > 0 else None
                 closed_iso = datetime.now(timezone.utc).isoformat()
+                _eparts = split_day_exit_reasons(
+                    str(reporting.get("raw_exit_reason") or getattr(position, "_learning_raw_exit_reason", None) or close_reason or "")
+                )
+                ex_payload["raw_exit_reason"] = reporting.get("raw_exit_reason") or _eparts["raw_exit_reason"]
+                ex_payload["canonical_exit_reason"] = (
+                    reporting.get("canonical_exit_reason") or _eparts["canonical_exit_reason"]
+                )
+                if reporting.get("dead_trade_reason") or _eparts.get("dead_trade_reason"):
+                    ex_payload["dead_trade_reason"] = (
+                        reporting.get("dead_trade_reason") or _eparts.get("dead_trade_reason")
+                    )
+                _epx = float(entry_price or getattr(position, "entry_price", 0.0) or 0.0)
+                _hi = float(getattr(position, "highest_price", 0.0) or 0.0)
+                _lo = float(getattr(position, "lowest_price", 0.0) or 0.0)
+                if _epx > 0:
+                    if _hi > 0:
+                        ex_payload["mfe_pct"] = max(0.0, (_hi - _epx) / _epx)
+                        ex_payload["max_favorable_excursion"] = ex_payload["mfe_pct"]
+                    if _lo > 0:
+                        ex_payload["mae_pct"] = max(0.0, (_epx - _lo) / _epx)
+                        ex_payload["max_adverse_excursion"] = ex_payload["mae_pct"]
+                _ident = resolve_setup_identity(ex_payload)
+                if _ident.get("setup_type_canonical"):
+                    ex_payload["setup_type_canonical"] = _ident["setup_type_canonical"]
+                    ex_payload["setup_type_raw"] = _ident["setup_type_raw"]
+                    ex_payload["setup_type"] = _ident["setup_type_canonical"]
+                    ex_payload["entry_thesis"] = _ident["entry_thesis"] or _ident["setup_type_canonical"]
+                    ex_payload["day_route_regime"] = _ident["day_route_regime"]
+                    ex_payload["adaptive_regime"] = _ident["adaptive_regime"]
                 decision_id = str(ex_payload.get("decision_id") or ex_payload.get("entry_decision_id") or "")
                 bus = normalize_symbol(symbol).replace("/", "").upper()
                 entry_feats = _lookup_entry_features(
@@ -8856,9 +8961,19 @@ class PortfolioEngine:
             {"reason_code": exit_type.name, "exit_trigger": exit_trigger, "qty": quantity},
         )
 
-        from backend.services.day_trade_thesis import canonical_day_exit_reason
+        from backend.services.day_trade_thesis import canonical_day_exit_reason, split_day_exit_reasons
 
-        exit_trigger = canonical_day_exit_reason(exit_trigger, exit_type_name=exit_type.name)
+        # Preserve internal STALL detail for learning before display canonicalize.
+        _raw_exit_trigger = str(exit_trigger or "")
+        _exit_parts = split_day_exit_reasons(_raw_exit_trigger, exit_type_name=exit_type.name)
+        exit_trigger = str(_exit_parts.get("canonical_exit_reason") or canonical_day_exit_reason(_raw_exit_trigger, exit_type_name=exit_type.name))
+        # Stash on position for learning/attribution writers (not a strategy change).
+        try:
+            setattr(position, "_learning_raw_exit_reason", _exit_parts.get("raw_exit_reason"))
+            setattr(position, "_learning_canonical_exit_reason", _exit_parts.get("canonical_exit_reason"))
+            setattr(position, "_learning_dead_trade_reason", _exit_parts.get("dead_trade_reason"))
+        except Exception:
+            pass
 
         if quantity > position.quantity:
             logger.error(f"SELL_ERROR: Quantity {quantity} > position {position.quantity} for {symbol}")
@@ -9133,6 +9248,43 @@ class PortfolioEngine:
                         explain_obj.exit_r_multiple = r_multiple
                         explain_obj.exit_trigger = exit_trigger
                         original_explain = explain_obj.to_dict()
+                    # Learning labels: raw STALL_EXIT_DEAD_NO_MFE + canonical STALL_EXIT.
+                    _raw_lrn = getattr(position, "_learning_raw_exit_reason", None) or _raw_exit_trigger
+                    _canon_lrn = getattr(position, "_learning_canonical_exit_reason", None) or exit_trigger
+                    _dead_lrn = getattr(position, "_learning_dead_trade_reason", None)
+                    original_explain["raw_exit_reason"] = str(_raw_lrn or "")
+                    original_explain["canonical_exit_reason"] = str(_canon_lrn or "")
+                    original_explain["exit_reason_raw"] = str(_raw_lrn or "")
+                    original_explain["exit_reason_canonical"] = str(_canon_lrn or "")
+                    if _dead_lrn:
+                        original_explain["dead_trade_reason"] = str(_dead_lrn)
+                    # MFE/MAE from position marks (authoritative for this close).
+                    try:
+                        _ep = float(getattr(position, "entry_price", 0.0) or 0.0)
+                        _hi = float(getattr(position, "highest_price", 0.0) or 0.0)
+                        _lo = float(getattr(position, "lowest_price", 0.0) or 0.0)
+                        if _ep > 0:
+                            _mfe = max(0.0, (_hi - _ep) / _ep) if _hi > 0 else float(original_explain.get("mfe_pct") or 0.0)
+                            _mae = max(0.0, (_ep - _lo) / _ep) if _lo > 0 else abs(float(original_explain.get("mae_pct") or 0.0))
+                            original_explain["mfe_pct"] = _mfe
+                            original_explain["mae_pct"] = _mae
+                            original_explain["max_favorable_excursion"] = _mfe
+                            original_explain["max_adverse_excursion"] = _mae
+                    except Exception:
+                        pass
+                    try:
+                        from backend.services.day_trade_thesis import resolve_setup_identity
+
+                        _ident = resolve_setup_identity(original_explain)
+                        if _ident.get("setup_type_canonical"):
+                            original_explain["setup_type_canonical"] = _ident["setup_type_canonical"]
+                            original_explain["setup_type_raw"] = _ident["setup_type_raw"]
+                            original_explain["setup_type"] = _ident["setup_type_canonical"]
+                            original_explain["entry_thesis"] = _ident["entry_thesis"] or _ident["setup_type_canonical"]
+                            original_explain["day_route_regime"] = _ident["day_route_regime"]
+                            original_explain["adaptive_regime"] = _ident["adaptive_regime"]
+                    except Exception:
+                        pass
                     original_explain["model_trained_at"] = getattr(explain_obj, "model_trained_at", "") or original_explain.get("model_trained_at", "")
                     original_explain["model_accuracy"] = getattr(explain_obj, "model_accuracy", None) or original_explain.get("model_accuracy")
                     original_explain["signal_ts_utc"] = getattr(explain_obj, "signal_content_timestamp", "") or original_explain.get("signal_content_timestamp", "")
@@ -10079,7 +10231,9 @@ class PortfolioEngine:
         # HUMAN_MANUAL_SELL records.
         is_manual = exit_type == ExitType.MANUAL
         wall_cooldown_until = float(self._quality_filter_state.symbol_cooldown_wall.get(normalized_symbol, time.time() + float(POST_SELL_COOLDOWN_WALL_SEC)))
-        ai_close_reason = self._resolve_learning_close_reason(exit_type, exit_trigger, force_sell=force_sell)
+        # Resolve learning close reason from RAW engine trigger so DEAD_NO_MFE survives.
+        _learn_trig = str(getattr(position, "_learning_raw_exit_reason", None) or _raw_exit_trigger or exit_trigger or "")
+        ai_close_reason = self._resolve_learning_close_reason(exit_type, _learn_trig, force_sell=force_sell)
         entry_px = float(position.entry_price or 0.0)
         mark_px = sell_eval.get("mark_price")
         decision_mark_pnl_pct = float(sell_eval.get("net_exit_pct") or 0.0) if sell_eval.get("mark_price") is not None else None
@@ -10096,6 +10250,9 @@ class PortfolioEngine:
             "slippage_usd": float(slippage_cost),
             "net_pnl_usd": float(realized_pnl),
             "exit_trigger": str(exit_trigger or ""),
+            "raw_exit_reason": str(getattr(position, "_learning_raw_exit_reason", None) or _learn_trig or ""),
+            "canonical_exit_reason": str(getattr(position, "_learning_canonical_exit_reason", None) or exit_trigger or ""),
+            "dead_trade_reason": getattr(position, "_learning_dead_trade_reason", None),
             "exit_type": str(exit_type.value),
         }
         with contextlib.suppress(Exception):

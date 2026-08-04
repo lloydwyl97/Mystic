@@ -132,6 +132,15 @@ def _propagate_symbol_strategy_expectancy(conn: sqlite3.Connection, sym: str, st
         logger.warning("propagate_symbol_strategy_expectancy failed symbol=%s: %s", sym, exc)
 
 
+def _as_float(v: Any) -> float | None:
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def record_outcome_training_row(
     *,
     symbol: str,
@@ -154,15 +163,30 @@ def record_outcome_training_row(
     """Insert or replace outcome row. Returns row id or None on failure."""
     try:
         ensure_ai_canonical_tables(db_path)
+        from backend.services.day_trade_thesis import resolve_setup_identity, split_day_exit_reasons
+
         sym = _normalize_symbol(symbol)
+        ex = dict(explainability or {})
+        identity = resolve_setup_identity(ex)
+        exit_parts = split_day_exit_reasons(
+            str(ex.get("raw_exit_reason") or ex.get("exit_trigger") or close_reason or "")
+        )
+        raw_exit = str(ex.get("raw_exit_reason") or exit_parts["raw_exit_reason"] or close_reason or "")
+        canonical_exit = str(
+            ex.get("canonical_exit_reason") or exit_parts["canonical_exit_reason"] or close_reason or ""
+        )
+        # Classify using raw stall detail when present (DEAD still counts as STALL_LOSS).
         gb, ol, oc = classify_outcome_label(
-            close_reason=close_reason,
+            close_reason=raw_exit or close_reason,
             net_profit_usd=net_profit_usd,
             net_profit_pct=net_profit_pct,
             manual_sell=manual_sell,
         )
-        ex = explainability or {}
         ingested = datetime.now(timezone.utc).isoformat()
+        mfe = _as_float(ex.get("mfe_pct") if ex.get("mfe_pct") is not None else ex.get("max_favorable_excursion"))
+        mae = _as_float(ex.get("mae_pct") if ex.get("mae_pct") is not None else ex.get("max_adverse_excursion"))
+        if mae is not None and mae < 0:
+            mae = abs(mae)
 
         # ROOT-CAUSE ATTRIBUTION FOR TRAINING: reuse day_outcome_attribution's
         # classifier (already computed at close time for human/ops review) so the
@@ -177,88 +201,109 @@ def record_outcome_training_row(
             attribution_reason = classify_outcome_reason(
                 explainability=ex,
                 net_profit_pct=net_profit_pct,
-                close_reason=close_reason,
+                close_reason=raw_exit or close_reason,
                 hold_seconds=hold_seconds,
             )
         except Exception as attr_exc:
             logger.debug("outcome_attribution_reason skipped symbol=%s: %s", symbol, attr_exc)
+
+        score_components = {
+            "feature_version": ex.get("feature_version"),
+            "feature_dim": ex.get("feature_dim"),
+            "artifact_path": ex.get("artifact_path"),
+            "artifact_sha256": ex.get("artifact_sha256"),
+            "model_trained_at": ex.get("model_trained_at"),
+            "model_accuracy": ex.get("model_accuracy"),
+            "close_reason": close_reason,
+            "exit_reason_raw": raw_exit,
+            "exit_reason_canonical": canonical_exit,
+            "raw_exit_reason": raw_exit,
+            "canonical_exit_reason": canonical_exit,
+            "dead_trade_reason": ex.get("dead_trade_reason") or exit_parts.get("dead_trade_reason"),
+            "ai_confidence": ex.get("ai_confidence"),
+            "confidence": ex.get("confidence") or ex.get("ai_confidence"),
+            "entry_buy_margin": ex.get("entry_buy_margin"),
+            "buy_margin": ex.get("buy_margin"),
+            "trend_score": ex.get("trend_score"),
+            "chop_score": ex.get("chop_score"),
+            "coin_expectancy": ex.get("coin_expectancy"),
+            "signal_ctx_rs_btc": ex.get("signal_ctx_rs_btc"),
+            "entry_spread_pct": ex.get("entry_spread_pct"),
+            "selected_net_expected_value": ex.get("selected_net_expected_value"),
+            "day_route_regime": identity["day_route_regime"] or ex.get("day_route_regime"),
+            "adaptive_regime": identity["adaptive_regime"],
+            "setup_type": identity["setup_type_canonical"] or ex.get("setup_type") or ex.get("entry_thesis"),
+            "setup_type_canonical": identity["setup_type_canonical"],
+            "setup_type_raw": identity["setup_type_raw"],
+            "entry_thesis": identity["entry_thesis"],
+            "final_selection_score": ex.get("final_selection_score"),
+            "rank_score": ex.get("rank_score"),
+            "prob_buy": ex.get("prob_buy"),
+            "prob_hold": ex.get("prob_hold"),
+            "prob_sell": ex.get("prob_sell"),
+            "mfe_pct": mfe,
+            "mae_pct": mae,
+            "feature_health_pass": ex.get("feature_health_pass"),
+            "feature_health_pct": ex.get("feature_health_pct"),
+            "feature_health_bad_count": ex.get("feature_health_bad_count"),
+            "setup_score": ex.get("setup_score"),
+            "execution_quality_score": ex.get("execution_quality_score"),
+            "feature_health_score": ex.get("feature_health_score"),
+            "block_scores_json": ex.get("block_scores_json"),
+            "intelligence_rank_delta": ex.get("intelligence_rank_delta"),
+            "outcome_attribution_reason": attribution_reason,
+        }
+
+        values: dict[str, Any] = {
+            "symbol": sym,
+            "opened_at_utc": opened_at_utc,
+            "closed_at_utc": closed_at_utc,
+            "hold_seconds": hold_seconds,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "realized_pct": net_profit_pct,
+            "outcome_label": ol,
+            "outcome_class": oc,
+            "features_json": features_json,
+            "context_json": context_json,
+            "strategy_id": strategy_id,
+            "good_bad_memory_class": gb,
+            "gross_pnl_pct": gross_pnl_pct,
+            "net_pnl_pct": net_profit_pct,
+            "trade_was_worth_taking": 1 if ol == 1 else 0,
+            "ingested_at_utc": ingested,
+            "score_components_json": json.dumps(score_components, separators=(",", ":")),
+            "max_favorable_excursion": mfe,
+            "max_adverse_excursion": mae,
+            "mfe_giveback_pct": _as_float(ex.get("mfe_giveback_pct")),
+            "exit_quality_label": ex.get("exit_quality_label"),
+            "selected_net_expected_value": _as_float(ex.get("selected_net_expected_value")),
+            "net_expected_value_entry": _as_float(ex.get("selected_net_expected_value")),
+        }
+
         with sqlite3.connect(db_path) as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO ai_outcome_training_rows (
-                    symbol, opened_at_utc, closed_at_utc, hold_seconds,
-                    entry_price, exit_price, realized_pct, outcome_label, outcome_class,
-                    features_json, context_json, strategy_id,
-                    good_bad_memory_class, gross_pnl_pct, net_pnl_pct,
-                    trade_was_worth_taking, ingested_at_utc,
-                    score_components_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(symbol, opened_at_utc, closed_at_utc) DO UPDATE SET
-                    good_bad_memory_class=excluded.good_bad_memory_class,
-                    outcome_label=excluded.outcome_label,
-                    outcome_class=excluded.outcome_class,
-                    net_pnl_pct=excluded.net_pnl_pct,
-                    gross_pnl_pct=excluded.gross_pnl_pct,
-                    trade_was_worth_taking=excluded.trade_was_worth_taking,
-                    features_json=COALESCE(excluded.features_json, ai_outcome_training_rows.features_json),
-                    context_json=COALESCE(excluded.context_json, ai_outcome_training_rows.context_json),
-                    score_components_json=COALESCE(excluded.score_components_json, ai_outcome_training_rows.score_components_json),
-                    ingested_at_utc=excluded.ingested_at_utc
-                """,
-                (
-                    sym,
-                    opened_at_utc,
-                    closed_at_utc,
-                    hold_seconds,
-                    entry_price,
-                    exit_price,
-                    net_profit_pct,
-                    ol,
-                    oc,
-                    features_json,
-                    context_json,
-                    strategy_id,
-                    gb,
-                    gross_pnl_pct,
-                    net_profit_pct,
-                    1 if ol == 1 else 0,
-                    ingested,
-                    json.dumps(
-                        {
-                            "feature_version": ex.get("feature_version"),
-                            "feature_dim": ex.get("feature_dim"),
-                            "artifact_path": ex.get("artifact_path"),
-                            "artifact_sha256": ex.get("artifact_sha256"),
-                            "model_trained_at": ex.get("model_trained_at"),
-                            "model_accuracy": ex.get("model_accuracy"),
-                            "close_reason": close_reason,
-                            "ai_confidence": ex.get("ai_confidence"),
-                            "confidence": ex.get("confidence"),
-                            "entry_buy_margin": ex.get("entry_buy_margin"),
-                            "buy_margin": ex.get("buy_margin"),
-                            "trend_score": ex.get("trend_score"),
-                            "chop_score": ex.get("chop_score"),
-                            "coin_expectancy": ex.get("coin_expectancy"),
-                            "signal_ctx_rs_btc": ex.get("signal_ctx_rs_btc"),
-                            "entry_spread_pct": ex.get("entry_spread_pct"),
-                            "selected_net_expected_value": ex.get("selected_net_expected_value"),
-                            "day_route_regime": ex.get("day_route_regime"),
-                            "setup_type": ex.get("setup_type") or ex.get("entry_thesis"),
-                            "final_selection_score": ex.get("final_selection_score"),
-                            "feature_health_pass": ex.get("feature_health_pass"),
-                            "feature_health_pct": ex.get("feature_health_pct"),
-                            "feature_health_bad_count": ex.get("feature_health_bad_count"),
-                            "setup_score": ex.get("setup_score"),
-                            "execution_quality_score": ex.get("execution_quality_score"),
-                            "feature_health_score": ex.get("feature_health_score"),
-                            "block_scores_json": ex.get("block_scores_json"),
-                            "intelligence_rank_delta": ex.get("intelligence_rank_delta"),
-                            "outcome_attribution_reason": attribution_reason,
-                        },
-                        separators=(",", ":"),
-                    ),
-                ),
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(ai_outcome_training_rows)").fetchall()}
+            insert_cols = [c for c in values if c in cols]
+            placeholders = ", ".join("?" for _ in insert_cols)
+            update_cols = [
+                c
+                for c in insert_cols
+                if c not in ("symbol", "opened_at_utc", "closed_at_utc")
+            ]
+            # Prefer excluded values for MFE/MAE/score so repairs overwrite NULLs.
+            set_parts = []
+            for c in update_cols:
+                if c in ("features_json", "context_json"):
+                    set_parts.append(f"{c}=COALESCE(excluded.{c}, ai_outcome_training_rows.{c})")
+                else:
+                    set_parts.append(f"{c}=excluded.{c}")
+            sql = (
+                f"INSERT INTO ai_outcome_training_rows ({', '.join(insert_cols)}) "
+                f"VALUES ({placeholders}) "
+                f"ON CONFLICT(symbol, opened_at_utc, closed_at_utc) DO UPDATE SET "
+                + ", ".join(set_parts)
             )
+            cur = conn.execute(sql, tuple(values[c] for c in insert_cols))
             _propagate_symbol_strategy_expectancy(conn, sym, strategy_id or "day")
             conn.commit()
             row_id = int(cur.lastrowid or 0) or None

@@ -609,6 +609,8 @@ def apply_ml_locked_setup_override(
     dd["setup_type"] = locked
     dd["entry_thesis"] = locked
     dd["allweather_setup"] = locked
+    dd["setup_type_canonical"] = locked
+    dd["setup_type_raw"] = prior_setup or locked
     dd["setup_regime_remapped_from"] = prior_setup
     # Keep narrative / adaptive labels aligned with final locked setup identity.
     narr = str(dd.get("candidate_explanation_narrative") or "")
@@ -621,7 +623,11 @@ def apply_ml_locked_setup_override(
         dd["candidate_explanation_narrative"] = f"setup={locked}. {narr}".strip()
         dd["setup_identity_unified"] = True
     if route_regime and route_regime != "unknown":
-        dd["adaptive_regime"] = str(dd.get("adaptive_regime") or route_regime)
+        # Store route regime only — never "structure::SETUP" hybrids as adaptive_regime.
+        dd["day_route_regime"] = route_regime
+        dd["adaptive_regime"] = route_regime
+    identity = resolve_setup_identity(dd)
+    dd.update(identity)
     dd.update(levels)
     return dd
 
@@ -730,8 +736,14 @@ def bear_regime_entry_adjustment(
     }
 
 
+# Internal STALL detail preserved for learning (display still uses STALL_EXIT).
+EXIT_STALL = "STALL_EXIT"
+EXIT_STALL_DEAD_NO_MFE = "STALL_EXIT_DEAD_NO_MFE"
+DEAD_TRADE_NO_MFE = "DEAD_NO_MFE"
+
+
 def canonical_day_exit_reason(exit_trigger: str, *, exit_type_name: str = "") -> str:
-    """Map internal triggers to canonical DAY exit_reason labels."""
+    """Map internal triggers to canonical DAY exit_reason labels (display/reporting)."""
     trig = str(exit_trigger or "").strip().upper()
     if trig.startswith("EXTREME_PROTECTION"):
         return EXIT_EXTREME_PROTECTION
@@ -751,8 +763,10 @@ def canonical_day_exit_reason(exit_trigger: str, *, exit_type_name: str = "") ->
         return EXIT_TRAILING_STOP
     if trig.startswith("TIME_STOP"):
         return "TIME_STOP_EXIT"
+    # Display/reporting collapse: all stall variants → STALL_EXIT.
+    # Learning must call split_day_exit_reasons() to keep DEAD_NO_MFE detail.
     if trig.startswith("STALL_EXIT") or trig.startswith("STALL"):
-        return "STALL_EXIT"
+        return EXIT_STALL
     if trig.startswith("GIVEBACK_EXIT") or trig.startswith("GIVEBACK"):
         return "GIVEBACK_EXIT"
     if trig.startswith("VOLATILITY_STOP"):
@@ -781,6 +795,72 @@ def canonical_day_exit_reason(exit_trigger: str, *, exit_type_name: str = "") ->
     if trig == "MANUAL" or exit_type_name == "MANUAL":
         return EXIT_MANUAL
     return EXIT_NET_PROFIT
+
+
+def split_day_exit_reasons(exit_trigger: str, *, exit_type_name: str = "") -> dict[str, Any]:
+    """
+    Split engine exit trigger into raw (learning) vs canonical (display) labels.
+
+    STALL_EXIT_DEAD_NO_MFE must survive for learning/attribution even though
+    paper_trades / UI continue to show STALL_EXIT.
+    """
+    trig = str(exit_trigger or "").strip().upper()
+    dead_trade_reason: str | None = None
+    if "STALL_EXIT_DEAD_NO_MFE" in trig or "STALL_EXIT_DEAD" in trig:
+        raw_exit_reason = EXIT_STALL_DEAD_NO_MFE
+        dead_trade_reason = DEAD_TRADE_NO_MFE
+    else:
+        raw_exit_reason = trig
+    canonical_exit_reason = canonical_day_exit_reason(trig, exit_type_name=exit_type_name)
+    if not raw_exit_reason:
+        raw_exit_reason = canonical_exit_reason
+    return {
+        "raw_exit_reason": raw_exit_reason,
+        "canonical_exit_reason": canonical_exit_reason,
+        "dead_trade_reason": dead_trade_reason,
+    }
+
+
+def resolve_setup_identity(decision_data: dict[str, Any] | None) -> dict[str, str]:
+    """
+    Authoritative setup key for learning/ranking — label consistency only.
+
+    Prefer locked ``setup_type`` / ``entry_thesis`` (post-remap). Keep raw/remap
+    source separately so narrative pollution cannot reopen a second bucket.
+    """
+    dd = dict(decision_data or {})
+    canonical = str(
+        dd.get("setup_type_canonical")
+        or dd.get("setup_type")
+        or dd.get("entry_thesis")
+        or dd.get("allweather_setup")
+        or ""
+    ).strip().upper()
+    raw = str(
+        dd.get("setup_type_raw")
+        or dd.get("setup_regime_remapped_from")
+        or ""
+    ).strip().upper()
+    if not raw:
+        raw = canonical
+    entry_thesis = str(dd.get("entry_thesis") or canonical or "").strip().upper() or canonical
+    # Prefer day_route_regime. Ignore adaptive strings that embed a setup
+    # (e.g. "trending_up::HTF_TREND_PULLBACK") — those polluted penalty buckets.
+    regime = str(dd.get("day_route_regime") or dd.get("regime") or "").strip().lower()
+    adaptive = str(dd.get("adaptive_regime") or "").strip()
+    if "::" in adaptive:
+        adaptive = regime or adaptive.split("::", 1)[0]
+    if not regime:
+        regime = adaptive.lower() if adaptive and "::" not in adaptive else "neutral"
+    return {
+        "setup_type_canonical": canonical,
+        "setup_type_raw": raw,
+        "entry_thesis": entry_thesis or canonical,
+        "day_route_regime": regime or "neutral",
+        "adaptive_regime": adaptive or (regime or "neutral"),
+        # Alias used by ranking/penalty callers
+        "setup_type": canonical,
+    }
 
 
 def thesis_min_profit_floor(entry_thesis: str, thesis_score: float) -> float:

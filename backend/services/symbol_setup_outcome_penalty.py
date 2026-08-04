@@ -73,6 +73,22 @@ ETH_CREDIT_SETUPS = frozenset({"FAILED_BREAKDOWN_REVERSAL", "RANGE_BOUNCE"})
 ETH_V3_RANK_MAX = 0.04
 ETH_V3_FINAL_SCORE_CREDIT = 0.02
 
+# Universal low-MFE STALL demotion (rank/EV only — never a hard block).
+DAY_UNIVERSAL_PENALTY_SYMBOLS = frozenset({"BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"})
+DAY_UNIVERSAL_PENALTY_SETUPS = frozenset(
+    {"RANGE_BOUNCE", "FAILED_BREAKDOWN_REVERSAL", "HTF_TREND_PULLBACK"}
+)
+# Match STALL dead floors for learning demotion (do not change exit floors).
+LOW_MFE_STALL_MAX_MFE_PCT = 0.0050
+LOW_MFE_STALL_MIN_MAE_PCT = 0.0025
+LOW_MFE_STALL_MIN_COUNT = 2
+LOW_MFE_STALL_RANK_BASE = -0.12
+LOW_MFE_STALL_EV_FACTOR = 0.72
+LOW_MFE_STALL_FINAL_SCORE = -0.05
+# Ocean/paper IDs are far below CLEAN_INFRA_MIN_SELL_ID (2987); low-MFE path
+# must see recent post-clean sells or demotion never fires.
+LOW_MFE_STALL_MIN_SELL_ID = 1
+
 
 @dataclass
 class ClosedTradeRow:
@@ -85,6 +101,10 @@ class ClosedTradeRow:
     hold_min: float
     selected_ev: float | None
     timestamp: str
+    mfe_pct: float | None = None
+    mae_pct: float | None = None
+    raw_exit_reason: str = ""
+    worth_taking: int | None = None
 
 
 def _parse_explain(raw: str | None) -> dict[str, Any]:
@@ -97,21 +117,39 @@ def _parse_explain(raw: str | None) -> dict[str, Any]:
 
 
 def _extract_setup_regime_ev(explain: dict[str, Any]) -> tuple[str, str, float | None]:
-    setup = str(explain.get("setup_type") or explain.get("entry_thesis") or "")
-    regime = str(explain.get("day_route_regime") or explain.get("signal_regime_label") or explain.get("regime") or explain.get("adaptive_regime") or "neutral").strip().lower()
-    sc = explain.get("score_components_json")
-    if isinstance(sc, str):
-        try:
-            scj = json.loads(sc)
-            regime = str(scj.get("adaptive_regime") or regime).strip().lower()
-        except Exception:
-            pass
+    from backend.services.day_trade_thesis import resolve_setup_identity
+
+    identity = resolve_setup_identity(explain)
+    setup = identity["setup_type_canonical"] or str(explain.get("setup_type") or explain.get("entry_thesis") or "")
+    regime = identity["day_route_regime"] or "neutral"
+    # Do NOT overwrite regime with score_components adaptive_regime hybrids
+    # like "trending_up::HTF_TREND_PULLBACK" — that polluted learning buckets.
     ev_raw = explain.get("selected_net_expected_value")
     try:
         selected_ev = float(ev_raw) if ev_raw is not None else None
     except Exception:
         selected_ev = None
     return setup, regime, selected_ev
+
+
+def _extract_mfe_mae(explain: dict[str, Any]) -> tuple[float | None, float | None]:
+    def _f(v: Any) -> float | None:
+        if v is None or v == "":
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    mfe = _f(explain.get("mfe_pct"))
+    if mfe is None:
+        mfe = _f(explain.get("max_favorable_excursion"))
+    mae = _f(explain.get("mae_pct"))
+    if mae is None:
+        mae = _f(explain.get("max_adverse_excursion"))
+    if mae is not None and mae < 0:
+        mae = abs(mae)
+    return mfe, mae
 
 
 def _load_closed_trades(db_path: str | Path, *, min_sell_id: int = CLEAN_INFRA_MIN_SELL_ID) -> list[ClosedTradeRow]:
@@ -135,6 +173,14 @@ def _load_closed_trades(db_path: str | Path, *, min_sell_id: int = CLEAN_INFRA_M
             setup, regime, selected_ev = _extract_setup_regime_ev(explain)
             hold_sec = float(r["hold_time_seconds"] or explain.get("hold_time_seconds") or explain.get("time_in_trade_sec") or 0)
             hold_min = hold_sec / 60.0 if hold_sec > 0 else 75.0
+            mfe, mae = _extract_mfe_mae(explain)
+            raw_exit = str(
+                explain.get("raw_exit_reason")
+                or explain.get("exit_reason_raw")
+                or explain.get("exit_trigger")
+                or r["exit_reason"]
+                or ""
+            )
             rows.append(
                 ClosedTradeRow(
                     sell_id=int(r["id"]),
@@ -146,9 +192,118 @@ def _load_closed_trades(db_path: str | Path, *, min_sell_id: int = CLEAN_INFRA_M
                     hold_min=hold_min,
                     selected_ev=selected_ev,
                     timestamp=str(r["timestamp"] or ""),
+                    mfe_pct=mfe,
+                    mae_pct=mae,
+                    raw_exit_reason=raw_exit,
+                    worth_taking=None,
                 )
             )
     return rows
+
+
+def _is_low_mfe_stall_loss(t: ClosedTradeRow) -> bool:
+    reason = (t.raw_exit_reason or t.exit_reason or "").upper()
+    if "STALL" not in reason and "GIVEBACK" not in reason:
+        return False
+    if t.pnl >= 0:
+        return False
+    mfe = float(t.mfe_pct) if t.mfe_pct is not None else None
+    mae = float(t.mae_pct) if t.mae_pct is not None else None
+    # Prefer explicit DEAD_NO_MFE; also accept STALL/GIVEBACK with measured low MFE.
+    is_dead = "STALL_EXIT_DEAD" in reason or "DEAD_NO_MFE" in reason
+    if mfe is None and not is_dead:
+        return False
+    if mfe is not None and mfe >= LOW_MFE_STALL_MAX_MFE_PCT and not is_dead:
+        return False
+    if mae is not None and mae < LOW_MFE_STALL_MIN_MAE_PCT and not is_dead:
+        return False
+    if t.worth_taking is not None and int(t.worth_taking) != 0 and not is_dead:
+        return False
+    return True
+
+
+def evaluate_low_mfe_stall_penalty(
+    symbol: str,
+    setup: str,
+    regime: str,
+    *,
+    db_path: str | Path | None = None,
+    min_sell_id: int = LOW_MFE_STALL_MIN_SELL_ID,
+) -> dict[str, Any]:
+    """
+    Non-blocking rank/EV demotion for repeated low-MFE STALL/GIVEBACK losses.
+
+    Applies across BTC/ETH/SOL/XRP and RANGE_BOUNCE/FBR/HTF using the same
+    canonical setup key ranking used. Never hard-blocks a candidate.
+    """
+    from backend.services.day_trade_thesis import resolve_setup_identity
+
+    sym = normalize_symbol(symbol)
+    identity = resolve_setup_identity({"setup_type": setup, "day_route_regime": regime})
+    setup_u = (identity["setup_type_canonical"] or str(setup or "")).strip().upper()
+    regime_l = (identity["day_route_regime"] or str(regime or "neutral")).strip().lower()
+
+    base: dict[str, Any] = {
+        "applied": False,
+        "symbol": sym,
+        "setup": setup_u,
+        "regime": regime_l,
+        "rank_delta": 0.0,
+        "ev_factor": 1.0,
+        "size_factor": 1.0,
+        "final_score_adjustment": 0.0,
+        "reason": "low_mfe_stall_not_applicable",
+        "hard_block": False,
+        "penalty_generation": "low_mfe_stall_v1",
+    }
+
+    if sym not in DAY_UNIVERSAL_PENALTY_SYMBOLS:
+        base["reason"] = "symbol_not_in_day_penalty_scope"
+        return base
+    if setup_u not in DAY_UNIVERSAL_PENALTY_SETUPS:
+        base["reason"] = "setup_not_in_day_penalty_scope"
+        return base
+
+    if db_path is None:
+        from backend.database_schema import DATABASE_PATH
+
+        db_path = DATABASE_PATH
+
+    all_trades = _load_closed_trades(db_path, min_sell_id=min_sell_id)
+    bucket = [
+        t
+        for t in all_trades
+        if t.symbol == sym and (t.setup or "").upper() == setup_u
+    ]
+    recent = bucket[-10:]
+    losers = [t for t in recent if _is_low_mfe_stall_loss(t)]
+    if len(losers) < LOW_MFE_STALL_MIN_COUNT:
+        base["reason"] = "low_mfe_stall_history_insufficient"
+        base["low_mfe_stall_count"] = len(losers)
+        base["bucket_count"] = len(recent)
+        return base
+
+    severity = min(1.0, len(losers) / 5.0 + abs(sum(t.pnl for t in losers)) / 40.0)
+    rank_delta = LOW_MFE_STALL_RANK_BASE - 0.04 * severity
+    ev_factor = max(0.45, LOW_MFE_STALL_EV_FACTOR - 0.08 * severity)
+    final_adj = LOW_MFE_STALL_FINAL_SCORE - 0.02 * severity
+    return {
+        "applied": True,
+        "symbol": sym,
+        "setup": setup_u,
+        "regime": regime_l,
+        "rank_delta": round(rank_delta, 4),
+        "ev_factor": round(ev_factor, 4),
+        "size_factor": 1.0,  # demote rank/EV only — do not shrink size as a soft gate
+        "final_score_adjustment": round(final_adj, 4),
+        "reason": "repeated_low_mfe_stall_losses",
+        "hard_block": False,
+        "penalty_generation": "low_mfe_stall_v1",
+        "low_mfe_stall_count": len(losers),
+        "bucket_count": len(recent),
+        "severity": round(severity, 4),
+        "eligible": True,
+    }
 
 
 def _metrics(trades: list[ClosedTradeRow]) -> dict[str, Any]:
@@ -996,9 +1151,12 @@ def assign_v3_selection_ranks(
 
 
 def evaluate_outcome_penalty_for_candidate(decision_data: dict[str, Any], symbol: str) -> dict[str, Any]:
+    from backend.services.day_trade_thesis import resolve_setup_identity
+
     dd = dict(decision_data or {})
-    setup = str(dd.get("setup_type") or dd.get("entry_thesis") or "")
-    regime = str(dd.get("day_route_regime") or dd.get("day_regime") or dd.get("regime") or "neutral")
+    identity = resolve_setup_identity(dd)
+    setup = identity["setup_type_canonical"] or str(dd.get("setup_type") or dd.get("entry_thesis") or "")
+    regime = identity["day_route_regime"] or str(dd.get("day_route_regime") or dd.get("day_regime") or dd.get("regime") or "neutral")
     return evaluate_outcome_penalty(symbol, setup, regime)
 
 
@@ -1011,9 +1169,17 @@ def apply_v3_outcome_ranking_to_decision_data(
     db_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Apply v3 outcome ranking: penalties/credits hit final_selection_score directly."""
+    from backend.services.day_trade_thesis import resolve_setup_identity
+
     dd = dict(decision_data or {})
-    setup = str(dd.get("setup_type") or dd.get("entry_thesis") or "")
-    regime = str(dd.get("day_route_regime") or dd.get("day_regime") or dd.get("regime") or "neutral")
+    identity = resolve_setup_identity(dd)
+    setup = identity["setup_type_canonical"] or str(dd.get("setup_type") or dd.get("entry_thesis") or "")
+    regime = identity["day_route_regime"] or str(dd.get("day_route_regime") or dd.get("day_regime") or dd.get("regime") or "neutral")
+    dd["setup_type_canonical"] = identity["setup_type_canonical"]
+    dd["setup_type_raw"] = identity["setup_type_raw"]
+    if identity["setup_type_canonical"]:
+        dd["setup_type"] = identity["setup_type_canonical"]
+        dd["entry_thesis"] = identity["entry_thesis"] or identity["setup_type_canonical"]
 
     if db_path is None:
         from backend.database_schema import DATABASE_PATH
@@ -1022,11 +1188,13 @@ def apply_v3_outcome_ranking_to_decision_data(
 
     xrp_pen = evaluate_outcome_penalty(symbol, setup, regime, db_path=db_path)
     btc_pen = evaluate_btc_outcome_penalty(symbol, setup, regime, db_path=db_path)
+    low_mfe_pen = evaluate_low_mfe_stall_penalty(symbol, setup, regime, db_path=db_path)
     sol_cred = evaluate_sol_outcome_credit(symbol, setup, regime, db_path=db_path)
     eth_cred = evaluate_eth_outcome_credit(symbol, setup, regime, db_path=db_path)
 
     dd["outcome_churn_penalty_eval"] = xrp_pen
     dd["outcome_btc_penalty_eval"] = btc_pen
+    dd["outcome_low_mfe_stall_penalty_eval"] = low_mfe_pen
     dd["outcome_sol_credit_eval"] = sol_cred
     dd["outcome_eth_credit_eval"] = eth_cred
     dd["v3_ranking_fix_applied"] = True
@@ -1051,17 +1219,23 @@ def apply_v3_outcome_ranking_to_decision_data(
         active_pen = xrp_pen
     elif btc_pen.get("applied"):
         active_pen = btc_pen
+    elif low_mfe_pen.get("applied"):
+        active_pen = low_mfe_pen
 
     if active_pen is not None:
         penalty_applied = True
         dd["outcome_churn_penalty_applied"] = active_pen is xrp_pen and bool(xrp_pen.get("applied"))
         dd["outcome_btc_penalty_applied"] = active_pen is btc_pen and bool(btc_pen.get("applied"))
+        dd["outcome_low_mfe_stall_penalty_applied"] = active_pen is low_mfe_pen and bool(low_mfe_pen.get("applied"))
         outcome_rank_delta += float(active_pen.get("rank_delta") or 0.0)
         ev_mult *= float(active_pen.get("ev_factor") or 1.0)
         size_mult *= float(active_pen.get("size_factor") or 1.0)
         final_score_adjustment += float(active_pen.get("final_score_adjustment") or 0.0)
         penalty_reasons.append(str(active_pen.get("reason") or "outcome_penalty"))
-        if xrp_pen.get("applied"):
+        # Soft demotion only — candidate remains eligible for selection.
+        dd["outcome_penalty_hard_block"] = False
+        dd["candidate_eligible"] = True
+        if xrp_pen.get("applied") and active_pen is xrp_pen:
             peer_ceiling = float(xrp_pen.get("peer_ev_ceiling") or 0.012)
             cap_mult = float(xrp_pen.get("peer_ev_cap_multiplier") or 0.88)
             scaled_ev = raw_ev * ev_mult
@@ -1071,10 +1245,17 @@ def apply_v3_outcome_ranking_to_decision_data(
             dd["outcome_churn_peer_ev_ceiling"] = peer_ceiling
         else:
             dd["adjusted_ev"] = round(raw_ev * ev_mult, 8)
-            dd["outcome_btc_rank_penalty"] = float(btc_pen.get("rank_delta") or 0.0)
+            if active_pen is btc_pen:
+                dd["outcome_btc_rank_penalty"] = float(btc_pen.get("rank_delta") or 0.0)
+            if active_pen is low_mfe_pen:
+                dd["outcome_low_mfe_stall_rank_penalty"] = float(low_mfe_pen.get("rank_delta") or 0.0)
+                dd["outcome_low_mfe_stall_ev_factor"] = float(low_mfe_pen.get("ev_factor") or 1.0)
     else:
         dd["outcome_churn_penalty_applied"] = False
         dd["outcome_btc_penalty_applied"] = False
+        dd["outcome_low_mfe_stall_penalty_applied"] = False
+        dd["outcome_penalty_hard_block"] = False
+        dd["candidate_eligible"] = True
         dd["adjusted_ev"] = round(raw_ev * ev_mult, 8)
 
     if sol_cred.get("applied"):

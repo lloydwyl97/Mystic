@@ -170,22 +170,61 @@ def build_attribution_payload(
     hold_seconds: float | None,
     entry_features: list[float] | None = None,
 ) -> dict[str, Any]:
+    from backend.services.day_trade_thesis import resolve_setup_identity, split_day_exit_reasons
+
     ex = dict(explainability or {})
+    identity = resolve_setup_identity(ex)
+    # Stamp unified setup identity back so classifiers/writers share one key.
+    ex["setup_type"] = identity["setup_type_canonical"] or ex.get("setup_type")
+    ex["setup_type_canonical"] = identity["setup_type_canonical"]
+    ex["setup_type_raw"] = identity["setup_type_raw"]
+    ex["entry_thesis"] = identity["entry_thesis"] or ex.get("entry_thesis")
+    ex["day_route_regime"] = identity["day_route_regime"]
     blocks = compute_block_scores_from_decision_data(ex)
     if not ex.get("feature_health_score"):
         ex["feature_health_score"] = blocks.get("feature_health_score", 0.0)
+    exit_parts = split_day_exit_reasons(
+        str(ex.get("raw_exit_reason") or ex.get("exit_trigger") or close_reason or "")
+    )
+    raw_exit = str(ex.get("raw_exit_reason") or exit_parts["raw_exit_reason"] or close_reason or "")
+    canonical_exit = str(
+        ex.get("canonical_exit_reason") or exit_parts["canonical_exit_reason"] or close_reason or ""
+    )
     reason = classify_outcome_reason(
         explainability=ex,
         net_profit_pct=net_profit_pct,
-        close_reason=close_reason,
+        close_reason=raw_exit or close_reason,
         hold_seconds=hold_seconds,
     )
     fh_pass = entry_feature_health_pass(ex)
+    try:
+        mfe = ex.get("mfe_pct")
+        if mfe is None:
+            mfe = ex.get("max_favorable_excursion")
+        mfe_f = float(mfe) if mfe is not None else None
+    except (TypeError, ValueError):
+        mfe_f = None
+    try:
+        mae = ex.get("mae_pct")
+        if mae is None:
+            mae = ex.get("max_adverse_excursion")
+        mae_f = float(mae) if mae is not None else None
+    except (TypeError, ValueError):
+        mae_f = None
+    if mae_f is not None and mae_f < 0:
+        mae_f = abs(mae_f)
+    setup_thesis = identity["setup_type_canonical"] or str(ex.get("setup_type") or ex.get("entry_thesis") or "")
+    regime = identity["day_route_regime"] or str(ex.get("day_route_regime") or ex.get("regime") or "")
     return {
         "trade_id": trade_id,
         "symbol": symbol,
-        "regime": str(ex.get("day_route_regime") or ex.get("regime") or ""),
-        "setup_thesis": str(ex.get("setup_type") or ex.get("entry_thesis") or ""),
+        "regime": regime,
+        "setup_thesis": setup_thesis,
+        "setup_type": setup_thesis,
+        "setup_type_canonical": identity["setup_type_canonical"],
+        "setup_type_raw": identity["setup_type_raw"],
+        "entry_thesis": identity["entry_thesis"],
+        "adaptive_regime": identity["adaptive_regime"],
         "entry_time": str(ex.get("entry_timestamp") or ex.get("timestamp") or ""),
         "exit_time": datetime.now(timezone.utc).isoformat(),
         "net_pnl_after_fees": float(net_profit_usd or 0.0),
@@ -206,8 +245,19 @@ def build_attribution_payload(
             "buy_margin": ex.get("entry_buy_margin") or ex.get("buy_margin"),
         },
         "final_selection_score": float(ex.get("final_selection_score") or 0.0),
+        "rank_score": float(ex.get("rank_score") or 0.0) if ex.get("rank_score") is not None else None,
+        "selected_net_expected_value": ex.get("selected_net_expected_value"),
         "execution_quality_score": float(ex.get("execution_quality_score") or 0.5),
-        "exit_reason": str(close_reason or ""),
+        "exit_reason": canonical_exit or str(close_reason or ""),
+        "exit_reason_raw": raw_exit,
+        "exit_reason_canonical": canonical_exit,
+        "raw_exit_reason": raw_exit,
+        "canonical_exit_reason": canonical_exit,
+        "dead_trade_reason": ex.get("dead_trade_reason") or exit_parts.get("dead_trade_reason"),
+        "mfe_pct": mfe_f,
+        "mae_pct": mae_f,
+        "max_favorable_excursion": mfe_f,
+        "max_adverse_excursion": mae_f,
         "outcome_reason": reason,
         "feature_health_pass": fh_pass,
         "regime_transition_score": float(ex.get("regime_transition_score") or 0.0),
