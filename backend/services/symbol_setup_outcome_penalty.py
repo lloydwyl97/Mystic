@@ -80,7 +80,16 @@ DAY_UNIVERSAL_PENALTY_SETUPS = frozenset(
         "RANGE_BOUNCE",
         "FAILED_BREAKDOWN_REVERSAL",
         "HTF_TREND_PULLBACK",
+        "TREND_PULLBACK",  # alias / legacy label for HTF pullback thesis
         "BREAKOUT",
+    }
+)
+# Setups that keep selecting into STALL_DEAD clusters after soft demotion.
+P1C_TOXIC_STALL_SETUPS = frozenset(
+    {
+        "HTF_TREND_PULLBACK",
+        "TREND_PULLBACK",
+        "FAILED_BREAKDOWN_REVERSAL",
     }
 )
 # Match STALL dead floors for learning demotion (do not change exit floors).
@@ -95,12 +104,12 @@ LOW_MFE_STALL_FINAL_SCORE = -0.05
 # must see recent post-clean sells or demotion never fires.
 LOW_MFE_STALL_MIN_SELL_ID = 1
 
-# P1B soft rank/EV calibration (non-blocking). Stronger count/quality scaling.
+# P1C soft rank/EV calibration (non-blocking). Stronger HTF/FBR demotion.
 P1B_LOOKBACK = 12
 P1B_SETUP_LOOKBACK = 16
-P1B_RANK_FLOOR = -0.60
-P1B_EV_FLOOR = 0.28
-P1B_FSS_FLOOR = -0.30
+P1B_RANK_FLOOR = -0.75
+P1B_EV_FLOOR = 0.22
+P1B_FSS_FLOOR = -0.40
 P1B_GIVEBACK_MFE_MAX = 0.0035
 P1B_MFE_SEVERE = 0.0010
 P1B_MFE_MODERATE = 0.0020
@@ -108,6 +117,10 @@ P1B_MAE_SEVERE = 0.0040
 P1B_HOLD_DEAD_MIN = 100.0
 P1B_SETUP_STALL_MIN = 3
 P1B_SOFTEN_PF = 1.25
+P1C_PENALTY_GENERATION = "low_mfe_stall_p1c"
+# Defer fills whose post-demotion score is still negative (capacity discipline).
+P1C_DEFER_FSS_MAX = 0.0
+P1C_DEFER_MIN_STALL = 2
 
 
 @dataclass
@@ -285,16 +298,65 @@ def _trade_quality_weight(t: ClosedTradeRow) -> float:
 
 
 def _p1b_count_tier_rank_ev(stall_count: int) -> tuple[float, float, float]:
-    """Base rank_delta / ev_factor / fss_adj from STALL_DEAD count."""
+    """Base rank_delta / ev_factor / fss_adj from STALL_DEAD count (P1C)."""
     if stall_count >= 5:
-        return -0.42, 0.38, -0.20
+        return -0.52, 0.30, -0.26
     if stall_count >= 4:
-        return -0.34, 0.45, -0.16
+        return -0.44, 0.36, -0.22
     if stall_count >= 3:
-        return -0.26, 0.52, -0.12
+        return -0.36, 0.42, -0.18
     if stall_count >= 2:
-        return -0.18, 0.62, -0.08
+        return -0.24, 0.52, -0.12
     return 0.0, 1.0, 0.0
+
+
+def _normalize_penalty_setup(setup_u: str) -> str:
+    """Collapse legacy TREND_PULLBACK into HTF bucket for outcome history."""
+    s = str(setup_u or "").strip().upper()
+    if s == "TREND_PULLBACK":
+        return "HTF_TREND_PULLBACK"
+    return s
+
+
+def _setup_matches_penalty_bucket(trade_setup: str, target_setup: str) -> bool:
+    a = _normalize_penalty_setup(trade_setup)
+    b = _normalize_penalty_setup(target_setup)
+    return bool(a) and a == b
+
+
+def should_defer_low_mfe_stall_fill(decision_data: dict[str, Any] | None) -> bool:
+    """
+    Soft capacity discipline: do not consume an open slot with a deeply
+    demoted toxic stall cluster whose final_selection_score is still < 0.
+
+    Not a hard setup block — candidate_eligible stays True; a later bar with
+    recovered score / better peers can still fill.
+    """
+    dd = dict(decision_data or {})
+    reason = str(dd.get("penalty_reason") or "")
+    low_mfe_on = bool(dd.get("outcome_low_mfe_stall_penalty_applied")) or (
+        "repeated_low_mfe_stall_losses" in reason or "low_mfe" in reason.lower()
+    )
+    if not low_mfe_on and not bool(dd.get("outcome_penalty_applied")):
+        return False
+    if not low_mfe_on:
+        return False
+    try:
+        fss = float(dd.get("final_selection_score") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if fss >= P1C_DEFER_FSS_MAX:
+        return False
+    try:
+        stall = int(dd.get("low_mfe_stall_count") or 0)
+    except (TypeError, ValueError):
+        stall = 0
+    setup = _normalize_penalty_setup(
+        str(dd.get("setup_type_canonical") or dd.get("setup_type") or dd.get("entry_thesis") or "")
+    )
+    if setup in P1C_TOXIC_STALL_SETUPS and stall >= P1C_DEFER_MIN_STALL:
+        return True
+    return stall >= 3
 
 
 def _bucket_pnl_pf(trades: list[ClosedTradeRow]) -> tuple[float, float, int, int]:
@@ -335,8 +397,10 @@ def evaluate_low_mfe_stall_penalty(
 
     sym = normalize_symbol(symbol)
     identity = resolve_setup_identity({"setup_type": setup, "day_route_regime": regime})
-    setup_u = (identity["setup_type_canonical"] or str(setup or "")).strip().upper()
+    setup_raw = (identity["setup_type_canonical"] or str(setup or "")).strip().upper()
+    setup_u = _normalize_penalty_setup(setup_raw)
     regime_l = (identity["day_route_regime"] or str(regime or "neutral")).strip().lower()
+    toxic_setup = setup_u in P1C_TOXIC_STALL_SETUPS
 
     base: dict[str, Any] = {
         "applied": False,
@@ -351,7 +415,7 @@ def evaluate_low_mfe_stall_penalty(
         "hard_block": False,
         "candidate_eligible": True,
         "eligible": True,
-        "penalty_generation": "low_mfe_stall_p1b",
+        "penalty_generation": P1C_PENALTY_GENERATION,
         "low_mfe_stall_count": 0,
         "giveback_weak_count": 0,
         "bucket_net_pnl": 0.0,
@@ -361,7 +425,7 @@ def evaluate_low_mfe_stall_penalty(
     if sym not in DAY_UNIVERSAL_PENALTY_SYMBOLS:
         base["reason"] = "symbol_not_in_day_penalty_scope"
         return base
-    if setup_u not in DAY_UNIVERSAL_PENALTY_SETUPS:
+    if setup_raw not in DAY_UNIVERSAL_PENALTY_SETUPS and setup_u not in DAY_UNIVERSAL_PENALTY_SETUPS:
         base["reason"] = "setup_not_in_day_penalty_scope"
         return base
 
@@ -372,7 +436,7 @@ def evaluate_low_mfe_stall_penalty(
 
     all_trades = _load_closed_trades(db_path, min_sell_id=min_sell_id)
     pair_bucket = [
-        t for t in all_trades if t.symbol == sym and (t.setup or "").upper() == setup_u
+        t for t in all_trades if t.symbol == sym and _setup_matches_penalty_bucket(t.setup, setup_u)
     ]
     recent = pair_bucket[-P1B_LOOKBACK:]
     stall_dead = [t for t in recent if _is_stall_dead_loss(t)]
@@ -380,7 +444,9 @@ def evaluate_low_mfe_stall_penalty(
     # Legacy combined count for min-threshold (stall primary; giveback can help reach 2).
     combined_weak = stall_dead + [t for t in giveback_weak if t not in stall_dead]
 
-    setup_bucket = [t for t in all_trades if (t.setup or "").upper() == setup_u][-P1B_SETUP_LOOKBACK:]
+    setup_bucket = [
+        t for t in all_trades if _setup_matches_penalty_bucket(t.setup, setup_u)
+    ][-P1B_SETUP_LOOKBACK:]
     setup_stall = [t for t in setup_bucket if _is_stall_dead_loss(t)]
     setup_net, setup_pf, _, setup_stall_n = _bucket_pnl_pf(setup_bucket)
 
@@ -413,6 +479,7 @@ def evaluate_low_mfe_stall_penalty(
     ev_factor = 1.0
     fss_adj = 0.0
     quality = 0.0
+    toxic_boost_applied = False
 
     if effective_stall >= LOW_MFE_STALL_MIN_COUNT:
         rank_delta, ev_factor, fss_adj = _p1b_count_tier_rank_ev(effective_stall)
@@ -422,25 +489,33 @@ def evaluate_low_mfe_stall_penalty(
             if quality_src
             else 0.0
         )
-        # Scale magnitude by quality (up to +25% stronger).
-        q_scale = 1.0 + 0.25 * quality
+        # Scale magnitude by quality (up to +30% stronger on P1C).
+        q_scale = 1.0 + 0.30 * quality
         rank_delta *= q_scale
         fss_adj *= q_scale
         ev_factor = 1.0 - (1.0 - ev_factor) * q_scale
 
         # PnL damage boost when bucket net negative with 2+ stall.
         if pair_stall_n >= 2 and pair_net < 0:
-            damage = min(1.0, abs(pair_net) / 45.0)
-            rank_delta -= 0.04 * damage
-            fss_adj -= 0.02 * damage
-            ev_factor *= max(0.88, 1.0 - 0.08 * damage)
+            damage = min(1.0, abs(pair_net) / 35.0)
+            rank_delta -= 0.06 * damage
+            fss_adj -= 0.03 * damage
+            ev_factor *= max(0.84, 1.0 - 0.12 * damage)
+
+        # Extra HTF/FBR rescope when the pair bucket is still bleeding.
+        if toxic_setup and pair_net < 0 and pair_stall_n >= 2:
+            toxic_boost_applied = True
+            t_scale = min(1.0, 0.45 + 0.15 * pair_stall_n)
+            rank_delta -= 0.12 * t_scale
+            fss_adj -= 0.06 * t_scale
+            ev_factor *= max(0.80, 1.0 - 0.12 * t_scale)
 
     # Secondary GIVEBACK weakness (small) — never uses stall-tier severity alone.
     if gb_count > 0:
-        gb_rank = max(-0.10, -0.04 * gb_count)
-        gb_ev = max(0.85, 1.0 - 0.05 * gb_count)
+        gb_rank = max(-0.12, -0.045 * gb_count)
+        gb_ev = max(0.82, 1.0 - 0.055 * gb_count)
         rank_delta += gb_rank
-        fss_adj -= 0.015 * min(gb_count, 3)
+        fss_adj -= 0.018 * min(gb_count, 3)
         ev_factor *= gb_ev
 
     # Setup-wide cluster (smaller than symbol/setup).
@@ -448,37 +523,50 @@ def evaluate_low_mfe_stall_penalty(
     setup_ev = 1.0
     setup_fss = 0.0
     if setup_cluster:
-        setup_rank = -0.08
-        setup_ev = 0.90
-        setup_fss = -0.04
-        # Slightly stronger if setup stall count is high.
+        setup_rank = -0.10 if toxic_setup else -0.08
+        setup_ev = 0.88 if toxic_setup else 0.90
+        setup_fss = -0.05 if toxic_setup else -0.04
         if setup_stall_n >= 5:
-            setup_rank = -0.12
-            setup_ev = 0.85
-            setup_fss = -0.06
+            setup_rank = -0.16 if toxic_setup else -0.12
+            setup_ev = 0.80 if toxic_setup else 0.85
+            setup_fss = -0.08 if toxic_setup else -0.06
         rank_delta += setup_rank
         fss_adj += setup_fss
         ev_factor *= setup_ev
 
-    # Soften profitable / recovering buckets.
+    # Soften profitable / recovering buckets — never erase a bleeding toxic cluster.
     soften = 1.0
     soften_reasons: list[str] = []
-    if pair_pf > P1B_SOFTEN_PF and pair_np >= max(1, pair_stall_n) and pair_net > 0:
+    severe_bleed = effective_stall >= 3 and pair_net < 0
+    if (
+        pair_pf > P1B_SOFTEN_PF
+        and pair_np >= max(1, pair_stall_n + (1 if toxic_setup else 0))
+        and pair_net > 0
+    ):
         soften *= 0.45
         soften_reasons.append("bucket_pf_and_net_profit_offset")
     last3 = recent[-3:]
-    if len(last3) >= 3 and sum(t.pnl for t in last3) > 0:
+    last3_stall = sum(1 for t in last3 if _is_stall_dead_loss(t))
+    # P1C: do not soften severe bleeders on a lucky latest-3; require zero stalls in last3.
+    if (
+        not severe_bleed
+        and len(last3) >= 3
+        and sum(t.pnl for t in last3) > 0
+        and last3_stall == 0
+    ):
         soften *= 0.70
         soften_reasons.append("latest_3_net_positive")
-    # Never fully erase a 3+ stall-dead cluster; giveback-only may soften more.
-    if effective_stall >= 3:
-        soften = max(soften, 0.55)
+    # Floor: keep most of the demotion for 3+ stall-dead; toxic bleeders keep more.
+    if severe_bleed and toxic_setup:
+        soften = max(soften, 0.85)
+    elif effective_stall >= 3:
+        soften = max(soften, 0.70)
     elif effective_stall >= 2:
-        soften = max(soften, 0.40)
+        soften = max(soften, 0.50)
     elif giveback_only:
         soften = max(soften, 0.30)
     else:
-        soften = max(soften, 0.35)
+        soften = max(soften, 0.40)
 
     if soften < 0.999:
         rank_delta *= soften
@@ -505,6 +593,8 @@ def evaluate_low_mfe_stall_penalty(
         reasons.append("low_mfe_giveback_secondary")
     if setup_cluster:
         reasons.append("setup_wide_stall_cluster")
+    if toxic_boost_applied:
+        reasons.append("toxic_htf_fbr_boost")
     if soften_reasons:
         reasons.append("softened:" + ",".join(soften_reasons))
 
@@ -522,7 +612,7 @@ def evaluate_low_mfe_stall_penalty(
         "hard_block": False,
         "candidate_eligible": True,
         "eligible": True,
-        "penalty_generation": "low_mfe_stall_p1b",
+        "penalty_generation": P1C_PENALTY_GENERATION,
         "low_mfe_stall_count": stall_count,
         "giveback_weak_count": gb_count,
         "combined_weak_count": len(combined_weak),
@@ -541,6 +631,7 @@ def evaluate_low_mfe_stall_penalty(
         "soften_reasons": soften_reasons,
         "trigger_count": trigger_count,
         "effective_stall_count": effective_stall,
+        "toxic_setup_boost": toxic_boost_applied,
     }
 
 
@@ -1455,60 +1546,67 @@ def apply_v3_outcome_ranking_to_decision_data(
     penalty_applied = False
     credit_applied = False
 
-    active_pen = None
-    if xrp_pen.get("applied"):
-        active_pen = xrp_pen
-    elif btc_pen.get("applied"):
-        active_pen = btc_pen
-    elif low_mfe_pen.get("applied"):
-        active_pen = low_mfe_pen
+    # Soft demotion only — candidate remains eligible for selection.
+    dd["outcome_penalty_hard_block"] = False
+    dd["hard_block"] = False
+    dd["candidate_eligible"] = True
+    dd["outcome_churn_penalty_applied"] = False
+    dd["outcome_btc_penalty_applied"] = False
+    dd["outcome_low_mfe_stall_penalty_applied"] = False
 
-    if active_pen is not None:
+    # P1C: stack low-MFE demotion with symbol-specific penalties (additive).
+    if xrp_pen.get("applied"):
         penalty_applied = True
-        dd["outcome_churn_penalty_applied"] = active_pen is xrp_pen and bool(xrp_pen.get("applied"))
-        dd["outcome_btc_penalty_applied"] = active_pen is btc_pen and bool(btc_pen.get("applied"))
-        dd["outcome_low_mfe_stall_penalty_applied"] = active_pen is low_mfe_pen and bool(low_mfe_pen.get("applied"))
-        outcome_rank_delta += float(active_pen.get("rank_delta") or 0.0)
-        ev_mult *= float(active_pen.get("ev_factor") or 1.0)
-        size_mult *= float(active_pen.get("size_factor") or 1.0)
-        final_score_adjustment += float(active_pen.get("final_score_adjustment") or 0.0)
+        dd["outcome_churn_penalty_applied"] = True
+        outcome_rank_delta += float(xrp_pen.get("rank_delta") or 0.0)
+        ev_mult *= float(xrp_pen.get("ev_factor") or 1.0)
+        size_mult *= float(xrp_pen.get("size_factor") or 1.0)
+        final_score_adjustment += float(xrp_pen.get("final_score_adjustment") or 0.0)
+        penalty_reasons.append(str(xrp_pen.get("reason") or "xrp_outcome_penalty"))
+        dd["outcome_churn_rank_penalty"] = float(xrp_pen.get("rank_delta") or 0.0)
+        dd["outcome_churn_ev_factor"] = float(xrp_pen.get("ev_factor") or 1.0)
+        dd["outcome_churn_peer_ev_ceiling"] = float(xrp_pen.get("peer_ev_ceiling") or 0.012)
+
+    if btc_pen.get("applied"):
+        penalty_applied = True
+        dd["outcome_btc_penalty_applied"] = True
+        outcome_rank_delta += float(btc_pen.get("rank_delta") or 0.0)
+        ev_mult *= float(btc_pen.get("ev_factor") or 1.0)
+        size_mult *= float(btc_pen.get("size_factor") or 1.0)
+        final_score_adjustment += float(btc_pen.get("final_score_adjustment") or 0.0)
+        penalty_reasons.append(str(btc_pen.get("reason") or "btc_outcome_penalty"))
+        dd["outcome_btc_rank_penalty"] = float(btc_pen.get("rank_delta") or 0.0)
+
+    if low_mfe_pen.get("applied"):
+        penalty_applied = True
+        dd["outcome_low_mfe_stall_penalty_applied"] = True
+        outcome_rank_delta += float(low_mfe_pen.get("rank_delta") or 0.0)
+        ev_mult *= float(low_mfe_pen.get("ev_factor") or 1.0)
+        # size_factor stays 1.0 on low-MFE path by design
+        final_score_adjustment += float(low_mfe_pen.get("final_score_adjustment") or 0.0)
         pen_reason = str(
-            active_pen.get("outcome_penalty_reason")
-            or active_pen.get("reason")
-            or "outcome_penalty"
+            low_mfe_pen.get("outcome_penalty_reason")
+            or low_mfe_pen.get("reason")
+            or "repeated_low_mfe_stall_losses"
         )
         penalty_reasons.append(pen_reason)
-        # Soft demotion only — candidate remains eligible for selection.
-        dd["outcome_penalty_hard_block"] = False
-        dd["hard_block"] = False
-        dd["candidate_eligible"] = True
-        if xrp_pen.get("applied") and active_pen is xrp_pen:
-            peer_ceiling = float(xrp_pen.get("peer_ev_ceiling") or 0.012)
-            cap_mult = float(xrp_pen.get("peer_ev_cap_multiplier") or 0.88)
-            scaled_ev = raw_ev * ev_mult
-            dd["adjusted_ev"] = round(min(scaled_ev, peer_ceiling * cap_mult), 8)
-            dd["outcome_churn_rank_penalty"] = float(xrp_pen.get("rank_delta") or 0.0)
-            dd["outcome_churn_ev_factor"] = float(xrp_pen.get("ev_factor") or 1.0)
-            dd["outcome_churn_peer_ev_ceiling"] = peer_ceiling
-        else:
-            dd["adjusted_ev"] = round(raw_ev * ev_mult, 8)
-            if active_pen is btc_pen:
-                dd["outcome_btc_rank_penalty"] = float(btc_pen.get("rank_delta") or 0.0)
-            if active_pen is low_mfe_pen:
-                dd["outcome_low_mfe_stall_rank_penalty"] = float(low_mfe_pen.get("rank_delta") or 0.0)
-                dd["outcome_low_mfe_stall_ev_factor"] = float(low_mfe_pen.get("ev_factor") or 1.0)
-                dd["low_mfe_stall_count"] = int(low_mfe_pen.get("low_mfe_stall_count") or 0)
-                dd["bucket_net_pnl"] = low_mfe_pen.get("bucket_net_pnl")
-                dd["bucket_profit_factor"] = low_mfe_pen.get("bucket_profit_factor")
-                dd["outcome_penalty_rank_delta"] = float(low_mfe_pen.get("rank_delta") or 0.0)
-                dd["outcome_penalty_ev_factor"] = float(low_mfe_pen.get("ev_factor") or 1.0)
+        dd["outcome_low_mfe_stall_rank_penalty"] = float(low_mfe_pen.get("rank_delta") or 0.0)
+        dd["outcome_low_mfe_stall_ev_factor"] = float(low_mfe_pen.get("ev_factor") or 1.0)
+        dd["low_mfe_stall_count"] = int(low_mfe_pen.get("low_mfe_stall_count") or 0)
+        dd["giveback_weak_count"] = int(low_mfe_pen.get("giveback_weak_count") or 0)
+        dd["bucket_net_pnl"] = low_mfe_pen.get("bucket_net_pnl")
+        dd["bucket_profit_factor"] = low_mfe_pen.get("bucket_profit_factor")
+        dd["outcome_penalty_rank_delta"] = float(low_mfe_pen.get("rank_delta") or 0.0)
+        dd["outcome_penalty_ev_factor"] = float(low_mfe_pen.get("ev_factor") or 1.0)
+        dd["outcome_penalty_final_score_adjustment"] = float(low_mfe_pen.get("final_score_adjustment") or 0.0)
+        dd["penalty_generation"] = str(low_mfe_pen.get("penalty_generation") or P1C_PENALTY_GENERATION)
+
+    if xrp_pen.get("applied"):
+        peer_ceiling = float(xrp_pen.get("peer_ev_ceiling") or 0.012)
+        cap_mult = float(xrp_pen.get("peer_ev_cap_multiplier") or 0.88)
+        scaled_ev = raw_ev * ev_mult
+        dd["adjusted_ev"] = round(min(scaled_ev, peer_ceiling * cap_mult), 8)
     else:
-        dd["outcome_churn_penalty_applied"] = False
-        dd["outcome_btc_penalty_applied"] = False
-        dd["outcome_low_mfe_stall_penalty_applied"] = False
-        dd["outcome_penalty_hard_block"] = False
-        dd["hard_block"] = False
-        dd["candidate_eligible"] = True
         dd["adjusted_ev"] = round(raw_ev * ev_mult, 8)
 
     if sol_cred.get("applied"):
@@ -1571,6 +1669,14 @@ def apply_v3_outcome_ranking_to_decision_data(
     )
     dd["selection_score"] = dd["final_selection_score"]
     dd["adjusted_rank_used_in_final_selection"] = True
+    # Always expose eval + defer telemetry for BUY explain persistence.
+    if "low_mfe_stall_count" not in dd:
+        dd["low_mfe_stall_count"] = int(low_mfe_pen.get("low_mfe_stall_count") or 0)
+    if "bucket_net_pnl" not in dd and low_mfe_pen.get("bucket_net_pnl") is not None:
+        dd["bucket_net_pnl"] = low_mfe_pen.get("bucket_net_pnl")
+    if "bucket_profit_factor" not in dd and low_mfe_pen.get("bucket_profit_factor") is not None:
+        dd["bucket_profit_factor"] = low_mfe_pen.get("bucket_profit_factor")
+    dd["low_mfe_stall_fill_deferred"] = bool(should_defer_low_mfe_stall_fill(dd))
     return dd
 
 

@@ -131,8 +131,9 @@ def test_1_repeated_stall_dead_strengthens_penalty(tmp_path: Path):
         assert p["ev_factor"] < 1.0
 
     assert p2["rank_delta"] > p4["rank_delta"]  # less negative than count-4
-    # Count-6 is strictly stronger on at least one demotion axis (rank or EV).
-    assert (p4["rank_delta"] > p6["rank_delta"]) or (p4["ev_factor"] > p6["ev_factor"])
+    # Count-6 is strictly stronger on at least one demotion axis, or both sit at P1C floors.
+    at_floor = p4["rank_delta"] <= -0.74 and p6["rank_delta"] <= -0.74 and p4["ev_factor"] <= 0.23 and p6["ev_factor"] <= 0.23
+    assert at_floor or (p4["rank_delta"] > p6["rank_delta"]) or (p4["ev_factor"] > p6["ev_factor"])
     assert p2["ev_factor"] > p4["ev_factor"]
     assert p4["ev_factor"] >= p6["ev_factor"]
     assert p2["low_mfe_stall_count"] == 2
@@ -309,5 +310,5 @@ def test_7_explainability_fields_stamped(tmp_path: Path):
     assert out["hard_block"] is False
     assert out["candidate_eligible"] is True
     eval_obj = out.get("outcome_low_mfe_stall_penalty_eval") or {}
-    assert eval_obj.get("penalty_generation") == "low_mfe_stall_p1b"
+    assert eval_obj.get("penalty_generation") == "low_mfe_stall_p1c"
     assert eval_obj.get("hard_block") is False

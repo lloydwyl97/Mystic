@@ -1515,6 +1515,23 @@ class TradeExplainability:
     argmax_action: str = ""
     prediction: str = ""
     side_signal: str = ""
+    # P1C low-MFE stall demotion explain stamps (BUY persistence)
+    outcome_low_mfe_stall_penalty_applied: bool = False
+    low_mfe_stall_count: int = 0
+    giveback_weak_count: int = 0
+    bucket_net_pnl: float | None = None
+    bucket_profit_factor: float | None = None
+    outcome_penalty_rank_delta: float | None = None
+    outcome_penalty_ev_factor: float | None = None
+    rank_score_before_outcome_penalty: float | None = None
+    selected_net_expected_value_before_outcome_penalty: float | None = None
+    final_selection_score_before_outcome_penalty: float | None = None
+    outcome_adjusted_rank_score: float | None = None
+    raw_rank_score: float | None = None
+    setup_type_canonical: str = ""
+    penalty_generation: str = ""
+    outcome_low_mfe_stall_penalty_eval_json: str = "{}"
+    low_mfe_stall_fill_deferred: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for storage"""
@@ -1642,7 +1659,89 @@ class TradeExplainability:
             "argmax_action": self.argmax_action,
             "prediction": self.prediction,
             "side_signal": self.side_signal,
+            "outcome_low_mfe_stall_penalty_applied": self.outcome_low_mfe_stall_penalty_applied,
+            "low_mfe_stall_count": self.low_mfe_stall_count,
+            "giveback_weak_count": self.giveback_weak_count,
+            "bucket_net_pnl": self.bucket_net_pnl,
+            "bucket_profit_factor": self.bucket_profit_factor,
+            "outcome_penalty_rank_delta": self.outcome_penalty_rank_delta,
+            "outcome_penalty_ev_factor": self.outcome_penalty_ev_factor,
+            "rank_score_before_outcome_penalty": self.rank_score_before_outcome_penalty,
+            "selected_net_expected_value_before_outcome_penalty": self.selected_net_expected_value_before_outcome_penalty,
+            "final_selection_score_before_outcome_penalty": self.final_selection_score_before_outcome_penalty,
+            "outcome_adjusted_rank_score": self.outcome_adjusted_rank_score,
+            "raw_rank_score": self.raw_rank_score,
+            "setup_type_canonical": self.setup_type_canonical or self.setup_type,
+            "penalty_generation": self.penalty_generation,
+            "outcome_low_mfe_stall_penalty_eval": (
+                json.loads(self.outcome_low_mfe_stall_penalty_eval_json)
+                if self.outcome_low_mfe_stall_penalty_eval_json
+                and self.outcome_low_mfe_stall_penalty_eval_json != "{}"
+                else {}
+            ),
+            "low_mfe_stall_fill_deferred": self.low_mfe_stall_fill_deferred,
         }
+
+
+def _stamp_low_mfe_outcome_explain(explainability: TradeExplainability, dd: dict[str, Any] | None) -> None:
+    """Copy P1C low-MFE stall demotion fields from decision_data onto BUY explainability."""
+    _dd = dict(dd or {})
+    explainability.outcome_penalty_applied = bool(_dd.get("outcome_penalty_applied"))
+    explainability.outcome_credit_applied = bool(_dd.get("outcome_credit_applied"))
+    explainability.penalty_reason = str(_dd.get("penalty_reason") or "")
+    explainability.outcome_low_mfe_stall_penalty_applied = bool(
+        _dd.get("outcome_low_mfe_stall_penalty_applied")
+    )
+    try:
+        explainability.low_mfe_stall_count = int(_dd.get("low_mfe_stall_count") or 0)
+    except (TypeError, ValueError):
+        explainability.low_mfe_stall_count = 0
+    try:
+        explainability.giveback_weak_count = int(_dd.get("giveback_weak_count") or 0)
+    except (TypeError, ValueError):
+        explainability.giveback_weak_count = 0
+
+    def _opt_float(key: str) -> float | None:
+        raw = _dd.get(key)
+        if raw in (None, ""):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    explainability.bucket_net_pnl = _opt_float("bucket_net_pnl")
+    explainability.bucket_profit_factor = _opt_float("bucket_profit_factor")
+    explainability.outcome_penalty_rank_delta = _opt_float("outcome_penalty_rank_delta")
+    explainability.outcome_penalty_ev_factor = _opt_float("outcome_penalty_ev_factor")
+    explainability.rank_score_before_outcome_penalty = _opt_float("rank_score_before_outcome_penalty")
+    explainability.selected_net_expected_value_before_outcome_penalty = _opt_float(
+        "selected_net_expected_value_before_outcome_penalty"
+    )
+    explainability.final_selection_score_before_outcome_penalty = _opt_float(
+        "final_selection_score_before_outcome_penalty"
+    )
+    explainability.outcome_adjusted_rank_score = _opt_float("outcome_adjusted_rank_score")
+    explainability.raw_rank_score = _opt_float("raw_rank_score")
+    explainability.setup_type_canonical = str(
+        _dd.get("setup_type_canonical") or _dd.get("setup_type") or explainability.setup_type or ""
+    )
+    explainability.penalty_generation = str(_dd.get("penalty_generation") or "")
+    explainability.low_mfe_stall_fill_deferred = bool(_dd.get("low_mfe_stall_fill_deferred"))
+    try:
+        _eval = _dd.get("outcome_low_mfe_stall_penalty_eval")
+        if isinstance(_eval, dict):
+            explainability.outcome_low_mfe_stall_penalty_eval_json = json.dumps(
+                _eval, separators=(",", ":"), default=str
+            )
+            if not explainability.penalty_generation:
+                explainability.penalty_generation = str(_eval.get("penalty_generation") or "")
+        elif isinstance(_eval, str) and _eval.strip():
+            explainability.outcome_low_mfe_stall_penalty_eval_json = _eval
+        else:
+            explainability.outcome_low_mfe_stall_penalty_eval_json = "{}"
+    except (TypeError, ValueError):
+        explainability.outcome_low_mfe_stall_penalty_eval_json = "{}"
 
 
 def _exit_observation_family(exit_type: ExitType) -> str:
@@ -13762,6 +13861,7 @@ class PortfolioEngine:
                 explainability.argmax_action = str(_dd.get("argmax_action") or "")
                 explainability.prediction = str(_dd.get("prediction") or _dd.get("argmax_action") or "")
                 explainability.side_signal = str(_dd.get("side") or _dd.get("action") or "")
+                _stamp_low_mfe_outcome_explain(explainability, _dd)
                 if not explainability.entry_thesis:
                     logger.warning(
                         "MULTI_BUY_MISSING_SETUP symbol=%s decision_id=%s dd_keys=%s",
@@ -14725,17 +14825,41 @@ class PortfolioEngine:
         _slots_left = max(0, _max_pos_bar - len(self.open_positions))
         _buy_budget = min(_max_buys_per_bar, _slots_left) if _slots_left > 0 else 0
         _buy_queue: list[BuyCandidate] = []
+        from backend.services.symbol_setup_outcome_penalty import should_defer_low_mfe_stall_fill
+
         for cand in chosen:
             if cand.symbol in self.open_positions:
                 continue
             if any(x.symbol == cand.symbol for x in _buy_queue):
                 continue
+            _cdd = dict(cand.decision_data or {})
+            if should_defer_low_mfe_stall_fill(_cdd):
+                _cdd["low_mfe_stall_fill_deferred"] = True
+                cand.decision_data = _cdd
+                logger.info(
+                    "BUY_DEFERRED_LOW_MFE_STALL_RANK symbol=%s setup=%s fss=%.5f stall=%s reason=%s",
+                    cand.symbol,
+                    str(_cdd.get("setup_type") or _cdd.get("entry_thesis") or ""),
+                    float(_cdd.get("final_selection_score") or 0.0),
+                    _cdd.get("low_mfe_stall_count"),
+                    str(_cdd.get("penalty_reason") or "")[:120],
+                )
+                continue
             _buy_queue.append(cand)
             if _buy_budget > 0 and len(_buy_queue) >= _buy_budget:
                 break
         if not _buy_queue:
-            top_candidate = chosen[0]
-            self._bar_extra_buy_candidates = []
+            # All unheld candidates deferred (toxic negative FSS) — skip the bar.
+            await self._emit_day_health_telemetry("BUY_SKIPPED_LOW_MFE_STALL_DEFER")
+            logger.info(
+                "BUY_SKIPPED: all unheld candidates deferred by low-MFE stall rank discipline (held=%s chosen=%s)",
+                sorted(open_syms),
+                [c.symbol for c in chosen],
+            )
+            for c in bar_candidate_snapshot:
+                await self._bar_pipeline_terminal(c.decision_id, "LOW_MFE_STALL_DEFER", pipeline_done)
+            self.current_bar_candidates.clear()
+            return None
         else:
             top_candidate = _buy_queue[0]
             self._bar_extra_buy_candidates = list(_buy_queue[1:])
@@ -15162,6 +15286,7 @@ class PortfolioEngine:
                 explainability.higher_score_skipped_json = json.dumps(_skipped or [], separators=(",", ":"))
         except Exception:
             explainability.higher_score_skipped_json = "[]"
+        _stamp_low_mfe_outcome_explain(explainability, _dd)
         # P1B: persist model probs / opinion penalties / rank for post-trade measurement.
         for _attr, _key in (
             ("prob_buy", "prob_buy"),
