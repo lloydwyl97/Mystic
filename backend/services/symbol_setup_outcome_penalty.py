@@ -76,18 +76,38 @@ ETH_V3_FINAL_SCORE_CREDIT = 0.02
 # Universal low-MFE STALL demotion (rank/EV only — never a hard block).
 DAY_UNIVERSAL_PENALTY_SYMBOLS = frozenset({"BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"})
 DAY_UNIVERSAL_PENALTY_SETUPS = frozenset(
-    {"RANGE_BOUNCE", "FAILED_BREAKDOWN_REVERSAL", "HTF_TREND_PULLBACK"}
+    {
+        "RANGE_BOUNCE",
+        "FAILED_BREAKDOWN_REVERSAL",
+        "HTF_TREND_PULLBACK",
+        "BREAKOUT",
+    }
 )
 # Match STALL dead floors for learning demotion (do not change exit floors).
 LOW_MFE_STALL_MAX_MFE_PCT = 0.0050
 LOW_MFE_STALL_MIN_MAE_PCT = 0.0025
 LOW_MFE_STALL_MIN_COUNT = 2
+# Legacy v1 constants retained for audit diffs / older tests.
 LOW_MFE_STALL_RANK_BASE = -0.12
 LOW_MFE_STALL_EV_FACTOR = 0.72
 LOW_MFE_STALL_FINAL_SCORE = -0.05
 # Ocean/paper IDs are far below CLEAN_INFRA_MIN_SELL_ID (2987); low-MFE path
 # must see recent post-clean sells or demotion never fires.
 LOW_MFE_STALL_MIN_SELL_ID = 1
+
+# P1B soft rank/EV calibration (non-blocking). Stronger count/quality scaling.
+P1B_LOOKBACK = 12
+P1B_SETUP_LOOKBACK = 16
+P1B_RANK_FLOOR = -0.60
+P1B_EV_FLOOR = 0.28
+P1B_FSS_FLOOR = -0.30
+P1B_GIVEBACK_MFE_MAX = 0.0035
+P1B_MFE_SEVERE = 0.0010
+P1B_MFE_MODERATE = 0.0020
+P1B_MAE_SEVERE = 0.0040
+P1B_HOLD_DEAD_MIN = 100.0
+P1B_SETUP_STALL_MIN = 3
+P1B_SOFTEN_PF = 1.25
 
 
 @dataclass
@@ -201,25 +221,99 @@ def _load_closed_trades(db_path: str | Path, *, min_sell_id: int = CLEAN_INFRA_M
     return rows
 
 
-def _is_low_mfe_stall_loss(t: ClosedTradeRow) -> bool:
-    reason = (t.raw_exit_reason or t.exit_reason or "").upper()
-    if "STALL" not in reason and "GIVEBACK" not in reason:
-        return False
+def _is_stall_dead_loss(t: ClosedTradeRow) -> bool:
+    """True STALL_EXIT_DEAD_NO_MFE (or equivalent) with negative PnL."""
     if t.pnl >= 0:
+        return False
+    reason = (t.raw_exit_reason or t.exit_reason or "").upper()
+    if "STALL_EXIT_DEAD" in reason or "DEAD_NO_MFE" in reason:
+        return True
+    # Measured STALL with low-MFE / elevated-MAE profile.
+    if "STALL" not in reason:
         return False
     mfe = float(t.mfe_pct) if t.mfe_pct is not None else None
     mae = float(t.mae_pct) if t.mae_pct is not None else None
-    # Prefer explicit DEAD_NO_MFE; also accept STALL/GIVEBACK with measured low MFE.
-    is_dead = "STALL_EXIT_DEAD" in reason or "DEAD_NO_MFE" in reason
-    if mfe is None and not is_dead:
+    if mfe is None:
         return False
-    if mfe is not None and mfe >= LOW_MFE_STALL_MAX_MFE_PCT and not is_dead:
+    if mfe >= LOW_MFE_STALL_MAX_MFE_PCT:
         return False
-    if mae is not None and mae < LOW_MFE_STALL_MIN_MAE_PCT and not is_dead:
+    if mae is not None and mae < LOW_MFE_STALL_MIN_MAE_PCT:
         return False
-    if t.worth_taking is not None and int(t.worth_taking) != 0 and not is_dead:
+    if t.worth_taking is not None and int(t.worth_taking) != 0:
         return False
     return True
+
+
+def _is_secondary_giveback_loss(t: ClosedTradeRow) -> bool:
+    """GIVEBACK with low MFE and negative PnL — secondary weakness only."""
+    if t.pnl >= 0:
+        return False
+    reason = (t.raw_exit_reason or t.exit_reason or "").upper()
+    if "GIVEBACK" not in reason:
+        return False
+    if "STALL_EXIT_DEAD" in reason or "DEAD_NO_MFE" in reason:
+        return False
+    mfe = float(t.mfe_pct) if t.mfe_pct is not None else None
+    if mfe is None:
+        return False
+    return mfe < P1B_GIVEBACK_MFE_MAX
+
+
+def _is_low_mfe_stall_loss(t: ClosedTradeRow) -> bool:
+    """Backward-compatible: STALL dead OR (legacy) low-MFE GIVEBACK counted as loss."""
+    return _is_stall_dead_loss(t) or _is_secondary_giveback_loss(t)
+
+
+def _trade_quality_weight(t: ClosedTradeRow) -> float:
+    """0..1 quality severity for a single dead/weak trade (higher = worse)."""
+    mfe = float(t.mfe_pct) if t.mfe_pct is not None else None
+    mae = float(t.mae_pct) if t.mae_pct is not None else None
+    hold = float(t.hold_min or 0.0)
+    w = 0.35
+    if mfe is not None:
+        if mfe < P1B_MFE_SEVERE:
+            w += 0.30
+        elif mfe < P1B_MFE_MODERATE:
+            w += 0.18
+        elif mfe < LOW_MFE_STALL_MAX_MFE_PCT:
+            w += 0.08
+    if mae is not None and mae >= P1B_MAE_SEVERE:
+        w += 0.20
+    if hold >= P1B_HOLD_DEAD_MIN and (mfe is None or mfe < P1B_MFE_MODERATE):
+        w += 0.15  # dead-on-arrival near stall horizon
+    return min(1.0, w)
+
+
+def _p1b_count_tier_rank_ev(stall_count: int) -> tuple[float, float, float]:
+    """Base rank_delta / ev_factor / fss_adj from STALL_DEAD count."""
+    if stall_count >= 5:
+        return -0.42, 0.38, -0.20
+    if stall_count >= 4:
+        return -0.34, 0.45, -0.16
+    if stall_count >= 3:
+        return -0.26, 0.52, -0.12
+    if stall_count >= 2:
+        return -0.18, 0.62, -0.08
+    return 0.0, 1.0, 0.0
+
+
+def _bucket_pnl_pf(trades: list[ClosedTradeRow]) -> tuple[float, float, int, int]:
+    """Return net_pnl, profit_factor, net_profit_count, stall_dead_count."""
+    if not trades:
+        return 0.0, 0.0, 0, 0
+    net = sum(t.pnl for t in trades)
+    wins = [t.pnl for t in trades if t.pnl > 0]
+    losses = [t.pnl for t in trades if t.pnl <= 0]
+    gw = sum(wins) if wins else 0.0
+    gl = abs(sum(losses)) if losses else 0.0
+    pf = (gw / gl) if gl > 0 else (999.0 if gw > 0 else 0.0)
+    np_count = sum(
+        1
+        for t in trades
+        if "NET_PROFIT" in (t.raw_exit_reason or t.exit_reason or "").upper()
+    )
+    stall_n = sum(1 for t in trades if _is_stall_dead_loss(t))
+    return float(net), float(pf), int(np_count), int(stall_n)
 
 
 def evaluate_low_mfe_stall_penalty(
@@ -231,10 +325,11 @@ def evaluate_low_mfe_stall_penalty(
     min_sell_id: int = LOW_MFE_STALL_MIN_SELL_ID,
 ) -> dict[str, Any]:
     """
-    Non-blocking rank/EV demotion for repeated low-MFE STALL/GIVEBACK losses.
+    P1B non-blocking rank/EV demotion for repeated low-MFE dead-trade history.
 
-    Applies across BTC/ETH/SOL/XRP and RANGE_BOUNCE/FBR/HTF using the same
-    canonical setup key ranking used. Never hard-blocks a candidate.
+    Symbol+setup bucket is primary; setup-wide cluster adds a smaller demotion.
+    GIVEBACK low-MFE negatives add secondary weakness only.
+    Profitable/recovering buckets are softened. Never hard-blocks a candidate.
     """
     from backend.services.day_trade_thesis import resolve_setup_identity
 
@@ -254,7 +349,13 @@ def evaluate_low_mfe_stall_penalty(
         "final_score_adjustment": 0.0,
         "reason": "low_mfe_stall_not_applicable",
         "hard_block": False,
-        "penalty_generation": "low_mfe_stall_v1",
+        "candidate_eligible": True,
+        "eligible": True,
+        "penalty_generation": "low_mfe_stall_p1b",
+        "low_mfe_stall_count": 0,
+        "giveback_weak_count": 0,
+        "bucket_net_pnl": 0.0,
+        "bucket_profit_factor": 0.0,
     }
 
     if sym not in DAY_UNIVERSAL_PENALTY_SYMBOLS:
@@ -270,23 +371,143 @@ def evaluate_low_mfe_stall_penalty(
         db_path = DATABASE_PATH
 
     all_trades = _load_closed_trades(db_path, min_sell_id=min_sell_id)
-    bucket = [
-        t
-        for t in all_trades
-        if t.symbol == sym and (t.setup or "").upper() == setup_u
+    pair_bucket = [
+        t for t in all_trades if t.symbol == sym and (t.setup or "").upper() == setup_u
     ]
-    recent = bucket[-10:]
-    losers = [t for t in recent if _is_low_mfe_stall_loss(t)]
-    if len(losers) < LOW_MFE_STALL_MIN_COUNT:
+    recent = pair_bucket[-P1B_LOOKBACK:]
+    stall_dead = [t for t in recent if _is_stall_dead_loss(t)]
+    giveback_weak = [t for t in recent if _is_secondary_giveback_loss(t)]
+    # Legacy combined count for min-threshold (stall primary; giveback can help reach 2).
+    combined_weak = stall_dead + [t for t in giveback_weak if t not in stall_dead]
+
+    setup_bucket = [t for t in all_trades if (t.setup or "").upper() == setup_u][-P1B_SETUP_LOOKBACK:]
+    setup_stall = [t for t in setup_bucket if _is_stall_dead_loss(t)]
+    setup_net, setup_pf, _, setup_stall_n = _bucket_pnl_pf(setup_bucket)
+
+    pair_net, pair_pf, pair_np, pair_stall_n = _bucket_pnl_pf(recent)
+
+    stall_count = len(stall_dead)
+    gb_count = len(giveback_weak)
+    trigger_count = max(stall_count, len(combined_weak) if stall_count >= 1 else len(combined_weak))
+
+    setup_cluster = setup_stall_n >= P1B_SETUP_STALL_MIN and setup_net < 0
+
+    giveback_only = stall_count == 0 and gb_count >= LOW_MFE_STALL_MIN_COUNT
+    if (
+        stall_count < LOW_MFE_STALL_MIN_COUNT
+        and not giveback_only
+        and not setup_cluster
+    ):
         base["reason"] = "low_mfe_stall_history_insufficient"
-        base["low_mfe_stall_count"] = len(losers)
+        base["low_mfe_stall_count"] = stall_count
+        base["giveback_weak_count"] = gb_count
         base["bucket_count"] = len(recent)
+        base["bucket_net_pnl"] = round(pair_net, 4)
+        base["bucket_profit_factor"] = round(pair_pf, 4)
+        base["setup_stall_count"] = setup_stall_n
         return base
 
-    severity = min(1.0, len(losers) / 5.0 + abs(sum(t.pnl for t in losers)) / 40.0)
-    rank_delta = LOW_MFE_STALL_RANK_BASE - 0.04 * severity
-    ev_factor = max(0.45, LOW_MFE_STALL_EV_FACTOR - 0.08 * severity)
-    final_adj = LOW_MFE_STALL_FINAL_SCORE - 0.02 * severity
+    # --- Primary symbol/setup demotion from STALL_DEAD count ---
+    effective_stall = stall_count
+    rank_delta = 0.0
+    ev_factor = 1.0
+    fss_adj = 0.0
+    quality = 0.0
+
+    if effective_stall >= LOW_MFE_STALL_MIN_COUNT:
+        rank_delta, ev_factor, fss_adj = _p1b_count_tier_rank_ev(effective_stall)
+        quality_src = stall_dead
+        quality = (
+            sum(_trade_quality_weight(t) for t in quality_src) / len(quality_src)
+            if quality_src
+            else 0.0
+        )
+        # Scale magnitude by quality (up to +25% stronger).
+        q_scale = 1.0 + 0.25 * quality
+        rank_delta *= q_scale
+        fss_adj *= q_scale
+        ev_factor = 1.0 - (1.0 - ev_factor) * q_scale
+
+        # PnL damage boost when bucket net negative with 2+ stall.
+        if pair_stall_n >= 2 and pair_net < 0:
+            damage = min(1.0, abs(pair_net) / 45.0)
+            rank_delta -= 0.04 * damage
+            fss_adj -= 0.02 * damage
+            ev_factor *= max(0.88, 1.0 - 0.08 * damage)
+
+    # Secondary GIVEBACK weakness (small) — never uses stall-tier severity alone.
+    if gb_count > 0:
+        gb_rank = max(-0.10, -0.04 * gb_count)
+        gb_ev = max(0.85, 1.0 - 0.05 * gb_count)
+        rank_delta += gb_rank
+        fss_adj -= 0.015 * min(gb_count, 3)
+        ev_factor *= gb_ev
+
+    # Setup-wide cluster (smaller than symbol/setup).
+    setup_rank = 0.0
+    setup_ev = 1.0
+    setup_fss = 0.0
+    if setup_cluster:
+        setup_rank = -0.08
+        setup_ev = 0.90
+        setup_fss = -0.04
+        # Slightly stronger if setup stall count is high.
+        if setup_stall_n >= 5:
+            setup_rank = -0.12
+            setup_ev = 0.85
+            setup_fss = -0.06
+        rank_delta += setup_rank
+        fss_adj += setup_fss
+        ev_factor *= setup_ev
+
+    # Soften profitable / recovering buckets.
+    soften = 1.0
+    soften_reasons: list[str] = []
+    if pair_pf > P1B_SOFTEN_PF and pair_np >= max(1, pair_stall_n) and pair_net > 0:
+        soften *= 0.45
+        soften_reasons.append("bucket_pf_and_net_profit_offset")
+    last3 = recent[-3:]
+    if len(last3) >= 3 and sum(t.pnl for t in last3) > 0:
+        soften *= 0.70
+        soften_reasons.append("latest_3_net_positive")
+    # Never fully erase a 3+ stall-dead cluster; giveback-only may soften more.
+    if effective_stall >= 3:
+        soften = max(soften, 0.55)
+    elif effective_stall >= 2:
+        soften = max(soften, 0.40)
+    elif giveback_only:
+        soften = max(soften, 0.30)
+    else:
+        soften = max(soften, 0.35)
+
+    if soften < 0.999:
+        rank_delta *= soften
+        fss_adj *= soften
+        ev_factor = 1.0 - (1.0 - ev_factor) * soften
+
+    # Caps / floors.
+    rank_delta = max(P1B_RANK_FLOOR, min(0.0, rank_delta))
+    ev_factor = max(P1B_EV_FLOOR, min(1.0, ev_factor))
+    fss_adj = max(P1B_FSS_FLOOR, min(0.0, fss_adj))
+
+    # If somehow no material demotion, do not claim applied.
+    if rank_delta > -0.01 and ev_factor > 0.99 and fss_adj > -0.005:
+        base["reason"] = "penalty_softened_to_noop"
+        base["low_mfe_stall_count"] = stall_count
+        base["giveback_weak_count"] = gb_count
+        base["bucket_net_pnl"] = round(pair_net, 4)
+        base["bucket_profit_factor"] = round(pair_pf, 4)
+        base["soften"] = round(soften, 4)
+        return base
+
+    reasons = ["repeated_low_mfe_stall_losses"]
+    if gb_count > 0:
+        reasons.append("low_mfe_giveback_secondary")
+    if setup_cluster:
+        reasons.append("setup_wide_stall_cluster")
+    if soften_reasons:
+        reasons.append("softened:" + ",".join(soften_reasons))
+
     return {
         "applied": True,
         "symbol": sym,
@@ -294,15 +515,32 @@ def evaluate_low_mfe_stall_penalty(
         "regime": regime_l,
         "rank_delta": round(rank_delta, 4),
         "ev_factor": round(ev_factor, 4),
-        "size_factor": 1.0,  # demote rank/EV only — do not shrink size as a soft gate
-        "final_score_adjustment": round(final_adj, 4),
+        "size_factor": 1.0,  # demote rank/EV only — never shrink size as a soft gate
+        "final_score_adjustment": round(fss_adj, 4),
         "reason": "repeated_low_mfe_stall_losses",
+        "outcome_penalty_reason": "; ".join(reasons),
         "hard_block": False,
-        "penalty_generation": "low_mfe_stall_v1",
-        "low_mfe_stall_count": len(losers),
-        "bucket_count": len(recent),
-        "severity": round(severity, 4),
+        "candidate_eligible": True,
         "eligible": True,
+        "penalty_generation": "low_mfe_stall_p1b",
+        "low_mfe_stall_count": stall_count,
+        "giveback_weak_count": gb_count,
+        "combined_weak_count": len(combined_weak),
+        "bucket_count": len(recent),
+        "bucket_net_pnl": round(pair_net, 4),
+        "bucket_profit_factor": round(pair_pf, 4),
+        "bucket_net_profit_count": pair_np,
+        "setup_stall_count": setup_stall_n,
+        "setup_net_pnl": round(setup_net, 4),
+        "setup_profit_factor": round(setup_pf, 4),
+        "setup_cluster_applied": setup_cluster,
+        "setup_rank_delta": round(setup_rank, 4),
+        "setup_ev_factor": round(setup_ev, 4),
+        "quality_severity": round(quality, 4),
+        "soften": round(soften, 4),
+        "soften_reasons": soften_reasons,
+        "trigger_count": trigger_count,
+        "effective_stall_count": effective_stall,
     }
 
 
@@ -1205,6 +1443,9 @@ def apply_v3_outcome_ranking_to_decision_data(
         dd["selected_net_expected_value_raw"] = raw_ev
 
     dd["raw_rank_score"] = round(float(raw_rank_score), 6)
+    # Pre-penalty stamps for explainability / BUY-side audit.
+    dd["rank_score_before_outcome_penalty"] = round(float(raw_rank_score), 6)
+    dd["selected_net_expected_value_before_outcome_penalty"] = round(raw_ev, 8)
 
     outcome_rank_delta = 0.0
     final_score_adjustment = 0.0
@@ -1231,9 +1472,15 @@ def apply_v3_outcome_ranking_to_decision_data(
         ev_mult *= float(active_pen.get("ev_factor") or 1.0)
         size_mult *= float(active_pen.get("size_factor") or 1.0)
         final_score_adjustment += float(active_pen.get("final_score_adjustment") or 0.0)
-        penalty_reasons.append(str(active_pen.get("reason") or "outcome_penalty"))
+        pen_reason = str(
+            active_pen.get("outcome_penalty_reason")
+            or active_pen.get("reason")
+            or "outcome_penalty"
+        )
+        penalty_reasons.append(pen_reason)
         # Soft demotion only — candidate remains eligible for selection.
         dd["outcome_penalty_hard_block"] = False
+        dd["hard_block"] = False
         dd["candidate_eligible"] = True
         if xrp_pen.get("applied") and active_pen is xrp_pen:
             peer_ceiling = float(xrp_pen.get("peer_ev_ceiling") or 0.012)
@@ -1250,11 +1497,17 @@ def apply_v3_outcome_ranking_to_decision_data(
             if active_pen is low_mfe_pen:
                 dd["outcome_low_mfe_stall_rank_penalty"] = float(low_mfe_pen.get("rank_delta") or 0.0)
                 dd["outcome_low_mfe_stall_ev_factor"] = float(low_mfe_pen.get("ev_factor") or 1.0)
+                dd["low_mfe_stall_count"] = int(low_mfe_pen.get("low_mfe_stall_count") or 0)
+                dd["bucket_net_pnl"] = low_mfe_pen.get("bucket_net_pnl")
+                dd["bucket_profit_factor"] = low_mfe_pen.get("bucket_profit_factor")
+                dd["outcome_penalty_rank_delta"] = float(low_mfe_pen.get("rank_delta") or 0.0)
+                dd["outcome_penalty_ev_factor"] = float(low_mfe_pen.get("ev_factor") or 1.0)
     else:
         dd["outcome_churn_penalty_applied"] = False
         dd["outcome_btc_penalty_applied"] = False
         dd["outcome_low_mfe_stall_penalty_applied"] = False
         dd["outcome_penalty_hard_block"] = False
+        dd["hard_block"] = False
         dd["candidate_eligible"] = True
         dd["adjusted_ev"] = round(raw_ev * ev_mult, 8)
 
@@ -1302,6 +1555,13 @@ def apply_v3_outcome_ranking_to_decision_data(
             bm = None
 
     dd["buy_margin_at_rank"] = bm
+    dd["final_selection_score_before_outcome_penalty"] = compute_final_selection_score(
+        adjusted_ev=float(raw_ev),
+        outcome_adjusted_rank=float(raw_rank_score),
+        raw_rank_score=float(raw_rank_score),
+        buy_margin=bm,
+        final_score_adjustment=0.0,
+    )
     dd["final_selection_score"] = compute_final_selection_score(
         adjusted_ev=float(dd["adjusted_ev"]),
         outcome_adjusted_rank=float(dd["outcome_adjusted_rank_score"]),

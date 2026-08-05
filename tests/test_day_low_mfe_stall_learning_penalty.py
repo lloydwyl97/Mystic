@@ -285,9 +285,9 @@ def test_8_penalty_is_non_blocking(tmp_path: Path):
     )
     assert out.get("candidate_eligible") is True
     assert out.get("outcome_penalty_hard_block") is False
-    # Still has a usable final score — demoted, not removed.
+    assert out.get("hard_block") is False
+    # Still has a usable final score — demoted, not removed (may be negative FSS).
     assert out.get("final_selection_score") is not None
-    assert float(out["final_selection_score"]) >= 0.0
     if out.get("outcome_penalty_applied"):
         assert float(out["adjusted_ev"]) <= float(out["raw_ev"])
         assert float(out["outcome_adjusted_rank_score"]) <= 0.50
