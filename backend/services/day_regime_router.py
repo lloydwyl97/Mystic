@@ -240,10 +240,11 @@ def evaluate_day_entry_route(
                     "route_min_thesis_score": 1.0,
                 }
         elif regime == DAY_REGIME_BEAR:
-            if setup not in (SETUP_FAILED_BREAKDOWN_REVERSAL, SETUP_VWAP_REVERSION):
+            # Profit policy: prefer RANGE/VWAP in bear — FBR is disabled for fills.
+            if setup not in (SETUP_RANGE_BOUNCE, SETUP_VWAP_REVERSION):
                 return {
                     "allowed": False,
-                    "block_reason": "ALLWEATHER_ROUTE_BEAR_REVERSAL_ONLY",
+                    "block_reason": "ALLWEATHER_ROUTE_BEAR_MR_ONLY",
                     "day_route_regime": regime,
                     "strategy_family": family,
                     "route_rank_delta": 0.0,

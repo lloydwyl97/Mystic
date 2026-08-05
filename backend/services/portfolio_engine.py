@@ -14825,7 +14825,10 @@ class PortfolioEngine:
         _slots_left = max(0, _max_pos_bar - len(self.open_positions))
         _buy_budget = min(_max_buys_per_bar, _slots_left) if _slots_left > 0 else 0
         _buy_queue: list[BuyCandidate] = []
-        from backend.services.symbol_setup_outcome_penalty import should_defer_low_mfe_stall_fill
+        from backend.services.symbol_setup_outcome_penalty import (
+            should_defer_day_fbr_fill,
+            should_defer_low_mfe_stall_fill,
+        )
 
         for cand in chosen:
             if cand.symbol in self.open_positions:
@@ -14833,6 +14836,16 @@ class PortfolioEngine:
             if any(x.symbol == cand.symbol for x in _buy_queue):
                 continue
             _cdd = dict(cand.decision_data or {})
+            if should_defer_day_fbr_fill(_cdd):
+                _cdd["day_fbr_fill_deferred"] = True
+                cand.decision_data = _cdd
+                logger.info(
+                    "BUY_DEFERRED_DAY_FBR symbol=%s setup=%s fss=%.5f (DAY_FBR_FILLS_ENABLED=false)",
+                    cand.symbol,
+                    str(_cdd.get("setup_type") or _cdd.get("entry_thesis") or ""),
+                    float(_cdd.get("final_selection_score") or 0.0),
+                )
+                continue
             if should_defer_low_mfe_stall_fill(_cdd):
                 _cdd["low_mfe_stall_fill_deferred"] = True
                 cand.decision_data = _cdd

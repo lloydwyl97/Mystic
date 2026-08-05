@@ -64,12 +64,13 @@ LTF_TFS = ("1m", "5m")
 BREAKOUT_ALT_SYMBOLS = frozenset({"SOLUSDT", "XRPUSDT", "DOGEUSDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"})
 
 _RANK_DELTA = {
-    SETUP_HTF_TREND_PULLBACK: 0.07,
+    # Profit bias (Ocean evidence): RANGE/BREAKOUT win; FBR is the bleed bucket.
+    SETUP_HTF_TREND_PULLBACK: 0.04,
     SETUP_VWAP_REVERSION: -0.02,
-    SETUP_BREAKOUT_CONTINUATION: -0.06,
+    SETUP_BREAKOUT_CONTINUATION: 0.06,
     SETUP_NO_CLEAR_THESIS: -0.14,
-    SETUP_FAILED_BREAKDOWN_REVERSAL: 0.03,  # mild boost in bear/range for learning data
-    SETUP_RANGE_BOUNCE: 0.01,
+    SETUP_FAILED_BREAKDOWN_REVERSAL: -0.22,  # demote — do not mint FBR for "activity"
+    SETUP_RANGE_BOUNCE: 0.08,
     RESEARCH_FAILED_BREAKDOWN_REVERSAL: 0.0,
     RESEARCH_15M_30M_RECLAIM: 0.0,
     RESEARCH_VOLATILITY_EXPANSION: 0.0,
@@ -94,12 +95,12 @@ _RANK_DELTA_SCALP = {
     RESEARCH_SHORT_BEAR_CONTINUATION: 0.0,
 }
 _EV_FACTOR = {
-    SETUP_HTF_TREND_PULLBACK: 1.08,
+    SETUP_HTF_TREND_PULLBACK: 1.04,
     SETUP_VWAP_REVERSION: 0.92,
-    SETUP_BREAKOUT_CONTINUATION: 0.88,
+    SETUP_BREAKOUT_CONTINUATION: 1.06,
     SETUP_NO_CLEAR_THESIS: 0.50,
-    SETUP_FAILED_BREAKDOWN_REVERSAL: 0.95,
-    SETUP_RANGE_BOUNCE: 0.93,
+    SETUP_FAILED_BREAKDOWN_REVERSAL: 0.55,
+    SETUP_RANGE_BOUNCE: 1.08,
 }
 _EV_FACTOR_SCALP = {
     SETUP_HTF_TREND_PULLBACK: 1.0,
@@ -377,7 +378,14 @@ def classify_buy_thesis(
         ev_map = _EV_FACTOR_SCALP
         size_map = _SIZE_FACTOR_SCALP
     else:
-        pref = [SETUP_HTF_TREND_PULLBACK, SETUP_BREAKOUT_CONTINUATION, SETUP_VWAP_REVERSION, SETUP_FAILED_BREAKDOWN_REVERSAL, SETUP_RANGE_BOUNCE]
+        # Prefer proven winners first; FBR last (fills also gated off by default).
+        pref = [
+            SETUP_RANGE_BOUNCE,
+            SETUP_BREAKOUT_CONTINUATION,
+            SETUP_HTF_TREND_PULLBACK,
+            SETUP_VWAP_REVERSION,
+            SETUP_FAILED_BREAKDOWN_REVERSAL,
+        ]
         rank_map = _RANK_DELTA
         ev_map = _EV_FACTOR
         size_map = _SIZE_FACTOR
@@ -556,18 +564,22 @@ def resolve_day_route_regime(decision_data: dict[str, Any]) -> str:
 
 
 def remap_setup_for_day_regime(setup: str, regime: str) -> str:
-    """Map trend/breakout labels to regime-appropriate setups for learning + exits."""
+    """Map trend/breakout labels to regime-appropriate setups for learning + exits.
+
+    Profit policy: do NOT mint FAILED_BREAKDOWN_REVERSAL from unrelated setups.
+    Bear HTF/breakout maps to RANGE_BOUNCE (mean-reversion) instead of FBR.
+    """
     st = str(setup or SETUP_NO_CLEAR_THESIS)
     reg = str(regime or "").strip().lower()
     if reg == "bear":
         if st in (SETUP_HTF_TREND_PULLBACK, SETUP_BREAKOUT_CONTINUATION):
-            return SETUP_FAILED_BREAKDOWN_REVERSAL
+            return SETUP_RANGE_BOUNCE
         if st not in (SETUP_FAILED_BREAKDOWN_REVERSAL, SETUP_VWAP_REVERSION, SETUP_RANGE_BOUNCE):
-            return SETUP_FAILED_BREAKDOWN_REVERSAL
+            return SETUP_RANGE_BOUNCE
     elif reg in ("range", "neutral"):
         if st in (SETUP_HTF_TREND_PULLBACK, SETUP_BREAKOUT_CONTINUATION):
             return SETUP_RANGE_BOUNCE
-        # Preserve explicit FBR — do not collapse into RANGE_BOUNCE (learning pollution).
+        # Preserve explicit FBR label for audit — fills are gated separately.
         if st == SETUP_FAILED_BREAKDOWN_REVERSAL:
             return st
         if st not in (SETUP_VWAP_REVERSION, SETUP_RANGE_BOUNCE, SETUP_FAILED_BREAKDOWN_REVERSAL):
@@ -593,13 +605,13 @@ def apply_ml_locked_setup_override(
     locked = str(dd.get("allweather_setup") or dd.get("setup_type") or dd.get("entry_thesis") or "")
     if not locked or locked == SETUP_NO_CLEAR_THESIS:
         if route_regime == "bear":
-            locked = SETUP_FAILED_BREAKDOWN_REVERSAL
+            locked = SETUP_RANGE_BOUNCE
         elif route_regime in ("range", "neutral"):
             locked = SETUP_RANGE_BOUNCE
         else:
             locked = SETUP_HTF_TREND_PULLBACK
     elif "BREAKOUT_CONTINUATION" in locked and route_regime == "bear":
-        locked = SETUP_FAILED_BREAKDOWN_REVERSAL
+        locked = SETUP_RANGE_BOUNCE
     elif "BREAKOUT_CONTINUATION" in locked and route_regime in ("range", "neutral"):
         locked = SETUP_RANGE_BOUNCE
 

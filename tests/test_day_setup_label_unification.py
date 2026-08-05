@@ -63,5 +63,5 @@ def test_locked_override_stamps_canonical_and_raw():
 
 def test_remap_deterministic_for_range_and_bear():
     assert remap_setup_for_day_regime(SETUP_HTF_TREND_PULLBACK, "range") == SETUP_RANGE_BOUNCE
-    assert remap_setup_for_day_regime(SETUP_HTF_TREND_PULLBACK, "bear") == SETUP_FAILED_BREAKDOWN_REVERSAL
+    assert remap_setup_for_day_regime(SETUP_HTF_TREND_PULLBACK, "bear") == SETUP_RANGE_BOUNCE
     assert remap_setup_for_day_regime(SETUP_FAILED_BREAKDOWN_REVERSAL, "range") == SETUP_FAILED_BREAKDOWN_REVERSAL

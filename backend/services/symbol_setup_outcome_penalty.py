@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 from collections import defaultdict
@@ -322,6 +323,22 @@ def _setup_matches_penalty_bucket(trade_setup: str, target_setup: str) -> bool:
     a = _normalize_penalty_setup(trade_setup)
     b = _normalize_penalty_setup(target_setup)
     return bool(a) and a == b
+
+
+def day_fbr_fills_enabled() -> bool:
+    """DAY FBR fills off by default — Ocean evidence: FBR is the main bleed bucket."""
+    return os.getenv("DAY_FBR_FILLS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def should_defer_day_fbr_fill(decision_data: dict[str, Any] | None) -> bool:
+    """Skip DAY FAILED_BREAKDOWN_REVERSAL fills unless explicitly re-enabled."""
+    if day_fbr_fills_enabled():
+        return False
+    dd = dict(decision_data or {})
+    setup = _normalize_penalty_setup(
+        str(dd.get("setup_type_canonical") or dd.get("setup_type") or dd.get("entry_thesis") or "")
+    )
+    return setup == "FAILED_BREAKDOWN_REVERSAL"
 
 
 def should_defer_low_mfe_stall_fill(decision_data: dict[str, Any] | None) -> bool:
