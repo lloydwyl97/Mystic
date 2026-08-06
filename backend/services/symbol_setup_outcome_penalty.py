@@ -93,6 +93,15 @@ P1C_TOXIC_STALL_SETUPS = frozenset(
         "FAILED_BREAKDOWN_REVERSAL",
     }
 )
+# Profit path: never starve these via low-MFE fill defer (rank demotion still applies).
+DAY_PREFERRED_FILL_SETUPS = frozenset(
+    {
+        "RANGE_BOUNCE",
+        "BREAKOUT",
+        "BREAKOUT_CONTINUATION",
+        "VWAP_REVERSION",
+    }
+)
 # Match STALL dead floors for learning demotion (do not change exit floors).
 LOW_MFE_STALL_MAX_MFE_PCT = 0.0050
 LOW_MFE_STALL_MIN_MAE_PCT = 0.0025
@@ -362,10 +371,15 @@ def should_defer_low_mfe_stall_fill(decision_data: dict[str, Any] | None) -> boo
     Soft capacity discipline: do not consume an open slot with a deeply
     demoted toxic stall cluster whose final_selection_score is still < 0.
 
-    Not a hard setup block — candidate_eligible stays True; a later bar with
-    recovered score / better peers can still fill.
+    RANGE/BREAKOUT/VWAP are never fill-deferred here — those are the active
+    profit path while HTF/FBR fills are gated off. Rank/EV demotion still applies.
     """
     dd = dict(decision_data or {})
+    setup = _normalize_penalty_setup(
+        str(dd.get("setup_type_canonical") or dd.get("setup_type") or dd.get("entry_thesis") or "")
+    )
+    if setup in DAY_PREFERRED_FILL_SETUPS or setup.startswith("BREAKOUT"):
+        return False
     reason = str(dd.get("penalty_reason") or "")
     low_mfe_on = bool(dd.get("outcome_low_mfe_stall_penalty_applied")) or (
         "repeated_low_mfe_stall_losses" in reason or "low_mfe" in reason.lower()
@@ -384,9 +398,6 @@ def should_defer_low_mfe_stall_fill(decision_data: dict[str, Any] | None) -> boo
         stall = int(dd.get("low_mfe_stall_count") or 0)
     except (TypeError, ValueError):
         stall = 0
-    setup = _normalize_penalty_setup(
-        str(dd.get("setup_type_canonical") or dd.get("setup_type") or dd.get("entry_thesis") or "")
-    )
     if setup in P1C_TOXIC_STALL_SETUPS and stall >= P1C_DEFER_MIN_STALL:
         return True
     return stall >= 3

@@ -17,6 +17,7 @@ from backend.services.symbol_setup_outcome_penalty import (
     day_htf_fills_enabled,
     should_defer_day_fbr_fill,
     should_defer_day_htf_fill,
+    should_defer_low_mfe_stall_fill,
 )
 
 
@@ -74,3 +75,26 @@ def test_bull_default_is_breakout_not_htf():
 
 def test_bull_keeps_range_bounce():
     assert remap_setup_for_day_regime(SETUP_RANGE_BOUNCE, "bull") == SETUP_RANGE_BOUNCE
+
+
+def test_range_breakout_never_low_mfe_fill_deferred():
+    """Profit path must not be starved by low-MFE fill defer."""
+    for setup in (SETUP_RANGE_BOUNCE, SETUP_BREAKOUT_CONTINUATION, "BREAKOUT", "VWAP_REVERSION"):
+        dd = {
+            "setup_type": setup,
+            "outcome_low_mfe_stall_penalty_applied": True,
+            "penalty_reason": "repeated_low_mfe_stall_losses",
+            "final_selection_score": -0.20,
+            "low_mfe_stall_count": 5,
+        }
+        assert should_defer_low_mfe_stall_fill(dd) is False, setup
+    # Toxic HTF still defers when FSS < 0.
+    assert should_defer_low_mfe_stall_fill(
+        {
+            "setup_type": SETUP_HTF_TREND_PULLBACK,
+            "outcome_low_mfe_stall_penalty_applied": True,
+            "penalty_reason": "repeated_low_mfe_stall_losses",
+            "final_selection_score": -0.20,
+            "low_mfe_stall_count": 5,
+        }
+    ) is True
