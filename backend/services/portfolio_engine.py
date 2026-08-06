@@ -14827,6 +14827,7 @@ class PortfolioEngine:
         _buy_queue: list[BuyCandidate] = []
         from backend.services.symbol_setup_outcome_penalty import (
             should_defer_day_fbr_fill,
+            should_defer_day_htf_fill,
             should_defer_low_mfe_stall_fill,
         )
 
@@ -14841,6 +14842,16 @@ class PortfolioEngine:
                 cand.decision_data = _cdd
                 logger.info(
                     "BUY_DEFERRED_DAY_FBR symbol=%s setup=%s fss=%.5f (DAY_FBR_FILLS_ENABLED=false)",
+                    cand.symbol,
+                    str(_cdd.get("setup_type") or _cdd.get("entry_thesis") or ""),
+                    float(_cdd.get("final_selection_score") or 0.0),
+                )
+                continue
+            if should_defer_day_htf_fill(_cdd):
+                _cdd["day_htf_fill_deferred"] = True
+                cand.decision_data = _cdd
+                logger.info(
+                    "BUY_DEFERRED_DAY_HTF symbol=%s setup=%s fss=%.5f (DAY_HTF_FILLS_ENABLED=false)",
                     cand.symbol,
                     str(_cdd.get("setup_type") or _cdd.get("entry_thesis") or ""),
                     float(_cdd.get("final_selection_score") or 0.0),

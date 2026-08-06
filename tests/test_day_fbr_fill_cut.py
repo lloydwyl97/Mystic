@@ -14,7 +14,9 @@ from backend.services.day_trade_thesis import (
 )
 from backend.services.symbol_setup_outcome_penalty import (
     day_fbr_fills_enabled,
+    day_htf_fills_enabled,
     should_defer_day_fbr_fill,
+    should_defer_day_htf_fill,
 )
 
 
@@ -44,3 +46,31 @@ def test_fbr_fills_can_reenable(monkeypatch):
     monkeypatch.setenv("DAY_FBR_FILLS_ENABLED", "true")
     assert day_fbr_fills_enabled() is True
     assert should_defer_day_fbr_fill({"setup_type": SETUP_FAILED_BREAKDOWN_REVERSAL}) is False
+
+
+def test_htf_fills_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("DAY_HTF_FILLS_ENABLED", raising=False)
+    assert day_htf_fills_enabled() is False
+    assert should_defer_day_htf_fill({"setup_type": SETUP_HTF_TREND_PULLBACK}) is True
+    assert should_defer_day_htf_fill({"setup_type": "TREND_PULLBACK"}) is True
+    assert should_defer_day_htf_fill({"setup_type": SETUP_RANGE_BOUNCE}) is False
+    assert should_defer_day_htf_fill({"setup_type": SETUP_BREAKOUT_CONTINUATION}) is False
+
+
+def test_htf_fills_can_reenable(monkeypatch):
+    monkeypatch.setenv("DAY_HTF_FILLS_ENABLED", "true")
+    assert day_htf_fills_enabled() is True
+    assert should_defer_day_htf_fill({"setup_type": SETUP_HTF_TREND_PULLBACK}) is False
+
+
+def test_bull_default_is_breakout_not_htf():
+    dd = apply_ml_locked_setup_override(
+        {"day_route_regime": "bull", "setup_type": "", "entry_thesis": ""},
+        current_price=100.0,
+        atr=1.0,
+    )
+    assert dd["setup_type"] == SETUP_BREAKOUT_CONTINUATION
+
+
+def test_bull_keeps_range_bounce():
+    assert remap_setup_for_day_regime(SETUP_RANGE_BOUNCE, "bull") == SETUP_RANGE_BOUNCE

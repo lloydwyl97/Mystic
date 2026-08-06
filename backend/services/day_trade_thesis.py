@@ -585,8 +585,10 @@ def remap_setup_for_day_regime(setup: str, regime: str) -> str:
         if st not in (SETUP_VWAP_REVERSION, SETUP_RANGE_BOUNCE, SETUP_FAILED_BREAKDOWN_REVERSAL):
             return SETUP_RANGE_BOUNCE
     elif reg == "bull":
-        if st in (SETUP_FAILED_BREAKDOWN_REVERSAL, SETUP_RANGE_BOUNCE):
-            return SETUP_HTF_TREND_PULLBACK
+        # Profit policy: do not mint HTF from MR labels (HTF fills are gated off).
+        if st == SETUP_FAILED_BREAKDOWN_REVERSAL:
+            return SETUP_BREAKOUT_CONTINUATION
+        # Keep RANGE_BOUNCE as-is — it is an allowed fill path.
     return st
 
 
@@ -609,7 +611,8 @@ def apply_ml_locked_setup_override(
         elif route_regime in ("range", "neutral"):
             locked = SETUP_RANGE_BOUNCE
         else:
-            locked = SETUP_HTF_TREND_PULLBACK
+            # Bull default: BREAKOUT (HTF fills gated off by default).
+            locked = SETUP_BREAKOUT_CONTINUATION
     elif "BREAKOUT_CONTINUATION" in locked and route_regime == "bear":
         locked = SETUP_RANGE_BOUNCE
     elif "BREAKOUT_CONTINUATION" in locked and route_regime in ("range", "neutral"):

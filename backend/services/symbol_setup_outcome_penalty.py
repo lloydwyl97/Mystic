@@ -330,6 +330,11 @@ def day_fbr_fills_enabled() -> bool:
     return os.getenv("DAY_FBR_FILLS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
+def day_htf_fills_enabled() -> bool:
+    """DAY HTF/TREND_PULLBACK fills off by default — post-FBR-cut bleed bucket."""
+    return os.getenv("DAY_HTF_FILLS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
 def should_defer_day_fbr_fill(decision_data: dict[str, Any] | None) -> bool:
     """Skip DAY FAILED_BREAKDOWN_REVERSAL fills unless explicitly re-enabled."""
     if day_fbr_fills_enabled():
@@ -339,6 +344,17 @@ def should_defer_day_fbr_fill(decision_data: dict[str, Any] | None) -> bool:
         str(dd.get("setup_type_canonical") or dd.get("setup_type") or dd.get("entry_thesis") or "")
     )
     return setup == "FAILED_BREAKDOWN_REVERSAL"
+
+
+def should_defer_day_htf_fill(decision_data: dict[str, Any] | None) -> bool:
+    """Skip DAY HTF_TREND_PULLBACK / TREND_PULLBACK fills unless explicitly re-enabled."""
+    if day_htf_fills_enabled():
+        return False
+    dd = dict(decision_data or {})
+    setup = _normalize_penalty_setup(
+        str(dd.get("setup_type_canonical") or dd.get("setup_type") or dd.get("entry_thesis") or "")
+    )
+    return setup in ("HTF_TREND_PULLBACK", "TREND_PULLBACK")
 
 
 def should_defer_low_mfe_stall_fill(decision_data: dict[str, Any] | None) -> bool:
