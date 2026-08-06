@@ -15,10 +15,7 @@ from backend.services.day_trade_thesis import (
     apply_ml_locked_setup_override,
     remap_setup_for_day_regime,
 )
-from backend.services.symbol_setup_outcome_penalty import (
-    apply_v3_outcome_ranking_to_decision_data,
-    evaluate_low_mfe_stall_penalty,
-)
+from backend.services.symbol_setup_outcome_penalty import evaluate_low_mfe_stall_penalty
 
 
 def _ensure_trades_table(db: str) -> None:
