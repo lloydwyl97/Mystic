@@ -85,21 +85,12 @@ DAY_UNIVERSAL_PENALTY_SETUPS = frozenset(
         "BREAKOUT",
     }
 )
-# Setups that keep selecting into STALL_DEAD clusters after soft demotion.
+# Setups that receive stronger soft rank/EV demotion (never hard-blocked).
 P1C_TOXIC_STALL_SETUPS = frozenset(
     {
         "HTF_TREND_PULLBACK",
         "TREND_PULLBACK",
         "FAILED_BREAKDOWN_REVERSAL",
-    }
-)
-# Profit path: never starve these via low-MFE fill defer (rank demotion still applies).
-DAY_PREFERRED_FILL_SETUPS = frozenset(
-    {
-        "RANGE_BOUNCE",
-        "BREAKOUT",
-        "BREAKOUT_CONTINUATION",
-        "VWAP_REVERSION",
     }
 )
 # Match STALL dead floors for learning demotion (do not change exit floors).
@@ -128,9 +119,6 @@ P1B_HOLD_DEAD_MIN = 100.0
 P1B_SETUP_STALL_MIN = 3
 P1B_SOFTEN_PF = 1.25
 P1C_PENALTY_GENERATION = "low_mfe_stall_p1c"
-# Defer fills whose post-demotion score is still negative (capacity discipline).
-P1C_DEFER_FSS_MAX = 0.0
-P1C_DEFER_MIN_STALL = 2
 
 
 @dataclass
@@ -335,72 +323,28 @@ def _setup_matches_penalty_bucket(trade_setup: str, target_setup: str) -> bool:
 
 
 def day_fbr_fills_enabled() -> bool:
-    """DAY FBR fills off by default — Ocean evidence: FBR is the main bleed bucket."""
-    return os.getenv("DAY_FBR_FILLS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    """Retired hard-gate flag. Ranking engine always allows FBR fills (soft demotion only)."""
+    return True
 
 
 def day_htf_fills_enabled() -> bool:
-    """DAY HTF/TREND_PULLBACK fills off by default — post-FBR-cut bleed bucket."""
-    return os.getenv("DAY_HTF_FILLS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    """Retired hard-gate flag. Ranking engine always allows HTF fills (soft demotion only)."""
+    return True
 
 
 def should_defer_day_fbr_fill(decision_data: dict[str, Any] | None) -> bool:
-    """Skip DAY FAILED_BREAKDOWN_REVERSAL fills unless explicitly re-enabled."""
-    if day_fbr_fills_enabled():
-        return False
-    dd = dict(decision_data or {})
-    setup = _normalize_penalty_setup(
-        str(dd.get("setup_type_canonical") or dd.get("setup_type") or dd.get("entry_thesis") or "")
-    )
-    return setup == "FAILED_BREAKDOWN_REVERSAL"
+    """Retired: never hard-defer FBR. Soft rank/EV demotion remains elsewhere."""
+    return False
 
 
 def should_defer_day_htf_fill(decision_data: dict[str, Any] | None) -> bool:
-    """Skip DAY HTF_TREND_PULLBACK / TREND_PULLBACK fills unless explicitly re-enabled."""
-    if day_htf_fills_enabled():
-        return False
-    dd = dict(decision_data or {})
-    setup = _normalize_penalty_setup(
-        str(dd.get("setup_type_canonical") or dd.get("setup_type") or dd.get("entry_thesis") or "")
-    )
-    return setup in ("HTF_TREND_PULLBACK", "TREND_PULLBACK")
+    """Retired: never hard-defer HTF/TREND. Soft rank/EV demotion remains elsewhere."""
+    return False
 
 
 def should_defer_low_mfe_stall_fill(decision_data: dict[str, Any] | None) -> bool:
-    """
-    Soft capacity discipline: do not consume an open slot with a deeply
-    demoted toxic stall cluster whose final_selection_score is still < 0.
-
-    RANGE/BREAKOUT/VWAP are never fill-deferred here — those are the active
-    profit path while HTF/FBR fills are gated off. Rank/EV demotion still applies.
-    """
-    dd = dict(decision_data or {})
-    setup = _normalize_penalty_setup(
-        str(dd.get("setup_type_canonical") or dd.get("setup_type") or dd.get("entry_thesis") or "")
-    )
-    if setup in DAY_PREFERRED_FILL_SETUPS or setup.startswith("BREAKOUT"):
-        return False
-    reason = str(dd.get("penalty_reason") or "")
-    low_mfe_on = bool(dd.get("outcome_low_mfe_stall_penalty_applied")) or (
-        "repeated_low_mfe_stall_losses" in reason or "low_mfe" in reason.lower()
-    )
-    if not low_mfe_on and not bool(dd.get("outcome_penalty_applied")):
-        return False
-    if not low_mfe_on:
-        return False
-    try:
-        fss = float(dd.get("final_selection_score") or 0.0)
-    except (TypeError, ValueError):
-        return False
-    if fss >= P1C_DEFER_FSS_MAX:
-        return False
-    try:
-        stall = int(dd.get("low_mfe_stall_count") or 0)
-    except (TypeError, ValueError):
-        stall = 0
-    if setup in P1C_TOXIC_STALL_SETUPS and stall >= P1C_DEFER_MIN_STALL:
-        return True
-    return stall >= 3
+    """Retired: never hard-defer on low-MFE/negative FSS. Soft demotion only."""
+    return False
 
 
 def _bucket_pnl_pf(trades: list[ClosedTradeRow]) -> tuple[float, float, int, int]:
@@ -1720,7 +1664,10 @@ def apply_v3_outcome_ranking_to_decision_data(
         dd["bucket_net_pnl"] = low_mfe_pen.get("bucket_net_pnl")
     if "bucket_profit_factor" not in dd and low_mfe_pen.get("bucket_profit_factor") is not None:
         dd["bucket_profit_factor"] = low_mfe_pen.get("bucket_profit_factor")
-    dd["low_mfe_stall_fill_deferred"] = bool(should_defer_low_mfe_stall_fill(dd))
+    # Hard fill defer retired — stamp false so explainability cannot imply a gate.
+    dd["low_mfe_stall_fill_deferred"] = False
+    dd["day_fbr_fill_deferred"] = False
+    dd["day_htf_fill_deferred"] = False
     return dd
 
 

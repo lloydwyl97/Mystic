@@ -14825,76 +14825,37 @@ class PortfolioEngine:
         _slots_left = max(0, _max_pos_bar - len(self.open_positions))
         _buy_budget = min(_max_buys_per_bar, _slots_left) if _slots_left > 0 else 0
         _buy_queue: list[BuyCandidate] = []
-        from backend.services.symbol_setup_outcome_penalty import (
-            should_defer_day_fbr_fill,
-            should_defer_day_htf_fill,
-            should_defer_low_mfe_stall_fill,
-        )
-
+        # Ranking engine: no setup hard-cuts / low-MFE fill defers. Soft rank/EV
+        # demotion already applied on decision_data; safety filters ran above.
         for cand in chosen:
             if cand.symbol in self.open_positions:
                 continue
             if any(x.symbol == cand.symbol for x in _buy_queue):
                 continue
-            _cdd = dict(cand.decision_data or {})
-            if should_defer_day_fbr_fill(_cdd):
-                _cdd["day_fbr_fill_deferred"] = True
-                cand.decision_data = _cdd
-                logger.info(
-                    "BUY_DEFERRED_DAY_FBR symbol=%s setup=%s fss=%.5f (DAY_FBR_FILLS_ENABLED=false)",
-                    cand.symbol,
-                    str(_cdd.get("setup_type") or _cdd.get("entry_thesis") or ""),
-                    float(_cdd.get("final_selection_score") or 0.0),
-                )
-                continue
-            if should_defer_day_htf_fill(_cdd):
-                _cdd["day_htf_fill_deferred"] = True
-                cand.decision_data = _cdd
-                logger.info(
-                    "BUY_DEFERRED_DAY_HTF symbol=%s setup=%s fss=%.5f (DAY_HTF_FILLS_ENABLED=false)",
-                    cand.symbol,
-                    str(_cdd.get("setup_type") or _cdd.get("entry_thesis") or ""),
-                    float(_cdd.get("final_selection_score") or 0.0),
-                )
-                continue
-            if should_defer_low_mfe_stall_fill(_cdd):
-                _cdd["low_mfe_stall_fill_deferred"] = True
-                cand.decision_data = _cdd
-                logger.info(
-                    "BUY_DEFERRED_LOW_MFE_STALL_RANK symbol=%s setup=%s fss=%.5f stall=%s reason=%s",
-                    cand.symbol,
-                    str(_cdd.get("setup_type") or _cdd.get("entry_thesis") or ""),
-                    float(_cdd.get("final_selection_score") or 0.0),
-                    _cdd.get("low_mfe_stall_count"),
-                    str(_cdd.get("penalty_reason") or "")[:120],
-                )
-                continue
             _buy_queue.append(cand)
             if _buy_budget > 0 and len(_buy_queue) >= _buy_budget:
                 break
         if not _buy_queue:
-            # All unheld candidates deferred (toxic negative FSS) — skip the bar.
-            await self._emit_day_health_telemetry("BUY_SKIPPED_LOW_MFE_STALL_DEFER")
+            await self._emit_day_health_telemetry("BUY_SKIPPED_NO_UNHELD_CANDIDATE")
             logger.info(
-                "BUY_SKIPPED: all unheld candidates deferred by low-MFE stall rank discipline (held=%s chosen=%s)",
+                "BUY_SKIPPED: no unheld candidates after ranking (held=%s chosen=%s)",
                 sorted(open_syms),
                 [c.symbol for c in chosen],
             )
             for c in bar_candidate_snapshot:
-                await self._bar_pipeline_terminal(c.decision_id, "LOW_MFE_STALL_DEFER", pipeline_done)
+                await self._bar_pipeline_terminal(c.decision_id, "NO_UNHELD_CANDIDATE", pipeline_done)
             self.current_bar_candidates.clear()
             return None
-        else:
-            top_candidate = _buy_queue[0]
-            self._bar_extra_buy_candidates = list(_buy_queue[1:])
-            if self._bar_extra_buy_candidates:
-                logger.info(
-                    "MULTI_BUY_QUEUE primary=%s extras=%s budget=%d slots_left=%d",
-                    top_candidate.symbol,
-                    [c.symbol for c in self._bar_extra_buy_candidates],
-                    _buy_budget,
-                    _slots_left,
-                )
+        top_candidate = _buy_queue[0]
+        self._bar_extra_buy_candidates = list(_buy_queue[1:])
+        if self._bar_extra_buy_candidates:
+            logger.info(
+                "MULTI_BUY_QUEUE primary=%s extras=%s budget=%d slots_left=%d",
+                top_candidate.symbol,
+                [c.symbol for c in self._bar_extra_buy_candidates],
+                _buy_budget,
+                _slots_left,
+            )
         # Re-stamp truthful why_selected on every executable fill this bar
         # (primary + multi-buy extras). Score-ordered #1 may be an already-open
         # peer skipped for capacity — never claim a false score victory.

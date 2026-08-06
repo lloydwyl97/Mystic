@@ -1,4 +1,4 @@
-"""P1C: stronger soft HTF/FBR demotion + negative-FSS fill deferral."""
+"""P1C: stronger soft HTF/FBR demotion (hard fill defer retired)."""
 
 from __future__ import annotations
 
@@ -146,7 +146,7 @@ def test_p1c_severe_bleed_not_softened_by_latest3(tmp_path: Path):
     assert hard["rank_delta"] <= soft["rank_delta"] or hard["ev_factor"] <= soft["ev_factor"]
 
 
-def test_p1c_defer_negative_fss_toxic_fill(tmp_path: Path):
+def test_p1c_negative_fss_toxic_still_eligible_no_hard_defer(tmp_path: Path):
     db = str(tmp_path / "defer.db")
     _seed_stall_dead(db, symbol="ETH/USDT", setup="HTF_TREND_PULLBACK", n=4, pnl=-9.0)
     out = apply_v3_outcome_ranking_to_decision_data(
@@ -165,16 +165,16 @@ def test_p1c_defer_negative_fss_toxic_fill(tmp_path: Path):
     assert out["candidate_eligible"] is True
     assert out["hard_block"] is False
     assert float(out["final_selection_score"]) < 0.0
-    assert out.get("low_mfe_stall_fill_deferred") is True
-    assert should_defer_low_mfe_stall_fill(out) is True
+    assert out.get("low_mfe_stall_fill_deferred") is False
+    assert should_defer_low_mfe_stall_fill(out) is False
 
 
-def test_p1c_no_defer_when_score_non_negative(tmp_path: Path):
+def test_p1c_hard_fill_defer_always_false():
     dd = {
         "outcome_low_mfe_stall_penalty_applied": True,
         "penalty_reason": "repeated_low_mfe_stall_losses",
-        "final_selection_score": 0.05,
-        "low_mfe_stall_count": 3,
+        "final_selection_score": -0.20,
+        "low_mfe_stall_count": 5,
         "setup_type": "HTF_TREND_PULLBACK",
     }
     assert should_defer_low_mfe_stall_fill(dd) is False

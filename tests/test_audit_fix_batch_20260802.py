@@ -33,7 +33,7 @@ def test_parse_spread_caps_falls_back_on_garbage():
 def test_fbr_preserved_in_range_remap():
     assert remap_setup_for_day_regime(SETUP_FAILED_BREAKDOWN_REVERSAL, "range") == SETUP_FAILED_BREAKDOWN_REVERSAL
     assert remap_setup_for_day_regime(SETUP_FAILED_BREAKDOWN_REVERSAL, "neutral") == SETUP_FAILED_BREAKDOWN_REVERSAL
-    assert remap_setup_for_day_regime(SETUP_HTF_TREND_PULLBACK, "range") == SETUP_RANGE_BOUNCE
+    assert remap_setup_for_day_regime(SETUP_HTF_TREND_PULLBACK, "range") == SETUP_HTF_TREND_PULLBACK
 
 
 def test_apply_ml_locked_keeps_fbr_and_unifies_narrative():

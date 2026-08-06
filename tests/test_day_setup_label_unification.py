@@ -50,18 +50,18 @@ def test_locked_override_stamps_canonical_and_raw():
         "regime": "range",
     }
     out = apply_ml_locked_setup_override(dd, current_price=100.0, atr=1.0)
-    assert out["setup_type"] == SETUP_RANGE_BOUNCE
-    assert out["setup_type_canonical"] == SETUP_RANGE_BOUNCE
+    # Identity-preserving: HTF must not be laundered into RANGE for fill optics.
+    assert out["setup_type"] == SETUP_HTF_TREND_PULLBACK
+    assert out["setup_type_canonical"] == SETUP_HTF_TREND_PULLBACK
     assert out["setup_type_raw"] == SETUP_HTF_TREND_PULLBACK
-    assert out["entry_thesis"] == SETUP_RANGE_BOUNCE
+    assert out["entry_thesis"] == SETUP_HTF_TREND_PULLBACK
     assert out["day_route_regime"] == "range"
-    # Ranking and learning share the same key.
     ident = resolve_setup_identity(out)
     assert ident["setup_type_canonical"] == out["setup_type"]
-    assert ident["setup_type_canonical"] == SETUP_RANGE_BOUNCE
+    assert ident["setup_type_canonical"] == SETUP_HTF_TREND_PULLBACK
 
 
 def test_remap_deterministic_for_range_and_bear():
-    assert remap_setup_for_day_regime(SETUP_HTF_TREND_PULLBACK, "range") == SETUP_RANGE_BOUNCE
-    assert remap_setup_for_day_regime(SETUP_HTF_TREND_PULLBACK, "bear") == SETUP_RANGE_BOUNCE
+    assert remap_setup_for_day_regime(SETUP_HTF_TREND_PULLBACK, "range") == SETUP_HTF_TREND_PULLBACK
+    assert remap_setup_for_day_regime(SETUP_HTF_TREND_PULLBACK, "bear") == SETUP_HTF_TREND_PULLBACK
     assert remap_setup_for_day_regime(SETUP_FAILED_BREAKDOWN_REVERSAL, "range") == SETUP_FAILED_BREAKDOWN_REVERSAL

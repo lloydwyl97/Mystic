@@ -564,31 +564,30 @@ def resolve_day_route_regime(decision_data: dict[str, Any]) -> str:
 
 
 def remap_setup_for_day_regime(setup: str, regime: str) -> str:
-    """Map trend/breakout labels to regime-appropriate setups for learning + exits.
+    """Preserve HTF/FBR identity for ranking — never rewrite them into RANGE.
 
-    Profit policy: do NOT mint FAILED_BREAKDOWN_REVERSAL from unrelated setups.
-    Bear HTF/breakout maps to RANGE_BOUNCE (mean-reversion) instead of FBR.
+    Soft rank/EV demotion handles toxic buckets. Remap must not launder HTF/FBR
+    into RANGE for fill optics. Unknown/empty setups still get a regime default
+    via apply_ml_locked_setup_override.
     """
     st = str(setup or SETUP_NO_CLEAR_THESIS)
+    if st == "TREND_PULLBACK":
+        return SETUP_HTF_TREND_PULLBACK
+    # Honest identity: keep primary DAY setups as classified.
+    if st in (
+        SETUP_HTF_TREND_PULLBACK,
+        SETUP_FAILED_BREAKDOWN_REVERSAL,
+        SETUP_RANGE_BOUNCE,
+        SETUP_BREAKOUT_CONTINUATION,
+        SETUP_VWAP_REVERSION,
+        SETUP_NO_CLEAR_THESIS,
+    ):
+        return st
     reg = str(regime or "").strip().lower()
-    if reg == "bear":
-        if st in (SETUP_HTF_TREND_PULLBACK, SETUP_BREAKOUT_CONTINUATION):
-            return SETUP_RANGE_BOUNCE
-        if st not in (SETUP_FAILED_BREAKDOWN_REVERSAL, SETUP_VWAP_REVERSION, SETUP_RANGE_BOUNCE):
-            return SETUP_RANGE_BOUNCE
-    elif reg in ("range", "neutral"):
-        if st in (SETUP_HTF_TREND_PULLBACK, SETUP_BREAKOUT_CONTINUATION):
-            return SETUP_RANGE_BOUNCE
-        # Preserve explicit FBR label for audit — fills are gated separately.
-        if st == SETUP_FAILED_BREAKDOWN_REVERSAL:
-            return st
-        if st not in (SETUP_VWAP_REVERSION, SETUP_RANGE_BOUNCE, SETUP_FAILED_BREAKDOWN_REVERSAL):
-            return SETUP_RANGE_BOUNCE
-    elif reg == "bull":
-        # Profit policy: do not mint HTF from MR labels (HTF fills are gated off).
-        if st == SETUP_FAILED_BREAKDOWN_REVERSAL:
-            return SETUP_BREAKOUT_CONTINUATION
-        # Keep RANGE_BOUNCE as-is — it is an allowed fill path.
+    if reg in ("range", "neutral", "bear"):
+        return SETUP_RANGE_BOUNCE
+    if reg == "bull":
+        return SETUP_HTF_TREND_PULLBACK
     return st
 
 
@@ -598,7 +597,7 @@ def apply_ml_locked_setup_override(
     current_price: float,
     atr: float,
 ) -> dict[str, Any]:
-    """Stamp regime-compatible setup/levels so entry labels match exit manager rules."""
+    """Stamp setup/levels for exits; preserve raw vs locked identity for explainability."""
     dd = dict(decision_data or {})
     route_regime = resolve_day_route_regime(dd)
     dd["day_route_regime"] = route_regime
@@ -611,12 +610,7 @@ def apply_ml_locked_setup_override(
         elif route_regime in ("range", "neutral"):
             locked = SETUP_RANGE_BOUNCE
         else:
-            # Bull default: BREAKOUT (HTF fills gated off by default).
-            locked = SETUP_BREAKOUT_CONTINUATION
-    elif "BREAKOUT_CONTINUATION" in locked and route_regime == "bear":
-        locked = SETUP_RANGE_BOUNCE
-    elif "BREAKOUT_CONTINUATION" in locked and route_regime in ("range", "neutral"):
-        locked = SETUP_RANGE_BOUNCE
+            locked = SETUP_HTF_TREND_PULLBACK
 
     locked = remap_setup_for_day_regime(locked, route_regime)
 
@@ -626,7 +620,8 @@ def apply_ml_locked_setup_override(
     dd["allweather_setup"] = locked
     dd["setup_type_canonical"] = locked
     dd["setup_type_raw"] = prior_setup or locked
-    dd["setup_regime_remapped_from"] = prior_setup
+    dd["setup_regime_remapped_from"] = prior_setup if prior_setup and prior_setup != locked else ""
+    dd["setup_remap_is_identity_preserving"] = bool(not prior_setup or prior_setup == locked)
     # Keep narrative / adaptive labels aligned with final locked setup identity.
     narr = str(dd.get("candidate_explanation_narrative") or "")
     if prior_setup and prior_setup != locked:
