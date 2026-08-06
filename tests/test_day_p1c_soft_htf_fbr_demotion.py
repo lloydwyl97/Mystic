@@ -11,7 +11,6 @@ import pytest
 from backend.services.symbol_setup_outcome_penalty import (
     apply_v3_outcome_ranking_to_decision_data,
     evaluate_low_mfe_stall_penalty,
-    should_defer_low_mfe_stall_fill,
 )
 
 
@@ -165,19 +164,6 @@ def test_p1c_negative_fss_toxic_still_eligible_no_hard_defer(tmp_path: Path):
     assert out["candidate_eligible"] is True
     assert out["hard_block"] is False
     assert float(out["final_selection_score"]) < 0.0
-    assert out.get("low_mfe_stall_fill_deferred") is False
-    assert should_defer_low_mfe_stall_fill(out) is False
-
-
-def test_p1c_hard_fill_defer_always_false():
-    dd = {
-        "outcome_low_mfe_stall_penalty_applied": True,
-        "penalty_reason": "repeated_low_mfe_stall_losses",
-        "final_selection_score": -0.20,
-        "low_mfe_stall_count": 5,
-        "setup_type": "HTF_TREND_PULLBACK",
-    }
-    assert should_defer_low_mfe_stall_fill(dd) is False
 
 
 def test_p1c_trend_pullback_aliases_htf(tmp_path: Path):

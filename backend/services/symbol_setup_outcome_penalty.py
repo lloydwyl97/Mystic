@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sqlite3
 import time
 from collections import defaultdict
@@ -320,31 +319,6 @@ def _setup_matches_penalty_bucket(trade_setup: str, target_setup: str) -> bool:
     a = _normalize_penalty_setup(trade_setup)
     b = _normalize_penalty_setup(target_setup)
     return bool(a) and a == b
-
-
-def day_fbr_fills_enabled() -> bool:
-    """Retired hard-gate flag. Ranking engine always allows FBR fills (soft demotion only)."""
-    return True
-
-
-def day_htf_fills_enabled() -> bool:
-    """Retired hard-gate flag. Ranking engine always allows HTF fills (soft demotion only)."""
-    return True
-
-
-def should_defer_day_fbr_fill(decision_data: dict[str, Any] | None) -> bool:
-    """Retired: never hard-defer FBR. Soft rank/EV demotion remains elsewhere."""
-    return False
-
-
-def should_defer_day_htf_fill(decision_data: dict[str, Any] | None) -> bool:
-    """Retired: never hard-defer HTF/TREND. Soft rank/EV demotion remains elsewhere."""
-    return False
-
-
-def should_defer_low_mfe_stall_fill(decision_data: dict[str, Any] | None) -> bool:
-    """Retired: never hard-defer on low-MFE/negative FSS. Soft demotion only."""
-    return False
 
 
 def _bucket_pnl_pf(trades: list[ClosedTradeRow]) -> tuple[float, float, int, int]:
@@ -1664,10 +1638,6 @@ def apply_v3_outcome_ranking_to_decision_data(
         dd["bucket_net_pnl"] = low_mfe_pen.get("bucket_net_pnl")
     if "bucket_profit_factor" not in dd and low_mfe_pen.get("bucket_profit_factor") is not None:
         dd["bucket_profit_factor"] = low_mfe_pen.get("bucket_profit_factor")
-    # Hard fill defer retired — stamp false so explainability cannot imply a gate.
-    dd["low_mfe_stall_fill_deferred"] = False
-    dd["day_fbr_fill_deferred"] = False
-    dd["day_htf_fill_deferred"] = False
     return dd
 
 

@@ -5390,6 +5390,30 @@ class PortfolioEngine:
                     close_reason=close_reason,
                     outcome_class=str(ex_payload.get("outcome_reason") or ""),
                 )
+            # Promote/starve DAY arms from realized close (Thompson bandit).
+            with contextlib.suppress(Exception):
+                from backend.services.day_outcome_bandit import record_bandit_outcome
+
+                _setup = str(
+                    ex_payload.get("setup_type_canonical")
+                    or ex_payload.get("setup_type")
+                    or ex_payload.get("entry_thesis")
+                    or ""
+                )
+                _regime = str(
+                    ex_payload.get("day_route_regime")
+                    or ex_payload.get("regime")
+                    or "range"
+                )
+                record_bandit_outcome(
+                    symbol=symbol,
+                    setup=_setup,
+                    regime=_regime,
+                    pnl_usd=float(realized_profit) if realized_profit is not None else 0.0,
+                    exit_reason=str(close_reason or ""),
+                    db_path=self.db_path,
+                    trade_id=str(getattr(position, "trade_id", "") or ""),
+                )
         except Exception as e:
             logger.debug(
                 "LEARNING_WRITER_SKIPPED symbol=%s reason=%s err=%s",
@@ -6690,7 +6714,8 @@ class PortfolioEngine:
         candidate.decision_data = dd
 
     def _apply_outcome_churn_penalty_to_candidate(self, candidate: BuyCandidate) -> None:
-        """v3 outcome ranking: penalties/credits drive final_selection_score."""
+        """Soft outcome demotion, then DAY bandit owns final selection score."""
+        from backend.services.day_outcome_bandit import apply_bandit_to_decision_data
         from backend.services.symbol_setup_outcome_penalty import apply_v3_outcome_ranking_to_decision_data
 
         dd = dict(candidate.decision_data or {})
@@ -6699,11 +6724,16 @@ class PortfolioEngine:
         if dd.get("selected_net_expected_value_raw") is None:
             dd["selected_net_expected_value_raw"] = raw_ev
         bm = resolve_buy_margin_from_payload(dd)
-        candidate.decision_data = apply_v3_outcome_ranking_to_decision_data(
+        dd = apply_v3_outcome_ranking_to_decision_data(
             dd,
             candidate.symbol,
             raw_rank_score=raw_rank,
             buy_margin=bm,
+        )
+        candidate.decision_data = apply_bandit_to_decision_data(
+            dd,
+            candidate.symbol,
+            db_path=self.db_path,
         )
 
     def _symbol_same_day_thesis_loss_count(self, symbol: str) -> int:
@@ -13928,6 +13958,14 @@ class PortfolioEngine:
 
         self.last_bar_timestamp = bar_timestamp
 
+        # Hydrate promote/kill arms once from recent DAY sells if empty.
+        if not getattr(self, "_day_bandit_bootstrapped", False):
+            with contextlib.suppress(Exception):
+                from backend.services.day_outcome_bandit import bootstrap_bandit_from_paper_trades
+
+                bootstrap_bandit_from_paper_trades(self.db_path, lookback=120)
+            self._day_bandit_bootstrapped = True
+
         full_universe_diag = await self._augment_full_universe_candidates(bar_timestamp)
 
         # Phase 3: aggregate adaptive-weight diagnostics over the bar so we can
@@ -14585,7 +14623,13 @@ class PortfolioEngine:
                 ts = float(d.get("signal_timestamp") or d.get("bar_timestamp") or getattr(c, "bar_timestamp", 0) or 0.0)
             except Exception:
                 ts = 0.0
+            # Primary: day_bandit_score (promote winners / bury starved losers).
+            try:
+                bandit = float(d.get("day_bandit_score") or d.get("final_selection_score") or d.get("selection_score") or 0.0)
+            except Exception:
+                bandit = 0.0
             return (
+                -bandit,
                 -float(d.get("final_selection_score") or d.get("selection_score") or 0.0),
                 -nev,
                 -float(d.get("outcome_adjusted_rank_score") or c.rank_score()),
@@ -14610,16 +14654,17 @@ class PortfolioEngine:
         for i, cand in enumerate(valid_candidates[:5]):
             _ra = _rank_align_for_price_regime(cand) if _price_regime_behavior_split_enabled() else 0.0
             logger.info(
-                "RANK #%d: %s | final_sel=%.5f adj_rank=%.3f rank=%.3f conf=%.3f day_regime=%s ps_regime=%s regime_align=%.3f",
+                "RANK #%d: %s | bandit=%.4f starved=%s final_sel=%.5f adj_rank=%.3f rank=%.3f conf=%.3f day_regime=%s setup=%s",
                 i + 1,
                 cand.symbol,
+                float((cand.decision_data or {}).get("day_bandit_score") or (cand.decision_data or {}).get("final_selection_score") or 0.0),
+                bool((cand.decision_data or {}).get("day_bandit_starved")),
                 float((cand.decision_data or {}).get("final_selection_score") or (cand.decision_data or {}).get("selection_score") or 0.0),
                 float((cand.decision_data or {}).get("outcome_adjusted_rank_score") or 0.0),
                 cand.rank_score(),
                 cand.confidence,
                 (cand.decision_data or {}).get("day_route_regime") or "?",
-                cand.price_structure_regime,
-                _ra,
+                str((cand.decision_data or {}).get("setup_type_canonical") or (cand.decision_data or {}).get("setup_type") or "?")[:28],
             )
 
         # Execution sanity telemetry only: keep all ranked candidates unless data is truly broken.

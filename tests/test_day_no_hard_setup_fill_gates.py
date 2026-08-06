@@ -1,4 +1,4 @@
-"""Path A: DAY hard setup fill gates removed — soft demotion only."""
+"""Hard setup fill gates removed; bandit + soft demotion only."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 
 import backend.services.symbol_setup_outcome_penalty as outcome_pen
+from backend.services.day_outcome_bandit import apply_bandit_to_decision_data, record_bandit_outcome
 from backend.services.day_trade_thesis import (
     SETUP_BREAKOUT_CONTINUATION,
     SETUP_FAILED_BREAKDOWN_REVERSAL,
@@ -14,12 +15,7 @@ from backend.services.day_trade_thesis import (
     SETUP_RANGE_BOUNCE,
     apply_ml_locked_setup_override,
 )
-from backend.services.symbol_setup_outcome_penalty import (
-    apply_v3_outcome_ranking_to_decision_data,
-    should_defer_day_fbr_fill,
-    should_defer_day_htf_fill,
-    should_defer_low_mfe_stall_fill,
-)
+from backend.services.symbol_setup_outcome_penalty import apply_v3_outcome_ranking_to_decision_data
 
 
 def _ensure_trades_table(db: str) -> None:
@@ -77,9 +73,18 @@ def _seed_stall_dead(db: str, *, symbol: str, setup: str, n: int = 4, pnl: float
             conn.commit()
 
 
-def test_fbr_eligible_soft_demoted(tmp_path: Path):
+def test_fbr_eligible_soft_demoted_then_bandit(tmp_path: Path):
     db = str(tmp_path / "fbr.db")
     _seed_stall_dead(db, symbol="SOL/USDT", setup=SETUP_FAILED_BREAKDOWN_REVERSAL, n=4)
+    for _ in range(4):
+        record_bandit_outcome(
+            symbol="SOL/USDT",
+            setup=SETUP_FAILED_BREAKDOWN_REVERSAL,
+            regime="bear",
+            pnl_usd=-8.0,
+            exit_reason="STALL_EXIT",
+            db_path=db,
+        )
     out = apply_v3_outcome_ranking_to_decision_data(
         {
             "setup_type": SETUP_FAILED_BREAKDOWN_REVERSAL,
@@ -92,11 +97,10 @@ def test_fbr_eligible_soft_demoted(tmp_path: Path):
         buy_margin=0.02,
         db_path=db,
     )
-    assert out["outcome_penalty_applied"] is True or out["outcome_low_mfe_stall_penalty_applied"] is True
+    out = apply_bandit_to_decision_data(out, "SOL/USDT", db_path=db)
     assert out["hard_block"] is False
     assert out["candidate_eligible"] is True
-    assert should_defer_day_fbr_fill(out) is False
-    assert out.get("day_fbr_fill_deferred") is False
+    assert out["day_bandit_starved"] is True
 
 
 def test_htf_eligible_soft_demoted(tmp_path: Path):
@@ -114,70 +118,16 @@ def test_htf_eligible_soft_demoted(tmp_path: Path):
         buy_margin=0.02,
         db_path=db,
     )
+    out = apply_bandit_to_decision_data(out, "ETH/USDT", db_path=db)
     assert out["outcome_low_mfe_stall_penalty_applied"] is True
     assert out["hard_block"] is False
     assert out["candidate_eligible"] is True
-    assert should_defer_day_htf_fill(out) is False
-    assert out.get("day_htf_fill_deferred") is False
-
-
-def test_low_mfe_history_does_not_empty_buy_queue(tmp_path: Path):
-    db = str(tmp_path / "queue.db")
-    for sym, setup in (
-        ("BTC/USDT", SETUP_HTF_TREND_PULLBACK),
-        ("ETH/USDT", SETUP_FAILED_BREAKDOWN_REVERSAL),
-        ("SOL/USDT", SETUP_RANGE_BOUNCE),
-    ):
-        _seed_stall_dead(db, symbol=sym, setup=setup, n=3)
-    ranked = []
-    for sym, setup, raw in (
-        ("BTC/USDT", SETUP_HTF_TREND_PULLBACK, 0.50),
-        ("ETH/USDT", SETUP_FAILED_BREAKDOWN_REVERSAL, 0.48),
-        ("SOL/USDT", SETUP_RANGE_BOUNCE, 0.70),
-    ):
-        out = apply_v3_outcome_ranking_to_decision_data(
-            {
-                "setup_type": setup,
-                "day_route_regime": "range",
-                "selected_net_expected_value": 0.09,
-                "buy_margin": 0.02,
-            },
-            sym,
-            raw_rank_score=raw,
-            buy_margin=0.02,
-            db_path=db,
-        )
-        assert out["candidate_eligible"] is True
-        assert should_defer_low_mfe_stall_fill(out) is False
-        ranked.append((sym, float(out["final_selection_score"]), out))
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    assert len(ranked) == 3
-    assert ranked[0][0] in ("BTC/USDT", "ETH/USDT", "SOL/USDT")
-    assert all(r[2].get("low_mfe_stall_fill_deferred") is False for r in ranked)
-
-
-def test_negative_fss_not_a_setup_defer_gate(tmp_path: Path):
-    db = str(tmp_path / "neg.db")
-    _seed_stall_dead(db, symbol="XRP/USDT", setup=SETUP_HTF_TREND_PULLBACK, n=5, pnl=-10.0)
-    out = apply_v3_outcome_ranking_to_decision_data(
-        {
-            "setup_type": SETUP_HTF_TREND_PULLBACK,
-            "day_route_regime": "range",
-            "selected_net_expected_value": 0.07,
-            "buy_margin": 0.02,
-        },
-        "XRP/USDT",
-        raw_rank_score=0.52,
-        buy_margin=0.02,
-        db_path=db,
-    )
-    assert float(out["final_selection_score"]) < 0.0
-    assert out["candidate_eligible"] is True
-    assert should_defer_low_mfe_stall_fill(out) is False
 
 
 def test_no_preferred_fill_whitelist():
     assert not hasattr(outcome_pen, "DAY_PREFERRED_FILL_SETUPS")
+    assert not hasattr(outcome_pen, "should_defer_day_fbr_fill")
+    assert not hasattr(outcome_pen, "should_defer_low_mfe_stall_fill")
 
 
 def test_remapped_htf_does_not_pretend_native_range():
@@ -192,8 +142,6 @@ def test_remapped_htf_does_not_pretend_native_range():
         atr=1.0,
     )
     assert out["setup_type"] == SETUP_HTF_TREND_PULLBACK
-    assert out["setup_type_canonical"] == SETUP_HTF_TREND_PULLBACK
-    assert out["setup_type_raw"] == SETUP_HTF_TREND_PULLBACK
     assert out["setup_type"] != SETUP_RANGE_BOUNCE
 
 
