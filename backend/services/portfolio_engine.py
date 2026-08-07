@@ -1548,6 +1548,13 @@ class TradeExplainability:
     day_bandit_starved: bool = False
     day_bandit_size_factor: float | None = None
     final_selection_score_pre_bandit: float | None = None
+    # Entry-confirmation soft demotion (Batch 4)
+    entry_confirmation_enabled: bool = False
+    entry_confirmation_score: float | None = None
+    entry_confirmation_state: str = ""
+    entry_confirmation_reasons: str = ""
+    entry_confirmation_rank_delta: float | None = None
+    entry_confirmation_size_factor: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for storage"""
@@ -1710,6 +1717,12 @@ class TradeExplainability:
             "day_bandit_starved": self.day_bandit_starved,
             "day_bandit_size_factor": self.day_bandit_size_factor,
             "final_selection_score_pre_bandit": self.final_selection_score_pre_bandit,
+            "entry_confirmation_enabled": self.entry_confirmation_enabled,
+            "entry_confirmation_score": self.entry_confirmation_score,
+            "entry_confirmation_state": self.entry_confirmation_state,
+            "entry_confirmation_reasons": self.entry_confirmation_reasons,
+            "entry_confirmation_rank_delta": self.entry_confirmation_rank_delta,
+            "entry_confirmation_size_factor": self.entry_confirmation_size_factor,
         }
 
 
@@ -1755,6 +1768,27 @@ def _stamp_day_bandit_explain(explainability: TradeExplainability, dd: dict[str,
     explainability.day_bandit_starved = bool(_dd.get("day_bandit_starved"))
     explainability.day_bandit_size_factor = _opt_float("day_bandit_size_factor")
     explainability.final_selection_score_pre_bandit = _opt_float("final_selection_score_pre_bandit")
+
+
+def _stamp_entry_confirmation_explain(explainability: TradeExplainability, dd: dict[str, Any] | None) -> None:
+    """Copy Batch 4 entry-confirmation fields from decision_data onto BUY explainability."""
+    _dd = dict(dd or {})
+
+    def _opt_float(key: str) -> float | None:
+        raw = _dd.get(key)
+        if raw in (None, ""):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    explainability.entry_confirmation_enabled = bool(_dd.get("entry_confirmation_enabled"))
+    explainability.entry_confirmation_score = _opt_float("entry_confirmation_score")
+    explainability.entry_confirmation_state = str(_dd.get("entry_confirmation_state") or "")
+    explainability.entry_confirmation_reasons = str(_dd.get("entry_confirmation_reasons") or "")
+    explainability.entry_confirmation_rank_delta = _opt_float("entry_confirmation_rank_delta")
+    explainability.entry_confirmation_size_factor = _opt_float("entry_confirmation_size_factor")
 
 
 def _stamp_low_mfe_outcome_explain(explainability: TradeExplainability, dd: dict[str, Any] | None) -> None:
@@ -6788,7 +6822,18 @@ class PortfolioEngine:
         candidate.decision_data = dd
 
     def _apply_outcome_churn_penalty_to_candidate(self, candidate: BuyCandidate) -> None:
-        """Soft outcome demotion, then DAY bandit owns final selection score."""
+        """Soft outcome demotion → soft entry-confirmation demotion → DAY
+        bandit owns final selection score.
+
+        Entry confirmation is a ranking + size soft penalty computed from
+        already-stamped signal fields (mark vs vwap, candle body/wick, EMA
+        alignment, ADX floor). It never sets hard_block; a fully-red
+        confirmation still leaves the candidate eligible for a small
+        exploration trade (size floor 0.20).
+        """
+        from backend.services.day_entry_confirmation import (
+            apply_entry_confirmation_to_decision_data,
+        )
         from backend.services.day_outcome_bandit import apply_bandit_to_decision_data
         from backend.services.symbol_setup_outcome_penalty import apply_v3_outcome_ranking_to_decision_data
 
@@ -6803,6 +6848,10 @@ class PortfolioEngine:
             candidate.symbol,
             raw_rank_score=raw_rank,
             buy_margin=bm,
+        )
+        dd = apply_entry_confirmation_to_decision_data(
+            dd,
+            current_price=float(getattr(candidate, "current_price", 0.0) or 0.0),
         )
         candidate.decision_data = apply_bandit_to_decision_data(
             dd,
@@ -13967,6 +14016,7 @@ class PortfolioEngine:
                 explainability.side_signal = str(_dd.get("side") or _dd.get("action") or "")
                 _stamp_low_mfe_outcome_explain(explainability, _dd)
                 _stamp_day_bandit_explain(explainability, _dd)
+                _stamp_entry_confirmation_explain(explainability, _dd)
                 if not explainability.entry_thesis:
                     logger.warning(
                         "MULTI_BUY_MISSING_SETUP symbol=%s decision_id=%s dd_keys=%s",
@@ -15393,6 +15443,7 @@ class PortfolioEngine:
             explainability.higher_score_skipped_json = "[]"
         _stamp_low_mfe_outcome_explain(explainability, _dd)
         _stamp_day_bandit_explain(explainability, _dd)
+        _stamp_entry_confirmation_explain(explainability, _dd)
         # P1B: persist model probs / opinion penalties / rank for post-trade measurement.
         for _attr, _key in (
             ("prob_buy", "prob_buy"),
