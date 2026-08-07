@@ -1532,6 +1532,22 @@ class TradeExplainability:
     penalty_generation: str = ""
     outcome_low_mfe_stall_penalty_eval_json: str = "{}"
     low_mfe_stall_fill_deferred: bool = False
+    # DAY bandit (Thompson-sampled promote/kill allocator) — stamped at BUY time
+    # so post-trade audits can replay α/β/mean/starved/size from paper_trades JSON alone.
+    day_bandit_enabled: bool = False
+    day_bandit_arm_key: str = ""
+    day_bandit_alpha: float | None = None
+    day_bandit_beta: float | None = None
+    day_bandit_mean: float | None = None
+    day_bandit_sample: float | None = None
+    day_bandit_score: float | None = None
+    day_bandit_n_obs: int = 0
+    day_bandit_wins: int = 0
+    day_bandit_losses: int = 0
+    day_bandit_total_pnl: float | None = None
+    day_bandit_starved: bool = False
+    day_bandit_size_factor: float | None = None
+    final_selection_score_pre_bandit: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for storage"""
@@ -1680,7 +1696,65 @@ class TradeExplainability:
                 else {}
             ),
             "low_mfe_stall_fill_deferred": self.low_mfe_stall_fill_deferred,
+            "day_bandit_enabled": self.day_bandit_enabled,
+            "day_bandit_arm_key": self.day_bandit_arm_key,
+            "day_bandit_alpha": self.day_bandit_alpha,
+            "day_bandit_beta": self.day_bandit_beta,
+            "day_bandit_mean": self.day_bandit_mean,
+            "day_bandit_sample": self.day_bandit_sample,
+            "day_bandit_score": self.day_bandit_score,
+            "day_bandit_n_obs": self.day_bandit_n_obs,
+            "day_bandit_wins": self.day_bandit_wins,
+            "day_bandit_losses": self.day_bandit_losses,
+            "day_bandit_total_pnl": self.day_bandit_total_pnl,
+            "day_bandit_starved": self.day_bandit_starved,
+            "day_bandit_size_factor": self.day_bandit_size_factor,
+            "final_selection_score_pre_bandit": self.final_selection_score_pre_bandit,
         }
+
+
+def _stamp_day_bandit_explain(explainability: TradeExplainability, dd: dict[str, Any] | None) -> None:
+    """Copy DAY bandit (Thompson) fields from decision_data onto BUY explainability.
+
+    Called after apply_bandit_to_decision_data has stamped bandit fields on the
+    candidate's decision_data. Persisting into paper_trades.explainability_json
+    lets post-trade replay reconstruct α/β/mean/starved/size at decision time
+    without depending on rolling process logs.
+    """
+    _dd = dict(dd or {})
+
+    def _opt_float(key: str) -> float | None:
+        raw = _dd.get(key)
+        if raw in (None, ""):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _opt_int(key: str) -> int:
+        raw = _dd.get(key)
+        if raw in (None, ""):
+            return 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    explainability.day_bandit_enabled = bool(_dd.get("day_bandit_enabled"))
+    explainability.day_bandit_arm_key = str(_dd.get("day_bandit_arm_key") or "")
+    explainability.day_bandit_alpha = _opt_float("day_bandit_alpha")
+    explainability.day_bandit_beta = _opt_float("day_bandit_beta")
+    explainability.day_bandit_mean = _opt_float("day_bandit_mean")
+    explainability.day_bandit_sample = _opt_float("day_bandit_sample")
+    explainability.day_bandit_score = _opt_float("day_bandit_score")
+    explainability.day_bandit_n_obs = _opt_int("day_bandit_n_obs")
+    explainability.day_bandit_wins = _opt_int("day_bandit_wins")
+    explainability.day_bandit_losses = _opt_int("day_bandit_losses")
+    explainability.day_bandit_total_pnl = _opt_float("day_bandit_total_pnl")
+    explainability.day_bandit_starved = bool(_dd.get("day_bandit_starved"))
+    explainability.day_bandit_size_factor = _opt_float("day_bandit_size_factor")
+    explainability.final_selection_score_pre_bandit = _opt_float("final_selection_score_pre_bandit")
 
 
 def _stamp_low_mfe_outcome_explain(explainability: TradeExplainability, dd: dict[str, Any] | None) -> None:
@@ -13892,6 +13966,7 @@ class PortfolioEngine:
                 explainability.prediction = str(_dd.get("prediction") or _dd.get("argmax_action") or "")
                 explainability.side_signal = str(_dd.get("side") or _dd.get("action") or "")
                 _stamp_low_mfe_outcome_explain(explainability, _dd)
+                _stamp_day_bandit_explain(explainability, _dd)
                 if not explainability.entry_thesis:
                     logger.warning(
                         "MULTI_BUY_MISSING_SETUP symbol=%s decision_id=%s dd_keys=%s",
@@ -15317,6 +15392,7 @@ class PortfolioEngine:
         except Exception:
             explainability.higher_score_skipped_json = "[]"
         _stamp_low_mfe_outcome_explain(explainability, _dd)
+        _stamp_day_bandit_explain(explainability, _dd)
         # P1B: persist model probs / opinion penalties / rank for post-trade measurement.
         for _attr, _key in (
             ("prob_buy", "prob_buy"),

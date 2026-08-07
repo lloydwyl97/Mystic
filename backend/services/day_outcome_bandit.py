@@ -399,6 +399,7 @@ def bootstrap_bandit_from_paper_trades(
     import json
 
     count = 0
+    skipped_unknown = 0
     # Oldest first so chronology is natural
     for symbol, pnl, exit_reason, ex_json in reversed(list(rows)):
         setup = "UNKNOWN"
@@ -410,6 +411,11 @@ def bootstrap_bandit_from_paper_trades(
                 regime = str(ex.get("day_route_regime") or ex.get("regime") or "range")
             except Exception:
                 pass
+        # Skip legacy rows where the setup was never labeled — those arms muddy
+        # the pool because they mix multiple real setups under one bucket.
+        if str(setup or "").strip().upper() in ("", "UNKNOWN"):
+            skipped_unknown += 1
+            continue
         record_bandit_outcome(
             symbol=str(symbol),
             setup=setup,
@@ -419,8 +425,12 @@ def bootstrap_bandit_from_paper_trades(
             db_path=db_path,
         )
         count += 1
-    if count:
-        logger.info("DAY_BANDIT_BOOTSTRAP hydrated %d sells into arms", count)
+    if count or skipped_unknown:
+        logger.info(
+            "DAY_BANDIT_BOOTSTRAP hydrated %d sells into arms (skipped_unknown=%d)",
+            count,
+            skipped_unknown,
+        )
     return count
 
 
