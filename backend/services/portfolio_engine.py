@@ -1555,6 +1555,14 @@ class TradeExplainability:
     entry_confirmation_reasons: str = ""
     entry_confirmation_rank_delta: float | None = None
     entry_confirmation_size_factor: float | None = None
+    # HTF anchor soft demotion (Batch 5)
+    htf_anchor_enabled: bool = False
+    htf_anchor_score: float | None = None
+    htf_anchor_state: str = ""
+    htf_anchor_reasons: str = ""
+    htf_anchor_family: str = ""
+    htf_anchor_rank_delta: float | None = None
+    htf_anchor_size_factor: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for storage"""
@@ -1723,6 +1731,13 @@ class TradeExplainability:
             "entry_confirmation_reasons": self.entry_confirmation_reasons,
             "entry_confirmation_rank_delta": self.entry_confirmation_rank_delta,
             "entry_confirmation_size_factor": self.entry_confirmation_size_factor,
+            "htf_anchor_enabled": self.htf_anchor_enabled,
+            "htf_anchor_score": self.htf_anchor_score,
+            "htf_anchor_state": self.htf_anchor_state,
+            "htf_anchor_reasons": self.htf_anchor_reasons,
+            "htf_anchor_family": self.htf_anchor_family,
+            "htf_anchor_rank_delta": self.htf_anchor_rank_delta,
+            "htf_anchor_size_factor": self.htf_anchor_size_factor,
         }
 
 
@@ -1789,6 +1804,28 @@ def _stamp_entry_confirmation_explain(explainability: TradeExplainability, dd: d
     explainability.entry_confirmation_reasons = str(_dd.get("entry_confirmation_reasons") or "")
     explainability.entry_confirmation_rank_delta = _opt_float("entry_confirmation_rank_delta")
     explainability.entry_confirmation_size_factor = _opt_float("entry_confirmation_size_factor")
+
+
+def _stamp_htf_anchor_explain(explainability: TradeExplainability, dd: dict[str, Any] | None) -> None:
+    """Copy Batch 5 HTF anchor fields from decision_data onto BUY explainability."""
+    _dd = dict(dd or {})
+
+    def _opt_float(key: str) -> float | None:
+        raw = _dd.get(key)
+        if raw in (None, ""):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    explainability.htf_anchor_enabled = bool(_dd.get("htf_anchor_enabled"))
+    explainability.htf_anchor_score = _opt_float("htf_anchor_score")
+    explainability.htf_anchor_state = str(_dd.get("htf_anchor_state") or "")
+    explainability.htf_anchor_reasons = str(_dd.get("htf_anchor_reasons") or "")
+    explainability.htf_anchor_family = str(_dd.get("htf_anchor_family") or "")
+    explainability.htf_anchor_rank_delta = _opt_float("htf_anchor_rank_delta")
+    explainability.htf_anchor_size_factor = _opt_float("htf_anchor_size_factor")
 
 
 def _stamp_low_mfe_outcome_explain(explainability: TradeExplainability, dd: dict[str, Any] | None) -> None:
@@ -6834,6 +6871,7 @@ class PortfolioEngine:
         from backend.services.day_entry_confirmation import (
             apply_entry_confirmation_to_decision_data,
         )
+        from backend.services.day_htf_anchor import apply_htf_anchor_to_decision_data
         from backend.services.day_outcome_bandit import apply_bandit_to_decision_data
         from backend.services.symbol_setup_outcome_penalty import apply_v3_outcome_ranking_to_decision_data
 
@@ -6849,6 +6887,7 @@ class PortfolioEngine:
             raw_rank_score=raw_rank,
             buy_margin=bm,
         )
+        dd = apply_htf_anchor_to_decision_data(dd)
         dd = apply_entry_confirmation_to_decision_data(
             dd,
             current_price=float(getattr(candidate, "current_price", 0.0) or 0.0),
@@ -14017,6 +14056,7 @@ class PortfolioEngine:
                 _stamp_low_mfe_outcome_explain(explainability, _dd)
                 _stamp_day_bandit_explain(explainability, _dd)
                 _stamp_entry_confirmation_explain(explainability, _dd)
+                _stamp_htf_anchor_explain(explainability, _dd)
                 if not explainability.entry_thesis:
                     logger.warning(
                         "MULTI_BUY_MISSING_SETUP symbol=%s decision_id=%s dd_keys=%s",
@@ -15444,6 +15484,7 @@ class PortfolioEngine:
         _stamp_low_mfe_outcome_explain(explainability, _dd)
         _stamp_day_bandit_explain(explainability, _dd)
         _stamp_entry_confirmation_explain(explainability, _dd)
+        _stamp_htf_anchor_explain(explainability, _dd)
         # P1B: persist model probs / opinion penalties / rank for post-trade measurement.
         for _attr, _key in (
             ("prob_buy", "prob_buy"),
