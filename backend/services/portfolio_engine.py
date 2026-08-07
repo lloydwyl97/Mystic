@@ -1563,6 +1563,17 @@ class TradeExplainability:
     htf_anchor_family: str = ""
     htf_anchor_rank_delta: float | None = None
     htf_anchor_size_factor: float | None = None
+    # Liquidity/spread gate (Batch 6)
+    liquidity_gate_enabled: bool = False
+    liquidity_quality_score: float | None = None
+    liquidity_quality_state: str = ""
+    liquidity_quality_reasons: str = ""
+    liquidity_quality_rank_delta: float | None = None
+    liquidity_quality_size_factor: float | None = None
+    liquidity_spread_bps: float | None = None
+    liquidity_typical_spread_bps: float | None = None
+    liquidity_hard_blocked: bool = False
+    liquidity_hard_block_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for storage"""
@@ -1738,6 +1749,16 @@ class TradeExplainability:
             "htf_anchor_family": self.htf_anchor_family,
             "htf_anchor_rank_delta": self.htf_anchor_rank_delta,
             "htf_anchor_size_factor": self.htf_anchor_size_factor,
+            "liquidity_gate_enabled": self.liquidity_gate_enabled,
+            "liquidity_quality_score": self.liquidity_quality_score,
+            "liquidity_quality_state": self.liquidity_quality_state,
+            "liquidity_quality_reasons": self.liquidity_quality_reasons,
+            "liquidity_quality_rank_delta": self.liquidity_quality_rank_delta,
+            "liquidity_quality_size_factor": self.liquidity_quality_size_factor,
+            "liquidity_spread_bps": self.liquidity_spread_bps,
+            "liquidity_typical_spread_bps": self.liquidity_typical_spread_bps,
+            "liquidity_hard_blocked": self.liquidity_hard_blocked,
+            "liquidity_hard_block_reason": self.liquidity_hard_block_reason,
         }
 
 
@@ -1826,6 +1847,31 @@ def _stamp_htf_anchor_explain(explainability: TradeExplainability, dd: dict[str,
     explainability.htf_anchor_family = str(_dd.get("htf_anchor_family") or "")
     explainability.htf_anchor_rank_delta = _opt_float("htf_anchor_rank_delta")
     explainability.htf_anchor_size_factor = _opt_float("htf_anchor_size_factor")
+
+
+def _stamp_liquidity_gate_explain(explainability: TradeExplainability, dd: dict[str, Any] | None) -> None:
+    """Copy Batch 6 liquidity/spread gate fields from decision_data onto BUY explainability."""
+    _dd = dict(dd or {})
+
+    def _opt_float(key: str) -> float | None:
+        raw = _dd.get(key)
+        if raw in (None, ""):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    explainability.liquidity_gate_enabled = bool(_dd.get("liquidity_gate_enabled"))
+    explainability.liquidity_quality_score = _opt_float("liquidity_quality_score")
+    explainability.liquidity_quality_state = str(_dd.get("liquidity_quality_state") or "")
+    explainability.liquidity_quality_reasons = str(_dd.get("liquidity_quality_reasons") or "")
+    explainability.liquidity_quality_rank_delta = _opt_float("liquidity_quality_rank_delta")
+    explainability.liquidity_quality_size_factor = _opt_float("liquidity_quality_size_factor")
+    explainability.liquidity_spread_bps = _opt_float("liquidity_spread_bps")
+    explainability.liquidity_typical_spread_bps = _opt_float("liquidity_typical_spread_bps")
+    explainability.liquidity_hard_blocked = bool(_dd.get("liquidity_hard_blocked"))
+    explainability.liquidity_hard_block_reason = str(_dd.get("liquidity_hard_block_reason") or "")
 
 
 def _stamp_low_mfe_outcome_explain(explainability: TradeExplainability, dd: dict[str, Any] | None) -> None:
@@ -6872,11 +6918,20 @@ class PortfolioEngine:
             apply_entry_confirmation_to_decision_data,
         )
         from backend.services.day_htf_anchor import apply_htf_anchor_to_decision_data
+        from backend.services.day_liquidity_gate import apply_liquidity_gate_to_decision_data
         from backend.services.day_outcome_bandit import apply_bandit_to_decision_data
         from backend.services.symbol_setup_outcome_penalty import apply_v3_outcome_ranking_to_decision_data
 
         dd = dict(candidate.decision_data or {})
         raw_rank = float(candidate.rank_score())
+        # Cost telemetry (spread/fee/slip) must be hydrated before liquidity
+        # gate reads spread_pct, otherwise raw redis/fallback values would be
+        # used directly instead of the normalized ones.
+        self._hydrate_cost_telemetry(
+            symbol=candidate.symbol,
+            strategy_id=str(dd.get("live_ai_strategy") or "day"),
+            decision_data=dd,
+        )
         raw_ev = self._estimate_candidate_net_expected_value(dd)
         if dd.get("selected_net_expected_value_raw") is None:
             dd["selected_net_expected_value_raw"] = raw_ev
@@ -6887,6 +6942,7 @@ class PortfolioEngine:
             raw_rank_score=raw_rank,
             buy_margin=bm,
         )
+        dd = apply_liquidity_gate_to_decision_data(dd, candidate.symbol)
         dd = apply_htf_anchor_to_decision_data(dd)
         dd = apply_entry_confirmation_to_decision_data(
             dd,
@@ -14057,6 +14113,7 @@ class PortfolioEngine:
                 _stamp_day_bandit_explain(explainability, _dd)
                 _stamp_entry_confirmation_explain(explainability, _dd)
                 _stamp_htf_anchor_explain(explainability, _dd)
+                _stamp_liquidity_gate_explain(explainability, _dd)
                 if not explainability.entry_thesis:
                     logger.warning(
                         "MULTI_BUY_MISSING_SETUP symbol=%s decision_id=%s dd_keys=%s",
@@ -15485,6 +15542,7 @@ class PortfolioEngine:
         _stamp_day_bandit_explain(explainability, _dd)
         _stamp_entry_confirmation_explain(explainability, _dd)
         _stamp_htf_anchor_explain(explainability, _dd)
+        _stamp_liquidity_gate_explain(explainability, _dd)
         # P1B: persist model probs / opinion penalties / rank for post-trade measurement.
         for _attr, _key in (
             ("prob_buy", "prob_buy"),
