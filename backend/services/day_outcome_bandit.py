@@ -34,6 +34,17 @@ SLIDING_WINDOW = 40
 BANDIT_BLEND_PRIMARY = 0.72  # share of selection score from bandit sample
 BANDIT_BLEND_SECONDARY = 0.28  # residual from existing final_selection_score
 
+# Batch 7: widened size curve.
+# Fresh arms (< N_OBS_FOR_UPSIZE) are capped at MAX_SIZE_FRESH so the bandit
+# does not upsize before it has enough data to know if the arm is truly a
+# winner. Well-observed arms can scale up to MAX_SIZE_TOP with strong mean
+# so proven winners actually get more capital. Starved arms keep the tiny
+# STARVE_SIZE_FLOOR unchanged. This replaces the old hard cap of 1.35 with
+# a data-gated curve.
+N_OBS_FOR_UPSIZE = int(os.getenv("DAY_BANDIT_N_OBS_FOR_UPSIZE", "8") or "8")
+MAX_SIZE_FRESH = float(os.getenv("DAY_BANDIT_MAX_SIZE_FRESH", "1.15") or "1.15")
+MAX_SIZE_TOP = float(os.getenv("DAY_BANDIT_MAX_SIZE_TOP", "2.00") or "2.00")
+
 # Hierarchical (partial-pooling) prior: when an arm has zero observations we
 # borrow evidence from peer arms with the same (setup, regime) family across
 # other symbols, then also from the (symbol, regime) family across other
@@ -398,23 +409,38 @@ def sample_arm(
     starved = bool(stats["starved"])
     n_obs = int(stats.get("n_obs") or 0)
     peer_n = int(stats.get("peer_n_obs") or 0)
+    mean = float(stats["mean"])
     if starved:
         size_factor = STARVE_SIZE_FLOOR
         # Pull sample toward zero so ranking buries the arm when better peers exist.
-        sample = min(sample, float(stats["mean"]) * 0.5)
+        sample = min(sample, mean * 0.5)
     elif n_obs == 0 and peer_n == 0:
-        # No evidence at all → full explore.
-        size_factor = 1.0
+        # No evidence at all → mid-range explore. Cap below MAX_SIZE_FRESH so
+        # the bandit does not oversize a truly-unknown arm.
+        size_factor = min(1.0, MAX_SIZE_FRESH)
+    elif n_obs < N_OBS_FOR_UPSIZE:
+        # Fresh arm (including peer-informed): use empirical mean but cap
+        # size at MAX_SIZE_FRESH so an early lucky streak cannot bet the farm.
+        raw = 0.4 + mean * (MAX_SIZE_FRESH - 0.4) * 2.0  # map mean [0,1] into [0.4, MAX_SIZE_FRESH+small]
+        raw = min(raw, MAX_SIZE_FRESH)
+        size_factor = max(EXPLORE_SIZE_FLOOR, raw)
     else:
-        # Map mean [0,1] → size [floor, 1.35]. Fresh-but-peer-informed arms
-        # use their hierarchical mean; empirical arms use their own mean.
-        size_factor = max(EXPLORE_SIZE_FLOOR, min(1.35, 0.4 + float(stats["mean"]) * 1.2))
+        # Well-observed arm: allow size to reach MAX_SIZE_TOP for genuine
+        # winners. Curve is linear in mean from the floor up to MAX_SIZE_TOP
+        # so a mean of 0.5 sits at ~ (floor+top)/2.
+        raw = EXPLORE_SIZE_FLOOR + mean * (MAX_SIZE_TOP - EXPLORE_SIZE_FLOOR)
+        size_factor = max(EXPLORE_SIZE_FLOOR, min(MAX_SIZE_TOP, raw))
     return {
         **stats,
         "sample": float(sample),
         "size_factor": float(size_factor),
         "hard_block": False,
         "candidate_eligible": True,
+        "size_factor_cap": (
+            "starve" if starved
+            else "fresh" if n_obs < N_OBS_FOR_UPSIZE
+            else "top"
+        ),
     }
 
 
