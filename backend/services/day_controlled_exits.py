@@ -438,12 +438,116 @@ def backfill_position_exit_metadata(position: Any, coin_profile: dict[str, Any])
     return added
 
 
+def _break_even_trigger_pct() -> float:
+    """MFE fraction that must be reached before break-even ratchet activates.
+
+    Default 0.30% is well above round-trip cost (~0.20%). Below trigger, no
+    change. Above trigger, stop is lifted to entry_price + offset.
+    """
+    return float(os.getenv("DAY_BREAK_EVEN_TRIGGER_PCT", "0.0030"))
+
+
+def _break_even_offset_pct() -> float:
+    """After trigger, stop = entry * (1 + offset). Default +0.05% to cover exit slippage."""
+    return float(os.getenv("DAY_BREAK_EVEN_OFFSET_PCT", "0.0005"))
+
+
+def _mfe_trail_tier_1_pct() -> float:
+    """MFE fraction at which the trail tightens to tier-1 (default 0.50%)."""
+    return float(os.getenv("DAY_MFE_TRAIL_TIER1_MFE_PCT", "0.0050"))
+
+
+def _mfe_trail_tier_1_trail_pct() -> float:
+    """Trail distance used once tier-1 MFE is reached (default 0.30%)."""
+    return float(os.getenv("DAY_MFE_TRAIL_TIER1_TRAIL_PCT", "0.0030"))
+
+
+def _mfe_trail_tier_2_pct() -> float:
+    """MFE fraction at which the trail tightens to tier-2 (default 1.00%)."""
+    return float(os.getenv("DAY_MFE_TRAIL_TIER2_MFE_PCT", "0.0100"))
+
+
+def _mfe_trail_tier_2_trail_pct() -> float:
+    """Trail distance used once tier-2 MFE is reached (default 0.20%)."""
+    return float(os.getenv("DAY_MFE_TRAIL_TIER2_TRAIL_PCT", "0.0020"))
+
+
+def _break_even_enabled() -> bool:
+    return os.getenv("DAY_BREAK_EVEN_TRAIL_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def apply_break_even_and_mfe_trail(position: Any, current_price: float) -> bool:
+    """Ratchet stop above entry when MFE has cleared cost, then tighten trail
+    by MFE tier. Never widens/lowers the stop; only ratchets upward.
+
+    Order of protection once MFE clears:
+    1. MFE ≥ trigger (default 0.30%): move stop to entry + 0.05%. Removes
+       "won-then-gave-back-to-loss" losses on ~50% of stalled winners.
+    2. MFE ≥ tier-1 (default 0.50%): trailing distance tightens to 0.30%.
+    3. MFE ≥ tier-2 (default 1.00%): trailing distance tightens to 0.20%.
+
+    Returns True if the position's stop or trailing_stop_price advanced.
+    """
+    if not _break_even_enabled():
+        return False
+    entry = float(getattr(position, "entry_price", 0.0) or 0.0)
+    if entry <= 0 or current_price <= 0:
+        return False
+    highest = float(getattr(position, "highest_price", 0.0) or entry)
+    mfe_pct = max(0.0, (highest - entry) / entry) if entry > 0 else 0.0
+    if mfe_pct <= 0.0:
+        return False
+
+    changed = False
+
+    trigger = _break_even_trigger_pct()
+    if mfe_pct + 1e-12 >= trigger:
+        be_stop = entry * (1.0 + _break_even_offset_pct())
+        current_stop = float(getattr(position, "stop_price", 0.0) or 0.0)
+        if be_stop > current_stop + 1e-12:
+            position.stop_price = be_stop
+            changed = True
+        current_trail = float(getattr(position, "trailing_stop_price", 0.0) or 0.0)
+        if be_stop > current_trail + 1e-12:
+            position.trailing_stop_price = be_stop
+            changed = True
+
+    tier2 = _mfe_trail_tier_2_pct()
+    tier1 = _mfe_trail_tier_1_pct()
+    if mfe_pct + 1e-12 >= tier2:
+        tightened = _mfe_trail_tier_2_trail_pct()
+    elif mfe_pct + 1e-12 >= tier1:
+        tightened = _mfe_trail_tier_1_trail_pct()
+    else:
+        tightened = None
+
+    if tightened is not None and tightened > 0:
+        new_trail = highest * (1.0 - tightened)
+        current_trail = float(getattr(position, "trailing_stop_price", 0.0) or 0.0)
+        if new_trail > current_trail + 1e-12:
+            position.trailing_stop_price = new_trail
+            changed = True
+        # Also ratchet the stop_price up so evaluate_engine_managed_exit's stop
+        # gate uses the tightened level (not just the trailing gate).
+        current_stop = float(getattr(position, "stop_price", 0.0) or 0.0)
+        if new_trail > current_stop + 1e-12 and new_trail < entry * (1.0 + 0.02):
+            # Safety cap: never lift stop above entry+2% (silly stop).
+            position.stop_price = new_trail
+            changed = True
+
+    return changed
+
+
 def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dict[str, Any] | None = None) -> bool:
     """Ratchet trailing stop when price makes new highs; returns True if level changed.
 
     In bull regime, once price has moved DAY_BULL_TRAIL_MFE_THRESHOLD (default 1.5%)
     in our favour, the trail distance is widened by DAY_BULL_TRAIL_MULTIPLIER (default 2x)
     so normal intraday noise does not shake out a strongly trending position.
+
+    After the base trailing update, apply_break_even_and_mfe_trail runs so
+    once MFE clears round-trip cost the stop is lifted to break-even and the
+    trail tightens by MFE tier. Both changes are ratchets — never widen.
     """
     entry = float(getattr(position, "entry_price", 0.0) or 0.0)
     if entry <= 0 or current_price <= 0:
@@ -461,17 +565,20 @@ def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dic
         trail_pct = blend_by_scalar(trail_pct, widened_trail_pct, scalar)
 
     activation = entry * (1.0 + trail_pct)
-    if highest < activation:
-        return False
+    base_changed = False
+    if highest >= activation:
+        new_trail = highest * (1.0 - trail_pct)
+        current_trail = float(getattr(position, "trailing_stop_price", 0.0) or 0.0)
+        floor = entry * (1.0 - float(profile.get("sl") or 0.010))
+        new_trail = max(new_trail, floor, current_trail)
+        if new_trail > current_trail + 1e-12:
+            position.trailing_stop_price = new_trail
+            base_changed = True
 
-    new_trail = highest * (1.0 - trail_pct)
-    current_trail = float(getattr(position, "trailing_stop_price", 0.0) or 0.0)
-    floor = entry * (1.0 - float(profile.get("sl") or 0.010))
-    new_trail = max(new_trail, floor, current_trail)
-    if new_trail > current_trail + 1e-12:
-        position.trailing_stop_price = new_trail
-        return True
-    return False
+    # Break-even ratchet + tiered MFE-tightening apply regardless of the base
+    # trail activation (they use their own MFE thresholds).
+    tier_changed = apply_break_even_and_mfe_trail(position, current_price)
+    return base_changed or tier_changed
 
 
 def preview_next_engine_exit(
