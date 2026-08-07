@@ -1177,12 +1177,35 @@ class RealTimeAISignalGenerator:
                         old_sha = artifact_sha
                         self.model_artifact_sha256[slot] = latest_sha
                         artifact_sha = latest_sha
+                        # Batch 8 fix: when the underlying pkl changes, refresh
+                        # trained_at and accuracy from the new metadata so the
+                        # Redis signal and downstream paper_trades.explainability
+                        # both reflect the currently-loaded model. Prior code
+                        # only refreshed the sha, leaving stale/empty values in
+                        # self.model_trained_ats and self.model_accuracies.
+                        try:
+                            import joblib as _joblib
+
+                            _md = _joblib.load(artifact_path)
+                            self.model_trained_ats[slot] = str(_md.get("trained_at") or "")
+                            _acc = _md.get("accuracy")
+                            try:
+                                self.model_accuracies[slot] = float(_acc) if _acc is not None else 0.0
+                            except (TypeError, ValueError):
+                                self.model_accuracies[slot] = 0.0
+                        except Exception as _md_e:
+                            logger.debug(
+                                "ARTIFACT_METADATA_REFRESH skipped for %s: %s",
+                                slot,
+                                _md_e,
+                            )
                         logger.info(
-                            "ARTIFACT_HASH_REFRESH: slot=%s symbol=%s old=%s new=%s",
+                            "ARTIFACT_HASH_REFRESH: slot=%s symbol=%s old=%s new=%s trained_at=%s",
                             slot,
                             symbol,
                             old_sha[:12] if old_sha else "",
                             latest_sha[:12],
+                            self.model_trained_ats.get(slot, "") or "",
                         )
                 except Exception as hash_e:
                     logger.debug("ARTIFACT_HASH_REFRESH skipped for %s: %s", slot, hash_e)

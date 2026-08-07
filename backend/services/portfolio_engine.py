@@ -1874,6 +1874,71 @@ def _stamp_liquidity_gate_explain(explainability: TradeExplainability, dd: dict[
     explainability.liquidity_hard_block_reason = str(_dd.get("liquidity_hard_block_reason") or "")
 
 
+def _hydrate_model_metadata_from_redis(symbol: str, strategy_id: str = "day") -> dict[str, str]:
+    """Batch 8 fallback: read model_trained_at/model_accuracy directly from the
+    live ai_signal:<strategy>:<SYM> Redis hash when decision_data was captured
+    before ai_signal_generator reloaded per-coin ML metadata.
+
+    Returns {"model_trained_at": str, "model_accuracy": str} — empty strings on
+    any error. Never raises; never blocks the BUY path.
+    """
+    out = {"model_trained_at": "", "model_accuracy": ""}
+    try:
+        from backend.config.redis_config import get_redis_client
+        from backend.services.live_strategy_contracts import redis_ai_signal_key
+
+        r = get_redis_client()
+        if r is None:
+            return out
+        sym_bus = str(symbol or "").replace("/", "").upper()
+        if not sym_bus:
+            return out
+        key = redis_ai_signal_key(str(strategy_id or "day").strip().lower() or "day", sym_bus)
+        raw = r.hgetall(key) or {}
+        for k, v in raw.items():
+            kk = k.decode("utf-8", errors="ignore") if isinstance(k, bytes) else str(k)
+            if kk not in ("model_trained_at", "model_accuracy"):
+                continue
+            vv = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else str(v)
+            out[kk] = vv or ""
+    except Exception:
+        pass
+    return out
+
+
+def _stamp_model_metadata_with_redis_fallback(
+    explainability: TradeExplainability,
+    dd: dict[str, Any] | None,
+    symbol: str,
+    strategy_id: str,
+) -> None:
+    """Populate explainability.model_trained_at + .model_accuracy from decision_data
+    with a Redis-hash fallback. Fixes the batch-8 wiring gap where paper_trades
+    entries showed empty model metadata even though ai_signal:day:* had valid
+    trained_at/accuracy values at BUY time.
+    """
+    _dd = dd or {}
+    _trained = str(_dd.get("model_trained_at") or "").strip()
+    _acc_raw = _dd.get("model_accuracy")
+    _acc: float | None
+    try:
+        _acc = float(_acc_raw) if _acc_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        _acc = None
+    if not _trained or _acc is None:
+        fallback = _hydrate_model_metadata_from_redis(symbol, strategy_id)
+        if not _trained:
+            _trained = fallback.get("model_trained_at", "") or ""
+        if _acc is None:
+            try:
+                _fa = fallback.get("model_accuracy", "") or ""
+                _acc = float(_fa) if _fa else None
+            except (TypeError, ValueError):
+                _acc = None
+    explainability.model_trained_at = _trained
+    explainability.model_accuracy = _acc
+
+
 def _stamp_low_mfe_outcome_explain(explainability: TradeExplainability, dd: dict[str, Any] | None) -> None:
     """Copy P1C low-MFE stall demotion fields from decision_data onto BUY explainability."""
     _dd = dict(dd or {})
@@ -11459,11 +11524,26 @@ class PortfolioEngine:
                 position.lowest_price = min(position.lowest_price, current_price)
 
             # Persist either watermark so MAE/wick-stop memory survives restarts
-            if position.highest_price > old_high or float(position.lowest_price or 0.0) < old_low or old_low <= 0:
-                profile = get_coin_profile(symbol)
-                from backend.services.day_controlled_exits import refresh_trailing_stop
+            watermark_changed = (
+                position.highest_price > old_high
+                or float(position.lowest_price or 0.0) < old_low
+                or old_low <= 0
+            )
+            profile = get_coin_profile(symbol)
+            from backend.services.day_controlled_exits import (
+                apply_break_even_and_mfe_trail,
+                refresh_trailing_stop,
+            )
 
+            if watermark_changed:
                 refresh_trailing_stop(position, current_price, profile)
+            # Break-even + MFE-tier ratchet must run every monitor cycle, not
+            # only on new-HH/new-LL. Positions whose peak MFE was reached in a
+            # prior cycle (or before this code path was live) would otherwise
+            # never see their stop lifted to break-even, and a subsequent
+            # reversal would exit via giveback/stall for a full loss.
+            be_changed = apply_break_even_and_mfe_trail(position, current_price)
+            if watermark_changed or be_changed:
                 await self._persist_position_to_sqlite(position)
 
             # LEARNING INGESTION: open-position heartbeat (throttled per symbol).
@@ -14054,7 +14134,7 @@ class PortfolioEngine:
                 # ARTIFACT_CONTRACT / ENTRY_EXIT_MISSING_PRICE_OR_SETUP fail closed.
                 explainability.artifact_path = str(_dd.get("model_artifact_path") or "")
                 explainability.artifact_sha256 = str(_dd.get("artifact_sha256") or "")
-                explainability.model_trained_at = str(_dd.get("model_trained_at") or "")
+                _stamp_model_metadata_with_redis_fallback(explainability, _dd, symbol, _sid)
                 try:
                     explainability.feature_version = int(_dd.get("feature_version") or 0)
                 except (TypeError, ValueError):
@@ -15336,11 +15416,7 @@ class PortfolioEngine:
         explainability.entry_spread_source = str(_costs_bar.get("entry_spread_source") or "")
         explainability.artifact_path = str(_dd.get("model_artifact_path") or "")
         explainability.artifact_sha256 = str(_dd.get("artifact_sha256") or "")
-        explainability.model_trained_at = str(_dd.get("model_trained_at") or "")
-        try:
-            explainability.model_accuracy = float(_dd.get("model_accuracy") or 0) or None
-        except (TypeError, ValueError):
-            explainability.model_accuracy = None
+        _stamp_model_metadata_with_redis_fallback(explainability, _dd, symbol, selected_strategy)
         try:
             explainability.feature_version = int(_dd.get("feature_version") or 0)
         except (TypeError, ValueError):
