@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 
 from backend.services.binance_scalp.config import ScalpConfig
@@ -10,6 +11,13 @@ from backend.services.binance_scalp.paper_spread_caps import (
     parse_paper_spread_caps_json,
     uses_paper_spread_caps,
 )
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 CALIBRATION_PROFILES: dict[str, dict[str, float]] = {
     # A — current strict production paper defaults
@@ -53,15 +61,25 @@ def _attach_paper_spread_caps(econ: ScalpEconomics, config: ScalpConfig) -> Scal
 
 
 def economics_for_config(config: ScalpConfig) -> ScalpEconomics:
+    """Paper economics follow realized MFE (moderate 0.15% target) by default.
+
+    Closed-trade audit: most MAX_HOLD exits never reached 0.25% MFE; the two
+    NET_PROFIT winners cleared ~0.25–0.79%. Moderate target aligns hold/exit.
+    Live path never uses calibration profiles.
+    """
     base = ScalpEconomics.from_env()
     econ = base
+    if config.scalp_live:
+        econ = _attach_paper_spread_caps(econ, config)
+        return econ
     if config.calibration_mode:
-        if config.scalp_live:
-            raise RuntimeError("SCALP_CALIBRATION_MODE cannot be enabled with SCALP_LIVE=true")
-        # Only apply a calibration profile when calibration mode is explicitly on.
-        # SCALP_CALIBRATION_MODE=false always uses strict/raw .env economics, regardless
-        # of SCALP_PAPER_ENABLED, so profile selection stays an explicit opt-in.
         econ = apply_profile(base, config.calibration_profile)
+    elif config.scalp_paper_enabled and _env_bool("SCALP_PAPER_ECON_AUTO", True):
+        # Auto-apply profile for paper even when SCALP_CALIBRATION_MODE=false.
+        profile = (config.calibration_profile or "moderate").strip().lower()
+        if profile not in CALIBRATION_PROFILES:
+            profile = "moderate"
+        econ = apply_profile(base, profile)
     econ = _attach_paper_spread_caps(econ, config)
     return econ
 

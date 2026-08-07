@@ -97,11 +97,11 @@ class ScalpConfig:
                 for s in (
                     os.getenv(
                         "SCALP_DISABLED_STRATEGIES",
-                        # Default empty for paper runs so all researched strategies
-                        # (breakout_momentum + the three others explored in phase3/4
-                        # replays) can participate. Set the env var explicitly to
-                        # disable any on this local paper instance if desired.
-                        "",
+                        # Ocean paper proof: only setups that ever produced genuine
+                        # fills. Others were 100% STRATEGY_NO_SIGNAL / soft-rank noise.
+                        "breakout_momentum,orderbook_tape_scalp,failed_breakdown_reversal,"
+                        "compression_breakout,volume_impulse_continuation,"
+                        "trend_pullback_micro,failed_breakout_reversal",
                     )
                     or ""
                 ).split(",")

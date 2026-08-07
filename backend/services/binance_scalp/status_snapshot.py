@@ -656,6 +656,17 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
 
         entry_telemetry = read_entry_telemetry(rclient, prefix=config.redis_key_prefix)
 
+    paper_proof: dict[str, Any] = {"live_blocked": True}
+    if not config.scalp_live:
+        with contextlib.suppress(Exception):
+            from backend.services.binance_scalp.paper_proof import compute_paper_proof
+
+            paper_proof = compute_paper_proof(config.database_path)
+
+    from backend.services.binance_scalp.strategies import STRATEGY_NAMES
+
+    enabled = [n for n in STRATEGY_NAMES if n not in config.disabled_strategies]
+
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "overall_decision": overall,
@@ -668,7 +679,8 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
         "warm_rounds_note": ("momentum_confirmed requires ~60s history and 60s trend; warm_rounds=6 (~35s) under-warms 60s checks"),
         "fee_model_verified": econ.is_fee_model_verified(),
         "calibration_mode": config.calibration_mode,
-        "calibration_profile": config.calibration_profile if config.calibration_mode else "strict",
+        "calibration_profile": config.calibration_profile,
+        "net_profit_target_pct": econ.net_profit_target_pct,
         "products": list(config.products),
         "scalp_live": config.scalp_live,
         "scalp_paper_enabled": config.scalp_paper_enabled,
@@ -681,5 +693,7 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
         "memory_kb": _read_mem_kb(),
         "strategy_router": strategy_router,
         "disabled_strategies": sorted(config.disabled_strategies),
+        "enabled_strategies": enabled,
         "entry_telemetry": entry_telemetry,
+        "paper_proof": paper_proof,
     }

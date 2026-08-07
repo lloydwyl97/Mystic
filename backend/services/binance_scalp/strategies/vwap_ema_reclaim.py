@@ -65,16 +65,25 @@ class VwapEmaReclaimStrategy:
             return reject_signal(ctx, self.name, "NO_VWAP_EMA_RECLAIM")
 
         mom = ctx.mom
-        # Require higher_low + 60s mid lift in paper too (was paper-loosened).
-        mom_ok = (
-            mom.bid_change_15s > 0
-            and mom.mid_change_15s > 0
-            and mom.mid_change_30s > 0
-            and mom.mid_change_60s > 0
-            and higher_low
-        )
-        if not ctx.config.scalp_paper_enabled:
-            mom_ok = mom_ok and mom.momentum_confirmed
+        # Paper: require reclaim impulse without demanding perfect 60s lift
+        # (strict >0 on 60s was a major NO_PULLBACK_RECOVERY reject pile).
+        if ctx.config.scalp_paper_enabled:
+            mom_ok = (
+                mom.bid_change_15s > 0
+                and mom.mid_change_15s > 0
+                and mom.mid_change_30s > 0
+                and mom.mid_change_60s >= -0.00005
+                and higher_low
+            )
+        else:
+            mom_ok = (
+                mom.bid_change_15s > 0
+                and mom.mid_change_15s > 0
+                and mom.mid_change_30s > 0
+                and mom.mid_change_60s > 0
+                and higher_low
+                and mom.momentum_confirmed
+            )
         if not mom_ok:
             return reject_signal(ctx, self.name, "NO_PULLBACK_RECOVERY")
 

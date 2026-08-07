@@ -35,7 +35,9 @@ class RangeBounceScalpStrategy:
         support = min(b["low"] for b in support_window)
         cur = ctx.snap.mid
         dist_to_support = (cur - support) / cur if cur > 0 else 1.0
-        support_cap = 0.002 if ctx.config.scalp_paper_enabled else 0.0015
+        # Paper: slightly wider support band — Ocean reject mass was NOT_NEAR_SUPPORT
+        # while genuine fills that did pass were the only profitable setup cluster.
+        support_cap = 0.0025 if ctx.config.scalp_paper_enabled else 0.0015
         if dist_to_support > support_cap:
             return reject_signal(ctx, self.name, "NOT_NEAR_SUPPORT")
 
