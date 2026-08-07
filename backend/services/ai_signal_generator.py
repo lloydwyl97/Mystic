@@ -188,6 +188,11 @@ class RealTimeAISignalGenerator:
         self.model_feature_versions: dict[str, int] = {}
         self.model_feature_dims: dict[str, int] = {}
         self.model_artifact_sha256: dict[str, str] = {}
+        # Trained-at ISO timestamp per slot — surfaced in Redis signal
+        # payload as model_trained_at so paper_trades.explainability_json
+        # captures it and post-trade audits can pin PnL to model version.
+        self.model_trained_ats: dict[str, str] = {}
+        self.model_accuracies: dict[str, float] = {}
         self.feature_history: dict[str, list[list[float]]] = {}
 
         self.models_dir = Path("models/active")
@@ -286,6 +291,8 @@ class RealTimeAISignalGenerator:
         self.model_feature_versions.clear()
         self.model_feature_dims.clear()
         self.model_artifact_sha256.clear()
+        self.model_trained_ats.clear()
+        self.model_accuracies.clear()
 
         min_fv_global = live_ai_min_feature_version()
         min_by_strat = live_ai_min_feature_versions_map(self.enabled_strategies)
@@ -357,6 +364,11 @@ class RealTimeAISignalGenerator:
                     self.model_artifact_paths[slot] = str(model_path.resolve())
                     self.model_artifact_sha256[slot] = sha256_file(model_path)
                     self.model_label_versions[slot] = str(model_data.get("label_version", ""))
+                    self.model_trained_ats[slot] = str(model_data.get("trained_at") or "")
+                    try:
+                        self.model_accuracies[slot] = float(model_data.get("accuracy") or 0.0)
+                    except (TypeError, ValueError):
+                        self.model_accuracies[slot] = 0.0
                     try:
                         self.model_label_horizons[slot] = int(
                             model_data.get("label_lookahead_bars") or model_data.get("label_lookahead") or 0,
@@ -1187,6 +1199,8 @@ class RealTimeAISignalGenerator:
                 "prediction": prediction,
                 "model_used": True,
                 "model_artifact_path": artifact_path,
+                "model_trained_at": str(self.model_trained_ats.get(slot, "") or ""),
+                "model_accuracy": str(self.model_accuracies.get(slot, 0.0) or 0.0),
                 "live_ai_strategy": strategy_id,
                 "signal_source": "per_coin_ml",
                 "features_count": len(features),
