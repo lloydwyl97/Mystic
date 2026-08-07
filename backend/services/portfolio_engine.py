@@ -14038,7 +14038,7 @@ class PortfolioEngine:
             with contextlib.suppress(Exception):
                 from backend.services.day_outcome_bandit import bootstrap_bandit_from_paper_trades
 
-                bootstrap_bandit_from_paper_trades(self.db_path, lookback=120)
+                bootstrap_bandit_from_paper_trades(self.db_path, lookback=240)
             self._day_bandit_bootstrapped = True
 
         full_universe_diag = await self._augment_full_universe_candidates(bar_timestamp)

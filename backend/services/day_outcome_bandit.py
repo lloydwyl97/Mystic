@@ -34,6 +34,18 @@ SLIDING_WINDOW = 40
 BANDIT_BLEND_PRIMARY = 0.72  # share of selection score from bandit sample
 BANDIT_BLEND_SECONDARY = 0.28  # residual from existing final_selection_score
 
+# Hierarchical (partial-pooling) prior: when an arm has zero observations we
+# borrow evidence from peer arms with the same (setup, regime) family across
+# other symbols, then also from the (symbol, regime) family across other
+# setups, blended and shrunk toward the uninformative Beta(1,1). This makes
+# a fresh (BTC/USDT, VWAP_REVERSION, bull) arm start closer to the empirical
+# behavior of VWAP_REVERSION in bull rather than at 50/50, so early trades
+# still ride real signal instead of coin-flipping prior mass.
+HIERARCHICAL_PRIOR_ENABLED_DEFAULT = True
+HIERARCHICAL_PRIOR_MAX_WEIGHT = 2.5  # max effective peer weight added to α+β
+HIERARCHICAL_PRIOR_SETUP_REGIME_WEIGHT = 0.6
+HIERARCHICAL_PRIOR_SYMBOL_REGIME_WEIGHT = 0.4
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS day_outcome_bandit_arms (
     arm_key TEXT PRIMARY KEY,
@@ -56,6 +68,16 @@ CREATE INDEX IF NOT EXISTS idx_day_bandit_symbol ON day_outcome_bandit_arms(symb
 
 def bandit_enabled() -> bool:
     return os.getenv("DAY_OUTCOME_BANDIT_ENABLED", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def hierarchical_prior_enabled() -> bool:
+    default = "true" if HIERARCHICAL_PRIOR_ENABLED_DEFAULT else "false"
+    return os.getenv("DAY_BANDIT_HIERARCHICAL_PRIOR_ENABLED", default).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -229,6 +251,69 @@ def record_bandit_outcome(
     }
 
 
+def _peer_prior_alpha_beta(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str,
+    setup: str,
+    regime: str,
+) -> tuple[float, float, int]:
+    """Compute a hierarchical (partial-pooling) prior α, β for a fresh arm.
+
+    Blends two peer families:
+    1. Same (setup, regime), different symbol — how does this setup behave in
+       this regime elsewhere in the universe?
+    2. Same (symbol, regime), different setup — how does this symbol behave in
+       this regime across setups?
+
+    Each family contributes at most HIERARCHICAL_PRIOR_MAX_WEIGHT / 2 units of
+    effective observation mass. Result is added to Beta(1,1) so an arm with no
+    peer support still falls back to the uninformative prior.
+    """
+    peer_alpha = 0.0
+    peer_beta = 0.0
+    peer_used = 0
+    for label, weight, query, params in (
+        (
+            "setup_regime",
+            HIERARCHICAL_PRIOR_SETUP_REGIME_WEIGHT,
+            """
+            SELECT alpha, beta, n_obs FROM day_outcome_bandit_arms
+            WHERE setup = ? AND regime = ? AND symbol != ?
+            """,
+            (setup, regime, symbol),
+        ),
+        (
+            "symbol_regime",
+            HIERARCHICAL_PRIOR_SYMBOL_REGIME_WEIGHT,
+            """
+            SELECT alpha, beta, n_obs FROM day_outcome_bandit_arms
+            WHERE symbol = ? AND regime = ? AND setup != ?
+            """,
+            (symbol, regime, setup),
+        ),
+    ):
+        del label  # kept for grepability during debugging
+        rows = conn.execute(query, params).fetchall()
+        fam_a = 0.0
+        fam_b = 0.0
+        fam_n = 0
+        for r in rows:
+            fam_a += max(0.0, float(r["alpha"] or 0.0) - PRIOR_ALPHA)
+            fam_b += max(0.0, float(r["beta"] or 0.0) - PRIOR_BETA)
+            fam_n += int(r["n_obs"] or 0)
+        if fam_n <= 0:
+            continue
+        # Shrink family mass to at most (weight * MAX_WEIGHT) effective obs
+        # so a huge peer set does not overwhelm the true prior.
+        cap = HIERARCHICAL_PRIOR_MAX_WEIGHT * weight
+        scale = min(1.0, cap / (fam_a + fam_b + 1e-9))
+        peer_alpha += fam_a * scale
+        peer_beta += fam_b * scale
+        peer_used += fam_n
+    return peer_alpha, peer_beta, peer_used
+
+
 def get_arm_stats(
     symbol: str,
     setup: str,
@@ -237,25 +322,43 @@ def get_arm_stats(
     db_path: str | Path,
 ) -> dict[str, Any]:
     ensure_bandit_schema(db_path)
-    key = arm_key(symbol, setup, regime)
+    sym = _normalize_symbol(symbol)
+    st = _normalize_setup(setup)
+    reg = _normalize_regime(regime)
+    key = arm_key(sym, st, reg)
     with sqlite3.connect(str(db_path), timeout=15) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT * FROM day_outcome_bandit_arms WHERE arm_key=?",
             (key,),
         ).fetchone()
-    if row is None:
-        return {
-            "arm_key": key,
-            "alpha": PRIOR_ALPHA,
-            "beta": PRIOR_BETA,
-            "mean": 0.5,
-            "n_obs": 0,
-            "wins": 0,
-            "losses": 0,
-            "total_pnl": 0.0,
-            "starved": False,
-        }
+        if row is None:
+            alpha = PRIOR_ALPHA
+            beta = PRIOR_BETA
+            peer_n = 0
+            prior_source = "uniform"
+            if hierarchical_prior_enabled():
+                p_a, p_b, peer_n = _peer_prior_alpha_beta(
+                    conn, symbol=sym, setup=st, regime=reg
+                )
+                if peer_n > 0:
+                    alpha = PRIOR_ALPHA + p_a
+                    beta = PRIOR_BETA + p_b
+                    prior_source = "hierarchical"
+            mean = alpha / (alpha + beta) if (alpha + beta) > 0 else 0.5
+            return {
+                "arm_key": key,
+                "alpha": alpha,
+                "beta": beta,
+                "mean": mean,
+                "n_obs": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_pnl": 0.0,
+                "starved": False,
+                "prior_source": prior_source,
+                "peer_n_obs": peer_n,
+            }
     alpha = float(row["alpha"] or PRIOR_ALPHA)
     beta = float(row["beta"] or PRIOR_BETA)
     mean = alpha / (alpha + beta) if (alpha + beta) > 0 else 0.5
@@ -271,6 +374,8 @@ def get_arm_stats(
         "losses": int(row["losses"] or 0),
         "total_pnl": float(row["total_pnl"] or 0.0),
         "starved": starved,
+        "prior_source": "empirical",
+        "peer_n_obs": 0,
     }
 
 
@@ -291,14 +396,18 @@ def sample_arm(
     except ValueError:
         sample = 0.5
     starved = bool(stats["starved"])
+    n_obs = int(stats.get("n_obs") or 0)
+    peer_n = int(stats.get("peer_n_obs") or 0)
     if starved:
         size_factor = STARVE_SIZE_FLOOR
         # Pull sample toward zero so ranking buries the arm when better peers exist.
         sample = min(sample, float(stats["mean"]) * 0.5)
-    elif int(stats["n_obs"] or 0) == 0:
+    elif n_obs == 0 and peer_n == 0:
+        # No evidence at all → full explore.
         size_factor = 1.0
     else:
-        # Map mean [0,1] → size [floor, 1.35]
+        # Map mean [0,1] → size [floor, 1.35]. Fresh-but-peer-informed arms
+        # use their hierarchical mean; empirical arms use their own mean.
         size_factor = max(EXPLORE_SIZE_FLOOR, min(1.35, 0.4 + float(stats["mean"]) * 1.2))
     return {
         **stats,
@@ -359,6 +468,8 @@ def apply_bandit_to_decision_data(
     dd["day_bandit_starved"] = bool(sampled["starved"])
     dd["day_bandit_size_factor"] = round(float(sampled["size_factor"]), 4)
     dd["day_bandit_score"] = round(float(bandit_score), 6)
+    dd["day_bandit_prior_source"] = str(sampled.get("prior_source") or "")
+    dd["day_bandit_peer_n_obs"] = int(sampled.get("peer_n_obs") or 0)
     dd["final_selection_score_pre_bandit"] = prior_fss
     dd["final_selection_score"] = round(float(bandit_score), 6)
     dd["selection_score"] = dd["final_selection_score"]
@@ -377,7 +488,7 @@ def apply_bandit_to_decision_data(
 def bootstrap_bandit_from_paper_trades(
     db_path: str | Path,
     *,
-    lookback: int = 120,
+    lookback: int = 240,
 ) -> int:
     """One-shot hydrate from recent DAY sells if arms table is empty."""
     ensure_bandit_schema(db_path)
