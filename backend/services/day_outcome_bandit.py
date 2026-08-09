@@ -5,7 +5,13 @@ Updated on every closed DAY sell from realized net PnL.
 Used as the primary ranking key for BUY selection.
 
 Risk/safety gates (spread, max open, duplicate symbol, paper/live) stay elsewhere.
-This module never hard-blocks; toxic arms get near-zero size + bottom rank.
+The bandit itself never hard-blocks; toxic arms get near-zero size + bottom rank.
+
+Exception: the opt-in env var DAY_BLOCK_SETUP_REGIME_PAIRS (comma-separated
+"SETUP:regime" pairs, e.g. "HTF_TREND_PULLBACK:range") applies an explicit
+hard-block on named (setup, regime) combinations. Used to cull structural
+losers whose bandit starvation is too slow to prevent ongoing bleed. Empty by
+default (no blocks); safe to set/unset via .env with a restart.
 """
 
 from __future__ import annotations
@@ -466,6 +472,37 @@ def apply_bandit_to_decision_data(
     regime = identity.get("day_route_regime") or str(
         dd.get("day_route_regime") or dd.get("regime") or "range"
     )
+
+    # Opt-in explicit hard-block on named (setup, regime) pairs. Empty env = no
+    # blocks. Format: "SETUP:regime,SETUP:regime" (case-insensitive on both
+    # sides). Used when structural losers need to stop trading immediately
+    # rather than wait for slow bandit starvation.
+    _block_env = os.getenv("DAY_BLOCK_SETUP_REGIME_PAIRS", "").strip()
+    if _block_env:
+        _block_set = {
+            p.strip().upper()
+            for p in _block_env.split(",")
+            if p.strip() and ":" in p
+        }
+        _key = f"{str(setup).upper()}:{str(regime).upper()}"
+        if _key in _block_set:
+            dd["day_bandit_enabled"] = True
+            dd["day_bandit_hard_block_reason"] = (
+                f"SETUP_REGIME_BLOCKED:{setup}:{regime}"
+            )
+            dd["hard_block"] = True
+            dd["candidate_eligible"] = False
+            dd["final_selection_score"] = 0.0
+            dd["selection_score"] = 0.0
+            logger.info(
+                "DAY_SETUP_REGIME_HARD_BLOCK symbol=%s setup=%s regime=%s key=%s",
+                symbol,
+                setup,
+                regime,
+                _key,
+            )
+            return dd
+
     sampled = sample_arm(symbol, setup, regime, db_path=db_path, rng=rng)
     prior_fss = 0.0
     try:
