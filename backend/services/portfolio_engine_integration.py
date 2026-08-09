@@ -1014,6 +1014,17 @@ class PortfolioEngineIntegration:
                         "candle_upper_wick_pct": _dig_float(dd, "candle_upper_wick_pct", 0.0),
                         "candle_lower_wick_pct": _dig_float(dd, "candle_lower_wick_pct", 0.0),
                         "candle_body_pct": _dig_float(dd, "candle_body_pct", 0.0),
+                        # Multi-bar volume + reversal features from ai_signal_generator (used by
+                        # day_candle_quality_gate). Aggregated 24h `ctx_relative_volume` cannot
+                        # see per-candle volume spikes on rejection bars; these do.
+                        "recent_last_bar_vol_ratio": _dig_float(dd, "recent_last_bar_vol_ratio", 1.0),
+                        "recent_vol_5_vs_20": _dig_float(dd, "recent_vol_5_vs_20", 1.0),
+                        "recent_vp_divergence": _dig_float(dd, "recent_vp_divergence", 0.0),
+                        "recent_3bar_reversal_flag": _dig_int(dd, "recent_3bar_reversal_flag"),
+                        # ML model quality — read by day_model_quality_gate to demote signals
+                        # from poorly-validated per-coin models (e.g. SOL 33% accuracy).
+                        "model_accuracy": _dig_float(dd, "model_accuracy", 0.5),
+                        "model_trained_at": str(dd.get("model_trained_at") or "")[:64],
                         # RF/GBM disagreement computed in ai_signal_generator.py — was missing
                         # from this whitelist so it never reached candidate.decision_data,
                         # ai_candidate_snapshots, the AI ranking dashboard panel, or the

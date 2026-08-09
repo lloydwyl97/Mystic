@@ -6979,11 +6979,13 @@ class PortfolioEngine:
         confirmation still leaves the candidate eligible for a small
         exploration trade (size floor 0.20).
         """
+        from backend.services.day_candle_quality_gate import apply_candle_quality_to_decision_data
         from backend.services.day_entry_confirmation import (
             apply_entry_confirmation_to_decision_data,
         )
         from backend.services.day_htf_anchor import apply_htf_anchor_to_decision_data
         from backend.services.day_liquidity_gate import apply_liquidity_gate_to_decision_data
+        from backend.services.day_model_quality_gate import apply_model_quality_to_decision_data
         from backend.services.day_outcome_bandit import apply_bandit_to_decision_data
         from backend.services.symbol_setup_outcome_penalty import apply_v3_outcome_ranking_to_decision_data
 
@@ -7013,6 +7015,8 @@ class PortfolioEngine:
             dd,
             current_price=float(getattr(candidate, "current_price", 0.0) or 0.0),
         )
+        dd = apply_candle_quality_to_decision_data(dd)
+        dd = apply_model_quality_to_decision_data(dd)
         candidate.decision_data = apply_bandit_to_decision_data(
             dd,
             candidate.symbol,

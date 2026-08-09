@@ -1087,6 +1087,14 @@ class RealTimeAISignalGenerator:
             candle_upper_wick_pct = 0.0
             candle_lower_wick_pct = 0.0
             candle_body_pct = 0.0
+            # Multi-bar volume + reversal features (last-N bars) so downstream
+            # candle-quality gate can detect volume spikes on rejection candles,
+            # volume-price divergence, and 3-bar top-rejection patterns that the
+            # aggregated 24h `ctx_relative_volume` scalar cannot see.
+            recent_last_bar_vol_ratio = 1.0  # last bar volume vs 20-bar SMA
+            recent_vol_5_vs_20 = 1.0  # mean(last 5 bars vol) vs mean(prior 20)
+            recent_vp_divergence = 0.0  # bearish=-1..0, bullish=0..+1
+            recent_3bar_reversal_flag = 0  # 1 = top-rejection top-out on last 3 bars
             candle_shape_tf = "1m" if sid0 == "day" else ranking_tf_label
             _shape_bars = market_1m_exec if sid0 == "day" and market_1m_exec else (_rank_in or market_primary)
             try:
@@ -1104,6 +1112,52 @@ class RealTimeAISignalGenerator:
                         candle_body_pct = abs(_c - _o) / _rng
             except Exception:
                 candle_upper_wick_pct = candle_lower_wick_pct = candle_body_pct = 0.0
+
+            try:
+                if _shape_bars and len(_shape_bars) >= 21:
+                    _vols = [float(b[5]) for b in _shape_bars[-25:]]
+                    _closes = [float(b[4]) for b in _shape_bars[-25:]]
+                    if len(_vols) >= 21:
+                        _last = _vols[-1]
+                        _prior20 = _vols[-21:-1]
+                        _prior20_mean = sum(_prior20) / max(1, len(_prior20)) or 1.0
+                        if _prior20_mean > 0:
+                            recent_last_bar_vol_ratio = _last / _prior20_mean
+                        _last5_mean = sum(_vols[-5:]) / 5.0
+                        _prior20_for_5 = _vols[-25:-5] if len(_vols) >= 25 else _vols[:-5]
+                        _p20m = sum(_prior20_for_5) / max(1, len(_prior20_for_5)) or 1.0
+                        if _p20m > 0:
+                            recent_vol_5_vs_20 = _last5_mean / _p20m
+                        if len(_closes) >= 6:
+                            _dc = _closes[-1] - _closes[-6]
+                            _dv = (sum(_vols[-5:]) / 5.0) - (sum(_vols[-11:-5]) / 6.0)
+                            if _dc > 0 and _dv < 0:
+                                recent_vp_divergence = -min(1.0, abs(_dv) / max(_p20m, 1e-9))
+                            elif _dc < 0 and _dv > 0:
+                                recent_vp_divergence = -min(1.0, abs(_dv) / max(_p20m, 1e-9))
+                            elif _dc > 0 and _dv > 0:
+                                recent_vp_divergence = min(1.0, _dv / max(_p20m, 1e-9))
+                if _shape_bars and len(_shape_bars) >= 4:
+                    _b1, _b2, _b3 = _shape_bars[-3], _shape_bars[-2], _shape_bars[-1]
+                    _highs = [float(b[2]) for b in (_b1, _b2, _b3)]
+                    _closes3 = [float(b[4]) for b in (_b1, _b2, _b3)]
+                    _opens3 = [float(b[1]) for b in (_b1, _b2, _b3)]
+                    _lows3 = [float(b[3]) for b in (_b1, _b2, _b3)]
+                    _rngs = [max(1e-12, _highs[i] - _lows3[i]) for i in range(3)]
+                    _upper_wicks = [(_highs[i] - max(_closes3[i], _opens3[i])) / _rngs[i] for i in range(3)]
+                    _bodies = [abs(_closes3[i] - _opens3[i]) / _rngs[i] for i in range(3)]
+                    if (
+                        max(_upper_wicks) >= 0.45
+                        and _closes3[-1] < _closes3[-2]
+                        and (_closes3[-2] > _closes3[-3] or _highs[-2] > _highs[-3])
+                        and _bodies[-1] <= 0.6
+                    ):
+                        recent_3bar_reversal_flag = 1
+            except Exception:
+                recent_last_bar_vol_ratio = 1.0
+                recent_vol_5_vs_20 = 1.0
+                recent_vp_divergence = 0.0
+                recent_3bar_reversal_flag = 0
 
             # Compute spread_penalty from live bid/ask data in Redis
             spread_pct_raw = 0.0
@@ -1270,6 +1324,10 @@ class RealTimeAISignalGenerator:
                 "candle_upper_wick_pct": str(round(candle_upper_wick_pct, 6)),
                 "candle_lower_wick_pct": str(round(candle_lower_wick_pct, 6)),
                 "candle_body_pct": str(round(candle_body_pct, 6)),
+                "recent_last_bar_vol_ratio": str(round(recent_last_bar_vol_ratio, 5)),
+                "recent_vol_5_vs_20": str(round(recent_vol_5_vs_20, 5)),
+                "recent_vp_divergence": str(round(recent_vp_divergence, 5)),
+                "recent_3bar_reversal_flag": str(int(recent_3bar_reversal_flag)),
                 "ai_clock_contract": ("day_htf_v5_1m_ctx10tf" if sid0 == "day" else ("v3" if int(feat_version) >= 3 else "v2")),
                 "day_htf_contract": "1m_native+ctx_1m_5m_15m_30m_1h_4h_8h_12h_1d_1w" if sid0 == "day" else "",
                 "day_htf_bars_json": (json.dumps(day_tf_audit, separators=(",", ":")) if sid0 == "day" and day_tf_audit else ""),
