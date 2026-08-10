@@ -206,6 +206,29 @@ def rank_setup_signal(
             selection_confidence="blocked",
         )
 
+    # Adaptive per-arm block: skip (symbol, setup) combos that are consistently
+    # losing money based on the last 30d of scalp_learning_outcomes. This is
+    # the data-driven equivalent of manually dropping SOL from SCALP_PRODUCTS.
+    # Never blocks arms with insufficient sample count.
+    try:
+        from backend.services.binance_scalp.scalp_arm_blocker import arm_blocked
+
+        _arm_blk, _arm_reason, _arm_stats = arm_blocked(ctx.snap.symbol, sig.setup_name)
+        if _arm_blk:
+            return RankedCandidate(
+                signal=sig,
+                rank_score=0.0,
+                entry_eligible=False,
+                hard_block=_arm_reason or "ARM_ADAPTIVE_BLOCK",
+                regime=regime,
+                regime_native=regime in STRATEGY_NATIVE_REGIMES.get(sig.setup_name, frozenset()),
+                soft_reason=sig.reject_reason,
+                selection_confidence="arm_blocked",
+            )
+    except Exception:
+        # Blocker failures must never gate live scalping — fall through.
+        pass
+
     depth_ok, impact, fill = depth_check(ctx.snap, ctx.notional_usd, ctx.econ)
     if not depth_ok:
         return RankedCandidate(

@@ -23,6 +23,11 @@ EXIT_SETUP_INVALIDATED = "SETUP_INVALIDATED_EXIT"
 EXIT_MOMENTUM_FAILED = "MOMENTUM_FAILED_EXIT"
 EXIT_EARLY_SCRATCH = "EARLY_SCRATCH_EXIT"
 EXIT_MAX_HOLD_HARD_LIMIT = "MAX_HOLD_HARD_LIMIT"
+# Micro-TP: books a small green exit as soon as MFE has "armed" the exit and
+# price gives back a configurable fraction. Prevents scalp from repeatedly
+# reaching +0.15%+ then giving it all back and eventually hitting MAX_HOLD
+# for a small loss — which is what the 14-sell history showed.
+EXIT_MICRO_TP = "MICRO_TP_LOCK"
 
 DECISION_HOLD = "HOLD"
 DECISION_SELL = "SELL"
@@ -33,6 +38,77 @@ HIGHER_LOWS_MIN_REVIEWS = 2
 
 def _review_interval_sec() -> int:
     return int(os.getenv("SCALP_REVIEW_INTERVAL_SEC", "30"))
+
+
+def _micro_tp_enabled() -> bool:
+    return os.getenv("SCALP_MICRO_TP_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _micro_tp_arm_pct() -> float:
+    """MFE (as pct of entry) that arms the micro-TP lock. Once armed, we watch
+    for a give-back to trigger the exit."""
+    try:
+        return float(os.getenv("SCALP_MICRO_TP_ARM_PCT", "0.0018"))
+    except (TypeError, ValueError):
+        return 0.0018
+
+
+def _micro_tp_min_exec_net_pct() -> float:
+    """Minimum executable net pct required at exit — do not fire micro-TP if
+    the current fill would still be a loss after fees + spread."""
+    try:
+        return float(os.getenv("SCALP_MICRO_TP_MIN_NET_PCT", "0.0006"))
+    except (TypeError, ValueError):
+        return 0.0006
+
+
+def _micro_tp_giveback_frac() -> float:
+    """Fraction of armed MFE to give back before firing (0.35 = 35% giveback)."""
+    try:
+        v = float(os.getenv("SCALP_MICRO_TP_GIVEBACK_FRAC", "0.35"))
+    except (TypeError, ValueError):
+        v = 0.35
+    # Clamp so we never accept absurd values
+    return max(0.10, min(0.75, v))
+
+
+def _micro_tp_exit(
+    *,
+    max_fav: float,
+    fav: float,
+    executable_net_pct: float,
+    hold_sec: float,
+) -> tuple[bool, str]:
+    """Book any decent green if giveback exceeds threshold.
+
+    Only fires when:
+      * feature enabled (kill switch defaults on)
+      * max_fav has reached the arm threshold (default 0.18%)
+      * current executable net is still positive by min-exec floor
+      * giveback from peak is >= giveback_frac * max_fav
+    """
+    if not _micro_tp_enabled():
+        return False, ""
+    if hold_sec < 30.0:
+        # Skip the first 30s to avoid whipsaw on entry noise.
+        return False, ""
+    arm = _micro_tp_arm_pct()
+    if max_fav < arm:
+        return False, ""
+    if executable_net_pct < _micro_tp_min_exec_net_pct():
+        return False, ""
+    giveback_frac = _micro_tp_giveback_frac()
+    # Giveback = how much of the MFE we've lost from peak.
+    # If max_fav = 0.20% and current fav = 0.10%, giveback_frac = (0.20-0.10)/0.20 = 0.50
+    if max_fav <= 0:
+        return False, ""
+    giveback = max(0.0, (max_fav - fav) / max_fav)
+    if giveback < giveback_frac:
+        return False, ""
+    return True, (
+        f"micro_tp_lock mfe_pct={max_fav:.4f} "
+        f"fav_pct={fav:.4f} giveback={giveback:.2f} net_exec={executable_net_pct:.4f}"
+    )
 
 
 def _review_trigger_sec(econ: ScalpEconomics) -> int:
@@ -315,6 +391,23 @@ def evaluate_exit(
 
     if profit_hit:
         return _sell(STATE_OPEN, "profit_target_met", EXIT_NET_PROFIT_TARGET)
+
+    # Micro-TP: book any position that reached the arm threshold and gave back
+    # a configurable share of MFE from peak. This is what turns "MFE=+0.20%
+    # then times out at -0.15%" into "+0.13% booked". Fires BEFORE scratch/stall
+    # so a position that's already had a good move doesn't get scratched for
+    # small loss just because momentum stalled after the peak.
+    mtp, mtp_reason = _micro_tp_exit(
+        max_fav=max_fav,
+        fav=fav,
+        executable_net_pct=executable_net_pct,
+        hold_sec=hold_sec,
+    )
+    if mtp:
+        diag_base["micro_tp_arm_pct"] = _micro_tp_arm_pct()
+        diag_base["micro_tp_giveback_frac"] = _micro_tp_giveback_frac()
+        diag_base["micro_tp_trigger_detail"] = mtp_reason
+        return _sell(STATE_OPEN, mtp_reason, EXIT_MICRO_TP)
 
     hard = _max_hold_hard_sec(econ)
     scratch, scratch_reason = _early_scratch_exit(
