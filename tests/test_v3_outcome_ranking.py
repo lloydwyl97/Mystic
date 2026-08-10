@@ -91,11 +91,14 @@ def test_xrp_loses_final_rank_to_sol_when_comparable(mock_xrp, mock_btc, mock_so
     assert sol_dd["final_selection_score"] > xrp_dd["final_selection_score"]
 
 
+@patch("backend.services.symbol_setup_outcome_penalty.evaluate_low_mfe_stall_penalty")
 @patch("backend.services.symbol_setup_outcome_penalty.evaluate_eth_outcome_credit")
 @patch("backend.services.symbol_setup_outcome_penalty.evaluate_sol_outcome_credit")
 @patch("backend.services.symbol_setup_outcome_penalty.evaluate_btc_outcome_penalty")
 @patch("backend.services.symbol_setup_outcome_penalty.evaluate_outcome_penalty")
-def test_sol_credit_raises_final_selection_score(mock_xrp, mock_btc, mock_sol, mock_eth):
+def test_sol_credit_raises_final_selection_score(mock_xrp, mock_btc, mock_sol, mock_eth, mock_low_mfe):
+    # Neutralize the low-MFE stall penalty path so the test isolates the SOL-credit contribution.
+    mock_low_mfe.return_value = {"applied": False, "rank_delta": 0.0, "ev_factor": 1.0, "size_factor": 1.0, "final_score_adjustment": 0.0, "reason": "no_low_mfe_stall"}
     mock_xrp.return_value = {"applied": False, "rank_delta": 0.0, "ev_factor": 1.0, "size_factor": 1.0, "final_score_adjustment": 0.0, "reason": "not_xrp"}
     mock_btc.return_value = {"applied": False, "rank_delta": 0.0, "ev_factor": 1.0, "size_factor": 1.0, "final_score_adjustment": 0.0, "reason": "not_btc"}
     mock_sol.side_effect = lambda sym, setup, regime, **kw: (

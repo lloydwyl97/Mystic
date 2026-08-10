@@ -780,8 +780,8 @@ def label_pending_snapshots(db_path: str = DATABASE_PATH) -> dict[str, int]:
                 counters["unlabelable"] += 1
                 continue
 
-            def _missing_horizon_cols() -> list[tuple[str, int]]:
-                return [(col, horizon_sec) for col, horizon_sec in _HORIZONS if row[col] is None and age_sec >= horizon_sec]
+            def _missing_horizon_cols(_row=row, _age_sec=age_sec) -> list[tuple[str, int]]:
+                return [(col, horizon_sec) for col, horizon_sec in _HORIZONS if _row[col] is None and _age_sec >= horizon_sec]
 
             updates: dict[str, float] = {}
             still_missing = _missing_horizon_cols()

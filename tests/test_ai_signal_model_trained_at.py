@@ -51,9 +51,15 @@ def test_trained_at_landed_in_pickle_metadata():
 
 
 def test_portfolio_engine_reads_model_trained_at_from_dd():
-    """BUY-persistence must map decision_data.model_trained_at → explainability."""
+    """BUY-persistence must map decision_data.model_trained_at → explainability.
+
+    The code was refactored into a helper (`_stamp_model_metadata_explain`) that
+    reads `_dd.get("model_trained_at")` and assigns it via `explainability.model_trained_at = _trained`,
+    with Redis-hash fallback for empty values. Assert both halves of that
+    wiring still exist so the batch-8 metadata fix does not silently regress.
+    """
     from backend.services import portfolio_engine as pe
 
     src = Path(inspect.getsourcefile(pe)).read_text()
-    # Present in at least one BUY stamp path
-    assert 'explainability.model_trained_at = str(_dd.get("model_trained_at")' in src
+    assert '_dd.get("model_trained_at")' in src, "dd.model_trained_at read missing"
+    assert "explainability.model_trained_at = _trained" in src, "explainability.model_trained_at assignment missing"

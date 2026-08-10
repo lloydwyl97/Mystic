@@ -936,9 +936,9 @@ class PortfolioEngineIntegration:
                         except (TypeError, ValueError):
                             return default
 
-                    def _prob_float(key: str, default: float = 0.0) -> float:
+                    def _prob_float(key: str, default: float = 0.0, _dd=dd) -> float:
                         try:
-                            raw = dd.get(key)
+                            raw = _dd.get(key)
                             if raw is None or str(raw).strip() == "":
                                 return default
                             v = float(raw)
@@ -1003,8 +1003,7 @@ class PortfolioEngineIntegration:
                         "signal_side_penalty": _side_pen,
                         "symbol_identity_penalty": float(dd.get("symbol_identity_penalty") or 0.0),
                         "quality_opinion_reasons": json.dumps(
-                            (q_det or {}).get("opinion_reasons")
-                            or (["signal_side_penalty"] if _side_pen > 0 else []),
+                            (q_det or {}).get("opinion_reasons") or (["signal_side_penalty"] if _side_pen > 0 else []),
                             separators=(",", ":"),
                         ),
                         "veto_opinion_reasons": json.dumps((ve_det or {}).get("opinion_reasons", []), separators=(",", ":")),

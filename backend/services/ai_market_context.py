@@ -86,6 +86,7 @@ logger = logging.getLogger(__name__)
 def _ensure_role_intel_column() -> None:
     """Idempotent migration: add role_intel_json column to ai_context_snapshots."""
     from backend.database_schema import DATABASE_PATH
+
     try:
         with sqlite3.connect(DATABASE_PATH) as conn:
             cols = [r[1] for r in conn.execute("PRAGMA table_info(ai_context_snapshots)")]
@@ -805,13 +806,15 @@ class AIMarketContextService:
                 ordered_symbols[-1] if ordered_symbols else "-",
             )
         elif self._loop_count % 5 == 1:
+            # btc-dominance proxy: use last iteration's value if available.
+            _btc_dom_val = float(locals().get("market_structure_signal", 0.0) or 0.0)
             logger.info(
                 "AI_CONTEXT loop=%s published=%d/%d regime=%s btc_dom~%.2f",
                 self._loop_count,
                 published,
                 len(self.symbols),
                 market_regime,
-                btc_dom_proxy,
+                _btc_dom_val,
             )
 
     def _persist_snapshot(self, payload: dict[str, Any]) -> None:
