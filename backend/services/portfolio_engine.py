@@ -11811,18 +11811,25 @@ class PortfolioEngine:
         # Allweather positions are already excluded above — only engine-managed positions.
         _tp1_enabled = os.getenv("DAY_TP1_PARTIAL_ENABLED", "true").lower() in ("1", "true", "yes", "on")
         _tp1_pct = float(os.getenv("DAY_TP1_PARTIAL_PCT", "0.50"))
+        # Per-symbol profit floor: MIN_NET_PROFIT_TO_SELL_{BTC,ETH,SOL,XRP} env
+        # falls back to global MIN_NET_PROFIT_TO_SELL. Different coins have
+        # different achievable MFE distributions; global 0.4% starved wins on
+        # low-vol coins pre-2026-08-10.
+        from backend.config.trading_economics import min_net_profit_for_symbol as _mnp_for_sym
+        _min_net_profit = float(_mnp_for_sym(symbol))
         if _tp1_enabled and not getattr(position, "tp1_hit", False):
             _tp1_price = float(getattr(position, "take_profit_1_price", 0) or 0)
-            if _tp1_price > 0 and current_price >= _tp1_price and net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL) * 0.45:
+            if _tp1_price > 0 and current_price >= _tp1_price and net_pnl_pct + 1e-12 >= _min_net_profit * 0.45:
                 _partial_qty = quantity * _tp1_pct
                 if _partial_qty > 0:
                     logger.info(
-                        "TP1_PARTIAL_EXIT: %s price=%.6f tp1=%.6f partial_pct=%.0f%% net_pct=%.4f",
+                        "TP1_PARTIAL_EXIT: %s price=%.6f tp1=%.6f partial_pct=%.0f%% net_pct=%.4f floor=%.4f",
                         symbol,
                         current_price,
                         _tp1_price,
                         _tp1_pct * 100,
                         net_pnl_pct,
+                        _min_net_profit,
                     )
                     _tp1_result = await self.execute_sell_fifo(
                         symbol,
@@ -11842,12 +11849,12 @@ class PortfolioEngine:
                             await self._persist_position_to_sqlite(remaining_position)
                     return _tp1_result
 
-        if net_pnl_pct + 1e-12 < MIN_NET_PROFIT_TO_SELL:
+        if net_pnl_pct + 1e-12 < _min_net_profit:
             logger.debug(
                 "HOLD_PROFIT_NOT_ENOUGH symbol=%s net_pct=%.6f floor=%.6f",
                 symbol,
                 net_pnl_pct,
-                MIN_NET_PROFIT_TO_SELL,
+                _min_net_profit,
             )
             return None
 
@@ -11913,7 +11920,7 @@ class PortfolioEngine:
             pnl_pct,
             ESTIMATED_ROUNDTRIP_COST,
             net_pnl_pct,
-            MIN_NET_PROFIT_TO_SELL,
+            _min_net_profit,
             rationale,
             fading,
         )

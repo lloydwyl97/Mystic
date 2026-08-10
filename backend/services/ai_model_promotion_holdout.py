@@ -8,6 +8,7 @@ active and candidate artifacts on the same rows, and returns comparable metrics.
 from __future__ import annotations
 
 import json
+import os
 import pickle
 import sqlite3
 from pathlib import Path
@@ -30,8 +31,21 @@ from backend.services.ai_model_promotion_pac import (
 
 HOLDOUT_FRACTION = 0.2
 MIN_HOLDOUT_SAMPLES = MIN_PAC_SAMPLES
-MIN_HOLDOUT_CONFIDENCE_SAMPLES = 20
-TARGET_HOLDOUT_SAMPLES = 20
+# Larger holdout = more statistical power to detect real model improvements.
+# 20 was too small: two models with different underlying accuracy routinely
+# tied at ceiling (both 1.0) because they ranked the same 12 BUY predictions
+# in the same order on 20 rows. Env-overrideable. Falls back down to
+# MIN_HOLDOUT_SAMPLES when data is genuinely thin.
+try:
+    _confidence_env = int(os.getenv("MODEL_PROMOTION_MIN_CONFIDENCE_SAMPLES", "60") or "60")
+except (TypeError, ValueError):
+    _confidence_env = 60
+try:
+    _target_env = int(os.getenv("MODEL_PROMOTION_TARGET_HOLDOUT_SAMPLES", "60") or "60")
+except (TypeError, ValueError):
+    _target_env = 60
+MIN_HOLDOUT_CONFIDENCE_SAMPLES = max(20, _confidence_env)
+TARGET_HOLDOUT_SAMPLES = max(20, _target_env)
 
 
 def _canonical_bus_symbol(raw: str) -> str:

@@ -873,8 +873,22 @@ def resolve_setup_identity(decision_data: dict[str, Any] | None) -> dict[str, st
     }
 
 
-def thesis_min_profit_floor(entry_thesis: str, thesis_score: float) -> float:
-    base = float(MIN_NET_PROFIT_TO_SELL)
+def thesis_min_profit_floor(
+    entry_thesis: str,
+    thesis_score: float,
+    symbol: str | None = None,
+) -> float:
+    """Setup-family profit floor with per-symbol MIN_NET_PROFIT override.
+
+    The base floor comes from `min_net_profit_for_symbol` (per-coin env override
+    or global default). Setup-family adjustments are additive on top so that
+    trend-continuation setups still require a wider target than mean-reversion.
+    """
+    if symbol:
+        from backend.config.trading_economics import min_net_profit_for_symbol
+        base = float(min_net_profit_for_symbol(symbol))
+    else:
+        base = float(MIN_NET_PROFIT_TO_SELL)
     score_adj = max(0.0, min(1.0, 1.0 - float(thesis_score or 0.0)))
     if entry_thesis == SETUP_HTF_TREND_PULLBACK:
         return base + 0.0022 + 0.0015 * score_adj

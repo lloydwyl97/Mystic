@@ -384,10 +384,49 @@ def register_candidate_and_maybe_promote(
             age_h = _active_age_hours(active_path)
             stale_h = _stale_hours_threshold()
             metrics["active_age_hours"] = round(float(age_h), 3) if age_h is not None else None
+
+            # Artifact-accuracy override: when the tiny (<=20 row) holdout ceilings
+            # both models at accuracy=1.0 they always tie downstream, even when the
+            # underlying trained model is markedly better. Read
+            # `artifact_accuracy_stored` from each side's holdout dict; if the
+            # candidate's raw training/validation accuracy is meaningfully better
+            # AND the active model's stored accuracy is at/below random-chance-ish
+            # floor, promote. Handles the SOL case where active=0.33 stayed live
+            # for hours while a 0.48 candidate got rejected every 15 min. Never
+            # bypasses bad_ok/pac_ok — only the "cannot separate on holdout" tie.
+            act_h_dict = metrics.get("active_holdout") if isinstance(metrics.get("active_holdout"), dict) else {}
+            cand_h_dict = metrics.get("candidate_holdout") if isinstance(metrics.get("candidate_holdout"), dict) else {}
+            try:
+                a_art = float(act_h_dict.get("artifact_accuracy_stored") or 0.0)
+            except (TypeError, ValueError):
+                a_art = 0.0
+            try:
+                c_art = float(cand_h_dict.get("artifact_accuracy_stored") or 0.0)
+            except (TypeError, ValueError):
+                c_art = 0.0
+            metrics["active_artifact_accuracy"] = round(a_art, 5)
+            metrics["candidate_artifact_accuracy"] = round(c_art, 5)
+            try:
+                below_chance_floor = float(os.getenv("MODEL_PROMOTION_ARTIFACT_ACC_FLOOR", "0.45"))
+            except (TypeError, ValueError):
+                below_chance_floor = 0.45
+            try:
+                artifact_min_lift = float(os.getenv("MODEL_PROMOTION_ARTIFACT_ACC_LIFT", "0.05"))
+            except (TypeError, ValueError):
+                artifact_min_lift = 0.05
+            artifact_override = (
+                a_art > 0.0
+                and c_art > 0.0
+                and (c_art - a_art) >= artifact_min_lift
+                and (a_art <= below_chance_floor or (c_art - a_art) >= 0.10)
+            )
             # Tied candidates are normally rejected to avoid churn — but when the
             # active model is stale, promote so live inference keeps absorbing
             # recent coin/market structure from outcome-weighted retrains.
-            if age_h is not None and age_h >= stale_h:
+            if artifact_override:
+                metrics["promotion_path"] = "artifact_accuracy_override"
+                metrics["artifact_accuracy_delta"] = round(c_art - a_art, 5)
+            elif age_h is not None and age_h >= stale_h:
                 metrics["promotion_path"] = "stale_refresh_tie"
                 metrics["stale_hours_threshold"] = stale_h
             else:

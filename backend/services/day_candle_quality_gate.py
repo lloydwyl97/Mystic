@@ -28,10 +28,12 @@ SIZE_FACTOR_AT_ZERO = 0.25
 SIZE_FACTOR_AT_HALF = 0.65
 
 DEFAULT_WEIGHTS: dict[str, float] = {
-    "volume_spike_reversal": 0.35,  # big vol on a rejection bar = biggest tell
-    "vp_divergence": 0.25,
-    "three_bar_reversal": 0.20,
-    "last_bar_shape": 0.20,
+    "volume_spike_reversal": 0.25,  # big vol on a rejection bar
+    "vp_divergence": 0.15,
+    "three_bar_reversal": 0.10,
+    "last_bar_shape": 0.10,
+    "candlestick_bias": 0.20,  # classic bear/bull candlestick patterns
+    "sub_regime": 0.20,  # topping/climax_up when main=trending_up
 }
 
 
@@ -118,6 +120,74 @@ def _last_bar_shape_credit(upper_wick_pct: float, body_pct: float, direction: st
     return 1.0, "shape_ok"
 
 
+def _candlestick_bias_credit(dd: dict[str, Any], direction: str) -> tuple[float, str]:
+    """Score based on classic candlestick pattern flags (BUY only).
+
+    dd carries cs_pat_* integer flags emitted by day_candlestick_patterns.
+    We already have `cs_net_bias` in [-1, +1] (positive=bull, negative=bear).
+    For BUYs, negative bias = penalty. Bullish patterns = credit.
+    """
+    if direction != "buy":
+        return 1.0, "not_buy"
+    try:
+        net = float(dd.get("cs_net_bias") or 0.0)
+    except (TypeError, ValueError):
+        net = 0.0
+    # Hard bearish overrides (single strong signal beats the aggregate)
+    if _safe_int(dd.get("cs_pat_three_black_crows_bear"), 0) == 1:
+        return 0.05, "three_black_crows"
+    if _safe_int(dd.get("cs_pat_bearish_engulfing_bear"), 0) == 1:
+        return 0.20, "bearish_engulfing"
+    if _safe_int(dd.get("cs_pat_shooting_star_bear"), 0) == 1:
+        return 0.35, "shooting_star"
+    # Bullish confirmations (small boost, ceilinged at 1.0)
+    if _safe_int(dd.get("cs_pat_three_white_soldiers_bull"), 0) == 1:
+        return 1.0, "three_white_soldiers"
+    if _safe_int(dd.get("cs_pat_bullish_engulfing_bull"), 0) == 1:
+        return 1.0, "bullish_engulfing"
+    if _safe_int(dd.get("cs_pat_hammer_bull"), 0) == 1:
+        return 1.0, "hammer"
+    # Fallback to aggregate signed bias
+    if net <= -0.6:
+        return 0.20, f"cs_net_bias={net:.2f}"
+    if net <= -0.3:
+        return 0.55, f"cs_net_bias={net:.2f}"
+    if net >= 0.3:
+        return 1.0, f"cs_net_bias={net:.2f}"
+    return 0.80, "cs_neutral"
+
+
+def _sub_regime_credit(dd: dict[str, Any], direction: str) -> tuple[float, str]:
+    """Score based on fast sub-regime label.
+
+    BUYs get penalized when sub_regime is bearish (topping / climax_up /
+    distribution). SELLs are symmetric but this gate is BUY-only so we
+    early-return neutral for non-BUY.
+    """
+    if direction != "buy":
+        return 1.0, "not_buy"
+    sr = str(dd.get("sub_regime") or "").strip().lower()
+    try:
+        conf = float(dd.get("sub_regime_confidence") or 0.5)
+    except (TypeError, ValueError):
+        conf = 0.5
+    if sr in ("climax_up",):
+        return max(0.05, 0.20 - 0.10 * (conf - 0.5)), "climax_up_conf"
+    if sr == "topping":
+        return max(0.15, 0.35 - 0.15 * (conf - 0.5)), f"topping_conf={conf:.2f}"
+    if sr == "distribution":
+        return max(0.30, 0.55 - 0.15 * (conf - 0.5)), "distribution"
+    if sr == "bottoming":
+        return 1.0, "bottoming"
+    if sr == "accumulation":
+        return 1.0, "accumulation"
+    if sr in ("normal_up",):
+        return 1.0, "normal_up"
+    if sr in ("normal_down",):
+        return 0.65, "normal_down_but_buy"
+    return 0.90, f"neutral_{sr or 'unknown'}"
+
+
 def _score_to_rank_delta(score: float) -> float:
     s = max(0.0, min(1.0, float(score)))
     return RANK_DELTA_AT_ZERO * (1.0 - s)
@@ -159,6 +229,8 @@ def compute_candle_quality(decision_data: dict[str, Any]) -> dict[str, Any]:
     vpd_c, vpd_r = _vp_divergence_credit(vp_div, direction)
     tbr_c, tbr_r = _three_bar_reversal_credit(reversal_flag, direction)
     lbs_c, lbs_r = _last_bar_shape_credit(upper_wick, body, direction)
+    cs_c, cs_r = _candlestick_bias_credit(dd, direction)
+    sr_c, sr_r = _sub_regime_credit(dd, direction)
 
     w = DEFAULT_WEIGHTS
     components = {
@@ -166,6 +238,8 @@ def compute_candle_quality(decision_data: dict[str, Any]) -> dict[str, Any]:
         "vp_divergence": {"credit": vpd_c, "reason": vpd_r, "weight": w["vp_divergence"]},
         "three_bar_reversal": {"credit": tbr_c, "reason": tbr_r, "weight": w["three_bar_reversal"]},
         "last_bar_shape": {"credit": lbs_c, "reason": lbs_r, "weight": w["last_bar_shape"]},
+        "candlestick_bias": {"credit": cs_c, "reason": cs_r, "weight": w["candlestick_bias"]},
+        "sub_regime": {"credit": sr_c, "reason": sr_r, "weight": w["sub_regime"]},
     }
     total_w = sum(float(v["weight"]) for v in components.values()) or 1.0
     weighted_sum = sum(float(v["credit"]) * float(v["weight"]) for v in components.values())

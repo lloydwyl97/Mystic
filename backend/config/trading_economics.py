@@ -95,6 +95,33 @@ MIN_NET_PROFIT_TO_SELL: Final[float] = _env_float("MIN_NET_PROFIT_TO_SELL", 0.00
 # 0.0 disables; default 0.0 keeps backward compatibility.
 MIN_PROFIT_AFTER_COSTS_USD: Final[float] = _env_float("MIN_PROFIT_AFTER_COSTS_USD", 0.0)
 
+# Per-symbol overrides for MIN_NET_PROFIT_TO_SELL. Different coins have
+# different achievable MFE distributions in the same market conditions —
+# a global 0.4% target may starve wins on low-vol coins while leaving PnL
+# on the table for higher-vol coins. Empty env → falls back to the global
+# MIN_NET_PROFIT_TO_SELL value above. Format: floats in [0.0005, 0.05].
+_PER_COIN_MIN_NET_PROFIT: Final[dict[str, float]] = {
+    "BTCUSDT": _env_float("MIN_NET_PROFIT_TO_SELL_BTC", MIN_NET_PROFIT_TO_SELL),
+    "ETHUSDT": _env_float("MIN_NET_PROFIT_TO_SELL_ETH", MIN_NET_PROFIT_TO_SELL),
+    "SOLUSDT": _env_float("MIN_NET_PROFIT_TO_SELL_SOL", MIN_NET_PROFIT_TO_SELL),
+    "XRPUSDT": _env_float("MIN_NET_PROFIT_TO_SELL_XRP", MIN_NET_PROFIT_TO_SELL),
+}
+
+
+def min_net_profit_for_symbol(symbol: str) -> float:
+    """Return the per-symbol MIN_NET_PROFIT_TO_SELL, falling back to global.
+
+    Symbol may arrive as "BTC/USDT", "BTCUSDT", or "BTCUSD" — normalized here.
+    Callers must use this helper (not the global constant directly) whenever
+    they know the trading symbol; otherwise they get the top-level default.
+    """
+    if not symbol:
+        return MIN_NET_PROFIT_TO_SELL
+    s = str(symbol).strip().upper().replace("/", "").replace("-", "")
+    if s.endswith("USD") and not s.endswith("USDT"):
+        s = s + "T"
+    return float(_PER_COIN_MIN_NET_PROFIT.get(s, MIN_NET_PROFIT_TO_SELL))
+
 # -- Cooldowns ---------------------------------------------------------------
 # Block re-entry on a symbol for this many seconds after Mystic closed it.
 COOLDOWN_SECONDS_AFTER_SELL: Final[int] = _env_int(

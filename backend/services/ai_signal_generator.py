@@ -1159,6 +1159,45 @@ class RealTimeAISignalGenerator:
                 recent_vp_divergence = 0.0
                 recent_3bar_reversal_flag = 0
 
+            # Candlestick pattern detection — 9 boolean flags emitted alongside
+            # existing candle_body_pct / wick fields. Read by day_candle_quality_gate
+            # for soft demotion when bearish patterns appear on BUY signals.
+            candlestick_flags: dict[str, int] = {}
+            candlestick_net_bias = 0.0
+            try:
+                from backend.services.day_candlestick_patterns import (
+                    detect_patterns as _detect_cs_patterns,
+                    net_bearish_pattern_score as _cs_net_bias,
+                )
+
+                candlestick_flags = _detect_cs_patterns(_shape_bars or [])
+                candlestick_net_bias = float(_cs_net_bias(candlestick_flags))
+            except Exception:
+                candlestick_flags = {}
+                candlestick_net_bias = 0.0
+
+            # Fast sub-regime layered on top of ai_context main regime.
+            # Detects topping/bottoming/climax that the slow main regime misses.
+            sub_regime_data: dict[str, Any] = {}
+            try:
+                from backend.services.day_sub_regime import compute_sub_regime as _compute_sub_regime
+
+                sub_regime_data = _compute_sub_regime(
+                    _shape_bars or [],
+                    main_regime=str(ctx_payload.get("ctx_market_regime") or "").strip(),
+                    recent_last_bar_vol_ratio=float(recent_last_bar_vol_ratio),
+                    recent_3bar_reversal_flag=int(recent_3bar_reversal_flag),
+                    upper_wick_pct=float(candle_upper_wick_pct),
+                    lower_wick_pct=float(candle_lower_wick_pct),
+                    cs_bearish_engulfing=int(candlestick_flags.get("cs_pat_bearish_engulfing_bear", 0) or 0),
+                    cs_bullish_engulfing=int(candlestick_flags.get("cs_pat_bullish_engulfing_bull", 0) or 0),
+                    cs_shooting_star=int(candlestick_flags.get("cs_pat_shooting_star_bear", 0) or 0),
+                    cs_hammer=int(candlestick_flags.get("cs_pat_hammer_bull", 0) or 0),
+                )
+            except Exception:
+                sub_regime_data = {"sub_regime": "unknown", "sub_regime_confidence": 0.5,
+                                    "sub_regime_agrees_with_main": 1, "sub_regime_reason": "compute_failed"}
+
             # Compute spread_penalty from live bid/ask data in Redis
             spread_pct_raw = 0.0
             try:
@@ -1328,6 +1367,20 @@ class RealTimeAISignalGenerator:
                 "recent_vol_5_vs_20": str(round(recent_vol_5_vs_20, 5)),
                 "recent_vp_divergence": str(round(recent_vp_divergence, 5)),
                 "recent_3bar_reversal_flag": str(int(recent_3bar_reversal_flag)),
+                "cs_pat_hammer_bull": str(int(candlestick_flags.get("cs_pat_hammer_bull", 0))),
+                "cs_pat_shooting_star_bear": str(int(candlestick_flags.get("cs_pat_shooting_star_bear", 0))),
+                "cs_pat_doji_neutral": str(int(candlestick_flags.get("cs_pat_doji_neutral", 0))),
+                "cs_pat_bullish_engulfing_bull": str(int(candlestick_flags.get("cs_pat_bullish_engulfing_bull", 0))),
+                "cs_pat_bearish_engulfing_bear": str(int(candlestick_flags.get("cs_pat_bearish_engulfing_bear", 0))),
+                "cs_pat_inside_bar_neutral": str(int(candlestick_flags.get("cs_pat_inside_bar_neutral", 0))),
+                "cs_pat_outside_bar_neutral": str(int(candlestick_flags.get("cs_pat_outside_bar_neutral", 0))),
+                "cs_pat_three_white_soldiers_bull": str(int(candlestick_flags.get("cs_pat_three_white_soldiers_bull", 0))),
+                "cs_pat_three_black_crows_bear": str(int(candlestick_flags.get("cs_pat_three_black_crows_bear", 0))),
+                "cs_net_bias": str(round(candlestick_net_bias, 5)),
+                "sub_regime": str(sub_regime_data.get("sub_regime", "unknown"))[:32],
+                "sub_regime_confidence": str(round(float(sub_regime_data.get("sub_regime_confidence", 0.5) or 0.5), 5)),
+                "sub_regime_agrees_with_main": str(int(sub_regime_data.get("sub_regime_agrees_with_main", 1) or 0)),
+                "sub_regime_reason": str(sub_regime_data.get("sub_regime_reason", ""))[:64],
                 "ai_clock_contract": ("day_htf_v5_1m_ctx10tf" if sid0 == "day" else ("v3" if int(feat_version) >= 3 else "v2")),
                 "day_htf_contract": "1m_native+ctx_1m_5m_15m_30m_1h_4h_8h_12h_1d_1w" if sid0 == "day" else "",
                 "day_htf_bars_json": (json.dumps(day_tf_audit, separators=(",", ":")) if sid0 == "day" and day_tf_audit else ""),
