@@ -75,6 +75,7 @@ from backend.config.trading_economics import (
     ESTIMATED_ROUNDTRIP_COST_PCT,
     MIN_NET_PROFIT_TO_SELL,
     TAKER_FEE,
+    min_net_profit_for_symbol as _mnp_for_sym,
 )
 from backend.config.trading_economics import (
     SLIPPAGE_BUFFER as SLIPPAGE_PCT,
@@ -1716,10 +1717,7 @@ class TradeExplainability:
             "setup_type_canonical": self.setup_type_canonical or self.setup_type,
             "penalty_generation": self.penalty_generation,
             "outcome_low_mfe_stall_penalty_eval": (
-                json.loads(self.outcome_low_mfe_stall_penalty_eval_json)
-                if self.outcome_low_mfe_stall_penalty_eval_json
-                and self.outcome_low_mfe_stall_penalty_eval_json != "{}"
-                else {}
+                json.loads(self.outcome_low_mfe_stall_penalty_eval_json) if self.outcome_low_mfe_stall_penalty_eval_json and self.outcome_low_mfe_stall_penalty_eval_json != "{}" else {}
             ),
             "low_mfe_stall_fill_deferred": self.low_mfe_stall_fill_deferred,
             "day_bandit_enabled": self.day_bandit_enabled,
@@ -1945,9 +1943,7 @@ def _stamp_low_mfe_outcome_explain(explainability: TradeExplainability, dd: dict
     explainability.outcome_penalty_applied = bool(_dd.get("outcome_penalty_applied"))
     explainability.outcome_credit_applied = bool(_dd.get("outcome_credit_applied"))
     explainability.penalty_reason = str(_dd.get("penalty_reason") or "")
-    explainability.outcome_low_mfe_stall_penalty_applied = bool(
-        _dd.get("outcome_low_mfe_stall_penalty_applied")
-    )
+    explainability.outcome_low_mfe_stall_penalty_applied = bool(_dd.get("outcome_low_mfe_stall_penalty_applied"))
     try:
         explainability.low_mfe_stall_count = int(_dd.get("low_mfe_stall_count") or 0)
     except (TypeError, ValueError):
@@ -1971,25 +1967,17 @@ def _stamp_low_mfe_outcome_explain(explainability: TradeExplainability, dd: dict
     explainability.outcome_penalty_rank_delta = _opt_float("outcome_penalty_rank_delta")
     explainability.outcome_penalty_ev_factor = _opt_float("outcome_penalty_ev_factor")
     explainability.rank_score_before_outcome_penalty = _opt_float("rank_score_before_outcome_penalty")
-    explainability.selected_net_expected_value_before_outcome_penalty = _opt_float(
-        "selected_net_expected_value_before_outcome_penalty"
-    )
-    explainability.final_selection_score_before_outcome_penalty = _opt_float(
-        "final_selection_score_before_outcome_penalty"
-    )
+    explainability.selected_net_expected_value_before_outcome_penalty = _opt_float("selected_net_expected_value_before_outcome_penalty")
+    explainability.final_selection_score_before_outcome_penalty = _opt_float("final_selection_score_before_outcome_penalty")
     explainability.outcome_adjusted_rank_score = _opt_float("outcome_adjusted_rank_score")
     explainability.raw_rank_score = _opt_float("raw_rank_score")
-    explainability.setup_type_canonical = str(
-        _dd.get("setup_type_canonical") or _dd.get("setup_type") or explainability.setup_type or ""
-    )
+    explainability.setup_type_canonical = str(_dd.get("setup_type_canonical") or _dd.get("setup_type") or explainability.setup_type or "")
     explainability.penalty_generation = str(_dd.get("penalty_generation") or "")
     explainability.low_mfe_stall_fill_deferred = bool(_dd.get("low_mfe_stall_fill_deferred"))
     try:
         _eval = _dd.get("outcome_low_mfe_stall_penalty_eval")
         if isinstance(_eval, dict):
-            explainability.outcome_low_mfe_stall_penalty_eval_json = json.dumps(
-                _eval, separators=(",", ":"), default=str
-            )
+            explainability.outcome_low_mfe_stall_penalty_eval_json = json.dumps(_eval, separators=(",", ":"), default=str)
             if not explainability.penalty_generation:
                 explainability.penalty_generation = str(_eval.get("penalty_generation") or "")
         elif isinstance(_eval, str) and _eval.strip():
@@ -5325,22 +5313,11 @@ class PortfolioEngine:
                         ex_payload["entry_thesis"] = _ident["entry_thesis"] or _ident["setup_type_canonical"]
                         ex_payload["day_route_regime"] = _ident["day_route_regime"]
                         ex_payload["adaptive_regime"] = _ident["adaptive_regime"]
-                    _eparts = split_day_exit_reasons(
-                        str(
-                            reporting.get("raw_exit_reason")
-                            or getattr(position, "_learning_raw_exit_reason", None)
-                            or close_reason
-                            or ""
-                        )
-                    )
+                    _eparts = split_day_exit_reasons(str(reporting.get("raw_exit_reason") or getattr(position, "_learning_raw_exit_reason", None) or close_reason or ""))
                     ex_payload["raw_exit_reason"] = reporting.get("raw_exit_reason") or _eparts["raw_exit_reason"]
-                    ex_payload["canonical_exit_reason"] = (
-                        reporting.get("canonical_exit_reason") or _eparts["canonical_exit_reason"]
-                    )
+                    ex_payload["canonical_exit_reason"] = reporting.get("canonical_exit_reason") or _eparts["canonical_exit_reason"]
                     if reporting.get("dead_trade_reason") or _eparts.get("dead_trade_reason"):
-                        ex_payload["dead_trade_reason"] = (
-                            reporting.get("dead_trade_reason") or _eparts.get("dead_trade_reason")
-                        )
+                        ex_payload["dead_trade_reason"] = reporting.get("dead_trade_reason") or _eparts.get("dead_trade_reason")
 
                 entry_px = float(entry_price or 0.0)
                 hi = float(getattr(position, "highest_price", 0.0) or 0.0)
@@ -5522,17 +5499,11 @@ class PortfolioEngine:
                 entry_ts = float(getattr(position, "entry_time", 0.0) or 0.0)
                 opened_iso = datetime.fromtimestamp(entry_ts, tz=timezone.utc).isoformat() if entry_ts > 0 else None
                 closed_iso = datetime.now(timezone.utc).isoformat()
-                _eparts = split_day_exit_reasons(
-                    str(reporting.get("raw_exit_reason") or getattr(position, "_learning_raw_exit_reason", None) or close_reason or "")
-                )
+                _eparts = split_day_exit_reasons(str(reporting.get("raw_exit_reason") or getattr(position, "_learning_raw_exit_reason", None) or close_reason or ""))
                 ex_payload["raw_exit_reason"] = reporting.get("raw_exit_reason") or _eparts["raw_exit_reason"]
-                ex_payload["canonical_exit_reason"] = (
-                    reporting.get("canonical_exit_reason") or _eparts["canonical_exit_reason"]
-                )
+                ex_payload["canonical_exit_reason"] = reporting.get("canonical_exit_reason") or _eparts["canonical_exit_reason"]
                 if reporting.get("dead_trade_reason") or _eparts.get("dead_trade_reason"):
-                    ex_payload["dead_trade_reason"] = (
-                        reporting.get("dead_trade_reason") or _eparts.get("dead_trade_reason")
-                    )
+                    ex_payload["dead_trade_reason"] = reporting.get("dead_trade_reason") or _eparts.get("dead_trade_reason")
                 _epx = float(entry_price or getattr(position, "entry_price", 0.0) or 0.0)
                 _hi = float(getattr(position, "highest_price", 0.0) or 0.0)
                 _lo = float(getattr(position, "lowest_price", 0.0) or 0.0)
@@ -5650,17 +5621,8 @@ class PortfolioEngine:
             with contextlib.suppress(Exception):
                 from backend.services.day_outcome_bandit import record_bandit_outcome
 
-                _setup = str(
-                    ex_payload.get("setup_type_canonical")
-                    or ex_payload.get("setup_type")
-                    or ex_payload.get("entry_thesis")
-                    or ""
-                )
-                _regime = str(
-                    ex_payload.get("day_route_regime")
-                    or ex_payload.get("regime")
-                    or "range"
-                )
+                _setup = str(ex_payload.get("setup_type_canonical") or ex_payload.get("setup_type") or ex_payload.get("entry_thesis") or "")
+                _regime = str(ex_payload.get("day_route_regime") or ex_payload.get("regime") or "range")
                 record_bandit_outcome(
                     symbol=symbol,
                     setup=_setup,
@@ -6422,11 +6384,7 @@ class PortfolioEngine:
 
             # AUTO-CLEAR: Clear invariant/recovery pauses on restart - startup will re-evaluate
             # Writer/init only — never from GET/status read paths.
-            if (
-                allow_mutations
-                and self._trading_paused
-                and any(tag in self._pause_reason for tag in ("RECOVERY_FAILED", "INVARIANT_VIOLATION", "EQUITY_MISMATCH"))
-            ):
+            if allow_mutations and self._trading_paused and any(tag in self._pause_reason for tag in ("RECOVERY_FAILED", "INVARIANT_VIOLATION", "EQUITY_MISMATCH")):
                 logger.warning("LOAD_LEDGER: Clearing stale pause '%s' (startup will re-evaluate)", self._pause_reason[:80])
                 self._trading_paused = False
                 self._pause_reason = ""
@@ -11528,11 +11486,7 @@ class PortfolioEngine:
                 position.lowest_price = min(position.lowest_price, current_price)
 
             # Persist either watermark so MAE/wick-stop memory survives restarts
-            watermark_changed = (
-                position.highest_price > old_high
-                or float(position.lowest_price or 0.0) < old_low
-                or old_low <= 0
-            )
+            watermark_changed = position.highest_price > old_high or float(position.lowest_price or 0.0) < old_low or old_low <= 0
             profile = get_coin_profile(symbol)
             from backend.services.day_controlled_exits import (
                 apply_break_even_and_mfe_trail,
@@ -11815,7 +11769,6 @@ class PortfolioEngine:
         # falls back to global MIN_NET_PROFIT_TO_SELL. Different coins have
         # different achievable MFE distributions; global 0.4% starved wins on
         # low-vol coins pre-2026-08-10.
-        from backend.config.trading_economics import min_net_profit_for_symbol as _mnp_for_sym
         _min_net_profit = float(_mnp_for_sym(symbol))
         if _tp1_enabled and not getattr(position, "tp1_hit", False):
             _tp1_price = float(getattr(position, "take_profit_1_price", 0) or 0)
@@ -11981,6 +11934,7 @@ class PortfolioEngine:
             entry_price=float(position.entry_price or 0.0),
             mark=mark,
             bundle=None,
+            symbol=symbol,
         )
         thesis_reason = str(thesis_eval.get("reason") or "")
         if str(thesis_eval.get("action") or "") == "warn" or thesis_reason.startswith(EXIT_THESIS_WARNING):
@@ -16603,7 +16557,7 @@ class PortfolioEngine:
             "thesis_target_level": float(getattr(pos, "thesis_target_level", 0.0) or 0.0),
             "max_hold_min": int(getattr(pos, "max_hold_min", 0) or profile.get("max_hold_min") or 75),
             "trailing_stop_price": float(getattr(pos, "trailing_stop_price", 0) or 0),
-            "eligible_for_net_profit_exit": net_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL),
+            "eligible_for_net_profit_exit": net_pct + 1e-12 >= float(_mnp_for_sym(getattr(pos, "symbol", ""))),
             "red_thesis_exit_blocked": False,
             "stop_price": stop,
             "stop_loss": stop,
@@ -16630,11 +16584,7 @@ class PortfolioEngine:
         Needed after restart (trade_explanations memory empty) and for multi-buy extras
         that were stamped in SQLite but not on the in-memory Position object.
         """
-        missing_tids = [
-            str(r.get("trade_id") or "")
-            for r in positions_rows
-            if r.get("trade_id") and not str(r.get("why_selected") or "").strip()
-        ]
+        missing_tids = [str(r.get("trade_id") or "") for r in positions_rows if r.get("trade_id") and not str(r.get("why_selected") or "").strip()]
         if not missing_tids:
             return
         try:
@@ -19566,11 +19516,7 @@ class PortfolioEngine:
         if not row:
             base = {"date": today, "status": "NO_DATA"}
             try:
-                base.update(
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, lambda: self._scoreboard_activity_breakdown_sync(today)
-                    )
-                )
+                base.update(await asyncio.get_running_loop().run_in_executor(None, lambda: self._scoreboard_activity_breakdown_sync(today)))
             except sqlite3.OperationalError as exc:
                 if is_locked_error(exc):
                     base["degraded"] = True
@@ -19581,9 +19527,7 @@ class PortfolioEngine:
 
         data = dict(zip(columns, row, strict=False))
         try:
-            breakdown = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: self._scoreboard_activity_breakdown_sync(today)
-            )
+            breakdown = await asyncio.get_running_loop().run_in_executor(None, lambda: self._scoreboard_activity_breakdown_sync(today))
             data.update(breakdown)
         except sqlite3.OperationalError as exc:
             if is_locked_error(exc):

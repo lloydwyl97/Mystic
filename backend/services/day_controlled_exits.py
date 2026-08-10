@@ -77,6 +77,7 @@ def effective_max_hold_min(position: Any, coin_profile: dict[str, Any] | None = 
         base += int(round(_bull_hold_extension_min() * scalar))
     return base
 
+
 ALLOWED_DAY_EXIT_REASONS = frozenset(
     {
         EXIT_NET_PROFIT,
@@ -195,10 +196,7 @@ def evaluate_stall_exit(
             "hold_minutes": hold_minutes,
             "mfe_pct": round(mfe_pct, 6),
             "mae_pct": round(mae_pct, 6),
-            "detail": (
-                f"stall_min={stall_min:.0f}m mfe={mfe_pct:.6f} mae={mae_pct:.6f} "
-                f"max_mfe={max_mfe:.6f} min_adverse={min_adverse:.6f}"
-            ),
+            "detail": (f"stall_min={stall_min:.0f}m mfe={mfe_pct:.6f} mae={mae_pct:.6f} max_mfe={max_mfe:.6f} min_adverse={min_adverse:.6f}"),
         }
         payload.update(extra)
         return payload
@@ -245,10 +243,7 @@ def evaluate_stall_exit(
         "hold_minutes": hold_minutes,
         "mfe_pct": round(mfe_pct, 6),
         "mae_pct": round(mae_pct, 6),
-        "detail": (
-            f"stall_min={stall_min:.0f}m mfe={mfe_pct:.6f} mae={mae_pct:.6f} "
-            f"max_mfe={max_mfe:.6f} min_adverse={min_adverse:.6f}"
-        ),
+        "detail": (f"stall_min={stall_min:.0f}m mfe={mfe_pct:.6f} mae={mae_pct:.6f} max_mfe={max_mfe:.6f} min_adverse={min_adverse:.6f}"),
     }
 
 
@@ -770,12 +765,8 @@ def evaluate_engine_managed_exit(
         _highest = float(getattr(position, "highest_price", entry) or entry)
         _mfe = max(0.0, (_highest - entry) / entry) if entry > 0 else 0.0
         _bull_scalar, _ = get_regime_validated_scalar(_pos_regime)
-        _bull_mfe_thresh = blend_by_scalar(
-            _giveback_min_mfe_pct(), float(os.getenv("DAY_BULL_GIVEBACK_MIN_MFE", "0.005")), _bull_scalar
-        )
-        _bull_trigger = blend_by_scalar(
-            _giveback_trigger_pnl_pct(), float(os.getenv("DAY_BULL_GIVEBACK_TRIGGER", "-0.003")), _bull_scalar
-        )
+        _bull_mfe_thresh = blend_by_scalar(_giveback_min_mfe_pct(), float(os.getenv("DAY_BULL_GIVEBACK_MIN_MFE", "0.005")), _bull_scalar)
+        _bull_trigger = blend_by_scalar(_giveback_trigger_pnl_pct(), float(os.getenv("DAY_BULL_GIVEBACK_TRIGGER", "-0.003")), _bull_scalar)
         if _mfe >= _bull_mfe_thresh and net_pnl_pct + 1e-12 <= _bull_trigger:
             giveback = {
                 "action": "sell",
@@ -839,8 +830,13 @@ def evaluate_engine_managed_exit(
                 "detail": f"max_hold_min={max_hold}",
             }
 
+    # Resolve per-coin profit floor from the position's symbol.
+    from backend.config.trading_economics import min_net_profit_for_symbol as _mnp
+    _sym = str(getattr(position, "symbol", "") or "")
+    _min_net = float(_mnp(_sym)) if _sym else float(MIN_NET_PROFIT_TO_SELL)
+
     target = effective_target_price(entry, float(getattr(position, "take_profit_1_price", 0) or 0), target_level)
-    if target > 0 and current_price >= target and net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL) * 0.45:
+    if target > 0 and current_price >= target and net_pnl_pct + 1e-12 >= _min_net * 0.45:
         return {
             "action": "sell",
             "reason": EXIT_NET_PROFIT,
@@ -849,7 +845,7 @@ def evaluate_engine_managed_exit(
             "detail": "target_hit",
         }
 
-    if net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL):
+    if net_pnl_pct + 1e-12 >= _min_net:
         te = evaluate_thesis_exit(
             entry_thesis=setup,
             thesis_score=float(getattr(position, "thesis_score", 0.0) or 0.0),
@@ -859,6 +855,7 @@ def evaluate_engine_managed_exit(
             entry_price=entry,
             mark=current_price,
             bundle=bundle,
+            symbol=_sym or None,
         )
         if str(te.get("action")) == "sell":
             return {

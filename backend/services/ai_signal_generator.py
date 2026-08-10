@@ -438,9 +438,7 @@ class RealTimeAISignalGenerator:
                         await self._generate_signal_for_symbol(strategy_id, symbol)
                         if (strategy_id or "").strip().lower() == "day":
                             # Keep peers alive while this symbol's REST work runs.
-                            await self._heartbeat_all_day_signal_hashes(
-                                reason=f"MID_CYCLE_HEARTBEAT:{symbol}"
-                            )
+                            await self._heartbeat_all_day_signal_hashes(reason=f"MID_CYCLE_HEARTBEAT:{symbol}")
                     # Persistence heartbeat: top-4 DAY hashes must never flap to HLEN=0.
                     if (strategy_id or "").strip().lower() == "day" and self.redis:
                         for symbol in self.symbols:
@@ -1146,12 +1144,7 @@ class RealTimeAISignalGenerator:
                     _rngs = [max(1e-12, _highs[i] - _lows3[i]) for i in range(3)]
                     _upper_wicks = [(_highs[i] - max(_closes3[i], _opens3[i])) / _rngs[i] for i in range(3)]
                     _bodies = [abs(_closes3[i] - _opens3[i]) / _rngs[i] for i in range(3)]
-                    if (
-                        max(_upper_wicks) >= 0.45
-                        and _closes3[-1] < _closes3[-2]
-                        and (_closes3[-2] > _closes3[-3] or _highs[-2] > _highs[-3])
-                        and _bodies[-1] <= 0.6
-                    ):
+                    if max(_upper_wicks) >= 0.45 and _closes3[-1] < _closes3[-2] and (_closes3[-2] > _closes3[-3] or _highs[-2] > _highs[-3]) and _bodies[-1] <= 0.6:
                         recent_3bar_reversal_flag = 1
             except Exception:
                 recent_last_bar_vol_ratio = 1.0
@@ -1184,7 +1177,7 @@ class RealTimeAISignalGenerator:
 
                 sub_regime_data = _compute_sub_regime(
                     _shape_bars or [],
-                    main_regime=str(ctx_payload.get("ctx_market_regime") or "").strip(),
+                    main_regime=str((ctx_payload or {}).get("ctx_market_regime") or (ctx_payload or {}).get("market_regime") or "").strip(),
                     recent_last_bar_vol_ratio=float(recent_last_bar_vol_ratio),
                     recent_3bar_reversal_flag=int(recent_3bar_reversal_flag),
                     upper_wick_pct=float(candle_upper_wick_pct),
@@ -1195,8 +1188,7 @@ class RealTimeAISignalGenerator:
                     cs_hammer=int(candlestick_flags.get("cs_pat_hammer_bull", 0) or 0),
                 )
             except Exception:
-                sub_regime_data = {"sub_regime": "unknown", "sub_regime_confidence": 0.5,
-                                    "sub_regime_agrees_with_main": 1, "sub_regime_reason": "compute_failed"}
+                sub_regime_data = {"sub_regime": "unknown", "sub_regime_confidence": 0.5, "sub_regime_agrees_with_main": 1, "sub_regime_reason": "compute_failed"}
 
             # Compute spread_penalty from live bid/ask data in Redis
             spread_pct_raw = 0.0

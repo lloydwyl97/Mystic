@@ -107,16 +107,16 @@ def _query_giveback_samples(
     out: list[float] = []
     try:
         with sqlite3.connect(db_path, timeout=10) as conn:
-            # We need to join to attribution to filter by setup/regime.
+            # Join attribution to filter by setup/regime.
             # ai_outcome_training_rows carries symbol + closed_at_utc + mfe_giveback_pct.
-            # day_outcome_attribution maps trade → setup + regime.
+            # day_outcome_attribution maps trade → setup_thesis + regime.
             rows = conn.execute(
                 """
                 SELECT
                     otr.mfe_giveback_pct,
                     otr.outcome_label,
-                    doa.setup_type_canonical,
-                    doa.day_route_regime
+                    doa.setup_thesis,
+                    doa.regime
                 FROM ai_outcome_training_rows otr
                 LEFT JOIN day_outcome_attribution doa ON otr.symbol = doa.symbol
                     AND otr.closed_at_utc = doa.closed_at_utc

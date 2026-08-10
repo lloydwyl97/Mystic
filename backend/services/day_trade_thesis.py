@@ -839,18 +839,8 @@ def resolve_setup_identity(decision_data: dict[str, Any] | None) -> dict[str, st
     source separately so narrative pollution cannot reopen a second bucket.
     """
     dd = dict(decision_data or {})
-    canonical = str(
-        dd.get("setup_type_canonical")
-        or dd.get("setup_type")
-        or dd.get("entry_thesis")
-        or dd.get("allweather_setup")
-        or ""
-    ).strip().upper()
-    raw = str(
-        dd.get("setup_type_raw")
-        or dd.get("setup_regime_remapped_from")
-        or ""
-    ).strip().upper()
+    canonical = str(dd.get("setup_type_canonical") or dd.get("setup_type") or dd.get("entry_thesis") or dd.get("allweather_setup") or "").strip().upper()
+    raw = str(dd.get("setup_type_raw") or dd.get("setup_regime_remapped_from") or "").strip().upper()
     if not raw:
         raw = canonical
     entry_thesis = str(dd.get("entry_thesis") or canonical or "").strip().upper() or canonical
@@ -886,6 +876,7 @@ def thesis_min_profit_floor(
     """
     if symbol:
         from backend.config.trading_economics import min_net_profit_for_symbol
+
         base = float(min_net_profit_for_symbol(symbol))
     else:
         base = float(MIN_NET_PROFIT_TO_SELL)
@@ -1033,8 +1024,14 @@ def evaluate_thesis_exit(
     entry_price: float,
     mark: float,
     bundle: dict[str, Any] | None = None,
+    symbol: str | None = None,
 ) -> dict[str, Any]:
-    """Thesis-aware hold/sell hint for position management (no new gates)."""
+    """Thesis-aware hold/sell hint for position management (no new gates).
+
+    `symbol`: optional per-coin profit floor override. When provided,
+    both `thesis_min_profit_floor` and the target-hit / floor gates use
+    `min_net_profit_for_symbol(symbol)` instead of the global default.
+    """
     if not entry_thesis or entry_thesis == SETUP_NO_CLEAR_THESIS:
         return {"action": "default", "reason": "no_thesis"}
 
@@ -1067,12 +1064,18 @@ def evaluate_thesis_exit(
     if net_pnl < 0:
         return {"action": "hold", "reason": "THESIS_HOLD_NOISE", "net_pnl_pct": net_pnl}
 
+    if symbol:
+        from backend.config.trading_economics import min_net_profit_for_symbol
+        min_net = float(min_net_profit_for_symbol(symbol))
+    else:
+        min_net = float(MIN_NET_PROFIT_TO_SELL)
+
     target_hit = thesis_target_level > 0 and mark >= thesis_target_level * 0.998
-    min_floor = thesis_min_profit_floor(entry_thesis, thesis_score)
-    if target_hit and net_pnl >= float(MIN_NET_PROFIT_TO_SELL) * 0.45:
+    min_floor = thesis_min_profit_floor(entry_thesis, thesis_score, symbol=symbol)
+    if target_hit and net_pnl >= min_net * 0.45:
         return {"action": "sell", "reason": EXIT_NET_PROFIT, "net_pnl_pct": net_pnl, "detail": "target_hit"}
 
-    if net_pnl >= float(MIN_NET_PROFIT_TO_SELL):
+    if net_pnl >= min_net:
         if thesis_target_level > 0 and mark < thesis_target_level * 0.992 and net_pnl < min_floor:
             return {"action": "hold", "reason": "THESIS_HOLD_AWAIT_TARGET", "net_pnl_pct": net_pnl}
         return {"action": "sell", "reason": EXIT_NET_PROFIT, "net_pnl_pct": net_pnl, "detail": "profit_floor"}
