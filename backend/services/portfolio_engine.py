@@ -16035,11 +16035,38 @@ class PortfolioEngine:
         if _to_api_symbol(symbol) not in DAY_TRADE_SYMBOLS:
             logger.debug("[BUY_GATE] %s not in trading universe, rejecting", symbol)
             return (False, None)
-        if ENTRY_MAJOR_ONLY and symbol not in ENTRY_ALLOWED_SYMBOLS:
-            logger.debug(
+        # Independent allowlist: enforced whenever ENTRY_MAJOR_ONLY=true OR the
+        # operator narrows ENTRY_ALLOWED_SYMBOLS below the trading universe.
+        # Previously this was gated behind ENTRY_GATES_ENFORCED and silently
+        # inert when that master switch was unset, letting XRP through even
+        # after the operator removed it from the allowlist.
+        _major_only_env = os.getenv("ENTRY_MAJOR_ONLY", "false").strip().lower() in ("1", "true", "yes", "on")
+        if _major_only_env and symbol not in ENTRY_ALLOWED_SYMBOLS:
+            logger.info(
                 "CANDIDATE_REJECTED_SYMBOL_NOT_ALLOWED: %s allowlist=%s",
                 symbol,
                 sorted(ENTRY_ALLOWED_SYMBOLS),
+            )
+            return (False, None)
+        # Enforce hard_block flags set by upstream ranking modules
+        # (day_outcome_bandit / day_liquidity_gate / operator setup+regime block).
+        # These modules stamp dd["hard_block"]=True + candidate_eligible=False
+        # but pre-fix nothing downstream actually rejected the trade — the DAY
+        # engine treated them as metadata only. This closes that leak.
+        _dd = decision_data or {}
+        if bool(_dd.get("hard_block")) or _dd.get("candidate_eligible") is False:
+            _reason = str(
+                _dd.get("day_bandit_hard_block_reason")
+                or _dd.get("liquidity_hard_block_reason")
+                or _dd.get("hard_block_reason")
+                or "HARD_BLOCK"
+            )
+            logger.info(
+                "CANDIDATE_REJECTED_HARD_BLOCK symbol=%s reason=%s setup=%s regime=%s",
+                symbol,
+                _reason,
+                _dd.get("setup_type_canonical") or _dd.get("setup_type"),
+                _dd.get("day_route_regime") or _dd.get("regime"),
             )
             return (False, None)
 

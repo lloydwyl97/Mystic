@@ -743,14 +743,30 @@ class PortfolioEngineIntegration:
                             await self.redis_client.delete(claimed_key)
                         continue
 
-                    if is_buy and _ENTRY_MAJOR_ONLY and ccxt_symbol not in _ENTRY_ALLOWED_SYMBOLS:
-                        # Symbol-identity gating is telemetry-only. Keep pair in ranking flow.
+                    # ENTRY_MAJOR_ONLY now enforces an independent allowlist (no
+                    # master ENTRY_GATES_ENFORCED requirement). When the operator
+                    # sets ENTRY_MAJOR_ONLY=true, symbols outside ENTRY_ALLOWED_SYMBOLS
+                    # are hard-rejected here, matching the downstream gate in
+                    # portfolio_engine.add_buy_candidate. Pre-fix this branch only
+                    # added a soft ranking penalty which was insufficient (XRP kept
+                    # trading even after removal from the allowlist).
+                    _entry_major_only_live = os.getenv("ENTRY_MAJOR_ONLY", "false").strip().lower() in ("1", "true", "yes", "on")
+                    if is_buy and _entry_major_only_live and ccxt_symbol not in _ENTRY_ALLOWED_SYMBOLS:
                         logger.info(
-                            "ENTRY_SYMBOL_TELEMETRY: %s not in major-only allowlist -> penalty only",
+                            "ENTRY_SYMBOL_HARD_BLOCK: %s not in major-only allowlist -> reject",
                             ccxt_symbol,
                         )
-                        dd["quality_opinion_penalty"] = float(dd.get("quality_opinion_penalty") or 0.0) + 2.5
-                        dd["symbol_identity_penalty"] = 2.5
+                        await self._strategy_runtime_audit_row(
+                            event_type=EVT_SIGNAL_CONSUME,
+                            decision_id=decision_id,
+                            reject_reason="SYMBOL_NOT_ALLOWED",
+                            strategy_id=live_ai_strategy,
+                            symbol=symbol,
+                            redis_signal_key=ks,
+                        )
+                        with contextlib.suppress(Exception):
+                            await self.redis_client.delete(claimed_key)
+                        continue
 
                     if is_buy and _ENTRY_LIQUIDITY_GATE_ENABLED:
 
