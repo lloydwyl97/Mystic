@@ -14938,6 +14938,51 @@ class PortfolioEngine:
         execution_sane_candidates: list[BuyCandidate] = []
         for _rank_idx, _cand in enumerate(valid_candidates):
             _sym = _cand.symbol
+            # Post-ranking hard-block enforcement. day_outcome_bandit and
+            # day_liquidity_gate stamp dd["hard_block"]=True /
+            # candidate_eligible=False during _apply_ranking_stack, which
+            # runs AFTER add_buy_candidate — so the admission-time gate
+            # cannot see the flag. Enforce it here, right before the buy
+            # actually executes. Covers:
+            #   * DAY_BLOCK_SETUP_REGIME_PAIRS operator block
+            #   * day_liquidity_gate catastrophic-spread block
+            _dd_hb = _cand.decision_data or {}
+            if bool(_dd_hb.get("hard_block")) or _dd_hb.get("candidate_eligible") is False:
+                _hb_reason = str(
+                    _dd_hb.get("day_bandit_hard_block_reason")
+                    or _dd_hb.get("liquidity_hard_block_reason")
+                    or _dd_hb.get("hard_block_reason")
+                    or "HARD_BLOCK"
+                )
+                logger.info(
+                    "BAR_HARD_BLOCK_REJECT #%d: %s reason=%s setup=%s regime=%s",
+                    _rank_idx + 1,
+                    _sym,
+                    _hb_reason,
+                    _dd_hb.get("setup_type_canonical") or _dd_hb.get("setup_type"),
+                    _dd_hb.get("day_route_regime") or _dd_hb.get("regime"),
+                )
+                with contextlib.suppress(Exception):
+                    from backend.services.day_gate_telemetry import (
+                        record_gate_event,
+                        record_shadow_reject,
+                    )
+
+                    record_gate_event(
+                        self.db_path,
+                        gate_id="HARD_BLOCK",
+                        symbol=str(_sym),
+                        outcome="hard_blocked",
+                        decision_id=str(getattr(_cand, "decision_id", "") or ""),
+                    )
+                    record_shadow_reject(
+                        self.db_path,
+                        candidate=_cand,
+                        gate_id="HARD_BLOCK",
+                        bar_timestamp=int(bar_timestamp or 0),
+                    )
+                await self._bar_pipeline_terminal(_cand.decision_id, f"BAR_HARD_BLOCK:{_hb_reason}", pipeline_done)
+                continue
             # BUY margin is score/sizing influence only (not a ranking blocker).
             _bm_raw = resolve_buy_margin_from_payload(_cand.decision_data)
             _sleeve = str(getattr(_cand, "sleeve", "") or "").strip().upper() or assign_sleeve(normalize_symbol(_sym), float(_cand.confidence), _cand.decision_data)
