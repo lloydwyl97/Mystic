@@ -84,6 +84,48 @@ def test_connect_ro_with_block_closes_underlying_connection(tmp_path: Path) -> N
         conn.execute("SELECT 1")
 
 
+def test_connect_managed_closes_and_preserves_commit_semantics(tmp_path: Path) -> None:
+    """connect_managed replaces bare `with sqlite3.connect(...) as conn:` call sites
+    (21 in portfolio_engine.py) that bypassed connect_rw/connect_ro entirely and thus
+    still leaked a connection/fd per call even after the connect_rw/connect_ro fix.
+    """
+    db = tmp_path / "managed.db"
+    with sqlite3.connect(db) as c:
+        c.execute("CREATE TABLE t(x INTEGER)")
+        c.commit()
+
+    with sqlite_runtime.connect_managed(db) as conn:
+        conn.execute("INSERT INTO t (x) VALUES (1)")
+        assert conn.execute("SELECT x FROM t").fetchone() == (1,)
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+
+    with sqlite3.connect(db) as c2:
+        assert c2.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
+
+
+def test_connect_managed_closes_and_rolls_back_on_exception(tmp_path: Path) -> None:
+    db = tmp_path / "managed_err.db"
+    with sqlite3.connect(db) as c:
+        c.execute("CREATE TABLE t(x INTEGER)")
+        c.commit()
+
+    captured_conn = None
+    with contextlib.suppress(RuntimeError):
+        with sqlite_runtime.connect_managed(db, timeout=5) as conn:
+            captured_conn = conn
+            conn.execute("INSERT INTO t (x) VALUES (1)")
+            raise RuntimeError("boom")
+
+    assert captured_conn is not None
+    with pytest.raises(sqlite3.ProgrammingError):
+        captured_conn.execute("SELECT 1")
+
+    with sqlite3.connect(db) as c2:
+        assert c2.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0
+
+
 def test_writer_helper_sets_busy_timeout_and_retries(tmp_path: Path) -> None:
     db = tmp_path / "w.db"
     with sqlite3.connect(db) as c:

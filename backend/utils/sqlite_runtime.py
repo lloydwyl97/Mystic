@@ -146,6 +146,26 @@ def connect_ro(db_path: str | Path, *, timeout_sec: float | None = None) -> sqli
     return _AutoCloseConnection(conn)  # type: ignore[return-value]
 
 
+@contextlib.contextmanager
+def connect_managed(db_path: str | Path, *, timeout: float | None = None):
+    """Drop-in replacement for bare `with sqlite3.connect(db_path) as conn:`.
+
+    `sqlite3.Connection.__exit__` only commits/rolls back — it never closes the
+    connection/fd. Call sites written as `with sqlite3.connect(...) as conn:`
+    (bypassing `connect_rw`/`connect_ro`) leak one fd per call, same root cause
+    as `_AutoCloseConnection` above. This preserves the exact connect() args and
+    the exact commit-on-success/rollback-on-exception semantics callers already
+    depend on (no pragma/WAL changes), and guarantees `.close()` runs after.
+    """
+    conn = sqlite3.connect(str(db_path), timeout=timeout) if timeout is not None else sqlite3.connect(str(db_path))
+    try:
+        with conn:
+            yield conn
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
 def run_locked_retry(
     op: Callable[[], T],
     *,

@@ -109,7 +109,7 @@ from backend.services.risk_governor import (
     MAX_CONSEC_LOSSES,
     RiskGovernor,
 )
-from backend.utils.sqlite_runtime import connect_ro, connect_rw, is_locked_error, run_locked_retry
+from backend.utils.sqlite_runtime import connect_managed, connect_ro, connect_rw, is_locked_error, run_locked_retry
 from backend.utils.symbols import normalize_symbol
 
 if TYPE_CHECKING:
@@ -3559,7 +3559,7 @@ class PortfolioEngine:
         metrics: dict[str, int] = {"buy_trades": 0, "sell_trades": 0}
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 cursor = conn.cursor()
 
                 # STEP 1: Clear current state in SQLite
@@ -4139,7 +4139,7 @@ class PortfolioEngine:
         """Ensure database schema exists for recording trades (not as position source)"""
         try:
             # BUG #54 FIX: Use context manager for proper connection cleanup
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 cursor = conn.cursor()
                 self._ensure_schema(cursor)
                 conn.commit()  # CRITICAL: Commit the DDL statements (CREATE TABLE)
@@ -4940,7 +4940,7 @@ class PortfolioEngine:
         """
         sym = normalize_symbol(symbol)
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 row = conn.execute(
                     "SELECT cooldown_until FROM position_close_ledger WHERE symbol = ? ORDER BY closed_at_epoch DESC LIMIT 1",
                     (sym,),
@@ -4961,7 +4961,7 @@ class PortfolioEngine:
         """
         out: list[dict[str, Any]] = []
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 rows = conn.execute(
                     """
                     SELECT symbol, closed_at, closed_at_epoch, close_reason,
@@ -5270,7 +5270,7 @@ class PortfolioEngine:
                 buy_explain: dict[str, Any] | None = None
                 if tid:
                     try:
-                        with sqlite3.connect(self.db_path) as _lc:
+                        with connect_managed(self.db_path) as _lc:
                             _row = _lc.execute(
                                 """
                                 SELECT explainability_json, context_snapshot_json, decision_id, confidence
@@ -5479,7 +5479,7 @@ class PortfolioEngine:
                 # Merge BUY explainability when in-memory payload is thin (empty probs/setup).
                 if tid and (not ex_payload.get("prob_buy") or not ex_payload.get("setup_type")):
                     try:
-                        with sqlite3.connect(self.db_path) as _lc:
+                        with connect_managed(self.db_path) as _lc:
                             _row = _lc.execute(
                                 """
                                 SELECT explainability_json FROM paper_trades
@@ -5812,7 +5812,7 @@ class PortfolioEngine:
         if sell_trade_id:
 
             def _lookup_ledger_id() -> int | None:
-                with sqlite3.connect(self.db_path) as conn:
+                with connect_managed(self.db_path) as conn:
                     row = conn.execute(
                         """
                         SELECT id FROM position_close_ledger
@@ -5926,7 +5926,7 @@ class PortfolioEngine:
                     dust_sid = str(getattr(position, "entry_strategy_id", "") or "").strip() or None
 
                     def _write_dust_sell() -> None:
-                        with sqlite3.connect(self.db_path) as conn:
+                        with connect_managed(self.db_path) as conn:
                             cur = conn.cursor()
                             cur.execute(
                                 """INSERT INTO paper_trades (
@@ -6072,7 +6072,7 @@ class PortfolioEngine:
     def _load_constraints_from_sqlite(self) -> None:
         """Phase 3: Load exchange symbol constraints from SQLite into self._symbol_constraints. COIN UNIVERSE: only load symbols in fixed universe."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     SELECT name FROM sqlite_master
@@ -6106,7 +6106,7 @@ class PortfolioEngine:
     def _load_constraints_from_sqlite_single(self, symbol: str) -> dict | None:
         """Load constraints for a single symbol from SQLite"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
@@ -6139,7 +6139,7 @@ class PortfolioEngine:
             return
         try:
             # BUG #53 FIX: Use context manager for proper connection cleanup
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 cursor = conn.cursor()
                 now = datetime.now(timezone.utc).isoformat()
                 for sym, c in constraints.items():
@@ -6985,7 +6985,7 @@ class PortfolioEngine:
         """Same-day losing DAY exits with thesis invalidation label (XRP churn guard)."""
         ns = normalize_symbol(symbol)
         try:
-            with sqlite3.connect(self.db_path, timeout=10) as conn:
+            with connect_managed(self.db_path, timeout=10) as conn:
                 row = conn.execute(
                     """
                     SELECT COUNT(*) FROM paper_trades
@@ -11972,7 +11972,7 @@ class PortfolioEngine:
             return
         new_cache: dict[tuple[str, str, str], dict[str, float]] = {}
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 cur = conn.execute(
                     """
                     SELECT strategy_id, symbol, regime, component_name, weight
@@ -12086,7 +12086,7 @@ class PortfolioEngine:
             "sum_net_pct": 0.0,
         }
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 row = conn.execute(
                     """
                     WITH recent AS (
@@ -12136,7 +12136,7 @@ class PortfolioEngine:
             "adaptive_symbol_bias": 0.0,
         }
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 exp_row = conn.execute(
                     """
                     SELECT expectancy, good_count, bad_count
@@ -12184,7 +12184,7 @@ class PortfolioEngine:
         except Exception:
             pass
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 peer_row = conn.execute(
                     """
                     SELECT
@@ -12725,7 +12725,7 @@ class PortfolioEngine:
         if sid != "day":
             sid = "day"
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 row = conn.execute(
                     """
                     SELECT allocated_capital, deployed_capital, available_capital, realized_pnl,
@@ -13362,7 +13362,7 @@ class PortfolioEngine:
     def _latest_inference_fallback(self, symbol: str, strategy_id: str) -> dict[str, Any] | None:
         symbol_bus = normalize_symbol(symbol).replace("/", "")
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 row = conn.execute(
                     """
                     SELECT decision_id, prediction, argmax_action, prob_buy, prob_hold, prob_sell,
@@ -13757,7 +13757,7 @@ class PortfolioEngine:
         except Exception:
             return
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 conn.execute(
                     """
                     INSERT INTO operational_state(key, value_json, updated_ts)
@@ -13796,7 +13796,7 @@ class PortfolioEngine:
         except Exception:
             return None
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 cur = conn.execute(
                     """
                     INSERT INTO ai_rank_snapshots(
@@ -16918,7 +16918,7 @@ class PortfolioEngine:
         # Persist across restarts: pull compact decision fields from recent trades.
         out: list[dict[str, Any]] = []
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_managed(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
                     """
