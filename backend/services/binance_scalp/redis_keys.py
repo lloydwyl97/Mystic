@@ -58,6 +58,19 @@ def scan_key(prefix: str, symbol_bus: str) -> str:
     return key
 
 
+def ranking_meta_key(prefix: str, symbol_bus: str) -> str:
+    """Cross-process diagnostic snapshot of evaluate_all()'s per-symbol
+    ranking row (item p22 unified EV contract). The scalp paper runner and
+    the API/uvicorn process are separate OS processes with no shared
+    memory, so any per-process in-memory cache (see
+    scalp_strategy_router._LAST_RANKING_META_BY_SYMBOL) is invisible to the
+    API — this key is how the API process reads it instead."""
+    sym = symbol_bus.strip().upper()
+    key = f"{normalize_prefix(prefix)}:ranking_meta:{sym}"
+    assert_key_allowed(key, prefix=prefix)
+    return key
+
+
 def runner_state_key(prefix: str) -> str:
     key = f"{normalize_prefix(prefix)}:runner:state"
     assert_key_allowed(key, prefix=prefix)

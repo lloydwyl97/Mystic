@@ -90,9 +90,7 @@ def _query_arm_stats(
     lookback_days: int | None = None,
 ) -> dict[str, Any]:
     lb = int(lookback_days or _lookback_days())
-    since_iso = time.strftime(
-        "%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - lb * 86400)
-    )
+    since_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - lb * 86400))
     out = {"n": 0, "wins": 0, "total_pnl_usd": 0.0, "avg_pnl_usd": 0.0, "win_rate": 0.0}
     try:
         with sqlite3.connect(db_path, timeout=5.0) as conn:
@@ -158,10 +156,7 @@ def arm_blocked(
     wr = float(stats.get("win_rate") or 0.0)
     avg = float(stats.get("avg_pnl_usd") or 0.0)
     if wr <= _max_win_rate() and avg <= _max_avg_pnl_usd():
-        reason = (
-            f"ARM_ADAPTIVE_BLOCK n={n} wr={wr:.2f} avg=${avg:.2f} "
-            f"lookback={_lookback_days()}d"
-        )
+        reason = f"ARM_ADAPTIVE_BLOCK n={n} wr={wr:.2f} avg=${avg:.2f} lookback={_lookback_days()}d"
         _ARM_CACHE[key] = (True, reason, now, stats)
         return True, reason, stats
     _ARM_CACHE[key] = (False, "", now, stats)

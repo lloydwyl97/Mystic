@@ -85,12 +85,8 @@ def test_promote_archives_prior_active_and_keeps_candidate_path(tmp_path: Path):
 
     assert ok1 is True and ok2 is True
     with sqlite3.connect(db) as conn:
-        actives = conn.execute(
-            "SELECT path, status FROM ai_model_versions WHERE status='active'"
-        ).fetchall()
-        archived = conn.execute(
-            "SELECT path, status FROM ai_model_versions WHERE status='archived'"
-        ).fetchall()
+        actives = conn.execute("SELECT path, status FROM ai_model_versions WHERE status='active'").fetchall()
+        archived = conn.execute("SELECT path, status FROM ai_model_versions WHERE status='archived'").fetchall()
     assert len(actives) == 1
     assert str(cand2) in actives[0][0]
     assert len(archived) >= 1
@@ -169,14 +165,14 @@ def test_prune_retires_registry_candidates():
 
 def test_model_panel_reads_promote_reject_event_types():
     src = (REPO / "backend/endpoints/portfolio_engine_endpoints.py").read_text()
-    assert '("promote", "promoted")' in src or "\"promote\", \"promoted\"" in src
-    assert '("reject", "rejected")' in src or "\"reject\", \"rejected\"" in src
+    assert '("promote", "promoted")' in src or '"promote", "promoted"' in src
+    assert '("reject", "rejected")' in src or '"reject", "rejected"' in src
 
 
 def test_scalp_learning_resolves_nested_rank_score():
     src = (REPO / "backend/services/binance_scalp/paper_engine.py").read_text()
     assert '_sr.get("best_rank_score")' in src
-    assert '"rank_score": ranking_meta.get("rank_score")' in src or "ranking_meta.get(\"rank_score\")" in src
+    assert '"rank_score": ranking_meta.get("rank_score")' in src or 'ranking_meta.get("rank_score")' in src
 
 
 def test_feature_version_no_longer_invents_five_on_missing():

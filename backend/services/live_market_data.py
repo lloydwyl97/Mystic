@@ -499,24 +499,39 @@ class LiveMarketDataService:
                     response.raise_for_status()
                     data = response.json()
 
-                # Convert to CCXT format
-                t = {
-                    "symbol": s,
-                    "last": float(data.get("lastPrice", 0)),
-                    "bid": float(data.get("bidPrice", 0)),
-                    "ask": float(data.get("askPrice", 0)),
-                    "high": float(data.get("highPrice", 0)),
-                    "low": float(data.get("lowPrice", 0)),
-                    "volume": float(data.get("volume", 0)),
-                    "quoteVolume": float(data.get("quoteVolume", 0)),
-                    "change": float(data.get("priceChange", 0)),
-                    "percentage": float(data.get("priceChangePercent", 0)),
-                    "timestamp": int(data.get("closeTime", 0)),
-                }
+                # A 200 response with a missing/zero lastPrice is not a real
+                # market read (price is never legitimately 0 for a traded
+                # symbol) — treat it the same as a hard failure (item p25)
+                # rather than caching/returning a zero-priced ticker that a
+                # caller could misread as "market is flat."
+                last_price_raw = data.get("lastPrice")
+                if last_price_raw is None or float(last_price_raw) <= 0.0:
+                    logger.warning("get_ticker %s: 200 response with missing/zero lastPrice — treating as failure", s)
+                    async with self._lock:
+                        t_stale = self._ticker_cache.get(s)
+                    if t_stale:
+                        t = t_stale
+                    else:
+                        return None
+                else:
+                    # Convert to CCXT format
+                    t = {
+                        "symbol": s,
+                        "last": float(data.get("lastPrice", 0)),
+                        "bid": float(data.get("bidPrice", 0)),
+                        "ask": float(data.get("askPrice", 0)),
+                        "high": float(data.get("highPrice", 0)),
+                        "low": float(data.get("lowPrice", 0)),
+                        "volume": float(data.get("volume", 0)),
+                        "quoteVolume": float(data.get("quoteVolume", 0)),
+                        "change": float(data.get("priceChange", 0)),
+                        "percentage": float(data.get("priceChangePercent", 0)),
+                        "timestamp": int(data.get("closeTime", 0)),
+                    }
 
-                # Cache it for future use
-                async with self._lock:
-                    self._ticker_cache[s] = t
+                    # Cache it for future use
+                    async with self._lock:
+                        self._ticker_cache[s] = t
 
         except (RateLimitedError, CircuitOpenError) as e:
             async with self._lock:
@@ -527,7 +542,16 @@ class LiveMarketDataService:
             else:
                 logger.warning("Rate limited getting ticker for %s: %s", s, e)
                 return None
-        except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError) as e:
+        except (
+            ValueError,
+            TypeError,
+            AttributeError,
+            KeyError,
+            IndexError,
+            RuntimeError,
+            OSError,
+            httpx.HTTPError,
+        ) as e:
             logger.debug(f"Failed to get ticker for {s}: {e}")
             return None
 
@@ -735,10 +759,24 @@ class LiveMarketDataService:
             return {
                 "bids": ob.get("bids", [])[:limit],
                 "asks": ob.get("asks", [])[:limit],
+                "fetch_failed": False,
             }
-        except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError) as e:
+        except (
+            ValueError,
+            TypeError,
+            AttributeError,
+            KeyError,
+            IndexError,
+            RuntimeError,
+            OSError,
+            ccxt.BaseError,
+        ) as e:
             logger.exception(f"order_book failed {s}: {e}")
-            return {"bids": [], "asks": []}
+            # Explicit failure marker (item p25) — empty bids/asks alone is
+            # indistinguishable from a genuinely empty book; callers that care
+            # about the difference should check `fetch_failed` rather than
+            # inferring failure from emptiness.
+            return {"bids": [], "asks": [], "fetch_failed": True, "error": str(e)}
 
     async def get_historical_data(self, symbol: str, timeframe: str = "1m", limit: int = 300) -> dict[str, Any]:
         s = _to_ccxt_symbol(symbol)

@@ -69,10 +69,7 @@ def purge_closed_scalp_positions(
 def reconcile_scalp_ledger_equity(db_path: str) -> dict[str, Any]:
     """Heal scalp ledger from closed trades when flat; always align total_equity."""
     with connect_rw(db_path) as conn:
-        row = conn.execute(
-            "SELECT principal, cash_balance, positions_value, realized_pnl, total_equity "
-            "FROM scalp_paper_ledger WHERE id=1"
-        ).fetchone()
+        row = conn.execute("SELECT principal, cash_balance, positions_value, realized_pnl, total_equity FROM scalp_paper_ledger WHERE id=1").fetchone()
         if not row:
             return {"skipped": True, "reason": "no_ledger_row"}
         principal = float(row[0] or 0)
@@ -81,12 +78,7 @@ def reconcile_scalp_ledger_equity(db_path: str) -> dict[str, Any]:
         realized = float(row[3] or 0)
         equity = float(row[4] or 0)
         open_n = int(conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0] or 0)
-        sell_pnl = float(
-            conn.execute(
-                "SELECT COALESCE(SUM(pnl_usd), 0) FROM scalp_paper_trades WHERE UPPER(side)='SELL'"
-            ).fetchone()[0]
-            or 0.0
-        )
+        sell_pnl = float(conn.execute("SELECT COALESCE(SUM(pnl_usd), 0) FROM scalp_paper_trades WHERE UPPER(side)='SELL'").fetchone()[0] or 0.0)
         out: dict[str, Any] = {"open_positions": open_n, "sell_pnl": sell_pnl}
         if open_n == 0 and principal > 0:
             expected_cash = principal + sell_pnl

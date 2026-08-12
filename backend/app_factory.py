@@ -251,11 +251,6 @@ except (ImportError, ModuleNotFoundError, AttributeError, ValueError, TypeError,
     live_market_data_service = None  # type: ignore[assignment, misc]
 
 try:
-    from backend.services.realtime_model_trainer import RealTimeModelTrainer
-except (ImportError, ModuleNotFoundError, AttributeError, ValueError, TypeError, RuntimeError):
-    RealTimeModelTrainer = None  # type: ignore[assignment, misc]
-
-try:
     from backend.services.ai_continuous_learner import ContinuousLearner
 except (ImportError, ModuleNotFoundError, AttributeError, ValueError, TypeError, RuntimeError):
     ContinuousLearner = None  # type: ignore[assignment, misc]
@@ -571,6 +566,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("[LIFESPAN] VolumeProfileService start failed: %s", e)
 
+    # AggTrade collector: feeds real aggressor buy/sell volume into the
+    # microstructure engine (backend.services.microstructure_engine).
+    # Ranking/EV input only — never a trade gate.
+    try:
+        from backend.services.agg_trade_collector import agg_trade_collector
+
+        await agg_trade_collector.start()
+        logger.info("[LIFESPAN] AggTradeCollector started - real aggressor buy/sell volume feeding microstructure_engine")
+    except Exception as e:
+        logger.warning("[LIFESPAN] AggTradeCollector start failed: %s", e)
+
     # ----------------------------------------------------------------
     # Single-process production: embed DAY context + ML training + signals
     # (when EXTERNAL_SUPERVISOR_MODE=false this process owns supervision).
@@ -844,10 +850,7 @@ def create_app() -> FastAPI:
 
     # Add CORS middleware if configured; default to allow all during development
     try:
-        _raw_origins = (
-            getattr(settings, "ui_origins", None)
-            or getattr(settings, "allowed_origins", None)
-        )
+        _raw_origins = getattr(settings, "ui_origins", None) or getattr(settings, "allowed_origins", None)
         if _raw_origins:
             origins: list[str] = [str(x) for x in _raw_origins] if isinstance(_raw_origins, (list, tuple)) else [str(_raw_origins)]  # type: ignore[misc]
         else:
@@ -1114,6 +1117,7 @@ def create_app() -> FastAPI:
         Returns immediately; the subprocess runs detached so this response can be delivered.
         """
         import subprocess
+
         repo_root = Path(__file__).resolve().parent.parent
         script = str(repo_root / "stop_mystic.sh")
         start_script = str(repo_root / "start_mystic.sh")

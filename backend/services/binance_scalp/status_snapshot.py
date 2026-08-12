@@ -546,11 +546,7 @@ def _evaluate_strategy_router(
                 "tie_margin": _rank_tie_margin(),
                 "rank_floor": _min_tradeable_score(),
                 "min_confident_rank": _min_confident_rank(),
-                "final_below_floor_reason": (
-                    None
-                    if globally_selected
-                    else row.get("hard_block") or row.get("soft_reason") or "GLOBAL_CONFIDENCE_OR_TIE_GATE"
-                ),
+                "final_below_floor_reason": (None if globally_selected else row.get("hard_block") or row.get("soft_reason") or "GLOBAL_CONFIDENCE_OR_TIE_GATE"),
             }
         )
 
@@ -558,11 +554,7 @@ def _evaluate_strategy_router(
     inventory = router.strategy_inventory()
     selected = next((r for r in ranked_entries if r.get("globally_selected")), None)
     rank_leader = ranked_entries[0] if ranked_entries else None
-    global_hard_block = None if selected else (
-        (rank_leader or {}).get("hard_block")
-        or (rank_leader or {}).get("soft_reason")
-        or ("RANK_LOW_CONFIDENCE_TIE" if ranked_entries else "NO_CANDIDATES")
-    )
+    global_hard_block = None if selected else ((rank_leader or {}).get("hard_block") or (rank_leader or {}).get("soft_reason") or ("RANK_LOW_CONFIDENCE_TIE" if ranked_entries else "NO_CANDIDATES"))
 
     return {
         "inventory": inventory,

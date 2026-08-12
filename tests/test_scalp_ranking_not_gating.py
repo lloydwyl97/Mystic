@@ -1,0 +1,234 @@
+"""Architecture v2 (2026-08-11): SCALP is a ranking/EV engine, not a permission bot.
+
+These tests assert the specific rule from the directive: opinion-style
+evidence (a strategy's own sig.passed, regime mismatch, symbol-level
+historical stall risk, per-arm negative EV, MTF trend disagreement) may only
+move rank_score / confidence / size. Only mechanical safety conditions
+(stale/bad data, excessive spread/impact, no executable net edge, duplicate
+position, max-open/exposure, exchange failure) may set entry_eligible=False.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+from backend.services.binance_scalp.config import get_scalp_config
+from backend.services.binance_scalp.economics import ScalpEconomics
+from backend.services.binance_scalp.scalp_candidate_ranking import (
+    prepare_entry_signal,
+    rank_setup_signal,
+)
+from backend.services.binance_scalp.scalp_dynamic_sizing import compute_scalp_position_size
+from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, StrategyMarketContext
+
+
+def _ctx(*, spread: float = 0.0002, mid_change_15s: float = 0.0) -> StrategyMarketContext:
+    econ = ScalpEconomics.from_env()
+    config = get_scalp_config()
+    snap = SimpleNamespace(
+        symbol="ETHUSDT",
+        spread_pct=spread,
+        best_ask=100.0,
+        best_bid=99.98,
+        mid=100.0,
+        asks=[[100.0, 1000.0]],
+    )
+    mom = SimpleNamespace(
+        mid_change_15s=mid_change_15s,
+        mid_change_30s=mid_change_15s,
+        bid_change_15s=mid_change_15s,
+        momentum_confirmed=False,
+    )
+    return StrategyMarketContext(
+        symbol="ETHUSDT",
+        snap=snap,
+        mom=mom,
+        bars_1m=[{"low": 99.5, "high": 100.5, "close": 100.0}] * 15,
+        econ=econ,
+        config=config,
+        notional_usd=25.0,
+    )
+
+
+def _reachable_soft_sig(reason: str = "NOT_NEAR_SUPPORT", symbol: str = "ETHUSDT") -> ScalpSetupSignal:
+    """A strategy-rejected setup whose expected move comfortably clears net
+    edge — i.e. the only reason it isn't executable under the old regime is
+    the strategy's own opinion, not economics."""
+    return ScalpSetupSignal(
+        symbol=symbol,
+        side="BUY",
+        score=0.0,
+        setup_name="range_bounce_scalp",
+        confidence=0.4,
+        entry_reason="",
+        invalidation_reason=None,
+        required_target_pct=0.0025,
+        expected_move_pct=0.006,
+        spread_pct=0.0002,
+        impact_pct=0.0,
+        depth_sufficient=True,
+        limit_buy_price=100.0,
+        passed=False,
+        reject_reason=reason,
+    )
+
+
+def test_soft_reject_with_real_net_edge_is_entry_eligible():
+    """A strategy-opinion reject (NOT_NEAR_SUPPORT) with a genuinely
+    executable net edge must NOT be hard-blocked — only mechanical safety
+    can do that."""
+    ranked = rank_setup_signal(_reachable_soft_sig(), regime="range", ctx=_ctx())
+    assert ranked.hard_block is None
+    assert ranked.entry_eligible is True
+    assert ranked.rank_score > 0.0
+
+
+def test_regime_mismatch_never_blocks_entry_eligible():
+    with mock.patch.dict(os.environ, {"SCALP_REQUIRE_REGIME_NATIVE": "true"}):
+        ranked = rank_setup_signal(_reachable_soft_sig(), regime="trend_up", ctx=_ctx())
+    assert ranked.hard_block is None
+    assert ranked.entry_eligible is True
+    assert ranked.regime_mismatch is True
+    assert "regime_mismatch" in ranked.selection_confidence
+
+
+def test_symbol_stall_risk_never_blocks_entry_eligible_but_penalizes_score():
+    ctx = _ctx()
+    with mock.patch.dict(os.environ, {"SCALP_STALL_RISK_SYMBOL_GATE_ENABLED": "true", "SCALP_STALL_RISK_SYMBOL_BLOCKLIST": "ETHUSDT"}):
+        blocked_symbol = rank_setup_signal(_reachable_soft_sig(symbol="ETHUSDT"), regime="range", ctx=ctx)
+        clear_symbol = rank_setup_signal(_reachable_soft_sig(symbol="BTCUSDT"), regime="range", ctx=_ctx())
+    assert blocked_symbol.entry_eligible is True
+    assert blocked_symbol.symbol_stall_risk is True
+    # Same setup/context otherwise — ETHUSDT must rank strictly lower than an
+    # identical BTCUSDT candidate because of the stall-risk penalty.
+    assert blocked_symbol.rank_score < clear_symbol.rank_score
+
+
+def test_arm_negative_ev_never_blocks_entry_eligible():
+    with mock.patch(
+        "backend.services.binance_scalp.scalp_arm_blocker.arm_blocked",
+        return_value=(True, "NEGATIVE_EV_ARM", {"sample_count": 40, "win_rate": 0.1}),
+    ):
+        ranked = rank_setup_signal(_reachable_soft_sig(), regime="range", ctx=_ctx())
+    assert ranked.hard_block is None
+    assert ranked.entry_eligible is True
+    assert ranked.arm_penalty_mult < 1.0
+
+
+def test_prepare_entry_signal_promotes_soft_rank_with_honest_provenance():
+    ranked = rank_setup_signal(_reachable_soft_sig(), regime="range", ctx=_ctx())
+    assert ranked.entry_eligible is True
+    sig = prepare_entry_signal(ranked, _ctx())
+    assert sig.passed is False  # never forged
+    assert sig.setup_context["soft_rank_entry"] is True
+    assert sig.setup_context["entry_owner"] == "ranking_ev"
+
+
+def test_prepare_entry_signal_stamps_strategy_owner_for_genuine_pass():
+    passed_sig = ScalpSetupSignal(
+        symbol="BTCUSDT",
+        side="BUY",
+        score=2.6,
+        setup_name="range_bounce_scalp",
+        confidence=0.7,
+        entry_reason="support_bounce",
+        invalidation_reason="support_break",
+        required_target_pct=0.0025,
+        expected_move_pct=0.0035,
+        spread_pct=0.0002,
+        impact_pct=0.0,
+        depth_sufficient=True,
+        limit_buy_price=100.0,
+        passed=True,
+        reject_reason=None,
+    )
+    ranked = rank_setup_signal(passed_sig, regime="range", ctx=_ctx())
+    sig = prepare_entry_signal(ranked, _ctx())
+    assert sig.setup_context["entry_owner"] == "strategy"
+    assert sig.setup_context["soft_rank_entry"] is False
+
+
+def test_hard_safety_reasons_still_block_entry_eligible():
+    """Mechanical safety must still block — this is the one form of gate the
+    architecture explicitly keeps."""
+    sig = ScalpSetupSignal(
+        symbol="ETHUSDT",
+        side="BUY",
+        score=0.0,
+        setup_name="range_bounce_scalp",
+        confidence=0.0,
+        entry_reason="",
+        invalidation_reason=None,
+        required_target_pct=0.0025,
+        expected_move_pct=0.0,
+        spread_pct=0.02,
+        impact_pct=0.0,
+        depth_sufficient=True,
+        limit_buy_price=100.0,
+        passed=False,
+        reject_reason="NOT_NEAR_SUPPORT",
+    )
+    ranked = rank_setup_signal(sig, regime="range", ctx=_ctx(spread=0.02))
+    assert ranked.entry_eligible is False
+    assert ranked.hard_block == "SPREAD_TOO_WIDE"
+
+
+def test_dynamic_sizing_genuine_pass_sizes_larger_than_soft_rank():
+    passed = compute_scalp_position_size(
+        base_cap=100.0,
+        free_cash=1000.0,
+        strategy_passed=True,
+    )
+    soft = compute_scalp_position_size(
+        base_cap=100.0,
+        free_cash=1000.0,
+        strategy_passed=False,
+    )
+    assert passed.notional > soft.notional
+    assert soft.notional > 0.0  # never fully refused
+
+
+def test_dynamic_sizing_never_exceeds_base_cap_or_free_cash():
+    result = compute_scalp_position_size(
+        base_cap=100.0,
+        free_cash=40.0,
+        strategy_passed=True,
+    )
+    assert result.notional <= 40.0
+    assert result.notional <= 100.0
+
+
+def test_dynamic_sizing_stall_risk_and_regime_mismatch_compound_discount():
+    clean = compute_scalp_position_size(base_cap=100.0, free_cash=1000.0, strategy_passed=True)
+    conflicted = compute_scalp_position_size(
+        base_cap=100.0,
+        free_cash=1000.0,
+        strategy_passed=True,
+        regime_mismatch=True,
+        symbol_stall_risk=True,
+        arm_penalty_mult=0.20,
+        mtf_penalty_mult=0.40,
+    )
+    assert conflicted.notional < clean.notional
+    assert conflicted.notional > 0.0
+
+
+def test_dynamic_sizing_respects_min_floor():
+    result = compute_scalp_position_size(
+        base_cap=100.0,
+        free_cash=1000.0,
+        min_notional=5.0,
+        strategy_passed=False,
+        regime_mismatch=True,
+        symbol_stall_risk=True,
+        arm_penalty_mult=0.2,
+        mtf_penalty_mult=0.2,
+    )
+    assert result.notional >= 5.0

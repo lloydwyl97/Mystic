@@ -120,9 +120,5 @@ def test_apply_liquidity_gate_size_and_rank_compound():
     }
     out = apply_liquidity_gate_to_decision_data(dd, "ETH/USDT")
     liq_size = float(out["liquidity_quality_size_factor"])
-    assert out["thesis_size_factor"] == pytest.approx(
-        max(SIZE_FACTOR_AT_ZERO, 0.80 * liq_size), rel=1e-4
-    )
-    assert out["thesis_rank_delta"] == pytest.approx(
-        -0.03 + float(out["liquidity_quality_rank_delta"]), rel=1e-4
-    )
+    assert out["thesis_size_factor"] == pytest.approx(max(SIZE_FACTOR_AT_ZERO, 0.80 * liq_size), rel=1e-4)
+    assert out["thesis_rank_delta"] == pytest.approx(-0.03 + float(out["liquidity_quality_rank_delta"]), rel=1e-4)

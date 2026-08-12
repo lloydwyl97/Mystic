@@ -168,13 +168,9 @@ def record_outcome_training_row(
         sym = _normalize_symbol(symbol)
         ex = dict(explainability or {})
         identity = resolve_setup_identity(ex)
-        exit_parts = split_day_exit_reasons(
-            str(ex.get("raw_exit_reason") or ex.get("exit_trigger") or close_reason or "")
-        )
+        exit_parts = split_day_exit_reasons(str(ex.get("raw_exit_reason") or ex.get("exit_trigger") or close_reason or ""))
         raw_exit = str(ex.get("raw_exit_reason") or exit_parts["raw_exit_reason"] or close_reason or "")
-        canonical_exit = str(
-            ex.get("canonical_exit_reason") or exit_parts["canonical_exit_reason"] or close_reason or ""
-        )
+        canonical_exit = str(ex.get("canonical_exit_reason") or exit_parts["canonical_exit_reason"] or close_reason or "")
         # Classify using raw stall detail when present (DEAD still counts as STALL_LOSS).
         gb, ol, oc = classify_outcome_label(
             close_reason=raw_exit or close_reason,
@@ -285,11 +281,7 @@ def record_outcome_training_row(
             cols = {r[1] for r in conn.execute("PRAGMA table_info(ai_outcome_training_rows)").fetchall()}
             insert_cols = [c for c in values if c in cols]
             placeholders = ", ".join("?" for _ in insert_cols)
-            update_cols = [
-                c
-                for c in insert_cols
-                if c not in ("symbol", "opened_at_utc", "closed_at_utc")
-            ]
+            update_cols = [c for c in insert_cols if c not in ("symbol", "opened_at_utc", "closed_at_utc")]
             # Prefer excluded values for MFE/MAE/score so repairs overwrite NULLs.
             set_parts = []
             for c in update_cols:
@@ -297,12 +289,7 @@ def record_outcome_training_row(
                     set_parts.append(f"{c}=COALESCE(excluded.{c}, ai_outcome_training_rows.{c})")
                 else:
                     set_parts.append(f"{c}=excluded.{c}")
-            sql = (
-                f"INSERT INTO ai_outcome_training_rows ({', '.join(insert_cols)}) "
-                f"VALUES ({placeholders}) "
-                f"ON CONFLICT(symbol, opened_at_utc, closed_at_utc) DO UPDATE SET "
-                + ", ".join(set_parts)
-            )
+            sql = f"INSERT INTO ai_outcome_training_rows ({', '.join(insert_cols)}) VALUES ({placeholders}) ON CONFLICT(symbol, opened_at_utc, closed_at_utc) DO UPDATE SET " + ", ".join(set_parts)
             cur = conn.execute(sql, tuple(values[c] for c in insert_cols))
             _propagate_symbol_strategy_expectancy(conn, sym, strategy_id or "day")
             conn.commit()

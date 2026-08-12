@@ -66,16 +66,8 @@ def _round_trip_execution_costs(
     persisted_entry_fee: float | None = None,
     persisted_entry_slippage: float | None = None,
 ) -> tuple[float, float]:
-    entry_fee = (
-        float(persisted_entry_fee)
-        if persisted_entry_fee is not None
-        else entry_notional * econ.taker_fee_pct
-    )
-    entry_slippage = (
-        float(persisted_entry_slippage)
-        if persisted_entry_slippage is not None
-        else entry_notional * econ.slippage_buffer_pct
-    )
+    entry_fee = float(persisted_entry_fee) if persisted_entry_fee is not None else entry_notional * econ.taker_fee_pct
+    entry_slippage = float(persisted_entry_slippage) if persisted_entry_slippage is not None else entry_notional * econ.slippage_buffer_pct
     fees = entry_fee + exit_notional * econ.taker_fee_pct
     slippage = entry_slippage + exit_notional * econ.slippage_buffer_pct
     return fees, slippage
@@ -330,18 +322,18 @@ class BinanceScalpPaperEngine:
 
             rs_raw = self._redis.get(runner_state_key(self.config.redis_key_prefix))
             ld_raw = self._redis.get(last_decision_key(self.config.redis_key_prefix))
-            runner_state = json.loads(rs_raw) if rs_raw else {
-                "updated_at_epoch": epoch,
-                "operational_mode": (
-                    "max_open_positions_reached"
-                    if entry_blocked_reason == "MAX_OPEN_POSITIONS"
-                    else "entry_scan_active"
-                ),
-                "open_count": open_count,
-                "max_open_positions": int(self.config.max_open_positions),
-                "open_symbols": open_syms,
-                "entry_blocked_reason": entry_blocked_reason,
-            }
+            runner_state = (
+                json.loads(rs_raw)
+                if rs_raw
+                else {
+                    "updated_at_epoch": epoch,
+                    "operational_mode": ("max_open_positions_reached" if entry_blocked_reason == "MAX_OPEN_POSITIONS" else "entry_scan_active"),
+                    "open_count": open_count,
+                    "max_open_positions": int(self.config.max_open_positions),
+                    "open_symbols": open_syms,
+                    "entry_blocked_reason": entry_blocked_reason,
+                }
+            )
             if isinstance(runner_state, dict):
                 runner_state = dict(runner_state)
                 runner_state["updated_at_epoch"] = epoch
@@ -402,9 +394,7 @@ class BinanceScalpPaperEngine:
                             touch_rolling_telemetry_heartbeat,
                         )
 
-                        touch_rolling_telemetry_heartbeat(
-                            self._redis, prefix=self.config.redis_key_prefix
-                        )
+                        touch_rolling_telemetry_heartbeat(self._redis, prefix=self.config.redis_key_prefix)
                 except Exception as exc:
                     logger.debug("SCALP_STATUS_HEARTBEAT_SKIPPED %s", exc)
                 for _ in range(int(max(5.0, interval_sec) * 10)):
@@ -412,9 +402,7 @@ class BinanceScalpPaperEngine:
                         break
                     time.sleep(0.1)
 
-        self._heartbeat_thread = threading.Thread(
-            target=_loop, name="scalp-status-heartbeat", daemon=True
-        )
+        self._heartbeat_thread = threading.Thread(target=_loop, name="scalp-status-heartbeat", daemon=True)
         self._heartbeat_thread.start()
 
     def _publish_runner_state(
@@ -746,20 +734,25 @@ class BinanceScalpPaperEngine:
             return []
         sym, snap, sig = best["symbol"], best["snap"], best["signal"]
         ranked_summary = [{"symbol": r["symbol"], "rank_score": r.get("rank_score"), "entry_eligible": r.get("entry_eligible"), "hard_block": r.get("hard_block")} for r in ranked]
-        if not getattr(sig, "passed", False):
+        # Architecture v2 (2026-08-11): sig.passed is no longer a promotion
+        # requirement here — pick_best_global_candidate() already only
+        # returns candidates with entry_eligible=True, meaning every
+        # mechanical safety hard_block (stale data, bad spread/impact, no
+        # net edge, duplicate position, exposure cap) already cleared for
+        # this candidate. A strategy-rejected (soft-rank) pick is executable;
+        # scalp_dynamic_sizing.py is what protects capital on it, not a
+        # second permission check here.
+        if not bool(best.get("entry_eligible")):
             self._record_reject(
                 conn,
                 sym,
                 "BUY",
-                "RANKED_NOT_EXECUTABLE",
+                best.get("hard_block") or "RANKED_NOT_ELIGIBLE",
                 json.dumps({"setup": sig.as_dict(), "rank_score": best.get("rank_score")}),
             )
-            # The top-ranked candidate itself failed its preflight (spread/impact/
-            # net-edge/depth) — a genuine operational failure for this attempt,
-            # not an ordinary "nothing ranked" outcome.
             self._publish_last_decision(
                 decision="BLOCKED",
-                reason="RANKED_NOT_EXECUTABLE",
+                reason=str(best.get("hard_block") or "RANKED_NOT_ELIGIBLE"),
                 selected_symbol=sym,
                 rank_score=best.get("rank_score"),
                 entry_armed=self._entry_armed_ok(),
@@ -837,24 +830,10 @@ class BinanceScalpPaperEngine:
             return
 
         sym, snap, sig = candidates[0]
-        # Authority: never fill soft-rank or non-passed setups (scalp_strategy_owner_v1).
-        soft_rank_entry = bool((sig.setup_context or {}).get("soft_rank_entry", False))
-        if soft_rank_entry or not bool(sig.passed):
-            self._record_reject(
-                conn,
-                sym,
-                "BUY",
-                "SOFT_RANK_PROMOTION_BLOCKED",
-                json.dumps({"passed": bool(sig.passed), "soft_rank_entry": soft_rank_entry, "setup": sig.setup_name}),
-            )
-            self._record_gate(
-                gate_id="SOFT_RANK_BLOCKED",
-                symbol=sym,
-                setup=sig.setup_name,
-                entry_price=float(getattr(sig, "limit_buy_price", 0.0) or 0.0),
-                detail="execute_path_authority_block",
-            )
-            return
+        # Architecture v2 (2026-08-11): entry_eligible (mechanical hard_block
+        # only) already gated this candidate in _entry_candidates(). A
+        # soft-rank / opinion-conflicted pick is executable — it must size
+        # small via scalp_dynamic_sizing.py below, not be refused here.
 
         if sym.upper() in self._entry_reservations:
             self._record_reject(conn, sym, "BUY", "ENTRY_RESERVED", json.dumps({"symbol": sym}))
@@ -870,11 +849,57 @@ class BinanceScalpPaperEngine:
         ledger = self._ledger(conn)
         reserved_n = sum(float((r or {}).get("notional") or 0.0) for r in self._entry_reservations.values())
         free_cash = float(ledger["cash_balance"]) - reserved_n
-        # Per-symbol caps (e.g. SOLUSDT:50) cut concentration without blocking samples.
-        notional = min(self.config.notional_cap_for_symbol(sym), free_cash)
-        if notional < 1.0:
+        # Per-symbol caps (e.g. SOLUSDT:50) remain the mechanical exposure
+        # ceiling. scalp_dynamic_sizing.py scales *down* from this ceiling
+        # using confidence/arm/MTF/regime/volatility/liquidity evidence —
+        # it never raises above it and never re-blocks the trade.
+        base_cap = min(self.config.notional_cap_for_symbol(sym), free_cash)
+        if base_cap < 1.0:
             self._record_reject(conn, sym, "BUY", "INSUFFICIENT_CASH", f"cash={ledger['cash_balance']} reserved={reserved_n}")
             return
+
+        ranking_meta_for_size = getattr(self, "_last_ranking_meta", {}) or {}
+        try:
+            _, epoch_for_size = self._now()
+            realized_vol = self._momentum.diagnostics(sym, epoch_for_size, snap.best_bid, snap.mid).realized_volatility_pct
+        except Exception:
+            realized_vol = None
+        from backend.services.binance_scalp.scalp_dynamic_sizing import compute_scalp_position_size
+
+        try:
+            from backend.services.ai_calibration_tracker import calibration_confidence_multiplier
+
+            cal_mult, _cal_reason = calibration_confidence_multiplier(sym)
+        except Exception:
+            cal_mult = 1.0
+
+        sizing = compute_scalp_position_size(
+            base_cap=base_cap,
+            free_cash=free_cash,
+            min_notional=5.0,
+            strategy_passed=bool(getattr(sig, "passed", False)),
+            arm_penalty_mult=float(ranking_meta_for_size.get("arm_penalty_mult", 1.0) or 1.0),
+            mtf_penalty_mult=float(ranking_meta_for_size.get("mtf_penalty_mult", 1.0) or 1.0),
+            regime_mismatch=bool(ranking_meta_for_size.get("regime_mismatch", False)),
+            symbol_stall_risk=bool(ranking_meta_for_size.get("symbol_stall_risk", False)),
+            spread_pct=float(getattr(sig, "spread_pct", 0.0) or 0.0),
+            impact_pct=float(getattr(sig, "impact_pct", 0.0) or 0.0),
+            realized_volatility_pct=realized_vol,
+            calibration_mult=cal_mult,
+        )
+        notional = sizing.notional
+        if notional < 1.0:
+            self._record_reject(conn, sym, "BUY", "INSUFFICIENT_CASH", f"cash={ledger['cash_balance']} reserved={reserved_n} sizing={sizing.reasoning}")
+            return
+        with contextlib.suppress(Exception):
+            self._record_gate(
+                gate_id="DYNAMIC_SIZE_APPLIED",
+                symbol=sym,
+                outcome="ranked",
+                setup=sig.setup_name,
+                entry_price=float(getattr(sig, "limit_buy_price", 0.0) or 0.0),
+                detail=sizing.reasoning,
+            )
 
         limit_buy = sig.limit_buy_price
         qty = notional / limit_buy
@@ -892,29 +917,31 @@ class BinanceScalpPaperEngine:
         from backend.services.day_trade_thesis import scalp_strategy_to_thesis
 
         thesis_fields = scalp_strategy_to_thesis(sig.setup_name, sig.setup_context or {})
-        soft_rank_entry = False
+        strategy_passed = bool(getattr(sig, "passed", False))
+        soft_rank_entry = bool((sig.setup_context or {}).get("soft_rank_entry", not strategy_passed))
         entry_diag = {
             "setup_name": sig.setup_name,
             "setup_context": sig.setup_context,
             "setup_signal": sig.as_dict(),
-            "passed": True,
-            "soft_rank_entry": False,
+            "passed": strategy_passed,
+            "soft_rank_entry": soft_rank_entry,
             "entry_eligible": True,
-            "entry_owner": "strategy",
+            "entry_owner": "strategy" if strategy_passed else "ranking_ev",
             "ml_role": "rank_size",
-            "decision_policy_version": "scalp_strategy_owner_v1",
+            "decision_policy_version": "scalp_ranking_not_gating_v2",
             "bar_closed": True,
             "selected_symbol": sym,
             "symbol_ranking": ranking_meta,
             # Top-level rank_score for learning writer (not only nested under symbol_ranking).
-            "rank_score": ranking_meta.get("rank_score")
-            if ranking_meta.get("rank_score") is not None
-            else ranking_meta.get("best_rank_score"),
+            "rank_score": ranking_meta.get("rank_score") if ranking_meta.get("rank_score") is not None else ranking_meta.get("best_rank_score"),
             "selection_confidence": ranking_meta.get("selection_confidence"),
             "review_lows": [],
             "session_low_bid": limit_buy,
             "entry_time": ts,
             "spread_at_entry": float(snap.spread_pct),
+            "dynamic_sizing": sizing.reasoning,
+            "dynamic_sizing_multiplier": sizing.combined_multiplier,
+            "base_cap": base_cap,
             **thesis_fields,
             **entry_intel,
         }
@@ -959,17 +986,18 @@ class BinanceScalpPaperEngine:
                             "setup_signal": sig.as_dict(),
                             "paper_limit": True,
                             "selected_symbol": sym,
-                            "passed": True,
-                            "soft_rank_entry": False,
+                            "passed": strategy_passed,
+                            "soft_rank_entry": soft_rank_entry,
                             "entry_eligible": True,
-                            "entry_owner": "strategy",
+                            "entry_owner": "strategy" if strategy_passed else "ranking_ev",
                             "ml_role": "rank_size",
-                            "decision_policy_version": "scalp_strategy_owner_v1",
+                            "decision_policy_version": "scalp_ranking_not_gating_v2",
                             "bar_closed": True,
                             "setup_name": sig.setup_name,
                             "rank_score": ranking_meta.get("rank_score"),
                             "selection_confidence": ranking_meta.get("selection_confidence"),
                             "context_snapshot_json": _role_ctx_snap,
+                            "dynamic_sizing": sizing.reasoning,
                         }
                     ),
                 ),
@@ -1456,10 +1484,7 @@ class BinanceScalpPaperEngine:
         exit_price = pf.expected_avg_fill if pf.expected_avg_fill > 0 else pf.limit_sell_price
         net_pct = pf.expected_net_edge_pct
         net_usd = (exit_price - entry) * qty - (
-            exit_price * qty * self.econ.taker_fee_pct
-            + exit_price * qty * self.econ.slippage_buffer_pct
-            + entry * qty * self.econ.taker_fee_pct
-            + entry * qty * self.econ.slippage_buffer_pct
+            exit_price * qty * self.econ.taker_fee_pct + exit_price * qty * self.econ.slippage_buffer_pct + entry * qty * self.econ.taker_fee_pct + entry * qty * self.econ.slippage_buffer_pct
         )
         profit_hit = net_pct >= target_pct
         exit_spread_ok = pf.reject_reason != "SPREAD_TOO_WIDE"
@@ -1668,13 +1693,7 @@ class BinanceScalpPaperEngine:
                     with contextlib.suppress(Exception):
                         _ctx_obj = json.loads(_ctx_raw)
                 _sr = _entry_diag.get("symbol_ranking") if isinstance(_entry_diag.get("symbol_ranking"), dict) else {}
-                _entry_score = (
-                    _entry_diag.get("score")
-                    or _entry_diag.get("rank_score")
-                    or _entry_diag.get("selected_score")
-                    or _sr.get("rank_score")
-                    or _sr.get("best_rank_score")
-                )
+                _entry_score = _entry_diag.get("score") or _entry_diag.get("rank_score") or _entry_diag.get("selected_score") or _sr.get("rank_score") or _sr.get("best_rank_score")
                 _rank = {
                     "strategy_id": str(close_payload["row"].get("strategy_id", "")),
                     "setup": str(close_payload["row"].get("strategy_id", "")),
@@ -1759,11 +1778,7 @@ class BinanceScalpPaperEngine:
                     if isinstance(_intel, dict):
                         _regime = str(_intel.get("market_regime") or "unknown")
                 # Prefer BUY trade_id from position row when available
-                _buy_tid = str(
-                    (_row.get("trade_id") if isinstance(_row, dict) else None)
-                    or close_payload.get("trade_id")
-                    or ""
-                )
+                _buy_tid = str((_row.get("trade_id") if isinstance(_row, dict) else None) or close_payload.get("trade_id") or "")
                 _role_learn(
                     self.config.database_path,
                     trade_id=str(close_payload.get("trade_id") or "") + "_sell",

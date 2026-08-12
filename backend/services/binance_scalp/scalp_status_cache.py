@@ -69,9 +69,7 @@ def publish_status_snapshot(payload: dict[str, Any], *, ttl_sec: float | None = 
         store = dict(payload)
         store["_cached_at"] = float(store.get("_cached_at") or now)
         store["updated_at_epoch"] = float(store.get("updated_at_epoch") or store["_cached_at"])
-        store["updated_at"] = store.get("updated_at") or time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(store["updated_at_epoch"])
-        )
+        store["updated_at"] = store.get("updated_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(store["updated_at_epoch"]))
         store["age_seconds"] = 0.0
         store["snapshot_available"] = True
         store["stale"] = False
@@ -214,9 +212,7 @@ def build_runner_api_status_payload(
         "NO_SIGNAL": "NO_SETUP",
         "WAITING": "WAITING",
     }.get(decision, "SCANNING")
-    if rs.get("operational_mode") == "max_open_positions_reached" or open_count > 0 and str(
-        rs.get("entry_blocked_reason") or ""
-    ) == "MAX_OPEN_POSITIONS":
+    if rs.get("operational_mode") == "max_open_positions_reached" or open_count > 0 and str(rs.get("entry_blocked_reason") or "") == "MAX_OPEN_POSITIONS":
         overall = "WAITING_FOR_EXIT"
     top_blocker = str(ld.get("reason") or rs.get("entry_blocked_reason") or "") or None
     open_syms = list(open_symbols or rs.get("open_symbols") or [])
@@ -244,9 +240,7 @@ def build_runner_api_status_payload(
         "runner_state": rs,
         "entry_armed": bool(entry_armed),
         "open_scalp_positions": int(open_count),
-        "open_positions_summary": [
-            {"symbol": s, "status": "OPEN"} for s in open_syms
-        ],
+        "open_positions_summary": [{"symbol": s, "status": "OPEN"} for s in open_syms],
         "last_fill": last_fill,
         "scalp_engaged": True,
         "scalp_live": bool(scalp_live),

@@ -41,9 +41,7 @@ async def test_get_scoreboard_does_not_call_update_or_reconcile(tmp_path: Path, 
     fifo_spy = MagicMock()
     engine.update_scoreboard = update_spy
     engine._sync_paper_fifo_remaining_to_engine_positions_sync = fifo_spy
-    engine.get_scoreboard_today = AsyncMock(
-        return_value={"date": "2026-08-03", "status": "NO_DATA", "trades": 0}
-    )
+    engine.get_scoreboard_today = AsyncMock(return_value={"date": "2026-08-03", "status": "NO_DATA", "trades": 0})
 
     monkeypatch.setattr(portfolio_engine_endpoints, "get_portfolio_engine", lambda: engine)
 

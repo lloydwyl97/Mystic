@@ -94,9 +94,7 @@ def compute_sub_regime(
     drift_10 = _pct(closes[-11], closes[-1]) if n >= 11 else 0.0
     # Recent range vs prior range (expansion detector)
     rng_5 = max(highs[-5:]) - min(lows[-5:]) if n >= 5 else 0.0
-    rng_prev5 = (
-        max(highs[-10:-5]) - min(lows[-10:-5]) if n >= 10 else max(1e-12, rng_5)
-    )
+    rng_prev5 = max(highs[-10:-5]) - min(lows[-10:-5]) if n >= 10 else max(1e-12, rng_5)
     rng_expansion = (rng_5 / rng_prev5) if rng_prev5 > 0 else 1.0
     # Volume expansion
     v_last5 = sum(vols[-5:]) / 5.0
@@ -108,11 +106,7 @@ def compute_sub_regime(
     main_dn = main in ("trending_down", "bear", "downtrend")
 
     # Climax up: strong drift up + massive last-bar vol + rejection wick
-    if (
-        drift_10 > 0.008
-        and recent_last_bar_vol_ratio >= 2.5
-        and upper_wick_pct >= 0.45
-    ):
+    if drift_10 > 0.008 and recent_last_bar_vol_ratio >= 2.5 and upper_wick_pct >= 0.45:
         return {
             "sub_regime": "climax_up",
             "sub_regime_confidence": 0.85,
@@ -121,11 +115,7 @@ def compute_sub_regime(
         }
 
     # Climax down: strong drift down + massive vol + hammer/lower_wick
-    if (
-        drift_10 < -0.008
-        and recent_last_bar_vol_ratio >= 2.5
-        and lower_wick_pct >= 0.45
-    ):
+    if drift_10 < -0.008 and recent_last_bar_vol_ratio >= 2.5 and lower_wick_pct >= 0.45:
         return {
             "sub_regime": "climax_down",
             "sub_regime_confidence": 0.85,
@@ -189,13 +179,10 @@ def compute_sub_regime(
 
     # Normal: agrees with main regime
     if main_up:
-        return {"sub_regime": "normal_up", "sub_regime_confidence": 0.7,
-                "sub_regime_agrees_with_main": 1, "sub_regime_reason": "aligned_up"}
+        return {"sub_regime": "normal_up", "sub_regime_confidence": 0.7, "sub_regime_agrees_with_main": 1, "sub_regime_reason": "aligned_up"}
     if main_dn:
-        return {"sub_regime": "normal_down", "sub_regime_confidence": 0.7,
-                "sub_regime_agrees_with_main": 1, "sub_regime_reason": "aligned_down"}
-    return {"sub_regime": "normal_range", "sub_regime_confidence": 0.6,
-            "sub_regime_agrees_with_main": 1, "sub_regime_reason": "range_or_chop"}
+        return {"sub_regime": "normal_down", "sub_regime_confidence": 0.7, "sub_regime_agrees_with_main": 1, "sub_regime_reason": "aligned_down"}
+    return {"sub_regime": "normal_range", "sub_regime_confidence": 0.6, "sub_regime_agrees_with_main": 1, "sub_regime_reason": "range_or_chop"}
 
 
 __all__ = ["compute_sub_regime", "sub_regime_enabled"]

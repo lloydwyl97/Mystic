@@ -34,6 +34,13 @@ EXIT_FAILED_RECLAIM = "FAILED_RECLAIM_EXIT"
 EXIT_STALL = "STALL_EXIT"
 EXIT_STALL_DEAD = "STALL_EXIT_DEAD_NO_MFE"
 EXIT_GIVEBACK = "GIVEBACK_EXIT"
+EXIT_PROGRESS_DECAY = "PROGRESS_DECAY_EXIT"
+EXIT_ADAPTIVE_LOSS = "ADAPTIVE_LOSS_EXIT"
+
+PROGRESS_DECAY_HOLD_TOO_YOUNG = "PROGRESS_DECAY_HOLD_TOO_YOUNG"
+PROGRESS_DECAY_GREEN = "PROGRESS_DECAY_GREEN"
+PROGRESS_DECAY_NO_ARM_HISTORY = "PROGRESS_DECAY_NO_ARM_HISTORY"
+PROGRESS_DECAY_NORMAL_PACE = "PROGRESS_DECAY_NORMAL_PACE"
 
 # Telemetry hold reasons (action=hold; never force-sell).
 STALL_HOLD_TOO_YOUNG = "STALL_HOLD_TOO_YOUNG"
@@ -86,6 +93,7 @@ ALLOWED_DAY_EXIT_REASONS = frozenset(
         EXIT_STALL,
         EXIT_STALL_DEAD,
         EXIT_GIVEBACK,
+        EXIT_PROGRESS_DECAY,
         EXIT_FAILED_RECLAIM,
         EXIT_EXTREME_PROTECTION,
         EXIT_THESIS_INVALIDATION,
@@ -108,6 +116,7 @@ ENGINE_RISK_EXIT_PREFIXES = (
     EXIT_STALL,
     EXIT_STALL_DEAD,
     EXIT_GIVEBACK,
+    EXIT_PROGRESS_DECAY,
     EXIT_TRAILING_STOP,
     EXIT_THESIS_INVALIDATION,
     EXIT_FAILED_RECLAIM,
@@ -272,6 +281,7 @@ def evaluate_giveback_exit(
     highest_price: float,
     net_pnl_pct: float,
     hold_minutes: float,
+    position: Any = None,
 ) -> dict[str, Any] | None:
     """
     Cut DAY holds that reached meaningful favorable excursion and then reversed
@@ -280,6 +290,22 @@ def evaluate_giveback_exit(
 
     Defaults require ~20m development and a clearer MFE/giveback so 1–3m noise
     does not churn day trades. Exit-only — no entry/ranking changes.
+
+    Adaptive MAE handling (item p7): when `position` is supplied and its
+    (symbol, setup, regime) arm has enough losing-trade history, the arm's
+    own historical MAE-among-losers percentile (day_adaptive_targets.py)
+    replaces the fixed global -0.15% trigger — a "typical" reversal for a
+    volatile arm may be much bigger than -0.15% (fires too eagerly on
+    normal noise), while a calm arm's typical reversal may be much smaller
+    (the fixed trigger waits too long). Falls back to the fixed constant
+    whenever there isn't enough real history.
+
+    HoldEV tightening (item p8 promotion): once the base trigger above is
+    resolved, hold_ev_engine's combined momentum/orderflow/excursion/
+    progress score can shrink (never widen) its magnitude toward breakeven
+    when it already disfavors continuing to hold — see
+    hold_ev_giveback_tighten_factor's docstring. Neutral (no effect) when
+    HoldEV has insufficient data.
     """
     if not _giveback_exit_enabled():
         return None
@@ -293,6 +319,23 @@ def evaluate_giveback_exit(
     if mfe_pct < _giveback_min_mfe_pct():
         return None
     trigger = _giveback_trigger_pnl_pct()
+    trigger_source = "fixed_default"
+    if position is not None:
+        try:
+            from backend.services.day_adaptive_targets import adaptive_giveback_trigger_for_arm
+
+            _adaptive = adaptive_giveback_trigger_for_arm(
+                str(getattr(position, "symbol", "") or ""),
+                str(getattr(position, "entry_thesis", "") or ""),
+                str(getattr(position, "day_route_regime_at_entry", "") or ""),
+            )
+            if _adaptive.get("source") not in ("insufficient_data", "disabled"):
+                trigger = float(_adaptive["trigger_pct"])
+                trigger_source = str(_adaptive["source"])
+        except Exception:
+            pass
+    hev_factor, hev_detail = _hold_ev_tighten(position, entry_price=entry, net_pnl_pct=net_pnl_pct, hold_minutes=hold_minutes)
+    trigger *= hev_factor
     if net_pnl_pct + 1e-12 > trigger:
         return None
     return {
@@ -300,8 +343,197 @@ def evaluate_giveback_exit(
         "reason": EXIT_GIVEBACK,
         "net_pnl_pct": net_pnl_pct,
         "hold_minutes": hold_minutes,
-        "detail": f"mfe={mfe_pct:.6f} trigger={trigger:.6f}",
+        "detail": f"mfe={mfe_pct:.6f} trigger={trigger:.6f} trigger_source={trigger_source} {hev_detail}",
     }
+
+
+def _hold_ev_tighten(position: Any, *, entry_price: float, net_pnl_pct: float, hold_minutes: float) -> tuple[float, str]:
+    """Shared helper: best-effort HoldEV giveback-tighten factor + detail
+    string. Returns (1.0, "hev=unavailable") on any failure or missing
+    position — always neutral, never blocks the caller."""
+    if position is None or entry_price <= 0:
+        return 1.0, "hev=unavailable"
+    try:
+        from backend.services.hold_ev_engine import hold_ev_for_position, hold_ev_giveback_tighten_factor
+
+        approx_current = entry_price * (1.0 + float(net_pnl_pct or 0.0))
+        _hev = hold_ev_for_position(position, current_price=approx_current, hold_minutes=hold_minutes)
+        factor = hold_ev_giveback_tighten_factor(_hev.hold_ev_score, _hev.confidence)
+        return factor, f"hev_score={_hev.hold_ev_score:.3f} hev_factor={factor:.3f}"
+    except Exception:
+        return 1.0, "hev=unavailable"
+
+
+def _adaptive_loss_exit_enabled() -> bool:
+    return os.getenv("DAY_ADAPTIVE_LOSS_EXIT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _adaptive_loss_min_hold_min() -> float:
+    # Avoid 1-2 minute entry noise; require the position to have had a real
+    # chance to move before treating adverse excursion as informative.
+    return float(os.getenv("DAY_ADAPTIVE_LOSS_MIN_HOLD_MIN", "10"))
+
+
+def evaluate_adaptive_loss_exit(
+    *,
+    entry_price: float,
+    net_pnl_pct: float,
+    hold_minutes: float,
+    position: Any = None,
+) -> dict[str, Any] | None:
+    """Item p7 gap-closure: adaptive MAE-distribution-informed early exit for
+    STRAIGHT losers — positions that go against entry WITHOUT ever building
+    the meaningful favorable excursion that ``evaluate_giveback_exit``
+    requires (its ``mfe_pct >= _giveback_min_mfe_pct()`` gate). Before this,
+    a straight loser had NO adaptive MAE check at all between entry and the
+    fixed per-coin ``stop_price``/``thesis_invalid_level`` (~1% typical) —
+    the fixed stop was the only signal, contrary to item 7's intent that
+    the distribution/EV-based normalcy check become PRIMARY for loss
+    handling, with only the catastrophic hard stop remaining fixed.
+
+    When the (symbol, setup, regime) arm has enough real LOSING-trade
+    history, an adverse excursion beyond the arm's own losing-MAE
+    percentile (default p75 — "worse than 75% of this arm's own historical
+    losers already were") is treated as abnormal for this specific arm and
+    exited early. This can only ever fire EARLIER/TIGHTER than the fixed
+    stop_loss (never wider) — the fixed stop_loss and catastrophic extreme
+    protection remain fully in place downstream as the mechanical backstop
+    regardless of this check's outcome, and this check itself never
+    overrides them, only pre-empts them when the arm's own real data says
+    the current excursion is already abnormal.
+
+    Honest fallback: with no position, insufficient arm history, or a
+    cross-symbol-only pool, returns None — no early exit, identical to
+    behavior before this item existed.
+    """
+    if not _adaptive_loss_exit_enabled() or position is None:
+        return None
+    entry = float(entry_price or 0.0)
+    if entry <= 0 or hold_minutes < _adaptive_loss_min_hold_min():
+        return None
+    if net_pnl_pct >= 0.0:
+        return None
+    try:
+        from backend.services.mfe_mae_distribution_learner import get_mae_distribution
+
+        dist = get_mae_distribution(
+            str(getattr(position, "symbol", "") or ""),
+            "day",
+            db_path=_db_path(),
+        )
+    except Exception:
+        return None
+    if dist.confidence_status == "insufficient_data" or dist.stratum_used == "strategy_cross_symbol":
+        return None
+    percentile_key = os.getenv("DAY_ADAPTIVE_LOSS_EXIT_PERCENTILE", "p75")
+    abnormal_mae = float(dist.percentiles.get(percentile_key, 0.0))
+    if abnormal_mae <= 0.0:
+        return None
+    current_mae = max(0.0, -net_pnl_pct)
+    if current_mae + 1e-12 < abnormal_mae:
+        return None
+    return {
+        "action": "sell",
+        "reason": EXIT_ADAPTIVE_LOSS,
+        "net_pnl_pct": net_pnl_pct,
+        "hold_minutes": hold_minutes,
+        "detail": f"mae={current_mae:.6f} abnormal_threshold={abnormal_mae:.6f} stratum={dist.stratum_used} n_obs={dist.n_obs}",
+    }
+
+
+def _progress_decay_enabled() -> bool:
+    return os.getenv("DAY_PROGRESS_DECAY_EXIT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _progress_decay_min_hold_min() -> float:
+    return float(os.getenv("DAY_PROGRESS_DECAY_MIN_HOLD_MIN", "30"))
+
+
+def _progress_decay_min_ratio() -> float:
+    """A position paced below this fraction of its arm's typical
+    same-duration winner MFE pace is "decaying", not just quiet."""
+    return float(os.getenv("DAY_PROGRESS_DECAY_MIN_RATIO", "0.35"))
+
+
+def evaluate_progress_decay_exit(
+    *,
+    entry_price: float,
+    highest_price: float,
+    net_pnl_pct: float,
+    hold_minutes: float,
+    position: Any = None,
+) -> dict[str, Any] | None:
+    """Item p9: progress_rate = MFE / holding_time continuation decay.
+
+    Replaces "wait for the fixed time-stop, then cut" with "if this red
+    position's favorable-excursion pace is far below what winners on this
+    exact arm typically show by this point in the hold, that's a genuine
+    decay signal — independent of the catastrophic max-hold failsafe, which
+    is untouched and still the hard ceiling."
+
+    Never fires on a green position (profit exits own those), never fires
+    before `DAY_PROGRESS_DECAY_MIN_HOLD_MIN`, and never fires without real
+    per-arm history to compare against (no `position`, or the arm's MFE
+    distribution for this hold-time bucket is insufficient_data) — there is
+    no fixed-global fallback pace to guess at, unlike the trail/target/
+    giveback adaptations above, because an invented "typical pace" would
+    itself be exactly the kind of unvalidated opinion the architecture rule
+    forbids injecting as a new blocker.
+    """
+    if not _progress_decay_enabled():
+        return None
+    entry = float(entry_price or 0.0)
+    if entry <= 0 or hold_minutes <= 0:
+        return None
+    if net_pnl_pct is not None and net_pnl_pct >= 0.0:
+        return None
+    if hold_minutes < _progress_decay_min_hold_min():
+        return None
+    if position is None:
+        return None
+    highest = float(highest_price or entry)
+    mfe_pct = max(0.0, (highest - entry) / entry)
+    progress_rate = mfe_pct / hold_minutes
+
+    try:
+        from backend.services.mfe_mae_distribution_learner import get_mfe_distribution, hold_time_bucket
+
+        symbol = str(getattr(position, "symbol", "") or "")
+        hb = hold_time_bucket(hold_minutes * 60.0, "day")
+        dist = get_mfe_distribution(symbol, "day", hold_bucket_filter=hb, db_path=_db_path())
+    except Exception:
+        return None
+    if dist.confidence_status == "insufficient_data" or dist.n_obs <= 0:
+        return None
+    if dist.stratum_used == "strategy_cross_symbol":
+        # Conservative: this is a novel signal, not (yet) validated the way
+        # the trail/target/giveback adaptations above are — only trust the
+        # symbol's own real history, never a cross-symbol pool, to decide to
+        # cut a trade early.
+        return None
+    typical_mfe = float(dist.percentiles.get("p50", 0.0))
+    if typical_mfe <= 0:
+        return None
+    typical_pace = typical_mfe / hold_minutes
+    if typical_pace <= 0:
+        return None
+    ratio = progress_rate / typical_pace
+    if ratio > _progress_decay_min_ratio():
+        return None
+
+    return {
+        "action": "sell",
+        "reason": EXIT_PROGRESS_DECAY,
+        "net_pnl_pct": net_pnl_pct,
+        "hold_minutes": hold_minutes,
+        "detail": (f"progress_rate={progress_rate:.8f} typical_pace={typical_pace:.8f} ratio={ratio:.4f} arm_n_obs={dist.n_obs} arm_stratum={dist.stratum_used}"),
+    }
+
+
+def _db_path() -> str:
+    from backend.database_schema import DATABASE_PATH
+
+    return DATABASE_PATH
 
 
 @dataclass(frozen=True)
@@ -327,12 +559,53 @@ def effective_stop_price(entry_price: float, stop_price: float, thesis_invalid_l
     return max(candidates) if candidates else 0.0
 
 
-def effective_target_price(entry_price: float, tp1: float, thesis_target: float) -> float:
-    """Long target: nearest profit objective above entry."""
+def effective_target_price(entry_price: float, tp1: float, thesis_target: float, position: Any = None, bundle: dict[str, Any] | None = None) -> float:
+    """Long target: nearest profit objective above entry.
+
+    When `position` is supplied and its (symbol, setup, regime) arm has
+    enough winning-trade history, the arm's actual MFE p60 (see
+    day_adaptive_targets.py) joins the candidate pool. Because the final
+    choice is still `min()` across all candidates, this can only ever pull
+    the target CLOSER to entry (take profit at what winners on this arm
+    actually reach) — never push it further away. Optional and additive;
+    omitting `position` reproduces the exact prior behavior.
+
+    When `bundle` (the DAY MTF OHLCV bundle) is also supplied, item p6's
+    ATR-grid expectancy-selected target (day_adaptive_targets.atr_grid_target_candidate)
+    joins the same candidate pool under the same min()-only-tightens rule.
+    """
     entry = float(entry_price or 0.0)
     if entry <= 0:
         return 0.0
     candidates = [float(v) for v in (tp1, thesis_target) if v and float(v) > entry]
+    if position is not None:
+        try:
+            from backend.services.day_adaptive_targets import adaptive_target_pct_for_arm
+
+            _adaptive = adaptive_target_pct_for_arm(
+                str(getattr(position, "symbol", "") or ""),
+                str(getattr(position, "entry_thesis", "") or ""),
+                str(getattr(position, "day_route_regime_at_entry", "") or ""),
+            )
+            _pct = float(_adaptive.get("target_pct") or 0.0)
+            if _pct > 0:
+                candidates.append(entry * (1.0 + _pct))
+        except Exception:
+            pass
+        if bundle:
+            try:
+                from backend.services.day_adaptive_targets import atr_grid_target_candidate
+                from backend.services.day_feature_stack_v2 import atr_pct_multi_period
+
+                rows_1h = bundle.get("1h") if isinstance(bundle, dict) else None
+                current_atr_pct = float(atr_pct_multi_period(rows_1h).get(14, 0.0)) if rows_1h else 0.0
+                if current_atr_pct > 0:
+                    _atr_grid = atr_grid_target_candidate(str(getattr(position, "symbol", "") or ""), current_atr_pct)
+                    _atr_pct = float(_atr_grid.get("target_pct") or 0.0)
+                    if _atr_pct > 0:
+                        candidates.append(entry * (1.0 + _atr_pct))
+            except Exception:
+                pass
     return min(candidates) if candidates else 0.0
 
 
@@ -516,6 +789,26 @@ def apply_break_even_and_mfe_trail(position: Any, current_price: float) -> bool:
     else:
         tightened = None
 
+    # Adaptive trail (day_adaptive_trail.py): once a (symbol, setup, regime)
+    # arm has enough closed-winner history (default 4+ obs), its actual
+    # MFE-giveback percentile is a better trail width than the fixed 0.20%/
+    # 0.30% tier constants above. Only overrides when the arm has real
+    # history (source == "arm_history") — insufficient-data and disabled
+    # cases fall back to the fixed tiers computed above, unchanged.
+    if tightened is not None and tightened > 0:
+        try:
+            from backend.services.day_adaptive_trail import adaptive_trail_pct_for_arm
+
+            _adaptive = adaptive_trail_pct_for_arm(
+                str(getattr(position, "symbol", "") or ""),
+                str(getattr(position, "entry_thesis", "") or ""),
+                str(getattr(position, "day_route_regime_at_entry", "") or ""),
+            )
+            if _adaptive.get("source") == "arm_history":
+                tightened = float(_adaptive["trail_pct"])
+        except Exception:
+            pass
+
     if tightened is not None and tightened > 0:
         new_trail = highest * (1.0 - tightened)
         current_trail = float(getattr(position, "trailing_stop_price", 0.0) or 0.0)
@@ -588,7 +881,7 @@ def preview_next_engine_exit(
     """Read-only: next exit path and whether position can stall indefinitely."""
     entry = float(getattr(position, "entry_price", 0.0) or 0.0)
     stop = effective_stop_price(entry, float(getattr(position, "stop_price", 0) or 0), float(getattr(position, "thesis_invalid_level", 0) or 0))
-    target = effective_target_price(entry, float(getattr(position, "take_profit_1_price", 0) or 0), float(getattr(position, "thesis_target_level", 0) or 0))
+    target = effective_target_price(entry, float(getattr(position, "take_profit_1_price", 0) or 0), float(getattr(position, "thesis_target_level", 0) or 0), position, bundle)
     max_hold = effective_max_hold_min(position, coin_profile)
     if int(getattr(position, "max_hold_min", 0) or 0) < max_hold:
         position.max_hold_min = max_hold
@@ -647,6 +940,27 @@ def preview_next_engine_exit(
         ]
     )
 
+    # HoldEV (item p8): continuous hold-economics score — see
+    # hold_ev_engine.py's architecture note. Exposed here for observability;
+    # its actual bounded, tighten-only influence on exit management lives in
+    # evaluate_giveback_exit / the bull-regime branch of
+    # evaluate_engine_managed_exit (DAY) and _early_scratch_exit /
+    # _stall_before_max_hold (SCALP) — not in next_exit/exit_checks above,
+    # which describe the OTHER mechanical levers (stop/trail/target/time).
+    hold_ev_payload: dict[str, Any] | None = None
+    try:
+        from backend.services.hold_ev_engine import hold_ev_for_position
+
+        _hev = hold_ev_for_position(position, current_price=float(current_price or 0.0), hold_minutes=hold_minutes)
+        hold_ev_payload = {
+            "hold_ev_score": _hev.hold_ev_score,
+            "recommendation": _hev.recommendation,
+            "confidence": _hev.confidence,
+            "detail": _hev.detail,
+        }
+    except Exception:
+        hold_ev_payload = None
+
     return {
         "effective_stop": stop,
         "effective_target": target,
@@ -659,6 +973,7 @@ def preview_next_engine_exit(
         "distance_to_stop_pct": round(dist_stop_pct, 6) if dist_stop_pct is not None else None,
         "distance_to_target_pct": round(dist_target_pct, 6) if dist_target_pct is not None else None,
         "can_be_stuck_indefinitely": can_stall,
+        "hold_ev": hold_ev_payload,
     }
 
 
@@ -702,6 +1017,22 @@ def evaluate_engine_managed_exit(
             "net_pnl_pct": net_pnl_pct,
             "hold_minutes": hold_minutes,
         }
+
+    # Item p7 gap-closure: adaptive MAE-distribution check for STRAIGHT losers
+    # (never built the favorable excursion evaluate_giveback_exit requires),
+    # evaluated BEFORE the fixed stop-loss so the arm's own real losing-trade
+    # history — not a fixed per-coin percentage — is the PRIMARY signal for
+    # loss handling. Can only fire tighter/earlier than the fixed stop below,
+    # never wider: the fixed stop_loss and catastrophic extreme protection
+    # above remain the unconditional mechanical backstop regardless.
+    adaptive_loss = evaluate_adaptive_loss_exit(
+        entry_price=entry,
+        net_pnl_pct=net_pnl_pct,
+        hold_minutes=hold_minutes,
+        position=position,
+    )
+    if adaptive_loss is not None:
+        return adaptive_loss
 
     stop = effective_stop_price(entry, float(getattr(position, "stop_price", 0) or 0), invalid_level)
     low = float(bar_low if bar_low is not None else current_price)
@@ -762,18 +1093,44 @@ def evaluate_engine_managed_exit(
         # normal bull noise can easily exceed the default -0.15% trigger on the way to target.
         # Leniency is scaled by validated edge: if "bull" hasn't shown a real forward-return
         # edge yet, blend back toward the standard (tighter) giveback thresholds.
+        #
+        # Item p7 gap-closure: the "tighter" side of that blend used to always be the
+        # fixed global -0.15% constant, silently bypassing this arm's own adaptive
+        # MAE-distribution trigger (day_adaptive_targets.adaptive_giveback_trigger_for_arm)
+        # even when real per-arm history existed — the bull path is now grounded in the
+        # SAME adaptive-or-fixed trigger the non-bull path uses, before applying the
+        # bull-specific leniency blend on top of it.
         _highest = float(getattr(position, "highest_price", entry) or entry)
         _mfe = max(0.0, (_highest - entry) / entry) if entry > 0 else 0.0
         _bull_scalar, _ = get_regime_validated_scalar(_pos_regime)
+        _base_trigger = _giveback_trigger_pnl_pct()
+        _base_trigger_source = "fixed_default"
+        try:
+            from backend.services.day_adaptive_targets import adaptive_giveback_trigger_for_arm
+
+            _adaptive_bull = adaptive_giveback_trigger_for_arm(
+                str(getattr(position, "symbol", "") or ""),
+                str(getattr(position, "entry_thesis", "") or ""),
+                _pos_regime,
+            )
+            if _adaptive_bull.get("source") not in ("insufficient_data", "disabled"):
+                _base_trigger = float(_adaptive_bull["trigger_pct"])
+                _base_trigger_source = str(_adaptive_bull["source"])
+        except Exception:
+            pass
         _bull_mfe_thresh = blend_by_scalar(_giveback_min_mfe_pct(), float(os.getenv("DAY_BULL_GIVEBACK_MIN_MFE", "0.005")), _bull_scalar)
-        _bull_trigger = blend_by_scalar(_giveback_trigger_pnl_pct(), float(os.getenv("DAY_BULL_GIVEBACK_TRIGGER", "-0.003")), _bull_scalar)
+        _bull_trigger = blend_by_scalar(_base_trigger, float(os.getenv("DAY_BULL_GIVEBACK_TRIGGER", "-0.003")), _bull_scalar)
+        # Item p8 promotion: same HoldEV tighten-only nudge as the non-bull
+        # giveback path, applied on top of the bull-leniency blend above.
+        _hev_factor, _hev_detail = _hold_ev_tighten(position, entry_price=entry, net_pnl_pct=net_pnl_pct, hold_minutes=hold_minutes)
+        _bull_trigger *= _hev_factor
         if _mfe >= _bull_mfe_thresh and net_pnl_pct + 1e-12 <= _bull_trigger:
             giveback = {
                 "action": "sell",
                 "reason": EXIT_GIVEBACK,
                 "net_pnl_pct": net_pnl_pct,
                 "hold_minutes": hold_minutes,
-                "detail": f"bull_giveback mfe={_mfe:.6f} trigger={_bull_trigger}",
+                "detail": f"bull_giveback mfe={_mfe:.6f} trigger={_bull_trigger} base_trigger_source={_base_trigger_source} {_hev_detail}",
             }
         else:
             giveback = None
@@ -783,6 +1140,7 @@ def evaluate_engine_managed_exit(
             highest_price=float(getattr(position, "highest_price", entry) or entry),
             net_pnl_pct=net_pnl_pct,
             hold_minutes=hold_minutes,
+            position=position,
         )
     if giveback is not None:
         return giveback
@@ -790,6 +1148,17 @@ def evaluate_engine_managed_exit(
     max_hold = effective_max_hold_min(position, coin_profile)
     if int(getattr(position, "max_hold_min", 0) or 0) < max_hold:
         position.max_hold_min = max_hold
+
+    progress_decay = evaluate_progress_decay_exit(
+        entry_price=entry,
+        highest_price=float(getattr(position, "highest_price", entry) or entry),
+        net_pnl_pct=net_pnl_pct,
+        hold_minutes=hold_minutes,
+        position=position,
+    )
+    if progress_decay is not None:
+        return progress_decay
+
     _stall_regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
     # Full stall suppression is the strongest bull-regime bonus, so it requires the
     # strongest evidence bar: only skip the stall check once the label has shown a
@@ -832,10 +1201,11 @@ def evaluate_engine_managed_exit(
 
     # Resolve per-coin profit floor from the position's symbol.
     from backend.config.trading_economics import min_net_profit_for_symbol as _mnp
+
     _sym = str(getattr(position, "symbol", "") or "")
     _min_net = float(_mnp(_sym)) if _sym else float(MIN_NET_PROFIT_TO_SELL)
 
-    target = effective_target_price(entry, float(getattr(position, "take_profit_1_price", 0) or 0), target_level)
+    target = effective_target_price(entry, float(getattr(position, "take_profit_1_price", 0) or 0), target_level, position, bundle)
     if target > 0 and current_price >= target and net_pnl_pct + 1e-12 >= _min_net * 0.45:
         return {
             "action": "sell",

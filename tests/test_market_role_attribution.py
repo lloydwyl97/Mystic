@@ -40,6 +40,7 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_temp_db() -> str:
     f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     f.close()
@@ -106,9 +107,14 @@ def _insert_buy(
                 '{}', 'ACTIVE', ?, 'day', ?, 0.75)
         """,
         (
-            trade_id, symbol, qty, price, qty,
+            trade_id,
+            symbol,
+            qty,
+            price,
+            qty,
             qty * price * 0.001,
-            ts, ts,
+            ts,
+            ts,
             json.dumps(context_snapshot),
         ),
     )
@@ -149,9 +155,17 @@ def _insert_sell(
                 '{}', 'ACTIVE', 'NET_PROFIT_TARGET', ?, 'day')
         """,
         (
-            sell_trade_id, symbol, qty, exit_price, entry_price,
-            realized_pnl, pnl_pct, hold_seconds, fee,
-            ts, ts,
+            sell_trade_id,
+            symbol,
+            qty,
+            exit_price,
+            entry_price,
+            realized_pnl,
+            pnl_pct,
+            hold_seconds,
+            fee,
+            ts,
+            ts,
         ),
     )
     conn.commit()
@@ -162,6 +176,7 @@ def _insert_sell(
 # Learner imports (lazy to avoid path issues)
 # ---------------------------------------------------------------------------
 
+
 def _get_learner():
     from backend.services.market_role_outcome_learner import (
         MIN_OUTCOME_SAMPLES,
@@ -169,12 +184,14 @@ def _get_learner():
         get_learning_stats,
         record_trade_outcome,
     )
+
     return record_trade_outcome, get_learning_stats, get_learned_adjustment, MIN_OUTCOME_SAMPLES
 
 
 # ---------------------------------------------------------------------------
 # Test 1: Full BUY → SELL → attribution → learning pipeline
 # ---------------------------------------------------------------------------
+
 
 def test_full_attribution_pipeline() -> None:
     """
@@ -196,9 +213,9 @@ def test_full_attribution_pipeline() -> None:
     context_snapshot = {
         "symbol": symbol,
         "market_role": "infrastructure_leader",
-        "rs_short_1h": 0.012,       # ETH outperforming BTC
+        "rs_short_1h": 0.012,  # ETH outperforming BTC
         "rs_medium_4h": 0.008,
-        "momentum_score": 0.65,     # mild bullish momentum
+        "momentum_score": 0.65,  # mild bullish momentum
         "volatility_score": 0.42,
         "volume_accel": 1.3,
         "btc_correlation": 0.82,
@@ -238,9 +255,7 @@ def test_full_attribution_pipeline() -> None:
     hold_seconds = 1800  # 30 minutes
 
     with sqlite3.connect(db_path) as conn:
-        realized_pnl, mfe_pct, mae_pct = _insert_sell(
-            conn, sell_trade_id, buy_trade_id, symbol, qty, entry_price, exit_price, hold_seconds
-        )
+        realized_pnl, mfe_pct, mae_pct = _insert_sell(conn, sell_trade_id, buy_trade_id, symbol, qty, entry_price, exit_price, hold_seconds)
 
     assert realized_pnl > 0, f"STEP 5 FAIL: expected profit, got {realized_pnl}"
     assert mfe_pct > 0, f"STEP 6 FAIL: expected positive MFE, got {mfe_pct}"
@@ -298,6 +313,7 @@ def test_full_attribution_pipeline() -> None:
 # Test 11: BTC self-comparison
 # ---------------------------------------------------------------------------
 
+
 def test_btc_self_comparison() -> None:
     """BTC compared to itself must produce correlation=1.0, beta=1.0, rs=0.0."""
     import asyncio
@@ -332,6 +348,7 @@ def test_btc_self_comparison() -> None:
 # Test 12: Timestamp misalignment → empty alignment
 # ---------------------------------------------------------------------------
 
+
 def test_timestamp_misalignment() -> None:
     """Completely non-overlapping timestamps produce empty aligned arrays."""
     from backend.services.market_role_intelligence import _align_candles
@@ -349,6 +366,7 @@ def test_timestamp_misalignment() -> None:
 # Test 13: Duplicate timestamps → deduplicated (last row wins)
 # ---------------------------------------------------------------------------
 
+
 def test_duplicate_timestamps() -> None:
     """Duplicate timestamps are deduplicated; last row per timestamp wins."""
     from backend.services.market_role_intelligence import _align_candles
@@ -356,7 +374,7 @@ def test_duplicate_timestamps() -> None:
     ts_base = 1_000_000
     sym_rows = [
         [ts_base, 1, 1, 1, 100.0, 1],
-        [ts_base, 1, 1, 1, 200.0, 1],    # duplicate — should keep this
+        [ts_base, 1, 1, 1, 200.0, 1],  # duplicate — should keep this
         [ts_base + 3600_000, 1, 1, 1, 110.0, 1],
     ]
     btc_rows = [
@@ -375,16 +393,24 @@ def test_duplicate_timestamps() -> None:
 # Test 14: Insufficient samples → learned_adjustment == 0.0
 # ---------------------------------------------------------------------------
 
+
 def test_insufficient_samples_returns_zero() -> None:
     """When fewer than MIN_OUTCOME_SAMPLES outcomes exist, learned_adjustment = 0.0."""
     db_path = _make_temp_db()
     record_outcome, get_stats, get_adj, MIN_SAMPLES = _get_learner()
 
-    ctx = json.dumps({
-        "rs_short_1h": 0.01, "momentum_score": 0.6, "volatility_score": 0.3,
-        "volume_accel": 1.2, "btc_correlation": 0.7, "btc_beta": 1.1,
-        "catalyst_score": 0.0, "live_context_adjustment": 0.01,
-    })
+    ctx = json.dumps(
+        {
+            "rs_short_1h": 0.01,
+            "momentum_score": 0.6,
+            "volatility_score": 0.3,
+            "volume_accel": 1.2,
+            "btc_correlation": 0.7,
+            "btc_beta": 1.1,
+            "catalyst_score": 0.0,
+            "live_context_adjustment": 0.01,
+        }
+    )
 
     # Insert MIN_SAMPLES - 1 outcomes
     for i in range(MIN_SAMPLES - 1):
@@ -405,14 +431,15 @@ def test_insufficient_samples_returns_zero() -> None:
 
     adj = get_adj(db_path, "SOLUSDT", "day")
     stats = get_stats(db_path, "SOLUSDT", "day")
-    assert adj == 0.0, f"TEST 14 FAIL: expected 0.0 with {MIN_SAMPLES-1} samples, got {adj}"
+    assert adj == 0.0, f"TEST 14 FAIL: expected 0.0 with {MIN_SAMPLES - 1} samples, got {adj}"
     assert stats.confidence_status == "insufficient_data", f"TEST 14 FAIL: status={stats.confidence_status}"
-    print(f"  TEST 14 PASS: learned_adjustment=0.0 with {MIN_SAMPLES-1}/{MIN_SAMPLES} samples, status=insufficient_data")
+    print(f"  TEST 14 PASS: learned_adjustment=0.0 with {MIN_SAMPLES - 1}/{MIN_SAMPLES} samples, status=insufficient_data")
 
 
 # ---------------------------------------------------------------------------
 # Test 15: Zero BTC variance → beta returns None
 # ---------------------------------------------------------------------------
+
 
 def test_zero_btc_variance_returns_none() -> None:
     """If BTC closes are all equal (zero variance), beta must be None."""
@@ -433,6 +460,7 @@ def test_zero_btc_variance_returns_none() -> None:
 # Test 16: Learned adjustment bounded after sufficient samples
 # ---------------------------------------------------------------------------
 
+
 def test_learned_adjustment_bounded_after_sufficient_samples() -> None:
     """After MIN_OUTCOME_SAMPLES outcomes, learned_adjustment is non-zero and within ±0.02."""
     db_path = _make_temp_db()
@@ -440,24 +468,26 @@ def test_learned_adjustment_bounded_after_sufficient_samples() -> None:
 
     # 15 consistently profitable trades with high rs_short_1h
     for i in range(15):
-        ctx = json.dumps({
-            "rs_short_1h": 0.015,        # consistently positive RS
-            "rs_medium_4h": 0.010,
-            "momentum_score": 0.72,      # consistently bullish
-            "volatility_score": 0.40,
-            "volume_accel": 1.4,
-            "btc_correlation": 0.75,
-            "btc_beta": 1.2,
-            "catalyst_score": 0.0,
-            "live_context_adjustment": 0.018,
-        })
+        ctx = json.dumps(
+            {
+                "rs_short_1h": 0.015,  # consistently positive RS
+                "rs_medium_4h": 0.010,
+                "momentum_score": 0.72,  # consistently bullish
+                "volatility_score": 0.40,
+                "volume_accel": 1.4,
+                "btc_correlation": 0.75,
+                "btc_beta": 1.2,
+                "catalyst_score": 0.0,
+                "live_context_adjustment": 0.018,
+            }
+        )
         record_outcome(
             db_path,
             trade_id=f"sell_{i}",
             buy_trade_id=f"buy_{i}",
             symbol="XRPUSDT",
             strategy="day",
-            realized_pnl_pct=0.008,     # all winners
+            realized_pnl_pct=0.008,  # all winners
             hold_seconds=1200,
             exit_reason="NET_PROFIT_TARGET",
             mfe_pct=0.012,
@@ -503,6 +533,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"  FAILED: {e}")
             import traceback
+
             traceback.print_exc()
             failed += 1
 

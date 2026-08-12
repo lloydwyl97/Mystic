@@ -126,13 +126,15 @@ def evaluate_stale_symbol(
         logger.warning("STALE_EVAL: holdout metrics unavailable for %s: %s", sym, _hv_exc)
         validation_metrics = {}
     validation_metrics.setdefault("holdout_status", "STALE_EVAL_BYPASS")
-    validation_metrics.update({
-        "accuracy": cand_acc,
-        "active_accuracy": active_acc,
-        "profit_after_cost": profit_proxy,
-        "avg_net_pnl_pct": profit_proxy,
-        "evaluation": "stale_model_workflow",
-    })
+    validation_metrics.update(
+        {
+            "accuracy": cand_acc,
+            "active_accuracy": active_acc,
+            "profit_after_cost": profit_proxy,
+            "avg_net_pnl_pct": profit_proxy,
+            "evaluation": "stale_model_workflow",
+        }
+    )
     result["validation_metrics"] = validation_metrics
 
     if not promote:

@@ -175,11 +175,7 @@ def build_entry_telemetry(ranked: list[dict[str, Any]]) -> dict[str, Any]:
             symbols[-1]["role_live_adj"] = fetch_role_ranking_delta_from_redis(sym)
 
     # Pass rates this cycle
-    strategy_pass_rate = {
-        name: round(strategy_pass[name] / strategy_eval[name], 4)
-        for name in strategy_eval
-        if strategy_eval[name] > 0
-    }
+    strategy_pass_rate = {name: round(strategy_pass[name] / strategy_eval[name], 4) for name in strategy_eval if strategy_eval[name] > 0}
 
     return {
         "updated_at_epoch": time.time(),
@@ -303,19 +299,14 @@ def update_rolling_telemetry(redis_client: Any, cycle: dict[str, Any], *, prefix
         rolling["pct_cycles_with_eligible"] = round(int(rolling.get("cycles_with_eligible") or 0) / cycles, 4)
         rolling["strategy_pass_rate"] = {
             name: round(
-                int((rolling.get("strategy_pass_counts") or {}).get(name, 0))
-                / max(1, int((rolling.get("strategy_eval_counts") or {}).get(name, 0))),
+                int((rolling.get("strategy_pass_counts") or {}).get(name, 0)) / max(1, int((rolling.get("strategy_eval_counts") or {}).get(name, 0))),
                 4,
             )
             for name in (rolling.get("strategy_eval_counts") or {})
         }
         # Top lists for API/dashboard
-        rolling["top_reject_reasons"] = dict(
-            sorted((rolling.get("reject_reasons") or {}).items(), key=lambda kv: -int(kv[1]))[:15]
-        )
-        rolling["top_post_pass_blockers"] = dict(
-            sorted((rolling.get("post_pass_blockers") or {}).items(), key=lambda kv: -int(kv[1]))[:15]
-        )
+        rolling["top_reject_reasons"] = dict(sorted((rolling.get("reject_reasons") or {}).items(), key=lambda kv: -int(kv[1]))[:15])
+        rolling["top_post_pass_blockers"] = dict(sorted((rolling.get("post_pass_blockers") or {}).items(), key=lambda kv: -int(kv[1]))[:15])
 
         redis_client.setex(key, _ROLLING_TTL_SEC, json.dumps(rolling, separators=(",", ":")))
         return rolling

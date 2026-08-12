@@ -40,6 +40,8 @@ if __name__ == "__main__":
 
 _SCALP_INGEST_INTERVAL_SEC = 300  # ingest scalp outcomes every 5 minutes
 _DAY_SHADOW_RESOLVE_INTERVAL_SEC = 300  # resolve DAY shadow rejects on closed bars
+_CALIBRATION_TRACKING_INTERVAL_SEC = 900  # recompute Brier/ECE calibration every 15 minutes
+_MULTI_TARGET_ML_RETRAIN_INTERVAL_SEC = 1800  # retrain expected-return/MFE/MAE/time regressors every 30 minutes
 
 
 async def _scalp_ingest_loop() -> None:
@@ -97,6 +99,45 @@ async def _scalp_shadow_resolve_loop() -> None:
         await asyncio.sleep(_DAY_SHADOW_RESOLVE_INTERVAL_SEC)
 
 
+async def _calibration_tracking_loop() -> None:
+    """Periodic Brier score / ECE calibration recompute per symbol (item p12)."""
+    while True:
+        try:
+            from backend.services.ai_calibration_tracker import run_calibration_tracking_cycle
+
+            result = await asyncio.to_thread(run_calibration_tracking_cycle)
+            degraded = [sym for sym, r in result.items() if r.get("degraded")]
+            if degraded:
+                logger.info("CALIBRATION_TRACKING degraded_symbols=%s", degraded)
+        except Exception as exc:
+            logger.debug("CALIBRATION_TRACKING_SKIPPED %s", exc)
+        await asyncio.sleep(_CALIBRATION_TRACKING_INTERVAL_SEC)
+
+
+async def _multi_target_ml_retrain_loop() -> None:
+    """Periodic retrain of the expected-return/MFE/MAE/time-to-target
+    regression heads per (strategy, symbol) (item p10)."""
+    while True:
+        try:
+            from backend.config.trading_universe import TRADING_SYMBOLS
+            from backend.services.ai_multi_target_regressors import train_multi_target_regressors
+
+            for strategy_id in ("day", "scalp"):
+                for symbol in TRADING_SYMBOLS:
+                    result = await asyncio.to_thread(train_multi_target_regressors, strategy_id, symbol)
+                    if result.trained:
+                        logger.info(
+                            "MULTI_TARGET_ML_TRAINED strategy=%s symbol=%s n_rows=%d val_mae=%s",
+                            strategy_id,
+                            symbol,
+                            result.n_rows,
+                            result.val_mae_by_target,
+                        )
+        except Exception as exc:
+            logger.debug("MULTI_TARGET_ML_RETRAIN_SKIPPED %s", exc)
+        await asyncio.sleep(_MULTI_TARGET_ML_RETRAIN_INTERVAL_SEC)
+
+
 async def main() -> None:
     pipeline = None
     try:
@@ -111,6 +152,8 @@ async def main() -> None:
         asyncio.ensure_future(_scalp_ingest_loop())
         asyncio.ensure_future(_day_shadow_resolve_loop())
         asyncio.ensure_future(_scalp_shadow_resolve_loop())
+        asyncio.ensure_future(_calibration_tracking_loop())
+        asyncio.ensure_future(_multi_target_ml_retrain_loop())
         while True:
             await asyncio.sleep(60)
     except KeyboardInterrupt:

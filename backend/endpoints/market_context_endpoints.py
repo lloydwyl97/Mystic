@@ -67,10 +67,7 @@ async def _read_role_context_from_redis(symbol: str, redis_client: redis_async.R
             result["error"] = "no_context_in_redis"
             return result
 
-        payload: dict[str, str] = {
-            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
-            for k, v in raw.items()
-        }
+        payload: dict[str, str] = {(k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v) for k, v in raw.items()}
 
         ts_raw = payload.get("ts_utc", "")
         fresh_sec = _freshness_sec(ts_raw)
@@ -93,38 +90,40 @@ async def _read_role_context_from_redis(symbol: str, redis_client: redis_async.R
             except (TypeError, ValueError):
                 return v
 
-        result.update({
-            "market_role": role_intel.get("market_role") or MARKET_ROLES.get(sym, "unknown"),
-            "role_code": role_intel.get("role_code"),
-            "rs_btc_24h": _f("ctx_rs_btc"),
-            "rs_eth_24h": _f("ctx_rs_eth"),
-            "rs_short_1h": role_intel.get("rs_short_1h"),
-            "rs_medium_4h": role_intel.get("rs_medium_4h"),
-            "btc_correlation": role_intel.get("btc_correlation"),
-            "btc_beta": role_intel.get("btc_beta"),
-            "momentum_score": role_intel.get("momentum_score"),
-            "volatility_score": role_intel.get("volatility_score"),
-            "volume_accel": role_intel.get("volume_accel"),
-            "catalyst_score": role_intel.get("catalyst_score"),
-            "catalyst_source": role_intel.get("catalyst_source", "unavailable"),
-            "catalyst_category": role_intel.get("catalyst_category"),
-            "market_regime": payload.get("ctx_market_regime", "unknown"),
-            "risk_regime": role_intel.get("risk_regime", "neutral"),
-            "fear_greed": _f("ctx_sentiment_fear_greed"),
-            "btc_dominance_proxy": _f("ctx_btc_dominance_proxy"),
-            "spread_pct": _f("ctx_spread_pct"),
-            "depth_imbalance": _f("ctx_depth_imbalance"),
-            "volume_24h_usd": _f("ctx_volume_24h_usd"),
-            "liquidity_tier": payload.get("ctx_liquidity_tier"),
-            "live_context_adjustment": role_intel.get("live_context_adjustment", _f("ctx_role_ranking_delta", 0.0)),
-            "role_ranking_delta": _f("ctx_role_ranking_delta", 0.0),
-            "ctx_multiplier": _f("ctx_multiplier", 1.0),
-            "source_status": role_intel.get("source_status", "live") if role_intel else "partial",
-            "freshness_seconds": fresh_sec,
-            "context_ts_utc": ts_raw,
-            "day_consumed": fresh_sec is not None and fresh_sec < 300,
-            "scalp_consumed": fresh_sec is not None and fresh_sec < 120,
-        })
+        result.update(
+            {
+                "market_role": role_intel.get("market_role") or MARKET_ROLES.get(sym, "unknown"),
+                "role_code": role_intel.get("role_code"),
+                "rs_btc_24h": _f("ctx_rs_btc"),
+                "rs_eth_24h": _f("ctx_rs_eth"),
+                "rs_short_1h": role_intel.get("rs_short_1h"),
+                "rs_medium_4h": role_intel.get("rs_medium_4h"),
+                "btc_correlation": role_intel.get("btc_correlation"),
+                "btc_beta": role_intel.get("btc_beta"),
+                "momentum_score": role_intel.get("momentum_score"),
+                "volatility_score": role_intel.get("volatility_score"),
+                "volume_accel": role_intel.get("volume_accel"),
+                "catalyst_score": role_intel.get("catalyst_score"),
+                "catalyst_source": role_intel.get("catalyst_source", "unavailable"),
+                "catalyst_category": role_intel.get("catalyst_category"),
+                "market_regime": payload.get("ctx_market_regime", "unknown"),
+                "risk_regime": role_intel.get("risk_regime", "neutral"),
+                "fear_greed": _f("ctx_sentiment_fear_greed"),
+                "btc_dominance_proxy": _f("ctx_btc_dominance_proxy"),
+                "spread_pct": _f("ctx_spread_pct"),
+                "depth_imbalance": _f("ctx_depth_imbalance"),
+                "volume_24h_usd": _f("ctx_volume_24h_usd"),
+                "liquidity_tier": payload.get("ctx_liquidity_tier"),
+                "live_context_adjustment": role_intel.get("live_context_adjustment", _f("ctx_role_ranking_delta", 0.0)),
+                "role_ranking_delta": _f("ctx_role_ranking_delta", 0.0),
+                "ctx_multiplier": _f("ctx_multiplier", 1.0),
+                "source_status": role_intel.get("source_status", "live") if role_intel else "partial",
+                "freshness_seconds": fresh_sec,
+                "context_ts_utc": ts_raw,
+                "day_consumed": fresh_sec is not None and fresh_sec < 300,
+                "scalp_consumed": fresh_sec is not None and fresh_sec < 120,
+            }
+        )
 
     except Exception as exc:
         logger.debug("market_context_endpoint %s error: %s", symbol, exc)
@@ -142,6 +141,7 @@ def _build_day_breakdown(sym: str, ctx: dict[str, Any]) -> dict[str, Any]:
     day_stats = {"sample_count": 0, "learned_adjustment": 0.0, "confidence": 0.0, "confidence_status": "insufficient_data"}
     try:
         from backend.services.market_role_outcome_learner import get_learning_stats as _gls
+
         s = _gls(_DB_PATH, sym, "day")
         day_stats = {
             "sample_count": s.sample_count,
@@ -177,6 +177,7 @@ def _build_scalp_breakdown(sym: str) -> dict[str, Any]:
     scalp_stats = {"sample_count": 0, "learned_adjustment": 0.0, "confidence": 0.0, "confidence_status": "insufficient_data"}
     try:
         from backend.services.market_role_outcome_learner import get_learning_stats as _gls
+
         s = _gls(_DB_PATH, sym, "scalp")
         scalp_stats = {
             "sample_count": s.sample_count,
@@ -191,6 +192,7 @@ def _build_scalp_breakdown(sym: str) -> dict[str, Any]:
     raw_delta = 0.0
     try:
         from backend.services.market_role_intelligence import fetch_role_ranking_delta_from_redis as _frrd
+
         raw_delta = _frrd(sym)
         live_adj = round(max(-0.04, min(0.04, raw_delta * (0.04 / 0.06))), 5)
     except Exception:
@@ -272,23 +274,25 @@ async def get_market_role_summary() -> dict[str, Any]:
             except (TypeError, ValueError):
                 return v
 
-        summary.append({
-            "symbol": sym,
-            "role": ctx.get("market_role", "unknown"),
-            "regime": ctx.get("market_regime", "unknown"),
-            "rs_btc": _fmt(ctx.get("rs_btc_24h")),
-            "rs_short_1h": _fmt(ctx.get("rs_short_1h")),
-            "momentum": _fmt(ctx.get("momentum_score")),
-            "volatility": _fmt(ctx.get("volatility_score")),
-            "btc_corr": _fmt(ctx.get("btc_correlation")),
-            "btc_beta": _fmt(ctx.get("btc_beta")),
-            "catalyst": _fmt(ctx.get("catalyst_score")),
-            "catalyst_src": ctx.get("catalyst_source", "unavailable"),
-            "rank_delta": _fmt(ctx.get("role_ranking_delta"), 4),
-            "live_context_adj": _fmt(ctx.get("live_context_adjustment"), 4),
-            "freshness_s": ctx.get("freshness_seconds"),
-            "source": ctx.get("source_status", "unavailable"),
-        })
+        summary.append(
+            {
+                "symbol": sym,
+                "role": ctx.get("market_role", "unknown"),
+                "regime": ctx.get("market_regime", "unknown"),
+                "rs_btc": _fmt(ctx.get("rs_btc_24h")),
+                "rs_short_1h": _fmt(ctx.get("rs_short_1h")),
+                "momentum": _fmt(ctx.get("momentum_score")),
+                "volatility": _fmt(ctx.get("volatility_score")),
+                "btc_corr": _fmt(ctx.get("btc_correlation")),
+                "btc_beta": _fmt(ctx.get("btc_beta")),
+                "catalyst": _fmt(ctx.get("catalyst_score")),
+                "catalyst_src": ctx.get("catalyst_source", "unavailable"),
+                "rank_delta": _fmt(ctx.get("role_ranking_delta"), 4),
+                "live_context_adj": _fmt(ctx.get("live_context_adjustment"), 4),
+                "freshness_s": ctx.get("freshness_seconds"),
+                "source": ctx.get("source_status", "unavailable"),
+            }
+        )
 
     btc_item = next((s for s in summary if s["symbol"] == "BTCUSDT"), {})
     return {

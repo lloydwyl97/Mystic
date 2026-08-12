@@ -297,12 +297,7 @@ def register_candidate_and_maybe_promote(
     # days purely because holdout_status wasn't "OK" — never because the
     # candidate was actually worse. See 2026-07-26 stale-model audit.
     tiered_info = metrics.get("tiered_holdout")
-    tiered_fallback_eligible = (
-        not holdout_ok
-        and isinstance(tiered_info, dict)
-        and tiered_info.get("status") == "OK"
-        and bool(metrics.get("tiered_holdout_pass"))
-    )
+    tiered_fallback_eligible = not holdout_ok and isinstance(tiered_info, dict) and tiered_info.get("status") == "OK" and bool(metrics.get("tiered_holdout_pass"))
 
     if not has_active:
         # Cold-start bootstrap: no active model exists so there is nothing to
@@ -326,7 +321,16 @@ def register_candidate_and_maybe_promote(
         pac_ok = holdout_ok and c_profit is not None and a_profit is not None and c_profit >= (a_profit - 0.0005)
         bad_ok = holdout_ok and c_bad is not None and a_bad is not None and c_bad <= (a_bad + 0.0005)
 
-    promote = accuracy_ok and pac_ok and bad_ok
+    # Item p23: accuracy is diagnostic only. The real promotion gate is
+    # after-cost economics (profit_after_cost >= active's, within tolerance)
+    # and risk (bad_trade_rate <= active's, within tolerance) — a classifier
+    # can be more accurate on labels while being economically worse (e.g.
+    # correctly calling more HOLDs on trades that would have been small
+    # winners), or less accurate while capturing better net PnL on the buy
+    # calls it does make. accuracy_ok/c_acc/a_acc remain fully computed and
+    # logged in `metrics` and `reject_reason` for observability; they no
+    # longer block or force promotion on their own.
+    promote = pac_ok and bad_ok
     holdout_low_confidence = bool(metrics.get("holdout_low_confidence")) or holdout_count < 20
     metrics["holdout_low_confidence"] = holdout_low_confidence
     cand_holdout = metrics.get("candidate_holdout")
@@ -414,12 +418,7 @@ def register_candidate_and_maybe_promote(
                 artifact_min_lift = float(os.getenv("MODEL_PROMOTION_ARTIFACT_ACC_LIFT", "0.05"))
             except (TypeError, ValueError):
                 artifact_min_lift = 0.05
-            artifact_override = (
-                a_art > 0.0
-                and c_art > 0.0
-                and (c_art - a_art) >= artifact_min_lift
-                and (a_art <= below_chance_floor or (c_art - a_art) >= 0.10)
-            )
+            artifact_override = a_art > 0.0 and c_art > 0.0 and (c_art - a_art) >= artifact_min_lift and (a_art <= below_chance_floor or (c_art - a_art) >= 0.10)
             # Tied candidates are normally rejected to avoid churn — but when the
             # active model is stale, promote so live inference keeps absorbing
             # recent coin/market structure from outcome-weighted retrains.
@@ -443,9 +442,11 @@ def register_candidate_and_maybe_promote(
                 else:
                     promote = False
                     reject_reason = "candidate_not_improved_over_active"
-    # Soft promote: accuracy within margin already (accuracy_ok), but PAC/precision
-    # clearly better — prefer tradable buy edge over pure accuracy ties.
-    if (not promote) and holdout_ok and has_active and accuracy_ok and pac_ok and bad_ok:
+    # Soft promote: economics gate passed (pac_ok/bad_ok) but an earlier tie/
+    # coverage check above still rejected — prefer tradable buy edge (better
+    # net PnL or buy precision) over that rejection. Accuracy is diagnostic
+    # only (item p23) and is intentionally not part of this condition.
+    if (not promote) and holdout_ok and has_active and pac_ok and bad_ok:
         cand_h = metrics.get("candidate_holdout") if isinstance(metrics.get("candidate_holdout"), dict) else {}
         act_h = metrics.get("active_holdout") if isinstance(metrics.get("active_holdout"), dict) else {}
         c_bp = cand_h.get("buy_precision_if_followed")

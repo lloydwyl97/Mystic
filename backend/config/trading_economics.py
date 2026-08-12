@@ -122,6 +122,7 @@ def min_net_profit_for_symbol(symbol: str) -> float:
         s = s + "T"
     return float(_PER_COIN_MIN_NET_PROFIT.get(s, MIN_NET_PROFIT_TO_SELL))
 
+
 # -- Cooldowns ---------------------------------------------------------------
 # Block re-entry on a symbol for this many seconds after Mystic closed it.
 COOLDOWN_SECONDS_AFTER_SELL: Final[int] = _env_int(

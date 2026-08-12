@@ -105,10 +105,7 @@ def _micro_tp_exit(
     giveback = max(0.0, (max_fav - fav) / max_fav)
     if giveback < giveback_frac:
         return False, ""
-    return True, (
-        f"micro_tp_lock mfe_pct={max_fav:.4f} "
-        f"fav_pct={fav:.4f} giveback={giveback:.2f} net_exec={executable_net_pct:.4f}"
-    )
+    return True, (f"micro_tp_lock mfe_pct={max_fav:.4f} fav_pct={fav:.4f} giveback={giveback:.2f} net_exec={executable_net_pct:.4f}")
 
 
 def _review_trigger_sec(econ: ScalpEconomics) -> int:
@@ -163,6 +160,14 @@ def _scratch_min_reviews(setup_name: str | None = None) -> int:
     return base
 
 
+def _effective_scratch_min_reviews(setup_name: str | None = None, hold_ev_reduction: int = 0) -> int:
+    """Item p8 promotion: HoldEV can reduce (never increase) the required
+    review count, bounded at a floor of 1 — it can make an already-
+    scratchable, already-momentum-stalled position scratch a review or two
+    sooner, but can never remove the review-count floor entirely."""
+    return max(1, _scratch_min_reviews(setup_name) - max(0, int(hold_ev_reduction or 0)))
+
+
 def _stall_exit_hold_frac() -> float:
     # Default 50% of hard max-hold so stalled paper scalps exit ~10m, not 15–20m.
     return float(os.getenv("SCALP_STALL_EXIT_HOLD_FRAC", "0.50"))
@@ -201,6 +206,7 @@ def _early_scratch_exit(
     econ: ScalpEconomics,
     stale_review_count: int,
     setup_name: str | None = None,
+    hold_ev_reduction: int = 0,
 ) -> tuple[bool, str]:
     """Exit flat/slightly-negative scalps that stall before hard max-hold."""
     min_hold = _scratch_min_hold_sec(setup_name)
@@ -216,7 +222,7 @@ def _early_scratch_exit(
         return False, ""
     if not _scratchable_net(executable_net_pct, econ):
         return False, ""
-    min_reviews = _scratch_min_reviews(setup_name)
+    min_reviews = _effective_scratch_min_reviews(setup_name, hold_ev_reduction)
     trigger = _review_trigger_sec(econ)
     if hold_sec >= trigger and stale_review_count >= min_reviews:
         return True, "stalled_no_progress_review_scratch"
@@ -236,6 +242,7 @@ def _stall_before_max_hold(
     econ: ScalpEconomics,
     stale_review_count: int,
     setup_name: str | None = None,
+    hold_ev_reduction: int = 0,
 ) -> tuple[bool, str]:
     """Cut prolonged no-progress holds before the hard ceiling."""
     if hold_sec >= hard:
@@ -252,7 +259,7 @@ def _stall_before_max_hold(
         return False, ""
     if not _momentum_stalled(mom):
         return False, ""
-    if stale_review_count >= _scratch_min_reviews(setup_name):
+    if stale_review_count >= _effective_scratch_min_reviews(setup_name, hold_ev_reduction):
         return True, "stall_before_max_hold_no_progress"
     return False, ""
 
@@ -347,6 +354,36 @@ def evaluate_exit(
         "stale_review_count": stale_review_count,
     }
 
+    # HoldEV (item p8) — see hold_ev_engine.py's architecture note. Computed
+    # on every review (hold and sell alike) so it is a live, observed signal
+    # for SCALP, mirroring the DAY wiring in day_controlled_exits.py. Its
+    # score also feeds hold_ev_scratch_review_reduction below — a bounded,
+    # tighten-only reduction (never increase) in the stale-review count the
+    # early-scratch/stall checks require; it never changes decision/state/
+    # reason on its own and can never make an otherwise-non-scratchable
+    # position scratchable.
+    hold_ev_reduction = 0
+    try:
+        from backend.services.hold_ev_engine import compute_hold_ev, hold_ev_scratch_review_reduction
+
+        _hev = compute_hold_ev(
+            symbol=snap.symbol,
+            strategy="scalp",
+            entry_price=entry,
+            current_price=bid,
+            highest_price=entry * (1.0 + max_fav),
+            hold_minutes=hold_sec / 60.0,
+            realized_volatility_pct=getattr(mom, "realized_volatility_pct", None),
+            spread_pct=snap.spread_pct,
+        )
+        diag_base["hold_ev_score"] = _hev.hold_ev_score
+        diag_base["hold_ev_recommendation"] = _hev.recommendation
+        diag_base["hold_ev_confidence"] = _hev.confidence
+        hold_ev_reduction = hold_ev_scratch_review_reduction(_hev.hold_ev_score, _hev.confidence)
+        diag_base["hold_ev_scratch_review_reduction"] = hold_ev_reduction
+    except Exception:
+        pass
+
     def _hold(state: str, reason: str) -> ExitReviewResult:
         d = {**diag_base, "decision": DECISION_HOLD, "state": state, "reason": reason, "higher_lows": _higher_lows(review_lows)}
         return ExitReviewResult(
@@ -420,12 +457,13 @@ def evaluate_exit(
         econ=econ,
         stale_review_count=stale_review_count,
         setup_name=track.setup_name,
+        hold_ev_reduction=hold_ev_reduction,
     )
     if scratch:
         target_progress = econ.net_profit_target_pct * _scratch_progress_frac()
         diag_base["scratch_trigger_detail"] = scratch_reason
         diag_base["scratch_target_progress_pct"] = target_progress
-        diag_base["scratch_min_reviews"] = _scratch_min_reviews(track.setup_name)
+        diag_base["scratch_min_reviews"] = _effective_scratch_min_reviews(track.setup_name, hold_ev_reduction)
         diag_base["scratch_min_hold_sec"] = _scratch_min_hold_sec(track.setup_name)
         diag_base["scratch_momentum_stalled"] = _momentum_stalled(mom)
         diag_base["scratch_flat_or_slight_neg"] = _scratchable_net(executable_net_pct, econ)
@@ -441,6 +479,7 @@ def evaluate_exit(
         econ=econ,
         stale_review_count=stale_review_count,
         setup_name=track.setup_name,
+        hold_ev_reduction=hold_ev_reduction,
     )
     if stall:
         diag_base["scratch_trigger_detail"] = stall_reason
@@ -485,7 +524,7 @@ def evaluate_exit(
     scratch_ready = hold_sec >= _scratch_min_hold_sec(track.setup_name)
     if (
         scratch_ready
-        and stale_review_count >= _scratch_min_reviews(track.setup_name)
+        and stale_review_count >= _effective_scratch_min_reviews(track.setup_name, hold_ev_reduction)
         and max_fav < target_progress
         and _scratchable_net(executable_net_pct, econ)
         and momentum_stalled

@@ -27,9 +27,7 @@ from backend.services.portfolio_engine import (
 
 
 def test_explainability_class_carries_day_bandit_fields():
-    ex = TradeExplainability(
-        trade_id="t1", symbol="BTC/USDT", side="BUY", timestamp="ts"
-    )
+    ex = TradeExplainability(trade_id="t1", symbol="BTC/USDT", side="BUY", timestamp="ts")
     ex.day_bandit_enabled = True
     ex.day_bandit_arm_key = "BTC/USDT|HTF_TREND_PULLBACK|range"
     ex.day_bandit_alpha = 10.4
@@ -65,9 +63,7 @@ def test_explainability_class_carries_day_bandit_fields():
 
 
 def test_stamp_day_bandit_explain_copies_all_fields():
-    ex = TradeExplainability(
-        trade_id="t2", symbol="ETH/USDT", side="BUY", timestamp="ts"
-    )
+    ex = TradeExplainability(trade_id="t2", symbol="ETH/USDT", side="BUY", timestamp="ts")
     dd = {
         "day_bandit_enabled": True,
         "day_bandit_arm_key": "ETH/USDT|HTF_TREND_PULLBACK|range",
@@ -99,9 +95,7 @@ def test_stamp_day_bandit_explain_copies_all_fields():
 
 
 def test_stamp_day_bandit_explain_tolerates_missing_dd():
-    ex = TradeExplainability(
-        trade_id="t3", symbol="SOL/USDT", side="BUY", timestamp="ts"
-    )
+    ex = TradeExplainability(trade_id="t3", symbol="SOL/USDT", side="BUY", timestamp="ts")
     _stamp_day_bandit_explain(ex, None)
     assert ex.day_bandit_enabled is False
     assert ex.day_bandit_arm_key == ""
@@ -167,9 +161,7 @@ def test_bootstrap_skips_unknown_setup_labels(tmp_path: Path):
     assert count == 2
 
     with sqlite3.connect(db) as conn:
-        arms = conn.execute(
-            "SELECT setup FROM day_outcome_bandit_arms ORDER BY setup"
-        ).fetchall()
+        arms = conn.execute("SELECT setup FROM day_outcome_bandit_arms ORDER BY setup").fetchall()
     setups = sorted(r[0] for r in arms)
     assert setups == ["HTF_TREND_PULLBACK", "RANGE_BOUNCE"]
     assert "UNKNOWN" not in setups

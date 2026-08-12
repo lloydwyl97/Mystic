@@ -204,13 +204,7 @@ def _load_closed_trades(db_path: str | Path, *, min_sell_id: int = CLEAN_INFRA_M
             hold_sec = float(r["hold_time_seconds"] or explain.get("hold_time_seconds") or explain.get("time_in_trade_sec") or 0)
             hold_min = hold_sec / 60.0 if hold_sec > 0 else 75.0
             mfe, mae = _extract_mfe_mae(explain)
-            raw_exit = str(
-                explain.get("raw_exit_reason")
-                or explain.get("exit_reason_raw")
-                or explain.get("exit_trigger")
-                or r["exit_reason"]
-                or ""
-            )
+            raw_exit = str(explain.get("raw_exit_reason") or explain.get("exit_reason_raw") or explain.get("exit_trigger") or r["exit_reason"] or "")
             rows.append(
                 ClosedTradeRow(
                     sell_id=int(r["id"]),
@@ -331,11 +325,7 @@ def _bucket_pnl_pf(trades: list[ClosedTradeRow]) -> tuple[float, float, int, int
     gw = sum(wins) if wins else 0.0
     gl = abs(sum(losses)) if losses else 0.0
     pf = (gw / gl) if gl > 0 else (999.0 if gw > 0 else 0.0)
-    np_count = sum(
-        1
-        for t in trades
-        if "NET_PROFIT" in (t.raw_exit_reason or t.exit_reason or "").upper()
-    )
+    np_count = sum(1 for t in trades if "NET_PROFIT" in (t.raw_exit_reason or t.exit_reason or "").upper())
     stall_n = sum(1 for t in trades if _is_stall_dead_loss(t))
     return float(net), float(pf), int(np_count), int(stall_n)
 
@@ -397,18 +387,14 @@ def evaluate_low_mfe_stall_penalty(
         db_path = DATABASE_PATH
 
     all_trades = _load_closed_trades(db_path, min_sell_id=min_sell_id)
-    pair_bucket = [
-        t for t in all_trades if t.symbol == sym and _setup_matches_penalty_bucket(t.setup, setup_u)
-    ]
+    pair_bucket = [t for t in all_trades if t.symbol == sym and _setup_matches_penalty_bucket(t.setup, setup_u)]
     recent = pair_bucket[-P1B_LOOKBACK:]
     stall_dead = [t for t in recent if _is_stall_dead_loss(t)]
     giveback_weak = [t for t in recent if _is_secondary_giveback_loss(t)]
     # Legacy combined count for min-threshold (stall primary; giveback can help reach 2).
     combined_weak = stall_dead + [t for t in giveback_weak if t not in stall_dead]
 
-    setup_bucket = [
-        t for t in all_trades if _setup_matches_penalty_bucket(t.setup, setup_u)
-    ][-P1B_SETUP_LOOKBACK:]
+    setup_bucket = [t for t in all_trades if _setup_matches_penalty_bucket(t.setup, setup_u)][-P1B_SETUP_LOOKBACK:]
     setup_stall = [t for t in setup_bucket if _is_stall_dead_loss(t)]
     setup_net, setup_pf, _, setup_stall_n = _bucket_pnl_pf(setup_bucket)
 
@@ -421,11 +407,7 @@ def evaluate_low_mfe_stall_penalty(
     setup_cluster = setup_stall_n >= P1B_SETUP_STALL_MIN and setup_net < 0
 
     giveback_only = stall_count == 0 and gb_count >= LOW_MFE_STALL_MIN_COUNT
-    if (
-        stall_count < LOW_MFE_STALL_MIN_COUNT
-        and not giveback_only
-        and not setup_cluster
-    ):
+    if stall_count < LOW_MFE_STALL_MIN_COUNT and not giveback_only and not setup_cluster:
         base["reason"] = "low_mfe_stall_history_insufficient"
         base["low_mfe_stall_count"] = stall_count
         base["giveback_weak_count"] = gb_count
@@ -446,11 +428,7 @@ def evaluate_low_mfe_stall_penalty(
     if effective_stall >= LOW_MFE_STALL_MIN_COUNT:
         rank_delta, ev_factor, fss_adj = _p1b_count_tier_rank_ev(effective_stall)
         quality_src = stall_dead
-        quality = (
-            sum(_trade_quality_weight(t) for t in quality_src) / len(quality_src)
-            if quality_src
-            else 0.0
-        )
+        quality = sum(_trade_quality_weight(t) for t in quality_src) / len(quality_src) if quality_src else 0.0
         # Scale magnitude by quality (up to +30% stronger on P1C).
         q_scale = 1.0 + 0.30 * quality
         rank_delta *= q_scale
@@ -500,22 +478,13 @@ def evaluate_low_mfe_stall_penalty(
     soften = 1.0
     soften_reasons: list[str] = []
     severe_bleed = effective_stall >= 3 and pair_net < 0
-    if (
-        pair_pf > P1B_SOFTEN_PF
-        and pair_np >= max(1, pair_stall_n + (1 if toxic_setup else 0))
-        and pair_net > 0
-    ):
+    if pair_pf > P1B_SOFTEN_PF and pair_np >= max(1, pair_stall_n + (1 if toxic_setup else 0)) and pair_net > 0:
         soften *= 0.45
         soften_reasons.append("bucket_pf_and_net_profit_offset")
     last3 = recent[-3:]
     last3_stall = sum(1 for t in last3 if _is_stall_dead_loss(t))
     # P1C: do not soften severe bleeders on a lucky latest-3; require zero stalls in last3.
-    if (
-        not severe_bleed
-        and len(last3) >= 3
-        and sum(t.pnl for t in last3) > 0
-        and last3_stall == 0
-    ):
+    if not severe_bleed and len(last3) >= 3 and sum(t.pnl for t in last3) > 0 and last3_stall == 0:
         soften *= 0.70
         soften_reasons.append("latest_3_net_positive")
     # Floor: keep most of the demotion for 3+ stall-dead; toxic bleeders keep more.
@@ -1546,11 +1515,7 @@ def apply_v3_outcome_ranking_to_decision_data(
         ev_mult *= float(low_mfe_pen.get("ev_factor") or 1.0)
         # size_factor stays 1.0 on low-MFE path by design
         final_score_adjustment += float(low_mfe_pen.get("final_score_adjustment") or 0.0)
-        pen_reason = str(
-            low_mfe_pen.get("outcome_penalty_reason")
-            or low_mfe_pen.get("reason")
-            or "repeated_low_mfe_stall_losses"
-        )
+        pen_reason = str(low_mfe_pen.get("outcome_penalty_reason") or low_mfe_pen.get("reason") or "repeated_low_mfe_stall_losses")
         penalty_reasons.append(pen_reason)
         dd["outcome_low_mfe_stall_rank_penalty"] = float(low_mfe_pen.get("rank_delta") or 0.0)
         dd["outcome_low_mfe_stall_ev_factor"] = float(low_mfe_pen.get("ev_factor") or 1.0)

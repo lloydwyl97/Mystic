@@ -1,0 +1,40 @@
+MYSTIC POST-UPGRADE ANALYSIS CUTOFF
+===================================
+Marked at (UTC): 2026-08-10T02:11:07.824881+00:00
+Host:            mystic-Virtual-Machine
+Git HEAD:        1b4bb3127f7e15b622f877d940adb33ac044a322
+
+Rule: future audits must filter data STRICTLY AFTER this marker.
+      Use the SQLite `system_marks` table for programmatic access.
+
+== Recent commits (upgrades included in this cutoff) ==
+1b4bb31 fix full-app bug sweep: NameError, closure-captured loop vars, stale tests
+fc0cb3b fix bugs from post-deploy audit
+a1ebc31 scalp profitability: adaptive arm blocker + micro-TP lock
+9157905 ai learning upgrades: promotion override, candlesticks, sub-regime, adaptive trail, per-coin profit
+af6fd93 add day candle-quality + model-quality soft-demotion gates
+2d7cc2d add opt-in setup+regime hard-block env for day bandit
+
+== DB row counters at cutoff (use as WHERE id > X filter) ==
+  paper_trades:              count=    196  max_id=   4185
+  scalp_paper_trades:        count=     11  max_id=   1151
+  day_outcome_attribution:   count=     97  max_id=    536
+  scalp_learning_outcomes:   count=      5  max_id=    238
+  ai_outcome_training_rows:  count=     97  max_id=   1933
+  ai_model_versions:         count=  32004  max_id=  32296
+  portfolio_engine_positions (open): 1
+
+== Ledger snapshot at cutoff ==
+  principal:        $   25,000.00
+  cash_balance:     $   20,987.62
+  positions_value:  $    2,189.39
+  realized_pnl:     $      378.02
+  unrealized_pnl:   $       -0.14
+  total_equity:     $   23,177.02
+
+Bandit arms captured: 0 (see system_marks.data_json for full snapshot)
+
+SQL usage examples:
+  paper_trades since cutoff:            SELECT * FROM paper_trades WHERE id > 4185;
+  scalp_paper_trades since cutoff:      SELECT * FROM scalp_paper_trades WHERE id > 1151;
+  attribution since cutoff:             SELECT * FROM day_outcome_attribution WHERE id > 536;

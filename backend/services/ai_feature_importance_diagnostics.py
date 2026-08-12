@@ -85,9 +85,7 @@ def compute_and_record_feature_importance(
         try:
             from sklearn.inspection import permutation_importance
 
-            result = permutation_importance(
-                gbm_model, X_val_s, y_val, n_repeats=5, random_state=42, scoring="accuracy", n_jobs=1
-            )
+            result = permutation_importance(gbm_model, X_val_s, y_val, n_repeats=5, random_state=42, scoring="accuracy", n_jobs=1)
             gbm_imp = _normalize(np.clip(np.asarray(result.importances_mean, dtype=np.float64), 0.0, None))
         except Exception as exc:
             logger.debug("GBM_PERMUTATION_IMPORTANCE_FAILED [%s] %s: %s", strategy_id, symbol, exc)

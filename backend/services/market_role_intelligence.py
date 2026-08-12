@@ -46,47 +46,48 @@ ROLE_CODES: dict[str, int] = {
 _CORR_LOOKBACK_BARS = 48  # 48h rolling window on 1h bars
 
 # Minimum feature weight to avoid noise amplification
-_RS_MIN_SIGNAL = 0.003   # 0.3% slope difference before RS contributes
-_MOM_NEUTRAL = 0.5       # momentum score == neutral
-_VOL_NEUTRAL = 0.35      # volatility normalised mid-point
-_VA_NEUTRAL = 1.0        # volume acceleration == flat
-_CORR_NEUTRAL = 0.5      # correlation normalised mid-point (raw 0.0 = neutral)
+_RS_MIN_SIGNAL = 0.003  # 0.3% slope difference before RS contributes
+_MOM_NEUTRAL = 0.5  # momentum score == neutral
+_VOL_NEUTRAL = 0.35  # volatility normalised mid-point
+_VA_NEUTRAL = 1.0  # volume acceleration == flat
+_CORR_NEUTRAL = 0.5  # correlation normalised mid-point (raw 0.0 = neutral)
 
 
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class MarketRoleContext:
     """Live structured market-role context for one symbol."""
 
     symbol: str
-    market_role: str           # descriptive label only — no ranking points from label alone
-    role_code: int             # 0-3 numeric for feature encoding
+    market_role: str  # descriptive label only — no ranking points from label alone
+    role_code: int  # 0-3 numeric for feature encoding
 
     # BTC relative strength (short = 1h slope diff, medium = 4h slope diff)
-    rs_short_1h: float | None         # range approx ±0.20 (clipped)
-    rs_medium_4h: float | None        # range approx ±0.20 (clipped)
+    rs_short_1h: float | None  # range approx ±0.20 (clipped)
+    rs_medium_4h: float | None  # range approx ±0.20 (clipped)
 
     # Cross-asset metrics (computed from timestamp-aligned 1h OHLCV, 48-bar window)
-    btc_correlation: float | None     # Pearson [-1, +1]
-    btc_beta: float | None            # regression beta
+    btc_correlation: float | None  # Pearson [-1, +1]
+    btc_beta: float | None  # regression beta
 
     # Composite scores
-    momentum_score: float | None      # weighted ema_align + slope composite [0,1]
-    volatility_score: float | None    # normalized ATR [0=low, 1=high]
-    volume_accel: float | None        # recent_vol / historic_vol (1.0 = flat)
+    momentum_score: float | None  # weighted ema_align + slope composite [0,1]
+    volatility_score: float | None  # normalized ATR [0=low, 1=high]
+    volume_accel: float | None  # recent_vol / historic_vol (1.0 = flat)
 
     # Catalyst / news (from pluggable provider)
-    catalyst_score: float | None      # [0, 1]
-    catalyst_source: str              # provider name or "unavailable"
+    catalyst_score: float | None  # [0, 1]
+    catalyst_source: str  # provider name or "unavailable"
     catalyst_category: str | None
     catalyst_freshness_sec: int | None
 
     # Market regime context
-    market_regime: str                # "trending_up" / "chop" / "trending_down"
-    risk_regime: str                  # "risk_on" / "neutral" / "risk_off"
+    market_regime: str  # "trending_up" / "chop" / "trending_down"
+    risk_regime: str  # "risk_on" / "neutral" / "risk_off"
 
     # Live context adjustment (data-driven, no static role points)
     live_context_adjustment: float = 0.0
@@ -122,13 +123,13 @@ class MarketRoleContext:
         # Momentum: above-neutral is constructive, below-neutral is cautionary
         mom = self.momentum_score
         if mom is not None:
-            mom_deviation = mom - _MOM_NEUTRAL           # positive = bullish
+            mom_deviation = mom - _MOM_NEUTRAL  # positive = bullish
             delta += max(-0.012, min(0.012, mom_deviation * 0.12))
 
         # Volume acceleration: above-flat inflow is constructive
         va = self.volume_accel
         if va is not None:
-            va_deviation = va - _VA_NEUTRAL              # positive = accelerating
+            va_deviation = va - _VA_NEUTRAL  # positive = accelerating
             delta += max(-0.008, min(0.008, va_deviation * 0.008))
 
         # BTC correlation: higher correlation during risk-off → tighter BTC linkage
@@ -155,6 +156,7 @@ class MarketRoleContext:
 # ---------------------------------------------------------------------------
 # Timestamp alignment helpers
 # ---------------------------------------------------------------------------
+
 
 def _ts(row: list | tuple) -> int:
     """Extract integer millisecond timestamp from CCXT OHLCV row."""
@@ -199,6 +201,7 @@ def _align_candles(
 # ---------------------------------------------------------------------------
 # Computation helpers
 # ---------------------------------------------------------------------------
+
 
 def _returns(closes: np.ndarray) -> np.ndarray:
     """Log returns, safe for zero/near-zero prices."""
@@ -290,14 +293,16 @@ def _volatility_score(sym_rows_1h: list | None) -> float | None:
     """
     if not sym_rows_1h or len(sym_rows_1h) < 14:
         return None
-    highs  = np.array([float(r[2]) for r in sym_rows_1h], dtype=np.float64)
-    lows   = np.array([float(r[3]) for r in sym_rows_1h], dtype=np.float64)
+    highs = np.array([float(r[2]) for r in sym_rows_1h], dtype=np.float64)
+    lows = np.array([float(r[3]) for r in sym_rows_1h], dtype=np.float64)
     closes = np.array([float(r[4]) for r in sym_rows_1h], dtype=np.float64)
-    tr = np.maximum.reduce([
-        highs[1:] - lows[1:],
-        np.abs(highs[1:] - closes[:-1]),
-        np.abs(lows[1:] - closes[:-1]),
-    ])
+    tr = np.maximum.reduce(
+        [
+            highs[1:] - lows[1:],
+            np.abs(highs[1:] - closes[:-1]),
+            np.abs(lows[1:] - closes[:-1]),
+        ]
+    )
     atr14 = float(np.mean(tr[-14:]))
     ref = float(closes[-1]) or 1.0
     atr_pct = atr14 / ref
@@ -313,6 +318,7 @@ def _volume_acceleration(recent_vol: float, hist_vol: float) -> float | None:
 # ---------------------------------------------------------------------------
 # Main compute function
 # ---------------------------------------------------------------------------
+
 
 async def compute_market_role_context(
     symbol: str,

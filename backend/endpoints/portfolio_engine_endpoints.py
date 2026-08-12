@@ -745,6 +745,163 @@ async def get_all_coins_status() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@router.get("/unified-ev-contract")
+async def get_unified_ev_contract_manifest() -> dict[str, Any]:
+    """
+    Item p22: the declarative manifest of every ranking/EV/sizing/exit
+    family currently wired into DAY and/or SCALP, with each family's real
+    live weight/cap (never a hardcoded duplicate), stage, and module
+    location. Single source of truth for "what feeds ranking and how much."
+    """
+    try:
+        from backend.services.unified_ev_contract import manifest_as_dict
+
+        return {
+            "success": True,
+            "manifest": manifest_as_dict(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception(f"Error getting unified EV contract manifest: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/unified-ev-contract/{symbol}")
+async def get_unified_ev_contract_snapshot(symbol: str) -> dict[str, Any]:
+    """
+    Item p22: per-symbol audit breakdown — flattens the live ai_context
+    Redis payload for `symbol` (+ SCALP ranking meta when available) into
+    one per-family view for "why did this symbol rank where it did."
+    """
+    try:
+        symbol = symbol.upper().replace("/", "").replace("-", "").replace("_", "")
+        if not symbol.endswith("USDT"):
+            symbol = f"{symbol}USDT"
+
+        from backend.services.unified_ev_contract import compute_unified_ranking_snapshot
+
+        engine = get_portfolio_engine()
+        ctx_payload, ctx_age_sec = engine._get_context_payload(symbol)
+
+        scalp_meta: dict[str, Any] | None = None
+        with contextlib.suppress(Exception):
+            from backend.services.binance_scalp.scalp_strategy_router import get_last_ranking_meta
+
+            scalp_meta = get_last_ranking_meta(symbol)
+
+        calibration: dict[str, Any] | None = None
+        with contextlib.suppress(Exception):
+            from backend.services.ai_calibration_tracker import calibration_confidence_multiplier
+
+            cal_mult, cal_reason = calibration_confidence_multiplier(symbol)
+            calibration = {"mult": cal_mult, "reason": cal_reason}
+
+        snapshot = compute_unified_ranking_snapshot(symbol, ctx_payload=ctx_payload, scalp_ranking_meta=scalp_meta, calibration=calibration)
+        snapshot["ctx_age_sec"] = ctx_age_sec if ctx_age_sec != float("inf") else None
+        return {
+            "success": True,
+            "data": snapshot,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception(f"Error getting unified EV contract snapshot for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/model-calibration")
+async def get_model_calibration_snapshots() -> dict[str, Any]:
+    """
+    Item p12: latest persisted Brier score / ECE model-probability
+    calibration snapshot per symbol (backend/services/
+    ai_calibration_tracker.py — how well predicted confidence matches
+    realized win rate), recomputed every 15 minutes by the background
+    calibration-tracking loop in start_ai_learning.py. Diagnostic-only —
+    never gates trading. Distinct from the existing `/calibration` endpoint
+    below, which reports trade-level profitability calibration (win rate,
+    profit factor, cost drag), not model probability calibration.
+    """
+    try:
+        rows: list[dict[str, Any]] = []
+        with connect_ro(DATABASE_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            for r in conn.execute(
+                """
+                SELECT symbol, computed_at_utc, sample_count, brier_score, ece, available, degraded, degraded_reason
+                FROM ai_calibration_snapshots
+                WHERE id IN (
+                    SELECT MAX(id) FROM ai_calibration_snapshots GROUP BY symbol
+                )
+                ORDER BY symbol
+                """
+            ):
+                rows.append(dict(r))
+        return {
+            "success": True,
+            "snapshots": rows,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception(f"Error getting calibration snapshots: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/walk-forward/{symbol}")
+async def get_walk_forward_report(symbol: str, strategy_id: str = "day", n_splits: int = 5) -> dict[str, Any]:
+    """
+    Item p13: purged/embargoed walk-forward validation report for `symbol`
+    — real after-cost win rate/profit factor/drawdown per fold from
+    ai_outcome_training_rows, with training rows whose outcome window
+    overlaps each test fold purged (+ a boundary embargo), removing the
+    lookahead leakage present in every plain chronological split elsewhere
+    in the repo. Offline diagnostic — never called from the live decision
+    path.
+    """
+    try:
+        symbol = symbol.upper().replace("/", "").replace("-", "").replace("_", "")
+        if not symbol.endswith("USDT"):
+            symbol = f"{symbol}USDT"
+
+        from backend.services.walk_forward_validation import load_and_report_for_symbol
+
+        report = load_and_report_for_symbol(strategy_id, symbol, db_path=DATABASE_PATH, n_splits=n_splits)
+        return {
+            "success": True,
+            "data": report.to_dict(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception(f"Error getting walk-forward report for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/feature-ablation/{symbol}")
+async def get_feature_ablation_report(symbol: str, strategy_id: str = "day") -> dict[str, Any]:
+    """
+    Item p14: zero-ablation impact of each named feature family on real
+    after-cost net expectancy/profit factor/drawdown/MFE-capture, measured
+    against the live active model artifact + real closed-trade outcome
+    rows. Offline diagnostic — never called from the live decision path.
+    """
+    try:
+        symbol = symbol.upper().replace("/", "").replace("-", "").replace("_", "")
+        if not symbol.endswith("USDT"):
+            symbol = f"{symbol}USDT"
+
+        from backend.services.feature_family_ablation import load_and_run_ablation_for_symbol
+        from backend.services.live_strategy_contracts import per_coin_artifact_file
+
+        model_path = per_coin_artifact_file("models/active", strategy_id, symbol)
+        report = load_and_run_ablation_for_symbol(strategy_id, symbol, db_path=DATABASE_PATH, model_artifact_path=str(model_path))
+        return {
+            "success": True,
+            "data": report.to_dict(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception(f"Error getting feature ablation report for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.get("/decisions")
 async def get_last_decisions(count: int = 10) -> dict[str, Any]:
     """
@@ -1682,10 +1839,7 @@ async def set_execution_mode(
             return {
                 "success": True,
                 "status": "restart_required",
-                "message": (
-                    "Live flags written to .env. Service must restart to activate real order placement. "
-                    "Use /api/system/restart to apply."
-                ),
+                "message": ("Live flags written to .env. Service must restart to activate real order placement. Use /api/system/restart to apply."),
             }
 
         if mode == "paper":
@@ -1703,10 +1857,7 @@ async def set_execution_mode(
             return {
                 "success": True,
                 "status": "restart_required",
-                "message": (
-                    "Paper flags written to .env. Service must restart to deactivate live orders. "
-                    "Use /api/system/restart to apply."
-                ),
+                "message": ("Paper flags written to .env. Service must restart to deactivate live orders. Use /api/system/restart to apply."),
             }
 
         # Fallback: unknown mode
@@ -1838,12 +1989,8 @@ async def get_model_panel() -> dict[str, Any]:
                         "candidate_holdout_pac": meta.get("candidate_holdout_pac"),
                         "feature_version": meta.get("feature_version"),
                         "feature_dim": meta.get("feature_dim"),
-                        "last_promotion_event": pe.get("last_event_at")
-                        if pe.get("last_event_type") in ("promote", "promoted")
-                        else None,
-                        "last_rejection_event": pe.get("last_event_at")
-                        if pe.get("last_event_type") in ("reject", "rejected")
-                        else None,
+                        "last_promotion_event": pe.get("last_event_at") if pe.get("last_event_type") in ("promote", "promoted") else None,
+                        "last_rejection_event": pe.get("last_event_at") if pe.get("last_event_type") in ("reject", "rejected") else None,
                         # Model diversity / calibration provenance (see ai_blended_classifier.py,
                         # ai_training_pipeline.py, ai_feature_importance_diagnostics.py).
                         "blend_status": meta.get("active_blend_status"),

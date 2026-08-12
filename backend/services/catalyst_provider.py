@@ -31,29 +31,32 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Catalyst categories (open-ended string, these are suggestions)
-CATALYST_CATEGORIES = frozenset({
-    "regulatory",
-    "etf_flow",
-    "institutional",
-    "protocol_upgrade",
-    "partnership",
-    "macro_event",
-    "negative_event",
-    "unknown",
-})
+CATALYST_CATEGORIES = frozenset(
+    {
+        "regulatory",
+        "etf_flow",
+        "institutional",
+        "protocol_upgrade",
+        "partnership",
+        "macro_event",
+        "negative_event",
+        "unknown",
+    }
+)
 
 
 @dataclass(frozen=True)
 class CatalystResult:
     """Structured result from a catalyst provider."""
+
     symbol: str
-    score: float               # [0, 1] relevance/impact score
-    source: str                # provider name
-    freshness_sec: int         # age of the underlying data
-    confidence: float = 1.0   # how confident the score is [0, 1]
-    category: str | None = None         # catalyst type
-    direction: str | None = None        # "positive" / "negative" / "neutral"
-    headline: str | None = None         # brief summary
+    score: float  # [0, 1] relevance/impact score
+    source: str  # provider name
+    freshness_sec: int  # age of the underlying data
+    confidence: float = 1.0  # how confident the score is [0, 1]
+    category: str | None = None  # catalyst type
+    direction: str | None = None  # "positive" / "negative" / "neutral"
+    headline: str | None = None  # brief summary
     expires_at: float = field(default_factory=lambda: time.time() + 3600)
     is_stale: bool = False
 
@@ -216,21 +219,91 @@ class NewsDataIoCatalystProvider(CatalystProvider):
         "SOLUSDT": "SOL",
         "XRPUSDT": "XRP",
     }
-    _BULLISH_WORDS: frozenset[str] = frozenset({
-        "surge", "rally", "breakout", "bullish", "gains", "gained", "high", "target",
-        "approval", "approved", "etf", "institutional", "inflow", "inflows", "buy",
-        "bought", "accumulate", "launch", "upgrade", "partnership", "milestone",
-        "record", "adoption", "outperform", "strong", "support", "recover", "reclaim",
-        "positive", "optimistic", "growth", "rise", "rising", "jumped", "explode",
-        "moon", "upside", "momentum", "demand", "interest", "listing",
-    })
-    _BEARISH_WORDS: frozenset[str] = frozenset({
-        "crash", "drop", "fall", "fell", "sell", "bearish", "concern", "risk",
-        "warning", "exploit", "hack", "breach", "loss", "lose", "lawsuit", "ban",
-        "rejected", "decline", "dump", "plunge", "collapse", "vulnerability", "fraud",
-        "scam", "fear", "panic", "outflow", "outflows", "withdraw", "negative",
-        "pessimistic", "weak", "resistance", "struggle", "failed", "failure",
-    })
+    _BULLISH_WORDS: frozenset[str] = frozenset(
+        {
+            "surge",
+            "rally",
+            "breakout",
+            "bullish",
+            "gains",
+            "gained",
+            "high",
+            "target",
+            "approval",
+            "approved",
+            "etf",
+            "institutional",
+            "inflow",
+            "inflows",
+            "buy",
+            "bought",
+            "accumulate",
+            "launch",
+            "upgrade",
+            "partnership",
+            "milestone",
+            "record",
+            "adoption",
+            "outperform",
+            "strong",
+            "support",
+            "recover",
+            "reclaim",
+            "positive",
+            "optimistic",
+            "growth",
+            "rise",
+            "rising",
+            "jumped",
+            "explode",
+            "moon",
+            "upside",
+            "momentum",
+            "demand",
+            "interest",
+            "listing",
+        }
+    )
+    _BEARISH_WORDS: frozenset[str] = frozenset(
+        {
+            "crash",
+            "drop",
+            "fall",
+            "fell",
+            "sell",
+            "bearish",
+            "concern",
+            "risk",
+            "warning",
+            "exploit",
+            "hack",
+            "breach",
+            "loss",
+            "lose",
+            "lawsuit",
+            "ban",
+            "rejected",
+            "decline",
+            "dump",
+            "plunge",
+            "collapse",
+            "vulnerability",
+            "fraud",
+            "scam",
+            "fear",
+            "panic",
+            "outflow",
+            "outflows",
+            "withdraw",
+            "negative",
+            "pessimistic",
+            "weak",
+            "resistance",
+            "struggle",
+            "failed",
+            "failure",
+        }
+    )
     _CATEGORY_HINTS: dict[str, list[tuple[str, list[str]]]] = {
         "XRPUSDT": [
             ("regulatory", ["sec", "ripple", "lawsuit", "ruling", "etf", "approval", "rlusd", "regulatory"]),
@@ -288,11 +361,16 @@ class NewsDataIoCatalystProvider(CatalystProvider):
             if cached:
                 r, _ = cached
                 return CatalystResult(
-                    symbol=r.symbol, score=r.score, source=r.source,
+                    symbol=r.symbol,
+                    score=r.score,
+                    source=r.source,
                     freshness_sec=int(time.time() - cached[1]),
                     confidence=round(r.confidence * 0.5, 4),
-                    category=r.category, direction=r.direction, headline=r.headline,
-                    expires_at=r.expires_at, is_stale=True,
+                    category=r.category,
+                    direction=r.direction,
+                    headline=r.headline,
+                    expires_at=r.expires_at,
+                    is_stale=True,
                 )
             return None
 
@@ -301,11 +379,16 @@ class NewsDataIoCatalystProvider(CatalystProvider):
         if cached and (time.time() - cached[1]) < self._cache_ttl():
             r, cached_at = cached
             return CatalystResult(
-                symbol=r.symbol, score=r.score, source=r.source,
+                symbol=r.symbol,
+                score=r.score,
+                source=r.source,
                 freshness_sec=int(time.time() - cached_at),
-                confidence=r.confidence, category=r.category,
-                direction=r.direction, headline=r.headline,
-                expires_at=r.expires_at, is_stale=False,
+                confidence=r.confidence,
+                category=r.category,
+                direction=r.direction,
+                headline=r.headline,
+                expires_at=r.expires_at,
+                is_stale=False,
             )
 
         coin_param = self._COIN_PARAMS.get(sym)
@@ -403,6 +486,7 @@ class NewsDataIoCatalystProvider(CatalystProvider):
             if top_pub_date:
                 with contextlib.suppress(Exception):
                     from datetime import datetime, timezone
+
                     tnorm = str(top_pub_date).replace(" ", "T")
                     t = datetime.fromisoformat(tnorm)
                     if t.tzinfo is None:
@@ -431,7 +515,14 @@ class NewsDataIoCatalystProvider(CatalystProvider):
         NewsDataIoCatalystProvider._CACHE[sym] = (result_obj, time.time())
         logger.info(
             "NEWSDATA_IO %s score=%.3f dir=%s cat=%s articles=%d bull=%.2f bear=%.2f fresh=%ds",
-            sym, score, direction, category, len(articles), total_bull, total_bear, freshness,
+            sym,
+            score,
+            direction,
+            category,
+            len(articles),
+            total_bull,
+            total_bear,
+            freshness,
         )
         return result_obj
 

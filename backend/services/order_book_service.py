@@ -302,6 +302,19 @@ class OrderBookService:
             await self.redis.hset(order_book_key, mapping=mapping)
             await self.redis.expire(order_book_key, ttl)
 
+            # Real microstructure engine: multi-depth imbalance, microprice,
+            # snapshot-OFI, queue dynamics, imbalance persistence/slope. Feeds
+            # ranking/EV only — never a gate. Best-effort; never blocks the
+            # order-book hot path.
+            with contextlib.suppress(Exception):
+                from backend.services.microstructure_engine import (
+                    publish_to_redis_async,
+                    record_snapshot,
+                )
+
+                record_snapshot(symbol, bids, asks)
+                await publish_to_redis_async(symbol, self.redis)
+
             self.stats["updates_processed"] += 1
             self.stats["features_calculated"] += 1
 

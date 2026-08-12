@@ -183,13 +183,9 @@ def build_attribution_payload(
     blocks = compute_block_scores_from_decision_data(ex)
     if not ex.get("feature_health_score"):
         ex["feature_health_score"] = blocks.get("feature_health_score", 0.0)
-    exit_parts = split_day_exit_reasons(
-        str(ex.get("raw_exit_reason") or ex.get("exit_trigger") or close_reason or "")
-    )
+    exit_parts = split_day_exit_reasons(str(ex.get("raw_exit_reason") or ex.get("exit_trigger") or close_reason or ""))
     raw_exit = str(ex.get("raw_exit_reason") or exit_parts["raw_exit_reason"] or close_reason or "")
-    canonical_exit = str(
-        ex.get("canonical_exit_reason") or exit_parts["canonical_exit_reason"] or close_reason or ""
-    )
+    canonical_exit = str(ex.get("canonical_exit_reason") or exit_parts["canonical_exit_reason"] or close_reason or "")
     reason = classify_outcome_reason(
         explainability=ex,
         net_profit_pct=net_profit_pct,

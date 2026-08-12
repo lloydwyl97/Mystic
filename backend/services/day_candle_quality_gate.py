@@ -215,9 +215,7 @@ def compute_candle_quality(decision_data: dict[str, Any]) -> dict[str, Any]:
         }
 
     dd = dict(decision_data or {})
-    direction = str(
-        dd.get("side") or dd.get("prediction") or dd.get("action") or ""
-    ).strip().lower()
+    direction = str(dd.get("side") or dd.get("prediction") or dd.get("action") or "").strip().lower()
 
     last_vol_ratio = _safe_float(dd.get("recent_last_bar_vol_ratio"), 1.0)
     vp_div = _safe_float(dd.get("recent_vp_divergence"), 0.0)

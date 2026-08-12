@@ -24,9 +24,7 @@ def _hget_redis(redis_obj: Any, key: str, field: str) -> str | None:
 def _count_ai_signals_pending() -> int:
     try:
         with sqlite3.connect(DATABASE_PATH, timeout=3) as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM ai_live_signals WHERE consumed = 0"
-            ).fetchone()
+            row = conn.execute("SELECT COUNT(*) FROM ai_live_signals WHERE consumed = 0").fetchone()
             return int(row[0]) if row else 0
     except Exception:
         return 0

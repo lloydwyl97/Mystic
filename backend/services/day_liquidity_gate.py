@@ -283,9 +283,7 @@ def apply_liquidity_gate_to_decision_data(
         dd["candidate_eligible"] = False
         # Preserve any pre-existing block reason but prepend this one for clarity.
         existing_reason = str(dd.get("hard_block_reason") or "")
-        dd["hard_block_reason"] = str(result["liquidity_hard_block_reason"]) + (
-            f"|{existing_reason}" if existing_reason else ""
-        )
+        dd["hard_block_reason"] = str(result["liquidity_hard_block_reason"]) + (f"|{existing_reason}" if existing_reason else "")
     else:
         dd["hard_block"] = bool(dd.get("hard_block") or False)
         dd["candidate_eligible"] = bool(dd.get("candidate_eligible", True) and not dd.get("hard_block"))

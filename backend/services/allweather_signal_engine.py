@@ -238,9 +238,7 @@ def diagnose_entry_state(
         trend_pullback = bool(near_ema and resuming and 35.0 <= state.rsi <= 62.0)
         breakout = bool(c > state.don_high and state.rsi <= BREAKOUT_RSI_MAX_TREND)
     elif state.regime == REG_NEUTRAL:
-        breakout = bool(
-            c > state.don_high and c > state.ema55 and state.adx >= 18 and state.rsi <= BREAKOUT_RSI_MAX_NEUTRAL
-        )
+        breakout = bool(c > state.don_high and c > state.ema55 and state.adx >= 18 and state.rsi <= BREAKOUT_RSI_MAX_NEUTRAL)
     elif state.regime == REG_RANGE:
         recent_low = state.don_low
         range_bounce = bool(c > recent_low * 1.001 and state.rsi < 45 and c > state.prev_close)
@@ -309,12 +307,7 @@ def entry_signal(state: AWState) -> dict[str, Any] | None:
         # Continuation while trend intact (emas stacked + adx + not blown-out + up tick).
         # Lets the app trade "up" regimes that are grinding without a fresh donchian break or deep band pullback on this exact bar.
         # Conservative brackets. Generates outcomes for learning instead of idling.
-        if (
-            state.ema21 > state.ema55 > state.ema200
-            and state.adx >= 18
-            and state.rsi < CONTINUATION_RSI_MAX
-            and c > state.prev_close
-        ):
+        if state.ema21 > state.ema55 > state.ema200 and state.adx >= 18 and state.rsi < CONTINUATION_RSI_MAX and c > state.prev_close:
             return {"setup": SETUP_TREND_PULLBACK, "regime": state.regime, "target_atr": 2.0, "stop_atr": 1.2}
 
     if state.regime == REG_NEUTRAL:

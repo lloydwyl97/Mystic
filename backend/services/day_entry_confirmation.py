@@ -196,22 +196,13 @@ def compute_entry_confirmation(
     w = dict(weights or DEFAULT_WEIGHTS)
 
     entry_vwap = float(dd.get("entry_vwap") or 0.0)
-    mark = float(
-        current_price
-        if current_price is not None
-        else (dd.get("current_price") or dd.get("mark_price") or dd.get("price") or 0.0)
-    )
+    mark = float(current_price if current_price is not None else (dd.get("current_price") or dd.get("mark_price") or dd.get("price") or 0.0))
     body = float(dd.get("candle_body_pct") or 0.0)
     upper = float(dd.get("candle_upper_wick_pct") or 0.0)
     lower = float(dd.get("candle_lower_wick_pct") or 0.0)
     ema = dd.get("signal_ema_alignment")
     adx = dd.get("signal_adx") or dd.get("adx")
-    setup = (
-        dd.get("setup_type_canonical")
-        or dd.get("setup_type")
-        or dd.get("entry_thesis")
-        or ""
-    )
+    setup = dd.get("setup_type_canonical") or dd.get("setup_type") or dd.get("entry_thesis") or ""
 
     vwap_c, vwap_r = _mark_vs_vwap_credit(mark, entry_vwap)
     body_c, body_r = _candle_body_credit(body, upper, lower)

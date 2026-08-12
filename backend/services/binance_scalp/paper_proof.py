@@ -58,12 +58,7 @@ def compute_paper_proof(db_path: str | Path) -> dict[str, Any]:
         if raw:
             try:
                 d = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
-                setup = str(
-                    d.get("setup_name")
-                    or (d.get("entry_setup_signal") or {}).get("setup_name")
-                    or d.get("scalp_setup")
-                    or "unknown"
-                )
+                setup = str(d.get("setup_name") or (d.get("entry_setup_signal") or {}).get("setup_name") or d.get("scalp_setup") or "unknown")
             except Exception:
                 pass
         bucket = by_setup.setdefault(setup, {"n": 0.0, "pnl": 0.0, "wins": 0.0})
@@ -74,12 +69,7 @@ def compute_paper_proof(db_path: str | Path) -> dict[str, Any]:
 
     win_rate = (wins / sells) if sells else 0.0
     pf = (gross_win / gross_loss) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
-    ready = (
-        sells >= MIN_CLOSED_SELLS
-        and net >= MIN_NET_PNL_USD
-        and win_rate >= MIN_WIN_RATE
-        and pf >= MIN_PROFIT_FACTOR
-    )
+    ready = sells >= MIN_CLOSED_SELLS and net >= MIN_NET_PNL_USD and win_rate >= MIN_WIN_RATE and pf >= MIN_PROFIT_FACTOR
     return {
         "closed_sells": sells,
         "wins": wins,

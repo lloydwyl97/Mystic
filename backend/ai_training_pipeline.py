@@ -1661,18 +1661,19 @@ class AITrainingDataPipeline:
                         try:
                             from backend.services.ai_blended_classifier import build_blended_classifier
 
-                            final_model, blend_telemetry = build_blended_classifier(
-                                model, X_train_s, y_train, w_train, X_val_s, y_val
-                            )
+                            final_model, blend_telemetry = build_blended_classifier(model, X_train_s, y_train, w_train, X_val_s, y_val)
                         except Exception as blend_e:
                             logger.debug("BLENDED_CLASSIFIER_SKIPPED: [%s] %s (%s)", strat, sym, blend_e)
-                            final_model, blend_telemetry = model, {
-                                "rf_val_acc": round(float(acc), 4),
-                                "gbm_val_acc": None,
-                                "blend_w_rf": 1.0,
-                                "blend_w_gbm": 0.0,
-                                "blend_status": "rf_only_exception",
-                            }
+                            final_model, blend_telemetry = (
+                                model,
+                                {
+                                    "rf_val_acc": round(float(acc), 4),
+                                    "gbm_val_acc": None,
+                                    "blend_w_rf": 1.0,
+                                    "blend_w_gbm": 0.0,
+                                    "blend_status": "rf_only_exception",
+                                },
+                            )
                         if blend_telemetry.get("blend_status") == "blended":
                             acc = float(final_model.score(X_val_s, y_val))
 

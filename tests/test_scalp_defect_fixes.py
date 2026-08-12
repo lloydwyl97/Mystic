@@ -156,16 +156,12 @@ def test_empty_scalp_ledger_repairs_cash_basis_mismatch(tmp_path: Path):
     db_path = tmp_path / "scalp.db"
     init_scalp_schema(db_path, principal=1000.0)
     with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            "UPDATE scalp_paper_ledger SET cash_balance=10000, total_equity=10000 WHERE id=1"
-        )
+        conn.execute("UPDATE scalp_paper_ledger SET cash_balance=10000, total_equity=10000 WHERE id=1")
         conn.commit()
 
     applied = init_scalp_schema(db_path, principal=1000.0)
 
     with sqlite3.connect(db_path) as conn:
-        row = conn.execute(
-            "SELECT principal, cash_balance, total_equity FROM scalp_paper_ledger WHERE id=1"
-        ).fetchone()
+        row = conn.execute("SELECT principal, cash_balance, total_equity FROM scalp_paper_ledger WHERE id=1").fetchone()
     assert "repair_empty_ledger_basis" in applied
     assert row == (1000.0, 1000.0, 1000.0)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from typing import Any
@@ -10,6 +11,7 @@ from backend.services.binance_scalp.config import ScalpConfig
 from backend.services.binance_scalp.economics import ScalpEconomics
 from backend.services.binance_scalp.market_reader import MarketSnapshot, ScalpMarketReader
 from backend.services.binance_scalp.momentum_tracker import MomentumDiagnostics, MomentumTracker
+from backend.services.binance_scalp.redis_keys import ranking_meta_key
 from backend.services.binance_scalp.scalp_candidate_ranking import (
     RankedCandidate,
     pick_best_ranked,
@@ -24,8 +26,73 @@ from backend.services.binance_scalp.scalp_regime_classifier import (
 from backend.services.binance_scalp.strategies import STRATEGY_NAMES, enabled_strategies
 from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, StrategyMarketContext
 from backend.services.binance_scalp.strategies.kline_cache import KlineCache, MIN_REGIME_1H_BARS
+from backend.services.multi_horizon_ev import cached_multi_horizon_ev
 
 logger = logging.getLogger(__name__)
+
+# Last per-symbol ranking meta from evaluate_all() (item p22 unified EV
+# contract wiring) — read-only diagnostic cache, never a decision input.
+# In-process only: fast path for same-process callers (tests, and the scalp
+# runner itself). The live scalp runner and the API/uvicorn process are
+# separate OS processes, so this dict is invisible across processes —
+# get_last_ranking_meta() falls back to the cross-process Redis snapshot
+# (_publish_ranking_meta_to_redis / ranking_meta_key) for that case.
+_LAST_RANKING_META_BY_SYMBOL: dict[str, dict[str, Any]] = {}
+
+
+def _json_safe_ranking_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Strip/convert the non-JSON-safe pieces of an evaluate_all() row
+    (raw MarketSnapshot/ScalpSetupSignal objects) before publishing to
+    Redis for cross-process diagnostic reads."""
+    safe = {k: v for k, v in row.items() if k not in ("snap", "signal")}
+    signal = row.get("signal")
+    if signal is not None:
+        with contextlib.suppress(Exception):
+            safe["signal"] = signal.as_dict()
+    return safe
+
+
+def _publish_ranking_meta_to_redis(sym: str, row: dict[str, Any], *, redis_url: str, prefix: str) -> None:
+    try:
+        import json
+
+        import redis as redis_sync
+
+        client = redis_sync.from_url(redis_url, decode_responses=True)
+        key = ranking_meta_key(prefix, sym)
+        client.setex(key, 30, json.dumps(_json_safe_ranking_row(row), default=str))
+    except Exception as exc:
+        logger.debug("SCALP_RANKING_META_REDIS_PUBLISH_FAILED symbol=%s: %s", sym, exc)
+
+
+def get_last_ranking_meta(symbol: str, *, redis_url: str | None = None, prefix: str | None = None) -> dict[str, Any] | None:
+    """Most recent evaluate_all() ranking row for `symbol`. Checks the
+    in-process cache first (same-process callers, e.g. tests or the scalp
+    runner itself), then falls back to the cross-process Redis snapshot
+    (needed for the API/uvicorn process, which runs as a separate OS
+    process from the scalp runner and never shares its memory).
+    Diagnostic-only (used by the unified EV contract API endpoint); never
+    consulted by any entry/exit/sizing decision path."""
+    row = _LAST_RANKING_META_BY_SYMBOL.get(symbol)
+    if row is not None:
+        return dict(row)
+    try:
+        import json
+
+        import redis as redis_sync
+
+        from backend.services.binance_scalp.config import ScalpConfig
+
+        cfg_defaults = ScalpConfig.from_env()
+        url = redis_url or cfg_defaults.redis_url
+        pfx = prefix or cfg_defaults.redis_key_prefix
+        client = redis_sync.from_url(url, decode_responses=True)
+        raw = client.get(ranking_meta_key(pfx, symbol))
+        if raw:
+            return json.loads(raw)
+    except Exception as exc:
+        logger.debug("SCALP_RANKING_META_REDIS_READ_FAILED symbol=%s: %s", symbol, exc)
+    return None
 
 
 def _mtf_confirmation_gate_enabled() -> bool:
@@ -189,54 +256,65 @@ class ScalpStrategyRouter:
         hard_block = best_ranked.hard_block
         selection_confidence = best_ranked.selection_confidence
 
-        if entry_eligible and _mtf_confirmation_gate_enabled():
+        # Architecture v2 (2026-08-11): "all-timeframes-must-agree" is exactly
+        # the opinion-gate pattern the ranking architecture forbids. MTF
+        # (dis)agreement is real evidence, but it now moves rank_score/size
+        # down instead of setting entry_eligible=False. A down 5m/15m trend
+        # no longer excludes BTC/ETH/SOL/XRP from ranking — it makes that
+        # candidate compete with a real handicap and, via
+        # scalp_dynamic_sizing.py, trade smaller if it still wins the pick.
+        mtf_penalty_mult = 1.0
+        mtf_conflict_reason: str | None = None
+        if _mtf_confirmation_gate_enabled():
             if mtf_5m_aligned is False:
-                entry_eligible = False
-                soft_reason = "MTF_5M_NOT_ALIGNED"
-                selection_confidence = "mtf_confirmation_blocked"
-            elif _mtf_require_15m() and mtf_15m_aligned is False:
-                entry_eligible = False
-                soft_reason = "MTF_15M_NOT_ALIGNED"
-                selection_confidence = "mtf_confirmation_blocked"
-            if not entry_eligible and soft_reason and "MTF_" in str(soft_reason):
-                try:
-                    import os
+                mtf_conflict_reason = "MTF_5M_NOT_ALIGNED_RANKED"
+                mtf_penalty_mult *= float(os.getenv("SCALP_MTF_5M_CONFLICT_RANK_MULT", "0.40"))
+            if _mtf_require_15m() and mtf_15m_aligned is False:
+                mtf_conflict_reason = mtf_conflict_reason or "MTF_15M_NOT_ALIGNED_RANKED"
+                mtf_penalty_mult *= float(os.getenv("SCALP_MTF_15M_CONFLICT_RANK_MULT", "0.55"))
+            if mtf_penalty_mult < 1.0:
+                rank_score_penalized = round(float(best_ranked.rank_score) * mtf_penalty_mult, 4)
+                # RankedCandidate is frozen — rebuild with the penalized score
+                # rather than mutate, keeping every other field/provenance intact.
+                from dataclasses import replace as _replace
 
-                    from backend.services.scalp_gate_telemetry import record_gate_event, record_shadow_reject
+                best_ranked = _replace(best_ranked, rank_score=rank_score_penalized)
+                soft_reason = soft_reason or mtf_conflict_reason
+                selection_confidence = f"{selection_confidence}_mtf_conflict_ranked"
+                with contextlib.suppress(Exception):
+                    from backend.services.scalp_gate_telemetry import record_gate_event
 
                     _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
                     record_gate_event(
                         _db,
-                        gate_id="MTF_NOT_ALIGNED",
+                        gate_id="MTF_CONFLICT_RANKED",
                         symbol=sym,
-                        outcome="hard_blocked",
+                        outcome="ranked",
                         setup=best_ranked.signal.setup_name,
-                        detail=str(soft_reason),
+                        detail=f"{mtf_conflict_reason} mult={mtf_penalty_mult}",
                     )
-                    record_shadow_reject(
-                        _db,
-                        symbol=sym,
-                        gate_id="MTF_NOT_ALIGNED",
-                        setup=best_ranked.signal.setup_name,
-                        entry_price=float(getattr(best_ranked.signal, "limit_buy_price", 0.0) or 0.0),
-                        detail=str(soft_reason),
-                    )
-                except Exception:
-                    pass
 
+        meta["best_rank_score"] = best_ranked.rank_score
         meta["entry_eligible"] = entry_eligible
         meta["hard_block"] = hard_block
         meta["soft_reason"] = soft_reason
         meta["selection_confidence"] = selection_confidence
-        meta["entry_owner"] = "strategy"
+        meta["mtf_penalty_mult"] = mtf_penalty_mult
+        meta["arm_penalty_mult"] = float(best_ranked.arm_penalty_mult)
+        meta["regime_mismatch"] = bool(best_ranked.regime_mismatch)
+        meta["symbol_stall_risk"] = bool(best_ranked.symbol_stall_risk)
+        meta["microstructure_adjustment"] = float(best_ranked.microstructure_adjustment)
+        meta["strategy_passed"] = bool(best_ranked.signal.passed)
+        meta["entry_owner"] = "strategy" if best_ranked.signal.passed else "ranking_ev"
         meta["ml_role"] = "rank_size"
-        meta["decision_policy_version"] = "scalp_strategy_owner_v1"
+        meta["decision_policy_version"] = "scalp_ranking_not_gating_v2"
 
         if entry_eligible:
             entry_sig = prepare_entry_signal(best_ranked, ctx)
             return entry_sig, signals, meta
 
-        # No trade — return best scored signal for status/diagnostics only.
+        # Mechanical safety hard_block only — return best scored signal for
+        # status/diagnostics; not executable.
         display_sig = best_ranked.signal
         return display_sig, signals, meta
 
@@ -316,8 +394,22 @@ class ScalpStrategyRouter:
                 "soft_reason": meta.get("soft_reason"),
                 "reachability_surplus": meta.get("reachability_surplus"),
                 "selection_confidence": meta.get("selection_confidence"),
+                # EV-sizing inputs (scalp_dynamic_sizing.py) — never gates.
+                "strategy_passed": meta.get("strategy_passed"),
+                "arm_penalty_mult": meta.get("arm_penalty_mult", 1.0),
+                "mtf_penalty_mult": meta.get("mtf_penalty_mult", 1.0),
+                "regime_mismatch": meta.get("regime_mismatch", False),
+                "symbol_stall_risk": meta.get("symbol_stall_risk", False),
+                "microstructure_adjustment": meta.get("microstructure_adjustment", 0.0),
+                # Item p11: composite EV across SCALP's realistic 30s-20m
+                # holding horizons — diagnostic/ranking evidence only, never
+                # a gate. TTL-cached (~5min) so this cheap-but-not-free
+                # sqlite lookup doesn't run on every ~5s evaluate_all() tick.
+                "multi_horizon_ev": cached_multi_horizon_ev(sym, "scalp").to_dict(),
             }
             rows.append(row)
+            _LAST_RANKING_META_BY_SYMBOL[sym] = dict(row)
+            _publish_ranking_meta_to_redis(sym, row, redis_url=self.config.redis_url, prefix=self.config.redis_key_prefix)
 
         rows.sort(
             key=lambda r: (

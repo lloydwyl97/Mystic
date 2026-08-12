@@ -338,14 +338,8 @@ def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list
                 realized_pnl = float(ledger_row[3] or 0)
                 unrealized_pnl = float(ledger_row[4] or 0)
                 total_equity = float(ledger_row[5] or 0)
-                clean_empty = all(
-                    abs(value) < 0.01
-                    for value in (positions_value, realized_pnl, unrealized_pnl)
-                )
-                basis_mismatch = (
-                    abs(cash - canonical_principal) >= 0.01
-                    or abs(total_equity - canonical_principal) >= 0.01
-                )
+                clean_empty = all(abs(value) < 0.01 for value in (positions_value, realized_pnl, unrealized_pnl))
+                basis_mismatch = abs(cash - canonical_principal) >= 0.01 or abs(total_equity - canonical_principal) >= 0.01
                 if clean_empty and basis_mismatch:
                     conn.execute(
                         """

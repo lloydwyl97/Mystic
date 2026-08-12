@@ -17,18 +17,10 @@ def require_admin_key(
     if not admin_api_key and not admin_token:
         raise HTTPException(status_code=500, detail="Admin authentication is not configured")
 
-    api_key_ok = bool(
-        admin_api_key
-        and x_api_key
-        and hmac.compare_digest(x_api_key, admin_api_key)
-    )
+    api_key_ok = bool(admin_api_key and x_api_key and hmac.compare_digest(x_api_key, admin_api_key))
     bearer = ""
     if authorization:
         bearer = authorization[7:] if authorization.startswith("Bearer ") else authorization
-    token_ok = bool(
-        admin_token
-        and bearer
-        and hmac.compare_digest(bearer, admin_token)
-    )
+    token_ok = bool(admin_token and bearer and hmac.compare_digest(bearer, admin_token))
     if not api_key_ok and not token_ok:
         raise HTTPException(status_code=401, detail="Invalid or missing admin credential")

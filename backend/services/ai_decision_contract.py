@@ -183,6 +183,11 @@ MARKET_CONTEXT_FIELDS: Final[tuple[str, ...]] = (
     "ctx_btc_dominance_proxy",
     "ctx_market_regime",
     "ctx_sentiment_fear_greed",
+    "ctx_feature_stack_json",
+    "ctx_derivatives_json",
+    "ctx_cross_exchange_json",
+    "ctx_multi_horizon_ev_json",
+    "ctx_multi_target_ml_json",
 )
 
 
@@ -250,7 +255,20 @@ CTX_MTF_ALIGN_WEIGHT: Final[float] = 0.05  # +/- 5% from MTF agreement
 CTX_RS_WEIGHT: Final[float] = 0.025  # +/- 2.5% from BTC/ETH RS
 CTX_DEPTH_WEIGHT: Final[float] = 0.02  # +/- 2% from orderbook imbalance
 CTX_REGIME_WEIGHT: Final[float] = 0.025  # +/- 2.5% from market regime
-CTX_TOTAL_CAP: Final[float] = 0.10  # absolute cap on combined adjustment
+# Real microstructure engine (OFI + aggressor flow + microprice pressure) —
+# see backend/services/microstructure_engine.py. Ranking input only, never a
+# gate. Kept small relative to MTF/RS since it is short-horizon and noisy at
+# DAY's holding-time scale; SCALP applies its own separate bounded delta.
+CTX_MICROSTRUCTURE_WEIGHT: Final[float] = 0.02  # +/- 2% from live order-flow/microstructure
+# Feature-stack completion promotions (items p15/p16/p18/p19/p20) — kept small
+# relative to the established MTF/RS/regime signals since they are newer and
+# not yet ablation-tuned; feature_family_ablation.py can be used to validate
+# and adjust these once enough live sample history accumulates.
+CTX_FEATURE_STACK_WEIGHT: Final[float] = 0.02  # +/- 2% from momentum x RVOL confirmation (p15/p16)
+CTX_BTC_LAG_WEIGHT: Final[float] = 0.015  # +/- 1.5% from measured BTC lead/lag correlation (p19)
+CTX_DERIVATIVES_WEIGHT: Final[float] = 0.015  # +/- 1.5% from OI positioning bias + funding percentile (p18)
+CTX_CROSS_EXCHANGE_WEIGHT: Final[float] = 0.01  # +/- 1% from cross-venue price dislocation (p20)
+CTX_TOTAL_CAP: Final[float] = 0.18  # absolute cap on combined adjustment (raised from 0.12 to fit p15/16/18/19/20 promotions)
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +369,12 @@ __all__ = [
     "AI_SIGNAL_LOOP_SEC",
     "CONTEXT_DIMS_DAY_FULL",
     "CONTEXT_DIMS_V2",
+    "CTX_BTC_LAG_WEIGHT",
+    "CTX_CROSS_EXCHANGE_WEIGHT",
     "CTX_DEPTH_WEIGHT",
+    "CTX_DERIVATIVES_WEIGHT",
+    "CTX_FEATURE_STACK_WEIGHT",
+    "CTX_MICROSTRUCTURE_WEIGHT",
     "CTX_MTF_ALIGN_WEIGHT",
     "CTX_REGIME_WEIGHT",
     "CTX_RS_WEIGHT",

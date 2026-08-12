@@ -75,9 +75,9 @@ def test_decision_data_parsed_whitelist_includes_probs_and_penalties():
     assert '"signal_side_penalty"' in src
     assert '"side"' in src
     # Must not wipe accumulated dd penalties with empty q_det alone.
-    assert "_q_pen = float(dd.get(\"quality_opinion_penalty\")" in src
+    assert '_q_pen = float(dd.get("quality_opinion_penalty")' in src
     # SELL must take the same non-BUY penalty path (not a pass-through).
-    assert 'if not is_buy:' in src
+    assert "if not is_buy:" in src
     assert 'side_penalty = 8.0 if str(side).strip().lower() == "sell" else 4.0' in src
 
 

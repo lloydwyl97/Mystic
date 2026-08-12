@@ -1066,6 +1066,7 @@ def evaluate_thesis_exit(
 
     if symbol:
         from backend.config.trading_economics import min_net_profit_for_symbol
+
         min_net = float(min_net_profit_for_symbol(symbol))
     else:
         min_net = float(MIN_NET_PROFIT_TO_SELL)

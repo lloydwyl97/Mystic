@@ -14948,12 +14948,7 @@ class PortfolioEngine:
             #   * day_liquidity_gate catastrophic-spread block
             _dd_hb = _cand.decision_data or {}
             if bool(_dd_hb.get("hard_block")) or _dd_hb.get("candidate_eligible") is False:
-                _hb_reason = str(
-                    _dd_hb.get("day_bandit_hard_block_reason")
-                    or _dd_hb.get("liquidity_hard_block_reason")
-                    or _dd_hb.get("hard_block_reason")
-                    or "HARD_BLOCK"
-                )
+                _hb_reason = str(_dd_hb.get("day_bandit_hard_block_reason") or _dd_hb.get("liquidity_hard_block_reason") or _dd_hb.get("hard_block_reason") or "HARD_BLOCK")
                 logger.info(
                     "BAR_HARD_BLOCK_REJECT #%d: %s reason=%s setup=%s regime=%s",
                     _rank_idx + 1,
@@ -16100,12 +16095,7 @@ class PortfolioEngine:
         # engine treated them as metadata only. This closes that leak.
         _dd = decision_data or {}
         if bool(_dd.get("hard_block")) or _dd.get("candidate_eligible") is False:
-            _reason = str(
-                _dd.get("day_bandit_hard_block_reason")
-                or _dd.get("liquidity_hard_block_reason")
-                or _dd.get("hard_block_reason")
-                or "HARD_BLOCK"
-            )
+            _reason = str(_dd.get("day_bandit_hard_block_reason") or _dd.get("liquidity_hard_block_reason") or _dd.get("hard_block_reason") or "HARD_BLOCK")
             logger.info(
                 "CANDIDATE_REJECTED_HARD_BLOCK symbol=%s reason=%s setup=%s regime=%s",
                 symbol,

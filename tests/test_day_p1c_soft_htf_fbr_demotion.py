@@ -88,7 +88,7 @@ def _seed_stall_dead(db: str, *, symbol: str, setup: str, n: int, pnl: float = -
             mfe=0.0006,
             mae=0.005,
             hold_sec=7200.0 + i,
-            ts=f"2026-08-04T{10+i:02d}:00:00+00:00",
+            ts=f"2026-08-04T{10 + i:02d}:00:00+00:00",
         )
 
 
@@ -109,9 +109,7 @@ def test_p1c_eth_htf_stronger_than_mild_bucket(tmp_path: Path):
 def test_p1c_xrp_fbr_toxic_boost(tmp_path: Path):
     db = str(tmp_path / "fbr.db")
     _seed_stall_dead(db, symbol="XRP/USDT", setup="FAILED_BREAKDOWN_REVERSAL", n=4, pnl=-12.0)
-    pen = evaluate_low_mfe_stall_penalty(
-        "XRP/USDT", "FAILED_BREAKDOWN_REVERSAL", "bear", db_path=db
-    )
+    pen = evaluate_low_mfe_stall_penalty("XRP/USDT", "FAILED_BREAKDOWN_REVERSAL", "bear", db_path=db)
     assert pen["applied"] is True
     assert pen["rank_delta"] <= -0.40
     assert pen["ev_factor"] <= 0.40
@@ -132,7 +130,7 @@ def test_p1c_severe_bleed_not_softened_by_latest3(tmp_path: Path):
             raw_exit="NET_PROFIT_EXIT",
             mfe=0.005,
             mae=0.001,
-            ts=f"2026-08-04T{18+i:02d}:00:00+00:00",
+            ts=f"2026-08-04T{18 + i:02d}:00:00+00:00",
         )
     _seed_stall_dead(db_hard, symbol="ETH/USDT", setup="HTF_TREND_PULLBACK", n=3, pnl=-6.0)
 

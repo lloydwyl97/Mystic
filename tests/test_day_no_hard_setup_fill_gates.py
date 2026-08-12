@@ -65,7 +65,7 @@ def _seed_stall_dead(db: str, *, symbol: str, setup: str, n: int = 4, pnl: float
                 (
                     symbol,
                     pnl - i * 0.2,
-                    f"2026-08-04T{10+i:02d}:00:00+00:00",
+                    f"2026-08-04T{10 + i:02d}:00:00+00:00",
                     json.dumps(explain),
                     7200.0 + i,
                 ),

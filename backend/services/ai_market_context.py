@@ -51,11 +51,17 @@ from backend.config.day_active_timeframes import (
 from backend.config.redis_config import get_shared_redis_async
 from backend.config.trading_universe import TOP4_BASE_COINS, TRADING_SYMBOLS, get_trading_symbols
 from backend.database_schema import DATABASE_PATH
+from backend.derivatives_monitor import derivatives_positioning_signal, derivatives_reference_snapshot
 from backend.services.ai_canonical_storage import ensure_ai_canonical_tables
 from backend.services.ai_decision_contract import (
     AI_CONTEXT_LOOP_SEC,
     AI_SENTIMENT_LOOP_SEC,
+    CTX_BTC_LAG_WEIGHT,
+    CTX_CROSS_EXCHANGE_WEIGHT,
     CTX_DEPTH_WEIGHT,
+    CTX_DERIVATIVES_WEIGHT,
+    CTX_FEATURE_STACK_WEIGHT,
+    CTX_MICROSTRUCTURE_WEIGHT,
     CTX_MTF_ALIGN_WEIGHT,
     CTX_REGIME_WEIGHT,
     CTX_RS_WEIGHT,
@@ -66,11 +72,18 @@ from backend.services.ai_decision_contract import (
     REDIS_TTL_AI_CONTEXT_SEC,
 )
 from backend.services.catalyst_provider import get_default_provider
+from backend.services.cross_exchange_reference import cross_exchange_dislocation_signal, cross_exchange_snapshot
 from backend.services.day_active_market_bundle import (
     apply_day_bundle_stagger,
     async_fetch_day_active_ohlcv_bundle,
     async_read_cached_day_active_bundle,
     month_context_four_from_daily,
+)
+from backend.services.day_feature_stack_v2 import (
+    btc_lag_predictive_signal,
+    compute_feature_stack_snapshot,
+    momentum_pct,
+    momentum_rvol_confirmation_signal,
 )
 from backend.services.live_market_data import live_market_data_service
 from backend.services.market_regime import regime_score
@@ -79,6 +92,8 @@ from backend.services.market_role_intelligence import (
     cache_role_context,
     compute_market_role_context,
 )
+from backend.services.ai_multi_target_regressors import predict_multi_target_from_latest_inference
+from backend.services.multi_horizon_ev import compute_multi_horizon_ev
 
 logger = logging.getLogger(__name__)
 
@@ -249,12 +264,31 @@ def _ctx_multiplier(
     rs_eth: float,
     depth_imbalance: float,
     market_regime: str,
+    microstructure_signal: float = 0.0,
+    feature_stack_signal: float = 0.0,
+    btc_lag_signal: float = 0.0,
+    derivatives_signal: float = 0.0,
+    cross_exchange_signal: float = 0.0,
 ) -> tuple[float, dict[str, float]]:
     """
-    Combine MTF + RS + depth + regime into one multiplier on winner_probability.
+    Combine MTF + RS + depth + regime + microstructure + feature-stack
+    (momentum x same-symbol RVOL) + BTC-lag + derivatives + cross-exchange
+    into one multiplier on winner_probability.
 
     Returns (multiplier, applied_components_for_audit).
     The multiplier is symmetric around 1.0 and clamped to +/- CTX_TOTAL_CAP.
+
+    ``microstructure_signal`` is the bounded [-1, 1] normalized output of
+    ``microstructure_engine.get_microstructure_ranking_delta`` (already
+    divided by its own cap) — real order-flow/OFI/microprice evidence, never
+    a hard gate. See backend/services/microstructure_engine.py.
+
+    ``feature_stack_signal``/``btc_lag_signal``/``derivatives_signal``/
+    ``cross_exchange_signal`` are the p15/p16/p18/p19/p20 ranking promotions
+    (see day_feature_stack_v2.py, derivatives_monitor.py,
+    cross_exchange_reference.py) — each already bounded [-1, 1] and each
+    honestly 0.0 whenever its underlying feed is unavailable/insufficient,
+    never a hard gate.
     """
     align_scores: list[float] = []
     for tf in DAY_ACTIVE_TIMEFRAMES:
@@ -280,7 +314,13 @@ def _ctx_multiplier(
         regime_signed = 0.0
     regime_term = regime_signed * CTX_REGIME_WEIGHT
 
-    total = mtf_term + rs_term + depth_term + regime_term
+    micro_term = max(-1.0, min(1.0, microstructure_signal)) * CTX_MICROSTRUCTURE_WEIGHT
+    feature_stack_term = max(-1.0, min(1.0, feature_stack_signal)) * CTX_FEATURE_STACK_WEIGHT
+    btc_lag_term = max(-1.0, min(1.0, btc_lag_signal)) * CTX_BTC_LAG_WEIGHT
+    derivatives_term = max(-1.0, min(1.0, derivatives_signal)) * CTX_DERIVATIVES_WEIGHT
+    cross_exchange_term = max(-1.0, min(1.0, cross_exchange_signal)) * CTX_CROSS_EXCHANGE_WEIGHT
+
+    total = mtf_term + rs_term + depth_term + regime_term + micro_term + feature_stack_term + btc_lag_term + derivatives_term + cross_exchange_term
     total = max(-CTX_TOTAL_CAP, min(CTX_TOTAL_CAP, total))
     multiplier = 1.0 + total
 
@@ -291,6 +331,11 @@ def _ctx_multiplier(
         "rs_term": float(rs_term),
         "depth_term": float(depth_term),
         "regime_term": float(regime_term),
+        "microstructure_term": float(micro_term),
+        "feature_stack_term": float(feature_stack_term),
+        "btc_lag_term": float(btc_lag_term),
+        "derivatives_term": float(derivatives_term),
+        "cross_exchange_term": float(cross_exchange_term),
         "total_signed": float(total),
     }
 
@@ -692,12 +737,108 @@ class AIMarketContextService:
                     min(1.0, 0.45 * top4_breadth + 0.30 * ((corr_to_btc + 1.0) / 2.0) + 0.25 * btc_vol_share),
                 )
 
+                # Real microstructure engine (OFI + aggressor flow + microprice
+                # pressure) — bounded [-cap, +cap]; normalized to [-1, 1] here
+                # for the shared multiplier formula. Never a gate.
+                microstructure_delta = 0.0
+                micro_cap = 0.03
+                with contextlib.suppress(Exception):
+                    from backend.services.microstructure_engine import (
+                        _RANKING_DELTA_CAP,
+                        get_microstructure_ranking_delta,
+                    )
+
+                    microstructure_delta = get_microstructure_ranking_delta(symbol)
+                    micro_cap = _RANKING_DELTA_CAP
+                microstructure_signed = (microstructure_delta / micro_cap) if micro_cap else 0.0
+
+                # ------------------------------------------------------------------
+                # Feature-stack completion (p15 momentum, p16 same-symbol RVOL,
+                # p17 volatility stack, p19 BTC lag correlation) — computed here
+                # (before _ctx_multiplier) so p15/p16/p19 can feed real ranking
+                # terms below, not just diagnostic JSON. Reuses the same cached
+                # DAY MTF bundle already fetched above (no extra API load).
+                # ------------------------------------------------------------------
+                feature_stack_json = "{}"
+                fs_snapshot = None
+                own_bundle_for_fs: dict = {}
+                try:
+                    own_bundle_for_fs = await async_read_cached_day_active_bundle(_to_ccxt(symbol)) or {}
+                    fs_snapshot = compute_feature_stack_snapshot(
+                        symbol,
+                        own_bundle_for_fs,
+                        btc_bundle=btc_bundle_raw if symbol.upper() != "BTCUSDT" else None,
+                    )
+                    feature_stack_json = json.dumps(fs_snapshot.to_dict(), separators=(",", ":"), default=str)
+                except Exception as fs_exc:
+                    logger.debug("AI_CONTEXT feature_stack %s failed: %s", symbol, fs_exc)
+
+                feature_stack_signed = 0.0
+                btc_lag_signed = 0.0
+                if fs_snapshot is not None:
+                    with contextlib.suppress(Exception):
+                        feature_stack_signed = momentum_rvol_confirmation_signal(fs_snapshot.momentum, fs_snapshot.rvol)
+                    with contextlib.suppress(Exception):
+                        btc_recent_return = 0.0
+                        btc_lag = fs_snapshot.btc_lag
+                        if btc_lag is not None and btc_lag.confidence == "confident" and btc_lag.best_lag_bars < 0:
+                            btc_rows_1m = btc_bundle_raw.get("1m") if btc_bundle_raw else None
+                            lag_n = abs(btc_lag.best_lag_bars)
+                            if btc_rows_1m and len(btc_rows_1m) > lag_n:
+                                btc_recent_return = momentum_pct(btc_rows_1m, lag_n)
+                        btc_lag_signed = btc_lag_predictive_signal(btc_lag, btc_recent_return)
+
+                # ------------------------------------------------------------------
+                # Derivatives reference feed (p18) — public, non-execution GLOBAL
+                # Binance futures OI/funding/basis. Decoupled from EXCHANGE_ID
+                # (execution venue has no futures market). Honest degraded state
+                # (available=False) when unreachable; never a gate.
+                # ------------------------------------------------------------------
+                derivatives_json = '{"available": false, "degraded_reason": "not_attempted"}'
+                deriv_signed = 0.0
+                try:
+                    deriv_snapshot = await asyncio.to_thread(derivatives_reference_snapshot, symbol)
+                    derivatives_json = json.dumps(deriv_snapshot, separators=(",", ":"), default=str)
+                    deriv_signed = derivatives_positioning_signal(deriv_snapshot)
+                except Exception as deriv_exc:
+                    logger.debug("AI_CONTEXT derivatives_reference %s failed: %s", symbol, deriv_exc)
+
+                # ------------------------------------------------------------------
+                # Cross-exchange informational layer (p20) — public Coinbase feed,
+                # price dislocation + coarse volume ratio vs the execution venue.
+                # Informational only; never changes the execution venue.
+                # ------------------------------------------------------------------
+                cross_exchange_json = '{"available": false, "degraded_reason": "not_attempted"}'
+                cross_exchange_signed = 0.0
+                try:
+                    own_last_price = 0.0
+                    with contextlib.suppress(Exception):
+                        rows_1m_ce = (own_bundle_for_fs.get("1m") if own_bundle_for_fs else None) or []
+                        if rows_1m_ce:
+                            own_last_price = float(rows_1m_ce[-1][4])
+                    if own_last_price > 0:
+                        ce_snapshot = await asyncio.to_thread(
+                            cross_exchange_snapshot,
+                            symbol,
+                            own_price=own_last_price,
+                            own_volume_24h=float(t24.get("volume_24h_usd", 0.0)),
+                        )
+                        cross_exchange_json = json.dumps(ce_snapshot, separators=(",", ":"), default=str)
+                        cross_exchange_signed = cross_exchange_dislocation_signal(ce_snapshot)
+                except Exception as ce_exc:
+                    logger.debug("AI_CONTEXT cross_exchange %s failed: %s", symbol, ce_exc)
+
                 multiplier, audit = _ctx_multiplier(
                     own_mtf=own_mtf,
                     rs_btc=rs_btc,
                     rs_eth=rs_eth,
                     depth_imbalance=depth_imb,
                     market_regime=symbol_regime,
+                    microstructure_signal=microstructure_signed,
+                    feature_stack_signal=feature_stack_signed,
+                    btc_lag_signal=btc_lag_signed,
+                    derivatives_signal=deriv_signed,
+                    cross_exchange_signal=cross_exchange_signed,
                 )
 
                 # ------------------------------------------------------------------
@@ -739,6 +880,38 @@ class AIMarketContextService:
                     except Exception as role_exc:
                         logger.debug("AI_CONTEXT role_intel %s failed: %s", symbol, role_exc)
 
+                # (feature_stack_json / derivatives_json / cross_exchange_json were
+                # computed above, before _ctx_multiplier, so p15/p16/p18/p19/p20 can
+                # feed real ranking terms rather than diagnostic-only JSON.)
+
+                # ------------------------------------------------------------------
+                # Multi-horizon EV (p11) — composite EV across DAY's realistic
+                # 15m-24h holding horizons, each estimated from ONLY the
+                # historical trades whose own realized hold_seconds fell in
+                # that bucket (mfe_mae_distribution_learner strata). Additive
+                # diagnostic/ranking evidence; never a gate.
+                # ------------------------------------------------------------------
+                multi_horizon_ev_json = '{"available": false, "degraded_reason": "not_attempted"}'
+                try:
+                    mhev_result = await asyncio.to_thread(compute_multi_horizon_ev, symbol, "day")
+                    multi_horizon_ev_json = json.dumps(mhev_result.to_dict(), separators=(",", ":"), default=str)
+                except Exception as mhev_exc:
+                    logger.debug("AI_CONTEXT multi_horizon_ev %s failed: %s", symbol, mhev_exc)
+
+                # ------------------------------------------------------------------
+                # Multi-target ML (p10) — expected_return/MFE/MAE/time-to-target
+                # regression heads, reusing the exact feature vector already
+                # logged for this symbol's most recent live decision
+                # (ai_inference_log.features_json). Additive diagnostic
+                # evidence; never a gate.
+                # ------------------------------------------------------------------
+                multi_target_ml_json = '{"available": false, "degraded_reason": "not_attempted"}'
+                try:
+                    mtml_pred = await asyncio.to_thread(predict_multi_target_from_latest_inference, "day", symbol)
+                    multi_target_ml_json = json.dumps(mtml_pred.to_dict(), separators=(",", ":"), default=str)
+                except Exception as mtml_exc:
+                    logger.debug("AI_CONTEXT multi_target_ml %s failed: %s", symbol, mtml_exc)
+
                 ts_utc = datetime.now(timezone.utc).isoformat()
                 payload: dict[str, Any] = {
                     "symbol": symbol,
@@ -763,6 +936,28 @@ class AIMarketContextService:
                     # New role-intelligence fields (append-only; existing consumers unaffected)
                     "ctx_role_intel_json": role_intel_json,
                     "ctx_role_ranking_delta": float(role_ranking_delta),
+                    # Real microstructure engine fields (append-only). Ranking/EV
+                    # input only — see backend/services/microstructure_engine.py.
+                    "ctx_microstructure_ranking_delta": float(microstructure_delta),
+                    # Feature-stack completion (append-only): multi-horizon momentum,
+                    # same-symbol RVOL, ATR7/14/28 + realized vol + vol percentile,
+                    # BTC lag correlation — see day_feature_stack_v2.py.
+                    "ctx_feature_stack_json": feature_stack_json,
+                    # Derivatives reference feed (append-only): OI/funding/basis
+                    # from GLOBAL Binance futures — see backend/derivatives_monitor.py.
+                    "ctx_derivatives_json": derivatives_json,
+                    # Cross-exchange informational layer (append-only): Coinbase
+                    # public-feed price dislocation + volume ratio — see
+                    # backend/services/cross_exchange_reference.py.
+                    "ctx_cross_exchange_json": cross_exchange_json,
+                    # Multi-horizon EV (append-only): composite EV across
+                    # DAY's 15m-24h realistic holding horizons — see
+                    # backend/services/multi_horizon_ev.py.
+                    "ctx_multi_horizon_ev_json": multi_horizon_ev_json,
+                    # Multi-target ML (append-only): expected_return/MFE/MAE/
+                    # time-to-target regression heads — see
+                    # backend/services/ai_multi_target_regressors.py.
+                    "ctx_multi_target_ml_json": multi_target_ml_json,
                 }
 
                 if self.redis is not None:

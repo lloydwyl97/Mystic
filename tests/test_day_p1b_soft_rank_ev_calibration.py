@@ -50,11 +50,7 @@ def _insert_sell(
     ts: str = "2026-08-04T12:00:00+00:00",
     display_exit: str | None = None,
 ) -> None:
-    display = display_exit or (
-        "STALL_EXIT" if "STALL" in raw_exit.upper() else raw_exit.split("_EXIT")[0] + "_EXIT"
-        if "_EXIT" in raw_exit
-        else raw_exit
-    )
+    display = display_exit or ("STALL_EXIT" if "STALL" in raw_exit.upper() else raw_exit.split("_EXIT")[0] + "_EXIT" if "_EXIT" in raw_exit else raw_exit)
     if "GIVEBACK" in raw_exit.upper():
         display = "GIVEBACK_EXIT"
     if "NET_PROFIT" in raw_exit.upper():
@@ -106,7 +102,7 @@ def _seed_stall_dead(
             mfe=mfe,
             mae=mae,
             hold_sec=7200.0 + i,
-            ts=f"2026-08-04T{10+i:02d}:00:00+00:00",
+            ts=f"2026-08-04T{10 + i:02d}:00:00+00:00",
         )
 
 
@@ -192,9 +188,7 @@ def test_3_htf_setup_cluster_applies_setup_level_penalty(tmp_path: Path):
         "selected_net_expected_value": 0.12,
         "buy_margin": 0.10,
     }
-    out = apply_v3_outcome_ranking_to_decision_data(
-        dd, "SOL/USDT", raw_rank_score=0.60, buy_margin=0.10, db_path=db
-    )
+    out = apply_v3_outcome_ranking_to_decision_data(dd, "SOL/USDT", raw_rank_score=0.60, buy_margin=0.10, db_path=db)
     assert out["outcome_penalty_applied"] is True
     assert float(out["final_selection_score"]) < float(out["final_selection_score_before_outcome_penalty"])
 
@@ -219,7 +213,7 @@ def test_4_profitable_bucket_softens_penalty(tmp_path: Path):
             raw_exit="NET_PROFIT_EXIT",
             mfe=0.005,
             mae=0.001,
-            ts=f"2026-08-04T{18+i:02d}:00:00+00:00",
+            ts=f"2026-08-04T{18 + i:02d}:00:00+00:00",
         )
 
     bad = evaluate_low_mfe_stall_penalty("BTC/USDT", SETUP_RANGE_BOUNCE, "range", db_path=db_bad)
@@ -272,9 +266,7 @@ def test_6_candidate_remains_executable(tmp_path: Path):
         "selected_net_expected_value": 0.09,
         "buy_margin": 0.11,
     }
-    out = apply_v3_outcome_ranking_to_decision_data(
-        dd, "ETH/USDT", raw_rank_score=0.55, buy_margin=0.11, db_path=db
-    )
+    out = apply_v3_outcome_ranking_to_decision_data(dd, "ETH/USDT", raw_rank_score=0.55, buy_margin=0.11, db_path=db)
     assert out["outcome_penalty_applied"] is True
     assert out["candidate_eligible"] is True
     assert out["outcome_penalty_hard_block"] is False
@@ -293,9 +285,7 @@ def test_7_explainability_fields_stamped(tmp_path: Path):
         "selected_net_expected_value": 0.10,
         "buy_margin": 0.12,
     }
-    out = apply_v3_outcome_ranking_to_decision_data(
-        dd, "ETH/USDT", raw_rank_score=0.50, buy_margin=0.12, db_path=db
-    )
+    out = apply_v3_outcome_ranking_to_decision_data(dd, "ETH/USDT", raw_rank_score=0.50, buy_margin=0.12, db_path=db)
     assert out["outcome_penalty_applied"] is True
     assert out.get("penalty_reason")
     assert "repeated_low_mfe_stall_losses" in str(out["penalty_reason"])

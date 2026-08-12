@@ -75,10 +75,7 @@ def test_2_mfe_mae_persist_into_ai_outcome_training_rows(tmp_path: Path):
     assert rid is not None
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT max_favorable_excursion, max_adverse_excursion, score_components_json "
-            "FROM ai_outcome_training_rows ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+        row = conn.execute("SELECT max_favorable_excursion, max_adverse_excursion, score_components_json FROM ai_outcome_training_rows ORDER BY id DESC LIMIT 1").fetchone()
     assert row is not None
     assert row["max_favorable_excursion"] is not None
     assert row["max_adverse_excursion"] is not None
@@ -170,8 +167,7 @@ def test_4_day_outcome_attribution_filled(tmp_path: Path):
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT setup_thesis, regime, final_selection_score, model_probabilities_json "
-            "FROM day_outcome_attribution WHERE trade_id=?",
+            "SELECT setup_thesis, regime, final_selection_score, model_probabilities_json FROM day_outcome_attribution WHERE trade_id=?",
             ("mystic_SOL/USDT_test",),
         ).fetchone()
     assert row["setup_thesis"] == SETUP_RANGE_BOUNCE
@@ -249,9 +245,7 @@ def test_6_sol_range_bounce_low_mfe_stall_applies_penalty(tmp_path: Path):
         "selected_net_expected_value": 0.10,
         "buy_margin": 0.12,
     }
-    out = apply_v3_outcome_ranking_to_decision_data(
-        dd, "SOL/USDT", raw_rank_score=0.55, buy_margin=0.12, db_path=db
-    )
+    out = apply_v3_outcome_ranking_to_decision_data(dd, "SOL/USDT", raw_rank_score=0.55, buy_margin=0.12, db_path=db)
     assert out["outcome_penalty_applied"] is True
     assert out.get("candidate_eligible") is True
     assert out.get("outcome_penalty_hard_block") is False
@@ -280,9 +274,7 @@ def test_8_penalty_is_non_blocking(tmp_path: Path):
         "selected_net_expected_value": 0.08,
         "buy_margin": 0.10,
     }
-    out = apply_v3_outcome_ranking_to_decision_data(
-        dd, "BTC/USDT", raw_rank_score=0.50, buy_margin=0.10, db_path=db
-    )
+    out = apply_v3_outcome_ranking_to_decision_data(dd, "BTC/USDT", raw_rank_score=0.50, buy_margin=0.10, db_path=db)
     assert out.get("candidate_eligible") is True
     assert out.get("outcome_penalty_hard_block") is False
     assert out.get("hard_block") is False

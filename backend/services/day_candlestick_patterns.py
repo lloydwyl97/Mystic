@@ -60,20 +60,12 @@ def _bar_geom(b: list | tuple) -> dict[str, float]:
 
 def _is_hammer(g: dict[str, float]) -> bool:
     """Long lower wick, small body, small/no upper wick — bullish rejection at lows."""
-    return (
-        g["low_pct"] >= 0.55
-        and g["body_pct"] <= 0.35
-        and g["up_pct"] <= 0.20
-    )
+    return g["low_pct"] >= 0.55 and g["body_pct"] <= 0.35 and g["up_pct"] <= 0.20
 
 
 def _is_shooting_star(g: dict[str, float]) -> bool:
     """Long upper wick, small body, small/no lower wick — bearish rejection at highs."""
-    return (
-        g["up_pct"] >= 0.55
-        and g["body_pct"] <= 0.35
-        and g["low_pct"] <= 0.20
-    )
+    return g["up_pct"] >= 0.55 and g["body_pct"] <= 0.35 and g["low_pct"] <= 0.20
 
 
 def _is_doji(g: dict[str, float]) -> bool:
@@ -83,24 +75,12 @@ def _is_doji(g: dict[str, float]) -> bool:
 
 def _is_bullish_engulfing(prev: dict[str, float], curr: dict[str, float]) -> bool:
     """Current bull candle body fully engulfs previous bear candle body."""
-    return (
-        prev["is_dn"] == 1
-        and curr["is_up"] == 1
-        and curr["c"] >= prev["o"]
-        and curr["o"] <= prev["c"]
-        and curr["body"] > prev["body"] * 1.0
-    )
+    return prev["is_dn"] == 1 and curr["is_up"] == 1 and curr["c"] >= prev["o"] and curr["o"] <= prev["c"] and curr["body"] > prev["body"] * 1.0
 
 
 def _is_bearish_engulfing(prev: dict[str, float], curr: dict[str, float]) -> bool:
     """Current bear candle body fully engulfs previous bull candle body."""
-    return (
-        prev["is_up"] == 1
-        and curr["is_dn"] == 1
-        and curr["o"] >= prev["c"]
-        and curr["c"] <= prev["o"]
-        and curr["body"] > prev["body"] * 1.0
-    )
+    return prev["is_up"] == 1 and curr["is_dn"] == 1 and curr["o"] >= prev["c"] and curr["c"] <= prev["o"] and curr["body"] > prev["body"] * 1.0
 
 
 def _is_inside_bar(prev: dict[str, float], curr: dict[str, float]) -> bool:
@@ -118,16 +98,7 @@ def _is_three_black_crows(bars: list[dict[str, float]]) -> bool:
     if len(bars) < 3:
         return False
     b1, b2, b3 = bars[-3], bars[-2], bars[-1]
-    return (
-        b1["is_dn"] == 1
-        and b2["is_dn"] == 1
-        and b3["is_dn"] == 1
-        and b2["c"] < b1["c"]
-        and b3["c"] < b2["c"]
-        and b1["body_pct"] >= 0.5
-        and b2["body_pct"] >= 0.5
-        and b3["body_pct"] >= 0.5
-    )
+    return b1["is_dn"] == 1 and b2["is_dn"] == 1 and b3["is_dn"] == 1 and b2["c"] < b1["c"] and b3["c"] < b2["c"] and b1["body_pct"] >= 0.5 and b2["body_pct"] >= 0.5 and b3["body_pct"] >= 0.5
 
 
 def _is_three_white_soldiers(bars: list[dict[str, float]]) -> bool:
@@ -135,16 +106,7 @@ def _is_three_white_soldiers(bars: list[dict[str, float]]) -> bool:
     if len(bars) < 3:
         return False
     b1, b2, b3 = bars[-3], bars[-2], bars[-1]
-    return (
-        b1["is_up"] == 1
-        and b2["is_up"] == 1
-        and b3["is_up"] == 1
-        and b2["c"] > b1["c"]
-        and b3["c"] > b2["c"]
-        and b1["body_pct"] >= 0.5
-        and b2["body_pct"] >= 0.5
-        and b3["body_pct"] >= 0.5
-    )
+    return b1["is_up"] == 1 and b2["is_up"] == 1 and b3["is_up"] == 1 and b2["c"] > b1["c"] and b3["c"] > b2["c"] and b1["body_pct"] >= 0.5 and b2["body_pct"] >= 0.5 and b3["body_pct"] >= 0.5
 
 
 def detect_patterns(shape_bars: list) -> dict[str, int]:
@@ -224,22 +186,15 @@ def net_bearish_pattern_score(flags: dict[str, Any]) -> float:
     Positive = bullish patterns dominate; negative = bearish patterns dominate.
     Used by day_candle_quality_gate to combine with volume/wick signals.
     """
+
     def _f(k: str) -> int:
         try:
             return int(float(flags.get(k, 0) or 0))
         except (TypeError, ValueError):
             return 0
 
-    bull = (
-        _f("cs_pat_hammer_bull") * 0.6
-        + _f("cs_pat_bullish_engulfing_bull") * 0.8
-        + _f("cs_pat_three_white_soldiers_bull") * 1.0
-    )
-    bear = (
-        _f("cs_pat_shooting_star_bear") * 0.6
-        + _f("cs_pat_bearish_engulfing_bear") * 0.8
-        + _f("cs_pat_three_black_crows_bear") * 1.0
-    )
+    bull = _f("cs_pat_hammer_bull") * 0.6 + _f("cs_pat_bullish_engulfing_bull") * 0.8 + _f("cs_pat_three_white_soldiers_bull") * 1.0
+    bear = _f("cs_pat_shooting_star_bear") * 0.6 + _f("cs_pat_bearish_engulfing_bear") * 0.8 + _f("cs_pat_three_black_crows_bear") * 1.0
     net = bull - bear
     return max(-1.0, min(1.0, net))
 

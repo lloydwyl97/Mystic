@@ -357,6 +357,21 @@ _SCHEMA = [
         created_at              TEXT NOT NULL DEFAULT (datetime('now'))
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS ai_calibration_snapshots (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol                  TEXT NOT NULL,
+        computed_at_utc         TEXT NOT NULL,
+        sample_count            INTEGER NOT NULL,
+        brier_score             REAL,
+        ece                     REAL,
+        available               INTEGER NOT NULL DEFAULT 0,
+        degraded                INTEGER NOT NULL DEFAULT 0,
+        degraded_reason         TEXT,
+        buckets_json            TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_ai_calibration_symbol_time ON ai_calibration_snapshots(symbol, computed_at_utc)",
 ]
 
 
@@ -621,6 +636,27 @@ def persist_ai_feature_sample_row(
         logger.debug("persist_ai_feature_sample_row failed: %s", e)
 
 
+def _symbol_variants_for_lookup(symbol: str) -> list[str]:
+    """Different subsystems write to `ai_outcome_training_rows` (and related
+    tables) using different symbol conventions — DAY's live positions use
+    ccxt slash form ("BTC/USDT") while SCALP and Redis/context keys use
+    plain exchange form ("BTCUSDT"). Any lookup keyed by symbol must try
+    both directions or it will silently return zero rows for whichever
+    convention it didn't anticipate, even when real matching data exists
+    under the other spelling."""
+    sym = str(symbol).strip().upper()
+    variants = {sym}
+    try:
+        from backend.utils.symbols import to_ccxt_symbol, to_exchange_symbol
+
+        variants.add(to_ccxt_symbol(sym))
+        variants.add(to_exchange_symbol(sym))
+    except Exception:
+        if "/" in sym:
+            variants.add(sym.replace("/", ""))
+    return sorted(variants)
+
+
 def read_recent_outcome_training_rows(
     symbol: str | None = None,
     strategy_id: str | None = None,
@@ -632,9 +668,9 @@ def read_recent_outcome_training_rows(
     where: list[str] = []
     params: list[Any] = []
     if symbol:
-        where.append("(UPPER(symbol)=UPPER(?) OR UPPER(symbol)=UPPER(?))")
-        sym = str(symbol).strip().upper()
-        params.extend([sym, sym.replace("/", "")])
+        variants = _symbol_variants_for_lookup(symbol)
+        where.append("(" + " OR ".join("UPPER(symbol)=UPPER(?)" for _ in variants) + ")")
+        params.extend(variants)
     if strategy_id:
         where.append("LOWER(COALESCE(strategy_id, 'day')) = LOWER(?)")
         params.append(str(strategy_id).strip().lower())

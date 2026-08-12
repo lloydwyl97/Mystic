@@ -55,19 +55,13 @@ def test_8_buy_explainability_includes_prob_penalty_rank_fields():
 def test_9_sell_learning_rank_data_maps_scores_from_explainability():
     """Mirror portfolio_engine learning enrichment mapping from BUY explainability."""
     ex_payload = _sample_explainability().to_dict()
-    _sel = (
-        ex_payload.get("selected_score")
-        or ex_payload.get("final_selection_score")
-        or ex_payload.get("rank_score")
-    )
+    _sel = ex_payload.get("selected_score") or ex_payload.get("final_selection_score") or ex_payload.get("rank_score")
     rank_data = {
         "selected_score": _sel,
         "entry_score": _sel,
         "rank_score": ex_payload.get("rank_score") or _sel,
         "final_selection_score": ex_payload.get("final_selection_score") or _sel,
-        "buy_margin": ex_payload.get("buy_margin")
-        if ex_payload.get("buy_margin") is not None
-        else ex_payload.get("entry_buy_margin"),
+        "buy_margin": ex_payload.get("buy_margin") if ex_payload.get("buy_margin") is not None else ex_payload.get("entry_buy_margin"),
         "selected_net_expected_value": ex_payload.get("selected_net_expected_value"),
         "prob_buy": ex_payload.get("prob_buy"),
         "prob_hold": ex_payload.get("prob_hold"),
@@ -100,11 +94,7 @@ def test_10_missing_optional_telemetry_does_not_crash():
     assert payload["side"] == "BUY"
 
     # Learning mapping tolerates empties.
-    _sel = (
-        payload.get("selected_score")
-        or payload.get("final_selection_score")
-        or payload.get("rank_score")
-    )
+    _sel = payload.get("selected_score") or payload.get("final_selection_score") or payload.get("rank_score")
     rank_data = {
         "selected_score": _sel,
         "entry_score": _sel,

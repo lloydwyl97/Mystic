@@ -68,13 +68,13 @@ MAX_LEARNED_ADJ_TOTAL: float = 0.02
 
 # Features tracked and their neutral values
 _FEATURE_NEUTRALS: dict[str, float] = {
-    "rs_short_1h":    0.0,
-    "rs_medium_4h":   0.0,
+    "rs_short_1h": 0.0,
+    "rs_medium_4h": 0.0,
     "momentum_score": 0.5,
     "volatility_score": 0.35,
-    "volume_accel":   1.0,
+    "volume_accel": 1.0,
     "btc_correlation": 0.0,
-    "btc_beta":       1.0,
+    "btc_beta": 1.0,
     "catalyst_score": 0.0,
     "live_ranking_delta": 0.0,
 }
@@ -152,16 +152,18 @@ def _pearson(x: list[float], y: list[float]) -> float:
 # Public API
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class LearningStats:
     """Per-symbol learning statistics returned to callers."""
+
     symbol: str
     strategy: str
     sample_count: int
-    learned_adjustment: float          # total bounded adjustment for ranking
+    learned_adjustment: float  # total bounded adjustment for ranking
     confidence: float
-    confidence_status: str             # "insufficient_data" / "low_confidence" / "confident"
-    per_feature: dict[str, dict]       # feature → {corr, adj, count, status}
+    confidence_status: str  # "insufficient_data" / "low_confidence" / "confident"
+    per_feature: dict[str, dict]  # feature → {corr, adj, count, status}
 
 
 def record_trade_outcome(
@@ -203,9 +205,7 @@ def record_trade_outcome(
             return None
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    cutoff_iso = datetime.fromtimestamp(
-        time.time() - OUTCOME_RETENTION_DAYS * 86400, tz=timezone.utc
-    ).isoformat()
+    cutoff_iso = datetime.fromtimestamp(time.time() - OUTCOME_RETENTION_DAYS * 86400, tz=timezone.utc).isoformat()
 
     try:
         with sqlite3.connect(db_path) as conn:
@@ -220,13 +220,24 @@ def record_trade_outcome(
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    trade_id, buy_trade_id, symbol.upper(), strategy.lower(),
-                    float(realized_pnl_pct), int(hold_seconds), str(exit_reason),
-                    mfe_pct, mae_pct, market_regime,
-                    _f("rs_short_1h"), _f("rs_medium_4h"),
-                    _f("momentum_score"), _f("volatility_score"),
-                    _f("volume_accel"), _f("btc_correlation"),
-                    _f("btc_beta"), _f("catalyst_score"),
+                    trade_id,
+                    buy_trade_id,
+                    symbol.upper(),
+                    strategy.lower(),
+                    float(realized_pnl_pct),
+                    int(hold_seconds),
+                    str(exit_reason),
+                    mfe_pct,
+                    mae_pct,
+                    market_regime,
+                    _f("rs_short_1h"),
+                    _f("rs_medium_4h"),
+                    _f("momentum_score"),
+                    _f("volatility_score"),
+                    _f("volume_accel"),
+                    _f("btc_correlation"),
+                    _f("btc_beta"),
+                    _f("catalyst_score"),
                     _f("live_context_adjustment"),
                     now_iso,
                 ),
@@ -270,8 +281,14 @@ def _recompute_stats(db_path: str, symbol: str, strategy: str) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
 
         feature_cols = [
-            "rs_short_1h", "rs_medium_4h", "momentum_score", "volatility_score",
-            "volume_accel", "btc_correlation", "btc_beta", "catalyst_score",
+            "rs_short_1h",
+            "rs_medium_4h",
+            "momentum_score",
+            "volatility_score",
+            "volume_accel",
+            "btc_correlation",
+            "btc_beta",
+            "catalyst_score",
             "live_ranking_delta",
         ]
         col_idx = {name: idx + 1 for idx, name in enumerate(feature_cols)}
@@ -281,11 +298,7 @@ def _recompute_stats(db_path: str, symbol: str, strategy: str) -> None:
                 neutral = _FEATURE_NEUTRALS.get(feat, 0.0)
                 col = col_idx[feat]
                 # Extract feature values aligned with pnl_pcts (only rows where both are non-null)
-                pairs = [
-                    (float(r[col]) - neutral, r[0])
-                    for r in rows
-                    if r[col] is not None and r[0] is not None
-                ]
+                pairs = [(float(r[col]) - neutral, r[0]) for r in rows if r[col] is not None and r[0] is not None]
                 nf = len(pairs)
                 conf, status = _confidence(nf)
 
@@ -296,8 +309,7 @@ def _recompute_stats(db_path: str, symbol: str, strategy: str) -> None:
                     pnl_vals = [p[1] for p in pairs]
                     corr = _pearson(feat_vals, pnl_vals)
                     adj = round(
-                        max(-MAX_LEARNED_ADJ_PER_FEATURE,
-                            min(MAX_LEARNED_ADJ_PER_FEATURE, corr * 0.02)),
+                        max(-MAX_LEARNED_ADJ_PER_FEATURE, min(MAX_LEARNED_ADJ_PER_FEATURE, corr * 0.02)),
                         6,
                     )
 

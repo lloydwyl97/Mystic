@@ -2,6 +2,7 @@
 Exchange constraint handler for SCALP live orders.
 Fetches and caches lot size / min notional from Binance.US /exchangeInfo.
 """
+
 from __future__ import annotations
 
 import logging
@@ -27,11 +28,26 @@ _FALLBACK = {
 
 
 def get_symbol_constraints(symbol: str) -> dict:
-    """Return lot-size and min-notional constraints for a symbol. Results are cached."""
+    """Return lot-size and min-notional constraints for a symbol. Results are cached.
+
+    Includes an explicit ``is_fallback`` flag (item p25): when the real
+    /exchangeInfo fetch has never succeeded (or this symbol wasn't in the
+    last successful response), the conservative generic ``_FALLBACK``
+    values are used instead of real exchange filters. ``is_fallback=True``
+    lets callers log/alert on this rather than silently rounding orders to
+    generic values that look identical to real per-symbol filters.
+    """
     global _CACHE, _CACHE_TS
     if time.time() - _CACHE_TS > _CACHE_TTL or symbol not in _CACHE:
         _refresh_cache()
-    return dict(_CACHE.get(symbol, _FALLBACK))
+    cached = _CACHE.get(symbol)
+    if cached is not None:
+        result = dict(cached)
+        result["is_fallback"] = False
+        return result
+    result = dict(_FALLBACK)
+    result["is_fallback"] = True
+    return result
 
 
 def round_qty_to_step(symbol: str, qty: float) -> float:
@@ -59,20 +75,14 @@ def _refresh_cache() -> None:
         new_cache: Dict[str, dict] = {}
         for sym_info in data.get("symbols", []):
             s = sym_info["symbol"]
-            filters: dict[str, dict] = {
-                f["filterType"]: f for f in sym_info.get("filters", [])
-            }
+            filters: dict[str, dict] = {f["filterType"]: f for f in sym_info.get("filters", [])}
             lot = filters.get("LOT_SIZE", {})
             notional = filters.get("MIN_NOTIONAL", {}) or filters.get("NOTIONAL", {})
             new_cache[s] = {
                 "min_qty": float(lot.get("minQty", _FALLBACK["min_qty"])),
                 "max_qty": float(lot.get("maxQty", _FALLBACK["max_qty"])),
                 "step_size": float(lot.get("stepSize", _FALLBACK["step_size"])),
-                "min_notional": float(
-                    notional.get("minNotional")
-                    or notional.get("notionalMin")
-                    or _FALLBACK["min_notional"]
-                ),
+                "min_notional": float(notional.get("minNotional") or notional.get("notionalMin") or _FALLBACK["min_notional"]),
             }
         _CACHE = new_cache
         _CACHE_TS = time.time()

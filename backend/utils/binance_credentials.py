@@ -11,11 +11,7 @@ import os
 
 
 def get_binance_us_api_key() -> str:
-    return (
-        (os.getenv("BINANCE_US_API_KEY") or "").strip()
-        or (os.getenv("BINANCEUS_API_KEY") or "").strip()
-        or (os.getenv("BINANCE_API_KEY") or "").strip()
-    )
+    return (os.getenv("BINANCE_US_API_KEY") or "").strip() or (os.getenv("BINANCEUS_API_KEY") or "").strip() or (os.getenv("BINANCE_API_KEY") or "").strip()
 
 
 def get_binance_us_secret_key() -> str:

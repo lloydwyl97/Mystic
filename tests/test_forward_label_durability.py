@@ -129,9 +129,7 @@ def test_old_partial_rows_are_not_starved_by_newer_partial_backlog():
             counters = label_pending_snapshots(str(db_path))
 
         with sqlite3.connect(str(db_path)) as conn:
-            status = conn.execute(
-                "SELECT label_status FROM ai_candidate_snapshots WHERE decision_id='old_due'"
-            ).fetchone()[0]
+            status = conn.execute("SELECT label_status FROM ai_candidate_snapshots WHERE decision_id='old_due'").fetchone()[0]
         assert counters["labeled"] >= 1
         assert status == "LABELED"
 

@@ -99,9 +99,7 @@ class ScalpConfig:
                         "SCALP_DISABLED_STRATEGIES",
                         # Ocean paper proof: only setups that ever produced genuine
                         # fills. Others were 100% STRATEGY_NO_SIGNAL / soft-rank noise.
-                        "breakout_momentum,orderbook_tape_scalp,failed_breakdown_reversal,"
-                        "compression_breakout,volume_impulse_continuation,"
-                        "trend_pullback_micro,failed_breakout_reversal",
+                        "breakout_momentum,orderbook_tape_scalp,failed_breakdown_reversal,compression_breakout,volume_impulse_continuation,trend_pullback_micro,failed_breakout_reversal",
                     )
                     or ""
                 ).split(",")
@@ -131,10 +129,7 @@ class ScalpConfig:
         - SCALP_LIVE=true + SCALP_LIVE_ARMED=true   →  passes (engine was explicitly armed).
         """
         if self.scalp_live and not os.getenv("SCALP_LIVE_ARMED", "false").lower() == "true":
-            raise RuntimeError(
-                "SCALP_LIVE=true but SCALP_LIVE_ARMED is not set. "
-                "Set SCALP_LIVE_ARMED=true and arm the engine explicitly before live trading."
-            )
+            raise RuntimeError("SCALP_LIVE=true but SCALP_LIVE_ARMED is not set. Set SCALP_LIVE_ARMED=true and arm the engine explicitly before live trading.")
         if self.allow_market_orders and not self.scalp_live:
             raise RuntimeError("SCALP_ALLOW_MARKET_ORDERS must remain false in paper mode.")
         if self.calibration_mode and self.scalp_live:

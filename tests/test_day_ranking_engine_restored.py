@@ -60,7 +60,7 @@ def _seed(db: str, symbol: str, setup: str, n: int = 3) -> None:
                     explainability_json, hold_time_seconds, is_synthetic
                 ) VALUES (?, 'SELL', ?, 'STALL_EXIT', ?, 100.0, 99.4, ?, ?, 0)
                 """,
-                (symbol, -7.0 - i, f"2026-08-05T{11+i:02d}:00:00+00:00", json.dumps(explain), 7000.0),
+                (symbol, -7.0 - i, f"2026-08-05T{11 + i:02d}:00:00+00:00", json.dumps(explain), 7000.0),
             )
             conn.commit()
 
@@ -121,9 +121,7 @@ def test_bandit_selection_beats_toxic_high_raw_rank(tmp_path: Path):
 def test_soft_penalty_apis_still_active(tmp_path: Path):
     db = str(tmp_path / "api.db")
     _seed(db, "SOL/USDT", SETUP_FAILED_BREAKDOWN_REVERSAL, n=3)
-    pen = evaluate_low_mfe_stall_penalty(
-        "SOL/USDT", SETUP_FAILED_BREAKDOWN_REVERSAL, "bear", db_path=db
-    )
+    pen = evaluate_low_mfe_stall_penalty("SOL/USDT", SETUP_FAILED_BREAKDOWN_REVERSAL, "bear", db_path=db)
     assert pen["hard_block"] is False
     assert pen["candidate_eligible"] is True
 

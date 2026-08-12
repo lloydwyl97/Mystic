@@ -129,12 +129,8 @@ def test_multiplicative_size_and_additive_rank():
     }
     out = apply_htf_anchor_to_decision_data(dd)
     anchor_size = float(out["htf_anchor_size_factor"])
-    assert out["thesis_size_factor"] == pytest.approx(
-        max(SIZE_FACTOR_AT_ZERO, 0.80 * anchor_size), rel=1e-4
-    )
-    assert out["thesis_rank_delta"] == pytest.approx(
-        -0.05 + float(out["htf_anchor_rank_delta"]), rel=1e-4
-    )
+    assert out["thesis_size_factor"] == pytest.approx(max(SIZE_FACTOR_AT_ZERO, 0.80 * anchor_size), rel=1e-4)
+    assert out["thesis_rank_delta"] == pytest.approx(-0.05 + float(out["htf_anchor_rank_delta"]), rel=1e-4)
 
 
 def test_disable_flag(monkeypatch):

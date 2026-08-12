@@ -105,9 +105,7 @@ def test_winner_outranks_starved_loser(tmp_path: Path):
 
 
 def test_arm_key_normalizes_aliases():
-    assert arm_key("BTCUSDT", "TREND_PULLBACK", "trending_up") == arm_key(
-        "BTC/USDT", "HTF_TREND_PULLBACK", "bull"
-    )
+    assert arm_key("BTCUSDT", "TREND_PULLBACK", "trending_up") == arm_key("BTC/USDT", "HTF_TREND_PULLBACK", "bull")
 
 
 def test_no_hard_block_on_toxic(tmp_path: Path):

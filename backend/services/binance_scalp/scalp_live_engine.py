@@ -43,9 +43,7 @@ class ScalpLiveEngine:
         self._armed = False
 
         if not config.scalp_live:
-            raise RuntimeError(
-                "ScalpLiveEngine instantiated with scalp_live=False. Use paper engine."
-            )
+            raise RuntimeError("ScalpLiveEngine instantiated with scalp_live=False. Use paper engine.")
 
     # ------------------------------------------------------------------
     # Arming
@@ -71,9 +69,7 @@ class ScalpLiveEngine:
     # Entry / Exit
     # ------------------------------------------------------------------
 
-    async def execute_live_entry(
-        self, symbol: str, notional: float, ref_price: float
-    ) -> bool:
+    async def execute_live_entry(self, symbol: str, notional: float, ref_price: float) -> bool:
         """
         Execute a live scalp entry.
         Returns True if fill succeeded and position opened.
@@ -90,9 +86,7 @@ class ScalpLiveEngine:
         notional = min(notional, SCALP_LIVE_MAX_NOTIONAL)
 
         if len(self._open_positions) >= SCALP_LIVE_MAX_OPEN:
-            logger.debug(
-                "[SCALP_LIVE] Max open positions (%d) reached", SCALP_LIVE_MAX_OPEN
-            )
+            logger.debug("[SCALP_LIVE] Max open positions (%d) reached", SCALP_LIVE_MAX_OPEN)
             return False
 
         if symbol in self._open_positions:
@@ -116,28 +110,40 @@ class ScalpLiveEngine:
         return True
 
     async def execute_live_exit(
-        self, symbol: str, ref_price: float
+        self,
+        symbol: str,
+        ref_price: float,
+        *,
+        is_urgent_exit: bool = False,
+        spread_pct: float = 0.0,
+        adverse_selection_risk: float = 0.0,
     ) -> Optional[float]:
         """
         Execute a live scalp exit.
         Returns realized PnL if successful, None if failed.
+
+        Pass `is_urgent_exit=True` for catastrophic-stop/circuit-breaker/
+        max-hold exits — forces a guaranteed-fill MARKET order (item p21).
         """
         if not self.is_armed():
             return None
 
         entry_fill = self._open_positions.get(symbol)
         if entry_fill is None:
-            logger.warning(
-                "[SCALP_LIVE] exit called for %s but no open position", symbol
-            )
+            logger.warning("[SCALP_LIVE] exit called for %s but no open position", symbol)
             return None
 
         assert self._bridge is not None
-        fill = await self._bridge.place_sell(symbol, entry_fill.qty, ref_price)
+        fill = await self._bridge.place_sell(
+            symbol,
+            entry_fill.qty,
+            ref_price,
+            is_urgent_exit=is_urgent_exit,
+            spread_pct=spread_pct,
+            adverse_selection_risk=adverse_selection_risk,
+        )
         if fill is None:
-            logger.error(
-                "[SCALP_LIVE] SELL fill failed for %s — position remains open", symbol
-            )
+            logger.error("[SCALP_LIVE] SELL fill failed for %s — position remains open", symbol)
             return None
 
         entry_cost = entry_fill.qty * entry_fill.fill_price + entry_fill.fee_usdt
@@ -165,11 +171,7 @@ class ScalpLiveEngine:
         Trips when daily realized PnL falls below the configured loss limit,
         scaled by live max notional and max open positions.
         """
-        limit = (
-            self._config.daily_loss_limit_pct
-            * SCALP_LIVE_MAX_NOTIONAL
-            * SCALP_LIVE_MAX_OPEN
-        )
+        limit = self._config.daily_loss_limit_pct * SCALP_LIVE_MAX_NOTIONAL * SCALP_LIVE_MAX_OPEN
         if self._daily_pnl < -limit:
             logger.warning(
                 "[SCALP_LIVE] Daily loss circuit: pnl=%.2f limit=-%.2f",

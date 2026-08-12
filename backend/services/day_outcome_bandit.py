@@ -355,9 +355,7 @@ def get_arm_stats(
             peer_n = 0
             prior_source = "uniform"
             if hierarchical_prior_enabled():
-                p_a, p_b, peer_n = _peer_prior_alpha_beta(
-                    conn, symbol=sym, setup=st, regime=reg
-                )
+                p_a, p_b, peer_n = _peer_prior_alpha_beta(conn, symbol=sym, setup=st, regime=reg)
                 if peer_n > 0:
                     alpha = PRIOR_ALPHA + p_a
                     beta = PRIOR_BETA + p_b
@@ -442,11 +440,7 @@ def sample_arm(
         "size_factor": float(size_factor),
         "hard_block": False,
         "candidate_eligible": True,
-        "size_factor_cap": (
-            "starve" if starved
-            else "fresh" if n_obs < N_OBS_FOR_UPSIZE
-            else "top"
-        ),
+        "size_factor_cap": ("starve" if starved else "fresh" if n_obs < N_OBS_FOR_UPSIZE else "top"),
     }
 
 
@@ -466,12 +460,8 @@ def apply_bandit_to_decision_data(
     from backend.services.day_trade_thesis import resolve_setup_identity
 
     identity = resolve_setup_identity(dd)
-    setup = identity.get("setup_type_canonical") or str(
-        dd.get("setup_type") or dd.get("entry_thesis") or "UNKNOWN"
-    )
-    regime = identity.get("day_route_regime") or str(
-        dd.get("day_route_regime") or dd.get("regime") or "range"
-    )
+    setup = identity.get("setup_type_canonical") or str(dd.get("setup_type") or dd.get("entry_thesis") or "UNKNOWN")
+    regime = identity.get("day_route_regime") or str(dd.get("day_route_regime") or dd.get("regime") or "range")
 
     # Opt-in explicit hard-block on named (setup, regime) pairs. Empty env = no
     # blocks. Format: "SETUP:regime,SETUP:regime" (case-insensitive on both
@@ -479,17 +469,11 @@ def apply_bandit_to_decision_data(
     # rather than wait for slow bandit starvation.
     _block_env = os.getenv("DAY_BLOCK_SETUP_REGIME_PAIRS", "").strip()
     if _block_env:
-        _block_set = {
-            p.strip().upper()
-            for p in _block_env.split(",")
-            if p.strip() and ":" in p
-        }
+        _block_set = {p.strip().upper() for p in _block_env.split(",") if p.strip() and ":" in p}
         _key = f"{str(setup).upper()}:{str(regime).upper()}"
         if _key in _block_set:
             dd["day_bandit_enabled"] = True
-            dd["day_bandit_hard_block_reason"] = (
-                f"SETUP_REGIME_BLOCKED:{setup}:{regime}"
-            )
+            dd["day_bandit_hard_block_reason"] = f"SETUP_REGIME_BLOCKED:{setup}:{regime}"
             dd["hard_block"] = True
             dd["candidate_eligible"] = False
             dd["final_selection_score"] = 0.0
@@ -511,10 +495,7 @@ def apply_bandit_to_decision_data(
         prior_fss = 0.0
     # Compress prior FSS into ~[-0.5, 0.5] then blend with bandit sample in [0,1].
     prior_norm = math.tanh(prior_fss)
-    bandit_score = (
-        BANDIT_BLEND_PRIMARY * float(sampled["sample"])
-        + BANDIT_BLEND_SECONDARY * (0.5 + 0.5 * prior_norm)
-    )
+    bandit_score = BANDIT_BLEND_PRIMARY * float(sampled["sample"]) + BANDIT_BLEND_SECONDARY * (0.5 + 0.5 * prior_norm)
     if sampled["starved"]:
         bandit_score *= 0.35
 

@@ -34,8 +34,11 @@ def test_fresh_arm_uniform_when_no_peers(tmp_path: Path):
     assert st["prior_source"] == "uniform"
     assert st["peer_n_obs"] == 0
     samp = sample_arm(
-        "BTC/USDT", "HTF_TREND_PULLBACK", "range",
-        db_path=db, rng=random.Random(0),
+        "BTC/USDT",
+        "HTF_TREND_PULLBACK",
+        "range",
+        db_path=db,
+        rng=random.Random(0),
     )
     assert samp["size_factor"] == pytest.approx(1.0, abs=1e-6)
 

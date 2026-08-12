@@ -620,9 +620,7 @@ class TradingCircuitBreaker:
             import time
             from datetime import datetime, timezone
 
-            any_active = any(
-                [self.daily_loss_freeze_active, self.equity_circuit_breaker_active, self.account_failsafe_active]
-            )
+            any_active = any([self.daily_loss_freeze_active, self.equity_circuit_breaker_active, self.account_failsafe_active])
             fingerprint = (
                 bool(self.daily_loss_freeze_active),
                 bool(self.equity_circuit_breaker_active),

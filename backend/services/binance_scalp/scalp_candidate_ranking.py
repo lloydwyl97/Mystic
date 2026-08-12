@@ -45,6 +45,21 @@ SOFT_REJECT_SCORE: dict[str, float] = {
 }
 
 
+def min_tradeable_score() -> float:
+    """Public alias of the soft reference tradeability score.
+
+    NOT a permission gate — see architecture note in rank_setup_signal.
+    Exposed for scalp_dynamic_sizing.py so the EV-sizing formula uses the
+    same reference threshold rather than duplicating the magic default.
+    """
+    return _min_tradeable_score()
+
+
+def min_confident_rank() -> float:
+    """Public alias — see min_tradeable_score(). Not a gate."""
+    return _min_confident_rank()
+
+
 def _min_tradeable_score() -> float:
     # Evidence review (repair-all Phase 8): entry rank score at the time of
     # buy showed no meaningful separation between winners and losers in 184
@@ -165,7 +180,7 @@ def _reachability_soft_mult(
 @dataclass(frozen=True)
 class RankedCandidate:
     signal: ScalpSetupSignal
-    rank_score: float                      # final score (base + context adjustments)
+    rank_score: float  # final score (base + context adjustments)
     entry_eligible: bool
     hard_block: str | None
     regime: str
@@ -179,11 +194,17 @@ class RankedCandidate:
     reachability_multiplier: float | None = None
     target_gap_pct: float | None = None
     # Market-role context breakdown (live + learned, never a gate)
-    raw_rank_score: float = 0.0            # score before context adjustments
+    raw_rank_score: float = 0.0  # score before context adjustments
     live_context_adjustment: float = 0.0  # bounded ±0.04 from live market-role data
-    learned_adjustment: float = 0.0       # bounded ±0.02 from outcome history
+    learned_adjustment: float = 0.0  # bounded ±0.02 from outcome history
     role_sample_count: int = 0
     role_confidence: str = "insufficient_data"
+    microstructure_adjustment: float = 0.0  # bounded ±0.03 from real OFI/microprice/imbalance
+    # EV inputs for scalp_dynamic_sizing.py (never used to gate — sizing only)
+    arm_penalty_mult: float = 1.0
+    arm_stats: Any = None
+    regime_mismatch: bool = False
+    symbol_stall_risk: bool = False
 
 
 def rank_setup_signal(
@@ -206,28 +227,25 @@ def rank_setup_signal(
             selection_confidence="blocked",
         )
 
-    # Adaptive per-arm block: skip (symbol, setup) combos that are consistently
-    # losing money based on the last 30d of scalp_learning_outcomes. This is
-    # the data-driven equivalent of manually dropping SOL from SCALP_PRODUCTS.
-    # Never blocks arms with insufficient sample count.
-    try:
+    # Adaptive per-arm EV signal: (symbol, setup) combos with a consistently
+    # negative historical expectancy over the last 30d of
+    # scalp_learning_outcomes are ranking/size inputs, not permission gates
+    # (architecture rule: opinion/expectancy evidence must influence ranking
+    # and sizing, never become a new hard entry blocker). A heavily negative
+    # arm still competes for the global pick — it will simply almost never
+    # win against a healthier arm, and scalp_dynamic_sizing.py sizes it near
+    # the practical floor even when it does win. Never blocks on insufficient
+    # sample count (handled by arm_blocked itself).
+    arm_penalty_mult = 1.0
+    arm_stats_for_sizing: Any = None
+    with contextlib.suppress(Exception):
         from backend.services.binance_scalp.scalp_arm_blocker import arm_blocked
 
         _arm_blk, _arm_reason, _arm_stats = arm_blocked(ctx.snap.symbol, sig.setup_name)
+        arm_stats_for_sizing = _arm_stats
         if _arm_blk:
-            return RankedCandidate(
-                signal=sig,
-                rank_score=0.0,
-                entry_eligible=False,
-                hard_block=_arm_reason or "ARM_ADAPTIVE_BLOCK",
-                regime=regime,
-                regime_native=regime in STRATEGY_NATIVE_REGIMES.get(sig.setup_name, frozenset()),
-                soft_reason=sig.reject_reason,
-                selection_confidence="arm_blocked",
-            )
-    except Exception:
-        # Blocker failures must never gate live scalping — fall through.
-        pass
+            # Strong rank penalty (not exclusion) — evidence-based negative EV.
+            arm_penalty_mult = float(os.getenv("SCALP_ARM_NEGATIVE_EV_RANK_MULT", "0.20"))
 
     depth_ok, impact, fill = depth_check(ctx.snap, ctx.notional_usd, ctx.econ)
     if not depth_ok:
@@ -251,7 +269,7 @@ def rank_setup_signal(
     target_gap_val: float | None = None
 
     if sig.passed:
-        rank_score = float(sig.score) * regime_mult
+        rank_score = float(sig.score) * regime_mult * arm_penalty_mult
         hard_block = None
     else:
         reason = sig.reject_reason or ""
@@ -279,7 +297,7 @@ def rank_setup_signal(
             )
         base_score = _soft_base_score(reason)
         mom_boost = _soft_momentum_boost(ctx)
-        rank_score = (base_score + mom_boost) * regime_mult
+        rank_score = (base_score + mom_boost) * regime_mult * arm_penalty_mult
         hard_block = None
 
     expected = float(sig.expected_move_pct or 0.0)
@@ -315,26 +333,47 @@ def rank_setup_signal(
             )
 
     min_score = _min_tradeable_score()
-    # Lever-4 fix (evidence: 188/188 observed SCALP entries over 8 days were
-    # soft-rank promotions of setups the strategy itself REJECTED — never a
-    # genuine sig.passed setup — net -$4.35, 15.3% win rate. Prior review
-    # already found rank_score does not discriminate winners from losers for
-    # these soft entries. Soft-rejected setups may still rank/score for
-    # status/diagnostics display, but must never be promoted to an executable
-    # trade. Only a strategy's own confirmed pass_signal() may enter live.
-    entry_eligible = sig.passed and rank_score >= min_score and hard_block is None
+    # Architecture v2 (2026-08-11, "ranking not gating" rule): the prior
+    # "lever-4" fix required sig.passed AND rank_score>=min_score AND
+    # hard_block is None as a single boolean permission before ANY candidate
+    # could execute. That was itself an opinion/confidence-threshold gate —
+    # exactly the pattern the current architecture rule forbids for anything
+    # that is not mechanical safety. The original evidence it was fixing
+    # (188/188 soft-rank entries, -$4.35, 15.3% WR, rank_score not
+    # discriminating outcome) is still real and is NOT ignored — it is now
+    # addressed on the sizing side: scalp_dynamic_sizing.py sizes
+    # soft-rejected / regime-mismatched / arm-negative-EV / symbol-stall-risk
+    # candidates down toward the practical notional floor instead of a
+    # full-size bet, so a weak opinion costs little instead of nothing.
+    #
+    # entry_eligible now means ONLY "no mechanical safety hard_block fired"
+    # (spread / depth / stale-data / momentum-data-insufficient / net-edge —
+    # all handled above, before this point). rank_score is still fully
+    # computed and still drives which of the four symbols wins the global
+    # pick (pick_best_global_candidate) — a rejected setup can still be
+    # ranked and traded (small), it can never be forbidden by an opinion
+    # signal.
+    entry_eligible = hard_block is None
     soft_reason = None if sig.passed else sig.reject_reason
-    if entry_eligible and not native and _require_regime_native():
-        entry_eligible = False
-        confidence = "regime_mismatch"
-        soft_reason = f"REGIME_BLOCKED:{regime}"
-    elif not entry_eligible and hard_block is None:
-        confidence = "below_min"
+    confidence = "genuine_pass" if sig.passed else "soft_rank_ranked"
+    if rank_score < min_score:
+        confidence = f"{confidence}_below_min_score"  # observability only — does not block
 
-    if entry_eligible and _symbol_stall_risk_gate_enabled() and sig.symbol.upper() in _symbol_stall_risk_blocklist():
-        entry_eligible = False
-        confidence = "symbol_stall_risk_blocked"
-        soft_reason = f"SYMBOL_STALL_RISK_GATE:{sig.symbol}"
+    regime_mismatch = not native and _require_regime_native()
+    if regime_mismatch:
+        # Opinion signal only now — already reflected in regime_mult above.
+        confidence = f"{confidence}_regime_mismatch"
+        soft_reason = soft_reason or f"REGIME_MISMATCH_RANKED:{regime}"
+
+    symbol_stall_risk = _symbol_stall_risk_gate_enabled() and sig.symbol.upper() in _symbol_stall_risk_blocklist()
+    if symbol_stall_risk:
+        # Evidence-based *symbol-level* negative-EV signal (ETHUSDT/XRPUSDT
+        # historically worse win rate on this arm-population) — penalize
+        # rank/size, never exclude. The four top-4 symbols must all remain
+        # ranked and eligible per the architecture rule.
+        confidence = f"{confidence}_symbol_stall_risk"
+        soft_reason = soft_reason or f"SYMBOL_STALL_RISK_RANKED:{sig.symbol}"
+        rank_score = round(rank_score * float(os.getenv("SCALP_SYMBOL_STALL_RISK_RANK_MULT", "0.35")), 4)
 
     # ------------------------------------------------------------------
     # Market-role context adjustment — direct bounded addition to score.
@@ -361,42 +400,28 @@ def rank_setup_signal(
         role_conf_status = _stats.confidence_status
         learned_adj = round(max(-0.02, min(0.02, _stats.learned_adjustment)), 5)
 
-    rank_score = round(rank_score + live_ctx_adj + learned_adj, 4)
+    # Real microstructure engine (OFI + aggressor flow + microprice pressure,
+    # short 250ms-30s windows) — feeds this SCALP entry's rank_score only.
+    # Never eligibility, never a gate. See microstructure_engine.py.
+    micro_adj = 0.0
+    with contextlib.suppress(Exception):
+        from backend.services.microstructure_engine import get_microstructure_ranking_delta as _gmrd
 
-    # Measurement: counters only — never flips eligibility (scalp_strategy_owner_v1).
+        micro_adj = round(_gmrd(sig.symbol), 5)
+
+    rank_score = round(rank_score + live_ctx_adj + learned_adj + micro_adj, 4)
+
+    # Measurement: counters only — never flips eligibility (scalp_strategy_owner_v2).
+    # Outcome is "hard_blocked" ONLY for mechanical safety (hard_block set).
+    # Everything opinion-derived (soft-rank, regime mismatch, symbol stall
+    # risk, arm negative-EV, below min score) is recorded as "ranked" —
+    # it was penalized, not rejected — to keep telemetry honest about what
+    # actually happened.
     with contextlib.suppress(Exception):
         from backend.services.scalp_gate_telemetry import record_gate_event
 
         _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
-        if sig.passed and entry_eligible:
-            record_gate_event(
-                _db,
-                gate_id="STRATEGY_PASS",
-                symbol=sig.symbol,
-                outcome="passed",
-                setup=sig.setup_name,
-                regime=regime,
-            )
-        elif not sig.passed:
-            record_gate_event(
-                _db,
-                gate_id="STRATEGY_NO_SIGNAL",
-                reason=str(sig.reject_reason or soft_reason or ""),
-                symbol=sig.symbol,
-                outcome="hard_blocked",
-                setup=sig.setup_name,
-                regime=regime,
-                detail="soft_rank_diagnostic_only",
-            )
-            record_gate_event(
-                _db,
-                gate_id="SOFT_RANK_BLOCKED",
-                symbol=sig.symbol,
-                outcome="hard_blocked",
-                setup=sig.setup_name,
-                regime=regime,
-            )
-        elif hard_block:
+        if hard_block:
             record_gate_event(
                 _db,
                 reason=str(hard_block),
@@ -405,34 +430,56 @@ def rank_setup_signal(
                 setup=sig.setup_name,
                 regime=regime,
             )
-        elif soft_reason and "REGIME" in str(soft_reason).upper():
+        elif sig.passed:
+            record_gate_event(
+                _db,
+                gate_id="STRATEGY_PASS",
+                symbol=sig.symbol,
+                outcome="ranked",
+                setup=sig.setup_name,
+                regime=regime,
+                detail=str(confidence),
+            )
+        else:
+            record_gate_event(
+                _db,
+                gate_id="SOFT_RANK_RANKED",
+                reason=str(sig.reject_reason or soft_reason or ""),
+                symbol=sig.symbol,
+                outcome="ranked",
+                setup=sig.setup_name,
+                regime=regime,
+                detail=str(confidence),
+            )
+        if regime_mismatch:
             record_gate_event(
                 _db,
                 gate_id="REGIME_MISMATCH",
                 symbol=sig.symbol,
-                outcome="hard_blocked",
+                outcome="ranked",
                 setup=sig.setup_name,
                 regime=regime,
                 detail=str(soft_reason),
             )
-        elif soft_reason and "STALL_RISK" in str(soft_reason).upper():
+        if symbol_stall_risk:
             record_gate_event(
                 _db,
                 gate_id="SYMBOL_STALL_RISK",
                 symbol=sig.symbol,
-                outcome="hard_blocked",
+                outcome="ranked",
                 setup=sig.setup_name,
                 regime=regime,
+                detail=f"rank_penalty_mult={os.getenv('SCALP_SYMBOL_STALL_RISK_RANK_MULT', '0.35')}",
             )
-        elif not entry_eligible:
+        if arm_penalty_mult < 1.0:
             record_gate_event(
                 _db,
-                gate_id="RANK_BELOW_MIN",
+                gate_id="ARM_NEGATIVE_EV_RANKED",
                 symbol=sig.symbol,
-                outcome="hard_blocked",
+                outcome="ranked",
                 setup=sig.setup_name,
                 regime=regime,
-                detail=str(soft_reason or confidence or ""),
+                detail=f"arm_penalty_mult={arm_penalty_mult}",
             )
 
     return RankedCandidate(
@@ -454,6 +501,11 @@ def rank_setup_signal(
         learned_adjustment=learned_adj,
         role_sample_count=role_samples,
         role_confidence=role_conf_status,
+        microstructure_adjustment=micro_adj,
+        arm_penalty_mult=arm_penalty_mult,
+        arm_stats=arm_stats_for_sizing,
+        regime_mismatch=regime_mismatch,
+        symbol_stall_risk=symbol_stall_risk,
     )
 
 
@@ -461,53 +513,52 @@ def prepare_entry_signal(
     ranked: RankedCandidate,
     ctx: StrategyMarketContext,
 ) -> ScalpSetupSignal:
-    """Return an executable entry signal only for genuine strategy passes.
+    """Return an executable entry signal for any candidate that is
+    ``entry_eligible`` (i.e. no mechanical safety hard_block fired).
 
-    Soft-rank promotion (forcing ``passed=True`` on rejects) is permanently
-    disabled — ``entry_eligible`` already requires ``sig.passed``, so this
-    path must never resurrect rejected setups into paper/live trades.
+    Architecture v2 (2026-08-11): a strategy's own ``sig.passed`` is a
+    strong, but no longer mandatory, ranking/confidence input — see the
+    architecture note in ``rank_setup_signal``. This function stamps HONEST
+    provenance (never forges ``passed=True``) so downstream sizing
+    (``scalp_dynamic_sizing.py``) and learning attribution can tell a
+    genuine strategy pass from an opinion-ranked promotion. Position size,
+    not eligibility, is what protects capital on a weak/soft-rank/negative-EV
+    candidate.
     """
-    del ctx  # reserved for future genuine-pass enrichment; unused by design
-    sig = ranked.signal
-    if not sig.passed:
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "SOFT_RANK_PROMOTION_BLOCKED setup=%s symbol=%s soft_reason=%s — refusing entry",
-            sig.setup_name,
-            sig.symbol,
-            ranked.soft_reason,
-        )
-        with contextlib.suppress(Exception):
-            from backend.services.scalp_gate_telemetry import record_gate_event, record_shadow_reject
-
-            _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
-            record_gate_event(
-                _db,
-                gate_id="SOFT_RANK_BLOCKED",
-                symbol=sig.symbol,
-                outcome="hard_blocked",
-                setup=sig.setup_name,
-                detail=str(ranked.soft_reason or ""),
-            )
-            record_shadow_reject(
-                _db,
-                symbol=sig.symbol,
-                gate_id="SOFT_RANK_BLOCKED",
-                setup=sig.setup_name,
-                entry_price=float(getattr(sig, "limit_buy_price", 0.0) or 0.0),
-                detail=str(ranked.soft_reason or ""),
-            )
-        return sig
-    # Authority stamp — strategy owns entry; intel/ML only ranked among passed.
     from dataclasses import replace
 
+    sig = ranked.signal
+    if not ranked.entry_eligible:
+        # Mechanical safety hard_block — this path should not be reached by
+        # the caller for a non-eligible candidate, but stay defensive.
+        return sig
+
     ctx_map = dict(sig.setup_context or {})
-    ctx_map["entry_owner"] = "strategy"
+    ctx_map["entry_owner"] = "strategy" if sig.passed else "ranking_ev"
     ctx_map["ml_role"] = "rank_size"
-    ctx_map["decision_policy_version"] = "scalp_strategy_owner_v1"
-    ctx_map["soft_rank_entry"] = False
+    ctx_map["decision_policy_version"] = "scalp_ranking_not_gating_v2"
+    ctx_map["soft_rank_entry"] = not sig.passed
+    ctx_map["regime_mismatch"] = bool(ranked.regime_mismatch)
+    ctx_map["symbol_stall_risk"] = bool(ranked.symbol_stall_risk)
+    ctx_map["arm_penalty_mult"] = float(ranked.arm_penalty_mult)
+    ctx_map["rank_score_at_entry"] = float(ranked.rank_score)
+    ctx_map["selection_confidence"] = str(ranked.selection_confidence)
     ctx_map["bar_closed"] = True
+
+    with contextlib.suppress(Exception):
+        from backend.services.scalp_gate_telemetry import record_gate_event
+
+        _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
+        record_gate_event(
+            _db,
+            gate_id="STRATEGY_PASS" if sig.passed else "SOFT_RANK_PROMOTED",
+            symbol=sig.symbol,
+            outcome="entered",
+            setup=sig.setup_name,
+            detail=f"rank_score={ranked.rank_score} confidence={ranked.selection_confidence}",
+        )
+
+    del ctx  # reserved for future genuine-pass enrichment; unused by design
     return replace(sig, setup_context=ctx_map)
 
 
@@ -616,6 +667,8 @@ __all__ = [
     "HARD_REJECT_REASONS",
     "RankedCandidate",
     "SOFT_REJECT_SCORE",
+    "min_confident_rank",
+    "min_tradeable_score",
     "pick_best_global_candidate",
     "pick_best_ranked",
     "prepare_entry_signal",

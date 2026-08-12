@@ -53,9 +53,7 @@ def test_all_red_scores_low_and_size_at_floor():
     assert out["entry_confirmation_score"] < 0.25
     assert out["entry_confirmation_state"] == "contradicted"
     assert out["entry_confirmation_rank_delta"] < 0.0
-    assert out["entry_confirmation_size_factor"] == pytest.approx(
-        SIZE_FACTOR_AT_ZERO, abs=0.05
-    )
+    assert out["entry_confirmation_size_factor"] == pytest.approx(SIZE_FACTOR_AT_ZERO, abs=0.05)
 
 
 def test_missing_data_yields_neutral():
@@ -94,12 +92,8 @@ def test_applies_multiplicative_size_and_additive_rank():
     # Confirmation score should be middling (~0.4), size factor ~0.5
     conf_size = float(out["entry_confirmation_size_factor"])
     assert 0.30 <= conf_size <= 0.75
-    assert out["thesis_size_factor"] == pytest.approx(
-        max(SIZE_FACTOR_AT_ZERO, 0.80 * conf_size), rel=1e-4
-    )
-    assert out["thesis_rank_delta"] == pytest.approx(
-        -0.05 + float(out["entry_confirmation_rank_delta"]), rel=1e-4
-    )
+    assert out["thesis_size_factor"] == pytest.approx(max(SIZE_FACTOR_AT_ZERO, 0.80 * conf_size), rel=1e-4)
+    assert out["thesis_rank_delta"] == pytest.approx(-0.05 + float(out["entry_confirmation_rank_delta"]), rel=1e-4)
 
 
 def test_disable_flag_produces_noop(monkeypatch):

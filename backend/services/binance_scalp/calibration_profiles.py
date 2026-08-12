@@ -19,6 +19,7 @@ def _env_bool(name: str, default: bool) -> bool:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
+
 CALIBRATION_PROFILES: dict[str, dict[str, float]] = {
     # A — current strict production paper defaults
     "strict": {

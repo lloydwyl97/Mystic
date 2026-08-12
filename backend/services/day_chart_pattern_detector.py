@@ -51,9 +51,7 @@ def _extract_ohlc(rows: list[list]) -> tuple[list[float], list[float], list[floa
     return closes, highs, lows
 
 
-def find_swing_points(
-    highs: list[float], lows: list[float], *, lookback: int = _DEFAULT_LOOKBACK
-) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+def find_swing_points(highs: list[float], lows: list[float], *, lookback: int = _DEFAULT_LOOKBACK) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
     """Local-extrema swing points: bar i is a swing high if its high is the unique
     max within [i-lookback, i+lookback] (swing low: unique min of lows, symmetric).
     Returns (swing_highs, swing_lows) as (index, price) pairs, oldest-first."""
@@ -72,9 +70,7 @@ def find_swing_points(
     return swing_highs, swing_lows
 
 
-def _double_top_bottom(
-    swing_highs: list[tuple[int, float]], swing_lows: list[tuple[int, float]], last_price: float
-) -> tuple[float, str | None]:
+def _double_top_bottom(swing_highs: list[tuple[int, float]], swing_lows: list[tuple[int, float]], last_price: float) -> tuple[float, str | None]:
     if last_price <= 0:
         return 0.0, None
     if len(swing_highs) >= 2:
@@ -94,9 +90,7 @@ def _double_top_bottom(
     return 0.0, None
 
 
-def _trend_structure(
-    swing_highs: list[tuple[int, float]], swing_lows: list[tuple[int, float]]
-) -> tuple[float, str | None]:
+def _trend_structure(swing_highs: list[tuple[int, float]], swing_lows: list[tuple[int, float]]) -> tuple[float, str | None]:
     if len(swing_highs) < 2 or len(swing_lows) < 2:
         return 0.0, None
     higher_high = swing_highs[-1][1] > swing_highs[-2][1]
@@ -110,9 +104,7 @@ def _trend_structure(
     return 0.0, None
 
 
-def _triangle_wedge(
-    swing_highs: list[tuple[int, float]], swing_lows: list[tuple[int, float]]
-) -> tuple[float, str | None]:
+def _triangle_wedge(swing_highs: list[tuple[int, float]], swing_lows: list[tuple[int, float]]) -> tuple[float, str | None]:
     if len(swing_highs) < 2 or len(swing_lows) < 2:
         return 0.0, None
     high_slope = swing_highs[-1][1] - swing_highs[-2][1]
@@ -126,9 +118,7 @@ def _triangle_wedge(
     return 0.0, None
 
 
-def _support_resistance_breakout(
-    swing_highs: list[tuple[int, float]], swing_lows: list[tuple[int, float]], last_price: float
-) -> tuple[float, str | None]:
+def _support_resistance_breakout(swing_highs: list[tuple[int, float]], swing_lows: list[tuple[int, float]], last_price: float) -> tuple[float, str | None]:
     if last_price <= 0:
         return 0.0, None
     if swing_highs and last_price > swing_highs[-1][1] * 1.001:

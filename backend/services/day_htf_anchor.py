@@ -42,7 +42,7 @@ DEFAULT_WEIGHTS: dict[str, float] = {
 }
 
 RANK_DELTA_AT_ZERO = -0.10  # counter-HTF setup
-RANK_DELTA_AT_ONE = 0.05    # HTF-aligned bonus
+RANK_DELTA_AT_ONE = 0.05  # HTF-aligned bonus
 SIZE_FACTOR_AT_ZERO = 0.55
 SIZE_FACTOR_AT_ONE = 1.15
 SIZE_FACTOR_AT_HALF = 0.85
@@ -217,12 +217,7 @@ def compute_htf_anchor(
         }
     dd = dict(decision_data or {})
     w = dict(weights or DEFAULT_WEIGHTS)
-    setup = str(
-        dd.get("setup_type_canonical")
-        or dd.get("setup_type")
-        or dd.get("entry_thesis")
-        or ""
-    )
+    setup = str(dd.get("setup_type_canonical") or dd.get("setup_type") or dd.get("entry_thesis") or "")
     family = _setup_family(setup)
 
     mtf = parse_mtf_json(dd)

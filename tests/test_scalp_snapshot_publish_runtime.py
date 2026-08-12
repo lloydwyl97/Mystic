@@ -136,9 +136,7 @@ def test_paper_engine_warm_and_tick_publish_same_key() -> None:
     eng._redis.get.return_value = None
     eng._entry_armed_ok = lambda: True
     eng._cached_open_symbols = []
-    eng._publish_api_status_snapshot = BinanceScalpPaperEngine._publish_api_status_snapshot.__get__(
-        eng, BinanceScalpPaperEngine
-    )
+    eng._publish_api_status_snapshot = BinanceScalpPaperEngine._publish_api_status_snapshot.__get__(eng, BinanceScalpPaperEngine)
 
     with patch(
         "backend.services.binance_scalp.scalp_status_cache.publish_status_snapshot",

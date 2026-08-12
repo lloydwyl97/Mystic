@@ -2,13 +2,43 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from backend.services import day_adaptive_targets as dat
+from backend.services import day_controlled_exits as dce
+from backend.services import mfe_mae_distribution_learner as _dist
 from backend.services.day_controlled_exits import EXIT_STOP_LOSS, evaluate_engine_managed_exit
+from backend.services.market_role_outcome_learner import _SCHEMA_SQL
 from backend.services.portfolio_engine import OpenPosition, PortfolioEngine, PriceCache
+
+
+@pytest.fixture(autouse=True)
+def _isolated_mae_distribution_db(tmp_path, monkeypatch):
+    """These tests exercise fresh-vs-stale MARK handling for the fixed
+    stop-loss specifically. Without this, ``evaluate_adaptive_loss_exit``
+    (item p7) would read whatever real market_role_trade_outcomes history
+    happens to exist in the actual production DB and could legitimately
+    preempt the fixed stop-loss with an earlier ADAPTIVE_LOSS_EXIT — correct
+    live behavior, but not what these specific mark-freshness tests are
+    about. Point BOTH day_controlled_exits._db_path and
+    day_adaptive_targets._db_path at the same empty, isolated schema (and
+    clear the distribution module's own result cache, which is keyed by
+    symbol/strategy only, not db_path, so a real-DB read from either module
+    can otherwise leak into the other) so the adaptive-loss check always
+    degrades to insufficient_data and these tests see pure fixed-stop-loss
+    behavior, as originally intended.
+    """
+    p = str(tmp_path / "isolated_outcomes.db")
+    with sqlite3.connect(p) as conn:
+        conn.executescript(_SCHEMA_SQL)
+        conn.commit()
+    _dist._cache.clear()
+    monkeypatch.setattr(dce, "_db_path", lambda: p)
+    monkeypatch.setattr(dat, "_db_path", lambda: p)
 
 
 def _xrp_position() -> OpenPosition:
