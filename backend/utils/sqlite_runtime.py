@@ -71,14 +71,59 @@ def ensure_wal(db_path: str | Path) -> None:
         conn.close()
 
 
+class _AutoCloseConnection:
+    """Proxy around sqlite3.Connection that closes the connection on `with` exit.
+
+    `sqlite3.Connection.__exit__` only commits/rolls back the transaction; it does
+    NOT close the connection or its file descriptor. Every `with connect_rw(...) as
+    conn:` call site across the codebase relied on that assumption, so each call
+    leaked one open connection/fd. Under sustained write contention (retries via
+    run_locked_retry, repeated bar-cycle failures) this leak compounds quickly and
+    starves the single SQLite writer lock, causing cascading "database is locked"
+    errors. This wrapper preserves the exact commit/rollback-on-exit behavior
+    callers already depend on, and additionally guarantees `.close()` runs after,
+    with zero changes required at any of the 37 existing call sites.
+    """
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        object.__setattr__(self, "_conn", conn)
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return self._conn.__exit__(exc_type, exc, tb)
+        finally:
+            with contextlib.suppress(Exception):
+                self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._conn, name, value)
+
+    def __del__(self):
+        with contextlib.suppress(Exception):
+            self._conn.close()
+
+
 def connect_rw(db_path: str | Path) -> sqlite3.Connection:
-    """Read-write connection for portfolio writer / mutation paths."""
+    """Read-write connection for portfolio writer / mutation paths.
+
+    Returns an _AutoCloseConnection proxy (see class docstring) so `with
+    connect_rw(...) as conn:` always releases the underlying connection/fd.
+    """
     ensure_wal(db_path)
     conn = sqlite3.connect(str(db_path), timeout=_db_timeout_sec())
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute(f"PRAGMA busy_timeout={_busy_timeout_ms()};")
-    return conn
+    return _AutoCloseConnection(conn)  # type: ignore[return-value]
 
 
 def connect_ro(db_path: str | Path, *, timeout_sec: float | None = None) -> sqlite3.Connection:

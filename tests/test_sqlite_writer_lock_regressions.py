@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import sqlite3
 import time
@@ -14,6 +15,58 @@ import pytest
 from backend.services.circuit_breaker_service import TradingCircuitBreaker
 from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 from backend.utils import sqlite_runtime
+
+
+def test_connect_rw_with_block_closes_underlying_connection(tmp_path: Path) -> None:
+    """sqlite3.Connection.__exit__ only commits/rolls back — it never closes the fd.
+
+    Every `with connect_rw(...) as conn:` call site (37 across the codebase) relies
+    on the connection actually closing on exit. Before the fix, each such call leaked
+    one open connection/fd; under sustained retry storms this compounded into
+    cascading "database is locked" failures. connect_rw must return a wrapper whose
+    `with` exit both preserves commit/rollback semantics AND closes the connection.
+    """
+    db = tmp_path / "autoclose.db"
+    with sqlite3.connect(db) as c:
+        c.execute("CREATE TABLE t(x INTEGER)")
+        c.commit()
+
+    with sqlite_runtime.connect_rw(db) as conn:
+        conn.execute("INSERT INTO t (x) VALUES (1)")
+        # sanity: proxy still behaves like a normal connection mid-block
+        assert conn.execute("SELECT x FROM t").fetchone() == (1,)
+
+    # After the `with` block exits, the underlying sqlite3 connection must be closed
+    # (a closed connection raises ProgrammingError on any further use).
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+
+    # Commit-on-success semantics must be preserved: the insert above should be durable.
+    with sqlite3.connect(db) as c2:
+        assert c2.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
+
+
+def test_connect_rw_with_block_closes_on_exception(tmp_path: Path) -> None:
+    """Connection must close (and roll back) even when the `with` body raises."""
+    db = tmp_path / "autoclose_err.db"
+    with sqlite3.connect(db) as c:
+        c.execute("CREATE TABLE t(x INTEGER)")
+        c.commit()
+
+    captured_conn = None
+    with contextlib.suppress(RuntimeError):
+        with sqlite_runtime.connect_rw(db) as conn:
+            captured_conn = conn
+            conn.execute("INSERT INTO t (x) VALUES (1)")
+            raise RuntimeError("boom")
+
+    assert captured_conn is not None
+    with pytest.raises(sqlite3.ProgrammingError):
+        captured_conn.execute("SELECT 1")
+
+    # Rolled back: the insert must not be durable since the block raised.
+    with sqlite3.connect(db) as c2:
+        assert c2.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0
 
 
 def test_writer_helper_sets_busy_timeout_and_retries(tmp_path: Path) -> None:
