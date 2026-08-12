@@ -69,6 +69,21 @@ def test_connect_rw_with_block_closes_on_exception(tmp_path: Path) -> None:
         assert c2.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0
 
 
+def test_connect_ro_with_block_closes_underlying_connection(tmp_path: Path) -> None:
+    """connect_ro hits every GET/status API request — leaks here compound fast."""
+    db = tmp_path / "ro_autoclose.db"
+    with sqlite3.connect(db) as c:
+        c.execute("CREATE TABLE t(x INTEGER)")
+        c.execute("INSERT INTO t (x) VALUES (1)")
+        c.commit()
+
+    with sqlite_runtime.connect_ro(db, timeout_sec=1.0) as conn:
+        assert conn.execute("SELECT x FROM t").fetchone() == (1,)
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+
+
 def test_writer_helper_sets_busy_timeout_and_retries(tmp_path: Path) -> None:
     db = tmp_path / "w.db"
     with sqlite3.connect(db) as c:

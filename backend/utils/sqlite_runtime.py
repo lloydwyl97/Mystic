@@ -127,7 +127,13 @@ def connect_rw(db_path: str | Path) -> sqlite3.Connection:
 
 
 def connect_ro(db_path: str | Path, *, timeout_sec: float | None = None) -> sqlite3.Connection:
-    """Short-lived read connection for GET/dashboard routes — no write txn, no WAL rewrite."""
+    """Short-lived read connection for GET/dashboard routes — no write txn, no WAL rewrite.
+
+    Returns an _AutoCloseConnection proxy (see class docstring on connect_rw) so
+    `with connect_ro(...) as conn:` always releases the underlying connection/fd.
+    This path is hit on every GET/status API request, so an unclosed connection
+    here leaks fast under normal dashboard/API polling traffic.
+    """
     timeout = _db_timeout_sec() if timeout_sec is None else max(0.1, float(timeout_sec))
     path = str(db_path)
     try:
@@ -137,7 +143,7 @@ def connect_ro(db_path: str | Path, *, timeout_sec: float | None = None) -> sqli
         with contextlib.suppress(sqlite3.Error):
             conn.execute("PRAGMA query_only=ON;")
     conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)};")
-    return conn
+    return _AutoCloseConnection(conn)  # type: ignore[return-value]
 
 
 def run_locked_retry(
