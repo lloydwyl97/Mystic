@@ -190,10 +190,6 @@ def apply_scalp_migrations(conn: sqlite3.Connection) -> list[str]:
     applied: list[str] = []
     version = _current_schema_version(conn)
     if version < 3:
-        if migrate_exit_manager_v3(conn):
-            applied.append("migrate_exit_manager_v3")
-        else:
-            applied.append("ensure_exit_manager_v3")
         conn.execute("UPDATE scalp_meta SET schema_version = ? WHERE id = 1", (SCHEMA_VERSION,))
     if version < 2:
         if migrate_scalp_positions_open_unique(conn):
@@ -210,6 +206,12 @@ def apply_scalp_migrations(conn: sqlite3.Connection) -> list[str]:
     elif not _has_open_symbol_unique_index(conn):
         migrate_scalp_positions_open_unique(conn)
         applied.append("repair_open_symbol_partial_index")
+    # After any positions rebuild: a money-DB copy can already be
+    # schema_version=3 while last_review_ts / state columns are missing.
+    if migrate_exit_manager_v3(conn):
+        applied.append("migrate_exit_manager_v3")
+    elif version < 3:
+        applied.append("ensure_exit_manager_v3")
     return applied
 
 

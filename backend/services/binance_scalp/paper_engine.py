@@ -633,10 +633,19 @@ class BinanceScalpPaperEngine:
         if not ranked:
             ranked = self._router.evaluate_all(epoch=epoch, notional_usd=notional) or []
 
-        with contextlib.suppress(Exception):
+        try:
             from backend.services.binance_scalp.scalp_opportunity_dataset import record_opportunity_cycle
 
-            record_opportunity_cycle(self.config.database_path, rows=ranked, epoch=epoch)
+            written = record_opportunity_cycle(
+                self.config.database_path,
+                rows=ranked,
+                epoch=epoch,
+                conn=conn,
+            )
+            if written:
+                logger.info("SCALP_OPPORTUNITY_CYCLE written=%s symbols=%s", written, [r.get("symbol") for r in ranked])
+        except Exception:
+            logger.exception("SCALP_OPPORTUNITY_CYCLE_FAILED n=%s", len(ranked))
 
         if open_symbols:
             ranked = [r for r in ranked if str(r.get("symbol") or "").upper() not in open_symbols]

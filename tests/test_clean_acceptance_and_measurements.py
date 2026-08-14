@@ -73,3 +73,64 @@ def test_measure_all_setups_returns_nine():
     assert "momentum_flip_strength" in meas["range_bounce_scalp"]
     delta = evidence_rank_delta(meas)
     assert -0.05 <= delta <= 0.05
+
+
+def test_opportunity_cycle_writes_under_immediate_lock(tmp_path: Path):
+    import sqlite3
+
+    from backend.services.binance_scalp.scalp_opportunity_dataset import record_opportunity_cycle
+    from backend.services.binance_scalp.schema import init_scalp_schema
+
+    db = str(tmp_path / "scalp.db")
+    init_scalp_schema(db, principal=1000.0)
+    holder = sqlite3.connect(db, timeout=10)
+    holder.execute("BEGIN IMMEDIATE")
+    n = record_opportunity_cycle(
+        db,
+        rows=[{"symbol": "BTCUSDT", "mid": 100.0, "spread_pct": 0.0002, "rank_score": 0.4, "strategy_passed": False}],
+        epoch=1.0,
+        conn=holder,
+    )
+    holder.commit()
+    holder.close()
+    assert n == 1
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*), symbol FROM scalp_opportunity_snapshots").fetchone()[0] == 1
+    conn.close()
+
+
+def test_exit_manager_columns_repair_when_version_already_3(tmp_path: Path):
+    import sqlite3
+
+    from backend.services.binance_scalp.schema import apply_scalp_migrations
+
+    db = str(tmp_path / "scalp.db")
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE scalp_meta (id INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL);
+        INSERT INTO scalp_meta VALUES (1, 3);
+        CREATE TABLE scalp_paper_positions (
+            id INTEGER PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            exchange TEXT,
+            strategy_id TEXT,
+            quantity REAL,
+            entry_price REAL,
+            entry_time TEXT,
+            entry_time_epoch REAL,
+            trade_id TEXT,
+            paper_order_id TEXT,
+            status TEXT,
+            reprice_count INTEGER,
+            diagnostics_json TEXT
+        );
+        """
+    )
+    conn.commit()
+    applied = apply_scalp_migrations(conn)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(scalp_paper_positions)")}
+    conn.close()
+    assert "last_review_ts" in cols
+    assert "state" in cols
+    assert any("migrate_exit_manager_v3" in a for a in applied)

@@ -54,11 +54,17 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
 """
 
 
-def ensure_opportunity_table(db_path: str) -> None:
-    with sqlite3.connect(db_path, timeout=10) as conn:
-        conn.execute(_CREATE)
-        conn.execute(f"CREATE INDEX IF NOT EXISTS ix_scalp_opp_epoch ON {TABLE}(epoch, symbol)")
-        conn.commit()
+def ensure_opportunity_table(db_path: str, conn: sqlite3.Connection | None = None) -> None:
+    def _apply(c: sqlite3.Connection) -> None:
+        c.execute(_CREATE)
+        c.execute(f"CREATE INDEX IF NOT EXISTS ix_scalp_opp_epoch ON {TABLE}(epoch, symbol)")
+
+    if conn is not None:
+        _apply(conn)
+        return
+    with sqlite3.connect(db_path, timeout=10) as owned:
+        _apply(owned)
+        owned.commit()
 
 
 def record_opportunity_cycle(
@@ -67,20 +73,29 @@ def record_opportunity_cycle(
     rows: list[dict[str, Any]],
     epoch: float | None = None,
     cost_pct: float = 0.0006,
+    conn: sqlite3.Connection | None = None,
 ) -> int:
+    """Persist one evaluate_all() cycle.
+
+    When ``conn`` is the paper-engine tick connection (BEGIN IMMEDIATE),
+    reuse it. A second sqlite writer against the same file deadlocks under
+    that lock and the snapshot never lands.
+    """
     if not rows:
         return 0
-    ensure_opportunity_table(db_path)
+    ensure_opportunity_table(db_path, conn=conn)
     now = datetime.now(timezone.utc).isoformat()
     ts = float(epoch if epoch is not None else time.time())
     written = 0
-    with sqlite3.connect(db_path, timeout=10) as conn:
+    owned = conn is None
+    writer = conn if conn is not None else sqlite3.connect(db_path, timeout=10)
+    try:
         for row in rows:
             snap = row.get("snap")
             mid = float(getattr(snap, "mid", 0) or row.get("mid") or 0)
             spread = float(getattr(snap, "spread_pct", 0) or row.get("spread_pct") or 0)
             meta = row.get("rank_meta") or {}
-            conn.execute(
+            writer.execute(
                 f"""
                 INSERT INTO {TABLE}
                 (created_at, epoch, symbol, mid, spread_pct, impact_pct, regime,
@@ -106,7 +121,11 @@ def record_opportunity_cycle(
                 ),
             )
             written += 1
-        conn.commit()
+        if owned:
+            writer.commit()
+    finally:
+        if owned:
+            writer.close()
     _ = cost_pct
     return written
 
