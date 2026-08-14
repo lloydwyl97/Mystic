@@ -428,7 +428,14 @@ def rank_setup_signal(
 
         micro_adj = round(_gmrd(sig.symbol), 5)
 
-    rank_score = round(rank_score + live_ctx_adj + learned_adj + micro_adj, 4)
+    feature_adj = 0.0
+    with contextlib.suppress(Exception):
+        feats = (sig.setup_context or {}).get("features") or {}
+        if feats:
+            from backend.services.binance_scalp.scalp_setup_measurements import evidence_rank_delta
+
+            feature_adj = round(evidence_rank_delta({sig.setup_name: feats}), 5)
+    rank_score = round(rank_score + live_ctx_adj + learned_adj + micro_adj + feature_adj, 4)
 
     # Measurement: counters only — never flips eligibility (scalp_strategy_owner_v2).
     # Outcome is "hard_blocked" ONLY for mechanical safety (hard_block set).

@@ -7,6 +7,7 @@ is never computed on mixed books.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -124,3 +125,104 @@ def read_validation_cutoff(db_path: str | Path) -> dict[str, Any] | None:
 def post_repair_where(timestamp_column: str = "timestamp") -> tuple[str, tuple[str, ...]]:
     """SQL fragment: timestamp_column >= cutoff. Caller supplies cutoff_utc."""
     return f"{timestamp_column} >= ?", ()
+
+
+# Accounting keeps these rows. Strategy-acceptance stats must exclude them.
+RECONCILIATION_EXIT_REASONS = frozenset(
+    {
+        "RECONCILIATION_MANUAL_EXIT",
+        "RECONCILIATION_EXIT",
+    }
+)
+RECONCILIATION_TRADE_IDS = frozenset(
+    {
+        # Ocean DAY SELL of restored orphan XRP BUY 980. Not an AI-selected entry.
+        "983",
+    }
+)
+
+
+def is_strategy_acceptance_eligible(
+    *,
+    exit_reason: str | None = None,
+    trade_id: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> bool:
+    """True when a close may count toward clean AI-strategy WR/net/expectancy."""
+    reason = str(exit_reason or "").strip().upper()
+    if reason in RECONCILIATION_EXIT_REASONS:
+        return False
+    extra = extra or {}
+    acceptance = str(extra.get("acceptance_class") or extra.get("strategy_acceptance") or "").strip().upper()
+    if acceptance in RECONCILIATION_EXIT_REASONS or acceptance == "RECONCILIATION":
+        return False
+    tid = str(trade_id or extra.get("trade_id") or "").strip()
+    if tid in RECONCILIATION_TRADE_IDS:
+        return False
+    return True
+
+
+def mark_reconciliation_manual_exit(
+    db_path: str | Path,
+    *,
+    trade_id: int = 983,
+    note: str = "Restored orphan inventory flatten; excluded from clean AI-strategy acceptance.",
+) -> dict[str, Any]:
+    """Stamp an existing close as reconciliation. Does not delete or change cash."""
+    path = str(db_path)
+    conn = sqlite3.connect(path, timeout=15)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT id, trade_id, symbol, side, exit_reason, pnl, explainability_json FROM paper_trades WHERE id=?",
+            (int(trade_id),),
+        ).fetchone()
+        if row is None:
+            return {"updated": False, "reason": "not_found", "id": trade_id}
+        extra = {}
+        raw = row["explainability_json"]
+        if raw:
+            try:
+                extra = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            except Exception:
+                extra = {}
+        extra["acceptance_class"] = "RECONCILIATION_MANUAL_EXIT"
+        extra["strategy_acceptance_eligible"] = False
+        extra["reconciliation_note"] = note
+        extra["original_exit_reason"] = row["exit_reason"]
+        conn.execute(
+            """
+            UPDATE paper_trades
+            SET exit_reason='RECONCILIATION_MANUAL_EXIT',
+                explainability_json=?
+            WHERE id=?
+            """,
+            (json.dumps(extra, separators=(",", ":"), default=str), int(trade_id)),
+        )
+        conn.commit()
+        return {
+            "updated": True,
+            "id": int(trade_id),
+            "symbol": row["symbol"],
+            "pnl": row["pnl"],
+            "prior_exit_reason": row["exit_reason"],
+            "exit_reason": "RECONCILIATION_MANUAL_EXIT",
+        }
+    finally:
+        conn.close()
+
+
+def clean_strategy_acceptance_sql(
+    *,
+    exit_reason_column: str = "exit_reason",
+    id_column: str = "id",
+) -> str:
+    """SQL AND-clause excluding reconciliation/manual inventory closes."""
+    reasons = ", ".join(f"'{r}'" for r in sorted(RECONCILIATION_EXIT_REASONS))
+    ids = ", ".join(str(int(i)) for i in RECONCILIATION_TRADE_IDS if str(i).isdigit())
+    return (
+        f" AND UPPER(COALESCE({exit_reason_column}, '')) NOT IN ({reasons}) "
+        f" AND COALESCE({id_column}, 0) NOT IN ({ids}) "
+        f" AND COALESCE(json_extract(explainability_json, '$.acceptance_class'), '') "
+        f" NOT IN ('RECONCILIATION_MANUAL_EXIT', 'RECONCILIATION')"
+    )

@@ -23,7 +23,8 @@ from backend.services.binance_scalp.scalp_regime_classifier import (
     REGIME_RANGE,
     classify_scalp_regime,
 )
-from backend.services.binance_scalp.strategies import STRATEGY_NAMES, enabled_strategies
+from backend.services.binance_scalp.scalp_setup_measurements import evidence_rank_delta, measure_all_setups
+from backend.services.binance_scalp.strategies import ALL_STRATEGIES, STRATEGY_NAMES, enabled_strategies
 from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, StrategyMarketContext
 from backend.services.binance_scalp.strategies.kline_cache import KlineCache, MIN_REGIME_1H_BARS
 from backend.services.multi_horizon_ev import cached_multi_horizon_ev
@@ -186,9 +187,16 @@ class ScalpStrategyRouter:
 
         signals: list[ScalpSetupSignal] = []
         ranked_list: list[RankedCandidate] = []
+        measurements: dict[str, dict[str, float]] = {}
+        with contextlib.suppress(Exception):
+            measurements = measure_all_setups(ctx)
+        meta["setup_measurements"] = measurements
+        meta["measured_strategies"] = list(measurements.keys())
 
-        # Ranking engine: evaluate every enabled strategy; soft misses score, hard safety blocks.
-        for strategy in enabled_strategies(self.config):
+        enabled_names = {s.name for s in enabled_strategies(self.config)}
+        # Measure every module every cycle. Disabled modules stay out of the
+        # executable pick but their features inform rank/learning.
+        for strategy in ALL_STRATEGIES:
             try:
                 sig = strategy.evaluate(ctx)
             except Exception as exc:
@@ -211,6 +219,13 @@ class ScalpStrategyRouter:
                     reject_reason=f"STRATEGY_ERROR:{exc}",
                     setup_context={"error": str(exc)[:200]},
                 )
+            feats = measurements.get(sig.setup_name) or {}
+            ctx_map = dict(sig.setup_context or {})
+            ctx_map["features"] = feats
+            ctx_map["runtime_enabled"] = sig.setup_name in enabled_names
+            from dataclasses import replace as _sig_replace
+
+            sig = _sig_replace(sig, setup_context=ctx_map)
             signals.append(sig)
             ranked_list.append(rank_setup_signal(sig, regime=regime, ctx=ctx))
 
@@ -242,10 +257,12 @@ class ScalpStrategyRouter:
             for r in ranked_list
         ]
 
-        best_ranked = pick_best_ranked(ranked_list)
+        executable = [r for r in ranked_list if r.signal.setup_name in enabled_names]
+        best_ranked = pick_best_ranked(executable) or pick_best_ranked(ranked_list)
         if best_ranked is None:
             meta["hard_block"] = "NO_CANDIDATES"
             return None, signals, meta
+        meta["setup_evidence_delta"] = evidence_rank_delta(measurements)
 
         meta["reachability_surplus"] = best_ranked.reachability_surplus
         meta["selection_confidence"] = best_ranked.selection_confidence

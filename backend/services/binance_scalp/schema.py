@@ -27,6 +27,7 @@ SCALP_TABLES = (
     "scalp_gate_counters",
     "scalp_shadow_rejects",
     "scalp_post_exit_path",
+    "scalp_opportunity_snapshots",
 )
 
 SCHEMA_VERSION = 3
@@ -366,6 +367,9 @@ def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list
             from backend.services.binance_scalp.scalp_post_exit_path import ensure_post_exit_path_table
 
             ensure_post_exit_path_table(str(path))
+            from backend.services.binance_scalp.scalp_opportunity_dataset import ensure_opportunity_table
+
+            ensure_opportunity_table(str(path))
             applied.append("ensure_scalp_intelligence_tables")
         except Exception:
             pass

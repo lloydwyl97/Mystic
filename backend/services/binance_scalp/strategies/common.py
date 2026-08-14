@@ -93,23 +93,37 @@ def reject_signal(
     *,
     expected_move: float = 0.0,
     impact: float = 0.0,
+    setup_context: dict | None = None,
+    score: float = 0.0,
+    confidence: float = 0.0,
+    mechanical: bool = True,
 ) -> ScalpSetupSignal:
+    """Build a failed signal.
+
+    Mechanical/economic rejects keep score=0 and disappear from execution.
+    Opinion rejects should pass setup_context features and a continuous score
+    so ranking can learn; they must not vanish as information.
+    """
+    ctx_map = dict(setup_context or {})
+    ctx_map["reject_class"] = "mechanical" if mechanical else "opinion"
+    ctx_map["opinion_reject"] = not mechanical
     return ScalpSetupSignal(
         symbol=ctx.symbol,
         side="BUY",
-        score=0.0,
+        score=float(score),
         setup_name=setup_name,
-        confidence=0.0,
+        confidence=float(confidence),
         entry_reason="",
         invalidation_reason=None,
         required_target_pct=ctx.econ.net_profit_target_pct,
         expected_move_pct=expected_move,
         spread_pct=ctx.snap.spread_pct,
         impact_pct=impact,
-        depth_sufficient=False,
+        depth_sufficient=not mechanical,
         limit_buy_price=ctx.snap.best_ask,
         passed=False,
         reject_reason=reason,
+        setup_context=ctx_map,
     )
 
 

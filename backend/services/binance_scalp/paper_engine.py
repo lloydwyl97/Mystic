@@ -633,6 +633,11 @@ class BinanceScalpPaperEngine:
         if not ranked:
             ranked = self._router.evaluate_all(epoch=epoch, notional_usd=notional) or []
 
+        with contextlib.suppress(Exception):
+            from backend.services.binance_scalp.scalp_opportunity_dataset import record_opportunity_cycle
+
+            record_opportunity_cycle(self.config.database_path, rows=ranked, epoch=epoch)
+
         if open_symbols:
             ranked = [r for r in ranked if str(r.get("symbol") or "").upper() not in open_symbols]
 
@@ -1857,6 +1862,10 @@ class BinanceScalpPaperEngine:
             from backend.services.binance_scalp.scalp_post_exit_path import fill_due_post_exit_paths
 
             fill_due_post_exit_paths(self.config.database_path, self.reader, now_epoch=time.time())
+        with contextlib.suppress(Exception):
+            from backend.services.binance_scalp.scalp_opportunity_dataset import label_due_opportunities
+
+            label_due_opportunities(self.config.database_path, self.reader, now_epoch=time.time())
         with contextlib.suppress(Exception):
             pre_open: list[sqlite3.Row] = []
             try:
