@@ -272,10 +272,19 @@ def test_scalp_money_db_migrate_copies_and_isolates():
             )
             conn.commit()
         result = migrate_scalp_money_database(str(day_db), str(scalp_db))
-        assert result["migrated"] is True
+        assert result["migrated"] is False
+        assert result["reason"] == "isolation_complete_no_import"
         with sqlite3.connect(str(scalp_db)) as conn:
             n = conn.execute("SELECT COUNT(*) FROM scalp_paper_trades").fetchone()[0]
-        assert n == 1
+        assert n == 0
+        with sqlite3.connect(str(scalp_db)) as conn:
+            conn.execute(
+                """
+                INSERT INTO scalp_paper_trades (trade_id, symbol, side, quantity, price, notional)
+                VALUES ('live1', 'BTCUSDT', 'SELL', 0.001, 100000, 100)
+                """
+            )
+            conn.commit()
         again = migrate_scalp_money_database(str(day_db), str(scalp_db))
         assert again["reason"] == "already_populated"
 

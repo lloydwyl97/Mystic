@@ -254,10 +254,12 @@ def resolve_scalp_database_path(repo_root: str, env_get) -> str:
 
 
 def migrate_scalp_money_database(day_db: str, scalp_db: str) -> dict[str, Any]:
-    """Copy scalp_* money tables from the shared DAY file into mystic_scalp.db.
+    """Ensure mystic_scalp.db exists. Never import leftover DAY-file scalp_* history.
 
-    Idempotent: if the destination already has scalp_paper_trades rows, skip.
-    Learning tables (trade_learning_outcomes) stay on the DAY database.
+    Isolation is complete. Historical scalp rows on mystic_trading.db are
+    analysis-only. Copying them into the money DB contaminates clean
+    acceptance and trips the consecutive-loss breaker on pre-cutoff losses.
+    Learning tables stay on the DAY database.
     """
     from backend.services.binance_scalp.schema import init_scalp_schema
 
@@ -278,7 +280,6 @@ def migrate_scalp_money_database(day_db: str, scalp_db: str) -> dict[str, Any]:
         return result
 
     dst = _connect(dst_path, timeout=15.0)
-    src = _connect(src_path, readonly=True, timeout=15.0)
     try:
         try:
             existing = int(dst.execute("SELECT COUNT(*) FROM scalp_paper_trades").fetchone()[0] or 0)
@@ -288,44 +289,10 @@ def migrate_scalp_money_database(day_db: str, scalp_db: str) -> dict[str, Any]:
             result["reason"] = "already_populated"
             result["existing_trades"] = existing
             return result
-
-        src_tables = {str(r[0]) for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        dst.execute("BEGIN IMMEDIATE")
-        copied = 0
-        for table in SCALP_MONEY_TABLES:
-            if table not in src_tables:
-                continue
-            rows = src.execute(f"SELECT * FROM {table}").fetchall()
-            if not rows:
-                result["copied_tables"][table] = 0
-                continue
-            cols = [d[0] for d in src.execute(f"SELECT * FROM {table} LIMIT 0").description]
-            placeholders = ",".join("?" * len(cols))
-            col_sql = ",".join(cols)
-            dst.execute(f"DELETE FROM {table}")
-            dst.executemany(
-                f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})",
-                [tuple(row[c] for c in cols) for row in rows],
-            )
-            result["copied_tables"][table] = len(rows)
-            copied += len(rows)
-        dst.commit()
-        result["migrated"] = copied > 0
-        result["reason"] = "copied" if copied else "source_empty"
-        logger.critical(
-            "SCALP_MONEY_DB_MIGRATED src=%s dst=%s copied_rows=%d tables=%s",
-            src_path,
-            dst_path,
-            copied,
-            result["copied_tables"],
-        )
+        result["reason"] = "isolation_complete_no_import"
+        result["existing_trades"] = existing
         return result
-    except Exception:
-        dst.rollback()
-        logger.exception("SCALP_MONEY_DB_MIGRATE_FAILED")
-        raise
     finally:
-        src.close()
         dst.close()
 
 

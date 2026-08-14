@@ -855,14 +855,14 @@ class BinanceScalpPaperEngine:
             self._record_gate(gate_id="CASH_OR_SLOTS", reason="MAX_OPEN_POSITIONS", detail=f"open={open_count} reserved={pending_slots}")
             return
 
-        if self._check_scalp_circuit_breaker():
-            self._last_circuit_breaker_open = True
+        breaker_open = self._check_scalp_circuit_breaker()
+        self._last_circuit_breaker_open = bool(breaker_open)
+        # Measure and store every cycle even when the breaker blocks execution.
+        candidates = self._entry_candidates(conn)
+        if breaker_open:
             self._publish_last_decision(decision="BLOCKED", reason="SCALP_CIRCUIT_BREAKER_OPEN")
             self._record_gate(gate_id="SCALP_CIRCUIT_BREAKER", reason="SCALP_CIRCUIT_BREAKER_OPEN")
             return
-        self._last_circuit_breaker_open = False
-
-        candidates = self._entry_candidates(conn)
         if not candidates:
             return
 
