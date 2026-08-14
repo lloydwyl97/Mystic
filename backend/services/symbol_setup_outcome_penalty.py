@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 from collections import defaultdict
@@ -1446,11 +1447,23 @@ def apply_v3_outcome_ranking_to_decision_data(
 
         db_path = DATABASE_PATH
 
-    xrp_pen = evaluate_outcome_penalty(symbol, setup, regime, db_path=db_path)
-    btc_pen = evaluate_btc_outcome_penalty(symbol, setup, regime, db_path=db_path)
+    coin_identity_on = str(os.getenv("DAY_COIN_IDENTITY_RANKING", "false")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if coin_identity_on:
+        xrp_pen = evaluate_outcome_penalty(symbol, setup, regime, db_path=db_path)
+        btc_pen = evaluate_btc_outcome_penalty(symbol, setup, regime, db_path=db_path)
+        sol_cred = evaluate_sol_outcome_credit(symbol, setup, regime, db_path=db_path)
+        eth_cred = evaluate_eth_outcome_credit(symbol, setup, regime, db_path=db_path)
+    else:
+        xrp_pen = {"applied": False, "reason": "coin_identity_ranking_disabled"}
+        btc_pen = {"applied": False, "reason": "coin_identity_ranking_disabled"}
+        sol_cred = {"applied": False, "reason": "coin_identity_ranking_disabled"}
+        eth_cred = {"applied": False, "reason": "coin_identity_ranking_disabled"}
     low_mfe_pen = evaluate_low_mfe_stall_penalty(symbol, setup, regime, db_path=db_path)
-    sol_cred = evaluate_sol_outcome_credit(symbol, setup, regime, db_path=db_path)
-    eth_cred = evaluate_eth_outcome_credit(symbol, setup, regime, db_path=db_path)
 
     dd["outcome_churn_penalty_eval"] = xrp_pen
     dd["outcome_btc_penalty_eval"] = btc_pen

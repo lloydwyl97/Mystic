@@ -48,13 +48,12 @@ class ScalpConfig:
 
     @classmethod
     def from_env(cls) -> ScalpConfig:
-        products_raw = os.getenv("SCALP_PRODUCTS", "BTCUSDT,ETHUSDT")
+        products_raw = os.getenv("SCALP_PRODUCTS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")
         products = tuple(p.strip().upper() for p in products_raw.split(",") if p.strip())
         prefix = (os.getenv("SCALP_REDIS_PREFIX", "scalp") or "scalp").strip().rstrip(":")
-        db = os.getenv(
-            "DATABASE_PATH",
-            os.path.join(_REPO_ROOT, "mystic_trading.db"),
-        )
+        from backend.services.atomic_execution_book import resolve_scalp_database_path
+
+        db = resolve_scalp_database_path(_REPO_ROOT, os.getenv)
         symbol_caps: dict[str, float] = {}
         raw_caps = (os.getenv("SCALP_SYMBOL_NOTIONAL_CAPS_JSON") or "").strip()
         if raw_caps:

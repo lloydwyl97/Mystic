@@ -2099,6 +2099,11 @@ class PortfolioEngine:
     def __init__(self, db_path: str = DATABASE_PATH, principal: float | None = None, test_mode: bool = False):
         self.db_path = db_path
         self.test_mode = test_mode  # Test mode bypasses exchange constraints for deterministic unit tests
+        # Crash-injection hooks for atomic OPEN tests. Never set in production.
+        self._inject_crash_before_buy_txn = False
+        self._inject_crash_during_buy_txn = False
+        self._inject_crash_after_buy_commit = False
+        self._inject_crash_during_mtm = False
 
         # =================================================================
         # AUTHORITATIVE LEDGER (portfolio engine is the source of truth)
@@ -2126,7 +2131,9 @@ class PortfolioEngine:
         # Startup timestamp retained for downstream age telemetry only.
         self._startup_timestamp: float = time.time()
 
-        # Position tracking
+        # Position tracking — never mutate this dict in-place while another
+        # task iterates it. Reload by swapping the dict reference. Iterate
+        # via list(self.open_positions) / list(.items()).
         self.open_positions: dict[str, OpenPosition] = {}
         self.coin_performance: dict[str, CoinPerformance] = {}
 
@@ -2352,6 +2359,23 @@ class PortfolioEngine:
         ledger_loaded = await self._load_ledger_from_sqlite()
         await self._load_positions_from_sqlite()
         self._load_constraints_from_sqlite()
+        if not self.test_mode:
+            try:
+                from backend.services.atomic_execution_book import restore_orphaned_day_buys
+
+                restored = restore_orphaned_day_buys(self.db_path)
+                if restored:
+                    logger.critical("STARTUP_ORPHAN_RESTORE count=%d", len(restored))
+                    await self._load_positions_from_sqlite()
+                    await self._load_ledger_from_sqlite()
+            except Exception:
+                logger.exception("STARTUP_ORPHAN_RESTORE_FAILED")
+            try:
+                from backend.services.validation_cutoff import ensure_validation_cutoff
+
+                ensure_validation_cutoff(self.db_path, engine="day", repo_root=os.path.dirname(self.db_path))
+            except Exception:
+                logger.exception("VALIDATION_CUTOFF_DAY_FAILED")
 
         if ledger_loaded:  # SQLite ledger exists (positions may be 0 after selling all)
             # Successfully restored from SQLite
@@ -2426,7 +2450,7 @@ class PortfolioEngine:
             self._unrealized_pnl = 0.0
             self._total_equity = self.principal
             self._available_balance = self.principal
-            self.open_positions.clear()
+            self.open_positions = {}
             self._compute_total_open_risk()
 
             # Persist initial state to SQLite for restart tests
@@ -3076,8 +3100,8 @@ class PortfolioEngine:
             await paper_service._ensure_redis()
             await paper_service._load_positions_from_redis()
 
-            # Clear existing positions
-            self.open_positions.clear()
+            # Replace the dict — never mutate in-place while another task iterates.
+            adopted: dict[str, OpenPosition] = {}
             total_cost_basis = 0.0
             total_unrealized = 0.0
 
@@ -3129,8 +3153,10 @@ class PortfolioEngine:
                     confidence_at_entry=0.5,
                 )
 
-                self.open_positions[ccxt_symbol] = position
+                adopted[ccxt_symbol] = position
                 logger.info(f"ADOPT_POSITIONS: {ccxt_symbol} qty={quantity:.6f} entry=${entry_price:.4f} cost=${cost_basis:.2f}")
+
+            self.open_positions = adopted
 
             # Canonical: positions_value = market value (cost_basis + unrealized), cost_basis = sum(entry*qty)
             self._cost_basis = total_cost_basis
@@ -3174,7 +3200,7 @@ class PortfolioEngine:
 
         except Exception as e:
             logger.exception(f"ADOPT_POSITIONS FAILED: {e}")
-            self.open_positions.clear()
+            self.open_positions = {}
             self._positions_value = 0.0
             self._cost_basis = 0.0
             self.cash_balance = self._total_equity
@@ -3500,7 +3526,7 @@ class PortfolioEngine:
                     current_positions, metrics = self._rebuild_from_trade_ledger_sqlite()
 
                 # STEP 4: Rebuild in-memory positions and persist via canonical helper
-                self.open_positions.clear()
+                recovered: dict[str, OpenPosition] = {}
                 rebuilt_count = 0
 
                 for raw_symbol, total_qty, avg_price, earliest_entry in current_positions:
@@ -3520,9 +3546,11 @@ class PortfolioEngine:
                         confidence_at_entry=0.5,
                     )
 
-                    self.open_positions[symbol] = position
+                    recovered[symbol] = position
                     await self._persist_position_to_sqlite(position)
                     rebuilt_count += 1
+
+                self.open_positions = recovered
 
                 # STEP 5: Clear stale Redis caches using async client + SCAN
                 redis_scanned, redis_deleted = await self._clear_recovery_redis_caches()
@@ -3820,7 +3848,7 @@ class PortfolioEngine:
         if not self.open_positions:
             return prices
 
-        for symbol in self.open_positions:
+        for symbol in list(self.open_positions):
             ns = normalize_symbol(symbol)
             last_px = await self._fetch_live_mark_for_open_position(symbol)
             if last_px <= 0:
@@ -4002,6 +4030,8 @@ class PortfolioEngine:
         GET/read routes should pass ``allow_network_mtm=False`` so status never blocks on
         Binance REST; Redis/cache marks are used instead (writer owns live MTM persist).
         """
+        if getattr(self, "_inject_crash_during_mtm", False):
+            raise RuntimeError("INJECTED_CRASH_DURING_MTM")
         resolved_prices = self._resolve_mtm_prices(prices)
         if not resolved_prices and self.open_positions and allow_network_mtm:
             resolved_prices = await self._fetch_mtm_prices_for_open_positions()
@@ -4188,6 +4218,17 @@ class PortfolioEngine:
         ledger_loaded = await self._load_ledger_from_sqlite()
         await self._load_positions_from_sqlite()
         self._load_constraints_from_sqlite()
+        if not self.test_mode:
+            try:
+                from backend.services.atomic_execution_book import restore_orphaned_day_buys
+
+                restored = restore_orphaned_day_buys(self.db_path)
+                if restored:
+                    logger.critical("ISOLATED_INIT_ORPHAN_RESTORE count=%d", len(restored))
+                    await self._load_positions_from_sqlite()
+                    await self._load_ledger_from_sqlite()
+            except Exception:
+                logger.exception("ISOLATED_INIT_ORPHAN_RESTORE_FAILED")
 
         if ledger_loaded:
             logger.info("ISOLATED_INIT: Restored ledger from SQLite")
@@ -4834,6 +4875,186 @@ class PortfolioEngine:
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _sync_persist)
+
+    def _commit_atomic_day_open_sync(
+        self,
+        *,
+        trade_bind: tuple[Any, ...],
+        position: OpenPosition,
+        cash_balance: float,
+        positions_value: float,
+        realized_pnl: float,
+        unrealized_pnl: float,
+        total_equity: float,
+        pre_ledger: dict[str, Any],
+        fee: float,
+        slippage_cost: float,
+        quantity: float,
+        fill_price: float,
+        symbol: str,
+        trade_id: str,
+        entry_reason: str,
+        sleeve: str,
+    ) -> None:
+        """Commit BUY trade + position + ledger + audit in one BEGIN IMMEDIATE.
+
+        Memory and Redis are updated only after this returns. A crash during
+        MTM after this commit can no longer orphan inventory.
+        """
+        if getattr(self, "_inject_crash_before_buy_txn", False):
+            raise RuntimeError("INJECTED_CRASH_BEFORE_BUY_TXN")
+
+        def _op() -> None:
+            with connect_rw(self.db_path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.cursor()
+                if getattr(self, "_inject_crash_during_buy_txn", False):
+                    raise RuntimeError("INJECTED_CRASH_DURING_BUY_TXN")
+                cursor.execute(
+                    """
+                    INSERT INTO paper_trades (
+                        trade_id, paper_run_id, mode, symbol, side, quantity, price,
+                        remaining_position, stop_price, take_profit_price,
+                        atr_at_entry, entry_bar_timestamp, confidence,
+                        fees_paid, slippage_cost, timestamp, status,
+                        explainability_json, diagnostics_json, sleeve,
+                        entry_timestamp, decision_id, strategy_id, context_snapshot_json
+                    ) VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    trade_bind,
+                )
+                timestamp = datetime.now(timezone.utc).isoformat()
+                entry_fee = getattr(position, "entry_fee", 0.0) or 0.0
+                sleeve_val = getattr(position, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value
+                entry_sid = str(getattr(position, "entry_strategy_id", "") or "")
+                repair_cnt = int(getattr(position, "repair_add_count", 0) or 0)
+                last_repair_ts = float(getattr(position, "last_repair_add_ts", 0.0) or 0.0)
+                repair_ids = str(getattr(position, "repair_add_trade_ids", "[]") or "[]")
+                avg_after = float(getattr(position, "average_entry_after_repair", 0.0) or 0.0)
+                orig_cost = float(getattr(position, "original_position_cost", 0.0) or 0.0)
+                if orig_cost <= 0:
+                    orig_cost = float(position.quantity or 0) * float(position.entry_price or 0)
+                from backend.services.day_inventory_recovery import thesis_json_for_position
+
+                thesis_json = json.dumps(thesis_json_for_position(position), separators=(",", ":"))
+                status_val = str(getattr(position, "status", "ACTIVE") or "ACTIVE")
+                dust_at = float(getattr(position, "dust_detected_at", 0.0) or 0.0)
+                dust_qty = float(getattr(position, "dust_qty_canonical", 0.0) or 0.0)
+                cursor.execute(
+                    """
+                    INSERT OR REPLACE INTO portfolio_engine_positions (
+                        symbol, quantity, entry_price, entry_time, trade_id,
+                        stop_price, take_profit_1_price, take_profit_2_price,
+                        trailing_stop_price, tp1_hit, highest_price, lowest_price,
+                        atr_at_entry, entry_bar_timestamp, confidence_at_entry,
+                        entry_fee, sleeve, entry_strategy_id,
+                        repair_add_count, last_repair_add_ts, repair_add_trade_ids,
+                        average_entry_after_repair, original_position_cost, thesis_json,
+                        status, dust_detected_at, dust_qty_canonical, last_updated
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        position.symbol,
+                        position.quantity,
+                        position.entry_price,
+                        position.entry_time,
+                        position.trade_id,
+                        position.stop_price,
+                        position.take_profit_1_price,
+                        position.take_profit_2_price,
+                        position.trailing_stop_price,
+                        1 if position.tp1_hit else 0,
+                        position.highest_price,
+                        float(getattr(position, "lowest_price", 0.0) or 0.0),
+                        position.atr_at_entry,
+                        position.entry_bar_timestamp,
+                        position.confidence_at_entry,
+                        entry_fee,
+                        sleeve_val,
+                        entry_sid,
+                        repair_cnt,
+                        last_repair_ts,
+                        repair_ids,
+                        avg_after,
+                        orig_cost,
+                        thesis_json,
+                        status_val,
+                        dust_at,
+                        dust_qty,
+                        timestamp,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT OR REPLACE INTO portfolio_engine_ledger (
+                        id, principal, cash_balance, positions_value,
+                        realized_pnl, unrealized_pnl, total_equity,
+                        account_status, trading_paused, pause_reason,
+                        last_updated, version
+                    ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        COALESCE((SELECT version FROM portfolio_engine_ledger WHERE id=1), 0) + 1)
+                    """,
+                    (
+                        self.principal,
+                        cash_balance,
+                        positions_value,
+                        realized_pnl,
+                        unrealized_pnl,
+                        total_equity,
+                        self._account_status.value,
+                        1 if self._trading_paused else 0,
+                        self._pause_reason,
+                        timestamp,
+                    ),
+                )
+                if self._audit_writes_allowed():
+                    existing = cursor.execute(
+                        "SELECT id FROM portfolio_engine_audit WHERE trade_id = ? AND action = ? LIMIT 1",
+                        (trade_id, "BUY"),
+                    ).fetchone()
+                    if not existing:
+                        post_ledger = {
+                            "cash_balance": cash_balance,
+                            "positions_value": positions_value,
+                            "total_equity": total_equity,
+                        }
+                        cursor.execute(
+                            """
+                            INSERT INTO portfolio_engine_audit (
+                                ts, action, symbol, qty, price, fees, slippage,
+                                decision_id, trade_id, ranked_candidates_json,
+                                pre_ledger_json, post_ledger_json,
+                                pre_positions_digest, post_positions_digest,
+                                invariant_ok, invariant_diff, entry_reason, exit_reason, sleeve
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                timestamp,
+                                "BUY",
+                                symbol,
+                                quantity,
+                                fill_price,
+                                fee,
+                                slippage_cost,
+                                None,
+                                trade_id,
+                                None,
+                                json.dumps(pre_ledger),
+                                json.dumps(post_ledger),
+                                "",
+                                "",
+                                1 if abs(total_equity - (cash_balance + positions_value)) < 0.05 else 0,
+                                total_equity - (cash_balance + positions_value),
+                                entry_reason,
+                                None,
+                                sleeve,
+                            ),
+                        )
+                conn.commit()
+
+        run_locked_retry(_op)
+        if getattr(self, "_inject_crash_after_buy_commit", False):
+            raise RuntimeError("INJECTED_CRASH_AFTER_BUY_COMMIT")
 
     async def _delete_position_from_sqlite(self, symbol: str) -> None:
         """Delete position from SQLite when closed"""
@@ -6562,7 +6783,7 @@ class PortfolioEngine:
         loop = asyncio.get_running_loop()
         rows = await loop.run_in_executor(None, _sync_load)
 
-        self.open_positions.clear()
+        rebuilt: dict[str, OpenPosition] = {}
         for row in rows:
             raw_symbol = row[0]
             normalized_symbol = normalize_symbol(raw_symbol)
@@ -6667,7 +6888,7 @@ class PortfolioEngine:
                 )
                 if allow_mutations:
                     await self._persist_position_to_sqlite(pos)
-            self.open_positions[pos.symbol] = pos
+            rebuilt[pos.symbol] = pos
             logger.debug(
                 "LOAD_POSITION: %s qty=%.6f entry=$%.4f (normalized from %s)",
                 pos.symbol,
@@ -6675,6 +6896,8 @@ class PortfolioEngine:
                 pos.entry_price,
                 raw_symbol,
             )
+
+        self.open_positions = rebuilt
 
         if allow_mutations:
             # Backfill entry_fee from paper_trades for positions with entry_fee=0 (join trade_id -> fees_paid)
@@ -8488,66 +8711,8 @@ class PortfolioEngine:
                     _entry_reserved = False
                 return None
 
-        # Persist trade row only after live order success (or when not in LIVE mode)
-        # and after the final cash invariant has passed.
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(None, _sync_insert)
-        except Exception:
-            # PE-2: INSERT failed — abort before any cash debit (fail-closed)
-            logger.error("BUY_ABORTED: paper_trades INSERT failed for %s — aborting, cash NOT debited", symbol)
-            if _entry_reserved:
-                self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
-                _entry_reserved = False
-            return None
-
-        try:
-            from backend.services.strategy_runtime_audit import EVT_BUY_EXECUTED, insert_audit_row_async
-
-            await insert_audit_row_async(
-                event_type=EVT_BUY_EXECUTED,
-                decision_id=(decision_id or None),
-                strategy_id=str(getattr(explainability, "live_ai_strategy", "") or "") or None,
-                symbol=symbol,
-                artifact_path=str(getattr(explainability, "artifact_path", "") or "") or None,
-                artifact_sha256=str(getattr(explainability, "artifact_sha256", "") or "") or None,
-                feature_version=int(getattr(explainability, "feature_version", 0) or 0) or None,
-                feature_dim=int(getattr(explainability, "feature_dim", 0) or 0) or None,
-                paper_trade_id=trade_id,
-                extra_json={
-                    "confidence": confidence,
-                    "ctx_age_sec": float(getattr(explainability, "ctx_age_sec", -1.0)),
-                    "ctx_ts_utc": str(getattr(explainability, "ctx_ts_utc", "") or ""),
-                },
-            )
-        except Exception:
-            logger.debug("strategy_runtime_audit BUY_EXECUTED skipped", exc_info=True)
-
-        # =================================================================
-        # UPDATE AUTHORITATIVE LEDGER (conservation of money)
-        # =================================================================
-        # Convert the still-active reservation into the cash debit. The final cash
-        # invariant passed before the trade-row commit, and the reservation prevented
-        # concurrent entries from consuming these funds in the interim.
-        async with self._global_cash_lock:
-            self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
-            _entry_reserved = False
-            # Cash decreases by total cost (canonical: cash = USDT on exchange)
-            self.cash_balance -= total_cost
-            self._available_balance = max(0.0, self.cash_balance)
-        # Persist cash debit immediately so MTM loop cannot reload pre-buy cash.
-        try:
-            async with self._sqlite_writer_lock:
-                await self._persist_ledger_to_sqlite()
-        except Exception:
-            logger.warning("BUY_CASH_PERSIST_EARLY_FAILED symbol=%s — will retry after position stamp", symbol, exc_info=True)
-
-        # BUY never changes realized_pnl. positions_value and total_equity recomputed below.
-
-        # Fee is a realized cost (reduces equity)
-        # Note: fee is part of total_cost, so equity decreases by fee amount
-
-        # Resolve sleeve: explicit param > assignment function > default
+        # Build the position object BEFORE any money write. Memory and Redis
+        # stay unchanged until the atomic OPEN commits.
         effective_sleeve = sleeve or assign_sleeve(normalized_symbol, confidence)
 
         position = OpenPosition(
@@ -8631,19 +8796,105 @@ class PortfolioEngine:
         from backend.services.day_inventory_recovery import mark_new_regime_entry
 
         mark_new_regime_entry(position)
-        self.open_positions[normalized_symbol] = position
-        self._recently_added_symbols[normalized_symbol] = time.time()
 
-        # Store explainability
+        committed_cash = float(self.cash_balance) - float(total_cost)
+        added_mark = float(quantity) * float(fill_price)
+        committed_positions_value = float(self._positions_value) + added_mark
+        committed_equity = committed_cash + committed_positions_value
+        trade_bind = (
+            trade_id,
+            paper_run_id,
+            buy_mode,
+            symbol,
+            quantity,
+            fill_price,
+            quantity,
+            stop_price,
+            tp1_price,
+            atr,
+            bar_timestamp,
+            confidence,
+            fee,
+            slippage_cost,
+            timestamp,
+            json.dumps(explainability.to_dict()),
+            json.dumps(protected_audit),
+            effective_sleeve,
+            timestamp,
+            decision_id or None,
+            buy_strategy_id,
+            _ctx_snapshot,
+        )
+        try:
+            await asyncio.to_thread(
+                self._commit_atomic_day_open_sync,
+                trade_bind=trade_bind,
+                position=position,
+                cash_balance=committed_cash,
+                positions_value=committed_positions_value,
+                realized_pnl=float(self._realized_pnl),
+                unrealized_pnl=float(self._unrealized_pnl),
+                total_equity=committed_equity,
+                pre_ledger=pre_ledger,
+                fee=fee,
+                slippage_cost=slippage_cost,
+                quantity=quantity,
+                fill_price=fill_price,
+                symbol=symbol,
+                trade_id=trade_id,
+                entry_reason=explainability.regime if explainability else "unknown",
+                sleeve=effective_sleeve,
+            )
+        except Exception:
+            logger.error("BUY_ABORTED: atomic OPEN failed for %s — cash NOT debited, no position", symbol, exc_info=True)
+            if _entry_reserved:
+                self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
+                _entry_reserved = False
+            return None
+
+        async with self._global_cash_lock:
+            self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
+            _entry_reserved = False
+            self.cash_balance = committed_cash
+            self._available_balance = max(0.0, self.cash_balance)
+            self._positions_value = committed_positions_value
+            self._total_equity = committed_equity
+        next_positions = dict(self.open_positions)
+        next_positions[normalized_symbol] = position
+        self.open_positions = next_positions
+        self._recently_added_symbols[normalized_symbol] = time.time()
         self.trade_explanations[trade_id] = explainability
         self._prune_trade_explanations()
 
-        # Canonical: total_equity = cash_balance + positions_value (market)
-        await self._recompute_positions_values()
+        try:
+            from backend.services.strategy_runtime_audit import EVT_BUY_EXECUTED, insert_audit_row_async
 
-        # Persist position to SQLite + paper Redis BEFORE invariant check so
-        # _get_canonical_positions() matches engine memory (avoids false CANONICAL_MISMATCH on every buy).
-        await self._persist_position_to_sqlite(position)
+            await insert_audit_row_async(
+                event_type=EVT_BUY_EXECUTED,
+                decision_id=(decision_id or None),
+                strategy_id=str(getattr(explainability, "live_ai_strategy", "") or "") or None,
+                symbol=symbol,
+                artifact_path=str(getattr(explainability, "artifact_path", "") or "") or None,
+                artifact_sha256=str(getattr(explainability, "artifact_sha256", "") or "") or None,
+                feature_version=int(getattr(explainability, "feature_version", 0) or 0) or None,
+                feature_dim=int(getattr(explainability, "feature_dim", 0) or 0) or None,
+                paper_trade_id=trade_id,
+                extra_json={
+                    "confidence": confidence,
+                    "ctx_age_sec": float(getattr(explainability, "ctx_age_sec", -1.0)),
+                    "ctx_ts_utc": str(getattr(explainability, "ctx_ts_utc", "") or ""),
+                },
+            )
+        except Exception:
+            logger.debug("strategy_runtime_audit BUY_EXECUTED skipped", exc_info=True)
+
+        # MTM is after the authoritative commit. A crash here cannot orphan inventory.
+        try:
+            await self._recompute_positions_values()
+            await self._persist_ledger_to_sqlite()
+        except Exception:
+            logger.exception("BUY_MTM_AFTER_COMMIT_FAILED symbol=%s — SQLite OPEN is authoritative", symbol)
+
         if self._paper_service:
             try:
                 await self._paper_service.create_buy_order(
@@ -8659,36 +8910,9 @@ class PortfolioEngine:
             except Exception as e:
                 logger.warning(f"PAPER_SYNC_BUY_FAILED: {symbol} - {e}")
 
-        # Validate invariants (must pass after every trade)
         invariants_ok = await self._validate_invariants("execute_buy_fifo")
         if not invariants_ok:
             logger.error(f"BUY_INVARIANT_VIOLATION: {symbol} - ledger may be inconsistent")
-
-        # =================================================================
-        # PERSIST TO SQLITE (survive restarts)
-        # =================================================================
-        await self._persist_ledger_to_sqlite()
-        # =================================================================
-        # ITEM 3: RECORD IMMUTABLE AUDIT TRAIL
-        # =================================================================
-        post_ledger = {
-            "cash_balance": self.cash_balance,
-            "positions_value": self._positions_value,
-            "total_equity": self._total_equity,
-        }
-        await self._record_audit(
-            action="BUY",
-            symbol=symbol,
-            qty=quantity,
-            price=fill_price,
-            fees=fee,
-            slippage=slippage_cost,  # ACCOUNTING REPAIR: total cost, not price delta
-            trade_id=trade_id,
-            pre_ledger=pre_ledger,
-            post_ledger=post_ledger,
-            entry_reason=explainability.regime if explainability else "unknown",
-            sleeve=effective_sleeve,
-        )
 
         # ITEM 5: Increment buy counters for pacing (overflow if this buy used hourly overflow slot)
         self.increment_buy_counters(overflow=getattr(self, "_pending_overflow_buy", False))
@@ -16693,6 +16917,45 @@ class PortfolioEngine:
         except Exception:
             logger.debug("open-position explain enrich failed", exc_info=True)
 
+    def get_trading_capability_status(self) -> dict[str, Any]:
+        """Honest capability flags. Process-alive is not the same as entries enabled."""
+        ks = self.get_kill_switch_status()
+        failsafe = "ACCOUNT_FAILSAFE" in str(self._kill_switch_reason or "")
+        accounting: dict[str, Any] = {"ok": True, "orphans": []}
+        try:
+            from backend.services.atomic_execution_book import find_cash_position_disagreement
+
+            accounting = find_cash_position_disagreement(self.db_path)
+        except Exception as exc:
+            accounting = {"ok": False, "error": str(exc)[:200], "orphans": []}
+        reasons: list[str] = []
+        if self._trading_paused:
+            reasons.append(f"trading_paused:{self._pause_reason}")
+        if self._account_status != AccountStatus.HEALTHY:
+            reasons.append(f"account_status:{self._account_status.value}")
+        if ks.get("buys_blocked"):
+            reasons.append(f"kill_switch:{ks.get('mode')}:{ks.get('reason')}")
+        if not accounting.get("ok", False):
+            n_orphans = len(accounting.get("orphans") or [])
+            reasons.append(f"accounting_disagreement:orphans={n_orphans}:diff={accounting.get('identity_diff')}")
+        day_entry = (
+            not self._trading_paused
+            and self._account_status == AccountStatus.HEALTHY
+            and not bool(ks.get("buys_blocked"))
+            and bool(accounting.get("ok"))
+        )
+        return {
+            "process_alive": True,
+            "accounting_healthy": bool(accounting.get("ok")),
+            "day_entry_enabled": day_entry,
+            "day_exit_enabled": not bool(ks.get("sells_blocked")),
+            "kill_switch_mode": ks.get("mode"),
+            "kill_switch_reason": ks.get("reason"),
+            "failsafe_active": failsafe,
+            "no_trade_reason": "; ".join(reasons) if reasons else None,
+            "accounting": accounting,
+        }
+
     def get_portfolio_status(self) -> dict[str, Any]:
         """
         Get full portfolio status for observability.
@@ -16733,6 +16996,7 @@ class PortfolioEngine:
 
         from backend.config.live_test_mode import get_live_test_api_fields
 
+        capability = self.get_trading_capability_status()
         forward_accounting: dict[str, Any] = {}
         try:
             from backend.services.allweather_paper_accounting import compute_pnl_breakdown
@@ -16748,6 +17012,14 @@ class PortfolioEngine:
             "account_status": self._account_status.value,
             "trading_paused": self._trading_paused,
             "pause_reason": self._pause_reason if self._trading_paused else None,
+            "kill_switch_mode": capability["kill_switch_mode"],
+            "kill_switch_reason": capability["kill_switch_reason"],
+            "failsafe_active": capability["failsafe_active"],
+            "accounting_healthy": capability["accounting_healthy"],
+            "day_entry_enabled": capability["day_entry_enabled"],
+            "day_exit_enabled": capability["day_exit_enabled"],
+            "no_trade_reason": capability["no_trade_reason"],
+            "process_alive": True,
             # POSITION SUMMARY
             "open_positions": positions_list,
             "positions": positions_list,

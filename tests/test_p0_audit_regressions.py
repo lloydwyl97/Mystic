@@ -58,9 +58,9 @@ def test_admin_dependency_accepts_dashboard_bearer_token(
 def test_buy_cash_gate_precedes_trade_row_commit() -> None:
     source = inspect.getsource(PortfolioEngine._execute_buy_fifo_locked)
     final_gate = source.index("pending_other = self._pending_buy_notional(exclude_symbol=symbol)")
-    trade_commit = source.index("await loop.run_in_executor(None, _sync_insert)")
-    cash_debit = source.index("self.cash_balance -= total_cost")
-    assert final_gate < trade_commit < cash_debit
+    trade_commit = source.index("_commit_atomic_day_open_sync")
+    cash_apply = source.index("self.cash_balance = committed_cash")
+    assert final_gate < trade_commit < cash_apply
 
 
 def test_tp1_latch_occurs_only_after_successful_sell_result() -> None:

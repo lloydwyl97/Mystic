@@ -22,6 +22,7 @@ of inventing a profit.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sqlite3
@@ -313,9 +314,96 @@ def read_recent_learning_rows(
         return []
 
 
+def consume_setup_outcomes_for_ranking(
+    db_path: str,
+    setup: str,
+    *,
+    limit: int = 40,
+) -> dict[str, Any]:
+    """Read closed trade_learning_outcomes for a setup (all four coins).
+
+    This is the consume half of the learning loop. It never hard-blocks and
+    never applies a coin-identity penalty. Callers use expectancy as a rank
+    adjustment only.
+    """
+    out: dict[str, Any] = {
+        "consumed": False,
+        "setup": str(setup or ""),
+        "n": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": None,
+        "expectancy_usd": None,
+        "rank_delta": 0.0,
+    }
+    setup_u = str(setup or "").strip().upper()
+    if not setup_u:
+        return out
+    try:
+        _ensure_table(db_path)
+        conn = sqlite3.connect(db_path, timeout=10)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT net_profit_usd, extra_json, rank_data_json, close_reason
+                FROM {TABLE_NAME}
+                WHERE realized_profit_unknown = 0 AND net_profit_usd IS NOT NULL
+                ORDER BY id DESC LIMIT ?
+                """,
+                (max(20, int(limit) * 4),),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("LEARNING_CONSUME_FAILED err=%s", exc)
+        return out
+
+    matched: list[float] = []
+    for row in rows:
+        extra: dict[str, Any] = {}
+        rank: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            extra = json.loads(row["extra_json"] or "{}") if row["extra_json"] else {}
+        with contextlib.suppress(Exception):
+            rank = json.loads(row["rank_data_json"] or "{}") if row["rank_data_json"] else {}
+        setup_row = str(
+            extra.get("setup_type_canonical")
+            or extra.get("setup_type")
+            or extra.get("setup")
+            or rank.get("setup")
+            or ""
+        ).strip().upper()
+        if setup_row != setup_u:
+            continue
+        matched.append(float(row["net_profit_usd"]))
+        if len(matched) >= int(limit):
+            break
+    if not matched:
+        return out
+    wins = sum(1 for p in matched if p > 0)
+    losses = len(matched) - wins
+    expectancy = sum(matched) / len(matched)
+    # Bounded rank influence only. Never a permission gate.
+    rank_delta = max(-0.05, min(0.05, expectancy / 10.0))
+    out.update(
+        {
+            "consumed": True,
+            "n": len(matched),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(wins / len(matched), 4),
+            "expectancy_usd": round(expectancy, 6),
+            "rank_delta": round(rank_delta, 6),
+        }
+    )
+    return out
+
+
 __all__ = [
     "TABLE_NAME",
     "TradeLearningRecord",
+    "consume_setup_outcomes_for_ranking",
     "read_recent_learning_rows",
     "record_trade_outcome",
 ]

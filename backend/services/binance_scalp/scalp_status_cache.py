@@ -253,6 +253,9 @@ def build_runner_api_status_payload(
         "runner_active": True,
         "pnl_summary": pnl_summary or {"engine": "scalp", "note": "pnl_omitted_on_fast_path"},
         "heartbeat_epoch": float(rs.get("updated_at_epoch") or now),
+        "circuit_breaker_open": str(ld.get("reason") or rs.get("entry_blocked_reason") or "") == "SCALP_CIRCUIT_BREAKER_OPEN",
+        "scalp_entry_enabled": not bool(rs.get("entry_blocked_reason") or (str(ld.get("reason") or "") in {"SCALP_CIRCUIT_BREAKER_OPEN", "SCALP_PAPER_DISABLED", "FEE_MODEL_UNVERIFIED"})),
+        "scalp_exit_enabled": True,
     }
 
 

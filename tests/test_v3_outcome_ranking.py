@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -48,11 +49,13 @@ def test_compute_final_selection_score_prefers_adjusted_ev():
     assert high > low
 
 
+@patch("backend.services.symbol_setup_outcome_penalty.evaluate_low_mfe_stall_penalty")
 @patch("backend.services.symbol_setup_outcome_penalty.evaluate_eth_outcome_credit")
 @patch("backend.services.symbol_setup_outcome_penalty.evaluate_sol_outcome_credit")
 @patch("backend.services.symbol_setup_outcome_penalty.evaluate_btc_outcome_penalty")
 @patch("backend.services.symbol_setup_outcome_penalty.evaluate_outcome_penalty")
-def test_xrp_loses_final_rank_to_sol_when_comparable(mock_xrp, mock_btc, mock_sol, mock_eth):
+def test_xrp_loses_final_rank_to_sol_when_comparable(mock_xrp, mock_btc, mock_sol, mock_eth, mock_low_mfe):
+    mock_low_mfe.return_value = {"applied": False, "rank_delta": 0.0, "ev_factor": 1.0, "size_factor": 1.0, "final_score_adjustment": 0.0, "reason": "no_low_mfe_stall"}
     mock_xrp.side_effect = lambda sym, setup, regime, **kw: (
         {
             "applied": True,
@@ -86,9 +89,20 @@ def test_xrp_loses_final_rank_to_sol_when_comparable(mock_xrp, mock_btc, mock_so
     xrp_dd = apply_v3_outcome_ranking_to_decision_data(_base_dd(), "XRP/USDT", raw_rank_score=0.44, buy_margin=0.35)
     sol_dd = apply_v3_outcome_ranking_to_decision_data(_base_dd(selected_net_expected_value=0.011), "SOL/USDT", raw_rank_score=0.40, buy_margin=0.02)
 
-    assert xrp_dd["outcome_penalty_applied"] is True
-    assert sol_dd["outcome_credit_applied"] is True
-    assert sol_dd["final_selection_score"] > xrp_dd["final_selection_score"]
+    # Default: coin identity ranking is off. Opportunity scores are not
+    # rewritten because the symbol is XRP or SOL.
+    assert xrp_dd["outcome_penalty_applied"] is False
+    assert sol_dd["outcome_credit_applied"] is False
+    assert xrp_dd.get("outcome_churn_penalty_eval", {}).get("reason") == "coin_identity_ranking_disabled"
+    mock_xrp.assert_not_called()
+    mock_sol.assert_not_called()
+
+    with patch.dict(os.environ, {"DAY_COIN_IDENTITY_RANKING": "true"}):
+        xrp_on = apply_v3_outcome_ranking_to_decision_data(_base_dd(), "XRP/USDT", raw_rank_score=0.44, buy_margin=0.35)
+        sol_on = apply_v3_outcome_ranking_to_decision_data(_base_dd(selected_net_expected_value=0.011), "SOL/USDT", raw_rank_score=0.40, buy_margin=0.02)
+    assert xrp_on["outcome_penalty_applied"] is True
+    assert sol_on["outcome_credit_applied"] is True
+    assert sol_on["final_selection_score"] > xrp_on["final_selection_score"]
 
 
 @patch("backend.services.symbol_setup_outcome_penalty.evaluate_low_mfe_stall_penalty")
@@ -119,8 +133,14 @@ def test_sol_credit_raises_final_selection_score(mock_xrp, mock_btc, mock_sol, m
     base = apply_v3_outcome_ranking_to_decision_data(_base_dd(), "SOL/USDT", raw_rank_score=0.41, buy_margin=0.02)
     neutral = apply_v3_outcome_ranking_to_decision_data(_base_dd(), "ETH/USDT", raw_rank_score=0.41, buy_margin=0.02)
 
-    assert base["outcome_credit_applied"] is True
-    assert base["final_selection_score"] > neutral["final_selection_score"]
+    assert base["outcome_credit_applied"] is False
+    assert abs(base["final_selection_score"] - neutral["final_selection_score"]) < 1e-9
+
+    with patch.dict(os.environ, {"DAY_COIN_IDENTITY_RANKING": "true"}):
+        base_on = apply_v3_outcome_ranking_to_decision_data(_base_dd(), "SOL/USDT", raw_rank_score=0.41, buy_margin=0.02)
+        neutral_on = apply_v3_outcome_ranking_to_decision_data(_base_dd(), "ETH/USDT", raw_rank_score=0.41, buy_margin=0.02)
+    assert base_on["outcome_credit_applied"] is True
+    assert base_on["final_selection_score"] > neutral_on["final_selection_score"]
 
 
 def test_solo_candidate_still_has_positive_final_score():

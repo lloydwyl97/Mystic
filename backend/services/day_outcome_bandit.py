@@ -526,6 +526,21 @@ def apply_bandit_to_decision_data(
     except (TypeError, ValueError):
         prev_size = 1.0
     dd["thesis_size_factor"] = round(max(STARVE_SIZE_FLOOR, prev_size * float(sampled["size_factor"])), 4)
+    try:
+        from backend.services.trade_learning_writer import consume_setup_outcomes_for_ranking
+
+        learned = consume_setup_outcomes_for_ranking(str(db_path), str(setup))
+        dd["learning_outcomes_consumed"] = bool(learned.get("consumed"))
+        dd["learning_outcomes_n"] = int(learned.get("n") or 0)
+        dd["learning_outcomes_win_rate"] = learned.get("win_rate")
+        dd["learning_outcomes_expectancy_usd"] = learned.get("expectancy_usd")
+        dd["learning_outcomes_rank_delta"] = float(learned.get("rank_delta") or 0.0)
+        if learned.get("consumed") and int(learned.get("n") or 0) >= 8:
+            blended = float(dd["final_selection_score"]) + float(learned.get("rank_delta") or 0.0)
+            dd["final_selection_score"] = round(max(0.0, min(1.0, blended)), 6)
+            dd["selection_score"] = dd["final_selection_score"]
+    except Exception:
+        dd["learning_outcomes_consumed"] = False
     return dd
 
 

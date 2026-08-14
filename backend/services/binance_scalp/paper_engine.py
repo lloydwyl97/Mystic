@@ -108,11 +108,23 @@ class BinanceScalpPaperEngine:
         self._heartbeat_stop = False
         self._heartbeat_thread = None
         self._cached_open_symbols: list[str] = []
+        self._last_circuit_breaker_open = False
+        try:
+            from backend.database_schema import DATABASE_PATH as _DAY_DB
+            from backend.services.atomic_execution_book import migrate_scalp_money_database
+
+            migrate_scalp_money_database(_DAY_DB, self.config.database_path)
+        except Exception:
+            logger.exception("SCALP_MONEY_DB_MIGRATE_SKIPPED")
         init_scalp_schema(self.config.database_path)
         with contextlib.suppress(Exception):
             from backend.services.scalp_gate_telemetry import ensure_scalp_gate_schema
 
             ensure_scalp_gate_schema(self.config.database_path)
+        with contextlib.suppress(Exception):
+            from backend.services.validation_cutoff import ensure_validation_cutoff
+
+            ensure_validation_cutoff(self.config.database_path, engine="scalp", repo_root=self.config.repo_root)
         if self.config.scalp_paper_enabled and self.config.scalp_paper_auto_arm:
             set_entry_armed(
                 self._redis,
@@ -122,6 +134,15 @@ class BinanceScalpPaperEngine:
             )
         else:
             set_entry_armed(self._redis, prefix=self.config.redis_key_prefix, armed=False)
+        try:
+            if self._check_scalp_circuit_breaker():
+                self._last_circuit_breaker_open = True
+                self._publish_last_decision(decision="BLOCKED", reason="SCALP_CIRCUIT_BREAKER_OPEN")
+            else:
+                self._last_circuit_breaker_open = False
+                self._publish_last_decision(decision="SCAN", reason="")
+        except Exception:
+            logger.debug("SCALP_STARTUP_CB_STATUS_SKIPPED", exc_info=True)
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.config.database_path, timeout=10.0)
@@ -821,9 +842,11 @@ class BinanceScalpPaperEngine:
             return
 
         if self._check_scalp_circuit_breaker():
+            self._last_circuit_breaker_open = True
             self._publish_last_decision(decision="BLOCKED", reason="SCALP_CIRCUIT_BREAKER_OPEN")
             self._record_gate(gate_id="SCALP_CIRCUIT_BREAKER", reason="SCALP_CIRCUIT_BREAKER_OPEN")
             return
+        self._last_circuit_breaker_open = False
 
         candidates = self._entry_candidates(conn)
         if not candidates:
@@ -1740,7 +1763,9 @@ class BinanceScalpPaperEngine:
                         "context_snapshot": _ctx_obj,
                     },
                 )
-                record_trade_outcome(rec, db_path=self.config.database_path)
+                from backend.database_schema import DATABASE_PATH as _DAY_LEARNING_DB
+
+                record_trade_outcome(rec, db_path=_DAY_LEARNING_DB)
             except Exception as _lw_exc:
                 logger.debug("SCALP_LEARNING_WRITE_SKIPPED %s", _lw_exc)
 
@@ -1826,6 +1851,7 @@ class BinanceScalpPaperEngine:
                 snapshot_source="runner_tick_start",
             )
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             post_commit: list = []
             if not self.config.scalp_paper_enabled:
                 for sym in self.config.products:
@@ -1878,6 +1904,8 @@ class BinanceScalpPaperEngine:
             else:
                 entry_blocked = "MAX_OPEN_POSITIONS"
                 self._publish_last_decision(decision="BLOCKED", reason="MAX_OPEN_POSITIONS")
+            if getattr(self, "_last_circuit_breaker_open", False):
+                entry_blocked = "SCALP_CIRCUIT_BREAKER_OPEN"
             open_after = self._open_positions(conn)
             self._publish_runner_state(conn, open_rows=open_after, epoch=epoch, entry_blocked_reason=entry_blocked)
             pending_sell = getattr(self, "_pending_sell_log", None)

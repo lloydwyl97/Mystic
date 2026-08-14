@@ -103,12 +103,12 @@ def _symbol_stall_risk_blocklist() -> frozenset[str]:
     Override via SCALP_STALL_RISK_SYMBOL_BLOCKLIST (comma-separated) or
     disable via SCALP_STALL_RISK_SYMBOL_GATE_ENABLED=false.
     """
-    raw = os.getenv("SCALP_STALL_RISK_SYMBOL_BLOCKLIST", "ETHUSDT,XRPUSDT")
+    raw = os.getenv("SCALP_STALL_RISK_SYMBOL_BLOCKLIST", "")
     return frozenset(s.strip().upper() for s in raw.split(",") if s.strip())
 
 
 def _symbol_stall_risk_gate_enabled() -> bool:
-    return str(os.getenv("SCALP_STALL_RISK_SYMBOL_GATE_ENABLED", "true")).strip().lower() in (
+    return str(os.getenv("SCALP_STALL_RISK_SYMBOL_GATE_ENABLED", "false")).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -118,7 +118,7 @@ def _symbol_stall_risk_gate_enabled() -> bool:
 
 def _require_regime_native() -> bool:
     """When true (default), only regime-native strategies may become entry_eligible."""
-    return str(os.getenv("SCALP_REQUIRE_REGIME_NATIVE", "true")).strip().lower() in (
+    return str(os.getenv("SCALP_REQUIRE_REGIME_NATIVE", "false")).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -616,8 +616,8 @@ def _global_tie_key(row: dict[str, Any]) -> tuple:
     passed = 1 if getattr(sig, "passed", False) else 0
     reach = float(meta.get("reachability_surplus") or 0)
     sym = str(row.get("symbol") or "")
-    # Deprioritize BTC on pure weak ties (tight spread was winning every coin flip).
-    sym_penalty = -0.002 if sym == "BTCUSDT" else 0.0
+    # Rank the opportunity, never the coin identity.
+    sym_penalty = 0.0
     # Market-role intelligence soft delta (affects tie-breaking only, not eligibility)
     role_delta = _role_ranking_delta(row)
     return (

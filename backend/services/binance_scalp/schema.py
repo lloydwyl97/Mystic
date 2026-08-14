@@ -353,6 +353,7 @@ def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list
                     )
                     applied.append("repair_empty_ledger_basis")
         applied.extend(apply_scalp_migrations(conn))
+        conn.commit()
         try:
             from backend.services.scalp_outcome_attribution import ensure_scalp_outcome_attribution_table
             from backend.services.scalp_post_trade_feature_review import ensure_scalp_post_trade_review_table
@@ -371,7 +372,6 @@ def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list
             applied.append("ensure_scalp_gate_tables")
         except Exception:
             pass
-        conn.commit()
         return applied
 
 

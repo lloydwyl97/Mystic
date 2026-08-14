@@ -6,14 +6,18 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from backend.database_schema import DATABASE_PATH
+def _default_scalp_money_db() -> str:
+    from backend.services.binance_scalp.config import get_scalp_config
+
+    return get_scalp_config().database_path
 
 
-def build_scalp_pnl_summary(db_path: str = DATABASE_PATH) -> dict[str, Any]:
+def build_scalp_pnl_summary(db_path: str | None = None) -> dict[str, Any]:
     """DAY and scalp PnL must stay separate; this is scalp-only.
 
     Short busy timeout — safe for runner publish path; GET /status must not call this.
     """
+    db_path = db_path or _default_scalp_money_db()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     out: dict[str, Any] = {
         "engine": "scalp",
