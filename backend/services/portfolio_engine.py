@@ -6671,17 +6671,10 @@ class PortfolioEngine:
                     for psym in paper_open_syms:
                         ns = normalize_symbol(psym)
                         if ns not in open_syms:
-                            cursor.execute(
-                                """
-                                UPDATE paper_trades SET remaining_position = 0
-                                WHERE symbol = ? AND side = 'BUY' AND timestamp < ?
-                                """,
-                                (psym, cutoff_iso),
-                            )
-                            logger.warning(
-                                "FIFO_RECONCILE: zeroed ghost BUY remaining for %s (no engine open position, age>%.0fs)",
+                            logger.critical(
+                                "FIFO_RECONCILE_ORPHAN_NOT_ZEROED symbol=%s — remaining BUY lots kept; "
+                                "restore_orphaned_day_buys owns this, heal-by-zero is forbidden",
                                 psym,
-                                grace_sec,
                             )
 
                     for sym, pos in self.open_positions.items():

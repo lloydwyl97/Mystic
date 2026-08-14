@@ -174,6 +174,33 @@ def test_crash_during_mtm_after_commit_reload_restores_position():
         assert proof["ok"] is True
 
 
+def test_orphan_restore_detects_zeroed_remaining_without_sell():
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "day.db"
+        engine = _init_engine(db)
+        with sqlite3.connect(str(db)) as conn:
+            conn.execute(
+                """
+                INSERT INTO paper_trades (
+                    trade_id, paper_run_id, mode, symbol, side, quantity, price,
+                    remaining_position, timestamp, status
+                ) VALUES ('orphan_zeroed', 'test', 'paper', 'XRP/USDT', 'BUY', 100, 1.0,
+                          0.0, datetime('now'), 'executed')
+                """
+            )
+            conn.execute(
+                "UPDATE portfolio_engine_ledger SET cash_balance=9900, positions_value=0, total_equity=9900 WHERE id=1"
+            )
+            conn.commit()
+        orphans = find_orphaned_day_buys(str(db))
+        assert len(orphans) == 1
+        restored = restore_orphaned_day_buys(str(db))
+        assert len(restored) == 1
+        proof = assert_cash_plus_marks_equals_equity(str(db))
+        assert proof["ok"] is True
+        assert proof["cash"] == pytest.approx(9900.0, abs=0.05)
+
+
 def test_orphan_restore_from_committed_buy_does_not_invent_cash():
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "day.db"

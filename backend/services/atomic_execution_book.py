@@ -52,15 +52,25 @@ def find_orphaned_day_buys(db_path: str | Path) -> list[dict[str, Any]]:
     try:
         rows = conn.execute(
             """
-            SELECT t.id, t.trade_id, t.symbol, t.quantity, t.remaining_position, t.price, t.created_at
+            SELECT t.id, t.trade_id, t.symbol, t.quantity,
+                   CASE WHEN IFNULL(t.remaining_position, 0) > 1e-12
+                        THEN t.remaining_position ELSE t.quantity END AS remaining_position,
+                   t.price, t.created_at
             FROM paper_trades t
             WHERE upper(t.side) = 'BUY'
-              AND IFNULL(t.remaining_position, 0) > 1e-12
+              AND IFNULL(t.quantity, 0) > 1e-12
               AND NOT EXISTS (
                   SELECT 1 FROM portfolio_engine_positions p
                   WHERE replace(replace(upper(p.symbol), '/', ''), '-', '')
                       = replace(replace(upper(t.symbol), '/', ''), '-', '')
                     AND IFNULL(p.quantity, 0) > 1e-12
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM paper_trades s
+                  WHERE upper(s.side) = 'SELL'
+                    AND replace(replace(upper(s.symbol), '/', ''), '-', '')
+                        = replace(replace(upper(t.symbol), '/', ''), '-', '')
+                    AND s.id > t.id
               )
             ORDER BY t.id
             """
@@ -156,6 +166,10 @@ def restore_orphaned_day_buys(db_path: str | Path) -> list[dict[str, Any]]:
             ).fetchone()
             if existing and float(existing[0] or 0) > 1e-12:
                 continue
+            cur.execute(
+                "UPDATE paper_trades SET remaining_position = ? WHERE id = ?",
+                (qty, orphan.get("id")),
+            )
             cur.execute(
                 """
                 INSERT OR REPLACE INTO portfolio_engine_positions (
