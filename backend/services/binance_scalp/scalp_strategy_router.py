@@ -282,9 +282,10 @@ class ScalpStrategyRouter:
                 soft_reason = soft_reason or mtf_conflict_reason
                 selection_confidence = f"{selection_confidence}_mtf_conflict_ranked"
                 with contextlib.suppress(Exception):
+                    from backend.services.binance_scalp.config import get_scalp_config
                     from backend.services.scalp_gate_telemetry import record_gate_event
 
-                    _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
+                    _db = get_scalp_config().database_path
                     record_gate_event(
                         _db,
                         gate_id="MTF_CONFLICT_RANKED",

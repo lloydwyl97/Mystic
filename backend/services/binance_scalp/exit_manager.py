@@ -128,13 +128,28 @@ def _meaningful_recovery(recovery: float, max_fav: float, econ: ScalpEconomics) 
     return recovery >= RECOVERY_MIN_PCT and max_fav >= target_progress * 0.4
 
 
-def _scratch_min_hold_sec(setup_name: str | None = None) -> int:
+def _is_genuine_pass_context(setup_context: dict | None) -> bool:
+    ctx = setup_context or {}
+    if ctx.get("soft_rank_entry"):
+        return False
+    if ctx.get("entry_owner") == "strategy":
+        return True
+    return bool(ctx.get("passed")) and not ctx.get("soft_rank_entry")
+
+
+def _scratch_min_hold_sec(setup_name: str | None = None, setup_context: dict | None = None) -> int:
     base = int(os.getenv("SCALP_SCRATCH_MIN_HOLD_SEC", "180"))
     name = (setup_name or "").strip().lower()
     # Range bounce gets a slightly longer floor, but must still scratch before
     # MAX_HOLD (post soft-rank paper: delayed range scratch → max-hold bleed).
     if name == "range_bounce_scalp":
-        return int(os.getenv("SCALP_RANGE_SCRATCH_MIN_HOLD_SEC", str(max(base, 300))))
+        base = int(os.getenv("SCALP_RANGE_SCRATCH_MIN_HOLD_SEC", str(max(base, 300))))
+    # Replay of genuine-pass VWAP reclaim: 3/3 scratched at the short floor
+    # finished red, while the same entries held to the 20m horizon were 66.7%
+    # WR / +EV. Historical scratches that never had MFE stay on the short
+    # floor (soft-rank). This is an exit-timing change, not an entry gate.
+    if _is_genuine_pass_context(setup_context):
+        return int(os.getenv("SCALP_GENUINE_SCRATCH_MIN_HOLD_SEC", str(max(base, 420))))
     return base
 
 
@@ -206,10 +221,11 @@ def _early_scratch_exit(
     econ: ScalpEconomics,
     stale_review_count: int,
     setup_name: str | None = None,
+    setup_context: dict | None = None,
     hold_ev_reduction: int = 0,
 ) -> tuple[bool, str]:
     """Exit flat/slightly-negative scalps that stall before hard max-hold."""
-    min_hold = _scratch_min_hold_sec(setup_name)
+    min_hold = _scratch_min_hold_sec(setup_name, setup_context)
     if hold_sec < min_hold or hold_sec >= hard:
         return False, ""
     if _meaningful_recovery(recovery, max_fav, econ):
@@ -457,6 +473,7 @@ def evaluate_exit(
         econ=econ,
         stale_review_count=stale_review_count,
         setup_name=track.setup_name,
+        setup_context=track.setup_context,
         hold_ev_reduction=hold_ev_reduction,
     )
     if scratch:
@@ -464,7 +481,7 @@ def evaluate_exit(
         diag_base["scratch_trigger_detail"] = scratch_reason
         diag_base["scratch_target_progress_pct"] = target_progress
         diag_base["scratch_min_reviews"] = _effective_scratch_min_reviews(track.setup_name, hold_ev_reduction)
-        diag_base["scratch_min_hold_sec"] = _scratch_min_hold_sec(track.setup_name)
+        diag_base["scratch_min_hold_sec"] = _scratch_min_hold_sec(track.setup_name, track.setup_context)
         diag_base["scratch_momentum_stalled"] = _momentum_stalled(mom)
         diag_base["scratch_flat_or_slight_neg"] = _scratchable_net(executable_net_pct, econ)
         return _sell(STATE_RECOVERY_HOLD, scratch_reason, EXIT_EARLY_SCRATCH)
@@ -521,7 +538,7 @@ def evaluate_exit(
     meaningful_rec = _meaningful_recovery(recovery, max_fav, econ)
     target_progress = econ.net_profit_target_pct * _scratch_progress_frac()
 
-    scratch_ready = hold_sec >= _scratch_min_hold_sec(track.setup_name)
+    scratch_ready = hold_sec >= _scratch_min_hold_sec(track.setup_name, track.setup_context)
     if (
         scratch_ready
         and stale_review_count >= _effective_scratch_min_reviews(track.setup_name, hold_ev_reduction)
@@ -564,6 +581,9 @@ def track_from_row(row: Any, diag: dict | None = None) -> PositionTrack:
         session_low = float(diag.get("session_low_bid") or session_low)
         setup_name = str(diag.get("setup_name") or "")
         setup_context = dict(diag.get("setup_context") or {})
+        for key in ("passed", "soft_rank_entry", "entry_owner"):
+            if key in diag and key not in setup_context:
+                setup_context[key] = diag.get(key)
     slb = _col(row, "session_low_bid")
     if slb is not None:
         session_low = float(slb)

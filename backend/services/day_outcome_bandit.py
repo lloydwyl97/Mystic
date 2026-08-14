@@ -529,16 +529,37 @@ def apply_bandit_to_decision_data(
     try:
         from backend.services.trade_learning_writer import consume_setup_outcomes_for_ranking
 
-        learned = consume_setup_outcomes_for_ranking(str(db_path), str(setup))
+        learned = consume_setup_outcomes_for_ranking(
+            str(db_path),
+            str(setup),
+            features={
+                "volatility": dd.get("realized_volatility_pct") or dd.get("volatility"),
+                "momentum": dd.get("mid_change_60s") or dd.get("momentum"),
+                "volume": dd.get("volume_ratio") or dd.get("volume"),
+                "regime": regime,
+                "model_probability": dd.get("model_probability") or dd.get("confidence"),
+                "mfe_pct": dd.get("expected_mfe_pct"),
+                "hold_seconds": dd.get("expected_hold_seconds"),
+                "exit_reason": dd.get("planned_exit_reason"),
+                "market_regime": regime,
+            },
+        )
         dd["learning_outcomes_consumed"] = bool(learned.get("consumed"))
         dd["learning_outcomes_n"] = int(learned.get("n") or 0)
         dd["learning_outcomes_win_rate"] = learned.get("win_rate")
         dd["learning_outcomes_expectancy_usd"] = learned.get("expectancy_usd")
         dd["learning_outcomes_rank_delta"] = float(learned.get("rank_delta") or 0.0)
+        dd["learning_outcomes_size_factor"] = float(learned.get("size_factor") or 1.0)
+        dd["learning_outcomes_exit_hold_bias"] = float(learned.get("exit_hold_bias") or 0.0)
+        dd["learning_outcomes_feature_matched_n"] = int(learned.get("feature_matched_n") or 0)
         if learned.get("consumed") and int(learned.get("n") or 0) >= 8:
             blended = float(dd["final_selection_score"]) + float(learned.get("rank_delta") or 0.0)
             dd["final_selection_score"] = round(max(0.0, min(1.0, blended)), 6)
             dd["selection_score"] = dd["final_selection_score"]
+            dd["thesis_size_factor"] = round(
+                max(STARVE_SIZE_FLOOR, float(dd.get("thesis_size_factor") or 1.0) * float(learned.get("size_factor") or 1.0)),
+                4,
+            )
     except Exception:
         dd["learning_outcomes_consumed"] = False
     return dd

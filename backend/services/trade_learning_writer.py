@@ -314,17 +314,92 @@ def read_recent_learning_rows(
         return []
 
 
+def _bucket_vol(value: Any) -> str:
+    try:
+        v = abs(float(value))
+    except (TypeError, ValueError):
+        return "unk"
+    if v < 0.002:
+        return "low"
+    if v < 0.006:
+        return "mid"
+    return "high"
+
+
+def _bucket_mom(value: Any) -> str:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "unk"
+    if v > 0.0003:
+        return "up"
+    if v < -0.0003:
+        return "down"
+    return "flat"
+
+
+def _bucket_hold(value: Any) -> str:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "unk"
+    if v < 120:
+        return "short"
+    if v < 600:
+        return "medium"
+    return "long"
+
+
+def _bucket_mfe(value: Any) -> str:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "unk"
+    if v >= 0.0025:
+        return "reached_target"
+    if v >= 0.0012:
+        return "partial"
+    return "none"
+
+
+def _row_feature_state(extra: dict[str, Any], rank: dict[str, Any], indicators: dict[str, Any], close_reason: str) -> dict[str, str]:
+    hold = extra.get("hold_seconds") or indicators.get("hold_seconds") or rank.get("hold_seconds")
+    holding = indicators.get("indicators_while_holding")
+    mfe = extra.get("mfe_pct") or rank.get("mfe_pct")
+    if mfe is None and isinstance(holding, dict):
+        mfe = holding.get("max_favorable_pct")
+    if mfe is None and isinstance(indicators, dict):
+        mfe = indicators.get("max_favorable_pct") or indicators.get("mfe_pct")
+    vol = extra.get("volatility") or extra.get("realized_volatility_pct") or rank.get("volatility")
+    mom = extra.get("momentum") or extra.get("mid_change_60s") or rank.get("momentum")
+    volume = extra.get("volume_role") or extra.get("volume") or rank.get("volume")
+    regime = str(extra.get("regime") or extra.get("market_regime") or rank.get("regime") or "unk")
+    model_p = extra.get("model_probability") or rank.get("model_probability") or rank.get("confidence")
+    return {
+        "vol": _bucket_vol(vol),
+        "mom": _bucket_mom(mom),
+        "hold": _bucket_hold(hold),
+        "mfe": _bucket_mfe(mfe),
+        "volume": _bucket_vol(volume) if volume is not None else "unk",
+        "regime": str(regime or "unk").lower()[:24] or "unk",
+        "exit": str(close_reason or extra.get("close_reason") or "unk").upper()[:40],
+        "model": "high" if (float(model_p) if model_p not in (None, "") else 0.5) >= 0.65 else "low",
+    }
+
+
 def consume_setup_outcomes_for_ranking(
     db_path: str,
     setup: str,
     *,
     limit: int = 40,
+    features: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read closed trade_learning_outcomes for a setup (all four coins).
 
-    This is the consume half of the learning loop. It never hard-blocks and
-    never applies a coin-identity penalty. Callers use expectancy as a rank
-    adjustment only.
+    When ``features`` is provided, outcomes that share volatility / momentum /
+    MFE / hold / exit / regime buckets are weighted more heavily. This is the
+    consume half of the learning loop. It never hard-blocks and never applies
+    a coin-identity penalty. Callers use expectancy as a rank/size adjustment.
     """
     out: dict[str, Any] = {
         "consumed": False,
@@ -335,10 +410,15 @@ def consume_setup_outcomes_for_ranking(
         "win_rate": None,
         "expectancy_usd": None,
         "rank_delta": 0.0,
+        "size_factor": 1.0,
+        "exit_hold_bias": 0.0,
+        "weighted_n": 0.0,
+        "feature_matched_n": 0,
     }
     setup_u = str(setup or "").strip().upper()
     if not setup_u:
         return out
+    current = _row_feature_state(features or {}, features or {}, features or {}, str((features or {}).get("exit_reason") or ""))
     try:
         _ensure_table(db_path)
         conn = sqlite3.connect(db_path, timeout=10)
@@ -346,12 +426,13 @@ def consume_setup_outcomes_for_ranking(
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 f"""
-                SELECT net_profit_usd, extra_json, rank_data_json, close_reason
+                SELECT net_profit_usd, extra_json, rank_data_json, close_reason,
+                       hold_seconds, indicators_while_holding_json
                 FROM {TABLE_NAME}
                 WHERE realized_profit_unknown = 0 AND net_profit_usd IS NOT NULL
                 ORDER BY id DESC LIMIT ?
                 """,
-                (max(20, int(limit) * 4),),
+                (max(20, int(limit) * 6),),
             ).fetchall()
         finally:
             conn.close()
@@ -359,14 +440,20 @@ def consume_setup_outcomes_for_ranking(
         logger.debug("LEARNING_CONSUME_FAILED err=%s", exc)
         return out
 
-    matched: list[float] = []
+    matched: list[tuple[float, float]] = []
+    feature_matched = 0
+    hold_bias_num = 0.0
+    hold_bias_den = 0.0
     for row in rows:
         extra: dict[str, Any] = {}
         rank: dict[str, Any] = {}
+        indicators: dict[str, Any] = {}
         with contextlib.suppress(Exception):
             extra = json.loads(row["extra_json"] or "{}") if row["extra_json"] else {}
         with contextlib.suppress(Exception):
             rank = json.loads(row["rank_data_json"] or "{}") if row["rank_data_json"] else {}
+        with contextlib.suppress(Exception):
+            indicators = json.loads(row["indicators_while_holding_json"] or "{}") if row["indicators_while_holding_json"] else {}
         setup_row = str(
             extra.get("setup_type_canonical")
             or extra.get("setup_type")
@@ -376,16 +463,40 @@ def consume_setup_outcomes_for_ranking(
         ).strip().upper()
         if setup_row != setup_u:
             continue
-        matched.append(float(row["net_profit_usd"]))
+        extra = dict(extra)
+        extra.setdefault("hold_seconds", row["hold_seconds"])
+        extra.setdefault("mfe_pct", indicators.get("max_favorable_pct") if isinstance(indicators, dict) else None)
+        hist = _row_feature_state(extra, rank, {"indicators_while_holding": indicators}, str(row["close_reason"] or ""))
+        weight = 1.0
+        overlap = 0
+        for key in ("vol", "mom", "mfe", "hold", "regime", "exit", "volume"):
+            if current.get(key) not in (None, "", "unk") and current.get(key) == hist.get(key):
+                overlap += 1
+        if overlap:
+            weight += 0.35 * overlap
+            feature_matched += 1
+        pnl = float(row["net_profit_usd"])
+        matched.append((pnl, weight))
+        if hist.get("exit") and "SCRATCH" in hist["exit"] and hist.get("mfe") == "reached_target":
+            hold_bias_num += -1.0 * weight
+            hold_bias_den += weight
+        elif hist.get("exit") and "PROGRESS_DECAY" in hist["exit"] and hist.get("mfe") in {"reached_target", "partial"}:
+            hold_bias_num += -0.6 * weight
+            hold_bias_den += weight
         if len(matched) >= int(limit):
             break
     if not matched:
         return out
-    wins = sum(1 for p in matched if p > 0)
+    wsum = sum(w for _, w in matched)
+    expectancy = sum(p * w for p, w in matched) / wsum
+    wins = sum(1 for p, _ in matched if p > 0)
     losses = len(matched) - wins
-    expectancy = sum(matched) / len(matched)
-    # Bounded rank influence only. Never a permission gate.
+    # Bounded rank/size influence only. Never a permission gate.
     rank_delta = max(-0.05, min(0.05, expectancy / 10.0))
+    size_factor = max(0.55, min(1.25, 1.0 + expectancy / 20.0))
+    exit_hold_bias = 0.0
+    if hold_bias_den > 0:
+        exit_hold_bias = max(-1.0, min(1.0, hold_bias_num / hold_bias_den))
     out.update(
         {
             "consumed": True,
@@ -395,6 +506,10 @@ def consume_setup_outcomes_for_ranking(
             "win_rate": round(wins / len(matched), 4),
             "expectancy_usd": round(expectancy, 6),
             "rank_delta": round(rank_delta, 6),
+            "size_factor": round(size_factor, 4),
+            "exit_hold_bias": round(exit_hold_bias, 4),
+            "weighted_n": round(wsum, 3),
+            "feature_matched_n": feature_matched,
         }
     )
     return out

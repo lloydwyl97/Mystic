@@ -26,6 +26,7 @@ SCALP_TABLES = (
     "scalp_strategy_score_weights",
     "scalp_gate_counters",
     "scalp_shadow_rejects",
+    "scalp_post_exit_path",
 )
 
 SCHEMA_VERSION = 3
@@ -362,6 +363,9 @@ def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list
             ensure_scalp_outcome_attribution_table(str(path))
             ensure_scalp_post_trade_review_table(str(path))
             ensure_scalp_strategy_score_weights_table(str(path))
+            from backend.services.binance_scalp.scalp_post_exit_path import ensure_post_exit_path_table
+
+            ensure_post_exit_path_table(str(path))
             applied.append("ensure_scalp_intelligence_tables")
         except Exception:
             pass

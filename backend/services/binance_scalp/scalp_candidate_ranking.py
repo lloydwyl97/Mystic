@@ -399,6 +399,25 @@ def rank_setup_signal(
         role_samples = _stats.sample_count
         role_conf_status = _stats.confidence_status
         learned_adj = round(max(-0.02, min(0.02, _stats.learned_adjustment)), 5)
+        with contextlib.suppress(Exception):
+            from backend.services.trade_learning_writer import consume_setup_outcomes_for_ranking
+
+            _learned = consume_setup_outcomes_for_ranking(
+                _db,
+                sig.setup_name,
+                features={
+                    "volatility": getattr(ctx.mom, "realized_volatility_pct", None),
+                    "momentum": getattr(ctx.mom, "mid_change_60s", None),
+                    "regime": regime,
+                    "model_probability": sig.confidence,
+                    "market_regime": regime,
+                },
+            )
+            if _learned.get("consumed") and int(_learned.get("n") or 0) >= 8:
+                learned_adj = round(
+                    max(-0.04, min(0.04, learned_adj + float(_learned.get("rank_delta") or 0.0))),
+                    5,
+                )
 
     # Real microstructure engine (OFI + aggressor flow + microprice pressure,
     # short 250ms-30s windows) — feeds this SCALP entry's rank_score only.
@@ -420,7 +439,9 @@ def rank_setup_signal(
     with contextlib.suppress(Exception):
         from backend.services.scalp_gate_telemetry import record_gate_event
 
-        _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
+        from backend.services.binance_scalp.config import get_scalp_config
+
+        _db = get_scalp_config().database_path
         if hard_block:
             record_gate_event(
                 _db,
@@ -546,9 +567,10 @@ def prepare_entry_signal(
     ctx_map["bar_closed"] = True
 
     with contextlib.suppress(Exception):
+        from backend.services.binance_scalp.config import get_scalp_config
         from backend.services.scalp_gate_telemetry import record_gate_event
 
-        _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
+        _db = get_scalp_config().database_path
         record_gate_event(
             _db,
             gate_id="STRATEGY_PASS" if sig.passed else "SOFT_RANK_PROMOTED",
