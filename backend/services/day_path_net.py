@@ -63,22 +63,47 @@ def _norm_ohlcv_symbol(symbol: str) -> str:
     return s
 
 
-def load_recent_bars(db_path: str, symbol: str, *, n: int = LOOKBACK_BARS) -> list[dict[str, Any]]:
-    if not db_path or not Path(db_path).exists():
+def _symbol_lookups(symbol: str) -> list[str]:
+    raw = str(symbol or "").strip()
+    if not raw:
         return []
-    want = _norm_ohlcv_symbol(symbol)
+    norm = _norm_ohlcv_symbol(raw)
+    slash = norm.replace("-", "/")
+    compact = norm.replace("-", "")
+    out: list[str] = []
+    for item in (norm, slash, compact, raw.upper()):
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+def load_recent_bars(db_path: str, symbol: str, *, n: int = LOOKBACK_BARS) -> list[dict[str, Any]]:
+    path = Path(db_path) if db_path else Path()
+    if not db_path or not path.exists():
+        fallback = Path(__file__).resolve().parents[2] / "mystic_trading.db"
+        if fallback.exists():
+            path = fallback
+        else:
+            return []
+    names = _symbol_lookups(symbol)
+    if not names:
+        return []
+    rows: list[tuple[Any, ...]] = []
     try:
-        with sqlite3.connect(db_path) as conn:
-            rows = conn.execute(
-                """
-                SELECT open, high, low, close, volume, ts
-                FROM feature_ohlcv
-                WHERE interval='1m' AND symbol=?
-                ORDER BY ts DESC
-                LIMIT ?
-                """,
-                (want, int(n)),
-            ).fetchall()
+        with sqlite3.connect(str(path)) as conn:
+            for want in names:
+                rows = conn.execute(
+                    """
+                    SELECT open, high, low, close, volume, ts
+                    FROM feature_ohlcv
+                    WHERE interval='1m' AND symbol=?
+                    ORDER BY ts DESC
+                    LIMIT ?
+                    """,
+                    (want, int(n)),
+                ).fetchall()
+                if rows:
+                    break
     except Exception:
         return []
     bars: list[dict[str, Any]] = []
@@ -145,15 +170,39 @@ def predict_decision_net(decision_data: dict[str, Any]) -> float | None:
 
 
 def stamp_day_path_prediction(decision_data: dict[str, Any]) -> dict[str, Any]:
+    _, stamped = resolve_day_path_ev(decision_data)
+    return stamped
+
+
+def resolve_day_path_ev(
+    decision_data: dict[str, Any] | None,
+    *,
+    symbol: str = "",
+    db_path: str = "",
+) -> tuple[float | None, dict[str, Any]]:
+    """Accepted artifact only. Missing prediction is HOLD (0), never invented EV.
+
+    Returns (ev, stamp). ev is None only when no accepted artifact is loaded.
+    """
     dd = dict(decision_data or {})
     art = load_accepted_day_artifact()
+    if art is None:
+        return None, dd
+    sym = str(symbol or dd.get("symbol") or dd.get("symbol_bus") or "")
+    if sym:
+        dd["symbol"] = sym
+        dd = attach_bars(dd, db_path, sym)
     pred = predict_decision_net(dd)
-    if art is None or pred is None:
-        return dd
-    dd["selected_net_expected_value"] = float(pred)
-    dd["selected_net_expected_value_is_net"] = "1"
-    dd["predicted_net_return"] = float(pred)
     dd["forward_net_model_version"] = art.version
     dd["day_path_horizon_min"] = int(art.primary_horizon_min)
     dd["hold_action_ev"] = 0.0
-    return dd
+    dd["selected_net_expected_value_is_net"] = "1"
+    if pred is None:
+        dd["selected_net_expected_value"] = 0.0
+        dd["predicted_net_return"] = 0.0
+        dd["path_net_status"] = "unavailable_hold"
+        return 0.0, dd
+    dd["selected_net_expected_value"] = float(pred)
+    dd["predicted_net_return"] = float(pred)
+    dd["path_net_status"] = "predicted"
+    return float(pred), dd

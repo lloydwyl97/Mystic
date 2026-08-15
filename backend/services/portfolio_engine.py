@@ -7176,7 +7176,7 @@ class PortfolioEngine:
             strategy_id=str(dd.get("live_ai_strategy") or "day"),
             decision_data=dd,
         )
-        raw_ev = self._estimate_candidate_net_expected_value(dd)
+        raw_ev = self._estimate_candidate_net_expected_value(dd, symbol=str(candidate.symbol or ""))
         if dd.get("selected_net_expected_value_raw") is None:
             dd["selected_net_expected_value_raw"] = raw_ev
         bm = resolve_buy_margin_from_payload(dd)
@@ -7491,7 +7491,7 @@ class PortfolioEngine:
         from backend.services.day_regime_router import compute_hist_expectancy_pct
 
         dd = dict(candidate.decision_data or {})
-        net_ev = float(dd.get("adjusted_ev") or dd.get("selected_net_expected_value") or self._estimate_candidate_net_expected_value(dd))
+        net_ev = float(dd.get("adjusted_ev") or dd.get("selected_net_expected_value") or self._estimate_candidate_net_expected_value(dd, symbol=str(candidate.symbol or "")))
         sym = normalize_symbol(candidate.symbol)
         perf = self.coin_performance.get(sym)
         equity = max(float(self._total_equity or 0.0), float(self.principal or 10000.0))
@@ -12463,7 +12463,7 @@ class PortfolioEngine:
         rel_volume = _safe_float(dd.get("relative_volume"), _safe_float(dd.get("volume_expansion"), 0.0))
         trend = float(candidate.trend_score or 0.0)
         momentum = _safe_float(dd.get("price_momentum"), 0.0)
-        net_ev = self._estimate_candidate_net_expected_value(dd)
+        net_ev = self._estimate_candidate_net_expected_value(dd, symbol=str(symbol or ""))
 
         try:
             from backend.services.day_entry_quality_gate import build_basket_rs_ranks
@@ -13889,32 +13889,47 @@ class PortfolioEngine:
             "entry_buy_margin": float(bm) if bm is not None else None,
         }
 
-    def _estimate_candidate_net_expected_value(self, decision_data: dict[str, Any]) -> float:
+    def _estimate_candidate_net_expected_value(
+        self,
+        decision_data: dict[str, Any],
+        *,
+        symbol: str = "",
+    ) -> float:
         """
         Estimate per-candidate net expected value as fractional return.
-        Uses model probabilities and estimated win/loss/cost components.
+        When an accepted DAY path artifact is loaded, that prediction is the
+        only EV. Missing bars/features are HOLD (0), not an invented edge.
         """
         dd = decision_data or {}
         sid = str(dd.get("live_ai_strategy") or "day").strip().lower()
         if sid != "day":
             sid = "day"
+        sym = str(symbol or dd.get("symbol") or dd.get("symbol_bus") or "")
         self._hydrate_cost_telemetry(
-            symbol=str(dd.get("symbol") or dd.get("symbol_bus") or ""),
+            symbol=sym,
             strategy_id=sid,
             decision_data=dd,
         )
-        with contextlib.suppress(Exception):
-            from backend.services.day_path_net import attach_bars, stamp_day_path_prediction
+        try:
+            from backend.services.day_path_net import resolve_day_path_ev
 
-            sym = str(dd.get("symbol") or dd.get("symbol_bus") or "")
-            if sid == "day" and sym:
-                dd = attach_bars(dd, str(getattr(self, "db_path", "") or ""), sym)
-            stamped = stamp_day_path_prediction(dd)
-            predicted = stamped.get("selected_net_expected_value") if stamped.get("forward_net_model_version") else None
+            predicted, stamped = resolve_day_path_ev(
+                dd,
+                symbol=sym,
+                db_path=str(getattr(self, "db_path", "") or ""),
+            )
             if predicted is not None:
                 if decision_data is not None:
                     decision_data.update(stamped)
                 return float(predicted)
+        except Exception:
+            logger.warning("DAY_PATH_NET_EV_FAILED symbol=%s — HOLD", sym, exc_info=True)
+            if decision_data is not None:
+                decision_data["path_net_status"] = "error_hold"
+                decision_data["selected_net_expected_value"] = 0.0
+                decision_data["predicted_net_return"] = 0.0
+                decision_data["selected_net_expected_value_is_net"] = "1"
+            return 0.0
         # If upstream computed EV, still apply explicit cost subtraction here.
         explicit = _safe_float(dd.get("selected_net_expected_value"), float("nan"))
         explicit2 = _safe_float(dd.get("net_expected_value"), float("nan"))
@@ -14278,7 +14293,7 @@ class PortfolioEngine:
                 sizing_mult = perf.sizing_multiplier if perf else 1.0
                 strategy_id_for_size = str((cand.decision_data or {}).get("live_ai_strategy") or "day").strip().lower()
                 top_meta_score = float((cand.decision_data or {}).get("final_selection_score") or (cand.decision_data or {}).get("selection_score") or cand.rank_score())
-                top_net_ev = self._estimate_candidate_net_expected_value(cand.decision_data or {})
+                top_net_ev = self._estimate_candidate_net_expected_value(cand.decision_data or {}, symbol=str(symbol or ""))
                 if float(top_net_ev) <= 0.0:
                     logger.info("MULTI_BUY_SKIP_NEGATIVE_EV symbol=%s net_ev=%.6f", symbol, float(top_net_ev))
                     continue
@@ -15462,7 +15477,7 @@ class PortfolioEngine:
         cycle_leaderboard: list[dict[str, Any]] = []
         for _idx, _cand in enumerate(valid_candidates):
             _dd = _cand.decision_data or {}
-            _net_ev = self._estimate_candidate_net_expected_value(_dd)
+            _net_ev = self._estimate_candidate_net_expected_value(_dd, symbol=str(_cand.symbol or ""))
             _spread_val, _spread_units = self._normalize_spread_fraction(_dd.get("spread_pct"))
             _atr_ratio = (_cand.atr / _cand.current_price) if _cand.current_price > 0 else 0.0
             cycle_leaderboard.append(
@@ -15523,7 +15538,11 @@ class PortfolioEngine:
         )
         symbol = top_candidate.symbol
         top_dd = top_candidate.decision_data or {}
-        top_net_ev = self._estimate_candidate_net_expected_value(top_dd)
+        top_net_ev = self._estimate_candidate_net_expected_value(top_dd, symbol=str(top_candidate.symbol or ""))
+        if top_dd.get("path_net_status"):
+            top_dd["adjusted_ev"] = float(top_net_ev)
+            top_dd["selected_net_expected_value"] = float(top_net_ev)
+            top_dd["predicted_net_return"] = float(top_net_ev)
         top_meta["score"] = float(top_dd.get("final_selection_score") or top_dd.get("selection_score") or top_candidate.rank_score())
         top_meta["net_expected_value"] = float(top_dd.get("adjusted_ev") or top_net_ev)
         top_meta["rank_score"] = float(top_candidate.rank_score())
