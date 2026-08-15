@@ -28,7 +28,7 @@ def setup_function(_fn):
 
 
 def test_get_last_ranking_meta_none_when_unseen():
-    assert ssr.get_last_ranking_meta("BTCUSDT") is None
+    assert ssr.get_last_ranking_meta("BTCUSDT", redis_url=_TEST_REDIS_URL, prefix=_TEST_PREFIX) is None
 
 
 def test_get_last_ranking_meta_returns_cached_row():

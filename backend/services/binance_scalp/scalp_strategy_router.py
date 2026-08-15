@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from backend.services.binance_scalp.config import ScalpConfig
@@ -188,8 +190,11 @@ class ScalpStrategyRouter:
         signals: list[ScalpSetupSignal] = []
         ranked_list: list[RankedCandidate] = []
         measurements: dict[str, dict[str, float]] = {}
+        stage_ms: dict[str, float] = {}
+        t_meas = time.perf_counter()
         with contextlib.suppress(Exception):
             measurements = measure_all_setups(ctx)
+        stage_ms["measure_all_setups"] = round((time.perf_counter() - t_meas) * 1000.0, 1)
         meta["setup_measurements"] = measurements
         meta["measured_strategies"] = list(measurements.keys())
 
@@ -197,9 +202,12 @@ class ScalpStrategyRouter:
         # Measure every module every cycle. Disabled modules stay out of the
         # executable pick but their features inform rank/learning.
         for strategy in ALL_STRATEGIES:
+            t_strat = time.perf_counter()
             try:
                 sig = strategy.evaluate(ctx)
+                stage_ms[f"eval:{sig.setup_name}"] = round((time.perf_counter() - t_strat) * 1000.0, 1)
             except Exception as exc:
+                stage_ms[f"eval:{getattr(strategy, 'name', '?')}"] = round((time.perf_counter() - t_strat) * 1000.0, 1)
                 logger.warning("strategy %s failed %s: %s", getattr(strategy, "name", "?"), sym, exc)
                 sig = ScalpSetupSignal(
                     symbol=sym,
@@ -227,7 +235,10 @@ class ScalpStrategyRouter:
 
             sig = _sig_replace(sig, setup_context=ctx_map)
             signals.append(sig)
+            t_rank = time.perf_counter()
             ranked_list.append(rank_setup_signal(sig, regime=regime, ctx=ctx))
+            stage_ms[f"rank:{sig.setup_name}"] = round((time.perf_counter() - t_rank) * 1000.0, 1)
+        meta["stage_ms"] = stage_ms
 
         meta["ranked"] = [
             {
@@ -327,6 +338,7 @@ class ScalpStrategyRouter:
         meta["ml_role"] = "rank_size"
         meta["decision_policy_version"] = "scalp_ranking_not_gating_v2"
 
+        meta["stage_ms"] = stage_ms
         if entry_eligible:
             entry_sig = prepare_entry_signal(best_ranked, ctx)
             return entry_sig, signals, meta
@@ -386,6 +398,8 @@ class ScalpStrategyRouter:
     ) -> list[dict[str, Any]]:
         """Evaluate all products; return ranked entry candidates (eligible first)."""
         rows: list[dict[str, Any]] = []
+        t_all = time.perf_counter()
+        self._prefetch_history(list(self.config.products))
         for sym in self.config.products:
             # Fetch snapshot once and pass it through — evaluate_symbol() would
             # otherwise independently re-fetch the same symbol's depth via
@@ -393,12 +407,18 @@ class ScalpStrategyRouter:
             # doubling Binance /api/v3/depth calls per symbol per cycle for no
             # benefit (same 5s cycle, no ranking/scoring logic depends on which
             # fetch is used). Pure duplicate-call elimination; no logic change.
+            t_sym = time.perf_counter()
             snap = self.reader.read(sym)
             if snap is None:
+                logger.info("SCALP_EVAL_TIMING symbol=%s snap=None elapsed_ms=%.0f", sym, (time.perf_counter() - t_sym) * 1000.0)
                 continue
             best, all_sigs, meta = self.evaluate_symbol(sym, epoch=epoch, notional_usd=notional_usd, snap=snap)
             if best is None and not meta.get("ranked"):
+                logger.info("SCALP_EVAL_TIMING symbol=%s no_ranked elapsed_ms=%.0f", sym, (time.perf_counter() - t_sym) * 1000.0)
                 continue
+            t_ev = time.perf_counter()
+            mh_ev = cached_multi_horizon_ev(sym, "scalp").to_dict()
+            ev_ms = round((time.perf_counter() - t_ev) * 1000.0, 1)
             row = {
                 "symbol": sym,
                 "snap": snap,
@@ -423,11 +443,20 @@ class ScalpStrategyRouter:
                 # holding horizons — diagnostic/ranking evidence only, never
                 # a gate. TTL-cached (~5min) so this cheap-but-not-free
                 # sqlite lookup doesn't run on every ~5s evaluate_all() tick.
-                "multi_horizon_ev": cached_multi_horizon_ev(sym, "scalp").to_dict(),
+                "multi_horizon_ev": mh_ev,
             }
             rows.append(row)
             _LAST_RANKING_META_BY_SYMBOL[sym] = dict(row)
             _publish_ranking_meta_to_redis(sym, row, redis_url=self.config.redis_url, prefix=self.config.redis_key_prefix)
+            logger.info(
+                "SCALP_EVAL_TIMING symbol=%s elapsed_ms=%.0f ev_ms=%s passed=%s reject=%s setups=%s",
+                sym,
+                (time.perf_counter() - t_sym) * 1000.0,
+                ev_ms,
+                bool(meta.get("strategy_passed")),
+                meta.get("soft_reason") or meta.get("hard_block") or "",
+                ",".join(f"{k}={v}" for k, v in (meta.get("stage_ms") or {}).items()),
+            )
 
         rows.sort(
             key=lambda r: (
@@ -436,7 +465,32 @@ class ScalpStrategyRouter:
                 -float((r.get("rank_meta") or {}).get("reachability_surplus") or 0.0),
             )
         )
+        logger.info(
+            "SCALP_EVALUATE_ALL_DONE symbols=%s elapsed_ms=%.0f",
+            [r.get("symbol") for r in rows],
+            (time.perf_counter() - t_all) * 1000.0,
+        )
         return rows
+
+    def _prefetch_history(self, symbols: list[str]) -> None:
+        """Independent kline I/O for all four coins. Cache writes are locked."""
+        if not symbols:
+            return
+
+        def _one(sym: str) -> None:
+            try:
+                self.klines.get(sym)
+                self.klines.get_5m(sym)
+                self.klines.get_15m(sym)
+                self.klines.get_1h(sym)
+            except Exception as exc:
+                logger.warning("SCALP_PREFETCH_FAILED symbol=%s err=%s", sym, exc)
+
+        t0 = time.perf_counter()
+        workers = min(4, max(1, len(symbols)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_one, symbols))
+        logger.info("SCALP_PREFETCH_DONE symbols=%s elapsed_ms=%.0f", symbols, (time.perf_counter() - t0) * 1000.0)
 
     def strategy_inventory(self) -> dict[str, Any]:
         disabled = self.config.disabled_strategies

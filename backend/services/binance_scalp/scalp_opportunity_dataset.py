@@ -5,6 +5,7 @@ Forward labels are filled later from live mids / 1m bars. Never executes.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import time
@@ -49,7 +50,8 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     plus_300s_mae REAL,
     plus_600s_mae REAL,
     plus_1200s_mae REAL,
-    labeled INTEGER NOT NULL DEFAULT 0
+    labeled INTEGER NOT NULL DEFAULT 0,
+    horizon_labels_json TEXT NOT NULL DEFAULT '{{}}'
 )
 """
 
@@ -58,6 +60,9 @@ def ensure_opportunity_table(db_path: str, conn: sqlite3.Connection | None = Non
     def _apply(c: sqlite3.Connection) -> None:
         c.execute(_CREATE)
         c.execute(f"CREATE INDEX IF NOT EXISTS ix_scalp_opp_epoch ON {TABLE}(epoch, symbol)")
+        cols = {str(r[1]) for r in c.execute(f"PRAGMA table_info({TABLE})")}
+        if "horizon_labels_json" not in cols:
+            c.execute(f"ALTER TABLE {TABLE} ADD COLUMN horizon_labels_json TEXT NOT NULL DEFAULT '{{}}'")
 
     if conn is not None:
         _apply(conn)
@@ -130,6 +135,45 @@ def record_opportunity_cycle(
     return written
 
 
+def _path_label(mid0: float, epoch: float, horizon_sec: int, bars: list[dict[str, Any]], *, cost_pct: float, target_pct: float = 0.0025) -> dict[str, Any]:
+    end_ts = epoch + horizon_sec
+    highs: list[float] = []
+    lows: list[float] = []
+    last_close = mid0
+    time_to_target = None
+    time_to_adverse = None
+    for b in bars:
+        ts = float(b.get("ts") or 0)
+        if ts < epoch or ts > end_ts:
+            continue
+        high = float(b.get("high") or 0)
+        low = float(b.get("low") or 0)
+        close = float(b.get("close") or 0)
+        if high > 0:
+            highs.append(high)
+        if low > 0:
+            lows.append(low)
+        if close > 0:
+            last_close = close
+        age = ts - epoch
+        if time_to_target is None and mid0 > 0 and high > 0 and (high - mid0) / mid0 >= target_pct:
+            time_to_target = age
+        if time_to_adverse is None and mid0 > 0 and low > 0 and (low - mid0) / mid0 <= -target_pct:
+            time_to_adverse = age
+    mfe = max(((h - mid0) / mid0) for h in highs) if highs and mid0 > 0 else 0.0
+    mae = min(((lo - mid0) / mid0) for lo in lows) if lows and mid0 > 0 else 0.0
+    gross = (last_close - mid0) / mid0 if mid0 > 0 else 0.0
+    return {
+        "gross": gross,
+        "net": gross - cost_pct,
+        "mfe": mfe,
+        "mae": mae,
+        "hit_target": bool(mfe >= target_pct),
+        "time_to_target": time_to_target,
+        "time_to_adverse": time_to_adverse,
+    }
+
+
 def label_due_opportunities(db_path: str, reader: Any, *, now_epoch: float | None = None, cost_pct: float = 0.0006) -> int:
     ensure_opportunity_table(db_path)
     now = float(now_epoch if now_epoch is not None else time.time())
@@ -153,19 +197,41 @@ def label_due_opportunities(db_path: str, reader: Any, *, now_epoch: float | Non
             mid = float(getattr(snap, "mid", 0) or 0)
             if mid <= 0:
                 continue
+            bars: list[dict[str, Any]] = []
+            with contextlib.suppress(Exception):
+                from backend.services.binance_scalp.strategies.kline_cache import fetch_1m_bars
+
+                bars = fetch_1m_bars(str(row["symbol"]), minutes=40) or []
+            existing_labels: dict[str, Any] = {}
+            with contextlib.suppress(Exception):
+                existing_labels = json.loads(row["horizon_labels_json"] or "{}") if "horizon_labels_json" in row.keys() else {}
             gross = (mid - mid0) / mid0
             net = gross - cost_pct
             sets = []
             vals: list[Any] = []
             col = {30: "plus_30s", 60: "plus_60s", 180: "plus_180s", 300: "plus_300s", 600: "plus_600s", 1200: "plus_1200s"}
+            labels = dict(existing_labels)
             for sec, prefix in col.items():
                 if row[f"{prefix}_net"] is None and age >= sec:
+                    path = _path_label(mid0, float(row["epoch"] or 0), sec, bars, cost_pct=cost_pct) if bars else {
+                        "gross": gross,
+                        "net": net,
+                        "mfe": max(0.0, gross),
+                        "mae": min(0.0, gross),
+                        "hit_target": gross >= 0.0025,
+                        "time_to_target": None,
+                        "time_to_adverse": None,
+                    }
                     sets.append(f"{prefix}_net=?")
-                    vals.append(net)
+                    vals.append(path["net"])
                     sets.append(f"{prefix}_mfe=?")
-                    vals.append(max(0.0, gross))
+                    vals.append(path["mfe"])
                     sets.append(f"{prefix}_mae=?")
-                    vals.append(min(0.0, gross))
+                    vals.append(path["mae"])
+                    labels[str(sec)] = path
+            if labels != existing_labels:
+                sets.append("horizon_labels_json=?")
+                vals.append(json.dumps(labels, default=str))
             complete = age >= 1200 and all(row[f"{col[s]}_net"] is not None or age >= s for s in HORIZONS_SEC)
             if complete:
                 sets.append("labeled=1")

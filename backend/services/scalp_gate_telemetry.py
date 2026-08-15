@@ -14,6 +14,8 @@ from backend.services.scalp_gate_registry import DECISION_POLICY_VERSION, get_ga
 
 logger = logging.getLogger(__name__)
 
+_SCHEMA_READY: set[str] = set()
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS scalp_gate_counters (
     date TEXT NOT NULL,
@@ -68,10 +70,20 @@ def _utc_now() -> str:
 
 
 def ensure_scalp_gate_schema(db_path: str | Path) -> None:
-    conn = sqlite3.connect(str(db_path), timeout=30)
+    path = str(db_path)
+    if path in _SCHEMA_READY:
+        return
+    conn = sqlite3.connect(path, timeout=2)
     try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scalp_gate_counters'"
+        ).fetchone()
+        if exists:
+            _SCHEMA_READY.add(path)
+            return
         conn.executescript(SCHEMA_SQL)
         conn.commit()
+        _SCHEMA_READY.add(path)
     finally:
         conn.close()
 
@@ -101,7 +113,7 @@ def record_gate_event(
             "sized_down": 1 if outcome == "sized_down" else 0,
             "rank_penalized": 1 if outcome == "rank_penalized" else 0,
         }
-        conn = sqlite3.connect(str(db_path), timeout=30)
+        conn = sqlite3.connect(str(db_path), timeout=0.15)
         try:
             conn.execute(
                 """

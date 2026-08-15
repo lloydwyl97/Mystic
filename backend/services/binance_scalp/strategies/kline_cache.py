@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -170,6 +171,7 @@ class KlineCache:
         self._ttl = ttl_sec
         self._ttl_1h = ttl_1h_sec
         self._cache: dict[str, tuple[float, list[dict]]] = {}
+        self._lock = threading.Lock()
 
     def _get_interval(
         self,
@@ -183,11 +185,13 @@ class KlineCache:
         key = f"{sym}:{interval}:{minutes}"
         now = time.time()
         ttl = ttl_sec if ttl_sec is not None else self._ttl
-        hit = self._cache.get(key)
-        if hit and (now - hit[0]) < ttl:
-            return hit[1]
+        with self._lock:
+            hit = self._cache.get(key)
+            if hit and (now - hit[0]) < ttl:
+                return hit[1]
         bars = fetch_bars(sym, interval, minutes=minutes)
-        self._cache[key] = (now, bars)
+        with self._lock:
+            self._cache[key] = (now, bars)
         return bars
 
     def get(self, symbol: str, *, minutes: int = DEFAULT_1M_LOOKBACK_MINUTES) -> list[dict]:

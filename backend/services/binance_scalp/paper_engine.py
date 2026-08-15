@@ -605,7 +605,12 @@ class BinanceScalpPaperEngine:
             logger.warning("[SCALP_CIRCUIT_BREAKER] Check failed (non-blocking): %s", e)
         return False
 
-    def _entry_candidates(self, conn: sqlite3.Connection) -> list[tuple[str, MarketSnapshot, object]]:
+    def _entry_candidates(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        pre_ranked: list[dict] | None = None,
+    ) -> list[tuple[str, MarketSnapshot, object]]:
         if not self.config.scalp_paper_enabled:
             self._publish_last_decision(decision="BLOCKED", reason=SCALP_PAPER_DISABLED)
             return []
@@ -621,17 +626,20 @@ class BinanceScalpPaperEngine:
         # (exactly parallel to how the day all-weather engine replaced the old router
         # when ALLWEATHER_ENGINE_ENABLED=true).
         ranked: list[dict] = []
-        try:
-            from backend.services.binance_scalp import scalp_signal_engine as _se
+        if pre_ranked is not None:
+            ranked = list(pre_ranked)
+        else:
+            try:
+                from backend.services.binance_scalp import scalp_signal_engine as _se
 
-            if _se.scalp_signal_engine_enabled():
-                _se.bind_paper_engine(router=self._router, momentum=self._momentum, klines=self._klines)
+                if _se.scalp_signal_engine_enabled():
+                    _se.bind_paper_engine(router=self._router, momentum=self._momentum, klines=self._klines)
+                    ranked = self._router.evaluate_all(epoch=epoch, notional_usd=notional) or []
+            except Exception:
+                ranked = []
+
+            if not ranked:
                 ranked = self._router.evaluate_all(epoch=epoch, notional_usd=notional) or []
-        except Exception:
-            ranked = []
-
-        if not ranked:
-            ranked = self._router.evaluate_all(epoch=epoch, notional_usd=notional) or []
 
         self._pending_opportunity_rows = ranked
         self._pending_opportunity_epoch = epoch
@@ -837,7 +845,7 @@ class BinanceScalpPaperEngine:
         )
         return [(sym, snap, sig)]
 
-    def _try_entry(self, conn: sqlite3.Connection) -> None:
+    def _try_entry(self, conn: sqlite3.Connection, *, pre_ranked: list[dict] | None = None) -> None:
         open_count = conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0]
         pending_slots = len(self._entry_reservations)
         if open_count + pending_slots >= self.config.max_open_positions:
@@ -847,7 +855,7 @@ class BinanceScalpPaperEngine:
         breaker_open = self._check_scalp_circuit_breaker()
         self._last_circuit_breaker_open = bool(breaker_open)
         # Measure and store every cycle even when the breaker blocks execution.
-        candidates = self._entry_candidates(conn)
+        candidates = self._entry_candidates(conn, pre_ranked=pre_ranked)
         if breaker_open:
             self._publish_last_decision(decision="BLOCKED", reason="SCALP_CIRCUIT_BREAKER_OPEN")
             self._record_gate(gate_id="SCALP_CIRCUIT_BREAKER", reason="SCALP_CIRCUIT_BREAKER_OPEN")
@@ -1878,10 +1886,9 @@ class BinanceScalpPaperEngine:
                 entry_blocked_reason=blocked,
                 snapshot_source="runner_tick_start",
             )
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            post_commit: list = []
-            if not self.config.scalp_paper_enabled:
+        if not self.config.scalp_paper_enabled:
+            with self._conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 for sym in self.config.products:
                     self._write_signal(
                         sym,
@@ -1895,27 +1902,45 @@ class BinanceScalpPaperEngine:
                     )
                 self._publish_last_decision(decision="BLOCKED", reason=SCALP_PAPER_DISABLED)
                 conn.commit()
-                return
+            return
 
-            if not self.econ.is_fee_model_verified():
+        if not self.econ.is_fee_model_verified():
+            with self._conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 for sym in self.config.products:
                     self._record_reject(conn, sym, "BUY", FEE_MODEL_UNVERIFIED, "fee model not verified")
                 self._publish_last_decision(decision="BLOCKED", reason=FEE_MODEL_UNVERIFIED)
                 conn.commit()
-                return
+            return
 
-            _, epoch = self._now()
-            for sym in self.config.products:
-                snap = self.reader.read(sym)
-                if snap is None:
-                    continue
-                self._record_momentum(snap)
-                self._write_market_cache(snap)
-                bars = self._klines.get(sym)
-                regime = self._router._current_regime(sym, epoch, bars)
-                self._seed_scalp_market_memory(sym, snap, micro_regime=regime)
-                self._publish_scan_snapshot(sym, snap, micro_regime=regime, epoch=epoch)
+        _, epoch = self._now()
+        for sym in self.config.products:
+            snap = self.reader.read(sym)
+            if snap is None:
+                continue
+            self._record_momentum(snap)
+            self._write_market_cache(snap)
+            bars = self._klines.get(sym)
+            regime = self._router._current_regime(sym, epoch, bars)
+            self._seed_scalp_market_memory(sym, snap, micro_regime=regime)
+            self._publish_scan_snapshot(sym, snap, micro_regime=regime, epoch=epoch)
 
+        notional = float(self.config.max_notional_paper)
+        with contextlib.suppress(Exception):
+            with self._conn() as _cash:
+                notional = min(notional, float(self._ledger(_cash)["cash_balance"]))
+        pre_ranked: list[dict] = []
+        try:
+            pre_ranked = self._router.evaluate_all(epoch=epoch, notional_usd=notional) or []
+        except Exception:
+            logger.exception("SCALP_EVALUATE_ALL_FAILED")
+            pre_ranked = []
+        self._pending_opportunity_rows = pre_ranked
+        self._pending_opportunity_epoch = epoch
+
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            post_commit: list = []
             open_rows = self._open_positions(conn)
             entry_blocked: str | None = None
             for row in open_rows:
@@ -1923,7 +1948,7 @@ class BinanceScalpPaperEngine:
             open_count = conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0]
             if open_count < self.config.max_open_positions:
                 before_rejects = conn.execute("SELECT COUNT(*) FROM scalp_rejects").fetchone()[0]
-                self._try_entry(conn)
+                self._try_entry(conn, pre_ranked=pre_ranked)
                 after_rejects = conn.execute("SELECT COUNT(*) FROM scalp_rejects").fetchone()[0]
                 if after_rejects > before_rejects:
                     last = conn.execute("SELECT reason FROM scalp_rejects ORDER BY id DESC LIMIT 1").fetchone()

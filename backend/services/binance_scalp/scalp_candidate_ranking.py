@@ -4,8 +4,24 @@ from __future__ import annotations
 
 import contextlib
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any
+
+_LEARN_CACHE: dict[str, tuple[float, Any]] = {}
+_LEARN_CACHE_TTL_SEC = 30.0
+
+
+def _learn_cache_get(key: str):
+    hit = _LEARN_CACHE.get(key)
+    if hit and hit[0] > time.time():
+        return True, hit[1]
+    return False, None
+
+
+def _learn_cache_set(key: str, value: Any) -> Any:
+    _LEARN_CACHE[key] = (time.time() + _LEARN_CACHE_TTL_SEC, value)
+    return value
 
 from backend.services.binance_scalp.scalp_regime_classifier import STRATEGY_NATIVE_REGIMES
 from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, StrategyMarketContext
@@ -395,24 +411,37 @@ def rank_setup_signal(
         live_ctx_adj = round(max(-0.04, min(0.04, _raw_delta * (0.04 / 0.06))), 5)
 
         _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
-        _stats = _gls(_db, sig.symbol, "scalp")
+        stats_key = f"gls:{sig.symbol}:scalp"
+        hit, cached_stats = _learn_cache_get(stats_key)
+        if hit:
+            _stats = cached_stats
+        else:
+            _stats = _learn_cache_set(stats_key, _gls(_db, sig.symbol, "scalp"))
         role_samples = _stats.sample_count
         role_conf_status = _stats.confidence_status
         learned_adj = round(max(-0.02, min(0.02, _stats.learned_adjustment)), 5)
         with contextlib.suppress(Exception):
             from backend.services.trade_learning_writer import consume_setup_outcomes_for_ranking
 
-            _learned = consume_setup_outcomes_for_ranking(
-                _db,
-                sig.setup_name,
-                features={
-                    "volatility": getattr(ctx.mom, "realized_volatility_pct", None),
-                    "momentum": getattr(ctx.mom, "mid_change_60s", None),
-                    "regime": regime,
-                    "model_probability": sig.confidence,
-                    "market_regime": regime,
-                },
-            )
+            consume_key = f"consume:{sig.setup_name}"
+            hit_c, cached_learned = _learn_cache_get(consume_key)
+            if hit_c:
+                _learned = cached_learned
+            else:
+                _learned = _learn_cache_set(
+                    consume_key,
+                    consume_setup_outcomes_for_ranking(
+                        _db,
+                        sig.setup_name,
+                        features={
+                            "volatility": getattr(ctx.mom, "realized_volatility_pct", None),
+                            "momentum": getattr(ctx.mom, "mid_change_60s", None),
+                            "regime": regime,
+                            "model_probability": sig.confidence,
+                            "market_regime": regime,
+                        },
+                    ),
+                )
             if _learned.get("consumed") and int(_learned.get("n") or 0) >= 8:
                 learned_adj = round(
                     max(-0.04, min(0.04, learned_adj + float(_learned.get("rank_delta") or 0.0))),
