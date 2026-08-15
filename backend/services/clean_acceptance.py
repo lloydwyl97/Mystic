@@ -1,7 +1,8 @@
 """Canonical clean-sample queries for DAY and SCALP acceptance.
 
 Never compare mixed timestamp formats as raw strings.
-Never move the stored cutoff. Never delete history.
+Never delete history. The stored cutoff moves only when the operator
+explicitly marks a new clean-sample start.
 """
 
 from __future__ import annotations
@@ -17,8 +18,8 @@ from backend.services.validation_cutoff import (
     read_validation_cutoff,
 )
 
-DAY_CUTOFF_UTC = "2026-08-14T23:11:24.128567+00:00"
-SCALP_CUTOFF_UTC = "2026-08-14T23:11:32.101152+00:00"
+DAY_CUTOFF_UTC = "2026-08-15T02:03:02.291353+00:00"
+SCALP_CUTOFF_UTC = "2026-08-15T02:03:02.291353+00:00"
 
 
 def parse_ts(raw: Any) -> datetime | None:

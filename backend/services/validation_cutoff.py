@@ -98,15 +98,70 @@ def ensure_validation_cutoff(db_path: str | Path, *, engine: str, repo_root: str
         conn.close()
 
 
+def replace_validation_cutoff(
+    db_path: str | Path,
+    *,
+    engine: str,
+    label: str,
+    cutoff_utc: str,
+    repo_root: str | None = None,
+    note: str = "User-marked clean-sample start. Earlier rows stay in the book and are not acceptance.",
+) -> dict[str, Any]:
+    """Overwrite the stored cutoff. Only when the operator explicitly marks a new start."""
+    path = str(db_path)
+    root = repo_root or str(Path(path).resolve().parent)
+    sha = _git_sha(root)
+    conn = sqlite3.connect(path, timeout=15)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executescript(_SCHEMA)
+        prior = conn.execute(f"SELECT label, cutoff_utc, git_sha FROM {CUTOFF_TABLE} WHERE id=1").fetchone()
+        conn.execute(
+            f"""
+            INSERT INTO {CUTOFF_TABLE} (id, label, cutoff_utc, git_sha, engine, note)
+            VALUES (1, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                label=excluded.label,
+                cutoff_utc=excluded.cutoff_utc,
+                git_sha=excluded.git_sha,
+                engine=excluded.engine,
+                note=excluded.note
+            """,
+            (label, cutoff_utc, sha, engine, note),
+        )
+        conn.commit()
+        logger.critical(
+            "VALIDATION_CUTOFF_REPLACED engine=%s label=%s cutoff_utc=%s prior=%s git_sha=%s db=%s",
+            engine,
+            label,
+            cutoff_utc,
+            (prior[1] if prior else None),
+            sha,
+            path,
+        )
+        return {
+            "label": label,
+            "cutoff_utc": cutoff_utc,
+            "git_sha": sha,
+            "engine": engine,
+            "prior_cutoff_utc": prior[1] if prior else None,
+            "replaced": True,
+        }
+    except Exception:
+        conn.rollback()
+        logger.exception("VALIDATION_CUTOFF_REPLACE_FAILED engine=%s db=%s", engine, path)
+        raise
+    finally:
+        conn.close()
+
+
 def read_validation_cutoff(db_path: str | Path) -> dict[str, Any] | None:
     path = str(db_path)
     if not Path(path).exists():
         return None
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
     try:
-        row = conn.execute(
-            f"SELECT label, cutoff_utc, git_sha, engine, note FROM {CUTOFF_TABLE} WHERE id=1"
-        ).fetchone()
+        row = conn.execute(f"SELECT label, cutoff_utc, git_sha, engine, note FROM {CUTOFF_TABLE} WHERE id=1").fetchone()
         if not row:
             return None
         return {
