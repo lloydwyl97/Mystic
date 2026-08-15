@@ -55,6 +55,7 @@ def test_stall_exit_defaults_cut_before_three_quarter_hold(monkeypatch):
 
 
 def test_stall_before_max_hold_fires_near_half_ceiling(monkeypatch):
+    monkeypatch.setenv("SCALP_PATH_AWARE_EXIT", "false")
     monkeypatch.setenv("SCALP_HOLD_MAX_MINUTES", "20")
     monkeypatch.setenv("SCALP_STALL_EXIT_HOLD_FRAC", "0.50")
     monkeypatch.setenv("SCALP_STALL_EXIT_MIN_SEC", "600")

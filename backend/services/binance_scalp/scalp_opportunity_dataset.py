@@ -94,7 +94,13 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     plus_600s_mae REAL,
     plus_1200s_mae REAL,
     labeled INTEGER NOT NULL DEFAULT 0,
-    horizon_labels_json TEXT NOT NULL DEFAULT '{{}}'
+    horizon_labels_json TEXT NOT NULL DEFAULT '{{}}',
+    predicted_net_ev REAL,
+    predicted_prob_positive_net REAL,
+    predicted_mfe REAL,
+    predicted_mae REAL,
+    predicted_horizon TEXT,
+    model_version TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -106,6 +112,16 @@ def ensure_opportunity_table(db_path: str, conn: sqlite3.Connection | None = Non
         cols = {str(r[1]) for r in c.execute(f"PRAGMA table_info({TABLE})")}
         if "horizon_labels_json" not in cols:
             c.execute(f"ALTER TABLE {TABLE} ADD COLUMN horizon_labels_json TEXT NOT NULL DEFAULT '{{}}'")
+        for col, spec in (
+            ("predicted_net_ev", "REAL"),
+            ("predicted_prob_positive_net", "REAL"),
+            ("predicted_mfe", "REAL"),
+            ("predicted_mae", "REAL"),
+            ("predicted_horizon", "TEXT"),
+            ("model_version", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if col not in cols:
+                c.execute(f"ALTER TABLE {TABLE} ADD COLUMN {col} {spec}")
 
     if conn is not None:
         _apply(conn)
@@ -148,8 +164,10 @@ def record_opportunity_cycle(
                 INSERT INTO {TABLE}
                 (created_at, epoch, symbol, mid, spread_pct, impact_pct, regime,
                  best_setup, best_passed, best_reject, rank_score,
-                 measurements_json, signals_json, feature_vector_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 measurements_json, signals_json, feature_vector_json,
+                 predicted_net_ev, predicted_prob_positive_net, predicted_mfe,
+                 predicted_mae, predicted_horizon, model_version)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     now,
@@ -166,6 +184,12 @@ def record_opportunity_cycle(
                     json.dumps(meta.get("setup_measurements") or {}, default=str),
                     compact_signals_json(row.get("all_signals") or []),
                     compact_feature_vector_json((row.get("rank_meta") or {}).get("feature_vector") or []),
+                    row.get("expected_net_ev"),
+                    row.get("predicted_prob_positive_net"),
+                    row.get("expected_mfe"),
+                    row.get("expected_mae"),
+                    row.get("expected_hold"),
+                    str(row.get("forward_net_model_version") or ""),
                 ),
             )
             written += 1

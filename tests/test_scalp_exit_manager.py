@@ -15,6 +15,7 @@ from backend.services.binance_scalp.economics import ScalpEconomics
 from backend.services.binance_scalp.exit_manager import (
     EXIT_EARLY_SCRATCH,
     EXIT_MAX_HOLD_HARD_LIMIT,
+    EXIT_PATH_EXECUTABLE_PROFIT,
     PositionTrack,
     STATE_OPEN,
     _effective_scratch_min_reviews,
@@ -51,7 +52,8 @@ def _flat_mom() -> MomentumDiagnostics:
     )
 
 
-def test_early_scratch_on_stalled_flat_position():
+def test_early_scratch_on_stalled_flat_position(monkeypatch):
+    monkeypatch.setenv("SCALP_PATH_AWARE_EXIT", "false")
     econ = ScalpEconomics.from_env()
     config = get_scalp_config()
     entry = 100.0
@@ -84,7 +86,8 @@ def test_early_scratch_on_stalled_flat_position():
     assert review.exit_reason == EXIT_EARLY_SCRATCH
 
 
-def test_stall_before_max_hold_not_at_hard_ceiling():
+def test_stall_before_max_hold_not_at_hard_ceiling(monkeypatch):
+    monkeypatch.setenv("SCALP_PATH_AWARE_EXIT", "false")
     econ = ScalpEconomics.from_env()
     config = get_scalp_config()
     entry = 100.0
@@ -152,7 +155,8 @@ def test_early_scratch_exit_fires_sooner_with_hold_ev_reduction():
     assert reason
 
 
-def test_evaluate_exit_applies_hold_ev_scratch_reduction_end_to_end():
+def test_evaluate_exit_applies_hold_ev_scratch_reduction_end_to_end(monkeypatch):
+    monkeypatch.setenv("SCALP_PATH_AWARE_EXIT", "false")
     """Full evaluate_exit wiring: a position that would NOT scratch on its
     own stale-review count does scratch once HoldEV strongly disfavors
     continuing to hold, and does not exceed what the underlying scratch
@@ -194,3 +198,74 @@ def test_evaluate_exit_applies_hold_ev_scratch_reduction_end_to_end():
     assert tightened.decision == "SELL"
     assert tightened.exit_reason == EXIT_EARLY_SCRATCH
     assert tightened.diagnostics.get("hold_ev_scratch_review_reduction") == 1
+
+
+def _path_track(entry: float = 100.0, bid: float = 99.98) -> PositionTrack:
+    return PositionTrack(
+        entry_price=entry,
+        state=STATE_OPEN,
+        max_favorable_pct=0.00001,
+        max_adverse_pct=0.0002,
+        session_low_bid=bid,
+        stale_review_count=4,
+        review_lows=(bid, bid, bid),
+        setup_name="vwap_ema_reclaim",
+        setup_context={"soft_rank_entry": True},
+    )
+
+
+def test_path_aware_takes_first_executable_profit(monkeypatch):
+    monkeypatch.setenv("SCALP_PATH_AWARE_EXIT", "true")
+    review = evaluate_exit(
+        track=_path_track(100.0, 100.08),
+        snap=_Snap("BTCUSDT", 100.08),
+        mom=_flat_mom(),
+        econ=ScalpEconomics.from_env(),
+        config=get_scalp_config(),
+        trade_id="path-tp",
+        hold_sec=45.0,
+        executable_net_pct=0.0004,
+        profit_hit=False,
+        exit_spread_ok=True,
+        perform_review=True,
+    )
+    assert review.decision == "SELL"
+    assert review.exit_reason == EXIT_PATH_EXECUTABLE_PROFIT
+
+
+def test_path_aware_does_not_scratch_flat_loser(monkeypatch):
+    monkeypatch.setenv("SCALP_PATH_AWARE_EXIT", "true")
+    review = evaluate_exit(
+        track=_path_track(),
+        snap=_Snap("ETHUSDT", 99.98),
+        mom=_flat_mom(),
+        econ=ScalpEconomics.from_env(),
+        config=get_scalp_config(),
+        trade_id="path-hold",
+        hold_sec=610.0,
+        executable_net_pct=-0.0003,
+        profit_hit=False,
+        exit_spread_ok=True,
+        perform_review=True,
+    )
+    assert review.decision == "HOLD"
+    assert review.reason == "path_awaiting_executable_profit"
+
+
+def test_path_aware_holds_all_four_symbols(monkeypatch):
+    monkeypatch.setenv("SCALP_PATH_AWARE_EXIT", "true")
+    for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"):
+        review = evaluate_exit(
+            track=_path_track(),
+            snap=_Snap(sym, 99.98),
+            mom=_flat_mom(),
+            econ=ScalpEconomics.from_env(),
+            config=get_scalp_config(),
+            trade_id=f"path-{sym}",
+            hold_sec=200.0,
+            executable_net_pct=-0.0002,
+            profit_hit=False,
+            exit_spread_ok=True,
+            perform_review=False,
+        )
+        assert review.decision == "HOLD", sym

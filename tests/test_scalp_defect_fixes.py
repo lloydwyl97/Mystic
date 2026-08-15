@@ -47,6 +47,10 @@ class _Tracker:
 
 
 def test_status_uses_enriched_global_pick_and_only_marks_selected_symbol(monkeypatch):
+    monkeypatch.setenv("SCALP_FORWARD_NET_ARTIFACT", "/tmp/missing_scalp_artifact.json")
+    from backend.services.binance_scalp.forward_net_predictor import reset_artifact_cache
+
+    reset_artifact_cache()
     rows = []
     for symbol, score in (("BTCUSDT", 1.8), ("SOLUSDT", 1.7)):
         signal = _Signal(symbol, score)

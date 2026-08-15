@@ -28,12 +28,30 @@ EXIT_MAX_HOLD_HARD_LIMIT = "MAX_HOLD_HARD_LIMIT"
 # reaching +0.15%+ then giving it all back and eventually hitting MAX_HOLD
 # for a small loss — which is what the 14-sell history showed.
 EXIT_MICRO_TP = "MICRO_TP_LOCK"
+EXIT_PATH_EXECUTABLE_PROFIT = "PATH_EXECUTABLE_PROFIT"
 
 DECISION_HOLD = "HOLD"
 DECISION_SELL = "SELL"
+PATH_AWARE_POLICY = "scalp_path_aware_v1"
 
 RECOVERY_MIN_PCT = 0.00012
 HIGHER_LOWS_MIN_REVIEWS = 2
+
+
+def _path_aware_exit_enabled() -> bool:
+    """Take first executable net; hold losers to the realization horizon.
+
+    This is an exit policy, not an entry gate. Scratch/stall opinion exits
+    are skipped so a later favorable print can still be taken.
+    """
+    return os.getenv("SCALP_PATH_AWARE_EXIT", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _path_min_executable_net_pct() -> float:
+    try:
+        return float(os.getenv("SCALP_PATH_MIN_EXECUTABLE_NET_PCT", "0.0001"))
+    except (TypeError, ValueError):
+        return 0.0001
 
 
 def _review_interval_sec() -> int:
@@ -444,6 +462,24 @@ def evaluate_exit(
 
     if profit_hit:
         return _sell(STATE_OPEN, "profit_target_met", EXIT_NET_PROFIT_TARGET)
+
+    if _path_aware_exit_enabled():
+        diag_base["exit_policy"] = PATH_AWARE_POLICY
+        if executable_net_pct > _path_min_executable_net_pct():
+            return _sell(STATE_OPEN, "path_first_executable_profit", EXIT_PATH_EXECUTABLE_PROFIT)
+        mtp, mtp_reason = _micro_tp_exit(
+            max_fav=max_fav,
+            fav=fav,
+            executable_net_pct=executable_net_pct,
+            hold_sec=hold_sec,
+        )
+        if mtp:
+            diag_base["micro_tp_trigger_detail"] = mtp_reason
+            return _sell(STATE_OPEN, mtp_reason, EXIT_MICRO_TP)
+        hard = _max_hold_hard_sec(econ)
+        if hold_sec >= hard:
+            return _sell(STATE_MAX_HOLD_REVIEW, f"path_horizon_{hard}s", EXIT_MAX_HOLD_HARD_LIMIT)
+        return _hold(STATE_OPEN, "path_awaiting_executable_profit")
 
     # Micro-TP: book any position that reached the arm threshold and gave back
     # a configurable share of MFE from peak. This is what turns "MFE=+0.20%

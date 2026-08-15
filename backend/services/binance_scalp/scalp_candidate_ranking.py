@@ -751,7 +751,18 @@ def candidate_expected_gross_pct(row: dict[str, Any]) -> float:
 
 
 def candidate_expected_net_ev(row: dict[str, Any]) -> float:
-    """BUY expected net after costs. HOLD is a separate action with EV=0."""
+    """BUY expected net after costs. HOLD is a separate action with EV=0.
+
+    If an accepted forward-net artifact is loaded, use its already-net
+    prediction. Otherwise fall back to claimed gross minus costs.
+    This is not a threshold gate.
+    """
+    with contextlib.suppress(Exception):
+        from backend.services.binance_scalp.forward_net_predictor import predict_row_expected_net
+
+        predicted = predict_row_expected_net(row)
+        if predicted is not None:
+            return float(predicted)
     return candidate_expected_gross_pct(row) - candidate_roundtrip_cost_pct(row)
 
 
@@ -787,7 +798,7 @@ def attach_action_predictions(row: dict[str, Any]) -> dict[str, Any]:
             expected_hold = mid.get("bucket")
     gross = candidate_expected_gross_pct(row)
     cost = candidate_roundtrip_cost_pct(row)
-    ev = gross - cost
+    ev = candidate_expected_net_ev(row)
     row["expected_gross_move"] = round(gross, 8)
     row["roundtrip_cost_pct"] = round(cost, 8)
     row["expected_net_ev"] = round(ev, 8)
@@ -798,6 +809,25 @@ def attach_action_predictions(row: dict[str, Any]) -> dict[str, Any]:
     row["expected_hold"] = expected_hold
     row["hold_action_ev"] = HOLD_ACTION_EV
     row["action_name"] = f"BUY_{row.get('symbol')}"
+    row["forward_net_model_version"] = ""
+    with contextlib.suppress(Exception):
+        from backend.services.binance_scalp.forward_net_predictor import load_accepted_artifact
+
+        art = load_accepted_artifact()
+        if art is not None:
+            row["forward_net_model_version"] = art.version
+            feats = {}
+            meta = row.get("rank_meta") or {}
+            meas = meta.get("setup_measurements") or row.get("setup_measurements") or {}
+            if meas:
+                from backend.services.binance_scalp.forward_net_predictor import (
+                    flatten_measurements,
+                    predict_artifact,
+                )
+
+                feats = flatten_measurements(meas, live_book=True)
+                pred = predict_artifact(art, feats)
+                row["predicted_prob_positive_net"] = round(float(pred["predicted_prob_positive_net"]), 4)
     return row
 
 

@@ -197,6 +197,21 @@ class ScalpStrategyRouter:
         stage_ms["measure_all_setups"] = round((time.perf_counter() - t_meas) * 1000.0, 1)
         meta["setup_measurements"] = measurements
         meta["measured_strategies"] = list(measurements.keys())
+        compact_bars = []
+        for bar in list(bars or [])[-30:]:
+            if not isinstance(bar, dict):
+                continue
+            compact_bars.append(
+                {
+                    "open": float(bar.get("open") or 0),
+                    "high": float(bar.get("high") or 0),
+                    "low": float(bar.get("low") or 0),
+                    "close": float(bar.get("close") or 0),
+                    "volume": float(bar.get("volume") or 0),
+                    "ts": bar.get("ts"),
+                }
+            )
+        meta["bars_1m"] = compact_bars
 
         enabled_names = {s.name for s in enabled_strategies(self.config)}
         # Measure every module every cycle. Disabled modules stay out of the
@@ -336,7 +351,7 @@ class ScalpStrategyRouter:
         meta["strategy_passed"] = bool(best_ranked.signal.passed)
         meta["entry_owner"] = "strategy" if best_ranked.signal.passed else "ranking_ev"
         meta["ml_role"] = "rank_size"
-        meta["decision_policy_version"] = "scalp_hold_as_action_v1"
+        meta["decision_policy_version"] = "scalp_path_aware_v1"
 
         meta["stage_ms"] = stage_ms
         if entry_eligible:
