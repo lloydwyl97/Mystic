@@ -1070,6 +1070,23 @@ class BinanceScalpPaperEngine:
         except Exception:
             _role_ctx_snap = "{}"
         entry_diag["context_snapshot_json"] = _role_ctx_snap
+        _scalp_prov: dict = {}
+        with contextlib.suppress(Exception):
+            from backend.services.entry_decision_authority import build_scalp_entry_provenance
+
+            _feat_fp = ""
+            _vec = (ranking_meta.get("rank_meta") or {}).get("feature_vector") or entry_intel.get("entry_scalp_vector") or []
+            if _vec:
+                _feat_fp = ",".join(str(round(float(x), 6)) for x in list(_vec)[:12])
+            _scalp_prov = build_scalp_entry_provenance(
+                ranking_meta=ranking_meta,
+                symbol=sym,
+                setup_name=sig.setup_name,
+                strategy_passed=strategy_passed,
+                epoch=epoch,
+                feature_fingerprint=_feat_fp,
+            )
+            entry_diag.update(_scalp_prov)
 
         try:
             conn.execute(
@@ -1100,7 +1117,7 @@ class BinanceScalpPaperEngine:
                             "entry_eligible": True,
                             "entry_owner": "strategy" if strategy_passed else "ranking_ev",
                             "ml_role": "rank_size",
-                            "decision_policy_version": "scalp_path_aware_v1",
+                            "decision_policy_version": _scalp_prov.get("entry_policy_version") or "scalp_path_aware_v1",
                             "bar_closed": True,
                             "setup_name": sig.setup_name,
                             "rank_score": ranking_meta.get("rank_score"),
@@ -1114,6 +1131,7 @@ class BinanceScalpPaperEngine:
                             "predicted_mae": ranking_meta.get("selected_expected_mae"),
                             "predicted_horizon": ranking_meta.get("selected_expected_hold"),
                             "forward_net_model_version": ranking_meta.get("forward_net_model_version") or "",
+                            **_scalp_prov,
                         }
                     ),
                 ),
@@ -1350,6 +1368,10 @@ class BinanceScalpPaperEngine:
             "scalp_setup": entry_diag.get("scalp_setup"),
             "micro_regime": entry_diag.get("micro_regime"),
         }
+        from backend.services.entry_decision_authority import copy_entry_provenance
+
+        sell_diag = copy_entry_provenance(entry_diag, sell_diag)
+        sell_diag = copy_entry_provenance(buy_diag, sell_diag)
 
         conn.execute(
             """

@@ -13,6 +13,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from backend.services.binance_scalp.historical_forensic import _parse_ts
+from backend.services.entry_decision_authority import (
+    extract_provenance,
+    is_model_controlled,
+    summarize_book,
+)
 from backend.services.validation_cutoff import (
     is_strategy_acceptance_eligible,
     read_validation_cutoff,
@@ -57,15 +62,36 @@ def day_clean_rows(db_path: str) -> dict[str, Any]:
     cut = cutoff_dt(db_path, fallback=DAY_CUTOFF_UTC)
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(paper_trades)")}
+    created_col = "created_at" if "created_at" in cols else "timestamp"
     sells = list(
         conn.execute(
-            """
-            SELECT id, trade_id, symbol, pnl, created_at, timestamp, entry_timestamp,
+            f"""
+            SELECT id, trade_id, symbol, pnl, {created_col} AS created_at, timestamp, entry_timestamp,
                    exit_reason, explainability_json
             FROM paper_trades WHERE UPPER(side)='SELL' ORDER BY id
             """
         )
     )
+    buys = list(
+        conn.execute(
+            """
+            SELECT trade_id, entry_timestamp, explainability_json
+            FROM paper_trades WHERE UPPER(side)='BUY'
+            """
+        )
+    )
+    buy_by_entry: dict[str, dict[str, Any]] = {}
+    buy_by_tid: dict[str, dict[str, Any]] = {}
+    for b in buys:
+        try:
+            payload = json.loads(b["explainability_json"] or "{}")
+        except Exception:
+            payload = {}
+        if b["entry_timestamp"]:
+            buy_by_entry[str(b["entry_timestamp"])] = payload
+        if b["trade_id"]:
+            buy_by_tid[str(b["trade_id"])] = payload
     open_pos = []
     try:
         open_pos = list(conn.execute("SELECT symbol, quantity, entry_price, trade_id, status FROM portfolio_engine_positions WHERE status='ACTIVE'"))
@@ -79,6 +105,14 @@ def day_clean_rows(db_path: str) -> dict[str, Any]:
     for r in sells:
         entry = parse_ts(r["entry_timestamp"])
         exit_t = parse_ts(r["timestamp"]) or parse_ts(r["created_at"])
+        try:
+            sell_ex = json.loads(r["explainability_json"] or "{}")
+        except Exception:
+            sell_ex = {}
+        buy_ex = buy_by_tid.get(str(r["trade_id"] or "")) or buy_by_entry.get(str(r["entry_timestamp"] or "")) or {}
+        merged = dict(buy_ex)
+        if isinstance(sell_ex, dict):
+            merged.update({k: v for k, v in sell_ex.items() if v not in (None, "")})
         eligible = _eligible(r["exit_reason"], r["id"], r["explainability_json"])
         rec = {
             "id": r["id"],
@@ -93,6 +127,12 @@ def day_clean_rows(db_path: str) -> dict[str, Any]:
             "sell_after_cutoff": bool(exit_t and exit_t >= cut),
             "strategy_acceptance_eligible": eligible,
             "clean": bool(entry and entry >= cut and eligible),
+            "model_controlled": is_model_controlled(merged, engine="day"),
+            "entry_policy_version": merged.get("entry_policy_version"),
+            "model_version": merged.get("model_version") or merged.get("forward_net_model_version"),
+            "selected_action": merged.get("selected_action"),
+            "selection_reason": merged.get("selection_reason"),
+            "provenance": extract_provenance(merged),
         }
         if rec["sell_after_cutoff"]:
             post_exit.append(rec)
@@ -104,24 +144,17 @@ def day_clean_rows(db_path: str) -> dict[str, Any]:
             historical_string_trap.append(rec)
 
     def _summ(rows: list[dict[str, Any]]) -> dict[str, Any]:
-        n = len(rows)
-        wins = sum(1 for x in rows if x["pnl"] > 0)
-        net = sum(x["pnl"] for x in rows)
-        return {
-            "n": n,
-            "wins": wins,
-            "wr": None if n == 0 else round(wins / n, 4),
-            "net": round(net, 4),
-            "expectancy": None if n == 0 else round(net / n, 6),
-            "rows": rows,
-        }
+        return summarize_book(rows)
 
+    model_controlled = [x for x in clean if x.get("model_controlled")]
     return {
         "engine": "day",
         "cutoff_utc": cut.isoformat(),
         "rule": "SELL with parsed entry_timestamp >= cutoff AND not reconciliation/manual-inventory",
         "do_not_use": "raw string compare of ISO timestamp vs 'YYYY-MM-DD HH:MM' (T > space includes all same-day rows)",
         "clean": _summ(clean),
+        "clean_runtime": _summ(clean),
+        "model_controlled": _summ(model_controlled),
         "post_cutoff_exits_including_recon": _summ(post_exit),
         "broken_string_compare_population": _summ(historical_string_trap),
         "open_positions": [dict(r) for r in open_pos],
@@ -157,6 +190,20 @@ def scalp_clean_rows(db_path: str) -> dict[str, Any]:
             """
         )
     )
+    buys = list(
+        conn.execute(
+            """
+            SELECT trade_id, diagnostics_json
+            FROM scalp_paper_trades WHERE UPPER(side)='BUY'
+            """
+        )
+    )
+    buy_by_tid = {}
+    for b in buys:
+        try:
+            buy_by_tid[str(b["trade_id"] or "")] = json.loads(b["diagnostics_json"] or "{}")
+        except Exception:
+            buy_by_tid[str(b["trade_id"] or "")] = {}
     opens = list(conn.execute("SELECT symbol, status, entry_time, trade_id FROM scalp_paper_positions WHERE status='OPEN'"))
     conn.close()
     clean = []
@@ -165,7 +212,12 @@ def scalp_clean_rows(db_path: str) -> dict[str, Any]:
             diag = json.loads(r["diagnostics_json"] or "{}")
         except Exception:
             diag = {}
-        entry = _scalp_entry_dt(str(r["trade_id"] or ""), str(r["created_at"] or ""), diag)
+        buy_tid = str(r["trade_id"] or "").replace("_SELL", "")
+        buy_diag = buy_by_tid.get(buy_tid) or {}
+        merged = dict(buy_diag)
+        if isinstance(diag, dict):
+            merged.update({k: v for k, v in diag.items() if v not in (None, "")})
+        entry = _scalp_entry_dt(str(r["trade_id"] or ""), str(r["created_at"] or ""), merged)
         exit_t = parse_ts(r["created_at"])
         eligible = _eligible(r["exit_reason"], r["id"], diag)
         rec = {
@@ -179,26 +231,26 @@ def scalp_clean_rows(db_path: str) -> dict[str, Any]:
             "buy_after_cutoff": bool(entry and entry >= cut),
             "sell_after_cutoff": bool(exit_t and exit_t >= cut),
             "strategy_acceptance_eligible": eligible,
-            "soft_rank_entry": diag.get("soft_rank_entry"),
+            "soft_rank_entry": merged.get("soft_rank_entry", diag.get("soft_rank_entry")),
             "clean": bool(entry and entry >= cut and eligible),
+            "model_controlled": is_model_controlled(merged, engine="scalp"),
+            "entry_policy_version": merged.get("entry_policy_version") or merged.get("decision_policy_version"),
+            "model_version": merged.get("model_version") or merged.get("forward_net_model_version"),
+            "selected_action": merged.get("selected_action"),
+            "selection_reason": merged.get("selection_reason"),
+            "source_opportunity_id": merged.get("source_opportunity_id"),
+            "provenance": extract_provenance(merged),
         }
         if rec["clean"]:
             clean.append(rec)
 
-    n = len(clean)
-    wins = sum(1 for x in clean if x["pnl"] > 0)
-    net = sum(x["pnl"] for x in clean)
+    model_controlled = [x for x in clean if x.get("model_controlled")]
     return {
         "engine": "scalp",
         "cutoff_utc": cut.isoformat(),
         "rule": "SELL with parsed entry time from trade_id epoch or diagnostics >= cutoff AND not reconciliation",
-        "clean": {
-            "n": n,
-            "wins": wins,
-            "wr": None if n == 0 else round(wins / n, 4),
-            "net": round(net, 4),
-            "expectancy": None if n == 0 else round(net / n, 6),
-            "rows": clean,
-        },
+        "clean": summarize_book(clean),
+        "clean_runtime": summarize_book(clean),
+        "model_controlled": summarize_book(model_controlled),
         "open_positions": [dict(r) for r in opens],
     }

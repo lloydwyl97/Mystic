@@ -1579,7 +1579,7 @@ class TradeExplainability:
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for storage"""
         sym = self.symbol or ""
-        return {
+        out = {
             "trade_id": self.trade_id,
             "symbol": self.symbol,
             "symbol_canonical_no_slash": sym.replace("/", "").upper(),
@@ -1761,6 +1761,10 @@ class TradeExplainability:
             "liquidity_hard_blocked": self.liquidity_hard_blocked,
             "liquidity_hard_block_reason": self.liquidity_hard_block_reason,
         }
+        prov = getattr(self, "entry_provenance", None)
+        if isinstance(prov, dict) and prov:
+            out.update(prov)
+        return out
 
 
 def _stamp_day_bandit_explain(explainability: TradeExplainability, dd: dict[str, Any] | None) -> None:
@@ -14410,6 +14414,19 @@ class PortfolioEngine:
                 _stamp_entry_confirmation_explain(explainability, _dd)
                 _stamp_htf_anchor_explain(explainability, _dd)
                 _stamp_liquidity_gate_explain(explainability, _dd)
+                with contextlib.suppress(Exception):
+                    from backend.services.entry_decision_authority import build_day_entry_provenance
+
+                    explainability.entry_provenance = build_day_entry_provenance(
+                        decision_data=_dd,
+                        symbol=str(symbol or ""),
+                        decision_id=str(getattr(cand, "decision_id", "") or ""),
+                        bar_timestamp=bar_timestamp,
+                        rank_score=explainability.final_selection_score,
+                        why_selected=str(explainability.why_selected or ""),
+                        direction_probability=explainability.prob_buy,
+                        feature_fingerprint=str(explainability.artifact_sha256 or explainability.feature_version or ""),
+                    )
                 if not explainability.entry_thesis:
                     logger.warning(
                         "MULTI_BUY_MISSING_SETUP symbol=%s decision_id=%s dd_keys=%s",
@@ -15941,6 +15958,19 @@ class PortfolioEngine:
             explainability.entry_buy_margin = float(_ebm_bar) if _ebm_bar is not None else None
         except (TypeError, ValueError):
             explainability.entry_buy_margin = None
+        with contextlib.suppress(Exception):
+            from backend.services.entry_decision_authority import build_day_entry_provenance
+
+            explainability.entry_provenance = build_day_entry_provenance(
+                decision_data=top_dd,
+                symbol=str(symbol or ""),
+                decision_id=str(top_candidate.decision_id or ""),
+                bar_timestamp=bar_timestamp,
+                rank_score=top_meta.get("final_selection_score") or top_meta.get("score"),
+                why_selected=str(_dd.get("why_selected") or ""),
+                direction_probability=explainability.prob_buy,
+                feature_fingerprint=str(explainability.artifact_sha256 or explainability.feature_version or ""),
+            )
 
         if POSITION_FIRST_ROUTING_ENABLED and symbol in self.open_positions:
             managed = await self._route_selected_open_position(
