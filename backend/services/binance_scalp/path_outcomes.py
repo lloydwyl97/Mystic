@@ -130,8 +130,7 @@ def all_horizon_path_labels(
     *,
     cost_pct: float = DEFAULT_COST,
     target_pct: float = TARGET_PCT,
+    horizons: tuple[int, ...] | None = None,
 ) -> dict[int, dict[str, Any]]:
-    return {
-        h: path_labels_for_horizon(mid0, future, horizon_min=h, cost_pct=cost_pct, target_pct=target_pct)
-        for h in HORIZONS_MIN
-    }
+    use = horizons if horizons else HORIZONS_MIN
+    return {h: path_labels_for_horizon(mid0, future, horizon_min=h, cost_pct=cost_pct, target_pct=target_pct) for h in use}

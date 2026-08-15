@@ -36,6 +36,102 @@ EXIT_STALL_DEAD = "STALL_EXIT_DEAD_NO_MFE"
 EXIT_GIVEBACK = "GIVEBACK_EXIT"
 EXIT_PROGRESS_DECAY = "PROGRESS_DECAY_EXIT"
 EXIT_ADAPTIVE_LOSS = "ADAPTIVE_LOSS_EXIT"
+EXIT_PATH_EXECUTABLE_PROFIT = "PATH_EXECUTABLE_PROFIT"
+DAY_PATH_AWARE_POLICY = "day_path_aware_v1"
+
+
+def _path_aware_exit_enabled() -> bool:
+    """Take first executable net; hold losers to the realization horizon.
+
+    Exit policy only. Stall / giveback / stop / thesis-red are skipped so a
+    later favorable print can still be taken. Extreme protection stays.
+    """
+    return os.getenv("DAY_PATH_AWARE_EXIT", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _path_min_executable_net_pct() -> float:
+    try:
+        return float(os.getenv("DAY_PATH_MIN_EXECUTABLE_NET_PCT", "0.0001"))
+    except (TypeError, ValueError):
+        return 0.0001
+
+
+def _evaluate_path_aware_exit(
+    *,
+    position: Any,
+    current_price: float,
+    net_pnl_pct: float,
+    hold_minutes: float,
+    coin_profile: dict[str, Any],
+    bundle: dict[str, Any] | None,
+    entry: float,
+    atr_pct: float,
+) -> dict[str, Any]:
+    extreme = evaluate_extreme_protection(
+        entry_price=entry,
+        mark=current_price,
+        net_pnl_pct=net_pnl_pct,
+        atr_pct=atr_pct,
+        bundle=bundle,
+    )
+    if str(extreme.get("action")) == "sell":
+        return {
+            "action": "sell",
+            "reason": EXIT_EXTREME_PROTECTION,
+            "net_pnl_pct": net_pnl_pct,
+            "hold_minutes": hold_minutes,
+        }
+
+    min_exec = _path_min_executable_net_pct()
+    min_net = float(MIN_NET_PROFIT_TO_SELL)
+    if net_pnl_pct + 1e-12 >= min_net:
+        return {
+            "action": "sell",
+            "reason": EXIT_NET_PROFIT,
+            "net_pnl_pct": net_pnl_pct,
+            "hold_minutes": hold_minutes,
+            "detail": "path_aware_profit_floor",
+        }
+    if net_pnl_pct + 1e-12 > min_exec:
+        return {
+            "action": "sell",
+            "reason": EXIT_PATH_EXECUTABLE_PROFIT,
+            "net_pnl_pct": net_pnl_pct,
+            "hold_minutes": hold_minutes,
+            "detail": "path_aware_first_executable_net",
+        }
+
+    trail = float(getattr(position, "trailing_stop_price", 0) or 0)
+    trail_pct = float(getattr(position, "trail_pct", 0) or coin_profile.get("trail") or 0.005)
+    highest = float(getattr(position, "highest_price", entry) or entry)
+    if trail > 0 and highest >= entry * (1.0 + trail_pct) and current_price <= trail and net_pnl_pct + 1e-12 > min_exec:
+        return {
+            "action": "sell",
+            "reason": EXIT_TRAILING_STOP,
+            "net_pnl_pct": net_pnl_pct,
+            "hold_minutes": hold_minutes,
+            "detail": "path_aware_trail_locks_green",
+        }
+
+    max_hold = effective_max_hold_min(position, coin_profile)
+    if int(getattr(position, "max_hold_min", 0) or 0) < max_hold:
+        position.max_hold_min = max_hold
+    if hold_minutes >= max_hold:
+        return {
+            "action": "sell",
+            "reason": EXIT_TIME_STOP,
+            "net_pnl_pct": net_pnl_pct,
+            "hold_minutes": hold_minutes,
+            "detail": f"path_aware_max_hold_min={max_hold}",
+        }
+    return {
+        "action": "hold",
+        "reason": "PATH_AWARE_HOLD",
+        "net_pnl_pct": net_pnl_pct,
+        "hold_minutes": hold_minutes,
+        "detail": DAY_PATH_AWARE_POLICY,
+    }
+
 
 PROGRESS_DECAY_HOLD_TOO_YOUNG = "PROGRESS_DECAY_HOLD_TOO_YOUNG"
 PROGRESS_DECAY_GREEN = "PROGRESS_DECAY_GREEN"
@@ -88,6 +184,7 @@ def effective_max_hold_min(position: Any, coin_profile: dict[str, Any] | None = 
 ALLOWED_DAY_EXIT_REASONS = frozenset(
     {
         EXIT_NET_PROFIT,
+        EXIT_PATH_EXECUTABLE_PROFIT,
         EXIT_VOLATILITY_STOP,
         EXIT_TIME_STOP,
         EXIT_STALL,
@@ -1002,6 +1099,18 @@ def evaluate_engine_managed_exit(
     atr_pct = 0.01
     if invalid_level > 0 and invalid_level < entry:
         atr_pct = max(0.008, (entry - invalid_level) / entry)
+
+    if _path_aware_exit_enabled():
+        return _evaluate_path_aware_exit(
+            position=position,
+            current_price=current_price,
+            net_pnl_pct=net_pnl_pct,
+            hold_minutes=hold_minutes,
+            coin_profile=coin_profile,
+            bundle=bundle,
+            entry=entry,
+            atr_pct=atr_pct,
+        )
 
     extreme = evaluate_extreme_protection(
         entry_price=entry,

@@ -31,6 +31,11 @@ from backend.services.day_controlled_exits import (
 from backend.services.market_role_outcome_learner import _SCHEMA_SQL
 
 
+@pytest.fixture(autouse=True)
+def _disable_day_path_aware_exit(monkeypatch):
+    monkeypatch.setenv("DAY_PATH_AWARE_EXIT", "false")
+
+
 @pytest.fixture()
 def db_path(tmp_path, monkeypatch):
     p = str(tmp_path / "test_outcomes.db")

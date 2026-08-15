@@ -17,6 +17,11 @@ from backend.services.portfolio_engine import OpenPosition, PortfolioEngine, Pri
 
 
 @pytest.fixture(autouse=True)
+def _disable_day_path_aware_exit(monkeypatch):
+    monkeypatch.setenv("DAY_PATH_AWARE_EXIT", "false")
+
+
+@pytest.fixture(autouse=True)
 def _isolated_mae_distribution_db(tmp_path, monkeypatch):
     """These tests exercise fresh-vs-stale MARK handling for the fixed
     stop-loss specifically. Without this, ``evaluate_adaptive_loss_exit``

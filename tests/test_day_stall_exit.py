@@ -21,6 +21,7 @@ def _day_trade_stall_defaults(monkeypatch):
     monkeypatch.setenv("DAY_STALL_MIN_ADVERSE_PCT", "0.0025")
     monkeypatch.setenv("DAY_STALL_RECOVERY_PCT", "0.0010")
     monkeypatch.setenv("DAY_GIVEBACK_EXIT_ENABLED", "false")
+    monkeypatch.setenv("DAY_PATH_AWARE_EXIT", "false")
 
 
 class _Pos:

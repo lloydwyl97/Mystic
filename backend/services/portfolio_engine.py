@@ -5342,6 +5342,7 @@ class PortfolioEngine:
             "STALL_EXIT",
             "GIVEBACK_EXIT",
             "NET_PROFIT_EXIT",
+            "PATH_EXECUTABLE_PROFIT",
             "STOP_LOSS_EXIT",
             "TRAILING_STOP_EXIT",
             "THESIS_INVALIDATION_EXIT",
@@ -6675,8 +6676,7 @@ class PortfolioEngine:
                         ns = normalize_symbol(psym)
                         if ns not in open_syms:
                             logger.critical(
-                                "FIFO_RECONCILE_ORPHAN_NOT_ZEROED symbol=%s — remaining BUY lots kept; "
-                                "restore_orphaned_day_buys owns this, heal-by-zero is forbidden",
+                                "FIFO_RECONCILE_ORPHAN_NOT_ZEROED symbol=%s — remaining BUY lots kept; restore_orphaned_day_buys owns this, heal-by-zero is forbidden",
                                 psym,
                             )
 
@@ -11921,7 +11921,10 @@ class PortfolioEngine:
             if bar_low <= 0:
                 bar_low = float(current_price)
 
-        from backend.services.day_controlled_exits import evaluate_engine_managed_exit
+        from backend.services.day_controlled_exits import (
+            EXIT_PATH_EXECUTABLE_PROFIT,
+            evaluate_engine_managed_exit,
+        )
         from backend.services.day_trade_thesis import EXIT_NET_PROFIT
 
         managed = evaluate_engine_managed_exit(
@@ -11943,7 +11946,8 @@ class PortfolioEngine:
                 hold_minutes,
                 managed.get("detail"),
             )
-            exit_type = ExitType.TAKE_PROFIT_1 if exit_reason.startswith(EXIT_NET_PROFIT) else ExitType.MANUAL
+            profit_exit = exit_reason.startswith(EXIT_NET_PROFIT) or exit_reason == EXIT_PATH_EXECUTABLE_PROFIT
+            exit_type = ExitType.TAKE_PROFIT_1 if profit_exit else ExitType.MANUAL
             return await self.execute_sell_fifo(
                 symbol,
                 quantity,
@@ -13899,6 +13903,18 @@ class PortfolioEngine:
             strategy_id=sid,
             decision_data=dd,
         )
+        with contextlib.suppress(Exception):
+            from backend.services.day_path_net import attach_bars, stamp_day_path_prediction
+
+            sym = str(dd.get("symbol") or dd.get("symbol_bus") or "")
+            if sid == "day" and sym:
+                dd = attach_bars(dd, str(getattr(self, "db_path", "") or ""), sym)
+            stamped = stamp_day_path_prediction(dd)
+            predicted = stamped.get("selected_net_expected_value") if stamped.get("forward_net_model_version") else None
+            if predicted is not None:
+                if decision_data is not None:
+                    decision_data.update(stamped)
+                return float(predicted)
         # If upstream computed EV, still apply explicit cost subtraction here.
         explicit = _safe_float(dd.get("selected_net_expected_value"), float("nan"))
         explicit2 = _safe_float(dd.get("net_expected_value"), float("nan"))
@@ -16934,12 +16950,7 @@ class PortfolioEngine:
         if not accounting.get("ok", False):
             n_orphans = len(accounting.get("orphans") or [])
             reasons.append(f"accounting_disagreement:orphans={n_orphans}:diff={accounting.get('identity_diff')}")
-        day_entry = (
-            not self._trading_paused
-            and self._account_status == AccountStatus.HEALTHY
-            and not bool(ks.get("buys_blocked"))
-            and bool(accounting.get("ok"))
-        )
+        day_entry = not self._trading_paused and self._account_status == AccountStatus.HEALTHY and not bool(ks.get("buys_blocked")) and bool(accounting.get("ok"))
         return {
             "process_alive": True,
             "accounting_healthy": bool(accounting.get("ok")),
