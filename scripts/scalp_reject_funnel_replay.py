@@ -29,15 +29,38 @@ HORIZONS = (1, 3, 5, 10, 20)
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 
 
+def _median(xs: list[float]) -> float | None:
+    if not xs:
+        return None
+    ys = sorted(xs)
+    mid = len(ys) // 2
+    if len(ys) % 2:
+        return ys[mid]
+    return (ys[mid - 1] + ys[mid]) / 2.0
+
+
+def _std(xs: list[float]) -> float | None:
+    n = len(xs)
+    if n < 2:
+        return None
+    mean = sum(xs) / n
+    return (sum((x - mean) ** 2 for x in xs) / (n - 1)) ** 0.5
+
+
 def _summarize(rows: list[dict]) -> dict:
     if not rows:
         return {"n": 0}
     n = len(rows)
+    nets = [r["net"] for r in rows]
+    gross = [r["gross"] for r in rows]
     wins = sum(1 for r in rows if r["net"] > 0)
     return {
         "n": n,
         "wr": round(wins / n, 4),
-        "net_exp": round(sum(r["net"] for r in rows) / n, 6),
+        "net_exp": round(sum(nets) / n, 6),
+        "gross_exp": round(sum(gross) / n, 6),
+        "median_net": round(_median(nets) or 0.0, 6),
+        "std_net": round(_std(nets) or 0.0, 6),
         "mfe": round(sum(r["mfe"] for r in rows) / n, 6),
         "mae": round(sum(r["mae"] for r in rows) / n, 6),
         "hit_target": round(sum(1 for r in rows if r["hit_target"]) / n, 4),
@@ -112,7 +135,10 @@ def main() -> int:
     evals_by_symbol = {s.name: Counter() for s in ALL_STRATEGIES}
     rejected_fwd = {s.name: defaultdict(list) for s in ALL_STRATEGIES}
     passed_fwd = {s.name: defaultdict(list) for s in ALL_STRATEGIES}
+    rejected_ids = {s.name: set() for s in ALL_STRATEGIES}
+    passed_ids = {s.name: set() for s in ALL_STRATEGIES}
     rank_vs = []
+    row_seq = 0
 
     for sym in SYMBOLS:
         raw = bars_by.get(_ohlcv_symbol(sym), [])
@@ -131,17 +157,31 @@ def main() -> int:
             entry = float(snap.best_ask)
             fwd = {m: forward_stats(future, entry, m) for m in HORIZONS}
             st5 = fwd.get(5)
+            bar_id = f"{sym}:{i}"
             for strat in ALL_STRATEGIES:
+                row_seq += 1
+                row_id = f"{bar_id}:{strat.name}"
                 evals[strat.name] += 1
                 evals_by_symbol[strat.name][sym] += 1
                 sig = strat.evaluate(ctx)
                 meas = meas_all.get(strat.name) or {}
                 reason = sig.reject_reason if not sig.passed else "PASSED"
                 funnels[strat.name][reason] += 1
-                bucket = passed_fwd if sig.passed else rejected_fwd
+                if sig.passed:
+                    passed_ids[strat.name].add(bar_id)
+                    bucket = passed_fwd
+                else:
+                    rejected_ids[strat.name].add(bar_id)
+                    bucket = rejected_fwd
                 for m, st in fwd.items():
                     if st:
-                        bucket[strat.name][m].append(st)
+                        rec = dict(st)
+                        rec["row_id"] = row_id
+                        rec["bar_id"] = bar_id
+                        rec["symbol"] = sym
+                        rec["bar_index"] = i
+                        rec["strategy"] = strat.name
+                        bucket[strat.name][m].append(rec)
                 if st5 and meas:
                     rank_vs.append(
                         (
@@ -153,20 +193,44 @@ def main() -> int:
                         )
                     )
 
+    names = [s.name for s in ALL_STRATEGIES]
+    overlap = {}
+    for a in names:
+        overlap[a] = {}
+        for b in names:
+            if a == b:
+                overlap[a][b] = 1.0
+                continue
+            sa, sb = rejected_ids[a], rejected_ids[b]
+            union = len(sa | sb)
+            overlap[a][b] = round(len(sa & sb) / union, 4) if union else None
     scalp_report = {}
-    for name in [s.name for s in ALL_STRATEGIES]:
+    for name in names:
         rej5 = rejected_fwd[name].get(5) or []
         profitable_rejected = sum(1 for s in rej5 if s["net"] > 0)
+        nets = [s["net"] for s in rej5]
+        gross = [s["gross"] for s in rej5]
         scalp_report[name] = {
             "evaluations": evals[name],
             "evaluations_by_symbol": dict(evals_by_symbol[name]),
             "funnel": dict(funnels[name]),
             "passed": funnels[name].get("PASSED", 0),
+            "rejected_row_count": len(rejected_ids[name]),
+            "rejected_unique_bar_ids": len(rejected_ids[name]),
+            "rejected_unique_row_ids": len({r.get("row_id") for r in rej5}),
+            "passed_unique_bar_ids": len(passed_ids[name]),
+            "rejected_list_id": id(rej5),
+            "rejected_id_sample": sorted(rejected_ids[name])[:8],
             "rejected_forward": {str(k): _summarize(v) for k, v in rejected_fwd[name].items()},
             "passed_forward": {str(k): _summarize(v) for k, v in passed_fwd[name].items()},
             "rejected_5m_n": len(rej5),
             "rejected_5m_profitable_frac": round(profitable_rejected / len(rej5), 4) if rej5 else None,
+            "rejected_5m_mean_gross": round(sum(gross) / len(gross), 6) if gross else None,
+            "rejected_5m_mean_net": round(sum(nets) / len(nets), 6) if nets else None,
+            "rejected_5m_median_net": round(_median(nets) or 0.0, 6) if nets else None,
+            "rejected_5m_std_net": round(_std(nets) or 0.0, 6) if nets else None,
             "rejected_5m_expectancy": round(sum(s["net"] for s in rej5) / len(rej5), 6) if rej5 else None,
+            "overlap_with_other_rejected": overlap[name],
         }
 
     xs = [a for a, b, *_ in rank_vs]

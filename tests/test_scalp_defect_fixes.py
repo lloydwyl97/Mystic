@@ -20,6 +20,10 @@ class _Signal:
         self.setup_name = "test_setup"
         self.score = score
         self.passed = True
+        self.expected_move_pct = 0.0035
+        self.spread_pct = 0.0002
+        self.impact_pct = 0.0
+        self.confidence = 0.7
 
     def as_dict(self) -> dict:
         return {
@@ -27,6 +31,10 @@ class _Signal:
             "setup_name": self.setup_name,
             "score": self.score,
             "passed": self.passed,
+            "expected_move_pct": self.expected_move_pct,
+            "spread_pct": self.spread_pct,
+            "impact_pct": self.impact_pct,
+            "confidence": self.confidence,
         }
 
 

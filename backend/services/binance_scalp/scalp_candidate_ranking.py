@@ -693,42 +693,187 @@ def _global_tie_key(row: dict[str, Any]) -> tuple:
     )
 
 
+HOLD_ACTION_EV = 0.0
+HOLD_ACTION_NAME = "HOLD"
+DECISION_POLICY_HOLD_AS_ACTION = "scalp_hold_as_action_v1"
+
+
+def _num(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _signal_field(row: dict[str, Any], name: str, default: float = 0.0) -> float:
+    sig = row.get("signal")
+    if sig is None:
+        return _num((row.get("rank_meta") or {}).get(name), default)
+    if isinstance(sig, dict):
+        return _num(sig.get(name), default)
+    return _num(getattr(sig, name, None), default)
+
+
+def candidate_roundtrip_cost_pct(row: dict[str, Any]) -> float:
+    """Spread + fees + slippage + impact. Same economics as live SCALP fills."""
+    snap = row.get("snap")
+    spread = _num(getattr(snap, "spread_pct", None) if snap is not None else None)
+    if spread <= 0:
+        spread = _signal_field(row, "spread_pct")
+    impact = _signal_field(row, "impact_pct")
+    if impact <= 0:
+        impact = _num((row.get("rank_meta") or {}).get("impact_pct"))
+    intel = row.get("intelligence") or {}
+    slip = _num(intel.get("slippage_estimate"))
+    try:
+        from backend.services.binance_scalp.economics import ScalpEconomics
+
+        econ = ScalpEconomics.from_env()
+        if slip <= 0:
+            slip = float(econ.slippage_buffer_pct)
+        return float(econ.roundtrip_fee_pct) + spread + impact + slip
+    except Exception:
+        return 0.0004 + spread + impact + (slip if slip > 0 else 0.0001)
+
+
+def candidate_expected_gross_pct(row: dict[str, Any]) -> float:
+    """Gross move the candidate itself claimed. Missing/zero stays zero."""
+    expected = _signal_field(row, "expected_move_pct")
+    if expected > 0:
+        return expected
+    meta = row.get("rank_meta") or {}
+    expected = _num(meta.get("expected_move_pct"))
+    if expected > 0:
+        return expected
+    return _num((row.get("intelligence") or {}).get("expected_move_pct") or (row.get("intelligence") or {}).get("projected_gross_pct"))
+
+
+def candidate_expected_net_ev(row: dict[str, Any]) -> float:
+    """BUY expected net after costs. HOLD is a separate action with EV=0."""
+    return candidate_expected_gross_pct(row) - candidate_roundtrip_cost_pct(row)
+
+
+def candidate_positive_net_probability(row: dict[str, Any]) -> float:
+    """Probability the BUY's expected net is positive. Not a permission gate."""
+    ev = candidate_expected_net_ev(row)
+    cost = candidate_roundtrip_cost_pct(row)
+    if ev <= HOLD_ACTION_EV:
+        return 0.0
+    conf = _signal_field(row, "confidence")
+    if 0.0 < conf <= 1.0:
+        return round(min(0.99, max(0.51, conf)), 4)
+    surplus = ev / cost if cost > 0 else ev
+    return round(min(0.95, max(0.51, 0.50 + surplus * 8.0)), 4)
+
+
+def attach_action_predictions(row: dict[str, Any]) -> dict[str, Any]:
+    """Stamp absolute predicted outcomes on a ranking row. Rank alone is not enough."""
+    mh = row.get("multi_horizon_ev") or {}
+    horizons = mh.get("horizons") if isinstance(mh, dict) else None
+    expected_mfe = None
+    expected_mae = None
+    expected_hold = None
+    if isinstance(horizons, list) and horizons:
+        mfe_vals = [_num(h.get("expected_mfe_pct")) for h in horizons if isinstance(h, dict)]
+        mae_vals = [_num(h.get("expected_mae_pct")) for h in horizons if isinstance(h, dict)]
+        if mfe_vals:
+            expected_mfe = round(sum(mfe_vals) / len(mfe_vals), 6)
+        if mae_vals:
+            expected_mae = round(sum(mae_vals) / len(mae_vals), 6)
+        mid = horizons[len(horizons) // 2]
+        if isinstance(mid, dict):
+            expected_hold = mid.get("bucket")
+    gross = candidate_expected_gross_pct(row)
+    cost = candidate_roundtrip_cost_pct(row)
+    ev = gross - cost
+    row["expected_gross_move"] = round(gross, 8)
+    row["roundtrip_cost_pct"] = round(cost, 8)
+    row["expected_net_ev"] = round(ev, 8)
+    row["predicted_net_return"] = round(ev, 8)
+    row["predicted_prob_positive_net"] = candidate_positive_net_probability(row)
+    row["expected_mfe"] = expected_mfe
+    row["expected_mae"] = expected_mae
+    row["expected_hold"] = expected_hold
+    row["hold_action_ev"] = HOLD_ACTION_EV
+    row["action_name"] = f"BUY_{row.get('symbol')}"
+    return row
+
+
+def rank_actions_with_hold(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """BUY actions plus HOLD(EV=0). Highest expected net wins."""
+    actions: list[dict[str, Any]] = []
+    for row in rows:
+        stamped = attach_action_predictions(dict(row))
+        actions.append(stamped)
+    actions.append(
+        {
+            "action_name": HOLD_ACTION_NAME,
+            "symbol": HOLD_ACTION_NAME,
+            "entry_eligible": True,
+            "expected_gross_move": 0.0,
+            "roundtrip_cost_pct": 0.0,
+            "expected_net_ev": HOLD_ACTION_EV,
+            "predicted_net_return": HOLD_ACTION_EV,
+            "predicted_prob_positive_net": 0.5,
+            "expected_mfe": 0.0,
+            "expected_mae": 0.0,
+            "expected_hold": 0.0,
+            "hold_action_ev": HOLD_ACTION_EV,
+            "rank_score": 0.0,
+        }
+    )
+    actions.sort(key=lambda r: (-_num(r.get("expected_net_ev")), -_num(r.get("rank_score"))))
+    return actions
+
+
 def pick_best_global_candidate(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     """
-    Pick one global entry among per-symbol rows.
+    Rank BUY expected-net against HOLD(EV=0).
 
-    Skips weak all-symbol ties (least-bad cluster) unless a candidate clears
-    SCALP_MIN_CONFIDENT_RANK with margin over second place.
+    This is not a threshold gate. HOLD is an action. If every BUY has
+    negative expected net, HOLD wins and no entry is selected.
     """
     eligible = [r for r in rows if r.get("entry_eligible")]
     if not eligible:
         return None
 
-    eligible.sort(key=lambda r: (-float(r.get("rank_score") or 0), *_global_tie_key(r)[::-1]))
-    top_score = float(eligible[0].get("rank_score") or 0)
-    second_score = float(eligible[1].get("rank_score") or 0) if len(eligible) > 1 else 0.0
-    margin = top_score - second_score
-    tie_margin = _rank_tie_margin()
-    min_confident = _min_confident_rank()
+    for row in eligible:
+        attach_action_predictions(row)
 
-    if top_score < min_confident and margin < tie_margin:
+    actions = rank_actions_with_hold(eligible)
+    winner = actions[0] if actions else None
+    if winner is None or str(winner.get("action_name") or "") == HOLD_ACTION_NAME:
+        return None
+    if _num(winner.get("expected_net_ev")) <= HOLD_ACTION_EV:
         return None
 
-    if margin < tie_margin and len(eligible) > 1:
-        tied = [r for r in eligible if abs(float(r.get("rank_score") or 0) - top_score) <= tie_margin + 1e-9]
-        return max(tied, key=_global_tie_key)
-
-    return eligible[0]
+    chosen_symbol = str(winner.get("symbol") or "")
+    chosen = next((r for r in eligible if str(r.get("symbol") or "") == chosen_symbol), winner)
+    peers = [r for r in eligible if _num(r.get("expected_net_ev")) > HOLD_ACTION_EV]
+    if len(peers) > 1:
+        top_ev = _num(chosen.get("expected_net_ev"))
+        tied = [r for r in peers if abs(_num(r.get("expected_net_ev")) - top_ev) <= 1e-9]
+        if len(tied) > 1:
+            return max(tied, key=_global_tie_key)
+    return chosen
 
 
 __all__ = [
+    "DECISION_POLICY_HOLD_AS_ACTION",
     "HARD_REJECT_REASONS",
+    "HOLD_ACTION_EV",
+    "HOLD_ACTION_NAME",
     "RankedCandidate",
     "SOFT_REJECT_SCORE",
+    "attach_action_predictions",
+    "candidate_expected_net_ev",
     "min_confident_rank",
     "min_tradeable_score",
     "pick_best_global_candidate",
     "pick_best_ranked",
     "prepare_entry_signal",
+    "rank_actions_with_hold",
     "rank_setup_signal",
 ]

@@ -30,6 +30,7 @@ from backend.services.binance_scalp.scalp_candidate_ranking import (
     _min_tradeable_score,
     _min_confident_rank,
     _rank_tie_margin,
+    attach_action_predictions,
     pick_best_global_candidate,
 )
 from backend.services.binance_scalp.near_pass import (
@@ -494,6 +495,8 @@ def _evaluate_strategy_router(
     except Exception:
         pass
 
+    for row in ranked:
+        attach_action_predictions(row)
     best = pick_best_global_candidate(ranked)
     selected_symbol = str(best.get("symbol") or "") if best else ""
     per_symbol: dict[str, Any] = {}
@@ -537,9 +540,15 @@ def _evaluate_strategy_router(
                 "momentum_boost": best_ranked_row.get("momentum_boost"),
                 "reachability_multiplier": best_ranked_row.get("reachability_multiplier"),
                 "reachability_surplus_pct": meta.get("reachability_surplus"),
-                "expected_move_pct": best_ranked_row.get("expected_move_pct"),
+                "expected_move_pct": best_ranked_row.get("expected_move_pct") or row.get("expected_gross_move"),
                 "required_target_pct": best_ranked_row.get("required_target_pct"),
                 "target_gap_pct": best_ranked_row.get("target_gap_pct"),
+                "predicted_net_return": row.get("predicted_net_return") or row.get("expected_net_ev"),
+                "predicted_prob_positive_net": row.get("predicted_prob_positive_net"),
+                "expected_mfe": row.get("expected_mfe"),
+                "expected_mae": row.get("expected_mae"),
+                "expected_hold": row.get("expected_hold"),
+                "hold_action_ev": row.get("hold_action_ev"),
                 "regime": meta.get("regime"),
                 "regime_native": best_ranked_row.get("regime_native"),
                 "intelligence": _json_safe(row.get("intelligence") or {}),

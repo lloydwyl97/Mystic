@@ -14,6 +14,49 @@ from typing import Any
 
 TABLE = "scalp_opportunity_snapshots"
 HORIZONS_SEC = (30, 60, 180, 300, 600, 1200)
+_SIGNAL_KEYS = (
+    "setup_name",
+    "passed",
+    "reject_reason",
+    "score",
+    "confidence",
+    "expected_move_pct",
+    "required_target_pct",
+    "spread_pct",
+    "impact_pct",
+    "entry_reason",
+)
+
+
+def compact_signals_json(signals: Any) -> str:
+    """Always-valid reduced signal schema. Never character-truncate JSON."""
+    rows: list[dict[str, Any]] = []
+    if isinstance(signals, list):
+        source = signals
+    elif isinstance(signals, dict):
+        source = [signals]
+    else:
+        source = []
+    for item in source:
+        if hasattr(item, "as_dict"):
+            item = item.as_dict()
+        if not isinstance(item, dict):
+            continue
+        rows.append({key: item.get(key) for key in _SIGNAL_KEYS})
+    return json.dumps(rows, separators=(",", ":"), default=str)
+
+
+def compact_feature_vector_json(vector: Any) -> str:
+    """Always-valid numeric vector. Never character-truncate JSON."""
+    if not isinstance(vector, list):
+        return "[]"
+    out: list[float] = []
+    for value in vector:
+        try:
+            out.append(float(value))
+        except (TypeError, ValueError):
+            out.append(0.0)
+    return json.dumps(out, separators=(",", ":"))
 
 _CREATE = f"""
 CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -121,8 +164,8 @@ def record_opportunity_cycle(
                     str(row.get("soft_reason") or meta.get("soft_reason") or meta.get("hard_block") or ""),
                     float(row.get("rank_score") or 0),
                     json.dumps(meta.get("setup_measurements") or {}, default=str),
-                    json.dumps(row.get("all_signals") or [], default=str)[:8000],
-                    json.dumps((row.get("rank_meta") or {}).get("feature_vector") or [], default=str)[:4000],
+                    compact_signals_json(row.get("all_signals") or []),
+                    compact_feature_vector_json((row.get("rank_meta") or {}).get("feature_vector") or []),
                 ),
             )
             written += 1

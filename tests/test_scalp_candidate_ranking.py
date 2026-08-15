@@ -12,8 +12,11 @@ sys.path.insert(0, str(REPO))
 from backend.services.binance_scalp.config import get_scalp_config
 from backend.services.binance_scalp.economics import ScalpEconomics
 from backend.services.binance_scalp.scalp_candidate_ranking import (
+    HOLD_ACTION_EV,
     SOFT_REJECT_SCORE,
+    attach_action_predictions,
     pick_best_global_candidate,
+    rank_actions_with_hold,
     rank_setup_signal,
 )
 from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, StrategyMarketContext
@@ -125,7 +128,7 @@ def test_global_tie_prefers_non_btc_when_scores_equal():
             "rank_score": 1.62,
             "entry_eligible": True,
             "rank_meta": {"soft_reason": "NOT_NEAR_SUPPORT", "regime_native": True, "reachability_surplus": 0.001},
-            "signal": SimpleNamespace(passed=False, spread_pct=0.00005),
+            "signal": SimpleNamespace(passed=False, spread_pct=0.0002, expected_move_pct=0.0035, impact_pct=0.0, confidence=0.6),
             "mom": SimpleNamespace(mid_change_15s=0.0001, mid_change_30s=0.0001),
             "intelligence": {"memory_rank_delta": 0.0},
         },
@@ -134,7 +137,7 @@ def test_global_tie_prefers_non_btc_when_scores_equal():
             "rank_score": 1.62,
             "entry_eligible": True,
             "rank_meta": {"soft_reason": "NOT_NEAR_SUPPORT", "regime_native": True, "reachability_surplus": 0.0012},
-            "signal": SimpleNamespace(passed=False, spread_pct=0.0002),
+            "signal": SimpleNamespace(passed=False, spread_pct=0.0002, expected_move_pct=0.0035, impact_pct=0.0, confidence=0.6),
             "mom": SimpleNamespace(mid_change_15s=0.0002, mid_change_30s=0.0002),
             "intelligence": {"memory_rank_delta": 0.01},
         },
@@ -142,6 +145,67 @@ def test_global_tie_prefers_non_btc_when_scores_equal():
     best = pick_best_global_candidate(rows)
     assert best is not None
     assert best["symbol"] == "ETHUSDT"
+
+
+def test_hold_wins_when_all_buy_expected_net_is_negative():
+    rows = [
+        {
+            "symbol": sym,
+            "rank_score": score,
+            "entry_eligible": True,
+            "rank_meta": {"soft_reason": "NO_VWAP_EMA_RECLAIM", "regime_native": True},
+            "signal": SimpleNamespace(
+                passed=False,
+                spread_pct=0.0002,
+                expected_move_pct=0.0,
+                impact_pct=0.0,
+                confidence=0.0,
+            ),
+        }
+        for sym, score in (("XRPUSDT", 0.9518), ("ETHUSDT", 0.7916), ("BTCUSDT", 0.34), ("SOLUSDT", 0.28))
+    ]
+    assert pick_best_global_candidate(rows) is None
+    actions = rank_actions_with_hold(rows)
+    assert actions[0]["action_name"] == "HOLD"
+    assert actions[0]["expected_net_ev"] == HOLD_ACTION_EV
+    assert all(float(r["expected_net_ev"]) < HOLD_ACTION_EV for r in actions if r["action_name"] != "HOLD")
+
+
+def test_positive_expected_net_buy_beats_hold():
+    rows = [
+        {
+            "symbol": "BTCUSDT",
+            "rank_score": 0.4,
+            "entry_eligible": True,
+            "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.0035, impact_pct=0.0, confidence=0.7),
+        },
+        {
+            "symbol": "ETHUSDT",
+            "rank_score": 0.9,
+            "entry_eligible": True,
+            "signal": SimpleNamespace(passed=False, spread_pct=0.0002, expected_move_pct=0.0, impact_pct=0.0, confidence=0.0),
+        },
+    ]
+    best = pick_best_global_candidate(rows)
+    assert best is not None
+    assert best["symbol"] == "BTCUSDT"
+    assert float(best["expected_net_ev"]) > HOLD_ACTION_EV
+
+
+def test_ranking_report_includes_absolute_predicted_outcomes():
+    row = {
+        "symbol": "SOLUSDT",
+        "rank_score": 0.8,
+        "entry_eligible": True,
+        "signal": SimpleNamespace(passed=False, spread_pct=0.0002, expected_move_pct=0.0, impact_pct=0.0, confidence=0.0),
+    }
+    stamped = attach_action_predictions(row)
+    assert "predicted_net_return" in stamped
+    assert "predicted_prob_positive_net" in stamped
+    assert "expected_mfe" in stamped
+    assert "expected_mae" in stamped
+    assert stamped["hold_action_ev"] == HOLD_ACTION_EV
+    assert stamped["predicted_net_return"] < 0
 
 
 def test_soft_scores_materially_lower_than_before():

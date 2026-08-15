@@ -707,8 +707,15 @@ class BinanceScalpPaperEngine:
             self._publish_last_decision(decision="NO_SIGNAL", reason="NO_RANKED_CANDIDATE", entry_armed=self._entry_armed_ok())
             return []
 
-        from backend.services.binance_scalp.scalp_candidate_ranking import pick_best_global_candidate
+        from backend.services.binance_scalp.scalp_candidate_ranking import (
+            HOLD_ACTION_EV,
+            attach_action_predictions,
+            pick_best_global_candidate,
+            rank_actions_with_hold,
+        )
 
+        for row in ranked:
+            attach_action_predictions(row)
         best = pick_best_global_candidate(ranked)
         if best is None:
             eligible_rows = [r for r in ranked if r.get("entry_eligible")]
@@ -717,10 +724,17 @@ class BinanceScalpPaperEngine:
             meta = top.get("rank_meta") or {}
             top_score = float(top.get("rank_score") or 0)
             second_score = float(eligible_rows[1].get("rank_score") or 0) if len(eligible_rows) > 1 else 0.0
+            actions = rank_actions_with_hold(eligible_rows) if eligible_rows else []
+            best_buy_ev = max((float(r.get("expected_net_ev") or 0) for r in eligible_rows), default=None)
+            hold_won = bool(eligible_rows) and (best_buy_ev is None or best_buy_ev <= HOLD_ACTION_EV)
             reason = (
-                "RANK_LOW_CONFIDENCE_TIE"
-                if eligible_rows and top_score < float(os.getenv("SCALP_MIN_CONFIDENT_RANK", "1.55"))
-                else top.get("hard_block") or meta.get("hard_block") or top.get("soft_reason") or meta.get("soft_reason") or f"RANK_BELOW_MIN:{top.get('rank_score')}"
+                "HOLD_WINS_ACTION_RANK"
+                if hold_won
+                else (
+                    "RANK_LOW_CONFIDENCE_TIE"
+                    if eligible_rows and top_score < float(os.getenv("SCALP_MIN_CONFIDENT_RANK", "1.55"))
+                    else top.get("hard_block") or meta.get("hard_block") or top.get("soft_reason") or meta.get("soft_reason") or f"RANK_BELOW_MIN:{top.get('rank_score')}"
+                )
             )
             if not eligible_rows and ranked:
                 reason = top.get("hard_block") or meta.get("hard_block") or top.get("soft_reason") or meta.get("soft_reason") or "NO_ENTRY_ELIGIBLE"
@@ -740,6 +754,19 @@ class BinanceScalpPaperEngine:
                             "entry_eligible": bool(top.get("entry_eligible")),
                             "rank_margin": round(top_score - second_score, 4),
                         },
+                        "action_rank": [
+                            {
+                                "action": r.get("action_name"),
+                                "symbol": r.get("symbol"),
+                                "expected_net_ev": r.get("expected_net_ev"),
+                                "predicted_prob_positive_net": r.get("predicted_prob_positive_net"),
+                                "expected_mfe": r.get("expected_mfe"),
+                                "expected_mae": r.get("expected_mae"),
+                                "rank_score": r.get("rank_score"),
+                            }
+                            for r in actions
+                        ],
+                        "hold_action_ev": HOLD_ACTION_EV,
                         "all_symbols": [
                             {
                                 "symbol": r["symbol"],
@@ -748,13 +775,33 @@ class BinanceScalpPaperEngine:
                                 "best_setup": r.get("best_setup"),
                                 "hard_block": r.get("hard_block"),
                                 "soft_reason": r.get("soft_reason"),
+                                "expected_net_ev": r.get("expected_net_ev"),
+                                "predicted_net_return": r.get("predicted_net_return"),
+                                "predicted_prob_positive_net": r.get("predicted_prob_positive_net"),
+                                "expected_mfe": r.get("expected_mfe"),
+                                "expected_mae": r.get("expected_mae"),
+                                "expected_hold": r.get("expected_hold"),
                             }
                             for r in ranked
                         ],
                     }
                 ),
             )
-            ranked_summary = [{"symbol": r["symbol"], "rank_score": r.get("rank_score"), "entry_eligible": r.get("entry_eligible"), "hard_block": r.get("hard_block")} for r in ranked]
+            ranked_summary = [
+                {
+                    "symbol": r["symbol"],
+                    "rank_score": r.get("rank_score"),
+                    "entry_eligible": r.get("entry_eligible"),
+                    "hard_block": r.get("hard_block"),
+                    "expected_net_ev": r.get("expected_net_ev"),
+                    "predicted_net_return": r.get("predicted_net_return"),
+                    "predicted_prob_positive_net": r.get("predicted_prob_positive_net"),
+                    "expected_mfe": r.get("expected_mfe"),
+                    "expected_mae": r.get("expected_mae"),
+                    "expected_hold": r.get("expected_hold"),
+                }
+                for r in ranked
+            ]
             self._publish_last_decision(
                 decision="NO_SIGNAL",
                 reason=reason,
@@ -765,7 +812,21 @@ class BinanceScalpPaperEngine:
             )
             return []
         sym, snap, sig = best["symbol"], best["snap"], best["signal"]
-        ranked_summary = [{"symbol": r["symbol"], "rank_score": r.get("rank_score"), "entry_eligible": r.get("entry_eligible"), "hard_block": r.get("hard_block")} for r in ranked]
+        ranked_summary = [
+            {
+                "symbol": r["symbol"],
+                "rank_score": r.get("rank_score"),
+                "entry_eligible": r.get("entry_eligible"),
+                "hard_block": r.get("hard_block"),
+                "expected_net_ev": r.get("expected_net_ev"),
+                "predicted_net_return": r.get("predicted_net_return"),
+                "predicted_prob_positive_net": r.get("predicted_prob_positive_net"),
+                "expected_mfe": r.get("expected_mfe"),
+                "expected_mae": r.get("expected_mae"),
+                "expected_hold": r.get("expected_hold"),
+            }
+            for r in ranked
+        ]
         # Architecture v2 (2026-08-11): sig.passed is no longer a promotion
         # requirement here — pick_best_global_candidate() already only
         # returns candidates with entry_eligible=True, meaning every
@@ -810,9 +871,19 @@ class BinanceScalpPaperEngine:
                     "entry_eligible": r.get("entry_eligible"),
                     "best_setup": r.get("best_setup"),
                     "hard_block": r.get("hard_block"),
+                    "expected_net_ev": r.get("expected_net_ev"),
+                    "predicted_net_return": r.get("predicted_net_return"),
+                    "predicted_prob_positive_net": r.get("predicted_prob_positive_net"),
+                    "expected_mfe": r.get("expected_mfe"),
+                    "expected_mae": r.get("expected_mae"),
+                    "expected_hold": r.get("expected_hold"),
                 }
                 for r in ranked
             ],
+            "selected_action": f"BUY_{sym}",
+            "hold_action_ev": HOLD_ACTION_EV,
+            "selected_expected_net_ev": best.get("expected_net_ev"),
+            "selected_predicted_prob_positive_net": best.get("predicted_prob_positive_net"),
             "scalp_intelligence": entry_intel,
         }
         logger.info("SCALP_STRATEGY_PICK %s", self._last_ranking_meta["selection_reason"])

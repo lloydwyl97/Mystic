@@ -336,7 +336,7 @@ class ScalpStrategyRouter:
         meta["strategy_passed"] = bool(best_ranked.signal.passed)
         meta["entry_owner"] = "strategy" if best_ranked.signal.passed else "ranking_ev"
         meta["ml_role"] = "rank_size"
-        meta["decision_policy_version"] = "scalp_ranking_not_gating_v2"
+        meta["decision_policy_version"] = "scalp_hold_as_action_v1"
 
         meta["stage_ms"] = stage_ms
         if entry_eligible:

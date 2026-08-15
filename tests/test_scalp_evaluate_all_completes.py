@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from dataclasses import replace
 from pathlib import Path
 
 from backend.services.binance_scalp.scalp_opportunity_dataset import (
+    compact_signals_json,
     label_due_opportunities,
     record_opportunity_cycle,
 )
@@ -160,11 +162,41 @@ def test_opportunity_record_and_label(tmp_path: Path):
     assert labeled >= 1
     conn = sqlite3.connect(db)
     row = conn.execute(
-        "SELECT symbol,best_reject,plus_30s_net,plus_60s_net,horizon_labels_json FROM scalp_opportunity_snapshots"
+        "SELECT symbol,best_reject,plus_30s_net,plus_60s_net,horizon_labels_json,signals_json FROM scalp_opportunity_snapshots"
     ).fetchone()
     conn.close()
     assert row[0] == "BTCUSDT"
     assert row[1] == "NO_PULLBACK_RECOVERY"
     assert row[2] is not None
     assert row[3] is not None
+    parsed = json.loads(row[5])
+    assert isinstance(parsed, list)
+    assert parsed[0]["setup_name"] == "vwap_ema_reclaim"
+    assert parsed[0]["passed"] is False
     assert "30" in (row[4] or "")
+
+
+def test_compact_signals_json_never_truncates_and_stays_valid():
+    huge = [
+        {
+            "setup_name": f"setup_{i}",
+            "passed": False,
+            "reject_reason": "NO_VWAP_EMA_RECLAIM",
+            "score": 0.0,
+            "confidence": 0.0,
+            "expected_move_pct": 0.0,
+            "required_target_pct": 0.0025,
+            "spread_pct": 0.0002,
+            "impact_pct": 0.0,
+            "entry_reason": "x" * 400,
+            "setup_context": {"noise": "y" * 2000},
+        }
+        for i in range(12)
+    ]
+    raw = compact_signals_json(huge)
+    parsed = json.loads(raw)
+    assert isinstance(parsed, list)
+    assert len(parsed) == 12
+    assert "setup_context" not in parsed[0]
+    assert parsed[0]["setup_name"] == "setup_0"
+    assert raw[-1] == "]"
