@@ -117,11 +117,15 @@ def build_day_entry_provenance(
     version = str(dd.get("forward_net_model_version") or "")
     buy_ev = _num(dd.get("selected_net_expected_value") if dd.get("selected_net_expected_value") not in (None, "") else dd.get("predicted_net_return"))
     p_pos = _num(dd.get("p_positive_net") if dd.get("p_positive_net") not in (None, "") else dd.get("predicted_prob_positive_net"))
-    if status == "predicted" and version == DAY_ACCEPTED_MODEL and buy_ev is not None and buy_ev > HOLD_EV:
+    if status == "predicted" and version == DAY_ACCEPTED_MODEL and buy_ev is not None:
         policy = DAY_POLICY
         model_version = version
-        selected_action = "BUY"
-        selection_reason = "PATH_NET_BEATS_HOLD"
+        if buy_ev > HOLD_EV:
+            selected_action = "BUY"
+            selection_reason = "PATH_NET_BEATS_HOLD"
+        else:
+            selected_action = "HOLD"
+            selection_reason = "HOLD_WINS"
     elif status in ("unavailable_hold", "error_hold") and version == DAY_ACCEPTED_MODEL:
         policy = DAY_POLICY
         model_version = version

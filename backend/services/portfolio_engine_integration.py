@@ -1376,8 +1376,13 @@ class PortfolioEngineIntegration:
                                 entry_bar,
                                 self.entry_decision_interval,
                             )
-                            result = await self.engine.process_bar_candidates(current_bar)
-                            self.last_entry_bar_processed = entry_bar
+                            try:
+                                result = await self.engine.process_bar_candidates(current_bar)
+                            finally:
+                                # Consume this entry window even if process_bar_candidates
+                                # raises after a partial fill. Retrying the same 15m bar
+                                # on later 1m ticks can double-buy.
+                                self.last_entry_bar_processed = entry_bar
 
                             if self.redis_client and cand_buses:
                                 for b in set(cand_buses):

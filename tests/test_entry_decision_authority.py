@@ -47,6 +47,26 @@ def test_day_predicted_path_is_model_controlled():
     assert is_model_controlled(prov, engine="day") is True
 
 
+def test_day_predicted_nonpositive_ev_stamps_hold_not_legacy_buy():
+    prov = build_day_entry_provenance(
+        decision_data={
+            "path_net_status": "predicted",
+            "forward_net_model_version": DAY_ACCEPTED_MODEL,
+            "selected_net_expected_value": -0.0002,
+            "p_positive_net": 0.41,
+        },
+        symbol="ETH/USDT",
+        decision_id="day_ETHUSDT_hold",
+        why_selected="highest_final_selection_score",
+    )
+    assert prov["entry_policy_version"] == DAY_POLICY
+    assert prov["model_version"] == DAY_ACCEPTED_MODEL
+    assert prov["selected_action"] == "HOLD"
+    assert prov["selection_reason"] == "HOLD_WINS"
+    assert prov["buy_ev"] == -0.0002
+    assert is_model_controlled(prov, engine="day") is False
+
+
 def test_day_missing_path_status_is_legacy_direction():
     prov = build_day_entry_provenance(
         decision_data={"selected_net_expected_value": 0.0007, "prob_buy": 0.57},
