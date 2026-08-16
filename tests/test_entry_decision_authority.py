@@ -67,6 +67,23 @@ def test_day_predicted_nonpositive_ev_stamps_hold_not_legacy_buy():
     assert is_model_controlled(prov, engine="day") is False
 
 
+def test_day_error_hold_without_version_stamps_hold_not_legacy_buy():
+    prov = build_day_entry_provenance(
+        decision_data={
+            "path_net_status": "error_hold",
+            "selected_net_expected_value": 0.0,
+        },
+        symbol="BTC/USDT",
+        decision_id="day_BTCUSDT_err",
+        why_selected="highest_final_selection_score",
+    )
+    assert prov["entry_policy_version"] == DAY_POLICY
+    assert prov["model_version"] == DAY_ACCEPTED_MODEL
+    assert prov["selected_action"] == "HOLD"
+    assert prov["selection_reason"] == "PATH_NET_UNAVAILABLE_HOLD"
+    assert is_model_controlled(prov, engine="day") is False
+
+
 def test_day_missing_path_status_is_legacy_direction():
     prov = build_day_entry_provenance(
         decision_data={"selected_net_expected_value": 0.0007, "prob_buy": 0.57},

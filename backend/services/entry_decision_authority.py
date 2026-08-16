@@ -126,9 +126,9 @@ def build_day_entry_provenance(
         else:
             selected_action = "HOLD"
             selection_reason = "HOLD_WINS"
-    elif status in ("unavailable_hold", "error_hold") and version == DAY_ACCEPTED_MODEL:
+    elif status in ("unavailable_hold", "error_hold"):
         policy = DAY_POLICY
-        model_version = version
+        model_version = version or DAY_ACCEPTED_MODEL
         selected_action = "HOLD"
         selection_reason = "PATH_NET_UNAVAILABLE_HOLD"
     else:

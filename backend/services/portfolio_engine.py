@@ -13929,7 +13929,10 @@ class PortfolioEngine:
         except Exception:
             logger.warning("DAY_PATH_NET_EV_FAILED symbol=%s — HOLD", sym, exc_info=True)
             if decision_data is not None:
+                from backend.services.day_path_net import DAY_PATH_MODEL_VERSION
+
                 decision_data["path_net_status"] = "error_hold"
+                decision_data["forward_net_model_version"] = DAY_PATH_MODEL_VERSION
                 decision_data["selected_net_expected_value"] = 0.0
                 decision_data["predicted_net_return"] = 0.0
                 decision_data["selected_net_expected_value_is_net"] = "1"
@@ -14427,6 +14430,9 @@ class PortfolioEngine:
                         direction_probability=explainability.prob_buy,
                         feature_fingerprint=str(explainability.artifact_sha256 or explainability.feature_version or ""),
                     )
+                    from backend.services.decision_book_tape import record_day_decision
+
+                    record_day_decision(symbol=str(symbol or ""), provenance=explainability.entry_provenance)
                 if not explainability.entry_thesis:
                     logger.warning(
                         "MULTI_BUY_MISSING_SETUP symbol=%s decision_id=%s dd_keys=%s",
@@ -15971,6 +15977,9 @@ class PortfolioEngine:
                 direction_probability=explainability.prob_buy,
                 feature_fingerprint=str(explainability.artifact_sha256 or explainability.feature_version or ""),
             )
+            from backend.services.decision_book_tape import record_day_decision
+
+            record_day_decision(symbol=str(symbol or ""), provenance=explainability.entry_provenance)
 
         if POSITION_FIRST_ROUTING_ENABLED and symbol in self.open_positions:
             managed = await self._route_selected_open_position(

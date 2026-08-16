@@ -15,9 +15,11 @@ sys.path.insert(0, str(REPO))
 from backend.services.binance_scalp.forward_net_predictor import (
     FEATURE_KEYS,
     GAP_BARS,
+    ForwardNetArtifact,
     chronological_folds,
     flatten_measurements,
     path_labels,
+    predict_row_expected_net,
     reset_artifact_cache,
 )
 from backend.services.binance_scalp.scalp_candidate_ranking import (
@@ -84,8 +86,12 @@ def test_path_labels_subtract_costs():
     assert labels["mfe_5m"] > 0
 
 
-def test_hold_still_wins_when_all_buy_ev_negative():
+def test_hold_still_wins_when_all_buy_ev_negative(monkeypatch):
     reset_artifact_cache()
+    monkeypatch.setattr(
+        "backend.services.binance_scalp.forward_net_predictor.load_accepted_artifact",
+        lambda: None,
+    )
     rows = [
         {
             "symbol": sym,
@@ -101,8 +107,44 @@ def test_hold_still_wins_when_all_buy_ev_negative():
     assert actions[0]["expected_net_ev"] == HOLD_ACTION_EV
 
 
-def test_fallback_ev_is_gross_minus_cost_without_artifact():
+def test_loaded_artifact_empty_features_fail_closed_to_hold(monkeypatch):
+    art = ForwardNetArtifact(
+        version="scalp_path_net_v1",
+        accepted=True,
+        feature_names=["ret_1", "ret_5", "evt_mom_expansion"],
+        mean=[0.0, 0.0, 0.0],
+        scale=[1.0, 1.0, 1.0],
+        coef=[0.1, 0.1, 0.1],
+        intercept=0.002,
+        log_coef=[0.0, 0.0, 0.0],
+        log_intercept=0.0,
+        primary_horizon_min=5,
+        trained_at="2026-08-16T00:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        "backend.services.binance_scalp.forward_net_predictor.load_accepted_artifact",
+        lambda: art,
+    )
+    empty = {"symbol": "SOLUSDT", "rank_meta": {}, "setup_measurements": {}}
+    assert predict_row_expected_net(empty) == 0.0
+    row = {
+        "symbol": "SOLUSDT",
+        "entry_eligible": True,
+        "rank_score": 0.9,
+        "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.003, impact_pct=0.0, confidence=0.7),
+        "rank_meta": {},
+        "setup_measurements": {},
+    }
+    assert candidate_expected_net_ev(row) == 0.0
+    assert pick_best_global_candidate([row]) is None
+
+
+def test_fallback_ev_is_gross_minus_cost_without_artifact(monkeypatch):
     reset_artifact_cache()
+    monkeypatch.setattr(
+        "backend.services.binance_scalp.forward_net_predictor.load_accepted_artifact",
+        lambda: None,
+    )
     row = {
         "symbol": "BTCUSDT",
         "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.0035, impact_pct=0.0, confidence=0.7),

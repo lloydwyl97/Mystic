@@ -32,6 +32,9 @@ def test_path_label_detects_executable_mfe_when_terminal_red():
     assert lab["executable_profit_occurred"] is True
     assert lab["path_order"] == "MFE_FIRST"
     assert lab["profit_before_adverse"] is True
+    assert lab["target_d_net"] == lab["executable_mfe_net"]
+    assert lab["target_close_net"] == lab["terminal_net"]
+    assert lab["target_close_net"] < lab["target_d_net"]
 
 
 def test_path_labels_do_not_use_bars_past_horizon():
@@ -52,10 +55,7 @@ def test_reconstructable_features_have_no_future_or_book_or_coin_id():
     banned = {"mfe", "mae", "time_to_target", "terminal_net", "symbol", "passed", "orderbook_imbalance"}
     assert banned.isdisjoint(FEATURE_KEYS)
     assert "orderbook_imbalance" in LIVE_ONLY
-    bars = [
-        {"open": 100, "high": 100.2, "low": 99.8, "close": 100 + i * 0.01, "volume": 10 + i}
-        for i in range(25)
-    ]
+    bars = [{"open": 100, "high": 100.2, "low": 99.8, "close": 100 + i * 0.01, "volume": 10 + i} for i in range(25)]
     feats = reconstructable_features(bars, btc_ret_5=0.001, ts=datetime(2026, 8, 14, 15, 0, tzinfo=timezone.utc))
     assert feats["ret_1"] != 0 or feats["rel_volume"] >= 0
     assert "orderbook_imbalance" not in feats
@@ -72,7 +72,11 @@ def test_old_rejected_feature_set_unchanged():
     assert "orderbook_imbalance" not in OLD_KEYS
 
 
-def test_hold_still_wins_negative_ev():
+def test_hold_still_wins_negative_ev(monkeypatch):
+    monkeypatch.setattr(
+        "backend.services.binance_scalp.forward_net_predictor.load_accepted_artifact",
+        lambda: None,
+    )
     rows = [
         {
             "symbol": sym,

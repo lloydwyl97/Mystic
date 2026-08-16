@@ -47,6 +47,7 @@ def path_labels_for_horizon(
         "path_order": "NONE",
         "target_c": False,
         "target_d_net": None,
+        "target_close_net": None,
     }
     if mid0 <= 0 or not future:
         return empty
@@ -120,6 +121,7 @@ def path_labels_for_horizon(
         "path_order": order,
         "target_c": bool(t_target is not None),
         "target_d_net": target_d,
+        "target_close_net": terminal_net,
         "mfe_first": order == "MFE_FIRST",
     }
 

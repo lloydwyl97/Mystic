@@ -364,7 +364,7 @@ def load_accepted_artifact() -> ForwardNetArtifact | None:
     return art if art.accepted else None
 
 
-def _features_for_runtime_row(row: dict[str, Any], names: list[str]) -> dict[str, float]:
+def _measurement_source(row: dict[str, Any]) -> dict[str, Any]:
     meta = row.get("rank_meta") or {}
     meas = meta.get("setup_measurements") or row.get("setup_measurements") or {}
     if not meas:
@@ -372,7 +372,37 @@ def _features_for_runtime_row(row: dict[str, Any], names: list[str]) -> dict[str
         ctx = getattr(sig, "setup_context", None) if sig is not None else None
         if isinstance(ctx, dict):
             meas = {"best": ctx.get("features") or {}}
+    return meas if isinstance(meas, dict) else {}
+
+
+def _has_usable_measurements(meas: dict[str, Any]) -> bool:
+    for block in meas.values():
+        if not isinstance(block, dict):
+            continue
+        for key, val in block.items():
+            if key in ("passed", "hard_block", "entry_eligible"):
+                continue
+            try:
+                if abs(float(val)) > 0.0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
+def _runtime_features_present(row: dict[str, Any], names: list[str]) -> bool:
+    """True only when the artifact has the market/features it was trained on."""
+    meta = row.get("rank_meta") or {}
     bars = meta.get("bars_1m") or row.get("bars_1m") or []
+    uses_bars = any(str(n).startswith("ret_") or str(n).startswith("evt_") for n in names)
+    if uses_bars:
+        return isinstance(bars, list) and len(bars) >= 8
+    return _has_usable_measurements(_measurement_source(row))
+
+
+def _features_for_runtime_row(row: dict[str, Any], names: list[str]) -> dict[str, float]:
+    meas = _measurement_source(row)
+    bars = (row.get("rank_meta") or {}).get("bars_1m") or row.get("bars_1m") or []
     if bars and any(n.startswith("ret_") or n.startswith("evt_") for n in names):
         from backend.services.binance_scalp.reconstructable_features import reconstructable_features
 
@@ -394,10 +424,16 @@ def _features_for_runtime_row(row: dict[str, Any], names: list[str]) -> dict[str
 
 
 def predict_row_expected_net(row: dict[str, Any]) -> float | None:
-    """Runtime BUY EV from the accepted artifact, or None if none accepted."""
+    """Runtime BUY EV from the accepted artifact, or None if none accepted.
+
+    Missing/empty features are HOLD (0), not the intercept. Same fail-closed
+    rule as DAY resolve_day_path_ev.
+    """
     art = load_accepted_artifact()
     if art is None:
         return None
+    if not _runtime_features_present(row, art.feature_names):
+        return 0.0
     feats = _features_for_runtime_row(row, art.feature_names)
     pred = predict_artifact(art, feats)
     return float(pred["predicted_net_ev"])

@@ -717,6 +717,15 @@ class BinanceScalpPaperEngine:
         for row in ranked:
             attach_action_predictions(row)
         best = pick_best_global_candidate(ranked)
+        with contextlib.suppress(Exception):
+            from backend.services.decision_book_tape import record_scalp_cycle
+
+            record_scalp_cycle(
+                ranked=ranked,
+                chosen=best,
+                redis_client=self._redis,
+                hold_ev=HOLD_ACTION_EV,
+            )
         if best is None:
             eligible_rows = [r for r in ranked if r.get("entry_eligible")]
             # Prefer an eligible row for reject reason; fall back to rank leader.
