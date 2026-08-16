@@ -41,6 +41,19 @@ PROVENANCE_KEYS = (
     "direction_model_probability",
     "legacy_rank_score",
     "final_decision_function",
+    "day_authority_mode",
+    "old_rank_execution_authority",
+    "old_rank_nominee",
+    "old_rank_score",
+    "btc_path_ev",
+    "eth_path_ev",
+    "sol_path_ev",
+    "xrp_path_ev",
+    "path_ev_winner",
+    "selected_symbol",
+    "selected_ev",
+    "path_net_model_id",
+    "path_aware_policy_id",
 )
 
 
@@ -114,38 +127,44 @@ def build_day_entry_provenance(
 ) -> dict[str, Any]:
     dd = dict(decision_data or {})
     status = str(dd.get("path_net_status") or "")
-    version = str(dd.get("forward_net_model_version") or "")
-    buy_ev = _num(dd.get("selected_net_expected_value") if dd.get("selected_net_expected_value") not in (None, "") else dd.get("predicted_net_return"))
+    version = str(dd.get("forward_net_model_version") or dd.get("path_net_model_id") or "")
+    buy_ev = _num(
+        dd.get("selected_ev")
+        if dd.get("selected_ev") not in (None, "")
+        else (dd.get("selected_net_expected_value") if dd.get("selected_net_expected_value") not in (None, "") else dd.get("predicted_net_return"))
+    )
     p_pos = _num(dd.get("p_positive_net") if dd.get("p_positive_net") not in (None, "") else dd.get("predicted_prob_positive_net"))
-    if status == "predicted" and version == DAY_ACCEPTED_MODEL and buy_ev is not None:
-        policy = DAY_POLICY
-        model_version = version
-        if buy_ev > HOLD_EV:
-            selected_action = "BUY"
-            selection_reason = "PATH_NET_BEATS_HOLD"
+    mode = str(dd.get("day_authority_mode") or "")
+    if mode == "direct_four_coin_path_ev" or (status == "predicted" and version == DAY_ACCEPTED_MODEL and buy_ev is not None):
+        policy = str(dd.get("path_aware_policy_id") or DAY_POLICY)
+        model_version = version or DAY_ACCEPTED_MODEL
+        action_in = str(dd.get("selected_action") or "")
+        if (buy_ev or 0) > HOLD_EV:
+            selected_action = action_in if action_in.upper().startswith("BUY") else "BUY"
+            selection_reason = str(dd.get("why_selected") or "PATH_NET_BEATS_HOLD")
         else:
             selected_action = "HOLD"
-            selection_reason = "HOLD_WINS"
+            selection_reason = str(dd.get("why_selected") or "HOLD_WINS")
     elif status in ("unavailable_hold", "error_hold"):
         policy = DAY_POLICY
         model_version = version or DAY_ACCEPTED_MODEL
         selected_action = "HOLD"
         selection_reason = "PATH_NET_UNAVAILABLE_HOLD"
     else:
-        policy = LEGACY_DIRECTION
-        model_version = version or LEGACY_DIRECTION
-        selected_action = "BUY"
-        selection_reason = str(why_selected or "RANK_THEN_POSITIVE_EV_UNPROVEN")
+        policy = DAY_POLICY
+        model_version = version or DAY_ACCEPTED_MODEL
+        selected_action = "HOLD"
+        selection_reason = "HOLD_WINS"
     opp = str(decision_id or "").strip() or f"{bar_timestamp}:{symbol}"
     return {
         "entry_policy_version": policy,
         "model_version": model_version,
-        "prediction_timestamp": _now_iso(),
+        "prediction_timestamp": str(dd.get("prediction_timestamp") or _now_iso()),
         "predicted_net_return": buy_ev,
         "p_positive_net": p_pos,
         "predicted_mfe": _num(dd.get("predicted_mfe") if dd.get("predicted_mfe") not in (None, "") else dd.get("expected_mfe")),
         "predicted_mae": _num(dd.get("predicted_mae") if dd.get("predicted_mae") not in (None, "") else dd.get("expected_mae")),
-        "predicted_horizon": dd.get("day_path_horizon_min") if dd.get("day_path_horizon_min") not in (None, "") else dd.get("predicted_horizon"),
+        "predicted_horizon": dd.get("horizon_minutes") if dd.get("horizon_minutes") not in (None, "") else (dd.get("day_path_horizon_min") if dd.get("day_path_horizon_min") not in (None, "") else dd.get("predicted_horizon")),
         "hold_ev": HOLD_EV,
         "buy_ev": buy_ev,
         "selected_action": selected_action,
@@ -155,11 +174,24 @@ def build_day_entry_provenance(
         "strategy": str(dd.get("live_ai_strategy") or "day"),
         "setup": str(dd.get("setup_type") or dd.get("entry_thesis") or "day"),
         "feature_fingerprint": feature_fingerprint or str(dd.get("feature_fingerprint") or ""),
-        "path_net_status": status,
+        "path_net_status": status or "predicted",
         "forward_net_model_version": version,
         "direction_model_probability": _num(direction_probability if direction_probability not in (None, "") else dd.get("prob_buy")),
-        "legacy_rank_score": _num(rank_score if rank_score not in (None, "") else dd.get("final_selection_score")),
-        "final_decision_function": "portfolio_engine.process_bar_candidates",
+        "legacy_rank_score": _num(dd.get("old_rank_score") if dd.get("old_rank_score") not in (None, "") else (rank_score if rank_score not in (None, "") else dd.get("final_selection_score"))),
+        "final_decision_function": "day_direct_path_ev_authority.select_action",
+        "day_authority_mode": dd.get("day_authority_mode") or "direct_four_coin_path_ev",
+        "old_rank_execution_authority": False,
+        "old_rank_nominee": dd.get("old_rank_nominee") or "",
+        "old_rank_score": dd.get("old_rank_score"),
+        "btc_path_ev": dd.get("btc_path_ev"),
+        "eth_path_ev": dd.get("eth_path_ev"),
+        "sol_path_ev": dd.get("sol_path_ev"),
+        "xrp_path_ev": dd.get("xrp_path_ev"),
+        "path_ev_winner": dd.get("path_ev_winner"),
+        "selected_symbol": dd.get("selected_symbol") or symbol,
+        "selected_ev": dd.get("selected_ev") if dd.get("selected_ev") not in (None, "") else buy_ev,
+        "path_net_model_id": dd.get("path_net_model_id") or version,
+        "path_aware_policy_id": dd.get("path_aware_policy_id") or DAY_POLICY,
     }
 
 

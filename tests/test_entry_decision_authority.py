@@ -84,7 +84,7 @@ def test_day_error_hold_without_version_stamps_hold_not_legacy_buy():
     assert is_model_controlled(prov, engine="day") is False
 
 
-def test_day_missing_path_status_is_legacy_direction():
+def test_day_missing_path_status_is_not_old_rank_buy():
     prov = build_day_entry_provenance(
         decision_data={"selected_net_expected_value": 0.0007, "prob_buy": 0.57},
         symbol="XRP/USDT",
@@ -92,8 +92,8 @@ def test_day_missing_path_status_is_legacy_direction():
         why_selected="highest_final_selection_score",
         direction_probability=0.57,
     )
-    assert prov["entry_policy_version"] == LEGACY_DIRECTION
-    assert prov["model_version"] == LEGACY_DIRECTION
+    assert prov["selected_action"] == "HOLD"
+    assert prov["old_rank_execution_authority"] is False
     assert is_model_controlled(prov, engine="day") is False
 
 

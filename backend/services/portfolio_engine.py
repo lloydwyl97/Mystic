@@ -14265,6 +14265,61 @@ class PortfolioEngine:
 
         return diagnostics
 
+    async def _select_direct_path_ev_candidate(
+        self,
+        valid_candidates: list,
+        bar_timestamp: int,
+    ) -> tuple[Any, dict[str, Any]]:
+        """DAY paper authority: four-coin path-EV vs HOLD. Old rank is telemetry only."""
+        from backend.services.day_direct_path_ev_authority import (
+            _api_symbol,
+            _slash_symbol,
+            decide_day_bar,
+        )
+        from backend.services.decision_book_tape import record_day_bar_authority
+
+        decision = decide_day_bar(db_path=str(self.db_path or ""), candidates=list(valid_candidates or []))
+        with contextlib.suppress(Exception):
+            record_day_bar_authority(decision)
+        self._last_day_path_ev_decision = decision
+        if not str(decision.get("selected_action") or "").upper().startswith("BUY"):
+            return None, decision
+        want = _api_symbol(str(decision.get("selected_symbol") or ""))
+        found = None
+        for cand in list(valid_candidates or []) + list(getattr(self, "current_bar_candidates", None) or []):
+            if _api_symbol(getattr(cand, "symbol", "")) == want:
+                found = cand
+                break
+        if found is None:
+            slash = _slash_symbol(want)
+            price = 0.0
+            with contextlib.suppress(Exception):
+                price = float(self._get_cached_market_price(slash) or self._get_cached_market_price(want) or 0.0)
+            atr = 0.0
+            if price > 0:
+                with contextlib.suppress(Exception):
+                    atr = float(await self._get_atr_for_symbol(slash, price) or 0.0)
+            found = BuyCandidate(
+                symbol=slash,
+                confidence=0.0,
+                trend_score=0.0,
+                chop_score=0.0,
+                coin_edge_score=0.0,
+                volatility_penalty=0.0,
+                spread_penalty=0.0,
+                atr=float(atr or 0.0),
+                current_price=float(price or 0.0),
+                decision_data={},
+                decision_id=f"path_ev_{want}_{bar_timestamp}",
+            )
+        found.decision_data = dict(found.decision_data or {})
+        found.decision_data.update(decision)
+        found.decision_data["hard_block"] = False
+        found.decision_data["candidate_eligible"] = True
+        found.decision_data["live_ai_strategy"] = "day"
+        found.decision_data["why_selected"] = str(decision.get("why_selected") or "PATH_NET_BEATS_HOLD")
+        return found, decision
+
     async def _execute_additional_bar_buys(
         self,
         *,
@@ -14280,8 +14335,10 @@ class PortfolioEngine:
         """
         extras = list(getattr(self, "_bar_extra_buy_candidates", None) or [])
         self._bar_extra_buy_candidates = []
-        if not extras:
-            return 0
+        # Direct four-coin path-EV buys one coin or HOLD. Old-rank extras do not execute.
+        if extras:
+            logger.info("MULTI_BUY_SKIP_OLD_RANK extras=%s", [getattr(c, "symbol", "") for c in extras])
+        return 0
         try:
             max_pos = int(os.getenv("MAX_OPEN_POSITIONS", str(getattr(self, "max_positions", 4) or 4)))
         except Exception:
@@ -14553,22 +14610,8 @@ class PortfolioEngine:
         )
 
         if not self.current_bar_candidates:
-            logger.debug(f"BAR_CLOSE: No candidates for bar {bar_timestamp}")
-            await self._emit_day_health_telemetry("NO_BAR_CANDIDATES")
-            self._persist_profit_cycle_state(
-                {
-                    "bar_timestamp": int(bar_timestamp),
-                    "full_universe_diagnostics": full_universe_diag,
-                    "adaptive_weight_diagnostics": {
-                        "adaptive_weight_applied_count": int(full_universe_diag.get("adaptive_weight_applied_count") or 0),
-                        "adaptive_weight_missing_count": int(full_universe_diag.get("adaptive_weight_missing_count") or 0),
-                        "adaptive_weight_score_delta_sum": float(full_universe_diag.get("adaptive_weight_score_delta_sum") or 0.0),
-                        "adaptive_weight_top_components": full_universe_diag.get("adaptive_weight_top_components") or {},
-                    },
-                    "current_cycle": {"leaderboard": [], "leaderboard_len": 0},
-                }
-            )
-            return None
+            logger.info("BAR_CLOSE: no old-rank candidates — direct path-EV still scores four coins")
+            await self._emit_day_health_telemetry("NO_BAR_CANDIDATES_PATH_EV_AUTHORITY")
 
         bar_candidate_snapshot: list[BuyCandidate] = list(self.current_bar_candidates)
         pipeline_done: set[str] = set()
@@ -15069,12 +15112,10 @@ class PortfolioEngine:
                 pass
 
         if not valid_candidates:
-            logger.debug("BAR_CLOSE: No valid candidates after regime routing")
-            await self._emit_day_health_telemetry("NO_VALID_CANDIDATES_AFTER_REGIME_ROUTE")
+            logger.info("BAR_CLOSE: no old-rank candidates — direct path-EV still scores four coins")
+            await self._emit_day_health_telemetry("NO_OLD_RANK_CANDIDATES_PATH_EV_AUTHORITY")
             for c in bar_candidate_snapshot:
                 await self._bar_pipeline_terminal(c.decision_id, "BAR_PRE_RANK_FILTERED", pipeline_done)
-            self.current_bar_candidates.clear()
-            return None
 
         for _tc in valid_candidates:
             try:
@@ -15208,294 +15249,123 @@ class PortfolioEngine:
                 str((cand.decision_data or {}).get("setup_type_canonical") or (cand.decision_data or {}).get("setup_type") or "?")[:28],
             )
 
-        # Execution sanity telemetry only: keep all ranked candidates unless data is truly broken.
-        execution_sane_candidates: list[BuyCandidate] = []
-        for _rank_idx, _cand in enumerate(valid_candidates):
-            _sym = _cand.symbol
-            # Post-ranking hard-block enforcement. day_outcome_bandit and
-            # day_liquidity_gate stamp dd["hard_block"]=True /
-            # candidate_eligible=False during _apply_ranking_stack, which
-            # runs AFTER add_buy_candidate — so the admission-time gate
-            # cannot see the flag. Enforce it here, right before the buy
-            # actually executes. Covers:
-            #   * DAY_BLOCK_SETUP_REGIME_PAIRS operator block
-            #   * day_liquidity_gate catastrophic-spread block
-            _dd_hb = _cand.decision_data or {}
-            if bool(_dd_hb.get("hard_block")) or _dd_hb.get("candidate_eligible") is False:
-                _hb_reason = str(_dd_hb.get("day_bandit_hard_block_reason") or _dd_hb.get("liquidity_hard_block_reason") or _dd_hb.get("hard_block_reason") or "HARD_BLOCK")
-                logger.info(
-                    "BAR_HARD_BLOCK_REJECT #%d: %s reason=%s setup=%s regime=%s",
-                    _rank_idx + 1,
-                    _sym,
-                    _hb_reason,
-                    _dd_hb.get("setup_type_canonical") or _dd_hb.get("setup_type"),
-                    _dd_hb.get("day_route_regime") or _dd_hb.get("regime"),
-                )
-                with contextlib.suppress(Exception):
-                    from backend.services.day_gate_telemetry import (
-                        record_gate_event,
-                        record_shadow_reject,
-                    )
-
-                    record_gate_event(
-                        self.db_path,
-                        gate_id="HARD_BLOCK",
-                        symbol=str(_sym),
-                        outcome="hard_blocked",
-                        decision_id=str(getattr(_cand, "decision_id", "") or ""),
-                    )
-                    record_shadow_reject(
-                        self.db_path,
-                        candidate=_cand,
-                        gate_id="HARD_BLOCK",
-                        bar_timestamp=int(bar_timestamp or 0),
-                    )
-                await self._bar_pipeline_terminal(_cand.decision_id, f"BAR_HARD_BLOCK:{_hb_reason}", pipeline_done)
-                continue
-            # BUY margin is score/sizing influence only (not a ranking blocker).
-            _bm_raw = resolve_buy_margin_from_payload(_cand.decision_data)
-            _sleeve = str(getattr(_cand, "sleeve", "") or "").strip().upper() or assign_sleeve(normalize_symbol(_sym), float(_cand.confidence), _cand.decision_data)
-            _bm_thr = buy_margin_threshold_core() if _sleeve == Sleeve.CORE.value else buy_margin_threshold_active()
-            _bm_fail = False
-            if _bm_raw is None:
-                logger.info(
-                    "BUY_MARGIN_TELEMETRY #%d: %s BUY_MARGIN missing (threshold=%.4f sleeve=%s)%s",
-                    _rank_idx + 1,
-                    _sym,
-                    _bm_thr,
-                    _sleeve or Sleeve.ACTIVE.value,
-                    " -> BLOCKED" if ENABLE_PROFITABILITY_ENFORCEMENT else " -> penalty only",
-                )
-                _cand.decision_data = dict(_cand.decision_data or {})
-                if ENABLE_PROFITABILITY_ENFORCEMENT:
-                    _cand.decision_data["buy_margin_exec_status"] = "missing_blocked"
-                    _bm_fail = True
-                else:
-                    _cand.decision_data["buy_margin_exec_status"] = "missing_penalty_only"
-                    _cand.decision_data["buy_margin_penalty_exec"] = 4.0
-            try:
-                _bm_val = float(_bm_raw) if _bm_raw is not None else float("nan")
-            except (TypeError, ValueError):
-                _bm_val = float("nan")
-            # Wire BAR_EXEC_* absolute floor (was env-loaded but unused).
-            _bm_thr_eff = float(_bm_thr)
-            if BAR_EXEC_ENFORCE_BUY_MARGIN:
-                _bm_thr_eff = max(_bm_thr_eff, float(BAR_EXEC_ABSOLUTE_MIN_BUY_MARGIN))
-            if not _bm_fail and (not math.isfinite(_bm_val) or _bm_val < _bm_thr_eff):
-                logger.info(
-                    "BUY_MARGIN_TELEMETRY #%d: %s BUY_MARGIN %.6f < %.6f (sleeve=%s abs_floor=%.4f)%s",
-                    _rank_idx + 1,
-                    _sym,
-                    _bm_val,
-                    _bm_thr_eff,
-                    _sleeve or Sleeve.ACTIVE.value,
-                    float(BAR_EXEC_ABSOLUTE_MIN_BUY_MARGIN),
-                    " -> BLOCKED" if ENABLE_PROFITABILITY_ENFORCEMENT else " -> penalty only",
-                )
-                _cand.decision_data = dict(_cand.decision_data or {})
-                if ENABLE_PROFITABILITY_ENFORCEMENT:
-                    _cand.decision_data["buy_margin_exec_status"] = "below_threshold_blocked"
-                    _bm_fail = True
-                else:
-                    _cand.decision_data["buy_margin_exec_status"] = "below_threshold_penalty_only"
-                    _cand.decision_data["buy_margin_penalty_exec"] = 4.0
-            if _bm_fail:
-                with contextlib.suppress(Exception):
-                    from backend.services.day_gate_telemetry import record_gate_event, record_shadow_reject
-
-                    record_gate_event(
-                        self.db_path,
-                        gate_id="BUY_MARGIN_FLOOR",
-                        symbol=str(_sym),
-                        outcome="hard_blocked",
-                        decision_id=str(getattr(_cand, "decision_id", "") or ""),
-                    )
-                    record_shadow_reject(
-                        self.db_path,
-                        candidate=_cand,
-                        gate_id="BUY_MARGIN_FLOOR",
-                        bar_timestamp=int(bar_timestamp or 0),
-                    )
-                await self._bar_pipeline_terminal(_cand.decision_id, "BAR_BUY_MARGIN_BLOCKED", pipeline_done)
-                continue
-            _spread_raw = _cand.decision_data.get("spread_pct")
-            if _spread_raw in (None, ""):
-                _spread_raw = _cand.decision_data.get("spread")
-            _spread_val, _spread_units = self._normalize_spread_fraction(_spread_raw)
-            logger.debug(
-                "SPREAD_ENTRY_CHECK: symbol=%s spread_val=%.6f max_spread_pct=%.6f units=fractional",
-                _sym,
-                _spread_val,
-                MAX_SPREAD_PCT,
+        # DAY paper authority: four-coin path-EV vs HOLD(0). Old rank is telemetry only.
+        top_candidate, _day_auth = await self._select_direct_path_ev_candidate(valid_candidates, bar_timestamp)
+        self._bar_extra_buy_candidates = []
+        if top_candidate is None:
+            await self._emit_day_health_telemetry("DAY_PATH_EV_HOLD")
+            logger.info(
+                "DAY_PATH_EV_HOLD winner=%s btc=%.6f eth=%.6f sol=%.6f xrp=%.6f old_nominee=%s",
+                (_day_auth or {}).get("path_ev_winner"),
+                float((_day_auth or {}).get("btc_path_ev") or 0),
+                float((_day_auth or {}).get("eth_path_ev") or 0),
+                float((_day_auth or {}).get("sol_path_ev") or 0),
+                float((_day_auth or {}).get("xrp_path_ev") or 0),
+                (_day_auth or {}).get("old_rank_nominee"),
             )
-            if _spread_units == "percent_whole":
-                logger.warning(
-                    "SPREAD_UNITS_NORMALIZED: symbol=%s spread_raw=%s spread_fraction=%.6f",
-                    _sym,
-                    str(_spread_raw),
-                    _spread_val,
-                )
-            if _spread_val > MAX_SPREAD_PCT:
-                logger.info(
-                    "SPREAD_TELEMETRY #%d: %s spread=%.4f%% > max=%.4f%% -> penalty only",
-                    _rank_idx + 1,
-                    _sym,
-                    _spread_val * 100.0,
-                    MAX_SPREAD_PCT * 100.0,
-                )
-                _cand.decision_data = dict(_cand.decision_data or {})
-                _cand.decision_data["spread_exec_status"] = "wide_penalty_only"
-                _cand.decision_data["spread_pct"] = _spread_val
-                _cand.decision_data["spread_units"] = _spread_units
-                _cand.decision_data["spread_penalty_exec"] = float(_cand.decision_data.get("spread_penalty_exec") or 0.0) + 4.0
-            if _cand.current_price > 0 and _cand.atr / _cand.current_price < MIN_ATR_RATIO:
-                if ENABLE_ATR_ENFORCEMENT:
-                    logger.warning(
-                        "BUY_BLOCKED_LOW_ATR #%d: %s atr_ratio=%.6f < %.6f",
-                        _rank_idx + 1,
-                        _sym,
-                        _cand.atr / _cand.current_price,
-                        MIN_ATR_RATIO,
-                    )
-                    _cand.decision_data = dict(_cand.decision_data or {})
-                    _cand.decision_data["atr_exec_status"] = "low_atr_blocked"
-                    await self._bar_pipeline_terminal(_cand.decision_id, "BAR_LOW_ATR_BLOCKED", pipeline_done)
-                    continue
-                logger.info(
-                    "TELEMETRY_LOW_ATR symbol=%s atr_ratio=%.6f min=%.6f (ENABLE_ATR_ENFORCEMENT=false)",
-                    _sym,
-                    _cand.atr / _cand.current_price,
-                    MIN_ATR_RATIO,
-                )
-            execution_sane_candidates.append(_cand)
-
-        if not execution_sane_candidates:
-            await self._emit_day_health_telemetry("NO_EXECUTION_SANE_CANDIDATES")
-            logger.info("BAR_CLOSE: No candidates passed spread/ATR execution sanity (%d ranked)", len(valid_candidates))
             self._persist_profit_cycle_state(
                 {
                     "bar_timestamp": int(bar_timestamp),
                     "full_universe_diagnostics": full_universe_diag,
-                    "adaptive_weight_diagnostics": {
-                        "adaptive_weight_applied_count": int(full_universe_diag.get("adaptive_weight_applied_count") or 0),
-                        "adaptive_weight_missing_count": int(full_universe_diag.get("adaptive_weight_missing_count") or 0),
-                        "adaptive_weight_score_delta_sum": float(full_universe_diag.get("adaptive_weight_score_delta_sum") or 0.0),
-                        "adaptive_weight_top_components": full_universe_diag.get("adaptive_weight_top_components") or {},
+                    "current_cycle": {
+                        "leaderboard": [],
+                        "leaderboard_len": 0,
+                        "selected_trade": False,
+                        "day_authority_mode": "direct_four_coin_path_ev",
+                        "old_rank_execution_authority": False,
+                        "path_ev_winner": (_day_auth or {}).get("path_ev_winner"),
                     },
-                    "current_cycle": {"leaderboard": [], "leaderboard_len": 0},
                 }
             )
             self.current_bar_candidates.clear()
             return None
+        execution_sane_candidates: list[BuyCandidate] = [top_candidate]
+        self._bar_extra_buy_candidates = []
+
+        def _stamp_true_safety(reason: str) -> None:
+            auth = dict(getattr(self, "_last_day_path_ev_decision", None) or {})
+            auth["true_safety_reject_reason"] = reason
+            self._last_day_path_ev_decision = auth
+            if top_candidate is not None:
+                top_candidate.decision_data = dict(top_candidate.decision_data or {})
+                top_candidate.decision_data["true_safety_reject_reason"] = reason
 
         open_syms = set(self.open_positions.keys())
-        # Never fall back to already-held symbols — that only produced
-        # BUY_BLOCKED_EXPOSURE_CAP and starved the multi-buy queue for ETH/SOL/XRP.
-        chosen = [c for c in execution_sane_candidates if c.symbol not in open_syms]
-        if not chosen:
-            await self._emit_day_health_telemetry("BUY_SKIPPED_NO_CHOSEN_CANDIDATE")
+        if normalize_symbol(top_candidate.symbol) in self.open_positions:
+            _stamp_true_safety("DUPLICATE_SAME_SYMBOL")
+            await self._emit_day_health_telemetry("BUY_SKIPPED_DUPLICATE_SAME_SYMBOL")
             logger.info(
-                "BUY_SKIPPED: no unheld candidates after spread/ATR/margin filters (held=%s sane=%s)",
+                "DAY_PATH_EV_SAFETY reject=DUPLICATE_SAME_SYMBOL symbol=%s held=%s",
+                top_candidate.symbol,
                 sorted(open_syms),
-                [c.symbol for c in execution_sane_candidates],
             )
             self._persist_profit_cycle_state(
                 {
                     "bar_timestamp": int(bar_timestamp),
                     "full_universe_diagnostics": full_universe_diag,
-                    "adaptive_weight_diagnostics": {
-                        "adaptive_weight_applied_count": int(full_universe_diag.get("adaptive_weight_applied_count") or 0),
-                        "adaptive_weight_missing_count": int(full_universe_diag.get("adaptive_weight_missing_count") or 0),
-                        "adaptive_weight_score_delta_sum": float(full_universe_diag.get("adaptive_weight_score_delta_sum") or 0.0),
-                        "adaptive_weight_top_components": full_universe_diag.get("adaptive_weight_top_components") or {},
+                    "current_cycle": {
+                        "leaderboard": [],
+                        "leaderboard_len": 0,
+                        "selected_trade": False,
+                        "day_authority_mode": "direct_four_coin_path_ev",
+                        "old_rank_execution_authority": False,
+                        "true_safety_reject_reason": "DUPLICATE_SAME_SYMBOL",
                     },
-                    "current_cycle": {"leaderboard": [], "leaderboard_len": 0},
+                }
+            )
+            self.current_bar_candidates.clear()
+            return None
+        try:
+            _max_pos_bar = int(os.getenv("MAX_OPEN_POSITIONS", str(getattr(self, "max_positions", 4) or 4)))
+        except Exception:
+            _max_pos_bar = 4
+        if _max_pos_bar > 0 and len(self.open_positions) >= _max_pos_bar:
+            _stamp_true_safety("MAX_OPEN_LIMIT")
+            await self._emit_day_health_telemetry("BUY_SKIPPED_MAX_OPEN_LIMIT")
+            logger.info(
+                "DAY_PATH_EV_SAFETY reject=MAX_OPEN_LIMIT open=%s max=%s",
+                len(self.open_positions),
+                _max_pos_bar,
+            )
+            self._persist_profit_cycle_state(
+                {
+                    "bar_timestamp": int(bar_timestamp),
+                    "full_universe_diagnostics": full_universe_diag,
+                    "current_cycle": {
+                        "leaderboard": [],
+                        "leaderboard_len": 0,
+                        "selected_trade": False,
+                        "day_authority_mode": "direct_four_coin_path_ev",
+                        "old_rank_execution_authority": False,
+                        "true_safety_reject_reason": "MAX_OPEN_LIMIT",
+                    },
                 }
             )
             self.current_bar_candidates.clear()
             return None
 
-        logger.info(
-            "CANDIDATE_SELECTION_TRACE stage=execution_sane_rank chosen_count=%d first_symbol=%s first_decision_id=%s",
-            len(chosen),
-            chosen[0].symbol if chosen else "",
-            (chosen[0].decision_id or "") if chosen else "",
-        )
-
-        # RiskGovernor hard/soft account gates (env-gated; live when ENABLE_GOVERNANCE_ENFORCEMENT).
-        chosen, gov_hold = await self._apply_risk_governor(chosen)
+        chosen, gov_hold = await self._apply_risk_governor([top_candidate])
         if gov_hold:
+            _stamp_true_safety(f"GOVERNANCE:{gov_hold}")
             await self._emit_day_health_telemetry(f"BUY_BLOCKED_GOVERNANCE:{gov_hold}")
             for c in bar_candidate_snapshot:
                 await self._bar_pipeline_terminal(c.decision_id, f"GOVERNANCE:{gov_hold}", pipeline_done)
             self.current_bar_candidates.clear()
             return None
         if not chosen:
+            _stamp_true_safety("GOVERNANCE_FILTERED")
             await self._emit_day_health_telemetry("BUY_SKIPPED_GOVERNANCE_FILTERED")
-            logger.info("BUY_SKIPPED: RiskGovernor rejected all candidates this bar")
+            logger.info("BUY_SKIPPED: RiskGovernor rejected path-EV winner this bar")
             for c in bar_candidate_snapshot:
                 await self._bar_pipeline_terminal(c.decision_id, "GOVERNANCE_FILTERED", pipeline_done)
             self.current_bar_candidates.clear()
             return None
-
-        # Selection is ranking-only. Execution enforces buy_margin, capacity,
-        # and duplicate-symbol blocks. Skip candidates Mystic already holds
-        # (one open position per symbol).
-        # Fill multiple open slots per bar when several symbols have buy intent
-        # (was hard-capped at top-1, so BTC often starved ETH/SOL/XRP).
-        _max_buys_per_bar = max(1, int(os.getenv("DAY_MAX_BUYS_PER_BAR", "4")))
-        try:
-            _max_pos_bar = int(os.getenv("MAX_OPEN_POSITIONS", str(getattr(self, "max_positions", 4) or 4)))
-        except Exception:
-            _max_pos_bar = 4
-        _slots_left = max(0, _max_pos_bar - len(self.open_positions))
-        _buy_budget = min(_max_buys_per_bar, _slots_left) if _slots_left > 0 else 0
-        _buy_queue: list[BuyCandidate] = []
-        # Ranking engine: no setup hard-cuts / low-MFE fill defers. Soft rank/EV
-        # demotion already applied on decision_data; safety filters ran above.
-        for cand in chosen:
-            if cand.symbol in self.open_positions:
-                continue
-            if any(x.symbol == cand.symbol for x in _buy_queue):
-                continue
-            _buy_queue.append(cand)
-            if _buy_budget > 0 and len(_buy_queue) >= _buy_budget:
-                break
-        if not _buy_queue:
-            await self._emit_day_health_telemetry("BUY_SKIPPED_NO_UNHELD_CANDIDATE")
-            logger.info(
-                "BUY_SKIPPED: no unheld candidates after ranking (held=%s chosen=%s)",
-                sorted(open_syms),
-                [c.symbol for c in chosen],
-            )
-            for c in bar_candidate_snapshot:
-                await self._bar_pipeline_terminal(c.decision_id, "NO_UNHELD_CANDIDATE", pipeline_done)
-            self.current_bar_candidates.clear()
-            return None
-        top_candidate = _buy_queue[0]
-        self._bar_extra_buy_candidates = list(_buy_queue[1:])
-        if self._bar_extra_buy_candidates:
-            logger.info(
-                "MULTI_BUY_QUEUE primary=%s extras=%s budget=%d slots_left=%d",
-                top_candidate.symbol,
-                [c.symbol for c in self._bar_extra_buy_candidates],
-                _buy_budget,
-                _slots_left,
-            )
-        # Re-stamp truthful why_selected on every executable fill this bar
-        # (primary + multi-buy extras). Score-ordered #1 may be an already-open
-        # peer skipped for capacity — never claim a false score victory.
-        try:
-            from backend.services.symbol_setup_outcome_penalty import assign_v3_selection_ranks
-
-            _exe_fills = [top_candidate] + list(getattr(self, "_bar_extra_buy_candidates", None) or [])
-            assign_v3_selection_ranks(
-                valid_candidates,
-                open_symbols=set(self.open_positions.keys()),
-                selected_list=_exe_fills,
-            )
-        except Exception as _why_err:
-            logger.warning("truthful why_selected stamp failed: %s", _why_err)
+        top_candidate = chosen[0]
+        logger.info(
+            "CANDIDATE_SELECTION_TRACE stage=direct_four_coin_path_ev symbol=%s decision_id=%s",
+            top_candidate.symbol,
+            top_candidate.decision_id or "",
+        )
         top_meta: dict[str, Any] = {}
         cycle_leaderboard: list[dict[str, Any]] = []
         for _idx, _cand in enumerate(valid_candidates):
@@ -15561,7 +15431,15 @@ class PortfolioEngine:
         )
         symbol = top_candidate.symbol
         top_dd = top_candidate.decision_data or {}
-        top_net_ev = self._estimate_candidate_net_expected_value(top_dd, symbol=str(top_candidate.symbol or ""))
+        with contextlib.suppress(Exception):
+            _auth_stamp = dict(getattr(self, "_last_day_path_ev_decision", None) or {})
+            if _auth_stamp:
+                top_dd = dict(top_dd)
+                top_dd.update(_auth_stamp)
+                top_candidate.decision_data = top_dd
+        top_net_ev = float(top_dd.get("selected_ev") or top_dd.get("selected_net_expected_value") or 0.0)
+        if top_dd.get("path_net_status") not in ("predicted", "unavailable_hold", "error_hold"):
+            top_net_ev = self._estimate_candidate_net_expected_value(top_dd, symbol=str(top_candidate.symbol or ""))
         if top_dd.get("path_net_status"):
             top_dd["adjusted_ev"] = float(top_net_ev)
             top_dd["selected_net_expected_value"] = float(top_net_ev)
@@ -15863,7 +15741,7 @@ class PortfolioEngine:
             leaderboard=cycle_leaderboard,
             score_components=snapshot_score_components,
             peer_ranks=peer_ranks_payload,
-            winner_reason="highest_final_selection_score",
+            winner_reason=str(_dd.get("why_selected") or "PATH_NET_BEATS_HOLD"),
             rejected_reason_json={},
             market_regime=str(_dd.get("ctx_market_regime") or _dd.get("market_regime") or _dd.get("regime") or "unknown"),
         )
@@ -15871,7 +15749,7 @@ class PortfolioEngine:
         explainability.selected_score = float(top_meta.get("final_selection_score") or top_meta.get("score") or 0.0)
         explainability.selected_net_expected_value = float(top_dd.get("adjusted_ev") or top_net_ev)
         explainability.peer_ranks_json = json.dumps(peer_ranks_payload, separators=(",", ":"))
-        explainability.arbiter_winner_reason = str(_dd.get("why_selected") or "highest_final_selection_score")
+        explainability.arbiter_winner_reason = str(_dd.get("why_selected") or "PATH_NET_BEATS_HOLD")
         explainability.arbiter_rejected_reason_json = "{}"
         explainability.outcome_penalty_applied = bool(_dd.get("outcome_penalty_applied"))
         explainability.outcome_credit_applied = bool(_dd.get("outcome_credit_applied"))

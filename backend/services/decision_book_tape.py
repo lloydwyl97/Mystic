@@ -289,6 +289,69 @@ def record_rows(rows: list[dict[str, Any]], *, force: bool = False) -> int:
         return 0
 
 
+def record_day_bar_authority(decision: dict[str, Any], *, redis_client: Any = None) -> int:
+    """Persist BTC/ETH/SOL/XRP + HOLD on every DAY bar. Never changes the decision."""
+    try:
+        dec = dict(decision or {})
+        hold_ev = HOLD_EV
+        selected = str(dec.get("selected_action") or "HOLD")
+        winner = str(dec.get("path_ev_winner") or "HOLD")
+        extras = {
+            "day_authority_mode": dec.get("day_authority_mode"),
+            "old_rank_execution_authority": False,
+            "old_rank_nominee": dec.get("old_rank_nominee"),
+            "old_rank_score": dec.get("old_rank_score"),
+            "btc_path_ev": dec.get("btc_path_ev"),
+            "eth_path_ev": dec.get("eth_path_ev"),
+            "sol_path_ev": dec.get("sol_path_ev"),
+            "xrp_path_ev": dec.get("xrp_path_ev"),
+            "hold_ev": hold_ev,
+            "path_ev_winner": winner,
+            "selected_action": selected,
+            "selected_symbol": dec.get("selected_symbol"),
+            "selected_ev": dec.get("selected_ev"),
+            "path_net_model_id": dec.get("path_net_model_id"),
+            "path_aware_policy_id": dec.get("path_aware_policy_id"),
+            "why_selected": dec.get("why_selected"),
+        }
+        payload = json.dumps(extras, default=str)
+        ts = dec.get("prediction_timestamp") or _now_iso()
+        version = dec.get("path_net_model_id") or dec.get("forward_net_model_version")
+        rows = []
+        for sym, ev in (
+            ("BTCUSDT", dec.get("btc_path_ev")),
+            ("ETHUSDT", dec.get("eth_path_ev")),
+            ("SOLUSDT", dec.get("sol_path_ev")),
+            ("XRPUSDT", dec.get("xrp_path_ev")),
+            ("HOLD", hold_ev),
+        ):
+            book = snapshot_book(sym, redis_client) if sym != "HOLD" else {
+                "best_bid": None, "best_ask": None, "mid": None, "spread_pct": None,
+                "bid_qty_top5": None, "ask_qty_top5": None, "imbalance_top5": None,
+                "ofi_5s": None, "agg_flow_imbalance_5s": None, "microprice_pressure": None,
+                "book_source": "hold", "book_age_sec": None,
+            }
+            action = selected if (sym == winner or (sym == "HOLD" and selected == "HOLD")) else "HOLD"
+            rows.append(
+                {
+                    "ts_utc": ts,
+                    "engine": "day",
+                    "symbol": sym,
+                    "selected_action": action,
+                    "selection_reason": dec.get("why_selected"),
+                    "buy_ev": ev if sym != "HOLD" else hold_ev,
+                    "hold_ev": hold_ev,
+                    "model_version": version,
+                    **book,
+                    "extras_json": payload,
+                }
+            )
+        return record_rows(rows, force=True)
+    except Exception as exc:
+        logger.debug("decision_book_tape day bar failed: %s", exc)
+        return 0
+
+
 def record_day_decision(
     *,
     symbol: str,
