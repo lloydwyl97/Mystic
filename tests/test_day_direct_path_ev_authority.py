@@ -8,6 +8,7 @@ from backend.services.day_direct_path_ev_authority import (
     OLD_RANK_EXECUTION_AUTHORITY,
     decide_day_bar,
     old_rank_telemetry,
+    post_cost_economics_ev,
     select_action,
 )
 from backend.services.entry_decision_authority import build_day_entry_provenance, is_model_controlled
@@ -233,6 +234,40 @@ def test_live_flags_remain_false_in_authority_files():
         src = open(path, encoding="utf-8").read()
         for token in banned:
             assert token not in src
+
+
+def test_post_cost_economics_ev_negative_cannot_beat_hold():
+    ev = post_cost_economics_ev(
+        {
+            "expected_favorable_excursion": 0.002,
+            "expected_adverse_excursion": 0.008,
+            "prob_buy": 0.40,
+            "prob_sell": 0.40,
+            "prob_hold": 0.20,
+            "estimated_fees_pct": 0.001,
+            "estimated_slippage_pct": 0.0005,
+            "spread_pct": 0.0004,
+        }
+    )
+    assert ev is not None
+    assert ev < 0.0
+    scores = {
+        "btc_path_ev": 0.01,
+        "eth_path_ev": 0.0,
+        "sol_path_ev": 0.0,
+        "xrp_path_ev": 0.0,
+        "path_net_status": "predicted",
+    }
+    out = select_action(scores)
+    assert out["selected_action"].startswith("BUY")
+    # Ranking EV itself must be the economic number when identifiable and non-positive.
+    scores["btc_path_ev"] = min(0.01, ev)
+    out2 = select_action(scores)
+    assert out2["selected_action"] == "HOLD"
+
+
+def test_post_cost_economics_ev_missing_fields_is_none():
+    assert post_cost_economics_ev({"buy_margin": -0.2, "confidence": 0.9}) is None
 
 
 def test_process_bar_uses_direct_selector_not_old_queue():

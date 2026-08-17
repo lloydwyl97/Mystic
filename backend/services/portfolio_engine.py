@@ -14291,33 +14291,41 @@ class PortfolioEngine:
                 found = cand
                 break
         if found is None:
-            slash = _slash_symbol(want)
-            price = 0.0
-            with contextlib.suppress(Exception):
-                price = float(self._get_cached_market_price(slash) or self._get_cached_market_price(want) or 0.0)
-            atr = 0.0
-            if price > 0:
-                with contextlib.suppress(Exception):
-                    atr = float(await self._get_atr_for_symbol(slash, price) or 0.0)
-            found = BuyCandidate(
-                symbol=slash,
-                confidence=0.0,
-                trend_score=0.0,
-                chop_score=0.0,
-                coin_edge_score=0.0,
-                volatility_penalty=0.0,
-                spread_penalty=0.0,
-                atr=float(atr or 0.0),
-                current_price=float(price or 0.0),
-                decision_data={},
-                decision_id=f"path_ev_{want}_{bar_timestamp}",
-            )
+            decision = dict(decision)
+            decision["selected_action"] = "HOLD"
+            decision["why_selected"] = "PATH_NET_NO_SCORED_CANDIDATE"
+            decision["true_safety_reject_reason"] = "PATH_NET_NO_SCORED_CANDIDATE"
+            self._last_day_path_ev_decision = decision
+            return None, decision
         found.decision_data = dict(found.decision_data or {})
+        cand_ev = 0.0
+        with contextlib.suppress(Exception):
+            cand_ev = float(
+                found.decision_data.get("selected_net_expected_value")
+                or found.decision_data.get("adjusted_ev")
+                or found.decision_data.get("predicted_net_return")
+                or 0.0
+            )
+        if cand_ev <= 0.0:
+            with contextlib.suppress(Exception):
+                cand_ev = float(self._estimate_candidate_net_expected_value(found.decision_data, symbol=str(found.symbol or "")))
+        auth_ev = float(decision.get("selected_ev") or decision.get("selected_net_expected_value") or 0.0)
+        from backend.services.day_direct_path_ev_authority import post_cost_economics_ev
+
+        econ_ev = post_cost_economics_ev(found.decision_data)
+        # Economic quality must beat HOLD in path-EV, scored candidate, and identifiable post-cost EV.
+        if auth_ev <= 0.0 or cand_ev <= 0.0 or (econ_ev is not None and econ_ev <= 0.0):
+            decision = dict(decision)
+            decision["selected_action"] = "HOLD"
+            decision["why_selected"] = "PATH_NET_CANDIDATE_NONPOSITIVE_EV"
+            decision["candidate_net_ev"] = cand_ev
+            decision["candidate_post_cost_ev"] = econ_ev
+            self._last_day_path_ev_decision = decision
+            return None, decision
         found.decision_data.update(decision)
-        found.decision_data["hard_block"] = False
-        found.decision_data["candidate_eligible"] = True
         found.decision_data["live_ai_strategy"] = "day"
         found.decision_data["why_selected"] = str(decision.get("why_selected") or "PATH_NET_BEATS_HOLD")
+        found.decision_data["candidate_net_ev"] = cand_ev
         return found, decision
 
     async def _execute_additional_bar_buys(
@@ -16868,7 +16876,24 @@ class PortfolioEngine:
     def get_trading_capability_status(self) -> dict[str, Any]:
         """Honest capability flags. Process-alive is not the same as entries enabled."""
         ks = self.get_kill_switch_status()
-        failsafe = "ACCOUNT_FAILSAFE" in str(self._kill_switch_reason or "")
+        account_equity = float(getattr(self, "cash_balance", 0.0) or 0.0) + float(getattr(self, "_positions_value", 0.0) or 0.0)
+        from backend.services.circuit_breaker_service import account_failsafe_tripped
+
+        principal = float(getattr(self, "principal", 0.0) or 0.0)
+        ledger_failsafe = account_failsafe_tripped(account_equity, principal)
+        # Persisted CB / leftover reason strings are not authority. Revalidate them
+        # against the same equity predicate execution uses, then drop stale latch.
+        with contextlib.suppress(Exception):
+            from backend.services.circuit_breaker_service import trading_circuit_breaker
+
+            trading_circuit_breaker.check_account_failsafe(account_equity, principal)
+        failsafe = bool(ledger_failsafe)
+        failsafe_reason = ""
+        if failsafe:
+            failsafe_reason = (
+                f"ACCOUNT_FAILSAFE equity=${account_equity:.2f} principal=${float(self.principal or 0.0):.2f} "
+                "— MANUAL POSITION REVIEW REQUIRED"
+            )
         accounting: dict[str, Any] = {"ok": True, "orphans": []}
         try:
             from backend.services.atomic_execution_book import find_cash_position_disagreement
@@ -16881,19 +16906,27 @@ class PortfolioEngine:
             reasons.append(f"trading_paused:{self._pause_reason}")
         if self._account_status != AccountStatus.HEALTHY:
             reasons.append(f"account_status:{self._account_status.value}")
-        if ks.get("buys_blocked"):
+        if failsafe:
+            reasons.append(failsafe_reason)
+        elif ks.get("buys_blocked"):
             reasons.append(f"kill_switch:{ks.get('mode')}:{ks.get('reason')}")
         if not accounting.get("ok", False):
             n_orphans = len(accounting.get("orphans") or [])
             reasons.append(f"accounting_disagreement:orphans={n_orphans}:diff={accounting.get('identity_diff')}")
-        day_entry = not self._trading_paused and self._account_status == AccountStatus.HEALTHY and not bool(ks.get("buys_blocked")) and bool(accounting.get("ok"))
+        day_entry = (
+            not self._trading_paused
+            and self._account_status == AccountStatus.HEALTHY
+            and not bool(ks.get("buys_blocked"))
+            and not failsafe
+            and bool(accounting.get("ok"))
+        )
         return {
             "process_alive": True,
             "accounting_healthy": bool(accounting.get("ok")),
             "day_entry_enabled": day_entry,
             "day_exit_enabled": not bool(ks.get("sells_blocked")),
             "kill_switch_mode": ks.get("mode"),
-            "kill_switch_reason": ks.get("reason"),
+            "kill_switch_reason": (failsafe_reason if failsafe else ks.get("reason")),
             "failsafe_active": failsafe,
             "no_trade_reason": "; ".join(reasons) if reasons else None,
             "accounting": accounting,
@@ -17268,10 +17301,30 @@ class PortfolioEngine:
                                         if not pos_row:
                                             return True, None
                                         entry_time = float(pos_row["entry_time"] or 0.0)
-                                        sell_after = conn.execute(
-                                            "SELECT 1 FROM paper_trades WHERE symbol = ? AND side = 'SELL' AND (strftime('%s', timestamp) > ? OR timestamp > ?) LIMIT 1",
-                                            (sym, entry_time, str(entry_time)),
-                                        ).fetchone()
+                                        sell_rows = conn.execute(
+                                            """
+                                            SELECT timestamp FROM paper_trades
+                                            WHERE symbol = ? AND UPPER(side) = 'SELL'
+                                            """,
+                                            (sym,),
+                                        ).fetchall()
+                                        sell_after = None
+                                        for srow in sell_rows:
+                                            sell_epoch = 0.0
+                                            raw_ts = srow[0] if srow else None
+                                            if raw_ts is not None:
+                                                try:
+                                                    sell_epoch = float(raw_ts)
+                                                except (TypeError, ValueError):
+                                                    try:
+                                                        sell_epoch = datetime.fromisoformat(
+                                                            str(raw_ts).replace("Z", "+00:00")
+                                                        ).timestamp()
+                                                    except Exception:
+                                                        sell_epoch = 0.0
+                                            if sell_epoch > entry_time + 1e-6:
+                                                sell_after = srow
+                                                break
                                         if sell_after:
                                             conn.execute("BEGIN IMMEDIATE")
                                             conn.execute("DELETE FROM portfolio_engine_positions WHERE symbol = ?", (sym,))
@@ -18145,6 +18198,18 @@ class PortfolioEngine:
 
     def _check_kill_switch_buy(self) -> tuple[bool, str]:
         """Check if buy is blocked by kill switch"""
+        from backend.services.circuit_breaker_service import account_failsafe_tripped
+
+        account_equity = float(getattr(self, "cash_balance", 0.0) or 0.0) + float(getattr(self, "_positions_value", 0.0) or 0.0)
+        principal = float(getattr(self, "principal", 0.0) or 0.0)
+        if account_failsafe_tripped(account_equity, principal):
+            reason = (
+                f"KILL_SWITCH_{KillSwitchMode.PAUSE_BUYS.value}: "
+                f"{self._CIRCUIT_BREAKER_REASON_PREFIX}ACCOUNT_FAILSAFE "
+                f"equity=${account_equity:.2f} principal=${principal:.2f} "
+                "— MANUAL POSITION REVIEW REQUIRED"
+            )
+            return False, reason
         if self._entries_paused_by_kill_switch():
             return False, f"KILL_SWITCH_{self._kill_switch_mode.value}: {self._kill_switch_reason}"
         return True, ""
@@ -18171,6 +18236,24 @@ class PortfolioEngine:
 
     def get_kill_switch_status(self) -> dict[str, Any]:
         """Get current kill switch status"""
+        from backend.services.circuit_breaker_service import account_failsafe_tripped
+
+        account_equity = float(getattr(self, "cash_balance", 0.0) or 0.0) + float(getattr(self, "_positions_value", 0.0) or 0.0)
+        principal = float(getattr(self, "principal", 0.0) or 0.0)
+        failsafe = account_failsafe_tripped(account_equity, principal)
+        if failsafe:
+            reason = (
+                f"{self._CIRCUIT_BREAKER_REASON_PREFIX}ACCOUNT_FAILSAFE "
+                f"equity=${account_equity:.2f} principal=${principal:.2f} "
+                "— MANUAL POSITION REVIEW REQUIRED"
+            )
+            return {
+                "mode": KillSwitchMode.PAUSE_BUYS.value,
+                "reason": reason,
+                "buys_blocked": True,
+                "sells_blocked": self._kill_switch_mode == KillSwitchMode.PAUSE_ALL,
+                "protective_sells_allowed": True,
+            }
         return {
             "mode": self._kill_switch_mode.value,
             "reason": self._kill_switch_reason,
@@ -19855,12 +19938,18 @@ class PortfolioEngine:
         from backend.services.operator_config_service import get_max_open_positions
 
         mode = "LIVE" if effective_live else "PAPER"
+        capability = self.get_trading_capability_status()
+        ks = self.get_kill_switch_status()
         return {
             "mode": mode,
             "live_execution_enabled": bool(self._live_execution_enabled),
             "live_service_connected": bool(self._live_service is not None),
             "real_orders_enabled": effective_live,
-            "kill_switch": self._kill_switch_mode.value,
+            "kill_switch": ks.get("mode"),
+            "kill_switch_reason": capability.get("kill_switch_reason") or ks.get("reason"),
+            "failsafe_active": bool(capability.get("failsafe_active")),
+            "day_entry_enabled": bool(capability.get("day_entry_enabled")),
+            "no_trade_reason": capability.get("no_trade_reason"),
             "account_status": current_account_status.value,
             "trading_paused": self._trading_paused,
             "pause_reason": self._pause_reason if self._trading_paused else None,

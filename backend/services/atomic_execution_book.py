@@ -45,39 +45,200 @@ def _connect(path: str | Path, *, readonly: bool = False, timeout: float = 2.0) 
     return conn
 
 
+def _norm_sym(symbol: str) -> str:
+    return str(symbol or "").replace("/", "").replace("-", "").replace("_", "").upper()
+
+
+def _buy_closed_by_trade_id(conn: sqlite3.Connection, trade_id: str, symbol: str, buy_id: int) -> bool:
+    """True only when THIS buy lot was closed — not when a later same-symbol sell exists."""
+    tid = str(trade_id or "").strip()
+    if not tid:
+        return False
+    like = f"%{tid}%"
+    try:
+        row = conn.execute(
+            """
+            SELECT 1 FROM paper_trades
+            WHERE upper(side) = 'SELL'
+              AND id > ?
+              AND (
+                    IFNULL(explainability_json, '') LIKE ?
+                 OR IFNULL(diagnostics_json, '') LIKE ?
+                 OR IFNULL(context_snapshot_json, '') LIKE ?
+              )
+            LIMIT 1
+            """,
+            (int(buy_id), like, like, like),
+        ).fetchone()
+        if row:
+            return True
+    except sqlite3.OperationalError:
+        pass
+    try:
+        row = conn.execute(
+            """
+            SELECT 1 FROM position_close_ledger
+            WHERE IFNULL(detail, '') LIKE ?
+            LIMIT 1
+            """,
+            (f"%buy_trade_id={tid}%",),
+        ).fetchone()
+        if row:
+            return True
+    except sqlite3.OperationalError:
+        pass
+    try:
+        row = conn.execute(
+            """
+            SELECT 1 FROM operational_state
+            WHERE key = 'ledger_orphan_buy_cash_restore'
+              AND IFNULL(value_json, '') LIKE ?
+            LIMIT 1
+            """,
+            (f"%\"trade_id\": \"{tid}\"%",),
+        ).fetchone()
+        if row:
+            return True
+    except sqlite3.OperationalError:
+        pass
+    _ = symbol
+    return False
+
+
 def find_orphaned_day_buys(db_path: str | Path) -> list[dict[str, Any]]:
-    """BUY rows with remaining qty and no matching portfolio_engine_positions row."""
+    """BUY rows whose cash was spent and inventory is gone, with no matching close.
+
+    A later SELL of the same symbol does not close this lot unless it references
+    this buy's trade_id. ``created_at`` is an alias of ``timestamp``.
+    """
     path = str(db_path)
     conn = _connect(path, readonly=True, timeout=2.0)
     try:
-        rows = conn.execute(
-            """
-            SELECT t.id, t.trade_id, t.symbol, t.quantity,
-                   CASE WHEN IFNULL(t.remaining_position, 0) > 1e-12
-                        THEN t.remaining_position ELSE t.quantity END AS remaining_position,
-                   t.price, t.created_at
-            FROM paper_trades t
-            WHERE upper(t.side) = 'BUY'
-              AND IFNULL(t.quantity, 0) > 1e-12
-              AND NOT EXISTS (
-                  SELECT 1 FROM portfolio_engine_positions p
-                  WHERE replace(replace(upper(p.symbol), '/', ''), '-', '')
-                      = replace(replace(upper(t.symbol), '/', ''), '-', '')
-                    AND IFNULL(p.quantity, 0) > 1e-12
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM paper_trades s
-                  WHERE upper(s.side) = 'SELL'
-                    AND replace(replace(upper(s.symbol), '/', ''), '-', '')
-                        = replace(replace(upper(t.symbol), '/', ''), '-', '')
-                    AND s.id > t.id
-              )
-            ORDER BY t.id
-            """
-        ).fetchall()
-        return [dict(r) for r in rows]
-    except sqlite3.OperationalError:
+        try:
+            buys = conn.execute(
+                """
+                SELECT t.id, t.trade_id, t.symbol, t.quantity,
+                       IFNULL(t.remaining_position, 0) AS remaining_raw,
+                       CASE WHEN IFNULL(t.remaining_position, 0) > 1e-12
+                            THEN t.remaining_position ELSE t.quantity END AS remaining_position,
+                       t.price, t.timestamp AS created_at,
+                       IFNULL(t.diagnostics_json, '') AS diagnostics_json
+                FROM paper_trades t
+                WHERE upper(t.side) = 'BUY'
+                  AND IFNULL(t.quantity, 0) > 1e-12
+                ORDER BY t.id
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        open_tids: set[str] = set()
+        open_syms: set[str] = set()
+        try:
+            for r in conn.execute(
+                """
+                SELECT trade_id, symbol FROM portfolio_engine_positions
+                WHERE IFNULL(quantity, 0) > 1e-12
+                """
+            ):
+                if r["trade_id"]:
+                    open_tids.add(str(r["trade_id"]))
+                open_syms.add(_norm_sym(r["symbol"]))
+        except sqlite3.OperationalError:
+            pass
+        later_sell_syms: set[str] = set()
+        try:
+            for r in conn.execute(
+                """
+                SELECT b.id AS buy_id, b.symbol
+                FROM paper_trades b
+                WHERE upper(b.side) = 'BUY'
+                  AND EXISTS (
+                      SELECT 1 FROM paper_trades s
+                      WHERE upper(s.side) = 'SELL'
+                        AND replace(replace(upper(s.symbol), '/', ''), '-', '')
+                            = replace(replace(upper(b.symbol), '/', ''), '-', '')
+                        AND s.id > b.id
+                  )
+                """
+            ):
+                later_sell_syms.add(f"{int(r['buy_id'])}")
+        except sqlite3.OperationalError:
+            later_sell_syms = set()
+        out: list[dict[str, Any]] = []
+        for r in buys:
+            d = dict(r)
+            if "ORPHAN_CASH_RESTORED" in str(d.get("diagnostics_json") or ""):
+                continue
+            tid = str(d.get("trade_id") or "")
+            if tid and tid in open_tids:
+                continue
+            if not tid and _norm_sym(d.get("symbol") or "") in open_syms:
+                continue
+            if _buy_closed_by_trade_id(conn, tid, str(d.get("symbol") or ""), int(d.get("id") or 0)):
+                continue
+            remaining_raw = float(d.get("remaining_raw") or 0.0)
+            has_later_same_symbol_sell = str(int(d.get("id") or 0)) in later_sell_syms
+            # remaining=0 + a later same-symbol SELL is normal FIFO history, not an orphan.
+            # remaining=0 with no later same-symbol SELL is a vanished lot (cash spent, inventory gone).
+            if remaining_raw <= 1e-12 and has_later_same_symbol_sell:
+                continue
+            d.pop("diagnostics_json", None)
+            d.pop("remaining_raw", None)
+            out.append(d)
+        return out
+    except sqlite3.DatabaseError:
         return []
+    finally:
+        conn.close()
+
+
+def find_unclosed_buy_cash_debits(db_path: str | Path) -> list[dict[str, Any]]:
+    """BUY lots that spent cash and were never closed by trade_id.
+
+    Unlike ``find_orphaned_day_buys``, a later same-symbol SELL of a *different*
+    lot does not hide this debit. Used for ledger identity repair.
+    """
+    path = str(db_path)
+    conn = _connect(path, readonly=True, timeout=2.0)
+    try:
+        try:
+            buys = conn.execute(
+                """
+                SELECT t.id, t.trade_id, t.symbol, t.quantity,
+                       CASE WHEN IFNULL(t.remaining_position, 0) > 1e-12
+                            THEN t.remaining_position ELSE t.quantity END AS remaining_position,
+                       t.price, t.timestamp AS created_at,
+                       IFNULL(t.diagnostics_json, '') AS diagnostics_json
+                FROM paper_trades t
+                WHERE upper(t.side) = 'BUY'
+                  AND IFNULL(t.quantity, 0) > 1e-12
+                ORDER BY t.id
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        open_tids: set[str] = set()
+        try:
+            for r in conn.execute(
+                "SELECT trade_id FROM portfolio_engine_positions WHERE IFNULL(quantity, 0) > 1e-12"
+            ):
+                if r["trade_id"]:
+                    open_tids.add(str(r["trade_id"]))
+        except sqlite3.OperationalError:
+            pass
+        out: list[dict[str, Any]] = []
+        for r in buys:
+            d = dict(r)
+            if "ORPHAN_CASH_RESTORED" in str(d.get("diagnostics_json") or ""):
+                continue
+            tid = str(d.get("trade_id") or "")
+            if tid and tid in open_tids:
+                continue
+            if _buy_closed_by_trade_id(conn, tid, str(d.get("symbol") or ""), int(d.get("id") or 0)):
+                continue
+            d.pop("diagnostics_json", None)
+            out.append(d)
+        return out
     except sqlite3.DatabaseError:
         return []
     finally:

@@ -23,6 +23,17 @@ except (ImportError, ModuleNotFoundError, AttributeError, ValueError, TypeError,
 logger = logging.getLogger(__name__)
 
 
+ACCOUNT_FAILSAFE_EQUITY_FRACTION = 0.90
+
+
+def account_failsafe_tripped(current_equity: float, principal: float) -> bool:
+    """Authoritative failsafe predicate: equity collapsed vs principal."""
+    prin = float(principal or 0.0)
+    if prin <= 0.0:
+        return False
+    return float(current_equity or 0.0) <= prin * ACCOUNT_FAILSAFE_EQUITY_FRACTION
+
+
 class CircuitState(Enum):
     CLOSED = "closed"  # Normal operation
     OPEN = "open"  # Circuit is open, failing fast
@@ -319,9 +330,9 @@ class TradingCircuitBreaker:
         """
         if principal <= 0:
             return bool(self.account_failsafe_active)
-        threshold = float(principal) * 0.90  # 10% loss from starting capital
+        threshold = float(principal) * ACCOUNT_FAILSAFE_EQUITY_FRACTION
         eq = float(current_equity or 0.0)
-        if eq <= threshold:
+        if account_failsafe_tripped(eq, principal):
             if not self.account_failsafe_active:
                 self.account_failsafe_active = True
                 logger.critical(

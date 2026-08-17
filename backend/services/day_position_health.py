@@ -6,6 +6,7 @@ No sells, no rotation, no gate changes. Persists to operational_state + optional
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sqlite3
@@ -503,6 +504,15 @@ def update_telemetry(
         max_open_positions=max_pos,
         last_bar_skip_reason=last_bar_skip_reason,
     )
+    with contextlib.suppress(Exception):
+        cap = engine.get_trading_capability_status()
+        payload["failsafe_active"] = bool(cap.get("failsafe_active"))
+        payload["day_entry_enabled"] = bool(cap.get("day_entry_enabled"))
+        payload["no_trade_reason"] = cap.get("no_trade_reason")
+        if cap.get("failsafe_active") or not cap.get("day_entry_enabled"):
+            reason = str(cap.get("no_trade_reason") or cap.get("kill_switch_reason") or "")
+            if reason:
+                payload["capital_idle_reason"] = reason
     persist_health(payload, db_path=str(getattr(engine, "db_path", DATABASE_PATH)))
     if payload.get("capital_deployable") and payload.get("trapped_position_days_max", 0) >= 1.0:
         record_capital_idle_observation(

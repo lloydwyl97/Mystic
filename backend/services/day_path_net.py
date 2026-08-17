@@ -202,7 +202,23 @@ def resolve_day_path_ev(
         dd["predicted_net_return"] = 0.0
         dd["path_net_status"] = "unavailable_hold"
         return 0.0, dd
-    dd["selected_net_expected_value"] = float(pred)
-    dd["predicted_net_return"] = float(pred)
+    pred_f = float(pred)
+    dd["selected_net_expected_value_raw"] = pred_f
+    # Learning haircut only — never a permission gate. Stall history reduces EV vs HOLD.
+    try:
+        from backend.services.symbol_setup_outcome_penalty import evaluate_low_mfe_stall_penalty
+
+        setup = str(dd.get("setup_type") or dd.get("entry_thesis") or "")
+        regime = str(dd.get("day_route_regime") or dd.get("regime") or "")
+        pen = evaluate_low_mfe_stall_penalty(sym, setup, regime, db_path=db_path or None)
+        if pen.get("applied"):
+            factor = float(pen.get("ev_factor") or 1.0)
+            pred_f = pred_f * factor
+            dd["outcome_low_mfe_stall_penalty_applied"] = True
+            dd["outcome_low_mfe_stall_ev_factor"] = factor
+    except Exception:
+        pass
+    dd["selected_net_expected_value"] = pred_f
+    dd["predicted_net_return"] = pred_f
     dd["path_net_status"] = "predicted"
-    return float(pred), dd
+    return pred_f, dd

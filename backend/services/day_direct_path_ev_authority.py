@@ -44,6 +44,51 @@ def _coin_key(api: str) -> str:
     return s.lower()
 
 
+def _opt_float(payload: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        raw = payload.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if val == val:  # not NaN
+            return val
+    return None
+
+
+def post_cost_economics_ev(decision_data: dict[str, Any] | None) -> float | None:
+    """Reconstruct post-cost EV from candidate fields. None if not identifiable.
+
+    Used to keep ranking honest: a path-net score cannot beat HOLD when the
+    candidate's own expected move after fees/slip/spread is non-positive.
+    Does not invent an edge from buy_margin or regime.
+    """
+    dd = decision_data or {}
+    efe = _opt_float(dd, "expected_favorable_excursion", "estimated_mfe", "estimated_win_pct")
+    eae = _opt_float(dd, "expected_adverse_excursion", "estimated_mae", "estimated_loss_pct")
+    if efe is None or eae is None:
+        return None
+    p_buy = _opt_float(dd, "prob_buy", "winner_probability")
+    p_sell = _opt_float(dd, "prob_sell")
+    if p_buy is None:
+        p_buy = 0.5
+    if p_sell is None:
+        p_sell = max(0.0, 1.0 - float(p_buy))
+    p_hold = max(0.0, _opt_float(dd, "prob_hold") or 0.0)
+    total = float(p_buy) + float(p_sell) + float(p_hold)
+    if total > 0:
+        p_buy = float(p_buy) / total
+        p_sell = float(p_sell) / total
+    fees = max(0.0, _opt_float(dd, "estimated_fees_pct") or 0.0)
+    slip = max(0.0, _opt_float(dd, "estimated_slippage_pct") or 0.0)
+    spread = max(0.0, _opt_float(dd, "spread_cost_pct", "spread_pct") or 0.0)
+    if fees == 0.0 and slip == 0.0 and spread == 0.0:
+        fees = float(ESTIMATED_ROUNDTRIP_COST)
+    return float(p_buy) * float(efe) - float(p_sell) * abs(float(eae)) - fees - slip - spread
+
+
 def score_four_coins(*, db_path: str = "") -> dict[str, Any]:
     """Score BTC/ETH/SOL/XRP independently. Missing prediction is HOLD (0), not invented."""
     art = load_accepted_day_artifact()

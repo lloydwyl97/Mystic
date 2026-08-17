@@ -245,6 +245,9 @@ def test_status_exposes_failsafe_when_not_trading_paused():
         db = Path(tmp) / "status.db"
         engine = _init_engine(db)
         engine._trading_paused = False
+        engine.cash_balance = 8040.0
+        engine._positions_value = 0.0
+        engine._total_equity = 8040.0
         from backend.services.portfolio_engine import KillSwitchMode
 
         engine._kill_switch_mode = KillSwitchMode.PAUSE_BUYS
@@ -253,7 +256,150 @@ def test_status_exposes_failsafe_when_not_trading_paused():
         assert cap["failsafe_active"] is True
         assert cap["day_entry_enabled"] is False
         assert cap["no_trade_reason"]
-        assert "kill_switch" in cap["no_trade_reason"]
+        assert "ACCOUNT_FAILSAFE" in cap["no_trade_reason"]
+
+
+def test_status_and_execution_agree_when_kill_switch_resume_but_equity_low():
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "status_resume.db"
+        engine = _init_engine(db, cash=25_000.0)
+        engine.cash_balance = 20_984.86
+        engine._positions_value = 0.0
+        engine._total_equity = 20_984.86
+        engine._trading_paused = False
+        from backend.services.portfolio_engine import KillSwitchMode
+
+        engine._kill_switch_mode = KillSwitchMode.RESUME
+        engine._kill_switch_reason = ""
+        cap = engine.get_trading_capability_status()
+        ks = engine.get_kill_switch_status()
+        can_buy, reason = engine._check_kill_switch_buy()
+        assert cap["failsafe_active"] is True
+        assert cap["day_entry_enabled"] is False
+        assert "ACCOUNT_FAILSAFE" in str(cap["no_trade_reason"])
+        assert ks["buys_blocked"] is True
+        assert ks["mode"] == "PAUSE_BUYS"
+        assert "ACCOUNT_FAILSAFE" in str(ks["reason"])
+        assert can_buy is False
+        assert "ACCOUNT_FAILSAFE" in reason
+        op = asyncio.run(engine.get_operator_status())
+        assert op["failsafe_active"] is True
+        assert op["kill_switch"] == "PAUSE_BUYS"
+        assert op["day_entry_enabled"] is False
+        assert "ACCOUNT_FAILSAFE" in str(op.get("no_trade_reason") or op.get("kill_switch_reason") or "")
+
+
+def test_later_same_symbol_sell_does_not_hide_unclosed_other_lot():
+    from backend.services.atomic_execution_book import find_unclosed_buy_cash_debits
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "lots.db"
+        engine = _init_engine(db)
+        with sqlite3.connect(str(db)) as conn:
+            conn.execute(
+                """
+                INSERT INTO paper_trades (
+                    trade_id, paper_run_id, mode, symbol, side, quantity, price,
+                    remaining_position, timestamp, status
+                ) VALUES
+                ('buy_a', 'test', 'paper', 'SOL/USDT', 'BUY', 30.0, 70.0, 0.0, '2026-08-01T21:15:00+00:00', 'executed'),
+                ('sell_b', 'test', 'paper', 'SOL/USDT', 'SELL', 28.0, 71.0, 0.0, '2026-08-10T08:42:00+00:00', 'executed')
+                """
+            )
+            conn.commit()
+        unclosed = find_unclosed_buy_cash_debits(str(db))
+        assert any(o.get("trade_id") == "buy_a" for o in unclosed)
+        orphans = find_orphaned_day_buys(str(db))
+        assert not any(o.get("trade_id") == "buy_a" for o in orphans)
+
+
+def test_canonical_purge_ignores_historical_sells_before_entry():
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "purge.db"
+        engine = _init_engine(db)
+        entry_time = time.time()
+        with sqlite3.connect(str(db)) as conn:
+            conn.execute(
+                """
+                INSERT INTO paper_trades (
+                    trade_id, paper_run_id, mode, symbol, side, quantity, price,
+                    remaining_position, timestamp, status
+                ) VALUES ('old_sell', 'test', 'paper', 'BTC/USDT', 'SELL', 0.03, 65000, 0.0,
+                          '2026-08-01T00:00:00+00:00', 'executed')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO portfolio_engine_positions (
+                    symbol, quantity, entry_price, entry_time, trade_id,
+                    stop_price, take_profit_1_price, take_profit_2_price,
+                    highest_price, atr_at_entry, last_updated
+                ) VALUES ('BTC/USDT', 0.03373, 65206.88, ?, 'new_buy',
+                          63000.0, 67000.0, 69000.0, 65206.88, 400.0, datetime('now'))
+                """,
+                (entry_time,),
+            )
+            conn.commit()
+
+        def _check():
+            with sqlite3.connect(str(db)) as conn:
+                pos_row = conn.execute("SELECT * FROM portfolio_engine_positions WHERE symbol=?", ("BTC/USDT",)).fetchone()
+                assert pos_row is not None
+                entry = float(pos_row[3] if pos_row[3] else 0)
+                sells = conn.execute("SELECT timestamp FROM paper_trades WHERE symbol=? AND side='SELL'", ("BTC/USDT",)).fetchall()
+                later = False
+                for srow in sells:
+                    raw = srow[0]
+                    try:
+                        from datetime import datetime
+                        epoch = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        epoch = 0.0
+                    if epoch > entry + 1e-6:
+                        later = True
+                return later
+
+        assert _check() is False
+        with sqlite3.connect(str(db)) as conn:
+            n = conn.execute("SELECT COUNT(*) FROM portfolio_engine_positions WHERE symbol='BTC/USDT'").fetchone()[0]
+        assert n == 1
+
+
+def test_orphan_cash_restore_credits_identified_buys_only():
+    from backend.services.ledger_operational_heal import apply_orphan_buy_cash_restore
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "heal.db"
+        engine = _init_engine(db, cash=25_000.0)
+        with sqlite3.connect(str(db)) as conn:
+            conn.execute(
+                """
+                INSERT INTO paper_trades (
+                    id, trade_id, paper_run_id, mode, symbol, side, quantity, price,
+                    remaining_position, timestamp, status
+                ) VALUES (4194, 'mystic_BTC/USDT_1', 'test', 'paper', 'BTC/USDT', 'BUY',
+                          0.03373, 65206.88, 0.0, '2026-08-10T08:00:07+00:00', 'executed')
+                """
+            )
+            conn.execute(
+                "UPDATE portfolio_engine_ledger SET cash_balance=20984.86, positions_value=0, realized_pnl=385.15, total_equity=20984.86 WHERE id=1"
+            )
+            conn.commit()
+            buy_id = conn.execute("SELECT id FROM paper_trades WHERE trade_id='mystic_BTC/USDT_1'").fetchone()[0]
+        out = apply_orphan_buy_cash_restore(
+            str(db),
+            buy_ids=[int(buy_id)],
+            heal_key="TEST_ORPHAN_BTC_4194",
+            reason="test restore vanished BTC buy cash",
+        )
+        assert out["success"] is True
+        with sqlite3.connect(str(db)) as conn:
+            cash, equity, realized = conn.execute(
+                "SELECT cash_balance, total_equity, realized_pnl FROM portfolio_engine_ledger WHERE id=1"
+            ).fetchone()
+        assert realized == pytest.approx(385.15, abs=0.01)
+        assert cash == pytest.approx(20984.86 + 0.03373 * 65206.88, abs=0.02)
+        assert find_orphaned_day_buys(str(db)) == []
 
 
 def test_scalp_money_db_migrate_copies_and_isolates():

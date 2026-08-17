@@ -1538,7 +1538,12 @@ function refreshCommandCenter() {
         }
     }
     const op = canon.operator || {};
+    const failsafeOn = op.failsafe_active === true || dh.failsafe_active === true;
     set("cc-kill-switch", op.kill_switch || "--");
+    set("cc-failsafe", failsafeOn ? "ACCOUNT_FAILSAFE" : "OFF");
+    if (failsafeOn && (op.no_trade_reason || dh.capital_idle_reason)) {
+        set("cc-day-decision", op.no_trade_reason || dh.capital_idle_reason);
+    }
     const lr = window._lastLiveReadiness || {};
     set("cc-live-ready", lr.ready_for_tiny_live_test === true ? "READY" : (lr.live_orders_block_reason || (lr.live_readiness_blockers || [])[0] || "--"));
 }
@@ -1668,6 +1673,7 @@ function updateDayHealth(res) {
     const set = setCardText;
     set("dh-slots", d.open_positions_count != null || d.max_open_positions != null ? `${d.open_positions_count || 0}/${d.max_open_positions || 4}` : "--");
     set("dh-idle-cash", d.cash_balance != null ? "$" + Number(d.cash_balance).toFixed(2) : "--");
+    set("dh-failsafe", d.failsafe_active === true ? "ACCOUNT_FAILSAFE" : (d.failsafe_active === false ? "OFF" : "--"));
     set("dh-idle-reason", d.capital_idle_reason || "--");
     set("cc-day-decision", d.capital_idle_reason || "--");
     set("cc-day-positions", d.open_positions_count != null ? String(d.open_positions_count) : "--");

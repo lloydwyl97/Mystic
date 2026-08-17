@@ -201,11 +201,21 @@ def _read_operator_status_from_sqlite_sync() -> dict[str, Any] | None:
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='portfolio_engine_ledger'")
         if not cursor.fetchone():
             return None
-        cursor.execute("SELECT cash_balance, total_equity, positions_value, account_status, trading_paused, pause_reason FROM portfolio_engine_ledger WHERE id=1")
-        row = cursor.fetchone()
+        try:
+            cursor.execute("SELECT cash_balance, total_equity, positions_value, account_status, trading_paused, pause_reason, principal FROM portfolio_engine_ledger WHERE id=1")
+            row = cursor.fetchone()
+            principal_present = True
+        except sqlite3.OperationalError:
+            cursor.execute("SELECT cash_balance, total_equity, positions_value, account_status, trading_paused, pause_reason FROM portfolio_engine_ledger WHERE id=1")
+            row = cursor.fetchone()
+            principal_present = False
         if not row or row[0] is None:
             return None
-        cash_balance, total_equity, positions_value, account_status, trading_paused, pause_reason = row
+        if principal_present:
+            cash_balance, total_equity, positions_value, account_status, trading_paused, pause_reason, principal = row
+        else:
+            cash_balance, total_equity, positions_value, account_status, trading_paused, pause_reason = row
+            principal = 0.0
 
         cursor.execute("SELECT COUNT(*) FROM portfolio_engine_positions WHERE quantity > 0")
         pos_row = cursor.fetchone()
@@ -215,6 +225,7 @@ def _read_operator_status_from_sqlite_sync() -> dict[str, Any] | None:
             "cash_balance": float(cash_balance or 0),
             "total_equity": float(total_equity or 0),
             "positions_value": float(positions_value or 0),
+            "principal": float(principal or 0),
             "account_status": account_status or "UNKNOWN",
             "trading_paused": bool(trading_paused),
             "pause_reason": pause_reason or "",
@@ -2132,6 +2143,20 @@ async def get_operator_status() -> dict[str, Any]:
         sqlite_data = await _read_operator_status_from_sqlite()
         if sqlite_data:
             status.update(sqlite_data)
+            from backend.services.circuit_breaker_service import account_failsafe_tripped
+
+            ledger_equity = float(sqlite_data.get("cash_balance") or 0) + float(sqlite_data.get("positions_value") or 0)
+            principal = float(sqlite_data.get("principal") or 0)
+            if account_failsafe_tripped(ledger_equity, principal):
+                reason = (
+                    f"ACCOUNT_FAILSAFE equity=${ledger_equity:.2f} principal=${principal:.2f} "
+                    "— MANUAL POSITION REVIEW REQUIRED"
+                )
+                status["kill_switch"] = "PAUSE_BUYS"
+                status["kill_switch_reason"] = reason
+                status["failsafe_active"] = True
+                status["day_entry_enabled"] = False
+                status["no_trade_reason"] = reason
 
         try:
             from backend.services.day_position_health import load_health
@@ -2190,6 +2215,18 @@ async def get_day_position_health() -> dict[str, Any]:
         payload = await asyncio.to_thread(load_health)
         if payload is None:
             return {"success": True, "data": None, "note": "no_telemetry_yet"}
+        try:
+            engine = get_portfolio_engine()
+            cap = engine.get_trading_capability_status()
+            payload = dict(payload)
+            payload["failsafe_active"] = bool(cap.get("failsafe_active"))
+            payload["day_entry_enabled"] = bool(cap.get("day_entry_enabled"))
+            if cap.get("failsafe_active") or not cap.get("day_entry_enabled"):
+                reason = str(cap.get("no_trade_reason") or cap.get("kill_switch_reason") or "")
+                if reason:
+                    payload["capital_idle_reason"] = reason
+        except Exception:
+            pass
         return {"success": True, "data": payload}
     except Exception as e:
         logger.exception("Error getting day position health: %s", e)
