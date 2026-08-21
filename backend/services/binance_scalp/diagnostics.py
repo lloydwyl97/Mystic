@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from backend.services.binance_scalp.config import ScalpConfig, get_scalp_config
@@ -59,6 +60,8 @@ def build_fee_diagnostic(
             "SCALP_USE_MAKER_ONLY": econ.use_maker_only,
             "SCALP_ENTRY_IS_MAKER": econ.entry_is_maker,
             "SCALP_EXIT_IS_MAKER": econ.exit_is_maker,
+            "SCALP_ENGINE_VERSION": os.getenv("SCALP_ENGINE_VERSION", "scalp_v1"),
+            "SCALP_CIRCUIT_BREAKER_EPOCH": os.getenv("SCALP_CIRCUIT_BREAKER_EPOCH", ""),
         },
     }
 

@@ -556,9 +556,15 @@ class BinanceScalpPaperEngine:
         Two conditions trigger the breaker:
         1. Today's closed-trade PnL is worse than -SCALP_DAILY_LOSS_LIMIT_PCT * principal.
         2. The last SCALP_MAX_CONSECUTIVE_LOSSES closed trades are all losses.
+
+        SCALP_CIRCUIT_BREAKER_EPOCH excludes trades closed before that timestamp.
+        The breaker keeps no state and re-derives from history each cycle, so once
+        it trips on a run of losses it stays tripped forever unless the window is
+        moved. The epoch moves the window; it does not weaken either threshold.
         """
         try:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            epoch = (self.config.circuit_breaker_epoch or "").strip()
             with self._conn() as conn:
                 ledger = self._ledger(conn)
                 principal = float(ledger["principal"])
@@ -571,8 +577,9 @@ class BinanceScalpPaperEngine:
                     WHERE upper(side) = 'SELL'
                       AND pnl_usd IS NOT NULL
                       AND date(created_at) = ?
+                      AND (? = '' OR created_at >= ?)
                     """,
-                    (today,),
+                    (today, epoch, epoch),
                 ).fetchone()
                 today_pnl = float(row[0]) if row else 0.0
                 daily_limit = self.config.daily_loss_limit_pct * principal
@@ -591,14 +598,16 @@ class BinanceScalpPaperEngine:
                     """
                     SELECT pnl_usd FROM scalp_paper_trades
                     WHERE upper(side) = 'SELL' AND pnl_usd IS NOT NULL
+                      AND (? = '' OR created_at >= ?)
                     ORDER BY id DESC LIMIT ?
                     """,
-                    (max_consec,),
+                    (epoch, epoch, max_consec),
                 ).fetchall()
                 if len(recent_rows) >= max_consec and all(float(r[0]) <= 0.0 for r in recent_rows):
                     logger.warning(
-                        "[SCALP_CIRCUIT_BREAKER] %d consecutive losses, halt=True",
+                        "[SCALP_CIRCUIT_BREAKER] %d consecutive losses since epoch=%s, halt=True",
                         max_consec,
+                        epoch or "(none)",
                     )
                     return True
         except Exception as e:
