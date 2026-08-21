@@ -5160,6 +5160,26 @@ class PortfolioEngine:
             float(cooldown_until),
         )
 
+    def _lookup_last_position_close(self, symbol: str) -> dict[str, Any] | None:
+        """Most recent position_close_ledger row for same-rise rebuy checks."""
+        sym = normalize_symbol(symbol)
+        try:
+            with connect_managed(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT close_reason, closed_at_epoch
+                    FROM position_close_ledger
+                    WHERE symbol = ?
+                    ORDER BY closed_at_epoch DESC LIMIT 1
+                    """,
+                    (sym,),
+                ).fetchone()
+            if not row:
+                return None
+            return {"close_reason": str(row[0] or ""), "closed_at_epoch": float(row[1] or 0.0)}
+        except Exception:
+            return None
+
     def _lookup_position_close_cooldown(self, symbol: str) -> float:
         """Return the most recent ``cooldown_until`` for ``symbol`` (epoch seconds).
 
@@ -11998,6 +12018,17 @@ class PortfolioEngine:
         # different achievable MFE distributions; global 0.4% starved wins on
         # low-vol coins pre-2026-08-10.
         _min_net_profit = float(_mnp_for_sym(symbol))
+        try:
+            from backend.services.day_trade_thesis import htf_4h_rise_intact as _htf_4h_rise_intact
+        except Exception:
+            _htf_4h_rise_intact = lambda _b: False  # noqa: E731
+        if _htf_4h_rise_intact(bundle_obj):
+            logger.info(
+                "DAY_4H_RISE_HOLD symbol=%s net_pct=%.6f skip=tp1_partial_and_leftover_net_profit",
+                symbol,
+                net_pnl_pct,
+            )
+            return None
         if _tp1_enabled and not getattr(position, "tp1_hit", False):
             _tp1_price = float(getattr(position, "take_profit_1_price", 0) or 0)
             if _tp1_price > 0 and current_price >= _tp1_price and net_pnl_pct + 1e-12 >= _min_net_profit * 0.45:

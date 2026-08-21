@@ -936,6 +936,133 @@ def _bundle_tf_align(bundle: dict[str, Any] | None, tf: str) -> float | None:
     return None
 
 
+def _ohlcv_ohlc(row: Any) -> tuple[float, float, float, float] | None:
+    """Parse CCXT-style [ts, o, h, l, c, v] or dict candle to (o, h, l, c)."""
+    try:
+        if isinstance(row, dict):
+            o = float(row.get("open") or 0)
+            h = float(row.get("high") or 0)
+            l = float(row.get("low") or 0)
+            c = float(row.get("close") or 0)
+        elif isinstance(row, (list, tuple)) and len(row) >= 5:
+            o = float(row[1])
+            h = float(row[2])
+            l = float(row[3])
+            c = float(row[4])
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+    if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+        return None
+    return o, h, l, c
+
+
+def _4h_recent_ohlc(bundle: dict[str, Any] | None) -> list[tuple[float, float, float, float]]:
+    if not isinstance(bundle, dict):
+        return []
+    rows = bundle.get("4h")
+    if not isinstance(rows, list):
+        return []
+    out: list[tuple[float, float, float, float]] = []
+    for row in rows[-8:]:
+        parsed = _ohlcv_ohlc(row)
+        if parsed is not None:
+            out.append(parsed)
+    return out
+
+
+def htf_4h_rise_intact(bundle: dict[str, Any] | None) -> bool:
+    """True while the 4H breakout/rise is still on (green HH or aligned 4H).
+
+    Used to hold DAY through vertical 4H expansions instead of clipping at
+    the first 0.4% path-aware print. Missing bundle is not intact.
+    """
+    if not isinstance(bundle, dict):
+        return False
+    align = _bundle_tf_align(bundle, "4h")
+    candles = _4h_recent_ohlc(bundle)
+    if len(candles) >= 2:
+        _o, h, _l, c = candles[-1]
+        _po, ph, pl, pc = candles[-2]
+        # A close under the prior 4H low ends the rise even if EMAs still stack up.
+        if c < pl:
+            return False
+        if c >= pc and (c >= _o or h >= ph):
+            return True
+        if c >= pl and align is not None and align >= 0.50:
+            return True
+    elif align is not None and align >= 0.52:
+        return True
+    return False
+
+
+def htf_4h_rise_broken(bundle: dict[str, Any] | None) -> bool:
+    """True when 4H structure has given way — first lower close below prior low."""
+    if not isinstance(bundle, dict):
+        return False
+    if htf_4h_rise_intact(bundle):
+        return False
+    align = _bundle_tf_align(bundle, "4h")
+    candles = _4h_recent_ohlc(bundle)
+    if len(candles) >= 2:
+        o, _h, _l, c = candles[-1]
+        _po, _ph, pl, pc = candles[-2]
+        if c < pl:
+            return True
+        if c < o and c < pc and (align is None or align < 0.45):
+            return True
+    if align is not None and align < 0.40:
+        return True
+    return False
+
+
+_PROFIT_CLOSE_MARKERS = (
+    "NET_PROFIT",
+    "PATH_EXECUTABLE_PROFIT",
+    "TP1",
+    "TAKE_PROFIT",
+)
+
+
+def is_day_profit_close_reason(reason: str | None) -> bool:
+    r = str(reason or "").strip().upper()
+    return any(m in r for m in _PROFIT_CLOSE_MARKERS)
+
+
+def htf_4h_rise_intact_for_symbol(symbol: str) -> bool:
+    """Read the cached DAY 4H bundle for a symbol (BTC/ETH/SOL/XRP)."""
+    try:
+        from backend.services.day_active_market_bundle import read_cached_day_active_bundle_sync
+
+        return htf_4h_rise_intact(read_cached_day_active_bundle_sync(symbol))
+    except Exception:
+        return False
+
+
+def should_block_rebuy_on_4h_rise(
+    *,
+    last_close_reason: str | None,
+    last_close_epoch: float | None,
+    bundle: dict[str, Any] | None,
+    now_epoch: float,
+) -> tuple[bool, str]:
+    """Block same-rise rebuy after a TP1/path-aware clip while 4H is still up."""
+    if not is_day_profit_close_reason(last_close_reason):
+        return False, ""
+    if htf_4h_rise_intact(bundle):
+        return True, "SAME_4H_RISE_NO_REBUY"
+    if htf_4h_rise_broken(bundle):
+        return False, ""
+    try:
+        closed = float(last_close_epoch or 0.0)
+    except (TypeError, ValueError):
+        closed = 0.0
+    if closed > 0 and (float(now_epoch) - closed) < 14400.0:
+        return True, "SAME_4H_BAR_NO_REBUY"
+    return False, ""
+
+
 def thesis_invalidated_live(
     entry_thesis: str,
     *,
@@ -974,6 +1101,11 @@ def thesis_invalidated_live(
         if m5 is not None and m5 < 0.35:
             return True
     if entry_thesis == SETUP_BREAKOUT_CONTINUATION:
+        # 4H still rising: a 15m dip is not thesis death on a vertical breakout.
+        if htf_4h_rise_intact(bundle):
+            return False
+        if htf_4h_rise_broken(bundle):
+            return True
         m5 = _bundle_tf_align(bundle, "5m")
         m15 = _bundle_tf_align(bundle, "15m")
         if m5 is not None and m15 is not None and m5 < 0.42 and m15 < 0.45:

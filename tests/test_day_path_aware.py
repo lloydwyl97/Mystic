@@ -108,6 +108,45 @@ def test_path_aware_max_hold_still_exits():
     assert out["reason"] == EXIT_TIME_STOP
 
 
+def _rising_4h_rows(n: int = 60, start: float = 2000.0) -> list[list]:
+    rows = []
+    px = start
+    ts = 1_700_000_000_000
+    for _ in range(n):
+        o = px
+        c = px * 1.012
+        rows.append([ts, o, c * 1.003, o * 0.998, c, 100.0])
+        px = c
+        ts += 14_400_000
+    return rows
+
+
+def test_path_aware_holds_green_on_4h_rise():
+    out = evaluate_engine_managed_exit(
+        position=_Pos(),
+        current_price=2318.0,
+        net_pnl_pct=0.005,
+        hold_minutes=20.0,
+        coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
+        bundle={"4h": _rising_4h_rows()},
+    )
+    assert out["action"] == "hold"
+    assert out["reason"] == "PATH_AWARE_HOLD_4H_RISE"
+
+
+def test_path_aware_holds_time_stop_on_4h_rise():
+    out = evaluate_engine_managed_exit(
+        position=_Pos(max_hold_min=300),
+        current_price=2390.0,
+        net_pnl_pct=0.03,
+        hold_minutes=400.0,
+        coin_profile={"max_hold_min": 300, "trail": 0.005, "sl": 0.01},
+        bundle={"4h": _rising_4h_rows()},
+    )
+    assert out["action"] == "hold"
+    assert out["reason"] == "PATH_AWARE_HOLD_4H_RISE"
+
+
 def test_predict_without_artifact_is_none(monkeypatch, tmp_path):
     monkeypatch.setenv("DAY_PATH_NET_ARTIFACT", str(tmp_path / "missing.json"))
     reset_day_artifact_cache()

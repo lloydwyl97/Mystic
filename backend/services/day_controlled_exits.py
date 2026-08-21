@@ -25,6 +25,7 @@ from backend.services.day_trade_thesis import (
     SETUP_VWAP_REVERSION,
     evaluate_extreme_protection,
     evaluate_thesis_exit,
+    htf_4h_rise_intact,
     thesis_invalidated_live,
 )
 
@@ -80,6 +81,18 @@ def _evaluate_path_aware_exit(
             "reason": EXIT_EXTREME_PROTECTION,
             "net_pnl_pct": net_pnl_pct,
             "hold_minutes": hold_minutes,
+        }
+
+    # 4H breakout still rising: do not TP1 / first-executable / trail / time-stop
+    # the position. That was clipping ETH 2312→2391 and XRP 0.99→1.43 as many
+    # 0.4–1.4% sells on the same rise. Extreme protection above still fires.
+    if htf_4h_rise_intact(bundle):
+        return {
+            "action": "hold",
+            "reason": "PATH_AWARE_HOLD_4H_RISE",
+            "net_pnl_pct": net_pnl_pct,
+            "hold_minutes": hold_minutes,
+            "detail": "4h_breakout_intact",
         }
 
     min_exec = _path_min_executable_net_pct()

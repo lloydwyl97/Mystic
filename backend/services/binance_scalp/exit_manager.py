@@ -338,6 +338,18 @@ class ExitReviewResult:
     updated_track: PositionTrack
 
 
+def _scalp_4h_rise_intact(symbol: str, htf_bundle: dict[str, Any] | None = None) -> bool:
+    """Same 4H-rise hold as DAY — do not 7bp-clip BTC/ETH/SOL/XRP on a breakout."""
+    try:
+        from backend.services.day_trade_thesis import htf_4h_rise_intact, htf_4h_rise_intact_for_symbol
+
+        if htf_bundle is not None:
+            return bool(htf_4h_rise_intact(htf_bundle))
+        return bool(htf_4h_rise_intact_for_symbol(symbol))
+    except Exception:
+        return False
+
+
 def evaluate_exit(
     *,
     track: PositionTrack,
@@ -351,6 +363,7 @@ def evaluate_exit(
     profit_hit: bool,
     exit_spread_ok: bool,
     perform_review: bool,
+    htf_bundle: dict[str, Any] | None = None,
 ) -> ExitReviewResult:
     entry = track.entry_price
     bid = snap.best_bid
@@ -459,6 +472,10 @@ def evaluate_exit(
                 track.setup_context,
             ),
         )
+
+    if _scalp_4h_rise_intact(snap.symbol, htf_bundle):
+        diag_base["exit_policy"] = "scalp_4h_rise_hold"
+        return _hold(STATE_HEALTHY_HOLD, "4h_breakout_intact")
 
     if profit_hit:
         return _sell(STATE_OPEN, "profit_target_met", EXIT_NET_PROFIT_TARGET)
