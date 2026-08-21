@@ -5180,6 +5180,24 @@ class PortfolioEngine:
         except Exception:
             return None
 
+    def _same_4h_rise_rebuy_block(self, symbol: str) -> tuple[bool, str]:
+        """Block a rebuy into the same 4H rise the engine just took profit on."""
+        try:
+            from backend.services.day_active_market_bundle import read_cached_day_active_bundle_sync
+            from backend.services.day_trade_thesis import should_block_rebuy_on_4h_rise
+
+            last = self._lookup_last_position_close(symbol)
+            if not last:
+                return False, ""
+            return should_block_rebuy_on_4h_rise(
+                last_close_reason=last.get("close_reason"),
+                last_close_epoch=last.get("closed_at_epoch"),
+                bundle=read_cached_day_active_bundle_sync(symbol),
+                now_epoch=time.time(),
+            )
+        except Exception:
+            return False, ""
+
     def _lookup_position_close_cooldown(self, symbol: str) -> float:
         """Return the most recent ``cooldown_until`` for ``symbol`` (epoch seconds).
 
@@ -8333,6 +8351,31 @@ class PortfolioEngine:
                     attempted_symbol=normalized_symbol,
                     active_positions=active_count,
                     max_positions=MAX_OPEN_POSITIONS,
+                )
+            return None
+
+        # A profit close on a 4H rise that is still intact means the engine
+        # clipped its own runner. Re-entering the same rise is churn, not a
+        # new DAY thesis.
+        rebuy_blocked, rebuy_why = self._same_4h_rise_rebuy_block(normalized_symbol)
+        if rebuy_blocked:
+            logger.info(
+                "DAY_REBUY_BLOCKED_SAME_4H_RISE symbol=%s reason=%s",
+                normalized_symbol,
+                rebuy_why,
+            )
+            await self._record_reject(
+                normalized_symbol,
+                "BUY",
+                "same_4h_rise_no_rebuy",
+                rebuy_why,
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+            if decision_id:
+                await self._update_pipeline_decision(
+                    decision_id,
+                    {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": rebuy_why},
                 )
             return None
 
@@ -11965,7 +12008,7 @@ class PortfolioEngine:
             logger.warning(
                 "ENGINE_MANAGED_EXIT symbol=%s reason=%s net_pct=%.6f hold_min=%.1f detail=%s "
                 "htf_4h_rise_intact=%s htf_4h_rise_broken=%s prior_4h_low=%s current_4h_close=%s "
-                "4h_bundle_missing=%s extreme_protection_fired=%s",
+                "4h_bundle_present=%s extreme_protection_fired=%s",
                 symbol,
                 exit_reason,
                 net_pnl_pct,
@@ -11975,7 +12018,7 @@ class PortfolioEngine:
                 managed.get("htf_4h_rise_broken"),
                 managed.get("prior_4h_low"),
                 managed.get("current_4h_close"),
-                managed.get("4h_bundle_missing"),
+                managed.get("4h_bundle_present"),
                 managed.get("extreme_protection_fired"),
             )
             profit_exit = exit_reason.startswith(EXIT_NET_PROFIT) or exit_reason == EXIT_PATH_EXECUTABLE_PROFIT
@@ -12033,12 +12076,12 @@ class PortfolioEngine:
         _snap4 = _day_4h_snap(bundle_obj)
         if not _snap4.get("htf_4h_rise_broken"):
             logger.info(
-                "DAY_4H_HOLD_NO_SCALP_CLIP symbol=%s net_pct=%.6f intact=%s missing=%s "
+                "DAY_4H_HOLD_NO_SCALP_CLIP symbol=%s net_pct=%.6f intact=%s bundle_present=%s "
                 "prior_4h_low=%s current_4h_close=%s skip=tp1_partial_and_leftover_net_profit",
                 symbol,
                 net_pnl_pct,
                 _snap4.get("htf_4h_rise_intact"),
-                _snap4.get("4h_bundle_missing"),
+                _snap4.get("4h_bundle_present"),
                 _snap4.get("prior_4h_low"),
                 _snap4.get("current_4h_close"),
             )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import sys
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from backend.services.binance_scalp.exit_manager import (
     STATE_OPEN,
     _effective_scratch_min_reviews,
     _early_scratch_exit,
+    _max_hold_hard_sec,
     evaluate_exit,
 )
 from backend.services.binance_scalp.momentum_tracker import MomentumDiagnostics
@@ -272,8 +274,6 @@ def test_path_aware_holds_all_four_symbols(monkeypatch):
 
 
 def test_scalp_max_hold_not_suppressed_by_4h():
-    import inspect
-
     import backend.services.binance_scalp.exit_manager as em
     import backend.services.binance_scalp.paper_engine as pe
 
@@ -307,3 +307,18 @@ def test_scalp_live_remains_false_and_cb_config_present():
     assert cfg.scalp_live is False
     assert cfg.max_consecutive_losses >= 1
     assert cfg.scalp_paper_enabled is True
+
+
+def test_scalp_stays_short_horizon():
+    """Max hold stays in scalp territory, not DAY-length holds."""
+    econ = ScalpEconomics.from_env()
+    assert _max_hold_hard_sec(econ) <= 3600
+
+
+def test_scalp_module_has_no_day_thesis_dependency():
+    import backend.services.binance_scalp.exit_manager as em
+
+    src = inspect.getsource(em)
+    assert "htf_4h_rise_intact" not in src
+    assert "htf_4h_rise_broken" not in src
+    assert "day_trade_thesis" not in src

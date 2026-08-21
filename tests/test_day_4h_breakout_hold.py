@@ -130,6 +130,17 @@ def test_engine_maps_structure_break_not_tp1():
     assert "PATH_EXECUTABLE" not in out["reason"]
 
 
+def test_rebuy_block_is_wired_into_the_buy_path():
+    """The helper is useless unless execute_buy_fifo actually calls it."""
+    import inspect
+
+    from backend.services.portfolio_engine import PortfolioEngine
+
+    assert "should_block_rebuy_on_4h_rise" in inspect.getsource(PortfolioEngine._same_4h_rise_rebuy_block)
+    # execute_buy_fifo is a thin locking wrapper; the guard lives under the lock.
+    assert "_same_4h_rise_rebuy_block" in inspect.getsource(PortfolioEngine._execute_buy_fifo_locked)
+
+
 def test_allow_rebuy_after_non_profit_exit():
     blocked, _why = should_block_rebuy_on_4h_rise(
         last_close_reason="THESIS_INVALIDATION_EXIT",

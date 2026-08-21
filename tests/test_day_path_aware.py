@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from backend.services.day_controlled_exits import (
+    DAY_FULL_FLATTEN_REASONS,
     EXIT_DAY_4H_STRUCTURE_BREAK,
     EXIT_EXTREME_PROTECTION,
     EXIT_NET_PROFIT,
@@ -61,6 +62,8 @@ def test_missing_4h_bundle_does_not_unlock_tiny_profit_clips():
     )
     assert out["action"] == "hold"
     assert out["reason"] == "PATH_AWARE_HOLD_4H_MISSING"
+    assert out["diagnostic"] == "DAY_4H_BUNDLE_MISSING"
+    assert out["4h_bundle_present"] is False
     assert out["reason"] not in {EXIT_PATH_EXECUTABLE_PROFIT, EXIT_NET_PROFIT}
 
 
@@ -177,12 +180,34 @@ def test_4h_structure_break_exits_as_day_not_scalp_clip():
     )
     assert out["action"] == "sell"
     assert out["reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
-    assert out["reason"] not in {EXIT_NET_PROFIT, EXIT_PATH_EXECUTABLE_PROFIT, "TP1", "NET_PROFIT_EXIT"}
+    assert out["reason"] not in {EXIT_NET_PROFIT, EXIT_PATH_EXECUTABLE_PROFIT, EXIT_TIME_STOP, "TP1", "NET_PROFIT_EXIT"}
     assert out["htf_4h_rise_broken"] is True
     assert out["htf_4h_rise_intact"] is False
     assert out["prior_4h_low"] is not None
     assert out["current_4h_close"] is not None
+    assert out["4h_bundle_present"] is True
     assert out["extreme_protection_fired"] is False
+
+
+def test_only_structure_break_and_extreme_may_full_flatten():
+    assert DAY_FULL_FLATTEN_REASONS == {EXIT_DAY_4H_STRUCTURE_BREAK, EXIT_EXTREME_PROTECTION}
+    for banned in (EXIT_NET_PROFIT, EXIT_PATH_EXECUTABLE_PROFIT, EXIT_TIME_STOP):
+        assert banned not in DAY_FULL_FLATTEN_REASONS
+
+
+@pytest.mark.parametrize("net", [0.0006, 0.0045, 0.02, -0.006])
+def test_no_scalp_clip_at_any_net_when_4h_not_intact(net):
+    """4H absent: no profit level and no hold time may produce a sell."""
+    out = evaluate_engine_managed_exit(
+        position=_Pos(stop_price=0.0, thesis_invalid_level=0.0, trailing_stop_price=99.9, highest_price=101.0),
+        current_price=100.0,
+        net_pnl_pct=net,
+        hold_minutes=5000.0,
+        coin_profile={"max_hold_min": 300, "trail": 0.005, "sl": 0.01},
+        bundle=None,
+    )
+    assert out["action"] == "hold"
+    assert out["reason"] == "PATH_AWARE_HOLD_4H_MISSING"
 
 
 def test_extreme_protection_still_fires():

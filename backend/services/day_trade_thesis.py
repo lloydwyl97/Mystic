@@ -23,6 +23,7 @@ EXIT_THESIS_INVALIDATION = "THESIS_INVALIDATION_EXIT"
 EXIT_STOP_LOSS = "STOP_LOSS_EXIT"
 EXIT_TRAILING_STOP = "TRAILING_STOP_EXIT"
 EXIT_DAY_4H_STRUCTURE_BREAK = "DAY_4H_STRUCTURE_BREAK_EXIT"
+DAY_4H_BUNDLE_MISSING = "DAY_4H_BUNDLE_MISSING"
 
 SETUP_HTF_TREND_PULLBACK = "HTF_TREND_PULLBACK"
 SETUP_VWAP_REVERSION = "VWAP_REVERSION"
@@ -1014,6 +1015,7 @@ def day_4h_structure_snapshot(bundle: dict[str, Any] | None) -> dict[str, Any]:
         "htf_4h_rise_broken": htf_4h_rise_broken(bundle),
         "prior_4h_low": prior_4h_low,
         "current_4h_close": current_4h_close,
+        "4h_bundle_present": not missing,
         "4h_bundle_missing": missing,
     }
 

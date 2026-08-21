@@ -16,6 +16,7 @@ from typing import Any
 from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_PROFIT_TO_SELL
 from backend.services.ai_regime_validation import blend_by_scalar, get_regime_validated_scalar
 from backend.services.day_trade_thesis import (
+    DAY_4H_BUNDLE_MISSING,
     EXIT_DAY_4H_STRUCTURE_BREAK,
     EXIT_EXTREME_PROTECTION,
     EXIT_NET_PROFIT,
@@ -39,8 +40,13 @@ EXIT_GIVEBACK = "GIVEBACK_EXIT"
 EXIT_PROGRESS_DECAY = "PROGRESS_DECAY_EXIT"
 EXIT_ADAPTIVE_LOSS = "ADAPTIVE_LOSS_EXIT"
 EXIT_PATH_EXECUTABLE_PROFIT = "PATH_EXECUTABLE_PROFIT"
-EXIT_DAY_4H_STRUCTURE_BREAK = EXIT_DAY_4H_STRUCTURE_BREAK
 DAY_PATH_AWARE_POLICY = "day_path_aware_v1"
+HOLD_4H_RISE = "PATH_AWARE_HOLD_4H_RISE"
+HOLD_4H_MISSING = "PATH_AWARE_HOLD_4H_MISSING"
+HOLD_4H_UNDECIDED = "PATH_AWARE_HOLD_4H_UNDECIDED"
+
+# Reasons that are allowed to full-flatten a DAY position. Anything else holds.
+DAY_FULL_FLATTEN_REASONS = frozenset({EXIT_DAY_4H_STRUCTURE_BREAK, EXIT_EXTREME_PROTECTION})
 
 
 def _path_aware_exit_enabled() -> bool:
@@ -85,34 +91,26 @@ def _evaluate_path_aware_exit(
             "net_pnl_pct": net_pnl_pct,
             "hold_minutes": hold_minutes,
             "detail": "extreme_protection",
-            "htf_4h_rise_intact": snap4["htf_4h_rise_intact"],
-            "htf_4h_rise_broken": snap4["htf_4h_rise_broken"],
-            "prior_4h_low": snap4["prior_4h_low"],
-            "current_4h_close": snap4["current_4h_close"],
-            "4h_bundle_missing": snap4["4h_bundle_missing"],
+            **snap4,
             "extreme_protection_fired": True,
         }
     base = {
         "net_pnl_pct": net_pnl_pct,
         "hold_minutes": hold_minutes,
-        "htf_4h_rise_intact": snap4["htf_4h_rise_intact"],
-        "htf_4h_rise_broken": snap4["htf_4h_rise_broken"],
-        "prior_4h_low": snap4["prior_4h_low"],
-        "current_4h_close": snap4["current_4h_close"],
-        "4h_bundle_missing": snap4["4h_bundle_missing"],
+        **snap4,
         "extreme_protection_fired": False,
     }
 
-    # 4H still rising: never TP1 / first-executable / trail / time-stop.
+    # 4H still rising: never TP1 / net-profit / first-executable / trail / time-stop.
     if snap4["htf_4h_rise_intact"]:
         return {
             "action": "hold",
-            "reason": "PATH_AWARE_HOLD_4H_RISE",
+            "reason": HOLD_4H_RISE,
             "detail": "4h_breakout_intact",
             **base,
         }
 
-    # Dedicated DAY exit — not a 0.4% / 0.01% scalp clip.
+    # The only structural DAY sell. Never a 0.4% / 0.01% scalp clip.
     if snap4["htf_4h_rise_broken"]:
         return {
             "action": "sell",
@@ -121,17 +119,19 @@ def _evaluate_path_aware_exit(
             **base,
         }
 
-    # Missing or undecided 4H: hold. Do not unlock tiny profit clips.
+    # No 4H evidence is not permission to scalp-clip. Extreme protection above
+    # is the only exit left in this state.
     if snap4["4h_bundle_missing"]:
         return {
             "action": "hold",
-            "reason": "PATH_AWARE_HOLD_4H_MISSING",
+            "reason": HOLD_4H_MISSING,
             "detail": "4h_bundle_missing_no_scalp_clip",
+            "diagnostic": DAY_4H_BUNDLE_MISSING,
             **base,
         }
     return {
         "action": "hold",
-        "reason": "PATH_AWARE_HOLD_4H_UNDECIDED",
+        "reason": HOLD_4H_UNDECIDED,
         "detail": "4h_not_intact_not_broken_no_scalp_clip",
         **base,
     }
