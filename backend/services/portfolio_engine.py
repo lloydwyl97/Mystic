@@ -386,6 +386,23 @@ def compute_entry_distance_pct(symbol: str, atr: float, price: float) -> float:
     return (price - floor_price) / price
 
 
+def day_intact_profit_floor(*, entry_price: float, prior_4h_low: float, min_net_profit: float) -> float:
+    """Net profit required to close a DAY position while the 4H rise is still intact.
+
+    Scaled to the structural risk the position is carrying, so closing a live
+    trend costs a gain worth having. Bounded below so it can never decay into a
+    scalp clip, and above so a distant 4H low cannot put profit out of reach.
+    """
+    r_mult = float(os.getenv("DAY_INTACT_PROFIT_R_MULT", "0.5"))
+    floor_min_mult = float(os.getenv("DAY_INTACT_PROFIT_FLOOR_MIN_MULT", "2.0"))
+    floor_max = float(os.getenv("DAY_INTACT_PROFIT_FLOOR_MAX_PCT", "0.025"))
+
+    entry = float(entry_price or 0.0)
+    low = float(prior_4h_low or 0.0)
+    structural_r = (entry - low) / entry if entry > 0 and 0.0 < low < entry else 0.0
+    return max(float(min_net_profit) * floor_min_mult, min(structural_r * r_mult, floor_max))
+
+
 def compute_position_risk_usd(quantity: float, entry_price: float, stop_price: float) -> float:
     """USD at risk to the enforced DAY risk floor for a long position."""
     qty = float(quantity or 0)
@@ -12079,17 +12096,37 @@ class PortfolioEngine:
             _day_4h_snap = lambda _b: {"htf_4h_rise_broken": False, "htf_4h_rise_intact": False, "4h_bundle_missing": True}  # noqa: E731
         _snap4 = _day_4h_snap(bundle_obj)
         if not _snap4.get("htf_4h_rise_broken"):
-            logger.info(
-                "DAY_4H_HOLD_NO_SCALP_CLIP symbol=%s net_pct=%.6f intact=%s bundle_present=%s "
-                "prior_4h_low=%s current_4h_close=%s skip=tp1_partial_and_leftover_net_profit",
+            # Trend intact. Profit-taking stays reachable here on purpose: gating it
+            # behind a structure break means profit can only ever be booked after the
+            # move has already been given back. The floor keeps it from degrading into
+            # the scalp clips this engine is not supposed to take.
+            _intact_floor = day_intact_profit_floor(
+                entry_price=entry_price,
+                prior_4h_low=float(_snap4.get("prior_4h_low") or 0.0),
+                min_net_profit=_min_net_profit,
+            )
+            if net_pnl_pct < _intact_floor:
+                logger.info(
+                    "DAY_4H_HOLD_NO_SCALP_CLIP symbol=%s net_pct=%.6f intact_floor=%.6f intact=%s "
+                    "bundle_present=%s prior_4h_low=%s current_4h_close=%s skip=tp1_partial_and_leftover_net_profit",
+                    symbol,
+                    net_pnl_pct,
+                    _intact_floor,
+                    _snap4.get("htf_4h_rise_intact"),
+                    _snap4.get("4h_bundle_present"),
+                    _snap4.get("prior_4h_low"),
+                    _snap4.get("current_4h_close"),
+                )
+                return None
+            logger.warning(
+                "DAY_4H_INTACT_PROFIT_TAKE symbol=%s net_pct=%.6f >= intact_floor=%.6f "
+                "prior_4h_low=%s current_4h_close=%s",
                 symbol,
                 net_pnl_pct,
-                _snap4.get("htf_4h_rise_intact"),
-                _snap4.get("4h_bundle_present"),
+                _intact_floor,
                 _snap4.get("prior_4h_low"),
                 _snap4.get("current_4h_close"),
             )
-            return None
         if _tp1_enabled and not getattr(position, "tp1_hit", False):
             _tp1_price = float(getattr(position, "take_profit_1_price", 0) or 0)
             if _tp1_price > 0 and current_price >= _tp1_price and net_pnl_pct + 1e-12 >= _min_net_profit * 0.45:

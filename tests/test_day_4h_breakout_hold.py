@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from backend.services.day_controlled_exits import EXIT_DAY_4H_STRUCTURE_BREAK, evaluate_engine_managed_exit
+from backend.services.portfolio_engine import day_intact_profit_floor
 from backend.services.day_trade_thesis import (
     SETUP_BREAKOUT_CONTINUATION,
     htf_4h_rise_broken,
@@ -150,3 +151,44 @@ def test_allow_rebuy_after_non_profit_exit():
         now_epoch=1_700_000_100.0,
     )
     assert blocked is False
+
+
+def test_intact_trend_profit_floor_scales_with_structural_risk():
+    """A wider 4H structure means more risk carried, so more profit is required."""
+    tight = day_intact_profit_floor(entry_price=100.0, prior_4h_low=99.0, min_net_profit=0.001)
+    wide = day_intact_profit_floor(entry_price=100.0, prior_4h_low=95.0, min_net_profit=0.001)
+    assert wide > tight
+
+
+def test_intact_trend_profit_floor_never_degrades_into_a_scalp_clip():
+    """The original goal stands: DAY must not clip tiny profits on a live rise."""
+    floor = day_intact_profit_floor(entry_price=100.0, prior_4h_low=99.9, min_net_profit=0.004)
+    assert floor >= 0.008
+
+
+def test_intact_trend_profit_floor_is_capped_so_profit_stays_reachable():
+    """A distant 4H low must not put profit-taking permanently out of reach."""
+    floor = day_intact_profit_floor(entry_price=100.0, prior_4h_low=50.0, min_net_profit=0.004)
+    assert floor <= 0.025
+
+
+def test_small_gain_on_intact_trend_still_holds():
+    floor = day_intact_profit_floor(entry_price=91.32, prior_4h_low=89.94, min_net_profit=0.005)
+    assert 0.003561 < floor  # live SOL: +0.36% must not trigger a clip
+
+
+def test_large_gain_on_intact_trend_now_takes_profit():
+    """Regression guard: profit was previously unreachable until the trend broke."""
+    floor = day_intact_profit_floor(entry_price=1.3781, prior_4h_low=1.3157, min_net_profit=0.003)
+    assert 0.024626 >= floor  # live XRP: +2.46% must be bookable while 4H is intact
+
+
+def test_profit_is_not_gated_behind_structure_break_in_source():
+    """The old guard returned None whenever the 4H rise was not broken."""
+    import inspect
+
+    from backend.services.portfolio_engine import PortfolioEngine
+
+    src = inspect.getsource(PortfolioEngine._check_exit_conditions)
+    assert "day_intact_profit_floor" in src
+    assert "DAY_4H_INTACT_PROFIT_TAKE" in src
