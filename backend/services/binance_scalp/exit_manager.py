@@ -29,6 +29,12 @@ EXIT_MAX_HOLD_HARD_LIMIT = "MAX_HOLD_HARD_LIMIT"
 # for a small loss — which is what the 14-sell history showed.
 EXIT_MICRO_TP = "MICRO_TP_LOCK"
 EXIT_PATH_EXECUTABLE_PROFIT = "PATH_EXECUTABLE_PROFIT"
+# Bounded downside for the path-aware branch. That branch returns before the
+# scratch/stall/momentum exits below, so without this a losing position has no
+# exit at all until the 20-minute horizon. The first 53 paper closes split
+# exactly two ways: 25 profit takes averaging +$0.0085 and 28 horizon timeouts
+# averaging -$0.053, with no timeout ever closing green.
+EXIT_PATH_MAX_ADVERSE_STOP = "PATH_MAX_ADVERSE_STOP"
 
 DECISION_HOLD = "HOLD"
 DECISION_SELL = "SELL"
@@ -39,19 +45,42 @@ HIGHER_LOWS_MIN_REVIEWS = 2
 
 
 def _path_aware_exit_enabled() -> bool:
-    """Take first executable net; hold losers to the realization horizon.
+    """Take profit at the first executable net that clears the floor, and cut
+    losers at a bounded stop rather than at the horizon.
 
-    This is an exit policy, not an entry gate. Scratch/stall opinion exits
-    are skipped so a later favorable print can still be taken.
+    This is an exit policy, not an entry gate. The scratch/stall opinion exits
+    are still skipped so a later favorable print can be taken, but the downside
+    is bounded so "skipped" cannot mean "unbounded".
     """
     return os.getenv("SCALP_PATH_AWARE_EXIT", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _path_min_executable_net_pct() -> float:
+    """Minimum executable net before the path-aware branch books a winner.
+
+    Deliberately low. Across the first 53 paper closes the best winner was
+    +0.1015% net and the median was +0.0206%, so raising this floor to a
+    conventional target books nothing at all — at 0.15% it would have taken
+    zero of the 25 winners. The asymmetry is fixed on the loss side instead.
+    """
     try:
         return float(os.getenv("SCALP_PATH_MIN_EXECUTABLE_NET_PCT", "0.0001"))
     except (TypeError, ValueError):
         return 0.0001
+
+
+def _path_max_adverse_net_pct() -> float:
+    """Executable net (as a positive magnitude) at which a loser is cut.
+
+    Set beyond the model's own predicted MAE for every traded symbol (max
+    observed 0.122%) so it fires on tail moves rather than on the adverse
+    excursion a healthy position is expected to survive.
+    """
+    try:
+        v = float(os.getenv("SCALP_PATH_MAX_ADVERSE_NET_PCT", "0.0015"))
+    except (TypeError, ValueError):
+        v = 0.0015
+    return abs(v)
 
 
 def _review_interval_sec() -> int:
@@ -476,6 +505,15 @@ def evaluate_exit(
         if mtp:
             diag_base["micro_tp_trigger_detail"] = mtp_reason
             return _sell(STATE_OPEN, mtp_reason, EXIT_MICRO_TP)
+        stop_pct = _path_max_adverse_net_pct()
+        diag_base["path_max_adverse_net_pct"] = stop_pct
+        diag_base["path_min_executable_net_pct"] = _path_min_executable_net_pct()
+        if executable_net_pct <= -stop_pct:
+            return _sell(
+                STATE_MAX_HOLD_REVIEW,
+                f"path_max_adverse_stop net={executable_net_pct:.5f} bound=-{stop_pct:.5f}",
+                EXIT_PATH_MAX_ADVERSE_STOP,
+            )
         hard = _max_hold_hard_sec(econ)
         if hold_sec >= hard:
             return _sell(STATE_MAX_HOLD_REVIEW, f"path_horizon_{hard}s", EXIT_MAX_HOLD_HARD_LIMIT)

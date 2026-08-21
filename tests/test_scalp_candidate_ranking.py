@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
@@ -20,6 +22,20 @@ from backend.services.binance_scalp.scalp_candidate_ranking import (
     rank_setup_signal,
 )
 from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, StrategyMarketContext
+
+
+@pytest.fixture(autouse=True)
+def _cost_based_ev_fallback(monkeypatch):
+    """Pin these to the cost-based EV fallback rather than a trained artifact.
+
+    candidate_expected_net_ev prefers a forward-net prediction when one loads,
+    so whichever model file happens to sit in models/ decides the outcome —
+    these rows carry no real features and score 0.0, which is neither the
+    fallback arithmetic under test nor a stable result across machines.
+    """
+    import backend.services.binance_scalp.forward_net_predictor as fnp
+
+    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda row: None)
 
 
 def _ctx(*, spread: float = 0.0002, mid_change_15s: float = 0.0, confirmed: bool = False) -> StrategyMarketContext:
@@ -206,6 +222,29 @@ def test_ranking_report_includes_absolute_predicted_outcomes():
     assert "expected_mae" in stamped
     assert stamped["hold_action_ev"] == HOLD_ACTION_EV
     assert stamped["predicted_net_return"] < 0
+
+
+def test_clear_rank_leader_survives_an_expected_net_tie():
+    """Equal EV is not a tie. The tie-break is for clustered rank scores, so a
+    clear leader must not be overridden by it."""
+    rows = [
+        {
+            "symbol": "BTCUSDT",
+            "rank_score": 1.8,
+            "entry_eligible": True,
+            "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7),
+        },
+        {
+            "symbol": "SOLUSDT",
+            "rank_score": 2.0,
+            "entry_eligible": True,
+            "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7),
+        },
+    ]
+    best = pick_best_global_candidate(rows)
+    assert best is not None
+    assert float(rows[0]["expected_net_ev"]) == float(rows[1]["expected_net_ev"])
+    assert best["symbol"] == "SOLUSDT"
 
 
 def test_soft_scores_materially_lower_than_before():

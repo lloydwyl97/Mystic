@@ -886,7 +886,16 @@ def pick_best_global_candidate(rows: list[dict[str, Any]]) -> dict[str, Any] | N
         top_ev = _num(chosen.get("expected_net_ev"))
         tied = [r for r in peers if abs(_num(r.get("expected_net_ev")) - top_ev) <= 1e-9]
         if len(tied) > 1:
-            return max(tied, key=_global_tie_key)
+            # _global_tie_key is the secondary sort for *clustered* rank scores.
+            # Equal EV alone is not a tie: applying it to a clear rank leader
+            # discards the ranking, including any AI enrichment boost, that had
+            # already separated the candidates.
+            top_rank = max(_num(r.get("rank_score")) for r in tied)
+            clustered = [r for r in tied if top_rank - _num(r.get("rank_score")) <= _rank_tie_margin()]
+            if len(clustered) > 1:
+                return max(clustered, key=_global_tie_key)
+            if clustered:
+                return clustered[0]
     return chosen
 
 

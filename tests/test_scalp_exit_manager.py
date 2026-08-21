@@ -17,11 +17,14 @@ from backend.services.binance_scalp.exit_manager import (
     EXIT_EARLY_SCRATCH,
     EXIT_MAX_HOLD_HARD_LIMIT,
     EXIT_PATH_EXECUTABLE_PROFIT,
+    EXIT_PATH_MAX_ADVERSE_STOP,
     PositionTrack,
     STATE_OPEN,
     _effective_scratch_min_reviews,
     _early_scratch_exit,
     _max_hold_hard_sec,
+    _path_max_adverse_net_pct,
+    _path_min_executable_net_pct,
     evaluate_exit,
 )
 from backend.services.binance_scalp.momentum_tracker import MomentumDiagnostics
@@ -233,6 +236,78 @@ def test_path_aware_takes_first_executable_profit(monkeypatch):
     )
     assert review.decision == "SELL"
     assert review.exit_reason == EXIT_PATH_EXECUTABLE_PROFIT
+
+
+def test_path_aware_profit_floor_stays_reachable(monkeypatch):
+    """Best observed winner was +0.1015% net; a conventional target books nothing."""
+    monkeypatch.delenv("SCALP_PATH_MIN_EXECUTABLE_NET_PCT", raising=False)
+    assert _path_min_executable_net_pct() <= 0.0002
+
+
+def test_path_aware_cuts_a_loser_at_the_bounded_stop(monkeypatch):
+    """Without this the path-aware branch has no loss exit before 20 minutes."""
+    monkeypatch.setenv("SCALP_PATH_AWARE_EXIT", "true")
+    review = evaluate_exit(
+        track=_path_track(100.0, 99.80),
+        snap=_Snap("ETHUSDT", 99.80),
+        mom=_flat_mom(),
+        econ=ScalpEconomics.from_env(),
+        config=get_scalp_config(),
+        trade_id="path-stop",
+        hold_sec=120.0,
+        executable_net_pct=-0.0020,
+        profit_hit=False,
+        exit_spread_ok=True,
+        perform_review=True,
+    )
+    assert review.decision == "SELL"
+    assert review.exit_reason == EXIT_PATH_MAX_ADVERSE_STOP
+
+
+def test_path_aware_stop_fires_well_before_the_horizon(monkeypatch):
+    """The stop must not depend on hold time; 28/28 horizon exits were losses."""
+    monkeypatch.setenv("SCALP_PATH_AWARE_EXIT", "true")
+    review = evaluate_exit(
+        track=_path_track(100.0, 99.85),
+        snap=_Snap("XRPUSDT", 99.85),
+        mom=_flat_mom(),
+        econ=ScalpEconomics.from_env(),
+        config=get_scalp_config(),
+        trade_id="path-stop-early",
+        hold_sec=5.0,
+        executable_net_pct=-0.0015,
+        profit_hit=False,
+        exit_spread_ok=True,
+        perform_review=False,
+    )
+    assert review.decision == "SELL"
+    assert review.exit_reason == EXIT_PATH_MAX_ADVERSE_STOP
+
+
+def test_path_aware_stop_sits_beyond_predicted_mae(monkeypatch):
+    """Largest predicted MAE across traded symbols is 0.122%; the stop must clear
+    it so normal adverse excursion does not close a healthy position."""
+    monkeypatch.delenv("SCALP_PATH_MAX_ADVERSE_NET_PCT", raising=False)
+    assert _path_max_adverse_net_pct() > 0.00122
+
+
+def test_path_aware_stop_is_configurable(monkeypatch):
+    monkeypatch.setenv("SCALP_PATH_AWARE_EXIT", "true")
+    monkeypatch.setenv("SCALP_PATH_MAX_ADVERSE_NET_PCT", "0.0050")
+    review = evaluate_exit(
+        track=_path_track(100.0, 99.80),
+        snap=_Snap("ETHUSDT", 99.80),
+        mom=_flat_mom(),
+        econ=ScalpEconomics.from_env(),
+        config=get_scalp_config(),
+        trade_id="path-stop-wide",
+        hold_sec=120.0,
+        executable_net_pct=-0.0020,
+        profit_hit=False,
+        exit_spread_ok=True,
+        perform_review=True,
+    )
+    assert review.decision == "HOLD"
 
 
 def test_path_aware_does_not_scratch_flat_loser(monkeypatch):
