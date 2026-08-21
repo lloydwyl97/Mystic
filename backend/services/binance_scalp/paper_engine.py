@@ -66,9 +66,9 @@ def _round_trip_execution_costs(
     persisted_entry_fee: float | None = None,
     persisted_entry_slippage: float | None = None,
 ) -> tuple[float, float]:
-    entry_fee = float(persisted_entry_fee) if persisted_entry_fee is not None else entry_notional * econ.taker_fee_pct
+    entry_fee = float(persisted_entry_fee) if persisted_entry_fee is not None else entry_notional * econ.entry_fee_pct()
     entry_slippage = float(persisted_entry_slippage) if persisted_entry_slippage is not None else entry_notional * econ.slippage_buffer_pct
-    fees = entry_fee + exit_notional * econ.taker_fee_pct
+    fees = entry_fee + exit_notional * econ.exit_fee_pct()
     slippage = entry_slippage + exit_notional * econ.slippage_buffer_pct
     return fees, slippage
 
@@ -1021,7 +1021,7 @@ class BinanceScalpPaperEngine:
 
         limit_buy = sig.limit_buy_price
         qty = notional / limit_buy
-        fee = notional * self.econ.taker_fee_pct
+        fee = notional * self.econ.entry_fee_pct()
         slip = notional * self.econ.slippage_buffer_pct
         trade_id = f"scalp_paper_{sym}_{int(time.time() * 1000)}"
         ts, epoch = self._now()
@@ -1329,7 +1329,7 @@ class BinanceScalpPaperEngine:
         sell_tid = f"{trade_id}_SELL"
         strategy_id = self._position_strategy_id(row)
         notional = qty * exit_price
-        fee = notional * self.econ.taker_fee_pct
+        fee = notional * self.econ.exit_fee_pct()
         slip = notional * self.econ.slippage_buffer_pct
         ledger = self._ledger(conn)
         pre = dict(ledger)
@@ -1477,8 +1477,8 @@ class BinanceScalpPaperEngine:
     ) -> None:
         """Post-close SCALP attribution, review, learning, and market memory (isolated from DAY)."""
         notional = qty * exit_price
-        sell_fee = notional * self.econ.taker_fee_pct
-        buy_fee = entry * qty * self.econ.taker_fee_pct
+        sell_fee = notional * self.econ.exit_fee_pct()
+        buy_fee = entry * qty * self.econ.entry_fee_pct()
         fees = sell_fee + buy_fee
         gross_pnl = (exit_price - entry) * qty
         slip_usd = notional * self.econ.slippage_buffer_pct
@@ -1648,7 +1648,7 @@ class BinanceScalpPaperEngine:
         exit_price = pf.expected_avg_fill if pf.expected_avg_fill > 0 else pf.limit_sell_price
         net_pct = pf.expected_net_edge_pct
         net_usd = (exit_price - entry) * qty - (
-            exit_price * qty * self.econ.taker_fee_pct + exit_price * qty * self.econ.slippage_buffer_pct + entry * qty * self.econ.taker_fee_pct + entry * qty * self.econ.slippage_buffer_pct
+            exit_price * qty * self.econ.exit_fee_pct() + exit_price * qty * self.econ.slippage_buffer_pct + entry * qty * self.econ.entry_fee_pct() + entry * qty * self.econ.slippage_buffer_pct
         )
         profit_hit = net_pct >= target_pct
         exit_spread_ok = pf.reject_reason != "SPREAD_TOO_WIDE"

@@ -366,24 +366,28 @@ def get_coin_profile(symbol: str) -> dict:
 
 
 def compute_entry_distance_pct(symbol: str, atr: float, price: float) -> float:
+    """Entry-time distance to the enforced DAY risk floor, as a fraction of price.
+
+    This is the same floor `_evaluate_path_aware_exit` enforces via
+    `DAY_RISK_FLOOR_EXIT`, so the stamped ``stop_price`` is a real level rather
+    than decoration. Once a position is open the floor also tracks 4H structure
+    and can only widen from here, bounded by DAY_RISK_FLOOR_MAX_ADVERSE_PCT.
     """
-    Entry-time ATR-derived distance fraction used ONLY to populate the
-    ``stop_price`` schema column on the ``paper_trades`` insert and the
-    OpenPosition metadata. The sell gate (`_check_exit_conditions`) ignores
-    this value and sells only on confirmed real net profit after costs.
-    """
+    from backend.services.day_trade_thesis import resolve_day_risk_floor_price
+
     if price <= 0:
         return get_coin_profile(symbol)["sl"]
     atr_pct = atr / price
     if atr_pct <= 0:
+        atr_pct = 0.01
+    floor_price = resolve_day_risk_floor_price(entry_price=price, atr_pct=atr_pct)
+    if floor_price <= 0 or floor_price >= price:
         return get_coin_profile(symbol)["sl"]
-    dynamic_sl = atr_pct * MAJOR_COIN_ATR_SL_MULT
-    floor, ceiling = MAJOR_COIN_SL_BOUNDS.get(_to_api_symbol(symbol), (0.007, 0.015))
-    return max(floor, min(dynamic_sl, ceiling))
+    return (price - floor_price) / price
 
 
 def compute_position_risk_usd(quantity: float, entry_price: float, stop_price: float) -> float:
-    """USD at risk to the advisory stop for a long position (dashboard/risk cap)."""
+    """USD at risk to the enforced DAY risk floor for a long position."""
     qty = float(quantity or 0)
     if qty <= 0:
         return 0.0
@@ -1369,7 +1373,7 @@ class OpenPosition:
 
     @property
     def risk_usd(self) -> float:
-        """Stop-distance risk in USD for open-risk caps and dashboard."""
+        """USD at risk to the enforced risk floor, for open-risk caps and dashboard."""
         return compute_position_risk_usd(self.quantity, self.entry_price, self.stop_price)
 
 

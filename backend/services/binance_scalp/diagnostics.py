@@ -57,6 +57,8 @@ def build_fee_diagnostic(
             "SCALP_IMPACT_CAP_PCT": econ.impact_cap_pct,
             "SCALP_FEE_MODEL_VERIFIED": econ.fee_model_verified,
             "SCALP_USE_MAKER_ONLY": econ.use_maker_only,
+            "SCALP_ENTRY_IS_MAKER": econ.entry_is_maker,
+            "SCALP_EXIT_IS_MAKER": econ.exit_is_maker,
         },
     }
 

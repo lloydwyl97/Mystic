@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from typing import Any
 
 from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_PROFIT_TO_SELL
@@ -23,6 +24,7 @@ EXIT_THESIS_INVALIDATION = "THESIS_INVALIDATION_EXIT"
 EXIT_STOP_LOSS = "STOP_LOSS_EXIT"
 EXIT_TRAILING_STOP = "TRAILING_STOP_EXIT"
 EXIT_DAY_4H_STRUCTURE_BREAK = "DAY_4H_STRUCTURE_BREAK_EXIT"
+EXIT_DAY_RISK_FLOOR = "DAY_RISK_FLOOR_EXIT"
 DAY_4H_BUNDLE_MISSING = "DAY_4H_BUNDLE_MISSING"
 
 SETUP_HTF_TREND_PULLBACK = "HTF_TREND_PULLBACK"
@@ -997,6 +999,50 @@ def htf_4h_rise_intact(bundle: dict[str, Any] | None) -> bool:
     elif align is not None and align >= 0.52:
         return True
     return False
+
+
+def _floor_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def resolve_day_risk_floor_price(
+    *,
+    entry_price: float,
+    thesis_invalid_level: float = 0.0,
+    prior_4h_low: float = 0.0,
+    atr_pct: float = 0.01,
+) -> float:
+    """Lowest price a DAY position may reach before the engine flattens it.
+
+    Placed just under the structural invalidation so the 4H structure exit gets
+    first refusal on a normal thesis failure, and hard-capped so adverse
+    excursion stays bounded when structure is far away, unknown, or when price
+    gaps through it between 4H closes. Returns 0.0 when it cannot be resolved.
+    """
+    entry = float(entry_price or 0.0)
+    if entry <= 0:
+        return 0.0
+
+    buffer = _floor_env("DAY_RISK_FLOOR_STRUCTURE_BUFFER_PCT", 0.003)
+    max_adverse = _floor_env("DAY_RISK_FLOOR_MAX_ADVERSE_PCT", 0.06)
+    min_adverse = _floor_env("DAY_RISK_FLOOR_MIN_ADVERSE_PCT", 0.02)
+
+    levels = [float(x) for x in (thesis_invalid_level, prior_4h_low) if x and 0.0 < float(x) < entry]
+    if levels:
+        candidate = min(levels) * (1.0 - buffer)
+    else:
+        # No structure known. Approximate where structure usually sits so the
+        # entry-time stamp matches what will actually be enforced once the 4H
+        # levels are available, rather than overstating risk.
+        atr_mult = _floor_env("DAY_RISK_FLOOR_ATR_MULT", 1.5)
+        candidate = entry * (1.0 - max(min_adverse, float(atr_pct or 0.01) * atr_mult))
+
+    hard_cap = entry * (1.0 - max_adverse)  # never tolerate worse than this
+    tight_cap = entry * (1.0 - min_adverse)  # never fire tighter than this
+    return max(hard_cap, min(candidate, tight_cap))
 
 
 def day_4h_structure_snapshot(bundle: dict[str, Any] | None) -> dict[str, Any]:

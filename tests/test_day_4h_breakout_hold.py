@@ -117,10 +117,11 @@ def test_engine_maps_structure_break_not_tp1():
         max_hold_min = 360
         day_route_regime_at_entry = ""
 
+    # Above the risk floor, so the structure break is what closes it — not the floor.
     out = evaluate_engine_managed_exit(
         position=_P(),
-        current_price=2200.0,
-        net_pnl_pct=0.008,
+        current_price=2290.0,
+        net_pnl_pct=-0.0095,
         hold_minutes=30.0,
         coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
         bundle={"4h": _broken_4h()},

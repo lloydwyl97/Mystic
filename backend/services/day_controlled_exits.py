@@ -19,6 +19,7 @@ from backend.services.ai_regime_validation import blend_by_scalar, get_regime_va
 from backend.services.day_trade_thesis import (
     DAY_4H_BUNDLE_MISSING,
     EXIT_DAY_4H_STRUCTURE_BREAK,
+    EXIT_DAY_RISK_FLOOR,
     EXIT_EXTREME_PROTECTION,
     EXIT_NET_PROFIT,
     EXIT_STOP_LOSS,
@@ -29,6 +30,7 @@ from backend.services.day_trade_thesis import (
     day_4h_structure_snapshot,
     evaluate_extreme_protection,
     evaluate_thesis_exit,
+    resolve_day_risk_floor_price,
     thesis_invalidated_live,
 )
 
@@ -47,7 +49,9 @@ HOLD_4H_MISSING = "PATH_AWARE_HOLD_4H_MISSING"
 HOLD_4H_UNDECIDED = "PATH_AWARE_HOLD_4H_UNDECIDED"
 
 # Reasons that are allowed to full-flatten a DAY position. Anything else holds.
-DAY_FULL_FLATTEN_REASONS = frozenset({EXIT_DAY_4H_STRUCTURE_BREAK, EXIT_EXTREME_PROTECTION})
+DAY_FULL_FLATTEN_REASONS = frozenset(
+    {EXIT_DAY_4H_STRUCTURE_BREAK, EXIT_DAY_RISK_FLOOR, EXIT_EXTREME_PROTECTION}
+)
 
 logger = logging.getLogger(__name__)
 _exit_policy_logged = False
@@ -112,12 +116,30 @@ def _evaluate_path_aware_exit(
             **snap4,
             "extreme_protection_fired": True,
         }
+    risk_floor_price = resolve_day_risk_floor_price(
+        entry_price=entry,
+        thesis_invalid_level=float(getattr(position, "thesis_invalid_level", 0.0) or 0.0),
+        prior_4h_low=float(snap4.get("prior_4h_low") or 0.0),
+        atr_pct=atr_pct,
+    )
     base = {
         "net_pnl_pct": net_pnl_pct,
         "hold_minutes": hold_minutes,
         **snap4,
+        "risk_floor_price": risk_floor_price,
         "extreme_protection_fired": False,
     }
+
+    # Bounded adverse excursion. Must be checked before the 4H hold below, or the
+    # hold makes it unreachable and the position can bleed unbounded for up to a
+    # full 4H bar waiting for a close that may never come at a tolerable price.
+    if risk_floor_price > 0 and current_price <= risk_floor_price:
+        return {
+            "action": "sell",
+            "reason": EXIT_DAY_RISK_FLOOR,
+            "detail": f"mark_at_or_below_risk_floor={risk_floor_price:.8f}",
+            **base,
+        }
 
     # 4H still rising: never TP1 / net-profit / first-executable / trail / time-stop.
     if snap4["htf_4h_rise_intact"]:

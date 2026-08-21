@@ -7,6 +7,7 @@ import pytest
 from backend.services.day_controlled_exits import (
     DAY_FULL_FLATTEN_REASONS,
     EXIT_DAY_4H_STRUCTURE_BREAK,
+    EXIT_DAY_RISK_FLOOR,
     EXIT_EXTREME_PROTECTION,
     EXIT_NET_PROFIT,
     EXIT_PATH_EXECUTABLE_PROFIT,
@@ -15,6 +16,7 @@ from backend.services.day_controlled_exits import (
     _path_aware_exit_enabled,
     evaluate_engine_managed_exit,
 )
+from backend.services.day_trade_thesis import resolve_day_risk_floor_price
 from backend.services.day_direct_path_ev_authority import (
     DAY_AUTHORITY_MODE,
     OLD_RANK_EXECUTION_AUTHORITY,
@@ -190,6 +192,69 @@ def test_4h_structure_break_exits_as_day_not_scalp_clip():
     assert out["extreme_protection_fired"] is False
 
 
+def test_risk_floor_sits_below_structure_so_structure_exits_first():
+    """A floor tighter than structure would fire first and defeat the 4H hold."""
+    entry, invalid, prior_low = 77899.73, 76064.14, 76262.45
+    floor = resolve_day_risk_floor_price(
+        entry_price=entry, thesis_invalid_level=invalid, prior_4h_low=prior_low, atr_pct=0.0236
+    )
+    assert floor < invalid
+    assert floor < prior_low
+    assert floor > entry * 0.94  # still inside the hard adverse cap
+
+
+def test_risk_floor_flattens_even_while_4h_intact():
+    """The whole point: bound the bleed instead of waiting on a 4H close."""
+    entry = 77899.73
+    floor = resolve_day_risk_floor_price(entry_price=entry, thesis_invalid_level=76064.14, atr_pct=0.0236)
+    out = evaluate_engine_managed_exit(
+        position=_Pos(entry_price=entry, stop_price=0.0, thesis_invalid_level=76064.14),
+        current_price=floor,
+        net_pnl_pct=floor / entry - 1.0,
+        hold_minutes=120.0,
+        coin_profile={"max_hold_min": 2142, "trail": 0.004, "sl": 0.02},
+        bundle={"4h": _rising_4h_rows(start=60000.0)},
+    )
+    assert out["action"] == "sell"
+    assert out["reason"] == EXIT_DAY_RISK_FLOOR
+    assert out["htf_4h_rise_intact"] is True  # held-through state, still flattened
+
+
+def test_risk_floor_does_not_fire_above_structure():
+    entry = 77899.73
+    out = evaluate_engine_managed_exit(
+        position=_Pos(entry_price=entry, stop_price=0.0, thesis_invalid_level=76064.14),
+        current_price=76262.45,
+        net_pnl_pct=-0.021,
+        hold_minutes=120.0,
+        coin_profile={"max_hold_min": 2142, "trail": 0.004, "sl": 0.02},
+        bundle={"4h": _rising_4h_rows(start=60000.0)},
+    )
+    assert out["action"] == "hold"
+    assert out["reason"] == "PATH_AWARE_HOLD_4H_RISE"
+
+
+def test_risk_floor_is_hard_capped_when_structure_is_absurd():
+    floor = resolve_day_risk_floor_price(entry_price=100.0, thesis_invalid_level=80.0, atr_pct=0.01)
+    assert floor == pytest.approx(94.0)
+
+
+def test_risk_floor_never_tighter_than_min_adverse():
+    floor = resolve_day_risk_floor_price(entry_price=100.0, thesis_invalid_level=99.5, atr_pct=0.001)
+    assert floor <= 98.0
+
+
+def test_stamped_stop_equals_enforced_floor():
+    """stop_price was previously decoration; it must now be a real level."""
+    from backend.services.portfolio_engine import compute_entry_distance_pct
+
+    price, atr = 77899.73, 1332.82
+    dist = compute_entry_distance_pct("BTCUSDT", atr, price)
+    stamped = price * (1.0 - dist)
+    enforced = resolve_day_risk_floor_price(entry_price=price, atr_pct=atr / price)
+    assert stamped == pytest.approx(enforced, rel=1e-9)
+
+
 def test_day_exit_policy_defaults_to_path_aware(monkeypatch):
     """DAY must not fall back to the scalp ladder just because the env is unset."""
     monkeypatch.delenv("DAY_PATH_AWARE_EXIT", raising=False)
@@ -197,7 +262,11 @@ def test_day_exit_policy_defaults_to_path_aware(monkeypatch):
 
 
 def test_only_structure_break_and_extreme_may_full_flatten():
-    assert DAY_FULL_FLATTEN_REASONS == {EXIT_DAY_4H_STRUCTURE_BREAK, EXIT_EXTREME_PROTECTION}
+    assert DAY_FULL_FLATTEN_REASONS == {
+        EXIT_DAY_4H_STRUCTURE_BREAK,
+        EXIT_DAY_RISK_FLOOR,
+        EXIT_EXTREME_PROTECTION,
+    }
     for banned in (EXIT_NET_PROFIT, EXIT_PATH_EXECUTABLE_PROFIT, EXIT_TIME_STOP):
         assert banned not in DAY_FULL_FLATTEN_REASONS
 

@@ -36,12 +36,18 @@ class ScalpEconomics:
     stale_scalp_timeout_sec: int
     fee_model_verified: bool
     use_maker_only: bool
+    # Sided fill mode. Entries are posted as limit orders (`sig.limit_buy_price`)
+    # so they rest and earn the maker fee; exits must cross to guarantee the
+    # scalp actually closes, so they pay taker.
+    entry_is_maker: bool
+    exit_is_maker: bool
 
     @classmethod
     def from_env(cls) -> ScalpEconomics:
         # Reference Mystic Binance.US defaults without importing DAY sell thresholds.
         default_taker = float(os.getenv("BINANCE_US_TAKER_FEE_PCT", "0.0002"))
         default_maker = float(os.getenv("BINANCE_US_MAKER_FEE_PCT", "0.0"))
+        _maker_only = _bool("SCALP_USE_MAKER_ONLY", False)
         return cls(
             maker_fee_pct=float(os.getenv("SCALP_MAKER_FEE_PCT", str(default_maker))),
             taker_fee_pct=float(os.getenv("SCALP_TAKER_FEE_PCT", str(default_taker))),
@@ -58,7 +64,9 @@ class ScalpEconomics:
             min_projected_surplus_pct=float(os.getenv("SCALP_MIN_PROJECTED_SURPLUS_PCT", "0.00015")),
             stale_scalp_timeout_sec=int(os.getenv("SCALP_STALE_TIMEOUT_SEC", "300")),
             fee_model_verified=_bool("SCALP_FEE_MODEL_VERIFIED", False),
-            use_maker_only=_bool("SCALP_USE_MAKER_ONLY", False),
+            use_maker_only=_maker_only,
+            entry_is_maker=_bool("SCALP_ENTRY_IS_MAKER", True) or _maker_only,
+            exit_is_maker=_bool("SCALP_EXIT_IS_MAKER", False) or _maker_only,
         )
 
     @property
@@ -67,12 +75,12 @@ class ScalpEconomics:
 
     def entry_fee_pct(self, *, entry_maker: bool | None = None) -> float:
         if entry_maker is None:
-            entry_maker = self.use_maker_only
+            entry_maker = self.entry_is_maker
         return self.maker_fee_pct if entry_maker else self.taker_fee_pct
 
     def exit_fee_pct(self, *, exit_maker: bool | None = None) -> float:
         if exit_maker is None:
-            exit_maker = self.use_maker_only
+            exit_maker = self.exit_is_maker
         return self.maker_fee_pct if exit_maker else self.taker_fee_pct
 
     def roundtrip_fee_for_mode(self, *, entry_maker: bool, exit_maker: bool) -> float:
@@ -88,9 +96,9 @@ class ScalpEconomics:
         exit_maker: bool | None = None,
     ) -> float:
         if entry_maker is None:
-            entry_maker = self.use_maker_only
+            entry_maker = self.entry_is_maker
         if exit_maker is None:
-            exit_maker = self.use_maker_only
+            exit_maker = self.exit_is_maker
         return self.roundtrip_fee_for_mode(entry_maker=entry_maker, exit_maker=exit_maker) + spread_pct + buy_impact_pct + sell_impact_pct + self.slippage_buffer_pct
 
     def required_gross_move_for_min_edge_pct(
@@ -151,6 +159,9 @@ class ScalpEconomics:
             "stale_scalp_timeout_sec": self.stale_scalp_timeout_sec,
             "fee_model_verified": self.fee_model_verified,
             "use_maker_only": self.use_maker_only,
+            "entry_is_maker": self.entry_is_maker,
+            "exit_is_maker": self.exit_is_maker,
+            "roundtrip_fee_pct": self.roundtrip_fee_pct,
         }
 
     def roundtrip_cost_pct(

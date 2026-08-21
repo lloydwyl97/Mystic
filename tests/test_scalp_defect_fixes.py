@@ -151,7 +151,12 @@ def test_stale_exit_preview_waits_for_same_review_interval_as_engine():
 
 
 def test_learning_costs_use_persisted_entry_and_exit_economics():
-    econ = SimpleNamespace(taker_fee_pct=0.001, slippage_buffer_pct=0.0005)
+    econ = SimpleNamespace(
+        taker_fee_pct=0.001,
+        slippage_buffer_pct=0.0005,
+        entry_fee_pct=lambda: 0.001,
+        exit_fee_pct=lambda: 0.001,
+    )
     fees, slippage = _round_trip_execution_costs(
         entry_notional=150.0,
         exit_notional=153.0,
@@ -162,6 +167,50 @@ def test_learning_costs_use_persisted_entry_and_exit_economics():
 
     assert fees == pytest.approx(0.17 + 153.0 * 0.001)
     assert slippage == pytest.approx(0.08 + 153.0 * 0.0005)
+
+
+def test_scalp_entry_rests_as_maker_and_exit_crosses_as_taker():
+    """Entries already post at limit_buy_price; exits must cross to guarantee the close."""
+    from backend.services.binance_scalp.economics import ScalpEconomics
+
+    econ = ScalpEconomics.from_env()
+    assert econ.entry_is_maker is True
+    assert econ.exit_is_maker is False
+    assert econ.entry_fee_pct() == econ.maker_fee_pct
+    assert econ.exit_fee_pct() == econ.taker_fee_pct
+    assert econ.roundtrip_fee_pct == econ.maker_fee_pct + econ.taker_fee_pct
+
+
+def test_scalp_costs_follow_fill_mode_not_hardcoded_taker():
+    """The maker/taker mode flag was previously computed and then ignored."""
+    from backend.services.binance_scalp.economics import ScalpEconomics
+
+    econ = ScalpEconomics.from_env()
+    taker_rt = econ.roundtrip_fee_for_mode(entry_maker=False, exit_maker=False)
+    maker_rt = econ.roundtrip_fee_for_mode(entry_maker=True, exit_maker=True)
+    assert maker_rt < taker_rt
+
+    fees_taker, _ = _round_trip_execution_costs(
+        entry_notional=1000.0,
+        exit_notional=1000.0,
+        econ=SimpleNamespace(
+            taker_fee_pct=econ.taker_fee_pct,
+            slippage_buffer_pct=econ.slippage_buffer_pct,
+            entry_fee_pct=lambda: econ.taker_fee_pct,
+            exit_fee_pct=lambda: econ.taker_fee_pct,
+        ),
+    )
+    fees_maker, _ = _round_trip_execution_costs(
+        entry_notional=1000.0,
+        exit_notional=1000.0,
+        econ=SimpleNamespace(
+            taker_fee_pct=econ.taker_fee_pct,
+            slippage_buffer_pct=econ.slippage_buffer_pct,
+            entry_fee_pct=lambda: econ.maker_fee_pct,
+            exit_fee_pct=lambda: econ.maker_fee_pct,
+        ),
+    )
+    assert fees_maker < fees_taker
 
 
 def test_empty_scalp_ledger_repairs_cash_basis_mismatch(tmp_path: Path):
