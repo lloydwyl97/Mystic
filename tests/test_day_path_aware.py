@@ -12,6 +12,7 @@ from backend.services.day_controlled_exits import (
     EXIT_PATH_EXECUTABLE_PROFIT,
     EXIT_STALL_DEAD,
     EXIT_TIME_STOP,
+    _path_aware_exit_enabled,
     evaluate_engine_managed_exit,
 )
 from backend.services.day_direct_path_ev_authority import (
@@ -187,6 +188,12 @@ def test_4h_structure_break_exits_as_day_not_scalp_clip():
     assert out["current_4h_close"] is not None
     assert out["4h_bundle_present"] is True
     assert out["extreme_protection_fired"] is False
+
+
+def test_day_exit_policy_defaults_to_path_aware(monkeypatch):
+    """DAY must not fall back to the scalp ladder just because the env is unset."""
+    monkeypatch.delenv("DAY_PATH_AWARE_EXIT", raising=False)
+    assert _path_aware_exit_enabled() is True
 
 
 def test_only_structure_break_and_extreme_may_full_flatten():

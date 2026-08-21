@@ -8,6 +8,7 @@ Net-profit exit remains one path among several — never the only sell path.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -48,14 +49,31 @@ HOLD_4H_UNDECIDED = "PATH_AWARE_HOLD_4H_UNDECIDED"
 # Reasons that are allowed to full-flatten a DAY position. Anything else holds.
 DAY_FULL_FLATTEN_REASONS = frozenset({EXIT_DAY_4H_STRUCTURE_BREAK, EXIT_EXTREME_PROTECTION})
 
+logger = logging.getLogger(__name__)
+_exit_policy_logged = False
+
 
 def _path_aware_exit_enabled() -> bool:
-    """Take first executable net; hold losers to the realization horizon.
+    """DAY exit policy: hold the 4H thesis; sell only on structure break or extreme.
 
-    Exit policy only. Stall / giveback / stop / thesis-red are skipped so a
-    later favorable print can still be taken. Extreme protection stays.
+    When enabled (production default), the legacy ladder below — stop, trail,
+    thesis-red, stall, giveback, time stop, and the net-profit clips — is
+    unreachable. Disabling it restores that ladder wholesale, which is why the
+    resolved policy is logged once per process: a silent flip would turn DAY
+    back into a scalper.
     """
-    return os.getenv("DAY_PATH_AWARE_EXIT", "true").strip().lower() in {"1", "true", "yes", "on"}
+    raw = os.getenv("DAY_PATH_AWARE_EXIT")
+    enabled = (raw if raw is not None else "true").strip().lower() in {"1", "true", "yes", "on"}
+    global _exit_policy_logged
+    if not _exit_policy_logged:
+        _exit_policy_logged = True
+        logger.warning(
+            "DAY_EXIT_POLICY_RESOLVED path_aware=%s sell_reasons=%s source=%s",
+            enabled,
+            sorted(DAY_FULL_FLATTEN_REASONS) if enabled else "legacy_ladder",
+            "env" if raw is not None else "code_default",
+        )
+    return enabled
 
 
 def _path_min_executable_net_pct() -> float:
