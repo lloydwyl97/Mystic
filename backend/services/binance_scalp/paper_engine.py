@@ -21,7 +21,6 @@ from backend.services.binance_scalp.exit_manager import (
     PositionTrack,
     STATE_MAX_HOLD_REVIEW,
     _max_hold_hard_sec,
-    _scalp_4h_rise_intact,
     evaluate_exit,
     track_from_row,
 )
@@ -1717,11 +1716,7 @@ class BinanceScalpPaperEngine:
             )
 
         hard = _max_hold_hard_sec(self.econ)
-        if (
-            age >= hard
-            and (review.decision != DECISION_SELL or not review.exit_reason)
-            and not _scalp_4h_rise_intact(sym)
-        ):
+        if age >= hard and (review.decision != DECISION_SELL or not review.exit_reason):
             forced_diag = dict(review.diagnostics or {})
             forced_diag["forced_max_hold"] = True
             forced_diag["hold_seconds"] = round(age, 1)

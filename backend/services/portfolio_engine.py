@@ -11963,12 +11963,20 @@ class PortfolioEngine:
         if str(managed.get("action") or "") == "sell":
             exit_reason = str(managed.get("reason") or "ENGINE_MANAGED_EXIT")
             logger.warning(
-                "ENGINE_MANAGED_EXIT symbol=%s reason=%s net_pct=%.6f hold_min=%.1f detail=%s",
+                "ENGINE_MANAGED_EXIT symbol=%s reason=%s net_pct=%.6f hold_min=%.1f detail=%s "
+                "htf_4h_rise_intact=%s htf_4h_rise_broken=%s prior_4h_low=%s current_4h_close=%s "
+                "4h_bundle_missing=%s extreme_protection_fired=%s",
                 symbol,
                 exit_reason,
                 net_pnl_pct,
                 hold_minutes,
                 managed.get("detail"),
+                managed.get("htf_4h_rise_intact"),
+                managed.get("htf_4h_rise_broken"),
+                managed.get("prior_4h_low"),
+                managed.get("current_4h_close"),
+                managed.get("4h_bundle_missing"),
+                managed.get("extreme_protection_fired"),
             )
             profit_exit = exit_reason.startswith(EXIT_NET_PROFIT) or exit_reason == EXIT_PATH_EXECUTABLE_PROFIT
             exit_type = ExitType.TAKE_PROFIT_1 if profit_exit else ExitType.MANUAL
@@ -12019,14 +12027,20 @@ class PortfolioEngine:
         # low-vol coins pre-2026-08-10.
         _min_net_profit = float(_mnp_for_sym(symbol))
         try:
-            from backend.services.day_trade_thesis import htf_4h_rise_intact as _htf_4h_rise_intact
+            from backend.services.day_trade_thesis import day_4h_structure_snapshot as _day_4h_snap
         except Exception:
-            _htf_4h_rise_intact = lambda _b: False  # noqa: E731
-        if _htf_4h_rise_intact(bundle_obj):
+            _day_4h_snap = lambda _b: {"htf_4h_rise_broken": False, "htf_4h_rise_intact": False, "4h_bundle_missing": True}  # noqa: E731
+        _snap4 = _day_4h_snap(bundle_obj)
+        if not _snap4.get("htf_4h_rise_broken"):
             logger.info(
-                "DAY_4H_RISE_HOLD symbol=%s net_pct=%.6f skip=tp1_partial_and_leftover_net_profit",
+                "DAY_4H_HOLD_NO_SCALP_CLIP symbol=%s net_pct=%.6f intact=%s missing=%s "
+                "prior_4h_low=%s current_4h_close=%s skip=tp1_partial_and_leftover_net_profit",
                 symbol,
                 net_pnl_pct,
+                _snap4.get("htf_4h_rise_intact"),
+                _snap4.get("4h_bundle_missing"),
+                _snap4.get("prior_4h_low"),
+                _snap4.get("current_4h_close"),
             )
             return None
         if _tp1_enabled and not getattr(position, "tp1_hit", False):

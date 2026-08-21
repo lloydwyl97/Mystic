@@ -5,11 +5,18 @@ from __future__ import annotations
 import pytest
 
 from backend.services.day_controlled_exits import (
+    EXIT_DAY_4H_STRUCTURE_BREAK,
+    EXIT_EXTREME_PROTECTION,
     EXIT_NET_PROFIT,
     EXIT_PATH_EXECUTABLE_PROFIT,
     EXIT_STALL_DEAD,
     EXIT_TIME_STOP,
     evaluate_engine_managed_exit,
+)
+from backend.services.day_direct_path_ev_authority import (
+    DAY_AUTHORITY_MODE,
+    OLD_RANK_EXECUTION_AUTHORITY,
+    select_action,
 )
 from backend.services.day_path_net import (
     predict_decision_net,
@@ -43,7 +50,7 @@ def _path_aware_on(monkeypatch):
     monkeypatch.setenv("DAY_PATH_MIN_EXECUTABLE_NET_PCT", "0.0001")
 
 
-def test_path_aware_takes_first_executable_net():
+def test_missing_4h_bundle_does_not_unlock_tiny_profit_clips():
     out = evaluate_engine_managed_exit(
         position=_Pos(),
         current_price=100.08,
@@ -52,11 +59,12 @@ def test_path_aware_takes_first_executable_net():
         coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
         bundle=None,
     )
-    assert out["action"] == "sell"
-    assert out["reason"] == EXIT_PATH_EXECUTABLE_PROFIT
+    assert out["action"] == "hold"
+    assert out["reason"] == "PATH_AWARE_HOLD_4H_MISSING"
+    assert out["reason"] not in {EXIT_PATH_EXECUTABLE_PROFIT, EXIT_NET_PROFIT}
 
 
-def test_path_aware_uses_net_profit_label_at_floor():
+def test_missing_4h_bundle_does_not_net_profit_clip():
     out = evaluate_engine_managed_exit(
         position=_Pos(),
         current_price=100.50,
@@ -65,8 +73,9 @@ def test_path_aware_uses_net_profit_label_at_floor():
         coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
         bundle=None,
     )
-    assert out["action"] == "sell"
-    assert out["reason"] == EXIT_NET_PROFIT
+    assert out["action"] == "hold"
+    assert out["reason"] == "PATH_AWARE_HOLD_4H_MISSING"
+    assert out["reason"] != EXIT_NET_PROFIT
 
 
 def test_path_aware_does_not_stall_red():
@@ -79,7 +88,7 @@ def test_path_aware_does_not_stall_red():
         bundle=None,
     )
     assert out["action"] == "hold"
-    assert out["reason"] == "PATH_AWARE_HOLD"
+    assert out["reason"] == "PATH_AWARE_HOLD_4H_MISSING"
     assert out.get("reason") != EXIT_STALL_DEAD
 
 
@@ -95,7 +104,7 @@ def test_path_aware_holds_loser_to_horizon():
     assert out["action"] == "hold"
 
 
-def test_path_aware_max_hold_still_exits():
+def test_path_aware_max_hold_does_not_exit_when_4h_missing():
     out = evaluate_engine_managed_exit(
         position=_Pos(stop_price=0.0, thesis_invalid_level=0.0, max_hold_min=300),
         current_price=99.50,
@@ -104,8 +113,9 @@ def test_path_aware_max_hold_still_exits():
         coin_profile={"max_hold_min": 300, "trail": 0.005, "sl": 0.01},
         bundle=None,
     )
-    assert out["action"] == "sell"
-    assert out["reason"] == EXIT_TIME_STOP
+    assert out["action"] == "hold"
+    assert out["reason"] == "PATH_AWARE_HOLD_4H_MISSING"
+    assert out["reason"] != EXIT_TIME_STOP
 
 
 def _rising_4h_rows(n: int = 60, start: float = 2000.0) -> list[list]:
@@ -145,6 +155,59 @@ def test_path_aware_holds_time_stop_on_4h_rise():
     )
     assert out["action"] == "hold"
     assert out["reason"] == "PATH_AWARE_HOLD_4H_RISE"
+
+
+def _broken_4h_rows() -> list[list]:
+    rows = _rising_4h_rows(60)
+    last = rows[-1]
+    prior_low = float(rows[-2][3])
+    dump_close = prior_low * 0.97
+    rows[-1] = [last[0], last[4], last[4], dump_close * 0.99, dump_close, 100.0]
+    return rows
+
+
+def test_4h_structure_break_exits_as_day_not_scalp_clip():
+    out = evaluate_engine_managed_exit(
+        position=_Pos(),
+        current_price=2200.0,
+        net_pnl_pct=0.005,
+        hold_minutes=20.0,
+        coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
+        bundle={"4h": _broken_4h_rows()},
+    )
+    assert out["action"] == "sell"
+    assert out["reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
+    assert out["reason"] not in {EXIT_NET_PROFIT, EXIT_PATH_EXECUTABLE_PROFIT, "TP1", "NET_PROFIT_EXIT"}
+    assert out["htf_4h_rise_broken"] is True
+    assert out["htf_4h_rise_intact"] is False
+    assert out["prior_4h_low"] is not None
+    assert out["current_4h_close"] is not None
+    assert out["extreme_protection_fired"] is False
+
+
+def test_extreme_protection_still_fires():
+    out = evaluate_engine_managed_exit(
+        position=_Pos(stop_price=0.0, thesis_invalid_level=0.0),
+        current_price=94.0,
+        net_pnl_pct=-0.06,
+        hold_minutes=20.0,
+        coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
+        bundle={"1h": {"ema_align": 0.10}, "4h": {"ema_align": 0.10}},
+    )
+    assert out["action"] == "sell"
+    assert out["reason"] == EXIT_EXTREME_PROTECTION
+    assert out["extreme_protection_fired"] is True
+
+
+def test_path_ev_authority_unchanged():
+    assert DAY_AUTHORITY_MODE == "direct_four_coin_path_ev"
+    assert OLD_RANK_EXECUTION_AUTHORITY is False
+    out = select_action({"btc_path_ev": -0.01, "eth_path_ev": -0.02, "sol_path_ev": 0.0, "xrp_path_ev": -0.03})
+    assert out["selected_action"] == "HOLD"
+    assert out["why_selected"] == "HOLD_WINS"
+    out2 = select_action({"btc_path_ev": 0.002, "eth_path_ev": 0.001, "sol_path_ev": -0.01, "xrp_path_ev": 0.0})
+    assert out2["selected_action"] == "BUY_BTCUSDT"
+    assert out2["old_rank_execution_authority"] is False
 
 
 def test_predict_without_artifact_is_none(monkeypatch, tmp_path):

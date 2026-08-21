@@ -81,7 +81,6 @@ def test_early_scratch_on_stalled_flat_position(monkeypatch):
         profit_hit=False,
         exit_spread_ok=True,
         perform_review=True,
-        htf_bundle={},
     )
     assert review.decision == "SELL", review.reason
     assert review.exit_reason == EXIT_EARLY_SCRATCH
@@ -116,7 +115,6 @@ def test_stall_before_max_hold_not_at_hard_ceiling(monkeypatch):
         profit_hit=False,
         exit_spread_ok=True,
         perform_review=True,
-        htf_bundle={},
     )
     assert review.decision == "SELL", review.reason
     assert review.exit_reason == EXIT_EARLY_SCRATCH
@@ -190,7 +188,6 @@ def test_evaluate_exit_applies_hold_ev_scratch_reduction_end_to_end(monkeypatch)
         profit_hit=False,
         exit_spread_ok=True,
         perform_review=False,  # avoid the stale_review_count += 1 path so only the pre-review checks apply
-        htf_bundle={},
     )
     with mock.patch("backend.services.hold_ev_engine.compute_hold_ev") as mock_compute, mock.patch("backend.services.hold_ev_engine.hold_ev_scratch_review_reduction", return_value=0):
         neutral = evaluate_exit(**common_kwargs)
@@ -231,7 +228,6 @@ def test_path_aware_takes_first_executable_profit(monkeypatch):
         profit_hit=False,
         exit_spread_ok=True,
         perform_review=True,
-        htf_bundle={},
     )
     assert review.decision == "SELL"
     assert review.exit_reason == EXIT_PATH_EXECUTABLE_PROFIT
@@ -251,7 +247,6 @@ def test_path_aware_does_not_scratch_flat_loser(monkeypatch):
         profit_hit=False,
         exit_spread_ok=True,
         perform_review=True,
-        htf_bundle={},
     )
     assert review.decision == "HOLD"
     assert review.reason == "path_awaiting_executable_profit"
@@ -272,41 +267,43 @@ def test_path_aware_holds_all_four_symbols(monkeypatch):
             profit_hit=False,
             exit_spread_ok=True,
             perform_review=False,
-            htf_bundle={},
         )
         assert review.decision == "HOLD", sym
 
 
-def _rising_4h(n: int = 60, start: float = 80.0) -> list[list]:
-    rows = []
-    px = start
-    ts = 1_700_000_000_000
-    for _ in range(n):
-        o = px
-        c = px * 1.012
-        rows.append([ts, o, c * 1.003, o * 0.998, c, 100.0])
-        px = c
-        ts += 14_400_000
-    return rows
+def test_scalp_max_hold_not_suppressed_by_4h():
+    import inspect
+
+    import backend.services.binance_scalp.exit_manager as em
+    import backend.services.binance_scalp.paper_engine as pe
+
+    src = inspect.getsource(em.evaluate_exit) + inspect.getsource(pe.BinanceScalpPaperEngine._try_exit)
+    assert "htf_4h_rise_intact" not in src
+    assert "_scalp_4h_rise_intact" not in src
+    assert "4h_breakout_intact" not in src
 
 
-def test_scalp_holds_all_four_on_4h_breakout(monkeypatch):
+def test_scalp_profit_hit_still_clips_like_scalp(monkeypatch):
     monkeypatch.setenv("SCALP_PATH_AWARE_EXIT", "true")
-    bundle = {"4h": _rising_4h()}
-    for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"):
-        review = evaluate_exit(
-            track=_path_track(),
-            snap=_Snap(sym, 90.69),
-            mom=_flat_mom(),
-            econ=ScalpEconomics.from_env(),
-            config=get_scalp_config(),
-            trade_id=f"4h-{sym}",
-            hold_sec=2000.0,
-            executable_net_pct=0.008,
-            profit_hit=True,
-            exit_spread_ok=True,
-            perform_review=True,
-            htf_bundle=bundle,
-        )
-        assert review.decision == "HOLD", (sym, review.reason)
-        assert review.reason == "4h_breakout_intact"
+    review = evaluate_exit(
+        track=_path_track(100.0, 100.25),
+        snap=_Snap("SOLUSDT", 100.25),
+        mom=_flat_mom(),
+        econ=ScalpEconomics.from_env(),
+        config=get_scalp_config(),
+        trade_id="scalp-clip",
+        hold_sec=2000.0,
+        executable_net_pct=0.008,
+        profit_hit=True,
+        exit_spread_ok=True,
+        perform_review=True,
+    )
+    assert review.decision == "SELL"
+    assert review.exit_reason == "NET_PROFIT_TARGET"
+
+
+def test_scalp_live_remains_false_and_cb_config_present():
+    cfg = get_scalp_config()
+    assert cfg.scalp_live is False
+    assert cfg.max_consecutive_losses >= 1
+    assert cfg.scalp_paper_enabled is True

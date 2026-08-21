@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from backend.services.day_controlled_exits import EXIT_DAY_4H_STRUCTURE_BREAK, evaluate_engine_managed_exit
 from backend.services.day_trade_thesis import (
     SETUP_BREAKOUT_CONTINUATION,
     htf_4h_rise_broken,
@@ -97,6 +98,36 @@ def test_allow_rebuy_after_tp1_when_4h_broke():
     )
     assert blocked is False
     assert why == ""
+
+
+def test_engine_maps_structure_break_not_tp1():
+    class _P:
+        entry_price = 2312.0
+        highest_price = 2400.0
+        lowest_price = 2200.0
+        stop_price = 0.0
+        trailing_stop_price = 0.0
+        trail_pct = 0.005
+        take_profit_1_price = 2342.0
+        entry_thesis = "BREAKOUT_CONTINUATION"
+        entry_vwap = 0.0
+        thesis_invalid_level = 0.0
+        thesis_target_level = 0.0
+        thesis_score = 0.7
+        max_hold_min = 360
+        day_route_regime_at_entry = ""
+
+    out = evaluate_engine_managed_exit(
+        position=_P(),
+        current_price=2200.0,
+        net_pnl_pct=0.008,
+        hold_minutes=30.0,
+        coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
+        bundle={"4h": _broken_4h()},
+    )
+    assert out["reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
+    assert "NET_PROFIT" not in out["reason"]
+    assert "PATH_EXECUTABLE" not in out["reason"]
 
 
 def test_allow_rebuy_after_non_profit_exit():

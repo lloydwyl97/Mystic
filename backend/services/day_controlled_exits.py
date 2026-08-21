@@ -16,6 +16,7 @@ from typing import Any
 from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_PROFIT_TO_SELL
 from backend.services.ai_regime_validation import blend_by_scalar, get_regime_validated_scalar
 from backend.services.day_trade_thesis import (
+    EXIT_DAY_4H_STRUCTURE_BREAK,
     EXIT_EXTREME_PROTECTION,
     EXIT_NET_PROFIT,
     EXIT_STOP_LOSS,
@@ -23,9 +24,9 @@ from backend.services.day_trade_thesis import (
     EXIT_THESIS_WARNING,
     EXIT_TRAILING_STOP,
     SETUP_VWAP_REVERSION,
+    day_4h_structure_snapshot,
     evaluate_extreme_protection,
     evaluate_thesis_exit,
-    htf_4h_rise_intact,
     thesis_invalidated_live,
 )
 
@@ -38,6 +39,7 @@ EXIT_GIVEBACK = "GIVEBACK_EXIT"
 EXIT_PROGRESS_DECAY = "PROGRESS_DECAY_EXIT"
 EXIT_ADAPTIVE_LOSS = "ADAPTIVE_LOSS_EXIT"
 EXIT_PATH_EXECUTABLE_PROFIT = "PATH_EXECUTABLE_PROFIT"
+EXIT_DAY_4H_STRUCTURE_BREAK = EXIT_DAY_4H_STRUCTURE_BREAK
 DAY_PATH_AWARE_POLICY = "day_path_aware_v1"
 
 
@@ -68,6 +70,7 @@ def _evaluate_path_aware_exit(
     entry: float,
     atr_pct: float,
 ) -> dict[str, Any]:
+    snap4 = day_4h_structure_snapshot(bundle)
     extreme = evaluate_extreme_protection(
         entry_price=entry,
         mark=current_price,
@@ -81,68 +84,56 @@ def _evaluate_path_aware_exit(
             "reason": EXIT_EXTREME_PROTECTION,
             "net_pnl_pct": net_pnl_pct,
             "hold_minutes": hold_minutes,
+            "detail": "extreme_protection",
+            "htf_4h_rise_intact": snap4["htf_4h_rise_intact"],
+            "htf_4h_rise_broken": snap4["htf_4h_rise_broken"],
+            "prior_4h_low": snap4["prior_4h_low"],
+            "current_4h_close": snap4["current_4h_close"],
+            "4h_bundle_missing": snap4["4h_bundle_missing"],
+            "extreme_protection_fired": True,
         }
+    base = {
+        "net_pnl_pct": net_pnl_pct,
+        "hold_minutes": hold_minutes,
+        "htf_4h_rise_intact": snap4["htf_4h_rise_intact"],
+        "htf_4h_rise_broken": snap4["htf_4h_rise_broken"],
+        "prior_4h_low": snap4["prior_4h_low"],
+        "current_4h_close": snap4["current_4h_close"],
+        "4h_bundle_missing": snap4["4h_bundle_missing"],
+        "extreme_protection_fired": False,
+    }
 
-    # 4H breakout still rising: do not TP1 / first-executable / trail / time-stop
-    # the position. That was clipping ETH 2312→2391 and XRP 0.99→1.43 as many
-    # 0.4–1.4% sells on the same rise. Extreme protection above still fires.
-    if htf_4h_rise_intact(bundle):
+    # 4H still rising: never TP1 / first-executable / trail / time-stop.
+    if snap4["htf_4h_rise_intact"]:
         return {
             "action": "hold",
             "reason": "PATH_AWARE_HOLD_4H_RISE",
-            "net_pnl_pct": net_pnl_pct,
-            "hold_minutes": hold_minutes,
             "detail": "4h_breakout_intact",
+            **base,
         }
 
-    min_exec = _path_min_executable_net_pct()
-    min_net = float(MIN_NET_PROFIT_TO_SELL)
-    if net_pnl_pct + 1e-12 >= min_net:
+    # Dedicated DAY exit — not a 0.4% / 0.01% scalp clip.
+    if snap4["htf_4h_rise_broken"]:
         return {
             "action": "sell",
-            "reason": EXIT_NET_PROFIT,
-            "net_pnl_pct": net_pnl_pct,
-            "hold_minutes": hold_minutes,
-            "detail": "path_aware_profit_floor",
-        }
-    if net_pnl_pct + 1e-12 > min_exec:
-        return {
-            "action": "sell",
-            "reason": EXIT_PATH_EXECUTABLE_PROFIT,
-            "net_pnl_pct": net_pnl_pct,
-            "hold_minutes": hold_minutes,
-            "detail": "path_aware_first_executable_net",
+            "reason": EXIT_DAY_4H_STRUCTURE_BREAK,
+            "detail": "4h_close_below_prior_4h_low",
+            **base,
         }
 
-    trail = float(getattr(position, "trailing_stop_price", 0) or 0)
-    trail_pct = float(getattr(position, "trail_pct", 0) or coin_profile.get("trail") or 0.005)
-    highest = float(getattr(position, "highest_price", entry) or entry)
-    if trail > 0 and highest >= entry * (1.0 + trail_pct) and current_price <= trail and net_pnl_pct + 1e-12 > min_exec:
+    # Missing or undecided 4H: hold. Do not unlock tiny profit clips.
+    if snap4["4h_bundle_missing"]:
         return {
-            "action": "sell",
-            "reason": EXIT_TRAILING_STOP,
-            "net_pnl_pct": net_pnl_pct,
-            "hold_minutes": hold_minutes,
-            "detail": "path_aware_trail_locks_green",
-        }
-
-    max_hold = effective_max_hold_min(position, coin_profile)
-    if int(getattr(position, "max_hold_min", 0) or 0) < max_hold:
-        position.max_hold_min = max_hold
-    if hold_minutes >= max_hold:
-        return {
-            "action": "sell",
-            "reason": EXIT_TIME_STOP,
-            "net_pnl_pct": net_pnl_pct,
-            "hold_minutes": hold_minutes,
-            "detail": f"path_aware_max_hold_min={max_hold}",
+            "action": "hold",
+            "reason": "PATH_AWARE_HOLD_4H_MISSING",
+            "detail": "4h_bundle_missing_no_scalp_clip",
+            **base,
         }
     return {
         "action": "hold",
-        "reason": "PATH_AWARE_HOLD",
-        "net_pnl_pct": net_pnl_pct,
-        "hold_minutes": hold_minutes,
-        "detail": DAY_PATH_AWARE_POLICY,
+        "reason": "PATH_AWARE_HOLD_4H_UNDECIDED",
+        "detail": "4h_not_intact_not_broken_no_scalp_clip",
+        **base,
     }
 
 

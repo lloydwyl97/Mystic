@@ -22,6 +22,7 @@ EXIT_THESIS_WARNING = "THESIS_INVALIDATION_WARNING_ONLY"
 EXIT_THESIS_INVALIDATION = "THESIS_INVALIDATION_EXIT"
 EXIT_STOP_LOSS = "STOP_LOSS_EXIT"
 EXIT_TRAILING_STOP = "TRAILING_STOP_EXIT"
+EXIT_DAY_4H_STRUCTURE_BREAK = "DAY_4H_STRUCTURE_BREAK_EXIT"
 
 SETUP_HTF_TREND_PULLBACK = "HTF_TREND_PULLBACK"
 SETUP_VWAP_REVERSION = "VWAP_REVERSION"
@@ -995,6 +996,26 @@ def htf_4h_rise_intact(bundle: dict[str, Any] | None) -> bool:
     elif align is not None and align >= 0.52:
         return True
     return False
+
+
+def day_4h_structure_snapshot(bundle: dict[str, Any] | None) -> dict[str, Any]:
+    """Explainability for 4H hold vs structure-break exits."""
+    candles = _4h_recent_ohlc(bundle)
+    prior_4h_low = None
+    current_4h_close = None
+    if len(candles) >= 2:
+        prior_4h_low = candles[-2][2]
+        current_4h_close = candles[-1][3]
+    elif len(candles) == 1:
+        current_4h_close = candles[-1][3]
+    missing = (not isinstance(bundle, dict)) or not isinstance(bundle.get("4h"), list) or len(candles) < 2
+    return {
+        "htf_4h_rise_intact": htf_4h_rise_intact(bundle),
+        "htf_4h_rise_broken": htf_4h_rise_broken(bundle),
+        "prior_4h_low": prior_4h_low,
+        "current_4h_close": current_4h_close,
+        "4h_bundle_missing": missing,
+    }
 
 
 def htf_4h_rise_broken(bundle: dict[str, Any] | None) -> bool:
