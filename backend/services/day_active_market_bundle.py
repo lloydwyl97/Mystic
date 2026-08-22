@@ -330,8 +330,26 @@ async def _fetch_day_active_ohlcv_bundle_raw(
             if rows or tf not in critical_tfs or attempt == 1:
                 break
             await asyncio.sleep(1.5)
-        out[tf] = rows
-        tf_fetched_at[tf] = now
+        need = min_bars_for_day_tf(tf)
+        fetched_n = len(rows) if isinstance(rows, list) else 0
+        prior_n = len(prior_rows) if isinstance(prior_rows, list) else 0
+        # A failed/empty live fetch is not proof the market has no bars.
+        # Keep a complete prior TF so a rate-limit or 451 cannot flap the
+        # DAY active contract while Redis/context already hold those TFs.
+        if fetched_n < need and prior_n >= need:
+            logger.warning(
+                "DAY_BUNDLE_TF_EMPTY_REUSE_PRIOR %s %s fetched=%s need=%s prior=%s",
+                sym,
+                tf,
+                fetched_n,
+                need,
+                prior_n,
+            )
+            out[tf] = prior_rows
+            tf_fetched_at[tf] = prior_ts or now
+        else:
+            out[tf] = rows
+            tf_fetched_at[tf] = now
     return out, tf_fetched_at
 
 

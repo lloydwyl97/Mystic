@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_PROFIT_TO_SELL
+from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_PROFIT_TO_SELL, min_net_profit_for_symbol
 from backend.services.ai_regime_validation import blend_by_scalar, get_regime_validated_scalar
 from backend.services.day_trade_thesis import (
     DAY_4H_BUNDLE_MISSING,
@@ -1010,6 +1010,60 @@ def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dic
     return base_changed or tier_changed
 
 
+def _trail_semantics(
+    *,
+    entry: float,
+    current_price: float,
+    position: Any,
+    coin_profile: dict[str, Any],
+    path_aware: bool,
+    atr_pct: float,
+    bundle: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Split the overloaded ``trailing_stop_price`` field into distinct concepts.
+
+    Persisted ``trailing_stop_price`` is a high-water ratchet:
+    ``highest * (1 - trail_distance)`` after ``highest >= entry * (1 + trail_distance)``.
+    For a long that is an intended *stop below the high*, not a target above market.
+    Path-aware execution does not sell on that ratchet; leftover net-profit and the
+    risk floor / 4H break / extreme protection do.
+    """
+    highest = float(getattr(position, "highest_price", entry) or entry)
+    trail_distance = float(getattr(position, "trail_pct", 0.0) or coin_profile.get("trail") or 0.005)
+    trail_activation = entry * (1.0 + trail_distance) if entry > 0 else 0.0
+    ratchet = float(getattr(position, "trailing_stop_price", 0.0) or 0.0)
+    activated = bool(entry > 0 and highest >= trail_activation - 1e-12)
+    # Executable only in the legacy ladder, and only as a stop *below* the mark.
+    executable_trail = None
+    if (not path_aware) and activated and ratchet > 0 and 0 < ratchet <= float(current_price or 0.0):
+        executable_trail = ratchet
+    snap4 = day_4h_structure_snapshot(bundle)
+    hard_stop = resolve_day_risk_floor_price(
+        entry_price=entry,
+        thesis_invalid_level=float(getattr(position, "thesis_invalid_level", 0.0) or 0.0),
+        prior_4h_low=float(snap4.get("prior_4h_low") or 0.0),
+        atr_pct=atr_pct,
+    )
+    persisted_stop = float(getattr(position, "stop_price", 0.0) or 0.0)
+    if hard_stop <= 0:
+        hard_stop = persisted_stop if 0 < persisted_stop < entry else 0.0
+    return {
+        "high_water": highest,
+        "trail_activation": trail_activation,
+        "trail_distance": trail_distance,
+        "ratchet_trail_price": ratchet,
+        "executable_trailing_stop": executable_trail,
+        "hard_stop": hard_stop,
+        "persisted_stop_price": persisted_stop,
+        "trailing_stop_in_exit_authority": bool(not path_aware and executable_trail is not None),
+        "path_aware_exit": path_aware,
+        "4h_bundle_present": bool(snap4.get("4h_bundle_present")),
+        "prior_4h_low": snap4.get("prior_4h_low"),
+        "htf_4h_rise_intact": snap4.get("htf_4h_rise_intact"),
+        "htf_4h_rise_broken": snap4.get("htf_4h_rise_broken"),
+    }
+
+
 def preview_next_engine_exit(
     *,
     position: Any,
@@ -1019,7 +1073,13 @@ def preview_next_engine_exit(
     coin_profile: dict[str, Any],
     bundle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Read-only: next exit path and whether position can stall indefinitely."""
+    """Read-only: next *executable* exit authority and trail-field split.
+
+    Does not mutate exit behaviour. When path-aware is on, ``next_engine_exit``
+    is the authority that can actually flatten the position — not the legacy
+    ladder's ``current_price <= ratchet_trail`` check, which is true whenever
+    the mark is below a high-water ratchet and is not an exit in this policy.
+    """
     entry = float(getattr(position, "entry_price", 0.0) or 0.0)
     stop = effective_stop_price(entry, float(getattr(position, "stop_price", 0) or 0), float(getattr(position, "thesis_invalid_level", 0) or 0))
     target = effective_target_price(entry, float(getattr(position, "take_profit_1_price", 0) or 0), float(getattr(position, "thesis_target_level", 0) or 0), position, bundle)
@@ -1031,6 +1091,20 @@ def preview_next_engine_exit(
 
     highest = float(getattr(position, "highest_price", entry) or entry)
     mfe_pct = max(0.0, (highest - entry) / entry) if entry > 0 else 0.0
+    invalid = float(getattr(position, "thesis_invalid_level", 0.0) or 0.0)
+    atr_pct = 0.01
+    if invalid > 0 and invalid < entry:
+        atr_pct = max(0.008, (entry - invalid) / entry)
+    path_aware = _path_aware_exit_enabled()
+    trail_info = _trail_semantics(
+        entry=entry,
+        current_price=current_price,
+        position=position,
+        coin_profile=coin_profile,
+        path_aware=path_aware,
+        atr_pct=atr_pct,
+        bundle=bundle,
+    )
     _stall_preview = evaluate_stall_exit(
         entry_price=entry,
         highest_price=highest,
@@ -1050,9 +1124,10 @@ def preview_next_engine_exit(
         "time_stop": bool(hold_minutes >= max_hold and net_pnl_pct + 1e-12 < float(MIN_NET_PROFIT_TO_SELL)),
         "profit_target": bool(target > 0 and current_price >= target and net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL) * 0.45),
         "net_profit": bool(net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL)),
+        "risk_floor": bool(trail_info["hard_stop"] > 0 and current_price <= float(trail_info["hard_stop"])),
     }
 
-    next_exit = "none"
+    legacy_next = "none"
     priority = [
         ("stop_loss", EXIT_STOP_LOSS),
         ("trailing_stop", EXIT_TRAILING_STOP),
@@ -1064,10 +1139,62 @@ def preview_next_engine_exit(
     ]
     for key, reason in priority:
         if checks[key]:
-            next_exit = reason
+            legacy_next = reason
             break
 
+    next_exit = legacy_next
+    current_authority = legacy_next
+    next_executable_condition = legacy_next
+    if path_aware:
+        managed = _evaluate_path_aware_exit(
+            position=position,
+            current_price=current_price,
+            net_pnl_pct=net_pnl_pct,
+            hold_minutes=hold_minutes,
+            coin_profile=coin_profile,
+            bundle=bundle,
+            entry=entry,
+            atr_pct=atr_pct,
+        )
+        current_authority = str(managed.get("reason") or HOLD_4H_MISSING)
+        if str(managed.get("action") or "") == "sell":
+            next_exit = current_authority
+            next_executable_condition = current_authority
+        else:
+            # Leftover path in portfolio_engine._check_exit_conditions: intact
+            # 4H may still take profit once net clears the structure-aware floor.
+            # That is existing execution, reported here — not a new gate.
+            try:
+                from backend.services.portfolio_engine import day_intact_profit_floor
+
+                min_net = float(min_net_profit_for_symbol(str(getattr(position, "symbol", "") or "")))
+                intact_floor = day_intact_profit_floor(
+                    entry_price=entry,
+                    prior_4h_low=float(trail_info.get("prior_4h_low") or 0.0),
+                    min_net_profit=min_net,
+                )
+            except Exception:
+                intact_floor = float(MIN_NET_PROFIT_TO_SELL) * 2.0
+            if (not trail_info.get("htf_4h_rise_broken")) and net_pnl_pct + 1e-12 >= intact_floor:
+                next_exit = EXIT_NET_PROFIT
+                next_executable_condition = f"{EXIT_NET_PROFIT}_intact_floor"
+                current_authority = f"{current_authority}+{EXIT_NET_PROFIT}_intact_floor"
+            elif checks["risk_floor"]:
+                next_exit = EXIT_DAY_RISK_FLOOR
+                next_executable_condition = EXIT_DAY_RISK_FLOOR
+            else:
+                next_exit = current_authority
+                if trail_info["hard_stop"] > 0 and entry > 0:
+                    next_executable_condition = f"{EXIT_DAY_RISK_FLOOR}_or_{EXIT_DAY_4H_STRUCTURE_BREAK}"
+                else:
+                    next_executable_condition = EXIT_DAY_4H_STRUCTURE_BREAK
+
     dist_stop_pct = ((current_price - stop) / entry) if stop > 0 and entry > 0 else None
+    dist_hard_pct = (
+        ((current_price - float(trail_info["hard_stop"])) / entry)
+        if trail_info["hard_stop"] > 0 and entry > 0
+        else None
+    )
     dist_target_pct = ((target - current_price) / entry) if target > 0 and entry > 0 else None
     hold_remaining_min = max(0.0, max_hold - hold_minutes)
 
@@ -1078,16 +1205,10 @@ def preview_next_engine_exit(
             max_hold > 0,
             trail > 0,
             bool(thesis),
+            trail_info["hard_stop"] > 0,
         ]
     )
 
-    # HoldEV (item p8): continuous hold-economics score — see
-    # hold_ev_engine.py's architecture note. Exposed here for observability;
-    # its actual bounded, tighten-only influence on exit management lives in
-    # evaluate_giveback_exit / the bull-regime branch of
-    # evaluate_engine_managed_exit (DAY) and _early_scratch_exit /
-    # _stall_before_max_hold (SCALP) — not in next_exit/exit_checks above,
-    # which describe the OTHER mechanical levers (stop/trail/target/time).
     hold_ev_payload: dict[str, Any] | None = None
     try:
         from backend.services.hold_ev_engine import hold_ev_for_position
@@ -1109,9 +1230,20 @@ def preview_next_engine_exit(
         "hold_minutes": round(hold_minutes, 2),
         "hold_remaining_min": round(hold_remaining_min, 2),
         "trailing_stop_price": trail,
+        "high_water": trail_info["high_water"],
+        "trail_activation": trail_info["trail_activation"],
+        "trail_distance": trail_info["trail_distance"],
+        "executable_trailing_stop": trail_info["executable_trailing_stop"],
+        "hard_stop": trail_info["hard_stop"],
+        "current_exit_authority": current_authority,
+        "next_executable_exit_condition": next_executable_condition,
+        "trailing_stop_in_exit_authority": trail_info["trailing_stop_in_exit_authority"],
+        "path_aware_exit": path_aware,
+        "legacy_ladder_next_exit": legacy_next,
         "exit_checks": checks,
         "next_engine_exit": next_exit,
         "distance_to_stop_pct": round(dist_stop_pct, 6) if dist_stop_pct is not None else None,
+        "distance_to_hard_stop_pct": round(dist_hard_pct, 6) if dist_hard_pct is not None else None,
         "distance_to_target_pct": round(dist_target_pct, 6) if dist_target_pct is not None else None,
         "can_be_stuck_indefinitely": can_stall,
         "hold_ev": hold_ev_payload,

@@ -2387,6 +2387,7 @@ class PortfolioEngine:
         ledger_loaded = await self._load_ledger_from_sqlite()
         await self._load_positions_from_sqlite()
         self._load_constraints_from_sqlite()
+        self._load_coin_performance_from_sqlite()
         if not self.test_mode:
             try:
                 from backend.services.atomic_execution_book import restore_orphaned_day_buys
@@ -4246,6 +4247,7 @@ class PortfolioEngine:
         ledger_loaded = await self._load_ledger_from_sqlite()
         await self._load_positions_from_sqlite()
         self._load_constraints_from_sqlite()
+        self._load_coin_performance_from_sqlite()
         if not self.test_mode:
             try:
                 from backend.services.atomic_execution_book import restore_orphaned_day_buys
@@ -16866,15 +16868,19 @@ class PortfolioEngine:
         opened_router = bool(getattr(pos, "opened_under_router", False))
         hold_min = max(0.0, (time.time() - entry_ts) / 60.0) if entry_ts > 0 else 0.0
         profile = get_coin_profile(symbol)
+        from backend.services.day_active_market_bundle import read_cached_day_active_bundle_sync
         from backend.services.day_controlled_exits import preview_next_engine_exit
 
+        cached_bundle = None
+        with contextlib.suppress(Exception):
+            cached_bundle = read_cached_day_active_bundle_sync(symbol)
         exit_preview = preview_next_engine_exit(
             position=pos,
             current_price=mark,
             net_pnl_pct=net_pct,
             hold_minutes=hold_min,
             coin_profile=profile,
-            bundle=None,
+            bundle=cached_bundle,
         )
         hi = float(pos.highest_price or ep or 0.0)
         lo = float(getattr(pos, "lowest_price", 0.0) or 0.0)
@@ -16928,6 +16934,13 @@ class PortfolioEngine:
             "thesis_target_level": float(getattr(pos, "thesis_target_level", 0.0) or 0.0),
             "max_hold_min": int(getattr(pos, "max_hold_min", 0) or profile.get("max_hold_min") or 75),
             "trailing_stop_price": float(getattr(pos, "trailing_stop_price", 0) or 0),
+            "high_water": (exit_preview or {}).get("high_water"),
+            "trail_activation": (exit_preview or {}).get("trail_activation"),
+            "trail_distance": (exit_preview or {}).get("trail_distance"),
+            "executable_trailing_stop": (exit_preview or {}).get("executable_trailing_stop"),
+            "hard_stop": (exit_preview or {}).get("hard_stop"),
+            "current_exit_authority": (exit_preview or {}).get("current_exit_authority"),
+            "next_executable_exit_condition": (exit_preview or {}).get("next_executable_exit_condition"),
             "eligible_for_net_profit_exit": net_pct + 1e-12 >= float(_mnp_for_sym(getattr(pos, "symbol", ""))),
             "red_thesis_exit_blocked": False,
             "stop_price": stop,
@@ -16936,7 +16949,7 @@ class PortfolioEngine:
             "take_profit_2_price": tp2,
             "take_profit": tp1,
             "tp1_hit": bool(getattr(pos, "tp1_hit", False)),
-            "exit_levels_are_advisory_metadata_only": False,
+            "exit_levels_are_advisory_metadata_only": bool((exit_preview or {}).get("path_aware_exit")),
             "engine_exit_preview": exit_preview,
             "sleeve": getattr(pos, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value,
             "status": getattr(pos, "status", "ACTIVE"),
@@ -17261,14 +17274,94 @@ class PortfolioEngine:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    def get_coin_status(self, symbol: str) -> dict[str, Any]:
-        """Get per-coin status for observability"""
-        perf = self.coin_performance.get(symbol)
-        if not perf:
-            return {"symbol": symbol, "status": "no_data"}
+    def _coin_status_keys(self, symbol: str) -> list[str]:
+        raw = str(symbol or "").strip()
+        bus = raw.upper().replace("/", "").replace("-", "").replace("_", "")
+        if bus and not bus.endswith("USDT"):
+            bus = f"{bus}USDT"
+        ccxt = f"{bus[:-4]}/USDT" if bus.endswith("USDT") and len(bus) > 4 else raw
+        keys = []
+        for k in (raw, ccxt, bus, raw.upper()):
+            if k and k not in keys:
+                keys.append(k)
+        return keys
 
-        return {
-            "symbol": symbol,
+    def _load_coin_performance_from_sqlite(self) -> int:
+        """Hydrate in-memory coin_performance from SQLite so /coins is not empty after restart."""
+        loaded = 0
+        try:
+            with connect_managed(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("SELECT * FROM coin_performance").fetchall()
+            for row in rows:
+                sym = str(row["symbol"] or "").strip()
+                if not sym:
+                    continue
+                perf = CoinPerformance(symbol=sym)
+                perf.trades_24h = int(row["trades_24h"] or 0)
+                perf.pnl_24h = float(row["pnl_24h"] or 0.0)
+                perf.win_count_20 = int(row["win_count_20"] or 0)
+                perf.loss_count_20 = int(row["loss_count_20"] or 0)
+                perf.total_trades_20 = int(row["total_trades_20"] or 0)
+                perf.avg_win = float(row["avg_win"] or 0.0)
+                perf.avg_loss = float(row["avg_loss"] or 0.0)
+                perf.expectancy = float(row["expectancy"] or 0.0)
+                perf.stop_loss_hits_10 = int(row["stop_loss_hits_10"] or 0)
+                perf.current_drawdown = float(row["current_drawdown"] or 0.0)
+                perf.peak_value = float(row["peak_value"] or 0.0)
+                perf.pause_until = float(row["pause_until"] or 0.0)
+                perf.sizing_multiplier = float(row["sizing_multiplier"] or 1.0)
+                perf.last_updated = float(row["last_updated"] or 0.0)
+                if "profit_factor" in row.keys():
+                    pf = row["profit_factor"]
+                    perf.profit_factor = None if pf is None else float(pf)
+                if "trades_last_30d" in row.keys():
+                    perf.trades_last_30d = int(row["trades_last_30d"] or 0)
+                if "avg_pnl" in row.keys():
+                    perf.avg_pnl = float(row["avg_pnl"] or 0.0)
+                self.coin_performance[sym] = perf
+                loaded += 1
+        except Exception:
+            logger.debug("coin_performance sqlite hydrate skipped", exc_info=True)
+        return loaded
+
+    def get_coin_status(self, symbol: str) -> dict[str, Any]:
+        """Per-coin observability: persisted performance plus the live book row."""
+        if not self.coin_performance:
+            self._load_coin_performance_from_sqlite()
+        keys = self._coin_status_keys(symbol)
+        perf = None
+        matched = symbol
+        for k in keys:
+            perf = self.coin_performance.get(k)
+            if perf:
+                matched = k
+                break
+        open_pos = None
+        for k in keys:
+            pos = self.open_positions.get(k)
+            if pos is not None:
+                open_pos = self.build_open_position_api_row(k, pos)
+                break
+        book = {
+            "open": open_pos is not None,
+            "quantity": (open_pos or {}).get("quantity"),
+            "entry_price": (open_pos or {}).get("entry_price"),
+            "current_price": (open_pos or {}).get("current_price"),
+            "unrealized_pnl": (open_pos or {}).get("unrealized_pnl"),
+            "net_pnl_pct": (open_pos or {}).get("net_pnl_pct"),
+            "current_exit_authority": (open_pos or {}).get("current_exit_authority"),
+        }
+        if not perf and open_pos is None:
+            return {"symbol": symbol, "status": "no_data", "book": book}
+        out: dict[str, Any] = {
+            "symbol": matched,
+            "status": "open" if open_pos is not None else "flat",
+            "book": book,
+        }
+        if not perf:
+            return out
+        out.update({
             "is_paused": perf.is_paused,
             "pause_until": perf.pause_until,
             "trades_24h": perf.trades_24h,
@@ -17280,7 +17373,8 @@ class PortfolioEngine:
             "stop_loss_hits_10": perf.stop_loss_hits_10,
             "sizing_multiplier": perf.sizing_multiplier,
             "last_updated": perf.last_updated,
-        }
+        })
+        return out
 
     def get_last_decisions(self, count: int = 10) -> list[dict[str, Any]]:
         """Get last N decisions with full explainability (memory, else paper_trades)."""
@@ -20913,6 +21007,7 @@ async def ensure_portfolio_engine_readable() -> PortfolioEngine:
         return engine
     await engine._load_ledger_from_sqlite(allow_mutations=False)
     await engine._load_positions_from_sqlite(allow_mutations=False)
+    engine._load_coin_performance_from_sqlite()
     await engine._recompute_positions_values(None, allow_network_mtm=False)
     _portfolio_engine_initialized = True
     return engine

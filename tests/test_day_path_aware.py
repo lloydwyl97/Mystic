@@ -13,8 +13,10 @@ from backend.services.day_controlled_exits import (
     EXIT_PATH_EXECUTABLE_PROFIT,
     EXIT_STALL_DEAD,
     EXIT_TIME_STOP,
+    EXIT_TRAILING_STOP,
     _path_aware_exit_enabled,
     evaluate_engine_managed_exit,
+    preview_next_engine_exit,
 )
 from backend.services.day_trade_thesis import resolve_day_risk_floor_price
 from backend.services.day_direct_path_ev_authority import (
@@ -46,6 +48,7 @@ class _Pos:
         self.thesis_score = kw.get("thesis_score", 0.7)
         self.max_hold_min = kw.get("max_hold_min", 360)
         self.day_route_regime_at_entry = kw.get("day_route_regime_at_entry", "")
+        self.symbol = kw.get("symbol", "ETH/USDT")
 
 
 @pytest.fixture(autouse=True)
@@ -343,3 +346,65 @@ def test_accepted_artifact_with_bars_stamps_model_version():
     assert stamped["path_net_status"] == "predicted"
     assert stamped["forward_net_model_version"] == "day_path_net_v1"
     reset_day_artifact_cache()
+
+
+def test_preview_does_not_name_nonexecutable_trail_when_path_aware():
+    """BTC-shaped book: mark below high-water ratchet. Path-aware must not
+    report TRAILING_STOP as the next executable authority."""
+    pos = _Pos(
+        entry_price=77374.93,
+        highest_price=78745.84,
+        lowest_price=76558.9,
+        stop_price=78588.35,
+        trailing_stop_price=78588.35,
+        trail_pct=0.004,
+        thesis_invalid_level=75492.42,
+        take_profit_1_price=78303.43,
+        symbol="BTC/USDT",
+    )
+    preview = preview_next_engine_exit(
+        position=pos,
+        current_price=77104.28,
+        net_pnl_pct=-0.0041,
+        hold_minutes=1890.0,
+        coin_profile={"max_hold_min": 27450, "trail": 0.004, "sl": 0.01},
+        bundle=None,
+    )
+    assert preview["path_aware_exit"] is True
+    assert preview["legacy_ladder_next_exit"] == EXIT_TRAILING_STOP
+    assert preview["next_engine_exit"] != EXIT_TRAILING_STOP
+    assert preview["executable_trailing_stop"] is None
+    assert preview["trailing_stop_in_exit_authority"] is False
+    assert preview["high_water"] == pytest.approx(78745.84)
+    assert preview["hard_stop"] > 0
+    assert preview["hard_stop"] < 77374.93
+    assert "TRAILING_STOP" not in str(preview["current_exit_authority"])
+
+
+def test_preview_splits_trail_fields_and_names_intact_profit_when_ready():
+    rows = _rising_4h_rows()
+    pos = _Pos(
+        entry_price=1.378,
+        highest_price=1.49925,
+        lowest_price=1.364,
+        stop_price=1.3787,
+        trailing_stop_price=1.49625,
+        trail_pct=0.005,
+        thesis_invalid_level=1.3236,
+        take_profit_1_price=1.397,
+        symbol="XRP/USDT",
+    )
+    preview = preview_next_engine_exit(
+        position=pos,
+        current_price=1.486,
+        net_pnl_pct=0.077,
+        hold_minutes=1920.0,
+        coin_profile={"max_hold_min": 12564, "trail": 0.005, "sl": 0.01},
+        bundle={"4h": rows},
+    )
+    assert preview["high_water"] == pytest.approx(1.49925)
+    assert preview["trail_activation"] == pytest.approx(1.378 * 1.005)
+    assert preview["trail_distance"] == pytest.approx(0.005)
+    assert preview["executable_trailing_stop"] is None
+    assert preview["next_engine_exit"] == EXIT_NET_PROFIT
+    assert "NET_PROFIT" in str(preview["current_exit_authority"])
