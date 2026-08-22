@@ -65,3 +65,27 @@ def test_coin_status_keys_cover_slash_and_bus():
     keys = eng._coin_status_keys("BTCUSDT")
     assert "BTC/USDT" in keys
     assert "BTCUSDT" in keys
+
+
+def test_coin_status_book_falls_back_to_sqlite_positions(tmp_path):
+    db = str(tmp_path / "t2.db")
+    con = sqlite3.connect(db)
+    con.execute(
+        """
+        CREATE TABLE portfolio_engine_positions (
+            symbol TEXT, quantity REAL, entry_price REAL,
+            highest_price REAL, lowest_price REAL
+        )
+        """
+    )
+    con.execute(
+        "INSERT INTO portfolio_engine_positions VALUES ('XRP/USDT', 10.0, 1.30, 1.40, 1.28)"
+    )
+    con.commit()
+    con.close()
+    eng = PortfolioEngine(db_path=db, principal=10000.0, test_mode=True)
+    st = eng.get_coin_status("XRPUSDT")
+    assert st["status"] == "open"
+    assert st["book"]["open"] is True
+    assert st["book"]["quantity"] == 10.0
+    assert st["book"]["entry_price"] == 1.30

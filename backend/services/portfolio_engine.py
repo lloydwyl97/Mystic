@@ -17343,6 +17343,32 @@ class PortfolioEngine:
             if pos is not None:
                 open_pos = self.build_open_position_api_row(k, pos)
                 break
+        if open_pos is None:
+            with contextlib.suppress(Exception):
+                with connect_managed(self.db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        """
+                        SELECT symbol, quantity, entry_price, highest_price, lowest_price
+                        FROM portfolio_engine_positions
+                        WHERE quantity > 0 AND symbol IN ({})
+                        LIMIT 1
+                        """.format(",".join("?" * len(keys))),
+                        tuple(keys),
+                    ).fetchone()
+                if row is not None:
+                    qty = float(row["quantity"] or 0.0)
+                    entry = float(row["entry_price"] or 0.0)
+                    mark = float(self._position_mark_prices.get(row["symbol"], entry) or entry)
+                    open_pos = {
+                        "symbol": row["symbol"],
+                        "quantity": qty,
+                        "entry_price": entry,
+                        "current_price": mark,
+                        "unrealized_pnl": (mark - entry) * qty if entry else 0.0,
+                        "net_pnl_pct": ((mark - entry) / entry - ESTIMATED_ROUNDTRIP_COST) if entry and mark else 0.0,
+                        "current_exit_authority": None,
+                    }
         book = {
             "open": open_pos is not None,
             "quantity": (open_pos or {}).get("quantity"),
