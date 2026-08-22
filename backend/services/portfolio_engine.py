@@ -9475,23 +9475,56 @@ class PortfolioEngine:
             logger.debug("_fetch_authoritative_open_position_sync failed %s: %s", normalized, e)
             return None
 
-    def _entry_close_already_recorded_sync(self, symbol: str, entry_trade_id: str, quantity: float) -> bool:
-        """True when position_close_ledger already records a full close for this entry lot."""
-        if not entry_trade_id:
-            return False
+    @staticmethod
+    def _closed_lot_tombstone_key(entry_trade_id: str) -> str:
+        """Redis key for a fully closed DAY lot. Identity is the entry trade_id, not the symbol."""
+        return f"paper:closed_lot:{entry_trade_id}"
+
+    def _entry_lot_still_open_sync(
+        self,
+        symbol: str,
+        entry_trade_id: str,
+        *,
+        conn: Any | None = None,
+    ) -> tuple[bool, float]:
+        """Return (still_open, remaining_qty) for this entry lot from SQLite authority."""
+        normalized = normalize_symbol(symbol)
+        sql = """
+            SELECT quantity, trade_id
+            FROM portfolio_engine_positions
+            WHERE symbol = ?
+        """
+
+        def _read(cur) -> tuple[bool, float]:
+            row = cur.execute(sql, (normalized,)).fetchone()
+            if not row:
+                return False, 0.0
+            qty = float(row[0] or 0.0)
+            trade_id = str(row[1] or "")
+            if qty <= 0:
+                return False, 0.0
+            if entry_trade_id and trade_id and trade_id != str(entry_trade_id):
+                return False, 0.0
+            return True, qty
+
         try:
-            with connect_rw(self.db_path) as conn:
-                row = conn.execute(
-                    """
-                    SELECT 1 FROM position_close_ledger
-                    WHERE symbol = ? AND sell_trade_id = ? AND ABS(quantity - ?) < 1e-6
-                    LIMIT 1
-                    """,
-                    (normalize_symbol(symbol), entry_trade_id, float(quantity)),
-                ).fetchone()
-            return row is not None
+            if conn is not None:
+                return _read(conn)
+            with connect_rw(self.db_path) as owned:
+                return _read(owned)
         except Exception:
+            return False, 0.0
+
+    def _entry_close_already_recorded_sync(self, symbol: str, entry_trade_id: str, quantity: float) -> bool:
+        """True only when this entry lot is no longer open for the requested size.
+
+        A prior TP1 / leftover SELL of the same quantity must not count as a full
+        close while ``portfolio_engine_positions`` still holds remaining qty.
+        """
+        still_open, remaining = self._entry_lot_still_open_sync(symbol, entry_trade_id)
+        if still_open and remaining + 1e-9 >= float(quantity or 0.0):
             return False
+        return not still_open
 
     def _sell_idempotency_duplicate_sync(
         self,
@@ -9499,30 +9532,26 @@ class PortfolioEngine:
         entry_trade_id: str,
         quantity: float,
         exit_trigger: str,
+        *,
+        available_qty: float | None = None,
     ) -> bool:
-        """True when an identical full close was already persisted for this open lot."""
-        if self._entry_close_already_recorded_sync(symbol, entry_trade_id, quantity):
+        """True when this remaining lot is already consumed.
+
+        Authority is the open SQLite row, not a prior paper_trades SELL with the
+        same qty/reason/entry id. TP1 and leftover may share NET_PROFIT_EXIT and
+        the same size after a 50% clip; that is a new close of the remainder.
+        """
+        qty = float(quantity or 0.0)
+        if qty <= 0:
             return True
-        try:
-            with connect_rw(self.db_path) as conn:
-                row = conn.execute(
-                    """
-                    SELECT 1 FROM paper_trades
-                    WHERE symbol = ? AND UPPER(side) = 'SELL' AND ABS(quantity - ?) < 1e-6
-                      AND exit_reason = ? AND status = 'executed'
-                      AND COALESCE(json_extract(explainability_json, '$.paper_entry_trade_id'), '') = ?
-                    LIMIT 1
-                    """,
-                    (
-                        normalize_symbol(symbol),
-                        float(quantity),
-                        str(exit_trigger or ""),
-                        str(entry_trade_id or ""),
-                    ),
-                ).fetchone()
-            return row is not None
-        except Exception:
+        if available_qty is not None:
+            remaining = float(available_qty or 0.0)
+            still_open = remaining > 0
+        else:
+            still_open, remaining = self._entry_lot_still_open_sync(symbol, entry_trade_id)
+        if still_open and remaining + 1e-9 >= qty:
             return False
+        return True
 
     async def execute_legacy_inventory_cleanup(self, symbol: str) -> dict[str, Any] | None:
         """Close pre-router legacy DAY inventory; excluded from new-regime scoreboard."""
@@ -9849,12 +9878,20 @@ class PortfolioEngine:
                         conn.rollback()
                         return False
 
-                    if self._sell_idempotency_duplicate_sync(normalized_symbol, position_trade_id, quantity, exit_trigger):
+                    if self._sell_idempotency_duplicate_sync(
+                        normalized_symbol,
+                        position_trade_id,
+                        quantity,
+                        exit_trigger,
+                        available_qty=float(available_qty or 0.0),
+                    ):
                         logger.warning(
-                            "SELL_IDEMPOTENCY_ALREADY_CLOSED: %s entry_trade_id=%s qty=%.8f exit=%s",
+                            "SELL_IDEMPOTENCY_ALREADY_CLOSED: %s entry_trade_id=%s qty=%.8f "
+                            "available=%.8f exit=%s",
                             normalized_symbol,
                             position_trade_id,
                             quantity,
+                            float(available_qty or 0.0),
                             exit_trigger,
                         )
                         conn.rollback()
@@ -10735,6 +10772,12 @@ class PortfolioEngine:
             async with self._deletion_lock:
                 del self.open_positions[normalized_symbol]
                 await self._delete_position_from_sqlite(normalized_symbol)
+                await self._write_closed_lot_tombstone(
+                    normalized_symbol,
+                    entry_trade_id=str(position.trade_id or ""),
+                    sell_trade_id=str(sell_trade_id or ""),
+                    quantity=float(quantity),
+                )
                 # AUTO-CLEANUP: When account cleared (0 positions), clear stale quarantines
                 if len(self.open_positions) == 0:
                     await self._clear_all_quarantines()
@@ -18081,6 +18124,61 @@ class PortfolioEngine:
         except Exception as exc:
             logger.debug("PAPER_REDIS_MARK_REFRESH failed: %s", exc)
 
+    def _resolve_heal_mark(self, symbol: str, entry: float, existing: Any | None) -> float:
+        """Mark for Redis heal. Never silently replace a live mark with entry."""
+        resolved = self._resolve_mtm_prices(None) or {}
+        mark = float(resolved.get(symbol) or 0.0)
+        if mark <= 0:
+            mark = float(self._position_mark_prices.get(symbol) or 0.0)
+        if mark <= 0 and existing is not None:
+            cur = float(getattr(existing, "current_price", 0.0) or 0.0)
+            if cur > 0 and abs(cur - float(entry or 0.0)) > 1e-9:
+                mark = cur
+        if mark <= 0:
+            mark = float(entry or 0.0)
+        return mark
+
+    async def _write_closed_lot_tombstone(
+        self,
+        symbol: str,
+        *,
+        entry_trade_id: str,
+        sell_trade_id: str,
+        quantity: float,
+    ) -> None:
+        """Record that this entry lot is fully closed so heal cannot resurrect it.
+
+        Keyed by entry trade_id, not symbol, so a later new XRP/BTC lot is allowed.
+        """
+        if not entry_trade_id:
+            return
+        try:
+            from backend.services.paper_trading_service import get_paper_trading_service
+
+            paper = self._paper_service or get_paper_trading_service()
+            self._paper_service = paper
+            await paper._ensure_redis()
+            if not paper.redis_client:
+                return
+            payload = json.dumps(
+                {
+                    "symbol": normalize_symbol(symbol),
+                    "entry_trade_id": str(entry_trade_id),
+                    "sell_trade_id": str(sell_trade_id or ""),
+                    "quantity": float(quantity),
+                    "kind": "FULL",
+                    "closed_at": datetime.now(timezone.utc).isoformat(),
+                },
+                separators=(",", ":"),
+            )
+            await paper.redis_client.set(
+                self._closed_lot_tombstone_key(str(entry_trade_id)),
+                payload,
+                ex=7 * 24 * 3600,
+            )
+        except Exception:
+            logger.debug("closed-lot tombstone write skipped", exc_info=True)
+
     async def _sync_paper_redis_from_sqlite_authoritative(self) -> None:
         """
         Paper mode self-heal: SQLite ``portfolio_engine_positions`` and ``portfolio_engine_ledger``
@@ -18104,7 +18202,8 @@ class PortfolioEngine:
                         """
                         SELECT symbol, quantity, entry_price, entry_time,
                                COALESCE(repair_add_count, 0), COALESCE(last_repair_add_ts, 0),
-                               COALESCE(entry_strategy_id, 'day'), COALESCE(sleeve, 'ACTIVE')
+                               COALESCE(entry_strategy_id, 'day'), COALESCE(sleeve, 'ACTIVE'),
+                               COALESCE(trade_id, '')
                         FROM portfolio_engine_positions
                         WHERE quantity > 0
                         ORDER BY symbol
@@ -18119,14 +18218,23 @@ class PortfolioEngine:
             now = datetime.now(timezone.utc)
             resolved = self._resolve_mtm_prices(None) or {}
 
-            for raw_sym, qty, entry, entry_time, repair_cnt, repair_ts, strategy_id, sleeve in rows:
+            for raw_sym, qty, entry, entry_time, repair_cnt, repair_ts, strategy_id, sleeve, trade_id in rows:
                 sym = normalize_symbol(str(raw_sym))
                 open_symbols.add(sym)
                 qty_f = float(qty or 0)
                 entry_f = float(entry or 0)
                 if qty_f <= 0:
                     continue
-                mark = float(resolved.get(sym) or 0)
+                lot_id = str(trade_id or "")
+                if lot_id and paper.redis_client:
+                    tombstone = await paper.redis_client.get(self._closed_lot_tombstone_key(lot_id))
+                    if tombstone:
+                        # SQLite still has the lot: it is open. Drop the stale tombstone.
+                        await paper.redis_client.delete(self._closed_lot_tombstone_key(lot_id))
+                existing = paper.positions.get(sym)
+                mark = self._resolve_heal_mark(sym, entry_f, existing)
+                if mark <= 0:
+                    mark = float(resolved.get(sym) or 0)
                 if mark <= 0:
                     mark = entry_f
                 unreal = (mark - entry_f) * qty_f
@@ -18134,7 +18242,6 @@ class PortfolioEngine:
                     entry_dt = datetime.fromtimestamp(float(entry_time), tz=timezone.utc)
                 except (TypeError, ValueError, OSError):
                     entry_dt = now
-                existing = paper.positions.get(sym)
                 if existing:
                     drift = (
                         abs(float(existing.quantity) - qty_f) > 1e-9
