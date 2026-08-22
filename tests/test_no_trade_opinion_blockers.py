@@ -18,6 +18,24 @@ import pytest
 from backend.services.portfolio_engine import DAY_TRADE_SYMBOLS, PortfolioEngine
 
 
+@pytest.fixture(autouse=True)
+def _isolate_trade_state_from_runtime(monkeypatch):
+    """Keep this file off live Redis / process-wide TradeStateStore.
+
+    Production TradeState COOLDOWN after a real sell is a legitimate
+    execution-safety gate (ENABLE_TRADE_STATE_ENTRY_BLOCKING). These tests
+    exist to prove quality-filter *opinion* pauses are not buy gates. Without
+    isolation they inherit ``trade_state:{SYMBOL}`` from the paper runtime
+    (or an earlier pytest notify_exit) and fail for the wrong reason.
+    """
+    import backend.services.trade_state as trade_state
+
+    isolated = trade_state.TradeStateStore(redis_client=None)
+    monkeypatch.setattr(trade_state, "_store_instance", isolated)
+    monkeypatch.setattr(trade_state, "get_trade_state_store", lambda redis_client=None: isolated)
+    return isolated
+
+
 def _base_engine() -> PortfolioEngine:
     engine = PortfolioEngine(principal=25_000.0, test_mode=True)
     engine.cash_balance = 25_000.0
@@ -92,6 +110,29 @@ async def test_genuine_safety_blocks_still_enforced():
     allowed2, reason2 = await engine2._can_open_position("BTC/USDT", 5_000.0)
     assert allowed2 is False
     assert "CASH" in reason2 or "INSUFFICIENT" in reason2
+
+
+@pytest.mark.asyncio
+async def test_trade_state_cooldown_is_execution_safety_not_opinion(
+    _isolate_trade_state_from_runtime, monkeypatch
+):
+    """TradeState COOLDOWN is permitted execution safety, not a quality-filter opinion gate.
+
+    Seeded only on the isolated in-memory store (no Redis). Production still
+    writes trade_state:{SYMBOL} after notify_exit; this test does not disable that.
+    """
+    import backend.services.portfolio_engine as pe
+
+    monkeypatch.setattr(pe, "ENABLE_TRADE_STATE_ENTRY_BLOCKING", True)
+    until = time.time() + 300.0
+    _isolate_trade_state_from_runtime._local_state["BTCUSDT"] = {
+        "state": "COOLDOWN",
+        "cooldown_until": str(until),
+        "exit_reason": "NET_PROFIT_EXIT",
+    }
+    allowed, reason = await _base_engine()._can_open_position("BTC/USDT", 100.0)
+    assert allowed is False
+    assert reason.startswith("TRADE_STATE:COOLDOWN_ACTIVE_UNTIL_"), reason
 
 
 @pytest.mark.asyncio
