@@ -713,7 +713,14 @@ class ExitType(Enum):
 
 def paper_trades_exit_type_label(exit_type: ExitType, exit_trigger: str) -> str:
     """DB/report label for paper_trades.exit_type — prefer engine trigger over MANUAL."""
-    from backend.services.day_trade_thesis import EXIT_MANUAL, canonical_day_exit_reason
+    from backend.services.day_trade_thesis import (
+        EXIT_DAY_4H_STRUCTURE_BREAK,
+        EXIT_DAY_RISK_FLOOR,
+        EXIT_EMERGENCY_FLATTEN,
+        EXIT_MANUAL,
+        EXIT_RESTART_FLATTEN,
+        canonical_day_exit_reason,
+    )
 
     if exit_type == ExitType.DUST_WRITEOFF:
         return ExitType.DUST_WRITEOFF.value
@@ -721,6 +728,15 @@ def paper_trades_exit_type_label(exit_type: ExitType, exit_trigger: str) -> str:
         return ExitType.TAKE_PROFIT_1.value
     if exit_type == ExitType.TAKE_PROFIT_FULL:
         return ExitType.TAKE_PROFIT_FULL.value
+    trig = str(exit_trigger or "").upper()
+    if "DAY_4H_STRUCTURE_BREAK" in trig:
+        return EXIT_DAY_4H_STRUCTURE_BREAK
+    if "DAY_RISK_FLOOR" in trig:
+        return EXIT_DAY_RISK_FLOOR
+    if "EMERGENCY_FLATTEN" in trig:
+        return EXIT_EMERGENCY_FLATTEN
+    if "RESTART_FLATTEN" in trig:
+        return EXIT_RESTART_FLATTEN
     canon = canonical_day_exit_reason(str(exit_trigger or ""), exit_type_name=exit_type.name)
     if canon and canon not in (EXIT_MANUAL, "MANUAL", ""):
         return str(canon)
@@ -5413,6 +5429,10 @@ class PortfolioEngine:
             "THESIS_INVALIDATION_EXIT",
             "FAILED_RECLAIM_EXIT",
             "EXTREME_PROTECTION_EXIT",
+            "DAY_4H_STRUCTURE_BREAK_EXIT",
+            "DAY_RISK_FLOOR_EXIT",
+            "EMERGENCY_FLATTEN",
+            "RESTART_FLATTEN",
         ):
             if canon in trig:
                 return canon
@@ -5443,6 +5463,14 @@ class PortfolioEngine:
             return "ALLWEATHER_ATR_TARGET_EXIT"
         if "ALLWEATHER_TIME_STOP" in trig:
             return "ALLWEATHER_TIME_STOP_EXIT"
+        if "DAY_4H_STRUCTURE_BREAK" in trig:
+            return "DAY_4H_STRUCTURE_BREAK_EXIT"
+        if "DAY_RISK_FLOOR" in trig:
+            return "DAY_RISK_FLOOR_EXIT"
+        if "EMERGENCY_FLATTEN" in trig:
+            return "EMERGENCY_FLATTEN"
+        if "RESTART_FLATTEN" in trig:
+            return "RESTART_FLATTEN"
 
         canonical = canonical_day_exit_reason(exit_trigger, exit_type_name=exit_type.name)
         if canonical in ALLOWED_DAY_EXIT_REASONS:

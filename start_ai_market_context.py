@@ -31,6 +31,16 @@ logger = logging.getLogger("ai_market_context")
 
 async def _main() -> int:
     from backend.services.ai_market_context import get_market_context_service
+    from backend.utils.process_singleton import (
+        AI_MARKET_CONTEXT_PIDFILE,
+        ProcessAlreadyRunning,
+        acquire_process_singleton,
+    )
+
+    try:
+        acquire_process_singleton(AI_MARKET_CONTEXT_PIDFILE, label="AI market context")
+    except ProcessAlreadyRunning:
+        return 1
 
     svc = get_market_context_service()
     await svc.start()

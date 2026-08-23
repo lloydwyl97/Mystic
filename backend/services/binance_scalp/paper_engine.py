@@ -8,7 +8,7 @@ import logging
 import os
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import redis
 from backend.services.binance_scalp.calibration_profiles import economics_for_config
@@ -109,6 +109,9 @@ class BinanceScalpPaperEngine:
         self._heartbeat_thread = None
         self._cached_open_symbols: list[str] = []
         self._last_circuit_breaker_open = False
+        self._last_breaker_reason = ""
+        self._last_breaker_recovery_until = ""
+        self._last_breaker_eval_after = ""
         try:
             from backend.database_schema import DATABASE_PATH as _DAY_DB
             from backend.services.atomic_execution_book import migrate_scalp_money_database
@@ -151,8 +154,97 @@ class BinanceScalpPaperEngine:
         return conn
 
     def _now(self) -> tuple[str, float]:
-        dt = datetime.now(timezone.utc)
+        dt = self._utcnow()
         return dt.isoformat(), dt.timestamp()
+
+    def _utcnow(self) -> datetime:
+        override = getattr(self, "_utcnow_override", None)
+        if override is not None:
+            return override
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _parse_utc_ts(raw: str | None) -> datetime | None:
+        s = str(raw or "").strip()
+        if not s:
+            return None
+        s = s.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            try:
+                dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def _consec_eval_floor(self, epoch: str, eval_after: str) -> str:
+        candidates = [s.strip() for s in (epoch, eval_after) if str(s or "").strip()]
+        if not candidates:
+            return ""
+        parsed: list[tuple[datetime, str]] = []
+        for item in candidates:
+            dt = self._parse_utc_ts(item)
+            if dt is not None:
+                parsed.append((dt, item))
+        if not parsed:
+            return max(candidates)
+        return max(parsed, key=lambda item: item[0])[1]
+
+    def _load_consec_breaker_state(self, conn: sqlite3.Connection) -> dict[str, str]:
+        try:
+            row = conn.execute(
+                """
+                SELECT consec_breaker_tripped_at, consec_breaker_recovery_until,
+                       consec_breaker_eval_after, consec_breaker_reason
+                FROM scalp_meta WHERE id = 1
+                """
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return {}
+        if row is None:
+            return {}
+        return {
+            "tripped_at": str(row[0] or ""),
+            "recovery_until": str(row[1] or ""),
+            "eval_after": str(row[2] or ""),
+            "reason": str(row[3] or ""),
+        }
+
+    def _save_consec_breaker_state(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        tripped_at: str = "",
+        recovery_until: str = "",
+        eval_after: str | None = None,
+        reason: str = "",
+    ) -> None:
+        if eval_after is None:
+            conn.execute(
+                """
+                UPDATE scalp_meta
+                SET consec_breaker_tripped_at = ?,
+                    consec_breaker_recovery_until = ?,
+                    consec_breaker_reason = ?
+                WHERE id = 1
+                """,
+                (tripped_at or None, recovery_until or None, reason or None),
+            )
+            return
+        conn.execute(
+            """
+            UPDATE scalp_meta
+            SET consec_breaker_tripped_at = ?,
+                consec_breaker_recovery_until = ?,
+                consec_breaker_eval_after = ?,
+                consec_breaker_reason = ?
+            WHERE id = 1
+            """,
+            (tripped_at or None, recovery_until or None, eval_after or None, reason or None),
+        )
 
     def _ledger(self, conn: sqlite3.Connection) -> sqlite3.Row:
         row = conn.execute("SELECT * FROM scalp_paper_ledger WHERE id = 1").fetchone()
@@ -455,6 +547,10 @@ class BinanceScalpPaperEngine:
                 "products_scanned": list(self.config.products),
                 "entry_blocked_reason": entry_blocked_reason,
                 "momentum_warmed": True,
+                "circuit_breaker_open": bool(self._last_circuit_breaker_open),
+                "circuit_breaker_reason": getattr(self, "_last_breaker_reason", "") or "",
+                "breaker_recovery_until": getattr(self, "_last_breaker_recovery_until", "") or "",
+                "breaker_eval_after": getattr(self, "_last_breaker_eval_after", "") or "",
             }
             key = runner_state_key(self.config.redis_key_prefix)
             self._redis.setex(key, 90, json.dumps(payload, separators=(",", ":")))
@@ -553,23 +649,31 @@ class BinanceScalpPaperEngine:
     def _check_scalp_circuit_breaker(self) -> bool:
         """Check SCALP-specific circuit breaker. Returns True if circuit is open (halt new entries).
 
-        Two conditions trigger the breaker:
+        Two independent conditions trigger the breaker:
         1. Today's closed-trade PnL is worse than -SCALP_DAILY_LOSS_LIMIT_PCT * principal.
-        2. The last SCALP_MAX_CONSECUTIVE_LOSSES closed trades are all losses.
+        2. The last SCALP_MAX_CONSECUTIVE_LOSSES closed trades (after the eval floor)
+           are all losses.
 
-        SCALP_CIRCUIT_BREAKER_EPOCH excludes trades closed before that timestamp.
-        The breaker keeps no state and re-derives from history each cycle, so once
-        it trips on a run of losses it stays tripped forever unless the window is
-        moved. The epoch moves the window; it does not weaken either threshold.
+        Consecutive-loss trips persist a cooldown of SCALP_BREAKER_RECOVERY_SEC.
+        After that window the engine starts a fresh consec evaluation; historical
+        SELL rows stay in the book. A restart reads the persisted cooldown so an
+        active trip cannot be erased. Daily-loss protection is not merged into
+        this cooldown. SCALP_CIRCUIT_BREAKER_EPOCH remains an operator floor.
         """
+        self._last_breaker_reason = ""
+        self._last_breaker_recovery_until = ""
+        self._last_breaker_eval_after = ""
         try:
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            now = self._utcnow()
+            today = now.strftime("%Y-%m-%d")
             epoch = (self.config.circuit_breaker_epoch or "").strip()
+            recovery_sec = int(getattr(self.config, "breaker_recovery_sec", 14400) or 14400)
+            if recovery_sec < 0:
+                recovery_sec = 0
             with self._conn() as conn:
                 ledger = self._ledger(conn)
                 principal = float(ledger["principal"])
 
-                # Daily loss check
                 row = conn.execute(
                     """
                     SELECT COALESCE(SUM(pnl_usd), 0) AS today_pnl
@@ -584,6 +688,7 @@ class BinanceScalpPaperEngine:
                 today_pnl = float(row[0]) if row else 0.0
                 daily_limit = self.config.daily_loss_limit_pct * principal
                 if today_pnl <= -daily_limit:
+                    self._last_breaker_reason = "DAILY_LOSS_LIMIT"
                     logger.warning(
                         "[SCALP_CIRCUIT_BREAKER] Daily loss limit hit: today_pnl=%.4f limit=-%.4f principal=%.2f halt=True",
                         today_pnl,
@@ -592,24 +697,108 @@ class BinanceScalpPaperEngine:
                     )
                     return True
 
-                # Consecutive loss check
-                max_consec = self.config.max_consecutive_losses
+                state = self._load_consec_breaker_state(conn)
+                eval_after = str(state.get("eval_after") or "").strip()
+                recovery_until_raw = str(state.get("recovery_until") or "").strip()
+                recovery_until_dt = self._parse_utc_ts(recovery_until_raw)
+                trip_dt = self._parse_utc_ts(str(state.get("tripped_at") or ""))
+                epoch_dt = self._parse_utc_ts(epoch)
+                if (
+                    recovery_until_dt is not None
+                    and now < recovery_until_dt
+                    and epoch_dt is not None
+                    and trip_dt is not None
+                    and epoch_dt > trip_dt
+                ):
+                    self._save_consec_breaker_state(
+                        conn,
+                        tripped_at="",
+                        recovery_until="",
+                        eval_after=eval_after,
+                        reason="",
+                    )
+                    recovery_until_dt = None
+                    recovery_until_raw = ""
+                    logger.info(
+                        "[SCALP_CIRCUIT_BREAKER] operator epoch=%s cleared trip_at=%s",
+                        epoch,
+                        state.get("tripped_at"),
+                    )
+
+                if recovery_until_dt is not None and now < recovery_until_dt:
+                    self._last_breaker_reason = "CONSECUTIVE_LOSSES_COOLDOWN"
+                    self._last_breaker_recovery_until = recovery_until_raw
+                    self._last_breaker_eval_after = eval_after
+                    logger.warning(
+                        "[SCALP_CIRCUIT_BREAKER] consec cooldown until=%s halt=True",
+                        recovery_until_raw,
+                    )
+                    return True
+
+                if recovery_until_dt is not None and now >= recovery_until_dt:
+                    eval_after = recovery_until_raw
+                    self._save_consec_breaker_state(
+                        conn,
+                        tripped_at="",
+                        recovery_until="",
+                        eval_after=eval_after,
+                        reason="",
+                    )
+                    logger.info(
+                        "[SCALP_CIRCUIT_BREAKER] consec cooldown expired eval_after=%s",
+                        eval_after,
+                    )
+
+                floor = self._consec_eval_floor(epoch, eval_after)
+                max_consec = int(self.config.max_consecutive_losses)
                 recent_rows = conn.execute(
                     """
-                    SELECT pnl_usd FROM scalp_paper_trades
+                    SELECT pnl_usd, created_at FROM scalp_paper_trades
                     WHERE upper(side) = 'SELL' AND pnl_usd IS NOT NULL
                       AND (? = '' OR created_at >= ?)
                     ORDER BY id DESC LIMIT ?
                     """,
-                    (epoch, epoch, max_consec),
+                    (floor, floor, max_consec),
                 ).fetchall()
                 if len(recent_rows) >= max_consec and all(float(r[0]) <= 0.0 for r in recent_rows):
-                    logger.warning(
-                        "[SCALP_CIRCUIT_BREAKER] %d consecutive losses since epoch=%s, halt=True",
-                        max_consec,
-                        epoch or "(none)",
+                    newest_loss_at = str(recent_rows[0][1] or "")
+                    trip_dt = self._parse_utc_ts(newest_loss_at) or now
+                    rec_until_dt = trip_dt + timedelta(seconds=recovery_sec)
+                    rec_until_iso = rec_until_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    if now < rec_until_dt:
+                        self._save_consec_breaker_state(
+                            conn,
+                            tripped_at=newest_loss_at,
+                            recovery_until=rec_until_iso,
+                            eval_after=eval_after,
+                            reason="CONSECUTIVE_LOSSES",
+                        )
+                        self._last_breaker_reason = "CONSECUTIVE_LOSSES_COOLDOWN"
+                        self._last_breaker_recovery_until = rec_until_iso
+                        self._last_breaker_eval_after = eval_after
+                        logger.warning(
+                            "[SCALP_CIRCUIT_BREAKER] %d consecutive losses trip_at=%s until=%s halt=True",
+                            max_consec,
+                            newest_loss_at,
+                            rec_until_iso,
+                        )
+                        return True
+                    self._save_consec_breaker_state(
+                        conn,
+                        tripped_at="",
+                        recovery_until="",
+                        eval_after=rec_until_iso,
+                        reason="",
                     )
-                    return True
+                    self._last_breaker_eval_after = rec_until_iso
+                    logger.info(
+                        "[SCALP_CIRCUIT_BREAKER] stale consec streak recovered eval_after=%s",
+                        rec_until_iso,
+                    )
+                    return False
+
+                self._last_breaker_eval_after = eval_after
+                return False
         except Exception as e:
             logger.warning("[SCALP_CIRCUIT_BREAKER] Check failed (non-blocking): %s", e)
         return False

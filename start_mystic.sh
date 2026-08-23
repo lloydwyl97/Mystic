@@ -36,6 +36,55 @@ export PAPER_TRADING_INITIAL_BALANCE="${PAPER_TRADING_INITIAL_BALANCE:-10000.0}"
 export RUN_ID="${RUN_ID:-run_$(date -u +%Y%m%dT%H%M%SZ)}"
 LOG_DIR="${PWD}/logs"
 mkdir -p "$LOG_DIR"
+LIFECYCLE_LOCK="${LOG_DIR}/mystic_lifecycle.lock"
+
+acquire_lifecycle_lock() {
+    exec 9>"$LIFECYCLE_LOCK"
+    if ! flock -w 120 9; then
+        echo "ERROR: another start/stop is holding $LIFECYCLE_LOCK"
+        exit 1
+    fi
+}
+
+process_count() {
+    local pattern="$1"
+    local n
+    n="$(pgrep -f "$pattern" 2>/dev/null | wc -l)"
+    echo "${n// /}"
+}
+
+refuse_duplicate_or_collapse() {
+    local pattern="$1"
+    local label="$2"
+    local n
+    n="$(process_count "$pattern")"
+    n="${n:-0}"
+    if [ "$n" -eq 1 ]; then
+        echo "OK: $label already running — refusing duplicate start"
+        return 0
+    fi
+    if [ "$n" -gt 1 ]; then
+        echo "WARN: $label has $n copies — collapsing before launch"
+        stop_by_pattern "$pattern"
+    fi
+    return 1
+}
+
+assert_single_after_start() {
+    local pattern="$1"
+    local label="$2"
+    local n
+    n="$(process_count "$pattern")"
+    n="${n:-0}"
+    if [ "$n" -gt 1 ]; then
+        echo "WARN: $label count=$n after start — collapsing to one"
+        stop_by_pattern "$pattern"
+        return 1
+    fi
+    return 0
+}
+
+acquire_lifecycle_lock
 
 LEGACY_PATTERNS=(
     "live_data_collector.py"
@@ -178,19 +227,36 @@ start_backend() {
 }
 
 start_live_md() {
+    if refuse_duplicate_or_collapse "start_live_market_data.py" "Live Market Data"; then
+        return 0
+    fi
     echo "Starting Live Market Data loops..."
     nohup "$PYTHON" start_live_market_data.py > /home/mystic/mystic/logs/mystic_live_md.log 2>&1 &
     require_running "start_live_market_data.py" "Live Market Data" "/home/mystic/mystic/logs/mystic_live_md.log" 20 1 || return 1
+    if ! assert_single_after_start "start_live_market_data.py" "Live Market Data"; then
+        nohup "$PYTHON" start_live_market_data.py >> /home/mystic/mystic/logs/mystic_live_md.log 2>&1 &
+        require_running "start_live_market_data.py" "Live Market Data" "/home/mystic/mystic/logs/mystic_live_md.log" 20 1 || return 1
+    fi
 }
 
 start_signal() {
+    if refuse_duplicate_or_collapse "start_ai_signal_generator.py" "AI Signal Generator"; then
+        return 0
+    fi
     echo "Starting AI Signal Generator..."
     nohup "$PYTHON" start_ai_signal_generator.py > /home/mystic/mystic/logs/mystic_signal.log 2>&1 &
     require_running "start_ai_signal_generator.py" "AI Signal Generator" "/home/mystic/mystic/logs/mystic_signal.log" 20 1 || return 1
+    if ! assert_single_after_start "start_ai_signal_generator.py" "AI Signal Generator"; then
+        nohup "$PYTHON" start_ai_signal_generator.py >> /home/mystic/mystic/logs/mystic_signal.log 2>&1 &
+        require_running "start_ai_signal_generator.py" "AI Signal Generator" "/home/mystic/mystic/logs/mystic_signal.log" 20 1 || return 1
+    fi
 }
 
 start_portfolio() {
     local log_mode="${1:-append}"
+    if refuse_duplicate_or_collapse "start_portfolio_engine_integration.py" "Portfolio Engine Integration"; then
+        return 0
+    fi
     echo "Starting Portfolio Engine Integration..."
     if [ "$log_mode" = "truncate" ]; then
         nohup "$PYTHON" start_portfolio_engine_integration.py > /home/mystic/mystic/logs/mystic_portfolio.log 2>&1 &
@@ -198,9 +264,13 @@ start_portfolio() {
         nohup "$PYTHON" start_portfolio_engine_integration.py >> /home/mystic/mystic/logs/mystic_portfolio.log 2>&1 &
     fi
     require_running "start_portfolio_engine_integration.py" "Portfolio Engine Integration" "/home/mystic/mystic/logs/mystic_portfolio.log" 20 1 || return 1
+    if ! assert_single_after_start "start_portfolio_engine_integration.py" "Portfolio Engine Integration"; then
+        nohup "$PYTHON" start_portfolio_engine_integration.py >> /home/mystic/mystic/logs/mystic_portfolio.log 2>&1 &
+        require_running "start_portfolio_engine_integration.py" "Portfolio Engine Integration" "/home/mystic/mystic/logs/mystic_portfolio.log" 20 1 || return 1
+    fi
 }
 
-start_learning() {
+_launch_learning() {
     echo "Starting AI Learning..."
     nice -n 10 nohup env \
         DAY_HISTORICAL_TRAIN_BASES="BTC,ETH,SOL,XRP" \
@@ -208,16 +278,34 @@ start_learning() {
         DAY_HISTORICAL_ANCHOR_STRIDE="2" \
         DAY_HISTORICAL_ROWS_PER_COLLECT="160" \
         "$PYTHON" start_ai_learning.py > /home/mystic/mystic/logs/mystic_learning.log 2>&1 &
+}
+
+start_learning() {
+    if refuse_duplicate_or_collapse "start_ai_learning.py" "AI Learning"; then
+        return 0
+    fi
+    _launch_learning
     require_running "start_ai_learning.py" "AI Learning" "/home/mystic/mystic/logs/mystic_learning.log" 20 1 || return 1
+    if ! assert_single_after_start "start_ai_learning.py" "AI Learning"; then
+        _launch_learning
+        require_running "start_ai_learning.py" "AI Learning" "/home/mystic/mystic/logs/mystic_learning.log" 20 1 || return 1
+    fi
 }
 
 start_ai_context() {
+    if refuse_duplicate_or_collapse "start_ai_market_context.py" "AI Market Context"; then
+        return 0
+    fi
     echo "Starting AI Market Context..."
     nohup "$PYTHON" start_ai_market_context.py > /home/mystic/mystic/logs/mystic_ai_context.log 2>&1 &
     require_running "start_ai_market_context.py" "AI Market Context" "/home/mystic/mystic/logs/mystic_ai_context.log" 20 1 || return 1
+    if ! assert_single_after_start "start_ai_market_context.py" "AI Market Context"; then
+        nohup "$PYTHON" start_ai_market_context.py >> /home/mystic/mystic/logs/mystic_ai_context.log 2>&1 &
+        require_running "start_ai_market_context.py" "AI Market Context" "/home/mystic/mystic/logs/mystic_ai_context.log" 20 1 || return 1
+    fi
 }
 
-start_scalp() {
+_launch_scalp() {
     local scalp_paper="${SCALP_PAPER_ENABLED:-true}"
     local scalp_auto_arm="${SCALP_PAPER_AUTO_ARM:-true}"
     local scalp_fee="${SCALP_FEE_MODEL_VERIFIED:-true}"
@@ -225,7 +313,18 @@ start_scalp() {
     nohup env SCALP_PAPER_ENABLED="${scalp_paper}" SCALP_PAPER_AUTO_ARM="${scalp_auto_arm}" \
         SCALP_FEE_MODEL_VERIFIED="${scalp_fee}" \
         "$PYTHON" -m backend.services.binance_scalp.runner > /home/mystic/mystic/logs/mystic_scalp.log 2>&1 &
+}
+
+start_scalp() {
+    if refuse_duplicate_or_collapse "backend.services.binance_scalp.runner" "Scalp Paper Runner"; then
+        return 0
+    fi
+    _launch_scalp
     require_running "backend.services.binance_scalp.runner" "Scalp Paper Runner" "/home/mystic/mystic/logs/mystic_scalp.log" 20 1 || return 1
+    if ! assert_single_after_start "backend.services.binance_scalp.runner" "Scalp Paper Runner"; then
+        _launch_scalp
+        require_running "backend.services.binance_scalp.runner" "Scalp Paper Runner" "/home/mystic/mystic/logs/mystic_scalp.log" 20 1 || return 1
+    fi
 }
 
 stop_live_md() { stop_by_pattern "start_live_market_data.py"; }

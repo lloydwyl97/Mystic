@@ -13,6 +13,12 @@ logger = logging.getLogger("binance_scalp_runner")
 def main() -> int:
     from backend.services.binance_scalp.config import get_scalp_config
     from backend.services.binance_scalp.paper_engine import BinanceScalpPaperEngine
+    from backend.utils.process_singleton import SCALP_RUNNER_PIDFILE, ProcessAlreadyRunning, acquire_process_singleton
+
+    try:
+        acquire_process_singleton(SCALP_RUNNER_PIDFILE, label="SCALP runner")
+    except ProcessAlreadyRunning:
+        return 1
 
     cfg = get_scalp_config()
     cfg.assert_no_live_trading()

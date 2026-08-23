@@ -212,7 +212,25 @@ def apply_scalp_migrations(conn: sqlite3.Connection) -> list[str]:
         applied.append("migrate_exit_manager_v3")
     elif version < 3:
         applied.append("ensure_exit_manager_v3")
+    if ensure_breaker_recovery_columns(conn):
+        applied.append("ensure_breaker_recovery_columns")
     return applied
+
+
+def ensure_breaker_recovery_columns(conn: sqlite3.Connection) -> bool:
+    """Persist consecutive-loss trip/cooldown so a restart cannot erase protection."""
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(scalp_meta)")}
+    added = False
+    for name, ddl in (
+        ("consec_breaker_tripped_at", "TEXT"),
+        ("consec_breaker_recovery_until", "TEXT"),
+        ("consec_breaker_eval_after", "TEXT"),
+        ("consec_breaker_reason", "TEXT"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE scalp_meta ADD COLUMN {name} {ddl}")
+            added = True
+    return added
 
 
 def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list[str]:
@@ -224,7 +242,11 @@ def init_scalp_schema(db_path: str | Path, *, principal: float = 1000.0) -> list
             CREATE TABLE IF NOT EXISTS scalp_meta (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 schema_version INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                consec_breaker_tripped_at TEXT,
+                consec_breaker_recovery_until TEXT,
+                consec_breaker_eval_after TEXT,
+                consec_breaker_reason TEXT
             );
 
             CREATE TABLE IF NOT EXISTS scalp_paper_ledger (

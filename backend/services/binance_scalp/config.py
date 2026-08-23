@@ -42,9 +42,11 @@ class ScalpConfig:
     daily_loss_limit_pct: float
     max_consecutive_losses: int
     # Trades before this timestamp are excluded from circuit-breaker arithmetic.
-    # The breaker recomputes from history every cycle and has no stored state, so
-    # a cutoff is the only way to clear it without rewriting closed-trade rows.
+    # Operator floor only — normal 24/7 recovery uses breaker_recovery_sec.
     circuit_breaker_epoch: str
+    # After N consecutive losses the breaker stays open this many seconds, then
+    # starts a fresh consec window. Historical SELL rows are not deleted.
+    breaker_recovery_sec: int
     scalp_engine_version: str
     scalp_live_armed: bool
     scalp_live_max_notional: float
@@ -112,6 +114,7 @@ class ScalpConfig:
             daily_loss_limit_pct=float(os.getenv("SCALP_DAILY_LOSS_LIMIT_PCT", "0.05")),
             max_consecutive_losses=int(os.getenv("SCALP_MAX_CONSECUTIVE_LOSSES", "5")),
             circuit_breaker_epoch=str(os.getenv("SCALP_CIRCUIT_BREAKER_EPOCH", "") or "").strip(),
+            breaker_recovery_sec=int(os.getenv("SCALP_BREAKER_RECOVERY_SEC", "14400") or "14400"),
             scalp_engine_version=str(os.getenv("SCALP_ENGINE_VERSION", "scalp_v1") or "scalp_v1").strip(),
             scalp_live_armed=_bool("SCALP_LIVE_ARMED", False),
             scalp_live_max_notional=float(os.getenv("SCALP_LIVE_MAX_NOTIONAL", "50.0")),

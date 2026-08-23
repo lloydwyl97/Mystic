@@ -139,6 +139,13 @@ async def _multi_target_ml_retrain_loop() -> None:
 
 
 async def main() -> None:
+    from backend.utils.process_singleton import AI_LEARNING_PIDFILE, ProcessAlreadyRunning, acquire_process_singleton
+
+    try:
+        acquire_process_singleton(AI_LEARNING_PIDFILE, label="AI learning")
+    except ProcessAlreadyRunning:
+        logger.error("AI learning already running — refusing duplicate start")
+        return
     pipeline = None
     try:
         from backend.ai_training_pipeline import get_ai_training_pipeline

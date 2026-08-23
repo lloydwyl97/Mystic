@@ -213,8 +213,18 @@ def test_scalp_costs_follow_fill_mode_not_hardcoded_taker():
     assert fees_maker < fees_taker
 
 
-def _breaker_probe(db_path: Path, *, epoch: str, max_consec: int = 10, daily_limit_pct: float = 0.05):
+def _breaker_probe(
+    db_path: Path,
+    *,
+    epoch: str,
+    max_consec: int = 10,
+    daily_limit_pct: float = 0.05,
+    recovery_sec: int = 14400,
+    now=None,
+):
     """Run the real breaker against a real DB without booting the whole engine."""
+    from datetime import datetime, timezone
+
     from backend.services.binance_scalp.paper_engine import BinanceScalpPaperEngine
 
     engine = object.__new__(BinanceScalpPaperEngine)
@@ -222,11 +232,17 @@ def _breaker_probe(db_path: Path, *, epoch: str, max_consec: int = 10, daily_lim
         circuit_breaker_epoch=epoch,
         max_consecutive_losses=max_consec,
         daily_loss_limit_pct=daily_limit_pct,
+        breaker_recovery_sec=recovery_sec,
         database_path=str(db_path),
     )
     engine._conn = lambda: sqlite3.connect(str(db_path), timeout=10.0)
     engine._ledger = lambda conn: {"principal": 1000.0}
-    return BinanceScalpPaperEngine._check_scalp_circuit_breaker(engine)
+    engine._utcnow_override = now or datetime.now(timezone.utc)
+    engine._last_breaker_reason = ""
+    engine._last_breaker_recovery_until = ""
+    engine._last_breaker_eval_after = ""
+    open_ = BinanceScalpPaperEngine._check_scalp_circuit_breaker(engine)
+    return open_, engine
 
 
 def _seed_sells(db_path: Path, rows: list[tuple[float, str]]) -> None:
@@ -242,24 +258,33 @@ def _seed_sells(db_path: Path, rows: list[tuple[float, str]]) -> None:
 
 
 def test_circuit_breaker_epoch_clears_a_stale_losing_run(tmp_path: Path):
-    """The breaker keeps no state, so a tripped run blocks forever until the window moves."""
+    """Operator epoch still excludes a tripped streak from the consec window."""
+    from datetime import datetime, timezone
+
     db = tmp_path / "scalp.db"
+    now = datetime(2026, 8, 17, 8, 15, tzinfo=timezone.utc)
     _seed_sells(db, [(-0.05, f"2026-08-17 08:{i:02d}:00") for i in range(10)])
 
-    assert _breaker_probe(db, epoch="") is True
-    assert _breaker_probe(db, epoch="2026-08-21 00:00:00") is False
+    open_, _ = _breaker_probe(db, epoch="", recovery_sec=3600, now=now)
+    assert open_ is True
+    open_, _ = _breaker_probe(db, epoch="2026-08-21 00:00:00", recovery_sec=3600, now=now)
+    assert open_ is False
 
 
 def test_circuit_breaker_rearms_on_new_losses_after_epoch(tmp_path: Path):
     """Moving the window must not disarm the breaker against fresh losses."""
+    from datetime import datetime, timezone
+
     db = tmp_path / "scalp.db"
+    now = datetime(2026, 8, 22, 1, 15, tzinfo=timezone.utc)
     _seed_sells(
         db,
         [(-0.05, f"2026-08-17 08:{i:02d}:00") for i in range(10)]
         + [(-0.05, f"2026-08-22 01:{i:02d}:00") for i in range(10)],
     )
 
-    assert _breaker_probe(db, epoch="2026-08-21 00:00:00") is True
+    open_, _ = _breaker_probe(db, epoch="2026-08-21 00:00:00", recovery_sec=3600, now=now)
+    assert open_ is True
 
 
 def test_circuit_breaker_epoch_still_honours_daily_loss_limit(tmp_path: Path):
@@ -268,7 +293,9 @@ def test_circuit_breaker_epoch_still_honours_daily_loss_limit(tmp_path: Path):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     _seed_sells(db, [(-60.0, f"{today} 01:00:00")])
 
-    assert _breaker_probe(db, epoch=f"{today} 00:00:00") is True
+    open_, engine = _breaker_probe(db, epoch=f"{today} 00:00:00")
+    assert open_ is True
+    assert engine._last_breaker_reason == "DAILY_LOSS_LIMIT"
 
 
 def test_circuit_breaker_epoch_unset_preserves_legacy_behaviour(tmp_path: Path):
@@ -279,7 +306,8 @@ def test_circuit_breaker_epoch_unset_preserves_legacy_behaviour(tmp_path: Path):
         [(-0.05, f"2026-08-17 08:{i:02d}:00") for i in range(9)] + [(0.02, "2026-08-17 09:00:00")],
     )
 
-    assert _breaker_probe(db, epoch="") is False
+    open_, _ = _breaker_probe(db, epoch="")
+    assert open_ is False
 
 
 def test_empty_scalp_ledger_repairs_cash_basis_mismatch(tmp_path: Path):

@@ -3,6 +3,14 @@
 
 cd /home/mystic/mystic || exit 1
 
+LIFECYCLE_LOCK="${PWD}/logs/mystic_lifecycle.lock"
+mkdir -p "${PWD}/logs"
+exec 9>"$LIFECYCLE_LOCK"
+if ! flock -w 120 9; then
+  echo "ERROR: another start/stop is holding $LIFECYCLE_LOCK"
+  exit 1
+fi
+
 echo "Stopping Mystic services..."
 ACTIVE_PATTERNS=(
   "uvicorn backend.main:app"
