@@ -1,7 +1,0 @@
-{
-  "ts_utc": "2026-05-25T00:39:33.172525+00:00",
-  "reason": "25k_clean_reset_after_5day_outage_stale_buys",
-  "principal": 25000.0,
-  "positions_cleared": 4,
-  "learning_cleared": true
-}
