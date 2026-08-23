@@ -45,6 +45,7 @@ def test_start_mystic_has_lifecycle_lock_and_skip_guards():
     stop = (REPO / "stop_mystic.sh").read_text()
     assert "mystic_lifecycle.lock" in stop
     assert "flock" in stop
+    assert "stopping processes anyway" in stop
 
 
 def test_scalp_runner_and_context_and_learning_use_process_singleton():
