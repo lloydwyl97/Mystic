@@ -46,10 +46,37 @@ acquire_lifecycle_lock() {
     fi
 }
 
+list_app_pids() {
+    local pattern="$1"
+    local pid cmd
+    local self_pid=$$
+    local parent_pid=${PPID:-}
+    while read -r pid; do
+        [ -z "$pid" ] && continue
+        [ "$pid" = "$self_pid" ] && continue
+        [ -n "$parent_pid" ] && [ "$pid" = "$parent_pid" ] && continue
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+        [ -z "$cmd" ] && continue
+        case "$cmd" in
+            *start_mystic.sh*|*stop_mystic.sh*) continue ;;
+        esac
+        case "$cmd" in
+            *bash*|*ssh*|*sudo\ -u*) continue ;;
+        esac
+        case "$cmd" in
+            *python*|*uvicorn*) ;;
+            *) continue ;;
+        esac
+        case "$cmd" in
+            *"$pattern"*) echo "$pid" ;;
+        esac
+    done < <(pgrep -f "$pattern" 2>/dev/null)
+}
+
 process_count() {
     local pattern="$1"
     local n
-    n="$(pgrep -f "$pattern" 2>/dev/null | wc -l)"
+    n="$(list_app_pids "$pattern" | wc -l)"
     echo "${n// /}"
 }
 
@@ -97,7 +124,7 @@ LEGACY_PATTERNS=(
 stop_by_pattern() {
     local pattern="$1"
     local pids
-    pids="$(pgrep -f "$pattern" 2>/dev/null || true)"
+    pids="$(list_app_pids "$pattern")"
     if [ -z "$pids" ]; then
         return 0
     fi
@@ -106,7 +133,7 @@ stop_by_pattern() {
         kill -TERM "$pid" 2>/dev/null || true
     done
     sleep 2
-    pids="$(pgrep -f "$pattern" 2>/dev/null || true)"
+    pids="$(list_app_pids "$pattern")"
     if [ -n "$pids" ]; then
         for pid in $pids; do
             kill -KILL "$pid" 2>/dev/null || true
@@ -130,7 +157,7 @@ require_running() {
     local sleep_sec="${5:-1}"
     local i
     for ((i=1; i<=tries; i++)); do
-        if pgrep -f "$pattern" >/dev/null 2>&1; then
+        if [ "$(process_count "$pattern")" -ge 1 ]; then
             echo "OK: $label running"
             return 0
         fi
@@ -372,7 +399,7 @@ ensure_running_or_start() {
     local pattern="$1"
     local start_fn="$2"
     local label="$3"
-    if pgrep -f "$pattern" >/dev/null 2>&1; then
+    if [ "$(process_count "$pattern")" -ge 1 ]; then
         echo "OK: $label already running"
         return 0
     fi
