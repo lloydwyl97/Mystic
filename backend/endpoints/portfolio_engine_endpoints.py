@@ -391,6 +391,10 @@ async def get_portfolio_performance() -> dict[str, Any]:
         await engine._recompute_positions_values()
         ledger = await engine.get_ledger()
         realized_pnl = float(ledger.get("realized_pnl", 0) or 0)
+        realized_pnl_live = float(ledger.get("realized_pnl_live", 0) or 0)
+        realized_pnl_paper_historical = float(ledger.get("realized_pnl_paper_historical", 0) or 0)
+        realized_pnl_ledger_stored = float(ledger.get("realized_pnl_ledger_stored", ledger.get("realized_pnl", 0)) or 0)
+        account_execution_mode = str(ledger.get("account_execution_mode") or "")
         unrealized_pnl = float(ledger.get("unrealized_pnl", 0) or 0)
         total_equity = float(ledger.get("total_equity", 0) or 0)
         principal = float(ledger.get("principal", 0) or 0)
@@ -454,7 +458,11 @@ async def get_portfolio_performance() -> dict[str, Any]:
         return {
             "success": True,
             "performance": {
+                "account_execution_mode": account_execution_mode,
                 "realized_pnl": realized_pnl,
+                "realized_pnl_live": realized_pnl_live,
+                "realized_pnl_paper_historical": realized_pnl_paper_historical,
+                "realized_pnl_ledger_stored": realized_pnl_ledger_stored,
                 "unrealized_pnl": unrealized_pnl,
                 "total_pnl": total_pnl,
                 "component_pnl_sum": realized_pnl + unrealized_pnl,

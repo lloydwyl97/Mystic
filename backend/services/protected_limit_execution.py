@@ -473,6 +473,38 @@ async def run_protected_preflight(
     return res
 
 
+async def _enrich_live_order_fills(live_service: Any, order: dict[str, Any], exchange_symbol: str) -> dict[str, Any]:
+    """Re-fetch so commission/fills survive IOC expire. Never invent quantity."""
+    order_id = str(order.get("id") or "")
+    if not order_id:
+        return order
+    try:
+        st = await live_service.fetch_order("binanceus", order_id, exchange_symbol)
+    except Exception:
+        return order
+    if st.get("status") != "success":
+        return order
+    fetched = st.get("order") or {}
+    merged = dict(order)
+    for key in (
+        "filled",
+        "average",
+        "cost",
+        "status",
+        "fee",
+        "fees",
+        "trades",
+        "commission",
+        "commissionAsset",
+        "info",
+        "amount",
+        "price",
+    ):
+        if fetched.get(key) is not None:
+            merged[key] = fetched[key]
+    return merged
+
+
 async def execute_protected_limit_live(
     live_service: Any,
     *,
@@ -528,6 +560,8 @@ async def execute_protected_limit_live(
 
         order = result.get("order") or {}
         order_id = str(order.get("id") or "")
+        if order_id:
+            order = await _enrich_live_order_fills(live_service, order, exchange_symbol)
         filled = float(order.get("filled") or 0.0)
         amount = float(order.get("amount") or quantity)
 
@@ -541,15 +575,21 @@ async def execute_protected_limit_live(
                 filled,
                 amount,
             )
+            if filled > 0:
+                order["_mystic_partial_fill"] = True
+                order["_mystic_ioc_incomplete"] = True
+                return order
             return None
 
         deadline = time.time() + timeout
+        last = order
         while time.time() < deadline:
             await asyncio.sleep(poll_interval)
             st = await live_service.fetch_order("binanceus", order_id, exchange_symbol)
             if st.get("status") != "success":
                 continue
             o = st.get("order") or {}
+            last = o
             filled = float(o.get("filled") or 0.0)
             amount = float(o.get("amount") or quantity)
             status = str(o.get("status") or "").lower()
@@ -565,12 +605,19 @@ async def execute_protected_limit_live(
         if order_id:
             with contextlib.suppress(Exception):
                 await live_service.cancel_order("binanceus", order_id, exchange_symbol)
+            last = await _enrich_live_order_fills(live_service, last, exchange_symbol)
+            filled = float(last.get("filled") or filled or 0.0)
         logger.warning(
-            "PROTECTED_LIMIT_TIMEOUT_CANCEL %s %s order_id=%s — no market fallback",
+            "PROTECTED_LIMIT_TIMEOUT_CANCEL %s %s order_id=%s filled=%.8f — no market fallback",
             side_l,
             exchange_symbol,
             order_id,
+            filled,
         )
+        if filled > 0:
+            last["_mystic_partial_fill"] = True
+            last["_mystic_ioc_incomplete"] = True
+            return last
         return None
 
     return None

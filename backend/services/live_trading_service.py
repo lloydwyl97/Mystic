@@ -72,6 +72,41 @@ def _to_binance_pair(sym: str) -> str:
     return s + "USDT"
 
 
+def _order_fill_payload(order: dict[str, Any] | None) -> dict[str, Any]:
+    """Preserve fill economics from CCXT/Binance (commission + asset)."""
+    raw = order if isinstance(order, dict) else {}
+    payload = {
+        "id": raw.get("id"),
+        "symbol": raw.get("symbol"),
+        "type": raw.get("type"),
+        "side": raw.get("side"),
+        "amount": raw.get("amount"),
+        "price": raw.get("price"),
+        "filled": raw.get("filled"),
+        "average": raw.get("average"),
+        "cost": raw.get("cost"),
+        "clientOrderId": raw.get("clientOrderId"),
+        "status": raw.get("status"),
+        "timestamp": raw.get("timestamp"),
+        "fee": raw.get("fee"),
+        "fees": raw.get("fees"),
+        "trades": raw.get("trades"),
+        "commission": raw.get("commission"),
+        "commissionAsset": raw.get("commissionAsset"),
+    }
+    info = raw.get("info")
+    if isinstance(info, dict):
+        payload["info"] = {
+            "status": info.get("status"),
+            "executedQty": info.get("executedQty"),
+            "cummulativeQuoteQty": info.get("cummulativeQuoteQty"),
+            "commission": info.get("commission"),
+            "commissionAsset": info.get("commissionAsset"),
+            "fills": info.get("fills"),
+        }
+    return payload
+
+
 class LiveTradingService:
     """Service for live trading operations with real APIs (Binance.US only)."""
 
@@ -577,20 +612,7 @@ class LiveTradingService:
                 )
                 return {
                     "status": "success",
-                    "order": {
-                        "id": order.get("id"),
-                        "symbol": order.get("symbol"),
-                        "type": order.get("type"),
-                        "side": order.get("side"),
-                        "amount": order.get("amount"),
-                        "price": order.get("price"),
-                        "filled": order.get("filled"),
-                        "average": order.get("average"),
-                        "cost": order.get("cost"),
-                        "clientOrderId": order.get("clientOrderId"),
-                        "status": order.get("status"),
-                        "timestamp": order.get("timestamp"),
-                    },
+                    "order": _order_fill_payload(order),
                     "exchange": EXCHANGE_ID,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
@@ -634,15 +656,7 @@ class LiveTradingService:
                 order = await asyncio.to_thread(self.binance.fetch_order, id=order_id, symbol=pair)
                 return {
                     "status": "success",
-                    "order": {
-                        "id": order.get("id"),
-                        "symbol": order.get("symbol"),
-                        "status": order.get("status"),
-                        "filled": order.get("filled"),
-                        "average": order.get("average"),
-                        "amount": order.get("amount"),
-                        "cost": order.get("cost"),
-                    },
+                    "order": _order_fill_payload(order),
                 }
             return {"status": "error", "message": "Exchange not available"}
         except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError) as e:

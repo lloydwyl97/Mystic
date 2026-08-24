@@ -63,32 +63,18 @@ def ensure_fill_fee_audit_table(db_path: str | None = None) -> None:
         conn.close()
 
 
-def _extract_exchange_fee_usd(live_order: dict[str, Any] | None) -> float | None:
+def _extract_exchange_fee_usd(live_order: dict[str, Any] | None, *, symbol: str = "", fill_price: float = 0.0) -> float | None:
     if not live_order or not isinstance(live_order, dict):
         return None
-    for key in ("fee", "fees"):
-        raw = live_order.get(key)
-        if raw is None:
-            continue
-        if isinstance(raw, (int, float)):
-            return float(raw)
-        if isinstance(raw, dict):
-            try:
-                cost = float(raw.get("cost") or 0.0)
-                if cost > 0:
-                    return cost
-            except (TypeError, ValueError):
-                pass
-        if isinstance(raw, list):
-            total = 0.0
-            for item in raw:
-                if isinstance(item, dict):
-                    try:
-                        total += float(item.get("cost") or 0.0)
-                    except (TypeError, ValueError):
-                        pass
-            if total > 0:
-                return total
+    from backend.services.live_fill_economics import extract_live_commission
+
+    comm = extract_live_commission(
+        live_order,
+        symbol=symbol or str(live_order.get("symbol") or ""),
+        fill_price=float(fill_price or live_order.get("average") or live_order.get("price") or 0.0),
+    )
+    if comm.fee_from_exchange:
+        return float(comm.usd)
     return None
 
 
@@ -111,7 +97,7 @@ def build_sell_fill_fee_audit(
     hs = float(half_spread_pct if half_spread_pct is not None else ORDERBOOK_HALF_SPREAD_ESTIMATE)
     notional = max(0.0, float(quantity) * float(fill_price))
     expected_fee = notional * float(sell_fee_rate)
-    exchange_fee = _extract_exchange_fee_usd(live_order)
+    exchange_fee = _extract_exchange_fee_usd(live_order, symbol=symbol, fill_price=fill_price)
     fee_from_exchange = exchange_fee is not None
     actual_fee = float(exchange_fee) if fee_from_exchange else expected_fee
     actual_fee_rate = (actual_fee / notional) if notional > 0 else float(sell_fee_rate)

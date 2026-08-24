@@ -2786,21 +2786,18 @@ class PortfolioEngine:
                 if price <= 0:
                     continue
                 notional = free_qty * price
-                if notional < min_notional:
-                    logger.debug(
-                        "LIVE_RECONCILE_IMPORT_SKIP: %s notional=%.2f < min=%.2f",
-                        symbol,
-                        notional,
-                        min_notional,
-                    )
-                    continue
                 qty_step = float(constraints.get("qty_step") or DEFAULT_QTY_STEP)
                 snapped = self._floor_to_step(free_qty, qty_step) if qty_step > 0 else free_qty
-                if snapped <= 0:
+                track_qty = snapped if snapped > 0 else free_qty
+                if track_qty <= qty_epsilon:
                     continue
+                is_dust, _, dust_reason, _ = self._dust_check(symbol, track_qty, price)
+                if not is_dust and notional < min_notional:
+                    is_dust = True
+                    dust_reason = dust_reason or "below min_notional"
                 position = OpenPosition(
                     symbol=symbol,
-                    quantity=snapped,
+                    quantity=track_qty,
                     entry_price=price,
                     entry_time=time.time(),
                     trade_id=f"reconcile_import_{symbol.replace('/', '_')}_{int(time.time())}",
@@ -2814,15 +2811,21 @@ class PortfolioEngine:
                     entry_bar_timestamp=int(time.time()),
                     confidence_at_entry=0.5,
                 )
+                if is_dust:
+                    position.status = "DUST_PENDING"
+                    position.dust_qty_canonical = track_qty
+                    position.dust_detected_at = time.time()
                 self.open_positions[symbol] = position
                 await self._persist_position_to_sqlite(position)
                 imported_any = True
                 logger.info(
-                    "LIVE_RECONCILE_ASSET_IMPORTED symbol=%s qty=%s entry_price=%s notional=%.2f",
+                    "LIVE_RECONCILE_ASSET_IMPORTED symbol=%s qty=%s entry_price=%s notional=%.2f dust=%s reason=%s",
                     symbol,
-                    snapped,
+                    track_qty,
                     price,
-                    snapped * price,
+                    track_qty * price,
+                    is_dust,
+                    dust_reason or "",
                 )
             except Exception as e:
                 logger.warning("LIVE_RECONCILE_IMPORT_ERROR: %s %s", symbol, e)
@@ -8762,14 +8765,47 @@ class PortfolioEngine:
                 live_order_buy = await self._verify_order_fill(live_order_buy, exchange_symbol, "buy")
                 filled_qty = live_order_buy.get("filled")
                 avg_price = live_order_buy.get("average")
-                if filled_qty and float(filled_qty) > 0:
-                    quantity = float(filled_qty)
+                if not filled_qty or float(filled_qty) <= 0:
+                    error_msg = "PROTECTED_LIMIT_BUY_NOT_FILLED"
+                    logger.error("LIVE_BUY_FAILED: %s - %s", exchange_symbol, error_msg)
+                    await self._record_reject(
+                        symbol,
+                        "BUY",
+                        error_msg,
+                        "LIVE_BUY_FAILED",
+                        decision_id=decision_id,
+                        explainability=explainability,
+                    )
+                    if _entry_reserved:
+                        self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
+                        _entry_reserved = False
+                    return None
+                quantity = float(filled_qty)
                 if avg_price and float(avg_price) > 0:
                     fill_price = float(avg_price)
-                fee = quantity * fill_price * exec_fee_rate
-                slippage_cost = (fill_price - price) * quantity  # Total cost, not price delta
-                total_cost = quantity * fill_price + fee
-                logger.warning(f"LIVE_BUY_SUCCESS: {exchange_symbol} | Order ID: {live_order_buy.get('id')} | Status: {live_order_buy.get('status')} | Filled: {quantity:.6f} @ {fill_price:.4f}")
+                from backend.services.live_fill_economics import apply_live_buy_economics, extract_live_commission
+
+                comm = extract_live_commission(live_order_buy, symbol=symbol, fill_price=fill_price)
+                modeled_fee = quantity * fill_price * exec_fee_rate
+                quantity, fee, total_cost = apply_live_buy_economics(
+                    filled_qty=quantity,
+                    fill_price=fill_price,
+                    modeled_fee=modeled_fee,
+                    commission=comm,
+                )
+                slippage_cost = (fill_price - price) * quantity
+                protected_audit["live_commission"] = comm.to_dict()
+                if live_order_buy.get("_mystic_partial_fill") or live_order_buy.get("_mystic_ioc_incomplete"):
+                    logger.warning(
+                        "LIVE_PARTIAL_FILL_ADOPTED %s filled=%.8f fee_usd=%.8f fee_from_exchange=%s — requested entry unsuccessful, inventory tracked",
+                        exchange_symbol,
+                        quantity,
+                        fee,
+                        comm.fee_from_exchange,
+                    )
+                logger.warning(
+                    f"LIVE_BUY_SUCCESS: {exchange_symbol} | Order ID: {live_order_buy.get('id')} | Status: {live_order_buy.get('status')} | Filled: {quantity:.6f} @ {fill_price:.4f} fee_usd={fee:.8f} fee_from_exchange={comm.fee_from_exchange}"
+                )
             except Exception as e:
                 logger.exception(f"LIVE_BUY_ERROR: {symbol} - {e}")
                 await self._record_reject(
@@ -8873,6 +8909,18 @@ class PortfolioEngine:
             legacy_pre_regime_router=False,
             opened_under_router=True,
         )
+        if live_order_buy and (live_order_buy.get("_mystic_partial_fill") or live_order_buy.get("_mystic_ioc_incomplete")):
+            is_dust, _, dust_reason, _ = self._dust_check(normalized_symbol, quantity, fill_price)
+            if is_dust:
+                position.status = "DUST_PENDING"
+                position.dust_qty_canonical = quantity
+                position.dust_detected_at = time.time()
+                logger.warning(
+                    "LIVE_PARTIAL_FILL_DUST %s qty=%.12g reason=%s — tracked in inventory/equity",
+                    normalized_symbol,
+                    quantity,
+                    dust_reason or "below min",
+                )
         from backend.services.day_controlled_exits import stamp_open_position_exit_metadata
 
         stamp_open_position_exit_metadata(
@@ -10709,6 +10757,26 @@ class PortfolioEngine:
         else:
             fee = quantity * fill_price * sell_exec_fee_rate
             proceeds = (quantity * fill_price) - fee
+            if live_order_sell:
+                from backend.services.live_fill_economics import apply_live_sell_economics, extract_live_commission
+
+                comm = extract_live_commission(live_order_sell, symbol=normalized_symbol, fill_price=fill_price)
+                fee, proceeds = apply_live_sell_economics(
+                    quantity=quantity,
+                    fill_price=fill_price,
+                    modeled_fee=fee,
+                    commission=comm,
+                )
+                if sell_preflight_audit is None:
+                    sell_preflight_audit = {}
+                sell_preflight_audit["live_commission"] = comm.to_dict()
+                if comm.fee_from_exchange:
+                    logger.info(
+                        "LIVE_SELL_EXCHANGE_FEE %s fee_usd=%.8f proceeds=%.8f",
+                        normalized_symbol,
+                        fee,
+                        proceeds,
+                    )
         entry_fee_pro_rata = (getattr(position, "entry_fee", 0) or 0) * (quantity / position.quantity) if position.quantity > 0 else 0
         entry_cost = (quantity * position.entry_price) + entry_fee_pro_rata
         realized_pnl = proceeds - entry_cost
@@ -16754,10 +16822,21 @@ class PortfolioEngine:
         else:
             perf.avg_loss = perf.avg_loss * 0.9 + abs(realized_pnl) * 0.1
 
-        # Rolling loss-hit counter (read by the per-coin pause rules below).
-        # Live path increments this only when a real net-negative sell is
-        # observed (e.g., a human-manual close or a dust write-off in the red).
-        if is_loss:
+        # Rolling last-N loss hits. When DAY is LIVE this is live-mode closes only.
+        # Paper/learning history stays in coin_performance rows; it must not pause LIVE.
+        from backend.services.execution_mode_service import is_live_execution_allowed_sync
+        from backend.services.live_fill_economics import live_closes_24h, live_risk_loss_hits, recent_sell_pnls
+
+        live_day = bool(is_live_execution_allowed_sync())
+        live_pnls: list[float] = []
+        if live_day:
+            live_pnls = recent_sell_pnls(self.db_path, symbol, limit=10, mode="live")
+            perf.stop_loss_hits_10 = live_risk_loss_hits(
+                is_live_day=True,
+                sticky_hits=perf.stop_loss_hits_10,
+                live_pnls=live_pnls,
+            )
+        elif is_loss:
             perf.stop_loss_hits_10 = min(10, perf.stop_loss_hits_10 + 1)
 
         # Update expectancy
@@ -16793,9 +16872,32 @@ class PortfolioEngine:
             perf.sizing_multiplier = 1.0
 
         # CHECK PAUSE RULES
+        # Classification (audit 2026-08-24):
+        # A shared learning: win_rate_20, sizing_multiplier, expectancy, avg_win/loss, PF learning
+        # B live risk/account when DAY is LIVE: pause_until, loss_heavy, 24h pause, PF disable
+        # C contamination: B fields previously mixed paper+live — isolated below
         should_pause = False
         pause_duration = 0
         pause_reason = ""
+        pause_trades_24h = perf.trades_24h
+        pause_pnl_24h = perf.pnl_24h
+        pause_wr = perf.win_rate_20
+        pause_pf = perf.profit_factor
+        pause_trades_20 = perf.total_trades_20
+        if live_day:
+            pause_trades_24h, pause_pnl_24h = live_closes_24h(self.db_path, symbol)
+            live20 = recent_sell_pnls(self.db_path, symbol, limit=20, mode="live")
+            pause_trades_20 = len(live20)
+            wins20 = sum(1 for p in live20 if p > 0)
+            pause_wr = (wins20 / pause_trades_20) if pause_trades_20 else 0.5
+            gp = sum(p for p in live20 if p > 0)
+            gl = abs(sum(p for p in live20 if p < 0))
+            if gl > 0:
+                pause_pf = gp / gl
+            elif gp > 0:
+                pause_pf = None
+            else:
+                pause_pf = 1.0
 
         # Rule 4 (COIN UNIVERSE): Temporary disable if profit_factor < 1.0 and trades >= 20 (30d lookback proxy)
         try:
@@ -16810,19 +16912,19 @@ class PortfolioEngine:
             DISABLE_DAYS_MAX = 14
             MIN_TRADES_FOR_DISABLE = 20
             PROFIT_FACTOR_DISABLE_THRESHOLD = 1.0
-        if perf.profit_factor is not None and perf.profit_factor < PROFIT_FACTOR_DISABLE_THRESHOLD and perf.total_trades_20 >= MIN_TRADES_FOR_DISABLE and current_time >= perf.pause_until:
+        if pause_pf is not None and pause_pf < PROFIT_FACTOR_DISABLE_THRESHOLD and pause_trades_20 >= MIN_TRADES_FOR_DISABLE and current_time >= perf.pause_until:
             import random
 
             disable_days = random.uniform(DISABLE_DAYS_MIN, DISABLE_DAYS_MAX)
             should_pause = True
             pause_duration = disable_days * 86400
-            pause_reason = f"underperform: profit_factor={perf.profit_factor:.2f}, trades_20={perf.total_trades_20} (COIN_UNIVERSE_RULES)"
+            pause_reason = f"underperform: profit_factor={pause_pf:.2f}, trades_20={pause_trades_20} (COIN_UNIVERSE_RULES)"
 
         # Rule 1: High trades + negative PnL + low win rate
-        if not should_pause and perf.trades_24h >= PAUSE_THRESHOLD_TRADES_24H and perf.pnl_24h < 0 and perf.win_rate_20 < PAUSE_THRESHOLD_WIN_RATE:
+        if not should_pause and pause_trades_24h >= PAUSE_THRESHOLD_TRADES_24H and pause_pnl_24h < 0 and pause_wr < PAUSE_THRESHOLD_WIN_RATE:
             should_pause = True
             pause_duration = PAUSE_DURATION_UNDERPERFORM
-            pause_reason = f"underperform: {perf.trades_24h} trades, ${perf.pnl_24h:.2f} PnL, {perf.win_rate_20:.1%} WR"
+            pause_reason = f"underperform: {pause_trades_24h} trades, ${pause_pnl_24h:.2f} PnL, {pause_wr:.1%} WR"
 
         # Rule 2: Too many recent losing closes — pause the coin to let the
         # learning loop catch up before resuming buys.
@@ -16837,6 +16939,14 @@ class PortfolioEngine:
         if should_pause and current_time >= perf.pause_until:
             perf.pause_until = current_time + pause_duration
             logger.warning(f"PAUSE: {symbol} paused for {pause_duration / 3600:.1f}h | Reason: {pause_reason}")
+        elif live_day and not should_pause and perf.pause_until > current_time:
+            logger.warning(
+                "LIVE_RISK_PAUSE_CLEARED symbol=%s previous_until=%.0f live_hits=%s",
+                symbol,
+                perf.pause_until,
+                perf.stop_loss_hits_10,
+            )
+            perf.pause_until = 0.0
 
         perf.last_updated = current_time
 
@@ -17145,6 +17255,28 @@ class PortfolioEngine:
             "accounting": accounting,
         }
 
+    def _mode_aware_pnl_fields(self, forward_accounting: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Headline realized PnL is live-only when DAY is LIVE. Paper history is not rewritten."""
+        from backend.services.execution_mode_service import is_live_execution_allowed_sync
+        from backend.services.live_fill_economics import sum_realized_pnl_by_mode
+
+        live_r = sum_realized_pnl_by_mode(self.db_path, mode="live")
+        paper_r = sum_realized_pnl_by_mode(self.db_path, mode="paper")
+        is_live = bool(is_live_execution_allowed_sync())
+        fwd = forward_accounting or {}
+        if is_live:
+            headline = live_r
+        elif fwd.get("forward_epoch_started_at"):
+            headline = float(fwd.get("realized_pnl_forward_usd") or 0.0)
+        else:
+            headline = float(self._realized_pnl)
+        return {
+            "account_execution_mode": "live" if is_live else "paper",
+            "realized_pnl_live": live_r,
+            "realized_pnl_paper_historical": paper_r,
+            "headline_realized_pnl": headline,
+        }
+
     def get_portfolio_status(self) -> dict[str, Any]:
         """
         Get full portfolio status for observability.
@@ -17163,11 +17295,27 @@ class PortfolioEngine:
         as an auxiliary diagnostic only.
         """
         positions_list = []
+        dust_list = []
         for symbol, pos in self.open_positions.items():
             if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
+                dust_list.append(self.build_open_position_api_row(symbol, pos))
                 continue
             positions_list.append(self.build_open_position_api_row(symbol, pos))
         self.enrich_open_position_rows_from_buy_explain(positions_list)
+        live_dust_value = 0.0
+        for row in dust_list:
+            try:
+                live_dust_value += float(row.get("market_value") or row.get("quantity", 0) or 0) * float(
+                    row.get("current_price") or row.get("entry_price") or 0
+                )
+            except (TypeError, ValueError):
+                pass
+        if live_dust_value <= 0:
+            live_dust_value = sum(
+                float(getattr(p, "quantity", 0) or 0) * float(getattr(p, "entry_price", 0) or 0)
+                for p in self.open_positions.values()
+                if getattr(p, "status", "ACTIVE") == "DUST_PENDING"
+            )
 
         # Account equity: cash + MTM positions (matches engine._total_equity / persisted ledger row)
         account_equity = self._total_equity
@@ -17193,6 +17341,7 @@ class PortfolioEngine:
             forward_accounting = compute_pnl_breakdown(self.db_path)
         except Exception as exc:
             forward_accounting = {"error": str(exc)[:200]}
+        mode_pnl = self._mode_aware_pnl_fields(forward_accounting)
 
         return {
             # DAY mode (normal repaired strategy — no inventory recovery freeze)
@@ -17232,9 +17381,15 @@ class PortfolioEngine:
             "equity_check": account_equity_check,
             # P&L BREAKDOWN
             "principal": self.principal,
+            "account_execution_mode": mode_pnl["account_execution_mode"],
             "realized_pnl_ledger_stored": self._realized_pnl,
-            "realized_pnl": (float(forward_accounting.get("realized_pnl_forward_usd") or 0.0) if forward_accounting.get("forward_epoch_started_at") else self._realized_pnl),
+            "realized_pnl_live": mode_pnl["realized_pnl_live"],
+            "realized_pnl_paper_historical": mode_pnl["realized_pnl_paper_historical"],
+            "realized_pnl": mode_pnl["headline_realized_pnl"],
             "unrealized_pnl": self._unrealized_pnl,
+            "dust_positions": dust_list,
+            "live_dust_quantity": sum(float(getattr(p, "quantity", 0) or 0) for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") == "DUST_PENDING"),
+            "live_dust_value": live_dust_value,
             "forward_paper_accounting": forward_accounting,
             "realized_pnl_forward": forward_accounting.get("realized_pnl_forward_usd", 0.0),
             "synthetic_smoke_pnl": forward_accounting.get("synthetic_smoke_pnl_usd", 0.0),
@@ -17323,12 +17478,17 @@ class PortfolioEngine:
                 abs(total_equity - equity_check_canonical),
             )
 
+        mode_pnl = self._mode_aware_pnl_fields()
         return {
             # LEDGER STATE (canonical)
             "principal": self.principal,
             "cash_balance": self.cash_balance,
             "positions_value": self._positions_value,
-            "realized_pnl": self._realized_pnl,
+            "realized_pnl": mode_pnl["headline_realized_pnl"],
+            "realized_pnl_live": mode_pnl["realized_pnl_live"],
+            "realized_pnl_paper_historical": mode_pnl["realized_pnl_paper_historical"],
+            "realized_pnl_ledger_stored": self._realized_pnl,
+            "account_execution_mode": mode_pnl["account_execution_mode"],
             "unrealized_pnl": self._unrealized_pnl,
             "total_equity": total_equity,
             # ACCOUNT STATUS
@@ -17392,9 +17552,65 @@ class PortfolioEngine:
                     perf.avg_pnl = float(row["avg_pnl"] or 0.0)
                 self.coin_performance[sym] = perf
                 loaded += 1
+            self._reconcile_live_risk_pauses()
         except Exception:
             logger.debug("coin_performance sqlite hydrate skipped", exc_info=True)
         return loaded
+
+    def _reconcile_live_risk_pauses(self) -> int:
+        """Clear paper-inherited LIVE pauses. Does not delete coin_performance rows."""
+        from backend.services.execution_mode_service import is_live_execution_allowed_sync
+        from backend.services.live_fill_economics import live_closes_24h, recent_sell_pnls, rolling_loss_count
+
+        if not is_live_execution_allowed_sync():
+            return 0
+        now = time.time()
+        cleared = 0
+        try:
+            from backend.config.coin_universe_rules import MIN_TRADES_FOR_DISABLE, PROFIT_FACTOR_DISABLE_THRESHOLD
+        except ImportError:
+            MIN_TRADES_FOR_DISABLE = 20
+            PROFIT_FACTOR_DISABLE_THRESHOLD = 1.0
+        for symbol, perf in list(self.coin_performance.items()):
+            live10 = recent_sell_pnls(self.db_path, symbol, limit=10, mode="live")
+            hits = rolling_loss_count(live10, 10)
+            perf.stop_loss_hits_10 = hits
+            t24, p24 = live_closes_24h(self.db_path, symbol)
+            live20 = recent_sell_pnls(self.db_path, symbol, limit=20, mode="live")
+            wr = (sum(1 for p in live20 if p > 0) / len(live20)) if live20 else 0.5
+            gp = sum(p for p in live20 if p > 0)
+            gl = abs(sum(p for p in live20 if p < 0))
+            pf = (gp / gl) if gl > 0 else (None if gp > 0 else 1.0)
+            would = hits >= PAUSE_THRESHOLD_STOP_HITS
+            would = would or (t24 >= PAUSE_THRESHOLD_TRADES_24H and p24 < 0 and wr < PAUSE_THRESHOLD_WIN_RATE)
+            would = would or (
+                pf is not None and pf < PROFIT_FACTOR_DISABLE_THRESHOLD and len(live20) >= MIN_TRADES_FOR_DISABLE
+            )
+            if not would and perf.pause_until > now:
+                logger.warning("LIVE_RISK_PAUSE_CLEARED_ON_LOAD symbol=%s hits=%s", symbol, hits)
+                perf.pause_until = 0.0
+                cleared += 1
+                try:
+                    self._persist_coin_performance_sync(perf)
+                except Exception:
+                    logger.debug("LIVE_RISK_PAUSE_PERSIST_SKIP %s", symbol, exc_info=True)
+        return cleared
+
+    def _persist_coin_performance_sync(self, perf: CoinPerformance) -> None:
+        def _op() -> None:
+            with connect_rw(self.db_path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    """
+                    UPDATE coin_performance
+                    SET stop_loss_hits_10 = ?, pause_until = ?, last_updated = ?
+                    WHERE symbol = ?
+                    """,
+                    (perf.stop_loss_hits_10, perf.pause_until, time.time(), perf.symbol),
+                )
+                conn.commit()
+
+        run_locked_retry(_op)
 
     def get_coin_status(self, symbol: str) -> dict[str, Any]:
         """Per-coin observability: persisted performance plus the live book row."""

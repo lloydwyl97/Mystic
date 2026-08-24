@@ -53,6 +53,7 @@ from backend.services.binance_scalp.scalp_position_retention import maybe_run_sc
 from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
 from backend.services.binance_scalp.schema import init_scalp_schema
 from backend.services.binance_scalp.strategies.kline_cache import KlineCache
+from backend.utils.sqlite_runtime import connect_rw, is_locked_error, run_locked_retry
 
 logger = logging.getLogger(__name__)
 WOULD_ENTER_NOT_ARMED = "WOULD_ENTER_NOT_ARMED"
@@ -148,9 +149,8 @@ class BinanceScalpPaperEngine:
             logger.debug("SCALP_STARTUP_CB_STATUS_SKIPPED", exc_info=True)
 
     def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.config.database_path, timeout=10.0)
+        conn = connect_rw(self.config.database_path)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     def _now(self) -> tuple[str, float]:
@@ -664,6 +664,19 @@ class BinanceScalpPaperEngine:
         self._last_breaker_recovery_until = ""
         self._last_breaker_eval_after = ""
         try:
+            return run_locked_retry(self._evaluate_scalp_circuit_breaker)
+        except sqlite3.OperationalError as e:
+            self._last_breaker_reason = "SCALP_BREAKER_STATE_UNAVAILABLE"
+            kind = "locked" if is_locked_error(e) else "operational"
+            logger.error("[SCALP_CIRCUIT_BREAKER] state unavailable fail-closed (%s): %s", kind, e)
+            return True
+        except Exception as e:
+            self._last_breaker_reason = "SCALP_BREAKER_STATE_UNAVAILABLE"
+            logger.error("[SCALP_CIRCUIT_BREAKER] Check failed (fail-closed): %s", e)
+            return True
+
+    def _evaluate_scalp_circuit_breaker(self) -> bool:
+        try:
             now = self._utcnow()
             today = now.strftime("%Y-%m-%d")
             epoch = (self.config.circuit_breaker_epoch or "").strip()
@@ -799,9 +812,8 @@ class BinanceScalpPaperEngine:
 
                 self._last_breaker_eval_after = eval_after
                 return False
-        except Exception as e:
-            logger.warning("[SCALP_CIRCUIT_BREAKER] Check failed (non-blocking): %s", e)
-        return False
+        except Exception:
+            raise
 
     def _entry_candidates(
         self,
