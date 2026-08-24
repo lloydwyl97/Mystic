@@ -61,6 +61,23 @@ _DB_PERSIST_INTERVAL_SEC = float(os.getenv("MICROSTRUCTURE_DB_PERSIST_INTERVAL_S
 _RANKING_DELTA_CAP = float(os.getenv("MICROSTRUCTURE_RANKING_DELTA_CAP", "0.03"))
 _PRICE_LEVEL_TOL_REL = 1e-7  # relative tolerance for matching a price level across snapshots
 
+# Tape fields published by uvicorn (AggTradeCollector + OrderBookService).
+# The SCALP runner records local L2 only; without this overlay its
+# trade_hist stays empty and flow/absorption stay permanently zero.
+_TAPE_OVERLAY_PREFIXES: tuple[str, ...] = (
+    "agg_flow_imbalance_",
+    "agg_buy_vol_",
+    "agg_sell_vol_",
+    "trade_count_",
+    "avg_trade_size_",
+)
+_TAPE_OVERLAY_KEYS: tuple[str, ...] = (
+    "signed_volume_5s",
+    "flow_acceleration",
+    "bid_absorption_score",
+    "ask_absorption_score",
+)
+
 
 def _now() -> float:
     return time.time()
@@ -138,6 +155,10 @@ def _ofi_increment(prev: _DepthSample, curr: _DepthSample) -> float:
         - 1[ask_n <= ask_{n-1}] * asksize_n + 1[ask_n >= ask_{n-1}] * asksize_{n-1}
 
     Positive = net buy-side pressure at the top of book.
+
+    Raw increment is in base-asset size, so XRP (thousands of coins) dwarfs
+    BTC. Divide by contemporaneous L1 depth so the stored value is
+    depth-relative and cross-symbol comparable. Sign is unchanged.
     """
     bid_term = 0.0
     if curr.bid_px >= prev.bid_px:
@@ -149,7 +170,11 @@ def _ofi_increment(prev: _DepthSample, curr: _DepthSample) -> float:
         ask_term -= curr.ask_sz
     if curr.ask_px >= prev.ask_px:
         ask_term += prev.ask_sz
-    return bid_term + ask_term
+    raw = bid_term + ask_term
+    scale = 0.5 * (prev.bid_sz + prev.ask_sz + curr.bid_sz + curr.ask_sz)
+    if scale <= 0.0:
+        return 0.0
+    return raw / scale
 
 
 def _levels_match(a: float, b: float) -> bool:
@@ -280,6 +305,16 @@ def record_snapshot(
     _evict_old(st.ofi_hist, t)
 
     _maybe_persist(symbol, st, t)
+
+
+def aggressor_is_sell(is_buyer_maker: bool) -> bool:
+    """Binance aggTrade ``m`` / ``isBuyerMaker`` mapping.
+
+    Official spot aggTrade: ``m=true`` means the buyer was the maker, so the
+    seller was the aggressor. ``m=false`` means the seller was the maker, so
+    the buyer was the aggressor.
+    """
+    return bool(is_buyer_maker)
 
 
 def record_agg_trade(symbol: str, qty: float, is_buyer_maker: bool, ts: float | None = None) -> None:
@@ -442,8 +477,41 @@ def compute_features(symbol: str) -> dict[str, Any]:
         out[f"ask_replenished_{tag}"] = round(ask_added, 8)
 
     _enrich_micro_scores(out, depth_samples, trade_samples, now_ts, latest, mid)
+    if not trade_samples:
+        _overlay_redis_tape(out, symbol)
     _attach_cross_market(out, symbol)
     return out
+
+
+def _overlay_redis_tape(out: dict[str, Any], symbol: str) -> None:
+    """Copy uvicorn tape/absorption into a book-only local compute.
+
+    Local OFI/OBI/microprice stay from this process's snapshots. Missing Redis
+    is a no-op — never invent nonzero defaults.
+    """
+    redis_feats = _features_from_redis(symbol)
+    if not redis_feats:
+        return
+    for key, val in redis_feats.items():
+        if key in _TAPE_OVERLAY_KEYS or any(key.startswith(p) for p in _TAPE_OVERLAY_PREFIXES):
+            out[key] = val
+    flow = float(out.get("agg_flow_imbalance_5s") or 0.0)
+    mp = float(out.get("microprice_pressure") or 0.0)
+    fragility = float(out.get("depth_fragility") or 0.0)
+    near = float(out.get("near_touch_depth_loss") or 0.0)
+    adverse = max(
+        0.0,
+        min(
+            1.0,
+            0.30 * fragility
+            + 0.25 * max(0.0, -mp * 400.0)
+            + 0.20 * max(0.0, -flow)
+            + 0.25 * near,
+        ),
+    )
+    out["adverse_selection_score"] = round(adverse, 4)
+    out["p_adverse_move"] = round(adverse, 4)
+    out["source"] = "local_book+redis_tape"
 
 
 def _attach_cross_market(out: dict[str, Any], symbol: str) -> None:
@@ -737,6 +805,7 @@ __all__ = [
     "DEPTH_LEVELS",
     "QUEUE_WINDOWS_SEC",
     "WINDOWS_SEC",
+    "aggressor_is_sell",
     "compute_features",
     "get_microstructure_ranking_delta",
     "get_stats",

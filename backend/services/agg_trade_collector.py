@@ -50,6 +50,8 @@ class AggTradeCollector:
             "errors": 0,
             "reconnects": 0,
             "last_error": None,
+            "by_symbol": {s: 0 for s in self.symbols},
+            "last_ts_by_symbol": {s: 0.0 for s in self.symbols},
         }
 
         logger.info(f"AggTradeCollector initialized for {len(self.symbols)} symbols")
@@ -128,9 +130,14 @@ class AggTradeCollector:
 
             self.stats["messages_received"] += 1
             self.stats["trades_processed"] += 1
+            by_sym = self.stats.setdefault("by_symbol", {})
+            prev = int(by_sym.get(symbol) or 0)
+            by_sym[symbol] = prev + 1
+            last_ts = self.stats.setdefault("last_ts_by_symbol", {})
+            last_ts[symbol] = float(ts or 0.0)
             await self._heartbeat_throttled(symbol)
 
-            if self.stats["trades_processed"] == 1:
+            if prev == 0:
                 logger.info(f"First aggTrade processed for {symbol}")
 
         except json.JSONDecodeError as e:
@@ -159,7 +166,11 @@ class AggTradeCollector:
             await beat(
                 "agg_trade_collector:ws_messages",
                 get_shared_redis_async(),
-                extra={"last_symbol": symbol, "messages_received": self.stats["messages_received"]},
+                extra={
+                    "last_symbol": symbol,
+                    "messages_received": self.stats["messages_received"],
+                    "by_symbol": self.stats.get("by_symbol") or {},
+                },
             )
         except Exception:
             pass

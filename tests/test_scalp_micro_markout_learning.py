@@ -145,6 +145,25 @@ def test_buy_microstructure_stamp_invariant():
     assert buy_microstructure_invariant_violations({**version_stamps(), "microstructure_features": {}}) != []
 
 
+def test_feature_context_extra_persists_tape_fields():
+    from backend.services.binance_scalp.scalp_micro_contract import feature_context_extra
+
+    extra = feature_context_extra(
+        {
+            "ofi_5s": 0.4,
+            "agg_flow_imbalance_5s": 0.22,
+            "trade_count_5s": 4,
+            "flow_acceleration": 0.05,
+            "bid_absorption_score": 0.3,
+            "ask_absorption_score": 0.0,
+        }
+    )
+    assert extra["agg_flow_imbalance_5s"] == 0.22
+    assert extra["trade_count_5s"] == 4
+    assert extra["flow_acceleration"] == 0.05
+    assert extra["agg_flow_bucket"] == "buying"
+
+
 def test_markout_completes_without_future_leak(tmp_path):
     reset_markouts()
     db = str(tmp_path / "scalp_micro.db")

@@ -260,3 +260,139 @@ def test_get_stats_reports_tracked_symbols():
     stats = m.get_stats()
     assert "BTC" in stats["symbols_tracked"]
     assert stats["depth_samples"]["BTC"] >= 1
+
+
+def test_binance_is_buyer_maker_true_is_aggressive_sell():
+    from backend.services.microstructure_engine import aggressor_is_sell
+
+    assert aggressor_is_sell(True) is True
+    assert aggressor_is_sell(False) is False
+
+
+def test_binance_aggtrade_fixture_direction():
+    """Official Binance.US/com aggTrade ``m`` flag (buyer is maker)."""
+    from backend.services.microstructure_engine import aggressor_is_sell
+
+    sell_aggressor = {
+        "e": "aggTrade",
+        "E": 1672515782136,
+        "s": "BTCUSDT",
+        "a": 26129,
+        "p": "0.001",
+        "q": "100",
+        "f": 100,
+        "l": 105,
+        "T": 1672515782136,
+        "m": True,
+    }
+    buy_aggressor = dict(sell_aggressor)
+    buy_aggressor["m"] = False
+    assert aggressor_is_sell(bool(sell_aggressor["m"])) is True
+    assert aggressor_is_sell(bool(buy_aggressor["m"])) is False
+
+
+def test_redis_tape_overlay_when_local_book_has_no_trades(monkeypatch):
+    from backend.services import microstructure_engine as m
+
+    bids, asks = _book(100.0, 5.0, 100.2, 5.0)
+    m.record_snapshot("ETHUSDT", bids, asks, ts=time.time())
+    monkeypatch.setattr(
+        m,
+        "_features_from_redis",
+        lambda symbol: {
+            "symbol": "ETH",
+            "data_age_sec": 0.01,
+            "agg_flow_imbalance_5s": 0.42,
+            "trade_count_5s": 7,
+            "signed_volume_5s": 1.25,
+            "flow_acceleration": 0.11,
+            "bid_absorption_score": 0.31,
+            "ask_absorption_score": 0.0,
+            "ofi_5s": 99.0,
+        },
+    )
+    feats = m.compute_features("ETHUSDT")
+    assert feats["agg_flow_imbalance_5s"] == 0.42
+    assert feats["trade_count_5s"] == 7
+    assert feats["signed_volume_5s"] == 1.25
+    assert feats["flow_acceleration"] == 0.11
+    assert feats["bid_absorption_score"] == 0.31
+    assert feats["source"] == "local_book+redis_tape"
+    assert feats["ofi_5s"] != 99.0
+
+
+def test_local_trades_are_not_overwritten_by_redis(monkeypatch):
+    from backend.services import microstructure_engine as m
+
+    bids, asks = _book(100.0, 5.0, 100.2, 5.0)
+    now = time.time()
+    m.record_snapshot("BTCUSDT", bids, asks, ts=now)
+    m.record_agg_trade("BTCUSDT", qty=3.0, is_buyer_maker=False, ts=now)
+    monkeypatch.setattr(
+        m,
+        "_features_from_redis",
+        lambda symbol: {"agg_flow_imbalance_5s": -1.0, "trade_count_5s": 99, "data_age_sec": 0.01},
+    )
+    feats = m.compute_features("BTCUSDT")
+    assert feats["trade_count_5s"] == 1
+    assert feats["agg_flow_imbalance_5s"] == pytest.approx(1.0)
+
+
+def test_bid_absorption_rises_on_aggressive_sells_stable_price_replenish():
+    from backend.services import microstructure_engine as m
+
+    t0 = time.time()
+    bids1, asks1 = _book(100.0, 5.0, 100.2, 5.0)
+    m.record_snapshot("SOLUSDT", bids1, asks1, ts=t0)
+    m.record_agg_trade("SOLUSDT", qty=2.0, is_buyer_maker=True, ts=t0 + 0.1)
+    bids2, asks2 = _book(100.0, 8.0, 100.2, 5.0)
+    m.record_snapshot("SOLUSDT", bids2, asks2, ts=t0 + 0.2)
+    feats = m.compute_features("SOLUSDT")
+    assert feats["bid_absorption_score"] > 0.0
+    assert feats["ask_absorption_score"] == 0.0
+
+
+def test_ask_absorption_rises_on_aggressive_buys_stable_price_replenish():
+    from backend.services import microstructure_engine as m
+
+    t0 = time.time()
+    bids1, asks1 = _book(100.0, 5.0, 100.2, 5.0)
+    m.record_snapshot("SOLUSDT", bids1, asks1, ts=t0)
+    m.record_agg_trade("SOLUSDT", qty=2.0, is_buyer_maker=False, ts=t0 + 0.1)
+    bids2, asks2 = _book(100.0, 5.0, 100.2, 8.0)
+    m.record_snapshot("SOLUSDT", bids2, asks2, ts=t0 + 0.2)
+    feats = m.compute_features("SOLUSDT")
+    assert feats["ask_absorption_score"] > 0.0
+    assert feats["bid_absorption_score"] == 0.0
+
+
+def test_no_aggressive_flow_leaves_absorption_neutral():
+    from backend.services import microstructure_engine as m
+
+    t0 = time.time()
+    bids, asks = _book(100.0, 5.0, 100.2, 5.0)
+    m.record_snapshot("XRPUSDT", bids, asks, ts=t0)
+    m.record_snapshot("XRPUSDT", bids, asks, ts=t0 + 0.2)
+    feats = m.compute_features("XRPUSDT")
+    assert feats["bid_absorption_score"] == 0.0
+    assert feats["ask_absorption_score"] == 0.0
+    assert feats["trade_count_5s"] == 0
+    assert feats["agg_flow_imbalance_5s"] == 0.0
+
+
+def test_ofi_depth_normalized_xrp_comparable_to_btc():
+    from backend.services import microstructure_engine as m
+
+    t0 = time.time()
+    btc1, a1 = _book(80000.0, 1.0, 80001.0, 1.0)
+    btc2, a2 = _book(80000.0, 1.6, 80001.0, 0.4)
+    m.record_snapshot("BTCUSDT", btc1, a1, ts=t0)
+    m.record_snapshot("BTCUSDT", btc2, a2, ts=t0 + 0.1)
+    x1, xa1 = _book(1.50, 5000.0, 1.51, 5000.0)
+    x2, xa2 = _book(1.50, 8000.0, 1.51, 2000.0)
+    m.record_snapshot("XRPUSDT", x1, xa1, ts=t0)
+    m.record_snapshot("XRPUSDT", x2, xa2, ts=t0 + 0.1)
+    btc = m.compute_features("BTCUSDT")["ofi_1s"]
+    xrp = m.compute_features("XRPUSDT")["ofi_1s"]
+    assert btc > 0 and xrp > 0
+    assert abs(btc - xrp) / max(abs(btc), abs(xrp)) < 0.15
