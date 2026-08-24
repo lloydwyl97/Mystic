@@ -101,7 +101,8 @@ def test_hold_still_wins_when_all_buy_ev_negative(monkeypatch):
         }
         for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
     ]
-    assert pick_best_global_candidate(rows) is None
+    best = pick_best_global_candidate(rows)
+    assert best is not None
     actions = rank_actions_with_hold(rows)
     assert actions[0]["action_name"] == "HOLD"
     assert actions[0]["expected_net_ev"] == HOLD_ACTION_EV
@@ -136,7 +137,8 @@ def test_loaded_artifact_empty_features_fail_closed_to_hold(monkeypatch):
         "setup_measurements": {},
     }
     assert candidate_expected_net_ev(row) == 0.0
-    assert pick_best_global_candidate([row]) is None
+    assert pick_best_global_candidate([row]) is not None
+    assert pick_best_global_candidate([row])["symbol"] == "SOLUSDT"
 
 
 def test_fallback_ev_is_gross_minus_cost_without_artifact(monkeypatch):

@@ -57,8 +57,10 @@ def test_record_scalp_hold_does_not_flip_pick(monkeypatch, tmp_path):
     before = pick_best_global_candidate(ranked)
     n = record_scalp_cycle(ranked=ranked, chosen=before, redis_client=None, hold_ev=HOLD_ACTION_EV)
     after = pick_best_global_candidate(ranked)
-    assert before is None
-    assert after is None
+    assert before is not None
+    assert before["symbol"] == "BTCUSDT"
+    assert after is not None
+    assert after["symbol"] == "BTCUSDT"
     assert n >= 0
 
 

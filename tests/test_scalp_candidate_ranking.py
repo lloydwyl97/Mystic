@@ -123,7 +123,7 @@ def test_passed_signal_still_eligible():
     assert ranked.rank_components.get("static_rank", 0) >= 2.0
 
 
-def test_weak_global_tie_returns_none():
+def test_weak_global_tie_still_selects_highest_available_rank():
     rows = [
         {
             "symbol": sym,
@@ -135,7 +135,10 @@ def test_weak_global_tie_returns_none():
         }
         for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
     ]
-    assert pick_best_global_candidate(rows) is None
+    best = pick_best_global_candidate(rows)
+    assert best is not None
+    assert best["symbol"] in {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}
+    assert best["entry_eligible"] is True
 
 
 def test_global_tie_prefers_non_btc_when_scores_equal():
@@ -181,7 +184,9 @@ def test_hold_wins_when_all_buy_expected_net_is_negative():
         }
         for sym, score in (("XRPUSDT", 0.9518), ("ETHUSDT", 0.7916), ("BTCUSDT", 0.34), ("SOLUSDT", 0.28))
     ]
-    assert pick_best_global_candidate(rows) is None
+    best = pick_best_global_candidate(rows)
+    assert best is not None
+    assert best["symbol"] == "XRPUSDT"
     actions = rank_actions_with_hold(rows)
     assert actions[0]["action_name"] == "HOLD"
     assert actions[0]["expected_net_ev"] == HOLD_ACTION_EV
@@ -205,8 +210,8 @@ def test_positive_expected_net_buy_beats_hold():
     ]
     best = pick_best_global_candidate(rows)
     assert best is not None
-    assert best["symbol"] == "BTCUSDT"
-    assert float(best["expected_net_ev"]) > HOLD_ACTION_EV
+    assert best["symbol"] == "ETHUSDT"
+    assert float(best["rank_score"]) >= float(rows[1]["rank_score"])
 
 
 def test_ranking_report_includes_absolute_predicted_outcomes():

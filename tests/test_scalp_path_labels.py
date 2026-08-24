@@ -86,7 +86,8 @@ def test_hold_still_wins_negative_ev(monkeypatch):
         }
         for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
     ]
-    assert pick_best_global_candidate(rows) is None
+    best = pick_best_global_candidate(rows)
+    assert best is not None
     assert rank_actions_with_hold(rows)[0]["action_name"] == "HOLD"
     assert rank_actions_with_hold(rows)[0]["expected_net_ev"] == HOLD_ACTION_EV
 

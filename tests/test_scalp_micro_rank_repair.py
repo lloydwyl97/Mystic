@@ -20,9 +20,12 @@ from backend.services.binance_scalp.scalp_micro_contract import (
 from backend.services.binance_scalp.scalp_micro_ev import heuristic_horizon_ev
 from backend.services.binance_scalp.scalp_micro_observability import build_peer_micro_snapshot
 from backend.services.binance_scalp.scalp_micro_rank import (
+    AUTHORITATIVE_SELECTION,
+    EV_TIE_TOLERANCE,
     RANK_PRIMARY,
     TIEBREAK_SCALE,
     apply_repaired_rank,
+    ev_scores_tied,
     repaired_primary_score,
 )
 from backend.services.binance_scalp.scalp_micro_replay import replay_four_coin_rank
@@ -46,6 +49,22 @@ def _base(**overrides):
     }
     feats.update(overrides)
     return feats
+
+
+def test_static_cannot_reverse_nontied_ev10s():
+    weak = apply_repaired_rank(static_rank=2.6, feats=_base(), micro_ev={"EV_10s": -6.794e-05})[0]
+    strong = apply_repaired_rank(static_rank=0.40, feats=_base(), micro_ev={"EV_10s": -6.54e-05})[0]
+    assert strong > weak
+    assert TIEBREAK_SCALE == 0.0
+    assert not ev_scores_tied(-6.794e-05, -6.54e-05)
+
+
+def test_exact_ev_tie_is_deterministic():
+    a, _, ca = apply_repaired_rank(static_rank=1.28, feats=_base(), micro_ev={"EV_10s": -6.5e-05})
+    b, _, cb = apply_repaired_rank(static_rank=0.98, feats=_base(), micro_ev={"EV_10s": -6.5e-05})
+    assert a == b
+    assert ev_scores_tied(a, b)
+    assert ca["static_rank"] != cb["static_rank"]
 
 
 def test_repaired_rank_orders_by_ev10s_not_static():
@@ -247,6 +266,90 @@ def test_pick_best_uses_repaired_rank_among_hold_survivors(monkeypatch):
     assert best["symbol"] == "ETHUSDT"
 
 
+def test_pick_best_selects_select_v2_leader_even_when_path_net_hold_disagrees(monkeypatch):
+    import backend.services.binance_scalp.forward_net_predictor as fnp
+
+    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda row: None)
+
+    def _row(sym, rank, expected):
+        return {
+            "symbol": sym,
+            "rank_score": rank,
+            "entry_eligible": True,
+            "signal": SimpleNamespace(
+                passed=False,
+                spread_pct=0.0002,
+                expected_move_pct=expected,
+                impact_pct=0.0,
+                confidence=0.4,
+            ),
+        }
+
+    rows = [
+        _row("ETHUSDT", 2.393e-05, 0.0),
+        _row("BTCUSDT", -4.729e-05, 0.0),
+        _row("SOLUSDT", -0.00011764, 0.0),
+        _row("XRPUSDT", -0.00011823, 0.004),
+    ]
+    best = pick_best_global_candidate(rows)
+    assert best is not None
+    assert best["symbol"] == "ETHUSDT"
+    assert float(best.get("expected_net_ev") or 0) <= 0
+
+
+def test_pick_best_second_slot_is_next_select_v2_leader(monkeypatch):
+    import backend.services.binance_scalp.forward_net_predictor as fnp
+
+    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda row: None)
+    rows = [
+        {"symbol": "ETHUSDT", "rank_score": 3e-05, "entry_eligible": True, "already_open": True, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
+        {"symbol": "BTCUSDT", "rank_score": -1e-05, "entry_eligible": True, "already_open": False, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
+        {"symbol": "SOLUSDT", "rank_score": -5e-05, "entry_eligible": True, "already_open": False, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
+        {"symbol": "XRPUSDT", "rank_score": -9e-05, "entry_eligible": True, "already_open": False, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
+    ]
+    best = pick_best_global_candidate(rows)
+    assert best is not None
+    assert best["symbol"] == "BTCUSDT"
+
+
+def test_pick_best_skips_hard_block_and_already_open(monkeypatch):
+    import backend.services.binance_scalp.forward_net_predictor as fnp
+
+    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda row: None)
+    rows = [
+        {"symbol": "ETHUSDT", "rank_score": 1e-04, "entry_eligible": False, "hard_block": "SPREAD_TOO_WIDE", "signal": SimpleNamespace(passed=True, spread_pct=0.02, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
+        {"symbol": "BTCUSDT", "rank_score": 5e-05, "entry_eligible": True, "already_open": True, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
+        {"symbol": "SOLUSDT", "rank_score": -2e-05, "entry_eligible": True, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
+        {"symbol": "XRPUSDT", "rank_score": -8e-05, "entry_eligible": True, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
+    ]
+    best = pick_best_global_candidate(rows)
+    assert best is not None
+    assert best["symbol"] == "SOLUSDT"
+
+
+def test_negative_ev_leader_still_selected(monkeypatch):
+    import backend.services.binance_scalp.forward_net_predictor as fnp
+
+    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda row: None)
+    rows = [
+        {"symbol": "XRPUSDT", "rank_score": -6.112e-05, "entry_eligible": True, "signal": SimpleNamespace(passed=False, spread_pct=0.0002, expected_move_pct=0.0, impact_pct=0.0, confidence=0.4)},
+        {"symbol": "BTCUSDT", "rank_score": -8.004e-05, "entry_eligible": True, "signal": SimpleNamespace(passed=False, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.4)},
+        {"symbol": "ETHUSDT", "rank_score": -9.706e-05, "entry_eligible": True, "signal": SimpleNamespace(passed=False, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.4)},
+        {"symbol": "SOLUSDT", "rank_score": -0.00011865, "entry_eligible": True, "signal": SimpleNamespace(passed=False, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.4)},
+    ]
+    best = pick_best_global_candidate(rows)
+    assert best is not None
+    assert best["symbol"] == "XRPUSDT"
+
+
+def test_hard_safety_and_universe_unchanged():
+    assert "SPREAD_TOO_WIDE" in HARD_REJECT_REASONS
+    src = inspect.getsource(pick_best_global_candidate)
+    assert "expected_net_ev" not in src
+    assert "HOLD_ACTION_EV" not in src
+    assert inspect.getsource(compute_scalp_position_size).count("apply_repaired_rank") == 0
+
+
 def test_rank_setup_signal_stamps_select_v2(monkeypatch):
     monkeypatch.setattr(
         "backend.services.microstructure_engine.compute_features",
@@ -282,6 +385,7 @@ def test_rank_setup_signal_stamps_select_v2(monkeypatch):
     assert ranked.entry_eligible is True
     assert ranked.rank_components["selection_version"] == "scalp_micro_select_v2"
     assert ranked.rank_components["primary"] == "EV_10s"
+    assert ranked.rank_components["authoritative_selection"] is True
     assert abs(ranked.rank_score - ranked.rank_components["EV_10s"]) < 1e-3
 
 
@@ -320,4 +424,25 @@ def test_negative_ev_and_negative_flow_still_eligible(monkeypatch):
     assert ranked.entry_eligible is True
     assert ranked.hard_block is None
     assert ranked.rank_components["EV_10s"] < 0
-    assert TIEBREAK_SCALE == 1e-5
+    assert TIEBREAK_SCALE == 0.0
+    assert AUTHORITATIVE_SELECTION is True
+    assert EV_TIE_TOLERANCE <= 1e-12
+
+
+def test_day_exits_universe_and_max_open_untouched():
+    from backend.services.binance_scalp.config import ScalpConfig
+    from backend.services.binance_scalp.exit_manager import _path_max_adverse_net_pct
+    from backend.services.microstructure_engine import get_microstructure_ranking_delta
+    import backend.services.binance_scalp.paper_engine as pe
+
+    day_src = inspect.getsource(get_microstructure_ranking_delta)
+    assert "apply_repaired_rank" not in day_src
+    assert "scalp_micro_select_v2" not in day_src
+    assert "authoritative_selection" not in day_src
+    exit_src = inspect.getsource(_path_max_adverse_net_pct)
+    assert 'SCALP_PATH_MAX_ADVERSE_NET_PCT", "0.0015"' in exit_src
+    paper_src = inspect.getsource(pe)
+    assert "max_open_positions" in paper_src
+    assert "SCALP_MAX_OPEN_POSITIONS" in inspect.getsource(ScalpConfig.from_env)
+    products = get_scalp_config().products
+    assert set(products) >= {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}

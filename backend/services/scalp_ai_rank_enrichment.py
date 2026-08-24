@@ -142,18 +142,16 @@ def enrich_scalp_ranked_candidates(
         merged = dict(row)
         merged["intelligence"] = intel
         merged["final_scalp_selection_score"] = intel.get("final_scalp_selection_score")
-        # Apply intelligence into the score pick_best_global_candidate actually uses.
-        # select_v2 primary is EV_10s (~1e-4). A raw ±0.16 intel add would
-        # dominate and re-invert the repaired order — keep intel as tie-break.
+        # select_v2: EV_10s is lexicographic primary. Do not add intel into
+        # rank_score — that blend reversed real EV gaps. Intel stays on the
+        # row for exact-EV tie-break only.
         base_rank = float(merged.get("rank_score") or 0.0)
         intel_delta = float(intel.get("intelligence_rank_delta") or 0.0)
         sel_ver = str(merged.get("selection_version") or (merged.get("rank_components") or {}).get("selection_version") or "")
-        if sel_ver == "scalp_micro_select_v2" or (merged.get("rank_components") or {}).get("primary") == "EV_10s":
-            from backend.services.binance_scalp.scalp_micro_rank import TIEBREAK_SCALE
-
-            intel_delta = intel_delta * TIEBREAK_SCALE
+        ev_primary = sel_ver == "scalp_micro_select_v2" or (merged.get("rank_components") or {}).get("primary") == "EV_10s"
         merged["rank_score_raw"] = base_rank
-        merged["rank_score"] = round(base_rank + intel_delta, 8)
+        merged["rank_score"] = round(base_rank if ev_primary else base_rank + intel_delta, 8)
+        merged["intelligence_rank_delta"] = intel_delta
         enriched.append(merged)
     enriched.sort(
         key=lambda r: (

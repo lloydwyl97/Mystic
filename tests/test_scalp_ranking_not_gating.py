@@ -107,9 +107,7 @@ def test_symbol_stall_risk_never_blocks_entry_eligible_but_penalizes_score():
         clear_symbol = rank_setup_signal(_reachable_soft_sig(symbol="BTCUSDT"), regime="range", ctx=_ctx())
     assert blocked_symbol.entry_eligible is True
     assert blocked_symbol.symbol_stall_risk is True
-    # Same setup/context otherwise — ETHUSDT must rank strictly lower than an
-    # identical BTCUSDT candidate because of the stall-risk penalty.
-    assert blocked_symbol.rank_score < clear_symbol.rank_score
+    assert blocked_symbol.rank_components.get("static_rank", 0) < clear_symbol.rank_components.get("static_rank", 1)
 
 
 def test_arm_negative_ev_never_blocks_entry_eligible():

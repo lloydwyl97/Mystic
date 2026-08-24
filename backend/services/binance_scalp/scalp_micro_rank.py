@@ -1,8 +1,8 @@
-"""Deterministic SCALP ranking repair (select_v2).
+"""Deterministic SCALP ranking repair (select_v2, authoritative).
 
-Frozen 885de8c+ validation chose EV_10s as the primary four-coin sort key.
-Blending that signal back into the inverted static/setup rank stayed inverted.
-Static score remains a tiny tie-break only. Never a permission gate.
+PRIMARY SORT = decision-time EV_10s.
+Static/setup/intel are tie-break only when EV_10s is numerically tied.
+Never blend static back into EV. Never a permission gate.
 
 DAY ranking delta is intentionally unchanged.
 """
@@ -14,9 +14,11 @@ from typing import Any
 from backend.services.binance_scalp.scalp_micro_contract import SELECTION_VERSION
 from backend.services.binance_scalp.scalp_micro_ev import heuristic_horizon_ev
 
-# EV_10s is typically a few 1e-4. Tie-break must stay smaller than any real EV gap.
-TIEBREAK_SCALE = 1e-5
+# No additive blend. Observed 0.25 bp EV gaps (~2.5e-6) were reversed by 1e-5 * static.
+TIEBREAK_SCALE = 0.0
+EV_TIE_TOLERANCE = 1e-12
 RANK_PRIMARY = "EV_10s"
+AUTHORITATIVE_SELECTION = True
 
 
 def _f(d: dict[str, Any] | None, key: str, default: float = 0.0) -> float:
@@ -28,6 +30,10 @@ def _f(d: dict[str, Any] | None, key: str, default: float = 0.0) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return default
+
+
+def ev_scores_tied(a: float, b: float, *, tol: float = EV_TIE_TOLERANCE) -> bool:
+    return abs(float(a) - float(b)) <= float(tol)
 
 
 def repaired_primary_score(feats: dict[str, Any] | None, micro_ev: dict[str, Any] | None = None) -> float:
@@ -48,6 +54,7 @@ def rank_components(feats: dict[str, Any] | None, *, ev10: float, static_rank: f
     return {
         "selection_version": SELECTION_VERSION,
         "primary": RANK_PRIMARY,
+        "authoritative_selection": AUTHORITATIVE_SELECTION,
         "EV_10s": round(float(ev10), 8),
         "agg_flow_imbalance_5s": _f(f, "agg_flow_imbalance_5s"),
         "ofi_5s": _f(f, "ofi_5s"),
@@ -57,7 +64,7 @@ def rank_components(feats: dict[str, Any] | None, *, ev10: float, static_rank: f
         "net_absorption": _f(f, "bid_absorption_score") - _f(f, "ask_absorption_score"),
         "depth_fragility": _f(f, "depth_fragility"),
         "static_rank": round(float(static_rank), 6),
-        "static_tiebreak": round(float(tiebreak), 10),
+        "static_tiebreak": round(float(tiebreak), 12),
         "obi_standalone": "neutralized",
         "absorption_standalone": "neutralized",
         "fragility_standalone": "neutralized",
@@ -75,19 +82,25 @@ def apply_repaired_rank(
     feature_adj: float = 0.0,
     micro_ev: dict[str, Any] | None = None,
 ) -> tuple[float, float, dict[str, Any]]:
-    """Return (final_rank, micro_adj_diagnostic, components). Does not change eligibility."""
+    """Return (final_rank, micro_adj_diagnostic, components).
+
+    final_rank is EV_10s only. Residual is recorded, never added.
+    Does not change eligibility.
+    """
     primary = repaired_primary_score(feats, micro_ev)
     residual = float(static_rank) + float(live_ctx_adj) + float(learned_adj) + float(micro_learn_adj) + float(feature_adj)
     tie = TIEBREAK_SCALE * residual
-    final = float(primary) + tie
     comps = rank_components(feats, ev10=primary, static_rank=static_rank, tiebreak=tie)
-    return round(final, 8), round(float(primary), 8), comps
+    return round(float(primary), 8), round(float(primary), 8), comps
 
 
 __all__ = [
+    "AUTHORITATIVE_SELECTION",
+    "EV_TIE_TOLERANCE",
     "RANK_PRIMARY",
     "TIEBREAK_SCALE",
     "apply_repaired_rank",
+    "ev_scores_tied",
     "rank_components",
     "repaired_primary_score",
 ]

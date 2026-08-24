@@ -948,33 +948,33 @@ def rank_actions_with_hold(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def pick_best_global_candidate(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """
-    Rank BUY expected-net against HOLD(EV=0).
+    """Select the highest select_v2 rank among hard-eligible candidates.
 
-    This is not a threshold gate. HOLD is an action. If every BUY has
-    negative expected net, HOLD wins and no entry is selected.
+    Path-net / HOLD opinion does not skip a higher-ranked available coin.
+    Negative EV_10s still trades if the candidate is entry_eligible.
+    Already-open symbols are skipped. Hard safety stays on entry_eligible.
     """
-    eligible = [r for r in rows if r.get("entry_eligible")]
+    from backend.services.binance_scalp.scalp_micro_rank import EV_TIE_TOLERANCE, ev_scores_tied
+
+    eligible = [
+        r
+        for r in rows
+        if r.get("entry_eligible")
+        and not r.get("already_open")
+        and str(r.get("hard_block") or "") == ""
+    ]
     if not eligible:
         return None
 
     for row in eligible:
         attach_action_predictions(row)
 
-    actions = rank_actions_with_hold(eligible)
-    winner = actions[0] if actions else None
-    if winner is None or str(winner.get("action_name") or "") == HOLD_ACTION_NAME:
-        return None
-    if _num(winner.get("expected_net_ev")) <= HOLD_ACTION_EV:
-        return None
-
-    peers = [r for r in eligible if _num(r.get("expected_net_ev")) > HOLD_ACTION_EV]
-    if not peers:
-        return None
-    # select_v2: repaired rank_score is the four-coin key among HOLD survivors.
-    # HOLD(EV=0) stays the existing action rank — not a new microstructure gate.
-    top_rank = max(_num(r.get("rank_score")) for r in peers)
-    clustered = [r for r in peers if abs(top_rank - _num(r.get("rank_score"))) <= 1e-9]
+    top_rank = max(_num(r.get("rank_score")) for r in eligible)
+    clustered = [
+        r
+        for r in eligible
+        if ev_scores_tied(_num(r.get("rank_score")), top_rank, tol=EV_TIE_TOLERANCE)
+    ]
     if len(clustered) > 1:
         return max(clustered, key=_global_tie_key)
     return clustered[0]
