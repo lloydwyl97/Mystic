@@ -15,10 +15,11 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _fresh_state():
+def _fresh_state(monkeypatch):
     """Each test gets an isolated symbol-state dict (module uses process-global state)."""
     mod = importlib.import_module("backend.services.microstructure_engine")
     mod._STATE.clear()
+    monkeypatch.setattr(mod, "_features_from_redis", lambda symbol: {})
     yield mod
     mod._STATE.clear()
 
@@ -224,6 +225,31 @@ def test_compute_features_missing_symbol_is_empty_dict():
     from backend.services import microstructure_engine as m
 
     assert m.compute_features("NOSUCHSYMBOL") == {}
+
+
+def test_features_from_redis_used_when_local_state_empty(monkeypatch):
+    from backend.services import microstructure_engine as m
+
+    m._STATE.clear()
+    monkeypatch.setattr(
+        m,
+        "_features_from_redis",
+        lambda symbol: {"symbol": "BTC", "ofi_5s": 1.25, "data_age_sec": 0.01, "source": "redis"},
+    )
+    feats = m.compute_features("BTCUSDT")
+    assert feats["source"] == "redis"
+    assert feats["ofi_5s"] == 1.25
+
+
+def test_stale_redis_features_are_not_authoritative(monkeypatch):
+    from backend.services import microstructure_engine as m
+
+    class _R:
+        def hgetall(self, key):
+            return {"data_age_sec": "99", "ofi_5s": "9"}
+
+    monkeypatch.setattr("backend.config.redis_config.get_shared_redis_sync", lambda: _R())
+    assert m._features_from_redis("ETHUSDT") == {}
 
 
 def test_get_stats_reports_tracked_symbols():

@@ -37,26 +37,15 @@ def cross_market_features(symbol: str, *, own_mid: float = 0.0) -> dict[str, Any
         except Exception:
             pass
         try:
-            from backend.services.derivatives_monitor import get_basis_bps
+            from backend.derivatives_monitor import fetch_binance_funding_and_basis
 
-            basis = get_basis_bps(symbol)
-            if basis is not None:
+            px = fetch_binance_funding_and_basis(symbol if str(symbol).endswith("USDT") else f"{symbol}USDT")
+            if px and px.get("basis_pct") is not None:
                 out["spot_perp_available"] = True
-                out["spot_perp_basis_bps"] = round(float(basis), 4)
+                out["spot_perp_basis_bps"] = round(float(px["basis_pct"]) * 10_000.0, 4)
                 out["cross_market_stale"] = False
         except Exception:
-            try:
-                from backend.services import derivatives_monitor as dm
-
-                fn = getattr(dm, "get_perpetual_basis", None) or getattr(dm, "spot_perp_basis", None)
-                if fn:
-                    basis = fn(symbol)
-                    if basis is not None:
-                        out["spot_perp_available"] = True
-                        out["spot_perp_basis_bps"] = round(float(basis), 4)
-                        out["cross_market_stale"] = False
-            except Exception:
-                pass
+            pass
     _CACHE[symbol] = (now + _TTL, out)
     return dict(out)
 

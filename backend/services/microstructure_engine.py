@@ -321,11 +321,44 @@ def _window(dq_iterable, now_ts: float, window_sec: float):
 # ---------------------------------------------------------------------------
 
 
+def _features_from_redis(symbol: str) -> dict[str, Any]:
+    """Cross-process read of ``microstructure:{BASE}`` published by uvicorn."""
+    try:
+        from backend.config.redis_config import get_shared_redis_sync
+
+        r = get_shared_redis_sync()
+        raw = r.hgetall(f"microstructure:{_base(symbol)}")
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    out: dict[str, Any] = {"symbol": _base(symbol), "source": "redis"}
+    for k, v in raw.items():
+        key = k.decode() if isinstance(k, bytes) else str(k)
+        val = v.decode() if isinstance(v, bytes) else v
+        if key in {"features_json", "microstructure_json"}:
+            continue
+        try:
+            out[key] = float(val)
+        except (TypeError, ValueError):
+            out[key] = val
+    age = float(out.get("data_age_sec") or 999)
+    if age > 10.0:
+        return {}
+    _attach_cross_market(out, symbol)
+    return out
+
+
 def compute_features(symbol: str) -> dict[str, Any]:
-    """Full microstructure feature dict for one symbol. Empty dict if no data."""
+    """Full microstructure feature dict for one symbol. Empty dict if no data.
+
+    The SCALP runner is a separate process from the uvicorn collector. If this
+    process has no local book history, read the Redis hash the collector
+    already publishes. Missing/stale Redis is empty evidence, not a gate.
+    """
     st = _STATE.get(_base(symbol))
     if st is None or not st.depth_hist:
-        return {}
+        return _features_from_redis(symbol)
 
     now_ts = st.depth_hist[-1].ts
     latest = st.depth_hist[-1]
@@ -409,7 +442,21 @@ def compute_features(symbol: str) -> dict[str, Any]:
         out[f"ask_replenished_{tag}"] = round(ask_added, 8)
 
     _enrich_micro_scores(out, depth_samples, trade_samples, now_ts, latest, mid)
+    _attach_cross_market(out, symbol)
     return out
+
+
+def _attach_cross_market(out: dict[str, Any], symbol: str) -> None:
+    with contextlib.suppress(Exception):
+        from backend.services.binance_scalp.scalp_cross_market import cross_market_features
+
+        mid = float(out.get("mid") or 0.0)
+        if mid <= 0:
+            bb = float(out.get("best_bid") or 0.0)
+            ba = float(out.get("best_ask") or 0.0)
+            mid = 0.5 * (bb + ba) if bb > 0 and ba > 0 else 0.0
+        cm = cross_market_features(symbol, own_mid=mid)
+        out.update(cm)
 
 
 def _enrich_micro_scores(

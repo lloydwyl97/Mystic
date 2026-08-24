@@ -1376,6 +1376,29 @@ class BinanceScalpPaperEngine:
                             "predicted_horizon": ranking_meta.get("selected_expected_hold"),
                             "forward_net_model_version": ranking_meta.get("forward_net_model_version") or "",
                             **_scalp_prov,
+                            **{
+                                k: entry_diag[k]
+                                for k in (
+                                    "feature_version",
+                                    "microstructure_version",
+                                    "selection_version",
+                                    "model_version",
+                                    "feature_set_version",
+                                    "microstructure_features",
+                                    "EV_1s",
+                                    "EV_5s",
+                                    "EV_10s",
+                                    "EV_30s",
+                                    "EV_60s",
+                                    "p_positive_executable_net_5s",
+                                    "p_positive_executable_net_10s",
+                                    "p_positive_executable_net_30s",
+                                    "p_adverse_move",
+                                    "selection_micro_score",
+                                    "calibration_status",
+                                )
+                                if k in entry_diag
+                            },
                         }
                     ),
                 ),
@@ -2329,6 +2352,11 @@ class BinanceScalpPaperEngine:
             snaps[sym] = snap
             self._record_momentum(snap)
             self._write_market_cache(snap)
+            with contextlib.suppress(Exception):
+                from backend.services.microstructure_engine import record_snapshot
+
+                if getattr(snap, "bids", None) and getattr(snap, "asks", None):
+                    record_snapshot(sym, snap.bids, snap.asks)
 
         # Existing -15 bp authority must see the book before ranking work.
         from backend.services.binance_scalp.scalp_micro_latency import timed
