@@ -72,6 +72,9 @@ def extract_peer_fields(row: dict[str, Any]) -> dict[str, Any]:
         "soft_rank": bool(soft_rank) and not strategy_passed,
         "soft_reason": row.get("soft_reason") or meta.get("soft_reason"),
         "hard_block": row.get("hard_block") or meta.get("hard_block"),
+        "rank_components": row.get("rank_components") or meta.get("rank_components") or ctx.get("rank_components") or {},
+        "selection_version": row.get("selection_version") or meta.get("selection_version") or ctx.get("selection_version"),
+        "ev_position": None,
     }
 
 
@@ -126,15 +129,27 @@ def build_peer_micro_snapshot(
                 "available": False,
                 "hard_block": "NOT_IN_CYCLE",
             }
+    ev_ordered = sorted(
+        [s for s in available_syms if extracted[s].get("EV_10s") is not None],
+        key=lambda s: -float(extracted[s].get("EV_10s") or 0.0),
+    )
+    for pos, sym in enumerate(ev_ordered, start=1):
+        if sym in peers:
+            peers[sym]["ev_position"] = pos
     used_open = int(open_count if open_count is not None else len(open_set))
     slots_free = used_open < int(max_open)
+    selected = str(selected_symbol).upper() if selected_symbol else None
+    sel_rec = peers.get(selected) if selected else None
     return {
         "version": "scalp_peer_micro_v1",
-        "selected_symbol": str(selected_symbol).upper() if selected_symbol else None,
+        "selected_symbol": selected,
         "open_symbols": sorted(open_set),
         "open_count": used_open,
         "max_open": int(max_open),
         "slots_available": bool(slots_free),
+        "selected_rank_position": (sel_rec or {}).get("available_rank_position") or (sel_rec or {}).get("rank_position"),
+        "selected_ev_position": (sel_rec or {}).get("ev_position"),
+        "selected_final_rank": (sel_rec or {}).get("final_rank_score"),
         "peers": peers,
     }
 

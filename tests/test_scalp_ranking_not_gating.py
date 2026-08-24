@@ -87,7 +87,8 @@ def test_soft_reject_with_real_net_edge_is_entry_eligible():
     ranked = rank_setup_signal(_reachable_soft_sig(), regime="range", ctx=_ctx())
     assert ranked.hard_block is None
     assert ranked.entry_eligible is True
-    assert ranked.rank_score > 0.0
+    assert ranked.rank_score is not None
+    assert ranked.rank_components.get("eligibility_effect") is False
 
 
 def test_regime_mismatch_never_blocks_entry_eligible():

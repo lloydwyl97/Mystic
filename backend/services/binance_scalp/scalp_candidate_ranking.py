@@ -223,6 +223,7 @@ class RankedCandidate:
     symbol_stall_risk: bool = False
     # Observability only — already computed during ranking; never a gate.
     micro_ev: dict[str, Any] = field(default_factory=dict)
+    rank_components: dict[str, Any] = field(default_factory=dict)
 
 
 def rank_setup_signal(
@@ -450,16 +451,14 @@ def rank_setup_signal(
                     5,
                 )
 
-    # Real microstructure engine (OFI + aggressor flow + microprice pressure,
-    # short 250ms-30s windows) — feeds this SCALP entry's rank_score only.
-    # Never eligibility, never a gate. See microstructure_engine.py.
+    # Real microstructure features — ranking only, never eligibility.
+    # select_v2: EV_10s is the primary four-coin key (frozen validation).
+    # DAY get_microstructure_ranking_delta is not used here.
     micro_adj = 0.0
     micro_feats: dict = {}
     with contextlib.suppress(Exception):
         from backend.services.microstructure_engine import compute_features as _cmf
-        from backend.services.microstructure_engine import get_microstructure_ranking_delta as _gmrd
 
-        micro_adj = round(_gmrd(sig.symbol), 5)
         micro_feats = _cmf(sig.symbol) or {}
 
     micro_learn_adj = 0.0
@@ -482,7 +481,6 @@ def rank_setup_signal(
         from backend.services.binance_scalp.scalp_micro_ev import multi_horizon_ev
 
         micro_ev = multi_horizon_ev(micro_feats)
-        micro_adj = round(micro_adj + max(-0.02, min(0.02, 80.0 * float(micro_ev.get("selection_micro_score") or 0.0))), 5)
 
     feature_adj = 0.0
     with contextlib.suppress(Exception):
@@ -491,7 +489,21 @@ def rank_setup_signal(
             from backend.services.binance_scalp.scalp_setup_measurements import evidence_rank_delta
 
             feature_adj = round(evidence_rank_delta({sig.setup_name: feats}), 5)
-    rank_score = round(rank_score + live_ctx_adj + learned_adj + micro_adj + micro_learn_adj + feature_adj, 4)
+    rank_components: dict = {}
+    with contextlib.suppress(Exception):
+        from backend.services.binance_scalp.scalp_micro_rank import apply_repaired_rank
+
+        rank_score, micro_adj, rank_components = apply_repaired_rank(
+            static_rank=float(rank_score),
+            feats=micro_feats,
+            live_ctx_adj=float(live_ctx_adj),
+            learned_adj=float(learned_adj),
+            micro_learn_adj=float(micro_learn_adj),
+            feature_adj=float(feature_adj),
+            micro_ev=micro_ev,
+        )
+    if not rank_components:
+        rank_score = round(rank_score + live_ctx_adj + learned_adj + micro_adj + micro_learn_adj + feature_adj, 4)
 
     # Measurement: counters only — never flips eligibility (scalp_strategy_owner_v2).
     # Outcome is "hard_blocked" ONLY for mechanical safety (hard_block set).
@@ -591,6 +603,7 @@ def rank_setup_signal(
         regime_mismatch=regime_mismatch,
         symbol_stall_risk=symbol_stall_risk,
         micro_ev=dict(micro_ev or {}),
+        rank_components=dict(rank_components or {}),
     )
 
 
@@ -639,6 +652,7 @@ def prepare_entry_signal(
         ctx_map.update(version_stamps())
         ctx_map["final_micro_rank_delta"] = float(ranked.microstructure_adjustment)
         ctx_map["learned_adjustment"] = float(ranked.learned_adjustment)
+        ctx_map["rank_components"] = dict(getattr(ranked, "rank_components", None) or {})
         ctx_map["microstructure_features"] = {
             k: _mf.get(k)
             for k in (
@@ -954,24 +968,16 @@ def pick_best_global_candidate(rows: list[dict[str, Any]]) -> dict[str, Any] | N
     if _num(winner.get("expected_net_ev")) <= HOLD_ACTION_EV:
         return None
 
-    chosen_symbol = str(winner.get("symbol") or "")
-    chosen = next((r for r in eligible if str(r.get("symbol") or "") == chosen_symbol), winner)
     peers = [r for r in eligible if _num(r.get("expected_net_ev")) > HOLD_ACTION_EV]
-    if len(peers) > 1:
-        top_ev = _num(chosen.get("expected_net_ev"))
-        tied = [r for r in peers if abs(_num(r.get("expected_net_ev")) - top_ev) <= 1e-9]
-        if len(tied) > 1:
-            # _global_tie_key is the secondary sort for *clustered* rank scores.
-            # Equal EV alone is not a tie: applying it to a clear rank leader
-            # discards the ranking, including any AI enrichment boost, that had
-            # already separated the candidates.
-            top_rank = max(_num(r.get("rank_score")) for r in tied)
-            clustered = [r for r in tied if top_rank - _num(r.get("rank_score")) <= _rank_tie_margin()]
-            if len(clustered) > 1:
-                return max(clustered, key=_global_tie_key)
-            if clustered:
-                return clustered[0]
-    return chosen
+    if not peers:
+        return None
+    # select_v2: repaired rank_score is the four-coin key among HOLD survivors.
+    # HOLD(EV=0) stays the existing action rank — not a new microstructure gate.
+    top_rank = max(_num(r.get("rank_score")) for r in peers)
+    clustered = [r for r in peers if abs(top_rank - _num(r.get("rank_score"))) <= 1e-9]
+    if len(clustered) > 1:
+        return max(clustered, key=_global_tie_key)
+    return clustered[0]
 
 
 __all__ = [

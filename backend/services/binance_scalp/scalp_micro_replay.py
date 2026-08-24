@@ -34,11 +34,13 @@ def replay_events(events: list[dict[str, Any]], *, symbol: str = "BTCUSDT") -> d
 
 
 def replay_four_coin_rank(per_symbol_feats: dict[str, dict[str, Any]]) -> list[tuple[str, float]]:
-    """Rank all four coins from decision-time features only."""
+    """Rank all four coins from decision-time features only (select_v2: EV_10s)."""
+    from backend.services.binance_scalp.scalp_micro_rank import repaired_primary_score
+
     scored = []
     for sym, feats in per_symbol_feats.items():
         ev = multi_horizon_ev(feats)
-        scored.append((sym, float(ev["selection_micro_score"])))
+        scored.append((sym, float(repaired_primary_score(feats, ev))))
     scored.sort(key=lambda x: -x[1])
     return scored
 

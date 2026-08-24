@@ -316,9 +316,12 @@ class ScalpStrategyRouter:
                 mtf_conflict_reason = mtf_conflict_reason or "MTF_15M_NOT_ALIGNED_RANKED"
                 mtf_penalty_mult *= float(os.getenv("SCALP_MTF_15M_CONFLICT_RANK_MULT", "0.55"))
             if mtf_penalty_mult < 1.0:
-                rank_score_penalized = round(float(best_ranked.rank_score) * mtf_penalty_mult, 4)
-                # RankedCandidate is frozen — rebuild with the penalized score
-                # rather than mutate, keeping every other field/provenance intact.
+                # MTF is a residual handicap only. Multiplying a typically
+                # negative EV_10s primary would invert the penalty.
+                old_score = float(best_ranked.rank_score)
+                primary = float((getattr(best_ranked, "rank_components", None) or {}).get("EV_10s") or old_score)
+                tie = old_score - primary
+                rank_score_penalized = round(primary + tie * mtf_penalty_mult, 8)
                 from dataclasses import replace as _replace
 
                 best_ranked = _replace(best_ranked, rank_score=rank_score_penalized)
@@ -350,6 +353,8 @@ class ScalpStrategyRouter:
         meta["microstructure_adjustment"] = float(best_ranked.microstructure_adjustment)
         meta["static_rank_score"] = float(getattr(best_ranked, "raw_rank_score", 0.0) or 0.0)
         meta["learned_adjustment"] = float(getattr(best_ranked, "learned_adjustment", 0.0) or 0.0)
+        meta["rank_components"] = dict(getattr(best_ranked, "rank_components", None) or {})
+        meta["selection_version"] = (getattr(best_ranked, "rank_components", None) or {}).get("selection_version")
         _ev = getattr(best_ranked, "micro_ev", None) or {}
         for _ek in ("EV_1s", "EV_5s", "EV_10s", "EV_30s", "EV_60s"):
             if _ev.get(_ek) is not None:
@@ -487,6 +492,8 @@ class ScalpStrategyRouter:
                 "EV_10s": meta.get("EV_10s"),
                 "EV_30s": meta.get("EV_30s"),
                 "EV_60s": meta.get("EV_60s"),
+                "rank_components": meta.get("rank_components") or {},
+                "selection_version": meta.get("selection_version"),
                 # Item p11: composite EV across SCALP's realistic 30s-20m
                 # holding horizons — diagnostic/ranking evidence only, never
                 # a gate. TTL-cached (~5min) so this cheap-but-not-free

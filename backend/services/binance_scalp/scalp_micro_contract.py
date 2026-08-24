@@ -11,7 +11,8 @@ from typing import Any
 # Existing 40-dim contract stays SCALP_FEATURE_VERSION=1.
 SCALP_FEATURE_VERSION = 1
 MICROSTRUCTURE_VERSION = "scalp_micro_v1"
-SELECTION_VERSION = "scalp_micro_select_v1"
+SELECTION_VERSION = "scalp_micro_select_v2"
+SELECTION_VERSION_V1 = "scalp_micro_select_v1"
 MODEL_VERSION = "scalp_micro_ev_v1"
 FEATURE_SET_VERSION = "scalp_micro_features_v1"
 
@@ -242,6 +243,7 @@ __all__ = [
     "MODEL_VERSION",
     "SCALP_FEATURE_VERSION",
     "SELECTION_VERSION",
+    "SELECTION_VERSION_V1",
     "buy_microstructure_invariant_violations",
     "extract_micro_vector",
     "feature_context_extra",

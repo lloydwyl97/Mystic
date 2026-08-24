@@ -119,7 +119,8 @@ def test_passed_signal_still_eligible():
     )
     ranked = rank_setup_signal(passed, regime="range", ctx=ctx)
     assert ranked.entry_eligible is True
-    assert ranked.rank_score >= 2.0
+    assert ranked.rank_components.get("primary") == "EV_10s"
+    assert ranked.rank_components.get("static_rank", 0) >= 2.0
 
 
 def test_weak_global_tie_returns_none():
