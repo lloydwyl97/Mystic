@@ -100,7 +100,8 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     predicted_mfe REAL,
     predicted_mae REAL,
     predicted_horizon TEXT,
-    model_version TEXT NOT NULL DEFAULT ''
+    model_version TEXT NOT NULL DEFAULT '',
+    peer_micro_json TEXT NOT NULL DEFAULT '{{}}'
 )
 """
 
@@ -119,6 +120,7 @@ def ensure_opportunity_table(db_path: str, conn: sqlite3.Connection | None = Non
             ("predicted_mae", "REAL"),
             ("predicted_horizon", "TEXT"),
             ("model_version", "TEXT NOT NULL DEFAULT ''"),
+            ("peer_micro_json", "TEXT NOT NULL DEFAULT '{}'"),
         ):
             if col not in cols:
                 c.execute(f"ALTER TABLE {TABLE} ADD COLUMN {col} {spec}")
@@ -166,8 +168,8 @@ def record_opportunity_cycle(
                  best_setup, best_passed, best_reject, rank_score,
                  measurements_json, signals_json, feature_vector_json,
                  predicted_net_ev, predicted_prob_positive_net, predicted_mfe,
-                 predicted_mae, predicted_horizon, model_version)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 predicted_mae, predicted_horizon, model_version, peer_micro_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     now,
@@ -190,6 +192,7 @@ def record_opportunity_cycle(
                     row.get("expected_mae"),
                     row.get("expected_hold"),
                     str(row.get("forward_net_model_version") or ""),
+                    json.dumps(row.get("peer_micro_snapshot") or {}, default=str),
                 ),
             )
             written += 1

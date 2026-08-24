@@ -348,6 +348,12 @@ class ScalpStrategyRouter:
         meta["regime_mismatch"] = bool(best_ranked.regime_mismatch)
         meta["symbol_stall_risk"] = bool(best_ranked.symbol_stall_risk)
         meta["microstructure_adjustment"] = float(best_ranked.microstructure_adjustment)
+        meta["static_rank_score"] = float(getattr(best_ranked, "raw_rank_score", 0.0) or 0.0)
+        meta["learned_adjustment"] = float(getattr(best_ranked, "learned_adjustment", 0.0) or 0.0)
+        _ev = getattr(best_ranked, "micro_ev", None) or {}
+        for _ek in ("EV_1s", "EV_5s", "EV_10s", "EV_30s", "EV_60s"):
+            if _ev.get(_ek) is not None:
+                meta[_ek] = _ev.get(_ek)
         micro_q = 1.0
         with contextlib.suppress(Exception):
             ctx_micro = (best_ranked.signal.setup_context or {}) if best_ranked.signal else {}
@@ -474,6 +480,13 @@ class ScalpStrategyRouter:
                 "regime_mismatch": meta.get("regime_mismatch", False),
                 "symbol_stall_risk": meta.get("symbol_stall_risk", False),
                 "microstructure_adjustment": meta.get("microstructure_adjustment", 0.0),
+                "learned_adjustment": meta.get("learned_adjustment", 0.0),
+                "static_rank_score": meta.get("static_rank_score", 0.0),
+                "EV_1s": meta.get("EV_1s"),
+                "EV_5s": meta.get("EV_5s"),
+                "EV_10s": meta.get("EV_10s"),
+                "EV_30s": meta.get("EV_30s"),
+                "EV_60s": meta.get("EV_60s"),
                 # Item p11: composite EV across SCALP's realistic 30s-20m
                 # holding horizons — diagnostic/ranking evidence only, never
                 # a gate. TTL-cached (~5min) so this cheap-but-not-free

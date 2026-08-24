@@ -868,6 +868,7 @@ class BinanceScalpPaperEngine:
 
         self._pending_opportunity_rows = ranked
         self._pending_opportunity_epoch = epoch
+        full_ranked = list(ranked)
 
         if open_symbols:
             ranked = [r for r in ranked if str(r.get("symbol") or "").upper() not in open_symbols]
@@ -916,6 +917,19 @@ class BinanceScalpPaperEngine:
             )
 
         if not ranked:
+            with contextlib.suppress(Exception):
+                from backend.services.binance_scalp.scalp_micro_observability import build_peer_micro_snapshot
+
+                _empty_peer = build_peer_micro_snapshot(
+                    full_ranked,
+                    open_symbols=open_symbols,
+                    max_open=int(self.config.max_open_positions),
+                    open_count=len(open_symbols),
+                    selected_symbol=None,
+                )
+                self._last_peer_micro_snapshot = _empty_peer
+                for opp in self._pending_opportunity_rows or []:
+                    opp["peer_micro_snapshot"] = _empty_peer
             for sym in self.config.products:
                 snap = self.reader.read(sym)
                 if snap is None:
@@ -942,6 +956,20 @@ class BinanceScalpPaperEngine:
         for row in ranked:
             attach_action_predictions(row)
         best = pick_best_global_candidate(ranked)
+        peer_snap: dict = {}
+        with contextlib.suppress(Exception):
+            from backend.services.binance_scalp.scalp_micro_observability import build_peer_micro_snapshot
+
+            peer_snap = build_peer_micro_snapshot(
+                full_ranked,
+                open_symbols=open_symbols,
+                max_open=int(self.config.max_open_positions),
+                open_count=len(open_symbols),
+                selected_symbol=(best or {}).get("symbol") if best else None,
+            )
+            self._last_peer_micro_snapshot = peer_snap
+            for opp in self._pending_opportunity_rows or []:
+                opp["peer_micro_snapshot"] = peer_snap
         with contextlib.suppress(Exception):
             from backend.services.decision_book_tape import record_scalp_cycle
 
@@ -1001,6 +1029,7 @@ class BinanceScalpPaperEngine:
                             for r in actions
                         ],
                         "hold_action_ev": HOLD_ACTION_EV,
+                        "peer_micro_snapshot": peer_snap,
                         "all_symbols": [
                             {
                                 "symbol": r["symbol"],
@@ -1123,6 +1152,7 @@ class BinanceScalpPaperEngine:
             "selected_expected_hold": best.get("expected_hold"),
             "forward_net_model_version": best.get("forward_net_model_version") or "",
             "scalp_intelligence": entry_intel,
+            "peer_micro_snapshot": peer_snap,
         }
         logger.info("SCALP_STRATEGY_PICK %s", self._last_ranking_meta["selection_reason"])
 
@@ -1247,6 +1277,23 @@ class BinanceScalpPaperEngine:
 
         limit_buy = sig.limit_buy_price
         qty = notional / limit_buy
+        _soft_mult = 1.0 if bool(getattr(sig, "passed", False)) else float(os.getenv("SCALP_SOFT_RANK_SIZE_MULT", "0.35"))
+        size_diag: dict = {}
+        with contextlib.suppress(Exception):
+            from backend.services.binance_scalp.scalp_micro_observability import size_diagnostics
+
+            size_diag = size_diagnostics(
+                sizing,
+                base_notional=float(base_cap),
+                qty=float(qty),
+                strategy_passed=bool(getattr(sig, "passed", False)),
+                microstructure_size_factor=float(ranking_meta_for_size.get("micro_quality_mult", 1.0) or 1.0),
+                learning_size_multiplier=1.0,
+                soft_rank_multiplier=float(_soft_mult),
+                calibration_mult=float(cal_mult),
+                arm_penalty_mult=float(ranking_meta_for_size.get("arm_penalty_mult", 1.0) or 1.0),
+                mtf_penalty_mult=float(ranking_meta_for_size.get("mtf_penalty_mult", 1.0) or 1.0),
+            )
         fee = notional * self.econ.entry_fee_pct()
         slip = notional * self.econ.slippage_buffer_pct
         trade_id = f"scalp_paper_{sym}_{int(time.time() * 1000)}"
@@ -1286,6 +1333,8 @@ class BinanceScalpPaperEngine:
             "dynamic_sizing": sizing.reasoning,
             "dynamic_sizing_multiplier": sizing.combined_multiplier,
             "base_cap": base_cap,
+            "size_diagnostics": size_diag,
+            "peer_micro_snapshot": ranking_meta.get("peer_micro_snapshot") or getattr(self, "_last_peer_micro_snapshot", {}),
             **thesis_fields,
             **entry_intel,
         }
@@ -1391,6 +1440,8 @@ class BinanceScalpPaperEngine:
                             "selection_confidence": ranking_meta.get("selection_confidence"),
                             "context_snapshot_json": _role_ctx_snap,
                             "dynamic_sizing": sizing.reasoning,
+                            "size_diagnostics": size_diag,
+                            "peer_micro_snapshot": ranking_meta.get("peer_micro_snapshot") or getattr(self, "_last_peer_micro_snapshot", {}),
                             "predicted_net_ev": ranking_meta.get("selected_expected_net_ev"),
                             "predicted_net_return": ranking_meta.get("selected_expected_net_ev"),
                             "predicted_prob_positive_net": ranking_meta.get("selected_predicted_prob_positive_net"),

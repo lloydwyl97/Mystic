@@ -221,6 +221,8 @@ class RankedCandidate:
     arm_stats: Any = None
     regime_mismatch: bool = False
     symbol_stall_risk: bool = False
+    # Observability only — already computed during ranking; never a gate.
+    micro_ev: dict[str, Any] = field(default_factory=dict)
 
 
 def rank_setup_signal(
@@ -588,6 +590,7 @@ def rank_setup_signal(
         arm_stats=arm_stats_for_sizing,
         regime_mismatch=regime_mismatch,
         symbol_stall_risk=symbol_stall_risk,
+        micro_ev=dict(micro_ev or {}),
     )
 
 
