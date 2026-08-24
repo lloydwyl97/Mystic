@@ -2177,6 +2177,34 @@ class BinanceScalpPaperEngine:
         else:
             _after_commit()
 
+    def _exit_open_positions_now(self) -> None:
+        """Evaluate existing path-aware exits before ranking/klines.
+
+        Does not change PATH_MAX_ADVERSE_STOP or any other exit threshold.
+        Removes only the evaluate_all / kline delay in front of _try_exit.
+        """
+        post_commit: list = []
+        pending_sell = None
+        try:
+            with self._conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                for row in self._open_positions(conn):
+                    self._try_exit(conn, row, post_commit=post_commit)
+                pending_sell = getattr(self, "_pending_sell_log", None)
+                self._pending_sell_log = None
+                conn.commit()
+        except Exception:
+            logger.exception("SCALP_EARLY_EXIT_PASS_FAILED")
+            return
+        if pending_sell:
+            sym, net_usd, reason = pending_sell
+            logger.info("SCALP_PAPER_SELL %s pnl=%.4f reason=%s", sym, net_usd, reason)
+        for fn in post_commit:
+            try:
+                fn()
+            except Exception as exc:
+                logger.warning("SCALP_POST_COMMIT_HOOK_FAILED %s", exc)
+
     def tick(self) -> None:
         self.config.assert_no_live_trading()
         if self.config.scalp_paper_enabled and self.config.scalp_paper_auto_arm:
@@ -2237,12 +2265,19 @@ class BinanceScalpPaperEngine:
             return
 
         _, epoch = self._now()
+        snaps = {}
         for sym in self.config.products:
             snap = self.reader.read(sym)
             if snap is None:
                 continue
+            snaps[sym] = snap
             self._record_momentum(snap)
             self._write_market_cache(snap)
+
+        # Existing -15 bp authority must see the book before ranking work.
+        self._exit_open_positions_now()
+
+        for sym, snap in snaps.items():
             bars = self._klines.get(sym)
             regime = self._router._current_regime(sym, epoch, bars)
             self._seed_scalp_market_memory(sym, snap, micro_regime=regime)
