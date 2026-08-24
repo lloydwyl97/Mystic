@@ -452,10 +452,35 @@ def rank_setup_signal(
     # short 250ms-30s windows) — feeds this SCALP entry's rank_score only.
     # Never eligibility, never a gate. See microstructure_engine.py.
     micro_adj = 0.0
+    micro_feats: dict = {}
     with contextlib.suppress(Exception):
+        from backend.services.microstructure_engine import compute_features as _cmf
         from backend.services.microstructure_engine import get_microstructure_ranking_delta as _gmrd
 
         micro_adj = round(_gmrd(sig.symbol), 5)
+        micro_feats = _cmf(sig.symbol) or {}
+
+    micro_learn_adj = 0.0
+    micro_learn: dict = {}
+    with contextlib.suppress(Exception):
+        from backend.services.binance_scalp.config import get_scalp_config
+        from backend.services.binance_scalp.scalp_micro_learning import micro_learning_adjustments
+
+        micro_learn = micro_learning_adjustments(
+            get_scalp_config().database_path,
+            symbol=sig.symbol,
+            ofi_5s=float(micro_feats.get("ofi_5s") or 0.0),
+            obi_l5=float(micro_feats.get("obi_l5") or 0.0),
+            adverse_selection_score=float(micro_feats.get("adverse_selection_score") or 0.0),
+        )
+        micro_learn_adj = round(float(micro_learn.get("rank_delta") or 0.0), 5)
+
+    micro_ev: dict = {}
+    with contextlib.suppress(Exception):
+        from backend.services.binance_scalp.scalp_micro_ev import multi_horizon_ev
+
+        micro_ev = multi_horizon_ev(micro_feats)
+        micro_adj = round(micro_adj + max(-0.02, min(0.02, 80.0 * float(micro_ev.get("selection_micro_score") or 0.0))), 5)
 
     feature_adj = 0.0
     with contextlib.suppress(Exception):
@@ -464,7 +489,7 @@ def rank_setup_signal(
             from backend.services.binance_scalp.scalp_setup_measurements import evidence_rank_delta
 
             feature_adj = round(evidence_rank_delta({sig.setup_name: feats}), 5)
-    rank_score = round(rank_score + live_ctx_adj + learned_adj + micro_adj + feature_adj, 4)
+    rank_score = round(rank_score + live_ctx_adj + learned_adj + micro_adj + micro_learn_adj + feature_adj, 4)
 
     # Measurement: counters only — never flips eligibility (scalp_strategy_owner_v2).
     # Outcome is "hard_blocked" ONLY for mechanical safety (hard_block set).
@@ -558,7 +583,7 @@ def rank_setup_signal(
         learned_adjustment=learned_adj,
         role_sample_count=role_samples,
         role_confidence=role_conf_status,
-        microstructure_adjustment=micro_adj,
+        microstructure_adjustment=round(micro_adj + micro_learn_adj, 5),
         arm_penalty_mult=arm_penalty_mult,
         arm_stats=arm_stats_for_sizing,
         regime_mismatch=regime_mismatch,
@@ -601,6 +626,46 @@ def prepare_entry_signal(
     ctx_map["rank_score_at_entry"] = float(ranked.rank_score)
     ctx_map["selection_confidence"] = str(ranked.selection_confidence)
     ctx_map["bar_closed"] = True
+    with contextlib.suppress(Exception):
+        from backend.services.binance_scalp.scalp_micro_contract import version_stamps
+        from backend.services.binance_scalp.scalp_micro_ev import multi_horizon_ev
+        from backend.services.microstructure_engine import compute_features
+
+        _mf = compute_features(sig.symbol) or {}
+        _ev = multi_horizon_ev(_mf)
+        ctx_map.update(version_stamps())
+        ctx_map["microstructure_features"] = {
+            k: _mf.get(k)
+            for k in (
+                "ofi_1s",
+                "ofi_5s",
+                "ofi_15s",
+                "ofi_30s",
+                "obi_l1",
+                "obi_l5",
+                "obi_l10",
+                "obi_l20",
+                "weighted_depth_imbalance",
+                "microprice_pressure",
+                "microprice_accel",
+                "agg_flow_imbalance_5s",
+                "signed_volume_5s",
+                "bid_cancelled_5s",
+                "ask_cancelled_5s",
+                "bid_replenished_5s",
+                "ask_replenished_5s",
+                "bid_absorption_score",
+                "ask_absorption_score",
+                "depth_fragility",
+                "adverse_selection_score",
+                "spread_pct",
+            )
+            if k in _mf
+        }
+        ctx_map.update({k: _ev[k] for k in _ev if k.startswith("EV_") or k.startswith("p_")})
+        ctx_map["selection_micro_score"] = _ev.get("selection_micro_score")
+        ctx_map["model_version"] = _ev.get("model_version")
+        ctx_map["calibration_status"] = _ev.get("calibration_status")
 
     with contextlib.suppress(Exception):
         from backend.services.binance_scalp.config import get_scalp_config

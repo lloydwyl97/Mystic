@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEPTH_LEVELS: tuple[int, ...] = (1, 3, 5, 10, 20)
-WINDOWS_SEC: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0)
+WINDOWS_SEC: tuple[float, ...] = (0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 15.0, 30.0)
 QUEUE_WINDOWS_SEC: tuple[float, ...] = (1.0, 5.0, 30.0)
 MAX_WINDOW_SEC = max(WINDOWS_SEC)
 
@@ -408,7 +408,94 @@ def compute_features(symbol: str) -> dict[str, Any]:
         out[f"ask_cancelled_{tag}"] = round(ask_cancelled, 8)
         out[f"ask_replenished_{tag}"] = round(ask_added, 8)
 
+    _enrich_micro_scores(out, depth_samples, trade_samples, now_ts, latest, mid)
     return out
+
+
+def _enrich_micro_scores(
+    out: dict[str, Any],
+    depth_samples: list[_DepthSample],
+    trade_samples: list[tuple[float, float, bool]],
+    now_ts: float,
+    latest: _DepthSample,
+    mid: float,
+) -> None:
+    """Absorption, fragility, adverse-selection, intensity — ranking only."""
+    win = _window(depth_samples, now_ts, 5.0)
+    trades_5 = _window(trade_samples, now_ts, 5.0)
+    sell_vol = sum(q for _, q, ibm in trades_5 if ibm)
+    buy_vol = sum(q for _, q, ibm in trades_5 if not ibm)
+    trade_n = len(trades_5)
+    avg_sz = ((buy_vol + sell_vol) / trade_n) if trade_n else 0.0
+    first = win[0] if win else latest
+    last = win[-1] if win else latest
+    mid0 = (first.bid_px + first.ask_px) / 2.0
+    mid1 = (last.bid_px + last.ask_px) / 2.0
+    ret_5 = ((mid1 - mid0) / mid0) if mid0 > 0 else 0.0
+    bid_add = float(out.get("bid_replenished_5s") or 0.0)
+    ask_add = float(out.get("ask_replenished_5s") or 0.0)
+    bid_cx = float(out.get("bid_cancelled_5s") or 0.0)
+    ask_cx = float(out.get("ask_cancelled_5s") or 0.0)
+    # SELL absorption: aggressive sells but price fails down and bids refill.
+    sell_abs = 0.0
+    if sell_vol > 0:
+        flow_share = sell_vol / (sell_vol + buy_vol + 1e-9)
+        price_held = 1.0 if ret_5 > -0.00015 else max(0.0, 1.0 + ret_5 / 0.0004)
+        replenish = 1.0 if bid_add > bid_cx else 0.35
+        sell_abs = min(1.0, flow_share * price_held * replenish)
+        if ret_5 <= -0.0004:
+            sell_abs *= 0.25
+    buy_abs = 0.0
+    if buy_vol > 0:
+        flow_share = buy_vol / (sell_vol + buy_vol + 1e-9)
+        price_held = 1.0 if ret_5 < 0.00015 else max(0.0, 1.0 - ret_5 / 0.0004)
+        replenish = 1.0 if ask_add > ask_cx else 0.35
+        buy_abs = min(1.0, flow_share * price_held * replenish)
+        if ret_5 >= 0.0004:
+            buy_abs *= 0.25
+    spread = float(out.get("spread_pct") or 0.0)
+    near_touch_loss = 0.0
+    if len(win) >= 3:
+        b0 = sum(sz for _, sz in first.bids_top10[:3])
+        b1 = sum(sz for _, sz in last.bids_top10[:3])
+        a0 = sum(sz for _, sz in first.asks_top10[:3])
+        a1 = sum(sz for _, sz in last.asks_top10[:3])
+        if b0 + a0 > 0:
+            near_touch_loss = max(0.0, 1.0 - (b1 + a1) / (b0 + a0))
+    cancel_imb = 0.0
+    if bid_cx + ask_cx > 0:
+        cancel_imb = (ask_cx - bid_cx) / (bid_cx + ask_cx)
+    fragility = max(0.0, min(1.0, 0.45 * near_touch_loss + 0.25 * min(1.0, spread / 0.0008) + 0.30 * max(0.0, -float(out.get("obi_l1") or 0.0))))
+    mp = float(out.get("microprice_pressure") or 0.0)
+    flow = float(out.get("agg_flow_imbalance_5s") or 0.0)
+    adverse = max(0.0, min(1.0, 0.30 * fragility + 0.25 * max(0.0, -mp * 400.0) + 0.20 * max(0.0, -flow) + 0.25 * near_touch_loss))
+    trades_1 = _window(trade_samples, now_ts, 1.0)
+    trades_15 = _window(trade_samples, now_ts, 15.0)
+    out["bid_absorption_score"] = round(sell_abs, 4)
+    out["ask_absorption_score"] = round(buy_abs, 4)
+    out["depth_fragility"] = round(fragility, 4)
+    out["near_touch_depth_loss"] = round(near_touch_loss, 4)
+    out["cancel_imbalance_5s"] = round(cancel_imb, 4)
+    out["adverse_selection_score"] = round(adverse, 4)
+    out["p_adverse_move"] = round(adverse, 4)
+    out["trade_count_5s"] = trade_n
+    out["avg_trade_size_5s"] = round(avg_sz, 8)
+    out["trade_count_1s"] = len(trades_1)
+    out["trade_count_15s"] = len(trades_15)
+    out["signed_volume_5s"] = round(buy_vol - sell_vol, 8)
+    out["flow_acceleration"] = round(float(out.get("agg_flow_imbalance_1s") or 0.0) - float(out.get("agg_flow_imbalance_5s") or 0.0), 6)
+    out["microprice_accel"] = 0.0
+    if len(win) >= 2:
+        mp0 = microprice(first.bid_px, first.bid_sz, first.ask_px, first.ask_sz)
+        m0 = (first.bid_px + first.ask_px) / 2.0
+        p0 = ((mp0 - m0) / m0) if m0 > 0 else 0.0
+        out["microprice_accel"] = round(mp - p0, 8)
+    out["l1_liquidity_ratio"] = round((latest.bid_sz / latest.ask_sz) if latest.ask_sz > 0 else 0.0, 6)
+    # Weighted depth imbalance L20 using available top-10 as proxy when L20 missing.
+    bid_w = sum(sz / (i + 1) for i, (_, sz) in enumerate(latest.bids_top10))
+    ask_w = sum(sz / (i + 1) for i, (_, sz) in enumerate(latest.asks_top10))
+    tot_w = bid_w + ask_w
+    out["weighted_depth_imbalance"] = round(((bid_w - ask_w) / tot_w) if tot_w > 0 else 0.0, 6)
 
 
 def _window_tag(w: float) -> str:
@@ -434,14 +521,21 @@ def get_microstructure_ranking_delta(symbol: str) -> float:
         ofi_5s = float(feats.get("ofi_5s", 0.0))
         mp_pressure = float(feats.get("microprice_pressure", 0.0))
         agg_flow_5s = float(feats.get("agg_flow_imbalance_5s", 0.0))
+        absorp = float(feats.get("bid_absorption_score") or 0.0) - float(feats.get("ask_absorption_score") or 0.0)
+        adverse = float(feats.get("adverse_selection_score") or 0.0)
 
         # OFI has no fixed scale (depends on symbol's typical top-of-book size),
         # so squash with tanh using a fixed soft scale of 5 base-asset units.
         ofi_signed = math.tanh(ofi_5s / 5.0) if abs(ofi_5s) > 1e-9 else 0.0
 
-        # Robust, monotonic composite: OFI direction + real aggressor flow +
-        # microprice pressure (size-weighted quote pulling away from mid).
-        signal = (0.40 * ofi_signed) + (0.30 * agg_flow_5s) + (0.30 * math.tanh(mp_pressure * 500.0))
+        # Composite remains ranking-only. Adverse selection is a penalty, not a gate.
+        signal = (
+            (0.32 * ofi_signed)
+            + (0.22 * agg_flow_5s)
+            + (0.22 * math.tanh(mp_pressure * 500.0))
+            + (0.14 * max(-1.0, min(1.0, absorp)))
+            - (0.10 * (2.0 * adverse - 0.5))
+        )
         delta = max(-_RANKING_DELTA_CAP, min(_RANKING_DELTA_CAP, signal * _RANKING_DELTA_CAP))
         return round(delta, 6)
     except Exception:
@@ -570,6 +664,9 @@ async def publish_to_redis_async(symbol: str, redis_client: Any, *, ttl_sec: int
             "microprice_pressure": str(feats.get("microprice_pressure", 0.0)),
             "ofi_5s": str(feats.get("ofi_5s", 0.0)),
             "agg_flow_imbalance_5s": str(feats.get("agg_flow_imbalance_5s", 0.0)),
+            "adverse_selection_score": str(feats.get("adverse_selection_score", 0.0)),
+            "bid_absorption_score": str(feats.get("bid_absorption_score", 0.0)),
+            "ask_absorption_score": str(feats.get("ask_absorption_score", 0.0)),
             "microstructure_ranking_delta": str(get_microstructure_ranking_delta(symbol)),
             "microstructure_json": _json.dumps(feats, default=str)[:4000],
         }

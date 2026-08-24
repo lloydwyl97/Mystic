@@ -267,7 +267,13 @@ class OrderBookService:
             await self.redis.close()
         logger.info("OrderBookService stopped")
 
-    async def process_order_book(self, symbol: str, bids: list[list[float]], asks: list[list[float]]) -> None:
+    async def process_order_book(
+        self,
+        symbol: str,
+        bids: list[list[float]],
+        asks: list[list[float]],
+        last_update_id: int | None = None,
+    ) -> None:
         """
         Process order book update from Binance WebSocket
 
@@ -289,6 +295,7 @@ class OrderBookService:
                 "bids": bids,
                 "asks": asks,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "last_update_id": last_update_id,
             }
             self.last_update[symbol] = datetime.now(timezone.utc)
 
@@ -314,6 +321,13 @@ class OrderBookService:
 
                 record_snapshot(symbol, bids, asks)
                 await publish_to_redis_async(symbol, self.redis)
+            with contextlib.suppress(Exception):
+                from backend.services.binance_scalp.l2_book import apply_partial_snapshot
+                from backend.services.binance_scalp.scalp_micro_latency import timed
+
+                done = timed("ws_to_local_book")
+                apply_partial_snapshot(symbol, bids, asks, last_update_id)
+                done()
 
             self.stats["updates_processed"] += 1
             self.stats["features_calculated"] += 1

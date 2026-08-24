@@ -64,6 +64,10 @@ Active keys to preserve: all four `ai_signal:day:*` and `ai_context:*` for top-4
 
 Shared cadence constants: `backend/config/mystic_api_schedule.py`
 
+## SCALP microstructure
+
+See `docs/SCALP_MICROSTRUCTURE.md`. Exit review cadence `SCALP_EXIT_INTERVAL_SEC` (default 0.25s); rank cadence `SCALP_RANK_INTERVAL_SEC` (default 1s). Do not set `SCALP_LOOP_SEC=0.1`.
+
 ## Backup reference
 
 Final cleanup backup (2026-05-24):  

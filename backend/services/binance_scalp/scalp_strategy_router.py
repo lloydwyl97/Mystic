@@ -348,6 +348,26 @@ class ScalpStrategyRouter:
         meta["regime_mismatch"] = bool(best_ranked.regime_mismatch)
         meta["symbol_stall_risk"] = bool(best_ranked.symbol_stall_risk)
         meta["microstructure_adjustment"] = float(best_ranked.microstructure_adjustment)
+        micro_q = 1.0
+        with contextlib.suppress(Exception):
+            ctx_micro = (best_ranked.signal.setup_context or {}) if best_ranked.signal else {}
+            adverse = float(ctx_micro.get("p_adverse_move") or ctx_micro.get("adverse_selection_score") or 0.0)
+            ev10 = float(ctx_micro.get("EV_10s") or 0.0)
+            from backend.services.binance_scalp.config import get_scalp_config
+            from backend.services.binance_scalp.scalp_micro_learning import micro_learning_adjustments
+            from backend.services.microstructure_engine import compute_features
+
+            mf = compute_features(sym) or {}
+            learned = micro_learning_adjustments(
+                get_scalp_config().database_path,
+                symbol=sym,
+                ofi_5s=float(mf.get("ofi_5s") or 0.0),
+                obi_l5=float(mf.get("obi_l5") or 0.0),
+                adverse_selection_score=float(mf.get("adverse_selection_score") or 0.0),
+            )
+            micro_q = float(learned.get("size_mult") or 1.0)
+            micro_q *= max(0.70, min(1.15, 1.0 - 0.35 * adverse + 200.0 * ev10))
+        meta["micro_quality_mult"] = round(max(0.70, min(1.15, micro_q)), 4)
         meta["strategy_passed"] = bool(best_ranked.signal.passed)
         meta["entry_owner"] = "strategy" if best_ranked.signal.passed else "ranking_ev"
         meta["ml_role"] = "rank_size"

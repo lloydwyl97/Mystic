@@ -158,13 +158,18 @@ class OrderBookCollector:
 
             top_bids = [[float(b[0]), float(b[1])] for b in bids]
             top_asks = [[float(a[0]), float(a[1])] for a in asks]
+            last_update_id = update.get("lastUpdateId")
+            try:
+                last_update_id = int(last_update_id) if last_update_id is not None else None
+            except (TypeError, ValueError):
+                last_update_id = None
 
             # Forward to order book service for processing
             # Ensure service is started before processing
             if not order_book_service.is_running:
                 logger.info(f"Starting OrderBookService for first message from {symbol}")
                 await order_book_service.start()
-            await order_book_service.process_order_book(symbol, top_bids, top_asks)
+            await order_book_service.process_order_book(symbol, top_bids, top_asks, last_update_id=last_update_id)
 
             self.stats["messages_received"] += 1
             self.stats["order_books_processed"] += 1

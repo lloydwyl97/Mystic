@@ -28,10 +28,11 @@ def main() -> int:
             cfg.calibration_profile,
             cfg.products,
         )
-    loop_sec = float(os.getenv("SCALP_LOOP_SEC", "5"))
+    loop_sec = float(os.getenv("SCALP_RANK_INTERVAL_SEC", os.getenv("SCALP_LOOP_SEC", "1")))
+    exit_sec = float(os.getenv("SCALP_EXIT_INTERVAL_SEC", "0.25"))
     engine = BinanceScalpPaperEngine()
     try:
-        engine.run_loop(interval_sec=loop_sec)
+        engine.run_loop(interval_sec=loop_sec, exit_interval_sec=exit_sec)
     except KeyboardInterrupt:
         logger.info("scalp paper interrupted")
     finally:

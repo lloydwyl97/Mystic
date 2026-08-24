@@ -33,7 +33,7 @@ def test_exit_runs_before_ranking_in_tick():
     from backend.services.binance_scalp import paper_engine as pe
 
     src = open(pe.__file__, encoding="utf-8").read()
-    tick_at = src.find("def tick(self)")
+    tick_at = src.find("def tick(")
     early = src.find("self._exit_open_positions_now()", tick_at)
     ranking = src.find("self._router.evaluate_all(", tick_at)
     klines = src.find("self._klines.get(", tick_at)

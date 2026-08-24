@@ -115,6 +115,7 @@ def compute_scalp_position_size(
     impact_pct: float = 0.0,
     realized_volatility_pct: float | None = None,
     calibration_mult: float = 1.0,
+    micro_quality_mult: float = 1.0,
 ) -> SizingResult:
     """Compute the EV-scaled notional for one SCALP entry.
 
@@ -136,8 +137,9 @@ def compute_scalp_position_size(
     vol_adj = _volatility_adjustment(realized_volatility_pct)
     liq_adj = _liquidity_adjustment(spread_pct, impact_pct)
     cal_adj = _clamp(float(calibration_mult), 0.05, 1.0)
+    micro_adj = _clamp(float(micro_quality_mult), 0.70, 1.15)
 
-    combined = confidence_factor * _clamp(arm_penalty_mult, 0.05, 1.0) * _clamp(mtf_penalty_mult, 0.05, 1.0) * vol_adj * liq_adj * cal_adj
+    combined = confidence_factor * _clamp(arm_penalty_mult, 0.05, 1.0) * _clamp(mtf_penalty_mult, 0.05, 1.0) * vol_adj * liq_adj * cal_adj * micro_adj
     combined = max(combined, _min_sizing_multiplier())
 
     raw_notional = float(base_cap) * combined
@@ -146,7 +148,7 @@ def compute_scalp_position_size(
 
     reasoning = (
         f"conf={confidence_factor:.3f} arm={arm_penalty_mult:.3f} mtf={mtf_penalty_mult:.3f} "
-        f"vol_adj={vol_adj:.3f} liq_adj={liq_adj:.3f} cal_adj={cal_adj:.3f} combined={combined:.3f} "
+        f"vol_adj={vol_adj:.3f} liq_adj={liq_adj:.3f} cal_adj={cal_adj:.3f} micro_adj={micro_adj:.3f} combined={combined:.3f} "
         f"base_cap={base_cap:.2f} -> notional={notional:.2f}"
     )
     return SizingResult(

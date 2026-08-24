@@ -1214,6 +1214,7 @@ class BinanceScalpPaperEngine:
             impact_pct=float(getattr(sig, "impact_pct", 0.0) or 0.0),
             realized_volatility_pct=realized_vol,
             calibration_mult=cal_mult,
+            micro_quality_mult=float(ranking_meta_for_size.get("micro_quality_mult", 1.0) or 1.0),
         )
         notional = sizing.notional
         if notional < 1.0:
@@ -1279,6 +1280,30 @@ class BinanceScalpPaperEngine:
             entry_diag["scalp_setup"] = entry_intel.get("scalp_setup")
         if entry_intel.get("micro_regime"):
             entry_diag["micro_regime"] = entry_intel.get("micro_regime")
+        with contextlib.suppress(Exception):
+            from backend.services.binance_scalp.scalp_micro_contract import version_stamps
+
+            entry_diag.update(version_stamps())
+            ctx = sig.setup_context or {}
+            for k in (
+                "microstructure_features",
+                "EV_1s",
+                "EV_5s",
+                "EV_10s",
+                "EV_30s",
+                "EV_60s",
+                "p_positive_executable_net_5s",
+                "p_positive_executable_net_10s",
+                "p_positive_executable_net_30s",
+                "p_adverse_move",
+                "adverse_selection_score",
+                "selection_micro_score",
+                "calibration_status",
+            ):
+                if ctx.get(k) is not None:
+                    entry_diag[k] = ctx.get(k)
+            if ctx.get("microstructure_features"):
+                entry_diag.update({f"micro_{kk}": vv for kk, vv in (ctx.get("microstructure_features") or {}).items()})
 
         # Entry-time market-role context (Redis — cross-process; for learning attribution)
         _role_ctx_snap = "{}"
@@ -1416,6 +1441,21 @@ class BinanceScalpPaperEngine:
                 },
             )
             logger.info("SCALP_PAPER_BUY %s setup=%s qty=%.8f price=%.4f", sym, sig.setup_name, qty, limit_buy)
+            with contextlib.suppress(Exception):
+                from backend.services.binance_scalp.scalp_markout import schedule_markout
+
+                schedule_markout(
+                    kind="entry",
+                    symbol=sym,
+                    side="BUY",
+                    mid=float(snap.mid or limit_buy),
+                    entry_px=float(limit_buy),
+                    qty=float(qty),
+                    notional=float(notional),
+                    fee_pct=float(self.econ.entry_fee_pct() + self.econ.exit_fee_pct()),
+                    slip_pct=float(self.econ.slippage_buffer_pct),
+                    extra=dict((sig.setup_context or {}).get("microstructure_features") or {}),
+                )
             set_entry_armed(self._redis, prefix=self.config.redis_key_prefix, armed=False)
             with contextlib.suppress(Exception):
                 from backend.services.scalp_gate_telemetry import record_gate_event
@@ -2205,7 +2245,21 @@ class BinanceScalpPaperEngine:
             except Exception as exc:
                 logger.warning("SCALP_POST_COMMIT_HOOK_FAILED %s", exc)
 
-    def tick(self) -> None:
+    def _observe_markouts(self, snaps: dict) -> None:
+        with contextlib.suppress(Exception):
+            from backend.services.binance_scalp.scalp_markout import flush_completed, observe_book
+
+            for sym, snap in snaps.items():
+                observe_book(
+                    sym,
+                    bid=float(getattr(snap, "best_bid", 0.0) or 0.0),
+                    ask=float(getattr(snap, "best_ask", 0.0) or 0.0),
+                    bids=getattr(snap, "bids", None),
+                    asks=getattr(snap, "asks", None),
+                )
+            flush_completed(self.config.database_path)
+
+    def tick(self, *, rank: bool = True) -> None:
         self.config.assert_no_live_trading()
         if self.config.scalp_paper_enabled and self.config.scalp_paper_auto_arm:
             set_entry_armed(
@@ -2215,28 +2269,30 @@ class BinanceScalpPaperEngine:
                 persistent=True,
             )
         # Publish before heavy REST/klines so snapshot cannot go missing mid-tick.
-        with contextlib.suppress(Exception):
-            from backend.services.binance_scalp.scalp_post_exit_path import fill_due_post_exit_paths
+        # Exit-only ticks skip opportunity labeling / kline-adjacent work.
+        if rank:
+            with contextlib.suppress(Exception):
+                from backend.services.binance_scalp.scalp_post_exit_path import fill_due_post_exit_paths
 
-            fill_due_post_exit_paths(self.config.database_path, self.reader, now_epoch=time.time())
-        with contextlib.suppress(Exception):
-            from backend.services.binance_scalp.scalp_opportunity_dataset import label_due_opportunities
+                fill_due_post_exit_paths(self.config.database_path, self.reader, now_epoch=time.time())
+            with contextlib.suppress(Exception):
+                from backend.services.binance_scalp.scalp_opportunity_dataset import label_due_opportunities
 
-            label_due_opportunities(self.config.database_path, self.reader, now_epoch=time.time())
-        with contextlib.suppress(Exception):
-            pre_open: list[sqlite3.Row] = []
-            try:
-                with self._conn() as _c:
-                    pre_open = self._open_positions(_c)
-            except Exception:
-                pre_open = []
-            blocked = "MAX_OPEN_POSITIONS" if pre_open and len(pre_open) >= int(self.config.max_open_positions) else None
-            self._publish_api_status_snapshot(
-                open_rows=pre_open,
-                epoch=time.time(),
-                entry_blocked_reason=blocked,
-                snapshot_source="runner_tick_start",
-            )
+                label_due_opportunities(self.config.database_path, self.reader, now_epoch=time.time())
+            with contextlib.suppress(Exception):
+                pre_open: list[sqlite3.Row] = []
+                try:
+                    with self._conn() as _c:
+                        pre_open = self._open_positions(_c)
+                except Exception:
+                    pre_open = []
+                blocked = "MAX_OPEN_POSITIONS" if pre_open and len(pre_open) >= int(self.config.max_open_positions) else None
+                self._publish_api_status_snapshot(
+                    open_rows=pre_open,
+                    epoch=time.time(),
+                    entry_blocked_reason=blocked,
+                    snapshot_source="runner_tick_start",
+                )
         if not self.config.scalp_paper_enabled:
             with self._conn() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -2275,7 +2331,14 @@ class BinanceScalpPaperEngine:
             self._write_market_cache(snap)
 
         # Existing -15 bp authority must see the book before ranking work.
+        from backend.services.binance_scalp.scalp_micro_latency import timed
+
+        _exit_done = timed("event_to_exit_review")
         self._exit_open_positions_now()
+        _exit_done()
+        self._observe_markouts(snaps)
+        if not rank:
+            return
 
         for sym, snap in snaps.items():
             bars = self._klines.get(sym)
@@ -2295,6 +2358,25 @@ class BinanceScalpPaperEngine:
             pre_ranked = []
         self._pending_opportunity_rows = pre_ranked
         self._pending_opportunity_epoch = epoch
+        with contextlib.suppress(Exception):
+            from backend.services.binance_scalp.scalp_markout import schedule_markout
+
+            for row in pre_ranked:
+                snap = snaps.get(str(row.get("symbol") or ""))
+                if snap is None:
+                    continue
+                schedule_markout(
+                    kind="candidate",
+                    symbol=str(row.get("symbol") or ""),
+                    side="BUY",
+                    mid=float(getattr(snap, "mid", 0.0) or 0.0),
+                    entry_px=float(getattr(snap, "best_ask", 0.0) or getattr(snap, "mid", 0.0) or 0.0),
+                    qty=0.0,
+                    notional=float(notional),
+                    fee_pct=float(self.econ.entry_fee_pct() + self.econ.exit_fee_pct()),
+                    slip_pct=float(self.econ.slippage_buffer_pct),
+                    extra={"rank_score": row.get("rank_score")},
+                )
 
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -2359,7 +2441,7 @@ class BinanceScalpPaperEngine:
                 include_pnl=True,
             )
 
-    def run_loop(self, interval_sec: float = 5.0) -> None:
+    def run_loop(self, interval_sec: float = 5.0, exit_interval_sec: float | None = None) -> None:
         if not self.config.scalp_paper_enabled:
             logger.error("Scalp paper loop idle: SCALP_PAPER_ENABLED=false (set true in .env and restart)")
             while True:
@@ -2424,12 +2506,19 @@ class BinanceScalpPaperEngine:
         maybe_run_scalp_reject_retention(self.config.database_path)
         maybe_run_scalp_position_housekeeping(self.config.database_path)
 
+        exit_sec = float(exit_interval_sec) if exit_interval_sec is not None else float(os.getenv("SCALP_EXIT_INTERVAL_SEC", "0.25"))
+        rank_sec = float(interval_sec)
+        last_rank = 0.0
         try:
             while True:
                 try:
-                    self.tick()
-                    maybe_run_scalp_reject_retention(self.config.database_path)
-                    maybe_run_scalp_position_housekeeping(self.config.database_path)
+                    now = time.time()
+                    do_rank = (now - last_rank) >= rank_sec
+                    self.tick(rank=do_rank)
+                    if do_rank:
+                        last_rank = now
+                        maybe_run_scalp_reject_retention(self.config.database_path)
+                        maybe_run_scalp_position_housekeeping(self.config.database_path)
                 except Exception as exc:
                     logger.exception("scalp paper tick error: %s", exc)
                     with contextlib.suppress(Exception):
@@ -2445,7 +2534,7 @@ class BinanceScalpPaperEngine:
                     beat_sync("scalp_runner:tick", self._redis, extra={"products": ",".join(self.config.products)})
                 except Exception:
                     pass
-                time.sleep(interval_sec)
+                time.sleep(max(0.05, min(exit_sec, rank_sec)))
         finally:
             self._heartbeat_stop = True
             self.shutdown()
