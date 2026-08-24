@@ -1299,6 +1299,8 @@ class BinanceScalpPaperEngine:
                 "adverse_selection_score",
                 "selection_micro_score",
                 "calibration_status",
+                "final_micro_rank_delta",
+                "learned_adjustment",
             ):
                 if ctx.get(k) is not None:
                     entry_diag[k] = ctx.get(k)
@@ -1396,6 +1398,8 @@ class BinanceScalpPaperEngine:
                                     "p_adverse_move",
                                     "selection_micro_score",
                                     "calibration_status",
+                                    "final_micro_rank_delta",
+                                    "learned_adjustment",
                                 )
                                 if k in entry_diag
                             },
@@ -1467,6 +1471,12 @@ class BinanceScalpPaperEngine:
             with contextlib.suppress(Exception):
                 from backend.services.binance_scalp.scalp_markout import schedule_markout
 
+                from backend.services.binance_scalp.scalp_micro_contract import feature_context_extra
+                from backend.services.microstructure_engine import compute_features
+
+                _ctx = sig.setup_context or {}
+                _mf = dict(compute_features(sym) or {})
+                _mf.update(dict(_ctx.get("microstructure_features") or {}))
                 schedule_markout(
                     kind="entry",
                     symbol=sym,
@@ -1477,7 +1487,16 @@ class BinanceScalpPaperEngine:
                     notional=float(notional),
                     fee_pct=float(self.econ.entry_fee_pct() + self.econ.exit_fee_pct()),
                     slip_pct=float(self.econ.slippage_buffer_pct),
-                    extra=dict((sig.setup_context or {}).get("microstructure_features") or {}),
+                    extra=feature_context_extra(
+                        _mf,
+                        {
+                            "trade_id": trade_id,
+                            "rank_score": ranking_meta.get("rank_score"),
+                            "final_micro_rank_delta": _ctx.get("final_micro_rank_delta"),
+                            "learned_adjustment": _ctx.get("learned_adjustment"),
+                            "decision_epoch": epoch,
+                        },
+                    ),
                 )
             set_entry_armed(self._redis, prefix=self.config.redis_key_prefix, armed=False)
             with contextlib.suppress(Exception):
@@ -2393,9 +2412,14 @@ class BinanceScalpPaperEngine:
                 snap = snaps.get(str(row.get("symbol") or ""))
                 if snap is None:
                     continue
+                from backend.services.binance_scalp.scalp_micro_contract import feature_context_extra
+                from backend.services.microstructure_engine import compute_features
+
+                _sym = str(row.get("symbol") or "")
+                _mf = compute_features(_sym) or {}
                 schedule_markout(
                     kind="candidate",
-                    symbol=str(row.get("symbol") or ""),
+                    symbol=_sym,
                     side="BUY",
                     mid=float(getattr(snap, "mid", 0.0) or 0.0),
                     entry_px=float(getattr(snap, "best_ask", 0.0) or getattr(snap, "mid", 0.0) or 0.0),
@@ -2403,7 +2427,15 @@ class BinanceScalpPaperEngine:
                     notional=float(notional),
                     fee_pct=float(self.econ.entry_fee_pct() + self.econ.exit_fee_pct()),
                     slip_pct=float(self.econ.slippage_buffer_pct),
-                    extra={"rank_score": row.get("rank_score")},
+                    extra=feature_context_extra(
+                        _mf,
+                        {
+                            "rank_score": row.get("rank_score"),
+                            "decision_epoch": epoch,
+                            "entry_eligible": bool(row.get("entry_eligible")),
+                            "final_micro_rank_delta": row.get("microstructure_adjustment"),
+                        },
+                    ),
                 )
 
         with self._conn() as conn:

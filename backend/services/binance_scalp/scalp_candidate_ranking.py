@@ -634,10 +634,13 @@ def prepare_entry_signal(
         _mf = compute_features(sig.symbol) or {}
         _ev = multi_horizon_ev(_mf)
         ctx_map.update(version_stamps())
+        ctx_map["final_micro_rank_delta"] = float(ranked.microstructure_adjustment)
+        ctx_map["learned_adjustment"] = float(ranked.learned_adjustment)
         ctx_map["microstructure_features"] = {
             k: _mf.get(k)
             for k in (
                 "ofi_1s",
+                "ofi_3s",
                 "ofi_5s",
                 "ofi_15s",
                 "ofi_30s",
@@ -649,6 +652,7 @@ def prepare_entry_signal(
                 "microprice_pressure",
                 "microprice_accel",
                 "agg_flow_imbalance_5s",
+                "trade_count_5s",
                 "signed_volume_5s",
                 "bid_cancelled_5s",
                 "ask_cancelled_5s",

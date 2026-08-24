@@ -82,9 +82,156 @@ def version_stamps() -> dict[str, str]:
     }
 
 
+MARKOUT_FEATURE_KEYS: tuple[str, ...] = (
+    "ofi_1s",
+    "ofi_3s",
+    "ofi_5s",
+    "ofi_15s",
+    "ofi_30s",
+    "obi_l1",
+    "obi_l5",
+    "obi_l10",
+    "obi_l20",
+    "microprice_pressure",
+    "agg_flow_imbalance_5s",
+    "trade_count_5s",
+    "signed_volume_5s",
+    "bid_cancelled_5s",
+    "ask_cancelled_5s",
+    "bid_replenished_5s",
+    "ask_replenished_5s",
+    "bid_absorption_score",
+    "ask_absorption_score",
+    "depth_fragility",
+    "adverse_selection_score",
+    "p_adverse_move",
+    "spread_pct",
+    "ranking_delta",
+    "cross_venue_dislocation_bps",
+    "spot_perp_basis_bps",
+)
+
+
+def _f(raw: Any, default: float = 0.0) -> float:
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def label_ofi_bucket(ofi: float) -> str:
+    if ofi >= 1.0:
+        return "strongly_positive"
+    if ofi >= 0.15:
+        return "positive"
+    if ofi > -0.15:
+        return "neutral"
+    if ofi > -1.0:
+        return "negative"
+    return "strongly_negative"
+
+
+def label_obi_bucket(obi: float) -> str:
+    if obi >= 0.50:
+        return "strongly_positive"
+    if obi >= 0.15:
+        return "positive"
+    if obi > -0.15:
+        return "neutral"
+    if obi > -0.50:
+        return "negative"
+    return "strongly_negative"
+
+
+def label_microprice_bucket(pressure: float) -> str:
+    if pressure > 1e-6:
+        return "favorable"
+    if pressure < -1e-6:
+        return "adverse"
+    return "neutral"
+
+
+def label_adverse_bucket(score: float) -> str:
+    if score >= 0.45:
+        return "high"
+    if score >= 0.20:
+        return "medium"
+    return "low"
+
+
+def label_agg_flow_bucket(flow: float) -> str:
+    if flow > 0.15:
+        return "buying"
+    if flow < -0.15:
+        return "selling"
+    return "neutral"
+
+
+def label_absorption_bucket(bid_abs: float, ask_abs: float) -> str:
+    net = bid_abs - ask_abs
+    if net > 0.15:
+        return "supportive"
+    if net < -0.15:
+        return "adverse"
+    return "neutral"
+
+
+def feature_context_extra(feats: dict[str, Any] | None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Dataset labels + raw features for markouts. Never a permission gate."""
+    src = dict(feats or {})
+    out = dict(extra or {})
+    out.update(version_stamps())
+    for key in MARKOUT_FEATURE_KEYS:
+        if key in src and src[key] is not None:
+            out[key] = src[key]
+    ofi = _f(out.get("ofi_5s") if out.get("ofi_5s") is not None else src.get("ofi_5s"))
+    obi = _f(out.get("obi_l5") if out.get("obi_l5") is not None else src.get("obi_l5") or src.get("obi_l1"))
+    pressure = _f(out.get("microprice_pressure") if out.get("microprice_pressure") is not None else src.get("microprice_pressure"))
+    adverse = _f(out.get("adverse_selection_score") if out.get("adverse_selection_score") is not None else src.get("adverse_selection_score"))
+    flow = _f(out.get("agg_flow_imbalance_5s") if out.get("agg_flow_imbalance_5s") is not None else src.get("agg_flow_imbalance_5s"))
+    out["ofi_bucket"] = label_ofi_bucket(ofi)
+    out["obi_bucket"] = label_obi_bucket(obi)
+    out["microprice_bucket"] = label_microprice_bucket(pressure)
+    out["adverse_bucket"] = label_adverse_bucket(adverse)
+    out["agg_flow_bucket"] = label_agg_flow_bucket(flow)
+    out["absorption_bucket"] = label_absorption_bucket(
+        _f(src.get("bid_absorption_score")),
+        _f(src.get("ask_absorption_score")),
+    )
+    if src.get("symbol") is not None:
+        out.setdefault("symbol", src.get("symbol"))
+    if src.get("ts") is not None:
+        out.setdefault("decision_ts", src.get("ts"))
+    return out
+
+
+def buy_microstructure_invariant_violations(diag: dict[str, Any] | None) -> list[str]:
+    """Return missing/wrong BUY stamp fields. Empty list means the invariant holds."""
+    d = dict(diag or {})
+    setup = (d.get("setup") or {}).get("setup_context") or d.get("setup_context") or {}
+    violations: list[str] = []
+    micro_ver = d.get("microstructure_version") or setup.get("microstructure_version")
+    feature_set = d.get("feature_set_version") or setup.get("feature_set_version")
+    model = d.get("model_version") or setup.get("model_version")
+    feats = d.get("microstructure_features") or setup.get("microstructure_features") or {}
+    if micro_ver != MICROSTRUCTURE_VERSION:
+        violations.append(f"microstructure_version={micro_ver!r}")
+    if feature_set != FEATURE_SET_VERSION:
+        violations.append(f"feature_set_version={feature_set!r}")
+    if model != MODEL_VERSION:
+        violations.append(f"model_version={model!r}")
+    if not isinstance(feats, dict) or not feats:
+        violations.append("microstructure_features_empty")
+    ev10 = d.get("EV_10s") if d.get("EV_10s") is not None else setup.get("EV_10s")
+    if ev10 is None:
+        violations.append("EV_10s_missing")
+    return violations
+
+
 __all__ = [
     "EV_HORIZONS_SEC",
     "FEATURE_SET_VERSION",
+    "MARKOUT_FEATURE_KEYS",
     "MARKOUT_HORIZONS_SEC",
     "MICROSTRUCTURE_VERSION",
     "MICRO_FEATURE_NAMES",
@@ -92,6 +239,14 @@ __all__ = [
     "MODEL_VERSION",
     "SCALP_FEATURE_VERSION",
     "SELECTION_VERSION",
+    "buy_microstructure_invariant_violations",
     "extract_micro_vector",
+    "feature_context_extra",
+    "label_absorption_bucket",
+    "label_adverse_bucket",
+    "label_agg_flow_bucket",
+    "label_microprice_bucket",
+    "label_obi_bucket",
+    "label_ofi_bucket",
     "version_stamps",
 ]
