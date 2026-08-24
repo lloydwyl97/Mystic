@@ -646,7 +646,7 @@ class BinanceScalpPaperEngine:
             return True
         return is_entry_armed(self._redis, prefix=self.config.redis_key_prefix)
 
-    def _check_scalp_circuit_breaker(self) -> bool:
+    def _check_scalp_circuit_breaker(self, conn: sqlite3.Connection | None = None) -> bool:
         """Check SCALP-specific circuit breaker. Returns True if circuit is open (halt new entries).
 
         Two independent conditions trigger the breaker:
@@ -659,11 +659,17 @@ class BinanceScalpPaperEngine:
         SELL rows stay in the book. A restart reads the persisted cooldown so an
         active trip cannot be erased. Daily-loss protection is not merged into
         this cooldown. SCALP_CIRCUIT_BREAKER_EPOCH remains an operator floor.
+
+        When the paper tick already holds BEGIN IMMEDIATE, pass that connection.
+        Opening a second writer to expire the cooldown fail-closes on 'database is locked'
+        and the breaker never recovers.
         """
         self._last_breaker_reason = ""
         self._last_breaker_recovery_until = ""
         self._last_breaker_eval_after = ""
         try:
+            if conn is not None:
+                return self._evaluate_scalp_circuit_breaker(conn)
             return run_locked_retry(self._evaluate_scalp_circuit_breaker)
         except sqlite3.OperationalError as e:
             self._last_breaker_reason = "SCALP_BREAKER_STATE_UNAVAILABLE"
@@ -675,7 +681,7 @@ class BinanceScalpPaperEngine:
             logger.error("[SCALP_CIRCUIT_BREAKER] Check failed (fail-closed): %s", e)
             return True
 
-    def _evaluate_scalp_circuit_breaker(self) -> bool:
+    def _evaluate_scalp_circuit_breaker(self, conn: sqlite3.Connection | None = None) -> bool:
         try:
             now = self._utcnow()
             today = now.strftime("%Y-%m-%d")
@@ -683,7 +689,10 @@ class BinanceScalpPaperEngine:
             recovery_sec = int(getattr(self.config, "breaker_recovery_sec", 14400) or 14400)
             if recovery_sec < 0:
                 recovery_sec = 0
-            with self._conn() as conn:
+            owned = conn is None
+            if owned:
+                conn = self._conn()
+            try:
                 ledger = self._ledger(conn)
                 principal = float(ledger["principal"])
 
@@ -812,6 +821,12 @@ class BinanceScalpPaperEngine:
 
                 self._last_breaker_eval_after = eval_after
                 return False
+            finally:
+                if owned:
+                    with contextlib.suppress(Exception):
+                        conn.commit()
+                    with contextlib.suppress(Exception):
+                        conn.close()
         except Exception:
             raise
 
@@ -1146,7 +1161,7 @@ class BinanceScalpPaperEngine:
             self._record_gate(gate_id="CASH_OR_SLOTS", reason="MAX_OPEN_POSITIONS", detail=f"open={open_count} reserved={pending_slots}")
             return
 
-        breaker_open = self._check_scalp_circuit_breaker()
+        breaker_open = self._check_scalp_circuit_breaker(conn)
         self._last_circuit_breaker_open = bool(breaker_open)
         # Measure and store every cycle even when the breaker blocks execution.
         candidates = self._entry_candidates(conn, pre_ranked=pre_ranked)

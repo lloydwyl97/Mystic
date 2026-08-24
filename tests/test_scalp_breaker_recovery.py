@@ -150,6 +150,55 @@ def test_restart_after_recovery_does_not_resurrect_trip(tmp_path: Path):
     assert engine._last_breaker_reason != "CONSECUTIVE_LOSSES_COOLDOWN"
 
 
+def test_recovery_on_tick_connection_while_write_lock_held(tmp_path: Path):
+    """Expire must use the tick's BEGIN IMMEDIATE conn; a second writer fail-closes."""
+    from backend.services.binance_scalp.paper_engine import BinanceScalpPaperEngine
+
+    db = tmp_path / "scalp.db"
+    now = datetime(2026, 8, 24, 13, 40, 23, tzinfo=timezone.utc)
+    _seed(db, [(-0.05, f"2026-08-24 13:3{i}:00") for i in range(5)])
+    assert _probe(db, now=now, max_consec=5, recovery_sec=14400)[0] is True
+    after = now + timedelta(hours=4, seconds=30)
+
+    locker = sqlite3.connect(str(db), timeout=0.1)
+    locker.execute("BEGIN IMMEDIATE")
+    try:
+        locked_engine = object.__new__(BinanceScalpPaperEngine)
+        locked_engine.config = SimpleNamespace(
+            circuit_breaker_epoch="",
+            max_consecutive_losses=5,
+            daily_loss_limit_pct=0.05,
+            breaker_recovery_sec=14400,
+            database_path=str(db),
+        )
+        locked_engine._ledger = lambda conn: {"principal": 1000.0}
+        locked_engine._utcnow_override = after
+        locked_engine._last_breaker_reason = ""
+        locked_engine._last_breaker_recovery_until = ""
+        locked_engine._last_breaker_eval_after = ""
+
+        def _second_writer():
+            c = sqlite3.connect(str(db), timeout=0.05)
+            c.execute("BEGIN IMMEDIATE")
+            return c
+
+        locked_engine._conn = _second_writer
+        assert BinanceScalpPaperEngine._check_scalp_circuit_breaker(locked_engine) is True
+        assert locked_engine._last_breaker_reason == "SCALP_BREAKER_STATE_UNAVAILABLE"
+
+        open_ = BinanceScalpPaperEngine._check_scalp_circuit_breaker(locked_engine, locker)
+        assert open_ is False
+        locker.commit()
+    finally:
+        locker.close()
+    with sqlite3.connect(db) as conn:
+        tripped, until = conn.execute(
+            "SELECT consec_breaker_tripped_at, consec_breaker_recovery_until FROM scalp_meta WHERE id=1"
+        ).fetchone()
+    assert not tripped
+    assert not until
+
+
 def test_daily_loss_stays_independent_of_consec_recovery(tmp_path: Path):
     db = tmp_path / "scalp.db"
     today = datetime(2026, 8, 23, 13, 0, tzinfo=timezone.utc)
