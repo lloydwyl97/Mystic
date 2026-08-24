@@ -1348,6 +1348,12 @@ class BinanceScalpPaperEngine:
                 feature_fingerprint=_feat_fp,
             )
             entry_diag.update(_scalp_prov)
+        with contextlib.suppress(Exception):
+            from backend.services.binance_scalp.scalp_micro_contract import version_stamps
+
+            # Path-net provenance may set model_version=scalp_path_net_v1.
+            # BUY microstructure stamps must remain scalp_micro_ev_v1.
+            entry_diag.update(version_stamps())
 
         try:
             conn.execute(

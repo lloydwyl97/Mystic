@@ -111,6 +111,24 @@ def test_learning_consumes_feature_context_extra(tmp_path):
     assert adj["eligibility"] is False
 
 
+def test_buy_microstructure_stamp_survives_path_net_provenance():
+    from backend.services.binance_scalp.scalp_micro_contract import (
+        buy_microstructure_invariant_violations,
+        version_stamps,
+    )
+
+    diag = {
+        **version_stamps(),
+        "microstructure_features": {"ofi_5s": 0.2, "obi_l1": 0.1},
+        "EV_10s": 0.0001,
+    }
+    diag.update({"model_version": "scalp_path_net_v1", "forward_net_model_version": "scalp_path_net_v1"})
+    diag.update(version_stamps())
+    assert buy_microstructure_invariant_violations(diag) == []
+    assert diag["model_version"] == "scalp_micro_ev_v1"
+    assert diag["forward_net_model_version"] == "scalp_path_net_v1"
+
+
 def test_buy_microstructure_stamp_invariant():
     from backend.services.binance_scalp.scalp_micro_contract import (
         buy_microstructure_invariant_violations,
