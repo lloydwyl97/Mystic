@@ -172,7 +172,9 @@ def find_orphaned_day_buys(db_path: str | Path) -> list[dict[str, Any]]:
             tid = str(d.get("trade_id") or "")
             if tid and tid in open_tids:
                 continue
-            if not tid and _norm_sym(d.get("symbol") or "") in open_syms:
+            # Live reconcile can rewrite trade_id to reconcile_import_* while
+            # the mystic BUY row still holds remaining. Inventory is present.
+            if _norm_sym(d.get("symbol") or "") in open_syms:
                 continue
             if _buy_closed_by_trade_id(conn, tid, str(d.get("symbol") or ""), int(d.get("id") or 0)):
                 continue

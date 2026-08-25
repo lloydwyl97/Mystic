@@ -90,6 +90,18 @@ def test_block_rebuy_after_tp1_while_4h_rising():
     assert why == "SAME_4H_RISE_NO_REBUY"
 
 
+def test_allow_rebuy_after_one_4h_bar_even_if_rise_still_intact():
+    """A 14h+ flat book on a live rise is a new DAY thesis, not churn."""
+    blocked, why = should_block_rebuy_on_4h_rise(
+        last_close_reason="NET_PROFIT_EXIT",
+        last_close_epoch=1_700_000_000.0,
+        bundle={"4h": _rising_4h()},
+        now_epoch=1_700_000_000.0 + 14400.0,
+    )
+    assert blocked is False
+    assert why == ""
+
+
 def test_allow_rebuy_after_tp1_when_4h_broke():
     blocked, why = should_block_rebuy_on_4h_rise(
         last_close_reason="TP1",

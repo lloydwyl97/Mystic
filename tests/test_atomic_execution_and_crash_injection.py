@@ -230,6 +230,50 @@ def test_orphan_restore_from_committed_buy_does_not_invent_cash():
         assert find_orphaned_day_buys(str(db)) == []
 
 
+def test_reconcile_import_trade_id_mismatch_is_not_orphan():
+    from backend.services.atomic_execution_book import find_cash_position_disagreement
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "day.db"
+        _init_engine(db)
+        with sqlite3.connect(str(db)) as conn:
+            conn.execute(
+                """
+                INSERT INTO paper_trades (
+                    trade_id, paper_run_id, mode, symbol, side, quantity, price,
+                    remaining_position, timestamp, status
+                ) VALUES ('mystic_BTC/USDT_1787675408882', 'test', 'paper', 'BTC/USDT', 'BUY',
+                          0.00082983, 79141.45, 0.00082983, datetime('now'), 'executed')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO portfolio_engine_positions (
+                    symbol, quantity, entry_price, entry_time, trade_id,
+                    stop_price, take_profit_1_price, take_profit_2_price,
+                    trailing_stop_price, tp1_hit, highest_price,
+                    atr_at_entry, entry_bar_timestamp, confidence_at_entry, last_updated
+                ) VALUES (
+                    'BTC/USDT', 0.00082, 79328.73, strftime('%s','now'),
+                    'reconcile_import_BTC_USDT_1787675558',
+                    77000, 81000, 83000, 0, 0, 79328.73, 0, 0, 0.5, datetime('now')
+                )
+                """
+            )
+            conn.execute(
+                """
+                UPDATE portfolio_engine_ledger
+                SET cash_balance=173.62, positions_value=64.95, total_equity=238.57
+                WHERE id=1
+                """
+            )
+            conn.commit()
+        assert find_orphaned_day_buys(str(db)) == []
+        acc = find_cash_position_disagreement(str(db))
+        assert acc["ok"] is True
+        assert acc["orphans"] == []
+
+
 def test_open_positions_swap_not_in_place_clear():
     engine = PortfolioEngine(principal=10_000.0, test_mode=True)
     engine.open_positions = {"ETH/USDT": _position(symbol="ETH/USDT", trade_id="a")}

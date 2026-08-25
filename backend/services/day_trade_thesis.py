@@ -1126,20 +1126,26 @@ def should_block_rebuy_on_4h_rise(
     bundle: dict[str, Any] | None,
     now_epoch: float,
 ) -> tuple[bool, str]:
-    """Block same-rise rebuy after a TP1/path-aware clip while 4H is still up."""
+    """Block same-rise rebuy after a TP1/path-aware clip for one 4H bar.
+
+    The block is anti-churn on the bar that was just clipped. It must not
+    sideline a flat book for the entire remaining bull rise — that left
+    live DAY in cash for 14h–36h+ while 4H stayed intact.
+    """
     if not is_day_profit_close_reason(last_close_reason):
-        return False, ""
-    if htf_4h_rise_intact(bundle):
-        return True, "SAME_4H_RISE_NO_REBUY"
-    if htf_4h_rise_broken(bundle):
         return False, ""
     try:
         closed = float(last_close_epoch or 0.0)
     except (TypeError, ValueError):
         closed = 0.0
-    if closed > 0 and (float(now_epoch) - closed) < 14400.0:
-        return True, "SAME_4H_BAR_NO_REBUY"
-    return False, ""
+    age = (float(now_epoch) - closed) if closed > 0 else float("inf")
+    if age >= 14400.0:
+        return False, ""
+    if htf_4h_rise_intact(bundle):
+        return True, "SAME_4H_RISE_NO_REBUY"
+    if htf_4h_rise_broken(bundle):
+        return False, ""
+    return True, "SAME_4H_BAR_NO_REBUY"
 
 
 def thesis_invalidated_live(

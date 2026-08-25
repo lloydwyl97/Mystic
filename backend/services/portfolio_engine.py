@@ -2754,9 +2754,9 @@ class PortfolioEngine:
     ) -> None:
         """
         Import exchange balances that are not yet in engine positions.
-        For each non-USDT asset where free > dust: if symbol not in open_positions,
-        create position with qty and entry_price from market. Recompute positions_value
-        and total_equity after import. Never adjust realized_pnl (do not treat as loss).
+        Skip leftover dust. If an unclosed mystic BUY exists for the symbol,
+        reuse that trade_id and fill price instead of minting reconcile_import_*.
+        Never adjust realized_pnl (do not treat as loss).
         """
         if not self._live_execution_enabled or not self._live_service:
             return
@@ -2795,12 +2795,41 @@ class PortfolioEngine:
                 if not is_dust and notional < min_notional:
                     is_dust = True
                     dust_reason = dust_reason or "below min_notional"
+                if is_dust:
+                    logger.info(
+                        "LIVE_RECONCILE_IMPORT_SKIP_DUST symbol=%s qty=%s reason=%s",
+                        symbol,
+                        track_qty,
+                        dust_reason or "dust",
+                    )
+                    continue
+                lot_tid = ""
+                lot_px = price
+                try:
+                    with connect_managed(self.db_path) as conn:
+                        row = conn.execute(
+                            """
+                            SELECT trade_id, price FROM paper_trades
+                            WHERE side = 'BUY'
+                              AND replace(replace(upper(symbol), '/', ''), '-', '')
+                                  = replace(replace(upper(?), '/', ''), '-', '')
+                              AND IFNULL(remaining_position, 0) > 1e-12
+                            ORDER BY id DESC LIMIT 1
+                            """,
+                            (symbol,),
+                        ).fetchone()
+                    if row:
+                        lot_tid = str(row[0] or "")
+                        if float(row[1] or 0) > 0:
+                            lot_px = float(row[1])
+                except Exception:
+                    lot_tid = ""
                 position = OpenPosition(
                     symbol=symbol,
                     quantity=track_qty,
-                    entry_price=price,
+                    entry_price=lot_px,
                     entry_time=time.time(),
-                    trade_id=f"reconcile_import_{symbol.replace('/', '_')}_{int(time.time())}",
+                    trade_id=lot_tid or f"reconcile_import_{symbol.replace('/', '_')}_{int(time.time())}",
                     stop_price=price * 0.97,
                     take_profit_1_price=price * 1.02,
                     take_profit_2_price=price * 1.05,
@@ -2811,21 +2840,16 @@ class PortfolioEngine:
                     entry_bar_timestamp=int(time.time()),
                     confidence_at_entry=0.5,
                 )
-                if is_dust:
-                    position.status = "DUST_PENDING"
-                    position.dust_qty_canonical = track_qty
-                    position.dust_detected_at = time.time()
                 self.open_positions[symbol] = position
                 await self._persist_position_to_sqlite(position)
                 imported_any = True
                 logger.info(
-                    "LIVE_RECONCILE_ASSET_IMPORTED symbol=%s qty=%s entry_price=%s notional=%.2f dust=%s reason=%s",
+                    "LIVE_RECONCILE_ASSET_IMPORTED symbol=%s qty=%s entry_price=%s trade_id=%s notional=%.2f",
                     symbol,
                     track_qty,
-                    price,
-                    track_qty * price,
-                    is_dust,
-                    dust_reason or "",
+                    lot_px,
+                    position.trade_id,
+                    track_qty * lot_px,
                 )
             except Exception as e:
                 logger.warning("LIVE_RECONCILE_IMPORT_ERROR: %s %s", symbol, e)
@@ -6816,6 +6840,28 @@ class PortfolioEngine:
                                 """,
                                 (qty, sym),
                             )
+                        if str(tid).startswith("reconcile_import_"):
+                            lot = cursor.execute(
+                                """
+                                SELECT trade_id FROM paper_trades
+                                WHERE symbol = ? AND side = 'BUY'
+                                  AND IFNULL(remaining_position, 0) > 1e-12
+                                ORDER BY id DESC LIMIT 1
+                                """,
+                                (sym,),
+                            ).fetchone()
+                            if lot and lot[0] and str(lot[0]) != tid:
+                                pos.trade_id = str(lot[0])
+                                cursor.execute(
+                                    "UPDATE portfolio_engine_positions SET trade_id = ? WHERE symbol = ?",
+                                    (pos.trade_id, sym),
+                                )
+                                logger.info(
+                                    "FIFO_RECONCILE: rebound %s trade_id %s -> %s",
+                                    sym,
+                                    tid,
+                                    pos.trade_id,
+                                )
                         logger.info(
                             "FIFO_RECONCILE: aligned paper BUY remaining for %s to qty=%.8f trade_id=%s",
                             sym,
@@ -8408,9 +8454,8 @@ class PortfolioEngine:
                 )
             return None
 
-        # A profit close on a 4H rise that is still intact means the engine
-        # clipped its own runner. Re-entering the same rise is churn, not a
-        # new DAY thesis.
+        # A profit close on a 4H rise is anti-churn for one 4H bar only.
+        # After that, a flat book may re-enter even if the rise is still intact.
         rebuy_blocked, rebuy_why = self._same_4h_rise_rebuy_block(normalized_symbol)
         if rebuy_blocked:
             logger.info(
