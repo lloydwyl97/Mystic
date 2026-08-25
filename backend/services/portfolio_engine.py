@@ -2965,9 +2965,9 @@ class PortfolioEngine:
         self._available_balance = max(0.0, self.cash_balance)
         # Canonical: total_equity = cash + positions_value (market). Do not modify realized_pnl.
         await self._recompute_positions_values()
-        # LIVE_RECONCILE: use same fetch for principal (no extra Binance call)
-        if source == "LIVE_RECONCILE":
-            self.principal = self.cash_balance + self._positions_value
+        # Do not rewrite principal from a mid-session mark. That ratcheted
+        # live DAY principal to a full-book high-water, then left it there
+        # after clips and tripped ACCOUNT_FAILSAFE on ordinary P&L.
         await self._persist_ledger_to_sqlite()
         logger.info(
             "CASH_DRIFT_AUTOSYNC: source=%s exchange_usdt=%.2f local_before=%.2f local_after=%.2f drift=%.2f threshold=%.2f open_orders=%d",
@@ -5263,6 +5263,59 @@ class PortfolioEngine:
             )
         except Exception:
             return False, ""
+
+    def _late_4h_rise_entry_block(self, symbol: str) -> tuple[bool, str]:
+        try:
+            from backend.services.day_active_market_bundle import read_cached_day_active_bundle_sync
+            from backend.services.day_trade_thesis import should_block_late_4h_rise_entry
+
+            return should_block_late_4h_rise_entry(
+                read_cached_day_active_bundle_sync(symbol),
+                time.time(),
+            )
+        except Exception:
+            return False, ""
+
+    def _intact_4h_open_count(self, exclude: str = "") -> int:
+        from backend.services.day_trade_thesis import htf_4h_rise_intact_for_symbol
+
+        n = 0
+        skip = normalize_symbol(exclude) if exclude else ""
+        for sym, pos in self.open_positions.items():
+            if skip and normalize_symbol(sym) == skip:
+                continue
+            if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
+                continue
+            if float(getattr(pos, "quantity", 0) or 0) <= 0:
+                continue
+            try:
+                if htf_4h_rise_intact_for_symbol(sym):
+                    n += 1
+            except Exception:
+                continue
+        for psym in self._pending_buy_symbols():
+            if skip and normalize_symbol(psym) == skip:
+                continue
+            if normalize_symbol(psym) in {normalize_symbol(s) for s in self.open_positions.keys()}:
+                continue
+            try:
+                if htf_4h_rise_intact_for_symbol(psym):
+                    n += 1
+            except Exception:
+                continue
+        return n
+
+    def _intact_4h_slot_block(self, symbol: str) -> tuple[bool, str]:
+        try:
+            from backend.services.day_trade_thesis import htf_4h_rise_intact_for_symbol, intact_4h_slot_blocked
+
+            if not htf_4h_rise_intact_for_symbol(symbol):
+                return False, ""
+            if intact_4h_slot_blocked(open_intact=self._intact_4h_open_count(exclude=symbol), candidate_intact=True):
+                return True, "SAME_4H_THESIS_SLOT_CAP"
+        except Exception:
+            return False, ""
+        return False, ""
 
     def _lookup_position_close_cooldown(self, symbol: str) -> float:
         """Return the most recent ``cooldown_until`` for ``symbol`` (epoch seconds).
@@ -8475,6 +8528,42 @@ class PortfolioEngine:
                 await self._update_pipeline_decision(
                     decision_id,
                     {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": rebuy_why},
+                )
+            return None
+
+        late_blocked, late_why = self._late_4h_rise_entry_block(normalized_symbol)
+        if late_blocked:
+            logger.info("DAY_ENTRY_BLOCKED_LATE_4H_RISE symbol=%s reason=%s", normalized_symbol, late_why)
+            await self._record_reject(
+                normalized_symbol,
+                "BUY",
+                "late_4h_rise_no_buy",
+                late_why,
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+            if decision_id:
+                await self._update_pipeline_decision(
+                    decision_id,
+                    {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": late_why},
+                )
+            return None
+
+        slot_blocked, slot_why = self._intact_4h_slot_block(normalized_symbol)
+        if slot_blocked:
+            logger.info("DAY_ENTRY_BLOCKED_4H_SLOT_CAP symbol=%s reason=%s", normalized_symbol, slot_why)
+            await self._record_reject(
+                normalized_symbol,
+                "BUY",
+                "same_4h_thesis_slot_cap",
+                slot_why,
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+            if decision_id:
+                await self._update_pipeline_decision(
+                    decision_id,
+                    {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": slot_why},
                 )
             return None
 
@@ -11748,6 +11837,13 @@ class PortfolioEngine:
             else:
                 logger.info(f"BUY_BLOCKED_MAX_POSITIONS: {symbol} - portfolio full (active={active_count}, pending_slots={pending_slots}, total={len(self.open_positions)}/{max_positions_limit})")
                 return False, "MAX_POSITIONS_REACHED"
+
+        late_blocked, late_why = self._late_4h_rise_entry_block(symbol)
+        if late_blocked:
+            return False, late_why
+        slot_blocked, slot_why = self._intact_4h_slot_block(symbol)
+        if slot_blocked:
+            return False, slot_why
 
         # NON-BLOCKING BY DESIGN: bear regime is advisory context for ranking/sizing,
         # not a hard entry blocker — Mystic does not gate trades on regime opinion.

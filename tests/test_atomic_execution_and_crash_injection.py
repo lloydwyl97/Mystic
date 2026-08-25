@@ -284,6 +284,26 @@ def test_open_positions_swap_not_in_place_clear():
     assert list(engine.open_positions) == ["XRP/USDT"]
 
 
+def test_live_reconcile_cash_sync_does_not_ratchet_principal(monkeypatch):
+    monkeypatch.setenv("CASH_DRIFT_SYNC_ENABLED", "true")
+    monkeypatch.setenv("CASH_DRIFT_THRESHOLD_USD", "1.00")
+    monkeypatch.setenv("CASH_SYNC_REQUIRE_NO_OPEN_ORDERS", "false")
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "day.db"
+        engine = _init_engine(db, cash=239.47)
+        engine.principal = 239.47
+        engine.cash_balance = 126.88
+        engine._positions_value = 112.59
+        engine._live_service = None
+        ok = asyncio.run(engine.sync_cash_from_exchange(237.59, "LIVE_RECONCILE"))
+        assert ok is True
+        assert engine.cash_balance == pytest.approx(237.59, abs=0.01)
+        assert engine.principal == pytest.approx(239.47, abs=0.01)
+        cap = engine.get_trading_capability_status()
+        assert cap["failsafe_active"] is False
+        assert cap["day_entry_enabled"] is True
+
+
 def test_status_exposes_failsafe_when_not_trading_paused():
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "status.db"

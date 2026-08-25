@@ -50,7 +50,7 @@ HOLD_4H_UNDECIDED = "PATH_AWARE_HOLD_4H_UNDECIDED"
 
 # Reasons that are allowed to full-flatten a DAY position. Anything else holds.
 DAY_FULL_FLATTEN_REASONS = frozenset(
-    {EXIT_DAY_4H_STRUCTURE_BREAK, EXIT_DAY_RISK_FLOOR, EXIT_EXTREME_PROTECTION}
+    {EXIT_DAY_4H_STRUCTURE_BREAK, EXIT_DAY_RISK_FLOOR, EXIT_EXTREME_PROTECTION, EXIT_GIVEBACK}
 )
 
 logger = logging.getLogger(__name__)
@@ -61,10 +61,10 @@ def _path_aware_exit_enabled() -> bool:
     """DAY exit policy: hold the 4H thesis; sell only on structure break or extreme.
 
     When enabled (production default), the legacy ladder below — stop, trail,
-    thesis-red, stall, giveback, time stop, and the net-profit clips — is
-    unreachable. Disabling it restores that ladder wholesale, which is why the
-    resolved policy is logged once per process: a silent flip would turn DAY
-    back into a scalper.
+    thesis-red, stall, time stop, and the net-profit clips — is unreachable.
+    Giveback stays reachable on an intact 4H hold so a real MFE that reverses
+    to red is not held until the 4H close. Disabling path-aware restores the
+    full ladder, which is why the resolved policy is logged once per process.
     """
     raw = os.getenv("DAY_PATH_AWARE_EXIT")
     enabled = (raw if raw is not None else "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -140,6 +140,18 @@ def _evaluate_path_aware_exit(
             "detail": f"mark_at_or_below_risk_floor={risk_floor_price:.8f}",
             **base,
         }
+
+    giveback_on_hold = os.getenv("DAY_GIVEBACK_ON_4H_HOLD", "true").lower() in ("1", "true", "yes", "on")
+    if giveback_on_hold and snap4["htf_4h_rise_intact"]:
+        gb = evaluate_giveback_exit(
+            entry_price=entry,
+            highest_price=float(getattr(position, "highest_price", entry) or entry),
+            net_pnl_pct=net_pnl_pct,
+            hold_minutes=hold_minutes,
+            position=position,
+        )
+        if gb is not None:
+            return {**gb, **base, "reason": EXIT_GIVEBACK}
 
     # 4H still rising: never TP1 / net-profit / first-executable / trail / time-stop.
     if snap4["htf_4h_rise_intact"]:

@@ -8,6 +8,8 @@ from backend.services.day_trade_thesis import (
     SETUP_BREAKOUT_CONTINUATION,
     htf_4h_rise_broken,
     htf_4h_rise_intact,
+    intact_4h_slot_blocked,
+    should_block_late_4h_rise_entry,
     should_block_rebuy_on_4h_rise,
     thesis_invalidated_live,
 )
@@ -100,6 +102,31 @@ def test_allow_rebuy_after_one_4h_bar_even_if_rise_still_intact():
     )
     assert blocked is False
     assert why == ""
+
+
+def test_block_late_4h_entry_when_1h_weak():
+    blocked, why = should_block_late_4h_rise_entry(
+        {"4h": _rising_4h(), "1h": {"ema_align": 0.20}},
+        now_epoch=1_700_849_600.0 + 600.0,
+    )
+    assert blocked is True
+    assert why == "LATE_4H_RISE_1H_WEAK"
+
+
+def test_block_late_4h_entry_when_bar_is_late():
+    last_ts_ms = 1_700_000_000_000 + 59 * 14_400_000
+    blocked, why = should_block_late_4h_rise_entry(
+        {"4h": _rising_4h()},
+        now_epoch=last_ts_ms / 1000.0 + 11_000.0,
+    )
+    assert blocked is True
+    assert why == "LATE_4H_RISE_BAR_LATE"
+
+
+def test_intact_4h_slot_cap_blocks_third_name():
+    assert intact_4h_slot_blocked(open_intact=2, candidate_intact=True) is True
+    assert intact_4h_slot_blocked(open_intact=1, candidate_intact=True) is False
+    assert intact_4h_slot_blocked(open_intact=2, candidate_intact=False) is False
 
 
 def test_allow_rebuy_after_tp1_when_4h_broke():

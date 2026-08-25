@@ -14,6 +14,7 @@ from backend.services.day_controlled_exits import (
     EXIT_STALL_DEAD,
     EXIT_TIME_STOP,
     EXIT_TRAILING_STOP,
+    EXIT_GIVEBACK,
     _path_aware_exit_enabled,
     evaluate_engine_managed_exit,
     preview_next_engine_exit,
@@ -153,6 +154,20 @@ def test_path_aware_holds_green_on_4h_rise():
     assert out["reason"] == "PATH_AWARE_HOLD_4H_RISE"
 
 
+def test_path_aware_giveback_sells_fade_while_4h_intact():
+    pos = _Pos(entry_price=100.0, highest_price=100.40, symbol="NOARM/USDT", entry_thesis="")
+    out = evaluate_engine_managed_exit(
+        position=pos,
+        current_price=99.80,
+        net_pnl_pct=-0.0020,
+        hold_minutes=45.0,
+        coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
+        bundle={"4h": _rising_4h_rows()},
+    )
+    assert out["action"] == "sell"
+    assert out["reason"] == EXIT_GIVEBACK
+
+
 def test_path_aware_holds_time_stop_on_4h_rise():
     out = evaluate_engine_managed_exit(
         position=_Pos(max_hold_min=300),
@@ -269,6 +284,7 @@ def test_only_structure_break_and_extreme_may_full_flatten():
         EXIT_DAY_4H_STRUCTURE_BREAK,
         EXIT_DAY_RISK_FLOOR,
         EXIT_EXTREME_PROTECTION,
+        EXIT_GIVEBACK,
     }
     for banned in (EXIT_NET_PROFIT, EXIT_PATH_EXECUTABLE_PROFIT, EXIT_TIME_STOP):
         assert banned not in DAY_FULL_FLATTEN_REASONS

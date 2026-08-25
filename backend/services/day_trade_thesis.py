@@ -1148,6 +1148,79 @@ def should_block_rebuy_on_4h_rise(
     return True, "SAME_4H_BAR_NO_REBUY"
 
 
+def _current_4h_bar_progress(bundle: dict[str, Any] | None, now_epoch: float) -> float | None:
+    if not isinstance(bundle, dict):
+        return None
+    rows = bundle.get("4h")
+    if not isinstance(rows, list) or not rows:
+        return None
+    last = rows[-1]
+    try:
+        if isinstance(last, dict):
+            ts = float(last.get("timestamp") or last.get("t") or 0.0)
+        elif isinstance(last, (list, tuple)) and last:
+            ts = float(last[0] or 0.0)
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+    if ts <= 0:
+        return None
+    if ts > 1e12:
+        ts /= 1000.0
+    return max(0.0, min(1.0, (float(now_epoch) - ts) / 14400.0))
+
+
+def should_block_late_4h_rise_entry(
+    bundle: dict[str, Any] | None,
+    now_epoch: float,
+) -> tuple[bool, str]:
+    """Block a new DAY buy into a 4H rise that is already late or fading.
+
+    Intact 4H is not enough. Afternoon live losers bought the same rise after
+    it had already peaked, then waited for the 4H close to sell the fade.
+    """
+    if os.getenv("DAY_LATE_4H_ENTRY_BLOCK", "true").lower() not in ("1", "true", "yes", "on"):
+        return False, ""
+    if not htf_4h_rise_intact(bundle):
+        return False, ""
+    try:
+        align1_max = float(os.getenv("DAY_LATE_4H_1H_ALIGN_MAX", "0.42"))
+    except (TypeError, ValueError):
+        align1_max = 0.42
+    try:
+        bar_late = float(os.getenv("DAY_LATE_4H_BAR_LATE_FRAC", "0.70"))
+    except (TypeError, ValueError):
+        bar_late = 0.70
+    align1 = _bundle_tf_align(bundle, "1h")
+    if align1 is not None and align1 < align1_max:
+        return True, "LATE_4H_RISE_1H_WEAK"
+    candles = _4h_recent_ohlc(bundle)
+    align4 = _bundle_tf_align(bundle, "4h")
+    if len(candles) >= 2:
+        o, h, _l, c = candles[-1]
+        _po, ph, _pl, pc = candles[-2]
+        if c < o and (align4 is None or align4 < 0.58):
+            return True, "LATE_4H_RISE_RED_BAR"
+        if h < ph and c < pc:
+            return True, "LATE_4H_RISE_NO_HH"
+    frac = _current_4h_bar_progress(bundle, now_epoch)
+    if frac is not None and frac >= bar_late:
+        return True, "LATE_4H_RISE_BAR_LATE"
+    return False, ""
+
+
+def intact_4h_slot_blocked(*, open_intact: int, candidate_intact: bool, max_open: int = 2) -> bool:
+    """True when another intact-4H name would stack onto the same tape."""
+    if not candidate_intact:
+        return False
+    try:
+        cap = int(os.getenv("DAY_INTACT_4H_MAX_POSITIONS", str(max_open)) or max_open)
+    except (TypeError, ValueError):
+        cap = int(max_open)
+    return int(open_intact) >= max(1, cap)
+
+
 def thesis_invalidated_live(
     entry_thesis: str,
     *,
