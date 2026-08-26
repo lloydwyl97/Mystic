@@ -50,7 +50,13 @@ HOLD_4H_UNDECIDED = "PATH_AWARE_HOLD_4H_UNDECIDED"
 
 # Reasons that are allowed to full-flatten a DAY position. Anything else holds.
 DAY_FULL_FLATTEN_REASONS = frozenset(
-    {EXIT_DAY_4H_STRUCTURE_BREAK, EXIT_DAY_RISK_FLOOR, EXIT_EXTREME_PROTECTION, EXIT_GIVEBACK}
+    {
+        EXIT_DAY_4H_STRUCTURE_BREAK,
+        EXIT_DAY_RISK_FLOOR,
+        EXIT_EXTREME_PROTECTION,
+        EXIT_GIVEBACK,
+        EXIT_STALL_DEAD,
+    }
 )
 
 logger = logging.getLogger(__name__)
@@ -62,9 +68,9 @@ def _path_aware_exit_enabled() -> bool:
 
     When enabled (production default), the legacy ladder below — stop, trail,
     thesis-red, stall, time stop, and the net-profit clips — is unreachable.
-    Giveback stays reachable on an intact 4H hold so a real MFE that reverses
-    to red is not held until the 4H close. Disabling path-aware restores the
-    full ladder, which is why the resolved policy is logged once per process.
+    Giveback and stall stay reachable on an intact 4H hold: a real MFE that
+    reverses to red, or a 2h dead red lot that never bounced, must not wait
+    for the 4H close. Disabling path-aware restores the full ladder.
     """
     raw = os.getenv("DAY_PATH_AWARE_EXIT")
     enabled = (raw if raw is not None else "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -152,6 +158,20 @@ def _evaluate_path_aware_exit(
         )
         if gb is not None:
             return {**gb, **base, "reason": EXIT_GIVEBACK}
+
+    stall_on_hold = os.getenv("DAY_STALL_ON_4H_HOLD", "true").lower() in ("1", "true", "yes", "on")
+    if stall_on_hold and snap4["htf_4h_rise_intact"]:
+        stall = evaluate_stall_exit(
+            entry_price=entry,
+            highest_price=float(getattr(position, "highest_price", entry) or entry),
+            net_pnl_pct=net_pnl_pct,
+            hold_minutes=hold_minutes,
+            max_hold_min=effective_max_hold_min(position, coin_profile),
+            current_price=current_price,
+            lowest_price=float(getattr(position, "lowest_price", 0.0) or 0.0),
+        )
+        if stall is not None and str(stall.get("action") or "") == "sell":
+            return {**stall, **base, "reason": EXIT_STALL_DEAD}
 
     # 4H still rising: never TP1 / net-profit / first-executable / trail / time-stop.
     if snap4["htf_4h_rise_intact"]:

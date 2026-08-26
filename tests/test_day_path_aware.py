@@ -168,6 +168,27 @@ def test_path_aware_giveback_sells_fade_while_4h_intact():
     assert out["reason"] == EXIT_GIVEBACK
 
 
+def test_path_aware_stall_sells_dead_red_hold_while_4h_intact():
+    pos = _Pos(
+        entry_price=100.0,
+        highest_price=100.05,
+        lowest_price=99.60,
+        thesis_invalid_level=0.0,
+        symbol="NOARM/USDT",
+        entry_thesis="",
+    )
+    out = evaluate_engine_managed_exit(
+        position=pos,
+        current_price=99.65,
+        net_pnl_pct=-0.0045,
+        hold_minutes=130.0,
+        coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
+        bundle={"4h": _rising_4h_rows()},
+    )
+    assert out["action"] == "sell"
+    assert out["reason"] == EXIT_STALL_DEAD
+
+
 def test_path_aware_holds_time_stop_on_4h_rise():
     out = evaluate_engine_managed_exit(
         position=_Pos(max_hold_min=300),
@@ -285,6 +306,7 @@ def test_only_structure_break_and_extreme_may_full_flatten():
         EXIT_DAY_RISK_FLOOR,
         EXIT_EXTREME_PROTECTION,
         EXIT_GIVEBACK,
+        EXIT_STALL_DEAD,
     }
     for banned in (EXIT_NET_PROFIT, EXIT_PATH_EXECUTABLE_PROFIT, EXIT_TIME_STOP):
         assert banned not in DAY_FULL_FLATTEN_REASONS
