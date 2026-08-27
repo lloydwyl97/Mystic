@@ -936,14 +936,16 @@ def _break_even_enabled() -> bool:
 
 
 def apply_break_even_and_mfe_trail(position: Any, current_price: float) -> bool:
-    """Ratchet stop above entry when MFE has cleared cost, then tighten trail
-    by MFE tier. Never widens/lowers the stop; only ratchets upward.
+    """Lift stop/trail to break-even after cost-clearing MFE. Do not tighten.
 
-    Order of protection once MFE clears:
-    1. MFE ≥ trigger (default 0.30%): move stop to entry + 0.05%. Removes
-       "won-then-gave-back-to-loss" losses on ~50% of stalled winners.
-    2. MFE ≥ tier-1 (default 0.50%): trailing distance tightens to 0.30%.
-    3. MFE ≥ tier-2 (default 1.00%): trailing distance tightens to 0.20%.
+    CONSTANT coin-profile trail (validated holdout): after activation the
+    distance from high-water stays at the coin profile. MFE tiers that used
+    to shrink that distance to 0.30% / 0.20% are removed. Adaptive-arm
+    width overrides are also not applied here.
+
+    Remaining protection once MFE ≥ trigger (default 0.30%):
+    move stop and trailing_stop_price up to entry + 0.05% if that is higher
+    than the current ratchet. Never lowers a level.
 
     Returns True if the position's stop or trailing_stop_price advanced.
     """
@@ -971,49 +973,6 @@ def apply_break_even_and_mfe_trail(position: Any, current_price: float) -> bool:
             position.trailing_stop_price = be_stop
             changed = True
 
-    tier2 = _mfe_trail_tier_2_pct()
-    tier1 = _mfe_trail_tier_1_pct()
-    if mfe_pct + 1e-12 >= tier2:
-        tightened = _mfe_trail_tier_2_trail_pct()
-    elif mfe_pct + 1e-12 >= tier1:
-        tightened = _mfe_trail_tier_1_trail_pct()
-    else:
-        tightened = None
-
-    # Adaptive trail (day_adaptive_trail.py): once a (symbol, setup, regime)
-    # arm has enough closed-winner history (default 4+ obs), its actual
-    # MFE-giveback percentile is a better trail width than the fixed 0.20%/
-    # 0.30% tier constants above. Only overrides when the arm has real
-    # history (source == "arm_history") — insufficient-data and disabled
-    # cases fall back to the fixed tiers computed above, unchanged.
-    if tightened is not None and tightened > 0:
-        try:
-            from backend.services.day_adaptive_trail import adaptive_trail_pct_for_arm
-
-            _adaptive = adaptive_trail_pct_for_arm(
-                str(getattr(position, "symbol", "") or ""),
-                str(getattr(position, "entry_thesis", "") or ""),
-                str(getattr(position, "day_route_regime_at_entry", "") or ""),
-            )
-            if _adaptive.get("source") == "arm_history":
-                tightened = float(_adaptive["trail_pct"])
-        except Exception:
-            pass
-
-    if tightened is not None and tightened > 0:
-        new_trail = highest * (1.0 - tightened)
-        current_trail = float(getattr(position, "trailing_stop_price", 0.0) or 0.0)
-        if new_trail > current_trail + 1e-12:
-            position.trailing_stop_price = new_trail
-            changed = True
-        # Also ratchet the stop_price up so evaluate_engine_managed_exit's stop
-        # gate uses the tightened level (not just the trailing gate).
-        current_stop = float(getattr(position, "stop_price", 0.0) or 0.0)
-        if new_trail > current_stop + 1e-12 and new_trail < entry * (1.0 + 0.02):
-            # Safety cap: never lift stop above entry+2% (silly stop).
-            position.stop_price = new_trail
-            changed = True
-
     return changed
 
 
@@ -1025,8 +984,8 @@ def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dic
     so normal intraday noise does not shake out a strongly trending position.
 
     After the base trailing update, apply_break_even_and_mfe_trail runs so
-    once MFE clears round-trip cost the stop is lifted to break-even and the
-    trail tightens by MFE tier. Both changes are ratchets — never widen.
+    once MFE clears round-trip cost the stop is lifted to break-even.
+    Trail distance stays at the coin-profile value (CONSTANT). Never lowers.
     """
     entry = float(getattr(position, "entry_price", 0.0) or 0.0)
     if entry <= 0 or current_price <= 0:
@@ -1054,10 +1013,9 @@ def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dic
             position.trailing_stop_price = new_trail
             base_changed = True
 
-    # Break-even ratchet + tiered MFE-tightening apply regardless of the base
-    # trail activation (they use their own MFE thresholds).
-    tier_changed = apply_break_even_and_mfe_trail(position, current_price)
-    return base_changed or tier_changed
+    # Break-even ratchet only. Coin-profile distance is not tightened by MFE.
+    be_changed = apply_break_even_and_mfe_trail(position, current_price)
+    return base_changed or be_changed
 
 
 def _trail_semantics(

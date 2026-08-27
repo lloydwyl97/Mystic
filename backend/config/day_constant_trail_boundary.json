@@ -1,0 +1,15 @@
+{
+  "prior_baseline_sha": "4bb1de0",
+  "repair": "constant_coin_profile_trail",
+  "mfe_tightening": "removed",
+  "be_lift_preserved": true,
+  "coin_profile_trail": {
+    "BTCUSDT": 0.0040,
+    "ETHUSDT": 0.0045,
+    "SOLUSDT": 0.0055,
+    "XRPUSDT": 0.0050
+  },
+  "CONSTANT_TRAIL_VALID_START_LOCAL": null,
+  "CONSTANT_TRAIL_VALID_START_OCEAN": null,
+  "note": "Host start timestamps are written at deploy; do not rewrite prior trades."
+}

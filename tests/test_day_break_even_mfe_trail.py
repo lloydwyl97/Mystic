@@ -54,23 +54,23 @@ def test_break_even_ratchets_stop_when_trigger_hit():
     assert pos.trailing_stop_price == pytest.approx(100.05, rel=1e-6)
 
 
-def test_tier1_tightens_trail_and_ratchets_stop():
+def test_tier1_does_not_tighten_trail_distance():
+    """CONSTANT: +0.55% MFE lifts BE only — does not shrink trail to 0.30%."""
     pos = _Pos(entry_price=100.0, highest_price=100.55, stop_price=99.0, trailing_stop_price=99.0)
     changed = apply_break_even_and_mfe_trail(pos, current_price=100.55)
     assert changed is True
-    # tier-1 default trail 0.30% behind highest → 100.55 * (1 - 0.003) ≈ 100.2484
-    assert pos.trailing_stop_price == pytest.approx(100.55 * (1 - 0.003), rel=1e-6)
-    # Also ratcheted stop_price to the tightened trail level
-    tier1_level = 100.55 * (1 - 0.003)
-    assert pos.stop_price >= tier1_level - 1e-6
+    assert pos.stop_price == pytest.approx(100.05, rel=1e-6)
+    assert pos.trailing_stop_price == pytest.approx(100.05, rel=1e-6)
+    assert pos.trailing_stop_price < 100.55 * (1 - 0.003) - 1e-6
 
 
-def test_tier2_tightens_trail_further():
+def test_tier2_does_not_tighten_trail_distance():
+    """CONSTANT: +1.10% MFE does not shrink trail to 0.20%."""
     pos = _Pos(entry_price=100.0, highest_price=101.10, stop_price=99.0, trailing_stop_price=99.0)
     changed = apply_break_even_and_mfe_trail(pos, current_price=101.10)
     assert changed is True
-    # tier-2 default trail 0.20% behind highest → 101.10 * (1 - 0.002) ≈ 100.898
-    assert pos.trailing_stop_price == pytest.approx(101.10 * (1 - 0.002), rel=1e-6)
+    assert pos.trailing_stop_price == pytest.approx(100.05, rel=1e-6)
+    assert pos.trailing_stop_price < 101.10 * (1 - 0.002) - 1e-6
 
 
 def test_ratchet_is_monotone():
@@ -95,14 +95,12 @@ def test_disable_flag_short_circuits(monkeypatch):
 
 
 def test_ratchet_capped_below_entry_plus_2pct():
-    # Even at absurd MFE (5%), the safety cap keeps stop below entry+2%.
+    # BE-only: even at 5% MFE this helper only lifts to entry+0.05%.
     pos = _Pos(entry_price=100.0, highest_price=105.0, stop_price=99.0, trailing_stop_price=99.0)
     apply_break_even_and_mfe_trail(pos, current_price=105.0)
-    # tier-2 trail: 105 * (1 - 0.002) = 104.79 → exceeds entry * 1.02 = 102.00
-    # so stop_price should be at most 102.0, but trailing_stop_price ratchets fully
+    assert pos.stop_price == pytest.approx(100.05, rel=1e-6)
     assert pos.stop_price <= 100.0 * 1.02 + 1e-6
-    # trailing_stop_price is not subject to the +2% cap — it locks the gain
-    assert pos.trailing_stop_price == pytest.approx(105.0 * 0.998, rel=1e-6)
+    assert pos.trailing_stop_price == pytest.approx(100.05, rel=1e-6)
 
 
 def test_refresh_trailing_stop_invokes_break_even():
@@ -111,11 +109,9 @@ def test_refresh_trailing_stop_invokes_break_even():
     profile = {"trail": 0.005, "sl": 0.010, "max_hold_min": 75}
     changed = refresh_trailing_stop(pos, current_price=100.60, coin_profile=profile)
     assert changed is True
-    # Base trail: 100.60 * 0.995 = 100.097
-    # Tier-1 trail: 100.60 * 0.997 = 100.2982 (tighter, wins)
-    # → trailing_stop_price should be the tier-1 value
+    # CONSTANT: coin-profile 0.50% behind high-water. No 0.30% MFE tighten.
+    assert pos.trailing_stop_price == pytest.approx(100.60 * (1 - 0.005), rel=1e-6)
     assert pos.trailing_stop_price >= 100.05
-    assert pos.trailing_stop_price == pytest.approx(100.60 * (1 - 0.003), rel=1e-6)
     # stop_price ratcheted to entry+offset (0.0005) at minimum
     assert pos.stop_price >= 100.0 * 1.0005
 

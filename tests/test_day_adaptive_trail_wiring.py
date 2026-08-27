@@ -13,6 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
@@ -34,6 +36,7 @@ def _position(**overrides) -> SimpleNamespace:
 
 
 def test_uses_adaptive_trail_when_arm_history_sufficient():
+    """CONSTANT: learned widths must not shrink the coin-profile trail."""
     pos = _position()
     with mock.patch(
         "backend.services.day_adaptive_trail.adaptive_trail_pct_for_arm",
@@ -41,8 +44,8 @@ def test_uses_adaptive_trail_when_arm_history_sufficient():
     ):
         changed = apply_break_even_and_mfe_trail(pos, current_price=101.4)
     assert changed is True
-    expected_trail = pos.highest_price * (1.0 - 0.0123)
-    assert pos.trailing_stop_price == expected_trail
+    assert pos.trailing_stop_price == pytest.approx(100.05, rel=1e-9)
+    assert pos.trailing_stop_price != pos.highest_price * (1.0 - 0.0123)
 
 
 def test_falls_back_to_fixed_tier_when_history_insufficient():
@@ -53,9 +56,9 @@ def test_falls_back_to_fixed_tier_when_history_insufficient():
     ):
         changed = apply_break_even_and_mfe_trail(pos, current_price=101.4)
     assert changed is True
-    # Tier-2 fixed default (0.20%) must be used, not the fallback trail_pct.
-    expected_trail = pos.highest_price * (1.0 - 0.0020)
-    assert abs(pos.trailing_stop_price - expected_trail) < 1e-9
+    # CONSTANT: no 0.20% tier-2 tighten. BE lift only.
+    assert pos.trailing_stop_price == pytest.approx(100.05, rel=1e-9)
+    assert abs(pos.trailing_stop_price - pos.highest_price * (1.0 - 0.0020)) > 1e-6
 
 
 def test_never_crashes_when_adaptive_module_raises():
@@ -65,4 +68,5 @@ def test_never_crashes_when_adaptive_module_raises():
         side_effect=RuntimeError("db unavailable"),
     ):
         changed = apply_break_even_and_mfe_trail(pos, current_price=101.4)
-    assert changed is True  # still ratchets using the fixed-tier fallback
+    assert changed is True
+    assert pos.trailing_stop_price == pytest.approx(100.05, rel=1e-9)
