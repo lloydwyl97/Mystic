@@ -19,8 +19,8 @@ async def test_canonical_mark_prefers_binance_over_stale_redis():
         new=AsyncMock(return_value=book),
     ):
         with patch(
-            "backend.services.canonical_mark_price._fetch_binance_1m_close",
-            new=AsyncMock(return_value=1.1088),
+            "backend.services.canonical_mark_price._fetch_binance_1m_kline",
+            new=AsyncMock(return_value={"high": 1.1095, "close": 1.1088}),
         ):
             mark = await fetch_canonical_mark("XRP/USDT", use_cache=False)
 
@@ -29,6 +29,8 @@ async def test_canonical_mark_prefers_binance_over_stale_redis():
     assert mark.source == "binance_book_ticker_mid"
     assert mark.fresh is True
     assert mark.symbol_format == "XRPUSDT"
+    assert mark.kline_1m_high == pytest.approx(1.1095)
+    assert mark.kline_1m_close == pytest.approx(1.1088)
 
 
 @pytest.mark.asyncio
@@ -41,8 +43,8 @@ async def test_stale_redis_mark_string_not_used_when_binance_available():
         new=AsyncMock(return_value=book),
     ):
         with patch(
-            "backend.services.canonical_mark_price._fetch_binance_1m_close",
-            new=AsyncMock(return_value=1.1088),
+            "backend.services.canonical_mark_price._fetch_binance_1m_kline",
+            new=AsyncMock(return_value={"high": 1.1088, "close": 1.1088}),
         ):
             mark = await fetch_canonical_mark("XRP/USDT", use_cache=False)
 

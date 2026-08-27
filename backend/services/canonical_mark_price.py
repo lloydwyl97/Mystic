@@ -37,6 +37,7 @@ class CanonicalMark:
     age_seconds: float
     fresh: bool
     kline_1m_close: float | None = None
+    kline_1m_high: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -75,7 +76,7 @@ async def _fetch_binance_last_price(bus: str) -> float | None:
     return last_px if last_px > 0 else None
 
 
-async def _fetch_binance_1m_close(bus: str) -> float | None:
+async def _fetch_binance_1m_kline(bus: str) -> dict[str, float] | None:
     from backend.services.canonical_http_client import get_http_client
 
     client = await get_http_client()
@@ -85,7 +86,22 @@ async def _fetch_binance_1m_close(bus: str) -> float | None:
     rows = resp.json()
     if not rows:
         return None
+    high_px = float(rows[0][2])
     close_px = float(rows[0][4])
+    if close_px <= 0 and high_px <= 0:
+        return None
+    return {
+        "open_time": float(rows[0][0]),
+        "high": high_px if high_px > 0 else close_px,
+        "close": close_px if close_px > 0 else high_px,
+    }
+
+
+async def _fetch_binance_1m_close(bus: str) -> float | None:
+    kline = await _fetch_binance_1m_kline(bus)
+    if not kline:
+        return None
+    close_px = float(kline.get("close") or 0.0)
     return close_px if close_px > 0 else None
 
 
@@ -148,6 +164,8 @@ async def fetch_canonical_mark(symbol: str, *, use_cache: bool = True) -> Canoni
             payload = dict(cached[1])
             payload["age_seconds"] = max(0.0, now - float(payload.get("timestamp") or now))
             payload["fresh"] = payload["age_seconds"] <= float(SELL_MARK_MAX_AGE_SECONDS)
+            payload.setdefault("kline_1m_close", None)
+            payload.setdefault("kline_1m_high", None)
             return CanonicalMark(**payload)
 
     bid = ask = mid = last = kline_close = None
@@ -178,10 +196,16 @@ async def fetch_canonical_mark(symbol: str, *, use_cache: bool = True) -> Canoni
             return redis_mark
         return None
 
+    kline_close = None
+    kline_high = None
     try:
-        kline_close = await _fetch_binance_1m_close(bus)
+        kline = await _fetch_binance_1m_kline(bus)
+        if kline:
+            kline_close = float(kline.get("close") or 0.0) or None
+            kline_high = float(kline.get("high") or 0.0) or None
     except Exception:
         kline_close = None
+        kline_high = None
 
     result = CanonicalMark(
         symbol=ccxt_sym,
@@ -196,6 +220,7 @@ async def fetch_canonical_mark(symbol: str, *, use_cache: bool = True) -> Canoni
         age_seconds=0.0,
         fresh=True,
         kline_1m_close=kline_close,
+        kline_1m_high=kline_high,
     )
     if use_cache:
         _CANONICAL_MARK_CACHE[bus] = (now, result.to_dict())
@@ -216,6 +241,7 @@ def canonical_mark_to_exit_telemetry_fields(mark: CanonicalMark | None) -> dict[
             "mid": None,
             "last": None,
             "kline_1m_close": None,
+            "kline_1m_high": None,
             "canonical_source": "missing",
         }
     stale = not mark.fresh or mark.age_seconds > float(SELL_MARK_MAX_AGE_SECONDS)
@@ -231,6 +257,7 @@ def canonical_mark_to_exit_telemetry_fields(mark: CanonicalMark | None) -> dict[
         "mid": mark.mid,
         "last": mark.last,
         "kline_1m_close": mark.kline_1m_close,
+        "kline_1m_high": mark.kline_1m_high,
         "canonical_source": mark.source,
         "symbol_format": mark.symbol_format,
     }

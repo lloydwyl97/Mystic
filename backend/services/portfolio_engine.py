@@ -3985,6 +3985,7 @@ class PortfolioEngine:
                 "mid": float(cached_price),
                 "last": float(cached_price),
                 "kline_1m_close": None,
+                "kline_1m_high": None,
                 "canonical_source": "price_cache",
                 "symbol_format": ns,
             }
@@ -4009,6 +4010,7 @@ class PortfolioEngine:
             "mid": stale_px if stale_px > 0 else None,
             "last": stale_px if stale_px > 0 else None,
             "kline_1m_close": None,
+            "kline_1m_high": None,
             "canonical_source": "missing" if stale_px <= 0 else "price_cache_stale",
             "symbol_format": ns,
         }
@@ -12045,10 +12047,34 @@ class PortfolioEngine:
                 any_stale_marks = True
                 continue
 
-            # Update high/low watermarks (for MFE/MAE diagnostics)
+            # Update high/low watermarks (for MFE/MAE diagnostics).
+            # High-water folds executable mark AND the live 1m high already
+            # fetched on this path so a brief post-entry print is not lost
+            # between 45s book-mid samples. Exits still use current_price (mid).
+            from backend.services.day_high_water import (
+                first_full_minute_epoch,
+                fold_high_water,
+                load_feature_1m_candles,
+                max_post_entry_1m_high,
+            )
+
             old_high = position.highest_price
             old_low = float(getattr(position, "lowest_price", 0.0) or 0.0)
-            position.highest_price = max(position.highest_price, current_price)
+            kline_high = mark_info.get("kline_1m_high")
+            hist_high = 0.0
+            if not getattr(position, "_hw_1m_backfilled", False):
+                entry_ts = float(getattr(position, "entry_time", 0.0) or 0.0)
+                hist_high = max_post_entry_1m_high(
+                    entry_ts,
+                    load_feature_1m_candles(symbol, first_full_minute_epoch(entry_ts)),
+                )
+                position._hw_1m_backfilled = True
+            position.highest_price = fold_high_water(
+                position.highest_price,
+                current_price,
+                kline_high,
+                hist_high,
+            )
             if not hasattr(position, "lowest_price") or position.lowest_price <= 0:
                 position.lowest_price = min(position.entry_price, current_price)
             else:
