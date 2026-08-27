@@ -9,6 +9,8 @@ from backend.services.day_trade_thesis import (
     htf_4h_rise_broken,
     htf_4h_rise_intact,
     intact_4h_slot_blocked,
+    late_4h_rise_signal,
+    same_4h_rise_rebuy_signal,
     should_block_late_4h_rise_entry,
     should_block_rebuy_on_4h_rise,
     thesis_invalidated_live,
@@ -88,8 +90,17 @@ def test_block_rebuy_after_tp1_while_4h_rising():
         bundle={"4h": _rising_4h()},
         now_epoch=1_700_000_100.0,
     )
-    assert blocked is True
-    assert why == "SAME_4H_RISE_NO_REBUY"
+    assert blocked is False
+    assert why == ""
+    assert (
+        same_4h_rise_rebuy_signal(
+            last_close_reason="NET_PROFIT_EXIT",
+            last_close_epoch=1_700_000_000.0,
+            bundle={"4h": _rising_4h()},
+            now_epoch=1_700_000_100.0,
+        )
+        == "SAME_4H_RISE_NO_REBUY"
+    )
 
 
 def test_allow_rebuy_after_one_4h_bar_even_if_rise_still_intact():
@@ -109,8 +120,9 @@ def test_block_late_4h_entry_when_1h_weak():
         {"4h": _rising_4h(), "1h": {"ema_align": 0.20}},
         now_epoch=1_700_849_600.0 + 600.0,
     )
-    assert blocked is True
-    assert why == "LATE_4H_RISE_1H_WEAK"
+    assert blocked is False
+    assert why == ""
+    assert late_4h_rise_signal({"4h": _rising_4h(), "1h": {"ema_align": 0.20}}, 1_700_849_600.0 + 600.0) == "LATE_4H_RISE_1H_WEAK"
 
 
 def test_block_late_4h_entry_when_bar_is_late():
@@ -119,8 +131,9 @@ def test_block_late_4h_entry_when_bar_is_late():
         {"4h": _rising_4h()},
         now_epoch=last_ts_ms / 1000.0 + 11_000.0,
     )
-    assert blocked is True
-    assert why == "LATE_4H_RISE_BAR_LATE"
+    assert blocked is False
+    assert why == ""
+    assert late_4h_rise_signal({"4h": _rising_4h()}, last_ts_ms / 1000.0 + 11_000.0) == "LATE_4H_RISE_BAR_LATE"
 
 
 def test_intact_4h_slot_cap_blocks_third_name():
@@ -172,14 +185,17 @@ def test_engine_maps_structure_break_not_tp1():
 
 
 def test_rebuy_block_is_wired_into_the_buy_path():
-    """The helper is useless unless execute_buy_fifo actually calls it."""
+    """Same-rise is telemetry/rank only — buy path must not reject it."""
     import inspect
 
     from backend.services.portfolio_engine import PortfolioEngine
 
-    assert "should_block_rebuy_on_4h_rise" in inspect.getsource(PortfolioEngine._same_4h_rise_rebuy_block)
-    # execute_buy_fifo is a thin locking wrapper; the guard lives under the lock.
-    assert "_same_4h_rise_rebuy_block" in inspect.getsource(PortfolioEngine._execute_buy_fifo_locked)
+    buy_src = inspect.getsource(PortfolioEngine._execute_buy_fifo_locked)
+    can_src = inspect.getsource(PortfolioEngine._can_open_position)
+    assert "same_4h_rise_no_rebuy" not in buy_src
+    assert "late_4h_rise_no_buy" not in buy_src
+    assert "late_4h_rise_no_buy" not in can_src
+    assert "_log_day_rise_rank_telemetry" in buy_src
 
 
 def test_allow_rebuy_after_non_profit_exit():
@@ -223,11 +239,11 @@ def test_large_gain_on_intact_trend_now_takes_profit():
 
 
 def test_profit_is_not_gated_behind_structure_break_in_source():
-    """The old guard returned None whenever the 4H rise was not broken."""
+    """Path-aware leftover NET_PROFIT clip is skipped; legacy string may remain."""
     import inspect
 
     from backend.services.portfolio_engine import PortfolioEngine
 
     src = inspect.getsource(PortfolioEngine._check_exit_conditions)
-    assert "day_intact_profit_floor" in src
-    assert "DAY_4H_INTACT_PROFIT_TAKE" in src
+    assert "_path_aware_exit_enabled" in src
+    assert "return None" in src

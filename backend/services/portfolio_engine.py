@@ -5247,34 +5247,51 @@ class PortfolioEngine:
             return None
 
     def _same_4h_rise_rebuy_block(self, symbol: str) -> tuple[bool, str]:
-        """Block a rebuy into the same 4H rise the engine just took profit on."""
+        """Diagnostic only. Same-rise rebuy is never a permission block."""
         try:
             from backend.services.day_active_market_bundle import read_cached_day_active_bundle_sync
-            from backend.services.day_trade_thesis import should_block_rebuy_on_4h_rise
+            from backend.services.day_trade_thesis import same_4h_rise_rebuy_signal
 
             last = self._lookup_last_position_close(symbol)
             if not last:
                 return False, ""
-            return should_block_rebuy_on_4h_rise(
+            why = same_4h_rise_rebuy_signal(
                 last_close_reason=last.get("close_reason"),
                 last_close_epoch=last.get("closed_at_epoch"),
                 bundle=read_cached_day_active_bundle_sync(symbol),
                 now_epoch=time.time(),
             )
+            return False, why
         except Exception:
             return False, ""
 
     def _late_4h_rise_entry_block(self, symbol: str) -> tuple[bool, str]:
+        """Diagnostic only. Late-4H is never a permission block."""
         try:
             from backend.services.day_active_market_bundle import read_cached_day_active_bundle_sync
-            from backend.services.day_trade_thesis import should_block_late_4h_rise_entry
+            from backend.services.day_trade_thesis import late_4h_rise_signal
 
-            return should_block_late_4h_rise_entry(
+            why = late_4h_rise_signal(
                 read_cached_day_active_bundle_sync(symbol),
                 time.time(),
             )
+            return False, why
         except Exception:
             return False, ""
+
+    def _log_day_rise_rank_telemetry(self, symbol: str) -> None:
+        try:
+            _rebuy_blocked, rebuy_why = self._same_4h_rise_rebuy_block(symbol)
+            _late_blocked, late_why = self._late_4h_rise_entry_block(symbol)
+            if rebuy_why or late_why:
+                logger.info(
+                    "QUALITY_TELEMETRY DAY_RISE_RANK_ONLY symbol=%s same_rise=%s late_4h=%s (not blocking)",
+                    symbol,
+                    rebuy_why or "",
+                    late_why or "",
+                )
+        except Exception:
+            return
 
     def _intact_4h_open_count(self, exclude: str = "") -> int:
         from backend.services.day_trade_thesis import htf_4h_rise_intact_for_symbol
@@ -7383,6 +7400,9 @@ class PortfolioEngine:
         )
         dd = apply_liquidity_gate_to_decision_data(dd, candidate.symbol)
         dd = apply_htf_anchor_to_decision_data(dd)
+        from backend.services.day_trade_thesis import apply_late_4h_rank_to_decision_data
+
+        dd = apply_late_4h_rank_to_decision_data(dd, candidate.symbol)
         dd = apply_entry_confirmation_to_decision_data(
             dd,
             current_price=float(getattr(candidate, "current_price", 0.0) or 0.0),
@@ -8507,47 +8527,9 @@ class PortfolioEngine:
                 )
             return None
 
-        # A profit close on a 4H rise is anti-churn for one 4H bar only.
-        # After that, a flat book may re-enter even if the rise is still intact.
-        rebuy_blocked, rebuy_why = self._same_4h_rise_rebuy_block(normalized_symbol)
-        if rebuy_blocked:
-            logger.info(
-                "DAY_REBUY_BLOCKED_SAME_4H_RISE symbol=%s reason=%s",
-                normalized_symbol,
-                rebuy_why,
-            )
-            await self._record_reject(
-                normalized_symbol,
-                "BUY",
-                "same_4h_rise_no_rebuy",
-                rebuy_why,
-                decision_id=decision_id,
-                explainability=explainability,
-            )
-            if decision_id:
-                await self._update_pipeline_decision(
-                    decision_id,
-                    {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": rebuy_why},
-                )
-            return None
-
-        late_blocked, late_why = self._late_4h_rise_entry_block(normalized_symbol)
-        if late_blocked:
-            logger.info("DAY_ENTRY_BLOCKED_LATE_4H_RISE symbol=%s reason=%s", normalized_symbol, late_why)
-            await self._record_reject(
-                normalized_symbol,
-                "BUY",
-                "late_4h_rise_no_buy",
-                late_why,
-                decision_id=decision_id,
-                explainability=explainability,
-            )
-            if decision_id:
-                await self._update_pipeline_decision(
-                    decision_id,
-                    {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": late_why},
-                )
-            return None
+        # Same-rise / late-4H are rank/size diagnostics, not permission.
+        # After any exit the symbol returns to the normal four-coin ranking.
+        self._log_day_rise_rank_telemetry(normalized_symbol)
 
         slot_blocked, slot_why = self._intact_4h_slot_block(normalized_symbol)
         if slot_blocked:
@@ -11838,9 +11820,6 @@ class PortfolioEngine:
                 logger.info(f"BUY_BLOCKED_MAX_POSITIONS: {symbol} - portfolio full (active={active_count}, pending_slots={pending_slots}, total={len(self.open_positions)}/{max_positions_limit})")
                 return False, "MAX_POSITIONS_REACHED"
 
-        late_blocked, late_why = self._late_4h_rise_entry_block(symbol)
-        if late_blocked:
-            return False, late_why
         slot_blocked, slot_why = self._intact_4h_slot_block(symbol)
         if slot_blocked:
             return False, slot_why
@@ -12293,6 +12272,7 @@ class PortfolioEngine:
 
         from backend.services.day_controlled_exits import (
             EXIT_PATH_EXECUTABLE_PROFIT,
+            _path_aware_exit_enabled,
             evaluate_engine_managed_exit,
         )
         from backend.services.day_trade_thesis import EXIT_NET_PROFIT
@@ -12335,6 +12315,12 @@ class PortfolioEngine:
                 current_bar=current_bar,
                 force_sell=exit_type == ExitType.MANUAL,
             )
+
+        # Path-aware already decided hold. Do not leftover-clip a green intact rise
+        # via DAY_4H_INTACT_PROFIT_TAKE / TP1 / NET_PROFIT. Trail, giveback,
+        # stall, risk floor, and 4H break remain in evaluate_engine_managed_exit.
+        if _path_aware_exit_enabled():
+            return None
 
         require_tf_ctx = os.getenv("DAY_EXIT_REQUIRE_FULL_TF_CONTEXT", "true").lower() in ("1", "true", "yes", "on")
         missing_list = None if day_hold_missing is None else list(day_hold_missing)

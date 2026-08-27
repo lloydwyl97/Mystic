@@ -54,6 +54,7 @@ DAY_FULL_FLATTEN_REASONS = frozenset(
         EXIT_DAY_4H_STRUCTURE_BREAK,
         EXIT_DAY_RISK_FLOOR,
         EXIT_EXTREME_PROTECTION,
+        EXIT_TRAILING_STOP,
         EXIT_GIVEBACK,
         EXIT_STALL_DEAD,
     }
@@ -66,11 +67,11 @@ _exit_policy_logged = False
 def _path_aware_exit_enabled() -> bool:
     """DAY exit policy: hold the 4H thesis; sell only on structure break or extreme.
 
-    When enabled (production default), the legacy ladder below — stop, trail,
-    thesis-red, stall, time stop, and the net-profit clips — is unreachable.
-    Giveback and stall stay reachable on an intact 4H hold: a real MFE that
-    reverses to red, or a 2h dead red lot that never bounced, must not wait
-    for the 4H close. Disabling path-aware restores the full ladder.
+    When enabled (production default), the leftover net-profit / TP1 clips
+    stay unreachable. An intact 4H hold still sells on: extreme protection,
+    risk floor, an activated trailing stop (price pulled back through the
+    ratchet), giveback-to-red, stall, or a later 4H structure break.
+    Disabling path-aware restores the full leftover ladder.
     """
     raw = os.getenv("DAY_PATH_AWARE_EXIT")
     enabled = (raw if raw is not None else "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -173,7 +174,20 @@ def _evaluate_path_aware_exit(
         if stall is not None and str(stall.get("action") or "") == "sell":
             return {**stall, **base, "reason": EXIT_STALL_DEAD}
 
-    # 4H still rising: never TP1 / net-profit / first-executable / trail / time-stop.
+    # Existing trail: once the high-water ratchet is armed, a pullback through
+    # it is deterioration — not a "green enough" clip.
+    trail_pct = float(getattr(position, "trail_pct", 0) or coin_profile.get("trail") or 0.005)
+    highest = float(getattr(position, "highest_price", entry) or entry)
+    trail = float(getattr(position, "trailing_stop_price", 0) or 0)
+    if trail > 0 and highest >= entry * (1.0 + trail_pct) - 1e-12 and current_price <= trail:
+        return {
+            "action": "sell",
+            "reason": EXIT_TRAILING_STOP,
+            "detail": f"trail={trail:.8f}",
+            **base,
+        }
+
+    # 4H still rising: never TP1 / leftover net-profit / time-stop.
     if snap4["htf_4h_rise_intact"]:
         return {
             "action": "hold",
@@ -1061,18 +1075,14 @@ def _trail_semantics(
     Persisted ``trailing_stop_price`` is a high-water ratchet:
     ``highest * (1 - trail_distance)`` after ``highest >= entry * (1 + trail_distance)``.
     For a long that is an intended *stop below the high*, not a target above market.
-    Path-aware execution does not sell on that ratchet; leftover net-profit and the
-    risk floor / 4H break / extreme protection do.
+    Path-aware sells when the mark pulls back through that ratchet.
     """
     highest = float(getattr(position, "highest_price", entry) or entry)
     trail_distance = float(getattr(position, "trail_pct", 0.0) or coin_profile.get("trail") or 0.005)
     trail_activation = entry * (1.0 + trail_distance) if entry > 0 else 0.0
     ratchet = float(getattr(position, "trailing_stop_price", 0.0) or 0.0)
     activated = bool(entry > 0 and highest >= trail_activation - 1e-12)
-    # Executable only in the legacy ladder, and only as a stop *below* the mark.
-    executable_trail = None
-    if (not path_aware) and activated and ratchet > 0 and 0 < ratchet <= float(current_price or 0.0):
-        executable_trail = ratchet
+    executable_trail = ratchet if activated and ratchet > 0 else None
     snap4 = day_4h_structure_snapshot(bundle)
     hard_stop = resolve_day_risk_floor_price(
         entry_price=entry,
@@ -1091,7 +1101,7 @@ def _trail_semantics(
         "executable_trailing_stop": executable_trail,
         "hard_stop": hard_stop,
         "persisted_stop_price": persisted_stop,
-        "trailing_stop_in_exit_authority": bool(not path_aware and executable_trail is not None),
+        "trailing_stop_in_exit_authority": bool(executable_trail is not None),
         "path_aware_exit": path_aware,
         "4h_bundle_present": bool(snap4.get("4h_bundle_present")),
         "prior_4h_low": snap4.get("prior_4h_low"),
@@ -1112,9 +1122,9 @@ def preview_next_engine_exit(
     """Read-only: next *executable* exit authority and trail-field split.
 
     Does not mutate exit behaviour. When path-aware is on, ``next_engine_exit``
-    is the authority that can actually flatten the position — not the legacy
-    ladder's ``current_price <= ratchet_trail`` check, which is true whenever
-    the mark is below a high-water ratchet and is not an exit in this policy.
+    is the authority that can actually flatten the position: risk floor,
+    activated trail (mark through the ratchet), giveback, stall, or 4H break.
+    Leftover intact-floor NET_PROFIT is not an executable authority.
     """
     entry = float(getattr(position, "entry_price", 0.0) or 0.0)
     stop = effective_stop_price(entry, float(getattr(position, "stop_price", 0) or 0), float(getattr(position, "thesis_invalid_level", 0) or 0))
@@ -1197,33 +1207,22 @@ def preview_next_engine_exit(
             next_exit = current_authority
             next_executable_condition = current_authority
         else:
-            # Leftover path in portfolio_engine._check_exit_conditions: intact
-            # 4H may still take profit once net clears the structure-aware floor.
-            # That is existing execution, reported here — not a new gate.
-            try:
-                from backend.services.portfolio_engine import day_intact_profit_floor
-
-                min_net = float(min_net_profit_for_symbol(str(getattr(position, "symbol", "") or "")))
-                intact_floor = day_intact_profit_floor(
-                    entry_price=entry,
-                    prior_4h_low=float(trail_info.get("prior_4h_low") or 0.0),
-                    min_net_profit=min_net,
-                )
-            except Exception:
-                intact_floor = float(MIN_NET_PROFIT_TO_SELL) * 2.0
-            if (not trail_info.get("htf_4h_rise_broken")) and net_pnl_pct + 1e-12 >= intact_floor:
-                next_exit = EXIT_NET_PROFIT
-                next_executable_condition = f"{EXIT_NET_PROFIT}_intact_floor"
-                current_authority = f"{current_authority}+{EXIT_NET_PROFIT}_intact_floor"
+            if checks["trailing_stop"]:
+                next_exit = EXIT_TRAILING_STOP
+                next_executable_condition = EXIT_TRAILING_STOP
+                current_authority = EXIT_TRAILING_STOP
             elif checks["risk_floor"]:
                 next_exit = EXIT_DAY_RISK_FLOOR
                 next_executable_condition = EXIT_DAY_RISK_FLOOR
+            elif trail_info.get("executable_trailing_stop"):
+                next_exit = current_authority
+                next_executable_condition = EXIT_TRAILING_STOP
+            elif trail_info["hard_stop"] > 0 and entry > 0:
+                next_exit = current_authority
+                next_executable_condition = f"{EXIT_DAY_RISK_FLOOR}_or_{EXIT_DAY_4H_STRUCTURE_BREAK}"
             else:
                 next_exit = current_authority
-                if trail_info["hard_stop"] > 0 and entry > 0:
-                    next_executable_condition = f"{EXIT_DAY_RISK_FLOOR}_or_{EXIT_DAY_4H_STRUCTURE_BREAK}"
-                else:
-                    next_executable_condition = EXIT_DAY_4H_STRUCTURE_BREAK
+                next_executable_condition = EXIT_DAY_4H_STRUCTURE_BREAK
 
     dist_stop_pct = ((current_price - stop) / entry) if stop > 0 and entry > 0 else None
     dist_hard_pct = (

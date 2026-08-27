@@ -305,6 +305,7 @@ def test_only_structure_break_and_extreme_may_full_flatten():
         EXIT_DAY_4H_STRUCTURE_BREAK,
         EXIT_DAY_RISK_FLOOR,
         EXIT_EXTREME_PROTECTION,
+        EXIT_TRAILING_STOP,
         EXIT_GIVEBACK,
         EXIT_STALL_DEAD,
     }
@@ -387,8 +388,7 @@ def test_accepted_artifact_with_bars_stamps_model_version():
 
 
 def test_preview_does_not_name_nonexecutable_trail_when_path_aware():
-    """BTC-shaped book: mark below high-water ratchet. Path-aware must not
-    report TRAILING_STOP as the next executable authority."""
+    """BTC-shaped book: mark through the high-water ratchet is a trail sell."""
     pos = _Pos(
         entry_price=77374.93,
         highest_price=78745.84,
@@ -410,13 +410,12 @@ def test_preview_does_not_name_nonexecutable_trail_when_path_aware():
     )
     assert preview["path_aware_exit"] is True
     assert preview["legacy_ladder_next_exit"] == EXIT_TRAILING_STOP
-    assert preview["next_engine_exit"] != EXIT_TRAILING_STOP
-    assert preview["executable_trailing_stop"] is None
-    assert preview["trailing_stop_in_exit_authority"] is False
+    assert preview["next_engine_exit"] == EXIT_TRAILING_STOP
+    assert preview["executable_trailing_stop"] == pytest.approx(78588.35)
+    assert preview["trailing_stop_in_exit_authority"] is True
     assert preview["high_water"] == pytest.approx(78745.84)
     assert preview["hard_stop"] > 0
     assert preview["hard_stop"] < 77374.93
-    assert "TRAILING_STOP" not in str(preview["current_exit_authority"])
 
 
 def test_preview_splits_trail_fields_and_names_intact_profit_when_ready():
@@ -443,6 +442,76 @@ def test_preview_splits_trail_fields_and_names_intact_profit_when_ready():
     assert preview["high_water"] == pytest.approx(1.49925)
     assert preview["trail_activation"] == pytest.approx(1.378 * 1.005)
     assert preview["trail_distance"] == pytest.approx(0.005)
-    assert preview["executable_trailing_stop"] is None
-    assert preview["next_engine_exit"] == EXIT_NET_PROFIT
-    assert "NET_PROFIT" in str(preview["current_exit_authority"])
+    assert preview["executable_trailing_stop"] == pytest.approx(1.49625)
+    assert preview["next_engine_exit"] == EXIT_TRAILING_STOP
+    assert "NET_PROFIT" not in str(preview["current_exit_authority"])
+
+
+def test_intact_green_sol_clip_level_holds_until_trail():
+    """Replay: SOL 101.08 → 102.52 was NET_PROFIT while 4H advanced. Must hold."""
+    rows = _rising_4h_rows(start=100.59)
+    pos = _Pos(
+        entry_price=101.08,
+        highest_price=102.52,
+        lowest_price=101.00,
+        stop_price=0.0,
+        trailing_stop_price=102.52 * 0.995,
+        trail_pct=0.005,
+        thesis_invalid_level=0.0,
+        symbol="SOL/USDT",
+    )
+    hold = evaluate_engine_managed_exit(
+        position=pos,
+        current_price=102.52,
+        net_pnl_pct=0.012508,
+        hold_minutes=244.0,
+        coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
+        bundle={"4h": rows},
+    )
+    assert hold["action"] == "hold"
+    assert hold["reason"] == "PATH_AWARE_HOLD_4H_RISE"
+    trail_hit = evaluate_engine_managed_exit(
+        position=pos,
+        current_price=102.52 * 0.995 - 0.01,
+        net_pnl_pct=0.007,
+        hold_minutes=300.0,
+        coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
+        bundle={"4h": rows},
+    )
+    assert trail_hit["action"] == "sell"
+    assert trail_hit["reason"] == EXIT_TRAILING_STOP
+
+
+def test_intact_green_eth_clip_level_holds_until_trail():
+    """Replay: ETH 2535.56 → 2565.31 was NET_PROFIT on intact 4H. Must hold."""
+    rows = _rising_4h_rows(start=2482.93)
+    pos = _Pos(
+        entry_price=2535.56,
+        highest_price=2565.31,
+        lowest_price=2530.0,
+        stop_price=0.0,
+        trailing_stop_price=2565.31 * 0.995,
+        trail_pct=0.005,
+        thesis_invalid_level=0.0,
+        symbol="ETH/USDT",
+    )
+    hold = evaluate_engine_managed_exit(
+        position=pos,
+        current_price=2565.31,
+        net_pnl_pct=0.010962,
+        hold_minutes=12.0,
+        coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
+        bundle={"4h": rows},
+    )
+    assert hold["action"] == "hold"
+    assert hold["reason"] == "PATH_AWARE_HOLD_4H_RISE"
+    trail_hit = evaluate_engine_managed_exit(
+        position=pos,
+        current_price=2565.31 * 0.995 - 0.5,
+        net_pnl_pct=0.005,
+        hold_minutes=40.0,
+        coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
+        bundle={"4h": rows},
+    )
+    assert trail_hit["action"] == "sell"
+    assert trail_hit["reason"] == EXIT_TRAILING_STOP

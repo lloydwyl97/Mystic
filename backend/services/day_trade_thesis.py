@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from typing import Any
 
 from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_PROFIT_TO_SELL
@@ -1119,6 +1120,30 @@ def htf_4h_rise_intact_for_symbol(symbol: str) -> bool:
         return False
 
 
+def same_4h_rise_rebuy_signal(
+    *,
+    last_close_reason: str | None,
+    last_close_epoch: float | None,
+    bundle: dict[str, Any] | None,
+    now_epoch: float,
+) -> str:
+    """Diagnostic label only. Never a permission to skip ranking."""
+    if not is_day_profit_close_reason(last_close_reason):
+        return ""
+    try:
+        closed = float(last_close_epoch or 0.0)
+    except (TypeError, ValueError):
+        closed = 0.0
+    age = (float(now_epoch) - closed) if closed > 0 else float("inf")
+    if age >= 14400.0:
+        return ""
+    if htf_4h_rise_intact(bundle):
+        return "SAME_4H_RISE_NO_REBUY"
+    if htf_4h_rise_broken(bundle):
+        return ""
+    return "SAME_4H_BAR_NO_REBUY"
+
+
 def should_block_rebuy_on_4h_rise(
     *,
     last_close_reason: str | None,
@@ -1126,26 +1151,8 @@ def should_block_rebuy_on_4h_rise(
     bundle: dict[str, Any] | None,
     now_epoch: float,
 ) -> tuple[bool, str]:
-    """Block same-rise rebuy after a TP1/path-aware clip for one 4H bar.
-
-    The block is anti-churn on the bar that was just clipped. It must not
-    sideline a flat book for the entire remaining bull rise — that left
-    live DAY in cash for 14h–36h+ while 4H stayed intact.
-    """
-    if not is_day_profit_close_reason(last_close_reason):
-        return False, ""
-    try:
-        closed = float(last_close_epoch or 0.0)
-    except (TypeError, ValueError):
-        closed = 0.0
-    age = (float(now_epoch) - closed) if closed > 0 else float("inf")
-    if age >= 14400.0:
-        return False, ""
-    if htf_4h_rise_intact(bundle):
-        return True, "SAME_4H_RISE_NO_REBUY"
-    if htf_4h_rise_broken(bundle):
-        return False, ""
-    return True, "SAME_4H_BAR_NO_REBUY"
+    """Never a trade-opinion blocker. Same-rise is rank/diagnostic only."""
+    return False, ""
 
 
 def _current_4h_bar_progress(bundle: dict[str, Any] | None, now_epoch: float) -> float | None:
@@ -1171,19 +1178,18 @@ def _current_4h_bar_progress(bundle: dict[str, Any] | None, now_epoch: float) ->
     return max(0.0, min(1.0, (float(now_epoch) - ts) / 14400.0))
 
 
-def should_block_late_4h_rise_entry(
-    bundle: dict[str, Any] | None,
-    now_epoch: float,
-) -> tuple[bool, str]:
-    """Block a new DAY buy into a 4H rise that is already late or fading.
+_LATE_4H_RANK_SIZE = {
+    "LATE_4H_RISE_1H_WEAK": (-0.04, 0.85),
+    "LATE_4H_RISE_NO_HH": (-0.04, 0.85),
+    "LATE_4H_RISE_RED_BAR": (-0.03, 0.90),
+    "LATE_4H_RISE_BAR_LATE": (-0.03, 0.90),
+}
 
-    Intact 4H is not enough. Afternoon live losers bought the same rise after
-    it had already peaked, then waited for the 4H close to sell the fade.
-    """
-    if os.getenv("DAY_LATE_4H_ENTRY_BLOCK", "true").lower() not in ("1", "true", "yes", "on"):
-        return False, ""
+
+def late_4h_rise_signal(bundle: dict[str, Any] | None, now_epoch: float) -> str:
+    """Late-rise diagnostic. Used for rank/size only — never permission."""
     if not htf_4h_rise_intact(bundle):
-        return False, ""
+        return ""
     try:
         align1_max = float(os.getenv("DAY_LATE_4H_1H_ALIGN_MAX", "0.42"))
     except (TypeError, ValueError):
@@ -1194,19 +1200,61 @@ def should_block_late_4h_rise_entry(
         bar_late = 0.70
     align1 = _bundle_tf_align(bundle, "1h")
     if align1 is not None and align1 < align1_max:
-        return True, "LATE_4H_RISE_1H_WEAK"
+        return "LATE_4H_RISE_1H_WEAK"
     candles = _4h_recent_ohlc(bundle)
     align4 = _bundle_tf_align(bundle, "4h")
     if len(candles) >= 2:
         o, h, _l, c = candles[-1]
         _po, ph, _pl, pc = candles[-2]
         if c < o and (align4 is None or align4 < 0.58):
-            return True, "LATE_4H_RISE_RED_BAR"
+            return "LATE_4H_RISE_RED_BAR"
         if h < ph and c < pc:
-            return True, "LATE_4H_RISE_NO_HH"
+            return "LATE_4H_RISE_NO_HH"
     frac = _current_4h_bar_progress(bundle, now_epoch)
     if frac is not None and frac >= bar_late:
-        return True, "LATE_4H_RISE_BAR_LATE"
+        return "LATE_4H_RISE_BAR_LATE"
+    return ""
+
+
+def late_4h_rank_size_adjust(signal: str) -> tuple[float, float]:
+    return _LATE_4H_RANK_SIZE.get(str(signal or ""), (0.0, 1.0))
+
+
+def apply_late_4h_rank_to_decision_data(decision_data: dict[str, Any], symbol: str) -> dict[str, Any]:
+    """Stamp late-4H as a rank/size adjustment. Never sets hard_block."""
+    dd = dict(decision_data or {})
+    try:
+        from backend.services.day_active_market_bundle import read_cached_day_active_bundle_sync
+
+        signal = late_4h_rise_signal(read_cached_day_active_bundle_sync(symbol), time.time())
+    except Exception:
+        signal = ""
+    rank_d, size_f = late_4h_rank_size_adjust(signal)
+    dd["late_4h_rise_signal"] = signal
+    dd["late_4h_rank_delta"] = rank_d
+    dd["late_4h_size_factor"] = size_f
+    if signal:
+        try:
+            prev_rank = float(dd.get("thesis_rank_delta") or 0.0)
+        except (TypeError, ValueError):
+            prev_rank = 0.0
+        try:
+            prev_size = float(dd.get("thesis_size_factor") or 1.0)
+        except (TypeError, ValueError):
+            prev_size = 1.0
+        dd["thesis_rank_delta"] = round(prev_rank + rank_d, 5)
+        dd["thesis_size_factor"] = round(max(0.20, prev_size * size_f), 5)
+    dd["hard_block"] = bool(dd.get("hard_block") or False)
+    if "candidate_eligible" not in dd:
+        dd["candidate_eligible"] = True
+    return dd
+
+
+def should_block_late_4h_rise_entry(
+    bundle: dict[str, Any] | None,
+    now_epoch: float,
+) -> tuple[bool, str]:
+    """Never a permission block. Late-4H is rank/size/diagnostics only."""
     return False, ""
 
 
