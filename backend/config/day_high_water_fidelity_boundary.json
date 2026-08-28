@@ -2,7 +2,7 @@
   "prior_constant_trail_baseline_sha": "7dd76d6",
   "high_water_fidelity_repair_sha": "4f215df",
   "entry_minute_guard": "skip_full_1m_high_when_candle_opened_before_first_full_minute_after_entry",
-  "HIGH_WATER_FIDELITY_VALID_START_LOCAL": null,
-  "HIGH_WATER_FIDELITY_VALID_START_OCEAN": null,
+  "HIGH_WATER_FIDELITY_VALID_START_LOCAL": "2026-08-28T00:03:55Z",
+  "HIGH_WATER_FIDELITY_VALID_START_OCEAN": "2026-08-28T00:05:20Z",
   "note": "Host start timestamps are written at deploy; do not rewrite prior trades. Clean repaired DAY economics begin at these stamps."
 }
