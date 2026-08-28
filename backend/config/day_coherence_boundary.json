@@ -8,7 +8,7 @@
     "fresh_coherent_forming_4h",
     "prebuy_exit_state_consistency"
   ],
-  "DAY_COHERENCE_VALID_START_LOCAL": "",
-  "DAY_COHERENCE_VALID_START_OCEAN": "",
+  "DAY_COHERENCE_VALID_START_LOCAL": "2026-08-28T13:01:40Z",
+  "DAY_COHERENCE_VALID_START_OCEAN": "2026-08-28T13:02:50Z",
   "note": "Host start timestamps are written at deploy; do not rewrite prior trades. Clean repaired DAY economics begin at these stamps."
 }
