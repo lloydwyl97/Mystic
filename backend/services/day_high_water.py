@@ -35,6 +35,47 @@ def first_full_minute_epoch(entry_epoch: float) -> float:
     return float((int(entry_epoch) // 60 + 1) * 60)
 
 
+def kline_open_is_post_entry(entry_epoch: float, kline_open_epoch: float | None) -> bool:
+    """True only when the 1m candle opened at or after the first full minute after entry.
+
+    The current forming candle high has no trade timestamp. If that candle
+    opened before entry, its high can include pre-entry prints. Without
+    intraminute stamps we must not use that full high.
+    """
+    if entry_epoch <= 0:
+        return False
+    if kline_open_epoch is None:
+        return False
+    try:
+        opened = float(kline_open_epoch)
+    except (TypeError, ValueError):
+        return False
+    if opened <= 0:
+        return False
+    if opened > 1e12:
+        opened = opened / 1000.0
+    return opened + 1e-9 >= first_full_minute_epoch(entry_epoch)
+
+
+def usable_kline_high(
+    entry_epoch: float,
+    kline_open_epoch: float | None,
+    kline_high: float | None,
+) -> float | None:
+    """Return 1m high only when the candle is proven post-entry. Else None."""
+    if kline_high is None:
+        return None
+    try:
+        high = float(kline_high)
+    except (TypeError, ValueError):
+        return None
+    if high <= 0:
+        return None
+    if not kline_open_is_post_entry(entry_epoch, kline_open_epoch):
+        return None
+    return high
+
+
 def _candle_open_epoch(candle: dict[str, Any]) -> float:
     raw = candle.get("open_time", candle.get("ts", candle.get("timestamp")))
     if raw is None:
@@ -53,13 +94,28 @@ def _candle_open_epoch(candle: dict[str, Any]) -> float:
 
 
 def max_post_entry_1m_high(entry_epoch: float, candles: list[dict[str, Any]] | None) -> float:
-    """Max 1m high from candles opening at or after the first full minute after entry."""
-    cutoff = first_full_minute_epoch(entry_epoch)
+    """Max 1m high from candles that cannot include a pre-entry print.
+
+    Explicit ``open_time``: include if the candle opened at or after the first
+    full minute after entry.
+
+    Persist-only ``ts`` (feature_ohlcv writes now()): require persist time at
+    or after first_full_minute+60s so an entry-minute bar flushed after the
+    minute close cannot leak a pre-entry wick.
+    """
+    full_min = first_full_minute_epoch(entry_epoch)
+    persist_cutoff = full_min + 60.0 if full_min > 0 else 0.0
     best = 0.0
     for candle in candles or []:
         if not isinstance(candle, dict):
             continue
-        ts = _candle_open_epoch(candle)
+        has_open = candle.get("open_time") is not None
+        if has_open:
+            ts = _candle_open_epoch({"open_time": candle.get("open_time")})
+            cutoff = full_min
+        else:
+            ts = _candle_open_epoch(candle)
+            cutoff = persist_cutoff
         if cutoff > 0 and ts + 1e-9 < cutoff:
             continue
         try:

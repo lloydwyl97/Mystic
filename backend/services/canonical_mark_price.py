@@ -38,6 +38,7 @@ class CanonicalMark:
     fresh: bool
     kline_1m_close: float | None = None
     kline_1m_high: float | None = None
+    kline_1m_open_time: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -166,6 +167,7 @@ async def fetch_canonical_mark(symbol: str, *, use_cache: bool = True) -> Canoni
             payload["fresh"] = payload["age_seconds"] <= float(SELL_MARK_MAX_AGE_SECONDS)
             payload.setdefault("kline_1m_close", None)
             payload.setdefault("kline_1m_high", None)
+            payload.setdefault("kline_1m_open_time", None)
             return CanonicalMark(**payload)
 
     bid = ask = mid = last = kline_close = None
@@ -198,14 +200,17 @@ async def fetch_canonical_mark(symbol: str, *, use_cache: bool = True) -> Canoni
 
     kline_close = None
     kline_high = None
+    kline_open = None
     try:
         kline = await _fetch_binance_1m_kline(bus)
         if kline:
             kline_close = float(kline.get("close") or 0.0) or None
             kline_high = float(kline.get("high") or 0.0) or None
+            kline_open = float(kline.get("open_time") or 0.0) or None
     except Exception:
         kline_close = None
         kline_high = None
+        kline_open = None
 
     result = CanonicalMark(
         symbol=ccxt_sym,
@@ -221,6 +226,7 @@ async def fetch_canonical_mark(symbol: str, *, use_cache: bool = True) -> Canoni
         fresh=True,
         kline_1m_close=kline_close,
         kline_1m_high=kline_high,
+        kline_1m_open_time=kline_open,
     )
     if use_cache:
         _CANONICAL_MARK_CACHE[bus] = (now, result.to_dict())
@@ -242,6 +248,7 @@ def canonical_mark_to_exit_telemetry_fields(mark: CanonicalMark | None) -> dict[
             "last": None,
             "kline_1m_close": None,
             "kline_1m_high": None,
+            "kline_1m_open_time": None,
             "canonical_source": "missing",
         }
     stale = not mark.fresh or mark.age_seconds > float(SELL_MARK_MAX_AGE_SECONDS)
@@ -258,6 +265,7 @@ def canonical_mark_to_exit_telemetry_fields(mark: CanonicalMark | None) -> dict[
         "last": mark.last,
         "kline_1m_close": mark.kline_1m_close,
         "kline_1m_high": mark.kline_1m_high,
+        "kline_1m_open_time": mark.kline_1m_open_time,
         "canonical_source": mark.source,
         "symbol_format": mark.symbol_format,
     }

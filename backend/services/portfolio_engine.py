@@ -3986,6 +3986,7 @@ class PortfolioEngine:
                 "last": float(cached_price),
                 "kline_1m_close": None,
                 "kline_1m_high": None,
+                "kline_1m_open_time": None,
                 "canonical_source": "price_cache",
                 "symbol_format": ns,
             }
@@ -4011,6 +4012,7 @@ class PortfolioEngine:
             "last": stale_px if stale_px > 0 else None,
             "kline_1m_close": None,
             "kline_1m_high": None,
+            "kline_1m_open_time": None,
             "canonical_source": "missing" if stale_px <= 0 else "price_cache_stale",
             "symbol_format": ns,
         }
@@ -12056,14 +12058,19 @@ class PortfolioEngine:
                 fold_high_water,
                 load_feature_1m_candles,
                 max_post_entry_1m_high,
+                usable_kline_high,
             )
 
             old_high = position.highest_price
             old_low = float(getattr(position, "lowest_price", 0.0) or 0.0)
-            kline_high = mark_info.get("kline_1m_high")
+            entry_ts = float(getattr(position, "entry_time", 0.0) or 0.0)
+            kline_high = usable_kline_high(
+                entry_ts,
+                mark_info.get("kline_1m_open_time"),
+                mark_info.get("kline_1m_high"),
+            )
             hist_high = 0.0
             if not getattr(position, "_hw_1m_backfilled", False):
-                entry_ts = float(getattr(position, "entry_time", 0.0) or 0.0)
                 hist_high = max_post_entry_1m_high(
                     entry_ts,
                     load_feature_1m_candles(symbol, first_full_minute_epoch(entry_ts)),
