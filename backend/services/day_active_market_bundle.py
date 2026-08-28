@@ -227,6 +227,23 @@ def read_cached_day_active_bundle_sync(ccxt_symbol: str) -> dict[str, list[list]
         return None
 
 
+def resolve_pre_buy_day_structure_bundle(
+    ccxt_symbol: str,
+    mtf_fallback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Pre-buy 4H must use the same OHLCV cache the exit monitor uses.
+
+    Ranking/context MTF is feature dicts (ema_align/trend), not candles.
+    ``htf_4h_rise_broken`` on that dict can stay intact via align >= 0.52
+    while live mark is already below the prior 4H low. Prefer the DAY
+    active bundle whenever it has at least two 4H bars.
+    """
+    active = read_cached_day_active_bundle_sync(ccxt_symbol)
+    if isinstance(active, dict) and isinstance(active.get("4h"), list) and len(active["4h"]) >= 2:
+        return active
+    return dict(mtf_fallback or {})
+
+
 def month_context_four_from_daily(ohlcv_1d: list[list]) -> tuple[list[float] | None, str | None]:
     """
     Calendar-month-style context derived **only** from real native **1d** candles.

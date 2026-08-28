@@ -8208,7 +8208,9 @@ class PortfolioEngine:
                 price_structure_regime=str(getattr(explainability, "price_structure_regime", "") or "unknown"),
             )
             dd_ec["day_route_regime"] = day_regime_ec
-            bundle_ec = _mtf_bundle(dd_ec, ctx_payload_ec)
+            from backend.services.day_active_market_bundle import resolve_pre_buy_day_structure_bundle
+
+            bundle_ec = resolve_pre_buy_day_structure_bundle(symbol, _mtf_bundle(dd_ec, ctx_payload_ec))
             spread_ec = float(getattr(explainability, "spread_pct", 0.0) or getattr(explainability, "entry_spread_pct", 0.0) or 0.0)
             consistency = evaluate_pre_buy_exit_consistency(
                 setup=str(getattr(explainability, "entry_thesis", "") or getattr(explainability, "setup_type", "") or ""),

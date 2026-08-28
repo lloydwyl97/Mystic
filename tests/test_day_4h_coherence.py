@@ -270,3 +270,56 @@ def test_1m_close_used_when_mark_absent():
     assert snap["current_4h_close"] == 79899.89
     assert snap["htf_4h_rise_broken"] is False
     assert snap["forming_close_source"] == "1m_close"
+
+
+def test_mtf_align_only_bundle_misses_already_broken_4h():
+    """Production hole: pre-buy used ranking MTF dicts, not OHLCV."""
+    now = _ts("2026-08-28T16:30:10Z")
+    mtf_only = {"4h": {"ema_align": 1.0, "trend": 1.0, "rsi": 60.0}}
+    snap = day_4h_structure_snapshot(mtf_only, current_price=2434.04, now_epoch=now)
+    assert snap["4h_bundle_missing"] is True
+    assert snap["htf_4h_rise_broken"] is False
+    allowed = _pre_buy(entry=2434.04, bundle=mtf_only, now_epoch=now)
+    assert allowed["allowed"] is True
+
+
+def test_clean_window_eth_xrp_btc_already_below_prior_low_blocked():
+    """Ocean 2026-08-28 clean-window BUY→seconds-later 4H-break cases."""
+    cases = [
+        ("2026-08-28T16:30:10Z", 2434.04, 2470.0, 2432.71),
+        ("2026-08-28T17:45:11Z", 1.3865, 1.3879, 1.38625),
+        ("2026-08-28T19:15:10Z", 77664.23, 78329.04, 77663.765),
+    ]
+    for iso, entry, prior_low, mark in cases:
+        now = _ts(iso)
+        open_ms = current_utc_4h_open_ms(now)
+        prior_ms = open_ms - DAY_4H_MS
+        prefix = _rising_prefix(60, prior_ms, start=prior_low * 0.95)
+        prior = [prior_ms, prior_low * 1.01, prior_low * 1.02, prior_low, prior_low * 1.005, 100.0]
+        forming = [open_ms, prior_low * 0.99, prior_low * 1.001, prior_low * 0.98, mark, 100.0]
+        bundle = {"4h": prefix + [prior, forming]}
+        snap = day_4h_structure_snapshot(bundle, current_price=entry, now_epoch=now)
+        assert snap["prior_4h_low"] == prior_low
+        assert snap["htf_4h_rise_broken"] is True
+        pre = _pre_buy(entry=entry, bundle=bundle, now_epoch=now)
+        assert pre["allowed"] is False, iso
+        assert pre["immediate_exit_reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
+
+
+def test_resolve_pre_buy_prefers_ohlcv_cache(monkeypatch):
+    from backend.services.day_active_market_bundle import resolve_pre_buy_day_structure_bundle
+
+    ohlcv = {"4h": [[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], "1h": []}
+    mtf = {"4h": {"ema_align": 1.0, "trend": 1.0}}
+    monkeypatch.setattr(
+        "backend.services.day_active_market_bundle.read_cached_day_active_bundle_sync",
+        lambda _sym: ohlcv,
+    )
+    got = resolve_pre_buy_day_structure_bundle("ETH/USDT", mtf)
+    assert got["4h"][1][3] == 10
+    monkeypatch.setattr(
+        "backend.services.day_active_market_bundle.read_cached_day_active_bundle_sync",
+        lambda _sym: None,
+    )
+    got = resolve_pre_buy_day_structure_bundle("ETH/USDT", mtf)
+    assert got["4h"]["ema_align"] == 1.0
