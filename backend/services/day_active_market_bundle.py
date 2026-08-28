@@ -314,6 +314,11 @@ async def _fetch_day_active_ohlcv_bundle_raw(
         prior_rows = prior_bundle.get(tf)
         prior_ts = prior_tf_fetched_at.get(tf, 0.0)
         still_fresh = isinstance(prior_rows, list) and len(prior_rows) >= min_bars_for_day_tf(tf) and (now - prior_ts) < _tf_refresh_interval_sec(tf)
+        if still_fresh and tf == "4h":
+            from backend.services.day_trade_thesis import fourh_requires_boundary_refresh
+
+            if fourh_requires_boundary_refresh(prior_rows, now):
+                still_fresh = False
         if still_fresh:
             out[tf] = prior_rows
             tf_fetched_at[tf] = prior_ts

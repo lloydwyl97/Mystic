@@ -1,0 +1,14 @@
+{
+  "prior_day_baseline_sha": "931c337",
+  "repair": "4h_forming_freshness_and_prebuy_consistency_and_constant_trail_no_bull_widen",
+  "includes": [
+    "high_water_fidelity",
+    "entry_minute_guard",
+    "constant_profile_trail_no_bull_widen",
+    "fresh_coherent_forming_4h",
+    "prebuy_exit_state_consistency"
+  ],
+  "DAY_COHERENCE_VALID_START_LOCAL": "",
+  "DAY_COHERENCE_VALID_START_OCEAN": "",
+  "note": "Host start timestamps are written at deploy; do not rewrite prior trades. Clean repaired DAY economics begin at these stamps."
+}

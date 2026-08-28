@@ -87,7 +87,7 @@ def test_profile_distance_holds_after_half_and_one_pct_mfe(symbol, entry, trail_
     profile = get_coin_profile(symbol)
     assert profile["trail"] == pytest.approx(trail_pct)
 
-    for mfe in (0.005, 0.010, 0.020):
+    for mfe in (0.005, 0.010, 0.015, 0.020, 0.050):
         high = entry * (1.0 + mfe)
         pos = _Pos(
             symbol=symbol,
@@ -96,6 +96,7 @@ def test_profile_distance_holds_after_half_and_one_pct_mfe(symbol, entry, trail_
             trail_pct=trail_pct,
             trailing_stop_price=0.0,
             stop_price=entry * (1.0 - profile["sl"]),
+            day_route_regime_at_entry="bull",
         )
         refresh_trailing_stop(pos, high, profile)
         profile_trail = high * (1.0 - trail_pct)
@@ -104,6 +105,9 @@ def test_profile_distance_holds_after_half_and_one_pct_mfe(symbol, entry, trail_
         assert pos.trailing_stop_price == pytest.approx(expected, rel=1e-6)
         assert pos.trailing_stop_price != pytest.approx(high * (1.0 - 0.0030), rel=1e-4)
         assert pos.trailing_stop_price != pytest.approx(high * (1.0 - 0.0020), rel=1e-4)
+        widened = high * (1.0 - min(trail_pct * 2.0, 0.025))
+        if abs(widened - expected) > 1e-6:
+            assert pos.trailing_stop_price != pytest.approx(widened, rel=1e-4)
 
 
 def test_high_water_ratchet_rises_with_new_highs():

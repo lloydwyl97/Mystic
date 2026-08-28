@@ -104,8 +104,9 @@ def _evaluate_path_aware_exit(
     bundle: dict[str, Any] | None,
     entry: float,
     atr_pct: float,
+    now_epoch: float | None = None,
 ) -> dict[str, Any]:
-    snap4 = day_4h_structure_snapshot(bundle)
+    snap4 = day_4h_structure_snapshot(bundle, current_price=current_price, now_epoch=now_epoch)
     extreme = evaluate_extreme_protection(
         entry_price=entry,
         mark=current_price,
@@ -979,13 +980,10 @@ def apply_break_even_and_mfe_trail(position: Any, current_price: float) -> bool:
 def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dict[str, Any] | None = None) -> bool:
     """Ratchet trailing stop when price makes new highs; returns True if level changed.
 
-    In bull regime, once price has moved DAY_BULL_TRAIL_MFE_THRESHOLD (default 1.5%)
-    in our favour, the trail distance is widened by DAY_BULL_TRAIL_MULTIPLIER (default 2x)
-    so normal intraday noise does not shake out a strongly trending position.
-
     After the base trailing update, apply_break_even_and_mfe_trail runs so
     once MFE clears round-trip cost the stop is lifted to break-even.
     Trail distance stays at the coin-profile value (CONSTANT). Never lowers.
+    Bull MFE widening is not applied.
     """
     entry = float(getattr(position, "entry_price", 0.0) or 0.0)
     if entry <= 0 or current_price <= 0:
@@ -994,13 +992,6 @@ def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dic
     profile = coin_profile or {}
     trail_pct = float(getattr(position, "trail_pct", 0.0) or profile.get("trail") or 0.005)
     highest = float(getattr(position, "highest_price", 0.0) or entry)
-    mfe_pct = max(0.0, (highest - entry) / entry) if entry > 0 else 0.0
-
-    regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
-    if regime == "bull" and mfe_pct >= _bull_trail_mfe_threshold():
-        scalar, _ = get_regime_validated_scalar(regime)
-        widened_trail_pct = min(trail_pct * _bull_trail_multiplier(), 0.025)
-        trail_pct = blend_by_scalar(trail_pct, widened_trail_pct, scalar)
 
     activation = entry * (1.0 + trail_pct)
     base_changed = False
@@ -1041,7 +1032,7 @@ def _trail_semantics(
     ratchet = float(getattr(position, "trailing_stop_price", 0.0) or 0.0)
     activated = bool(entry > 0 and highest >= trail_activation - 1e-12)
     executable_trail = ratchet if activated and ratchet > 0 else None
-    snap4 = day_4h_structure_snapshot(bundle)
+    snap4 = day_4h_structure_snapshot(bundle, current_price=current_price)
     hard_stop = resolve_day_risk_floor_price(
         entry_price=entry,
         thesis_invalid_level=float(getattr(position, "thesis_invalid_level", 0.0) or 0.0),
@@ -1252,6 +1243,7 @@ def evaluate_engine_managed_exit(
     coin_profile: dict[str, Any],
     bundle: dict[str, Any] | None = None,
     bar_low: float | None = None,
+    now_epoch: float | None = None,
 ) -> dict[str, Any]:
     """
     Shared paper/live exit manager. Risk exits bypass net-profit-only gate.
@@ -1279,6 +1271,7 @@ def evaluate_engine_managed_exit(
             bundle=bundle,
             entry=entry,
             atr_pct=atr_pct,
+            now_epoch=now_epoch,
         )
 
     extreme = evaluate_extreme_protection(
@@ -1820,6 +1813,7 @@ def evaluate_pre_buy_exit_consistency(
         coin_profile=coin_profile,
         bundle=bundle,
         bar_low=entry,
+        now_epoch=now_ts,
     )
     immediate = str(managed.get("reason") or "")
     result["checks"]["managed_exit"] = immediate
@@ -1829,6 +1823,7 @@ def evaluate_pre_buy_exit_consistency(
         EXIT_FAILED_RECLAIM,
         EXIT_TIME_STOP,
         EXIT_EXTREME_PROTECTION,
+        EXIT_DAY_4H_STRUCTURE_BREAK,
     ):
         result.update(
             {

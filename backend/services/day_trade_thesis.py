@@ -973,6 +973,142 @@ def _ohlcv_ohlc(row: Any) -> tuple[float, float, float, float] | None:
     return o, h, l, c
 
 
+DAY_4H_MS = 4 * 3600 * 1000
+
+
+def current_utc_4h_open_ms(now_epoch: float | None = None) -> int:
+    """UTC 4H bar open (ms) for 00/04/08/12/16/20."""
+    now = time.time() if now_epoch is None else float(now_epoch)
+    ms = int(now * 1000.0)
+    return (ms // DAY_4H_MS) * DAY_4H_MS
+
+
+def ohlcv_row_open_ms(row: Any) -> int | None:
+    try:
+        if isinstance(row, dict):
+            ts = float(row.get("timestamp") or row.get("t") or row.get("open_time") or 0.0)
+        elif isinstance(row, (list, tuple)) and row:
+            ts = float(row[0] or 0.0)
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+    if ts <= 0:
+        return None
+    if ts < 1e12:
+        ts *= 1000.0
+    return int(ts)
+
+
+def fourh_requires_boundary_refresh(rows: list[Any] | None, now_epoch: float | None = None) -> bool:
+    """True when cached last 4H open is not the current UTC 4H bar."""
+    if not isinstance(rows, list) or not rows:
+        return True
+    last = ohlcv_row_open_ms(rows[-1])
+    if last is None:
+        return True
+    return last != current_utc_4h_open_ms(now_epoch)
+
+
+def _fresh_forming_close(
+    bundle: dict[str, Any] | None,
+    current_price: float | None,
+    now_epoch: float,
+    bar_open_ms: int,
+) -> tuple[float | None, str]:
+    try:
+        px = float(current_price or 0.0)
+    except (TypeError, ValueError):
+        px = 0.0
+    if px > 0:
+        return px, "canonical_mark"
+    if not isinstance(bundle, dict):
+        return None, ""
+    rows = bundle.get("1m")
+    if not isinstance(rows, list) or not rows:
+        return None, ""
+    now_ms = int(float(now_epoch) * 1000.0)
+    last = rows[-1]
+    ot = ohlcv_row_open_ms(last)
+    if ot is None or ot < bar_open_ms or ot > now_ms:
+        return None, ""
+    ohlc = _ohlcv_ohlc(last)
+    if ohlc is None:
+        return None, ""
+    return ohlc[3], "1m_close"
+
+
+def _row_with_forming_close(row: Any, close: float) -> Any:
+    ohlc = _ohlcv_ohlc(row)
+    if ohlc is None:
+        return row
+    o, h, l, _c = ohlc
+    h = max(h, close)
+    l = min(l, close)
+    if isinstance(row, dict):
+        out = dict(row)
+        out["close"] = close
+        out["high"] = h
+        out["low"] = l
+        return out
+    new = list(row)
+    while len(new) < 5:
+        new.append(0.0)
+    new[2] = h
+    new[3] = l
+    new[4] = close
+    return new
+
+
+def resolve_day_4h_structure_bundle(
+    bundle: dict[str, Any] | None,
+    *,
+    current_price: float | None = None,
+    now_epoch: float | None = None,
+) -> dict[str, Any] | None:
+    """Same 4H identity/prior-low, forming close from live mark or current 1m.
+
+    Drops future 4H bars. If the cached last bar is the previous UTC 4H
+    (1800s TTL carried identity across the boundary), appends a synthetic
+    forming bar so prior-low rolls immediately.
+    """
+    if not isinstance(bundle, dict):
+        return bundle
+    rows = bundle.get("4h")
+    if not isinstance(rows, list) or not rows:
+        return bundle
+    now = time.time() if now_epoch is None else float(now_epoch)
+    bar_open = current_utc_4h_open_ms(now)
+    kept: list[Any] = []
+    for row in rows:
+        ot = ohlcv_row_open_ms(row)
+        if ot is not None and ot > bar_open:
+            continue
+        kept.append(row)
+    if not kept:
+        out = dict(bundle)
+        out["4h"] = []
+        out["_forming_4h_close_source"] = "dropped_lookahead"
+        return out
+    last = kept[-1]
+    last_ot = ohlcv_row_open_ms(last)
+    fresh, src = _fresh_forming_close(bundle, current_price, now, bar_open)
+    if last_ot == bar_open and fresh is not None:
+        kept[-1] = _row_with_forming_close(last, fresh)
+        src_out = src
+    elif last_ot == bar_open - DAY_4H_MS and fresh is not None:
+        prev = _ohlcv_ohlc(last)
+        prev_c = prev[3] if prev is not None else fresh
+        kept.append([bar_open, prev_c, max(prev_c, fresh), min(prev_c, fresh), fresh, 0.0])
+        src_out = src + "+boundary_synth"
+    else:
+        src_out = "cached_4h"
+    out = dict(bundle)
+    out["4h"] = kept
+    out["_forming_4h_close_source"] = src_out
+    return out
+
+
 def _4h_recent_ohlc(bundle: dict[str, Any] | None) -> list[tuple[float, float, float, float]]:
     if not isinstance(bundle, dict):
         return []
@@ -987,12 +1123,18 @@ def _4h_recent_ohlc(bundle: dict[str, Any] | None) -> list[tuple[float, float, f
     return out
 
 
-def htf_4h_rise_intact(bundle: dict[str, Any] | None) -> bool:
+def htf_4h_rise_intact(
+    bundle: dict[str, Any] | None,
+    *,
+    current_price: float | None = None,
+    now_epoch: float | None = None,
+) -> bool:
     """True while the 4H breakout/rise is still on (green HH or aligned 4H).
 
     Used to hold DAY through vertical 4H expansions instead of clipping at
     the first 0.4% path-aware print. Missing bundle is not intact.
     """
+    bundle = resolve_day_4h_structure_bundle(bundle, current_price=current_price, now_epoch=now_epoch)
     if not isinstance(bundle, dict):
         return False
     align = _bundle_tf_align(bundle, "4h")
@@ -1056,9 +1198,15 @@ def resolve_day_risk_floor_price(
     return max(hard_cap, min(candidate, tight_cap))
 
 
-def day_4h_structure_snapshot(bundle: dict[str, Any] | None) -> dict[str, Any]:
+def day_4h_structure_snapshot(
+    bundle: dict[str, Any] | None,
+    *,
+    current_price: float | None = None,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
     """Explainability for 4H hold vs structure-break exits."""
-    candles = _4h_recent_ohlc(bundle)
+    resolved = resolve_day_4h_structure_bundle(bundle, current_price=current_price, now_epoch=now_epoch)
+    candles = _4h_recent_ohlc(resolved)
     prior_4h_low = None
     current_4h_close = None
     if len(candles) >= 2:
@@ -1066,19 +1214,26 @@ def day_4h_structure_snapshot(bundle: dict[str, Any] | None) -> dict[str, Any]:
         current_4h_close = candles[-1][3]
     elif len(candles) == 1:
         current_4h_close = candles[-1][3]
-    missing = (not isinstance(bundle, dict)) or not isinstance(bundle.get("4h"), list) or len(candles) < 2
+    missing = (not isinstance(resolved, dict)) or not isinstance(resolved.get("4h"), list) or len(candles) < 2
     return {
-        "htf_4h_rise_intact": htf_4h_rise_intact(bundle),
-        "htf_4h_rise_broken": htf_4h_rise_broken(bundle),
+        "htf_4h_rise_intact": htf_4h_rise_intact(resolved),
+        "htf_4h_rise_broken": htf_4h_rise_broken(resolved),
         "prior_4h_low": prior_4h_low,
         "current_4h_close": current_4h_close,
         "4h_bundle_present": not missing,
         "4h_bundle_missing": missing,
+        "forming_close_source": (resolved or {}).get("_forming_4h_close_source") if isinstance(resolved, dict) else "",
     }
 
 
-def htf_4h_rise_broken(bundle: dict[str, Any] | None) -> bool:
+def htf_4h_rise_broken(
+    bundle: dict[str, Any] | None,
+    *,
+    current_price: float | None = None,
+    now_epoch: float | None = None,
+) -> bool:
     """True when 4H structure has given way — first lower close below prior low."""
+    bundle = resolve_day_4h_structure_bundle(bundle, current_price=current_price, now_epoch=now_epoch)
     if not isinstance(bundle, dict):
         return False
     if htf_4h_rise_intact(bundle):
