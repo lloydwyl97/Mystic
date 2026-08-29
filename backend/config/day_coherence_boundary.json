@@ -1,17 +1,19 @@
 {
-  "current_day_baseline_sha": "afc67cb",
-  "repair": "prebuy_uses_day_ohlcv_bundle_not_mtf_align",
-  "DAY_PREBUY_4H_COHERENCE_VALID_START_LOCAL": "2026-08-28T23:25:55Z",
-  "DAY_PREBUY_4H_COHERENCE_VALID_START_OCEAN": "2026-08-28T23:26:43Z",
+  "current_day_baseline_sha": "7c273da",
+  "repair": "mandatory_flatten_same_call_residual_ioc",
+  "DAY_RESIDUAL_EXIT_VALID_START_LOCAL": "2026-08-29T00:18:47Z",
+  "DAY_RESIDUAL_EXIT_VALID_START_OCEAN": "2026-08-29T00:20:01Z",
   "source": {
-    "local": "portfolio_engine_integration STARTING after afc67cb restart; uvicorn 2026-08-28T23:25:43Z CDT-converted; integration 2026-08-28 18:25:55 CDT",
-    "ocean": "portfolio_engine_integration STARTING 23:26:43Z; uvicorn process lstart 2026-08-28T23:26:26Z"
+    "local": "portfolio_engine_integration STARTING 2026-08-28 19:18:47 CDT after 7c273da restart",
+    "ocean": "portfolio_engine_integration STARTING 2026-08-29T00:20:01Z after 7c273da pull"
   },
   "historical_superseded": {
+    "DAY_PREBUY_4H_COHERENCE_VALID_START_LOCAL": "2026-08-28T23:25:55Z",
+    "DAY_PREBUY_4H_COHERENCE_VALID_START_OCEAN": "2026-08-28T23:26:43Z",
     "DAY_COHERENCE_VALID_START_LOCAL": "2026-08-28T13:01:40Z",
     "DAY_COHERENCE_VALID_START_OCEAN": "2026-08-28T13:02:50Z",
-    "classification": "PRE-afc67cb / contaminated for final repaired headline economics",
-    "note": "Do not rewrite those trades. Do not use them as the fully-repaired DAY start."
+    "classification": "PRE-7c273da / contaminated for residual-exit-repaired headline economics",
+    "note": "Do not rewrite those trades. Headline DAY economics now require BUY timestamp >= host DAY_RESIDUAL_EXIT_VALID_START_*."
   },
   "includes": [
     "high_water_fidelity",
@@ -19,7 +21,8 @@
     "constant_profile_trail_no_bull_widen",
     "fresh_coherent_forming_4h",
     "prebuy_exit_state_consistency",
-    "prebuy_4h_from_day_active_ohlcv"
+    "prebuy_4h_from_day_active_ohlcv",
+    "mandatory_flatten_residual_execution"
   ],
-  "note": "Headline DAY economics require BUY timestamp >= host DAY_PREBUY_4H_COHERENCE_VALID_START_*. Host stamps are actual restart/runtime load times. Do not invent. Do not rewrite prior trades."
+  "note": "Headline DAY economics require BUY timestamp >= host DAY_RESIDUAL_EXIT_VALID_START_*. Host stamps are actual restart/runtime load times. Do not invent. Do not rewrite prior trades."
 }
