@@ -1376,7 +1376,9 @@ class OpenPosition:
     # === DUST_INVARIANT_LOCK ===
     # DO NOT MODIFY. Binance.US produces dust leftovers; dust must not pause trading.
     # DUST_PENDING positions are excluded from pause logic by design.
-    status: str = "ACTIVE"  # ACTIVE | DUST_PENDING
+    status: str = "ACTIVE"  # ACTIVE | DUST_PENDING | EXIT_RESIDUAL_PENDING
+    exit_residual_reason: str = ""
+    exit_residual_since: float = 0.0
     dust_detected_at: float = 0.0
     dust_qty_canonical: float = 0.0
     # === END DUST_INVARIANT_LOCK ===
@@ -2721,7 +2723,10 @@ class PortfolioEngine:
                 # Rule 2: DB differs -> set DB = exchange snapped, ACTIVE
                 if abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
                     position.quantity = snapped
-                    position.status = "ACTIVE"
+                    from backend.services.day_mandatory_exit_execution import STATUS_EXIT_RESIDUAL_PENDING
+
+                    if str(getattr(position, "status", "") or "") != STATUS_EXIT_RESIDUAL_PENDING:
+                        position.status = "ACTIVE"
                     position.dust_detected_at = 0.0
                     position.dust_qty_canonical = 0.0
                     await self._persist_position_to_sqlite(position)
@@ -2903,7 +2908,10 @@ class PortfolioEngine:
                 continue
             if abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
                 position.quantity = snapped
-                position.status = "ACTIVE"
+                from backend.services.day_mandatory_exit_execution import STATUS_EXIT_RESIDUAL_PENDING
+
+                if str(getattr(position, "status", "") or "") != STATUS_EXIT_RESIDUAL_PENDING:
+                    position.status = "ACTIVE"
                 position.dust_detected_at = 0.0
                 position.dust_qty_canonical = 0.0
                 await self._persist_position_to_sqlite(position)
@@ -7070,6 +7078,8 @@ class PortfolioEngine:
                 price_structure_regime_at_entry=str(thesis_payload.get("price_structure_regime_at_entry") or ""),
                 max_hold_min=int(thesis_payload.get("max_hold_min") or 0),
                 trail_pct=float(thesis_payload.get("trail_pct") or 0.0),
+                exit_residual_reason=str(thesis_payload.get("exit_residual_reason") or ""),
+                exit_residual_since=float(thesis_payload.get("exit_residual_since") or 0.0),
             )
             from backend.services.day_inventory_recovery import apply_legacy_tags_from_thesis
 
@@ -9969,7 +9979,70 @@ class PortfolioEngine:
         sell_preflight_audit: dict[str, Any] = {}
         sell_exec_fee_rate = TAKER_FEE
 
+        from backend.services.day_mandatory_exit_execution import (
+            is_mandatory_day_flatten,
+            is_meaningful_residual,
+            mark_exit_residual_pending,
+            run_mandatory_exit_ioc_loop,
+        )
+
+        mandatory_flatten = is_mandatory_day_flatten(
+            exit_trigger,
+            force_sell=force_sell or emergency_sell,
+            exit_type_name=exit_type.name,
+        )
+
         async def _protected_live_sell(qty: float) -> dict[str, Any] | None:
+            if mandatory_flatten:
+                constraints = self._symbol_constraints.get(normalized_symbol) or self._symbol_constraints.get(symbol) or {}
+
+                async def _pf(q: float, impact: float):
+                    return await run_protected_preflight(
+                        symbol=normalized_symbol,
+                        side="SELL",
+                        quantity=q,
+                        reference_price=price,
+                        live_capable=True,
+                        mandatory_exit=True,
+                        allow_chunk=True,
+                        max_impact_pct=impact,
+                    )
+
+                async def _place(q: float, limit: float):
+                    return await execute_protected_limit_live(
+                        self._live_service,
+                        symbol=_to_api_symbol(symbol),
+                        side="sell",
+                        quantity=q,
+                        limit_price=limit,
+                    )
+
+                def _meaningful(q: float) -> bool:
+                    return is_meaningful_residual(
+                        q,
+                        float(price),
+                        min_qty=float(constraints.get("min_qty") or 0.0),
+                        min_notional=float(constraints.get("min_notional") or 0.0),
+                        qty_step=float(constraints.get("qty_step") or 0.0),
+                    )
+
+                flatten = await run_mandatory_exit_ioc_loop(
+                    quantity=qty,
+                    preflight=_pf,
+                    place_ioc=_place,
+                    is_meaningful=_meaningful,
+                )
+                if flatten.combined_order:
+                    return flatten.combined_order
+                if flatten.abandoned_reason:
+                    await self._record_reject(
+                        normalized_symbol,
+                        "SELL",
+                        flatten.abandoned_reason,
+                        "MANDATORY_EXIT_HOLD",
+                    )
+                return None
+
             pf = await run_protected_preflight(
                 symbol=normalized_symbol,
                 side="SELL",
@@ -10586,6 +10659,15 @@ class PortfolioEngine:
                     else:
                         error_msg = "PROTECTED_LIMIT_SELL_NOT_FILLED"
                         logger.error("LIVE_SELL_FAILED: %s - %s", exchange_symbol, error_msg)
+                        if mandatory_flatten:
+                            mark_exit_residual_pending(position, exit_trigger)
+                            await self._persist_position_to_sqlite(position)
+                            logger.warning(
+                                "EXIT_RESIDUAL_PENDING_SET %s qty=%.8f reason=%s cause=no_live_fill",
+                                normalized_symbol,
+                                float(position.quantity or 0.0),
+                                exit_trigger,
+                            )
                         err_lower = (error_msg or "").lower()
                         is_insufficient_balance = "insufficient" in err_lower or "-2010" in (error_msg or "")
                         if is_insufficient_balance and not reconciled:
@@ -10809,6 +10891,8 @@ class PortfolioEngine:
                     quantity=quantity,
                     reference_price=price,
                     live_capable=False,
+                    mandatory_exit=mandatory_flatten,
+                    allow_chunk=False,
                 )
                 sell_preflight_audit = pf.to_audit_dict()
                 if not pf.passed:
@@ -11033,6 +11117,14 @@ class PortfolioEngine:
                 position.dust_qty_canonical = position.quantity
                 await self._persist_position_to_sqlite(position)
             else:
+                if mandatory_flatten:
+                    mark_exit_residual_pending(position, exit_trigger)
+                    logger.warning(
+                        "EXIT_RESIDUAL_PENDING_SET %s qty=%.8f reason=%s cause=partial_fill",
+                        normalized_symbol,
+                        float(position.quantity or 0.0),
+                        exit_trigger,
+                    )
                 await self._persist_position_to_sqlite(position)
 
         # Update coin performance (Phase 6). Live path produces only TP / MANUAL /
@@ -11304,6 +11396,11 @@ class PortfolioEngine:
     # =========================================================================
     # SLEEVE CAPITAL & POSITION ACCOUNTING
     # =========================================================================
+
+    def has_exit_residual_pending(self) -> bool:
+        from backend.services.day_mandatory_exit_execution import is_exit_residual_pending
+
+        return any(is_exit_residual_pending(p) for p in self.open_positions.values())
 
     def _sleeve_position_count(self, sleeve: str) -> int:
         """Count active (non-DUST_PENDING) positions in a given sleeve."""
@@ -12205,6 +12302,27 @@ class PortfolioEngine:
 
         entry_price = float(position.entry_price or 0.0)
         quantity = float(position.quantity or 0.0)
+
+        from backend.services.day_mandatory_exit_execution import is_exit_residual_pending
+
+        if is_exit_residual_pending(position) and quantity > 0 and isinstance(current_price, (int, float)) and current_price > 0:
+            residual_reason = str(getattr(position, "exit_residual_reason", "") or "TRAILING_STOP_EXIT")
+            logger.warning(
+                "EXIT_RESIDUAL_PENDING_RESUME symbol=%s qty=%.8f reason=%s mark=%.8f",
+                symbol,
+                quantity,
+                residual_reason,
+                float(current_price),
+            )
+            return await self.execute_sell_fifo(
+                symbol,
+                quantity,
+                current_price,
+                ExitType.MANUAL,
+                residual_reason,
+                current_bar=current_bar,
+                force_sell=True,
+            )
 
         if not isinstance(current_price, (int, float)) or current_price <= 0.0:
             logger.warning(

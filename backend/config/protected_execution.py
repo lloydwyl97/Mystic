@@ -74,6 +74,13 @@ USE_PROTECTED_LIMIT_EXECUTION: Final[bool] = _env_bool("USE_PROTECTED_LIMIT_EXEC
 ORDERBOOK_MAX_AGE_SEC: Final[float] = _env_float("ORDERBOOK_MAX_AGE_SEC", 5.0)
 ORDERBOOK_DEPTH_LIMIT: Final[int] = _env_int("ORDERBOOK_DEPTH_LIMIT", 100)
 
+# Mandatory DAY flatten (trail / 4H break / risk floor): spread+impact guide HOW
+# to liquidate, not WHETHER. Absolute bounds — never unlimited slippage.
+MANDATORY_EXIT_MAX_SPREAD_PCT: Final[float] = _env_float("MANDATORY_EXIT_MAX_SPREAD_PCT", 0.02)
+MANDATORY_EXIT_MAX_IMPACT_PCT: Final[float] = _env_float("MANDATORY_EXIT_MAX_IMPACT_PCT", 0.01)
+MANDATORY_EXIT_SAME_CALL_ATTEMPTS: Final[int] = _env_int("MANDATORY_EXIT_SAME_CALL_ATTEMPTS", 6)
+MANDATORY_EXIT_PENDING_RETRY_SEC: Final[float] = _env_float("MANDATORY_EXIT_PENDING_RETRY_SEC", 1.0)
+
 # Reject reason codes (stable strings for logs/API)
 ORDERBOOK_STALE = "ORDERBOOK_STALE"
 ORDERBOOK_MISSING = "ORDERBOOK_MISSING"

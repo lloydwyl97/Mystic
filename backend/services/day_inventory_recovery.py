@@ -43,6 +43,8 @@ def thesis_json_for_position(pos: Any) -> dict[str, Any]:
         "trail_pct": float(getattr(pos, "trail_pct", 0.0) or 0.0),
         "legacy_pre_regime_router": bool(getattr(pos, "legacy_pre_regime_router", False)),
         "opened_under_router": bool(getattr(pos, "opened_under_router", False)),
+        "exit_residual_reason": str(getattr(pos, "exit_residual_reason", "") or ""),
+        "exit_residual_since": float(getattr(pos, "exit_residual_since", 0.0) or 0.0),
     }
 
 

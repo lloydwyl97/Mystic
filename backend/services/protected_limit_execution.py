@@ -16,6 +16,8 @@ from typing import Any
 from backend.config.protected_execution import (
     DEPTH_INSUFFICIENT,
     EXECUTABLE_NET_PROFIT_BELOW_FLOOR,
+    MANDATORY_EXIT_MAX_IMPACT_PCT,
+    MANDATORY_EXIT_MAX_SPREAD_PCT,
     MAX_ORDERBOOK_PRICE_IMPACT_PCT,
     MAX_ORDERBOOK_SPREAD_PCT,
     ORDERBOOK_DEPTH_LIMIT,
@@ -68,6 +70,7 @@ class ProtectedPreflightResult:
     quantity: float = 0.0
     execution_mode: str = ""
     book_age_sec: float = 0.0
+    executable_qty: float = 0.0
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_audit_dict(self) -> dict[str, Any]:
@@ -137,6 +140,57 @@ def _walk_book(levels: list[list[float]], qty_needed: float) -> tuple[float, flo
         if px <= 0 or q <= 0:
             continue
         take = min(remaining, q)
+        cost += take * px
+        filled += take
+        remaining -= take
+    if filled <= 0:
+        return 0.0, 0.0, False
+    avg = cost / filled
+    fully = remaining <= max(1e-12, qty_needed * 1e-9)
+    return avg, filled, fully
+
+
+def walk_book_within_impact(
+    levels: list[list[float]],
+    qty_needed: float,
+    *,
+    best_px: float,
+    max_impact_pct: float,
+    sell: bool,
+) -> tuple[float, float, bool]:
+    """Walk book but stop before avg fill exceeds max_impact vs top of book."""
+    remaining = float(qty_needed)
+    cost = 0.0
+    filled = 0.0
+    cap = float(max_impact_pct)
+    top = float(best_px)
+    if remaining <= 0 or top <= 0:
+        return 0.0, 0.0, False
+    for level in levels:
+        if remaining <= 1e-15:
+            break
+        if not level or len(level) < 2:
+            continue
+        px = float(level[0])
+        q = float(level[1])
+        if px <= 0 or q <= 0:
+            continue
+        take = min(remaining, q)
+        new_filled = filled + take
+        new_avg = (cost + take * px) / new_filled
+        if sell:
+            impact = (top - new_avg) / top
+        else:
+            impact = (new_avg - top) / top
+        if impact > cap + 1e-15:
+            if filled <= 0:
+                # First level is always 0 impact vs itself; take it even if later
+                # levels would breach. Never skip a real top-of-book bid/ask.
+                take = min(remaining, q)
+                cost += take * px
+                filled += take
+                remaining -= take
+            break
         cost += take * px
         filled += take
         remaining -= take
@@ -276,9 +330,18 @@ async def run_protected_preflight(
     quantity: float,
     reference_price: float,
     live_capable: bool = False,
+    mandatory_exit: bool = False,
+    allow_chunk: bool = False,
+    max_impact_pct: float | None = None,
 ) -> ProtectedPreflightResult:
     """
-    Order-book preflight for BUY or SELL. Returns passed=False on any reject — no fallback.
+    Order-book preflight for BUY or SELL.
+
+    Entry / discretionary SELL: reject on spread, impact, or incomplete depth.
+
+    Mandatory DAY flatten (``mandatory_exit=True``): spread/impact size the
+    executable chunk and limit. They must not refuse liquidation unless the
+    book is missing/stale or the absolute catastrophic bound is breached.
     """
     ns = normalize_symbol(symbol)
     side_u = str(side or "").strip().upper()
@@ -347,7 +410,17 @@ async def run_protected_preflight(
 
     mid = (best_bid + best_ask) / 2.0
     spread_pct = (best_ask - best_bid) / mid if mid > 0 else 1.0
-    max_spread = effective_max_orderbook_spread_pct(live_capable=live_capable)
+    flatten = bool(mandatory_exit) and side_u == "SELL"
+    max_spread = (
+        float(MANDATORY_EXIT_MAX_SPREAD_PCT)
+        if flatten
+        else effective_max_orderbook_spread_pct(live_capable=live_capable)
+    )
+    impact_cap = float(max_impact_pct) if max_impact_pct is not None else float(MAX_ORDERBOOK_PRICE_IMPACT_PCT)
+    if flatten:
+        impact_cap = min(impact_cap, float(MANDATORY_EXIT_MAX_IMPACT_PCT))
+    chunk_ok = bool(flatten and allow_chunk)
+
     if spread_pct > max_spread + 1e-15:
         return _fail(
             ns,
@@ -360,6 +433,7 @@ async def run_protected_preflight(
             max_spread=max_spread,
             best_bid=best_bid,
             best_ask=best_ask,
+            mandatory_exit=flatten,
         )
 
     if side_u == "BUY":
@@ -397,8 +471,18 @@ async def run_protected_preflight(
                 max_impact=MAX_ORDERBOOK_PRICE_IMPACT_PCT,
             )
         protected_limit = min(avg_fill, best_ask * (1.0 + MAX_ORDERBOOK_PRICE_IMPACT_PCT))
+        executable_qty = float(quantity)
     elif side_u == "SELL":
-        avg_fill, filled_qty, fully = _walk_book(bids, quantity)
+        if chunk_ok:
+            avg_fill, filled_qty, fully = walk_book_within_impact(
+                bids,
+                quantity,
+                best_px=best_bid,
+                max_impact_pct=impact_cap,
+                sell=True,
+            )
+        else:
+            avg_fill, filled_qty, fully = _walk_book(bids, quantity)
         if avg_fill <= 0:
             return _fail(
                 ns,
@@ -408,7 +492,7 @@ async def run_protected_preflight(
                 reference_price=reference_price,
                 quantity=quantity,
             )
-        if not PROTECTED_LIMIT_ALLOW_PARTIAL and not fully:
+        if not flatten and not PROTECTED_LIMIT_ALLOW_PARTIAL and not fully:
             return _fail(
                 ns,
                 side_u,
@@ -420,7 +504,7 @@ async def run_protected_preflight(
                 requested_qty=quantity,
             )
         price_impact = (best_bid - avg_fill) / best_bid if best_bid > 0 else 0.0
-        if price_impact > MAX_ORDERBOOK_PRICE_IMPACT_PCT + 1e-15:
+        if not flatten and price_impact > MAX_ORDERBOOK_PRICE_IMPACT_PCT + 1e-15:
             return _fail(
                 ns,
                 side_u,
@@ -431,7 +515,41 @@ async def run_protected_preflight(
                 price_impact_pct=price_impact,
                 max_impact=MAX_ORDERBOOK_PRICE_IMPACT_PCT,
             )
-        protected_limit = max(avg_fill, best_bid * (1.0 - MAX_ORDERBOOK_PRICE_IMPACT_PCT))
+        if flatten and not chunk_ok and price_impact > impact_cap + 1e-15:
+            # Flatten without chunk: still send at best bid for whatever the
+            # impact cap allows via a forced chunk of top-of-book.
+            avg_fill, filled_qty, fully = walk_book_within_impact(
+                bids,
+                quantity,
+                best_px=best_bid,
+                max_impact_pct=impact_cap,
+                sell=True,
+            )
+            if avg_fill <= 0 or filled_qty <= 0:
+                return _fail(
+                    ns,
+                    side_u,
+                    PRICE_IMPACT_TOO_HIGH,
+                    execution_mode=exec_mode,
+                    reference_price=reference_price,
+                    quantity=quantity,
+                    price_impact_pct=price_impact,
+                    max_impact=impact_cap,
+                    mandatory_exit=True,
+                )
+            price_impact = (best_bid - avg_fill) / best_bid if best_bid > 0 else 0.0
+        executable_qty = float(filled_qty if (flatten or chunk_ok) else quantity)
+        if flatten and executable_qty <= 0:
+            return _fail(
+                ns,
+                side_u,
+                DEPTH_INSUFFICIENT,
+                execution_mode=exec_mode,
+                reference_price=reference_price,
+                quantity=quantity,
+                mandatory_exit=True,
+            )
+        protected_limit = max(avg_fill, best_bid * (1.0 - impact_cap))
     else:
         return _fail(
             ns,
@@ -454,9 +572,11 @@ async def run_protected_preflight(
         protected_limit_price=protected_limit,
         price_impact_pct=price_impact,
         reference_price=float(reference_price),
-        quantity=float(quantity),
+        quantity=float(executable_qty if side_u == "SELL" and flatten else quantity),
         execution_mode=exec_mode,
         book_age_sec=book_age,
+        executable_qty=float(executable_qty if side_u == "SELL" else quantity),
+        diagnostics={"mandatory_exit": flatten, "allow_chunk": chunk_ok, "impact_cap": impact_cap},
     )
     _update_last_state(res)
     logger.info(

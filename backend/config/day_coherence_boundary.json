@@ -1,14 +1,25 @@
 {
-  "prior_day_baseline_sha": "931c337",
-  "repair": "4h_forming_freshness_and_prebuy_consistency_and_constant_trail_no_bull_widen",
+  "current_day_baseline_sha": "afc67cb",
+  "repair": "prebuy_uses_day_ohlcv_bundle_not_mtf_align",
+  "DAY_PREBUY_4H_COHERENCE_VALID_START_LOCAL": "2026-08-28T23:25:55Z",
+  "DAY_PREBUY_4H_COHERENCE_VALID_START_OCEAN": "2026-08-28T23:26:43Z",
+  "source": {
+    "local": "portfolio_engine_integration STARTING after afc67cb restart; uvicorn 2026-08-28T23:25:43Z CDT-converted; integration 2026-08-28 18:25:55 CDT",
+    "ocean": "portfolio_engine_integration STARTING 23:26:43Z; uvicorn process lstart 2026-08-28T23:26:26Z"
+  },
+  "historical_superseded": {
+    "DAY_COHERENCE_VALID_START_LOCAL": "2026-08-28T13:01:40Z",
+    "DAY_COHERENCE_VALID_START_OCEAN": "2026-08-28T13:02:50Z",
+    "classification": "PRE-afc67cb / contaminated for final repaired headline economics",
+    "note": "Do not rewrite those trades. Do not use them as the fully-repaired DAY start."
+  },
   "includes": [
     "high_water_fidelity",
     "entry_minute_guard",
     "constant_profile_trail_no_bull_widen",
     "fresh_coherent_forming_4h",
-    "prebuy_exit_state_consistency"
+    "prebuy_exit_state_consistency",
+    "prebuy_4h_from_day_active_ohlcv"
   ],
-  "DAY_COHERENCE_VALID_START_LOCAL": "2026-08-28T13:01:40Z",
-  "DAY_COHERENCE_VALID_START_OCEAN": "2026-08-28T13:02:50Z",
-  "note": "Host start timestamps are written at deploy; do not rewrite prior trades. Clean repaired DAY economics begin at these stamps."
+  "note": "Headline DAY economics require BUY timestamp >= host DAY_PREBUY_4H_COHERENCE_VALID_START_*. Host stamps are actual restart/runtime load times. Do not invent. Do not rewrite prior trades."
 }

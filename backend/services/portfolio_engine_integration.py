@@ -1789,7 +1789,12 @@ class PortfolioEngineIntegration:
             try:
                 await self._monitor_positions_once(refresh_market_data=False)
 
-                await asyncio.sleep(self._exit_monitor_interval)
+                from backend.config.protected_execution import MANDATORY_EXIT_PENDING_RETRY_SEC
+
+                pending = bool(self.engine and self.engine.has_exit_residual_pending())
+                await asyncio.sleep(
+                    float(MANDATORY_EXIT_PENDING_RETRY_SEC) if pending else self._exit_monitor_interval
+                )
 
             except asyncio.CancelledError:
                 break
