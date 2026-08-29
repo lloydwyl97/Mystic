@@ -1292,6 +1292,7 @@ class RegimeState:
     drawdown_guard_active: bool = False
     churn_guard_active: bool = False
     churn_guard_activated_at: float = 0.0
+    churn_parole_window_fp: str = ""
     current_drawdown_pct: float = 0.0
     rolling_peak_equity: float = 0.0
     rolling_peak_timestamp: float = 0.0
@@ -1308,6 +1309,7 @@ class RegimeState:
             "spread_blocked_symbols": self.spread_blocked_symbols,
             "drawdown_guard_active": self.drawdown_guard_active,
             "churn_guard_active": self.churn_guard_active,
+            "churn_parole_window_fp": getattr(self, "churn_parole_window_fp", "") or "",
             "current_drawdown_pct": self.current_drawdown_pct * 100,
             "rolling_peak_equity": self.rolling_peak_equity,
             "churn_ratio": self.churn_ratio,
@@ -2400,6 +2402,7 @@ class PortfolioEngine:
 
         # Ensure DB schema exists
         self._ensure_db_schema()
+        self._load_churn_guard_state()
 
         # STEP 1: Try to load from SQLite (deterministic restart)
         ledger_loaded = await self._load_ledger_from_sqlite()
@@ -19787,8 +19790,37 @@ class PortfolioEngine:
             self._last_regime_classify_ts = 0
         await self._classify_market_regime()
 
+    def _load_churn_guard_state(self) -> None:
+        """Restore CHURN_GUARD lock + parole fingerprint across restart."""
+        try:
+            from backend.services.day_churn_guard import load_churn_guard_state
+
+            loaded = load_churn_guard_state(self.db_path)
+            self._regime_state.churn_guard_active = loaded.active
+            self._regime_state.churn_guard_activated_at = loaded.activated_at
+            self._regime_state.churn_parole_window_fp = loaded.parole_window_fp
+            self._regime_state.churn_ratio = loaded.ratio if loaded.ratio != float("inf") else 0.0
+            if loaded.active or loaded.parole_window_fp:
+                logger.info(
+                    "STARTUP: CHURN_GUARD restored active=%s activated_at=%.0f parole_fp=%s",
+                    loaded.active,
+                    loaded.activated_at,
+                    (loaded.parole_window_fp or "")[:48],
+                )
+        except Exception:
+            logger.debug("STARTUP: CHURN_GUARD restore skipped", exc_info=True)
+
     async def _check_churn_guard(self) -> None:
-        """Check and update churn guard based on recent roundtrip cost vs gross profit"""
+        """Check and update churn guard based on recent roundtrip cost vs gross profit.
+
+        After the 4h parole the identical frozen 20-SELL window cannot start a
+        new lock. A new completed SELL (changed fingerprint) re-evaluates normally.
+        """
+        from backend.services.day_churn_guard import (
+            ChurnGuardState,
+            evaluate_churn_transition,
+            persist_churn_guard_state,
+        )
 
         def _sync_get():
             conn = sqlite3.connect(self.db_path)
@@ -19798,7 +19830,8 @@ class PortfolioEngine:
                     """
                     SELECT s.fees + COALESCE(b.fees, 0) as roundtrip_fees,
                            s.slippage + COALESCE(b.slippage, 0) as roundtrip_slippage,
-                           CASE WHEN s.invariant_diff > 0 THEN s.invariant_diff ELSE 0 END as profit
+                           CASE WHEN s.invariant_diff > 0 THEN s.invariant_diff ELSE 0 END as profit,
+                           s.id
                     FROM (
                         SELECT fees, slippage, invariant_diff, symbol, id
                         FROM portfolio_engine_audit
@@ -19825,60 +19858,29 @@ class PortfolioEngine:
         if not rows:
             return
 
-        total_fees = sum(r[0] or 0 for r in rows)
-        total_slippage = sum(r[1] or 0 for r in rows)
-        gross_profit = sum(r[2] or 0 for r in rows)
-
-        total_costs = total_fees + total_slippage
-        if len(rows) >= CHURN_GUARD_MIN_SAMPLES:
-            if gross_profit > 0:
-                churn_ratio = total_costs / gross_profit
-            else:
-                churn_ratio = float("inf")
-            self._regime_state.churn_ratio = churn_ratio
-
-            # Cold-start / clean-slate guard: require at least one real winning
-            # trade before the ratio can block new entries. Without this, a fresh
-            # start with all-loser history produces ratio=inf and deadlocks entry.
-            if gross_profit < CHURN_GUARD_MIN_GROSS_WIN_SUM:
-                return
-
-            if churn_ratio > CHURN_RATIO_LIMIT:
-                if not self._regime_state.churn_guard_active:
-                    logger.warning(
-                        "REGIME: CHURN_GUARD activated - fees=%.2f profit=%.2f ratio=%.2f > %.2f (max %dh)",
-                        total_costs,
-                        gross_profit,
-                        churn_ratio,
-                        CHURN_RATIO_LIMIT,
-                        CHURN_GUARD_MAX_SEC // 3600,
-                    )
-                    self._regime_state.churn_guard_activated_at = time.time()
-                now = time.time()
-                elapsed = now - self._regime_state.churn_guard_activated_at if self._regime_state.churn_guard_activated_at > 0 else 0
-                if elapsed > CHURN_GUARD_MAX_SEC:
-                    logger.info(
-                        "REGIME: CHURN_GUARD auto-cleared after %.0fh (max=%dh) — allowing trades with tightened criteria",
-                        elapsed / 3600,
-                        CHURN_GUARD_MAX_SEC // 3600,
-                    )
-                    self._regime_state.churn_guard_active = False
-                    self._regime_state.churn_guard_activated_at = 0.0
-                else:
-                    self._regime_state.churn_guard_active = True
-            else:
-                self._regime_state.churn_guard_active = False
-                self._regime_state.churn_guard_activated_at = 0.0
-        else:
-            self._regime_state.churn_ratio = total_costs / gross_profit if gross_profit > 0 else 0.0
-            if self._regime_state.churn_guard_active:
-                logger.info(
-                    "REGIME: CHURN_GUARD cleared (samples=%s min=%s gross_profit=%.4f)",
-                    len(rows),
-                    CHURN_GUARD_MIN_SAMPLES,
-                    gross_profit,
-                )
-            self._regime_state.churn_guard_active = False
+        prior = ChurnGuardState(
+            active=bool(self._regime_state.churn_guard_active),
+            activated_at=float(self._regime_state.churn_guard_activated_at or 0.0),
+            parole_window_fp=str(getattr(self._regime_state, "churn_parole_window_fp", "") or ""),
+            ratio=float(self._regime_state.churn_ratio or 0.0),
+        )
+        nxt = evaluate_churn_transition(
+            now=time.time(),
+            rows=rows,
+            state=prior,
+            ratio_limit=CHURN_RATIO_LIMIT,
+            max_sec=float(CHURN_GUARD_MAX_SEC),
+            min_samples=CHURN_GUARD_MIN_SAMPLES,
+            min_gross_win=CHURN_GUARD_MIN_GROSS_WIN_SUM,
+        )
+        self._regime_state.churn_guard_active = nxt.active
+        self._regime_state.churn_guard_activated_at = nxt.activated_at
+        self._regime_state.churn_parole_window_fp = nxt.parole_window_fp
+        self._regime_state.churn_ratio = 0.0 if nxt.ratio == float("inf") else float(nxt.ratio)
+        try:
+            persist_churn_guard_state(self.db_path, nxt)
+        except Exception:
+            logger.debug("CHURN_GUARD persist failed", exc_info=True)
 
     def _check_regime_guards(self, symbol: str, current_bar: int) -> tuple[bool, str]:
         """Check if trade is blocked by regime guards.
