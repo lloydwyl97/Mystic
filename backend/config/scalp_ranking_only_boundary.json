@@ -1,0 +1,12 @@
+{
+  "repair": "scalp_ranking_only_entry_permission",
+  "commit": "2a99924",
+  "parent": "2f979b1",
+  "SCALP_RANKING_ONLY_VALID_START_LOCAL": "2026-08-30T17:46:35Z",
+  "SCALP_RANKING_ONLY_VALID_START_OCEAN": "2026-08-30T17:47:57Z",
+  "source": {
+    "local": "binance_scalp.runner STARTING 2026-08-30 12:46:35 CDT after 2a99924 local restart",
+    "ocean": "binance_scalp.runner STARTING 2026-08-30T17:47:57Z after 2a99924 pull"
+  },
+  "note": "SCALP-only research boundary. Do not rewrite prior SCALP trades. Do not change DAY_RESIDUAL_EXIT_VALID_START_*. Headline SCALP comparison after this repair uses BUY/runtime at or after the host stamp."
+}
