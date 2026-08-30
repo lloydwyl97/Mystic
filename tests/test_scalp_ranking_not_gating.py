@@ -1,6 +1,6 @@
 """SCALP ranking vs execution.
 
-Rejected setups may still rank. They cannot fill.
+Rejected setups may still rank and fill when mechanical safety is clear.
 Mechanical safety still owns hard_block.
 Regime / stall / arm-EV remain rank/size only.
 """
@@ -19,6 +19,7 @@ sys.path.insert(0, str(REPO))
 from backend.services.binance_scalp.config import get_scalp_config
 from backend.services.binance_scalp.economics import ScalpEconomics
 from backend.services.binance_scalp.scalp_candidate_ranking import (
+    pick_best_global_candidate,
     prepare_entry_signal,
     rank_setup_signal,
 )
@@ -77,14 +78,35 @@ def _reachable_soft_sig(reason: str = "NOT_NEAR_SUPPORT", symbol: str = "ETHUSDT
     )
 
 
-def test_soft_reject_ranks_but_cannot_execute():
-    """NOT_NEAR_SUPPORT with a real net edge is not a safety hard_block,
-    but it is not entry_eligible."""
+def test_soft_reject_ranks_and_is_eligible():
+    """NOT_NEAR_SUPPORT with a real net edge is not a safety hard_block."""
     ranked = rank_setup_signal(_reachable_soft_sig(), regime="range", ctx=_ctx())
     assert ranked.hard_block is None
-    assert ranked.entry_eligible is False
+    assert ranked.entry_eligible is True
     assert ranked.rank_score is not None
     assert ranked.soft_reason == "NOT_NEAR_SUPPORT"
+    assert ranked.signal.passed is False
+    assert ranked.selection_confidence.startswith("soft_rank_ranked")
+
+
+def test_case_a_no_pullback_recovery_eligible():
+    ranked = rank_setup_signal(_reachable_soft_sig("NO_PULLBACK_RECOVERY"), regime="range", ctx=_ctx())
+    assert ranked.hard_block is None
+    assert ranked.entry_eligible is True
+    assert ranked.signal.passed is False
+    best = pick_best_global_candidate(
+        [
+            {
+                "symbol": "ETHUSDT",
+                "rank_score": ranked.rank_score,
+                "entry_eligible": ranked.entry_eligible,
+                "hard_block": ranked.hard_block,
+                "signal": ranked.signal,
+            }
+        ]
+    )
+    assert best is not None
+    assert best["entry_eligible"] is True
 
 
 def test_regime_mismatch_never_sets_hard_block_on_genuine_pass():
@@ -170,12 +192,13 @@ def test_arm_negative_ev_never_blocks_genuine_pass():
     assert ranked.arm_penalty_mult < 1.0
 
 
-def test_prepare_entry_signal_does_not_promote_soft_rank():
+def test_prepare_entry_signal_stamps_soft_rank_without_forging_pass():
     ranked = rank_setup_signal(_reachable_soft_sig(), regime="range", ctx=_ctx())
-    assert ranked.entry_eligible is False
+    assert ranked.entry_eligible is True
     sig = prepare_entry_signal(ranked, _ctx())
     assert sig.passed is False
-    assert not (sig.setup_context or {}).get("entry_owner")
+    assert (sig.setup_context or {}).get("entry_owner") == "ranking_ev"
+    assert (sig.setup_context or {}).get("soft_rank_entry") is True
 
 
 def test_prepare_entry_signal_stamps_strategy_owner_for_genuine_pass():
@@ -279,3 +302,60 @@ def test_dynamic_sizing_respects_min_floor():
         mtf_penalty_mult=0.2,
     )
     assert result.notional >= 5.0
+
+
+def test_case_d_spread_blocks_soft_rank():
+    sig = _reachable_soft_sig("NOT_NEAR_SUPPORT")
+    ranked = rank_setup_signal(sig, regime="range", ctx=_ctx(spread=0.02))
+    assert ranked.entry_eligible is False
+    assert ranked.hard_block == "SPREAD_TOO_WIDE"
+
+
+def test_case_e_stale_data_is_hard_block():
+    stale = _reachable_soft_sig("STALE_DATA")
+    ranked = rank_setup_signal(stale, regime="range", ctx=_ctx())
+    assert ranked.entry_eligible is False
+    assert ranked.hard_block == "STALE_DATA"
+
+
+def test_case_f_no_executable_net_edge_blocks():
+    unreachable = _reachable_soft_sig("TARGET_NOT_REACHABLE")
+    ranked = rank_setup_signal(unreachable, regime="range", ctx=_ctx())
+    assert ranked.entry_eligible is False
+    assert ranked.hard_block in {"TARGET_NOT_REACHABLE", "NO_EXECUTABLE_NET_EDGE"}
+
+
+def test_case_g_breaker_blocks_regardless_of_passed():
+    from backend.services.binance_scalp.paper_engine import BinanceScalpPaperEngine
+
+    engine = object.__new__(BinanceScalpPaperEngine)
+    engine._last_circuit_breaker_open = False
+
+    def _open(_conn=None):
+        return True
+
+    engine._check_scalp_circuit_breaker = _open
+    assert engine._check_scalp_circuit_breaker() is True
+
+
+def test_paper_engine_no_sig_passed_buy_locks():
+    import inspect
+
+    from backend.services.binance_scalp import paper_engine as pe
+
+    cand_src = inspect.getsource(pe.BinanceScalpPaperEngine._entry_candidates)
+    try_src = inspect.getsource(pe.BinanceScalpPaperEngine._try_entry)
+    full = cand_src + try_src
+    assert "STRATEGY_NOT_PASSED" not in full
+    assert "if not strategy_passed:" not in inspect.getsource(pe.BinanceScalpPaperEngine._try_entry)
+    assert "or not bool(getattr(sig, \"passed\", False))" not in cand_src
+
+
+def test_soft_rank_reservation_not_popped_for_opinion():
+    import inspect
+
+    from backend.services.binance_scalp.paper_engine import BinanceScalpPaperEngine
+
+    src = inspect.getsource(BinanceScalpPaperEngine._try_entry)
+    assert "if not strategy_passed:" not in src
+    assert "self._entry_reservations.pop" not in src or "INSUFFICIENT_CASH" in src

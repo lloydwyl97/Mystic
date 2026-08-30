@@ -55,7 +55,7 @@ def _sig_field(s: Any, key: str, default: Any = None) -> Any:
 
 def _classify_post_pass_blocker(ranked_row: dict[str, Any]) -> str | None:
     """
-    Why a genuine-pass setup still failed entry_eligible.
+    Why a genuine-pass setup still failed entry_eligible (safety only).
     Returns None if eligible or never passed.
     """
     meta = ranked_row.get("rank_meta") or {}
@@ -195,11 +195,11 @@ def build_entry_telemetry(ranked: list[dict[str, Any]]) -> dict[str, Any]:
         "symbol_setup_eval_counts": dict(symbol_setup_eval.most_common(40)),
         "symbol_setup_pass_counts": dict(symbol_setup_pass.most_common(40)),
         "symbols": symbols,
-        "soft_rank_entry_allowed": False,
+        "soft_rank_entry_allowed": True,
         "note": (
             "genuine_pass_setups = strategies that returned passed=True this cycle. "
-            "entry_eligible_count requires passed + min score + no hard block + regime-native (when enabled). "
-            "post_pass_blockers = passed setups that still could not enter."
+            "entry_eligible_count requires no mechanical hard_block (soft-rank may be eligible). "
+            "post_pass_blockers = passed setups that still could not enter (safety only)."
         ),
     }
 

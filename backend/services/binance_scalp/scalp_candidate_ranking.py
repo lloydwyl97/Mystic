@@ -133,7 +133,7 @@ def _symbol_stall_risk_gate_enabled() -> bool:
 
 
 def _require_regime_native() -> bool:
-    """When true (default), only regime-native strategies may become entry_eligible."""
+    """When true, non-native regime is a rank/size label only — not entry_eligible."""
     return str(os.getenv("SCALP_REQUIRE_REGIME_NATIVE", "false")).strip().lower() in (
         "1",
         "true",
@@ -352,12 +352,10 @@ def rank_setup_signal(
             )
 
     min_score = _min_tradeable_score()
-    # Soft-rank (sig.passed=False) may still RANK for diagnostics. It cannot
-    # EXECUTE. Paper history after the 08-11 "ranking not gating" change was
-    # ~100% soft-rank fills, negative on all four symbols, PF 0.13–0.27.
-    # Mechanical safety still owns hard_block. Genuine strategy confirm owns
-    # entry_eligible. Regime / stall / arm-EV remain rank/size only.
-    entry_eligible = hard_block is None and bool(sig.passed)
+    # Soft-rank (sig.passed=False) still RANKS and may EXECUTE if mechanical
+    # safety is clear. Opinion misses change score / size / telemetry only.
+    # hard_block owns BUY permission. Never forge passed=True.
+    entry_eligible = hard_block is None
     soft_reason = None if sig.passed else sig.reject_reason
     confidence = "genuine_pass" if sig.passed else "soft_rank_ranked"
     if rank_score < min_score:
@@ -596,11 +594,11 @@ def prepare_entry_signal(
     ranked: RankedCandidate,
     ctx: StrategyMarketContext,
 ) -> ScalpSetupSignal:
-    """Return an executable entry signal only when ``entry_eligible``.
+    """Stamp provenance on an ``entry_eligible`` candidate.
 
-    ``entry_eligible`` requires mechanical safety clear **and** ``sig.passed``.
-    Soft-rank rows stay in the rank list with honest provenance; they are not
-    promoted into a fill. Never forges ``passed=True``.
+    ``entry_eligible`` is mechanical safety only (``hard_block is None``).
+    Soft-rank stays labeled (``soft_rank_entry``, ``entry_owner=ranking_ev``).
+    Never forges ``passed=True``.
     """
     from dataclasses import replace
 

@@ -1090,13 +1090,9 @@ class BinanceScalpPaperEngine:
             }
             for r in ranked
         ]
-        # Soft-rank cannot fill. entry_eligible already requires sig.passed
-        # plus mechanical safety; this second check stays fail-closed.
-        if not bool(best.get("entry_eligible")) or not bool(getattr(sig, "passed", False)):
-            reject_why = (
-                best.get("hard_block")
-                or ("STRATEGY_NOT_PASSED" if not bool(getattr(sig, "passed", False)) else "RANKED_NOT_ELIGIBLE")
-            )
+        # Mechanical safety only. Soft-rank / sig.passed is not a BUY lock.
+        if not bool(best.get("entry_eligible")):
+            reject_why = best.get("hard_block") or "RANKED_NOT_ELIGIBLE"
             self._record_reject(
                 conn,
                 sym,
@@ -1307,10 +1303,7 @@ class BinanceScalpPaperEngine:
 
         thesis_fields = scalp_strategy_to_thesis(sig.setup_name, sig.setup_context or {})
         strategy_passed = bool(getattr(sig, "passed", False))
-        if not strategy_passed:
-            self._entry_reservations.pop(sym.upper(), None)
-            return []
-        soft_rank_entry = False
+        soft_rank_entry = not strategy_passed
         entry_diag = {
             "setup_name": sig.setup_name,
             "setup_context": sig.setup_context,
