@@ -28,7 +28,9 @@ ensure_ipv4_only()
 # while eliminating redundant duplicate Binance calls within the same window.
 # Does not change any entry/exit/ranking/scoring/sizing/learning logic.
 SCALP_DEPTH_CACHE_TTL_SEC: float = float(os.getenv("SCALP_DEPTH_CACHE_TTL_SEC", "2.5"))
+SCALP_WS_DEPTH_MAX_AGE_SEC: float = float(os.getenv("SCALP_WS_DEPTH_MAX_AGE_SEC", "1.5"))
 _DEPTH_CACHE_KEY_PREFIX = "scalp:depth_cache:"
+_WS_DEPTH_KEY_PREFIX = "scalp:ws_depth:"
 _DEPTH_ENDPOINT_WEIGHT = 5  # Binance.US weight for GET /api/v3/depth?limit=100
 
 
@@ -98,6 +100,42 @@ def _read_depth_cache(r: redis.Redis, sym: str) -> tuple[list[list[float]], list
         return None
 
 
+def publish_ws_depth(symbol: str, bids: list[list[float]], asks: list[list[float]]) -> None:
+    """Publish the live depth20@100ms book for SCALP fills (runner is another process).
+
+    Does not change DAY ranking or trails. Best-effort Redis write.
+    """
+    if not bids or not asks:
+        return
+    bus = symbol_bus(symbol)
+    try:
+        r = redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"), decode_responses=True)
+        payload = json.dumps({"fetched_at": time.time(), "bids": bids, "asks": asks, "source": "websocket"})
+        r.set(f"{_WS_DEPTH_KEY_PREFIX}{bus}", payload, ex=5)
+        r.set(f"{_DEPTH_CACHE_KEY_PREFIX}{bus}", payload, ex=max(5, int(SCALP_DEPTH_CACHE_TTL_SEC * 2)))
+    except Exception:
+        pass
+
+
+def _read_ws_depth(r: redis.Redis, sym: str) -> tuple[list[list[float]], list[list[float]], float] | None:
+    try:
+        raw = r.get(f"{_WS_DEPTH_KEY_PREFIX}{sym}")
+        if not raw:
+            return None
+        payload = json.loads(raw)
+        fetched_at = float(payload.get("fetched_at") or 0)
+        age = time.time() - fetched_at
+        if age > SCALP_WS_DEPTH_MAX_AGE_SEC or age < 0:
+            return None
+        bids = payload.get("bids") or []
+        asks = payload.get("asks") or []
+        if not bids or not asks:
+            return None
+        return bids, asks, age
+    except Exception:
+        return None
+
+
 def _write_depth_cache(r: redis.Redis, sym: str, bids: list[list[float]], asks: list[list[float]]) -> None:
     try:
         payload = json.dumps({"fetched_at": time.time(), "bids": bids, "asks": asks})
@@ -149,20 +187,25 @@ class ScalpMarketReader:
         base = symbol_base(bus)
         redis_spread, imbalance = self._read_redis_features(base)
 
-        cached = _read_depth_cache(self._redis, bus)
-        if cached is not None:
-            bids, asks, age_sec = cached
-            book_source = "binance_us_public_depth_readonly_cached"
+        ws_book = _read_ws_depth(self._redis, bus)
+        if ws_book is not None:
+            bids, asks, age_sec = ws_book
+            book_source = "binance_us_ws_depth20"
         else:
-            try:
-                bids, asks = fetch_depth_sync(bus)
-            except Exception:
-                return None
-            age_sec = 0.0
-            book_source = "binance_us_public_depth_readonly"
-            if bids and asks:
-                _write_depth_cache(self._redis, bus, bids, asks)
-                _record_depth_weight_usage(self._redis)
+            cached = _read_depth_cache(self._redis, bus)
+            if cached is not None:
+                bids, asks, age_sec = cached
+                book_source = "binance_us_public_depth_readonly_cached"
+            else:
+                try:
+                    bids, asks = fetch_depth_sync(bus)
+                except Exception:
+                    return None
+                age_sec = 0.0
+                book_source = "binance_us_public_depth_readonly"
+                if bids and asks:
+                    _write_depth_cache(self._redis, bus, bids, asks)
+                    _record_depth_weight_usage(self._redis)
 
         if not bids or not asks:
             return None

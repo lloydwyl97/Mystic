@@ -1090,25 +1090,23 @@ class BinanceScalpPaperEngine:
             }
             for r in ranked
         ]
-        # Architecture v2 (2026-08-11): sig.passed is no longer a promotion
-        # requirement here — pick_best_global_candidate() already only
-        # returns candidates with entry_eligible=True, meaning every
-        # mechanical safety hard_block (stale data, bad spread/impact, no
-        # net edge, duplicate position, exposure cap) already cleared for
-        # this candidate. A strategy-rejected (soft-rank) pick is executable;
-        # scalp_dynamic_sizing.py is what protects capital on it, not a
-        # second permission check here.
-        if not bool(best.get("entry_eligible")):
+        # Soft-rank cannot fill. entry_eligible already requires sig.passed
+        # plus mechanical safety; this second check stays fail-closed.
+        if not bool(best.get("entry_eligible")) or not bool(getattr(sig, "passed", False)):
+            reject_why = (
+                best.get("hard_block")
+                or ("STRATEGY_NOT_PASSED" if not bool(getattr(sig, "passed", False)) else "RANKED_NOT_ELIGIBLE")
+            )
             self._record_reject(
                 conn,
                 sym,
                 "BUY",
-                best.get("hard_block") or "RANKED_NOT_ELIGIBLE",
+                reject_why,
                 json.dumps({"setup": sig.as_dict(), "rank_score": best.get("rank_score")}),
             )
             self._publish_last_decision(
                 decision="BLOCKED",
-                reason=str(best.get("hard_block") or "RANKED_NOT_ELIGIBLE"),
+                reason=str(reject_why),
                 selected_symbol=sym,
                 rank_score=best.get("rank_score"),
                 entry_armed=self._entry_armed_ok(),
@@ -1309,7 +1307,10 @@ class BinanceScalpPaperEngine:
 
         thesis_fields = scalp_strategy_to_thesis(sig.setup_name, sig.setup_context or {})
         strategy_passed = bool(getattr(sig, "passed", False))
-        soft_rank_entry = bool((sig.setup_context or {}).get("soft_rank_entry", not strategy_passed))
+        if not strategy_passed:
+            self._entry_reservations.pop(sym.upper(), None)
+            return []
+        soft_rank_entry = False
         entry_diag = {
             "setup_name": sig.setup_name,
             "setup_context": sig.setup_context,

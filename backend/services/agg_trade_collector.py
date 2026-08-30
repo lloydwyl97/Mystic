@@ -80,11 +80,10 @@ class AggTradeCollector:
 
     async def _connect_and_listen(self) -> None:
         streams = [f"{symbol.lower()}usdt@aggTrade" for symbol in self.symbols]
-        async with websockets.connect(self.ws_url, open_timeout=30, ping_interval=20, ping_timeout=20) as websocket:
+        url = f"{self.ws_url}?streams={'/'.join(streams)}"
+        async with websockets.connect(url, open_timeout=30, ping_interval=20, ping_timeout=20) as websocket:
             self.websocket = websocket
-            subscribe_msg = {"method": "SUBSCRIBE", "params": streams, "id": 2}
-            await websocket.send(json.dumps(subscribe_msg))
-            logger.info(f"Subscribed to {len(streams)} aggTrade streams")
+            logger.info(f"Connected to {len(streams)} aggTrade combined streams")
 
             async for message in websocket:
                 if not self.is_running:
@@ -108,9 +107,12 @@ class AggTradeCollector:
             data = json.loads(message)
             if "result" in data:
                 return
-            if "stream" not in data or "data" not in data:
+            if isinstance(data.get("data"), dict):
+                payload = data["data"]
+            elif str(data.get("e") or "") == "aggTrade":
+                payload = data
+            else:
                 return
-            payload: dict[str, Any] = data["data"]
             symbol = str(payload.get("s") or "").replace("USDT", "")
             qty = float(payload.get("q") or 0.0)
             is_buyer_maker = bool(payload.get("m"))

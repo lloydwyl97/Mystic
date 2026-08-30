@@ -6,6 +6,7 @@ All data from Binance US only - Production ready
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -170,6 +171,10 @@ class OrderBookCollector:
                 logger.info(f"Starting OrderBookService for first message from {symbol}")
                 await order_book_service.start()
             await order_book_service.process_order_book(symbol, top_bids, top_asks, last_update_id=last_update_id)
+            with contextlib.suppress(Exception):
+                from backend.services.binance_scalp.market_reader import publish_ws_depth
+
+                publish_ws_depth(symbol, top_bids, top_asks)
 
             self.stats["messages_received"] += 1
             self.stats["order_books_processed"] += 1

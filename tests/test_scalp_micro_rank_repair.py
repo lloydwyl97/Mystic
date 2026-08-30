@@ -421,7 +421,7 @@ def test_negative_ev_and_negative_flow_still_eligible(monkeypatch):
         reject_reason="NOT_NEAR_SUPPORT",
     )
     ranked = rank_setup_signal(sig, regime="range", ctx=ctx)
-    assert ranked.entry_eligible is True
+    assert ranked.entry_eligible is False
     assert ranked.hard_block is None
     assert ranked.rank_components["EV_10s"] < 0
     assert TIEBREAK_SCALE == 0.0

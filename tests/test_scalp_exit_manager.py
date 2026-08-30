@@ -229,7 +229,7 @@ def test_path_aware_takes_first_executable_profit(monkeypatch):
         config=get_scalp_config(),
         trade_id="path-tp",
         hold_sec=45.0,
-        executable_net_pct=0.0004,
+        executable_net_pct=0.0007,
         profit_hit=False,
         exit_spread_ok=True,
         perform_review=True,
@@ -238,10 +238,29 @@ def test_path_aware_takes_first_executable_profit(monkeypatch):
     assert review.exit_reason == EXIT_PATH_EXECUTABLE_PROFIT
 
 
-def test_path_aware_profit_floor_stays_reachable(monkeypatch):
-    """Best observed winner was +0.1015% net; a conventional target books nothing."""
+def test_path_aware_profit_floor_matches_roundtrip_cost(monkeypatch):
+    """+1bp crumbs are below taker+slip (6bp). Floor is the cost hurdle."""
     monkeypatch.delenv("SCALP_PATH_MIN_EXECUTABLE_NET_PCT", raising=False)
-    assert _path_min_executable_net_pct() <= 0.0002
+    assert _path_min_executable_net_pct() == 0.0006
+
+
+def test_path_aware_does_not_clip_one_bp_crumb(monkeypatch):
+    monkeypatch.setenv("SCALP_PATH_AWARE_EXIT", "true")
+    monkeypatch.delenv("SCALP_PATH_MIN_EXECUTABLE_NET_PCT", raising=False)
+    review = evaluate_exit(
+        track=_path_track(100.0, 100.02),
+        snap=_Snap("BTCUSDT", 100.02),
+        mom=_flat_mom(),
+        econ=ScalpEconomics.from_env(),
+        config=get_scalp_config(),
+        trade_id="path-crumb",
+        hold_sec=45.0,
+        executable_net_pct=0.0001,
+        profit_hit=False,
+        exit_spread_ok=True,
+        perform_review=True,
+    )
+    assert review.decision != "SELL" or review.exit_reason != EXIT_PATH_EXECUTABLE_PROFIT
 
 
 def test_path_aware_cuts_a_loser_at_the_bounded_stop(monkeypatch):

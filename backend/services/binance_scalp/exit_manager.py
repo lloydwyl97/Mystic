@@ -58,15 +58,13 @@ def _path_aware_exit_enabled() -> bool:
 def _path_min_executable_net_pct() -> float:
     """Minimum executable net before the path-aware branch books a winner.
 
-    Deliberately low. Across the first 53 paper closes the best winner was
-    +0.1015% net and the median was +0.0206%, so raising this floor to a
-    conventional target books nothing at all — at 0.15% it would have taken
-    zero of the 25 winners. The asymmetry is fixed on the loss side instead.
+    Floor matches round-trip taker+slip (4bp+2bp) so +1bp crumbs cannot
+    fire before micro-TP. MAE stay at -15bp. Not an entry gate.
     """
     try:
-        return float(os.getenv("SCALP_PATH_MIN_EXECUTABLE_NET_PCT", "0.0001"))
+        return float(os.getenv("SCALP_PATH_MIN_EXECUTABLE_NET_PCT", "0.0006"))
     except (TypeError, ValueError):
-        return 0.0001
+        return 0.0006
 
 
 def _path_max_adverse_net_pct() -> float:

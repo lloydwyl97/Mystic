@@ -352,27 +352,12 @@ def rank_setup_signal(
             )
 
     min_score = _min_tradeable_score()
-    # Architecture v2 (2026-08-11, "ranking not gating" rule): the prior
-    # "lever-4" fix required sig.passed AND rank_score>=min_score AND
-    # hard_block is None as a single boolean permission before ANY candidate
-    # could execute. That was itself an opinion/confidence-threshold gate —
-    # exactly the pattern the current architecture rule forbids for anything
-    # that is not mechanical safety. The original evidence it was fixing
-    # (188/188 soft-rank entries, -$4.35, 15.3% WR, rank_score not
-    # discriminating outcome) is still real and is NOT ignored — it is now
-    # addressed on the sizing side: scalp_dynamic_sizing.py sizes
-    # soft-rejected / regime-mismatched / arm-negative-EV / symbol-stall-risk
-    # candidates down toward the practical notional floor instead of a
-    # full-size bet, so a weak opinion costs little instead of nothing.
-    #
-    # entry_eligible now means ONLY "no mechanical safety hard_block fired"
-    # (spread / depth / stale-data / momentum-data-insufficient / net-edge —
-    # all handled above, before this point). rank_score is still fully
-    # computed and still drives which of the four symbols wins the global
-    # pick (pick_best_global_candidate) — a rejected setup can still be
-    # ranked and traded (small), it can never be forbidden by an opinion
-    # signal.
-    entry_eligible = hard_block is None
+    # Soft-rank (sig.passed=False) may still RANK for diagnostics. It cannot
+    # EXECUTE. Paper history after the 08-11 "ranking not gating" change was
+    # ~100% soft-rank fills, negative on all four symbols, PF 0.13–0.27.
+    # Mechanical safety still owns hard_block. Genuine strategy confirm owns
+    # entry_eligible. Regime / stall / arm-EV remain rank/size only.
+    entry_eligible = hard_block is None and bool(sig.passed)
     soft_reason = None if sig.passed else sig.reject_reason
     confidence = "genuine_pass" if sig.passed else "soft_rank_ranked"
     if rank_score < min_score:
@@ -611,17 +596,11 @@ def prepare_entry_signal(
     ranked: RankedCandidate,
     ctx: StrategyMarketContext,
 ) -> ScalpSetupSignal:
-    """Return an executable entry signal for any candidate that is
-    ``entry_eligible`` (i.e. no mechanical safety hard_block fired).
+    """Return an executable entry signal only when ``entry_eligible``.
 
-    Architecture v2 (2026-08-11): a strategy's own ``sig.passed`` is a
-    strong, but no longer mandatory, ranking/confidence input — see the
-    architecture note in ``rank_setup_signal``. This function stamps HONEST
-    provenance (never forges ``passed=True``) so downstream sizing
-    (``scalp_dynamic_sizing.py``) and learning attribution can tell a
-    genuine strategy pass from an opinion-ranked promotion. Position size,
-    not eligibility, is what protects capital on a weak/soft-rank/negative-EV
-    candidate.
+    ``entry_eligible`` requires mechanical safety clear **and** ``sig.passed``.
+    Soft-rank rows stay in the rank list with honest provenance; they are not
+    promoted into a fill. Never forges ``passed=True``.
     """
     from dataclasses import replace
 
