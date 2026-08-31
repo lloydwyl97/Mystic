@@ -32,6 +32,7 @@ _DEFAULT_TTL_SEC = 600
 # for transient network/exchange hiccups, not tight enough to false-alarm.
 CRITICAL_TASK_THRESHOLDS_SEC: dict[str, float] = {
     "order_book_collector:ws_messages": 60.0,
+    "agg_trade_collector:ws_messages": 180.0,
     "live_market_data:ohlcv_loop": 180.0,
     "scalp_runner:tick": 60.0,
 }
