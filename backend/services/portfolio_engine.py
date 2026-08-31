@@ -7462,11 +7462,45 @@ class PortfolioEngine:
     def _count_open_day_top4_positions(self) -> int:
         n = 0
         for sym, pos in self.open_positions.items():
-            if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
+            if not self._day_position_blocks_new_entry(pos):
                 continue
-            if _to_api_symbol(sym) in DAY_TRADE_SYMBOLS and float(getattr(pos, "quantity", 0) or 0) > 0:
+            if _to_api_symbol(sym) in DAY_TRADE_SYMBOLS:
                 n += 1
         return n
+
+    @staticmethod
+    def _day_position_blocks_new_entry(position: Any) -> bool:
+        """True when inventory must block a same-symbol DAY BUY.
+
+        ACTIVE and EXIT_RESIDUAL_PENDING with qty>0 are held.
+        DUST_PENDING is leftover accounting and is never held for entry.
+        """
+        if position is None:
+            return False
+        status = str(getattr(position, "status", "ACTIVE") or "ACTIVE")
+        if status == "DUST_PENDING":
+            return False
+        return float(getattr(position, "quantity", 0) or 0) > 0
+
+    def _day_entry_held_symbols(self) -> set[str]:
+        return {normalize_symbol(sym) for sym, pos in self.open_positions.items() if self._day_position_blocks_new_entry(pos)}
+
+    def _day_dust_symbols(self) -> set[str]:
+        return {normalize_symbol(sym) for sym, pos in self.open_positions.items() if str(getattr(pos, "status", "") or "") == "DUST_PENDING"}
+
+    def _day_entry_held_count(self) -> int:
+        return sum(1 for pos in self.open_positions.values() if self._day_position_blocks_new_entry(pos))
+
+    def _day_path_ev_entry_block_reason(self, symbol: str, max_open: int) -> str | None:
+        """Path-EV true-safety: duplicate ACTIVE/residual, or max-open of held slots.
+
+        DUST_PENDING does not populate the held set and does not consume slots.
+        """
+        if normalize_symbol(symbol) in self._day_entry_held_symbols():
+            return "DUPLICATE_SAME_SYMBOL"
+        if max_open > 0 and self._day_entry_held_count() >= max_open:
+            return "MAX_OPEN_LIMIT"
+        return None
 
     def _is_bear_day_regime(self) -> bool:
         from backend.services.day_regime_router import DAY_REGIME_BEAR, classify_day_regime
@@ -8504,7 +8538,8 @@ class PortfolioEngine:
         # basis while its cash had already been spent. The execute_buy_fifo
         # per-symbol lock now serializes concurrent attempts; this fresh read
         # additionally catches the case where memory itself is stale.
-        already_open_in_memory = normalized_symbol in self.open_positions and self.open_positions[normalized_symbol].quantity > 0
+        mem_pos = self.open_positions.get(normalized_symbol)
+        already_open_in_memory = self._day_position_blocks_new_entry(mem_pos)
         already_open_in_db = False
         if not already_open_in_memory:
             db_row = await asyncio.to_thread(self._fetch_authoritative_open_position_sync, normalized_symbol)
@@ -9682,6 +9717,7 @@ class PortfolioEngine:
                     SELECT quantity, trade_id, entry_price
                     FROM portfolio_engine_positions
                     WHERE symbol = ? AND quantity > 0
+                      AND COALESCE(status, 'ACTIVE') != 'DUST_PENDING'
                     LIMIT 1
                     """,
                     (normalized,),
@@ -11740,7 +11776,7 @@ class PortfolioEngine:
             return False, "ENTRY_ALREADY_RESERVED"
         if ns in self._pending_buy_order_symbols():
             return False, "ENTRY_PENDING_ORDER"
-        active_count = sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING")
+        active_count = self._day_entry_held_count()
         pending_slots = len(self._pending_buy_symbols() - {normalize_symbol(s) for s in self.open_positions})
         max_positions_limit = MAX_OPEN_POSITIONS
         if active_count + pending_slots >= max_positions_limit:
@@ -11904,7 +11940,7 @@ class PortfolioEngine:
         # Check max positions (hard limit: 10)
         # DUST_INVARIANT: Exclude DUST_PENDING from count - dust must not block new buys
         # Count pending entry reservations / pending BUY orders toward slot exposure.
-        active_count = sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING")
+        active_count = self._day_entry_held_count()
         pending_slot_symbols = self._pending_buy_symbols() - {normalize_symbol(s) for s in self.open_positions}
         pending_slots = len(pending_slot_symbols)
         max_positions_limit = MAX_OPEN_POSITIONS
@@ -11949,7 +11985,15 @@ class PortfolioEngine:
 
         # Check symbol not already open (max 1 per symbol)
         # Dust/zero-size positions: cleanup and allow buy; never block on stale memory.
+        # DUST_PENDING is leftover accounting — do not treat as held and do not flatten.
         position = self.open_positions.get(symbol)
+        if position is not None and str(getattr(position, "status", "ACTIVE") or "") == "DUST_PENDING":
+            logger.info(
+                "DAY_ENTRY_DUST_NOT_HELD symbol=%s qty=%s (does not block new DAY BUY)",
+                symbol,
+                getattr(position, "quantity", 0),
+            )
+            position = None
         if position is not None:
             await self._ensure_symbol_constraints(symbol)
             constraints = self._symbol_constraints.get(symbol) or {}
@@ -15850,14 +15894,23 @@ class PortfolioEngine:
                 top_candidate.decision_data = dict(top_candidate.decision_data or {})
                 top_candidate.decision_data["true_safety_reject_reason"] = reason
 
-        open_syms = set(self.open_positions.keys())
-        if normalize_symbol(top_candidate.symbol) in self.open_positions:
+        held_syms = self._day_entry_held_symbols()
+        dust_syms = self._day_dust_symbols()
+        logger.info(
+            "DAY_ENTRY_HELD_SET active=%s dust=%s held=%s",
+            sorted(held_syms),
+            sorted(dust_syms),
+            sorted(held_syms),
+        )
+        _path_ev_block = self._day_path_ev_entry_block_reason(top_candidate.symbol, 0)
+        if _path_ev_block == "DUPLICATE_SAME_SYMBOL":
             _stamp_true_safety("DUPLICATE_SAME_SYMBOL")
             await self._emit_day_health_telemetry("BUY_SKIPPED_DUPLICATE_SAME_SYMBOL")
             logger.info(
-                "DAY_PATH_EV_SAFETY reject=DUPLICATE_SAME_SYMBOL symbol=%s held=%s",
+                "DAY_PATH_EV_SAFETY reject=DUPLICATE_SAME_SYMBOL symbol=%s held=%s dust=%s",
                 top_candidate.symbol,
-                sorted(open_syms),
+                sorted(held_syms),
+                sorted(dust_syms),
             )
             self._persist_profit_cycle_state(
                 {
@@ -15879,13 +15932,14 @@ class PortfolioEngine:
             _max_pos_bar = int(os.getenv("MAX_OPEN_POSITIONS", str(getattr(self, "max_positions", 4) or 4)))
         except Exception:
             _max_pos_bar = 4
-        if _max_pos_bar > 0 and len(self.open_positions) >= _max_pos_bar:
+        if self._day_path_ev_entry_block_reason(top_candidate.symbol, _max_pos_bar) == "MAX_OPEN_LIMIT":
             _stamp_true_safety("MAX_OPEN_LIMIT")
             await self._emit_day_health_telemetry("BUY_SKIPPED_MAX_OPEN_LIMIT")
             logger.info(
-                "DAY_PATH_EV_SAFETY reject=MAX_OPEN_LIMIT open=%s max=%s",
-                len(self.open_positions),
+                "DAY_PATH_EV_SAFETY reject=MAX_OPEN_LIMIT open=%s max=%s dust=%s",
+                self._day_entry_held_count(),
                 _max_pos_bar,
+                sorted(self._day_dust_symbols()),
             )
             self._persist_profit_cycle_state(
                 {
@@ -16419,7 +16473,7 @@ class PortfolioEngine:
 
             record_day_decision(symbol=str(symbol or ""), provenance=explainability.entry_provenance)
 
-        if POSITION_FIRST_ROUTING_ENABLED and symbol in self.open_positions:
+        if POSITION_FIRST_ROUTING_ENABLED and self._day_position_blocks_new_entry(self.open_positions.get(normalize_symbol(symbol)) or self.open_positions.get(symbol)):
             managed = await self._route_selected_open_position(
                 candidate=top_candidate,
                 explainability=explainability,
