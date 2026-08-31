@@ -28,6 +28,7 @@ SCALP_TABLES = (
     "scalp_shadow_rejects",
     "scalp_post_exit_path",
     "scalp_opportunity_snapshots",
+    "scalp_structural_quotes",
 )
 
 SCHEMA_VERSION = 3
@@ -214,7 +215,30 @@ def apply_scalp_migrations(conn: sqlite3.Connection) -> list[str]:
         applied.append("ensure_exit_manager_v3")
     if ensure_breaker_recovery_columns(conn):
         applied.append("ensure_breaker_recovery_columns")
+    if ensure_structural_quotes_table(conn):
+        applied.append("ensure_structural_quotes_table")
     return applied
+
+
+def ensure_structural_quotes_table(conn: sqlite3.Connection) -> bool:
+    """Audit log for paper LP rest/fill. Does not mutate DAY tables."""
+    existed = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='scalp_structural_quotes'").fetchone()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scalp_structural_quotes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            action TEXT NOT NULL,
+            price REAL NOT NULL DEFAULT 0,
+            qty REAL NOT NULL DEFAULT 0,
+            reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_scalp_structural_quotes_symbol ON scalp_structural_quotes(symbol)")
+    return existed is None
 
 
 def ensure_breaker_recovery_columns(conn: sqlite3.Connection) -> bool:

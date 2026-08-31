@@ -53,6 +53,7 @@ class ScalpConfig:
     scalp_live_max_open: int
     scalp_thesis: str = "structural"
     legacy_prediction_entries: bool = False
+    structural_max_hold_sec: int = 600
     symbol_notional_caps: dict[str, float] = field(default_factory=dict)
 
     @classmethod
@@ -120,6 +121,7 @@ class ScalpConfig:
             scalp_engine_version=str(os.getenv("SCALP_ENGINE_VERSION", "scalp_structural_v1") or "scalp_structural_v1").strip(),
             scalp_thesis=("legacy_prediction" if (os.getenv("SCALP_THESIS", "structural") or "structural").strip().lower() == "legacy_prediction" else "structural"),
             legacy_prediction_entries=_bool("SCALP_LEGACY_PREDICTION_ENTRIES", False),
+            structural_max_hold_sec=int(os.getenv("SCALP_STRUCTURAL_MAX_HOLD_SEC", "600") or "600"),
             scalp_live_armed=_bool("SCALP_LIVE_ARMED", False),
             scalp_live_max_notional=float(os.getenv("SCALP_LIVE_MAX_NOTIONAL", "50.0")),
             scalp_live_max_open=int(os.getenv("SCALP_LIVE_MAX_OPEN", "2")),

@@ -54,7 +54,22 @@ from backend.services.binance_scalp.scalp_reject_throttle import (
 from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
 from backend.services.binance_scalp.schema import init_scalp_schema
 from backend.services.binance_scalp.strategies.kline_cache import KlineCache
-from backend.services.binance_scalp.structural_thesis import new_entry_block_reason
+from backend.services.binance_scalp.structural_lp import (
+    SETUP_NAME as STRUCTURAL_SETUP,
+)
+from backend.services.binance_scalp.structural_lp import (
+    book_from_snap,
+    is_structural_position,
+)
+from backend.services.binance_scalp.structural_lp import (
+    step as structural_lp_step,
+)
+from backend.services.binance_scalp.structural_thesis import (
+    new_entry_block_reason,
+    prediction_circuit_breaker_applies,
+    ranking_eval_permitted,
+    structural_lp_executable,
+)
 from backend.utils.sqlite_runtime import connect_rw, is_locked_error, run_locked_retry
 
 logger = logging.getLogger(__name__)
@@ -115,6 +130,7 @@ class BinanceScalpPaperEngine:
         self._last_breaker_reason = ""
         self._last_breaker_recovery_until = ""
         self._last_breaker_eval_after = ""
+        self._lp_quotes: dict[str, object] = {}
         try:
             from backend.database_schema import DATABASE_PATH as _DAY_DB
             from backend.services.atomic_execution_book import migrate_scalp_money_database
@@ -141,7 +157,7 @@ class BinanceScalpPaperEngine:
         else:
             set_entry_armed(self._redis, prefix=self.config.redis_key_prefix, armed=False)
         try:
-            if self._check_scalp_circuit_breaker():
+            if prediction_circuit_breaker_applies(self.config) and self._check_scalp_circuit_breaker():
                 self._last_circuit_breaker_open = True
                 self._publish_last_decision(decision="BLOCKED", reason="SCALP_CIRCUIT_BREAKER_OPEN")
             else:
@@ -669,6 +685,8 @@ class BinanceScalpPaperEngine:
         self._last_breaker_reason = ""
         self._last_breaker_recovery_until = ""
         self._last_breaker_eval_after = ""
+        if not prediction_circuit_breaker_applies(self.config):
+            return False
         try:
             if conn is not None:
                 return self._evaluate_scalp_circuit_breaker(conn)
@@ -1685,13 +1703,14 @@ class BinanceScalpPaperEngine:
         exit_gate: dict,
         hold_seconds: float = 0.0,
         spread_at_exit: float = 0.0,
+        exit_maker: bool | None = None,
     ) -> None:
         trade_id = str(row["trade_id"])
         sell_tid = f"{trade_id}_SELL"
         strategy_id = self._position_strategy_id(row)
         notional = qty * exit_price
-        fee = notional * self.econ.exit_fee_pct()
-        slip = notional * self.econ.slippage_buffer_pct
+        fee = notional * self.econ.exit_fee_pct(exit_maker=exit_maker)
+        slip = 0.0 if exit_maker else notional * self.econ.slippage_buffer_pct
         ledger = self._ledger(conn)
         pre = dict(ledger)
 
@@ -1959,6 +1978,8 @@ class BinanceScalpPaperEngine:
             logger.debug("SCALP_MARKET_MEMORY_CLOSE_SKIPPED %s", exc)
 
     def _try_exit(self, conn: sqlite3.Connection, row: sqlite3.Row, *, post_commit: list | None = None) -> None:
+        if is_structural_position(row):
+            return
         sym = str(row["symbol"])
         snap = self.reader.read(sym)
         if snap is None:
@@ -2328,8 +2349,225 @@ class BinanceScalpPaperEngine:
         else:
             _after_commit()
 
+    def _record_structural_quote(self, conn: sqlite3.Connection, action: object) -> None:
+        try:
+            conn.execute(
+                """
+                INSERT INTO scalp_structural_quotes (symbol, side, action, price, qty, reason)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(getattr(action, "symbol", "") or ""),
+                    str(getattr(getattr(action, "quote", None), "side", "") or getattr(action, "kind", "") or ""),
+                    str(getattr(action, "kind", "") or ""),
+                    float(getattr(action, "price", 0.0) or 0.0),
+                    float(getattr(action, "qty", 0.0) or 0.0),
+                    str(getattr(action, "reason", "") or ""),
+                ),
+            )
+        except Exception:
+            logger.debug("SCALP_STRUCTURAL_QUOTE_LOG_SKIPPED", exc_info=True)
+
+    def _structural_open_long(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        sym: str,
+        price: float,
+        qty: float,
+        reason: str,
+        spread_pct: float,
+    ) -> None:
+        if qty <= 0 or price <= 0:
+            return
+        if conn.execute(
+            "SELECT 1 FROM scalp_paper_positions WHERE symbol = ? AND status = 'OPEN' LIMIT 1",
+            (sym,),
+        ).fetchone():
+            return
+        notional = qty * price
+        fee = notional * self.econ.entry_fee_pct(entry_maker=True)
+        ts, epoch = self._now()
+        trade_id = f"scalp_lp_{sym}_{int(epoch * 1000)}"
+        ledger = self._ledger(conn)
+        if float(ledger["cash_balance"]) < notional + fee:
+            return
+        diag = {
+            "setup_name": STRUCTURAL_SETUP,
+            "book": STRUCTURAL_SETUP,
+            "fill_model": "through_price_only",
+            "entry_owner": "structural_lp",
+            "passed": True,
+            "soft_rank_entry": False,
+            "spread_at_entry": spread_pct,
+            "paper_limit": True,
+        }
+        conn.execute(
+            """
+            INSERT INTO scalp_paper_trades
+            (trade_id, symbol, exchange, strategy_id, side, quantity, price, notional,
+             fee_usd, slippage_usd, diagnostics_json)
+            VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                trade_id,
+                sym,
+                self.config.exchange,
+                STRUCTURAL_SETUP,
+                qty,
+                price,
+                notional,
+                fee,
+                json.dumps(diag),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO scalp_paper_positions
+            (symbol, exchange, strategy_id, quantity, entry_price, entry_time,
+             entry_time_epoch, trade_id, paper_order_id, status, state,
+             max_favorable_pct, max_adverse_pct, stale_review_count,
+             session_low_bid, diagnostics_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 'OPEN', 0, 0, 0, ?, ?)
+            """,
+            (
+                sym,
+                self.config.exchange,
+                STRUCTURAL_SETUP,
+                qty,
+                price,
+                ts,
+                epoch,
+                trade_id,
+                f"paper_order_{trade_id}",
+                price,
+                json.dumps(diag),
+            ),
+        )
+        new_cash = float(ledger["cash_balance"]) - notional - fee
+        pos_val = float(ledger["positions_value"]) + notional
+        conn.execute(
+            """
+            UPDATE scalp_paper_ledger SET
+              cash_balance = ?,
+              positions_value = ?,
+              total_equity = ?,
+              updated_at = datetime('now')
+            WHERE id = 1
+            """,
+            (new_cash, pos_val, new_cash + pos_val),
+        )
+        logger.info("SCALP_STRUCTURAL_BUY %s qty=%.8f price=%.4f reason=%s", sym, qty, price, reason)
+
+    def _structural_close(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        exit_price: float,
+        reason: str,
+        exit_maker: bool,
+    ) -> None:
+        entry = float(row["entry_price"])
+        qty = float(row["quantity"])
+        if qty <= 0 or exit_price <= 0:
+            return
+        entry_fee = entry * qty * self.econ.entry_fee_pct(entry_maker=True)
+        exit_fee = exit_price * qty * self.econ.exit_fee_pct(exit_maker=exit_maker)
+        exit_slip = 0.0 if exit_maker else exit_price * qty * self.econ.slippage_buffer_pct
+        net_usd = (exit_price - entry) * qty - (entry_fee + exit_fee + exit_slip)
+        net_pct = net_usd / (entry * qty) if entry * qty else 0.0
+        age = time.time() - float(row["entry_time_epoch"] or 0.0)
+        self._execute_sell(
+            conn,
+            row,
+            sym=str(row["symbol"]),
+            entry=entry,
+            qty=qty,
+            exit_price=exit_price,
+            net_pct=net_pct,
+            net_usd=net_usd,
+            reason=reason,
+            pf_dict={"fill_model": "through_price_only" if exit_maker else "taker_flatten"},
+            exit_gate={"book": STRUCTURAL_SETUP},
+            hold_seconds=max(0.0, age),
+            spread_at_exit=0.0,
+            exit_maker=exit_maker,
+        )
+        self._pending_sell_log = (str(row["symbol"]), net_usd, reason)
+
+    def _run_structural_lp(
+        self,
+        conn: sqlite3.Connection,
+        snaps: dict,
+        *,
+        epoch: float,
+    ) -> str | None:
+        if not structural_lp_executable(self.config):
+            return new_entry_block_reason(self.config)
+        open_rows = {str(r["symbol"]).upper(): r for r in self._open_positions(conn)}
+        open_count = len(open_rows)
+        last_reason: str | None = None
+        for sym in self.config.products:
+            snap = snaps.get(sym)
+            book = book_from_snap(snap, epoch=epoch) if snap is not None else None
+            pos = open_rows.get(str(sym).upper())
+            if pos is not None and not is_structural_position(pos):
+                self._lp_quotes.pop(sym, None)
+                continue
+            inv = float(pos["quantity"]) if pos is not None else 0.0
+            hold = 0.0
+            if pos is not None and is_structural_position(pos):
+                hold = max(0.0, epoch - float(pos["entry_time_epoch"] or 0.0))
+            lot = 0.0
+            if snap is not None and float(getattr(snap, "best_bid", 0.0) or 0.0) > 0:
+                cap = min(self.config.notional_cap_for_symbol(sym), float(self._ledger(conn)["cash_balance"]))
+                lot = cap / float(snap.best_bid) if cap >= 1.0 else 0.0
+            if pos is None and open_count >= int(self.config.max_open_positions):
+                lot = 0.0
+            quote = self._lp_quotes.get(sym)
+            nxt, actions = structural_lp_step(
+                quote,  # type: ignore[arg-type]
+                book,
+                inventory_qty=inv,
+                lot_qty=lot,
+                hold_sec=hold,
+                max_hold_sec=float(self.config.structural_max_hold_sec),
+            )
+            self._lp_quotes[sym] = nxt
+            for act in actions:
+                self._record_structural_quote(conn, act)
+                if act.kind == "buy" and pos is None and lot > 0:
+                    self._structural_open_long(
+                        conn,
+                        sym=sym,
+                        price=float(act.price),
+                        qty=float(act.qty),
+                        reason=act.reason,
+                        spread_pct=float(getattr(snap, "spread_pct", 0.0) or 0.0) if snap is not None else 0.0,
+                    )
+                    open_count += 1
+                    last_reason = act.reason
+                elif act.kind in {"sell", "timeout_sell"} and pos is not None and is_structural_position(pos):
+                    self._structural_close(
+                        conn,
+                        pos,
+                        exit_price=float(act.price),
+                        reason=act.reason,
+                        exit_maker=act.kind == "sell",
+                    )
+                    open_count = max(0, open_count - 1)
+                    last_reason = act.reason
+                    open_rows.pop(str(sym).upper(), None)
+                    pos = None
+        if last_reason:
+            self._publish_last_decision(decision="FILL", reason=last_reason)
+        else:
+            self._publish_last_decision(decision="QUOTE", reason="STRUCTURAL_REST_TOUCH")
+        return last_reason
+
     def _exit_open_positions_now(self) -> None:
-        """Evaluate existing path-aware exits before ranking/klines.
+        """Evaluate leftover ranking-book exits before the structural tick.
 
         Does not change PATH_MAX_ADVERSE_STOP or any other exit threshold.
         Removes only the evaluate_all / kline delay in front of _try_exit.
@@ -2340,6 +2578,8 @@ class BinanceScalpPaperEngine:
             with self._conn() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 for row in self._open_positions(conn):
+                    if is_structural_position(row):
+                        continue
                     self._try_exit(conn, row, post_commit=post_commit)
                 pending_sell = getattr(self, "_pending_sell_log", None)
                 self._pending_sell_log = None
@@ -2381,15 +2621,17 @@ class BinanceScalpPaperEngine:
             )
         # Publish before heavy REST/klines so snapshot cannot go missing mid-tick.
         # Exit-only ticks skip opportunity labeling / kline-adjacent work.
+        ranking_on = ranking_eval_permitted(self.config)
         if rank:
-            with contextlib.suppress(Exception):
-                from backend.services.binance_scalp.scalp_post_exit_path import fill_due_post_exit_paths
+            if ranking_on:
+                with contextlib.suppress(Exception):
+                    from backend.services.binance_scalp.scalp_post_exit_path import fill_due_post_exit_paths
 
-                fill_due_post_exit_paths(self.config.database_path, self.reader, now_epoch=time.time())
-            with contextlib.suppress(Exception):
-                from backend.services.binance_scalp.scalp_opportunity_dataset import label_due_opportunities
+                    fill_due_post_exit_paths(self.config.database_path, self.reader, now_epoch=time.time())
+                with contextlib.suppress(Exception):
+                    from backend.services.binance_scalp.scalp_opportunity_dataset import label_due_opportunities
 
-                label_due_opportunities(self.config.database_path, self.reader, now_epoch=time.time())
+                    label_due_opportunities(self.config.database_path, self.reader, now_epoch=time.time())
             with contextlib.suppress(Exception):
                 pre_open: list[sqlite3.Row] = []
                 try:
@@ -2440,11 +2682,12 @@ class BinanceScalpPaperEngine:
             snaps[sym] = snap
             self._record_momentum(snap)
             self._write_market_cache(snap)
-            with contextlib.suppress(Exception):
-                from backend.services.microstructure_engine import record_snapshot
+            if ranking_on:
+                with contextlib.suppress(Exception):
+                    from backend.services.microstructure_engine import record_snapshot
 
-                if getattr(snap, "bids", None) and getattr(snap, "asks", None):
-                    record_snapshot(sym, snap.bids, snap.asks)
+                    if getattr(snap, "bids", None) and getattr(snap, "asks", None):
+                        record_snapshot(sym, snap.bids, snap.asks)
 
         # Existing -15 bp authority must see the book before ranking work.
         from backend.services.binance_scalp.scalp_micro_latency import timed
@@ -2452,59 +2695,32 @@ class BinanceScalpPaperEngine:
         _exit_done = timed("event_to_exit_review")
         self._exit_open_positions_now()
         _exit_done()
-        self._observe_markouts(snaps)
+        if ranking_on:
+            self._observe_markouts(snaps)
         if not rank:
             return
 
-        for sym, snap in snaps.items():
-            bars = self._klines.get(sym)
-            regime = self._router._current_regime(sym, epoch, bars)
-            self._seed_scalp_market_memory(sym, snap, micro_regime=regime)
-            self._publish_scan_snapshot(sym, snap, micro_regime=regime, epoch=epoch)
-
-        notional = float(self.config.max_notional_paper)
-        with contextlib.suppress(Exception), self._conn() as _cash:
-            notional = min(notional, float(self._ledger(_cash)["cash_balance"]))
         pre_ranked: list[dict] = []
-        try:
-            pre_ranked = self._router.evaluate_all(epoch=epoch, notional_usd=notional) or []
-        except Exception:
-            logger.exception("SCALP_EVALUATE_ALL_FAILED")
-            pre_ranked = []
-        self._pending_opportunity_rows = pre_ranked
-        self._pending_opportunity_epoch = epoch
-        with contextlib.suppress(Exception):
-            from backend.services.binance_scalp.scalp_markout import schedule_markout
+        if ranking_on:
+            for sym, snap in snaps.items():
+                bars = self._klines.get(sym)
+                regime = self._router._current_regime(sym, epoch, bars)
+                self._seed_scalp_market_memory(sym, snap, micro_regime=regime)
+                self._publish_scan_snapshot(sym, snap, micro_regime=regime, epoch=epoch)
 
-            for row in pre_ranked:
-                snap = snaps.get(str(row.get("symbol") or ""))
-                if snap is None:
-                    continue
-                from backend.services.binance_scalp.scalp_micro_contract import feature_context_extra
-                from backend.services.microstructure_engine import compute_features
-
-                _sym = str(row.get("symbol") or "")
-                _mf = compute_features(_sym) or {}
-                schedule_markout(
-                    kind="candidate",
-                    symbol=_sym,
-                    side="BUY",
-                    mid=float(getattr(snap, "mid", 0.0) or 0.0),
-                    entry_px=float(getattr(snap, "best_ask", 0.0) or getattr(snap, "mid", 0.0) or 0.0),
-                    qty=0.0,
-                    notional=float(notional),
-                    fee_pct=float(self.econ.entry_fee_pct() + self.econ.exit_fee_pct()),
-                    slip_pct=float(self.econ.slippage_buffer_pct),
-                    extra=feature_context_extra(
-                        _mf,
-                        {
-                            "rank_score": row.get("rank_score"),
-                            "decision_epoch": epoch,
-                            "entry_eligible": bool(row.get("entry_eligible")),
-                            "final_micro_rank_delta": row.get("microstructure_adjustment"),
-                        },
-                    ),
-                )
+            notional = float(self.config.max_notional_paper)
+            with contextlib.suppress(Exception), self._conn() as _cash:
+                notional = min(notional, float(self._ledger(_cash)["cash_balance"]))
+            try:
+                pre_ranked = self._router.evaluate_all(epoch=epoch, notional_usd=notional) or []
+            except Exception:
+                logger.exception("SCALP_EVALUATE_ALL_FAILED")
+                pre_ranked = []
+            self._pending_opportunity_rows = pre_ranked
+            self._pending_opportunity_epoch = epoch
+        else:
+            self._pending_opportunity_rows = None
+            self._pending_opportunity_epoch = None
 
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -2512,21 +2728,26 @@ class BinanceScalpPaperEngine:
             open_rows = self._open_positions(conn)
             entry_blocked: str | None = None
             for row in open_rows:
+                if is_structural_position(row):
+                    continue
                 self._try_exit(conn, row, post_commit=post_commit)
-            open_count = conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0]
-            if open_count < self.config.max_open_positions:
-                before_rejects = conn.execute("SELECT COUNT(*) FROM scalp_rejects").fetchone()[0]
-                self._try_entry(conn, pre_ranked=pre_ranked)
-                after_rejects = conn.execute("SELECT COUNT(*) FROM scalp_rejects").fetchone()[0]
-                if after_rejects > before_rejects:
-                    last = conn.execute("SELECT reason FROM scalp_rejects ORDER BY id DESC LIMIT 1").fetchone()
-                    if last:
-                        entry_blocked = str(last[0] or "")
+            if ranking_on:
+                open_count = conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0]
+                if open_count < self.config.max_open_positions:
+                    before_rejects = conn.execute("SELECT COUNT(*) FROM scalp_rejects").fetchone()[0]
+                    self._try_entry(conn, pre_ranked=pre_ranked)
+                    after_rejects = conn.execute("SELECT COUNT(*) FROM scalp_rejects").fetchone()[0]
+                    if after_rejects > before_rejects:
+                        last = conn.execute("SELECT reason FROM scalp_rejects ORDER BY id DESC LIMIT 1").fetchone()
+                        if last:
+                            entry_blocked = str(last[0] or "")
+                else:
+                    entry_blocked = "MAX_OPEN_POSITIONS"
+                    self._publish_last_decision(decision="BLOCKED", reason="MAX_OPEN_POSITIONS")
+                if getattr(self, "_last_circuit_breaker_open", False):
+                    entry_blocked = "SCALP_CIRCUIT_BREAKER_OPEN"
             else:
-                entry_blocked = "MAX_OPEN_POSITIONS"
-                self._publish_last_decision(decision="BLOCKED", reason="MAX_OPEN_POSITIONS")
-            if getattr(self, "_last_circuit_breaker_open", False):
-                entry_blocked = "SCALP_CIRCUIT_BREAKER_OPEN"
+                entry_blocked = self._run_structural_lp(conn, snaps, epoch=epoch)
             open_after = self._open_positions(conn)
             self._publish_runner_state(conn, open_rows=open_after, epoch=epoch, entry_blocked_reason=entry_blocked)
             pending_sell = getattr(self, "_pending_sell_log", None)
@@ -2536,7 +2757,7 @@ class BinanceScalpPaperEngine:
             pending_epoch = getattr(self, "_pending_opportunity_epoch", None)
             self._pending_opportunity_rows = None
             self._pending_opportunity_epoch = None
-            if pending_opp:
+            if ranking_on and pending_opp:
                 try:
                     from backend.services.binance_scalp.scalp_opportunity_dataset import record_opportunity_cycle
 
@@ -2560,7 +2781,6 @@ class BinanceScalpPaperEngine:
                     fn()
                 except Exception as exc:
                     logger.warning("SCALP_POST_COMMIT_HOOK_FAILED %s", exc)
-            # Fast /api/scalp/status reads this Redis snapshot — never rebuilds on GET.
             self._publish_api_status_snapshot(
                 open_rows=open_after,
                 epoch=epoch,

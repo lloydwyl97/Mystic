@@ -8,8 +8,11 @@ from backend.services.binance_scalp.structural_thesis import (
     PREDICTION_RETIRED,
     STRUCTURAL_NOT_EXECUTABLE,
     new_entry_block_reason,
+    prediction_circuit_breaker_applies,
     prediction_entries_permitted,
+    ranking_eval_permitted,
     status_fields,
+    structural_lp_executable,
 )
 
 
@@ -22,6 +25,8 @@ def test_default_env_is_structural_and_not_live(monkeypatch):
     assert cfg.legacy_prediction_entries is False
     assert cfg.scalp_live is False
     assert prediction_entries_permitted(cfg) is False
+    assert ranking_eval_permitted(cfg) is False
+    assert prediction_circuit_breaker_applies(cfg) is False
     assert new_entry_block_reason(cfg) == STRUCTURAL_NOT_EXECUTABLE
 
 
@@ -37,11 +42,19 @@ def test_legacy_requires_both_flags(monkeypatch):
     assert new_entry_block_reason(cfg2) is None
 
 
-def test_status_fields_never_claim_structural_or_live_execution():
-    cfg = SimpleNamespace(scalp_thesis="structural", legacy_prediction_entries=False)
+def test_status_fields_paper_lp_not_live_or_arb():
+    cfg = SimpleNamespace(
+        scalp_thesis="structural",
+        legacy_prediction_entries=False,
+        scalp_paper_enabled=True,
+        scalp_live=False,
+    )
     fields = status_fields(cfg)
-    assert fields["structural_entries_executable"] is False
+    assert fields["structural_entries_executable"] is True
+    assert fields["structural_arb_executable"] is False
     assert fields["prediction_entries_permitted"] is False
+    assert fields["prediction_circuit_breaker_applies"] is False
+    assert structural_lp_executable(cfg) is True
 
 
 def test_entry_candidates_blocked_on_structural_thesis(monkeypatch):

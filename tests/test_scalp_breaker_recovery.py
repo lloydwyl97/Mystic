@@ -28,6 +28,8 @@ def _probe(
         daily_loss_limit_pct=daily_limit_pct,
         breaker_recovery_sec=recovery_sec,
         database_path=str(db_path),
+        scalp_thesis="legacy_prediction",
+        legacy_prediction_entries=True,
     )
     engine._conn = lambda: sqlite3.connect(str(db_path), timeout=10.0)
     engine._ledger = lambda _conn: {"principal": 1000.0}
@@ -168,6 +170,8 @@ def test_recovery_on_tick_connection_while_write_lock_held(tmp_path: Path):
             daily_loss_limit_pct=0.05,
             breaker_recovery_sec=14400,
             database_path=str(db),
+            scalp_thesis="legacy_prediction",
+            legacy_prediction_entries=True,
         )
         locked_engine._ledger = lambda _conn: {"principal": 1000.0}
         locked_engine._utcnow_override = after
@@ -205,3 +209,29 @@ def test_daily_loss_stays_independent_of_consec_recovery(tmp_path: Path):
     with sqlite3.connect(db) as conn:
         until = conn.execute("SELECT consec_breaker_recovery_until FROM scalp_meta WHERE id=1").fetchone()[0]
     assert not until
+
+
+def test_structural_thesis_does_not_use_prediction_breaker(tmp_path: Path):
+    from backend.services.binance_scalp.paper_engine import BinanceScalpPaperEngine
+
+    db = tmp_path / "scalp.db"
+    now = datetime(2026, 8, 22, 22, 10, tzinfo=timezone.utc)
+    _seed(db, [(-0.05, f"2026-08-22 22:0{i}:00") for i in range(5)])
+    engine = object.__new__(BinanceScalpPaperEngine)
+    engine.config = SimpleNamespace(
+        circuit_breaker_epoch="",
+        max_consecutive_losses=5,
+        daily_loss_limit_pct=0.05,
+        breaker_recovery_sec=3600,
+        database_path=str(db),
+        scalp_thesis="structural",
+        legacy_prediction_entries=False,
+    )
+    engine._conn = lambda: sqlite3.connect(str(db), timeout=10.0)
+    engine._ledger = lambda _conn: {"principal": 1000.0}
+    engine._utcnow_override = now
+    engine._last_breaker_reason = ""
+    engine._last_breaker_recovery_until = ""
+    engine._last_breaker_eval_after = ""
+    assert BinanceScalpPaperEngine._check_scalp_circuit_breaker(engine) is False
+    assert engine._last_breaker_reason == ""

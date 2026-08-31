@@ -40,6 +40,7 @@ from backend.services.binance_scalp.scalp_candidate_ranking import (
 from backend.services.binance_scalp.scalp_control import is_entry_armed
 from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
 from backend.services.binance_scalp.strategies.kline_cache import KlineCache
+from backend.services.binance_scalp.structural_thesis import ranking_eval_permitted
 from backend.services.binance_scalp.structural_thesis import status_fields as structural_status_fields
 
 
@@ -603,14 +604,27 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
     rest_spreads = {row["symbol"]: row.get("spread_pct") for row in symbol_rows if not row.get("error")}
     freshness = _redis_orderbook_freshness(rclient, symbols, rest_spreads=rest_spreads)
 
-    strategy_router = _evaluate_strategy_router(
-        config,
-        econ,
-        reader,
-        tracker,
-        warm_rounds=warm_rounds,
-        redis_client=rclient,
-    )
+    if ranking_eval_permitted(config):
+        strategy_router = _evaluate_strategy_router(
+            config,
+            econ,
+            reader,
+            tracker,
+            warm_rounds=warm_rounds,
+            redis_client=rclient,
+        )
+    else:
+        strategy_router = {
+            "inventory": [],
+            "overall_entry_ready": False,
+            "best_candidate": None,
+            "best_global_candidate": None,
+            "ranked_candidates": [],
+            "global_hard_block": "SCALP_PREDICTION_THESIS_RETIRED",
+            "symbols": {},
+            "warm_rounds_used": warm_rounds,
+            "note": "ranking book retired; structural LP uses through-price fills",
+        }
 
     micro_regimes = _overlay_runner_scan(
         symbol_rows,

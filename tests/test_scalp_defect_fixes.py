@@ -234,6 +234,8 @@ def _breaker_probe(
         daily_loss_limit_pct=daily_limit_pct,
         breaker_recovery_sec=recovery_sec,
         database_path=str(db_path),
+        scalp_thesis="legacy_prediction",
+        legacy_prediction_entries=True,
     )
     engine._conn = lambda: sqlite3.connect(str(db_path), timeout=10.0)
     engine._ledger = lambda _conn: {"principal": 1000.0}

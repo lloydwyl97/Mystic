@@ -55,6 +55,8 @@ def test_read_lock_fail_closed_then_recovers(tmp_path: Path, monkeypatch):
         daily_loss_limit_pct=0.05,
         breaker_recovery_sec=14400,
         database_path=str(db),
+        scalp_thesis="legacy_prediction",
+        legacy_prediction_entries=True,
     )
     engine._ledger = lambda _conn: {"principal": 1000.0}
     engine._utcnow_override = now
@@ -94,6 +96,8 @@ def test_write_lock_fail_closed_then_persists(tmp_path: Path, monkeypatch):
         daily_loss_limit_pct=0.05,
         breaker_recovery_sec=14400,
         database_path=str(db),
+        scalp_thesis="legacy_prediction",
+        legacy_prediction_entries=True,
     )
     engine._ledger = lambda _conn: {"principal": 1000.0}
     engine._utcnow_override = now

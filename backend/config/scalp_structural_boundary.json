@@ -4,6 +4,9 @@
   "SCALP_THESIS": "structural",
   "legacy_prediction_entries": false,
   "scalp_live": false,
-  "structural_entries_executable": false,
-  "note": "SCALP-only. DAY unchanged. Ranking/VWAP/pullback/momentum/imbalance buys are retired. Structural LP/arb is authorized as the thesis, not armed for execution until honest fill data exists."
+  "structural_entries_executable": true,
+  "structural_arb_executable": false,
+  "structural_fill_model": "through_price_only",
+  "prediction_circuit_breaker_applies": false,
+  "note": "SCALP-only. DAY unchanged. Paper LP rests at touch and fills only when the opposite side walks through. Touch is not a fill. Mid/cross-venue dislocation is not arb. Prediction ranking and its consec breaker are unused leftovers."
 }
