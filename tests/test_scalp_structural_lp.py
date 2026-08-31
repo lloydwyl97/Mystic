@@ -350,6 +350,24 @@ def test_ranking_runtime_isolated():
     assert fields["ranking_eval_permitted"] is False
 
 
+def test_old_through_fill_sells_do_not_trip_new_breaker(tmp_path):
+    db = tmp_path / "s.db"
+    init_scalp_schema(db)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """
+        INSERT INTO scalp_paper_trades
+        (trade_id, symbol, side, quantity, price, notional, pnl_usd, strategy_id, diagnostics_json)
+        VALUES ('old1','BTCUSDT','SELL',1,1,1,-0.5,'structural_lp','{"fill_model":"through_price_only"}')
+        """
+    )
+    from backend.services.binance_scalp.structural_economics import structural_stats
+
+    stats = structural_stats(conn)
+    assert stats["roundtrips"] == 0
+    assert stats["net_usd"] == 0.0
+
+
 def test_engine_skips_ranking_construction(monkeypatch, tmp_path):
     monkeypatch.setenv("SCALP_LIVE", "false")
     monkeypatch.setenv("SCALP_PAPER_ENABLED", "true")

@@ -34,15 +34,37 @@ def build_scalp_pnl_summary(db_path: str | None = None) -> dict[str, Any]:
                 """
                 SELECT COUNT(*), COALESCE(SUM(pnl_usd), 0)
                 FROM scalp_paper_trades
-                WHERE side='SELL' AND strategy_id='structural_lp' AND date(created_at) = date(?)
+                WHERE side='SELL' AND strategy_id='structural_lp'
+                  AND IFNULL(diagnostics_json,'') LIKE '%structural_event_queue_v1%'
+                  AND date(created_at) = date(?)
                 """,
                 (today,),
             ).fetchone()
             if row:
                 out["today"] = {"sells": int(row[0] or 0), "realized_pnl_usd": round(float(row[1] or 0.0), 2)}
-            row2 = conn.execute("SELECT COUNT(*), COALESCE(SUM(pnl_usd), 0) FROM scalp_paper_trades WHERE side='SELL' AND strategy_id='structural_lp'").fetchone()
+            row2 = conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(pnl_usd), 0) FROM scalp_paper_trades
+                WHERE side='SELL' AND strategy_id='structural_lp'
+                  AND IFNULL(diagnostics_json,'') LIKE '%structural_event_queue_v1%'
+                """
+            ).fetchone()
             if row2:
                 out["all_time"] = {"sells": int(row2[0] or 0), "realized_pnl_usd": round(float(row2[1] or 0.0), 2)}
+            thru = conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(pnl_usd), 0) FROM scalp_paper_trades
+                WHERE side='SELL' AND strategy_id='structural_lp'
+                  AND IFNULL(diagnostics_json,'') NOT LIKE '%structural_event_queue_v1%'
+                """
+            ).fetchone()
+            if thru:
+                out["retired_through_fill_book"] = {
+                    "sells": int(thru[0] or 0),
+                    "realized_pnl_usd": round(float(thru[1] or 0.0), 2),
+                    "mixed": False,
+                    "note": "dc93d31 L1 through-fill approximation — not event-queue PnL",
+                }
             legacy = conn.execute("SELECT COUNT(*), COALESCE(SUM(pnl_usd), 0) FROM scalp_paper_trades WHERE side='SELL' AND IFNULL(strategy_id,'') != 'structural_lp'").fetchone()
             if legacy:
                 out["legacy_ranking_book"] = {

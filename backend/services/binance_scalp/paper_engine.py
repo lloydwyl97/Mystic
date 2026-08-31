@@ -2647,6 +2647,7 @@ class BinanceScalpPaperEngine:
                 """
                 SELECT pnl_usd FROM scalp_paper_trades
                 WHERE side='SELL' AND strategy_id='structural_lp'
+                  AND IFNULL(diagnostics_json,'') LIKE '%structural_event_queue_v1%'
                 ORDER BY id DESC LIMIT 20
                 """
             )
@@ -2662,7 +2663,9 @@ class BinanceScalpPaperEngine:
         daily = conn.execute(
             """
             SELECT COALESCE(SUM(pnl_usd), 0) FROM scalp_paper_trades
-            WHERE side='SELL' AND strategy_id='structural_lp' AND date(created_at)=date(?)
+            WHERE side='SELL' AND strategy_id='structural_lp'
+              AND IFNULL(diagnostics_json,'') LIKE '%structural_event_queue_v1%'
+              AND date(created_at)=date(?)
             """,
             (today,),
         ).fetchone()

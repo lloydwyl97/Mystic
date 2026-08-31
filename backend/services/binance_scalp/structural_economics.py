@@ -136,6 +136,7 @@ def structural_stats(conn: sqlite3.Connection) -> dict[str, Any]:
             SELECT symbol, pnl_usd, exit_reason, quantity, price, entry_price, fee_usd, slippage_usd
             FROM scalp_paper_trades
             WHERE side='SELL' AND strategy_id='structural_lp'
+              AND IFNULL(diagnostics_json,'') LIKE '%structural_event_queue_v1%'
             """
         )
     )

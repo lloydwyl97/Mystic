@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from backend.services.binance_scalp.structural_mode import FILL_MODEL_VERSION
+
 BREAKER_ID = 1
 
 
@@ -43,6 +45,7 @@ def default_thresholds(*, consec: int, daily_loss_usd: float, timeout_rate: floa
         "max_adverse_1s_rate": float(adverse_rate),
         "recovery_sec": int(recovery_sec),
         "stale_tape_opens": True,
+        "fill_model": FILL_MODEL_VERSION,
     }
 
 
@@ -80,6 +83,8 @@ def load_state(conn: sqlite3.Connection, thresholds: dict[str, Any]) -> Structur
             stored_th = {**thresholds, **json.loads(row[5])}
         except json.JSONDecodeError:
             stored_th = dict(thresholds)
+    if str(stored_th.get("fill_model") or "") != FILL_MODEL_VERSION:
+        return StructuralBreakerState(open=False, reason="", tripped_at="", recovery_until="", stats=stats, thresholds=thresholds)
     return StructuralBreakerState(
         open=bool(row[0]) if row else False,
         reason=str(row[1] or "") if row else "",
