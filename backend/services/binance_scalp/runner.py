@@ -22,6 +22,8 @@ def main() -> int:
 
     cfg = get_scalp_config()
     cfg.assert_no_live_trading()
+    mode = cfg.assert_structural_startup()
+    logger.info("SCALP_STRUCTURAL_START mode=%s fill_model=structural_event_queue_v1 live_impossible=true", mode)
     if cfg.calibration_mode:
         logger.info(
             "SCALP_CALIBRATION_MODE active profile=%s products=%s",

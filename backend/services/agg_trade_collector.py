@@ -129,6 +129,16 @@ class AggTradeCollector:
                 with_import_ok = False
             if with_import_ok:
                 record_agg_trade(symbol, qty=qty, is_buyer_maker=is_buyer_maker, ts=ts)
+            try:
+                from backend.services.binance_scalp.structural_tape import parse_agg_payload, publish_trade_event
+
+                ev = parse_agg_payload(payload, recv_ts=ts)
+                if ev is not None:
+                    from backend.config.redis_config import get_shared_redis_sync
+
+                    publish_trade_event(get_shared_redis_sync(), ev)
+            except Exception:
+                pass
 
             self.stats["messages_received"] += 1
             self.stats["trades_processed"] += 1

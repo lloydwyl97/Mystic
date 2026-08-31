@@ -314,15 +314,21 @@
                 <div class="readiness-card header__tooltip" data-tooltip="SCALP entry-gate strictness profile (strict/calibration mode) — unrelated to the ML confidence calibrator shown in the Model panel" title="SCALP gate profile, not ML confidence calibration"><span class="readiness-label">Gate profile</span><span class="readiness-value" id="scalp-calibration">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">All-time PnL</span><span class="readiness-value" id="scalp-alltime-pnl">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">All-time sells</span><span class="readiness-value" id="scalp-alltime-sells">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Mode</span><span class="readiness-value" id="scalp-mode">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Fee model ok</span><span class="readiness-value" id="scalp-fee-ok">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Warm rounds</span><span class="readiness-value" id="scalp-warm-rounds">--</span></div>
-                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Warm note</span><span class="readiness-value" id="scalp-warm-note">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Structural mode</span><span class="readiness-value" id="scalp-mode">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Fee assumptions</span><span class="readiness-value" id="scalp-fee-ok">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Fill model</span><span class="readiness-value" id="scalp-fill-model">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Paper / shadow</span><span class="readiness-value" id="scalp-paper-shadow">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Structural breaker</span><span class="readiness-value" id="scalp-struct-breaker">--</span></div>
+                <div class="readiness-card readiness-card--span2"><span class="readiness-label">Breaker reason</span><span class="readiness-value" id="scalp-struct-breaker-reason">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Gross spread</span><span class="readiness-value" id="scalp-gross-spread">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Fees (sim)</span><span class="readiness-value" id="scalp-fees">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Timeout cost</span><span class="readiness-value" id="scalp-timeout-cost">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">Adverse 1s</span><span class="readiness-value" id="scalp-adverse">--</span></div>
             </div>
         </section>
-        <section class="widget widget--full" id="scalp-pass-telemetry-widget" aria-label="SCALP pass-rate telemetry">
-            <h2 class="widget__title">SCALP pass-rate telemetry</h2>
-            <p class="widget__subtitle">Genuine <code>sig.passed</code> only — soft rejects never enter. Rolling window + last cycle. Does not loosen entry gates.</p>
+        <section class="widget widget--full" id="scalp-pass-telemetry-widget" aria-label="SCALP pass-rate telemetry" hidden>
+            <h2 class="widget__title">Ranking-only pass-rate telemetry (retired)</h2>
+            <p class="widget__subtitle">Isolated ranking-era diagnostics. Not used by structural LP.</p>
             <div class="readiness-grid">
                 <div class="readiness-card"><span class="readiness-label">Last cycle passes</span><span class="readiness-value" id="scalp-tel-pass">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Last cycle eligible</span><span class="readiness-value" id="scalp-tel-elig">--</span></div>
@@ -359,17 +365,17 @@
             <h2 class="widget__title">Per-symbol diagnostics (BTC / ETH / SOL / XRP)</h2>
             <div class="widget__table-wrap widget__table-wrap--scroll">
                 <table class="positions-table">
-                    <thead><tr><th>Symbol</th><th>Decision</th><th>Reject</th><th>Micro regime</th><th>Dist to pass</th><th>Spread</th><th>Momentum</th><th>Eligible</th></tr></thead>
+                    <thead><tr><th>Symbol</th><th>Quote</th><th>Queue ahead</th><th>Partial</th><th>Book source / age</th><th>Tape age</th><th>Spread</th><th>PnL</th></tr></thead>
                     <tbody id="scalp-symbols-tbody"><tr><td colspan="8">--</td></tr></tbody>
                 </table>
             </div>
         </section>
         <section class="widget widget--full">
-            <h2 class="widget__title">Strategy router / ranked candidates</h2>
+            <h2 class="widget__title">Structural quotes / breaker</h2>
             <pre id="scalp-router-pre" class="panel-pre">--</pre>
         </section>
         <section class="widget widget--full">
-            <h2 class="widget__title">Strategy inventory</h2>
+            <h2 class="widget__title">Ranking-only inventory (retired, isolated)</h2>
             <pre id="scalp-strategies-pre" class="panel-pre">--</pre>
         </section>
         <section class="widget widget--full">

@@ -586,13 +586,36 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
     config = get_scalp_config()
     econ = economics_for_config(config)
     reader = ScalpMarketReader(config)
-    tracker = MomentumTracker()
+    tracker = None
     symbols = config.products
+    symbol_rows: list[dict[str, Any]] = []
+    if ranking_eval_permitted(config):
+        from backend.services.binance_scalp.momentum_tracker import MomentumTracker
 
-    if warm_rounds > 0:
-        warm_momentum(reader, tracker, symbols, rounds=warm_rounds, interval_sec=warm_interval_sec)
-
-    symbol_rows = [_evaluate_symbol_status(sym, reader, tracker, econ, config) for sym in symbols]
+        tracker = MomentumTracker()
+        if warm_rounds > 0:
+            warm_momentum(reader, tracker, symbols, rounds=warm_rounds, interval_sec=warm_interval_sec)
+        symbol_rows = [_evaluate_symbol_status(sym, reader, tracker, econ, config) for sym in symbols]
+    else:
+        for sym in symbols:
+            snap = reader.read(sym)
+            if snap is None:
+                symbol_rows.append({"symbol": sym, "error": "NO_BOOK", "decision": "NO_BOOK"})
+                continue
+            symbol_rows.append(
+                {
+                    "symbol": sym,
+                    "best_bid": snap.best_bid,
+                    "best_ask": snap.best_ask,
+                    "spread_pct": snap.spread_pct,
+                    "book_source": getattr(snap, "book_source", None),
+                    "orderbook_age_sec": getattr(snap, "orderbook_age_sec", None),
+                    "decision": "STRUCTURAL_LP",
+                    "reject_reason": None,
+                    "momentum_confirmed": False,
+                    "ranking_only": False,
+                }
+            )
 
     db_path = Path(config.database_path)
     open_positions = 0
@@ -622,8 +645,9 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
             "ranked_candidates": [],
             "global_hard_block": "SCALP_PREDICTION_THESIS_RETIRED",
             "symbols": {},
-            "warm_rounds_used": warm_rounds,
-            "note": "ranking book retired; structural LP uses through-price fills",
+            "warm_rounds_used": 0,
+            "ranking_only": True,
+            "note": "ranking book retired and isolated; structural LP uses event-queue fills (structural_event_queue_v1)",
         }
 
     micro_regimes = _overlay_runner_scan(
@@ -634,14 +658,28 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
     )
     selected_symbol = str((strategy_router.get("best_global_candidate") or {}).get("symbol") or "")
     entry_armed = bool(is_entry_armed(rclient, prefix=config.redis_key_prefix))
+    runner_state = _load_runner_state(rclient, prefix=config.redis_key_prefix)
+    rs_quotes = (runner_state or {}).get("quotes") or {}
+    rs_tape = (runner_state or {}).get("tape") or {}
     for row in symbol_rows:
-        if not row.get("error"):
+        if row.get("error"):
+            continue
+        row["entry_armed"] = entry_armed
+        if ranking_eval_permitted(config):
             selected = bool(selected_symbol and row.get("symbol") == selected_symbol)
             row["would_enter_if_armed"] = selected
             row["would_enter"] = selected and entry_armed
-            row["entry_armed"] = entry_armed
             row["decision"] = _symbol_decision(row)
-    runner_state = _load_runner_state(rclient, prefix=config.redis_key_prefix)
+        else:
+            q = rs_quotes.get(row["symbol"]) or {}
+            t = rs_tape.get(row["symbol"]) or {}
+            row["quote"] = q
+            row["tape"] = t
+            row["queue_ahead"] = q.get("queue_ahead")
+            row["queue_consumed"] = q.get("queue_consumed")
+            row["filled_qty"] = q.get("filled_qty")
+            row["remaining_qty"] = q.get("remaining_qty")
+            row["decision"] = "QUOTE" if q.get("price") else "SCAN"
     operational = _derive_operational_summary(
         runner_state=runner_state,
         open_positions=open_positions,
@@ -692,8 +730,10 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
         "top_blocker": top_blocker,
         "operational_summary": operational,
         "runner_state": runner_state,
-        "warm_rounds_recommended": 12,
-        "warm_rounds_note": ("momentum_confirmed requires ~60s history and 60s trend; warm_rounds=6 (~35s) under-warms 60s checks"),
+        "warm_rounds_recommended": 0,
+        "warm_rounds_note": "ranking warm retired; structural LP consumes tape every exit tick (~0.25s)",
+        "fill_model": structural_status_fields(config).get("structural_fill_model"),
+        "ranking_only_fields": ["strategy_router", "entry_telemetry", "enabled_strategies", "disabled_strategies", "micro_regimes"],
         "fee_model_verified": econ.is_fee_model_verified(),
         "calibration_mode": config.calibration_mode,
         "calibration_profile": config.calibration_profile,
@@ -714,4 +754,9 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
         "enabled_strategies": enabled,
         "entry_telemetry": entry_telemetry,
         "paper_proof": paper_proof,
+        "quotes": rs_quotes,
+        "tape": rs_tape,
+        "structural_breaker": (runner_state or {}).get("structural_breaker") or {},
+        "structural_stats": (runner_state or {}).get("structural_stats") or {},
+        "legacy_inventory": (runner_state or {}).get("legacy_inventory") or [],
     }

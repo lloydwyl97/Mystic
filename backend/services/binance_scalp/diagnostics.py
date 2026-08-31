@@ -60,8 +60,10 @@ def build_fee_diagnostic(
             "SCALP_USE_MAKER_ONLY": econ.use_maker_only,
             "SCALP_ENTRY_IS_MAKER": econ.entry_is_maker,
             "SCALP_EXIT_IS_MAKER": econ.exit_is_maker,
-            "SCALP_ENGINE_VERSION": os.getenv("SCALP_ENGINE_VERSION", "scalp_v1"),
+            "SCALP_ENGINE_VERSION": "structural_event_queue_v1",
+            "SCALP_ENGINE_VERSION_ENV_LEFTOVER": os.getenv("SCALP_ENGINE_VERSION", ""),
             "SCALP_CIRCUIT_BREAKER_EPOCH": os.getenv("SCALP_CIRCUIT_BREAKER_EPOCH", ""),
+            "note": "leftover ranking env SCALP_ENGINE_VERSION is ignored by structural LP",
         },
     }
 

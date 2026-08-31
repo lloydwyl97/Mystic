@@ -26,7 +26,6 @@ from backend.services.binance_scalp.exit_manager import (
     track_from_row,
 )
 from backend.services.binance_scalp.market_reader import MarketSnapshot, ScalpMarketReader
-from backend.services.binance_scalp.momentum_tracker import MomentumTracker
 from backend.services.binance_scalp.protected_preflight import (
     FEE_MODEL_UNVERIFIED,
     NET_PROFIT_TARGET_NOT_MET,
@@ -51,18 +50,30 @@ from backend.services.binance_scalp.scalp_reject_throttle import (
     ScalpRejectThrottle,
     maybe_run_scalp_reject_retention,
 )
-from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
 from backend.services.binance_scalp.schema import init_scalp_schema
-from backend.services.binance_scalp.strategies.kline_cache import KlineCache
+from backend.services.binance_scalp.structural_lp import (
+    CANCEL_REQUOTE,
+    EDGE_SHORT,
+    NO_BOOK,
+    STALE_TAPE,
+    TIMEOUT,
+    TOXIC,
+    book_from_snap,
+    consume_events,
+    is_structural_position,
+    load_working_quotes,
+    place_quote,
+    quote_still_current,
+    save_working_quote,
+)
 from backend.services.binance_scalp.structural_lp import (
     SETUP_NAME as STRUCTURAL_SETUP,
 )
-from backend.services.binance_scalp.structural_lp import (
-    book_from_snap,
-    is_structural_position,
-)
-from backend.services.binance_scalp.structural_lp import (
-    step as structural_lp_step,
+from backend.services.binance_scalp.structural_mode import (
+    FILL_MODEL_VERSION,
+    MODE_DISABLED,
+    ledger_writes_enabled,
+    quoting_enabled,
 )
 from backend.services.binance_scalp.structural_thesis import (
     new_entry_block_reason,
@@ -103,23 +114,16 @@ class BinanceScalpPaperEngine:
         self.config.assert_no_live_trading()
         if self.config.allow_repair_add:
             raise RuntimeError("SCALP_ALLOW_REPAIR_ADD must remain false")
+        self._structural_mode = self.config.assert_structural_startup()
         self.econ = econ or economics_for_config(self.config)
         self.reader = ScalpMarketReader(self.config)
-        self._momentum = MomentumTracker()
-        self._klines = KlineCache()
-        self._router = ScalpStrategyRouter(
-            config=self.config,
-            econ=self.econ,
-            reader=self.reader,
-            momentum=self._momentum,
-            klines=self._klines,
-        )
-        try:
-            from backend.services.binance_scalp import scalp_signal_engine as _se
-
-            _se.bind_paper_engine(router=self._router, momentum=self._momentum, klines=self._klines)
-        except Exception:
-            pass
+        self._momentum = None
+        self._klines = None
+        self._router = None
+        self._tape_ids: dict[str, str] = {}
+        self._pending_markouts: list[dict] = []
+        self._struct_breaker_view: dict = {}
+        self._recent_mids: dict[str, list[float]] = {}
         self._reject_throttle = ScalpRejectThrottle()
         self._redis = redis.from_url(self.config.redis_url, decode_responses=True)
         self._entry_reservations: dict[str, dict] = {}
@@ -564,7 +568,16 @@ class BinanceScalpPaperEngine:
                 "open_symbols": open_symbols,
                 "products_scanned": list(self.config.products),
                 "entry_blocked_reason": entry_blocked_reason,
-                "momentum_warmed": True,
+                "momentum_warmed": False,
+                "ranking_runtime": "isolated",
+                "structural_mode": getattr(self, "_structural_mode", None) or self.config.resolved_structural_mode(),
+                "fill_model": FILL_MODEL_VERSION,
+                "paper_shadow": (getattr(self, "_structural_mode", "") == "STRUCTURAL_SHADOW"),
+                "quotes": getattr(self, "_structural_quote_views", {}),
+                "tape": getattr(self, "_structural_tape_views", {}),
+                "structural_breaker": getattr(self, "_struct_breaker_view", {}),
+                "structural_stats": getattr(self, "_structural_stats_view", {}),
+                "legacy_inventory": getattr(self, "_legacy_inventory_symbols", []),
                 "circuit_breaker_open": bool(self._last_circuit_breaker_open),
                 "circuit_breaker_reason": getattr(self, "_last_breaker_reason", "") or "",
                 "breaker_recovery_until": getattr(self, "_last_breaker_recovery_until", "") or "",
@@ -653,6 +666,8 @@ class BinanceScalpPaperEngine:
         )
 
     def _record_momentum(self, snap: MarketSnapshot) -> None:
+        if self._momentum is None:
+            return
         _, epoch = self._now()
         self._momentum.record(snap.symbol_bus, epoch, snap.best_bid, snap.mid)
 
@@ -2351,18 +2366,31 @@ class BinanceScalpPaperEngine:
 
     def _record_structural_quote(self, conn: sqlite3.Connection, action: object) -> None:
         try:
+            quote = getattr(action, "quote", None)
+            audit = dict(getattr(action, "audit", None) or {})
             conn.execute(
                 """
-                INSERT INTO scalp_structural_quotes (symbol, side, action, price, qty, reason)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO scalp_structural_quotes
+                (symbol, side, action, price, qty, reason, quote_id, queue_ahead, queue_consumed,
+                 filled_qty, remaining_qty, agg_id, data_source, fill_model, audit_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(getattr(action, "symbol", "") or ""),
-                    str(getattr(getattr(action, "quote", None), "side", "") or getattr(action, "kind", "") or ""),
+                    str(getattr(quote, "side", "") or getattr(action, "kind", "") or ""),
                     str(getattr(action, "kind", "") or ""),
                     float(getattr(action, "price", 0.0) or 0.0),
                     float(getattr(action, "qty", 0.0) or 0.0),
                     str(getattr(action, "reason", "") or ""),
+                    str(getattr(quote, "quote_id", "") or ""),
+                    float(getattr(quote, "queue_ahead", 0.0) or 0.0),
+                    float(getattr(quote, "queue_consumed", 0.0) or 0.0),
+                    float(getattr(quote, "filled_qty", 0.0) or 0.0),
+                    float(getattr(quote, "remaining_qty", 0.0) or 0.0),
+                    int(getattr(quote, "last_agg_id", 0) or 0),
+                    str(getattr(quote, "data_source", "") or audit.get("data_source") or ""),
+                    FILL_MODEL_VERSION,
+                    json.dumps(audit),
                 ),
             )
         except Exception:
@@ -2380,10 +2408,57 @@ class BinanceScalpPaperEngine:
     ) -> None:
         if qty <= 0 or price <= 0:
             return
-        if conn.execute(
-            "SELECT 1 FROM scalp_paper_positions WHERE symbol = ? AND status = 'OPEN' LIMIT 1",
+        existing = conn.execute(
+            "SELECT * FROM scalp_paper_positions WHERE symbol = ? AND status = 'OPEN' LIMIT 1",
             (sym,),
-        ).fetchone():
+        ).fetchone()
+        if existing is not None:
+            if not is_structural_position(existing):
+                return
+            old_qty = float(existing["quantity"])
+            old_entry = float(existing["entry_price"])
+            new_qty = old_qty + qty
+            vwap = ((old_entry * old_qty) + (price * qty)) / new_qty if new_qty else price
+            add_notional = qty * price
+            add_fee = add_notional * self.econ.entry_fee_pct(entry_maker=True)
+            ledger = self._ledger(conn)
+            if float(ledger["cash_balance"]) < add_notional + add_fee:
+                return
+            conn.execute(
+                """
+                UPDATE scalp_paper_positions SET quantity = ?, entry_price = ?, diagnostics_json = ?
+                WHERE id = ?
+                """,
+                (
+                    new_qty,
+                    vwap,
+                    json.dumps(
+                        {
+                            "setup_name": STRUCTURAL_SETUP,
+                            "book": STRUCTURAL_SETUP,
+                            "fill_model": FILL_MODEL_VERSION,
+                            "entry_owner": "structural_lp",
+                            "partial_add": True,
+                            "fee_assumption": "simulation_assumption",
+                        }
+                    ),
+                    existing["id"],
+                ),
+            )
+            new_cash = float(ledger["cash_balance"]) - add_notional - add_fee
+            pos_val = float(ledger["positions_value"]) + add_notional
+            conn.execute(
+                """
+                UPDATE scalp_paper_ledger SET
+                  cash_balance = ?,
+                  positions_value = ?,
+                  total_equity = ?,
+                  updated_at = datetime('now')
+                WHERE id = 1
+                """,
+                (new_cash, pos_val, new_cash + pos_val),
+            )
+            logger.info("SCALP_STRUCTURAL_BUY_ADD %s qty=%.8f price=%.4f reason=%s", sym, qty, price, reason)
             return
         notional = qty * price
         fee = notional * self.econ.entry_fee_pct(entry_maker=True)
@@ -2395,8 +2470,9 @@ class BinanceScalpPaperEngine:
         diag = {
             "setup_name": STRUCTURAL_SETUP,
             "book": STRUCTURAL_SETUP,
-            "fill_model": "through_price_only",
+            "fill_model": FILL_MODEL_VERSION,
             "entry_owner": "structural_lp",
+            "fee_assumption": "simulation_assumption",
             "passed": True,
             "soft_rank_entry": False,
             "spread_at_entry": spread_pct,
@@ -2467,34 +2543,166 @@ class BinanceScalpPaperEngine:
         exit_price: float,
         reason: str,
         exit_maker: bool,
+        qty: float | None = None,
     ) -> None:
         entry = float(row["entry_price"])
-        qty = float(row["quantity"])
-        if qty <= 0 or exit_price <= 0:
+        pos_qty = float(row["quantity"])
+        close_qty = float(qty) if qty is not None else pos_qty
+        close_qty = min(close_qty, pos_qty)
+        if close_qty <= 0 or exit_price <= 0:
             return
-        entry_fee = entry * qty * self.econ.entry_fee_pct(entry_maker=True)
-        exit_fee = exit_price * qty * self.econ.exit_fee_pct(exit_maker=exit_maker)
-        exit_slip = 0.0 if exit_maker else exit_price * qty * self.econ.slippage_buffer_pct
-        net_usd = (exit_price - entry) * qty - (entry_fee + exit_fee + exit_slip)
-        net_pct = net_usd / (entry * qty) if entry * qty else 0.0
+        entry_fee = entry * close_qty * self.econ.entry_fee_pct(entry_maker=True)
+        exit_fee = exit_price * close_qty * self.econ.exit_fee_pct(exit_maker=exit_maker)
+        exit_slip = 0.0 if exit_maker else exit_price * close_qty * self.econ.slippage_buffer_pct
+        net_usd = (exit_price - entry) * close_qty - (entry_fee + exit_fee + exit_slip)
+        net_pct = net_usd / (entry * close_qty) if entry * close_qty else 0.0
         age = time.time() - float(row["entry_time_epoch"] or 0.0)
+        remaining = pos_qty - close_qty
+        if remaining > 1e-12:
+            ledger = self._ledger(conn)
+            notional = close_qty * exit_price
+            fee = notional * self.econ.exit_fee_pct(exit_maker=exit_maker)
+            slip = 0.0 if exit_maker else notional * self.econ.slippage_buffer_pct
+            sell_tid = f"{row['trade_id']}_SELL_{int(time.time() * 1000)}"
+            conn.execute(
+                """
+                INSERT INTO scalp_paper_trades
+                (trade_id, symbol, exchange, strategy_id, side, quantity, price, notional,
+                 fee_usd, slippage_usd, pnl_usd, pnl_pct, entry_price, exit_reason, diagnostics_json)
+                VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sell_tid,
+                    str(row["symbol"]),
+                    self.config.exchange,
+                    STRUCTURAL_SETUP,
+                    close_qty,
+                    exit_price,
+                    notional,
+                    fee,
+                    slip,
+                    net_usd,
+                    net_pct,
+                    entry,
+                    reason,
+                    json.dumps(
+                        {
+                            "fill_model": FILL_MODEL_VERSION,
+                            "book": STRUCTURAL_SETUP,
+                            "partial": True,
+                            "fee_assumption": "simulation_assumption",
+                            "exit_maker": exit_maker,
+                        }
+                    ),
+                ),
+            )
+            conn.execute(
+                "UPDATE scalp_paper_positions SET quantity = ? WHERE id = ?",
+                (remaining, row["id"]),
+            )
+            pos_cost = entry * close_qty
+            new_cash = float(ledger["cash_balance"]) + notional - fee - slip
+            new_pos_val = max(0.0, float(ledger["positions_value"]) - pos_cost)
+            conn.execute(
+                """
+                UPDATE scalp_paper_ledger SET
+                  cash_balance = ?,
+                  positions_value = ?,
+                  realized_pnl = realized_pnl + ?,
+                  total_equity = ?,
+                  updated_at = datetime('now')
+                WHERE id = 1
+                """,
+                (new_cash, new_pos_val, net_usd, new_cash + new_pos_val),
+            )
+            self._pending_sell_log = (str(row["symbol"]), net_usd, reason)
+            return
         self._execute_sell(
             conn,
             row,
             sym=str(row["symbol"]),
             entry=entry,
-            qty=qty,
+            qty=close_qty,
             exit_price=exit_price,
             net_pct=net_pct,
             net_usd=net_usd,
             reason=reason,
-            pf_dict={"fill_model": "through_price_only" if exit_maker else "taker_flatten"},
+            pf_dict={
+                "fill_model": FILL_MODEL_VERSION if exit_maker else "taker_flatten_timeout",
+                "fee_assumption": "simulation_assumption",
+            },
             exit_gate={"book": STRUCTURAL_SETUP},
             hold_seconds=max(0.0, age),
             spread_at_exit=0.0,
             exit_maker=exit_maker,
         )
         self._pending_sell_log = (str(row["symbol"]), net_usd, reason)
+
+    def _legacy_inventory_rows(self, conn: sqlite3.Connection) -> list[sqlite3.Row]:
+        return [r for r in self._open_positions(conn) if not is_structural_position(r)]
+
+    def _structural_consec_and_rolling(self, conn: sqlite3.Connection) -> tuple[int, list[float], float]:
+        rows = list(
+            conn.execute(
+                """
+                SELECT pnl_usd FROM scalp_paper_trades
+                WHERE side='SELL' AND strategy_id='structural_lp'
+                ORDER BY id DESC LIMIT 20
+                """
+            )
+        )
+        pnls = [float(r[0] or 0.0) for r in reversed(rows)]
+        consec = 0
+        for pnl in reversed(pnls):
+            if pnl < 0:
+                consec += 1
+            else:
+                break
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        daily = conn.execute(
+            """
+            SELECT COALESCE(SUM(pnl_usd), 0) FROM scalp_paper_trades
+            WHERE side='SELL' AND strategy_id='structural_lp' AND date(created_at)=date(?)
+            """,
+            (today,),
+        ).fetchone()
+        return consec, pnls, float(daily[0] or 0.0) if daily else 0.0
+
+    def _schedule_markout(self, *, trade_id: str, symbol: str, side: str, price: float, ts: float) -> None:
+        self._pending_markouts.append({"trade_id": trade_id, "symbol": symbol, "side": side, "price": price, "fill_ts": ts, "done": set()})
+
+    def _flush_structural_markouts(self, conn: sqlite3.Connection, snaps: dict, *, now: float) -> None:
+        from backend.services.binance_scalp.structural_economics import MARKOUT_HORIZONS, record_markout
+
+        keep: list[dict] = []
+        for item in self._pending_markouts:
+            snap = snaps.get(item["symbol"])
+            if snap is None:
+                keep.append(item)
+                continue
+            bid = float(getattr(snap, "best_bid", 0.0) or 0.0)
+            ask = float(getattr(snap, "best_ask", 0.0) or 0.0)
+            done = item["done"]
+            for h in MARKOUT_HORIZONS:
+                if h in done:
+                    continue
+                if now < float(item["fill_ts"]) + h:
+                    continue
+                record_markout(
+                    conn,
+                    trade_id=item["trade_id"],
+                    symbol=item["symbol"],
+                    side=item["side"],
+                    fill_price=float(item["price"]),
+                    fill_ts=float(item["fill_ts"]),
+                    horizon_sec=h,
+                    bid=bid,
+                    ask=ask,
+                )
+                done.add(h)
+            if len(done) < len(MARKOUT_HORIZONS):
+                keep.append(item)
+        self._pending_markouts = keep
 
     def _run_structural_lp(
         self,
@@ -2503,98 +2711,278 @@ class BinanceScalpPaperEngine:
         *,
         epoch: float,
     ) -> str | None:
-        if not structural_lp_executable(self.config):
+        from backend.services.binance_scalp.structural_breaker import (
+            default_thresholds,
+            evaluate,
+            load_state,
+            save_state,
+        )
+        from backend.services.binance_scalp.structural_economics import quote_blocked, structural_stats
+        from backend.services.binance_scalp.structural_lp import LpAction
+        from backend.services.binance_scalp.structural_tape import consume_trade_events, tape_freshness
+
+        mode = getattr(self, "_structural_mode", None) or self.config.resolved_structural_mode()
+        if mode == MODE_DISABLED:
+            return "STRUCTURAL_DISABLED"
+        if not quoting_enabled(mode):
             return new_entry_block_reason(self.config)
+        writes = ledger_writes_enabled(mode)
+        if not self._lp_quotes and not self._tape_ids:
+            loaded, tape_ids = load_working_quotes(conn)
+            self._lp_quotes = dict(loaded)
+            self._tape_ids = dict(tape_ids)
+
+        now_ts = float(epoch)
+        stale_sec = float(self.config.structural_tape_stale_sec)
+        tape_views: dict[str, dict] = {}
+        for sym in self.config.products:
+            tape_views[sym] = tape_freshness(self._redis, sym, now=now_ts, stale_sec=stale_sec)
+        tape_stale = (not tape_views) or all(not v.get("fresh") for v in tape_views.values())
+
+        stats = structural_stats(conn)
+        consec, rolling, daily = self._structural_consec_and_rolling(conn)
+        thresholds = default_thresholds(
+            consec=int(self.config.structural_breaker_consec),
+            daily_loss_usd=float(self.config.structural_breaker_daily_loss_usd),
+            timeout_rate=float(self.config.structural_breaker_timeout_rate),
+            adverse_rate=float(self.config.structural_max_adverse_1s),
+            recovery_sec=int(self.config.structural_breaker_recovery_sec),
+        )
+        prior = load_state(conn, thresholds)
+        prior.thresholds = {**thresholds, **(prior.thresholds or {})}
+        breaker = evaluate(
+            consec_losses=consec,
+            daily_pnl=daily,
+            rolling_pnl=rolling,
+            timeout_rate=float(stats.get("timeout_rate") or 0.0),
+            adverse_1s_rate=float(stats.get("adverse_1s_rate") or 0.0),
+            tape_stale=tape_stale,
+            now=self._utcnow(),
+            prior=prior,
+        )
+        save_state(conn, breaker)
+        self._struct_breaker_view = breaker.as_dict()
+        self._last_circuit_breaker_open = bool(breaker.open)
+        self._last_breaker_reason = str(breaker.reason or "")
+        self._last_breaker_recovery_until = str(breaker.recovery_until or "")
+
         open_rows = {str(r["symbol"]).upper(): r for r in self._open_positions(conn)}
-        open_count = len(open_rows)
+        legacy = [str(r["symbol"]).upper() for r in open_rows.values() if not is_structural_position(r)]
+        self._legacy_inventory_symbols = legacy
+        struct_open = sum(1 for r in open_rows.values() if is_structural_position(r))
         last_reason: str | None = None
+        quote_views: dict[str, dict] = {}
+
         for sym in self.config.products:
             snap = snaps.get(sym)
             book = book_from_snap(snap, epoch=epoch) if snap is not None else None
             pos = open_rows.get(str(sym).upper())
             if pos is not None and not is_structural_position(pos):
                 self._lp_quotes.pop(sym, None)
+                save_working_quote(conn, sym, None, self._tape_ids.get(sym, "0-0"))
                 continue
-            inv = float(pos["quantity"]) if pos is not None else 0.0
+            events, new_id = consume_trade_events(self._redis, sym, last_stream_id=self._tape_ids.get(sym, "0-0"))
+            self._tape_ids[sym] = new_id
+            tape = tape_views.get(sym) or {}
+            quote = self._lp_quotes.get(sym)
+
+            if quote is not None and tape.get("fresh"):
+                quote, fill_acts = consume_events(quote, events)
+                self._lp_quotes[sym] = quote
+                for act in fill_acts:
+                    self._record_structural_quote(conn, act)
+                    last_reason = act.reason
+                    if writes and act.qty > 0:
+                        if quote.side == "BID":
+                            self._structural_open_long(
+                                conn,
+                                sym=sym,
+                                price=float(act.price),
+                                qty=float(act.qty),
+                                reason=act.reason,
+                                spread_pct=float(getattr(snap, "spread_pct", 0.0) or 0.0) if snap is not None else 0.0,
+                            )
+                            self._schedule_markout(
+                                trade_id=f"{act.quote.quote_id if act.quote else sym}_{int(now_ts * 1000)}",
+                                symbol=sym,
+                                side="BUY",
+                                price=float(act.price),
+                                ts=now_ts,
+                            )
+                            struct_open += 1
+                            open_rows = {str(r["symbol"]).upper(): r for r in self._open_positions(conn)}
+                            pos = open_rows.get(str(sym).upper())
+                        elif quote.side == "ASK" and pos is not None and is_structural_position(pos):
+                            self._structural_close(
+                                conn,
+                                pos,
+                                exit_price=float(act.price),
+                                reason=act.reason,
+                                exit_maker=True,
+                                qty=float(act.qty),
+                            )
+                            self._schedule_markout(
+                                trade_id=str(pos["trade_id"]),
+                                symbol=sym,
+                                side="SELL",
+                                price=float(act.price),
+                                ts=now_ts,
+                            )
+                            open_rows = {str(r["symbol"]).upper(): r for r in self._open_positions(conn)}
+                            pos = open_rows.get(str(sym).upper())
+                            struct_open = sum(1 for r in open_rows.values() if is_structural_position(r))
+                if quote is not None and quote.remaining_qty <= 1e-12:
+                    self._lp_quotes[sym] = None
+                    quote = None
+            elif quote is not None and not tape.get("fresh"):
+                last_reason = STALE_TAPE
+
             hold = 0.0
             if pos is not None and is_structural_position(pos):
-                hold = max(0.0, epoch - float(pos["entry_time_epoch"] or 0.0))
+                hold = max(0.0, now_ts - float(pos["entry_time_epoch"] or 0.0))
+            if pos is not None and is_structural_position(pos) and hold >= float(self.config.structural_max_hold_sec):
+                exit_px = float(book.best_bid) if book is not None and book.best_bid > 0 else float(pos["entry_price"])
+                timeout_act = LpAction(
+                    kind="timeout_sell",
+                    symbol=sym,
+                    reason=TIMEOUT,
+                    price=exit_px,
+                    qty=float(pos["quantity"]),
+                    quote=quote,
+                    audit={"fill_model": FILL_MODEL_VERSION, "exit": "taker_timeout", "fee_assumption": "simulation_assumption"},
+                )
+                self._record_structural_quote(conn, timeout_act)
+                if writes:
+                    self._structural_close(conn, pos, exit_price=exit_px, reason=TIMEOUT, exit_maker=False)
+                self._lp_quotes[sym] = None
+                quote = None
+                pos = None
+                last_reason = TIMEOUT
+                open_rows = {str(r["symbol"]).upper(): r for r in self._open_positions(conn)}
+                struct_open = sum(1 for r in open_rows.values() if is_structural_position(r))
+
+            book_stale = book is None or float(book.age_sec or 0.0) > 2.5
+            if book is None:
+                last_reason = last_reason or NO_BOOK
+                save_working_quote(conn, sym, self._lp_quotes.get(sym), self._tape_ids.get(sym, "0-0"))
+                continue
+
+            if book.mid > 0:
+                hist = self._recent_mids.setdefault(sym, [])
+                hist.append(book.mid)
+                del hist[:-30]
+            recent = self._recent_mids.get(sym) or []
+            range_bps = 0.0
+            if len(recent) >= 2 and book.mid > 0:
+                range_bps = (max(recent) - min(recent)) / book.mid * 10_000.0
+            block = quote_blocked(
+                spread_bps=book.spread_bps,
+                maker_fee_pct=self.econ.maker_fee_pct,
+                min_net_edge_bps=float(self.config.structural_min_net_edge_bps),
+                recent_range_bps=range_bps,
+                max_range_mult=float(self.config.structural_max_range_mult),
+                adverse_1s_rate=float(stats.get("adverse_1s_rate") or 0.0),
+                max_adverse=float(self.config.structural_max_adverse_1s),
+            )
+            want_side = "ASK" if pos is not None and is_structural_position(pos) else "BID"
+            can_place = not breaker.open and not book_stale and bool(tape.get("fresh")) and block is None
+            if want_side == "BID" and (struct_open >= int(self.config.max_open_positions) or pos is not None):
+                can_place = False
             lot = 0.0
             if snap is not None and float(getattr(snap, "best_bid", 0.0) or 0.0) > 0:
                 cap = min(self.config.notional_cap_for_symbol(sym), float(self._ledger(conn)["cash_balance"]))
                 lot = cap / float(snap.best_bid) if cap >= 1.0 else 0.0
-            if pos is None and open_count >= int(self.config.max_open_positions):
-                lot = 0.0
+            if want_side == "ASK" and pos is not None:
+                lot = float(pos["quantity"])
+            if lot <= 0:
+                can_place = False
+
             quote = self._lp_quotes.get(sym)
-            nxt, actions = structural_lp_step(
-                quote,  # type: ignore[arg-type]
-                book,
-                inventory_qty=inv,
-                lot_qty=lot,
-                hold_sec=hold,
-                max_hold_sec=float(self.config.structural_max_hold_sec),
-            )
-            self._lp_quotes[sym] = nxt
-            for act in actions:
-                self._record_structural_quote(conn, act)
-                if act.kind == "buy" and pos is None and lot > 0:
-                    self._structural_open_long(
+            if quote is not None and quote_still_current(quote, book, side=want_side):
+                last_reason = last_reason or "STRUCTURAL_QUOTE_HELD"
+            elif quote is not None:
+                cancel = LpAction(
+                    kind="cancel",
+                    symbol=sym,
+                    reason=CANCEL_REQUOTE if can_place else (block or STALE_TAPE if not tape.get("fresh") else EDGE_SHORT),
+                    price=float(quote.price),
+                    qty=float(quote.remaining_qty),
+                    quote=quote,
+                    audit={"fill_model": FILL_MODEL_VERSION, "assumption": "cancellations_do_not_consume_queue"},
+                )
+                self._record_structural_quote(conn, cancel)
+                self._lp_quotes[sym] = None
+                quote = None
+
+            if can_place and quote is None:
+                qid = f"{sym}:{want_side}:{int(now_ts * 1000)}"
+                placed = place_quote(
+                    book,
+                    side=want_side,
+                    qty=lot,
+                    now_ts=now_ts,
+                    quote_id=qid,
+                    last_agg_id=int(max((ev.agg_id for ev in events), default=0)),
+                )
+                if placed is not None:
+                    self._lp_quotes[sym] = placed
+                    self._record_structural_quote(
                         conn,
-                        sym=sym,
-                        price=float(act.price),
-                        qty=float(act.qty),
-                        reason=act.reason,
-                        spread_pct=float(getattr(snap, "spread_pct", 0.0) or 0.0) if snap is not None else 0.0,
+                        LpAction(
+                            kind="rest",
+                            symbol=sym,
+                            reason="STRUCTURAL_REST_TOUCH",
+                            price=placed.price,
+                            qty=placed.qty,
+                            quote=placed,
+                            audit={
+                                "fill_model": FILL_MODEL_VERSION,
+                                "queue_ahead": placed.queue_ahead,
+                                "data_source": placed.data_source,
+                                "assumption": "cancellations_do_not_consume_queue",
+                                "mode": mode,
+                            },
+                        ),
                     )
-                    open_count += 1
-                    last_reason = act.reason
-                elif act.kind in {"sell", "timeout_sell"} and pos is not None and is_structural_position(pos):
-                    self._structural_close(
-                        conn,
-                        pos,
-                        exit_price=float(act.price),
-                        reason=act.reason,
-                        exit_maker=act.kind == "sell",
-                    )
-                    open_count = max(0, open_count - 1)
-                    last_reason = act.reason
-                    open_rows.pop(str(sym).upper(), None)
-                    pos = None
-        if last_reason:
+                    last_reason = last_reason or "STRUCTURAL_REST_TOUCH"
+            elif block:
+                last_reason = last_reason or block
+            elif breaker.open:
+                last_reason = last_reason or f"STRUCTURAL_BREAKER:{breaker.reason}"
+            elif book_stale:
+                last_reason = last_reason or NO_BOOK
+            elif not tape.get("fresh"):
+                last_reason = last_reason or STALE_TAPE
+
+            qnow = self._lp_quotes.get(sym)
+            quote_views[sym] = {
+                "side": getattr(qnow, "side", None),
+                "price": getattr(qnow, "price", None),
+                "queue_ahead": getattr(qnow, "queue_ahead", None),
+                "queue_consumed": getattr(qnow, "queue_consumed", None),
+                "filled_qty": getattr(qnow, "filled_qty", None),
+                "remaining_qty": getattr(qnow, "remaining_qty", None),
+                "posted_ts": getattr(qnow, "posted_ts", None),
+                "quote_id": getattr(qnow, "quote_id", None),
+                "data_source": getattr(qnow, "data_source", None),
+            }
+            save_working_quote(conn, sym, qnow, self._tape_ids.get(sym, "0-0"))
+
+        self._flush_structural_markouts(conn, snaps, now=now_ts)
+        self._structural_quote_views = quote_views
+        self._structural_tape_views = tape_views
+        self._structural_stats_view = stats
+        if last_reason and ("FILL" in str(last_reason) or last_reason == TIMEOUT):
             self._publish_last_decision(decision="FILL", reason=last_reason)
+        elif breaker.open:
+            self._publish_last_decision(decision="BLOCKED", reason=f"STRUCTURAL_BREAKER:{breaker.reason}")
         else:
-            self._publish_last_decision(decision="QUOTE", reason="STRUCTURAL_REST_TOUCH")
+            self._publish_last_decision(decision="QUOTE", reason=last_reason or "STRUCTURAL_REST_TOUCH")
         return last_reason
 
     def _exit_open_positions_now(self) -> None:
-        """Evaluate leftover ranking-book exits before the structural tick.
-
-        Does not change PATH_MAX_ADVERSE_STOP or any other exit threshold.
-        Removes only the evaluate_all / kline delay in front of _try_exit.
-        """
-        post_commit: list = []
-        pending_sell = None
-        try:
-            with self._conn() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                for row in self._open_positions(conn):
-                    if is_structural_position(row):
-                        continue
-                    self._try_exit(conn, row, post_commit=post_commit)
-                pending_sell = getattr(self, "_pending_sell_log", None)
-                self._pending_sell_log = None
-                conn.commit()
-        except Exception:
-            logger.exception("SCALP_EARLY_EXIT_PASS_FAILED")
-            return
-        if pending_sell:
-            sym, net_usd, reason = pending_sell
-            logger.info("SCALP_PAPER_SELL %s pnl=%.4f reason=%s", sym, net_usd, reason)
-        for fn in post_commit:
-            try:
-                fn()
-            except Exception as exc:
-                logger.warning("SCALP_POST_COMMIT_HOOK_FAILED %s", exc)
+        """Leftover ranking inventory is reported, never mixed with structural exits."""
+        return
 
     def _observe_markouts(self, snaps: dict) -> None:
         with contextlib.suppress(Exception):
@@ -2697,8 +3085,6 @@ class BinanceScalpPaperEngine:
         _exit_done()
         if ranking_on:
             self._observe_markouts(snaps)
-        if not rank:
-            return
 
         pre_ranked: list[dict] = []
         if ranking_on:
@@ -2727,10 +3113,11 @@ class BinanceScalpPaperEngine:
             post_commit: list = []
             open_rows = self._open_positions(conn)
             entry_blocked: str | None = None
-            for row in open_rows:
-                if is_structural_position(row):
-                    continue
-                self._try_exit(conn, row, post_commit=post_commit)
+            if ranking_on:
+                for row in open_rows:
+                    if is_structural_position(row):
+                        continue
+                    self._try_exit(conn, row, post_commit=post_commit)
             if ranking_on:
                 open_count = conn.execute("SELECT COUNT(*) FROM scalp_paper_positions WHERE status='OPEN'").fetchone()[0]
                 if open_count < self.config.max_open_positions:
@@ -2801,43 +3188,19 @@ class BinanceScalpPaperEngine:
                 time.sleep(max(interval_sec, 30.0))
             return
         self.config.assert_no_live_trading()
+        mode = getattr(self, "_structural_mode", None) or self.config.resolved_structural_mode()
         armed = is_entry_armed(self._redis, prefix=self.config.redis_key_prefix)
-        try:
-            from backend.services.binance_scalp import scalp_signal_engine as _se
-
-            engine_on = _se.scalp_signal_engine_enabled()
-        except Exception:
-            engine_on = False
         logger.info(
-            "Binance scalp paper loop products=%s max_open=%s interval=%ss paper_only=True live_blocked=True calibration=%s profile=%s entry_armed=%s signal_engine=%s",
+            "Binance scalp structural loop mode=%s fill_model=%s products=%s max_open=%s "
+            "rank_interval=%ss lp_on_exit_ticks=true paper_only=True live_blocked=True "
+            "entry_armed=%s ranking_runtime=isolated",
+            mode,
+            FILL_MODEL_VERSION,
             self.config.products,
             self.config.max_open_positions,
             interval_sec,
-            self.config.calibration_mode,
-            self.config.calibration_profile if self.config.calibration_mode else "strict",
             armed if not self.config.calibration_mode else "auto",
-            engine_on,
         )
-
-        # Warm the in-memory MomentumTracker so the first real ticks are not
-        # immediately rejected with MOMENTUM_DATA_INSUFFICIENT / history < 30s.
-        # Mirrors the explicit warm used by /api/scalp/status diagnostics.
-        # After this the engine can evaluate breakout_momentum (and other enabled
-        # strategies) with real 15/30/60s rising checks and the full entry gate.
-        warm_rounds = 12
-        warm_interval = 5.0
-        logger.info(
-            "SCALP_WARMING momentum for %s (~%ss history for confirmed checks)",
-            self.config.products,
-            int(warm_rounds * warm_interval),
-        )
-        for _ in range(warm_rounds):
-            for sym in self.config.products:
-                snap = self.reader.read(sym)
-                if snap:
-                    self._record_momentum(snap)
-            time.sleep(warm_interval)
-        logger.info("SCALP_WARM complete — now evaluating entries with bounded exits (net-profit / momentum-fail / setup-invalid / hard max-hold)")
         # Seed open-symbol cache so heartbeat reports held slots honestly during first tick.
         with contextlib.suppress(Exception), self._conn() as _c:
             rows = self._open_positions(_c)
@@ -2845,8 +3208,8 @@ class BinanceScalpPaperEngine:
             self._publish_api_status_snapshot(
                 open_rows=rows,
                 epoch=time.time(),
-                entry_blocked_reason=("MAX_OPEN_POSITIONS" if rows and len(rows) >= int(self.config.max_open_positions) else "WARM_COMPLETE"),
-                snapshot_source="runner_warm",
+                entry_blocked_reason=("MAX_OPEN_POSITIONS" if rows and len(rows) >= int(self.config.max_open_positions) else "STRUCTURAL_READY"),
+                snapshot_source="runner_start",
             )
         self._start_status_heartbeat(interval_sec=30.0)
 

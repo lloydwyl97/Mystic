@@ -29,6 +29,9 @@ SCALP_TABLES = (
     "scalp_post_exit_path",
     "scalp_opportunity_snapshots",
     "scalp_structural_quotes",
+    "scalp_structural_breaker",
+    "scalp_structural_markouts",
+    "scalp_structural_working",
 )
 
 SCHEMA_VERSION = 3
@@ -217,6 +220,14 @@ def apply_scalp_migrations(conn: sqlite3.Connection) -> list[str]:
         applied.append("ensure_breaker_recovery_columns")
     if ensure_structural_quotes_table(conn):
         applied.append("ensure_structural_quotes_table")
+    from backend.services.binance_scalp.structural_breaker import ensure_structural_breaker_table
+    from backend.services.binance_scalp.structural_economics import ensure_markout_table
+    from backend.services.binance_scalp.structural_lp import ensure_working_quote_table
+
+    ensure_structural_breaker_table(conn)
+    ensure_markout_table(conn)
+    ensure_working_quote_table(conn)
+    applied.append("ensure_structural_breaker_markouts_working")
     return applied
 
 
@@ -237,6 +248,20 @@ def ensure_structural_quotes_table(conn: sqlite3.Connection) -> bool:
         )
         """
     )
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(scalp_structural_quotes)")}
+    for name, ddl in (
+        ("quote_id", "TEXT"),
+        ("queue_ahead", "REAL"),
+        ("queue_consumed", "REAL"),
+        ("filled_qty", "REAL"),
+        ("remaining_qty", "REAL"),
+        ("agg_id", "INTEGER"),
+        ("data_source", "TEXT"),
+        ("fill_model", "TEXT"),
+        ("audit_json", "TEXT"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE scalp_structural_quotes ADD COLUMN {name} {ddl}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_scalp_structural_quotes_symbol ON scalp_structural_quotes(symbol)")
     return existed is None
 

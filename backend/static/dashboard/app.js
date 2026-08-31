@@ -1105,21 +1105,19 @@ function updateScalpEngineStatus(res, stale) {
     }
     set("scalp-alltime-sells", allTime.sells != null ? String(allTime.sells) : "--");
 
-    // Mode flags
-    const modeParts = [];
-    if (d.scalp_live === true) modeParts.push("LIVE");
-    else if (d.scalp_paper_enabled === true) modeParts.push("paper");
-    else modeParts.push("--");
-    set("scalp-mode", modeParts.join(", "));
-
-    // Fee model and warm rounds
-    set("scalp-fee-ok", d.fee_model_verified === true ? "yes" : d.fee_model_verified === false ? "no" : "--");
-    const warmUsed = d.warm_rounds_used != null ? d.warm_rounds_used : null;
-    const warmRec = d.warm_rounds_recommended != null ? d.warm_rounds_recommended : null;
-    set("scalp-warm-rounds", warmUsed != null || warmRec != null
-        ? (warmUsed != null ? warmUsed : "?") + " / " + (warmRec != null ? warmRec : "?")
-        : "--");
-    set("scalp-warm-note", d.warm_rounds_note || "--");
+    const structMode = d.structural_mode || (d.scalp_live === true ? "REFUSED" : (d.scalp_paper_enabled === true ? "STRUCTURAL_PAPER" : "DISABLED"));
+    set("scalp-mode", structMode);
+    set("scalp-fill-model", d.fill_model || d.structural_fill_model || "--");
+    set("scalp-paper-shadow", d.structural_shadow === true || d.paper_shadow === true ? "SHADOW (no ledger)" : (d.scalp_paper_enabled === true ? "PAPER" : "--"));
+    const br = d.structural_breaker || (d.runner_state && d.runner_state.structural_breaker) || {};
+    set("scalp-struct-breaker", br.status || (br.open ? "OPEN" : "CLOSED"));
+    set("scalp-struct-breaker-reason", br.reason || br.next_eligible_recovery || "--");
+    const st = d.structural_stats || (d.runner_state && d.runner_state.structural_stats) || {};
+    set("scalp-gross-spread", st.gross_spread_usd != null ? "$" + Number(st.gross_spread_usd).toFixed(2) : "--");
+    set("scalp-fees", st.fees_usd != null ? "$" + Number(st.fees_usd).toFixed(2) + " (sim)" : "--");
+    set("scalp-timeout-cost", st.timeout_slip_usd != null ? "$" + Number(st.timeout_slip_usd).toFixed(2) : "--");
+    set("scalp-adverse", st.adverse_1s_rate != null ? (Number(st.adverse_1s_rate) * 100).toFixed(1) + "%" : "--");
+    set("scalp-fee-ok", d.fee_model_verified === true ? "sim assumptions verified" : d.fee_model_verified === false ? "unverified" : "--");
 
     window._lastScalpStatus = d;
     updateScalpSymbolDiagnostics(d);
@@ -1150,21 +1148,28 @@ function updateScalpSymbolDiagnostics(d) {
         tbody.innerHTML = "<tr><td colspan=\"8\">--</td></tr>";
         return;
     }
+    const quotes = d.quotes || (d.runner_state && d.runner_state.quotes) || {};
+    const tape = d.tape || (d.runner_state && d.runner_state.tape) || {};
+    const bySym = (d.structural_stats && d.structural_stats.by_symbol) || {};
     tbody.innerHTML = keys.map(function (sym) {
         const row = symbols[sym] || {};
-        const mrRaw = micro[sym];
-        const mrStr = typeof mrRaw === "string" ? mrRaw : (mrRaw && (mrRaw.micro_regime || mrRaw.regime)) || "--";
-        const dist = row.distance_to_pass || {};
-        const distPct = dist.distance_to_pass_pct != null ? Number(dist.distance_to_pass_pct).toFixed(3) + "%" : "--";
-        const rejectRaw = String(row.reject_reason || "--");
-        const rejectShort = rejectRaw.length > 28 ? rejectRaw.slice(0, 26) + "…" : rejectRaw;
-        const eligible = telemetry[sym];
-        const eligibleStr = eligible === true ? "✓" : eligible === false ? "✗" : "--";
-        return "<tr><td>" + sym + "</td><td>" + (row.decision || "--") +
-            "</td><td class=\"td-wrap\" title=\"" + rejectRaw.replace(/"/g, "&quot;") + "\">" + rejectShort +
-            "</td><td>" + mrStr + "</td><td>" + distPct + "</td><td>" +
-            (row.spread_pct != null ? (Number(row.spread_pct) * 100).toFixed(3) + "%" : "--") + "</td><td>" +
-            (row.momentum_confirmed ? "yes" : "no") + "</td><td>" + eligibleStr + "</td></tr>";
+        const q = quotes[sym] || row.quote || {};
+        const t = tape[sym] || row.tape || {};
+        const qtxt = q.side ? (q.side + " " + Number(q.price || 0).toFixed(4)) : "--";
+        const ahead = q.queue_ahead != null ? Number(q.queue_ahead).toFixed(6) : "--";
+        const partial = (q.filled_qty != null && q.remaining_qty != null)
+            ? Number(q.filled_qty).toFixed(6) + " / rem " + Number(q.remaining_qty).toFixed(6)
+            : "--";
+        const book = (row.book_source || "--") + (row.orderbook_age_sec != null ? " " + Number(row.orderbook_age_sec).toFixed(2) + "s" : "");
+        const tapeAge = t.age_sec != null ? Number(t.age_sec).toFixed(2) + "s" + (t.fresh ? "" : " STALE") : "missing";
+        const pnl = bySym[sym] && bySym[sym].net != null ? "$" + Number(bySym[sym].net).toFixed(2) : "--";
+        return "<tr><td>" + sym + "</td><td>" + qtxt +
+            "</td><td>" + ahead +
+            "</td><td>" + partial +
+            "</td><td>" + book +
+            "</td><td>" + tapeAge +
+            "</td><td>" + (row.spread_pct != null ? (Number(row.spread_pct) * 10000).toFixed(1) + " bps" : "--") +
+            "</td><td>" + pnl + "</td></tr>";
     }).join("");
 }
 
@@ -1172,7 +1177,15 @@ function updateScalpRouter(d) {
     const pre = document.getElementById("scalp-router-pre");
     if (!pre) return;
     try {
-        pre.textContent = JSON.stringify(d.strategy_router || {}, null, 2);
+        pre.textContent = JSON.stringify({
+            structural_mode: d.structural_mode,
+            fill_model: d.fill_model || d.structural_fill_model,
+            quotes: d.quotes || (d.runner_state && d.runner_state.quotes) || {},
+            tape: d.tape || (d.runner_state && d.runner_state.tape) || {},
+            structural_breaker: d.structural_breaker || (d.runner_state && d.runner_state.structural_breaker) || {},
+            structural_stats: d.structural_stats || {},
+            ranking_router_retired: d.strategy_router || {},
+        }, null, 2);
     } catch (_e) {
         pre.textContent = "--";
     }

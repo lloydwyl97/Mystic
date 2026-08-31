@@ -1,21 +1,23 @@
-"""New SCALP book: structural economics, not prediction ranking.
-
-The 1-120s / 3-20m / maker-on-ranker theses are retired. This module is the
-only authorized SCALP entry policy.
-
-Paper LP rests at touch and fills only on through-price. Cross-venue / mid
-dislocation is not arb and is not executable. Live is not armed.
-The prediction-book circuit breaker does not apply to this thesis.
-"""
+"""Structural SCALP policy. Ranking/prediction cannot activate in this process."""
 
 from __future__ import annotations
 
 from typing import Any
 
+from backend.services.binance_scalp.structural_mode import (
+    FILL_MODEL_VERSION,
+    MODE_DISABLED,
+    MODE_PAPER,
+    MODE_SHADOW,
+    ledger_writes_enabled,
+    quoting_enabled,
+)
+
 THESIS_STRUCTURAL = "structural"
 THESIS_LEGACY_PREDICTION = "legacy_prediction"
 PREDICTION_RETIRED = "SCALP_PREDICTION_THESIS_RETIRED"
 STRUCTURAL_RANKING_BLOCKED = "SCALP_STRUCTURAL_NOT_EXECUTABLE"
+STRUCTURAL_NOT_EXECUTABLE = STRUCTURAL_RANKING_BLOCKED
 
 
 def normalize_thesis(raw: Any) -> str:
@@ -25,52 +27,55 @@ def normalize_thesis(raw: Any) -> str:
     return THESIS_STRUCTURAL
 
 
-def prediction_entries_permitted(config: Any) -> bool:
-    """Legacy VWAP/pullback/momentum/imbalance ranking may buy only if both flags are on."""
-    thesis = normalize_thesis(getattr(config, "scalp_thesis", THESIS_STRUCTURAL))
-    return thesis == THESIS_LEGACY_PREDICTION and bool(getattr(config, "legacy_prediction_entries", False))
+def prediction_entries_permitted(_config: Any) -> bool:
+    return False
 
 
 def ranking_eval_permitted(config: Any) -> bool:
-    return prediction_entries_permitted(config)
+    return False
 
 
 def prediction_circuit_breaker_applies(config: Any) -> bool:
-    """Consec-loss breaker belongs to the retired ranking book only."""
-    return prediction_entries_permitted(config)
+    """Leftover ranking-breaker arithmetic only. Structural process refuses these flags at startup."""
+    thesis = str(getattr(config, "scalp_thesis", "") or "").strip().lower()
+    return thesis == THESIS_LEGACY_PREDICTION and bool(getattr(config, "legacy_prediction_entries", False))
+
+
+def structural_mode_of(config: Any) -> str:
+    try:
+        return config.resolved_structural_mode()
+    except Exception:
+        raw = getattr(config, "structural_mode", "") or ""
+        if raw in {MODE_DISABLED, MODE_PAPER, MODE_SHADOW}:
+            return str(raw)
+        return MODE_PAPER if bool(getattr(config, "scalp_paper_enabled", False)) else MODE_DISABLED
 
 
 def structural_lp_executable(config: Any) -> bool:
-    if normalize_thesis(getattr(config, "scalp_thesis", THESIS_STRUCTURAL)) != THESIS_STRUCTURAL:
-        return False
     if bool(getattr(config, "scalp_live", False)):
         return False
-    return bool(getattr(config, "scalp_paper_enabled", False))
+    return quoting_enabled(structural_mode_of(config))
 
 
 def new_entry_block_reason(config: Any) -> str | None:
-    """Blocks ranking `_try_entry` only. Structural LP uses its own tick path."""
-    if prediction_entries_permitted(config):
-        return None
-    if normalize_thesis(getattr(config, "scalp_thesis", THESIS_STRUCTURAL)) == THESIS_STRUCTURAL:
-        return STRUCTURAL_RANKING_BLOCKED
-    return PREDICTION_RETIRED
+    return STRUCTURAL_RANKING_BLOCKED
 
 
 def status_fields(config: Any) -> dict[str, Any]:
-    thesis = normalize_thesis(getattr(config, "scalp_thesis", THESIS_STRUCTURAL))
+    mode = structural_mode_of(config)
     return {
-        "scalp_thesis": thesis,
-        "legacy_prediction_entries": bool(getattr(config, "legacy_prediction_entries", False)),
-        "prediction_entries_permitted": prediction_entries_permitted(config),
-        "ranking_eval_permitted": ranking_eval_permitted(config),
-        "prediction_circuit_breaker_applies": prediction_circuit_breaker_applies(config),
-        "structural_entries_executable": structural_lp_executable(config),
+        "scalp_thesis": THESIS_STRUCTURAL,
+        "structural_mode": mode,
+        "legacy_prediction_entries": False,
+        "prediction_entries_permitted": False,
+        "ranking_eval_permitted": False,
+        "prediction_circuit_breaker_applies": False,
+        "structural_entries_executable": structural_lp_executable(config) and ledger_writes_enabled(mode),
+        "structural_shadow": mode == MODE_SHADOW,
         "structural_arb_executable": False,
-        "structural_fill_model": "through_price_only",
-        "new_entry_block_reason": new_entry_block_reason(config),
+        "structural_fill_model": FILL_MODEL_VERSION,
+        "fee_assumption_label": "simulation_assumption",
+        "exchange_live_impossible": True,
+        "new_entry_block_reason": STRUCTURAL_RANKING_BLOCKED,
+        "scalp_engine_version": FILL_MODEL_VERSION,
     }
-
-
-# Compat alias used by older tests/imports
-STRUCTURAL_NOT_EXECUTABLE = STRUCTURAL_RANKING_BLOCKED

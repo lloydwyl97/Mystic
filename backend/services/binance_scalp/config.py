@@ -54,6 +54,15 @@ class ScalpConfig:
     scalp_thesis: str = "structural"
     legacy_prediction_entries: bool = False
     structural_max_hold_sec: int = 600
+    structural_mode: str = "STRUCTURAL_PAPER"
+    structural_min_net_edge_bps: float = 2.0
+    structural_tape_stale_sec: float = 3.0
+    structural_max_range_mult: float = 8.0
+    structural_max_adverse_1s: float = 0.80
+    structural_breaker_consec: int = 8
+    structural_breaker_daily_loss_usd: float = 25.0
+    structural_breaker_timeout_rate: float = 0.50
+    structural_breaker_recovery_sec: int = 1800
     symbol_notional_caps: dict[str, float] = field(default_factory=dict)
 
     @classmethod
@@ -118,10 +127,19 @@ class ScalpConfig:
             max_consecutive_losses=int(os.getenv("SCALP_MAX_CONSECUTIVE_LOSSES", "5")),
             circuit_breaker_epoch=str(os.getenv("SCALP_CIRCUIT_BREAKER_EPOCH", "") or "").strip(),
             breaker_recovery_sec=int(os.getenv("SCALP_BREAKER_RECOVERY_SEC", "14400") or "14400"),
-            scalp_engine_version=str(os.getenv("SCALP_ENGINE_VERSION", "scalp_structural_v1") or "scalp_structural_v1").strip(),
+            scalp_engine_version="structural_event_queue_v1",
             scalp_thesis=("legacy_prediction" if (os.getenv("SCALP_THESIS", "structural") or "structural").strip().lower() == "legacy_prediction" else "structural"),
             legacy_prediction_entries=_bool("SCALP_LEGACY_PREDICTION_ENTRIES", False),
             structural_max_hold_sec=int(os.getenv("SCALP_STRUCTURAL_MAX_HOLD_SEC", "600") or "600"),
+            structural_mode=str(os.getenv("SCALP_STRUCTURAL_MODE") or "").strip(),
+            structural_min_net_edge_bps=float(os.getenv("SCALP_STRUCTURAL_MIN_NET_EDGE_BPS", "2.0") or "2.0"),
+            structural_tape_stale_sec=float(os.getenv("SCALP_STRUCTURAL_TAPE_STALE_SEC", "3.0") or "3.0"),
+            structural_max_range_mult=float(os.getenv("SCALP_STRUCTURAL_MAX_RANGE_MULT", "8.0") or "8.0"),
+            structural_max_adverse_1s=float(os.getenv("SCALP_STRUCTURAL_MAX_ADVERSE_1S", "0.80") or "0.80"),
+            structural_breaker_consec=int(os.getenv("SCALP_STRUCTURAL_BREAKER_CONSEC", "8") or "8"),
+            structural_breaker_daily_loss_usd=float(os.getenv("SCALP_STRUCTURAL_BREAKER_DAILY_LOSS_USD", "25") or "25"),
+            structural_breaker_timeout_rate=float(os.getenv("SCALP_STRUCTURAL_BREAKER_TIMEOUT_RATE", "0.50") or "0.50"),
+            structural_breaker_recovery_sec=int(os.getenv("SCALP_STRUCTURAL_BREAKER_RECOVERY_SEC", "1800") or "1800"),
             scalp_live_armed=_bool("SCALP_LIVE_ARMED", False),
             scalp_live_max_notional=float(os.getenv("SCALP_LIVE_MAX_NOTIONAL", "50.0")),
             scalp_live_max_open=int(os.getenv("SCALP_LIVE_MAX_OPEN", "2")),
@@ -136,19 +154,29 @@ class ScalpConfig:
             return min(float(self.max_notional_paper), per)
         return float(self.max_notional_paper)
 
-    def assert_no_live_trading(self) -> None:
-        """Hard block: raises if live trading attempted without proper arming.
+    def resolved_structural_mode(self) -> str:
+        from backend.services.binance_scalp.structural_mode import resolve_structural_mode
 
-        - SCALP_LIVE=false  →  always safe (paper mode, no-op).
-        - SCALP_LIVE=true + SCALP_LIVE_ARMED=false  →  raises (misconfigured live attempt).
-        - SCALP_LIVE=true + SCALP_LIVE_ARMED=true   →  passes (engine was explicitly armed).
-        """
-        if self.scalp_live and not os.getenv("SCALP_LIVE_ARMED", "false").lower() == "true":
-            raise RuntimeError("SCALP_LIVE=true but SCALP_LIVE_ARMED is not set. Set SCALP_LIVE_ARMED=true and arm the engine explicitly before live trading.")
-        if self.allow_market_orders and not self.scalp_live:
-            raise RuntimeError("SCALP_ALLOW_MARKET_ORDERS must remain false in paper mode.")
+        return resolve_structural_mode(
+            env_mode=self.structural_mode,
+            scalp_live=self.scalp_live,
+            scalp_live_armed=self.scalp_live_armed,
+            scalp_paper_enabled=self.scalp_paper_enabled,
+            scalp_thesis=self.scalp_thesis,
+            legacy_prediction_entries=self.legacy_prediction_entries,
+            allow_market_orders=self.allow_market_orders,
+        )
+
+    def assert_no_live_trading(self) -> None:
+        """Structural process: exchange-live is impossible. Legacy flags refuse startup."""
+        if self.allow_market_orders:
+            raise RuntimeError("SCALP_ALLOW_MARKET_ORDERS is refused in the structural process.")
         if self.calibration_mode and self.scalp_live:
             raise RuntimeError("SCALP_CALIBRATION_MODE requires SCALP_LIVE=false")
+        self.resolved_structural_mode()
+
+    def assert_structural_startup(self) -> str:
+        return self.resolved_structural_mode()
 
 
 def get_scalp_config() -> ScalpConfig:

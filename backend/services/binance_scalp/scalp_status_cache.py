@@ -253,7 +253,19 @@ def build_runner_api_status_payload(
         "runner_active": True,
         "pnl_summary": pnl_summary or {"engine": "scalp", "note": "pnl_omitted_on_fast_path"},
         "heartbeat_epoch": float(rs.get("updated_at_epoch") or now),
-        "circuit_breaker_open": str(ld.get("reason") or rs.get("entry_blocked_reason") or "") == "SCALP_CIRCUIT_BREAKER_OPEN",
+        "circuit_breaker_open": bool(rs.get("circuit_breaker_open"))
+        or str(ld.get("reason") or rs.get("entry_blocked_reason") or "").startswith("STRUCTURAL_BREAKER")
+        or str(ld.get("reason") or "") == "SCALP_CIRCUIT_BREAKER_OPEN",
+        "structural_mode": rs.get("structural_mode"),
+        "fill_model": rs.get("fill_model") or "structural_event_queue_v1",
+        "paper_shadow": rs.get("paper_shadow"),
+        "quotes": rs.get("quotes") or {},
+        "tape": rs.get("tape") or {},
+        "structural_breaker": rs.get("structural_breaker") or {},
+        "structural_stats": rs.get("structural_stats") or {},
+        "legacy_inventory": rs.get("legacy_inventory") or [],
+        "ranking_runtime": "isolated",
+        "ranking_only": False,
         "scalp_entry_enabled": not bool(rs.get("entry_blocked_reason") or (str(ld.get("reason") or "") in {"SCALP_CIRCUIT_BREAKER_OPEN", "SCALP_PAPER_DISABLED", "FEE_MODEL_UNVERIFIED"})),
         "scalp_exit_enabled": True,
     }

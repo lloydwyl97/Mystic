@@ -191,7 +191,7 @@ def scalp_entry_telemetry() -> dict:
                 "available": False,
                 "note": "No telemetry yet — wait one paper-runner cycle (~5s) after start.",
             }
-        out: dict = {"engine": "scalp", "available": True}
+        out: dict = {"engine": "scalp", "available": True, "ranking_only": True, "note": "ranking-era telemetry isolated from structural LP"}
         if payload:
             out.update(payload)
         if rolling_full and "rolling" not in out:
