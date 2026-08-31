@@ -117,6 +117,6 @@ async def test_fresh_sqlite_read_catches_position_missing_from_stale_memory():
         assert "ETH/USDT" not in engine.open_positions  # simulated staleness
         row = await asyncio.to_thread(engine._fetch_authoritative_open_position_sync, "ETH/USDT")
         assert row is not None, "fresh SQLite read must find the position even though memory does not have it"
-        qty, trade_id, entry_price = row
+        qty, trade_id, _entry_price = row
         assert float(qty) == pytest.approx(2.06)
         assert trade_id == "race-test-buy-1"

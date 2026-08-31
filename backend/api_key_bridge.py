@@ -8,7 +8,11 @@ import logging
 
 from backend.utils.binance_credentials import (
     get_binance_us_api_key as _resolve_api_key,
+)
+from backend.utils.binance_credentials import (
     get_binance_us_secret_key as _resolve_secret_key,
+)
+from backend.utils.binance_credentials import (
     sync_binance_us_env_aliases,
 )
 

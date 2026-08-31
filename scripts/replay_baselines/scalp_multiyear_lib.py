@@ -19,12 +19,12 @@ TOP4_API = {"BTC/USDT": "BTCUSDT", "ETH/USDT": "ETHUSDT", "SOL/USDT": "SOLUSDT",
 NOTIONAL = 25.0
 PRINCIPAL = 25000.0
 
-from backend.services.binance_scalp.scalp_regime_classifier import (  # noqa: E402
+from backend.services.binance_scalp.scalp_regime_classifier import (
     STRATEGY_NATIVE_REGIMES,
     regime_at_ts,
     summarize_regime_coverage,
 )
-from scripts.run_day_execution_replay import fetch_klines_cached  # noqa: E402
+from scripts.run_day_execution_replay import fetch_klines_cached
 
 
 def normalize_bar(bar: dict) -> dict:
@@ -141,7 +141,7 @@ def build_data_coverage(*, target_days_1m: int = 180, target_days_1h: int = 720)
                 end_ms_use = widest[1]
             else:
                 end_ms_use = end_ms
-            bars, meta = load_or_fetch_bars(sym, interval, start_ms, end_ms_use)
+            _bars, meta = load_or_fetch_bars(sym, interval, start_ms, end_ms_use)
             sym_report[interval] = meta
             coverage["intervals"].setdefault(interval, []).append(meta.get("bar_count", 0))
         coverage["symbols"][sym] = sym_report
@@ -316,7 +316,7 @@ def run_regime_filtered_replay(
     )
 
     api_sym = TOP4_API.get(symbol, symbol.replace("/", ""))
-    trades_raw, stats, _ = replay_symbol(
+    trades_raw, _stats, _ = replay_symbol(
         api_sym,
         bars_1m,
         config=config,

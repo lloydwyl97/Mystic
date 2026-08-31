@@ -68,7 +68,7 @@ def measure_all_setups(ctx: StrategyMarketContext) -> dict[str, dict[str, float]
     }
 
     closes = [float(b["close"]) for b in bars] if bars else []
-    highs = [float(b["high"]) for b in bars] if bars else []
+    [float(b["high"]) for b in bars] if bars else []
     lows = [float(b["low"]) for b in bars] if bars else []
     vols = [float(b.get("volume") or 0.0) for b in bars] if bars else []
 

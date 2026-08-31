@@ -9,6 +9,8 @@ import pytest
 
 from backend.database_schema import DATABASE_PATH
 from backend.services.symbol_setup_outcome_penalty import (
+    XRP_PENALTY_V1_EV_FACTOR,
+    XRP_PENALTY_V1_RANK_DELTA,
     apply_outcome_penalty_to_decision_data,
     apply_v3_outcome_ranking_to_decision_data,
     build_churn_audit,
@@ -17,8 +19,6 @@ from backend.services.symbol_setup_outcome_penalty import (
     evaluate_outcome_penalty,
     evaluate_sol_outcome_credit,
     write_churn_audit_artifact,
-    XRP_PENALTY_V1_EV_FACTOR,
-    XRP_PENALTY_V1_RANK_DELTA,
 )
 
 

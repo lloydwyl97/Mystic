@@ -48,7 +48,7 @@ def enrich_basket_relative_strength(candidates: list[Any]) -> None:
             dd.setdefault("rs_rank", 1)
             dd.setdefault("relative_strength_rank", 1)
             dd["basket_rs_rank_delta"] = 0.0
-            setattr(cand, "decision_data", dd)
+            cand.decision_data = dd
         return
 
     rs_vals = {s: _f(d, "ctx_rs_btc", 0.0) + _f(d, "ctx_rs_eth", 0.0) for s, d in by_sym.items()}
@@ -83,10 +83,10 @@ def enrich_basket_relative_strength(candidates: list[Any]) -> None:
         dd["execution_rank"] = exec_rank.get(sym, n)
         dd["feature_health_rank"] = fh_rank.get(sym, n)
         dd["setup_quality_rank"] = setup_rank.get(sym, n)
-        dd["relative_strength_rank"] = int(round(composite))
+        dd["relative_strength_rank"] = round(composite)
         # Rank 1 = best → positive delta; rank n = worst → negative
         dd["basket_rs_rank_delta"] = round(max(-0.06, min(0.06, ((n + 1 - composite) / n - 0.5) * 0.12)), 4)
-        setattr(cand, "decision_data", dd)
+        cand.decision_data = dd
 
 
 def leading_lagging_summary(candidates: list[Any]) -> dict[str, str]:

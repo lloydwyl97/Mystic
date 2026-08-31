@@ -24,7 +24,7 @@ from backend.services.day_feature_audit import (
     run_full_audit,
 )
 from backend.services.day_feature_health import LEARNING_BLOCKED_FEATURE_NAMES
-from backend.services.feature_mapping import get_feature_name  # noqa: F401 — re-export for tooling
+from backend.services.feature_mapping import get_feature_name
 
 COIN_LABELS = ("BTC", "ETH", "SOL", "XRP")
 SYMBOL_TO_LABEL = {
@@ -344,7 +344,7 @@ async def run_indicator_truth_audit(symbols: list[str] | None = None) -> dict[st
         )
         consensus_status = coin_status.get("BTC") or "MISSING"
         for st in status_priority:
-            if any(coin_status.get(l) == st for l in COIN_LABELS):
+            if any(coin_status.get(label) == st for label in COIN_LABELS):
                 consensus_status = st
                 break
 
@@ -372,7 +372,7 @@ async def run_indicator_truth_audit(symbols: list[str] | None = None) -> dict[st
         # Pass/fail checks
         if not all(len((per_coin.get(s) or {}).get("features") or []) == AI_FEATURE_DIM_V2 for s in syms):
             pass  # handled globally
-        if consensus_status == "MISSING" and not any(coin_status.get(l) == "MISSING" for l in COIN_LABELS):
+        if consensus_status == "MISSING" and not any(coin_status.get(label) == "MISSING" for label in COIN_LABELS):
             pass
         if name in SENTIMENT_UNSUPPORTED:
             if trust != 0.0:
@@ -498,4 +498,4 @@ async def run_indicator_truth_audit(symbols: list[str] | None = None) -> dict[st
     }
 
 
-__all__ = ["run_indicator_truth_audit", "COIN_LABELS", "SENTIMENT_UNSUPPORTED"]
+__all__ = ["COIN_LABELS", "SENTIMENT_UNSUPPORTED", "run_indicator_truth_audit"]

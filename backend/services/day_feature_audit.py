@@ -200,8 +200,8 @@ async def _load_inputs_for_symbol(symbol_bus: str) -> dict[str, Any]:
 
     sentiment: dict[str, Any] | None = None
     try:
-        from backend.services.ai_decision_contract import REDIS_KEY_AI_SENTIMENT
         from backend.config.redis_config import get_shared_redis_async
+        from backend.services.ai_decision_contract import REDIS_KEY_AI_SENTIMENT
 
         r = await get_shared_redis_async()
         raw_s = await r.get(REDIS_KEY_AI_SENTIMENT) if r else None
@@ -414,16 +414,15 @@ def build_context_provenance(inp: dict[str, Any], bundle: dict[str, Any]) -> dic
     micro_ctx_fields = frozenset({"ctx_spread_pct", "ctx_depth_imbalance"})
 
     for fname, (st, src) in ctx_fields.items():
-        if ctx_stale and st in ("LIVE", "CALCULATED"):
-            st = "STALE"
-        base_trust = FEATURE_TRUST_SCORES.get(st, 0.5)
+        status = "STALE" if ctx_stale and st in ("LIVE", "CALCULATED") else st
+        base_trust = FEATURE_TRUST_SCORES.get(status, 0.5)
         trust = base_trust * (ctx_fresh_mod if fname in micro_ctx_fields else 1.0)
         row: dict[str, Any] = {
-            "status": st,
+            "status": status,
             "source": src,
             "age_seconds": ctx_age,
             "trust_score": round(trust, 4),
-            "learning_allowed": st in ("LIVE", "CALCULATED") and not ctx_stale,
+            "learning_allowed": status in ("LIVE", "CALCULATED") and not ctx_stale,
         }
         if fname in micro_ctx_fields:
             row["orderbook_updated_at"] = ctx_updated_at
@@ -520,9 +519,9 @@ def format_coin_summary(coin_report: dict[str, Any]) -> str:
 
 
 __all__ = [
-    "build_symbol_feature_audit",
-    "run_full_audit",
-    "format_coin_summary",
     "BAD_STATUSES",
     "PASS_STATUSES",
+    "build_symbol_feature_audit",
+    "format_coin_summary",
+    "run_full_audit",
 ]

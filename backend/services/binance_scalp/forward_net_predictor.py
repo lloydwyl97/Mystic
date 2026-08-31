@@ -78,7 +78,7 @@ def _num(value: Any, default: float = 0.0) -> float:
 
 def flatten_measurements(measurements: dict[str, Any] | None, *, live_book: bool = False) -> dict[str, float]:
     """Reduce 9-strategy measurements to the shared continuous feature set."""
-    out = {k: 0.0 for k in FEATURE_KEYS}
+    out = dict.fromkeys(FEATURE_KEYS, 0.0)
     if live_book:
         out["orderbook_imbalance"] = 0.0
     if not isinstance(measurements, dict):
@@ -181,7 +181,7 @@ def chronological_folds(n: int, *, gap: int = GAP_BARS) -> list[tuple[range, ran
 def effective_sample_report(net: list[float], epochs: list[float], symbols: list[str]) -> dict[str, Any]:
     n = len(net)
     windows = set()
-    for ep, sym in zip(epochs, symbols):
+    for ep, sym in zip(epochs, symbols, strict=False):
         windows.add((sym, int(ep // (WINDOW_BARS * 60))))
     xs = np.asarray(net, dtype=float)
     ac = None
@@ -192,7 +192,7 @@ def effective_sample_report(net: list[float], epochs: list[float], symbols: list
         ac = float(a.dot(b) / den) if den else None
     ess = n
     if ac is not None and abs(ac) < 0.999:
-        ess = int(round(n * (1.0 - abs(ac)) / (1.0 + abs(ac))))
+        ess = round(n * (1.0 - abs(ac)) / (1.0 + abs(ac)))
     return {
         "raw_snapshots": n,
         "unique_market_windows": len(windows),
@@ -233,7 +233,7 @@ class ForwardNetArtifact:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ForwardNetArtifact":
+    def from_dict(cls, payload: dict[str, Any]) -> ForwardNetArtifact:
         return cls(
             version=str(payload.get("version") or MODEL_VERSION),
             accepted=bool(payload.get("accepted")),
@@ -262,7 +262,7 @@ def _standardize_apply(x: np.ndarray, mean: np.ndarray, scale: np.ndarray) -> np
 
 
 def fit_linear(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, float]:
-    xs, mean, scale = _standardize_fit(x)
+    xs, _mean, _scale = _standardize_fit(x)
     xs = np.column_stack([xs, np.ones(len(xs))])
     coef, *_ = np.linalg.lstsq(xs, y, rcond=None)
     return coef, float(coef[-1])
@@ -278,7 +278,7 @@ def predict_linear(x: np.ndarray, mean: np.ndarray, scale: np.ndarray, coef: np.
 def fit_logistic(x: np.ndarray, y_bin: np.ndarray) -> tuple[np.ndarray, float]:
     from sklearn.linear_model import LogisticRegression
 
-    xs, mean, scale = _standardize_fit(x)
+    xs, _mean, _scale = _standardize_fit(x)
     if len(set(y_bin.tolist())) < 2:
         return np.zeros(x.shape[1]), -10.0
     clf = LogisticRegression(max_iter=200, solver="lbfgs")

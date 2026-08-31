@@ -12,7 +12,6 @@ from backend.services.trade_learning_writer import (
     record_trade_outcome,
 )
 
-
 SETUP = "VWAP_EMA_RECLAIM"
 
 

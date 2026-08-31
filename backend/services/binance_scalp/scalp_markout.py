@@ -19,7 +19,7 @@ from backend.services.binance_scalp.scalp_micro_contract import MARKOUT_HORIZONS
 
 logger = logging.getLogger(__name__)
 
-_PENDING: list["_PendingMarkout"] = []
+_PENDING: list[_PendingMarkout] = []
 _LAST_FLUSH_TS = 0.0
 _FLUSH_INTERVAL_SEC = 2.0
 _TABLE_READY: set[str] = set()

@@ -50,7 +50,7 @@ def _insert_sell(
     ts: str = "2026-08-04T12:00:00+00:00",
     display_exit: str | None = None,
 ) -> None:
-    display = display_exit or ("STALL_EXIT" if "STALL" in raw_exit.upper() else raw_exit.split("_EXIT")[0] + "_EXIT" if "_EXIT" in raw_exit else raw_exit)
+    display = display_exit or ("STALL_EXIT" if "STALL" in raw_exit.upper() else raw_exit.split("_EXIT", maxsplit=1)[0] + "_EXIT" if "_EXIT" in raw_exit else raw_exit)
     if "GIVEBACK" in raw_exit.upper():
         display = "GIVEBACK_EXIT"
     if "NET_PROFIT" in raw_exit.upper():

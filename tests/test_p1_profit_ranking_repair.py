@@ -6,7 +6,6 @@ from pathlib import Path
 
 from backend.services.portfolio_engine import BuyCandidate
 
-
 REPO = Path(__file__).resolve().parents[1]
 
 

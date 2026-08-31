@@ -16,7 +16,7 @@ _ADMIN_EXIT_TYPES = frozenset({"ADMIN_POSITION_CLEAR", "STALE_PRE_CORRECTION_POS
 def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
-    return {key: row[key] for key in row.keys()}
+    return {key: row[key] for key in row}
 
 
 def _parse_json_field(raw: Any) -> Any:

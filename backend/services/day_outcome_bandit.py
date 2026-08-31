@@ -59,7 +59,7 @@ MAX_SIZE_TOP = float(os.getenv("DAY_BANDIT_MAX_SIZE_TOP", "2.00") or "2.00")
 # behavior of VWAP_REVERSION in bull rather than at 50/50, so early trades
 # still ride real signal instead of coin-flipping prior mass.
 HIERARCHICAL_PRIOR_ENABLED_DEFAULT = True
-HIERARCHICAL_PRIOR_MAX_WEIGHT = 2.5  # max effective peer weight added to α+β
+HIERARCHICAL_PRIOR_MAX_WEIGHT = 2.5  # max effective peer weight added to alpha+β
 HIERARCHICAL_PRIOR_SETUP_REGIME_WEIGHT = 0.6
 HIERARCHICAL_PRIOR_SYMBOL_REGIME_WEIGHT = 0.4
 
@@ -145,11 +145,7 @@ def ensure_bandit_schema(db_path: str | Path) -> None:
 
 def _is_win(pnl: float, exit_reason: str) -> bool:
     er = str(exit_reason or "").upper()
-    if "NET_PROFIT" in er and pnl > 0:
-        return True
-    if pnl > 0.5:  # clear green after costs
-        return True
-    return False
+    return ("NET_PROFIT" in er and pnl > 0) or pnl > 0.5
 
 
 def _weight(pnl: float) -> float:
@@ -247,7 +243,7 @@ def record_bandit_outcome(
 
     mean = float(alpha / (alpha + beta)) if (alpha + beta) > 0 else 0.5
     logger.info(
-        "DAY_BANDIT_UPDATE arm=%s win=%s pnl=%.3f α=%.3f β=%.3f mean=%.3f n=%d trade=%s",
+        "DAY_BANDIT_UPDATE arm=%s win=%s pnl=%.3f alpha=%.3f β=%.3f mean=%.3f n=%d trade=%s",
         key,
         win,
         pnl,
@@ -275,7 +271,7 @@ def _peer_prior_alpha_beta(
     setup: str,
     regime: str,
 ) -> tuple[float, float, int]:
-    """Compute a hierarchical (partial-pooling) prior α, β for a fresh arm.
+    """Compute a hierarchical (partial-pooling) prior alpha, β for a fresh arm.
 
     Blends two peer families:
     1. Same (setup, regime), different symbol — how does this setup behave in

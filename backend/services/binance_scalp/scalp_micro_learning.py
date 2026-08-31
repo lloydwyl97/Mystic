@@ -1,6 +1,6 @@
 """Learn from executable markouts — rank/size only, never eligibility.
 
-Buckets: symbol × OFI tercile × queue-imbalance tercile × adverse tercile.
+Buckets: symbol x OFI tercile x queue-imbalance tercile x adverse tercile.
 Reward positive forward executable net; penalize negative.
 Requires sample size + recency; missing data is a zero adjustment.
 """

@@ -11,6 +11,7 @@ import logging
 from datetime import timezone
 from typing import Any
 
+from alerts import alert_evolution_cycle, alert_strategy_mutation, alert_trade_execution
 from db_logger import (
     get_strategy_id,
     get_strategy_stats,
@@ -20,8 +21,6 @@ from db_logger import (
 )
 from mutator import run_evolution_cycle
 from reward_engine import evaluate_strategies
-
-from alerts import alert_evolution_cycle, alert_strategy_mutation, alert_trade_execution
 
 logger = logging.getLogger(__name__)
 

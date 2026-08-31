@@ -317,14 +317,16 @@ def test_full_attribution_pipeline() -> None:
 def test_btc_self_comparison() -> None:
     """BTC compared to itself must produce correlation=1.0, beta=1.0, rs=0.0."""
     import asyncio
+
     from backend.services.market_role_intelligence import compute_market_role_context
 
     # Build realistic BTC 1h OHLCV rows (100 bars)
     ts_base = int(time.time() * 1000) - 100 * 3600 * 1000
     btc_rows = []
     price = 65000.0
+    rng = np.random.default_rng(0)
     for i in range(100):
-        price *= 1 + np.random.normal(0, 0.003)
+        price *= 1 + rng.normal(0, 0.003)
         ts = ts_base + i * 3600_000
         btc_rows.append([ts, price * 0.999, price * 1.001, price * 0.998, price, 1000.0])
 
@@ -464,7 +466,7 @@ def test_zero_btc_variance_returns_none() -> None:
 def test_learned_adjustment_bounded_after_sufficient_samples() -> None:
     """After MIN_OUTCOME_SAMPLES outcomes, learned_adjustment is non-zero and within ±0.02."""
     db_path = _make_temp_db()
-    record_outcome, get_stats, get_adj, MIN_SAMPLES = _get_learner()
+    record_outcome, get_stats, get_adj, _MIN_SAMPLES = _get_learner()
 
     # 15 consistently profitable trades with high rs_short_1h
     for i in range(15):
@@ -500,7 +502,7 @@ def test_learned_adjustment_bounded_after_sufficient_samples() -> None:
     adj = get_adj(db_path, "XRPUSDT", "day")
 
     assert stats.sample_count == 15, f"TEST 16 FAIL: sample_count={stats.sample_count}"
-    assert stats.confidence_status != "insufficient_data", f"TEST 16 FAIL: still insufficient after 15 samples"
+    assert stats.confidence_status != "insufficient_data", "TEST 16 FAIL: still insufficient after 15 samples"
     assert -0.02 <= adj <= 0.02, f"TEST 16 FAIL: learned_adj {adj} out of ±0.02 bounds"
     print(f"  TEST 16 PASS: learned_adjustment={adj:.6f} within ±0.02, status={stats.confidence_status}, samples={stats.sample_count}")
 
@@ -528,7 +530,7 @@ if __name__ == "__main__":
         print(f"\n── {t.__name__} ──")
         try:
             t()
-            print(f"  PASSED")
+            print("  PASSED")
             passed += 1
         except Exception as e:
             print(f"  FAILED: {e}")

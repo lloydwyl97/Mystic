@@ -5,6 +5,7 @@ Answers: was there a tradable profitable excursion, even if the horizon closed r
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 DEFAULT_COST = 0.0006
@@ -15,7 +16,7 @@ HORIZONS_MIN = (1, 3, 5, 10, 20)
 def _f(value: Any, default: float = 0.0) -> float:
     try:
         out = float(value)
-        return out if out == out else default
+        return default if math.isnan(out) else out
     except (TypeError, ValueError):
         return default
 

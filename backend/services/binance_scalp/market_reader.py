@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 
 import redis
+
 from backend.services.binance_scalp.config import ScalpConfig, get_scalp_config
 
 # Force IPv4 for Binance.US REST on this VM — shared bootstrap patch.

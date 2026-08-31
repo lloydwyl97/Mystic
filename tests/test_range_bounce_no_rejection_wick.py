@@ -24,9 +24,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from backend.services.binance_scalp.config import get_scalp_config
 from backend.services.binance_scalp.strategies.base import StrategyMarketContext
 from backend.services.binance_scalp.strategies.range_bounce_scalp import RangeBounceScalpStrategy
-from backend.services.binance_scalp.config import get_scalp_config
 
 
 def _bars(*, low: float, high: float, closes: list[float]) -> list[dict]:

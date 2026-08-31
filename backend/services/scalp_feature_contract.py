@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 SCALP_FEATURE_VERSION = 1
@@ -144,7 +145,7 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 def _safe(v: Any, default: float = 0.0) -> float:
     try:
         x = float(v)
-        if x != x:  # NaN
+        if math.isnan(x):
             return default
         return x
     except (TypeError, ValueError):

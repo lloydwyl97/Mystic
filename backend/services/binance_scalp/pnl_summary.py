@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
+
 def _default_scalp_money_db() -> str:
     from backend.services.binance_scalp.config import get_scalp_config
 

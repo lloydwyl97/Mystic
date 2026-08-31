@@ -362,7 +362,7 @@ def scalp_learning_summary(limit: int = Query(20, ge=1, le=200)) -> dict[str, An
         with _ro_conn() as conn:
             reviews = _rows(
                 conn,
-                f"""
+                """
                 SELECT trade_id, symbol, closed_at_utc, review_json, ingested_at_utc
                 FROM scalp_post_trade_feature_reviews
                 ORDER BY closed_at_utc DESC
@@ -382,7 +382,7 @@ def scalp_learning_summary(limit: int = Query(20, ge=1, le=200)) -> dict[str, An
             )
             attribution = _rows(
                 conn,
-                f"""
+                """
                 SELECT trade_id, symbol, micro_regime, scalp_setup, outcome_reason,
                        net_pnl_after_fees, exit_reason, created_at
                 FROM scalp_outcome_attribution

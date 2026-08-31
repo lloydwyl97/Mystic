@@ -268,9 +268,9 @@ def cached_multi_horizon_ev(symbol: str, strategy: str, **kwargs: Any) -> MultiH
 
 __all__ = [
     "DAY_HORIZON_BUCKETS",
+    "SCALP_HORIZON_BUCKETS",
     "HorizonEV",
     "MultiHorizonEVResult",
-    "SCALP_HORIZON_BUCKETS",
     "cached_multi_horizon_ev",
     "compute_multi_horizon_ev",
 ]

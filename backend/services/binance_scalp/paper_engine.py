@@ -11,15 +11,16 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import redis
+
 from backend.services.binance_scalp.calibration_profiles import economics_for_config
 from backend.services.binance_scalp.config import ScalpConfig, get_scalp_config
 from backend.services.binance_scalp.economics import ScalpEconomics
 from backend.services.binance_scalp.exit_manager import (
     DECISION_SELL,
     EXIT_MAX_HOLD_HARD_LIMIT,
+    STATE_MAX_HOLD_REVIEW,
     ExitReviewResult,
     PositionTrack,
-    STATE_MAX_HOLD_REVIEW,
     _max_hold_hard_sec,
     evaluate_exit,
     track_from_row,
@@ -45,14 +46,15 @@ from backend.services.binance_scalp.scalp_control import (
     is_entry_armed,
     set_entry_armed,
 )
+from backend.services.binance_scalp.scalp_position_retention import maybe_run_scalp_position_housekeeping
 from backend.services.binance_scalp.scalp_reject_throttle import (
     ScalpRejectThrottle,
     maybe_run_scalp_reject_retention,
 )
-from backend.services.binance_scalp.scalp_position_retention import maybe_run_scalp_position_housekeeping
 from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
 from backend.services.binance_scalp.schema import init_scalp_schema
 from backend.services.binance_scalp.strategies.kline_cache import KlineCache
+from backend.services.binance_scalp.structural_thesis import new_entry_block_reason
 from backend.utils.sqlite_runtime import connect_rw, is_locked_error, run_locked_retry
 
 logger = logging.getLogger(__name__)
@@ -173,7 +175,7 @@ class BinanceScalpPaperEngine:
             dt = datetime.fromisoformat(s)
         except ValueError:
             try:
-                dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+                dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")  # noqa: DTZ007
             except ValueError:
                 return None
         if dt.tzinfo is None:
@@ -687,8 +689,7 @@ class BinanceScalpPaperEngine:
             today = now.strftime("%Y-%m-%d")
             epoch = (self.config.circuit_breaker_epoch or "").strip()
             recovery_sec = int(getattr(self.config, "breaker_recovery_sec", 14400) or 14400)
-            if recovery_sec < 0:
-                recovery_sec = 0
+            recovery_sec = max(recovery_sec, 0)
             owned = conn is None
             if owned:
                 conn = self._conn()
@@ -725,13 +726,7 @@ class BinanceScalpPaperEngine:
                 recovery_until_dt = self._parse_utc_ts(recovery_until_raw)
                 trip_dt = self._parse_utc_ts(str(state.get("tripped_at") or ""))
                 epoch_dt = self._parse_utc_ts(epoch)
-                if (
-                    recovery_until_dt is not None
-                    and now < recovery_until_dt
-                    and epoch_dt is not None
-                    and trip_dt is not None
-                    and epoch_dt > trip_dt
-                ):
+                if recovery_until_dt is not None and now < recovery_until_dt and epoch_dt is not None and trip_dt is not None and epoch_dt > trip_dt:
                     self._save_consec_breaker_state(
                         conn,
                         tripped_at="",
@@ -827,7 +822,7 @@ class BinanceScalpPaperEngine:
                         conn.commit()
                     with contextlib.suppress(Exception):
                         conn.close()
-        except Exception:
+        except Exception:  # noqa: TRY203
             raise
 
     def _entry_candidates(
@@ -838,6 +833,11 @@ class BinanceScalpPaperEngine:
     ) -> list[tuple[str, MarketSnapshot, object]]:
         if not self.config.scalp_paper_enabled:
             self._publish_last_decision(decision="BLOCKED", reason=SCALP_PAPER_DISABLED)
+            return []
+        thesis_block = new_entry_block_reason(self.config)
+        if thesis_block:
+            self._publish_last_decision(decision="BLOCKED", reason=thesis_block)
+            self._record_gate(gate_id="SCALP_THESIS", reason=thesis_block)
             return []
 
         open_symbols = {str(r[0]).upper() for r in conn.execute("SELECT symbol FROM scalp_paper_positions WHERE status='OPEN'")}
@@ -1189,6 +1189,10 @@ class BinanceScalpPaperEngine:
         self._last_circuit_breaker_open = bool(breaker_open)
         # Measure and store every cycle even when the breaker blocks execution.
         candidates = self._entry_candidates(conn, pre_ranked=pre_ranked)
+        thesis_block = new_entry_block_reason(self.config)
+        if thesis_block:
+            self._publish_last_decision(decision="BLOCKED", reason=thesis_block)
+            return
         if breaker_open:
             self._publish_last_decision(decision="BLOCKED", reason="SCALP_CIRCUIT_BREAKER_OPEN")
             self._record_gate(gate_id="SCALP_CIRCUIT_BREAKER", reason="SCALP_CIRCUIT_BREAKER_OPEN")
@@ -1536,7 +1540,6 @@ class BinanceScalpPaperEngine:
             logger.info("SCALP_PAPER_BUY %s setup=%s qty=%.8f price=%.4f", sym, sig.setup_name, qty, limit_buy)
             with contextlib.suppress(Exception):
                 from backend.services.binance_scalp.scalp_markout import schedule_markout
-
                 from backend.services.binance_scalp.scalp_micro_contract import feature_context_extra
                 from backend.services.microstructure_engine import compute_features
 
@@ -2460,9 +2463,8 @@ class BinanceScalpPaperEngine:
             self._publish_scan_snapshot(sym, snap, micro_regime=regime, epoch=epoch)
 
         notional = float(self.config.max_notional_paper)
-        with contextlib.suppress(Exception):
-            with self._conn() as _cash:
-                notional = min(notional, float(self._ledger(_cash)["cash_balance"]))
+        with contextlib.suppress(Exception), self._conn() as _cash:
+            notional = min(notional, float(self._ledger(_cash)["cash_balance"]))
         pre_ranked: list[dict] = []
         try:
             pre_ranked = self._router.evaluate_all(epoch=epoch, notional_usd=notional) or []
@@ -2617,16 +2619,15 @@ class BinanceScalpPaperEngine:
             time.sleep(warm_interval)
         logger.info("SCALP_WARM complete — now evaluating entries with bounded exits (net-profit / momentum-fail / setup-invalid / hard max-hold)")
         # Seed open-symbol cache so heartbeat reports held slots honestly during first tick.
-        with contextlib.suppress(Exception):
-            with self._conn() as _c:
-                rows = self._open_positions(_c)
-                self._cached_open_symbols = [str(r["symbol"]) for r in rows]
-                self._publish_api_status_snapshot(
-                    open_rows=rows,
-                    epoch=time.time(),
-                    entry_blocked_reason=("MAX_OPEN_POSITIONS" if rows and len(rows) >= int(self.config.max_open_positions) else "WARM_COMPLETE"),
-                    snapshot_source="runner_warm",
-                )
+        with contextlib.suppress(Exception), self._conn() as _c:
+            rows = self._open_positions(_c)
+            self._cached_open_symbols = [str(r["symbol"]) for r in rows]
+            self._publish_api_status_snapshot(
+                open_rows=rows,
+                epoch=time.time(),
+                entry_blocked_reason=("MAX_OPEN_POSITIONS" if rows and len(rows) >= int(self.config.max_open_positions) else "WARM_COMPLETE"),
+                snapshot_source="runner_warm",
+            )
         self._start_status_heartbeat(interval_sec=30.0)
 
         maybe_run_scalp_reject_retention(self.config.database_path)

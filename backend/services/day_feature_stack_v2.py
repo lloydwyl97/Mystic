@@ -384,10 +384,10 @@ def btc_lag_predictive_signal(btc_lag: LagCorrelationResult | None, btc_recent_r
 
 
 __all__ = [
-    "DEFAULT_MOMENTUM_HORIZONS",
-    "DEFAULT_RVOL_TFS",
     "DEFAULT_ATR_PERIODS",
+    "DEFAULT_MOMENTUM_HORIZONS",
     "DEFAULT_REALIZED_VOL_WINDOWS",
+    "DEFAULT_RVOL_TFS",
     "FeatureStackSnapshot",
     "LagCorrelationResult",
     "atr_pct_multi_period",

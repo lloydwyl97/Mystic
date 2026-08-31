@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -55,7 +56,7 @@ def safe_float(v: Any, default: float = 0.0) -> float:
         if v in (None, ""):
             return default
         x = float(v)
-        return x if x == x else default
+        return default if math.isnan(x) else x
     except (TypeError, ValueError):
         return default
 

@@ -114,7 +114,7 @@ def test_partial_below_import_min_still_tracked():
     notional = filled * px
     assert notional < 11.0
     comm = extract_live_commission({}, symbol="BTCUSDT", fill_price=px)
-    qty, fee, cash = apply_live_buy_economics(
+    qty, _fee, cash = apply_live_buy_economics(
         filled_qty=filled,
         fill_price=px,
         modeled_fee=0.0,

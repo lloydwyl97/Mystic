@@ -56,7 +56,7 @@ def test_compute_final_selection_score_prefers_adjusted_ev():
 @patch("backend.services.symbol_setup_outcome_penalty.evaluate_outcome_penalty")
 def test_xrp_loses_final_rank_to_sol_when_comparable(mock_xrp, mock_btc, mock_sol, mock_eth, mock_low_mfe):
     mock_low_mfe.return_value = {"applied": False, "rank_delta": 0.0, "ev_factor": 1.0, "size_factor": 1.0, "final_score_adjustment": 0.0, "reason": "no_low_mfe_stall"}
-    mock_xrp.side_effect = lambda sym, setup, regime, **kw: (
+    mock_xrp.side_effect = lambda sym, _setup, _regime, **_kw: (
         {
             "applied": True,
             "rank_delta": -0.38,
@@ -71,7 +71,7 @@ def test_xrp_loses_final_rank_to_sol_when_comparable(mock_xrp, mock_btc, mock_so
         else {"applied": False, "rank_delta": 0.0, "ev_factor": 1.0, "size_factor": 1.0, "final_score_adjustment": 0.0, "reason": "not_xrp"}
     )
     mock_btc.return_value = {"applied": False, "rank_delta": 0.0, "ev_factor": 1.0, "size_factor": 1.0, "final_score_adjustment": 0.0, "reason": "not_btc"}
-    mock_sol.side_effect = lambda sym, setup, regime, **kw: (
+    mock_sol.side_effect = lambda sym, _setup, _regime, **_kw: (
         {
             "applied": True,
             "rank_delta": 0.10,
@@ -115,7 +115,7 @@ def test_sol_credit_raises_final_selection_score(mock_xrp, mock_btc, mock_sol, m
     mock_low_mfe.return_value = {"applied": False, "rank_delta": 0.0, "ev_factor": 1.0, "size_factor": 1.0, "final_score_adjustment": 0.0, "reason": "no_low_mfe_stall"}
     mock_xrp.return_value = {"applied": False, "rank_delta": 0.0, "ev_factor": 1.0, "size_factor": 1.0, "final_score_adjustment": 0.0, "reason": "not_xrp"}
     mock_btc.return_value = {"applied": False, "rank_delta": 0.0, "ev_factor": 1.0, "size_factor": 1.0, "final_score_adjustment": 0.0, "reason": "not_btc"}
-    mock_sol.side_effect = lambda sym, setup, regime, **kw: (
+    mock_sol.side_effect = lambda sym, _setup, _regime, **_kw: (
         {
             "applied": True,
             "rank_delta": 0.08,

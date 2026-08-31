@@ -54,11 +54,10 @@ def test_connect_rw_with_block_closes_on_exception(tmp_path: Path) -> None:
         c.commit()
 
     captured_conn = None
-    with contextlib.suppress(RuntimeError):
-        with sqlite_runtime.connect_rw(db) as conn:
-            captured_conn = conn
-            conn.execute("INSERT INTO t (x) VALUES (1)")
-            raise RuntimeError("boom")
+    with contextlib.suppress(RuntimeError), sqlite_runtime.connect_rw(db) as conn:
+        captured_conn = conn
+        conn.execute("INSERT INTO t (x) VALUES (1)")
+        raise RuntimeError("boom")
 
     assert captured_conn is not None
     with pytest.raises(sqlite3.ProgrammingError):
@@ -112,11 +111,10 @@ def test_connect_managed_closes_and_rolls_back_on_exception(tmp_path: Path) -> N
         c.commit()
 
     captured_conn = None
-    with contextlib.suppress(RuntimeError):
-        with sqlite_runtime.connect_managed(db, timeout=5) as conn:
-            captured_conn = conn
-            conn.execute("INSERT INTO t (x) VALUES (1)")
-            raise RuntimeError("boom")
+    with contextlib.suppress(RuntimeError), sqlite_runtime.connect_managed(db, timeout=5) as conn:
+        captured_conn = conn
+        conn.execute("INSERT INTO t (x) VALUES (1)")
+        raise RuntimeError("boom")
 
     assert captured_conn is not None
     with pytest.raises(sqlite3.ProgrammingError):
@@ -153,7 +151,7 @@ def test_writer_helper_sets_busy_timeout_and_retries(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_skips_unchanged_persist(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(TradingCircuitBreaker, "_load_circuit_state", lambda self: None)
+    monkeypatch.setattr(TradingCircuitBreaker, "_load_circuit_state", lambda _self: None)
     cb = TradingCircuitBreaker()
     cb.daily_loss_freeze_active = False
     cb.equity_circuit_breaker_active = False
@@ -176,7 +174,7 @@ async def test_circuit_breaker_skips_unchanged_persist(monkeypatch: pytest.Monke
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_writes_on_state_change(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(TradingCircuitBreaker, "_load_circuit_state", lambda self: None)
+    monkeypatch.setattr(TradingCircuitBreaker, "_load_circuit_state", lambda _self: None)
     cb = TradingCircuitBreaker()
     cb.daily_loss_freeze_active = False
     cb.equity_circuit_breaker_active = False

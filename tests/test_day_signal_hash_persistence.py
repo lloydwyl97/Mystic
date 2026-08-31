@@ -165,9 +165,8 @@ async def test_db_failure_does_not_delete_redis_signal() -> None:
 async def test_ttl_exceeds_expected_publish_interval() -> None:
     fake = _FakeRedis()
     gen = _make_generator(fake)
-    with patch("backend.services.ai_signal_generator.AI_SIGNAL_REDIS_TTL_SEC", 300):
-        with patch("backend.services.ai_signal_generator.MAX_SIGNAL_AGE_SEC", 180):
-            ttl = gen._signal_redis_ttl_sec()
+    with patch("backend.services.ai_signal_generator.AI_SIGNAL_REDIS_TTL_SEC", 300), patch("backend.services.ai_signal_generator.MAX_SIGNAL_AGE_SEC", 180):
+        ttl = gen._signal_redis_ttl_sec()
     assert ttl >= 1800
     await gen._publish_degraded_day_signal_hash("day", "BTCUSDT", reason="HOLD")
     key = redis_ai_signal_key("day", "BTCUSDT")

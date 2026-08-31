@@ -28,7 +28,7 @@ async def main() -> int:
     report = await run_full_audit()
     print(json.dumps({"pass": report["pass"], "feature_version": report["feature_version"]}, indent=2))
     print("\n========== SUMMARY BY COIN ==========")
-    for sym, coin in (report.get("symbols") or {}).items():
+    for _sym, coin in (report.get("symbols") or {}).items():
         print(format_coin_summary(coin))
 
     print("\n========== SUMMARY BY BLOCK (all coins) ==========")

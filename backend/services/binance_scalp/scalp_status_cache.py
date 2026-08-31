@@ -212,7 +212,7 @@ def build_runner_api_status_payload(
         "NO_SIGNAL": "NO_SETUP",
         "WAITING": "WAITING",
     }.get(decision, "SCANNING")
-    if rs.get("operational_mode") == "max_open_positions_reached" or open_count > 0 and str(rs.get("entry_blocked_reason") or "") == "MAX_OPEN_POSITIONS":
+    if rs.get("operational_mode") == "max_open_positions_reached" or (open_count > 0 and str(rs.get("entry_blocked_reason") or "") == "MAX_OPEN_POSITIONS"):
         overall = "WAITING_FOR_EXIT"
     top_blocker = str(ld.get("reason") or rs.get("entry_blocked_reason") or "") or None
     open_syms = list(open_symbols or rs.get("open_symbols") or [])

@@ -1,0 +1,44 @@
+---
+description: After every Mystic file edit, run ruff check --fix, ruff format, and pytest
+alwaysApply: true
+---
+
+# MYSTIC LINT / FORMAT / TEST AFTER EVERY FILE CHANGE
+
+After **every** file edit, update, addition, or deletion in `/home/mystic/mystic` (Local Cursor VM), agents MUST run this exact chain from the repo root before considering the work done:
+
+```bash
+cd /home/mystic/mystic
+./venv/bin/ruff check . --fix && ./venv/bin/ruff format . && ./venv/bin/pytest
+```
+
+## When this applies
+
+- Any create, edit, or delete of a tracked or new file under the Mystic repo
+- Code, tests, config, scripts, and docs
+- Multiple files in one turn: run the chain **once at the end**, after the last edit
+- If a fix is required to make ruff or pytest pass, apply it, then **re-run the full chain**
+
+## Tools
+
+- Use the project venv binaries: `/home/mystic/mystic/venv/bin/ruff` and `/home/mystic/mystic/venv/bin/pytest`
+- Do not use a different ruff or a system pytest
+
+## Do not skip
+
+- Do not skip because the change "looks small"
+- Do not skip because only comments, docs, or config changed
+- Do not skip because ruff/pytest ran earlier in the same session
+- If the user asked for read-only research / no code changes, do **not** edit files and do **not** run `--fix` (no files were changed)
+
+## Failure handling
+
+- If `ruff check . --fix` reports remaining errors, fix them and re-run the full chain
+- If `pytest` fails, fix the failure and re-run the full chain
+- Do not declare the edit complete while the chain is red
+
+## Exceptions
+
+- User explicitly said not to lint/format/test
+- User explicitly requested read-only / no code changes
+- The only action was a git commit/push with no file content edits in that turn

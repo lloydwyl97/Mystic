@@ -52,7 +52,7 @@ def classify_outcome_label(
     if reason == "DUST_WRITEOFF":
         return "BAD", 0, "DUST"
     profitable = net_profit_usd is not None and float(net_profit_usd) > 0
-    pct_ok = net_profit_pct is not None and float(net_profit_pct) >= float(MIN_NET_PROFIT_TO_SELL)
+    net_profit_pct is not None and float(net_profit_pct) >= float(MIN_NET_PROFIT_TO_SELL)
     if reason == "AI_NET_PROFIT_SELL" or "NET_PROFIT" in reason or reason.startswith("TP"):
         if profitable:
             return "GOOD", 1, "NET_PROFIT_WIN"
@@ -578,9 +578,9 @@ def backfill_outcome_features_from_inference(db_path: str = DATABASE_PATH, *, wi
 
 
 __all__ = [
+    "backfill_outcome_features_from_inference",
     "classify_outcome_label",
     "record_outcome_training_row",
     "repair_mislabeled_profitable_ai_sells",
     "repair_missing_sell_feature_versions",
-    "backfill_outcome_features_from_inference",
 ]

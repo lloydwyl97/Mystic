@@ -13,7 +13,6 @@ from backend.services.admin_auth import require_admin_key
 from backend.services.portfolio_engine import PortfolioEngine
 from backend.utils.redis_helpers import SHARED_ATOMIC_WRITER_ROLES, WRITER_ROLES
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 

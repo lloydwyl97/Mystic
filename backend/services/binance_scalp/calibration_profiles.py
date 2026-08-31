@@ -65,7 +65,7 @@ def economics_for_config(config: ScalpConfig) -> ScalpEconomics:
     """Paper economics follow realized MFE (moderate 0.15% target) by default.
 
     Closed-trade audit: most MAX_HOLD exits never reached 0.25% MFE; the two
-    NET_PROFIT winners cleared ~0.25–0.79%. Moderate target aligns hold/exit.
+    NET_PROFIT winners cleared ~0.25-0.79%. Moderate target aligns hold/exit.
     Live path never uses calibration profiles.
     """
     base = ScalpEconomics.from_env()

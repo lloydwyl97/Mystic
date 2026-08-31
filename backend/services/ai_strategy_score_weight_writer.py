@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -77,7 +78,7 @@ def _opt(d: dict[str, Any], key: str) -> float | None:
         return None
     try:
         v = float(raw)
-        return v if v == v else None
+        return None if math.isnan(v) else v
     except (TypeError, ValueError):
         return None
 

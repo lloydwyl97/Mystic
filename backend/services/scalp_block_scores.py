@@ -41,7 +41,7 @@ def _sf(v: Any, d: float = 0.0) -> float:
 
 
 def compute_block_scores_from_sidecar(sidecar: dict[str, Any] | None) -> dict[str, float]:
-    out = {k: 0.0 for k in BLOCK_SCORE_KEYS}
+    out = dict.fromkeys(BLOCK_SCORE_KEYS, 0.0)
     if not sidecar:
         return out
     rows = list(sidecar.get("features") or [])
@@ -64,7 +64,7 @@ def compute_block_scores_from_sidecar(sidecar: dict[str, Any] | None) -> dict[st
 
 def compute_block_scores_from_intelligence(data: dict[str, Any] | None) -> dict[str, float]:
     if not data:
-        return {k: 0.0 for k in BLOCK_SCORE_KEYS}
+        return dict.fromkeys(BLOCK_SCORE_KEYS, 0.0)
     raw = data.get("feature_health_json")
     if raw:
         try:

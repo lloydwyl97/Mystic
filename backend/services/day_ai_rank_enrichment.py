@@ -124,7 +124,7 @@ def apply_intelligence_rank_delta_to_candidate(candidate: Any) -> None:
     delta = float(dd.get("intelligence_rank_delta") or 0.0)
     existing = float(dd.get("thesis_rank_delta") or 0.0)
     dd["thesis_rank_delta"] = round(existing + delta, 4)
-    setattr(candidate, "decision_data", dd)
+    candidate.decision_data = dd
 
 
 __all__ = [

@@ -220,7 +220,7 @@ def _performance_display_context() -> dict[str, Any]:
     if history_incomplete:
         note += (
             " History incomplete: retained closed-trade realized PnL does not reconcile to "
-            "lifetime account PnL (Current Equity − Principal) because older trade history "
+            "lifetime account PnL (Current Equity - Principal) because older trade history "
             "is unavailable after paper_trades prune/rotation. Do not treat visible Realized "
             "as an explanation of Total PnL vs Principal."
         )

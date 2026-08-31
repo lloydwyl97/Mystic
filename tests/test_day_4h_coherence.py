@@ -18,7 +18,6 @@ from backend.services.day_trade_thesis import (
 )
 from backend.services.portfolio_engine import get_coin_profile
 
-
 DAY_4H_MS = 4 * 3600 * 1000
 
 
@@ -45,8 +44,8 @@ def _ts(iso: str) -> float:
     return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
 
 
-def _bar(open_iso: str, o: float, h: float, l: float, c: float) -> list:
-    return [int(_ts(open_iso) * 1000), o, h, l, c, 100.0]
+def _bar(open_iso: str, o: float, h: float, low: float, c: float) -> list:
+    return [int(_ts(open_iso) * 1000), o, h, low, c, 100.0]
 
 
 def _rising_prefix(n: int, end_open_ms: int, start: float = 79000.0) -> list[list]:
@@ -69,7 +68,7 @@ def _btc_bundle(*, forming_close: float, prior_low: float = 79764.12) -> dict:
     prefix = _rising_prefix(60, prior_open)
     prior = [prior_open, 80272.15, 81439.52, prior_low, 79829.70, 100.0]
     forming = [now_open, 79834.93, 80000.0, 79570.32, forming_close, 100.0]
-    return {"4h": prefix + [prior, forming]}
+    return {"4h": [*prefix, prior, forming]}
 
 
 def _pre_buy(*, entry: float, bundle: dict, now_epoch: float | None = None) -> dict:
@@ -182,7 +181,7 @@ def test_sol1_post_entry_break_still_exits():
     prefix = _rising_prefix(60, bar0, start=100.0)
     prior = _bar("2026-08-27T20:00:00Z", 109.19, 110.54, 108.28, 109.15)
     forming = [bar0, 109.17, 110.0, 108.30, 108.56, 100.0]
-    bundle = {"4h": prefix[:-1] + [prior, forming]}
+    bundle = {"4h": [*prefix[:-1], prior, forming]}
     pos = _Pos(symbol="SOL/USDT", entry_price=108.40, highest_price=108.56, trail_pct=0.0055)
     at_entry = evaluate_engine_managed_exit(
         position=pos,
@@ -216,7 +215,7 @@ def test_sol3_new_bar_prior_low_rollover_exits():
     prefix = _rising_prefix(60, bar04, start=100.0)
     prior_00 = _bar("2026-08-28T00:00:00Z", 109.17, 110.0, 105.92, 106.82)
     forming_04 = [bar04, 106.88, 107.80, 106.30, 106.37, 100.0]
-    bundle = {"4h": prefix[:-1] + [prior_00, forming_04]}
+    bundle = {"4h": [*prefix[:-1], prior_00, forming_04]}
     assert fourh_requires_boundary_refresh(bundle["4h"], now_exit) is True
     snap = day_4h_structure_snapshot(bundle, current_price=105.06, now_epoch=now_exit)
     assert snap["prior_4h_low"] == 106.30
@@ -253,7 +252,7 @@ def test_no_lookahead_future_4h_bar():
     prior = _bar("2026-08-27T20:00:00Z", 109.19, 110.54, 108.28, 109.15)
     forming = [bar00, 109.17, 110.0, 108.30, 108.40, 100.0]
     future_bar = [future, 106.88, 107.8, 106.3, 105.00, 100.0]
-    bundle = {"4h": prefix[:-1] + [prior, forming, future_bar]}
+    bundle = {"4h": [*prefix[:-1], prior, forming, future_bar]}
     resolved = resolve_day_4h_structure_bundle(bundle, current_price=108.40, now_epoch=now)
     last_ot = resolved["4h"][-1][0]
     assert last_ot == bar00
@@ -297,7 +296,7 @@ def test_clean_window_eth_xrp_btc_already_below_prior_low_blocked():
         prefix = _rising_prefix(60, prior_ms, start=prior_low * 0.95)
         prior = [prior_ms, prior_low * 1.01, prior_low * 1.02, prior_low, prior_low * 1.005, 100.0]
         forming = [open_ms, prior_low * 0.99, prior_low * 1.001, prior_low * 0.98, mark, 100.0]
-        bundle = {"4h": prefix + [prior, forming]}
+        bundle = {"4h": [*prefix, prior, forming]}
         snap = day_4h_structure_snapshot(bundle, current_price=entry, now_epoch=now)
         assert snap["prior_4h_low"] == prior_low
         assert snap["htf_4h_rise_broken"] is True

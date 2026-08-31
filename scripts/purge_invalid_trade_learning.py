@@ -18,7 +18,6 @@ import sqlite3
 import sys
 from pathlib import Path
 
-
 DEFAULT_DB = Path(__file__).resolve().parents[1] / "mystic_trading.db"
 
 LEARNING_TABLES = (

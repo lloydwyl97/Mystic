@@ -25,6 +25,7 @@ from typing import Any
 
 # Direct imports for production
 import redis
+
 from backend.config.redis_config import get_shared_redis_sync
 from backend.services.redis_service import get_redis_service
 

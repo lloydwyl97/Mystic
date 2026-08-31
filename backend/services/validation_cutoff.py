@@ -212,9 +212,7 @@ def is_strategy_acceptance_eligible(
     if acceptance in RECONCILIATION_EXIT_REASONS or acceptance == "RECONCILIATION":
         return False
     tid = str(trade_id or extra.get("trade_id") or "").strip()
-    if tid in RECONCILIATION_TRADE_IDS:
-        return False
-    return True
+    return tid not in RECONCILIATION_TRADE_IDS
 
 
 def mark_reconciliation_manual_exit(

@@ -40,8 +40,9 @@ except (ImportError, ModuleNotFoundError, AttributeError):
 
 # Optional Redis (sync client for atomic counters)
 try:
-    from backend.config.redis_config import get_redis_client
     from redis import Redis  # type: ignore[import-not-found]
+
+    from backend.config.redis_config import get_redis_client
 except (ImportError, ModuleNotFoundError, AttributeError):
     redis = None  # type: ignore[assignment]
     Redis = None  # type: ignore[assignment]

@@ -79,7 +79,7 @@ def test_mfe_uses_winners_only(db_path):
 
 
 def test_mae_uses_losers_only(db_path):
-    for i in range(6):
+    for _i in range(6):
         _insert(db_path, symbol="SOLUSDT", strategy="scalp", pnl_pct=1.0, mfe_pct=0.02, mae_pct=0.5)  # winner MAE must not leak in
     for i in range(6):
         _insert(db_path, symbol="SOLUSDT", strategy="scalp", pnl_pct=-1.0, mfe_pct=0.001, mae_pct=0.01 + i * 0.001)
@@ -102,7 +102,7 @@ def test_cascade_falls_back_when_bucket_too_specific(db_path):
 def test_cross_symbol_fallback_when_symbol_itself_thin(db_path):
     for i in range(6):
         _insert(db_path, symbol="BTCUSDT", strategy="day", pnl_pct=1.0, mfe_pct=0.01 + i * 0.001, mae_pct=0.001)
-    for i in range(2):
+    for _i in range(2):
         _insert(db_path, symbol="ETHUSDT", strategy="day", pnl_pct=1.0, mfe_pct=0.03, mae_pct=0.001)
     result = dist.get_mfe_distribution("ETHUSDT", "day", db_path=db_path)
     assert result.stratum_used == "strategy_cross_symbol"

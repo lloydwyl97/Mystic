@@ -12,8 +12,9 @@ full-flatten exits. No market-order fallback. No unlimited slippage.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from backend.config.protected_execution import (
     MANDATORY_EXIT_MAX_IMPACT_PCT,
@@ -31,7 +32,8 @@ logger = logging.getLogger(__name__)
 
 STATUS_EXIT_RESIDUAL_PENDING = "EXIT_RESIDUAL_PENDING"
 
-MANDATORY_FLATTEN_PREFIXES: tuple[str, ...] = ENGINE_RISK_EXIT_PREFIXES + (
+MANDATORY_FLATTEN_PREFIXES: tuple[str, ...] = (
+    *ENGINE_RISK_EXIT_PREFIXES,
     EXIT_TRAILING_STOP,
     EXIT_DAY_4H_STRUCTURE_BREAK,
     EXIT_DAY_RISK_FLOOR,
@@ -71,9 +73,7 @@ def is_mandatory_day_flatten(
         return False
     if any(trig.startswith(str(p).upper()) for p in MANDATORY_FLATTEN_PREFIXES):
         return True
-    if force_sell and et == "MANUAL":
-        return True
-    return False
+    return bool(force_sell and et == "MANUAL")
 
 
 def is_exit_residual_pending(position: Any) -> bool:
@@ -100,9 +100,7 @@ def is_meaningful_residual(
         return False
     if min_qty > 0 and stepped + 1e-15 < min_qty:
         return False
-    if min_notional > 0 and stepped * px + 1e-15 < min_notional:
-        return False
-    return True
+    return not (min_notional > 0 and stepped * px + 1e-15 < min_notional)
 
 
 def mark_exit_residual_pending(position: Any, reason: str) -> None:
@@ -121,8 +119,7 @@ def clear_exit_residual_pending(position: Any) -> None:
 
 
 def impact_for_attempt(attempt_index: int) -> float:
-    if attempt_index < 0:
-        attempt_index = 0
+    attempt_index = max(attempt_index, 0)
     if attempt_index >= len(MANDATORY_IMPACT_LADDER):
         return float(MANDATORY_IMPACT_LADDER[-1])
     return float(MANDATORY_IMPACT_LADDER[attempt_index])

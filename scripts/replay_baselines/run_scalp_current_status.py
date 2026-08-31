@@ -23,9 +23,9 @@ from backend.services.binance_scalp.market_reader import ScalpMarketReader
 from backend.services.binance_scalp.momentum_tracker import MomentumTracker
 from backend.services.binance_scalp.orderbook_book import walk_buy_notional
 from backend.services.binance_scalp.schema import SCALP_TABLES, verify_scalp_tables
+from backend.services.binance_scalp.status_snapshot import build_scalp_status
 from backend.services.binance_scalp.strategies import STRATEGY_NAMES, enabled_strategies
 from backend.services.binance_scalp.strategies.kline_cache import KlineCache
-from backend.services.binance_scalp.status_snapshot import build_scalp_status
 
 SCRIPT = "scripts/replay_baselines/run_scalp_current_status.py"
 OUT = REPO / "scripts" / "replay_baselines" / "scalp_current_status_latest.json"

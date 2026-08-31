@@ -48,7 +48,7 @@ def test_fallback_to_age_when_no_ts():
         "ctx_ts_utc": now_iso,
         "feature_version": "1",
     }
-    ok, reason, detail = evaluate_signal_hash_for_entry(dd)
+    ok, reason, _detail = evaluate_signal_hash_for_entry(dd)
     # age 10s is well under max; must not fail closed on timestamp missing/parse
     assert reason not in ("SIGNAL_CONTENT_TIMESTAMP_MISSING", "SIGNAL_CONTENT_TIMESTAMP_PARSE")
     assert ok is True
@@ -65,21 +65,21 @@ def test_fallback_to_zero_content_age_when_no_ts():
         "ctx_ts_utc": now_iso,
         "feature_version": "1",
     }
-    ok, reason, detail = evaluate_signal_hash_for_entry(dd)
+    ok, reason, _detail = evaluate_signal_hash_for_entry(dd)
     assert reason != "SIGNAL_CONTENT_TIMESTAMP_MISSING"
     assert ok is True
 
 
 def test_missing_ts_gives_missing():
     dd = {"content_fresh": "1"}  # no timestamp and no usable age
-    ok, reason, detail = evaluate_signal_hash_for_entry(dd)
+    ok, reason, _detail = evaluate_signal_hash_for_entry(dd)
     assert ok is False
-    assert reason == "SIGNAL_CONTENT_TIMESTAMP_MISSING" or reason == "SIGNAL_CONTENT_TIMESTAMP_PARSE"
+    assert reason in {"SIGNAL_CONTENT_TIMESTAMP_MISSING", "SIGNAL_CONTENT_TIMESTAMP_PARSE"}
 
 
 def test_malformed_ts_gives_parse():
     dd = {"timestamp": "not-a-time", "content_fresh": "1"}
-    ok, reason, detail = evaluate_signal_hash_for_entry(dd)
+    ok, reason, _detail = evaluate_signal_hash_for_entry(dd)
     assert ok is False
     assert reason in ("SIGNAL_CONTENT_TIMESTAMP_PARSE", "SIGNAL_CONTENT_TIMESTAMP_MISSING")
 
@@ -88,7 +88,7 @@ def test_real_stale_still_rejected():
     # very old epoch
     old = str(time.time() - 100000)
     dd = {"timestamp": old, "content_fresh": "1", "signal_content_stale": "0"}
-    ok, reason, detail = evaluate_signal_hash_for_entry(dd)
+    ok, reason, _detail = evaluate_signal_hash_for_entry(dd)
     # Should hit AGE_EXCEEDED (or STALE if flag), not let it pass
     assert ok is False
     assert reason in ("SIGNAL_CONTENT_AGE_EXCEEDED", "SIGNAL_CONTENT_STALE")

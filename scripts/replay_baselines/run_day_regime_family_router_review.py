@@ -139,7 +139,7 @@ def _simple_vwap_signal(bars: list[dict], regime: str) -> dict | None:
     lows = [b["l"] for b in bars[-30:]]
     c = closes[-1]
     ema20 = sum(closes[-20:]) / 20.0
-    recent_low = min(lows[-8:])  # noqa: F841 - used below for reclaim proxy
+    recent_low = min(lows[-8:])
     adx_proxy = abs(closes[-1] - closes[-8]) / (max(c, 1e-9)) * 100  # rough
     if c < ema20 * 1.002 and c > recent_low * 0.995 and adx_proxy < 2.8:
         # target ~0.6-0.9% after fees, stop ~0.8%
@@ -153,7 +153,7 @@ def _classify_regime_for_bar(bars: list[dict]) -> str:
         return DAY_REGIME_NEUTRAL
     closes = [b["c"] for b in bars]
     highs = [b["h"] for b in bars]
-    lows = [b["l"] for b in bars]
+    [b["l"] for b in bars]
     # crude regime
     ema21 = sum(closes[-21:]) / 21
     ema55 = sum(closes[-55:]) / 55 if len(closes) >= 55 else ema21
@@ -238,7 +238,7 @@ def _run_sleeve_backtest(
                 prev = bhist[-2] if len(bhist) > 1 else cur
                 s = aw_sig(prev, cur)
                 if s:
-                    setup, tgt_a, stp_a = s
+                    _setup, tgt_a, stp_a = s
                     atr = max(1e-9, (cur["h"] - cur["l"]))
                     tgt = cur["c"] * (1 + tgt_a * (atr / cur["c"]))
                     stp = cur["c"] * (1 - stp_a * (atr / cur["c"]))
@@ -407,7 +407,7 @@ def main() -> int:
     start = time.time()
 
     # Load or fetch bars for several windows using existing cache helpers
-    end = datetime.now(timezone.utc)
+    datetime.now(timezone.utc)
     bars_by_sym: dict[str, list[dict]] = {}
     for sym_api, sym in [("BTCUSDT", "BTC/USDT"), ("ETHUSDT", "ETH/USDT"), ("SOLUSDT", "SOL/USDT"), ("XRPUSDT", "XRP/USDT")]:
         try:
@@ -451,7 +451,7 @@ def main() -> int:
     # Run the 4 scenarios on a few representative windows (use full cache available)
     for scenario in SCENARIOS:
         scen_trades: list[PaperTrade] = []
-        for w in [30, 90, 180]:
+        for _w in [30, 90, 180]:
             maxs = MAX_SLOTS_BASE
             if scenario == "aw_trend_sleeve_alone":
                 trades = _run_sleeve_backtest(bars_by_sym, SLEEVE_TREND, maxs, PRINCIPAL)
@@ -473,7 +473,7 @@ def main() -> int:
                 uniq.append(t)
 
         mets = _compute_metrics(uniq, PRINCIPAL, 180)
-        res = ScenarioResult(name=scenario, trades=uniq[:200], metrics=mets)
+        ScenarioResult(name=scenario, trades=uniq[:200], metrics=mets)
         results["scenarios"][scenario] = {
             "metrics": mets,
             "sample_trades": len(uniq),

@@ -51,7 +51,7 @@ def _corr(xs: np.ndarray, ys: np.ndarray) -> float | None:
 
 
 def _econ(realized: np.ndarray) -> dict[str, Any]:
-    n = int(len(realized))
+    n = len(realized)
     if n == 0:
         return {"n": 0, "wr": None, "net": 0.0, "expectancy": None, "pf": None}
     wins = realized[realized > 0]
@@ -78,10 +78,10 @@ def _quartile(pred: np.ndarray, realized: np.ndarray) -> dict[str, Any] | None:
     bot, top = realized[order[:q]], realized[order[-q:]]
     bot_d, top_d = realized[order[:d]], realized[order[-d:]]
     return {
-        "bottom_quartile": {"n": int(len(bot)), "mean": round(float(bot.mean()), 6), "wr": round(float((bot > 0).mean()), 4)},
-        "top_quartile": {"n": int(len(top)), "mean": round(float(top.mean()), 6), "wr": round(float((top > 0).mean()), 4)},
-        "bottom_decile": {"n": int(len(bot_d)), "mean": round(float(bot_d.mean()), 6)},
-        "top_decile": {"n": int(len(top_d)), "mean": round(float(top_d.mean()), 6)},
+        "bottom_quartile": {"n": len(bot), "mean": round(float(bot.mean()), 6), "wr": round(float((bot > 0).mean()), 4)},
+        "top_quartile": {"n": len(top), "mean": round(float(top.mean()), 6), "wr": round(float((top > 0).mean()), 4)},
+        "bottom_decile": {"n": len(bot_d), "mean": round(float(bot_d.mean()), 6)},
+        "top_decile": {"n": len(top_d), "mean": round(float(top_d.mean()), 6)},
         "top_minus_bottom_q": round(float(top.mean() - bot.mean()), 6),
     }
 
@@ -264,7 +264,7 @@ def eval_target(train, valid, test, names, horizon, target) -> dict[str, Any]:
         models["gradient_boosting"] = {"corr": _corr(gb, y_te), "quartiles": _quartile(gb, y_te)}
     # policy uses linear predicted target as BUY EV vs HOLD=0
     policy_rows = []
-    for r, p in zip(test, lin):
+    for r, _p in zip(test, lin, strict=False):
         item = dict(r)
         item["path"] = {target: r["path"][horizon].get("target_d_net" if target == "target_d_net" else "terminal_net")}
         policy_rows.append(item)
@@ -422,7 +422,17 @@ def run(args) -> dict[str, Any]:
     for h, block in comparisons.items():
         for tname, ev in block.items():
             ok, reason = accept(ev)
-            candidates.append({"horizon": h, "target": tname, "accepted": ok, "reason": reason, "corr": ev["models"]["linear"]["corr"], "buys": ev["policy_linear_vs_hold"]["buy_count"], "expectancy": ev["policy_linear_vs_hold"]["econ"]["expectancy"]})
+            candidates.append(
+                {
+                    "horizon": h,
+                    "target": tname,
+                    "accepted": ok,
+                    "reason": reason,
+                    "corr": ev["models"]["linear"]["corr"],
+                    "buys": ev["policy_linear_vs_hold"]["buy_count"],
+                    "expectancy": ev["policy_linear_vs_hold"]["econ"]["expectancy"],
+                }
+            )
     report["acceptance_candidates"] = candidates
     accepted = [c for c in candidates if c["accepted"]]
     report["model_accepted"] = bool(accepted)

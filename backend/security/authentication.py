@@ -30,12 +30,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import jwt
+from redis import Redis  # type: ignore[import-not-found]
 
 from backend.config import settings
 
 # Direct imports for production
 from backend.config.redis_config import get_redis_client
-from redis import Redis  # type: ignore[import-not-found]
 
 logger = logging.getLogger(__name__)
 

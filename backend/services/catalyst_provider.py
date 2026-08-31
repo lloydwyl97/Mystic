@@ -188,7 +188,7 @@ class NewsDataIoCatalystProvider(CatalystProvider):
 
     Daily limit management (free plan = 200 calls/day):
       - Cache TTL: 3600s (1h) per symbol
-      - 4 coins × 24 refreshes/day = 96 calls/day — safely within limit
+      - 4 coins x 24 refreshes/day = 96 calls/day — safely within limit
       - Override via NEWSDATA_CACHE_TTL_SEC
       - Graceful 429 backoff with 1h rate-limit guard using stale cache
 
@@ -411,20 +411,22 @@ class NewsDataIoCatalystProvider(CatalystProvider):
                 "language": "en",
                 "timezone": "America/Chicago",
             }
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get(
+            async with (
+                aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session,
+                session.get(
                     "https://newsdata.io/api/1/crypto",
                     params=params,
                     headers={"User-Agent": "Mystic/1.0"},
-                ) as resp:
-                    if resp.status == 429:
-                        NewsDataIoCatalystProvider._RATE_LIMITED_UNTIL = time.time() + 3600
-                        logger.warning("NEWSDATA_IO rate limited — backoff 1h, sym=%s", sym)
-                        return None
-                    if resp.status != 200:
-                        logger.debug("NEWSDATA_IO %s HTTP %s", sym, resp.status)
-                        return None
-                    data = await resp.json()
+                ) as resp,
+            ):
+                if resp.status == 429:
+                    NewsDataIoCatalystProvider._RATE_LIMITED_UNTIL = time.time() + 3600
+                    logger.warning("NEWSDATA_IO rate limited — backoff 1h, sym=%s", sym)
+                    return None
+                if resp.status != 200:
+                    logger.debug("NEWSDATA_IO %s HTTP %s", sym, resp.status)
+                    return None
+                data = await resp.json()
 
             all_articles: list[dict] = data.get("results", []) or []
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -51,7 +52,7 @@ def _num(value: Any) -> float | None:
         out = float(value)
     except (TypeError, ValueError):
         return None
-    if out != out:  # NaN
+    if math.isnan(out):
         return None
     return out
 
@@ -160,12 +161,8 @@ def snapshot_book(symbol: str, redis_client: Any = None) -> dict[str, Any]:
     if book["imbalance_top5"] is None:
         book["imbalance_top5"] = _num(ob.get("order_book_imbalance"))
     book["ofi_5s"] = _num(micro.get("ofi_5s") if micro.get("ofi_5s") not in (None, "") else ob.get("ofi_5s"))
-    book["agg_flow_imbalance_5s"] = _num(
-        micro.get("agg_flow_imbalance_5s") if micro.get("agg_flow_imbalance_5s") not in (None, "") else ob.get("agg_flow_imbalance_5s")
-    )
-    book["microprice_pressure"] = _num(
-        micro.get("microprice_pressure") if micro.get("microprice_pressure") not in (None, "") else ob.get("microprice_pressure")
-    )
+    book["agg_flow_imbalance_5s"] = _num(micro.get("agg_flow_imbalance_5s") if micro.get("agg_flow_imbalance_5s") not in (None, "") else ob.get("agg_flow_imbalance_5s"))
+    book["microprice_pressure"] = _num(micro.get("microprice_pressure") if micro.get("microprice_pressure") not in (None, "") else ob.get("microprice_pressure"))
     if book["book_source"] == "missing" and (book["ofi_5s"] is not None or book["microprice_pressure"] is not None):
         book["book_source"] = "redis_microstructure"
     return book
@@ -233,10 +230,7 @@ def record_rows(rows: list[dict[str, Any]], *, force: bool = False) -> int:
         if not rows:
             return 0
         engine = str(rows[0].get("engine") or "")
-        any_buy = any(
-            str(r.get("selected_action") or "").upper().startswith("BUY") or ((_num(r.get("buy_ev")) or 0.0) > HOLD_EV)
-            for r in rows
-        )
+        any_buy = any(str(r.get("selected_action") or "").upper().startswith("BUY") or ((_num(r.get("buy_ev")) or 0.0) > HOLD_EV) for r in rows)
         if not _should_write(engine, force or any_buy):
             return 0
         _ensure_table()
@@ -325,12 +319,24 @@ def record_day_bar_authority(decision: dict[str, Any], *, redis_client: Any = No
             ("XRPUSDT", dec.get("xrp_path_ev")),
             ("HOLD", hold_ev),
         ):
-            book = snapshot_book(sym, redis_client) if sym != "HOLD" else {
-                "best_bid": None, "best_ask": None, "mid": None, "spread_pct": None,
-                "bid_qty_top5": None, "ask_qty_top5": None, "imbalance_top5": None,
-                "ofi_5s": None, "agg_flow_imbalance_5s": None, "microprice_pressure": None,
-                "book_source": "hold", "book_age_sec": None,
-            }
+            book = (
+                snapshot_book(sym, redis_client)
+                if sym != "HOLD"
+                else {
+                    "best_bid": None,
+                    "best_ask": None,
+                    "mid": None,
+                    "spread_pct": None,
+                    "bid_qty_top5": None,
+                    "ask_qty_top5": None,
+                    "imbalance_top5": None,
+                    "ofi_5s": None,
+                    "agg_flow_imbalance_5s": None,
+                    "microprice_pressure": None,
+                    "book_source": "hold",
+                    "book_age_sec": None,
+                }
+            )
             action = selected if (sym == winner or (sym == "HOLD" and selected == "HOLD")) else "HOLD"
             rows.append(
                 {

@@ -5,6 +5,8 @@ from __future__ import annotations
 import inspect
 from types import SimpleNamespace
 
+import pytest
+
 from backend.services.binance_scalp.exit_manager import (
     DECISION_SELL,
     EXIT_PATH_MAX_ADVERSE_STOP,
@@ -17,8 +19,6 @@ from backend.services.binance_scalp.scalp_candidate_ranking import (
     pick_best_global_candidate,
 )
 from backend.services.binance_scalp.scalp_dynamic_sizing import compute_scalp_position_size
-import pytest
-
 from backend.services.scalp_ai_rank_enrichment import INTELLIGENCE_DELTA_CAP
 
 
@@ -26,7 +26,7 @@ from backend.services.scalp_ai_rank_enrichment import INTELLIGENCE_DELTA_CAP
 def _cost_based_ev_fallback(monkeypatch):
     import backend.services.binance_scalp.forward_net_predictor as fnp
 
-    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda row: None)
+    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda _row: None)
 
 
 def test_exit_runs_before_ranking_in_tick():
@@ -49,6 +49,7 @@ def test_adverse_stop_threshold_unchanged():
 def test_adverse_stop_fires_without_review_phase():
     from backend.services.binance_scalp.config import get_scalp_config
     from backend.services.binance_scalp.economics import ScalpEconomics
+
     track = PositionTrack(
         entry_price=100.0,
         state="OPEN",

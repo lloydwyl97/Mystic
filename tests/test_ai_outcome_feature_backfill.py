@@ -96,7 +96,7 @@ def test_outcome_xy_filter_accepts_backfilled_rows():
             "rank_snapshot_id": None,
         }
     ]
-    X, y, syms, w_mult = _outcome_rows_to_xy_for_strategy(outcome_rows, "day", 145)
+    X, _y, syms, w_mult = _outcome_rows_to_xy_for_strategy(outcome_rows, "day", 145)
     assert len(X) == 1
     assert len(w_mult) == 1
-    assert syms == ["ETHUSDT"] or syms == ["ETH/USDT"]
+    assert syms in (["ETHUSDT"], ["ETH/USDT"])

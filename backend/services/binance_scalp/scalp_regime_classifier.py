@@ -191,7 +191,7 @@ def regime_at_ts(regime_index: dict[int, str], epoch: int) -> str:
 
 def summarize_regime_coverage(bars_1h: list[dict]) -> dict[str, Any]:
     """Hours/days per regime for one symbol series."""
-    counts: dict[str, int] = {r: 0 for r in ALL_SCALP_REGIMES}
+    counts: dict[str, int] = dict.fromkeys(ALL_SCALP_REGIMES, 0)
     for i in range(len(bars_1h)):
         st = classify_scalp_regime(bars_1h, i)
         if st:

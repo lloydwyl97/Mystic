@@ -6,13 +6,13 @@ import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from backend.services.binance_scalp.strategies.range_bounce_scalp import RangeBounceScalpStrategy
-from backend.services.binance_scalp.strategies.base import StrategyMarketContext
 from backend.services.binance_scalp.config import get_scalp_config
 from backend.services.binance_scalp.scalp_strategy_router import (
     ScalpStrategyRouter,
     _mtf_confirmation_gate_enabled,
 )
+from backend.services.binance_scalp.strategies.base import StrategyMarketContext
+from backend.services.binance_scalp.strategies.range_bounce_scalp import RangeBounceScalpStrategy
 
 
 class _PermissiveEcon:

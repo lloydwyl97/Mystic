@@ -97,4 +97,4 @@ def compute_paper_proof(db_path: str | Path) -> dict[str, Any]:
     }
 
 
-__all__ = ["compute_paper_proof", "MIN_CLOSED_SELLS", "MIN_NET_PNL_USD"]
+__all__ = ["MIN_CLOSED_SELLS", "MIN_NET_PNL_USD", "compute_paper_proof"]

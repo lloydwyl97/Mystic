@@ -1129,9 +1129,7 @@ class RealTimeAISignalGenerator:
                         if len(_closes) >= 6:
                             _dc = _closes[-1] - _closes[-6]
                             _dv = (sum(_vols[-5:]) / 5.0) - (sum(_vols[-11:-5]) / 6.0)
-                            if _dc > 0 and _dv < 0:
-                                recent_vp_divergence = -min(1.0, abs(_dv) / max(_p20m, 1e-9))
-                            elif _dc < 0 and _dv > 0:
+                            if (_dc > 0 and _dv < 0) or (_dc < 0 and _dv > 0):
                                 recent_vp_divergence = -min(1.0, abs(_dv) / max(_p20m, 1e-9))
                             elif _dc > 0 and _dv > 0:
                                 recent_vp_divergence = min(1.0, _dv / max(_p20m, 1e-9))
@@ -1160,6 +1158,8 @@ class RealTimeAISignalGenerator:
             try:
                 from backend.services.day_candlestick_patterns import (
                     detect_patterns as _detect_cs_patterns,
+                )
+                from backend.services.day_candlestick_patterns import (
                     net_bearish_pattern_score as _cs_net_bias,
                 )
 
@@ -2441,7 +2441,7 @@ class RealTimeAISignalGenerator:
                         float(ctx_multiplier),
                         json.dumps(ctx_audit, separators=(",", ":")),
                         int(feature_version),
-                        int(len(features)) if features else (145 if int(feature_version) >= 2 else 124),
+                        len(features) if features else (145 if int(feature_version) >= 2 else 124),
                         feats_json,
                         self.model_artifact_paths.get(model_slot, "unknown"),
                         str(self.model_label_versions.get(model_slot, "")),

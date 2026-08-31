@@ -22,10 +22,9 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from backend.services.admin_auth import require_admin_key
-
 from backend.config.trading_universe import TRADING_SYMBOLS
 from backend.database_schema import DATABASE_PATH
+from backend.services.admin_auth import require_admin_key
 from backend.services.portfolio_engine import (
     MAX_TOTAL_OPEN_RISK_PCT,
     compute_position_risk_usd,
@@ -2156,10 +2155,7 @@ async def get_operator_status() -> dict[str, Any]:
             ledger_equity = float(sqlite_data.get("cash_balance") or 0) + float(sqlite_data.get("positions_value") or 0)
             principal = float(sqlite_data.get("principal") or 0)
             if account_failsafe_tripped(ledger_equity, principal):
-                reason = (
-                    f"ACCOUNT_FAILSAFE equity=${ledger_equity:.2f} principal=${principal:.2f} "
-                    "— MANUAL POSITION REVIEW REQUIRED"
-                )
+                reason = f"ACCOUNT_FAILSAFE equity=${ledger_equity:.2f} principal=${principal:.2f} — MANUAL POSITION REVIEW REQUIRED"
                 status["kill_switch"] = "PAUSE_BUYS"
                 status["kill_switch_reason"] = reason
                 status["failsafe_active"] = True

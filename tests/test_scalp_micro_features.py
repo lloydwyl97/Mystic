@@ -126,8 +126,26 @@ def test_executable_markout_long_uses_bid_not_mid_fantasy():
 
 
 def test_multi_horizon_ev_responds_to_ofi():
-    bull = {"ofi_5s": 8.0, "agg_flow_imbalance_5s": 0.8, "microprice_pressure": 0.0004, "obi_l5": 0.6, "bid_absorption_score": 0.4, "ask_absorption_score": 0.0, "adverse_selection_score": 0.05, "spread_pct": 0.0001}
-    bear = {"ofi_5s": -8.0, "agg_flow_imbalance_5s": -0.8, "microprice_pressure": -0.0004, "obi_l5": -0.6, "bid_absorption_score": 0.0, "ask_absorption_score": 0.4, "adverse_selection_score": 0.7, "spread_pct": 0.0004}
+    bull = {
+        "ofi_5s": 8.0,
+        "agg_flow_imbalance_5s": 0.8,
+        "microprice_pressure": 0.0004,
+        "obi_l5": 0.6,
+        "bid_absorption_score": 0.4,
+        "ask_absorption_score": 0.0,
+        "adverse_selection_score": 0.05,
+        "spread_pct": 0.0001,
+    }
+    bear = {
+        "ofi_5s": -8.0,
+        "agg_flow_imbalance_5s": -0.8,
+        "microprice_pressure": -0.0004,
+        "obi_l5": -0.6,
+        "bid_absorption_score": 0.0,
+        "ask_absorption_score": 0.4,
+        "adverse_selection_score": 0.7,
+        "spread_pct": 0.0004,
+    }
     assert heuristic_horizon_ev(bull, 10) > heuristic_horizon_ev(bear, 10)
     ev = multi_horizon_ev(bull)
     assert ev["EV_5s"] != ev["EV_1s"]

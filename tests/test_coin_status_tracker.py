@@ -78,9 +78,7 @@ def test_coin_status_book_falls_back_to_sqlite_positions(tmp_path):
         )
         """
     )
-    con.execute(
-        "INSERT INTO portfolio_engine_positions VALUES ('XRP/USDT', 10.0, 1.30, 1.40, 1.28)"
-    )
+    con.execute("INSERT INTO portfolio_engine_positions VALUES ('XRP/USDT', 10.0, 1.30, 1.40, 1.28)")
     con.commit()
     con.close()
     eng = PortfolioEngine(db_path=db, principal=10000.0, test_mode=True)

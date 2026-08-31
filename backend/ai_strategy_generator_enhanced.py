@@ -11,9 +11,9 @@ from typing import Any
 
 import anyio
 import pandas as pd
+import redis
 from openai import OpenAI
 
-import redis
 from backend.config.redis_config import get_shared_redis_sync
 
 # Import from single source of truth

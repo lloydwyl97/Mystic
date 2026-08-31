@@ -22,15 +22,15 @@ from backend.services.day_controlled_exits import apply_break_even_and_mfe_trail
 
 
 def _position(**overrides) -> SimpleNamespace:
-    base = dict(
-        symbol="BTC/USDT",
-        entry_price=100.0,
-        highest_price=101.5,  # 1.5% MFE -> clears both tiers
-        stop_price=99.0,
-        trailing_stop_price=0.0,
-        entry_thesis="HTF_TREND_PULLBACK",
-        day_route_regime_at_entry="bull",
-    )
+    base = {
+        "symbol": "BTC/USDT",
+        "entry_price": 100.0,
+        "highest_price": 101.5,  # 1.5% MFE -> clears both tiers
+        "stop_price": 99.0,
+        "trailing_stop_price": 0.0,
+        "entry_thesis": "HTF_TREND_PULLBACK",
+        "day_route_regime_at_entry": "bull",
+    }
     base.update(overrides)
     return SimpleNamespace(**base)
 

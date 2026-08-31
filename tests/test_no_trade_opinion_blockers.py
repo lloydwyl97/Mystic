@@ -28,11 +28,11 @@ def _isolate_trade_state_from_runtime(monkeypatch):
     isolation they inherit ``trade_state:{SYMBOL}`` from the paper runtime
     (or an earlier pytest notify_exit) and fail for the wrong reason.
     """
-    import backend.services.trade_state as trade_state
+    from backend.services import trade_state
 
     isolated = trade_state.TradeStateStore(redis_client=None)
     monkeypatch.setattr(trade_state, "_store_instance", isolated)
-    monkeypatch.setattr(trade_state, "get_trade_state_store", lambda redis_client=None: isolated)
+    monkeypatch.setattr(trade_state, "get_trade_state_store", lambda _redis_client=None: isolated)
     return isolated
 
 
@@ -113,9 +113,7 @@ async def test_genuine_safety_blocks_still_enforced():
 
 
 @pytest.mark.asyncio
-async def test_trade_state_cooldown_is_execution_safety_not_opinion(
-    _isolate_trade_state_from_runtime, monkeypatch
-):
+async def test_trade_state_cooldown_is_execution_safety_not_opinion(_isolate_trade_state_from_runtime, monkeypatch):
     """TradeState COOLDOWN is permitted execution safety, not a quality-filter opinion gate.
 
     Seeded only on the isolated in-memory store (no Redis). Production still
@@ -138,7 +136,7 @@ async def test_trade_state_cooldown_is_execution_safety_not_opinion(
 @pytest.mark.asyncio
 async def test_portfolio_trade_state_exception_fails_open(monkeypatch):
     import backend.services.portfolio_engine as pe
-    import backend.services.trade_state as trade_state
+    from backend.services import trade_state
 
     class _BrokenStore:
         async def allow_new_entry_async(self, *_args, **_kwargs):
@@ -146,7 +144,7 @@ async def test_portfolio_trade_state_exception_fails_open(monkeypatch):
 
     monkeypatch.setattr(pe, "ENABLE_TRADE_STATE_ENTRY_BLOCKING", True)
     monkeypatch.setattr(pe, "ENABLE_GOVERNANCE_ENFORCEMENT", False)
-    monkeypatch.setattr(trade_state, "get_trade_state_store", lambda: _BrokenStore())
+    monkeypatch.setattr(trade_state, "get_trade_state_store", _BrokenStore)
 
     allowed, reason = await _base_engine()._can_open_position("BTC/USDT", 100.0)
 

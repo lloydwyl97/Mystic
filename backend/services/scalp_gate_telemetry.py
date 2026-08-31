@@ -75,9 +75,7 @@ def ensure_scalp_gate_schema(db_path: str | Path) -> None:
         return
     conn = sqlite3.connect(path, timeout=2)
     try:
-        exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scalp_gate_counters'"
-        ).fetchone()
+        exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='scalp_gate_counters'").fetchone()
         if exists:
             _SCHEMA_READY.add(path)
             return

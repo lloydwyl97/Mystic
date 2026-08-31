@@ -41,7 +41,7 @@ from backend.database_schema import DATABASE_PATH
 MIN_OBS: int = int(os.getenv("MFE_MAE_DIST_MIN_OBS", "8"))
 LOOKBACK_DAYS: int = int(os.getenv("MFE_MAE_DIST_LOOKBACK_DAYS", "45"))
 _CACHE_TTL_SEC: float = 120.0
-_cache: dict[str, tuple[float, "DistributionResult"]] = {}
+_cache: dict[str, tuple[float, DistributionResult]] = {}
 
 _PERCENTILES: tuple[float, ...] = (0.10, 0.25, 0.50, 0.60, 0.75, 0.80, 0.90)
 

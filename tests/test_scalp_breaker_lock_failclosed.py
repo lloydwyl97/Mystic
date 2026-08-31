@@ -19,9 +19,7 @@ def test_local_five_losses_trip(tmp_path: Path):
     assert engine._last_breaker_reason == "CONSECUTIVE_LOSSES_COOLDOWN"
     assert engine._last_breaker_recovery_until
     with sqlite3.connect(db) as conn:
-        tripped, until = conn.execute(
-            "SELECT consec_breaker_tripped_at, consec_breaker_recovery_until FROM scalp_meta WHERE id=1"
-        ).fetchone()
+        tripped, until = conn.execute("SELECT consec_breaker_tripped_at, consec_breaker_recovery_until FROM scalp_meta WHERE id=1").fetchone()
     assert tripped
     assert until
 
@@ -34,9 +32,7 @@ def test_ocean_ten_losses_trip(tmp_path: Path):
     assert open_ is True
     assert engine._last_breaker_reason == "CONSECUTIVE_LOSSES_COOLDOWN"
     with sqlite3.connect(db) as conn:
-        tripped, until = conn.execute(
-            "SELECT consec_breaker_tripped_at, consec_breaker_recovery_until FROM scalp_meta WHERE id=1"
-        ).fetchone()
+        tripped, until = conn.execute("SELECT consec_breaker_tripped_at, consec_breaker_recovery_until FROM scalp_meta WHERE id=1").fetchone()
     assert tripped
     assert until
 
@@ -60,7 +56,7 @@ def test_read_lock_fail_closed_then_recovers(tmp_path: Path, monkeypatch):
         breaker_recovery_sec=14400,
         database_path=str(db),
     )
-    engine._ledger = lambda conn: {"principal": 1000.0}
+    engine._ledger = lambda _conn: {"principal": 1000.0}
     engine._utcnow_override = now
     engine._last_breaker_reason = ""
     engine._last_breaker_recovery_until = ""
@@ -99,7 +95,7 @@ def test_write_lock_fail_closed_then_persists(tmp_path: Path, monkeypatch):
         breaker_recovery_sec=14400,
         database_path=str(db),
     )
-    engine._ledger = lambda conn: {"principal": 1000.0}
+    engine._ledger = lambda _conn: {"principal": 1000.0}
     engine._utcnow_override = now
     engine._last_breaker_reason = ""
     engine._last_breaker_recovery_until = ""
@@ -135,14 +131,13 @@ def test_four_hour_recovery_and_retrip(tmp_path: Path):
     assert restarted._last_breaker_recovery_until == until
 
     after = trip + timedelta(hours=4, seconds=1)
-    open_, recovered = _probe(db, now=after, max_consec=5, recovery_sec=14400)
+    open_, _recovered = _probe(db, now=after, max_consec=5, recovery_sec=14400)
     assert open_ is False
 
     with sqlite3.connect(db) as conn:
         for idx in range(5):
             conn.execute(
-                "INSERT INTO scalp_paper_trades (trade_id, symbol, side, quantity, price, notional, pnl_usd, created_at) "
-                "VALUES (?,'XRPUSDT','SELL',1,1,1,-0.06,?)",
+                "INSERT INTO scalp_paper_trades (trade_id, symbol, side, quantity, price, notional, pnl_usd, created_at) VALUES (?,'XRPUSDT','SELL',1,1,1,-0.06,?)",
                 (f"fresh{idx}", (after + timedelta(minutes=idx + 1)).strftime("%Y-%m-%d %H:%M:%S")),
             )
         conn.commit()

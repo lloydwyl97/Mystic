@@ -15,11 +15,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.database_schema import DATABASE_PATH
+from backend.services.ai_canonical_storage import ensure_ai_canonical_tables
 from backend.services.ai_decision_contract import FEATURE_VERSION_CURRENT as FEATURE_VERSION
+from backend.services.ai_post_trade_feature_review import ensure_post_trade_feature_review_table
 from backend.services.day_market_memory import _redis_key as day_memory_key
 from backend.services.day_outcome_attribution import ensure_outcome_attribution_table
-from backend.services.ai_canonical_storage import ensure_ai_canonical_tables
-from backend.services.ai_post_trade_feature_review import ensure_post_trade_feature_review_table
 
 
 def _core_active() -> bool:
@@ -82,6 +82,7 @@ def main() -> int:
 
     try:
         import redis
+
         from backend.config.redis_config import get_redis_url
 
         r = redis.from_url(get_redis_url(), decode_responses=True)

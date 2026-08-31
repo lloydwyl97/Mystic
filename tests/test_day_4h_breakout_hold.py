@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from backend.services.day_controlled_exits import EXIT_DAY_4H_STRUCTURE_BREAK, evaluate_engine_managed_exit
-from backend.services.portfolio_engine import day_intact_profit_floor
 from backend.services.day_trade_thesis import (
     SETUP_BREAKOUT_CONTINUATION,
     htf_4h_rise_broken,
@@ -15,6 +14,7 @@ from backend.services.day_trade_thesis import (
     should_block_rebuy_on_4h_rise,
     thesis_invalidated_live,
 )
+from backend.services.portfolio_engine import day_intact_profit_floor
 
 
 def _rising_4h(n: int = 60, start: float = 2000.0) -> list[list]:
@@ -229,13 +229,13 @@ def test_intact_trend_profit_floor_is_capped_so_profit_stays_reachable():
 
 def test_small_gain_on_intact_trend_still_holds():
     floor = day_intact_profit_floor(entry_price=91.32, prior_4h_low=89.94, min_net_profit=0.005)
-    assert 0.003561 < floor  # live SOL: +0.36% must not trigger a clip
+    assert floor > 0.003561  # live SOL: +0.36% must not trigger a clip
 
 
 def test_large_gain_on_intact_trend_now_takes_profit():
     """Regression guard: profit was previously unreachable until the trend broke."""
     floor = day_intact_profit_floor(entry_price=1.3781, prior_4h_low=1.3157, min_net_profit=0.003)
-    assert 0.024626 >= floor  # live XRP: +2.46% must be bookable while 4H is intact
+    assert floor <= 0.024626  # live XRP: +2.46% must be bookable while 4H is intact
 
 
 def test_profit_is_not_gated_behind_structure_break_in_source():

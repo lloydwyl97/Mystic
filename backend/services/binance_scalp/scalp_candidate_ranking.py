@@ -23,6 +23,7 @@ def _learn_cache_set(key: str, value: Any) -> Any:
     _LEARN_CACHE[key] = (time.time() + _LEARN_CACHE_TTL_SEC, value)
     return value
 
+
 from backend.services.binance_scalp.scalp_regime_classifier import STRATEGY_NATIVE_REGIMES
 from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, StrategyMarketContext
 from backend.services.binance_scalp.strategies.common import (
@@ -266,7 +267,7 @@ def rank_setup_signal(
             # Strong rank penalty (not exclusion) — evidence-based negative EV.
             arm_penalty_mult = float(os.getenv("SCALP_ARM_NEGATIVE_EV_RANK_MULT", "0.20"))
 
-    depth_ok, impact, fill = depth_check(ctx.snap, ctx.notional_usd, ctx.econ)
+    depth_ok, impact, _fill = depth_check(ctx.snap, ctx.notional_usd, ctx.econ)
     if not depth_ok:
         return RankedCandidate(
             signal=sig,
@@ -495,9 +496,8 @@ def rank_setup_signal(
     # it was penalized, not rejected — to keep telemetry honest about what
     # actually happened.
     with contextlib.suppress(Exception):
-        from backend.services.scalp_gate_telemetry import record_gate_event
-
         from backend.services.binance_scalp.config import get_scalp_config
+        from backend.services.scalp_gate_telemetry import record_gate_event
 
         _db = get_scalp_config().database_path
         if hard_block:
@@ -720,7 +720,7 @@ def _global_tie_key(row: dict[str, Any]) -> tuple:
     """Secondary sort when rank scores cluster — not spread/BTC order."""
     meta = row.get("rank_meta") or {}
     soft = str(meta.get("soft_reason") or row.get("soft_reason") or "")
-    soft_tier = _soft_base_score(soft.split(":")[0] if soft else None)
+    soft_tier = _soft_base_score(soft.split(":", maxsplit=1)[0] if soft else None)
     intel = row.get("intelligence") or {}
     mem_delta = float(intel.get("memory_rank_delta") or 0)
     # Do not treat win_rate=0.0 as missing (falsy) and fall through to dollar PnL.
@@ -739,7 +739,7 @@ def _global_tie_key(row: dict[str, Any]) -> tuple:
     sig = row.get("signal")
     passed = 1 if getattr(sig, "passed", False) else 0
     reach = float(meta.get("reachability_surplus") or 0)
-    sym = str(row.get("symbol") or "")
+    str(row.get("symbol") or "")
     # Rank the opportunity, never the coin identity.
     sym_penalty = 0.0
     # Market-role intelligence soft delta (affects tie-breaking only, not eligibility)
@@ -933,13 +933,7 @@ def pick_best_global_candidate(rows: list[dict[str, Any]]) -> dict[str, Any] | N
     """
     from backend.services.binance_scalp.scalp_micro_rank import EV_TIE_TOLERANCE, ev_scores_tied
 
-    eligible = [
-        r
-        for r in rows
-        if r.get("entry_eligible")
-        and not r.get("already_open")
-        and str(r.get("hard_block") or "") == ""
-    ]
+    eligible = [r for r in rows if r.get("entry_eligible") and not r.get("already_open") and str(r.get("hard_block") or "") == ""]
     if not eligible:
         return None
 
@@ -947,11 +941,7 @@ def pick_best_global_candidate(rows: list[dict[str, Any]]) -> dict[str, Any] | N
         attach_action_predictions(row)
 
     top_rank = max(_num(r.get("rank_score")) for r in eligible)
-    clustered = [
-        r
-        for r in eligible
-        if ev_scores_tied(_num(r.get("rank_score")), top_rank, tol=EV_TIE_TOLERANCE)
-    ]
+    clustered = [r for r in eligible if ev_scores_tied(_num(r.get("rank_score")), top_rank, tol=EV_TIE_TOLERANCE)]
     if len(clustered) > 1:
         return max(clustered, key=_global_tie_key)
     return clustered[0]
@@ -962,8 +952,8 @@ __all__ = [
     "HARD_REJECT_REASONS",
     "HOLD_ACTION_EV",
     "HOLD_ACTION_NAME",
-    "RankedCandidate",
     "SOFT_REJECT_SCORE",
+    "RankedCandidate",
     "attach_action_predictions",
     "candidate_expected_net_ev",
     "min_confident_rank",

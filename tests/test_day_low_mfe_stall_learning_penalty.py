@@ -256,7 +256,7 @@ def test_6_sol_range_bounce_low_mfe_stall_applies_penalty(tmp_path: Path):
 
 def test_7_all_top4_symbols_in_penalty_scope(tmp_path: Path):
     db = str(tmp_path / "scope.db")
-    assert DAY_UNIVERSAL_PENALTY_SYMBOLS == {"BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"}
+    assert {"BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"} == DAY_UNIVERSAL_PENALTY_SYMBOLS
     for sym in sorted(DAY_UNIVERSAL_PENALTY_SYMBOLS):
         _seed_low_mfe_stall_sells(db, symbol=sym, setup=SETUP_RANGE_BOUNCE, n=2)
         pen = evaluate_low_mfe_stall_penalty(sym, SETUP_RANGE_BOUNCE, "range", db_path=db)

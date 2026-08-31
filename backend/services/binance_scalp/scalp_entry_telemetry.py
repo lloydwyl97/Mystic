@@ -84,7 +84,7 @@ def _classify_post_pass_blocker(ranked_row: dict[str, Any]) -> str | None:
     if soft.startswith("NO_EXECUTABLE") or hard == "NO_EXECUTABLE_NET_EDGE":
         return "NO_EXECUTABLE_NET_EDGE"
     if soft:
-        return f"SOFT:{soft.split(':')[0]}"
+        return f"SOFT:{soft.split(':', maxsplit=1)[0]}"
     if conf:
         return f"CONF:{conf}"
     return "POST_PASS_UNKNOWN"
@@ -432,7 +432,7 @@ __all__ = [
     "publish_entry_telemetry",
     "read_entry_telemetry",
     "read_rolling_telemetry",
-    "telemetry_key",
     "rolling_key",
+    "telemetry_key",
     "update_rolling_telemetry",
 ]

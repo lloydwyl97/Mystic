@@ -93,7 +93,7 @@ def _metrics_from_stats(st: StrategyStats, *, window_days: int, principal: float
         }
     wins = st.wins
     wr = wins / n * 100
-    avg_hold = statistics.mean(st.hold_seconds) / 60 if st.hold_seconds else 0
+    statistics.mean(st.hold_seconds) / 60 if st.hold_seconds else 0
     longest = max(st.hold_seconds) / 60 if st.hold_seconds else 0
     exp = st.net_pnl_usd / n
     tpm = (n / max(window_days, 1)) * 30

@@ -21,8 +21,11 @@ AI_MARKET_CONTEXT_PIDFILE = "/tmp/mystic_ai_market_context.pid"
 AI_LEARNING_PIDFILE = "/tmp/mystic_ai_learning.pid"
 
 
-class ProcessAlreadyRunning(RuntimeError):
+class ProcessAlreadyRunningError(RuntimeError):
     """Another live process already holds the singleton lock."""
+
+
+ProcessAlreadyRunning = ProcessAlreadyRunningError
 
 
 def acquire_process_singleton(pid_file: str | Path, *, label: str) -> None:
@@ -41,7 +44,7 @@ def acquire_process_singleton(pid_file: str | Path, *, label: str) -> None:
         os.close(fd)
         holder = _read_pid(path)
         logger.error("ABORT: %s already running (pidfile=%s holder=%s)", label, path, holder)
-        raise ProcessAlreadyRunning(f"{label} already running (pidfile={path} holder={holder})") from exc
+        raise ProcessAlreadyRunningError(f"{label} already running (pidfile={path} holder={holder})") from exc
     os.ftruncate(fd, 0)
     os.write(fd, f"{os.getpid()}\n".encode())
     os.fsync(fd)

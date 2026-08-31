@@ -6,19 +6,19 @@ from backend.services.binance_scalp.scalp_dynamic_sizing import compute_scalp_po
 
 
 def _base_kwargs():
-    return dict(
-        base_cap=100.0,
-        free_cash=1000.0,
-        min_notional=5.0,
-        strategy_passed=True,
-        arm_penalty_mult=1.0,
-        mtf_penalty_mult=1.0,
-        regime_mismatch=False,
-        symbol_stall_risk=False,
-        spread_pct=0.0,
-        impact_pct=0.0,
-        realized_volatility_pct=None,
-    )
+    return {
+        "base_cap": 100.0,
+        "free_cash": 1000.0,
+        "min_notional": 5.0,
+        "strategy_passed": True,
+        "arm_penalty_mult": 1.0,
+        "mtf_penalty_mult": 1.0,
+        "regime_mismatch": False,
+        "symbol_stall_risk": False,
+        "spread_pct": 0.0,
+        "impact_pct": 0.0,
+        "realized_volatility_pct": None,
+    }
 
 
 def test_calibration_mult_defaults_to_neutral():

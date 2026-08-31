@@ -339,6 +339,6 @@ def apply_orphan_buy_cash_restore(
 __all__ = [
     "HEAL_STATE_KEY",
     "ORPHAN_BUY_HEAL_STATE_KEY",
-    "apply_sell_cash_credit_heal",
     "apply_orphan_buy_cash_restore",
+    "apply_sell_cash_credit_heal",
 ]

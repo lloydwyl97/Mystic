@@ -268,7 +268,7 @@ def effective_max_hold_min(position: Any, coin_profile: dict[str, Any] | None = 
     regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
     if regime == "bull":
         scalar, _ = get_regime_validated_scalar(regime)
-        base += int(round(_bull_hold_extension_min() * scalar))
+        base += round(_bull_hold_extension_min() * scalar)
     return base
 
 
@@ -480,7 +480,7 @@ def evaluate_giveback_exit(
     back to net-negative, instead of waiting for the stall floor to book a
     deeper loss.
 
-    Defaults require ~20m development and a clearer MFE/giveback so 1–3m noise
+    Defaults require ~20m development and a clearer MFE/giveback so 1-3m noise
     does not churn day trades. Exit-only — no entry/ranking changes.
 
     Adaptive MAE handling (item p7): when `position` is supplied and its
@@ -1155,30 +1155,25 @@ def preview_next_engine_exit(
         if str(managed.get("action") or "") == "sell":
             next_exit = current_authority
             next_executable_condition = current_authority
+        elif checks["trailing_stop"]:
+            next_exit = EXIT_TRAILING_STOP
+            next_executable_condition = EXIT_TRAILING_STOP
+            current_authority = EXIT_TRAILING_STOP
+        elif checks["risk_floor"]:
+            next_exit = EXIT_DAY_RISK_FLOOR
+            next_executable_condition = EXIT_DAY_RISK_FLOOR
+        elif trail_info.get("executable_trailing_stop"):
+            next_exit = current_authority
+            next_executable_condition = EXIT_TRAILING_STOP
+        elif trail_info["hard_stop"] > 0 and entry > 0:
+            next_exit = current_authority
+            next_executable_condition = f"{EXIT_DAY_RISK_FLOOR}_or_{EXIT_DAY_4H_STRUCTURE_BREAK}"
         else:
-            if checks["trailing_stop"]:
-                next_exit = EXIT_TRAILING_STOP
-                next_executable_condition = EXIT_TRAILING_STOP
-                current_authority = EXIT_TRAILING_STOP
-            elif checks["risk_floor"]:
-                next_exit = EXIT_DAY_RISK_FLOOR
-                next_executable_condition = EXIT_DAY_RISK_FLOOR
-            elif trail_info.get("executable_trailing_stop"):
-                next_exit = current_authority
-                next_executable_condition = EXIT_TRAILING_STOP
-            elif trail_info["hard_stop"] > 0 and entry > 0:
-                next_exit = current_authority
-                next_executable_condition = f"{EXIT_DAY_RISK_FLOOR}_or_{EXIT_DAY_4H_STRUCTURE_BREAK}"
-            else:
-                next_exit = current_authority
-                next_executable_condition = EXIT_DAY_4H_STRUCTURE_BREAK
+            next_exit = current_authority
+            next_executable_condition = EXIT_DAY_4H_STRUCTURE_BREAK
 
     dist_stop_pct = ((current_price - stop) / entry) if stop > 0 and entry > 0 else None
-    dist_hard_pct = (
-        ((current_price - float(trail_info["hard_stop"])) / entry)
-        if trail_info["hard_stop"] > 0 and entry > 0
-        else None
-    )
+    dist_hard_pct = ((current_price - float(trail_info["hard_stop"])) / entry) if trail_info["hard_stop"] > 0 and entry > 0 else None
     dist_target_pct = ((target - current_price) / entry) if target > 0 and entry > 0 else None
     hold_remaining_min = max(0.0, max_hold - hold_minutes)
 

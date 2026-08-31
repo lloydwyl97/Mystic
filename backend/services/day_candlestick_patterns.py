@@ -35,16 +35,16 @@ def _bar_geom(b: list | tuple) -> dict[str, float]:
     """Return {o,h,l,c,rng,body,upper_wick,lower_wick,body_pct,up_pct,low_pct,is_up,is_dn}."""
     o = float(b[1])
     h = float(b[2])
-    l = float(b[3])
+    low = float(b[3])
     c = float(b[4])
-    rng = max(h - l, 1e-12)
+    rng = max(h - low, 1e-12)
     body_abs = abs(c - o)
     upper = h - max(c, o)
-    lower = min(c, o) - l
+    lower = min(c, o) - low
     return {
         "o": o,
         "h": h,
-        "l": l,
+        "l": low,
         "c": c,
         "rng": rng,
         "body": body_abs,

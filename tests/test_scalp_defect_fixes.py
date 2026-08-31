@@ -8,9 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from backend.services.binance_scalp import status_snapshot
 from backend.services.binance_scalp.paper_engine import _round_trip_execution_costs
 from backend.services.binance_scalp.scalp_position_lifecycle import _stale_review_due
-from backend.services.binance_scalp import status_snapshot
 from backend.services.binance_scalp.schema import init_scalp_schema
 
 
@@ -236,7 +236,7 @@ def _breaker_probe(
         database_path=str(db_path),
     )
     engine._conn = lambda: sqlite3.connect(str(db_path), timeout=10.0)
-    engine._ledger = lambda conn: {"principal": 1000.0}
+    engine._ledger = lambda _conn: {"principal": 1000.0}
     engine._utcnow_override = now or datetime.now(timezone.utc)
     engine._last_breaker_reason = ""
     engine._last_breaker_recovery_until = ""
@@ -250,8 +250,7 @@ def _seed_sells(db_path: Path, rows: list[tuple[float, str]]) -> None:
     with sqlite3.connect(db_path) as conn:
         for idx, (pnl, created_at) in enumerate(rows):
             conn.execute(
-                "INSERT INTO scalp_paper_trades (trade_id, symbol, side, quantity, price, notional, pnl_usd, created_at) "
-                "VALUES (?,'XRPUSDT','SELL',1,1,1,?,?)",
+                "INSERT INTO scalp_paper_trades (trade_id, symbol, side, quantity, price, notional, pnl_usd, created_at) VALUES (?,'XRPUSDT','SELL',1,1,1,?,?)",
                 (f"t{idx}", pnl, created_at),
             )
         conn.commit()
@@ -279,8 +278,7 @@ def test_circuit_breaker_rearms_on_new_losses_after_epoch(tmp_path: Path):
     now = datetime(2026, 8, 22, 1, 15, tzinfo=timezone.utc)
     _seed_sells(
         db,
-        [(-0.05, f"2026-08-17 08:{i:02d}:00") for i in range(10)]
-        + [(-0.05, f"2026-08-22 01:{i:02d}:00") for i in range(10)],
+        [(-0.05, f"2026-08-17 08:{i:02d}:00") for i in range(10)] + [(-0.05, f"2026-08-22 01:{i:02d}:00") for i in range(10)],
     )
 
     open_, _ = _breaker_probe(db, epoch="2026-08-21 00:00:00", recovery_sec=3600, now=now)

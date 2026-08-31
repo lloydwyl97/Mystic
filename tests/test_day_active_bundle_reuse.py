@@ -29,7 +29,7 @@ class _Svc:
 @pytest.mark.asyncio
 async def test_empty_live_fetch_reuses_complete_prior_tf():
     prior = {tf: _rows(min_bars_for_day_tf(tf) + 10) for tf in DAY_ACTIVE_TIMEFRAMES}
-    prior_ts = {tf: 1.0 for tf in DAY_ACTIVE_TIMEFRAMES}
+    prior_ts = dict.fromkeys(DAY_ACTIVE_TIMEFRAMES, 1.0)
     svc = _Svc({"1m": [], "5m": [], "15m": [], "30m": [], "1h": prior["1h"], "4h": prior["4h"], "8h": prior["8h"], "12h": prior["12h"], "1d": prior["1d"], "1w": prior["1w"]})
     bundle, _ = await _fetch_day_active_ohlcv_bundle_raw(
         svc,
@@ -71,7 +71,7 @@ async def test_4h_refetched_on_utc_bar_boundary_inside_ttl():
     fresh_4h.append([cur, 2.0, 2.0, 2.0, 2.0, 1.0])
     prior = {tf: _rows(min_bars_for_day_tf(tf) + 10) for tf in DAY_ACTIVE_TIMEFRAMES}
     prior["4h"] = stale_4h
-    prior_ts = {tf: now - 60.0 for tf in DAY_ACTIVE_TIMEFRAMES}
+    prior_ts = dict.fromkeys(DAY_ACTIVE_TIMEFRAMES, now - 60.0)
     fetched = {"4h": 0}
 
     class _Svc4:

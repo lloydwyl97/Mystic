@@ -115,7 +115,7 @@ def eval_one(train, valid, test, horizon: int) -> dict:
         chosen = realized[lin[idx] > 0]
         by_sym[sym] = {
             "n": len(idx),
-            "buy_n": int(len(chosen)),
+            "buy_n": len(chosen),
             "buy_wr": None if len(chosen) == 0 else round(float((chosen > 0).mean()), 4),
             "buy_exp": None if len(chosen) == 0 else round(float(chosen.mean()), 6),
         }
@@ -140,7 +140,7 @@ def main() -> int:
     scored.sort(
         key=lambda s: (
             not s["accepted"],
-            -float((((s["ev"].get("policy_linear_vs_hold") or {}).get("econ") or {}).get("expectancy") or -9)),
+            -float(((s["ev"].get("policy_linear_vs_hold") or {}).get("econ") or {}).get("expectancy") or -9),
         )
     )
     best = scored[0]

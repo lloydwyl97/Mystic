@@ -116,7 +116,7 @@ def main() -> int:
         bars_1m, _ = load_or_fetch_bars(sym, "1m", s1, e1)
         bars_1m_by_sym[sym] = bars_1m
 
-    # Strategy × regime matrix
+    # Strategy x regime matrix
     matrix: dict[str, dict[str, Any]] = {}
     all_trades_by_strategy: dict[str, list] = defaultdict(list)
     wf_results: dict[str, Any] = {}
@@ -183,7 +183,7 @@ def main() -> int:
                 wd = max(1.0, (window[1] - window[0]) / 86400)
                 wf[name] = compute_trade_metrics(sub, window_days=wd)
             wf_results[strat] = {
-                "splits": {k: v for k, v in splits.items()},
+                "splits": dict(splits.items()),
                 "metrics": wf,
                 "promotion": promotion_checks(wf.get("train", {}), wf.get("validation", {}), wf.get("test", {})),
             }

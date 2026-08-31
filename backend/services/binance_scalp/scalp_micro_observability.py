@@ -98,11 +98,7 @@ def build_peer_micro_snapshot(
             -float(extracted[s].get("final_rank_score") or 0.0),
         ),
     )
-    available_syms = [
-        s
-        for s in ordered_syms
-        if extracted[s].get("entry_eligible") and s not in open_set
-    ]
+    available_syms = [s for s in ordered_syms if extracted[s].get("entry_eligible") and s not in open_set]
     peers: dict[str, Any] = {}
     for pos, sym in enumerate(ordered_syms, start=1):
         rec = dict(extracted[sym])
@@ -115,7 +111,7 @@ def build_peer_micro_snapshot(
         if sym not in peers:
             peers[sym] = {
                 "symbol": sym,
-                **{k: None for k in EV_KEYS},
+                **dict.fromkeys(EV_KEYS),
                 "static_rank_score": None,
                 "microstructure_adjustment": None,
                 "learning_adjustment": None,

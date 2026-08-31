@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from pathlib import Path
 
 from backend.services.day_churn_guard import (
     CHURN_GUARD_MAX_SEC,
@@ -126,7 +127,7 @@ def test_case7_restart_while_active_preserves_identity():
         assert still.active is True
         assert still.activated_at == 5_000.0
     finally:
-        os.unlink(path)
+        Path(path).unlink()
 
 
 def test_threshold_and_window_constants_unchanged():

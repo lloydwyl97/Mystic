@@ -30,7 +30,6 @@ from typing import Any
 
 from backend.database_schema import DATABASE_PATH
 
-
 _ARM_CACHE: dict[str, tuple[bool, str, float, dict[str, Any]]] = {}
 
 

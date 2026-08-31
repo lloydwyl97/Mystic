@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+import redis
 from ai_auto_learner import AIAutoLearner
 from ai_mode_controller import AITradingController
 from backup_utils import snapshot
@@ -14,7 +15,6 @@ from notifier import send_performance_alert, send_trade_alert
 from stagnation_detector import check_performance_plateau, detect_stagnation
 from strategy_tagger import get_strategy_confidence, tag_trade
 
-import redis
 from backend.config.redis_config import get_shared_redis_sync
 
 # Import from single source of truth

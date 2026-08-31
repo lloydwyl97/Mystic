@@ -32,9 +32,7 @@ def test_mark_reconciliation_keeps_pnl(tmp_path: Path):
         )
         """
     )
-    conn.execute(
-        "INSERT INTO paper_trades VALUES (983,'t','XRP/USDT','SELL','MANUAL_EXIT',-9.6,'{}')"
-    )
+    conn.execute("INSERT INTO paper_trades VALUES (983,'t','XRP/USDT','SELL','MANUAL_EXIT',-9.6,'{}')")
     conn.commit()
     conn.close()
     out = mark_reconciliation_manual_exit(db, trade_id=983)

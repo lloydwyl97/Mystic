@@ -15,7 +15,7 @@ Learned adjustment formula
 For each (symbol, strategy, feature):
 
   correlation = Pearson(feature_value_normed, pnl_pct) over last N outcomes
-  learned_adj = clamp(correlation × 0.02, -0.02, +0.02)    if N >= MIN_SAMPLES
+  learned_adj = clamp(correlation x 0.02, -0.02, +0.02)    if N >= MIN_SAMPLES
               = 0.0                                          if N < MIN_SAMPLES
 
   Where feature_value_normed is the feature value centered on its neutral point
@@ -277,7 +277,7 @@ def _recompute_stats(db_path: str, symbol: str, strategy: str) -> None:
             return
 
         pnl_pcts = [r[0] for r in rows if r[0] is not None]
-        n = len(pnl_pcts)
+        len(pnl_pcts)
         now_iso = datetime.now(timezone.utc).isoformat()
 
         feature_cols = [
@@ -373,8 +373,7 @@ def get_learning_stats(
                 "confidence": round(conf, 4),
                 "confidence_status": status,
             }
-            if cnt > max_samples:
-                max_samples = cnt
+            max_samples = max(max_samples, cnt)
             total_adj += adj
 
     except Exception as exc:
@@ -407,8 +406,8 @@ def get_learned_adjustment(db_path: str, symbol: str, strategy: str) -> float:
 
 
 __all__ = [
-    "MIN_OUTCOME_SAMPLES",
     "CONFIDENCE_FULL_SAMPLES",
+    "MIN_OUTCOME_SAMPLES",
     "LearningStats",
     "get_learned_adjustment",
     "get_learning_stats",

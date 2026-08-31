@@ -88,7 +88,7 @@ async def test_can_open_position_telemetry_only_when_cooldown_disabled(monkeypat
     engine._total_equity = 10000.0
     engine._total_open_risk = 0.0
 
-    ok, reason = await engine._can_open_position("BTCUSDT", 100.0)
+    _ok, reason = await engine._can_open_position("BTCUSDT", 100.0)
     assert reason != "SYMBOL_SELL_COOLDOWN"
 
 
@@ -97,10 +97,9 @@ def test_risk_governor_instance_created_on_init(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pe, "DATABASE_PATH", str(tmp_path / "t.db"))
     # Avoid heavy DB init side effects where possible
-    with patch.object(pe.PortfolioEngine, "_get_default_symbol_constraints", return_value={}):
-        with patch.object(pe.PortfolioEngine, "__init__", pe.PortfolioEngine.__init__):
-            # Minimal init may still hit DB — use __new__ + manual attrs instead
-            pass
+    with patch.object(pe.PortfolioEngine, "_get_default_symbol_constraints", return_value={}), patch.object(pe.PortfolioEngine, "__init__", pe.PortfolioEngine.__init__):
+        # Minimal init may still hit DB — use __new__ + manual attrs instead
+        pass
     eng = pe.PortfolioEngine.__new__(pe.PortfolioEngine)
     eng._risk_governor = pe.RiskGovernor(shadow_only=True)
     assert hasattr(eng._risk_governor, "decide")

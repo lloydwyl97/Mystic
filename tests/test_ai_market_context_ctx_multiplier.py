@@ -18,13 +18,13 @@ _NEUTRAL_MTF = {"1h": {"bars": 20, "ema_align": 0.5}}
 
 
 def _base_kwargs(**overrides):
-    kwargs = dict(
-        own_mtf=_NEUTRAL_MTF,
-        rs_btc=0.0,
-        rs_eth=0.0,
-        depth_imbalance=0.0,
-        market_regime="ranging",
-    )
+    kwargs = {
+        "own_mtf": _NEUTRAL_MTF,
+        "rs_btc": 0.0,
+        "rs_eth": 0.0,
+        "depth_imbalance": 0.0,
+        "market_regime": "ranging",
+    }
     kwargs.update(overrides)
     return kwargs
 

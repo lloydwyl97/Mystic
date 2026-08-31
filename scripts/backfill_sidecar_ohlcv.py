@@ -25,10 +25,7 @@ def _db_symbol(api_symbol: str) -> str:
 
 
 def _fetch_page(symbol: str, start_ms: int, end_ms: int) -> list:
-    url = (
-        "https://api.binance.us/api/v3/klines"
-        f"?symbol={symbol}&interval=1m&startTime={start_ms}&endTime={end_ms}&limit=1000"
-    )
+    url = f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m&startTime={start_ms}&endTime={end_ms}&limit=1000"
     for attempt in range(6):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "mystic-sidecar-ohlcv"})

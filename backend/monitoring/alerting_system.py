@@ -30,11 +30,11 @@ from enum import Enum
 from typing import Any
 
 import httpx
+import redis
+from redis import Redis
 from trading_config import trading_config
 
-import redis
 from backend.config.redis_config import get_shared_redis_sync
-from redis import Redis
 
 logger = logging.getLogger(__name__)
 

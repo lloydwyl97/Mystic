@@ -44,10 +44,8 @@ def _is_vwap_replay_proven_range(regime: str, decision_data: dict[str, Any]) -> 
     if regime not in (DAY_REGIME_RANGE, DAY_REGIME_NEUTRAL):
         return False
     adx = float(decision_data.get("adx") or 20.0)
-    if adx > 28.0:
-        return False
     # The strict reclaim checks are in evaluate_day_entry_route; we just gate the sleeve here.
-    return True
+    return adx <= 28.0
 
 
 def choose_paper_sleeve(

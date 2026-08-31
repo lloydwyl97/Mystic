@@ -6,9 +6,9 @@ import sqlite3
 import threading
 import time
 
+from backend.services.binance_scalp.scalp_markout import flush_completed, reset_markouts, schedule_markout
 from backend.services.binance_scalp.scalp_micro_latency import latency_report, percentile, record_latency, reset_latency
 from backend.services.binance_scalp.scalp_micro_replay import replay_events
-from backend.services.binance_scalp.scalp_markout import flush_completed, reset_markouts, schedule_markout
 
 
 def test_latency_percentiles():

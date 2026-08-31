@@ -75,10 +75,7 @@ def build_rows(db: str, *, horizons: tuple[int, ...], cost: float, step: int, ta
                 ts=ts if hasattr(ts, "hour") else None,
             )
             future = raw[i : i + max_h]
-            path = {
-                h: path_labels_for_horizon(mid, future, horizon_min=h, cost_pct=cost, target_pct=target_pct)
-                for h in horizons
-            }
+            path = {h: path_labels_for_horizon(mid, future, horizon_min=h, cost_pct=cost, target_pct=target_pct) for h in horizons}
             rows.append({"symbol": sym, "epoch": epoch, "features": feats, "path": path})
     rows.sort(key=lambda r: (r["epoch"], r["symbol"]))
     return rows
@@ -113,7 +110,7 @@ def eval_one(train, valid, test, horizon: int, names: tuple[str, ...]) -> dict:
     valid_corr = ev["stability"]["valid_corr"]
     if ok and (valid_corr is None or valid_corr <= 0):
         ok, reason = False, "valid corr is not positive"
-    buy_realized = np.asarray([float(r["path"][horizon].get(TARGET) or 0.0) for r, p in zip(test, lin) if float(p) > 0])
+    buy_realized = np.asarray([float(r["path"][horizon].get(TARGET) or 0.0) for r, p in zip(test, lin, strict=False) if float(p) > 0])
     return {
         "accepted": ok,
         "reason": reason,
@@ -122,14 +119,14 @@ def eval_one(train, valid, test, horizon: int, names: tuple[str, ...]) -> dict:
         "lin": lin,
         "y_te": y_te,
         "buy_wr": _wr(buy_realized),
-        "buy_n": int(len(buy_realized)),
-        "all_action_wr": _wr(np.asarray([float(r["path"][horizon].get(TARGET) or 0.0) if float(p) > 0 else 0.0 for r, p in zip(test, lin)])),
+        "buy_n": len(buy_realized),
+        "all_action_wr": _wr(np.asarray([float(r["path"][horizon].get(TARGET) or 0.0) if float(p) > 0 else 0.0 for r, p in zip(test, lin, strict=False)])),
     }
 
 
 def _coef_report(art) -> dict:
     rows = []
-    for n, c in zip(art.feature_names, art.coef):
+    for n, c in zip(art.feature_names, art.coef, strict=False):
         rows.append({"feature": n, "coef": c, "one_sigma_bps": round(float(c) * 1e4, 4)})
     rows.sort(key=lambda r: abs(r["coef"]), reverse=True)
     return {
@@ -174,7 +171,7 @@ def train_engine(*, db: str, out_dir: Path, engine: str) -> dict:
     scored.sort(
         key=lambda s: (
             not s["accepted"],
-            -float((((s["ev"].get("policy_linear_vs_hold") or {}).get("econ") or {}).get("expectancy") or -9)),
+            -float(((s["ev"].get("policy_linear_vs_hold") or {}).get("econ") or {}).get("expectancy") or -9),
         )
     )
     best = scored[0]
@@ -190,14 +187,7 @@ def train_engine(*, db: str, out_dir: Path, engine: str) -> dict:
     pol = best["ev"]["policy_linear_vs_hold"]
     wr = best["buy_wr"]
     exp = (pol.get("econ") or {}).get("expectancy")
-    authority_pass = bool(
-        best["accepted"]
-        and wr is not None
-        and wr >= 0.60
-        and (pol.get("econ") or {}).get("net", 0) > 0
-        and (exp or 0) > 0
-        and (best["buy_n"] or 0) >= 30
-    )
+    authority_pass = bool(best["accepted"] and wr is not None and wr >= 0.60 and (pol.get("econ") or {}).get("net", 0) > 0 and (exp or 0) > 0 and (best["buy_n"] or 0) >= 30)
     return {
         "engine": engine,
         "artifact": str(dest),

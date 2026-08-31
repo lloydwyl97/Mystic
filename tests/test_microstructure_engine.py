@@ -19,7 +19,7 @@ def _fresh_state(monkeypatch):
     """Each test gets an isolated symbol-state dict (module uses process-global state)."""
     mod = importlib.import_module("backend.services.microstructure_engine")
     mod._STATE.clear()
-    monkeypatch.setattr(mod, "_features_from_redis", lambda symbol: {})
+    monkeypatch.setattr(mod, "_features_from_redis", lambda _symbol: {})
     yield mod
     mod._STATE.clear()
 
@@ -156,8 +156,8 @@ def test_queue_dynamics_detects_addition_and_removal():
     m.record_snapshot("BTCUSDT", bids1, asks1, ts=t0)
 
     # Best bid size grows (replenishment/addition); best ask size shrinks (depletion).
-    bids2 = [(100.0, 9.0)] + bids1[1:]
-    asks2 = [(100.2, 1.0)] + asks1[1:]
+    bids2 = [(100.0, 9.0), *bids1[1:]]
+    asks2 = [(100.2, 1.0), *asks1[1:]]
     m.record_snapshot("BTCUSDT", bids2, asks2, ts=t0 + 0.5)
 
     feats = m.compute_features("BTCUSDT")
@@ -205,7 +205,7 @@ def test_ranking_delta_bounded_and_never_raises():
     assert m.get_microstructure_ranking_delta("DOGEUSDT") == 0.0
 
     t0 = time.time()
-    bids, asks = _book(100.0, 50.0, 100.2, 1.0)
+    _bids, _asks = _book(100.0, 50.0, 100.2, 1.0)
     for i in range(20):
         b, a = _book(100.0 + i * 0.001, 50.0 + i, 100.2, max(0.1, 1.0 - i * 0.02))
         m.record_snapshot("BTCUSDT", b, a, ts=t0 + i * 0.1)
@@ -234,7 +234,7 @@ def test_features_from_redis_used_when_local_state_empty(monkeypatch):
     monkeypatch.setattr(
         m,
         "_features_from_redis",
-        lambda symbol: {"symbol": "BTC", "ofi_5s": 1.25, "data_age_sec": 0.01, "source": "redis"},
+        lambda _symbol: {"symbol": "BTC", "ofi_5s": 1.25, "data_age_sec": 0.01, "source": "redis"},
     )
     feats = m.compute_features("BTCUSDT")
     assert feats["source"] == "redis"
@@ -248,7 +248,7 @@ def test_stale_redis_features_are_not_authoritative(monkeypatch):
         def hgetall(self, key):
             return {"data_age_sec": "99", "ofi_5s": "9"}
 
-    monkeypatch.setattr("backend.config.redis_config.get_shared_redis_sync", lambda: _R())
+    monkeypatch.setattr("backend.config.redis_config.get_shared_redis_sync", _R)
     assert m._features_from_redis("ETHUSDT") == {}
 
 
@@ -299,7 +299,7 @@ def test_redis_tape_overlay_when_local_book_has_no_trades(monkeypatch):
     monkeypatch.setattr(
         m,
         "_features_from_redis",
-        lambda symbol: {
+        lambda _symbol: {
             "symbol": "ETH",
             "data_age_sec": 0.01,
             "agg_flow_imbalance_5s": 0.42,
@@ -331,7 +331,7 @@ def test_local_trades_are_not_overwritten_by_redis(monkeypatch):
     monkeypatch.setattr(
         m,
         "_features_from_redis",
-        lambda symbol: {"agg_flow_imbalance_5s": -1.0, "trade_count_5s": 99, "data_age_sec": 0.01},
+        lambda _symbol: {"agg_flow_imbalance_5s": -1.0, "trade_count_5s": 99, "data_age_sec": 0.01},
     )
     feats = m.compute_features("BTCUSDT")
     assert feats["trade_count_5s"] == 1

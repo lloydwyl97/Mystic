@@ -79,7 +79,7 @@ def run_scalp_indicator_truth_audit(symbols: list[str] | None = None) -> dict[st
         priority = ("FALLBACK", "MISSING", "STALE", "ZERO_DEFAULT", "PLACEHOLDER", "UNSUPPORTED_FOR_SPOT", "WARMUP", "CALCULATED_PROXY", "CALCULATED", "LIVE")
         consensus = coin_status.get("BTC") or "MISSING"
         for st in priority:
-            if any(coin_status.get(l) == st for l in COIN_LABELS):
+            if any(coin_status.get(label) == st for label in COIN_LABELS):
                 consensus = st
                 break
 

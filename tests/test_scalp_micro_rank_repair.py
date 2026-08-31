@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
+from backend.services.binance_scalp.config import get_scalp_config
+from backend.services.binance_scalp.economics import ScalpEconomics
 from backend.services.binance_scalp.scalp_candidate_ranking import (
     HARD_REJECT_REASONS,
     pick_best_global_candidate,
@@ -30,9 +33,6 @@ from backend.services.binance_scalp.scalp_micro_rank import (
 )
 from backend.services.binance_scalp.scalp_micro_replay import replay_four_coin_rank
 from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, StrategyMarketContext
-from backend.services.binance_scalp.config import get_scalp_config
-from backend.services.binance_scalp.economics import ScalpEconomics
-from types import SimpleNamespace
 
 
 def _base(**overrides):
@@ -191,16 +191,16 @@ def test_peer_observability_preserves_four_coin_ev_and_components():
 
 
 def test_sizing_formula_unchanged_by_rank_repair():
-    kwargs = dict(
-        base_cap=50.0,
-        free_cash=1000.0,
-        min_notional=5.0,
-        strategy_passed=False,
-        micro_quality_mult=1.0,
-        calibration_mult=1.0,
-        spread_pct=0.0002,
-        impact_pct=0.0001,
-    )
+    kwargs = {
+        "base_cap": 50.0,
+        "free_cash": 1000.0,
+        "min_notional": 5.0,
+        "strategy_passed": False,
+        "micro_quality_mult": 1.0,
+        "calibration_mult": 1.0,
+        "spread_pct": 0.0002,
+        "impact_pct": 0.0001,
+    }
     a = compute_scalp_position_size(**kwargs)
     b = compute_scalp_position_size(**kwargs)
     assert a.notional == b.notional
@@ -211,8 +211,9 @@ def test_sizing_formula_unchanged_by_rank_repair():
 
 
 def test_xrp_ofi_depth_norm_still_comparable():
-    from backend.services import microstructure_engine as m
     import time
+
+    from backend.services import microstructure_engine as m
 
     m._STATE.clear()
     t0 = time.time()
@@ -240,7 +241,8 @@ def test_xrp_ofi_depth_norm_still_comparable():
 def test_pick_best_uses_repaired_rank_among_hold_survivors(monkeypatch):
     import backend.services.binance_scalp.forward_net_predictor as fnp
 
-    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda row: None)
+    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda _row: None)
+
     def _row(sym, rank, ev_move):
         return {
             "symbol": sym,
@@ -269,7 +271,7 @@ def test_pick_best_uses_repaired_rank_among_hold_survivors(monkeypatch):
 def test_pick_best_selects_select_v2_leader_even_when_path_net_hold_disagrees(monkeypatch):
     import backend.services.binance_scalp.forward_net_predictor as fnp
 
-    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda row: None)
+    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda _row: None)
 
     def _row(sym, rank, expected):
         return {
@@ -300,12 +302,36 @@ def test_pick_best_selects_select_v2_leader_even_when_path_net_hold_disagrees(mo
 def test_pick_best_second_slot_is_next_select_v2_leader(monkeypatch):
     import backend.services.binance_scalp.forward_net_predictor as fnp
 
-    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda row: None)
+    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda _row: None)
     rows = [
-        {"symbol": "ETHUSDT", "rank_score": 3e-05, "entry_eligible": True, "already_open": True, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
-        {"symbol": "BTCUSDT", "rank_score": -1e-05, "entry_eligible": True, "already_open": False, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
-        {"symbol": "SOLUSDT", "rank_score": -5e-05, "entry_eligible": True, "already_open": False, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
-        {"symbol": "XRPUSDT", "rank_score": -9e-05, "entry_eligible": True, "already_open": False, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
+        {
+            "symbol": "ETHUSDT",
+            "rank_score": 3e-05,
+            "entry_eligible": True,
+            "already_open": True,
+            "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7),
+        },
+        {
+            "symbol": "BTCUSDT",
+            "rank_score": -1e-05,
+            "entry_eligible": True,
+            "already_open": False,
+            "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7),
+        },
+        {
+            "symbol": "SOLUSDT",
+            "rank_score": -5e-05,
+            "entry_eligible": True,
+            "already_open": False,
+            "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7),
+        },
+        {
+            "symbol": "XRPUSDT",
+            "rank_score": -9e-05,
+            "entry_eligible": True,
+            "already_open": False,
+            "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7),
+        },
     ]
     best = pick_best_global_candidate(rows)
     assert best is not None
@@ -315,10 +341,22 @@ def test_pick_best_second_slot_is_next_select_v2_leader(monkeypatch):
 def test_pick_best_skips_hard_block_and_already_open(monkeypatch):
     import backend.services.binance_scalp.forward_net_predictor as fnp
 
-    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda row: None)
+    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda _row: None)
     rows = [
-        {"symbol": "ETHUSDT", "rank_score": 1e-04, "entry_eligible": False, "hard_block": "SPREAD_TOO_WIDE", "signal": SimpleNamespace(passed=True, spread_pct=0.02, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
-        {"symbol": "BTCUSDT", "rank_score": 5e-05, "entry_eligible": True, "already_open": True, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
+        {
+            "symbol": "ETHUSDT",
+            "rank_score": 1e-04,
+            "entry_eligible": False,
+            "hard_block": "SPREAD_TOO_WIDE",
+            "signal": SimpleNamespace(passed=True, spread_pct=0.02, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7),
+        },
+        {
+            "symbol": "BTCUSDT",
+            "rank_score": 5e-05,
+            "entry_eligible": True,
+            "already_open": True,
+            "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7),
+        },
         {"symbol": "SOLUSDT", "rank_score": -2e-05, "entry_eligible": True, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
         {"symbol": "XRPUSDT", "rank_score": -8e-05, "entry_eligible": True, "signal": SimpleNamespace(passed=True, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.7)},
     ]
@@ -330,7 +368,7 @@ def test_pick_best_skips_hard_block_and_already_open(monkeypatch):
 def test_negative_ev_leader_still_selected(monkeypatch):
     import backend.services.binance_scalp.forward_net_predictor as fnp
 
-    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda row: None)
+    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda _row: None)
     rows = [
         {"symbol": "XRPUSDT", "rank_score": -6.112e-05, "entry_eligible": True, "signal": SimpleNamespace(passed=False, spread_pct=0.0002, expected_move_pct=0.0, impact_pct=0.0, confidence=0.4)},
         {"symbol": "BTCUSDT", "rank_score": -8.004e-05, "entry_eligible": True, "signal": SimpleNamespace(passed=False, spread_pct=0.0002, expected_move_pct=0.004, impact_pct=0.0, confidence=0.4)},
@@ -353,7 +391,7 @@ def test_hard_safety_and_universe_unchanged():
 def test_rank_setup_signal_stamps_select_v2(monkeypatch):
     monkeypatch.setattr(
         "backend.services.microstructure_engine.compute_features",
-        lambda symbol: _base(agg_flow_imbalance_5s=0.4, ofi_5s=1.5),
+        lambda _symbol: _base(agg_flow_imbalance_5s=0.4, ofi_5s=1.5),
     )
     ctx = StrategyMarketContext(
         symbol="BTCUSDT",
@@ -392,7 +430,7 @@ def test_rank_setup_signal_stamps_select_v2(monkeypatch):
 def test_negative_ev_and_negative_flow_still_eligible(monkeypatch):
     monkeypatch.setattr(
         "backend.services.microstructure_engine.compute_features",
-        lambda symbol: _base(agg_flow_imbalance_5s=-0.8, ofi_5s=-3.0, adverse_selection_score=0.8),
+        lambda _symbol: _base(agg_flow_imbalance_5s=-0.8, ofi_5s=-3.0, adverse_selection_score=0.8),
     )
     ctx = StrategyMarketContext(
         symbol="ETHUSDT",
@@ -430,10 +468,10 @@ def test_negative_ev_and_negative_flow_still_eligible(monkeypatch):
 
 
 def test_day_exits_universe_and_max_open_untouched():
+    import backend.services.binance_scalp.paper_engine as pe
     from backend.services.binance_scalp.config import ScalpConfig
     from backend.services.binance_scalp.exit_manager import _path_max_adverse_net_pct
     from backend.services.microstructure_engine import get_microstructure_ranking_delta
-    import backend.services.binance_scalp.paper_engine as pe
 
     day_src = inspect.getsource(get_microstructure_ranking_delta)
     assert "apply_repaired_rank" not in day_src

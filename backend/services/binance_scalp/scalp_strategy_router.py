@@ -28,7 +28,7 @@ from backend.services.binance_scalp.scalp_regime_classifier import (
 from backend.services.binance_scalp.scalp_setup_measurements import evidence_rank_delta, measure_all_setups
 from backend.services.binance_scalp.strategies import ALL_STRATEGIES, STRATEGY_NAMES, enabled_strategies
 from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, StrategyMarketContext
-from backend.services.binance_scalp.strategies.kline_cache import KlineCache, MIN_REGIME_1H_BARS
+from backend.services.binance_scalp.strategies.kline_cache import MIN_REGIME_1H_BARS, KlineCache
 from backend.services.multi_horizon_ev import cached_multi_horizon_ev
 
 logger = logging.getLogger(__name__)

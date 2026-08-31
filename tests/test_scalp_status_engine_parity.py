@@ -16,8 +16,8 @@ import json
 
 import pytest
 
-from backend.services.binance_scalp.status_snapshot import _ENGINE_DECISION_TO_STATUS, _load_last_decision
 from backend.services.binance_scalp.redis_keys import last_decision_key
+from backend.services.binance_scalp.status_snapshot import _ENGINE_DECISION_TO_STATUS, _load_last_decision
 
 
 class _FakeRedis:

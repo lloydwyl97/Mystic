@@ -17,6 +17,8 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import itertools
+
 from backend.services.binance_scalp.scalp_candidate_ranking import (
     HOLD_ACTION_EV,
     attach_action_predictions,
@@ -33,7 +35,7 @@ def _corr(xs, ys):
         return None
     mx = sum(xs) / n
     my = sum(ys) / n
-    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=False))
     dx = sum((x - mx) ** 2 for x in xs) ** 0.5
     dy = sum((y - my) ** 2 for y in ys) ** 0.5
     if dx == 0 or dy == 0:
@@ -43,8 +45,8 @@ def _corr(xs, ys):
 
 def _bucket(xs, ys, edges):
     out = []
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        pair = [(x, y) for x, y in zip(xs, ys) if lo <= x < hi]
+    for lo, hi in itertools.pairwise(edges):
+        pair = [(x, y) for x, y in zip(xs, ys, strict=False) if lo <= x < hi]
         if not pair:
             out.append({"lo": lo, "hi": hi, "n": 0})
             continue
@@ -64,13 +66,14 @@ def _bucket(xs, ys, edges):
 
 
 def _quartile(xs, ys):
-    paired = sorted(zip(xs, ys), key=lambda t: t[0])
+    paired = sorted(zip(xs, ys, strict=False), key=lambda t: t[0])
     n = len(paired)
     if n < 20:
         return None
     q = n // 4
     bot = paired[:q]
     top = paired[-q:]
+
     def _summ(rows):
         vals = [y for _, y in rows]
         return {
@@ -78,25 +81,28 @@ def _quartile(xs, ys):
             "mean_net": round(sum(vals) / len(vals), 6),
             "wr": round(sum(1 for v in vals if v > 0) / len(vals), 4),
         }
+
     return {"bottom": _summ(bot), "top": _summ(top), "spread": round(_summ(top)["mean_net"] - _summ(bot)["mean_net"], 6)}
 
 
 def _decile(xs, ys):
-    paired = sorted(zip(xs, ys), key=lambda t: t[0])
+    paired = sorted(zip(xs, ys, strict=False), key=lambda t: t[0])
     n = len(paired)
     if n < 20:
         return None
     k = max(1, n // 10)
     bot = paired[:k]
     top = paired[-k:]
+
     def _summ(rows):
         vals = [y for _, y in rows]
         return {"n": len(vals), "mean_net": round(sum(vals) / len(vals), 6), "wr": round(sum(1 for v in vals if v > 0) / len(vals), 4)}
+
     return {"bottom_10": _summ(bot), "top_10": _summ(top), "spread": round(_summ(top)["mean_net"] - _summ(bot)["mean_net"], 6)}
 
 
 def _mae(pred, real):
-    pair = [(p, r) for p, r in zip(pred, real) if p is not None and r is not None]
+    pair = [(p, r) for p, r in zip(pred, real, strict=False) if p is not None and r is not None]
     if len(pair) < 5:
         return None
     return round(sum(abs(p - r) for p, r in pair) / len(pair), 6)
@@ -110,15 +116,17 @@ def opportunity_edge(conn: sqlite3.Connection) -> dict:
     net_col = "plus_300s_net" if "plus_300s_net" in cols else None
     if net_col is None:
         return {"available": False, "reason": "no_forward_net_column"}
-    rows = list(conn.execute(
-        f"""
+    rows = list(
+        conn.execute(
+            f"""
         SELECT id, symbol, rank_score, best_passed, best_setup, best_reject,
                spread_pct, measurements_json, {net_col} AS net,
                plus_300s_mfe AS mfe, plus_300s_mae AS mae
         FROM scalp_opportunity_snapshots
         WHERE {net_col} IS NOT NULL
         """
-    ))
+        )
+    )
     if not rows:
         return {"available": True, "n": 0, "reason": "no_labeled_rows"}
     by_sym = defaultdict(list)
@@ -209,9 +217,7 @@ def day_edge(conn: sqlite3.Connection) -> dict:
         return {"available": False, "reason": "no_paper_trades"}
     cols = {r[1] for r in conn.execute("PRAGMA table_info(paper_trades)")}
     pnl_col = "pnl" if "pnl" in cols else "pnl_usd"
-    sells = list(conn.execute(
-        f"SELECT id, symbol, {pnl_col} AS pnl, exit_reason, explainability_json FROM paper_trades WHERE UPPER(side)='SELL'"
-    ))
+    sells = list(conn.execute(f"SELECT id, symbol, {pnl_col} AS pnl, exit_reason, explainability_json FROM paper_trades WHERE UPPER(side)='SELL'"))
     profit, stall = [], []
     by_sym = defaultdict(list)
     for r in sells:
@@ -235,10 +241,12 @@ def day_edge(conn: sqlite3.Connection) -> dict:
         elif er in {"STALL_EXIT", "GIVEBACK_EXIT", "PROGRESS_DECAY"}:
             stall.append(rec)
         by_sym[rec["symbol"]].append(rec)
+
     def _mean(rows, key):
         if not rows:
             return None
         return round(sum(r[key] for r in rows) / len(rows), 6)
+
     xs = [r["buy_prob"] for r in profit + stall]
     ys = [r["pnl"] for r in profit + stall]
     return {
@@ -271,14 +279,16 @@ def replay_hold_as_action(conn: sqlite3.Connection) -> dict:
         return {"available": False}
     cols = {r[1] for r in conn.execute("PRAGMA table_info(scalp_opportunity_snapshots)")}
     net_col = "plus_300s_net" if "plus_300s_net" in cols else None
-    rows = list(conn.execute(
-        f"""
+    rows = list(
+        conn.execute(
+            f"""
         SELECT created_at, symbol, rank_score, best_passed, spread_pct, impact_pct,
-               {net_col if net_col else 'NULL'} AS net
+               {net_col if net_col else "NULL"} AS net
         FROM scalp_opportunity_snapshots
         ORDER BY created_at, symbol
         """
-    ))
+        )
+    )
     cycles = defaultdict(list)
     for r in rows:
         cycles[str(r["created_at"])].append(r)
@@ -314,6 +324,7 @@ def replay_hold_as_action(conn: sqlite3.Connection) -> dict:
             new_trades.append(0.0)
         elif new.get("realized_net") is not None:
             new_trades.append(new["realized_net"])
+
     def _summ(vals):
         if not vals:
             return {"n": 0}
@@ -323,14 +334,13 @@ def replay_hold_as_action(conn: sqlite3.Connection) -> dict:
             "net": round(sum(vals), 6),
             "expectancy": round(sum(vals) / len(vals), 6),
             "pf": round(
-                (sum(v for v in vals if v > 0) / abs(sum(v for v in vals if v < 0)))
-                if any(v < 0 for v in vals)
-                else None,
+                (sum(v for v in vals if v > 0) / abs(sum(v for v in vals if v < 0))) if any(v < 0 for v in vals) else None,
                 4,
             )
             if any(v < 0 for v in vals)
             else None,
         }
+
     return {
         "available": True,
         "cycles": len(cycles),

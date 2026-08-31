@@ -92,9 +92,7 @@ def test_old_rank_telemetry_only():
 
 
 def test_all_four_plus_hold_keys_present():
-    out = select_action(
-        {"btc_path_ev": 0.01, "eth_path_ev": 0.0, "sol_path_ev": 0.0, "xrp_path_ev": 0.0, "path_net_status": "predicted"}
-    )
+    out = select_action({"btc_path_ev": 0.01, "eth_path_ev": 0.0, "sol_path_ev": 0.0, "xrp_path_ev": 0.0, "path_net_status": "predicted"})
     for key in ("btc_path_ev", "eth_path_ev", "sol_path_ev", "xrp_path_ev", "hold_ev"):
         assert key in out
     assert out["hold_ev"] == 0.0
@@ -146,7 +144,7 @@ def test_tape_persists_all_four_coins_and_hold(monkeypatch):
         return len(rows)
 
     monkeypatch.setattr("backend.services.decision_book_tape.record_rows", _fake_record)
-    monkeypatch.setattr("backend.services.decision_book_tape.snapshot_book", lambda *a, **k: {})
+    monkeypatch.setattr("backend.services.decision_book_tape.snapshot_book", lambda *_a, **_k: {})
     from backend.services.decision_book_tape import record_day_bar_authority
 
     n = record_day_bar_authority(
@@ -225,8 +223,8 @@ def test_live_flags_remain_false_in_authority_files():
         "backend/services/decision_book_tape.py",
     )
     banned = (
-        'LIVE_TRADES_ALLOWED = True',
-        'SCALP_LIVE = True',
+        "LIVE_TRADES_ALLOWED = True",
+        "SCALP_LIVE = True",
         'TRADING_MODE = "live"',
         'EXECUTION_MODE = "live"',
     )

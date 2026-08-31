@@ -1,0 +1,9 @@
+{
+  "authorization": "scalp_structural_thesis",
+  "replaces": "legacy_prediction_ranking",
+  "SCALP_THESIS": "structural",
+  "legacy_prediction_entries": false,
+  "scalp_live": false,
+  "structural_entries_executable": false,
+  "note": "SCALP-only. DAY unchanged. Ranking/VWAP/pullback/momentum/imbalance buys are retired. Structural LP/arb is authorized as the thesis, not armed for execution until honest fill data exists."
+}

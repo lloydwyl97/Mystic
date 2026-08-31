@@ -33,7 +33,7 @@ def test_start_mystic_has_lifecycle_lock_and_skip_guards():
     assert "refuse_duplicate_or_collapse" in text
     assert "list_app_pids" in text
     assert text.count("9>&-") >= 6
-    for pattern, label in (
+    for pattern, _label in (
         ("start_live_market_data.py", "Live Market Data"),
         ("start_ai_signal_generator.py", "AI Signal Generator"),
         ("start_portfolio_engine_integration.py", "Portfolio Engine Integration"),

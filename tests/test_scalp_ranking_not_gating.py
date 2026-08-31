@@ -348,7 +348,7 @@ def test_paper_engine_no_sig_passed_buy_locks():
     full = cand_src + try_src
     assert "STRATEGY_NOT_PASSED" not in full
     assert "if not strategy_passed:" not in inspect.getsource(pe.BinanceScalpPaperEngine._try_entry)
-    assert "or not bool(getattr(sig, \"passed\", False))" not in cand_src
+    assert 'or not bool(getattr(sig, "passed", False))' not in cand_src
 
 
 def test_soft_rank_reservation_not_popped_for_opinion():

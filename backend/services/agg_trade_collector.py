@@ -50,8 +50,8 @@ class AggTradeCollector:
             "errors": 0,
             "reconnects": 0,
             "last_error": None,
-            "by_symbol": {s: 0 for s in self.symbols},
-            "last_ts_by_symbol": {s: 0.0 for s in self.symbols},
+            "by_symbol": dict.fromkeys(self.symbols, 0),
+            "last_ts_by_symbol": dict.fromkeys(self.symbols, 0.0),
         }
 
         logger.info(f"AggTradeCollector initialized for {len(self.symbols)} symbols")

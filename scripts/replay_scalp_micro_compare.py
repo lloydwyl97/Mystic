@@ -14,7 +14,7 @@ FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "scalp_l2
 
 
 def _base(stream: str) -> str:
-    return stream.split("@")[0].replace("usdt", "").upper()
+    return stream.split("@", maxsplit=1)[0].replace("usdt", "").upper()
 
 
 def main() -> int:

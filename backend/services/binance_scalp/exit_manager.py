@@ -229,7 +229,7 @@ def _effective_scratch_min_reviews(setup_name: str | None = None, hold_ev_reduct
 
 
 def _stall_exit_hold_frac() -> float:
-    # Default 50% of hard max-hold so stalled paper scalps exit ~10m, not 15–20m.
+    # Default 50% of hard max-hold so stalled paper scalps exit ~10m, not 15-20m.
     return float(os.getenv("SCALP_STALL_EXIT_HOLD_FRAC", "0.50"))
 
 
@@ -389,7 +389,6 @@ def evaluate_exit(
     max_adv = max(track.max_adverse_pct, adv)
     session_low = min(track.session_low_bid, bid)
     recovery = (bid - session_low) / entry if entry > 0 else 0.0
-    recovering = recovery >= RECOVERY_MIN_PCT and bid > session_low
     review_lows = list(track.review_lows)
     stale_review_count = track.stale_review_count
 

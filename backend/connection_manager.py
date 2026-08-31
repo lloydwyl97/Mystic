@@ -35,8 +35,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 import pika
-
 import redis
+
 from backend.config.redis_config import get_shared_redis_sync
 
 # Import with fallback for backend module paths

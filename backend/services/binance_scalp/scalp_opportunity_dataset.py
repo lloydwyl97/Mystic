@@ -38,11 +38,10 @@ def compact_signals_json(signals: Any) -> str:
     else:
         source = []
     for item in source:
-        if hasattr(item, "as_dict"):
-            item = item.as_dict()
-        if not isinstance(item, dict):
+        row = item.as_dict() if hasattr(item, "as_dict") else item
+        if not isinstance(row, dict):
             continue
-        rows.append({key: item.get(key) for key in _SIGNAL_KEYS})
+        rows.append({key: row.get(key) for key in _SIGNAL_KEYS})
     return json.dumps(rows, separators=(",", ":"), default=str)
 
 
@@ -57,6 +56,7 @@ def compact_feature_vector_json(vector: Any) -> str:
         except (TypeError, ValueError):
             out.append(0.0)
     return json.dumps(out, separators=(",", ":"))
+
 
 _CREATE = f"""
 CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -274,7 +274,7 @@ def label_due_opportunities(db_path: str, reader: Any, *, now_epoch: float | Non
                 bars = fetch_1m_bars(str(row["symbol"]), minutes=40) or []
             existing_labels: dict[str, Any] = {}
             with contextlib.suppress(Exception):
-                existing_labels = json.loads(row["horizon_labels_json"] or "{}") if "horizon_labels_json" in row.keys() else {}
+                existing_labels = json.loads(row["horizon_labels_json"] or "{}") if "horizon_labels_json" in row else {}
             gross = (mid - mid0) / mid0
             net = gross - cost_pct
             sets = []
@@ -283,15 +283,19 @@ def label_due_opportunities(db_path: str, reader: Any, *, now_epoch: float | Non
             labels = dict(existing_labels)
             for sec, prefix in col.items():
                 if row[f"{prefix}_net"] is None and age >= sec:
-                    path = _path_label(mid0, float(row["epoch"] or 0), sec, bars, cost_pct=cost_pct) if bars else {
-                        "gross": gross,
-                        "net": net,
-                        "mfe": max(0.0, gross),
-                        "mae": min(0.0, gross),
-                        "hit_target": gross >= 0.0025,
-                        "time_to_target": None,
-                        "time_to_adverse": None,
-                    }
+                    path = (
+                        _path_label(mid0, float(row["epoch"] or 0), sec, bars, cost_pct=cost_pct)
+                        if bars
+                        else {
+                            "gross": gross,
+                            "net": net,
+                            "mfe": max(0.0, gross),
+                            "mae": min(0.0, gross),
+                            "hit_target": gross >= 0.0025,
+                            "time_to_target": None,
+                            "time_to_adverse": None,
+                        }
+                    )
                     sets.append(f"{prefix}_net=?")
                     vals.append(path["net"])
                     sets.append(f"{prefix}_mfe=?")

@@ -201,9 +201,8 @@ async def test_monitor_all_positions_stop_loss_uses_fresh_mtm_not_stale_cache():
     stale_integration_prices = {"XRP/USDT": 1.1306}
     current_bar = int(time.time() / 60) * 60
 
-    with patch("backend.services.canonical_mark_price.fetch_canonical_mark", new=AsyncMock(return_value=fresh)):
-        with patch("backend.services.ai_learning_ingestion.record_position_heartbeat"):
-            exits = await engine.monitor_all_positions(stale_integration_prices, current_bar)
+    with patch("backend.services.canonical_mark_price.fetch_canonical_mark", new=AsyncMock(return_value=fresh)), patch("backend.services.ai_learning_ingestion.record_position_heartbeat"):
+        exits = await engine.monitor_all_positions(stale_integration_prices, current_bar)
 
     assert sell_calls == [EXIT_STOP_LOSS]
     assert exits

@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.preprocessing import MinMaxScaler
 from torch import nn, optim
+from utils.redis_helpers import to_str, to_str_list
 
 from backend.config.redis_config import get_shared_redis_sync
 from backend.utils.path_helpers import (
@@ -27,7 +28,6 @@ from backend.utils.path_helpers import (
     get_model_file_path,
     get_scaler_file_path,
 )
-from utils.redis_helpers import to_str, to_str_list
 
 # ---------------------------------------------------------------------
 # Logging

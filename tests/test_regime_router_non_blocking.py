@@ -19,22 +19,22 @@ from backend.services.day_controlled_exits import evaluate_pre_buy_exit_consiste
 
 
 def _base_kwargs(**overrides):
-    base = dict(
-        setup="HTF_TREND_PULLBACK",
-        entry_price=100.0,
-        stop_price=97.0,
-        thesis_invalid_level=0.0,  # no invalidation level -> avoids thesis_invalidated_live block
-        thesis_target_level=105.0,
-        entry_vwap=99.5,
-        entry_ts=0.0,
-        coin_profile={"trail": 0.005, "max_hold_min": 60, "sl": 0.01},
-        bundle=None,
-        spread_pct=0.0005,
-        day_regime="range",  # mismatched vs HTF_TREND_PULLBACK setup -> router would reject
-        decision_data={"adx": 15.0, "rsi": 50.0, "bb_position": 0.5, "thesis_score": 0.75},
-        context_payload=None,
-        thesis_score=0.75,
-    )
+    base = {
+        "setup": "HTF_TREND_PULLBACK",
+        "entry_price": 100.0,
+        "stop_price": 97.0,
+        "thesis_invalid_level": 0.0,  # no invalidation level -> avoids thesis_invalidated_live block
+        "thesis_target_level": 105.0,
+        "entry_vwap": 99.5,
+        "entry_ts": 0.0,
+        "coin_profile": {"trail": 0.005, "max_hold_min": 60, "sl": 0.01},
+        "bundle": None,
+        "spread_pct": 0.0005,
+        "day_regime": "range",  # mismatched vs HTF_TREND_PULLBACK setup -> router would reject
+        "decision_data": {"adx": 15.0, "rsi": 50.0, "bb_position": 0.5, "thesis_score": 0.75},
+        "context_payload": None,
+        "thesis_score": 0.75,
+    }
     base.update(overrides)
     return base
 

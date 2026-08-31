@@ -30,7 +30,7 @@ def _probe(
         database_path=str(db_path),
     )
     engine._conn = lambda: sqlite3.connect(str(db_path), timeout=10.0)
-    engine._ledger = lambda conn: {"principal": 1000.0}
+    engine._ledger = lambda _conn: {"principal": 1000.0}
     engine._utcnow_override = now
     engine._last_breaker_reason = ""
     engine._last_breaker_recovery_until = ""
@@ -44,8 +44,7 @@ def _seed(db_path: Path, rows: list[tuple[float, str]]) -> None:
     with sqlite3.connect(db_path) as conn:
         for idx, (pnl, created_at) in enumerate(rows):
             conn.execute(
-                "INSERT INTO scalp_paper_trades (trade_id, symbol, side, quantity, price, notional, pnl_usd, created_at) "
-                "VALUES (?,'XRPUSDT','SELL',1,1,1,?,?)",
+                "INSERT INTO scalp_paper_trades (trade_id, symbol, side, quantity, price, notional, pnl_usd, created_at) VALUES (?,'XRPUSDT','SELL',1,1,1,?,?)",
                 (f"t{idx}", pnl, created_at),
             )
         conn.commit()
@@ -110,8 +109,7 @@ def test_retrip_after_fresh_loss_sequence(tmp_path: Path):
     with sqlite3.connect(db) as conn:
         for idx in range(5):
             conn.execute(
-                "INSERT INTO scalp_paper_trades (trade_id, symbol, side, quantity, price, notional, pnl_usd, created_at) "
-                "VALUES (?,'XRPUSDT','SELL',1,1,1,-0.04,?)",
+                "INSERT INTO scalp_paper_trades (trade_id, symbol, side, quantity, price, notional, pnl_usd, created_at) VALUES (?,'XRPUSDT','SELL',1,1,1,-0.04,?)",
                 (f"new{idx}", f"2026-08-22 12:1{idx}:00"),
             )
         conn.commit()
@@ -171,7 +169,7 @@ def test_recovery_on_tick_connection_while_write_lock_held(tmp_path: Path):
             breaker_recovery_sec=14400,
             database_path=str(db),
         )
-        locked_engine._ledger = lambda conn: {"principal": 1000.0}
+        locked_engine._ledger = lambda _conn: {"principal": 1000.0}
         locked_engine._utcnow_override = after
         locked_engine._last_breaker_reason = ""
         locked_engine._last_breaker_recovery_until = ""
@@ -192,9 +190,7 @@ def test_recovery_on_tick_connection_while_write_lock_held(tmp_path: Path):
     finally:
         locker.close()
     with sqlite3.connect(db) as conn:
-        tripped, until = conn.execute(
-            "SELECT consec_breaker_tripped_at, consec_breaker_recovery_until FROM scalp_meta WHERE id=1"
-        ).fetchone()
+        tripped, until = conn.execute("SELECT consec_breaker_tripped_at, consec_breaker_recovery_until FROM scalp_meta WHERE id=1").fetchone()
     assert not tripped
     assert not until
 

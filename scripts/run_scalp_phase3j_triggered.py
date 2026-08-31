@@ -16,6 +16,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 import redis
+
 from backend.services.binance_scalp.config import get_scalp_config
 from backend.services.binance_scalp.economics import ScalpEconomics
 from backend.services.binance_scalp.scalp_control import (

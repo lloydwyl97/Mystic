@@ -9,17 +9,16 @@ from backend.services.day_controlled_exits import (
     EXIT_DAY_4H_STRUCTURE_BREAK,
     EXIT_DAY_RISK_FLOOR,
     EXIT_EXTREME_PROTECTION,
+    EXIT_GIVEBACK,
     EXIT_NET_PROFIT,
     EXIT_PATH_EXECUTABLE_PROFIT,
     EXIT_STALL_DEAD,
     EXIT_TIME_STOP,
     EXIT_TRAILING_STOP,
-    EXIT_GIVEBACK,
     _path_aware_exit_enabled,
     evaluate_engine_managed_exit,
     preview_next_engine_exit,
 )
-from backend.services.day_trade_thesis import resolve_day_risk_floor_price
 from backend.services.day_direct_path_ev_authority import (
     DAY_AUTHORITY_MODE,
     OLD_RANK_EXECUTION_AUTHORITY,
@@ -31,6 +30,7 @@ from backend.services.day_path_net import (
     resolve_day_path_ev,
     stamp_day_path_prediction,
 )
+from backend.services.day_trade_thesis import resolve_day_risk_floor_price
 
 
 class _Pos:
@@ -234,9 +234,7 @@ def test_4h_structure_break_exits_as_day_not_scalp_clip():
 def test_risk_floor_sits_below_structure_so_structure_exits_first():
     """A floor tighter than structure would fire first and defeat the 4H hold."""
     entry, invalid, prior_low = 77899.73, 76064.14, 76262.45
-    floor = resolve_day_risk_floor_price(
-        entry_price=entry, thesis_invalid_level=invalid, prior_4h_low=prior_low, atr_pct=0.0236
-    )
+    floor = resolve_day_risk_floor_price(entry_price=entry, thesis_invalid_level=invalid, prior_4h_low=prior_low, atr_pct=0.0236)
     assert floor < invalid
     assert floor < prior_low
     assert floor > entry * 0.94  # still inside the hard adverse cap
@@ -301,14 +299,14 @@ def test_day_exit_policy_defaults_to_path_aware(monkeypatch):
 
 
 def test_only_structure_break_and_extreme_may_full_flatten():
-    assert DAY_FULL_FLATTEN_REASONS == {
+    assert {
         EXIT_DAY_4H_STRUCTURE_BREAK,
         EXIT_DAY_RISK_FLOOR,
         EXIT_EXTREME_PROTECTION,
         EXIT_TRAILING_STOP,
         EXIT_GIVEBACK,
         EXIT_STALL_DEAD,
-    }
+    } == DAY_FULL_FLATTEN_REASONS
     for banned in (EXIT_NET_PROFIT, EXIT_PATH_EXECUTABLE_PROFIT, EXIT_TIME_STOP):
         assert banned not in DAY_FULL_FLATTEN_REASONS
 

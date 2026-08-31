@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import redis
+
 from backend.config.trading_universe import get_trading_symbols
 from backend.database_schema import DATABASE_PATH
 from backend.services.ai_decision_contract import REDIS_KEY_AI_CONTEXT

@@ -66,6 +66,8 @@ def restore_env_backup(backup: dict[str, str]) -> None:
         "SCALP_PAPER_ENABLED": "false",
         "SCALP_LIVE": "false",
         "SCALP_CALIBRATION_MODE": "false",
+        "SCALP_THESIS": "structural",
+        "SCALP_LEGACY_PREDICTION_ENTRIES": "false",
     }
     merged = {**backup, **safe}
     set_env_keys(merged)
@@ -77,6 +79,8 @@ def restore_safe_env() -> None:
             "SCALP_PAPER_ENABLED": "false",
             "SCALP_LIVE": "false",
             "SCALP_CALIBRATION_MODE": "false",
+            "SCALP_THESIS": "structural",
+            "SCALP_LEGACY_PREDICTION_ENTRIES": "false",
         }
     )
 
@@ -142,6 +146,7 @@ def _service_active() -> bool:
 def clear_entry_armed(redis_url: str | None = None, *, prefix: str | None = None) -> bool:
     try:
         import redis
+
         from backend.services.binance_scalp.config import get_scalp_config
         from backend.services.binance_scalp.scalp_control import clear_entry_armed as _clear
 

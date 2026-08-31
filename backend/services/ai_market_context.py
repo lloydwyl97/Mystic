@@ -71,6 +71,7 @@ from backend.services.ai_decision_contract import (
     REDIS_KEY_AI_SENTIMENT,
     REDIS_TTL_AI_CONTEXT_SEC,
 )
+from backend.services.ai_multi_target_regressors import predict_multi_target_from_latest_inference
 from backend.services.catalyst_provider import get_default_provider
 from backend.services.cross_exchange_reference import cross_exchange_dislocation_signal, cross_exchange_snapshot
 from backend.services.day_active_market_bundle import (
@@ -92,7 +93,6 @@ from backend.services.market_role_intelligence import (
     cache_role_context,
     compute_market_role_context,
 )
-from backend.services.ai_multi_target_regressors import predict_multi_target_from_latest_inference
 from backend.services.multi_horizon_ev import compute_multi_horizon_ev
 
 logger = logging.getLogger(__name__)

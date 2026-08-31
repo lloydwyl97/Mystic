@@ -9,6 +9,7 @@ from collections import defaultdict
 from typing import Any
 
 import redis
+
 from backend.config.mystic_api_schedule import BINANCEUS_WEIGHT_PER_MIN
 from backend.metrics import (
     limiter_circuit_open,

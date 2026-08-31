@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_FLOOR, Decimal
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from backend.config.buy_admission import (
@@ -75,13 +76,15 @@ from backend.config.trading_economics import (
     ESTIMATED_ROUNDTRIP_COST_PCT,
     MIN_NET_PROFIT_TO_SELL,
     TAKER_FEE,
-    min_net_profit_for_symbol as _mnp_for_sym,
 )
 from backend.config.trading_economics import (
     SLIPPAGE_BUFFER as SLIPPAGE_PCT,
 )
 from backend.config.trading_economics import (
     log_trading_economics_at_startup as _log_trading_economics_at_startup,
+)
+from backend.config.trading_economics import (
+    min_net_profit_for_symbol as _mnp_for_sym,
 )
 from backend.config.trading_mode import (
     TradingMode,
@@ -103,10 +106,10 @@ from backend.services.live_strategy_contracts import (
 )
 from backend.services.paper_trading_service import get_paper_trading_service
 from backend.services.risk_governor import (
-    AccountSnapshot,
-    CandidateInfo,
     LOSS_HOLD_COOLDOWN_MIN,
     MAX_CONSEC_LOSSES,
+    AccountSnapshot,
+    CandidateInfo,
     RiskGovernor,
 )
 from backend.utils.sqlite_runtime import connect_managed, connect_ro, connect_rw, is_locked_error, run_locked_retry
@@ -1575,7 +1578,7 @@ class TradeExplainability:
     outcome_low_mfe_stall_penalty_eval_json: str = "{}"
     low_mfe_stall_fill_deferred: bool = False
     # DAY bandit (Thompson-sampled promote/kill allocator) — stamped at BUY time
-    # so post-trade audits can replay α/β/mean/starved/size from paper_trades JSON alone.
+    # so post-trade audits can replay alpha/β/mean/starved/size from paper_trades JSON alone.
     day_bandit_enabled: bool = False
     day_bandit_arm_key: str = ""
     day_bandit_alpha: float | None = None
@@ -1813,7 +1816,7 @@ def _stamp_day_bandit_explain(explainability: TradeExplainability, dd: dict[str,
 
     Called after apply_bandit_to_decision_data has stamped bandit fields on the
     candidate's decision_data. Persisting into paper_trades.explainability_json
-    lets post-trade replay reconstruct α/β/mean/starved/size at decision time
+    lets post-trade replay reconstruct alpha/β/mean/starved/size at decision time
     without depending on rolling process logs.
     """
     _dd = dict(dd or {})
@@ -3001,7 +3004,7 @@ class PortfolioEngine:
         try:
             parent = os.path.dirname(path)
             if parent:
-                os.makedirs(parent, exist_ok=True)
+                Path(parent).mkdir(parents=True, exist_ok=True)
             now_utc = datetime.now(timezone.utc).isoformat()
             payload = {
                 "time_epoch": time.time(),
@@ -5328,7 +5331,7 @@ class PortfolioEngine:
         for psym in self._pending_buy_symbols():
             if skip and normalize_symbol(psym) == skip:
                 continue
-            if normalize_symbol(psym) in {normalize_symbol(s) for s in self.open_positions.keys()}:
+            if normalize_symbol(psym) in {normalize_symbol(s) for s in self.open_positions}:
                 continue
             try:
                 if htf_4h_rise_intact_for_symbol(psym):
@@ -5620,12 +5623,12 @@ class PortfolioEngine:
         Best-effort: never raises into the engine.
         """
         try:
+            from backend.services.day_controlled_exits import ALLOWED_DAY_EXIT_REASONS
+            from backend.services.day_trade_thesis import EXIT_NET_PROFIT
             from backend.services.trade_learning_writer import (
                 TradeLearningRecord,
                 record_trade_outcome,
             )
-            from backend.services.day_controlled_exits import ALLOWED_DAY_EXIT_REASONS
-            from backend.services.day_trade_thesis import EXIT_NET_PROFIT
 
             entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
             qty = float(getattr(position, "quantity", 0.0) or 0.0)
@@ -5635,7 +5638,7 @@ class PortfolioEngine:
                 net_pct = gross_pct - ESTIMATED_ROUNDTRIP_COST
             reporting = dict(exit_reporting or {})
             decision_mark_pnl_pct = reporting.get("decision_mark_pnl_pct")
-            decision_mark_pnl_usd = reporting.get("decision_mark_pnl_usd")
+            reporting.get("decision_mark_pnl_usd")
 
             # Canonicalize close_reason here too (defensive) and preserve legacy for audit
             orig_close_reason = str(close_reason or "")
@@ -8939,7 +8942,14 @@ class PortfolioEngine:
                         comm.fee_from_exchange,
                     )
                 logger.warning(
-                    f"LIVE_BUY_SUCCESS: {exchange_symbol} | Order ID: {live_order_buy.get('id')} | Status: {live_order_buy.get('status')} | Filled: {quantity:.6f} @ {fill_price:.4f} fee_usd={fee:.8f} fee_from_exchange={comm.fee_from_exchange}"
+                    "LIVE_BUY_SUCCESS: %s | Order ID: %s | Status: %s | Filled: %.6f @ %.4f fee_usd=%.8f fee_from_exchange=%s",
+                    exchange_symbol,
+                    live_order_buy.get("id"),
+                    live_order_buy.get("status"),
+                    quantity,
+                    fill_price,
+                    fee,
+                    comm.fee_from_exchange,
                 )
             except Exception as e:
                 logger.exception(f"LIVE_BUY_ERROR: {symbol} - {e}")
@@ -9760,9 +9770,7 @@ class PortfolioEngine:
             still_open = remaining > 0
         else:
             still_open, remaining = self._entry_lot_still_open_sync(symbol, entry_trade_id)
-        if still_open and remaining + 1e-9 >= qty:
-            return False
-        return True
+        return not (still_open and remaining + 1e-09 >= qty)
 
     async def execute_legacy_inventory_cleanup(self, symbol: str) -> dict[str, Any] | None:
         """Close pre-router legacy DAY inventory; excluded from new-regime scoreboard."""
@@ -9893,9 +9901,9 @@ class PortfolioEngine:
         exit_trigger = str(_exit_parts.get("canonical_exit_reason") or canonical_day_exit_reason(_raw_exit_trigger, exit_type_name=exit_type.name))
         # Stash on position for learning/attribution writers (not a strategy change).
         try:
-            setattr(position, "_learning_raw_exit_reason", _exit_parts.get("raw_exit_reason"))
-            setattr(position, "_learning_canonical_exit_reason", _exit_parts.get("canonical_exit_reason"))
-            setattr(position, "_learning_dead_trade_reason", _exit_parts.get("dead_trade_reason"))
+            position._learning_raw_exit_reason = _exit_parts.get("raw_exit_reason")
+            position._learning_canonical_exit_reason = _exit_parts.get("canonical_exit_reason")
+            position._learning_dead_trade_reason = _exit_parts.get("dead_trade_reason")
         except Exception:
             pass
 
@@ -10160,8 +10168,7 @@ class PortfolioEngine:
                         available_qty=float(available_qty or 0.0),
                     ):
                         logger.warning(
-                            "SELL_IDEMPOTENCY_ALREADY_CLOSED: %s entry_trade_id=%s qty=%.8f "
-                            "available=%.8f exit=%s",
+                            "SELL_IDEMPOTENCY_ALREADY_CLOSED: %s entry_trade_id=%s qty=%.8f available=%.8f exit=%s",
                             normalized_symbol,
                             position_trade_id,
                             quantity,
@@ -11269,7 +11276,6 @@ class PortfolioEngine:
         # Persist a row in the canonical position_close_ledger so the
         # cooldown survives process restarts and is observable next to
         # HUMAN_MANUAL_SELL records.
-        is_manual = exit_type == ExitType.MANUAL
         wall_cooldown_until = float(self._quality_filter_state.symbol_cooldown_wall.get(normalized_symbol, time.time() + float(POST_SELL_COOLDOWN_WALL_SEC)))
         # Resolve learning close reason from RAW engine trigger so DEAD_NO_MFE survives.
         _learn_trig = str(getattr(position, "_learning_raw_exit_reason", None) or _raw_exit_trigger or exit_trigger or "")
@@ -11724,7 +11730,7 @@ class PortfolioEngine:
         did = str(decision_id or "").strip()
         # Idempotent: same decision_id already reserved
         if did:
-            for sym, r in (self._entry_reservations or {}).items():
+            for _sym, r in (self._entry_reservations or {}).items():
                 if str((r or {}).get("decision_id") or "") == did:
                     return True, "IDEMPOTENT_EXISTING"
         if ns in self._entry_reservations:
@@ -11735,7 +11741,7 @@ class PortfolioEngine:
         if ns in self._pending_buy_order_symbols():
             return False, "ENTRY_PENDING_ORDER"
         active_count = sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING")
-        pending_slots = len(self._pending_buy_symbols() - {normalize_symbol(s) for s in self.open_positions.keys()})
+        pending_slots = len(self._pending_buy_symbols() - {normalize_symbol(s) for s in self.open_positions})
         max_positions_limit = MAX_OPEN_POSITIONS
         if active_count + pending_slots >= max_positions_limit:
             return False, "MAX_POSITIONS_WITH_PENDING"
@@ -11899,7 +11905,7 @@ class PortfolioEngine:
         # DUST_INVARIANT: Exclude DUST_PENDING from count - dust must not block new buys
         # Count pending entry reservations / pending BUY orders toward slot exposure.
         active_count = sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING")
-        pending_slot_symbols = self._pending_buy_symbols() - {normalize_symbol(s) for s in self.open_positions.keys()}
+        pending_slot_symbols = self._pending_buy_symbols() - {normalize_symbol(s) for s in self.open_positions}
         pending_slots = len(pending_slot_symbols)
         max_positions_limit = MAX_OPEN_POSITIONS
         from backend.config.live_test_mode import live_test_max_open_positions_limit
@@ -12531,8 +12537,7 @@ class PortfolioEngine:
             )
             if net_pnl_pct < _intact_floor:
                 logger.info(
-                    "DAY_4H_HOLD_NO_SCALP_CLIP symbol=%s net_pct=%.6f intact_floor=%.6f intact=%s "
-                    "bundle_present=%s prior_4h_low=%s current_4h_close=%s skip=tp1_partial_and_leftover_net_profit",
+                    "DAY_4H_HOLD_NO_SCALP_CLIP symbol=%s net_pct=%.6f intact_floor=%.6f intact=%s bundle_present=%s prior_4h_low=%s current_4h_close=%s skip=tp1_partial_and_leftover_net_profit",
                     symbol,
                     net_pnl_pct,
                     _intact_floor,
@@ -12543,8 +12548,7 @@ class PortfolioEngine:
                 )
                 return None
             logger.warning(
-                "DAY_4H_INTACT_PROFIT_TAKE symbol=%s net_pct=%.6f >= intact_floor=%.6f "
-                "prior_4h_low=%s current_4h_close=%s",
+                "DAY_4H_INTACT_PROFIT_TAKE symbol=%s net_pct=%.6f >= intact_floor=%.6f prior_4h_low=%s current_4h_close=%s",
                 symbol,
                 net_pnl_pct,
                 _intact_floor,
@@ -14853,12 +14857,7 @@ class PortfolioEngine:
         found.decision_data = dict(found.decision_data or {})
         cand_ev = 0.0
         with contextlib.suppress(Exception):
-            cand_ev = float(
-                found.decision_data.get("selected_net_expected_value")
-                or found.decision_data.get("adjusted_ev")
-                or found.decision_data.get("predicted_net_return")
-                or 0.0
-            )
+            cand_ev = float(found.decision_data.get("selected_net_expected_value") or found.decision_data.get("adjusted_ev") or found.decision_data.get("predicted_net_return") or 0.0)
         if cand_ev <= 0.0:
             with contextlib.suppress(Exception):
                 cand_ev = float(self._estimate_candidate_net_expected_value(found.decision_data, symbol=str(found.symbol or "")))
@@ -15056,7 +15055,7 @@ class PortfolioEngine:
                         "MULTI_BUY_MISSING_SETUP symbol=%s decision_id=%s dd_keys=%s",
                         symbol,
                         cand.decision_id,
-                        sorted(list(_dd.keys()))[:40],
+                        sorted(_dd.keys())[:40],
                     )
                 exec_price = float(cand.current_price or 0.0)
                 with contextlib.suppress(Exception):
@@ -15701,7 +15700,7 @@ class PortfolioEngine:
                         dd["thesis_rank_delta"] = round(existing + basket_delta, 4)
                         intel = float(dd.get("intelligence_rank_delta") or 0.0) + basket_delta
                         dd["intelligence_rank_delta"] = round(max(-0.10, min(0.10, intel)), 4)
-                        setattr(_tc, "decision_data", dd)
+                        _tc.decision_data = dd
                 except Exception:
                     pass
             ll = leading_lagging_summary(valid_candidates)
@@ -17496,10 +17495,7 @@ class PortfolioEngine:
         failsafe = bool(ledger_failsafe)
         failsafe_reason = ""
         if failsafe:
-            failsafe_reason = (
-                f"ACCOUNT_FAILSAFE equity=${account_equity:.2f} principal=${float(self.principal or 0.0):.2f} "
-                "— MANUAL POSITION REVIEW REQUIRED"
-            )
+            failsafe_reason = f"ACCOUNT_FAILSAFE equity=${account_equity:.2f} principal=${float(self.principal or 0.0):.2f} — MANUAL POSITION REVIEW REQUIRED"
         accounting: dict[str, Any] = {"ok": True, "orphans": []}
         try:
             from backend.services.atomic_execution_book import find_cash_position_disagreement
@@ -17519,13 +17515,7 @@ class PortfolioEngine:
         if not accounting.get("ok", False):
             n_orphans = len(accounting.get("orphans") or [])
             reasons.append(f"accounting_disagreement:orphans={n_orphans}:diff={accounting.get('identity_diff')}")
-        day_entry = (
-            not self._trading_paused
-            and self._account_status == AccountStatus.HEALTHY
-            and not bool(ks.get("buys_blocked"))
-            and not failsafe
-            and bool(accounting.get("ok"))
-        )
+        day_entry = not self._trading_paused and self._account_status == AccountStatus.HEALTHY and not bool(ks.get("buys_blocked")) and not failsafe and bool(accounting.get("ok"))
         return {
             "process_alive": True,
             "accounting_healthy": bool(accounting.get("ok")),
@@ -17588,16 +17578,12 @@ class PortfolioEngine:
         live_dust_value = 0.0
         for row in dust_list:
             try:
-                live_dust_value += float(row.get("market_value") or row.get("quantity", 0) or 0) * float(
-                    row.get("current_price") or row.get("entry_price") or 0
-                )
+                live_dust_value += float(row.get("market_value") or row.get("quantity", 0) or 0) * float(row.get("current_price") or row.get("entry_price") or 0)
             except (TypeError, ValueError):
                 pass
         if live_dust_value <= 0:
             live_dust_value = sum(
-                float(getattr(p, "quantity", 0) or 0) * float(getattr(p, "entry_price", 0) or 0)
-                for p in self.open_positions.values()
-                if getattr(p, "status", "ACTIVE") == "DUST_PENDING"
+                float(getattr(p, "quantity", 0) or 0) * float(getattr(p, "entry_price", 0) or 0) for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") == "DUST_PENDING"
             )
 
         # Account equity: cash + MTM positions (matches engine._total_equity / persisted ledger row)
@@ -17826,12 +17812,12 @@ class PortfolioEngine:
                 perf.pause_until = float(row["pause_until"] or 0.0)
                 perf.sizing_multiplier = float(row["sizing_multiplier"] or 1.0)
                 perf.last_updated = float(row["last_updated"] or 0.0)
-                if "profit_factor" in row.keys():
+                if "profit_factor" in row:
                     pf = row["profit_factor"]
                     perf.profit_factor = None if pf is None else float(pf)
-                if "trades_last_30d" in row.keys():
+                if "trades_last_30d" in row:
                     perf.trades_last_30d = int(row["trades_last_30d"] or 0)
-                if "avg_pnl" in row.keys():
+                if "avg_pnl" in row:
                     perf.avg_pnl = float(row["avg_pnl"] or 0.0)
                 self.coin_performance[sym] = perf
                 loaded += 1
@@ -17866,9 +17852,7 @@ class PortfolioEngine:
             pf = (gp / gl) if gl > 0 else (None if gp > 0 else 1.0)
             would = hits >= PAUSE_THRESHOLD_STOP_HITS
             would = would or (t24 >= PAUSE_THRESHOLD_TRADES_24H and p24 < 0 and wr < PAUSE_THRESHOLD_WIN_RATE)
-            would = would or (
-                pf is not None and pf < PROFIT_FACTOR_DISABLE_THRESHOLD and len(live20) >= MIN_TRADES_FOR_DISABLE
-            )
+            would = would or (pf is not None and pf < PROFIT_FACTOR_DISABLE_THRESHOLD and len(live20) >= MIN_TRADES_FOR_DISABLE)
             if not would and perf.pause_until > now:
                 logger.warning("LIVE_RISK_PAUSE_CLEARED_ON_LOAD symbol=%s hits=%s", symbol, hits)
                 perf.pause_until = 0.0
@@ -17957,19 +17941,21 @@ class PortfolioEngine:
         }
         if not perf:
             return out
-        out.update({
-            "is_paused": perf.is_paused,
-            "pause_until": perf.pause_until,
-            "trades_24h": perf.trades_24h,
-            "pnl_24h": perf.pnl_24h,
-            "win_rate_20": perf.win_rate_20,
-            "expectancy": perf.expectancy,
-            "avg_win": perf.avg_win,
-            "avg_loss": perf.avg_loss,
-            "stop_loss_hits_10": perf.stop_loss_hits_10,
-            "sizing_multiplier": perf.sizing_multiplier,
-            "last_updated": perf.last_updated,
-        })
+        out.update(
+            {
+                "is_paused": perf.is_paused,
+                "pause_until": perf.pause_until,
+                "trades_24h": perf.trades_24h,
+                "pnl_24h": perf.pnl_24h,
+                "win_rate_20": perf.win_rate_20,
+                "expectancy": perf.expectancy,
+                "avg_win": perf.avg_win,
+                "avg_loss": perf.avg_loss,
+                "stop_loss_hits_10": perf.stop_loss_hits_10,
+                "sizing_multiplier": perf.sizing_multiplier,
+                "last_updated": perf.last_updated,
+            }
+        )
         return out
 
     def get_last_decisions(self, count: int = 10) -> list[dict[str, Any]]:
@@ -18136,9 +18122,7 @@ class PortfolioEngine:
                                                     sell_epoch = float(raw_ts)
                                                 except (TypeError, ValueError):
                                                     try:
-                                                        sell_epoch = datetime.fromisoformat(
-                                                            str(raw_ts).replace("Z", "+00:00")
-                                                        ).timestamp()
+                                                        sell_epoch = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00")).timestamp()
                                                     except Exception:
                                                         sell_epoch = 0.0
                                             if sell_epoch > entry_time + 1e-6:
@@ -19125,11 +19109,7 @@ class PortfolioEngine:
         principal = float(getattr(self, "principal", 0.0) or 0.0)
         failsafe = account_failsafe_tripped(account_equity, principal)
         if failsafe:
-            reason = (
-                f"{self._CIRCUIT_BREAKER_REASON_PREFIX}ACCOUNT_FAILSAFE "
-                f"equity=${account_equity:.2f} principal=${principal:.2f} "
-                "— MANUAL POSITION REVIEW REQUIRED"
-            )
+            reason = f"{self._CIRCUIT_BREAKER_REASON_PREFIX}ACCOUNT_FAILSAFE equity=${account_equity:.2f} principal=${principal:.2f} — MANUAL POSITION REVIEW REQUIRED"
             return {
                 "mode": KillSwitchMode.PAUSE_BUYS.value,
                 "reason": reason,

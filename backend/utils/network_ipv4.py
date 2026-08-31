@@ -38,7 +38,7 @@ def ensure_ipv4_only() -> None:
 
     original_getaddrinfo = _socket.getaddrinfo
 
-    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002 (match socket signature)
+    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
         try:
             results = original_getaddrinfo(host, port, _socket.AF_INET, type, proto, flags)
             if results:

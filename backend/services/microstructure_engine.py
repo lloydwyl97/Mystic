@@ -253,7 +253,7 @@ def _persistence_and_reversals(values: list[float]) -> tuple[float, float]:
     prev_sign = 0
     for v in values:
         sign = 1 if v > 0 else (-1 if v < 0 else 0)
-        if sign != 0 and prev_sign != 0 and sign != prev_sign:
+        if sign != 0 and prev_sign not in (0, sign):
             reversals += 1
         if sign != 0:
             prev_sign = sign
@@ -503,10 +503,7 @@ def _overlay_redis_tape(out: dict[str, Any], symbol: str) -> None:
         0.0,
         min(
             1.0,
-            0.30 * fragility
-            + 0.25 * max(0.0, -mp * 400.0)
-            + 0.20 * max(0.0, -flow)
-            + 0.25 * near,
+            0.30 * fragility + 0.25 * max(0.0, -mp * 400.0) + 0.20 * max(0.0, -flow) + 0.25 * near,
         ),
     )
     out["adverse_selection_score"] = round(adverse, 4)
@@ -644,13 +641,7 @@ def get_microstructure_ranking_delta(symbol: str) -> float:
         ofi_signed = math.tanh(ofi_5s / 5.0) if abs(ofi_5s) > 1e-9 else 0.0
 
         # Composite remains ranking-only. Adverse selection is a penalty, not a gate.
-        signal = (
-            (0.32 * ofi_signed)
-            + (0.22 * agg_flow_5s)
-            + (0.22 * math.tanh(mp_pressure * 500.0))
-            + (0.14 * max(-1.0, min(1.0, absorp)))
-            - (0.10 * (2.0 * adverse - 0.5))
-        )
+        signal = (0.32 * ofi_signed) + (0.22 * agg_flow_5s) + (0.22 * math.tanh(mp_pressure * 500.0)) + (0.14 * max(-1.0, min(1.0, absorp))) - (0.10 * (2.0 * adverse - 0.5))
         delta = max(-_RANKING_DELTA_CAP, min(_RANKING_DELTA_CAP, signal * _RANKING_DELTA_CAP))
         return round(delta, 6)
     except Exception:

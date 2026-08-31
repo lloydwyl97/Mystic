@@ -64,7 +64,7 @@ def _insert(db_path, *, symbol, pnl_pct, mfe_pct, mae_pct, hold_seconds=600):
 
 
 def _pos(**overrides):
-    base = dict(symbol="BTC/USDT", entry_thesis="HTF_TREND_PULLBACK", day_route_regime_at_entry="range")
+    base = {"symbol": "BTC/USDT", "entry_thesis": "HTF_TREND_PULLBACK", "day_route_regime_at_entry": "range"}
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -292,7 +292,7 @@ def test_atr_grid_target_selects_best_expectancy_multiple(db_path, monkeypatch):
 
 
 def test_atr_grid_target_never_uses_cross_symbol_pool(db_path, monkeypatch):
-    for i in range(30):
+    for _i in range(30):
         _insert(db_path, symbol="ETHUSDT", pnl_pct=0.05, mfe_pct=0.05, mae_pct=0.001)
     monkeypatch.setattr(dat, "_db_path", lambda: db_path)
     result = dat.atr_grid_target_candidate("SOLUSDT", current_atr_pct=0.01)
@@ -327,7 +327,7 @@ def test_effective_target_price_unaffected_when_bundle_omitted(db_path, monkeypa
 
 
 def test_progress_decay_never_uses_cross_symbol_pool(db_path, monkeypatch):
-    for i in range(6):
+    for _i in range(6):
         _insert(db_path, symbol="ETHUSDT", pnl_pct=1.0, mfe_pct=0.05, mae_pct=0.001, hold_seconds=1800)
     with mock.patch("backend.services.day_controlled_exits._db_path", return_value=db_path):
         out = evaluate_progress_decay_exit(

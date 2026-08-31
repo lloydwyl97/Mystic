@@ -63,7 +63,7 @@ def parse_feature_health_sidecar(decision_data: dict[str, Any] | None) -> dict[s
 
 def compute_block_scores_from_sidecar(sidecar: dict[str, Any] | None) -> dict[str, float]:
     """Aggregate per-feature trust into block scores in [0, 1]."""
-    out: dict[str, float] = {k: 0.0 for k in BLOCK_SCORE_KEYS}
+    out: dict[str, float] = dict.fromkeys(BLOCK_SCORE_KEYS, 0.0)
     if not sidecar:
         out["feature_health_score"] = 0.0
         return out

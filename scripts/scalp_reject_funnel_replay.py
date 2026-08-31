@@ -73,7 +73,7 @@ def _corr(xs, ys):
         return None
     mx = sum(xs) / n
     my = sum(ys) / n
-    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=False))
     dx = sum((x - mx) ** 2 for x in xs) ** 0.5
     dy = sum((y - my) ** 2 for y in ys) ** 0.5
     if dx == 0 or dy == 0:
@@ -149,9 +149,7 @@ def main() -> int:
                 continue
             snap = _snapshot(sym, mid, window)
             mom = _mom_from_bars(window)
-            ctx = StrategyMarketContext(
-                symbol=sym, snap=snap, mom=mom, bars_1m=window, econ=econ, config=config, notional_usd=NOTIONAL
-            )
+            ctx = StrategyMarketContext(symbol=sym, snap=snap, mom=mom, bars_1m=window, econ=econ, config=config, notional_usd=NOTIONAL)
             meas_all = measure_all_setups(ctx)
             future = raw[i + 1 : i + 21]
             entry = float(snap.best_ask)
@@ -277,7 +275,11 @@ def main() -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, default=str))
-    print(json.dumps({"ok": True, "db": str(db), "out": str(out), "funnel_passed": {k: v["passed"] for k, v in scalp_report.items()}, "evals": {k: v["evaluations"] for k, v in scalp_report.items()}}, indent=2))
+    print(
+        json.dumps(
+            {"ok": True, "db": str(db), "out": str(out), "funnel_passed": {k: v["passed"] for k, v in scalp_report.items()}, "evals": {k: v["evaluations"] for k, v in scalp_report.items()}}, indent=2
+        )
+    )
     for name, body in scalp_report.items():
         print(name, "evals", body["evaluations"], "passed", body["passed"], "rej5_exp", body["rejected_5m_expectancy"], "syms", body["evaluations_by_symbol"])
     conn.close()

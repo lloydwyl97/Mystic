@@ -326,7 +326,6 @@ def entry_signal(state: AWState) -> dict[str, Any] | None:
     # TREND_DOWN: failed breakdown / reversal when sweep low + reclaim + momentum flip
     if state.regime == REG_TREND_DOWN:
         # proxy for failed breakdown: made a low then reclaimed with positive close change + low rsi
-        recent = 0.008  # ~0.8% sweep tolerance relative
         swept_low = (c - state.don_low) / max(state.don_low, 1e-9) > -0.012  # within recent low area
         reclaim = c > state.prev_close and state.rsi < 40
         if swept_low and reclaim:
@@ -370,9 +369,9 @@ def exit_decision(
 
 
 __all__ = [
+    "BREAKOUT_RSI_HOT",
     "BREAKOUT_RSI_MAX_NEUTRAL",
     "BREAKOUT_RSI_MAX_TREND",
-    "BREAKOUT_RSI_HOT",
     "CONTINUATION_RSI_MAX",
     "EXIT_ATR_STOP",
     "EXIT_ATR_TARGET",

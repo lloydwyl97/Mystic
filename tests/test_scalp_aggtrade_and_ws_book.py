@@ -23,9 +23,7 @@ def test_aggtrade_accepts_combined_and_raw_payloads():
     c = AggTradeCollector()
 
     async def _run():
-        with mock.patch("backend.services.microstructure_engine.record_agg_trade", _record), mock.patch.object(
-            c, "_heartbeat_throttled", new=mock.AsyncMock()
-        ):
+        with mock.patch("backend.services.microstructure_engine.record_agg_trade", _record), mock.patch.object(c, "_heartbeat_throttled", new=mock.AsyncMock()):
             await c._process_message(
                 json.dumps(
                     {
@@ -34,9 +32,7 @@ def test_aggtrade_accepts_combined_and_raw_payloads():
                     }
                 )
             )
-            await c._process_message(
-                json.dumps({"e": "aggTrade", "s": "ETHUSDT", "q": "0.2", "m": False, "T": 2_000_000})
-            )
+            await c._process_message(json.dumps({"e": "aggTrade", "s": "ETHUSDT", "q": "0.2", "m": False, "T": 2_000_000}))
             await c._process_message(json.dumps({"result": None, "id": 1}))
 
     asyncio.run(_run())

@@ -224,12 +224,12 @@ def registry_snapshot() -> dict[str, Any]:
 
 __all__ = [
     "DECISION_POLICY_VERSION",
-    "SCALP_GATES",
-    "GateSpec",
     "MEASUREMENT_WINDOW_STARTED_UTC",
     "REASON_TO_GATE",
     "REGISTRY_VERSION",
+    "SCALP_GATES",
     "THRESHOLD_FREEZE_ACTIVE",
+    "GateSpec",
     "get_gate",
     "map_reason_to_gate",
     "registry_snapshot",

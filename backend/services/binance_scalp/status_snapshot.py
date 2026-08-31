@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import redis
+
 from backend.services.binance_scalp.calibration_profiles import economics_for_config
 from backend.services.binance_scalp.config import ScalpConfig, get_scalp_config
 from backend.services.binance_scalp.economics import ScalpEconomics
@@ -20,25 +21,26 @@ from backend.services.binance_scalp.momentum_gross_estimate import (
     compute_momentum_gross_estimate,
 )
 from backend.services.binance_scalp.momentum_tracker import MomentumDiagnostics, MomentumTracker
-from backend.services.binance_scalp.orderbook_book import walk_buy_notional, walk_sell_qty
-from backend.services.binance_scalp.protected_preflight import run_scalp_preflight
-from backend.services.binance_scalp.redis_keys import scan_key, runner_state_key
-from backend.services.binance_scalp.scalp_control import is_entry_armed
-from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
-from backend.services.binance_scalp.strategies.kline_cache import KlineCache
-from backend.services.binance_scalp.scalp_candidate_ranking import (
-    _min_tradeable_score,
-    _min_confident_rank,
-    _rank_tie_margin,
-    attach_action_predictions,
-    pick_best_global_candidate,
-)
 from backend.services.binance_scalp.near_pass import (
     NEAR_PASS_THRESHOLD,
     _distance_to_pass,
     is_high_quality_near_pass,
     warm_momentum,
 )
+from backend.services.binance_scalp.orderbook_book import walk_buy_notional, walk_sell_qty
+from backend.services.binance_scalp.protected_preflight import run_scalp_preflight
+from backend.services.binance_scalp.redis_keys import runner_state_key, scan_key
+from backend.services.binance_scalp.scalp_candidate_ranking import (
+    _min_confident_rank,
+    _min_tradeable_score,
+    _rank_tie_margin,
+    attach_action_predictions,
+    pick_best_global_candidate,
+)
+from backend.services.binance_scalp.scalp_control import is_entry_armed
+from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
+from backend.services.binance_scalp.strategies.kline_cache import KlineCache
+from backend.services.binance_scalp.structural_thesis import status_fields as structural_status_fields
 
 
 def _overlay_runner_scan(
@@ -685,6 +687,7 @@ def build_scalp_status(*, warm_rounds: int = 0, warm_interval_sec: float = 5.0) 
         "products": list(config.products),
         "scalp_live": config.scalp_live,
         "scalp_paper_enabled": config.scalp_paper_enabled,
+        **structural_status_fields(config),
         "entry_armed": entry_armed,
         "open_scalp_positions": open_positions,
         "warm_rounds_used": warm_rounds,

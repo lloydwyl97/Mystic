@@ -28,7 +28,7 @@ def _seed_trades(db: Path, rows: list[tuple[str, str, float, str]]) -> None:
             )
             """
         )
-        for i, (symbol, mode, pnl, ts) in enumerate(rows):
+        for _i, (symbol, mode, pnl, ts) in enumerate(rows):
             conn.execute(
                 "INSERT INTO paper_trades (symbol, side, mode, pnl, timestamp) VALUES (?,?,?,?,?)",
                 (symbol, "SELL", mode, pnl, ts),
@@ -47,8 +47,7 @@ def test_paper_losses_do_not_count_as_live_hits(tmp_path: Path):
     db = tmp_path / "t.db"
     _seed_trades(
         db,
-        [("BTCUSDT", "paper", -1.0, f"2026-08-2{i}T00:00:00") for i in range(5)]
-        + [("BTCUSDT", "live", 0.53, "2026-08-24T10:14:00")],
+        [("BTCUSDT", "paper", -1.0, f"2026-08-2{i}T00:00:00") for i in range(5)] + [("BTCUSDT", "live", 0.53, "2026-08-24T10:14:00")],
     )
     paper_sticky = 10
     live_pnls = recent_sell_pnls(str(db), "BTCUSDT", limit=10, mode="live")

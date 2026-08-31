@@ -703,7 +703,7 @@ def build_feature_dict_from_ohlcv(
     out["ichimoku_kijun"] = kijun
     out["ichimoku_senkou_a"] = senkou_a
     out["ichimoku_senkou_b"] = senkou_b
-    ichi_status = "CALCULATED" if n_bars >= 52 else ("WARMUP" if n_bars >= 9 else "WARMUP")
+    ichi_status = "CALCULATED" if n_bars >= 52 else "WARMUP"
     ichi_src = f"ichimoku native ohlcv bars={n_bars}"
     for iname in ("ichimoku_tenkan", "ichimoku_kijun", "ichimoku_senkou_a", "ichimoku_senkou_b"):
         _record_feature_provenance(provenance, iname, ichi_status, ichi_src, learning_allowed=ichi_status == "CALCULATED")

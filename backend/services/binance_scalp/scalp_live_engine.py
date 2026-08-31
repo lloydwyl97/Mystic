@@ -37,7 +37,7 @@ class ScalpLiveEngine:
 
     def __init__(self, config: ScalpConfig) -> None:
         self._config = config
-        self._bridge: Optional[ScalpOrderBridge] = None
+        self._bridge: ScalpOrderBridge | None = None
         self._open_positions: dict[str, ScalpFill] = {}  # symbol -> entry ScalpFill
         self._daily_pnl: float = 0.0
         self._armed = False
@@ -117,7 +117,7 @@ class ScalpLiveEngine:
         is_urgent_exit: bool = False,
         spread_pct: float = 0.0,
         adverse_selection_risk: float = 0.0,
-    ) -> Optional[float]:
+    ) -> float | None:
         """
         Execute a live scalp exit.
         Returns realized PnL if successful, None if failed.

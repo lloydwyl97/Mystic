@@ -35,7 +35,7 @@ def _cost_based_ev_fallback(monkeypatch):
     """
     import backend.services.binance_scalp.forward_net_predictor as fnp
 
-    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda row: None)
+    monkeypatch.setattr(fnp, "predict_row_expected_net", lambda _row: None)
 
 
 def _ctx(*, spread: float = 0.0002, mid_change_15s: float = 0.0, confirmed: bool = False) -> StrategyMarketContext:

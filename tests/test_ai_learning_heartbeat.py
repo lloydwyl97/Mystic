@@ -1,8 +1,8 @@
 """Heartbeat math and thesis-valid capture (data only, no strategy changes)."""
 
+import os
 import sqlite3
 import tempfile
-import os
 
 from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, TAKER_FEE
 from backend.services.ai_learning_ingestion import (
@@ -141,7 +141,7 @@ def test_record_position_heartbeat_persists_calc_v2_fields():
                 """
             ).fetchone()
         assert row is not None
-        ep, mk, up, nup, qty, gross_usd, net_usd, fee, ws, ver = row
+        ep, mk, up, nup, qty, gross_usd, net_usd, _fee, ws, ver = row
         assert ep == 100.0 and mk == 99.5 and qty == 10.0
         assert abs(up - (-0.005)) < 1e-12
         assert abs(nup - (-0.005 - float(ESTIMATED_ROUNDTRIP_COST))) < 1e-12

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from backend.services.binance_scalp.config import ScalpConfig
@@ -36,6 +36,7 @@ def _deep_book(mid: float) -> tuple[list[list[float]], list[list[float]]]:
 
 def _mom_from_bars(bars: list[dict[str, Any]]) -> MomentumDiagnostics:
     closes = [float(b["close"]) for b in bars]
+
     def ch(n: int) -> float:
         if len(closes) <= n or closes[-1 - n] <= 0:
             return 0.0
@@ -285,7 +286,7 @@ def replay_all_strategies(
         reverse=True,
     )
     return {
-        "evaluated_at": datetime.utcnow().isoformat() + "Z",
+        "evaluated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "symbols": list(symbols),
         "note": "Replay only. Disabled runtime strategies were NOT enabled in paper/live.",
         "ranked_by_structural_expectancy": [name for name, _ in ranked],

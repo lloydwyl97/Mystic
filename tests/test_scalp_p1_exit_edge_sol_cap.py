@@ -10,8 +10,8 @@ from backend.services.binance_scalp.config import ScalpConfig
 from backend.services.binance_scalp.economics import ScalpEconomics
 from backend.services.binance_scalp.exit_manager import (
     EXIT_EARLY_SCRATCH,
-    PositionTrack,
     STATE_OPEN,
+    PositionTrack,
     _stall_exit_hold_frac,
     _stall_exit_min_sec,
     evaluate_exit,

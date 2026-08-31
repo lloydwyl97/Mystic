@@ -23,8 +23,7 @@ def fold_high_water(previous: float, *candidates: float | None) -> float:
             px = float(raw)
         except (TypeError, ValueError):
             continue
-        if px > best:
-            best = px
+        best = max(best, px)
     return best
 
 
@@ -122,8 +121,7 @@ def max_post_entry_1m_high(entry_epoch: float, candles: list[dict[str, Any]] | N
             high = float(candle.get("high") or 0.0)
         except (TypeError, ValueError):
             continue
-        if high > best:
-            best = high
+        best = max(best, high)
     return best
 
 

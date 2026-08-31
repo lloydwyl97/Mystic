@@ -54,7 +54,7 @@ def maybe_run_scalp_reject_retention(db_path: str, *, min_interval_sec: float = 
             max_run_seconds=30.0,
         )
         tables = out.get("tables") or {}
-        scalp = tables.get("scalp_rejects") or {}
+        tables.get("scalp_rejects") or {}
         _LAST_RETENTION_AT = now
         return out
     except Exception:

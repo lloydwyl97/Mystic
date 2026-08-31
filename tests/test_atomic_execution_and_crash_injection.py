@@ -177,7 +177,7 @@ def test_crash_during_mtm_after_commit_reload_restores_position():
 def test_orphan_restore_detects_zeroed_remaining_without_sell():
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "day.db"
-        engine = _init_engine(db)
+        _init_engine(db)
         with sqlite3.connect(str(db)) as conn:
             conn.execute(
                 """
@@ -188,9 +188,7 @@ def test_orphan_restore_detects_zeroed_remaining_without_sell():
                           0.0, datetime('now'), 'executed')
                 """
             )
-            conn.execute(
-                "UPDATE portfolio_engine_ledger SET cash_balance=9900, positions_value=0, total_equity=9900 WHERE id=1"
-            )
+            conn.execute("UPDATE portfolio_engine_ledger SET cash_balance=9900, positions_value=0, total_equity=9900 WHERE id=1")
             conn.commit()
         orphans = find_orphaned_day_buys(str(db))
         assert len(orphans) == 1
@@ -204,7 +202,7 @@ def test_orphan_restore_detects_zeroed_remaining_without_sell():
 def test_orphan_restore_from_committed_buy_does_not_invent_cash():
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "day.db"
-        engine = _init_engine(db)
+        _init_engine(db)
         with sqlite3.connect(str(db)) as conn:
             conn.execute(
                 """
@@ -215,9 +213,7 @@ def test_orphan_restore_from_committed_buy_does_not_invent_cash():
                           1476.60871, datetime('now'), 'executed')
                 """
             )
-            conn.execute(
-                "UPDATE portfolio_engine_ledger SET cash_balance=8041.04, positions_value=0, total_equity=8041.04 WHERE id=1"
-            )
+            conn.execute("UPDATE portfolio_engine_ledger SET cash_balance=8041.04, positions_value=0, total_equity=8041.04 WHERE id=1")
             conn.commit()
         orphans = find_orphaned_day_buys(str(db))
         assert len(orphans) == 1
@@ -358,7 +354,7 @@ def test_later_same_symbol_sell_does_not_hide_unclosed_other_lot():
 
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "lots.db"
-        engine = _init_engine(db)
+        _init_engine(db)
         with sqlite3.connect(str(db)) as conn:
             conn.execute(
                 """
@@ -380,7 +376,7 @@ def test_later_same_symbol_sell_does_not_hide_unclosed_other_lot():
 def test_canonical_purge_ignores_historical_sells_before_entry():
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "purge.db"
-        engine = _init_engine(db)
+        _init_engine(db)
         entry_time = time.time()
         with sqlite3.connect(str(db)) as conn:
             conn.execute(
@@ -416,6 +412,7 @@ def test_canonical_purge_ignores_historical_sells_before_entry():
                     raw = srow[0]
                     try:
                         from datetime import datetime
+
                         epoch = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
                     except Exception:
                         epoch = 0.0
@@ -434,7 +431,7 @@ def test_orphan_cash_restore_credits_identified_buys_only():
 
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "heal.db"
-        engine = _init_engine(db, cash=25_000.0)
+        _init_engine(db, cash=25_000.0)
         with sqlite3.connect(str(db)) as conn:
             conn.execute(
                 """
@@ -445,9 +442,7 @@ def test_orphan_cash_restore_credits_identified_buys_only():
                           0.03373, 65206.88, 0.0, '2026-08-10T08:00:07+00:00', 'executed')
                 """
             )
-            conn.execute(
-                "UPDATE portfolio_engine_ledger SET cash_balance=20984.86, positions_value=0, realized_pnl=385.15, total_equity=20984.86 WHERE id=1"
-            )
+            conn.execute("UPDATE portfolio_engine_ledger SET cash_balance=20984.86, positions_value=0, realized_pnl=385.15, total_equity=20984.86 WHERE id=1")
             conn.commit()
             buy_id = conn.execute("SELECT id FROM paper_trades WHERE trade_id='mystic_BTC/USDT_1'").fetchone()[0]
         out = apply_orphan_buy_cash_restore(
@@ -458,9 +453,7 @@ def test_orphan_cash_restore_credits_identified_buys_only():
         )
         assert out["success"] is True
         with sqlite3.connect(str(db)) as conn:
-            cash, equity, realized = conn.execute(
-                "SELECT cash_balance, total_equity, realized_pnl FROM portfolio_engine_ledger WHERE id=1"
-            ).fetchone()
+            cash, _equity, realized = conn.execute("SELECT cash_balance, total_equity, realized_pnl FROM portfolio_engine_ledger WHERE id=1").fetchone()
         assert realized == pytest.approx(385.15, abs=0.01)
         assert cash == pytest.approx(20984.86 + 0.03373 * 65206.88, abs=0.02)
         assert find_orphaned_day_buys(str(db)) == []
@@ -504,7 +497,7 @@ def test_learning_consume_affects_rank_delta():
         db = Path(tmp) / "learn.db"
         from backend.config.trading_mode import TradingMode
 
-        for i, pnl in enumerate([2.0, 1.5, 1.0, 0.8, 0.5, 0.4, 0.3, 0.2]):
+        for _i, pnl in enumerate([2.0, 1.5, 1.0, 0.8, 0.5, 0.4, 0.3, 0.2]):
             rec = TradeLearningRecord(
                 symbol="BTCUSDT",
                 entry_timestamp=1.0,

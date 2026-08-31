@@ -13,7 +13,6 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
 from backend.config.redis_config import get_redis_client as get_actual_redis_client
-from backend.services.admin_auth import require_admin_key
 from backend.observability.order_metrics import (
     ACTIVE_ORDERS_GAUGE,
     ADV_ORDERS_CREATE_LATENCY_SECONDS,
@@ -24,6 +23,7 @@ from backend.observability.order_metrics import (
     ORDERS_ERRORS_TOTAL,
     ORDERS_GET_LATENCY_SECONDS,
 )
+from backend.services.admin_auth import require_admin_key
 from backend.services.order_service import order_service
 from backend.utils.enhanced_logging import get_service_logger
 

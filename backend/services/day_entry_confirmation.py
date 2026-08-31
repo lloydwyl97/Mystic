@@ -1,7 +1,7 @@
 """DAY entry-confirmation soft demotion.
 
 Post-audit observation: recent DAY BUYs closed with MFE < 0.06% but MAE
-0.25–0.65% — entries triggered at bar-close on setups that never actually
+0.25-0.65% — entries triggered at bar-close on setups that never actually
 confirmed a directional move. This module computes a soft "did the bar
 confirm the entry direction?" penalty that lowers a candidate's rank and
 size when confirmation is missing, without hard-blocking the trade.

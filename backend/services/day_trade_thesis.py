@@ -612,9 +612,7 @@ def apply_ml_locked_setup_override(
     prior_setup = str(decision_data.get("setup_type") or decision_data.get("entry_thesis") or decision_data.get("allweather_setup") or "")
     locked = str(dd.get("allweather_setup") or dd.get("setup_type") or dd.get("entry_thesis") or "")
     if not locked or locked == SETUP_NO_CLEAR_THESIS:
-        if route_regime == "bear":
-            locked = SETUP_RANGE_BOUNCE
-        elif route_regime in ("range", "neutral"):
+        if route_regime == "bear" or route_regime in ("range", "neutral"):
             locked = SETUP_RANGE_BOUNCE
         else:
             locked = SETUP_HTF_TREND_PULLBACK
@@ -957,20 +955,20 @@ def _ohlcv_ohlc(row: Any) -> tuple[float, float, float, float] | None:
         if isinstance(row, dict):
             o = float(row.get("open") or 0)
             h = float(row.get("high") or 0)
-            l = float(row.get("low") or 0)
+            low = float(row.get("low") or 0)
             c = float(row.get("close") or 0)
         elif isinstance(row, (list, tuple)) and len(row) >= 5:
             o = float(row[1])
             h = float(row[2])
-            l = float(row[3])
+            low = float(row[3])
             c = float(row[4])
         else:
             return None
     except (TypeError, ValueError):
         return None
-    if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+    if o <= 0 or h <= 0 or low <= 0 or c <= 0:
         return None
-    return o, h, l, c
+    return o, h, low, c
 
 
 DAY_4H_MS = 4 * 3600 * 1000
@@ -1042,20 +1040,20 @@ def _row_with_forming_close(row: Any, close: float) -> Any:
     ohlc = _ohlcv_ohlc(row)
     if ohlc is None:
         return row
-    o, h, l, _c = ohlc
+    _o, h, low, _c = ohlc
     h = max(h, close)
-    l = min(l, close)
+    low = min(low, close)
     if isinstance(row, dict):
         out = dict(row)
         out["close"] = close
         out["high"] = h
-        out["low"] = l
+        out["low"] = low
         return out
     new = list(row)
     while len(new) < 5:
         new.append(0.0)
     new[2] = h
-    new[3] = l
+    new[3] = low
     new[4] = close
     return new
 
@@ -1247,9 +1245,7 @@ def htf_4h_rise_broken(
             return True
         if c < o and c < pc and (align is None or align < 0.45):
             return True
-    if align is not None and align < 0.40:
-        return True
-    return False
+    return bool(align is not None and align < 0.4)
 
 
 _PROFIT_CLOSE_MARKERS = (

@@ -11,8 +11,8 @@ from backend.database_schema import DATABASE_PATH
 from backend.services.ai_canonical_storage import ensure_ai_canonical_tables
 from backend.services.ai_strategy_score_weight_writer import (
     COMPONENT_BOUNDS,
-    backfill_adaptive_score_weights_from_outcomes,
     adaptive_weights_row_count,
+    backfill_adaptive_score_weights_from_outcomes,
     extract_scaled_components,
     propagate_adaptive_score_weights_for_close,
 )

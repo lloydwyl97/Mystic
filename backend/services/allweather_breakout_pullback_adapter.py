@@ -382,8 +382,8 @@ def record_executable_signal() -> None:
 
 def check_paper_idle_alarm() -> dict[str, Any]:
     """Diagnostic idle alarm. Returns current status; logs warnings at thresholds."""
-    import time as _time
     import logging
+    import time as _time
 
     logger = logging.getLogger(__name__)
     now = _time.time()

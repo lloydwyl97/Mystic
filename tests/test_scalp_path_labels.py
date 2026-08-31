@@ -63,7 +63,7 @@ def test_reconstructable_features_have_no_future_or_book_or_coin_id():
 
 def test_chronological_gap_still_required():
     folds = chronological_folds(200, gap=20)
-    train, valid, test = folds[0]
+    train, valid, _test = folds[0]
     assert valid.start - train.stop >= 20
 
 

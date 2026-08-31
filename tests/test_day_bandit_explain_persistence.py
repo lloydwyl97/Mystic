@@ -3,7 +3,7 @@
 Guards:
 1. TradeExplainability round-trips DAY bandit fields through to_dict() so
    paper_trades.explainability_json can be replayed offline.
-2. _stamp_day_bandit_explain copies α/β/mean/starved/size/score from
+2. _stamp_day_bandit_explain copies alpha/β/mean/starved/size/score from
    decision_data onto the dataclass exactly as apply_bandit_to_decision_data
    would have written them.
 3. bootstrap_bandit_from_paper_trades ignores legacy sells whose setup label

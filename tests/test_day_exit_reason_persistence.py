@@ -14,10 +14,7 @@ from backend.services.portfolio_engine import ExitType, paper_trades_exit_type_l
 
 
 def test_4h_structure_break_persists_canonical_not_manual():
-    assert (
-        paper_trades_exit_type_label(ExitType.MANUAL, EXIT_DAY_4H_STRUCTURE_BREAK)
-        == EXIT_DAY_4H_STRUCTURE_BREAK
-    )
+    assert paper_trades_exit_type_label(ExitType.MANUAL, EXIT_DAY_4H_STRUCTURE_BREAK) == EXIT_DAY_4H_STRUCTURE_BREAK
     assert canonical_day_exit_reason(EXIT_DAY_4H_STRUCTURE_BREAK, exit_type_name="MANUAL") == EXIT_DAY_4H_STRUCTURE_BREAK
 
 

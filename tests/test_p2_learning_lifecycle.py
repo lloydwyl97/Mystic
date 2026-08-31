@@ -11,7 +11,6 @@ from unittest.mock import patch
 from backend.services.ai_canonical_storage import ensure_ai_canonical_tables
 from backend.services.ai_model_promotion import maybe_rollback_underperforming_model, register_candidate_and_maybe_promote
 
-
 REPO = Path(__file__).resolve().parents[1]
 
 

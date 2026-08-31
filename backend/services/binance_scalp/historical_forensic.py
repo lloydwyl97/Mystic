@@ -37,7 +37,7 @@ def _parse_ts(raw: Any) -> datetime | None:
         "%Y-%m-%dT%H:%M:%S",
     ):
         try:
-            dt = datetime.strptime(text, fmt)
+            dt = datetime.strptime(text, fmt)  # noqa: DTZ007
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc)
@@ -68,9 +68,7 @@ def _ohlcv_symbol(symbol: str) -> str:
 
 def load_ohlcv(conn: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
     out: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    rows = conn.execute(
-        "SELECT symbol, open, high, low, close, volume, ts FROM feature_ohlcv WHERE interval='1m' ORDER BY ts"
-    )
+    rows = conn.execute("SELECT symbol, open, high, low, close, volume, ts FROM feature_ohlcv WHERE interval='1m' ORDER BY ts")
     for symbol, o, h, low, c, v, ts in rows:
         dt = _parse_ts(ts)
         if dt is None:
@@ -283,12 +281,8 @@ def classify_scalp_book(db_path: str, *, target_pct: float = SCALP_TARGET_PCT) -
         exc = {"mfe_pct": None, "mae_pct": None, "time_to_mfe_sec": None, "time_to_mae_sec": None}
         post = {"path": {}, "hit_original_target_after_exit": False, "hit_target_after_sec": None}
         if t["entry_ts"] and t["exit_ts"] and t["entry_price"] and bars:
-            exc = reconstruct_excursions(
-                bars, entry_ts=t["entry_ts"], exit_ts=t["exit_ts"], entry_price=t["entry_price"]
-            )
-            post = reconstruct_post_exit(
-                bars, exit_ts=t["exit_ts"], entry_price=t["entry_price"], target_pct=target_pct
-            )
+            exc = reconstruct_excursions(bars, entry_ts=t["entry_ts"], exit_ts=t["exit_ts"], entry_price=t["entry_price"])
+            post = reconstruct_post_exit(bars, exit_ts=t["exit_ts"], entry_price=t["entry_price"], target_pct=target_pct)
         cls = classify_loss(
             net_pnl=float(t["net_pnl"] or 0),
             gross_pnl=float(t["gross_pnl"] or 0),

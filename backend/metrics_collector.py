@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+import redis
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     Counter,
@@ -23,8 +24,6 @@ from prometheus_client import (
     Info,
     generate_latest,
 )
-
-import redis
 
 try:
     from backend.services.websocket_manager import websocket_manager  # type: ignore[import-not-found]

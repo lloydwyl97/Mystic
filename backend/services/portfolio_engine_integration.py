@@ -1178,7 +1178,7 @@ class PortfolioEngineIntegration:
                                     _bm_final = float(v)
                                     break
                             if _bm_final > 0.0 or confidence >= 0.55:
-                                from backend.services.day_trade_thesis import SETUP_HTF_TREND_PULLBACK, SETUP_FAILED_BREAKDOWN_REVERSAL, SETUP_RANGE_BOUNCE
+                                from backend.services.day_trade_thesis import SETUP_FAILED_BREAKDOWN_REVERSAL, SETUP_HTF_TREND_PULLBACK, SETUP_RANGE_BOUNCE
 
                                 _use = SETUP_HTF_TREND_PULLBACK
                                 # crude regime hint from dd
@@ -1792,9 +1792,7 @@ class PortfolioEngineIntegration:
                 from backend.config.protected_execution import MANDATORY_EXIT_PENDING_RETRY_SEC
 
                 pending = bool(self.engine and self.engine.has_exit_residual_pending())
-                await asyncio.sleep(
-                    float(MANDATORY_EXIT_PENDING_RETRY_SEC) if pending else self._exit_monitor_interval
-                )
+                await asyncio.sleep(float(MANDATORY_EXIT_PENDING_RETRY_SEC) if pending else self._exit_monitor_interval)
 
             except asyncio.CancelledError:
                 break

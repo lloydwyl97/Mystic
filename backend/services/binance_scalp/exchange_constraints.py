@@ -7,13 +7,12 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-_CACHE: Dict[str, dict] = {}
+_CACHE: dict[str, dict] = {}
 _CACHE_TS: float = 0.0
 _CACHE_TTL: float = 3600.0  # 1 hour
 
@@ -72,7 +71,7 @@ def _refresh_cache() -> None:
         )
         resp.raise_for_status()
         data = resp.json()
-        new_cache: Dict[str, dict] = {}
+        new_cache: dict[str, dict] = {}
         for sym_info in data.get("symbols", []):
             s = sym_info["symbol"]
             filters: dict[str, dict] = {f["filterType"]: f for f in sym_info.get("filters", [])}

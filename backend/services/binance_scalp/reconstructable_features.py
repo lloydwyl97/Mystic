@@ -102,7 +102,7 @@ def reconstructable_features(
     projected_move: float = 0.0,
 ) -> dict[str, float]:
     """Features from bars known at the current close. No future bars."""
-    out = {k: 0.0 for k in FEATURE_KEYS}
+    out = dict.fromkeys(FEATURE_KEYS, 0.0)
     if len(bars) < 8:
         return out
     closes = [float(b["close"]) for b in bars]

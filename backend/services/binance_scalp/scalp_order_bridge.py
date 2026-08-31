@@ -64,7 +64,7 @@ class ScalpOrderBridge:
         *,
         spread_pct: float = 0.0,
         adverse_selection_risk: float = 0.0,
-    ) -> Optional[ScalpFill]:
+    ) -> ScalpFill | None:
         """Place a scalp BUY. Returns ScalpFill on success, None on failure.
 
         Order type (MARKET vs LIMIT_IOC) is chosen dynamically per-order from
@@ -92,7 +92,7 @@ class ScalpOrderBridge:
         is_urgent_exit: bool = False,
         spread_pct: float = 0.0,
         adverse_selection_risk: float = 0.0,
-    ) -> Optional[ScalpFill]:
+    ) -> ScalpFill | None:
         """Place a scalp SELL. Returns ScalpFill on success, None on failure.
 
         Set `is_urgent_exit=True` for catastrophic-stop/circuit-breaker/max-hold

@@ -22,6 +22,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import itertools
+
 from backend.services.binance_scalp.forward_net_predictor import (
     DEFAULT_COST,
     FEATURE_GROUPS,
@@ -68,10 +70,10 @@ def _quartile(pred: np.ndarray, realized: np.ndarray) -> dict[str, Any] | None:
     bot_d = realized[order[:d]]
     top_d = realized[order[-d:]]
     return {
-        "bottom_quartile": {"n": int(len(bot)), "mean_net": round(float(bot.mean()), 6), "wr": round(float((bot > 0).mean()), 4)},
-        "top_quartile": {"n": int(len(top)), "mean_net": round(float(top.mean()), 6), "wr": round(float((top > 0).mean()), 4)},
-        "bottom_decile": {"n": int(len(bot_d)), "mean_net": round(float(bot_d.mean()), 6), "wr": round(float((bot_d > 0).mean()), 4)},
-        "top_decile": {"n": int(len(top_d)), "mean_net": round(float(top_d.mean()), 6), "wr": round(float((top_d > 0).mean()), 4)},
+        "bottom_quartile": {"n": len(bot), "mean_net": round(float(bot.mean()), 6), "wr": round(float((bot > 0).mean()), 4)},
+        "top_quartile": {"n": len(top), "mean_net": round(float(top.mean()), 6), "wr": round(float((top > 0).mean()), 4)},
+        "bottom_decile": {"n": len(bot_d), "mean_net": round(float(bot_d.mean()), 6), "wr": round(float((bot_d > 0).mean()), 4)},
+        "top_decile": {"n": len(top_d), "mean_net": round(float(top_d.mean()), 6), "wr": round(float((top_d > 0).mean()), 4)},
         "top_minus_bottom_q": round(float(top.mean() - bot.mean()), 6),
     }
 
@@ -89,7 +91,7 @@ def _buckets(pred: np.ndarray, realized: np.ndarray, n_buckets: int = 5) -> list
         out.append(
             {
                 "bucket": i + 1,
-                "n": int(len(ys)),
+                "n": len(ys),
                 "mean_pred": round(float(pred[idx].mean()), 6) if len(idx) else None,
                 "mean_realized": round(float(ys.mean()), 6) if len(ys) else None,
                 "wr": round(float((ys > 0).mean()), 4) if len(ys) else None,
@@ -100,7 +102,7 @@ def _buckets(pred: np.ndarray, realized: np.ndarray, n_buckets: int = 5) -> list
 
 
 def _econ(realized: np.ndarray) -> dict[str, Any]:
-    n = int(len(realized))
+    n = len(realized)
     if n == 0:
         return {"n": 0, "wr": None, "net": 0.0, "expectancy": None, "pf": None, "avg_win": None, "avg_loss": None, "mae": None}
     wins = realized[realized > 0]
@@ -125,7 +127,7 @@ def _calib(pred: np.ndarray, realized: np.ndarray, n_bins: int = 5) -> list[dict
         return []
     lo, hi = float(pred.min()), float(pred.max())
     if hi - lo < 1e-12:
-        return [{"n": int(len(pred)), "mean_pred": round(lo, 6), "mean_realized": round(float(realized.mean()), 6)}]
+        return [{"n": len(pred), "mean_pred": round(lo, 6), "mean_realized": round(float(realized.mean()), 6)}]
     bins = np.linspace(lo, hi, n_bins + 1)
     out = []
     for i in range(n_bins):
@@ -150,7 +152,7 @@ def _prob_calib(prob: np.ndarray, realized: np.ndarray) -> list[dict[str, Any]]:
     edges = [0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.01]
     out = []
     hit = (realized > 0).astype(float)
-    for lo, hi in zip(edges[:-1], edges[1:]):
+    for lo, hi in itertools.pairwise(edges):
         mask = (prob >= lo) & (prob < hi)
         if not mask.any():
             continue
@@ -175,11 +177,11 @@ def _drawdown(rets: np.ndarray) -> float:
 
 
 def _ctx_for_bar(symbol: str, window: list[dict[str, Any]]):
+    from dataclasses import replace
+
     from backend.services.binance_scalp.config import ScalpConfig
     from backend.services.binance_scalp.economics import ScalpEconomics
     from backend.services.binance_scalp.strategies.base import StrategyMarketContext
-
-    from dataclasses import replace
 
     mid = float(window[-1]["close"])
     snap = replace(

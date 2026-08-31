@@ -50,10 +50,7 @@ class _Reader:
 
 class _Klines:
     def __init__(self) -> None:
-        self.bars = [
-            {"open": 99.8, "high": 100.2, "low": 99.7, "close": 100.0 + i * 0.01, "volume": 10 + i, "ts": 1_700_000_000 + i * 60}
-            for i in range(40)
-        ]
+        self.bars = [{"open": 99.8, "high": 100.2, "low": 99.7, "close": 100.0 + i * 0.01, "volume": 10 + i, "ts": 1_700_000_000 + i * 60} for i in range(40)]
 
     def get(self, symbol: str, *, minutes: int = 120):
         return list(self.bars)
@@ -107,10 +104,9 @@ def test_evaluate_all_completes_all_four_under_write_lock(tmp_path: Path):
 
 
 def test_nine_strategies_return_control(tmp_path: Path):
-    from backend.services.binance_scalp.strategies.base import StrategyMarketContext
-
     from backend.services.binance_scalp.config import ScalpConfig
     from backend.services.binance_scalp.economics import ScalpEconomics
+    from backend.services.binance_scalp.strategies.base import StrategyMarketContext
 
     bars = _Klines().bars
     ctx = StrategyMarketContext(
@@ -161,9 +157,7 @@ def test_opportunity_record_and_label(tmp_path: Path):
     labeled = label_due_opportunities(db, _Later(), now_epoch=time.time(), cost_pct=0.0006)
     assert labeled >= 1
     conn = sqlite3.connect(db)
-    row = conn.execute(
-        "SELECT symbol,best_reject,plus_30s_net,plus_60s_net,horizon_labels_json,signals_json FROM scalp_opportunity_snapshots"
-    ).fetchone()
+    row = conn.execute("SELECT symbol,best_reject,plus_30s_net,plus_60s_net,horizon_labels_json,signals_json FROM scalp_opportunity_snapshots").fetchone()
     conn.close()
     assert row[0] == "BTCUSDT"
     assert row[1] == "NO_PULLBACK_RECOVERY"

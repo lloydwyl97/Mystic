@@ -244,9 +244,7 @@ def _is_stall_dead_loss(t: ClosedTradeRow) -> bool:
         return False
     if mae is not None and mae < LOW_MFE_STALL_MIN_MAE_PCT:
         return False
-    if t.worth_taking is not None and int(t.worth_taking) != 0:
-        return False
-    return True
+    return not (t.worth_taking is not None and int(t.worth_taking) != 0)
 
 
 def _is_secondary_giveback_loss(t: ClosedTradeRow) -> bool:
@@ -396,14 +394,14 @@ def evaluate_low_mfe_stall_penalty(
     combined_weak = stall_dead + [t for t in giveback_weak if t not in stall_dead]
 
     setup_bucket = [t for t in all_trades if _setup_matches_penalty_bucket(t.setup, setup_u)][-P1B_SETUP_LOOKBACK:]
-    setup_stall = [t for t in setup_bucket if _is_stall_dead_loss(t)]
+    [t for t in setup_bucket if _is_stall_dead_loss(t)]
     setup_net, setup_pf, _, setup_stall_n = _bucket_pnl_pf(setup_bucket)
 
     pair_net, pair_pf, pair_np, pair_stall_n = _bucket_pnl_pf(recent)
 
     stall_count = len(stall_dead)
     gb_count = len(giveback_weak)
-    trigger_count = max(stall_count, len(combined_weak) if stall_count >= 1 else len(combined_weak))
+    trigger_count = max(stall_count, len(combined_weak))
 
     setup_cluster = setup_stall_n >= P1B_SETUP_STALL_MIN and setup_net < 0
 
@@ -865,9 +863,7 @@ def _xrp_penalty_recovery_met(
     if avg_win > 0 and avg_loss > (2.0 * avg_win):
         return False
     bad_exits = sum(1 for t in post_xrp if "TIME_STOP" in (t.exit_reason or "").upper() or "STOP_LOSS" in (t.exit_reason or "").upper())
-    if bad_exits / max(len(post_xrp), 1) > 0.45:
-        return False
-    return True
+    return not bad_exits / max(len(post_xrp), 1) > 0.45
 
 
 def evaluate_outcome_penalty(
@@ -1392,7 +1388,7 @@ def assign_v3_selection_ranks(
         elif targets and id(cand) not in target_ids:
             dd.pop("why_selected", None)
             dd.pop("selection_key_used", None)
-        setattr(cand, "decision_data", dd)
+        cand.decision_data = dd
 
     if not targets:
         targets = [candidates[0]] if candidates else []
@@ -1408,7 +1404,7 @@ def assign_v3_selection_ranks(
             base_why = str(dd.get("why_selected") or "")
             dd["selection_key_used"] = "multi_buy_capacity_fill"
             dd["why_selected"] = f"multi_buy_capacity_fill: {base_why}" if base_why else "multi_buy_capacity_fill"
-        setattr(target, "decision_data", dd)
+        target.decision_data = dd
 
 
 def evaluate_outcome_penalty_for_candidate(decision_data: dict[str, Any], symbol: str) -> dict[str, Any]:

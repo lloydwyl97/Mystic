@@ -16,12 +16,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-
-from backend.services.admin_auth import require_admin_key
 from pydantic import BaseModel
 
 from backend.config.redis_config import get_redis_client, get_shared_redis_async
 from backend.database_schema import DATABASE_PATH
+from backend.services.admin_auth import require_admin_key
 from backend.services.paper_trading_service import get_paper_trading_service
 
 _sleeve_cutover_epoch_cache: int | None = None
@@ -102,7 +101,7 @@ def _validate_data_integrity_sync(positions_value: float, principal: float, real
         # Use ledger realized (never-decrease / prune-aware), not raw paper Σpnl.
         # Paper prune can leave sqlite_sum << ledger realized without a cash bug.
         # Flat book: cash ≈ principal + realized.
-        # Open book: cash ≈ principal + realized − open cost basis.
+        # Open book: cash ≈ principal + realized - open cost basis.
         if float(positions_value or 0.0) == 0.0:
             expected_cash = float(principal or 0.0) + ledger_realized
             data_integrity_diff = float(cash_balance or 0.0) - expected_cash

@@ -32,7 +32,7 @@ class _StubModel:
 def _make_rows(n=100, seed=7):
     rng = random.Random(seed)
     rows = []
-    for i in range(n):
+    for _i in range(n):
         features = [rng.random() for _ in range(FEATURE_DIM)]
         # Ground truth: rows where feature[5] > 0.5 are real winners.
         is_winner = features[5] > 0.5
@@ -159,9 +159,9 @@ class _FakeScaler:
         # Mimics standardization: subtract each column's mean.
         import statistics
 
-        cols = list(zip(*x))
+        cols = list(zip(*x, strict=False))
         means = [statistics.fmean(c) for c in cols]
-        return [[v - m for v, m in zip(row, means)] for row in x]
+        return [[v - m for v, m in zip(row, means, strict=False)] for row in x]
 
 
 def test_load_and_run_ablation_applies_scaler_before_scoring(tmp_path):

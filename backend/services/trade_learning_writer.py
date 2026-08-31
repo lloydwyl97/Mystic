@@ -454,13 +454,7 @@ def consume_setup_outcomes_for_ranking(
             rank = json.loads(row["rank_data_json"] or "{}") if row["rank_data_json"] else {}
         with contextlib.suppress(Exception):
             indicators = json.loads(row["indicators_while_holding_json"] or "{}") if row["indicators_while_holding_json"] else {}
-        setup_row = str(
-            extra.get("setup_type_canonical")
-            or extra.get("setup_type")
-            or extra.get("setup")
-            or rank.get("setup")
-            or ""
-        ).strip().upper()
+        setup_row = str(extra.get("setup_type_canonical") or extra.get("setup_type") or extra.get("setup") or rank.get("setup") or "").strip().upper()
         if setup_row != setup_u:
             continue
         extra = dict(extra)

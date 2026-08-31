@@ -146,28 +146,28 @@ def _wire_sell_engine(engine: PortfolioEngine, symbol: str, qty: float, sell_pri
     engine._normalize_order_amount = MagicMock(return_value=(qty, "ok", qty))
     engine._dust_check = MagicMock(return_value=(False, qty, "", qty * sell_price))
     engine._floor_to_step = lambda q, _s: q
-    engine._evaluate_sell_profitability = AsyncMock(
-        return_value=_allowed_sell_eval(symbol=symbol, mark_price=sell_price, avg_entry_price=engine.open_positions[symbol].entry_price)
-    )
+    engine._evaluate_sell_profitability = AsyncMock(return_value=_allowed_sell_eval(symbol=symbol, mark_price=sell_price, avg_entry_price=engine.open_positions[symbol].entry_price))
 
 
 async def _sell(engine: PortfolioEngine, symbol: str, qty: float, price: float, reason: str = "NET_PROFIT_EXIT"):
     mock_pf = MagicMock(passed=True, expected_avg_fill=price)
     mock_pf.to_audit_dict = MagicMock(return_value={"passed": True})
-    with patch("backend.services.protected_limit_execution.run_protected_preflight", AsyncMock(return_value=mock_pf)):
-        with patch("backend.services.protected_limit_execution.USE_PROTECTED_LIMIT_EXECUTION", True):
-            with patch(
-                "backend.services.paper_trading_service.get_paper_trading_service",
-                return_value=engine._paper_service,
-            ):
-                return await engine.execute_sell_fifo(
-                    symbol,
-                    qty,
-                    price,
-                    ExitType.TAKE_PROFIT_1,
-                    reason,
-                    force_sell=True,
-                )
+    with (
+        patch("backend.services.protected_limit_execution.run_protected_preflight", AsyncMock(return_value=mock_pf)),
+        patch("backend.services.protected_limit_execution.USE_PROTECTED_LIMIT_EXECUTION", True),
+        patch(
+            "backend.services.paper_trading_service.get_paper_trading_service",
+            return_value=engine._paper_service,
+        ),
+    ):
+        return await engine.execute_sell_fifo(
+            symbol,
+            qty,
+            price,
+            ExitType.TAKE_PROFIT_1,
+            reason,
+            force_sell=True,
+        )
 
 
 def test_idempotency_allows_same_qty_reason_while_remainder_open():
@@ -215,9 +215,7 @@ def test_heal_mark_keeps_nonzero_redis_mark_when_not_entry():
 
 def test_closed_lot_tombstone_is_lot_not_symbol_scoped():
     assert PortfolioEngine._closed_lot_tombstone_key("mystic_XRP/USDT_1") == "paper:closed_lot:mystic_XRP/USDT_1"
-    assert PortfolioEngine._closed_lot_tombstone_key("mystic_XRP/USDT_2") != PortfolioEngine._closed_lot_tombstone_key(
-        "mystic_XRP/USDT_1"
-    )
+    assert PortfolioEngine._closed_lot_tombstone_key("mystic_XRP/USDT_2") != PortfolioEngine._closed_lot_tombstone_key("mystic_XRP/USDT_1")
 
 
 @pytest.mark.asyncio
@@ -275,9 +273,7 @@ async def test_tp1_then_remainder_same_reason_and_qty_both_commit():
         assert second is not None
         with sqlite3.connect(str(db_path)) as conn:
             rem = conn.execute("SELECT quantity FROM portfolio_engine_positions WHERE symbol=?", (symbol,)).fetchone()
-            sells = conn.execute(
-                "SELECT quantity, exit_reason FROM paper_trades WHERE side='SELL' ORDER BY id"
-            ).fetchall()
+            sells = conn.execute("SELECT quantity, exit_reason FROM paper_trades WHERE side='SELL' ORDER BY id").fetchall()
         assert rem is None or float(rem[0] or 0) <= 0
         assert len(sells) == 2
         assert sells[0][0] == pytest.approx(half, abs=1e-6)

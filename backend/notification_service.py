@@ -17,7 +17,6 @@ from email.mime.text import MIMEText
 from typing import Any
 
 import httpx
-
 import redis
 
 # Import from single source of truth

@@ -36,15 +36,17 @@ def test_publish_status_snapshot_writes_api_key() -> None:
             store["value"] = value
 
     fake = _FakeRedis()
-    with patch("redis.from_url", return_value=fake):
-        with patch(
+    with (
+        patch("redis.from_url", return_value=fake),
+        patch(
             "backend.services.binance_scalp.config.get_scalp_config",
             return_value=MagicMock(redis_url="redis://localhost:6379/0", redis_key_prefix="scalp"),
-        ):
-            scalp_status_cache.publish_status_snapshot(
-                {"overall_decision": "SCANNING", "snapshot_source": "runner_warm"},
-                ttl_sec=90,
-            )
+        ),
+    ):
+        scalp_status_cache.publish_status_snapshot(
+            {"overall_decision": "SCANNING", "snapshot_source": "runner_warm"},
+            ttl_sec=90,
+        )
     assert store["key"] == API_STATUS_SNAPSHOT_KEY
     assert store["ttl"] >= 180
     payload = json.loads(store["value"])

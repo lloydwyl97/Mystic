@@ -95,7 +95,7 @@ def _buy_closed_by_trade_id(conn: sqlite3.Connection, trade_id: str, symbol: str
               AND IFNULL(value_json, '') LIKE ?
             LIMIT 1
             """,
-            (f"%\"trade_id\": \"{tid}\"%",),
+            (f'%"trade_id": "{tid}"%',),
         ).fetchone()
         if row:
             return True
@@ -221,9 +221,7 @@ def find_unclosed_buy_cash_debits(db_path: str | Path) -> list[dict[str, Any]]:
             return []
         open_tids: set[str] = set()
         try:
-            for r in conn.execute(
-                "SELECT trade_id FROM portfolio_engine_positions WHERE IFNULL(quantity, 0) > 1e-12"
-            ):
+            for r in conn.execute("SELECT trade_id FROM portfolio_engine_positions WHERE IFNULL(quantity, 0) > 1e-12"):
                 if r["trade_id"]:
                     open_tids.add(str(r["trade_id"]))
         except sqlite3.OperationalError:
@@ -273,9 +271,7 @@ def find_cash_position_disagreement(db_path: str | Path) -> dict[str, Any]:
         out["identity_diff"] = abs(identity - float(led["total_equity"] or 0))
         orphans = find_orphaned_day_buys(path)
         out["orphans"] = orphans
-        out["implied_orphan_notional"] = sum(
-            float(o.get("remaining_position") or 0) * float(o.get("price") or 0) for o in orphans
-        )
+        out["implied_orphan_notional"] = sum(float(o.get("remaining_position") or 0) * float(o.get("price") or 0) for o in orphans)
         if orphans or out["identity_diff"] > 0.05:
             out["ok"] = False
         return out
@@ -357,8 +353,7 @@ def restore_orphaned_day_buys(db_path: str | Path) -> list[dict[str, Any]]:
             )
             notional = qty * price
             logger.critical(
-                "ACCOUNTING_ORPHAN_RESTORED id=%s trade_id=%s symbol=%s qty=%.8f price=%.8f notional=%.4f "
-                "(cash unchanged; inventory restored from committed BUY row)",
+                "ACCOUNTING_ORPHAN_RESTORED id=%s trade_id=%s symbol=%s qty=%.8f price=%.8f notional=%.4f (cash unchanged; inventory restored from committed BUY row)",
                 orphan.get("id"),
                 trade_id,
                 symbol,
@@ -369,15 +364,8 @@ def restore_orphaned_day_buys(db_path: str | Path) -> list[dict[str, Any]]:
             restored.append({**orphan, "restored_notional": notional})
 
         if restored:
-            pos_val = float(
-                cur.execute(
-                    "SELECT COALESCE(SUM(quantity * entry_price), 0) FROM portfolio_engine_positions WHERE IFNULL(quantity,0) > 0"
-                ).fetchone()[0]
-                or 0
-            )
-            led = cur.execute(
-                "SELECT cash_balance, realized_pnl, principal FROM portfolio_engine_ledger WHERE id=1"
-            ).fetchone()
+            pos_val = float(cur.execute("SELECT COALESCE(SUM(quantity * entry_price), 0) FROM portfolio_engine_positions WHERE IFNULL(quantity,0) > 0").fetchone()[0] or 0)
+            led = cur.execute("SELECT cash_balance, realized_pnl, principal FROM portfolio_engine_ledger WHERE id=1").fetchone()
             if led is not None:
                 cash = float(led[0] or 0)
                 realized = float(led[1] or 0)
@@ -464,9 +452,7 @@ def assert_cash_plus_marks_equals_equity(db_path: str | Path, *, tolerance: floa
     path = str(db_path)
     conn = _connect(path, readonly=True, timeout=2.0)
     try:
-        led = conn.execute(
-            "SELECT cash_balance, positions_value, total_equity FROM portfolio_engine_ledger WHERE id=1"
-        ).fetchone()
+        led = conn.execute("SELECT cash_balance, positions_value, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
         if led is None:
             return {"ok": False, "error": "no_ledger"}
         cash = float(led[0] or 0)

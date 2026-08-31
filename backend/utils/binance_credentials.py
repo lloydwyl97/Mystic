@@ -49,7 +49,7 @@ def sync_binance_us_env_aliases() -> None:
 
 __all__ = [
     "get_binance_us_api_key",
-    "get_binance_us_secret_key",
     "get_binance_us_credentials",
+    "get_binance_us_secret_key",
     "sync_binance_us_env_aliases",
 ]

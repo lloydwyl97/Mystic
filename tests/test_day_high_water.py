@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from backend.services.canonical_mark_price import CanonicalMark
 from backend.services.day_controlled_exits import apply_break_even_and_mfe_trail, refresh_trailing_stop
 from backend.services.day_high_water import (
     first_full_minute_epoch,
@@ -15,7 +16,6 @@ from backend.services.day_high_water import (
     max_post_entry_1m_high,
     usable_kline_high,
 )
-from backend.services.canonical_mark_price import CanonicalMark
 from backend.services.portfolio_engine import OpenPosition, PortfolioEngine
 
 
@@ -160,7 +160,7 @@ async def test_monitor_folds_kline_high_and_does_not_sell_on_activation(tmp_path
     engine = PortfolioEngine.__new__(PortfolioEngine)
     engine.db_path = str(tmp_path / "hw.db")
     engine.open_positions = {}
-    engine._price_cache = type("C", (), {"set": lambda *a, **k: None, "get_with_age": lambda *a, **k: (None, None)})()
+    engine._price_cache = type("C", (), {"set": lambda *_a, **_k: None, "get_with_age": lambda *_a, **_k: (None, None)})()
     engine._live_service = None
     engine._live_execution_enabled = False
     engine._exit_mark_price_source_stale = False
@@ -206,10 +206,12 @@ async def test_monitor_folds_kline_high_and_does_not_sell_on_activation(tmp_path
         kline_1m_open_time=datetime_epoch("2026-08-27T22:18:00Z") * 1000,
     )
 
-    with patch("backend.services.canonical_mark_price.fetch_canonical_mark", new=AsyncMock(return_value=mark)):
-        with patch("backend.services.day_high_water.load_feature_1m_candles", return_value=[]):
-            with patch("backend.services.ai_learning_ingestion.record_position_heartbeat"):
-                exits = await engine.monitor_all_positions({"BTC/USDT": 80399.41}, int(time.time()))
+    with (
+        patch("backend.services.canonical_mark_price.fetch_canonical_mark", new=AsyncMock(return_value=mark)),
+        patch("backend.services.day_high_water.load_feature_1m_candles", return_value=[]),
+        patch("backend.services.ai_learning_ingestion.record_position_heartbeat"),
+    ):
+        exits = await engine.monitor_all_positions({"BTC/USDT": 80399.41}, int(time.time()))
 
     assert pos.highest_price == pytest.approx(80435.11)
     assert pos.highest_price >= 80114.0 * 1.004
@@ -224,7 +226,7 @@ async def test_monitor_rejects_entry_minute_kline_high(tmp_path, monkeypatch):
     monkeypatch.setenv("DAY_PATH_AWARE_EXIT", "true")
     engine = PortfolioEngine.__new__(PortfolioEngine)
     engine.db_path = str(tmp_path / "hw2.db")
-    engine._price_cache = type("C", (), {"set": lambda *a, **k: None, "get_with_age": lambda *a, **k: (None, None)})()
+    engine._price_cache = type("C", (), {"set": lambda *_a, **_k: None, "get_with_age": lambda *_a, **_k: (None, None)})()
     engine._live_service = None
     engine._live_execution_enabled = False
     engine._exit_mark_price_source_stale = False
@@ -268,10 +270,12 @@ async def test_monitor_rejects_entry_minute_kline_high(tmp_path, monkeypatch):
         kline_1m_high=105.0,
         kline_1m_open_time=datetime_epoch("2026-08-27T21:00:00Z") * 1000,
     )
-    with patch("backend.services.canonical_mark_price.fetch_canonical_mark", new=AsyncMock(return_value=mark)):
-        with patch("backend.services.day_high_water.load_feature_1m_candles", return_value=[]):
-            with patch("backend.services.ai_learning_ingestion.record_position_heartbeat"):
-                await engine.monitor_all_positions({"BTC/USDT": 100.4}, int(time.time()))
+    with (
+        patch("backend.services.canonical_mark_price.fetch_canonical_mark", new=AsyncMock(return_value=mark)),
+        patch("backend.services.day_high_water.load_feature_1m_candles", return_value=[]),
+        patch("backend.services.ai_learning_ingestion.record_position_heartbeat"),
+    ):
+        await engine.monitor_all_positions({"BTC/USDT": 100.4}, int(time.time()))
     assert pos.highest_price == pytest.approx(100.4)
     assert pos.highest_price < 105.0
     assert engine.execute_sell_fifo.await_count == 0

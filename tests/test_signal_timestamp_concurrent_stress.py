@@ -24,9 +24,9 @@ import uuid
 import pytest
 
 pytest.importorskip("redis")
-import redis as redis_lib  # noqa: E402
+import redis as redis_lib
 
-from backend.services.live_strategy_contracts import redis_ai_signal_key  # noqa: E402
+from backend.services.live_strategy_contracts import redis_ai_signal_key
 
 
 def _redis_available() -> bool:
@@ -146,7 +146,7 @@ def test_fetch_survives_cold_connection_establishment_latency(monkeypatch):
                 raise ConnectionError("connection pool not yet established")
             return {b"timestamp": b"1234567890.0", b"content_fresh": b"1"}
 
-    monkeypatch.setattr("backend.config.redis_config.get_redis_client", lambda: _ColdThenReadyClient())
+    monkeypatch.setattr("backend.config.redis_config.get_redis_client", _ColdThenReadyClient)
     sig = engine._fetch_redis_ai_signal_string_map("day", "BTCUSDT")
 
     assert sig.get("timestamp") == "1234567890.0", "must recover once the connection pool comes up within the retry budget"

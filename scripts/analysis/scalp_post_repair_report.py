@@ -66,7 +66,7 @@ def _parse_ts(raw: Any) -> datetime | None:
     text = text.replace("Z", "+00:00")
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f"):
         try:
-            return datetime.strptime(text.replace("+00:00", ""), fmt) if "%z" not in fmt else datetime.strptime(text, fmt)
+            return datetime.strptime(text.replace("+00:00", ""), fmt) if "%z" not in fmt else datetime.strptime(text, fmt)  # noqa: DTZ007
         except ValueError:
             continue
     try:
@@ -203,11 +203,7 @@ def load_report(*, db_path: str, host: str, eval_after: str, threshold: int) -> 
             )
         except sqlite3.OperationalError:
             meta = {}
-        ledger = dict(
-            conn.execute(
-                "SELECT realized_pnl, cash_balance, positions_value, principal FROM scalp_paper_ledger WHERE id=1"
-            ).fetchone()
-        )
+        ledger = dict(conn.execute("SELECT realized_pnl, cash_balance, positions_value, principal FROM scalp_paper_ledger WHERE id=1").fetchone())
         hist = HISTORICAL_BASELINE[host]
         hist_sells = conn.execute(
             "SELECT COUNT(*), COALESCE(SUM(pnl_usd),0) FROM scalp_paper_trades WHERE upper(side)='SELL' AND created_at<=?",
@@ -270,9 +266,7 @@ def load_report(*, db_path: str, host: str, eval_after: str, threshold: int) -> 
                     "exit_reason": str(sell["exit_reason"] or "UNKNOWN"),
                     "mfe_pct": mfe,
                     "mae_pct": mae,
-                    "mfe_capture": round(net / (mfe * float(buy["notional"] if buy else sell["notional"] or 0)), 6)
-                    if mfe and mfe > 0 and buy
-                    else None,
+                    "mfe_capture": round(net / (mfe * float(buy["notional"] if buy else sell["notional"] or 0)), 6) if mfe and mfe > 0 and buy else None,
                     "entry_spread": _entry_spread(buy_diag, pos_diag, sell_diag),
                     "exit_spread": _exit_spread(sell_diag),
                     "rank_score": _rank_score(buy_diag, pos_diag, sell_diag),
@@ -406,9 +400,7 @@ def main() -> int:
     if not args.json_only:
         clean = report["clean_post_repair"]
         print(
-            f"\n{host.upper()} CLEAN POST-REPAIR  trades={clean['trades']} "
-            f"W/L={clean['wins']}/{clean['losses']} WR={clean['win_rate']} net={clean['net']} "
-            f"class={CLASSIFICATION}",
+            f"\n{host.upper()} CLEAN POST-REPAIR  trades={clean['trades']} W/L={clean['wins']}/{clean['losses']} WR={clean['win_rate']} net={clean['net']} class={CLASSIFICATION}",
             file=os.sys.stderr,
         )
     return 0

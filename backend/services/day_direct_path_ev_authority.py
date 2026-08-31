@@ -6,6 +6,7 @@ Does not change SCALP. Does not change DAY exits.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -53,7 +54,7 @@ def _opt_float(payload: dict[str, Any], *keys: str) -> float | None:
             val = float(raw)
         except (TypeError, ValueError):
             continue
-        if val == val:  # not NaN
+        if not math.isnan(val):
             return val
     return None
 
@@ -184,12 +185,14 @@ def old_rank_telemetry(candidates: list[Any] | None) -> tuple[str, float | None]
     rows = list(candidates or [])
     if not rows:
         return "", None
+
     def _score(c: Any) -> float:
         dd = getattr(c, "decision_data", None) or {}
         try:
             return float(dd.get("final_selection_score") or dd.get("selection_score") or c.rank_score())
         except Exception:
             return 0.0
+
     top = max(rows, key=_score)
     return _api_symbol(getattr(top, "symbol", "") or ""), _score(top)
 

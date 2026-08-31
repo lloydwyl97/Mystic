@@ -99,15 +99,7 @@ def evaluate_depth_vs_path_ev(
             None
             if allowed
             else (
-                "EV_NOT_ABOVE_HOLD"
-                if not ev_beats_hold
-                else "NO_BOOK"
-                if not book_ok
-                else "SPREAD_GT_ASSUMED_COST"
-                if not spread_ok
-                else "DEPTH_TOO_THIN"
-                if not depth_ok
-                else "RESIDUAL_EV_LE_HOLD"
+                "EV_NOT_ABOVE_HOLD" if not ev_beats_hold else "NO_BOOK" if not book_ok else "SPREAD_GT_ASSUMED_COST" if not spread_ok else "DEPTH_TOO_THIN" if not depth_ok else "RESIDUAL_EV_LE_HOLD"
             )
         ),
         "book": book,

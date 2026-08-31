@@ -71,7 +71,7 @@ def purged_walk_forward_splits(
 
     order = sorted(range(n), key=lambda i: open_times[i])
     fold_size = n // (n_splits + 1)
-    embargo_n = max(0, int(round(embargo_frac * n)))
+    embargo_n = max(0, round(embargo_frac * n))
 
     splits: list[FoldSplit] = []
     for fold in range(1, n_splits + 1):

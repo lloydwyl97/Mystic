@@ -12,8 +12,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST
 from backend.services.binance_scalp.forward_net_predictor import chronological_folds
 from backend.services.binance_scalp.reconstructable_features import FEATURE_GROUPS
+from backend.services.day_path_net import DAY_HORIZONS_MIN
 from scripts.scalp_path_edge_walkforward import _corr, _downsample, _fit_predict, _policy
 from scripts.train_path_net_close_v2 import (
     DAY_STEP,
@@ -25,14 +27,8 @@ from scripts.train_path_net_close_v2 import (
     _xy,
     build_rows,
 )
-from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST
-from backend.services.day_path_net import DAY_HORIZONS_MIN
 
-GROUPS = {
-    name: tuple(k for k in keys if k in FEATURE_KEYS_V2)
-    for name, keys in FEATURE_GROUPS.items()
-    if any(k in FEATURE_KEYS_V2 for k in keys)
-}
+GROUPS = {name: tuple(k for k in keys if k in FEATURE_KEYS_V2) for name, keys in FEATURE_GROUPS.items() if any(k in FEATURE_KEYS_V2 for k in keys)}
 
 
 def _score(train, valid, test, names: tuple[str, ...], horizon: int) -> dict:
@@ -45,7 +41,7 @@ def _score(train, valid, test, names: tuple[str, ...], horizon: int) -> dict:
     pred_va = _fit_predict(x_tr, y_tr, x_va)
     pol_rows = [{"epoch": r["epoch"], "symbol": r["symbol"], "path": {TARGET: r["path"][horizon].get(TARGET)}} for r in test]
     pol = _policy(pol_rows, pred, TARGET)
-    buy = np.asarray([float(r["path"][horizon].get(TARGET) or 0.0) for r, p in zip(test, pred) if float(p) > 0])
+    buy = np.asarray([float(r["path"][horizon].get(TARGET) or 0.0) for r, p in zip(test, pred, strict=False) if float(p) > 0])
     wr = None if len(buy) == 0 else round(float((buy > 0).mean()), 4)
     exp = (pol.get("econ") or {}).get("expectancy")
     net = (pol.get("econ") or {}).get("net")
@@ -58,9 +54,7 @@ def _score(train, valid, test, names: tuple[str, ...], horizon: int) -> dict:
         "buy_wr": wr,
         "net": net,
         "expectancy": exp,
-        "authority_pass": bool(
-            wr is not None and wr >= 0.60 and (net or 0) > 0 and (exp or 0) > 0 and (pol.get("buy_count") or 0) >= 30
-        ),
+        "authority_pass": bool(wr is not None and wr >= 0.60 and (net or 0) > 0 and (exp or 0) > 0 and (pol.get("buy_count") or 0) >= 30),
     }
 
 

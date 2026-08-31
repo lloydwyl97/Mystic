@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import redis
+
 from backend.services.binance_scalp.redis_keys import assert_key_allowed, normalize_prefix
 
 CONTROL_TTL_SEC = 3600

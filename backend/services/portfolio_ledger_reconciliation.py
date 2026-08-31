@@ -119,7 +119,7 @@ def compute_expected_cash(
         conn.row_factory = sqlite3.Row
         available_cols = {r[1] for r in conn.execute("PRAGMA table_info(paper_trades)")}
         fee_cols = [c for c in ("entry_fee_usd", "exit_fee_usd", "fees_paid", "commission") if c in available_cols]
-        select_cols = ["side", "quantity", "price"] + fee_cols
+        select_cols = ["side", "quantity", "price", *fee_cols]
         if "mode" in available_cols:
             select_cols.append("mode")
         if "paper_run_id" in available_cols:
@@ -647,6 +647,6 @@ __all__ = [
     "SymbolPositionReplay",
     "compute_expected_cash",
     "reconcile_ledger_cash",
-    "replay_symbol_position_from_trades",
     "repair_orphaned_buy_lot_via_position_merge",
+    "replay_symbol_position_from_trades",
 ]

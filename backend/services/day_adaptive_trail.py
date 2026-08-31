@@ -227,7 +227,7 @@ def adaptive_trail_pct_for_arm(
     # reasonable balance.
     # Convert giveback (fraction of MFE lost) to a trail pct (fraction of
     # entry). Empirical fit: trail_pct ~= p60_giveback * 0.4, since typical
-    # winning MFE is around 0.6–1.2% and 40% giveback = 0.24–0.48% trail.
+    # winning MFE is around 0.6-1.2% and 40% giveback = 0.24-0.48% trail.
     proposed = p60 * 0.40
     capped = False
     if proposed < min_pct:
@@ -249,6 +249,6 @@ def adaptive_trail_pct_for_arm(
 
 
 __all__ = [
-    "adaptive_trail_pct_for_arm",
     "adaptive_trail_enabled",
+    "adaptive_trail_pct_for_arm",
 ]

@@ -36,6 +36,8 @@ def pytest_approx(x, tol=1e-9):
         def __eq__(self, other):
             return abs(other - x) <= tol
 
+        __hash__ = None
+
     return _A(x)
 
 

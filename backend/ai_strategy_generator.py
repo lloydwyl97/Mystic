@@ -14,6 +14,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import redis
 import torch
 import uvicorn
 from dotenv import load_dotenv
@@ -24,7 +25,6 @@ from sklearn.preprocessing import MinMaxScaler
 from torch import nn, optim
 from torch.utils.data import DataLoader, TensorDataset
 
-import redis
 from backend.config.redis_config import get_shared_redis_sync
 from backend.services.task_manager import task_manager
 

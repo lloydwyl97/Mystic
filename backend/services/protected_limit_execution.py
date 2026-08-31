@@ -411,11 +411,7 @@ async def run_protected_preflight(
     mid = (best_bid + best_ask) / 2.0
     spread_pct = (best_ask - best_bid) / mid if mid > 0 else 1.0
     flatten = bool(mandatory_exit) and side_u == "SELL"
-    max_spread = (
-        float(MANDATORY_EXIT_MAX_SPREAD_PCT)
-        if flatten
-        else effective_max_orderbook_spread_pct(live_capable=live_capable)
-    )
+    max_spread = float(MANDATORY_EXIT_MAX_SPREAD_PCT) if flatten else effective_max_orderbook_spread_pct(live_capable=live_capable)
     impact_cap = float(max_impact_pct) if max_impact_pct is not None else float(MAX_ORDERBOOK_PRICE_IMPACT_PCT)
     if flatten:
         impact_cap = min(impact_cap, float(MANDATORY_EXIT_MAX_IMPACT_PCT))

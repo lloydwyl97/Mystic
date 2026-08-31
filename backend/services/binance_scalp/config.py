@@ -51,6 +51,8 @@ class ScalpConfig:
     scalp_live_armed: bool
     scalp_live_max_notional: float
     scalp_live_max_open: int
+    scalp_thesis: str = "structural"
+    legacy_prediction_entries: bool = False
     symbol_notional_caps: dict[str, float] = field(default_factory=dict)
 
     @classmethod
@@ -115,7 +117,9 @@ class ScalpConfig:
             max_consecutive_losses=int(os.getenv("SCALP_MAX_CONSECUTIVE_LOSSES", "5")),
             circuit_breaker_epoch=str(os.getenv("SCALP_CIRCUIT_BREAKER_EPOCH", "") or "").strip(),
             breaker_recovery_sec=int(os.getenv("SCALP_BREAKER_RECOVERY_SEC", "14400") or "14400"),
-            scalp_engine_version=str(os.getenv("SCALP_ENGINE_VERSION", "scalp_v1") or "scalp_v1").strip(),
+            scalp_engine_version=str(os.getenv("SCALP_ENGINE_VERSION", "scalp_structural_v1") or "scalp_structural_v1").strip(),
+            scalp_thesis=("legacy_prediction" if (os.getenv("SCALP_THESIS", "structural") or "structural").strip().lower() == "legacy_prediction" else "structural"),
+            legacy_prediction_entries=_bool("SCALP_LEGACY_PREDICTION_ENTRIES", False),
             scalp_live_armed=_bool("SCALP_LIVE_ARMED", False),
             scalp_live_max_notional=float(os.getenv("SCALP_LIVE_MAX_NOTIONAL", "50.0")),
             scalp_live_max_open=int(os.getenv("SCALP_LIVE_MAX_OPEN", "2")),

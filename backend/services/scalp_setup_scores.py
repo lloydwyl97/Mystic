@@ -135,7 +135,7 @@ _SETUP_FN = {
 
 
 def compute_all_setup_scores(data: dict[str, Any], blocks: dict[str, float]) -> dict[str, float]:
-    return {name: _SETUP_FN.get(name, lambda d, b: 0.5)(data, blocks) for name in ALL_SCALP_SETUPS}
+    return {name: _SETUP_FN.get(name, lambda _d, _b: 0.5)(data, blocks) for name in ALL_SCALP_SETUPS}
 
 
 def compute_setup_score(setup: str, data: dict[str, Any], blocks: dict[str, float]) -> float:

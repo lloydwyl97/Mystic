@@ -29,7 +29,6 @@ from backend.services.protected_limit_execution import (
     walk_book_within_impact,
 )
 
-
 SOL_QTY = 0.6228754
 SOL_ENTRY = 104.87
 SOL_STEP = 0.001
@@ -392,8 +391,9 @@ def test_pending_survives_restart_payload():
 
 
 def test_integration_uses_fast_pending_retry():
-    from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
     import inspect
+
+    from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 
     src = inspect.getsource(PortfolioEngineIntegration._position_monitor_loop)
     assert "MANDATORY_EXIT_PENDING_RETRY_SEC" in src

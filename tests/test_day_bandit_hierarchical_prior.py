@@ -81,7 +81,7 @@ def test_hierarchical_prior_penalizes_fresh_arm_in_bad_family(tmp_path: Path):
 
 
 def test_peer_mass_is_capped_relative_to_prior(tmp_path: Path):
-    """Even with tons of peer observations, α+β growth is bounded."""
+    """Even with tons of peer observations, alpha+β growth is bounded."""
     db = _fresh_db(tmp_path, "capped.db")
     for _ in range(60):
         record_bandit_outcome(

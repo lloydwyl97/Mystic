@@ -80,7 +80,6 @@ def fill_due_post_exit_paths(db_path: str, reader: Any, *, now_epoch: float | No
         for row in rows:
             exit_epoch = float(row["exit_epoch"] or 0)
             age = now - exit_epoch
-            updates: dict[str, float] = {}
             col_by_off = {
                 30: "plus_30s",
                 60: "plus_60s",
@@ -110,7 +109,7 @@ def fill_due_post_exit_paths(db_path: str, reader: Any, *, now_epoch: float | No
                     vals.append(mid)
             entry = float(row["entry_price"] or 0)
             hit = int(row["hit_target_after"] or 0)
-            hit_sec = row["hit_target_after_sec"]
+            row["hit_target_after_sec"]
             if entry > 0 and mid >= entry * 1.0025 and not hit:
                 sets.append("hit_target_after=1")
                 sets.append("hit_target_after_sec=?")

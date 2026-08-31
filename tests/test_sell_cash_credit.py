@@ -191,27 +191,29 @@ async def test_execute_sell_fifo_credits_cash_and_closes_position():
         mock_pf.expected_avg_fill = sell_price
         mock_pf.to_audit_dict = MagicMock(return_value={"passed": True})
 
-        with patch.object(engine, "_evaluate_sell_profitability", AsyncMock(return_value=sell_eval)):
-            with patch(
+        with (
+            patch.object(engine, "_evaluate_sell_profitability", AsyncMock(return_value=sell_eval)),
+            patch(
                 "backend.services.protected_limit_execution.run_protected_preflight",
                 AsyncMock(return_value=mock_pf),
-            ):
-                with patch(
-                    "backend.services.protected_limit_execution.USE_PROTECTED_LIMIT_EXECUTION",
-                    True,
-                ):
-                    with patch(
-                        "backend.services.paper_trading_service.get_paper_trading_service",
-                        return_value=engine._paper_service,
-                    ):
-                        result = await engine.execute_sell_fifo(
-                            "BTC/USDT",
-                            qty,
-                            sell_price,
-                            ExitType.TAKE_PROFIT_1,
-                            "NET_PROFIT_EXIT",
-                            force_sell=True,
-                        )
+            ),
+            patch(
+                "backend.services.protected_limit_execution.USE_PROTECTED_LIMIT_EXECUTION",
+                True,
+            ),
+            patch(
+                "backend.services.paper_trading_service.get_paper_trading_service",
+                return_value=engine._paper_service,
+            ),
+        ):
+            result = await engine.execute_sell_fifo(
+                "BTC/USDT",
+                qty,
+                sell_price,
+                ExitType.TAKE_PROFIT_1,
+                "NET_PROFIT_EXIT",
+                force_sell=True,
+            )
 
         assert result is not None
         assert "BTC/USDT" not in engine.open_positions
@@ -302,21 +304,23 @@ async def test_trade_3059_style_sell_post_cash_increases_not_flat():
         mock_pf.expected_avg_fill = sell_price
         mock_pf.to_audit_dict = MagicMock(return_value={})
 
-        with patch.object(engine, "_evaluate_sell_profitability", AsyncMock(return_value=_allowed_sell_eval())):
-            with patch("backend.services.protected_limit_execution.run_protected_preflight", AsyncMock(return_value=mock_pf)):
-                with patch("backend.services.protected_limit_execution.USE_PROTECTED_LIMIT_EXECUTION", True):
-                    with patch(
-                        "backend.services.paper_trading_service.get_paper_trading_service",
-                        return_value=engine._paper_service,
-                    ):
-                        await engine.execute_sell_fifo(
-                            "BTC/USDT",
-                            qty,
-                            sell_price,
-                            ExitType.TAKE_PROFIT_1,
-                            "NET_PROFIT_EXIT",
-                            force_sell=True,
-                        )
+        with (
+            patch.object(engine, "_evaluate_sell_profitability", AsyncMock(return_value=_allowed_sell_eval())),
+            patch("backend.services.protected_limit_execution.run_protected_preflight", AsyncMock(return_value=mock_pf)),
+            patch("backend.services.protected_limit_execution.USE_PROTECTED_LIMIT_EXECUTION", True),
+            patch(
+                "backend.services.paper_trading_service.get_paper_trading_service",
+                return_value=engine._paper_service,
+            ),
+        ):
+            await engine.execute_sell_fifo(
+                "BTC/USDT",
+                qty,
+                sell_price,
+                ExitType.TAKE_PROFIT_1,
+                "NET_PROFIT_EXIT",
+                force_sell=True,
+            )
 
         expected_proceeds = qty * sell_price * (1 - 0.001)  # maker fee approx
         assert float(engine.cash_balance) > pre_cash + 3700.0

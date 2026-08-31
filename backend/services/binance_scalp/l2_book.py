@@ -223,8 +223,8 @@ def reset_books() -> None:
 
 
 __all__ = [
-    "LocalL2Book",
     "STALE_SEC",
+    "LocalL2Book",
     "apply_partial_snapshot",
     "book_for",
     "reset_books",

@@ -297,6 +297,6 @@ def apply_candle_quality_to_decision_data(
 
 __all__ = [
     "apply_candle_quality_to_decision_data",
-    "compute_candle_quality",
     "candle_quality_gate_enabled",
+    "compute_candle_quality",
 ]

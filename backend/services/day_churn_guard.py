@@ -11,8 +11,9 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 logger = logging.getLogger(__name__)
 

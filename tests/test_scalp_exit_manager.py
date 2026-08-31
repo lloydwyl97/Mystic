@@ -18,10 +18,10 @@ from backend.services.binance_scalp.exit_manager import (
     EXIT_MAX_HOLD_HARD_LIMIT,
     EXIT_PATH_EXECUTABLE_PROFIT,
     EXIT_PATH_MAX_ADVERSE_STOP,
-    PositionTrack,
     STATE_OPEN,
-    _effective_scratch_min_reviews,
+    PositionTrack,
     _early_scratch_exit,
+    _effective_scratch_min_reviews,
     _max_hold_hard_sec,
     _path_max_adverse_net_pct,
     _path_min_executable_net_pct,
@@ -141,17 +141,17 @@ def test_effective_scratch_min_reviews_reduces_but_floors_at_one():
 
 def test_early_scratch_exit_fires_sooner_with_hold_ev_reduction():
     econ = ScalpEconomics.from_env()
-    kwargs = dict(
-        hold_sec=610.0,
-        hard=100000,
-        max_fav=0.00001,
-        executable_net_pct=-0.0003,
-        mom=_flat_mom(),
-        recovery=0.0,
-        econ=econ,
-        stale_review_count=2,
-        setup_name="range_bounce_scalp",
-    )
+    kwargs = {
+        "hold_sec": 610.0,
+        "hard": 100000,
+        "max_fav": 0.00001,
+        "executable_net_pct": -0.0003,
+        "mom": _flat_mom(),
+        "recovery": 0.0,
+        "econ": econ,
+        "stale_review_count": 2,
+        "setup_name": "range_bounce_scalp",
+    }
     fired_without, _ = _early_scratch_exit(**kwargs, hold_ev_reduction=0)
     assert fired_without is False  # 2 stale reviews < the arm's normal min of 3
 
@@ -181,24 +181,24 @@ def test_evaluate_exit_applies_hold_ev_scratch_reduction_end_to_end(monkeypatch)
         setup_name="range_bounce_scalp",
         setup_context={},
     )
-    common_kwargs = dict(
-        track=track,
-        snap=_Snap("BTCUSDT", bid),
-        mom=_flat_mom(),
-        econ=econ,
-        config=config,
-        trade_id="t3",
-        hold_sec=610.0,
-        executable_net_pct=-0.0003,
-        profit_hit=False,
-        exit_spread_ok=True,
-        perform_review=False,  # avoid the stale_review_count += 1 path so only the pre-review checks apply
-    )
-    with mock.patch("backend.services.hold_ev_engine.compute_hold_ev") as mock_compute, mock.patch("backend.services.hold_ev_engine.hold_ev_scratch_review_reduction", return_value=0):
+    common_kwargs = {
+        "track": track,
+        "snap": _Snap("BTCUSDT", bid),
+        "mom": _flat_mom(),
+        "econ": econ,
+        "config": config,
+        "trade_id": "t3",
+        "hold_sec": 610.0,
+        "executable_net_pct": -0.0003,
+        "profit_hit": False,
+        "exit_spread_ok": True,
+        "perform_review": False,  # avoid the stale_review_count += 1 path so only the pre-review checks apply
+    }
+    with mock.patch("backend.services.hold_ev_engine.compute_hold_ev"), mock.patch("backend.services.hold_ev_engine.hold_ev_scratch_review_reduction", return_value=0):
         neutral = evaluate_exit(**common_kwargs)
     assert neutral.decision == "HOLD"
 
-    with mock.patch("backend.services.hold_ev_engine.compute_hold_ev") as mock_compute2, mock.patch("backend.services.hold_ev_engine.hold_ev_scratch_review_reduction", return_value=1):
+    with mock.patch("backend.services.hold_ev_engine.compute_hold_ev"), mock.patch("backend.services.hold_ev_engine.hold_ev_scratch_review_reduction", return_value=1):
         tightened = evaluate_exit(**common_kwargs)
     assert tightened.decision == "SELL"
     assert tightened.exit_reason == EXIT_EARLY_SCRATCH

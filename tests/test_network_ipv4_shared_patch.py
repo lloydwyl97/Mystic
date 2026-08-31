@@ -16,7 +16,7 @@ def test_ensure_ipv4_only_is_idempotent(monkeypatch):
     calls = {"count": 0}
     original = socket.getaddrinfo
 
-    def _fake_original(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002
+    def _fake_original(host, port, family=0, type=0, proto=0, flags=0):
         calls["count"] += 1
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, port))]
 
@@ -34,7 +34,7 @@ def test_ensure_ipv4_only_is_idempotent(monkeypatch):
 
 
 def test_ensure_ipv4_only_filters_to_af_inet(monkeypatch):
-    def _mixed_family_lookup(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002
+    def _mixed_family_lookup(host, port, family=0, type=0, proto=0, flags=0):
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, port))]
 
     monkeypatch.setattr(socket, "getaddrinfo", _mixed_family_lookup)

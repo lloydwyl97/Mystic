@@ -104,11 +104,7 @@ def is_model_controlled(payload: dict[str, Any] | None, *, engine: str) -> bool:
     if buy_ev <= hold_ev:
         return False
     if engine == "day":
-        return (
-            version == DAY_ACCEPTED_MODEL
-            and policy == DAY_POLICY
-            and str(src.get("path_net_status") or "") == "predicted"
-        )
+        return version == DAY_ACCEPTED_MODEL and policy == DAY_POLICY and str(src.get("path_net_status") or "") == "predicted"
     if engine == "scalp":
         return version == SCALP_ACCEPTED_MODEL and policy == SCALP_POLICY
     return False
@@ -164,7 +160,9 @@ def build_day_entry_provenance(
         "p_positive_net": p_pos,
         "predicted_mfe": _num(dd.get("predicted_mfe") if dd.get("predicted_mfe") not in (None, "") else dd.get("expected_mfe")),
         "predicted_mae": _num(dd.get("predicted_mae") if dd.get("predicted_mae") not in (None, "") else dd.get("expected_mae")),
-        "predicted_horizon": dd.get("horizon_minutes") if dd.get("horizon_minutes") not in (None, "") else (dd.get("day_path_horizon_min") if dd.get("day_path_horizon_min") not in (None, "") else dd.get("predicted_horizon")),
+        "predicted_horizon": dd.get("horizon_minutes")
+        if dd.get("horizon_minutes") not in (None, "")
+        else (dd.get("day_path_horizon_min") if dd.get("day_path_horizon_min") not in (None, "") else dd.get("predicted_horizon")),
         "hold_ev": HOLD_EV,
         "buy_ev": buy_ev,
         "selected_action": selected_action,

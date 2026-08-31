@@ -17,11 +17,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
+import redis
 import torch
 from textblob import TextBlob
 from torch import nn
-
-import redis
 
 # Import from single source of truth
 try:

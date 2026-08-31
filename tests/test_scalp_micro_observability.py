@@ -107,19 +107,19 @@ def test_pick_unchanged_when_peer_snapshot_attached():
 
 
 def test_size_diagnostics_equal_existing_inputs_qty_unchanged():
-    kwargs = dict(
-        base_cap=50.0,
-        free_cash=1000.0,
-        min_notional=5.0,
-        strategy_passed=False,
-        arm_penalty_mult=1.0,
-        mtf_penalty_mult=1.0,
-        micro_quality_mult=1.0,
-        calibration_mult=1.0,
-        spread_pct=0.0002,
-        impact_pct=0.0001,
-        realized_volatility_pct=0.001,
-    )
+    kwargs = {
+        "base_cap": 50.0,
+        "free_cash": 1000.0,
+        "min_notional": 5.0,
+        "strategy_passed": False,
+        "arm_penalty_mult": 1.0,
+        "mtf_penalty_mult": 1.0,
+        "micro_quality_mult": 1.0,
+        "calibration_mult": 1.0,
+        "spread_pct": 0.0002,
+        "impact_pct": 0.0001,
+        "realized_volatility_pct": 0.001,
+    }
     a = compute_scalp_position_size(**kwargs)
     b = compute_scalp_position_size(**kwargs)
     assert a.notional == b.notional
