@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -151,6 +152,17 @@ def test_quote_persists_at_same_touch():
     assert quote_still_current(q, book, side="BID") is True
     moved = _book(99.9, 100.0)
     assert quote_still_current(q, moved, side="BID") is False
+
+
+def test_tape_freshness_allows_small_clock_skew():
+    from backend.services.binance_scalp.structural_tape import tape_freshness
+
+    class _R:
+        def get(self, _k):
+            return json.dumps({"trade_ts": 1000.4, "agg_id": 1})
+
+    out = tape_freshness(_R(), "BTCUSDT", now=1000.0, stale_sec=3.0)
+    assert out["fresh"] is True
 
 
 def test_missing_stale_trade_data_does_not_fill():

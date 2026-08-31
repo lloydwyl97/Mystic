@@ -187,5 +187,6 @@ def tape_freshness(redis_client: Any, symbol: str, *, now: float, stale_sec: flo
     age = float(now) - last
     out["last_trade_ts"] = last
     out["age_sec"] = age
-    out["fresh"] = last > 0 and 0 <= age <= float(stale_sec)
+    # Negative age is exchange/host clock skew, not a missing tape.
+    out["fresh"] = last > 0 and -1.5 <= age <= float(stale_sec)
     return out
