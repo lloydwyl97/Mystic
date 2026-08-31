@@ -16,7 +16,7 @@ FILL_MODEL_VERSION = "structural_event_queue_v1"
 TAPE_STREAM_PREFIX = "scalp:tape:"
 TAPE_FRESH_KEY_PREFIX = "scalp:tape:fresh:"
 TAPE_MAXLEN = 8000
-DEFAULT_STALE_SEC = 3.0
+DEFAULT_STALE_SEC = 15.0
 
 
 @dataclass(frozen=True)

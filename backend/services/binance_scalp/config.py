@@ -56,7 +56,7 @@ class ScalpConfig:
     structural_max_hold_sec: int = 600
     structural_mode: str = "STRUCTURAL_PAPER"
     structural_min_net_edge_bps: float = 2.0
-    structural_tape_stale_sec: float = 3.0
+    structural_tape_stale_sec: float = 15.0
     structural_max_range_mult: float = 8.0
     structural_max_adverse_1s: float = 0.80
     structural_breaker_consec: int = 8
@@ -133,7 +133,7 @@ class ScalpConfig:
             structural_max_hold_sec=int(os.getenv("SCALP_STRUCTURAL_MAX_HOLD_SEC", "600") or "600"),
             structural_mode=str(os.getenv("SCALP_STRUCTURAL_MODE") or "").strip(),
             structural_min_net_edge_bps=float(os.getenv("SCALP_STRUCTURAL_MIN_NET_EDGE_BPS", "2.0") or "2.0"),
-            structural_tape_stale_sec=float(os.getenv("SCALP_STRUCTURAL_TAPE_STALE_SEC", "3.0") or "3.0"),
+            structural_tape_stale_sec=float(os.getenv("SCALP_STRUCTURAL_TAPE_STALE_SEC", "15.0") or "15.0"),
             structural_max_range_mult=float(os.getenv("SCALP_STRUCTURAL_MAX_RANGE_MULT", "8.0") or "8.0"),
             structural_max_adverse_1s=float(os.getenv("SCALP_STRUCTURAL_MAX_ADVERSE_1S", "0.80") or "0.80"),
             structural_breaker_consec=int(os.getenv("SCALP_STRUCTURAL_BREAKER_CONSEC", "8") or "8"),
