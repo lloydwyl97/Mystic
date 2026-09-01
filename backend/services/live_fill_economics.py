@@ -224,7 +224,8 @@ def sum_realized_pnl_by_mode(
                   AND LOWER(COALESCE(mode, '')) = ?
                   AND COALESCE(is_synthetic, 0) = 0
                   AND COALESCE(exit_type, '') NOT IN (
-                    'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT'
+                    'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT',
+                    'DUST_WRITEOFF'
                   )
                 """,
                 (wanted,),

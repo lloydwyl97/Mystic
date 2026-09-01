@@ -1,10 +1,14 @@
 """Live Binance commission accounting — quote, base, mixed; no double-count."""
 
+import sqlite3
+import tempfile
+
 from backend.services.live_fill_economics import (
     apply_live_buy_economics,
     apply_live_sell_economics,
     extract_live_commission,
     live_round_trip_net,
+    sum_realized_pnl_by_mode,
 )
 
 
@@ -117,3 +121,54 @@ def test_paper_model_used_when_no_exchange_fee():
     assert qty == 1.0
     assert fee == 0.1
     assert cash == 100.1
+
+
+def _make_paper_trades_db(rows: list[dict]) -> str:
+    """Create a temp SQLite with paper_trades rows, return path."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    conn = sqlite3.connect(tmp.name)
+    conn.execute("""
+        CREATE TABLE paper_trades (
+            id INTEGER PRIMARY KEY,
+            side TEXT, pnl REAL, mode TEXT,
+            is_synthetic INTEGER DEFAULT 0,
+            exit_type TEXT
+        )
+    """)
+    for r in rows:
+        conn.execute(
+            "INSERT INTO paper_trades (side, pnl, mode, is_synthetic, exit_type) VALUES (?,?,?,?,?)",
+            (r["side"], r["pnl"], r["mode"], r.get("is_synthetic", 0), r.get("exit_type")),
+        )
+    conn.commit()
+    conn.close()
+    return tmp.name
+
+
+def test_dust_writeoff_excluded_from_live_pnl():
+    """DUST_WRITEOFF rows must not count toward live realized P&L."""
+    path = _make_paper_trades_db(
+        [
+            {"side": "SELL", "pnl": -1.30, "mode": "live", "exit_type": None},
+            {"side": "SELL", "pnl": -7.33, "mode": "live", "exit_type": "DUST_WRITEOFF"},
+            {"side": "SELL", "pnl": 973.98, "mode": "paper", "exit_type": None},
+        ]
+    )
+    live = sum_realized_pnl_by_mode(path, mode="live")
+    paper = sum_realized_pnl_by_mode(path, mode="paper")
+    # Dust must not contaminate live P&L
+    assert abs(live - (-1.30)) < 1e-6, f"live={live} (expected -1.30, dust must be excluded)"
+    assert abs(paper - 973.98) < 1e-6, f"paper={paper}"
+
+
+def test_paper_dust_also_excluded():
+    """DUST_WRITEOFF rows for paper mode are also excluded."""
+    path = _make_paper_trades_db(
+        [
+            {"side": "SELL", "pnl": 10.0, "mode": "paper", "exit_type": None},
+            {"side": "SELL", "pnl": -0.50, "mode": "paper", "exit_type": "DUST_WRITEOFF"},
+        ]
+    )
+    paper = sum_realized_pnl_by_mode(path, mode="paper")
+    assert abs(paper - 10.0) < 1e-6, f"paper={paper} (dust excluded)"

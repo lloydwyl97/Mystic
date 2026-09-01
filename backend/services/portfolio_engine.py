@@ -3044,7 +3044,8 @@ class PortfolioEngine:
                     FROM paper_trades
                     WHERE side='SELL' AND pnl IS NOT NULL
                       AND COALESCE(exit_type, '') NOT IN (
-                        'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT'
+                        'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
+                        'RESEARCH_RESET_EXIT', 'DUST_WRITEOFF'
                       )
                       AND COALESCE(is_synthetic, 0) = 0
                 """
@@ -19245,7 +19246,10 @@ class PortfolioEngine:
                     SELECT COALESCE(SUM(pnl), 0)
                     FROM paper_trades
                     WHERE date(timestamp) = ? AND UPPER(side) = 'SELL'
-                      AND COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT')
+                      AND COALESCE(exit_type, '') NOT IN (
+                        'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
+                        'RESEARCH_RESET_EXIT', 'DUST_WRITEOFF'
+                      )
                       AND COALESCE(is_synthetic, 0) = 0
                     """,
                     (today,),
@@ -20701,7 +20705,7 @@ class PortfolioEngine:
                 SELECT COUNT(*), COALESCE(SUM(pnl), 0)
                 FROM paper_trades
                 WHERE date(timestamp) = ? AND UPPER(side) = 'SELL'
-                  AND COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT') AND COALESCE(is_synthetic, 0) = 0
+                  AND COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT', 'DUST_WRITEOFF') AND COALESCE(is_synthetic, 0) = 0
                 """,
                 (day,),
             )
@@ -21322,7 +21326,9 @@ class PortfolioEngine:
                 exit_reason_sql = "exit_reason" if "exit_reason" in cols else "NULL"
                 exit_type_sql = "exit_type" if "exit_type" in cols else "NULL"
                 expl_sql = "explainability_json" if "explainability_json" in cols else "NULL"
-                admin_filter = "COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT') AND COALESCE(is_synthetic, 0) = 0"
+                admin_filter = (
+                    "COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT', 'DUST_WRITEOFF') AND COALESCE(is_synthetic, 0) = 0"
+                )
                 cur.execute(
                     f"""
                     SELECT {id_sql}, {trade_id_sql}, symbol, side, quantity, price, pnl, timestamp, {sleeve_sql},
