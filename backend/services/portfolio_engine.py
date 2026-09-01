@@ -4383,6 +4383,9 @@ class PortfolioEngine:
             ("diagnostics_json", "TEXT"),
             ("strategy_id", "TEXT"),
             ("context_snapshot_json", "TEXT"),
+            ("mark_price", "REAL"),
+            ("slippage_pct_implied", "REAL"),
+            ("spread_pct_used", "REAL"),
         ]
 
         for col_name, col_type in new_columns:
@@ -7419,6 +7422,25 @@ class PortfolioEngine:
             buy_margin=bm,
         )
         dd = apply_liquidity_gate_to_decision_data(dd, candidate.symbol)
+        with contextlib.suppress(Exception):
+            from backend.config.trading_economics import DAY_TARGET_NOTIONAL_PER_SLOT_USD
+            from backend.services.spread_book_telemetry import log_spread_shadow
+
+            r = None
+            try:
+                from backend.config.redis_config import get_redis_client
+
+                r = get_redis_client()
+            except Exception:
+                r = None
+            shadow = log_spread_shadow(
+                symbol=str(candidate.symbol or ""),
+                current_decision_data=dd,
+                current_notional_usd=float(DAY_TARGET_NOTIONAL_PER_SLOT_USD),
+                redis_client=r,
+            )
+            if shadow:
+                dd["spread_shadow"] = shadow
         dd = apply_htf_anchor_to_decision_data(dd)
         from backend.services.day_trade_thesis import apply_late_4h_rank_to_decision_data
 
@@ -8622,6 +8644,7 @@ class PortfolioEngine:
         from backend.services.protected_limit_execution import execute_protected_limit_live, run_protected_preflight
 
         live_capable = bool(self._live_execution_enabled and self._live_service and is_live_execution_allowed_sync() and can_place_live_orders_sync()[0])
+        _entry_ref_decision_ts = time.time()
         preflight = await run_protected_preflight(
             symbol=normalized_symbol,
             side="BUY",
@@ -9193,6 +9216,30 @@ class PortfolioEngine:
                 self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
                 _entry_reserved = False
             return None
+        with contextlib.suppress(Exception):
+            from backend.services.entry_fill_telemetry import (
+                build_entry_reference_telemetry,
+                persist_entry_reference_row,
+            )
+
+            _tel = build_entry_reference_telemetry(
+                best_bid=float(getattr(preflight, "best_bid", 0.0) or 0.0),
+                best_ask=float(getattr(preflight, "best_ask", 0.0) or 0.0),
+                submitted_order_price=float(getattr(preflight, "protected_limit_price", 0.0) or price or 0.0),
+                fill_price=float(fill_price),
+                decision_ts=_entry_ref_decision_ts,
+                fill_ts=time.time(),
+                live_order=live_order_buy if isinstance(live_order_buy, dict) else None,
+            )
+            with connect_rw(self.db_path) as _tel_conn:
+                persist_entry_reference_row(
+                    _tel_conn,
+                    trade_id=trade_id,
+                    telemetry=_tel,
+                    context_snapshot_json=_ctx_snapshot,
+                    diagnostics_json=json.dumps(protected_audit),
+                )
+                _tel_conn.commit()
 
         async with self._global_cash_lock:
             self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
@@ -14477,6 +14524,10 @@ class PortfolioEngine:
         dd["spread_pct"] = float(spread)
         dd["spread_cost_pct"] = float(spread)
         dd["spread_source"] = str(spread_source)
+        with contextlib.suppress(Exception):
+            from backend.config.execution_cost_model import stamp_named_costs
+
+            stamp_named_costs(dd, symbol)
 
         bm = resolve_buy_margin_from_payload(dd)
         if bm is None:

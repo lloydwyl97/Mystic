@@ -1987,6 +1987,19 @@ class PortfolioEngineIntegration:
                             cm = await fetch_canonical_mark(ccxt_sym, use_cache=True)
                             if cm is not None and cm.mark > 0:
                                 price = float(cm.mark)
+                                if float(getattr(cm, "bid", 0) or 0) > 0 and float(getattr(cm, "ask", 0) or 0) > 0:
+                                    from backend.services.spread_book_telemetry import book_payload, write_market_book_async
+
+                                    await write_market_book_async(
+                                        self.redis_client,
+                                        f"{base_symbol}USDT" if not str(base_symbol).endswith("USDT") else str(base_symbol),
+                                        book_payload(
+                                            bid=float(cm.bid),
+                                            ask=float(cm.ask),
+                                            source="canonical_mark",
+                                            timestamp=float(getattr(cm, "timestamp", 0) or time.time()),
+                                        ),
+                                    )
                         except Exception:
                             price = 0.0
                         if price <= 0 and live_market_data_service:
