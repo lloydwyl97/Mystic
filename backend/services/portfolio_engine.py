@@ -19291,7 +19291,7 @@ class PortfolioEngine:
         review/closure rather than issuing unattended live sell orders.
         """
         try:
-            from backend.services.circuit_breaker_service import trading_circuit_breaker
+            from backend.services.circuit_breaker_service import EQUITY_CIRCUIT_BREAKER_FRACTION, trading_circuit_breaker
         except Exception:
             logger.warning("CIRCUIT_BREAKER_CHECK: service unavailable, skipping")
             return {"skipped": True}
@@ -19316,6 +19316,7 @@ class PortfolioEngine:
             "total_equity": total_equity,
             "principal": float(self.principal),
             "realized_pnl_today": realized_pnl_today,
+            "residual_pending": bool(self.has_exit_residual_pending()),
         }
 
         result = await trading_circuit_breaker.check_all_hard_kills_async(portfolio_data)
@@ -19323,6 +19324,8 @@ class PortfolioEngine:
         conditions = result.get("conditions", {})
         prefix = self._CIRCUIT_BREAKER_REASON_PREFIX
         set_by_cb = str(self._kill_switch_reason or "").startswith(prefix)
+        session_high = float(getattr(trading_circuit_breaker, "session_high_equity", 0.0) or 0.0)
+        equity_floor = session_high * EQUITY_CIRCUIT_BREAKER_FRACTION if session_high > 0 else 0.0
 
         if actions.get("close_all_positions"):
             reason = f"{prefix}ACCOUNT_FAILSAFE equity=${portfolio_data['total_equity']:.2f} principal=${portfolio_data['principal']:.2f} — MANUAL POSITION REVIEW REQUIRED"
@@ -19337,7 +19340,7 @@ class PortfolioEngine:
             )
         elif actions.get("block_new_entries"):
             which = "DAILY_LOSS_FREEZE" if conditions.get("daily_loss_freeze") else "EQUITY_CIRCUIT_BREAKER"
-            reason = f"{prefix}{which} equity=${portfolio_data['total_equity']:.2f} realized_pnl_today=${realized_pnl_today:.2f}"
+            reason = f"{prefix}{which} equity=${portfolio_data['total_equity']:.2f} session_high=${session_high:.2f} threshold=${equity_floor:.2f} realized_pnl_today=${realized_pnl_today:.2f}"
             if self._kill_switch_mode != KillSwitchMode.PAUSE_BUYS or not set_by_cb:
                 await self.set_kill_switch("PAUSE_BUYS", reason=reason)
         elif set_by_cb and self._kill_switch_mode != KillSwitchMode.RESUME:

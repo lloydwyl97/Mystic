@@ -24,6 +24,12 @@ logger = logging.getLogger(__name__)
 
 
 ACCOUNT_FAILSAFE_EQUITY_FRACTION = 0.90
+EQUITY_CIRCUIT_BREAKER_FRACTION = 0.93
+# One-tick cash+positions double-count during EXIT_RESIDUAL_PENDING (Ocean
+# 2026-09-01: $233 → $296.95) must not become the 7% watermark.
+SESSION_HIGH_MAX_ONE_TICK_INCREASE = 0.08
+SESSION_HIGH_UNEXPLAINED_GAP = 0.12
+SESSION_HIGH_STABLE_BAND = 0.03
 
 
 def account_failsafe_tripped(current_equity: float, principal: float) -> bool:
@@ -236,6 +242,7 @@ class TradingCircuitBreaker:
         self.equity_circuit_breaker_active = False
         self.account_failsafe_active = False
         self.session_high_equity = 0.0
+        self.last_stable_equity = 0.0
         self.last_daily_reset = None
 
         # Cold-start observability (see get_cold_start_status()).
@@ -276,12 +283,67 @@ class TradingCircuitBreaker:
                     current_equity,
                 )
             self.session_high_equity = current_equity
+            if current_equity > 0:
+                self.last_stable_equity = current_equity
             self.last_daily_reset = today
 
-    def update_session_high(self, current_equity: float) -> None:
+    def _note_stable_equity(self, current_equity: float) -> None:
+        eq = float(current_equity or 0.0)
+        if eq <= 0:
+            return
+        prev = float(self.last_stable_equity or 0.0)
+        if prev <= 0 or abs(eq - prev) / prev <= SESSION_HIGH_STABLE_BAND:
+            self.last_stable_equity = eq
+
+    def _revert_spiked_session_high(self, current_equity: float) -> bool:
+        """Drop a watermark that is not supported by recent stable equity.
+
+        A real 7%+ crash keeps last_stable near the old high. A residual-fill
+        double-count leaves last_stable near the true book and a spiked high.
+        """
+        high = float(self.session_high_equity or 0.0)
+        eq = float(current_equity or 0.0)
+        if high <= 0 or eq <= 0:
+            return False
+        if high <= eq * (1.0 + SESSION_HIGH_UNEXPLAINED_GAP):
+            return False
+        stable = float(self.last_stable_equity or 0.0)
+        if stable > 0 and stable >= high * (1.0 - SESSION_HIGH_UNEXPLAINED_GAP):
+            return False
+        replacement = stable if stable > 0 else eq
+        logger.warning(
+            "[CIRCUIT BREAKER] SESSION_HIGH_SPIKE_REVERT high=%.2f current=%.2f stable=%.2f -> %.2f",
+            high,
+            eq,
+            stable,
+            replacement,
+        )
+        self.session_high_equity = replacement
+        return True
+
+    def update_session_high(self, current_equity: float, *, residual_pending: bool = False) -> None:
         """Update session high equity for circuit breaker calculations"""
-        self._maybe_reset_daily_session_high(current_equity)
-        self.session_high_equity = max(self.session_high_equity, current_equity)
+        eq = float(current_equity or 0.0)
+        self._maybe_reset_daily_session_high(eq)
+        if residual_pending:
+            logger.warning(
+                "[CIRCUIT BREAKER] SESSION_HIGH_SKIP residual_pending equity=%.2f high=%.2f",
+                eq,
+                self.session_high_equity,
+            )
+            return
+        if eq <= 0:
+            return
+        self._revert_spiked_session_high(eq)
+        if self.session_high_equity > 0 and eq > self.session_high_equity * (1.0 + SESSION_HIGH_MAX_ONE_TICK_INCREASE):
+            logger.warning(
+                "[CIRCUIT BREAKER] SESSION_HIGH_SPIKE_REJECT current=%.2f high=%.2f",
+                eq,
+                self.session_high_equity,
+            )
+            return
+        self.session_high_equity = max(self.session_high_equity, eq)
+        self._note_stable_equity(eq)
 
     def check_daily_loss_freeze(self, realized_pnl_today: float, equity: float) -> bool:
         """
@@ -307,7 +369,7 @@ class TradingCircuitBreaker:
         if self.session_high_equity == 0:
             return False
 
-        threshold = self.session_high_equity * 0.93  # 7% drawdown from session high
+        threshold = self.session_high_equity * EQUITY_CIRCUIT_BREAKER_FRACTION  # 7% drawdown from session high
         if current_equity <= threshold:
             if not self.equity_circuit_breaker_active:
                 self.equity_circuit_breaker_active = True
@@ -367,9 +429,10 @@ class TradingCircuitBreaker:
         current_equity = portfolio_data.get("total_equity", 0)
         principal = portfolio_data.get("principal", 0.0)
         realized_pnl_today = portfolio_data.get("realized_pnl_today", 0)
+        residual_pending = bool(portfolio_data.get("residual_pending", False))
 
         # Update session high
-        self.update_session_high(current_equity)
+        self.update_session_high(current_equity, residual_pending=residual_pending)
 
         results = {
             "daily_loss_freeze": self.check_daily_loss_freeze(realized_pnl_today, current_equity),
@@ -431,6 +494,7 @@ class TradingCircuitBreaker:
             "account_failsafe_active": bool(circuit_data.get("account_failsafe_active", False)),
         }
         self.session_high_equity = float(circuit_data.get("session_high_equity", 0.0) or 0.0)
+        self.last_stable_equity = float(circuit_data.get("last_stable_equity", 0.0) or 0.0)
         self.last_daily_reset = circuit_data.get("last_daily_reset") or None
 
         for flag_name, persisted_value in persisted.items():
@@ -488,8 +552,8 @@ class TradingCircuitBreaker:
                 self.daily_loss_freeze_active = False
                 cleared.append("daily_loss_freeze_active")
         if "equity_circuit_breaker_active" in pending:
-            self._maybe_reset_daily_session_high(current_equity)
-            if self.session_high_equity > 0 and current_equity <= self.session_high_equity * 0.93:
+            self.update_session_high(current_equity, residual_pending=bool(portfolio_data.get("residual_pending", False)))
+            if self.session_high_equity > 0 and current_equity <= self.session_high_equity * EQUITY_CIRCUIT_BREAKER_FRACTION:
                 self.equity_circuit_breaker_active = True
                 confirmed.append("equity_circuit_breaker_active")
             else:
@@ -519,6 +583,7 @@ class TradingCircuitBreaker:
             "equity_circuit_breaker_active": self.equity_circuit_breaker_active,
             "account_failsafe_active": self.account_failsafe_active,
             "session_high_equity": self.session_high_equity,
+            "last_stable_equity": self.last_stable_equity,
             "last_daily_reset": self.last_daily_reset,
             "persisted_state_timestamp": self.persisted_state_timestamp,
             "persisted_state_age_sec": round(self.persisted_state_age_sec, 1) if self.persisted_state_age_sec is not None else None,
@@ -588,6 +653,7 @@ class TradingCircuitBreaker:
                 "equity_circuit_breaker_active": self.equity_circuit_breaker_active,
                 "account_failsafe_active": self.account_failsafe_active,
                 "session_high_equity": self.session_high_equity,
+                "last_stable_equity": self.last_stable_equity,
                 "last_daily_reset": self.last_daily_reset,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -637,6 +703,7 @@ class TradingCircuitBreaker:
                 bool(self.equity_circuit_breaker_active),
                 bool(self.account_failsafe_active),
                 float(self.session_high_equity or 0.0),
+                float(self.last_stable_equity or 0.0),
                 str(self.last_daily_reset or ""),
                 bool(any_active),
             )
@@ -655,6 +722,7 @@ class TradingCircuitBreaker:
                 "equity_circuit_breaker_active": self.equity_circuit_breaker_active,
                 "account_failsafe_active": self.account_failsafe_active,
                 "session_high_equity": self.session_high_equity,
+                "last_stable_equity": self.last_stable_equity,
                 "last_daily_reset": self.last_daily_reset,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }

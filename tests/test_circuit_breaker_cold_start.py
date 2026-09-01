@@ -31,6 +31,7 @@ def _fresh_breaker() -> TradingCircuitBreaker:
     tcb.equity_circuit_breaker_active = False
     tcb.account_failsafe_active = False
     tcb.session_high_equity = 0.0
+    tcb.last_stable_equity = 0.0
     tcb.last_daily_reset = None
     tcb.needs_revalidation = set()
     tcb.persisted_state_timestamp = None
@@ -221,6 +222,61 @@ async def test_half_open_failed_recovery_reopens_deterministically():
     with pytest.raises(RuntimeError):
         await cb.call(_fail)  # fails again during HALF_OPEN probe
     assert cb.state == CircuitState.OPEN
+
+
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def test_session_high_rejects_residual_double_count_spike():
+    """Ocean 2026-09-01: cash already included the XRP sell while qty was still marked."""
+    tcb = _fresh_breaker()
+    tcb.last_daily_reset = _today_utc()
+    tcb.session_high_equity = 236.15
+    tcb.last_stable_equity = 236.15
+    tcb.update_session_high(296.94630321799997)
+    assert tcb.session_high_equity == pytest.approx(236.15)
+    assert tcb.check_equity_circuit_breaker(233.15) is False
+
+
+def test_session_high_skips_update_while_residual_pending():
+    tcb = _fresh_breaker()
+    tcb.last_daily_reset = _today_utc()
+    tcb.session_high_equity = 233.15
+    tcb.last_stable_equity = 233.15
+    tcb.update_session_high(296.95, residual_pending=True)
+    assert tcb.session_high_equity == pytest.approx(233.15)
+
+
+def test_latched_spike_watermark_reverts_and_does_not_trip():
+    tcb = _fresh_breaker()
+    tcb.last_daily_reset = _today_utc()
+    tcb.session_high_equity = 296.95
+    tcb.last_stable_equity = 236.15
+    tcb.equity_circuit_breaker_active = True
+    out = tcb.check_all_hard_kills(
+        {"total_equity": 233.15, "principal": 236.15, "realized_pnl_today": -3.10},
+        skip_sync_persist=True,
+    )
+    assert tcb.session_high_equity == pytest.approx(236.15)
+    assert out["conditions"]["equity_circuit_breaker"] is False
+    assert out["actions"]["block_new_entries"] is False
+    assert tcb.equity_circuit_breaker_active is False
+
+
+def test_genuine_seven_percent_drawdown_still_trips():
+    tcb = _fresh_breaker()
+    tcb.last_daily_reset = _today_utc()
+    tcb.session_high_equity = 236.15
+    tcb.last_stable_equity = 236.15
+    crashed = 236.15 * 0.92
+    out = tcb.check_all_hard_kills(
+        {"total_equity": crashed, "principal": 236.15, "realized_pnl_today": -20.0},
+        skip_sync_persist=True,
+    )
+    assert tcb.session_high_equity == pytest.approx(236.15)
+    assert out["conditions"]["equity_circuit_breaker"] is True
+    assert out["actions"]["block_new_entries"] is True
 
 
 @pytest.mark.asyncio
