@@ -235,6 +235,54 @@ def sum_realized_pnl_by_mode(
         return 0.0
 
 
+def sum_dust_adjustment_pnl(db_path: str) -> float:
+    """Sum DUST_WRITEOFF SELL pnl. Account adjustment only — not strategy expectancy."""
+    try:
+        with sqlite3.connect(db_path, timeout=5) as conn:
+            expr = _sell_pnl_expr(conn)
+            row = conn.execute(
+                f"""
+                SELECT COALESCE(SUM({expr}), 0)
+                FROM paper_trades
+                WHERE UPPER(side)='SELL'
+                  AND COALESCE(exit_type, '') = 'DUST_WRITEOFF'
+                """,
+            ).fetchone()
+        return float((row or (0.0,))[0] or 0.0)
+    except sqlite3.Error:
+        return 0.0
+
+
+def mode_scoped_equity_views(
+    *,
+    account_equity: float,
+    principal: float,
+    live_realized: float,
+    paper_realized: float,
+    unrealized: float,
+    dust_adjustment: float,
+    is_live: bool,
+) -> dict[str, Any]:
+    """Live consumers must not see paper-inflated performance_equity as live equity.
+
+    cash_plus_positions_equity is the live account mark. performance_equity equals
+    that mark in live mode. Paper realized stays in paper_realized_pnl only.
+    """
+    cash_plus = float(account_equity)
+    if is_live:
+        performance = cash_plus
+    else:
+        performance = float(principal) + float(paper_realized) + float(unrealized)
+    return {
+        "cash_plus_positions_equity": cash_plus,
+        "performance_equity": performance,
+        "live_realized_pnl": float(live_realized),
+        "paper_realized_pnl": float(paper_realized),
+        "dust_adjustment_pnl": float(dust_adjustment),
+        "performance_equity_uses_live_account": bool(is_live),
+    }
+
+
 def recent_sell_pnls(
     db_path: str,
     symbol: str,

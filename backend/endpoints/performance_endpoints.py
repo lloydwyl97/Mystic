@@ -210,7 +210,12 @@ def _performance_display_context() -> dict[str, Any]:
     realized = float(ledger.get("realized_pnl") or 0)
     unrealized = float(ledger.get("unrealized_pnl") or 0)
     lifetime_account_pnl = equity - principal
-    performance_equity = principal + realized + unrealized
+    if str(ledger.get("account_execution_mode") or "") == "live":
+        performance_equity = equity
+    elif ledger.get("performance_equity") is not None:
+        performance_equity = float(ledger.get("performance_equity") or 0)
+    else:
+        performance_equity = principal + realized + unrealized
     # Same auxiliary tolerance used by portfolio status (fees/open lots + truncated history).
     inv_tolerance = 5.0
     history_incomplete = abs(equity - performance_equity) > inv_tolerance

@@ -3,11 +3,15 @@
 import sqlite3
 import tempfile
 
+import pytest
+
 from backend.services.live_fill_economics import (
     apply_live_buy_economics,
     apply_live_sell_economics,
     extract_live_commission,
     live_round_trip_net,
+    mode_scoped_equity_views,
+    sum_dust_adjustment_pnl,
     sum_realized_pnl_by_mode,
 )
 
@@ -172,3 +176,46 @@ def test_paper_dust_also_excluded():
     )
     paper = sum_realized_pnl_by_mode(path, mode="paper")
     assert abs(paper - 10.0) < 1e-6, f"paper={paper} (dust excluded)"
+
+
+def test_dust_adjustment_sum_is_separate():
+    path = _make_paper_trades_db(
+        [
+            {"side": "SELL", "pnl": -1.30, "mode": "live", "exit_type": None},
+            {"side": "SELL", "pnl": -7.33, "mode": "live", "exit_type": "DUST_WRITEOFF"},
+        ]
+    )
+    assert abs(sum_dust_adjustment_pnl(path) - (-7.33)) < 1e-6
+    assert abs(sum_realized_pnl_by_mode(path, mode="live") - (-1.30)) < 1e-6
+
+
+def test_live_performance_equity_is_cash_plus_positions_not_paper():
+    views = mode_scoped_equity_views(
+        account_equity=236.15,
+        principal=236.95,
+        live_realized=-1.34,
+        paper_realized=973.98,
+        unrealized=0.0,
+        dust_adjustment=-10.13,
+        is_live=True,
+    )
+    assert views["performance_equity"] == pytest.approx(236.15)
+    assert views["cash_plus_positions_equity"] == pytest.approx(236.15)
+    assert views["paper_realized_pnl"] == pytest.approx(973.98)
+    assert views["live_realized_pnl"] == pytest.approx(-1.34)
+    assert views["performance_equity_uses_live_account"] is True
+    # Paper profit must not appear as live equity
+    assert views["performance_equity"] < 300.0
+
+
+def test_paper_mode_performance_equity_uses_paper_realized():
+    views = mode_scoped_equity_views(
+        account_equity=10000.0,
+        principal=10000.0,
+        live_realized=0.0,
+        paper_realized=50.0,
+        unrealized=10.0,
+        dust_adjustment=0.0,
+        is_live=False,
+    )
+    assert views["performance_equity"] == pytest.approx(10060.0)

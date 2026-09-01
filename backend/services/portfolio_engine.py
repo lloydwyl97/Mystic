@@ -17695,13 +17695,8 @@ class PortfolioEngine:
         # Account equity: cash + MTM positions (matches engine._total_equity / persisted ledger row)
         account_equity = self._total_equity
         account_equity_check = self.cash_balance + self._positions_value
-        # Performance equity: principal + accumulated realized + mark-to-market unrealized
-        performance_equity = self.principal + self._realized_pnl + self._unrealized_pnl
         # Canonical operational identity used by dashboard/risk endpoints.
         equity_invariant_ok = abs(account_equity - account_equity_check) < 1.0
-        # Secondary books check (fees/slippage on open lots can separate the two views)
-        inv_tolerance = 5.0 + len(self.open_positions) * 3.0
-        performance_equity_consistency_ok = abs(account_equity - performance_equity) < inv_tolerance
 
         total_risk = self._calculate_total_open_risk()
         self._log_capital_concentration(account_equity)
@@ -17717,6 +17712,24 @@ class PortfolioEngine:
         except Exception as exc:
             forward_accounting = {"error": str(exc)[:200]}
         mode_pnl = self._mode_aware_pnl_fields(forward_accounting)
+        from backend.services.live_fill_economics import mode_scoped_equity_views, sum_dust_adjustment_pnl
+
+        dust_adj = 0.0
+        try:
+            dust_adj = sum_dust_adjustment_pnl(self.db_path)
+        except Exception:
+            dust_adj = 0.0
+        equity_views = mode_scoped_equity_views(
+            account_equity=account_equity,
+            principal=self.principal,
+            live_realized=mode_pnl["realized_pnl_live"],
+            paper_realized=mode_pnl["realized_pnl_paper_historical"],
+            unrealized=self._unrealized_pnl,
+            dust_adjustment=dust_adj,
+            is_live=mode_pnl["account_execution_mode"] == "live",
+        )
+        performance_equity = equity_views["performance_equity"]
+        performance_equity_consistency_ok = abs(account_equity - performance_equity) < 1.0
 
         return {
             # DAY mode (normal repaired strategy — no inventory recovery freeze)
@@ -17747,6 +17760,8 @@ class PortfolioEngine:
             "account_equity": account_equity,
             "performance_equity": performance_equity,
             "principal_based_equity": performance_equity,
+            "cash_plus_positions_equity": equity_views["cash_plus_positions_equity"],
+            "performance_equity_uses_live_account": equity_views["performance_equity_uses_live_account"],
             "available_balance": self._available_balance,
             # EQUITY: explicit aliases + books check
             "operational_equity": account_equity,
@@ -17759,7 +17774,9 @@ class PortfolioEngine:
             "account_execution_mode": mode_pnl["account_execution_mode"],
             "realized_pnl_ledger_stored": self._realized_pnl,
             "realized_pnl_live": mode_pnl["realized_pnl_live"],
+            "paper_realized_pnl": mode_pnl["realized_pnl_paper_historical"],
             "realized_pnl_paper_historical": mode_pnl["realized_pnl_paper_historical"],
+            "dust_adjustment_pnl": equity_views["dust_adjustment_pnl"],
             "realized_pnl": mode_pnl["headline_realized_pnl"],
             "unrealized_pnl": self._unrealized_pnl,
             "dust_positions": dust_list,
