@@ -27,6 +27,11 @@ from typing import Any
 import redis.asyncio as redis  # type: ignore[import-not-found]
 
 from backend.config.redis_config import get_shared_redis_async
+from backend.config.trading_economics import (
+    ORDERBOOK_HALF_SPREAD_ESTIMATE,
+    SLIPPAGE_BUFFER,
+    TAKER_FEE,
+)
 from backend.database_schema import DATABASE_PATH, execute_read
 from backend.services.redis_service import get_redis_service
 from backend.services.symbols import _to_ccxt_symbol  # type: ignore[import-not-found]
@@ -131,8 +136,10 @@ class PaperTradingService:
         self.positions: dict[str, PaperPosition] = {}
         self.orders: dict[str, PaperOrder] = {}
         self.trade_history: list[dict[str, Any]] = []
-        self.commission_rate = 0.001
-        self.slippage_rate = 0.0005
+        # Binance.US Advanced Spot (Apr 2026): 0% maker / 0.02% taker. Verified against
+        # 129 authenticated post-2026-04-21 fills measuring 2.000 bps/side taker.
+        self.commission_rate = TAKER_FEE
+        self.slippage_rate = SLIPPAGE_BUFFER
         self.enabled = True
         self._running = False
         self._task: asyncio.Task | None = None
@@ -1138,9 +1145,9 @@ class PaperTradingService:
     async def _fill_order(self, order: PaperOrder, mark_price: float) -> None:
         if order.status != "PENDING":
             return
-        # FIX 6: Apply half-spread slippage instead of fixed slippage
-        # Conservative spread assumption for crypto (0.1% = 0.001)
-        spread_pct = 0.001  # 0.1% spread
+        # Half-spread slippage. Measured Binance.US top-four full spread is 0.59-2.19 bps
+        # (980k decision_book_tape samples); ORDERBOOK_HALF_SPREAD_ESTIMATE is the canonical half.
+        spread_pct = ORDERBOOK_HALF_SPREAD_ESTIMATE * 2.0
         fill_price = mark_price * (1.0 + spread_pct / 2) if order.side == "BUY" else mark_price * (1.0 - spread_pct / 2)
         commission = order.quantity * fill_price * self.commission_rate
         ts_now = datetime.now(timezone.utc)
