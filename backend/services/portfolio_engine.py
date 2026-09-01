@@ -4801,6 +4801,84 @@ class PortfolioEngine:
             raise RuntimeError(f"SELL_CASH_CREDIT_FAILED: cash delta {delta:.4f} != proceeds {proc:.4f}")
         return delta
 
+    def _apply_confirmed_sell_qty_to_memory(
+        self,
+        position: Any,
+        sold_qty: float,
+        *,
+        fill_price: float,
+        qty_step: float = 0.0,
+        min_qty: float = 0.0,
+        min_notional: float = 0.0,
+        mandatory_flatten: bool = False,
+        exit_trigger: str = "",
+        dust_writeoff: bool = False,
+        base_qty_reduction: float = 0.0,
+    ) -> float:
+        """Cut in-memory qty to the genuine unsold residual after a confirmed fill.
+
+        Must run under ``_fifo_sell_lock`` before cash is visible to MTM so
+        positions_value cannot still mark the sold coins (Ocean 2026-09-01 XRP
+        47.0 fill / 47.09 book → fake $296 equity).
+        """
+        sold = float(sold_qty or 0.0)
+        fee_base = max(0.0, float(base_qty_reduction or 0.0))
+        prior = float(getattr(position, "quantity", 0.0) or 0.0)
+        already = float(getattr(position, "_confirmed_sell_qty_applied", 0.0) or 0.0)
+        if already > 0.0 and abs(already - sold) <= 1e-12:
+            return prior
+        if (sold <= 0.0 and fee_base <= 0.0) or prior <= 0.0:
+            return prior
+        remaining = float(Decimal(str(prior)) - Decimal(str(min(sold, prior))) - Decimal(str(fee_base)))
+        remaining = max(remaining, 0.0)
+        snapped = remaining
+        if qty_step > 0.0 and remaining > 0.0:
+            snapped = float(self._floor_to_step(remaining, qty_step))
+        position.quantity = snapped if snapped > 0.0 else remaining
+        if dust_writeoff:
+            position._confirmed_sell_qty_applied = sold
+            return float(position.quantity or 0.0)
+        if position.quantity <= 0.0:
+            position.quantity = 0.0
+            position._confirmed_sell_qty_applied = sold
+            return 0.0
+        is_dust = (min_qty > 0.0 and position.quantity + 1e-15 < min_qty) or (min_notional > 0.0 and fill_price > 0.0 and (position.quantity * fill_price) + 1e-15 < min_notional)
+        if is_dust:
+            position.status = "DUST_PENDING"
+            position.dust_detected_at = time.time()
+            position.dust_qty_canonical = float(position.quantity)
+        elif mandatory_flatten:
+            from backend.services.day_mandatory_exit_execution import mark_exit_residual_pending
+
+            mark_exit_residual_pending(position, exit_trigger)
+        position._confirmed_sell_qty_applied = sold
+        return float(position.quantity or 0.0)
+
+    def _mtm_after_confirmed_sell(self, symbol: str, mark: float) -> None:
+        """Recompute positions_value from the post-fill in-memory book."""
+        ns = normalize_symbol(symbol)
+        px = float(mark or 0.0)
+        prices: dict[str, float] = {}
+        existing = getattr(self, "_position_mark_prices", None)
+        if isinstance(existing, dict):
+            for key, val in existing.items():
+                try:
+                    mark_px = float(val or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if mark_px > 0.0:
+                    prices[str(key)] = mark_px
+        if px > 0.0:
+            prices[symbol] = px
+            prices[ns] = px
+            if "/" in ns:
+                prices[ns.replace("/", "")] = px
+        pv, cb = self._compute_positions_value_and_cost_basis(prices or None)
+        self._positions_value = float(pv)
+        self._cost_basis = float(cb)
+        self._unrealized_pnl = self._positions_value - self._cost_basis
+        self._total_equity = float(self.cash_balance or 0.0) + self._positions_value
+
     async def _persist_ledger_to_sqlite(self) -> None:
         """Persist authoritative ledger to SQLite (must be called after every trade)"""
         now_epoch = time.time()
@@ -6826,6 +6904,8 @@ class PortfolioEngine:
                 self._trading_paused = False
                 self._pause_reason = ""
                 self._account_status = AccountStatus.HEALTHY
+
+            self._hydrate_kill_switch_from_ledger_sync()
 
             logger.info(f"LOAD_LEDGER: Restored from SQLite (version={row[10]})")
             logger.info(f"LOAD_LEDGER: principal=${self.principal:.2f} cash=${self.cash_balance:.2f}")
@@ -9994,6 +10074,7 @@ class PortfolioEngine:
         if quantity > position.quantity:
             logger.error(f"SELL_ERROR: Quantity {quantity} > position {position.quantity} for {symbol}")
             return None
+        position._confirmed_sell_qty_applied = 0.0
 
         sell_eval = await self._evaluate_sell_profitability(
             symbol=normalized_symbol,
@@ -11051,6 +11132,7 @@ class PortfolioEngine:
                     exec_check.executable_net_pct,
                 )
 
+        base_qty_reduction = 0.0
         if dust_writeoff:
             fee = 0.0
             proceeds = 0.0
@@ -11067,6 +11149,7 @@ class PortfolioEngine:
                     modeled_fee=fee,
                     commission=comm,
                 )
+                base_qty_reduction = float(getattr(comm, "base_qty_reduction", 0.0) or 0.0)
                 if sell_preflight_audit is None:
                     sell_preflight_audit = {}
                 sell_preflight_audit["live_commission"] = comm.to_dict()
@@ -11092,10 +11175,22 @@ class PortfolioEngine:
                 sell_sqlite_ok = await loop.run_in_executor(None, _sync_fifo_sell)
                 if not sell_sqlite_ok:
                     return None
-                # Credit cash under the same lock immediately after SQLite commit so
-                # dashboard/reconcile reload cannot observe a closed position with stale cash.
+                constraints = self._symbol_constraints.get(symbol) or self._symbol_constraints.get(normalized_symbol) or {}
+                self._apply_confirmed_sell_qty_to_memory(
+                    position,
+                    quantity,
+                    fill_price=float(fill_price),
+                    qty_step=float(constraints.get("qty_step") or 0.0),
+                    min_qty=float(constraints.get("min_qty") or 0.0),
+                    min_notional=float(constraints.get("min_notional") or 0.0),
+                    mandatory_flatten=bool(mandatory_flatten),
+                    exit_trigger=str(exit_trigger or ""),
+                    dust_writeoff=bool(dust_writeoff),
+                    base_qty_reduction=float(base_qty_reduction or 0.0),
+                )
                 if not dust_writeoff:
                     self._apply_sell_cash_credit(proceeds, realized_pnl, dust_writeoff=dust_writeoff)
+                self._mtm_after_confirmed_sell(normalized_symbol, float(fill_price or price or 0.0))
                 await self._persist_ledger_to_sqlite()
 
             try:
@@ -11161,8 +11256,27 @@ class PortfolioEngine:
         )
 
         # Cash/realized credited under _fifo_sell_lock immediately after FIFO SQLite commit.
+        # Qty is already the unsold residual when `_confirmed_sell_qty_applied` is set.
 
-        if quantity >= position.quantity:
+        already_applied = float(getattr(position, "_confirmed_sell_qty_applied", 0.0) or 0.0)
+        if already_applied > 0.0:
+            remaining_now = float(getattr(position, "quantity", 0.0) or 0.0)
+            position.entry_fee = max(0.0, (getattr(position, "entry_fee", 0) or 0) - entry_fee_pro_rata)
+            if remaining_now <= 0.0:
+                async with self._deletion_lock:
+                    self.open_positions.pop(normalized_symbol, None)
+                    await self._delete_position_from_sqlite(normalized_symbol)
+                    await self._write_closed_lot_tombstone(
+                        normalized_symbol,
+                        entry_trade_id=str(position.trade_id or ""),
+                        sell_trade_id=str(sell_trade_id or ""),
+                        quantity=float(quantity),
+                    )
+                    if len(self.open_positions) == 0:
+                        await self._clear_all_quarantines()
+            else:
+                await self._persist_position_to_sqlite(position)
+        elif quantity >= position.quantity:
             # Full close - remove position
             # BUG #28: Wrap deletion in lock
             async with self._deletion_lock:
@@ -17584,9 +17698,60 @@ class PortfolioEngine:
         except Exception:
             logger.debug("open-position explain enrich failed", exc_info=True)
 
+    def _effective_entry_control(self) -> dict[str, Any]:
+        """Merge in-memory kill with persisted breaker/ledger authority."""
+        import sys
+
+        from backend.services.circuit_breaker_service import read_persisted_entry_control
+
+        persisted: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            persisted = read_persisted_entry_control(self.db_path) or {}
+        memory_mode = self._kill_switch_mode.value
+        requested = str(persisted.get("requested_kill_mode") or memory_mode or "RESUME")
+        requested_reason = str(persisted.get("requested_kill_reason") or self._kill_switch_reason or "")
+        pause_modes = {"PAUSE_BUYS", "PAUSE_ALL", "PAUSE_ALL_ENTRIES", "EMERGENCY_FLATTEN"}
+        memory_blocked = self._entries_paused_by_kill_switch()
+        requested_blocked = requested in pause_modes
+        cb = bool(persisted.get("equity_circuit_breaker_active"))
+        freeze = bool(persisted.get("daily_loss_freeze_active"))
+        failsafe_p = bool(persisted.get("account_failsafe_active"))
+        blocked = bool(memory_blocked or requested_blocked or cb or freeze or failsafe_p)
+        active = None
+        reasons: list[str] = []
+        if requested_blocked or memory_blocked:
+            mode = requested if requested_blocked else memory_mode
+            reasons.append(f"kill_switch:{mode}:{requested_reason}")
+            active = "requested_kill"
+        if freeze:
+            reasons.append("daily_loss_freeze")
+            active = "daily_loss_freeze"
+        if cb:
+            reasons.append("equity_circuit_breaker")
+            active = "equity_circuit_breaker"
+        if failsafe_p:
+            reasons.append("account_failsafe")
+            active = "account_failsafe"
+        source = str(os.environ.get("MYSTIC_PROCESS_ROLE") or Path(sys.argv[0] if sys.argv else "").name or "unknown")
+        return {
+            "requested_kill_mode": requested,
+            "requested_kill_reason": requested_reason,
+            "effective_entry_permitted": not blocked,
+            "effective_entry_state": "RESUME" if not blocked else "PAUSE",
+            "active_breaker": active,
+            "blocking_reason": "; ".join(reasons) if reasons else None,
+            "updated_at": persisted.get("updated_at"),
+            "source_process": source,
+            "equity_circuit_breaker_active": cb,
+            "daily_loss_freeze_active": freeze,
+            "account_failsafe_persisted": failsafe_p,
+            "memory_kill_mode": memory_mode,
+        }
+
     def get_trading_capability_status(self) -> dict[str, Any]:
         """Honest capability flags. Process-alive is not the same as entries enabled."""
         ks = self.get_kill_switch_status()
+        ctrl = self._effective_entry_control()
         account_equity = float(getattr(self, "cash_balance", 0.0) or 0.0) + float(getattr(self, "_positions_value", 0.0) or 0.0)
         from backend.services.circuit_breaker_service import account_failsafe_tripped
 
@@ -17598,7 +17763,7 @@ class PortfolioEngine:
             from backend.services.circuit_breaker_service import trading_circuit_breaker
 
             trading_circuit_breaker.check_account_failsafe(account_equity, principal)
-        failsafe = bool(ledger_failsafe)
+        failsafe = bool(ledger_failsafe or ctrl.get("account_failsafe_persisted"))
         failsafe_reason = ""
         if failsafe:
             failsafe_reason = f"ACCOUNT_FAILSAFE equity=${account_equity:.2f} principal=${float(self.principal or 0.0):.2f} — MANUAL POSITION REVIEW REQUIRED"
@@ -17616,19 +17781,29 @@ class PortfolioEngine:
             reasons.append(f"account_status:{self._account_status.value}")
         if failsafe:
             reasons.append(failsafe_reason)
-        elif ks.get("buys_blocked"):
-            reasons.append(f"kill_switch:{ks.get('mode')}:{ks.get('reason')}")
+        elif not ctrl.get("effective_entry_permitted"):
+            reasons.append(str(ctrl.get("blocking_reason") or f"kill_switch:{ks.get('mode')}:{ks.get('reason')}"))
         if not accounting.get("ok", False):
             n_orphans = len(accounting.get("orphans") or [])
             reasons.append(f"accounting_disagreement:orphans={n_orphans}:diff={accounting.get('identity_diff')}")
-        day_entry = not self._trading_paused and self._account_status == AccountStatus.HEALTHY and not bool(ks.get("buys_blocked")) and not failsafe and bool(accounting.get("ok"))
+        day_entry = not self._trading_paused and self._account_status == AccountStatus.HEALTHY and bool(ctrl.get("effective_entry_permitted")) and not failsafe and bool(accounting.get("ok"))
         return {
             "process_alive": True,
             "accounting_healthy": bool(accounting.get("ok")),
             "day_entry_enabled": day_entry,
             "day_exit_enabled": not bool(ks.get("sells_blocked")),
-            "kill_switch_mode": ks.get("mode"),
-            "kill_switch_reason": (failsafe_reason if failsafe else ks.get("reason")),
+            "kill_switch_mode": ctrl.get("requested_kill_mode") or ks.get("mode"),
+            "kill_switch_reason": (failsafe_reason if failsafe else (ctrl.get("requested_kill_reason") or ks.get("reason"))),
+            "requested_kill_mode": ctrl.get("requested_kill_mode"),
+            "requested_kill_reason": ctrl.get("requested_kill_reason"),
+            "effective_entry_permitted": bool(day_entry),
+            "effective_entry_state": "RESUME" if day_entry else "PAUSE",
+            "active_breaker": "account_failsafe" if failsafe else ctrl.get("active_breaker"),
+            "blocking_reason": reasons[0] if reasons else ctrl.get("blocking_reason"),
+            "entry_control_updated_at": ctrl.get("updated_at"),
+            "entry_control_source_process": ctrl.get("source_process"),
+            "equity_circuit_breaker_active": bool(ctrl.get("equity_circuit_breaker_active")),
+            "daily_loss_freeze_active": bool(ctrl.get("daily_loss_freeze_active")),
             "failsafe_active": failsafe,
             "no_trade_reason": "; ".join(reasons) if reasons else None,
             "accounting": accounting,
@@ -17740,6 +17915,16 @@ class PortfolioEngine:
             "pause_reason": self._pause_reason if self._trading_paused else None,
             "kill_switch_mode": capability["kill_switch_mode"],
             "kill_switch_reason": capability["kill_switch_reason"],
+            "requested_kill_mode": capability.get("requested_kill_mode"),
+            "requested_kill_reason": capability.get("requested_kill_reason"),
+            "effective_entry_permitted": capability.get("effective_entry_permitted"),
+            "effective_entry_state": capability.get("effective_entry_state"),
+            "active_breaker": capability.get("active_breaker"),
+            "blocking_reason": capability.get("blocking_reason"),
+            "entry_control_updated_at": capability.get("entry_control_updated_at"),
+            "entry_control_source_process": capability.get("entry_control_source_process"),
+            "equity_circuit_breaker_active": capability.get("equity_circuit_breaker_active"),
+            "daily_loss_freeze_active": capability.get("daily_loss_freeze_active"),
             "failsafe_active": capability["failsafe_active"],
             "accounting_healthy": capability["accounting_healthy"],
             "day_entry_enabled": capability["day_entry_enabled"],
@@ -19148,6 +19333,25 @@ class PortfolioEngine:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _sync_persist)
 
+    def _hydrate_kill_switch_from_ledger_sync(self) -> None:
+        """Adopt ledger kill-switch on process start so API/worker share authority."""
+        try:
+            with connect_ro(self.db_path, timeout_sec=2.0) as conn:
+                cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(portfolio_engine_ledger)").fetchall()}
+                if "kill_switch_mode" not in cols:
+                    return
+                row = conn.execute("SELECT kill_switch_mode, COALESCE(kill_switch_reason, '') FROM portfolio_engine_ledger WHERE id=1").fetchone()
+            if not row:
+                return
+            mode = str(row[0] or KillSwitchMode.RESUME.value)
+            try:
+                self._kill_switch_mode = KillSwitchMode(mode)
+            except ValueError:
+                self._kill_switch_mode = KillSwitchMode.RESUME
+            self._kill_switch_reason = str(row[1] or "")
+        except Exception:
+            logger.debug("hydrate kill switch from ledger failed", exc_info=True)
+
     def _entries_paused_by_kill_switch(self) -> bool:
         return self._kill_switch_mode in (
             KillSwitchMode.PAUSE_BUYS,
@@ -19200,6 +19404,10 @@ class PortfolioEngine:
                 "— MANUAL POSITION REVIEW REQUIRED"
             )
             return False, reason
+        ctrl = self._effective_entry_control()
+        if not ctrl.get("effective_entry_permitted"):
+            mode = str(ctrl.get("requested_kill_mode") or self._kill_switch_mode.value)
+            return False, f"KILL_SWITCH_{mode}: {ctrl.get('blocking_reason') or self._kill_switch_reason}"
         if self._entries_paused_by_kill_switch():
             return False, f"KILL_SWITCH_{self._kill_switch_mode.value}: {self._kill_switch_reason}"
         return True, ""
@@ -19231,21 +19439,33 @@ class PortfolioEngine:
         account_equity = float(getattr(self, "cash_balance", 0.0) or 0.0) + float(getattr(self, "_positions_value", 0.0) or 0.0)
         principal = float(getattr(self, "principal", 0.0) or 0.0)
         failsafe = account_failsafe_tripped(account_equity, principal)
+        ctrl = self._effective_entry_control()
+        requested = str(ctrl.get("requested_kill_mode") or self._kill_switch_mode.value)
+        effective_blocked = (not bool(ctrl.get("effective_entry_permitted"))) or failsafe
+        effective_mode = requested
+        if failsafe or (effective_blocked and requested == KillSwitchMode.RESUME.value):
+            effective_mode = KillSwitchMode.PAUSE_BUYS.value
+        reason = str(ctrl.get("requested_kill_reason") or self._kill_switch_reason or "")
         if failsafe:
             reason = f"{self._CIRCUIT_BREAKER_REASON_PREFIX}ACCOUNT_FAILSAFE equity=${account_equity:.2f} principal=${principal:.2f} — MANUAL POSITION REVIEW REQUIRED"
-            return {
-                "mode": KillSwitchMode.PAUSE_BUYS.value,
-                "reason": reason,
-                "buys_blocked": True,
-                "sells_blocked": self._kill_switch_mode == KillSwitchMode.PAUSE_ALL,
-                "protective_sells_allowed": True,
-            }
+        elif ctrl.get("blocking_reason"):
+            reason = str(ctrl.get("blocking_reason"))
         return {
-            "mode": self._kill_switch_mode.value,
-            "reason": self._kill_switch_reason,
-            "buys_blocked": self._entries_paused_by_kill_switch(),
+            "mode": effective_mode,
+            "reason": reason,
+            "buys_blocked": bool(effective_blocked),
             "sells_blocked": self._kill_switch_mode == KillSwitchMode.PAUSE_ALL,
             "protective_sells_allowed": True,
+            "requested_kill_mode": requested,
+            "requested_kill_reason": str(ctrl.get("requested_kill_reason") or self._kill_switch_reason or ""),
+            "effective_entry_permitted": not bool(effective_blocked),
+            "effective_entry_state": "PAUSE" if effective_blocked else "RESUME",
+            "active_breaker": "account_failsafe" if failsafe else ctrl.get("active_breaker"),
+            "blocking_reason": reason if effective_blocked else None,
+            "entry_control_updated_at": ctrl.get("updated_at"),
+            "entry_control_source_process": ctrl.get("source_process"),
+            "equity_circuit_breaker_active": bool(ctrl.get("equity_circuit_breaker_active")),
+            "daily_loss_freeze_active": bool(ctrl.get("daily_loss_freeze_active")),
         }
 
     _CIRCUIT_BREAKER_REASON_PREFIX = "CIRCUIT_BREAKER:"
@@ -20938,6 +21158,15 @@ class PortfolioEngine:
             "real_orders_enabled": effective_live,
             "kill_switch": ks.get("mode"),
             "kill_switch_reason": capability.get("kill_switch_reason") or ks.get("reason"),
+            "requested_kill_mode": capability.get("requested_kill_mode") or ks.get("requested_kill_mode"),
+            "effective_entry_permitted": bool(capability.get("effective_entry_permitted")),
+            "effective_entry_state": capability.get("effective_entry_state"),
+            "active_breaker": capability.get("active_breaker"),
+            "blocking_reason": capability.get("blocking_reason") or capability.get("no_trade_reason"),
+            "entry_control_updated_at": capability.get("entry_control_updated_at"),
+            "entry_control_source_process": capability.get("entry_control_source_process"),
+            "equity_circuit_breaker_active": bool(capability.get("equity_circuit_breaker_active")),
+            "daily_loss_freeze_active": bool(capability.get("daily_loss_freeze_active")),
             "failsafe_active": bool(capability.get("failsafe_active")),
             "day_entry_enabled": bool(capability.get("day_entry_enabled")),
             "no_trade_reason": capability.get("no_trade_reason"),

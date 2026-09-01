@@ -740,6 +740,106 @@ class TradingCircuitBreaker:
             logger.warning(f"[CIRCUIT BREAKER] Failed to persist state (async): {e}")
 
 
+_PAUSE_KILL_MODES = frozenset({"PAUSE_BUYS", "PAUSE_ALL", "PAUSE_ALL_ENTRIES", "EMERGENCY_FLATTEN"})
+
+
+def read_persisted_entry_control(db_path: str) -> dict[str, Any]:
+    """SQLite authority for RESUME/PAUSE across API and integration processes.
+
+    Reads ledger kill-switch plus ``operational_state`` circuit-breaker flags.
+    Does not create a new control system.
+    """
+    import json
+    import sqlite3
+    from datetime import datetime, timezone
+
+    out: dict[str, Any] = {
+        "requested_kill_mode": "RESUME",
+        "requested_kill_reason": "",
+        "equity_circuit_breaker_active": False,
+        "daily_loss_freeze_active": False,
+        "account_failsafe_active": False,
+        "trading_paused_persisted": False,
+        "pause_reason": "",
+        "updated_at": None,
+        "source": "sqlite",
+        "active_breaker": None,
+        "blocking_reason": None,
+        "entry_permitted": True,
+    }
+    path = str(db_path or "")
+    if not path:
+        return out
+    conn = sqlite3.connect(path, timeout=2.0)
+    try:
+        tables = {str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "portfolio_engine_ledger" in tables:
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(portfolio_engine_ledger)").fetchall()}
+            select_cols = ["'RESUME'", "''", "NULL"]
+            if "kill_switch_mode" in cols:
+                select_cols[0] = "COALESCE(kill_switch_mode, 'RESUME')"
+            if "kill_switch_reason" in cols:
+                select_cols[1] = "COALESCE(kill_switch_reason, '')"
+            if "last_updated" in cols:
+                select_cols[2] = "last_updated"
+            row = conn.execute(f"SELECT {select_cols[0]}, {select_cols[1]}, {select_cols[2]} FROM portfolio_engine_ledger WHERE id=1").fetchone()
+            if row:
+                out["requested_kill_mode"] = str(row[0] or "RESUME")
+                out["requested_kill_reason"] = str(row[1] or "")
+                out["updated_at"] = row[2]
+        if "operational_state" in tables:
+            for key in ("risk:circuit_breakers", "risk:trading_paused"):
+                row = conn.execute(
+                    "SELECT value_json, updated_ts FROM operational_state WHERE key=?",
+                    (key,),
+                ).fetchone()
+                if not row or not row[0]:
+                    continue
+                try:
+                    data = json.loads(row[0])
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                if key == "risk:circuit_breakers":
+                    out["equity_circuit_breaker_active"] = bool(data.get("equity_circuit_breaker_active"))
+                    out["daily_loss_freeze_active"] = bool(data.get("daily_loss_freeze_active"))
+                    out["account_failsafe_active"] = bool(data.get("account_failsafe_active"))
+                    ts = data.get("updated_at") or row[1]
+                    if ts:
+                        out["updated_at"] = ts
+                else:
+                    out["trading_paused_persisted"] = bool(data.get("trading_paused"))
+                    out["pause_reason"] = str(data.get("pause_reason") or "")
+                    if data.get("updated_at"):
+                        out["updated_at"] = data.get("updated_at")
+    except Exception:
+        logger.debug("read_persisted_entry_control failed", exc_info=True)
+        return out
+    finally:
+        conn.close()
+
+    blockers: list[str] = []
+    requested = str(out["requested_kill_mode"] or "RESUME")
+    if requested in _PAUSE_KILL_MODES:
+        blockers.append(f"kill_switch:{requested}:{out['requested_kill_reason']}")
+        out["active_breaker"] = "requested_kill"
+    if out["daily_loss_freeze_active"]:
+        blockers.append("daily_loss_freeze")
+        out["active_breaker"] = "daily_loss_freeze"
+    if out["equity_circuit_breaker_active"]:
+        blockers.append("equity_circuit_breaker")
+        out["active_breaker"] = "equity_circuit_breaker"
+    if out["account_failsafe_active"]:
+        blockers.append("account_failsafe")
+        out["active_breaker"] = "account_failsafe"
+    out["blocking_reason"] = "; ".join(blockers) if blockers else None
+    out["entry_permitted"] = not bool(blockers)
+    if out["updated_at"] is None:
+        out["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return out
+
+
 # Global circuit breaker service instance
 circuit_breaker_service = CircuitBreakerService()
 
