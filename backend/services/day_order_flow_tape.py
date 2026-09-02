@@ -103,6 +103,19 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def bus_symbol(symbol: str) -> str:
+    """Normalize to the bus form the tape stream is keyed on.
+
+    Callers arrive in both forms: the portfolio engine holds positions as
+    ETH/USDT while the collector writes scalp:tape:ETHUSDT. Mirrors
+    structural_tape.parse_agg_payload so both sides agree on one key.
+    """
+    s = str(symbol or "").upper().replace("/", "").replace("-", "").replace(":", "")
+    if s and not s.endswith("USDT"):
+        s = f"{s}USDT"
+    return s
+
+
 def read_tape(
     symbol: str,
     *,
@@ -119,10 +132,11 @@ def read_tape(
     r = _redis(client)
     if r is None:
         return []
+    key = f"{TAPE_STREAM_PREFIX}{bus_symbol(symbol)}"
     lo_ms = max(0, int((since_ts - 60.0) * 1000))
     hi = "+" if until_ts is None else f"{int((until_ts + 60.0) * 1000)}"
     try:
-        entries = r.xrange(f"{TAPE_STREAM_PREFIX}{symbol}", f"{lo_ms}", hi, count=MAX_TAPE_READ)
+        entries = r.xrange(key, f"{lo_ms}", hi, count=MAX_TAPE_READ)
     except Exception:
         logger.debug("order-flow tape: xrange failed for %s", symbol, exc_info=True)
         return []
@@ -227,7 +241,7 @@ def _tape_stale_sec(symbol: str, *, now: float, client: Any | None = None) -> fl
     if r is None:
         return -1.0
     try:
-        entries = r.xrevrange(f"{TAPE_STREAM_PREFIX}{symbol}", "+", "-", count=1)
+        entries = r.xrevrange(f"{TAPE_STREAM_PREFIX}{bus_symbol(symbol)}", "+", "-", count=1)
     except Exception:
         return -1.0
     if not entries:
@@ -270,7 +284,7 @@ def bar_flow_rows(
         total_notional = w.buy_notional + w.sell_notional
         rows.append(
             {
-                "symbol": symbol,
+                "symbol": bus_symbol(symbol),
                 "bar_open_epoch": int(bar_open),
                 "bar_sec": int(bar_sec),
                 "trade_count": w.trade_count,

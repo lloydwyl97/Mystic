@@ -150,6 +150,24 @@ def test_bars_without_prints_produce_no_row():
     assert rows == []
 
 
+def test_ccxt_form_symbols_resolve_to_the_bus_keyed_stream():
+    """The portfolio engine holds ETH/USDT; the tape is keyed ETHUSDT."""
+    assert tape.bus_symbol("ETH/USDT") == "ETHUSDT"
+    assert tape.bus_symbol("ETHUSDT") == "ETHUSDT"
+    assert tape.bus_symbol("btc/usdt") == "BTCUSDT"
+    assert tape.bus_symbol("SOL") == "SOLUSDT"
+
+    now = 1_700_000_000.0
+    c = _client([_print_entry(now - 30, 100.0, 3.0, False)])
+    slashed = tape.heartbeat_flow_fields("BTC/USDT", now=now, client=c)
+    assert slashed["flow_version"] == tape.FLOW_VERSION, "slash form must hit the tape"
+    assert slashed["flow_trades_15m"] == 1
+    assert slashed["flow_cvd_qty_15m"] == 3.0
+
+    rows = tape.bar_flow_rows("BTC/USDT", since_ts=now - 900, until_ts=now, client=c)
+    assert rows and rows[0]["symbol"] == "BTCUSDT", "stored symbol must be normalized"
+
+
 def test_redis_failure_degrades_to_empty_not_exception():
     class Broken:
         def xrange(self, *a, **k):
