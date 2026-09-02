@@ -37,19 +37,21 @@ class RetentionPolicy:
 
 
 RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
-    RetentionPolicy("ai_inference_log", "ts_utc", 7, "iso_utc"),
-    RetentionPolicy("ai_context_snapshots", "ts_utc", 7, "iso_utc"),
+    RetentionPolicy("ai_inference_log", "ts_utc", 90, "iso_utc"),
+    RetentionPolicy("ai_context_snapshots", "ts_utc", 30, "iso_utc"),
     # strategy_runtime_audit writes ~160k rows/day — keep only 3 days (~480k rows max)
     RetentionPolicy("strategy_runtime_audit", "ts_utc", 3, "iso_utc"),
-    RetentionPolicy("feature_ohlcv", "ts", 7, "feature_ohlcv"),
+    RetentionPolicy("feature_ohlcv", "ts", 90, "feature_ohlcv"),
     RetentionPolicy("paper_trades", "timestamp", 90, "iso_utc"),
     # Append-only high-frequency logs (created_at tracks insert time).
-    RetentionPolicy("ai_live_signals", "created_at", 7, "iso_utc"),
-    RetentionPolicy("pipeline_decisions", "created_at", 7, "iso_utc"),
+    RetentionPolicy("ai_live_signals", "created_at", 30, "iso_utc"),
+    RetentionPolicy("pipeline_decisions", "created_at", 30, "iso_utc"),
     RetentionPolicy("ai_rank_snapshots", "created_at", 14, "iso_utc"),
     RetentionPolicy("scalp_rejects", "created_at", 7, "iso_utc"),
     RetentionPolicy("ai_feature_samples", "created_at", 14, "iso_utc"),
     RetentionPolicy("decision_book_tape", "ts_utc", 14, "iso_utc"),
+    RetentionPolicy("day_decision_group_records", "created_at", 90, "iso_utc"),
+    RetentionPolicy("day_decision_candidate_records", "created_at", 90, "iso_utc"),
 )
 
 

@@ -386,11 +386,15 @@ def record_day_decision(
     feature_version: str = "",
     artifact_version: str = "",
     config_version: str = "",
-    mode: str = "paper",
+    mode: str | None = None,
     detail: dict[str, Any] | None = None,
 ) -> None:
     """Upsert a structured DAY decision record (idempotent on decision_id)."""
     try:
+        if mode is None:
+            from backend.services.day_decision_observability import runtime_account_execution_mode
+
+            mode = runtime_account_execution_mode()
         ensure_day_gate_schema(db_path)
         did = str(decision_id or "").strip()
         if not did:
@@ -446,7 +450,7 @@ def record_day_decision(
                     artifact_version or None,
                     config_version or CONFIG_VERSION,
                     DECISION_POLICY_VERSION,
-                    mode or "paper",
+                    mode or "unknown",
                     json.dumps(detail or {}, default=str)[:8000],
                 ),
             )
