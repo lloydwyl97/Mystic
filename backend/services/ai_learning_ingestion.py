@@ -128,12 +128,40 @@ CREATE INDEX IF NOT EXISTS ix_pos_hb_sym ON ai_position_heartbeats(symbol, epoch
 
 HEARTBEAT_CALC_VERSION = 2
 
+# flow_* = real signed volume from the Binance.US aggTrade tape
+# (backend/services/day_order_flow_tape.py), captured while the position is
+# open. The 145-dim vector's volume_delta/order_flow/volume_imbalance dims are
+# OHLCV proxies and stay zeroed; these columns are the first genuine flow the
+# system retains. flow_trades_15m and flow_tape_stale_sec must be read
+# alongside the imbalances — Binance.US top-4 prints are sparse, so a balanced
+# tape and an absent one both show imbalance 0.0 and are only separable by
+# print count and staleness. flow_version is 0 when no tape was available.
+# NULL on rows predating this migration.
 _HEARTBEAT_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("quantity", "REAL DEFAULT 0"),
     ("gross_unrealized_pnl", "REAL DEFAULT 0"),
     ("net_unrealized_pnl", "REAL DEFAULT 0"),
     ("fee_estimate", "REAL DEFAULT 0"),
     ("heartbeat_calc_version", "INTEGER DEFAULT 1"),
+    ("flow_trades_15m", "INTEGER"),
+    ("flow_cvd_qty_15m", "REAL"),
+    ("flow_imbalance_5m", "REAL"),
+    ("flow_imbalance_15m", "REAL"),
+    ("flow_imbalance_60m", "REAL"),
+    ("flow_notional_imbalance_15m", "REAL"),
+    ("flow_tape_stale_sec", "REAL"),
+    ("flow_version", "INTEGER"),
+)
+
+_FLOW_HEARTBEAT_FIELDS: tuple[str, ...] = (
+    "flow_trades_15m",
+    "flow_cvd_qty_15m",
+    "flow_imbalance_5m",
+    "flow_imbalance_15m",
+    "flow_imbalance_60m",
+    "flow_notional_imbalance_15m",
+    "flow_tape_stale_sec",
+    "flow_version",
 )
 
 # day_route_regime = the DAY router's per-symbol classify_day_regime() label
@@ -182,6 +210,18 @@ def _migrate_heartbeat_columns(conn: sqlite3.Connection) -> None:
     for col_name, col_def in _HEARTBEAT_MIGRATION_COLUMNS:
         if col_name not in existing:
             conn.execute(f"ALTER TABLE ai_position_heartbeats ADD COLUMN {col_name} {col_def}")
+
+
+def _heartbeat_flow_fields(symbol: str) -> dict[str, Any]:
+    """Tape-derived flow for the heartbeat row. Never raises into the caller."""
+    try:
+        from backend.services.day_order_flow_tape import heartbeat_flow_fields
+
+        fields = heartbeat_flow_fields(symbol)
+    except Exception:
+        logger.debug("heartbeat order-flow capture failed for %s", symbol, exc_info=True)
+        return {}
+    return {k: fields.get(k) for k in _FLOW_HEARTBEAT_FIELDS} if fields else {}
 
 
 def _migrate_snapshot_columns(conn: sqlite3.Connection) -> None:
@@ -447,6 +487,7 @@ def record_position_heartbeat(
                 entry_price=entry_price,
                 mark=mark,
             )
+            flow = _heartbeat_flow_fields(symbol)
             conn.execute(
                 """
                 INSERT INTO ai_position_heartbeats (
@@ -455,8 +496,11 @@ def record_position_heartbeat(
                     dist_to_target_pct, dist_to_invalid_pct, thesis_valid, exit_allowed,
                     would_sell_now_net_usd, hold_seconds, entry_thesis,
                     quantity, gross_unrealized_pnl, net_unrealized_pnl, fee_estimate,
-                    heartbeat_calc_version
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    heartbeat_calc_version,
+                    flow_trades_15m, flow_cvd_qty_15m, flow_imbalance_5m, flow_imbalance_15m,
+                    flow_imbalance_60m, flow_notional_imbalance_15m, flow_tape_stale_sec,
+                    flow_version
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     _now_iso(),
@@ -483,6 +527,7 @@ def record_position_heartbeat(
                     net_unrealized_pnl,
                     fee_estimate,
                     HEARTBEAT_CALC_VERSION,
+                    *(flow.get(k) for k in _FLOW_HEARTBEAT_FIELDS),
                 ),
             )
             conn.commit()
