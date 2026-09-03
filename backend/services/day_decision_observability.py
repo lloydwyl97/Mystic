@@ -20,7 +20,10 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = "day_decision_obs_v1"
 TABLE_GROUPS = "day_decision_group_records"
 TABLE_CANDIDATES = "day_decision_candidate_records"
-FEATURE_SCHEMA = "day_path_ev_candidate_v1"
+TABLE_FEATURE_ARTIFACTS = "day_decision_feature_artifacts"
+FEATURE_SCHEMA = "day_145_feature_vector_v1"
+FEATURE_SCHEMA_FALLBACK = "day_path_ev_candidate_v1"
+STRATEGY_ID = "day"
 
 _COINS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 _RANK_DELTAS = (
@@ -35,6 +38,14 @@ _RANK_DELTAS = (
     "thesis_rank_delta",
     "ml_rank_adjustment",
     "outcome_low_mfe_stall_ev_factor",
+)
+_HAIRCUTS = (
+    "outcome_low_mfe_stall_ev_factor",
+    "quality_opinion_penalty",
+    "signal_side_penalty",
+    "pnl_adapt_penalty",
+    "veto_opinion_penalty",
+    "confidence_floor_penalty",
 )
 
 SCHEMA_SQL = f"""
@@ -78,6 +89,13 @@ CREATE TABLE IF NOT EXISTS {TABLE_CANDIDATES} (
     PRIMARY KEY (decision_group_id, symbol)
 );
 CREATE INDEX IF NOT EXISTS idx_day_obs_cands_created ON {TABLE_CANDIDATES}(created_at);
+CREATE TABLE IF NOT EXISTS {TABLE_FEATURE_ARTIFACTS} (
+    feature_artifact_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    feature_schema_version TEXT NOT NULL,
+    feature_dim INTEGER,
+    feature_values_json TEXT NOT NULL
+);
 """
 
 
@@ -138,7 +156,76 @@ def _candidate_map(candidates: list[Any] | None) -> dict[str, Any]:
     return out
 
 
-def _feature_payload(dd: dict[str, Any]) -> dict[str, Any]:
+def _coerce_feature_vector(raw: Any) -> list[float] | None:
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return None
+    if isinstance(raw, dict) and "features" in raw:
+        raw = raw.get("features")
+    if not isinstance(raw, (list, tuple)):
+        return None
+    out: list[float] = []
+    for item in raw:
+        try:
+            out.append(float(item))
+        except (TypeError, ValueError):
+            return None
+    return out or None
+
+
+def _lookup_inference_vector(
+    db_path: str | Path | None,
+    *,
+    symbol: str,
+    bar_timestamp: int | None,
+) -> tuple[list[float] | None, str | None]:
+    """Read-only lookup of the stored 145-vector. Never calls the live model."""
+    if not db_path or not symbol:
+        return None, None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        try:
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(ai_inference_log)")}
+            if "features_json" not in cols:
+                return None, None
+            params: list[Any] = [symbol, _api(symbol)]
+            if symbol.endswith("USDT"):
+                params.append(f"{symbol[:-4]}/USDT")
+            placeholders = ",".join("?" * len(params))
+            sql = f"""
+                SELECT id, features_json FROM ai_inference_log
+                WHERE symbol IN ({placeholders}) AND features_json IS NOT NULL
+            """
+            if bar_timestamp is not None and "ts_utc" in cols:
+                epoch = float(bar_timestamp)
+                if epoch > 1e12:
+                    epoch = epoch / 1000.0
+                sql += " AND ts_utc <= datetime(?, 'unixepoch') ORDER BY ts_utc DESC LIMIT 1"
+                params.append(epoch)
+            else:
+                sql += " ORDER BY id DESC LIMIT 1"
+            row = conn.execute(sql, params).fetchone()
+            if not row:
+                return None, None
+            vec = _coerce_feature_vector(row[1])
+            return vec, str(row[0])
+        finally:
+            conn.close()
+    except Exception:
+        return None, None
+
+
+def _feature_payload(
+    dd: dict[str, Any],
+    *,
+    db_path: str | Path | None = None,
+    symbol: str = "",
+    bar_timestamp: int | None = None,
+) -> dict[str, Any]:
     keys = (
         "prob_buy",
         "p_buy",
@@ -158,11 +245,26 @@ def _feature_payload(dd: dict[str, Any]) -> dict[str, Any]:
         "outcome_low_mfe_stall_ev_factor",
         "first_hard_block",
         "true_safety_reject_reason",
+        "inference_log_id",
     )
     payload = {k: dd.get(k) for k in keys if dd.get(k) not in (None, "")}
     deltas = {k: _num(dd.get(k)) for k in _RANK_DELTAS if dd.get(k) not in (None, "")}
     if deltas:
         payload["rank_deltas"] = deltas
+    vec = None
+    for key in ("feature_vector", "features", "features_json"):
+        vec = _coerce_feature_vector(dd.get(key))
+        if vec:
+            break
+    inf_id = None
+    if vec is None:
+        vec, inf_id = _lookup_inference_vector(db_path, symbol=symbol, bar_timestamp=bar_timestamp)
+        if inf_id:
+            payload["inference_log_id"] = inf_id
+    if vec:
+        payload["feature_vector"] = vec
+        payload["feature_dim"] = len(vec)
+        payload["feature_schema_version"] = FEATURE_SCHEMA
     return payload
 
 
@@ -171,13 +273,25 @@ def _feature_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def _artifact_id_for_vector(vector: list[float], schema: str) -> str:
+    blob = json.dumps({"schema": schema, "vector": vector}, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
 def _book_fields(symbol: str) -> dict[str, Any]:
     empty = {
+        "bid": None,
+        "ask": None,
         "best_bid": None,
         "best_ask": None,
+        "midpoint": None,
         "mid": None,
+        "spread_bps": None,
         "spread_pct": None,
         "predicted_impact": None,
+        "expected_slippage": None,
+        "quote_timestamp": None,
+        "quote_age": None,
         "book_ts": None,
     }
     if symbol == "HOLD":
@@ -188,37 +302,88 @@ def _book_fields(symbol: str) -> dict[str, Any]:
         book = snapshot_book(symbol)
     except Exception:
         return empty
+    bid = book.get("best_bid")
+    ask = book.get("best_ask")
+    mid = book.get("mid")
+    spread_pct = book.get("spread_pct")
+    age = book.get("book_age_sec")
     return {
-        "best_bid": book.get("best_bid"),
-        "best_ask": book.get("best_ask"),
-        "mid": book.get("mid"),
-        "spread_pct": book.get("spread_pct"),
+        "bid": bid,
+        "ask": ask,
+        "best_bid": bid,
+        "best_ask": ask,
+        "midpoint": mid,
+        "mid": mid,
+        "spread_bps": (float(spread_pct) * 1e4) if spread_pct is not None else None,
+        "spread_pct": spread_pct,
         "predicted_impact": book.get("microprice_pressure"),
+        "expected_slippage": book.get("expected_slippage"),
+        "quote_timestamp": book.get("ts_utc") or _now_iso(),
+        "quote_age": age,
         "book_ts": _now_iso(),
     }
 
 
 def _account_state(engine: Any) -> dict[str, Any]:
+    try:
+        from backend.config.trading_economics import DAY_MAX_OPEN_SLOTS
+    except Exception:
+        DAY_MAX_OPEN_SLOTS = 4
     if engine is None:
-        return {"slot_count": None, "cash_balance": None, "open_symbols": []}
+        return {
+            "slot_count": DAY_MAX_OPEN_SLOTS,
+            "slots_used": 0,
+            "cash_balance": None,
+            "cash_available": None,
+            "open_symbols": [],
+            "capital_state": None,
+        }
     positions = list(getattr(engine, "positions", None) or [])
     open_syms = []
     for pos in positions:
         qty = float(getattr(pos, "quantity", 0) or 0)
         if qty > 0:
             open_syms.append(_api(getattr(pos, "symbol", "") or ""))
-    cash = getattr(engine, "cash_balance", None)
+    cash = _num(getattr(engine, "cash_balance", None))
     return {
-        "slot_count": len(open_syms),
-        "cash_balance": _num(cash),
+        "slot_count": DAY_MAX_OPEN_SLOTS,
+        "slots_used": len(open_syms),
+        "cash_balance": cash,
+        "cash_available": cash,
         "open_symbols": open_syms,
+        "capital_state": getattr(engine, "account_status", None),
     }
 
 
 def _lifecycle_from_action(selected_action: str) -> str:
     if str(selected_action or "").upper().startswith("BUY"):
-        return "selected_execute"
+        return "ranking_selected"
     return "HOLD"
+
+
+def _haircuts(dd: dict[str, Any]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for key in _HAIRCUTS:
+        val = _num(dd.get(key))
+        if val is not None:
+            out[key] = val
+    for key, val in dd.items():
+        if "haircut" in str(key).lower():
+            num = _num(val)
+            if num is not None:
+                out[str(key)] = num
+    return out
+
+
+def _proposed_notional(symbol: str) -> float:
+    if symbol == "HOLD":
+        return 0.0
+    try:
+        from backend.config.trading_economics import DAY_TARGET_NOTIONAL_PER_SLOT_USD
+
+        return float(DAY_TARGET_NOTIONAL_PER_SLOT_USD)
+    except Exception:
+        return 0.0
 
 
 def build_group_contract(
@@ -228,6 +393,7 @@ def build_group_contract(
     bar_timestamp: int | None = None,
     engine: Any = None,
     account_state: dict[str, Any] | None = None,
+    db_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Pure builder. Never mutates ``decision``."""
     dec = dict(decision or {})
@@ -243,21 +409,54 @@ def build_group_contract(
         )
     cand_map = _candidate_map(candidates)
     model_version = str(dec.get("path_net_model_id") or dec.get("forward_net_model_version") or "")
+    acct = dict(account_state or _account_state(engine))
+    open_syms = {_api(s) for s in (acct.get("open_symbols") or [])}
+    slots_used = int(acct.get("slots_used") if acct.get("slots_used") is not None else len(open_syms))
+    slot_count = int(acct["slot_count"]) if acct.get("slot_count") is not None else 4
+    cash = acct.get("cash_available") if acct.get("cash_available") is not None else acct.get("cash_balance")
     rows = []
+    artifacts: list[dict[str, Any]] = []
+    scored: list[tuple[str, float]] = []
     for sym in (*_COINS, "HOLD"):
         cand = cand_map.get(sym)
         dd = dict(getattr(cand, "decision_data", None) or {}) if cand is not None else {}
-        ev_key = {"BTCUSDT": "btc_path_ev", "ETHUSDT": "eth_path_ev", "SOLUSDT": "sol_path_ev", "XRPUSDT": "xrp_path_ev"}.get(sym)
+        ev_key = {
+            "BTCUSDT": "btc_path_ev",
+            "ETHUSDT": "eth_path_ev",
+            "SOLUSDT": "sol_path_ev",
+            "XRPUSDT": "xrp_path_ev",
+        }.get(sym)
         path_ev = _num(dec.get(ev_key)) if ev_key else 0.0
         exclusion = str(dd.get("first_hard_block") or dd.get("true_safety_reject_reason") or "") or None
         if cand is None and sym != "HOLD":
             exclusion = exclusion or "NO_SCORED_CANDIDATE"
-        feats = _feature_payload(dd) if sym != "HOLD" else {}
+        feats = _feature_payload(dd, db_path=db_path, symbol=sym, bar_timestamp=bar_timestamp) if sym != "HOLD" else {}
         deltas = {k: _num(dd.get(k)) for k in _RANK_DELTAS if dd.get(k) not in (None, "")}
         base = _num(dd.get("ml_score") if dd.get("ml_score") not in (None, "") else dd.get("buy_margin"))
         p_buy = _num(dd.get("prob_buy") if dd.get("prob_buy") not in (None, "") else dd.get("p_buy"))
         final_score = _num(dd.get("final_selection_score") if dd.get("final_selection_score") not in (None, "") else path_ev)
         book = _book_fields(sym)
+        vector = feats.get("feature_vector") if isinstance(feats.get("feature_vector"), list) else None
+        artifact_id = None
+        schema = str(feats.get("feature_schema_version") or FEATURE_SCHEMA_FALLBACK)
+        if vector:
+            artifact_id = _artifact_id_for_vector(vector, FEATURE_SCHEMA)
+            artifacts.append(
+                {
+                    "feature_artifact_id": artifact_id,
+                    "feature_schema_version": FEATURE_SCHEMA,
+                    "feature_dim": len(vector),
+                    "feature_values": vector,
+                }
+            )
+            schema = FEATURE_SCHEMA
+        elif feats:
+            artifact_id = _feature_hash(feats)
+        if sym != "HOLD" and final_score is not None:
+            scored.append((sym, float(final_score)))
+        already_open = sym in open_syms
+        slot_available = slots_used < slot_count and not already_open
+        capital_available = cash is None or float(cash) > 0
         rows.append(
             {
                 "symbol": sym,
@@ -265,29 +464,60 @@ def build_group_contract(
                 "exclusion_reason": None if (cand is not None or sym == "HOLD") else exclusion,
                 "base_score": base,
                 "p_buy": p_buy,
-                "path_ev": path_ev if sym != "HOLD" else 0.0,
+                "path_ev": 0.0 if sym == "HOLD" else path_ev,
                 "rank_deltas": deltas,
+                "all_rank_deltas": deltas,
+                "all_haircuts": {} if sym == "HOLD" else _haircuts(dd),
                 "final_rank_score": 0.0 if sym == "HOLD" else final_score,
-                "feature_schema": FEATURE_SCHEMA,
+                "rank_position": None,
+                "feature_schema": schema,
+                "feature_schema_version": schema,
                 "feature_values": feats,
-                "feature_hash": _feature_hash(feats) if feats else None,
+                "feature_hash": artifact_id,
+                "feature_artifact_id": artifact_id,
+                "symbol_already_open": already_open,
+                "slot_available": True if sym == "HOLD" else slot_available,
+                "capital_available": True if sym == "HOLD" else capital_available,
+                "proposed_notional": 0.0 if sym == "HOLD" else _proposed_notional(sym),
+                "gross_value": 0.0 if sym == "HOLD" else None,
+                "net_value": 0.0 if sym == "HOLD" else None,
+                "capital_usage": 0.0 if sym == "HOLD" else None,
                 **book,
             }
         )
-    acct = dict(account_state or _account_state(engine))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    rank_map = {sym: idx + 1 for idx, (sym, _) in enumerate(scored)}
+    for row in rows:
+        if row["symbol"] == "HOLD":
+            row["rank_position"] = len(scored) + 1
+        else:
+            row["rank_position"] = rank_map.get(row["symbol"])
+    mode = runtime_account_execution_mode()
+    data_ts = dec.get("prediction_timestamp") or bar_timestamp
     return {
         "schema_version": SCHEMA_VERSION,
         "decision_group_id": group_id,
-        "account_execution_mode": runtime_account_execution_mode(),
+        "decision_timestamp": _now_iso(),
+        "runtime_trading_mode": mode,
+        "account_execution_mode": mode,
+        "strategy_id": STRATEGY_ID,
         "bar_timestamp": bar_timestamp,
         "prediction_timestamp": dec.get("prediction_timestamp"),
+        "data_timestamp": data_ts,
+        "data_freshness": dec.get("data_freshness") or dec.get("path_net_status"),
+        "feature_schema_version": FEATURE_SCHEMA,
         "model_version": model_version,
+        "calibration_version": str(dec.get("calibration_version") or dec.get("path_net_status") or ""),
+        "ranking_version": str(dec.get("ranking_version") or dec.get("why_selected") or "direct_four_coin_path_ev"),
         "feature_schema": FEATURE_SCHEMA,
-        "feature_artifact_ref": f"{FEATURE_SCHEMA}:{model_version or 'unknown'}",
+        "feature_artifact_ref": artifacts[0]["feature_artifact_id"] if artifacts else f"{FEATURE_SCHEMA}:{model_version or 'unknown'}",
+        "feature_artifacts": artifacts,
         "selected_ranking_action": selected,
         "selected_action": selected,
         "selected_symbol": selected_symbol or "HOLD",
+        "execute_authorization": None,
         "execute_authorized": None,
+        "final_lifecycle_state": _lifecycle_from_action(selected),
         "lifecycle_state": _lifecycle_from_action(selected),
         "order_submitted": False,
         "order_id": None,
@@ -296,9 +526,12 @@ def build_group_contract(
         "maker_taker": None,
         "commission": None,
         "commission_asset": None,
-        "slot_count": acct.get("slot_count"),
+        "cash_available": cash,
+        "slot_count": slot_count,
+        "slots_used": slots_used,
         "cash_balance": acct.get("cash_balance"),
-        "open_symbols": acct.get("open_symbols") or [],
+        "open_symbols": list(acct.get("open_symbols") or []),
+        "capital_state": acct.get("capital_state"),
         "candidates": rows,
     }
 
@@ -324,6 +557,7 @@ def record_day_ranking_group(
             bar_timestamp=bar_timestamp,
             engine=engine,
             account_state=account_state,
+            db_path=db_path,
         )
         _ensure_schema(db_path)
         created = _now_iso()
@@ -356,7 +590,7 @@ def record_day_ranking_group(
                     contract["feature_artifact_ref"],
                     contract["slot_count"],
                     contract["cash_balance"],
-                    json.dumps(contract, default=str)[:32000],
+                    json.dumps(contract, default=str)[:64000],
                     None,
                     None,
                     None,
@@ -365,7 +599,30 @@ def record_day_ranking_group(
                     None,
                 ),
             )
+            for art in contract.get("feature_artifacts") or []:
+                conn.execute(
+                    f"""
+                    INSERT OR IGNORE INTO {TABLE_FEATURE_ARTIFACTS}(
+                        feature_artifact_id, created_at, feature_schema_version,
+                        feature_dim, feature_values_json
+                    ) VALUES (?,?,?,?,?)
+                    """,
+                    (
+                        art["feature_artifact_id"],
+                        created,
+                        art["feature_schema_version"],
+                        art["feature_dim"],
+                        json.dumps(art["feature_values"], default=str),
+                    ),
+                )
             for row in contract["candidates"]:
+                stored_features = dict(row["feature_values"] or {})
+                if stored_features.get("feature_vector") and row.get("feature_artifact_id"):
+                    stored_features = {
+                        **{k: v for k, v in stored_features.items() if k != "feature_vector"},
+                        "feature_artifact_id": row["feature_artifact_id"],
+                        "feature_dim": stored_features.get("feature_dim"),
+                    }
                 conn.execute(
                     f"""
                     INSERT OR REPLACE INTO {TABLE_CANDIDATES}(
@@ -385,7 +642,7 @@ def record_day_ranking_group(
                         row["path_ev"],
                         json.dumps(row["rank_deltas"], default=str),
                         row["final_rank_score"],
-                        json.dumps(row["feature_values"], default=str)[:16000],
+                        json.dumps(stored_features, default=str)[:32000],
                         row["feature_hash"],
                     ),
                 )
@@ -394,7 +651,7 @@ def record_day_ranking_group(
             conn.close()
         return str(contract["decision_group_id"])
     except Exception as exc:
-        logger.debug("day decision observability record failed: %s", exc)
+        logger.warning("DAY_DECISION_OBSERVABILITY record failed: %s", exc)
         return None
 
 
@@ -410,6 +667,12 @@ def update_day_decision_lifecycle(
     maker_taker: str | None = None,
     commission: float | None = None,
     commission_asset: str | None = None,
+    block_reason: str | None = None,
+    requested_qty: float | None = None,
+    filled_qty: float | None = None,
+    fill_timestamp: str | None = None,
+    fill_price: float | None = None,
+    trade_id: str | None = None,
 ) -> None:
     """Patch order/fill fields after ranking. Does not change trading behavior."""
     if not observability_enabled() or not db_path or not decision_group_id:
@@ -430,8 +693,10 @@ def update_day_decision_lifecycle(
                     contract = {}
             if execute_authorized is not None:
                 contract["execute_authorized"] = bool(execute_authorized)
+                contract["execute_authorization"] = bool(execute_authorized)
             if lifecycle_state:
                 contract["lifecycle_state"] = lifecycle_state
+                contract["final_lifecycle_state"] = lifecycle_state
             if order_id:
                 contract["order_id"] = order_id
                 contract["order_submitted"] = True
@@ -440,12 +705,24 @@ def update_day_decision_lifecycle(
                 contract["order_submitted"] = True
             if fill_trade_id:
                 contract["fill_trade_id"] = fill_trade_id
+            if trade_id:
+                contract["trade_id"] = trade_id
             if maker_taker:
                 contract["maker_taker"] = maker_taker
             if commission is not None:
                 contract["commission"] = commission
             if commission_asset:
                 contract["commission_asset"] = commission_asset
+            if block_reason:
+                contract["block_reason"] = block_reason
+            if requested_qty is not None:
+                contract["requested_qty"] = requested_qty
+            if filled_qty is not None:
+                contract["filled_qty"] = filled_qty
+            if fill_timestamp:
+                contract["fill_timestamp"] = fill_timestamp
+            if fill_price is not None:
+                contract["fill_price"] = fill_price
             sets = [
                 "contract_json=?",
                 "execute_authorized=COALESCE(?, execute_authorized)",
@@ -460,7 +737,7 @@ def update_day_decision_lifecycle(
             conn.execute(
                 f"UPDATE {TABLE_GROUPS} SET {', '.join(sets)} WHERE decision_group_id=?",
                 (
-                    json.dumps(contract, default=str)[:32000],
+                    json.dumps(contract, default=str)[:64000],
                     None if execute_authorized is None else (1 if execute_authorized else 0),
                     lifecycle_state,
                     order_id,
@@ -476,7 +753,7 @@ def update_day_decision_lifecycle(
         finally:
             conn.close()
     except Exception as exc:
-        logger.debug("day decision observability update failed: %s", exc)
+        logger.warning("DAY_DECISION_OBSERVABILITY update failed: %s", exc)
 
 
 def classify_terminal_fill(*, status: str, filled_qty: float, requested_qty: float) -> str:
@@ -493,3 +770,64 @@ def classify_terminal_fill(*, status: str, filled_qty: float, requested_qty: flo
     if st in {"submitted", "new", "open", "ack"}:
         return "order_submitted"
     return "no_order_match"
+
+
+def classify_execute_lifecycle(
+    *,
+    result: dict[str, Any] | None,
+    block_reason: str | None = None,
+) -> str:
+    """Map an execution result to a spec lifecycle state. Telemetry only."""
+    if result is None:
+        return "blocked_after_ranking" if block_reason else "execute_decision"
+    status = str(result.get("status") or "")
+    filled = float(result.get("filled_qty") or result.get("quantity") or 0)
+    requested = float(result.get("requested_qty") or result.get("quantity") or 0)
+    labeled = classify_terminal_fill(status=status, filled_qty=filled, requested_qty=requested)
+    if labeled != "no_order_match":
+        return labeled
+    if result.get("trade_id") or result.get("fill_id"):
+        return "filled"
+    if result.get("exchange_order_id") or result.get("order_id") or result.get("client_order_id"):
+        return "order_submitted"
+    return "execute_decision"
+
+
+def estimate_observability_storage(
+    *,
+    groups_per_day: float,
+    group_bytes: float,
+    candidate_bytes: float,
+    artifact_bytes: float,
+    index_overhead: float = 0.20,
+    current_db_bytes: int,
+    disk_free_bytes: int,
+    reserve_bytes: int,
+    candidates_per_group: int = 5,
+) -> dict[str, Any]:
+    """Project observability growth from measured write sizes. Prospective only."""
+    bytes_per_group = group_bytes + (candidate_bytes * candidates_per_group) + artifact_bytes
+    bytes_per_day = groups_per_day * bytes_per_group * (1.0 + index_overhead)
+    out: dict[str, Any] = {
+        "rows_per_day": groups_per_day,
+        "bytes_per_day": bytes_per_day,
+        "current_db_bytes": current_db_bytes,
+        "disk_free_bytes": disk_free_bytes,
+        "reserve_bytes": reserve_bytes,
+        "horizons": {},
+    }
+    selected = 30
+    for days in (30, 60, 90):
+        growth = bytes_per_day * days
+        remaining = disk_free_bytes - growth - reserve_bytes
+        fits = remaining > 0
+        out["horizons"][str(days)] = {
+            "days": days,
+            "growth_bytes": growth,
+            "remaining_after_reserve_bytes": remaining,
+            "fits": fits,
+        }
+        if fits:
+            selected = days
+    out["selected_retention_days"] = selected
+    return out

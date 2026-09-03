@@ -17014,30 +17014,48 @@ class PortfolioEngine:
                 mode=None,
                 detail={"bar_timestamp": int(bar_timestamp), "net_ev": float(top_net_ev)},
             )
-            from backend.services.day_decision_observability import update_day_decision_lifecycle
+            from backend.services.day_decision_observability import (
+                classify_execute_lifecycle,
+                update_day_decision_lifecycle,
+            )
 
             _exec = result is not None
-            _life = "filled" if _exec else "blocked_after_ranking"
             _oid = None
             _tid = None
             _fee = None
+            _cid = None
+            _filled = None
+            _px = None
             if isinstance(result, dict):
                 _oid = str(result.get("exchange_order_id") or result.get("order_id") or "") or None
-                _tid = str(result.get("trade_id") or "") or None
+                _cid = str(result.get("client_order_id") or "") or None
+                _tid = str(result.get("trade_id") or result.get("fill_id") or "") or None
                 if result.get("fee") is not None:
                     _fee = float(result.get("fee"))
-                if _exec and _oid:
-                    _life = "filled"
+                if result.get("quantity") is not None:
+                    _filled = float(result.get("quantity"))
+                if result.get("price") is not None:
+                    _px = float(result.get("price"))
+            _life = classify_execute_lifecycle(
+                result=result if isinstance(result, dict) else None,
+                block_reason=_first if not _exec else None,
+            )
             update_day_decision_lifecycle(
                 self.db_path,
                 decision_group_id=f"daygrp_{int(bar_timestamp)}",
                 execute_authorized=_exec,
                 lifecycle_state=_life,
                 order_id=_oid,
+                client_order_id=_cid,
                 fill_trade_id=_tid,
                 maker_taker="taker" if _exec else None,
                 commission=_fee,
                 commission_asset="USDT" if _fee is not None else None,
+                block_reason=_first if not _exec else None,
+                requested_qty=float(quantity) if quantity is not None else None,
+                filled_qty=_filled,
+                fill_price=_px,
+                trade_id=_tid,
             )
         return result
 

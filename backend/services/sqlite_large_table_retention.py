@@ -52,6 +52,8 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     RetentionPolicy("decision_book_tape", "ts_utc", 14, "iso_utc"),
     RetentionPolicy("day_decision_group_records", "created_at", 90, "iso_utc"),
     RetentionPolicy("day_decision_candidate_records", "created_at", 90, "iso_utc"),
+    RetentionPolicy("day_decision_feature_artifacts", "created_at", 90, "iso_utc"),
+    RetentionPolicy("day_decision_outcome_labels", "created_at", 90, "iso_utc"),
 )
 
 

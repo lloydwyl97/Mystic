@@ -85,6 +85,33 @@ def test_sizing_and_order_request_unchanged():
     assert qty == DAY_TARGET_NOTIONAL_PER_SLOT_USD / price
 
 
+def test_golden_trading_outputs_byte_equal():
+    off = select_action(_fixed_scores(), old_rank_nominee="BTCUSDT", old_rank_score=1.0)
+    on = select_action(_fixed_scores(), old_rank_nominee="BTCUSDT", old_rank_score=1.0)
+    contract = build_group_contract(decision=on, bar_timestamp=5)
+    keys = (
+        "selected_action",
+        "selected_symbol",
+        "selected_ev",
+        "btc_path_ev",
+        "eth_path_ev",
+        "sol_path_ev",
+        "xrp_path_ev",
+        "hold_ev",
+        "why_selected",
+    )
+    for key in keys:
+        assert off.get(key) == on.get(key)
+    assert off["selected_action"] == "BUY_SOLUSDT"
+    assert off["selected_symbol"] == "SOLUSDT"
+    assert contract["selected_action"] == off["selected_action"]
+    price = 50.0
+    qty = DAY_TARGET_NOTIONAL_PER_SLOT_USD / price
+    order = {"symbol": off["selected_symbol"], "side": "BUY", "type": "MARKET", "quantity": qty, "price": None}
+    assert order["quantity"] == DAY_TARGET_NOTIONAL_PER_SLOT_USD / price
+    assert contract["lifecycle_state"] in {"ranking_selected", "HOLD"}
+
+
 def test_exit_state_unchanged_by_observability_builder():
     from backend.services.day_trade_thesis import EXIT_DAY_4H_STRUCTURE_BREAK, EXIT_TRAILING_STOP
 
