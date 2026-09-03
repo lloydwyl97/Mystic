@@ -38,6 +38,7 @@ from backend.config.mystic_api_schedule import (
     SIGNAL_CONSUMER_INTERVAL_SEC,
 )
 from backend.database_schema import DATABASE_PATH
+from backend.services.day_4h_label_runner import run_label_batch as run_day_4h_label_batch
 from backend.services.gate_reason_codes import GateReason
 from backend.services.live_strategy_contracts import per_coin_artifact_file
 from backend.services.portfolio_engine import (
@@ -73,6 +74,10 @@ _EXIT_MONITOR_STALE_BD_SIGNATURE = "name 'bd' is not defined"
 # tracks live marks (same recompute as API /status) without write-on-read in FastAPI.
 _LEDGER_MTM_PERSIST_INTERVAL_SEC = LEDGER_MTM_PERSIST_INTERVAL_SEC
 _LEDGER_MTM_PERSIST_INITIAL_DELAY_SEC = 5.0
+
+# Offline DAY outcome labeling. Research-only cadence; nothing in the trade path waits on it.
+_DAY_4H_LABEL_INTERVAL_SEC = float(os.getenv("DAY_4H_LABEL_INTERVAL_SEC", "1800") or "1800")
+_DAY_4H_LABEL_INITIAL_DELAY_SEC = float(os.getenv("DAY_4H_LABEL_INITIAL_DELAY_SEC", "300") or "300")
 # Tracked base coins are the live DAY top-4, sourced from the single source of
 # truth in ``backend.config.trading_universe``. Do not hardcode here.
 from backend.config.trading_universe import TOP4_BASE_COINS as _TRACKED_TRADE_BASE_SYMBOLS
@@ -302,6 +307,7 @@ class PortfolioEngineIntegration:
             self._paper_retention_task = asyncio.create_task(self._paper_retention_loop(), name="portfolio_engine:paper_retention")
             self._large_table_retention_task = asyncio.create_task(self._large_table_retention_loop(), name="portfolio_engine:large_table_retention")
             self._ledger_mtm_task = asyncio.create_task(self._ledger_mtm_persist_loop(), name="portfolio_engine:ledger_mtm_persist")
+            self._day_4h_label_task = asyncio.create_task(self._day_4h_label_loop(), name="portfolio_engine:day_4h_label")
             try:
                 from backend.services.simplified_pnl_observation import ENABLED as _PNLOB
 
@@ -416,6 +422,10 @@ class PortfolioEngineIntegration:
             self._ledger_mtm_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._ledger_mtm_task
+        if getattr(self, "_day_4h_label_task", None):
+            self._day_4h_label_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._day_4h_label_task
 
         if getattr(self, "_pnl_observation_task", None):
             self._pnl_observation_task.cancel()
@@ -2422,6 +2432,48 @@ class PortfolioEngineIntegration:
                 logger.warning("LARGE_TABLE_RETENTION: %s", e)
             await asyncio.sleep(_LARGE_TABLE_RETENTION_INTERVAL_SEC)
         logger.info("LARGE_TABLE_RETENTION: Stopped")
+
+    async def _day_4h_label_loop(self) -> None:
+        """
+        Offline outcome labeling for matured DAY ranking decisions.
+
+        Research/observability only: reads the decision ledger and the 1m tape and writes
+        `day_decision_outcome_labels`. It never reads or mutates ranking, sizing, exits,
+        the order path, or the book, and every failure is swallowed so a labeling problem
+        can never disturb trading.
+        """
+        logger.info(
+            "DAY_4H_LABEL: Starting loop (every %.0fs, initial delay %.0fs)",
+            _DAY_4H_LABEL_INTERVAL_SEC,
+            _DAY_4H_LABEL_INITIAL_DELAY_SEC,
+        )
+        await asyncio.sleep(_DAY_4H_LABEL_INITIAL_DELAY_SEC)
+        while self.is_running:
+            try:
+                if self.engine:
+                    db_path = self.engine.db_path
+                    loop = asyncio.get_running_loop()
+                    summary = await loop.run_in_executor(
+                        None,
+                        lambda path=db_path: run_day_4h_label_batch(path),
+                    )
+                    if summary.get("labels_written"):
+                        logger.info(
+                            "DAY_4H_LABEL: groups=%s labels=%s authoritative=%s reconstructed=%s errors=%s",
+                            summary.get("groups_scanned"),
+                            summary.get("labels_written"),
+                            summary.get("authoritative"),
+                            summary.get("reconstructed"),
+                            summary.get("errors"),
+                        )
+                    else:
+                        logger.debug("DAY_4H_LABEL: nothing matured")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("DAY_4H_LABEL: %s", e)
+            await asyncio.sleep(_DAY_4H_LABEL_INTERVAL_SEC)
+        logger.info("DAY_4H_LABEL: Stopped")
 
     def get_status(self) -> dict[str, Any]:
         """Get integration status"""

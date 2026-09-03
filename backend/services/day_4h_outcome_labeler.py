@@ -37,6 +37,9 @@ BE_TRIGGER_BPS = 30.0
 DEFAULT_TRAIL_BPS = 40.0
 MAX_LIFECYCLE_SEC = 8 * 3600
 
+# Distinguishes "caller did not scan" from a scan that legitimately found no break.
+NOT_SCANNED = object()
+
 
 def _now_epoch() -> float:
     return datetime.now(timezone.utc).timestamp()
@@ -207,6 +210,7 @@ def label_candidate(
     fill: dict[str, Any] | None = None,
     seed_4h: list[list[float]] | None = None,
     trail_bps: float = DEFAULT_TRAIL_BPS,
+    break_seconds: Any = NOT_SCANNED,
 ) -> dict[str, Any]:
     now = _now_epoch() if now_epoch is None else float(now_epoch)
     if symbol == HOLD_SYMBOL:
@@ -223,7 +227,13 @@ def label_candidate(
             continue
         val, _prov = markout_at(bars, entry_px=float(entry_px or 0.0), decision_epoch=decision_epoch, horizon_sec=sec)
         markouts[name] = val
-    break_sec = first_4h_break_seconds(bars, decision_epoch=decision_epoch, end_epoch=end, seed_4h=seed_4h)
+    # Callers that already scanned the tape (the offline runner) pass the result in so the
+    # O(bars^2) reference scan is not repeated.
+    break_sec = (
+        first_4h_break_seconds(bars, decision_epoch=decision_epoch, end_epoch=end, seed_4h=seed_4h)
+        if break_seconds is NOT_SCANNED
+        else break_seconds
+    )
     mfe = extrema.get("mfe_bps")
     covered = bool(mfe is not None and mfe + 1e-12 >= cost)
     time_to_cover = None
@@ -337,6 +347,7 @@ __all__ = [
     "HOLD_SYMBOL",
     "HORIZONS_SEC",
     "LABEL_VERSION",
+    "NOT_SCANNED",
     "clip_bars_asof",
     "first_4h_break_seconds",
     "hold_label",

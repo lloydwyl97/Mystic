@@ -236,6 +236,145 @@ def consistency_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+PATH_EV_BINS = (
+    ("<=0", -1e18, 0.0),
+    ("0-5bps", 0.0, 0.0005),
+    ("5-15bps", 0.0005, 0.0015),
+    ("15-30bps", 0.0015, 0.0030),
+    ("30bps+", 0.0030, 1e18),
+)
+P_BUY_BINS = (
+    ("<0.50", -1e18, 0.50),
+    ("0.50-0.60", 0.50, 0.60),
+    ("0.60-0.75", 0.60, 0.75),
+    ("0.75-0.90", 0.75, 0.90),
+    ("0.90+", 0.90, 1e18),
+)
+RANK_SCORE_BINS = (
+    ("<0.60", -1e18, 0.60),
+    ("0.60-0.70", 0.60, 0.70),
+    ("0.70-0.80", 0.70, 0.80),
+    ("0.80+", 0.80, 1e18),
+)
+SPREAD_BINS = (
+    ("<=0.5bps", -1e18, 0.5),
+    ("0.5-1bps", 0.5, 1.0),
+    ("1-2bps", 1.0, 2.0),
+    ("2bps+", 2.0, 1e18),
+)
+VOLATILITY_BINS = (
+    ("<50bps", -1e18, 50.0),
+    ("50-100bps", 50.0, 100.0),
+    ("100-200bps", 100.0, 200.0),
+    ("200bps+", 200.0, 1e18),
+)
+SESSIONS = (("asia", 0, 8), ("europe", 8, 14), ("us", 14, 22), ("late", 22, 24))
+
+
+def _bin_label(value: float | None, bins: tuple[tuple[str, float, float], ...]) -> str:
+    if value is None:
+        return "unknown"
+    for name, low, high in bins:
+        if low <= float(value) < high:
+            return name
+    return "unknown"
+
+
+def _selected_candidate(row: dict[str, Any]) -> dict[str, Any]:
+    """Candidate payload for the selected symbol, preferring the stored contract copy."""
+    selected = str(row.get("selected_symbol") or HOLD_SYMBOL)
+    for cand in (row.get("contract") or {}).get("candidates") or []:
+        if str(cand.get("symbol")) == selected:
+            return cand
+    return (row.get("candidates") or {}).get(selected) or {}
+
+
+def _session_of(created_at: Any) -> str:
+    parsed = _parse_iso(created_at if isinstance(created_at, str) else None)
+    if parsed is None:
+        return "unknown"
+    hour = parsed.astimezone(timezone.utc).hour
+    for name, low, high in SESSIONS:
+        if low <= hour < high:
+            return name
+    return "unknown"
+
+
+def _hour_of(created_at: Any) -> str:
+    parsed = _parse_iso(created_at if isinstance(created_at, str) else None)
+    return "unknown" if parsed is None else f"{parsed.astimezone(timezone.utc).hour:02d}"
+
+
+def _volatility_bps(row: dict[str, Any]) -> float | None:
+    """Prior completed 4H range in bps. The only volatility measure stored per decision."""
+    tel = _selected_4h(row)
+    high = _num(tel.get("prior_4h_high"))
+    low = _num(tel.get("prior_4h_low"))
+    close = _num(tel.get("prior_4h_close"))
+    if high is None or low is None or not close:
+        return None
+    return (high - low) / close * 1e4
+
+
+def _labeled_coin_nets(row: dict[str, Any]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for symbol, lab in (row.get("labels") or {}).items():
+        if symbol == HOLD_SYMBOL or symbol not in COINS:
+            continue
+        net = _num(lab.get("production_exit_net_bps"))
+        if net is None:
+            net = _num((lab.get("markouts") or {}).get("4h")) if isinstance(lab.get("markouts"), dict) else None
+        if net is not None:
+            out[str(symbol)] = float(net)
+    return out
+
+
+def breakdowns(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Entry-quality metrics sliced by the dimensions stored on each decision.
+
+    Dimensions with no stored field resolve to an `unknown` bucket rather than being
+    dropped, so a missing feed is visible instead of silently absent.
+    """
+    executed = [r for r in rows if str(r.get("selected_action") or "").upper().startswith("BUY")]
+
+    def group_by(name: str, key) -> dict[str, Any]:
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for row in executed:
+            try:
+                bucket = str(key(row))
+            except Exception:
+                bucket = "unknown"
+            buckets.setdefault(bucket, []).append(row)
+        return {name: {b: _metrics(rs) for b, rs in sorted(buckets.items())}}
+
+    def cand_num(row: dict[str, Any], field: str) -> float | None:
+        return _num(_selected_candidate(row).get(field))
+
+    out: dict[str, Any] = {}
+    out.update(group_by("symbol", lambda r: r.get("selected_symbol") or HOLD_SYMBOL))
+    out.update(group_by("hour_utc", lambda r: _hour_of(r.get("created_at"))))
+    out.update(group_by("session", lambda r: _session_of(r.get("created_at"))))
+    out.update(group_by("4h_structure_state", lambda r: _selected_4h(r).get("4h_structure_state") or "unknown"))
+    out.update(
+        group_by(
+            "distance_to_break_bin",
+            lambda r: _bin_label(_num(_selected_4h(r).get("distance_to_4h_break_bps")), DISTANCE_BINS),
+        )
+    )
+    out.update(group_by("path_ev_bin", lambda r: _bin_label(cand_num(r, "path_ev"), PATH_EV_BINS)))
+    out.update(group_by("p_buy_bin", lambda r: _bin_label(cand_num(r, "p_buy"), P_BUY_BINS)))
+    out.update(group_by("rank_score_bin", lambda r: _bin_label(cand_num(r, "final_rank_score"), RANK_SCORE_BINS)))
+    out.update(group_by("spread_state", lambda r: _bin_label(cand_num(r, "spread_bps"), SPREAD_BINS)))
+    out.update(group_by("volatility_state", lambda r: _bin_label(_volatility_bps(r), VOLATILITY_BINS)))
+    out.update(
+        group_by(
+            "liquidity_state",
+            lambda r: _bin_label(cand_num(r, "expected_slippage"), SPREAD_BINS),
+        )
+    )
+    return out
+
+
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     executed = [r for r in rows if str(r.get("selected_action") or "").upper().startswith("BUY")]
     holds = [r for r in rows if not str(r.get("selected_action") or "").upper().startswith("BUY")]
@@ -263,16 +402,38 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         all_weak.append(bool(peer.get("all_four_already_broken")))
         broken_peer_intact.append(bool(peer.get("selected_broken_peer_intact_flag")))
     nets = [_num(((r.get("labels") or {}).get(str(r.get("selected_symbol") or "")) or {}).get("production_exit_net_bps")) for r in executed]
+    selected_metrics = _metrics(executed)
+    near_break: dict[str, int] = {name: 0 for name, _lo, _hi in DISTANCE_BINS}
+    near_break["unknown"] = 0
+    best_coin_hits: list[bool] = []
+    regret_vs_best: list[float | None] = []
+    for row in executed:
+        near_break[_bin_label(_num(_selected_4h(row).get("distance_to_4h_break_bps")), DISTANCE_BINS)] += 1
+        coin_nets = _labeled_coin_nets(row)
+        selected = str(row.get("selected_symbol") or "")
+        if len(coin_nets) < 2 or selected not in coin_nets:
+            continue
+        best_symbol = max(coin_nets, key=lambda s: coin_nets[s])
+        best_coin_hits.append(coin_nets[selected] >= coin_nets[best_symbol] - 1e-9)
+        regret_vs_best.append(coin_nets[best_symbol] - coin_nets[selected])
     return {
         "decision_groups": len(rows),
         "selected_trade_count": len(executed),
         "selected_HOLD_count": len(holds),
         "selected_already_4h_broken_rate": _rate(already),
+        "selected_near_break_distribution": near_break,
         "rapid_4h_break_rate": _rate(rapid),
+        "cost_cover_rate": selected_metrics["cost_cover_rate"],
+        "BE_rate": selected_metrics["BE_rate"],
+        "trail_rate": selected_metrics["trail_rate"],
+        "positive_net_rate": _rate([bool(n is not None and n > 0) for n in nets]),
         "average_net_bps": _mean(nets),
         "median_net_bps": _median(nets),
-        "positive_net_rate": _rate([bool(n is not None and n > 0) for n in nets]),
+        "MFE": selected_metrics["mean_MFE"],
+        "MAE": selected_metrics["mean_MAE"],
         "regret_vs_HOLD": _mean(regrets),
+        "regret_vs_best_labeled_candidate": _mean(regret_vs_best),
+        "best_coin_selection_rate": _rate(best_coin_hits),
         "selected_negative_rate": _rate([bool(n is not None and n < 0) for n in nets]),
         "all_four_weak_rate": _rate(all_weak),
         "selected_broken_while_peer_intact_rate": _rate(broken_peer_intact),
@@ -280,6 +441,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "label_coverage": labeled,
         "label_missing": missing,
         "consistency": consistency_table(rows),
+        "breakdowns": breakdowns(rows),
     }
 
 
@@ -302,6 +464,12 @@ def build_scorecard(db_path: str | Path, *, window: str = "24h") -> dict[str, An
 
 __all__ = [
     "DISTANCE_BINS",
+    "PATH_EV_BINS",
+    "P_BUY_BINS",
+    "RANK_SCORE_BINS",
+    "SPREAD_BINS",
+    "VOLATILITY_BINS",
+    "breakdowns",
     "build_scorecard",
     "consistency_table",
     "load_scorecard_rows",
