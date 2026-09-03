@@ -375,6 +375,17 @@ def _haircuts(dd: dict[str, Any]) -> dict[str, float]:
     return out
 
 
+def _collect_4h_group(decision: dict[str, Any]) -> dict[str, Any]:
+    """Fail-open 4H telemetry. Never mutates decision or ranking scores."""
+    try:
+        from backend.services.day_4h_entry_telemetry import collect_4h_entry_telemetry
+
+        return collect_4h_entry_telemetry(decision)
+    except Exception as exc:
+        logger.debug("DAY_DECISION_OBSERVABILITY 4h telemetry failed: %s", exc)
+        return {}
+
+
 def _proposed_notional(symbol: str) -> float:
     if symbol == "HOLD":
         return 0.0
@@ -417,6 +428,8 @@ def build_group_contract(
     rows = []
     artifacts: list[dict[str, Any]] = []
     scored: list[tuple[str, float]] = []
+    fourh_group = _collect_4h_group(dec)
+    fourh_by_symbol = dict(fourh_group.get("4h_entry_telemetry") or {})
     for sym in (*_COINS, "HOLD"):
         cand = cand_map.get(sym)
         dd = dict(getattr(cand, "decision_data", None) or {}) if cand is not None else {}
@@ -457,6 +470,7 @@ def build_group_contract(
         already_open = sym in open_syms
         slot_available = slots_used < slot_count and not already_open
         capital_available = cash is None or float(cash) > 0
+        fourh_tel = fourh_by_symbol.get(sym)
         rows.append(
             {
                 "symbol": sym,
@@ -482,6 +496,7 @@ def build_group_contract(
                 "gross_value": 0.0 if sym == "HOLD" else None,
                 "net_value": 0.0 if sym == "HOLD" else None,
                 "capital_usage": 0.0 if sym == "HOLD" else None,
+                "4h_entry_telemetry": fourh_tel,
                 **book,
             }
         )
@@ -533,6 +548,14 @@ def build_group_contract(
         "open_symbols": list(acct.get("open_symbols") or []),
         "capital_state": acct.get("capital_state"),
         "candidates": rows,
+        "4h_entry_telemetry": fourh_by_symbol,
+        "4h_peer_structure": fourh_group.get("4h_peer_structure"),
+        "selected_already_broken_at_ranking": fourh_group.get("selected_already_broken_at_ranking"),
+        "selected_4h_state": fourh_group.get("selected_4h_state"),
+        "selected_distance_to_break_bps": fourh_group.get("selected_distance_to_break_bps"),
+        "healthiest_peer_symbol": fourh_group.get("healthiest_peer_symbol"),
+        "healthiest_peer_distance_bps": fourh_group.get("healthiest_peer_distance_bps"),
+        "all_four_already_broken": fourh_group.get("all_four_already_broken"),
     }
 
 
@@ -617,6 +640,8 @@ def record_day_ranking_group(
                 )
             for row in contract["candidates"]:
                 stored_features = dict(row["feature_values"] or {})
+                if row.get("4h_entry_telemetry"):
+                    stored_features["4h_entry_telemetry"] = row["4h_entry_telemetry"]
                 if stored_features.get("feature_vector") and row.get("feature_artifact_id"):
                     stored_features = {
                         **{k: v for k, v in stored_features.items() if k != "feature_vector"},

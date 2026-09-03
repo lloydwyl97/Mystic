@@ -54,6 +54,8 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     RetentionPolicy("day_decision_candidate_records", "created_at", 90, "iso_utc"),
     RetentionPolicy("day_decision_feature_artifacts", "created_at", 90, "iso_utc"),
     RetentionPolicy("day_decision_outcome_labels", "created_at", 90, "iso_utc"),
+    RetentionPolicy("day_experiment_registry", "timestamp", 90, "iso_utc"),
+    RetentionPolicy("day_forward_lock_registry", "created_at", 90, "iso_utc"),
 )
 
 
