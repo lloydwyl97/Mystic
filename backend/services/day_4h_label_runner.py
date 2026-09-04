@@ -110,8 +110,7 @@ def load_1m_bars_utc(conn: sqlite3.Connection, symbol: str) -> list[tuple[int, f
         return []
     for name in (symbol, f"{symbol[:-4]}-USDT", f"{symbol[:-4]}/USDT"):
         rows = conn.execute(
-            "SELECT ts, open, high, low, close, volume FROM feature_ohlcv "
-            "WHERE interval='1m' AND symbol=? ORDER BY ts ASC",
+            "SELECT ts, open, high, low, close, volume FROM feature_ohlcv WHERE interval='1m' AND symbol=? ORDER BY ts ASC",
             (name,),
         ).fetchall()
         if not rows:
@@ -219,16 +218,13 @@ def load_close_ledger(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
         if qty_total > 0:
             priced = [t for t in tranches if t["exit_price"] is not None]
             if priced:
-                weighted_exit = sum(
-                    float(t["exit_price"]) * float(t["quantity"]) for t in priced
-                ) / max(sum(float(t["quantity"]) for t in priced), 1e-12)
+                weighted_exit = sum(float(t["exit_price"]) * float(t["quantity"]) for t in priced) / max(sum(float(t["quantity"]) for t in priced), 1e-12)
         out[buy_id] = {
             "symbol": dominant["symbol"],
             "exit_epoch": max(exits) if exits else None,
             "exit_reason": dominant["exit_reason"],
             "realized_profit": None if any(p is None for p in profits) else sum(float(p) for p in profits),
-            "realized_profit_unknown": any(t["realized_profit_unknown"] for t in tranches)
-            or any(p is None for p in profits),
+            "realized_profit_unknown": any(t["realized_profit_unknown"] for t in tranches) or any(p is None for p in profits),
             "quantity": qty_total,
             "entry_price": dominant["entry_price"],
             "exit_price": weighted_exit if weighted_exit is not None else dominant["exit_price"],
@@ -408,12 +404,39 @@ def persist_labels(db_path: str | Path, payloads: list[dict[str, Any]]) -> int:
     return written
 
 
+def upgradable_labels(conn: sqlite3.Connection) -> set[tuple[str, str]]:
+    """Selected legs whose stored label is now weaker than the evidence allows.
+
+    A fill that is still open when it first matures can only be described by a markout, so
+    the runner writes a reconstructed label. Once that position closes the production exit
+    becomes available and the label must be recomputed, otherwise the trades held longest
+    keep a counterfactual outcome forever - a biased slice, not a random one.
+    """
+    closes = load_close_ledger(conn)
+    if not closes:
+        return set()
+    try:
+        rows = conn.execute(
+            f"SELECT g.decision_group_id, g.selected_symbol, g.contract_json, l.label_json "
+            f"FROM {TABLE_GROUPS} g JOIN {TABLE_LABELS} l "
+            f"ON l.decision_group_id = g.decision_group_id AND l.symbol = g.selected_symbol "
+            f"WHERE g.execute_authorized = 1 AND COALESCE(g.fill_trade_id,'') != ''"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    out: set[tuple[str, str]] = set()
+    for gid, symbol, contract_raw, label_raw in rows:
+        if str(_loads(label_raw).get("provenance") or "") == "authoritative":
+            continue
+        if authoritative_fill(_loads(contract_raw), closes) is not None:
+            out.add((str(gid), str(symbol)))
+    return out
+
+
 def completed_labels(conn: sqlite3.Connection) -> set[tuple[str, str]]:
     """Groups/symbols already labeled to completion. Avoids rewriting settled history."""
     try:
-        rows = conn.execute(
-            f"SELECT decision_group_id, symbol, label_json FROM {TABLE_LABELS}"
-        ).fetchall()
+        rows = conn.execute(f"SELECT decision_group_id, symbol, label_json FROM {TABLE_LABELS}").fetchall()
     except sqlite3.OperationalError:
         return set()
     done: set[tuple[str, str]] = set()
@@ -421,7 +444,7 @@ def completed_labels(conn: sqlite3.Connection) -> set[tuple[str, str]]:
         payload = _loads(raw)
         if payload.get("label_completed_at") and payload.get("label_version") == LABEL_VERSION:
             done.add((str(gid), str(symbol)))
-    return done
+    return done - upgradable_labels(conn)
 
 
 def pending_groups(
@@ -435,8 +458,7 @@ def pending_groups(
     cutoff = datetime.fromtimestamp(float(now_epoch) - float(min_maturity_sec), tz=timezone.utc)
     try:
         rows = conn.execute(
-            f"SELECT decision_group_id, created_at, selected_action, selected_symbol, contract_json "
-            f"FROM {TABLE_GROUPS} WHERE created_at <= ? ORDER BY created_at ASC",
+            f"SELECT decision_group_id, created_at, selected_action, selected_symbol, contract_json FROM {TABLE_GROUPS} WHERE created_at <= ? ORDER BY created_at ASC",
             (cutoff.isoformat(),),
         ).fetchall()
     except sqlite3.OperationalError:
@@ -538,17 +560,11 @@ def run_label_batch(
                         bars = bars_cache[symbol]
                         is_selected = symbol == selected
                         symbol_fill = fill if (is_selected and fill) else None
-                        entry_px = (
-                            symbol_fill["entry_price"]
-                            if symbol_fill
-                            else mark_at_or_before(bars, decision_epoch)
-                        )
+                        entry_px = symbol_fill["entry_price"] if symbol_fill else mark_at_or_before(bars, decision_epoch)
                         end = min(now, decision_epoch + MAX_LIFECYCLE_SEC)
                         if symbol_fill and symbol_fill.get("exit_epoch"):
                             end = min(end, float(symbol_fill["exit_epoch"]))
-                        break_sec = scan_first_4h_break(
-                            bars, decision_epoch=decision_epoch, end_epoch=end
-                        )
+                        break_sec = scan_first_4h_break(bars, decision_epoch=decision_epoch, end_epoch=end)
                         payload = label_candidate(
                             decision_group_id=group["decision_group_id"],
                             symbol=symbol,
@@ -610,4 +626,5 @@ __all__ = [
     "run_label_batch",
     "scan_first_4h_break",
     "trade_id_epoch",
+    "upgradable_labels",
 ]

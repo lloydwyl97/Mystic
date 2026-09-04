@@ -27,6 +27,7 @@ from backend.services.day_4h_label_runner import (
     run_label_batch,
     scan_first_4h_break,
     trade_id_epoch,
+    upgradable_labels,
 )
 from backend.services.day_4h_outcome_labeler import first_4h_break_seconds, label_candidate, persist_label
 from backend.services.day_decision_label_contract import TABLE_LABELS
@@ -108,8 +109,7 @@ def _make_db(path, *, groups: int = 2, decision_epoch: int = BASE, with_fill: bo
         if with_fill:
             contract.update({"trade_id": trade_id, "fill_price": 1.45, "filled_qty": 30.0, "commission": 0.01})
         conn.execute(
-            f"INSERT INTO {TABLE_GROUPS}(decision_group_id,created_at,selected_action,selected_symbol,lifecycle_state,contract_json,"
-            "execute_authorized,fill_trade_id) VALUES (?,?,?,?,?,?,?,?)",
+            f"INSERT INTO {TABLE_GROUPS}(decision_group_id,created_at,selected_action,selected_symbol,lifecycle_state,contract_json,execute_authorized,fill_trade_id) VALUES (?,?,?,?,?,?,?,?)",
             (
                 gid,
                 created,
@@ -235,9 +235,7 @@ def test_scan_first_4h_break_matches_reference_implementation():
         bars = _ramp_bars(BASE - 4 * 3600, 400, 80000.0, step)
         decision = bars[300][0]
         end = decision + 3600
-        assert scan_first_4h_break(bars, decision_epoch=decision, end_epoch=end) == first_4h_break_seconds(
-            bars, decision_epoch=decision, end_epoch=end
-        )
+        assert scan_first_4h_break(bars, decision_epoch=decision, end_epoch=end) == first_4h_break_seconds(bars, decision_epoch=decision, end_epoch=end)
 
 
 def test_scan_first_4h_break_empty_tape():
@@ -278,9 +276,7 @@ def test_run_label_batch_labels_every_candidate_and_hold(tmp_path):
     assert "authoritative" in by_symbol["XRPUSDT"]
     for loser in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
         assert by_symbol[loser] == {"reconstructed"}
-    counterfactual = conn.execute(
-        f"SELECT COUNT(*) FROM {TABLE_LABELS} WHERE provenance='reconstructed' AND production_exit_net_bps IS NOT NULL"
-    ).fetchone()[0]
+    counterfactual = conn.execute(f"SELECT COUNT(*) FROM {TABLE_LABELS} WHERE provenance='reconstructed' AND production_exit_net_bps IS NOT NULL").fetchone()[0]
     conn.close()
     assert counterfactual == 0, "counterfactual candidates must not report a production exit"
 
@@ -305,6 +301,93 @@ def test_run_label_batch_is_idempotent_and_does_not_touch_decisions(tmp_path):
     # Settled groups are skipped on the second pass rather than rewritten.
     assert second["labels_written"] == 0
     assert second["errors"] == 0
+
+
+def _label_provenance(db, gid: str, symbol: str) -> str | None:
+    conn = sqlite3.connect(str(db))
+    try:
+        row = conn.execute(
+            f"SELECT provenance FROM {TABLE_LABELS} WHERE decision_group_id=? AND symbol=?",
+            (gid, symbol),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else None
+
+
+def test_reconstructed_label_is_upgraded_once_the_fill_closes(tmp_path):
+    """A fill still open at maturity gets a markout; its real exit must replace it later.
+
+    Production case: a trade held past the 4h maturity window is labeled while open, so no
+    production exit exists yet. If that label were treated as settled, the trades held
+    longest would keep a counterfactual outcome forever - a biased slice of the dataset
+    rather than a random one.
+    """
+    db = tmp_path / "upgrade.db"
+    _make_db(db, groups=1)
+    gid = f"daygrp_{BASE}"
+    conn = sqlite3.connect(str(db))
+    close_row = conn.execute("SELECT * FROM position_close_ledger").fetchall()
+    conn.execute("DELETE FROM position_close_ledger")  # position still open at maturity
+    conn.commit()
+    conn.close()
+
+    first = run_label_batch(db, now_epoch=BASE + 6 * 3600)
+    assert first["errors"] == 0
+    assert _label_provenance(db, gid, "XRPUSDT") == "reconstructed"
+
+    # the position now closes and the production exit becomes available
+    conn = sqlite3.connect(str(db))
+    conn.executemany(
+        "INSERT INTO position_close_ledger(id,symbol,closed_at,closed_at_epoch,close_reason,manual_sell,"
+        "realized_profit,realized_profit_unknown,cooldown_until,quantity,entry_price,exit_price,"
+        "sell_trade_id,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        close_row,
+    )
+    conn.commit()
+    conn.close()
+
+    second = run_label_batch(db, now_epoch=BASE + 6 * 3600)
+
+    assert second["errors"] == 0
+    assert second["labels_written"] > 0, "the closed fill must be revisited, not skipped"
+    assert _label_provenance(db, gid, "XRPUSDT") == "authoritative"
+
+
+def test_upgradable_labels_is_empty_once_everything_is_authoritative(tmp_path):
+    """Re-labelling must converge: no rewriting of settled history on every pass."""
+    db = tmp_path / "converge.db"
+    _make_db(db, groups=2)
+
+    run_label_batch(db, now_epoch=BASE + 6 * 3600)
+    repeat = run_label_batch(db, now_epoch=BASE + 6 * 3600)
+
+    conn = sqlite3.connect(str(db))
+    try:
+        assert upgradable_labels(conn) == set()
+    finally:
+        conn.close()
+    assert repeat["labels_written"] == 0
+
+
+def test_a_still_open_fill_is_not_treated_as_upgradable(tmp_path):
+    """With no close row there is nothing better to write, so nothing may be rewritten."""
+    db = tmp_path / "open.db"
+    _make_db(db, groups=1)
+    conn = sqlite3.connect(str(db))
+    conn.execute("DELETE FROM position_close_ledger")
+    conn.commit()
+    conn.close()
+
+    run_label_batch(db, now_epoch=BASE + 6 * 3600)
+    repeat = run_label_batch(db, now_epoch=BASE + 6 * 3600)
+
+    conn = sqlite3.connect(str(db))
+    try:
+        assert upgradable_labels(conn) == set()
+    finally:
+        conn.close()
+    assert repeat["labels_written"] == 0
 
 
 def test_run_label_batch_is_fail_open(tmp_path):
@@ -375,9 +458,7 @@ def test_hold_rows_are_never_dropped_from_the_group(tmp_path):
     _make_db(db, groups=1)
     run_label_batch(db, now_epoch=BASE + 6 * 3600)
     conn = sqlite3.connect(str(db))
-    hold = conn.execute(
-        f"SELECT production_exit_net_bps, mfe_bps, mae_bps FROM {TABLE_LABELS} WHERE symbol='HOLD'"
-    ).fetchone()
+    hold = conn.execute(f"SELECT production_exit_net_bps, mfe_bps, mae_bps FROM {TABLE_LABELS} WHERE symbol='HOLD'").fetchone()
     conn.close()
     assert hold == (0.0, 0.0, 0.0), "HOLD must stay explicit with zero economic value"
 
@@ -392,21 +473,25 @@ def test_break_seconds_kwarg_default_is_byte_identical_to_reference():
     decision = bars[300][0]
     now = decision + 6 * 3600
     default = label_candidate(
-        decision_group_id="g1", symbol="BTCUSDT", decision_epoch=decision,
-        entry_px=bars[300][4], bars=bars, now_epoch=now,
+        decision_group_id="g1",
+        symbol="BTCUSDT",
+        decision_epoch=decision,
+        entry_px=bars[300][4],
+        bars=bars,
+        now_epoch=now,
     )
     precomputed = label_candidate(
-        decision_group_id="g1", symbol="BTCUSDT", decision_epoch=decision,
-        entry_px=bars[300][4], bars=bars, now_epoch=now,
-        break_seconds=scan_first_4h_break(
-            bars, decision_epoch=decision, end_epoch=min(now, decision + 8 * 3600)
-        ),
+        decision_group_id="g1",
+        symbol="BTCUSDT",
+        decision_epoch=decision,
+        entry_px=bars[300][4],
+        bars=bars,
+        now_epoch=now,
+        break_seconds=scan_first_4h_break(bars, decision_epoch=decision, end_epoch=min(now, decision + 8 * 3600)),
     )
     for payload in (default, precomputed):
         payload.pop("label_completed_at", None)
-    assert json.dumps(default, sort_keys=True, default=str) == json.dumps(
-        precomputed, sort_keys=True, default=str
-    )
+    assert json.dumps(default, sort_keys=True, default=str) == json.dumps(precomputed, sort_keys=True, default=str)
 
 
 def test_break_seconds_none_means_no_break_not_unscanned():
@@ -414,8 +499,13 @@ def test_break_seconds_none_means_no_break_not_unscanned():
     flat = _ramp_bars(BASE - 4 * 3600, 400, 80000.0, 12.0)
     decision = flat[300][0]
     payload = label_candidate(
-        decision_group_id="g", symbol="BTCUSDT", decision_epoch=decision,
-        entry_px=flat[300][4], bars=flat, now_epoch=decision + 6 * 3600, break_seconds=None,
+        decision_group_id="g",
+        symbol="BTCUSDT",
+        decision_epoch=decision,
+        entry_px=flat[300][4],
+        bars=flat,
+        now_epoch=decision + 6 * 3600,
+        break_seconds=None,
     )
     assert payload["time_to_4h_break_sec"] is None
     assert payload["4h_break_within_3m"] is False
@@ -424,8 +514,11 @@ def test_break_seconds_none_means_no_break_not_unscanned():
 def test_golden_ranking_and_exit_unchanged_by_labeling(tmp_path):
     """Running the offline labeler must not perturb ranking or exit outputs."""
     scores = {
-        "btc_path_ev": 0.0001, "eth_path_ev": 0.0008, "sol_path_ev": 0.0002,
-        "xrp_path_ev": 0.0001, "path_net_status": "predicted",
+        "btc_path_ev": 0.0001,
+        "eth_path_ev": 0.0008,
+        "sol_path_ev": 0.0002,
+        "xrp_path_ev": 0.0001,
+        "path_net_status": "predicted",
         "path_net_model_id": "day_path_net_v1",
     }
     before = select_action(scores, old_rank_nominee="BTCUSDT", old_rank_score=9.0)
@@ -473,8 +566,13 @@ def test_batch_persist_matches_persist_label(tmp_path):
     decision = bars[300][0]
     payloads = [
         label_candidate(
-            decision_group_id=f"g{i}", symbol=sym, decision_epoch=decision,
-            entry_px=bars[300][4], bars=bars, now_epoch=decision + 6 * 3600, break_seconds=None,
+            decision_group_id=f"g{i}",
+            symbol=sym,
+            decision_epoch=decision,
+            entry_px=bars[300][4],
+            bars=bars,
+            now_epoch=decision + 6 * 3600,
+            break_seconds=None,
         )
         for i, sym in enumerate(COINS)
     ]
