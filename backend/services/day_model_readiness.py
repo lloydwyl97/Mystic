@@ -40,6 +40,11 @@ MATURITY_HORIZON_SEC = 4 * 3600
 HISTORICAL_66_WINDOW = ("2026-08-25T00:00:00+00:00", "2026-09-02T00:00:00+00:00")
 BUY_TRADE_ID_RE = re.compile(r"buy_trade_id=([^;]+)")
 
+# A position that is still open has no production exit, so no authoritative exit label can
+# exist for it yet. Dust tails are economically closed already: the paying tranche has sold
+# and the labeler books the residual as a write-off, so they stay in the denominator.
+OPEN_POSITION_STATUSES = frozenset({"ACTIVE", "OPEN", "PARTIAL", "PARTIALLY_FILLED"})
+
 
 def _num(value: Any) -> float | None:
     if value in (None, ""):
@@ -93,8 +98,7 @@ def load_state(db_path: str | Path) -> dict[str, Any]:
     out: dict[str, Any] = {"groups": {}, "labels": defaultdict(dict), "candidates": defaultdict(dict)}
     try:
         for row in conn.execute(
-            "SELECT decision_group_id, created_at, selected_action, selected_symbol, contract_json, "
-            f"execute_authorized, fill_trade_id, lifecycle_state, feature_artifact_ref FROM {TABLE_GROUPS}"
+            f"SELECT decision_group_id, created_at, selected_action, selected_symbol, contract_json, execute_authorized, fill_trade_id, lifecycle_state, feature_artifact_ref FROM {TABLE_GROUPS}"
         ):
             item = dict(row)
             item["contract"] = _loads(item.pop("contract_json"))
@@ -103,23 +107,20 @@ def load_state(db_path: str | Path) -> dict[str, Any]:
             item = dict(row)
             item["label"] = _loads(item.pop("label_json"))
             out["labels"][str(row["decision_group_id"])][str(row["symbol"])] = item
-        for row in conn.execute(
-            f"SELECT decision_group_id, symbol, p_buy, path_ev, final_rank_score, feature_json FROM {TABLE_CANDIDATES}"
-        ):
+        for row in conn.execute(f"SELECT decision_group_id, symbol, p_buy, path_ev, final_rank_score, feature_json FROM {TABLE_CANDIDATES}"):
             item = dict(row)
             item["features"] = _loads(item.pop("feature_json"))
             out["candidates"][str(row["decision_group_id"])][str(row["symbol"])] = item
         out["lock"] = [dict(r) for r in conn.execute(f"SELECT * FROM {TABLE_LOCK}")]
         out["registry"] = [dict(r) for r in conn.execute(f"SELECT * FROM {TABLE_REGISTRY}")]
         out["closes"] = [dict(r) for r in conn.execute("SELECT * FROM position_close_ledger")]
-        out["fifo"] = [
-            dict(r)
-            for r in conn.execute(
-                "SELECT symbol, trade_id, quantity, price, remaining_position FROM paper_trades "
-                "WHERE side='BUY' AND COALESCE(remaining_position,0) > 0"
-            )
-        ]
-        out["book"] = [dict(r) for r in conn.execute("SELECT symbol, quantity, entry_price, status FROM portfolio_engine_positions")]
+        out["fifo"] = [dict(r) for r in conn.execute("SELECT symbol, trade_id, quantity, price, remaining_position FROM paper_trades WHERE side='BUY' AND COALESCE(remaining_position,0) > 0")]
+        # trade_id links a book row back to the fill that opened it. Older schemas omit it;
+        # without it an open position cannot be matched, which must not be fatal here.
+        book_columns = ["symbol", "quantity", "entry_price", "status"]
+        if any(r[1] == "trade_id" for r in conn.execute("PRAGMA table_info(portfolio_engine_positions)")):
+            book_columns.append("trade_id")
+        out["book"] = [dict(r) for r in conn.execute(f"SELECT {', '.join(book_columns)} FROM portfolio_engine_positions")]
         ledger = conn.execute("SELECT total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
         out["equity"] = float(ledger["total_equity"]) if ledger else None
     finally:
@@ -130,12 +131,25 @@ def load_state(db_path: str | Path) -> dict[str, Any]:
 # --------------------------------------------------------------------------------------
 # A. production label integrity
 # --------------------------------------------------------------------------------------
+def open_fill_trade_ids(state: dict[str, Any]) -> set[str]:
+    """Fill trade ids whose position is still open, so no production exit exists yet."""
+    return {str(row.get("trade_id")).strip() for row in state.get("book") or [] if str(row.get("trade_id") or "").strip() and str(row.get("status") or "").strip().upper() in OPEN_POSITION_STATUSES}
+
+
 def check_production_label_integrity(state: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
+    """Every matured fill that has actually closed must carry an authoritative label.
+
+    Elapsed time alone does not make a fill labelable: a trade still holding an open
+    position has no production exit to describe, so it is reported separately rather than
+    counted as a miss. Excluding it tightens the invariant instead of relaxing it.
+    """
     now = now if now is not None else time.time()
+    still_open = open_fill_trade_ids(state)
     matured_traded = 0
     joined = 0
     missing: list[str] = []
     fabricated: list[str] = []
+    open_excluded: list[str] = []
     for gid, group in state["groups"].items():
         created = _parse_iso(group.get("created_at"))
         role = decision_role(group)
@@ -145,6 +159,9 @@ def check_production_label_integrity(state: dict[str, Any], *, now: float | None
         if role != "traded" or created is None:
             continue
         if created.timestamp() + MATURITY_HORIZON_SEC > now:
+            continue
+        if str(group.get("fill_trade_id") or "").strip() in still_open:
+            open_excluded.append(gid)
             continue
         matured_traded += 1
         if lab and str(lab.get("provenance")) == "authoritative":
@@ -162,6 +179,8 @@ def check_production_label_integrity(state: dict[str, Any], *, now: float | None
             "required_join_rate": MIN_MATURE_LABEL_COVERAGE,
             "unjoined_groups": missing[:10],
             "authoritative_without_fill": fabricated[:10],
+            "open_trades_excluded": len(open_excluded),
+            "open_trade_groups": open_excluded[:10],
         },
     )
 
@@ -648,6 +667,57 @@ def evaluate_readiness(db_path: str | Path, *, cutoff: str = FORWARD_LOCK_START,
     }
 
 
+def readiness_progress(report: dict[str, Any]) -> dict[str, Any]:
+    """How far the forward window has come, as current-vs-required counts.
+
+    Deliberately not a countdown date: accumulation rate is not constant and a date would
+    invite waiting for the clock instead of for the evidence.
+    """
+    span = (report.get("checks") or {}).get("G_forward_span") or {}
+    have_events = int(span.get("mature_authoritative_trade_labels") or 0)
+    need_events = int(span.get("required_mature_trade_labels") or 0)
+    have_blocks = int(span.get("chronological_blocks") or 0)
+    need_blocks = int(span.get("required_chronological_blocks") or 0)
+    coverage = (report.get("checks") or {}).get("D_feature_coverage") or {}
+    maturity = (report.get("checks") or {}).get("C_label_maturity") or {}
+    return {
+        "effective_feature_start": span.get("effective_window_start"),
+        "nominal_lock_cutoff": span.get("lock_cutoff"),
+        "mature_events": f"{have_events} / {need_events}",
+        "chronological_blocks": f"{have_blocks} / {need_blocks}",
+        "usable_groups": span.get("decision_groups"),
+        "selected_fills": span.get("selected_trades"),
+        "HOLD_groups": span.get("HOLD_groups"),
+        "calendar_days": span.get("calendar_days"),
+        "eligible_candidate_rows": coverage.get("eligible_candidate_rows"),
+        "label_coverage": maturity.get("group_label_coverage"),
+        "events_remaining": max(need_events - have_events, 0),
+        "blocks_remaining": max(need_blocks - have_blocks, 0),
+    }
+
+
+def format_snapshot(report: dict[str, Any]) -> str:
+    """Readable A-I snapshot ending in an unambiguous train / do-not-train line."""
+    lines = ["DAY MODEL DATA-READINESS SNAPSHOT", f"generated_at: {report.get('generated_at')}", ""]
+    for name, check in (report.get("checks") or {}).items():
+        lines.append(f"  {name:<34} {'PASS' if check.get('pass') else 'FAIL'}")
+    ready = bool(report.get("ready"))
+    lines += ["", f"DATA_READINESS = {'PASS' if ready else 'FAIL'}"]
+    if not ready:
+        lines.append(f"blocking: {', '.join(report.get('reasons_not_ready') or []) or 'unknown'}")
+    lines += ["", "PROGRESS TO READINESS:"]
+    for key, value in readiness_progress(report).items():
+        lines.append(f"  {key:<28} {value}")
+    lines += [
+        "",
+        f"READY_FOR_MODEL_TRAINING = {'true' if ready else 'false'}",
+        "",
+        "A passing gate permits the next task to be scoped. It does not authorize model",
+        "training, model promotion, or any strategy change; those remain explicit decisions.",
+    ]
+    return "\n".join(lines)
+
+
 def sample_support(state: dict[str, Any], *, cutoff: str = FORWARD_LOCK_START, now: float | None = None) -> dict[str, Any]:
     """Evidence available to a first challenger. The decision group is the primary unit.
 
@@ -724,8 +794,13 @@ def _cli() -> None:
     parser = argparse.ArgumentParser(description="DAY model data-readiness gate (offline, read-only)")
     parser.add_argument("--db", default=os.getenv("MYSTIC_DB_PATH", "mystic_trading.db"))
     parser.add_argument("--cutoff", default=FORWARD_LOCK_START)
+    parser.add_argument("--format", choices=("text", "json"), default="text")
     args = parser.parse_args()
-    print(json.dumps(evaluate_readiness(args.db, cutoff=args.cutoff), indent=2, default=str))
+    report = evaluate_readiness(args.db, cutoff=args.cutoff)
+    if args.format == "json":
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        print(format_snapshot(report))
 
 
 if __name__ == "__main__":
@@ -740,6 +815,7 @@ __all__ = [
     "MIN_EVENTS_PER_FEATURE",
     "MIN_FEATURE_COVERAGE",
     "MIN_MATURE_LABEL_COVERAGE",
+    "OPEN_POSITION_STATUSES",
     "acceptance_standard",
     "check_accounting",
     "check_counterfactual_integrity",
@@ -754,7 +830,10 @@ __all__ = [
     "evaluate_readiness",
     "feature_availability_start",
     "fifo_residual_report",
+    "format_snapshot",
     "is_residual_writeoff",
     "load_state",
+    "open_fill_trade_ids",
+    "readiness_progress",
     "sample_support",
 ]

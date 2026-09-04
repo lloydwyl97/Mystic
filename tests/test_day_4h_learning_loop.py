@@ -17,7 +17,7 @@ from backend.services.day_decision_observability import TABLE_CANDIDATES, TABLE_
 from backend.services.day_direct_path_ev_authority import select_action
 from backend.services.day_experiment_registry import SEED_ARMS, registry, seed_historical
 from backend.services.day_forward_lock import FORWARD_LOCK_START, HISTORICAL_66_END, challenger_export_schema, register_lock
-from backend.services.sqlite_large_table_retention import RETENTION_POLICIES
+from backend.services.sqlite_large_table_retention import PROTECTED_TABLES, RETENTION_POLICIES
 
 
 def _ts(iso: str) -> float:
@@ -207,8 +207,18 @@ def test_retention_keeps_90_days_for_learning_tables():
     keep = {p.table: p.keep_days for p in RETENTION_POLICIES}
     assert keep["day_decision_outcome_labels"] == 90
     assert keep["day_decision_group_records"] == 90
-    assert keep["day_experiment_registry"] == 90
-    assert keep["day_forward_lock_registry"] == 90
+
+
+def test_experiment_and_lock_registries_are_protected_not_expired():
+    """Sampled learning rows age out; the record of what was tried must not.
+
+    These two tables describe experiments and locks rather than sampling them, so deleting
+    them on a timer would erase the evidence needed to reproduce a sealed result.
+    """
+    keep = {p.table: p.keep_days for p in RETENTION_POLICIES}
+    assert "day_experiment_registry" not in keep
+    assert "day_forward_lock_registry" not in keep
+    assert set(PROTECTED_TABLES) == {"day_experiment_registry", "day_forward_lock_registry"}
 
 
 def test_report_window_empty_db(tmp_path):
