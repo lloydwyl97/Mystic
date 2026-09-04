@@ -108,8 +108,18 @@ def _make_db(path, *, groups: int = 2, decision_epoch: int = BASE, with_fill: bo
         if with_fill:
             contract.update({"trade_id": trade_id, "fill_price": 1.45, "filled_qty": 30.0, "commission": 0.01})
         conn.execute(
-            f"INSERT INTO {TABLE_GROUPS}(decision_group_id,created_at,selected_action,selected_symbol,lifecycle_state,contract_json) VALUES (?,?,?,?,?,?)",
-            (gid, created, "BUY_XRPUSDT", "XRPUSDT", "filled" if with_fill else "ranking_selected", json.dumps(contract)),
+            f"INSERT INTO {TABLE_GROUPS}(decision_group_id,created_at,selected_action,selected_symbol,lifecycle_state,contract_json,"
+            "execute_authorized,fill_trade_id) VALUES (?,?,?,?,?,?,?,?)",
+            (
+                gid,
+                created,
+                "BUY_XRPUSDT",
+                "XRPUSDT",
+                "filled" if with_fill else "ranking_selected",
+                json.dumps(contract),
+                1 if with_fill else None,
+                trade_id if with_fill else None,
+            ),
         )
         for s in (*COINS, "HOLD"):
             conn.execute(

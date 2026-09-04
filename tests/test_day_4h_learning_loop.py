@@ -111,6 +111,8 @@ def test_scorecard_consistency_and_regret():
         {
             "selected_action": "BUY_ETHUSDT",
             "selected_symbol": "ETHUSDT",
+            "execute_authorized": 1,
+            "fill_trade_id": "mystic_ETH/USDT_1",
             "contract": {
                 "4h_peer_structure": {
                     "selected_already_broken_at_ranking": True,
@@ -124,6 +126,7 @@ def test_scorecard_consistency_and_regret():
             },
             "labels": {
                 "ETHUSDT": {
+                    "provenance": "authoritative",
                     "production_exit_net_bps": -7.0,
                     "regret_vs_hold_bps": -7.0,
                     "mfe_bps": 0.0,

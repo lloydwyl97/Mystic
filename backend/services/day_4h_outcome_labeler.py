@@ -285,7 +285,14 @@ def label_candidate(
         "label_started_at": datetime.fromtimestamp(decision_epoch, tz=timezone.utc).isoformat(),
         "label_completed_at": _now_iso() if horizon_mature(decision_epoch=decision_epoch, horizon_sec=HORIZONS_SEC["4h"], now_epoch=now) else None,
         "label_version": LABEL_VERSION,
-        "market_data_cutoff": datetime.fromtimestamp(end, tz=timezone.utc).isoformat(),
+        # The lifecycle window (`end`) bounds MFE/MAE and the break scan, but a markout is a
+        # property of the coin rather than the trade, so it reads to decision + horizon even
+        # when the position exited earlier. The recorded cutoff is the furthest bar any part
+        # of this label consumed, otherwise it would understate the data boundary.
+        "market_data_cutoff": datetime.fromtimestamp(
+            min(now, max(end, decision_epoch + max((sec for name, sec in HORIZONS_SEC.items() if markouts.get(name) is not None), default=0.0))),
+            tz=timezone.utc,
+        ).isoformat(),
         "estimated_all_in_cost_bps": cost,
         "time_to_4h_break_sec": break_sec,
     }

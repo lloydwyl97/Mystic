@@ -76,7 +76,10 @@ def normalize_label(payload: dict[str, Any]) -> dict[str, Any]:
         "mae_bps": payload.get("mae_bps"),
         "time_to_mfe_sec": payload.get("time_to_mfe_sec"),
         "time_to_mae_sec": payload.get("time_to_mae_sec"),
-        "cost_cover": bool(payload.get("cost_cover")),
+        "cost_cover": bool(payload.get("cost_cover") or payload.get("covered_genuine_cost")),
+        # Carried so a label written through the contract cannot lose the flag that separates a
+        # simulated ranking loser from a real fill. The offline runner already persists it.
+        "counterfactual": bool(payload.get("counterfactual")),
         "production_exit_gross_bps": payload.get("production_exit_gross_bps"),
         "commission_bps": payload.get("commission_bps"),
         "spread_bps": payload.get("spread_bps"),
