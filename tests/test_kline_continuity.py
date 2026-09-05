@@ -546,7 +546,46 @@ async def test_concurrent_flush_no_duplicate():
 
 
 # ---------------------------------------------------------------------------
-# 20. Atomic cache state: upsert preserves sort order
+# 20. Orphaned-dup cleanup: sort+dedup heals pre-existing dups on next write
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_orphaned_dup_cleaned_on_next_write():
+    """If the Redis array already contains duplicate timestamps (produced by an
+    earlier race before the lock was in place), the next _append_candle write
+    must eliminate them via the sort+dedup pass.
+
+    The surviving row for the duplicate ts must be the one with higher volume
+    (the authoritative kline row, which sorts AFTER the zero-vol backfill row
+    for the same ts and is therefore kept as the 'last occurrence').
+    """
+    bar_ts = 1_003_000
+    # Seed Redis with a pre-existing duplicate (stale vol=0 followed by real vol)
+    existing_arr = [
+        [float(bar_ts - 60), 100.0, 100.0, 100.0, 100.0, 1.0],  # ts-1 clean
+        [float(bar_ts), 100.0, 100.0, 100.0, 100.0, 0.0],  # duplicate A (backfill)
+        [float(bar_ts), 100.0, 101.0, 99.5, 100.7, 3.5],  # duplicate B (kline)
+        [float(bar_ts + 60), 100.7, 100.7, 100.7, 100.7, 0.0],  # ts+1 clean
+    ]
+    store: dict[str, Any] = {"klines:BTCUSDT:1m": json.dumps(existing_arr)}
+    h = _make_hydrator(store)
+
+    # Trigger a new write (next minute's bar) — this invokes the sort+dedup pass
+    next_candle = [float(bar_ts + 120), 100.7, 102.0, 100.5, 101.5, 5.0]
+    await h._append_candle("BTCUSDT", "1m", next_candle)
+
+    arr = json.loads(store["klines:BTCUSDT:1m"])
+    ts_vals = [int(r[0]) for r in arr]
+
+    assert ts_vals.count(bar_ts) == 1, "sort+dedup must remove orphaned duplicate"
+    # The surviving row must be the kline-authority one (higher volume, later occurrence)
+    surviving = next(r for r in arr if int(r[0]) == bar_ts)
+    assert float(surviving[5]) == 3.5, "surviving row must have kline volume, not backfill zero"
+
+
+# ---------------------------------------------------------------------------
+# 21. Atomic cache state: upsert preserves sort order
 # ---------------------------------------------------------------------------
 
 

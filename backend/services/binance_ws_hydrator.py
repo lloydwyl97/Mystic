@@ -419,6 +419,17 @@ class BinanceWSHydrator:
                     arr[existing_idx] = row
                 else:
                     arr.append(row)
+                # Sort ascending by open-timestamp, then deduplicate: for any
+                # timestamp that appears more than once (possible if a prior race
+                # produced duplicates before the lock was in place), keep the last
+                # occurrence in the sorted order (= the most-recently-appended row,
+                # which carries the authoritative exchange kline volume and close).
+                arr.sort(key=lambda x: x[0])
+                ts_last_idx: dict[float, int] = {}
+                for i, r_row in enumerate(arr):
+                    ts_last_idx[r_row[0]] = i
+                if len(ts_last_idx) < len(arr):
+                    arr = [arr[ts_last_idx[ts]] for ts in sorted(ts_last_idx)]
                 # Trim to last 600
                 if len(arr) > 600:
                     arr = arr[-600:]
