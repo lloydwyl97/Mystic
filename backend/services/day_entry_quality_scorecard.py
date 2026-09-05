@@ -64,8 +64,8 @@ def scorecard_from_labeled_groups(groups: list[dict[str, Any]]) -> dict[str, Any
             if selected == best:
                 best_coin_selected += 1
             by_symbol[selected].append(sel_net)
-        regret_best += (best_net - sel_net)
-        regret_hold += (hold_net - sel_net)
+        regret_best += best_net - sel_net
+        regret_hold += hold_net - sel_net
         pred = _num(g.get("predicted_net_bps"))
         if pred is not None:
             pred_vs_real.append(pred - sel_net)

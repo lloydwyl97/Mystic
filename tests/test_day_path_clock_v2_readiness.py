@@ -133,13 +133,15 @@ def test_v3_parameter_count_and_group_unit():
     assert params["generic_140_selected_fills"]["justified_as_clock_v2_fitting_sample"] is False
     assert req["min_fully_comparable_independent_groups"] == 190
     assert req["min_authoritative_fills_execution_calibration"] == 50
-    assert req["target_horizon_status"] == TARGET_HORIZON_STATUS
+    # V3 was frozen when horizon was NOT_FROZEN; that value is immutable in v3.
+    # V4 (clock_v2_v4_readiness_requirements) carries the frozen status.
+    assert req["target_horizon_status"] == "TARGET_HORIZON_NOT_FROZEN"
     assert req["train_blocked_until_horizon_frozen"] is True
     assert spec["experiment_id"] == PLANNED_EXPERIMENT_ID_V3
     assert spec["train"] is False
     assert spec["promoted"] is False
     assert spec["result"] == "PLANNED_NOT_RUN"
-    assert spec["target_horizon_status"] == TARGET_HORIZON_STATUS
+    assert spec["target_horizon_status"] == "TARGET_HORIZON_NOT_FROZEN"
     v2 = clock_v2_v2_readiness_requirements()
     assert v2["min_feature_complete_groups"] == 140
     assert v2["min_authoritative_selected_trade_labels"] == 140
@@ -170,4 +172,21 @@ def test_v3_horizon_blocks_training_even_if_counts_high():
     assert spec["training_procedure"]["executed"] is False
     assert spec["train"] is False
     req = clock_v2_v3_readiness_requirements()
+    # v3 was written when horizon was not yet frozen; the constant it captured is preserved.
+    # v4 (clock_v2_v4_readiness_requirements) carries the frozen status.
     assert req["target_horizon_status"] == "TARGET_HORIZON_NOT_FROZEN"
+
+
+def test_v4_horizon_frozen_and_does_not_mutate_v3():
+    from backend.services.day_path_clock_v2 import (
+        clock_v2_v4_readiness_requirements,
+    )
+
+    req_v3 = clock_v2_v3_readiness_requirements()
+    req_v4 = clock_v2_v4_readiness_requirements()
+    # v4 carries the frozen horizon; v3 still shows NOT_FROZEN (immutable)
+    assert req_v3["target_horizon_status"] == "TARGET_HORIZON_NOT_FROZEN"
+    assert req_v4["target_horizon_status"] == "PRIMARY_TARGET_HORIZON_3H"
+    # Sample-support numbers must be identical
+    assert req_v4["min_fully_comparable_independent_groups"] == req_v3["min_fully_comparable_independent_groups"]
+    assert req_v4["min_authoritative_fills_execution_calibration"] == req_v3["min_authoritative_fills_execution_calibration"]

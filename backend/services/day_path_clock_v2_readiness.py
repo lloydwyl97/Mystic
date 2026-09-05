@@ -29,15 +29,20 @@ from backend.services.day_path_clock_v2 import (
     PLANNED_EXPERIMENT_ID,
     PLANNED_EXPERIMENT_ID_V2,
     PLANNED_EXPERIMENT_ID_V3,
+    PLANNED_EXPERIMENT_ID_V4,
     PLANNED_RESULT,
     PRIMARY_TARGET,
+    PRIMARY_TARGET_HORIZON_NAME,
+    PRIMARY_TARGET_HORIZON_SEC,
     REQUIRED_CLOCK_V2_FIELDS,
     TARGET_HORIZON_STATUS,
     clock_v2_statistical_contract,
     clock_v2_v2_readiness_requirements,
     clock_v2_v3_readiness_requirements,
+    clock_v2_v4_readiness_requirements,
     planned_challenger_specification_v2,
     planned_challenger_specification_v3,
+    planned_challenger_specification_v4,
 )
 from backend.services.day_path_clock_v2_capture import TABLE_ARTIFACT, group_completeness
 
@@ -222,7 +227,7 @@ def _load_labels_presence(db_path: str | Path) -> dict[tuple[str, str], dict[str
 def evaluate_clock_v2_readiness(db_path: str | Path, *, generic_state: dict[str, Any] | None = None) -> dict[str, Any]:
     """Separate gate. Generic day_model_readiness is unchanged."""
     req_v2 = clock_v2_v2_readiness_requirements()
-    req = clock_v2_v3_readiness_requirements()
+    req = clock_v2_v4_readiness_requirements()  # v4 supersedes v3; numbers unchanged, horizon frozen
     artifacts = _load_artifacts(db_path)
     groups = _load_groups(db_path)
     labels = _load_labels_presence(db_path)
@@ -332,7 +337,9 @@ def evaluate_clock_v2_readiness(db_path: str | Path, *, generic_state: dict[str,
     req_fills = int(req["min_authoritative_fills_execution_calibration"])
     req_selected = int(req_v2["min_authoritative_selected_trade_labels"])
     span_days = ((last - first).total_seconds() / 86400.0) if first and last else 0.0
-    horizon_frozen = req["target_horizon_status"] != TARGET_HORIZON_STATUS
+    # TARGET_HORIZON_STATUS is now "PRIMARY_TARGET_HORIZON_3H" (frozen).
+    # horizon_frozen is True when the status string is NOT the "not frozen" sentinel.
+    horizon_frozen = req["target_horizon_status"] != "TARGET_HORIZON_NOT_FROZEN"
     ok = (
         complete_feature_groups >= req_complete
         and fully_comparable >= req_comparable
@@ -356,11 +363,14 @@ def evaluate_clock_v2_readiness(db_path: str | Path, *, generic_state: dict[str,
         "train": False,
         "promoted": False,
         "original_planned_experiment": PLANNED_EXPERIMENT_ID,
-        "planned_experiment": PLANNED_EXPERIMENT_ID_V3,
         "planned_experiment_v2": PLANNED_EXPERIMENT_ID_V2,
+        "planned_experiment_v3": PLANNED_EXPERIMENT_ID_V3,
+        "planned_experiment": PLANNED_EXPERIMENT_ID_V4,
         "planned_result": PLANNED_RESULT,
         "target": PRIMARY_TARGET,
         "target_horizon_status": TARGET_HORIZON_STATUS,
+        "primary_target_horizon_sec": PRIMARY_TARGET_HORIZON_SEC,
+        "primary_target_horizon_name": PRIMARY_TARGET_HORIZON_NAME,
         "statistical_contract": clock_v2_statistical_contract(),
         "v3_parameter_contract": req["parameter_contract"],
         "requirements_v2_historical": req_v2,
@@ -416,10 +426,38 @@ def evaluate_clock_v2_readiness(db_path: str | Path, *, generic_state: dict[str,
     return snapshot
 
 
+def record_planned_clock_v2_v4(db_path: str | Path) -> None:
+    """Insert v4 (horizon frozen at 3h). Never overwrites v1/v2/v3."""
+    spec = planned_challenger_specification_v4()
+    seed_historical(db_path)
+    record_experiment(
+        db_path,
+        {
+            "experiment_id": spec["experiment_id"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "feature_set": spec["feature_set"],
+            "target": spec["target"],
+            "primary_target_horizon_sec": spec["primary_target_horizon_sec"],
+            "primary_target_horizon_name": spec["primary_target_horizon_name"],
+            "target_horizon_status": spec["target_horizon_status"],
+            "model_class": spec["model_class"],
+            "hyperparameters": spec["training_procedure"],
+            "training_period": "forward_after_capture",
+            "validation_period": "expanding_chrono_folds_purge_embargo_3h",
+            "locked_period": spec["acceptance"]["lock_cutoff"],
+            "result": spec["result"],
+            "promoted": False,
+            "notes": spec["notes"],
+            **spec,
+        },
+    )
+
+
 def persist_clock_v2_readiness(db_path: str | Path, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
     snap = snapshot or evaluate_clock_v2_readiness(db_path)
     record_planned_clock_v2_v2(db_path)
     record_planned_clock_v2_v3(db_path)
+    record_planned_clock_v2_v4(db_path)
     ensure_readiness_schema(db_path)
     conn = sqlite3.connect(str(db_path), timeout=30)
     try:
@@ -453,4 +491,5 @@ __all__ = [
     "persist_clock_v2_readiness",
     "record_planned_clock_v2_v2",
     "record_planned_clock_v2_v3",
+    "record_planned_clock_v2_v4",
 ]

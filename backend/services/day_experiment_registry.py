@@ -101,6 +101,20 @@ SEED_ARMS: tuple[ExperimentArm, ...] = (
         False,
         "Grouped-ranker readiness v3. TARGET_HORIZON_NOT_FROZEN. Does not mutate v1 or v2.",
     ),
+    ExperimentArm(
+        "M_clock_v2_planned_v4_20260904",
+        "2026-09-04",
+        "day_path_clock_v2_capture_1",
+        "expected_executable_net_bps",
+        "small_regularized_not_selected",
+        "not_fit",
+        "forward_after_capture",
+        "expanding_chrono_folds_purge_embargo_3h",
+        "forward_4h_entry_lock_20260903",
+        "PLANNED_NOT_RUN",
+        False,
+        "V4: horizon frozen at 3h (10800s) from pre-research DAY_HORIZONS_MIN design evidence. Does not mutate v1/v2/v3.",
+    ),
 )
 
 SCHEMA_SQL = f"""

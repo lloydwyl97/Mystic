@@ -321,7 +321,27 @@ CLOCK_V2_EFFECTIVE_FITTED_PARAMETERS = CLOCK_V2_INTERCEPT_COUNT + CLOCK_V2_NUMER
 CLOCK_V2_COST_CALIBRATION_PARAMETERS = 5  # 4 symbol spreads + 1 slippage; commission is known
 EVENTS_PER_PARAMETER = MIN_EVENTS_PER_FEATURE
 PLANNED_EXPERIMENT_ID_V3 = "M_clock_v2_planned_v3_20260905"
-TARGET_HORIZON_STATUS = "TARGET_HORIZON_NOT_FROZEN"
+PLANNED_EXPERIMENT_ID_V4 = "M_clock_v2_planned_v4_20260904"
+
+# Horizon freeze evidence (pre-existing, outcome-blind):
+# 1. scripts/train_day_path_net.py defines DAY_HORIZONS_MIN = (60, 120, 180) where
+#    180 is 180 1m-bars = 180 minutes = 3 clock hours. This is the design ceiling
+#    for DAY path prediction and predates clock-v2 research.
+# 2. models/day_path_net_v1.json stores primary_horizon_min=180, confirming the
+#    v1 artifact's horizon interpretation as 180 minutes.
+# 3. Verified: future = raw[i: i + max_h] uses 1m OHLCV rows, so 180 rows == 180 min.
+# 4. The 3h horizon is NOT selected from P&L inspection of locked outcomes;
+#    it is the inherited design ceiling from the pre-research training pipeline.
+PRIMARY_TARGET_HORIZON_SEC = 3 * 60 * 60  # 10800 seconds = 3 hours
+PRIMARY_TARGET_HORIZON_NAME = "3h"
+TARGET_HORIZON_STATUS = "PRIMARY_TARGET_HORIZON_3H"
+
+# Forming-candle contract:
+# Clock-v2 features use LAST CLOSED 1m candle only.
+# The forming (in-progress) bar for the current minute is excluded.
+# This is enforced by the kline pipeline: only x=True (closed) bars are written.
+# "last_close_at_or_before_cutoff" is the aggregation policy (see AGGREGATION).
+FORMING_CANDLE_ALLOWED = False
 
 
 def clock_v2_v3_parameter_contract() -> dict[str, Any]:
@@ -366,7 +386,8 @@ def clock_v2_v3_readiness_requirements() -> dict[str, Any]:
         "min_chronological_blocks_bookkeeping": MIN_CHRONOLOGICAL_BLOCKS,
         "block_definition": "UTC calendar day with >=1 decision group (bookkeeping only, not independent folds)",
         "validation_folds": "expanding chronological; grouped timestamp atomic; purge overlapping horizons; embargo >= max target horizon",
-        "target_horizon_status": TARGET_HORIZON_STATUS,
+        # V3 was frozen when the horizon was not yet decided; value is immutable.
+        "target_horizon_status": "TARGET_HORIZON_NOT_FROZEN",
         "train_blocked_until_horizon_frozen": True,
         "numeric_features_counted": CLOCK_V2_NUMERIC_FEATURE_COUNT,
         "categorical_parameters_counted": CLOCK_V2_CATEGORICAL_PARAMETER_COUNT,
@@ -420,7 +441,8 @@ def planned_challenger_specification_v3() -> dict[str, Any]:
         "categorical_encoding": "symbol dummies; HOLD omitted reference",
         "inputs": list(schema["inputs"]),
         "target": PRIMARY_TARGET,
-        "target_horizon_status": TARGET_HORIZON_STATUS,
+        # V3 was frozen before the horizon decision; status is immutable here.
+        "target_horizon_status": "TARGET_HORIZON_NOT_FROZEN",
         "target_contract": comparable_label_contract(),
         "actions": list(schema["actions"]),
         "hold_value_bps": 0.0,
@@ -465,5 +487,85 @@ def planned_challenger_specification_v3() -> dict[str, Any]:
         "statistical_contract": clock_v2_v3_parameter_contract(),
         "notes": (
             "V3 freezes grouped-ranker support before outcome research. Does not mutate M_clock_v2_planned_20260905 or M_clock_v2_planned_v2_20260905. TARGET_HORIZON_NOT_FROZEN blocks training."
+        ),
+    }
+
+
+def clock_v2_v4_readiness_requirements() -> dict[str, Any]:
+    """V4 readiness: v3 grouped-ranker numbers unchanged; horizon now frozen at 3h."""
+    v3 = clock_v2_v3_readiness_requirements()
+    return {
+        **v3,
+        "target_horizon_status": TARGET_HORIZON_STATUS,
+        "primary_target_horizon_sec": PRIMARY_TARGET_HORIZON_SEC,
+        "primary_target_horizon_name": PRIMARY_TARGET_HORIZON_NAME,
+        "embargo_seconds_min": max(PRIMARY_TARGET_HORIZON_SEC, *CLOCK_LABEL_HORIZONS_SEC.values()),
+        "purge_window_seconds": PRIMARY_TARGET_HORIZON_SEC,
+        "horizon_freeze_evidence": (
+            "scripts/train_day_path_net.py defines DAY_HORIZONS_MIN=(60,120,180) with 180 "
+            "as design ceiling; models/day_path_net_v1.json stores primary_horizon_min=180; "
+            "180 rows of 1m OHLCV == 180 minutes == 3 clock hours. "
+            "Horizon NOT selected from P&L inspection of locked outcomes."
+        ),
+        "horizon_not_chosen_by_pnl": True,
+    }
+
+
+def planned_challenger_specification_v4() -> dict[str, Any]:
+    """V4: same as v3 but target horizon is frozen at 3h. Does not mutate v1/v2/v3."""
+    req = clock_v2_v4_readiness_requirements()
+    schema = clock_challenger_export_schema()
+    return {
+        "experiment_id": PLANNED_EXPERIMENT_ID_V4,
+        "result": PLANNED_RESULT,
+        "promoted": False,
+        "train": False,
+        "live_gate": False,
+        "feature_set": f"{SCHEMA_VERSION}_capture_1",
+        "inputs": list(schema["inputs"]),
+        "target": PRIMARY_TARGET,
+        "primary_target_horizon_sec": PRIMARY_TARGET_HORIZON_SEC,
+        "primary_target_horizon_name": PRIMARY_TARGET_HORIZON_NAME,
+        "target_horizon_status": TARGET_HORIZON_STATUS,
+        "executable_price_method": EXECUTABLE_PRICE_METHOD,
+        "commission_methodology": "estimated_all_in_cost_bps from decision_book_tape spread at entry",
+        "spread_methodology": "recomputed from live bid/ask at decision time; stored in candidate artifact",
+        "slippage_methodology": "named expected_slippage_bps from entry telemetry",
+        "hold_value_bps": 0.0,
+        "actions": list(schema["actions"]),
+        "forming_candle_allowed": FORMING_CANDLE_ALLOWED,
+        "diagnostic_horizons": [k for k in CLOCK_LABEL_HORIZONS_SEC if k != PRIMARY_TARGET_HORIZON_NAME],
+        "diagnostic_horizons_not_alternate_targets": True,
+        "model_class": "small_regularized_not_selected",
+        "acceptance": {
+            **future_acceptance_bar(),
+            "primary_objective": "positive expected executable net after genuine costs",
+            "profit_factor_above_one": True,
+            "beats_current_champion": True,
+            "majority_chronological_folds": True,
+            "beats_hold_aware_baseline": True,
+            "positive_untouched_lock": True,
+            "drawdown_not_materially_worse": True,
+            "robust_under_conservative_spread_slippage": True,
+            "no_leakage": True,
+        },
+        "training_procedure": {
+            **planned_training_procedure(),
+            "executed": False,
+            "folds": "expanding_chronological",
+            "grouped_decision_timestamp_atomic": True,
+            "no_same_group_in_train_and_validation": True,
+            "purge_overlapping_label_horizons": True,
+            "embargo_seconds_min": req["embargo_seconds_min"],
+            "training_only_transforms": True,
+            "lock_inspection_during_development": False,
+            "untouched_lock_exactly_once": True,
+        },
+        "readiness_requirements": req,
+        "statistical_contract": clock_v2_v3_parameter_contract(),
+        "notes": (
+            "V4 freezes the primary target horizon at 3h based on pre-research design evidence "
+            "(DAY_HORIZONS_MIN max = 180 min). Does not mutate v1/v2/v3. "
+            "Diagnostic horizons (15m/30m/1h/2h/4h) are NOT selectable after performance inspection."
         ),
     }

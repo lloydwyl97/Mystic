@@ -65,9 +65,7 @@ def _build_db(path, *, groups: int = 3, traded_every: int = 1, with_telemetry: b
         "closed_at_epoch REAL, close_reason TEXT, manual_sell INT, realized_profit REAL, realized_profit_unknown INT, "
         "cooldown_until REAL, quantity REAL, entry_price REAL, exit_price REAL, sell_trade_id TEXT, detail TEXT)"
     )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS paper_trades (trade_id TEXT, symbol TEXT, side TEXT, quantity REAL, price REAL, remaining_position REAL)"
-    )
+    conn.execute("CREATE TABLE IF NOT EXISTS paper_trades (trade_id TEXT, symbol TEXT, side TEXT, quantity REAL, price REAL, remaining_position REAL)")
     conn.execute("CREATE TABLE IF NOT EXISTS portfolio_engine_positions (symbol TEXT, quantity REAL, entry_price REAL, status TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS portfolio_engine_ledger (id INTEGER PRIMARY KEY, total_equity REAL)")
     conn.execute("INSERT OR REPLACE INTO portfolio_engine_ledger (id,total_equity) VALUES (1, 1000.0)")
@@ -113,14 +111,12 @@ def _build_db(path, *, groups: int = 3, traded_every: int = 1, with_telemetry: b
         )
         for s in COINS:
             conn.execute(
-                f"INSERT INTO {TABLE_CANDIDATES} (decision_group_id, symbol, created_at, eligible, p_buy, path_ev, "
-                "final_rank_score, feature_json) VALUES (?,?,?,?,?,?,?,?)",
+                f"INSERT INTO {TABLE_CANDIDATES} (decision_group_id, symbol, created_at, eligible, p_buy, path_ev, final_rank_score, feature_json) VALUES (?,?,?,?,?,?,?,?)",
                 (gid, s, iso, 1, 0.6, 0.001, 0.7, json.dumps({"4h_entry_telemetry": _telemetry() if with_telemetry else {}})),
             )
         if traded:
             conn.execute(
-                "INSERT INTO position_close_ledger (symbol, closed_at_epoch, close_reason, realized_profit, quantity, "
-                "entry_price, exit_price, sell_trade_id, detail) VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO position_close_ledger (symbol, closed_at_epoch, close_reason, realized_profit, quantity, entry_price, exit_price, sell_trade_id, detail) VALUES (?,?,?,?,?,?,?,?,?)",
                 (symbol, created + 3600, "TRAILING_STOP_EXIT", 1.0, 1.0, 100.0, 101.0, f"sell_{index}", f"buy_trade_id={buy_id}"),
             )
     conn.commit()
@@ -263,10 +259,7 @@ def test_counterfactual_may_not_carry_production_fill_fields(tmp_path):
     _write_labels(db)
     assert check_counterfactual_integrity(load_state(db))["pass"] is True
     conn = sqlite3.connect(db)
-    conn.execute(
-        "UPDATE day_decision_outcome_labels SET exit_reason='TRAILING_STOP_EXIT', production_exit_net_bps=12.0 "
-        "WHERE decision_group_id='daygrp_0' AND symbol='ETHUSDT'"
-    )
+    conn.execute("UPDATE day_decision_outcome_labels SET exit_reason='TRAILING_STOP_EXIT', production_exit_net_bps=12.0 WHERE decision_group_id='daygrp_0' AND symbol='ETHUSDT'")
     conn.commit()
     conn.close()
     result = check_counterfactual_integrity(load_state(db))
@@ -334,16 +327,23 @@ def test_markout_horizons_are_isolated_from_later_bars():
     decision = 1_788_300_000.0
     bars = [(int(decision + 60 * i), 100.0, 100.0 + i * 0.01, 100.0, 100.0 + i * 0.01, 1.0) for i in range(300)]
     base = label_candidate(
-        decision_group_id="g", symbol="BTCUSDT", decision_epoch=decision, entry_px=100.0,
-        bars=bars, now_epoch=decision + 4 * 3600, break_seconds=None,
+        decision_group_id="g",
+        symbol="BTCUSDT",
+        decision_epoch=decision,
+        entry_px=100.0,
+        bars=bars,
+        now_epoch=decision + 4 * 3600,
+        break_seconds=None,
     )
-    mutated = [
-        b if b[0] <= decision + 1800 else (b[0], 9e5, 9e5, 9e5, 9e5, 1.0)
-        for b in bars
-    ]
+    mutated = [b if b[0] <= decision + 1800 else (b[0], 9e5, 9e5, 9e5, 9e5, 1.0) for b in bars]
     after = label_candidate(
-        decision_group_id="g", symbol="BTCUSDT", decision_epoch=decision, entry_px=100.0,
-        bars=mutated, now_epoch=decision + 4 * 3600, break_seconds=None,
+        decision_group_id="g",
+        symbol="BTCUSDT",
+        decision_epoch=decision,
+        entry_px=100.0,
+        bars=mutated,
+        now_epoch=decision + 4 * 3600,
+        break_seconds=None,
     )
     assert after["markouts"]["15m"] == base["markouts"]["15m"]
     assert after["markouts"]["30m"] == base["markouts"]["30m"]
@@ -355,8 +355,13 @@ def test_market_data_cutoff_covers_the_furthest_markout_consumed():
     decision = 1_788_300_000.0
     bars = [(int(decision + 60 * i), 100.0, 100.5, 99.5, 100.0 + i * 0.01, 1.0) for i in range(300)]
     label = label_candidate(
-        decision_group_id="g", symbol="BTCUSDT", decision_epoch=decision, entry_px=100.0, bars=bars,
-        now_epoch=decision + 4 * 3600, break_seconds=None,
+        decision_group_id="g",
+        symbol="BTCUSDT",
+        decision_epoch=decision,
+        entry_px=100.0,
+        bars=bars,
+        now_epoch=decision + 4 * 3600,
+        break_seconds=None,
         fill={"exit_epoch": decision + 600, "net_bps": 5.0, "gross_bps": 6.0, "exit_reason": "TRAILING_STOP_EXIT", "holding_seconds": 600},
     )
     from datetime import datetime

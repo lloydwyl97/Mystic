@@ -119,9 +119,7 @@ def _compact(features: dict[str, Any]) -> dict[str, Any]:
         "4h_range_position": features.get("position_within_current_4h_range"),
         "4h_alignment_state": features.get("4h_alignment_state"),
         "production_4h_break_true_at_decision": features.get("production_4h_break_true_now"),
-        "production_4h_intact_at_decision": features.get("production_4h_intact_at_decision")
-        if "production_4h_intact_at_decision" in features
-        else features.get("htf_4h_rise_intact"),
+        "production_4h_intact_at_decision": features.get("production_4h_intact_at_decision") if "production_4h_intact_at_decision" in features else features.get("htf_4h_rise_intact"),
         "minutes_into_4h_bar": features.get("minutes_into_current_4h_bar"),
         "distance_to_break_vs_cost": features.get("distance_to_break_vs_expected_cost"),
         "distance_to_break_vs_path_ev": features.get("distance_to_break_vs_path_ev"),

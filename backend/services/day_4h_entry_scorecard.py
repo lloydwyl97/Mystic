@@ -78,12 +78,9 @@ def load_scorecard_rows(db_path: str | Path, *, since: datetime | None = None) -
     conn = sqlite3.connect(str(db_path))
     try:
         groups = conn.execute(
-            "SELECT decision_group_id, created_at, selected_action, selected_symbol, contract_json, "
-            f"execute_authorized, fill_trade_id, lifecycle_state FROM {TABLE_GROUPS}"
+            f"SELECT decision_group_id, created_at, selected_action, selected_symbol, contract_json, execute_authorized, fill_trade_id, lifecycle_state FROM {TABLE_GROUPS}"
         ).fetchall()
-        cands = conn.execute(
-            f"SELECT decision_group_id, symbol, path_ev, p_buy, final_rank_score, feature_json FROM {TABLE_CANDIDATES}"
-        ).fetchall()
+        cands = conn.execute(f"SELECT decision_group_id, symbol, path_ev, p_buy, final_rank_score, feature_json FROM {TABLE_CANDIDATES}").fetchall()
         labels = conn.execute(
             f"SELECT decision_group_id, symbol, provenance, production_exit_net_bps, mfe_bps, mae_bps, cost_cover, exit_reason, regret_vs_hold_bps, label_json FROM {TABLE_LABELS}"
         ).fetchall()
@@ -253,11 +250,13 @@ def consistency_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "selected_closest_to_invalidation": pick(
             "selected closest to invalidation",
-            lambda r: selected_exec(r)
-            and tel(r).get("distance_to_4h_break_bps") is not None
-            and peer(r).get("healthiest_peer_distance_bps") is not None
-            and float(tel(r)["distance_to_4h_break_bps"]) <= float(peer(r)["healthiest_peer_distance_bps"])
-            and str(r.get("selected_symbol")) != str(peer(r).get("healthiest_peer_symbol")),
+            lambda r: (
+                selected_exec(r)
+                and tel(r).get("distance_to_4h_break_bps") is not None
+                and peer(r).get("healthiest_peer_distance_bps") is not None
+                and float(tel(r)["distance_to_4h_break_bps"]) <= float(peer(r)["healthiest_peer_distance_bps"])
+                and str(r.get("selected_symbol")) != str(peer(r).get("healthiest_peer_symbol"))
+            ),
         ),
         "selected_healthiest_structure": pick(
             "selected healthiest structure",
@@ -464,9 +463,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if lab is None:
             continue
         nets.append(_num(lab.get("production_exit_net_bps")))
-        regrets.append(
-            _num(lab.get("regret_vs_hold_bps") if lab.get("regret_vs_hold_bps") is not None else lab.get("production_exit_net_bps"))
-        )
+        regrets.append(_num(lab.get("regret_vs_hold_bps") if lab.get("regret_vs_hold_bps") is not None else lab.get("production_exit_net_bps")))
     selected_metrics = _metrics(executed)
     near_break: dict[str, int] = {name: 0 for name, _lo, _hi in DISTANCE_BINS}
     near_break["unknown"] = 0

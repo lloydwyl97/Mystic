@@ -229,11 +229,7 @@ def label_candidate(
         markouts[name] = val
     # Callers that already scanned the tape (the offline runner) pass the result in so the
     # O(bars^2) reference scan is not repeated.
-    break_sec = (
-        first_4h_break_seconds(bars, decision_epoch=decision_epoch, end_epoch=end, seed_4h=seed_4h)
-        if break_seconds is NOT_SCANNED
-        else break_seconds
-    )
+    break_sec = first_4h_break_seconds(bars, decision_epoch=decision_epoch, end_epoch=end, seed_4h=seed_4h) if break_seconds is NOT_SCANNED else break_seconds
     mfe = extrema.get("mfe_bps")
     covered = bool(mfe is not None and mfe + 1e-12 >= cost)
     time_to_cover = None

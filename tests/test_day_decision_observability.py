@@ -134,9 +134,7 @@ def test_disabled_writes_nothing(tmp_path, monkeypatch):
     assert observability_enabled() is False
     db = str(tmp_path / "obs.db")
     assert record_day_ranking_group(db, decision=_decision(), bar_timestamp=1) is None
-    assert not os.path.exists(db) or sqlite3.connect(db).execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (TABLE_GROUPS,)
-    ).fetchone() is None
+    assert not os.path.exists(db) or sqlite3.connect(db).execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (TABLE_GROUPS,)).fetchone() is None
 
 
 def test_terminal_fill_failure_only_for_zero_fill_cancel():
@@ -237,9 +235,7 @@ def test_blocked_after_ranking_reason(tmp_path, monkeypatch):
         block_reason="NO_SLOT_OR_CAPITAL",
     )
     conn = sqlite3.connect(db)
-    payload = json.loads(
-        conn.execute(f"SELECT contract_json FROM {TABLE_GROUPS} WHERE decision_group_id=?", (gid,)).fetchone()[0]
-    )
+    payload = json.loads(conn.execute(f"SELECT contract_json FROM {TABLE_GROUPS} WHERE decision_group_id=?", (gid,)).fetchone()[0])
     conn.close()
     assert payload["lifecycle_state"] == "blocked_after_ranking"
     assert payload["block_reason"] == "NO_SLOT_OR_CAPITAL"
@@ -250,9 +246,7 @@ def test_partial_and_terminal_and_hold_lifecycle():
     from backend.services.day_decision_observability import classify_execute_lifecycle
 
     assert classify_execute_lifecycle(result=None, block_reason="SPREAD") == "blocked_after_ranking"
-    assert (
-        classify_execute_lifecycle(result={"status": "canceled", "filled_qty": 0, "requested_qty": 1}) == "terminal_fill_failure"
-    )
+    assert classify_execute_lifecycle(result={"status": "canceled", "filled_qty": 0, "requested_qty": 1}) == "terminal_fill_failure"
     assert classify_execute_lifecycle(result={"status": "filled", "filled_qty": 0.2, "requested_qty": 1}) == "partial_fill"
     assert classify_execute_lifecycle(result={"order_id": "o1", "status": "new"}) == "order_submitted"
     assert classify_execute_lifecycle(result={"trade_id": "t1", "filled_qty": 1, "requested_qty": 1}) == "filled"
