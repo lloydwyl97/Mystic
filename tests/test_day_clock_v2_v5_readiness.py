@@ -513,6 +513,15 @@ def test_retention_dry_run_reports_without_deleting(tmp_path):
     assert remaining == 8
 
 
+def test_hourly_logrotate_runner_exists_so_the_size_rule_is_not_cosmetic():
+    """logrotate.timer is daily; a 20 MB cap needs an hourly check to mean anything."""
+    from pathlib import Path
+
+    text = Path(__file__).resolve().parents[1].joinpath("deploy/cron.hourly-mystic-logrotate").read_text()
+    assert "/etc/logrotate.d/mystic" in text
+    assert "--state" in text
+
+
 def test_logrotate_config_is_bounded_and_uses_copytruncate():
     from pathlib import Path
 
