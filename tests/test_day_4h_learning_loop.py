@@ -218,6 +218,8 @@ def test_experiment_and_lock_registries_are_protected_not_expired():
     keep = {p.table: p.keep_days for p in RETENTION_POLICIES}
     assert "day_experiment_registry" not in keep
     assert "day_forward_lock_registry" not in keep
+    assert "day_clock_v2_partition_registry" not in keep
+    assert "day_clock_v2_outcome_labels" not in keep
     assert set(PROTECTED_TABLES) == {
         "day_experiment_registry",
         "day_forward_lock_registry",
@@ -225,6 +227,8 @@ def test_experiment_and_lock_registries_are_protected_not_expired():
         "day_path_clock_readiness_history",
         "day_path_clock_v2_candidate_artifact",
         "day_path_clock_v2_readiness_history",
+        "day_clock_v2_partition_registry",
+        "day_clock_v2_outcome_labels",
     }
 
 

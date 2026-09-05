@@ -34,12 +34,35 @@ class RetentionPolicy:
     table: str
     ts_column: str
     keep_days: int
-    cutoff_format: str  # "iso_utc" | "feature_ohlcv"
+    cutoff_format: str  # "iso_utc" | "feature_ohlcv" | "epoch_seconds"
+
+
+# Documented justification for each window. Retention length is chosen from
+# reproducibility requirements, the maximum research horizon, and operational
+# debug needs — never from disk pressure alone.
+RETENTION_JUSTIFICATION: dict[str, str] = {
+    "microstructure_feature_snapshots": (
+        "Write-only SCALP microstructure telemetry: the only code that touches this table is "
+        "microstructure_engine (CREATE/INDEX/INSERT); nothing in backend, scripts or tests ever "
+        "SELECTs it, no research artifact or sealed lock references it, and it is neither "
+        "protected nor lock-dependent. 14 days is two full weeks of order-book debugging, far "
+        "beyond the longest research label horizon in the system (4h) and beyond the DAY "
+        "position lifecycle. At ~67k rows/day and ~4.6 KB/row it is 81.6% of the database."
+    ),
+    "scalp_shadow_rejects": (
+        "SCALP shadow gate telemetry sampled per rejected setup. Not an order, fill, accounting "
+        "or clock-v2 artifact and not referenced by any sealed lock. 30 days keeps a full month "
+        "of gate-behaviour history for SCALP diagnosis."
+    ),
+}
 
 
 RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     RetentionPolicy("ai_inference_log", "ts_utc", 90, "iso_utc"),
     RetentionPolicy("ai_context_snapshots", "ts_utc", 30, "iso_utc"),
+    # 81.6% of the database and ~306 MB/day. Write-only telemetry with no reader.
+    RetentionPolicy("microstructure_feature_snapshots", "ts_utc", 14, "epoch_seconds"),
+    RetentionPolicy("scalp_shadow_rejects", "created_at", 30, "iso_utc"),
     # strategy_runtime_audit writes ~160k rows/day — keep only 3 days (~480k rows max)
     RetentionPolicy("strategy_runtime_audit", "ts_utc", 3, "iso_utc"),
     RetentionPolicy("feature_ohlcv", "ts", 90, "feature_ohlcv"),
@@ -68,6 +91,10 @@ PROTECTED_TABLES: frozenset[str] = frozenset(
         "day_path_clock_readiness_history",
         "day_path_clock_v2_candidate_artifact",
         "day_path_clock_v2_readiness_history",
+        # CLOCK-V2 v5 authority: the partition contract and the 3h research target.
+        # Deleting either would make the v5 development dataset unreproducible.
+        "day_clock_v2_partition_registry",
+        "day_clock_v2_outcome_labels",
     }
 )
 
@@ -106,10 +133,12 @@ def _iso_to_dt(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _cutoff_value(policy: RetentionPolicy) -> str:
+def _cutoff_value(policy: RetentionPolicy) -> str | float:
     cutoff_dt = datetime.now(timezone.utc) - timedelta(days=policy.keep_days)
     if policy.cutoff_format == "feature_ohlcv":
         return cutoff_dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+    if policy.cutoff_format == "epoch_seconds":
+        return cutoff_dt.timestamp()
     return cutoff_dt.isoformat()
 
 
@@ -132,13 +161,13 @@ def lock_floor(conn: sqlite3.Connection) -> str | None:
     return min(floors) if floors else None
 
 
-def effective_cutoff(conn: sqlite3.Connection, policy: RetentionPolicy) -> tuple[str, str | None]:
+def effective_cutoff(conn: sqlite3.Connection, policy: RetentionPolicy) -> tuple[str | float, str | None]:
     """Policy cutoff, clamped back to the lock floor for lock-dependent learning tables."""
     cutoff = _cutoff_value(policy)
     if policy.table not in LOCK_DEPENDENT_TABLES:
         return cutoff, None
     floor = lock_floor(conn)
-    if floor and floor < cutoff:
+    if floor and isinstance(cutoff, str) and floor < cutoff:
         return floor, floor
     return cutoff, floor
 
@@ -168,7 +197,13 @@ def retention_dry_run(db_path: str | Path) -> dict[str, Any]:
                 rows = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
                 out["tables"][table] = {"status": "protected", "rows": rows, "rows_to_delete": 0}
         for policy in RETENTION_POLICIES:
-            entry: dict[str, Any] = {"keep_days": policy.keep_days, "ts_column": policy.ts_column}
+            entry: dict[str, Any] = {
+                "keep_days": policy.keep_days,
+                "ts_column": policy.ts_column,
+                "cutoff_format": policy.cutoff_format,
+            }
+            if policy.table in RETENTION_JUSTIFICATION:
+                entry["justification"] = RETENTION_JUSTIFICATION[policy.table]
             out["tables"][policy.table] = entry
             if not _table_exists(conn, policy.table):
                 entry["status"] = "skipped"
