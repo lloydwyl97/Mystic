@@ -430,6 +430,23 @@ def test_research_cycle_tolerates_bad_path():
     assert run_clock_v2_v5_cycle("")["labels_written"] == 0
 
 
+def test_label_table_exists_before_the_first_label_matures(tmp_path):
+    """The v5 label authority must be present as soon as the contract is live."""
+    from backend.services.day_clock_v2_labels import run_v5_label_batch
+
+    db = tmp_path / "labels.db"
+    out = run_v5_label_batch(db)
+    assert out["labels_written"] == 0
+    conn = sqlite3.connect(str(db))
+    try:
+        found = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE_V5_LABELS,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert found is not None
+
+
 # --- retention protections ---
 
 

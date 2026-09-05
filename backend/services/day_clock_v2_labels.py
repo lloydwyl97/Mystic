@@ -324,6 +324,15 @@ def run_v5_label_batch(db_path: str | Path, *, limit: int = DEFAULT_BATCH, now: 
     if not labels_enabled() or not db_path:
         return summary
     try:
+        # Create the target table up front so the v5 label authority exists and is
+        # inspectable from the moment the contract goes live, not only once the
+        # first DEVELOPMENT group matures three hours later.
+        ensure_v5_label_schema(db_path)
+    except Exception as exc:
+        logger.warning("DAY_CLOCK_V2_LABEL schema init failed: %s", exc)
+        summary["errors"] += 1
+        return summary
+    try:
         pending = _load_pending_groups(db_path, limit=limit)
     except Exception as exc:
         logger.warning("DAY_CLOCK_V2_LABEL scan failed: %s", exc)
