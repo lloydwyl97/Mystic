@@ -87,6 +87,20 @@ SEED_ARMS: tuple[ExperimentArm, ...] = (
         False,
         "Corrected clock-v2 readiness: complete groups required. Does not mutate M_clock_v2_planned_20260905.",
     ),
+    ExperimentArm(
+        "M_clock_v2_planned_v3_20260905",
+        "2026-09-05",
+        "day_path_clock_v2_capture_1",
+        "expected_executable_net_bps",
+        "small_regularized_not_selected",
+        "not_fit",
+        "forward_after_capture",
+        "expanding_chrono_folds_purge_embargo_pending_horizon",
+        "forward_4h_entry_lock_20260903",
+        "PLANNED_NOT_RUN",
+        False,
+        "Grouped-ranker readiness v3. TARGET_HORIZON_NOT_FROZEN. Does not mutate v1 or v2.",
+    ),
 )
 
 SCHEMA_SQL = f"""

@@ -517,21 +517,90 @@ def build_candidate_artifact(
     return artifact
 
 
+ELIGIBLE_REQUIRED_FIELDS: tuple[str, ...] = REQUIRED_CLOCK_V2_FIELDS
+INELIGIBLE_REQUIRED_FIELDS: tuple[str, ...] = ("symbol", "eligible", "eligibility_reason")
+HOLD_REQUIRED_ZERO_FIELDS: tuple[str, ...] = ("legacy_path_ev", "final_rank_score", "spread_bps", "estimated_all_in_cost_bps")
+
+
+def eligible_candidate_missing(art: dict[str, Any]) -> list[str]:
+    feats = art.get("features") or {}
+    return [n for n in ELIGIBLE_REQUIRED_FIELDS if feats.get(n) is None]
+
+
+def hold_semantics_ok(art: dict[str, Any]) -> bool:
+    feats = art.get("features") or {}
+    if str(art.get("symbol")) != HOLD_SYMBOL:
+        return False
+    if art.get("eligible") is False:
+        return False
+    return all(float(feats.get(name) or 0.0) == 0.0 for name in HOLD_REQUIRED_ZERO_FIELDS)
+
+
+def ineligible_semantics_ok(art: dict[str, Any]) -> bool:
+    return (not art.get("eligible")) and bool(art.get("eligibility_reason"))
+
+
+def recompute_spread_bps(best_bid: Any, best_ask: Any, mid: Any = None) -> float | None:
+    """Production quote contract: (ask - bid) / mid * 10_000."""
+    bid = _num(best_bid)
+    ask = _num(best_ask)
+    mid_px = _num(mid)
+    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    if mid_px is None or mid_px <= 0:
+        mid_px = (bid + ask) / 2.0
+    return ((ask - bid) / mid_px) * 1e4
+
+
+def artifact_fingerprint(art: dict[str, Any]) -> str:
+    """Pre-decision challenger payload only. No outcomes."""
+    feats = art.get("features") or {}
+    quote = art.get("quote") or {}
+    payload = {
+        "symbol": art.get("symbol"),
+        "eligible": art.get("eligible"),
+        "eligibility_reason": art.get("eligibility_reason"),
+        "production_p_buy": art.get("production_p_buy"),
+        "shadow_candidate_p_buy": art.get("shadow_candidate_p_buy"),
+        "p_buy_provenance": art.get("p_buy_provenance"),
+        "inputs": {name: feats.get(name) for name in REQUIRED_CLOCK_V2_FIELDS},
+        "spread_bps": quote.get("spread_bps") if art.get("symbol") != HOLD_SYMBOL else feats.get("spread_bps"),
+        "best_bid": quote.get("best_bid"),
+        "best_ask": quote.get("best_ask"),
+        "mid": quote.get("mid"),
+    }
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
 def group_completeness(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
     """FEATURE_COMPLETE uses eligible actions only. Ineligible coins stay visible."""
     by_sym = {str(a["symbol"]): a for a in artifacts}
     hold = by_sym.get(HOLD_SYMBOL)
     coins = [by_sym.get(s) for s in COINS]
-    feature_ok = bool(hold and hold.get("symbol") == HOLD_SYMBOL)
+    rows_present = hold is not None and all(art is not None for art in coins)
+    hold_ok = bool(hold and hold_semantics_ok(hold))
+    feature_ok = hold_ok and rows_present
+    eligible_complete = 0
+    eligible_total = 0
     for art in coins:
         if art is None:
             feature_ok = False
             continue
         if art.get("eligible"):
-            required_missing = [n for n in REQUIRED_CLOCK_V2_FIELDS if (art.get("features") or {}).get(n) is None]
-            if required_missing:
+            eligible_total += 1
+            missing = eligible_candidate_missing(art)
+            if missing:
                 feature_ok = False
-        # ineligible: no fake features required
+            else:
+                eligible_complete += 1
+        elif not ineligible_semantics_ok(art):
+            feature_ok = False
+    if not rows_present or not hold_ok:
+        status = "UNUSABLE"
+    elif feature_ok:
+        status = "FEATURE_COMPLETE"
+    else:
+        status = "FEATURE_PARTIAL"
     rectangular = True
     for art in coins:
         if art is None:
@@ -542,12 +611,17 @@ def group_completeness(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
             rectangular = False
     return {
         "FEATURE_COMPLETE": feature_ok,
+        "FEATURE_PARTIAL": status == "FEATURE_PARTIAL",
+        "UNUSABLE": status == "UNUSABLE",
+        "status": status,
         "LABEL_COMPLETE": False,
         "FULLY_COMPARABLE": False,
         "eligible_symbols": [s for s in COINS if by_sym.get(s, {}).get("eligible")] + [HOLD_SYMBOL],
         "ineligible_symbols": [s for s in COINS if by_sym.get(s) and not by_sym[s].get("eligible")],
         "rectangular_feature_complete": rectangular,
-        "hold_available": True,
+        "hold_available": hold_ok,
+        "eligible_candidate_complete": eligible_complete,
+        "eligible_candidate_total": eligible_total,
     }
 
 
@@ -633,6 +707,7 @@ __all__ = [
     "FEATURE_CONTRACT_VERSION",
     "MISSINGNESS_CATEGORIES",
     "TABLE_ARTIFACT",
+    "artifact_fingerprint",
     "build_candidate_artifact",
     "capture_clock_v2_fail_open",
     "capture_clock_v2_group",
@@ -640,7 +715,11 @@ __all__ = [
     "classify_historical_clock",
     "classify_historical_p_buy",
     "classify_historical_spread",
+    "eligible_candidate_missing",
     "group_completeness",
+    "hold_semantics_ok",
+    "ineligible_semantics_ok",
     "read_decision_quote",
     "read_shadow_p_buy",
+    "recompute_spread_bps",
 ]

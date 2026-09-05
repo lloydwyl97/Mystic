@@ -311,3 +311,159 @@ def clock_v2_v2_readiness_requirements() -> dict[str, Any]:
         "events_per_numeric_feature": MIN_EVENTS_PER_FEATURE,
         "why_multiplier_uses_14": ("14 is the numeric clock-v2 field count after excluding categorical symbol. It matches the generic 140 number but the unit is complete groups, not fills."),
     }
+
+
+# V3: grouped-ranker contract. Does not mutate v1 or v2.
+# Observation unit is one decision timestamp. Four coins in one group are
+# one correlated observation, not four independent events.
+CLOCK_V2_INTERCEPT_COUNT = 1
+CLOCK_V2_EFFECTIVE_FITTED_PARAMETERS = CLOCK_V2_INTERCEPT_COUNT + CLOCK_V2_NUMERIC_FEATURE_COUNT + CLOCK_V2_CATEGORICAL_PARAMETER_COUNT  # 19
+CLOCK_V2_COST_CALIBRATION_PARAMETERS = 5  # 4 symbol spreads + 1 slippage; commission is known
+EVENTS_PER_PARAMETER = MIN_EVENTS_PER_FEATURE
+PLANNED_EXPERIMENT_ID_V3 = "M_clock_v2_planned_v3_20260905"
+TARGET_HORIZON_STATUS = "TARGET_HORIZON_NOT_FROZEN"
+
+
+def clock_v2_v3_parameter_contract() -> dict[str, Any]:
+    """Outcome-blind parameter accounting for a grouped action ranker."""
+    return {
+        "decision_group_unit": "one DAY ranking timestamp; BTC/ETH/SOL/XRP/HOLD share one information set",
+        "candidates_in_a_group_are_not_independent_events": True,
+        "intra_group_correlation": "same bar, shared BTC reference, shared quote time, shared capital/slot state",
+        "categorical_encoding": "symbol dummies for BTC/ETH/SOL/XRP; HOLD is the omitted reference action",
+        "numeric_feature_count": CLOCK_V2_NUMERIC_FEATURE_COUNT,
+        "categorical_parameter_count": CLOCK_V2_CATEGORICAL_PARAMETER_COUNT,
+        "intercept_count": CLOCK_V2_INTERCEPT_COUNT,
+        "effective_fitted_parameters": CLOCK_V2_EFFECTIVE_FITTED_PARAMETERS,
+        "events_per_parameter": EVENTS_PER_PARAMETER,
+        "why_not_4x": "four candidates at one timestamp are one grouped observation",
+        "chronological_dependence": "overlapping clock-horizon labels make nearby groups dependent until purged",
+        "label_overlap": "purge window equals the undeclared max clock horizon once a horizon is frozen",
+        "roles": {
+            "A_model_fitting_sample_support": "fully comparable independent decision groups",
+            "B_counterfactual_label_support": "same groups, same-horizon labels for every eligible action plus HOLD=0",
+            "C_executable_cost_calibration": "authoritative fills used only to check spread/slippage realism",
+            "D_production_lifecycle_validation": "real exits, separate from the ranking target",
+            "E_final_live_policy_validation": "untouched lock used once after development",
+        },
+        "generic_140_selected_fills": {
+            "justified_for": "D/E of a selected-trade 4H-entry predictor (generic day_model_readiness)",
+            "justified_as_clock_v2_fitting_sample": False,
+            "kept_unaltered_in_generic_gate": True,
+        },
+    }
+
+
+def clock_v2_v3_readiness_requirements() -> dict[str, Any]:
+    return {
+        "version": "v3",
+        "observation_unit": "independent_decision_group_after_purge",
+        "min_fully_comparable_independent_groups": CLOCK_V2_EFFECTIVE_FITTED_PARAMETERS * EVENTS_PER_PARAMETER,
+        "min_authoritative_fills_execution_calibration": CLOCK_V2_COST_CALIBRATION_PARAMETERS * EVENTS_PER_PARAMETER,
+        "generic_140_selected_fills_not_the_fitting_population": True,
+        "selected_trades_alone_insufficient": True,
+        "do_not_count_four_candidates_as_four_events": True,
+        "min_chronological_blocks_bookkeeping": MIN_CHRONOLOGICAL_BLOCKS,
+        "block_definition": "UTC calendar day with >=1 decision group (bookkeeping only, not independent folds)",
+        "validation_folds": "expanding chronological; grouped timestamp atomic; purge overlapping horizons; embargo >= max target horizon",
+        "target_horizon_status": TARGET_HORIZON_STATUS,
+        "train_blocked_until_horizon_frozen": True,
+        "numeric_features_counted": CLOCK_V2_NUMERIC_FEATURE_COUNT,
+        "categorical_parameters_counted": CLOCK_V2_CATEGORICAL_PARAMETER_COUNT,
+        "effective_fitted_parameters": CLOCK_V2_EFFECTIVE_FITTED_PARAMETERS,
+        "cost_calibration_parameters": CLOCK_V2_COST_CALIBRATION_PARAMETERS,
+        "events_per_parameter": EVENTS_PER_PARAMETER,
+        "parameter_contract": clock_v2_v3_parameter_contract(),
+        "why_training_n_uses_19x10": (
+            "19 = 1 intercept + 14 numeric clock-v2 fields + 4 symbol dummies. "
+            "10 events per parameter is the conventional linear-support rule. "
+            "The event is a purged decision group, not a selected fill and not a candidate row."
+        ),
+        "why_fill_n_uses_5x10": ("Executable-cost calibration has 5 free parameters (4 symbol spreads + slippage). Commission is a known exchange constant. This is not a lowered 140."),
+        "missing_data_policy": MISSING_POLICY,
+        "locked_test_rule": "feature capture allowed; outcomes uninspected until a later explicit task; lock used once",
+    }
+
+
+def comparable_label_contract() -> dict[str, Any]:
+    return {
+        "primary_target": PRIMARY_TARGET,
+        "target_horizon_status": TARGET_HORIZON_STATUS,
+        "horizon_outputs_are_not_the_same_target": True,
+        "available_clock_horizons_sec": dict(CLOCK_LABEL_HORIZONS_SEC),
+        "combination_rule": None,
+        "same_for_every_eligible_coin": {
+            "horizon": "undeclared_until_frozen",
+            "price_methodology": EXECUTABLE_PRICE_METHOD,
+            "commission_methodology": "expected_exchange_commission_rt",
+            "spread_methodology": "decision_time_quote_spread_bps",
+            "slippage_methodology": "expected_slippage_rt",
+        },
+        "HOLD_bps": 0.0,
+        "production_lifecycle_is_separate_validation": True,
+        "do_not_mix_production_exit_with_clock_markout_in_ranking_target": True,
+    }
+
+
+def planned_challenger_specification_v3() -> dict[str, Any]:
+    """Corrected grouped-ranker readiness. Does not mutate v1 or v2."""
+    schema = clock_challenger_export_schema()
+    req = clock_v2_v3_readiness_requirements()
+    return {
+        "experiment_id": PLANNED_EXPERIMENT_ID_V3,
+        "result": PLANNED_RESULT,
+        "promoted": False,
+        "train": False,
+        "live_gate": False,
+        "feature_set": f"{SCHEMA_VERSION}_capture_1",
+        "feature_schema": list(schema["inputs"]),
+        "categorical_encoding": "symbol dummies; HOLD omitted reference",
+        "inputs": list(schema["inputs"]),
+        "target": PRIMARY_TARGET,
+        "target_horizon_status": TARGET_HORIZON_STATUS,
+        "target_contract": comparable_label_contract(),
+        "actions": list(schema["actions"]),
+        "hold_value_bps": 0.0,
+        "model_class": "small_regularized_not_selected",
+        "decision_group_unit": "one ranking timestamp",
+        "minimum_trainable_comparable_groups": req["min_fully_comparable_independent_groups"],
+        "minimum_authoritative_real_fill_support": req["min_authoritative_fills_execution_calibration"],
+        "minimum_chronological_span": "5 UTC calendar-day blocks (bookkeeping) plus expanding purged folds",
+        "fold_construction": "expanding chronological",
+        "purge_window": "max target horizon once frozen; blocked while TARGET_HORIZON_NOT_FROZEN",
+        "embargo": ">= max target horizon once frozen",
+        "missingness_policy": MISSING_POLICY,
+        "cost_calibration_method": "authoritative fills vs decision-time quote spread and named slippage; never substitute estimated_all_in_cost_bps for spread",
+        "locked_test_rule": req["locked_test_rule"],
+        "acceptance": {
+            **future_acceptance_bar(),
+            "primary_objective": "positive expected executable net after genuine costs",
+            "profit_factor_above_one": True,
+            "beats_current_champion": True,
+            "majority_chronological_folds": True,
+            "beats_hold_aware_baseline": True,
+            "positive_untouched_lock": True,
+            "drawdown_not_materially_worse": True,
+            "robust_under_conservative_spread_slippage": True,
+            "no_leakage": True,
+            "win_rate_is_diagnostic_not_objective": True,
+        },
+        "training_procedure": {
+            **planned_training_procedure(),
+            "executed": False,
+            "folds": "expanding_chronological",
+            "grouped_decision_timestamp_atomic": True,
+            "no_same_group_in_train_and_validation": True,
+            "purge_overlapping_label_horizons": True,
+            "embargo_seconds_min": None,
+            "embargo_pending_horizon_freeze": True,
+            "training_only_transforms": True,
+            "lock_inspection_during_development": False,
+            "untouched_lock_exactly_once": True,
+        },
+        "readiness_requirements": req,
+        "statistical_contract": clock_v2_v3_parameter_contract(),
+        "notes": (
+            "V3 freezes grouped-ranker support before outcome research. Does not mutate M_clock_v2_planned_20260905 or M_clock_v2_planned_v2_20260905. TARGET_HORIZON_NOT_FROZEN blocks training."
+        ),
+    }

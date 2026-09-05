@@ -28,12 +28,16 @@ from backend.services.day_path_clock_v2 import (
     CLOCK_V2_NUMERIC_FEATURE_COUNT,
     PLANNED_EXPERIMENT_ID,
     PLANNED_EXPERIMENT_ID_V2,
+    PLANNED_EXPERIMENT_ID_V3,
     PLANNED_RESULT,
     PRIMARY_TARGET,
     REQUIRED_CLOCK_V2_FIELDS,
+    TARGET_HORIZON_STATUS,
     clock_v2_statistical_contract,
     clock_v2_v2_readiness_requirements,
+    clock_v2_v3_readiness_requirements,
     planned_challenger_specification_v2,
+    planned_challenger_specification_v3,
 )
 from backend.services.day_path_clock_v2_capture import TABLE_ARTIFACT, group_completeness
 
@@ -108,6 +112,30 @@ def record_planned_clock_v2_v2(db_path: str | Path) -> None:
             "hyperparameters": spec["training_procedure"],
             "training_period": "forward_after_capture",
             "validation_period": "expanding_chrono_folds_purge_4h_embargo_4h",
+            "locked_period": spec["acceptance"]["lock_cutoff"],
+            "result": spec["result"],
+            "promoted": False,
+            "notes": spec["notes"],
+            **spec,
+        },
+    )
+
+
+def record_planned_clock_v2_v3(db_path: str | Path) -> None:
+    """Insert v3. Never overwrites v1 or v2."""
+    spec = planned_challenger_specification_v3()
+    seed_historical(db_path)
+    record_experiment(
+        db_path,
+        {
+            "experiment_id": spec["experiment_id"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "feature_set": spec["feature_set"],
+            "target": spec["target"],
+            "model_class": spec["model_class"],
+            "hyperparameters": spec["training_procedure"],
+            "training_period": "forward_after_capture",
+            "validation_period": "expanding_chrono_folds_purge_embargo_pending_horizon",
             "locked_period": spec["acceptance"]["lock_cutoff"],
             "result": spec["result"],
             "promoted": False,
@@ -193,7 +221,8 @@ def _load_labels_presence(db_path: str | Path) -> dict[tuple[str, str], dict[str
 
 def evaluate_clock_v2_readiness(db_path: str | Path, *, generic_state: dict[str, Any] | None = None) -> dict[str, Any]:
     """Separate gate. Generic day_model_readiness is unchanged."""
-    req = clock_v2_v2_readiness_requirements()
+    req_v2 = clock_v2_v2_readiness_requirements()
+    req = clock_v2_v3_readiness_requirements()
     artifacts = _load_artifacts(db_path)
     groups = _load_groups(db_path)
     labels = _load_labels_presence(db_path)
@@ -298,23 +327,26 @@ def evaluate_clock_v2_readiness(db_path: str | Path, *, generic_state: dict[str,
     generic_f = checks.get("F_accounting") or {}
     generic_h = checks.get("H_locked_test_protection") or {}
 
-    req_complete = int(req["min_feature_complete_groups"])
-    req_comparable = int(req["min_fully_comparable_labeled_groups"])
-    req_selected = int(req["min_authoritative_selected_trade_labels"])
+    req_complete = int(req["min_fully_comparable_independent_groups"])
+    req_comparable = int(req["min_fully_comparable_independent_groups"])
+    req_fills = int(req["min_authoritative_fills_execution_calibration"])
+    req_selected = int(req_v2["min_authoritative_selected_trade_labels"])
     span_days = ((last - first).total_seconds() / 86400.0) if first and last else 0.0
-    selected_only_insufficient = complete_feature_groups < req_complete or fully_comparable < req_comparable
+    horizon_frozen = req["target_horizon_status"] != TARGET_HORIZON_STATUS
     ok = (
         complete_feature_groups >= req_complete
         and fully_comparable >= req_comparable
-        and selected_auth >= req_selected
+        and selected_auth >= req_fills
         and len(blocks) >= MIN_CHRONOLOGICAL_BLOCKS
         and lock_inspected == 0
         and future_data == 0
         and bool(generic_f.get("pass", True))
-        and not selected_only_insufficient
+        and horizon_frozen
     )
-    # selected_auth reaching 140 never flips ok by itself: complete/comparable are required.
+    # Selected-trade counts never authorize research by themselves.
     if selected_auth >= req_selected and (complete_feature_groups < req_complete or fully_comparable < req_comparable):
+        ok = False
+    if not horizon_frozen:
         ok = False
 
     snapshot = {
@@ -324,10 +356,14 @@ def evaluate_clock_v2_readiness(db_path: str | Path, *, generic_state: dict[str,
         "train": False,
         "promoted": False,
         "original_planned_experiment": PLANNED_EXPERIMENT_ID,
-        "planned_experiment": PLANNED_EXPERIMENT_ID_V2,
+        "planned_experiment": PLANNED_EXPERIMENT_ID_V3,
+        "planned_experiment_v2": PLANNED_EXPERIMENT_ID_V2,
         "planned_result": PLANNED_RESULT,
         "target": PRIMARY_TARGET,
+        "target_horizon_status": TARGET_HORIZON_STATUS,
         "statistical_contract": clock_v2_statistical_contract(),
+        "v3_parameter_contract": req["parameter_contract"],
+        "requirements_v2_historical": req_v2,
         "requirements": req,
         "complete_feature_groups": complete_feature_groups,
         "complete_candidate_rows": sum(
@@ -370,6 +406,8 @@ def evaluate_clock_v2_readiness(db_path: str | Path, *, generic_state: dict[str,
         "future_data_rows": future_data,
         "generic_G_forward_span": generic_g.get("pass"),
         "generic_required_selected_trades": req_selected,
+        "v3_required_comparable_groups": req_complete,
+        "v3_required_calibration_fills": req_fills,
         "selected_trade_only_sufficient_for_ranker": False,
         "numeric_features_counted": CLOCK_V2_NUMERIC_FEATURE_COUNT,
         "groups_with_artifacts": len(by_group),
@@ -381,6 +419,7 @@ def evaluate_clock_v2_readiness(db_path: str | Path, *, generic_state: dict[str,
 def persist_clock_v2_readiness(db_path: str | Path, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
     snap = snapshot or evaluate_clock_v2_readiness(db_path)
     record_planned_clock_v2_v2(db_path)
+    record_planned_clock_v2_v3(db_path)
     ensure_readiness_schema(db_path)
     conn = sqlite3.connect(str(db_path), timeout=30)
     try:
@@ -413,4 +452,5 @@ __all__ = [
     "format_clock_v2_readiness",
     "persist_clock_v2_readiness",
     "record_planned_clock_v2_v2",
+    "record_planned_clock_v2_v3",
 ]

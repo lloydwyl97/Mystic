@@ -17,18 +17,22 @@ from backend.services.day_forward_lock import register_lock
 from backend.services.day_path_clock_pipeline import FORBIDDEN_OUTCOME_KEYS
 from backend.services.day_path_clock_v2_capture import (
     CANDIDATE_INELIGIBLE,
+    FEATURE_OHLCV_SOURCE,
+    KLINE_SOURCE,
     NO_QUOTE,
     NOT_COMPUTED_FOR_CANDIDATE,
     NOT_PERSISTED,
     SOURCE_DATA_GAP,
     SOURCE_DATA_STALE,
     TABLE_ARTIFACT,
+    artifact_fingerprint,
     build_candidate_artifact,
     capture_clock_v2_group,
     classify_historical_clock,
     classify_historical_p_buy,
     classify_historical_spread,
     group_completeness,
+    recompute_spread_bps,
 )
 from backend.services.day_path_input_validity import MAX_GAP_SEC, MAX_LAST_BAR_AGE_SEC
 from backend.services.day_path_net import predict_decision_net, reset_day_artifact_cache, resolve_day_path_ev
@@ -343,6 +347,115 @@ def test_golden_telemetry_off_vs_on_identity(tmp_path, monkeypatch):
     gid = record_day_ranking_group(db, decision=sel_on, bar_timestamp=int(t0.timestamp()))
     assert gid
     reset_day_artifact_cache()
+
+
+def test_pit_mutation_future_klines_do_not_change_artifact(monkeypatch):
+    as_of = datetime(2026, 9, 2, 13, 29, tzinfo=timezone.utc)
+    past = _dense_klines(90, start=as_of - timedelta(minutes=89))
+    redis = _redis_all(klines=dict.fromkeys(_COINS, past))
+    monkeypatch.setattr("backend.services.decision_book_tape.snapshot_book", _book)
+    contract = _contract(as_of=as_of, p_buys=dict.fromkeys(_COINS, 0.5))
+    before = build_candidate_artifact(contract, "BTCUSDT", redis_client=redis, as_of=as_of)
+    future = _dense_klines(20, start=as_of + timedelta(minutes=1), close0=50.0)
+    redis.strings = {k: json.dumps(past + future) for k in redis.strings}
+    after = build_candidate_artifact(contract, "BTCUSDT", redis_client=redis, as_of=as_of)
+    assert artifact_fingerprint(before) == artifact_fingerprint(after)
+    latest = datetime.fromisoformat(after["provenance"]["source_latest_ts"])
+    assert latest <= as_of
+
+
+def test_feature_ohlcv_fallback_same_clock_contract(tmp_path, monkeypatch):
+    as_of = datetime(2026, 9, 2, 13, 29, tzinfo=timezone.utc)
+    db = str(tmp_path / "ohlcv.db")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE feature_ohlcv (symbol TEXT, interval TEXT, ts TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL)")
+    t0 = as_of - timedelta(minutes=89)
+    px = 100.0
+    for i in range(90):
+        ts = t0 + timedelta(minutes=i)
+        px *= 1.00015
+        for sym in _COINS:
+            conn.execute(
+                "INSERT INTO feature_ohlcv VALUES (?,?,?,?,?,?,?,?)",
+                (sym, "1m", ts.isoformat(), px, px, px, px, 12.0),
+            )
+    conn.commit()
+    conn.close()
+    empty = FakeRedis(
+        hashes={f"ai_signal:day:{s}": {"prob_buy": "0.4"} for s in _COINS},
+        strings={f"klines:{s}:1m": None for s in _COINS},
+    )
+    monkeypatch.setattr("backend.services.decision_book_tape.snapshot_book", _book)
+    art = build_candidate_artifact(
+        _contract(as_of=as_of, p_buys={"BTCUSDT": 0.4}),
+        "BTCUSDT",
+        db_path=db,
+        redis_client=empty,
+        as_of=as_of,
+    )
+    assert art["provenance"]["kline_source"] == FEATURE_OHLCV_SOURCE
+    assert art["features"]["ret_5m"] is not None
+    latest = datetime.fromisoformat(art["provenance"]["source_latest_ts"])
+    assert latest <= as_of
+
+
+def test_redis_1m_preferred_when_present(monkeypatch):
+    as_of = datetime(2026, 9, 2, 13, 29, tzinfo=timezone.utc)
+    redis = _redis_all()
+    monkeypatch.setattr("backend.services.decision_book_tape.snapshot_book", _book)
+    art = build_candidate_artifact(
+        _contract(as_of=as_of, p_buys={"BTCUSDT": 0.5}),
+        "BTCUSDT",
+        redis_client=redis,
+        as_of=as_of,
+    )
+    assert art["provenance"]["kline_source"] == KLINE_SOURCE
+    assert art["provenance"]["observation_count"] >= 80
+
+
+def test_spread_recompute_matches_stored(monkeypatch):
+    as_of = datetime(2026, 9, 2, 13, 29, tzinfo=timezone.utc)
+    redis = _redis_all()
+    monkeypatch.setattr("backend.services.decision_book_tape.snapshot_book", _book)
+    art = build_candidate_artifact(
+        _contract(as_of=as_of, p_buys={"BTCUSDT": 0.5}),
+        "BTCUSDT",
+        redis_client=redis,
+        as_of=as_of,
+    )
+    q = art["quote"]
+    recomputed = recompute_spread_bps(q["best_bid"], q["best_ask"], q["mid"])
+    assert recomputed == q["spread_bps"]
+    assert art["features"]["estimated_all_in_cost_bps"] != q["spread_bps"]
+    assert q["quote_source"]
+    assert q["quote_timestamp"]
+
+
+def test_ineligible_null_clock_does_not_fail_group(monkeypatch):
+    as_of = datetime(2026, 9, 2, 13, 29, tzinfo=timezone.utc)
+    redis = _redis_all(klines={"BTCUSDT": _dense_klines(), "ETHUSDT": _gappy_klines(), "SOLUSDT": _gappy_klines(), "XRPUSDT": _gappy_klines()})
+    monkeypatch.setattr("backend.services.decision_book_tape.snapshot_book", _book)
+    contract = _contract(
+        as_of=as_of,
+        eligible={"BTCUSDT": True, "ETHUSDT": False, "SOLUSDT": False, "XRPUSDT": False},
+        p_buys={"BTCUSDT": 0.55},
+    )
+    arts = [build_candidate_artifact(contract, s, redis_client=redis, as_of=as_of) for s in (*_COINS, "HOLD")]
+    comp = group_completeness(arts)
+    assert comp["status"] == "FEATURE_COMPLETE"
+    assert comp["FEATURE_PARTIAL"] is False
+    assert arts[1]["eligible"] is False
+    assert arts[1]["features"]["ret_30m"] is None
+
+
+def test_eligible_stale_clock_is_partial(monkeypatch):
+    as_of = datetime(2026, 9, 2, 13, 29, tzinfo=timezone.utc)
+    redis = _redis_all(klines=dict.fromkeys(_COINS, _stale_klines()))
+    monkeypatch.setattr("backend.services.decision_book_tape.snapshot_book", _book)
+    arts = [build_candidate_artifact(_contract(as_of=as_of, p_buys=dict.fromkeys(_COINS, 0.4)), s, redis_client=redis, as_of=as_of) for s in (*_COINS, "HOLD")]
+    comp = group_completeness(arts)
+    assert comp["status"] == "FEATURE_PARTIAL"
+    assert comp["UNUSABLE"] is False
 
 
 def test_clock_modules_still_absent_from_live_authority():

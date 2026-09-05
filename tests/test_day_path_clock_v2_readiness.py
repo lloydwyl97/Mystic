@@ -11,22 +11,29 @@ from backend.services.day_experiment_registry import seed_historical
 from backend.services.day_forward_lock import challenger_export_schema
 from backend.services.day_model_readiness import MIN_EVENTS_PER_FEATURE
 from backend.services.day_path_clock_v2 import (
+    CLOCK_V2_EFFECTIVE_FITTED_PARAMETERS,
     CLOCK_V2_LISTED_INPUT_COUNT,
     CLOCK_V2_NUMERIC_FEATURE_COUNT,
     GENERIC_SELECTED_TRADE_LABEL_REQUIREMENT,
     PLANNED_EXPERIMENT_ID,
     PLANNED_EXPERIMENT_ID_V2,
+    PLANNED_EXPERIMENT_ID_V3,
     REQUIRED_CLOCK_V2_FIELDS,
+    TARGET_HORIZON_STATUS,
     clock_v2_statistical_contract,
     clock_v2_v2_readiness_requirements,
+    clock_v2_v3_parameter_contract,
+    clock_v2_v3_readiness_requirements,
     planned_challenger_specification,
     planned_challenger_specification_v2,
+    planned_challenger_specification_v3,
 )
 from backend.services.day_path_clock_v2_capture import capture_clock_v2_group
 from backend.services.day_path_clock_v2_readiness import (
     evaluate_clock_v2_readiness,
     persist_clock_v2_readiness,
     record_planned_clock_v2_v2,
+    record_planned_clock_v2_v3,
 )
 from tests.test_day_path_clock_v2_capture import _COINS, _book, _contract, _redis_all
 
@@ -114,3 +121,53 @@ def test_planned_v2_does_not_mutate_original(tmp_path):
     conn.close()
     assert v1 == ("PLANNED_NOT_RUN", 0)
     assert v2 == ("PLANNED_NOT_RUN", 0)
+
+
+def test_v3_parameter_count_and_group_unit():
+    params = clock_v2_v3_parameter_contract()
+    req = clock_v2_v3_readiness_requirements()
+    spec = planned_challenger_specification_v3()
+    assert CLOCK_V2_EFFECTIVE_FITTED_PARAMETERS == 19
+    assert params["effective_fitted_parameters"] == 19
+    assert params["candidates_in_a_group_are_not_independent_events"] is True
+    assert params["generic_140_selected_fills"]["justified_as_clock_v2_fitting_sample"] is False
+    assert req["min_fully_comparable_independent_groups"] == 190
+    assert req["min_authoritative_fills_execution_calibration"] == 50
+    assert req["target_horizon_status"] == TARGET_HORIZON_STATUS
+    assert req["train_blocked_until_horizon_frozen"] is True
+    assert spec["experiment_id"] == PLANNED_EXPERIMENT_ID_V3
+    assert spec["train"] is False
+    assert spec["promoted"] is False
+    assert spec["result"] == "PLANNED_NOT_RUN"
+    assert spec["target_horizon_status"] == TARGET_HORIZON_STATUS
+    v2 = clock_v2_v2_readiness_requirements()
+    assert v2["min_feature_complete_groups"] == 140
+    assert v2["min_authoritative_selected_trade_labels"] == 140
+
+
+def test_registry_v3_does_not_mutate_v1_or_v2(tmp_path):
+    db = str(tmp_path / "reg3.db")
+    seed_historical(db)
+    record_planned_clock_v2_v2(db)
+    record_planned_clock_v2_v3(db)
+    persist_clock_v2_readiness(db, snapshot={"DATA_READINESS": "FAIL", "train": False, "promoted": False})
+    conn = sqlite3.connect(db)
+    rows = {
+        eid: (result, promoted)
+        for eid, result, promoted in conn.execute(
+            f"SELECT experiment_id, result, promoted FROM {TABLE_REGISTRY} WHERE experiment_id IN (?,?,?)",
+            (PLANNED_EXPERIMENT_ID, PLANNED_EXPERIMENT_ID_V2, PLANNED_EXPERIMENT_ID_V3),
+        )
+    }
+    conn.close()
+    assert rows[PLANNED_EXPERIMENT_ID] == ("PLANNED_NOT_RUN", 0)
+    assert rows[PLANNED_EXPERIMENT_ID_V2] == ("PLANNED_NOT_RUN", 0)
+    assert rows[PLANNED_EXPERIMENT_ID_V3] == ("PLANNED_NOT_RUN", 0)
+
+
+def test_v3_horizon_blocks_training_even_if_counts_high():
+    spec = planned_challenger_specification_v3()
+    assert spec["training_procedure"]["executed"] is False
+    assert spec["train"] is False
+    req = clock_v2_v3_readiness_requirements()
+    assert req["target_horizon_status"] == "TARGET_HORIZON_NOT_FROZEN"
