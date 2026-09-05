@@ -138,6 +138,27 @@ def test_hold_selection_always_satisfies_invariant():
     assert out["pass"] is True
 
 
+def test_unknown_availability_is_not_a_violation():
+    """Legacy rows without path telemetry cannot say either way.
+
+    Reporting those as production defects would invent 288 defects that never
+    happened; they are excluded from trainable support instead.
+    """
+    rows = [{"symbol": "ETHUSDT", "action_available": None, "action_unavailable_reason": AVAILABILITY_UNKNOWN}]
+    out = selected_action_invariant(rows=rows, selected_symbol="ETHUSDT", filled=True)
+    assert out["pass"] is True
+    assert out["violations"] == []
+    assert out["availability_unverifiable"] is True
+    assert out["proven_production_defect"] is None
+
+
+def test_available_action_is_not_flagged_unverifiable():
+    rows = [{"symbol": "ETHUSDT", "action_available": True, "action_unavailable_reason": None}]
+    out = selected_action_invariant(rows=rows, selected_symbol="ETHUSDT", filled=True)
+    assert out["pass"] is True
+    assert out["availability_unverifiable"] is False
+
+
 # --- legacy candidate membership is a separate concept ---
 
 

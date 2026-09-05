@@ -92,51 +92,56 @@ def check_migration(db_path: str, scratch: Path) -> dict:
 def check_reconstruction(db_path: str) -> dict:
     conn = _ro(db_path)
     try:
-        groups = conn.execute(
-            "SELECT decision_group_id, selected_symbol, bar_timestamp FROM day_decision_group_records ORDER BY bar_timestamp"
-        ).fetchall()
-        by_group: dict[str, list[dict]] = {}
-        for row in conn.execute(f"SELECT * FROM {TABLE_CANDIDATES}"):
-            by_group.setdefault(row["decision_group_id"], []).append(dict(row))
-        clock_v2_ids = {
-            r[0] for r in conn.execute(f"SELECT DISTINCT decision_group_id FROM {TABLE_ARTIFACT}")
-        }
-        filled = {
+        groups = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT decision_group_id, selected_symbol, lifecycle_state, created_at, contract_json "
+                "FROM day_decision_group_records ORDER BY created_at"
+            )
+        ]
+        clock_v2_ids = {r[0] for r in conn.execute(f"SELECT DISTINCT decision_group_id FROM {TABLE_ARTIFACT}")}
+        flat_defective = {
             r[0]
             for r in conn.execute(
-                "SELECT decision_group_id FROM day_decision_group_records WHERE lifecycle_state IN ('filled','FILLED')"
+                f"SELECT c.decision_group_id FROM {TABLE_CANDIDATES} c "
+                "JOIN day_decision_group_records g ON g.decision_group_id = c.decision_group_id "
+                "AND c.symbol = g.selected_symbol WHERE c.eligible = 0 AND c.exclusion_reason = ?",
+                (NO_SCORED_CANDIDATE,),
             )
         }
     finally:
         conn.close()
 
-    status = Counter()
-    invariant = Counter()
-    defective_before = []
-    unresolved = []
+    status: Counter = Counter()
+    invariant: Counter = Counter()
+    lifecycles: Counter = Counter()
+    defective_before: list[dict] = []
+    unresolved: list[dict] = []
     fabricated_rank = 0
+    no_contract = 0
 
     for g in groups:
         gid = g["decision_group_id"]
-        rows = by_group.get(gid, [])
+        try:
+            contract = json.loads(g["contract_json"] or "{}")
+        except (TypeError, ValueError):
+            contract = {}
+        if not contract.get("candidates"):
+            no_contract += 1
+            continue
+
+        lifecycle = str(contract.get("final_lifecycle_state") or g["lifecycle_state"] or "")
+        lifecycles[lifecycle] += 1
+        selected = g["selected_symbol"]
         payload = {
             "decision_group_id": gid,
-            "selected_symbol": g["selected_symbol"],
-            "lifecycle_state": "filled" if gid in filled else "none",
-            "candidates": [
-                {
-                    "symbol": r.get("symbol"),
-                    "eligible": bool(r.get("eligible")),
-                    "exclusion_reason": r.get("exclusion_reason"),
-                    "path_input_valid": r.get("path_input_valid"),
-                    "path_ev": r.get("path_ev"),
-                    "final_rank_score": r.get("final_rank_score"),
-                }
-                for r in rows
-            ],
+            "selected_symbol": selected,
+            "lifecycle_state": lifecycle,
+            "open_symbols": contract.get("open_symbols") or [],
+            "slots_used": contract.get("slots_used"),
+            "slot_count": contract.get("slot_count"),
+            "candidates": contract["candidates"],
         }
-        sel = next((r for r in rows if r.get("symbol") == g["selected_symbol"]), None)
-        was_defective = bool(sel) and not sel.get("eligible") and sel.get("exclusion_reason") == NO_SCORED_CANDIDATE
 
         out = reconstruct_group_action_state(payload)
         status[out["reconstruction_status"]] += 1
@@ -144,31 +149,43 @@ def check_reconstruction(db_path: str) -> dict:
         fabricated_rank += sum(
             1 for r in out["rows"] if r.get("legacy_final_rank_score_valid") is False and r["symbol"] != "HOLD"
         )
-        if was_defective:
-            fixed = next((r for r in out["rows"] if r["symbol"] == g["selected_symbol"]), None)
+
+        if gid in flat_defective:
+            fixed = next((r for r in out["rows"] if r["symbol"] == selected), None)
             defective_before.append(
                 {
                     "group": gid,
-                    "symbol": g["selected_symbol"],
+                    "symbol": selected,
                     "clock_v2": gid in clock_v2_ids,
-                    "filled": gid in filled,
+                    "filled": lifecycle.lower() == "filled",
                     "available_after": None if fixed is None else fixed["action_available"],
                 }
             )
         if not out["selected_action_invariant"]["pass"]:
-            unresolved.append({"group": gid, "violations": out["selected_action_invariant"]["violations"]})
+            unresolved.append(
+                {
+                    "group": gid,
+                    "selected": selected,
+                    "violations": out["selected_action_invariant"]["violations"],
+                    "proven_defect": out["selected_action_invariant"].get("proven_production_defect"),
+                }
+            )
 
     repaired = [d for d in defective_before if d["available_after"] is True]
     return {
         "groups_total": len(groups),
+        "groups_without_contract_json": no_contract,
         "clock_v2_groups": len(clock_v2_ids),
+        "lifecycle_states": dict(lifecycles),
         "reconstruction_status": dict(status),
         "pit_reconstructable": status.get(RECONSTRUCTED_PIT, 0),
         "selected_action_invariant": dict(invariant),
         "defective_selected_before": len(defective_before),
         "defective_repaired": len(repaired),
+        "defective_still_unavailable": len(defective_before) - len(repaired),
         "defective_by_symbol": Counter(d["symbol"] for d in defective_before).most_common(),
         "defective_filled": sum(1 for d in defective_before if d["filled"]),
+        "defective_in_clock_v2": sum(1 for d in defective_before if d["clock_v2"]),
         "fabricated_rank_scores_nulled": fabricated_rank,
         "unresolved_invariant_failures": unresolved[:5],
     }
@@ -179,9 +196,11 @@ def main() -> int:
     scratch = Path("/tmp/clock_v2_migration_scratch.db")
     report = {
         "db": db,
+        # This script opens the production database read-only. It says nothing about
+        # whether the running service has already applied the additive migration.
+        "written_by_this_script": False,
         "migration": check_migration(db, scratch),
         "reconstruction": check_reconstruction(db),
-        "production_db_written": False,
     }
     print(json.dumps(report, indent=2, default=str))
     return 0

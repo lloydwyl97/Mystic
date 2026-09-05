@@ -309,13 +309,16 @@ def selected_action_invariant(
     reason = str(row.get("action_unavailable_reason") or "")
     violations: list[str] = []
     defect: str | None = None
-    if available is not True:
+    # None means the point-in-time record cannot say either way. That is a capture
+    # limitation of legacy rows, not a claim that production selected a blocked
+    # action, so it must not be reported as a violation. Such groups are already
+    # excluded from trainable support by their reconstruction status.
+    unverifiable = available is None
+    if available is False:
         if reason in HARD_UNAVAILABLE_REASONS:
             # Production selected an action a hard gate had already closed.
             defect = f"PRODUCTION_SELECTED_HARD_BLOCKED_ACTION:{reason}"
-            violations.append(VIOLATION_SELECTED_UNAVAILABLE)
-        else:
-            violations.append(VIOLATION_SELECTED_UNAVAILABLE)
+        violations.append(VIOLATION_SELECTED_UNAVAILABLE)
         if reason in LEGACY_MEMBERSHIP_REASONS:
             violations.append(VIOLATION_LEGACY_MEMBERSHIP_USED_AS_AVAILABILITY)
         if filled:
@@ -327,6 +330,7 @@ def selected_action_invariant(
         "action_available": available,
         "action_unavailable_reason": row.get("action_unavailable_reason"),
         "legacy_rank_candidate_present": row.get("legacy_rank_candidate_present"),
+        "availability_unverifiable": unverifiable,
         "violations": violations,
         "proven_production_defect": defect,
     }
