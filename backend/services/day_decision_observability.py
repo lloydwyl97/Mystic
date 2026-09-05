@@ -413,11 +413,7 @@ def build_group_contract(
     if bar_timestamp is not None:
         group_id = f"daygrp_{int(bar_timestamp)}"
     else:
-        group_id = str(
-            dec.get("decision_group_id")
-            or dec.get("decision_id")
-            or f"daygrp_{dec.get('prediction_timestamp') or _now_iso()}"
-        )
+        group_id = str(dec.get("decision_group_id") or dec.get("decision_id") or f"daygrp_{dec.get('prediction_timestamp') or _now_iso()}")
     cand_map = _candidate_map(candidates)
     model_version = str(dec.get("path_net_model_id") or dec.get("forward_net_model_version") or "")
     acct = dict(account_state or _account_state(engine))
@@ -691,6 +687,12 @@ def record_day_ranking_group(
             conn.commit()
         finally:
             conn.close()
+        try:
+            from backend.services.day_path_clock_v2_capture import capture_clock_v2_fail_open
+
+            capture_clock_v2_fail_open(db_path, contract)
+        except Exception as cap_exc:
+            logger.warning("DAY_CLOCK_V2_CAPTURE hook failed: %s", cap_exc)
         return str(contract["decision_group_id"])
     except Exception as exc:
         logger.warning("DAY_DECISION_OBSERVABILITY record failed: %s", exc)

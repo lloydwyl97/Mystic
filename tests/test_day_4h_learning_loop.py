@@ -223,6 +223,8 @@ def test_experiment_and_lock_registries_are_protected_not_expired():
         "day_forward_lock_registry",
         "day_path_clock_feature_snapshots",
         "day_path_clock_readiness_history",
+        "day_path_clock_v2_candidate_artifact",
+        "day_path_clock_v2_readiness_history",
     }
 
 

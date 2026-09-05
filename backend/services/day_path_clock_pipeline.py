@@ -172,7 +172,7 @@ def _candidate_context(contract: dict[str, Any], cand_row: dict[str, Any], symbo
         "final_rank_score": cand_row.get("final_rank_score"),
         "structure": fourh,
         "eligible": cand_row.get("eligible", 1) not in (0, False),
-        "spread_bps": fourh.get("spread_bps") or contract.get("spread_bps"),
+        "spread_bps": cand_row.get("spread_bps") if cand_row.get("spread_bps") not in (None, "") else (fourh.get("spread_bps") if fourh.get("spread_bps") not in (None, "") else None),
     }
 
 

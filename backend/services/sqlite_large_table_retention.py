@@ -66,6 +66,8 @@ PROTECTED_TABLES: frozenset[str] = frozenset(
         "day_forward_lock_registry",
         "day_path_clock_feature_snapshots",
         "day_path_clock_readiness_history",
+        "day_path_clock_v2_candidate_artifact",
+        "day_path_clock_v2_readiness_history",
     }
 )
 
