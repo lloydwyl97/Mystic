@@ -404,3 +404,143 @@ async def test_flush_clears_forming_candle():
     await h._flush_closed_kline("BTCUSDT", k)
     # In-memory candle must be cleared so next miniTicker starts fresh
     assert "BTCUSDT" not in h._c1m
+
+
+# ---------------------------------------------------------------------------
+# 14. miniTicker new-minute crossing must NOT write to Redis (dual-write fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_miniticker_new_minute_does_not_write_to_redis():
+    """miniTicker crossing a minute boundary must NOT persist any closed bar.
+
+    Closed bars are exclusively persisted by _flush_closed_kline (kline x=True).
+    This is the direct fix for the observed BTC/XRP duplicate timestamps and
+    ETH/SOL zero-volume entries that appeared post-reconnect-fix deployment.
+    """
+    store: dict[str, Any] = {}
+    h = _make_hydrator(store)
+    # Use 60-second-aligned boundaries: 1_001_040 / 60 == 16684 exactly.
+    ts_x = 1_001_040  # minute X open timestamp (60-aligned)
+    ts_x1 = ts_x + 60  # minute X+1 open timestamp = 1_001_100
+
+    # Seed a forming candle for minute X
+    h._c1m["BTCUSDT"] = [float(ts_x), 100.0, 101.0, 99.0, 100.5, 0.0]
+
+    # miniTicker tick arrives mid-minute X+1 — should only start new forming candle
+    await h._update_candles("BTCUSDT", float(ts_x1) + 0.5, 100.6)
+
+    # Redis must be completely untouched; closed bar has NOT arrived via kline yet
+    assert "klines:BTCUSDT:1m" not in store, (
+        "_update_candles must not write to Redis; closed bars are kline-stream-only"
+    )
+    # New forming candle must be started for minute X+1
+    assert int(h._c1m.get("BTCUSDT", [0])[0]) == ts_x1
+
+
+# ---------------------------------------------------------------------------
+# 15. _append_candle upserts by timestamp (replaces, does not duplicate)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_append_candle_upserts_by_timestamp():
+    """If a row with the same open-timestamp already exists, it is replaced in-place."""
+    store: dict[str, Any] = {}
+    h = _make_hydrator(store)
+    bar_ts = 1_001_060
+
+    # Write an initial bar (simulates miniTicker-derived entry or earlier write)
+    initial = [float(bar_ts), 100.0, 101.0, 99.0, 100.5, 0.0]  # zero volume — miniTicker
+    await h._append_candle("BTCUSDT", "1m", initial)
+    arr = json.loads(store["klines:BTCUSDT:1m"])
+    assert len(arr) == 1
+    assert float(arr[0][5]) == 0.0  # volume was zero
+
+    # Authoritative kline arrives for same timestamp with real volume
+    authoritative = [float(bar_ts), 100.1, 101.2, 99.1, 100.6, 7.5]
+    await h._append_candle("BTCUSDT", "1m", authoritative)
+
+    arr2 = json.loads(store["klines:BTCUSDT:1m"])
+    assert len(arr2) == 1, "upsert must replace, not append — no duplicate timestamps"
+    assert float(arr2[0][4]) == 100.6, "close from authoritative bar must replace earlier"
+    assert float(arr2[0][5]) == 7.5, "real volume must replace zero-volume miniTicker entry"
+
+
+# ---------------------------------------------------------------------------
+# 16. Volume authority: genuine zero-volume exchange bar must be preserved
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_genuine_zero_volume_exchange_bar_preserved():
+    """A Binance 1m bar with v=0 (genuine idle minute) must be written, not rejected.
+
+    Zero-close rejection (c=0) is the only fabrication guard.  A bar where
+    close > 0 but volume == 0 is a legitimate Binance exchange bar (no trades
+    that minute at any price) and must be preserved exactly as-is.
+    """
+    store: dict[str, Any] = {}
+    h = _make_hydrator(store)
+    bar_ts = 1_001_120
+
+    k = _make_kline_payload("BTCUSDT", bar_ts, c=100.5, v=0.0, closed=True)["k"]
+    await h._flush_closed_kline("BTCUSDT", k)
+
+    assert "klines:BTCUSDT:1m" in store
+    arr = json.loads(store["klines:BTCUSDT:1m"])
+    assert len(arr) == 1
+    assert float(arr[0][5]) == 0.0, "genuine zero-volume bar must be preserved"
+    assert float(arr[0][4]) == 100.5, "close price must be preserved"
+
+
+# ---------------------------------------------------------------------------
+# 17. 600-bar trim preserved after upsert
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_600_bar_trim_after_upsert():
+    """Array must not exceed 600 entries even after multiple upserts."""
+    store: dict[str, Any] = {}
+    h = _make_hydrator(store)
+
+    # Write 601 distinct bars
+    for i in range(601):
+        candle = [float(1_000_000 + i * 60), 100.0, 101.0, 99.0, 100.5, 1.0]
+        await h._append_candle("BTCUSDT", "1m", candle)
+
+    arr = json.loads(store["klines:BTCUSDT:1m"])
+    assert len(arr) == 600, "trim must keep newest 600 bars"
+    # Newest bar (ts 1_000_000 + 600*60) should be present
+    assert int(arr[-1][0]) == 1_000_000 + 600 * 60
+
+
+# ---------------------------------------------------------------------------
+# 18. Atomic cache state: upsert preserves sort order
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_preserves_ascending_order():
+    """Upserting an existing timestamp must not disturb the ascending sort order."""
+    store: dict[str, Any] = {}
+    h = _make_hydrator(store)
+
+    for i in range(3):
+        candle = [float(1_000_000 + i * 60), 100.0, 101.0, 99.0, 100.0 + i, 1.0]
+        await h._append_candle("BTCUSDT", "1m", candle)
+
+    # Upsert the middle bar
+    candle_mid_updated = [float(1_000_060), 100.0, 101.5, 98.5, 100.9, 2.5]
+    await h._append_candle("BTCUSDT", "1m", candle_mid_updated)
+
+    arr = json.loads(store["klines:BTCUSDT:1m"])
+    assert len(arr) == 3
+    ts_list = [int(r[0]) for r in arr]
+    assert ts_list == sorted(ts_list), "ascending order must be preserved after upsert"
+    # Middle bar must have updated values
+    mid = next(r for r in arr if int(r[0]) == 1_000_060)
+    assert float(mid[4]) == 100.9
+    assert float(mid[5]) == 2.5

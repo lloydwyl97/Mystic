@@ -346,30 +346,44 @@ class BinanceWSHydrator:
             pass
 
     async def _update_candles(self, sym: str, now_ts: float, px: float) -> None:
+        """Track the forming (in-progress) 1m candle from miniTicker price ticks.
+
+        This method ONLY maintains in-memory state (_c1m).  It does NOT write
+        anything to Redis.  Closed bars are persisted exclusively by
+        _flush_closed_kline (authoritative @kline_1m x=True events) and
+        _backfill_missing_bars (REST catch-up on reconnect).
+
+        Keeping the two responsibilities separate eliminates the dual-write race
+        where both the miniTicker and kline paths would call _append_candle for
+        the same minute and produce duplicate timestamps in the Redis array.
+        """
         try:
             if self._cg is None:
                 return
             start_ts = int(now_ts // 60) * 60
             cur = self._c1m.get(sym)
             if not cur or int(cur[0]) != start_ts:
-                # Flush previous candle if exists
-                if cur and len(cur) == 6:
-                    task = await task_manager.create_task(self._append_candle(sym, "1m", cur), name="binance_ws_hydrator:append_candle")
-                    self._tasks.append(task)
-                    # Possibly roll into 5m/15m on boundary
-                    await self._maybe_rollup(sym, int(cur[0]))
-                # Start new candle
+                # New minute: start a fresh forming candle.
+                # The previous minute's closed bar will be persisted by the
+                # @kline_1m x=True event, not here.
                 self._c1m[sym] = [float(start_ts), px, px, px, px, 0.0]
                 return
-            # Update existing candle
+            # Update the forming candle with the latest miniTicker price.
             cur[3] = min(cur[3], px)  # low
             cur[2] = max(cur[2], px)  # high
             cur[4] = px  # close
-            # volume unknown from miniTicker; keep 0.0
+            # Volume is updated by @kline_1m events; miniTicker carries no volume.
         except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
             pass
 
     async def _append_candle(self, sym: str, interval: str, candle: list[float]) -> None:
+        """Write one candle to the Redis klines history.
+
+        Upserts by open-timestamp: if a row with the same bar_ts already exists it
+        is replaced in-place rather than appended.  This prevents the miniTicker
+        and kline paths from creating duplicate rows for the same minute even when
+        both paths race to call this method.
+        """
         try:
             if self._cg is None:
                 return
@@ -377,13 +391,20 @@ class BinanceWSHydrator:
             key = f"klines:{sym}:{interval}"
 
             raw = await r.get(key)
-            arr = []
+            arr: list[list[float]] = []
             if raw:
                 try:
                     arr = json.loads(raw)
                 except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
                     arr = []
-            arr.append([candle[0], candle[1], candle[2], candle[3], candle[4], candle[5]])
+            bar_ts = candle[0]
+            row = [candle[0], candle[1], candle[2], candle[3], candle[4], candle[5]]
+            # Upsert: replace an existing row for this minute, or append if new.
+            existing_idx = next((i for i, r_row in enumerate(arr) if r_row[0] == bar_ts), None)
+            if existing_idx is not None:
+                arr[existing_idx] = row
+            else:
+                arr.append(row)
             # Trim to last 600
             if len(arr) > 600:
                 arr = arr[-600:]
