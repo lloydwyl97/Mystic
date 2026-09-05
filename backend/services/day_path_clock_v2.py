@@ -215,3 +215,99 @@ REQUIRED_CLOCK_V2_FIELDS: tuple[str, ...] = (
     "estimated_all_in_cost_bps",
     "rel_volume_15m",
 )
+
+# Generic day_model_readiness G_forward_span uses the 4H-entry challenger
+# (day_forward_lock.challenger_export_schema): 14 listed inputs including
+# categorical symbol x 10 events = 140 authoritative selected-trade labels.
+# That 140 is not a clock-v2 group count and is not mutated here.
+GENERIC_4H_CHALLENGER_INPUT_COUNT = 14
+GENERIC_SELECTED_TRADE_LABEL_REQUIREMENT = GENERIC_4H_CHALLENGER_INPUT_COUNT * MIN_EVENTS_PER_FEATURE
+
+CLOCK_V2_LISTED_INPUT_COUNT = len(REQUIRED_CLOCK_V2_FIELDS)  # 15
+CLOCK_V2_CATEGORICAL_FEATURES = ("symbol",)
+CLOCK_V2_NUMERIC_FEATURE_COUNT = CLOCK_V2_LISTED_INPUT_COUNT - len(CLOCK_V2_CATEGORICAL_FEATURES)  # 14
+CLOCK_V2_CATEGORICAL_PARAMETER_COUNT = 4  # BTC/ETH/SOL/XRP dummy; HOLD is the omitted level
+
+PLANNED_EXPERIMENT_ID_V2 = "M_clock_v2_planned_v2_20260905"
+
+
+def clock_v2_statistical_contract() -> dict[str, Any]:
+    """Document the 14-vs-15 split. Does not overwrite the generic 140 gate."""
+    return {
+        "generic_4h_challenger_inputs": list(challenger_inputs_4h()),
+        "generic_numeric_or_listed_count": GENERIC_4H_CHALLENGER_INPUT_COUNT,
+        "generic_categorical_included_in_count": True,
+        "generic_events_per_listed_input": MIN_EVENTS_PER_FEATURE,
+        "generic_required_authoritative_selected_trades": GENERIC_SELECTED_TRADE_LABEL_REQUIREMENT,
+        "generic_observation_unit": "authoritative_selected_trade_label",
+        "clock_v2_listed_inputs": list(REQUIRED_CLOCK_V2_FIELDS),
+        "clock_v2_listed_input_count": CLOCK_V2_LISTED_INPUT_COUNT,
+        "clock_v2_numeric_features": [n for n in REQUIRED_CLOCK_V2_FIELDS if n != "symbol"],
+        "clock_v2_numeric_feature_count": CLOCK_V2_NUMERIC_FEATURE_COUNT,
+        "clock_v2_categorical_features": list(CLOCK_V2_CATEGORICAL_FEATURES),
+        "clock_v2_categorical_parameter_count": CLOCK_V2_CATEGORICAL_PARAMETER_COUNT,
+        "clock_v2_effective_fitted_parameters_note": (
+            "symbol is one categorical with 4 coin levels plus HOLD as the reference action; "
+            "the 14 remaining fields are numeric. The original planned arm reused 14x10=140 "
+            "from the generic 4H schema instead of 15x10. That reuse is frozen, not silently "
+            "rewritten to 150."
+        ),
+        "why_140_is_correct_for_generic_gate": ("G_forward_span multiplies len(challenger_export_schema()['inputs']) by 10. Those 14 inputs are the 4H-entry schema, not clock-v2."),
+        "why_140_is_not_a_clock_v2_ranker_population": (
+            "140 selected-trade labels are fills chosen by the old policy. A BTC/ETH/SOL/XRP/HOLD ranker needs complete decision groups, not selected rows alone."
+        ),
+    }
+
+
+def challenger_inputs_4h() -> tuple[str, ...]:
+    from backend.services.day_forward_lock import challenger_export_schema
+
+    return tuple(challenger_export_schema()["inputs"])
+
+
+def planned_challenger_specification_v2() -> dict[str, Any]:
+    """New readiness/experiment contract. Does not mutate M_clock_v2_planned_20260905."""
+    schema = clock_challenger_export_schema()
+    return {
+        "experiment_id": PLANNED_EXPERIMENT_ID_V2,
+        "result": PLANNED_RESULT,
+        "promoted": False,
+        "train": False,
+        "live_gate": False,
+        "feature_set": f"{SCHEMA_VERSION}_capture_1",
+        "inputs": list(schema["inputs"]),
+        "target": PRIMARY_TARGET,
+        "actions": list(schema["actions"]),
+        "hold_value_bps": 0.0,
+        "model_class": "small_regularized_not_selected",
+        "acceptance": future_acceptance_bar(),
+        "training_procedure": {
+            **planned_training_procedure(),
+            "folds": "expanding_chronological",
+            "purge_overlapping_4h_labels": True,
+            "embargo_seconds_min": max(4 * 3600, *CLOCK_LABEL_HORIZONS_SEC.values()),
+            "calendar_day_blocks_are_not_independent_folds": True,
+        },
+        "group_definition": "one DAY ranking timestamp with BTC/ETH/SOL/XRP/HOLD actions",
+        "missing_data_rules": "NULL + reason; never zero-impute; ineligible coins keep eligibility=false",
+        "readiness_requirements": clock_v2_v2_readiness_requirements(),
+        "statistical_contract": clock_v2_statistical_contract(),
+        "notes": ("Corrected clock-v2 readiness: complete groups, not selected-trade-only. Original M_clock_v2_planned_20260905 remains PLANNED_NOT_RUN and unmodified."),
+    }
+
+
+def clock_v2_v2_readiness_requirements() -> dict[str, Any]:
+    return {
+        "min_feature_complete_groups": CLOCK_V2_NUMERIC_FEATURE_COUNT * MIN_EVENTS_PER_FEATURE,
+        "min_fully_comparable_labeled_groups": CLOCK_V2_NUMERIC_FEATURE_COUNT * MIN_EVENTS_PER_FEATURE,
+        "min_authoritative_selected_trade_labels": GENERIC_SELECTED_TRADE_LABEL_REQUIREMENT,
+        "selected_trades_alone_insufficient": True,
+        "min_chronological_blocks_bookkeeping": MIN_CHRONOLOGICAL_BLOCKS,
+        "block_definition": "UTC calendar day with >=1 decision group (bookkeeping only, not 5 independent folds)",
+        "validation_folds": "expanding chronological; purge overlapping 4h labels; embargo >= 4h",
+        "observation_unit": "complete_decision_group",
+        "numeric_features_counted": CLOCK_V2_NUMERIC_FEATURE_COUNT,
+        "categorical_parameters_counted": CLOCK_V2_CATEGORICAL_PARAMETER_COUNT,
+        "events_per_numeric_feature": MIN_EVENTS_PER_FEATURE,
+        "why_multiplier_uses_14": ("14 is the numeric clock-v2 field count after excluding categorical symbol. It matches the generic 140 number but the unit is complete groups, not fills."),
+    }

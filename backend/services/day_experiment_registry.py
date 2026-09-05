@@ -73,6 +73,20 @@ SEED_ARMS: tuple[ExperimentArm, ...] = (
         False,
         "Frozen clock-v2 challenger. Do not train until an explicit later task. Do not inspect the lock.",
     ),
+    ExperimentArm(
+        "M_clock_v2_planned_v2_20260905",
+        "2026-09-05",
+        "day_path_clock_v2_capture_1",
+        "expected_executable_net_bps",
+        "small_regularized_not_selected",
+        "not_fit",
+        "forward_after_capture",
+        "expanding_chrono_folds_purge_4h_embargo_4h",
+        "forward_4h_entry_lock_20260903",
+        "PLANNED_NOT_RUN",
+        False,
+        "Corrected clock-v2 readiness: complete groups required. Does not mutate M_clock_v2_planned_20260905.",
+    ),
 )
 
 SCHEMA_SQL = f"""
