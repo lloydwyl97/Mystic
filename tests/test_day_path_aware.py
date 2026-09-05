@@ -365,7 +365,8 @@ def test_accepted_artifact_without_bars_is_hold_not_invented(monkeypatch):
     reset_day_artifact_cache()
     ev, stamped = resolve_day_path_ev({"buy_margin": 0.20, "confidence": 0.90, "prob_buy": 0.80})
     assert ev == 0.0
-    assert stamped["path_net_status"] == "unavailable_hold"
+    assert stamped["path_net_status"] in {"unavailable_hold", "PATH_INPUT_INVALID_SCHEMA"}
+    assert stamped.get("path_input_valid") is False
     assert stamped["forward_net_model_version"] == "day_path_net_v1"
     assert stamped["predicted_net_return"] == 0.0
     reset_day_artifact_cache()

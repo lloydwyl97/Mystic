@@ -18,6 +18,14 @@ from backend.services.binance_scalp.forward_net_predictor import (
     predict_artifact,
 )
 from backend.services.binance_scalp.reconstructable_features import reconstructable_features
+from backend.services.day_path_input_validity import (
+    PATH_FEATURE_SCHEMA_VERSION,
+    PATH_INPUT_INVALID_SCHEMA,
+    five_bar_return,
+    ood_telemetry,
+    parse_bar_ts,
+    validate_path_bars,
+)
 
 DAY_PATH_MODEL_VERSION = "day_path_net_v1"
 DAY_HORIZONS_MIN = (60, 120, 180)
@@ -132,6 +140,40 @@ def attach_bars(decision_data: dict[str, Any], db_path: str, symbol: str) -> dic
     return dd
 
 
+def _as_of_from_decision(dd: dict[str, Any], bars: list[Any]) -> datetime | None:
+    raw = dd.get("path_as_of") or dd.get("decision_ts")
+    if raw:
+        parsed = parse_bar_ts(raw)
+        if parsed is not None:
+            return parsed
+    if dd.get("path_as_of_now"):
+        return datetime.now(timezone.utc)
+    if isinstance(bars, list) and bars:
+        last = bars[-1] if isinstance(bars[-1], dict) else {}
+        return parse_bar_ts(last.get("ts")) if isinstance(last, dict) else None
+    return datetime.now(timezone.utc)
+
+
+def _shadow_correct_btc_ev(
+    dd: dict[str, Any],
+    *,
+    db_path: str,
+    as_of: datetime | None,
+) -> tuple[float | None, float | None]:
+    """Shadow-only BTC 5-bar relative EV. Never used for live authority."""
+    btc_bars = dd.get("btc_bars_1m")
+    if not isinstance(btc_bars, list) or len(btc_bars) < 40:
+        btc_bars = load_recent_bars(db_path, "BTCUSDT") if db_path else []
+    btc_tel = validate_path_bars(btc_bars, as_of=as_of)
+    if not btc_tel.get("path_input_valid"):
+        return None, None
+    ret = five_bar_return(btc_bars)
+    if ret is None:
+        return None, None
+    shadow = predict_decision_net({**dd, "btc_ret_5": float(ret)})
+    return float(ret), (float(shadow) if shadow is not None else None)
+
+
 def _features_from_decision(dd: dict[str, Any]) -> dict[str, float]:
     bars = dd.get("bars_1m") or []
     if not isinstance(bars, list) or len(bars) < 8:
@@ -174,29 +216,68 @@ def stamp_day_path_prediction(decision_data: dict[str, Any]) -> dict[str, Any]:
     return stamped
 
 
+def _stamp_common(dd: dict[str, Any], art: ForwardNetArtifact, tel: dict[str, Any]) -> None:
+    dd.update(tel)
+    dd["forward_net_model_version"] = art.version
+    dd["path_model_version"] = art.version
+    dd["path_feature_schema_version"] = PATH_FEATURE_SCHEMA_VERSION
+    dd["day_path_horizon_min"] = int(art.primary_horizon_min)
+    dd["hold_action_ev"] = 0.0
+    dd["selected_net_expected_value_is_net"] = "1"
+    dd["legacy_btc_ret_5"] = float(dd.get("btc_ret_5") or 0.0)
+
+
 def resolve_day_path_ev(
     decision_data: dict[str, Any] | None,
     *,
     symbol: str = "",
     db_path: str = "",
 ) -> tuple[float | None, dict[str, Any]]:
-    """Accepted artifact only. Missing prediction is HOLD (0), never invented EV.
+    """Accepted artifact only. Sparse/stale/gappy 1m inputs cannot be authority.
 
-    Returns (ev, stamp). ev is None only when no accepted artifact is loaded.
+    Live EV still uses legacy btc_ret_5 (default 0). Corrected BTC-relative EV
+    and OOD z-counts are shadow telemetry only.
+    ev is None only when no accepted artifact is loaded.
     """
     dd = dict(decision_data or {})
     art = load_accepted_day_artifact()
     if art is None:
         return None, dd
+    supplied_bars = dd.get("bars_1m")
+    had_supplied_bars = isinstance(supplied_bars, list) and len(supplied_bars) >= 8
     sym = str(symbol or dd.get("symbol") or dd.get("symbol_bus") or "")
     if sym:
         dd["symbol"] = sym
         dd = attach_bars(dd, db_path, sym)
+    bars = dd.get("bars_1m") or []
+    if dd.get("path_as_of_now") or (bool(db_path) and not had_supplied_bars):
+        as_of = datetime.now(timezone.utc)
+    else:
+        as_of = _as_of_from_decision(dd, bars if isinstance(bars, list) else [])
+    tel = validate_path_bars(bars, as_of=as_of)
+    tel["path_model_version"] = art.version
+    feats = _features_from_decision(dd)
+    dd.update(ood_telemetry(feats, art) if feats else ood_telemetry({}, art))
+    correct_btc, shadow_ev = _shadow_correct_btc_ev(dd, db_path=db_path, as_of=as_of)
+    dd["correct_btc_ret_5"] = correct_btc
+    dd["shadow_correct_btc_path_ev"] = shadow_ev
+    if not tel.get("path_input_valid"):
+        _stamp_common(dd, art, tel)
+        reason = str(tel.get("path_invalid_reason") or PATH_INPUT_INVALID_SCHEMA)
+        dd["path_input_valid"] = False
+        dd["path_invalid_reason"] = reason
+        dd["path_net_status"] = reason
+        dd["selected_net_expected_value"] = 0.0
+        dd["predicted_net_return"] = 0.0
+        if feats:
+            blocked = predict_decision_net(dd)
+            if blocked is not None:
+                dd["legacy_path_ev"] = float(blocked)
+        return 0.0, dd
     pred = predict_decision_net(dd)
-    dd["forward_net_model_version"] = art.version
-    dd["day_path_horizon_min"] = int(art.primary_horizon_min)
-    dd["hold_action_ev"] = 0.0
-    dd["selected_net_expected_value_is_net"] = "1"
+    _stamp_common(dd, art, tel)
+    dd["path_input_valid"] = True
+    dd["path_invalid_reason"] = None
     if pred is None:
         dd["selected_net_expected_value"] = 0.0
         dd["predicted_net_return"] = 0.0
@@ -204,7 +285,7 @@ def resolve_day_path_ev(
         return 0.0, dd
     pred_f = float(pred)
     dd["selected_net_expected_value_raw"] = pred_f
-    # Learning haircut only — never a permission gate. Stall history reduces EV vs HOLD.
+    dd["legacy_path_ev"] = pred_f
     try:
         from backend.services.symbol_setup_outcome_penalty import evaluate_low_mfe_stall_penalty
 

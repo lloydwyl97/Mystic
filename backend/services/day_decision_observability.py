@@ -471,6 +471,7 @@ def build_group_contract(
         slot_available = slots_used < slot_count and not already_open
         capital_available = cash is None or float(cash) > 0
         fourh_tel = fourh_by_symbol.get(sym)
+        path_tel = dict((dec.get("path_input_by_symbol") or {}).get(sym) or {})
         rows.append(
             {
                 "symbol": sym,
@@ -479,6 +480,22 @@ def build_group_contract(
                 "base_score": base,
                 "p_buy": p_buy,
                 "path_ev": 0.0 if sym == "HOLD" else path_ev,
+                "path_input_valid": path_tel.get("path_input_valid"),
+                "path_invalid_reason": path_tel.get("path_invalid_reason"),
+                "path_row_count": path_tel.get("path_row_count"),
+                "path_first_bar_ts": path_tel.get("path_first_bar_ts"),
+                "path_last_bar_ts": path_tel.get("path_last_bar_ts"),
+                "path_actual_lookback_seconds": path_tel.get("path_actual_lookback_seconds"),
+                "path_max_gap_seconds": path_tel.get("path_max_gap_seconds"),
+                "path_latest_bar_age_seconds": path_tel.get("path_latest_bar_age_seconds"),
+                "path_model_version": path_tel.get("path_model_version") or model_version,
+                "path_feature_schema_version": path_tel.get("path_feature_schema_version"),
+                "legacy_btc_ret_5": path_tel.get("legacy_btc_ret_5"),
+                "correct_btc_ret_5": path_tel.get("correct_btc_ret_5"),
+                "legacy_path_ev": path_tel.get("legacy_path_ev"),
+                "shadow_correct_btc_path_ev": path_tel.get("shadow_correct_btc_path_ev"),
+                "path_max_abs_z": path_tel.get("path_max_abs_z"),
+                "path_ood_feature_count_at_8": path_tel.get("path_ood_feature_count_at_8"),
                 "rank_deltas": deltas,
                 "all_rank_deltas": deltas,
                 "all_haircuts": {} if sym == "HOLD" else _haircuts(dd),
