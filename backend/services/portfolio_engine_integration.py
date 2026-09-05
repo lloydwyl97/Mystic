@@ -39,6 +39,7 @@ from backend.config.mystic_api_schedule import (
 )
 from backend.database_schema import DATABASE_PATH
 from backend.services.day_4h_label_runner import run_label_batch as run_day_4h_label_batch
+from backend.services.day_clock_v2_research_cycle import run_clock_v2_v5_cycle as _run_clock_v2_v5_cycle
 from backend.services.gate_reason_codes import GateReason
 from backend.services.live_strategy_contracts import per_coin_artifact_file
 from backend.services.portfolio_engine import (
@@ -2468,6 +2469,23 @@ class PortfolioEngineIntegration:
                         )
                     else:
                         logger.debug("DAY_4H_LABEL: nothing matured")
+                    # CLOCK-V2 v5 research target (3h executable net) plus the
+                    # partition/experiment authority. Separate table, separate
+                    # partition; never reads the sealed 4H lock.
+                    v5 = await loop.run_in_executor(
+                        None,
+                        lambda path=db_path: _run_clock_v2_v5_cycle(path),
+                    )
+                    if v5.get("labels_written") or v5.get("planned_inserted"):
+                        logger.info(
+                            "DAY_CLOCK_V2_V5: groups=%s labels=%s valid=%s immature=%s planned_inserted=%s readiness=%s",
+                            v5.get("groups_scanned"),
+                            v5.get("labels_written"),
+                            v5.get("valid"),
+                            v5.get("immature"),
+                            v5.get("planned_inserted"),
+                            v5.get("readiness"),
+                        )
             except asyncio.CancelledError:
                 break
             except Exception as e:

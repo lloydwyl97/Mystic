@@ -15,9 +15,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from backend.services.day_clock_v2_action_contract import (
+    CONTRACT_VERSION as ACTION_CONTRACT_VERSION,
+)
+from backend.services.day_clock_v2_action_contract import (
+    evaluate_action_row,
+    selected_action_invariant,
+)
+from backend.services.day_clock_v2_partition import partition_for
+
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "day_decision_obs_v1"
+SCHEMA_VERSION = "day_decision_obs_v2_action_corrected"
+LEGACY_SCHEMA_VERSION = "day_decision_obs_v1"
 TABLE_GROUPS = "day_decision_group_records"
 TABLE_CANDIDATES = "day_decision_candidate_records"
 TABLE_FEATURE_ARTIFACTS = "day_decision_feature_artifacts"
@@ -86,6 +96,16 @@ CREATE TABLE IF NOT EXISTS {TABLE_CANDIDATES} (
     final_rank_score REAL,
     feature_json TEXT,
     feature_hash TEXT,
+    action_available INTEGER,
+    action_unavailable_reason TEXT,
+    legacy_rank_candidate_present INTEGER,
+    legacy_rank_candidate_reason TEXT,
+    legacy_final_rank_score REAL,
+    legacy_final_rank_score_valid INTEGER,
+    legacy_final_rank_reason TEXT,
+    production_selected INTEGER,
+    execution_resolvable_candidate_present INTEGER,
+    action_contract_version TEXT,
     PRIMARY KEY (decision_group_id, symbol)
 );
 CREATE INDEX IF NOT EXISTS idx_day_obs_cands_created ON {TABLE_CANDIDATES}(created_at);
@@ -138,10 +158,40 @@ def _num(value: Any) -> float | None:
         return None
 
 
+def _tri(value: Any) -> int | None:
+    """Three-valued store: None stays NULL so 'unknown' is not written as false."""
+    return None if value is None else (1 if value else 0)
+
+
+# Corrected action-semantics columns. Additive only: historical rows keep NULL,
+# so `eligible` / `exclusion_reason` / `final_rank_score` retain their v1 meaning
+# and are never silently redefined.
+_CANDIDATE_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("action_available", "INTEGER"),
+    ("action_unavailable_reason", "TEXT"),
+    ("legacy_rank_candidate_present", "INTEGER"),
+    ("legacy_rank_candidate_reason", "TEXT"),
+    ("legacy_final_rank_score", "REAL"),
+    ("legacy_final_rank_score_valid", "INTEGER"),
+    ("legacy_final_rank_reason", "TEXT"),
+    ("production_selected", "INTEGER"),
+    ("execution_resolvable_candidate_present", "INTEGER"),
+    ("action_contract_version", "TEXT"),
+)
+
+
+def _migrate_candidate_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({TABLE_CANDIDATES})")}
+    for name, decl in _CANDIDATE_MIGRATIONS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {TABLE_CANDIDATES} ADD COLUMN {name} {decl}")
+
+
 def _ensure_schema(db_path: str | Path) -> None:
     conn = sqlite3.connect(str(db_path), timeout=30)
     try:
         conn.executescript(SCHEMA_SQL)
+        _migrate_candidate_columns(conn)
         conn.commit()
     finally:
         conn.close()
@@ -415,6 +465,16 @@ def build_group_contract(
     else:
         group_id = str(dec.get("decision_group_id") or dec.get("decision_id") or f"daygrp_{dec.get('prediction_timestamp') or _now_iso()}")
     cand_map = _candidate_map(candidates)
+    # The executor resolves the selected symbol against
+    # `valid_candidates + self.current_bar_candidates` (portfolio_engine
+    # _select_direct_path_ev_candidate). The recorder is handed only the ranked
+    # snapshot, which is why production could fill a symbol this table marked
+    # NO_SCORED_CANDIDATE. Capture the wider resolvable set separately.
+    resolvable_map = dict(cand_map)
+    try:
+        resolvable_map.update(_candidate_map(list(getattr(engine, "current_bar_candidates", None) or [])))
+    except Exception:
+        pass
     model_version = str(dec.get("path_net_model_id") or dec.get("forward_net_model_version") or "")
     acct = dict(account_state or _account_state(engine))
     open_syms = {_api(s) for s in (acct.get("open_symbols") or [])}
@@ -468,11 +528,27 @@ def build_group_contract(
         capital_available = cash is None or float(cash) > 0
         fourh_tel = fourh_by_symbol.get(sym)
         path_tel = dict((dec.get("path_input_by_symbol") or {}).get(sym) or {})
+        action_state = evaluate_action_row(
+            symbol=sym,
+            candidate_present=cand is not None,
+            exclusion_reason=exclusion,
+            path_input_valid=path_tel.get("path_input_valid"),
+            path_invalid_reason=path_tel.get("path_invalid_reason"),
+            open_symbols=open_syms,
+            slots_used=slots_used,
+            slot_count=slot_count,
+            final_selection_score=(dd.get("final_selection_score") if cand is not None else None),
+            recorded_final_rank_score=final_score,
+            path_ev=path_ev,
+            production_selected=(sym == (selected_symbol or "HOLD")),
+        )
         rows.append(
             {
                 "symbol": sym,
                 "eligible": cand is not None or sym == "HOLD",
                 "exclusion_reason": None if (cand is not None or sym == "HOLD") else exclusion,
+                **action_state,
+                "execution_resolvable_candidate_present": (True if sym == "HOLD" else sym in resolvable_map),
                 "base_score": base,
                 "p_buy": p_buy,
                 "path_ev": 0.0 if sym == "HOLD" else path_ev,
@@ -522,10 +598,27 @@ def build_group_contract(
             row["rank_position"] = rank_map.get(row["symbol"])
     mode = runtime_account_execution_mode()
     data_ts = dec.get("prediction_timestamp") or bar_timestamp
+    decision_iso = _now_iso()
+    invariant = selected_action_invariant(
+        rows=rows,
+        selected_symbol=selected_symbol or "HOLD",
+        filled=False,
+    )
+    if not invariant.get("pass"):
+        logger.warning(
+            "DAY_CLOCK_V2_ACTION_INVARIANT group=%s selected=%s violations=%s reason=%s",
+            group_id,
+            invariant.get("selected_symbol"),
+            invariant.get("violations"),
+            invariant.get("action_unavailable_reason"),
+        )
     return {
         "schema_version": SCHEMA_VERSION,
+        "action_contract_version": ACTION_CONTRACT_VERSION,
+        "clock_v2_partition": partition_for(decision_iso),
+        "selected_action_invariant": invariant,
         "decision_group_id": group_id,
-        "decision_timestamp": _now_iso(),
+        "decision_timestamp": decision_iso,
         "runtime_trading_mode": mode,
         "account_execution_mode": mode,
         "strategy_id": STRATEGY_ID,
@@ -666,8 +759,13 @@ def record_day_ranking_group(
                     INSERT OR REPLACE INTO {TABLE_CANDIDATES}(
                         decision_group_id, symbol, created_at, eligible, exclusion_reason,
                         base_score, p_buy, path_ev, rank_deltas_json, final_rank_score,
-                        feature_json, feature_hash
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                        feature_json, feature_hash,
+                        action_available, action_unavailable_reason,
+                        legacy_rank_candidate_present, legacy_rank_candidate_reason,
+                        legacy_final_rank_score, legacy_final_rank_score_valid,
+                        legacy_final_rank_reason, production_selected,
+                        execution_resolvable_candidate_present, action_contract_version
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         contract["decision_group_id"],
@@ -682,6 +780,16 @@ def record_day_ranking_group(
                         row["final_rank_score"],
                         json.dumps(stored_features, default=str)[:32000],
                         row["feature_hash"],
+                        _tri(row.get("action_available")),
+                        row.get("action_unavailable_reason"),
+                        _tri(row.get("legacy_rank_candidate_present")),
+                        row.get("legacy_rank_candidate_reason"),
+                        row.get("legacy_final_rank_score"),
+                        _tri(row.get("legacy_final_rank_score_valid")),
+                        row.get("legacy_final_rank_reason"),
+                        _tri(row.get("production_selected")),
+                        _tri(row.get("execution_resolvable_candidate_present")),
+                        ACTION_CONTRACT_VERSION,
                     ),
                 )
             conn.commit()

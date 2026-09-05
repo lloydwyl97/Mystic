@@ -569,3 +569,190 @@ def planned_challenger_specification_v4() -> dict[str, Any]:
             "Diagnostic horizons (15m/30m/1h/2h/4h) are NOT selectable after performance inspection."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# V5: corrected action semantics. Does not mutate v1/v2/v3/v4.
+#
+# V4 listed `final_rank_score` as a model input. That field is only defined for
+# symbols the legacy 15m signal consumer admitted as buy-intent candidates: it is
+# the output of the bandit / adaptive-weight / symbol-trust / thesis / haircut
+# chain applied to a constructed BuyCandidate. Coins with no candidate have no
+# such score, and capture-v1 silently backfilled raw path_ev in its place.
+#
+# Option A (reconstruct an all-action shadow legacy rank) was rejected: the chain
+# consumes candidate-only inputs (buy_margin, setup_type_canonical, confidence,
+# chop/regime penalties) that do not exist for a coin whose signal side was
+# `hold`, so any all-action value would require inventing signal state. That is
+# not deterministically reproducible and fails point-in-time recovery.
+#
+# Option B is taken: `final_rank_score` is removed from the v5 model schema
+# because it is not a well-defined all-action feature. Its provenance is still
+# CAPTURED and audited (legacy_final_rank_score / _valid / _reason) so the
+# fabrication is visible; it is simply not a model input.
+#
+# Per the correction rule, dropping a parameter must not lower the support bar:
+# required groups = max(previous v4 requirement, new parameter count * 10).
+# ---------------------------------------------------------------------------
+
+PLANNED_EXPERIMENT_ID_V5 = "M_clock_v2_planned_v5_20260905"
+FINAL_RANK_TREATMENT_V5 = "REMOVED_NOT_WELL_DEFINED_ALL_ACTION_FEATURE"
+FINAL_RANK_PROVENANCE_CAPTURED = True
+
+REQUIRED_CLOCK_V2_FIELDS_V5: tuple[str, ...] = tuple(n for n in REQUIRED_CLOCK_V2_FIELDS if n != "final_rank_score")
+CLOCK_V2_V5_LISTED_INPUT_COUNT = len(REQUIRED_CLOCK_V2_FIELDS_V5)  # 14
+CLOCK_V2_V5_NUMERIC_FEATURE_COUNT = CLOCK_V2_V5_LISTED_INPUT_COUNT - len(CLOCK_V2_CATEGORICAL_FEATURES)  # 13
+CLOCK_V2_V5_EFFECTIVE_FITTED_PARAMETERS = CLOCK_V2_INTERCEPT_COUNT + CLOCK_V2_V5_NUMERIC_FEATURE_COUNT + CLOCK_V2_CATEGORICAL_PARAMETER_COUNT  # 18
+
+# max(190, 18*10) == 190. The correction cannot make training happen sooner.
+CLOCK_V2_V5_REQUIRED_GROUPS = max(
+    CLOCK_V2_EFFECTIVE_FITTED_PARAMETERS * EVENTS_PER_PARAMETER,
+    CLOCK_V2_V5_EFFECTIVE_FITTED_PARAMETERS * EVENTS_PER_PARAMETER,
+)
+CLOCK_V2_V5_REQUIRED_CALIBRATION_FILLS = CLOCK_V2_COST_CALIBRATION_PARAMETERS * EVENTS_PER_PARAMETER  # 50
+CLOCK_V2_V5_EMBARGO_SEC = max(4 * 3600, PRIMARY_TARGET_HORIZON_SEC)
+
+
+def clock_v2_v5_feature_schema() -> dict[str, Any]:
+    """All-action feature schema. Every listed input must be definable for every
+    production-available action, or it does not belong in the schema."""
+    return {
+        "inputs": list(REQUIRED_CLOCK_V2_FIELDS_V5),
+        "removed_from_v4": ["final_rank_score"],
+        "removal_reason": (
+            "legacy final_rank_score is only defined for legacy scored candidates; it is not an "
+            "all-action feature and capture-v1 substituted raw path_ev for absent candidates"
+        ),
+        "all_action_inputs_verified": {
+            "p_buy": "per-symbol ML signal published for all four coins regardless of side; "
+            "captured as production_p_buy with shadow_candidate_p_buy fallback and explicit provenance",
+            "legacy_path_ev": "scored independently for all four coins by score_four_coins",
+            "clock_features": "computed from 1m klines per symbol, independent of candidacy",
+            "structure_and_cost": "per-symbol 4H structure and decision-time quote",
+        },
+        "categorical_encoding": "symbol dummies for BTC/ETH/SOL/XRP; HOLD is the omitted reference action",
+        "targets": [PRIMARY_TARGET],
+        "target_horizon_sec": PRIMARY_TARGET_HORIZON_SEC,
+        "hold_value_bps": 0.0,
+        "actions": [*COINS, HOLD_SYMBOL],
+        "train": False,
+        "live_gate": False,
+    }
+
+
+def clock_v2_v5_readiness_requirements() -> dict[str, Any]:
+    """Frozen immutable v5 readiness contract."""
+    v4 = clock_v2_v4_readiness_requirements()
+    return {
+        **v4,
+        "version": "v5",
+        "action_contract_version": "day_clock_v2_action_contract_v1",
+        "partition_contract_version": "day_clock_v2_partition_v1",
+        "observation_unit": "independent_v5_DEVELOPMENT_decision_group_after_purge",
+        "counted_partition": "DEVELOPMENT",
+        "excluded_partitions": ["PRE_MODEL_QUARANTINE", "FINAL_TEST"],
+        "feature_complete_definition": (
+            "every production-available modeled action (action_available=true) plus HOLD has the "
+            "required v5 feature state; a legacy-unscored action does not disappear"
+        ),
+        "fully_comparable_definition": (
+            "all production-available actions share the 3h horizon, executable-price method, "
+            "commission method, spread method and slippage method, and all have valid labels; HOLD=0"
+        ),
+        "listed_inputs": list(REQUIRED_CLOCK_V2_FIELDS_V5),
+        "listed_input_count": CLOCK_V2_V5_LISTED_INPUT_COUNT,
+        "numeric_features_counted": CLOCK_V2_V5_NUMERIC_FEATURE_COUNT,
+        "effective_fitted_parameters": CLOCK_V2_V5_EFFECTIVE_FITTED_PARAMETERS,
+        "previous_v4_required_groups": CLOCK_V2_EFFECTIVE_FITTED_PARAMETERS * EVENTS_PER_PARAMETER,
+        "min_feature_complete_groups": CLOCK_V2_V5_REQUIRED_GROUPS,
+        "min_fully_comparable_independent_groups": CLOCK_V2_V5_REQUIRED_GROUPS,
+        "min_authoritative_fills_execution_calibration": CLOCK_V2_V5_REQUIRED_CALIBRATION_FILLS,
+        "support_floor_rule": "required_groups = max(previous_v4_requirement, new_parameter_count * 10)",
+        "support_floor_not_lowered": True,
+        "embargo_seconds_min": CLOCK_V2_V5_EMBARGO_SEC,
+        "purge_window_seconds": PRIMARY_TARGET_HORIZON_SEC,
+        "target": PRIMARY_TARGET,
+        "target_horizon_name": PRIMARY_TARGET_HORIZON_NAME,
+        "hold_target_bps": 0.0,
+        "require_zero_future_data_violations": True,
+        "require_accounting_pass": True,
+        "require_no_lock_inspection": True,
+        "require_final_test_contract_before_promotion": True,
+        "final_test_status_required_before_promotion": "DECLARED_FUTURE_WINDOW",
+        "train_on_readiness_pass": False,
+        "auto_train_forbidden": True,
+        "final_rank_treatment": FINAL_RANK_TREATMENT_V5,
+        "final_rank_provenance_still_captured": FINAL_RANK_PROVENANCE_CAPTURED,
+    }
+
+
+def planned_challenger_specification_v5() -> dict[str, Any]:
+    """V5: corrected action semantics, own partition, final_rank_score removed."""
+    req = clock_v2_v5_readiness_requirements()
+    schema = clock_v2_v5_feature_schema()
+    return {
+        "experiment_id": PLANNED_EXPERIMENT_ID_V5,
+        "parent_contracts": [
+            PLANNED_EXPERIMENT_ID,
+            PLANNED_EXPERIMENT_ID_V2,
+            PLANNED_EXPERIMENT_ID_V3,
+            PLANNED_EXPERIMENT_ID_V4,
+        ],
+        "result": PLANNED_RESULT,
+        "promoted": False,
+        "train": False,
+        "live_gate": False,
+        "feature_set": f"{SCHEMA_VERSION}_capture_2_action_corrected",
+        "inputs": list(schema["inputs"]),
+        "feature_schema": schema,
+        "removed_inputs": list(schema["removed_from_v4"]),
+        "final_rank_treatment": FINAL_RANK_TREATMENT_V5,
+        "target": PRIMARY_TARGET,
+        "primary_target_horizon_sec": PRIMARY_TARGET_HORIZON_SEC,
+        "primary_target_horizon_name": PRIMARY_TARGET_HORIZON_NAME,
+        "target_horizon_status": TARGET_HORIZON_STATUS,
+        "executable_price_method": EXECUTABLE_PRICE_METHOD,
+        "commission_methodology": "expected_exchange_commission_rt, identical for every action",
+        "spread_methodology": "decision_time_quote_spread_bps, identical for every action",
+        "slippage_methodology": "expected_slippage_rt, identical for every action",
+        "hold_value_bps": 0.0,
+        "actions": list(schema["actions"]),
+        "forming_candle_allowed": FORMING_CANDLE_ALLOWED,
+        "model_class": "small_regularized_not_selected",
+        "effective_fitted_parameters": CLOCK_V2_V5_EFFECTIVE_FITTED_PARAMETERS,
+        "minimum_trainable_comparable_groups": CLOCK_V2_V5_REQUIRED_GROUPS,
+        "minimum_authoritative_real_fill_support": CLOCK_V2_V5_REQUIRED_CALIBRATION_FILLS,
+        "acceptance": {
+            **future_acceptance_bar(),
+            "primary_objective": "positive expected executable net after genuine costs",
+            "profit_factor_above_one": True,
+            "beats_current_champion": True,
+            "majority_chronological_folds": True,
+            "beats_hold_aware_baseline": True,
+            "drawdown_not_materially_worse": True,
+            "no_leakage": True,
+            "future_final_test_required_before_promotion": True,
+        },
+        "training_procedure": {
+            **planned_training_procedure(),
+            "executed": False,
+            "folds": "expanding_chronological",
+            "grouped_decision_timestamp_atomic": True,
+            "no_same_group_in_train_and_validation": True,
+            "purge_overlapping_label_horizons": True,
+            "embargo_seconds_min": CLOCK_V2_V5_EMBARGO_SEC,
+            "training_partition": "DEVELOPMENT",
+            "quarantine_excluded": True,
+            "lock_inspection_during_development": False,
+            "generic_4h_lock_untouched": True,
+        },
+        "readiness_requirements": req,
+        "statistical_contract": clock_v2_v3_parameter_contract(),
+        "notes": (
+            "V5 corrects action semantics: action_available is path_input_valid plus real hard "
+            "gates, not legacy candidate-list membership. Uses the clock-v2 partition contract "
+            "instead of the open-ended 4H lock, which stays sealed and uninspected. "
+            "final_rank_score removed as not all-action definable; support floor held at "
+            f"{CLOCK_V2_V5_REQUIRED_GROUPS} groups. Does not mutate v1/v2/v3/v4. PLANNED_NOT_RUN."
+        ),
+    }
