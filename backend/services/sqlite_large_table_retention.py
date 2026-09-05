@@ -64,6 +64,8 @@ PROTECTED_TABLES: frozenset[str] = frozenset(
     {
         "day_experiment_registry",
         "day_forward_lock_registry",
+        "day_path_clock_feature_snapshots",
+        "day_path_clock_readiness_history",
     }
 )
 

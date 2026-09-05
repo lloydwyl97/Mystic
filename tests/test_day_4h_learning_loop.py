@@ -218,7 +218,12 @@ def test_experiment_and_lock_registries_are_protected_not_expired():
     keep = {p.table: p.keep_days for p in RETENTION_POLICIES}
     assert "day_experiment_registry" not in keep
     assert "day_forward_lock_registry" not in keep
-    assert set(PROTECTED_TABLES) == {"day_experiment_registry", "day_forward_lock_registry"}
+    assert set(PROTECTED_TABLES) == {
+        "day_experiment_registry",
+        "day_forward_lock_registry",
+        "day_path_clock_feature_snapshots",
+        "day_path_clock_readiness_history",
+    }
 
 
 def test_report_window_empty_db(tmp_path):

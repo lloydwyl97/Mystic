@@ -146,7 +146,12 @@ def test_unmatured_open_trade_is_not_double_counted():
 # ------------------------------------------------------------------------------------
 def test_sealed_research_authority_is_never_on_a_deletion_timer():
     policy_tables = {p.table for p in RETENTION_POLICIES}
-    assert set(PROTECTED_TABLES) == {"day_experiment_registry", "day_forward_lock_registry"}
+    assert set(PROTECTED_TABLES) == {
+        "day_experiment_registry",
+        "day_forward_lock_registry",
+        "day_path_clock_feature_snapshots",
+        "day_path_clock_readiness_history",
+    }
     assert not (policy_tables & PROTECTED_TABLES)
 
 

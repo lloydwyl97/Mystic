@@ -696,24 +696,51 @@ def readiness_progress(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+MATURE_EVENT_UNIT = "authoritative selected-trade labels: decision_role==traded AND label.provenance==authoritative. Not decision groups. Not four-coin candidate rows from one timestamp."
+CHRONOLOGICAL_BLOCK_DEFINITION = f"UTC floor(created_at_unix / {CHRONOLOGICAL_BLOCK_HOURS}h). Distinct 24-hour bins that contain at least one forward-window decision group."
+
+
 def format_snapshot(report: dict[str, Any]) -> str:
     """Readable A-I snapshot ending in an unambiguous train / do-not-train line."""
     lines = ["DAY MODEL DATA-READINESS SNAPSHOT", f"generated_at: {report.get('generated_at')}", ""]
     for name, check in (report.get("checks") or {}).items():
         lines.append(f"  {name:<34} {'PASS' if check.get('pass') else 'FAIL'}")
     ready = bool(report.get("ready"))
+    span = (report.get("checks") or {}).get("G_forward_span") or {}
+    lock = (report.get("checks") or {}).get("H_locked_test_protection") or {}
+    registry = (report.get("checks") or {}).get("I_experiment_registry") or {}
+    accounting = (report.get("checks") or {}).get("F_accounting") or {}
+    coverage = (report.get("checks") or {}).get("D_feature_coverage") or {}
     lines += ["", f"DATA_READINESS = {'PASS' if ready else 'FAIL'}"]
     if not ready:
         lines.append(f"blocking: {', '.join(report.get('reasons_not_ready') or []) or 'unknown'}")
+    lines += ["", "UNITS (do not change):"]
+    lines.append(f"  mature_event_unit: {MATURE_EVENT_UNIT}")
+    lines.append(f"  required_mature_trade_labels: {span.get('required_mature_trade_labels')}")
+    lines.append(f"  chronological_block_definition: {CHRONOLOGICAL_BLOCK_DEFINITION}")
+    lines.append(f"  required_chronological_blocks: {span.get('required_chronological_blocks')}")
     lines += ["", "PROGRESS TO READINESS:"]
     for key, value in readiness_progress(report).items():
         lines.append(f"  {key:<28} {value}")
+    extra = report.get("clock_v2_progress") or {}
+    if extra:
+        lines += ["", "CLOCK-V2 FEATURE COVERAGE (pre-decision only):"]
+        for key, value in extra.items():
+            lines.append(f"  {key:<28} {value}")
     lines += [
         "",
+        f"  accounting_integrity         {'PASS' if accounting.get('pass') else 'FAIL'}",
+        f"  lock_inspected               {lock.get('inspected')}",
+        f"  historical_66_excluded       {lock.get('historical_66_excluded')}",
+        f"  experiment_registry_arms     {registry.get('recorded_arms')}",
+        f"  feature_coverage             {coverage.get('coverage')}",
+        "",
+        f"READY_FOR_MODEL_RESEARCH = {'YES' if ready else 'NO'}",
         f"READY_FOR_MODEL_TRAINING = {'true' if ready else 'false'}",
         "",
         "A passing gate permits the next task to be scoped. It does not authorize model",
         "training, model promotion, or any strategy change; those remain explicit decisions.",
+        "This snapshot prints counts and pass/fail only. It does not print locked outcome values.",
     ]
     return "\n".join(lines)
 
@@ -809,8 +836,10 @@ if __name__ == "__main__":
 
 __all__ = [
     "ACCEPTANCE_STANDARD",
+    "CHRONOLOGICAL_BLOCK_DEFINITION",
     "CHRONOLOGICAL_BLOCK_HOURS",
     "LABEL_RECONCILE_TOLERANCE_BPS",
+    "MATURE_EVENT_UNIT",
     "MIN_CHRONOLOGICAL_BLOCKS",
     "MIN_EVENTS_PER_FEATURE",
     "MIN_FEATURE_COVERAGE",

@@ -59,6 +59,20 @@ SEED_ARMS: tuple[ExperimentArm, ...] = (
         False,
         "4h pre-entry research; do not reuse 66 as lock",
     ),
+    ExperimentArm(
+        "M_clock_v2_planned_20260905",
+        "2026-09-05",
+        "day_path_clock_v2",
+        "expected_executable_net_bps",
+        "small_regularized_not_selected",
+        "not_fit",
+        "forward_after_feature_start",
+        "expanding_chrono_folds",
+        "forward_4h_entry_lock_20260903",
+        "PLANNED_NOT_RUN",
+        False,
+        "Frozen clock-v2 challenger. Do not train until an explicit later task. Do not inspect the lock.",
+    ),
 )
 
 SCHEMA_SQL = f"""
@@ -124,6 +138,31 @@ def seed_historical(db_path: str | Path) -> int:
     finally:
         conn.close()
     return inserted
+
+
+def record_planned_clock_v2(db_path: str | Path) -> None:
+    """Insert the frozen clock-v2 plan. Never promotes. Never trains."""
+    from backend.services.day_path_clock_v2 import planned_challenger_specification
+
+    spec = planned_challenger_specification()
+    record_experiment(
+        db_path,
+        {
+            "experiment_id": spec["experiment_id"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "feature_set": spec["feature_set"],
+            "target": spec["target"],
+            "model_class": spec["model_class"],
+            "hyperparameters": spec["training_procedure"],
+            "training_period": "forward_after_feature_start",
+            "validation_period": "expanding_chrono_folds",
+            "locked_period": spec["acceptance"]["lock_cutoff"],
+            "result": spec["result"],
+            "promoted": False,
+            "notes": spec["notes"],
+            **spec,
+        },
+    )
 
 
 def record_experiment(db_path: str | Path, payload: dict[str, Any]) -> None:

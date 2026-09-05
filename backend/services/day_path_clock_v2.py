@@ -153,3 +153,65 @@ def future_decision_contract() -> dict[str, Any]:
         "activated": False,
         "live_authority": "day_path_net_v1_valid_dense_only",
     }
+
+
+PLANNED_EXPERIMENT_ID = "M_clock_v2_planned_20260905"
+PLANNED_RESULT = "PLANNED_NOT_RUN"
+
+
+def planned_challenger_specification() -> dict[str, Any]:
+    """Frozen first-challenger spec. Recorded before readiness. Not fitted."""
+    schema = clock_challenger_export_schema()
+    return {
+        "experiment_id": PLANNED_EXPERIMENT_ID,
+        "result": PLANNED_RESULT,
+        "promoted": False,
+        "train": False,
+        "live_gate": False,
+        "feature_set": SCHEMA_VERSION,
+        "inputs": list(schema["inputs"]),
+        "target": PRIMARY_TARGET,
+        "actions": list(schema["actions"]),
+        "hold_value_bps": 0.0,
+        "model_class": "small_regularized_not_selected",
+        "acceptance": future_acceptance_bar(),
+        "training_procedure": planned_training_procedure(),
+        "notes": "Frozen before lock inspection. Do not redesign after seeing the lock.",
+    }
+
+
+def planned_training_procedure() -> dict[str, Any]:
+    """Future training recipe only. Execution is a later explicit task."""
+    return {
+        "executed": False,
+        "folds": "expanding_chronological",
+        "purge_overlapping_outcome_intervals": True,
+        "embargo_seconds_min": max(CLOCK_LABEL_HORIZONS_SEC.values()),
+        "regularization": "strong",
+        "model_family": "small_only",
+        "calibration": "training_only",
+        "hold_alternative_bps": 0.0,
+        "portfolio_replay": "real_constraints",
+        "locked_test": "used_once",
+        "hyperparameter_search_on_lock": False,
+        "grid_search": False,
+    }
+
+
+REQUIRED_CLOCK_V2_FIELDS: tuple[str, ...] = (
+    "symbol",
+    "p_buy",
+    "legacy_path_ev",
+    "final_rank_score",
+    "ret_5m",
+    "ret_15m",
+    "ret_30m",
+    "realized_vol_10m",
+    "btc_rel_ret_5m",
+    "production_4h_break_true_at_decision",
+    "distance_to_4h_break_bps",
+    "4h_range_position",
+    "spread_bps",
+    "estimated_all_in_cost_bps",
+    "rel_volume_15m",
+)

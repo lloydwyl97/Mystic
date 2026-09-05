@@ -40,11 +40,11 @@ def load_asof_1m_bars(db_path: str | Path, symbol: str, as_of: Any, *, limit: in
                 """
                 SELECT open, high, low, close, volume, ts
                 FROM feature_ohlcv
-                WHERE interval='1m' AND symbol=? AND ts<=?
+                WHERE interval='1m' AND symbol=?
                 ORDER BY ts DESC
                 LIMIT ?
                 """,
-                (name, when.isoformat(), int(limit)),
+                (name, int(limit) * 3),
             ).fetchall()
             if rows:
                 break
@@ -54,8 +54,11 @@ def load_asof_1m_bars(db_path: str | Path, symbol: str, as_of: Any, *, limit: in
         conn.close()
     out = []
     for o, h, low, c, v, ts in reversed(rows):
+        parsed = parse_as_of(ts)
+        if parsed is None or parsed > when:
+            continue
         out.append({"open": o, "high": h, "low": low, "close": c, "volume": v, "ts": ts})
-    return out
+    return out[-int(limit) :]
 
 
 def _utc_iso(ts: Any) -> str | None:
