@@ -73,6 +73,39 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/portfolio-engine", tags=["Portfolio Engine"])
 
 
+def _authoritative_positions_value(ledger: dict[str, Any]) -> float:
+    """Marked-to-market position value from the ledger. Reporting only.
+
+    Prefers the authoritative scalar the ledger publishes. Falls back to summing a
+    `positions` collection only when one is actually present, so this never
+    reports 0.0 for an account that holds positions.
+    """
+    raw = (ledger or {}).get("positions_value")
+    if raw not in (None, ""):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    rows = (ledger or {}).get("positions")
+    if isinstance(rows, list) and rows:
+        total = 0.0
+        for pos in rows:
+            if not isinstance(pos, dict):
+                continue
+            value = pos.get("current_value")
+            if value in (None, ""):
+                try:
+                    value = float(pos.get("quantity") or 0) * float(pos.get("current_price") or 0)
+                except (TypeError, ValueError):
+                    value = 0.0
+            try:
+                total += float(value or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return total
+    return 0.0
+
+
 def _validate_accounting_identity(cash: float, positions: float, equity: float, realized: float, unrealized: float, total_pnl: float) -> dict[str, Any]:
     """
     INVARIANT CHECK: Validate accounting identities for PAPER mode.
@@ -331,7 +364,10 @@ async def get_portfolio_ledger() -> dict[str, Any]:
         # BUG #30 FIX: Validate equity invariant
         # INVARIANT: total_equity should equal cash_balance + positions_value
         cash_balance = float(ledger.get("cash_balance", 0))
-        positions_value = sum(pos.get("current_value", pos.get("quantity", 0) * pos.get("current_price", 0)) for pos in ledger.get("positions", []))
+        # The ledger exposes the authoritative scalar `positions_value`; it has no
+        # `positions` collection. Summing that absent key yielded 0.0 and raised a
+        # false EQUITY INVARIANT BROKEN alarm on every call with an open position.
+        positions_value = _authoritative_positions_value(ledger)
         total_equity = float(ledger.get("total_equity", 0))
         expected_equity = cash_balance + positions_value
 
