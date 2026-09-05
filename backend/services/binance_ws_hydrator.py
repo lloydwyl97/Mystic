@@ -68,6 +68,11 @@ class BinanceWSHydrator:
         self._c1m: dict[str, list[float]] = {}
         # Track last closed bar's open-timestamp (seconds) per symbol; used for gap detection and backfill
         self._last_bar_ts: dict[str, int] = {}
+        # Per-symbol asyncio.Lock serialises the Redis read-modify-write cycle in
+        # _append_candle and _backfill_missing_bars.  Without this, two concurrent
+        # tasks (e.g. backfill + kline flush) can both read the same stale array
+        # before either writes back, producing duplicate timestamps.
+        self._kline_write_locks: dict[str, asyncio.Lock] = {}
         # Track background tasks for proper cleanup
         self._tasks: list[asyncio.Task[Any]] = []
 
@@ -376,39 +381,48 @@ class BinanceWSHydrator:
         except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
             pass
 
+    def _kline_lock(self, sym: str) -> asyncio.Lock:
+        """Return (creating if needed) the per-symbol write-lock for kline history."""
+        if sym not in self._kline_write_locks:
+            self._kline_write_locks[sym] = asyncio.Lock()
+        return self._kline_write_locks[sym]
+
     async def _append_candle(self, sym: str, interval: str, candle: list[float]) -> None:
         """Write one candle to the Redis klines history.
 
         Upserts by open-timestamp: if a row with the same bar_ts already exists it
-        is replaced in-place rather than appended.  This prevents the miniTicker
-        and kline paths from creating duplicate rows for the same minute even when
-        both paths race to call this method.
+        is replaced in-place rather than appended.
+
+        The per-symbol asyncio.Lock (_kline_lock) serialises concurrent callers so
+        that two tasks cannot both read the same stale array and both append the same
+        timestamp before either write completes (read-modify-write race).
         """
         try:
             if self._cg is None:
                 return
             r = self._cg.r  # type: ignore[attr-defined]
             key = f"klines:{sym}:{interval}"
-
-            raw = await r.get(key)
-            arr: list[list[float]] = []
-            if raw:
-                try:
-                    arr = json.loads(raw)
-                except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
-                    arr = []
             bar_ts = candle[0]
             row = [candle[0], candle[1], candle[2], candle[3], candle[4], candle[5]]
-            # Upsert: replace an existing row for this minute, or append if new.
-            existing_idx = next((i for i, r_row in enumerate(arr) if r_row[0] == bar_ts), None)
-            if existing_idx is not None:
-                arr[existing_idx] = row
-            else:
-                arr.append(row)
-            # Trim to last 600
-            if len(arr) > 600:
-                arr = arr[-600:]
-            await r.set(key, json.dumps(arr), ex=900)
+
+            async with self._kline_lock(sym):
+                raw = await r.get(key)
+                arr: list[list[float]] = []
+                if raw:
+                    try:
+                        arr = json.loads(raw)
+                    except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
+                        arr = []
+                # Upsert: replace an existing row for this minute, or append if new.
+                existing_idx = next((i for i, r_row in enumerate(arr) if r_row[0] == bar_ts), None)
+                if existing_idx is not None:
+                    arr[existing_idx] = row
+                else:
+                    arr.append(row)
+                # Trim to last 600
+                if len(arr) > 600:
+                    arr = arr[-600:]
+                await r.set(key, json.dumps(arr), ex=900)
         except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
             pass
 
@@ -487,38 +501,41 @@ class BinanceWSHydrator:
             if not data:
                 return
             r = self._cg.r  # type: ignore[attr-defined]
-            raw = await r.get(f"klines:{sym}:1m")
-            arr: list[Any] = []
-            if raw:
-                try:
-                    arr = json.loads(raw)
-                except (ValueError, TypeError):
-                    arr = []
-            existing_ts: set[int] = {int(row[0]) for row in arr}
-            added = 0
-            for kline in data:
-                bar_ts = int(kline[0]) // 1000
-                if bar_ts in existing_ts:
-                    continue
-                if float(kline[4] or 0) <= 0:
-                    continue  # skip zero-close bars
-                candle = [
-                    float(bar_ts),
-                    float(kline[1]),
-                    float(kline[2]),
-                    float(kline[3]),
-                    float(kline[4]),
-                    float(kline[5]),
-                ]
-                arr.append(candle)
-                existing_ts.add(bar_ts)
-                added += 1
-            if added > 0:
-                arr.sort(key=lambda x: x[0])
-                if len(arr) > 600:
-                    arr = arr[-600:]
-                await r.set(f"klines:{sym}:1m", json.dumps(arr), ex=900)
-                self._last_bar_ts[sym] = max(int(row[0]) for row in arr)
+            # Acquire per-symbol lock: backfill does its own bulk read-modify-write
+            # and must not race with concurrent _append_candle calls.
+            async with self._kline_lock(sym):
+                raw = await r.get(f"klines:{sym}:1m")
+                arr: list[Any] = []
+                if raw:
+                    try:
+                        arr = json.loads(raw)
+                    except (ValueError, TypeError):
+                        arr = []
+                existing_ts: set[int] = {int(row[0]) for row in arr}
+                added = 0
+                for kline in data:
+                    bar_ts = int(kline[0]) // 1000
+                    if bar_ts in existing_ts:
+                        continue
+                    if float(kline[4] or 0) <= 0:
+                        continue  # skip zero-close bars
+                    candle = [
+                        float(bar_ts),
+                        float(kline[1]),
+                        float(kline[2]),
+                        float(kline[3]),
+                        float(kline[4]),
+                        float(kline[5]),
+                    ]
+                    arr.append(candle)
+                    existing_ts.add(bar_ts)
+                    added += 1
+                if added > 0:
+                    arr.sort(key=lambda x: x[0])
+                    if len(arr) > 600:
+                        arr = arr[-600:]
+                    await r.set(f"klines:{sym}:1m", json.dumps(arr), ex=900)
+                    self._last_bar_ts[sym] = max(int(row[0]) for row in arr)
                 logger.info(
                     "Backfilled %d missing 1m bars for %s (gap was %ds, last_ts=%d)",
                     added,

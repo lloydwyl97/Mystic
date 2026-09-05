@@ -432,9 +432,7 @@ async def test_miniticker_new_minute_does_not_write_to_redis():
     await h._update_candles("BTCUSDT", float(ts_x1) + 0.5, 100.6)
 
     # Redis must be completely untouched; closed bar has NOT arrived via kline yet
-    assert "klines:BTCUSDT:1m" not in store, (
-        "_update_candles must not write to Redis; closed bars are kline-stream-only"
-    )
+    assert "klines:BTCUSDT:1m" not in store, "_update_candles must not write to Redis; closed bars are kline-stream-only"
     # New forming candle must be started for minute X+1
     assert int(h._c1m.get("BTCUSDT", [0])[0]) == ts_x1
 
@@ -518,7 +516,37 @@ async def test_600_bar_trim_after_upsert():
 
 
 # ---------------------------------------------------------------------------
-# 18. Atomic cache state: upsert preserves sort order
+# 18. Concurrent write race: per-symbol lock prevents duplicate timestamps
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_flush_no_duplicate():
+    """Two concurrent _flush_closed_kline calls for the same (sym, ts) must produce
+    exactly one row, not two, even when both pass the _last_bar_ts guard simultaneously.
+
+    This tests the asyncio.Lock in _append_candle that serialises the
+    read-modify-write cycle and prevents the race observed in production
+    (XRP 1 dup after the first dual-write fix that lacked locking).
+    """
+    store: dict[str, Any] = {}
+    h = _make_hydrator(store)
+    bar_ts = 1_002_000
+
+    # Fire two concurrent flushes for the same bar — simulates exchange sending
+    # two x=True events before _last_bar_ts is updated by either task.
+    await asyncio.gather(
+        h._append_candle("BTCUSDT", "1m", [float(bar_ts), 100.0, 101.0, 99.0, 100.5, 2.0]),
+        h._append_candle("BTCUSDT", "1m", [float(bar_ts), 100.0, 101.0, 99.0, 100.5, 2.0]),
+    )
+
+    arr = json.loads(store["klines:BTCUSDT:1m"])
+    ts_vals = [int(r[0]) for r in arr]
+    assert ts_vals.count(bar_ts) == 1, "lock must prevent concurrent duplicate for same timestamp"
+
+
+# ---------------------------------------------------------------------------
+# 20. Atomic cache state: upsert preserves sort order
 # ---------------------------------------------------------------------------
 
 
