@@ -542,7 +542,15 @@ class BinanceWSHydrator:
                     existing_ts.add(bar_ts)
                     added += 1
                 if added > 0:
+                    # Sort ascending, then deduplicate by open-timestamp keeping
+                    # the last occurrence (same policy as _append_candle) so that
+                    # any pre-existing duplicate rows are also cleaned up here.
                     arr.sort(key=lambda x: x[0])
+                    ts_last_idx: dict[float, int] = {}
+                    for i, r_row in enumerate(arr):
+                        ts_last_idx[r_row[0]] = i
+                    if len(ts_last_idx) < len(arr):
+                        arr = [arr[ts_last_idx[ts]] for ts in sorted(ts_last_idx)]
                     if len(arr) > 600:
                         arr = arr[-600:]
                     await r.set(f"klines:{sym}:1m", json.dumps(arr), ex=900)
