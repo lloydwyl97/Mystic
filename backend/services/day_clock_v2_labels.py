@@ -263,6 +263,8 @@ def build_v5_label(
     base["target_bar_open_ts"] = resolved.get("target_bar_open_ts")
     base["target_bar_close_ts"] = resolved.get("target_bar_close_ts")
     base["exchange_symbol"] = resolved.get("exchange_symbol") or symbol
+    base["redis_present"] = bool(resolved.get("redis_present"))
+    base["rest_present"] = bool(resolved.get("rest_present"))
     if resolved.get("status") == STATUS_PENDING_NOT_MATURE:
         base["label_invalid_reason"] = INVALID_IMMATURE
         base["label_status"] = STATUS_PENDING_NOT_MATURE
@@ -559,6 +561,86 @@ def persist_v5_labels(db_path: str | Path, labels: list[dict[str, Any]]) -> int:
     return written
 
 
+def reconsider_rest_absent_mismatch_terminals(
+    db_path: str | Path,
+    *,
+    now: datetime | None = None,
+    redis_client: Any = None,
+    rest_fetch: Any = None,
+    source_resolver: Any = None,
+) -> dict[str, Any]:
+    """Retry TERMINAL mismatch rows that were Redis-present / REST-absent.
+
+    True Redis+REST OHLCV mismatches stay terminal. Only rows whose re-resolve
+    is no longer a contradiction are rewritten.
+    """
+    out = {"examined": 0, "recovered": 0, "still_mismatch": 0}
+    if not Path(db_path).exists():
+        return out
+    conn = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if TABLE_V5_LABELS not in tables or TABLE_ARTIFACT not in tables:
+            return out
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({TABLE_V5_LABELS})")}
+        if "label_status" not in cols:
+            return out
+        rows = [
+            dict(r)
+            for r in conn.execute(
+                f"""
+                SELECT decision_group_id, symbol, decision_timestamp, label_invalid_reason
+                FROM {TABLE_V5_LABELS}
+                WHERE label_source_version=? AND label_status=? AND label_invalid_reason=?
+                """,
+                (LABEL_SOURCE_VERSION, STATUS_TERMINAL_INVALID, INVALID_MISMATCH),
+            )
+        ]
+        arts = {
+            (str(r["decision_group_id"]), str(r["symbol"])): dict(r)
+            for r in conn.execute(
+                f"""
+                SELECT decision_group_id, symbol, decision_timestamp, action_available,
+                       quote_json, feature_json
+                FROM {TABLE_ARTIFACT}
+                """
+            )
+        }
+    finally:
+        conn.close()
+    rewritten: list[dict[str, Any]] = []
+    stamp = now or _now()
+    for row in rows:
+        out["examined"] += 1
+        art = arts.get((str(row["decision_group_id"]), str(row["symbol"])))
+        if art is None:
+            continue
+        entry, spread = _entry_and_spread(art)
+        avail = art.get("action_available")
+        lab = build_v5_label(
+            db_path=db_path,
+            decision_group_id=str(row["decision_group_id"]),
+            symbol=str(row["symbol"]),
+            decision_ts=art.get("decision_timestamp") or row.get("decision_timestamp"),
+            action_available=None if avail is None else bool(avail),
+            entry_px=entry,
+            spread_bps=spread,
+            now=stamp,
+            redis_client=redis_client,
+            rest_fetch=rest_fetch,
+            source_resolver=source_resolver,
+        )
+        if lab.get("label_status") == STATUS_TERMINAL_INVALID and lab.get("label_invalid_reason") == INVALID_MISMATCH:
+            out["still_mismatch"] += 1
+            continue
+        rewritten.append(lab)
+        out["recovered"] += 1
+    if rewritten:
+        persist_v5_labels(db_path, rewritten)
+    return out
+
+
 def run_v5_label_batch(
     db_path: str | Path,
     *,
@@ -578,6 +660,8 @@ def run_v5_label_batch(
         "immature": 0,
         "errors": 0,
         "partition": DEVELOPMENT,
+        "false_mismatch_examined": 0,
+        "false_mismatch_recovered": 0,
     }
     if not labels_enabled() or not db_path:
         return summary
@@ -587,6 +671,20 @@ def run_v5_label_batch(
         logger.warning("DAY_CLOCK_V2_LABEL schema init failed: %s", exc)
         summary["errors"] += 1
         return summary
+    try:
+        recovered = reconsider_rest_absent_mismatch_terminals(
+            db_path,
+            now=now,
+            redis_client=redis_client,
+            rest_fetch=rest_fetch,
+            source_resolver=source_resolver,
+        )
+        summary["false_mismatch_examined"] = int(recovered.get("examined") or 0)
+        summary["false_mismatch_recovered"] = int(recovered.get("recovered") or 0)
+        summary["labels_written"] += int(recovered.get("recovered") or 0)
+    except Exception as exc:
+        logger.warning("DAY_CLOCK_V2_LABEL mismatch recovery failed: %s", exc)
+        summary["errors"] += 1
     try:
         pending = _load_pending_groups(db_path, limit=limit)
     except Exception as exc:
@@ -646,10 +744,7 @@ def load_v5_label_presence(db_path: str | Path) -> dict[tuple[str, str], bool]:
                 FROM {TABLE_V5_LABELS}
                 """
             ).fetchall()
-            return {
-                (str(gid), str(sym)): bool(valid) and str(version or "") == LABEL_SOURCE_VERSION
-                for gid, sym, valid, version in rows
-            }
+            return {(str(gid), str(sym)): bool(valid) and str(version or "") == LABEL_SOURCE_VERSION for gid, sym, valid, version in rows}
         return {}
     finally:
         conn.close()
@@ -699,6 +794,7 @@ __all__ = [
     "hold_label",
     "load_v5_label_presence",
     "persist_v5_labels",
+    "reconsider_rest_absent_mismatch_terminals",
     "required_actions",
     "run_v5_label_batch",
     "v5_label_contract",

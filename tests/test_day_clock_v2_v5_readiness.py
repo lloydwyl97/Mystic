@@ -336,6 +336,34 @@ def test_readiness_reports_fail_below_floor_and_never_trains(tmp_path):
     assert snap["required_calibration_fills"] == 50
 
 
+def test_v5_readiness_does_not_query_4h_outcome_labels(tmp_path, monkeypatch):
+    db = tmp_path / "no4h.db"
+    _seed_artifacts(db, {"g1": _group()})
+    queries: list[str] = []
+    real_connect = sqlite3.connect
+
+    def spy(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(lambda sql: queries.append(str(sql)))
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    import backend.services.day_clock_v2_calibration as cal
+    import backend.services.day_clock_v2_labels as labs
+    import backend.services.day_model_readiness as model
+    import backend.services.day_path_clock_v2_readiness as ready
+
+    monkeypatch.setattr(ready.sqlite3, "connect", spy)
+    monkeypatch.setattr(labs.sqlite3, "connect", spy)
+    monkeypatch.setattr(cal.sqlite3, "connect", spy)
+    monkeypatch.setattr(model.sqlite3, "connect", spy)
+    snap = evaluate_clock_v2_v5_readiness(db)
+    joined = "\n".join(queries)
+    assert "day_decision_outcome_labels" not in joined
+    assert snap["generic_4h_lock"]["outcomes_read"] is False
+    assert snap["generic_4h_lock"]["inspected"] is False
+
+
 def test_readiness_leaves_generic_4h_lock_untouched(tmp_path):
     db = tmp_path / "r3.db"
     _seed_artifacts(db, {"g1": _group()})
@@ -446,9 +474,7 @@ def test_label_table_exists_before_the_first_label_matures(tmp_path):
     assert out["labels_written"] == 0
     conn = sqlite3.connect(str(db))
     try:
-        found = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE_V5_LABELS,)
-        ).fetchone()
+        found = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE_V5_LABELS,)).fetchone()
     finally:
         conn.close()
     assert found is not None

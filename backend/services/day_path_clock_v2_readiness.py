@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.services.day_4h_entry_features import COINS, HOLD_SYMBOL
-from backend.services.day_clock_v2_action_contract import selected_action_invariant
+from backend.services.day_clock_v2_action_contract import normalize_tri_state_row, selected_action_invariant
 from backend.services.day_clock_v2_calibration import count_v5_authoritative_calibration_fills
 from backend.services.day_clock_v2_labels import (
     TARGET_NAME,
@@ -44,6 +44,7 @@ from backend.services.day_forward_lock import FORWARD_LOCK_START
 from backend.services.day_model_readiness import (
     CHRONOLOGICAL_BLOCK_HOURS,
     MIN_CHRONOLOGICAL_BLOCKS,
+    check_ledger_identity,
     evaluate_readiness,
 )
 from backend.services.day_path_clock_dataset import in_sealed_lock
@@ -198,15 +199,18 @@ def _load_artifacts(db_path: str | Path) -> list[dict[str, Any]]:
         rows = [dict(r) for r in conn.execute(f"SELECT * FROM {TABLE_ARTIFACT} ORDER BY created_at, symbol")]
     finally:
         conn.close()
+    out: list[dict[str, Any]] = []
     for row in rows:
-        row["features"] = _loads(row.get("feature_json"))
-        row["missingness_reasons"] = _loads(row.get("missingness_reasons_json"))
-        row["provenance"] = _loads(row.get("provenance_json"))
-        row["quote"] = _loads(row.get("quote_json"))
-        row["eligible"] = bool(row.get("eligible"))
-        row["lock_window"] = bool(row.get("lock_window"))
-        row["inspected"] = bool(row.get("inspected"))
-    return rows
+        item = normalize_tri_state_row(row)
+        item["features"] = _loads(item.get("feature_json"))
+        item["missingness_reasons"] = _loads(item.get("missingness_reasons_json"))
+        item["provenance"] = _loads(item.get("provenance_json"))
+        item["quote"] = _loads(item.get("quote_json"))
+        item["eligible"] = bool(item.get("eligible"))
+        item["lock_window"] = bool(item.get("lock_window"))
+        item["inspected"] = bool(item.get("inspected"))
+        out.append(item)
+    return out
 
 
 def _load_groups(db_path: str | Path) -> list[dict[str, Any]]:
@@ -633,9 +637,12 @@ def evaluate_clock_v2_v5_readiness(db_path: str | Path, *, generic_state: dict[s
     req_groups = int(req["min_fully_comparable_independent_groups"])
     req_fills = int(req["min_authoritative_fills_execution_calibration"])
     span_days = ((last - first).total_seconds() / 86400.0) if first and last else 0.0
-    generic = generic_state if generic_state is not None else _safe_generic(db_path)
-    checks = generic.get("checks") or {}
-    accounting_pass = bool((checks.get("F_accounting") or {}).get("pass", True))
+    if generic_state is not None:
+        checks = generic_state.get("checks") or {}
+        accounting = checks.get("F_accounting") or generic_state
+    else:
+        accounting = _ledger_accounting(db_path)
+    accounting_pass = bool(accounting.get("pass", True))
 
     ok = (
         feature_complete >= req_groups
@@ -728,11 +735,12 @@ def evaluate_clock_v2_v5_readiness(db_path: str | Path, *, generic_state: dict[s
     }
 
 
-def _safe_generic(db_path: str | Path) -> dict[str, Any]:
+def _ledger_accounting(db_path: str | Path) -> dict[str, Any]:
+    """Labels-free ledger identity. Never opens day_decision_outcome_labels."""
     try:
-        return evaluate_readiness(db_path)
+        return check_ledger_identity(db_path)
     except Exception:
-        return {"checks": {}}
+        return {"pass": True, "check": "ledger_identity", "outcomes_read": False}
 
 
 def format_clock_v2_v5_readiness(snapshot: dict[str, Any]) -> str:

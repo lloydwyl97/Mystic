@@ -131,9 +131,7 @@ def test_forming_and_future_candles_are_rejected():
     now = HORIZON
     forming = _candle(datetime(2026, 9, 6, 3, 0, 0, tzinfo=timezone.utc))
     future = _candle(datetime(2026, 9, 6, 3, 1, 0, tzinfo=timezone.utc))
-    assert (
-        select_closed_horizon_candle([forming, future], horizon_at=HORIZON, now=now) is None
-    )
+    assert select_closed_horizon_candle([forming, future], horizon_at=HORIZON, now=now) is None
     chosen = select_closed_horizon_candle(
         [_candle(TARGET_OPEN), forming, future],
         horizon_at=HORIZON,
@@ -351,9 +349,7 @@ def test_hold_valid_v1_does_not_skip_retry_and_batch_is_idempotent(tmp_path):
     hold = hold_label(decision_group_id="daygrp_1", decision_ts=DECISION.isoformat())
     hold["label_source_version"] = "day_clock_v2_target_3h_v1"
     persist_v5_labels(db, [hold])
-    conn.execute(
-        f"UPDATE {TABLE_V5_LABELS} SET label_source_version='legacy_v1' WHERE symbol='HOLD'"
-    )
+    conn.execute(f"UPDATE {TABLE_V5_LABELS} SET label_source_version='legacy_v1' WHERE symbol='HOLD'")
     conn.commit()
     conn.close()
     redis, rest = _matching_books()
@@ -400,6 +396,107 @@ def test_obsolete_final_rank_blob_is_ignored_by_v5_export():
     from backend.services.day_path_clock_v2 import clock_v2_v5_readiness_requirements
 
     assert "final_rank_score" not in clock_v2_v5_readiness_requirements()["listed_inputs"]
+
+
+def test_redis_present_rest_empty_is_pending_not_terminal():
+    redis = _FakeRedis({"ETHUSDT": [_redis_row(TARGET_OPEN, 100.0)]})
+
+    def empty(symbol: str, start_ms: int, end_ms: int):
+        del symbol, start_ms, end_ms
+        return []
+
+    out = resolve_v5_horizon_candle("ETHUSDT", HORIZON, now=HORIZON + timedelta(hours=1), redis_client=redis, rest_fetch=empty)
+    assert out["ok"] is False
+    assert out["status"] == STATUS_PENDING_LABEL_SOURCE
+    assert out["reason"] == INVALID_REST_TRANSIENT
+    assert out["redis_present"] is True
+    assert out["rest_present"] is False
+
+
+def test_redis_present_rest_empty_then_match_completes_once(tmp_path):
+    db = tmp_path / "retry_rest.db"
+    _seed_group(db, gid="daygrp_retry")
+    redis = _FakeRedis({sym: [_redis_row(TARGET_OPEN, 110.0)] for sym in COINS})
+
+    def empty(symbol: str, start_ms: int, end_ms: int):
+        del symbol, start_ms, end_ms
+        return []
+
+    first = run_v5_label_batch(db, now=HORIZON + timedelta(hours=1), redis_client=redis, rest_fetch=empty)
+    assert first["groups_scanned"] == 1
+    conn = sqlite3.connect(str(db))
+    rows = conn.execute(f"SELECT symbol, label_status, label_invalid_reason, label_valid FROM {TABLE_V5_LABELS} WHERE symbol!='HOLD'").fetchall()
+    assert rows
+    assert all(status == STATUS_PENDING_LABEL_SOURCE for _, status, _, _ in rows)
+    assert all(reason == INVALID_REST_TRANSIENT for _, _, reason, _ in rows)
+    assert all(valid == 0 for _, _, _, valid in rows)
+
+    def rest(symbol: str, start_ms: int, end_ms: int):
+        del symbol, start_ms, end_ms
+        return [_rest_row(TARGET_OPEN, 110.0)]
+
+    second = run_v5_label_batch(db, now=HORIZON + timedelta(hours=1), redis_client=redis, rest_fetch=rest)
+    assert second["valid"] == 5
+    presence = load_v5_label_presence(db)
+    assert all(presence[("daygrp_retry", sym)] for sym in (*COINS, "HOLD"))
+    count = conn.execute(f"SELECT COUNT(*) FROM {TABLE_V5_LABELS}").fetchone()[0]
+    assert count == 5
+    third = run_v5_label_batch(db, now=HORIZON + timedelta(hours=1), redis_client=redis, rest_fetch=rest)
+    assert third["groups_scanned"] == 0
+    assert conn.execute(f"SELECT COUNT(*) FROM {TABLE_V5_LABELS}").fetchone()[0] == 5
+    conn.close()
+
+
+def test_legacy_false_mismatch_rest_absent_is_recovered(tmp_path):
+    db = tmp_path / "legacy_mismatch.db"
+    _seed_group(db, gid="daygrp_old")
+    redis = _FakeRedis({sym: [_redis_row(TARGET_OPEN, 110.0)] for sym in COINS})
+    lab = build_v5_label(
+        db_path=db,
+        decision_group_id="daygrp_old",
+        symbol="ETHUSDT",
+        decision_ts=DECISION.isoformat(),
+        action_available=True,
+        entry_px=100.0,
+        now=HORIZON + timedelta(hours=1),
+        redis_client=redis,
+        rest_fetch=lambda *_a, **_k: [],
+    )
+    lab["label_status"] = "TERMINAL_INVALID"
+    lab["label_invalid_reason"] = INVALID_MISMATCH
+    persist_v5_labels(db, [lab])
+    recovered = run_v5_label_batch(
+        db,
+        now=HORIZON + timedelta(hours=1),
+        redis_client=redis,
+        rest_fetch=lambda *_a, **_k: [_rest_row(TARGET_OPEN, 110.0)],
+    )
+    assert recovered["false_mismatch_recovered"] >= 1
+    conn = sqlite3.connect(str(db))
+    status, reason, valid = conn.execute(f"SELECT label_status, label_invalid_reason, label_valid FROM {TABLE_V5_LABELS} WHERE symbol='ETHUSDT'").fetchone()
+    conn.close()
+    assert status == STATUS_COMPLETE
+    assert reason is None
+    assert valid == 1
+
+
+def test_true_ohlcv_mismatch_stays_terminal_after_recovery(tmp_path):
+    db = tmp_path / "true_mismatch.db"
+    _seed_group(db, gid="daygrp_mm")
+    redis = _FakeRedis({sym: [_redis_row(TARGET_OPEN, 100.0)] for sym in COINS})
+
+    def rest(symbol: str, start_ms: int, end_ms: int):
+        del symbol, start_ms, end_ms
+        return [_rest_row(TARGET_OPEN, 101.0)]
+
+    run_v5_label_batch(db, now=HORIZON + timedelta(hours=1), redis_client=redis, rest_fetch=rest)
+    again = run_v5_label_batch(db, now=HORIZON + timedelta(hours=1), redis_client=redis, rest_fetch=rest)
+    conn = sqlite3.connect(str(db))
+    rows = conn.execute(f"SELECT label_status, label_invalid_reason FROM {TABLE_V5_LABELS} WHERE symbol!='HOLD'").fetchall()
+    conn.close()
+    assert rows
+    assert all(status == "TERMINAL_INVALID" and reason == INVALID_MISMATCH for status, reason in rows)
+    assert again["false_mismatch_recovered"] == 0
 
 
 def test_parse_redis_rejects_duplicates():

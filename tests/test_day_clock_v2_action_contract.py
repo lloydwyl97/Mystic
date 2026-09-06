@@ -29,6 +29,7 @@ from backend.services.day_clock_v2_action_contract import (
     evaluate_legacy_rank_candidate,
     reconstruct_group_action_state,
     selected_action_invariant,
+    sqlite_tri_bool,
 )
 from backend.services.day_clock_v2_partition import (
     CLOCK_V2_V5_DEVELOPMENT_START,
@@ -343,3 +344,73 @@ def test_partition_registration_does_not_touch_forward_lock_table(tmp_path):
     finally:
         conn.close()
     assert "day_forward_lock_registry" not in tables
+
+
+def test_sqlite_tri_bool_preserves_unknown():
+    assert sqlite_tri_bool(1) is True
+    assert sqlite_tri_bool(0) is False
+    assert sqlite_tri_bool(None) is None
+    assert sqlite_tri_bool(True) is True
+    assert sqlite_tri_bool(False) is False
+
+
+def test_selected_unavailable_integer_zero_is_a_violation():
+    rows = [
+        {"symbol": "ETHUSDT", "action_available": 0, "action_unavailable_reason": DUPLICATE_SAME_SYMBOL},
+        {"symbol": "HOLD", "action_available": 1, "action_unavailable_reason": None},
+    ]
+    out = selected_action_invariant(rows=rows, selected_symbol="ETHUSDT")
+    assert out["pass"] is False
+    assert VIOLATION_SELECTED_UNAVAILABLE in out["violations"]
+    assert out["action_available"] is False
+
+
+def test_artifact_sqlite_round_trip_tri_state(tmp_path):
+    from backend.services.day_path_clock_v2_capture import persist_group_artifacts
+    from backend.services.day_path_clock_v2_readiness import _load_artifacts
+
+    db = tmp_path / "tri.db"
+
+    def _art(symbol: str, available):
+        return {
+            "decision_group_id": "g_tri",
+            "symbol": symbol,
+            "created_at": "2026-09-06T00:00:00+00:00",
+            "decision_timestamp": "2026-09-06T00:00:00+00:00",
+            "feature_schema_version": "day_path_clock_v2",
+            "feature_contract_version": "day_path_clock_v2_capture_1",
+            "eligible": True,
+            "features": {"symbol": symbol},
+            "missingness_bitmap": 0,
+            "missingness_reasons": {},
+            "provenance": {},
+            "quote": {},
+            "lock_window": False,
+            "inspected": False,
+            "action_available": available,
+            "action_unavailable_reason": DUPLICATE_SAME_SYMBOL if available is False else None,
+            "legacy_rank_candidate_present": True,
+            "legacy_final_rank_score": None,
+            "legacy_final_rank_score_valid": False,
+            "clock_v2_partition": DEVELOPMENT,
+        }
+
+    persist_group_artifacts(
+        db,
+        [
+            _art("ETHUSDT", False),
+            _art("BTCUSDT", True),
+            _art("SOLUSDT", None),
+            _art("HOLD", True),
+        ],
+    )
+    loaded = {row["symbol"]: row for row in _load_artifacts(db)}
+    assert loaded["ETHUSDT"]["action_available"] is False
+    assert loaded["BTCUSDT"]["action_available"] is True
+    assert loaded["SOLUSDT"]["action_available"] is None
+    invariant = selected_action_invariant(rows=list(loaded.values()), selected_symbol="ETHUSDT")
+    assert invariant["pass"] is False
+    assert VIOLATION_SELECTED_UNAVAILABLE in invariant["violations"]
+    unknown = selected_action_invariant(rows=list(loaded.values()), selected_symbol="SOLUSDT")
+    assert unknown["pass"] is True
+    assert unknown["availability_unverifiable"] is True

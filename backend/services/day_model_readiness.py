@@ -531,6 +531,50 @@ def check_accounting(state: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def check_ledger_identity(db_path: str | Path) -> dict[str, Any]:
+    """Cash + positions_value ≈ equity. Never reads day_decision_outcome_labels."""
+    empty = {
+        "check": "ledger_identity",
+        "pass": True,
+        "outcomes_read": False,
+        "labels_queried": False,
+        "reason": "ledger_absent",
+    }
+    if not db_path or not Path(db_path).exists():
+        return empty
+    conn = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "portfolio_engine_ledger" not in tables:
+            return empty
+        row = conn.execute("SELECT cash_balance, positions_value, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
+    except sqlite3.Error:
+        return empty
+    finally:
+        conn.close()
+    if row is None:
+        return empty
+    try:
+        cash = float(row[0] or 0.0)
+        positions = float(row[1] or 0.0)
+        equity = float(row[2] or 0.0)
+    except (TypeError, ValueError):
+        return {**empty, "pass": False, "reason": "ledger_unreadable"}
+    drift = abs(equity - (cash + positions))
+    return {
+        "check": "ledger_identity",
+        "pass": drift <= 0.01,
+        "outcomes_read": False,
+        "labels_queried": False,
+        "cash_balance": cash,
+        "positions_value": positions,
+        "total_equity": equity,
+        "abs_drift": drift,
+        "tolerance": 0.01,
+        "reason": None if drift <= 0.01 else "equity_identity_broken",
+    }
+
+
 # --------------------------------------------------------------------------------------
 # G. forward chronological span
 # --------------------------------------------------------------------------------------
@@ -852,6 +896,7 @@ __all__ = [
     "check_feature_coverage",
     "check_forward_span",
     "check_label_maturity",
+    "check_ledger_identity",
     "check_locked_test_protection",
     "check_production_label_integrity",
     "check_time_authority",

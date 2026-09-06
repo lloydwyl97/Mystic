@@ -71,6 +71,35 @@ def _api(symbol: Any) -> str:
     return text
 
 
+def sqlite_tri_bool(raw: Any) -> bool | None:
+    """Normalize SQLite INTEGER/NULL tri-state. Never collapses NULL to False."""
+    if raw is None:
+        return None
+    if raw is True or raw is False:
+        return raw
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw in (0, 1):
+        return bool(int(raw))
+    if raw in ("0", "1"):
+        return raw == "1"
+    return None
+
+
+TRI_STATE_FIELDS: tuple[str, ...] = (
+    "action_available",
+    "legacy_rank_candidate_present",
+    "legacy_final_rank_score_valid",
+)
+
+
+def normalize_tri_state_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Coerce persisted 1/0/NULL at the load boundary. Leaves other keys untouched."""
+    out = dict(row or {})
+    for name in TRI_STATE_FIELDS:
+        if name in out:
+            out[name] = sqlite_tri_bool(out.get(name))
+    return out
+
+
 def _num(value: Any) -> float | None:
     if value is None or value == "":
         return None
@@ -305,7 +334,7 @@ def selected_action_invariant(
             "violations": [VIOLATION_SELECTED_UNAVAILABLE],
             "proven_production_defect": "SELECTED_ACTION_ROW_MISSING",
         }
-    available = row.get("action_available")
+    available = sqlite_tri_bool(row.get("action_available"))
     reason = str(row.get("action_unavailable_reason") or "")
     violations: list[str] = []
     defect: str | None = None
@@ -425,6 +454,8 @@ __all__ = [
     "evaluate_action_row",
     "evaluate_legacy_final_rank",
     "evaluate_legacy_rank_candidate",
+    "normalize_tri_state_row",
     "reconstruct_group_action_state",
     "selected_action_invariant",
+    "sqlite_tri_bool",
 ]

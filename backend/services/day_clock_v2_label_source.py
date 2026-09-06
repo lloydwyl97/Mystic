@@ -232,10 +232,7 @@ def ohlcv_equal(left: HorizonCandle, right: HorizonCandle) -> bool:
 
 
 def default_rest_fetch(symbol: str, start_ms: int, end_ms: int) -> list[Any]:
-    url = (
-        f"{BINANCE_US_KLINES}?symbol={api_symbol(symbol)}&interval={INTERVAL}"
-        f"&startTime={int(start_ms)}&endTime={int(end_ms)}&limit=20"
-    )
+    url = f"{BINANCE_US_KLINES}?symbol={api_symbol(symbol)}&interval={INTERVAL}&startTime={int(start_ms)}&endTime={int(end_ms)}&limit=20"
     req = urllib.request.Request(url, headers={"User-Agent": "mystic-clock-v2-label/v2"})
     with urllib.request.urlopen(req, timeout=REST_TIMEOUT_SEC) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
@@ -345,8 +342,11 @@ def resolve_v5_horizon_candle(
             return base
         return _ok(base, redis_candle, SOURCE_REDIS, verified=True)
     if redis_candle is not None and rest_candle is None:
-        base["reason"] = INVALID_MISMATCH
-        base["status"] = STATUS_TERMINAL_INVALID
+        # Redis presence without a REST candle is not a contradiction. REST is
+        # often briefly empty; keep the row retryable until REST can confirm or
+        # disagree. Do not complete from Redis alone while verification is required.
+        base["reason"] = INVALID_REST_TRANSIENT
+        base["status"] = STATUS_PENDING_LABEL_SOURCE
         return base
     if rest_candle is not None:
         return _ok(base, rest_candle, SOURCE_REST, verified=False)
