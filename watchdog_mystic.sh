@@ -14,7 +14,7 @@ set -u
 
 REPO="${MYSTIC_WATCHDOG_REPO:-/home/mystic/mystic}"
 LOG="${MYSTIC_WATCHDOG_LOG:-$REPO/logs/watchdog_mystic.log}"
-LOCK="${MYSTIC_WATCHDOG_FLOCK:-/tmp/mystic_watchdog.lock}"
+LOCK="${MYSTIC_WATCHDOG_FLOCK:-/run/mystic/watchdog.flock}"
 DEPLOY_LOCK="${MYSTIC_DEPLOY_LOCK:-/run/mystic/deploy.lock}"
 MAINTENANCE_LOCK="${MYSTIC_MAINTENANCE_LOCK:-/tmp/mystic_maintenance.lock}"
 START_CMD="${MYSTIC_WATCHDOG_START_CMD:-}"
@@ -58,6 +58,15 @@ PATTERNS=(
     "backend.services.binance_scalp.runner"
 )
 
+# Root crontab (*/3) and mystic crontab (*/5) both run this script. The flock
+# must be writable by either, or one user silently disables the other.
+if [ ! -d "$(dirname -- "$LOCK")" ]; then
+    mkdir -p "$(dirname -- "$LOCK")" 2>/dev/null || LOCK="/tmp/mystic_watchdog.lock"
+fi
+if [ ! -e "$LOCK" ]; then
+    : >"$LOCK" 2>/dev/null || true
+    chmod 666 "$LOCK" 2>/dev/null || true
+fi
 exec 9>"$LOCK"
 if ! flock -n 9; then
     exit 0

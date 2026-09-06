@@ -154,6 +154,15 @@ def test_lock_script_check_matches_watchdog(tmp_path: Path):
     assert "WATCHDOG_SUPPRESSED_DEPLOYMENT_LOCK" in check.stdout
 
 
+def test_watchdog_shared_flock_defaults_to_run_dir():
+    text = WATCHDOG.read_text()
+    assert "/run/mystic/watchdog.flock" in text
+    assert "chmod 666" in text
+    tmpfiles = REPO / "deploy" / "tmpfiles-mystic.conf"
+    assert tmpfiles.is_file()
+    assert "d /run/mystic 0775 mystic mystic" in tmpfiles.read_text()
+
+
 def test_watchdog_is_not_a_trading_gate():
     text = WATCHDOG.read_text()
     assert "start_mystic.sh is intentionally NOT gated" in text
