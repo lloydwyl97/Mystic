@@ -70,17 +70,10 @@ def _load_dev_groups(db: str) -> list[dict]:
     conn = _ro(db)
     try:
         arts = [dict(r) for r in conn.execute(f"SELECT * FROM {TABLE_ARTIFACT}")]
-        groups = {
-            r["decision_group_id"]: dict(r)
-            for r in conn.execute(
-                "SELECT decision_group_id, selected_symbol, created_at, schema_version, feature_schema FROM day_decision_group_records"
-            )
-        }
+        groups = {r["decision_group_id"]: dict(r) for r in conn.execute("SELECT decision_group_id, selected_symbol, created_at, schema_version, feature_schema FROM day_decision_group_records")}
         label_rows = 0
         label_valid = 0
-        if conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE_V5_LABELS,)
-        ).fetchone():
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE_V5_LABELS,)).fetchone():
             label_rows = conn.execute(f"SELECT COUNT(*) FROM {TABLE_V5_LABELS}").fetchone()[0]
             label_valid = conn.execute(f"SELECT COUNT(*) FROM {TABLE_V5_LABELS} WHERE label_valid=1").fetchone()[0]
     finally:
@@ -241,8 +234,16 @@ def main() -> int:
         "required_feature_complete_groups",
         "fully_comparable_development_groups",
         "required_fully_comparable_groups",
+        "FEATURE_COMPLETE_GROUPS",
+        "FULLY_COMPARABLE_GROUPS",
+        "AUTHORITATIVE_CALIBRATION_FILLS",
         "authoritative_calibration_fills",
         "required_calibration_fills",
+        "NON_HOLD_SELECTED_GROUPS",
+        "EXECUTE_AUTHORIZED_GROUPS",
+        "ACTUAL_LOGICAL_BUY_FILLS",
+        "groups_with_valid_selected_v2_label",
+        "groups_with_complete_execution_provenance",
         "chronological_span_days",
         "target_horizon_sec",
         "target_horizon_status",

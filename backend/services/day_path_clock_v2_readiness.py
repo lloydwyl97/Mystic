@@ -16,6 +16,7 @@ from typing import Any
 
 from backend.services.day_4h_entry_features import COINS, HOLD_SYMBOL
 from backend.services.day_clock_v2_action_contract import selected_action_invariant
+from backend.services.day_clock_v2_calibration import count_v5_authoritative_calibration_fills
 from backend.services.day_clock_v2_labels import (
     TARGET_NAME,
     load_v5_label_presence,
@@ -572,7 +573,6 @@ def evaluate_clock_v2_v5_readiness(db_path: str | Path, *, generic_state: dict[s
     partitions = Counter()
     feature_complete = 0
     fully_comparable = 0
-    calibration_fills = 0
     quarantined = 0
     future_data = 0
     lock_inspected = 0
@@ -581,7 +581,6 @@ def evaluate_clock_v2_v5_readiness(db_path: str | Path, *, generic_state: dict[s
     blocks: set[int] = set()
     first: datetime | None = None
     last: datetime | None = None
-    per_symbol = Counter()
 
     for gid, arts in by_group.items():
         stamped = next((a.get("clock_v2_partition") for a in arts if a.get("clock_v2_partition")), None)
@@ -622,9 +621,6 @@ def evaluate_clock_v2_v5_readiness(db_path: str | Path, *, generic_state: dict[s
         invariant = selected_action_invariant(rows=rows, selected_symbol=selected or HOLD_SYMBOL)
         if not invariant.get("pass"):
             invariant_violations += 1
-        if selected and selected != HOLD_SYMBOL and v5_labels.get((gid, selected)):
-            calibration_fills += 1
-            per_symbol[selected] += 1
         for art in arts:
             prov = art.get("provenance") or {}
             src = _parse_iso(prov.get("source_latest_ts"))
@@ -632,6 +628,8 @@ def evaluate_clock_v2_v5_readiness(db_path: str | Path, *, generic_state: dict[s
             if src and cut and src > cut:
                 future_data += 1
 
+    cal = count_v5_authoritative_calibration_fills(db_path)
+    calibration_fills = int(cal.get("authoritative_calibration_fills") or 0)
     req_groups = int(req["min_fully_comparable_independent_groups"])
     req_fills = int(req["min_authoritative_fills_execution_calibration"])
     span_days = ((last - first).total_seconds() / 86400.0) if first and last else 0.0
@@ -685,13 +683,30 @@ def evaluate_clock_v2_v5_readiness(db_path: str | Path, *, generic_state: dict[s
             "inspected": False,
             "outcomes_read": False,
         },
+        "FEATURE_COMPLETE_GROUPS": feature_complete,
         "feature_complete_development_groups": feature_complete,
         "required_feature_complete_groups": req_groups,
+        "FULLY_COMPARABLE_GROUPS": fully_comparable,
         "fully_comparable_development_groups": fully_comparable,
         "required_fully_comparable_groups": req_groups,
+        "AUTHORITATIVE_CALIBRATION_FILLS": calibration_fills,
         "authoritative_calibration_fills": calibration_fills,
         "required_calibration_fills": req_fills,
-        "per_symbol_calibration_support": dict(per_symbol),
+        "NON_HOLD_SELECTED_GROUPS": int(cal.get("non_hold_selected_groups") or 0),
+        "EXECUTE_AUTHORIZED_GROUPS": int(cal.get("execute_authorized_groups") or 0),
+        "ACTUAL_LOGICAL_BUY_FILLS": int(cal.get("actual_logical_buy_fills") or 0),
+        "non_hold_selected_groups": int(cal.get("non_hold_selected_groups") or 0),
+        "execute_authorized_groups": int(cal.get("execute_authorized_groups") or 0),
+        "actual_logical_buy_fills": int(cal.get("actual_logical_buy_fills") or 0),
+        "groups_with_authoritative_fill_linkage": int(cal.get("groups_with_authoritative_fill_linkage") or 0),
+        "groups_with_commission_provenance": int(cal.get("groups_with_commission_provenance") or 0),
+        "groups_with_spread_provenance": int(cal.get("groups_with_spread_provenance") or 0),
+        "groups_with_slippage_provenance": int(cal.get("groups_with_slippage_provenance") or 0),
+        "groups_with_valid_selected_v2_label": int(cal.get("groups_with_valid_selected_v2_label") or 0),
+        "groups_with_complete_execution_provenance": int(cal.get("groups_with_complete_execution_provenance") or 0),
+        "calibration_event_definition": cal.get("calibration_event_definition"),
+        "calibration_key": cal.get("calibration_key"),
+        "per_symbol_calibration_support": dict(cal.get("per_symbol_calibration_support") or {}),
         "chronological_blocks": len(blocks),
         "required_chronological_blocks": MIN_CHRONOLOGICAL_BLOCKS,
         "chronological_span_days": round(span_days, 2),
@@ -724,9 +739,12 @@ def format_clock_v2_v5_readiness(snapshot: dict[str, Any]) -> str:
     return "\n".join(
         [
             f"CLOCK_V2_V5_DATA_READINESS = {snapshot.get('DATA_READINESS')}",
-            f"FEATURE_COMPLETE = {snapshot.get('feature_complete_development_groups')} / {snapshot.get('required_feature_complete_groups')}",
-            f"FULLY_COMPARABLE = {snapshot.get('fully_comparable_development_groups')} / {snapshot.get('required_fully_comparable_groups')}",
-            f"calibration_fills = {snapshot.get('authoritative_calibration_fills')} / {snapshot.get('required_calibration_fills')}",
+            f"FEATURE_COMPLETE_GROUPS = {snapshot.get('feature_complete_development_groups')} / {snapshot.get('required_feature_complete_groups')}",
+            f"FULLY_COMPARABLE_GROUPS = {snapshot.get('fully_comparable_development_groups')} / {snapshot.get('required_fully_comparable_groups')}",
+            f"AUTHORITATIVE_CALIBRATION_FILLS = {snapshot.get('authoritative_calibration_fills')} / {snapshot.get('required_calibration_fills')}",
+            f"NON_HOLD_SELECTED_GROUPS = {snapshot.get('non_hold_selected_groups')}",
+            f"EXECUTE_AUTHORIZED_GROUPS = {snapshot.get('execute_authorized_groups')}",
+            f"ACTUAL_LOGICAL_BUY_FILLS = {snapshot.get('actual_logical_buy_fills')}",
             f"development_start = {snapshot.get('clock_v2_v5_development_start')}",
             f"final_test = {snapshot.get('final_test_status')}",
             f"train = {snapshot.get('train')}  promoted = {snapshot.get('promoted')}",
