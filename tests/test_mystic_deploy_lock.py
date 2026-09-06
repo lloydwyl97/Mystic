@@ -158,9 +158,66 @@ def test_watchdog_shared_flock_defaults_to_run_dir():
     text = WATCHDOG.read_text()
     assert "/run/mystic/watchdog.flock" in text
     assert "chmod 666" in text
+    assert "/tmp/mystic_watchdog.lock" not in text
+    assert "WATCHDOG_CANONICAL_FLOCK_UNAVAILABLE" in text
     tmpfiles = REPO / "deploy" / "tmpfiles-mystic.conf"
     assert tmpfiles.is_file()
     assert "d /run/mystic 0775 mystic mystic" in tmpfiles.read_text()
+
+
+def test_watchdog_same_canonical_flock_after_simulated_reboot(tmp_path):
+    run_dir = tmp_path / "run" / "mystic"
+    flock = run_dir / "watchdog.flock"
+    assert not run_dir.exists()
+    mystic_env = _lock_env(
+        tmp_path,
+        MYSTIC_WATCHDOG_FLOCK=str(flock),
+        MYSTIC_WATCHDOG_FORCE_MISSING="0",
+    )
+    root_env = dict(mystic_env)
+    mystic = _run([str(WATCHDOG)], mystic_env)
+    root = _run([str(WATCHDOG)], root_env)
+    assert mystic.returncode == 0
+    assert root.returncode == 0
+    assert flock.exists()
+    assert "WATCHDOG_CANONICAL_FLOCK_UNAVAILABLE" not in _log(tmp_path)
+    assert "/tmp/mystic_watchdog.lock" not in _log(tmp_path)
+
+
+def test_watchdog_canonical_flock_unavailable_fails_closed(tmp_path):
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("x")
+    flock = blocker / "watchdog.flock"
+    env = _lock_env(tmp_path, MYSTIC_WATCHDOG_FLOCK=str(flock), MYSTIC_WATCHDOG_FORCE_MISSING="1")
+    out = _run([str(WATCHDOG)], env)
+    assert out.returncode == 1
+    assert "WATCHDOG_CANONICAL_FLOCK_UNAVAILABLE" in (out.stderr + _log(tmp_path))
+    assert not (tmp_path / "started").exists()
+
+
+def test_parallel_acquire_exactly_one_winner(tmp_path):
+    env = _lock_env(tmp_path)
+    first = subprocess.Popen(
+        [str(LOCK_SH), "acquire", "--sha", "one"],
+        env={**os.environ, **env},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    second = subprocess.Popen(
+        [str(LOCK_SH), "acquire", "--sha", "two"],
+        env={**os.environ, **env},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    codes = sorted([first.wait(), second.wait()])
+    assert codes == [0, 1]
+    text = (tmp_path / "deploy.lock").read_text()
+    assert ("one" in text) ^ ("two" in text)
+    assert _run([str(LOCK_SH), "status"], env).returncode == 0
+    assert _run([str(LOCK_SH), "release"], env).returncode == 0
+    assert _run([str(LOCK_SH), "status"], env).returncode == 1
 
 
 def test_watchdog_is_not_a_trading_gate():

@@ -59,15 +59,21 @@ PATTERNS=(
 )
 
 # Root crontab (*/3) and mystic crontab (*/5) both run this script. The flock
-# must be writable by either, or one user silently disables the other.
-if [ ! -d "$(dirname -- "$LOCK")" ]; then
-    mkdir -p "$(dirname -- "$LOCK")" 2>/dev/null || LOCK="/tmp/mystic_watchdog.lock"
+# must be the canonical path for both. Never fall back to /tmp — that splits
+# authority after reboot when only one user can create /run/mystic.
+flock_dir="$(dirname -- "$LOCK")"
+if [ ! -d "$flock_dir" ]; then
+    mkdir -p "$flock_dir" 2>/dev/null || true
 fi
 if [ ! -e "$LOCK" ]; then
     : >"$LOCK" 2>/dev/null || true
     chmod 666 "$LOCK" 2>/dev/null || true
 fi
-exec 9>"$LOCK"
+if [ ! -d "$flock_dir" ] || ! { exec 9>"$LOCK"; } 2>/dev/null; then
+    _log "WATCHDOG_CANONICAL_FLOCK_UNAVAILABLE path=$LOCK"
+    echo "WATCHDOG_CANONICAL_FLOCK_UNAVAILABLE path=$LOCK" >&2
+    exit 1
+fi
 if ! flock -n 9; then
     exit 0
 fi

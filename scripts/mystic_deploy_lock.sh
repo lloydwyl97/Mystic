@@ -40,13 +40,10 @@ _write_lock() {
         echo "ERROR: cannot create lock directory $dir" >&2
         return 1
     fi
-    if [ -e "$path" ]; then
-        echo "ERROR: deploy lock already exists at $path" >&2
-        echo "       run: $0 status" >&2
-        return 1
-    fi
     umask 022
-    cat >"$path" <<EOF
+    local tmp
+    tmp="${path}.tmp.$$"
+    cat >"$tmp" <<EOF
 {
   "kind": "mystic_deploy_lock",
   "created_at": "$(_utc_now)",
@@ -57,6 +54,14 @@ _write_lock() {
   "reason": "${reason}"
 }
 EOF
+    # ln without -f is atomic: succeeds only when $path does not already exist.
+    if ! ln "$tmp" "$path" 2>/dev/null; then
+        rm -f -- "$tmp"
+        echo "ERROR: deploy lock already exists at $path" >&2
+        echo "       run: $0 status" >&2
+        return 1
+    fi
+    rm -f -- "$tmp"
 }
 
 _print_status() {
