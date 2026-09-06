@@ -3,6 +3,12 @@
 
 cd /home/mystic/mystic || exit 1
 
+DEPLOY_LOCK="${MYSTIC_DEPLOY_LOCK:-/run/mystic/deploy.lock}"
+MAINTENANCE_LOCK="${MYSTIC_MAINTENANCE_LOCK:-/tmp/mystic_maintenance.lock}"
+if [ ! -e "$DEPLOY_LOCK" ] && [ ! -e "$MAINTENANCE_LOCK" ]; then
+  echo "WARN: no deploy lock held; watchdog_mystic.sh may restart services during this stop"
+fi
+
 LIFECYCLE_LOCK="${PWD}/logs/mystic_lifecycle.lock"
 mkdir -p "${PWD}/logs"
 exec 9>"$LIFECYCLE_LOCK"

@@ -4,21 +4,47 @@
 # (the script itself stops everything first, so a partial-restart here
 # would fight it — a full restart is the correct, already-idempotent path).
 #
-# MAINTENANCE_LOCK: if /tmp/mystic_maintenance.lock exists, skip entirely.
-# A human/agent doing manual stop/pull/start work must create this lock
-# first, or this watchdog can race a manual restart mid-flight (observed:
-# both invocations spawn processes concurrently -> duplicate PIDs per
-# service, since only the backend port-listener check enforces
-# single-instance; the other launchers just check "is anything matching
-# already running").
+# DEPLOY LOCK: if /run/mystic/deploy.lock (or the legacy
+# /tmp/mystic_maintenance.lock) exists, this watchdog must NOT start or
+# restart Mystic. That closes the observed race where cron restarted the
+# stack after an operator had stopped it and checked out unverified code.
+# start_mystic.sh is intentionally NOT gated — an approved start during a
+# deploy must still work while the lock is held.
 set -u
 
-REPO="/home/mystic/mystic"
-LOG="$REPO/logs/watchdog_mystic.log"
-LOCK="/tmp/mystic_watchdog.lock"
-MAINTENANCE_LOCK="/tmp/mystic_maintenance.lock"
+REPO="${MYSTIC_WATCHDOG_REPO:-/home/mystic/mystic}"
+LOG="${MYSTIC_WATCHDOG_LOG:-$REPO/logs/watchdog_mystic.log}"
+LOCK="${MYSTIC_WATCHDOG_FLOCK:-/tmp/mystic_watchdog.lock}"
+DEPLOY_LOCK="${MYSTIC_DEPLOY_LOCK:-/run/mystic/deploy.lock}"
+MAINTENANCE_LOCK="${MYSTIC_MAINTENANCE_LOCK:-/tmp/mystic_maintenance.lock}"
+START_CMD="${MYSTIC_WATCHDOG_START_CMD:-}"
 
-if [ -e "$MAINTENANCE_LOCK" ]; then
+_utc_now() {
+    date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+_log() {
+    mkdir -p "$(dirname -- "$LOG")" 2>/dev/null || true
+    echo "$(_utc_now) $*" >> "$LOG"
+}
+
+deploy_lock_held() {
+    local path
+    for path in "$DEPLOY_LOCK" "$MAINTENANCE_LOCK"; do
+        [ -z "$path" ] && continue
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            if [ ! -f "$path" ]; then
+                _log "WATCHDOG_SUPPRESSED_MALFORMED_LOCK path=$path"
+                return 0
+            fi
+            _log "WATCHDOG_SUPPRESSED_DEPLOYMENT_LOCK path=$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if deploy_lock_held; then
     exit 0
 fi
 
@@ -38,21 +64,33 @@ if ! flock -n 9; then
 fi
 
 missing=0
-for p in "${PATTERNS[@]}"; do
-    if ! pgrep -f "$p" >/dev/null 2>&1; then
-        missing=1
-        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) MISSING: $p" >> "$LOG"
-    fi
-done
+force_missing="${MYSTIC_WATCHDOG_FORCE_MISSING:-}"
+if [ "$force_missing" = "1" ]; then
+    missing=1
+elif [ "$force_missing" = "0" ]; then
+    missing=0
+else
+    for p in "${PATTERNS[@]}"; do
+        if ! pgrep -f "$p" >/dev/null 2>&1; then
+            missing=1
+            _log "MISSING: $p"
+        fi
+    done
+fi
 
 if [ "$missing" -eq 1 ]; then
-    # Re-check the maintenance lock right before acting — closes the race
-    # where a lock is created between the loop above and this point.
-    if [ -e "$MAINTENANCE_LOCK" ]; then
+    # Re-check the deploy lock right before acting — closes the race where a
+    # lock is created between the scan above and this point.
+    if deploy_lock_held; then
         exit 0
     fi
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) restarting core stack" >> "$LOG"
-    cd "$REPO" || exit 1
-    ./start_mystic.sh core >> "$LOG" 2>&1
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) restart attempt complete" >> "$LOG"
+    _log "restarting core stack"
+    if [ -n "$START_CMD" ]; then
+        # Test / operator override — never used in production crontab.
+        bash -c "$START_CMD" >> "$LOG" 2>&1 || true
+    else
+        cd "$REPO" || exit 1
+        ./start_mystic.sh core >> "$LOG" 2>&1
+    fi
+    _log "restart attempt complete"
 fi
