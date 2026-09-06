@@ -155,6 +155,7 @@ def test_sealed_research_authority_is_never_on_a_deletion_timer():
         "day_path_clock_v2_readiness_history",
         "day_clock_v2_partition_registry",
         "day_clock_v2_outcome_labels",
+        "day_clock_v2_outcome_labels_history",
     }
     assert not (policy_tables & PROTECTED_TABLES)
 

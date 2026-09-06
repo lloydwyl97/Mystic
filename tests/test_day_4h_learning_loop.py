@@ -229,6 +229,7 @@ def test_experiment_and_lock_registries_are_protected_not_expired():
         "day_path_clock_v2_readiness_history",
         "day_clock_v2_partition_registry",
         "day_clock_v2_outcome_labels",
+        "day_clock_v2_outcome_labels_history",
     }
 
 

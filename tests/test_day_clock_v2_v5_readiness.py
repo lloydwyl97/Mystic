@@ -101,7 +101,14 @@ def test_v5_schema_removes_final_rank_score():
     assert "final_rank_score" not in REQUIRED_CLOCK_V2_FIELDS_V5
     schema = clock_v2_v5_feature_schema()
     assert schema["removed_from_v4"] == ["final_rank_score"]
+    assert schema["ignored_obsolete_feature_json_fields"] == ["final_rank_score"]
     assert "final_rank_score" not in schema["inputs"]
+    from backend.services.day_path_clock_v2 import v5_listed_features_from_blob
+
+    blob = {"p_buy": 0.4, "legacy_path_ev": 0.001, "final_rank_score": 0.001, "ret_5m": 0.01}
+    exported = v5_listed_features_from_blob(blob)
+    assert "final_rank_score" not in exported
+    assert exported["legacy_path_ev"] == 0.001
 
 
 def test_v5_keeps_all_action_definable_inputs_only():
@@ -459,6 +466,7 @@ def test_clock_v2_authority_tables_are_protected_from_retention():
         "day_path_clock_v2_candidate_artifact",
         "day_clock_v2_partition_registry",
         "day_clock_v2_outcome_labels",
+        "day_clock_v2_outcome_labels_history",
     ):
         assert table in PROTECTED_TABLES
     policy_tables = {p.table for p in RETENTION_POLICIES}

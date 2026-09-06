@@ -95,6 +95,7 @@ PROTECTED_TABLES: frozenset[str] = frozenset(
         # Deleting either would make the v5 development dataset unreproducible.
         "day_clock_v2_partition_registry",
         "day_clock_v2_outcome_labels",
+        "day_clock_v2_outcome_labels_history",
     }
 )
 

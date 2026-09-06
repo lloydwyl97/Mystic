@@ -600,6 +600,7 @@ FINAL_RANK_TREATMENT_V5 = "REMOVED_NOT_WELL_DEFINED_ALL_ACTION_FEATURE"
 FINAL_RANK_PROVENANCE_CAPTURED = True
 
 REQUIRED_CLOCK_V2_FIELDS_V5: tuple[str, ...] = tuple(n for n in REQUIRED_CLOCK_V2_FIELDS if n != "final_rank_score")
+OBSOLETE_V5_FEATURE_JSON_FIELDS: tuple[str, ...] = ("final_rank_score",)
 CLOCK_V2_V5_LISTED_INPUT_COUNT = len(REQUIRED_CLOCK_V2_FIELDS_V5)  # 14
 CLOCK_V2_V5_NUMERIC_FEATURE_COUNT = CLOCK_V2_V5_LISTED_INPUT_COUNT - len(CLOCK_V2_CATEGORICAL_FEATURES)  # 13
 CLOCK_V2_V5_EFFECTIVE_FITTED_PARAMETERS = CLOCK_V2_INTERCEPT_COUNT + CLOCK_V2_V5_NUMERIC_FEATURE_COUNT + CLOCK_V2_CATEGORICAL_PARAMETER_COUNT  # 18
@@ -619,6 +620,7 @@ def clock_v2_v5_feature_schema() -> dict[str, Any]:
     return {
         "inputs": list(REQUIRED_CLOCK_V2_FIELDS_V5),
         "removed_from_v4": ["final_rank_score"],
+        "ignored_obsolete_feature_json_fields": list(OBSOLETE_V5_FEATURE_JSON_FIELDS),
         "removal_reason": (
             "legacy final_rank_score is only defined for legacy scored candidates; it is not an "
             "all-action feature and capture-v1 substituted raw path_ev for absent candidates"
@@ -638,6 +640,12 @@ def clock_v2_v5_feature_schema() -> dict[str, Any]:
         "train": False,
         "live_gate": False,
     }
+
+
+def v5_listed_features_from_blob(feats: dict[str, Any] | None) -> dict[str, Any]:
+    """Trainer / readiness / export view. Drops obsolete blob leftovers."""
+    src = feats or {}
+    return {name: src.get(name) for name in REQUIRED_CLOCK_V2_FIELDS_V5}
 
 
 def clock_v2_v5_readiness_requirements() -> dict[str, Any]:
