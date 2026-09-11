@@ -15061,19 +15061,31 @@ class PortfolioEngine:
         self._last_day_path_ev_decision = decision
         if not str(decision.get("selected_action") or "").upper().startswith("BUY"):
             return None, decision
-        want = _api_symbol(str(decision.get("selected_symbol") or ""))
-        found = None
-        for cand in list(valid_candidates or []) + list(getattr(self, "current_bar_candidates", None) or []):
-            if _api_symbol(getattr(cand, "symbol", "")) == want:
-                found = cand
-                break
-        if found is None:
+        from backend.services.day_direct_path_ev_authority import next_executable_path_ev_symbol, post_cost_economics_ev
+
+        pool = list(valid_candidates or []) + list(getattr(self, "current_bar_candidates", None) or [])
+        by_api: dict[str, Any] = {}
+        for cand in pool:
+            api = _api_symbol(getattr(cand, "symbol", ""))
+            if api and api not in by_api:
+                by_api[api] = cand
+        picked = next_executable_path_ev_symbol(decision, executable_symbols=set(by_api))
+        if picked is None:
             decision = dict(decision)
             decision["selected_action"] = "HOLD"
             decision["why_selected"] = "PATH_NET_NO_SCORED_CANDIDATE"
             decision["true_safety_reject_reason"] = "PATH_NET_NO_SCORED_CANDIDATE"
             self._last_day_path_ev_decision = decision
             return None, decision
+        want, auth_ev = picked
+        found = by_api[want]
+        if want != _api_symbol(str(decision.get("selected_symbol") or "")):
+            decision = dict(decision)
+            decision["selected_action"] = f"BUY_{want}"
+            decision["selected_symbol"] = want
+            decision["selected_ev"] = float(auth_ev)
+            decision["why_selected"] = "PATH_NET_FALLBACK_EXECUTABLE"
+            decision["path_ev_fallback_from"] = _api_symbol(str(self._last_day_path_ev_decision.get("selected_symbol") or ""))
         found.decision_data = dict(found.decision_data or {})
         cand_ev = 0.0
         with contextlib.suppress(Exception):
@@ -15081,12 +15093,9 @@ class PortfolioEngine:
         if cand_ev <= 0.0:
             with contextlib.suppress(Exception):
                 cand_ev = float(self._estimate_candidate_net_expected_value(found.decision_data, symbol=str(found.symbol or "")))
-        auth_ev = float(decision.get("selected_ev") or decision.get("selected_net_expected_value") or 0.0)
-        from backend.services.day_direct_path_ev_authority import post_cost_economics_ev
-
         econ_ev = post_cost_economics_ev(found.decision_data)
-        # Economic quality must beat HOLD in path-EV, scored candidate, and identifiable post-cost EV.
-        if auth_ev <= 0.0 or cand_ev <= 0.0 or (econ_ev is not None and econ_ev <= 0.0):
+        # Path-EV already beat HOLD. Candidate/post-cost fields must not silently void the BUY.
+        if econ_ev is not None and econ_ev <= 0.0 and float(auth_ev) <= 0.0:
             decision = dict(decision)
             decision["selected_action"] = "HOLD"
             decision["why_selected"] = "PATH_NET_CANDIDATE_NONPOSITIVE_EV"
@@ -15098,6 +15107,7 @@ class PortfolioEngine:
         found.decision_data["live_ai_strategy"] = "day"
         found.decision_data["why_selected"] = str(decision.get("why_selected") or "PATH_NET_BEATS_HOLD")
         found.decision_data["candidate_net_ev"] = cand_ev
+        self._last_day_path_ev_decision = decision
         return found, decision
 
     async def _execute_additional_bar_buys(
@@ -15545,6 +15555,27 @@ class PortfolioEngine:
                 _entry_thesis = str((_tc.decision_data or {}).get("entry_thesis") or (_tc.decision_data or {}).get("setup_type") or "")
                 # No ML buy_margin bypass — thesis required for new opens (day_aw_owner_v1).
                 if _entry_thesis == SETUP_NO_CLEAR_THESIS and _tc.symbol not in self.open_positions:
+                    _dd_th = dict(_tc.decision_data or {})
+                    try:
+                        _prior_4h = float(
+                            _dd_th.get("prior_4h_low")
+                            or _dd_th.get("prior_completed_4h_low")
+                            or ((_dd_th.get("4h_entry_telemetry") or {}).get("prior_4h_low") if isinstance(_dd_th.get("4h_entry_telemetry"), dict) else 0.0)
+                            or 0.0
+                        )
+                    except (TypeError, ValueError):
+                        _prior_4h = 0.0
+                    if _prior_4h > 0:
+                        _dd_th["thesis_invalid_level"] = _prior_4h
+                        _dd_th["no_clear_thesis_4h_invalidation"] = True
+                        _tc.decision_data = _dd_th
+                        logger.info(
+                            "THESIS_ENTRY_4H_INVALIDATION symbol=%s prior_4h_low=%.8f (kept for path-EV execution)",
+                            _tc.symbol,
+                            _prior_4h,
+                        )
+                        _thesis_kept.append(_tc)
+                        continue
                     logger.info("THESIS_ENTRY_BLOCK: %s no clear thesis -> entry skipped", _tc.symbol)
                     await self._bar_pipeline_terminal(_tc.decision_id, "BAR_PRE_RANK_FILTERED", pipeline_done)
                     await self._record_learning_snapshot(_tc, "BLOCK", "NO_CLEAR_THESIS")

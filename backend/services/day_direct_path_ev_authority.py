@@ -243,6 +243,40 @@ def old_rank_telemetry(candidates: list[Any] | None) -> tuple[str, float | None]
     return _api_symbol(getattr(top, "symbol", "") or ""), _score(top)
 
 
+def ranked_path_ev_buys(decision: dict[str, Any]) -> list[tuple[str, float]]:
+    """Coins whose path-EV beats HOLD, highest first. Path-EV remains the authority."""
+    hold_ev = float(decision.get("hold_ev") if decision.get("hold_ev") is not None else HOLD_EV)
+    rows: list[tuple[str, float]] = []
+    for api, key in (("BTCUSDT", "btc"), ("ETHUSDT", "eth"), ("SOLUSDT", "sol"), ("XRPUSDT", "xrp")):
+        try:
+            ev = float(decision.get(f"{key}_path_ev") or HOLD_EV)
+        except (TypeError, ValueError):
+            ev = HOLD_EV
+        if ev > hold_ev:
+            rows.append((_api_symbol(api), ev))
+    rows.sort(key=lambda item: (-item[1], item[0]))
+    return rows
+
+
+def next_executable_path_ev_symbol(
+    decision: dict[str, Any],
+    *,
+    executable_symbols: set[str] | list[str],
+) -> tuple[str, float] | None:
+    """First path-EV winner that both beats HOLD and has an executable candidate.
+
+    Production recorded BUY_SOL / BUY_BTC while execution silently HOLDed when the
+    winner had no thesis candidate. That is not HOLD_WINS. Walk the scored list.
+    """
+    allowed = {_api_symbol(s) for s in executable_symbols if _api_symbol(s)}
+    if not allowed:
+        return None
+    for api, ev in ranked_path_ev_buys(decision):
+        if api in allowed:
+            return api, ev
+    return None
+
+
 def decide_day_bar(*, db_path: str = "", candidates: list[Any] | None = None) -> dict[str, Any]:
     nominee, score = old_rank_telemetry(candidates)
     scores = score_four_coins(db_path=db_path)
