@@ -355,6 +355,30 @@ DEFAULT_COIN_PROFILE = {
 }
 
 
+def vanished_lot_is_human_sell(
+    *,
+    status: str,
+    quantity: float,
+    entry_price: float,
+    fill_found: bool,
+    min_notional: float = 5.0,
+) -> bool:
+    """True when an exchange flatten should book as HUMAN_MANUAL_SELL.
+
+    DUST_PENDING is only a leftover stamp after a flatten. Treat as dust
+    writeoff only when there is no recovered sell and the leftover itself
+    is still a real dust notional.
+    """
+    if fill_found:
+        return True
+    qty = float(quantity or 0.0)
+    if qty <= 1e-10:
+        return True
+    if str(status or "ACTIVE").strip().upper() != "DUST_PENDING":
+        return True
+    return qty * float(entry_price or 0.0) >= float(min_notional)
+
+
 def _to_api_symbol(symbol: str) -> str:
     """Normalize any internal symbol form to Binance.US API form (BTCUSDT)."""
     if not symbol:
@@ -2718,6 +2742,17 @@ class PortfolioEngine:
                 price = getattr(position, "entry_price", 0) or 0
                 is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped, price)
                 if is_dust:
+                    prior_notional = float(db_qty or 0.0) * float(price or 0.0)
+                    if prior_notional >= 5.0 and float(db_qty or 0.0) > float(snapped or 0.0) + 1e-9:
+                        logger.info(
+                            "HUMAN_FLATTEN_TO_DUST:%s db_qty=%.12g ex_qty=%.12g -> manual_sell",
+                            symbol,
+                            db_qty,
+                            exchange_qty,
+                        )
+                        await self._handle_vanished_exchange_position(symbol, position, source="bootstrap_reconcile")
+                        cleared_pause_for_mismatch = True
+                        continue
                     position.quantity = snapped
                     position.status = "DUST_PENDING"
                     position.dust_qty_canonical = snapped
@@ -2904,6 +2939,17 @@ class PortfolioEngine:
             price = getattr(position, "entry_price", 0) or 0
             is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped, price)
             if is_dust:
+                prior_notional = float(db_qty or 0.0) * float(price or 0.0)
+                if prior_notional >= 5.0 and float(db_qty or 0.0) > float(snapped or 0.0) + 1e-9:
+                    logger.info(
+                        "HUMAN_FLATTEN_TO_DUST:%s db_qty=%.12g ex_qty=%.12g -> manual_sell",
+                        symbol,
+                        db_qty,
+                        exchange_qty,
+                    )
+                    await self._handle_vanished_exchange_position(symbol, position, source="periodic_reconcile")
+                    self._metrics_reconciliation_adjustments += 1
+                    continue
                 position.quantity = snapped
                 position.status = "DUST_PENDING"
                 position.dust_qty_canonical = snapped
@@ -6257,11 +6303,10 @@ class PortfolioEngine:
         """Reconcile a local position that the exchange no longer holds.
 
         Routes:
-          * ``status == "DUST_PENDING"`` -> existing dust-writeoff cleanup
-            (records ``DUST_WRITEOFF``, applies cooldown).
-          * otherwise -> HUMAN_MANUAL_SELL: tries to recover the actual
-            sell fill from Binance.US, persists a close-ledger row, applies
-            the standard post-sell cooldown, then removes the position.
+          * Recovered exchange SELL, ACTIVE flatten, or DUST_PENDING qty~0
+            after a human flatten -> HUMAN_MANUAL_SELL. Always closes the
+            BUY lot so accounting cannot pause entries.
+          * True leftover dust with no recovered sell -> DUST_WRITEOFF.
 
         Idempotent: if ``symbol`` is not present in ``open_positions`` the
         function returns immediately.
@@ -6271,6 +6316,21 @@ class PortfolioEngine:
         pos_status = getattr(position, "status", "ACTIVE") or "ACTIVE"
         now_epoch = time.time()
         cooldown_until = now_epoch + float(POST_SELL_COOLDOWN_WALL_SEC)
+        fill = await self._detect_human_manual_sell_fill(symbol, position)
+        if vanished_lot_is_human_sell(
+            status=str(pos_status),
+            quantity=float(position.quantity or 0.0),
+            entry_price=float(position.entry_price or 0.0),
+            fill_found=bool(fill.get("found")),
+        ):
+            await self._book_human_manual_sell_and_continue(
+                symbol,
+                position,
+                fill=fill,
+                source=source,
+                cooldown_until=cooldown_until,
+            )
+            return
         if pos_status == "DUST_PENDING":
             await self._remove_dust_position_canonical_cleanup(symbol, position)
             await self._record_position_close_ledger(
@@ -6300,12 +6360,23 @@ class PortfolioEngine:
             )
             return
 
-        fill = await self._detect_human_manual_sell_fill(symbol, position)
+    async def _book_human_manual_sell_and_continue(
+        self,
+        symbol: str,
+        position: OpenPosition,
+        *,
+        fill: dict[str, Any],
+        source: str,
+        cooldown_until: float,
+    ) -> None:
+        """Book a human exchange flatten and leave entries enabled."""
+        now_epoch = time.time()
         realized_profit = fill.get("realized_profit")
         exit_price = fill.get("exit_price")
         sell_trade_id = fill.get("trade_id")
+        fill_qty = float(fill.get("quantity") or position.quantity or 0.0)
         detail_bits = [f"source={source}"]
-        if fill["found"]:
+        if fill.get("found"):
             detail_bits.append("fill_recovered=true")
         else:
             detail_bits.append("fill_recovered=false_realized_profit_unknown")
@@ -6316,7 +6387,7 @@ class PortfolioEngine:
             manual_sell=True,
             cooldown_until=cooldown_until,
             realized_profit=realized_profit,
-            quantity=float(position.quantity or 0.0),
+            quantity=fill_qty,
             entry_price=float(position.entry_price or 0.0),
             exit_price=exit_price,
             sell_trade_id=sell_trade_id,
@@ -6344,7 +6415,7 @@ class PortfolioEngine:
             except Exception:
                 close_ledger_id = None
 
-        if fill["found"] and sell_trade_id and exit_price:
+        if fill.get("found") and sell_trade_id and exit_price:
             await self._persist_recovered_close_canonical_packet(
                 symbol=symbol,
                 position=position,
@@ -6355,6 +6426,7 @@ class PortfolioEngine:
                 close_ledger_id=close_ledger_id,
             )
         else:
+            await self._write_human_sell_close_row(symbol, position, fill=fill, source=source)
             self._record_learning_outcome(
                 symbol=symbol,
                 position=position,
@@ -6364,8 +6436,12 @@ class PortfolioEngine:
                 exit_price=exit_price,
                 realized_profit=realized_profit,
                 cooldown_until=cooldown_until,
-                fill_found=bool(fill["found"]),
+                fill_found=bool(fill.get("found")),
             )
+
+        if self._trading_paused and "accounting_disagreement" in str(self._pause_reason or ""):
+            self._trading_paused = False
+            self._pause_reason = ""
 
         sym_norm = normalize_symbol(symbol)
         async with self._deletion_lock:
@@ -6384,11 +6460,11 @@ class PortfolioEngine:
             self._compute_total_open_risk()
             await self._persist_ledger_to_sqlite()
 
-        if fill["found"]:
+        if fill.get("found"):
             logger.info(
                 "HUMAN_MANUAL_SELL_DETECTED symbol=%s qty=%s entry=%s exit=%s realized=%s trade_id=%s cooldown_until=%.0f source=%s",
                 sym_norm,
-                f"{position.quantity:.8f}" if position.quantity else "?",
+                f"{fill_qty:.8f}" if fill_qty else "?",
                 f"{position.entry_price:.8f}" if position.entry_price else "?",
                 f"{exit_price:.8f}" if exit_price else "?",
                 f"{realized_profit:.4f}" if realized_profit is not None else "?",
@@ -6400,11 +6476,88 @@ class PortfolioEngine:
             logger.info(
                 "HUMAN_MANUAL_SELL_DETECTED symbol=%s qty=%s entry=%s realized_profit_unknown=true cooldown_until=%.0f source=%s (live position vanished; no fill data on exchange)",
                 sym_norm,
-                f"{position.quantity:.8f}" if position.quantity else "?",
+                f"{fill_qty:.8f}" if fill_qty else "?",
                 f"{position.entry_price:.8f}" if position.entry_price else "?",
                 cooldown_until,
                 source,
             )
+
+    async def _write_human_sell_close_row(
+        self,
+        symbol: str,
+        position: OpenPosition,
+        *,
+        fill: dict[str, Any],
+        source: str,
+    ) -> None:
+        """Close the BUY lot when the exchange flatten has no recovered fill packet."""
+        normalized = normalize_symbol(symbol)
+        buy_tid = str(getattr(position, "trade_id", "") or "")
+        qty = float(fill.get("quantity") or position.quantity or 0.0)
+        entry = float(position.entry_price or 0.0)
+        exit_px = float(fill.get("exit_price") or entry or 0.0)
+        pnl = fill.get("realized_profit")
+        if pnl is None and entry > 0 and exit_px > 0 and qty > 0:
+            pnl = (exit_px - entry) * qty
+        pnl = float(pnl or 0.0)
+        fee = float(fill.get("fee_usd") or 0.0)
+        hold_seconds = int(time.time() - position.entry_time) if position.entry_time else 0
+        timestamp = datetime.now(timezone.utc).isoformat()
+        sell_trade_id = f"human_manual_sell_{normalized.replace('/', '_')}_{int(time.time() * 1000)}"
+        paper_service = get_paper_trading_service()
+        paper_run_id = getattr(paper_service, "paper_run_id", None) or "default"
+        mode = "live" if self._live_service else "paper"
+        sid = str(getattr(position, "entry_strategy_id", "") or "").strip() or None
+
+        def _write() -> None:
+            with connect_managed(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """INSERT INTO paper_trades (
+                        trade_id, paper_run_id, mode, symbol, side, quantity, price,
+                        entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
+                        fees_paid, slippage_cost, exit_type, exit_reason, timestamp, status, strategy_id
+                    ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, 0, 'HUMAN_MANUAL_SELL', 'HUMAN_MANUAL_SELL', ?, 'executed', ?)""",
+                    (
+                        sell_trade_id,
+                        paper_run_id,
+                        mode,
+                        normalized,
+                        qty,
+                        exit_px,
+                        entry,
+                        pnl,
+                        (pnl / (qty * entry)) if qty > 0 and entry > 0 else 0.0,
+                        hold_seconds,
+                        fee,
+                        timestamp,
+                        sid,
+                    ),
+                )
+                if buy_tid:
+                    cur.execute(
+                        """UPDATE paper_trades SET remaining_position = 0
+                           WHERE trade_id = ? AND side = 'BUY'""",
+                        (buy_tid,),
+                    )
+                cur.execute(
+                    """UPDATE paper_trades SET remaining_position = 0
+                       WHERE side = 'BUY' AND remaining_position > 0
+                         AND replace(replace(upper(symbol), '/', ''), '-', '')
+                             = replace(replace(upper(?), '/', ''), '-', '')""",
+                    (normalized,),
+                )
+                conn.commit()
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _write)
+        logger.info(
+            "HUMAN_MANUAL_SELL_LOT_CLOSED symbol=%s buy_tid=%s sell_tid=%s source=%s",
+            normalized,
+            buy_tid or "?",
+            sell_trade_id,
+            source,
+        )
 
     async def _remove_dust_position_canonical_cleanup(self, symbol: str, position: OpenPosition) -> None:
         """
