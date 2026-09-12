@@ -46,9 +46,10 @@ def _http_get(
 
 def _reference_feed_enabled() -> bool:
     """Kill switch for the public derivatives reference feed, independent of
-    the execution exchange. Default on; set DERIVATIVES_REFERENCE_FEED_ENABLED=0
-    to disable without a code change."""
-    return os.getenv("DERIVATIVES_REFERENCE_FEED_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+    the execution exchange. Default off — Binance Futures fapi endpoints
+    return HTTP 451 (geo-blocked) from US-based hosts. Set
+    DERIVATIVES_REFERENCE_FEED_ENABLED=1 to re-enable if accessible."""
+    return os.getenv("DERIVATIVES_REFERENCE_FEED_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
 
 
 def fetch_binance_open_interest(symbol: str) -> dict[str, Any]:

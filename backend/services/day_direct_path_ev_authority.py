@@ -7,6 +7,7 @@ Does not change SCALP. Does not change DAY exits.
 from __future__ import annotations
 
 import math
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,7 +22,9 @@ from backend.services.day_path_net import (
 DAY_AUTHORITY_MODE = "direct_four_coin_path_ev"
 DAY_POLICY_ID = "day_path_aware_v1"
 HOLD_ACTION = "HOLD"
-HOLD_EV = 0.0
+# Require model to predict at least 10 bps of edge above zero before trading.
+# The model is measured at -8.7 bps OOS — marginal positive EVs are noise.
+HOLD_EV = float(os.getenv("DAY_MIN_EV_FLOOR", "0.0010"))
 OLD_RANK_EXECUTION_AUTHORITY = False
 
 _COIN_KEYS = ("btc", "eth", "sol", "xrp")
@@ -276,8 +279,49 @@ def next_executable_path_ev_symbol(
             return api, ev
     return None
 
+_LEARNING_VETO_CONSEC = int(os.getenv("DAY_LEARNING_VETO_CONSEC_LOSSES", "3"))
+_LEARNING_VETO_LOOKBACK = int(os.getenv("DAY_LEARNING_VETO_LOOKBACK", "10"))
+
+
+def _learning_vetoed_coins(db_path: str) -> set[str]:
+    """Check recent trade outcomes per coin. If the last N consecutive trades
+    for a coin were all losses, suppress it so the model picks a different
+    coin or HOLDs. This gives the learning pipeline real influence on entries.
+    """
+    if _LEARNING_VETO_CONSEC <= 0 or not db_path:
+        return set()
+    vetoed: set[str] = set()
+    try:
+        import sqlite3
+
+        with sqlite3.connect(db_path, timeout=5) as conn:
+            for api in DAY_TRADE_SYMBOLS:
+                rows = conn.execute(
+                    """
+                    SELECT net_profit_usd FROM trade_learning_outcomes
+                    WHERE symbol = ? AND mode IN ('paper', 'live')
+                      AND net_profit_usd IS NOT NULL
+                    ORDER BY exit_timestamp DESC LIMIT ?
+                    """,
+                    (api, _LEARNING_VETO_LOOKBACK),
+                ).fetchall()
+                if len(rows) >= _LEARNING_VETO_CONSEC:
+                    recent = [r[0] for r in rows[:_LEARNING_VETO_CONSEC]]
+                    if all(pnl < 0 for pnl in recent):
+                        vetoed.add(_coin_key(api))
+    except Exception:
+        pass
+    return vetoed
+
 
 def decide_day_bar(*, db_path: str = "", candidates: list[Any] | None = None) -> dict[str, Any]:
     nominee, score = old_rank_telemetry(candidates)
     scores = score_four_coins(db_path=db_path)
+    vetoed = _learning_vetoed_coins(db_path)
+    for coin in vetoed:
+        key = f"{coin}_path_ev"
+        if key in scores:
+            scores[key] = HOLD_EV
+    if vetoed:
+        scores["learning_vetoed_coins"] = sorted(vetoed)
     return select_action(scores, old_rank_nominee=nominee, old_rank_score=score)
