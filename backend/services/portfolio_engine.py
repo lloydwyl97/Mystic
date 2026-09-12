@@ -15185,8 +15185,10 @@ class PortfolioEngine:
                 strategy_id_for_size = str((cand.decision_data or {}).get("live_ai_strategy") or "day").strip().lower()
                 top_meta_score = float((cand.decision_data or {}).get("final_selection_score") or (cand.decision_data or {}).get("selection_score") or cand.rank_score())
                 top_net_ev = self._estimate_candidate_net_expected_value(cand.decision_data or {}, symbol=str(symbol or ""))
-                if float(top_net_ev) <= 0.0:
-                    logger.info("MULTI_BUY_SKIP_NEGATIVE_EV symbol=%s net_ev=%.6f", symbol, float(top_net_ev))
+                from backend.services.day_direct_path_ev_authority import HOLD_EV as _MIN_EV
+
+                if float(top_net_ev) <= _MIN_EV:
+                    logger.info("MULTI_BUY_SKIP_BELOW_EV_FLOOR symbol=%s net_ev=%.6f floor=%.6f", symbol, float(top_net_ev), _MIN_EV)
                     continue
                 dyn_mult, _dyn_components, dyn_cap_reason = self._compute_dynamic_sizing_multiplier(
                     symbol=symbol,
@@ -16878,13 +16880,16 @@ class PortfolioEngine:
                 )
         except Exception:
             _ml_ev_bypass = False
-        if float(top_net_ev) <= 0.0 and not _ml_ev_bypass:
-            await self._emit_day_health_telemetry("BEST_CANDIDATE_NEGATIVE_EV")
+        from backend.services.day_direct_path_ev_authority import HOLD_EV as _EV_FLOOR
+
+        if float(top_net_ev) <= _EV_FLOOR and not _ml_ev_bypass:
+            await self._emit_day_health_telemetry("BEST_CANDIDATE_BELOW_EV_FLOOR")
             logger.info(
-                "BEST_CANDIDATE_NEGATIVE_EV: symbol=%s strategy=%s net_ev=%.6f -> no_trade",
+                "BEST_CANDIDATE_BELOW_EV_FLOOR: symbol=%s strategy=%s net_ev=%.6f floor=%.6f -> no_trade",
                 symbol,
                 str((top_candidate.decision_data or {}).get("live_ai_strategy") or "day"),
                 float(top_net_ev),
+                float(_EV_FLOOR),
             )
             try:
                 from backend.services.day_gate_telemetry import record_gate_event, record_shadow_reject

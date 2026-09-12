@@ -25,10 +25,10 @@ class _Cand:
 
 def test_old_rank_btc_path_ev_sol_selects_sol():
     scores = {
-        "btc_path_ev": 0.0001,
-        "eth_path_ev": 0.0002,
-        "sol_path_ev": 0.0009,
-        "xrp_path_ev": 0.0003,
+        "btc_path_ev": 0.0020,
+        "eth_path_ev": 0.0030,
+        "sol_path_ev": 0.0090,
+        "xrp_path_ev": 0.0040,
         "path_net_status": "predicted",
         "path_net_model_id": "day_path_net_v1",
     }
@@ -54,7 +54,7 @@ def test_old_rank_nominee_below_hold_selects_hold():
     out = select_action(scores, old_rank_nominee="ETHUSDT", old_rank_score=8.0)
     assert out["selected_action"] == "HOLD"
     assert out["path_ev_winner"] == "HOLD"
-    assert out["selected_ev"] == 0.0
+    assert out["selected_ev"] == HOLD_EV
     assert out["old_rank_nominee"] == "ETHUSDT"
     assert out["old_rank_execution_authority"] is False
 
@@ -62,9 +62,9 @@ def test_old_rank_nominee_below_hold_selects_hold():
 def test_missing_old_rank_still_selects_from_four_coins():
     scores = {
         "btc_path_ev": -0.0001,
-        "eth_path_ev": 0.0005,
-        "sol_path_ev": 0.0002,
-        "xrp_path_ev": 0.0001,
+        "eth_path_ev": 0.0050,
+        "sol_path_ev": 0.0020,
+        "xrp_path_ev": 0.0015,
         "path_net_status": "predicted",
         "path_net_model_id": "day_path_net_v1",
     }
@@ -74,13 +74,13 @@ def test_missing_old_rank_still_selects_from_four_coins():
     assert out["selected_action"] == "BUY_ETHUSDT"
 
 
-def test_hold_ev_is_exactly_zero():
+def test_hold_ev_floor_rejects_weak_signals():
     out = select_action(
         {"btc_path_ev": 0.0, "eth_path_ev": 0.0, "sol_path_ev": 0.0, "xrp_path_ev": 0.0, "path_net_status": "predicted"},
         old_rank_nominee="BTCUSDT",
         old_rank_score=1.0,
     )
-    assert out["hold_ev"] == 0.0
+    assert out["hold_ev"] == HOLD_EV
     assert out["selected_action"] == "HOLD"
 
 
@@ -95,7 +95,7 @@ def test_all_four_plus_hold_keys_present():
     out = select_action({"btc_path_ev": 0.01, "eth_path_ev": 0.0, "sol_path_ev": 0.0, "xrp_path_ev": 0.0, "path_net_status": "predicted"})
     for key in ("btc_path_ev", "eth_path_ev", "sol_path_ev", "xrp_path_ev", "hold_ev"):
         assert key in out
-    assert out["hold_ev"] == 0.0
+    assert out["hold_ev"] == HOLD_EV
 
 
 def test_no_setup_regime_or_fbr_in_selector():
@@ -108,10 +108,10 @@ def test_no_setup_regime_or_fbr_in_selector():
 def test_provenance_stamps_direct_mode():
     dec = select_action(
         {
-            "btc_path_ev": 0.0001,
-            "eth_path_ev": 0.0008,
-            "sol_path_ev": 0.0002,
-            "xrp_path_ev": 0.0001,
+            "btc_path_ev": 0.0020,
+            "eth_path_ev": 0.0080,
+            "sol_path_ev": 0.0030,
+            "xrp_path_ev": 0.0015,
             "path_net_status": "predicted",
             "path_net_model_id": "day_path_net_v1",
         },
@@ -130,7 +130,7 @@ def test_provenance_stamps_direct_mode():
 def test_decide_does_not_require_candidates():
     out = decide_day_bar(db_path="", candidates=None)
     assert out["day_authority_mode"] == DAY_AUTHORITY_MODE
-    assert out["hold_ev"] == 0.0
+    assert out["hold_ev"] == HOLD_EV
     assert "btc_path_ev" in out
     assert out["old_rank_execution_authority"] is False
 

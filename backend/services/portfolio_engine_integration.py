@@ -175,7 +175,7 @@ class PortfolioEngineIntegration:
 
         # Bar timing: 1m keeps cooldown/"N bars" semantics; entries decide on 15m closes.
         self.bar_interval = 60  # 1-minute bars (cooldown units)
-        self.entry_decision_interval = max(60, int(os.getenv("DAY_ENTRY_BAR_SEC", "900")))
+        self.entry_decision_interval = max(60, int(os.getenv("DAY_ENTRY_BAR_SEC", "300")))
         self.last_bar_processed = 0
         self.last_entry_bar_processed = 0
         self._exit_monitor_interval = max(5, EXIT_MONITOR_INTERVAL_SEC)
