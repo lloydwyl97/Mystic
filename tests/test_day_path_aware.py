@@ -361,17 +361,15 @@ def test_predict_without_artifact_is_none(monkeypatch, tmp_path):
     reset_day_artifact_cache()
 
 
-def test_accepted_artifact_without_bars_is_hold_not_invented(monkeypatch):
+def test_no_accepted_artifact_without_bars_is_hold_not_invented():
     reset_day_artifact_cache()
     ev, stamped = resolve_day_path_ev({"buy_margin": 0.20, "confidence": 0.90, "prob_buy": 0.80})
-    assert ev == 0.0
-    assert stamped["path_net_status"] == "unavailable_hold"
-    assert stamped["forward_net_model_version"] == "day_path_net_v1"
-    assert stamped["predicted_net_return"] == 0.0
+    assert ev is None
+    assert stamped.get("path_net_status") != "predicted"
     reset_day_artifact_cache()
 
 
-def test_accepted_artifact_with_bars_stamps_model_version():
+def test_no_accepted_artifact_with_bars_does_not_invent_ev():
     reset_day_artifact_cache()
     bars = []
     price = 100.0
@@ -379,9 +377,8 @@ def test_accepted_artifact_with_bars_stamps_model_version():
         price *= 1.0 + (0.0004 if i % 3 == 0 else -0.0002)
         bars.append({"open": price, "high": price * 1.001, "low": price * 0.999, "close": price, "volume": 10.0, "ts": 1786750000 + i * 60})
     ev, stamped = resolve_day_path_ev({"bars_1m": bars, "symbol": "ETHUSDT"})
-    assert ev is not None
-    assert stamped["path_net_status"] == "predicted"
-    assert stamped["forward_net_model_version"] == "day_path_net_v1"
+    assert ev is None
+    assert stamped.get("path_net_status") != "predicted"
     reset_day_artifact_cache()
 
 
