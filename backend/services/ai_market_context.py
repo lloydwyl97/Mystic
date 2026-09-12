@@ -452,25 +452,43 @@ class AIMarketContextService:
             out["month_from_daily"] = {"vec4": None, "ok": False, "reason": str(merr or "month_context_unavailable")}
         return out
 
-    async def _approx_quote_volume_24h_from_1m(self, ccxt_sym: str) -> float:
-        """Sum close*volume over last ~24h of 1m bars (USDT-quote notional proxy)."""
-        rows = None
+    async def _load_cached_1m_rows(self, ccxt_sym: str) -> list[Any]:
+        rows: list[Any] | None = None
         with contextlib.suppress(Exception):
             cached = await async_read_cached_day_active_bundle(ccxt_sym)
             if cached and isinstance(cached.get("1m"), list) and len(cached["1m"]) >= 30:
                 rows = cached["1m"]
-        if rows is None or len(rows) < 30:
-            return 0.0
+        return rows or []
+
+    async def _approx_quote_volume_24h_from_1m(self, ccxt_sym: str) -> float:
+        """Sum close*volume over last ~24h of 1m bars (USDT-quote notional proxy)."""
+        vol, _chg = await self._volume_and_change_from_1m(ccxt_sym)
+        return vol
+
+    async def _change_and_volume_from_1m(self, ccxt_sym: str) -> tuple[float | None, float]:
+        vol, chg = await self._volume_and_change_from_1m(ccxt_sym)
+        return chg, vol
+
+    async def _volume_and_change_from_1m(self, ccxt_sym: str) -> tuple[float, float | None]:
+        rows = await self._load_cached_1m_rows(ccxt_sym)
+        if len(rows) < 30:
+            return 0.0, None
         total = 0.0
         for r in rows[-1440:]:
             total += float(r[4]) * float(r[5])
-        return max(0.0, total)
+        change = None
+        if len(rows) >= 1200:
+            last = float(rows[-1][4])
+            prev = float(rows[-1440][4]) if len(rows) >= 1440 else float(rows[0][4])
+            if last > 0.0 and prev > 0.0:
+                change = last / prev - 1.0
+        return max(0.0, total), change
 
     async def _fetch_24h(self, symbol: str) -> dict[str, float]:
         """Get 24h ticker data: change %, quote volume (USD notional when available)."""
         ccxt_sym = _to_ccxt(symbol)
         with contextlib.suppress(Exception):
-            t = await live_market_data_service.get_ticker(ccxt_sym)
+            t = await live_market_data_service.get_ticker(ccxt_sym, force_refresh=True)
             if t:
                 pct = float(t.get("percentage") or t.get("change_24h") or 0.0)
                 # Normalized ticker uses volume_24h (quote preferred); raw ccxt keys differ.
@@ -482,10 +500,10 @@ class AIMarketContextService:
                     if fb > 0.0:
                         qvol = fb
                 return {"change_24h_pct": pct / 100.0, "volume_24h_usd": qvol}
-        fb2 = await self._approx_quote_volume_24h_from_1m(ccxt_sym)
+        change_1m, fb2 = await self._change_and_volume_from_1m(ccxt_sym)
         if fb2 > 0.0:
-            return {"change_24h_pct": 0.0, "volume_24h_usd": fb2}
-        return {"change_24h_pct": 0.0, "volume_24h_usd": 0.0}
+            return {"change_24h_pct": float(change_1m or 0.0), "volume_24h_usd": fb2}
+        return {"change_24h_pct": float(change_1m or 0.0), "volume_24h_usd": 0.0}
 
     async def _fetch_depth(self, symbol: str) -> tuple[float, float]:
         """Return (spread_pct, depth_imbalance) where imbalance in [-1, +1] (+ = bid-heavy)."""
