@@ -13,14 +13,11 @@ from typing import Any
 
 from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST
 from backend.config.trading_universe import DAY_TRADE_SYMBOLS
-from backend.services.day_path_net import (
-    DAY_PATH_MODEL_VERSION,
-    load_accepted_day_artifact,
-    resolve_day_path_ev,
-)
+from backend.services.day_live_tape_authority import LIVE_AUTHORITY_MODE, score_live_four_coins
+from backend.services.day_path_net import DAY_PATH_MODEL_VERSION
 
-DAY_AUTHORITY_MODE = "direct_four_coin_path_ev"
-DAY_POLICY_ID = "day_path_aware_v1"
+DAY_AUTHORITY_MODE = LIVE_AUTHORITY_MODE
+DAY_POLICY_ID = "day_live_tape_learn_v1"
 HOLD_ACTION = "HOLD"
 # Require model to predict at least 10 bps of edge above zero before trading.
 # The model is measured at -8.7 bps OOS — marginal positive EVs are noise.
@@ -94,71 +91,11 @@ def post_cost_economics_ev(decision_data: dict[str, Any] | None) -> float | None
 
 
 def score_four_coins(*, db_path: str = "") -> dict[str, Any]:
-    """Score BTC/ETH/SOL/XRP independently. Invalid timing cannot win.
-
-    Live EV keeps legacy btc_ret_5=0. Corrected BTC-relative EV is shadow only.
-    """
-    art = load_accepted_day_artifact()
-    evs: dict[str, float] = {}
-    statuses: dict[str, str] = {}
-    valid: dict[str, bool] = {}
-    by_symbol: dict[str, dict[str, Any]] = {}
-    shadow_evs: dict[str, float | None] = {}
-    for api in DAY_TRADE_SYMBOLS:
-        key = _coin_key(api)
-        pred, stamped = resolve_day_path_ev({"path_as_of_now": True}, symbol=api, db_path=db_path)
-        ok = bool(stamped.get("path_input_valid")) and str(stamped.get("path_net_status") or "") == "predicted"
-        valid[key] = ok
-        statuses[key] = "predicted" if ok else str(stamped.get("path_invalid_reason") or stamped.get("path_net_status") or "unavailable_hold")
-        evs[key] = float(pred) if ok and pred is not None else HOLD_EV
-        shadow_evs[key] = stamped.get("shadow_correct_btc_path_ev")
-        by_symbol[_api_symbol(api)] = {
-            "path_input_valid": ok,
-            "path_invalid_reason": None if ok else statuses[key],
-            "path_row_count": stamped.get("path_row_count"),
-            "path_first_bar_ts": stamped.get("path_first_bar_ts"),
-            "path_last_bar_ts": stamped.get("path_last_bar_ts"),
-            "path_actual_lookback_seconds": stamped.get("path_actual_lookback_seconds"),
-            "path_max_gap_seconds": stamped.get("path_max_gap_seconds"),
-            "path_latest_bar_age_seconds": stamped.get("path_latest_bar_age_seconds"),
-            "path_model_version": stamped.get("path_model_version") or (art.version if art is not None else DAY_PATH_MODEL_VERSION),
-            "path_feature_schema_version": stamped.get("path_feature_schema_version"),
-            "legacy_btc_ret_5": stamped.get("legacy_btc_ret_5"),
-            "correct_btc_ret_5": stamped.get("correct_btc_ret_5"),
-            "legacy_path_ev": stamped.get("legacy_path_ev"),
-            "shadow_correct_btc_path_ev": stamped.get("shadow_correct_btc_path_ev"),
-            "path_max_abs_z": stamped.get("path_max_abs_z"),
-            "path_ood_feature_count_at_4": stamped.get("path_ood_feature_count_at_4"),
-            "path_ood_feature_count_at_6": stamped.get("path_ood_feature_count_at_6"),
-            "path_ood_feature_count_at_8": stamped.get("path_ood_feature_count_at_8"),
-            "path_outside_training_minmax_count": stamped.get("path_outside_training_minmax_count"),
-        }
-    any_valid = any(valid.values())
-    shadow_pairs = [(k, v) for k, v in shadow_evs.items() if v is not None and valid.get(k)]
-    if shadow_pairs:
-        shadow_win_key = max(shadow_pairs, key=lambda item: (float(item[1]), 1))[0]
-        shadow_winner = {"btc": "BTCUSDT", "eth": "ETHUSDT", "sol": "SOLUSDT", "xrp": "XRPUSDT"}[shadow_win_key]
-        if float(shadow_evs[shadow_win_key] or 0) <= HOLD_EV:
-            shadow_winner = HOLD_ACTION
-    else:
-        shadow_winner = HOLD_ACTION
-    return {
-        "btc_path_ev": float(evs.get("btc", HOLD_EV)),
-        "eth_path_ev": float(evs.get("eth", HOLD_EV)),
-        "sol_path_ev": float(evs.get("sol", HOLD_EV)),
-        "xrp_path_ev": float(evs.get("xrp", HOLD_EV)),
-        "hold_ev": HOLD_EV,
-        "statuses": statuses,
-        "valid": valid,
-        "path_input_by_symbol": by_symbol,
-        "shadow_correct_btc_winner": shadow_winner,
-        "path_net_model_id": (art.version if art is not None else DAY_PATH_MODEL_VERSION),
-        "model_trained_at": (art.trained_at if art is not None else ""),
-        "horizon_minutes": (int(art.primary_horizon_min) if art is not None else None),
-        "costs_bps": round(float(ESTIMATED_ROUNDTRIP_COST) * 1e4, 4),
-        "path_net_status": "predicted" if any_valid else "path_input_invalid",
-        "model_accuracy": None,
-    }
+    """Score BTC/ETH/SOL/XRP from the live tape and live learning signal."""
+    live = score_live_four_coins(db_path=db_path)
+    live["hold_ev"] = HOLD_EV
+    live["path_net_model_id"] = live.get("path_net_model_id") or DAY_PATH_MODEL_VERSION
+    return live
 
 
 def select_action(
