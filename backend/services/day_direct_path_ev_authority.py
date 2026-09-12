@@ -13,14 +13,11 @@ from typing import Any
 
 from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST
 from backend.config.trading_universe import DAY_TRADE_SYMBOLS
-from backend.services.day_path_net import (
-    DAY_PATH_MODEL_VERSION,
-    load_accepted_day_artifact,
-    resolve_day_path_ev,
-)
+from backend.services.day_live_tape_authority import LIVE_AUTHORITY_MODE, score_live_four_coins
+from backend.services.day_path_net import DAY_PATH_MODEL_VERSION
 
-DAY_AUTHORITY_MODE = "direct_four_coin_path_ev"
-DAY_POLICY_ID = "day_path_aware_v1"
+DAY_AUTHORITY_MODE = LIVE_AUTHORITY_MODE
+DAY_POLICY_ID = "day_live_tape_learn_v1"
 HOLD_ACTION = "HOLD"
 # Require model to predict at least 10 bps of edge above zero before trading.
 # The model is measured at -8.7 bps OOS — marginal positive EVs are noise.
@@ -94,33 +91,11 @@ def post_cost_economics_ev(decision_data: dict[str, Any] | None) -> float | None
 
 
 def score_four_coins(*, db_path: str = "") -> dict[str, Any]:
-    """Score BTC/ETH/SOL/XRP independently. Missing prediction is HOLD (0), not invented."""
-    art = load_accepted_day_artifact()
-    evs: dict[str, float] = {}
-    statuses: dict[str, str] = {}
-    for api in DAY_TRADE_SYMBOLS:
-        key = _coin_key(api)
-        pred, stamped = resolve_day_path_ev({}, symbol=api, db_path=db_path)
-        if pred is None:
-            evs[key] = HOLD_EV
-            statuses[key] = "unavailable_hold"
-        else:
-            evs[key] = float(pred)
-            statuses[key] = str(stamped.get("path_net_status") or "predicted")
-    return {
-        "btc_path_ev": float(evs.get("btc", HOLD_EV)),
-        "eth_path_ev": float(evs.get("eth", HOLD_EV)),
-        "sol_path_ev": float(evs.get("sol", HOLD_EV)),
-        "xrp_path_ev": float(evs.get("xrp", HOLD_EV)),
-        "hold_ev": HOLD_EV,
-        "statuses": statuses,
-        "path_net_model_id": (art.version if art is not None else DAY_PATH_MODEL_VERSION),
-        "model_trained_at": (art.trained_at if art is not None else ""),
-        "horizon_minutes": (int(art.primary_horizon_min) if art is not None else None),
-        "costs_bps": round(float(ESTIMATED_ROUNDTRIP_COST) * 1e4, 4),
-        "path_net_status": "predicted" if art is not None else "unavailable_hold",
-        "model_accuracy": None,
-    }
+    """Score BTC/ETH/SOL/XRP from the live tape and live learning signal."""
+    live = score_live_four_coins(db_path=db_path)
+    live["hold_ev"] = HOLD_EV
+    live["path_net_model_id"] = live.get("path_net_model_id") or DAY_PATH_MODEL_VERSION
+    return live
 
 
 def select_action(

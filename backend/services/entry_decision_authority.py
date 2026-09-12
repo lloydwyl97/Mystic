@@ -130,7 +130,10 @@ def is_model_controlled(payload: dict[str, Any] | None, *, engine: str) -> bool:
     if buy_ev <= hold_ev:
         return False
     if engine == "day":
-        return version == DAY_ACCEPTED_MODEL and policy == DAY_POLICY and str(src.get("path_net_status") or "") == "predicted"
+        ok_version = version in {DAY_ACCEPTED_MODEL, "live_tape_learn_v1"}
+        ok_policy = policy in {DAY_POLICY, "day_live_tape_learn_v1"}
+        ok_status = str(src.get("path_net_status") or "") in {"predicted", "live_tape"}
+        return ok_version and ok_policy and ok_status
     if engine == "scalp":
         return version == SCALP_ACCEPTED_MODEL and policy == SCALP_POLICY
     return False
@@ -157,7 +160,7 @@ def build_day_entry_provenance(
     )
     p_pos = _num(dd.get("p_positive_net") if dd.get("p_positive_net") not in (None, "") else dd.get("predicted_prob_positive_net"))
     mode = str(dd.get("day_authority_mode") or "")
-    if mode == "direct_four_coin_path_ev" or (status == "predicted" and version == DAY_ACCEPTED_MODEL and buy_ev is not None):
+    if mode in {"direct_four_coin_path_ev", "live_tape_learn_v1"} or (status in {"predicted", "live_tape"} and buy_ev is not None):
         policy = str(dd.get("path_aware_policy_id") or DAY_POLICY)
         model_version = version or DAY_ACCEPTED_MODEL
         action_in = str(dd.get("selected_action") or "")
@@ -308,6 +311,47 @@ def build_scalp_entry_provenance(
         "legacy_rank_score": _num(meta.get("rank_score")),
         "final_decision_function": "scalp_candidate_ranking.pick_best_global_candidate",
     }
+
+
+REQUIRED_DAY_PROVENANCE_KEYS = (
+    "decision_id",
+    "inference_log_id",
+    "ai_inference_log_id",
+    "prediction_timestamp",
+    "decision_timestamp",
+    "p_buy",
+    "p_sell",
+    "p_hold",
+    "ml_score",
+    "predicted_gross_ev",
+    "predicted_cost",
+    "predicted_net_ev",
+    "final_selection_score",
+    "universe_rank",
+    "features_json_hash",
+    "prior_4h_low",
+    "distance_to_prior_4h_low_bps",
+    "forming_4h_bar_age_min",
+    "ema_alignment",
+    "thesis_invalid_components",
+    "spread",
+    "slippage_estimate",
+    "binance_order_id",
+    "binance_fill_id",
+)
+
+
+def stamp_live_fill_ids(provenance: dict[str, Any] | None, fill: dict[str, Any] | None) -> dict[str, Any]:
+    """Copy exchange fill IDs onto provenance. Does not change order placement."""
+    out = dict(provenance or {})
+    src = dict(fill or {})
+    order_id = src.get("id") or src.get("exchange_order_id") or src.get("orderId") or src.get("order_id")
+    fill_id = src.get("binance_fill_id") or src.get("tradeId") or src.get("trade_id") or src.get("fill_id")
+    if order_id not in (None, ""):
+        out["binance_order_id"] = order_id
+    if fill_id not in (None, ""):
+        out["binance_fill_id"] = fill_id
+    return out
 
 
 def summarize_book(rows: list[dict[str, Any]]) -> dict[str, Any]:

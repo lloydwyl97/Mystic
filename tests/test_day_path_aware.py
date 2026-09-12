@@ -341,7 +341,7 @@ def test_extreme_protection_still_fires():
 
 
 def test_path_ev_authority_unchanged():
-    assert DAY_AUTHORITY_MODE == "direct_four_coin_path_ev"
+    assert DAY_AUTHORITY_MODE == "live_tape_learn_v1"
     assert OLD_RANK_EXECUTION_AUTHORITY is False
     out = select_action({"btc_path_ev": -0.01, "eth_path_ev": -0.02, "sol_path_ev": 0.0, "xrp_path_ev": -0.03})
     assert out["selected_action"] == "HOLD"
