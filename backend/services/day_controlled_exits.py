@@ -468,8 +468,8 @@ def _stall_exit_enabled() -> bool:
 
 
 def _stall_min_hold_min() -> float:
-    # Day-trade style: do not cut "dead" holds until the idea has had hours.
-    return float(os.getenv("DAY_STALL_MIN_HOLD_MIN", "120"))
+    # Cut dead holds at 45 min — 2 hours of bleeding is too late.
+    return float(os.getenv("DAY_STALL_MIN_HOLD_MIN", "45"))
 
 
 def _stall_max_mfe_pct() -> float:
@@ -485,9 +485,9 @@ def _stall_max_mfe_pct() -> float:
 def _stall_min_adverse_pct() -> float:
     """Min MAE (fraction below entry) required to confirm a dead/worsening stall cut.
 
-    Flat red trades with tiny adverse are not force-sold; TIME_STOP still owns the ceiling.
+    Lowered to 0.15% — catch dying trades before they bleed further.
     """
-    return float(os.getenv("DAY_STALL_MIN_ADVERSE_PCT", "0.0025"))
+    return float(os.getenv("DAY_STALL_MIN_ADVERSE_PCT", "0.0015"))
 
 
 def _stall_recovery_pct() -> float:
@@ -599,13 +599,13 @@ def _giveback_exit_enabled() -> bool:
 
 
 def _giveback_min_hold_min() -> float:
-    # Avoid 3-minute noise cuts; require a real day-trade development window.
-    return float(os.getenv("DAY_GIVEBACK_MIN_HOLD_MIN", "20"))
+    # Green going red — cut at 8 min, not 20. The profit is already gone.
+    return float(os.getenv("DAY_GIVEBACK_MIN_HOLD_MIN", "8"))
 
 
 def _giveback_min_mfe_pct() -> float:
     """Min favorable excursion (fraction) that must have been reached before a reversal counts as a giveback."""
-    return float(os.getenv("DAY_GIVEBACK_MIN_MFE_PCT", "0.0025"))
+    return float(os.getenv("DAY_GIVEBACK_MIN_MFE_PCT", "0.0010"))
 
 
 def _giveback_trigger_pnl_pct() -> float:
@@ -1047,10 +1047,10 @@ def backfill_position_exit_metadata(position: Any, coin_profile: dict[str, Any])
 def _break_even_trigger_pct() -> float:
     """MFE fraction that must be reached before break-even ratchet activates.
 
-    Default 0.30% is well above round-trip cost (~0.20%). Below trigger, no
-    change. Above trigger, stop is lifted to entry_price + offset.
+    Default 0.15% — once a trade clears round-trip cost, lock break-even
+    so profitable trades cannot go red.
     """
-    return float(os.getenv("DAY_BREAK_EVEN_TRIGGER_PCT", "0.0030"))
+    return float(os.getenv("DAY_BREAK_EVEN_TRIGGER_PCT", "0.0015"))
 
 
 def _break_even_offset_pct() -> float:
@@ -1059,8 +1059,8 @@ def _break_even_offset_pct() -> float:
 
 
 def _mfe_trail_tier_1_pct() -> float:
-    """MFE fraction at which the trail tightens to tier-1 (default 0.50%)."""
-    return float(os.getenv("DAY_MFE_TRAIL_TIER1_MFE_PCT", "0.0050"))
+    """MFE fraction at which the trail tightens to tier-1 (default 0.20%)."""
+    return float(os.getenv("DAY_MFE_TRAIL_TIER1_MFE_PCT", "0.0020"))
 
 
 def _mfe_trail_tier_1_trail_pct() -> float:

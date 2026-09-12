@@ -475,15 +475,14 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("[LIFESPAN] MarketDataService init failed (latency may show no_redis_cache): %s", e)
 
-    # Social leaderboard read path: initialize service so /api/social/leaderboard can read from same DB
-    if SocialTradingService is not None and set_social_trading_service is not None:
-        try:
-            social_svc = SocialTradingService(database_pool_service=None, cache_service=None)
-            await social_svc.initialize()
-            set_social_trading_service(social_svc)
-            logger.info("[LIFESPAN] SocialTradingService initialized - /api/social/leaderboard will use canonical DB")
-        except Exception as e:
-            logger.warning("[LIFESPAN] SocialTradingService init failed (leaderboard may 500): %s", e)
+    # Social trading disabled — not used by DAY or SCALP trading systems.
+    # if SocialTradingService is not None and set_social_trading_service is not None:
+    #     try:
+    #         social_svc = SocialTradingService(database_pool_service=None, cache_service=None)
+    #         await social_svc.initialize()
+    #         set_social_trading_service(social_svc)
+    #     except Exception:
+    #         pass
 
     # M5: Load circuit breaker state if it was deferred (async context at import)
     try:
