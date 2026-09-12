@@ -56,6 +56,35 @@ def test_incident_1415_giveback_cuts_after_18bps_mfe(monkeypatch):
     assert out["reason"] == EXIT_GIVEBACK
 
 
+def test_incident_1415_peak_turn_sells_while_green(monkeypatch):
+    from backend.services.day_controlled_exits import EXIT_PEAK_TURN, evaluate_peak_turn_exit
+
+    monkeypatch.setenv("DAY_PEAK_TURN_EXIT_ENABLED", "true")
+    monkeypatch.setenv("DAY_PEAK_TURN_MIN_HOLD_MIN", "2")
+    monkeypatch.setenv("DAY_PEAK_TURN_MIN_MFE_PCT", "0.0015")
+    monkeypatch.setenv("DAY_PEAK_TURN_PULLBACK_PCT", "0.0008")
+    out = evaluate_peak_turn_exit(
+        entry_price=2613.6,
+        highest_price=2618.33,
+        current_price=2615.8,
+        net_pnl_pct=0.00024,
+        hold_minutes=8.0,
+    )
+    assert out is not None
+    assert out["action"] == "sell"
+    assert out["reason"] == EXIT_PEAK_TURN
+
+
+def test_incident_1415_spike_fade_blocks_buy_after_top():
+    from backend.services.day_controlled_exits import BUY_BLOCKED_SPIKE_FADE, evaluate_spike_fade_entry
+
+    bundle = {"4h": [[1, 2452.92, 2664.29, 2452.92, 2613.60, 1.0], [2, 2452.92, 2664.29, 2452.92, 2613.60, 1.0]]}
+    out = evaluate_spike_fade_entry(mark=2613.60, bundle=bundle)
+    assert out is not None
+    assert out["block_reason"] == BUY_BLOCKED_SPIKE_FADE
+    assert out["fade_pct"] > 0.004
+
+
 def test_incident_1415_stall_cuts_dead_hold(monkeypatch):
     from backend.services.day_controlled_exits import EXIT_STALL_DEAD, evaluate_stall_exit
 

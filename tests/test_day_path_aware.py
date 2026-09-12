@@ -12,6 +12,7 @@ from backend.services.day_controlled_exits import (
     EXIT_GIVEBACK,
     EXIT_NET_PROFIT,
     EXIT_PATH_EXECUTABLE_PROFIT,
+    EXIT_PEAK_TURN,
     EXIT_STALL_DEAD,
     EXIT_TIME_STOP,
     EXIT_TRAILING_STOP,
@@ -83,9 +84,8 @@ def test_missing_4h_bundle_does_not_net_profit_clip():
         coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
         bundle=None,
     )
-    assert out["action"] == "hold"
-    assert out["reason"] == "PATH_AWARE_HOLD_4H_MISSING"
-    assert out["reason"] != EXIT_NET_PROFIT
+    assert out["action"] == "sell"
+    assert out["reason"] in {EXIT_PATH_EXECUTABLE_PROFIT, EXIT_PEAK_TURN}
 
 
 def test_path_aware_does_not_stall_red():
@@ -150,8 +150,8 @@ def test_path_aware_holds_green_on_4h_rise():
         coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
         bundle={"4h": _rising_4h_rows()},
     )
-    assert out["action"] == "hold"
-    assert out["reason"] == "PATH_AWARE_HOLD_4H_RISE"
+    assert out["action"] == "sell"
+    assert out["reason"] == EXIT_PATH_EXECUTABLE_PROFIT
 
 
 def test_path_aware_giveback_sells_fade_while_4h_intact():
@@ -198,8 +198,8 @@ def test_path_aware_holds_time_stop_on_4h_rise():
         coin_profile={"max_hold_min": 300, "trail": 0.005, "sl": 0.01},
         bundle={"4h": _rising_4h_rows()},
     )
-    assert out["action"] == "hold"
-    assert out["reason"] == "PATH_AWARE_HOLD_4H_RISE"
+    assert out["action"] == "sell"
+    assert out["reason"] == EXIT_PATH_EXECUTABLE_PROFIT
 
 
 def _broken_4h_rows() -> list[list]:
@@ -215,7 +215,7 @@ def test_4h_structure_break_exits_as_day_not_scalp_clip():
     out = evaluate_engine_managed_exit(
         position=_Pos(),
         current_price=2200.0,
-        net_pnl_pct=0.005,
+        net_pnl_pct=-0.010,
         hold_minutes=20.0,
         coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
         bundle={"4h": _broken_4h_rows()},
@@ -306,16 +306,18 @@ def test_only_structure_break_and_extreme_may_full_flatten():
         EXIT_TRAILING_STOP,
         EXIT_GIVEBACK,
         EXIT_STALL_DEAD,
+        EXIT_PATH_EXECUTABLE_PROFIT,
+        EXIT_PEAK_TURN,
+        EXIT_NET_PROFIT,
     } == DAY_FULL_FLATTEN_REASONS
-    for banned in (EXIT_NET_PROFIT, EXIT_PATH_EXECUTABLE_PROFIT, EXIT_TIME_STOP):
-        assert banned not in DAY_FULL_FLATTEN_REASONS
+    assert EXIT_TIME_STOP not in DAY_FULL_FLATTEN_REASONS
 
 
-@pytest.mark.parametrize("net", [0.0006, 0.0045, 0.02, -0.006])
+@pytest.mark.parametrize("net", [0.0006, -0.006])
 def test_no_scalp_clip_at_any_net_when_4h_not_intact(net):
-    """4H absent: no profit level and no hold time may produce a sell."""
+    """4H absent: tiny or red marks still hold. Booked net is taken."""
     out = evaluate_engine_managed_exit(
-        position=_Pos(stop_price=0.0, thesis_invalid_level=0.0, trailing_stop_price=99.9, highest_price=101.0),
+        position=_Pos(stop_price=0.0, thesis_invalid_level=0.0, trailing_stop_price=0.0, highest_price=100.0),
         current_price=100.0,
         net_pnl_pct=net,
         hold_minutes=5000.0,
@@ -324,6 +326,20 @@ def test_no_scalp_clip_at_any_net_when_4h_not_intact(net):
     )
     assert out["action"] == "hold"
     assert out["reason"] == "PATH_AWARE_HOLD_4H_MISSING"
+
+
+@pytest.mark.parametrize("net", [0.0045, 0.02])
+def test_booked_net_sells_when_4h_missing(net):
+    out = evaluate_engine_managed_exit(
+        position=_Pos(stop_price=0.0, thesis_invalid_level=0.0, trailing_stop_price=99.9, highest_price=101.0),
+        current_price=100.0,
+        net_pnl_pct=net,
+        hold_minutes=5000.0,
+        coin_profile={"max_hold_min": 300, "trail": 0.005, "sl": 0.01},
+        bundle=None,
+    )
+    assert out["action"] == "sell"
+    assert out["reason"] in {EXIT_PATH_EXECUTABLE_PROFIT, EXIT_PEAK_TURN}
 
 
 def test_extreme_protection_still_fires():
@@ -447,7 +463,7 @@ def test_preview_splits_trail_fields_and_names_intact_profit_when_ready():
 
 
 def test_intact_green_sol_clip_level_holds_until_trail():
-    """Replay: SOL 101.08 → 102.52 was NET_PROFIT while 4H advanced. Must hold."""
+    """Replay: SOL 101.08 → 102.52 booked net while 4H advanced. Take it."""
     rows = _rising_4h_rows(start=100.59)
     pos = _Pos(
         entry_price=101.08,
@@ -467,8 +483,8 @@ def test_intact_green_sol_clip_level_holds_until_trail():
         coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
         bundle={"4h": rows},
     )
-    assert hold["action"] == "hold"
-    assert hold["reason"] == "PATH_AWARE_HOLD_4H_RISE"
+    assert hold["action"] == "sell"
+    assert hold["reason"] == EXIT_PATH_EXECUTABLE_PROFIT
     trail_hit = evaluate_engine_managed_exit(
         position=pos,
         current_price=102.52 * 0.995 - 0.01,
@@ -482,7 +498,7 @@ def test_intact_green_sol_clip_level_holds_until_trail():
 
 
 def test_intact_green_eth_clip_level_holds_until_trail():
-    """Replay: ETH 2535.56 → 2565.31 was NET_PROFIT on intact 4H. Must hold."""
+    """Replay: ETH 2535.56 → 2565.31 booked net on intact 4H. Take it."""
     rows = _rising_4h_rows(start=2482.93)
     pos = _Pos(
         entry_price=2535.56,
@@ -502,8 +518,8 @@ def test_intact_green_eth_clip_level_holds_until_trail():
         coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
         bundle={"4h": rows},
     )
-    assert hold["action"] == "hold"
-    assert hold["reason"] == "PATH_AWARE_HOLD_4H_RISE"
+    assert hold["action"] == "sell"
+    assert hold["reason"] == EXIT_PATH_EXECUTABLE_PROFIT
     trail_hit = evaluate_engine_managed_exit(
         position=pos,
         current_price=2565.31 * 0.995 - 0.5,

@@ -1251,6 +1251,7 @@ def htf_4h_rise_broken(
 _PROFIT_CLOSE_MARKERS = (
     "NET_PROFIT",
     "PATH_EXECUTABLE_PROFIT",
+    "PEAK_TURN",
     "TP1",
     "TAKE_PROFIT",
 )

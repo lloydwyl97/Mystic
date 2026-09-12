@@ -5621,6 +5621,7 @@ class PortfolioEngine:
             "GIVEBACK_EXIT",
             "NET_PROFIT_EXIT",
             "PATH_EXECUTABLE_PROFIT",
+            "PEAK_TURN_EXIT",
             "STOP_LOSS_EXIT",
             "TRAILING_STOP_EXIT",
             "THESIS_INVALIDATION_EXIT",
@@ -12718,6 +12719,7 @@ class PortfolioEngine:
 
         from backend.services.day_controlled_exits import (
             EXIT_PATH_EXECUTABLE_PROFIT,
+            EXIT_PEAK_TURN,
             _path_aware_exit_enabled,
             evaluate_engine_managed_exit,
         )
@@ -12750,7 +12752,10 @@ class PortfolioEngine:
                 managed.get("4h_bundle_present"),
                 managed.get("extreme_protection_fired"),
             )
-            profit_exit = exit_reason.startswith(EXIT_NET_PROFIT) or exit_reason == EXIT_PATH_EXECUTABLE_PROFIT
+            profit_exit = exit_reason.startswith(EXIT_NET_PROFIT) or exit_reason in {
+                EXIT_PATH_EXECUTABLE_PROFIT,
+                EXIT_PEAK_TURN,
+            }
             exit_type = ExitType.TAKE_PROFIT_1 if profit_exit else ExitType.MANUAL
             return await self.execute_sell_fifo(
                 symbol,
