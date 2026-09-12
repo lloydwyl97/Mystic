@@ -1665,6 +1665,23 @@ class _PreBuyPositionView:
         self.take_profit_1_price = target_level
 
 
+def last_look_buy_mark(
+    *,
+    decision_price: float,
+    expected_fill: float = 0.0,
+    best_bid: float = 0.0,
+    best_ask: float = 0.0,
+    limit_price: float = 0.0,
+) -> float:
+    """Live price the pre-buy 4H check must use at send.
+
+    A BUY breaks 4H when price is already through the prior low. Use the
+    lowest live/executable print, not the earlier decision mid.
+    """
+    marks = [float(x) for x in (decision_price, expected_fill, best_bid, best_ask, limit_price) if x is not None and float(x or 0.0) > 0.0]
+    return min(marks) if marks else 0.0
+
+
 def evaluate_pre_buy_exit_consistency(
     *,
     setup: str,

@@ -8793,6 +8793,84 @@ class PortfolioEngine:
         else:
             fill_price = price * (1 + SLIPPAGE_PCT)
             exec_fee_rate = TAKER_FEE
+        try:
+            from backend.services.day_active_market_bundle import resolve_pre_buy_day_structure_bundle
+            from backend.services.day_controlled_exits import evaluate_pre_buy_exit_consistency, last_look_buy_mark
+            from backend.services.day_regime_router import _mtf_bundle, classify_day_regime
+
+            look_px = last_look_buy_mark(
+                decision_price=float(price or 0.0),
+                expected_fill=float(getattr(preflight, "expected_avg_fill", 0.0) or 0.0),
+                best_bid=float(getattr(preflight, "best_bid", 0.0) or 0.0),
+                best_ask=float(getattr(preflight, "best_ask", 0.0) or 0.0),
+                limit_price=float(getattr(preflight, "protected_limit_price", 0.0) or 0.0),
+            )
+            if look_px > 0:
+                ctx_ll, _ = self._get_context_payload(normalized_symbol)
+                dd_ll: dict[str, Any] = {
+                    "setup_type": str(getattr(explainability, "setup_type", "") or getattr(explainability, "entry_thesis", "") or ""),
+                    "entry_thesis": str(getattr(explainability, "entry_thesis", "") or getattr(explainability, "setup_type", "") or ""),
+                    "day_route_regime": str(getattr(explainability, "day_route_regime", "") or getattr(explainability, "regime", "") or ""),
+                    "regime": str(getattr(explainability, "regime", "") or ""),
+                    "price_structure_regime": str(getattr(explainability, "price_structure_regime", "") or ""),
+                }
+                if ctx_ll:
+                    dd_ll.update({k: v for k, v in ctx_ll.items() if k not in dd_ll or not dd_ll.get(k)})
+                atr_ll = (atr / look_px) if look_px > 0 and atr > 0 else 0.0
+                day_regime_ll = classify_day_regime(
+                    dd_ll,
+                    context_payload=ctx_ll,
+                    chop_score=float(getattr(explainability, "chop_score", 0.5) or 0.5),
+                    atr_ratio=float(atr_ll),
+                    price_structure_regime=str(getattr(explainability, "price_structure_regime", "") or "unknown"),
+                )
+                bundle_ll = resolve_pre_buy_day_structure_bundle(normalized_symbol, _mtf_bundle(dd_ll, ctx_ll))
+                look = evaluate_pre_buy_exit_consistency(
+                    setup=str(dd_ll.get("entry_thesis") or dd_ll.get("setup_type") or ""),
+                    entry_price=float(look_px),
+                    stop_price=float(stop_price or 0.0),
+                    thesis_invalid_level=float(getattr(explainability, "thesis_invalid_level", 0.0) or 0.0),
+                    thesis_target_level=float(getattr(explainability, "thesis_target_level", 0.0) or 0.0),
+                    entry_vwap=float(getattr(explainability, "entry_vwap", 0.0) or 0.0),
+                    entry_ts=float(time.time()),
+                    coin_profile=get_coin_profile(normalized_symbol),
+                    bundle=bundle_ll,
+                    spread_pct=float(getattr(preflight, "spread_pct", 0.0) or 0.0),
+                    day_regime=day_regime_ll,
+                    decision_data=dd_ll,
+                    context_payload=ctx_ll,
+                    thesis_score=float(getattr(explainability, "thesis_score", 0.0) or 0.0),
+                )
+                if not look.get("allowed"):
+                    block_code = str(look.get("block_reason") or "ENTRY_EXIT_INCONSISTENT")
+                    logger.warning(
+                        "BUY_BLOCKED_LAST_LOOK symbol=%s look_px=%.8f decision_px=%.8f reason=%s",
+                        normalized_symbol,
+                        look_px,
+                        float(price or 0.0),
+                        block_code,
+                    )
+                    await self._record_reject(
+                        normalized_symbol,
+                        "BUY",
+                        block_code,
+                        "LAST_LOOK_ENTRY_EXIT",
+                        decision_id=decision_id,
+                        explainability=explainability,
+                        audit_context_extra={"last_look_px": look_px, "entry_exit_consistency": look},
+                    )
+                    if decision_id:
+                        await self._update_pipeline_decision(
+                            decision_id,
+                            {
+                                "stage": "EXECUTION",
+                                "execution_result": "NOT_EXECUTED",
+                                "execution_reason": f"LAST_LOOK:{block_code}",
+                            },
+                        )
+                    return None
+        except Exception:
+            logger.exception("LAST_LOOK_PRE_BUY_ERROR symbol=%s", normalized_symbol)
         fee = quantity * fill_price * exec_fee_rate
         notional = quantity * fill_price
         total_cost = notional + fee
