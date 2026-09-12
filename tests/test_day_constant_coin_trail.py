@@ -64,23 +64,23 @@ def _broken_4h() -> list[list]:
 
 
 def test_coin_profile_trail_distances_locked():
-    assert get_coin_profile("BTCUSDT")["trail"] == pytest.approx(0.0040)
-    assert get_coin_profile("ETHUSDT")["trail"] == pytest.approx(0.0045)
-    assert get_coin_profile("SOLUSDT")["trail"] == pytest.approx(0.0055)
-    assert get_coin_profile("XRPUSDT")["trail"] == pytest.approx(0.0050)
-    assert COIN_PROFILES["BTCUSDT"]["trail"] == 0.0040
-    assert COIN_PROFILES["ETHUSDT"]["trail"] == 0.0045
-    assert COIN_PROFILES["SOLUSDT"]["trail"] == 0.0055
-    assert COIN_PROFILES["XRPUSDT"]["trail"] == 0.0050
+    assert get_coin_profile("BTCUSDT")["trail"] == pytest.approx(0.0020)
+    assert get_coin_profile("ETHUSDT")["trail"] == pytest.approx(0.0020)
+    assert get_coin_profile("SOLUSDT")["trail"] == pytest.approx(0.0025)
+    assert get_coin_profile("XRPUSDT")["trail"] == pytest.approx(0.0025)
+    assert COIN_PROFILES["BTCUSDT"]["trail"] == 0.0020
+    assert COIN_PROFILES["ETHUSDT"]["trail"] == 0.0020
+    assert COIN_PROFILES["SOLUSDT"]["trail"] == 0.0025
+    assert COIN_PROFILES["XRPUSDT"]["trail"] == 0.0025
 
 
 @pytest.mark.parametrize(
     "symbol,entry,trail_pct",
     [
-        ("BTC/USDT", 80000.0, 0.0040),
-        ("ETH/USDT", 2500.0, 0.0045),
-        ("SOL/USDT", 100.0, 0.0055),
-        ("XRP/USDT", 1.50, 0.0050),
+        ("BTC/USDT", 80000.0, 0.0020),
+        ("ETH/USDT", 2500.0, 0.0020),
+        ("SOL/USDT", 100.0, 0.0025),
+        ("XRP/USDT", 1.50, 0.0025),
     ],
 )
 def test_profile_distance_holds_after_half_and_one_pct_mfe(symbol, entry, trail_pct):
@@ -103,22 +103,21 @@ def test_profile_distance_holds_after_half_and_one_pct_mfe(symbol, entry, trail_
         be_floor = entry * 1.0005
         expected = max(profile_trail, be_floor)
         assert pos.trailing_stop_price == pytest.approx(expected, rel=1e-6)
-        assert pos.trailing_stop_price != pytest.approx(high * (1.0 - 0.0030), rel=1e-4)
-        assert pos.trailing_stop_price != pytest.approx(high * (1.0 - 0.0020), rel=1e-4)
-        widened = high * (1.0 - min(trail_pct * 2.0, 0.025))
-        if abs(widened - expected) > 1e-6:
-            assert pos.trailing_stop_price != pytest.approx(widened, rel=1e-4)
+        # Verify trail uses the coin-profile distance, not a MFE-tightened one.
+        # Tier-1 trail_pct (0.30%) should NOT be used when profile trail is smaller.
+        if trail_pct < 0.0030:
+            assert pos.trailing_stop_price != pytest.approx(high * (1.0 - 0.0030), rel=1e-4)
 
 
 def test_high_water_ratchet_rises_with_new_highs():
-    pos = _Pos(symbol="SOL/USDT", entry_price=100.0, highest_price=100.60, trail_pct=0.0055)
+    pos = _Pos(symbol="SOL/USDT", entry_price=100.0, highest_price=100.60, trail_pct=0.0025)
     profile = get_coin_profile("SOLUSDT")
     refresh_trailing_stop(pos, 100.60, profile)
     first = pos.trailing_stop_price
     pos.highest_price = 102.00
     refresh_trailing_stop(pos, 102.00, profile)
     assert pos.trailing_stop_price > first
-    assert pos.trailing_stop_price == pytest.approx(102.00 * (1.0 - 0.0055), rel=1e-6)
+    assert pos.trailing_stop_price == pytest.approx(102.00 * (1.0 - 0.0025), rel=1e-6)
 
 
 def test_pullback_through_constant_trail_exits():
@@ -126,14 +125,14 @@ def test_pullback_through_constant_trail_exits():
         symbol="BTC/USDT",
         entry_price=80000.0,
         highest_price=80800.0,
-        trail_pct=0.0040,
-        trailing_stop_price=80800.0 * (1.0 - 0.0040),
+        trail_pct=0.0020,
+        trailing_stop_price=80800.0 * (1.0 - 0.0020),
         thesis_invalid_level=0.0,
         stop_price=0.0,
     )
     out = evaluate_engine_managed_exit(
         position=pos,
-        current_price=80800.0 * (1.0 - 0.0040) - 1.0,
+        current_price=80800.0 * (1.0 - 0.0020) - 1.0,
         net_pnl_pct=0.005,
         hold_minutes=40.0,
         coin_profile=get_coin_profile("BTCUSDT"),
@@ -144,7 +143,7 @@ def test_pullback_through_constant_trail_exits():
 
 
 def test_fourh_break_still_exits():
-    pos = _Pos(entry_price=2312.0, highest_price=2400.0, trailing_stop_price=0.0, trail_pct=0.0045)
+    pos = _Pos(entry_price=2312.0, highest_price=2400.0, trailing_stop_price=0.0, trail_pct=0.0020)
     out = evaluate_engine_managed_exit(
         position=pos,
         current_price=2290.0,

@@ -80,6 +80,8 @@ def test_persist_only_entry_minute_flush_does_not_leak():
 
 
 def test_trail_stays_unarmed_when_valid_high_below_activation():
+    # Trail 0.005, highest_price below entry * 1.005 → stays unarmed.
+    # Use explicit trail_pct=0.005 to isolate test from production profile changes.
     pos = SimpleNamespace(
         symbol="XRP/USDT",
         entry_price=1.4542,
@@ -93,7 +95,9 @@ def test_trail_stays_unarmed_when_valid_high_below_activation():
     refresh_trailing_stop(pos, 1.455, {"trail": 0.005, "sl": 0.010})
     assert pos.highest_price == pytest.approx(1.4579)
     assert pos.highest_price < 1.4542 * 1.005
-    assert pos.trailing_stop_price == pytest.approx(1.439658)
+    # Break-even trigger (0.15%) lifts stop to entry+0.05% = 1.4549271
+    # when MFE (0.254%) clears the trigger. Trail itself stays unarmed (below 0.5% activation).
+    assert pos.trailing_stop_price == pytest.approx(1.4542 * 1.0005, rel=1e-6)
     assert pos.trail_pct == pytest.approx(0.005)
 
 

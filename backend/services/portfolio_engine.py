@@ -341,16 +341,16 @@ COIN_PROFILES = {
     # Session day-trade ceilings (hours, not sub-hour churn).
     # New stamps use these; evaluate_engine_managed_exit also floors open holds
     # to the current profile so restarts pick up longer day-trade horizons.
-    "BTCUSDT": {"tp": 0.012, "sl": 0.008, "trail": 0.0040, "max_hold_min": 360},
-    "ETHUSDT": {"tp": 0.013, "sl": 0.009, "trail": 0.0045, "max_hold_min": 360},
-    "SOLUSDT": {"tp": 0.015, "sl": 0.010, "trail": 0.0055, "max_hold_min": 300},
-    "XRPUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0050, "max_hold_min": 300},
+    "BTCUSDT": {"tp": 0.012, "sl": 0.008, "trail": 0.0020, "max_hold_min": 360},
+    "ETHUSDT": {"tp": 0.013, "sl": 0.009, "trail": 0.0020, "max_hold_min": 360},
+    "SOLUSDT": {"tp": 0.015, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
+    "XRPUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
 }
 
 DEFAULT_COIN_PROFILE = {
     "tp": 0.014,
     "sl": 0.010,
-    "trail": 0.005,
+    "trail": 0.0025,
     "max_hold_min": 300,
 }
 
@@ -10562,42 +10562,94 @@ class PortfolioEngine:
                     sell_strategy_id = buy_row_strategy_id or str(getattr(position, "entry_strategy_id", "") or "").strip() or None
                     original_explain["strategy_id"] = sell_strategy_id or ""
 
-                    cursor.execute(
-                        """
-                        INSERT INTO paper_trades (
-                            trade_id, paper_run_id, mode, symbol, side, quantity, price,
-                            entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
-                            fees_paid, slippage_cost, exit_type, exit_r_multiple,
-                            timestamp, status, explainability_json, diagnostics_json, sleeve,
-                            exit_reason, entry_timestamp, decision_id, strategy_id
-                        ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                        (
-                            sell_trade_id,
-                            paper_run_id,
-                            sell_mode,
-                            symbol,
-                            quantity,
-                            price_val,
-                            position.entry_price,
-                            realized_pnl,
-                            pnl_pct,
-                            int(hold_time_seconds),
-                            fees_paid_val,
-                            slippage_cost_val,
-                            exit_type_val,
-                            r_multiple,
-                            timestamp,
-                            sell_status,
-                            json.dumps(original_explain),
-                            json.dumps(sell_preflight_audit) if sell_preflight_audit else None,
-                            pos_sleeve,
-                            exit_trigger,
-                            entry_ts_bind or None,
-                            buy_decision_id or None,
-                            sell_strategy_id,
-                        ),
-                    )
+                    # Ensure pnl_usd_net/pnl_pct_net columns exist (added 2026-09)
+                    _cols = {str(r[1]) for r in cursor.execute("PRAGMA table_info(paper_trades)")}
+                    _has_net_cols = "pnl_usd_net" in _cols
+                    if not _has_net_cols:
+                        try:
+                            cursor.execute("ALTER TABLE paper_trades ADD COLUMN pnl_usd_net REAL")
+                            cursor.execute("ALTER TABLE paper_trades ADD COLUMN pnl_pct_net REAL")
+                            _has_net_cols = True
+                        except sqlite3.OperationalError:
+                            pass
+
+                    if _has_net_cols:
+                        cursor.execute(
+                            """
+                            INSERT INTO paper_trades (
+                                trade_id, paper_run_id, mode, symbol, side, quantity, price,
+                                entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
+                                fees_paid, slippage_cost, exit_type, exit_r_multiple,
+                                timestamp, status, explainability_json, diagnostics_json, sleeve,
+                                exit_reason, entry_timestamp, decision_id, strategy_id,
+                                pnl_usd_net, pnl_pct_net
+                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                            (
+                                sell_trade_id,
+                                paper_run_id,
+                                sell_mode,
+                                symbol,
+                                quantity,
+                                price_val,
+                                position.entry_price,
+                                realized_pnl,
+                                pnl_pct,
+                                int(hold_time_seconds),
+                                fees_paid_val,
+                                slippage_cost_val,
+                                exit_type_val,
+                                r_multiple,
+                                timestamp,
+                                sell_status,
+                                json.dumps(original_explain),
+                                json.dumps(sell_preflight_audit) if sell_preflight_audit else None,
+                                pos_sleeve,
+                                exit_trigger,
+                                entry_ts_bind or None,
+                                buy_decision_id or None,
+                                sell_strategy_id,
+                                pnl_usd_net,
+                                pnl_pct_net,
+                            ),
+                        )
+                    else:
+                        cursor.execute(
+                            """
+                            INSERT INTO paper_trades (
+                                trade_id, paper_run_id, mode, symbol, side, quantity, price,
+                                entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
+                                fees_paid, slippage_cost, exit_type, exit_r_multiple,
+                                timestamp, status, explainability_json, diagnostics_json, sleeve,
+                                exit_reason, entry_timestamp, decision_id, strategy_id
+                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                            (
+                                sell_trade_id,
+                                paper_run_id,
+                                sell_mode,
+                                symbol,
+                                quantity,
+                                price_val,
+                                position.entry_price,
+                                realized_pnl,
+                                pnl_pct,
+                                int(hold_time_seconds),
+                                fees_paid_val,
+                                slippage_cost_val,
+                                exit_type_val,
+                                r_multiple,
+                                timestamp,
+                                sell_status,
+                                json.dumps(original_explain),
+                                json.dumps(sell_preflight_audit) if sell_preflight_audit else None,
+                                pos_sleeve,
+                                exit_trigger,
+                                entry_ts_bind or None,
+                                buy_decision_id or None,
+                                sell_strategy_id,
+                            ),
+                        )
 
                     # Phase 5: dust writeoffs audit - insert row when dust writeoff
                     if dust_writeoff:
@@ -11164,6 +11216,11 @@ class PortfolioEngine:
         entry_cost = (quantity * position.entry_price) + entry_fee_pro_rata
         realized_pnl = proceeds - entry_cost
         pnl_pct = (realized_pnl / entry_cost) if entry_cost > 0 else 0.0
+        # Net PnL: realized minus all fees (entry + exit)
+        _total_fees = fee + entry_fee_pro_rata
+        pnl_usd_net = realized_pnl  # proceeds already has exit fee deducted; entry fee in entry_cost
+        notional = quantity * position.entry_price
+        pnl_pct_net = (pnl_usd_net / notional) if notional > 0 else 0.0
 
         sell_sqlite_ok = False
         self._exit_in_progress.add(normalized_symbol)

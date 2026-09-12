@@ -37,9 +37,9 @@ class _Pos:
 
 
 def test_no_ratchet_below_break_even_trigger():
-    # MFE at 0.20% (below 0.30% default trigger) — nothing should change
-    pos = _Pos(entry_price=100.0, highest_price=100.2, stop_price=99.0, trailing_stop_price=99.0)
-    changed = apply_break_even_and_mfe_trail(pos, current_price=100.2)
+    # MFE at 0.10% (below 0.15% default trigger) — nothing should change
+    pos = _Pos(entry_price=100.0, highest_price=100.1, stop_price=99.0, trailing_stop_price=99.0)
+    changed = apply_break_even_and_mfe_trail(pos, current_price=100.1)
     assert changed is False
     assert pos.stop_price == 99.0
     assert pos.trailing_stop_price == 99.0
