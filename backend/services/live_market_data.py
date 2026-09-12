@@ -156,6 +156,8 @@ class LiveMarketDataService:
         self._tasks: list[asyncio.Task] = []
         self._lock = asyncio.Lock()
         self._ticker_cache: dict[str, dict] = {}  # key: "BTC/USDT"
+        self._ticker_cache_at: dict[str, float] = {}
+        self.ticker_cache_ttl_sec = float(os.getenv("LIVE_TICKER_CACHE_TTL_SEC", "30"))
         self._ohlcv_cache: dict[str, list] = {}  # key: "BTC/USDT" (1m loop cache)
         self._ohlcv_tf_cache: dict[tuple[str, str, int], tuple[float, list]] = {}
         self._ohlcv_fetch_failures: int = 0
@@ -349,6 +351,7 @@ class LiveMarketDataService:
 
                             async with self._lock:
                                 self._ticker_cache[sym] = ticker_data
+                                self._ticker_cache_at[sym] = time.time()
                             logger.debug(f"Fetched ticker for {sym}: ${ticker_data.get('last', 0)}")
                     except (RateLimitedError, CircuitOpenError) as e:
                         logger.warning("Rate limited fetching ticker for %s: %s", sym, e)
@@ -465,7 +468,12 @@ class LiveMarketDataService:
 
     # ---------------- getters ----------------
 
-    async def get_ticker(self, ccxt_symbol: str) -> dict | None:
+    def _ticker_cache_fresh(self, symbol: str) -> bool:
+        cached_at = float(self._ticker_cache_at.get(symbol, 0.0) or 0.0)
+        ttl = max(1.0, float(self.ticker_cache_ttl_sec))
+        return cached_at > 0.0 and (time.time() - cached_at) < ttl
+
+    async def get_ticker(self, ccxt_symbol: str, *, force_refresh: bool = False) -> dict | None:
         """
         Return a normalized ticker for a ccxt symbol (e.g., 'BTC/USDT').
         Output has convenience fields expected by downstream code (insert_tick):
@@ -478,11 +486,13 @@ class LiveMarketDataService:
         t: dict | None = None
         try:
             limiter = await self._get_limiter()
-            # Get from cache first (populated by ticker loop)
+            # Cache is process-local. Context/learning import this singleton
+            # without running _ticker_loop, so a hit with no TTL froze 24h %.
             async with self._lock:
                 t = self._ticker_cache.get(s)
+                cache_fresh = (not force_refresh) and t is not None and self._ticker_cache_fresh(s)
 
-            if not t:
+            if not cache_fresh:
                 # If not in cache, try direct API call
                 api_symbol = s.replace("/", "")
                 url = "https://api.binance.us/api/v3/ticker/24hr"
@@ -532,6 +542,7 @@ class LiveMarketDataService:
                     # Cache it for future use
                     async with self._lock:
                         self._ticker_cache[s] = t
+                        self._ticker_cache_at[s] = time.time()
 
         except (RateLimitedError, CircuitOpenError) as e:
             async with self._lock:
