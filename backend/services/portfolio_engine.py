@@ -15474,6 +15474,8 @@ class PortfolioEngine:
         from backend.services.day_trailing_buy import (
             arm_selected_candidate,
             available_economic_slots,
+            fresh_executable_book,
+            remaining_watch_notional_cap,
             select_ranked_arm_stream,
         )
         from backend.services.day_trailing_buy_store import load_active_intents
@@ -15534,6 +15536,25 @@ class PortfolioEngine:
             )
             if quantity <= 0:
                 logger.info("TRAILING_BUY_STREAM_SKIP %s BUY_SKIP_SIZING", symbol)
+                continue
+            book = fresh_executable_book(redis_client, symbol)
+            ask = float((book or {}).get("ask") or candidate.current_price or 0.0)
+            already_active = {str(row.get("symbol") or "") for row in load_active_intents(self.db_path)}
+            remaining_new = max(0, int(slots) - len(already_active))
+            free_cash = float(getattr(self, "_available_balance", 0.0) or 0.0) - float(self._pending_buy_notional())
+            cap = remaining_watch_notional_cap(free_cash=free_cash, remaining_new_slots=remaining_new)
+            if ask > 0 and cap > 0 and (quantity * ask) > cap + 1e-9:
+                quantity = cap / ask
+                logger.info(
+                    "TRAILING_BUY_STREAM_SLOT_CAP symbol=%s cap=%.4f ask=%.8f qty=%.8f remaining_new=%s",
+                    symbol,
+                    cap,
+                    ask,
+                    quantity,
+                    remaining_new,
+                )
+            if quantity <= 0 or cap <= 0:
+                logger.info("TRAILING_BUY_STREAM_SKIP %s NO_REMAINING_SLOT_CASH", symbol)
                 continue
             explainability = TradeExplainability(
                 trade_id="",

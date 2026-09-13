@@ -225,6 +225,30 @@ def available_economic_slots(*, held: int, pending_orders: int, max_positions: i
     return max(0, int(max_positions) - int(held) - int(pending_orders))
 
 
+def remaining_watch_notional_cap(*, free_cash: float, remaining_new_slots: int) -> float:
+    """Split leftover cash across remaining new watches so all four can arm."""
+    if remaining_new_slots <= 0:
+        return 0.0
+    return max(0.0, float(free_cash) / float(remaining_new_slots))
+
+
+def sync_book_redis(redis_client: Any = None) -> Any:
+    """read_market_book is sync. Never pass the async integration client."""
+    from backend.config.redis_config import get_redis_client
+
+    hgetall = getattr(redis_client, "hgetall", None)
+    if redis_client is None or hgetall is None:
+        return get_redis_client()
+    try:
+        import inspect
+
+        if inspect.iscoroutinefunction(hgetall):
+            return get_redis_client()
+    except Exception:
+        return get_redis_client()
+    return redis_client
+
+
 def fresh_executable_book(redis_client: Any, symbol: str) -> dict[str, Any] | None:
     book = read_market_book(redis_client, symbol)
     if not book:
@@ -480,13 +504,14 @@ async def cycle_trailing_buy_intents(engine: Any, redis_client: Any) -> dict[str
     summary = {"mode_ok": ok, "error": err, "cycled": 0, "submitted": 0, "filled": 0, "closed": 0}
     if not ok:
         return summary
+    books = sync_book_redis(redis_client)
     for intent in load_active_intents(engine.db_path):
         summary["cycled"] += 1
         symbol = str(intent.get("symbol") or "")
         if str(intent.get("status") or "") == SUBMITTING:
             await recover_submitting_intent(engine, intent)
             continue
-        book = read_market_book(redis_client, symbol)
+        book = read_market_book(books, symbol)
         ask = float((book or {}).get("ask") or 0.0)
         fresh = bool(book and book.get("fresh") and float(book.get("freshness_sec") or 0.0) <= BOOK_STALE_SEC)
         decision = observe_book(
@@ -687,12 +712,12 @@ def cancel_legacy_open_buy_orders(engine: Any, *, reason: str = "LEGACY_IMMEDIAT
 
 def load_operator_intents(db_path: str, redis_client: Any = None) -> list[dict[str, Any]]:
     rows = []
+    books = sync_book_redis(redis_client)
     for intent in load_active_intents(db_path):
         ask = None
-        if redis_client is not None:
-            book = read_market_book(redis_client, str(intent.get("symbol") or ""))
-            if book:
-                ask = float(book.get("ask") or 0.0)
+        book = read_market_book(books, str(intent.get("symbol") or ""))
+        if book:
+            ask = float(book.get("ask") or 0.0)
         rows.append(operator_row(intent, current_ask=ask))
     return rows
 
@@ -725,7 +750,9 @@ __all__ = [
     "rebound_trigger_ask",
     "recover_submitting_intent",
     "recover_trailing_buy_intents",
+    "remaining_watch_notional_cap",
     "required_improvement_bps",
     "retained_improvement_ceiling_ask",
     "select_ranked_arm_stream",
+    "sync_book_redis",
 ]

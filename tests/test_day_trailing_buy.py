@@ -22,8 +22,10 @@ from backend.services.day_trailing_buy import (
     observe_book,
     rebound_bps_from_spread,
     recover_submitting_intent,
+    remaining_watch_notional_cap,
     required_improvement_bps,
     select_ranked_arm_stream,
+    sync_book_redis,
 )
 from backend.services.day_trailing_buy_store import (
     CANCELED,
@@ -605,6 +607,22 @@ def test_available_slots_four_when_flat():
     assert available_economic_slots(held=0, pending_orders=1, max_positions=4) == 3
 
 
+def test_remaining_slot_cap_lets_fourth_coin_arm():
+    assert remaining_watch_notional_cap(free_cash=227.12, remaining_new_slots=4) == pytest.approx(56.78)
+    assert remaining_watch_notional_cap(free_cash=40.03, remaining_new_slots=1) == pytest.approx(40.03)
+    assert remaining_watch_notional_cap(free_cash=40.03, remaining_new_slots=0) == 0.0
+
+
+def test_sync_book_redis_rejects_async_client(monkeypatch):
+    class _Async:
+        async def hgetall(self, _key):
+            return {}
+
+    monkeypatch.setattr("backend.config.redis_config.get_redis_client", lambda: "SYNC")
+    assert sync_book_redis(_Async()) == "SYNC"
+    assert sync_book_redis(None) == "SYNC"
+
+
 def test_later_cycle_does_not_reset_arm_or_low(tmp_path):
     db = tmp_path / "tb.db"
     _, _, first = create_intent(
@@ -679,6 +697,8 @@ async def test_ranked_stream_arms_four_on_path_ev_hold(tmp_path, monkeypatch):
     engine.open_positions = {}
     engine.coin_performance = {}
     engine._total_equity = 227.0
+    engine._available_balance = 227.0
+    engine._pending_buy_notional = lambda: 0.0
     engine._day_entry_held_count = lambda: 0
     engine._pending_buy_order_symbols = set
     engine._check_kill_switch_buy = lambda: (True, "")
