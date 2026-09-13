@@ -613,10 +613,10 @@ def test_remaining_slot_cap_lets_fourth_coin_arm():
     assert remaining_watch_notional_cap(free_cash=40.03, remaining_new_slots=0) == 0.0
 
 
-def test_sync_book_redis_rejects_async_client(monkeypatch):
+def test_sync_book_redis_ignores_async_client(monkeypatch):
     class _Async:
-        async def hgetall(self, _key):
-            return {}
+        def hgetall(self, _key):
+            return None
 
     monkeypatch.setattr("backend.config.redis_config.get_redis_client", lambda: "SYNC")
     assert sync_book_redis(_Async()) == "SYNC"

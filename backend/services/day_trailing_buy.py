@@ -233,20 +233,11 @@ def remaining_watch_notional_cap(*, free_cash: float, remaining_new_slots: int) 
 
 
 def sync_book_redis(redis_client: Any = None) -> Any:
-    """read_market_book is sync. Never pass the async integration client."""
+    """Always use the sync Redis client. Integration's client is async."""
     from backend.config.redis_config import get_redis_client
 
-    hgetall = getattr(redis_client, "hgetall", None)
-    if redis_client is None or hgetall is None:
-        return get_redis_client()
-    try:
-        import inspect
-
-        if inspect.iscoroutinefunction(hgetall):
-            return get_redis_client()
-    except Exception:
-        return get_redis_client()
-    return redis_client
+    _ = redis_client
+    return get_redis_client()
 
 
 def fresh_executable_book(redis_client: Any, symbol: str) -> dict[str, Any] | None:
