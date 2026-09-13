@@ -7,9 +7,9 @@ ledger. All buys/sells go through this engine and live_trading_service.
 NON-NEGOTIABLE OBJECTIVES:
 1. Truth: Portfolio engine maintains AUTHORITATIVE cash/positions ledger.
 2. Discipline: Max open positions (env), max 1 open position per symbol.
-3. Minimal live core (buy path): path-EV selects a candidate; process_bar_candidates arms a
-   trailing-buy intent; the trailing-buy executor submits through execute_buy_fifo only after
-   a measured dip and rebound. Immediate decision-to-BUY is unreachable.
+3. Minimal live core (buy path): process_bar_candidates ranks the BTC/ETH/SOL/XRP stream and
+   arms trailing-buy intents; path-EV BUY/HOLD is telemetry only. The executor submits through
+   execute_buy_fifo only after a measured dip and rebound. Immediate decision-to-BUY is unreachable.
 4. Risk-based sizing: Position size from calculate_position_size (risk-based); EV/expectancy multipliers removed.
 5. Exit reliability: Every open position monitored, always, without tracking-set skips.
 6. Observability: Logs + endpoints; former gate reasons logged as TELEMETRY_ONLY where applicable.
@@ -15461,6 +15461,148 @@ class PortfolioEngine:
             logger.info("MULTI_BUY_SKIP_OLD_RANK extras=%s", [getattr(c, "symbol", "") for c in extras])
         return 0
 
+    async def _arm_trailing_buy_ranked_stream(
+        self,
+        *,
+        ranked_candidates: list[BuyCandidate],
+        stream_candidates: list[BuyCandidate],
+        bar_timestamp: int,
+        path_ev_decision: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Arm ranked top-4 candidates. Path-EV BUY/HOLD is telemetry only."""
+        from backend.config.redis_config import get_redis_client
+        from backend.services.day_trailing_buy import (
+            arm_selected_candidate,
+            available_economic_slots,
+            select_ranked_arm_stream,
+        )
+        from backend.services.day_trailing_buy_store import load_active_intents
+
+        pool = select_ranked_arm_stream(ranked_candidates, stream_candidates)
+        try:
+            max_pos = int(os.getenv("MAX_OPEN_POSITIONS", str(getattr(self, "max_positions", 4) or 4)))
+        except Exception:
+            max_pos = 4
+        slots = available_economic_slots(
+            held=self._day_entry_held_count(),
+            pending_orders=len(self._pending_buy_order_symbols()),
+            max_positions=max_pos,
+        )
+        allowed, why = self._check_kill_switch_buy()
+        logger.info(
+            "TRAILING_BUY_STREAM_AUTHORITY path_ev_winner=%s path_ev_action=%s ranked=%s slots=%s kill_ok=%s",
+            (path_ev_decision or {}).get("path_ev_winner"),
+            (path_ev_decision or {}).get("selected_action"),
+            [getattr(c, "symbol", "") for c in pool],
+            slots,
+            allowed,
+        )
+        armed_rows: list[dict[str, Any]] = []
+        preserved_rows: list[dict[str, Any]] = []
+        if not allowed:
+            logger.info("TRAILING_BUY_STREAM_BLOCKED %s", why)
+            return {
+                "trailing_buy_armed": False,
+                "intents": [],
+                "preserved": [],
+                "blocked": str(why or "KILL_OR_PAUSE"),
+            }
+        redis_client = get_redis_client()
+        new_armed = 0
+        for candidate in pool:
+            if new_armed >= slots:
+                break
+            symbol = str(candidate.symbol or "")
+            block = self._day_path_ev_entry_block_reason(symbol, max_pos)
+            if block == "DUPLICATE_SAME_SYMBOL":
+                logger.info("TRAILING_BUY_STREAM_SKIP %s DUPLICATE_SAME_SYMBOL", symbol)
+                continue
+            if block == "MAX_OPEN_LIMIT":
+                logger.info("TRAILING_BUY_STREAM_SKIP MAX_OPEN_LIMIT")
+                break
+            decision_id = str(candidate.decision_id or f"tb-stream-{_to_api_symbol(symbol)}-{int(bar_timestamp)}")
+            await self._entry_ensure_constraints(symbol)
+            perf = self.coin_performance.get(symbol)
+            sizing_mult = perf.sizing_multiplier if perf else 1.0
+            quantity, stop_price, _risk_usd = self.calculate_position_size(
+                symbol,
+                self._total_equity,
+                candidate.atr,
+                candidate.current_price,
+                sizing_mult,
+                candidate.confidence,
+            )
+            if quantity <= 0:
+                logger.info("TRAILING_BUY_STREAM_SKIP %s BUY_SKIP_SIZING", symbol)
+                continue
+            explainability = TradeExplainability(
+                trade_id="",
+                symbol=symbol,
+                side="BUY",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                ai_confidence=candidate.confidence,
+                trend_score=candidate.trend_score,
+                chop_score=candidate.chop_score,
+                coin_edge_score=candidate.coin_edge_score,
+                composite_score=candidate.composite_score,
+                regime=(candidate.decision_data or {}).get("regime", "unknown"),
+                price_structure_regime=candidate.price_structure_regime,
+                coin_win_rate_20=perf.win_rate_20 if perf else 0.5,
+                coin_expectancy=perf.expectancy if perf else 0.0,
+                portfolio_open_risk=self._calculate_total_open_risk(),
+            )
+            explainability.live_ai_strategy = str((candidate.decision_data or {}).get("live_ai_strategy") or "day")
+            explainability.decision_id = decision_id
+            armed = await arm_selected_candidate(
+                self,
+                symbol=symbol,
+                quantity=quantity,
+                stop_price=stop_price,
+                atr=float(candidate.atr or 0.0),
+                confidence=float(candidate.confidence or 0.0),
+                bar_timestamp=int(bar_timestamp),
+                explainability=explainability,
+                decision_id=decision_id,
+                sleeve=getattr(candidate, "sleeve", "") or "",
+                decision_data=dict(candidate.decision_data or {}),
+                redis_client=redis_client,
+            )
+            if not armed or not armed.get("trailing_buy_armed"):
+                continue
+            intent = dict(armed.get("intent") or {})
+            row = {
+                "symbol": symbol,
+                "intent_id": intent.get("intent_id"),
+                "decision_id": intent.get("decision_id") or decision_id,
+                "arm_ask": intent.get("arm_ask"),
+                "state": intent.get("status"),
+                "preserved": bool(armed.get("preserved")),
+            }
+            if armed.get("preserved") or armed.get("idempotent"):
+                preserved_rows.append(row)
+            else:
+                armed_rows.append(row)
+                new_armed += 1
+        active = load_active_intents(self.db_path)
+        first = (armed_rows or preserved_rows or [{}])[0]
+        logger.info(
+            "TRAILING_BUY_STREAM_RESULT new=%s preserved=%s active=%s symbols=%s",
+            len(armed_rows),
+            len(preserved_rows),
+            len(active),
+            [str(r.get("symbol") or "") for r in active],
+        )
+        return {
+            "trailing_buy_armed": bool(armed_rows or preserved_rows or active),
+            "symbol": first.get("symbol"),
+            "intent_id": first.get("intent_id"),
+            "decision_id": first.get("decision_id"),
+            "arm_ask": first.get("arm_ask"),
+            "intents": armed_rows + preserved_rows,
+            "preserved": preserved_rows,
+            "active_intent_count": len(active),
+        }
+
     async def process_bar_candidates(self, bar_timestamp: int) -> dict[str, Any] | None:
         """
         PHASE 5: At bar close, rank buy-intent candidates and execute up to
@@ -16186,7 +16328,7 @@ class PortfolioEngine:
                 str((cand.decision_data or {}).get("setup_type_canonical") or (cand.decision_data or {}).get("setup_type") or "?")[:28],
             )
 
-        # DAY paper authority: four-coin path-EV vs HOLD(0). Old rank is telemetry only.
+        # Path-EV BUY/HOLD is telemetry and learning evidence only in trailing-buy mode.
         top_candidate, _day_auth = await self._select_direct_path_ev_candidate(valid_candidates, bar_timestamp)
         self._bar_extra_buy_candidates = []
         if top_candidate is None:
@@ -16200,6 +16342,20 @@ class PortfolioEngine:
                 float((_day_auth or {}).get("xrp_path_ev") or 0),
                 (_day_auth or {}).get("old_rank_nominee"),
             )
+        else:
+            logger.info(
+                "DAY_PATH_EV_BUY_TELEMETRY winner=%s symbol=%s (non-authoritative in trailing_buy)",
+                (_day_auth or {}).get("path_ev_winner"),
+                getattr(top_candidate, "symbol", ""),
+            )
+
+        from backend.config.day_entry_execution import trailing_buy_mode_status
+
+        _tb_ok, _tb_err, _tb_mode = trailing_buy_mode_status()
+        self.day_entry_execution_mode = _tb_mode
+        self.day_entry_execution_error = "" if _tb_ok else _tb_err
+        if not _tb_ok:
+            logger.error("DAY_ENTRY_EXECUTION_FAIL_CLOSED %s — HOLD/NO_NEW_ENTRY", _tb_err)
             self._persist_profit_cycle_state(
                 {
                     "bar_timestamp": int(bar_timestamp),
@@ -16208,14 +16364,47 @@ class PortfolioEngine:
                         "leaderboard": [],
                         "leaderboard_len": 0,
                         "selected_trade": False,
-                        "day_authority_mode": "direct_four_coin_path_ev",
+                        "day_authority_mode": "trailing_buy_ranked_stream",
                         "old_rank_execution_authority": False,
                         "path_ev_winner": (_day_auth or {}).get("path_ev_winner"),
+                        "path_ev_authoritative": False,
+                        "day_entry_execution_error": _tb_err,
                     },
                 }
             )
             self.current_bar_candidates.clear()
             return None
+
+        armed_bundle = await self._arm_trailing_buy_ranked_stream(
+            ranked_candidates=valid_candidates,
+            stream_candidates=bar_candidate_snapshot,
+            bar_timestamp=int(bar_timestamp),
+            path_ev_decision=_day_auth,
+        )
+        armed_syms = {str(row.get("symbol") or "") for row in list(armed_bundle.get("intents") or []) if row.get("symbol")}
+        for _li, _lc in enumerate(valid_candidates or bar_candidate_snapshot):
+            _lreason = "trailing_buy_armed" if str(getattr(_lc, "symbol", "")) in armed_syms else "ranked_not_armed"
+            await self._record_learning_snapshot(_lc, "NO_TRADE", _lreason, rank=_li + 1)
+        self._persist_profit_cycle_state(
+            {
+                "bar_timestamp": int(bar_timestamp),
+                "full_universe_diagnostics": full_universe_diag,
+                "current_cycle": {
+                    "leaderboard": [],
+                    "leaderboard_len": 0,
+                    "selected_trade": False,
+                    "day_authority_mode": "trailing_buy_ranked_stream",
+                    "old_rank_execution_authority": False,
+                    "path_ev_authoritative": False,
+                    "path_ev_winner": (_day_auth or {}).get("path_ev_winner"),
+                    "trailing_buy_armed": bool(armed_bundle.get("trailing_buy_armed")),
+                    "trailing_buy_intents": list(armed_bundle.get("intents") or []),
+                },
+            }
+        )
+        self.current_bar_candidates.clear()
+        self._bar_extra_buy_candidates = []
+        return armed_bundle if armed_bundle.get("trailing_buy_armed") else None
         execution_sane_candidates: list[BuyCandidate] = [top_candidate]
         self._bar_extra_buy_candidates = []
 

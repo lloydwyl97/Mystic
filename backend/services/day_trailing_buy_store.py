@@ -129,7 +129,8 @@ def create_intent(
     fields: dict[str, Any],
     supersede_reason: str = "SUPERSEDED_BY_NEWER_DECISION",
 ) -> tuple[bool, str, dict[str, Any] | None]:
-    """Insert WAIT_DIP. One active intent per symbol. Supersedes WAIT_DIP/TRAIL_LOW only."""
+    """Insert WAIT_DIP. One active intent per symbol. Never resets an active watch."""
+    _ = supersede_reason
     ensure_trailing_buy_schema(db_path)
     symbol = _slash_symbol(str(fields.get("symbol") or ""))
     decision_id = str(fields.get("decision_id") or "").strip()
@@ -160,14 +161,9 @@ def create_intent(
             if str(cur.get("status") or "") == SUBMITTING:
                 conn.commit()
                 return False, "SYMBOL_SUBMITTING", cur
-            conn.execute(
-                """
-                UPDATE day_trailing_buy_intents
-                SET status=?, cancel_reason=?, updated_at=?
-                WHERE intent_id=? AND status IN ('WAIT_DIP','TRAIL_LOW')
-                """,
-                (CANCELED, supersede_reason, now, cur["intent_id"]),
-            )
+            # Later decision cycles must keep the armed ask and tracked low.
+            conn.commit()
+            return True, "PRESERVED_EXISTING", cur
         payload = fields.get("payload") if isinstance(fields.get("payload"), dict) else {}
         conn.execute(
             """

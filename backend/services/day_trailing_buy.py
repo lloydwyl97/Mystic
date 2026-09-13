@@ -26,6 +26,7 @@ from backend.services.day_trailing_buy_store import (
     create_intent,
     load_active_intents,
     load_intent,
+    load_intent_by_symbol,
     mark_order_accepted,
     mark_terminal,
     release_submitting_for_retry,
@@ -183,6 +184,47 @@ def operator_row(intent: dict[str, Any], *, current_ask: float | None = None) ->
     }
 
 
+def select_ranked_arm_stream(
+    ranked_candidates: list[Any] | None,
+    stream_candidates: list[Any] | None,
+) -> list[Any]:
+    """Keep existing rank order, then fill any missing top-4 stream symbols."""
+    seen: set[str] = set()
+    out: list[Any] = []
+    for cand in list(ranked_candidates or []):
+        api = _api(getattr(cand, "symbol", ""))
+        if api not in DAY_TRADE_SYMBOLS or api in seen:
+            continue
+        seen.add(api)
+        out.append(cand)
+    extras: list[Any] = []
+    for cand in list(stream_candidates or []):
+        api = _api(getattr(cand, "symbol", ""))
+        if api not in DAY_TRADE_SYMBOLS or api in seen:
+            continue
+        seen.add(api)
+        extras.append(cand)
+
+    def _extra_key(cand: Any) -> tuple[float, float, str]:
+        dd = getattr(cand, "decision_data", None) or {}
+        try:
+            score = float(dd.get("final_selection_score") or dd.get("selection_score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        try:
+            conf = float(getattr(cand, "confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        return (-score, -conf, str(getattr(cand, "symbol", "") or ""))
+
+    extras.sort(key=_extra_key)
+    return out + extras
+
+
+def available_economic_slots(*, held: int, pending_orders: int, max_positions: int) -> int:
+    return max(0, int(max_positions) - int(held) - int(pending_orders))
+
+
 def fresh_executable_book(redis_client: Any, symbol: str) -> dict[str, Any] | None:
     book = read_market_book(redis_client, symbol)
     if not book:
@@ -222,6 +264,17 @@ async def arm_selected_candidate(
     if not ok:
         logger.error("DAY_ENTRY_EXECUTION_FAIL_CLOSED %s — HOLD/NO_NEW_ENTRY", err)
         return None
+    existing = load_intent_by_symbol(engine.db_path, symbol)
+    if existing and str(existing.get("status") or "") in {WAIT_DIP, TRAIL_LOW, SUBMITTING}:
+        logger.info(
+            "TRAILING_BUY_PRESERVED symbol=%s intent=%s status=%s arm_ask=%.8f lowest_ask=%.8f",
+            symbol,
+            existing.get("intent_id"),
+            existing.get("status"),
+            float(existing.get("arm_ask") or 0.0),
+            float(existing.get("lowest_ask") or 0.0),
+        )
+        return {"trailing_buy_armed": True, "intent": existing, "idempotent": True, "preserved": True}
     book = fresh_executable_book(redis_client, symbol)
     if not book:
         logger.info("TRAILING_BUY_ARM_BLOCKED %s STALE_OR_MISSING_BOOK", symbol)
@@ -653,6 +706,7 @@ __all__ = [
     "ENTRY_AUTHORITY",
     "ObserveDecision",
     "arm_selected_candidate",
+    "available_economic_slots",
     "cancel_legacy_open_buy_orders",
     "cycle_trailing_buy_intents",
     "dip_achieved_bps",
@@ -673,4 +727,5 @@ __all__ = [
     "recover_trailing_buy_intents",
     "required_improvement_bps",
     "retained_improvement_ceiling_ask",
+    "select_ranked_arm_stream",
 ]

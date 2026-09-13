@@ -15,6 +15,7 @@ from backend.config.day_entry_execution import (
 from backend.services.day_trailing_buy import (
     DAY_TRADE_SYMBOLS,
     ENTRY_AUTHORITY,
+    available_economic_slots,
     formulas_for_symbol,
     honest_round_trip_cost_bps,
     min_dip_bps,
@@ -22,6 +23,7 @@ from backend.services.day_trailing_buy import (
     rebound_bps_from_spread,
     recover_submitting_intent,
     required_improvement_bps,
+    select_ranked_arm_stream,
 )
 from backend.services.day_trailing_buy_store import (
     CANCELED,
@@ -216,10 +218,12 @@ def test_only_one_active_intent_per_symbol(tmp_path):
         },
     )
     assert ok
-    assert load_intent(db, row["intent_id"])["decision_id"] == "d2"
+    assert _reason == "PRESERVED_EXISTING"
+    assert load_intent(db, row["intent_id"])["decision_id"] == "d1"
     active = load_active_intents(db)
     assert len(active) == 1
-    assert active[0]["decision_id"] == "d2"
+    assert active[0]["decision_id"] == "d1"
+    assert active[0]["arm_ask"] == pytest.approx(10.0)
 
 
 def test_conflicting_decision_does_not_replace_submitting(tmp_path):
@@ -378,7 +382,18 @@ async def test_restart_recovery_does_not_guess_resubmit(tmp_path):
 def test_process_bar_does_not_call_execute_buy_fifo():
     src = inspect.getsource(PortfolioEngine.process_bar_candidates)
     assert "await self.execute_buy_fifo" not in src
-    assert "arm_selected_candidate" in src
+    assert "_arm_trailing_buy_ranked_stream" in src
+
+
+def test_path_ev_hold_is_not_authoritative_in_trailing_buy():
+    src = inspect.getsource(PortfolioEngine.process_bar_candidates)
+    hold_idx = src.find("DAY_PATH_EV_HOLD")
+    arm_idx = src.find("_arm_trailing_buy_ranked_stream")
+    assert hold_idx != -1
+    assert arm_idx != -1
+    assert arm_idx > hold_idx
+    assert "path_ev_authoritative" in src
+    assert "TRAILING_BUY_STREAM_AUTHORITY" in inspect.getsource(PortfolioEngine._arm_trailing_buy_ranked_stream)
 
 
 def test_additional_bar_buys_cannot_submit():
@@ -543,3 +558,143 @@ def test_cancel_reason_persists(tmp_path):
     assert done["status"] == CANCELED
     assert done["cancel_reason"] == "KILL_OR_PAUSE"
     assert load_active_intents(db) == []
+
+
+class _StreamCand:
+    def __init__(self, symbol, score=0.1, decision_id=""):
+        self.symbol = symbol
+        self.confidence = 0.6
+        self.trend_score = 0.5
+        self.chop_score = 0.4
+        self.coin_edge_score = 0.5
+        self.atr = 1.0
+        self.current_price = 100.0
+        self.decision_data = {"final_selection_score": score, "live_ai_strategy": "day"}
+        self.decision_id = decision_id or f"d-{symbol}"
+        self.sleeve = "ACTIVE"
+        self.price_structure_regime = "unknown"
+        self.composite_score = 0.6
+
+
+def test_select_ranked_arm_stream_keeps_all_four():
+    ranked = [_StreamCand("BTCUSDT", 0.4), _StreamCand("ETHUSDT", 0.3)]
+    stream = [
+        _StreamCand("BTCUSDT", 0.4),
+        _StreamCand("ETHUSDT", 0.3),
+        _StreamCand("SOLUSDT", 0.2),
+        _StreamCand("XRPUSDT", 0.1),
+    ]
+    out = select_ranked_arm_stream(ranked, stream)
+    assert [_api_sym(c.symbol) for c in out] == ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+
+
+def _api_sym(symbol: str) -> str:
+    return str(symbol or "").replace("/", "").upper()
+
+
+def test_select_ranked_arm_stream_uses_snapshot_when_rank_empty():
+    stream = [_StreamCand(s, i) for i, s in enumerate(("XRPUSDT", "SOLUSDT", "ETHUSDT", "BTCUSDT"), start=1)]
+    out = select_ranked_arm_stream([], stream)
+    assert {c.symbol for c in out} == {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}
+    assert len(out) == 4
+
+
+def test_available_slots_four_when_flat():
+    assert available_economic_slots(held=0, pending_orders=0, max_positions=4) == 4
+    assert available_economic_slots(held=1, pending_orders=0, max_positions=4) == 3
+    assert available_economic_slots(held=0, pending_orders=1, max_positions=4) == 3
+
+
+def test_later_cycle_does_not_reset_arm_or_low(tmp_path):
+    db = tmp_path / "tb.db"
+    _, _, first = create_intent(
+        db,
+        fields={
+            "decision_id": "d1",
+            "symbol": "BTC/USDT",
+            "arm_ask": 100.0,
+            "arm_bid": 99.9,
+            "arm_midpoint": 99.95,
+            "round_trip_cost_bps": 6.04,
+            "spread_bps": 1.0,
+            "required_improvement_bps": 10.0,
+            "rebound_bps": 4.0,
+            "min_dip_bps": 14.0,
+            "expires_at": time.time() + 900,
+        },
+    )
+    update = __import__("backend.services.day_trailing_buy_store", fromlist=["update_watch"]).update_watch
+    update(db, first["intent_id"], status=TRAIL_LOW, lowest_ask=99.70, lowest_ask_ts=time.time())
+    ok, reason, row = create_intent(
+        db,
+        fields={
+            "decision_id": "d-later",
+            "symbol": "BTC/USDT",
+            "arm_ask": 101.0,
+            "arm_bid": 100.9,
+            "arm_midpoint": 100.95,
+            "round_trip_cost_bps": 6.04,
+            "spread_bps": 1.0,
+            "required_improvement_bps": 10.0,
+            "rebound_bps": 4.0,
+            "min_dip_bps": 14.0,
+            "expires_at": time.time() + 900,
+        },
+    )
+    assert ok
+    assert reason == "PRESERVED_EXISTING"
+    assert row["intent_id"] == first["intent_id"]
+    assert row["arm_ask"] == pytest.approx(100.0)
+    assert row["lowest_ask"] == pytest.approx(99.70)
+    assert row["status"] == TRAIL_LOW
+
+
+@pytest.mark.asyncio
+async def test_ranked_stream_arms_four_on_path_ev_hold(tmp_path, monkeypatch):
+    monkeypatch.setenv("DAY_ENTRY_EXECUTION_MODE", "trailing_buy")
+    monkeypatch.setenv("MAX_OPEN_POSITIONS", "4")
+    created: list[str] = []
+
+    async def _fake_arm(_engine, **kwargs):
+        created.append(str(kwargs["symbol"]))
+        return {
+            "trailing_buy_armed": True,
+            "intent": {
+                "intent_id": f"i-{kwargs['symbol']}",
+                "symbol": kwargs["symbol"],
+                "arm_ask": 1.0,
+                "status": WAIT_DIP,
+                "decision_id": kwargs["decision_id"],
+            },
+        }
+
+    monkeypatch.setattr("backend.services.day_trailing_buy.arm_selected_candidate", _fake_arm)
+    monkeypatch.setattr("backend.config.redis_config.get_redis_client", lambda: None)
+    monkeypatch.setattr(
+        "backend.services.day_trailing_buy_store.load_active_intents",
+        lambda _db: [{"symbol": s, "status": WAIT_DIP} for s in created],
+    )
+    engine = PortfolioEngine.__new__(PortfolioEngine)
+    engine.db_path = str(tmp_path / "tb.db")
+    engine.open_positions = {}
+    engine.coin_performance = {}
+    engine._total_equity = 227.0
+    engine._day_entry_held_count = lambda: 0
+    engine._pending_buy_order_symbols = set
+    engine._check_kill_switch_buy = lambda: (True, "")
+    engine._day_path_ev_entry_block_reason = lambda _symbol, _max: None
+    engine._entry_ensure_constraints = AsyncMock()
+    engine.calculate_position_size = lambda *_a, **_k: (0.01, 90.0, 1.0)
+    engine._calculate_total_open_risk = lambda: 0.0
+    stream = [_StreamCand(s) for s in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")]
+    out = await PortfolioEngine._arm_trailing_buy_ranked_stream(
+        engine,
+        ranked_candidates=stream,
+        stream_candidates=stream,
+        bar_timestamp=1_000,
+        path_ev_decision={"path_ev_winner": "HOLD", "selected_action": "HOLD"},
+    )
+    assert created == ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+    assert out["trailing_buy_armed"] is True
+    assert out["active_intent_count"] == 4
+    assert {row["state"] for row in out["intents"]} == {WAIT_DIP}

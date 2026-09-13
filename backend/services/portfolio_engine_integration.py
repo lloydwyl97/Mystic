@@ -1438,10 +1438,11 @@ class PortfolioEngineIntegration:
 
                             if result and result.get("trailing_buy_armed"):
                                 logger.info(
-                                    "BAR_TRAILING_BUY_ARMED: %s intent=%s arm_ask=%s",
+                                    "BAR_TRAILING_BUY_ARMED: %s intent=%s arm_ask=%s intents=%s",
                                     result.get("symbol"),
                                     result.get("intent_id"),
                                     result.get("arm_ask"),
+                                    result.get("intents") or result.get("active_intent_count"),
                                 )
                             elif result:
                                 logger.info(f"BAR_EXECUTION: {result['symbol']} | qty={result['quantity']:.6f} @ ${result['price']:.4f}")
