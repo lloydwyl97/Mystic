@@ -2745,6 +2745,22 @@ function updateOperator(data) {
     if (pos && pos.textContent === "--" && d.open_positions_count != null) pos.textContent = String(d.open_positions_count);
     const health = document.getElementById("status-health");
     if (health && d.account_status) health.textContent = d.account_status;
+    const trail = document.getElementById("status-trailing-buy");
+    if (trail) {
+        const intents = Array.isArray(d.trailing_buy_intents) ? d.trailing_buy_intents : [];
+        if (d.day_entry_execution_error) {
+            trail.textContent = String(d.day_entry_execution_error);
+        } else if (!intents.length) {
+            trail.textContent = (d.day_entry_execution_mode || "trailing_buy") + " idle";
+        } else {
+            trail.textContent = intents.map(function (row) {
+                return (row.symbol || "") + " " + (row.state || "") +
+                    " arm=" + (row.arm_ask != null ? Number(row.arm_ask) : "--") +
+                    " low=" + (row.lowest_ask != null ? Number(row.lowest_ask) : "--") +
+                    " reb=" + (row.rebound_bps != null ? Number(row.rebound_bps).toFixed(2) : "--");
+            }).join(" | ");
+        }
+    }
 }
 
 // positions: { positions: [...] }

@@ -628,6 +628,7 @@ async def execute_protected_limit_live(
     side: str,
     quantity: float,
     limit_price: float,
+    client_order_id: str | None = None,
 ) -> dict[str, Any] | None:
     """
     Place protected limit on Binance.US with strict timeout; cancel if not fully filled.
@@ -654,6 +655,7 @@ async def execute_protected_limit_live(
                 side=side_l,
                 amount=quantity,
                 price=limit_price,
+                client_order_id=client_order_id,
                 time_in_force=tif if tif == "IOC" else None,
             )
         except TypeError:
@@ -664,6 +666,7 @@ async def execute_protected_limit_live(
                 side=side_l,
                 amount=quantity,
                 price=limit_price,
+                client_order_id=client_order_id,
             )
         except Exception as ex:
             logger.warning("PROTECTED_LIMIT_LIVE place failed tif=%s %s: %s", tif, exchange_symbol, ex)

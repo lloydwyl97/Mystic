@@ -281,6 +281,7 @@ def test_open_positions_swap_not_in_place_clear():
 
 
 def test_live_reconcile_cash_sync_does_not_ratchet_principal(monkeypatch):
+    monkeypatch.setenv("DAY_ENTRY_EXECUTION_MODE", "trailing_buy")
     monkeypatch.setenv("CASH_DRIFT_SYNC_ENABLED", "true")
     monkeypatch.setenv("CASH_DRIFT_THRESHOLD_USD", "1.00")
     monkeypatch.setenv("CASH_SYNC_REQUIRE_NO_OPEN_ORDERS", "false")

@@ -295,6 +295,7 @@ class PortfolioEngineIntegration:
         if not hasattr(self, "_monitor_task") or self._monitor_task is None:
             self._monitor_task = asyncio.create_task(self._position_monitor_loop(), name="portfolio_engine:monitor")
             self._bar_processor_task = asyncio.create_task(self._bar_processor_loop(), name="portfolio_engine:bar_processor")
+            self._trailing_buy_task = asyncio.create_task(self._trailing_buy_loop(), name="portfolio_engine:trailing_buy")
             # CRITICAL FIX: Start signal consumption loop - this was MISSING!
             self._signal_consumer_task = asyncio.create_task(self._signal_consumption_loop(), name="portfolio_engine:signal_consumer")
             # CRITICAL FIX: Start price publisher loop to feed Redis with live prices
@@ -332,6 +333,11 @@ class PortfolioEngineIntegration:
                 build["python"] or "n/a",
                 build["pid"],
             )
+            with contextlib.suppress(Exception):
+                from backend.services.day_trailing_buy import recover_trailing_buy_intents
+
+                if self.engine:
+                    await recover_trailing_buy_intents(self.engine)
             try:
                 from backend.services.portfolio_engine import DAY_MODE_ENABLED
 
@@ -380,6 +386,10 @@ class PortfolioEngineIntegration:
             self._bar_processor_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._bar_processor_task
+        if getattr(self, "_trailing_buy_task", None):
+            self._trailing_buy_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._trailing_buy_task
 
         # Stop signal consumer task
         if hasattr(self, "_signal_consumer_task") and self._signal_consumer_task:
@@ -1334,6 +1344,30 @@ class PortfolioEngineIntegration:
                 {"stage": "GATES", "gate_result": GateReason.PASS, "gate_reason": GateReason.CANDIDATE_ADDED},
             )
 
+    async def _trailing_buy_loop(self) -> None:
+        """Watch fresh market_book asks and advance durable trailing-buy intents."""
+        from backend.services.day_trailing_buy import cycle_trailing_buy_intents
+
+        while self.is_running:
+            try:
+                if self.engine:
+                    summary = await cycle_trailing_buy_intents(self.engine, self.redis_client)
+                    if int(summary.get("cycled") or 0) > 0:
+                        logger.info(
+                            "TRAILING_BUY_CYCLE mode_ok=%s cycled=%s submitted=%s filled=%s closed=%s error=%s",
+                            summary.get("mode_ok"),
+                            summary.get("cycled"),
+                            summary.get("submitted"),
+                            summary.get("filled"),
+                            summary.get("closed"),
+                            summary.get("error") or "",
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("TRAILING_BUY_CYCLE_ERROR")
+            await asyncio.sleep(1.0)
+
     async def _bar_processor_loop(self) -> None:
         """Process candidates at each bar close"""
         from backend.services.day_active_market_bundle import apply_day_bundle_stagger
@@ -1402,7 +1436,14 @@ class PortfolioEngineIntegration:
                                     except Exception as rd_e:
                                         logger.debug("PE_PENDING_CLEAR: %s: %s", b, rd_e, exc_info=True)
 
-                            if result:
+                            if result and result.get("trailing_buy_armed"):
+                                logger.info(
+                                    "BAR_TRAILING_BUY_ARMED: %s intent=%s arm_ask=%s",
+                                    result.get("symbol"),
+                                    result.get("intent_id"),
+                                    result.get("arm_ask"),
+                                )
+                            elif result:
                                 logger.info(f"BAR_EXECUTION: {result['symbol']} | qty={result['quantity']:.6f} @ ${result['price']:.4f}")
                                 decision_id = result.get("decision_id")
                                 if decision_id and self.redis_client:
@@ -2544,9 +2585,9 @@ async def start_portfolio_integration() -> PortfolioEngineIntegration:
 # BUG #L8 FIX: Removed placeholder migrate_from_old_service function that computed/discarded values
 # without performing actual migration. If migration is needed, implement it properly with:
 # 1. Actually use the computed ATR/stop values
-# 2. Call engine.execute_buy_fifo() or create Position objects
+# 2. Confirmed trailing-buy intents call engine.execute_buy_fifo()
 # 3. Persist to SQLite ledger
-# See portfolio_engine.py execute_buy_fifo for proper position creation flow.
+# See day_trailing_buy.py and portfolio_engine.py execute_buy_fifo.
 
 
 def calculate_atr_from_ohlcv(ohlcv: list[list]) -> float:
