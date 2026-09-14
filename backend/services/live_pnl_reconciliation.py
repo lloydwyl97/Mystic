@@ -38,6 +38,11 @@ _QUOTE_ASSETS = {"USDT", "USD", "BUSD", "USDC"}
 _QTY_REL_TOL = 1e-6
 _QTY_ABS_TOL = 1e-12
 
+# A venue fill or recorded row counts as accounted for once all but this
+# fraction of its quantity is consumed. Step-size rounding leaves sub-unit
+# residuals that are not real unreconciled inventory.
+_RESIDUAL_REL_TOL = 1e-4
+
 _cache: dict[str, Any] = {"at": 0.0, "payload": None}
 
 
@@ -60,6 +65,7 @@ class SymbolRecon:
     venue_fee_base: dict[str, float] = field(default_factory=dict)
     venue_gross_usd: float = 0.0
     matched_fills: int = 0
+    matched_recorded_rows: int = 0
     unmatched_recorded_rows: int = 0
     unmatched_venue_fills: int = 0
     qty_coverage_pct: float = 0.0
@@ -95,6 +101,7 @@ class LivePnlReconciliation:
     legacy_mixed_total_usd: float = 0.0
 
     matched_fills: int = 0
+    matched_recorded_rows: int = 0
     unmatched_recorded_rows: int = 0
     unmatched_venue_fills: int = 0
     recorded_rows_with_exchange_order_id: int = 0
@@ -280,29 +287,36 @@ def _reconcile_symbol(symbol: str, recorded: dict[str, list[dict[str, Any]]], ve
             elif f["fee_cost"] > 0:
                 rec.venue_fee_base[f["fee_ccy"]] = rec.venue_fee_base.get(f["fee_ccy"], 0.0) + f["fee_cost"]
 
-        # Pair each recorded row with the nearest-in-time unused venue fill of
-        # the same quantity. No exchange order id is stored on historical rows,
-        # so quantity plus time is the strongest available key.
-        unused = sorted(vfills, key=lambda x: x["ts"])
-        taken: set[int] = set()
+        # Row-to-fill is many-to-many: the engine writes one row per FIFO lot
+        # while the venue reports one fill per partial execution. Pairing 1:1
+        # would report most rows unmatched even when every unit is accounted
+        # for, so consume quantity chronologically instead — which is what the
+        # FIFO accounting actually claims happened.
+        queue = sorted(vfills, key=lambda x: x["ts"] or 0)
+        remaining = [f["qty"] for f in queue]
+        touched = [False] * len(queue)
+        cursor = 0
         for r in sorted(rows, key=lambda x: x["ts"] or 0):
             if r["exit_type"] == "DUST_WRITEOFF":
                 # Written off without an exchange order by design.
                 continue
-            best_i = None
-            best_dt = None
-            for i, f in enumerate(unused):
-                if i in taken or not _qty_close(f["qty"], r["qty"]):
+            need = float(r["qty"])
+            tol = max(_QTY_ABS_TOL, need * _RESIDUAL_REL_TOL)
+            while need > tol and cursor < len(queue):
+                spent = max(_QTY_ABS_TOL, queue[cursor]["qty"] * _RESIDUAL_REL_TOL)
+                if remaining[cursor] <= spent:
+                    cursor += 1
                     continue
-                dt = abs((f["ts"] or 0) - (r["ts"] or 0))
-                if best_dt is None or dt < best_dt:
-                    best_i, best_dt = i, dt
-            if best_i is None:
+                take = min(need, remaining[cursor])
+                remaining[cursor] -= take
+                need -= take
+                touched[cursor] = True
+            if need > tol:
                 rec.unmatched_recorded_rows += 1
             else:
-                taken.add(best_i)
-                rec.matched_fills += 1
-        rec.unmatched_venue_fills += len(unused) - len(taken)
+                rec.matched_recorded_rows += 1
+        rec.matched_fills += sum(1 for t in touched if t)
+        rec.unmatched_venue_fills += sum(1 for i, f in enumerate(queue) if remaining[i] > max(_QTY_ABS_TOL, f["qty"] * _RESIDUAL_REL_TOL))
 
     rec.venue_gross_usd = rec.venue_sell_notional - rec.venue_buy_notional
     denom = rec.venue_buy_qty + rec.venue_sell_qty
@@ -348,6 +362,7 @@ async def build_reconciliation(db_path: str) -> LivePnlReconciliation:
         out.live_venue_gross_usd += rec.venue_gross_usd
         out.live_venue_fee_quote_usd += rec.venue_fee_quote_usd
         out.matched_fills += rec.matched_fills
+        out.matched_recorded_rows += rec.matched_recorded_rows
         out.unmatched_recorded_rows += rec.unmatched_recorded_rows
         out.unmatched_venue_fills += rec.unmatched_venue_fills
         for f in (venue.get(sym) or {}).get("fills") or []:
@@ -428,6 +443,7 @@ def presentation_fields(recon: dict[str, Any], *, is_live: bool) -> dict[str, An
         "paper_is_not_live_performance": True,
         "account_execution_mode": "live" if is_live else "paper",
         "matched_fills": int(recon.get("matched_fills") or 0),
+        "matched_recorded_rows": int(recon.get("matched_recorded_rows") or 0),
         "unmatched_recorded_rows": int(recon.get("unmatched_recorded_rows") or 0),
         "unmatched_venue_fills": int(recon.get("unmatched_venue_fills") or 0),
         "exchange_fees_quote_usd": float(recon.get("live_venue_fee_quote_usd") or 0.0),

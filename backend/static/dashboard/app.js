@@ -1636,7 +1636,7 @@ function updatePnlReconciliation(res, stale) {
     if (paperEl) paperEl.title = "Simulated trades only. Not live performance.";
 
     setCardText("pnl-fees", p.exchange_fees_quote_usd != null ? "$" + Number(p.exchange_fees_quote_usd).toFixed(4) : "--");
-    setCardText("pnl-matched", String(p.matched_fills != null ? p.matched_fills : "--"));
+    setCardText("pnl-matched", (p.matched_recorded_rows != null ? p.matched_recorded_rows : "--") + " rows / " + (p.matched_fills != null ? p.matched_fills : "--") + " fills");
     setCardText(
         "pnl-unmatched",
         (p.unmatched_recorded_rows != null ? p.unmatched_recorded_rows : "--") + " rows / " + (p.unmatched_venue_fills != null ? p.unmatched_venue_fills : "--") + " fills"

@@ -93,7 +93,7 @@ def test_legacy_value_is_read_not_rewritten(tmp_path: Path) -> None:
     assert rows == 5, "no row may be deleted"
 
 
-def test_reconcile_pairs_fills_and_counts_unmatched() -> None:
+def test_reconcile_counts_unmatched_quantity() -> None:
     recorded = {
         ("BTC/USDT", "BUY"): [
             {"qty": 0.001, "price": 60000.0, "ts": 1_000_000, "order_id": "", "exit_type": ""},
@@ -112,11 +112,47 @@ def test_reconcile_pairs_fills_and_counts_unmatched() -> None:
     }
     rec = _reconcile_symbol("BTC/USDT", recorded, venue)
 
-    assert rec.matched_fills == 2, "the two same-quantity rows pair to venue fills"
-    assert rec.unmatched_recorded_rows == 1, "the 0.002 buy has no venue fill"
-    assert rec.unmatched_venue_fills == 1, "the 0.009 venue sell has no recorded row"
+    assert rec.matched_recorded_rows == 2, "the 0.001 buy and the 0.001 sell are fully covered"
+    assert rec.unmatched_recorded_rows == 1, "the 0.002 buy has no venue quantity behind it"
+    assert rec.unmatched_venue_fills == 1, "the 0.009 venue sell is never claimed by a row"
     assert rec.venue_gross_usd == pytest.approx(578.0 - 60.0)
     assert rec.venue_fee_quote_usd == pytest.approx(0.638)
+
+
+def test_one_venue_fill_can_cover_several_fifo_rows() -> None:
+    """The engine writes one row per FIFO lot; the venue reports one fill."""
+    recorded = {
+        ("SOL/USDT", "SELL"): [
+            {"qty": 1.0, "price": 100.0, "ts": 10, "order_id": "", "exit_type": "NET_PROFIT"},
+            {"qty": 2.0, "price": 100.0, "ts": 11, "order_id": "", "exit_type": "NET_PROFIT"},
+            {"qty": 3.0, "price": 100.0, "ts": 12, "order_id": "", "exit_type": "NET_PROFIT"},
+        ]
+    }
+    venue = {"fills": [{"id": "1", "order": "o1", "side": "SELL", "qty": 6.0, "cost": 600.0, "ts": 13, "fee_cost": 0.6, "fee_ccy": "USDT"}]}
+    rec = _reconcile_symbol("SOL/USDT", recorded, venue)
+
+    assert rec.matched_recorded_rows == 3, "all three lots are covered by the single fill"
+    assert rec.unmatched_recorded_rows == 0
+    assert rec.unmatched_venue_fills == 0, "the fill is fully consumed"
+    assert rec.matched_fills == 1
+
+
+def test_one_row_can_span_several_partial_fills() -> None:
+    """A venue order split into partials must not read as unreconciled."""
+    recorded = {("ETH/USDT", "BUY"): [{"qty": 0.06, "price": 3000.0, "ts": 100, "order_id": "", "exit_type": ""}]}
+    venue = {
+        "fills": [
+            {"id": "1", "order": "o1", "side": "BUY", "qty": 0.02, "cost": 60.0, "ts": 101, "fee_cost": 0.06, "fee_ccy": "USDT"},
+            {"id": "2", "order": "o1", "side": "BUY", "qty": 0.02, "cost": 60.0, "ts": 102, "fee_cost": 0.06, "fee_ccy": "USDT"},
+            {"id": "3", "order": "o1", "side": "BUY", "qty": 0.02, "cost": 60.0, "ts": 103, "fee_cost": 0.06, "fee_ccy": "USDT"},
+        ]
+    }
+    rec = _reconcile_symbol("ETH/USDT", recorded, venue)
+
+    assert rec.matched_recorded_rows == 1
+    assert rec.unmatched_recorded_rows == 0
+    assert rec.matched_fills == 3, "every partial contributed"
+    assert rec.unmatched_venue_fills == 0
 
 
 def test_dust_writeoff_rows_are_not_expected_to_have_fills() -> None:
@@ -152,6 +188,7 @@ def test_presentation_primary_is_reconciled_live_not_paper_or_legacy() -> None:
         "legacy_mixed_total_usd": 964.60,
         "live_venue_fee_quote_usd": 2.11,
         "matched_fills": 120,
+        "matched_recorded_rows": 118,
         "unmatched_recorded_rows": 3,
         "unmatched_venue_fills": 7,
         "window_start": "2026-09-01T00:00:00+00:00",
