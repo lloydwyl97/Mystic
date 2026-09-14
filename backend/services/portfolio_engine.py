@@ -2246,6 +2246,8 @@ class PortfolioEngine:
         self._fifo_sell_lock: asyncio.Lock = asyncio.Lock()
         # Single-flight buy lock per symbol — prevents paired duplicate paper_trades rows
         self._buy_execution_locks: dict[str, asyncio.Lock] = {}
+        self._sell_execution_locks: dict[str, asyncio.Lock] = {}
+        self._dust_writeoff_seen: dict[str, float] = {}
         # Global cash lock — prevents cross-symbol overdraw (two symbols passing cash check then both debiting)
         self._global_cash_lock: asyncio.Lock = asyncio.Lock()
 
@@ -3074,14 +3076,49 @@ class PortfolioEngine:
             pass
         return None
 
-    def _compute_realized_pnl_from_paper_trades(self, *, forward_epoch_only: bool | None = None) -> float:
+    def realized_pnl_by_mode(self) -> dict[str, float]:
+        """Realized PnL split by execution mode. Never sums paper into live.
+
+        ``paper_trades`` holds both simulated and real fills in one table,
+        separated only by the ``mode`` column. Reporting their sum credited
+        the live account with simulated profit earned before live execution
+        began.
+        """
+        out = {"paper": 0.0, "live": 0.0}
+        try:
+            with connect_rw(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT COALESCE(LOWER(mode), 'paper') AS m, COALESCE(SUM(pnl), 0.0)
+                    FROM paper_trades
+                    WHERE side='SELL' AND pnl IS NOT NULL
+                      AND COALESCE(exit_type, '') NOT IN (
+                        'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
+                        'RESEARCH_RESET_EXIT', 'DUST_WRITEOFF'
+                      )
+                      AND COALESCE(is_synthetic, 0) = 0
+                    GROUP BY 1
+                    """
+                ).fetchall()
+            for m, total in rows:
+                out[str(m or "paper")] = float(total or 0.0)
+        except Exception as e:
+            logger.error("REALIZED_PNL_BY_MODE_FAILED: %s", e)
+        return out
+
+    def _compute_realized_pnl_from_paper_trades(self, *, forward_epoch_only: bool | None = None, mode: str | None = None) -> float:
         """
         CANONICAL SOURCE: Compute realized PnL directly from paper_trades table.
         When allweather forward paper epoch is set, defaults to forward non-synthetic only.
+
+        Scoped to the engine's current execution mode. ``paper_trades`` stores
+        paper and live fills side by side, so an unscoped SUM(pnl) reported
+        simulated paper profit as the live account's realized result.
         """
         epoch_start = self._forward_paper_epoch_start()
         if forward_epoch_only is None:
             forward_epoch_only = bool(epoch_start)
+        scope_mode = (mode if mode is not None else ("live" if self._live_execution_enabled else "paper")).strip().lower()
         try:
             with connect_rw(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -3094,16 +3131,17 @@ class PortfolioEngine:
                         'RESEARCH_RESET_EXIT', 'DUST_WRITEOFF'
                       )
                       AND COALESCE(is_synthetic, 0) = 0
+                      AND COALESCE(LOWER(mode), 'paper') = ?
                 """
-                params: tuple[Any, ...] = ()
+                params: tuple[Any, ...] = (scope_mode,)
                 if forward_epoch_only and epoch_start:
                     sql += " AND timestamp >= ?"
-                    params = (epoch_start,)
+                    params = (scope_mode, epoch_start)
                 cursor.execute(sql, params)
                 result = cursor.fetchone()
                 realized = float(result[0]) if result and result[0] is not None else 0.0
             scope = "forward_epoch" if forward_epoch_only and epoch_start else "all_time_non_synthetic"
-            logger.info("REALIZED_PNL_SYNC: Computed from paper_trades (%s): $%.2f", scope, realized)
+            logger.info("REALIZED_PNL_SYNC: Computed from paper_trades (mode=%s, %s): $%.2f", scope_mode, scope, realized)
             return realized
         except Exception as e:
             logger.exception(f"REALIZED_PNL_SYNC FAILED: {e}")
@@ -7894,7 +7932,11 @@ class PortfolioEngine:
                 current_price=cur,
                 atr=outcome.atr,
             )
-            candidate.decision_data = dd
+            # Shadow evaluation must not reach the live candidate. This
+            # overwrote live_ai_strategy, setup_type and the bracket levels
+            # on candidates the all-weather executor was not going to run.
+            if _awbp.execution_enabled():
+                candidate.decision_data = dd
             _awbp.log_shadow_entry(
                 symbol=candidate.symbol,
                 action="would_buy",
@@ -9199,7 +9241,37 @@ class PortfolioEngine:
 
         paper_service = get_paper_trading_service()
         paper_run_id = getattr(paper_service, "paper_run_id", None) or "default"
-        buy_mode = "live" if is_live_execution_allowed_sync() else "paper"
+        # Fail closed. buy_mode used to be decided by is_live_execution_allowed_sync()
+        # alone while the order block below additionally required _live_service and
+        # can_place_live_orders_sync(). When those disagreed the engine wrote a
+        # mode="live" trade row and opened a position with no exchange order behind it.
+        _live_required = bool(is_live_execution_allowed_sync())
+        _live_capable = bool(self._live_execution_enabled and self._live_service and can_place_live_orders_sync()[0])
+        if _live_required and not _live_capable:
+            reason = f"live execution unavailable: enabled={self._live_execution_enabled} service={self._live_service is not None} permitted={can_place_live_orders_sync()[0]}"
+            logger.error("BUY_BLOCKED_LIVE_EXECUTION_UNAVAILABLE: %s - %s", symbol, reason)
+            await self._record_reject(
+                symbol,
+                "BUY",
+                reason,
+                "LIVE_EXECUTION_UNAVAILABLE",
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+            if decision_id:
+                await self._update_pipeline_decision(
+                    decision_id,
+                    {
+                        "stage": "EXECUTION",
+                        "execution_result": "NOT_EXECUTED",
+                        "execution_reason": f"LIVE_EXECUTION_UNAVAILABLE:{reason}",
+                    },
+                )
+            if _entry_reserved:
+                self._release_entry_reservation(symbol, decision_id=str(decision_id or ""), reason="LIVE_EXECUTION_UNAVAILABLE")
+                _entry_reserved = False
+            return None
+        buy_mode = "live" if _live_required else "paper"
         buy_strategy_id = str(getattr(explainability, "live_ai_strategy", "") or "").strip() or None
 
         # Snapshot role context at entry time (Redis — cross-process safe)
@@ -9356,6 +9428,31 @@ class PortfolioEngine:
                     fee,
                     comm.fee_from_exchange,
                 )
+                # Record acceptance before anything below can fail. The atomic
+                # OPEN, the cash invariant and the ledger write can all still
+                # abort and return None; the trailing-buy caller then calls
+                # release_submitting_for_retry, which only retries while
+                # order_accepted=0. Without this stamp a commit failure bought
+                # the same intent a second time with the first fill already on
+                # the exchange. Marked accepted, recovery adopts it instead.
+                if trailing_buy_intent_id:
+                    try:
+                        from backend.services.day_trailing_buy_store import mark_order_accepted as _mark_accepted
+
+                        await asyncio.to_thread(
+                            _mark_accepted,
+                            self.db_path,
+                            str(trailing_buy_intent_id),
+                            order_id=str(live_order_buy.get("id") or ""),
+                            fill_id=str(live_order_buy.get("fill_id") or ""),
+                            trade_id=str(trade_id or ""),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "TRAILING_BUY_ACCEPT_STAMP_FAILED intent=%s order=%s — retry guard not armed",
+                            trailing_buy_intent_id,
+                            live_order_buy.get("id"),
+                        )
             except Exception as e:
                 logger.exception(f"LIVE_BUY_ERROR: {symbol} - {e}")
                 await self._record_reject(
@@ -10259,6 +10356,38 @@ class PortfolioEngine:
         current_bar: int | None = None,
         force_sell: bool = False,
     ) -> dict[str, Any] | None:
+        """Serialize sells per symbol, then run the FIFO sell.
+
+        The exit monitor, the mandatory-exit path and reconciliation can all
+        reach a sell for the same symbol concurrently. Every profitability and
+        quantity check inside happens before an ``await`` on the exchange, so
+        two loops could both pass those checks against the same position and
+        each place an order. ``_fifo_sell_lock`` is global and is only taken
+        much later, around the SQLite commit, so it does not prevent the
+        duplicate order itself.
+        """
+        lock = self._sell_execution_locks.setdefault(normalize_symbol(symbol), asyncio.Lock())
+        async with lock:
+            return await self._execute_sell_fifo_locked(
+                symbol,
+                quantity,
+                price,
+                exit_type,
+                exit_trigger,
+                current_bar=current_bar,
+                force_sell=force_sell,
+            )
+
+    async def _execute_sell_fifo_locked(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        exit_type: ExitType,
+        exit_trigger: str,
+        current_bar: int | None = None,
+        force_sell: bool = False,
+    ) -> dict[str, Any] | None:
         """
         PHASE 1: Execute SELL with FIFO matching against BUY lots.
         Decrements remaining_position on matched BUY rows.
@@ -10519,6 +10648,7 @@ class PortfolioEngine:
                 sell_fee_rate=exec_fee,
                 position_qty=float(position.quantity),
                 mark_price=float(price),
+                symbol=normalized_symbol,
             )
             if not exec_check.passed and not emergency_sell:
                 logger.warning(
@@ -11111,6 +11241,20 @@ class PortfolioEngine:
                     actual_sold_qty = self._floor_to_step(actual_sold_qty, qty_step)
                 is_dust, qty_quantized, dust_reason, est_notional = self._dust_check(symbol, actual_sold_qty, price)
                 if is_dust:
+                    # One write-off per residual. The same residual was being
+                    # written off on every monitor cycle (four times in 70s for
+                    # a single BTC 1e-05 leftover), each time booking another
+                    # DUST_WRITEOFF row at the full residual notional.
+                    prev = self._dust_writeoff_seen.get(symbol)
+                    if prev is not None and abs(float(prev) - float(qty_quantized)) <= max(1e-12, abs(float(prev)) * 1e-9):
+                        logger.info(
+                            "DUST_WRITEOFF_ALREADY_BOOKED symbol=%s qty=%.12g — removing position without a second write-off",
+                            symbol,
+                            qty_quantized,
+                        )
+                        await self._remove_dust_position_canonical_cleanup(symbol, position)
+                        return None
+                    self._dust_writeoff_seen[symbol] = float(qty_quantized)
                     dust_writeoff = True
                     actual_sold_qty = qty_quantized
                     dust_reason_str = dust_reason
@@ -11420,6 +11564,7 @@ class PortfolioEngine:
                 sell_fee_rate=sell_exec_fee_rate,
                 position_qty=float(position.quantity),
                 mark_price=float(price),
+                symbol=normalized_symbol,
             )
             if sell_preflight_audit:
                 sell_preflight_audit.update(exec_check.to_audit_dict())
@@ -12920,7 +13065,10 @@ class PortfolioEngine:
             _hold_h = max(0.0, (time.time() - _entry_ts) / 3600.0) if _entry_ts > 0 else 0.0
             _awbp_pos = _awbp.is_allweather_position(position)
             _legacy_aw = _aw.allweather_enabled() and _valid_bracket
-            if (_awbp_pos or _legacy_aw) and (_awbp.execution_enabled() or _legacy_aw or _awbp_pos):
+            # The second clause used to re-list _awbp_pos and _legacy_aw, so it
+            # was a tautology and execution_enabled() was never actually
+            # required: shadow-only positions took the ATR bracket exit.
+            if (_awbp_pos and _awbp.execution_enabled()) or _legacy_aw:
                 if current_bar is not None and not isinstance(current_bar, (int, float)) and hasattr(current_bar, "low"):
                     _bar_low = float(getattr(current_bar, "low", current_price) or current_price)
                     _bar_high = float(getattr(current_bar, "high", current_price) or current_price)
@@ -13052,9 +13200,12 @@ class PortfolioEngine:
                 return None
 
         try:
-            from backend.services.allweather_breakout_pullback_adapter import is_allweather_position
+            from backend.services import allweather_breakout_pullback_adapter as _awbp_skip
 
-            if is_allweather_position(position):
+            # Only hand a position to the all-weather bracket when that executor
+            # is actually enabled. Skipping the engine exit stack while the
+            # bracket was shadow-only left the position with no exit authority.
+            if _awbp_skip.is_allweather_position(position) and _awbp_skip.execution_enabled():
                 return None
         except Exception:
             pass
@@ -13177,6 +13328,7 @@ class PortfolioEngine:
                 sell_fee_rate=MAKER_FEE,
                 position_qty=quantity,
                 mark_price=current_price,
+                symbol=symbol,
             )
             if not exec_check.passed:
                 logger.debug(

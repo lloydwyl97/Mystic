@@ -6,6 +6,7 @@ import inspect
 
 import pytest
 
+from backend.config.execution_cost_model import honest_all_in_rt_pct
 from backend.services.day_controlled_exits import (
     EXIT_DAY_4H_STRUCTURE_BREAK,
     EXIT_DAY_RISK_FLOOR,
@@ -100,7 +101,7 @@ def test_profile_distance_holds_after_half_and_one_pct_mfe(symbol, entry, trail_
         )
         refresh_trailing_stop(pos, high, profile)
         profile_trail = high * (1.0 - trail_pct)
-        be_floor = entry * 1.0005
+        be_floor = entry * (1.0 + max(0.0005, honest_all_in_rt_pct(symbol)))
         expected = max(profile_trail, be_floor)
         assert pos.trailing_stop_price == pytest.approx(expected, rel=1e-6)
         # Verify trail uses the coin-profile distance, not a MFE-tightened one.
@@ -202,6 +203,9 @@ def test_rebuy_and_late_rise_are_not_permission():
 
 
 def test_be_lift_still_fires_without_tightening():
-    pos = _Pos(entry_price=100.0, highest_price=100.32, stop_price=99.0, trailing_stop_price=99.0)
+    pos = _Pos(entry_price=100.0, highest_price=100.32, stop_price=99.0, trailing_stop_price=99.0, symbol="ETH/USDT")
     assert apply_break_even_and_mfe_trail(pos, 100.32) is True
-    assert pos.stop_price == pytest.approx(100.05, rel=1e-6)
+    # Break-even is entry plus ETH's honest round trip, so filling this
+    # stop is flat-to-positive. A fixed +0.05% sat below that cost.
+    expected = 100.0 * (1.0 + max(0.0005, honest_all_in_rt_pct("ETH/USDT")))
+    assert pos.stop_price == pytest.approx(expected, rel=1e-6)

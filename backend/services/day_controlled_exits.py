@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from backend.config.execution_cost_model import honest_all_in_rt_pct
 from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_PROFIT_TO_SELL, min_net_profit_for_symbol
 from backend.services.ai_regime_validation import blend_by_scalar, get_regime_validated_scalar
 from backend.services.day_trade_thesis import (
@@ -1053,9 +1054,18 @@ def _break_even_trigger_pct() -> float:
     return float(os.getenv("DAY_BREAK_EVEN_TRIGGER_PCT", "0.0015"))
 
 
-def _break_even_offset_pct() -> float:
-    """After trigger, stop = entry * (1 + offset). Default +0.05% to cover exit slippage."""
-    return float(os.getenv("DAY_BREAK_EVEN_OFFSET_PCT", "0.0005"))
+def _break_even_offset_pct(symbol: str = "") -> float:
+    """After trigger, stop = entry * (1 + offset).
+
+    The offset must cover the honest round-trip for this symbol, otherwise
+    "break even" is a loss: the configured default of 0.05% sits below the
+    6-7.6 bps all-in round trip on the DAY universe, so a stop placed there
+    guaranteed a negative result every time it was hit.
+    """
+    configured = float(os.getenv("DAY_BREAK_EVEN_OFFSET_PCT", "0.0005"))
+    if not symbol:
+        return configured
+    return max(configured, honest_all_in_rt_pct(symbol))
 
 
 def _mfe_trail_tier_1_pct() -> float:
@@ -1082,6 +1092,19 @@ def _break_even_enabled() -> bool:
     return os.getenv("DAY_BREAK_EVEN_TRAIL_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _trail_activation_price(*, entry: float, trail_distance: float, symbol: str = "") -> float:
+    """Lowest high-water mark whose trail ratchet is profitable after costs.
+
+    The ratchet is ``highest * (1 - trail_distance)``. Requiring that to clear
+    ``entry * (1 + cost)`` gives ``highest >= entry * (1 + cost) / (1 - d)``.
+    """
+    if entry <= 0:
+        return 0.0
+    d = max(0.0, min(0.99, float(trail_distance or 0.0)))
+    cost = honest_all_in_rt_pct(symbol) if symbol else 0.0
+    return entry * (1.0 + cost) / (1.0 - d)
+
+
 def apply_break_even_and_mfe_trail(position: Any, current_price: float) -> bool:
     """Lift stop/trail to break-even after cost-clearing MFE. Do not tighten.
 
@@ -1090,9 +1113,11 @@ def apply_break_even_and_mfe_trail(position: Any, current_price: float) -> bool:
     to shrink that distance to 0.30% / 0.20% are removed. Adaptive-arm
     width overrides are also not applied here.
 
-    Remaining protection once MFE ≥ trigger (default 0.30%):
-    move stop and trailing_stop_price up to entry + 0.05% if that is higher
-    than the current ratchet. Never lowers a level.
+    Remaining protection once MFE ≥ trigger: move stop and trailing_stop_price
+    up to entry + the honest round-trip cost for this symbol if that is higher
+    than the current ratchet. Never lowers a level. The break-even level is
+    cost-inclusive by construction, so hitting it is flat-to-positive rather
+    than a small guaranteed loss.
 
     Returns True if the position's stop or trailing_stop_price advanced.
     """
@@ -1101,6 +1126,7 @@ def apply_break_even_and_mfe_trail(position: Any, current_price: float) -> bool:
     entry = float(getattr(position, "entry_price", 0.0) or 0.0)
     if entry <= 0 or current_price <= 0:
         return False
+    symbol = str(getattr(position, "symbol", "") or "")
     highest = float(getattr(position, "highest_price", 0.0) or entry)
     mfe_pct = max(0.0, (highest - entry) / entry) if entry > 0 else 0.0
     if mfe_pct <= 0.0:
@@ -1108,9 +1134,11 @@ def apply_break_even_and_mfe_trail(position: Any, current_price: float) -> bool:
 
     changed = False
 
-    trigger = _break_even_trigger_pct()
+    offset = _break_even_offset_pct(symbol)
+    # A break-even stop below the trigger would be armed the moment it is set.
+    trigger = max(_break_even_trigger_pct(), offset)
     if mfe_pct + 1e-12 >= trigger:
-        be_stop = entry * (1.0 + _break_even_offset_pct())
+        be_stop = entry * (1.0 + offset)
         current_stop = float(getattr(position, "stop_price", 0.0) or 0.0)
         if be_stop > current_stop + 1e-12:
             position.stop_price = be_stop
@@ -1139,11 +1167,16 @@ def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dic
     trail_pct = float(getattr(position, "trail_pct", 0.0) or profile.get("trail") or 0.005)
     highest = float(getattr(position, "highest_price", 0.0) or entry)
 
-    activation = entry * (1.0 + trail_pct)
+    symbol = str(getattr(position, "symbol", "") or "")
+    activation = _trail_activation_price(entry=entry, trail_distance=trail_pct, symbol=symbol)
     base_changed = False
     if highest >= activation:
         new_trail = highest * (1.0 - trail_pct)
         current_trail = float(getattr(position, "trailing_stop_price", 0.0) or 0.0)
+        # Trail distance stays at the coin profile. Positivity comes from the
+        # activation level alone: for highest >= entry*(1+cost)/(1-d), the
+        # ratchet highest*(1-d) is already >= entry*(1+cost), so no floor is
+        # needed here and the constant distance is preserved.
         floor = entry * (1.0 - float(profile.get("sl") or 0.010))
         new_trail = max(new_trail, floor, current_trail)
         if new_trail > current_trail + 1e-12:
@@ -1174,7 +1207,16 @@ def _trail_semantics(
     """
     highest = float(getattr(position, "highest_price", entry) or entry)
     trail_distance = float(getattr(position, "trail_pct", 0.0) or coin_profile.get("trail") or 0.005)
-    trail_activation = entry * (1.0 + trail_distance) if entry > 0 else 0.0
+    # Activation must be high enough that the resulting ratchet
+    # (highest * (1 - trail_distance)) is already above entry plus the honest
+    # round trip. Activating at entry * (1 + trail_distance) put the ratchet at
+    # entry * (1 - trail_distance**2) — below entry — so the first trail exit
+    # after activation was a structural loss.
+    trail_activation = _trail_activation_price(
+        entry=entry,
+        trail_distance=trail_distance,
+        symbol=str(getattr(position, "symbol", "") or ""),
+    )
     ratchet = float(getattr(position, "trailing_stop_price", 0.0) or 0.0)
     activated = bool(entry > 0 and highest >= trail_activation - 1e-12)
     executable_trail = ratchet if activated and ratchet > 0 else None

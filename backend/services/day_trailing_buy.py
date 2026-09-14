@@ -688,12 +688,44 @@ async def recover_submitting_intent(engine: Any, intent: dict[str, Any]) -> None
         )
         logger.info("TRAILING_BUY_RECOVERED_FILL intent=%s trade=%s", intent.get("intent_id"), local.get("trade_id"))
         return
-    exchange = await _exchange_order(engine, client_order_id=cid, symbol=symbol)
-    if exchange and str(exchange.get("state") or "") == "open":
+    exchange = await _exchange_order(
+        engine,
+        client_order_id=cid,
+        symbol=symbol,
+        order_id=str(intent.get("order_id") or ""),
+    )
+    state = str(exchange.get("state") or "") if exchange else ""
+    if state in {"open", "accepted"}:
+        # Live at the venue. Stamp accepted so no retry path can resubmit;
+        # the next cycle resolves it to filled or canceled.
         mark_order_accepted(engine.db_path, str(intent["intent_id"]), order_id=str(exchange.get("order_id") or ""))
-        logger.info("TRAILING_BUY_RECOVERED_OPEN_ORDER intent=%s order=%s", intent.get("intent_id"), exchange.get("order_id"))
+        logger.info(
+            "TRAILING_BUY_RECOVERED_%s_ORDER intent=%s order=%s",
+            state.upper(),
+            intent.get("intent_id"),
+            exchange.get("order_id"),
+        )
         return
-    if exchange and str(exchange.get("state") or "") == "filled":
+    if state == "canceled":
+        # Proven dead at the venue with nothing filled: release the reservation
+        # and let the intent retry rather than failing it as unconfirmed.
+        if float(exchange.get("filled") or 0.0) <= 0.0 and release_submitting_for_retry(engine.db_path, str(intent["intent_id"])):
+            logger.info(
+                "TRAILING_BUY_RECOVER_RETRY intent=%s venue_canceled order=%s",
+                intent.get("intent_id"),
+                exchange.get("order_id"),
+            )
+            return
+        mark_terminal(
+            engine.db_path,
+            str(intent["intent_id"]),
+            CANCELED,
+            reason="RECOVERED_VENUE_CANCELED",
+            order_id=str(exchange.get("order_id") or ""),
+        )
+        engine._release_entry_reservation(symbol, decision_id=decision_id, reason="RECOVERED_VENUE_CANCELED")
+        return
+    if state == "filled":
         mark_order_accepted(
             engine.db_path,
             str(intent["intent_id"]),
@@ -714,6 +746,15 @@ async def recover_submitting_intent(engine: Any, intent: dict[str, Any]) -> None
         return
     if bool(intent.get("order_accepted")):
         logger.warning("TRAILING_BUY_RECOVER_HOLD intent=%s accepted but fill unseen", intent.get("intent_id"))
+        return
+    if state == "unknown":
+        # The venue answered but the status is not one we can classify. Never
+        # resubmit against an unclassified order; hold for the next cycle.
+        logger.warning(
+            "TRAILING_BUY_RECOVER_HOLD intent=%s venue_state=unknown order=%s",
+            intent.get("intent_id"),
+            exchange.get("order_id") if exchange else "",
+        )
         return
     if exchange is None and not bool(intent.get("order_accepted")):
         if release_submitting_for_retry(engine.db_path, str(intent["intent_id"])):
@@ -761,8 +802,21 @@ def _local_fill(engine: Any, *, symbol: str, decision_id: str, client_order_id: 
         conn.close()
 
 
-async def _exchange_order(engine: Any, *, client_order_id: str, symbol: str) -> dict[str, Any] | None:
-    if not client_order_id:
+async def _exchange_order(engine: Any, *, client_order_id: str, symbol: str, order_id: str = "") -> dict[str, Any] | None:
+    """Resolve an order's venue state for restart recovery.
+
+    ``LiveTradingService.fetch_order`` is ``(exchange, order_id, symbol)``. The
+    previous call passed ``client_order_id=``/``symbol=`` keywords, which never
+    bound, so every lookup raised TypeError, fell through to a single
+    positional call that bound the id to ``exchange``, and returned "unknown".
+    Recovery therefore never adopted a real order.
+
+    Returns ``{"state": ...}`` with one of ``filled``, ``open``, ``accepted``,
+    ``canceled`` or ``unknown``. ``None`` means the lookup itself failed and
+    the caller must not draw a conclusion from it.
+    """
+    ref = str(order_id or "") or str(client_order_id or "")
+    if not ref:
         return None
     live = getattr(engine, "_live_service", None)
     if live is None:
@@ -770,25 +824,47 @@ async def _exchange_order(engine: Any, *, client_order_id: str, symbol: str) -> 
     fetch = getattr(live, "fetch_order", None) or getattr(live, "get_order", None)
     if fetch is None:
         return {"state": "unknown"}
+    raw: dict[str, Any] | None = None
     try:
-        raw = await fetch(client_order_id=client_order_id, symbol=symbol)
+        res = await fetch("binanceus", ref, symbol)
+        if isinstance(res, dict):
+            # LiveTradingService wraps the ccxt order: {"status": "success", "order": {...}}
+            raw = res.get("order") if str(res.get("status") or "") in {"success", "ok"} else (res.get("order") or None)
+            if raw is None and "id" in res:
+                raw = res
     except TypeError:
         try:
-            raw = await fetch(client_order_id)
+            res = await fetch(ref, symbol)
+            raw = res.get("order") if isinstance(res, dict) and "order" in res else res
         except Exception:
             return {"state": "unknown"}
     except Exception:
-        return None
+        # Transport/auth failure: we learned nothing. Must not be read as
+        # "no order exists", which would authorize a resubmit.
+        logger.exception("TRAILING_BUY_RECOVER_FETCH_FAILED symbol=%s ref=%s", symbol, ref)
+        return {"state": "unknown"}
     if not raw:
         return None
     status = str(raw.get("status") or raw.get("state") or "").lower()
-    if status in {"filled", "closed"}:
-        return {"state": "filled", "order_id": str(raw.get("id") or raw.get("order_id") or ""), "fill_id": str(raw.get("fill_id") or ""), "trade_id": str(raw.get("trade_id") or "")}
+    oid = str(raw.get("id") or raw.get("order_id") or ref)
+    filled = float(raw.get("filled") or 0.0)
+    if status in {"filled", "closed"} and filled > 0:
+        return {
+            "state": "filled",
+            "order_id": oid,
+            "fill_id": str(raw.get("fill_id") or ""),
+            "trade_id": str(raw.get("trade_id") or ""),
+        }
     if status in {"open", "new", "partially_filled", "partial"}:
-        return {"state": "open", "order_id": str(raw.get("id") or raw.get("order_id") or "")}
+        return {"state": "open", "order_id": oid, "filled": filled}
     if status in {"canceled", "cancelled", "expired", "rejected"}:
-        return None
-    return {"state": "unknown", "order_id": str(raw.get("id") or "")}
+        # Terminal at the venue with nothing filled: safe to release for retry.
+        # Returning None here made "cancelled" indistinguishable from "lookup
+        # failed", so a known-dead order was treated as unresolved.
+        return {"state": "canceled", "order_id": oid, "filled": filled}
+    if status in {"accepted", "pending_new", "pending"}:
+        return {"state": "accepted", "order_id": oid, "filled": filled}
+    return {"state": "unknown", "order_id": oid, "filled": filled}
 
 
 async def recover_trailing_buy_intents(engine: Any) -> int:

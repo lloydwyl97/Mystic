@@ -153,8 +153,13 @@ def execution_enabled() -> bool:
 
 
 def shadow_enabled() -> bool:
-    """Evaluate + log hypothetical decisions — default ON for integration review."""
-    return _env_bool("ALLWEATHER_BREAKOUT_PULLBACK_SHADOW", "true")
+    """Evaluate + log hypothetical decisions. Never changes live behaviour.
+
+    Default OFF. Shadow evaluation used to default ON "for integration
+    review", but every consumer of the shadow signal also acted on it, so
+    the observation path was a second live strategy.
+    """
+    return _env_bool("ALLWEATHER_BREAKOUT_PULLBACK_SHADOW", "false")
 
 
 def adapter_active() -> bool:
@@ -204,11 +209,16 @@ def is_allweather_strategy_family(strategy_family: str | None) -> bool:
 
 
 def is_allweather_position(position: Any) -> bool:
+    """Only an explicit strategy-family tag identifies an all-weather position.
+
+    The old fallback also claimed any position whose ``entry_thesis`` was
+    ``SETUP_BREAKOUT``/``SETUP_TREND_PULLBACK`` with bracket levels set.
+    ``SETUP_BREAKOUT`` is the string ``"BREAKOUT"``, which is also a normal
+    DAY setup name, so ordinary engine-managed DAY entries were claimed by
+    this family and skipped the engine exit stack.
+    """
     sf = getattr(position, "strategy_family", None) or getattr(position, "entry_strategy_id", "")
-    if is_allweather_strategy_family(str(sf)):
-        return True
-    thesis = str(getattr(position, "entry_thesis", "") or "")
-    return thesis in (SETUP_BREAKOUT, SETUP_TREND_PULLBACK) and bool(getattr(position, "thesis_target_level", 0.0) and getattr(position, "thesis_invalid_level", 0.0))
+    return is_allweather_strategy_family(str(sf))
 
 
 def apply_signal_to_decision_data(

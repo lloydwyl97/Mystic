@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from backend.config.execution_cost_model import honest_all_in_rt_pct
 from backend.services.day_controlled_exits import (
     DAY_FULL_FLATTEN_REASONS,
     EXIT_DAY_4H_STRUCTURE_BREAK,
@@ -451,7 +452,10 @@ def test_preview_splits_trail_fields_and_names_intact_profit_when_ready():
         bundle={"4h": rows},
     )
     assert preview["high_water"] == pytest.approx(1.49925)
-    assert preview["trail_activation"] == pytest.approx(1.378 * 1.005)
+    # Activation is the high-water at which the ratchet already clears
+    # entry plus the honest round trip: entry*(1+cost)/(1-trail).
+    expected_activation = 1.378 * (1.0 + honest_all_in_rt_pct("XRP/USDT")) / (1.0 - 0.005)
+    assert preview["trail_activation"] == pytest.approx(expected_activation)
     assert preview["trail_distance"] == pytest.approx(0.005)
     assert preview["executable_trailing_stop"] == pytest.approx(1.49625)
     assert preview["next_engine_exit"] == EXIT_TRAILING_STOP
