@@ -107,6 +107,7 @@ def observe_book(
     now: float,
     book_fresh: bool,
     thesis_invalid: bool = False,
+    validity_reason: str = "",
 ) -> ObserveDecision:
     """Pure state machine. Never submits. Never chases a lost improvement."""
     status = str(intent.get("status") or "")
@@ -122,6 +123,8 @@ def observe_book(
         return ObserveDecision("hold", status, current_ask=px)
     if now >= expires_at > 0:
         return ObserveDecision("expire", EXPIRED, "TIMEOUT", current_ask=px)
+    if validity_reason:
+        return ObserveDecision("cancel", CANCELED, str(validity_reason), current_ask=px)
     if thesis_invalid:
         return ObserveDecision("cancel", CANCELED, "THESIS_4H_INVALID", current_ask=px)
     if not book_fresh or px <= 0:
@@ -299,6 +302,35 @@ async def arm_selected_candidate(
     arm_mid = float(book["midpoint"])
     live_spread = float(book.get("spread_bps") or 0.0)
     formulas = formulas_for_symbol(symbol, arm_spread_bps=live_spread)
+    discovery: dict[str, Any] = {}
+    try:
+        from backend.services.day_path_net import load_recent_bars
+        from backend.services.day_setup_discovery import classify_setup, may_arm_setup, structured_min_dip_bps
+
+        raw_bars = load_recent_bars(str(getattr(engine, "db_path", "") or ""), symbol)
+        bars = []
+        for row in raw_bars:
+            ts = row.get("ts")
+            epoch = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(float(ts or 0) or 0)
+            bars.append((epoch, float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"]), float(row.get("volume") or 0.0)))
+        discovery = classify_setup(bars, symbol=symbol, ts=int(time.time()), atr=float(atr or 0.0), ask=arm_ask)
+        if not may_arm_setup(discovery):
+            logger.info(
+                "TRAILING_BUY_ARM_BLOCKED %s setup_class=%s reason=%s",
+                symbol,
+                discovery.get("setup_class"),
+                discovery.get("reason"),
+            )
+            return None
+        if str(discovery.get("setup_class") or "") == "STRUCTURED_PULLBACK_RECLAIM":
+            formulas["min_dip_bps"] = structured_min_dip_bps(
+                symbol,
+                float(atr or 0.0),
+                arm_ask,
+                float(formulas["rebound_bps"]),
+            )
+    except Exception:
+        logger.exception("TRAILING_BUY_SETUP_DISCOVERY_FAILED symbol=%s", symbol)
     notional = float(quantity) * arm_ask
     reserved, reserve_reason = engine._try_reserve_entry(
         symbol,
@@ -340,6 +372,7 @@ async def arm_selected_candidate(
                 "explainability": exp,
                 "decision_data": dict(decision_data or {}),
                 "entry_authority": ENTRY_AUTHORITY,
+                "setup_discovery": discovery,
             },
         },
     )
@@ -505,12 +538,36 @@ async def cycle_trailing_buy_intents(engine: Any, redis_client: Any) -> dict[str
         book = read_market_book(books, symbol)
         ask = float((book or {}).get("ask") or 0.0)
         fresh = bool(book and book.get("fresh") and float(book.get("freshness_sec") or 0.0) <= BOOK_STALE_SEC)
+        validity = ""
+        try:
+            from backend.services.day_path_net import load_recent_bars
+            from backend.services.day_setup_discovery import live_intent_validity
+
+            raw_bars = load_recent_bars(str(getattr(engine, "db_path", "") or ""), symbol)
+            bars = []
+            for row in raw_bars:
+                ts = row.get("ts")
+                epoch = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(float(ts or 0) or 0)
+                bars.append(
+                    (
+                        epoch,
+                        float(row["open"]),
+                        float(row["high"]),
+                        float(row["low"]),
+                        float(row["close"]),
+                        float(row.get("volume") or 0.0),
+                    )
+                )
+            validity = live_intent_validity(intent, ask=ask, now=time.time(), bars=bars)
+        except Exception:
+            logger.exception("TRAILING_BUY_VALIDITY_FAILED symbol=%s", symbol)
         decision = observe_book(
             intent,
             ask=ask,
             now=time.time(),
             book_fresh=fresh,
             thesis_invalid=_thesis_invalid(intent, ask),
+            validity_reason=validity,
         )
         if decision.action in {"expire", "cancel"}:
             mark_terminal(
