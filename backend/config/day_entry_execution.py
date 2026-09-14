@@ -11,7 +11,20 @@ VALID_ENTRY_MODES: Final[frozenset[str]] = frozenset({TRAILING_BUY_MODE})
 MODE_ENV: Final[str] = "DAY_ENTRY_EXECUTION_MODE"
 MAX_WAIT_ENV: Final[str] = "DAY_TRAILING_BUY_MAX_WAIT_SECONDS"
 DEFAULT_MAX_WAIT_SECONDS: Final[int] = 900
-BOOK_STALE_SEC: Final[float] = 30.0
+BOOK_STALE_ENV: Final[str] = "DAY_BOOK_STALE_SEC"
+DEFAULT_BOOK_STALE_SEC: Final[float] = 30.0
+
+
+def _resolve_book_stale_sec() -> float:
+    raw = str(os.getenv(BOOK_STALE_ENV, "") or "").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_BOOK_STALE_SEC
+    return value if value > 0 else DEFAULT_BOOK_STALE_SEC
+
+
+BOOK_STALE_SEC: Final[float] = _resolve_book_stale_sec()
 
 
 def raw_day_entry_execution_mode() -> str:
@@ -43,7 +56,9 @@ def trailing_buy_max_wait_seconds() -> int:
 
 
 __all__ = [
+    "BOOK_STALE_ENV",
     "BOOK_STALE_SEC",
+    "DEFAULT_BOOK_STALE_SEC",
     "DEFAULT_MAX_WAIT_SECONDS",
     "ENTRY_AUTHORITY_TRAILING_BUY",
     "MAX_WAIT_ENV",
