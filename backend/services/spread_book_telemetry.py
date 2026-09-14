@@ -148,8 +148,7 @@ def read_market_book(redis_client: Any, symbol: str) -> dict[str, Any] | None:
     if redis_client is None:
         return None
     now = time.time()
-    best: tuple[float, float, float, str] | None = None
-    best_age = float("inf")
+    candidates: list[tuple[float, float, float, float, str]] = []
     for key, ts_fields, default_source in (
         (orderbook_redis_key(symbol), ("updated_at", "ts_utc"), "websocket"),
         (book_redis_key(symbol), ("timestamp",), "market_book"),
@@ -162,12 +161,15 @@ def read_market_book(redis_client: Any, symbol: str) -> dict[str, Any] | None:
             continue
         bid, ask, ts, source = parsed
         age = max(0.0, now - ts)
-        if age < best_age:
-            best = (bid, ask, ts, source or default_source)
-            best_age = age
-    if best is None:
+        candidates.append((age, bid, ask, ts, source or default_source))
+        if age <= BOOK_STALE_SEC:
+            # Highest-priority usable source wins outright. Alternating sources
+            # between polls injects their price offset into the trailing-buy
+            # dip/rebound deltas as a phantom move.
+            break
+    if not candidates:
         return None
-    bid, ask, ts, source = best
+    _age, bid, ask, ts, source = min(candidates, key=lambda c: c[0])
     return book_payload(bid=bid, ask=ask, source=source, timestamp=ts)
 
 

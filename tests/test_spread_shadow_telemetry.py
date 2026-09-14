@@ -51,6 +51,39 @@ def test_read_market_book_falls_back_to_canonical_mark_when_websocket_is_older()
     assert book["ask"] == 79102.0
 
 
+def test_read_market_book_does_not_flap_source_when_both_are_fresh():
+    """A marginally fresher canonical mark must not displace a usable order book.
+
+    Switching source mid-intent feeds the offset between the two feeds into the
+    dip/rebound deltas as a price move that never happened.
+    """
+    sym = "SOL/USDT"
+    redis = _FakeRedis(
+        {
+            orderbook_redis_key(sym): _book(104.11, 104.12, 2.0, "websocket", "updated_at"),
+            book_redis_key(sym): _book(104.25, 104.26, 0.1, "canonical_mark", "timestamp"),
+        }
+    )
+    book = read_market_book(redis, sym)
+    assert book is not None
+    assert book["source"] == "websocket"
+    assert book["ask"] == 104.12
+
+
+def test_read_market_book_returns_stalest_fresher_when_neither_is_usable():
+    sym = "XRP/USDT"
+    redis = _FakeRedis(
+        {
+            orderbook_redis_key(sym): _book(1.46, 1.4601, BOOK_STALE_SEC + 60.0, "websocket", "updated_at"),
+            book_redis_key(sym): _book(1.47, 1.4701, BOOK_STALE_SEC + 10.0, "canonical_mark", "timestamp"),
+        }
+    )
+    book = read_market_book(redis, sym)
+    assert book is not None
+    assert book["source"] == "canonical_mark"
+    assert book["fresh"] is False
+
+
 def test_read_market_book_uses_ts_utc_when_updated_at_missing():
     sym = "SOL/USDT"
     raw = _book(104.11, 104.12, 1.0, "websocket", "ts_utc")
