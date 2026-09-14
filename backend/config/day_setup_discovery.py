@@ -26,6 +26,11 @@ BREAK_CONFIRM_BARS: Final[int] = 8
 VOLUME_CONFIRM_MULT: Final[float] = 1.15
 COST_PULLBACK_MULT: Final[float] = 2.0
 MAX_INTENT_AGE_SEC: Final[int] = 900
+# EARLY_TREND _range_break counts asof bars. STRUCTURE/4h windows are 240m + 8m prior.
+EARLY_TREND_MIN_BARS: Final[int] = CONSOLIDATION_BARS + BREAK_CONFIRM_BARS + 2
+STRUCTURE_LOOKBACK_MINUTES: Final[int] = 240 + BREAK_CONFIRM_BARS
+# feature_ohlcv persist-now is ~2 rows/min; keep 1-row/min coverage too.
+SETUP_DISCOVERY_LOOKBACK_BARS: Final[int] = max(EARLY_TREND_MIN_BARS, STRUCTURE_LOOKBACK_MINUTES * 3)
 
 SHADOW_EARLY_ENV: Final[str] = "DAY_EARLY_TREND_SHADOW"
 SHADOW_PULLBACK_ENV: Final[str] = "DAY_STRUCTURED_PULLBACK_SHADOW"

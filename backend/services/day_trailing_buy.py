@@ -313,9 +313,14 @@ async def arm_selected_candidate(
     from backend.services.day_setup_discovery import classify_setup, may_arm_setup, structured_min_dip_bps
 
     try:
+        from backend.config.day_setup_discovery import SETUP_DISCOVERY_LOOKBACK_BARS
         from backend.services.day_path_net import load_recent_bars
 
-        raw_bars = load_recent_bars(str(getattr(engine, "db_path", "") or ""), symbol)
+        raw_bars = load_recent_bars(
+            str(getattr(engine, "db_path", "") or ""),
+            symbol,
+            n=SETUP_DISCOVERY_LOOKBACK_BARS,
+        )
         bars = []
         for row in raw_bars:
             epoch = _bar_epoch(row.get("ts"))
@@ -333,10 +338,13 @@ async def arm_selected_candidate(
         discovery = {}
     if not may_arm_setup(discovery):
         logger.info(
-            "TRAILING_BUY_ARM_BLOCKED %s setup_class=%s reason=%s",
+            "TRAILING_BUY_ARM_BLOCKED %s setup_class=%s reason=%s asof=%s early_need=%s structure_need_min=%s",
             symbol,
             discovery.get("setup_class"),
             discovery.get("reason"),
+            discovery.get("asof_bars"),
+            discovery.get("early_trend_need_bars"),
+            discovery.get("structure_need_minutes"),
         )
         return None
     notional = float(quantity) * arm_ask
@@ -548,10 +556,15 @@ async def cycle_trailing_buy_intents(engine: Any, redis_client: Any) -> dict[str
         fresh = bool(book and book.get("fresh") and float(book.get("freshness_sec") or 0.0) <= BOOK_STALE_SEC)
         validity = ""
         try:
+            from backend.config.day_setup_discovery import SETUP_DISCOVERY_LOOKBACK_BARS
             from backend.services.day_path_net import load_recent_bars
             from backend.services.day_setup_discovery import live_intent_validity
 
-            raw_bars = load_recent_bars(str(getattr(engine, "db_path", "") or ""), symbol)
+            raw_bars = load_recent_bars(
+                str(getattr(engine, "db_path", "") or ""),
+                symbol,
+                n=SETUP_DISCOVERY_LOOKBACK_BARS,
+            )
             bars = []
             for row in raw_bars:
                 epoch = _bar_epoch(row.get("ts"))

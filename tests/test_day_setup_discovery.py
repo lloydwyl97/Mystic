@@ -9,7 +9,11 @@ import pytest
 from backend.config.day_entry_execution import VALID_ENTRY_MODES
 from backend.config.day_setup_discovery import (
     EARLY_TREND,
+    EARLY_TREND_MIN_BARS,
     REJECT_EXTENDED,
+    REJECT_NO_SETUP,
+    SETUP_DISCOVERY_LOOKBACK_BARS,
+    STRUCTURE_LOOKBACK_MINUTES,
     STRUCTURED_PULLBACK,
 )
 from backend.services.day_setup_discovery import (
@@ -40,6 +44,36 @@ def _bars(*, start: int, n: int, px: float, step: float = 0.0, vol: float = 10.0
         lo = min(o, price) - 0.05
         out.append((ts, o, h, lo, price, vol))
     return out
+
+
+def test_discovery_lookback_covers_early_trend_and_4h_structure():
+    assert EARLY_TREND_MIN_BARS == 55
+    assert STRUCTURE_LOOKBACK_MINUTES == 248
+    assert SETUP_DISCOVERY_LOOKBACK_BARS >= EARLY_TREND_MIN_BARS
+    assert SETUP_DISCOVERY_LOOKBACK_BARS >= STRUCTURE_LOOKBACK_MINUTES
+    src = inspect.getsource(__import__("backend.services.day_trailing_buy", fromlist=["arm_selected_candidate"]).arm_selected_candidate)
+    assert "SETUP_DISCOVERY_LOOKBACK_BARS" in src
+    assert "n=SETUP_DISCOVERY_LOOKBACK_BARS" in src
+
+
+def test_truncated_path_net_lookback_is_insufficient_bars():
+    start = 1_700_000_000
+    bars = _bars(start=start, n=40, px=100.0, step=0.0)
+    last = bars[-1]
+    out = classify_setup(bars, symbol="ETHUSDT", ts=last[0], atr=2.0, ask=last[4])
+    assert out["setup_class"] == REJECT_NO_SETUP
+    assert out["reason"] == "INSUFFICIENT_BARS"
+    assert out["asof_bars"] == 40
+    assert out["early_trend_need_bars"] == EARLY_TREND_MIN_BARS
+
+
+def test_full_asof_history_does_not_report_insufficient_bars():
+    start = 1_700_000_000
+    bars = _bars(start=start, n=EARLY_TREND_MIN_BARS, px=100.0, step=0.0)
+    last = bars[-1]
+    out = classify_setup(bars, symbol="ETHUSDT", ts=last[0], atr=2.0, ask=last[4])
+    assert out["asof_bars"] == EARLY_TREND_MIN_BARS
+    assert out["reason"] != "INSUFFICIENT_BARS"
 
 
 def test_early_trend_eligible_before_day_high():

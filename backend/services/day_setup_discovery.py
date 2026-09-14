@@ -13,6 +13,7 @@ from backend.config.day_setup_discovery import (
     COST_PULLBACK_MULT,
     EARLY_ROOM_ATR_MULT,
     EARLY_TREND,
+    EARLY_TREND_MIN_BARS,
     EXTENDED_1H_HIGH_ATR,
     EXTENDED_4H_RANGE_PCT,
     MAX_INTENT_AGE_SEC,
@@ -20,6 +21,7 @@ from backend.config.day_setup_discovery import (
     RECLAIM_ATR_MULT,
     REJECT_EXTENDED,
     REJECT_NO_SETUP,
+    STRUCTURE_LOOKBACK_MINUTES,
     STRUCTURED_PULLBACK,
     VOLUME_CONFIRM_MULT,
     setup_discovery_route,
@@ -135,7 +137,7 @@ def reclaim_bps_required(symbol: str, atr: float, price: float) -> float:
 
 
 def _range_break(asof: list[Bar], *, ts: int, atr: float, ask: float) -> dict[str, Any]:
-    need = CONSOLIDATION_BARS + BREAK_CONFIRM_BARS + 2
+    need = EARLY_TREND_MIN_BARS
     if len(asof) < need:
         return {"ok": False, "reason": "INSUFFICIENT_BARS"}
     consol = asof[-(CONSOLIDATION_BARS + BREAK_CONFIRM_BARS) : -BREAK_CONFIRM_BARS]
@@ -183,6 +185,9 @@ def classify_setup(
         "cost_rt": cost,
         "pullback_bps_req": pullback_bps_required(symbol, atr_abs, px),
         "reclaim_bps_req": reclaim_bps_required(symbol, atr_abs, px),
+        "asof_bars": len(asof),
+        "early_trend_need_bars": EARLY_TREND_MIN_BARS,
+        "structure_need_minutes": STRUCTURE_LOOKBACK_MINUTES,
     }
     if px <= 0 or atr_abs <= 0:
         out["reason"] = "NO_PRICE_OR_ATR"
