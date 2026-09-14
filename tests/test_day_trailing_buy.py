@@ -724,3 +724,77 @@ async def test_ranked_stream_arms_four_on_path_ev_hold(tmp_path, monkeypatch):
     assert out["trailing_buy_armed"] is True
     assert out["active_intent_count"] == 4
     assert {row["state"] for row in out["intents"]} == {WAIT_DIP}
+
+
+def test_intact_4h_slot_cap_ignores_arm_time_reservations(monkeypatch):
+    """Simultaneously armed intents must not block each other out of the 4H cap.
+
+    Each armed intent holds an entry reservation. Counting reservations as
+    occupied intact-4H slots made three or more armed intents mutually exclusive,
+    so every intent that completed its dip and rebound died at the submit gate.
+    """
+    import backend.services.day_trade_thesis as thesis
+
+    monkeypatch.setattr(thesis, "htf_4h_rise_intact_for_symbol", lambda _s: True)
+    engine = PortfolioEngine.__new__(PortfolioEngine)
+    engine.open_positions = {}
+    engine._pending_orders = {}
+    engine._entry_reservations = {
+        "BTC/USDT": {"notional": 57.0},
+        "ETH/USDT": {"notional": 57.0},
+        "SOL/USDT": {"notional": 57.0},
+        "XRP/USDT": {"notional": 57.0},
+    }
+    for sym in engine._entry_reservations:
+        assert PortfolioEngine._intact_4h_open_count(engine, exclude=sym) == 0
+        assert PortfolioEngine._intact_4h_slot_block(engine, sym) == (False, "")
+
+
+def test_intact_4h_slot_cap_still_counts_real_inflight_buys(monkeypatch):
+    import backend.services.day_trade_thesis as thesis
+
+    monkeypatch.setattr(thesis, "htf_4h_rise_intact_for_symbol", lambda _s: True)
+
+    class _Order:
+        def __init__(self, symbol):
+            self.side = "BUY"
+            self.symbol = symbol
+
+    engine = PortfolioEngine.__new__(PortfolioEngine)
+    engine.open_positions = {}
+    engine._entry_reservations = {}
+    engine._pending_orders = {"a": _Order("BTC/USDT"), "b": _Order("ETH/USDT")}
+    assert PortfolioEngine._intact_4h_open_count(engine, exclude="XRP/USDT") == 2
+    blocked, why = PortfolioEngine._intact_4h_slot_block(engine, "XRP/USDT")
+    assert blocked is True
+    assert why == "SAME_4H_THESIS_SLOT_CAP"
+
+
+def test_formulas_use_the_persisted_spread_column_name():
+    f = formulas_for_symbol("XRPUSDT", arm_spread_bps=0.687)
+    assert f["spread_bps"] == pytest.approx(0.687)
+    assert "arm_spread_bps" not in f
+
+
+def test_intent_max_age_tracks_configured_expiry():
+    from backend.config.day_entry_execution import trailing_buy_max_wait_seconds
+    from backend.config.day_setup_discovery import MAX_INTENT_AGE_SEC
+
+    assert trailing_buy_max_wait_seconds() == MAX_INTENT_AGE_SEC
+
+
+def test_log_observe_decision_emits_once_per_transition(caplog):
+    from backend.services.day_trailing_buy import ObserveDecision, log_observe_decision
+
+    intent = _intent(intent_id="obs-1", status=TRAIL_LOW, lowest_ask=99.7)
+    intent["intent_id"] = "obs-1"
+    watching = ObserveDecision("watch", TRAIL_LOW, "REBOUND_ABOVE_IMPROVEMENT", lowest_ask=99.7, current_ask=99.95)
+    with caplog.at_level("INFO"):
+        log_observe_decision(intent, watching, ask=99.95)
+        log_observe_decision(intent, watching, ask=99.96)
+        log_observe_decision(intent, ObserveDecision("new_low", TRAIL_LOW, "NEW_LOW", lowest_ask=99.5, current_ask=99.5), ask=99.5)
+    lines = [r for r in caplog.records if "TRAILING_BUY_OBSERVE" in r.getMessage()]
+    assert len(lines) == 2
+    assert "REBOUND_ABOVE_IMPROVEMENT" in lines[0].getMessage()
+    assert "submit_window=" in lines[0].getMessage()
+    assert "NEW_LOW" in lines[1].getMessage()

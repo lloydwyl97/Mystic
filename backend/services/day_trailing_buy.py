@@ -152,6 +152,46 @@ def observe_book(
     return ObserveDecision("watch", TRAIL_LOW, lowest_ask=lowest, lowest_ask_ts=lowest_ts, current_ask=px)
 
 
+_OBSERVE_LOGGED: dict[str, tuple[str, str]] = {}
+
+
+def log_observe_decision(intent: dict[str, Any], decision: ObserveDecision, *, ask: float) -> None:
+    """Emit one line per state/reason transition of the trailing-buy state machine.
+
+    The submit bracket is single-digit bps wide, so which branch fired -- and how
+    wide the bracket was at that moment -- is not recoverable after the fact from
+    the intent row alone. Repeats of an unchanged (status, reason) are suppressed.
+    """
+    intent_id = str(intent.get("intent_id") or "")
+    key = (str(decision.status or ""), str(decision.reason or ""))
+    if _OBSERVE_LOGGED.get(intent_id) == key:
+        return
+    _OBSERVE_LOGGED[intent_id] = key
+    arm_ask = float(intent.get("arm_ask") or 0.0)
+    lowest = float(decision.lowest_ask or intent.get("lowest_ask") or 0.0)
+    trigger = rebound_trigger_ask(lowest, float(intent.get("rebound_bps") or 0.0)) if lowest > 0 else 0.0
+    ceiling = retained_improvement_ceiling_ask(arm_ask, float(intent.get("required_improvement_bps") or 0.0)) if arm_ask > 0 else 0.0
+    width = ((ceiling - trigger) / arm_ask * 10000.0) if arm_ask > 0 and trigger > 0 else 0.0
+    logger.info(
+        "TRAILING_BUY_OBSERVE symbol=%s intent=%s action=%s status=%s reason=%s ask=%.8f arm=%.8f low=%.8f dip_got=%.2fbps dip_req=%.2fbps submit_window=[%.8f,%.8f] width=%.2fbps",
+        intent.get("symbol"),
+        intent_id,
+        decision.action,
+        decision.status,
+        decision.reason or "-",
+        float(ask or 0.0),
+        arm_ask,
+        lowest,
+        dip_achieved_bps(arm_ask, float(ask or 0.0)),
+        float(intent.get("min_dip_bps") or 0.0),
+        trigger,
+        ceiling,
+        width,
+    )
+    if decision.action in {"expire", "cancel", "submit"}:
+        _OBSERVE_LOGGED.pop(intent_id, None)
+
+
 def formulas_for_symbol(symbol: str, *, arm_spread_bps: float) -> dict[str, float]:
     cost = honest_round_trip_cost_bps(symbol)
     improvement = required_improvement_bps(symbol)
@@ -162,7 +202,8 @@ def formulas_for_symbol(symbol: str, *, arm_spread_bps: float) -> dict[str, floa
         "required_improvement_bps": improvement,
         "rebound_bps": rebound,
         "min_dip_bps": dip,
-        "arm_spread_bps": float(arm_spread_bps),
+        # Key must match the persisted column name; the store reads "spread_bps".
+        "spread_bps": float(arm_spread_bps),
     }
 
 
@@ -589,6 +630,7 @@ async def cycle_trailing_buy_intents(engine: Any, redis_client: Any) -> dict[str
             thesis_invalid=_thesis_invalid(intent, ask),
             validity_reason=validity,
         )
+        log_observe_decision(intent, decision, ask=ask)
         if decision.action in {"expire", "cancel"}:
             mark_terminal(
                 engine.db_path,

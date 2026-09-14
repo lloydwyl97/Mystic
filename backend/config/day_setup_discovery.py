@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 from typing import Final
 
+from backend.config.day_entry_execution import trailing_buy_max_wait_seconds
+
 EARLY_TREND = "EARLY_TREND_CONTINUATION"
 STRUCTURED_PULLBACK = "STRUCTURED_PULLBACK_RECLAIM"
 REJECT_EXTENDED = "REJECT_EXTENDED"
@@ -25,7 +27,9 @@ CONSOLIDATION_BARS: Final[int] = 45
 BREAK_CONFIRM_BARS: Final[int] = 8
 VOLUME_CONFIRM_MULT: Final[float] = 1.15
 COST_PULLBACK_MULT: Final[float] = 2.0
-MAX_INTENT_AGE_SEC: Final[int] = 900
+# One intent lifetime, not two. The trailing-buy expiry is authoritative; a second
+# independent constant here cancels as STALE_INTENT_MAX_AGE before expiry is reached.
+MAX_INTENT_AGE_SEC: Final[int] = trailing_buy_max_wait_seconds()
 # EARLY_TREND _range_break counts asof bars. STRUCTURE/4h windows are 240m + 8m prior.
 EARLY_TREND_MIN_BARS: Final[int] = CONSOLIDATION_BARS + BREAK_CONFIRM_BARS + 2
 STRUCTURE_LOOKBACK_MINUTES: Final[int] = 240 + BREAK_CONFIRM_BARS

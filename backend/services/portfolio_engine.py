@@ -5460,7 +5460,10 @@ class PortfolioEngine:
                     n += 1
             except Exception:
                 continue
-        for psym in self._pending_buy_symbols():
+        # In-flight BUY orders only. Arm-time entry reservations are candidates, not
+        # positions on the tape: counting them let a set of simultaneously armed
+        # trailing-buy intents block each other out of the cap they each had to pass.
+        for psym in self._pending_buy_order_symbols():
             if skip and normalize_symbol(psym) == skip:
                 continue
             if normalize_symbol(psym) in {normalize_symbol(s) for s in self.open_positions}:
@@ -12574,7 +12577,10 @@ class PortfolioEngine:
             logger.warning(f"BUY_BLOCKED_NO_CASH: {symbol} - available_balance=${self._available_balance:.2f} pending=${pending_notional:.2f}")
             return False, "INSUFFICIENT_CASH"
 
-        if notional_usd > free_cash:
+        # Compare at cent precision so the check agrees with the amount it reports.
+        # Sub-cent float drift between the reservation and the live ask otherwise
+        # rejects entries whose need and have are the same money.
+        if round(float(notional_usd), 2) > round(free_cash, 2):
             logger.info(f"BUY_BLOCKED_INSUFFICIENT_CASH: {symbol} - notional=${notional_usd:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_notional:.2f})")
             return False, f"INSUFFICIENT_CASH: need ${notional_usd:.2f}, have ${free_cash:.2f}"
 
