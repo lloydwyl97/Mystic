@@ -62,6 +62,7 @@ const BACKGROUND_ENDPOINTS = [
     { path: "/api/portfolio-engine/model-panel", key: "modelPanel" },
     { path: "/api/ai-diagnostics/missed-opportunities?limit=30", key: "missedOpportunities" },
     { path: "/api/portfolio-engine/trading-economics", key: "tradingEconomics" },
+    { path: "/api/portfolio-engine/pnl-reconciliation", key: "pnlReconciliation" },
     { path: "/api/portfolio-engine/scoreboard?days=7", key: "scoreboard7d" },
     { path: "/api/scalp/status", key: "scalpStatus", timeoutMs: SCALP_STATUS_TIMEOUT_MS },
     { path: "/api/context/market-role/summary", key: "marketRoleSummary" },
@@ -1009,6 +1010,9 @@ function updateUI(key, data, stale) {
         case "tradingEconomics":
             updateTradingEconomics(data);
             break;
+        case "pnlReconciliation":
+            updatePnlReconciliation(data, stale);
+            break;
         case "scalpStatus":
             updateScalpEngineStatus(data, stale);
             break;
@@ -1587,6 +1591,114 @@ function refreshEnginesPanelFromCache() {
     setPnlCard("eng-day-pnl", dayPnl, sb.trades);
     set("eng-day-scoreboard", sb.pass_fail || sb.status || "--");
     refreshCommandCenter();
+}
+
+// Trading result presentation. The primary figure is the live result
+// reconciled against Binance.US fills. Paper is shown separately and the
+// stored ledger total is labelled historical, because that value mixes
+// simulated paper profit with live results and is not trading performance.
+function updatePnlReconciliation(res, stale) {
+    const wrap = res && typeof res === "object" ? res : {};
+    const p = wrap.presentation || {};
+    const d = wrap.data || {};
+    if (!Object.keys(p).length) return;
+
+    const money = (v) => (v == null || Number.isNaN(Number(v)) ? "--" : (Number(v) >= 0 ? "+" : "") + "$" + Number(v).toFixed(2));
+    const signed = (id, v) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = money(v);
+        el.classList.remove("pnl-pos", "pnl-neg");
+        if (v != null && !Number.isNaN(Number(v))) el.classList.add(Number(v) >= 0 ? "pnl-pos" : "pnl-neg");
+    };
+
+    const reconciled = p.primary_result_is_exchange_reconciled === true;
+    signed("pnl-live-reconciled", reconciled ? p.live_reconciled_usd : p.live_recorded_usd);
+    const primaryEl = document.getElementById("pnl-live-reconciled");
+    if (primaryEl) {
+        primaryEl.title = reconciled
+            ? "Binance.US venue gross minus venue quote fees. The real trading result."
+            : "Exchange reconciliation unavailable — showing the engine's recorded live figure, which is not venue-confirmed.";
+    }
+    setCardText("pnl-live-source", reconciled ? "Binance.US reconciled" : "RECORDED ONLY — not venue-confirmed");
+    signed("pnl-live-recorded", p.live_recorded_usd);
+    signed("pnl-live-dust", p.live_dust_writeoff_usd);
+    signed("pnl-paper", p.paper_realized_usd);
+    signed("pnl-legacy", p.legacy_mixed_total_usd);
+
+    const legacyEl = document.getElementById("pnl-legacy");
+    if (legacyEl) {
+        // Never let the mixed total read as profit.
+        legacyEl.classList.remove("pnl-pos", "pnl-neg");
+        legacyEl.title = "Historical stored ledger value. Mixes paper with live. NOT live trading profit.";
+    }
+    const paperEl = document.getElementById("pnl-paper");
+    if (paperEl) paperEl.title = "Simulated trades only. Not live performance.";
+
+    setCardText("pnl-fees", p.exchange_fees_quote_usd != null ? "$" + Number(p.exchange_fees_quote_usd).toFixed(4) : "--");
+    setCardText("pnl-matched", String(p.matched_fills != null ? p.matched_fills : "--"));
+    setCardText(
+        "pnl-unmatched",
+        (p.unmatched_recorded_rows != null ? p.unmatched_recorded_rows : "--") + " rows / " + (p.unmatched_venue_fills != null ? p.unmatched_venue_fills : "--") + " fills"
+    );
+    setCardText("pnl-coverage", p.qty_coverage_pct != null ? Number(p.qty_coverage_pct).toFixed(2) + "%" : "--");
+    const ws = String(p.reconciliation_window_start || "").slice(0, 19).replace("T", " ");
+    const we = String(p.reconciliation_window_end || "").slice(0, 19).replace("T", " ");
+    setCardText("pnl-window", ws && we ? ws + " → " + we : "--");
+    setCardText("pnl-mode", String(p.account_execution_mode || "--").toUpperCase());
+
+    const noteEl = document.getElementById("pnl-notes");
+    if (noteEl) {
+        const notes = Array.isArray(p.notes) ? p.notes.slice() : [];
+        if (p.reconciliation_error) notes.unshift("Reconciliation error: " + p.reconciliation_error);
+        if (p.reconciliation_stale || stale || d.cached) {
+            const age = d.cache_age_sec != null ? " (cache age " + Number(d.cache_age_sec).toFixed(0) + "s)" : "";
+            notes.push((p.reconciliation_stale ? "Showing last good reconciliation" : "Cached reconciliation") + age);
+        }
+        noteEl.innerHTML = "";
+        notes.forEach((n) => {
+            const li = document.createElement("li");
+            li.textContent = n;
+            noteEl.appendChild(li);
+        });
+    }
+
+    const tbody = document.getElementById("pnl-recon-tbody");
+    if (tbody) {
+        const rows = Array.isArray(d.per_symbol) ? d.per_symbol : [];
+        tbody.innerHTML = "";
+        if (!rows.length) {
+            const tr = document.createElement("tr");
+            const td = document.createElement("td");
+            td.colSpan = 8;
+            td.textContent = p.reconciliation_error ? "Reconciliation unavailable" : "Loading...";
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+        }
+        rows.forEach((s) => {
+            const tr = document.createElement("tr");
+            const cells = [
+                s.symbol,
+                s.venue_buy_fills + " / " + s.venue_sell_fills,
+                s.recorded_buy_rows + " / " + s.recorded_sell_rows,
+                "$" + Number(s.venue_buy_notional || 0).toFixed(2),
+                "$" + Number(s.venue_sell_notional || 0).toFixed(2),
+                money(s.venue_gross_usd),
+                "$" + Number(s.venue_fee_quote_usd || 0).toFixed(4),
+                Number(s.qty_coverage_pct || 0).toFixed(1) + "%",
+            ];
+            cells.forEach((c, i) => {
+                const td = document.createElement("td");
+                td.textContent = String(c);
+                if (i === 5) {
+                    const v = Number(s.venue_gross_usd || 0);
+                    td.classList.add(v >= 0 ? "pnl-pos" : "pnl-neg");
+                }
+                tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+        });
+    }
 }
 
 function updateTradingEconomics(res) {

@@ -613,6 +613,44 @@ body {
     grid-column: span 2;
 }
 
+/* Primary trading result: the exchange-reconciled live figure. */
+.mini-card--primary {
+    grid-column: span 2;
+    border-color: var(--accent, #58a6ff);
+    box-shadow: inset 0 0 0 1px rgba(88, 166, 255, 0.18);
+}
+
+.mini-card__value--lg {
+    font-size: 1.6em;
+    line-height: 1.2;
+}
+
+/* Legacy mixed total is historical, not profit. Kept visually neutral so it
+   never reads as a live gain. */
+.mini-card--legacy {
+    border-style: dashed;
+    opacity: 0.82;
+}
+
+.mini-card--legacy .mini-card__value {
+    color: var(--text-muted, #8b949e);
+}
+
+.pnl-notes {
+    margin: 10px 0 4px;
+    padding-left: 18px;
+    font-size: 0.82em;
+    color: var(--text-muted, #8b949e);
+}
+
+.pnl-notes:empty {
+    display: none;
+}
+
+.pnl-notes li {
+    margin: 2px 0;
+}
+
 .mini-card::after {
     content: '';
     position: absolute;

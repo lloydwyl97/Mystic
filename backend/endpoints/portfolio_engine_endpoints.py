@@ -330,6 +330,35 @@ async def _read_positions_for_risk_from_sqlite() -> list[dict[str, Any]]:
     return await asyncio.to_thread(_read_positions_for_risk_from_sqlite_sync)
 
 
+@router.get("/pnl-reconciliation")
+async def get_pnl_reconciliation(force: bool = False) -> dict[str, Any]:
+    """Live result reconciled against Binance.US fills, separated from paper.
+
+    ``paper_trades`` holds paper and live rows in one table and the stored
+    ``portfolio_engine_ledger.realized_pnl`` is a historical sum of both.
+    Reporting that total as performance credits the live account with
+    simulated profit earned before live execution began.
+
+    Returns three separated figures, the matched/unmatched fill counts,
+    exchange fees and the reconciliation window. Nothing is rewritten.
+    """
+    try:
+        from backend.database_schema import DATABASE_PATH
+        from backend.services.execution_mode_service import is_live_execution_allowed_sync
+        from backend.services.live_pnl_reconciliation import get_reconciliation, presentation_fields
+
+        recon = await get_reconciliation(str(DATABASE_PATH), force=bool(force))
+        return {
+            "success": True,
+            "data": recon,
+            "presentation": presentation_fields(recon, is_live=bool(is_live_execution_allowed_sync())),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception("Error building live P&L reconciliation: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.get("/ledger")
 async def get_portfolio_ledger() -> dict[str, Any]:
     """
@@ -490,14 +519,35 @@ async def get_portfolio_performance() -> dict[str, Any]:
                 f"ACCOUNTING_MISMATCH in /performance: total_equity={total_equity:.2f} != cash={cash:.2f} + positions={positions:.2f}",
             )
 
+        # The displayed trading result is the exchange-reconciled live figure.
+        # Paper and the stored legacy total are reported beside it, never as
+        # live performance.
+        pnl_presentation: dict[str, Any] = {}
+        try:
+            from backend.services.live_pnl_reconciliation import get_reconciliation, presentation_fields
+
+            # Cache only: /performance must not wait on exchange round trips.
+            # The dedicated /pnl-reconciliation poll refreshes the cache.
+            _recon = await get_reconciliation(str(DATABASE_PATH), cached_only=True)
+            pnl_presentation = presentation_fields(_recon, is_live=account_execution_mode == "live")
+        except Exception as exc:
+            logger.warning("PNL_RECONCILIATION_UNAVAILABLE: %s", exc)
+            pnl_presentation = {
+                "primary_result_label": "LIVE (recorded, not exchange-reconciled)",
+                "primary_result_is_exchange_reconciled": False,
+                "reconciliation_error": str(exc)[:200],
+            }
+
         return {
             "success": True,
+            "pnl_presentation": pnl_presentation,
             "performance": {
                 "account_execution_mode": account_execution_mode,
                 "realized_pnl": realized_pnl,
                 "realized_pnl_live": realized_pnl_live,
                 "realized_pnl_paper_historical": realized_pnl_paper_historical,
                 "realized_pnl_ledger_stored": realized_pnl_ledger_stored,
+                "realized_pnl_ledger_stored_label": "LEGACY MIXED TOTAL (historical, not live profit)",
                 "unrealized_pnl": unrealized_pnl,
                 "total_pnl": total_pnl,
                 "component_pnl_sum": realized_pnl + unrealized_pnl,
