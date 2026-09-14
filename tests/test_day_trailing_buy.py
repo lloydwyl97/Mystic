@@ -15,6 +15,7 @@ from backend.config.day_entry_execution import (
 from backend.services.day_trailing_buy import (
     DAY_TRADE_SYMBOLS,
     ENTRY_AUTHORITY,
+    _bar_epoch,
     available_economic_slots,
     formulas_for_symbol,
     honest_round_trip_cost_bps,
@@ -58,6 +59,11 @@ def _intent(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def test_bar_epoch_parses_feature_ohlcv_naive_string():
+    assert _bar_epoch("2026-09-14 18:23:28.822881") == 1789410208
+    assert _bar_epoch(1789410208) == 1789410208
 
 
 def test_formulas_match_authoritative_costs():

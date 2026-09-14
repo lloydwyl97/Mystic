@@ -14,6 +14,7 @@ from backend.config.day_entry_execution import (
     trailing_buy_mode_status,
 )
 from backend.config.execution_cost_model import honest_all_in_rt_pct
+from backend.services.day_path_input_validity import parse_bar_ts
 from backend.services.day_trailing_buy_store import (
     CANCELED,
     EXPIRED,
@@ -35,6 +36,12 @@ from backend.services.day_trailing_buy_store import (
 from backend.services.spread_book_telemetry import read_market_book
 
 logger = logging.getLogger(__name__)
+
+
+def _bar_epoch(ts: Any) -> int:
+    parsed = parse_bar_ts(ts)
+    return int(parsed.timestamp()) if parsed is not None else 0
+
 
 ENTRY_AUTHORITY = ENTRY_AUTHORITY_TRAILING_BUY
 DAY_TRADE_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
@@ -303,25 +310,17 @@ async def arm_selected_candidate(
     live_spread = float(book.get("spread_bps") or 0.0)
     formulas = formulas_for_symbol(symbol, arm_spread_bps=live_spread)
     discovery: dict[str, Any] = {}
+    from backend.services.day_setup_discovery import classify_setup, may_arm_setup, structured_min_dip_bps
+
     try:
         from backend.services.day_path_net import load_recent_bars
-        from backend.services.day_setup_discovery import classify_setup, may_arm_setup, structured_min_dip_bps
 
         raw_bars = load_recent_bars(str(getattr(engine, "db_path", "") or ""), symbol)
         bars = []
         for row in raw_bars:
-            ts = row.get("ts")
-            epoch = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(float(ts or 0) or 0)
+            epoch = _bar_epoch(row.get("ts"))
             bars.append((epoch, float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"]), float(row.get("volume") or 0.0)))
         discovery = classify_setup(bars, symbol=symbol, ts=int(time.time()), atr=float(atr or 0.0), ask=arm_ask)
-        if not may_arm_setup(discovery):
-            logger.info(
-                "TRAILING_BUY_ARM_BLOCKED %s setup_class=%s reason=%s",
-                symbol,
-                discovery.get("setup_class"),
-                discovery.get("reason"),
-            )
-            return None
         if str(discovery.get("setup_class") or "") == "STRUCTURED_PULLBACK_RECLAIM":
             formulas["min_dip_bps"] = structured_min_dip_bps(
                 symbol,
@@ -331,6 +330,15 @@ async def arm_selected_candidate(
             )
     except Exception:
         logger.exception("TRAILING_BUY_SETUP_DISCOVERY_FAILED symbol=%s", symbol)
+        discovery = {}
+    if not may_arm_setup(discovery):
+        logger.info(
+            "TRAILING_BUY_ARM_BLOCKED %s setup_class=%s reason=%s",
+            symbol,
+            discovery.get("setup_class"),
+            discovery.get("reason"),
+        )
+        return None
     notional = float(quantity) * arm_ask
     reserved, reserve_reason = engine._try_reserve_entry(
         symbol,
@@ -546,8 +554,7 @@ async def cycle_trailing_buy_intents(engine: Any, redis_client: Any) -> dict[str
             raw_bars = load_recent_bars(str(getattr(engine, "db_path", "") or ""), symbol)
             bars = []
             for row in raw_bars:
-                ts = row.get("ts")
-                epoch = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(float(ts or 0) or 0)
+                epoch = _bar_epoch(row.get("ts"))
                 bars.append(
                     (
                         epoch,
