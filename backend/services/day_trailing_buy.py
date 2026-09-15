@@ -493,7 +493,32 @@ async def _pre_submit_safety(engine: Any, intent: dict[str, Any], ask: float) ->
         decision_id=str(intent.get("decision_id") or ""),
     )
     if not can_open:
-        return False, str(open_why or "CANNOT_OPEN")
+        why = str(open_why or "CANNOT_OPEN")
+        if why == "INSUFFICIENT_CASH" or why.startswith("INSUFFICIENT_CASH:"):
+            from backend.config.protected_execution import MAKER_FEE, USE_PROTECTED_LIMIT_EXECUTION
+            from backend.config.trading_economics import TAKER_FEE
+            from backend.services.day_entry_spendable import plan_executable_buy
+
+            own_res, _own_ns = engine._own_entry_reservation(symbol, str(intent.get("decision_id") or ""))
+            pending_other = engine._pending_buy_notional(
+                exclude_symbol=_own_ns if own_res else "",
+                exclude_decision_id=str(intent.get("decision_id") or ""),
+            )
+            constraints = (getattr(engine, "_symbol_constraints", None) or {}).get(symbol) or {}
+            plan = plan_executable_buy(
+                requested_qty=intent.get("quantity") or 0,
+                price=ask,
+                commission_rate=MAKER_FEE if USE_PROTECTED_LIMIT_EXECUTION else TAKER_FEE,
+                spendable=float(getattr(engine, "_available_balance", 0.0) or 0.0) - float(pending_other),
+                qty_step=constraints.get("qty_step") or 0,
+                min_qty=constraints.get("min_qty") or 0,
+                min_notional=constraints.get("min_notional") or 0,
+                allocation=own_res.get("notional") if own_res else intent.get("notional_usd"),
+            )
+            if plan.ok:
+                return True, ""
+            return False, plan.reason
+        return False, why
     ns = symbol
     try:
         from backend.utils.canonical_symbol_formatter import CanonicalSymbolFormatter
@@ -537,6 +562,11 @@ async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> di
         trailing_buy_intent_id=str(intent.get("intent_id") or ""),
     )
     if result:
+        engine._release_entry_reservation(
+            symbol,
+            decision_id=str(intent.get("decision_id") or ""),
+            reason="ORDER_ACCEPTED",
+        )
         mark_order_accepted(
             engine.db_path,
             str(intent["intent_id"]),
@@ -569,6 +599,20 @@ async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> di
             improvement,
         )
         return result
+    from backend.services.day_entry_spendable import is_terminal_buy_cash_reason
+
+    reject = str(getattr(engine, "last_buy_reject_reason", "") or "")
+    if is_terminal_buy_cash_reason(reject):
+        mark_terminal(
+            engine.db_path,
+            str(intent["intent_id"]),
+            CANCELED,
+            reason=reject,
+            current_ask=ask,
+        )
+        engine._release_entry_reservation(symbol, decision_id=str(intent.get("decision_id") or ""), reason=reject)
+        logger.info("TRAILING_BUY_SUBMIT_TERMINAL %s %s", symbol, reject)
+        return None
     # execute_buy_fifo returned None: no fill. Retry only if no order was accepted.
     if release_submitting_for_retry(engine.db_path, str(intent["intent_id"])):
         logger.info("TRAILING_BUY_SUBMIT_RETRYABLE %s no order accepted", symbol)

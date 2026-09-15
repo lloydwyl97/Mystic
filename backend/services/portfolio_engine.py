@@ -2338,6 +2338,7 @@ class PortfolioEngine:
         self._pending_orders: dict[str, PendingOrder] = {}
         # Atomic entry reservations (cash/slot/symbol) held until fill or release
         self._entry_reservations: dict[str, dict[str, Any]] = {}
+        self.last_buy_reject_reason: str = ""
 
         # Item 7: Scoreboard
         self._startup_timestamp = time.time()
@@ -8398,6 +8399,7 @@ class PortfolioEngine:
 
         Updates authoritative ledger on success and persists to SQLite + audit.
         """
+        self.last_buy_reject_reason = ""
         # Capture pre-ledger for audit
         pre_ledger = {
             "cash_balance": self.cash_balance,
@@ -9111,6 +9113,68 @@ class PortfolioEngine:
         notional = quantity * fill_price
         total_cost = notional + fee
 
+        from backend.services.day_entry_spendable import money as _money
+        from backend.services.day_entry_spendable import plan_executable_buy
+
+        own_res, own_ns = self._own_entry_reservation(normalized_symbol, str(decision_id or ""))
+        own_reserved = bool(decision_id) and str(own_res.get("decision_id") or "") == str(decision_id or "")
+        pending_other = self._pending_buy_notional(
+            exclude_symbol=own_ns if own_reserved else "",
+            exclude_decision_id=str(decision_id or "") if own_reserved else "",
+        )
+        constraints = self._symbol_constraints.get(symbol) or self._symbol_constraints.get(normalized_symbol) or {}
+        cash_plan = plan_executable_buy(
+            requested_qty=quantity,
+            price=fill_price,
+            commission_rate=exec_fee_rate,
+            spendable=_money(self._available_balance) - _money(pending_other),
+            qty_step=constraints.get("qty_step") or 0,
+            min_qty=constraints.get("min_qty") or 0,
+            min_notional=constraints.get("min_notional") or 0,
+            slippage_rate=0,
+            allocation=own_res.get("notional") if own_reserved else None,
+        )
+        if not cash_plan.ok:
+            self.last_buy_reject_reason = cash_plan.reason
+            logger.warning(
+                "BUY_BLOCKED_EXECUTABLE_CASH: %s reason=%s requested=%s spendable=%s",
+                symbol,
+                cash_plan.reason,
+                cash_plan.requested_quantity,
+                cash_plan.spendable,
+            )
+            await self._record_reject(
+                symbol,
+                "BUY",
+                cash_plan.reason,
+                "EXECUTABLE_CASH",
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+            if decision_id:
+                await self._update_pipeline_decision(
+                    decision_id,
+                    {
+                        "stage": "EXECUTION",
+                        "execution_result": "NOT_EXECUTED",
+                        "execution_reason": cash_plan.reason,
+                    },
+                )
+            return None
+        if cash_plan.shrunk or cash_plan.quantity != _money(quantity):
+            logger.info(
+                "BUY_QTY_SHRUNK_TO_SPENDABLE symbol=%s from=%s to=%s total_cost=%s spendable=%s",
+                symbol,
+                quantity,
+                cash_plan.quantity,
+                cash_plan.total_cost,
+                cash_plan.spendable,
+            )
+        quantity = float(cash_plan.quantity)
+        fee = float(cash_plan.commission)
+        notional = float(cash_plan.notional)
+        total_cost = float(cash_plan.total_cost)
+
         # Hard per-position size cap — respects MAX_POSITION_SIZE_USD env var (0 = disabled)
         if MAX_POSITION_SIZE_USD > 0 and total_cost > MAX_POSITION_SIZE_USD:
             total_cost = MAX_POSITION_SIZE_USD
@@ -9134,6 +9198,7 @@ class PortfolioEngine:
         # =================================================================
         can_open, block_reason = await self._can_open_position(symbol, total_cost, decision_id=str(decision_id or ""))
         if not can_open:
+            self.last_buy_reject_reason = str(block_reason or "")
             logger.warning(f"BUY_BLOCKED: {symbol} - {block_reason}")
             _gate_id = "CASH_OR_SLOTS"
             _br_u = str(block_reason or "").upper()
@@ -9187,6 +9252,7 @@ class PortfolioEngine:
                 sleeve=str(_reserve_sleeve or ""),
             )
             if not _ok_res:
+                self.last_buy_reject_reason = str(_res_reason or "")
                 logger.warning(f"BUY_BLOCKED_RESERVATION: {symbol} - {_res_reason}")
                 with contextlib.suppress(Exception):
                     from backend.services.day_gate_telemetry import record_gate_event
@@ -9463,10 +9529,13 @@ class PortfolioEngine:
         # Keep this entry's reservation active so concurrent buys cannot consume its cash
         # between this check and the debit below.
         async with self._global_cash_lock:
-            pending_other = self._pending_buy_notional(exclude_symbol=symbol)
-            free_cash = float(self._available_balance) - pending_other
-            if total_cost > free_cash:
-                reason = f"total_cost=${total_cost:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_other:.2f})"
+            from backend.services.day_entry_spendable import cash_covers
+            from backend.services.day_entry_spendable import money as _inv_money
+
+            pending_other = self._pending_buy_notional(exclude_symbol=symbol, exclude_decision_id=str(decision_id or ""))
+            free_cash = _inv_money(self._available_balance) - _inv_money(pending_other)
+            if not cash_covers(_inv_money(total_cost), free_cash):
+                reason = f"total_cost={_inv_money(total_cost)} > free={free_cash} (available={_inv_money(self._available_balance)} pending={_inv_money(pending_other)})"
                 logger.error(f"BUY_BLOCKED_CASH_INVARIANT: {symbol} - {reason}")
                 await self._record_reject(
                     symbol,
@@ -12388,20 +12457,36 @@ class PortfolioEngine:
         reservations = getattr(self, "_entry_reservations", None) or {}
         return set(reservations.keys()) | self._pending_buy_order_symbols()
 
-    def _pending_buy_notional(self, *, exclude_symbol: str = "") -> float:
+    def _pending_buy_notional(self, *, exclude_symbol: str = "", exclude_decision_id: str = "") -> float:
+        from backend.services.day_entry_spendable import money
+
         ex = normalize_symbol(exclude_symbol) if exclude_symbol else ""
-        n = 0.0
+        skip_did = str(exclude_decision_id or "").strip()
+        n = money(0)
         for sym, r in (getattr(self, "_entry_reservations", None) or {}).items():
+            if skip_did and str((r or {}).get("decision_id") or "") == skip_did:
+                continue
             if ex and normalize_symbol(sym) == ex:
                 continue
-            n += float((r or {}).get("notional") or 0.0)
+            n += money((r or {}).get("notional") or 0)
         for p in (getattr(self, "_pending_orders", None) or {}).values():
             if str(getattr(p, "side", "") or "").upper() != "BUY":
                 continue
             if ex and normalize_symbol(getattr(p, "symbol", "") or "") == ex:
                 continue
-            n += float(getattr(p, "remaining_qty", 0.0) or 0.0) * float(getattr(p, "price", 0.0) or 0.0)
-        return n
+            n += money(getattr(p, "remaining_qty", 0) or 0) * money(getattr(p, "price", 0) or 0)
+        return float(n)
+
+    def _own_entry_reservation(self, symbol: str, decision_id: str = "") -> tuple[dict[str, Any], str]:
+        ns = normalize_symbol(symbol)
+        reservations = getattr(self, "_entry_reservations", None) or {}
+        did = str(decision_id or "").strip()
+        if did:
+            for key, row in reservations.items():
+                if str((row or {}).get("decision_id") or "") == did:
+                    return dict(row or {}), normalize_symbol(key) or ns
+        row = reservations.get(ns) or reservations.get(symbol) or {}
+        return dict(row or {}), ns
 
     def _try_reserve_entry(
         self,
@@ -12438,9 +12523,12 @@ class PortfolioEngine:
         max_positions_limit = MAX_OPEN_POSITIONS
         if active_count + pending_slots >= max_positions_limit:
             return False, "MAX_POSITIONS_WITH_PENDING"
-        pending_n = self._pending_buy_notional()
-        if float(notional_usd) > float(self._available_balance) - pending_n + 1e-9:
-            return False, f"INSUFFICIENT_CASH_WITH_PENDING: need ${float(notional_usd):.2f}, free=${max(0.0, float(self._available_balance) - pending_n):.2f}"
+        from backend.services.day_entry_spendable import cash_covers, money
+
+        pending_n = self._pending_buy_notional(exclude_decision_id=did)
+        spendable = money(self._available_balance) - money(pending_n)
+        if not cash_covers(money(notional_usd), spendable):
+            return False, f"INSUFFICIENT_CASH_WITH_PENDING: need {money(notional_usd)} free={max(money(0), spendable)}"
         # Sleeve capacity including pending reserved notional for same sleeve
         if sleeve and ENABLE_SLEEVE_BLOCKING:
             sleeve_pending = sum(float((r or {}).get("notional") or 0.0) for r in (self._entry_reservations or {}).values() if str((r or {}).get("sleeve") or "") == str(sleeve))
@@ -12609,16 +12697,19 @@ class PortfolioEngine:
             live_cap = live_test_max_open_positions_limit()
             if live_cap is not None:
                 max_positions_limit = live_cap
-        existing_res = (getattr(self, "_entry_reservations", None) or {}).get(symbol) or {}
+        existing_res, own_ns = self._own_entry_reservation(symbol, str(decision_id or ""))
         own_reservation = bool(decision_id) and str(existing_res.get("decision_id") or "") == str(decision_id)
-        if symbol in self._pending_buy_order_symbols() and not own_reservation:
+        pending_order_symbols = self._pending_buy_order_symbols()
+        pending_symbols = self._pending_buy_symbols()
+        if (symbol in pending_order_symbols or own_ns in pending_order_symbols) and not own_reservation:
             logger.info(f"BUY_BLOCKED_PENDING_ENTRY: {symbol} - reservation or pending buy already exists")
             return False, "ENTRY_RESERVED_OR_PENDING"
-        if symbol in self._pending_buy_symbols() and not own_reservation:
+        if (symbol in pending_symbols or own_ns in pending_symbols) and not own_reservation:
             logger.info(f"BUY_BLOCKED_PENDING_ENTRY: {symbol} - reservation or pending buy already exists")
             return False, "ENTRY_RESERVED_OR_PENDING"
         if own_reservation:
             pending_slot_symbols.discard(symbol)
+            pending_slot_symbols.discard(own_ns)
         pending_slots = len(pending_slot_symbols)
         if active_count + pending_slots >= max_positions_limit:
             if PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK:
@@ -12738,19 +12829,37 @@ class PortfolioEngine:
                         return False, "POSITION_ALREADY_OPEN"
 
         # CRITICAL: Check cash available (enforce conservation of money)
-        # Pending entry reservations and in-flight BUY orders reduce free cash.
-        pending_notional = self._pending_buy_notional(exclude_symbol=symbol if own_reservation else "")
-        free_cash = float(self._available_balance) - pending_notional
-        if free_cash <= 0:
-            logger.warning(f"BUY_BLOCKED_NO_CASH: {symbol} - available_balance=${self._available_balance:.2f} pending=${pending_notional:.2f}")
-            return False, "INSUFFICIENT_CASH"
+        # Other-intent reservations and in-flight BUY orders reduce free cash.
+        # This intent's own reservation is spendable and is excluded once.
+        from backend.services.day_entry_spendable import cash_covers, money
 
-        # Compare at cent precision so the check agrees with the amount it reports.
-        # Sub-cent float drift between the reservation and the live ask otherwise
-        # rejects entries whose need and have are the same money.
-        if round(float(notional_usd), 2) > round(free_cash, 2):
-            logger.info(f"BUY_BLOCKED_INSUFFICIENT_CASH: {symbol} - notional=${notional_usd:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_notional:.2f})")
-            return False, f"INSUFFICIENT_CASH: need ${notional_usd:.2f}, have ${free_cash:.2f}"
+        pending_notional = self._pending_buy_notional(
+            exclude_symbol=own_ns if own_reservation else "",
+            exclude_decision_id=str(decision_id or "") if own_reservation else "",
+        )
+        spendable = money(self._available_balance) - money(pending_notional)
+        required = money(notional_usd)
+        if spendable <= 0:
+            logger.warning(
+                "BUY_BLOCKED_NO_CASH: %s - available_balance=%s pending=%s",
+                symbol,
+                money(self._available_balance),
+                money(pending_notional),
+            )
+            return False, "INSUFFICIENT_CASH"
+        if own_reservation:
+            # Already carved. execute_buy_fifo sizes quantity to this leftover.
+            pass
+        elif not cash_covers(required, spendable):
+            logger.info(
+                "BUY_BLOCKED_INSUFFICIENT_CASH: %s - notional=%s > free=%s (available=%s pending=%s)",
+                symbol,
+                required,
+                spendable,
+                money(self._available_balance),
+                money(pending_notional),
+            )
+            return False, f"INSUFFICIENT_CASH: need {required} have {spendable}"
 
         # Check portfolio risk cap (include reserved entry risk when present)
         total_open_risk = self._calculate_total_open_risk()
