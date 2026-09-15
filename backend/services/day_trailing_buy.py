@@ -84,6 +84,7 @@ _DETERMINISTIC_MARKERS = (
     "PENDING_BUY",
     "ENTRY_RESERVED",
     "THESIS_4H",
+    "COMPLETED_4H",
     "MAX_POSITIONS",
     "ACCOUNT_OVERALLOCATED",
     "DELEVERAGING",
@@ -617,6 +618,23 @@ async def _pre_submit_safety(engine: Any, intent: dict[str, Any], ask: float) ->
         return False, "PENDING_BUY_EXISTS"
     if _thesis_invalid(intent, ask):
         return False, "THESIS_4H_INVALID"
+    from backend.services.day_active_market_bundle import resolve_pre_buy_day_structure_bundle
+    from backend.services.day_controlled_exits import evaluate_completed_4h_buy_hard_safety
+
+    fourh = evaluate_completed_4h_buy_hard_safety(
+        mark=float(ask),
+        bundle=resolve_pre_buy_day_structure_bundle(symbol),
+        now_epoch=time.time(),
+    )
+    if not fourh.get("allowed"):
+        logger.info(
+            "TRAILING_BUY_HARD_SAFETY_4H symbol=%s intent=%s prior_4h_low=%s current_4h_close=%s",
+            symbol,
+            intent.get("intent_id"),
+            fourh.get("prior_4h_low"),
+            fourh.get("current_4h_close"),
+        )
+        return False, "COMPLETED_4H_ALREADY_INVALID"
     return True, ""
 
 

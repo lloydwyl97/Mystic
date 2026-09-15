@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from decimal import Decimal
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -36,6 +36,16 @@ from backend.services.day_trailing_buy_store import (
     update_watch,
 )
 from backend.services.portfolio_engine import PortfolioEngine
+
+
+@pytest.fixture(autouse=True)
+def _intact_4h_for_cash_tests():
+    with patch(
+        "backend.services.day_active_market_bundle.resolve_pre_buy_day_structure_bundle",
+        return_value={},
+    ):
+        yield
+
 
 # Captured ETH tbace6b0a92e3745d8 / XRP tbb226f475c96e428e (Ocean SQLite).
 ETH_ACCOUNT_CASH = Decimal("227.12229294")

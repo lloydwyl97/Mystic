@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
+from backend.services.day_entry_spendable import floor_to_step, money
 from backend.utils.symbols import normalize_symbol
 
 # coin_performance field classification (audit 2026-08-24).
@@ -156,14 +158,35 @@ def apply_live_buy_economics(
     commission: LiveCommission,
 ) -> tuple[float, float, float]:
     """Return (received_qty, entry_fee_usd, cash_debit). Exchange fees win when present."""
-    filled = max(0.0, float(filled_qty))
-    px = float(fill_price or 0.0)
+    filled = money(filled_qty)
+    if filled < 0:
+        filled = Decimal("0")
+    px = money(fill_price)
     if commission.fee_from_exchange:
-        received = max(0.0, filled - float(commission.base_qty_reduction or 0.0))
-        fee = float(commission.usd)
-        cash = filled * px + float(commission.quote_commission_usd or 0.0)
-        return received, fee, cash
-    return filled, float(modeled_fee), filled * px + float(modeled_fee)
+        received = filled - money(commission.base_qty_reduction or 0)
+        if received < 0:
+            received = Decimal("0")
+        fee = money(commission.usd)
+        cash = filled * px + money(commission.quote_commission_usd or 0)
+        return float(received), float(fee), float(cash)
+    modeled = money(modeled_fee)
+    return float(filled), float(modeled), float(filled * px + modeled)
+
+
+def sellable_and_residual_qty(
+    *,
+    credited_qty: object,
+    qty_step: object,
+) -> tuple[Decimal, Decimal]:
+    """Maximum exchange-valid sell qty and leftover real inventory."""
+    credited = money(credited_qty)
+    if credited < 0:
+        credited = Decimal("0")
+    sellable = floor_to_step(credited, money(qty_step))
+    residual = credited - sellable
+    if residual < 0:
+        residual = Decimal("0")
+    return sellable, residual
 
 
 def apply_live_sell_economics(

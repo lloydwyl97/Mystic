@@ -2879,14 +2879,6 @@ class PortfolioEngine:
                 if not is_dust and notional < min_notional:
                     is_dust = True
                     dust_reason = dust_reason or "below min_notional"
-                if is_dust:
-                    logger.info(
-                        "LIVE_RECONCILE_IMPORT_SKIP_DUST symbol=%s qty=%s reason=%s",
-                        symbol,
-                        track_qty,
-                        dust_reason or "dust",
-                    )
-                    continue
                 lot_tid = ""
                 lot_px = price
                 try:
@@ -2908,9 +2900,10 @@ class PortfolioEngine:
                             lot_px = float(row[1])
                 except Exception:
                     lot_tid = ""
+                held_qty = float(free_qty if is_dust else track_qty)
                 position = OpenPosition(
                     symbol=symbol,
-                    quantity=track_qty,
+                    quantity=held_qty,
                     entry_price=lot_px,
                     entry_time=time.time(),
                     trade_id=lot_tid or f"reconcile_import_{symbol.replace('/', '_')}_{int(time.time())}",
@@ -2924,16 +2917,22 @@ class PortfolioEngine:
                     entry_bar_timestamp=int(time.time()),
                     confidence_at_entry=0.5,
                 )
+                if is_dust:
+                    position.status = "DUST_PENDING"
+                    position.dust_detected_at = time.time()
+                    position.dust_qty_canonical = held_qty
                 self.open_positions[symbol] = position
                 await self._persist_position_to_sqlite(position)
                 imported_any = True
                 logger.info(
-                    "LIVE_RECONCILE_ASSET_IMPORTED symbol=%s qty=%s entry_price=%s trade_id=%s notional=%.2f",
+                    "LIVE_RECONCILE_ASSET_IMPORTED symbol=%s qty=%s entry_price=%s trade_id=%s notional=%.2f dust=%s reason=%s",
                     symbol,
-                    track_qty,
+                    held_qty,
                     lot_px,
                     position.trade_id,
-                    track_qty * lot_px,
+                    held_qty * lot_px,
+                    bool(is_dust),
+                    dust_reason or "",
                 )
             except Exception as e:
                 logger.warning("LIVE_RECONCILE_IMPORT_ERROR: %s %s", symbol, e)
@@ -2975,10 +2974,10 @@ class PortfolioEngine:
                 continue
             snapped = self._floor_to_step(exchange_qty, qty_step) if qty_step > 0 else exchange_qty
             price = getattr(position, "entry_price", 0) or 0
-            is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped, price)
+            is_dust, _, dust_reason, _ = self._dust_check(symbol, exchange_qty if snapped <= 0 < exchange_qty else snapped, price)
             if is_dust:
                 prior_notional = float(db_qty or 0.0) * float(price or 0.0)
-                if prior_notional >= 5.0 and float(db_qty or 0.0) > float(snapped or 0.0) + 1e-9:
+                if prior_notional >= 5.0 and float(db_qty or 0.0) > float(exchange_qty or 0.0) + 1e-9 and exchange_qty <= qty_epsilon:
                     logger.info(
                         "HUMAN_FLATTEN_TO_DUST:%s db_qty=%.12g ex_qty=%.12g -> manual_sell",
                         symbol,
@@ -2988,9 +2987,10 @@ class PortfolioEngine:
                     await self._handle_vanished_exchange_position(symbol, position, source="periodic_reconcile")
                     self._metrics_reconciliation_adjustments += 1
                     continue
-                position.quantity = snapped
+                held = float(exchange_qty if exchange_qty > 0 else snapped)
+                position.quantity = held
                 position.status = "DUST_PENDING"
-                position.dust_qty_canonical = snapped
+                position.dust_qty_canonical = held
                 position.dust_detected_at = time.time()
                 await self._persist_position_to_sqlite(position)
                 self._metrics_reconciliation_adjustments += 1
@@ -6676,7 +6676,18 @@ class PortfolioEngine:
             try:
                 if symbol not in self.open_positions:
                     return  # Idempotent: already cleaned
-                dust_qty = position.quantity
+                dust_qty = float(position.quantity or 0.0)
+                if dust_qty > 1e-12:
+                    position.status = "DUST_PENDING"
+                    position.dust_detected_at = time.time()
+                    position.dust_qty_canonical = dust_qty
+                    await self._persist_position_to_sqlite(position)
+                    logger.info(
+                        "DUST_PRESERVED_NOT_WRITEOFF symbol=%s qty=%.12g — real inventory kept",
+                        symbol,
+                        dust_qty,
+                    )
+                    return
                 dust_entry = position.entry_price
                 dust_notional = dust_qty * dust_entry if dust_qty > 0 and dust_entry > 0 else 0.0
                 hold_seconds = int(time.time() - position.entry_time) if position.entry_time else 0
@@ -9203,6 +9214,49 @@ class PortfolioEngine:
                     return None
         except Exception:
             logger.exception("LAST_LOOK_PRE_BUY_ERROR symbol=%s", normalized_symbol)
+        try:
+            from backend.services.day_active_market_bundle import resolve_pre_buy_day_structure_bundle
+            from backend.services.day_controlled_exits import evaluate_completed_4h_buy_hard_safety
+            from backend.services.day_regime_router import _mtf_bundle
+
+            fourh_px = float(fill_price or price or 0.0)
+            ctx_4h, _ = self._get_context_payload(normalized_symbol)
+            dd_4h: dict[str, Any] = {}
+            if ctx_4h:
+                dd_4h.update(ctx_4h)
+            fourh = evaluate_completed_4h_buy_hard_safety(
+                mark=fourh_px,
+                bundle=resolve_pre_buy_day_structure_bundle(normalized_symbol, _mtf_bundle(dd_4h, ctx_4h)),
+            )
+            if not fourh.get("allowed"):
+                logger.warning(
+                    "BUY_BLOCKED_COMPLETED_4H_ALREADY_INVALID symbol=%s mark=%.8f prior_4h_low=%s current_4h_close=%s",
+                    normalized_symbol,
+                    fourh_px,
+                    fourh.get("prior_4h_low"),
+                    fourh.get("current_4h_close"),
+                )
+                await self._record_reject(
+                    normalized_symbol,
+                    "BUY",
+                    "COMPLETED_4H_ALREADY_INVALID",
+                    "HARD_SAFETY",
+                    decision_id=decision_id,
+                    explainability=explainability,
+                    audit_context_extra={"completed_4h": fourh},
+                )
+                if decision_id:
+                    await self._update_pipeline_decision(
+                        decision_id,
+                        {
+                            "stage": "EXECUTION",
+                            "execution_result": "NOT_EXECUTED",
+                            "execution_reason": "HARD_SAFETY_REJECTED:COMPLETED_4H_ALREADY_INVALID",
+                        },
+                    )
+                return None
+        except Exception:
+            logger.exception("COMPLETED_4H_HARD_SAFETY_ERROR symbol=%s", normalized_symbol)
         fee = quantity * fill_price * exec_fee_rate
         notional = quantity * fill_price
         total_cost = notional + fee
@@ -11395,10 +11449,21 @@ class PortfolioEngine:
                     actual_sold_qty = self._floor_to_step(actual_sold_qty, qty_step)
                 is_dust, qty_quantized, dust_reason, est_notional = self._dust_check(symbol, actual_sold_qty, price)
                 if is_dust:
-                    # One write-off per residual. The same residual was being
-                    # written off on every monitor cycle (four times in 70s for
-                    # a single BTC 1e-05 leftover), each time booking another
-                    # DUST_WRITEOFF row at the full residual notional.
+                    residual = float(actual_sold_qty or 0.0)
+                    if residual > 0:
+                        position.quantity = residual
+                        position.status = "DUST_PENDING"
+                        position.dust_detected_at = time.time()
+                        position.dust_qty_canonical = residual
+                        await self._persist_position_to_sqlite(position)
+                        logger.warning(
+                            "LIVE_SELL_DUST_PRESERVED symbol=%s qty=%s reason=%s est_notional=%s",
+                            symbol,
+                            residual,
+                            dust_reason,
+                            residual * float(price or 0.0),
+                        )
+                        return None
                     prev = self._dust_writeoff_seen.get(symbol)
                     if prev is not None and abs(float(prev) - float(qty_quantized)) <= max(1e-12, abs(float(prev)) * 1e-9):
                         logger.info(
@@ -11420,17 +11485,12 @@ class PortfolioEngine:
                         dust_reason,
                         est_notional,
                     )
-                    # === DUST_INVARIANT_LOCK ===
-                    # BUG #1 FIX: Acquire deletion lock to prevent reconciliation race
-                    # Position status update must be atomic with respect to reconciliation
                     async with self._deletion_lock:
-                        # If qty quantizes to 0, mark DUST_PENDING so invariants do not pause trading
                         if qty_quantized <= 0:
                             position.status = "DUST_PENDING"
                             position.dust_detected_at = time.time()
                             position.dust_qty_canonical = position.quantity
                         logger.warning("DUST_PENDING_ENTER: %s qty_quantized=0 reason=%s", symbol, dust_reason)
-                        # === END DUST_INVARIANT_LOCK ===
                 else:
                     logger.warning(
                         "LIVE_SELL: Protected limit %s qty=%.8f exit=%s",
@@ -11966,15 +12026,18 @@ class PortfolioEngine:
             expected_remainder = float(Decimal(str(position.quantity)) - Decimal(str(quantity)))
             position.quantity -= quantity
             position.quantity = self._floor_to_step(position.quantity, qty_step)
-            if position.quantity <= 0 and expected_remainder > 0 and qty_step > 0:
-                expected_snapped = self._floor_to_step(expected_remainder, qty_step)
-                if expected_snapped > 0:
-                    position.quantity = expected_snapped
+            if position.quantity <= 0 and expected_remainder > 0:
+                position.quantity = expected_remainder
             is_dust = False
             if position.quantity <= 0 or (min_qty > 0 and position.quantity < min_qty) or (min_notional > 0 and fill_price > 0 and (position.quantity * fill_price) < min_notional):
                 is_dust = True
-            if is_dust and position.quantity <= 0:
+            if is_dust and expected_remainder > 0:
                 position.quantity = expected_remainder
+                position.status = "DUST_PENDING"
+                position.dust_detected_at = time.time()
+                position.dust_qty_canonical = expected_remainder
+                await self._persist_position_to_sqlite(position)
+            elif is_dust and position.quantity <= 0:
                 await self._remove_dust_position_canonical_cleanup(symbol, position)
             elif is_dust and position.quantity > 0:
                 position.status = "DUST_PENDING"

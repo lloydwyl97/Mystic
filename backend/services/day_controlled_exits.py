@@ -50,6 +50,7 @@ HOLD_4H_RISE = "PATH_AWARE_HOLD_4H_RISE"
 HOLD_4H_MISSING = "PATH_AWARE_HOLD_4H_MISSING"
 HOLD_4H_UNDECIDED = "PATH_AWARE_HOLD_4H_UNDECIDED"
 BUY_BLOCKED_SPIKE_FADE = "BUY_BLOCKED_SPIKE_FADE"
+COMPLETED_4H_ALREADY_INVALID = "COMPLETED_4H_ALREADY_INVALID"
 
 # Reasons that are allowed to full-flatten a DAY position. Anything else holds.
 DAY_FULL_FLATTEN_REASONS = frozenset(
@@ -1868,6 +1869,28 @@ def last_look_buy_mark(
     """
     marks = [float(x) for x in (decision_price, expected_fill, best_bid, best_ask, limit_price) if x is not None and float(x or 0.0) > 0.0]
     return min(marks) if marks else 0.0
+
+
+def evaluate_completed_4h_buy_hard_safety(
+    *,
+    mark: float,
+    bundle: dict[str, Any] | None,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    """Same completed-4H snapshot and invalidation the exit monitor uses.
+
+    If that snapshot is already broken, a BUY would be sold immediately as
+    ``DAY_4H_STRUCTURE_BREAK_EXIT``. That is hard safety, not a trade opinion.
+    """
+    px = float(mark or 0.0)
+    snap = day_4h_structure_snapshot(bundle, current_price=px if px > 0 else None, now_epoch=now_epoch)
+    broken = bool(snap.get("htf_4h_rise_broken"))
+    return {
+        "allowed": not broken,
+        "block_reason": COMPLETED_4H_ALREADY_INVALID if broken else "",
+        "immediate_exit_reason": EXIT_DAY_4H_STRUCTURE_BREAK if broken else "",
+        **snap,
+    }
 
 
 def evaluate_pre_buy_exit_consistency(

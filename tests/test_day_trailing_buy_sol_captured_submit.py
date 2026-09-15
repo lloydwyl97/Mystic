@@ -10,7 +10,7 @@ from __future__ import annotations
 import inspect
 import time
 from decimal import Decimal
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -285,7 +285,11 @@ async def test_sol_trailing_authority_reaches_execute_and_skips_soft_verdict(tmp
                 "filled": float(SOL_QTY),
             }
 
-    out = await _submit_claimed(_Eng(), intent, float(SOL_TRIGGER_ASK))
+    with patch(
+        "backend.services.day_active_market_bundle.resolve_pre_buy_day_structure_bundle",
+        return_value={},
+    ):
+        out = await _submit_claimed(_Eng(), intent, float(SOL_TRIGGER_ASK))
     assert out is not None
     assert out["outcome"] == FILL_ADOPTED
     assert called["entry_authority"] == ENTRY_AUTHORITY
@@ -343,7 +347,11 @@ async def test_sol_exchange_rejection_is_terminal_with_reason(tmp_path):
             calls.append(kwargs)
 
     engine = _Eng()
-    out = await _submit_claimed(engine, intent, float(SOL_TRIGGER_ASK))
+    with patch(
+        "backend.services.day_active_market_bundle.resolve_pre_buy_day_structure_bundle",
+        return_value={},
+    ):
+        out = await _submit_claimed(engine, intent, float(SOL_TRIGGER_ASK))
     assert out is None
     assert len(calls) == 1
     assert engine.last_buy_outcome.startswith(EXCHANGE_REJECTED)
