@@ -2339,6 +2339,7 @@ class PortfolioEngine:
         # Atomic entry reservations (cash/slot/symbol) held until fill or release
         self._entry_reservations: dict[str, dict[str, Any]] = {}
         self.last_buy_reject_reason: str = ""
+        self.last_buy_outcome: str = ""
 
         # Item 7: Scoreboard
         self._startup_timestamp = time.time()
@@ -8397,11 +8398,13 @@ class PortfolioEngine:
                 symbol,
                 entry_authority or "missing",
             )
+            self.last_buy_reject_reason = "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH"
             return None
         normalized_symbol_for_lock = normalize_symbol(symbol)
         # PE-3: Hard-gate — only DAY_TRADE_SYMBOLS may execute buys.
         if _to_api_symbol(symbol) not in DAY_TRADE_SYMBOLS:
             logger.debug("[BUY_GATE] %s not in trading universe, rejecting from execute_buy_fifo", symbol)
+            self.last_buy_reject_reason = "SYMBOL_NOT_EXECUTABLE"
             return None
         lock = self._buy_execution_locks.setdefault(normalized_symbol_for_lock, asyncio.Lock())
         async with lock:
@@ -8448,6 +8451,10 @@ class PortfolioEngine:
         Updates authoritative ledger on success and persists to SQLite + audit.
         """
         self.last_buy_reject_reason = ""
+        self.last_buy_outcome = ""
+        from backend.config.day_entry_execution import is_trailing_buy_confirmed
+
+        trailing_confirmed = is_trailing_buy_confirmed(entry_authority)
         # Capture pre-ledger for audit
         pre_ledger = {
             "cash_balance": self.cash_balance,
@@ -8516,7 +8523,14 @@ class PortfolioEngine:
 
         # Fail-closed for all DAY paths — no ML artifact bypass (day_aw_owner_v1).
         ok_ac, ac_code, ac_detail = evaluate_explainability_artifact_contract(explainability)
-        if not ok_ac:
+        if not ok_ac and trailing_confirmed:
+            logger.info(
+                "TELEMETRY_ARTIFACT_CONTRACT symbol=%s code=%s detail=%s (DAY_TRAILING_BUY_CONFIRMED — not enforced)",
+                symbol,
+                ac_code,
+                ac_detail,
+            )
+        elif not ok_ac:
             logger.warning(
                 "BUY_BLOCKED_ARTIFACT_CONTRACT: %s code=%s detail=%s",
                 symbol,
@@ -8562,7 +8576,14 @@ class PortfolioEngine:
         self._hydrate_explainability_entry_context_from_redis_if_missing(normalize_symbol(symbol), explainability)
 
         ok_ec, ec_code, ec_detail = evaluate_explainability_at_execution(explainability)
-        if not ok_ec:
+        if not ok_ec and trailing_confirmed:
+            logger.info(
+                "TELEMETRY_ENTRY_CONTEXT symbol=%s code=%s detail=%s (DAY_TRAILING_BUY_CONFIRMED — not enforced)",
+                symbol,
+                ec_code,
+                ec_detail,
+            )
+        elif not ok_ec:
             redis_ctx_ts_utc = ""
             try:
                 redis_ctx_payload, _redis_ctx_age = self._get_context_payload(symbol)
@@ -8667,7 +8688,13 @@ class PortfolioEngine:
                 context_payload=ctx_payload_ec,
                 thesis_score=float(getattr(explainability, "thesis_score", 0.0) or 0.0),
             )
-            if not consistency.get("allowed"):
+            if not consistency.get("allowed") and trailing_confirmed:
+                logger.info(
+                    "TELEMETRY_ENTRY_EXIT_CONSISTENCY symbol=%s reason=%s (DAY_TRAILING_BUY_CONFIRMED — not enforced)",
+                    symbol,
+                    consistency.get("block_reason"),
+                )
+            elif not consistency.get("allowed"):
                 block_code = str(consistency.get("block_reason") or "ENTRY_EXIT_INCONSISTENT")
                 logger.warning(
                     "BUY_BLOCKED_ENTRY_EXIT_INCONSISTENT symbol=%s reason=%s immediate=%s invalid_at_entry=%s",
@@ -8696,25 +8723,32 @@ class PortfolioEngine:
                     )
                 return None
         except Exception as exc:
-            logger.exception("BUY_BLOCKED_ENTRY_EXIT_CONSISTENCY_ERROR symbol=%s err=%s", symbol, exc)
-            await self._record_reject(
-                symbol,
-                "BUY",
-                f"entry_exit_consistency_error:{exc!s}",
-                "ENTRY_EXIT_INCONSISTENT",
-                decision_id=decision_id,
-                explainability=explainability,
-            )
-            if decision_id:
-                await self._update_pipeline_decision(
-                    decision_id,
-                    {
-                        "stage": "EXECUTION",
-                        "execution_result": "NOT_EXECUTED",
-                        "execution_reason": "ENTRY_EXIT_INCONSISTENT:gate_error",
-                    },
+            if trailing_confirmed:
+                logger.info(
+                    "TELEMETRY_ENTRY_EXIT_CONSISTENCY_ERROR symbol=%s err=%s (DAY_TRAILING_BUY_CONFIRMED — not enforced)",
+                    symbol,
+                    exc,
                 )
-            return None
+            else:
+                logger.exception("BUY_BLOCKED_ENTRY_EXIT_CONSISTENCY_ERROR symbol=%s err=%s", symbol, exc)
+                await self._record_reject(
+                    symbol,
+                    "BUY",
+                    f"entry_exit_consistency_error:{exc!s}",
+                    "ENTRY_EXIT_INCONSISTENT",
+                    decision_id=decision_id,
+                    explainability=explainability,
+                )
+                if decision_id:
+                    await self._update_pipeline_decision(
+                        decision_id,
+                        {
+                            "stage": "EXECUTION",
+                            "execution_result": "NOT_EXECUTED",
+                            "execution_reason": "ENTRY_EXIT_INCONSISTENT:gate_error",
+                        },
+                    )
+                return None
 
         bm_payload = {"buy_margin": getattr(explainability, "entry_buy_margin", None)}
         buy_margin_exec = resolve_buy_margin_from_payload(bm_payload)
@@ -8812,7 +8846,7 @@ class PortfolioEngine:
         can_proceed, regime_reason = self._check_regime_guards(symbol, bar_timestamp)
         if not can_proceed:
             logger.info("TELEMETRY_REGIME_GUARD symbol=%s reason=%s", symbol, regime_reason)
-            if ENABLE_REGIME_ENFORCEMENT:
+            if ENABLE_REGIME_ENFORCEMENT and not trailing_confirmed:
                 logger.warning("BUY_BLOCKED_REGIME_GUARD: %s - %s", symbol, regime_reason)
                 await self._record_reject(
                     symbol,
@@ -8978,7 +9012,13 @@ class PortfolioEngine:
         self._log_day_rise_rank_telemetry(normalized_symbol)
 
         slot_blocked, slot_why = self._intact_4h_slot_block(normalized_symbol)
-        if slot_blocked:
+        if slot_blocked and trailing_confirmed:
+            logger.info(
+                "TELEMETRY_4H_SLOT_CAP symbol=%s reason=%s (DAY_TRAILING_BUY_CONFIRMED — not enforced)",
+                normalized_symbol,
+                slot_why,
+            )
+        elif slot_blocked:
             logger.info("DAY_ENTRY_BLOCKED_4H_SLOT_CAP symbol=%s reason=%s", normalized_symbol, slot_why)
             await self._record_reject(
                 normalized_symbol,
@@ -9127,7 +9167,13 @@ class PortfolioEngine:
                     context_payload=ctx_ll,
                     thesis_score=float(getattr(explainability, "thesis_score", 0.0) or 0.0),
                 )
-                if not look.get("allowed"):
+                if not look.get("allowed") and trailing_confirmed:
+                    logger.info(
+                        "TELEMETRY_LAST_LOOK symbol=%s reason=%s (DAY_TRAILING_BUY_CONFIRMED — not enforced)",
+                        normalized_symbol,
+                        look.get("block_reason"),
+                    )
+                elif not look.get("allowed"):
                     block_code = str(look.get("block_reason") or "ENTRY_EXIT_INCONSISTENT")
                     logger.warning(
                         "BUY_BLOCKED_LAST_LOOK symbol=%s look_px=%.8f decision_px=%.8f reason=%s",
@@ -12781,8 +12827,16 @@ class PortfolioEngine:
                 logger.info(f"BUY_BLOCKED_MAX_POSITIONS: {symbol} - portfolio full (active={active_count}, pending_slots={pending_slots}, total={len(self.open_positions)}/{max_positions_limit})")
                 return False, "MAX_POSITIONS_REACHED"
 
+        from backend.config.day_entry_execution import trailing_buy_mode_active
+
         slot_blocked, slot_why = self._intact_4h_slot_block(symbol)
-        if slot_blocked:
+        if slot_blocked and trailing_buy_mode_active():
+            logger.info(
+                "TELEMETRY_4H_SLOT_CAP symbol=%s reason=%s (trailing-buy mode — not enforced)",
+                symbol,
+                slot_why,
+            )
+        elif slot_blocked:
             return False, slot_why
 
         # NON-BLOCKING BY DESIGN: bear regime is advisory context for ranking/sizing,
@@ -20504,6 +20558,8 @@ class PortfolioEngine:
         audit_context_extra: dict[str, Any] | None = None,
     ) -> None:
         """Record a rejected trade attempt"""
+        if str(side or "").upper() == "BUY":
+            self.last_buy_reject_reason = str(reason or "")
 
         def _sync_insert():
             def _op():

@@ -15,6 +15,7 @@ from backend.config.day_entry_execution import (
     trailing_buy_mode_status,
 )
 from backend.config.execution_cost_model import honest_all_in_rt_pct
+from backend.services.day_entry_spendable import is_terminal_buy_cash_reason, money
 from backend.services.day_path_input_validity import parse_bar_ts
 from backend.services.day_trailing_buy_store import (
     CANCELED,
@@ -46,6 +47,75 @@ def _bar_epoch(ts: Any) -> int:
 
 ENTRY_AUTHORITY = ENTRY_AUTHORITY_TRAILING_BUY
 DAY_TRADE_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
+ORDER_ACCEPTED = "ORDER_ACCEPTED"
+FILL_ADOPTED = "FILL_ADOPTED"
+HARD_SAFETY_REJECTED = "HARD_SAFETY_REJECTED"
+EXCHANGE_REJECTED = "EXCHANGE_REJECTED"
+TRANSIENT_RETRY = "TRANSIENT_RETRY"
+AMBIGUOUS_RECONCILE = "AMBIGUOUS_RECONCILE"
+BELOW_MIN_NOTIONAL = "BELOW_MIN_NOTIONAL"
+INTENT_EXPIRED = "INTENT_EXPIRED"
+
+_TRANSIENT_MARKERS = (
+    "LIVE_BUY_ERROR",
+    "TIMEOUT",
+    "RATE_LIMIT",
+    "TRANSIENT",
+    "PROTECTED_LIMIT_BUY_NOT_FILLED",
+    "NETWORK",
+    "CONNECTION",
+    "EXIT_MARK_STALE",
+    "PROTECTED_PREFLIGHT",
+)
+_MIN_NOTIONAL_MARKERS = ("BELOW_MIN_NOTIONAL", "below_min_notional")
+_EXCHANGE_MARKERS = ("EXCHANGE_REJECTED", "BINANCE", "-2010", "-1013", "-2011", "-1015")
+_DETERMINISTIC_MARKERS = (
+    "ARTIFACT_CONTRACT",
+    "ENTRY_CONTEXT",
+    "ENTRY_EXIT",
+    "INSUFFICIENT_CASH",
+    "INSUFFICIENT_EXECUTABLE",
+    "KILL",
+    "TRADING_PAUSED",
+    "HARD_FUSE",
+    "LIVE_TEST_GATE",
+    "LIVE_EXECUTION_UNAVAILABLE",
+    "POSITION_ALREADY_OPEN",
+    "PENDING_BUY",
+    "ENTRY_RESERVED",
+    "THESIS_4H",
+    "MAX_POSITIONS",
+    "ACCOUNT_OVERALLOCATED",
+    "DELEVERAGING",
+    "EXCHANGE_CONSTRAINT",
+    "SYMBOL_NOT_EXECUTABLE",
+    "BUY_BLOCKED_LEGACY",
+    "CASH_INVARIANT",
+    "HARD_SAFETY",
+    "STALE_MARKET",
+    "LAST_LOOK",
+)
+
+
+def classify_trailing_submit_outcome(reject: str) -> tuple[str, bool]:
+    """Map execute_buy_fifo reject text to an explicit outcome and retry flag."""
+    text = str(reject or "").strip()
+    upper = text.upper()
+    if not text:
+        return f"{AMBIGUOUS_RECONCILE}:UNSPECIFIED", False
+    if upper == "TIMEOUT" or upper.startswith("INTENT_EXPIRED"):
+        return INTENT_EXPIRED, False
+    if any(marker in text or marker.upper() in upper for marker in _MIN_NOTIONAL_MARKERS):
+        return BELOW_MIN_NOTIONAL if upper == "BELOW_MIN_NOTIONAL" else f"{BELOW_MIN_NOTIONAL}:{text}", False
+    if any(marker in upper for marker in _EXCHANGE_MARKERS) and "LIVE_BUY_ERROR" not in upper:
+        return f"{EXCHANGE_REJECTED}:{text}", False
+    if any(marker in upper for marker in _TRANSIENT_MARKERS):
+        return f"{TRANSIENT_RETRY}:{text}", True
+    if is_terminal_buy_cash_reason(text) or any(marker in upper for marker in _DETERMINISTIC_MARKERS):
+        return f"{HARD_SAFETY_REJECTED}:{text}", False
+    if "AMBIGUOUS" in upper or "UNCONFIRMED" in upper:
+        return f"{AMBIGUOUS_RECONCILE}:{text}", False
+    return f"{HARD_SAFETY_REJECTED}:{text}", False
 
 
 def _api(symbol: str) -> str:
@@ -523,7 +593,7 @@ async def _pre_submit_safety(engine: Any, intent: dict[str, Any], ask: float) ->
                 requested_qty=intent.get("quantity") or 0,
                 price=ask,
                 commission_rate=MAKER_FEE if USE_PROTECTED_LIMIT_EXECUTION else TAKER_FEE,
-                spendable=float(getattr(engine, "_available_balance", 0.0) or 0.0) - float(pending_other),
+                spendable=money(getattr(engine, "_available_balance", 0) or 0) - money(pending_other),
                 qty_step=constraints.get("qty_step") or 0,
                 min_qty=constraints.get("min_qty") or 0,
                 min_notional=constraints.get("min_notional") or 0,
@@ -556,9 +626,12 @@ async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> di
     explainability = _rebuild_explainability(payload, symbol)
     safe, reason = await _pre_submit_safety(engine, intent, ask)
     if not safe:
+        outcome, _retryable = classify_trailing_submit_outcome(reason)
+        engine.last_buy_outcome = outcome
         mark_terminal(engine.db_path, str(intent["intent_id"]), CANCELED, reason=reason, current_ask=ask)
         engine._release_entry_reservation(symbol, decision_id=str(intent.get("decision_id") or ""), reason=reason)
         logger.info("TRAILING_BUY_SUBMIT_BLOCKED %s %s", symbol, reason)
+        logger.info("TRAILING_BUY_SUBMIT_OUTCOME symbol=%s intent=%s outcome=%s", symbol, intent.get("intent_id"), outcome)
         return None
     result = await engine.execute_buy_fifo(
         symbol=symbol,
@@ -604,6 +677,11 @@ async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> di
         result["entry_authority"] = ENTRY_AUTHORITY
         result["trailing_buy_intent_id"] = intent.get("intent_id")
         result["entry_improvement_bps"] = improvement
+        filled = bool(result.get("fill_id") or result.get("filled") or result.get("average"))
+        outcome = FILL_ADOPTED if filled else ORDER_ACCEPTED
+        result["outcome"] = outcome
+        engine.last_buy_outcome = outcome
+        logger.info("TRAILING_BUY_SUBMIT_OUTCOME symbol=%s intent=%s outcome=%s", symbol, intent.get("intent_id"), outcome)
         logger.info(
             "TRAILING_BUY_FILLED symbol=%s intent=%s fill=%.8f arm_ask=%.8f improvement_bps=%.4f",
             symbol,
@@ -613,26 +691,40 @@ async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> di
             improvement,
         )
         return result
-    from backend.services.day_entry_spendable import is_terminal_buy_cash_reason
-
     reject = str(getattr(engine, "last_buy_reject_reason", "") or "")
-    if is_terminal_buy_cash_reason(reject):
+    outcome, retryable = classify_trailing_submit_outcome(reject)
+    engine.last_buy_outcome = outcome
+    logger.info("TRAILING_BUY_SUBMIT_OUTCOME symbol=%s intent=%s outcome=%s reject=%s", symbol, intent.get("intent_id"), outcome, reject or "UNSPECIFIED")
+    if is_terminal_buy_cash_reason(reject) or (not retryable and outcome.startswith(HARD_SAFETY_REJECTED)):
         mark_terminal(
             engine.db_path,
             str(intent["intent_id"]),
             CANCELED,
-            reason=reject,
+            reason=reject or outcome,
             current_ask=ask,
         )
-        engine._release_entry_reservation(symbol, decision_id=str(intent.get("decision_id") or ""), reason=reject)
-        logger.info("TRAILING_BUY_SUBMIT_TERMINAL %s %s", symbol, reject)
+        engine._release_entry_reservation(symbol, decision_id=str(intent.get("decision_id") or ""), reason=reject or outcome)
+        logger.info("TRAILING_BUY_SUBMIT_TERMINAL %s %s", symbol, reject or outcome)
         return None
-    # execute_buy_fifo returned None: no fill. Retry only if no order was accepted.
-    if release_submitting_for_retry(engine.db_path, str(intent["intent_id"])):
-        logger.info("TRAILING_BUY_SUBMIT_RETRYABLE %s no order accepted", symbol)
-    else:
-        mark_terminal(engine.db_path, str(intent["intent_id"]), FAILED, reason="SUBMIT_UNCONFIRMED")
-        engine._release_entry_reservation(symbol, decision_id=str(intent.get("decision_id") or ""), reason="SUBMIT_UNCONFIRMED")
+    if outcome.startswith(EXCHANGE_REJECTED) or outcome == BELOW_MIN_NOTIONAL or outcome.startswith(f"{BELOW_MIN_NOTIONAL}:"):
+        mark_terminal(
+            engine.db_path,
+            str(intent["intent_id"]),
+            CANCELED,
+            reason=reject or outcome,
+            current_ask=ask,
+        )
+        engine._release_entry_reservation(symbol, decision_id=str(intent.get("decision_id") or ""), reason=reject or outcome)
+        logger.info("TRAILING_BUY_SUBMIT_TERMINAL %s %s", symbol, reject or outcome)
+        return None
+    if outcome.startswith(AMBIGUOUS_RECONCILE):
+        logger.info("TRAILING_BUY_SUBMIT_HOLD %s %s", symbol, outcome)
+        return None
+    if retryable and release_submitting_for_retry(engine.db_path, str(intent["intent_id"])):
+        logger.info("TRAILING_BUY_SUBMIT_RETRYABLE %s %s", symbol, outcome)
+        return None
+    mark_terminal(engine.db_path, str(intent["intent_id"]), FAILED, reason=outcome)
+    engine._release_entry_reservation(symbol, decision_id=str(intent.get("decision_id") or ""), reason=outcome)
     return None
 
 

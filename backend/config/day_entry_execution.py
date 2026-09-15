@@ -46,6 +46,10 @@ def trailing_buy_mode_active() -> bool:
     return ok
 
 
+def is_trailing_buy_confirmed(entry_authority: object) -> bool:
+    return str(entry_authority or "") == ENTRY_AUTHORITY_TRAILING_BUY
+
+
 def trailing_buy_max_wait_seconds() -> int:
     raw = str(os.getenv(MAX_WAIT_ENV, str(DEFAULT_MAX_WAIT_SECONDS)) or "").strip()
     try:
@@ -65,6 +69,7 @@ __all__ = [
     "MODE_ENV",
     "TRAILING_BUY_MODE",
     "VALID_ENTRY_MODES",
+    "is_trailing_buy_confirmed",
     "raw_day_entry_execution_mode",
     "trailing_buy_max_wait_seconds",
     "trailing_buy_mode_active",
