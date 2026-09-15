@@ -516,6 +516,63 @@ async def test_sol_locked_path_without_authority_still_records_artifact(tmp_path
     assert "ARTIFACT_CONTRACT" in str(engine.last_buy_reject_reason)
 
 
+def test_kill_switch_memory_reconciles_from_persisted_resume():
+    """If in-memory kill is PAUSE_BUYS but ledger says RESUME with no breakers, reconcile."""
+    from backend.services.portfolio_engine import KillSwitchMode, PortfolioEngine
+
+    engine = PortfolioEngine.__new__(PortfolioEngine)
+    engine.db_path = ":memory:"
+    engine._kill_switch_mode = KillSwitchMode.PAUSE_BUYS
+    engine._kill_switch_reason = "deploy_trailing_submit_repair"
+
+    from unittest.mock import patch
+
+    persisted_resume = {
+        "requested_kill_mode": "RESUME",
+        "requested_kill_reason": "",
+        "equity_circuit_breaker_active": False,
+        "daily_loss_freeze_active": False,
+        "account_failsafe_active": False,
+    }
+    with patch(
+        "backend.services.circuit_breaker_service.read_persisted_entry_control",
+        return_value=persisted_resume,
+    ):
+        ctrl = engine._effective_entry_control()
+
+    assert ctrl["effective_entry_permitted"] is True
+    assert engine._kill_switch_mode == KillSwitchMode.RESUME
+    assert engine._kill_switch_reason == ""
+
+
+def test_kill_switch_memory_not_reconciled_when_breaker_active():
+    """If a breaker is active, do not reconcile even if requested mode is RESUME."""
+    from backend.services.portfolio_engine import KillSwitchMode, PortfolioEngine
+
+    engine = PortfolioEngine.__new__(PortfolioEngine)
+    engine.db_path = ":memory:"
+    engine._kill_switch_mode = KillSwitchMode.PAUSE_BUYS
+    engine._kill_switch_reason = "deploy"
+
+    from unittest.mock import patch
+
+    persisted_with_breaker = {
+        "requested_kill_mode": "RESUME",
+        "requested_kill_reason": "",
+        "equity_circuit_breaker_active": True,
+        "daily_loss_freeze_active": False,
+        "account_failsafe_active": False,
+    }
+    with patch(
+        "backend.services.circuit_breaker_service.read_persisted_entry_control",
+        return_value=persisted_with_breaker,
+    ):
+        ctrl = engine._effective_entry_control()
+
+    assert ctrl["effective_entry_permitted"] is False
+    assert engine._kill_switch_mode == KillSwitchMode.PAUSE_BUYS
+
+
 def test_no_strategy_or_exit_changes():
     src = inspect.getsource(observe_book)
     assert "REBOUND_CONFIRMED" in src

@@ -18532,6 +18532,16 @@ class PortfolioEngine:
         cb = bool(persisted.get("equity_circuit_breaker_active"))
         freeze = bool(persisted.get("daily_loss_freeze_active"))
         failsafe_p = bool(persisted.get("account_failsafe_active"))
+        if memory_blocked and not requested_blocked and not cb and not freeze and not failsafe_p:
+            logger.info(
+                "KILL_SWITCH_MEMORY_RECONCILED: persisted=RESUME memory_was=%s reason_was=%s",
+                memory_mode,
+                self._kill_switch_reason,
+            )
+            self._kill_switch_mode = KillSwitchMode.RESUME
+            self._kill_switch_reason = ""
+            memory_mode = KillSwitchMode.RESUME.value
+            memory_blocked = False
         blocked = bool(memory_blocked or requested_blocked or cb or freeze or failsafe_p)
         active = None
         reasons: list[str] = []
