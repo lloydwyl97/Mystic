@@ -798,3 +798,144 @@ def test_log_observe_decision_emits_once_per_transition(caplog):
     assert "REBOUND_ABOVE_IMPROVEMENT" in lines[0].getMessage()
     assert "submit_window=" in lines[0].getMessage()
     assert "NEW_LOW" in lines[1].getMessage()
+
+
+class _Expl:
+    def __init__(self):
+        self.entry_provenance = {}
+
+    def to_dict(self):
+        return {"symbol": "ETH/USDT", "side": "BUY"}
+
+
+def _arm_engine(tmp_path):
+    engine = PortfolioEngine.__new__(PortfolioEngine)
+    engine.db_path = str(tmp_path / "arm.db")
+    engine._entry_reservations = {}
+    engine._try_reserve_entry = lambda *_a, **_k: (True, "OK")
+    engine._release_entry_reservation = lambda *_a, **_k: None
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_soft_no_break_does_not_block_wait_dip(tmp_path, monkeypatch, caplog):
+    from backend.services.day_trailing_buy import arm_selected_candidate
+
+    monkeypatch.setenv("DAY_ENTRY_EXECUTION_MODE", "trailing_buy")
+    monkeypatch.setenv("DAY_SETUP_DISCOVERY_ROUTE", "true")
+    monkeypatch.setattr(
+        "backend.services.day_trailing_buy.fresh_executable_book",
+        lambda *_a, **_k: {"ask": 2475.46, "bid": 2475.30, "midpoint": 2475.38, "spread_bps": 0.65, "fresh": True, "freshness_sec": 1.0},
+    )
+    monkeypatch.setattr(
+        "backend.services.day_setup_discovery.classify_setup",
+        lambda *_a, **_k: {
+            "setup_class": "REJECT_NO_SETUP",
+            "reason": "NO_BREAK",
+            "asof_bars": 744,
+            "early_trend_need_bars": 55,
+            "structure_need_minutes": 248,
+        },
+    )
+    monkeypatch.setattr("backend.services.day_path_net.load_recent_bars", lambda *_a, **_k: [])
+    with caplog.at_level("INFO"):
+        out = await arm_selected_candidate(
+            _arm_engine(tmp_path),
+            symbol="ETH/USDT",
+            quantity=0.0251,
+            stop_price=2433.0,
+            atr=31.8,
+            confidence=0.5,
+            bar_timestamp=1,
+            explainability=_Expl(),
+            decision_id="day_ETHUSDT_nobreak",
+            sleeve="ACTIVE",
+            decision_data={"setup_type": "VWAP_REVERSION"},
+            redis_client=None,
+        )
+    assert out is not None
+    assert out["intent"]["status"] == WAIT_DIP
+    assert out["intent"]["order_id"] == ""
+    assert any("TRAILING_BUY_SETUP_TELEMETRY" in r.getMessage() and "NO_BREAK" in r.getMessage() for r in caplog.records)
+    assert not any("TRAILING_BUY_ARM_BLOCKED" in r.getMessage() and "NO_BREAK" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_stale_book_still_blocks_arm(tmp_path, monkeypatch):
+    from backend.services.day_trailing_buy import arm_selected_candidate
+
+    monkeypatch.setenv("DAY_ENTRY_EXECUTION_MODE", "trailing_buy")
+    monkeypatch.setattr("backend.services.day_trailing_buy.fresh_executable_book", lambda *_a, **_k: None)
+    out = await arm_selected_candidate(
+        _arm_engine(tmp_path),
+        symbol="BTC/USDT",
+        quantity=0.001,
+        stop_price=1.0,
+        atr=1.0,
+        confidence=0.5,
+        bar_timestamp=1,
+        explainability=_Expl(),
+        decision_id="d-stale",
+        sleeve="ACTIVE",
+        decision_data={},
+        redis_client=None,
+    )
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_four_ranked_slots_create_four_intents_without_orders(tmp_path, monkeypatch):
+    from backend.services.day_trailing_buy import arm_selected_candidate
+
+    monkeypatch.setenv("DAY_ENTRY_EXECUTION_MODE", "trailing_buy")
+    monkeypatch.setenv("DAY_SETUP_DISCOVERY_ROUTE", "true")
+    monkeypatch.setattr(
+        "backend.services.day_trailing_buy.fresh_executable_book",
+        lambda *_a, **_k: {"ask": 100.0, "bid": 99.9, "midpoint": 99.95, "spread_bps": 1.0, "fresh": True, "freshness_sec": 1.0},
+    )
+    monkeypatch.setattr(
+        "backend.services.day_setup_discovery.classify_setup",
+        lambda *_a, **_k: {"setup_class": "REJECT_NO_SETUP", "reason": "NO_BREAK", "asof_bars": 744},
+    )
+    monkeypatch.setattr("backend.services.day_path_net.load_recent_bars", lambda *_a, **_k: [])
+    engine = _arm_engine(tmp_path)
+    armed = []
+    for sym in ("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"):
+        out = await arm_selected_candidate(
+            engine,
+            symbol=sym,
+            quantity=0.01,
+            stop_price=1.0,
+            atr=1.0,
+            confidence=0.5,
+            bar_timestamp=1,
+            explainability=_Expl(),
+            decision_id=f"d-{sym}",
+            sleeve="ACTIVE",
+            decision_data={},
+            redis_client=None,
+        )
+        armed.append(out)
+    assert all(row and row["intent"]["status"] == WAIT_DIP for row in armed)
+    assert all(row["intent"]["order_id"] == "" for row in armed)
+    assert len({row["intent"]["symbol"] for row in armed}) == 4
+    src = inspect.getsource(PortfolioEngine.execute_buy_fifo)
+    assert "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH" in src
+
+
+def test_captured_rebound_still_reaches_cash_aware_submit():
+    from backend.services.day_trailing_buy import observe_book
+
+    eth = {
+        "status": TRAIL_LOW,
+        "arm_ask": 2481.73,
+        "min_dip_bps": 14.0,
+        "rebound_bps": 4.0,
+        "required_improvement_bps": 10.0,
+        "lowest_ask": 2474.01,
+        "lowest_ask_ts": 1.0,
+        "expires_at": 9_999_999.0,
+    }
+    d = observe_book(eth, ask=2475.46, now=10.0, book_fresh=True)
+    assert d.action == "submit"
+    assert "plan_executable_buy" in inspect.getsource(PortfolioEngine._execute_buy_fifo_locked)

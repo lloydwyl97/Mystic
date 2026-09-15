@@ -242,17 +242,13 @@ def intent_invalid_reason(
     symbol = str(intent.get("symbol") or "")
     if bars:
         ms = market_structure(bars, ts=int(now), atr=atr, ask=ask)
-        if is_extended(ms):
-            return "EXCESSIVELY_EXTENDED"
-        if not structure_intact(ms) and str(intent.get("setup") or "") not in {"RANGE_BOUNCE", "FAILED_BREAKDOWN_REVERSAL"}:
+        px = float(ms.get("price") or 0.0)
+        low4 = float(ms.get("low_240") or 0.0)
+        if px > 0 and low4 > 0 and px <= low4:
             return "STRUCTURE_BROKEN"
         ev = float(intent.get("predicted_ev") or 0.0)
         if ev > 0 and ev <= honest_all_in_rt_pct(symbol):
             return "POST_COST_EDGE_GONE"
-    elif atr > 0 and ask > 0:
-        arm = float(intent.get("arm_ask") or 0.0)
-        if arm > 0 and (ask - arm) / arm * 1e4 >= 0.25 * (atr / arm) * 1e4:
-            return "EXCESSIVELY_EXTENDED"
     return ""
 
 

@@ -149,6 +149,21 @@ def test_broken_structure_invalidates_intent():
     assert intent_invalid_reason(intent, ask=99.4, now=1100.0) == "STRUCTURE_BROKEN"
 
 
+def test_no_break_and_negative_returns_are_not_structure_broken():
+    start = 1_700_000_000
+    bars = _bars(start=start, n=240, px=100.0, step=-0.01)
+    intent = {"arm_ts": float(start + 240 * 60), "arm_ask": 100.0, "atr": 2.0, "setup": "VWAP_REVERSION"}
+    assert intent_invalid_reason(intent, ask=97.6, now=float(start + 240 * 60 + 10), bars=bars) == ""
+
+
+def test_completed_4h_low_break_is_structure_broken():
+    start = 1_700_000_000
+    bars = _bars(start=start, n=240, px=100.0, step=0.0)
+    low = min(b[3] for b in bars)
+    intent = {"arm_ts": float(start + 240 * 60), "arm_ask": 100.0, "atr": 2.0}
+    assert intent_invalid_reason(intent, ask=low, now=float(start + 240 * 60 + 10), bars=bars) == "STRUCTURE_BROKEN"
+
+
 def test_validity_shadow_does_not_cancel_until_enforced(monkeypatch):
     monkeypatch.setenv("DAY_SETUP_VALIDITY_ENFORCE", "false")
     intent = {"arm_ts": 1000.0, "arm_ask": 100.0, "atr": 2.0}

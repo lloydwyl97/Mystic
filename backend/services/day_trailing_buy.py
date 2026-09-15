@@ -11,6 +11,7 @@ from backend.config.day_entry_execution import (
     BOOK_STALE_SEC,
     ENTRY_AUTHORITY_TRAILING_BUY,
     trailing_buy_max_wait_seconds,
+    trailing_buy_mode_active,
     trailing_buy_mode_status,
 )
 from backend.config.execution_cost_model import honest_all_in_rt_pct
@@ -379,7 +380,7 @@ async def arm_selected_candidate(
         discovery = {}
     if not may_arm_setup(discovery):
         logger.info(
-            "TRAILING_BUY_ARM_BLOCKED %s setup_class=%s reason=%s asof=%s early_need=%s structure_need_min=%s",
+            "TRAILING_BUY_SETUP_TELEMETRY %s setup_class=%s reason=%s asof=%s early_need=%s structure_need_min=%s veto=false",
             symbol,
             discovery.get("setup_class"),
             discovery.get("reason"),
@@ -387,7 +388,17 @@ async def arm_selected_candidate(
             discovery.get("early_trend_need_bars"),
             discovery.get("structure_need_minutes"),
         )
-        return None
+        if not trailing_buy_mode_active():
+            logger.info(
+                "TRAILING_BUY_ARM_BLOCKED %s setup_class=%s reason=%s asof=%s early_need=%s structure_need_min=%s",
+                symbol,
+                discovery.get("setup_class"),
+                discovery.get("reason"),
+                discovery.get("asof_bars"),
+                discovery.get("early_trend_need_bars"),
+                discovery.get("structure_need_minutes"),
+            )
+            return None
     notional = float(quantity) * arm_ask
     reserved, reserve_reason = engine._try_reserve_entry(
         symbol,
