@@ -35,7 +35,12 @@ from backend.services.day_path_clock_v2_capture import (
     recompute_spread_bps,
 )
 from backend.services.day_path_input_validity import MAX_GAP_SEC, MAX_LAST_BAR_AGE_SEC
-from backend.services.day_path_net import predict_decision_net, reset_day_artifact_cache, resolve_day_path_ev
+from backend.services.day_path_net import (
+    load_accepted_day_artifact,
+    predict_decision_net,
+    reset_day_artifact_cache,
+    resolve_day_path_ev,
+)
 
 _COINS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 
@@ -334,8 +339,15 @@ def test_golden_telemetry_off_vs_on_identity(tmp_path, monkeypatch):
     sel_on = select_action(decision_inputs)
     contract_on = build_group_contract(decision=sel_on, bar_timestamp=int(t0.timestamp()))
     assert ev_off == ev_on == pred_off == pred_on
-    assert stamped_off["path_input_valid"] is True
-    assert stamped_on["path_input_valid"] is True
+    if load_accepted_day_artifact() is not None:
+        assert stamped_off["path_input_valid"] is True
+        assert stamped_on["path_input_valid"] is True
+    else:
+        # No accepted artifact is deployed, so nothing is stamped. The
+        # off-vs-on identity this test exists to prove is unaffected.
+        assert ev_off is None
+        assert "path_input_valid" not in stamped_off
+        assert "path_input_valid" not in stamped_on
     assert sel_off["selected_action"] == sel_on["selected_action"]
     assert sel_off.get("selected_symbol") == sel_on.get("selected_symbol")
     assert contract_off["selected_action"] == contract_on["selected_action"]

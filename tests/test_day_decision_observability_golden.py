@@ -6,15 +6,18 @@ import json
 
 from backend.config.trading_economics import DAY_TARGET_NOTIONAL_PER_SLOT_USD
 from backend.services.day_decision_observability import build_group_contract, record_day_ranking_group
-from backend.services.day_direct_path_ev_authority import decide_day_bar, select_action
+from backend.services.day_direct_path_ev_authority import HOLD_EV, decide_day_bar, select_action
 
 
 def _fixed_scores():
+    # Offset from the live minimum-EV floor so SOL remains the winner. The
+    # original bare literals predate the floor; under it every coin holds and
+    # the on/off comparison below stops covering a BUY decision.
     return {
-        "btc_path_ev": 0.00015,
-        "eth_path_ev": -0.00010,
-        "sol_path_ev": 0.00040,
-        "xrp_path_ev": 0.00005,
+        "btc_path_ev": HOLD_EV + 0.00015,
+        "eth_path_ev": HOLD_EV - 0.00010,
+        "sol_path_ev": HOLD_EV + 0.00040,
+        "xrp_path_ev": HOLD_EV + 0.00005,
         "path_net_status": "predicted",
         "path_net_model_id": "day_path_net_v1",
         "costs_bps": 6.5,

@@ -13,6 +13,7 @@ from typing import Any
 
 from backend.services.day_decision_observability import build_group_contract
 from backend.services.day_direct_path_ev_authority import (
+    HOLD_EV,
     OLD_RANK_EXECUTION_AUTHORITY,
     old_rank_telemetry,
     select_action,
@@ -32,6 +33,27 @@ SCORES = {
     },
     "path_net_model_id": "day_path_net_v1",
 }
+
+EV_KEYS = ("btc_path_ev", "eth_path_ev", "sol_path_ev", "xrp_path_ev")
+
+
+def _selectable_scores() -> dict[str, Any]:
+    """The captured bar, lifted above the live minimum-EV floor.
+
+    This bar was recorded before ``DAY_MIN_EV_FLOOR`` was raised to its current
+    value, so every EV in it now sits under the floor and production correctly
+    holds. The subject of these tests is the observability capture, not the
+    floor, so lift the whole vector by one constant — preserving the captured
+    ordering (eth > btc > sol > xrp) that selection actually reads — rather
+    than asserting a pre-floor outcome the engine no longer produces.
+    """
+    s = copy.deepcopy(SCORES)
+    lift = (HOLD_EV - min(float(s[k]) for k in EV_KEYS)) + 1e-4
+    if lift > 0:
+        for k in EV_KEYS:
+            s[k] = float(s[k]) + lift
+    return s
+
 
 TRADING_KEYS = (
     "btc_path_ev",
@@ -95,7 +117,7 @@ class _Engine:
 
 def _decide(cands) -> dict[str, Any]:
     nominee, score = old_rank_telemetry(cands)
-    return select_action(copy.deepcopy(SCORES), old_rank_nominee=nominee, old_rank_score=score)
+    return select_action(_selectable_scores(), old_rank_nominee=nominee, old_rank_score=score)
 
 
 def _account():
@@ -214,11 +236,12 @@ def test_hold_decision_is_unchanged_by_capture():
     for key in TRADING_KEYS:
         assert old.get(key) == new.get(key)
     assert new["selected_action"] == "HOLD"
-    assert new["hold_ev"] == 0.0
+    # HOLD carries the live minimum-EV floor, not zero.
+    assert new["hold_ev"] == HOLD_EV
 
 
 def test_path_input_invalid_coin_is_excluded_from_selection_exactly_as_before():
-    scores = copy.deepcopy(SCORES)
+    scores = _selectable_scores()
     scores["valid"]["eth"] = False
     scores["path_input_by_symbol"]["ETHUSDT"] = {
         "path_input_valid": False,

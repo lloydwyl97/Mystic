@@ -17,17 +17,21 @@ from backend.services.day_decision_observability import (
     runtime_account_execution_mode,
     update_day_decision_lifecycle,
 )
-from backend.services.day_direct_path_ev_authority import select_action
+from backend.services.day_direct_path_ev_authority import HOLD_EV, select_action
 from backend.services.day_gate_telemetry import record_day_decision
 
 
 def _decision(**overrides):
+    # EVs are offset from the live minimum-EV floor so ETH stays genuinely
+    # selectable. The original bare literals predate the floor and now all sit
+    # under it, which makes the engine hold and leaves the selection path here
+    # untested.
     base = select_action(
         {
-            "btc_path_ev": 0.0001,
-            "eth_path_ev": 0.0008,
-            "sol_path_ev": 0.0002,
-            "xrp_path_ev": 0.0001,
+            "btc_path_ev": HOLD_EV + 0.0001,
+            "eth_path_ev": HOLD_EV + 0.0008,
+            "sol_path_ev": HOLD_EV + 0.0002,
+            "xrp_path_ev": HOLD_EV + 0.0001,
             "path_net_status": "predicted",
             "path_net_model_id": "day_path_net_v1",
         },
@@ -169,13 +173,16 @@ def test_hold_is_explicit_and_rank_deltas_preserved():
             symbol="ETHUSDT",
             decision_data={
                 "prob_buy": 0.6,
-                "final_selection_score": 0.0008,
+                # Ranking compares a candidate's own score against the decision
+                # path-EV of coins that have no candidate row, so this carries
+                # the same floor offset as _decision().
+                "final_selection_score": HOLD_EV + 0.0008,
                 "intelligence_rank_delta": 0.01,
                 "quality_opinion_penalty": 0.02,
                 "feature_vector": [float(i) for i in range(145)],
             },
         ),
-        SimpleNamespace(symbol="BTCUSDT", decision_data={"prob_buy": 0.4, "final_selection_score": 0.0001}),
+        SimpleNamespace(symbol="BTCUSDT", decision_data={"prob_buy": 0.4, "final_selection_score": HOLD_EV + 0.0001}),
     ]
     contract = build_group_contract(decision=dec, candidates=cands, bar_timestamp=100)
     hold = next(r for r in contract["candidates"] if r["symbol"] == "HOLD")

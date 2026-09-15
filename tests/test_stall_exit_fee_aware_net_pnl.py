@@ -70,6 +70,28 @@ def test_tiny_net_green_never_stalled():
 def test_flat_at_exactly_zero_net_after_fees_never_stalled():
     """net_pnl_pct == 0.0 exactly must hit the >= 0 guard and hold, not stall."""
     current_price = ENTRY * (1.0 + ESTIMATED_ROUNDTRIP_COST)
+    out = evaluate_stall_exit(
+        entry_price=ENTRY,
+        highest_price=current_price,
+        current_price=current_price,
+        net_pnl_pct=0.0,
+        hold_minutes=STALL_ELIGIBLE_HOLD_MIN,
+        max_hold_min=360,
+    )
+    assert out is not None
+    assert out["action"] == "hold"
+    assert out["reason"] == STALL_HOLD_NOT_RED
+
+
+def test_flat_within_float_noise_of_zero_net_never_stalled():
+    """The break-even price does not round to exactly zero net.
+
+    ``(ENTRY * (1 + cost) - ENTRY) / ENTRY - cost`` leaves a residual around
+    1e-18 whose sign is a float artifact, so a break-even position can land
+    either side of the ``>= 0`` guard. Both sides must hold; only the label
+    differs, and neither may stall.
+    """
+    current_price = ENTRY * (1.0 + ESTIMATED_ROUNDTRIP_COST)
     net = _net_pnl_pct(current_price)
     assert abs(net) < 1e-9
     out = evaluate_stall_exit(
@@ -82,7 +104,8 @@ def test_flat_at_exactly_zero_net_after_fees_never_stalled():
     )
     assert out is not None
     assert out["action"] == "hold"
-    assert out["reason"] == STALL_HOLD_NOT_RED
+    assert out["reason"] in {STALL_HOLD_NOT_RED, STALL_HOLD_FLAT_NOT_DEAD}
+    assert out["reason"] != EXIT_STALL_DEAD
 
 
 def test_tiny_net_negative_flat_loss_not_force_stalled():

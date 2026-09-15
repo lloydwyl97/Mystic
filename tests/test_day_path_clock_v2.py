@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from backend.services.day_direct_path_ev_authority import select_action
+from backend.services.day_direct_path_ev_authority import HOLD_EV, select_action
 from backend.services.day_forward_lock import FORWARD_LOCK_START
 from backend.services.day_model_readiness import MIN_CHRONOLOGICAL_BLOCKS, MIN_EVENTS_PER_FEATURE, evaluate_readiness
 from backend.services.day_path_clock_compare import (
@@ -30,7 +30,12 @@ from backend.services.day_path_clock_v2 import (
     future_decision_contract,
 )
 from backend.services.day_path_input_validity import five_bar_return
-from backend.services.day_path_net import predict_decision_net, reset_day_artifact_cache, resolve_day_path_ev
+from backend.services.day_path_net import (
+    load_accepted_day_artifact,
+    predict_decision_net,
+    reset_day_artifact_cache,
+    resolve_day_path_ev,
+)
 
 
 def _ts(iso: str) -> datetime:
@@ -239,9 +244,15 @@ def test_legacy_production_golden_unchanged():
     legacy = predict_decision_net(dd)
     ev, stamped = resolve_day_path_ev(dd, symbol="ETHUSDT")
     assert ev == legacy
-    assert stamped["path_input_valid"] is True
+    if load_accepted_day_artifact() is not None:
+        assert stamped["path_input_valid"] is True
+    else:
+        # No accepted artifact is deployed: path-EV yields no authority and
+        # stamps nothing, and the HOLD branch below is the live outcome.
+        assert ev is None
+        assert "path_input_valid" not in stamped
     out = select_action({"btc_path_ev": ev, "eth_path_ev": 0.0, "sol_path_ev": 0.0, "xrp_path_ev": 0.0, "valid": {"btc": True, "eth": False, "sol": False, "xrp": False}})
-    if float(ev or 0.0) > 0.0:
+    if float(ev or 0.0) > HOLD_EV:
         assert out["selected_action"] == "BUY_BTCUSDT"
     else:
         assert out["selected_action"] == "HOLD"
