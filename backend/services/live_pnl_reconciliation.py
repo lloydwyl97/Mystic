@@ -66,6 +66,7 @@ class SymbolRecon:
     venue_gross_usd: float = 0.0
     matched_fills: int = 0
     matched_recorded_rows: int = 0
+    id_matched_rows: int = 0
     unmatched_recorded_rows: int = 0
     unmatched_venue_fills: int = 0
     qty_coverage_pct: float = 0.0
@@ -102,6 +103,7 @@ class LivePnlReconciliation:
 
     matched_fills: int = 0
     matched_recorded_rows: int = 0
+    id_matched_rows: int = 0
     unmatched_recorded_rows: int = 0
     unmatched_venue_fills: int = 0
     recorded_rows_with_exchange_order_id: int = 0
@@ -287,6 +289,14 @@ def _reconcile_symbol(symbol: str, recorded: dict[str, list[dict[str, Any]]], ve
             elif f["fee_cost"] > 0:
                 rec.venue_fee_base[f["fee_ccy"]] = rec.venue_fee_base.get(f["fee_ccy"], 0.0) + f["fee_cost"]
 
+        # Rows that carry an exchange order id reconcile exactly, with no
+        # inference. Historical rows predate identifier persistence and fall
+        # through to the quantity walk below.
+        for r in rows:
+            oid = str(r.get("order_id") or "").strip()
+            if oid and any(str(f.get("order") or "") == oid for f in vfills):
+                rec.id_matched_rows += 1
+
         # Row-to-fill is many-to-many: the engine writes one row per FIFO lot
         # while the venue reports one fill per partial execution. Pairing 1:1
         # would report most rows unmatched even when every unit is accounted
@@ -363,6 +373,7 @@ async def build_reconciliation(db_path: str) -> LivePnlReconciliation:
         out.live_venue_fee_quote_usd += rec.venue_fee_quote_usd
         out.matched_fills += rec.matched_fills
         out.matched_recorded_rows += rec.matched_recorded_rows
+        out.id_matched_rows += rec.id_matched_rows
         out.unmatched_recorded_rows += rec.unmatched_recorded_rows
         out.unmatched_venue_fills += rec.unmatched_venue_fills
         for f in (venue.get(sym) or {}).get("fills") or []:
@@ -378,7 +389,12 @@ async def build_reconciliation(db_path: str) -> LivePnlReconciliation:
     out.qty_coverage_pct = (100.0 * r_qty / v_qty) if v_qty > 0 else 0.0
 
     if out.recorded_rows_with_exchange_order_id == 0 and out.recorded_live_rows > 0:
-        out.notes.append("No exchange order id is stored on any recorded live row, so fills are paired by quantity and time rather than by id.")
+        out.notes.append(
+            "No exchange order id is stored on any recorded live row, so fills are paired by quantity and time rather than by id. "
+            "Rows written after identifier persistence landed carry the order id and reconcile exactly."
+        )
+    elif out.id_matched_rows:
+        out.notes.append(f"{out.id_matched_rows} row(s) reconciled exactly by exchange order id; the remainder are paired by quantity and time.")
     if abs(out.live_reconciled_usd - out.live_recorded_usd) > 1.0:
         out.notes.append(f"Recorded live P&L (${out.live_recorded_usd:,.2f}) differs from the exchange-reconciled result (${out.live_reconciled_usd:,.2f}).")
     out.notes.append("LEGACY MIXED TOTAL is historical and mixes paper with live. It is not live trading profit.")
@@ -444,6 +460,7 @@ def presentation_fields(recon: dict[str, Any], *, is_live: bool) -> dict[str, An
         "account_execution_mode": "live" if is_live else "paper",
         "matched_fills": int(recon.get("matched_fills") or 0),
         "matched_recorded_rows": int(recon.get("matched_recorded_rows") or 0),
+        "id_matched_rows": int(recon.get("id_matched_rows") or 0),
         "unmatched_recorded_rows": int(recon.get("unmatched_recorded_rows") or 0),
         "unmatched_venue_fills": int(recon.get("unmatched_venue_fills") or 0),
         "exchange_fees_quote_usd": float(recon.get("live_venue_fee_quote_usd") or 0.0),

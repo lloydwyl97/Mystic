@@ -5179,8 +5179,9 @@ class PortfolioEngine:
                         atr_at_entry, entry_bar_timestamp, confidence,
                         fees_paid, slippage_cost, timestamp, status,
                         explainability_json, diagnostics_json, sleeve,
-                        entry_timestamp, decision_id, strategy_id, context_snapshot_json
-                    ) VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?)
+                        entry_timestamp, decision_id, strategy_id, context_snapshot_json,
+                        order_id
+                    ) VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     trade_bind,
                 )
@@ -6562,8 +6563,9 @@ class PortfolioEngine:
                     """INSERT INTO paper_trades (
                         trade_id, paper_run_id, mode, symbol, side, quantity, price,
                         entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
-                        fees_paid, slippage_cost, exit_type, exit_reason, timestamp, status, strategy_id
-                    ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, 0, 'HUMAN_MANUAL_SELL', 'HUMAN_MANUAL_SELL', ?, 'executed', ?)""",
+                        fees_paid, slippage_cost, exit_type, exit_reason, timestamp, status, strategy_id,
+                        order_id
+                    ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, 0, 'HUMAN_MANUAL_SELL', 'HUMAN_MANUAL_SELL', ?, 'executed', ?, ?)""",
                     (
                         sell_trade_id,
                         paper_run_id,
@@ -6578,6 +6580,11 @@ class PortfolioEngine:
                         fee,
                         timestamp,
                         sid,
+                        # This row books a flatten Mystic never ordered, so the
+                        # caller reached it precisely because no fill packet was
+                        # recovered. Persist an id if the venue reported one
+                        # anyway rather than discarding it.
+                        str(fill.get("trade_id") or "") or None,
                     ),
                 )
                 if buy_tid:
@@ -9282,55 +9289,6 @@ class PortfolioEngine:
         except Exception:
             _ctx_snapshot = "{}"
 
-        def _sync_insert():
-            def _op() -> None:
-                with connect_rw(self.db_path) as conn:
-                    conn.execute("BEGIN IMMEDIATE")
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        """
-                        INSERT INTO paper_trades (
-                            trade_id, paper_run_id, mode, symbol, side, quantity, price,
-                            remaining_position, stop_price, take_profit_price,
-                            atr_at_entry, entry_bar_timestamp, confidence,
-                            fees_paid, slippage_cost, timestamp, status,
-                            explainability_json, diagnostics_json, sleeve,
-                            entry_timestamp, decision_id, strategy_id, context_snapshot_json
-                        ) VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                        (
-                            trade_id,
-                            paper_run_id,
-                            buy_mode,
-                            symbol,
-                            quantity,
-                            fill_price,
-                            quantity,  # remaining_position = full quantity
-                            stop_price,
-                            tp1_price,
-                            atr,
-                            bar_timestamp,
-                            confidence,
-                            fee,
-                            slippage_cost,  # ACCOUNTING REPAIR: total cost, not price delta
-                            timestamp,
-                            json.dumps(explainability.to_dict()),
-                            json.dumps(protected_audit),
-                            effective_sleeve,
-                            timestamp,
-                            decision_id or None,
-                            buy_strategy_id,
-                            _ctx_snapshot,
-                        ),
-                    )
-                    conn.commit()
-
-            try:
-                run_locked_retry(_op)
-            except Exception as e:
-                logger.error(f"PAPER_TRADES_BUY_INSERT_FAILED: {symbol} - {e}", exc_info=True)
-                raise  # PE-2: fail-closed — propagate so cash is NOT debited
-
         # =================================================================
         # LIVE EXECUTION: Execute on Binance.US FIRST (C1 fix: never persist executed BUY before order success)
         # LiveAdapter gate: refuse unless EXECUTION_MODE=live AND LIVE_TRADES_ALLOWED=true
@@ -9428,6 +9386,34 @@ class PortfolioEngine:
                     fee,
                     comm.fee_from_exchange,
                 )
+                # Durable exchange identity for this fill, written before the
+                # atomic OPEN so a later commit failure still leaves the venue
+                # order traceable. Append-only; it never rewrites a prior row.
+                try:
+                    from backend.services.live_order_identity import extract_identity, record_fill
+
+                    _identity = extract_identity(
+                        live_order_buy,
+                        symbol=symbol,
+                        side="BUY",
+                        mystic_trade_id=str(trade_id or ""),
+                        intent_id=str(trailing_buy_intent_id or ""),
+                        decision_id=str(decision_id or ""),
+                        client_order_id=str(client_order_id or ""),
+                        fallback_qty=float(quantity),
+                        fallback_price=float(fill_price),
+                        fee_amount=float(fee),
+                        fee_items=list(getattr(comm, "items", ()) or ()),
+                        fee_from_exchange=bool(comm.fee_from_exchange),
+                    )
+                    await asyncio.to_thread(record_fill, self.db_path, _identity)
+                except Exception:
+                    logger.exception(
+                        "LIVE_BUY_IDENTITY_RECORD_FAILED symbol=%s order=%s trade=%s",
+                        symbol,
+                        live_order_buy.get("id"),
+                        trade_id,
+                    )
                 # Record acceptance before anything below can fail. The atomic
                 # OPEN, the cash invariant and the ledger write can all still
                 # abort and return None; the trailing-buy caller then calls
@@ -9633,6 +9619,9 @@ class PortfolioEngine:
             decision_id or None,
             buy_strategy_id,
             _ctx_snapshot,
+            # Exchange order id on the trade row itself, so a FIFO row can be
+            # tied back to the venue without guessing by quantity and time.
+            str((live_order_buy or {}).get("id") or "") or None,
         )
         try:
             await asyncio.to_thread(
@@ -10981,8 +10970,8 @@ class PortfolioEngine:
                                 fees_paid, slippage_cost, exit_type, exit_r_multiple,
                                 timestamp, status, explainability_json, diagnostics_json, sleeve,
                                 exit_reason, entry_timestamp, decision_id, strategy_id,
-                                pnl_usd_net, pnl_pct_net
-                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                pnl_usd_net, pnl_pct_net, order_id
+                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                             (
                                 sell_trade_id,
@@ -11010,6 +10999,7 @@ class PortfolioEngine:
                                 sell_strategy_id,
                                 pnl_usd_net,
                                 pnl_pct_net,
+                                str((live_order_sell or {}).get("id") or "") or None,
                             ),
                         )
                     else:
@@ -11020,8 +11010,8 @@ class PortfolioEngine:
                                 entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
                                 fees_paid, slippage_cost, exit_type, exit_r_multiple,
                                 timestamp, status, explainability_json, diagnostics_json, sleeve,
-                                exit_reason, entry_timestamp, decision_id, strategy_id
-                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                exit_reason, entry_timestamp, decision_id, strategy_id, order_id
+                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                             (
                                 sell_trade_id,
@@ -11047,6 +11037,7 @@ class PortfolioEngine:
                                 entry_ts_bind or None,
                                 buy_decision_id or None,
                                 sell_strategy_id,
+                                str((live_order_sell or {}).get("id") or "") or None,
                             ),
                         )
 
@@ -11599,6 +11590,7 @@ class PortfolioEngine:
                 )
 
         base_qty_reduction = 0.0
+        sell_comm = None
         if dust_writeoff:
             fee = 0.0
             proceeds = 0.0
@@ -11609,6 +11601,7 @@ class PortfolioEngine:
                 from backend.services.live_fill_economics import apply_live_sell_economics, extract_live_commission
 
                 comm = extract_live_commission(live_order_sell, symbol=normalized_symbol, fill_price=fill_price)
+                sell_comm = comm
                 fee, proceeds = apply_live_sell_economics(
                     quantity=quantity,
                     fill_price=fill_price,
@@ -11635,6 +11628,36 @@ class PortfolioEngine:
         pnl_usd_net = realized_pnl  # proceeds already has exit fee deducted; entry fee in entry_cost
         notional = quantity * position.entry_price
         pnl_pct_net = (pnl_usd_net / notional) if notional > 0 else 0.0
+
+        # Durable exchange identity for a confirmed live exit. Written before
+        # the FIFO commit so the venue sell stays traceable even if the local
+        # row fails to persist. Dust write-offs place no order, so they are
+        # deliberately excluded.
+        if live_order_sell and not dust_writeoff:
+            try:
+                from backend.services.live_order_identity import extract_identity, iso_or_blank, record_fill
+
+                _sell_identity = extract_identity(
+                    live_order_sell,
+                    symbol=normalized_symbol,
+                    side="SELL",
+                    mystic_trade_id=str(sell_trade_id or ""),
+                    decision_id=str(getattr(position, "entry_decision_id", "") or ""),
+                    position_entry_ts=iso_or_blank(getattr(position, "entry_time", 0.0)),
+                    fallback_qty=float(quantity),
+                    fallback_price=float(fill_price),
+                    fee_amount=float(fee),
+                    fee_items=list(getattr(sell_comm, "items", ()) or ()),
+                    fee_from_exchange=bool(getattr(sell_comm, "fee_from_exchange", False)),
+                )
+                await asyncio.to_thread(record_fill, self.db_path, _sell_identity)
+            except Exception:
+                logger.exception(
+                    "LIVE_SELL_IDENTITY_RECORD_FAILED symbol=%s order=%s trade=%s",
+                    normalized_symbol,
+                    (live_order_sell or {}).get("id"),
+                    sell_trade_id,
+                )
 
         sell_sqlite_ok = False
         self._exit_in_progress.add(normalized_symbol)

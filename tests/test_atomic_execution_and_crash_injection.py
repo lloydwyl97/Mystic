@@ -60,7 +60,12 @@ def _position(*, symbol: str = "XRP/USDT", qty: float = 100.0, price: float = 1.
     )
 
 
-def _trade_bind(trade_id: str, symbol: str, qty: float, price: float) -> tuple:
+def _trade_bind(trade_id: str, symbol: str, qty: float, price: float, order_id: str | None = None) -> tuple:
+    """Bind tuple for the atomic OPEN, ending with the exchange order id.
+
+    ``order_id`` is the last column; a paper open has none, which is why the
+    default is None here.
+    """
     ts = "2026-08-14T00:00:00+00:00"
     return (
         trade_id,
@@ -85,6 +90,7 @@ def _trade_bind(trade_id: str, symbol: str, qty: float, price: float) -> tuple:
         None,
         "day",
         "{}",
+        order_id,
     )
 
 
