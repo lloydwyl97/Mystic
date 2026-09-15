@@ -9,6 +9,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from backend.services.day_entry_spendable import money
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_SQL = """
@@ -38,6 +40,13 @@ def ensure_reservation_schema(db_path: str | Path) -> None:
     conn = sqlite3.connect(str(db_path), timeout=30)
     try:
         conn.executescript(SCHEMA_SQL)
+        cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(day_entry_reservations)")}
+        if "notional_exact" not in cols:
+            try:
+                conn.execute("ALTER TABLE day_entry_reservations ADD COLUMN notional_exact TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
         conn.commit()
     finally:
         conn.close()
@@ -90,14 +99,15 @@ def create_reservation(
         if sym_hit:
             conn.commit()
             return False, "SYMBOL_RESERVED", ""
+        exact = str(money(notional_usd))
         conn.execute(
             """
             INSERT INTO day_entry_reservations(
                 reservation_id, decision_id, symbol, notional_usd, risk_usd, sleeve,
-                status, created_at, expires_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
+                status, created_at, expires_at, updated_at, notional_exact
+            ) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?)
             """,
-            (rid, did, sym, float(notional_usd), float(risk_usd or 0.0), str(sleeve or ""), now, expires, now),
+            (rid, did, sym, float(exact), float(risk_usd or 0.0), str(sleeve or ""), now, expires, now, exact),
         )
         conn.commit()
         return True, "OK", rid
@@ -182,22 +192,27 @@ def load_active_reservations(db_path: str | Path) -> list[dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT reservation_id, decision_id, symbol, notional_usd, risk_usd, sleeve,
-                   status, created_at, expires_at
+                   status, created_at, expires_at, notional_exact
             FROM day_entry_reservations WHERE status='ACTIVE'
             """
         ).fetchall()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            row = dict(r)
+            row["notional_usd"] = money(row.get("notional_exact") or row.get("notional_usd") or 0)
+            out.append(row)
+        return out
     finally:
         conn.close()
 
 
-def active_notional(db_path: str | Path, *, exclude_decision_id: str = "") -> float:
+def active_notional(db_path: str | Path, *, exclude_decision_id: str = ""):
     rows = load_active_reservations(db_path)
     n = 0.0
     for r in rows:
         if exclude_decision_id and str(r.get("decision_id")) == exclude_decision_id:
             continue
-        n += float(r.get("notional_usd") or 0.0)
+        n += money(r.get("notional_usd") or 0)
     return n
 
 

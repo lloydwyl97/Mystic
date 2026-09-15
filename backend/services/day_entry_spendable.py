@@ -14,6 +14,7 @@ from typing import Any
 
 INSUFFICIENT_EXECUTABLE_CASH_AFTER_QUANTIZATION = "INSUFFICIENT_EXECUTABLE_CASH_AFTER_QUANTIZATION"
 INSUFFICIENT_CASH = "INSUFFICIENT_CASH"
+INSUFFICIENT_CASH_WITH_PENDING = "INSUFFICIENT_CASH_WITH_PENDING"
 
 
 def money(value: object) -> Decimal:
@@ -45,6 +46,33 @@ def floor_to_step(qty: Decimal, step: Decimal) -> Decimal:
 
 def cash_covers(required: Decimal, spendable: Decimal) -> bool:
     return money(required) <= money(spendable)
+
+
+def remaining_slot_cap(*, free_cash: object, remaining_new_slots: object) -> Decimal:
+    """Equal leftover split across remaining new watches. Exact Decimal, no epsilon."""
+    slots = int(remaining_new_slots or 0)
+    if slots <= 0:
+        return Decimal("0")
+    leftover = money(free_cash)
+    if leftover <= 0:
+        return Decimal("0")
+    return leftover / Decimal(slots)
+
+
+def plan_reservation(*, target: object, remaining_cash: object) -> tuple[bool, Decimal, str]:
+    """Reserve min(target, remaining). Last-slot float residue cannot reject a funded slot."""
+    tgt = money(target)
+    rem = money(remaining_cash)
+    if rem <= 0:
+        return False, Decimal("0"), f"{INSUFFICIENT_CASH_WITH_PENDING}: need {tgt} free={max(Decimal('0'), rem)}"
+    if tgt <= 0:
+        return False, Decimal("0"), "INVALID_RESERVATION"
+    reserved = min(tgt, rem)
+    return True, reserved, "OK"
+
+
+def reservations_within_cash(*, reservations: object, open_order_commitments: object = 0, cash: object) -> bool:
+    return money(reservations) + money(open_order_commitments) <= money(cash)
 
 
 def is_terminal_buy_cash_reason(reason: str) -> bool:

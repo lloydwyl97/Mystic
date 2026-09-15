@@ -614,9 +614,11 @@ def test_available_slots_four_when_flat():
 
 
 def test_remaining_slot_cap_lets_fourth_coin_arm():
-    assert remaining_watch_notional_cap(free_cash=227.12, remaining_new_slots=4) == pytest.approx(56.78)
-    assert remaining_watch_notional_cap(free_cash=40.03, remaining_new_slots=1) == pytest.approx(40.03)
-    assert remaining_watch_notional_cap(free_cash=40.03, remaining_new_slots=0) == 0.0
+    from backend.services.day_entry_spendable import money
+
+    assert remaining_watch_notional_cap(free_cash=227.12, remaining_new_slots=4) == money("56.78")
+    assert remaining_watch_notional_cap(free_cash=40.03, remaining_new_slots=1) == money("40.03")
+    assert remaining_watch_notional_cap(free_cash=40.03, remaining_new_slots=0) == money(0)
 
 
 def test_sync_book_redis_ignores_async_client(monkeypatch):

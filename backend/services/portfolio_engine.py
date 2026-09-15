@@ -2781,13 +2781,47 @@ class PortfolioEngine:
                 self._pause_reason = ""
                 logger.info("LIVE_BOOTSTRAP_RECONCILE: Cleared trading_paused (was quantity/canonical mismatch)")
             await self._recompute_positions_values()
-            # Set cash/available from FREE USDT so governor free_usdt matches Binance at startup
+            from backend.services.live_account_basis import (
+                RECON_KEY,
+                SCORECARD_KEY,
+                apply_bootstrap_cash,
+                persist_operational_json,
+                trailing_buy_scorecard,
+            )
+
+            prior_cash = self.cash_balance
+            prior_principal = self.principal
             usdt_free = float(free_balances.get("USDT", 0) or 0)
-            self.cash_balance = usdt_free
-            self._available_balance = max(0.0, usdt_free)
-            # Recompute equity with fresh Binance cash (canonical: equity = cash + positions)
-            self._total_equity = self.cash_balance + self._positions_value
-            self.principal = self._total_equity
+            adopted = apply_bootstrap_cash(
+                stored_principal=prior_principal,
+                previous_cash=prior_cash,
+                exchange_cash=usdt_free,
+                positions_value=self._positions_value,
+            )
+            self.cash_balance = float(adopted["cash"])
+            self._available_balance = max(0.0, float(adopted["cash"]))
+            self._total_equity = float(adopted["equity"])
+            self.principal = float(adopted["principal"])
+            recon = adopted["reconciliation_adjustment"]
+            if recon != 0:
+                persist_operational_json(
+                    str(self.db_path),
+                    RECON_KEY,
+                    {
+                        "adjustment_usd": str(recon),
+                        "previous_cash": str(prior_cash),
+                        "exchange_cash": str(adopted["cash"]),
+                        "counted_as_trading_profit": False,
+                    },
+                )
+                logger.info(
+                    "LIVE_BOOTSTRAP_RECONCILE: cash adopted from exchange prior=%s now=%s recon=%s principal_preserved=%s",
+                    prior_cash,
+                    adopted["cash"],
+                    recon,
+                    adopted["principal"],
+                )
+            persist_operational_json(str(self.db_path), SCORECARD_KEY, trailing_buy_scorecard())
             await self._persist_ledger_to_sqlite()
             self._compute_total_open_risk()
             self._last_live_reconcile_time = time.time()
@@ -3164,8 +3198,22 @@ class PortfolioEngine:
         pruned table erase previously-recorded history.
         """
         try:
-            computed = self._compute_realized_pnl_from_paper_trades()
+            from backend.services.execution_mode_service import is_live_execution_allowed_sync
+
+            live_now = bool(is_live_execution_allowed_sync())
+            computed = self._compute_realized_pnl_from_paper_trades(mode="live" if live_now else None)
             epoch_start = self._forward_paper_epoch_start()
+            if live_now:
+                if abs(computed - self._realized_pnl) > 0.01:
+                    logger.warning(
+                        "REALIZED_PNL_LIVE_SCOPE: ledger $%.8f -> live fills $%.8f (paper/synthetic excluded)",
+                        self._realized_pnl,
+                        computed,
+                    )
+                    self._realized_pnl = computed
+                    self._total_equity = self.cash_balance + self._positions_value
+                    await self._persist_ledger_to_sqlite()
+                return
             healed = max(computed, self._realized_pnl)
             if abs(healed - self._realized_pnl) > 0.01:
                 logger.warning(
@@ -12457,7 +12505,7 @@ class PortfolioEngine:
         reservations = getattr(self, "_entry_reservations", None) or {}
         return set(reservations.keys()) | self._pending_buy_order_symbols()
 
-    def _pending_buy_notional(self, *, exclude_symbol: str = "", exclude_decision_id: str = "") -> float:
+    def _pending_buy_notional(self, *, exclude_symbol: str = "", exclude_decision_id: str = ""):
         from backend.services.day_entry_spendable import money
 
         ex = normalize_symbol(exclude_symbol) if exclude_symbol else ""
@@ -12475,7 +12523,7 @@ class PortfolioEngine:
             if ex and normalize_symbol(getattr(p, "symbol", "") or "") == ex:
                 continue
             n += money(getattr(p, "remaining_qty", 0) or 0) * money(getattr(p, "price", 0) or 0)
-        return float(n)
+        return n
 
     def _own_entry_reservation(self, symbol: str, decision_id: str = "") -> tuple[dict[str, Any], str]:
         ns = normalize_symbol(symbol)
@@ -12523,12 +12571,18 @@ class PortfolioEngine:
         max_positions_limit = MAX_OPEN_POSITIONS
         if active_count + pending_slots >= max_positions_limit:
             return False, "MAX_POSITIONS_WITH_PENDING"
-        from backend.services.day_entry_spendable import cash_covers, money
+        from backend.services.day_entry_spendable import money, plan_reservation, spendable_quote
 
         pending_n = self._pending_buy_notional(exclude_decision_id=did)
-        spendable = money(self._available_balance) - money(pending_n)
-        if not cash_covers(money(notional_usd), spendable):
-            return False, f"INSUFFICIENT_CASH_WITH_PENDING: need {money(notional_usd)} free={max(money(0), spendable)}"
+        spendable = spendable_quote(
+            account_cash=self._available_balance,
+            other_reservations=pending_n,
+            include_own_reservation=False,
+        )
+        ok_res, reserved_amt, res_reason = plan_reservation(target=notional_usd, remaining_cash=spendable)
+        if not ok_res:
+            return False, res_reason
+        notional_usd = reserved_amt
         # Sleeve capacity including pending reserved notional for same sleeve
         if sleeve and ENABLE_SLEEVE_BLOCKING:
             sleeve_pending = sum(float((r or {}).get("notional") or 0.0) for r in (self._entry_reservations or {}).values() if str((r or {}).get("sleeve") or "") == str(sleeve))
@@ -12553,7 +12607,7 @@ class PortfolioEngine:
                     return False, reason_p
                 if reason_p == "IDEMPOTENT_EXISTING":
                     self._entry_reservations[ns] = {
-                        "notional": float(notional_usd),
+                        "notional": money(notional_usd),
                         "risk_usd": float(risk_usd or 0.0),
                         "decision_id": did,
                         "reservation_id": reservation_id,
@@ -12564,7 +12618,7 @@ class PortfolioEngine:
             except Exception as exc:
                 logger.warning("persistent reservation failed (in-memory only): %s", exc)
         self._entry_reservations[ns] = {
-            "notional": float(notional_usd),
+            "notional": money(notional_usd),
             "risk_usd": float(risk_usd or 0.0),
             "decision_id": did,
             "reservation_id": reservation_id,
@@ -12594,8 +12648,10 @@ class PortfolioEngine:
                 ns = normalize_symbol(str(r.get("symbol") or ""))
                 if not ns:
                     continue
+                from backend.services.day_entry_spendable import money
+
                 self._entry_reservations[ns] = {
-                    "notional": float(r.get("notional_usd") or 0.0),
+                    "notional": money(r.get("notional_usd") or 0),
                     "risk_usd": float(r.get("risk_usd") or 0.0),
                     "decision_id": str(r.get("decision_id") or ""),
                     "reservation_id": str(r.get("reservation_id") or ""),
@@ -15765,7 +15821,6 @@ class PortfolioEngine:
             arm_selected_candidate,
             available_economic_slots,
             fresh_executable_book,
-            remaining_watch_notional_cap,
             select_ranked_arm_stream,
         )
         from backend.services.day_trailing_buy_store import load_active_intents
@@ -15831,19 +15886,29 @@ class PortfolioEngine:
             ask = float((book or {}).get("ask") or candidate.current_price or 0.0)
             already_active = {str(row.get("symbol") or "") for row in load_active_intents(self.db_path)}
             remaining_new = max(0, int(slots) - len(already_active))
-            free_cash = float(getattr(self, "_available_balance", 0.0) or 0.0) - float(self._pending_buy_notional())
-            cap = remaining_watch_notional_cap(free_cash=free_cash, remaining_new_slots=remaining_new)
-            if ask > 0 and cap > 0 and (quantity * ask) > cap + 1e-9:
-                quantity = cap / ask
+            from backend.services.day_entry_spendable import money, remaining_slot_cap, spendable_quote
+
+            free_cash = spendable_quote(
+                account_cash=getattr(self, "_available_balance", 0.0) or 0.0,
+                other_reservations=self._pending_buy_notional(),
+            )
+            cap = remaining_slot_cap(free_cash=free_cash, remaining_new_slots=remaining_new)
+            ask_m = money(ask)
+            qty_m = money(quantity)
+            reserved_notional = qty_m * ask_m if ask_m > 0 else money(0)
+            if ask_m > 0 and cap > 0 and reserved_notional > cap:
+                qty_m = cap / ask_m
+                reserved_notional = cap
+                quantity = float(qty_m)
                 logger.info(
-                    "TRAILING_BUY_STREAM_SLOT_CAP symbol=%s cap=%.4f ask=%.8f qty=%.8f remaining_new=%s",
+                    "TRAILING_BUY_STREAM_SLOT_CAP symbol=%s cap=%s ask=%.8f qty=%.8f remaining_new=%s",
                     symbol,
                     cap,
                     ask,
                     quantity,
                     remaining_new,
                 )
-            if quantity <= 0 or cap <= 0:
+            if qty_m <= 0 or cap <= 0:
                 logger.info("TRAILING_BUY_STREAM_SKIP %s NO_REMAINING_SLOT_CASH", symbol)
                 continue
             explainability = TradeExplainability(
@@ -15877,6 +15942,7 @@ class PortfolioEngine:
                 sleeve=getattr(candidate, "sleeve", "") or "",
                 decision_data=dict(candidate.decision_data or {}),
                 redis_client=redis_client,
+                reserved_notional=reserved_notional,
             )
             if not armed or not armed.get("trailing_buy_armed"):
                 continue
@@ -18621,6 +18687,13 @@ class PortfolioEngine:
         )
         performance_equity = equity_views["performance_equity"]
         performance_equity_consistency_ok = abs(account_equity - performance_equity) < 1.0
+        from backend.services.live_account_basis import RECON_KEY, load_operational_json, trailing_buy_scorecard
+
+        recon_row = load_operational_json(str(self.db_path), RECON_KEY)
+        try:
+            recon_adj = float(recon_row.get("adjustment_usd") or 0)
+        except (TypeError, ValueError):
+            recon_adj = 0.0
 
         return {
             # DAY mode (normal repaired strategy — no inventory recovery freeze)
@@ -18683,6 +18756,10 @@ class PortfolioEngine:
             "dust_adjustment_pnl": equity_views["dust_adjustment_pnl"],
             "realized_pnl": mode_pnl["headline_realized_pnl"],
             "unrealized_pnl": self._unrealized_pnl,
+            "contributed_principal": self.principal,
+            "cash_reconciliation_adjustment_usd": recon_adj,
+            "trailing_buy_scorecard": trailing_buy_scorecard(),
+            "lifetime_live_return_usd": float(self._total_equity) - float(self.principal),
             "dust_positions": dust_list,
             "live_dust_quantity": sum(float(getattr(p, "quantity", 0) or 0) for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") == "DUST_PENDING"),
             "live_dust_value": live_dust_value,
@@ -20024,6 +20101,14 @@ class PortfolioEngine:
             "reason": reason,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+    def apply_external_capital_flow(self, amount: float, *, kind: str = "deposit") -> float:
+        """Deposits/withdrawals change contributed principal, not trading P&L."""
+        from backend.services.live_account_basis import apply_external_capital_flow
+
+        self.principal = float(apply_external_capital_flow(self.principal, amount))
+        logger.info("EXTERNAL_CAPITAL_FLOW kind=%s amount=%s principal=%s", kind, amount, self.principal)
+        return self.principal
 
     async def _persist_kill_switch(self) -> None:
         """Persist kill switch state to SQLite"""

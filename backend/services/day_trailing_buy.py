@@ -277,11 +277,11 @@ def available_economic_slots(*, held: int, pending_orders: int, max_positions: i
     return max(0, int(max_positions) - int(held) - int(pending_orders))
 
 
-def remaining_watch_notional_cap(*, free_cash: float, remaining_new_slots: int) -> float:
+def remaining_watch_notional_cap(*, free_cash: object, remaining_new_slots: int):
     """Split leftover cash across remaining new watches so all four can arm."""
-    if remaining_new_slots <= 0:
-        return 0.0
-    return max(0.0, float(free_cash) / float(remaining_new_slots))
+    from backend.services.day_entry_spendable import remaining_slot_cap
+
+    return remaining_slot_cap(free_cash=free_cash, remaining_new_slots=remaining_new_slots)
 
 
 def sync_book_redis(redis_client: Any = None) -> Any:
@@ -324,6 +324,7 @@ async def arm_selected_candidate(
     sleeve: str,
     decision_data: dict[str, Any],
     redis_client: Any,
+    reserved_notional: object | None = None,
 ) -> dict[str, Any] | None:
     ok, err, mode = trailing_buy_mode_status()
     engine.day_entry_execution_error = "" if ok else err
@@ -399,7 +400,9 @@ async def arm_selected_candidate(
                 discovery.get("structure_need_minutes"),
             )
             return None
-    notional = float(quantity) * arm_ask
+    from backend.services.day_entry_spendable import money
+
+    notional = money(reserved_notional) if reserved_notional is not None else money(quantity) * money(arm_ask)
     reserved, reserve_reason = engine._try_reserve_entry(
         symbol,
         notional,
@@ -433,7 +436,7 @@ async def arm_selected_candidate(
             "confidence": float(confidence or 0.0),
             "bar_timestamp": int(bar_timestamp or 0),
             "sleeve": str(sleeve or ""),
-            "notional_usd": notional,
+            "notional_usd": float(notional),
             "thesis_invalid_level": float(decision_data.get("thesis_invalid_level") or getattr(explainability, "thesis_invalid_level", 0.0) or 0.0),
             "reservation_id": str((engine._entry_reservations.get(symbol) or {}).get("reservation_id") or ""),
             "payload": {

@@ -150,8 +150,8 @@ def test_eth_equality_float_reject_now_accepts():
         "BTC/USDT": {"notional": float(ETH_BTC_OTHER), "decision_id": "d-btc", "sleeve": "ACTIVE"},
     }
     pending = engine._pending_buy_notional(exclude_decision_id=ETH_DECISION)
-    assert pending == pytest.approx(float(ETH_SOL_OTHER) + float(ETH_XRP_OTHER) + float(ETH_BTC_OTHER))
-    assert pending < float(ETH_ACCOUNT_CASH) - 1.0
+    assert money(pending) == ETH_SOL_OTHER + ETH_XRP_OTHER + ETH_BTC_OTHER
+    assert money(pending) < ETH_ACCOUNT_CASH - Decimal("1")
 
 
 @pytest.mark.asyncio
