@@ -10,7 +10,7 @@ import sqlite3
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -121,6 +121,50 @@ async def test_reservation_duplicate_still_blocks_and_dust_does_not_fill_slots()
         assert ok2 is False
         assert reason2 == "ENTRY_ALREADY_RESERVED"
         assert all(p.status == "DUST_PENDING" for p in engine.open_positions.values())
+
+
+@pytest.mark.asyncio
+async def test_pre_submit_allows_dust_pending_same_symbol():
+    from backend.services.day_trailing_buy import _pre_submit_safety
+
+    engine = _engine()
+    engine.open_positions["ETH/USDT"] = _pos("ETH/USDT", qty=9.526e-05, status="DUST_PENDING", price=2402.9)
+    engine._can_open_position = AsyncMock(return_value=(True, ""))
+    engine._pending_buy_order_symbols = MagicMock(return_value=set())
+    engine._check_kill_switch_buy = MagicMock(return_value=(True, ""))
+    engine._trading_paused = False
+    with patch(
+        "backend.services.day_active_market_bundle.resolve_pre_buy_day_structure_bundle",
+        return_value={},
+    ):
+        ok, reason = await _pre_submit_safety(
+            engine,
+            {"symbol": "ETH/USDT", "notional_usd": 50.0, "decision_id": "day_ETHUSDT_dust"},
+            2399.65,
+        )
+    assert ok is True, reason
+    assert reason == ""
+    assert engine.open_positions["ETH/USDT"].status == "DUST_PENDING"
+    engine._remove_dust_position_canonical_cleanup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pre_submit_still_blocks_active_same_symbol():
+    from backend.services.day_trailing_buy import _pre_submit_safety
+
+    engine = _engine()
+    engine.open_positions["SOL/USDT"] = _pos("SOL/USDT", qty=0.585, status="ACTIVE", price=97.01)
+    engine._can_open_position = AsyncMock(return_value=(True, ""))
+    engine._pending_buy_order_symbols = MagicMock(return_value=set())
+    engine._check_kill_switch_buy = MagicMock(return_value=(True, ""))
+    engine._trading_paused = False
+    ok, reason = await _pre_submit_safety(
+        engine,
+        {"symbol": "SOL/USDT", "notional_usd": 50.0, "decision_id": "day_SOLUSDT_active"},
+        97.10,
+    )
+    assert ok is False
+    assert reason == "POSITION_ALREADY_OPEN"
 
 
 @pytest.mark.asyncio

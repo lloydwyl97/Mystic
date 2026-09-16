@@ -381,6 +381,28 @@ def _thesis_invalid(intent: dict[str, Any], ask: float) -> bool:
     return bool(level > 0 and ask > 0 and ask <= level)
 
 
+def _open_position_blocks_buy(engine: Any, symbol: str, ns: str) -> bool:
+    """True only for a held lot. DUST_PENDING leftover inventory never blocks a BUY."""
+    open_positions = getattr(engine, "open_positions", None) or {}
+    pos = open_positions.get(ns)
+    if pos is None:
+        pos = open_positions.get(symbol)
+    blocks_fn = getattr(engine, "_day_position_blocks_new_entry", None)
+    if callable(blocks_fn):
+        blocked = bool(blocks_fn(pos))
+    elif pos is None or str(getattr(pos, "status", "ACTIVE") or "ACTIVE") == "DUST_PENDING":
+        blocked = False
+    else:
+        blocked = float(getattr(pos, "quantity", 0) or 0) > 0
+    if pos is not None and not blocked and str(getattr(pos, "status", "") or "") == "DUST_PENDING":
+        logger.info(
+            "TRAILING_BUY_DUST_NOT_HELD symbol=%s qty=%s (does not block BUY)",
+            symbol,
+            getattr(pos, "quantity", 0),
+        )
+    return blocked
+
+
 async def arm_selected_candidate(
     engine: Any,
     *,
@@ -611,7 +633,7 @@ async def _pre_submit_safety(engine: Any, intent: dict[str, Any], ask: float) ->
         ns = CanonicalSymbolFormatter.to_canonical(symbol)
     except Exception:
         ns = symbol
-    if ns in getattr(engine, "open_positions", {}) or symbol in getattr(engine, "open_positions", {}):
+    if _open_position_blocks_buy(engine, symbol, ns):
         return False, "POSITION_ALREADY_OPEN"
     pending = set(engine._pending_buy_order_symbols())
     if ns in pending or symbol in pending:
