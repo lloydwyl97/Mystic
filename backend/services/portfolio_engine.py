@@ -243,9 +243,9 @@ TP2_R_MULTIPLE = 2.0
 MAJOR_COIN_ATR_SL_MULT = 1.8
 MAJOR_COIN_SL_BOUNDS: dict[str, tuple[float, float]] = {
     "BTCUSDT": (0.010, 0.020),
-    "ETHUSDT": (0.012, 0.020),
-    "SOLUSDT": (0.012, 0.020),
-    "XRPUSDT": (0.012, 0.020),
+    "ETHUSDT": (0.010, 0.020),
+    "SOLUSDT": (0.010, 0.020),
+    "XRPUSDT": (0.010, 0.020),
 }
 
 # Phase 3: Exchange symbol constraints TTL (6-12h recommended; Binance filter drift)
@@ -338,12 +338,11 @@ def _symbol_group_baseline(group: str) -> float:
 # these via evaluate_engine_managed_exit (see _check_exit_conditions).
 # =============================================================================
 COIN_PROFILES = {
-    # Session day-trade ceilings (hours, not sub-hour churn).
-    # New stamps use these; evaluate_engine_managed_exit also floors open holds
-    # to the current profile so restarts pick up longer day-trade horizons.
-    "BTCUSDT": {"tp": 0.012, "sl": 0.008, "trail": 0.0020, "max_hold_min": 360},
-    "ETHUSDT": {"tp": 0.013, "sl": 0.009, "trail": 0.0020, "max_hold_min": 360},
-    "SOLUSDT": {"tp": 0.015, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
+    # Uniform day-trade parameters for all four symbols (equalised 2026-09-17).
+    # tp=1.4%, sl=1.0%, trail=0.25%, max_hold=5h — identical behaviour per coin.
+    "BTCUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
+    "ETHUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
+    "SOLUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
     "XRPUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
 }
 
@@ -351,7 +350,7 @@ DEFAULT_COIN_PROFILE = {
     "tp": 0.014,
     "sl": 0.010,
     "trail": 0.0025,
-    "max_hold_min": 300,
+    "max_hold_min": 300,  # matches COIN_PROFILES (equalised 2026-09-17)
 }
 
 
@@ -2215,6 +2214,7 @@ class PortfolioEngine:
         # Bar-based decision buffer (Phase 5)
         self.current_bar_candidates: list[BuyCandidate] = []
         self.last_bar_timestamp: int = 0
+        self._trailing_buy_arms: dict[str, Any] = {}
 
         # Phase 3: adaptive ranking weights cache. Loaded periodically from
         # ai_strategy_score_weights; consumed by BuyCandidate.rank_score via
@@ -12215,7 +12215,8 @@ class PortfolioEngine:
 
     def _pending_buy_symbols(self) -> set[str]:
         reservations = getattr(self, "_entry_reservations", None) or {}
-        return set(reservations.keys()) | self._pending_buy_order_symbols()
+        armed = {normalize_symbol(s) for s in (getattr(self, "_trailing_buy_arms", None) or {})}
+        return set(reservations.keys()) | self._pending_buy_order_symbols() | armed
 
     def _pending_buy_notional(self, *, exclude_symbol: str = "") -> float:
         ex = normalize_symbol(exclude_symbol) if exclude_symbol else ""
@@ -12230,6 +12231,12 @@ class PortfolioEngine:
             if ex and normalize_symbol(getattr(p, "symbol", "") or "") == ex:
                 continue
             n += float(getattr(p, "remaining_qty", 0.0) or 0.0) * float(getattr(p, "price", 0.0) or 0.0)
+        for sym, arm in (getattr(self, "_trailing_buy_arms", None) or {}).items():
+            if ex and normalize_symbol(sym) == ex:
+                continue
+            qty = float(getattr(arm, "quantity", 0.0) or 0.0)
+            px = float(getattr(arm, "last_ask", 0.0) or getattr(arm, "initial_ask", 0.0) or 0.0)
+            n += qty * px
         return n
 
     def _try_reserve_entry(
@@ -15623,6 +15630,125 @@ class PortfolioEngine:
             "preserved": preserved_rows,
             "active_intent_count": len(active),
         }
+
+    def _arm_trailing_buy(
+        self,
+        *,
+        symbol: str,
+        quantity: float,
+        price: float,
+        stop_price: float,
+        atr: float,
+        confidence: float,
+        bar_timestamp: int,
+        explainability: TradeExplainability,
+        decision_id: str = "",
+        sleeve: str = "",
+    ) -> dict[str, Any]:
+        """Arm one Trailing Buy. Not a position. Cooldown starts only on fill."""
+        from backend.services.day_trailing_buy import (
+            WAITING_FOR_PULLBACK_REVERSAL,
+            TrailingBuyArm,
+        )
+
+        key = normalize_symbol(symbol)
+        arms = self._trailing_buy_arms
+        existing = arms.get(key)
+        for other in list(arms):
+            if other != key:
+                arms.pop(other, None)
+                logger.info(
+                    "TRAILING_BUY_REPLACE from=%s to=%s status=%s",
+                    other,
+                    key,
+                    WAITING_FOR_PULLBACK_REVERSAL,
+                )
+        arm = TrailingBuyArm(
+            symbol=symbol,
+            decision_epoch=time.time(),
+            initial_ask=float(price),
+            quantity=float(quantity),
+            stop_price=float(stop_price),
+            atr=float(atr),
+            confidence=float(confidence),
+            bar_timestamp=int(bar_timestamp),
+            decision_id=str(decision_id or ""),
+            sleeve=str(sleeve or ""),
+            explainability=explainability,
+        )
+        if existing is not None:
+            prior_low = float(getattr(existing, "lowest_ask", 0.0) or 0.0)
+            if prior_low > 0:
+                arm.lowest_ask = min(float(arm.lowest_ask), prior_low)
+            arm.saw_lower_low = bool(getattr(existing, "saw_lower_low", False))
+        arms[key] = arm
+        logger.info(
+            "TRAILING_BUY_ARMED symbol=%s ask=%.6f trigger=%.6f status=%s decision_id=%s",
+            key,
+            float(arm.initial_ask),
+            float(arm.trigger_ask),
+            WAITING_FOR_PULLBACK_REVERSAL,
+            decision_id,
+        )
+        return {
+            "symbol": symbol,
+            "quantity": float(quantity),
+            "price": float(price),
+            "armed": True,
+            "status": WAITING_FOR_PULLBACK_REVERSAL,
+            "decision_id": str(decision_id or ""),
+            "lowest_ask": float(arm.lowest_ask),
+            "trigger_ask": float(arm.trigger_ask),
+        }
+
+    async def poll_trailing_buy_arms(self, bar_timestamp: int) -> dict[str, Any] | None:
+        """Trail executable asks. Buy on the first confirmed rebound only."""
+        from backend.services.day_trailing_buy import ARM_MAX_SEC, executable_best_ask
+
+        last_fill: dict[str, Any] | None = None
+        now = time.time()
+        for key, arm in list((getattr(self, "_trailing_buy_arms", None) or {}).items()):
+            last = float(self._get_cached_market_price(getattr(arm, "symbol", key)) or 0.0)
+            ask = executable_best_ask(getattr(arm, "symbol", key), last_price=last)
+            if ask <= 0:
+                ask = last
+            state = arm.observe_ask(ask, ts=now)
+            if state == "EXPIRED":
+                self._trailing_buy_arms.pop(key, None)
+                logger.info("TRAILING_BUY_EXPIRED symbol=%s reason=ARM_TTL", key)
+                continue
+            if state != "BUY":
+                continue
+            self._trailing_buy_arms.pop(key, None)
+            result = await self.execute_buy_fifo(
+                symbol=str(getattr(arm, "symbol", key)),
+                quantity=float(arm.quantity),
+                price=float(ask or arm.trigger_ask or arm.initial_ask),
+                stop_price=float(arm.stop_price),
+                atr=float(arm.atr),
+                confidence=float(arm.confidence),
+                bar_timestamp=int(bar_timestamp or arm.bar_timestamp),
+                explainability=arm.explainability,
+                decision_id=str(arm.decision_id or ""),
+                sleeve=str(arm.sleeve or ""),
+            )
+            if result is None:
+                if now - float(arm.decision_epoch) <= float(ARM_MAX_SEC):
+                    self._trailing_buy_arms[key] = arm
+                    logger.info("TRAILING_BUY_FIRE_BLOCKED symbol=%s restored_arm=1", key)
+                continue
+            if isinstance(result, dict) and arm.decision_id:
+                result = dict(result)
+                result["decision_id"] = arm.decision_id
+            last_fill = result
+            logger.info(
+                "TRAILING_BUY_FILLED symbol=%s qty=%.6f ask=%.6f lowest=%.6f",
+                key,
+                float(arm.quantity),
+                float(ask),
+                float(arm.lowest_ask),
+            )
+        return last_fill
 
     async def process_bar_candidates(self, bar_timestamp: int) -> dict[str, Any] | None:
         """

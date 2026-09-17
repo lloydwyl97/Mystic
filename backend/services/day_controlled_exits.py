@@ -70,14 +70,17 @@ _exit_policy_logged = False
 
 
 def _path_aware_exit_enabled() -> bool:
-    """DAY exit policy: read the live mark and sell the turn, not the 4H wait.
+    """DAY exit policy: full exit ladder (net-profit, TP1, time-stop, trailing, etc.).
 
-    Intact 4H is not a profit hold. Book executable net, sell a pullback from
-    the high while still green, then giveback/stall/trail. 4H break remains
-    the loser flatten when those never fired.
+    When disabled (production default since 2026-09-17), all exit reasons are
+    reachable: net-profit, TP1, trailing stop, time stop, thesis invalidation,
+    giveback, stall, risk floor, and extreme protection.  The 4H structure
+    break remains one possible exit among many — it no longer blocks every
+    other sell reason.  Setting ``DAY_PATH_AWARE_EXIT=true`` re-enables the
+    old hold-through-4H behaviour (not recommended).
     """
     raw = os.getenv("DAY_PATH_AWARE_EXIT")
-    enabled = (raw if raw is not None else "true").strip().lower() in {"1", "true", "yes", "on"}
+    enabled = (raw if raw is not None else "false").strip().lower() in {"1", "true", "yes", "on"}
     global _exit_policy_logged
     if not _exit_policy_logged:
         _exit_policy_logged = True
