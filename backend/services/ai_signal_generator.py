@@ -1093,8 +1093,8 @@ class RealTimeAISignalGenerator:
             recent_vol_5_vs_20 = 1.0  # mean(last 5 bars vol) vs mean(prior 20)
             recent_vp_divergence = 0.0  # bearish=-1..0, bullish=0..+1
             recent_3bar_reversal_flag = 0  # 1 = top-rejection top-out on last 3 bars
-            candle_shape_tf = "1m" if sid0 == "day" else ranking_tf_label
-            _shape_bars = market_1m_exec if sid0 == "day" and market_1m_exec else (_rank_in or market_primary)
+            candle_shape_tf = "15m" if sid0 == "day" else ranking_tf_label
+            _shape_bars = (bundle.get("15m") or market_primary) if sid0 == "day" else (_rank_in or market_primary)
             try:
                 if _shape_bars and len(_shape_bars) >= 1:
                     _b = _shape_bars[-1]

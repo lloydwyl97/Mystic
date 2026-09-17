@@ -65,12 +65,12 @@ def _broken_4h() -> list[list]:
 
 
 def test_coin_profile_trail_distances_locked():
-    assert get_coin_profile("BTCUSDT")["trail"] == pytest.approx(0.0020)
-    assert get_coin_profile("ETHUSDT")["trail"] == pytest.approx(0.0020)
+    assert get_coin_profile("BTCUSDT")["trail"] == pytest.approx(0.0025)
+    assert get_coin_profile("ETHUSDT")["trail"] == pytest.approx(0.0025)
     assert get_coin_profile("SOLUSDT")["trail"] == pytest.approx(0.0025)
     assert get_coin_profile("XRPUSDT")["trail"] == pytest.approx(0.0025)
-    assert COIN_PROFILES["BTCUSDT"]["trail"] == 0.0020
-    assert COIN_PROFILES["ETHUSDT"]["trail"] == 0.0020
+    assert COIN_PROFILES["BTCUSDT"]["trail"] == 0.0025
+    assert COIN_PROFILES["ETHUSDT"]["trail"] == 0.0025
     assert COIN_PROFILES["SOLUSDT"]["trail"] == 0.0025
     assert COIN_PROFILES["XRPUSDT"]["trail"] == 0.0025
 
@@ -78,8 +78,8 @@ def test_coin_profile_trail_distances_locked():
 @pytest.mark.parametrize(
     "symbol,entry,trail_pct",
     [
-        ("BTC/USDT", 80000.0, 0.0020),
-        ("ETH/USDT", 2500.0, 0.0020),
+        ("BTC/USDT", 80000.0, 0.0025),
+        ("ETH/USDT", 2500.0, 0.0025),
         ("SOL/USDT", 100.0, 0.0025),
         ("XRP/USDT", 1.50, 0.0025),
     ],
