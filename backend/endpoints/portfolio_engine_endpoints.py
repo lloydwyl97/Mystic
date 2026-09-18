@@ -17,6 +17,7 @@ import contextlib
 import logging
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -2035,9 +2036,10 @@ async def get_trade_drilldown(trade_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-@router.get("/model-panel")
-async def get_model_panel() -> dict[str, Any]:
-    """Read-only model/learning visibility per top-4 symbol (no auto-promotion)."""
+def _build_model_panel_sync() -> dict[str, Any]:
+    """Blocking model-panel build. Runs sklearn inference over every holdout row
+    for all four symbols and reads a multi-gigabyte SQLite file, so it must never
+    execute on the event loop."""
     try:
         from backend.database_schema import DATABASE_PATH
         from backend.services.ai_market_diagnostics import build_model_freshness_report
@@ -2127,7 +2129,46 @@ async def get_model_panel() -> dict[str, Any]:
         }
     except Exception as e:
         logger.exception("Error building model panel: %s", e)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        raise
+
+
+_MODEL_PANEL_TTL_SEC = 300.0
+_model_panel_cache: tuple[float, dict[str, Any]] | None = None
+_model_panel_lock = asyncio.Lock()
+
+
+@router.get("/model-panel")
+async def get_model_panel() -> dict[str, Any]:
+    """Read-only model/learning visibility per top-4 symbol (no auto-promotion).
+
+    The dashboard polls this on every background cycle. The build takes minutes,
+    so it is offloaded to a worker thread, served from a TTL cache, and guarded
+    by a single-flight lock; concurrent pollers share one build instead of
+    stacking copies of it.
+    """
+    global _model_panel_cache
+
+    def _fresh() -> dict[str, Any] | None:
+        cached = _model_panel_cache
+        if cached and (time.monotonic() - cached[0]) < _MODEL_PANEL_TTL_SEC:
+            return cached[1]
+        return None
+
+    hit = _fresh()
+    if hit is not None:
+        return hit
+
+    async with _model_panel_lock:
+        hit = _fresh()
+        if hit is not None:
+            return hit
+        try:
+            payload = await asyncio.to_thread(_build_model_panel_sync)
+        except Exception as e:
+            logger.exception("Error building model panel: %s", e)
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        _model_panel_cache = (time.monotonic(), payload)
+        return payload
 
 
 @router.get("/ai-signals-panel")
