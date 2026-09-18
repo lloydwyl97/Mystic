@@ -148,7 +148,8 @@ def test_meaningful_residual_sol_not_dust():
 
 def test_mandatory_classifier():
     assert is_mandatory_day_flatten("TRAILING_STOP_EXIT", force_sell=True, exit_type_name="MANUAL")
-    assert is_mandatory_day_flatten("DAY_4H_STRUCTURE_BREAK_EXIT")
+    # 4H removed from mandatory flatten (2026-09-17)
+    assert not is_mandatory_day_flatten("DAY_4H_STRUCTURE_BREAK_EXIT")
     assert is_mandatory_day_flatten("DAY_RISK_FLOOR_EXIT")
     assert not is_mandatory_day_flatten("TP1_PARTIAL_EXIT", exit_type_name="TAKE_PROFIT_1")
     assert not is_mandatory_day_flatten("NET_PROFIT_EXIT", exit_type_name="TAKE_PROFIT_1")

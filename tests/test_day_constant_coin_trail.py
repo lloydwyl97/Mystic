@@ -65,12 +65,12 @@ def _broken_4h() -> list[list]:
 
 
 def test_coin_profile_trail_distances_locked():
-    assert get_coin_profile("BTCUSDT")["trail"] == pytest.approx(0.0025)
-    assert get_coin_profile("ETHUSDT")["trail"] == pytest.approx(0.0025)
+    assert get_coin_profile("BTCUSDT")["trail"] == pytest.approx(0.002)
+    assert get_coin_profile("ETHUSDT")["trail"] == pytest.approx(0.002)
     assert get_coin_profile("SOLUSDT")["trail"] == pytest.approx(0.0025)
     assert get_coin_profile("XRPUSDT")["trail"] == pytest.approx(0.0025)
-    assert COIN_PROFILES["BTCUSDT"]["trail"] == 0.0025
-    assert COIN_PROFILES["ETHUSDT"]["trail"] == 0.0025
+    assert COIN_PROFILES["BTCUSDT"]["trail"] == 0.002
+    assert COIN_PROFILES["ETHUSDT"]["trail"] == 0.002
     assert COIN_PROFILES["SOLUSDT"]["trail"] == 0.0025
     assert COIN_PROFILES["XRPUSDT"]["trail"] == 0.0025
 
@@ -78,8 +78,8 @@ def test_coin_profile_trail_distances_locked():
 @pytest.mark.parametrize(
     "symbol,entry,trail_pct",
     [
-        ("BTC/USDT", 80000.0, 0.0025),
-        ("ETH/USDT", 2500.0, 0.0025),
+        ("BTC/USDT", 80000.0, 0.002),
+        ("ETH/USDT", 2500.0, 0.002),
         ("SOL/USDT", 100.0, 0.0025),
         ("XRP/USDT", 1.50, 0.0025),
     ],
@@ -143,7 +143,9 @@ def test_pullback_through_constant_trail_exits():
     assert out["reason"] == EXIT_TRAILING_STOP
 
 
-def test_fourh_break_still_exits():
+def test_fourh_break_no_longer_exits():
+    """4H removed from trading authority (2026-09-17). A broken 4H no longer
+    produces a sell; the position falls to the standard exit ladder."""
     pos = _Pos(entry_price=2312.0, highest_price=2400.0, trailing_stop_price=0.0, trail_pct=0.0020)
     out = evaluate_engine_managed_exit(
         position=pos,
@@ -153,7 +155,7 @@ def test_fourh_break_still_exits():
         coin_profile=get_coin_profile("ETHUSDT"),
         bundle={"4h": _broken_4h()},
     )
-    assert out["reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
+    assert out["reason"] != EXIT_DAY_4H_STRUCTURE_BREAK
 
 
 def test_risk_floor_still_exits():
