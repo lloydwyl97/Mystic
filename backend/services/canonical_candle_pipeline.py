@@ -276,9 +276,12 @@ class CanonicalCandlePipeline:
         for symbol in symbols:
             for interval in CANONICAL_CANDLE_INTERVALS:
                 try:
-                    removed = delete_unaligned_persist_now_rows(symbol, interval)
-                    if removed:
-                        logger.info("purged persist-now rows symbol=%s interval=%s count=%s", symbol, interval, removed)
+                    while True:
+                        removed = delete_unaligned_persist_now_rows(symbol, interval)
+                        if removed:
+                            logger.info("purged persist-now rows symbol=%s interval=%s count=%s", symbol, interval, removed)
+                        if removed < 50000:
+                            break
                 except Exception as exc:
                     logger.warning("persist-now purge failed %s %s: %s", symbol, interval, exc)
         for symbol in symbols:
@@ -300,7 +303,8 @@ class CanonicalCandlePipeline:
                     await self.publish_redis(symbol, interval, aggregated[-200:], None)
                 out["streams"].append({"symbol": symbol, "interval": interval, "aggregated": len(aggregated)})
                 await asyncio.sleep(0.05)
-        out["full_history"] = await self.full_history_integrity(symbols)
+        # Full-history integrity is operator-triggered. Running it inside
+        # startup saturates SQLite and blocks the live API.
         self._hydrate_done = True
         return out
 
