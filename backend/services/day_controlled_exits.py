@@ -43,25 +43,20 @@ EXIT_GIVEBACK = "GIVEBACK_EXIT"
 EXIT_PROGRESS_DECAY = "PROGRESS_DECAY_EXIT"
 EXIT_ADAPTIVE_LOSS = "ADAPTIVE_LOSS_EXIT"
 EXIT_PATH_EXECUTABLE_PROFIT = "PATH_EXECUTABLE_PROFIT"
-EXIT_PEAK_TURN = "PEAK_TURN_EXIT"
 DAY_PATH_AWARE_POLICY = "day_path_aware_v1"
 HOLD_4H_RISE = "PATH_AWARE_HOLD_4H_RISE"
 HOLD_4H_MISSING = "PATH_AWARE_HOLD_4H_MISSING"
 HOLD_4H_UNDECIDED = "PATH_AWARE_HOLD_4H_UNDECIDED"
-BUY_BLOCKED_SPIKE_FADE = "BUY_BLOCKED_SPIKE_FADE"
 
 # Reasons that are allowed to full-flatten a DAY position. Anything else holds.
 DAY_FULL_FLATTEN_REASONS = frozenset(
     {
-        EXIT_DAY_4H_STRUCTURE_BREAK,
+        # EXIT_DAY_4H_STRUCTURE_BREAK removed — 4H has no trading authority (2026-09-17)
         EXIT_DAY_RISK_FLOOR,
         EXIT_EXTREME_PROTECTION,
         EXIT_TRAILING_STOP,
         EXIT_GIVEBACK,
         EXIT_STALL_DEAD,
-        EXIT_PATH_EXECUTABLE_PROFIT,
-        EXIT_PEAK_TURN,
-        EXIT_NET_PROFIT,
     }
 )
 
@@ -98,129 +93,6 @@ def _path_min_executable_net_pct() -> float:
         return float(os.getenv("DAY_PATH_MIN_EXECUTABLE_NET_PCT", "0.0001"))
     except (TypeError, ValueError):
         return 0.0001
-
-
-def _peak_turn_exit_enabled() -> bool:
-    return os.getenv("DAY_PEAK_TURN_EXIT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-
-
-def _peak_turn_min_hold_min() -> float:
-    try:
-        return float(os.getenv("DAY_PEAK_TURN_MIN_HOLD_MIN", "2"))
-    except (TypeError, ValueError):
-        return 2.0
-
-
-def _peak_turn_min_mfe_pct() -> float:
-    raw = os.getenv("DAY_PEAK_TURN_MIN_MFE_PCT") or os.getenv("DAY_GIVEBACK_MIN_MFE_PCT") or "0.0015"
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return 0.0015
-
-
-def _peak_turn_pullback_pct() -> float:
-    try:
-        return float(os.getenv("DAY_PEAK_TURN_PULLBACK_PCT", "0.0008"))
-    except (TypeError, ValueError):
-        return 0.0008
-
-
-def evaluate_peak_turn_exit(
-    *,
-    entry_price: float,
-    highest_price: float,
-    current_price: float,
-    net_pnl_pct: float,
-    hold_minutes: float,
-) -> dict[str, Any] | None:
-    """Sell the drop from the high while the trade is still green."""
-    if not _peak_turn_exit_enabled():
-        return None
-    entry = float(entry_price or 0.0)
-    high = float(highest_price or entry)
-    mark = float(current_price or 0.0)
-    if entry <= 0 or high <= 0 or mark <= 0:
-        return None
-    if hold_minutes < _peak_turn_min_hold_min():
-        return None
-    mfe_pct = max(0.0, (high - entry) / entry)
-    if mfe_pct + 1e-12 < _peak_turn_min_mfe_pct():
-        return None
-    pullback = (high - mark) / high
-    if pullback + 1e-12 < _peak_turn_pullback_pct():
-        return None
-    if net_pnl_pct + 1e-12 < 0.0:
-        return None
-    return {
-        "action": "sell",
-        "reason": EXIT_PEAK_TURN,
-        "net_pnl_pct": net_pnl_pct,
-        "hold_minutes": hold_minutes,
-        "detail": f"mfe={mfe_pct:.6f} pullback={pullback:.6f}",
-    }
-
-
-def _spike_fade_block_pct() -> float:
-    try:
-        return float(os.getenv("DAY_SPIKE_FADE_BLOCK_PCT", "0.0040"))
-    except (TypeError, ValueError):
-        return 0.0040
-
-
-def _row_high(row: Any) -> float:
-    if not isinstance(row, (list, tuple)) or not row:
-        return 0.0
-    parsed = None
-    try:
-        from backend.services.day_trade_thesis import _ohlcv_ohlc
-
-        parsed = _ohlcv_ohlc(row)
-    except Exception:
-        parsed = None
-    if parsed is not None:
-        return float(parsed[1] or 0.0)
-    if len(row) >= 5:
-        return float(row[2] or 0.0)
-    if len(row) >= 4:
-        return float(row[1] or 0.0)
-    return 0.0
-
-
-def forming_session_high(bundle: dict[str, Any] | None, mark: float = 0.0) -> float:
-    """Highest live 4H / 15m print. Used to refuse a BUY after the spike already printed."""
-    from backend.services.day_trade_thesis import _4h_recent_ohlc, resolve_day_4h_structure_bundle
-
-    resolved = resolve_day_4h_structure_bundle(bundle, current_price=mark or None)
-    highs: list[float] = []
-    for _o, h, _l, _c in _4h_recent_ohlc(resolved)[-1:]:
-        if h > 0:
-            highs.append(float(h))
-    src = resolved if isinstance(resolved, dict) else bundle
-    if isinstance(src, dict):
-        for key in ("15m", "1m"):
-            rows = src.get(key)
-            if isinstance(rows, list) and rows:
-                highs.append(_row_high(rows[-1]))
-    return max((x for x in highs if x > 0), default=0.0)
-
-
-def evaluate_spike_fade_entry(*, mark: float, bundle: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Block a BUY that is already well below the spike high — that is buying the top after it printed."""
-    px = float(mark or 0.0)
-    high = forming_session_high(bundle, px)
-    if px <= 0 or high <= 0:
-        return None
-    fade = (high - px) / high
-    if fade + 1e-12 < _spike_fade_block_pct():
-        return None
-    return {
-        "allowed": False,
-        "block_reason": BUY_BLOCKED_SPIKE_FADE,
-        "fade_pct": fade,
-        "forming_high": high,
-        "mark": px,
-    }
 
 
 def _evaluate_path_aware_exit(
@@ -278,36 +150,33 @@ def _evaluate_path_aware_exit(
             **base,
         }
 
-    highest = float(getattr(position, "highest_price", entry) or entry)
-    giveback_on_hold = os.getenv("DAY_GIVEBACK_ON_4H_HOLD", "true").lower() in ("1", "true", "yes", "on")
-    if giveback_on_hold and snap4["htf_4h_rise_intact"]:
-        gb = evaluate_giveback_exit(
-            entry_price=entry,
-            highest_price=highest,
-            net_pnl_pct=net_pnl_pct,
-            hold_minutes=hold_minutes,
-            position=position,
-        )
-        if gb is not None:
-            return {**gb, **base, "reason": EXIT_GIVEBACK}
+    # Giveback and stall: no longer gated on 4H rise intact (removed 2026-09-17).
+    gb = evaluate_giveback_exit(
+        entry_price=entry,
+        highest_price=float(getattr(position, "highest_price", entry) or entry),
+        net_pnl_pct=net_pnl_pct,
+        hold_minutes=hold_minutes,
+        position=position,
+    )
+    if gb is not None:
+        return {**gb, **base, "reason": EXIT_GIVEBACK}
 
-    stall_on_hold = os.getenv("DAY_STALL_ON_4H_HOLD", "true").lower() in ("1", "true", "yes", "on")
-    if stall_on_hold and snap4["htf_4h_rise_intact"]:
-        stall = evaluate_stall_exit(
-            entry_price=entry,
-            highest_price=highest,
-            net_pnl_pct=net_pnl_pct,
-            hold_minutes=hold_minutes,
-            max_hold_min=effective_max_hold_min(position, coin_profile),
-            current_price=current_price,
-            lowest_price=float(getattr(position, "lowest_price", 0.0) or 0.0),
-        )
-        if stall is not None and str(stall.get("action") or "") == "sell":
-            return {**stall, **base, "reason": EXIT_STALL_DEAD}
+    stall = evaluate_stall_exit(
+        entry_price=entry,
+        highest_price=float(getattr(position, "highest_price", entry) or entry),
+        net_pnl_pct=net_pnl_pct,
+        hold_minutes=hold_minutes,
+        max_hold_min=effective_max_hold_min(position, coin_profile),
+        current_price=current_price,
+        lowest_price=float(getattr(position, "lowest_price", 0.0) or 0.0),
+    )
+    if stall is not None and str(stall.get("action") or "") == "sell":
+        return {**stall, **base, "reason": EXIT_STALL_DEAD}
 
     # Existing trail: once the high-water ratchet is armed, a pullback through
     # it is deterioration — not a "green enough" clip.
     trail_pct = float(getattr(position, "trail_pct", 0) or coin_profile.get("trail") or 0.005)
+    highest = float(getattr(position, "highest_price", entry) or entry)
     trail = float(getattr(position, "trailing_stop_price", 0) or 0)
     if trail > 0 and highest >= entry * (1.0 + trail_pct) - 1e-12 and current_price <= trail:
         return {
@@ -317,57 +186,16 @@ def _evaluate_path_aware_exit(
             **base,
         }
 
-    peak = evaluate_peak_turn_exit(
-        entry_price=entry,
-        highest_price=highest,
-        current_price=current_price,
-        net_pnl_pct=net_pnl_pct,
-        hold_minutes=hold_minutes,
-    )
-    if peak is not None:
-        return {**peak, **base, "reason": EXIT_PEAK_TURN}
-
-    min_net = float(min_net_profit_for_symbol(str(getattr(position, "symbol", "") or "")) or MIN_NET_PROFIT_TO_SELL)
-    if net_pnl_pct + 1e-12 >= min_net:
-        return {
-            "action": "sell",
-            "reason": EXIT_PATH_EXECUTABLE_PROFIT,
-            "detail": f"net={net_pnl_pct:.6f} min_net={min_net:.6f}",
-            **base,
-        }
-
-    # 4H intact only holds when there is no booked profit and no turn off the high.
-    if snap4["htf_4h_rise_intact"]:
-        return {
-            "action": "hold",
-            "reason": HOLD_4H_RISE,
-            "detail": "4h_breakout_intact_no_profit_no_turn",
-            **base,
-        }
-
-    # The only structural DAY sell. Never a 0.4% / 0.01% scalp clip.
-    if snap4["htf_4h_rise_broken"]:
-        return {
-            "action": "sell",
-            "reason": EXIT_DAY_4H_STRUCTURE_BREAK,
-            "detail": "4h_close_below_prior_4h_low",
-            **base,
-        }
-
-    # No 4H evidence is not permission to scalp-clip. Extreme protection above
-    # is the only exit left in this state.
-    if snap4["4h_bundle_missing"]:
-        return {
-            "action": "hold",
-            "reason": HOLD_4H_MISSING,
-            "detail": "4h_bundle_missing_no_scalp_clip",
-            "diagnostic": DAY_4H_BUNDLE_MISSING,
-            **base,
-        }
+    # 4H has no production trading authority (removed 2026-09-17).
+    # No 4H hold, no 4H structure break sell, no 4H missing hold.
+    # Fall through: position stays in bracket for the standard exit ladder
+    # (net-profit, trailing, stop-loss, time-stop, etc.) via
+    # evaluate_engine_managed_exit when path_aware is off, or via the
+    # checks above (extreme, risk floor, giveback, stall, trail) when on.
     return {
         "action": "hold",
-        "reason": HOLD_4H_UNDECIDED,
-        "detail": "4h_not_intact_not_broken_no_scalp_clip",
+        "reason": "path_aware_bracket_hold",
+        "detail": "no_immediate_exit_signal",
         **base,
     }
 
@@ -424,7 +252,6 @@ ALLOWED_DAY_EXIT_REASONS = frozenset(
     {
         EXIT_NET_PROFIT,
         EXIT_PATH_EXECUTABLE_PROFIT,
-        EXIT_PEAK_TURN,
         EXIT_VOLATILITY_STOP,
         EXIT_TIME_STOP,
         EXIT_STALL,
@@ -443,7 +270,7 @@ ALLOWED_DAY_EXIT_REASONS = frozenset(
         "ALLWEATHER_ATR_STOP_EXIT",
         "ALLWEATHER_ATR_TARGET_EXIT",
         "ALLWEATHER_TIME_STOP_EXIT",
-        EXIT_DAY_4H_STRUCTURE_BREAK,
+        # EXIT_DAY_4H_STRUCTURE_BREAK removed — 4H has no trading authority (2026-09-17)
         EXIT_DAY_RISK_FLOOR,
         "EMERGENCY_FLATTEN",
         "RESTART_FLATTEN",
@@ -1316,10 +1143,10 @@ def preview_next_engine_exit(
             next_executable_condition = EXIT_TRAILING_STOP
         elif trail_info["hard_stop"] > 0 and entry > 0:
             next_exit = current_authority
-            next_executable_condition = f"{EXIT_DAY_RISK_FLOOR}_or_{EXIT_DAY_4H_STRUCTURE_BREAK}"
+            next_executable_condition = EXIT_DAY_RISK_FLOOR
         else:
             next_exit = current_authority
-            next_executable_condition = EXIT_DAY_4H_STRUCTURE_BREAK
+            next_executable_condition = "BRACKET_HOLD"
 
     dist_stop_pct = ((current_price - stop) / entry) if stop > 0 and entry > 0 else None
     dist_hard_pct = ((current_price - float(trail_info["hard_stop"])) / entry) if trail_info["hard_stop"] > 0 and entry > 0 else None
@@ -1814,23 +1641,6 @@ class _PreBuyPositionView:
         self.take_profit_1_price = target_level
 
 
-def last_look_buy_mark(
-    *,
-    decision_price: float,
-    expected_fill: float = 0.0,
-    best_bid: float = 0.0,
-    best_ask: float = 0.0,
-    limit_price: float = 0.0,
-) -> float:
-    """Live price the pre-buy 4H check must use at send.
-
-    A BUY breaks 4H when price is already through the prior low. Use the
-    lowest live/executable print, not the earlier decision mid.
-    """
-    marks = [float(x) for x in (decision_price, expected_fill, best_bid, best_ask, limit_price) if x is not None and float(x or 0.0) > 0.0]
-    return min(marks) if marks else 0.0
-
-
 def evaluate_pre_buy_exit_consistency(
     *,
     setup: str,
@@ -1984,7 +1794,7 @@ def evaluate_pre_buy_exit_consistency(
         EXIT_FAILED_RECLAIM,
         EXIT_TIME_STOP,
         EXIT_EXTREME_PROTECTION,
-        EXIT_DAY_4H_STRUCTURE_BREAK,
+        # EXIT_DAY_4H_STRUCTURE_BREAK removed — 4H has no trading authority (2026-09-17)
     ):
         result.update(
             {
@@ -1992,19 +1802,6 @@ def evaluate_pre_buy_exit_consistency(
                 "block_reason": f"ENTRY_EXIT_IMMEDIATE_{immediate}",
                 "immediate_exit_reason": immediate,
                 "invalidation_at_entry": immediate == EXIT_THESIS_INVALIDATION,
-                "entry_exit_state_consistent": False,
-            }
-        )
-        return result
-
-    spike = evaluate_spike_fade_entry(mark=entry, bundle=bundle)
-    result["checks"]["spike_fade"] = spike or {}
-    if spike is not None:
-        result.update(
-            {
-                "allowed": False,
-                "block_reason": BUY_BLOCKED_SPIKE_FADE,
-                "immediate_exit_reason": BUY_BLOCKED_SPIKE_FADE,
                 "entry_exit_state_consistent": False,
             }
         )

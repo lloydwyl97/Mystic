@@ -1251,7 +1251,6 @@ def htf_4h_rise_broken(
 _PROFIT_CLOSE_MARKERS = (
     "NET_PROFIT",
     "PATH_EXECUTABLE_PROFIT",
-    "PEAK_TURN",
     "TP1",
     "TAKE_PROFIT",
 )
@@ -1459,11 +1458,8 @@ def thesis_invalidated_live(
         if m5 is not None and m5 < 0.35:
             return True
     if entry_thesis == SETUP_BREAKOUT_CONTINUATION:
-        # 4H still rising: a 15m dip is not thesis death on a vertical breakout.
-        if htf_4h_rise_intact(bundle):
-            return False
-        if htf_4h_rise_broken(bundle):
-            return True
+        # 4H removed from thesis invalidation (2026-09-17).
+        # Use only 5m/15m alignment for breakout continuation.
         m5 = _bundle_tf_align(bundle, "5m")
         m15 = _bundle_tf_align(bundle, "15m")
         if m5 is not None and m15 is not None and m5 < 0.42 and m15 < 0.45:

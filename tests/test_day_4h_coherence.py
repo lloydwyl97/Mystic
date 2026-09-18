@@ -123,18 +123,21 @@ def test_fresh_mark_overrides_stale_forming_close_broken():
     assert snap["htf_4h_rise_broken"] is True
 
 
-def test_pre_buy_honors_immediate_4h_structure_break():
-    """BTC #4: same state already requires sell → no buy."""
+def test_pre_buy_does_not_block_on_4h_structure_break():
+    """4H removed from trading authority (2026-09-17). Pre-buy no longer
+    blocks on a broken 4H structure."""
     now = _ts("2026-08-28T05:00:09Z")
     entry = 79637.25
     bundle = _btc_bundle(forming_close=79672.42)
     result = _pre_buy(entry=entry, bundle=bundle, now_epoch=now)
-    assert result["allowed"] is False
-    assert "DAY_4H_STRUCTURE_BREAK" in result["block_reason"]
-    assert result["immediate_exit_reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
+    assert result["allowed"] is True
+    assert "DAY_4H_STRUCTURE_BREAK" not in result.get("block_reason", "")
+    assert result.get("immediate_exit_reason", "") != EXIT_DAY_4H_STRUCTURE_BREAK
 
 
-def test_btc4_cannot_buy_then_sell_same_structure():
+def test_btc4_no_longer_blocks_or_exits_on_4h_structure():
+    """4H removed from trading authority (2026-09-17). Neither pre-buy nor
+    managed exit reacts to a broken 4H structure."""
     now = _ts("2026-08-28T05:00:09Z")
     entry = 79637.25
     bundle = _btc_bundle(forming_close=79672.42)
@@ -149,10 +152,8 @@ def test_btc4_cannot_buy_then_sell_same_structure():
         bundle=bundle,
         now_epoch=now,
     )
-    assert pre["allowed"] is False
-    assert managed["action"] == "sell"
-    assert managed["reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
-    assert managed["htf_4h_rise_broken"] is True
+    assert pre["allowed"] is True
+    assert managed["reason"] != EXIT_DAY_4H_STRUCTURE_BREAK
 
 
 def test_btc5_stale_close_does_not_false_exit():
@@ -174,7 +175,9 @@ def test_btc5_stale_close_does_not_false_exit():
     assert managed["action"] == "hold"
 
 
-def test_sol1_post_entry_break_still_exits():
+def test_sol1_post_entry_break_no_longer_exits_on_4h():
+    """4H removed from trading authority (2026-09-17). The snapshot still
+    detects the break (telemetry) but the exit engine does not use it."""
     now_entry = _ts("2026-08-28T01:45:12Z")
     now_exit = _ts("2026-08-28T02:01:06Z")
     bar0 = int(_ts("2026-08-28T00:00:00Z") * 1000)
@@ -202,14 +205,16 @@ def test_sol1_post_entry_break_still_exits():
         bundle=bundle,
         now_epoch=now_exit,
     )
-    assert at_exit["action"] == "sell"
-    assert at_exit["reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
+    # 4H break detected in snapshot (telemetry) but no longer triggers a sell
+    assert at_exit["reason"] != EXIT_DAY_4H_STRUCTURE_BREAK
     assert day_4h_structure_snapshot(bundle, current_price=108.36, now_epoch=now_entry)["htf_4h_rise_broken"] is False
     assert day_4h_structure_snapshot(bundle, current_price=107.77, now_epoch=now_exit)["htf_4h_rise_broken"] is True
 
 
-def test_sol3_new_bar_prior_low_rollover_exits():
-    """Bundle still has 04:00 as last bar after 08:00 UTC; prior rolls to 04:00 low."""
+def test_sol3_new_bar_prior_low_rollover_no_4h_exit():
+    """Bundle still has 04:00 as last bar after 08:00 UTC; prior rolls to 04:00 low.
+    4H removed from trading authority (2026-09-17). Snapshot still detects break
+    but the exit engine does not use it as a sell signal."""
     now_exit = _ts("2026-08-28T10:12:06Z")
     bar04 = int(_ts("2026-08-28T04:00:00Z") * 1000)
     prefix = _rising_prefix(60, bar04, start=100.0)
@@ -231,7 +236,7 @@ def test_sol3_new_bar_prior_low_rollover_exits():
         bundle=bundle,
         now_epoch=now_exit,
     )
-    assert out["reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
+    assert out["reason"] != EXIT_DAY_4H_STRUCTURE_BREAK
 
 
 def test_utc_4h_boundary_forces_identity_refresh():
@@ -282,8 +287,9 @@ def test_mtf_align_only_bundle_misses_already_broken_4h():
     assert allowed["allowed"] is True
 
 
-def test_clean_window_eth_xrp_btc_already_below_prior_low_blocked():
-    """Ocean 2026-08-28 clean-window BUY→seconds-later 4H-break cases."""
+def test_clean_window_eth_xrp_btc_no_longer_blocked_on_4h():
+    """4H removed from trading authority (2026-09-17). Snapshot still detects
+    the break (telemetry), but pre-buy no longer blocks on it."""
     cases = [
         ("2026-08-28T16:30:10Z", 2434.04, 2470.0, 2432.71),
         ("2026-08-28T17:45:11Z", 1.3865, 1.3879, 1.38625),
@@ -301,8 +307,8 @@ def test_clean_window_eth_xrp_btc_already_below_prior_low_blocked():
         assert snap["prior_4h_low"] == prior_low
         assert snap["htf_4h_rise_broken"] is True
         pre = _pre_buy(entry=entry, bundle=bundle, now_epoch=now)
-        assert pre["allowed"] is False, iso
-        assert pre["immediate_exit_reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
+        assert pre["allowed"] is True, iso
+        assert pre.get("immediate_exit_reason", "") != EXIT_DAY_4H_STRUCTURE_BREAK
 
 
 def test_resolve_pre_buy_prefers_ohlcv_cache(monkeypatch):
