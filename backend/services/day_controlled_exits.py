@@ -185,12 +185,39 @@ def _evaluate_path_aware_exit(
             **base,
         }
 
+    # Profit taking. evaluate_engine_managed_exit returns this function's result
+    # directly, so the ladder's net-profit checks never run while path-aware is on
+    # and the trail above was the only reachable profit exit. Same condition and
+    # per-coin floor as the ladder's target_hit case. Placed last, as in the
+    # ladder, so a pullback through an armed trail still wins and a still-rising
+    # winner is not clipped early.
+    target_level = float(getattr(position, "thesis_target_level", 0.0) or 0.0)
+    symbol = str(getattr(position, "symbol", "") or "")
+    min_net = float(min_net_profit_for_symbol(symbol)) if symbol else float(MIN_NET_PROFIT_TO_SELL)
+
+    target = effective_target_price(
+        entry,
+        float(getattr(position, "take_profit_1_price", 0) or 0),
+        target_level,
+        position,
+        bundle,
+    )
+    if target > 0 and current_price >= target and net_pnl_pct + 1e-12 >= min_net * 0.45:
+        return {
+            "action": "sell",
+            "reason": EXIT_NET_PROFIT,
+            "detail": "target_hit",
+            **base,
+        }
+
+    # The ladder's second form -- bare per-coin floor plus a thesis sell -- is
+    # deliberately NOT restored. test_missing_4h_bundle_does_not_net_profit_clip
+    # requires a 0.45% winner whose target is still unreached to keep running, and
+    # that is the "let winners trail instead of clipping" intent. Reaching the
+    # resolved target is a different event, and that is what is restored above.
+
     # 4H has no production trading authority (removed 2026-09-17).
     # No 4H hold, no 4H structure break sell, no 4H missing hold.
-    # Fall through: position stays in bracket for the standard exit ladder
-    # (net-profit, trailing, stop-loss, time-stop, etc.) via
-    # evaluate_engine_managed_exit when path_aware is off, or via the
-    # checks above (extreme, risk floor, giveback, stall, trail) when on.
     return {
         "action": "hold",
         "reason": "path_aware_bracket_hold",

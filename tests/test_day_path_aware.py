@@ -149,9 +149,15 @@ def _rising_4h_rows(n: int = 60, start: float = 2000.0) -> list[list]:
 
 def test_path_aware_holds_green_on_4h_rise():
     """4H removed from exit authority (2026-09-17). With a rising 4H, position
-    stays in bracket hold (same behavior, different reason string)."""
+    stays in bracket hold (same behavior, different reason string).
+
+    No resolvable profit target here on purpose: this asserts the 4H rise does
+    not drive the exit, not that a winner at its target declines to take profit.
+    The _Pos default target of 101 against an ETH-scale mark would be reached
+    22x over and is not the condition under test.
+    """
     out = evaluate_engine_managed_exit(
-        position=_Pos(),
+        position=_Pos(take_profit_1_price=0.0, thesis_target_level=0.0),
         current_price=2318.0,
         net_pnl_pct=0.005,
         hold_minutes=20.0,
@@ -199,9 +205,13 @@ def test_path_aware_stall_sells_dead_red_hold_while_4h_intact():
 
 def test_path_aware_holds_time_stop_on_4h_rise():
     """4H removed from exit authority (2026-09-17). With a rising 4H, position
-    stays in bracket hold (same behavior, different reason string)."""
+    stays in bracket hold (same behavior, different reason string).
+
+    Target left unresolvable so the assertion is about the elapsed max hold and
+    the 4H rise, not about a winner sitting on top of its target.
+    """
     out = evaluate_engine_managed_exit(
-        position=_Pos(max_hold_min=300),
+        position=_Pos(max_hold_min=300, take_profit_1_price=0.0, thesis_target_level=0.0),
         current_price=2390.0,
         net_pnl_pct=0.03,
         hold_minutes=400.0,
@@ -223,9 +233,14 @@ def _broken_4h_rows() -> list[list]:
 
 def test_4h_structure_break_no_longer_exits():
     """4H removed from trading authority (2026-09-17). A broken 4H no longer
-    produces a sell; position falls to the standard exit ladder."""
+    produces a sell; position falls to the standard exit ladder.
+
+    With no resolvable target the ladder has no profit case to take, so this
+    isolates the 4H break itself. Whether a winner at its target takes profit is
+    covered by tests/test_day_net_profit_reachable.py.
+    """
     out = evaluate_engine_managed_exit(
-        position=_Pos(),
+        position=_Pos(take_profit_1_price=0.0, thesis_target_level=0.0),
         current_price=2200.0,
         net_pnl_pct=0.005,
         hold_minutes=20.0,
@@ -233,7 +248,7 @@ def test_4h_structure_break_no_longer_exits():
         bundle={"4h": _broken_4h_rows()},
     )
     assert out["reason"] != EXIT_DAY_4H_STRUCTURE_BREAK
-    assert out["reason"] not in {EXIT_NET_PROFIT, EXIT_PATH_EXECUTABLE_PROFIT, EXIT_TIME_STOP, "TP1", "NET_PROFIT_EXIT"}
+    assert out["reason"] not in {EXIT_PATH_EXECUTABLE_PROFIT, EXIT_TIME_STOP, "TP1"}
 
 
 def test_risk_floor_sits_below_structure_so_structure_exits_first():
