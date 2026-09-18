@@ -10,6 +10,7 @@ only. Gaps are fetched from the exchange; they are never fabricated.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -447,6 +448,13 @@ class CanonicalCandlePipeline:
     async def start(self) -> None:
         if self._running:
             return
+        # This pipeline is the only writer of completed candles, so the canonical
+        # identity constraint is enforced here. init_feature_store() would also do it
+        # but nothing starts feature_ingestor, so it never ran.
+        with contextlib.suppress(Exception):
+            from backend.services.feature_store import enforce_candle_identity_unique
+
+            await asyncio.to_thread(enforce_candle_identity_unique)
         self._running = True
         self._tasks = [
             asyncio.create_task(self._hydrate_background(), name="canonical_candle:hydrate"),

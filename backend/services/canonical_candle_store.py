@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import and_, asc, desc, select
+from sqlalchemy import and_, asc, desc, select, update
+from sqlalchemy.exc import IntegrityError
 
 from backend.config.canonical_candle_intervals import (
     CANONICAL_CANDLE_INTERVALS,
@@ -183,15 +184,36 @@ def upsert_completed_candles(symbol: str, interval: str, candles: list[dict[str,
                 "volume": parse_ohlcv_float(candle.get("volume")),
             }
             if existing is None:
-                session.add(
-                    FeatureOHLCV(
-                        symbol=db_sym,
-                        interval=interval,
-                        ts=ts,
-                        **payload,
+                # (symbol, interval, ts) is UNIQUE and this select-then-insert is not
+                # atomic, so a concurrent ingest of the same bar can land between the
+                # two statements. Take the row that won and update it instead of
+                # losing the whole batch to an IntegrityError.
+                savepoint = session.begin_nested()
+                try:
+                    session.add(
+                        FeatureOHLCV(
+                            symbol=db_sym,
+                            interval=interval,
+                            ts=ts,
+                            **payload,
+                        )
                     )
-                )
-                inserted += 1
+                    savepoint.commit()
+                    inserted += 1
+                except IntegrityError:
+                    savepoint.rollback()
+                    session.execute(
+                        update(FeatureOHLCV)
+                        .where(
+                            and_(
+                                FeatureOHLCV.symbol == db_sym,
+                                FeatureOHLCV.interval == interval,
+                                FeatureOHLCV.ts == ts,
+                            )
+                        )
+                        .values(**payload)
+                    )
+                    updated += 1
             else:
                 existing.open = payload["open"]
                 existing.high = payload["high"]
