@@ -49,6 +49,31 @@ def test_storage_report_warns_when_free_space_is_low(tmp_path, monkeypatch):
     assert report["filesystem_free_gib"] == 1.0
 
 
+def test_storage_report_accepts_mixed_epoch_and_iso_timestamps(tmp_path, monkeypatch):
+    import sqlite3
+
+    db = tmp_path / "mixed.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE paper_trades (timestamp REAL)")
+    conn.execute("CREATE TABLE day_trailing_buy_intents (created_at TEXT)")
+    conn.execute("INSERT INTO paper_trades VALUES (1789749000.0)")
+    conn.execute("INSERT INTO day_trailing_buy_intents VALUES ('2026-09-18T16:30:00+00:00')")
+    conn.commit()
+    conn.close()
+
+    class _Usage:
+        total = 50 * 1024**3
+        used = 20 * 1024**3
+        free = 30 * 1024**3
+
+    monkeypatch.setattr("backend.services.sqlite_large_table_retention.shutil.disk_usage", lambda _p: _Usage())
+    report = storage_report(db)
+    assert "error" not in report
+    assert report["severity"] == "OK"
+    assert report["learning_oldest"]
+    assert report["learning_newest"]
+
+
 def test_storage_report_is_ok_with_headroom(tmp_path, monkeypatch):
     db = tmp_path / "ok.db"
     db.write_bytes(b"0")

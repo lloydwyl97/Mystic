@@ -134,12 +134,29 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
 
 
 def _iso_to_dt(value: Any) -> datetime | None:
-    if not value:
+    if value is None or value == "":
         return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        raw = float(value)
+        if raw > 1e12:
+            raw /= 1000.0
+        try:
+            return datetime.fromtimestamp(raw, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
-        return None
+        try:
+            raw = float(value)
+        except (TypeError, ValueError):
+            return None
+        if raw > 1e12:
+            raw /= 1000.0
+        try:
+            return datetime.fromtimestamp(raw, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
@@ -274,32 +291,30 @@ def storage_report(db_path: str | Path) -> dict[str, Any]:
 
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        learning_bytes = 0
-        oldest: str | None = None
-        newest: str | None = None
+        learning_bytes = out["db_bytes"]
+        oldest_dt: datetime | None = None
+        newest_dt: datetime | None = None
         for table in sorted(LOCK_DEPENDENT_TABLES | PROTECTED_TABLES):
             if not _table_exists(conn, table):
                 continue
-            try:
-                learning_bytes += int(conn.execute("SELECT SUM(pgsize) FROM dbstat WHERE name=?", (table,)).fetchone()[0] or 0)
-            except sqlite3.Error:
-                pass
             column = "created_at" if _column_exists(conn, table, "created_at") else "timestamp"
             if not _column_exists(conn, table, column):
                 continue
             lo, hi = conn.execute(f"SELECT MIN({column}), MAX({column}) FROM {table}").fetchone()
-            oldest = min(x for x in (oldest, lo) if x) if (oldest or lo) else None
-            newest = max(x for x in (newest, hi) if x) if (newest or hi) else None
+            lo_dt, hi_dt = _iso_to_dt(lo), _iso_to_dt(hi)
+            if lo_dt and (oldest_dt is None or lo_dt < oldest_dt):
+                oldest_dt = lo_dt
+            if hi_dt and (newest_dt is None or hi_dt > newest_dt):
+                newest_dt = hi_dt
     finally:
         conn.close()
 
     out["learning_table_bytes"] = learning_bytes
-    out["learning_oldest"] = oldest
-    out["learning_newest"] = newest
+    out["learning_oldest"] = oldest_dt.isoformat() if oldest_dt else None
+    out["learning_newest"] = newest_dt.isoformat() if newest_dt else None
     span_days = 0.0
-    lo_dt, hi_dt = _iso_to_dt(oldest), _iso_to_dt(newest)
-    if lo_dt and hi_dt:
-        span_days = max((hi_dt - lo_dt).total_seconds() / 86400.0, 0.0)
+    if oldest_dt and newest_dt:
+        span_days = max((newest_dt - oldest_dt).total_seconds() / 86400.0, 0.0)
     out["learning_span_days"] = round(span_days, 3)
     per_day = learning_bytes / span_days if span_days > 0 else 0.0
     out["learning_bytes_per_day"] = int(per_day)
