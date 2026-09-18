@@ -15912,6 +15912,72 @@ class PortfolioEngine:
             "active_intent_count": len(active),
         }
 
+    def _record_ranked_stream_decisions(
+        self,
+        *,
+        ranked_candidates: list[BuyCandidate],
+        bar_timestamp: int,
+        arm_result: dict[str, Any] | None,
+        path_ev_decision: dict[str, Any] | None,
+    ) -> None:
+        """Write one structured decision record per ranked candidate for this bar.
+
+        Every ranked symbol gets a row, armed or not, so a bar that produced no
+        BUY is distinguishable from a bar that was never evaluated.
+        """
+        with contextlib.suppress(Exception):
+            from backend.services.day_gate_telemetry import record_day_decision
+
+            result = dict(arm_result or {})
+            blocked = str(result.get("blocked") or "")
+            armed_by_decision: dict[str, dict[str, Any]] = {}
+            for row in result.get("intents") or []:
+                did = str((row or {}).get("decision_id") or "")
+                if did:
+                    armed_by_decision[did] = dict(row)
+            preserved_ids = {str((row or {}).get("decision_id") or "") for row in (result.get("preserved") or [])}
+
+            for cand in ranked_candidates or []:
+                did = str(getattr(cand, "decision_id", "") or "")
+                if not did:
+                    continue
+                dd = dict(getattr(cand, "decision_data", None) or {})
+                intent = armed_by_decision.get(did)
+                if blocked:
+                    final_decision, first_block = "reject", blocked
+                elif intent is not None:
+                    final_decision, first_block = "arm", ""
+                else:
+                    final_decision = "reject"
+                    first_block = str(dd.get("first_hard_block") or "") or "NOT_ARMED_THIS_BAR"
+
+                record_day_decision(
+                    self.db_path,
+                    decision_id=did,
+                    symbol=str(getattr(cand, "symbol", "") or ""),
+                    aw_valid=bool(dd.get("allweather_setup")),
+                    setup=str(dd.get("setup_type") or dd.get("allweather_setup") or ""),
+                    regime=str(dd.get("allweather_regime") or dd.get("aw_regime") or ""),
+                    gates=list(dd.get("gates_evaluated") or []),
+                    first_hard_block=first_block,
+                    ml_score=float(dd.get("buy_margin") or dd.get("ml_score") or 0.0) or None,
+                    ml_rank_adjustment=float(dd.get("ml_rank_adjustment") or 0.0) or None,
+                    final_decision=final_decision,
+                    strategy_version=str(dd.get("decision_policy_version") or "day_aw_owner_v1"),
+                    model_version=str(dd.get("artifact_sha256") or dd.get("model_version") or "")[:64],
+                    feature_version=str(dd.get("feature_version") or ""),
+                    artifact_version=str(dd.get("artifact_path") or "")[:128],
+                    detail={
+                        "bar_timestamp": int(bar_timestamp),
+                        "authority": "DAY_TRAILING_BUY_RANKED_STREAM",
+                        "intent_id": str((intent or {}).get("intent_id") or ""),
+                        "arm_ask": (intent or {}).get("arm_ask"),
+                        "preserved_intent": did in preserved_ids,
+                        "path_ev_winner": (path_ev_decision or {}).get("path_ev_winner"),
+                        "path_ev_telemetry_only": True,
+                    },
+                )
+
     def _arm_trailing_buy(
         self,
         *,
@@ -16741,14 +16807,19 @@ class PortfolioEngine:
             try:
                 from backend.services.day_decision_state import (
                     MODEL_HOLD_TELEMETRY,
+                    PATH_EV_TELEMETRY_KEY,
                     build_hold_record,
                     persist_hold_record,
                 )
 
+                # Universe-level model opinion, not a per-symbol state. Keying it by
+                # path_ev_winner put a fake "HOLD" symbol in the per-symbol map, and
+                # when a winner existed it wrote the unslashed form (XRPUSDT) alongside
+                # the real XRP/USDT entry. Keep it under one explicit non-symbol key.
                 persist_hold_record(
                     str(self.db_path),
                     build_hold_record(
-                        symbol=str((_day_auth or {}).get("path_ev_winner") or "HOLD"),
+                        symbol=PATH_EV_TELEMETRY_KEY,
                         category=MODEL_HOLD_TELEMETRY,
                         reason="DAY_PATH_EV_HOLD",
                         authority="rank_score/path_ev_telemetry",
@@ -16777,6 +16848,17 @@ class PortfolioEngine:
                         "path_ev_winner": (_day_auth or {}).get("path_ev_winner"),
                     },
                 }
+            )
+            # DAY_TRAILING_BUY is the only automated BUY authority, and this branch is
+            # where it runs, so the structured decision record has to be written here.
+            # The record_day_decision() call further down is only reachable on the
+            # legacy direct-execute path, which left day_decision_records empty for
+            # every bar processed under trailing_buy mode.
+            self._record_ranked_stream_decisions(
+                ranked_candidates=valid_candidates,
+                bar_timestamp=int(bar_timestamp),
+                arm_result=result,
+                path_ev_decision=_day_auth,
             )
             self.current_bar_candidates.clear()
             return result
@@ -17721,7 +17803,9 @@ class PortfolioEngine:
                 model_version=str(_dd_final.get("artifact_sha256") or _dd_final.get("model_version") or "")[:64],
                 feature_version=str(_dd_final.get("feature_version") or ""),
                 artifact_version=str(_dd_final.get("artifact_path") or "")[:128],
-                mode="paper",
+                # mode omitted on purpose: record_day_decision resolves the real
+                # runtime account mode. Hardcoding "paper" stamped every record on
+                # this live account as paper.
                 detail={"bar_timestamp": int(bar_timestamp), "net_ev": float(top_net_ev)},
             )
         return result

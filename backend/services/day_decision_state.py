@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sqlite3
@@ -39,6 +40,45 @@ HOLD_CATEGORIES = (
 )
 
 STATE_KEY = "day_decision_holds"
+
+# Snapshot key for universe-level model telemetry. Deliberately not a tradable
+# symbol so it can never collide with, or overwrite, a per-symbol trailing state.
+PATH_EV_TELEMETRY_KEY = "DAY_PATH_EV"
+
+# Append-only episode ledger. The operational_state blob above is a latest-per-symbol
+# snapshot that is overwritten every cycle, so it cannot answer "what did DAY decide
+# over the last 24h". This table keeps one row per contiguous state episode per symbol
+# with an observation counter, which stays compact while making dips, lows, rebounds
+# and decision gaps countable after the fact.
+EPISODE_TABLE = "day_decision_hold_episodes"
+
+_EPISODE_DDL = (
+    f"""
+    CREATE TABLE IF NOT EXISTS {EPISODE_TABLE} (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        category TEXT NOT NULL,
+        exact_reason TEXT NOT NULL,
+        controlling_authority TEXT,
+        decision_id TEXT,
+        intent_id TEXT,
+        blocks_live_execution INTEGER NOT NULL DEFAULT 0,
+        first_seen_ts REAL NOT NULL,
+        last_seen_ts REAL NOT NULL,
+        observation_count INTEGER NOT NULL DEFAULT 1,
+        expires_at REAL,
+        next_reevaluation REAL,
+        first_observed_json TEXT,
+        last_observed_json TEXT,
+        required_json TEXT
+    )
+    """,
+    f"CREATE INDEX IF NOT EXISTS ix_{EPISODE_TABLE}_symbol_last ON {EPISODE_TABLE}(symbol, last_seen_ts)",
+    f"CREATE INDEX IF NOT EXISTS ix_{EPISODE_TABLE}_last ON {EPISODE_TABLE}(last_seen_ts)",
+    f"CREATE INDEX IF NOT EXISTS ix_{EPISODE_TABLE}_category ON {EPISODE_TABLE}(category, last_seen_ts)",
+)
+
+_episode_ready: set[str] = set()
 
 _BLOCKS_LIVE = {
     HARD_SAFETY_BLOCK,
@@ -131,15 +171,82 @@ def build_hold_record(
     }
 
 
+def _ensure_episode_table(conn: sqlite3.Connection, db_path: str) -> None:
+    if db_path in _episode_ready:
+        return
+    for stmt in _EPISODE_DDL:
+        conn.execute(stmt)
+    _episode_ready.add(db_path)
+
+
+def _append_episode(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    """Extend the current episode, or open a new one when the state changes."""
+    symbol = str(record.get("symbol") or "")
+    category = str(record.get("category") or "")
+    reason = str(record.get("exact_reason") or "")
+    ts = float(record.get("timestamp") or time.time())
+    observed = json.dumps(record.get("observed") or {}, default=str)
+
+    last = conn.execute(
+        f"SELECT id, category, exact_reason FROM {EPISODE_TABLE} WHERE symbol=? ORDER BY id DESC LIMIT 1",
+        (symbol,),
+    ).fetchone()
+
+    if last and last[1] == category and last[2] == reason:
+        conn.execute(
+            f"UPDATE {EPISODE_TABLE} SET last_seen_ts=?, observation_count=observation_count+1, last_observed_json=?, next_reevaluation=?, expires_at=?, decision_id=?, intent_id=? WHERE id=?",
+            (
+                ts,
+                observed,
+                record.get("next_reevaluation"),
+                record.get("expires_at"),
+                str(record.get("decision_id") or ""),
+                str(record.get("intent_id") or ""),
+                last[0],
+            ),
+        )
+        return
+
+    conn.execute(
+        f"INSERT INTO {EPISODE_TABLE}("
+        "symbol, category, exact_reason, controlling_authority, decision_id, intent_id, "
+        "blocks_live_execution, first_seen_ts, last_seen_ts, observation_count, "
+        "expires_at, next_reevaluation, first_observed_json, last_observed_json, required_json"
+        ") VALUES(?,?,?,?,?,?,?,?,?,1,?,?,?,?,?)",
+        (
+            symbol,
+            category,
+            reason,
+            str(record.get("controlling_authority") or ""),
+            str(record.get("decision_id") or ""),
+            str(record.get("intent_id") or ""),
+            1 if record.get("blocks_live_execution") else 0,
+            ts,
+            ts,
+            record.get("expires_at"),
+            record.get("next_reevaluation"),
+            observed,
+            observed,
+            json.dumps(record.get("required") or {}, default=str),
+        ),
+    )
+
+
 def persist_hold_record(db_path: str, record: dict[str, Any]) -> None:
     if not db_path:
         return
     symbol = str(record.get("symbol") or "")
     if not symbol:
         return
+    conn = None
     try:
         conn = sqlite3.connect(db_path, timeout=8)
         conn.execute("PRAGMA busy_timeout=8000")
+        _ensure_episode_table(conn, db_path)
+        # BEGIN IMMEDIATE: the snapshot is a read-modify-write of one shared JSON blob
+        # keyed by symbol. Without an exclusive write transaction, two symbols updating
+        # concurrently each read the pre-image and the second write drops the first.
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT value_json FROM operational_state WHERE key=?", (STATE_KEY,)).fetchone()
         current: dict[str, Any] = {}
         if row and row[0]:
@@ -152,10 +259,48 @@ def persist_hold_record(db_path: str, record: dict[str, Any]) -> None:
             "INSERT INTO operational_state(key, value_json, updated_ts) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_ts=excluded.updated_ts",
             (STATE_KEY, payload, int(time.time())),
         )
+        _append_episode(conn, record)
         conn.commit()
-        conn.close()
     except Exception:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.rollback()
         logger.debug("persist_hold_record failed", exc_info=True)
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+
+
+def load_hold_episodes(db_path: str, *, since_ts: float | None = None, symbol: str = "", limit: int = 500) -> list[dict[str, Any]]:
+    """Read the append-only episode ledger for runtime decision audits."""
+    if not db_path:
+        return []
+    sql = (
+        f"SELECT symbol, category, exact_reason, controlling_authority, decision_id, intent_id, "
+        f"blocks_live_execution, first_seen_ts, last_seen_ts, observation_count, expires_at, "
+        f"next_reevaluation, first_observed_json, last_observed_json, required_json "
+        f"FROM {EPISODE_TABLE} WHERE 1=1"
+    )
+    args: list[Any] = []
+    if since_ts is not None:
+        sql += " AND last_seen_ts >= ?"
+        args.append(float(since_ts))
+    if symbol:
+        sql += " AND symbol = ?"
+        args.append(symbol)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(int(limit))
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(sql, tuple(args)).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        logger.debug("load_hold_episodes failed", exc_info=True)
+        return []
 
 
 def load_hold_records(db_path: str) -> list[dict[str, Any]]:
