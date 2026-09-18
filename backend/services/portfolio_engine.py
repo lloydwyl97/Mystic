@@ -2440,6 +2440,12 @@ class PortfolioEngine:
                 apply_first_xrp_rt_correction(self.db_path)
             except Exception:
                 logger.exception("XRP_RT_ACCOUNTING_CORRECTION_FAILED")
+            try:
+                from backend.services.live_fill_economics import apply_eth_lot_integrity_correction
+
+                apply_eth_lot_integrity_correction(self.db_path)
+            except Exception:
+                logger.exception("ETH_LOT_INTEGRITY_CORRECTION_FAILED")
 
         # STEP 1: Try to load from SQLite (deterministic restart)
         ledger_loaded = await self._load_ledger_from_sqlite()
@@ -2778,7 +2784,19 @@ class PortfolioEngine:
                     # Coordinate: Skip pause logic for dust (continue without pause)
                     continue
                 # Rule 2: DB differs -> set DB = exchange snapped, ACTIVE
-                if abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
+                from backend.services.live_fill_economics import active_lot_keeps_booked_qty
+
+                if str(getattr(position, "status", "") or "ACTIVE").upper() == "ACTIVE" and active_lot_keeps_booked_qty(booked_qty=db_qty, exchange_qty=exchange_qty):
+                    try:
+                        from backend.services.day_entry_spendable import money as _money_surplus
+                        from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
+
+                        surplus = _money_surplus(exchange_qty) - _money_surplus(db_qty)
+                        if surplus > 0:
+                            stamp_protected_preexisting_dust(self.db_path, symbol, surplus)
+                    except Exception:
+                        logger.debug("PROTECTED_DUST_SURPLUS_SKIPPED %s", symbol, exc_info=True)
+                elif abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
                     position.quantity = snapped
                     from backend.services.day_mandatory_exit_execution import STATUS_EXIT_RESIDUAL_PENDING
 
@@ -3084,7 +3102,19 @@ class PortfolioEngine:
                 self._metrics_reconciliation_adjustments += 1
                 logger.info("DUST_PENDING:%s ex_qty=%s reason=%s", symbol, exact, dust_reason or "below min")
                 continue
-            if abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
+            from backend.services.live_fill_economics import active_lot_keeps_booked_qty
+
+            if str(getattr(position, "status", "") or "ACTIVE").upper() == "ACTIVE" and active_lot_keeps_booked_qty(booked_qty=db_qty, exchange_qty=exchange_qty):
+                try:
+                    from backend.services.day_entry_spendable import money as _money_surplus
+                    from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
+
+                    surplus = _money_surplus(exchange_qty) - _money_surplus(db_qty)
+                    if surplus > 0:
+                        stamp_protected_preexisting_dust(self.db_path, symbol, surplus)
+                except Exception:
+                    logger.debug("PROTECTED_DUST_SURPLUS_SKIPPED %s", symbol, exc_info=True)
+            elif abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
                 position.quantity = snapped
                 from backend.services.day_mandatory_exit_execution import STATUS_EXIT_RESIDUAL_PENDING
 
@@ -9885,7 +9915,7 @@ class PortfolioEngine:
                 _tel_conn.commit()
 
         async with self._global_cash_lock:
-            self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
+            self._consume_entry_reservation(symbol, decision_id=str(decision_id or ""))
             _entry_reserved = False
             self.cash_balance = committed_cash
             self._available_balance = max(0.0, self.cash_balance)
@@ -12770,6 +12800,17 @@ class PortfolioEngine:
             "ts": time.time(),
         }
         return True, "OK"
+
+    def _consume_entry_reservation(self, symbol: str, *, decision_id: str = "") -> None:
+        """A filled BUY spends the reservation. CONSUMED, not RELEASED."""
+        ns = normalize_symbol(symbol)
+        meta = self._entry_reservations.pop(ns, None) or {}
+        did = str(decision_id or meta.get("decision_id") or "")
+        rid = str(meta.get("reservation_id") or "")
+        with contextlib.suppress(Exception):
+            from backend.services.day_entry_reservations import consume_reservation
+
+            consume_reservation(self.db_path, reservation_id=rid, decision_id=did, symbol=ns)
 
     def _release_entry_reservation(self, symbol: str, *, decision_id: str = "", reason: str = "RELEASED") -> None:
         ns = normalize_symbol(symbol)

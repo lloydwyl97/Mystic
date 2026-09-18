@@ -18,6 +18,8 @@ from backend.utils.symbols import normalize_symbol
 QUOTE_FEE_ASSETS = frozenset({"USDT", "USD", "BUSD", "USDC"})
 FIRST_XRP_RT_CORRECTION_ID = "xrp_rt_488230379_488239569"
 FIRST_XRP_RT_CORRECTION_KEY = f"live_accounting_correction:{FIRST_XRP_RT_CORRECTION_ID}"
+ETH_LOT_CORRECTION_ID = "eth_integrity_1587754176_1587893573"
+ETH_LOT_CORRECTION_KEY = f"live_accounting_correction:{ETH_LOT_CORRECTION_ID}"
 _CORRECTIONS_TABLE = "live_accounting_corrections"
 
 # coin_performance field classification (audit 2026-08-24).
@@ -442,6 +444,219 @@ def _ensure_corrections_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+
+def active_lot_keeps_booked_qty(*, booked_qty: object, exchange_qty: object) -> bool:
+    """ACTIVE booked qty stays if exchange still covers it. Surplus is dust."""
+    booked = money(booked_qty)
+    exchange = money(exchange_qty)
+    if booked <= 0:
+        return False
+    return exchange + Decimal("0.000000000001") >= booked
+
+
+def eth_captured_buy_1587754176() -> dict[str, Any]:
+    """Authoritative Binance.US fill for BUY 1587754176."""
+    gross = money("0.0227")
+    fee = money("0.00000454")
+    px = money("2638.42")
+    return {
+        "trade_id": "18722272",
+        "order_id": "1587754176",
+        "quantity": str(gross),
+        "price": str(px),
+        "quote_quantity": "59.892134",
+        "commission_amount": str(fee),
+        "commission_asset": "ETH",
+        "maker_taker": "taker",
+        "fill_timestamp_ms": 1789761330207,
+        "net_credited": str(gross - fee),
+        "quote_commission": "0",
+        "buy_fee_quote_value": str(fee * px),
+    }
+
+
+def eth_current_buy_1587893573() -> dict[str, Any]:
+    """Authoritative Binance.US fill for the live ETH lot after 1587754176 exited."""
+    gross = money("0.0166")
+    fee = money("0.00000332")
+    px = money("2629.51")
+    return {
+        "trade_id": "18722674",
+        "order_id": "1587893573",
+        "quantity": str(gross),
+        "price": str(px),
+        "quote_quantity": "43.649866",
+        "commission_amount": str(fee),
+        "commission_asset": "ETH",
+        "maker_taker": "taker",
+        "fill_timestamp_ms": 1789770820700,
+        "net_credited": str(gross - fee),
+        "quote_commission": "0",
+        "buy_fee_quote_value": str(fee * px),
+    }
+
+
+def _eth_integrity_reservation_audit(db_path: str) -> dict[str, Any]:
+    """Canonicalize filled ETH reservations. Safe to call on every replay."""
+    from backend.services.day_entry_reservations import correct_filled_reservation_to_consumed
+
+    return {
+        "named_reservation": correct_filled_reservation_to_consumed(db_path, reservation_id="res_b1271f7a936e4a82"),
+        "live_reservation": correct_filled_reservation_to_consumed(db_path, reservation_id="res_9e7ebc24ecf34ffe"),
+    }
+
+
+def _eth_integrity_stamp_dust(db_path: str, payload: dict[str, Any], exchange_eth: object | None) -> None:
+    from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
+
+    live_net = money(eth_current_buy_1587893573()["net_credited"])
+    if exchange_eth is None:
+        return
+    surplus = money(exchange_eth) - live_net
+    if surplus < 0:
+        surplus = Decimal("0")
+    payload["protected_dust"] = str(surplus)
+    payload["exchange_eth"] = str(money(exchange_eth))
+    stamp_protected_preexisting_dust(db_path, "ETH/USDT", surplus)
+
+
+def apply_eth_lot_integrity_correction(db_path: str, *, exchange_eth: object | None = None) -> dict[str, Any]:
+    """Reconcile ETH qty/reservations. Idempotent. Never inserts a second trade."""
+    from datetime import datetime, timezone
+
+    existing = load_operational_json(db_path, ETH_LOT_CORRECTION_KEY)
+    if existing.get("applied"):
+        existing.update(_eth_integrity_reservation_audit(db_path))
+        _eth_integrity_stamp_dust(db_path, existing, exchange_eth)
+        persist_operational_json(db_path, ETH_LOT_CORRECTION_KEY, existing)
+        return existing
+    named = eth_captured_buy_1587754176()
+    live = eth_current_buy_1587893573()
+    live_net = money(live["net_credited"])
+    payload: dict[str, Any] = {
+        "correction_id": ETH_LOT_CORRECTION_ID,
+        "is_new_trade": False,
+        "named_buy": named,
+        "live_buy": live,
+        "named_reservation_id": "res_b1271f7a936e4a82",
+        "live_reservation_id": "res_9e7ebc24ecf34ffe",
+        "named_intent_id": "tb52cbcd4ef74e4e1b",
+        "named_decision_id": "day_ETHUSDT_1789760671103",
+        "live_intent_id": "tba3fa216c3f724628",
+        "live_decision_id": "day_ETHUSDT_1789770008654",
+        "exchange_order_ids": [named["order_id"], live["order_id"]],
+        "venue_trade_ids": [named["trade_id"], live["trade_id"]],
+        "previous_reservation_status": "RELEASED",
+        "corrected_canonical_status": "CONSUMED",
+        "correction_reason": "triple-counted base fee and RELEASED-after-fill reservation",
+        "reason": "triple-counted base fee and RELEASED-after-fill reservation",
+        "correction_timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        with sqlite3.connect(db_path, timeout=15) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            _ensure_corrections_table(conn)
+            already = conn.execute(
+                f"SELECT 1 FROM {_CORRECTIONS_TABLE} WHERE correction_id=?",
+                (ETH_LOT_CORRECTION_ID,),
+            ).fetchone()
+            if already:
+                conn.commit()
+                payload["applied"] = True
+                payload.update(_eth_integrity_reservation_audit(db_path))
+                _eth_integrity_stamp_dust(db_path, payload, exchange_eth)
+                persist_operational_json(db_path, ETH_LOT_CORRECTION_KEY, payload)
+                return payload
+            pos_row = conn.execute(
+                "SELECT symbol, quantity, status, trade_id, entry_price, entry_order_id, stop_price, "
+                "take_profit_1_price, trailing_stop_price, highest_price, thesis_json "
+                "FROM portfolio_engine_positions WHERE symbol IN ('ETH/USDT','ETHUSDT')"
+            ).fetchone()
+            prior_pos = None
+            if pos_row:
+                prior_pos = {
+                    "symbol": pos_row[0],
+                    "quantity": pos_row[1],
+                    "status": pos_row[2],
+                    "trade_id": pos_row[3],
+                    "entry_price": pos_row[4],
+                    "entry_order_id": pos_row[5],
+                    "stop_price": pos_row[6],
+                    "take_profit_1_price": pos_row[7],
+                    "trailing_stop_price": pos_row[8],
+                    "highest_price": pos_row[9],
+                    "thesis_json": pos_row[10],
+                }
+            payload["prior_position"] = prior_pos
+            buy_row = conn.execute("SELECT quantity, fees_paid FROM paper_trades WHERE order_id='1587754176' AND UPPER(side)='BUY'").fetchone()
+            payload["prior_named_buy"] = {"quantity": buy_row[0], "fees_paid": buy_row[1]} if buy_row else None
+            sell_row = conn.execute("SELECT trade_id, quantity, price, fees_paid, pnl, pnl_usd_net FROM paper_trades WHERE order_id='1587872124' AND UPPER(side)='SELL'").fetchone()
+            payload["prior_named_sell"] = (
+                dict(
+                    zip(
+                        ("trade_id", "quantity", "price", "fees_paid", "pnl", "pnl_usd_net"),
+                        sell_row,
+                        strict=False,
+                    )
+                )
+                if sell_row
+                else None
+            )
+            conn.execute(
+                "UPDATE paper_trades SET quantity=?, fees_paid=? WHERE order_id='1587754176' AND UPPER(side)='BUY'",
+                (float(money(named["net_credited"])), float(money(named["buy_fee_quote_value"]))),
+            )
+            if sell_row:
+                sold = money(sell_row[1])
+                exit_px = money(sell_row[2])
+                entry_px = money(named["price"])
+                sell_fee = money(sell_row[3] if sell_row[3] is not None else "0.01187381")
+                buy_fee_q = money(named["buy_fee_quote_value"])
+                net_all = sold * (exit_px - entry_px) - buy_fee_q - sell_fee
+                payload["named_sell_net_pnl"] = str(net_all)
+                cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(paper_trades)")}
+                sets = ["fees_paid=?", "pnl=?"]
+                params: list[Any] = [float(sell_fee), float(net_all)]
+                if "pnl_usd_net" in cols:
+                    sets.append("pnl_usd_net=?")
+                    params.append(float(net_all))
+                params.append("1587872124")
+                conn.execute(
+                    f"UPDATE paper_trades SET {', '.join(sets)} WHERE order_id=? AND UPPER(side)='SELL'",
+                    params,
+                )
+            if prior_pos and str(prior_pos.get("entry_order_id") or "") == "1587893573":
+                conn.execute(
+                    "UPDATE portfolio_engine_positions SET quantity=? WHERE symbol=? AND trade_id=?",
+                    (float(live_net), prior_pos["symbol"], prior_pos["trade_id"]),
+                )
+                payload["corrected_active_qty"] = str(live_net)
+                payload["preserved_entry_price"] = prior_pos.get("entry_price")
+                payload["preserved_trade_id"] = prior_pos.get("trade_id")
+            conn.execute(
+                f"""
+                INSERT INTO {_CORRECTIONS_TABLE} (
+                    correction_id, buy_order_id, sell_order_id, mystic_sell_trade_id,
+                    payload_json, created_ts
+                ) VALUES (?, ?, ?, ?, ?, datetime('now'))
+                """,
+                (
+                    ETH_LOT_CORRECTION_ID,
+                    named["order_id"],
+                    "1587872124",
+                    (sell_row[0] if sell_row else ""),
+                    json.dumps(payload, default=str),
+                ),
+            )
+            conn.commit()
+    except sqlite3.Error:
+        return {**payload, "applied": False, "error": "sqlite"}
+    payload.update(_eth_integrity_reservation_audit(db_path))
+    payload["applied"] = True
+    _eth_integrity_stamp_dust(db_path, payload, exchange_eth)
+    persist_operational_json(db_path, ETH_LOT_CORRECTION_KEY, payload)
+    return payload
 
 
 def apply_first_xrp_rt_correction(db_path: str) -> dict[str, Any]:

@@ -233,6 +233,47 @@ def consume_reservation(
         conn.close()
 
 
+def correct_filled_reservation_to_consumed(
+    db_path: str | Path,
+    *,
+    reservation_id: str,
+) -> dict[str, Any]:
+    """Canonicalize a filled BUY reservation to CONSUMED.
+
+    A RELEASED or EXPIRED row that already funded an accepted fill is not a
+    second reservation. This is the only transition that may move a non-ACTIVE
+    row to CONSUMED.
+    """
+    rid = str(reservation_id or "").strip()
+    if not rid:
+        return {"changed": False, "previous_status": "", "status": ""}
+    ensure_reservation_schema(db_path)
+    now = time.time()
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT status FROM day_entry_reservations WHERE reservation_id=?",
+            (rid,),
+        ).fetchone()
+        previous = str(row[0]) if row else ""
+        if not row:
+            conn.commit()
+            return {"changed": False, "previous_status": "", "status": ""}
+        if previous == STATUS_CONSUMED:
+            conn.commit()
+            return {"changed": False, "previous_status": previous, "status": STATUS_CONSUMED}
+        conn.execute(
+            "UPDATE day_entry_reservations SET status=?, updated_at=? WHERE reservation_id=? AND status!=?",
+            (STATUS_CONSUMED, now, rid, STATUS_CONSUMED),
+        )
+        conn.commit()
+        logger.info("RESERVATION_CORRECTED_CONSUMED reservation=%s previous=%s", rid, previous)
+        return {"changed": True, "previous_status": previous, "status": STATUS_CONSUMED}
+    finally:
+        conn.close()
+
+
 def reservation_status(db_path: str | Path, reservation_id: str) -> str:
     """Current status of one reservation, or "" when it does not exist."""
     if not reservation_id:
@@ -312,6 +353,7 @@ __all__ = [
     "active_notional",
     "active_symbols",
     "consume_reservation",
+    "correct_filled_reservation_to_consumed",
     "create_reservation",
     "ensure_reservation_schema",
     "expire_stale",
