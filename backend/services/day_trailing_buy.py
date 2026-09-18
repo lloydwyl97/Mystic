@@ -764,42 +764,23 @@ async def cycle_trailing_buy_intents(engine: Any, redis_client: Any) -> dict[str
         book = read_market_book(books, symbol)
         ask = float((book or {}).get("ask") or 0.0)
         fresh = bool(book and book.get("fresh") and float(book.get("freshness_sec") or 0.0) <= BOOK_STALE_SEC)
-        validity = ""
-        try:
-            from backend.config.day_setup_discovery import SETUP_DISCOVERY_LOOKBACK_BARS
-            from backend.services.day_path_net import load_recent_bars
-            from backend.services.day_setup_discovery import live_intent_validity
-
-            raw_bars = load_recent_bars(
-                str(getattr(engine, "db_path", "") or ""),
-                symbol,
-                n=SETUP_DISCOVERY_LOOKBACK_BARS,
-            )
-            bars = []
-            for row in raw_bars:
-                epoch = _bar_epoch(row.get("ts"))
-                bars.append(
-                    (
-                        epoch,
-                        float(row["open"]),
-                        float(row["high"]),
-                        float(row["low"]),
-                        float(row["close"]),
-                        float(row.get("volume") or 0.0),
-                    )
-                )
-            validity = live_intent_validity(intent, ask=ask, now=time.time(), bars=bars)
-        except Exception:
-            logger.exception("TRAILING_BUY_VALIDITY_FAILED symbol=%s", symbol)
+        # Setup-discovery / 4H structure cannot cancel a live intent.
+        # live_intent_validity is permanently unenforced; do not load bars for it.
         decision = observe_book(
             intent,
             ask=ask,
             now=time.time(),
             book_fresh=fresh,
             thesis_invalid=_thesis_invalid(intent, ask),
-            validity_reason=validity,
+            validity_reason="",
         )
         log_observe_decision(intent, decision, ask=ask)
+        try:
+            from backend.services.day_decision_state import record_trailing_observe
+
+            record_trailing_observe(str(engine.db_path), intent, decision, ask=ask)
+        except Exception:
+            logger.debug("hold-state persist skipped", exc_info=True)
         if decision.action in {"expire", "cancel"}:
             mark_terminal(
                 engine.db_path,

@@ -8323,16 +8323,18 @@ class PortfolioEngine:
                 entry_authority or "missing",
             )
             self.last_buy_reject_reason = "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH"
+            self._persist_buy_reject_hold(symbol, decision_id=decision_id, intent_id=trailing_buy_intent_id)
             return None
         normalized_symbol_for_lock = normalize_symbol(symbol)
         # PE-3: Hard-gate — only DAY_TRADE_SYMBOLS may execute buys.
         if _to_api_symbol(symbol) not in DAY_TRADE_SYMBOLS:
             logger.debug("[BUY_GATE] %s not in trading universe, rejecting from execute_buy_fifo", symbol)
             self.last_buy_reject_reason = "SYMBOL_NOT_EXECUTABLE"
+            self._persist_buy_reject_hold(symbol, decision_id=decision_id, intent_id=trailing_buy_intent_id)
             return None
         lock = self._buy_execution_locks.setdefault(normalized_symbol_for_lock, asyncio.Lock())
         async with lock:
-            return await self._execute_buy_fifo_locked(
+            bought = await self._execute_buy_fifo_locked(
                 symbol,
                 quantity,
                 price,
@@ -8347,6 +8349,9 @@ class PortfolioEngine:
                 client_order_id=client_order_id,
                 trailing_buy_intent_id=trailing_buy_intent_id,
             )
+            if bought is None:
+                self._persist_buy_reject_hold(symbol, decision_id=decision_id, intent_id=trailing_buy_intent_id)
+            return bought
 
     async def _execute_buy_fifo_locked(
         self,
@@ -12992,6 +12997,26 @@ class PortfolioEngine:
 
             if exit_result:
                 exits_executed.append(exit_result)
+            else:
+                try:
+                    from backend.services.day_decision_state import (
+                        OPEN_POSITION_HOLD,
+                        build_hold_record,
+                        persist_hold_record,
+                    )
+
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=str(symbol),
+                            category=OPEN_POSITION_HOLD,
+                            reason="NO_EXIT_CONDITION",
+                            authority="monitor_all_positions/_check_exit_conditions",
+                            observed={"mark": current_price, "qty": float(getattr(position, "quantity", 0) or 0)},
+                        ),
+                    )
+                except Exception:
+                    logger.debug("hold-state open-position persist skipped", exc_info=True)
 
         self._exit_mark_price_source_stale = any_stale_marks
 
@@ -15632,10 +15657,67 @@ class PortfolioEngine:
             slots,
             allowed,
         )
+        try:
+            from backend.services.day_decision_state import (
+                MODEL_HOLD_TELEMETRY,
+                NO_RANKED_CANDIDATE,
+                build_hold_record,
+                persist_hold_record,
+            )
+
+            if not pool:
+                for sym in DAY_TRADE_SYMBOLS:
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=str(sym),
+                            category=NO_RANKED_CANDIDATE,
+                            reason="no_usable_ranked_symbol",
+                            authority="trailing_buy_ranked_stream",
+                        ),
+                    )
+            else:
+                for cand in pool:
+                    dd = dict(getattr(cand, "decision_data", None) or {})
+                    side = str(dd.get("side") or dd.get("action") or "").upper()
+                    if side in {"HOLD", "SELL"}:
+                        persist_hold_record(
+                            str(self.db_path),
+                            build_hold_record(
+                                symbol=str(getattr(cand, "symbol", "") or ""),
+                                category=MODEL_HOLD_TELEMETRY,
+                                reason=f"model_side={side}",
+                                authority="rank_score/path_ev_telemetry",
+                                decision_id=str(getattr(cand, "decision_id", "") or ""),
+                                observed={"side": side, "confidence": getattr(cand, "confidence", None)},
+                            ),
+                        )
+        except Exception:
+            logger.debug("hold-state rank persist skipped", exc_info=True)
         armed_rows: list[dict[str, Any]] = []
         preserved_rows: list[dict[str, Any]] = []
         if not allowed:
             logger.info("TRAILING_BUY_STREAM_BLOCKED %s", why)
+            try:
+                from backend.services.day_decision_state import (
+                    OPERATOR_CONTROL_BLOCK,
+                    build_hold_record,
+                    persist_hold_record,
+                )
+
+                for cand in pool or stream_candidates or ranked_candidates:
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=str(getattr(cand, "symbol", "") or ""),
+                            category=OPERATOR_CONTROL_BLOCK,
+                            reason=str(why or "KILL_OR_PAUSE"),
+                            authority="trailing_buy_ranked_stream",
+                            decision_id=str(getattr(cand, "decision_id", "") or ""),
+                        ),
+                    )
+            except Exception:
+                logger.debug("hold-state operator persist skipped", exc_info=True)
             return {
                 "trailing_buy_armed": False,
                 "intents": [],
@@ -15651,9 +15733,48 @@ class PortfolioEngine:
             block = self._day_path_ev_entry_block_reason(symbol, max_pos)
             if block == "DUPLICATE_SAME_SYMBOL":
                 logger.info("TRAILING_BUY_STREAM_SKIP %s DUPLICATE_SAME_SYMBOL", symbol)
+                try:
+                    from backend.services.day_decision_state import (
+                        CAPITAL_OR_SLOT_BLOCK,
+                        OPEN_POSITION_HOLD,
+                        build_hold_record,
+                        persist_hold_record,
+                    )
+
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=symbol,
+                            category=OPEN_POSITION_HOLD,
+                            reason="DUPLICATE_SAME_SYMBOL",
+                            authority="trailing_buy_ranked_stream",
+                            decision_id=str(getattr(candidate, "decision_id", "") or ""),
+                        ),
+                    )
+                except Exception:
+                    logger.debug("hold-state duplicate persist skipped", exc_info=True)
                 continue
             if block == "MAX_OPEN_LIMIT":
                 logger.info("TRAILING_BUY_STREAM_SKIP MAX_OPEN_LIMIT")
+                try:
+                    from backend.services.day_decision_state import (
+                        CAPITAL_OR_SLOT_BLOCK,
+                        build_hold_record,
+                        persist_hold_record,
+                    )
+
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=symbol,
+                            category=CAPITAL_OR_SLOT_BLOCK,
+                            reason="MAX_OPEN_LIMIT",
+                            authority="trailing_buy_ranked_stream",
+                            decision_id=str(getattr(candidate, "decision_id", "") or ""),
+                        ),
+                    )
+                except Exception:
+                    logger.debug("hold-state slot persist skipped", exc_info=True)
                 break
             decision_id = str(candidate.decision_id or f"tb-stream-{_to_api_symbol(symbol)}-{int(bar_timestamp)}")
             await self._entry_ensure_constraints(symbol)
@@ -15669,6 +15790,26 @@ class PortfolioEngine:
             )
             if quantity <= 0:
                 logger.info("TRAILING_BUY_STREAM_SKIP %s BUY_SKIP_SIZING", symbol)
+                try:
+                    from backend.services.day_decision_state import (
+                        CAPITAL_OR_SLOT_BLOCK,
+                        build_hold_record,
+                        persist_hold_record,
+                    )
+
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=symbol,
+                            category=CAPITAL_OR_SLOT_BLOCK,
+                            reason="BUY_SKIP_SIZING",
+                            authority="trailing_buy_ranked_stream",
+                            decision_id=decision_id,
+                            observed={"quantity": quantity},
+                        ),
+                    )
+                except Exception:
+                    logger.debug("hold-state sizing persist skipped", exc_info=True)
                 continue
             book = fresh_executable_book(redis_client, symbol)
             ask = float((book or {}).get("ask") or candidate.current_price or 0.0)
@@ -15839,53 +15980,11 @@ class PortfolioEngine:
         }
 
     async def poll_trailing_buy_arms(self, bar_timestamp: int) -> dict[str, Any] | None:
-        """Trail executable asks. Buy on the first confirmed rebound only."""
-        from backend.services.day_trailing_buy import ARM_MAX_SEC, executable_best_ask
-
-        last_fill: dict[str, Any] | None = None
-        now = time.time()
-        for key, arm in list((getattr(self, "_trailing_buy_arms", None) or {}).items()):
-            last = float(self._get_cached_market_price(getattr(arm, "symbol", key)) or 0.0)
-            ask = executable_best_ask(getattr(arm, "symbol", key), last_price=last)
-            if ask <= 0:
-                ask = last
-            state = arm.observe_ask(ask, ts=now)
-            if state == "EXPIRED":
-                self._trailing_buy_arms.pop(key, None)
-                logger.info("TRAILING_BUY_EXPIRED symbol=%s reason=ARM_TTL", key)
-                continue
-            if state != "BUY":
-                continue
-            self._trailing_buy_arms.pop(key, None)
-            result = await self.execute_buy_fifo(
-                symbol=str(getattr(arm, "symbol", key)),
-                quantity=float(arm.quantity),
-                price=float(ask or arm.trigger_ask or arm.initial_ask),
-                stop_price=float(arm.stop_price),
-                atr=float(arm.atr),
-                confidence=float(arm.confidence),
-                bar_timestamp=int(bar_timestamp or arm.bar_timestamp),
-                explainability=arm.explainability,
-                decision_id=str(arm.decision_id or ""),
-                sleeve=str(arm.sleeve or ""),
-            )
-            if result is None:
-                if now - float(arm.decision_epoch) <= float(ARM_MAX_SEC):
-                    self._trailing_buy_arms[key] = arm
-                    logger.info("TRAILING_BUY_FIRE_BLOCKED symbol=%s restored_arm=1", key)
-                continue
-            if isinstance(result, dict) and arm.decision_id:
-                result = dict(result)
-                result["decision_id"] = arm.decision_id
-            last_fill = result
-            logger.info(
-                "TRAILING_BUY_FILLED symbol=%s qty=%.6f ask=%.6f lowest=%.6f",
-                key,
-                float(arm.quantity),
-                float(ask),
-                float(arm.lowest_ask),
-            )
-        return last_fill
+        """Unreachable legacy in-memory arm poll. Never submit an order from here."""
+        del bar_timestamp
+        logger.error("BUY_BLOCKED_LEGACY_IMMEDIATE_PATH poll_trailing_buy_arms is unreachable")
+        self.last_buy_reject_reason = "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH"
+        return None
 
     async def process_bar_candidates(self, bar_timestamp: int) -> dict[str, Any] | None:
         """
@@ -16107,9 +16206,11 @@ class PortfolioEngine:
                 _entry_thesis = str((_tc.decision_data or {}).get("entry_thesis") or (_tc.decision_data or {}).get("setup_type") or "")
                 # No ML buy_margin bypass — thesis required for new opens (day_aw_owner_v1).
                 if _entry_thesis == SETUP_NO_CLEAR_THESIS and _tc.symbol not in self.open_positions:
-                    logger.info("THESIS_ENTRY_BLOCK: %s no clear thesis -> entry skipped", _tc.symbol)
-                    await self._bar_pipeline_terminal(_tc.decision_id, "BAR_PRE_RANK_FILTERED", pipeline_done)
-                    await self._record_learning_snapshot(_tc, "BLOCK", "NO_CLEAR_THESIS")
+                    logger.info(
+                        "THESIS_ENTRY_TELEMETRY: %s no clear thesis (not blocking ranked trailing-buy)",
+                        _tc.symbol,
+                    )
+                    await self._record_learning_snapshot(_tc, "HOLD", "NO_CLEAR_THESIS_TELEMETRY")
                     try:
                         from backend.services.day_gate_telemetry import record_gate_event
 
@@ -16117,13 +16218,31 @@ class PortfolioEngine:
                             self.db_path,
                             gate_id="THESIS_NO_CLEAR",
                             symbol=_tc.symbol,
-                            outcome="hard_blocked",
+                            outcome="telemetry",
                             setup=_entry_thesis,
                             decision_id=str(_tc.decision_id or ""),
                         )
                     except Exception:
                         pass
-                    continue
+                    try:
+                        from backend.services.day_decision_state import (
+                            MODEL_HOLD_TELEMETRY,
+                            build_hold_record,
+                            persist_hold_record,
+                        )
+
+                        persist_hold_record(
+                            str(self.db_path),
+                            build_hold_record(
+                                symbol=str(_tc.symbol),
+                                category=MODEL_HOLD_TELEMETRY,
+                                reason="NO_CLEAR_THESIS",
+                                authority="rank_score/path_ev_telemetry",
+                                decision_id=str(_tc.decision_id or ""),
+                            ),
+                        )
+                    except Exception:
+                        logger.debug("hold-state thesis persist skipped", exc_info=True)
                 _thesis_kept.append(_tc)
             valid_candidates = _thesis_kept
 
@@ -16185,7 +16304,7 @@ class PortfolioEngine:
                             self.db_path,
                             gate_id="AW_EVAL_ERROR",
                             symbol=_tc.symbol,
-                            outcome="hard_blocked",
+                            outcome="telemetry",
                             decision_id=str(_tc.decision_id or ""),
                         )
                         record_shadow_reject(
@@ -16201,14 +16320,22 @@ class PortfolioEngine:
                     _gates = self._apply_allweather_production_gates(_tc)
                     if _gates.get("allowed"):
                         _dd_stamp = dict(_tc.decision_data or {})
-                        _dd_stamp.setdefault("entry_owner", "allweather")
+                        _dd_stamp.setdefault("entry_owner", "trailing_buy")
+                        _dd_stamp["allweather_shadow_owner"] = "allweather"
                         _dd_stamp.setdefault("ml_role", "rank_size")
                         _dd_stamp.setdefault("decision_policy_version", "day_aw_owner_v1")
                         _dd_stamp["bar_closed"] = bool(getattr(_awbp_outcome, "bar_closed", True))
                         if getattr(_awbp_outcome, "closed_bar_ts", 0):
                             _dd_stamp["closed_bar_ts"] = int(_awbp_outcome.closed_bar_ts)
+                        _dd_stamp["allweather_telemetry_only"] = True
+                        _dd_stamp["allweather_bracket_exit"] = False
+                        if str(_dd_stamp.get("strategy_family") or "") in {
+                            "ALLWEATHER_BREAKOUT_PULLBACK",
+                            "allweather",
+                        }:
+                            _dd_stamp["allweather_strategy_family_shadow"] = _dd_stamp.get("strategy_family")
+                            _dd_stamp["strategy_family"] = "day"
                         _tc.decision_data = _dd_stamp
-                        _routed.append(_tc)
                         try:
                             from backend.services.day_gate_telemetry import record_gate_event
 
@@ -16240,7 +16367,7 @@ class PortfolioEngine:
                                 self.db_path,
                                 gate_id="AW_ROUTE_BLOCK",
                                 symbol=_tc.symbol,
-                                outcome="hard_blocked",
+                                outcome="telemetry",
                                 decision_id=str(_tc.decision_id or ""),
                                 detail=_block_r,
                             )
@@ -16291,7 +16418,7 @@ class PortfolioEngine:
                             self.db_path,
                             gate_id=_aw_gate,
                             symbol=_tc.symbol,
-                            outcome="hard_blocked",
+                            outcome="telemetry",
                             regime=str(_diag.get("regime") or ""),
                             decision_id=str(_tc.decision_id or ""),
                         )
@@ -16304,8 +16431,11 @@ class PortfolioEngine:
                         )
                     except Exception:
                         pass
-                # AW execution path is terminal — no ML margin fall-through (day_aw_owner_v1).
-                continue
+                # AW is telemetry only. Ranked trailing-buy remains the live entry stream.
+                logger.info(
+                    "ALLWEATHER_BP_TELEMETRY_ONLY symbol=%s (not blocking ranked trailing-buy)",
+                    _tc.symbol,
+                )
             if _awbp_active:
                 _awbp_outcome = await self._apply_allweather_breakout_pullback_candidate(_tc)
                 if getattr(_awbp_outcome, "ok", False) and not _awbp_exec:
@@ -16597,13 +16727,38 @@ class PortfolioEngine:
         if top_candidate is None:
             await self._emit_day_health_telemetry("DAY_PATH_EV_HOLD")
             logger.info(
-                "DAY_PATH_EV_HOLD winner=%s btc=%.6f eth=%.6f sol=%.6f xrp=%.6f old_nominee=%s",
+                "DAY_PATH_EV_HOLD winner=%s btc=%.6f eth=%.6f sol=%.6f xrp=%.6f old_nominee=%s (telemetry only — ranked trailing-buy still arms)",
                 (_day_auth or {}).get("path_ev_winner"),
                 float((_day_auth or {}).get("btc_path_ev") or 0),
                 float((_day_auth or {}).get("eth_path_ev") or 0),
                 float((_day_auth or {}).get("sol_path_ev") or 0),
                 float((_day_auth or {}).get("xrp_path_ev") or 0),
                 (_day_auth or {}).get("old_rank_nominee"),
+            )
+            try:
+                from backend.services.day_decision_state import (
+                    MODEL_HOLD_TELEMETRY,
+                    build_hold_record,
+                    persist_hold_record,
+                )
+
+                persist_hold_record(
+                    str(self.db_path),
+                    build_hold_record(
+                        symbol=str((_day_auth or {}).get("path_ev_winner") or "HOLD"),
+                        category=MODEL_HOLD_TELEMETRY,
+                        reason="DAY_PATH_EV_HOLD",
+                        authority="rank_score/path_ev_telemetry",
+                        observed=dict(_day_auth or {}),
+                    ),
+                )
+            except Exception:
+                logger.debug("hold-state path-ev persist skipped", exc_info=True)
+            result = await self._arm_trailing_buy_ranked_stream(
+                ranked_candidates=valid_candidates,
+                stream_candidates=bar_candidate_snapshot,
+                bar_timestamp=int(bar_timestamp),
+                path_ev_decision=_day_auth,
             )
             self._persist_profit_cycle_state(
                 {
@@ -16612,15 +16767,16 @@ class PortfolioEngine:
                     "current_cycle": {
                         "leaderboard": [],
                         "leaderboard_len": 0,
-                        "selected_trade": False,
-                        "day_authority_mode": "direct_four_coin_path_ev",
+                        "selected_trade": bool(result and (result.get("armed") or result.get("trailing_buy_armed"))),
+                        "day_authority_mode": "trailing_buy_ranked_stream",
                         "old_rank_execution_authority": False,
+                        "path_ev_authoritative": False,
                         "path_ev_winner": (_day_auth or {}).get("path_ev_winner"),
                     },
                 }
             )
             self.current_bar_candidates.clear()
-            return None
+            return result
         execution_sane_candidates: list[BuyCandidate] = [top_candidate]
         self._bar_extra_buy_candidates = []
 
@@ -16664,8 +16820,8 @@ class PortfolioEngine:
                     },
                 }
             )
-            self.current_bar_candidates.clear()
-            return None
+            # Duplicate on the path-EV nominee does not cancel the other three coins.
+            logger.info("DAY_PATH_EV_SAFETY duplicate nominee — trailing stream still evaluates remaining coins")
         try:
             _max_pos_bar = int(os.getenv("MAX_OPEN_POSITIONS", str(getattr(self, "max_positions", 4) or 4)))
         except Exception:
@@ -16693,8 +16849,7 @@ class PortfolioEngine:
                     },
                 }
             )
-            self.current_bar_candidates.clear()
-            return None
+            logger.info("DAY_PATH_EV_SAFETY max-open nominee — trailing stream still evaluates remaining coins")
 
         chosen, gov_hold = await self._apply_risk_governor([top_candidate])
         if gov_hold:
@@ -16890,9 +17045,7 @@ class PortfolioEngine:
                     pipeline_done=pipeline_done,
                 )
             await self._bar_pipeline_not_selected_others(bar_candidate_snapshot, top_candidate.decision_id or "", pipeline_done)
-            self.current_bar_candidates.clear()
-            self._bar_extra_buy_candidates = []
-            return None
+            logger.info("BAR_SIZING_ZERO telemetry only — ranked trailing-buy still arms remaining coins")
 
         # Align execution-time audit payload with the live Redis ML hash when the queued
         # candidate lacks context_audit_emit (stale enqueue / stale existing_pairs shortcut).
@@ -17352,8 +17505,7 @@ class PortfolioEngine:
                     },
                 }
             )
-            self.current_bar_candidates.clear()
-            return None
+            logger.info("ENTRY_QUALITY telemetry only — ranked trailing-buy still arms")
 
         # Final EV discipline: selected candidate must have positive net expected value.
         # Default: no ML_EV_BYPASS (day_aw_owner_v1). Rollback only if DAY_ML_BYPASS_ENABLED=true.
@@ -17390,7 +17542,7 @@ class PortfolioEngine:
                     self.db_path,
                     gate_id="NEGATIVE_EV",
                     symbol=str(symbol),
-                    outcome="hard_blocked",
+                    outcome="telemetry",
                     setup=str((top_candidate.decision_data or {}).get("setup_type") or ""),
                     decision_id=str(top_candidate.decision_id or ""),
                 )
@@ -17430,8 +17582,7 @@ class PortfolioEngine:
                     },
                 }
             )
-            self.current_bar_candidates.clear()
-            return None
+            logger.info("BEST_CANDIDATE_BELOW_EV_FLOOR telemetry only — ranked trailing-buy still arms")
 
         # Arm Trailing Buy for the ranked top-4 stream. Fill happens on rebound.
         result = await self._arm_trailing_buy_ranked_stream(
@@ -18418,12 +18569,41 @@ class PortfolioEngine:
             "headline_realized_pnl": headline,
         }
 
+    def _persist_buy_reject_hold(self, symbol: str, *, decision_id: str = "", intent_id: str = "") -> None:
+        reason = str(getattr(self, "last_buy_reject_reason", "") or "")
+        if not reason:
+            return
+        try:
+            from backend.services.day_decision_state import build_hold_record, classify_hold_category, persist_hold_record
+
+            persist_hold_record(
+                str(self.db_path),
+                build_hold_record(
+                    symbol=str(symbol or ""),
+                    category=classify_hold_category(reject_reason=reason),
+                    reason=reason,
+                    authority="execute_buy_fifo",
+                    decision_id=str(decision_id or ""),
+                    intent_id=str(intent_id or ""),
+                ),
+            )
+        except Exception:
+            logger.debug("hold-state buy-reject persist skipped", exc_info=True)
+
     def get_trailing_buy_intent_status(self) -> list[dict[str, Any]]:
         try:
             from backend.config.redis_config import get_redis_client
             from backend.services.day_trailing_buy import load_operator_intents
 
             return load_operator_intents(str(self.db_path), get_redis_client())
+        except Exception:
+            return []
+
+    def get_day_decision_holds(self) -> list[dict[str, Any]]:
+        try:
+            from backend.services.day_decision_state import load_hold_records
+
+            return load_hold_records(str(self.db_path))
         except Exception:
             return []
 
@@ -18559,6 +18739,7 @@ class PortfolioEngine:
             "day_entry_execution_mode": capability.get("day_entry_execution_mode"),
             "day_entry_execution_error": capability.get("day_entry_execution_error"),
             "trailing_buy_intents": self.get_trailing_buy_intent_status(),
+            "day_decision_holds": self.get_day_decision_holds(),
             "day_exit_enabled": capability["day_exit_enabled"],
             "no_trade_reason": capability["no_trade_reason"],
             "process_alive": True,

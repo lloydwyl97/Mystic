@@ -400,6 +400,7 @@ def test_path_ev_hold_is_not_authoritative_in_trailing_buy():
     assert hold_idx != -1
     assert arm_idx != -1
     assert arm_idx > hold_idx
+    assert "return None" not in src[hold_idx:arm_idx]
     assert "path_ev_authoritative" in src
     assert "TRAILING_BUY_STREAM_AUTHORITY" in inspect.getsource(PortfolioEngine._arm_trailing_buy_ranked_stream)
 
