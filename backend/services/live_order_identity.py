@@ -232,17 +232,33 @@ def extract_identity(
     items = list(fee_items or [])
     resolved_fee = _as_float(fee_amount)
     resolved_asset = str(fee_asset or "").strip().upper()
+    native_pairs: list[tuple[float, str]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        amt = _as_float(it.get("amount") if it.get("amount") is not None else it.get("cost"))
+        asset = str(it.get("asset") or it.get("currency") or "").strip().upper()
+        if amt and asset:
+            native_pairs.append((amt, asset))
     if not resolved_asset:
         # The engine's own commission breakdown carries the settled asset per
         # item ({"amount", "asset", "usd"}); a fill can be charged in more than
         # one asset, so keep all of them rather than picking one.
         assets = []
-        for it in items:
-            if isinstance(it, dict):
-                a = str(it.get("asset") or it.get("currency") or "").strip().upper()
-                if a and a not in assets:
-                    assets.append(a)
+        for _amt, a in native_pairs:
+            if a and a not in assets:
+                assets.append(a)
         resolved_asset = ",".join(assets)
+    quote_assets = {"USDT", "USD", "BUSD", "USDC"}
+    non_quote = [(amt, a) for amt, a in native_pairs if a not in quote_assets]
+    # A quote-denominated estimate must never be stored as a base-asset commission.
+    if len({a for _amt, a in non_quote}) == 1:
+        native_asset = non_quote[0][1]
+        native_sum = sum(amt for amt, a in non_quote if a == native_asset)
+        if native_sum > 0:
+            resolved_fee = native_sum
+            if "," not in resolved_asset:
+                resolved_asset = native_asset
     if not resolved_asset:
         fee = raw.get("fee") if isinstance(raw.get("fee"), dict) else {}
         resolved_asset = str(fee.get("currency") or info.get("commissionAsset") or raw.get("commissionAsset") or "").strip().upper()

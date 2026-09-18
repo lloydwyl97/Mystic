@@ -1433,6 +1433,7 @@ class OpenPosition:
     entry_client_order_id: str = ""
     entry_fill_ids_json: str = "[]"
     quantity_exact: str = ""
+    protected_dust_qty: float = 0.0
 
     @property
     def risk_usd(self) -> float:
@@ -2432,6 +2433,13 @@ class PortfolioEngine:
         # Ensure DB schema exists
         self._ensure_db_schema()
         self._load_churn_guard_state()
+        if not self.test_mode:
+            try:
+                from backend.services.live_fill_economics import apply_first_xrp_rt_correction
+
+                apply_first_xrp_rt_correction(self.db_path)
+            except Exception:
+                logger.exception("XRP_RT_ACCOUNTING_CORRECTION_FAILED")
 
         # STEP 1: Try to load from SQLite (deterministic restart)
         ledger_loaded = await self._load_ledger_from_sqlite()
@@ -6858,9 +6866,10 @@ class PortfolioEngine:
         order_id = order.get("id")
         if not order_id or not self._live_service:
             return order
+        order = await self._attach_venue_trades(order, exchange_symbol)
         status = (order.get("status") or "").lower()
         if status in ("closed", "filled", "canceled", "cancelled", "expired"):
-            return order
+            return await self._attach_venue_trades(order, exchange_symbol)
         for _ in range(2):
             await asyncio.sleep(0.2 + 0.2 * random.random())
             res = await self._live_service.fetch_order("binanceus", str(order_id), exchange_symbol)
@@ -6889,7 +6898,28 @@ class PortfolioEngine:
                 order_id,
                 float(filled) if filled else 0,
             )
-        return order
+        return await self._attach_venue_trades(order, exchange_symbol)
+
+    async def _attach_venue_trades(self, order: dict[str, Any], exchange_symbol: str) -> dict[str, Any]:
+        """GET /order omits fills. myTrades is the venue commission authority."""
+        if not order or not self._live_service:
+            return order
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        if order.get("trades") or info.get("fills"):
+            return order
+        oid = str(order.get("id") or info.get("orderId") or "").strip()
+        if not oid:
+            return order
+        try:
+            from backend.services.live_fill_economics import merge_venue_trades_into_order
+
+            res = await self._live_service.fetch_order_trades("binanceus", exchange_symbol, oid)
+            if res.get("status") != "success":
+                return order
+            return merge_venue_trades_into_order(order, res.get("trades") or [])
+        except Exception:
+            logger.debug("ATTACH_VENUE_TRADES_SKIPPED order=%s", oid, exc_info=True)
+            return order
 
     def _prune_trade_explanations(self) -> None:
         """Ring-buffer cap: keep last TRADE_EXPLANATIONS_MAX by timestamp."""
@@ -7577,6 +7607,15 @@ class PortfolioEngine:
             )
 
         self.open_positions = rebuilt
+        try:
+            from backend.services.live_exchange_equity import load_protected_preexisting_dust
+
+            for _sym, _pos in self.open_positions.items():
+                if float(getattr(_pos, "protected_dust_qty", 0) or 0) > 0:
+                    continue
+                _pos.protected_dust_qty = float(load_protected_preexisting_dust(self.db_path, _sym))
+        except Exception:
+            logger.debug("PROTECTED_DUST_HYDRATE_SKIPPED", exc_info=True)
 
         if allow_mutations:
             # Backfill entry_fee from paper_trades for positions with entry_fee=0 (join trade_id -> fees_paid)
@@ -9644,6 +9683,18 @@ class PortfolioEngine:
         # stay unchanged until the atomic OPEN commits.
         effective_sleeve = sleeve or assign_sleeve(normalized_symbol, confidence)
 
+        _protected_dust = 0.0
+        _existing_lot = self.open_positions.get(normalized_symbol)
+        if _existing_lot is not None and str(getattr(_existing_lot, "status", "") or "").upper() == "DUST_PENDING":
+            from backend.services.day_entry_spendable import money as _money_dust
+            from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
+
+            _protected_dust = float(_money_dust(getattr(_existing_lot, "quantity_exact", "") or _existing_lot.quantity))
+            try:
+                stamp_protected_preexisting_dust(self.db_path, normalized_symbol, _protected_dust)
+            except Exception:
+                logger.debug("PROTECTED_DUST_STAMP_SKIPPED %s", normalized_symbol, exc_info=True)
+
         position = OpenPosition(
             symbol=normalized_symbol,
             quantity=quantity,
@@ -9687,6 +9738,7 @@ class PortfolioEngine:
             strategy_family=str(getattr(explainability, "strategy_family", "") or ""),
             legacy_pre_regime_router=False,
             opened_under_router=True,
+            protected_dust_qty=_protected_dust,
         )
         if live_order_buy and (live_order_buy.get("_mystic_partial_fill") or live_order_buy.get("_mystic_ioc_incomplete")):
             is_dust, _, dust_reason, _ = self._dust_check(normalized_symbol, quantity, fill_price)
@@ -11356,9 +11408,33 @@ class PortfolioEngine:
                         free_balances = balance.get("balance", {}).get("free", {})
                         base_coin = exchange_symbol[:-4] if exchange_symbol.endswith("USDT") else exchange_symbol
                         free_balance = float(free_balances.get(base_coin, 0))
-                        if free_balance < quantity:
-                            logger.warning(f"LIVE_SELL_QTY_ADJUST: {symbol} requested={quantity:.8f} free_balance={free_balance:.8f}")
-                            actual_sold_qty = free_balance
+                        from backend.services.live_exchange_equity import load_protected_preexisting_dust
+                        from backend.services.live_fill_economics import plan_sell_quantity
+
+                        protected = float(getattr(position, "protected_dust_qty", 0) or 0)
+                        if protected <= 0:
+                            protected = float(load_protected_preexisting_dust(self.db_path, normalized_symbol))
+                        await self._ensure_symbol_constraints(symbol)
+                        constraints = self._symbol_constraints.get(symbol) or {}
+                        qty_step = float(constraints.get("qty_step") or 0)
+                        planned = plan_sell_quantity(
+                            net_active_qty=position.quantity,
+                            exchange_free_qty=free_balance,
+                            protected_dust_qty=protected,
+                            qty_step=qty_step,
+                        )
+                        if float(planned.sellable) + 1e-15 < quantity or protected > 0:
+                            logger.warning(
+                                "LIVE_SELL_QTY_PROTECTED %s requested=%.8f net_active=%.8f free=%.8f protected=%.8f sellable=%.8f residual=%.8f",
+                                symbol,
+                                quantity,
+                                float(position.quantity),
+                                free_balance,
+                                protected,
+                                float(planned.sellable),
+                                float(planned.residual),
+                            )
+                        actual_sold_qty = float(planned.sellable)
                 except Exception as bal_err:
                     logger.warning(f"LIVE_SELL_BALANCE_CHECK_FAILED: {symbol} - {bal_err}, using original qty")
 
@@ -11742,6 +11818,7 @@ class PortfolioEngine:
                 )
 
         base_qty_reduction = 0.0
+        comm = None
         if dust_writeoff:
             fee = 0.0
             proceeds = 0.0
@@ -11794,6 +11871,9 @@ class PortfolioEngine:
                         decision_id=str(getattr(position, "decision_id", "") or ""),
                         fallback_qty=float(quantity),
                         fallback_price=float(fill_price),
+                        fee_amount=float(fee),
+                        fee_items=list(getattr(comm, "items", ()) or ()) if live_order_sell else [],
+                        fee_from_exchange=bool(getattr(comm, "fee_from_exchange", False)) if live_order_sell else False,
                     )
                     await asyncio.to_thread(record_fill, self.db_path, _sell_identity)
                 except Exception:
@@ -11827,6 +11907,12 @@ class PortfolioEngine:
                     self._apply_sell_cash_credit(proceeds, realized_pnl, dust_writeoff=dust_writeoff)
                 self._mtm_after_confirmed_sell(normalized_symbol, float(fill_price or price or 0.0))
                 await self._persist_ledger_to_sqlite()
+                try:
+                    from backend.services.live_exchange_equity import clear_protected_preexisting_dust
+
+                    clear_protected_preexisting_dust(self.db_path, normalized_symbol)
+                except Exception:
+                    logger.debug("PROTECTED_DUST_CLEAR_SKIPPED %s", normalized_symbol, exc_info=True)
 
             try:
                 from backend.services.simplified_pnl_observation import record_trade_close

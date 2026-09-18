@@ -708,15 +708,19 @@ class LiveTradingService:
                 oid = str(t.get("order") or info.get("orderId") or "")
                 if str(order_id) and oid and oid != str(order_id):
                     continue
+                fee = t.get("fee") if isinstance(t.get("fee"), dict) else {}
                 out.append(
                     {
                         "trade_id": str(t.get("id") or info.get("id") or ""),
                         "order_id": oid,
-                        "qty": t.get("amount"),
-                        "price": t.get("price"),
-                        "commission": (t.get("fee") or {}).get("cost") if isinstance(t.get("fee"), dict) else None,
-                        "commission_asset": (t.get("fee") or {}).get("currency") if isinstance(t.get("fee"), dict) else None,
-                        "timestamp": t.get("timestamp"),
+                        "qty": t.get("amount") or info.get("qty"),
+                        "price": t.get("price") or info.get("price"),
+                        "quote_qty": t.get("cost") or info.get("quoteQty"),
+                        "commission": fee.get("cost") if fee else info.get("commission"),
+                        "commission_asset": fee.get("currency") if fee else info.get("commissionAsset"),
+                        "taker_or_maker": t.get("takerOrMaker"),
+                        "is_maker": (t.get("takerOrMaker") == "maker") if t.get("takerOrMaker") else info.get("isBuyerMaker"),
+                        "timestamp": t.get("timestamp") or info.get("time"),
                     }
                 )
             return {"status": "success", "trades": out}

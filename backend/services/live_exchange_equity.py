@@ -27,6 +27,7 @@ LIFETIME_CONTRIBUTED_CAPITAL = "UNKNOWN"
 DUST_TRADE_PREFIX = "dust_exchange:"
 BASELINE_DUST_KEY = "forward_baseline_dust"
 CURRENT_DUST_SNAPSHOT_KEY = "exchange_dust_snapshot"
+PROTECTED_DUST_KEY = "protected_preexisting_dust"
 QUOTE_ASSETS = frozenset({"USDT", "USD", "BUSD", "USDC"})
 
 
@@ -220,6 +221,30 @@ def equity_basis_from_db(db_path: str, *, cash_usdt: object, principal: object) 
         "net_liquidatable_equity": float(eq["net_liquidatable_equity"]),
         "baseline_dust_known": bool(eq["baseline_dust_known"]),
     }
+
+
+def stamp_protected_preexisting_dust(db_path: str, symbol: str, quantity: object) -> None:
+    """Remember DUST_PENDING qty that a later ACTIVE SELL must not borrow."""
+    qty = money(quantity)
+    if qty < 0:
+        qty = Decimal("0")
+    raw = load_operational_json(db_path, PROTECTED_DUST_KEY)
+    coins = raw.get("coins") if isinstance(raw.get("coins"), dict) else {}
+    coins[str(symbol)] = format(qty, "f")
+    persist_operational_json(db_path, PROTECTED_DUST_KEY, {"coins": coins})
+
+
+def load_protected_preexisting_dust(db_path: str, symbol: str) -> Decimal:
+    raw = load_operational_json(db_path, PROTECTED_DUST_KEY)
+    coins = raw.get("coins") if isinstance(raw.get("coins"), dict) else {}
+    return money(coins.get(str(symbol)) or 0)
+
+
+def clear_protected_preexisting_dust(db_path: str, symbol: str) -> None:
+    raw = load_operational_json(db_path, PROTECTED_DUST_KEY)
+    coins = raw.get("coins") if isinstance(raw.get("coins"), dict) else {}
+    coins.pop(str(symbol), None)
+    persist_operational_json(db_path, PROTECTED_DUST_KEY, {"coins": coins})
 
 
 def persist_current_dust_snapshot(db_path: str, coins: list[dict[str, Any]]) -> None:
