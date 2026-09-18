@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import and_, asc, select
+from sqlalchemy import and_, asc, desc, select
 
 from backend.config.canonical_candle_intervals import (
     CANONICAL_CANDLE_INTERVALS,
@@ -221,8 +221,13 @@ def load_aligned_candles(
             conds.append(FeatureOHLCV.ts >= open_dt_from_ms(start_ms))
         if end_ms is not None:
             conds.append(FeatureOHLCV.ts <= open_dt_from_ms(end_ms))
-        stmt = select(FeatureOHLCV).where(and_(*conds)).order_by(asc(FeatureOHLCV.ts))
-        rows = list(session.execute(stmt).scalars().all())
+        if limit is not None and limit > 0 and start_ms is None and end_ms is None:
+            fetch_n = int(limit) * 4
+            stmt = select(FeatureOHLCV).where(and_(*conds)).order_by(desc(FeatureOHLCV.ts)).limit(fetch_n)
+            rows = list(reversed(list(session.execute(stmt).scalars().all())))
+        else:
+            stmt = select(FeatureOHLCV).where(and_(*conds)).order_by(asc(FeatureOHLCV.ts))
+            rows = list(session.execute(stmt).scalars().all())
     out: list[dict[str, Any]] = []
     seen: set[int] = set()
     for row in rows:

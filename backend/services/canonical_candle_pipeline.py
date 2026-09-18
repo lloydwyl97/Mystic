@@ -480,7 +480,15 @@ async def get_canonical_candles(
     if include_forming and isinstance(forming, dict):
         candles = [c for c in candles if int(c["open_ms"]) != int(forming.get("open_ms") or -1)]
         candles.append(forming)
-    integrity = await canonical_candle_pipeline.write_integrity(symbol, interval)
+    freshness = None
+    try:
+        redis = await canonical_candle_pipeline._redis()
+        if redis is not None:
+            raw_int = await redis.get(redis_integrity_key(symbol, interval))
+            if raw_int:
+                freshness = json.loads(raw_int.decode() if isinstance(raw_int, (bytes, bytearray)) else raw_int)
+    except Exception as exc:
+        logger.debug("canonical freshness cache read failed: %s", exc)
     return {
         "success": True,
         "symbol": api_symbol(symbol),
@@ -490,7 +498,7 @@ async def get_canonical_candles(
         "forming": forming,
         "redis_count": redis_count,
         "source": "canonical",
-        "freshness": integrity,
+        "freshness": freshness,
         "4h_authority": TELEMETRY_ONLY_NO_TRADE_AUTHORITY if interval == "4h" else "n/a",
     }
 
