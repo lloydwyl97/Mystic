@@ -15,13 +15,18 @@ logger = logging.getLogger(__name__)
 WAIT_DIP = "WAIT_DIP"
 TRAIL_LOW = "TRAIL_LOW"
 SUBMITTING = "SUBMITTING"
+ORDER_OPEN = "ORDER_OPEN"
+PARTIALLY_FILLED = "PARTIALLY_FILLED"
 FILLED = "FILLED"
 EXPIRED = "EXPIRED"
 CANCELED = "CANCELED"
 FAILED = "FAILED"
+RETRYABLE = "RETRYABLE"
 
-ACTIVE_STATES = frozenset({WAIT_DIP, TRAIL_LOW, SUBMITTING})
+IN_FLIGHT_STATES = frozenset({SUBMITTING, ORDER_OPEN, PARTIALLY_FILLED})
+ACTIVE_STATES = frozenset({WAIT_DIP, TRAIL_LOW}) | IN_FLIGHT_STATES
 TERMINAL_STATES = frozenset({FILLED, EXPIRED, CANCELED, FAILED})
+_ACTIVE_SQL = "'WAIT_DIP','TRAIL_LOW','SUBMITTING','ORDER_OPEN','PARTIALLY_FILLED'"
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS day_trailing_buy_intents (
@@ -67,7 +72,7 @@ CREATE TABLE IF NOT EXISTS day_trailing_buy_intents (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_day_tb_symbol_active
     ON day_trailing_buy_intents(symbol)
-    WHERE status IN ('WAIT_DIP','TRAIL_LOW','SUBMITTING');
+    WHERE status IN ('WAIT_DIP','TRAIL_LOW','SUBMITTING','ORDER_OPEN','PARTIALLY_FILLED');
 CREATE UNIQUE INDEX IF NOT EXISTS idx_day_tb_client_order
     ON day_trailing_buy_intents(client_order_id);
 CREATE INDEX IF NOT EXISTS idx_day_tb_decision
@@ -148,7 +153,7 @@ def create_intent(
         existing = conn.execute(
             """
             SELECT * FROM day_trailing_buy_intents
-            WHERE symbol=? AND status IN ('WAIT_DIP','TRAIL_LOW','SUBMITTING')
+            WHERE symbol=? AND status IN ('WAIT_DIP','TRAIL_LOW','SUBMITTING','ORDER_OPEN','PARTIALLY_FILLED')
             LIMIT 1
             """,
             (symbol,),
@@ -158,7 +163,7 @@ def create_intent(
             if str(cur.get("decision_id") or "") == decision_id:
                 conn.commit()
                 return True, "IDEMPOTENT_EXISTING", cur
-            if str(cur.get("status") or "") == SUBMITTING:
+            if str(cur.get("status") or "") in IN_FLIGHT_STATES:
                 conn.commit()
                 return False, "SYMBOL_SUBMITTING", cur
             # Later decision cycles must keep the armed ask and tracked low.
@@ -251,7 +256,7 @@ def load_active_intents(db_path: str | Path) -> list[dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT * FROM day_trailing_buy_intents
-            WHERE status IN ('WAIT_DIP','TRAIL_LOW','SUBMITTING')
+            WHERE status IN ('WAIT_DIP','TRAIL_LOW','SUBMITTING','ORDER_OPEN','PARTIALLY_FILLED')
             ORDER BY created_at ASC
             """
         ).fetchall()
@@ -268,7 +273,7 @@ def load_intent_by_symbol(db_path: str | Path, symbol: str) -> dict[str, Any] | 
         row = conn.execute(
             """
             SELECT * FROM day_trailing_buy_intents
-            WHERE symbol=? AND status IN ('WAIT_DIP','TRAIL_LOW','SUBMITTING')
+            WHERE symbol=? AND status IN ('WAIT_DIP','TRAIL_LOW','SUBMITTING','ORDER_OPEN','PARTIALLY_FILLED')
             LIMIT 1
             """,
             (_slash_symbol(symbol),),
@@ -385,7 +390,7 @@ def mark_terminal(
             args.append(float(current_ask))
         args.extend([intent_id])
         conn.execute(
-            f"UPDATE day_trailing_buy_intents SET {', '.join(sets)} WHERE intent_id=? AND status IN ('WAIT_DIP','TRAIL_LOW','SUBMITTING')",
+            f"UPDATE day_trailing_buy_intents SET {', '.join(sets)} WHERE intent_id=? AND status IN ('WAIT_DIP','TRAIL_LOW','SUBMITTING','ORDER_OPEN','PARTIALLY_FILLED')",
             args,
         )
         conn.commit()
@@ -423,6 +428,43 @@ def mark_order_accepted(
     try:
         conn.execute(
             f"UPDATE day_trailing_buy_intents SET {', '.join(sets)} WHERE intent_id=?",
+            args,
+        )
+        conn.commit()
+        return _fetch(conn, intent_id)
+    finally:
+        conn.close()
+
+
+def mark_in_flight(
+    db_path: str | Path,
+    intent_id: str,
+    status: str,
+    *,
+    order_id: str = "",
+    fill_id: str = "",
+    trade_id: str = "",
+    reason: str = "",
+) -> dict[str, Any] | None:
+    """SUBMITTING → ORDER_OPEN / PARTIALLY_FILLED. Never a new submit."""
+    if status not in {ORDER_OPEN, PARTIALLY_FILLED}:
+        raise ValueError(f"not in-flight resolve: {status}")
+    ensure_trailing_buy_schema(db_path)
+    now = _now()
+    sets = ["status=?", "updated_at=?", "order_accepted=1"]
+    args: list[Any] = [status, now]
+    if reason:
+        sets.append("cancel_reason=?")
+        args.append(str(reason)[:120])
+    for col, val in (("order_id", order_id), ("fill_id", fill_id), ("trade_id", trade_id)):
+        if str(val or "").strip():
+            sets.append(f"{col}=?")
+            args.append(str(val))
+    args.extend([intent_id])
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        conn.execute(
+            f"UPDATE day_trailing_buy_intents SET {', '.join(sets)} WHERE intent_id=? AND status IN ('SUBMITTING','ORDER_OPEN','PARTIALLY_FILLED')",
             args,
         )
         conn.commit()
@@ -471,6 +513,10 @@ __all__ = [
     "EXPIRED",
     "FAILED",
     "FILLED",
+    "IN_FLIGHT_STATES",
+    "ORDER_OPEN",
+    "PARTIALLY_FILLED",
+    "RETRYABLE",
     "SUBMITTING",
     "TERMINAL_STATES",
     "TRAIL_LOW",
@@ -484,6 +530,7 @@ __all__ = [
     "load_active_intents",
     "load_intent",
     "load_intent_by_symbol",
+    "mark_in_flight",
     "mark_order_accepted",
     "mark_terminal",
     "new_intent_id",

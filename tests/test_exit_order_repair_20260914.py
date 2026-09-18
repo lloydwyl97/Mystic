@@ -142,8 +142,8 @@ class _FakeLive:
         self.payload = payload
         self.calls: list[tuple] = []
 
-    async def fetch_order(self, exchange: str, order_id: str, symbol: str):
-        self.calls.append((exchange, order_id, symbol))
+    async def fetch_order(self, exchange: str, order_id: str, symbol: str, params=None):
+        self.calls.append((exchange, order_id, symbol, params))
         return self.payload
 
 
@@ -168,11 +168,11 @@ def test_exchange_order_classifies_every_state(status, filled, expected):
     live = _FakeLive({"status": "success", "order": {"id": "OID-1", "status": status, "filled": filled}})
     engine = SimpleNamespace(_live_service=live)
 
-    got = asyncio.run(_exchange_order(engine, client_order_id="CID-1", symbol="BTC/USDT", order_id="OID-1"))
+    got = asyncio.run(_exchange_order(engine, client_order_id="CID-1", symbol="BTC/USDT", order_id="1837670272"))
 
     assert got is not None
     assert got["state"] == expected
-    assert live.calls == [("binanceus", "OID-1", "BTC/USDT")]
+    assert live.calls == [("binanceus", "1837670272", "BTC/USDT", None)]
 
 
 def test_exchange_order_fetch_failure_is_unknown_not_no_order():
@@ -185,7 +185,8 @@ def test_exchange_order_fetch_failure_is_unknown_not_no_order():
 
     engine = SimpleNamespace(_live_service=Boom())
     got = asyncio.run(_exchange_order(engine, client_order_id="CID", symbol="BTC/USDT", order_id="OID"))
-    assert got == {"state": "unknown"}
+    assert got is not None
+    assert got["state"] == "unknown"
 
 
 # ------------------------------------------------- 7. IOC honors PROTECTED_LIMIT_ALLOW_PARTIAL

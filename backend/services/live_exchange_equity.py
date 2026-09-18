@@ -303,6 +303,45 @@ def backfill_provable_fill_identities(
     return written
 
 
+def backfill_exchange_reconciled_orders(
+    db_path: str,
+    *,
+    unmatched: list[dict[str, Any]],
+    known_order_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Write EXCHANGE_RECONCILED identity for full unmatched venue orders only."""
+    from backend.services.live_order_identity import record_exchange_reconciled
+    from backend.services.live_pnl_reconciliation import classify_unmatched_venue_fills
+
+    known = {str(x) for x in (known_order_ids or set()) if str(x).strip()}
+    groups = classify_unmatched_venue_fills(unmatched, known_order_ids=known)
+    written: list[dict[str, Any]] = []
+    for row in groups["full_buys_lacking_local"] + groups["full_sells_lacking_local"]:
+        oid = str(row.get("exchange_order_id") or "").strip()
+        if not oid or oid in known:
+            continue
+        ok = record_exchange_reconciled(
+            db_path,
+            symbol=str(row.get("symbol") or ""),
+            side=str(row.get("side") or ""),
+            exchange_order_id=oid,
+            client_order_id=str(row.get("client_order_id") or ""),
+            venue_trade_ids=[str(row.get("venue_trade_id") or "")] if row.get("venue_trade_id") else [],
+            executed_qty=float(row.get("quantity") or row.get("unmatched_quantity") or 0.0),
+            avg_fill_price=float(row.get("price") or 0.0),
+            cost_quote=float(row.get("quantity") or 0.0) * float(row.get("price") or 0.0),
+            classification=str(row.get("group") or "full_unmatched"),
+            event_ts_exchange=str(row.get("timestamp") or ""),
+            matching_sell_order_id=row.get("matching_sell_order_id"),
+            remaining_asset=row.get("remaining_asset"),
+            raw={"unmatched_reason": row.get("unmatched_reason") or ""},
+        )
+        if ok:
+            written.append({"symbol": row.get("symbol"), "side": row.get("side"), "exchange_order_id": oid, "source": "EXCHANGE_RECONCILED"})
+            known.add(oid)
+    return written
+
+
 def load_json_state(db_path: str, key: str) -> dict[str, Any]:
     return load_operational_json(db_path, key)
 

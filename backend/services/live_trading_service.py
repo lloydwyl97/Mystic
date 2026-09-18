@@ -648,21 +648,38 @@ class LiveTradingService:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
-    async def fetch_order(self, exchange: str, order_id: str, symbol: str) -> dict[str, Any]:
-        """Fetch order status from exchange. For PARTIALLY_FILLED verification."""
+    async def fetch_order(self, exchange: str, order_id: str, symbol: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Fetch order status. Numeric ids use orderId; others use origClientOrderId."""
         try:
             await self._ensure_initialized()
             if exchange.lower() in {EXCHANGE_ID.lower(), "binance", "binanceus"} and self.binance:
                 pair = _to_binance_pair(symbol)
-                order = await asyncio.to_thread(self.binance.fetch_order, id=order_id, symbol=pair)
+                extra = dict(params or {})
+                ref = str(order_id or "").strip()
+                if ref.isdigit() and "origClientOrderId" not in extra:
+                    order = await asyncio.to_thread(self.binance.fetch_order, id=ref, symbol=pair)
+                else:
+                    cid = str(extra.get("origClientOrderId") or ref)
+                    order = await asyncio.to_thread(
+                        self.binance.fetch_order,
+                        None,
+                        pair,
+                        {"origClientOrderId": cid},
+                    )
                 return {
                     "status": "success",
                     "order": _order_fill_payload(order),
                 }
             return {"status": "error", "message": "Exchange not available"}
-        except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError) as e:
-            logger.exception("fetch_order %s: %s", order_id, e)
-            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            msg = str(e)
+            code = ""
+            if "code" in msg and "-2013" in msg:
+                code = "-2013"
+            elif "code" in msg and "-1100" in msg:
+                code = "-1100"
+            logger.info("fetch_order ref=%s code=%s err=%s", order_id, code or "?", msg[:200])
+            return {"status": "error", "message": msg, "code": code}
 
     async def fetch_order_trades(self, exchange: str, symbol: str, order_id: str) -> dict[str, Any]:
         """Fetch the venue's per-fill trade records for one order.

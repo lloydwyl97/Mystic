@@ -19,6 +19,7 @@ from backend.services.live_pnl_reconciliation import (
     _epoch_ms,
     _qty_close,
     _reconcile_symbol,
+    classify_unmatched_venue_fills,
     presentation_fields,
     read_recorded_live,
 )
@@ -247,6 +248,38 @@ def test_epoch_parses_sqlite_timestamp_formats() -> None:
 def test_qty_tolerance_is_representation_drift_only() -> None:
     assert _qty_close(0.001, 0.001 + 1e-15)
     assert not _qty_close(0.001, 0.002)
+
+
+def test_unmatched_venue_fills_are_grouped() -> None:
+    unmatched = [
+        {"source": "venue_fill", "side": "BUY", "quantity": 1.0, "unmatched_quantity": 0.001, "dollar_discrepancy": 0.11, "exchange_order_id": "known-1"},
+        {"source": "venue_fill", "side": "BUY", "quantity": 0.5, "unmatched_quantity": 0.2, "dollar_discrepancy": 22.0, "exchange_order_id": "known-2"},
+        {"source": "venue_fill", "side": "BUY", "quantity": 0.001, "unmatched_quantity": 0.001, "dollar_discrepancy": 80.0, "exchange_order_id": "1837670272", "symbol": "BTC/USDT"},
+        {"source": "venue_fill", "side": "SELL", "quantity": 0.02, "unmatched_quantity": 0.02, "dollar_discrepancy": 50.0, "exchange_order_id": "sell-1"},
+        {"source": "local_recorded", "side": "SELL", "quantity": 1.0, "unmatched_quantity": 1.0, "dollar_discrepancy": 1.0},
+    ]
+    groups = classify_unmatched_venue_fills(unmatched, known_order_ids={"known-1", "known-2"})
+    assert groups["summary"]["base_asset_fee_fragments"]["count"] == 1
+    assert groups["summary"]["partial_fills_of_known_orders"]["count"] == 1
+    assert groups["summary"]["full_buys_lacking_local"]["count"] == 1
+    assert groups["summary"]["full_sells_lacking_local"]["count"] == 1
+    assert groups["summary"]["genuine_unexplained"]["count"] == 0
+    counted = sum(g["count"] for g in groups["summary"].values())
+    assert counted == 4
+
+
+def test_qty_coverage_does_not_double_count_one_fill() -> None:
+    recorded = {("ETH/USDT", "BUY"): [{"qty": 0.02, "price": 2500.0, "ts": 1, "order_id": "1587098371", "exit_type": ""}]}
+    venue = {
+        "fills": [
+            {"id": "a", "order": "1587098371", "side": "BUY", "qty": 0.01, "cost": 25.0, "ts": 1, "fee_cost": 0.0, "fee_ccy": "USDT"},
+            {"id": "b", "order": "1587098371", "side": "BUY", "qty": 0.01, "cost": 25.0, "ts": 2, "fee_cost": 0.0, "fee_ccy": "USDT"},
+        ]
+    }
+    rec = _reconcile_symbol("ETH/USDT", recorded, venue)
+    assert rec.matched_recorded_rows == 1
+    assert rec.unmatched_venue_fills == 0
+    assert rec.qty_coverage_pct == 100.0
 
 
 def test_day_symbol_universe_unchanged() -> None:

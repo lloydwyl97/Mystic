@@ -9608,7 +9608,9 @@ class PortfolioEngine:
         # between this check and the debit below.
         async with self._global_cash_lock:
             pending_other = self._pending_buy_notional(exclude_symbol=symbol)
-            free_cash = float(self._available_balance) - pending_other
+            from backend.services.day_entry_spendable import money as _money_cash
+
+            free_cash = float(_money_cash(self._available_balance) - _money_cash(pending_other))
             if total_cost > free_cash:
                 reason = f"total_cost=${total_cost:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_other:.2f})"
                 logger.error(f"BUY_BLOCKED_CASH_INVARIANT: {symbol} - {reason}")

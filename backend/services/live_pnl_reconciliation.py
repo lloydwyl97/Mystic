@@ -71,6 +71,7 @@ class SymbolRecon:
     unmatched_venue_fills: int = 0
     unmatched_records: list[dict[str, Any]] = field(default_factory=list)
     qty_coverage_pct: float = 0.0
+    unmatched_fill_groups: dict[str, Any] = field(default_factory=dict)
     error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -111,6 +112,7 @@ class LivePnlReconciliation:
     recorded_rows_with_exchange_order_id: int = 0
     recorded_live_rows: int = 0
     qty_coverage_pct: float = 0.0
+    unmatched_fill_groups: dict[str, Any] = field(default_factory=dict)
 
     per_symbol: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -145,6 +147,60 @@ def _epoch_ms(ts: str) -> int | None:
 
 def _qty_close(a: float, b: float) -> bool:
     return abs(a - b) <= max(_QTY_ABS_TOL, abs(b) * _QTY_REL_TOL)
+
+
+_FEE_FRAGMENT_REL = 0.0025
+
+
+def classify_unmatched_venue_fills(
+    unmatched: list[dict[str, Any]],
+    *,
+    known_order_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Group leftover venue fills without claiming the same quantity twice."""
+    known = {str(x).strip() for x in (known_order_ids or set()) if str(x).strip()}
+    groups: dict[str, list[dict[str, Any]]] = {
+        "base_asset_fee_fragments": [],
+        "partial_fills_of_known_orders": [],
+        "full_buys_lacking_local": [],
+        "full_sells_lacking_local": [],
+        "genuine_unexplained": [],
+    }
+    for row in unmatched or []:
+        if str(row.get("source") or "") != "venue_fill":
+            continue
+        qty = float(row.get("quantity") or 0.0)
+        leftover = float(row.get("unmatched_quantity") or 0.0)
+        if leftover <= 0:
+            continue
+        oid = str(row.get("exchange_order_id") or "").strip()
+        side = str(row.get("side") or "").upper()
+        consumed = max(0.0, qty - leftover)
+        residual = max(_QTY_ABS_TOL, qty * _RESIDUAL_REL_TOL)
+        is_full = consumed <= residual
+        fee_like = leftover <= max(residual, qty * _FEE_FRAGMENT_REL)
+        if oid in known and not is_full:
+            group = "base_asset_fee_fragments" if fee_like else "partial_fills_of_known_orders"
+        elif fee_like and not is_full:
+            group = "base_asset_fee_fragments"
+        elif is_full and side == "BUY":
+            group = "full_buys_lacking_local"
+        elif is_full and side == "SELL":
+            group = "full_sells_lacking_local"
+        else:
+            group = "genuine_unexplained"
+        item = dict(row)
+        item["group"] = group
+        groups[group].append(item)
+    summary = {
+        name: {
+            "count": len(rows),
+            "quantity": sum(float(r.get("unmatched_quantity") or 0.0) for r in rows),
+            "dollar_value": sum(float(r.get("dollar_discrepancy") or 0.0) for r in rows),
+        }
+        for name, rows in groups.items()
+    }
+    return {**groups, "summary": summary}
 
 
 def read_recorded_live(db_path: str) -> dict[str, Any]:
@@ -473,6 +529,16 @@ async def build_reconciliation(db_path: str) -> LivePnlReconciliation:
     except Exception:
         logger.debug("provable fill identity backfill skipped", exc_info=True)
 
+    known_ids = {str(r.get("order_id") or "").strip() for r in flat_recorded if str(r.get("order_id") or "").strip()}
+    venue_unmatched = [u for u in out.unmatched_records if str(u.get("source") or "") == "venue_fill"]
+    out.unmatched_fill_groups = classify_unmatched_venue_fills(venue_unmatched, known_order_ids=known_ids)
+    try:
+        from backend.services.live_exchange_equity import backfill_exchange_reconciled_orders
+
+        backfill_exchange_reconciled_orders(db_path, unmatched=venue_unmatched, known_order_ids=known_ids)
+    except Exception:
+        logger.debug("exchange-reconciled identity backfill skipped", exc_info=True)
+
     out.window_end = _iso(last_ts) if last_ts else str(local["last_ts"] or "")
     # Venue gross already nets base-asset commission out of received quantity;
     # quote-denominated commission is charged on top and must be subtracted.
@@ -641,6 +707,7 @@ def presentation_fields(
         "reconciliation_window_start": str(recon.get("window_start") or ""),
         "reconciliation_window_end": str(recon.get("window_end") or ""),
         "qty_coverage_pct": round(float(recon.get("qty_coverage_pct") or 0.0), 2),
+        "unmatched_fill_groups": dict(recon.get("unmatched_fill_groups") or {}),
         "reconciliation_stale": bool(recon.get("stale")),
         "reconciliation_error": str(recon.get("error") or ""),
         "notes": list(recon.get("notes") or []),

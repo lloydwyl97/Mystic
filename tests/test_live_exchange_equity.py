@@ -12,6 +12,7 @@ from backend.config.execution_cost_model import TAKER_COMMISSION_PCT
 from backend.services.live_exchange_equity import (
     FORWARD_BASELINE_LABEL,
     LIFETIME_CONTRIBUTED_CAPITAL,
+    backfill_exchange_reconciled_orders,
     backfill_provable_fill_identities,
     build_exchange_equity,
     cap_qty_coverage_pct,
@@ -22,7 +23,7 @@ from backend.services.live_exchange_equity import (
     reconstruct_forward_baseline_dust,
     should_import_exchange_dust,
 )
-from backend.services.live_order_identity import fills_for_order
+from backend.services.live_order_identity import fills_for_order, record_exchange_reconciled
 from backend.services.live_pnl_reconciliation import _reconcile_symbol
 from backend.services.portfolio_engine import OpenPosition, PortfolioEngine
 
@@ -168,6 +169,55 @@ def test_order_id_match_backfills_only_provable_ids(tmp_path):
         venue_fills=[{"symbol": "BTC/USDT", "side": "BUY", "order": "other-order", "id": "invented", "qty": 0.001, "price": 1.0, "cost": 1.0}],
     )
     assert skipped == []
+
+
+def test_exchange_reconciled_does_not_invent_decision(tmp_path):
+    db = str(tmp_path / "recon.db")
+    ok = record_exchange_reconciled(
+        db,
+        symbol="BTC/USDT",
+        side="BUY",
+        exchange_order_id="1837670272",
+        client_order_id="",
+        venue_trade_ids=["1"],
+        executed_qty=0.001,
+        avg_fill_price=80000.0,
+        cost_quote=80.0,
+        classification="full_buys_lacking_local",
+    )
+    assert ok is True
+    rows = fills_for_order(db, "1837670272")
+    assert len(rows) == 1
+    assert rows[0]["mystic_trade_id"] in (None, "")
+    assert rows[0]["decision_id"] in (None, "")
+    assert rows[0]["intent_id"] in (None, "")
+    raw = rows[0]["raw_json"]
+    assert "EXCHANGE_RECONCILED" in raw
+    assert '"decision_id": null' in raw
+    again = record_exchange_reconciled(db, symbol="BTC/USDT", side="BUY", exchange_order_id="1837670272", executed_qty=0.001, avg_fill_price=80000.0)
+    assert again is False
+    written = backfill_exchange_reconciled_orders(
+        db,
+        unmatched=[
+            {
+                "source": "venue_fill",
+                "symbol": "ETH/USDT",
+                "side": "BUY",
+                "quantity": 0.02,
+                "unmatched_quantity": 0.02,
+                "price": 2500.0,
+                "exchange_order_id": "1587098371",
+                "venue_trade_id": "9",
+                "dollar_discrepancy": 50.0,
+            }
+        ],
+        known_order_ids=set(),
+    )
+    assert written == [{"symbol": "ETH/USDT", "side": "BUY", "exchange_order_id": "1587098371", "source": "EXCHANGE_RECONCILED"}]
+    conn = sqlite3.connect(db)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    assert "paper_trades" not in tables
+    conn.close()
 
 
 def test_qty_coverage_cannot_exceed_100():

@@ -481,6 +481,67 @@ def all_order_ids(db_path: str) -> set[str]:
     return {str(r["exchange_order_id"]) for r in rows if r.get("exchange_order_id")}
 
 
+def record_exchange_reconciled(
+    db_path: str,
+    *,
+    symbol: str,
+    side: str,
+    exchange_order_id: str,
+    client_order_id: str = "",
+    venue_trade_ids: list[str] | None = None,
+    executed_qty: float = 0.0,
+    avg_fill_price: float = 0.0,
+    cost_quote: float = 0.0,
+    fee_amount: float = 0.0,
+    fee_asset: str = "",
+    order_status: str = "",
+    event_ts_exchange: str = "",
+    matching_sell_order_id: str | None = None,
+    remaining_asset: str | None = None,
+    classification: str = "",
+    raw: dict[str, Any] | None = None,
+) -> bool:
+    """Persist an exchange-authoritative fill that has no original local row.
+
+    Decision, intent and mystic trade ids stay empty. This is not a paper_trades
+    row and invents no strategy association.
+    """
+    oid = str(exchange_order_id or "").strip()
+    if not oid:
+        return False
+    if fills_for_order(db_path, oid):
+        return False
+    payload = dict(raw or {})
+    payload["source"] = "EXCHANGE_RECONCILED"
+    payload["classification"] = str(classification or "")
+    payload["matching_sell_order_id"] = matching_sell_order_id
+    payload["remaining_asset"] = remaining_asset
+    payload["decision_id"] = None
+    payload["intent_id"] = None
+    payload["mystic_trade_id"] = None
+    identity = OrderIdentity(
+        symbol=str(symbol or ""),
+        side=str(side or "").upper(),
+        exchange_order_id=oid,
+        client_order_id=str(client_order_id or ""),
+        fill_ids=list(venue_trade_ids or []),
+        venue_trade_ids=list(venue_trade_ids or []),
+        executed_qty=float(executed_qty or 0.0),
+        avg_fill_price=float(avg_fill_price or 0.0),
+        cost_quote=float(cost_quote or 0.0),
+        fee_amount=float(fee_amount or 0.0),
+        fee_asset=str(fee_asset or ""),
+        fee_from_exchange=True,
+        order_status=str(order_status or "FILLED"),
+        mystic_trade_id="",
+        intent_id="",
+        decision_id="",
+        event_ts_exchange=str(event_ts_exchange or ""),
+        raw=payload,
+    )
+    return record_fill(db_path, identity)
+
+
 def _query(db_path: str, where: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
     try:
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10) as conn:

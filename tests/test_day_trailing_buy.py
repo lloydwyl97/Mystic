@@ -31,6 +31,8 @@ from backend.services.day_trailing_buy import (
 from backend.services.day_trailing_buy_store import (
     CANCELED,
     EXPIRED,
+    FAILED,
+    ORDER_OPEN,
     SUBMITTING,
     TRAIL_LOW,
     WAIT_DIP,
@@ -385,6 +387,102 @@ async def test_restart_recovery_does_not_guess_resubmit(tmp_path):
     assert recovered["status"] == SUBMITTING
     assert recovered["order_accepted"] is True
     assert release_submitting_for_retry(db, row["intent_id"]) is False
+
+
+def _arm_and_claim(db, symbol="ETH/USDT", decision_id="dec-stuck"):
+    _, _, row = create_intent(
+        db,
+        fields={
+            "decision_id": decision_id,
+            "symbol": symbol,
+            "arm_ask": 10.0,
+            "arm_bid": 9.99,
+            "arm_midpoint": 9.995,
+            "round_trip_cost_bps": 6.17,
+            "spread_bps": 1.0,
+            "required_improvement_bps": 10.0,
+            "rebound_bps": 4.0,
+            "min_dip_bps": 14.0,
+            "expires_at": time.time() + 900,
+        },
+    )
+    __import__("backend.services.day_trailing_buy_store", fromlist=["update_watch"]).update_watch(db, row["intent_id"], status=TRAIL_LOW, lowest_ask=9.9, lowest_ask_ts=time.time())
+    claim_submitting(db, row["intent_id"])
+    return row
+
+
+@pytest.mark.asyncio
+async def test_stale_submitting_without_venue_order_fails(tmp_path):
+    db = tmp_path / "tb.db"
+    row = _arm_and_claim(db)
+    import sqlite3
+
+    conn = sqlite3.connect(str(db))
+    conn.execute("UPDATE day_trailing_buy_intents SET updated_at=? WHERE intent_id=?", (time.time() - 120, row["intent_id"]))
+    conn.commit()
+    conn.close()
+
+    class _Live:
+        async def fetch_order(self, *a, **k):
+            return {"status": "error", "code": "-2013", "message": '{"code":-2013,"msg":"Order does not exist."}'}
+
+    released: list[str] = []
+
+    class _Eng:
+        db_path = str(db)
+        _live_service = _Live()
+
+        def _release_entry_reservation(self, *a, **k):
+            released.append(str(k.get("reason") or a[-1] if a else ""))
+
+    await recover_submitting_intent(_Eng(), load_intent(db, row["intent_id"]))
+    recovered = load_intent(db, row["intent_id"])
+    assert recovered["status"] == FAILED
+    assert recovered["cancel_reason"] == "VENUE_ORDER_NOT_FOUND"
+    assert released == ["VENUE_ORDER_NOT_FOUND"]
+
+
+@pytest.mark.asyncio
+async def test_fresh_submitting_without_venue_order_holds(tmp_path):
+    db = tmp_path / "tb.db"
+    row = _arm_and_claim(db, symbol="SOL/USDT", decision_id="dec-fresh")
+
+    class _Live:
+        async def fetch_order(self, *a, **k):
+            return {"status": "error", "code": "-2013", "message": "Order does not exist."}
+
+    class _Eng:
+        db_path = str(db)
+        _live_service = _Live()
+
+        def _release_entry_reservation(self, *a, **k):
+            raise AssertionError("must not release while still transitional")
+
+    await recover_submitting_intent(_Eng(), load_intent(db, row["intent_id"]))
+    assert load_intent(db, row["intent_id"])["status"] == SUBMITTING
+
+
+@pytest.mark.asyncio
+async def test_recover_open_order_marks_order_open(tmp_path):
+    db = tmp_path / "tb.db"
+    row = _arm_and_claim(db, symbol="BTC/USDT", decision_id="dec-open2")
+
+    class _Live:
+        async def fetch_order(self, *a, **k):
+            return {"status": "success", "order": {"id": "1837670272", "status": "open", "filled": 0}}
+
+    class _Eng:
+        db_path = str(db)
+        _live_service = _Live()
+
+        def _release_entry_reservation(self, *a, **k):
+            raise AssertionError("open venue order must not release")
+
+    await recover_submitting_intent(_Eng(), load_intent(db, row["intent_id"]))
+    recovered = load_intent(db, row["intent_id"])
+    assert recovered["status"] == ORDER_OPEN
+    assert recovered["order_id"] == "1837670272"
+    assert recovered["order_accepted"] is True
 
 
 def test_process_bar_does_not_call_execute_buy_fifo():
