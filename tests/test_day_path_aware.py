@@ -14,6 +14,8 @@ from backend.services.day_controlled_exits import (
     EXIT_NET_PROFIT,
     EXIT_PATH_EXECUTABLE_PROFIT,
     EXIT_STALL_DEAD,
+    EXIT_STOP_LOSS,
+    EXIT_TAKE_PROFIT_1,
     EXIT_TIME_STOP,
     EXIT_TRAILING_STOP,
     _path_aware_exit_enabled,
@@ -119,8 +121,14 @@ def test_path_aware_loser_exits_via_giveback_when_4h_absent():
     assert out["reason"] in {EXIT_GIVEBACK, EXIT_STALL_DEAD}
 
 
-def test_path_aware_max_hold_does_not_exit_when_4h_missing():
-    """4H removed from exit authority (2026-09-17). Missing bundle → bracket hold."""
+def test_max_hold_exits_at_the_ceiling_even_when_4h_missing():
+    """A missing 4H bundle must not suppress the authorized 300-min ceiling.
+
+    This previously asserted the opposite: reaching max hold produced a bracket
+    hold and EXIT_TIME_STOP was explicitly forbidden, which is what made the
+    configured 300 min a value that never took effect. 4H is still not consulted
+    -- the bundle is None here and the time stop fires anyway.
+    """
     out = evaluate_engine_managed_exit(
         position=_Pos(stop_price=0.0, thesis_invalid_level=0.0, max_hold_min=300),
         current_price=99.50,
@@ -129,9 +137,22 @@ def test_path_aware_max_hold_does_not_exit_when_4h_missing():
         coin_profile={"max_hold_min": 300, "trail": 0.005, "sl": 0.01},
         bundle=None,
     )
-    assert out["action"] == "hold"
-    assert out["reason"] == "path_aware_bracket_hold"
-    assert out["reason"] != EXIT_TIME_STOP
+    assert out["action"] == "sell"
+    assert out["reason"] == EXIT_TIME_STOP
+
+    # Short of the ceiling the time stop must not be the reason. (At 299 min this
+    # same position is stall-cut as dead inventory, which is a different exit, so
+    # the hold here is taken inside the stall's 45-min minimum.)
+    held = evaluate_engine_managed_exit(
+        position=_Pos(stop_price=0.0, thesis_invalid_level=0.0, max_hold_min=300),
+        current_price=99.50,
+        net_pnl_pct=-0.006,
+        hold_minutes=40.0,
+        coin_profile={"max_hold_min": 300, "trail": 0.005, "sl": 0.01},
+        bundle=None,
+    )
+    assert held["action"] == "hold"
+    assert held["reason"] == "path_aware_bracket_hold"
 
 
 def _rising_4h_rows(n: int = 60, start: float = 2000.0) -> list[list]:
@@ -151,13 +172,14 @@ def test_path_aware_holds_green_on_4h_rise():
     """4H removed from exit authority (2026-09-17). With a rising 4H, position
     stays in bracket hold (same behavior, different reason string).
 
-    No resolvable profit target here on purpose: this asserts the 4H rise does
-    not drive the exit, not that a winner at its target declines to take profit.
-    The _Pos default target of 101 against an ETH-scale mark would be reached
-    22x over and is not the condition under test.
+    Entry is scaled to the ETH-scale mark and no thesis target is resolvable, so
+    neither the authorized 1.4% take-profit nor the adaptive net-profit target is
+    in reach. This isolates the 4H rise, which is the condition under test. The
+    original fixture paired a $100 entry with a 2318 mark, so its 101 target was
+    exceeded 22x over by fixture incoherence rather than by design.
     """
     out = evaluate_engine_managed_exit(
-        position=_Pos(take_profit_1_price=0.0, thesis_target_level=0.0),
+        position=_Pos(entry_price=2306.0, thesis_invalid_level=0.0, take_profit_1_price=0.0, thesis_target_level=0.0),
         current_price=2318.0,
         net_pnl_pct=0.005,
         hold_minutes=20.0,
@@ -207,19 +229,43 @@ def test_path_aware_holds_time_stop_on_4h_rise():
     """4H removed from exit authority (2026-09-17). With a rising 4H, position
     stays in bracket hold (same behavior, different reason string).
 
-    Target left unresolvable so the assertion is about the elapsed max hold and
-    the 4H rise, not about a winner sitting on top of its target.
+    A rising 4H is not a reason to hold, but it is also not a reason to exit. The
+    exit here comes from the authorized 300-min ceiling being exceeded (400 min),
+    not from 4H. Entry is scaled to the mark so no profit objective is in reach.
     """
     out = evaluate_engine_managed_exit(
-        position=_Pos(max_hold_min=300, take_profit_1_price=0.0, thesis_target_level=0.0),
+        position=_Pos(
+            entry_price=2378.0,
+            max_hold_min=300,
+            thesis_invalid_level=0.0,
+            take_profit_1_price=0.0,
+            thesis_target_level=0.0,
+        ),
         current_price=2390.0,
-        net_pnl_pct=0.03,
+        net_pnl_pct=0.003,
         hold_minutes=400.0,
         coin_profile={"max_hold_min": 300, "trail": 0.005, "sl": 0.01},
         bundle={"4h": _rising_4h_rows()},
     )
-    assert out["action"] == "hold"
-    assert out["reason"] == "path_aware_bracket_hold"
+    assert out["action"] == "sell"
+    assert out["reason"] == EXIT_TIME_STOP
+
+    # Same rising 4H, inside the ceiling -> hold. Proves 4H did not cause the exit.
+    held = evaluate_engine_managed_exit(
+        position=_Pos(
+            entry_price=2378.0,
+            max_hold_min=300,
+            thesis_invalid_level=0.0,
+            take_profit_1_price=0.0,
+            thesis_target_level=0.0,
+        ),
+        current_price=2390.0,
+        net_pnl_pct=0.003,
+        hold_minutes=120.0,
+        coin_profile={"max_hold_min": 300, "trail": 0.005, "sl": 0.01},
+        bundle={"4h": _rising_4h_rows()},
+    )
+    assert held["action"] == "hold"
 
 
 def _broken_4h_rows() -> list[list]:
@@ -278,19 +324,40 @@ def test_risk_floor_flattens_even_while_4h_intact():
 
 
 def test_risk_floor_does_not_fire_above_structure():
-    """4H removed from exit authority (2026-09-17). Position above risk floor
-    stays in bracket hold."""
+    """The catastrophic floor sits under structure and must not fire above it.
+
+    The mark here is 76262.45 against a resolved floor of ~75835.95, so the floor
+    is correctly untouched. The position is 2.1% down against a 2% profile stop,
+    so the ordinary stop is what closes it -- that separation is the point: the
+    floor is the catastrophic backstop, the profile sl is the ordinary stop. This
+    previously asserted a bracket hold, which was only true because the ordinary
+    stop was unreachable and a 2.1% loss could keep running.
+    """
     entry = 77899.73
+    profile = {"max_hold_min": 2142, "trail": 0.004, "sl": 0.02}
     out = evaluate_engine_managed_exit(
         position=_Pos(entry_price=entry, stop_price=0.0, thesis_invalid_level=76064.14),
         current_price=76262.45,
         net_pnl_pct=-0.021,
         hold_minutes=120.0,
-        coin_profile={"max_hold_min": 2142, "trail": 0.004, "sl": 0.02},
+        coin_profile=profile,
         bundle={"4h": _rising_4h_rows(start=60000.0)},
     )
-    assert out["action"] == "hold"
-    assert out["reason"] == "path_aware_bracket_hold"
+    assert out["reason"] != EXIT_DAY_RISK_FLOOR
+    assert out["action"] == "sell"
+    assert out["reason"] == EXIT_STOP_LOSS
+
+    # Above the ordinary stop as well -> genuine bracket hold, floor still silent.
+    held = evaluate_engine_managed_exit(
+        position=_Pos(entry_price=entry, stop_price=0.0, thesis_invalid_level=76064.14),
+        current_price=77000.00,
+        net_pnl_pct=-0.011,
+        hold_minutes=120.0,
+        coin_profile=profile,
+        bundle={"4h": _rising_4h_rows(start=60000.0)},
+    )
+    assert held["action"] == "hold"
+    assert held["reason"] == "path_aware_bracket_hold"
 
 
 def test_risk_floor_is_hard_capped_when_structure_is_absurd():
@@ -321,28 +388,38 @@ def test_day_exit_policy_defaults_to_path_aware(monkeypatch):
 
 
 def test_only_structure_break_and_extreme_may_full_flatten():
-    """4H removed from DAY_FULL_FLATTEN_REASONS (2026-09-17)."""
+    """Authorized exits may flatten. 4H never may."""
+    from backend.services.day_controlled_exits import EXIT_STOP_LOSS, EXIT_TAKE_PROFIT_1
+
     assert {
-        EXIT_DAY_RISK_FLOOR,
         EXIT_EXTREME_PROTECTION,
-        EXIT_TRAILING_STOP,
+        EXIT_DAY_RISK_FLOOR,
+        EXIT_STOP_LOSS,
         EXIT_GIVEBACK,
+        EXIT_TRAILING_STOP,
+        EXIT_NET_PROFIT,
+        EXIT_TAKE_PROFIT_1,
         EXIT_STALL_DEAD,
+        EXIT_TIME_STOP,
     } == DAY_FULL_FLATTEN_REASONS
     assert EXIT_DAY_4H_STRUCTURE_BREAK not in DAY_FULL_FLATTEN_REASONS
-    for banned in (EXIT_NET_PROFIT, EXIT_PATH_EXECUTABLE_PROFIT, EXIT_TIME_STOP):
-        assert banned not in DAY_FULL_FLATTEN_REASONS
+    assert EXIT_PATH_EXECUTABLE_PROFIT not in DAY_FULL_FLATTEN_REASONS
 
 
 @pytest.mark.parametrize("net", [0.0006, 0.0045, 0.02])
 def test_no_scalp_clip_at_any_positive_net_when_4h_absent(net):
-    """4H removed from exit authority (2026-09-17). No profit-taking occurs
-    when 4H is absent; position stays in bracket hold."""
+    """No small-profit clip occurs while the mark is below every objective.
+
+    The mark is 100.0 against a 100.0 entry, so neither the authorized 1.4%
+    take-profit (101.40) nor the armed trail (99.90) is in reach. Hold minutes
+    are inside the 300-min ceiling; the original 5000 made this assert that the
+    max-hold ceiling did not exist, which is a separate concern from clipping.
+    """
     out = evaluate_engine_managed_exit(
         position=_Pos(stop_price=0.0, thesis_invalid_level=0.0, trailing_stop_price=99.9, highest_price=101.0),
         current_price=100.0,
         net_pnl_pct=net,
-        hold_minutes=5000.0,
+        hold_minutes=120.0,
         coin_profile={"max_hold_min": 300, "trail": 0.005, "sl": 0.01},
         bundle=None,
     )
@@ -486,29 +563,55 @@ def test_preview_splits_trail_fields_and_names_intact_profit_when_ready():
 
 
 def test_intact_green_sol_clip_level_holds_until_trail():
-    """Replay: SOL 101.08 → 102.52 was NET_PROFIT while 4H advanced. Holds
-    in bracket (4H removed 2026-09-17). Trail still fires on pullback."""
+    """Replay: SOL 101.08 -> 102.52 while 4H advanced.
+
+    102.52 / 101.08 is +1.4247%, at or above the authorized 1.4% take-profit, so
+    the correct outcome is TAKE_PROFIT_1 -- this is real replay evidence that the
+    authorized take-profit is reachable. It previously asserted a bracket hold,
+    which was only true while every profit exit was unreachable. A mark just
+    under the 1.4% objective still holds, and the trail still fires on pullback.
+    """
     rows = _rising_4h_rows(start=100.59)
-    pos = _Pos(
-        entry_price=101.08,
-        highest_price=102.52,
-        lowest_price=101.00,
-        stop_price=0.0,
-        trailing_stop_price=102.52 * 0.995,
-        trail_pct=0.005,
-        thesis_invalid_level=0.0,
-        symbol="SOL/USDT",
-    )
-    hold = evaluate_engine_managed_exit(
-        position=pos,
+    profile = {"max_hold_min": 360, "trail": 0.005, "sl": 0.01}
+
+    def _pos():
+        return _Pos(
+            entry_price=101.08,
+            highest_price=102.52,
+            lowest_price=101.00,
+            stop_price=0.0,
+            trailing_stop_price=102.52 * 0.995,
+            trail_pct=0.005,
+            thesis_invalid_level=0.0,
+            thesis_target_level=0.0,
+            take_profit_1_price=0.0,
+            symbol="SOL/USDT",
+        )
+
+    took_profit = evaluate_engine_managed_exit(
+        position=_pos(),
         current_price=102.52,
         net_pnl_pct=0.012508,
         hold_minutes=244.0,
-        coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
+        coin_profile=profile,
         bundle={"4h": rows},
     )
-    assert hold["action"] == "hold"
-    assert hold["reason"] == "path_aware_bracket_hold"
+    assert took_profit["action"] == "sell"
+    assert took_profit["reason"] == EXIT_TAKE_PROFIT_1
+
+    # Just under the 1.4% objective and above the trail -> hold.
+    below = evaluate_engine_managed_exit(
+        position=_pos(),
+        current_price=101.08 * 1.013,
+        net_pnl_pct=0.0115,
+        hold_minutes=244.0,
+        coin_profile=profile,
+        bundle={"4h": rows},
+    )
+    assert below["action"] == "hold"
+    assert below["reason"] == "path_aware_bracket_hold"
+
+    pos = _pos()
     trail_hit = evaluate_engine_managed_exit(
         position=pos,
         current_price=102.52 * 0.995 - 0.01,

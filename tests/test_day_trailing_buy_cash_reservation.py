@@ -535,7 +535,8 @@ async def test_reservation_converts_once_and_terminal_releases_once(tmp_path):
 
     engine = _Eng()
     await _submit_claimed(engine, intent, 99.9)
-    assert len([r for r in releases if r[0] == "SOL/USDT"]) == 1
+    assert len(releases) == 0
+    assert "SOL/USDT" not in engine._entry_reservations
     assert "ETH/USDT" in engine._entry_reservations
 
 

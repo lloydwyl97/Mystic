@@ -350,3 +350,71 @@ class TestLeftover4hActionPathsClosed:
         out = evaluate_completed_4h_buy_hard_safety(mark=96.0, bundle=_make_bundle_4h_broken())
         assert out["allowed"] is True
         assert out["block_reason"] == ""
+
+
+class TestFourHourHasNoCompositeOrderAuthority:
+    def test_4h_is_not_required_for_a_day_signal(self):
+        from backend.config.day_active_timeframes import DAY_ACTIVE_TIMEFRAMES, DAY_REQUIRED_TIMEFRAMES
+
+        assert "4h" in DAY_ACTIVE_TIMEFRAMES
+        assert "4h" not in DAY_REQUIRED_TIMEFRAMES
+
+    def test_missing_4h_does_not_fail_the_live_bundle_contract(self):
+        from backend.config.day_active_timeframes import DAY_REQUIRED_TIMEFRAMES, min_bars_for_day_tf
+        from backend.services.day_active_market_bundle import validate_day_active_bundle
+
+        bundle = {tf: [[i, 1.0, 1.0, 1.0, 1.0, 1.0] for i in range(min_bars_for_day_tf(tf) + 5)] for tf in DAY_REQUIRED_TIMEFRAMES}
+        bundle["1m"] = [[i, 1.0, 1.0, 1.0, 1.0, 1.0] for i in range(260)]
+        bundle["1d"] = [[i, 1.0, 1.0, 1.0, 1.0, 1.0] for i in range(40)]
+        bundle["4h"] = []
+        ok, missing = validate_day_active_bundle(bundle)
+        assert not any("4h" in m for m in missing)
+        assert ok is True or not any("missing_tf:4h" in m for m in missing)
+
+    def test_thesis_htf_mean_excludes_4h(self):
+        from backend.services.day_trade_thesis import HTF_TFS
+
+        assert "4h" not in HTF_TFS
+        assert "15m" in HTF_TFS
+
+    def test_4h_slope_is_zeroed_in_the_live_context_vector(self):
+        from backend.services.ai_decision_contract import CONTEXT_DIMS_DAY_FULL
+        from backend.services.ai_feature_v2 import context_vector_day_full_mtf
+
+        snaps = {tf: {"slope": 0.42, "ema_align": 0.9} for tf in ("1m", "5m", "15m", "30m", "1h", "4h", "8h", "12h", "1d", "1w")}
+        vec = context_vector_day_full_mtf({}, mtf_snapshots=snaps, month_four=[0.0, 0.0])
+        idx = list(CONTEXT_DIMS_DAY_FULL).index("slope_pct_4h")
+        assert vec[idx] == 0.0
+        mean_idx = list(CONTEXT_DIMS_DAY_FULL).index("mean_ema_align_all_tf")
+        # 4h ema 0.9 must not pull the mean; remaining TFs are all 0.9 except 4h skipped
+        assert vec[mean_idx] == pytest.approx(0.9)
+
+    def test_ctx_multiplier_ignores_4h_align(self):
+        from backend.services.ai_market_context import _ctx_multiplier
+
+        own = {tf: {"bars": 20, "ema_align": 0.1} for tf in ("1m", "5m", "15m", "1h")}
+        own["4h"] = {"bars": 20, "ema_align": 1.0}
+        a, _ = _ctx_multiplier(own_mtf=own, rs_btc=0.0, rs_eth=0.0, depth_imbalance=0.0, market_regime="chop")
+        b, _ = _ctx_multiplier(
+            own_mtf={k: v for k, v in own.items() if k != "4h"},
+            rs_btc=0.0,
+            rs_eth=0.0,
+            depth_imbalance=0.0,
+            market_regime="chop",
+        )
+        assert a == pytest.approx(b)
+
+    def test_momentum_horizons_exclude_4h(self):
+        from backend.services.day_feature_stack_v2 import DEFAULT_MOMENTUM_HORIZONS
+
+        assert "4h" not in DEFAULT_MOMENTUM_HORIZONS
+
+    def test_ranking_source_prefers_15m_not_4h(self):
+        import inspect
+
+        from backend.services import ai_signal_generator as gen
+
+        src = inspect.getsource(gen.RealTimeAISignalGenerator._generate_signal_for_symbol)
+        assert 'ranking_source = bundle.get("15m")' in src
+        assert 'ranking_source = bundle.get("4h")' not in src
+        assert 'market_primary = bundle.get("4h")' not in src

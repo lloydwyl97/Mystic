@@ -1424,6 +1424,14 @@ class OpenPosition:
     opened_under_router: bool = False
     max_hold_min: int = 0
     trail_pct: float = 0.0
+    # Entry identity chain, carried so a position can always be traced back to
+    # the decision that authorized it and the venue order that created it.
+    entry_decision_id: str = ""
+    entry_intent_id: str = ""
+    entry_reservation_id: str = ""
+    entry_order_id: str = ""
+    entry_client_order_id: str = ""
+    entry_fill_ids_json: str = "[]"
 
     @property
     def risk_usd(self) -> float:
@@ -4605,6 +4613,17 @@ class PortfolioEngine:
             ("status", "TEXT DEFAULT 'ACTIVE'"),
             ("dust_detected_at", "REAL DEFAULT 0"),
             ("dust_qty_canonical", "REAL DEFAULT 0"),
+            # Entry identity chain. Without these a position could not be tied
+            # back to the decision that authorized it, the intent that armed it,
+            # the reservation that funded it, or the venue order and fills that
+            # created it -- reconciliation had to guess by symbol, quantity and
+            # time. entry_decision_id already existed but nothing populated it.
+            ("entry_decision_id", "TEXT DEFAULT ''"),
+            ("entry_intent_id", "TEXT DEFAULT ''"),
+            ("entry_reservation_id", "TEXT DEFAULT ''"),
+            ("entry_order_id", "TEXT DEFAULT ''"),
+            ("entry_client_order_id", "TEXT DEFAULT ''"),
+            ("entry_fill_ids_json", "TEXT DEFAULT '[]'"),
         ]:
             if col_name not in pos_cols:
                 try:
@@ -5073,8 +5092,11 @@ class PortfolioEngine:
                             entry_fee, sleeve, entry_strategy_id,
                             repair_add_count, last_repair_add_ts, repair_add_trade_ids,
                             average_entry_after_repair, original_position_cost, thesis_json,
-                            status, dust_detected_at, dust_qty_canonical, last_updated
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            status, dust_detected_at, dust_qty_canonical,
+                            entry_decision_id, entry_intent_id, entry_reservation_id,
+                            entry_order_id, entry_client_order_id, entry_fill_ids_json,
+                            last_updated
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                         (
                             pos.symbol,
@@ -5104,6 +5126,12 @@ class PortfolioEngine:
                             status_val,
                             dust_at,
                             dust_qty,
+                            str(getattr(pos, "entry_decision_id", "") or ""),
+                            str(getattr(pos, "entry_intent_id", "") or ""),
+                            str(getattr(pos, "entry_reservation_id", "") or ""),
+                            str(getattr(pos, "entry_order_id", "") or ""),
+                            str(getattr(pos, "entry_client_order_id", "") or ""),
+                            str(getattr(pos, "entry_fill_ids_json", "[]") or "[]"),
                             timestamp,
                         ),
                     )
@@ -5190,8 +5218,11 @@ class PortfolioEngine:
                         entry_fee, sleeve, entry_strategy_id,
                         repair_add_count, last_repair_add_ts, repair_add_trade_ids,
                         average_entry_after_repair, original_position_cost, thesis_json,
-                        status, dust_detected_at, dust_qty_canonical, last_updated
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        status, dust_detected_at, dust_qty_canonical,
+                        entry_decision_id, entry_intent_id, entry_reservation_id,
+                        entry_order_id, entry_client_order_id, entry_fill_ids_json,
+                        last_updated
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         position.symbol,
@@ -5221,6 +5252,12 @@ class PortfolioEngine:
                         status_val,
                         dust_at,
                         dust_qty,
+                        str(getattr(position, "entry_decision_id", "") or ""),
+                        str(getattr(position, "entry_intent_id", "") or ""),
+                        str(getattr(position, "entry_reservation_id", "") or ""),
+                        str(getattr(position, "entry_order_id", "") or ""),
+                        str(getattr(position, "entry_client_order_id", "") or ""),
+                        str(getattr(position, "entry_fill_ids_json", "[]") or "[]"),
                         timestamp,
                     ),
                 )
@@ -6715,7 +6752,16 @@ class PortfolioEngine:
                 break
             fetched = res.get("order", {})
             new_status = (fetched.get("status") or "").lower()
-            order = fetched
+            # Do not let the fetch reply erase the create reply's fills. Binance's
+            # GET /order carries no fills array, so replacing the order wholesale
+            # discarded the only copy of the per-fill venue trade ids.
+            from backend.services.protected_limit_execution import _merge_info_preserving_fills
+
+            merged = dict(fetched)
+            if not merged.get("trades") and order.get("trades"):
+                merged["trades"] = order["trades"]
+            merged["info"] = _merge_info_preserving_fills(order.get("info"), fetched.get("info"))
+            order = merged
             if new_status in ("closed", "filled", "canceled", "cancelled", "expired"):
                 break
         if (order.get("status") or "").lower() in ("partially_filled", "open"):
@@ -7268,7 +7314,13 @@ class PortfolioEngine:
                            COALESCE(lowest_price, 0),
                            COALESCE(status, 'ACTIVE'),
                            COALESCE(dust_detected_at, 0),
-                           COALESCE(dust_qty_canonical, 0)
+                           COALESCE(dust_qty_canonical, 0),
+                           COALESCE(entry_decision_id, ''),
+                           COALESCE(entry_intent_id, ''),
+                           COALESCE(entry_reservation_id, ''),
+                           COALESCE(entry_order_id, ''),
+                           COALESCE(entry_client_order_id, ''),
+                           COALESCE(entry_fill_ids_json, '[]')
                     FROM portfolio_engine_positions
                 """)
                 rows = cursor.fetchall()
@@ -7313,6 +7365,15 @@ class PortfolioEngine:
             status_val = str(row[24]) if len(row) > 24 and row[24] else "ACTIVE"
             dust_at = float(row[25]) if len(row) > 25 else 0.0
             dust_qty = float(row[26]) if len(row) > 26 else 0.0
+            # Entry identity chain. Restart adoption depends on these surviving
+            # the round trip, or the adopted position loses its link to the
+            # decision, intent, reservation and venue order that created it.
+            entry_decision_id = str(row[27]) if len(row) > 27 and row[27] else ""
+            entry_intent_id = str(row[28]) if len(row) > 28 and row[28] else ""
+            entry_reservation_id = str(row[29]) if len(row) > 29 and row[29] else ""
+            entry_order_id = str(row[30]) if len(row) > 30 and row[30] else ""
+            entry_client_order_id = str(row[31]) if len(row) > 31 and row[31] else ""
+            entry_fill_ids_json = str(row[32]) if len(row) > 32 and row[32] else "[]"
             pos = OpenPosition(
                 symbol=normalized_symbol,
                 quantity=row[1],
@@ -7354,6 +7415,12 @@ class PortfolioEngine:
                 trail_pct=float(thesis_payload.get("trail_pct") or 0.0),
                 exit_residual_reason=str(thesis_payload.get("exit_residual_reason") or ""),
                 exit_residual_since=float(thesis_payload.get("exit_residual_since") or 0.0),
+                entry_decision_id=entry_decision_id,
+                entry_intent_id=entry_intent_id,
+                entry_reservation_id=entry_reservation_id,
+                entry_order_id=entry_order_id,
+                entry_client_order_id=entry_client_order_id,
+                entry_fill_ids_json=entry_fill_ids_json,
             )
             from backend.services.day_inventory_recovery import apply_legacy_tags_from_thesis
 
@@ -9355,6 +9422,7 @@ class PortfolioEngine:
                     fee,
                     comm.fee_from_exchange,
                 )
+                _entry_fill_ids: list[str] = []
                 try:
                     from backend.services.live_order_identity import extract_identity, record_fill
 
@@ -9373,6 +9441,7 @@ class PortfolioEngine:
                         fee_from_exchange=bool(comm.fee_from_exchange),
                     )
                     await asyncio.to_thread(record_fill, self.db_path, _identity)
+                    _entry_fill_ids = list(_identity.fill_ids)
                 except Exception:
                     logger.exception(
                         "LIVE_BUY_IDENTITY_RECORD_FAILED symbol=%s order=%s trade=%s",
@@ -9525,6 +9594,18 @@ class PortfolioEngine:
             thesis_invalid_level=float(position.thesis_invalid_level or 0.0),
             thesis_target_level=float(position.thesis_target_level or 0.0),
         )
+        # Entry identity chain. Stamped before any money write so the position
+        # can never exist without a link back to the decision that authorized
+        # it, the intent that armed it, the reservation that funded it and the
+        # venue order that created it.
+        position.entry_decision_id = str(decision_id or "")
+        position.entry_intent_id = str(trailing_buy_intent_id or "")
+        position.entry_client_order_id = str(client_order_id or "")
+        position.entry_reservation_id = str((self._entry_reservations.get(normalized_symbol) or {}).get("reservation_id") or "")
+        if live_order_buy:
+            position.entry_order_id = str(live_order_buy.get("id") or "")
+            position.entry_fill_ids_json = json.dumps(_entry_fill_ids)
+
         explainability.setup_type = str(position.entry_thesis or explainability.setup_type or "")
         explainability.entry_thesis = str(position.entry_thesis or explainability.entry_thesis or "")
         explainability.thesis_invalid_level = float(position.thesis_invalid_level or 0.0)
@@ -12592,6 +12673,22 @@ class PortfolioEngine:
                         symbol,
                         _ts_reason,
                     )
+                    try:
+                        from backend.services.day_decision_state import build_hold_record, classify_hold_category, persist_hold_record
+
+                        persist_hold_record(
+                            str(self.db_path),
+                            build_hold_record(
+                                symbol=str(symbol or ""),
+                                category=classify_hold_category(reject_reason=f"COOLDOWN:{_ts_reason}"),
+                                reason=f"TRADE_STATE:{_ts_reason}",
+                                authority="_can_open_position",
+                                required={"trade_state": "IDLE"},
+                                observed={"trade_state_reason": str(_ts_reason)},
+                            ),
+                        )
+                    except Exception:
+                        logger.debug("hold-state cooldown persist skipped", exc_info=True)
                     return False, f"TRADE_STATE:{_ts_reason}"
             except Exception as _ts_err:
                 logger.warning("trade_state gate error for %s: %s — allowing entry (fail-open)", symbol, _ts_err)
@@ -13212,7 +13309,16 @@ class PortfolioEngine:
                 managed.get("4h_bundle_present"),
                 managed.get("extreme_protection_fired"),
             )
-            profit_exit = exit_reason.startswith(EXIT_NET_PROFIT) or exit_reason == EXIT_PATH_EXECUTABLE_PROFIT
+            # EXIT_TAKE_PROFIT_1 is the authorized 1.4% coin-profile take-profit.
+            # It must map to ExitType.TAKE_PROFIT_1 (and therefore force_sell
+            # False) like the other profit exits; leaving it out would book a
+            # reached profit objective as a forced MANUAL exit.
+            from backend.services.day_controlled_exits import EXIT_TAKE_PROFIT_1
+
+            profit_exit = exit_reason.startswith(EXIT_NET_PROFIT) or exit_reason in (
+                EXIT_PATH_EXECUTABLE_PROFIT,
+                EXIT_TAKE_PROFIT_1,
+            )
             exit_type = ExitType.TAKE_PROFIT_1 if profit_exit else ExitType.MANUAL
             return await self.execute_sell_fifo(
                 symbol,
@@ -15842,6 +15948,23 @@ class PortfolioEngine:
                 )
             if qty_m <= 0 or cap <= 0:
                 logger.info("TRAILING_BUY_STREAM_SKIP %s NO_REMAINING_SLOT_CASH", symbol)
+                try:
+                    from backend.services.day_decision_state import build_hold_record, classify_hold_category, persist_hold_record
+
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=symbol,
+                            category=classify_hold_category(reject_reason="NO_REMAINING_SLOT_CASH"),
+                            reason="NO_REMAINING_SLOT_CASH",
+                            authority="_arm_trailing_buy_ranked_stream",
+                            decision_id=str(getattr(candidate, "decision_id", "") or ""),
+                            observed={"cap": float(cap), "qty": float(qty_m), "ask": float(ask_m)},
+                            required={"remaining_slot_cash": ">0"},
+                        ),
+                    )
+                except Exception:
+                    logger.debug("hold-state slot-cash persist skipped", exc_info=True)
                 continue
             explainability = TradeExplainability(
                 trade_id="",

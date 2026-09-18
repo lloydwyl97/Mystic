@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -375,6 +377,39 @@ def fresh_executable_book(redis_client: Any, symbol: str) -> dict[str, Any] | No
     return book
 
 
+def _persist_hold(
+    engine: Any,
+    *,
+    symbol: str,
+    reason: str,
+    authority: str,
+    decision_id: str = "",
+    intent_id: str = "",
+    trailing_status: str = "",
+    observed: dict[str, Any] | None = None,
+    required: dict[str, Any] | None = None,
+) -> None:
+    """Record a HOLD category. Telemetry only — never changes the decision."""
+    try:
+        from backend.services.day_decision_state import build_hold_record, classify_hold_category, persist_hold_record
+
+        persist_hold_record(
+            str(getattr(engine, "db_path", "") or ""),
+            build_hold_record(
+                symbol=str(symbol or ""),
+                category=classify_hold_category(reject_reason=reason, trailing_status=trailing_status),
+                reason=reason,
+                authority=authority,
+                decision_id=str(decision_id or ""),
+                intent_id=str(intent_id or ""),
+                observed=observed,
+                required=required,
+            ),
+        )
+    except Exception:
+        logger.debug("trailing-buy hold persist skipped", exc_info=True)
+
+
 def _thesis_invalid(intent: dict[str, Any], ask: float) -> bool:
     level = float(intent.get("thesis_invalid_level") or 0.0)
     return bool(level > 0 and ask > 0 and ask <= level)
@@ -438,6 +473,13 @@ async def arm_selected_candidate(
     book = fresh_executable_book(redis_client, symbol)
     if not book:
         logger.info("TRAILING_BUY_ARM_BLOCKED %s STALE_OR_MISSING_BOOK", symbol)
+        _persist_hold(
+            engine,
+            symbol=symbol,
+            reason="STALE_OR_MISSING_BOOK",
+            authority="arm_selected_candidate",
+            decision_id=str(decision_id or ""),
+        )
         return None
     arm_ask = float(book["ask"])
     arm_bid = float(book["bid"])
@@ -445,7 +487,7 @@ async def arm_selected_candidate(
     live_spread = float(book.get("spread_bps") or 0.0)
     formulas = formulas_for_symbol(symbol, arm_spread_bps=live_spread)
     discovery: dict[str, Any] = {}
-    from backend.services.day_setup_discovery import classify_setup, may_arm_setup, structured_min_dip_bps
+    from backend.services.day_setup_discovery import classify_setup, may_arm_setup
 
     try:
         from backend.config.day_setup_discovery import SETUP_DISCOVERY_LOOKBACK_BARS
@@ -461,13 +503,8 @@ async def arm_selected_candidate(
             epoch = _bar_epoch(row.get("ts"))
             bars.append((epoch, float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"]), float(row.get("volume") or 0.0)))
         discovery = classify_setup(bars, symbol=symbol, ts=int(time.time()), atr=float(atr or 0.0), ask=arm_ask)
-        if str(discovery.get("setup_class") or "") == "STRUCTURED_PULLBACK_RECLAIM":
-            formulas["min_dip_bps"] = structured_min_dip_bps(
-                symbol,
-                float(atr or 0.0),
-                arm_ask,
-                float(formulas["rebound_bps"]),
-            )
+        # 240m structure / 4H discovery is telemetry only. It must not change
+        # the authorized dip distance or delay a BUY.
     except Exception:
         logger.exception("TRAILING_BUY_SETUP_DISCOVERY_FAILED symbol=%s", symbol)
         discovery = {}
@@ -668,17 +705,17 @@ async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> di
         trailing_buy_intent_id=str(intent.get("intent_id") or ""),
     )
     if result:
-        engine._release_entry_reservation(
-            symbol,
-            decision_id=str(intent.get("decision_id") or ""),
-            reason="ORDER_ACCEPTED",
-        )
+        # The order filled, so the reservation became a position. CONSUMED, not
+        # released: the cash was spent, not handed back.
+        _consume_intent_reservation(engine, intent)
+        order_id = str(result.get("order_id") or result.get("exchange_order_id") or "")
+        identity = _identity_for_order(engine, order_id)
         mark_order_accepted(
             engine.db_path,
             str(intent["intent_id"]),
-            order_id=str(result.get("order_id") or result.get("exchange_order_id") or ""),
-            fill_id=str(result.get("fill_id") or ""),
-            trade_id=str(result.get("trade_id") or ""),
+            order_id=order_id,
+            fill_id=str(result.get("fill_id") or "") or identity.get("fill_id", ""),
+            trade_id=str(result.get("trade_id") or "") or identity.get("trade_id", ""),
         )
         improvement = fill_improvement_vs_arm_bps(float(intent.get("arm_ask") or 0.0), float(result.get("price") or ask))
         mark_terminal(
@@ -686,9 +723,9 @@ async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> di
             str(intent["intent_id"]),
             FILLED,
             reason=ENTRY_AUTHORITY,
-            order_id=str(result.get("order_id") or result.get("exchange_order_id") or ""),
-            fill_id=str(result.get("fill_id") or ""),
-            trade_id=str(result.get("trade_id") or ""),
+            order_id=order_id,
+            fill_id=str(result.get("fill_id") or "") or identity.get("fill_id", ""),
+            trade_id=str(result.get("trade_id") or "") or identity.get("trade_id", ""),
             order_accepted=True,
             current_ask=float(result.get("price") or ask),
         )
@@ -759,6 +796,15 @@ async def cycle_trailing_buy_intents(engine: Any, redis_client: Any) -> dict[str
         summary["cycled"] += 1
         symbol = str(intent.get("symbol") or "")
         if str(intent.get("status") or "") == SUBMITTING:
+            _persist_hold(
+                engine,
+                symbol=symbol,
+                reason="SUBMITTING",
+                authority="cycle_trailing_buy_intents",
+                decision_id=str(intent.get("decision_id") or ""),
+                intent_id=str(intent.get("intent_id") or ""),
+                trailing_status=SUBMITTING,
+            )
             await recover_submitting_intent(engine, intent)
             continue
         book = read_market_book(books, symbol)
@@ -812,6 +858,82 @@ async def cycle_trailing_buy_intents(engine: Any, redis_client: Any) -> dict[str
     return summary
 
 
+def _identity_for_order(engine: Any, exchange_order_id: str) -> dict[str, str]:
+    """Recover Mystic's trade id and the venue fill ids for one exchange order.
+
+    ``live_exchange_fills`` is the canonical live venue record: one append-only
+    row per confirmed fill, carrying the exchange order id, Mystic's trade id,
+    the intent id, the decision id and the per-fill venue trade ids. It is the
+    only place the venue order id and Mystic's own identifiers are already
+    joined, so it is what restart adoption reads rather than re-deriving links.
+    """
+    if not exchange_order_id:
+        return {}
+    try:
+        from backend.services.live_order_identity import fills_for_order
+
+        rows = fills_for_order(engine.db_path, str(exchange_order_id))
+    except Exception:
+        logger.exception("TRAILING_BUY_IDENTITY_LOOKUP_FAILED order=%s", exchange_order_id)
+        return {}
+    buys = [r for r in rows if str(r.get("side") or "").upper() == "BUY"] or rows
+    if not buys:
+        return {}
+    row = buys[-1]
+    fill_ids: list[str] = []
+    try:
+        fill_ids = [str(x) for x in json.loads(str(row.get("fill_ids_json") or "[]")) if str(x).strip()]
+    except (TypeError, ValueError):
+        fill_ids = []
+    return {
+        "trade_id": str(row.get("mystic_trade_id") or ""),
+        "fill_id": ",".join(fill_ids),
+        "decision_id": str(row.get("decision_id") or ""),
+        "client_order_id": str(row.get("client_order_id") or ""),
+    }
+
+
+def _consume_intent_reservation(engine: Any, intent: dict[str, Any]) -> None:
+    """Retire a filled intent's reservation as CONSUMED, exactly once.
+
+    Uses the reservation_id stored on the intent row rather than the engine's
+    in-memory reservation map, because adoption runs after a restart when that
+    map is empty. A filled reservation left ACTIVE was being relabelled EXPIRED
+    by the staleness sweep, so deployed capital looked abandoned.
+    """
+    reservation_id = str(intent.get("reservation_id") or "")
+    decision_id = str(intent.get("decision_id") or "")
+    symbol = str(intent.get("symbol") or "")
+    try:
+        from backend.services.day_entry_reservations import consume_reservation
+
+        consumed = consume_reservation(
+            engine.db_path,
+            reservation_id=reservation_id,
+            decision_id=decision_id,
+            symbol=symbol,
+        )
+    except Exception:
+        logger.exception(
+            "RESERVATION_CONSUME_FAILED intent=%s reservation=%s — reservation may remain ACTIVE",
+            intent.get("intent_id"),
+            reservation_id,
+        )
+        return
+    # Drop the in-memory hold too, or the engine keeps counting spent capital as
+    # reserved until the next reload.
+    with contextlib.suppress(Exception):
+        from backend.services.portfolio_engine import normalize_symbol
+
+        engine._entry_reservations.pop(normalize_symbol(symbol), None)
+    if not consumed:
+        logger.info(
+            "RESERVATION_ALREADY_TERMINAL intent=%s reservation=%s — no second transition",
+            intent.get("intent_id"),
+            reservation_id,
+        )
+
+
 async def recover_submitting_intent(engine: Any, intent: dict[str, Any]) -> None:
     """Adopt an existing order/fill. Never guess a resubmit."""
     symbol = str(intent.get("symbol") or "")
@@ -819,24 +941,29 @@ async def recover_submitting_intent(engine: Any, intent: dict[str, Any]) -> None
     cid = str(intent.get("client_order_id") or "")
     local = _local_fill(engine, symbol=symbol, decision_id=decision_id, client_order_id=cid)
     if local:
+        order_id = str(local.get("order_id") or "")
+        identity = _identity_for_order(engine, order_id)
+        fill_id = str(local.get("fill_id") or "") or identity.get("fill_id", "")
+        trade_id = str(local.get("trade_id") or "") or identity.get("trade_id", "")
         mark_order_accepted(
             engine.db_path,
             str(intent["intent_id"]),
-            order_id=str(local.get("order_id") or ""),
-            fill_id=str(local.get("fill_id") or ""),
-            trade_id=str(local.get("trade_id") or ""),
+            order_id=order_id,
+            fill_id=fill_id,
+            trade_id=trade_id,
         )
         mark_terminal(
             engine.db_path,
             str(intent["intent_id"]),
             FILLED,
             reason="RECOVERED_LOCAL_FILL",
-            order_id=str(local.get("order_id") or ""),
-            fill_id=str(local.get("fill_id") or ""),
-            trade_id=str(local.get("trade_id") or ""),
+            order_id=order_id,
+            fill_id=fill_id,
+            trade_id=trade_id,
             order_accepted=True,
         )
-        logger.info("TRAILING_BUY_RECOVERED_FILL intent=%s trade=%s", intent.get("intent_id"), local.get("trade_id"))
+        _consume_intent_reservation(engine, intent)
+        logger.info("TRAILING_BUY_RECOVERED_FILL intent=%s trade=%s", intent.get("intent_id"), trade_id)
         return
     exchange = await _exchange_order(
         engine,
@@ -876,22 +1003,38 @@ async def recover_submitting_intent(engine: Any, intent: dict[str, Any]) -> None
         engine._release_entry_reservation(symbol, decision_id=decision_id, reason="RECOVERED_VENUE_CANCELED")
         return
     if state == "filled":
+        # The venue knows nothing about Mystic's trade id, so exchange["trade_id"]
+        # and exchange["fill_id"] are always blank here. Recover both from the
+        # canonical live fill record, which is keyed by exchange order id and was
+        # already written when the fill settled.
+        order_id = str(exchange.get("order_id") or "")
+        identity = _identity_for_order(engine, order_id)
+        fill_id = str(exchange.get("fill_id") or "") or identity.get("fill_id", "")
+        trade_id = str(exchange.get("trade_id") or "") or identity.get("trade_id", "")
         mark_order_accepted(
             engine.db_path,
             str(intent["intent_id"]),
-            order_id=str(exchange.get("order_id") or ""),
-            fill_id=str(exchange.get("fill_id") or ""),
-            trade_id=str(exchange.get("trade_id") or ""),
+            order_id=order_id,
+            fill_id=fill_id,
+            trade_id=trade_id,
         )
         mark_terminal(
             engine.db_path,
             str(intent["intent_id"]),
             FILLED,
             reason="RECOVERED_EXCHANGE_FILL",
-            order_id=str(exchange.get("order_id") or ""),
-            fill_id=str(exchange.get("fill_id") or ""),
-            trade_id=str(exchange.get("trade_id") or ""),
+            order_id=order_id,
+            fill_id=fill_id,
+            trade_id=trade_id,
             order_accepted=True,
+        )
+        _consume_intent_reservation(engine, intent)
+        logger.info(
+            "TRAILING_BUY_RECOVERED_EXCHANGE_FILL intent=%s order=%s trade=%s fill_ids=%s",
+            intent.get("intent_id"),
+            order_id,
+            trade_id or "UNRESOLVED",
+            fill_id or "UNRESOLVED",
         )
         return
     if bool(intent.get("order_accepted")):

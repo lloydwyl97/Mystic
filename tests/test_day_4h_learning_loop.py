@@ -220,7 +220,7 @@ def test_experiment_and_lock_registries_are_protected_not_expired():
     assert "day_forward_lock_registry" not in keep
     assert "day_clock_v2_partition_registry" not in keep
     assert "day_clock_v2_outcome_labels" not in keep
-    assert set(PROTECTED_TABLES) == {
+    required = {
         "day_experiment_registry",
         "day_forward_lock_registry",
         "day_path_clock_feature_snapshots",
@@ -230,7 +230,11 @@ def test_experiment_and_lock_registries_are_protected_not_expired():
         "day_clock_v2_partition_registry",
         "day_clock_v2_outcome_labels",
         "day_clock_v2_outcome_labels_history",
+        "paper_trades",
+        "live_exchange_fills",
+        "feature_ohlcv",
     }
+    assert required <= set(PROTECTED_TABLES)
 
 
 def test_report_window_empty_db(tmp_path):

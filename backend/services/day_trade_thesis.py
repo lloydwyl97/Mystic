@@ -66,7 +66,7 @@ ALL_SETUP_TYPES = (
     RESEARCH_SHORT_BEAR_CONTINUATION,
 )
 
-HTF_TFS = ("15m", "30m", "1h", "4h")
+HTF_TFS = ("15m", "30m", "1h")
 LTF_TFS = ("1m", "5m")
 BREAKOUT_ALT_SYMBOLS = frozenset({"SOLUSDT", "XRPUSDT", "DOGEUSDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"})
 
@@ -1382,10 +1382,13 @@ def apply_late_4h_rank_to_decision_data(decision_data: dict[str, Any], symbol: s
         signal = late_4h_rise_signal(read_cached_day_active_bundle_sync(symbol), time.time())
     except Exception:
         signal = ""
-    rank_d, size_f = late_4h_rank_size_adjust(signal)
+    _rank_d, _size_f = late_4h_rank_size_adjust(signal)
     dd["late_4h_rise_signal"] = signal
-    dd["late_4h_rank_delta"] = rank_d
-    dd["late_4h_size_factor"] = size_f
+    # Telemetry only. 4H cannot change rank or size, even through these stamps.
+    dd["late_4h_rank_delta"] = 0.0
+    dd["late_4h_size_factor"] = 1.0
+    dd["late_4h_computed_rank_delta"] = _rank_d
+    dd["late_4h_computed_size_factor"] = _size_f
     dd["late_4h_authority"] = "TELEMETRY_ONLY_NO_TRADE_AUTHORITY"
     dd["hard_block"] = bool(dd.get("hard_block") or False)
     if "candidate_eligible" not in dd:

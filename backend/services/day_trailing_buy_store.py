@@ -402,17 +402,28 @@ def mark_order_accepted(
     fill_id: str = "",
     trade_id: str = "",
 ) -> dict[str, Any] | None:
+    """Stamp the accepted order's identifiers. Never blanks a known identifier.
+
+    This used to write all three columns unconditionally, so any later partial
+    stamp erased identity that an earlier call had already proven. The recovery
+    path calls it with order_id alone while an order is merely open, which wiped
+    trade_id and fill_id; that is how FILLED intents ended up carrying an
+    exchange order id and nothing else. Only non-empty values are now written.
+    """
     ensure_trailing_buy_schema(db_path)
     now = _now()
+    sets = ["order_accepted=1", "updated_at=?"]
+    args: list[Any] = [now]
+    for col, val in (("order_id", order_id), ("fill_id", fill_id), ("trade_id", trade_id)):
+        if str(val or "").strip():
+            sets.append(f"{col}=?")
+            args.append(str(val))
+    args.append(intent_id)
     conn = sqlite3.connect(str(db_path), timeout=30)
     try:
         conn.execute(
-            """
-            UPDATE day_trailing_buy_intents
-            SET order_accepted=1, order_id=?, fill_id=?, trade_id=?, updated_at=?
-            WHERE intent_id=?
-            """,
-            (str(order_id or ""), str(fill_id or ""), str(trade_id or ""), now, intent_id),
+            f"UPDATE day_trailing_buy_intents SET {', '.join(sets)} WHERE intent_id=?",
+            args,
         )
         conn.commit()
         return _fetch(conn, intent_id)

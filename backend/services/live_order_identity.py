@@ -207,6 +207,22 @@ def extract_identity(
             otid = str(t.get("order") or "").strip()
             if otid:
                 venue_trade_ids.append(otid)
+    # Binance.US returns the per-fill trade ids in info["fills"] on the
+    # create-order reply (newOrderRespType FULL), as
+    # [{price, qty, commission, commissionAsset, tradeId}]. CCXT only mirrors
+    # them into the normalized "trades" list for some order types, so reading
+    # "trades" alone left fill_ids empty on every recorded live fill. GET /order
+    # omits fills altogether, which is why a re-fetch cannot substitute here.
+    for f in info.get("fills") or []:
+        if not isinstance(f, dict):
+            continue
+        tid = str(f.get("tradeId") or f.get("trade_id") or f.get("id") or "").strip()
+        if tid and tid not in fill_ids:
+            fill_ids.append(tid)
+        oid = str(f.get("orderId") or f.get("order_id") or "").strip()
+        if oid and oid not in venue_trade_ids:
+            venue_trade_ids.append(oid)
+
     # Binance also reports a single aggregate fill id on some responses.
     for key in ("fill_id", "tradeId", "trade_id"):
         v = str(raw.get(key) or info.get(key) or "").strip()
@@ -355,6 +371,97 @@ def record_fill(db_path: str, identity: OrderIdentity) -> bool:
             exc,
         )
         return False
+
+
+def rows_missing_venue_trade_ids(db_path: str, limit: int = 500) -> list[dict[str, Any]]:
+    """Recorded live fills whose per-fill venue trade ids were never captured."""
+    return _query(
+        db_path,
+        "WHERE COALESCE(fill_ids_json,'[]') IN ('[]','','null') AND LENGTH(COALESCE(exchange_order_id,''))>0 ORDER BY id DESC LIMIT ?",
+        (int(limit),),
+    )
+
+
+def backfill_venue_trade_ids(db_path: str, row_id: int, trade_ids: list[str], order_ids: list[str] | None = None) -> bool:
+    """Write venue-proven per-fill trade ids onto one existing identity row.
+
+    Only fills in ids that the venue actually reported for that exact order.
+    Never invents, never overwrites a non-empty value, and never touches any
+    other column, so the recorded fill economics stay exactly as settled.
+    """
+    ids = [str(x).strip() for x in (trade_ids or []) if str(x).strip()]
+    if not ids:
+        return False
+    oids = [str(x).strip() for x in (order_ids or []) if str(x).strip()]
+    try:
+        with sqlite3.connect(db_path, timeout=15) as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE {TABLE}
+                SET fill_ids_json = ?,
+                    venue_trade_ids_json = CASE
+                        WHEN COALESCE(venue_trade_ids_json,'[]') IN ('[]','','null') THEN ?
+                        ELSE venue_trade_ids_json END,
+                    fill_count = ?
+                WHERE id = ? AND COALESCE(fill_ids_json,'[]') IN ('[]','','null')
+                """,
+                (json.dumps(ids), json.dumps(oids), len(ids), int(row_id)),
+            )
+            conn.commit()
+            return bool(cur.rowcount)
+    except sqlite3.Error as exc:
+        logger.error("LIVE_FILL_BACKFILL_FAILED row=%s: %s", row_id, exc)
+        return False
+
+
+async def reconcile_venue_trade_ids(
+    db_path: str,
+    live_service: Any,
+    *,
+    limit: int = 500,
+    exchange: str = "binanceus",
+) -> dict[str, Any]:
+    """Capture missing per-fill venue trade ids from Binance.US.
+
+    The venue response is the only proof of a trade id, so a row the venue
+    cannot account for is reported as unproven and left untouched rather than
+    filled with a guess.
+    """
+    ensure_schema(db_path)
+    pending = rows_missing_venue_trade_ids(db_path, limit=limit)
+    out = {"examined": len(pending), "reconciled": 0, "unproven": 0, "errors": 0, "unproven_orders": []}
+    for row in pending:
+        order_id = str(row.get("exchange_order_id") or "")
+        symbol = str(row.get("symbol") or "")
+        if not order_id or not symbol:
+            out["unproven"] += 1
+            continue
+        try:
+            res = await live_service.fetch_order_trades(exchange, symbol, order_id)
+        except Exception as exc:
+            logger.warning("LIVE_FILL_RECONCILE_FETCH_FAILED order=%s: %s", order_id, exc)
+            out["errors"] += 1
+            continue
+        if res.get("status") != "success":
+            out["errors"] += 1
+            continue
+        trades = res.get("trades") or []
+        ids = [str(t.get("trade_id") or "") for t in trades if str(t.get("trade_id") or "").strip()]
+        oids = [str(t.get("order_id") or "") for t in trades if str(t.get("order_id") or "").strip()]
+        if not ids:
+            out["unproven"] += 1
+            out["unproven_orders"].append(order_id)
+            continue
+        if backfill_venue_trade_ids(db_path, int(row["id"]), ids, oids):
+            out["reconciled"] += 1
+    logger.info(
+        "LIVE_FILL_RECONCILE examined=%d reconciled=%d unproven=%d errors=%d",
+        out["examined"],
+        out["reconciled"],
+        out["unproven"],
+        out["errors"],
+    )
+    return out
 
 
 def fills_for_trade(db_path: str, mystic_trade_id: str) -> list[dict[str, Any]]:

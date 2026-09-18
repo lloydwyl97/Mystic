@@ -45,6 +45,10 @@ BUY_BLOCKED_SPIKE_FADE = "BUY_BLOCKED_SPIKE_FADE"
 EXIT_PROGRESS_DECAY = "PROGRESS_DECAY_EXIT"
 EXIT_ADAPTIVE_LOSS = "ADAPTIVE_LOSS_EXIT"
 EXIT_PATH_EXECUTABLE_PROFIT = "PATH_EXECUTABLE_PROFIT"
+# The authorized shared take-profit (coin_profile["tp"], 1.4%). Distinct from
+# EXIT_NET_PROFIT, which fires on the resolved adaptive/thesis target and is
+# gated by the per-coin net floor. One must never be reported as the other.
+EXIT_TAKE_PROFIT_1 = "TAKE_PROFIT_1_EXIT"
 DAY_PATH_AWARE_POLICY = "day_path_aware_v1"
 HOLD_4H_RISE = "PATH_AWARE_HOLD_4H_RISE"
 HOLD_4H_MISSING = "PATH_AWARE_HOLD_4H_MISSING"
@@ -55,11 +59,15 @@ COMPLETED_4H_ALREADY_INVALID = "COMPLETED_4H_ALREADY_INVALID"  # historical labe
 DAY_FULL_FLATTEN_REASONS = frozenset(
     {
         # EXIT_DAY_4H_STRUCTURE_BREAK removed — 4H has no trading authority (2026-09-17)
-        EXIT_DAY_RISK_FLOOR,
         EXIT_EXTREME_PROTECTION,
-        EXIT_TRAILING_STOP,
+        EXIT_DAY_RISK_FLOOR,
+        EXIT_STOP_LOSS,
         EXIT_GIVEBACK,
+        EXIT_TRAILING_STOP,
+        EXIT_NET_PROFIT,
+        EXIT_TAKE_PROFIT_1,
         EXIT_STALL_DEAD,
+        EXIT_TIME_STOP,
     }
 )
 
@@ -138,14 +146,30 @@ def _evaluate_path_aware_exit(
         "extreme_protection_fired": False,
     }
 
-    # Bounded adverse excursion. Must be checked before the 4H hold below, or the
-    # hold makes it unreachable and the position can bleed unbounded for up to a
-    # full 4H bar waiting for a close that may never come at a tolerable price.
+    # Bounded adverse excursion. Catastrophic tier: this is the gap/structural
+    # backstop (DAY_RISK_FLOOR_MIN_ADVERSE_PCT 2% .. MAX 6%), not the ordinary
+    # stop. It is only reachable when price gaps straight through the ordinary
+    # 1% stop below, or when no structure level is resolvable.
     if risk_floor_price > 0 and current_price <= risk_floor_price:
         return {
             "action": "sell",
             "reason": EXIT_DAY_RISK_FLOOR,
             "detail": f"mark_at_or_below_risk_floor={risk_floor_price:.8f}",
+            **base,
+        }
+
+    # Ordinary stop: the authorized coin-profile sl (1.0%), measured from entry.
+    # Without this the tightest reachable adverse exit was the 2% risk floor, so
+    # the configured 1.0% was never the effective stop. Kept as a pure loss stop
+    # from entry; break-even and high-water protection belong to the trail below,
+    # which owns the lifted stop_price/trailing_stop_price levels.
+    sl_pct = float(coin_profile.get("sl") or 0.010)
+    stop_price = entry * (1.0 - sl_pct) if sl_pct > 0 else 0.0
+    if stop_price > 0 and current_price <= stop_price:
+        return {
+            "action": "sell",
+            "reason": EXIT_STOP_LOSS,
+            "detail": f"mark_at_or_below_stop={stop_price:.8f} sl_pct={sl_pct:.4f}",
             **base,
         }
 
@@ -160,21 +184,9 @@ def _evaluate_path_aware_exit(
     if gb is not None:
         return {**gb, **base, "reason": EXIT_GIVEBACK}
 
-    stall = evaluate_stall_exit(
-        entry_price=entry,
-        highest_price=float(getattr(position, "highest_price", entry) or entry),
-        net_pnl_pct=net_pnl_pct,
-        hold_minutes=hold_minutes,
-        max_hold_min=effective_max_hold_min(position, coin_profile),
-        current_price=current_price,
-        lowest_price=float(getattr(position, "lowest_price", 0.0) or 0.0),
-    )
-    if stall is not None and str(stall.get("action") or "") == "sell":
-        return {**stall, **base, "reason": EXIT_STALL_DEAD}
-
     # Existing trail: once the high-water ratchet is armed, a pullback through
     # it is deterioration — not a "green enough" clip.
-    trail_pct = float(getattr(position, "trail_pct", 0) or coin_profile.get("trail") or 0.005)
+    trail_pct = float(getattr(position, "trail_pct", 0) or coin_profile.get("trail") or 0.0025)
     highest = float(getattr(position, "highest_price", entry) or entry)
     trail = float(getattr(position, "trailing_stop_price", 0) or 0)
     if trail > 0 and highest >= entry * (1.0 + trail_pct) - 1e-12 and current_price <= trail:
@@ -216,6 +228,49 @@ def _evaluate_path_aware_exit(
     # that is the "let winners trail instead of clipping" intent. Reaching the
     # resolved target is a different event, and that is what is restored above.
 
+    # Authorized shared take-profit: coin_profile["tp"] (1.4%) from entry. This is
+    # the outer profit objective and is deliberately reported under its own reason
+    # so it can never be confused with EXIT_NET_PROFIT above, which fires on the
+    # tighter resolved adaptive/thesis target.
+    tp_pct = float(coin_profile.get("tp") or 0.014)
+    tp1_price = entry * (1.0 + tp_pct) if tp_pct > 0 else 0.0
+    if tp1_price > 0 and current_price >= tp1_price:
+        return {
+            "action": "sell",
+            "reason": EXIT_TAKE_PROFIT_1,
+            "detail": f"mark_at_or_above_tp1={tp1_price:.8f} tp_pct={tp_pct:.4f}",
+            **base,
+        }
+
+    # Stall: dead inventory with no meaningful excursion. Ranked below the profit
+    # exits so a position sitting on a profit objective is never booked as a stall.
+    stall = evaluate_stall_exit(
+        entry_price=entry,
+        highest_price=float(getattr(position, "highest_price", entry) or entry),
+        net_pnl_pct=net_pnl_pct,
+        hold_minutes=hold_minutes,
+        max_hold_min=effective_max_hold_min(position, coin_profile),
+        current_price=current_price,
+        lowest_price=float(getattr(position, "lowest_price", 0.0) or 0.0),
+    )
+    if stall is not None and str(stall.get("action") or "") == "sell":
+        return {**stall, **base, "reason": EXIT_STALL_DEAD}
+
+    # Authorized maximum hold (300 min). Unconditional once the ceiling is
+    # reached: the legacy ladder only time-stopped when net was under the profit
+    # floor, which meant a position above that floor but below its target could
+    # sit open past the ceiling and the configured 300 was not a real maximum.
+    # Every profit exit above gets first refusal, so this only closes positions
+    # that did not reach an objective in time.
+    max_hold = effective_max_hold_min(position, coin_profile)
+    if max_hold > 0 and hold_minutes + 1e-9 >= float(max_hold):
+        return {
+            "action": "sell",
+            "reason": EXIT_TIME_STOP,
+            "detail": f"hold_min={hold_minutes:.1f} max_hold_min={max_hold}",
+            **base,
+        }
+
     # 4H has no production trading authority (removed 2026-09-17).
     # No 4H hold, no 4H structure break sell, no 4H missing hold.
     return {
@@ -240,44 +295,39 @@ STALL_HOLD_FLAT_NOT_DEAD = "STALL_HOLD_FLAT_NOT_DEAD"
 STALL_HOLD_NET_PROFIT_ELIGIBLE = "STALL_HOLD_NET_PROFIT_ELIGIBLE"
 
 
-def _bull_hold_extension_min() -> int:
-    """Extra minutes granted to bull-regime positions beyond the coin profile ceiling."""
-    return int(os.getenv("DAY_BULL_HOLD_EXTENSION_MIN", "120"))
-
-
-def _bull_trail_multiplier() -> float:
-    """Trail-pct multiplier applied when a bull position is trending strongly."""
-    return float(os.getenv("DAY_BULL_TRAIL_MULTIPLIER", "2.0"))
-
-
-def _bull_trail_mfe_threshold() -> float:
-    """Minimum MFE fraction before bull trail widening activates (default 1.5%)."""
-    return float(os.getenv("DAY_BULL_TRAIL_MFE_THRESHOLD", "0.015"))
+# Removed with the authorized-settings repair: _bull_hold_extension_min (made the
+# effective ceiling 342 min instead of the authorized 300), _bull_trail_multiplier
+# and _bull_trail_mfe_threshold (both already had zero consumers, so the 0.25%
+# coin-profile trail distance was never widened). DAY_BULL_HOLD_EXTENSION_MIN,
+# DAY_BULL_TRAIL_MULTIPLIER and DAY_BULL_TRAIL_MFE_THRESHOLD are now inert.
 
 
 def effective_max_hold_min(position: Any, coin_profile: dict[str, Any] | None = None) -> int:
-    """Session ceiling: prefer current profile when stamped hold is shorter (day-trade upgrade).
+    """Authorized session ceiling: the coin profile's max_hold_min.
 
-    Bull-regime positions receive an extra DAY_BULL_HOLD_EXTENSION_MIN (default +120 min)
-    so a trending position is not timed out before its target can be reached.
+    The coin profile is authoritative (300 min, identical for all four symbols).
+    Two behaviours were removed because they meant the configured 300 was never
+    the effective value:
+
+    * the bull-regime extension added DAY_BULL_HOLD_EXTENSION_MIN * regime scalar,
+      which made the real ceiling 342 min for bull-stamped positions;
+    * max(stamped, profile_hold) let a position stamped under an older, longer
+      profile keep that longer ceiling forever.
+
+    A stamped value is still honoured when no profile is supplied, so replay and
+    adoption of an older position remain possible.
     """
     profile_hold = int((coin_profile or {}).get("max_hold_min") or 0)
-    stamped = int(getattr(position, "max_hold_min", 0) or 0)
-    if profile_hold > 0 and stamped > 0:
-        base = max(stamped, profile_hold)
-    else:
-        base = stamped or profile_hold or 300
-    regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
-    if regime == "bull":
-        scalar, _ = get_regime_validated_scalar(regime)
-        base += round(_bull_hold_extension_min() * scalar)
-    return base
+    if profile_hold > 0:
+        return profile_hold
+    return int(getattr(position, "max_hold_min", 0) or 0) or 300
 
 
 ALLOWED_DAY_EXIT_REASONS = frozenset(
     {
         EXIT_NET_PROFIT,
         EXIT_PATH_EXECUTABLE_PROFIT,
+        EXIT_TAKE_PROFIT_1,
         EXIT_VOLATILITY_STOP,
         EXIT_TIME_STOP,
         EXIT_STALL,
@@ -821,8 +871,8 @@ def stamp_open_position_exit_metadata(
 
     profile = coin_profile or {}
     sl_pct = float(profile.get("sl") or 0.010)
-    trail_pct = float(profile.get("trail") or 0.005)
-    max_hold = int(profile.get("max_hold_min") or 75)
+    trail_pct = float(profile.get("trail") or 0.0025)
+    max_hold = int(profile.get("max_hold_min") or 300)
 
     invalid = float(thesis_invalid_level or getattr(position, "thesis_invalid_level", 0.0) or 0.0)
     target = float(thesis_target_level or getattr(position, "thesis_target_level", 0.0) or 0.0)
@@ -839,11 +889,15 @@ def stamp_open_position_exit_metadata(
         stop = max(stop, float(position.thesis_invalid_level or 0.0))
     position.stop_price = stop
 
+    # take_profit_1_price is the authorized shared take-profit and must stay at
+    # coin_profile["tp"] (1.4%). It used to be min()'d down to a tighter thesis
+    # target, which silently replaced the authorized 1.4% with whatever the
+    # thesis produced. The tighter target still drives EXIT_NET_PROFIT via
+    # thesis_target_level / effective_target_price; it no longer overwrites TP1.
+    tp_pct = float(profile.get("tp") or 0.014)
     if target > entry:
         position.thesis_target_level = target
-        position.take_profit_1_price = min(float(tp1_price or 0.0), target) if float(tp1_price or 0.0) > entry else target
-    else:
-        position.take_profit_1_price = float(tp1_price or entry * (1.0 + float(profile.get("tp") or 0.014)))
+    position.take_profit_1_price = entry * (1.0 + tp_pct)
 
     position.take_profit_2_price = float(tp2_price or position.take_profit_1_price * 1.007)
     position.trailing_stop_price = entry * (1.0 - sl_pct)
@@ -860,8 +914,8 @@ def backfill_position_exit_metadata(position: Any, coin_profile: dict[str, Any])
 
     sl_pct = float(coin_profile.get("sl") or 0.010)
     tp_pct = float(coin_profile.get("tp") or 0.014)
-    trail_pct = float(coin_profile.get("trail") or 0.005)
-    max_hold_min = int(coin_profile.get("max_hold_min") or 75)
+    trail_pct = float(coin_profile.get("trail") or 0.0025)
+    max_hold_min = int(coin_profile.get("max_hold_min") or 300)
 
     stop = float(getattr(position, "stop_price", 0.0) or 0.0)
     if stop <= 0 or stop >= entry:
@@ -1011,7 +1065,7 @@ def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dic
         return False
 
     profile = coin_profile or {}
-    trail_pct = float(getattr(position, "trail_pct", 0.0) or profile.get("trail") or 0.005)
+    trail_pct = float(getattr(position, "trail_pct", 0.0) or profile.get("trail") or 0.0025)
     highest = float(getattr(position, "highest_price", 0.0) or entry)
 
     activation = entry * (1.0 + trail_pct)
@@ -1048,7 +1102,7 @@ def _trail_semantics(
     Path-aware sells when the mark pulls back through that ratchet.
     """
     highest = float(getattr(position, "highest_price", entry) or entry)
-    trail_distance = float(getattr(position, "trail_pct", 0.0) or coin_profile.get("trail") or 0.005)
+    trail_distance = float(getattr(position, "trail_pct", 0.0) or coin_profile.get("trail") or 0.0025)
     trail_activation = _trail_activation_price(
         entry=entry,
         trail_distance=trail_distance,
@@ -1138,10 +1192,10 @@ def preview_next_engine_exit(
     giveback_ready = bool(_giveback_exit_enabled() and hold_minutes >= _giveback_min_hold_min() and mfe_pct >= _giveback_min_mfe_pct() and net_pnl_pct + 1e-12 <= _giveback_trigger_pnl_pct())
     checks = {
         "stop_loss": bool(stop > 0 and current_price <= stop),
-        "trailing_stop": bool(trail > 0 and current_price <= trail and highest >= entry * (1 + float(coin_profile.get("trail") or 0.005))),
+        "trailing_stop": bool(trail > 0 and current_price <= trail and highest >= entry * (1 + float(coin_profile.get("trail") or 0.0025))),
         "giveback_exit": giveback_ready,
         "stall_exit": stall_ready,
-        "time_stop": bool(hold_minutes >= max_hold and net_pnl_pct + 1e-12 < float(MIN_NET_PROFIT_TO_SELL)),
+        "time_stop": bool(max_hold > 0 and hold_minutes + 1e-9 >= float(max_hold)),
         "profit_target": bool(target > 0 and current_price >= target and net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL) * 0.45),
         "net_profit": bool(net_pnl_pct + 1e-12 >= float(MIN_NET_PROFIT_TO_SELL)),
         "risk_floor": bool(trail_info["hard_stop"] > 0 and current_price <= float(trail_info["hard_stop"])),
@@ -1337,7 +1391,7 @@ def evaluate_engine_managed_exit(
         }
 
     trail = float(getattr(position, "trailing_stop_price", 0) or 0)
-    trail_pct = float(getattr(position, "trail_pct", 0) or coin_profile.get("trail") or 0.005)
+    trail_pct = float(getattr(position, "trail_pct", 0) or coin_profile.get("trail") or 0.0025)
     highest = float(getattr(position, "highest_price", entry) or entry)
     if trail > 0 and highest >= entry * (1.0 + trail_pct) and current_price <= trail:
         return {
@@ -1822,8 +1876,8 @@ def evaluate_pre_buy_exit_consistency(
         target_level=float(thesis_target_level or 0.0),
         entry_vwap=float(entry_vwap or 0.0),
         entry_ts=entry_time,
-        trail_pct=float(coin_profile.get("trail") or 0.005),
-        max_hold_min=int(coin_profile.get("max_hold_min") or 75),
+        trail_pct=float(coin_profile.get("trail") or 0.0025),
+        max_hold_min=int(coin_profile.get("max_hold_min") or 300),
     )
     managed = evaluate_engine_managed_exit(
         position=pos,

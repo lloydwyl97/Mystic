@@ -89,11 +89,19 @@ _BLOCKS_LIVE = {
     COOLDOWN_ACTIVE,
 }
 
-_CAPITAL_MARKERS = ("INSUFFICIENT_CASH", "INSUFFICIENT_EXECUTABLE", "MAX_POSITIONS", "ACCOUNT_OVERALLOCATED", "ENTRY_RESERVED", "BELOW_MIN_NOTIONAL")
+_CAPITAL_MARKERS = (
+    "INSUFFICIENT_CASH",
+    "INSUFFICIENT_EXECUTABLE",
+    "MAX_POSITIONS",
+    "ACCOUNT_OVERALLOCATED",
+    "ENTRY_RESERVED",
+    "BELOW_MIN_NOTIONAL",
+    "NO_REMAINING_SLOT_CASH",
+)
 _ORDER_MARKERS = ("PENDING_BUY", "ORDER_ACCEPTED", "SUBMITTING")
 _OPERATOR_MARKERS = ("KILL", "TRADING_PAUSED", "PAUSE", "FAILSAFE", "CIRCUIT")
 _COOLDOWN_MARKERS = ("COOLDOWN",)
-_DATA_MARKERS = ("STALE_MARKET", "EXIT_MARK_STALE", "NO_CANONICAL", "DATA_REPAIR")
+_DATA_MARKERS = ("STALE_MARKET", "STALE_OR_MISSING_BOOK", "EXIT_MARK_STALE", "NO_CANONICAL", "DATA_REPAIR")
 
 
 def classify_hold_category(
@@ -242,6 +250,7 @@ def persist_hold_record(db_path: str, record: dict[str, Any]) -> None:
     try:
         conn = sqlite3.connect(db_path, timeout=8)
         conn.execute("PRAGMA busy_timeout=8000")
+        conn.execute("CREATE TABLE IF NOT EXISTS operational_state (key TEXT PRIMARY KEY, value_json TEXT, updated_ts INTEGER)")
         _ensure_episode_table(conn, db_path)
         # BEGIN IMMEDIATE: the snapshot is a read-modify-write of one shared JSON blob
         # keyed by symbol. Without an exclusive write transaction, two symbols updating

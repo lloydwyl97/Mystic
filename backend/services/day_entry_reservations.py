@@ -35,6 +35,17 @@ CREATE INDEX IF NOT EXISTS idx_day_res_expires ON day_entry_reservations(expires
 
 DEFAULT_TTL_SEC = 120.0
 
+# Terminal state for a reservation whose order actually filled. A reservation
+# that became a real position is not "released" (the cash was spent, not handed
+# back) and it is emphatically not "expired" or "timed out". Before this state
+# existed, a filled reservation stayed ACTIVE until the staleness sweep relabelled
+# it TIMEOUT, so the ledger claimed capital had been returned when it had in fact
+# been deployed, and every filled entry looked like an abandoned reservation.
+STATUS_CONSUMED = "CONSUMED"
+
+# Statuses that must never be rewritten by the staleness sweep or a late release.
+TERMINAL_STATUSES = frozenset({STATUS_CONSUMED})
+
 
 def ensure_reservation_schema(db_path: str | Path) -> None:
     conn = sqlite3.connect(str(db_path), timeout=30)
@@ -168,7 +179,82 @@ def release_reservation(
         conn.close()
 
 
+def consume_reservation(
+    db_path: str | Path,
+    *,
+    reservation_id: str = "",
+    decision_id: str = "",
+    symbol: str = "",
+) -> bool:
+    """Mark a reservation CONSUMED because its order filled into a position.
+
+    Exactly-once and idempotent: only an ACTIVE row transitions, so a second
+    call (a retry, or both the submit path and the adoption path reaching the
+    same fill) is a no-op and returns False. Returns True only for the single
+    call that performed the transition.
+
+    Resolution order is reservation_id, then decision_id, then symbol, because
+    the intent row carries the authoritative reservation_id and in-memory engine
+    metadata does not survive a restart.
+    """
+    ensure_reservation_schema(db_path)
+    now = time.time()
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = None
+        if reservation_id:
+            cur = conn.execute(
+                "UPDATE day_entry_reservations SET status=?, updated_at=? WHERE reservation_id=? AND status='ACTIVE'",
+                (STATUS_CONSUMED, now, str(reservation_id)),
+            )
+        if (cur is None or not cur.rowcount) and decision_id:
+            cur = conn.execute(
+                "UPDATE day_entry_reservations SET status=?, updated_at=? WHERE decision_id=? AND status='ACTIVE'",
+                (STATUS_CONSUMED, now, str(decision_id)),
+            )
+        if (cur is None or not cur.rowcount) and symbol:
+            sym = str(symbol).strip().upper().replace("-", "/")
+            cur = conn.execute(
+                "UPDATE day_entry_reservations SET status=?, updated_at=? WHERE symbol=? AND status='ACTIVE'",
+                (STATUS_CONSUMED, now, sym),
+            )
+        changed = int(cur.rowcount or 0) if cur is not None else 0
+        conn.commit()
+        if changed:
+            logger.info(
+                "RESERVATION_CONSUMED reservation=%s decision=%s symbol=%s",
+                reservation_id,
+                decision_id,
+                symbol,
+            )
+        return changed > 0
+    finally:
+        conn.close()
+
+
+def reservation_status(db_path: str | Path, reservation_id: str) -> str:
+    """Current status of one reservation, or "" when it does not exist."""
+    if not reservation_id:
+        return ""
+    ensure_reservation_schema(db_path)
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        row = conn.execute(
+            "SELECT status FROM day_entry_reservations WHERE reservation_id=?",
+            (str(reservation_id),),
+        ).fetchone()
+        return str(row[0]) if row else ""
+    finally:
+        conn.close()
+
+
 def expire_stale(db_path: str | Path) -> int:
+    """Sweep ACTIVE reservations past their TTL.
+
+    CONSUMED rows are excluded by the ACTIVE predicate, so a filled reservation
+    can never be relabelled EXPIRED after the fact.
+    """
     ensure_reservation_schema(db_path)
     now = time.time()
     conn = sqlite3.connect(str(db_path), timeout=30)
@@ -221,11 +307,15 @@ def active_symbols(db_path: str | Path) -> set[str]:
 
 
 __all__ = [
+    "STATUS_CONSUMED",
+    "TERMINAL_STATUSES",
     "active_notional",
     "active_symbols",
+    "consume_reservation",
     "create_reservation",
     "ensure_reservation_schema",
     "expire_stale",
     "load_active_reservations",
     "release_reservation",
+    "reservation_status",
 ]

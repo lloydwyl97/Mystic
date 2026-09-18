@@ -669,10 +669,29 @@ async def get_portfolio_status() -> dict[str, Any]:
         except Exception as e:
             logger.debug("STATUS_DEGRADED_CHECK skipped: %s", e)
 
+        pnl_presentation: dict[str, Any] = {}
+        try:
+            from backend.database_schema import DATABASE_PATH
+            from backend.services.execution_mode_service import is_live_execution_allowed_sync
+            from backend.services.live_pnl_reconciliation import get_reconciliation, presentation_fields
+
+            _recon = await get_reconciliation(str(DATABASE_PATH), cached_only=True)
+            pnl_presentation = presentation_fields(_recon, is_live=bool(is_live_execution_allowed_sync()))
+            status["pnl_presentation"] = pnl_presentation
+        except Exception as exc:
+            logger.warning("STATUS_PNL_RECONCILIATION_UNAVAILABLE: %s", exc)
+            pnl_presentation = {
+                "primary_result_label": "LIVE (recorded, not exchange-reconciled)",
+                "primary_result_is_exchange_reconciled": False,
+                "reconciliation_error": str(exc)[:200],
+            }
+            status["pnl_presentation"] = pnl_presentation
+
         # Ensure we show non-zero equity from adopted data
         return {
             "success": True,
             "data": status,
+            "pnl_presentation": pnl_presentation,
             "canonical_source": "portfolio_engine_ledger",
             "adopted_equity": status.get("total_equity", engine._total_equity),
             "adopted_cash": status.get("cash_balance", engine.cash_balance),

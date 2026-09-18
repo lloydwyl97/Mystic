@@ -496,8 +496,9 @@ def test_clock_v2_authority_tables_are_protected_from_retention():
     ):
         assert table in PROTECTED_TABLES
     policy_tables = {p.table for p in RETENTION_POLICIES}
-    for table in ("paper_trades",):
-        assert table in policy_tables  # orders/fills keep a long window, never dropped outright
+    for table in ("paper_trades", "live_exchange_fills", "feature_ohlcv"):
+        assert table not in policy_tables
+        assert table in PROTECTED_TABLES
     assert "day_clock_v2_outcome_labels" not in policy_tables
 
 

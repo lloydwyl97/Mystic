@@ -200,10 +200,15 @@ def context_vector_day_full_mtf(
     emas: list[float] = []
     for tf in DAY_ACTIVE_TIMEFRAMES:
         snap = mtf_snapshots.get(tf) if isinstance(mtf_snapshots.get(tf), dict) else {}
+        # 4h slope is stored for telemetry length-stability but has no order
+        # authority: always emit 0.0 so rank/p_buy cannot move on 4h slope.
+        if str(tf) == "4h":
+            front.append(0.0)
+            continue
         front.append(_slope_norm(snap.get("slope", 0.0)))
         emas.append(float(snap.get("ema_align", 0.5) or 0.5))
         emas[-1] = max(0.0, min(1.0, emas[-1]))
-    mean_ema = sum(emas) / float(len(emas))
+    mean_ema = sum(emas) / float(len(emas)) if emas else 0.5
 
     mf = list(month_four) if isinstance(month_four, list) else []
     mon0 = _clip(_safe_float(mf[0] if len(mf) > 0 else 0.0, 0.0), -6.0, 6.0)

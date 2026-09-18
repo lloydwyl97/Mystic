@@ -65,8 +65,8 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     RetentionPolicy("scalp_shadow_rejects", "created_at", 30, "iso_utc"),
     # strategy_runtime_audit writes ~160k rows/day — keep only 3 days (~480k rows max)
     RetentionPolicy("strategy_runtime_audit", "ts_utc", 3, "iso_utc"),
-    RetentionPolicy("feature_ohlcv", "ts", 90, "feature_ohlcv"),
-    RetentionPolicy("paper_trades", "timestamp", 90, "iso_utc"),
+    # feature_ohlcv and paper_trades are canonical history. They are never
+    # deleted by timed retention.
     # Append-only high-frequency logs (created_at tracks insert time).
     RetentionPolicy("ai_live_signals", "created_at", 30, "iso_utc"),
     RetentionPolicy("pipeline_decisions", "created_at", 30, "iso_utc"),
@@ -85,6 +85,15 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
 # prior result impossible to reproduce. They are tiny and must never be deleted on a timer.
 PROTECTED_TABLES: frozenset[str] = frozenset(
     {
+        "paper_trades",
+        "live_exchange_fills",
+        "portfolio_engine_ledger",
+        "portfolio_engine_audit",
+        "portfolio_engine_positions",
+        "portfolio_engine_orders",
+        "feature_ohlcv",
+        "day_entry_reservations",
+        "day_trailing_buy_intents",
         "day_experiment_registry",
         "day_forward_lock_registry",
         "day_path_clock_feature_snapshots",

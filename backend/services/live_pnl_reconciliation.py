@@ -453,6 +453,7 @@ def presentation_fields(recon: dict[str, Any], *, is_live: bool) -> dict[str, An
         "live_reconciled_usd": live_primary,
         "live_recorded_usd": float(recon.get("live_recorded_usd") or 0.0),
         "live_dust_writeoff_usd": float(recon.get("live_dust_writeoff_usd") or 0.0),
+        "live_dust_writeoff_label": "ACCOUNTING CORRECTION (historical dust write-off; not market P&L)",
         "paper_realized_usd": float(recon.get("paper_realized_usd") or 0.0),
         "legacy_mixed_total_usd": float(recon.get("legacy_mixed_total_usd") or 0.0),
         "legacy_mixed_total_label": "LEGACY MIXED TOTAL (historical, not live profit)",

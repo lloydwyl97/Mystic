@@ -21,6 +21,7 @@ from backend.services.day_controlled_exits import (
     EXIT_DAY_4H_STRUCTURE_BREAK,
     EXIT_DAY_RISK_FLOOR,
     EXIT_NET_PROFIT,
+    EXIT_STOP_LOSS,
     EXIT_TRAILING_STOP,
     evaluate_engine_managed_exit,
 )
@@ -122,16 +123,23 @@ def test_armed_trail_still_outranks_taking_profit():
     assert out["reason"] == EXIT_TRAILING_STOP
 
 
-def test_risk_floor_still_outranks_taking_profit():
+def test_loss_protection_outranks_taking_profit():
     """Loss protection must never be pre-empted by a profit check.
 
-    The breach price is DAY_RISK_FLOOR_MIN_ADVERSE_PCT (2% by default), not the
-    1% coin-profile `sl`, which is never used as an exit level under path-aware.
-    A position 1% down is therefore still a hold; 2.5% down breaches.
+    Two distinct adverse mechanisms, in precedence order: the catastrophic
+    DAY_RISK_FLOOR (DAY_RISK_FLOOR_MIN_ADVERSE_PCT, 2%..6%) and the ordinary
+    coin-profile stop (1.0%). The ordinary stop is the tighter of the two, so in
+    live trading it is the one that fires; the floor is the gap backstop.
     """
     pos = _Pos(entry_price=100.0, thesis_invalid_level=99.50, thesis_target_level=100.10)
-    assert _call(pos, 99.00, -0.0105)["action"] == "hold"
 
+    # 1% down breaches the ordinary stop.
+    out = _call(pos, 99.00, -0.0105)
+    assert out["action"] == "sell"
+    assert out["reason"] == EXIT_STOP_LOSS
+
+    # A gap straight through to 2.5% down is caught by the catastrophic floor,
+    # which outranks the ordinary stop.
     out = _call(pos, 97.50, -0.0255)
     assert out["action"] == "sell"
     assert out["reason"] == EXIT_DAY_RISK_FLOOR

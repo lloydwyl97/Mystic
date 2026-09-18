@@ -39,7 +39,6 @@ DEFAULT_MOMENTUM_HORIZONS: dict[str, int] = {
     "5m": 6,
     "15m": 8,
     "1h": 12,
-    "4h": 12,
     "1d": 14,
 }
 

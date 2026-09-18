@@ -266,6 +266,7 @@ async def test_monitor_folds_kline_high_and_does_not_sell_on_activation(tmp_path
         patch("backend.services.canonical_mark_price.fetch_canonical_mark", new=AsyncMock(return_value=mark)),
         patch("backend.services.day_high_water.load_feature_1m_candles", return_value=[]),
         patch("backend.services.ai_learning_ingestion.record_position_heartbeat"),
+        patch("backend.services.portfolio_engine.get_coin_profile", return_value={"tp": 0.014, "sl": 0.010, "trail": 0.004, "max_hold_min": 100000}),
     ):
         exits = await engine.monitor_all_positions({"BTC/USDT": 80399.41}, int(time.time()))
 
@@ -330,6 +331,7 @@ async def test_monitor_rejects_entry_minute_kline_high(tmp_path, monkeypatch):
         patch("backend.services.canonical_mark_price.fetch_canonical_mark", new=AsyncMock(return_value=mark)),
         patch("backend.services.day_high_water.load_feature_1m_candles", return_value=[]),
         patch("backend.services.ai_learning_ingestion.record_position_heartbeat"),
+        patch("backend.services.portfolio_engine.get_coin_profile", return_value={"tp": 0.014, "sl": 0.010, "trail": 0.004, "max_hold_min": 100000}),
     ):
         await engine.monitor_all_positions({"BTC/USDT": 100.4}, int(time.time()))
     assert pos.highest_price == pytest.approx(100.4)

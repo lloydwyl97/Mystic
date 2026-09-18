@@ -623,15 +623,35 @@ async def _enrich_live_order_fills(live_service: Any, order: dict[str, Any], exc
         "status",
         "fee",
         "fees",
-        "trades",
         "commission",
         "commissionAsset",
-        "info",
         "amount",
         "price",
     ):
         if fetched.get(key) is not None:
             merged[key] = fetched[key]
+    # "trades" and info["fills"] are the only carriers of the per-fill venue trade
+    # ids, and only the create-order response has them: Binance's GET /order reply
+    # omits fills entirely and CCXT leaves trades empty for it. Overwriting them
+    # with the fetched (empty) values is why every stored live fill had
+    # fill_ids_json=[] and venue_trade_ids_json=[]. Take the fetched value only
+    # when it actually carries something.
+    if fetched.get("trades"):
+        merged["trades"] = fetched["trades"]
+    merged["info"] = _merge_info_preserving_fills(order.get("info"), fetched.get("info"))
+    return merged
+
+
+def _merge_info_preserving_fills(original: Any, fetched: Any) -> Any:
+    """Overlay a fetched ``info`` without dropping the create response's fills."""
+    if not isinstance(fetched, dict):
+        return original
+    if not isinstance(original, dict):
+        return fetched
+    merged = dict(original)
+    merged.update({k: v for k, v in fetched.items() if v is not None})
+    if original.get("fills") and not fetched.get("fills"):
+        merged["fills"] = original["fills"]
     return merged
 
 

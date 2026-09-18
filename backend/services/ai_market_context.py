@@ -292,6 +292,8 @@ def _ctx_multiplier(
     """
     align_scores: list[float] = []
     for tf in DAY_ACTIVE_TIMEFRAMES:
+        if str(tf) == "4h":
+            continue
         snap = own_mtf.get(tf)
         if isinstance(snap, dict) and snap.get("bars", 0) > 5:
             align_scores.append(float(snap.get("ema_align", 0.5)))

@@ -153,7 +153,8 @@ def test_retention_learning_tables_are_90_days():
     from backend.services.sqlite_large_table_retention import RETENTION_POLICIES
 
     keep = {p.table: p.keep_days for p in RETENTION_POLICIES}
-    assert keep["feature_ohlcv"] == 90
+    assert "feature_ohlcv" not in keep
+    assert "paper_trades" not in keep
     assert keep["ai_inference_log"] == 90
     assert keep["day_decision_group_records"] == 90
     assert keep["day_decision_candidate_records"] == 90
@@ -163,7 +164,6 @@ def test_retention_learning_tables_are_90_days():
     assert keep["pipeline_decisions"] == 30
     assert keep["decision_book_tape"] == 14
     assert keep["strategy_runtime_audit"] == 3
-    assert keep["paper_trades"] == 90
 
 
 def test_hold_is_explicit_and_rank_deltas_preserved():

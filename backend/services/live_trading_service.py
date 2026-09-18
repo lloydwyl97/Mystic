@@ -663,6 +663,49 @@ class LiveTradingService:
             logger.exception("fetch_order %s: %s", order_id, e)
             return {"status": "error", "message": str(e)}
 
+    async def fetch_order_trades(self, exchange: str, symbol: str, order_id: str) -> dict[str, Any]:
+        """Fetch the venue's per-fill trade records for one order.
+
+        Binance.US ``GET /api/v3/myTrades`` is the authoritative source for
+        per-fill trade ids. The create-order reply carries them too, but only
+        that one reply does: ``GET /order`` omits fills, so a fill whose create
+        reply was discarded can only be reconciled here. Returns the trade ids
+        exactly as the venue reports them; nothing is synthesised.
+        """
+        try:
+            await self._ensure_initialized()
+            if exchange.lower() not in {EXCHANGE_ID.lower(), "binance", "binanceus"} or not self.binance:
+                return {"status": "error", "message": "Exchange not available"}
+            pair = _to_binance_pair(symbol)
+            trades = await asyncio.to_thread(
+                self.binance.fetch_my_trades,
+                symbol=pair,
+                params={"orderId": int(order_id)} if str(order_id).isdigit() else {},
+            )
+            out = []
+            for t in trades or []:
+                if not isinstance(t, dict):
+                    continue
+                info = t.get("info") if isinstance(t.get("info"), dict) else {}
+                oid = str(t.get("order") or info.get("orderId") or "")
+                if str(order_id) and oid and oid != str(order_id):
+                    continue
+                out.append(
+                    {
+                        "trade_id": str(t.get("id") or info.get("id") or ""),
+                        "order_id": oid,
+                        "qty": t.get("amount"),
+                        "price": t.get("price"),
+                        "commission": (t.get("fee") or {}).get("cost") if isinstance(t.get("fee"), dict) else None,
+                        "commission_asset": (t.get("fee") or {}).get("currency") if isinstance(t.get("fee"), dict) else None,
+                        "timestamp": t.get("timestamp"),
+                    }
+                )
+            return {"status": "success", "trades": out}
+        except Exception as e:  # reconciliation must never raise into trading
+            logger.warning("fetch_order_trades %s %s: %s", symbol, order_id, e)
+            return {"status": "error", "message": str(e)}
+
     async def cancel_order(self, exchange: str, order_id: str, symbol: str) -> dict[str, Any]:
         """Cancel an existing spot order on Binance.US."""
         try:

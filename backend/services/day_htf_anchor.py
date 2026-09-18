@@ -215,12 +215,13 @@ def compute_htf_anchor(
     if context_payload and isinstance(context_payload.get("mtf"), dict):
         mtf = {**mtf, **context_payload["mtf"]}
     h1 = _tf_align(mtf, "1h") if isinstance(mtf.get("1h"), dict) else None
-    h4 = _tf_align(mtf, "4h") if isinstance(mtf.get("4h"), dict) else None
+    # 4H is telemetry storage only. Do not let it move the HTF score.
+    _ = _tf_align(mtf, "4h") if isinstance(mtf.get("4h"), dict) else None
 
     momentum = _safe_float(dd.get("price_momentum"), 0.0)
     ema = _safe_float(dd.get("ema_alignment"), _safe_float(dd.get("signal_ema_alignment"), 0.5))
 
-    h_c, h_r = _h1_h4_agreement_credit(h1, h4, family)
+    h_c, h_r = _h1_h4_agreement_credit(h1, None, family)
     m_c, m_r = _momentum_credit(momentum, family)
     e_c, e_r = _ema_stack_credit(ema, family)
 
