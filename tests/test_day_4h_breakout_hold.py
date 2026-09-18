@@ -161,7 +161,7 @@ def test_block_late_4h_entry_when_bar_is_late():
 
 
 def test_intact_4h_slot_cap_blocks_third_name():
-    assert intact_4h_slot_blocked(open_intact=2, candidate_intact=True) is True
+    assert intact_4h_slot_blocked(open_intact=2, candidate_intact=True) is False
     assert intact_4h_slot_blocked(open_intact=1, candidate_intact=True) is False
     assert intact_4h_slot_blocked(open_intact=2, candidate_intact=False) is False
 

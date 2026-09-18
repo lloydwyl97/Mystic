@@ -734,7 +734,8 @@ def bear_regime_entry_adjustment(
 
     rank_pen = 0.0
     size_mult = 1.0
-    htf_bear = (h1 is not None and h1 < 0.42) and (h4 is not None and h4 < 0.40)
+    _ = (h1, h4)
+    htf_bear = False  # 4H cannot shrink rank/size; 1h is not a replacement gate
     ltf_bounce = (m5 is not None and m5 > 0.55) or (m15 is not None and m15 > 0.52)
     strong_breakout = setup_type == SETUP_BREAKOUT_CONTINUATION and _safe_float(dd.get("thesis_score"), 0.0) >= 0.65
 
@@ -1385,17 +1386,7 @@ def apply_late_4h_rank_to_decision_data(decision_data: dict[str, Any], symbol: s
     dd["late_4h_rise_signal"] = signal
     dd["late_4h_rank_delta"] = rank_d
     dd["late_4h_size_factor"] = size_f
-    if signal:
-        try:
-            prev_rank = float(dd.get("thesis_rank_delta") or 0.0)
-        except (TypeError, ValueError):
-            prev_rank = 0.0
-        try:
-            prev_size = float(dd.get("thesis_size_factor") or 1.0)
-        except (TypeError, ValueError):
-            prev_size = 1.0
-        dd["thesis_rank_delta"] = round(prev_rank + rank_d, 5)
-        dd["thesis_size_factor"] = round(max(0.20, prev_size * size_f), 5)
+    dd["late_4h_authority"] = "TELEMETRY_ONLY_NO_TRADE_AUTHORITY"
     dd["hard_block"] = bool(dd.get("hard_block") or False)
     if "candidate_eligible" not in dd:
         dd["candidate_eligible"] = True
@@ -1411,14 +1402,9 @@ def should_block_late_4h_rise_entry(
 
 
 def intact_4h_slot_blocked(*, open_intact: int, candidate_intact: bool, max_open: int = 2) -> bool:
-    """True when another intact-4H name would stack onto the same tape."""
-    if not candidate_intact:
-        return False
-    try:
-        cap = int(os.getenv("DAY_INTACT_4H_MAX_POSITIONS", str(max_open)) or max_open)
-    except (TypeError, ValueError):
-        cap = int(max_open)
-    return int(open_intact) >= max(1, cap)
+    """4H cannot consume a live slot. Env cannot restore this cap."""
+    _ = (open_intact, candidate_intact, max_open, os.getenv("DAY_INTACT_4H_MAX_POSITIONS"))
+    return False
 
 
 def thesis_invalidated_live(
@@ -1448,10 +1434,8 @@ def thesis_invalidated_live(
     if not isinstance(bundle, dict):
         return False
     if entry_thesis == SETUP_HTF_TREND_PULLBACK:
-        h1 = _bundle_tf_align(bundle, "1h")
-        h4 = _bundle_tf_align(bundle, "4h")
-        if h1 is not None and h4 is not None and h1 < 0.38 and h4 < 0.40:
-            return True
+        # 4H cannot invalidate. Do not substitute a 1h-only gate.
+        _ = (_bundle_tf_align(bundle, "1h"), _bundle_tf_align(bundle, "4h"))
     if entry_thesis == SETUP_VWAP_REVERSION:
         if entry_vwap > 0 and mark < entry_vwap * 0.993:
             return True

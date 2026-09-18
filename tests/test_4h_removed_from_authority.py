@@ -243,3 +243,80 @@ class TestCandleDataIntegrity:
         ok, missing = validate_day_active_bundle(empty_bundle)
         assert ok is False, "Empty bundle should not validate"
         assert any("1m" in m for m in missing), "Missing 1m should be flagged"
+
+
+# ---------------------------------------------------------------------------
+# 6. Leftover 4H action paths cannot restore authority
+# ---------------------------------------------------------------------------
+
+
+class TestLeftover4hActionPathsClosed:
+    def test_htf_trend_pullback_4h_cannot_invalidate(self):
+        from backend.services.day_trade_thesis import thesis_invalidated_live
+
+        result = thesis_invalidated_live(
+            "HTF_TREND_PULLBACK",
+            mark=100.0,
+            invalid_level=0.0,
+            bundle={"1h": [{"ema_align": 0.20}], "4h": [{"ema_align": 0.20}]},
+            entry_price=100.0,
+        )
+        assert result is False
+
+    def test_late_4h_does_not_compound_rank_or_size(self, monkeypatch):
+        from backend.services import day_trade_thesis as thesis
+
+        monkeypatch.setattr(thesis, "late_4h_rise_signal", lambda *_a, **_k: "LATE_4H_RISE_NO_HH")
+        out = thesis.apply_late_4h_rank_to_decision_data(
+            {"thesis_rank_delta": 0.10, "thesis_size_factor": 0.90},
+            "BTC/USDT",
+        )
+        assert out["thesis_rank_delta"] == 0.10
+        assert out["thesis_size_factor"] == 0.90
+        assert out["late_4h_authority"] == "TELEMETRY_ONLY_NO_TRADE_AUTHORITY"
+
+    def test_bear_regime_4h_cannot_penalize_rank_or_size(self):
+        from backend.services.day_trade_thesis import bear_regime_entry_adjustment
+
+        out = bear_regime_entry_adjustment(
+            {
+                "mtf_json": '{"1h":{"ema_align":0.30},"4h":{"ema_align":0.30},"5m":{"ema_align":0.70},"15m":{"ema_align":0.60}}',
+                "thesis_score": 0.40,
+            },
+            setup_type="VWAP_REVERSION",
+        )
+        assert out["bear_regime_rank_penalty"] == 0.0
+        assert out["bear_regime_size_factor"] == 1.0
+
+    def test_htf_allows_cannot_grant_on_4h(self):
+        from backend.services.day_regime_router import htf_allows_day_long
+        from backend.services.day_trade_thesis import SETUP_HTF_TREND_PULLBACK
+
+        ok, reason = htf_allows_day_long(
+            {"mtf_json": '{"1h":{"ema_align":0.20},"4h":{"ema_align":0.80}}'},
+            setup_type=SETUP_HTF_TREND_PULLBACK,
+            thesis_score=0.60,
+        )
+        assert reason != "htf_4h_permission"
+        assert ok is False
+
+    def test_setup_env_cannot_restore_4h_veto(self, monkeypatch):
+        from backend.config.day_setup_discovery import setup_discovery_route, setup_validity_enforced
+
+        monkeypatch.setenv("DAY_SETUP_DISCOVERY_ROUTE", "true")
+        monkeypatch.setenv("DAY_SETUP_VALIDITY_ENFORCE", "true")
+        assert setup_discovery_route() is False
+        assert setup_validity_enforced() is False
+
+    def test_intact_4h_slot_env_cannot_restore(self, monkeypatch):
+        from backend.services.day_trade_thesis import intact_4h_slot_blocked
+
+        monkeypatch.setenv("DAY_INTACT_4H_MAX_POSITIONS", "1")
+        assert intact_4h_slot_blocked(open_intact=3, candidate_intact=True, max_open=1) is False
+
+    def test_completed_4h_buy_hard_safety_always_allows(self):
+        from backend.services.day_controlled_exits import evaluate_completed_4h_buy_hard_safety
+
+        out = evaluate_completed_4h_buy_hard_safety(mark=96.0, bundle=_make_bundle_4h_broken())
+        assert out["allowed"] is True
+        assert out["block_reason"] == ""

@@ -143,10 +143,10 @@ def test_stale_data_cancels():
     assert d.reason == "STALE_MARKET_BOOK"
 
 
-def test_4h_invalidation_cancels():
+def test_4h_invalidation_does_not_cancel():
     d = observe_book(_intent(), ask=99.50, now=1_000_010.0, book_fresh=True, thesis_invalid=True)
-    assert d.action == "cancel"
-    assert d.reason == "THESIS_4H_INVALID"
+    assert d.action != "cancel"
+    assert d.reason != "THESIS_4H_INVALID"
 
 
 def test_invalid_configuration_fails_closed(monkeypatch):

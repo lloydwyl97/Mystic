@@ -235,17 +235,12 @@ def intent_invalid_reason(
         return "SOURCE_SETUP_INVALID"
     if better_candidate:
         return "REPLACED_BY_BETTER_CANDIDATE"
-    thesis = float(intent.get("thesis_invalid_level") or 0.0)
-    if thesis > 0 and ask > 0 and ask <= thesis:
-        return "STRUCTURE_BROKEN"
+    _ = float(intent.get("thesis_invalid_level") or 0.0)
     atr = float(intent.get("atr") or 0.0)
     symbol = str(intent.get("symbol") or "")
     if bars:
         ms = market_structure(bars, ts=int(now), atr=atr, ask=ask)
-        px = float(ms.get("price") or 0.0)
-        low4 = float(ms.get("low_240") or 0.0)
-        if px > 0 and low4 > 0 and px <= low4:
-            return "STRUCTURE_BROKEN"
+        _ = (ms.get("price"), ms.get("low_240"))
         ev = float(intent.get("predicted_ev") or 0.0)
         if ev > 0 and ev <= honest_all_in_rt_pct(symbol):
             return "POST_COST_EDGE_GONE"

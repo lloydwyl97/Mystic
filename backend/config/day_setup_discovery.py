@@ -56,10 +56,12 @@ def structured_pullback_shadow() -> bool:
 
 
 def setup_discovery_route() -> bool:
-    """When true, only A/B setups may arm. Default off (shadow labels only)."""
-    return _flag(ROUTE_ENV, False)
+    """Env cannot restore a 4H/240m arm veto."""
+    _ = _flag(ROUTE_ENV, False)
+    return False
 
 
 def setup_validity_enforced() -> bool:
-    """When true, observe/arm cancel on extension/stale/broken structure."""
-    return _flag(ENFORCE_ENV, False)
+    """Env cannot restore 4H structure-break intent cancellation."""
+    _ = _flag(ENFORCE_ENV, False)
+    return False

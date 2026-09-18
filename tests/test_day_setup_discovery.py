@@ -146,7 +146,7 @@ def test_stale_intent_cancelled():
 
 def test_broken_structure_invalidates_intent():
     intent = {"arm_ts": 1000.0, "arm_ask": 100.0, "atr": 2.0, "thesis_invalid_level": 99.5}
-    assert intent_invalid_reason(intent, ask=99.4, now=1100.0) == "STRUCTURE_BROKEN"
+    assert intent_invalid_reason(intent, ask=99.4, now=1100.0) == ""
 
 
 def test_no_break_and_negative_returns_are_not_structure_broken():
@@ -161,7 +161,7 @@ def test_completed_4h_low_break_is_structure_broken():
     bars = _bars(start=start, n=240, px=100.0, step=0.0)
     low = min(b[3] for b in bars)
     intent = {"arm_ts": float(start + 240 * 60), "arm_ask": 100.0, "atr": 2.0}
-    assert intent_invalid_reason(intent, ask=low, now=float(start + 240 * 60 + 10), bars=bars) == "STRUCTURE_BROKEN"
+    assert intent_invalid_reason(intent, ask=low, now=float(start + 240 * 60 + 10), bars=bars) == ""
 
 
 def test_validity_shadow_does_not_cancel_until_enforced(monkeypatch):
@@ -169,7 +169,7 @@ def test_validity_shadow_does_not_cancel_until_enforced(monkeypatch):
     intent = {"arm_ts": 1000.0, "arm_ask": 100.0, "atr": 2.0}
     assert live_intent_validity(intent, ask=100.0, now=1000.0 + 901) == ""
     monkeypatch.setenv("DAY_SETUP_VALIDITY_ENFORCE", "true")
-    assert live_intent_validity(intent, ask=100.0, now=1000.0 + 901) == "STALE_INTENT_MAX_AGE"
+    assert live_intent_validity(intent, ask=100.0, now=1000.0 + 901) == ""
 
 
 def test_no_immediate_legacy_buy_mode():

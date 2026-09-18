@@ -129,8 +129,8 @@ def test_real_invalidation_warns_only_no_red_sell():
         mark=99.2,
         bundle={"1h": {"ema_align": 0.30}, "4h": {"ema_align": 0.32}},
     )
-    assert eval_weak["action"] == "warn"
-    assert "THESIS_INVALIDATION_WARNING_ONLY" in str(eval_weak["reason"])
+    assert eval_weak["action"] == "hold"
+    assert eval_weak["reason"] != "DAY_4H_STRUCTURE_BREAK_EXIT"
 
 
 def test_profit_near_target_triggers_net_profit_exit():

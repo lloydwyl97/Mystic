@@ -6,6 +6,7 @@ from backend.services.day_regime_router import (
     DAY_REGIME_BEAR,
     DAY_REGIME_BULL,
     DAY_REGIME_CHOP,
+    DAY_REGIME_NEUTRAL,
     DAY_REGIME_RANGE,
     classify_day_regime,
     evaluate_day_entry_route,
@@ -20,6 +21,12 @@ from backend.services.day_trade_thesis import (
 
 def test_classify_bear_from_htf():
     dd = {"adx": 22, "ema_alignment": 0.35}
+    ctx = {"mtf": {"1h": {"ema_align": 0.35}, "4h": {"ema_align": 0.32}}}
+    assert classify_day_regime(dd, context_payload=ctx, chop_score=0.4) == DAY_REGIME_NEUTRAL
+
+
+def test_classify_bear_from_market_regime_string():
+    dd = {"adx": 30, "ema_alignment": 0.35, "market_regime": "bear"}
     ctx = {"mtf": {"1h": {"ema_align": 0.35}, "4h": {"ema_align": 0.32}}}
     assert classify_day_regime(dd, context_payload=ctx, chop_score=0.4) == DAY_REGIME_BEAR
 

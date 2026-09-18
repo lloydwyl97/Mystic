@@ -204,8 +204,7 @@ def observe_book(
         return ObserveDecision("expire", EXPIRED, "TIMEOUT", current_ask=px)
     if validity_reason:
         return ObserveDecision("cancel", CANCELED, str(validity_reason), current_ask=px)
-    if thesis_invalid:
-        return ObserveDecision("cancel", CANCELED, "THESIS_4H_INVALID", current_ask=px)
+    _ = thesis_invalid  # 4H / stamped thesis cannot cancel a live intent
     if not book_fresh or px <= 0:
         return ObserveDecision("cancel", CANCELED, "STALE_MARKET_BOOK", current_ask=px)
     if status == WAIT_DIP:
@@ -472,7 +471,7 @@ async def arm_selected_candidate(
     except Exception:
         logger.exception("TRAILING_BUY_SETUP_DISCOVERY_FAILED symbol=%s", symbol)
         discovery = {}
-    if not may_arm_setup(discovery):
+    if discovery:
         logger.info(
             "TRAILING_BUY_SETUP_TELEMETRY %s setup_class=%s reason=%s asof=%s early_need=%s structure_need_min=%s veto=false",
             symbol,
@@ -482,17 +481,7 @@ async def arm_selected_candidate(
             discovery.get("early_trend_need_bars"),
             discovery.get("structure_need_minutes"),
         )
-        if not trailing_buy_mode_active():
-            logger.info(
-                "TRAILING_BUY_ARM_BLOCKED %s setup_class=%s reason=%s asof=%s early_need=%s structure_need_min=%s",
-                symbol,
-                discovery.get("setup_class"),
-                discovery.get("reason"),
-                discovery.get("asof_bars"),
-                discovery.get("early_trend_need_bars"),
-                discovery.get("structure_need_minutes"),
-            )
-            return None
+    _ = may_arm_setup(discovery)  # 4H/240m discovery cannot veto a live arm
     from backend.services.day_entry_spendable import money
 
     notional = money(reserved_notional) if reserved_notional is not None else money(quantity) * money(arm_ask)

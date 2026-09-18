@@ -77,11 +77,9 @@ def classify_day_regime(
     if adx > 0 and adx <= DAY_CHOP_ADX_MAX and price_structure_regime == "range_bound" and float(chop_score or 0.5) >= 0.58:
         return DAY_REGIME_CHOP
 
-    if h1 is not None and h4 is not None and h1 >= 0.58 and h4 >= 0.52 and ema >= 0.55:
-        return DAY_REGIME_BULL
+    # 4H cannot stamp BULL/BEAR. Do not substitute a 1h-only regime gate.
+    _ = (h1, h4, ema)
     if "bear" in mr or "fear" in mr or "extreme fear" in mr:
-        return DAY_REGIME_BEAR
-    if h1 is not None and h4 is not None and h1 <= 0.42 and h4 <= 0.40:
         return DAY_REGIME_BEAR
     if adx > 0 and adx < 25 and price_structure_regime == "range_bound":
         return DAY_REGIME_RANGE
@@ -109,8 +107,7 @@ def htf_allows_day_long(
 
     if h1 is not None and h1 >= 0.48:
         return True, "htf_1h_permission"
-    if h4 is not None and h4 >= 0.50:
-        return True, "htf_4h_permission"
+    _ = h4  # 4H cannot grant or deny a live long
     if setup_type == SETUP_BREAKOUT_CONTINUATION and score >= 0.68 and m15 is not None and m15 >= 0.55:
         return True, "htf_breakout_reversal_confirmed"
     if setup_type == SETUP_VWAP_REVERSION and rsi <= 35.0 and bb <= 0.28:
