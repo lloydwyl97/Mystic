@@ -2744,8 +2744,8 @@ class PortfolioEngine:
                 # BUG #12 FIX: Ensure pause logic does not apply to DUST_PENDING
                 # DUST_PENDING is excluded from all pause checks by design
                 price = getattr(position, "entry_price", 0) or 0
-                is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped, price)
-                if is_dust:
+                is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped if snapped > 0 else exchange_qty, price)
+                if is_dust or str(getattr(position, "status", "") or "") == "DUST_PENDING":
                     prior_notional = float(db_qty or 0.0) * float(price or 0.0)
                     if prior_notional >= 5.0 and float(db_qty or 0.0) > float(snapped or 0.0) + 1e-9:
                         logger.info(
@@ -2757,12 +2757,16 @@ class PortfolioEngine:
                         await self._handle_vanished_exchange_position(symbol, position, source="bootstrap_reconcile")
                         cleared_pause_for_mismatch = True
                         continue
-                    position.quantity = snapped
+                    from backend.services.live_exchange_equity import exact_dust_quantity
+
+                    exact = exact_dust_quantity(total_balances.get(base_asset, exchange_qty))
+                    position.quantity = float(exact)
+                    position.quantity_exact = format(exact, "f")
                     position.status = "DUST_PENDING"
-                    position.dust_qty_canonical = snapped
+                    position.dust_qty_canonical = float(exact)
                     position.dust_detected_at = time.time()
                     await self._persist_position_to_sqlite(position)
-                    logger.info("DUST_PENDING:%s ex_qty=%.12g reason=%s", symbol, exchange_qty, dust_reason or "below min")
+                    logger.info("DUST_PENDING:%s ex_qty=%s reason=%s", symbol, exact, dust_reason or "below min")
                     # Coordinate: Skip pause logic for dust (continue without pause)
                     continue
                 # Rule 2: DB differs -> set DB = exchange snapped, ACTIVE
@@ -3047,8 +3051,8 @@ class PortfolioEngine:
                 continue
             snapped = self._floor_to_step(exchange_qty, qty_step) if qty_step > 0 else exchange_qty
             price = getattr(position, "entry_price", 0) or 0
-            is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped, price)
-            if is_dust:
+            is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped if snapped > 0 else exchange_qty, price)
+            if is_dust or str(getattr(position, "status", "") or "") == "DUST_PENDING":
                 prior_notional = float(db_qty or 0.0) * float(price or 0.0)
                 if prior_notional >= 5.0 and float(db_qty or 0.0) > float(snapped or 0.0) + 1e-9:
                     logger.info(
@@ -3060,13 +3064,17 @@ class PortfolioEngine:
                     await self._handle_vanished_exchange_position(symbol, position, source="periodic_reconcile")
                     self._metrics_reconciliation_adjustments += 1
                     continue
-                position.quantity = snapped
+                from backend.services.live_exchange_equity import exact_dust_quantity
+
+                exact = exact_dust_quantity(total_balances.get(base_asset, exchange_qty))
+                position.quantity = float(exact)
+                position.quantity_exact = format(exact, "f")
                 position.status = "DUST_PENDING"
-                position.dust_qty_canonical = snapped
+                position.dust_qty_canonical = float(exact)
                 position.dust_detected_at = time.time()
                 await self._persist_position_to_sqlite(position)
                 self._metrics_reconciliation_adjustments += 1
-                logger.info("DUST_PENDING:%s ex_qty=%.12g reason=%s", symbol, exchange_qty, dust_reason or "below min")
+                logger.info("DUST_PENDING:%s ex_qty=%s reason=%s", symbol, exact, dust_reason or "below min")
                 continue
             if abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
                 position.quantity = snapped

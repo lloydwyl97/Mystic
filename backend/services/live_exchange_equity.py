@@ -43,6 +43,12 @@ def sell_fee_pct() -> Decimal:
     return money(TAKER_COMMISSION_PCT)
 
 
+def exact_dust_quantity(exchange_qty: object) -> Decimal:
+    """Lot-size floor must never write a real leftover off as zero."""
+    qty = money(exchange_qty)
+    return qty if qty > 0 else Decimal("0")
+
+
 def mark_dust_asset(
     *,
     symbol: str,

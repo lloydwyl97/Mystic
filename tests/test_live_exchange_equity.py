@@ -16,6 +16,7 @@ from backend.services.live_exchange_equity import (
     build_exchange_equity,
     cap_qty_coverage_pct,
     dust_trade_id,
+    exact_dust_quantity,
     mark_dust_asset,
     persist_current_dust_snapshot,
     reconstruct_forward_baseline_dust,
@@ -44,6 +45,15 @@ def test_all_nonzero_assets_enter_gross_equity():
     assert len(out["dust_by_coin"]) == 4
     assert out["lifetime_contributed_capital"] == LIFETIME_CONTRIBUTED_CAPITAL
     assert "not contributed principal" in out["forward_baseline_label"]
+
+
+def test_lot_floor_cannot_write_dust_off():
+    engine = PortfolioEngine(principal=228.06746265, test_mode=True)
+    assert engine._floor_to_step(0.00000997, 0.00001) == 0.0
+    assert exact_dust_quantity("0.00000997") == Decimal("0.00000997")
+    assert exact_dust_quantity("0.00009134") == Decimal("0.00009134")
+    assert exact_dust_quantity("0.0008216") == Decimal("0.0008216")
+    assert exact_dust_quantity("0.0938") == Decimal("0.0938")
 
 
 def test_dust_uses_bid_and_sell_fee():
