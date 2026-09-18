@@ -1,9 +1,9 @@
-"""Live contributed-capital and trailing-buy P&L basis.
+"""Live account basis and trailing-buy forward baseline.
 
-Restart/bootstrap may adopt exchange cash and positions. It must not reset
-contributed principal to current equity. Balance reconciliation is not
-trading profit. Trailing-buy scorecard stays anchored at the 9039923 cash
-repair until that executor produces real fills.
+Restart/bootstrap may adopt exchange cash and positions. It must not invent
+contributed principal. ``228.06746265`` is the adopted forward cash baseline
+at SHA 9039923, not an owner deposit. Balance reconciliation is not trading
+profit. Lifetime contributed capital remains UNKNOWN.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ RECON_KEY = "live_cash_reconciliation"
 
 
 def apply_external_capital_flow(principal: object, amount: object) -> Decimal:
-    """Deposits/withdrawals change contribution basis, not trading P&L."""
+    """Deposits/withdrawals change the stored basis column, not trading P&L."""
     return money(principal) + money(amount)
 
 
@@ -83,11 +83,15 @@ def trailing_buy_scorecard(
         total = realized + unrealized
     return {
         "anchor_equity": str(TRAILING_BUY_ANCHOR_EQUITY),
+        "forward_baseline_equity": str(TRAILING_BUY_ANCHOR_EQUITY),
+        "forward_baseline_label": "forward baseline equity (adopted cash at SHA 9039923; not contributed principal)",
         "anchor_sha": TRAILING_BUY_ANCHOR_SHA,
         "realized_pnl": float(realized),
         "unrealized_pnl": float(unrealized),
         "total_pnl": float(total),
         "current_equity": str(money(current_equity)) if current_equity is not None else None,
+        "lifetime_contributed_capital": "UNKNOWN",
+        "total_pnl_label": "forward cash-or-mark change vs SHA 9039923 baseline; not contributed-capital return and not total-account P&L unless baseline dust is known",
     }
 
 

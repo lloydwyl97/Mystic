@@ -165,10 +165,14 @@ def read_recorded_live(db_path: str) -> dict[str, Any]:
     try:
         conn.row_factory = sqlite3.Row
         live = "LOWER(COALESCE(mode,'')) = 'live' AND COALESCE(is_synthetic,0) = 0"
+        cols = {str(c[1]) for c in conn.execute("PRAGMA table_info(paper_trades)")}
+        trade_expr = "COALESCE(trade_id,'')" if "trade_id" in cols else "''"
+        order_expr = "COALESCE(order_id,'')" if "order_id" in cols else "''"
+        exit_expr = "COALESCE(exit_type,'')" if "exit_type" in cols else "''"
         for r in conn.execute(
             f"""
             SELECT rowid AS local_id, symbol, UPPER(side) AS side, quantity, price, timestamp,
-                   COALESCE(order_id,'') AS order_id, COALESCE(exit_type,'') AS exit_type
+                   {order_expr} AS order_id, {exit_expr} AS exit_type, {trade_expr} AS trade_id
             FROM paper_trades
             WHERE {live}
             ORDER BY timestamp
@@ -177,11 +181,13 @@ def read_recorded_live(db_path: str) -> dict[str, Any]:
             out["rows"].setdefault((r["symbol"], r["side"]), []).append(
                 {
                     "local_id": r["local_id"],
+                    "trade_id": str(r["trade_id"] or ""),
                     "qty": float(r["quantity"] or 0.0),
                     "price": float(r["price"] or 0.0),
                     "ts": _epoch_ms(r["timestamp"]),
                     "timestamp": str(r["timestamp"] or ""),
                     "order_id": str(r["order_id"] or ""),
+                    "client_order_id": "",
                     "exit_type": str(r["exit_type"] or ""),
                 }
             )
@@ -293,41 +299,68 @@ def _reconcile_symbol(symbol: str, recorded: dict[str, list[dict[str, Any]]], ve
             elif f["fee_cost"] > 0:
                 rec.venue_fee_base[f["fee_ccy"]] = rec.venue_fee_base.get(f["fee_ccy"], 0.0) + f["fee_cost"]
 
-        # Rows that carry an exchange order id reconcile exactly, with no
-        # inference. Historical rows predate identifier persistence and fall
-        # through to the quantity walk below.
-        for r in rows:
-            oid = str(r.get("order_id") or "").strip()
-            if oid and any(str(f.get("order") or "") == oid for f in vfills):
+        queue = sorted(vfills, key=lambda x: x["ts"] or 0)
+        remaining = [float(f["qty"]) for f in queue]
+        touched = [False] * len(queue)
+        row_need = [0.0 if r.get("exit_type") == "DUST_WRITEOFF" else float(r["qty"]) for r in rows]
+
+        def _identity_hit(row: dict[str, Any], fill: dict[str, Any]) -> bool:
+            oid = str(row.get("order_id") or "").strip()
+            vid = str(row.get("venue_trade_id") or "").strip()
+            cid = str(row.get("client_order_id") or "").strip()
+            if oid and oid == str(fill.get("order") or "").strip():
+                return True
+            if vid and vid == str(fill.get("id") or "").strip():
+                return True
+            return bool(cid and cid == str(fill.get("client_order_id") or "").strip())
+
+        for i, r in enumerate(rows):
+            if r.get("exit_type") == "DUST_WRITEOFF":
+                continue
+            if not (str(r.get("order_id") or "").strip() or str(r.get("venue_trade_id") or "").strip() or str(r.get("client_order_id") or "").strip()):
+                continue
+            for j, f in enumerate(queue):
+                if remaining[j] <= max(_QTY_ABS_TOL, float(f["qty"]) * _RESIDUAL_REL_TOL):
+                    continue
+                if not _identity_hit(r, f):
+                    continue
+                take = min(row_need[i], remaining[j])
+                if take <= 0:
+                    continue
+                remaining[j] -= take
+                row_need[i] -= take
+                touched[j] = True
                 rec.id_matched_rows += 1
 
-        # Row-to-fill is many-to-many: the engine writes one row per FIFO lot
-        # while the venue reports one fill per partial execution. Pairing 1:1
-        # would report most rows unmatched even when every unit is accounted
-        # for, so consume quantity chronologically instead — which is what the
-        # FIFO accounting actually claims happened.
-        queue = sorted(vfills, key=lambda x: x["ts"] or 0)
-        remaining = [f["qty"] for f in queue]
-        touched = [False] * len(queue)
+        leftover_rows = [rows[i] for i, need in enumerate(row_need) if need > max(_QTY_ABS_TOL, float(rows[i]["qty"]) * _RESIDUAL_REL_TOL)]
+        leftover_idx = [j for j, f in enumerate(queue) if remaining[j] > max(_QTY_ABS_TOL, float(f["qty"]) * _RESIDUAL_REL_TOL)]
         cursor = 0
-        for r in sorted(rows, key=lambda x: x["ts"] or 0):
-            if r["exit_type"] == "DUST_WRITEOFF":
-                # Written off without an exchange order by design.
-                continue
-            need = float(r["qty"])
-            tol = max(_QTY_ABS_TOL, need * _RESIDUAL_REL_TOL)
-            while need > tol and cursor < len(queue):
-                spent = max(_QTY_ABS_TOL, queue[cursor]["qty"] * _RESIDUAL_REL_TOL)
-                if remaining[cursor] <= spent:
+        for r in leftover_rows:
+            i = rows.index(r)
+            need = row_need[i]
+            tol = max(_QTY_ABS_TOL, float(r["qty"]) * _RESIDUAL_REL_TOL)
+            while need > tol and cursor < len(leftover_idx):
+                j = leftover_idx[cursor]
+                spent = max(_QTY_ABS_TOL, queue[j]["qty"] * _RESIDUAL_REL_TOL)
+                if remaining[j] <= spent:
                     cursor += 1
                     continue
-                take = min(need, remaining[cursor])
-                remaining[cursor] -= take
+                take = min(need, remaining[j])
+                remaining[j] -= take
                 need -= take
-                touched[cursor] = True
-            leftover = need if need > tol else 0.0
-            if leftover:
+                touched[j] = True
+            row_need[i] = need
+
+        for i, r in enumerate(rows):
+            if r.get("exit_type") == "DUST_WRITEOFF":
+                continue
+            leftover = row_need[i]
+            tol = max(_QTY_ABS_TOL, float(r["qty"]) * _RESIDUAL_REL_TOL)
+            if leftover > tol:
                 rec.unmatched_recorded_rows += 1
+                reason = "local quantity exceeds venue fills for this identity"
+                if not str(r.get("order_id") or "").strip():
+                    reason = "historical row lacks exchange order id; qty/time pairing incomplete"
                 rec.unmatched_records.append(
                     {
                         "source": "local_recorded",
@@ -341,13 +374,14 @@ def _reconcile_symbol(symbol: str, recorded: dict[str, list[dict[str, Any]]], ve
                         "venue_trade_id": "",
                         "local_record_id": r.get("local_id"),
                         "dollar_discrepancy": leftover * float(r["price"] or 0.0),
+                        "unmatched_reason": reason,
                     }
                 )
             else:
                 rec.matched_recorded_rows += 1
         rec.matched_fills += sum(1 for t in touched if t)
-        for i, f in enumerate(queue):
-            leftover = remaining[i]
+        for j, f in enumerate(queue):
+            leftover = remaining[j]
             if leftover > max(_QTY_ABS_TOL, f["qty"] * _RESIDUAL_REL_TOL):
                 rec.unmatched_venue_fills += 1
                 rec.unmatched_records.append(
@@ -363,13 +397,16 @@ def _reconcile_symbol(symbol: str, recorded: dict[str, list[dict[str, Any]]], ve
                         "venue_trade_id": f.get("id") or "",
                         "local_record_id": "",
                         "dollar_discrepancy": leftover * ((f["cost"] / f["qty"]) if f["qty"] else 0.0),
+                        "unmatched_reason": "no local paper_trades row carries this exchange order id",
                     }
                 )
 
     rec.venue_gross_usd = rec.venue_sell_notional - rec.venue_buy_notional
     denom = rec.venue_buy_qty + rec.venue_sell_qty
-    if denom > 0:
-        rec.qty_coverage_pct = 100.0 * (rec.recorded_buy_qty + rec.recorded_sell_qty) / denom
+    leftover_v = sum(float(u.get("unmatched_quantity") or 0.0) for u in rec.unmatched_records if u.get("source") == "venue_fill")
+    from backend.services.live_exchange_equity import cap_qty_coverage_pct
+
+    rec.qty_coverage_pct = cap_qty_coverage_pct(matched_qty=max(0.0, denom - leftover_v), venue_qty=denom)
     return rec
 
 
@@ -404,6 +441,14 @@ async def build_reconciliation(db_path: str) -> LivePnlReconciliation:
         return out
 
     last_ts = 0
+    flat_recorded: list[dict[str, Any]] = []
+    flat_venue: list[dict[str, Any]] = []
+    for (sym, _side), rows in (local.get("rows") or {}).items():
+        for r in rows:
+            item = dict(r)
+            item["symbol"] = sym
+            item["side"] = _side
+            flat_recorded.append(item)
     for sym in DAY_SYMBOLS:
         rec = _reconcile_symbol(sym, local["rows"], venue.get(sym) or {})
         out.per_symbol.append(rec.to_dict())
@@ -417,15 +462,27 @@ async def build_reconciliation(db_path: str) -> LivePnlReconciliation:
         out.unmatched_records.extend(rec.unmatched_records)
         for f in (venue.get(sym) or {}).get("fills") or []:
             last_ts = max(last_ts, int(f["ts"] or 0))
+            item = dict(f)
+            item["symbol"] = sym
+            flat_venue.append(item)
+
+    try:
+        from backend.services.live_exchange_equity import backfill_provable_fill_identities
+
+        backfill_provable_fill_identities(db_path, recorded=flat_recorded, venue_fills=flat_venue)
+    except Exception:
+        logger.debug("provable fill identity backfill skipped", exc_info=True)
 
     out.window_end = _iso(last_ts) if last_ts else str(local["last_ts"] or "")
     # Venue gross already nets base-asset commission out of received quantity;
     # quote-denominated commission is charged on top and must be subtracted.
     out.live_reconciled_usd = out.live_venue_gross_usd - out.live_venue_fee_quote_usd
 
+    from backend.services.live_exchange_equity import cap_qty_coverage_pct
+
     v_qty = sum(float(s["venue_buy_qty"]) + float(s["venue_sell_qty"]) for s in out.per_symbol)
-    r_qty = sum(float(s["recorded_buy_qty"]) + float(s["recorded_sell_qty"]) for s in out.per_symbol)
-    out.qty_coverage_pct = (100.0 * r_qty / v_qty) if v_qty > 0 else 0.0
+    leftover_v = sum(float(u.get("unmatched_quantity") or 0.0) for u in out.unmatched_records if u.get("source") == "venue_fill")
+    out.qty_coverage_pct = cap_qty_coverage_pct(matched_qty=max(0.0, v_qty - leftover_v), venue_qty=v_qty)
 
     if out.recorded_rows_with_exchange_order_id == 0 and out.recorded_live_rows > 0:
         out.notes.append(
@@ -485,9 +542,12 @@ def account_basis_for_presentation(
     db_path: str,
     *,
     current_equity: float,
-    contributed_principal: float,
-) -> dict[str, float]:
-    """Ledger cash-identity inputs. Adoption deltas are corrections, not profit."""
+    contributed_principal: float | None = None,
+    forward_baseline_equity: float | None = None,
+    net_liquidatable_equity: float | None = None,
+    baseline_dust_known: bool = False,
+) -> dict[str, Any]:
+    """Forward-baseline inputs. Adoption deltas are corrections, not profit."""
     from backend.services.live_account_basis import RECON_KEY, load_operational_json
 
     raw = load_operational_json(db_path, RECON_KEY)
@@ -495,9 +555,12 @@ def account_basis_for_presentation(
         adj = float(raw.get("adjustment_usd") or 0.0)
     except (TypeError, ValueError):
         adj = 0.0
+    baseline = forward_baseline_equity if forward_baseline_equity is not None else contributed_principal
     return {
         "current_equity": float(current_equity or 0.0),
-        "contributed_principal": float(contributed_principal or 0.0),
+        "forward_baseline_equity": float(baseline or 0.0),
+        "net_liquidatable_equity": float(net_liquidatable_equity) if net_liquidatable_equity is not None else None,
+        "baseline_dust_known": bool(baseline_dust_known),
         "reconciliation_adjustment_usd": adj,
     }
 
@@ -508,6 +571,9 @@ def presentation_fields(
     is_live: bool,
     current_equity: float | None = None,
     contributed_principal: float | None = None,
+    forward_baseline_equity: float | None = None,
+    net_liquidatable_equity: float | None = None,
+    baseline_dust_known: bool = False,
     reconciliation_adjustment_usd: float | None = None,
 ) -> dict[str, Any]:
     """Separated live economic, completeness, correction and paper figures."""
@@ -517,28 +583,39 @@ def presentation_fields(
     dust = float(recon.get("live_dust_writeoff_usd") or 0.0)
     recon_adj = float(reconciliation_adjustment_usd or 0.0)
     accounting_correction = dust + recon_adj
-    economic = None
-    if current_equity is not None and contributed_principal is not None:
-        economic = float(current_equity) - float(contributed_principal)
-    if is_live and economic is not None:
-        primary = economic
-        label = "LIVE ECONOMIC (cash-identity: marked equity - contributed principal)"
+    baseline = forward_baseline_equity if forward_baseline_equity is not None else contributed_principal
+    cash_change = None
+    if current_equity is not None and baseline is not None:
+        cash_change = float(current_equity) - float(baseline)
+    comparable_change = None
+    if is_live and baseline_dust_known and net_liquidatable_equity is not None and baseline is not None:
+        comparable_change = float(net_liquidatable_equity) - float(baseline)
+    if comparable_change is not None:
+        primary = comparable_change
+        label = "LIVE NET LIQUIDATABLE CHANGE vs comparable forward baseline"
         primary_is_recon = True
     elif fill_tape is not None:
         primary = fill_tape
-        label = "LIVE (exchange-reconciled fill tape)"
+        label = "LIVE (exchange-reconciled fill tape; not total-account P&L)"
         primary_is_recon = True
     else:
         primary = recorded
-        label = "LIVE (recorded, not exchange-reconciled)"
+        label = "LIVE (recorded, not exchange-reconciled; not total-account P&L)"
         primary_is_recon = False
     return {
         "primary_result_label": label,
         "primary_result_usd": primary,
         "primary_result_is_exchange_reconciled": primary_is_recon,
-        "live_economic_pnl_usd": economic,
-        "live_economic_label": "LIVE ECONOMIC (cash-identity: marked equity - contributed principal; not fill-tape P&L)",
-        "contributed_principal_usd": contributed_principal,
+        "live_economic_pnl_usd": comparable_change,
+        "live_economic_label": (
+            "LIVE NET LIQUIDATABLE CHANGE vs comparable forward baseline" if comparable_change is not None else "INCOMPLETE: cash-only change is not total-account P&L because baseline dust is unknown"
+        ),
+        "forward_cash_change_usd": cash_change,
+        "forward_baseline_equity_usd": baseline,
+        "forward_baseline_label": "forward baseline equity (adopted cash at SHA 9039923; not contributed principal)",
+        "lifetime_contributed_capital": "UNKNOWN",
+        "contributed_principal_usd": None,
+        "net_liquidatable_equity_usd": net_liquidatable_equity,
         "current_equity_usd": current_equity,
         "live_reconciled_usd": fill_tape,
         "live_reconciled_label": "LOCAL-RECORD COMPLETENESS DIAGNOSTIC (venue fill tape gross - quote fees; not cash-identity)",

@@ -10,6 +10,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 import ccxt
@@ -286,14 +287,14 @@ class LiveTradingService:
 
                         for balance in account_data.get("balances", []):
                             asset = balance.get("asset")
-                            free = float(balance.get("free", 0))
-                            locked = float(balance.get("locked", 0))
+                            free = Decimal(str(balance.get("free") or "0"))
+                            locked = Decimal(str(balance.get("locked") or "0"))
                             total = free + locked
 
                             if total > 0:
-                                total_balances[asset] = total
-                                free_balances[asset] = free
-                                used_balances[asset] = locked
+                                total_balances[asset] = format(total, "f")
+                                free_balances[asset] = format(free, "f")
+                                used_balances[asset] = format(locked, "f")
 
                         balances[EXCHANGE_ID] = {
                             "total": total_balances,

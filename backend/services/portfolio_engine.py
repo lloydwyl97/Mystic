@@ -1432,6 +1432,7 @@ class OpenPosition:
     entry_order_id: str = ""
     entry_client_order_id: str = ""
     entry_fill_ids_json: str = "[]"
+    quantity_exact: str = ""
 
     @property
     def risk_usd(self) -> float:
@@ -2802,8 +2803,9 @@ class PortfolioEngine:
     ) -> None:
         """
         Import exchange balances that are not yet in engine positions.
-        Skip leftover dust. If an unclosed mystic BUY exists for the symbol,
-        reuse that trade_id and fill price instead of minting reconcile_import_*.
+        Genuine leftovers are retained as DUST_PENDING (no BUY, no realized P&L).
+        If an unclosed mystic BUY exists for the symbol, reuse that trade_id
+        and fill price instead of minting reconcile_import_*.
         Never adjust realized_pnl (do not treat as loss).
         """
         if not self._live_execution_enabled or not self._live_service:
@@ -2812,12 +2814,23 @@ class PortfolioEngine:
         qty_epsilon = 1e-10
         imported_any = False
         for asset, total_qty in total_balances.items():
-            if asset == "USDT" or (float(total_qty or 0) <= qty_epsilon):
+            if str(asset or "").upper() in ("USDT", "USD", "BUSD", "USDC"):
+                continue
+            if float(total_qty or 0) <= qty_epsilon:
                 continue
             symbol = normalize_symbol(f"{asset}/USDT")
             if not self._symbol_in_fixed_universe(symbol):
                 continue
+            exact_qty = str(total_qty)
             if symbol in self.open_positions:
+                existing = self.open_positions[symbol]
+                if str(getattr(existing, "status", "") or "") == "DUST_PENDING":
+                    await self._retain_exchange_dust(
+                        symbol=symbol,
+                        asset=str(asset),
+                        quantity=exact_qty,
+                        mark_hint=float(getattr(existing, "entry_price", 0) or 0),
+                    )
                 continue
             free_qty = float(free.get(asset, 0) or 0)
             if free_qty <= qty_epsilon:
@@ -2844,10 +2857,16 @@ class PortfolioEngine:
                     is_dust = True
                     dust_reason = dust_reason or "below min_notional"
                 if is_dust:
+                    await self._retain_exchange_dust(
+                        symbol=symbol,
+                        asset=str(asset),
+                        quantity=exact_qty if float(exact_qty or 0) > 0 else free_qty,
+                        mark_hint=price,
+                    )
                     logger.info(
-                        "LIVE_RECONCILE_IMPORT_SKIP_DUST symbol=%s qty=%s reason=%s",
+                        "LIVE_RECONCILE_DUST_RETAINED symbol=%s qty=%s reason=%s",
                         symbol,
-                        track_qty,
+                        exact_qty if float(exact_qty or 0) > 0 else free_qty,
                         dust_reason or "dust",
                     )
                     continue
@@ -2904,6 +2923,95 @@ class PortfolioEngine:
         if imported_any:
             await self._recompute_positions_values()
             await self._persist_ledger_to_sqlite()
+
+    async def _executable_bid(self, symbol: str, fallback: float = 0.0) -> tuple[float, str]:
+        try:
+            from backend.config.redis_config import get_redis_client
+            from backend.services.spread_book_telemetry import read_market_book
+
+            book = read_market_book(get_redis_client(), symbol)
+            bid = float((book or {}).get("bid") or (book or {}).get("best_bid") or 0.0)
+            if bid > 0:
+                return bid, "executable_bid"
+        except Exception:
+            pass
+        return float(fallback or 0.0), "last_price_fallback"
+
+    async def _retain_exchange_dust(
+        self,
+        *,
+        symbol: str,
+        asset: str,
+        quantity: object,
+        mark_hint: float = 0.0,
+    ) -> None:
+        """Keep exact exchange leftovers as DUST_PENDING. No BUY, slot, or realized P&L."""
+        from decimal import Decimal
+
+        from backend.services.live_exchange_equity import (
+            dust_trade_id,
+            persist_current_dust_snapshot,
+            should_import_exchange_dust,
+        )
+
+        qty = Decimal(str(quantity or "0"))
+        if qty <= 0:
+            return
+        exact = format(qty, "f")
+        existing = self.open_positions.get(symbol)
+        action = should_import_exchange_dust(
+            existing_status=str(getattr(existing, "status", "") or "") if existing else "",
+            existing_trade_id=str(getattr(existing, "trade_id", "") or "") if existing else "",
+            existing_qty=getattr(existing, "quantity_exact", "") or getattr(existing, "quantity", 0) if existing else 0,
+            exchange_qty=qty,
+        )
+        if action == "skip" and existing is not None:
+            return
+        bid, _src = await self._executable_bid(symbol, float(mark_hint or 0.0))
+        if bid <= 0:
+            bid = float(mark_hint or 0.0)
+        if bid <= 0:
+            logger.info("LIVE_RECONCILE_DUST_NO_MARK symbol=%s qty=%s", symbol, qty)
+            return
+        now = time.time()
+        if existing is not None and action == "update":
+            existing.quantity = float(qty)
+            existing.quantity_exact = exact
+            existing.dust_qty_canonical = float(qty)
+            existing.entry_price = bid
+            existing.status = "DUST_PENDING"
+            existing.dust_detected_at = float(getattr(existing, "dust_detected_at", 0) or now)
+            await self._persist_position_to_sqlite(existing)
+            return
+        position = OpenPosition(
+            symbol=symbol,
+            quantity=float(qty),
+            entry_price=bid,
+            entry_time=now,
+            trade_id=dust_trade_id(symbol),
+            stop_price=0.0,
+            take_profit_1_price=0.0,
+            take_profit_2_price=0.0,
+            trailing_stop_price=None,
+            tp1_hit=False,
+            highest_price=bid,
+            atr_at_entry=0.0,
+            entry_bar_timestamp=int(now),
+            confidence_at_entry=0.0,
+            status="DUST_PENDING",
+            dust_detected_at=now,
+            dust_qty_canonical=float(qty),
+            quantity_exact=exact,
+        )
+        self.open_positions[symbol] = position
+        await self._persist_position_to_sqlite(position)
+        try:
+            persist_current_dust_snapshot(
+                str(self.db_path),
+                [{"symbol": symbol, "asset": asset, "quantity": str(qty), "executable_bid": str(bid)}],
+            )
+        except Exception:
+            logger.debug("dust snapshot persist skipped", exc_info=True)
 
     async def run_live_reconcile(
         self,
@@ -18944,6 +19052,40 @@ class PortfolioEngine:
             recon_adj = float(recon_row.get("adjustment_usd") or 0)
         except (TypeError, ValueError):
             recon_adj = 0.0
+        from backend.services.live_exchange_equity import (
+            build_exchange_equity,
+            persist_current_dust_snapshot,
+            reconstruct_forward_baseline_dust,
+        )
+
+        active_marks = []
+        dust_marks = []
+        for symbol, pos in self.open_positions.items():
+            mark = float(self._position_mark_prices.get(symbol) or getattr(pos, "entry_price", 0) or 0)
+            exact = str(getattr(pos, "quantity_exact", "") or "")
+            qty = exact if exact else float(getattr(pos, "quantity", 0) or 0)
+            asset = symbol.split("/")[0] if "/" in symbol else symbol.replace("USDT", "")
+            row = {"symbol": symbol, "asset": asset, "quantity": qty, "mark": mark, "bid": mark, "executable_bid": mark, "market_value": float(qty) * mark}
+            if str(getattr(pos, "status", "ACTIVE") or "") == "DUST_PENDING":
+                dust_marks.append(row)
+            else:
+                active_marks.append(row)
+        baseline_dust = reconstruct_forward_baseline_dust(str(self.db_path))
+        exchange_equity = build_exchange_equity(
+            cash_usdt=self.cash_balance,
+            active_marks=active_marks,
+            dust_marks=dust_marks,
+            realized_strategy_pnl=mode_pnl["realized_pnl_live"],
+            unrealized_strategy_pnl=self._unrealized_pnl,
+            accounting_corrections=float(dust_adj or 0) + float(recon_adj or 0),
+            forward_baseline_cash=self.principal,
+            forward_baseline_dust_net=baseline_dust.get("net_liquidatable"),
+            baseline_dust_known=bool(baseline_dust.get("known")),
+        )
+        try:
+            persist_current_dust_snapshot(str(self.db_path), exchange_equity.get("dust_by_coin") or [])
+        except Exception:
+            pass
 
         return {
             # DAY mode (normal repaired strategy — no inventory recovery freeze)
@@ -18983,9 +19125,22 @@ class PortfolioEngine:
             "slots_open": max(0, MAX_OPEN_POSITIONS - self._count_live_slots()),
             # AUTHORITATIVE LEDGER (single meaning: account / cash+marks)
             "cash_balance": self.cash_balance,
+            "cash_usdt": float(exchange_equity["cash_usdt"]),
+            "active_position_market_value": float(exchange_equity["active_position_market_value"]),
+            "dust_market_value": float(exchange_equity["dust_market_value"]),
+            "dust_by_coin": exchange_equity["dust_by_coin"],
+            "gross_exchange_equity": float(exchange_equity["gross_exchange_equity"]),
+            "estimated_liquidation_cost": float(exchange_equity["estimated_liquidation_cost"]),
+            "net_liquidatable_equity": float(exchange_equity["net_liquidatable_equity"]),
+            "forward_net_equity_change": (float(exchange_equity["forward_net_equity_change"]) if exchange_equity.get("forward_net_equity_change") is not None else None),
+            "forward_cash_change": float(exchange_equity["forward_cash_change"]),
+            "realized_strategy_pnl": float(exchange_equity["realized_strategy_pnl"]),
+            "unrealized_strategy_pnl": float(exchange_equity["unrealized_strategy_pnl"]),
+            "accounting_corrections": float(exchange_equity["accounting_corrections"]),
+            "exchange_equity": exchange_equity,
             "positions_value": self._positions_value,
-            "total_equity": account_equity,
-            "account_equity": account_equity,
+            "total_equity": float(exchange_equity["gross_exchange_equity"]),
+            "account_equity": float(exchange_equity["gross_exchange_equity"]),
             "performance_equity": performance_equity,
             "principal_based_equity": performance_equity,
             "cash_plus_positions_equity": equity_views["cash_plus_positions_equity"],
@@ -18999,6 +19154,11 @@ class PortfolioEngine:
             "equity_check": account_equity_check,
             # P&L BREAKDOWN
             "principal": self.principal,
+            "forward_baseline_equity": float(self.principal or 0.0),
+            "forward_baseline_label": "forward baseline equity (adopted cash at SHA 9039923; not contributed principal)",
+            "lifetime_contributed_capital": "UNKNOWN",
+            "baseline_dust_known": bool(exchange_equity.get("baseline_dust_known")),
+            "equity_uncertainty": exchange_equity.get("uncertainty") or "",
             "account_execution_mode": mode_pnl["account_execution_mode"],
             "realized_pnl_ledger_stored": self._realized_pnl,
             "realized_pnl_live": mode_pnl["realized_pnl_live"],
@@ -19007,7 +19167,8 @@ class PortfolioEngine:
             "dust_adjustment_pnl": equity_views["dust_adjustment_pnl"],
             "realized_pnl": mode_pnl["headline_realized_pnl"],
             "unrealized_pnl": self._unrealized_pnl,
-            "contributed_principal": self.principal,
+            "contributed_principal": None,
+            "contributed_principal_label": "UNKNOWN — ledger principal column is the forward baseline, not an owner deposit",
             "cash_reconciliation_adjustment_usd": recon_adj,
             "trailing_buy_scorecard": trailing_buy_scorecard(
                 live_fills_since_anchor=mode_pnl["realized_pnl_live"],
@@ -19015,7 +19176,12 @@ class PortfolioEngine:
                 live_realized_pnl=mode_pnl["realized_pnl_live"],
                 live_unrealized_pnl=self._unrealized_pnl,
             ),
-            "lifetime_live_return_usd": float(account_equity) - float(self.principal or 0.0),
+            "lifetime_live_return_usd": (float(exchange_equity["forward_net_equity_change"]) if exchange_equity.get("forward_net_equity_change") is not None else None),
+            "lifetime_live_return_label": (
+                "comparable net-liquidatable change vs forward baseline"
+                if exchange_equity.get("forward_net_equity_change") is not None
+                else "UNKNOWN: baseline dust cannot be reconstructed; cash-only change is not total-account P&L"
+            ),
             "dust_positions": dust_list,
             "live_dust_quantity": sum(float(getattr(p, "quantity", 0) or 0) for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") == "DUST_PENDING"),
             "live_dust_value": live_dust_value,

@@ -65,10 +65,13 @@ def test_presentation_labels_dust_as_accounting_correction():
         },
         is_live=True,
         current_equity=223.92463088,
-        contributed_principal=228.06746265,
+        forward_baseline_equity=228.06746265,
         reconciliation_adjustment_usd=0.94516971,
     )
-    assert abs(cash["primary_result_usd"] - (223.92463088 - 228.06746265)) < 1e-9
-    assert "cash-identity" in cash["primary_result_label"]
+    assert cash["lifetime_contributed_capital"] == "UNKNOWN"
+    assert "not contributed principal" in cash["forward_baseline_label"]
+    assert cash["live_economic_pnl_usd"] is None
+    assert "not total-account P&L" in cash["live_economic_label"]
+    assert abs(cash["forward_cash_change_usd"] - (223.92463088 - 228.06746265)) < 1e-9
     assert abs(cash["accounting_correction_total_usd"] - (-144.07 + 0.94516971)) < 1e-9
     assert cash["paper_realized_usd"] == 973.98

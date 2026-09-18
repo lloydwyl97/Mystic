@@ -356,6 +356,7 @@ async def get_pnl_reconciliation(force: bool = False) -> dict[str, Any]:
     try:
         from backend.database_schema import DATABASE_PATH
         from backend.services.execution_mode_service import is_live_execution_allowed_sync
+        from backend.services.live_exchange_equity import equity_basis_from_db
         from backend.services.live_pnl_reconciliation import (
             account_basis_for_presentation,
             get_reconciliation,
@@ -366,10 +367,14 @@ async def get_pnl_reconciliation(force: bool = False) -> dict[str, Any]:
         ledger = {}
         try:
             conn = sqlite3.connect(f"file:{DATABASE_PATH}?mode=ro", uri=True, timeout=5)
-            row = conn.execute("SELECT principal, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
+            row = conn.execute("SELECT principal, cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
             conn.close()
             if row:
-                ledger = {"principal": float(row[0] or 0.0), "total_equity": float(row[1] or 0.0)}
+                ledger = {
+                    "principal": float(row[0] or 0.0),
+                    "cash_balance": float(row[1] or 0.0),
+                    "total_equity": float(row[2] or 0.0),
+                }
         except Exception:
             ledger = {}
         return {
@@ -380,8 +385,11 @@ async def get_pnl_reconciliation(force: bool = False) -> dict[str, Any]:
                 is_live=bool(is_live_execution_allowed_sync()),
                 **account_basis_for_presentation(
                     str(DATABASE_PATH),
-                    current_equity=float(ledger.get("total_equity") or 0.0),
-                    contributed_principal=float(ledger.get("principal") or 0.0),
+                    **equity_basis_from_db(
+                        str(DATABASE_PATH),
+                        cash_usdt=float(ledger.get("cash_balance") or ledger.get("total_equity") or 0.0),
+                        principal=float(ledger.get("principal") or 0.0),
+                    ),
                 ),
             ),
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -556,6 +564,7 @@ async def get_portfolio_performance() -> dict[str, Any]:
         # live performance.
         pnl_presentation: dict[str, Any] = {}
         try:
+            from backend.services.live_exchange_equity import equity_basis_from_db
             from backend.services.live_pnl_reconciliation import (
                 account_basis_for_presentation,
                 get_reconciliation,
@@ -570,8 +579,11 @@ async def get_portfolio_performance() -> dict[str, Any]:
                 is_live=account_execution_mode == "live",
                 **account_basis_for_presentation(
                     str(DATABASE_PATH),
-                    current_equity=total_equity,
-                    contributed_principal=principal,
+                    **equity_basis_from_db(
+                        str(DATABASE_PATH),
+                        cash_usdt=cash,
+                        principal=principal,
+                    ),
                 ),
             )
         except Exception as exc:
@@ -713,13 +725,16 @@ async def get_portfolio_status() -> dict[str, Any]:
             )
 
             _recon = await get_reconciliation(str(DATABASE_PATH), cached_only=True)
+            net_liq = status.get("net_liquidatable_equity")
             pnl_presentation = presentation_fields(
                 _recon,
                 is_live=bool(is_live_execution_allowed_sync()),
                 **account_basis_for_presentation(
                     str(DATABASE_PATH),
-                    current_equity=float(status.get("total_equity") or status.get("account_equity") or 0.0),
-                    contributed_principal=float(status.get("principal") or 0.0),
+                    current_equity=float(status.get("cash_usdt") or status.get("cash_balance") or 0.0),
+                    forward_baseline_equity=float(status.get("forward_baseline_equity") or status.get("principal") or 0.0),
+                    net_liquidatable_equity=float(net_liq) if net_liq is not None else None,
+                    baseline_dust_known=bool(status.get("baseline_dust_known")),
                 ),
             )
             status["pnl_presentation"] = pnl_presentation
