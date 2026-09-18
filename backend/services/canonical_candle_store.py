@@ -117,7 +117,7 @@ def row_from_binance_kline(kline: list[Any], *, symbol: str, interval: str, now_
         return None
     open_ms = int(kline[0])
     if not is_aligned_open_ms(open_ms, interval):
-        open_ms = align_open_ms(open_ms, interval)
+        return None
     width = interval_ms(interval)
     completed = (open_ms + width) <= int(now_ms)
     return candle_dict(
@@ -263,23 +263,53 @@ def continuity_report(
     start_ms: int,
     end_completed_ms: int,
 ) -> dict[str, Any]:
+    db_sym = db_symbol(symbol)
+    raw_open_ms: list[int] = []
+    invalid_boundary = 0
+    try:
+        with SessionLocal() as session:
+            conds = [
+                FeatureOHLCV.symbol == db_sym,
+                FeatureOHLCV.interval == interval,
+                FeatureOHLCV.ts >= open_dt_from_ms(start_ms),
+                FeatureOHLCV.ts <= open_dt_from_ms(end_completed_ms),
+            ]
+            stamps = session.execute(select(FeatureOHLCV.ts).where(and_(*conds)).order_by(asc(FeatureOHLCV.ts))).scalars().all()
+        for ts in stamps:
+            open_ms = open_ms_from_dt(ts)
+            if open_ms is None or not is_aligned_open_ms(open_ms, interval):
+                invalid_boundary += 1
+                continue
+            raw_open_ms.append(int(open_ms))
+    except Exception as exc:
+        logger.debug("continuity raw-timestamp scan failed %s %s: %s", symbol, interval, exc)
+        raw_open_ms = []
+        invalid_boundary = 0
     rows = load_aligned_candles(symbol, interval, start_ms=start_ms, end_ms=end_completed_ms)
     have = [int(r["open_ms"]) for r in rows]
+    if not raw_open_ms:
+        raw_open_ms = list(have)
     expected = expected_open_ms_range(start_ms, end_completed_ms, interval)
     have_set = set(have)
     missing = [ts for ts in expected if ts not in have_set]
     extra = [ts for ts in have if ts not in set(expected)]
-    duplicates = len(have) - len(have_set)
+    duplicates = len(raw_open_ms) - len(set(raw_open_ms))
     out_of_order = sum(1 for i in range(1, len(have)) if have[i] < have[i - 1])
     latest = rows[-1] if rows else None
     return {
         "symbol": api_symbol(symbol),
         "interval": interval,
         "row_count": len(rows),
+        "unique_count": len(have_set),
         "expected_count": len(expected),
+        "expected_first_ms": expected[0] if expected else None,
+        "expected_last_ms": expected[-1] if expected else None,
+        "actual_first_ms": have[0] if have else None,
+        "actual_last_ms": have[-1] if have else None,
         "missing_count": len(missing),
         "missing_timestamps": missing[:50],
         "duplicate_count": duplicates,
+        "invalid_boundary_count": invalid_boundary,
         "out_of_order_count": out_of_order,
         "extra_unaligned_or_outside": extra[:20],
         "oldest_open_ms": have[0] if have else None,

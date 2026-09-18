@@ -236,33 +236,30 @@ def test_allow_rebuy_after_non_profit_exit():
 
 
 def test_intact_trend_profit_floor_scales_with_structural_risk():
-    """A wider 4H structure means more risk carried, so more profit is required."""
+    """4H cannot change the live profit floor."""
     tight = day_intact_profit_floor(entry_price=100.0, prior_4h_low=99.0, min_net_profit=0.001)
     wide = day_intact_profit_floor(entry_price=100.0, prior_4h_low=95.0, min_net_profit=0.001)
-    assert wide > tight
+    assert tight == wide
 
 
 def test_intact_trend_profit_floor_never_degrades_into_a_scalp_clip():
-    """The original goal stands: DAY must not clip tiny profits on a live rise."""
     floor = day_intact_profit_floor(entry_price=100.0, prior_4h_low=99.9, min_net_profit=0.004)
     assert floor >= 0.008
 
 
 def test_intact_trend_profit_floor_is_capped_so_profit_stays_reachable():
-    """A distant 4H low must not put profit-taking permanently out of reach."""
     floor = day_intact_profit_floor(entry_price=100.0, prior_4h_low=50.0, min_net_profit=0.004)
     assert floor <= 0.025
 
 
 def test_small_gain_on_intact_trend_still_holds():
     floor = day_intact_profit_floor(entry_price=91.32, prior_4h_low=89.94, min_net_profit=0.005)
-    assert floor > 0.003561  # live SOL: +0.36% must not trigger a clip
+    assert floor > 0.003561
 
 
 def test_large_gain_on_intact_trend_now_takes_profit():
-    """Regression guard: profit was previously unreachable until the trend broke."""
     floor = day_intact_profit_floor(entry_price=1.3781, prior_4h_low=1.3157, min_net_profit=0.003)
-    assert floor <= 0.024626  # live XRP: +2.46% must be bookable while 4H is intact
+    assert floor <= 0.024626
 
 
 def test_profit_is_not_gated_behind_structure_break_in_source():

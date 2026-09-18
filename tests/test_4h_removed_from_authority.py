@@ -143,8 +143,38 @@ class TestAllCoinsLive:
     def test_all_four_in_coin_profiles(self):
         from backend.services.portfolio_engine import COIN_PROFILES
 
+        shared = {"tp": 0.014, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300}
         for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"):
             assert sym in COIN_PROFILES, f"{sym} missing from COIN_PROFILES"
+            assert COIN_PROFILES[sym] == shared
+
+    def test_rank_score_ignores_4h_payload_fields(self):
+        from backend.services.portfolio_engine import BuyCandidate
+
+        kwargs = {
+            "symbol": "BTCUSDT",
+            "confidence": 0.72,
+            "trend_score": 0.5,
+            "chop_score": 0.1,
+            "coin_edge_score": 0.0,
+            "volatility_penalty": 0.0,
+            "spread_penalty": 0.0,
+            "atr": 1.0,
+            "current_price": 100.0,
+            "decision_data": {"buy_margin": 0.04, "thesis_rank_delta": 0.01},
+        }
+        a = BuyCandidate(**kwargs)
+        kwargs["decision_data"] = {
+            "buy_margin": 0.04,
+            "thesis_rank_delta": 0.01,
+            "htf_4h_rise_broken": True,
+            "prior_4h_low": 1.0,
+            "4h_close": 0.5,
+            "late_4h_rank_delta": -0.04,
+            "htf_anchor_rank_delta": -0.10,
+        }
+        b = BuyCandidate(**kwargs)
+        assert a.rank_score() == b.rank_score()
 
 
 # ---------------------------------------------------------------------------

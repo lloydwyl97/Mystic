@@ -338,12 +338,11 @@ def _symbol_group_baseline(group: str) -> float:
 # these via evaluate_engine_managed_exit (see _check_exit_conditions).
 # =============================================================================
 COIN_PROFILES = {
-    # Session day-trade ceilings (hours, not sub-hour churn).
-    # New stamps use these; evaluate_engine_managed_exit also floors open holds
-    # to the current profile so restarts pick up longer day-trade horizons.
-    "BTCUSDT": {"tp": 0.012, "sl": 0.008, "trail": 0.0020, "max_hold_min": 360},
-    "ETHUSDT": {"tp": 0.013, "sl": 0.009, "trail": 0.0020, "max_hold_min": 360},
-    "SOLUSDT": {"tp": 0.015, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
+    # Uniform day-trade parameters for all four symbols. This is the only
+    # production authority — no per-coin trail/hold overrides.
+    "BTCUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
+    "ETHUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
+    "SOLUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
     "XRPUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
 }
 
@@ -397,8 +396,8 @@ def compute_entry_distance_pct(symbol: str, atr: float, price: float) -> float:
 
     This is the same floor `_evaluate_path_aware_exit` enforces via
     `DAY_RISK_FLOOR_EXIT`, so the stamped ``stop_price`` is a real level rather
-    than decoration. Once a position is open the floor also tracks 4H structure
-    and can only widen from here, bounded by DAY_RISK_FLOOR_MAX_ADVERSE_PCT.
+    than decoration.     Once a position is open the floor can only widen from here,
+    bounded by DAY_RISK_FLOOR_MAX_ADVERSE_PCT. 4H is not an input.
     """
     from backend.services.day_trade_thesis import resolve_day_risk_floor_price
 
@@ -414,20 +413,11 @@ def compute_entry_distance_pct(symbol: str, atr: float, price: float) -> float:
 
 
 def day_intact_profit_floor(*, entry_price: float, prior_4h_low: float, min_net_profit: float) -> float:
-    """Net profit required to close a DAY position while the 4H rise is still intact.
-
-    Scaled to the structural risk the position is carrying, so closing a live
-    trend costs a gain worth having. Bounded below so it can never decay into a
-    scalp clip, and above so a distant 4H low cannot put profit out of reach.
-    """
-    r_mult = float(os.getenv("DAY_INTACT_PROFIT_R_MULT", "0.5"))
+    """Compatibility helper. 4H cannot raise or suppress the live profit floor."""
+    _ = (entry_price, prior_4h_low)
     floor_min_mult = float(os.getenv("DAY_INTACT_PROFIT_FLOOR_MIN_MULT", "2.0"))
     floor_max = float(os.getenv("DAY_INTACT_PROFIT_FLOOR_MAX_PCT", "0.025"))
-
-    entry = float(entry_price or 0.0)
-    low = float(prior_4h_low or 0.0)
-    structural_r = (entry - low) / entry if entry > 0 and 0.0 < low < entry else 0.0
-    return max(float(min_net_profit) * floor_min_mult, min(structural_r * r_mult, floor_max))
+    return min(max(float(min_net_profit) * floor_min_mult, float(min_net_profit)), floor_max)
 
 
 def compute_position_risk_usd(quantity: float, entry_price: float, stop_price: float) -> float:
@@ -2247,6 +2237,8 @@ class PortfolioEngine:
         self._fifo_sell_lock: asyncio.Lock = asyncio.Lock()
         # Single-flight buy lock per symbol — prevents paired duplicate paper_trades rows
         self._buy_execution_locks: dict[str, asyncio.Lock] = {}
+        self._sell_execution_locks: dict[str, asyncio.Lock] = {}
+        self._dust_writeoff_seen: dict[str, float] = {}
         # Global cash lock — prevents cross-symbol overdraw (two symbols passing cash check then both debiting)
         self._global_cash_lock: asyncio.Lock = asyncio.Lock()
 
@@ -2656,9 +2648,8 @@ class PortfolioEngine:
 
             old_principal = self.principal
             old_cash = self.cash_balance
-
-            # Calculate total account value: FREE USDT + positions value (available to trade)
-            new_principal = usdt_balance + self._positions_value
+            new_equity = usdt_balance + self._positions_value
+            _ = (old_principal, new_equity)
 
             # CRITICAL: Use FREE USDT so free_usdt in governor matches Binance US "free" balance
             self.cash_balance = usdt_balance
@@ -2667,12 +2658,11 @@ class PortfolioEngine:
             # Log cash balance update (always)
             if abs(self.cash_balance - old_cash) > 0.01:
                 logger.info(f"CASH_BALANCE_SYNC: Updated from ${old_cash:.2f} → ${self.cash_balance:.2f}")
-
-            # Only update principal if significantly different (avoid micro-adjustments)
-            if abs(new_principal - old_principal) > 1.0:
-                logger.warning(
-                    f"PRINCIPAL_SYNC: Updated principal from Binance US old=${old_principal:.2f} → new=${new_principal:.2f} (USDT=${usdt_balance:.2f} + positions=${self._positions_value:.2f})"
-                )
+            logger.info(
+                "PRINCIPAL_SYNC: contributed principal left unchanged at $%.8f; exchange equity=$%.8f",
+                old_principal,
+                new_equity,
+            )
 
             # Recompute total_equity = cash + positions_value (do not leave stale)
             await self._recompute_positions_values()
@@ -2684,7 +2674,11 @@ class PortfolioEngine:
                     self._account_status = AccountStatus.HEALTHY
                     logger.info("PRINCIPAL_SYNC: Account status changed to HEALTHY after principal update")
             else:
-                logger.info(f"PRINCIPAL_SYNC: Principal unchanged (Binance=${new_principal:.2f}, current=${old_principal:.2f})")
+                logger.info(
+                    "PRINCIPAL_SYNC: Principal unchanged (exchange_equity=$%.8f, current=$%.8f)",
+                    new_equity,
+                    old_principal,
+                )
 
             return True
 
@@ -2783,9 +2777,8 @@ class PortfolioEngine:
             usdt_free = float(free_balances.get("USDT", 0) or 0)
             self.cash_balance = usdt_free
             self._available_balance = max(0.0, usdt_free)
-            # Recompute equity with fresh Binance cash (canonical: equity = cash + positions)
+            # Recompute equity with fresh Binance cash. Never overwrite contributed principal.
             self._total_equity = self.cash_balance + self._positions_value
-            self.principal = self._total_equity
             await self._persist_ledger_to_sqlite()
             self._compute_total_open_risk()
             self._last_live_reconcile_time = time.time()
@@ -3075,6 +3068,30 @@ class PortfolioEngine:
             pass
         return None
 
+    def realized_pnl_by_mode(self) -> dict[str, float]:
+        """Realized PnL split by execution mode. Never sums paper into live."""
+        out = {"paper": 0.0, "live": 0.0}
+        try:
+            with connect_rw(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT COALESCE(LOWER(mode), 'paper') AS m, COALESCE(SUM(pnl), 0.0)
+                    FROM paper_trades
+                    WHERE side='SELL' AND pnl IS NOT NULL
+                      AND COALESCE(exit_type, '') NOT IN (
+                        'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
+                        'RESEARCH_RESET_EXIT', 'DUST_WRITEOFF'
+                      )
+                      AND COALESCE(is_synthetic, 0) = 0
+                    GROUP BY 1
+                    """
+                ).fetchall()
+            for m, total in rows:
+                out[str(m or "paper")] = float(total or 0.0)
+        except Exception as e:
+            logger.error("REALIZED_PNL_BY_MODE_FAILED: %s", e)
+        return out
+
     def _compute_realized_pnl_from_paper_trades(self, *, forward_epoch_only: bool | None = None) -> float:
         """
         CANONICAL SOURCE: Compute realized PnL directly from paper_trades table.
@@ -3096,10 +3113,12 @@ class PortfolioEngine:
                       )
                       AND COALESCE(is_synthetic, 0) = 0
                 """
-                params: tuple[Any, ...] = ()
+                mode = "live" if getattr(self, "_live_execution_enabled", False) else "paper"
+                sql += " AND COALESCE(LOWER(mode), 'paper') = ?"
+                params: tuple[Any, ...] = (mode,)
                 if forward_epoch_only and epoch_start:
                     sql += " AND timestamp >= ?"
-                    params = (epoch_start,)
+                    params = (mode, epoch_start)
                 cursor.execute(sql, params)
                 result = cursor.fetchone()
                 realized = float(result[0]) if result and result[0] is not None else 0.0
@@ -6255,7 +6274,9 @@ class PortfolioEngine:
         from backend.services.live_recovered_close_writer import RecoveredCloseFill, persist_recovered_close
 
         sym = normalize_symbol(symbol)
-        exchange_order_id = str(fill.get("trade_id") or "").strip()
+        exchange_order_id = str(fill.get("trade_id") or "") or None
+        if exchange_order_id:
+            exchange_order_id = str(exchange_order_id).strip()
         if not exchange_order_id:
             return {"skipped": True, "reason": "missing_exchange_order_id"}
         exit_price = fill.get("exit_price")
@@ -6511,8 +6532,8 @@ class PortfolioEngine:
                     """INSERT INTO paper_trades (
                         trade_id, paper_run_id, mode, symbol, side, quantity, price,
                         entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
-                        fees_paid, slippage_cost, exit_type, exit_reason, timestamp, status, strategy_id
-                    ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, 0, 'HUMAN_MANUAL_SELL', 'HUMAN_MANUAL_SELL', ?, 'executed', ?)""",
+                        fees_paid, slippage_cost, exit_type, exit_reason, timestamp, status, strategy_id, order_id
+                    ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, 0, 'HUMAN_MANUAL_SELL', 'HUMAN_MANUAL_SELL', ?, 'executed', ?, ?)""",
                     (
                         sell_trade_id,
                         paper_run_id,
@@ -6527,6 +6548,7 @@ class PortfolioEngine:
                         fee,
                         timestamp,
                         sid,
+                        str(fill.get("trade_id") or "") or None,
                     ),
                 )
                 if buy_tid:
@@ -9232,55 +9254,6 @@ class PortfolioEngine:
         except Exception:
             _ctx_snapshot = "{}"
 
-        def _sync_insert():
-            def _op() -> None:
-                with connect_rw(self.db_path) as conn:
-                    conn.execute("BEGIN IMMEDIATE")
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        """
-                        INSERT INTO paper_trades (
-                            trade_id, paper_run_id, mode, symbol, side, quantity, price,
-                            remaining_position, stop_price, take_profit_price,
-                            atr_at_entry, entry_bar_timestamp, confidence,
-                            fees_paid, slippage_cost, timestamp, status,
-                            explainability_json, diagnostics_json, sleeve,
-                            entry_timestamp, decision_id, strategy_id, context_snapshot_json
-                        ) VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                        (
-                            trade_id,
-                            paper_run_id,
-                            buy_mode,
-                            symbol,
-                            quantity,
-                            fill_price,
-                            quantity,  # remaining_position = full quantity
-                            stop_price,
-                            tp1_price,
-                            atr,
-                            bar_timestamp,
-                            confidence,
-                            fee,
-                            slippage_cost,  # ACCOUNTING REPAIR: total cost, not price delta
-                            timestamp,
-                            json.dumps(explainability.to_dict()),
-                            json.dumps(protected_audit),
-                            effective_sleeve,
-                            timestamp,
-                            decision_id or None,
-                            buy_strategy_id,
-                            _ctx_snapshot,
-                        ),
-                    )
-                    conn.commit()
-
-            try:
-                run_locked_retry(_op)
-            except Exception as e:
-                logger.error(f"PAPER_TRADES_BUY_INSERT_FAILED: {symbol} - {e}", exc_info=True)
-                raise  # PE-2: fail-closed — propagate so cash is NOT debited
-
         # =================================================================
         # LIVE EXECUTION: Execute on Binance.US FIRST (C1 fix: never persist executed BUY before order success)
         # LiveAdapter gate: refuse unless EXECUTION_MODE=live AND LIVE_TRADES_ALLOWED=true
@@ -9377,6 +9350,49 @@ class PortfolioEngine:
                     fee,
                     comm.fee_from_exchange,
                 )
+                try:
+                    from backend.services.live_order_identity import extract_identity, record_fill
+
+                    _identity = extract_identity(
+                        live_order_buy,
+                        symbol=symbol,
+                        side="BUY",
+                        mystic_trade_id=str(trade_id or ""),
+                        intent_id=str(trailing_buy_intent_id or ""),
+                        decision_id=str(decision_id or ""),
+                        client_order_id=str(client_order_id or ""),
+                        fallback_qty=float(quantity),
+                        fallback_price=float(fill_price),
+                        fee_amount=float(fee),
+                        fee_items=list(getattr(comm, "items", ()) or ()),
+                        fee_from_exchange=bool(comm.fee_from_exchange),
+                    )
+                    await asyncio.to_thread(record_fill, self.db_path, _identity)
+                except Exception:
+                    logger.exception(
+                        "LIVE_BUY_IDENTITY_RECORD_FAILED symbol=%s order=%s trade=%s",
+                        symbol,
+                        live_order_buy.get("id"),
+                        trade_id,
+                    )
+                if trailing_buy_intent_id:
+                    try:
+                        from backend.services.day_trailing_buy_store import mark_order_accepted as _mark_accepted
+
+                        await asyncio.to_thread(
+                            _mark_accepted,
+                            self.db_path,
+                            str(trailing_buy_intent_id),
+                            order_id=str(live_order_buy.get("id") or ""),
+                            fill_id=str(live_order_buy.get("fill_id") or ""),
+                            trade_id=str(trade_id or ""),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "TRAILING_BUY_ACCEPT_STAMP_FAILED intent=%s order=%s — retry guard not armed",
+                            trailing_buy_intent_id,
+                            live_order_buy.get("id"),
+                        )
             except Exception as e:
                 logger.exception(f"LIVE_BUY_ERROR: {symbol} - {e}")
                 await self._record_reject(
@@ -10280,6 +10296,33 @@ class PortfolioEngine:
         current_bar: int | None = None,
         force_sell: bool = False,
     ) -> dict[str, Any] | None:
+        """Serialize sells per symbol, then run the FIFO sell."""
+        locks = getattr(self, "_sell_execution_locks", None)
+        if locks is None:
+            self._sell_execution_locks = {}
+            locks = self._sell_execution_locks
+        lock = locks.setdefault(normalize_symbol(symbol), asyncio.Lock())
+        async with lock:
+            return await self._execute_sell_fifo_locked(
+                symbol,
+                quantity,
+                price,
+                exit_type,
+                exit_trigger,
+                current_bar=current_bar,
+                force_sell=force_sell,
+            )
+
+    async def _execute_sell_fifo_locked(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        exit_type: ExitType,
+        exit_trigger: str,
+        current_bar: int | None = None,
+        force_sell: bool = False,
+    ) -> dict[str, Any] | None:
         """
         PHASE 1: Execute SELL with FIFO matching against BUY lots.
         Decrements remaining_position on matched BUY rows.
@@ -10872,8 +10915,8 @@ class PortfolioEngine:
                                 fees_paid, slippage_cost, exit_type, exit_r_multiple,
                                 timestamp, status, explainability_json, diagnostics_json, sleeve,
                                 exit_reason, entry_timestamp, decision_id, strategy_id,
-                                pnl_usd_net, pnl_pct_net
-                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                pnl_usd_net, pnl_pct_net, order_id
+                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                             (
                                 sell_trade_id,
@@ -10901,6 +10944,7 @@ class PortfolioEngine:
                                 sell_strategy_id,
                                 pnl_usd_net,
                                 pnl_pct_net,
+                                str((live_order_sell or {}).get("id") or "") or None,
                             ),
                         )
                     else:
@@ -10911,8 +10955,8 @@ class PortfolioEngine:
                                 entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
                                 fees_paid, slippage_cost, exit_type, exit_r_multiple,
                                 timestamp, status, explainability_json, diagnostics_json, sleeve,
-                                exit_reason, entry_timestamp, decision_id, strategy_id
-                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                exit_reason, entry_timestamp, decision_id, strategy_id, order_id
+                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                             (
                                 sell_trade_id,
@@ -10938,6 +10982,7 @@ class PortfolioEngine:
                                 entry_ts_bind or None,
                                 buy_decision_id or None,
                                 sell_strategy_id,
+                                str((live_order_sell or {}).get("id") or "") or None,
                             ),
                         )
 
@@ -11136,6 +11181,15 @@ class PortfolioEngine:
                     actual_sold_qty = qty_quantized
                     dust_reason_str = dust_reason
                     dust_est_notional_val = est_notional
+                    seen = getattr(self, "_dust_writeoff_seen", None)
+                    if seen is None:
+                        self._dust_writeoff_seen = {}
+                        seen = self._dust_writeoff_seen
+                    dust_key = f"{normalized_symbol}:{float(position.quantity):.12g}"
+                    if dust_key in seen:
+                        logger.warning("DUST_WRITEOFF_ALREADY_BOOKED symbol=%s qty=%s", symbol, actual_sold_qty)
+                        return None
+                    seen[dust_key] = time.time()
                     logger.warning(
                         "LIVE_SELL_DUST_WRITEOFF symbol=%s qty=%s reason=%s est_notional=%s",
                         symbol,
@@ -11363,6 +11417,15 @@ class PortfolioEngine:
                 actual_sold_qty = qty_quantized
                 dust_reason_str = dust_reason
                 dust_est_notional_val = est_notional
+                seen = getattr(self, "_dust_writeoff_seen", None)
+                if seen is None:
+                    self._dust_writeoff_seen = {}
+                    seen = self._dust_writeoff_seen
+                dust_key = f"{normalized_symbol}:{float(position.quantity):.12g}"
+                if dust_key in seen:
+                    logger.warning("DUST_WRITEOFF_ALREADY_BOOKED symbol=%s qty=%s", symbol, actual_sold_qty)
+                    return None
+                seen[dust_key] = time.time()
                 logger.info(
                     "PAPER_SELL_DUST_WRITEOFF symbol=%s qty=%s reason=%s est_notional=%s",
                     symbol,
@@ -11515,6 +11578,27 @@ class PortfolioEngine:
         sell_sqlite_ok = False
         self._exit_in_progress.add(normalized_symbol)
         try:
+            if live_order_sell and not dust_writeoff:
+                try:
+                    from backend.services.live_order_identity import extract_identity, record_fill
+
+                    _sell_identity = extract_identity(
+                        live_order_sell,
+                        symbol=symbol,
+                        side="SELL",
+                        mystic_trade_id=str(getattr(position, "trade_id", "") or ""),
+                        decision_id=str(getattr(position, "decision_id", "") or ""),
+                        fallback_qty=float(quantity),
+                        fallback_price=float(fill_price),
+                    )
+                    await asyncio.to_thread(record_fill, self.db_path, _sell_identity)
+                except Exception:
+                    logger.exception(
+                        "LIVE_SELL_IDENTITY_RECORD_FAILED symbol=%s order=%s trade=%s",
+                        symbol,
+                        (live_order_sell or {}).get("id"),
+                        getattr(position, "trade_id", ""),
+                    )
             # =================================================================
             # BUG #10 FIX: Acquire FIFO sell lock to prevent concurrent sells of same position
             async with self._fifo_sell_lock:
@@ -11972,6 +12056,12 @@ class PortfolioEngine:
                 pending_syms = {str(s) for s in pending() or []}
             except Exception:
                 pending_syms = set()
+        try:
+            pending_syms |= {str(s) for s in self._pending_buy_order_symbols()}
+        except Exception:
+            pass
+        reservations = getattr(self, "_entry_reservations", None) or {}
+        pending_syms |= {str(s) for s in reservations}
         open_syms = {str(s) for s, p in self.open_positions.items() if str(getattr(p, "status", "ACTIVE") or "") != "DUST_PENDING"}
         n += len(pending_syms - open_syms)
         return n
@@ -18337,6 +18427,29 @@ class PortfolioEngine:
         except Exception:
             return []
 
+    def _forward_scorecard_baseline_payload(self, account_equity: float) -> dict[str, Any]:
+        """Persist marked equity once as a forward baseline. Never overwrite principal."""
+        from backend.services.live_account_basis import load_operational_json, persist_operational_json
+
+        key = "forward_scorecard_baseline"
+        existing = {}
+        try:
+            existing = load_operational_json(str(self.db_path), key) or {}
+        except Exception:
+            existing = {}
+        if existing.get("equity") not in (None, ""):
+            return existing
+        payload = {
+            "equity": f"{float(account_equity):.8f}",
+            "principal_unchanged": f"{float(self.principal):.8f}",
+            "note": "forward marked-equity baseline; not contributed principal",
+        }
+        try:
+            persist_operational_json(str(self.db_path), key, payload)
+        except Exception:
+            pass
+        return payload
+
     def get_portfolio_status(self) -> dict[str, Any]:
         """
         Get full portfolio status for observability.
@@ -18539,6 +18652,20 @@ class PortfolioEngine:
             "sleeve_cutover": self.get_sleeve_cutover() if SLEEVE_ENABLED else None,
             # Explicit active router/sleeve state for the open book (never None for reporting)
             "active_sleeve_state": self._get_active_sleeve_state(),
+            "entry_reservations": [
+                {
+                    "symbol": str(sym),
+                    "decision_id": str((row or {}).get("decision_id") or ""),
+                    "notional": float((row or {}).get("notional") or 0.0),
+                    "sleeve": str((row or {}).get("sleeve") or ""),
+                }
+                for sym, row in (getattr(self, "_entry_reservations", None) or {}).items()
+            ],
+            "reservations_count": len(getattr(self, "_entry_reservations", None) or {}),
+            "day_mode_display": "DAY LIVE",
+            "scalp_mode_display": "SCALP PAPER",
+            "operator_mode_labels": {"day": "DAY LIVE", "scalp": "SCALP PAPER"},
+            "forward_scorecard_baseline": self._forward_scorecard_baseline_payload(account_equity),
             **get_live_test_api_fields(),
         }
 
@@ -21726,7 +21853,12 @@ class PortfolioEngine:
             "cash_balance": round(self.cash_balance, 2),
             "positions_value": round(self._positions_value, 2),
             "total_equity": round(self._total_equity, 2),
-            "open_positions_count": len(self.open_positions),
+            "open_positions_count": self._count_live_slots(),
+            "slots_used": self._count_live_slots(),
+            "reservations_count": len(getattr(self, "_entry_reservations", None) or {}),
+            "day_mode_display": "DAY LIVE",
+            "scalp_mode_display": "SCALP PAPER",
+            "operator_mode_labels": {"day": "DAY LIVE", "scalp": "SCALP PAPER"},
             "max_positions": get_max_open_positions(),
             "total_open_risk": round(self._total_open_risk, 2),
             "open_risk_pct": round(risk_pct, 2),

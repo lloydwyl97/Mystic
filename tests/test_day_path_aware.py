@@ -300,9 +300,9 @@ def test_stamped_stop_equals_enforced_floor():
 
 
 def test_day_exit_policy_defaults_to_path_aware(monkeypatch):
-    """With 4H gate disabled, default is now False when env is unset."""
+    """Non-4H path-aware ladder is the default; env cannot restore 4H."""
     monkeypatch.delenv("DAY_PATH_AWARE_EXIT", raising=False)
-    assert _path_aware_exit_enabled() is False
+    assert _path_aware_exit_enabled() is True
 
 
 def test_only_structure_break_and_extreme_may_full_flatten():

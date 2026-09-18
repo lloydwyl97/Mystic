@@ -127,7 +127,12 @@ def refresh_sec(interval: str) -> int:
 
 def align_open_ms(ts_ms: int, interval: str) -> int:
     width = interval_ms(interval)
-    return (int(ts_ms) // width) * width
+    ts = int(ts_ms)
+    if interval == "1w":
+        # Binance.US weekly klines open Monday 00:00 UTC. Unix epoch is Thursday.
+        monday0 = -3 * 86_400_000
+        return monday0 + ((ts - monday0) // width) * width
+    return (ts // width) * width
 
 
 def is_supported_interval(interval: str) -> bool:

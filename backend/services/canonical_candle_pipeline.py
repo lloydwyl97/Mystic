@@ -270,8 +270,17 @@ class CanonicalCandlePipeline:
                     await self.refresh_live(symbol, interval)
                 except Exception as exc:
                     logger.warning("hydrate live refresh failed %s %s: %s", symbol, interval, exc)
-        self._hydrate_done = True
-        logger.info("canonical candle live streams published; historical backfill continuing")
+        logger.info("canonical candle live streams published; historical identity rebuild continuing")
+        from backend.services.canonical_candle_store import delete_unaligned_persist_now_rows
+
+        for symbol in symbols:
+            for interval in CANONICAL_CANDLE_INTERVALS:
+                try:
+                    removed = delete_unaligned_persist_now_rows(symbol, interval)
+                    if removed:
+                        logger.info("purged persist-now rows symbol=%s interval=%s count=%s", symbol, interval, removed)
+                except Exception as exc:
+                    logger.warning("persist-now purge failed %s %s: %s", symbol, interval, exc)
         for symbol in symbols:
             end_ms = self._completed_open_ms("1m")
             result = await self.backfill_range(symbol, "1m", start_ms, end_ms)
@@ -291,7 +300,22 @@ class CanonicalCandlePipeline:
                     await self.publish_redis(symbol, interval, aggregated[-200:], None)
                 out["streams"].append({"symbol": symbol, "interval": interval, "aggregated": len(aggregated)})
                 await asyncio.sleep(0.05)
+        out["full_history"] = await self.full_history_integrity(symbols)
+        self._hydrate_done = True
         return out
+
+    async def full_history_integrity(self, symbols: list[str] | None = None) -> list[dict[str, Any]]:
+        """One complete unique-bucket continuity pass from retained start to last closed candle."""
+        symbols = symbols or list(CANONICAL_SYMBOLS)
+        start_ms = self.canonical_start_ms()
+        rows = []
+        for symbol in symbols:
+            for interval in CANONICAL_CANDLE_INTERVALS:
+                end_ms = self._completed_open_ms(interval)
+                await self.repair_gaps(symbol, interval, start_ms, end_ms)
+                rows.append(await self.write_integrity(symbol, interval, start_ms=start_ms))
+                await asyncio.sleep(0.05)
+        return rows
 
     async def refresh_live(self, symbol: str, interval: str) -> dict[str, Any]:
         klines = await self.fetch_binance(symbol, interval, limit=3)
@@ -303,7 +327,7 @@ class CanonicalCandlePipeline:
         return ingested
 
     async def write_integrity(self, symbol: str, interval: str, *, start_ms: int | None = None) -> dict[str, Any]:
-        start = int(start_ms if start_ms is not None else self._recent_window_start_ms(interval))
+        start = int(start_ms if start_ms is not None else self.canonical_start_ms())
         end_ms = self._completed_open_ms(interval)
         report = continuity_report(symbol, interval, start_ms=start, end_completed_ms=end_ms)
         now = time.time()

@@ -74,7 +74,7 @@ def _path_aware_exit_enabled() -> bool:
     risk floor, extreme). ``DAY_PATH_AWARE_EXIT`` cannot restore 4H authority.
     """
     raw = os.getenv("DAY_PATH_AWARE_EXIT")
-    enabled = (raw if raw is not None else "false").strip().lower() in {"1", "true", "yes", "on"}
+    enabled = (raw if raw is not None else "true").strip().lower() in {"1", "true", "yes", "on"}
     global _exit_policy_logged
     if not _exit_policy_logged:
         _exit_policy_logged = True
@@ -882,9 +882,28 @@ def _break_even_trigger_pct() -> float:
     return float(os.getenv("DAY_BREAK_EVEN_TRIGGER_PCT", "0.0015"))
 
 
-def _break_even_offset_pct() -> float:
-    """After trigger, stop = entry * (1 + offset). Default +0.05% to cover exit slippage."""
-    return float(os.getenv("DAY_BREAK_EVEN_OFFSET_PCT", "0.0005"))
+def _break_even_offset_pct(symbol: str = "") -> float:
+    """After trigger, stop = entry * (1 + offset).
+
+    The offset must cover the honest round-trip for this symbol.
+    """
+    configured = float(os.getenv("DAY_BREAK_EVEN_OFFSET_PCT", "0.0005"))
+    if not symbol:
+        return configured
+    from backend.config.execution_cost_model import honest_all_in_rt_pct
+
+    return max(configured, honest_all_in_rt_pct(symbol))
+
+
+def _trail_activation_price(*, entry: float, trail_distance: float, symbol: str = "") -> float:
+    """Lowest high-water mark whose trail ratchet is profitable after costs."""
+    if entry <= 0:
+        return 0.0
+    d = max(0.0, min(0.99, float(trail_distance or 0.0)))
+    from backend.config.execution_cost_model import honest_all_in_rt_pct
+
+    cost = honest_all_in_rt_pct(symbol) if symbol else 0.0
+    return entry * (1.0 + cost) / (1.0 - d)
 
 
 def _mfe_trail_tier_1_pct() -> float:
@@ -939,7 +958,7 @@ def apply_break_even_and_mfe_trail(position: Any, current_price: float) -> bool:
 
     trigger = _break_even_trigger_pct()
     if mfe_pct + 1e-12 >= trigger:
-        be_stop = entry * (1.0 + _break_even_offset_pct())
+        be_stop = entry * (1.0 + _break_even_offset_pct(str(getattr(position, "symbol", "") or "")))
         current_stop = float(getattr(position, "stop_price", 0.0) or 0.0)
         if be_stop > current_stop + 1e-12:
             position.stop_price = be_stop
@@ -1003,7 +1022,11 @@ def _trail_semantics(
     """
     highest = float(getattr(position, "highest_price", entry) or entry)
     trail_distance = float(getattr(position, "trail_pct", 0.0) or coin_profile.get("trail") or 0.005)
-    trail_activation = entry * (1.0 + trail_distance) if entry > 0 else 0.0
+    trail_activation = _trail_activation_price(
+        entry=entry,
+        trail_distance=trail_distance,
+        symbol=str(getattr(position, "symbol", "") or ""),
+    )
     ratchet = float(getattr(position, "trailing_stop_price", 0.0) or 0.0)
     activated = bool(entry > 0 and highest >= trail_activation - 1e-12)
     executable_trail = ratchet if activated and ratchet > 0 else None

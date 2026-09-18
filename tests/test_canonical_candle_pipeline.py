@@ -21,6 +21,7 @@ from backend.services.canonical_candle_store import (
     aggregate_exact_from_1m,
     candle_dict,
     expected_open_ms_range,
+    is_aligned_open_ms,
     refuse_research_table_read,
     row_from_binance_kline,
 )
@@ -34,8 +35,16 @@ def _kline(open_ms: int, o=100.0, h=101.0, low=99.0, c=100.5, v=1.25) -> list:
 def test_utc_alignment_every_interval(interval: str):
     raw = 1_700_000_123_456
     aligned = align_open_ms(raw, interval)
-    assert aligned % interval_ms(interval) == 0
+    assert aligned == align_open_ms(aligned, interval)
     assert aligned <= raw
+    if interval == "1w":
+        from datetime import datetime, timezone
+
+        dt = datetime.fromtimestamp(aligned / 1000.0, tz=timezone.utc)
+        assert dt.weekday() == 0
+        assert dt.hour == 0
+    else:
+        assert aligned % interval_ms(interval) == 0
 
 
 def test_zero_volume_legitimate_candle_is_kept():
@@ -73,6 +82,16 @@ def test_3m_aggregation_requires_exact_three_1m():
     assert out[0]["volume"] == 6
     missing = bars[:2]
     assert aggregate_exact_from_1m(missing, "3m") == []
+
+
+def test_persist_now_is_never_candle_identity():
+    now = 1_700_000_123_456
+    assert is_aligned_open_ms(now, "1m") is False
+    aligned = align_open_ms(now, "1m")
+    assert aligned != now
+    assert is_aligned_open_ms(aligned, "1m") is True
+    row = row_from_binance_kline(_kline(now), symbol="BTCUSDT", interval="1m", now_ms=now + 60_000)
+    assert row is None
 
 
 def test_expected_range_has_no_lookahead():

@@ -18,10 +18,10 @@ TIMEFRAME_CONSUMER_MATRIX: Final[dict[str, dict[str, str]]] = {
         "notes": "Fresh executable bid/ask. No candle substitution.",
     },
     "ranking": {
-        "timeframe": "DAY bundle 1m/5m/15m/30m/1h/4h/8h/12h/1d/1w + optional 3m cache",
-        "source": "day_active_market_bundle via canonical store/REST",
+        "timeframe": "BuyCandidate.rank_score: confidence + buy-margin + non-4H thesis_rank_delta",
+        "source": "ranked-candidate stream → trailing buy; 4H bundle fields are schema/telemetry only",
         "completed_only": "yes for candle-shape features",
-        "notes": "4H in the bundle is TELEMETRY_ONLY_NO_TRADE_AUTHORITY.",
+        "notes": "rank_score does not read 4h. 4H context dims stay in the artifact vector for compatibility and have no live rank/order authority.",
     },
     "candle_shape_body_wick": {
         "timeframe": "15m",
