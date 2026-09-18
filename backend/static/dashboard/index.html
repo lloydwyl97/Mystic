@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=41">
+    <link rel="stylesheet" href="style.css?v=42">
 </head>
 <body>
     <!-- Feature 4: Restart Required Banner -->
@@ -73,6 +73,44 @@
                 <div class="status-item"><button id="btn-sync-binance" class="operator-form__btn" style="font-size:12px;padding:4px 10px">Sync Now</button></div>
             </section>
         </div>
+
+        <section class="widget widget--full" id="canonical-candle-widget" aria-label="Canonical market candles">
+            <h2 class="widget__title">Market candles</h2>
+            <p class="widget__subtitle">Canonical Binance.US OHLCV — every supported timeframe. Forming bars are marked. Zero-volume doji are real exchange prints, not missing data.</p>
+            <div class="candle-controls">
+                <label>Symbol
+                    <select id="candle-symbol">
+                        <option value="BTCUSDT">BTC/USDT</option>
+                        <option value="ETHUSDT">ETH/USDT</option>
+                        <option value="SOLUSDT">SOL/USDT</option>
+                        <option value="XRPUSDT">XRP/USDT</option>
+                    </select>
+                </label>
+                <label>Timeframe
+                    <select id="candle-interval">
+                        <option value="1m">1m</option>
+                        <option value="3m">3m</option>
+                        <option value="5m">5m</option>
+                        <option value="15m">15m</option>
+                        <option value="30m">30m</option>
+                        <option value="1h">1h</option>
+                        <option value="2h">2h</option>
+                        <option value="4h">4h</option>
+                        <option value="6h">6h</option>
+                        <option value="8h">8h</option>
+                        <option value="12h">12h</option>
+                        <option value="1d">1d</option>
+                        <option value="1w">1w</option>
+                    </select>
+                </label>
+                <span class="status-value" id="candle-freshness">--</span>
+            </div>
+            <div class="widget__chart-wrap candle-chart-wrap">
+                <canvas id="chart-canonical-candles" height="220"></canvas>
+                <canvas id="chart-canonical-volume" height="70"></canvas>
+                <p class="widget__no-data" id="candle-no-data">No data</p>
+            </div>
+        </section>
 
         <section class="widget widget--full">
             <h2 class="widget__title">System health</h2>
@@ -748,6 +786,6 @@
     </div>
 
     <script src="vendor/chart.umd.min.js?v=4.4.1"></script>
-    <script src="app.js?v=58"></script>
+    <script src="app.js?v=59"></script>
 </body>
 </html>

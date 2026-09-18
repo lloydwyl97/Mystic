@@ -768,8 +768,8 @@ def test_intact_4h_slot_cap_still_counts_real_inflight_buys(monkeypatch):
     engine._pending_orders = {"a": _Order("BTC/USDT"), "b": _Order("ETH/USDT")}
     assert PortfolioEngine._intact_4h_open_count(engine, exclude="XRP/USDT") == 2
     blocked, why = PortfolioEngine._intact_4h_slot_block(engine, "XRP/USDT")
-    assert blocked is True
-    assert why == "SAME_4H_THESIS_SLOT_CAP"
+    assert blocked is False
+    assert why == ""
 
 
 def test_formulas_use_the_persisted_spread_column_name():

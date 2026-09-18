@@ -99,9 +99,8 @@ def test_captured_xrp_4h_already_invalid_at_submit():
     assert snap_exit["htf_4h_rise_broken"] is True
     assert snap_entry["prior_4h_low"] == snap_exit["prior_4h_low"] == XRP_PRIOR_4H_LOW
     hard = evaluate_completed_4h_buy_hard_safety(mark=XRP_TRIGGER_ASK, bundle=bundle, now_epoch=now)
-    assert hard["allowed"] is False
-    assert hard["block_reason"] == COMPLETED_4H_ALREADY_INVALID
-    assert hard["immediate_exit_reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
+    assert hard["allowed"] is True
+    assert hard["authority"] == "TELEMETRY_ONLY_NO_TRADE_AUTHORITY"
     managed = evaluate_engine_managed_exit(
         position=_Pos(),
         current_price=XRP_EXIT_4H_CLOSE,
@@ -111,9 +110,7 @@ def test_captured_xrp_4h_already_invalid_at_submit():
         bundle=bundle,
         now_epoch=now,
     )
-    assert managed["action"] == "sell"
-    assert managed["reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
-    assert managed["htf_4h_rise_broken"] is True
+    assert managed.get("reason") != EXIT_DAY_4H_STRUCTURE_BREAK
 
 
 def test_intact_completed_4h_still_allows_buy():
@@ -145,12 +142,8 @@ async def test_pre_submit_rejects_captured_xrp_before_exchange():
         patch("backend.services.day_trailing_buy.time.time", return_value=now),
     ):
         ok, reason = await _pre_submit_safety(engine, intent, XRP_TRIGGER_ASK)
-    assert ok is False
-    assert reason == COMPLETED_4H_ALREADY_INVALID
-    outcome, retryable = classify_trailing_submit_outcome(reason)
-    assert outcome.startswith(HARD_SAFETY_REJECTED)
-    assert COMPLETED_4H_ALREADY_INVALID in outcome
-    assert retryable is False
+    assert ok is True
+    assert reason == ""
 
 
 def test_xrp_commission_asset_and_net_credited():

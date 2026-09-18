@@ -44,6 +44,7 @@ from backend.services.portfolio_engine import get_coin_profile
 
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 BAR_DECISION_SEC = 900
+FOURH_SEC = 14400
 HORIZON_PAD_SEC = 14 * 24 * 3600
 
 
@@ -134,7 +135,10 @@ def parse_epoch(ts: Any) -> int | None:
         v = float(ts)
         return int(v / 1000.0) if v > 1e12 else int(v)
     try:
-        return int(datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp())
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
     except (TypeError, ValueError):
         return None
 
@@ -177,9 +181,23 @@ def resample_4h(bars_1m: list[tuple[int, float, float, float, float]]) -> list[l
     return out
 
 
-def fourh_bundle(rows: list[list[float]], now_epoch: float) -> dict[str, Any]:
-    cutoff = now_epoch + 1
-    kept = [r for r in rows if r[0] <= cutoff]
+def fourh_bundle(
+    rows: list[list[float]],
+    now_epoch: float,
+    bars_1m: list[tuple[int, float, ...]] | None = None,
+) -> dict[str, Any]:
+    """Completed 4H bars only. Optional 1m rows rebuild the forming bucket."""
+    kept = [r for r in rows if float(r[0]) + FOURH_SEC <= float(now_epoch) + 1e-9]
+    if bars_1m:
+        open_sec = (int(now_epoch) // FOURH_SEC) * FOURH_SEC
+        forming = [b for b in bars_1m if open_sec <= int(b[0]) <= int(now_epoch)]
+        if forming:
+            o = float(forming[0][1])
+            h = max(float(b[2]) for b in forming)
+            low = min(float(b[3]) for b in forming)
+            c = float(forming[-1][4])
+            kept = [r for r in kept if float(r[0]) != float(open_sec)]
+            kept.append([float(open_sec), o, h, low, c, 0.0])
     return {"4h": kept[-8:]}
 
 
@@ -278,6 +296,100 @@ def in_unlocked_band(p_buy: float) -> bool:
     return 0.0470 <= float(p_buy) < 0.18333
 
 
+def rank_key(inf: dict[str, Any]) -> float:
+    """Production ranks on final_selection_score; inference_log may only have p_buy."""
+    score = inf.get("final_selection_score")
+    if score not in (None, ""):
+        try:
+            return float(score)
+        except (TypeError, ValueError):
+            pass
+    return float(inf.get("p_buy") or 0.0)
+
+
+def path_ev_asof(
+    symbol: str,
+    epoch: int,
+    bars: dict[str, list[tuple[int, float, ...]]],
+) -> float:
+    """Missing or short 1m history is HOLD (0). Never invent a path EV."""
+    rows = bars.get(symbol) or []
+    usable = [b for b in rows if int(b[0]) <= int(epoch)]
+    if len(usable) < 8:
+        return 0.0
+    try:
+        from backend.services.binance_scalp.forward_net_predictor import predict_artifact
+        from backend.services.binance_scalp.reconstructable_features import reconstructable_features
+        from backend.services.day_path_net import load_accepted_day_artifact
+
+        art = load_accepted_day_artifact()
+        if art is None:
+            return 0.0
+        dicts = [
+            {
+                "open": float(b[1]),
+                "high": float(b[2]),
+                "low": float(b[3]),
+                "close": float(b[4]),
+                "volume": float(b[5]) if len(b) > 5 else 0.0,
+                "ts": int(b[0]),
+            }
+            for b in usable[-40:]
+        ]
+        btc = [b for b in (bars.get("BTCUSDT") or []) if int(b[0]) <= int(epoch)][-6:]
+        btc_ret = 0.0
+        if len(btc) >= 6 and float(btc[0][4]) > 0:
+            btc_ret = (float(btc[-1][4]) - float(btc[0][4])) / float(btc[0][4])
+        last_ts = dicts[-1]["ts"]
+        ts = datetime.fromtimestamp(float(last_ts), tz=timezone.utc)
+        feats = reconstructable_features(dicts, btc_ret_5=btc_ret, market_vol_5=abs(btc_ret), ts=ts)
+        pred = predict_artifact(art, feats)
+        return float(pred.get("predicted_net_ev") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def pick_direct_path_ev_winner(
+    inferences: list[dict[str, Any]],
+    *,
+    bars: dict[str, list[tuple[int, float, ...]]],
+    epoch: int,
+) -> tuple[dict[str, Any] | None, dict[str, float]]:
+    """Same rule as decide_day_bar / select_action: one coin or HOLD(0)."""
+    from backend.services.day_direct_path_ev_authority import select_action
+
+    evs = {sym: path_ev_asof(sym, epoch, bars) for sym in SYMBOLS}
+    scores = {
+        "btc_path_ev": evs["BTCUSDT"],
+        "eth_path_ev": evs["ETHUSDT"],
+        "sol_path_ev": evs["SOLUSDT"],
+        "xrp_path_ev": evs["XRPUSDT"],
+    }
+    decision = select_action(scores)
+    want = str(decision.get("selected_symbol") or "")
+    if not str(decision.get("selected_action") or "").upper().startswith("BUY") or not want:
+        return None, evs
+    found = None
+    for inf in inferences:
+        if inf.get("symbol") == want:
+            found = dict(inf)
+            break
+    if found is None:
+        found = {
+            "symbol": want,
+            "epoch": epoch,
+            "p_buy": 0.0,
+            "p_hold": 1.0,
+            "p_sell": 0.0,
+            "final_selection_score": evs.get(want, 0.0),
+        }
+    found["path_ev"] = evs.get(want, 0.0)
+    found["path_evs"] = evs
+    if float(found["path_ev"]) <= 0.0:
+        return None, evs
+    return found, evs
+
+
 class LinearCalibrator:
     """p_buy -> realized net. Fit on an earlier chronological window only."""
 
@@ -353,7 +465,9 @@ def _advance_position(
         if str(decision.get("action") or "") != "sell":
             continue
         reason = str(decision.get("reason") or "")
-        urgent = any(x in reason.upper() for x in ("STOP", "FLOOR", "EXTREME", "TRAIL", "STRUCTURE"))
+        if "4H_STRUCTURE" in reason.upper() or reason == "DAY_4H_STRUCTURE_BREAK_EXIT":
+            continue
+        urgent = any(x in reason.upper() for x in ("STOP", "FLOOR", "EXTREME", "TRAIL"))
         exit_mid = low if urgent and low > 0 else close
         exit_px = executable_sell_price(exit_mid, pos.symbol)
         return _close(pos, ep, exit_px, reason, sell_cost)
@@ -489,6 +603,7 @@ def run_arm(
     start_epoch: int | None = None,
     end_epoch: int | None = None,
     sell_cost: float = LEGACY_SELL_ROUNDTRIP_PCT,
+    authority_mode: str = "",
 ) -> tuple[list[ClosedTrade], int, int]:
     with production_exit_env():
         return _run_arm_body(

@@ -16,6 +16,7 @@ from backend.config.day_active_timeframes import (
     DAY_ACTIVE_TIMEFRAMES,
     DAY_FEATURE_BUILDER_MIN_1M_BARS,
     DAY_MONTH_CONTEXT_MIN_1D_BARS,
+    DAY_REQUIRED_TIMEFRAMES,
     fetch_limit_for_day_tf,
     min_bars_for_day_tf,
 )
@@ -285,7 +286,7 @@ def month_context_four_from_daily(ohlcv_1d: list[list]) -> tuple[list[float] | N
 def validate_day_active_bundle(bundle: dict[str, list[list]]) -> tuple[bool, list[str]]:
     """Return (ok, missing_reasons) — empty list reasons => ok."""
     missing: list[str] = []
-    for tf in DAY_ACTIVE_TIMEFRAMES:
+    for tf in DAY_REQUIRED_TIMEFRAMES:
         rows = bundle.get(tf)
         need = min_bars_for_day_tf(tf)
         n = len(rows) if isinstance(rows, list) else 0
@@ -372,6 +373,14 @@ async def _fetch_day_active_ohlcv_bundle_raw(
         else:
             out[tf] = rows
             tf_fetched_at[tf] = now
+    # 3m is canonical chart/store data attached for consumers; not a DAY vector dim.
+    try:
+        rows_3m = await svc.get_ohlcv(sym, "3m", 300)
+        if isinstance(rows_3m, list) and rows_3m:
+            out["3m"] = list(rows_3m)
+            tf_fetched_at["3m"] = now
+    except Exception as exc:
+        logger.debug("DAY_BUNDLE_3M_OPTIONAL %s: %s", sym, exc)
     return out, tf_fetched_at
 
 

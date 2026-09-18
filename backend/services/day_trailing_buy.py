@@ -639,24 +639,14 @@ async def _pre_submit_safety(engine: Any, intent: dict[str, Any], ask: float) ->
     if ns in pending or symbol in pending:
         return False, "PENDING_BUY_EXISTS"
     if _thesis_invalid(intent, ask):
-        return False, "THESIS_4H_INVALID"
-    from backend.services.day_active_market_bundle import resolve_pre_buy_day_structure_bundle
-    from backend.services.day_controlled_exits import evaluate_completed_4h_buy_hard_safety
-
-    fourh = evaluate_completed_4h_buy_hard_safety(
-        mark=float(ask),
-        bundle=resolve_pre_buy_day_structure_bundle(symbol),
-        now_epoch=time.time(),
-    )
-    if not fourh.get("allowed"):
+        # Price-vs-stamped-stop only. 4H structure cannot cancel the intent.
         logger.info(
-            "TRAILING_BUY_HARD_SAFETY_4H symbol=%s intent=%s prior_4h_low=%s current_4h_close=%s",
+            "TRAILING_BUY_THESIS_LEVEL_TELEMETRY symbol=%s intent=%s ask=%s level=%s authority=TELEMETRY_ONLY_NO_TRADE_AUTHORITY",
             symbol,
             intent.get("intent_id"),
-            fourh.get("prior_4h_low"),
-            fourh.get("current_4h_close"),
+            ask,
+            intent.get("thesis_invalid_level"),
         )
-        return False, "COMPLETED_4H_ALREADY_INVALID"
     return True, ""
 
 

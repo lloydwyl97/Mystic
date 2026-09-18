@@ -1181,7 +1181,8 @@ def resolve_day_risk_floor_price(
     max_adverse = _floor_env("DAY_RISK_FLOOR_MAX_ADVERSE_PCT", 0.06)
     min_adverse = _floor_env("DAY_RISK_FLOOR_MIN_ADVERSE_PCT", 0.02)
 
-    levels = [float(x) for x in (thesis_invalid_level, prior_4h_low) if x and 0.0 < float(x) < entry]
+    del prior_4h_low  # 4H cannot set the live risk floor
+    levels = [float(x) for x in (thesis_invalid_level,) if x and 0.0 < float(x) < entry]
     if levels:
         candidate = min(levels) * (1.0 - buffer)
     else:
@@ -1484,8 +1485,7 @@ def evaluate_extreme_protection(
     gross_loss = (entry_price - mark) / entry_price
 
     h1 = _bundle_tf_align(bundle, "1h") if bundle else None
-    h4 = _bundle_tf_align(bundle, "4h") if bundle else None
-    htf_collapse = h1 is not None and h4 is not None and h1 < 0.28 and h4 < 0.28
+    htf_collapse = h1 is not None and h1 < 0.28
 
     catastrophic = False
     if (net_pnl_pct <= -loss_floor and htf_collapse) or (gross_loss >= flash_floor and htf_collapse):

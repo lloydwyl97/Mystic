@@ -463,6 +463,17 @@ class BinanceWSHydrator:
                 return
             candle = [float(bar_ts), o, h, lo, c, v]
             await self._append_candle(sym, "1m", candle)
+            try:
+                from backend.services.canonical_candle_pipeline import canonical_candle_pipeline
+
+                await canonical_candle_pipeline.ingest_klines(
+                    sym,
+                    "1m",
+                    [[bar_ts * 1000, o, h, lo, c, v]],
+                    persist=True,
+                )
+            except Exception as exc:
+                logger.debug("canonical 1m ingest from hydrator failed %s: %s", sym, exc)
             self._last_bar_ts[sym] = bar_ts
             # If the in-memory forming candle covers the same minute, discard it
             # so the next miniTicker starts a fresh bar for the next minute.
@@ -583,26 +594,9 @@ class BinanceWSHydrator:
             kl = json.loads(raw)
             if not isinstance(kl, list) or len(kl) < 5:
                 return
-            # 5m roll every 5 minutes
-            if (last_start_ts % 300) == 240 and len(kl) >= 5:
-                chunk = kl[-5:]
-                ts0 = chunk[0][0]
-                o = float(chunk[0][1])
-                h = max(float(x[2]) for x in chunk)
-                low = min(float(x[3]) for x in chunk)
-                c = float(chunk[-1][4])
-                v = sum(float(x[5]) for x in chunk)
-                await self._append_candle(sym, "5m", [ts0, o, h, low, c, v])
-            # 15m roll every 15 minutes
-            if (last_start_ts % 900) == 840 and len(kl) >= 15:
-                chunk = kl[-15:]
-                ts0 = chunk[0][0]
-                o = float(chunk[0][1])
-                h = max(float(x[2]) for x in chunk)
-                low = min(float(x[3]) for x in chunk)
-                c = float(chunk[-1][4])
-                v = sum(float(x[5]) for x in chunk)
-                await self._append_candle(sym, "15m", [ts0, o, h, low, c, v])
+            # Higher-timeframe Redis/SQLite writes belong to canonical_candle_pipeline.
+            # The previous last-N 1m rollup was not UTC-bucket aligned.
+            return
         except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
             pass
 

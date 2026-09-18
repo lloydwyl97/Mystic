@@ -233,7 +233,7 @@ class TestCandleDataIntegrity:
 
         assert "1m" in DAY_ACTIVE_TIMEFRAMES, "1m must be in active timeframes"
         # 3m is NOT a fetched timeframe — confirm it's absent
-        assert "3m" not in DAY_ACTIVE_TIMEFRAMES, "3m should not be in active timeframes"
+        assert "3m" not in DAY_ACTIVE_TIMEFRAMES, "3m is canonical-store/chart only; not a DAY vector TF"
 
     def test_validate_bundle_flags_missing_1m(self):
         """Missing 1m bars must be flagged, not silently accepted."""

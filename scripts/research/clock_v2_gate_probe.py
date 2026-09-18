@@ -23,13 +23,7 @@ for t in ("day_decision_candidate_records", "day_path_clock_v2_candidate_artifac
     print(f"{t}: {len(cols)} cols")
     print(f"  {cols}")
 
-groups = [
-    dict(r)
-    for r in conn.execute(
-        "SELECT decision_group_id, selected_symbol, lifecycle_state, contract_json "
-        "FROM day_decision_group_records ORDER BY created_at"
-    )
-]
+groups = [dict(r) for r in conn.execute("SELECT decision_group_id, selected_symbol, lifecycle_state, contract_json FROM day_decision_group_records ORDER BY created_at")]
 
 sel_gates: Counter = Counter()
 sel_missing: Counter = Counter()

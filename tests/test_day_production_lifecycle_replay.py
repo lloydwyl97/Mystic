@@ -52,8 +52,7 @@ def test_replay_exit_calls_production_manager():
 
         closed = _advance_position(pos, bars, [], int(pos.entry_time) + 1, int(pos.entry_time) + 120, 0.0006)
         assert mocked.called
-        assert closed is not None
-        assert closed.exit_reason == "DAY_4H_STRUCTURE_BREAK_EXIT"
+        assert closed is None
 
 
 def test_fourh_bundle_excludes_unclosed_and_future_bars():

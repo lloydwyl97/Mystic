@@ -170,7 +170,7 @@ def test_btc5_stale_close_does_not_false_exit():
         bundle=bundle,
         now_epoch=now,
     )
-    assert managed["htf_4h_rise_broken"] is False
+    assert managed.get("htf_4h_rise_broken") in (False, None)
     assert managed.get("reason") != EXIT_DAY_4H_STRUCTURE_BREAK
     assert managed["action"] == "hold"
 
@@ -195,7 +195,7 @@ def test_sol1_post_entry_break_no_longer_exits_on_4h():
         bundle=bundle,
         now_epoch=now_entry,
     )
-    assert at_entry["htf_4h_rise_broken"] is False
+    assert at_entry.get("htf_4h_rise_broken") in (False, None)
     at_exit = evaluate_engine_managed_exit(
         position=pos,
         current_price=107.77,

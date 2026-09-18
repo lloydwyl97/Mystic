@@ -40,6 +40,8 @@ EXIT_FAILED_RECLAIM = "FAILED_RECLAIM_EXIT"
 EXIT_STALL = "STALL_EXIT"
 EXIT_STALL_DEAD = "STALL_EXIT_DEAD_NO_MFE"
 EXIT_GIVEBACK = "GIVEBACK_EXIT"
+EXIT_PEAK_TURN = "PEAK_TURN_EXIT"
+BUY_BLOCKED_SPIKE_FADE = "BUY_BLOCKED_SPIKE_FADE"
 EXIT_PROGRESS_DECAY = "PROGRESS_DECAY_EXIT"
 EXIT_ADAPTIVE_LOSS = "ADAPTIVE_LOSS_EXIT"
 EXIT_PATH_EXECUTABLE_PROFIT = "PATH_EXECUTABLE_PROFIT"
@@ -47,6 +49,7 @@ DAY_PATH_AWARE_POLICY = "day_path_aware_v1"
 HOLD_4H_RISE = "PATH_AWARE_HOLD_4H_RISE"
 HOLD_4H_MISSING = "PATH_AWARE_HOLD_4H_MISSING"
 HOLD_4H_UNDECIDED = "PATH_AWARE_HOLD_4H_UNDECIDED"
+COMPLETED_4H_ALREADY_INVALID = "COMPLETED_4H_ALREADY_INVALID"  # historical label; never a live buy block
 
 # Reasons that are allowed to full-flatten a DAY position. Anything else holds.
 DAY_FULL_FLATTEN_REASONS = frozenset(
@@ -67,12 +70,8 @@ _exit_policy_logged = False
 def _path_aware_exit_enabled() -> bool:
     """DAY exit policy: full exit ladder (net-profit, TP1, time-stop, trailing, etc.).
 
-    When disabled (production default since 2026-09-17), all exit reasons are
-    reachable: net-profit, TP1, trailing stop, time stop, thesis invalidation,
-    giveback, stall, risk floor, and extreme protection.  The 4H structure
-    break remains one possible exit among many — it no longer blocks every
-    other sell reason.  Setting ``DAY_PATH_AWARE_EXIT=true`` re-enables the
-    old hold-through-4H behaviour (not recommended).
+    Path-aware selects the non-4H ladder (net-profit, trail, giveback, stall,
+    risk floor, extreme). ``DAY_PATH_AWARE_EXIT`` cannot restore 4H authority.
     """
     raw = os.getenv("DAY_PATH_AWARE_EXIT")
     enabled = (raw if raw is not None else "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -128,7 +127,7 @@ def _evaluate_path_aware_exit(
     risk_floor_price = resolve_day_risk_floor_price(
         entry_price=entry,
         thesis_invalid_level=float(getattr(position, "thesis_invalid_level", 0.0) or 0.0),
-        prior_4h_low=float(snap4.get("prior_4h_low") or 0.0),
+        prior_4h_low=0.0,
         atr_pct=atr_pct,
     )
     base = {
@@ -1012,7 +1011,7 @@ def _trail_semantics(
     hard_stop = resolve_day_risk_floor_price(
         entry_price=entry,
         thesis_invalid_level=float(getattr(position, "thesis_invalid_level", 0.0) or 0.0),
-        prior_4h_low=float(snap4.get("prior_4h_low") or 0.0),
+        prior_4h_low=0.0,
         atr_pct=atr_pct,
     )
     persisted_stop = float(getattr(position, "stop_price", 0.0) or 0.0)
@@ -1806,3 +1805,159 @@ def evaluate_pre_buy_exit_consistency(
             }
         )
     return result
+
+
+def evaluate_completed_4h_buy_hard_safety(
+    *,
+    mark: float,
+    bundle: dict[str, Any] | None = None,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    """4H has no buy authority. Always allow. Snapshot is telemetry only."""
+    from backend.config.canonical_candle_intervals import TELEMETRY_ONLY_NO_TRADE_AUTHORITY
+    from backend.services.day_trade_thesis import day_4h_structure_snapshot
+
+    snap = day_4h_structure_snapshot(bundle, current_price=mark, now_epoch=now_epoch)
+    return {
+        **snap,
+        "allowed": True,
+        "reason": TELEMETRY_ONLY_NO_TRADE_AUTHORITY,
+        "authority": TELEMETRY_ONLY_NO_TRADE_AUTHORITY,
+        "block_reason": "",
+    }
+
+
+def last_look_buy_mark(
+    *,
+    decision_price: float,
+    expected_fill: float = 0.0,
+    best_bid: float = 0.0,
+    best_ask: float = 0.0,
+    limit_price: float = 0.0,
+) -> float:
+    """Lowest live/executable print for telemetry. Never a 4H trade gate."""
+    marks = [float(x) for x in (decision_price, expected_fill, best_bid, best_ask, limit_price) if x is not None and float(x or 0.0) > 0.0]
+    return min(marks) if marks else 0.0
+
+
+def _peak_turn_exit_enabled() -> bool:
+    return os.getenv("DAY_PEAK_TURN_EXIT_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+
+
+def _peak_turn_min_hold_min() -> float:
+    try:
+        return float(os.getenv("DAY_PEAK_TURN_MIN_HOLD_MIN", "2"))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+def _peak_turn_min_mfe_pct() -> float:
+    raw = os.getenv("DAY_PEAK_TURN_MIN_MFE_PCT") or os.getenv("DAY_GIVEBACK_MIN_MFE_PCT") or "0.0015"
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0015
+
+
+def _peak_turn_pullback_pct() -> float:
+    try:
+        return float(os.getenv("DAY_PEAK_TURN_PULLBACK_PCT", "0.0008"))
+    except (TypeError, ValueError):
+        return 0.0008
+
+
+def evaluate_peak_turn_exit(
+    *,
+    entry_price: float,
+    highest_price: float,
+    current_price: float,
+    net_pnl_pct: float,
+    hold_minutes: float,
+) -> dict[str, Any] | None:
+    """Sell the drop from the high while the trade is still green."""
+    if not _peak_turn_exit_enabled():
+        return None
+    entry = float(entry_price or 0.0)
+    high = float(highest_price or entry)
+    mark = float(current_price or 0.0)
+    if entry <= 0 or high <= 0 or mark <= 0:
+        return None
+    if hold_minutes < _peak_turn_min_hold_min():
+        return None
+    mfe_pct = max(0.0, (high - entry) / entry)
+    if mfe_pct + 1e-12 < _peak_turn_min_mfe_pct():
+        return None
+    pullback = (high - mark) / high
+    if pullback + 1e-12 < _peak_turn_pullback_pct():
+        return None
+    if net_pnl_pct + 1e-12 < 0.0:
+        return None
+    return {
+        "action": "sell",
+        "reason": EXIT_PEAK_TURN,
+        "net_pnl_pct": net_pnl_pct,
+        "hold_minutes": hold_minutes,
+        "detail": f"mfe={mfe_pct:.6f} pullback={pullback:.6f}",
+    }
+
+
+def _spike_fade_block_pct() -> float:
+    try:
+        return float(os.getenv("DAY_SPIKE_FADE_BLOCK_PCT", "0.0040"))
+    except (TypeError, ValueError):
+        return 0.0040
+
+
+def _row_high(row: Any) -> float:
+    if not isinstance(row, (list, tuple)) or not row:
+        return 0.0
+    parsed = None
+    try:
+        from backend.services.day_trade_thesis import _ohlcv_ohlc
+
+        parsed = _ohlcv_ohlc(row)
+    except Exception:
+        parsed = None
+    if parsed is not None:
+        return float(parsed[1] or 0.0)
+    if len(row) >= 5:
+        return float(row[2] or 0.0)
+    if len(row) >= 4:
+        return float(row[1] or 0.0)
+    return 0.0
+
+
+def forming_session_high(bundle: dict[str, Any] | None, mark: float = 0.0) -> float:
+    """Highest live print for telemetry. Not a production BUY gate."""
+    from backend.services.day_trade_thesis import _4h_recent_ohlc, resolve_day_4h_structure_bundle
+
+    resolved = resolve_day_4h_structure_bundle(bundle, current_price=mark or None)
+    highs: list[float] = []
+    for _o, h, _l, _c in _4h_recent_ohlc(resolved)[-1:]:
+        if h > 0:
+            highs.append(float(h))
+    src = resolved if isinstance(resolved, dict) else bundle
+    if isinstance(src, dict):
+        for key in ("15m", "1m"):
+            rows = src.get(key)
+            if isinstance(rows, list) and rows:
+                highs.append(_row_high(rows[-1]))
+    return max((x for x in highs if x > 0), default=0.0)
+
+
+def evaluate_spike_fade_entry(*, mark: float, bundle: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Telemetry helper. Production BUY paths must not call this as authority."""
+    px = float(mark or 0.0)
+    high = forming_session_high(bundle, px)
+    if px <= 0 or high <= 0:
+        return None
+    fade = (high - px) / high
+    if fade + 1e-12 < _spike_fade_block_pct():
+        return None
+    return {
+        "allowed": False,
+        "block_reason": BUY_BLOCKED_SPIKE_FADE,
+        "fade_pct": fade,
+        "forming_high": high,
+        "mark": px,
+    }

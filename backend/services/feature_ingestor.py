@@ -20,7 +20,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from backend.services.feature_store import init_feature_store, insert_ohlcv, insert_tick
+from backend.services.feature_store import init_feature_store, insert_tick
 from backend.services.live_market_data import live_market_data_service
 
 # Optional imports - try at top level
@@ -220,37 +220,17 @@ class FeatureIngestor:
         return results
 
     async def run_ohlcv_pass(self, interval: str = "1m") -> dict[str, Any]:
+        """OHLCV writes are owned by the canonical candle pipeline.
+
+        This pass is a no-op so FeatureIngestor cannot become a second writer.
         """
-        Execute a single OHLCV ingestion pass (latest candle only) across the current watchlist.
-        """
-        results: dict[str, Any] = {"items": [], "ts": _now_iso(), "interval": interval}
-        for sym in list(self.watchlist):
-            try:
-                candles = await live_market_data_service.get_ohlcv(sym, interval, limit=1)
-                if isinstance(candles, list) and candles:
-                    c = candles[-1]
-                    candle = {
-                        "open": float(c[1]),
-                        "high": float(c[2]),
-                        "low": float(c[3]),
-                        "close": float(c[4]),
-                        "volume": float(c[5]),
-                    }
-                    insert_ohlcv(sym, interval, candle)
-                    try:
-                        feat_ohlcv_total.labels(symbol=sym, interval=interval).inc()
-                        if metrics and getattr(metrics, "feature_ingest", None):
-                            metrics.feature_ingest.inc()  # type: ignore[attr-defined]
-                    except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
-                        pass
-                    results["items"].append({"symbol": sym, "status": "ok"})
-                else:
-                    results["items"].append({"symbol": sym, "status": "skip"})
-            except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError) as e:
-                with contextlib.suppress(ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
-                    feat_errors_total.labels(stage="ohlcv", symbol=sym).inc()
-                results["items"].append({"symbol": sym, "status": "error", "error": str(e)})
-                self._last_error = f"ohlcv:{sym}:{e}"
+        results: dict[str, Any] = {
+            "items": [{"symbol": sym, "status": "delegated_canonical_writer"} for sym in list(self.watchlist)],
+            "ts": _now_iso(),
+            "interval": interval,
+            "writer": "canonical_candle_pipeline",
+            "skipped": True,
+        }
         self._last_ohlcv_run = _now_iso()
         return results
 

@@ -621,13 +621,9 @@ def clock_v2_v5_feature_schema() -> dict[str, Any]:
         "inputs": list(REQUIRED_CLOCK_V2_FIELDS_V5),
         "removed_from_v4": ["final_rank_score"],
         "ignored_obsolete_feature_json_fields": list(OBSOLETE_V5_FEATURE_JSON_FIELDS),
-        "removal_reason": (
-            "legacy final_rank_score is only defined for legacy scored candidates; it is not an "
-            "all-action feature and capture-v1 substituted raw path_ev for absent candidates"
-        ),
+        "removal_reason": ("legacy final_rank_score is only defined for legacy scored candidates; it is not an all-action feature and capture-v1 substituted raw path_ev for absent candidates"),
         "all_action_inputs_verified": {
-            "p_buy": "per-symbol ML signal published for all four coins regardless of side; "
-            "captured as production_p_buy with shadow_candidate_p_buy fallback and explicit provenance",
+            "p_buy": "per-symbol ML signal published for all four coins regardless of side; captured as production_p_buy with shadow_candidate_p_buy fallback and explicit provenance",
             "legacy_path_ev": "scored independently for all four coins by score_four_coins",
             "clock_features": "computed from 1m klines per symbol, independent of candidacy",
             "structure_and_cost": "per-symbol 4H structure and decision-time quote",
@@ -659,13 +655,9 @@ def clock_v2_v5_readiness_requirements() -> dict[str, Any]:
         "observation_unit": "independent_v5_DEVELOPMENT_decision_group_after_purge",
         "counted_partition": "DEVELOPMENT",
         "excluded_partitions": ["PRE_MODEL_QUARANTINE", "FINAL_TEST"],
-        "feature_complete_definition": (
-            "every production-available modeled action (action_available=true) plus HOLD has the "
-            "required v5 feature state; a legacy-unscored action does not disappear"
-        ),
+        "feature_complete_definition": ("every production-available modeled action (action_available=true) plus HOLD has the required v5 feature state; a legacy-unscored action does not disappear"),
         "fully_comparable_definition": (
-            "all production-available actions share the 3h horizon, executable-price method, "
-            "commission method, spread method and slippage method, and all have valid labels; HOLD=0"
+            "all production-available actions share the 3h horizon, executable-price method, commission method, spread method and slippage method, and all have valid labels; HOLD=0"
         ),
         "listed_inputs": list(REQUIRED_CLOCK_V2_FIELDS_V5),
         "listed_input_count": CLOCK_V2_V5_LISTED_INPUT_COUNT,

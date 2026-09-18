@@ -1376,3 +1376,28 @@ html {
     white-space: nowrap;
     max-width: 100%;
 }
+
+.candle-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 10px;
+}
+.candle-controls select {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 4px 8px;
+}
+.candle-chart-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+#chart-canonical-candles,
+#chart-canonical-volume {
+    width: 100%;
+    display: block;
+}

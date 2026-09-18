@@ -92,13 +92,7 @@ def check_migration(db_path: str, scratch: Path) -> dict:
 def check_reconstruction(db_path: str) -> dict:
     conn = _ro(db_path)
     try:
-        groups = [
-            dict(r)
-            for r in conn.execute(
-                "SELECT decision_group_id, selected_symbol, lifecycle_state, created_at, contract_json "
-                "FROM day_decision_group_records ORDER BY created_at"
-            )
-        ]
+        groups = [dict(r) for r in conn.execute("SELECT decision_group_id, selected_symbol, lifecycle_state, created_at, contract_json FROM day_decision_group_records ORDER BY created_at")]
         clock_v2_ids = {r[0] for r in conn.execute(f"SELECT DISTINCT decision_group_id FROM {TABLE_ARTIFACT}")}
         flat_defective = {
             r[0]
@@ -146,9 +140,7 @@ def check_reconstruction(db_path: str) -> dict:
         out = reconstruct_group_action_state(payload)
         status[out["reconstruction_status"]] += 1
         invariant["pass" if out["selected_action_invariant"]["pass"] else "fail"] += 1
-        fabricated_rank += sum(
-            1 for r in out["rows"] if r.get("legacy_final_rank_score_valid") is False and r["symbol"] != "HOLD"
-        )
+        fabricated_rank += sum(1 for r in out["rows"] if r.get("legacy_final_rank_score_valid") is False and r["symbol"] != "HOLD")
 
         if gid in flat_defective:
             fixed = next((r for r in out["rows"] if r["symbol"] == selected), None)

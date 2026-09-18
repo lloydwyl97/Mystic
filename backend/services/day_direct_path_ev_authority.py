@@ -216,6 +216,7 @@ def next_executable_path_ev_symbol(
             return api, ev
     return None
 
+
 _LEARNING_VETO_CONSEC = int(os.getenv("DAY_LEARNING_VETO_CONSEC_LOSSES", "3"))
 _LEARNING_VETO_LOOKBACK = int(os.getenv("DAY_LEARNING_VETO_LOOKBACK", "10"))
 

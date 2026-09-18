@@ -5138,8 +5138,9 @@ class PortfolioEngine:
                         atr_at_entry, entry_bar_timestamp, confidence,
                         fees_paid, slippage_cost, timestamp, status,
                         explainability_json, diagnostics_json, sleeve,
-                        entry_timestamp, decision_id, strategy_id, context_snapshot_json
-                    ) VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?)
+                        entry_timestamp, decision_id, strategy_id, context_snapshot_json,
+                        order_id
+                    ) VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     trade_bind,
                 )
@@ -5457,7 +5458,7 @@ class PortfolioEngine:
                     n += 1
             except Exception:
                 continue
-        for psym in self._pending_buy_symbols():
+        for psym in self._pending_buy_order_symbols():
             if skip and normalize_symbol(psym) == skip:
                 continue
             if normalize_symbol(psym) in {normalize_symbol(s) for s in self.open_positions}:
@@ -6567,6 +6568,20 @@ class PortfolioEngine:
             try:
                 if symbol not in self.open_positions:
                     return  # Idempotent: already cleaned
+                if float(getattr(position, "quantity", 0) or 0) > 0:
+                    position.status = "DUST_PENDING"
+                    if float(getattr(position, "dust_qty_canonical", 0) or 0) <= 0:
+                        position.dust_qty_canonical = float(position.quantity)
+                    self.open_positions[symbol] = position
+                    logger.info(
+                        "DUST_PENDING_RETAIN: %s qty=%.12g (real residual, no writeoff)",
+                        symbol,
+                        float(position.quantity),
+                    )
+                    persist = getattr(self, "_persist_position_to_sqlite", None)
+                    if persist is not None:
+                        await persist(position)
+                    return
                 dust_qty = position.quantity
                 dust_entry = position.entry_price
                 dust_notional = dust_qty * dust_entry if dust_qty > 0 and dust_entry > 0 else 0.0
@@ -8258,6 +8273,9 @@ class PortfolioEngine:
         explainability: TradeExplainability,
         decision_id: str = "",
         sleeve: str = "",
+        entry_authority: str = "",
+        client_order_id: str = "",
+        trailing_buy_intent_id: str = "",
     ) -> dict[str, Any] | None:
         """
         SOLE EXECUTION POINT FOR BUYS — thin locking wrapper.
@@ -8274,10 +8292,21 @@ class PortfolioEngine:
         atomic with respect to any other concurrent buy attempt for the same
         symbol, regardless of unrelated async scheduling/reload timing.
         """
+        from backend.config.day_entry_execution import ENTRY_AUTHORITY_TRAILING_BUY, trailing_buy_mode_active
+
+        if trailing_buy_mode_active() and str(entry_authority or "") != ENTRY_AUTHORITY_TRAILING_BUY:
+            logger.error(
+                "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH symbol=%s authority=%s — trailing-buy is the only automated DAY BUY",
+                symbol,
+                entry_authority or "missing",
+            )
+            self.last_buy_reject_reason = "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH"
+            return None
         normalized_symbol_for_lock = normalize_symbol(symbol)
         # PE-3: Hard-gate — only DAY_TRADE_SYMBOLS may execute buys.
         if _to_api_symbol(symbol) not in DAY_TRADE_SYMBOLS:
             logger.debug("[BUY_GATE] %s not in trading universe, rejecting from execute_buy_fifo", symbol)
+            self.last_buy_reject_reason = "SYMBOL_NOT_EXECUTABLE"
             return None
         lock = self._buy_execution_locks.setdefault(normalized_symbol_for_lock, asyncio.Lock())
         async with lock:
@@ -8292,6 +8321,9 @@ class PortfolioEngine:
                 explainability,
                 decision_id=decision_id,
                 sleeve=sleeve,
+                entry_authority=entry_authority,
+                client_order_id=client_order_id,
+                trailing_buy_intent_id=trailing_buy_intent_id,
             )
 
     async def _execute_buy_fifo_locked(
@@ -8306,6 +8338,9 @@ class PortfolioEngine:
         explainability: TradeExplainability,
         decision_id: str = "",
         sleeve: str = "",
+        entry_authority: str = "",
+        client_order_id: str = "",
+        trailing_buy_intent_id: str = "",
     ) -> dict[str, Any] | None:
         """
         SOLE EXECUTION POINT FOR BUYS
@@ -8317,6 +8352,9 @@ class PortfolioEngine:
 
         Updates authoritative ledger on success and persists to SQLite + audit.
         """
+        from backend.config.day_entry_execution import is_trailing_buy_confirmed
+
+        trailing_confirmed = is_trailing_buy_confirmed(entry_authority)
         # Capture pre-ledger for audit
         pre_ledger = {
             "cash_balance": self.cash_balance,
@@ -8377,7 +8415,14 @@ class PortfolioEngine:
 
         # Fail-closed for all DAY paths — no ML artifact bypass (day_aw_owner_v1).
         ok_ac, ac_code, ac_detail = evaluate_explainability_artifact_contract(explainability)
-        if not ok_ac:
+        if not ok_ac and trailing_confirmed:
+            logger.info(
+                "TELEMETRY_ARTIFACT_CONTRACT symbol=%s code=%s detail=%s (DAY_TRAILING_BUY_CONFIRMED — not enforced)",
+                symbol,
+                ac_code,
+                ac_detail,
+            )
+        elif not ok_ac:
             logger.warning(
                 "BUY_BLOCKED_ARTIFACT_CONTRACT: %s code=%s detail=%s",
                 symbol,
@@ -8395,6 +8440,7 @@ class PortfolioEngine:
                     detail=str(ac_code or ""),
                     decision_id=str(decision_id or ""),
                 )
+            self.last_buy_reject_reason = ac_code or "ARTIFACT_CONTRACT_BLOCKED"
             await self._record_reject(
                 symbol,
                 "BUY",
@@ -8423,7 +8469,14 @@ class PortfolioEngine:
         self._hydrate_explainability_entry_context_from_redis_if_missing(normalize_symbol(symbol), explainability)
 
         ok_ec, ec_code, ec_detail = evaluate_explainability_at_execution(explainability)
-        if not ok_ec:
+        if not ok_ec and trailing_confirmed:
+            logger.info(
+                "TELEMETRY_ENTRY_CONTEXT symbol=%s code=%s (DAY_TRAILING_BUY_CONFIRMED — not enforced)",
+                symbol,
+                ec_code,
+            )
+            logger.info("TELEMETRY_ENTRY_EXIT_CONSISTENCY symbol=%s (telemetry only)", symbol)
+        elif not ok_ec:
             redis_ctx_ts_utc = ""
             try:
                 redis_ctx_payload, _redis_ctx_age = self._get_context_payload(symbol)
@@ -8528,7 +8581,13 @@ class PortfolioEngine:
                 context_payload=ctx_payload_ec,
                 thesis_score=float(getattr(explainability, "thesis_score", 0.0) or 0.0),
             )
-            if not consistency.get("allowed"):
+            if not consistency.get("allowed") and trailing_confirmed:
+                logger.info(
+                    "TELEMETRY_ENTRY_EXIT_CONSISTENCY symbol=%s reason=%s (DAY_TRAILING_BUY_CONFIRMED — not enforced)",
+                    symbol,
+                    consistency.get("block_reason"),
+                )
+            elif not consistency.get("allowed"):
                 block_code = str(consistency.get("block_reason") or "ENTRY_EXIT_INCONSISTENT")
                 logger.warning(
                     "BUY_BLOCKED_ENTRY_EXIT_INCONSISTENT symbol=%s reason=%s immediate=%s invalid_at_entry=%s",
@@ -8940,9 +8999,90 @@ class PortfolioEngine:
         else:
             fill_price = price * (1 + SLIPPAGE_PCT)
             exec_fee_rate = TAKER_FEE
+        try:
+            from backend.services.day_controlled_exits import last_look_buy_mark
+
+            look_px = last_look_buy_mark(
+                decision_price=float(price or 0.0),
+                expected_fill=float(getattr(preflight, "expected_avg_fill", 0.0) or 0.0),
+                best_bid=float(getattr(preflight, "best_bid", 0.0) or 0.0),
+                best_ask=float(getattr(preflight, "best_ask", 0.0) or 0.0),
+                limit_price=float(getattr(preflight, "protected_limit_price", 0.0) or 0.0),
+            )
+            if look_px > 0:
+                logger.info(
+                    "TELEMETRY_LAST_LOOK symbol=%s look_px=%.8f decision_px=%.8f BUY_BLOCKED_LAST_LOOK=never LAST_LOOK_ENTRY_EXIT=telemetry_only",
+                    normalized_symbol,
+                    look_px,
+                    float(price or 0.0),
+                )
+        except Exception:
+            logger.exception("LAST_LOOK_PRE_BUY_ERROR symbol=%s", normalized_symbol)
         fee = quantity * fill_price * exec_fee_rate
         notional = quantity * fill_price
         total_cost = notional + fee
+
+        from backend.services.day_entry_spendable import money as _money
+        from backend.services.day_entry_spendable import plan_executable_buy
+
+        own_res, own_ns = self._own_entry_reservation(normalized_symbol, str(decision_id or ""))
+        own_reserved = bool(decision_id) and str(own_res.get("decision_id") or "") == str(decision_id or "")
+        pending_other = self._pending_buy_notional(
+            exclude_symbol=own_ns if own_reserved else "",
+            exclude_decision_id=str(decision_id or "") if own_reserved else "",
+        )
+        constraints = self._symbol_constraints.get(symbol) or self._symbol_constraints.get(normalized_symbol) or {}
+        cash_plan = plan_executable_buy(
+            requested_qty=quantity,
+            price=fill_price,
+            commission_rate=exec_fee_rate,
+            spendable=_money(self._available_balance) - _money(pending_other),
+            qty_step=constraints.get("qty_step") or 0,
+            min_qty=constraints.get("min_qty") or 0,
+            min_notional=constraints.get("min_notional") or 0,
+            slippage_rate=0,
+            allocation=own_res.get("notional") if own_reserved else None,
+        )
+        if not cash_plan.ok:
+            self.last_buy_reject_reason = cash_plan.reason
+            logger.warning(
+                "BUY_BLOCKED_EXECUTABLE_CASH: %s reason=%s requested=%s spendable=%s",
+                symbol,
+                cash_plan.reason,
+                cash_plan.requested_quantity,
+                cash_plan.spendable,
+            )
+            await self._record_reject(
+                symbol,
+                "BUY",
+                cash_plan.reason,
+                "EXECUTABLE_CASH",
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+            if decision_id:
+                await self._update_pipeline_decision(
+                    decision_id,
+                    {
+                        "stage": "EXECUTION",
+                        "execution_result": "NOT_EXECUTED",
+                        "execution_reason": cash_plan.reason,
+                    },
+                )
+            return None
+        if cash_plan.shrunk or cash_plan.quantity != _money(quantity):
+            logger.info(
+                "BUY_QTY_SHRUNK_TO_SPENDABLE symbol=%s from=%s to=%s total_cost=%s spendable=%s",
+                symbol,
+                quantity,
+                cash_plan.quantity,
+                cash_plan.total_cost,
+                cash_plan.spendable,
+            )
+        quantity = float(cash_plan.quantity)
+        fee = float(cash_plan.commission)
+        notional = float(cash_plan.notional)
+        total_cost = float(cash_plan.total_cost)
 
         # Hard per-position size cap — respects MAX_POSITION_SIZE_USD env var (0 = disabled)
         if MAX_POSITION_SIZE_USD > 0 and total_cost > MAX_POSITION_SIZE_USD:
@@ -8965,7 +9105,7 @@ class PortfolioEngine:
         # =================================================================
         # SOLE EXECUTION GATE - all discipline checks
         # =================================================================
-        can_open, block_reason = await self._can_open_position(symbol, total_cost)
+        can_open, block_reason = await self._can_open_position(symbol, total_cost, decision_id=str(decision_id or ""))
         if not can_open:
             logger.warning(f"BUY_BLOCKED: {symbol} - {block_reason}")
             _gate_id = "CASH_OR_SLOTS"
@@ -9417,6 +9557,9 @@ class PortfolioEngine:
             decision_id or None,
             buy_strategy_id,
             _ctx_snapshot,
+            # Exchange order id on the trade row itself, so a FIFO row can be
+            # tied back to the venue without guessing by quantity and time.
+            str((live_order_buy or {}).get("id") or "") or None,
         )
         try:
             await asyncio.to_thread(
@@ -11813,6 +11956,26 @@ class PortfolioEngine:
 
         return any(is_exit_residual_pending(p) for p in self.open_positions.values())
 
+    def _count_live_slots(self) -> int:
+        """Occupied live slots: active positions/orders only. DUST_PENDING never counts."""
+        n = 0
+        for pos in self.open_positions.values():
+            if str(getattr(pos, "status", "ACTIVE") or "ACTIVE") == "DUST_PENDING":
+                continue
+            if float(getattr(pos, "quantity", 0) or 0) <= 0:
+                continue
+            n += 1
+        pending = getattr(self, "_pending_buy_symbols", None)
+        pending_syms = set()
+        if callable(pending):
+            try:
+                pending_syms = {str(s) for s in pending() or []}
+            except Exception:
+                pending_syms = set()
+        open_syms = {str(s) for s, p in self.open_positions.items() if str(getattr(p, "status", "ACTIVE") or "") != "DUST_PENDING"}
+        n += len(pending_syms - open_syms)
+        return n
+
     def _sleeve_position_count(self, sleeve: str) -> int:
         """Count active (non-DUST_PENDING) positions in a given sleeve."""
         return sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING" and (getattr(p, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value) == sleeve)
@@ -11889,7 +12052,7 @@ class PortfolioEngine:
 
     def _get_active_sleeve_state(self) -> dict[str, Any]:
         """Report the active sleeve/router state for open positions explicitly (never None dict)."""
-        n_open = len(self.open_positions)
+        n_open = self._count_live_slots()
         max_pos = MAX_OPEN_POSITIONS
         # Pick a representative open position for active_* fields (first one)
         active_sleeve = "ACTIVE"
@@ -12099,26 +12262,42 @@ class PortfolioEngine:
         armed = {normalize_symbol(s) for s in (getattr(self, "_trailing_buy_arms", None) or {})}
         return set(reservations.keys()) | self._pending_buy_order_symbols() | armed
 
-    def _pending_buy_notional(self, *, exclude_symbol: str = "") -> float:
+    def _pending_buy_notional(self, *, exclude_symbol: str = "", exclude_decision_id: str = ""):
+        from backend.services.day_entry_spendable import money
+
         ex = normalize_symbol(exclude_symbol) if exclude_symbol else ""
-        n = 0.0
+        skip_did = str(exclude_decision_id or "").strip()
+        n = money(0)
         for sym, r in (getattr(self, "_entry_reservations", None) or {}).items():
+            if skip_did and str((r or {}).get("decision_id") or "") == skip_did:
+                continue
             if ex and normalize_symbol(sym) == ex:
                 continue
-            n += float((r or {}).get("notional") or 0.0)
+            n += money((r or {}).get("notional") or 0)
         for p in (getattr(self, "_pending_orders", None) or {}).values():
             if str(getattr(p, "side", "") or "").upper() != "BUY":
                 continue
             if ex and normalize_symbol(getattr(p, "symbol", "") or "") == ex:
                 continue
-            n += float(getattr(p, "remaining_qty", 0.0) or 0.0) * float(getattr(p, "price", 0.0) or 0.0)
+            n += money(getattr(p, "remaining_qty", 0) or 0) * money(getattr(p, "price", 0) or 0)
         for sym, arm in (getattr(self, "_trailing_buy_arms", None) or {}).items():
             if ex and normalize_symbol(sym) == ex:
                 continue
-            qty = float(getattr(arm, "quantity", 0.0) or 0.0)
-            px = float(getattr(arm, "last_ask", 0.0) or getattr(arm, "initial_ask", 0.0) or 0.0)
+            qty = money(getattr(arm, "quantity", 0) or 0)
+            px = money(getattr(arm, "last_ask", 0) or getattr(arm, "initial_ask", 0) or 0)
             n += qty * px
         return n
+
+    def _own_entry_reservation(self, symbol: str, decision_id: str = "") -> tuple[dict[str, Any], str]:
+        ns = normalize_symbol(symbol)
+        reservations = getattr(self, "_entry_reservations", None) or {}
+        did = str(decision_id or "").strip()
+        if did:
+            for key, row in reservations.items():
+                if str((row or {}).get("decision_id") or "") == did:
+                    return dict(row or {}), normalize_symbol(key) or ns
+        row = reservations.get(ns) or reservations.get(symbol) or {}
+        return dict(row or {}), ns
 
     def _try_reserve_entry(
         self,
@@ -12154,9 +12333,18 @@ class PortfolioEngine:
         max_positions_limit = MAX_OPEN_POSITIONS
         if active_count + pending_slots >= max_positions_limit:
             return False, "MAX_POSITIONS_WITH_PENDING"
-        pending_n = self._pending_buy_notional()
-        if float(notional_usd) > float(self._available_balance) - pending_n + 1e-9:
-            return False, f"INSUFFICIENT_CASH_WITH_PENDING: need ${float(notional_usd):.2f}, free=${max(0.0, float(self._available_balance) - pending_n):.2f}"
+        from backend.services.day_entry_spendable import plan_reservation, spendable_quote
+
+        pending_n = self._pending_buy_notional(exclude_decision_id=did)
+        spendable = spendable_quote(
+            account_cash=self._available_balance,
+            other_reservations=pending_n,
+            include_own_reservation=False,
+        )
+        ok_res, reserved_amt, res_reason = plan_reservation(target=notional_usd, remaining_cash=spendable)
+        if not ok_res:
+            return False, res_reason
+        notional_usd = reserved_amt
         # Sleeve capacity including pending reserved notional for same sleeve
         if sleeve and ENABLE_SLEEVE_BLOCKING:
             sleeve_pending = sum(float((r or {}).get("notional") or 0.0) for r in (self._entry_reservations or {}).values() if str((r or {}).get("sleeve") or "") == str(sleeve))
@@ -12232,7 +12420,7 @@ class PortfolioEngine:
             if rows:
                 logger.info("DAY_RESERVATIONS_RECOVERED count=%s", len(rows))
 
-    async def _can_open_position(self, symbol: str, notional_usd: float) -> tuple[bool, str]:
+    async def _can_open_position(self, symbol: str, notional_usd: float, *, decision_id: str = "") -> tuple[bool, str]:
         """
         PHASE 2: Check if new position is allowed.
 
@@ -12325,8 +12513,11 @@ class PortfolioEngine:
             if live_cap is not None:
                 max_positions_limit = live_cap
         if symbol in self._pending_buy_symbols():
-            logger.info(f"BUY_BLOCKED_PENDING_ENTRY: {symbol} - reservation or pending buy already exists")
-            return False, "ENTRY_RESERVED_OR_PENDING"
+            own_res, _own_ns = self._own_entry_reservation(symbol, str(decision_id or ""))
+            own_reserved = bool(decision_id) and str(own_res.get("decision_id") or "") == str(decision_id or "")
+            if not own_reserved:
+                logger.info(f"BUY_BLOCKED_PENDING_ENTRY: {symbol} - reservation or pending buy already exists")
+                return False, "ENTRY_RESERVED_OR_PENDING"
         if active_count + pending_slots >= max_positions_limit:
             if PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK:
                 logger.info(
@@ -12446,15 +12637,35 @@ class PortfolioEngine:
 
         # CRITICAL: Check cash available (enforce conservation of money)
         # Pending entry reservations and in-flight BUY orders reduce free cash.
-        pending_notional = self._pending_buy_notional()
-        free_cash = float(self._available_balance) - pending_notional
+        # The submitting intent's own reservation is spendable.
+        from backend.services.day_entry_spendable import money
+
+        own_res, own_ns = self._own_entry_reservation(symbol, str(decision_id or ""))
+        own_reserved = bool(decision_id) and str(own_res.get("decision_id") or "") == str(decision_id or "")
+        pending_notional = self._pending_buy_notional(
+            exclude_symbol=own_ns if own_reserved else "",
+            exclude_decision_id=str(decision_id or "") if own_reserved else "",
+        )
+        free_cash = money(self._available_balance) - money(pending_notional)
         if free_cash <= 0:
-            logger.warning(f"BUY_BLOCKED_NO_CASH: {symbol} - available_balance=${self._available_balance:.2f} pending=${pending_notional:.2f}")
+            logger.warning(
+                "BUY_BLOCKED_NO_CASH: %s - available_balance=%s pending=%s",
+                symbol,
+                money(self._available_balance),
+                money(pending_notional),
+            )
             return False, "INSUFFICIENT_CASH"
 
-        if notional_usd > free_cash:
-            logger.info(f"BUY_BLOCKED_INSUFFICIENT_CASH: {symbol} - notional=${notional_usd:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_notional:.2f})")
-            return False, f"INSUFFICIENT_CASH: need ${notional_usd:.2f}, have ${free_cash:.2f}"
+        if money(notional_usd) - money("0.00000001") > free_cash:
+            logger.info(
+                "BUY_BLOCKED_INSUFFICIENT_CASH: %s - notional=%s > free=%s (available=%s pending=%s)",
+                symbol,
+                money(notional_usd),
+                free_cash,
+                money(self._available_balance),
+                money(pending_notional),
+            )
+            return False, f"INSUFFICIENT_CASH: need {money(notional_usd)} have {free_cash}"
 
         # Check portfolio risk cap (include reserved entry risk when present)
         total_open_risk = self._calculate_total_open_risk()
@@ -15220,28 +15431,40 @@ class PortfolioEngine:
             _api_symbol,
             _slash_symbol,
             decide_day_bar,
+            next_executable_path_ev_symbol,
         )
         from backend.services.decision_book_tape import record_day_bar_authority
 
+        # Telemetry-only 4H labels: THESIS_ENTRY_4H_INVALIDATION / no_clear_thesis_4h_invalidation
+        # never restore 4H buy/sell authority.
         decision = decide_day_bar(db_path=str(self.db_path or ""), candidates=list(valid_candidates or []))
         with contextlib.suppress(Exception):
             record_day_bar_authority(decision)
         self._last_day_path_ev_decision = decision
         if not str(decision.get("selected_action") or "").upper().startswith("BUY"):
             return None, decision
-        want = _api_symbol(str(decision.get("selected_symbol") or ""))
-        found = None
-        for cand in list(valid_candidates or []) + list(getattr(self, "current_bar_candidates", None) or []):
-            if _api_symbol(getattr(cand, "symbol", "")) == want:
-                found = cand
-                break
-        if found is None:
+        pool = list(valid_candidates or []) + list(getattr(self, "current_bar_candidates", None) or [])
+        by_api: dict[str, Any] = {}
+        for cand in pool:
+            api = _api_symbol(getattr(cand, "symbol", ""))
+            if api and api not in by_api:
+                by_api[api] = cand
+        picked = next_executable_path_ev_symbol(decision, executable_symbols=set(by_api))
+        if picked is None:
             decision = dict(decision)
             decision["selected_action"] = "HOLD"
             decision["why_selected"] = "PATH_NET_NO_SCORED_CANDIDATE"
             decision["true_safety_reject_reason"] = "PATH_NET_NO_SCORED_CANDIDATE"
             self._last_day_path_ev_decision = decision
             return None, decision
+        want, auth_pick = picked
+        found = by_api[want]
+        if want != _api_symbol(str(decision.get("selected_symbol") or "")):
+            decision = dict(decision)
+            decision["selected_action"] = f"BUY_{want}"
+            decision["selected_symbol"] = want
+            decision["selected_ev"] = float(auth_pick)
+            decision["why_selected"] = "PATH_NET_FALLBACK_EXECUTABLE"
         found.decision_data = dict(found.decision_data or {})
         cand_ev = 0.0
         with contextlib.suppress(Exception):
@@ -15275,225 +15498,185 @@ class PortfolioEngine:
         bar_candidate_snapshot: list,
         pipeline_done: set[str],
     ) -> int:
-        """Fill remaining open DAY slots with other buy-intent symbols on the same bar.
-
-        Primary selection still ranks; this only executes extras already queued in
-        ``self._bar_extra_buy_candidates`` (unheld, buy-intent, ranked). Returns
-        how many additional buys executed.
-        """
+        """Old-rank extras do not execute. Trailing-buy is the only automated DAY BUY."""
         extras = list(getattr(self, "_bar_extra_buy_candidates", None) or [])
         self._bar_extra_buy_candidates = []
-        # Direct four-coin path-EV buys one coin or HOLD. Old-rank extras do not execute.
         if extras:
             logger.info("MULTI_BUY_SKIP_OLD_RANK extras=%s", [getattr(c, "symbol", "") for c in extras])
         return 0
+
+    async def _arm_trailing_buy_ranked_stream(
+        self,
+        *,
+        ranked_candidates: list[BuyCandidate],
+        stream_candidates: list[BuyCandidate],
+        bar_timestamp: int,
+        path_ev_decision: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Arm ranked top-4 candidates. Path-EV BUY/HOLD is telemetry only."""
+        from backend.config.redis_config import get_redis_client
+        from backend.services.day_trailing_buy import (
+            arm_selected_candidate,
+            available_economic_slots,
+            fresh_executable_book,
+            select_ranked_arm_stream,
+        )
+        from backend.services.day_trailing_buy_store import load_active_intents
+
+        pool = select_ranked_arm_stream(ranked_candidates, stream_candidates)
         try:
             max_pos = int(os.getenv("MAX_OPEN_POSITIONS", str(getattr(self, "max_positions", 4) or 4)))
         except Exception:
             max_pos = 4
-        filled = 0
-        for cand in extras:
-            if len(self.open_positions) >= max_pos:
+        slots = available_economic_slots(
+            held=self._day_entry_held_count(),
+            pending_orders=len(self._pending_buy_order_symbols()),
+            max_positions=max_pos,
+        )
+        allowed, why = self._check_kill_switch_buy()
+        logger.info(
+            "TRAILING_BUY_STREAM_AUTHORITY path_ev_winner=%s path_ev_action=%s ranked=%s slots=%s kill_ok=%s",
+            (path_ev_decision or {}).get("path_ev_winner"),
+            (path_ev_decision or {}).get("selected_action"),
+            [getattr(c, "symbol", "") for c in pool],
+            slots,
+            allowed,
+        )
+        armed_rows: list[dict[str, Any]] = []
+        preserved_rows: list[dict[str, Any]] = []
+        if not allowed:
+            logger.info("TRAILING_BUY_STREAM_BLOCKED %s", why)
+            return {
+                "trailing_buy_armed": False,
+                "intents": [],
+                "preserved": [],
+                "blocked": str(why or "KILL_OR_PAUSE"),
+            }
+        redis_client = get_redis_client()
+        new_armed = 0
+        for candidate in pool:
+            if new_armed >= slots:
                 break
-            if cand.symbol in self.open_positions:
+            symbol = str(candidate.symbol or "")
+            block = self._day_path_ev_entry_block_reason(symbol, max_pos)
+            if block == "DUPLICATE_SAME_SYMBOL":
+                logger.info("TRAILING_BUY_STREAM_SKIP %s DUPLICATE_SAME_SYMBOL", symbol)
                 continue
-            symbol = cand.symbol
-            try:
-                await self._entry_ensure_constraints(symbol)
-                equity = self._total_equity
-                perf = self.coin_performance.get(symbol)
-                sizing_mult = perf.sizing_multiplier if perf else 1.0
-                strategy_id_for_size = str((cand.decision_data or {}).get("live_ai_strategy") or "day").strip().lower()
-                top_meta_score = float((cand.decision_data or {}).get("final_selection_score") or (cand.decision_data or {}).get("selection_score") or cand.rank_score())
-                top_net_ev = self._estimate_candidate_net_expected_value(cand.decision_data or {}, symbol=str(symbol or ""))
-                from backend.services.day_direct_path_ev_authority import HOLD_EV as _MIN_EV
+            if block == "MAX_OPEN_LIMIT":
+                logger.info("TRAILING_BUY_STREAM_SKIP MAX_OPEN_LIMIT")
+                break
+            decision_id = str(candidate.decision_id or f"tb-stream-{_to_api_symbol(symbol)}-{int(bar_timestamp)}")
+            await self._entry_ensure_constraints(symbol)
+            perf = self.coin_performance.get(symbol)
+            sizing_mult = perf.sizing_multiplier if perf else 1.0
+            quantity, stop_price, _risk_usd = self.calculate_position_size(
+                symbol,
+                self._total_equity,
+                candidate.atr,
+                candidate.current_price,
+                sizing_mult,
+                candidate.confidence,
+            )
+            if quantity <= 0:
+                logger.info("TRAILING_BUY_STREAM_SKIP %s BUY_SKIP_SIZING", symbol)
+                continue
+            book = fresh_executable_book(redis_client, symbol)
+            ask = float((book or {}).get("ask") or candidate.current_price or 0.0)
+            already_active = {str(row.get("symbol") or "") for row in load_active_intents(self.db_path)}
+            remaining_new = max(0, int(slots) - len(already_active))
+            from backend.services.day_entry_spendable import money, remaining_slot_cap, spendable_quote
 
-                if float(top_net_ev) <= _MIN_EV:
-                    logger.info("MULTI_BUY_SKIP_BELOW_EV_FLOOR symbol=%s net_ev=%.6f floor=%.6f", symbol, float(top_net_ev), _MIN_EV)
-                    continue
-                dyn_mult, _dyn_components, dyn_cap_reason = self._compute_dynamic_sizing_multiplier(
-                    symbol=symbol,
-                    strategy_id=strategy_id_for_size,
-                    final_profit_score=top_meta_score,
-                    net_expected_value=float(top_net_ev),
-                    confidence=float(cand.confidence or 0.0),
-                    decision_data=cand.decision_data or {},
-                    chop_score=float(cand.chop_score) if cand.chop_score is not None else None,
-                    coin_edge_score=float(cand.coin_edge_score) if cand.coin_edge_score is not None else None,
+            free_cash = spendable_quote(
+                account_cash=getattr(self, "_available_balance", 0.0) or 0.0,
+                other_reservations=self._pending_buy_notional(),
+            )
+            cap = remaining_slot_cap(free_cash=free_cash, remaining_new_slots=remaining_new)
+            ask_m = money(ask)
+            qty_m = money(quantity)
+            reserved_notional = qty_m * ask_m if ask_m > 0 else money(0)
+            if ask_m > 0 and cap > 0 and reserved_notional > cap:
+                qty_m = cap / ask_m
+                reserved_notional = cap
+                quantity = float(qty_m)
+                logger.info(
+                    "TRAILING_BUY_STREAM_SLOT_CAP symbol=%s cap=%s ask=%.8f qty=%.8f remaining_new=%s",
+                    symbol,
+                    cap,
+                    ask,
+                    quantity,
+                    remaining_new,
                 )
-                sizing_mult *= dyn_mult
-                quantity, stop_price, _risk_usd = self.calculate_position_size(symbol, equity, cand.atr, cand.current_price, sizing_mult, cand.confidence)
-                if quantity <= 0:
-                    logger.info(
-                        "MULTI_BUY_SKIP_SIZE symbol=%s dyn_cap_reason=%s",
-                        symbol,
-                        dyn_cap_reason,
-                    )
-                    continue
-                self._hydrate_buy_candidate_audit_from_redis_if_missing(cand)
-                explainability = TradeExplainability(
-                    trade_id="",
-                    symbol=symbol,
-                    side="BUY",
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                    ai_confidence=cand.confidence,
-                    trend_score=cand.trend_score,
-                    chop_score=cand.chop_score,
-                    coin_edge_score=cand.coin_edge_score,
-                    composite_score=cand.composite_score,
-                    regime=(cand.decision_data or {}).get("regime", "unknown"),
-                    price_structure_regime=cand.price_structure_regime,
-                    coin_win_rate_20=perf.win_rate_20 if perf else 0.5,
-                    coin_expectancy=perf.expectancy if perf else 0.0,
-                    portfolio_open_risk=self._calculate_total_open_risk(),
-                )
-                _dd = cand.decision_data or {}
-                # Keep Redis/artifact namespace on canonical day ML — AW family labels are
-                # attribution/shadow only when DAY_AW_OWNER is off (multi-buy was fetching
-                # ai_signal:allweather_breakout_pullback:* and missing setup stamps).
-                _sid = str(_dd.get("live_ai_strategy") or "day").strip().lower() or "day"
-                _aw_owner = os.getenv("DAY_AW_OWNER_ENABLED", "false").lower() in ("1", "true", "yes", "on")
-                if (not _aw_owner) and _sid in (
-                    "allweather_breakout_pullback",
-                    "allweather",
-                    "aw",
-                ):
-                    _sid = "day"
-                explainability.live_ai_strategy = _sid
-                # Same artifact + thesis stamps as primary bar buy — without these,
-                # ARTIFACT_CONTRACT / ENTRY_EXIT_MISSING_PRICE_OR_SETUP fail closed.
-                explainability.artifact_path = str(_dd.get("model_artifact_path") or "")
-                explainability.artifact_sha256 = str(_dd.get("artifact_sha256") or "")
-                _stamp_model_metadata_with_redis_fallback(explainability, _dd, symbol, _sid)
-                try:
-                    explainability.feature_version = int(_dd.get("feature_version") or 0)
-                except (TypeError, ValueError):
-                    explainability.feature_version = 0
-                try:
-                    explainability.feature_dim = int(_dd.get("feature_dim") or 0)
-                except (TypeError, ValueError):
-                    explainability.feature_dim = 0
-                explainability.setup_type = str(_dd.get("setup_type") or _dd.get("entry_thesis") or "")
-                explainability.entry_thesis = str(_dd.get("entry_thesis") or explainability.setup_type)
-                explainability.thesis_score = float(_safe_float(_dd.get("thesis_score"), 0.0))
-                explainability.thesis_invalid_level = float(_safe_float(_dd.get("thesis_invalid_level"), 0.0))
-                explainability.thesis_target_level = float(_safe_float(_dd.get("thesis_target_level"), 0.0))
-                explainability.entry_vwap = float(_safe_float(_dd.get("entry_vwap"), 0.0))
-                explainability.day_route_regime = str(_dd.get("day_route_regime") or _dd.get("regime") or "")
-                explainability.strategy_family = str(_dd.get("strategy_family") or "")
-                explainability.price_structure_regime = str(_dd.get("price_structure_regime") or getattr(cand, "price_structure_regime", "") or "")
-                try:
-                    _ebm = _dd.get("buy_margin")
-                    explainability.entry_buy_margin = float(_ebm) if _ebm not in (None, "") else None
-                except (TypeError, ValueError):
-                    explainability.entry_buy_margin = None
-                # P1B measurement stamps (multi-buy path)
-                for _attr, _key in (
-                    ("prob_buy", "prob_buy"),
-                    ("prob_hold", "prob_hold"),
-                    ("prob_sell", "prob_sell"),
-                ):
-                    try:
-                        _raw = _dd.get(_key)
-                        setattr(
-                            explainability,
-                            _attr,
-                            float(_raw) if _raw not in (None, "") else None,
-                        )
-                    except (TypeError, ValueError):
-                        setattr(explainability, _attr, None)
-                explainability.quality_opinion_penalty = float(_safe_float(_dd.get("quality_opinion_penalty"), 0.0))
-                explainability.signal_side_penalty = float(_safe_float(_dd.get("signal_side_penalty"), 0.0))
-                explainability.rank_score = float(_safe_float(_dd.get("rank_score"), cand.rank_score()))
-                explainability.final_selection_score = float(_safe_float(_dd.get("final_selection_score"), explainability.rank_score))
-                explainability.selected_score = explainability.final_selection_score
-                explainability.selected_net_expected_value = float(_safe_float(_dd.get("selected_net_expected_value"), _safe_float(_dd.get("adjusted_ev"), 0.0)))
-                explainability.why_selected = str(_dd.get("why_selected") or "")
-                explainability.selection_key_used = str(_dd.get("selection_key_used") or "")
-                explainability.arbiter_winner_reason = str(_dd.get("why_selected") or _dd.get("arbiter_winner_reason") or "multi_buy_capacity_fill")
-                explainability.winner_symbol = str(_dd.get("winner_symbol") or symbol or "")
-                explainability.winner_score = float(_safe_float(_dd.get("winner_score"), explainability.final_selection_score))
-                explainability.runner_up_symbol = str(_dd.get("runner_up_symbol") or "")
-                explainability.runner_up_score = float(_safe_float(_dd.get("runner_up_score"), 0.0))
-                explainability.skipped_reason = str(_dd.get("skipped_reason") or "")
-                explainability.argmax_action = str(_dd.get("argmax_action") or "")
-                explainability.prediction = str(_dd.get("prediction") or _dd.get("argmax_action") or "")
-                explainability.side_signal = str(_dd.get("side") or _dd.get("action") or "")
-                _stamp_low_mfe_outcome_explain(explainability, _dd)
-                _stamp_day_bandit_explain(explainability, _dd)
-                _stamp_entry_confirmation_explain(explainability, _dd)
-                _stamp_htf_anchor_explain(explainability, _dd)
-                _stamp_liquidity_gate_explain(explainability, _dd)
-                with contextlib.suppress(Exception):
-                    from backend.services.entry_decision_authority import build_day_entry_provenance
-
-                    explainability.entry_provenance = build_day_entry_provenance(
-                        decision_data=_dd,
-                        symbol=str(symbol or ""),
-                        decision_id=str(getattr(cand, "decision_id", "") or ""),
-                        bar_timestamp=bar_timestamp,
-                        rank_score=explainability.final_selection_score,
-                        why_selected=str(explainability.why_selected or ""),
-                        direction_probability=explainability.prob_buy,
-                        feature_fingerprint=str(explainability.artifact_sha256 or explainability.feature_version or ""),
-                    )
-                    from backend.services.decision_book_tape import record_day_decision
-
-                    record_day_decision(symbol=str(symbol or ""), provenance=explainability.entry_provenance)
-                if not explainability.entry_thesis:
-                    logger.warning(
-                        "MULTI_BUY_MISSING_SETUP symbol=%s decision_id=%s dd_keys=%s",
-                        symbol,
-                        cand.decision_id,
-                        sorted(_dd.keys())[:40],
-                    )
-                exec_price = float(cand.current_price or 0.0)
-                with contextlib.suppress(Exception):
-                    from backend.config.redis_config import get_redis_client
-                    from backend.utils.symbols import to_exchange_symbol
-
-                    redis_client = get_redis_client()
-                    if redis_client:
-                        base_symbol = to_exchange_symbol(symbol).replace("USDT", "")
-                        price_str = redis_client.get(f"market:{base_symbol}")
-                        if price_str:
-                            if isinstance(price_str, str):
-                                price_json = json.loads(price_str)
-                                fresh = float(price_json["price"]) if isinstance(price_json, dict) and "price" in price_json else float(price_str)
-                            else:
-                                fresh = float(price_str)
-                            if fresh > 0:
-                                exec_price = fresh
-                extra_result = await self.execute_buy_fifo(
-                    symbol=symbol,
-                    quantity=quantity,
-                    price=exec_price,
-                    stop_price=stop_price,
-                    atr=cand.atr,
-                    confidence=cand.confidence,
-                    bar_timestamp=bar_timestamp,
-                    explainability=explainability,
-                    decision_id=cand.decision_id,
-                    sleeve=getattr(cand, "sleeve", "") or "",
-                )
-                if extra_result is not None:
-                    filled += 1
-                    if cand.decision_id:
-                        pipeline_done.add(str(cand.decision_id))
-                    logger.info(
-                        "MULTI_BUY_EXECUTED symbol=%s qty=%.6f price=%.4f decision_id=%s",
-                        symbol,
-                        float(quantity),
-                        float(exec_price),
-                        cand.decision_id,
-                    )
-                else:
-                    logger.info("MULTI_BUY_BLOCKED symbol=%s decision_id=%s", symbol, cand.decision_id)
-            except Exception:
-                logger.exception("MULTI_BUY_ERROR symbol=%s", symbol)
-        if filled:
-            logger.info("MULTI_BUY_DONE filled=%d open_positions=%d", filled, len(self.open_positions))
-        return filled
+            if qty_m <= 0 or cap <= 0:
+                logger.info("TRAILING_BUY_STREAM_SKIP %s NO_REMAINING_SLOT_CASH", symbol)
+                continue
+            explainability = TradeExplainability(
+                trade_id="",
+                symbol=symbol,
+                side="BUY",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                ai_confidence=candidate.confidence,
+                trend_score=candidate.trend_score,
+                chop_score=candidate.chop_score,
+                coin_edge_score=candidate.coin_edge_score,
+                composite_score=candidate.composite_score,
+                regime=(candidate.decision_data or {}).get("regime", "unknown"),
+                price_structure_regime=candidate.price_structure_regime,
+                coin_win_rate_20=perf.win_rate_20 if perf else 0.5,
+                coin_expectancy=perf.expectancy if perf else 0.0,
+                portfolio_open_risk=self._calculate_total_open_risk(),
+            )
+            explainability.live_ai_strategy = str((candidate.decision_data or {}).get("live_ai_strategy") or "day")
+            explainability.decision_id = decision_id
+            armed = await arm_selected_candidate(
+                self,
+                symbol=symbol,
+                quantity=quantity,
+                stop_price=stop_price,
+                atr=float(candidate.atr or 0.0),
+                confidence=float(candidate.confidence or 0.0),
+                bar_timestamp=int(bar_timestamp),
+                explainability=explainability,
+                decision_id=decision_id,
+                sleeve=getattr(candidate, "sleeve", "") or "",
+                decision_data=dict(candidate.decision_data or {}),
+                redis_client=redis_client,
+                reserved_notional=reserved_notional,
+            )
+            if not armed or not armed.get("trailing_buy_armed"):
+                continue
+            intent = dict(armed.get("intent") or {})
+            row = {
+                "symbol": symbol,
+                "intent_id": intent.get("intent_id"),
+                "decision_id": intent.get("decision_id") or decision_id,
+                "arm_ask": intent.get("arm_ask"),
+                "state": intent.get("status"),
+                "preserved": bool(armed.get("preserved")),
+            }
+            if armed.get("preserved") or armed.get("idempotent"):
+                preserved_rows.append(row)
+            else:
+                armed_rows.append(row)
+                new_armed += 1
+        active = load_active_intents(self.db_path)
+        first = (armed_rows or preserved_rows or [{}])[0]
+        logger.info(
+            "TRAILING_BUY_STREAM_RESULT new=%s preserved=%s active=%s symbols=%s",
+            len(armed_rows),
+            len(preserved_rows),
+            len(active),
+            [str(r.get("symbol") or "") for r in active],
+        )
+        return {
+            "trailing_buy_armed": bool(armed_rows or preserved_rows or active),
+            "symbol": first.get("symbol"),
+            "intent_id": first.get("intent_id"),
+            "decision_id": first.get("decision_id"),
+            "arm_ask": first.get("arm_ask"),
+            "intents": armed_rows + preserved_rows,
+            "preserved": preserved_rows,
+            "active_intent_count": len(active),
+        }
 
     def _arm_trailing_buy(
         self,
@@ -17021,27 +17204,6 @@ class PortfolioEngine:
             },
         )
 
-        # Fresh price lookup to avoid executing on stale signal price (can be up to 60s old)
-        exec_price = top_candidate.current_price
-        try:
-            from backend.config.redis_config import get_redis_client
-            from backend.utils.symbols import to_exchange_symbol
-
-            redis_client = get_redis_client()
-            if redis_client:
-                base_symbol = to_exchange_symbol(symbol).replace("USDT", "")
-                price_str = redis_client.get(f"market:{base_symbol}")
-                if price_str:
-                    if isinstance(price_str, str):
-                        price_json = json.loads(price_str)
-                        fresh = float(price_json["price"]) if isinstance(price_json, dict) and "price" in price_json else float(price_str)
-                    else:
-                        fresh = float(price_str)
-                    if fresh > 0:
-                        exec_price = fresh
-        except Exception as e:
-            logger.debug("FRESH_PRICE_LOOKUP: %s fallback to candidate price: %s", symbol, e)
-
         # Optional entry quality gate (setup_credit / RS floor/rank) — default OFF.
         from backend.config.day_entry_gates import day_entry_gates_enforced
         from backend.services.day_entry_quality_gate import evaluate_entry_quality, persist_last_bar_evaluation
@@ -17181,23 +17343,23 @@ class PortfolioEngine:
             self.current_bar_candidates.clear()
             return None
 
-        # Arm Trailing Buy. Fill happens on the first confirmed ask rebound.
-        result = self._arm_trailing_buy(
-            symbol=symbol,
-            quantity=quantity,
-            price=exec_price,
-            stop_price=stop_price,
-            atr=top_candidate.atr,
-            confidence=top_candidate.confidence,
-            bar_timestamp=bar_timestamp,
-            explainability=explainability,
-            decision_id=top_candidate.decision_id,
-            sleeve=getattr(top_candidate, "sleeve", "") or "",
+        # Arm Trailing Buy for the ranked top-4 stream. Fill happens on rebound.
+        result = await self._arm_trailing_buy_ranked_stream(
+            ranked_candidates=valid_candidates,
+            stream_candidates=bar_candidate_snapshot,
+            bar_timestamp=int(bar_timestamp),
+            path_ev_decision=_day_auth,
         )
 
         # Paper Redis/cache sync is handled inside execute_buy_fifo (trade_id passed; no duplicate SQLite rows).
 
-        selected_disposition = "selected_trade_armed" if result is not None and result.get("armed") else ("selected_trade" if result is not None else "selected_no_trade")
+        armed_ok = bool(result is not None and (result.get("armed") or result.get("trailing_buy_armed")))
+        if armed_ok:
+            selected_disposition = "selected_trade_armed"
+        elif result is not None:
+            selected_disposition = "selected_trade"
+        else:
+            selected_disposition = "selected_no_trade"
         for _row in cycle_leaderboard:
             if _row.get("symbol") == top_candidate.symbol and str(_row.get("strategy_id")) == str(top_candidate.decision_data.get("live_ai_strategy") or "day"):
                 _row["disposition"] = selected_disposition
@@ -17208,7 +17370,7 @@ class PortfolioEngine:
         # NO_TRADE = ranked below the selected candidate. Execution unchanged.
         for _li, _lc in enumerate(valid_candidates):
             if _lc is top_candidate:
-                if result is not None and result.get("armed"):
+                if result is not None and (result.get("armed") or result.get("trailing_buy_armed")):
                     _ldec = "ARMED"
                     _lreason = "trailing_buy_waiting"
                 elif result is not None:
@@ -17237,6 +17399,8 @@ class PortfolioEngine:
                     "selected_symbol": top_candidate.symbol,
                     "selected_strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
                     "selected_trade": bool(result is not None),
+                    "path_ev_authoritative": False,
+                    "day_authority_mode": "trailing_buy_ranked_stream",
                     "selected_candidate": {
                         "symbol": top_candidate.symbol,
                         "strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
@@ -18028,6 +18192,16 @@ class PortfolioEngine:
         cb = bool(persisted.get("equity_circuit_breaker_active"))
         freeze = bool(persisted.get("daily_loss_freeze_active"))
         failsafe_p = bool(persisted.get("account_failsafe_active"))
+        if memory_blocked and not requested_blocked and not cb and not freeze and not failsafe_p:
+            logger.info(
+                "KILL_SWITCH_MEMORY_RECONCILED: persisted=RESUME memory_was=%s reason_was=%s",
+                memory_mode,
+                self._kill_switch_reason,
+            )
+            self._kill_switch_mode = KillSwitchMode.RESUME
+            self._kill_switch_reason = ""
+            memory_mode = KillSwitchMode.RESUME.value
+            memory_blocked = False
         blocked = bool(memory_blocked or requested_blocked or cb or freeze or failsafe_p)
         active = None
         reasons: list[str] = []
@@ -18171,7 +18345,9 @@ class PortfolioEngine:
         live_dust_value = 0.0
         for row in dust_list:
             try:
-                live_dust_value += float(row.get("market_value") or row.get("quantity", 0) or 0) * float(row.get("current_price") or row.get("entry_price") or 0)
+                qty = float(row.get("quantity") or 0)
+                mark = float(row.get("current_price") or row.get("entry_price") or 0)
+                live_dust_value += qty * mark
             except (TypeError, ValueError):
                 pass
         if live_dust_value <= 0:
@@ -18246,10 +18422,10 @@ class PortfolioEngine:
             # POSITION SUMMARY
             "open_positions": positions_list,
             "positions": positions_list,
-            "positions_count": len(self.open_positions),
+            "positions_count": self._count_live_slots(),
             "max_positions": MAX_OPEN_POSITIONS,
-            "slots_used": len(self.open_positions),
-            "slots_open": max(0, MAX_OPEN_POSITIONS - len(self.open_positions)),
+            "slots_used": self._count_live_slots(),
+            "slots_open": max(0, MAX_OPEN_POSITIONS - self._count_live_slots()),
             # AUTHORITATIVE LEDGER (single meaning: account / cash+marks)
             "cash_balance": self.cash_balance,
             "positions_value": self._positions_value,

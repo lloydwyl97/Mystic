@@ -171,27 +171,26 @@ class LiveMarketDataService:
         self._writer_lock: Any | None = None
 
     async def _persist_latest_1m_candle(self, ccxt_symbol: str, ohlcv: list) -> bool:
-        """Write latest 1m bar to feature_ohlcv (replaces standalone live_data_collector)."""
+        """Hand 1m REST rows to the single canonical candle writer."""
         if not ohlcv:
             return False
-        last = ohlcv[-1]
-        if not isinstance(last, (list, tuple)) or len(last) < 6:
-            return False
-        db_symbol = str(ccxt_symbol).replace("/", "-")
-        candle = {
-            "open": float(last[1]),
-            "high": float(last[2]),
-            "low": float(last[3]),
-            "close": float(last[4]),
-            "volume": float(last[5]),
-        }
         try:
-            from backend.services.feature_store import insert_ohlcv
+            from backend.services.canonical_candle_pipeline import canonical_candle_pipeline
 
-            await asyncio.to_thread(insert_ohlcv, db_symbol, "1m", candle)
+            klines = []
+            for row in ohlcv:
+                if not isinstance(row, (list, tuple)) or len(row) < 6:
+                    continue
+                ts = int(row[0])
+                if ts < 10_000_000_000:
+                    ts *= 1000
+                klines.append([ts, row[1], row[2], row[3], row[4], row[5]])
+            if not klines:
+                return False
+            await canonical_candle_pipeline.ingest_klines(ccxt_symbol, "1m", klines, persist=True)
             return True
         except Exception as exc:
-            logger.debug("feature_ohlcv persist failed %s: %s", db_symbol, exc)
+            logger.debug("canonical 1m persist failed %s: %s", ccxt_symbol, exc)
             return False
 
     async def _mark_market_heartbeat(self) -> None:
@@ -236,7 +235,13 @@ class LiveMarketDataService:
             await task_manager.create_task(self._ticker_loop(), name="live_market_data:ticker_loop"),
             await task_manager.create_task(self._ohlcv_loop(), name="live_market_data:ohlcv_loop"),
         ]
-        logger.info("LiveMarketDataService started (Binance.US only)")
+        try:
+            from backend.services.canonical_candle_pipeline import canonical_candle_pipeline
+
+            await canonical_candle_pipeline.start()
+        except Exception as exc:
+            logger.warning("canonical candle pipeline start failed: %s", exc)
+        logger.info("LiveMarketDataService started (Binance.US only; canonical candle writer)")
 
     async def _get_limiter(self) -> BinanceWeightLimiter:
         """Return shared Binance weight limiter for market data REST calls."""
@@ -282,6 +287,12 @@ class LiveMarketDataService:
         if self._writer_lock is not None:
             await self._writer_lock.release()
             self._writer_lock = None
+        try:
+            from backend.services.canonical_candle_pipeline import canonical_candle_pipeline
+
+            await canonical_candle_pipeline.stop()
+        except Exception as exc:
+            logger.debug("canonical candle pipeline stop: %s", exc)
         logger.info("LiveMarketDataService stopped")
 
     # ---------------- loops ----------------
@@ -617,6 +628,27 @@ class LiveMarketDataService:
         s = _to_ccxt_symbol(ccxt_symbol)
         cache_key = self._ohlcv_cache_key(s, timeframe, limit)
         symbol = ccxt_symbol.replace("/", "").replace("-", "")
+        try:
+            from backend.services.canonical_candle_store import load_aligned_candles
+
+            stored = load_aligned_candles(symbol, str(timeframe), limit=int(limit))
+            if stored and end_time_ms is None:
+                rows = [[int(c["open_ms"]), c["open"], c["high"], c["low"], c["close"], c["volume"]] for c in stored]
+                self._store_ohlcv_cache(cache_key, rows)
+                self._ohlcv_fetch_success += 1
+                return {
+                    "rows": rows,
+                    "used_cache": True,
+                    "retry_count": 0,
+                    "error_type": None,
+                    "endpoint": "canonical_candle_store",
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "recovered": False,
+                    "kline_fetch_failed": False,
+                }
+        except Exception as exc:
+            logger.debug("canonical store read miss %s %s: %s", s, timeframe, exc)
         url = f"{self.base_url}/klines"
         endpoint = f"GET {url}"
         retry_count = 0
@@ -792,7 +824,30 @@ class LiveMarketDataService:
     async def get_historical_data(self, symbol: str, timeframe: str = "1m", limit: int = 300) -> dict[str, Any]:
         s = _to_ccxt_symbol(symbol)
         try:
-            ohlcv = await asyncio.to_thread(self.binance.fetch_ohlcv, s, timeframe, limit=limit)
+            from backend.services.canonical_candle_pipeline import get_canonical_candles
+
+            payload = await get_canonical_candles(s, timeframe, limit=limit, include_forming=True)
+            candles = payload.get("candles") or []
+            if payload.get("success") and candles:
+                return {
+                    "status": "success",
+                    "data": {
+                        "timestamps": [c["open_ms"] for c in candles],
+                        "opens": [c["open"] for c in candles],
+                        "highs": [c["high"] for c in candles],
+                        "lows": [c["low"] for c in candles],
+                        "closes": [c["close"] for c in candles],
+                        "volumes": [c["volume"] for c in candles],
+                    },
+                    "symbol": s,
+                    "timeframe": timeframe,
+                    "source": "canonical",
+                    "forming": payload.get("forming"),
+                    "freshness": payload.get("freshness"),
+                }
+            ohlcv = await self.get_ohlcv(s, timeframe, limit)
+            if not ohlcv:
+                return {"status": "error", "message": "no_canonical_data", "symbol": s, "timeframe": timeframe}
             return {
                 "status": "success",
                 "data": {
@@ -831,10 +886,13 @@ class LiveMarketDataService:
             "2h": "2h",
             "4h": "4h",
             "6h": "6h",
+            "8h": "8h",
             "12h": "12h",
             "1d": "1d",
             "1w": "1w",
-        }.get(interval, "1m")
+        }.get(interval, "")
+        if not tf:
+            return []
         res = await self.get_historical_data(symbol, tf, 300)
         if res.get("status") != "success":
             return []

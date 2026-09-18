@@ -227,10 +227,7 @@ def stored_partition_contract(db_path: str | Path) -> dict[str, Any] | None:
 
 def declare_final_test_window(*_args: Any, **_kwargs: Any) -> None:
     """Refuse to create the final test window from this task."""
-    raise RuntimeError(
-        "FINAL_TEST is NOT_YET_CREATED by contract. It may only be declared after the v5 "
-        "specification is frozen and training is complete, and must cover future observations."
-    )
+    raise RuntimeError("FINAL_TEST is NOT_YET_CREATED by contract. It may only be declared after the v5 specification is frozen and training is complete, and must cover future observations.")
 
 
 __all__ = [

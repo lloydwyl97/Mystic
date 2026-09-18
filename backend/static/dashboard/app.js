@@ -204,6 +204,7 @@ function init() {
     initLiveBalanceWidget();
     initLiveTestCard();
     initRestartBanner();
+    initCanonicalCandles();
 }
 
 const ENDPOINT_FRESHNESS = {};
@@ -2803,7 +2804,7 @@ function updateExecutionMode(data) {
             badge.className = "header__mode header__mode--clickable live-test";
             badge.dataset.effectiveMode = "live-test";
         } else if (effective === "live") {
-            badge.textContent = "LIVE";
+            badge.textContent = "DAY LIVE · SCALP PAPER";
             badge.className = "header__mode header__mode--clickable live";
             badge.dataset.effectiveMode = "live";
         } else {
@@ -2832,7 +2833,7 @@ function updateOperator(data) {
             badge.className = "header__mode header__mode--clickable live-test";
             badge.dataset.effectiveMode = "live-test";
         } else if (mode === "live") {
-            badge.textContent = "LIVE";
+            badge.textContent = "DAY LIVE · SCALP PAPER";
             badge.className = "header__mode header__mode--clickable live";
             badge.dataset.effectiveMode = "live";
         } else {
@@ -3795,6 +3796,103 @@ function initLiveTestCard() {
             armRow.style.display = requireArm.checked ? "flex" : "none";
         });
     }
+}
+
+function initCanonicalCandles() {
+    const symbolEl = document.getElementById("candle-symbol");
+    const intervalEl = document.getElementById("candle-interval");
+    if (!symbolEl || !intervalEl) return;
+    const reload = function () { loadCanonicalCandles(); };
+    symbolEl.addEventListener("change", reload);
+    intervalEl.addEventListener("change", reload);
+    loadCanonicalCandles();
+    setInterval(loadCanonicalCandles, 20000);
+}
+
+async function loadCanonicalCandles() {
+    const symbolEl = document.getElementById("candle-symbol");
+    const intervalEl = document.getElementById("candle-interval");
+    const errEl = document.getElementById("candle-no-data");
+    const freshEl = document.getElementById("candle-freshness");
+    if (!symbolEl || !intervalEl) return;
+    const symbol = symbolEl.value;
+    const interval = intervalEl.value;
+    try {
+        const res = await fetch("/api/market/candles?symbol=" + encodeURIComponent(symbol) + "&interval=" + encodeURIComponent(interval) + "&limit=180");
+        const data = await res.json();
+        if (!data || !data.success || !Array.isArray(data.candles) || !data.candles.length) {
+            if (errEl) {
+                errEl.style.display = "block";
+                errEl.textContent = (data && data.error) ? String(data.error) : "No data";
+            }
+            if (freshEl) freshEl.textContent = "error";
+            return;
+        }
+        if (errEl) errEl.style.display = "none";
+        const fresh = data.freshness || {};
+        if (freshEl) {
+            freshEl.textContent = interval + " · " + data.candles.length + " bars · db_age=" +
+                (fresh.database_age_sec != null ? Number(fresh.database_age_sec).toFixed(0) + "s" : "--") +
+                " · source=" + (data.source || "canonical") +
+                (interval === "4h" ? " · TELEMETRY_ONLY_NO_TRADE_AUTHORITY" : "");
+        }
+        drawCanonicalCandles(data.candles);
+        recordEndpointFreshness("canonicalCandles", true);
+    } catch (e) {
+        if (errEl) {
+            errEl.style.display = "block";
+            errEl.textContent = "data error";
+        }
+        recordEndpointFreshness("canonicalCandles", false);
+    }
+}
+
+function drawCanonicalCandles(candles) {
+    const priceCanvas = document.getElementById("chart-canonical-candles");
+    const volCanvas = document.getElementById("chart-canonical-volume");
+    if (!priceCanvas || !volCanvas) return;
+    const priceCtx = priceCanvas.getContext("2d");
+    const volCtx = volCanvas.getContext("2d");
+    const w = priceCanvas.clientWidth || 640;
+    priceCanvas.width = w;
+    volCanvas.width = w;
+    const ph = priceCanvas.height;
+    const vh = volCanvas.height;
+    priceCtx.clearRect(0, 0, w, ph);
+    volCtx.clearRect(0, 0, w, vh);
+    const highs = candles.map(function (c) { return Number(c.high); });
+    const lows = candles.map(function (c) { return Number(c.low); });
+    const vols = candles.map(function (c) { return Number(c.volume) || 0; });
+    const minP = Math.min.apply(null, lows);
+    const maxP = Math.max.apply(null, highs);
+    const maxV = Math.max.apply(null, vols.concat([0]));
+    const pad = 8;
+    const span = (maxP - minP) || (maxP * 0.0001) || 1;
+    const slot = (w - pad * 2) / candles.length;
+    candles.forEach(function (c, i) {
+        const o = Number(c.open);
+        const h = Number(c.high);
+        const l = Number(c.low);
+        const cl = Number(c.close);
+        const v = Number(c.volume) || 0;
+        const x = pad + i * slot + slot / 2;
+        const y = function (p) { return pad + (1 - (p - minP) / span) * (ph - pad * 2); };
+        const up = cl >= o;
+        const forming = !!c.forming;
+        priceCtx.strokeStyle = forming ? "#f0b90b" : (up ? "#0ecb81" : "#f6465d");
+        priceCtx.fillStyle = priceCtx.strokeStyle;
+        priceCtx.beginPath();
+        priceCtx.moveTo(x, y(h));
+        priceCtx.lineTo(x, y(l));
+        priceCtx.stroke();
+        const top = y(Math.max(o, cl));
+        const bot = y(Math.min(o, cl));
+        const bodyH = Math.max(2, bot - top);
+        priceCtx.fillRect(x - Math.max(1, slot * 0.3), top, Math.max(2, slot * 0.6), bodyH);
+        const vhgt = maxV > 0 ? (v / maxV) * (vh - 4) : 0;
+        volCtx.fillStyle = v === 0 ? "#6e7681" : (up ? "#0ecb81" : "#f6465d");
+        volCtx.fillRect(x - Math.max(1, slot * 0.3), vh - vhgt, Math.max(2, slot * 0.6), Math.max(v === 0 ? 1 : 0, vhgt));
+    });
 }
 
 if (document.readyState === "loading") {
