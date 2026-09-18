@@ -189,6 +189,46 @@ def test_ranked_stream_records_hard_block_reason(tmp_path, monkeypatch):
     assert captured[0]["first_hard_block"] == "KILL_OR_PAUSE"
 
 
+def test_arm_result_never_reports_a_phantom_execute():
+    """The nominee record site must not call a blocked arm an execution.
+
+    _arm_trailing_buy_ranked_stream returns "trailing_buy_armed" and never a
+    "quantity", so the old `result.get("armed")` check made "arm" unreachable and
+    sent every non-None result to "execute" -- 559 of 1468 production rows claimed
+    an execution with approved_size NULL and no matching fill.
+    """
+    from backend.services.portfolio_engine import _to_api_symbol
+
+    def label(result: dict | None, nominee: str) -> tuple[str, str]:
+        armed_syms = {_to_api_symbol(str((r or {}).get("symbol") or "")) for r in (result or {}).get("intents") or []}
+        if result is None:
+            return "reject", "EXECUTION_GATE"
+        if result.get("quantity") is not None:
+            return "execute", ""
+        if result.get("armed") or result.get("trailing_buy_armed"):
+            ok = _to_api_symbol(nominee) in armed_syms
+            return ("arm", "") if ok else ("reject", "NOT_ARMED_THIS_BAR")
+        return "reject", str(result.get("blocked") or "NOT_ARMED_THIS_BAR")
+
+    # Armed for the nominee -> "arm", not "execute".
+    assert label({"trailing_buy_armed": True, "intents": [{"symbol": "BTCUSDT"}]}, "BTC/USDT") == ("arm", "")
+
+    # Armed, but for a different coin -> the nominee did not arm.
+    assert label({"trailing_buy_armed": True, "intents": [{"symbol": "ETHUSDT"}]}, "BTC/USDT") == ("reject", "NOT_ARMED_THIS_BAR")
+
+    # Blocked -> carries the real reason, never "execute".
+    assert label({"trailing_buy_armed": False, "intents": [], "blocked": "KILL_OR_PAUSE"}, "BTC/USDT") == ("reject", "KILL_OR_PAUSE")
+
+    # Nothing armed and no reason -> still not an execution.
+    assert label({"trailing_buy_armed": False, "intents": []}, "BTC/USDT") == (
+        "reject",
+        "NOT_ARMED_THIS_BAR",
+    )
+
+    # Only a real filled quantity earns "execute".
+    assert label({"quantity": 0.00077, "intents": []}, "BTC/USDT") == ("execute", "")
+
+
 def test_episode_table_survives_json_payloads(db):
     rec = _rec(
         "BTC/USDT",

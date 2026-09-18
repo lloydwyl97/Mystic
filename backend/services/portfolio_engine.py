@@ -17769,21 +17769,42 @@ class PortfolioEngine:
             result = dict(result)
             result["decision_id"] = top_candidate.decision_id
 
+        # Cover every ranked symbol, not just the path-EV nominee. This branch used to
+        # record one row per bar, so three of the four coins had no decision row at all
+        # whenever path-EV named a winner. record_day_decision upserts on decision_id,
+        # so this runs first and the richer nominee record below overwrites its row.
+        self._record_ranked_stream_decisions(
+            ranked_candidates=valid_candidates,
+            bar_timestamp=int(bar_timestamp),
+            arm_result=result,
+            path_ev_decision=_day_auth,
+        )
+
         # Structured DAY decision record (authority + measurement)
         with contextlib.suppress(Exception):
             from backend.services.day_gate_telemetry import record_day_decision
 
             _dd_final = dict(getattr(top_candidate, "decision_data", None) or {})
             _gates_eval = list(_dd_final.get("gates_evaluated") or [])
-            if result is not None and result.get("armed"):
-                _final = "arm"
-                _first = ""
-            elif result is not None:
-                _final = "execute"
-                _first = ""
-            else:
+            # _arm_trailing_buy_ranked_stream returns "trailing_buy_armed", never
+            # "armed", and never a "quantity". Checking result.get("armed") made the
+            # "arm" label unreachable and sent every non-None result to "execute",
+            # so 559 of 1468 rows claimed an execution that never reached the
+            # exchange (approved_size NULL, no matching fill). Label the real outcome.
+            _armed_syms = {_to_api_symbol(str((_row or {}).get("symbol") or "")) for _row in (result or {}).get("intents") or []}
+            if result is None:
                 _final = "reject"
                 _first = str(_dd_final.get("first_hard_block") or "EXECUTION_GATE")
+            elif result.get("quantity") is not None:
+                _final = "execute"
+                _first = ""
+            elif result.get("armed") or result.get("trailing_buy_armed"):
+                _armed_here = _to_api_symbol(str(top_candidate.symbol or "")) in _armed_syms
+                _final = "arm" if _armed_here else "reject"
+                _first = "" if _armed_here else "NOT_ARMED_THIS_BAR"
+            else:
+                _final = "reject"
+                _first = str(result.get("blocked") or _dd_final.get("first_hard_block") or "NOT_ARMED_THIS_BAR")
             record_day_decision(
                 self.db_path,
                 decision_id=str(top_candidate.decision_id or f"bar_{bar_timestamp}_{top_candidate.symbol}"),
