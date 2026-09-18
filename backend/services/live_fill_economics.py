@@ -230,6 +230,7 @@ def sum_realized_pnl_by_mode(
     db_path: str,
     *,
     mode: str,
+    day: str | None = None,
 ) -> float:
     """Sum SELL pnl for one paper_trades.mode. Does not rewrite rows."""
     wanted = str(mode or "").strip().lower()
@@ -238,8 +239,7 @@ def sum_realized_pnl_by_mode(
     try:
         with sqlite3.connect(db_path, timeout=5) as conn:
             expr = _sell_pnl_expr(conn)
-            row = conn.execute(
-                f"""
+            sql = f"""
                 SELECT COALESCE(SUM({expr}), 0)
                 FROM paper_trades
                 WHERE UPPER(side)='SELL'
@@ -250,9 +250,12 @@ def sum_realized_pnl_by_mode(
                     'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT',
                     'DUST_WRITEOFF'
                   )
-                """,
-                (wanted,),
-            ).fetchone()
+            """
+            params: list[Any] = [wanted]
+            if day:
+                sql += " AND date(timestamp) = ?"
+                params.append(str(day))
+            row = conn.execute(sql, params).fetchone()
         return float((row or (0.0,))[0] or 0.0)
     except sqlite3.Error:
         return 0.0

@@ -67,16 +67,27 @@ def trailing_buy_scorecard(
     *,
     live_fills_since_anchor: object = 0,
     current_equity: object | None = None,
+    live_realized_pnl: object | None = None,
+    live_unrealized_pnl: object = 0,
 ) -> dict[str, Any]:
-    """P&L since the 9039923 cash-repair equity. Zero until real fills."""
-    fills = money(live_fills_since_anchor)
-    _ = current_equity
+    """Fill-based live P&L since the 9039923 cash-repair equity.
+
+    Realized uses live fill PnL. Marked total is current equity minus the
+    anchor. Paper history is never included.
+    """
+    realized = money(live_realized_pnl) if live_realized_pnl is not None else money(live_fills_since_anchor)
+    unrealized = money(live_unrealized_pnl)
+    if current_equity is not None:
+        total = money(current_equity) - TRAILING_BUY_ANCHOR_EQUITY
+    else:
+        total = realized + unrealized
     return {
         "anchor_equity": str(TRAILING_BUY_ANCHOR_EQUITY),
         "anchor_sha": TRAILING_BUY_ANCHOR_SHA,
-        "realized_pnl": float(fills),
-        "unrealized_pnl": 0.0,
-        "total_pnl": float(fills),
+        "realized_pnl": float(realized),
+        "unrealized_pnl": float(unrealized),
+        "total_pnl": float(total),
+        "current_equity": str(money(current_equity)) if current_equity is not None else None,
     }
 
 

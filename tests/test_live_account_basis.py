@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from backend.services.live_account_basis import (
     TRAILING_BUY_ANCHOR_EQUITY,
     apply_bootstrap_cash,
@@ -137,3 +139,14 @@ def test_trailing_buy_scorecard_stays_zero_without_fills():
     assert card["anchor_equity"] == str(TRAILING_BUY_ANCHOR_EQUITY)
     assert card["realized_pnl"] == 0.0
     assert card["total_pnl"] == 0.0
+
+
+def test_trailing_buy_scorecard_uses_fill_and_mark():
+    card = trailing_buy_scorecard(
+        live_realized_pnl=-1.25,
+        live_unrealized_pnl=-0.05,
+        current_equity=TRAILING_BUY_ANCHOR_EQUITY - Decimal("2.10"),
+    )
+    assert card["realized_pnl"] == pytest.approx(-1.25)
+    assert card["unrealized_pnl"] == pytest.approx(-0.05)
+    assert card["total_pnl"] == pytest.approx(-2.10)

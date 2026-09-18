@@ -284,6 +284,24 @@ def test_trailing_buy_remains_callable():
 
 
 @pytest.mark.asyncio
+async def test_refresh_live_skips_full_history_before_hydrate(monkeypatch):
+    pipe = CanonicalCandlePipeline()
+    pipe._cached_start_ms = 1_700_000_000_000
+    pipe._hydrate_done = False
+    pipe.fetch_binance = AsyncMock(return_value=[_kline(1_700_000_000_000)])
+    pipe.ingest_klines = AsyncMock(return_value={"completed": 1, "forming": 0})
+    pipe.repair_gaps = AsyncMock(return_value={})
+    await pipe.refresh_live("BTCUSDT", "1m")
+    pipe.repair_gaps.assert_not_awaited()
+    pipe._hydrate_done = True
+    pipe._last_backfill.clear()
+    await pipe.refresh_live("BTCUSDT", "1m")
+    assert pipe.repair_gaps.await_count == 1
+    start_ms = pipe.repair_gaps.await_args.args[2]
+    assert start_ms >= pipe._recent_window_start_ms("1m")
+
+
+@pytest.mark.asyncio
 async def test_api_contract_empty_is_error(monkeypatch):
     from backend.services.canonical_candle_pipeline import get_canonical_candles
 

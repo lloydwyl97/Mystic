@@ -18261,6 +18261,13 @@ class PortfolioEngine:
         except Exception as exc:
             accounting = {"ok": False, "error": str(exc)[:200], "orphans": []}
         reasons: list[str] = []
+        from backend.config.day_entry_execution import trailing_buy_mode_status
+
+        mode_ok, mode_err, mode_name = trailing_buy_mode_status()
+        self.day_entry_execution_mode = mode_name
+        self.day_entry_execution_error = "" if mode_ok else mode_err
+        if not mode_ok:
+            reasons.append(mode_err)
         if self._trading_paused:
             reasons.append(f"trading_paused:{self._pause_reason}")
         if self._account_status != AccountStatus.HEALTHY:
@@ -18272,11 +18279,15 @@ class PortfolioEngine:
         if not accounting.get("ok", False):
             n_orphans = len(accounting.get("orphans") or [])
             reasons.append(f"accounting_disagreement:orphans={n_orphans}:diff={accounting.get('identity_diff')}")
-        day_entry = not self._trading_paused and self._account_status == AccountStatus.HEALTHY and bool(ctrl.get("effective_entry_permitted")) and not failsafe and bool(accounting.get("ok"))
+        day_entry = (
+            mode_ok and not self._trading_paused and self._account_status == AccountStatus.HEALTHY and bool(ctrl.get("effective_entry_permitted")) and not failsafe and bool(accounting.get("ok"))
+        )
         return {
             "process_alive": True,
             "accounting_healthy": bool(accounting.get("ok")),
             "day_entry_enabled": day_entry,
+            "day_entry_execution_mode": mode_name,
+            "day_entry_execution_error": "" if mode_ok else mode_err,
             "day_exit_enabled": not bool(ks.get("sells_blocked")),
             "kill_switch_mode": ctrl.get("requested_kill_mode") or ks.get("mode"),
             "kill_switch_reason": (failsafe_reason if failsafe else (ctrl.get("requested_kill_reason") or ks.get("reason"))),
@@ -18316,6 +18327,15 @@ class PortfolioEngine:
             "realized_pnl_paper_historical": paper_r,
             "headline_realized_pnl": headline,
         }
+
+    def get_trailing_buy_intent_status(self) -> list[dict[str, Any]]:
+        try:
+            from backend.config.redis_config import get_redis_client
+            from backend.services.day_trailing_buy import load_operator_intents
+
+            return load_operator_intents(str(self.db_path), get_redis_client())
+        except Exception:
+            return []
 
     def get_portfolio_status(self) -> dict[str, Any]:
         """
@@ -18393,6 +18413,13 @@ class PortfolioEngine:
         )
         performance_equity = equity_views["performance_equity"]
         performance_equity_consistency_ok = abs(account_equity - performance_equity) < 1.0
+        from backend.services.live_account_basis import RECON_KEY, load_operational_json, trailing_buy_scorecard
+
+        recon_row = load_operational_json(str(self.db_path), RECON_KEY)
+        try:
+            recon_adj = float(recon_row.get("adjustment_usd") or 0)
+        except (TypeError, ValueError):
+            recon_adj = 0.0
 
         return {
             # DAY mode (normal repaired strategy — no inventory recovery freeze)
@@ -18416,6 +18443,9 @@ class PortfolioEngine:
             "failsafe_active": capability["failsafe_active"],
             "accounting_healthy": capability["accounting_healthy"],
             "day_entry_enabled": capability["day_entry_enabled"],
+            "day_entry_execution_mode": capability.get("day_entry_execution_mode"),
+            "day_entry_execution_error": capability.get("day_entry_execution_error"),
+            "trailing_buy_intents": self.get_trailing_buy_intent_status(),
             "day_exit_enabled": capability["day_exit_enabled"],
             "no_trade_reason": capability["no_trade_reason"],
             "process_alive": True,
@@ -18452,6 +18482,15 @@ class PortfolioEngine:
             "dust_adjustment_pnl": equity_views["dust_adjustment_pnl"],
             "realized_pnl": mode_pnl["headline_realized_pnl"],
             "unrealized_pnl": self._unrealized_pnl,
+            "contributed_principal": self.principal,
+            "cash_reconciliation_adjustment_usd": recon_adj,
+            "trailing_buy_scorecard": trailing_buy_scorecard(
+                live_fills_since_anchor=mode_pnl["realized_pnl_live"],
+                current_equity=account_equity,
+                live_realized_pnl=mode_pnl["realized_pnl_live"],
+                live_unrealized_pnl=self._unrealized_pnl,
+            ),
+            "lifetime_live_return_usd": float(account_equity) - float(self.principal or 0.0),
             "dust_positions": dust_list,
             "live_dust_quantity": sum(float(getattr(p, "quantity", 0) or 0) for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") == "DUST_PENDING"),
             "live_dust_value": live_dust_value,
@@ -19793,6 +19832,14 @@ class PortfolioEngine:
             "reason": reason,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+    def apply_external_capital_flow(self, amount: float, *, kind: str = "deposit") -> float:
+        """Deposits/withdrawals change contributed principal, not trading P&L."""
+        from backend.services.live_account_basis import apply_external_capital_flow
+
+        self.principal = float(apply_external_capital_flow(self.principal, amount))
+        logger.info("EXTERNAL_CAPITAL_FLOW kind=%s amount=%s principal=%s", kind, amount, self.principal)
+        return self.principal
 
     async def _persist_kill_switch(self) -> None:
         """Persist kill switch state to SQLite"""
@@ -21300,7 +21347,13 @@ class PortfolioEngine:
 
                     pass_fail = "PASS" if not fail_reasons else "FAIL"
 
-                    daily_realized_pnl = float(total_r)
+                    from backend.services.execution_mode_service import is_live_execution_allowed_sync
+                    from backend.services.live_fill_economics import sum_realized_pnl_by_mode
+
+                    if is_live_execution_allowed_sync():
+                        daily_realized_pnl = sum_realized_pnl_by_mode(self.db_path, mode="live", day=today)
+                    else:
+                        daily_realized_pnl = float(total_r)
                     daily_total_pnl = daily_realized_pnl + daily_unrealized_delta
 
                     cursor.execute(
@@ -21585,6 +21638,15 @@ class PortfolioEngine:
             return base
 
         data = dict(zip(columns, row, strict=False))
+        try:
+            from backend.services.live_fill_economics import sum_realized_pnl_by_mode
+
+            data["realized_pnl_audit_mixed"] = data.get("realized_pnl")
+            data["realized_pnl"] = sum_realized_pnl_by_mode(self.db_path, mode="live", day=today)
+            data["paper_realized_pnl_today"] = sum_realized_pnl_by_mode(self.db_path, mode="paper", day=today)
+            data["realized_pnl_source"] = "paper_trades.mode=live"
+        except Exception:
+            pass
         try:
             breakdown = await asyncio.get_running_loop().run_in_executor(None, lambda: self._scoreboard_activity_breakdown_sync(today))
             data.update(breakdown)

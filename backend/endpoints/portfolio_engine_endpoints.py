@@ -167,7 +167,7 @@ async def _refresh_engine_from_sqlite_for_live(engine: Any, *, allow_mutations: 
 
 
 def _sqlite_open_positions_count_sync() -> int:
-    """Count open rows in portfolio_engine_positions (quantity > 0)."""
+    """Count live open rows. DUST_PENDING leftover quantity does not occupy a slot."""
     conn = None
     try:
         conn = connect_ro(DATABASE_PATH, timeout_sec=2.0)
@@ -175,7 +175,12 @@ def _sqlite_open_positions_count_sync() -> int:
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='portfolio_engine_positions'")
         if not cursor.fetchone():
             return 0
-        cursor.execute("SELECT COUNT(*) FROM portfolio_engine_positions WHERE quantity > 0")
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM portfolio_engine_positions
+            WHERE quantity > 0 AND COALESCE(status, 'ACTIVE') != 'DUST_PENDING'
+            """
+        )
         row = cursor.fetchone()
         return int(row[0] or 0) if row else 0
     except Exception as e:
@@ -249,7 +254,12 @@ def _read_operator_status_from_sqlite_sync() -> dict[str, Any] | None:
             cash_balance, total_equity, positions_value, account_status, trading_paused, pause_reason = row
             principal = 0.0
 
-        cursor.execute("SELECT COUNT(*) FROM portfolio_engine_positions WHERE quantity > 0")
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM portfolio_engine_positions
+            WHERE quantity > 0 AND COALESCE(status, 'ACTIVE') != 'DUST_PENDING'
+            """
+        )
         pos_row = cursor.fetchone()
         open_positions_count = pos_row[0] if pos_row else 0
 
@@ -665,7 +675,7 @@ async def get_portfolio_status() -> dict[str, Any]:
             "canonical_source": "portfolio_engine_ledger",
             "adopted_equity": status.get("total_equity", engine._total_equity),
             "adopted_cash": status.get("cash_balance", engine.cash_balance),
-            "adopted_positions": len(engine.open_positions),
+            "adopted_positions": engine._count_live_slots(),
             "dust_pending_positions_current": engine_status["dust_pending_positions_current"],
             "dust_drift_events_total": engine_status["dust_drift_events_total"],
             "dust_reconcile_runs_total": engine_status["dust_reconcile_runs_total"],

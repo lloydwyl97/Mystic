@@ -22,6 +22,7 @@ from backend.config.canonical_candle_intervals import (
     CANONICAL_CANDLE_INTERVALS,
     CANONICAL_SYMBOLS,
     TELEMETRY_ONLY_NO_TRADE_AUTHORITY,
+    align_open_ms,
     interval_ms,
     refresh_sec,
     stale_after_sec,
@@ -60,6 +61,8 @@ class CanonicalCandlePipeline:
         self._last_backfill: dict[str, float] = {}
         self._source_ts: dict[str, int] = {}
         self._fetch_fn: FetchFn | None = None
+        self._cached_start_ms: int | None = None
+        self._hydrate_done = False
 
     def set_fetch_fn(self, fn: FetchFn | None) -> None:
         self._fetch_fn = fn
@@ -240,10 +243,21 @@ class CanonicalCandlePipeline:
         return {"before": report, "after": after, "repaired_fetched": repaired}
 
     def canonical_start_ms(self) -> int:
-        earliest = earliest_aligned_1m_open_ms()
-        if earliest is not None:
-            return int(earliest)
-        return align_week_ago()
+        if self._cached_start_ms is not None:
+            return int(self._cached_start_ms)
+        try:
+            earliest = earliest_aligned_1m_open_ms()
+        except Exception as exc:
+            logger.warning("canonical start lookup failed: %s", exc)
+            earliest = None
+        self._cached_start_ms = int(earliest) if earliest is not None else align_week_ago()
+        return int(self._cached_start_ms)
+
+    def _recent_window_start_ms(self, interval: str) -> int:
+        width = interval_ms(interval)
+        lookback = min(max(width * 120, 2 * 86_400_000), 7 * 86_400_000)
+        recent = self._now_ms() - lookback
+        return max(self.canonical_start_ms(), align_open_ms(recent, interval))
 
     async def startup_hydrate(self, symbols: list[str] | None = None) -> dict[str, Any]:
         """Live bars first, then 1m history, then exact HTF aggregates. Never blocks start()."""
@@ -256,6 +270,8 @@ class CanonicalCandlePipeline:
                     await self.refresh_live(symbol, interval)
                 except Exception as exc:
                     logger.warning("hydrate live refresh failed %s %s: %s", symbol, interval, exc)
+        self._hydrate_done = True
+        logger.info("canonical candle live streams published; historical backfill continuing")
         for symbol in symbols:
             end_ms = self._completed_open_ms("1m")
             result = await self.backfill_range(symbol, "1m", start_ms, end_ms)
@@ -280,14 +296,14 @@ class CanonicalCandlePipeline:
     async def refresh_live(self, symbol: str, interval: str) -> dict[str, Any]:
         klines = await self.fetch_binance(symbol, interval, limit=3)
         ingested = await self.ingest_klines(symbol, interval, klines, persist=True)
-        start_ms = self.canonical_start_ms()
         end_ms = self._completed_open_ms(interval)
-        if time.time() - self._last_backfill.get(self._stream_key(symbol, interval), 0) > refresh_sec(interval) * 4:
-            await self.repair_gaps(symbol, interval, start_ms, end_ms)
+        key = self._stream_key(symbol, interval)
+        if self._hydrate_done and time.time() - self._last_backfill.get(key, 0) > refresh_sec(interval) * 8:
+            await self.repair_gaps(symbol, interval, self._recent_window_start_ms(interval), end_ms)
         return ingested
 
     async def write_integrity(self, symbol: str, interval: str, *, start_ms: int | None = None) -> dict[str, Any]:
-        start = int(start_ms if start_ms is not None else self.canonical_start_ms())
+        start = int(start_ms if start_ms is not None else self._recent_window_start_ms(interval))
         end_ms = self._completed_open_ms(interval)
         report = continuity_report(symbol, interval, start_ms=start, end_completed_ms=end_ms)
         now = time.time()
@@ -365,13 +381,17 @@ class CanonicalCandlePipeline:
 
     async def _integrity_loop(self) -> None:
         while self._running:
+            if not self._hydrate_done:
+                await asyncio.sleep(5)
+                continue
             try:
-                start_ms = self.canonical_start_ms()
                 for symbol in CANONICAL_SYMBOLS:
                     for interval in CANONICAL_CANDLE_INTERVALS:
                         end_ms = self._completed_open_ms(interval)
+                        start_ms = self._recent_window_start_ms(interval)
                         await self.repair_gaps(symbol, interval, start_ms, end_ms)
                         await self.write_integrity(symbol, interval, start_ms=start_ms)
+                        await asyncio.sleep(0.2)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -381,6 +401,7 @@ class CanonicalCandlePipeline:
     async def _hydrate_background(self) -> None:
         try:
             await self.startup_hydrate()
+            self._hydrate_done = True
             logger.info("canonical candle hydrate complete")
         except asyncio.CancelledError:
             raise

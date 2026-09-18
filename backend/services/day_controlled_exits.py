@@ -1126,7 +1126,7 @@ def preview_next_engine_exit(
             entry=entry,
             atr_pct=atr_pct,
         )
-        current_authority = str(managed.get("reason") or HOLD_4H_MISSING)
+        current_authority = str(managed.get("reason") or "path_aware_bracket_hold")
         if str(managed.get("action") or "") == "sell":
             next_exit = current_authority
             next_executable_condition = current_authority
