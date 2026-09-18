@@ -75,6 +75,15 @@ def test_observe_stale_book_is_data_repair_not_model_hold():
     assert rec["category"] != MODEL_HOLD_TELEMETRY
 
 
+def test_try_reserve_entry_accepts_trailing_ttl():
+    import inspect
+
+    from backend.services.portfolio_engine import PortfolioEngine
+
+    params = inspect.signature(PortfolioEngine._try_reserve_entry).parameters
+    assert "ttl_sec" in params
+
+
 def test_persist_roundtrip(tmp_path):
     db = tmp_path / "holds.db"
     db.write_text("")

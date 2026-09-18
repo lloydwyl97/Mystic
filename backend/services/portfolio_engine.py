@@ -12402,6 +12402,7 @@ class PortfolioEngine:
         decision_id: str = "",
         risk_usd: float = 0.0,
         sleeve: str = "",
+        ttl_sec: float | None = None,
     ) -> tuple[bool, str]:
         """Reserve cash/slot/symbol/risk/sleeve under caller-held `_global_cash_lock`.
 
@@ -12451,14 +12452,16 @@ class PortfolioEngine:
             try:
                 from backend.services.day_entry_reservations import create_reservation
 
-                ok_p, reason_p, reservation_id = create_reservation(
-                    self.db_path,
-                    decision_id=did,
-                    symbol=ns,
-                    notional_usd=float(notional_usd),
-                    risk_usd=float(risk_usd or 0.0),
-                    sleeve=str(sleeve or ""),
-                )
+                reserve_kwargs = {
+                    "decision_id": did,
+                    "symbol": ns,
+                    "notional_usd": float(notional_usd),
+                    "risk_usd": float(risk_usd or 0.0),
+                    "sleeve": str(sleeve or ""),
+                }
+                if ttl_sec is not None:
+                    reserve_kwargs["ttl_sec"] = float(ttl_sec)
+                ok_p, reason_p, reservation_id = create_reservation(self.db_path, **reserve_kwargs)
                 if not ok_p:
                     return False, reason_p
                 if reason_p == "IDEMPOTENT_EXISTING":
