@@ -418,3 +418,51 @@ class TestFourHourHasNoCompositeOrderAuthority:
         assert 'ranking_source = bundle.get("15m")' in src
         assert 'ranking_source = bundle.get("4h")' not in src
         assert 'market_primary = bundle.get("4h")' not in src
+
+    def test_market_regime_label_ignores_4h_trend(self):
+        from backend.services.ai_market_context import _market_regime_from_mtf
+
+        chop_1h = {"1h": {"trend": 0.50}}
+        assert _market_regime_from_mtf(chop_1h) == "chop"
+        assert _market_regime_from_mtf({**chop_1h, "4h": {"trend": 0.99}}) == "chop"
+        assert _market_regime_from_mtf({**chop_1h, "4h": {"trend": 0.01}}) == "chop"
+        assert _market_regime_from_mtf({"1h": {"trend": 0.80}, "4h": {"trend": 0.01}}) == "trending_up"
+
+    def test_thesis_identity_is_invariant_to_4h_ema(self):
+        import json
+
+        from backend.services.day_trade_thesis import classify_buy_thesis
+
+        base_mtf = {
+            "15m": {"ema_align": 0.52},
+            "30m": {"ema_align": 0.52},
+            "1h": {"ema_align": 0.52},
+        }
+        kwargs = {
+            "symbol": "BTC/USDT",
+            "current_price": 100.0,
+            "atr": 1.0,
+            "strategy_id": "day",
+        }
+        a = classify_buy_thesis(
+            {
+                "ema_alignment": 0.55,
+                "adx": 20.0,
+                "rsi": 48.0,
+                "mtf_json": json.dumps({**base_mtf, "4h": {"ema_align": 0.10}}),
+            },
+            **kwargs,
+        )
+        b = classify_buy_thesis(
+            {
+                "ema_alignment": 0.55,
+                "adx": 20.0,
+                "rsi": 48.0,
+                "mtf_json": json.dumps({**base_mtf, "4h": {"ema_align": 0.95}}),
+            },
+            **kwargs,
+        )
+        assert a["setup_type"] == b["setup_type"]
+        assert a["thesis_rank_delta"] == b["thesis_rank_delta"]
+        assert a["thesis_size_factor"] == b["thesis_size_factor"]
+        assert a.get("thesis_target_level") == b.get("thesis_target_level")
