@@ -1,4 +1,4 @@
-"""Every no-action cycle must classify into one of the twelve HOLD categories."""
+"""Every no-action cycle must classify into one of the HOLD categories."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from backend.services.day_decision_state import (
     OPEN_POSITION_HOLD,
     OPERATOR_CONTROL_BLOCK,
     ORDER_PENDING,
+    TRAILING_BUY_TERMINAL,
     TRAILING_LOW,
     WAITING_FOR_DIP,
     WAITING_FOR_REBOUND,
@@ -24,7 +25,7 @@ from backend.services.day_decision_state import (
 )
 
 
-def test_all_twelve_categories_exist():
+def test_all_hold_categories_exist():
     assert HOLD_CATEGORIES == (
         MODEL_HOLD_TELEMETRY,
         NO_RANKED_CANDIDATE,
@@ -38,6 +39,7 @@ def test_all_twelve_categories_exist():
         DATA_REPAIR_REQUIRED,
         OPERATOR_CONTROL_BLOCK,
         COOLDOWN_ACTIVE,
+        TRAILING_BUY_TERMINAL,
     )
 
 
@@ -55,9 +57,18 @@ def test_classifier_covers_every_named_category():
         DATA_REPAIR_REQUIRED: {"reject_reason": "STALE_OR_MISSING_BOOK"},
         OPERATOR_CONTROL_BLOCK: {"reject_reason": "KILL_SWITCH_HALT"},
         COOLDOWN_ACTIVE: {"reject_reason": "COOLDOWN_ACTIVE_UNTIL_1"},
+        TRAILING_BUY_TERMINAL: {"trailing_status": "EXPIRED", "observe_reason": "TIMEOUT"},
     }
     for category, kwargs in cases.items():
         assert classify_hold_category(**kwargs) == category
+
+
+def test_timeout_and_improvement_lost_are_not_hard_safety():
+    for reason in ("TIMEOUT", "IMPROVEMENT_LOST", "INTENT_EXPIRED"):
+        cat = classify_hold_category(trailing_status="EXPIRED", observe_reason=reason)
+        assert cat == TRAILING_BUY_TERMINAL
+        assert hold_blocks_live_execution(cat) is False
+    assert classify_hold_category(reject_reason="SYMBOL_NOT_EXECUTABLE") == HARD_SAFETY_BLOCK
 
 
 def test_path_ev_hold_is_telemetry_and_does_not_block():

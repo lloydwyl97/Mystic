@@ -356,13 +356,34 @@ async def get_pnl_reconciliation(force: bool = False) -> dict[str, Any]:
     try:
         from backend.database_schema import DATABASE_PATH
         from backend.services.execution_mode_service import is_live_execution_allowed_sync
-        from backend.services.live_pnl_reconciliation import get_reconciliation, presentation_fields
+        from backend.services.live_pnl_reconciliation import (
+            account_basis_for_presentation,
+            get_reconciliation,
+            presentation_fields,
+        )
 
         recon = await get_reconciliation(str(DATABASE_PATH), force=bool(force))
+        ledger = {}
+        try:
+            conn = sqlite3.connect(f"file:{DATABASE_PATH}?mode=ro", uri=True, timeout=5)
+            row = conn.execute("SELECT principal, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
+            conn.close()
+            if row:
+                ledger = {"principal": float(row[0] or 0.0), "total_equity": float(row[1] or 0.0)}
+        except Exception:
+            ledger = {}
         return {
             "success": True,
             "data": recon,
-            "presentation": presentation_fields(recon, is_live=bool(is_live_execution_allowed_sync())),
+            "presentation": presentation_fields(
+                recon,
+                is_live=bool(is_live_execution_allowed_sync()),
+                **account_basis_for_presentation(
+                    str(DATABASE_PATH),
+                    current_equity=float(ledger.get("total_equity") or 0.0),
+                    contributed_principal=float(ledger.get("principal") or 0.0),
+                ),
+            ),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
@@ -535,12 +556,24 @@ async def get_portfolio_performance() -> dict[str, Any]:
         # live performance.
         pnl_presentation: dict[str, Any] = {}
         try:
-            from backend.services.live_pnl_reconciliation import get_reconciliation, presentation_fields
+            from backend.services.live_pnl_reconciliation import (
+                account_basis_for_presentation,
+                get_reconciliation,
+                presentation_fields,
+            )
 
             # Cache only: /performance must not wait on exchange round trips.
             # The dedicated /pnl-reconciliation poll refreshes the cache.
             _recon = await get_reconciliation(str(DATABASE_PATH), cached_only=True)
-            pnl_presentation = presentation_fields(_recon, is_live=account_execution_mode == "live")
+            pnl_presentation = presentation_fields(
+                _recon,
+                is_live=account_execution_mode == "live",
+                **account_basis_for_presentation(
+                    str(DATABASE_PATH),
+                    current_equity=total_equity,
+                    contributed_principal=principal,
+                ),
+            )
         except Exception as exc:
             logger.warning("PNL_RECONCILIATION_UNAVAILABLE: %s", exc)
             pnl_presentation = {
@@ -673,10 +706,22 @@ async def get_portfolio_status() -> dict[str, Any]:
         try:
             from backend.database_schema import DATABASE_PATH
             from backend.services.execution_mode_service import is_live_execution_allowed_sync
-            from backend.services.live_pnl_reconciliation import get_reconciliation, presentation_fields
+            from backend.services.live_pnl_reconciliation import (
+                account_basis_for_presentation,
+                get_reconciliation,
+                presentation_fields,
+            )
 
             _recon = await get_reconciliation(str(DATABASE_PATH), cached_only=True)
-            pnl_presentation = presentation_fields(_recon, is_live=bool(is_live_execution_allowed_sync()))
+            pnl_presentation = presentation_fields(
+                _recon,
+                is_live=bool(is_live_execution_allowed_sync()),
+                **account_basis_for_presentation(
+                    str(DATABASE_PATH),
+                    current_equity=float(status.get("total_equity") or status.get("account_equity") or 0.0),
+                    contributed_principal=float(status.get("principal") or 0.0),
+                ),
+            )
             status["pnl_presentation"] = pnl_presentation
         except Exception as exc:
             logger.warning("STATUS_PNL_RECONCILIATION_UNAVAILABLE: %s", exc)

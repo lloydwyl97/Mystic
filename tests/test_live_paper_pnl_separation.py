@@ -54,3 +54,21 @@ def test_presentation_labels_dust_as_accounting_correction():
     assert "ACCOUNTING CORRECTION" in fields["live_dust_writeoff_label"]
     assert fields["paper_is_not_live_performance"] is True
     assert "not live profit" in fields["legacy_mixed_total_label"]
+    cash = presentation_fields(
+        {
+            "ok": True,
+            "live_reconciled_usd": -34.92,
+            "live_recorded_usd": -8.67,
+            "live_dust_writeoff_usd": -144.07,
+            "paper_realized_usd": 973.98,
+            "legacy_mixed_total_usd": 965.31,
+        },
+        is_live=True,
+        current_equity=223.92463088,
+        contributed_principal=228.06746265,
+        reconciliation_adjustment_usd=0.94516971,
+    )
+    assert abs(cash["primary_result_usd"] - (223.92463088 - 228.06746265)) < 1e-9
+    assert "cash-identity" in cash["primary_result_label"]
+    assert abs(cash["accounting_correction_total_usd"] - (-144.07 + 0.94516971)) < 1e-9
+    assert cash["paper_realized_usd"] == 973.98

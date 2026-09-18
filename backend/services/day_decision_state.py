@@ -23,6 +23,7 @@ ORDER_PENDING = "ORDER_PENDING"
 DATA_REPAIR_REQUIRED = "DATA_REPAIR_REQUIRED"
 OPERATOR_CONTROL_BLOCK = "OPERATOR_CONTROL_BLOCK"
 COOLDOWN_ACTIVE = "COOLDOWN_ACTIVE"
+TRAILING_BUY_TERMINAL = "TRAILING_BUY_TERMINAL"
 
 HOLD_CATEGORIES = (
     MODEL_HOLD_TELEMETRY,
@@ -37,6 +38,7 @@ HOLD_CATEGORIES = (
     DATA_REPAIR_REQUIRED,
     OPERATOR_CONTROL_BLOCK,
     COOLDOWN_ACTIVE,
+    TRAILING_BUY_TERMINAL,
 )
 
 STATE_KEY = "day_decision_holds"
@@ -102,6 +104,9 @@ _ORDER_MARKERS = ("PENDING_BUY", "ORDER_ACCEPTED", "SUBMITTING")
 _OPERATOR_MARKERS = ("KILL", "TRADING_PAUSED", "PAUSE", "FAILSAFE", "CIRCUIT")
 _COOLDOWN_MARKERS = ("COOLDOWN",)
 _DATA_MARKERS = ("STALE_MARKET", "STALE_OR_MISSING_BOOK", "EXIT_MARK_STALE", "NO_CANONICAL", "DATA_REPAIR")
+# Watch TTL / retained-improvement expiry. These end an intent; they are not
+# hard safety and must not block the next ranked cycle.
+_TRAILING_TERMINAL_REASONS = frozenset({"TIMEOUT", "IMPROVEMENT_LOST", "INTENT_EXPIRED"})
 
 
 def classify_hold_category(
@@ -126,6 +131,8 @@ def classify_hold_category(
         return ORDER_PENDING
     if any(m in reason for m in _CAPITAL_MARKERS):
         return CAPITAL_OR_SLOT_BLOCK
+    if reason in _TRAILING_TERMINAL_REASONS or reason.startswith("INTENT_EXPIRED"):
+        return TRAILING_BUY_TERMINAL
     if reason and status in {"", "CANCELED", "FAILED", "EXPIRED"}:
         return HARD_SAFETY_BLOCK
     if status == "WAIT_DIP" or (observe_action == "watch" and status == "WAIT_DIP"):
