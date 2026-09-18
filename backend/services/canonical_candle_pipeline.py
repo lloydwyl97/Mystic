@@ -385,12 +385,20 @@ class CanonicalCandlePipeline:
             logger.debug("integrity write failed %s %s: %s", symbol, interval, exc)
         return status
 
-    async def status_matrix(self) -> dict[str, Any]:
+    async def status_matrix(self, *, full: bool = False) -> dict[str, Any]:
+        """Live status uses the recent window. Full 44-day scans are operator-only."""
         rows = []
         for symbol in CANONICAL_SYMBOLS:
             for interval in CANONICAL_CANDLE_INTERVALS:
-                rows.append(await self.write_integrity(symbol, interval))
-        return {"writer": WRITER_ROLE, "symbols": list(CANONICAL_SYMBOLS), "intervals": list(CANONICAL_CANDLE_INTERVALS), "streams": rows}
+                start_ms = self.canonical_start_ms() if full else self._recent_window_start_ms(interval)
+                rows.append(await self.write_integrity(symbol, interval, start_ms=start_ms))
+        return {
+            "writer": WRITER_ROLE,
+            "symbols": list(CANONICAL_SYMBOLS),
+            "intervals": list(CANONICAL_CANDLE_INTERVALS),
+            "full_history": bool(full),
+            "streams": rows,
+        }
 
     async def _refresh_loop(self) -> None:
         idx = 0

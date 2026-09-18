@@ -29,8 +29,8 @@ async def market_candles(
 
 
 @router.get("/api/market/candles/status")
-async def market_candles_status() -> dict[str, Any]:
-    matrix = await canonical_candle_pipeline.status_matrix()
+async def market_candles_status(full: bool = Query(False)) -> dict[str, Any]:
+    matrix = await canonical_candle_pipeline.status_matrix(full=full)
     return {"success": True, **matrix, "research_table": refuse_research_table_read()}
 
 

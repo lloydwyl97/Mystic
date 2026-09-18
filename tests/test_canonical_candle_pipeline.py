@@ -321,6 +321,27 @@ async def test_refresh_live_skips_full_history_before_hydrate(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_status_matrix_defaults_to_recent_window(monkeypatch):
+    pipe = CanonicalCandlePipeline()
+    pipe._cached_start_ms = 1_700_000_000_000
+    captured: list[int] = []
+
+    async def _fake_write(symbol, interval, *, start_ms=None):
+        captured.append(int(start_ms))
+        return {"symbol": symbol, "interval": interval, "start_ms": start_ms}
+
+    pipe.write_integrity = _fake_write  # type: ignore[method-assign]
+    out = await pipe.status_matrix()
+    assert out["full_history"] is False
+    assert captured
+    assert all(ts >= pipe._recent_window_start_ms("1w") for ts in captured)
+    captured.clear()
+    await pipe.status_matrix(full=True)
+    assert captured
+    assert all(ts == 1_700_000_000_000 for ts in captured)
+
+
+@pytest.mark.asyncio
 async def test_api_contract_empty_is_error(monkeypatch):
     from backend.services.canonical_candle_pipeline import get_canonical_candles
 
