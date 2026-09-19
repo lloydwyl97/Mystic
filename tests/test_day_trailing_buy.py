@@ -17,6 +17,7 @@ from backend.services.day_trailing_buy import (
     ENTRY_AUTHORITY,
     _bar_epoch,
     available_economic_slots,
+    cycle_trailing_buy_intents,
     formulas_for_symbol,
     honest_round_trip_cost_bps,
     min_dip_bps,
@@ -913,6 +914,7 @@ def _arm_engine(tmp_path):
     engine = PortfolioEngine.__new__(PortfolioEngine)
     engine.db_path = str(tmp_path / "arm.db")
     engine._entry_reservations = {}
+    engine.open_positions = {}
     engine._try_reserve_entry = lambda *_a, **_k: (True, "OK")
     engine._release_entry_reservation = lambda *_a, **_k: None
     return engine
@@ -1040,3 +1042,92 @@ def test_captured_rebound_still_reaches_cash_aware_submit():
     d = observe_book(eth, ask=2475.46, now=10.0, book_fresh=True)
     assert d.action == "submit"
     assert "plan_executable_buy" in inspect.getsource(PortfolioEngine._execute_buy_fifo_locked)
+
+
+def _expired_fields(symbol: str, *, arm: float, expires_at: float) -> dict:
+    return {
+        "decision_id": f"d-{symbol}",
+        "symbol": symbol,
+        "arm_ask": arm,
+        "arm_bid": arm - 0.1,
+        "arm_midpoint": arm - 0.05,
+        "round_trip_cost_bps": 6.0,
+        "spread_bps": 1.0,
+        "required_improvement_bps": 10.0,
+        "rebound_bps": 4.0,
+        "min_dip_bps": 14.0,
+        "expires_at": expires_at,
+        "quantity": 0.01,
+        "stop_price": arm * 0.99,
+        "notional_usd": 50.0,
+        "payload": {"decision_data": {"setup_type": "TEST"}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_timeout_creates_successor_without_inherited_low(tmp_path, monkeypatch):
+    monkeypatch.setenv("DAY_ENTRY_EXECUTION_MODE", "trailing_buy")
+    engine = _arm_engine(tmp_path)
+    create_intent(engine.db_path, fields=_expired_fields("ETH/USDT", arm=2600.0, expires_at=time.time() - 1))
+    monkeypatch.setattr(
+        "backend.services.day_trailing_buy.sync_book_redis",
+        lambda *_a, **_k: {},
+    )
+    monkeypatch.setattr(
+        "backend.services.day_trailing_buy.read_market_book",
+        lambda *_a, **_k: {"ask": 2644.0, "bid": 2643.8, "fresh": True, "freshness_sec": 1.0},
+    )
+    monkeypatch.setattr(
+        "backend.services.day_trailing_buy.fresh_executable_book",
+        lambda *_a, **_k: {"ask": 2644.0, "bid": 2643.8, "midpoint": 2643.9, "spread_bps": 0.8, "fresh": True, "freshness_sec": 1.0},
+    )
+    monkeypatch.setattr("backend.services.day_path_net.load_recent_bars", lambda *_a, **_k: [])
+    summary = await cycle_trailing_buy_intents(engine, redis_client=None)
+    assert summary["closed"] == 1
+    assert summary["successor"] == 1
+    active = load_active_intents(engine.db_path)
+    assert len(active) == 1
+    nxt = active[0]
+    assert nxt["status"] == WAIT_DIP
+    assert nxt["arm_ask"] == pytest.approx(2644.0)
+    assert float(nxt["lowest_ask"] or 0) == 0.0
+    assert nxt["intent_id"]
+
+
+@pytest.mark.asyncio
+async def test_successor_skips_when_position_open(tmp_path, monkeypatch):
+    monkeypatch.setenv("DAY_ENTRY_EXECUTION_MODE", "trailing_buy")
+    engine = _arm_engine(tmp_path)
+
+    class _Pos:
+        status = "ACTIVE"
+        quantity = 0.4
+
+    engine.open_positions = {"SOL/USDT": _Pos()}
+    create_intent(engine.db_path, fields=_expired_fields("SOL/USDT", arm=111.0, expires_at=time.time() - 1))
+    monkeypatch.setattr("backend.services.day_trailing_buy.sync_book_redis", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        "backend.services.day_trailing_buy.read_market_book",
+        lambda *_a, **_k: {"ask": 111.8, "bid": 111.7, "fresh": True, "freshness_sec": 1.0},
+    )
+    monkeypatch.setattr(
+        "backend.services.day_trailing_buy.fresh_executable_book",
+        lambda *_a, **_k: {"ask": 111.8, "bid": 111.7, "midpoint": 111.75, "spread_bps": 0.9, "fresh": True, "freshness_sec": 1.0},
+    )
+    summary = await cycle_trailing_buy_intents(engine, redis_client=None)
+    assert summary["closed"] == 1
+    assert summary["successor"] == 0
+    assert load_active_intents(engine.db_path) == []
+
+
+@pytest.mark.asyncio
+async def test_stale_book_cancel_does_not_rearm(tmp_path, monkeypatch):
+    monkeypatch.setenv("DAY_ENTRY_EXECUTION_MODE", "trailing_buy")
+    engine = _arm_engine(tmp_path)
+    create_intent(engine.db_path, fields=_expired_fields("XRP/USDT", arm=1.4, expires_at=time.time() + 900))
+    monkeypatch.setattr("backend.services.day_trailing_buy.sync_book_redis", lambda *_a, **_k: {})
+    monkeypatch.setattr("backend.services.day_trailing_buy.read_market_book", lambda *_a, **_k: None)
+    summary = await cycle_trailing_buy_intents(engine, redis_client=None)
+    assert summary["closed"] == 1
+    assert summary["successor"] == 0
+    assert load_active_intents(engine.db_path) == []

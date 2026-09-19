@@ -61,6 +61,7 @@ TRANSIENT_RETRY = "TRANSIENT_RETRY"
 AMBIGUOUS_RECONCILE = "AMBIGUOUS_RECONCILE"
 BELOW_MIN_NOTIONAL = "BELOW_MIN_NOTIONAL"
 INTENT_EXPIRED = "INTENT_EXPIRED"
+SUCCESSOR_EXPIRE_REASONS = frozenset({"TIMEOUT", "IMPROVEMENT_LOST"})
 
 _TRANSIENT_MARKERS = (
     "LIVE_BUY_ERROR",
@@ -590,6 +591,69 @@ async def arm_selected_candidate(
     return {"trailing_buy_armed": True, "intent": intent, "idempotent": False}
 
 
+async def rearm_successor_after_expire(
+    engine: Any,
+    expired: dict[str, Any],
+    redis_client: Any,
+    *,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Arm a fresh WAIT_DIP immediately after a natural expire.
+
+    New arm_ask from the live book. No inherited tracked low. No second
+    reservation while a watcher is already active. Ranking clock is not
+    required. Does not change dip, rebound, or improvement thresholds.
+    """
+    if str(reason or "") not in SUCCESSOR_EXPIRE_REASONS:
+        return None
+    symbol = str(expired.get("symbol") or "")
+    if not symbol:
+        return None
+    existing = load_intent_by_symbol(engine.db_path, symbol)
+    if existing:
+        return None
+    ns = symbol
+    try:
+        from backend.utils.canonical_symbol_formatter import CanonicalSymbolFormatter
+
+        ns = CanonicalSymbolFormatter.to_canonical(symbol)
+    except Exception:
+        ns = symbol
+    if _open_position_blocks_buy(engine, symbol, ns):
+        logger.info("TRAILING_BUY_SUCCESSOR_SKIPPED symbol=%s reason=POSITION_OPEN", symbol)
+        return None
+    payload = dict(expired.get("payload") or {})
+    expl = _rebuild_explainability(payload, symbol)
+    decision_data = dict(payload.get("decision_data") or {})
+    out = await arm_selected_candidate(
+        engine,
+        symbol=symbol,
+        quantity=float(expired.get("quantity") or 0.0),
+        stop_price=float(expired.get("stop_price") or 0.0),
+        atr=float(expired.get("atr") or 0.0),
+        confidence=float(expired.get("confidence") or 0.0),
+        bar_timestamp=int(time.time()),
+        explainability=expl,
+        decision_id=str(expired.get("decision_id") or ""),
+        sleeve=str(expired.get("sleeve") or ""),
+        decision_data=decision_data,
+        redis_client=redis_client,
+        reserved_notional=expired.get("notional_usd"),
+    )
+    if out and out.get("intent"):
+        nxt = out["intent"]
+        logger.info(
+            "TRAILING_BUY_SUCCESSOR_ARMED symbol=%s prior=%s next=%s reason=%s arm_ask=%.8f lowest_ask=%.8f",
+            symbol,
+            expired.get("intent_id"),
+            nxt.get("intent_id"),
+            reason,
+            float(nxt.get("arm_ask") or 0.0),
+            float(nxt.get("lowest_ask") or 0.0),
+        )
+    return out
+
+
 def _rebuild_explainability(payload: dict[str, Any], symbol: str) -> Any:
     from backend.services.portfolio_engine import TradeExplainability
 
@@ -792,7 +856,7 @@ async def cycle_trailing_buy_intents(engine: Any, redis_client: Any) -> dict[str
     ok, err, mode = trailing_buy_mode_status()
     engine.day_entry_execution_error = "" if ok else err
     engine.day_entry_execution_mode = mode
-    summary = {"mode_ok": ok, "error": err, "cycled": 0, "submitted": 0, "filled": 0, "closed": 0}
+    summary = {"mode_ok": ok, "error": err, "cycled": 0, "submitted": 0, "filled": 0, "closed": 0, "successor": 0}
     if not ok:
         return summary
     books = sync_book_redis(redis_client)
@@ -841,6 +905,15 @@ async def cycle_trailing_buy_intents(engine: Any, redis_client: Any) -> dict[str
             )
             engine._release_entry_reservation(symbol, decision_id=str(intent.get("decision_id") or ""), reason=decision.reason)
             summary["closed"] += 1
+            if decision.action == "expire" and decision.reason in SUCCESSOR_EXPIRE_REASONS:
+                successor = await rearm_successor_after_expire(
+                    engine,
+                    intent,
+                    redis_client,
+                    reason=decision.reason,
+                )
+                if successor:
+                    summary["successor"] += 1
             continue
         update_watch(
             engine.db_path,
@@ -1276,6 +1349,7 @@ def get_intent(db_path: str, intent_id: str) -> dict[str, Any] | None:
 __all__ = [
     "DAY_TRADE_SYMBOLS",
     "ENTRY_AUTHORITY",
+    "SUCCESSOR_EXPIRE_REASONS",
     "ObserveDecision",
     "arm_selected_candidate",
     "available_economic_slots",
@@ -1292,6 +1366,7 @@ __all__ = [
     "min_dip_bps",
     "observe_book",
     "operator_row",
+    "rearm_successor_after_expire",
     "rebound_achieved_bps",
     "rebound_bps_from_spread",
     "rebound_trigger_ask",
