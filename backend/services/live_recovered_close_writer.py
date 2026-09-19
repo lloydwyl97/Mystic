@@ -222,9 +222,40 @@ def persist_recovered_close(
             )
 
             existing_sell = _find_existing_sell(conn, fill)
-            if existing_sell:
+            oid = str(fill.exchange_sell_order_id or "").strip()
+            already_venue = None
+            if oid:
+                already_venue = conn.execute(
+                    """
+                    SELECT id, trade_id FROM paper_trades
+                    WHERE side = 'SELL' AND TRIM(COALESCE(order_id, '')) = ?
+                    LIMIT 1
+                    """,
+                    (oid,),
+                ).fetchone()
+            from backend.services.live_close_integrity import ECONOMIC_TABLE, ensure_live_close_tables
+
+            ensure_live_close_tables(conn)
+            claimed_new = False
+            if oid:
+                claim_cur = conn.execute(
+                    f"""
+                    INSERT OR IGNORE INTO {ECONOMIC_TABLE}
+                    (exchange_order_id, side, mystic_trade_id, symbol, created_at)
+                    VALUES (?, 'SELL', ?, ?, ?)
+                    """,
+                    (oid, sell_trade_id, fill.symbol, fill.closed_at_iso),
+                )
+                claimed_new = int(claim_cur.rowcount or 0) == 1
+            if already_venue and not existing_sell:
+                result["existing"]["paper_trades_sell"] = already_venue[0]
+                result["existing"]["venue_order_already_attributed"] = True
+                sell_trade_id = str(already_venue[1])
+            elif existing_sell:
                 result["existing"]["paper_trades_sell"] = existing_sell[0]
                 sell_trade_id = str(existing_sell[1])
+            elif oid and not claimed_new:
+                result["existing"]["economic_close_already_claimed"] = True
             else:
                 cur.execute(
                     """
@@ -233,8 +264,8 @@ def persist_recovered_close(
                         entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
                         fees_paid, slippage_cost, exit_type, timestamp, status,
                         explainability_json, diagnostics_json, sleeve, exit_reason,
-                        entry_timestamp, decision_id, strategy_id, confidence
-                    ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        entry_timestamp, decision_id, strategy_id, confidence, order_id
+                    ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         sell_trade_id,
@@ -260,6 +291,7 @@ def persist_recovered_close(
                         explain.get("decision_id"),
                         strategy_id,
                         confidence,
+                        oid or None,
                     ),
                 )
                 result["created"]["paper_trades_sell"] = int(cur.lastrowid)

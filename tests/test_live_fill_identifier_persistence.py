@@ -34,12 +34,10 @@ def _pairs() -> list[tuple[str, str]]:
 def test_engine_has_the_expected_number_of_paper_trades_inserts():
     """Guard the scan below: a new insert path must be reviewed for identifiers.
 
-    This was 7. One was a duplicate BUY insert (``_sync_insert``) left behind
-    when the atomic OPEN replaced it — defined inside ``_execute_buy_fifo_locked``
-    but never called from anywhere, and it bound a runtime ``buy_mode`` while
-    listing no ``order_id``. It was removed rather than fixed.
+    This was 6. The dust-cleanup SELL insert was removed so leftover dust
+    cannot create a completed live trade or invented realized P&L.
     """
-    assert len(_insert_statements()) == 6
+    assert len(_insert_statements()) == 5
 
 
 def test_every_insert_that_can_write_a_live_row_persists_order_id():
@@ -57,8 +55,7 @@ def test_every_insert_that_can_write_a_live_row_persists_order_id():
 
 def test_dust_writeoff_is_the_only_identifier_free_exit():
     identifier_free = [v for c, v in _pairs() if "order_id" not in c and "'paper'" not in v]
-    assert len(identifier_free) == 1
-    assert "DUST_WRITEOFF" in identifier_free[0]
+    assert identifier_free == []
 
 
 def test_column_and_placeholder_counts_match_on_every_insert():

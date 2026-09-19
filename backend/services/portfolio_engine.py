@@ -2446,6 +2446,16 @@ class PortfolioEngine:
                 apply_eth_lot_integrity_correction(self.db_path)
             except Exception:
                 logger.exception("ETH_LOT_INTEGRITY_CORRECTION_FAILED")
+            try:
+                from backend.services.live_close_integrity import classify_existing_rows, ensure_live_close_tables
+                from backend.utils.sqlite_runtime import connect_rw as _connect_rw_integrity
+
+                with _connect_rw_integrity(self.db_path) as _ic:
+                    ensure_live_close_tables(_ic)
+                    _ic.commit()
+                classify_existing_rows(self.db_path)
+            except Exception:
+                logger.exception("LIVE_CLOSE_CLASSIFICATION_FAILED")
 
         # STEP 1: Try to load from SQLite (deterministic restart)
         ledger_loaded = await self._load_ledger_from_sqlite()
@@ -5006,6 +5016,10 @@ class PortfolioEngine:
         if "startup_timestamp" not in ledger_cols:
             cursor.execute("ALTER TABLE portfolio_engine_ledger ADD COLUMN startup_timestamp TEXT")
 
+        from backend.services.live_close_integrity import ensure_live_close_tables
+
+        ensure_live_close_tables(cursor.connection)
+
         cursor.connection.commit()
 
     # =========================================================================
@@ -6805,54 +6819,39 @@ class PortfolioEngine:
                 self._compute_total_open_risk()
                 await self._delete_position_from_sqlite(symbol)
 
-                # Write dust_writeoff SELL to paper_trades so every BUY is accounted for
+                # Dust leftover is inventory, not a completed live strategy close.
                 try:
+                    from backend.services.live_close_integrity import persist_dust_inventory_event, persist_pending_close_event
+
                     normalized = normalize_symbol(symbol)
-                    sell_trade_id = f"dust_writeoff_{normalized.replace('/', '_')}_{int(time.time() * 1000)}"
-                    timestamp = datetime.now(timezone.utc).isoformat()
-                    paper_service = get_paper_trading_service()
-                    paper_run_id = getattr(paper_service, "paper_run_id", None) or "default"
-                    mode = "live" if self._live_service else "paper"
-                    dust_sid = str(getattr(position, "entry_strategy_id", "") or "").strip() or None
-
-                    def _write_dust_sell() -> None:
-                        with connect_managed(self.db_path) as conn:
-                            cur = conn.cursor()
-                            cur.execute(
-                                """INSERT INTO paper_trades (
-                                    trade_id, paper_run_id, mode, symbol, side, quantity, price,
-                                    entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
-                                    fees_paid, slippage_cost, exit_type, timestamp, status, strategy_id
-                                ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, 0, 0, 'DUST_WRITEOFF', ?, 'dust_writeoff', ?)""",
-                                (
-                                    sell_trade_id,
-                                    paper_run_id,
-                                    mode,
-                                    normalized,
-                                    dust_qty,
-                                    dust_entry,
-                                    dust_entry,
-                                    -dust_notional,
-                                    -1.0 if dust_notional > 0 else 0.0,
-                                    hold_seconds,
-                                    timestamp,
-                                    dust_sid,
-                                ),
-                            )
-                            # Zero out remaining_position on matching BUY(s)
-                            cur.execute(
-                                """UPDATE paper_trades
-                                   SET remaining_position = 0
-                                   WHERE symbol = ? AND side = 'BUY' AND remaining_position > 0""",
-                                (normalized,),
-                            )
-                            conn.commit()
-
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, _write_dust_sell)
-                    logger.info("DUST_SELL_RECORD: %s qty=%.8g entry=%.6f notional=%.4f trade_id=%s", symbol, dust_qty, dust_entry, dust_notional, sell_trade_id)
+                    persist_dust_inventory_event(
+                        self.db_path,
+                        symbol=normalized,
+                        quantity=float(dust_qty or 0.0),
+                        entry_price=float(dust_entry or 0.0),
+                        price_snapshot=float(dust_entry or 0.0),
+                        reason="CANONICAL_DUST_CLEANUP",
+                        est_notional=float(dust_notional or 0.0),
+                    )
+                    persist_pending_close_event(
+                        self.db_path,
+                        symbol=normalized,
+                        event_type="DUST_PENDING",
+                        exit_trigger="CANONICAL_DUST_CLEANUP",
+                        quantity=float(dust_qty or 0.0),
+                        price_snapshot=float(dust_entry or 0.0),
+                        detail="qty<=0 cleanup; no paper_trades SELL; no realized pnl",
+                    )
+                    logger.info(
+                        "DUST_INVENTORY_EVENT: %s qty=%.8g entry=%.6f notional=%.4f hold_s=%s",
+                        symbol,
+                        dust_qty,
+                        dust_entry,
+                        dust_notional,
+                        hold_seconds,
+                    )
                 except Exception as e:
-                    logger.warning("DUST_SELL_RECORD_FAILED: %s - %s (position still cleaned)", symbol, e)
+                    logger.warning("DUST_INVENTORY_EVENT_FAILED: %s - %s (position still cleaned)", symbol, e)
 
                 try:
                     if self._paper_service and symbol in getattr(self._paper_service, "positions", {}):
@@ -10528,6 +10527,41 @@ class PortfolioEngine:
             still_open, remaining = self._entry_lot_still_open_sync(symbol, entry_trade_id)
         return not (still_open and remaining + 1e-09 >= qty)
 
+    async def _finalize_dust_without_strategy_close(
+        self,
+        *,
+        symbol: str,
+        position: OpenPosition,
+        quantity: float,
+        exit_trigger: str,
+        price_snapshot: float,
+        reason: str,
+        est_notional: float,
+    ) -> None:
+        """Leftover dust is inventory, not a completed live strategy close."""
+        from backend.services.live_close_integrity import persist_dust_inventory_event
+
+        position.status = "DUST_PENDING"
+        position.dust_detected_at = time.time()
+        position.dust_qty_canonical = float(position.quantity or quantity or 0.0)
+        booked = persist_dust_inventory_event(
+            self.db_path,
+            symbol=symbol,
+            quantity=float(quantity or position.quantity or 0.0),
+            entry_price=float(position.entry_price or 0.0),
+            price_snapshot=float(price_snapshot or 0.0),
+            reason=str(reason or exit_trigger or "DUST"),
+            est_notional=float(est_notional or 0.0),
+        )
+        await self._persist_position_to_sqlite(position)
+        logger.warning(
+            "DUST_PENDING_NO_STRATEGY_CLOSE symbol=%s qty=%.8f booked=%s exit=%s",
+            symbol,
+            float(quantity or 0.0),
+            booked,
+            exit_trigger,
+        )
+
     async def execute_legacy_inventory_cleanup(self, symbol: str) -> dict[str, Any] | None:
         """Close pre-router legacy DAY inventory; excluded from new-regime scoreboard."""
         from backend.services.day_trade_thesis import EXIT_LEGACY_INVENTORY_CLEANUP
@@ -10917,6 +10951,23 @@ class PortfolioEngine:
                 with connect_rw(self.db_path) as conn:
                     conn.execute("BEGIN IMMEDIATE")
                     cursor = conn.cursor()
+                    from backend.services.execution_mode_service import is_live_execution_allowed_sync as _live_ok
+                    from backend.services.live_close_integrity import live_order_has_venue_fill as _has_fill
+
+                    if dust_writeoff:
+                        logger.error(
+                            "FIFO_SELL_REFUSED_DUST_WRITEOFF symbol=%s — dust is not a completed strategy close",
+                            normalized_symbol,
+                        )
+                        conn.rollback()
+                        return False
+                    if (_live_ok() or self._live_execution_enabled) and not _has_fill(live_order_sell):
+                        logger.error(
+                            "FIFO_SELL_REFUSED_NO_VENUE_FILL symbol=%s — completed trade writer unreachable",
+                            normalized_symbol,
+                        )
+                        conn.rollback()
+                        return False
 
                     # PHASE 2 FIX: Use AUTHORITATIVE ledger (portfolio_engine_positions) not paper_trades
                     # Since MAX_OPEN_PER_SYMBOL=1, there's exactly one position per symbol
@@ -11750,6 +11801,70 @@ class PortfolioEngine:
                         position.dust_qty_canonical = position.quantity
                     await self._persist_position_to_sqlite(position)
                     return None
+
+        if dust_writeoff:
+            await self._finalize_dust_without_strategy_close(
+                symbol=normalized_symbol,
+                position=position,
+                quantity=float(actual_sold_qty or 0.0),
+                exit_trigger=str(exit_trigger or ""),
+                price_snapshot=float(price or 0.0),
+                reason=str(dust_reason_str or "DUST"),
+                est_notional=float(dust_est_notional_val or 0.0),
+            )
+            return None
+
+        from backend.services.live_close_integrity import claim_economic_close, live_order_has_venue_fill, persist_pending_close_event
+
+        live_expected = bool(is_live_execution_allowed_sync() or self._live_execution_enabled)
+        if live_expected:
+            if not live_order_has_venue_fill(live_order_sell):
+                persist_pending_close_event(
+                    self.db_path,
+                    symbol=normalized_symbol,
+                    event_type="LIVE_CLOSE_NO_VENUE_FILL",
+                    exit_trigger=str(exit_trigger or ""),
+                    quantity=float(actual_sold_qty or 0.0),
+                    price_snapshot=float(price or 0.0),
+                    detail="exit decision without exchange fill; no realized pnl",
+                )
+                await self._record_reject(
+                    normalized_symbol,
+                    "SELL",
+                    "LIVE_CLOSE_NO_VENUE_FILL",
+                    "VENUE_FILL_REQUIRED",
+                )
+                logger.error(
+                    "LIVE_CLOSE_BLOCKED_NO_VENUE_FILL symbol=%s exit=%s qty=%.8f",
+                    normalized_symbol,
+                    exit_trigger,
+                    float(actual_sold_qty or 0.0),
+                )
+                return None
+            oid = str((live_order_sell or {}).get("id") or "").strip()
+            if not claim_economic_close(
+                self.db_path,
+                oid,
+                "SELL",
+                mystic_trade_id=str(getattr(position, "trade_id", "") or ""),
+                symbol=normalized_symbol,
+            ):
+                logger.warning(
+                    "LIVE_SELL_IDEMPOTENT_SKIP symbol=%s order=%s",
+                    normalized_symbol,
+                    oid,
+                )
+                persist_pending_close_event(
+                    self.db_path,
+                    symbol=normalized_symbol,
+                    event_type="LIVE_CLOSE_DUPLICATE_VENUE_FILL",
+                    exit_trigger=str(exit_trigger or ""),
+                    quantity=float(actual_sold_qty or 0.0),
+                    price_snapshot=float(price or 0.0),
+                    exchange_order_id=oid,
+                    detail="venue fill already attributed",
+                )
+                return None
 
         # =================================================================
         # Phase 4: Recompute all money math AFTER final quantity is known
@@ -20852,24 +20967,17 @@ class PortfolioEngine:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         def _sync_get() -> float:
+            from backend.services.live_close_integrity import venue_backed_unique_aggregate_sql
+
             conn = sqlite3.connect(self.db_path)
             try:
                 cur = conn.cursor()
                 cur.execute(
-                    """
-                    SELECT COALESCE(SUM(pnl), 0)
-                    FROM paper_trades
-                    WHERE date(timestamp) = ? AND UPPER(side) = 'SELL'
-                      AND COALESCE(exit_type, '') NOT IN (
-                        'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
-                        'RESEARCH_RESET_EXIT', 'DUST_WRITEOFF'
-                      )
-                      AND COALESCE(is_synthetic, 0) = 0
-                    """,
-                    (today,),
+                    venue_backed_unique_aggregate_sql("AND date(t.timestamp) = ?"),
+                    (today, today),
                 )
                 row = cur.fetchone()
-                return float(row[0] or 0.0) if row else 0.0
+                return float(row[1] or 0.0) if row else 0.0
             finally:
                 conn.close()
 
@@ -22323,14 +22431,11 @@ class PortfolioEngine:
             downtime = by_action.get("DOWNTIME_POSITION_CLEAR", {"count": 0, "pnl": 0.0})
             buys = by_action.get("BUY", {"count": 0, "pnl": 0.0})
 
+            from backend.services.live_close_integrity import venue_backed_unique_aggregate_sql
+
             cur.execute(
-                """
-                SELECT COUNT(*), COALESCE(SUM(pnl), 0)
-                FROM paper_trades
-                WHERE date(timestamp) = ? AND UPPER(side) = 'SELL'
-                  AND COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT', 'DUST_WRITEOFF') AND COALESCE(is_synthetic, 0) = 0
-                """,
-                (day,),
+                venue_backed_unique_aggregate_sql("AND date(t.timestamp) = ?"),
+                (day, day),
             )
             ai_sell_row = cur.fetchone()
             ai_paper_closes = int(ai_sell_row[0] or 0) if ai_sell_row else 0
@@ -22386,20 +22491,10 @@ class PortfolioEngine:
 
             closed_ai = ai["count"] if ai["count"] else ai_paper_closes
             cur.execute(
-                """
-                SELECT COALESCE(SUM(pnl), 0)
-                FROM paper_trades
-                WHERE date(timestamp) = ? AND UPPER(side) = 'SELL' AND pnl IS NOT NULL
-                  AND COALESCE(exit_type, '') NOT IN (
-                    'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
-                    'legacy_no_clear_position_clear', 'STALE_LIVE_GHOST_POSITION_CLEAR',
-                    'RESEARCH_RESET_EXIT'
-                  )
-                  AND COALESCE(is_synthetic, 0) = 0
-                """,
-                (day,),
+                venue_backed_unique_aggregate_sql("AND date(t.timestamp) = ?"),
+                (day, day),
             )
-            strategy_paper_today = float((cur.fetchone() or (0,))[0] or 0.0)
+            strategy_paper_today = float((cur.fetchone() or (0, 0))[1] or 0.0)
             return {
                 "ai_closed_trades": closed_ai,
                 "closed_ai_trades_today": closed_ai,
