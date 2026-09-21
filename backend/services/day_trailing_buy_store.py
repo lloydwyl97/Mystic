@@ -97,6 +97,11 @@ def ensure_trailing_buy_schema(db_path: str | Path) -> None:
     conn = sqlite3.connect(str(db_path), timeout=30)
     try:
         conn.executescript(SCHEMA_SQL)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(day_trailing_buy_intents)")}
+        if "engine_id" not in cols:
+            conn.execute("ALTER TABLE day_trailing_buy_intents ADD COLUMN engine_id TEXT DEFAULT 'LEGACY_DAY_LIVE'")
+        if "scalp_opportunity_id" not in cols:
+            conn.execute("ALTER TABLE day_trailing_buy_intents ADD COLUMN scalp_opportunity_id TEXT DEFAULT ''")
         conn.commit()
     finally:
         conn.close()
@@ -180,8 +185,9 @@ def create_intent(
                 status, expires_at, cancel_reason, order_id, client_order_id,
                 fill_id, trade_id, reservation_id, order_accepted, quantity,
                 stop_price, atr, confidence, bar_timestamp, sleeve, notional_usd,
-                thesis_invalid_level, payload_json, created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                thesis_invalid_level, payload_json, created_at, updated_at,
+                engine_id, scalp_opportunity_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 intent_id,
@@ -223,6 +229,8 @@ def create_intent(
                 json.dumps(payload, default=str),
                 now,
                 now,
+                str(fields.get("engine_id") or "SCALP_V2"),
+                str(fields.get("scalp_opportunity_id") or ""),
             ),
         )
         conn.commit()

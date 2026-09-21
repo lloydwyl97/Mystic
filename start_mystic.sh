@@ -438,10 +438,10 @@ run_core_stack() {
 
     echo ""
     echo "=========================================="
-    echo "MYSTIC ${label} STACK STARTED (DAY top-4 live, SCALP V2 pending qualification)"
+    echo "MYSTIC ${label} STACK STARTED (SCALP V2 live on the portfolio engine)"
     echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
     echo "Services: Backend + LiveMD + Signal + Portfolio + Context + Learning"
-    echo "SCALP V2: exit calibration integrated into main engine (no separate runner)."
+    echo "SCALP V2: live order authority is the portfolio engine. Paper scalp is not started."
     echo "Ensure .env has EXTERNAL_SUPERVISOR_MODE=true"
     echo "=========================================="
 }

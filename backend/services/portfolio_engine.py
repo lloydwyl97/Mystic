@@ -5314,7 +5314,16 @@ class PortfolioEngine:
                             timestamp,
                         ),
                     )
+                    from backend.services.scalp_v2.identity_stamp import stamp_engine
 
+                    stamp_engine(
+                        conn,
+                        "portfolio_engine_positions",
+                        "symbol",
+                        pos.symbol,
+                        str(getattr(pos, "engine_id", "") or "LEGACY_DAY_LIVE"),
+                        str(getattr(pos, "scalp_opportunity_id", "") or ""),
+                    )
                     conn.commit()
 
             run_locked_retry(_op)
@@ -5440,6 +5449,28 @@ class PortfolioEngine:
                         timestamp,
                     ),
                 )
+                from backend.services.scalp_v2.identity_stamp import stamp_engine
+
+                stamp_engine(
+                    conn,
+                    "portfolio_engine_positions",
+                    "symbol",
+                    position.symbol,
+                    str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE"),
+                    str(getattr(position, "scalp_opportunity_id", "") or ""),
+                )
+                stamp_engine(
+                    conn,
+                    "paper_trades",
+                    "trade_id",
+                    trade_id,
+                    str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE"),
+                    str(getattr(position, "scalp_opportunity_id", "") or ""),
+                )
+                if getattr(position, "scalp_opportunity_id", ""):
+                    from backend.services.scalp_v2.opportunity import mark_opportunity_on
+
+                    mark_opportunity_on(conn, position.symbol, str(position.scalp_opportunity_id), "OPEN")
                 cursor.execute(
                     """
                     INSERT OR REPLACE INTO portfolio_engine_ledger (
@@ -9810,6 +9841,29 @@ class PortfolioEngine:
         # venue order that created it.
         position.entry_decision_id = str(decision_id or "")
         position.entry_intent_id = str(trailing_buy_intent_id or "")
+        from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
+
+        position.engine_id = SCALP_V2_ENGINE_ID if buy_mode == "live" else str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE")
+        position.scalp_opportunity_id = ""
+        if trailing_buy_intent_id:
+            try:
+                from backend.services.day_trailing_buy_store import load_intent
+
+                armed = load_intent(self.db_path, str(trailing_buy_intent_id))
+                if armed:
+                    position.engine_id = str(armed.get("engine_id") or position.engine_id)
+                    position.scalp_opportunity_id = str(armed.get("scalp_opportunity_id") or "")
+            except Exception:
+                logger.debug("SCALP_V2_INTENT_STAMP_SKIPPED %s", symbol, exc_info=True)
+        if buy_mode == "live" and not position.scalp_opportunity_id:
+            from backend.services.scalp_v2.opportunity import ScalpOpportunityId
+
+            position.scalp_opportunity_id = ScalpOpportunityId.from_intent(
+                normalized_symbol,
+                str(getattr(position, "entry_thesis", "") or "LIVE"),
+                "",
+                arm_price=float(fill_price or 0.0),
+            ).canonical_id
         position.entry_client_order_id = str(client_order_id or "")
         position.entry_reservation_id = str((self._entry_reservations.get(normalized_symbol) or {}).get("reservation_id") or "")
         if live_order_buy:
@@ -11333,6 +11387,21 @@ class PortfolioEngine:
                                 str((live_order_sell or {}).get("id") or "") or None,
                             ),
                         )
+
+                    from backend.services.scalp_v2.identity_stamp import stamp_engine
+
+                    stamp_engine(
+                        conn,
+                        "paper_trades",
+                        "trade_id",
+                        sell_trade_id,
+                        str(getattr(position, "engine_id", "") or "LEGACY_EXIT_ONLY"),
+                        str(getattr(position, "scalp_opportunity_id", "") or ""),
+                    )
+                    if getattr(position, "scalp_opportunity_id", ""):
+                        from backend.services.scalp_v2.opportunity import mark_opportunity_on
+
+                        mark_opportunity_on(conn, symbol, str(position.scalp_opportunity_id), "CLOSED")
 
                     # Phase 5: dust writeoffs audit - insert row when dust writeoff
                     if dust_writeoff:
@@ -13303,13 +13372,12 @@ class PortfolioEngine:
                                 float(loss_hold_until) - now_wall,
                             )
                         else:
-                            logger.warning(
-                                "BUY_BLOCKED_HOLD_CONSEC_LOSSES symbol=%s consec=%s remaining=%.0fs",
+                            logger.info(
+                                "HOLD_CONSEC_LOSSES_TELEMETRY symbol=%s consec=%s remaining=%.0fs (not an entry veto)",
                                 symbol,
                                 consec,
                                 float(loss_hold_until) - now_wall,
                             )
-                            return False, "HOLD_CONSEC_LOSSES"
             except Exception as _lh_err:
                 logger.debug("loss_hold check skipped: %s", _lh_err)
 

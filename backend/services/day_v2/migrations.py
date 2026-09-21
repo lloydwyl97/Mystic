@@ -155,11 +155,30 @@ def migration_day_v2_shadow_observations(conn: sqlite3.Connection) -> dict[str, 
 # Migration registry and runner
 # ---------------------------------------------------------------------------
 
+
+def migration_legacy_exit_only(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Open legacy lots stay exit-only. Closed history is not relabeled."""
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(portfolio_engine_positions)")}
+    if "engine_id" not in cols:
+        return {"updated": 0, "skipped": "no engine_id column"}
+    cur = conn.execute(
+        """
+        UPDATE portfolio_engine_positions
+        SET engine_id='LEGACY_EXIT_ONLY'
+        WHERE UPPER(COALESCE(status,'ACTIVE')) IN ('ACTIVE','DUST_PENDING')
+          AND COALESCE(engine_id,'') IN ('','LEGACY_DAY_LIVE')
+        """
+    )
+    conn.commit()
+    return {"updated": int(cur.rowcount or 0)}
+
+
 _MIGRATIONS: list[tuple[str, Any]] = [
     ("engine_id_positions", migration_engine_id_positions),
     ("engine_id_paper_trades", migration_engine_id_paper_trades),
     ("engine_id_trailing_buy_intents", migration_engine_id_trailing_buy_intents),
     ("day_v2_shadow_observations", migration_day_v2_shadow_observations),
+    ("legacy_exit_only", migration_legacy_exit_only),
 ]
 
 

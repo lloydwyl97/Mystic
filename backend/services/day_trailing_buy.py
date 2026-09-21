@@ -537,6 +537,14 @@ async def arm_selected_candidate(
     if not reserved:
         logger.info("TRAILING_BUY_ARM_BLOCKED %s reservation=%s", symbol, reserve_reason)
         return None
+    setup_name = str(decision_data.get("setup_type") or decision_data.get("entry_thesis") or getattr(explainability, "setup_type", "") or "")
+    from backend.services.scalp_v2.opportunity import SCALP_V2_ENGINE_ID, arm_opportunity
+
+    opp_id, blocked = arm_opportunity(engine.db_path, symbol, setup_name, arm_bid or arm_ask)
+    if blocked:
+        engine._release_entry_reservation(symbol, decision_id=str(decision_id or ""), reason="SAME_MOVE_OPPORTUNITY")
+        logger.info("TRAILING_BUY_ARM_BLOCKED %s SAME_MOVE_OPPORTUNITY id=%s", symbol, opp_id)
+        return None
     now = time.time()
     exp = explainability.to_dict() if hasattr(explainability, "to_dict") else {}
     created_ok, create_reason, intent = create_intent(
@@ -545,7 +553,9 @@ async def arm_selected_candidate(
             "decision_id": decision_id,
             "inference_id": str(decision_data.get("ai_inference_log_id") or decision_data.get("inference_log_id") or ""),
             "symbol": symbol,
-            "setup": str(decision_data.get("setup_type") or decision_data.get("entry_thesis") or getattr(explainability, "setup_type", "") or ""),
+            "setup": setup_name,
+            "engine_id": SCALP_V2_ENGINE_ID,
+            "scalp_opportunity_id": opp_id,
             "arm_ts": now,
             "arm_bid": arm_bid,
             "arm_ask": arm_ask,

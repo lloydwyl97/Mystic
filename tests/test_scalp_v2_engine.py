@@ -52,22 +52,29 @@ def test_scalp_opportunity_id_is_deterministic():
 # ---------------------------------------------------------------------------
 
 
-def test_scalp_opportunity_id_differs_by_bar():
+def test_scalp_opportunity_id_ignores_clock_and_changes_with_anchor():
     from backend.services.scalp_v2.opportunity import ScalpOpportunityId
 
     bar1 = ScalpOpportunityId(
-        symbol="BTCUSDT",
+        symbol="BTC/USDT",
         setup_family="VWAP",
-        structural_anchor="LIVE",
+        structural_anchor="pxb:1",
         entry_bar_15m="2026-09-15T22:30:00+00:00",
     )
     bar2 = ScalpOpportunityId(
-        symbol="BTCUSDT",
+        symbol="BTC/USDT",
         setup_family="VWAP",
-        structural_anchor="LIVE",
+        structural_anchor="pxb:1",
         entry_bar_15m="2026-09-15T22:45:00+00:00",
     )
-    assert bar1.canonical_id != bar2.canonical_id
+    other = ScalpOpportunityId(
+        symbol="BTC/USDT",
+        setup_family="VWAP",
+        structural_anchor="pxb:2",
+        entry_bar_15m="2026-09-15T22:30:00+00:00",
+    )
+    assert bar1.canonical_id == bar2.canonical_id
+    assert bar1.canonical_id != other.canonical_id
 
 
 # ---------------------------------------------------------------------------
@@ -75,11 +82,11 @@ def test_scalp_opportunity_id_differs_by_bar():
 # ---------------------------------------------------------------------------
 
 
-def test_scalp_v2_stall_disabled_by_default(monkeypatch):
+def test_scalp_v2_stall_enabled_by_default(monkeypatch):
     monkeypatch.delenv("SCALP_V2_STALL_EXIT_ENABLED", raising=False)
     from backend.services.scalp_v2.exit_calibration import scalp_v2_stall_exit_enabled
 
-    assert scalp_v2_stall_exit_enabled() is False
+    assert scalp_v2_stall_exit_enabled() is True
 
 
 # ---------------------------------------------------------------------------
@@ -87,11 +94,11 @@ def test_scalp_v2_stall_disabled_by_default(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_scalp_v2_giveback_disabled_by_default(monkeypatch):
+def test_scalp_v2_giveback_enabled_by_default(monkeypatch):
     monkeypatch.delenv("SCALP_V2_GIVEBACK_EXIT_ENABLED", raising=False)
     from backend.services.scalp_v2.exit_calibration import scalp_v2_giveback_exit_enabled
 
-    assert scalp_v2_giveback_exit_enabled() is False
+    assert scalp_v2_giveback_exit_enabled() is True
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +255,8 @@ def _make_stall_candidate_position():
 
 
 def test_scalp_v2_exit_path_skips_stall(monkeypatch):
-    """With engine_id='SCALP_V2', stall exit must not fire even when stall conditions are met."""
-    monkeypatch.delenv("SCALP_V2_STALL_EXIT_ENABLED", raising=False)
+    """Explicit SCALP_V2_STALL_EXIT_ENABLED=false suppresses stall. The default keeps it."""
+    monkeypatch.setenv("SCALP_V2_STALL_EXIT_ENABLED", "false")
     monkeypatch.setenv("DAY_STALL_EXIT_ENABLED", "true")
     # Ensure path-aware exit is disabled so the legacy ladder runs (not path-aware exit)
     monkeypatch.setenv("DAY_PATH_AWARE_EXIT", "false")
@@ -284,8 +291,8 @@ def test_scalp_v2_exit_path_skips_stall(monkeypatch):
 
 
 def test_scalp_v2_exit_path_skips_giveback(monkeypatch):
-    """With engine_id='SCALP_V2', giveback exit must not fire even when conditions are met."""
-    monkeypatch.delenv("SCALP_V2_GIVEBACK_EXIT_ENABLED", raising=False)
+    """Explicit SCALP_V2_GIVEBACK_EXIT_ENABLED=false suppresses giveback. The default keeps it."""
+    monkeypatch.setenv("SCALP_V2_GIVEBACK_EXIT_ENABLED", "false")
     monkeypatch.setenv("DAY_GIVEBACK_EXIT_ENABLED", "true")
     # Ensure path-aware exit is disabled so the legacy ladder runs (not path-aware exit)
     monkeypatch.setenv("DAY_PATH_AWARE_EXIT", "false")

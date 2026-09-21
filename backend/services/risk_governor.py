@@ -213,10 +213,12 @@ class RiskGovernor:
                     )
                     result.account_hold_reason = None
                 else:
-                    result.account_hold_reason = "HOLD_CONSEC_LOSSES"
-                    result.rejections.append(Rejection("", "HOLD_CONSEC_LOSSES", f"consec_losses={account.consecutive_losses} >= {self._max_consec}"))
-                    _log_governance("Layer1", result, account, candidates)
-                    return result
+                    logger.info(
+                        "GOVERNANCE_TELEMETRY HOLD_CONSEC_LOSSES would_block consec_losses=%s>=%s (not an entry veto)",
+                        account.consecutive_losses,
+                        self._max_consec,
+                    )
+                    result.account_hold_reason = None
             # Cooldown expired: allow buys in strict (tier C) mode; do not overwrite when already in Tier D recovery
             elif tier != "D":
                 size_mult = float(os.getenv("TIER_C_SIZE_MULT", "0.25"))

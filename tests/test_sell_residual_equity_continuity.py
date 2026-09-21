@@ -243,6 +243,7 @@ async def test_execute_sell_fifo_partial_fill_equity_continuous():
             ),
             patch("backend.services.protected_limit_execution.USE_PROTECTED_LIMIT_EXECUTION", True),
             patch("backend.services.paper_trading_service.get_paper_trading_service", return_value=engine._paper_service),
+            patch.object(engine, "_fetch_mtm_prices_for_open_positions", AsyncMock(return_value={"XRP/USDT": fill})),
         ):
             result = await engine.execute_sell_fifo(
                 "XRP/USDT",

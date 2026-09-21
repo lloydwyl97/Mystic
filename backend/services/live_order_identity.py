@@ -411,6 +411,9 @@ def backfill_venue_trade_ids(db_path: str, row_id: int, trade_ids: list[str], or
     oids = [str(x).strip() for x in (order_ids or []) if str(x).strip()]
     try:
         with sqlite3.connect(db_path, timeout=15) as conn:
+            cols = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({TABLE})")}
+            if "venue_order_ids_json" not in cols:
+                conn.execute(f"ALTER TABLE {TABLE} ADD COLUMN venue_order_ids_json TEXT DEFAULT '[]'")
             cur = conn.execute(
                 f"""
                 UPDATE {TABLE}
@@ -418,10 +421,13 @@ def backfill_venue_trade_ids(db_path: str, row_id: int, trade_ids: list[str], or
                     venue_trade_ids_json = CASE
                         WHEN COALESCE(venue_trade_ids_json,'[]') IN ('[]','','null') THEN ?
                         ELSE venue_trade_ids_json END,
+                    venue_order_ids_json = CASE
+                        WHEN COALESCE(venue_order_ids_json,'[]') IN ('[]','','null') THEN ?
+                        ELSE venue_order_ids_json END,
                     fill_count = ?
                 WHERE id = ? AND COALESCE(fill_ids_json,'[]') IN ('[]','','null')
                 """,
-                (json.dumps(ids), json.dumps(oids), len(ids), int(row_id)),
+                (json.dumps(ids), json.dumps(ids), json.dumps(oids), len(ids), int(row_id)),
             )
             conn.commit()
             return bool(cur.rowcount)

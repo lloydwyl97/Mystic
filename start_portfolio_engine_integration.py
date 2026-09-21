@@ -193,6 +193,11 @@ async def main():
         _normalize_non_root_stream_handlers(exempt_loggers={"backend.services.portfolio_engine_integration"})
 
         logger.info("Initializing Portfolio Engine Integration...")
+        import os
+
+        from backend.services.day_v2.migrations import apply_all_migrations
+
+        apply_all_migrations(os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db"))
 
         # Start the service
         integration = await start_portfolio_integration()
