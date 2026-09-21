@@ -230,8 +230,18 @@ def _ohlcv_symbol(symbol: str) -> str:
 
 
 def load_candles_after(db_path: str, symbol: str, after_epoch: float, limit: int = MAX_HOLD_BARS + 2) -> list[dict[str, Any]]:
-    """Load 15m candles for symbol after the given epoch timestamp."""
+    """Load 15m candles for symbol after the given epoch timestamp.
+
+    feature_ohlcv.ts is stored as a datetime string (e.g. '2026-09-21 03:45:00.000000').
+    We must compare it as a string, not as a float, to avoid SQLite type-affinity
+    issues (TEXT > REAL always in SQLite, so a float parameter would match every row).
+    """
+    from datetime import datetime
+    from datetime import timezone as _tz
+
     ohlcv_sym = _ohlcv_symbol(symbol)
+    # Convert epoch -> UTC datetime string for proper string comparison in SQLite
+    after_dt_str = datetime.fromtimestamp(after_epoch, tz=_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -242,7 +252,7 @@ def load_candles_after(db_path: str, symbol: str, after_epoch: float, limit: int
         ORDER BY ts ASC
         LIMIT ?
         """,
-        (ohlcv_sym, after_epoch, limit),
+        (ohlcv_sym, after_dt_str, limit),
     ).fetchall()
     conn.close()
 
@@ -252,9 +262,11 @@ def load_candles_after(db_path: str, symbol: str, after_epoch: float, limit: int
             from datetime import datetime, timezone
 
             ts_str = str(r["ts"])
-            # feature_ohlcv ts is stored as a datetime string
+            # feature_ohlcv ts is stored as a datetime string (no timezone = UTC)
             try:
                 dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
                 ts_epoch = dt.timestamp()
             except Exception:
                 ts_epoch = 0.0
