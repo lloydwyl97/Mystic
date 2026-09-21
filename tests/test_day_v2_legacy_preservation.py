@@ -84,3 +84,39 @@ def test_new_modules_have_no_side_effects_on_import():
     # The attribute set of portfolio_engine should be unchanged
     added = after_attrs - before_attrs
     assert not added, f"Importing day_v2 modules added attributes to portfolio_engine: {added}"
+
+
+def test_engine_id_field_added_to_open_position():
+    """engine_id field must be present in OpenPosition with default LEGACY_DAY_LIVE."""
+    from backend.services.portfolio_engine import OpenPosition
+
+    pos = OpenPosition(
+        symbol="ETHUSDT",
+        quantity=0.01,
+        entry_price=2500.0,
+        entry_time=1.0,
+        trade_id="test_tid",
+        stop_price=2400.0,
+        take_profit_1_price=2600.0,
+        take_profit_2_price=2700.0,
+    )
+    assert pos.engine_id == "LEGACY_DAY_LIVE", "engine_id default must be LEGACY_DAY_LIVE"
+    assert pos.scalp_opportunity_id == "", "scalp_opportunity_id default must be empty string"
+
+
+def test_old_scalp_runner_not_imported_in_core_stack():
+    """The old binance_scalp.runner must NOT be imported by portfolio_engine or integration."""
+    import inspect
+
+    import backend.services.portfolio_engine as pe
+
+    source = inspect.getsource(pe)
+    assert "binance_scalp.runner" not in source, "portfolio_engine must not import binance_scalp.runner — it is disabled from core mode"
+
+    try:
+        import backend.services.portfolio_engine_integration as pei
+
+        source2 = inspect.getsource(pei)
+        assert "binance_scalp.runner" not in source2
+    except ImportError:
+        pass  # If it doesn't exist, test passes

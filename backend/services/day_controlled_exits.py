@@ -1352,11 +1352,28 @@ def evaluate_engine_managed_exit(
     bundle: dict[str, Any] | None = None,
     bar_low: float | None = None,
     now_epoch: float | None = None,
+    engine_id: str = "LEGACY_DAY_LIVE",
 ) -> dict[str, Any]:
     """
     Shared paper/live exit manager. Risk exits bypass net-profit-only gate.
     Priority: stop -> trailing -> thesis invalidation -> failed reclaim -> time -> profit.
+
+    engine_id controls SCALP V2 overrides:
+    - "SCALP_V2": stall/giveback exits are suppressed per evidence-based calibration
+      (stall 45% recovery rate, giveback 67% recovery rate — both premature).
+    - "LEGACY_DAY_LIVE" (default): legacy DAY_ env vars control stall/giveback as before.
+    The LEGACY_DAY_LIVE path is COMPLETELY UNCHANGED by this parameter.
     """
+    from backend.services.scalp_v2.exit_calibration import (
+        is_scalp_v2_engine,
+    )
+    from backend.services.scalp_v2.exit_calibration import (
+        scalp_v2_giveback_exit_enabled as _scalp_v2_giveback_enabled,
+    )
+    from backend.services.scalp_v2.exit_calibration import (
+        scalp_v2_stall_exit_enabled as _scalp_v2_stall_enabled,
+    )
+
     entry = float(getattr(position, "entry_price", 0.0) or 0.0)
     if entry <= 0 or current_price <= 0:
         return {"action": "hold", "reason": "missing_price"}
@@ -1466,8 +1483,15 @@ def evaluate_engine_managed_exit(
                 "hold_minutes": hold_minutes,
             }
 
+    # SCALP V2 override: giveback exit disabled by default (67% recovery rate, 2.8:1 ratio).
+    # LEGACY_DAY_LIVE path is COMPLETELY UNCHANGED — only SCALP_V2 is affected.
+    # DAY_GIVEBACK_EXIT_ENABLED continues to control legacy behavior.
+    _scalp_v2_skip_giveback = is_scalp_v2_engine(engine_id) and not _scalp_v2_giveback_enabled()
+    giveback: dict[str, Any] | None = None
     _pos_regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
-    if _pos_regime == "bull":
+    if _scalp_v2_skip_giveback:
+        pass  # SCALP V2: giveback suppressed per evidence-based calibration
+    elif _pos_regime == "bull":
         # In bull regime require a deeper reversal before treating a pullback as a giveback —
         # normal bull noise can easily exceed the default -0.15% trigger on the way to target.
         # Leniency is scaled by validated edge: if "bull" hasn't shown a real forward-return
@@ -1538,13 +1562,18 @@ def evaluate_engine_managed_exit(
     if progress_decay is not None:
         return progress_decay
 
+    # SCALP V2 override: stall exit disabled by default (45% recovery rate, 2.5:1 ratio).
+    # LEGACY_DAY_LIVE path is COMPLETELY UNCHANGED — only SCALP_V2 is affected.
+    # DAY_STALL_EXIT_ENABLED continues to control legacy behavior.
+    _scalp_v2_skip_stall = is_scalp_v2_engine(engine_id) and not _scalp_v2_stall_enabled()
+
     _stall_regime = str(getattr(position, "day_route_regime_at_entry", "") or "").lower()
     # Full stall suppression is the strongest bull-regime bonus, so it requires the
     # strongest evidence bar: only skip the stall check once the label has shown a
     # real validated forward-return edge (scalar >= 0.7), not merely "not enough
     # data yet" (scalar defaults to 1.0 pre-data — see AI_REGIME_VALIDATION_MIN_SAMPLES).
-    _stall_suppressed = False
-    if _stall_regime == "bull":
+    _stall_suppressed = _scalp_v2_skip_stall  # SCALP V2 suppression takes priority
+    if not _stall_suppressed and _stall_regime == "bull":
         _stall_scalar, _ = get_regime_validated_scalar(_stall_regime)
         _stall_suppressed = _stall_scalar >= 0.7
     if not _stall_suppressed:

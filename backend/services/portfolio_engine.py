@@ -1438,6 +1438,12 @@ class OpenPosition:
     entry_fill_ids_json: str = "[]"
     quantity_exact: str = ""
     protected_dust_qty: float = 0.0
+    # === ENGINE IDENTITY ===
+    # Identifies which engine owns this position. Defaults to LEGACY_DAY_LIVE for
+    # all existing positions. SCALP_V2 entries will stamp "SCALP_V2" here.
+    engine_id: str = "LEGACY_DAY_LIVE"
+    scalp_opportunity_id: str = ""  # SCALP V2 opportunity ID (empty for legacy)
+    # === END ENGINE IDENTITY ===
 
     @property
     def risk_usd(self) -> float:
@@ -12830,12 +12836,9 @@ class PortfolioEngine:
         reservations = getattr(self, "_entry_reservations", None) or {}
         armed = {normalize_symbol(s) for s in (getattr(self, "_trailing_buy_arms", None) or {})}
         return set(reservations.keys()) | self._pending_buy_order_symbols() | armed
-<<<<<<< HEAD
-=======
 
     def _pending_buy_notional(self, *, exclude_symbol: str = "", exclude_decision_id: str = ""):
         from backend.services.day_entry_spendable import money
->>>>>>> origin/fix/candle-pipeline-4h-authority-20260917
 
         ex = normalize_symbol(exclude_symbol) if exclude_symbol else ""
         skip_did = str(exclude_decision_id or "").strip()
@@ -12851,21 +12854,12 @@ class PortfolioEngine:
                 continue
             if ex and normalize_symbol(getattr(p, "symbol", "") or "") == ex:
                 continue
-<<<<<<< HEAD
-            n += float(getattr(p, "remaining_qty", 0.0) or 0.0) * float(getattr(p, "price", 0.0) or 0.0)
-        for sym, arm in (getattr(self, "_trailing_buy_arms", None) or {}).items():
-            if ex and normalize_symbol(sym) == ex:
-                continue
-            qty = float(getattr(arm, "quantity", 0.0) or 0.0)
-            px = float(getattr(arm, "last_ask", 0.0) or getattr(arm, "initial_ask", 0.0) or 0.0)
-=======
             n += money(getattr(p, "remaining_qty", 0) or 0) * money(getattr(p, "price", 0) or 0)
         for sym, arm in (getattr(self, "_trailing_buy_arms", None) or {}).items():
             if ex and normalize_symbol(sym) == ex:
                 continue
             qty = money(getattr(arm, "quantity", 0) or 0)
             px = money(getattr(arm, "last_ask", 0) or getattr(arm, "initial_ask", 0) or 0)
->>>>>>> origin/fix/candle-pipeline-4h-authority-20260917
             n += qty * px
         return n
 
@@ -16615,13 +16609,6 @@ class PortfolioEngine:
             "trigger_ask": float(arm.trigger_ask),
         }
 
-    async def poll_trailing_buy_arms(self, bar_timestamp: int) -> dict[str, Any] | None:
-        """Unreachable legacy in-memory arm poll. Never submit an order from here."""
-        del bar_timestamp
-        logger.error("BUY_BLOCKED_LEGACY_IMMEDIATE_PATH poll_trailing_buy_arms is unreachable")
-        self.last_buy_reject_reason = "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH"
-        return None
-
     def _arm_trailing_buy(
         self,
         *,
@@ -18355,34 +18342,16 @@ class PortfolioEngine:
             )
             logger.info("BEST_CANDIDATE_BELOW_EV_FLOOR telemetry only — ranked trailing-buy still arms")
 
-<<<<<<< HEAD
-        # Arm Trailing Buy. Fill happens on the first confirmed ask rebound.
-        result = self._arm_trailing_buy(
-            symbol=symbol,
-            quantity=quantity,
-            price=exec_price,
-            stop_price=stop_price,
-            atr=top_candidate.atr,
-            confidence=top_candidate.confidence,
-            bar_timestamp=bar_timestamp,
-            explainability=explainability,
-            decision_id=top_candidate.decision_id,
-            sleeve=getattr(top_candidate, "sleeve", "") or "",
-=======
         # Arm Trailing Buy for the ranked top-4 stream. Fill happens on rebound.
         result = await self._arm_trailing_buy_ranked_stream(
             ranked_candidates=valid_candidates,
             stream_candidates=bar_candidate_snapshot,
             bar_timestamp=int(bar_timestamp),
             path_ev_decision=_day_auth,
->>>>>>> origin/fix/candle-pipeline-4h-authority-20260917
         )
 
         # Paper Redis/cache sync is handled inside execute_buy_fifo (trade_id passed; no duplicate SQLite rows).
 
-<<<<<<< HEAD
-        selected_disposition = "selected_trade_armed" if result is not None and result.get("armed") else ("selected_trade" if result is not None else "selected_no_trade")
-=======
         armed_ok = bool(result is not None and (result.get("armed") or result.get("trailing_buy_armed")))
         if armed_ok:
             selected_disposition = "selected_trade_armed"
@@ -18390,7 +18359,6 @@ class PortfolioEngine:
             selected_disposition = "selected_trade"
         else:
             selected_disposition = "selected_no_trade"
->>>>>>> origin/fix/candle-pipeline-4h-authority-20260917
         for _row in cycle_leaderboard:
             if _row.get("symbol") == top_candidate.symbol and str(_row.get("strategy_id")) == str(top_candidate.decision_data.get("live_ai_strategy") or "day"):
                 _row["disposition"] = selected_disposition
@@ -18401,11 +18369,7 @@ class PortfolioEngine:
         # NO_TRADE = ranked below the selected candidate. Execution unchanged.
         for _li, _lc in enumerate(valid_candidates):
             if _lc is top_candidate:
-<<<<<<< HEAD
-                if result is not None and result.get("armed"):
-=======
                 if result is not None and (result.get("armed") or result.get("trailing_buy_armed")):
->>>>>>> origin/fix/candle-pipeline-4h-authority-20260917
                     _ldec = "ARMED"
                     _lreason = "trailing_buy_waiting"
                 elif result is not None:
@@ -18495,15 +18459,6 @@ class PortfolioEngine:
 
             _dd_final = dict(getattr(top_candidate, "decision_data", None) or {})
             _gates_eval = list(_dd_final.get("gates_evaluated") or [])
-<<<<<<< HEAD
-            if result is not None and result.get("armed"):
-                _final = "arm"
-                _first = ""
-            elif result is not None:
-                _final = "execute"
-                _first = ""
-            else:
-=======
             # _arm_trailing_buy_ranked_stream returns "trailing_buy_armed", never
             # "armed", and never a "quantity". Checking result.get("armed") made the
             # "arm" label unreachable and sent every non-None result to "execute",
@@ -18511,7 +18466,6 @@ class PortfolioEngine:
             # exchange (approved_size NULL, no matching fill). Label the real outcome.
             _armed_syms = {_to_api_symbol(str((_row or {}).get("symbol") or "")) for _row in (result or {}).get("intents") or []}
             if result is None:
->>>>>>> origin/fix/candle-pipeline-4h-authority-20260917
                 _final = "reject"
                 _first = str(_dd_final.get("first_hard_block") or "EXECUTION_GATE")
             elif result.get("quantity") is not None:

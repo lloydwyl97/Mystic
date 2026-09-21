@@ -122,6 +122,9 @@ class ClosedTrade:
     p_buy: float
     setup: str
     unlocked_band: bool
+    # Optional fields added for analysis modules — defaults preserve backward compat
+    time_to_mfe_sec: float = 0.0
+    hold_sec: float = 0.0
 
 
 def _api(symbol: str) -> str:
@@ -787,3 +790,50 @@ def run_all_arms(
             fold_rows.append(row)
         report["folds"][name] = fold_rows
     return report
+
+
+# ---------------------------------------------------------------------------
+# Compatibility stubs for analysis modules from the 2026-09-21 session.
+# These were not in the production version but are needed by analysis modules
+# committed as part of the DAY V2 lifecycle separation branch.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ReplayCandidate:
+    """Stub compatibility shim. Used by day_entry_conformance analysis modules."""
+
+    epoch: int
+    symbol: str
+    decision_id: str = ""
+    accepted: bool = True
+    reason: str = ""
+    first_reason: str = ""
+    score: float = 0.0
+    features_json: str = "{}"
+    # Extended fields used by analysis modules from the 2026-09-21 session
+    cash: float = 0.0
+    slot_occupancy: int = 0
+    intact_4h_open: int = 0
+    position_open: bool = False
+    pending_order: str = ""
+    cooldown_until: float = 0.0
+    fourh_intact: bool = True
+    veto_ev: float = 0.0
+    p_buy: float = 0.0
+    final_selection_score: float = 0.0
+
+
+def parse_feature_vector(features_json: str | None, *, expected_dim: int = 145) -> list[float]:
+    """Parse a JSON feature vector string. Returns a list of floats."""
+    import json
+
+    if not features_json:
+        return [0.0] * expected_dim
+    try:
+        data = json.loads(features_json)
+        if isinstance(data, list):
+            return [float(x) for x in data]
+        return [0.0] * expected_dim
+    except Exception:
+        return [0.0] * expected_dim

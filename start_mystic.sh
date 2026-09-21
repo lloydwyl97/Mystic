@@ -430,15 +430,18 @@ run_core_stack() {
     start_ai_context || return 1
     sleep 1
     start_learning || return 1
-    sleep 1
-    start_scalp || return 1
+    # SCALP V2 (2026-09-21): old paper binance_scalp.runner removed from core mode.
+    # The old runner had zero genuine-strategy-confirmed entries (all soft-rank).
+    # SCALP V2 replaces it with evidence-based exit calibration built into the main engine.
+    # To start the old runner explicitly: ./start_mystic.sh scalp
+    # start_scalp || return 1  # DISABLED in core mode
 
     echo ""
     echo "=========================================="
-    echo "MYSTIC ${label} STACK STARTED (DAY top-4 + scalp paper)"
+    echo "MYSTIC ${label} STACK STARTED (DAY top-4 live, SCALP V2 pending qualification)"
     echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
-    echo "Services: Backend + LiveMD + Signal + Portfolio + Context + Learning + Scalp"
-    echo "DAY and scalp are separate engines — PnL and scoreboard are not mixed."
+    echo "Services: Backend + LiveMD + Signal + Portfolio + Context + Learning"
+    echo "SCALP V2: exit calibration integrated into main engine (no separate runner)."
     echo "Ensure .env has EXTERNAL_SUPERVISOR_MODE=true"
     echo "=========================================="
 }

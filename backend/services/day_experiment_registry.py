@@ -241,7 +241,8 @@ def record_experiment(db_path: str | Path, payload: dict[str, Any]) -> None:
 
 
 def registry(db_path: str | Path | None = None) -> dict[str, Any]:
-    arms = [asdict(a) for a in SEED_ARMS]
+    # Add arm_id alias for compatibility with analysis modules
+    arms = [{**asdict(a), "arm_id": a.experiment_id} for a in SEED_ARMS]
     stored = 0
     if db_path:
         seed_historical(db_path)
@@ -268,3 +269,22 @@ __all__ = [
     "registry",
     "seed_historical",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Compatibility stubs for analysis modules from the 2026-09-21 session.
+# ---------------------------------------------------------------------------
+
+#: Feature families predeclared for experiment tracking (analysis stub).
+PREDECLARED_FEATURE_FAMILIES: frozenset[str] = frozenset(
+    {
+        "volume_delta",
+        "order_flow",
+        "volume_imbalance",
+        "price_momentum",
+        "ema_alignment",
+        "volatility",
+        "spread",
+        "regime",
+    }
+)
