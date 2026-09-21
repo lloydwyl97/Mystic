@@ -200,13 +200,18 @@ class RiskGovernor:
         if account.consecutive_losses >= self._max_consec:
             now_utc = account.current_time_utc
             if account.loss_hold_until is not None and now_utc < account.loss_hold_until:
-                if GOVERNANCE_LOCAL_SKIP_HOLD_CONSEC_LOSSES:
+                from backend.config.day_entry_execution import trailing_buy_mode_active
+
+                if GOVERNANCE_LOCAL_SKIP_HOLD_CONSEC_LOSSES or trailing_buy_mode_active():
                     logger.info(
-                        "GOVERNANCE_TELEMETRY HOLD_CONSEC_LOSSES would_block consec_losses=%s>=%s hold_until=%s (GOVERNANCE_LOCAL_SKIP_HOLD_CONSEC_LOSSES=true — not enforcing)",
+                        "GOVERNANCE_TELEMETRY HOLD_CONSEC_LOSSES would_block consec_losses=%s>=%s hold_until=%s (telemetry_only trailing_buy=%s local_skip=%s)",
                         account.consecutive_losses,
                         self._max_consec,
                         account.loss_hold_until,
+                        trailing_buy_mode_active(),
+                        GOVERNANCE_LOCAL_SKIP_HOLD_CONSEC_LOSSES,
                     )
+                    result.account_hold_reason = None
                 else:
                     result.account_hold_reason = "HOLD_CONSEC_LOSSES"
                     result.rejections.append(Rejection("", "HOLD_CONSEC_LOSSES", f"consec_losses={account.consecutive_losses} >= {self._max_consec}"))

@@ -75,8 +75,9 @@ def test_manual_flatten_row_persists_any_venue_id_it_was_given():
 
 def test_recovered_close_still_requires_an_exchange_order_id():
     """The packet path refuses to write without one; unchanged by this repair."""
-    assert '"reason": "missing_exchange_order_id"' in SOURCE
+    assert '"reason": "missing_real_venue_sell_identity"' in SOURCE
     assert "exchange_sell_order_id=exchange_order_id" in SOURCE
+    assert "venue_trade_ids=venue_trade_ids" in SOURCE
 
 
 def test_buy_commit_binds_the_live_order_id():

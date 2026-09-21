@@ -320,13 +320,15 @@ def test_status_exposes_failsafe_when_not_trading_paused():
         engine._kill_switch_mode = KillSwitchMode.PAUSE_BUYS
         engine._kill_switch_reason = "CB:ACCOUNT_FAILSAFE equity=$8040"
         cap = engine.get_trading_capability_status()
-        assert cap["failsafe_active"] is True
+        assert cap["failsafe_active"] is False
         assert cap["day_entry_enabled"] is False
         assert cap["no_trade_reason"]
-        assert "ACCOUNT_FAILSAFE" in cap["no_trade_reason"]
+        assert "ACCOUNT_FAILSAFE" in str(cap.get("kill_switch_reason") or cap.get("no_trade_reason") or "")
 
 
 def test_status_and_execution_agree_when_kill_switch_resume_but_equity_low():
+    from backend.services.canonical_failsafe_equity import build_canonical_nle
+
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "status_resume.db"
         engine = _init_engine(db, cash=25_000.0)
@@ -338,6 +340,17 @@ def test_status_and_execution_agree_when_kill_switch_resume_but_equity_low():
 
         engine._kill_switch_mode = KillSwitchMode.RESUME
         engine._kill_switch_reason = ""
+        # Incomplete cash-only book cannot trip.
+        cap0 = engine.get_trading_capability_status()
+        can0, _ = engine._check_kill_switch_buy()
+        assert cap0["failsafe_active"] is False
+        assert can0 is True
+        engine._canonical_nle_snapshot = build_canonical_nle(
+            balances=[{"asset": "USDT", "free": "20984.86", "locked": "0"}],
+            bids={},
+            as_of_epoch=1_000.0,
+            now_epoch=1_001.0,
+        )
         cap = engine.get_trading_capability_status()
         ks = engine.get_kill_switch_status()
         can_buy, reason = engine._check_kill_switch_buy()

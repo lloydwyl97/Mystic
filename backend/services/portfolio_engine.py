@@ -1424,6 +1424,10 @@ class OpenPosition:
     opened_under_router: bool = False
     max_hold_min: int = 0
     trail_pct: float = 0.0
+    trail_activated: bool = False
+    trail_activated_at: float = 0.0
+    trail_activation_price: float = 0.0
+    trail_high_water_source: str = ""
     # Entry identity chain, carried so a position can always be traced back to
     # the decision that authorized it and the venue order that created it.
     entry_decision_id: str = ""
@@ -2202,6 +2206,7 @@ class PortfolioEngine:
         self._trading_paused: bool = False
         self._pause_reason: str = ""
         self._last_governance_hold_reason: str | None = None  # From risk governor when buys held
+        self._canonical_nle_snapshot: dict[str, Any] | None = None
 
         # Startup timestamp retained for downstream age telemetry only.
         self._startup_timestamp: float = time.time()
@@ -6479,11 +6484,10 @@ class PortfolioEngine:
         from backend.services.live_recovered_close_writer import RecoveredCloseFill, persist_recovered_close
 
         sym = normalize_symbol(symbol)
-        exchange_order_id = str(fill.get("trade_id") or "") or None
-        if exchange_order_id:
-            exchange_order_id = str(exchange_order_id).strip()
-        if not exchange_order_id:
-            return {"skipped": True, "reason": "missing_exchange_order_id"}
+        exchange_order_id = str(fill.get("order_id") or fill.get("exchange_order_id") or "").strip()
+        venue_trade_ids = str(fill.get("venue_trade_id") or fill.get("trade_id") or "").strip()
+        if not exchange_order_id or not venue_trade_ids:
+            return {"skipped": True, "reason": "missing_real_venue_sell_identity"}
         exit_price = fill.get("exit_price")
         if exit_price is None or float(exit_price) <= 0:
             return {"skipped": True, "reason": "missing_exit_price"}
@@ -6495,6 +6499,7 @@ class PortfolioEngine:
             entry_price=float(position.entry_price or 0.0),
             exit_price=float(exit_price),
             exchange_sell_order_id=exchange_order_id,
+            venue_trade_ids=venue_trade_ids,
             closed_at_iso=closed_at_iso,
             closed_at_epoch=float(closed_at_epoch),
             source=str(source),
@@ -12269,6 +12274,34 @@ class PortfolioEngine:
             )
             if sell_preflight_audit is not None:
                 sell_preflight_audit["fill_fee_audit"] = _ffa_audit
+            evidence = dict(getattr(position, "_exit_decision_evidence", None) or {})
+            if evidence:
+                from backend.services.day_controlled_exits import _trail_semantics
+                from backend.services.exit_decision_evidence import build_exit_decision_evidence
+
+                trail_info = _trail_semantics(
+                    entry=float(position.entry_price or 0.0),
+                    current_price=float(fill_price or 0.0),
+                    position=position,
+                    coin_profile=get_coin_profile(normalized_symbol),
+                    path_aware=True,
+                    atr_pct=0.01,
+                    bundle=None,
+                )
+                evidence.update(
+                    build_exit_decision_evidence(
+                        controlling_exit_family=str(exit_trigger or ""),
+                        trail_info=trail_info,
+                        position=position,
+                        executable_bid=float(price or 0.0) or None,
+                        submitted_price=float(price or 0.0) or None,
+                        fill_price=float(fill_price or 0.0) or None,
+                    )
+                )
+                if sell_preflight_audit is None:
+                    sell_preflight_audit = {}
+                sell_preflight_audit["exit_decision_evidence"] = evidence
+                position._exit_decision_evidence = evidence
 
         with contextlib.suppress(Exception):
             from backend.services.trade_performance_tracker import log_trade_performance
@@ -12741,14 +12774,25 @@ class PortfolioEngine:
             return list(candidates), None
 
         if hold:
-            logger.warning(
-                "BUY_BLOCKED_GOVERNANCE hold_reason=%s tier=%s consec=%s dd_pct=%.2f",
-                hold,
-                result.drawdown_tier,
-                consec,
-                float(dd_pct or 0.0) * 100.0,
-            )
-            return [], hold
+            from backend.config.day_entry_execution import trailing_buy_mode_active
+
+            if hold == "HOLD_CONSEC_LOSSES" and trailing_buy_mode_active():
+                logger.info(
+                    "HOLD_CONSEC_LOSSES_TELEMETRY governance_hold ignored for trailing-buy arming tier=%s consec=%s",
+                    result.drawdown_tier,
+                    consec,
+                )
+                self._last_governance_hold_reason = "HOLD_CONSEC_LOSSES"
+                hold = None
+            else:
+                logger.warning(
+                    "BUY_BLOCKED_GOVERNANCE hold_reason=%s tier=%s consec=%s dd_pct=%.2f",
+                    hold,
+                    result.drawdown_tier,
+                    consec,
+                    float(dd_pct or 0.0) * 100.0,
+                )
+                return [], hold
 
         allowed: list[BuyCandidate] = []
         for info in result.allowed_candidates:
@@ -13238,18 +13282,28 @@ class PortfolioEngine:
         # account, position, cash, or risk rejection.
         if ENABLE_GOVERNANCE_ENFORCEMENT and not governance_risk_governor_shadow_only():
             try:
+                from backend.config.day_entry_execution import trailing_buy_mode_active
+
                 loss_hold_until = await self._get_loss_hold_until()
                 if loss_hold_until is not None and now_wall < float(loss_hold_until):
                     _, consec = await self.get_rolling_24h_risk_metrics()
                     if consec >= MAX_CONSEC_LOSSES:
                         self._last_governance_hold_reason = "HOLD_CONSEC_LOSSES"
-                        logger.warning(
-                            "BUY_BLOCKED_HOLD_CONSEC_LOSSES symbol=%s consec=%s remaining=%.0fs",
-                            symbol,
-                            consec,
-                            float(loss_hold_until) - now_wall,
-                        )
-                        return False, "HOLD_CONSEC_LOSSES"
+                        if trailing_buy_mode_active():
+                            logger.info(
+                                "HOLD_CONSEC_LOSSES_TELEMETRY symbol=%s consec=%s remaining=%.0fs (not an entry veto)",
+                                symbol,
+                                consec,
+                                float(loss_hold_until) - now_wall,
+                            )
+                        else:
+                            logger.warning(
+                                "BUY_BLOCKED_HOLD_CONSEC_LOSSES symbol=%s consec=%s remaining=%.0fs",
+                                symbol,
+                                consec,
+                                float(loss_hold_until) - now_wall,
+                            )
+                            return False, "HOLD_CONSEC_LOSSES"
             except Exception as _lh_err:
                 logger.debug("loss_hold check skipped: %s", _lh_err)
 
@@ -13680,6 +13734,24 @@ class PortfolioEngine:
                 EXIT_TAKE_PROFIT_1,
             )
             exit_type = ExitType.TAKE_PROFIT_1 if profit_exit else ExitType.MANUAL
+            from backend.services.day_controlled_exits import _trail_semantics
+            from backend.services.exit_decision_evidence import build_exit_decision_evidence
+
+            position._exit_decision_evidence = build_exit_decision_evidence(
+                controlling_exit_family=exit_reason,
+                trail_info=_trail_semantics(
+                    entry=entry_price,
+                    current_price=current_price,
+                    position=position,
+                    coin_profile=coin_profile,
+                    path_aware=True,
+                    atr_pct=0.01,
+                    bundle=bundle_obj,
+                ),
+                position=position,
+                executable_bid=float(current_price or 0.0) or None,
+                submitted_price=float(current_price or 0.0) or None,
+            )
             return await self.execute_sell_fifo(
                 symbol,
                 quantity,
@@ -19023,7 +19095,8 @@ class PortfolioEngine:
         requested_blocked = requested in pause_modes
         cb = bool(persisted.get("equity_circuit_breaker_active"))
         freeze = bool(persisted.get("daily_loss_freeze_active"))
-        failsafe_p = bool(persisted.get("account_failsafe_active"))
+        fs = self._canonical_failsafe_decision()
+        failsafe_p = bool(fs.get("tripped")) if fs.get("usable") else False
         if memory_blocked and not requested_blocked and not cb and not freeze and not failsafe_p:
             logger.info(
                 "KILL_SWITCH_MEMORY_RECONCILED: persisted=RESUME memory_was=%s reason_was=%s",
@@ -19070,21 +19143,18 @@ class PortfolioEngine:
         """Honest capability flags. Process-alive is not the same as entries enabled."""
         ks = self.get_kill_switch_status()
         ctrl = self._effective_entry_control()
-        account_equity = float(getattr(self, "cash_balance", 0.0) or 0.0) + float(getattr(self, "_positions_value", 0.0) or 0.0)
-        from backend.services.circuit_breaker_service import account_failsafe_tripped
-
+        fs = self._canonical_failsafe_decision()
         principal = float(getattr(self, "principal", 0.0) or 0.0)
-        ledger_failsafe = account_failsafe_tripped(account_equity, principal)
-        # Persisted CB / leftover reason strings are not authority. Revalidate them
-        # against the same equity predicate execution uses, then drop stale latch.
+        nle = fs.get("nle")
         with contextlib.suppress(Exception):
             from backend.services.circuit_breaker_service import trading_circuit_breaker
 
-            trading_circuit_breaker.check_account_failsafe(account_equity, principal)
-        failsafe = bool(ledger_failsafe or ctrl.get("account_failsafe_persisted"))
+            if fs.get("usable") and nle is not None:
+                trading_circuit_breaker.check_account_failsafe(float(nle), principal)
+        failsafe = bool(fs.get("tripped"))
         failsafe_reason = ""
         if failsafe:
-            failsafe_reason = f"ACCOUNT_FAILSAFE equity=${account_equity:.2f} principal=${float(self.principal or 0.0):.2f} — MANUAL POSITION REVIEW REQUIRED"
+            failsafe_reason = f"ACCOUNT_FAILSAFE equity=${float(nle or 0):.2f} principal=${float(self.principal or 0.0):.2f} — MANUAL POSITION REVIEW REQUIRED"
         accounting: dict[str, Any] = {"ok": True, "orphans": []}
         try:
             from backend.services.atomic_execution_book import find_cash_position_disagreement
@@ -20882,17 +20952,21 @@ class PortfolioEngine:
         )
         return any(trig.startswith(p) for p in protective_prefixes)
 
+    def _canonical_failsafe_decision(self) -> dict[str, Any]:
+        from backend.services.canonical_failsafe_equity import decide_account_failsafe
+
+        return decide_account_failsafe(getattr(self, "_canonical_nle_snapshot", None), getattr(self, "principal", 0.0))
+
     def _check_kill_switch_buy(self) -> tuple[bool, str]:
         """Check if buy is blocked by kill switch"""
-        from backend.services.circuit_breaker_service import account_failsafe_tripped
-
-        account_equity = float(getattr(self, "cash_balance", 0.0) or 0.0) + float(getattr(self, "_positions_value", 0.0) or 0.0)
+        fs = self._canonical_failsafe_decision()
         principal = float(getattr(self, "principal", 0.0) or 0.0)
-        if account_failsafe_tripped(account_equity, principal):
+        if fs.get("tripped"):
+            nle = fs.get("nle") or "0"
             reason = (
                 f"KILL_SWITCH_{KillSwitchMode.PAUSE_BUYS.value}: "
                 f"{self._CIRCUIT_BREAKER_REASON_PREFIX}ACCOUNT_FAILSAFE "
-                f"equity=${account_equity:.2f} principal=${principal:.2f} "
+                f"equity=${float(nle):.2f} principal=${principal:.2f} "
                 "— MANUAL POSITION REVIEW REQUIRED"
             )
             return False, reason
@@ -20926,11 +21000,10 @@ class PortfolioEngine:
 
     def get_kill_switch_status(self) -> dict[str, Any]:
         """Get current kill switch status"""
-        from backend.services.circuit_breaker_service import account_failsafe_tripped
-
-        account_equity = float(getattr(self, "cash_balance", 0.0) or 0.0) + float(getattr(self, "_positions_value", 0.0) or 0.0)
+        fs = self._canonical_failsafe_decision()
         principal = float(getattr(self, "principal", 0.0) or 0.0)
-        failsafe = account_failsafe_tripped(account_equity, principal)
+        failsafe = bool(fs.get("tripped"))
+        nle = fs.get("nle") or "0"
         ctrl = self._effective_entry_control()
         requested = str(ctrl.get("requested_kill_mode") or self._kill_switch_mode.value)
         effective_blocked = (not bool(ctrl.get("effective_entry_permitted"))) or failsafe
@@ -20939,7 +21012,7 @@ class PortfolioEngine:
             effective_mode = KillSwitchMode.PAUSE_BUYS.value
         reason = str(ctrl.get("requested_kill_reason") or self._kill_switch_reason or "")
         if failsafe:
-            reason = f"{self._CIRCUIT_BREAKER_REASON_PREFIX}ACCOUNT_FAILSAFE equity=${account_equity:.2f} principal=${principal:.2f} — MANUAL POSITION REVIEW REQUIRED"
+            reason = f"{self._CIRCUIT_BREAKER_REASON_PREFIX}ACCOUNT_FAILSAFE equity=${float(nle):.2f} principal=${principal:.2f} — MANUAL POSITION REVIEW REQUIRED"
         elif ctrl.get("blocking_reason"):
             reason = str(ctrl.get("blocking_reason"))
         return {
@@ -20984,6 +21057,56 @@ class PortfolioEngine:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _sync_get)
 
+    async def _refresh_canonical_nle_snapshot(self) -> dict[str, Any]:
+        """Pull complete exchange balances + bids. Incomplete snapshots stay unusable."""
+        from backend.services.canonical_failsafe_equity import build_canonical_nle
+
+        balances: list[dict[str, Any]] = []
+        bids: dict[str, Any] = {}
+        source = "unavailable"
+        live = getattr(self, "_live_service", None)
+        if live is not None:
+            try:
+                raw = await live.get_balance("binanceus", force_refresh=True)
+                rows = raw.get("balances") if isinstance(raw, dict) else raw
+                if isinstance(raw, dict) and isinstance(raw.get("info"), dict):
+                    rows = raw["info"].get("balances") or rows
+                if isinstance(rows, dict):
+                    for asset, item in rows.items():
+                        if isinstance(item, dict):
+                            balances.append({"asset": asset, "free": item.get("free"), "locked": item.get("used") or item.get("locked")})
+                        else:
+                            balances.append({"asset": asset, "free": item, "locked": 0})
+                elif isinstance(rows, list):
+                    balances = [r for r in rows if isinstance(r, dict)]
+                source = "binanceus"
+            except Exception as exc:
+                logger.warning("CANONICAL_NLE_BALANCE_FAILED err=%s", exc)
+            try:
+                if hasattr(live, "fetch_tickers"):
+                    tickers = await live.fetch_tickers(["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"])
+                elif hasattr(live, "get_tickers"):
+                    tickers = await live.get_tickers()
+                else:
+                    tickers = {}
+                for symbol, row in (tickers or {}).items():
+                    bid = None
+                    if isinstance(row, dict):
+                        bid = row.get("bid") or row.get("bidPrice") or (row.get("info") or {}).get("bidPrice")
+                    if bid:
+                        bids[str(symbol).replace("/", "").upper()] = bid
+                        bids[str(symbol).split("/")[0].upper()] = bid
+            except Exception as exc:
+                logger.warning("CANONICAL_NLE_BID_FAILED err=%s", exc)
+        snap = build_canonical_nle(
+            balances=balances,
+            bids=bids,
+            reservations=sum(float((r or {}).get("notional") or 0.0) for r in (getattr(self, "_entry_reservations", None) or {}).values()),
+            source=source,
+        )
+        self._canonical_nle_snapshot = snap
+        return snap
+
     async def run_trading_circuit_breaker_check(self) -> dict[str, Any]:
         """
         Evaluate hard-kill conditions (daily loss freeze, equity drawdown,
@@ -21002,31 +21125,40 @@ class PortfolioEngine:
             return {"skipped": True}
 
         realized_pnl_today = await self._realized_pnl_today_sync_free()
-        # Canonical account equity is cash + mark-to-market positions. Never trip
-        # ACCOUNT_FAILSAFE on a stale/low ledger total while cash+positions is healthy
-        # (Jul 31 incident: cash-only ~$3711 while book equity was ~$9900 → permanent PAUSE_BUYS).
-        account_equity = float(self.cash_balance or 0.0) + float(self._positions_value or 0.0)
-        ledger_equity = float(self._total_equity or 0.0)
-        if account_equity > 0:
-            total_equity = account_equity
-            if abs(account_equity - ledger_equity) > 1.0:
-                logger.warning(
-                    "CIRCUIT_BREAKER_EQUITY_SOURCE account=%.2f ledger=%.2f using_account=true",
-                    account_equity,
-                    ledger_equity,
-                )
+        await self._refresh_canonical_nle_snapshot()
+        fs = self._canonical_failsafe_decision()
+        if fs.get("usable") and fs.get("nle") is not None:
+            total_equity = float(fs["nle"])
         else:
-            total_equity = ledger_equity
+            total_equity = float(self.cash_balance or 0.0) + float(self._positions_value or 0.0)
+            logger.warning(
+                "CIRCUIT_BREAKER_NLE_UNUSABLE reason=%s cash=%s complete=%s stale=%s failsafe_suppressed=true",
+                fs.get("reason"),
+                (fs.get("snapshot") or {}).get("cash_usdt"),
+                (fs.get("snapshot") or {}).get("complete"),
+                (fs.get("snapshot") or {}).get("stale"),
+            )
         portfolio_data = {
             "total_equity": total_equity,
             "principal": float(self.principal),
             "realized_pnl_today": realized_pnl_today,
             "residual_pending": bool(self.has_exit_residual_pending()),
+            "failsafe_nle": fs,
         }
 
         result = await trading_circuit_breaker.check_all_hard_kills_async(portfolio_data)
         actions = result.get("actions", {})
         conditions = result.get("conditions", {})
+        if not fs.get("usable"):
+            conditions["account_failsafe"] = False
+            actions["close_all_positions"] = False
+            actions["pause_trading"] = bool(conditions.get("daily_loss_freeze") or conditions.get("equity_circuit_breaker"))
+        else:
+            conditions["account_failsafe"] = bool(fs.get("tripped"))
+            actions["close_all_positions"] = bool(fs.get("tripped"))
+            actions["pause_trading"] = bool(fs.get("tripped"))
+            if fs.get("tripped"):
+                actions["block_new_entries"] = True
         prefix = self._CIRCUIT_BREAKER_REASON_PREFIX
         set_by_cb = str(self._kill_switch_reason or "").startswith(prefix)
         session_high = float(getattr(trading_circuit_breaker, "session_high_equity", 0.0) or 0.0)
@@ -22628,21 +22760,21 @@ class PortfolioEngine:
         risk_pct = (self._total_open_risk / self._total_equity * 100) if self._total_equity > 0 else 0
         risk_cap_pct = MAX_TOTAL_OPEN_RISK_PCT * 100
 
-        # F7: effective mode from runtime switch (EXECUTION_MODE + LIVE_TRADES_ALLOWED)
-        from backend.services.execution_mode_service import is_live_execution_allowed_sync
-
-        effective_live = self._live_service is not None and self._live_execution_enabled and is_live_execution_allowed_sync()
         from backend.config.live_test_mode import get_live_test_api_fields
+        from backend.services.operator_account_status import account_operator_labels
         from backend.services.operator_config_service import get_max_open_positions
 
-        mode = "LIVE" if effective_live else "PAPER"
+        labels = account_operator_labels(live_client_present=self._live_service is not None)
         capability = self.get_trading_capability_status()
         ks = self.get_kill_switch_status()
         return {
-            "mode": mode,
-            "live_execution_enabled": bool(self._live_execution_enabled),
-            "live_service_connected": bool(self._live_service is not None),
-            "real_orders_enabled": effective_live,
+            "mode": labels["mode"],
+            "account_execution_live": labels["account_execution_live"],
+            "live_execution_enabled": bool(labels["real_orders_enabled"]),
+            "live_service_connected": labels["live_service_connected"],
+            "real_orders_enabled": labels["real_orders_enabled"],
+            "day_entry_execution_mode": labels["day_entry_execution_mode"],
+            "trailing_buy_execution_mode": labels["trailing_buy_execution_mode"],
             "kill_switch": ks.get("mode"),
             "kill_switch_reason": capability.get("kill_switch_reason") or ks.get("reason"),
             "requested_kill_mode": capability.get("requested_kill_mode") or ks.get("requested_kill_mode"),
@@ -22666,9 +22798,9 @@ class PortfolioEngine:
             "open_positions_count": self._count_live_slots(),
             "slots_used": self._count_live_slots(),
             "reservations_count": len(getattr(self, "_entry_reservations", None) or {}),
-            "day_mode_display": "DAY LIVE",
-            "scalp_mode_display": "SCALP PAPER",
-            "operator_mode_labels": {"day": "DAY LIVE", "scalp": "SCALP PAPER"},
+            "day_mode_display": labels["day_mode_display"],
+            "scalp_mode_display": labels["scalp_mode_display"],
+            "operator_mode_labels": labels["operator_mode_labels"],
             "max_positions": get_max_open_positions(),
             "total_open_risk": round(self._total_open_risk, 2),
             "open_risk_pct": round(risk_pct, 2),

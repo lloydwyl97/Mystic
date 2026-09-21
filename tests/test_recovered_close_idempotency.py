@@ -57,6 +57,7 @@ def _fill(**kw):
         "fill_recovered": True,
         "realized_profit_usd": -0.02,
         "fee_usd": 0.01,
+        "venue_trade_ids": "2630100123",
     }
     base.update(kw)
     return RecoveredCloseFill(**base)
@@ -103,3 +104,32 @@ def test_reconcile_claim_blocks_second_economic_close(tmp_path):
     conn.close()
     persist_recovered_close(_fill(), db_path=db, write_trade_performance=False)
     assert claim_economic_close(db, "911073809", "SELL") is False
+
+
+def test_reconcile_retry_cannot_create_duplicate_economic_sell(tmp_path):
+    db = str(tmp_path / "retry.db")
+    conn = sqlite3.connect(db)
+    _schema(conn)
+    conn.close()
+    first = persist_recovered_close(_fill(), db_path=db, write_trade_performance=True)
+    second = persist_recovered_close(_fill(), db_path=db, write_trade_performance=True)
+    assert first.get("economic_sell_written") is False
+    assert second.get("economic_sell_written") is False
+    conn = sqlite3.connect(db)
+    n = conn.execute("SELECT COUNT(*) FROM paper_trades WHERE side='SELL'").fetchone()[0]
+    conn.close()
+    assert n == 0
+
+
+def test_reconcile_rejects_trade_id_masquerading_as_order_id(tmp_path):
+    db = str(tmp_path / "fake.db")
+    conn = sqlite3.connect(db)
+    _schema(conn)
+    conn.close()
+    out = persist_recovered_close(_fill(exchange_sell_order_id="2630592", venue_trade_ids="2630592"), db_path=db)
+    assert out.get("economic_sell_written") is False
+    assert "missing_real_venue_sell_identity" in out.get("errors", [])
+    conn = sqlite3.connect(db)
+    n = conn.execute("SELECT COUNT(*) FROM paper_trades WHERE side='SELL'").fetchone()[0]
+    conn.close()
+    assert n == 0

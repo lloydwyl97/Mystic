@@ -184,16 +184,28 @@ def _evaluate_path_aware_exit(
     if gb is not None:
         return {**gb, **base, "reason": EXIT_GIVEBACK}
 
-    # Existing trail: once the high-water ratchet is armed, a pullback through
-    # it is deterioration — not a "green enough" clip.
-    trail_pct = float(getattr(position, "trail_pct", 0) or coin_profile.get("trail") or 0.0025)
-    highest = float(getattr(position, "highest_price", entry) or entry)
-    trail = float(getattr(position, "trailing_stop_price", 0) or 0)
-    if trail > 0 and highest >= entry * (1.0 + trail_pct) - 1e-12 and current_price <= trail:
+    # Existing trail: once the cost-aware high-water ratchet is activated, a
+    # pullback through it is deterioration. An initialized risk-floor or
+    # break-even stop is not an activated trail.
+    trail_info = _trail_semantics(
+        entry=entry,
+        current_price=current_price,
+        position=position,
+        coin_profile=coin_profile,
+        path_aware=True,
+        atr_pct=atr_pct,
+        bundle=bundle,
+    )
+    executable_trail = trail_info.get("executable_trailing_stop")
+    if executable_trail is not None and bool(trail_info.get("trailing_stop_in_exit_authority")) and current_price <= float(executable_trail):
+        from backend.services.exit_decision_evidence import stamp_trail_activation
+
+        stamp_trail_activation(position, highest=float(trail_info.get("high_water") or 0.0), source="path_aware_activated")
         return {
             "action": "sell",
             "reason": EXIT_TRAILING_STOP,
-            "detail": f"trail={trail:.8f}",
+            "detail": f"trail={float(executable_trail):.8f}",
+            "exit_evidence": trail_info,
             **base,
         }
 
@@ -1069,6 +1081,11 @@ def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dic
     highest = float(getattr(position, "highest_price", 0.0) or entry)
 
     activation = entry * (1.0 + trail_pct)
+    cost_activation = _trail_activation_price(
+        entry=entry,
+        trail_distance=trail_pct,
+        symbol=str(getattr(position, "symbol", "") or ""),
+    )
     base_changed = False
     if highest >= activation:
         new_trail = highest * (1.0 - trail_pct)
@@ -1078,6 +1095,10 @@ def refresh_trailing_stop(position: Any, current_price: float, coin_profile: dic
         if new_trail > current_trail + 1e-12:
             position.trailing_stop_price = new_trail
             base_changed = True
+    if highest >= cost_activation - 1e-12:
+        from backend.services.exit_decision_evidence import stamp_trail_activation
+
+        stamp_trail_activation(position, highest=highest, source="refresh_trailing_stop")
 
     # Break-even ratchet only. Coin-profile distance is not tightened by MFE.
     be_changed = apply_break_even_and_mfe_trail(position, current_price)
@@ -1109,7 +1130,16 @@ def _trail_semantics(
         symbol=str(getattr(position, "symbol", "") or ""),
     )
     ratchet = float(getattr(position, "trailing_stop_price", 0.0) or 0.0)
+    from backend.config.execution_cost_model import honest_all_in_rt_pct
+
+    cost_floor = entry * (1.0 + honest_all_in_rt_pct(str(getattr(position, "symbol", "") or ""))) if entry > 0 else 0.0
     activated = bool(entry > 0 and highest >= trail_activation - 1e-12)
+    if activated and not bool(getattr(position, "trail_activated", False)):
+        from backend.services.exit_decision_evidence import stamp_trail_activation
+
+        stamp_trail_activation(position, highest=highest, source="highest_price")
+    # Break-even / risk-floor values in trailing_stop_price are not a trail
+    # until canonical activation is true and stamped.
     executable_trail = ratchet if activated and ratchet > 0 else None
     snap4 = day_4h_structure_snapshot(bundle, current_price=current_price)
     hard_stop = resolve_day_risk_floor_price(
@@ -1123,13 +1153,17 @@ def _trail_semantics(
         hard_stop = persisted_stop if 0 < persisted_stop < entry else 0.0
     return {
         "high_water": highest,
+        "high_water_source": str(getattr(position, "trail_high_water_source", "") or "position.highest_price"),
         "trail_activation": trail_activation,
+        "activation_ts": float(getattr(position, "trail_activated_at", 0.0) or 0.0),
+        "activation_price": float(getattr(position, "trail_activation_price", 0.0) or 0.0),
+        "cost_aware_floor": cost_floor,
         "trail_distance": trail_distance,
         "ratchet_trail_price": ratchet,
         "executable_trailing_stop": executable_trail,
         "hard_stop": hard_stop,
         "persisted_stop_price": persisted_stop,
-        "trailing_stop_in_exit_authority": bool(executable_trail is not None),
+        "trailing_stop_in_exit_authority": bool(executable_trail is not None and activated),
         "path_aware_exit": path_aware,
         "4h_bundle_present": bool(snap4.get("4h_bundle_present")),
         "prior_4h_low": snap4.get("prior_4h_low"),
@@ -1192,7 +1226,7 @@ def preview_next_engine_exit(
     giveback_ready = bool(_giveback_exit_enabled() and hold_minutes >= _giveback_min_hold_min() and mfe_pct >= _giveback_min_mfe_pct() and net_pnl_pct + 1e-12 <= _giveback_trigger_pnl_pct())
     checks = {
         "stop_loss": bool(stop > 0 and current_price <= stop),
-        "trailing_stop": bool(trail > 0 and current_price <= trail and highest >= entry * (1 + float(coin_profile.get("trail") or 0.0025))),
+        "trailing_stop": bool(trail_info.get("trailing_stop_in_exit_authority") and trail_info.get("executable_trailing_stop") and current_price <= float(trail_info["executable_trailing_stop"])),
         "giveback_exit": giveback_ready,
         "stall_exit": stall_ready,
         "time_stop": bool(max_hold > 0 and hold_minutes + 1e-9 >= float(max_hold)),

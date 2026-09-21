@@ -13,11 +13,8 @@ import logging
 import sqlite3
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
-from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST
-from backend.config.trading_mode import TradingMode
 from backend.database_schema import DATABASE_PATH
 from backend.utils.sqlite_runtime import connect_rw, run_locked_retry
 
@@ -48,6 +45,7 @@ class RecoveredCloseFill:
     strategy_id: str = "day"
     confidence: float | None = None
     mode: str = "live"
+    venue_trade_ids: str = ""
 
 
 def recovered_sell_trade_id(symbol: str, exchange_sell_order_id: str) -> str:
@@ -152,13 +150,32 @@ def persist_recovered_close(
     Idempotently write canonical recovered-close rows.
     Returns dict of table -> id created or existing.
     """
-    result: dict[str, Any] = {"created": {}, "existing": {}, "errors": []}
+    result: dict[str, Any] = {"created": {}, "existing": {}, "errors": [], "economic_sell_written": False}
     sell_trade_id = recovered_sell_trade_id(fill.symbol, fill.exchange_sell_order_id)
     qty = float(fill.quantity)
     entry = float(fill.entry_price)
     exit_px = float(fill.exit_price)
     if qty <= 0 or entry <= 0 or exit_px <= 0:
         result["errors"].append("invalid_qty_or_prices")
+        return result
+    from backend.services.canonical_failsafe_equity import is_real_binance_order_id
+    from backend.services.live_close_integrity import persist_pending_close_event
+
+    venue_trades = str(fill.venue_trade_ids or "").strip()
+    oid = str(fill.exchange_sell_order_id or "").strip()
+    if not is_real_binance_order_id(oid) or not venue_trades:
+        persist_pending_close_event(
+            db_path,
+            symbol=fill.symbol,
+            event_type="EXCHANGE_RECONCILE_AUDIT",
+            exit_trigger=RECOVERED_CLOSE_REASON,
+            quantity=qty,
+            price_snapshot=exit_px,
+            exchange_order_id=oid,
+            detail="missing_real_venue_sell_identity; no economic SELL written",
+        )
+        result["existing"]["audit_only_invalid_identity"] = True
+        result["errors"].append("missing_real_venue_sell_identity")
         return result
 
     gross_pnl = (exit_px - entry) * qty
@@ -167,20 +184,6 @@ def persist_recovered_close(
         realized = float(fill.realized_profit_usd)
     else:
         realized = gross_pnl - fee
-    pnl_pct = (exit_px - entry) / entry if entry > 0 else 0.0
-    net_pct = pnl_pct - ESTIMATED_ROUNDTRIP_COST
-
-    entry_epoch = float(fill.entry_time_epoch or 0.0)
-    if entry_epoch <= 0:
-        try:
-            entry_epoch = datetime.fromisoformat(str(fill.closed_at_iso).replace("Z", "+00:00")).timestamp() - 1161.0
-        except Exception:
-            entry_epoch = float(fill.closed_at_epoch) - 1161.0
-    hold_seconds = max(0, int(float(fill.closed_at_epoch) - entry_epoch))
-    buy_ctx_pre = _load_buy_context(sqlite3.connect(db_path), fill.buy_trade_id)
-    explain_for_review = dict(buy_ctx_pre.get("explainability") or {})
-    strategy_id = fill.strategy_id or buy_ctx_pre.get("strategy_id") or "day"
-    confidence = fill.confidence if fill.confidence is not None else buy_ctx_pre.get("confidence")
 
     def _op() -> None:
         nonlocal sell_trade_id
@@ -188,38 +191,7 @@ def persist_recovered_close(
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.cursor()
             buy_ctx = _load_buy_context(conn, fill.buy_trade_id)
-            paper_run_id = fill.paper_run_id or buy_ctx.get("paper_run_id") or "recovered-close"
             sleeve = fill.sleeve or buy_ctx.get("sleeve") or "ACTIVE"
-            strategy_id = fill.strategy_id or buy_ctx.get("strategy_id") or "day"
-            confidence = fill.confidence if fill.confidence is not None else buy_ctx.get("confidence")
-            explain = dict(buy_ctx.get("explainability") or {})
-
-            diagnostics = {
-                "exchange_sell_order_id": str(fill.exchange_sell_order_id),
-                "source": str(fill.source),
-                "fill_recovered": bool(fill.fill_recovered),
-                "not_ai_protected_sell": True,
-                "not_duplicate": True,
-                "live_mode": True,
-                "buy_trade_id": fill.buy_trade_id,
-                "close_ledger_id": fill.close_ledger_id,
-                "recovered_close": True,
-            }
-
-            explain.update(
-                {
-                    "trade_id": sell_trade_id,
-                    "symbol": fill.symbol,
-                    "side": "SELL",
-                    "buy_trade_id": fill.buy_trade_id,
-                    "exchange_sell_order_id": str(fill.exchange_sell_order_id),
-                    "close_reason": RECOVERED_CLOSE_REASON,
-                    "source": fill.source,
-                    "fill_recovered": fill.fill_recovered,
-                    "not_ai_protected_sell": True,
-                    "live_ai_strategy": strategy_id,
-                }
-            )
 
             existing_sell = _find_existing_sell(conn, fill)
             oid = str(fill.exchange_sell_order_id or "").strip()
@@ -256,45 +228,8 @@ def persist_recovered_close(
                 sell_trade_id = str(existing_sell[1])
             elif oid and not claimed_new:
                 result["existing"]["economic_close_already_claimed"] = True
-            else:
-                cur.execute(
-                    """
-                    INSERT INTO paper_trades (
-                        trade_id, paper_run_id, mode, symbol, side, quantity, price,
-                        entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
-                        fees_paid, slippage_cost, exit_type, timestamp, status,
-                        explainability_json, diagnostics_json, sleeve, exit_reason,
-                        entry_timestamp, decision_id, strategy_id, confidence, order_id
-                    ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        sell_trade_id,
-                        paper_run_id,
-                        fill.mode,
-                        fill.symbol,
-                        qty,
-                        exit_px,
-                        entry,
-                        realized,
-                        pnl_pct,
-                        hold_seconds,
-                        fee,
-                        0.0,
-                        RECOVERED_SELL_EXIT_TYPE,
-                        fill.closed_at_iso,
-                        "executed",
-                        json.dumps(explain, separators=(",", ":"), default=str),
-                        json.dumps(diagnostics, separators=(",", ":")),
-                        sleeve,
-                        RECOVERED_CLOSE_REASON,
-                        buy_ctx.get("buy_timestamp"),
-                        explain.get("decision_id"),
-                        strategy_id,
-                        confidence,
-                        oid or None,
-                    ),
-                )
-                result["created"]["paper_trades_sell"] = int(cur.lastrowid)
+            result["existing"]["economic_sell_suppressed"] = True
+            result["economic_sell_written"] = False
 
             cur.execute(
                 """
@@ -384,100 +319,20 @@ def persist_recovered_close(
     finally:
         conn_check.close()
 
-    if not learning_exists:
-        try:
-            from backend.services.trade_learning_writer import TradeLearningRecord, record_trade_outcome
-
-            record = TradeLearningRecord(
-                symbol=fill.symbol.replace("/", ""),
-                entry_timestamp=entry_epoch,
-                exit_timestamp=float(fill.closed_at_epoch),
-                entry_price=entry,
-                exit_price=exit_px,
-                quantity=qty,
-                fees_paid=fee,
-                net_profit_usd=realized,
-                net_profit_pct=net_pct,
-                hold_seconds=float(hold_seconds),
-                decision_reason=f"engine_close:{RECOVERED_CLOSE_REASON}:{fill.source}",
-                confidence=float(confidence) if confidence is not None else None,
-                manual_sell_flag=True,
-                close_reason=RECOVERED_CLOSE_REASON,
-                realized_profit_unknown=not fill.fill_recovered,
-                extra={
-                    "source": fill.source,
-                    "fill_recovered": fill.fill_recovered,
-                    "not_ai_protected_sell": True,
-                    "buy_trade_id": fill.buy_trade_id,
-                    "exchange_sell_order_id": fill.exchange_sell_order_id,
-                    "canonical_sell_trade_id": sell_trade_id,
-                    "close_ledger_id": fill.close_ledger_id,
-                    "lesson": "exchange_reconcile_close_not_engine_sell",
-                },
-            )
-            if record_trade_outcome(record, db_path=db_path, mode_override=TradingMode.LIVE):
-                result["created"]["trade_learning_outcomes"] = True
-        except Exception as exc:
-            result["errors"].append(f"learning:{exc}")
-            logger.warning("RECOVERED_CLOSE_LEARNING_FAILED buy=%s err=%s", fill.buy_trade_id, exc)
-    else:
-        result["existing"]["trade_learning_outcomes"] = True
-
-    if write_trade_performance and not perf_exists:
-        try:
-            from backend.services.trade_performance_tracker import TradePerformanceTracker
-
-            TradePerformanceTracker._ensure_initialized()
-            oid = int(fill.exchange_sell_order_id)
-            with sqlite3.connect(db_path) as conn:
-                conn.execute(
-                    """
-                    INSERT INTO trade_performance (
-                        trade_id, symbol, side, entry_price, exit_price, quantity,
-                        pnl, pnl_pct, is_win, hold_time_seconds, strategy, confidence,
-                        mode, timestamp
-                    ) VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        oid,
-                        fill.symbol.replace("/", ""),
-                        entry,
-                        exit_px,
-                        qty,
-                        realized,
-                        pnl_pct * 100.0,
-                        1 if realized > 0 else (0 if realized < 0 else None),
-                        hold_seconds,
-                        strategy_id,
-                        confidence,
-                        fill.mode,
-                        fill.closed_at_iso,
-                    ),
-                )
-                conn.commit()
-                result["created"]["trade_performance"] = oid
-        except Exception as exc:
-            result["errors"].append(f"trade_performance:{exc}")
-            logger.warning("RECOVERED_CLOSE_PERF_FAILED buy=%s err=%s", fill.buy_trade_id, exc)
-    elif perf_exists:
-        result["existing"]["trade_performance"] = fill.exchange_sell_order_id
-
-    try:
-        from backend.services.ai_post_trade_feature_review import record_post_trade_feature_review
-
-        record_post_trade_feature_review(
-            trade_id=fill.buy_trade_id,
-            symbol=fill.symbol,
-            closed_at_utc=fill.closed_at_iso,
-            explainability=explain_for_review,
-            hold_seconds=float(hold_seconds),
-            net_profit_usd=realized,
-            net_profit_pct=net_pct,
-            db_path=db_path,
-        )
-    except Exception as exc:
-        result["errors"].append(f"post_review:{exc}")
-
+    persist_pending_close_event(
+        db_path,
+        symbol=fill.symbol,
+        event_type="EXCHANGE_RECONCILE_AUDIT",
+        exit_trigger=RECOVERED_CLOSE_REASON,
+        quantity=qty,
+        price_snapshot=exit_px,
+        exchange_order_id=oid,
+        detail=f"audit_only source={fill.source} venue_trades={venue_trades}",
+    )
+    result["created"]["reconcile_audit"] = True
+    result["existing"]["trade_learning_outcomes"] = bool(learning_exists)
+    result["existing"]["trade_performance"] = fill.exchange_sell_order_id if perf_exists else None
+    _ = write_trade_performance
     result["sell_trade_id"] = sell_trade_id
     logger.info(
         "RECOVERED_CLOSE_CANONICAL_OK buy=%s sell=%s exchange_order=%s created=%s existing=%s",

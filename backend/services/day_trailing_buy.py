@@ -695,6 +695,9 @@ async def _pre_submit_safety(engine: Any, intent: dict[str, Any], ask: float) ->
     )
     if not can_open:
         why = str(open_why or "CANNOT_OPEN")
+        if why == "HOLD_CONSEC_LOSSES":
+            logger.info("HOLD_CONSEC_LOSSES_TELEMETRY intent=%s symbol=%s submit_not_vetoed", intent.get("intent_id"), symbol)
+            return True, ""
         if why == "INSUFFICIENT_CASH" or why.startswith("INSUFFICIENT_CASH:"):
             from backend.config.protected_execution import MAKER_FEE, USE_PROTECTED_LIMIT_EXECUTION
             from backend.config.trading_economics import TAKER_FEE
