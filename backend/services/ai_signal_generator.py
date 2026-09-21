@@ -817,12 +817,12 @@ class RealTimeAISignalGenerator:
                         skip_reason=f"DAY_ACTIVE_CONTRACT_FAIL:{','.join(miss[:4])}",
                     )
                     return
-                market_primary = bundle.get("4h") or bundle.get("1h") or bundle.get("1m") or []
-                ranking_source = bundle.get("4h") or market_primary
+                market_primary = bundle.get("15m") or bundle.get("1h") or bundle.get("1m") or []
+                ranking_source = bundle.get("15m") or market_primary
                 market_1m_exec = bundle.get("1m") or []
                 day_tf_audit = {tf: len(bundle.get(tf) or []) for tf in DAY_ACTIVE_TIMEFRAMES if isinstance(bundle.get(tf), list) or bundle.get(tf) is None}
-                if bundle.get("4h"):
-                    ranking_tf_label = "4h"
+                if bundle.get("15m"):
+                    ranking_tf_label = "15m"
                 elif bundle.get("1h"):
                     ranking_tf_label = "1h"
                 else:

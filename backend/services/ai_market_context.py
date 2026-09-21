@@ -231,28 +231,21 @@ def _liquidity_tier(volume_usd: float) -> int:
 
 
 def _market_regime_from_mtf(mtf: dict[str, dict[str, float]]) -> str:
-    """Classify trend regime (trending_up/trending_down/chop) from a 1h+4h MTF pack.
+    """Classify trend regime from the 1h snapshot only.
 
-    Works on ANY symbol's own MTF snapshot — originally BTC-only (hence the old
-    name), which meant every symbol inherited BTC's regime label even when its
-    own chart was clearly breaking out independently of BTC (e.g. ETH running
-    while BTC chops). Now called once per symbol with that symbol's own_mtf so
-    each coin is judged on its own trend (see 2026-07-26 "misses breakouts"
-    investigation). Still called with btc_mtf for the broad/BTC-wide regime used
-    by market-role classification, where a BTC-wide view is the correct input.
+    4H may remain in the MTF pack as storage/display telemetry. It cannot
+    increment or decrement this score, so it cannot flip ``ctx_market_regime``
+    or the later ``day_route_regime_at_entry`` arm key.
     """
-    h1 = mtf.get("1h", {})
-    h4 = mtf.get("4h", {})
-    score = 0
-    for snap in (h1, h4):
-        t = snap.get("trend", 0.5)
-        if t > 0.66:
-            score += 1
-        elif t < 0.33:
-            score -= 1
-    if score >= 1:
+    h1 = mtf.get("1h", {}) if isinstance(mtf, dict) else {}
+    _ = mtf.get("4h", {}) if isinstance(mtf, dict) else {}
+    try:
+        t = float((h1 or {}).get("trend", 0.5) or 0.5)
+    except (TypeError, ValueError):
+        t = 0.5
+    if t > 0.66:
         return "trending_up"
-    if score <= -1:
+    if t < 0.33:
         return "trending_down"
     return "chop"
 
@@ -292,6 +285,8 @@ def _ctx_multiplier(
     """
     align_scores: list[float] = []
     for tf in DAY_ACTIVE_TIMEFRAMES:
+        if str(tf) == "4h":
+            continue
         snap = own_mtf.get(tf)
         if isinstance(snap, dict) and snap.get("bars", 0) > 5:
             align_scores.append(float(snap.get("ema_align", 0.5)))

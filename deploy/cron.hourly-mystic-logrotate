@@ -1,0 +1,16 @@
+#!/bin/sh
+# Hourly size check for the Mystic logs.
+#
+# logrotate.timer only fires daily. mystic_ai_context.log writes about 13 MB an
+# hour, so a daily check would let it reach roughly 300 MB before the 20 MB size
+# rule ever ran, making that rule cosmetic. This runs the same config hourly.
+#
+# A separate state file keeps this independent of the system daily run. Both use
+# size-based rules, so whichever runs second simply finds the log under
+# threshold and skips it; there is no double rotation.
+#
+# Install (as root on mystic-prod):
+#   cp /home/mystic/mystic/deploy/cron.hourly-mystic-logrotate /etc/cron.hourly/mystic-logrotate
+#   chmod 755 /etc/cron.hourly/mystic-logrotate
+
+exec /usr/sbin/logrotate --state /var/lib/logrotate/mystic.status /etc/logrotate.d/mystic

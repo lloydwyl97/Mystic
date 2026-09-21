@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -33,23 +34,89 @@ class RetentionPolicy:
     table: str
     ts_column: str
     keep_days: int
-    cutoff_format: str  # "iso_utc" | "feature_ohlcv"
+    cutoff_format: str  # "iso_utc" | "feature_ohlcv" | "epoch_seconds"
+
+
+# Documented justification for each window. Retention length is chosen from
+# reproducibility requirements, the maximum research horizon, and operational
+# debug needs — never from disk pressure alone.
+RETENTION_JUSTIFICATION: dict[str, str] = {
+    "microstructure_feature_snapshots": (
+        "Write-only SCALP microstructure telemetry: the only code that touches this table is "
+        "microstructure_engine (CREATE/INDEX/INSERT); nothing in backend, scripts or tests ever "
+        "SELECTs it, no research artifact or sealed lock references it, and it is neither "
+        "protected nor lock-dependent. 14 days is two full weeks of order-book debugging, far "
+        "beyond the longest research label horizon in the system (4h) and beyond the DAY "
+        "position lifecycle. At ~67k rows/day and ~4.6 KB/row it is 81.6% of the database."
+    ),
+    "scalp_shadow_rejects": (
+        "SCALP shadow gate telemetry sampled per rejected setup. Not an order, fill, accounting "
+        "or clock-v2 artifact and not referenced by any sealed lock. 30 days keeps a full month "
+        "of gate-behaviour history for SCALP diagnosis."
+    ),
+}
 
 
 RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
-    RetentionPolicy("ai_inference_log", "ts_utc", 7, "iso_utc"),
-    RetentionPolicy("ai_context_snapshots", "ts_utc", 7, "iso_utc"),
+    RetentionPolicy("ai_inference_log", "ts_utc", 90, "iso_utc"),
+    RetentionPolicy("ai_context_snapshots", "ts_utc", 30, "iso_utc"),
+    # 81.6% of the database and ~306 MB/day. Write-only telemetry with no reader.
+    RetentionPolicy("microstructure_feature_snapshots", "ts_utc", 14, "epoch_seconds"),
+    RetentionPolicy("scalp_shadow_rejects", "created_at", 30, "iso_utc"),
     # strategy_runtime_audit writes ~160k rows/day — keep only 3 days (~480k rows max)
     RetentionPolicy("strategy_runtime_audit", "ts_utc", 3, "iso_utc"),
-    RetentionPolicy("feature_ohlcv", "ts", 7, "feature_ohlcv"),
-    RetentionPolicy("paper_trades", "timestamp", 90, "iso_utc"),
+    # feature_ohlcv and paper_trades are canonical history. They are never
+    # deleted by timed retention.
     # Append-only high-frequency logs (created_at tracks insert time).
-    RetentionPolicy("ai_live_signals", "created_at", 7, "iso_utc"),
-    RetentionPolicy("pipeline_decisions", "created_at", 7, "iso_utc"),
+    RetentionPolicy("ai_live_signals", "created_at", 30, "iso_utc"),
+    RetentionPolicy("pipeline_decisions", "created_at", 30, "iso_utc"),
     RetentionPolicy("ai_rank_snapshots", "created_at", 14, "iso_utc"),
     RetentionPolicy("scalp_rejects", "created_at", 7, "iso_utc"),
     RetentionPolicy("ai_feature_samples", "created_at", 14, "iso_utc"),
     RetentionPolicy("decision_book_tape", "ts_utc", 14, "iso_utc"),
+    RetentionPolicy("day_decision_group_records", "created_at", 90, "iso_utc"),
+    RetentionPolicy("day_decision_candidate_records", "created_at", 90, "iso_utc"),
+    RetentionPolicy("day_decision_feature_artifacts", "created_at", 90, "iso_utc"),
+    RetentionPolicy("day_decision_outcome_labels", "created_at", 90, "iso_utc"),
+)
+
+# Sealed research authority. These describe experiments and locks rather than sampling them,
+# so ageing them out would silently destroy the record of what was already tried and make a
+# prior result impossible to reproduce. They are tiny and must never be deleted on a timer.
+PROTECTED_TABLES: frozenset[str] = frozenset(
+    {
+        "paper_trades",
+        "live_exchange_fills",
+        "portfolio_engine_ledger",
+        "portfolio_engine_audit",
+        "portfolio_engine_positions",
+        "portfolio_engine_orders",
+        "feature_ohlcv",
+        "day_entry_reservations",
+        "day_trailing_buy_intents",
+        "day_experiment_registry",
+        "day_forward_lock_registry",
+        "day_path_clock_feature_snapshots",
+        "day_path_clock_readiness_history",
+        "day_path_clock_v2_candidate_artifact",
+        "day_path_clock_v2_readiness_history",
+        # CLOCK-V2 v5 authority: the partition contract and the 3h research target.
+        # Deleting either would make the v5 development dataset unreproducible.
+        "day_clock_v2_partition_registry",
+        "day_clock_v2_outcome_labels",
+        "day_clock_v2_outcome_labels_history",
+    }
+)
+
+# Learning rows a sealed lock may need to reproduce its dataset. Retention on these is
+# additionally floored by the oldest cutoff any uninspected lock still depends on.
+LOCK_DEPENDENT_TABLES: frozenset[str] = frozenset(
+    {
+        "day_decision_group_records",
+        "day_decision_candidate_records",
+        "day_decision_feature_artifacts",
+        "day_decision_outcome_labels",
+    }
 )
 
 
@@ -66,11 +133,203 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(r[1] == column for r in rows)
 
 
-def _cutoff_value(policy: RetentionPolicy) -> str:
+def _iso_to_dt(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        raw = float(value)
+        if raw > 1e12:
+            raw /= 1000.0
+        try:
+            return datetime.fromtimestamp(raw, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            raw = float(value)
+        except (TypeError, ValueError):
+            return None
+        if raw > 1e12:
+            raw /= 1000.0
+        try:
+            return datetime.fromtimestamp(raw, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _cutoff_value(policy: RetentionPolicy) -> str | float:
     cutoff_dt = datetime.now(timezone.utc) - timedelta(days=policy.keep_days)
     if policy.cutoff_format == "feature_ohlcv":
         return cutoff_dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+    if policy.cutoff_format == "epoch_seconds":
+        return cutoff_dt.timestamp()
     return cutoff_dt.isoformat()
+
+
+def lock_floor(conn: sqlite3.Connection) -> str | None:
+    """Oldest instant any sealed forward lock still depends on.
+
+    Retention must never delete learning rows at or after this point: the lock's dataset
+    could no longer be rebuilt and an already-sealed result would become unreproducible.
+    Inspected locks are protected too — a published experiment still has to be auditable.
+    """
+    if not _table_exists(conn, "day_forward_lock_registry"):
+        return None
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(day_forward_lock_registry)")]
+    wanted = [c for c in ("dataset_cutoff", "training_start", "locked_test_start") if c in cols]
+    if not wanted:
+        return None
+    floors: list[str] = []
+    for row in conn.execute(f"SELECT {', '.join(wanted)} FROM day_forward_lock_registry"):
+        floors.extend(str(v).strip() for v in row if str(v or "").strip())
+    return min(floors) if floors else None
+
+
+def effective_cutoff(conn: sqlite3.Connection, policy: RetentionPolicy) -> tuple[str | float, str | None]:
+    """Policy cutoff, clamped back to the lock floor for lock-dependent learning tables."""
+    cutoff = _cutoff_value(policy)
+    if policy.table not in LOCK_DEPENDENT_TABLES:
+        return cutoff, None
+    floor = lock_floor(conn)
+    if floor and isinstance(cutoff, str) and floor < cutoff:
+        return floor, floor
+    return cutoff, floor
+
+
+def retention_dry_run(db_path: str | Path) -> dict[str, Any]:
+    """Report exactly what retention would remove, without deleting anything.
+
+    Read-only. Intended to be run before enabling enforcement on a new table, and safe to
+    run at any time against production.
+    """
+    path = Path(db_path)
+    if not path.is_file():
+        return {"error": f"database not found: {path}", "tables": {}}
+
+    out: dict[str, Any] = {
+        "dry_run": True,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "protected_tables": sorted(PROTECTED_TABLES),
+        "tables": {},
+        "total_rows_to_delete": 0,
+    }
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        out["lock_floor"] = lock_floor(conn)
+        for table in sorted(PROTECTED_TABLES):
+            if _table_exists(conn, table):
+                rows = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                out["tables"][table] = {"status": "protected", "rows": rows, "rows_to_delete": 0}
+        for policy in RETENTION_POLICIES:
+            entry: dict[str, Any] = {
+                "keep_days": policy.keep_days,
+                "ts_column": policy.ts_column,
+                "cutoff_format": policy.cutoff_format,
+            }
+            if policy.table in RETENTION_JUSTIFICATION:
+                entry["justification"] = RETENTION_JUSTIFICATION[policy.table]
+            out["tables"][policy.table] = entry
+            if not _table_exists(conn, policy.table):
+                entry["status"] = "skipped"
+                entry["reason"] = "table_missing"
+                continue
+            if not _column_exists(conn, policy.table, policy.ts_column):
+                entry["status"] = "skipped"
+                entry["reason"] = f"timestamp_column_missing:{policy.ts_column}"
+                continue
+            cutoff, floor = effective_cutoff(conn, policy)
+            entry["cutoff"] = cutoff
+            entry["lock_floor_applied"] = bool(floor and floor <= cutoff)
+            entry["rows"] = int(conn.execute(f"SELECT COUNT(*) FROM {policy.table}").fetchone()[0])
+            entry["rows_to_delete"] = int(conn.execute(f"SELECT COUNT(*) FROM {policy.table} WHERE {policy.ts_column} < ?", (cutoff,)).fetchone()[0])
+            entry["newest_row_to_delete"] = conn.execute(
+                f"SELECT MAX({policy.ts_column}) FROM {policy.table} WHERE {policy.ts_column} < ?",
+                (cutoff,),
+            ).fetchone()[0]
+            entry["oldest_row_retained"] = conn.execute(
+                f"SELECT MIN({policy.ts_column}) FROM {policy.table} WHERE {policy.ts_column} >= ?",
+                (cutoff,),
+            ).fetchone()[0]
+            try:
+                total_bytes = int(conn.execute("SELECT SUM(pgsize) FROM dbstat WHERE name=?", (policy.table,)).fetchone()[0] or 0)
+            except sqlite3.Error:
+                total_bytes = 0
+            entry["table_bytes"] = total_bytes
+            entry["estimated_bytes_reclaimed"] = int(total_bytes * entry["rows_to_delete"] / entry["rows"]) if entry["rows"] else 0
+            entry["status"] = "would_delete" if entry["rows_to_delete"] else "nothing_to_delete"
+            out["total_rows_to_delete"] += entry["rows_to_delete"]
+    finally:
+        conn.close()
+    return out
+
+
+DISK_WARNING_FREE_GB = float(os.getenv("RETENTION_DISK_WARNING_FREE_GB", "5") or "5")
+DISK_CRITICAL_FREE_GB = float(os.getenv("RETENTION_DISK_CRITICAL_FREE_GB", "2") or "2")
+
+
+def storage_report(db_path: str | Path) -> dict[str, Any]:
+    """Disk and learning-table growth, with a severity band.
+
+    Observability only. A rising band is not a trading gate and must never be used as a
+    reason to shorten the retention window; that requires separate, explicit evidence.
+    """
+    path = Path(db_path)
+    out: dict[str, Any] = {"db_path": str(path), "generated_at": datetime.now(timezone.utc).isoformat()}
+    if not path.is_file():
+        return {**out, "error": "database not found"}
+
+    usage = shutil.disk_usage(path.parent)
+    free_gb = usage.free / 1024**3
+    out["db_bytes"] = path.stat().st_size
+    out["db_gib"] = round(out["db_bytes"] / 1024**3, 3)
+    out["filesystem_total_gib"] = round(usage.total / 1024**3, 2)
+    out["filesystem_free_gib"] = round(free_gb, 2)
+    out["filesystem_used_pct"] = round(100.0 * usage.used / usage.total, 1) if usage.total else None
+
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        learning_bytes = out["db_bytes"]
+        oldest_dt: datetime | None = None
+        newest_dt: datetime | None = None
+        for table in sorted(LOCK_DEPENDENT_TABLES | PROTECTED_TABLES):
+            if not _table_exists(conn, table):
+                continue
+            column = "created_at" if _column_exists(conn, table, "created_at") else "timestamp"
+            if not _column_exists(conn, table, column):
+                continue
+            lo, hi = conn.execute(f"SELECT MIN({column}), MAX({column}) FROM {table}").fetchone()
+            lo_dt, hi_dt = _iso_to_dt(lo), _iso_to_dt(hi)
+            if lo_dt and (oldest_dt is None or lo_dt < oldest_dt):
+                oldest_dt = lo_dt
+            if hi_dt and (newest_dt is None or hi_dt > newest_dt):
+                newest_dt = hi_dt
+    finally:
+        conn.close()
+
+    out["learning_table_bytes"] = learning_bytes
+    out["learning_oldest"] = oldest_dt.isoformat() if oldest_dt else None
+    out["learning_newest"] = newest_dt.isoformat() if newest_dt else None
+    span_days = 0.0
+    if oldest_dt and newest_dt:
+        span_days = max((newest_dt - oldest_dt).total_seconds() / 86400.0, 0.0)
+    out["learning_span_days"] = round(span_days, 3)
+    per_day = learning_bytes / span_days if span_days > 0 else 0.0
+    out["learning_bytes_per_day"] = int(per_day)
+    out["learning_mb_per_day"] = round(per_day / 1024**2, 3)
+    for horizon in (30, 60, 90):
+        out[f"projection_{horizon}d_gib"] = round(per_day * horizon / 1024**3, 3)
+
+    if free_gb <= DISK_CRITICAL_FREE_GB:
+        out["severity"] = "CRITICAL"
+    elif free_gb <= DISK_WARNING_FREE_GB:
+        out["severity"] = "WARNING"
+    else:
+        out["severity"] = "OK"
+    out["severity_note"] = "observability only; not a trading gate and not a reason to shorten retention"
+    return out
 
 
 def _delete_one_batch(
@@ -150,8 +409,16 @@ def run_large_table_retention(
                     )
                     continue
 
-                cutoff = _cutoff_value(policy)
+                if policy.table in PROTECTED_TABLES:
+                    entry["status"] = "skipped"
+                    entry["reason"] = "protected_research_authority"
+                    logger.info("LARGE_TABLE_RETENTION: skip %s (protected)", policy.table)
+                    continue
+
+                cutoff, floor = effective_cutoff(conn, policy)
                 entry["cutoff"] = cutoff
+                if floor:
+                    entry["lock_floor"] = floor
                 deleted_total = 0
                 batches = 0
 
@@ -252,6 +519,11 @@ if __name__ == "__main__":
     parser.add_argument("--db", default=str(DATABASE_PATH))
     parser.add_argument("--unlimited", action="store_true", help="Delete until caught up (offline)")
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be deleted and exit without touching the database",
+    )
+    parser.add_argument(
         "--integrity-check",
         action="store_true",
         help="Run integrity_check after retention (offline only, no VACUUM)",
@@ -262,6 +534,10 @@ if __name__ == "__main__":
         help="Run integrity_check + VACUUM after retention (offline only, Mystic stopped)",
     )
     args = parser.parse_args()
+
+    if args.dry_run:
+        print(json.dumps({"retention": retention_dry_run(args.db), "storage": storage_report(args.db)}, indent=2))
+        sys.exit(0)
 
     before = Path(args.db).stat().st_size if Path(args.db).is_file() else 0
     out = run_large_table_retention(args.db, unlimited=args.unlimited)

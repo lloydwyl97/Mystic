@@ -308,6 +308,12 @@ def record_day_bar_authority(decision: dict[str, Any], *, redis_client: Any = No
             "path_aware_policy_id": dec.get("path_aware_policy_id"),
             "why_selected": dec.get("why_selected"),
         }
+        try:
+            from backend.services.day_4h_entry_telemetry import merge_4h_entry_extras
+
+            extras = merge_4h_entry_extras(extras, dec, redis_client=redis_client)
+        except Exception as exc:
+            logger.debug("decision_book_tape 4h extras failed: %s", exc)
         payload = json.dumps(extras, default=str)
         ts = dec.get("prediction_timestamp") or _now_iso()
         version = dec.get("path_net_model_id") or dec.get("forward_net_model_version")

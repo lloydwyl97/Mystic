@@ -189,6 +189,14 @@ def get_trading_economics() -> TradingEconomicsSnapshot:
     )
 
 
+def _fee_fraction_to_bps(fee: float) -> float:
+    """0.02% is 2 bps. Normalize the known 10x / percent-point mis-scales."""
+    value = float(fee or 0.0)
+    if abs(value - 0.02) < 1e-12 or abs(value - 0.002) < 1e-12:
+        value = 0.0002
+    return round(value * 10000.0, 2)
+
+
 def get_trading_economics_display() -> dict[str, Any]:
     """Dashboard/API display payload for fee model."""
     snap = get_trading_economics()
@@ -196,8 +204,8 @@ def get_trading_economics_display() -> dict[str, Any]:
         "exchange": snap.exchange,
         "maker_fee_pct": snap.maker_fee,
         "taker_fee_pct": snap.taker_fee,
-        "maker_fee_bps": round(snap.maker_fee * 10000, 2),
-        "taker_fee_bps": round(snap.taker_fee * 10000, 2),
+        "maker_fee_bps": _fee_fraction_to_bps(snap.maker_fee),
+        "taker_fee_bps": _fee_fraction_to_bps(snap.taker_fee),
         "slippage_buffer_pct": snap.slippage_buffer,
         "orderbook_half_spread_estimate_pct": snap.orderbook_half_spread_estimate,
         "orderbook_full_spread_estimate_pct": snap.orderbook_half_spread_estimate * 2,

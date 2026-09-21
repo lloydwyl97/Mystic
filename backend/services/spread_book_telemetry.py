@@ -11,6 +11,7 @@ import logging
 import time
 from typing import Any
 
+from backend.config.day_entry_execution import BOOK_STALE_SEC
 from backend.config.execution_cost_model import (
     RECORDED_FULL_SPREAD_PCT,
     shadow_sizing_enabled,
@@ -26,15 +27,29 @@ from backend.services.day_liquidity_gate import (
 logger = logging.getLogger(__name__)
 
 BOOK_KEY_PREFIX = "market_book:"
+ORDERBOOK_KEY_PREFIX = "orderbook:"
 BOOK_TTL_SEC = 120
+QUOTE_SUFFIXES = ("USDT", "USDC", "USD")
 
 
 def _api(symbol: str) -> str:
     return str(symbol or "").replace("/", "").replace("-", "").replace("_", "").upper()
 
 
+def _base(symbol: str) -> str:
+    api = _api(symbol)
+    for quote in QUOTE_SUFFIXES:
+        if api.endswith(quote) and len(api) > len(quote):
+            return api[: -len(quote)]
+    return api
+
+
 def book_redis_key(symbol: str) -> str:
     return f"{BOOK_KEY_PREFIX}{_api(symbol)}"
+
+
+def orderbook_redis_key(symbol: str) -> str:
+    return f"{ORDERBOOK_KEY_PREFIX}{_base(symbol)}"
 
 
 def book_payload(
@@ -56,7 +71,7 @@ def book_payload(
         "timestamp": ts,
         "source": source,
         "freshness_sec": round(age, 3),
-        "fresh": age <= 30.0,
+        "fresh": age <= BOOK_STALE_SEC,
     }
 
 
@@ -93,22 +108,69 @@ async def write_market_book_async(redis_client: Any, symbol: str, payload: dict[
         await pipe.execute()
 
 
-def read_market_book(redis_client: Any, symbol: str) -> dict[str, Any] | None:
-    if redis_client is None:
-        return None
-    raw = redis_client.hgetall(book_redis_key(symbol))
+def _parse_book_hash(raw: Any, ts_fields: tuple[str, ...]) -> tuple[float, float, float, str] | None:
+    """Return (bid, ask, epoch_ts, source) or None when unusable.
+
+    Fail closed: a book with no timestamp cannot be aged, so it is rejected rather
+    than defaulted to now.
+    """
     if not raw:
         return None
     decoded = {(k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v) for k, v in raw.items()}
     try:
         bid = float(decoded.get("bid") or 0)
         ask = float(decoded.get("ask") or 0)
-        ts = float(decoded.get("timestamp") or 0)
     except (TypeError, ValueError):
         return None
-    if bid <= 0 or ask <= 0:
+    if bid <= 0 or ask <= 0 or ask < bid:
         return None
-    return book_payload(bid=bid, ask=ask, source=str(decoded.get("source") or "market_book"), timestamp=ts)
+    ts = 0.0
+    for field in ts_fields:
+        try:
+            ts = float(decoded.get(field) or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts > 0:
+            break
+    if ts <= 0:
+        return None
+    return bid, ask, ts, str(decoded.get("source") or "")
+
+
+def read_market_book(redis_client: Any, symbol: str) -> dict[str, Any] | None:
+    """Return the freshest real top-of-book for ``symbol``.
+
+    ``orderbook:{BASE}`` is the websocket tape and lands sub-second.
+    ``market_book:{SYMBOL}`` is a cached canonical mark republished only once per
+    price-publisher interval. The trailing-buy submit window is single-digit bps
+    wide, so it must be evaluated against whichever source is actually current.
+    """
+    if redis_client is None:
+        return None
+    now = time.time()
+    candidates: list[tuple[float, float, float, float, str]] = []
+    for key, ts_fields, default_source in (
+        (orderbook_redis_key(symbol), ("updated_at", "ts_utc"), "websocket"),
+        (book_redis_key(symbol), ("timestamp",), "market_book"),
+    ):
+        try:
+            parsed = _parse_book_hash(redis_client.hgetall(key), ts_fields)
+        except Exception:
+            parsed = None
+        if parsed is None:
+            continue
+        bid, ask, ts, source = parsed
+        age = max(0.0, now - ts)
+        candidates.append((age, bid, ask, ts, source or default_source))
+        if age <= BOOK_STALE_SEC:
+            # Highest-priority usable source wins outright. Alternating sources
+            # between polls injects their price offset into the trailing-buy
+            # dip/rebound deltas as a phantom move.
+            break
+    if not candidates:
+        return None
+    _age, bid, ask, ts, source = min(candidates, key=lambda c: c[0])
+    return book_payload(bid=bid, ask=ask, source=source, timestamp=ts)
 
 
 def tape_median_spread_bps(symbol: str) -> float:

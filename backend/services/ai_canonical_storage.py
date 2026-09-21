@@ -509,6 +509,14 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
 ]
 
 
+# Database paths whose schema this process has already ensured.
+_ENSURED_PATHS: set[str] = set()
+_ENSURE_LOCK_TIMEOUT_SEC = 10.0
+# Ceiling on rows repaired per ensure call so a large unmigrated table cannot
+# hold a write lock for an unbounded time.
+_BACKFILL_ROW_LIMIT = 5000
+
+
 def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     try:
         return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -540,7 +548,9 @@ def _backfill_inference_feature_dim(conn: sqlite3.Connection) -> None:
             """
             SELECT id, features_json FROM ai_inference_log
             WHERE feature_dim IS NULL AND features_json IS NOT NULL AND TRIM(features_json) != ''
-            """
+            LIMIT ?
+            """,
+            (_BACKFILL_ROW_LIMIT,),
         ).fetchall()
         for row_id, raw in rows:
             try:
@@ -556,11 +566,21 @@ def _backfill_inference_feature_dim(conn: sqlite3.Connection) -> None:
         logger.debug("ai_inference_log feature_dim backfill skipped: %s", exc)
 
 
-def ensure_ai_canonical_tables(db_path: str | Path = DATABASE_PATH) -> None:
-    """Idempotently create every AI-canonical SQLite table and apply migrations."""
+def ensure_ai_canonical_tables(db_path: str | Path = DATABASE_PATH, *, force: bool = False) -> None:
+    """Idempotently create every AI-canonical SQLite table and apply migrations.
+
+    Schema creation is a process-lifetime concern, so the work is memoized per
+    database path. Without that, every one of the ~34 call sites re-ran the full
+    DDL batch plus the feature_dim backfill, which takes a write lock on a
+    multi-gigabyte database; read-only diagnostics that call this per symbol
+    then stall behind the live writers. Pass ``force=True`` in migrations or
+    tests that must re-apply against a mutated file.
+    """
     path = str(db_path)
+    if not force and path in _ENSURED_PATHS:
+        return
     try:
-        with sqlite3.connect(path) as conn:
+        with sqlite3.connect(path, timeout=_ENSURE_LOCK_TIMEOUT_SEC) as conn:
             cur = conn.cursor()
             for stmt in _SCHEMA:
                 cur.execute(stmt)
@@ -586,6 +606,7 @@ def ensure_ai_canonical_tables(db_path: str | Path = DATABASE_PATH) -> None:
             ensure_strategy_runtime_audit_table(path)
         except Exception as e:
             logger.debug("ensure_strategy_runtime_audit_table skipped: %s", e)
+        _ENSURED_PATHS.add(path)
     except sqlite3.Error as e:
         logger.warning("ensure_ai_canonical_tables failed at %s: %s", path, e)
 

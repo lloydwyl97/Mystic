@@ -11,6 +11,7 @@ Notes
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,7 @@ from sqlalchemy import (
     desc,
     func,
     select,
+    text,
 )
 from sqlalchemy.orm import declarative_base
 
@@ -36,6 +38,8 @@ from backend.services.db import get_engine, get_sessionmaker
 
 # Back-compat path used by labeler/online_trainer/paper_trader
 DB_PATH = os.getenv("MYSTIC_DB_PATH", "mystic_trading.db")
+
+logger = logging.getLogger(__name__)
 
 ENGINE = get_engine()
 SessionLocal = get_sessionmaker(ENGINE)
@@ -70,15 +74,23 @@ class FeatureOHLCV(Base):
     low = Column(Float)  # type: ignore[assignment]
     close = Column(Float)  # type: ignore[assignment]
     volume = Column(Float)  # type: ignore[assignment]
-    ts = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    # No persist-now default here. ts IS the exchange open time and part of the
+    # candle's identity, so a writer that omits it must fail rather than quietly
+    # record the import time as the bar's open.
+    ts = Column(DateTime, nullable=False, index=True)
 
 
 Index("ix_feature_ticks_symbol_ts", FeatureTick.symbol, FeatureTick.ts)
+# symbol + interval + open_time is the canonical candle identity, so it is unique.
+# upsert_completed_candles() reads-then-writes, which is not atomic, so without this
+# constraint two concurrent ingests could both miss the existing row and insert the
+# same bar twice.
 Index(
     "ix_feature_ohlcv_symbol_interval_ts",
     FeatureOHLCV.symbol,
     FeatureOHLCV.interval,
     FeatureOHLCV.ts,
+    unique=True,
 )
 
 # -------------------------
@@ -89,6 +101,44 @@ Index(
 def init_feature_store() -> None:
     """Create tables if they do not exist."""
     Base.metadata.create_all(ENGINE)
+    enforce_candle_identity_unique()
+
+
+_IDENTITY_INDEX = "ix_feature_ohlcv_symbol_interval_ts"
+
+
+def enforce_candle_identity_unique() -> None:
+    """Upgrade the candle identity index to UNIQUE on an existing database.
+
+    create_all() skips an index that already exists by name, so a database created
+    before the constraint keeps the old non-unique index and stays open to duplicate
+    (symbol, interval, ts) rows. Rebuild it, but only when the data is already clean:
+    failing startup over pre-existing duplicates would be worse than leaving the
+    index as it is and saying so.
+    """
+    try:
+        with ENGINE.begin() as conn:
+            row = conn.execute(
+                text("SELECT name, \"unique\" FROM pragma_index_list('feature_ohlcv') WHERE name = :n"),
+                {"n": _IDENTITY_INDEX},
+            ).fetchone()
+            if row is not None and int(row[1]) == 1:
+                return
+
+            dupes = conn.execute(text("SELECT COUNT(*) FROM (SELECT symbol, interval, ts FROM feature_ohlcv GROUP BY symbol, interval, ts HAVING COUNT(*) > 1)")).scalar_one()
+            if int(dupes or 0) > 0:
+                logger.error(
+                    "feature_ohlcv has %s duplicate (symbol, interval, ts) groups; leaving %s non-unique. De-duplicate before the canonical candle identity can be enforced.",
+                    dupes,
+                    _IDENTITY_INDEX,
+                )
+                return
+
+            conn.execute(text(f"DROP INDEX IF EXISTS {_IDENTITY_INDEX}"))
+            conn.execute(text(f"CREATE UNIQUE INDEX {_IDENTITY_INDEX} ON feature_ohlcv (symbol, interval, ts)"))
+            logger.info("feature_ohlcv candle identity is now UNIQUE(symbol, interval, ts)")
+    except Exception:
+        logger.exception("could not enforce the feature_ohlcv candle identity index")
 
 
 # -------------------------
@@ -151,50 +201,15 @@ def insert_ticks_bulk(items: Iterable[tuple[str, dict[str, Any]]]) -> int:
     return inserted
 
 
-def insert_ohlcv(symbol: str, interval: str, candle: dict[str, float]) -> None:
-    """
-    Insert one OHLCV candle (latest).
-    candle: {open, high, low, close, volume}
-    """
-    with SessionLocal() as s:
-        row = FeatureOHLCV(
-            symbol=str(symbol),
-            interval=str(interval),
-            open=_f(candle.get("open")),
-            high=_f(candle.get("high")),
-            low=_f(candle.get("low")),
-            close=_f(candle.get("close")),
-            volume=_f(candle.get("volume")),
-            ts=datetime.now(timezone.utc),
-        )
-        s.add(row)
-        s.commit()
-
-
-def insert_ohlcv_bulk(symbol: str, interval: str, candles: Iterable[dict[str, Any]]) -> int:
-    """
-    Bulk insert multiple candles for a symbol/interval.
-    Each dict should include: open, high, low, close, volume, and optionally ts (datetime).
-    Returns number of inserted rows.
-    """
-    inserted = 0
-    with SessionLocal() as s:
-        for c in candles:
-            ts = c.get("ts")
-            row = FeatureOHLCV(
-                symbol=str(symbol),
-                interval=str(interval),
-                open=_f(c.get("open")),
-                high=_f(c.get("high")),
-                low=_f(c.get("low")),
-                close=_f(c.get("close")),
-                volume=_f(c.get("volume")),
-                ts=ts if isinstance(ts, datetime) else datetime.now(timezone.utc),
-            )
-            s.add(row)
-            inserted += 1
-        s.commit()
-    return inserted
+# insert_ohlcv() and insert_ohlcv_bulk() were removed. Both stamped feature_ohlcv.ts
+# with the write time: insert_ohlcv() hardcoded datetime.now() and so could never
+# record an exchange open time, and insert_ohlcv_bulk() fell back to datetime.now()
+# whenever ts was absent or was epoch-ms rather than a datetime. Either one would
+# rewrite historical candles as if they had opened at import time, breaking the
+# symbol + interval + open_time identity. Neither had a caller anywhere in the tree;
+# they were only exported. Completed candles go through
+# canonical_candle_store.upsert_completed_candles(), which derives ts from the
+# exchange open_ms.
 
 
 # -------------------------
@@ -408,14 +423,13 @@ __all__ = [
     "FeatureOHLCV",
     "FeatureTick",
     "cleanup_retention",
+    "enforce_candle_identity_unique",
     "get_latest_tick",
     "get_ohlcv",
     "get_ohlcv_recent",
     "get_recent_ticks",
     "get_store_stats",
     "init_feature_store",
-    "insert_ohlcv",
-    "insert_ohlcv_bulk",
     "insert_tick",
     "insert_ticks_bulk",
 ]

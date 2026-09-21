@@ -20,7 +20,8 @@ from backend.services.portfolio_engine import KillSwitchMode, PortfolioEngine
 
 
 @pytest.fixture(autouse=True)
-def _healthy_accounting():
+def _healthy_accounting(monkeypatch):
+    monkeypatch.setenv("DAY_ENTRY_EXECUTION_MODE", "trailing_buy")
     with patch(
         "backend.services.atomic_execution_book.find_cash_position_disagreement",
         return_value={"ok": True, "orphans": []},

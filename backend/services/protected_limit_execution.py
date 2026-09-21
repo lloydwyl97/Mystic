@@ -13,6 +13,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from backend.config.execution_cost_model import honest_all_in_rt_pct
 from backend.config.protected_execution import (
     DEPTH_INSUFFICIENT,
     EXECUTABLE_NET_PROFIT_BELOW_FLOOR,
@@ -32,7 +33,12 @@ from backend.config.protected_execution import (
     USE_PROTECTED_LIMIT_EXECUTION,
     effective_max_orderbook_spread_pct,
 )
-from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, MIN_NET_PROFIT_TO_SELL, TAKER_FEE
+from backend.config.trading_economics import (
+    ESTIMATED_ROUNDTRIP_COST,
+    MIN_NET_PROFIT_TO_SELL,
+    TAKER_FEE,
+    min_net_profit_for_symbol,
+)
 from backend.utils.symbols import normalize_symbol
 
 logger = logging.getLogger(__name__)
@@ -232,10 +238,16 @@ def evaluate_executable_sell_profit(
     sell_fee_rate: float = 0.0,
     position_qty: float | None = None,
     mark_price: float | None = None,
+    symbol: str = "",
 ) -> ExecutableSellProfitCheck:
     """
     Final gate before SELL commit: profit must clear using executable fill price
     from protected preflight (or live fill), not monitor mark alone.
+
+    ``symbol`` selects the same per-coin floor and honest round-trip cost the
+    exit decision used. Without it this re-tested the exit against the global
+    MIN_NET_PROFIT_TO_SELL, so an exit authorized by a lower per-coin floor was
+    rejected here by an unrelated threshold it never had to clear.
     """
     base = ExecutableSellProfitCheck(
         passed=False,
@@ -248,8 +260,10 @@ def evaluate_executable_sell_profit(
         base.reject_reason = PROTECTED_FILL_NOT_PROFITABLE
         return base
 
+    floor = min_net_profit_for_symbol(symbol) if symbol else MIN_NET_PROFIT_TO_SELL
+    rt_cost = honest_all_in_rt_pct(symbol) if symbol else ESTIMATED_ROUNDTRIP_COST
     gross_pct = (executable_sell_price - entry_price) / entry_price
-    net_pct = gross_pct - ESTIMATED_ROUNDTRIP_COST
+    net_pct = gross_pct - rt_cost
     pos_qty = float(position_qty if position_qty is not None else quantity)
     entry_fee_pro_rata = float(entry_fee or 0.0) * (quantity / pos_qty) if pos_qty > 0 else 0.0
     entry_cost = (quantity * entry_price) + entry_fee_pro_rata
@@ -261,7 +275,7 @@ def evaluate_executable_sell_profit(
     base.executable_net_pct = net_pct
     base.executable_net_profit_usd = net_profit_usd
 
-    if net_pct + 1e-12 < MIN_NET_PROFIT_TO_SELL:
+    if net_pct + 1e-12 < floor:
         base.reject_reason = EXECUTABLE_NET_PROFIT_BELOW_FLOOR
         return base
     if net_profit_usd <= 0:
@@ -609,15 +623,35 @@ async def _enrich_live_order_fills(live_service: Any, order: dict[str, Any], exc
         "status",
         "fee",
         "fees",
-        "trades",
         "commission",
         "commissionAsset",
-        "info",
         "amount",
         "price",
     ):
         if fetched.get(key) is not None:
             merged[key] = fetched[key]
+    # "trades" and info["fills"] are the only carriers of the per-fill venue trade
+    # ids, and only the create-order response has them: Binance's GET /order reply
+    # omits fills entirely and CCXT leaves trades empty for it. Overwriting them
+    # with the fetched (empty) values is why every stored live fill had
+    # fill_ids_json=[] and venue_trade_ids_json=[]. Take the fetched value only
+    # when it actually carries something.
+    if fetched.get("trades"):
+        merged["trades"] = fetched["trades"]
+    merged["info"] = _merge_info_preserving_fills(order.get("info"), fetched.get("info"))
+    return merged
+
+
+def _merge_info_preserving_fills(original: Any, fetched: Any) -> Any:
+    """Overlay a fetched ``info`` without dropping the create response's fills."""
+    if not isinstance(fetched, dict):
+        return original
+    if not isinstance(original, dict):
+        return fetched
+    merged = dict(original)
+    merged.update({k: v for k, v in fetched.items() if v is not None})
+    if original.get("fills") and not fetched.get("fills"):
+        merged["fills"] = original["fills"]
     return merged
 
 
@@ -628,6 +662,7 @@ async def execute_protected_limit_live(
     side: str,
     quantity: float,
     limit_price: float,
+    client_order_id: str | None = None,
 ) -> dict[str, Any] | None:
     """
     Place protected limit on Binance.US with strict timeout; cancel if not fully filled.
@@ -654,6 +689,7 @@ async def execute_protected_limit_live(
                 side=side_l,
                 amount=quantity,
                 price=limit_price,
+                client_order_id=client_order_id,
                 time_in_force=tif if tif == "IOC" else None,
             )
         except TypeError:
@@ -664,6 +700,7 @@ async def execute_protected_limit_live(
                 side=side_l,
                 amount=quantity,
                 price=limit_price,
+                client_order_id=client_order_id,
             )
         except Exception as ex:
             logger.warning("PROTECTED_LIMIT_LIVE place failed tif=%s %s: %s", tif, exchange_symbol, ex)
@@ -692,6 +729,13 @@ async def execute_protected_limit_live(
                 amount,
             )
             if filled > 0:
+                # PROTECTED_LIMIT_ALLOW_PARTIAL is enforced pre-trade, in
+                # preflight: a quantity the visible book cannot fill completely
+                # is rejected as DEPTH_INSUFFICIENT and no order is sent. Once
+                # an IOC has partially filled the asset is already in the
+                # account, so the fill must be adopted and tracked. Returning
+                # None here would leave inventory we own invisible to the
+                # engine, which is what the dust reconciler then has to chase.
                 order["_mystic_partial_fill"] = True
                 order["_mystic_ioc_incomplete"] = True
                 return order

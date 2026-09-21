@@ -338,8 +338,8 @@ def _symbol_group_baseline(group: str) -> float:
 # these via evaluate_engine_managed_exit (see _check_exit_conditions).
 # =============================================================================
 COIN_PROFILES = {
-    # Uniform day-trade parameters for all four symbols (equalised 2026-09-17).
-    # tp=1.4%, sl=1.0%, trail=0.25%, max_hold=5h — identical behaviour per coin.
+    # Uniform day-trade parameters for all four symbols. This is the only
+    # production authority — no per-coin trail/hold overrides.
     "BTCUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
     "ETHUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
     "SOLUSDT": {"tp": 0.014, "sl": 0.010, "trail": 0.0025, "max_hold_min": 300},
@@ -396,8 +396,8 @@ def compute_entry_distance_pct(symbol: str, atr: float, price: float) -> float:
 
     This is the same floor `_evaluate_path_aware_exit` enforces via
     `DAY_RISK_FLOOR_EXIT`, so the stamped ``stop_price`` is a real level rather
-    than decoration. Once a position is open the floor also tracks 4H structure
-    and can only widen from here, bounded by DAY_RISK_FLOOR_MAX_ADVERSE_PCT.
+    than decoration.     Once a position is open the floor can only widen from here,
+    bounded by DAY_RISK_FLOOR_MAX_ADVERSE_PCT. 4H is not an input.
     """
     from backend.services.day_trade_thesis import resolve_day_risk_floor_price
 
@@ -413,20 +413,11 @@ def compute_entry_distance_pct(symbol: str, atr: float, price: float) -> float:
 
 
 def day_intact_profit_floor(*, entry_price: float, prior_4h_low: float, min_net_profit: float) -> float:
-    """Net profit required to close a DAY position while the 4H rise is still intact.
-
-    Scaled to the structural risk the position is carrying, so closing a live
-    trend costs a gain worth having. Bounded below so it can never decay into a
-    scalp clip, and above so a distant 4H low cannot put profit out of reach.
-    """
-    r_mult = float(os.getenv("DAY_INTACT_PROFIT_R_MULT", "0.5"))
+    """Compatibility helper. 4H cannot raise or suppress the live profit floor."""
+    _ = (entry_price, prior_4h_low)
     floor_min_mult = float(os.getenv("DAY_INTACT_PROFIT_FLOOR_MIN_MULT", "2.0"))
     floor_max = float(os.getenv("DAY_INTACT_PROFIT_FLOOR_MAX_PCT", "0.025"))
-
-    entry = float(entry_price or 0.0)
-    low = float(prior_4h_low or 0.0)
-    structural_r = (entry - low) / entry if entry > 0 and 0.0 < low < entry else 0.0
-    return max(float(min_net_profit) * floor_min_mult, min(structural_r * r_mult, floor_max))
+    return min(max(float(min_net_profit) * floor_min_mult, float(min_net_profit)), floor_max)
 
 
 def compute_position_risk_usd(quantity: float, entry_price: float, stop_price: float) -> float:
@@ -1433,6 +1424,20 @@ class OpenPosition:
     opened_under_router: bool = False
     max_hold_min: int = 0
     trail_pct: float = 0.0
+    trail_activated: bool = False
+    trail_activated_at: float = 0.0
+    trail_activation_price: float = 0.0
+    trail_high_water_source: str = ""
+    # Entry identity chain, carried so a position can always be traced back to
+    # the decision that authorized it and the venue order that created it.
+    entry_decision_id: str = ""
+    entry_intent_id: str = ""
+    entry_reservation_id: str = ""
+    entry_order_id: str = ""
+    entry_client_order_id: str = ""
+    entry_fill_ids_json: str = "[]"
+    quantity_exact: str = ""
+    protected_dust_qty: float = 0.0
 
     @property
     def risk_usd(self) -> float:
@@ -2201,6 +2206,7 @@ class PortfolioEngine:
         self._trading_paused: bool = False
         self._pause_reason: str = ""
         self._last_governance_hold_reason: str | None = None  # From risk governor when buys held
+        self._canonical_nle_snapshot: dict[str, Any] | None = None
 
         # Startup timestamp retained for downstream age telemetry only.
         self._startup_timestamp: float = time.time()
@@ -2246,6 +2252,8 @@ class PortfolioEngine:
         self._fifo_sell_lock: asyncio.Lock = asyncio.Lock()
         # Single-flight buy lock per symbol — prevents paired duplicate paper_trades rows
         self._buy_execution_locks: dict[str, asyncio.Lock] = {}
+        self._sell_execution_locks: dict[str, asyncio.Lock] = {}
+        self._dust_writeoff_seen: dict[str, float] = {}
         # Global cash lock — prevents cross-symbol overdraw (two symbols passing cash check then both debiting)
         self._global_cash_lock: asyncio.Lock = asyncio.Lock()
 
@@ -2430,6 +2438,29 @@ class PortfolioEngine:
         # Ensure DB schema exists
         self._ensure_db_schema()
         self._load_churn_guard_state()
+        if not self.test_mode:
+            try:
+                from backend.services.live_fill_economics import apply_first_xrp_rt_correction
+
+                apply_first_xrp_rt_correction(self.db_path)
+            except Exception:
+                logger.exception("XRP_RT_ACCOUNTING_CORRECTION_FAILED")
+            try:
+                from backend.services.live_fill_economics import apply_eth_lot_integrity_correction
+
+                apply_eth_lot_integrity_correction(self.db_path)
+            except Exception:
+                logger.exception("ETH_LOT_INTEGRITY_CORRECTION_FAILED")
+            try:
+                from backend.services.live_close_integrity import classify_existing_rows, ensure_live_close_tables
+                from backend.utils.sqlite_runtime import connect_rw as _connect_rw_integrity
+
+                with _connect_rw_integrity(self.db_path) as _ic:
+                    ensure_live_close_tables(_ic)
+                    _ic.commit()
+                classify_existing_rows(self.db_path)
+            except Exception:
+                logger.exception("LIVE_CLOSE_CLASSIFICATION_FAILED")
 
         # STEP 1: Try to load from SQLite (deterministic restart)
         ledger_loaded = await self._load_ledger_from_sqlite()
@@ -2655,9 +2686,8 @@ class PortfolioEngine:
 
             old_principal = self.principal
             old_cash = self.cash_balance
-
-            # Calculate total account value: FREE USDT + positions value (available to trade)
-            new_principal = usdt_balance + self._positions_value
+            new_equity = usdt_balance + self._positions_value
+            _ = (old_principal, new_equity)
 
             # CRITICAL: Use FREE USDT so free_usdt in governor matches Binance US "free" balance
             self.cash_balance = usdt_balance
@@ -2666,12 +2696,11 @@ class PortfolioEngine:
             # Log cash balance update (always)
             if abs(self.cash_balance - old_cash) > 0.01:
                 logger.info(f"CASH_BALANCE_SYNC: Updated from ${old_cash:.2f} → ${self.cash_balance:.2f}")
-
-            # Only update principal if significantly different (avoid micro-adjustments)
-            if abs(new_principal - old_principal) > 1.0:
-                logger.warning(
-                    f"PRINCIPAL_SYNC: Updated principal from Binance US old=${old_principal:.2f} → new=${new_principal:.2f} (USDT=${usdt_balance:.2f} + positions=${self._positions_value:.2f})"
-                )
+            logger.info(
+                "PRINCIPAL_SYNC: contributed principal left unchanged at $%.8f; exchange equity=$%.8f",
+                old_principal,
+                new_equity,
+            )
 
             # Recompute total_equity = cash + positions_value (do not leave stale)
             await self._recompute_positions_values()
@@ -2683,7 +2712,11 @@ class PortfolioEngine:
                     self._account_status = AccountStatus.HEALTHY
                     logger.info("PRINCIPAL_SYNC: Account status changed to HEALTHY after principal update")
             else:
-                logger.info(f"PRINCIPAL_SYNC: Principal unchanged (Binance=${new_principal:.2f}, current=${old_principal:.2f})")
+                logger.info(
+                    "PRINCIPAL_SYNC: Principal unchanged (exchange_equity=$%.8f, current=$%.8f)",
+                    new_equity,
+                    old_principal,
+                )
 
             return True
 
@@ -2740,8 +2773,8 @@ class PortfolioEngine:
                 # BUG #12 FIX: Ensure pause logic does not apply to DUST_PENDING
                 # DUST_PENDING is excluded from all pause checks by design
                 price = getattr(position, "entry_price", 0) or 0
-                is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped, price)
-                if is_dust:
+                is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped if snapped > 0 else exchange_qty, price)
+                if is_dust or str(getattr(position, "status", "") or "") == "DUST_PENDING":
                     prior_notional = float(db_qty or 0.0) * float(price or 0.0)
                     if prior_notional >= 5.0 and float(db_qty or 0.0) > float(snapped or 0.0) + 1e-9:
                         logger.info(
@@ -2753,16 +2786,32 @@ class PortfolioEngine:
                         await self._handle_vanished_exchange_position(symbol, position, source="bootstrap_reconcile")
                         cleared_pause_for_mismatch = True
                         continue
-                    position.quantity = snapped
+                    from backend.services.live_exchange_equity import exact_dust_quantity
+
+                    exact = exact_dust_quantity(total_balances.get(base_asset, exchange_qty))
+                    position.quantity = float(exact)
+                    position.quantity_exact = format(exact, "f")
                     position.status = "DUST_PENDING"
-                    position.dust_qty_canonical = snapped
+                    position.dust_qty_canonical = float(exact)
                     position.dust_detected_at = time.time()
                     await self._persist_position_to_sqlite(position)
-                    logger.info("DUST_PENDING:%s ex_qty=%.12g reason=%s", symbol, exchange_qty, dust_reason or "below min")
+                    logger.info("DUST_PENDING:%s ex_qty=%s reason=%s", symbol, exact, dust_reason or "below min")
                     # Coordinate: Skip pause logic for dust (continue without pause)
                     continue
                 # Rule 2: DB differs -> set DB = exchange snapped, ACTIVE
-                if abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
+                from backend.services.live_fill_economics import active_lot_keeps_booked_qty
+
+                if str(getattr(position, "status", "") or "ACTIVE").upper() == "ACTIVE" and active_lot_keeps_booked_qty(booked_qty=db_qty, exchange_qty=exchange_qty):
+                    try:
+                        from backend.services.day_entry_spendable import money as _money_surplus
+                        from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
+
+                        surplus = _money_surplus(exchange_qty) - _money_surplus(db_qty)
+                        if surplus > 0:
+                            stamp_protected_preexisting_dust(self.db_path, symbol, surplus)
+                    except Exception:
+                        logger.debug("PROTECTED_DUST_SURPLUS_SKIPPED %s", symbol, exc_info=True)
+                elif abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
                     position.quantity = snapped
                     from backend.services.day_mandatory_exit_execution import STATUS_EXIT_RESIDUAL_PENDING
 
@@ -2782,9 +2831,8 @@ class PortfolioEngine:
             usdt_free = float(free_balances.get("USDT", 0) or 0)
             self.cash_balance = usdt_free
             self._available_balance = max(0.0, usdt_free)
-            # Recompute equity with fresh Binance cash (canonical: equity = cash + positions)
+            # Recompute equity with fresh Binance cash. Never overwrite contributed principal.
             self._total_equity = self.cash_balance + self._positions_value
-            self.principal = self._total_equity
             await self._persist_ledger_to_sqlite()
             self._compute_total_open_risk()
             self._last_live_reconcile_time = time.time()
@@ -2800,8 +2848,9 @@ class PortfolioEngine:
     ) -> None:
         """
         Import exchange balances that are not yet in engine positions.
-        Skip leftover dust. If an unclosed mystic BUY exists for the symbol,
-        reuse that trade_id and fill price instead of minting reconcile_import_*.
+        Genuine leftovers are retained as DUST_PENDING (no BUY, no realized P&L).
+        If an unclosed mystic BUY exists for the symbol, reuse that trade_id
+        and fill price instead of minting reconcile_import_*.
         Never adjust realized_pnl (do not treat as loss).
         """
         if not self._live_execution_enabled or not self._live_service:
@@ -2810,12 +2859,23 @@ class PortfolioEngine:
         qty_epsilon = 1e-10
         imported_any = False
         for asset, total_qty in total_balances.items():
-            if asset == "USDT" or (float(total_qty or 0) <= qty_epsilon):
+            if str(asset or "").upper() in ("USDT", "USD", "BUSD", "USDC"):
+                continue
+            if float(total_qty or 0) <= qty_epsilon:
                 continue
             symbol = normalize_symbol(f"{asset}/USDT")
             if not self._symbol_in_fixed_universe(symbol):
                 continue
+            exact_qty = str(total_qty)
             if symbol in self.open_positions:
+                existing = self.open_positions[symbol]
+                if str(getattr(existing, "status", "") or "") == "DUST_PENDING":
+                    await self._retain_exchange_dust(
+                        symbol=symbol,
+                        asset=str(asset),
+                        quantity=exact_qty,
+                        mark_hint=float(getattr(existing, "entry_price", 0) or 0),
+                    )
                 continue
             free_qty = float(free.get(asset, 0) or 0)
             if free_qty <= qty_epsilon:
@@ -2842,10 +2902,16 @@ class PortfolioEngine:
                     is_dust = True
                     dust_reason = dust_reason or "below min_notional"
                 if is_dust:
+                    await self._retain_exchange_dust(
+                        symbol=symbol,
+                        asset=str(asset),
+                        quantity=exact_qty if float(exact_qty or 0) > 0 else free_qty,
+                        mark_hint=price,
+                    )
                     logger.info(
-                        "LIVE_RECONCILE_IMPORT_SKIP_DUST symbol=%s qty=%s reason=%s",
+                        "LIVE_RECONCILE_DUST_RETAINED symbol=%s qty=%s reason=%s",
                         symbol,
-                        track_qty,
+                        exact_qty if float(exact_qty or 0) > 0 else free_qty,
                         dust_reason or "dust",
                     )
                     continue
@@ -2903,6 +2969,95 @@ class PortfolioEngine:
             await self._recompute_positions_values()
             await self._persist_ledger_to_sqlite()
 
+    async def _executable_bid(self, symbol: str, fallback: float = 0.0) -> tuple[float, str]:
+        try:
+            from backend.config.redis_config import get_redis_client
+            from backend.services.spread_book_telemetry import read_market_book
+
+            book = read_market_book(get_redis_client(), symbol)
+            bid = float((book or {}).get("bid") or (book or {}).get("best_bid") or 0.0)
+            if bid > 0:
+                return bid, "executable_bid"
+        except Exception:
+            pass
+        return float(fallback or 0.0), "last_price_fallback"
+
+    async def _retain_exchange_dust(
+        self,
+        *,
+        symbol: str,
+        asset: str,
+        quantity: object,
+        mark_hint: float = 0.0,
+    ) -> None:
+        """Keep exact exchange leftovers as DUST_PENDING. No BUY, slot, or realized P&L."""
+        from decimal import Decimal
+
+        from backend.services.live_exchange_equity import (
+            dust_trade_id,
+            persist_current_dust_snapshot,
+            should_import_exchange_dust,
+        )
+
+        qty = Decimal(str(quantity or "0"))
+        if qty <= 0:
+            return
+        exact = format(qty, "f")
+        existing = self.open_positions.get(symbol)
+        action = should_import_exchange_dust(
+            existing_status=str(getattr(existing, "status", "") or "") if existing else "",
+            existing_trade_id=str(getattr(existing, "trade_id", "") or "") if existing else "",
+            existing_qty=getattr(existing, "quantity_exact", "") or getattr(existing, "quantity", 0) if existing else 0,
+            exchange_qty=qty,
+        )
+        if action == "skip" and existing is not None:
+            return
+        bid, _src = await self._executable_bid(symbol, float(mark_hint or 0.0))
+        if bid <= 0:
+            bid = float(mark_hint or 0.0)
+        if bid <= 0:
+            logger.info("LIVE_RECONCILE_DUST_NO_MARK symbol=%s qty=%s", symbol, qty)
+            return
+        now = time.time()
+        if existing is not None and action == "update":
+            existing.quantity = float(qty)
+            existing.quantity_exact = exact
+            existing.dust_qty_canonical = float(qty)
+            existing.entry_price = bid
+            existing.status = "DUST_PENDING"
+            existing.dust_detected_at = float(getattr(existing, "dust_detected_at", 0) or now)
+            await self._persist_position_to_sqlite(existing)
+            return
+        position = OpenPosition(
+            symbol=symbol,
+            quantity=float(qty),
+            entry_price=bid,
+            entry_time=now,
+            trade_id=dust_trade_id(symbol),
+            stop_price=0.0,
+            take_profit_1_price=0.0,
+            take_profit_2_price=0.0,
+            trailing_stop_price=None,
+            tp1_hit=False,
+            highest_price=bid,
+            atr_at_entry=0.0,
+            entry_bar_timestamp=int(now),
+            confidence_at_entry=0.0,
+            status="DUST_PENDING",
+            dust_detected_at=now,
+            dust_qty_canonical=float(qty),
+            quantity_exact=exact,
+        )
+        self.open_positions[symbol] = position
+        await self._persist_position_to_sqlite(position)
+        try:
+            persist_current_dust_snapshot(
+                str(self.db_path),
+                [{"symbol": symbol, "asset": asset, "quantity": str(qty), "executable_bid": str(bid)}],
+            )
+        except Exception:
+            logger.debug("dust snapshot persist skipped", exc_info=True)
+
     async def run_live_reconcile(
         self,
         total_balances: dict[str, float],
@@ -2937,8 +3092,8 @@ class PortfolioEngine:
                 continue
             snapped = self._floor_to_step(exchange_qty, qty_step) if qty_step > 0 else exchange_qty
             price = getattr(position, "entry_price", 0) or 0
-            is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped, price)
-            if is_dust:
+            is_dust, _, dust_reason, _ = self._dust_check(symbol, snapped if snapped > 0 else exchange_qty, price)
+            if is_dust or str(getattr(position, "status", "") or "") == "DUST_PENDING":
                 prior_notional = float(db_qty or 0.0) * float(price or 0.0)
                 if prior_notional >= 5.0 and float(db_qty or 0.0) > float(snapped or 0.0) + 1e-9:
                     logger.info(
@@ -2950,15 +3105,31 @@ class PortfolioEngine:
                     await self._handle_vanished_exchange_position(symbol, position, source="periodic_reconcile")
                     self._metrics_reconciliation_adjustments += 1
                     continue
-                position.quantity = snapped
+                from backend.services.live_exchange_equity import exact_dust_quantity
+
+                exact = exact_dust_quantity(total_balances.get(base_asset, exchange_qty))
+                position.quantity = float(exact)
+                position.quantity_exact = format(exact, "f")
                 position.status = "DUST_PENDING"
-                position.dust_qty_canonical = snapped
+                position.dust_qty_canonical = float(exact)
                 position.dust_detected_at = time.time()
                 await self._persist_position_to_sqlite(position)
                 self._metrics_reconciliation_adjustments += 1
-                logger.info("DUST_PENDING:%s ex_qty=%.12g reason=%s", symbol, exchange_qty, dust_reason or "below min")
+                logger.info("DUST_PENDING:%s ex_qty=%s reason=%s", symbol, exact, dust_reason or "below min")
                 continue
-            if abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
+            from backend.services.live_fill_economics import active_lot_keeps_booked_qty
+
+            if str(getattr(position, "status", "") or "ACTIVE").upper() == "ACTIVE" and active_lot_keeps_booked_qty(booked_qty=db_qty, exchange_qty=exchange_qty):
+                try:
+                    from backend.services.day_entry_spendable import money as _money_surplus
+                    from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
+
+                    surplus = _money_surplus(exchange_qty) - _money_surplus(db_qty)
+                    if surplus > 0:
+                        stamp_protected_preexisting_dust(self.db_path, symbol, surplus)
+                except Exception:
+                    logger.debug("PROTECTED_DUST_SURPLUS_SKIPPED %s", symbol, exc_info=True)
+            elif abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
                 position.quantity = snapped
                 from backend.services.day_mandatory_exit_execution import STATUS_EXIT_RESIDUAL_PENDING
 
@@ -3074,6 +3245,30 @@ class PortfolioEngine:
             pass
         return None
 
+    def realized_pnl_by_mode(self) -> dict[str, float]:
+        """Realized PnL split by execution mode. Never sums paper into live."""
+        out = {"paper": 0.0, "live": 0.0}
+        try:
+            with connect_rw(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT COALESCE(LOWER(mode), 'paper') AS m, COALESCE(SUM(pnl), 0.0)
+                    FROM paper_trades
+                    WHERE side='SELL' AND pnl IS NOT NULL
+                      AND COALESCE(exit_type, '') NOT IN (
+                        'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
+                        'RESEARCH_RESET_EXIT', 'DUST_WRITEOFF'
+                      )
+                      AND COALESCE(is_synthetic, 0) = 0
+                    GROUP BY 1
+                    """
+                ).fetchall()
+            for m, total in rows:
+                out[str(m or "paper")] = float(total or 0.0)
+        except Exception as e:
+            logger.error("REALIZED_PNL_BY_MODE_FAILED: %s", e)
+        return out
+
     def _compute_realized_pnl_from_paper_trades(self, *, forward_epoch_only: bool | None = None) -> float:
         """
         CANONICAL SOURCE: Compute realized PnL directly from paper_trades table.
@@ -3095,10 +3290,12 @@ class PortfolioEngine:
                       )
                       AND COALESCE(is_synthetic, 0) = 0
                 """
-                params: tuple[Any, ...] = ()
+                mode = "live" if getattr(self, "_live_execution_enabled", False) else "paper"
+                sql += " AND COALESCE(LOWER(mode), 'paper') = ?"
+                params: tuple[Any, ...] = (mode,)
                 if forward_epoch_only and epoch_start:
                     sql += " AND timestamp >= ?"
-                    params = (epoch_start,)
+                    params = (mode, epoch_start)
                 cursor.execute(sql, params)
                 result = cursor.fetchone()
                 realized = float(result[0]) if result and result[0] is not None else 0.0
@@ -4585,6 +4782,17 @@ class PortfolioEngine:
             ("status", "TEXT DEFAULT 'ACTIVE'"),
             ("dust_detected_at", "REAL DEFAULT 0"),
             ("dust_qty_canonical", "REAL DEFAULT 0"),
+            # Entry identity chain. Without these a position could not be tied
+            # back to the decision that authorized it, the intent that armed it,
+            # the reservation that funded it, or the venue order and fills that
+            # created it -- reconciliation had to guess by symbol, quantity and
+            # time. entry_decision_id already existed but nothing populated it.
+            ("entry_decision_id", "TEXT DEFAULT ''"),
+            ("entry_intent_id", "TEXT DEFAULT ''"),
+            ("entry_reservation_id", "TEXT DEFAULT ''"),
+            ("entry_order_id", "TEXT DEFAULT ''"),
+            ("entry_client_order_id", "TEXT DEFAULT ''"),
+            ("entry_fill_ids_json", "TEXT DEFAULT '[]'"),
         ]:
             if col_name not in pos_cols:
                 try:
@@ -4812,6 +5020,10 @@ class PortfolioEngine:
             cursor.execute("ALTER TABLE portfolio_engine_ledger ADD COLUMN regime_state_json TEXT")
         if "startup_timestamp" not in ledger_cols:
             cursor.execute("ALTER TABLE portfolio_engine_ledger ADD COLUMN startup_timestamp TEXT")
+
+        from backend.services.live_close_integrity import ensure_live_close_tables
+
+        ensure_live_close_tables(cursor.connection)
 
         cursor.connection.commit()
 
@@ -5053,8 +5265,11 @@ class PortfolioEngine:
                             entry_fee, sleeve, entry_strategy_id,
                             repair_add_count, last_repair_add_ts, repair_add_trade_ids,
                             average_entry_after_repair, original_position_cost, thesis_json,
-                            status, dust_detected_at, dust_qty_canonical, last_updated
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            status, dust_detected_at, dust_qty_canonical,
+                            entry_decision_id, entry_intent_id, entry_reservation_id,
+                            entry_order_id, entry_client_order_id, entry_fill_ids_json,
+                            last_updated
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                         (
                             pos.symbol,
@@ -5084,6 +5299,12 @@ class PortfolioEngine:
                             status_val,
                             dust_at,
                             dust_qty,
+                            str(getattr(pos, "entry_decision_id", "") or ""),
+                            str(getattr(pos, "entry_intent_id", "") or ""),
+                            str(getattr(pos, "entry_reservation_id", "") or ""),
+                            str(getattr(pos, "entry_order_id", "") or ""),
+                            str(getattr(pos, "entry_client_order_id", "") or ""),
+                            str(getattr(pos, "entry_fill_ids_json", "[]") or "[]"),
                             timestamp,
                         ),
                     )
@@ -5137,8 +5358,9 @@ class PortfolioEngine:
                         atr_at_entry, entry_bar_timestamp, confidence,
                         fees_paid, slippage_cost, timestamp, status,
                         explainability_json, diagnostics_json, sleeve,
-                        entry_timestamp, decision_id, strategy_id, context_snapshot_json
-                    ) VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?)
+                        entry_timestamp, decision_id, strategy_id, context_snapshot_json,
+                        order_id
+                    ) VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     trade_bind,
                 )
@@ -5169,8 +5391,11 @@ class PortfolioEngine:
                         entry_fee, sleeve, entry_strategy_id,
                         repair_add_count, last_repair_add_ts, repair_add_trade_ids,
                         average_entry_after_repair, original_position_cost, thesis_json,
-                        status, dust_detected_at, dust_qty_canonical, last_updated
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        status, dust_detected_at, dust_qty_canonical,
+                        entry_decision_id, entry_intent_id, entry_reservation_id,
+                        entry_order_id, entry_client_order_id, entry_fill_ids_json,
+                        last_updated
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         position.symbol,
@@ -5200,6 +5425,12 @@ class PortfolioEngine:
                         status_val,
                         dust_at,
                         dust_qty,
+                        str(getattr(position, "entry_decision_id", "") or ""),
+                        str(getattr(position, "entry_intent_id", "") or ""),
+                        str(getattr(position, "entry_reservation_id", "") or ""),
+                        str(getattr(position, "entry_order_id", "") or ""),
+                        str(getattr(position, "entry_client_order_id", "") or ""),
+                        str(getattr(position, "entry_fill_ids_json", "[]") or "[]"),
                         timestamp,
                     ),
                 )
@@ -5456,7 +5687,7 @@ class PortfolioEngine:
                     n += 1
             except Exception:
                 continue
-        for psym in self._pending_buy_symbols():
+        for psym in self._pending_buy_order_symbols():
             if skip and normalize_symbol(psym) == skip:
                 continue
             if normalize_symbol(psym) in {normalize_symbol(s) for s in self.open_positions}:
@@ -5469,15 +5700,8 @@ class PortfolioEngine:
         return n
 
     def _intact_4h_slot_block(self, symbol: str) -> tuple[bool, str]:
-        try:
-            from backend.services.day_trade_thesis import htf_4h_rise_intact_for_symbol, intact_4h_slot_blocked
-
-            if not htf_4h_rise_intact_for_symbol(symbol):
-                return False, ""
-            if intact_4h_slot_blocked(open_intact=self._intact_4h_open_count(exclude=symbol), candidate_intact=True):
-                return True, "SAME_4H_THESIS_SLOT_CAP"
-        except Exception:
-            return False, ""
+        # 4H has no production trading authority (removed 2026-09-17).
+        # Slot management uses MAX_OPEN_POSITIONS only.
         return False, ""
 
     def _lookup_position_close_cooldown(self, symbol: str) -> float:
@@ -6260,9 +6484,10 @@ class PortfolioEngine:
         from backend.services.live_recovered_close_writer import RecoveredCloseFill, persist_recovered_close
 
         sym = normalize_symbol(symbol)
-        exchange_order_id = str(fill.get("trade_id") or "").strip()
-        if not exchange_order_id:
-            return {"skipped": True, "reason": "missing_exchange_order_id"}
+        exchange_order_id = str(fill.get("order_id") or fill.get("exchange_order_id") or "").strip()
+        venue_trade_ids = str(fill.get("venue_trade_id") or fill.get("trade_id") or "").strip()
+        if not exchange_order_id or not venue_trade_ids:
+            return {"skipped": True, "reason": "missing_real_venue_sell_identity"}
         exit_price = fill.get("exit_price")
         if exit_price is None or float(exit_price) <= 0:
             return {"skipped": True, "reason": "missing_exit_price"}
@@ -6274,6 +6499,7 @@ class PortfolioEngine:
             entry_price=float(position.entry_price or 0.0),
             exit_price=float(exit_price),
             exchange_sell_order_id=exchange_order_id,
+            venue_trade_ids=venue_trade_ids,
             closed_at_iso=closed_at_iso,
             closed_at_epoch=float(closed_at_epoch),
             source=str(source),
@@ -6516,8 +6742,8 @@ class PortfolioEngine:
                     """INSERT INTO paper_trades (
                         trade_id, paper_run_id, mode, symbol, side, quantity, price,
                         entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
-                        fees_paid, slippage_cost, exit_type, exit_reason, timestamp, status, strategy_id
-                    ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, 0, 'HUMAN_MANUAL_SELL', 'HUMAN_MANUAL_SELL', ?, 'executed', ?)""",
+                        fees_paid, slippage_cost, exit_type, exit_reason, timestamp, status, strategy_id, order_id
+                    ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, 0, 'HUMAN_MANUAL_SELL', 'HUMAN_MANUAL_SELL', ?, 'executed', ?, ?)""",
                     (
                         sell_trade_id,
                         paper_run_id,
@@ -6532,6 +6758,7 @@ class PortfolioEngine:
                         fee,
                         timestamp,
                         sid,
+                        str(fill.get("trade_id") or "") or None,
                     ),
                 )
                 if buy_tid:
@@ -6573,6 +6800,20 @@ class PortfolioEngine:
             try:
                 if symbol not in self.open_positions:
                     return  # Idempotent: already cleaned
+                if float(getattr(position, "quantity", 0) or 0) > 0:
+                    position.status = "DUST_PENDING"
+                    if float(getattr(position, "dust_qty_canonical", 0) or 0) <= 0:
+                        position.dust_qty_canonical = float(position.quantity)
+                    self.open_positions[symbol] = position
+                    logger.info(
+                        "DUST_PENDING_RETAIN: %s qty=%.12g (real residual, no writeoff)",
+                        symbol,
+                        float(position.quantity),
+                    )
+                    persist = getattr(self, "_persist_position_to_sqlite", None)
+                    if persist is not None:
+                        await persist(position)
+                    return
                 dust_qty = position.quantity
                 dust_entry = position.entry_price
                 dust_notional = dust_qty * dust_entry if dust_qty > 0 and dust_entry > 0 else 0.0
@@ -6583,54 +6824,39 @@ class PortfolioEngine:
                 self._compute_total_open_risk()
                 await self._delete_position_from_sqlite(symbol)
 
-                # Write dust_writeoff SELL to paper_trades so every BUY is accounted for
+                # Dust leftover is inventory, not a completed live strategy close.
                 try:
+                    from backend.services.live_close_integrity import persist_dust_inventory_event, persist_pending_close_event
+
                     normalized = normalize_symbol(symbol)
-                    sell_trade_id = f"dust_writeoff_{normalized.replace('/', '_')}_{int(time.time() * 1000)}"
-                    timestamp = datetime.now(timezone.utc).isoformat()
-                    paper_service = get_paper_trading_service()
-                    paper_run_id = getattr(paper_service, "paper_run_id", None) or "default"
-                    mode = "live" if self._live_service else "paper"
-                    dust_sid = str(getattr(position, "entry_strategy_id", "") or "").strip() or None
-
-                    def _write_dust_sell() -> None:
-                        with connect_managed(self.db_path) as conn:
-                            cur = conn.cursor()
-                            cur.execute(
-                                """INSERT INTO paper_trades (
-                                    trade_id, paper_run_id, mode, symbol, side, quantity, price,
-                                    entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
-                                    fees_paid, slippage_cost, exit_type, timestamp, status, strategy_id
-                                ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, 0, 0, 'DUST_WRITEOFF', ?, 'dust_writeoff', ?)""",
-                                (
-                                    sell_trade_id,
-                                    paper_run_id,
-                                    mode,
-                                    normalized,
-                                    dust_qty,
-                                    dust_entry,
-                                    dust_entry,
-                                    -dust_notional,
-                                    -1.0 if dust_notional > 0 else 0.0,
-                                    hold_seconds,
-                                    timestamp,
-                                    dust_sid,
-                                ),
-                            )
-                            # Zero out remaining_position on matching BUY(s)
-                            cur.execute(
-                                """UPDATE paper_trades
-                                   SET remaining_position = 0
-                                   WHERE symbol = ? AND side = 'BUY' AND remaining_position > 0""",
-                                (normalized,),
-                            )
-                            conn.commit()
-
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, _write_dust_sell)
-                    logger.info("DUST_SELL_RECORD: %s qty=%.8g entry=%.6f notional=%.4f trade_id=%s", symbol, dust_qty, dust_entry, dust_notional, sell_trade_id)
+                    persist_dust_inventory_event(
+                        self.db_path,
+                        symbol=normalized,
+                        quantity=float(dust_qty or 0.0),
+                        entry_price=float(dust_entry or 0.0),
+                        price_snapshot=float(dust_entry or 0.0),
+                        reason="CANONICAL_DUST_CLEANUP",
+                        est_notional=float(dust_notional or 0.0),
+                    )
+                    persist_pending_close_event(
+                        self.db_path,
+                        symbol=normalized,
+                        event_type="DUST_PENDING",
+                        exit_trigger="CANONICAL_DUST_CLEANUP",
+                        quantity=float(dust_qty or 0.0),
+                        price_snapshot=float(dust_entry or 0.0),
+                        detail="qty<=0 cleanup; no paper_trades SELL; no realized pnl",
+                    )
+                    logger.info(
+                        "DUST_INVENTORY_EVENT: %s qty=%.8g entry=%.6f notional=%.4f hold_s=%s",
+                        symbol,
+                        dust_qty,
+                        dust_entry,
+                        dust_notional,
+                        hold_seconds,
+                    )
                 except Exception as e:
-                    logger.warning("DUST_SELL_RECORD_FAILED: %s - %s (position still cleaned)", symbol, e)
+                    logger.warning("DUST_INVENTORY_EVENT_FAILED: %s - %s (position still cleaned)", symbol, e)
 
                 try:
                     if self._paper_service and symbol in getattr(self._paper_service, "positions", {}):
@@ -6674,9 +6900,10 @@ class PortfolioEngine:
         order_id = order.get("id")
         if not order_id or not self._live_service:
             return order
+        order = await self._attach_venue_trades(order, exchange_symbol)
         status = (order.get("status") or "").lower()
         if status in ("closed", "filled", "canceled", "cancelled", "expired"):
-            return order
+            return await self._attach_venue_trades(order, exchange_symbol)
         for _ in range(2):
             await asyncio.sleep(0.2 + 0.2 * random.random())
             res = await self._live_service.fetch_order("binanceus", str(order_id), exchange_symbol)
@@ -6684,7 +6911,16 @@ class PortfolioEngine:
                 break
             fetched = res.get("order", {})
             new_status = (fetched.get("status") or "").lower()
-            order = fetched
+            # Do not let the fetch reply erase the create reply's fills. Binance's
+            # GET /order carries no fills array, so replacing the order wholesale
+            # discarded the only copy of the per-fill venue trade ids.
+            from backend.services.protected_limit_execution import _merge_info_preserving_fills
+
+            merged = dict(fetched)
+            if not merged.get("trades") and order.get("trades"):
+                merged["trades"] = order["trades"]
+            merged["info"] = _merge_info_preserving_fills(order.get("info"), fetched.get("info"))
+            order = merged
             if new_status in ("closed", "filled", "canceled", "cancelled", "expired"):
                 break
         if (order.get("status") or "").lower() in ("partially_filled", "open"):
@@ -6696,7 +6932,28 @@ class PortfolioEngine:
                 order_id,
                 float(filled) if filled else 0,
             )
-        return order
+        return await self._attach_venue_trades(order, exchange_symbol)
+
+    async def _attach_venue_trades(self, order: dict[str, Any], exchange_symbol: str) -> dict[str, Any]:
+        """GET /order omits fills. myTrades is the venue commission authority."""
+        if not order or not self._live_service:
+            return order
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        if order.get("trades") or info.get("fills"):
+            return order
+        oid = str(order.get("id") or info.get("orderId") or "").strip()
+        if not oid:
+            return order
+        try:
+            from backend.services.live_fill_economics import merge_venue_trades_into_order
+
+            res = await self._live_service.fetch_order_trades("binanceus", exchange_symbol, oid)
+            if res.get("status") != "success":
+                return order
+            return merge_venue_trades_into_order(order, res.get("trades") or [])
+        except Exception:
+            logger.debug("ATTACH_VENUE_TRADES_SKIPPED order=%s", oid, exc_info=True)
+            return order
 
     def _prune_trade_explanations(self) -> None:
         """Ring-buffer cap: keep last TRADE_EXPLANATIONS_MAX by timestamp."""
@@ -7237,7 +7494,13 @@ class PortfolioEngine:
                            COALESCE(lowest_price, 0),
                            COALESCE(status, 'ACTIVE'),
                            COALESCE(dust_detected_at, 0),
-                           COALESCE(dust_qty_canonical, 0)
+                           COALESCE(dust_qty_canonical, 0),
+                           COALESCE(entry_decision_id, ''),
+                           COALESCE(entry_intent_id, ''),
+                           COALESCE(entry_reservation_id, ''),
+                           COALESCE(entry_order_id, ''),
+                           COALESCE(entry_client_order_id, ''),
+                           COALESCE(entry_fill_ids_json, '[]')
                     FROM portfolio_engine_positions
                 """)
                 rows = cursor.fetchall()
@@ -7282,6 +7545,15 @@ class PortfolioEngine:
             status_val = str(row[24]) if len(row) > 24 and row[24] else "ACTIVE"
             dust_at = float(row[25]) if len(row) > 25 else 0.0
             dust_qty = float(row[26]) if len(row) > 26 else 0.0
+            # Entry identity chain. Restart adoption depends on these surviving
+            # the round trip, or the adopted position loses its link to the
+            # decision, intent, reservation and venue order that created it.
+            entry_decision_id = str(row[27]) if len(row) > 27 and row[27] else ""
+            entry_intent_id = str(row[28]) if len(row) > 28 and row[28] else ""
+            entry_reservation_id = str(row[29]) if len(row) > 29 and row[29] else ""
+            entry_order_id = str(row[30]) if len(row) > 30 and row[30] else ""
+            entry_client_order_id = str(row[31]) if len(row) > 31 and row[31] else ""
+            entry_fill_ids_json = str(row[32]) if len(row) > 32 and row[32] else "[]"
             pos = OpenPosition(
                 symbol=normalized_symbol,
                 quantity=row[1],
@@ -7323,6 +7595,12 @@ class PortfolioEngine:
                 trail_pct=float(thesis_payload.get("trail_pct") or 0.0),
                 exit_residual_reason=str(thesis_payload.get("exit_residual_reason") or ""),
                 exit_residual_since=float(thesis_payload.get("exit_residual_since") or 0.0),
+                entry_decision_id=entry_decision_id,
+                entry_intent_id=entry_intent_id,
+                entry_reservation_id=entry_reservation_id,
+                entry_order_id=entry_order_id,
+                entry_client_order_id=entry_client_order_id,
+                entry_fill_ids_json=entry_fill_ids_json,
             )
             from backend.services.day_inventory_recovery import apply_legacy_tags_from_thesis
 
@@ -7363,6 +7641,15 @@ class PortfolioEngine:
             )
 
         self.open_positions = rebuilt
+        try:
+            from backend.services.live_exchange_equity import load_protected_preexisting_dust
+
+            for _sym, _pos in self.open_positions.items():
+                if float(getattr(_pos, "protected_dust_qty", 0) or 0) > 0:
+                    continue
+                _pos.protected_dust_qty = float(load_protected_preexisting_dust(self.db_path, _sym))
+        except Exception:
+            logger.debug("PROTECTED_DUST_HYDRATE_SKIPPED", exc_info=True)
 
         if allow_mutations:
             # Backfill entry_fee from paper_trades for positions with entry_fee=0 (join trade_id -> fees_paid)
@@ -8264,6 +8551,9 @@ class PortfolioEngine:
         explainability: TradeExplainability,
         decision_id: str = "",
         sleeve: str = "",
+        entry_authority: str = "",
+        client_order_id: str = "",
+        trailing_buy_intent_id: str = "",
     ) -> dict[str, Any] | None:
         """
         SOLE EXECUTION POINT FOR BUYS — thin locking wrapper.
@@ -8280,14 +8570,27 @@ class PortfolioEngine:
         atomic with respect to any other concurrent buy attempt for the same
         symbol, regardless of unrelated async scheduling/reload timing.
         """
+        from backend.config.day_entry_execution import ENTRY_AUTHORITY_TRAILING_BUY, trailing_buy_mode_active
+
+        if trailing_buy_mode_active() and str(entry_authority or "") != ENTRY_AUTHORITY_TRAILING_BUY:
+            logger.error(
+                "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH symbol=%s authority=%s — trailing-buy is the only automated DAY BUY",
+                symbol,
+                entry_authority or "missing",
+            )
+            self.last_buy_reject_reason = "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH"
+            self._persist_buy_reject_hold(symbol, decision_id=decision_id, intent_id=trailing_buy_intent_id)
+            return None
         normalized_symbol_for_lock = normalize_symbol(symbol)
         # PE-3: Hard-gate — only DAY_TRADE_SYMBOLS may execute buys.
         if _to_api_symbol(symbol) not in DAY_TRADE_SYMBOLS:
             logger.debug("[BUY_GATE] %s not in trading universe, rejecting from execute_buy_fifo", symbol)
+            self.last_buy_reject_reason = "SYMBOL_NOT_EXECUTABLE"
+            self._persist_buy_reject_hold(symbol, decision_id=decision_id, intent_id=trailing_buy_intent_id)
             return None
         lock = self._buy_execution_locks.setdefault(normalized_symbol_for_lock, asyncio.Lock())
         async with lock:
-            return await self._execute_buy_fifo_locked(
+            bought = await self._execute_buy_fifo_locked(
                 symbol,
                 quantity,
                 price,
@@ -8298,7 +8601,13 @@ class PortfolioEngine:
                 explainability,
                 decision_id=decision_id,
                 sleeve=sleeve,
+                entry_authority=entry_authority,
+                client_order_id=client_order_id,
+                trailing_buy_intent_id=trailing_buy_intent_id,
             )
+            if bought is None:
+                self._persist_buy_reject_hold(symbol, decision_id=decision_id, intent_id=trailing_buy_intent_id)
+            return bought
 
     async def _execute_buy_fifo_locked(
         self,
@@ -8312,6 +8621,9 @@ class PortfolioEngine:
         explainability: TradeExplainability,
         decision_id: str = "",
         sleeve: str = "",
+        entry_authority: str = "",
+        client_order_id: str = "",
+        trailing_buy_intent_id: str = "",
     ) -> dict[str, Any] | None:
         """
         SOLE EXECUTION POINT FOR BUYS
@@ -8323,6 +8635,9 @@ class PortfolioEngine:
 
         Updates authoritative ledger on success and persists to SQLite + audit.
         """
+        from backend.config.day_entry_execution import is_trailing_buy_confirmed
+
+        trailing_confirmed = is_trailing_buy_confirmed(entry_authority)
         # Capture pre-ledger for audit
         pre_ledger = {
             "cash_balance": self.cash_balance,
@@ -8383,7 +8698,14 @@ class PortfolioEngine:
 
         # Fail-closed for all DAY paths — no ML artifact bypass (day_aw_owner_v1).
         ok_ac, ac_code, ac_detail = evaluate_explainability_artifact_contract(explainability)
-        if not ok_ac:
+        if not ok_ac and trailing_confirmed:
+            logger.info(
+                "TELEMETRY_ARTIFACT_CONTRACT symbol=%s code=%s detail=%s (DAY_TRAILING_BUY_CONFIRMED — not enforced)",
+                symbol,
+                ac_code,
+                ac_detail,
+            )
+        elif not ok_ac:
             logger.warning(
                 "BUY_BLOCKED_ARTIFACT_CONTRACT: %s code=%s detail=%s",
                 symbol,
@@ -8401,6 +8723,7 @@ class PortfolioEngine:
                     detail=str(ac_code or ""),
                     decision_id=str(decision_id or ""),
                 )
+            self.last_buy_reject_reason = ac_code or "ARTIFACT_CONTRACT_BLOCKED"
             await self._record_reject(
                 symbol,
                 "BUY",
@@ -8429,7 +8752,14 @@ class PortfolioEngine:
         self._hydrate_explainability_entry_context_from_redis_if_missing(normalize_symbol(symbol), explainability)
 
         ok_ec, ec_code, ec_detail = evaluate_explainability_at_execution(explainability)
-        if not ok_ec:
+        if not ok_ec and trailing_confirmed:
+            logger.info(
+                "TELEMETRY_ENTRY_CONTEXT symbol=%s code=%s (DAY_TRAILING_BUY_CONFIRMED — not enforced)",
+                symbol,
+                ec_code,
+            )
+            logger.info("TELEMETRY_ENTRY_EXIT_CONSISTENCY symbol=%s (telemetry only)", symbol)
+        elif not ok_ec:
             redis_ctx_ts_utc = ""
             try:
                 redis_ctx_payload, _redis_ctx_age = self._get_context_payload(symbol)
@@ -8534,7 +8864,13 @@ class PortfolioEngine:
                 context_payload=ctx_payload_ec,
                 thesis_score=float(getattr(explainability, "thesis_score", 0.0) or 0.0),
             )
-            if not consistency.get("allowed"):
+            if not consistency.get("allowed") and trailing_confirmed:
+                logger.info(
+                    "TELEMETRY_ENTRY_EXIT_CONSISTENCY symbol=%s reason=%s (DAY_TRAILING_BUY_CONFIRMED — not enforced)",
+                    symbol,
+                    consistency.get("block_reason"),
+                )
+            elif not consistency.get("allowed"):
                 block_code = str(consistency.get("block_reason") or "ENTRY_EXIT_INCONSISTENT")
                 logger.warning(
                     "BUY_BLOCKED_ENTRY_EXIT_INCONSISTENT symbol=%s reason=%s immediate=%s invalid_at_entry=%s",
@@ -8946,9 +9282,90 @@ class PortfolioEngine:
         else:
             fill_price = price * (1 + SLIPPAGE_PCT)
             exec_fee_rate = TAKER_FEE
+        try:
+            from backend.services.day_controlled_exits import last_look_buy_mark
+
+            look_px = last_look_buy_mark(
+                decision_price=float(price or 0.0),
+                expected_fill=float(getattr(preflight, "expected_avg_fill", 0.0) or 0.0),
+                best_bid=float(getattr(preflight, "best_bid", 0.0) or 0.0),
+                best_ask=float(getattr(preflight, "best_ask", 0.0) or 0.0),
+                limit_price=float(getattr(preflight, "protected_limit_price", 0.0) or 0.0),
+            )
+            if look_px > 0:
+                logger.info(
+                    "TELEMETRY_LAST_LOOK symbol=%s look_px=%.8f decision_px=%.8f BUY_BLOCKED_LAST_LOOK=never LAST_LOOK_ENTRY_EXIT=telemetry_only",
+                    normalized_symbol,
+                    look_px,
+                    float(price or 0.0),
+                )
+        except Exception:
+            logger.exception("LAST_LOOK_PRE_BUY_ERROR symbol=%s", normalized_symbol)
         fee = quantity * fill_price * exec_fee_rate
         notional = quantity * fill_price
         total_cost = notional + fee
+
+        from backend.services.day_entry_spendable import money as _money
+        from backend.services.day_entry_spendable import plan_executable_buy
+
+        own_res, own_ns = self._own_entry_reservation(normalized_symbol, str(decision_id or ""))
+        own_reserved = bool(decision_id) and str(own_res.get("decision_id") or "") == str(decision_id or "")
+        pending_other = self._pending_buy_notional(
+            exclude_symbol=own_ns if own_reserved else "",
+            exclude_decision_id=str(decision_id or "") if own_reserved else "",
+        )
+        constraints = self._symbol_constraints.get(symbol) or self._symbol_constraints.get(normalized_symbol) or {}
+        cash_plan = plan_executable_buy(
+            requested_qty=quantity,
+            price=fill_price,
+            commission_rate=exec_fee_rate,
+            spendable=_money(self._available_balance) - _money(pending_other),
+            qty_step=constraints.get("qty_step") or 0,
+            min_qty=constraints.get("min_qty") or 0,
+            min_notional=constraints.get("min_notional") or 0,
+            slippage_rate=0,
+            allocation=own_res.get("notional") if own_reserved else None,
+        )
+        if not cash_plan.ok:
+            self.last_buy_reject_reason = cash_plan.reason
+            logger.warning(
+                "BUY_BLOCKED_EXECUTABLE_CASH: %s reason=%s requested=%s spendable=%s",
+                symbol,
+                cash_plan.reason,
+                cash_plan.requested_quantity,
+                cash_plan.spendable,
+            )
+            await self._record_reject(
+                symbol,
+                "BUY",
+                cash_plan.reason,
+                "EXECUTABLE_CASH",
+                decision_id=decision_id,
+                explainability=explainability,
+            )
+            if decision_id:
+                await self._update_pipeline_decision(
+                    decision_id,
+                    {
+                        "stage": "EXECUTION",
+                        "execution_result": "NOT_EXECUTED",
+                        "execution_reason": cash_plan.reason,
+                    },
+                )
+            return None
+        if cash_plan.shrunk or cash_plan.quantity != _money(quantity):
+            logger.info(
+                "BUY_QTY_SHRUNK_TO_SPENDABLE symbol=%s from=%s to=%s total_cost=%s spendable=%s",
+                symbol,
+                quantity,
+                cash_plan.quantity,
+                cash_plan.total_cost,
+                cash_plan.spendable,
+            )
+        quantity = float(cash_plan.quantity)
+        fee = float(cash_plan.commission)
+        notional = float(cash_plan.notional)
+        total_cost = float(cash_plan.total_cost)
 
         # Hard per-position size cap — respects MAX_POSITION_SIZE_USD env var (0 = disabled)
         if MAX_POSITION_SIZE_USD > 0 and total_cost > MAX_POSITION_SIZE_USD:
@@ -8971,7 +9388,7 @@ class PortfolioEngine:
         # =================================================================
         # SOLE EXECUTION GATE - all discipline checks
         # =================================================================
-        can_open, block_reason = await self._can_open_position(symbol, total_cost)
+        can_open, block_reason = await self._can_open_position(symbol, total_cost, decision_id=str(decision_id or ""))
         if not can_open:
             logger.warning(f"BUY_BLOCKED: {symbol} - {block_reason}")
             _gate_id = "CASH_OR_SLOTS"
@@ -9098,55 +9515,6 @@ class PortfolioEngine:
         except Exception:
             _ctx_snapshot = "{}"
 
-        def _sync_insert():
-            def _op() -> None:
-                with connect_rw(self.db_path) as conn:
-                    conn.execute("BEGIN IMMEDIATE")
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        """
-                        INSERT INTO paper_trades (
-                            trade_id, paper_run_id, mode, symbol, side, quantity, price,
-                            remaining_position, stop_price, take_profit_price,
-                            atr_at_entry, entry_bar_timestamp, confidence,
-                            fees_paid, slippage_cost, timestamp, status,
-                            explainability_json, diagnostics_json, sleeve,
-                            entry_timestamp, decision_id, strategy_id, context_snapshot_json
-                        ) VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                        (
-                            trade_id,
-                            paper_run_id,
-                            buy_mode,
-                            symbol,
-                            quantity,
-                            fill_price,
-                            quantity,  # remaining_position = full quantity
-                            stop_price,
-                            tp1_price,
-                            atr,
-                            bar_timestamp,
-                            confidence,
-                            fee,
-                            slippage_cost,  # ACCOUNTING REPAIR: total cost, not price delta
-                            timestamp,
-                            json.dumps(explainability.to_dict()),
-                            json.dumps(protected_audit),
-                            effective_sleeve,
-                            timestamp,
-                            decision_id or None,
-                            buy_strategy_id,
-                            _ctx_snapshot,
-                        ),
-                    )
-                    conn.commit()
-
-            try:
-                run_locked_retry(_op)
-            except Exception as e:
-                logger.error(f"PAPER_TRADES_BUY_INSERT_FAILED: {symbol} - {e}", exc_info=True)
-                raise  # PE-2: fail-closed — propagate so cash is NOT debited
-
         # =================================================================
         # LIVE EXECUTION: Execute on Binance.US FIRST (C1 fix: never persist executed BUY before order success)
         # LiveAdapter gate: refuse unless EXECUTION_MODE=live AND LIVE_TRADES_ALLOWED=true
@@ -9243,6 +9611,51 @@ class PortfolioEngine:
                     fee,
                     comm.fee_from_exchange,
                 )
+                _entry_fill_ids: list[str] = []
+                try:
+                    from backend.services.live_order_identity import extract_identity, record_fill
+
+                    _identity = extract_identity(
+                        live_order_buy,
+                        symbol=symbol,
+                        side="BUY",
+                        mystic_trade_id=str(trade_id or ""),
+                        intent_id=str(trailing_buy_intent_id or ""),
+                        decision_id=str(decision_id or ""),
+                        client_order_id=str(client_order_id or ""),
+                        fallback_qty=float(quantity),
+                        fallback_price=float(fill_price),
+                        fee_amount=float(fee),
+                        fee_items=list(getattr(comm, "items", ()) or ()),
+                        fee_from_exchange=bool(comm.fee_from_exchange),
+                    )
+                    await asyncio.to_thread(record_fill, self.db_path, _identity)
+                    _entry_fill_ids = list(_identity.fill_ids)
+                except Exception:
+                    logger.exception(
+                        "LIVE_BUY_IDENTITY_RECORD_FAILED symbol=%s order=%s trade=%s",
+                        symbol,
+                        live_order_buy.get("id"),
+                        trade_id,
+                    )
+                if trailing_buy_intent_id:
+                    try:
+                        from backend.services.day_trailing_buy_store import mark_order_accepted as _mark_accepted
+
+                        await asyncio.to_thread(
+                            _mark_accepted,
+                            self.db_path,
+                            str(trailing_buy_intent_id),
+                            order_id=str(live_order_buy.get("id") or ""),
+                            fill_id=str(live_order_buy.get("fill_id") or ""),
+                            trade_id=str(trade_id or ""),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "TRAILING_BUY_ACCEPT_STAMP_FAILED intent=%s order=%s — retry guard not armed",
+                            trailing_buy_intent_id,
+                            live_order_buy.get("id"),
+                        )
             except Exception as e:
                 logger.exception(f"LIVE_BUY_ERROR: {symbol} - {e}")
                 await self._record_reject(
@@ -9268,7 +9681,9 @@ class PortfolioEngine:
         # between this check and the debit below.
         async with self._global_cash_lock:
             pending_other = self._pending_buy_notional(exclude_symbol=symbol)
-            free_cash = float(self._available_balance) - pending_other
+            from backend.services.day_entry_spendable import money as _money_cash
+
+            free_cash = float(_money_cash(self._available_balance) - _money_cash(pending_other))
             if total_cost > free_cash:
                 reason = f"total_cost=${total_cost:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_other:.2f})"
                 logger.error(f"BUY_BLOCKED_CASH_INVARIANT: {symbol} - {reason}")
@@ -9301,6 +9716,18 @@ class PortfolioEngine:
         # Build the position object BEFORE any money write. Memory and Redis
         # stay unchanged until the atomic OPEN commits.
         effective_sleeve = sleeve or assign_sleeve(normalized_symbol, confidence)
+
+        _protected_dust = 0.0
+        _existing_lot = self.open_positions.get(normalized_symbol)
+        if _existing_lot is not None and str(getattr(_existing_lot, "status", "") or "").upper() == "DUST_PENDING":
+            from backend.services.day_entry_spendable import money as _money_dust
+            from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
+
+            _protected_dust = float(_money_dust(getattr(_existing_lot, "quantity_exact", "") or _existing_lot.quantity))
+            try:
+                stamp_protected_preexisting_dust(self.db_path, normalized_symbol, _protected_dust)
+            except Exception:
+                logger.debug("PROTECTED_DUST_STAMP_SKIPPED %s", normalized_symbol, exc_info=True)
 
         position = OpenPosition(
             symbol=normalized_symbol,
@@ -9345,6 +9772,7 @@ class PortfolioEngine:
             strategy_family=str(getattr(explainability, "strategy_family", "") or ""),
             legacy_pre_regime_router=False,
             opened_under_router=True,
+            protected_dust_qty=_protected_dust,
         )
         if live_order_buy and (live_order_buy.get("_mystic_partial_fill") or live_order_buy.get("_mystic_ioc_incomplete")):
             is_dust, _, dust_reason, _ = self._dust_check(normalized_symbol, quantity, fill_price)
@@ -9370,6 +9798,18 @@ class PortfolioEngine:
             thesis_invalid_level=float(position.thesis_invalid_level or 0.0),
             thesis_target_level=float(position.thesis_target_level or 0.0),
         )
+        # Entry identity chain. Stamped before any money write so the position
+        # can never exist without a link back to the decision that authorized
+        # it, the intent that armed it, the reservation that funded it and the
+        # venue order that created it.
+        position.entry_decision_id = str(decision_id or "")
+        position.entry_intent_id = str(trailing_buy_intent_id or "")
+        position.entry_client_order_id = str(client_order_id or "")
+        position.entry_reservation_id = str((self._entry_reservations.get(normalized_symbol) or {}).get("reservation_id") or "")
+        if live_order_buy:
+            position.entry_order_id = str(live_order_buy.get("id") or "")
+            position.entry_fill_ids_json = json.dumps(_entry_fill_ids)
+
         explainability.setup_type = str(position.entry_thesis or explainability.setup_type or "")
         explainability.entry_thesis = str(position.entry_thesis or explainability.entry_thesis or "")
         explainability.thesis_invalid_level = float(position.thesis_invalid_level or 0.0)
@@ -9423,6 +9863,9 @@ class PortfolioEngine:
             decision_id or None,
             buy_strategy_id,
             _ctx_snapshot,
+            # Exchange order id on the trade row itself, so a FIFO row can be
+            # tied back to the venue without guessing by quantity and time.
+            str((live_order_buy or {}).get("id") or "") or None,
         )
         try:
             await asyncio.to_thread(
@@ -9476,7 +9919,7 @@ class PortfolioEngine:
                 _tel_conn.commit()
 
         async with self._global_cash_lock:
-            self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
+            self._consume_entry_reservation(symbol, decision_id=str(decision_id or ""))
             _entry_reserved = False
             self.cash_balance = committed_cash
             self._available_balance = max(0.0, self.cash_balance)
@@ -10089,6 +10532,41 @@ class PortfolioEngine:
             still_open, remaining = self._entry_lot_still_open_sync(symbol, entry_trade_id)
         return not (still_open and remaining + 1e-09 >= qty)
 
+    async def _finalize_dust_without_strategy_close(
+        self,
+        *,
+        symbol: str,
+        position: OpenPosition,
+        quantity: float,
+        exit_trigger: str,
+        price_snapshot: float,
+        reason: str,
+        est_notional: float,
+    ) -> None:
+        """Leftover dust is inventory, not a completed live strategy close."""
+        from backend.services.live_close_integrity import persist_dust_inventory_event
+
+        position.status = "DUST_PENDING"
+        position.dust_detected_at = time.time()
+        position.dust_qty_canonical = float(position.quantity or quantity or 0.0)
+        booked = persist_dust_inventory_event(
+            self.db_path,
+            symbol=symbol,
+            quantity=float(quantity or position.quantity or 0.0),
+            entry_price=float(position.entry_price or 0.0),
+            price_snapshot=float(price_snapshot or 0.0),
+            reason=str(reason or exit_trigger or "DUST"),
+            est_notional=float(est_notional or 0.0),
+        )
+        await self._persist_position_to_sqlite(position)
+        logger.warning(
+            "DUST_PENDING_NO_STRATEGY_CLOSE symbol=%s qty=%.8f booked=%s exit=%s",
+            symbol,
+            float(quantity or 0.0),
+            booked,
+            exit_trigger,
+        )
+
     async def execute_legacy_inventory_cleanup(self, symbol: str) -> dict[str, Any] | None:
         """Close pre-router legacy DAY inventory; excluded from new-regime scoreboard."""
         from backend.services.day_trade_thesis import EXIT_LEGACY_INVENTORY_CLEANUP
@@ -10134,6 +10612,33 @@ class PortfolioEngine:
         return result
 
     async def execute_sell_fifo(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        exit_type: ExitType,
+        exit_trigger: str,
+        current_bar: int | None = None,
+        force_sell: bool = False,
+    ) -> dict[str, Any] | None:
+        """Serialize sells per symbol, then run the FIFO sell."""
+        locks = getattr(self, "_sell_execution_locks", None)
+        if locks is None:
+            self._sell_execution_locks = {}
+            locks = self._sell_execution_locks
+        lock = locks.setdefault(normalize_symbol(symbol), asyncio.Lock())
+        async with lock:
+            return await self._execute_sell_fifo_locked(
+                symbol,
+                quantity,
+                price,
+                exit_type,
+                exit_trigger,
+                current_bar=current_bar,
+                force_sell=force_sell,
+            )
+
+    async def _execute_sell_fifo_locked(
         self,
         symbol: str,
         quantity: float,
@@ -10451,6 +10956,23 @@ class PortfolioEngine:
                 with connect_rw(self.db_path) as conn:
                     conn.execute("BEGIN IMMEDIATE")
                     cursor = conn.cursor()
+                    from backend.services.execution_mode_service import is_live_execution_allowed_sync as _live_ok
+                    from backend.services.live_close_integrity import live_order_has_venue_fill as _has_fill
+
+                    if dust_writeoff:
+                        logger.error(
+                            "FIFO_SELL_REFUSED_DUST_WRITEOFF symbol=%s — dust is not a completed strategy close",
+                            normalized_symbol,
+                        )
+                        conn.rollback()
+                        return False
+                    if (_live_ok() or self._live_execution_enabled) and not _has_fill(live_order_sell):
+                        logger.error(
+                            "FIFO_SELL_REFUSED_NO_VENUE_FILL symbol=%s — completed trade writer unreachable",
+                            normalized_symbol,
+                        )
+                        conn.rollback()
+                        return False
 
                     # PHASE 2 FIX: Use AUTHORITATIVE ledger (portfolio_engine_positions) not paper_trades
                     # Since MAX_OPEN_PER_SYMBOL=1, there's exactly one position per symbol
@@ -10735,8 +11257,8 @@ class PortfolioEngine:
                                 fees_paid, slippage_cost, exit_type, exit_r_multiple,
                                 timestamp, status, explainability_json, diagnostics_json, sleeve,
                                 exit_reason, entry_timestamp, decision_id, strategy_id,
-                                pnl_usd_net, pnl_pct_net
-                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                pnl_usd_net, pnl_pct_net, order_id
+                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                             (
                                 sell_trade_id,
@@ -10764,6 +11286,7 @@ class PortfolioEngine:
                                 sell_strategy_id,
                                 pnl_usd_net,
                                 pnl_pct_net,
+                                str((live_order_sell or {}).get("id") or "") or None,
                             ),
                         )
                     else:
@@ -10774,8 +11297,8 @@ class PortfolioEngine:
                                 entry_price, pnl, pnl_pct, remaining_position, hold_time_seconds,
                                 fees_paid, slippage_cost, exit_type, exit_r_multiple,
                                 timestamp, status, explainability_json, diagnostics_json, sleeve,
-                                exit_reason, entry_timestamp, decision_id, strategy_id
-                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                exit_reason, entry_timestamp, decision_id, strategy_id, order_id
+                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                             (
                                 sell_trade_id,
@@ -10801,6 +11324,7 @@ class PortfolioEngine:
                                 entry_ts_bind or None,
                                 buy_decision_id or None,
                                 sell_strategy_id,
+                                str((live_order_sell or {}).get("id") or "") or None,
                             ),
                         )
 
@@ -10970,9 +11494,33 @@ class PortfolioEngine:
                         free_balances = balance.get("balance", {}).get("free", {})
                         base_coin = exchange_symbol[:-4] if exchange_symbol.endswith("USDT") else exchange_symbol
                         free_balance = float(free_balances.get(base_coin, 0))
-                        if free_balance < quantity:
-                            logger.warning(f"LIVE_SELL_QTY_ADJUST: {symbol} requested={quantity:.8f} free_balance={free_balance:.8f}")
-                            actual_sold_qty = free_balance
+                        from backend.services.live_exchange_equity import load_protected_preexisting_dust
+                        from backend.services.live_fill_economics import plan_sell_quantity
+
+                        protected = float(getattr(position, "protected_dust_qty", 0) or 0)
+                        if protected <= 0:
+                            protected = float(load_protected_preexisting_dust(self.db_path, normalized_symbol))
+                        await self._ensure_symbol_constraints(symbol)
+                        constraints = self._symbol_constraints.get(symbol) or {}
+                        qty_step = float(constraints.get("qty_step") or 0)
+                        planned = plan_sell_quantity(
+                            net_active_qty=position.quantity,
+                            exchange_free_qty=free_balance,
+                            protected_dust_qty=protected,
+                            qty_step=qty_step,
+                        )
+                        if float(planned.sellable) + 1e-15 < quantity or protected > 0:
+                            logger.warning(
+                                "LIVE_SELL_QTY_PROTECTED %s requested=%.8f net_active=%.8f free=%.8f protected=%.8f sellable=%.8f residual=%.8f",
+                                symbol,
+                                quantity,
+                                float(position.quantity),
+                                free_balance,
+                                protected,
+                                float(planned.sellable),
+                                float(planned.residual),
+                            )
+                        actual_sold_qty = float(planned.sellable)
                 except Exception as bal_err:
                     logger.warning(f"LIVE_SELL_BALANCE_CHECK_FAILED: {symbol} - {bal_err}, using original qty")
 
@@ -10999,6 +11547,15 @@ class PortfolioEngine:
                     actual_sold_qty = qty_quantized
                     dust_reason_str = dust_reason
                     dust_est_notional_val = est_notional
+                    seen = getattr(self, "_dust_writeoff_seen", None)
+                    if seen is None:
+                        self._dust_writeoff_seen = {}
+                        seen = self._dust_writeoff_seen
+                    dust_key = f"{normalized_symbol}:{float(position.quantity):.12g}"
+                    if dust_key in seen:
+                        logger.warning("DUST_WRITEOFF_ALREADY_BOOKED symbol=%s qty=%s", symbol, actual_sold_qty)
+                        return None
+                    seen[dust_key] = time.time()
                     logger.warning(
                         "LIVE_SELL_DUST_WRITEOFF symbol=%s qty=%s reason=%s est_notional=%s",
                         symbol,
@@ -11226,6 +11783,15 @@ class PortfolioEngine:
                 actual_sold_qty = qty_quantized
                 dust_reason_str = dust_reason
                 dust_est_notional_val = est_notional
+                seen = getattr(self, "_dust_writeoff_seen", None)
+                if seen is None:
+                    self._dust_writeoff_seen = {}
+                    seen = self._dust_writeoff_seen
+                dust_key = f"{normalized_symbol}:{float(position.quantity):.12g}"
+                if dust_key in seen:
+                    logger.warning("DUST_WRITEOFF_ALREADY_BOOKED symbol=%s qty=%s", symbol, actual_sold_qty)
+                    return None
+                seen[dust_key] = time.time()
                 logger.info(
                     "PAPER_SELL_DUST_WRITEOFF symbol=%s qty=%s reason=%s est_notional=%s",
                     symbol,
@@ -11240,6 +11806,70 @@ class PortfolioEngine:
                         position.dust_qty_canonical = position.quantity
                     await self._persist_position_to_sqlite(position)
                     return None
+
+        if dust_writeoff:
+            await self._finalize_dust_without_strategy_close(
+                symbol=normalized_symbol,
+                position=position,
+                quantity=float(actual_sold_qty or 0.0),
+                exit_trigger=str(exit_trigger or ""),
+                price_snapshot=float(price or 0.0),
+                reason=str(dust_reason_str or "DUST"),
+                est_notional=float(dust_est_notional_val or 0.0),
+            )
+            return None
+
+        from backend.services.live_close_integrity import claim_economic_close, live_order_has_venue_fill, persist_pending_close_event
+
+        live_expected = bool(is_live_execution_allowed_sync() or self._live_execution_enabled)
+        if live_expected:
+            if not live_order_has_venue_fill(live_order_sell):
+                persist_pending_close_event(
+                    self.db_path,
+                    symbol=normalized_symbol,
+                    event_type="LIVE_CLOSE_NO_VENUE_FILL",
+                    exit_trigger=str(exit_trigger or ""),
+                    quantity=float(actual_sold_qty or 0.0),
+                    price_snapshot=float(price or 0.0),
+                    detail="exit decision without exchange fill; no realized pnl",
+                )
+                await self._record_reject(
+                    normalized_symbol,
+                    "SELL",
+                    "LIVE_CLOSE_NO_VENUE_FILL",
+                    "VENUE_FILL_REQUIRED",
+                )
+                logger.error(
+                    "LIVE_CLOSE_BLOCKED_NO_VENUE_FILL symbol=%s exit=%s qty=%.8f",
+                    normalized_symbol,
+                    exit_trigger,
+                    float(actual_sold_qty or 0.0),
+                )
+                return None
+            oid = str((live_order_sell or {}).get("id") or "").strip()
+            if not claim_economic_close(
+                self.db_path,
+                oid,
+                "SELL",
+                mystic_trade_id=str(getattr(position, "trade_id", "") or ""),
+                symbol=normalized_symbol,
+            ):
+                logger.warning(
+                    "LIVE_SELL_IDEMPOTENT_SKIP symbol=%s order=%s",
+                    normalized_symbol,
+                    oid,
+                )
+                persist_pending_close_event(
+                    self.db_path,
+                    symbol=normalized_symbol,
+                    event_type="LIVE_CLOSE_DUPLICATE_VENUE_FILL",
+                    exit_trigger=str(exit_trigger or ""),
+                    quantity=float(actual_sold_qty or 0.0),
+                    price_snapshot=float(price or 0.0),
+                    exchange_order_id=oid,
+                    detail="venue fill already attributed",
+                )
+                return None
 
         # =================================================================
         # Phase 4: Recompute all money math AFTER final quantity is known
@@ -11338,6 +11968,7 @@ class PortfolioEngine:
                 )
 
         base_qty_reduction = 0.0
+        comm = None
         if dust_writeoff:
             fee = 0.0
             proceeds = 0.0
@@ -11378,6 +12009,30 @@ class PortfolioEngine:
         sell_sqlite_ok = False
         self._exit_in_progress.add(normalized_symbol)
         try:
+            if live_order_sell and not dust_writeoff:
+                try:
+                    from backend.services.live_order_identity import extract_identity, record_fill
+
+                    _sell_identity = extract_identity(
+                        live_order_sell,
+                        symbol=symbol,
+                        side="SELL",
+                        mystic_trade_id=str(getattr(position, "trade_id", "") or ""),
+                        decision_id=str(getattr(position, "decision_id", "") or ""),
+                        fallback_qty=float(quantity),
+                        fallback_price=float(fill_price),
+                        fee_amount=float(fee),
+                        fee_items=list(getattr(comm, "items", ()) or ()) if live_order_sell else [],
+                        fee_from_exchange=bool(getattr(comm, "fee_from_exchange", False)) if live_order_sell else False,
+                    )
+                    await asyncio.to_thread(record_fill, self.db_path, _sell_identity)
+                except Exception:
+                    logger.exception(
+                        "LIVE_SELL_IDENTITY_RECORD_FAILED symbol=%s order=%s trade=%s",
+                        symbol,
+                        (live_order_sell or {}).get("id"),
+                        getattr(position, "trade_id", ""),
+                    )
             # =================================================================
             # BUG #10 FIX: Acquire FIFO sell lock to prevent concurrent sells of same position
             async with self._fifo_sell_lock:
@@ -11402,6 +12057,12 @@ class PortfolioEngine:
                     self._apply_sell_cash_credit(proceeds, realized_pnl, dust_writeoff=dust_writeoff)
                 self._mtm_after_confirmed_sell(normalized_symbol, float(fill_price or price or 0.0))
                 await self._persist_ledger_to_sqlite()
+                try:
+                    from backend.services.live_exchange_equity import clear_protected_preexisting_dust
+
+                    clear_protected_preexisting_dust(self.db_path, normalized_symbol)
+                except Exception:
+                    logger.debug("PROTECTED_DUST_CLEAR_SKIPPED %s", normalized_symbol, exc_info=True)
 
             try:
                 from backend.services.simplified_pnl_observation import record_trade_close
@@ -11613,6 +12274,34 @@ class PortfolioEngine:
             )
             if sell_preflight_audit is not None:
                 sell_preflight_audit["fill_fee_audit"] = _ffa_audit
+            evidence = dict(getattr(position, "_exit_decision_evidence", None) or {})
+            if evidence:
+                from backend.services.day_controlled_exits import _trail_semantics
+                from backend.services.exit_decision_evidence import build_exit_decision_evidence
+
+                trail_info = _trail_semantics(
+                    entry=float(position.entry_price or 0.0),
+                    current_price=float(fill_price or 0.0),
+                    position=position,
+                    coin_profile=get_coin_profile(normalized_symbol),
+                    path_aware=True,
+                    atr_pct=0.01,
+                    bundle=None,
+                )
+                evidence.update(
+                    build_exit_decision_evidence(
+                        controlling_exit_family=str(exit_trigger or ""),
+                        trail_info=trail_info,
+                        position=position,
+                        executable_bid=float(price or 0.0) or None,
+                        submitted_price=float(price or 0.0) or None,
+                        fill_price=float(fill_price or 0.0) or None,
+                    )
+                )
+                if sell_preflight_audit is None:
+                    sell_preflight_audit = {}
+                sell_preflight_audit["exit_decision_evidence"] = evidence
+                position._exit_decision_evidence = evidence
 
         with contextlib.suppress(Exception):
             from backend.services.trade_performance_tracker import log_trade_performance
@@ -11819,6 +12508,32 @@ class PortfolioEngine:
 
         return any(is_exit_residual_pending(p) for p in self.open_positions.values())
 
+    def _count_live_slots(self) -> int:
+        """Occupied live slots: active positions/orders only. DUST_PENDING never counts."""
+        n = 0
+        for pos in self.open_positions.values():
+            if str(getattr(pos, "status", "ACTIVE") or "ACTIVE") == "DUST_PENDING":
+                continue
+            if float(getattr(pos, "quantity", 0) or 0) <= 0:
+                continue
+            n += 1
+        pending = getattr(self, "_pending_buy_symbols", None)
+        pending_syms = set()
+        if callable(pending):
+            try:
+                pending_syms = {str(s) for s in pending() or []}
+            except Exception:
+                pending_syms = set()
+        try:
+            pending_syms |= {str(s) for s in self._pending_buy_order_symbols()}
+        except Exception:
+            pass
+        reservations = getattr(self, "_entry_reservations", None) or {}
+        pending_syms |= {str(s) for s in reservations}
+        open_syms = {str(s) for s, p in self.open_positions.items() if str(getattr(p, "status", "ACTIVE") or "") != "DUST_PENDING"}
+        n += len(pending_syms - open_syms)
+        return n
+
     def _sleeve_position_count(self, sleeve: str) -> int:
         """Count active (non-DUST_PENDING) positions in a given sleeve."""
         return sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING" and (getattr(p, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value) == sleeve)
@@ -11895,7 +12610,7 @@ class PortfolioEngine:
 
     def _get_active_sleeve_state(self) -> dict[str, Any]:
         """Report the active sleeve/router state for open positions explicitly (never None dict)."""
-        n_open = len(self.open_positions)
+        n_open = self._count_live_slots()
         max_pos = MAX_OPEN_POSITIONS
         # Pick a representative open position for active_* fields (first one)
         active_sleeve = "ACTIVE"
@@ -12059,14 +12774,25 @@ class PortfolioEngine:
             return list(candidates), None
 
         if hold:
-            logger.warning(
-                "BUY_BLOCKED_GOVERNANCE hold_reason=%s tier=%s consec=%s dd_pct=%.2f",
-                hold,
-                result.drawdown_tier,
-                consec,
-                float(dd_pct or 0.0) * 100.0,
-            )
-            return [], hold
+            from backend.config.day_entry_execution import trailing_buy_mode_active
+
+            if hold == "HOLD_CONSEC_LOSSES" and trailing_buy_mode_active():
+                logger.info(
+                    "HOLD_CONSEC_LOSSES_TELEMETRY governance_hold ignored for trailing-buy arming tier=%s consec=%s",
+                    result.drawdown_tier,
+                    consec,
+                )
+                self._last_governance_hold_reason = "HOLD_CONSEC_LOSSES"
+                hold = None
+            else:
+                logger.warning(
+                    "BUY_BLOCKED_GOVERNANCE hold_reason=%s tier=%s consec=%s dd_pct=%.2f",
+                    hold,
+                    result.drawdown_tier,
+                    consec,
+                    float(dd_pct or 0.0) * 100.0,
+                )
+                return [], hold
 
         allowed: list[BuyCandidate] = []
         for info in result.allowed_candidates:
@@ -12104,27 +12830,55 @@ class PortfolioEngine:
         reservations = getattr(self, "_entry_reservations", None) or {}
         armed = {normalize_symbol(s) for s in (getattr(self, "_trailing_buy_arms", None) or {})}
         return set(reservations.keys()) | self._pending_buy_order_symbols() | armed
+<<<<<<< HEAD
+=======
 
-    def _pending_buy_notional(self, *, exclude_symbol: str = "") -> float:
+    def _pending_buy_notional(self, *, exclude_symbol: str = "", exclude_decision_id: str = ""):
+        from backend.services.day_entry_spendable import money
+>>>>>>> origin/fix/candle-pipeline-4h-authority-20260917
+
         ex = normalize_symbol(exclude_symbol) if exclude_symbol else ""
-        n = 0.0
+        skip_did = str(exclude_decision_id or "").strip()
+        n = money(0)
         for sym, r in (getattr(self, "_entry_reservations", None) or {}).items():
+            if skip_did and str((r or {}).get("decision_id") or "") == skip_did:
+                continue
             if ex and normalize_symbol(sym) == ex:
                 continue
-            n += float((r or {}).get("notional") or 0.0)
+            n += money((r or {}).get("notional") or 0)
         for p in (getattr(self, "_pending_orders", None) or {}).values():
             if str(getattr(p, "side", "") or "").upper() != "BUY":
                 continue
             if ex and normalize_symbol(getattr(p, "symbol", "") or "") == ex:
                 continue
+<<<<<<< HEAD
             n += float(getattr(p, "remaining_qty", 0.0) or 0.0) * float(getattr(p, "price", 0.0) or 0.0)
         for sym, arm in (getattr(self, "_trailing_buy_arms", None) or {}).items():
             if ex and normalize_symbol(sym) == ex:
                 continue
             qty = float(getattr(arm, "quantity", 0.0) or 0.0)
             px = float(getattr(arm, "last_ask", 0.0) or getattr(arm, "initial_ask", 0.0) or 0.0)
+=======
+            n += money(getattr(p, "remaining_qty", 0) or 0) * money(getattr(p, "price", 0) or 0)
+        for sym, arm in (getattr(self, "_trailing_buy_arms", None) or {}).items():
+            if ex and normalize_symbol(sym) == ex:
+                continue
+            qty = money(getattr(arm, "quantity", 0) or 0)
+            px = money(getattr(arm, "last_ask", 0) or getattr(arm, "initial_ask", 0) or 0)
+>>>>>>> origin/fix/candle-pipeline-4h-authority-20260917
             n += qty * px
         return n
+
+    def _own_entry_reservation(self, symbol: str, decision_id: str = "") -> tuple[dict[str, Any], str]:
+        ns = normalize_symbol(symbol)
+        reservations = getattr(self, "_entry_reservations", None) or {}
+        did = str(decision_id or "").strip()
+        if did:
+            for key, row in reservations.items():
+                if str((row or {}).get("decision_id") or "") == did:
+                    return dict(row or {}), normalize_symbol(key) or ns
+        row = reservations.get(ns) or reservations.get(symbol) or {}
+        return dict(row or {}), ns
 
     def _try_reserve_entry(
         self,
@@ -12134,6 +12888,7 @@ class PortfolioEngine:
         decision_id: str = "",
         risk_usd: float = 0.0,
         sleeve: str = "",
+        ttl_sec: float | None = None,
     ) -> tuple[bool, str]:
         """Reserve cash/slot/symbol/risk/sleeve under caller-held `_global_cash_lock`.
 
@@ -12160,9 +12915,18 @@ class PortfolioEngine:
         max_positions_limit = MAX_OPEN_POSITIONS
         if active_count + pending_slots >= max_positions_limit:
             return False, "MAX_POSITIONS_WITH_PENDING"
-        pending_n = self._pending_buy_notional()
-        if float(notional_usd) > float(self._available_balance) - pending_n + 1e-9:
-            return False, f"INSUFFICIENT_CASH_WITH_PENDING: need ${float(notional_usd):.2f}, free=${max(0.0, float(self._available_balance) - pending_n):.2f}"
+        from backend.services.day_entry_spendable import plan_reservation, spendable_quote
+
+        pending_n = self._pending_buy_notional(exclude_decision_id=did)
+        spendable = spendable_quote(
+            account_cash=self._available_balance,
+            other_reservations=pending_n,
+            include_own_reservation=False,
+        )
+        ok_res, reserved_amt, res_reason = plan_reservation(target=notional_usd, remaining_cash=spendable)
+        if not ok_res:
+            return False, res_reason
+        notional_usd = reserved_amt
         # Sleeve capacity including pending reserved notional for same sleeve
         if sleeve and ENABLE_SLEEVE_BLOCKING:
             sleeve_pending = sum(float((r or {}).get("notional") or 0.0) for r in (self._entry_reservations or {}).values() if str((r or {}).get("sleeve") or "") == str(sleeve))
@@ -12174,14 +12938,16 @@ class PortfolioEngine:
             try:
                 from backend.services.day_entry_reservations import create_reservation
 
-                ok_p, reason_p, reservation_id = create_reservation(
-                    self.db_path,
-                    decision_id=did,
-                    symbol=ns,
-                    notional_usd=float(notional_usd),
-                    risk_usd=float(risk_usd or 0.0),
-                    sleeve=str(sleeve or ""),
-                )
+                reserve_kwargs = {
+                    "decision_id": did,
+                    "symbol": ns,
+                    "notional_usd": float(notional_usd),
+                    "risk_usd": float(risk_usd or 0.0),
+                    "sleeve": str(sleeve or ""),
+                }
+                if ttl_sec is not None:
+                    reserve_kwargs["ttl_sec"] = float(ttl_sec)
+                ok_p, reason_p, reservation_id = create_reservation(self.db_path, **reserve_kwargs)
                 if not ok_p:
                     return False, reason_p
                 if reason_p == "IDEMPOTENT_EXISTING":
@@ -12205,6 +12971,17 @@ class PortfolioEngine:
             "ts": time.time(),
         }
         return True, "OK"
+
+    def _consume_entry_reservation(self, symbol: str, *, decision_id: str = "") -> None:
+        """A filled BUY spends the reservation. CONSUMED, not RELEASED."""
+        ns = normalize_symbol(symbol)
+        meta = self._entry_reservations.pop(ns, None) or {}
+        did = str(decision_id or meta.get("decision_id") or "")
+        rid = str(meta.get("reservation_id") or "")
+        with contextlib.suppress(Exception):
+            from backend.services.day_entry_reservations import consume_reservation
+
+            consume_reservation(self.db_path, reservation_id=rid, decision_id=did, symbol=ns)
 
     def _release_entry_reservation(self, symbol: str, *, decision_id: str = "", reason: str = "RELEASED") -> None:
         ns = normalize_symbol(symbol)
@@ -12238,7 +13015,7 @@ class PortfolioEngine:
             if rows:
                 logger.info("DAY_RESERVATIONS_RECOVERED count=%s", len(rows))
 
-    async def _can_open_position(self, symbol: str, notional_usd: float) -> tuple[bool, str]:
+    async def _can_open_position(self, symbol: str, notional_usd: float, *, decision_id: str = "") -> tuple[bool, str]:
         """
         PHASE 2: Check if new position is allowed.
 
@@ -12312,6 +13089,22 @@ class PortfolioEngine:
                         symbol,
                         _ts_reason,
                     )
+                    try:
+                        from backend.services.day_decision_state import build_hold_record, classify_hold_category, persist_hold_record
+
+                        persist_hold_record(
+                            str(self.db_path),
+                            build_hold_record(
+                                symbol=str(symbol or ""),
+                                category=classify_hold_category(reject_reason=f"COOLDOWN:{_ts_reason}"),
+                                reason=f"TRADE_STATE:{_ts_reason}",
+                                authority="_can_open_position",
+                                required={"trade_state": "IDLE"},
+                                observed={"trade_state_reason": str(_ts_reason)},
+                            ),
+                        )
+                    except Exception:
+                        logger.debug("hold-state cooldown persist skipped", exc_info=True)
                     return False, f"TRADE_STATE:{_ts_reason}"
             except Exception as _ts_err:
                 logger.warning("trade_state gate error for %s: %s — allowing entry (fail-open)", symbol, _ts_err)
@@ -12331,8 +13124,11 @@ class PortfolioEngine:
             if live_cap is not None:
                 max_positions_limit = live_cap
         if symbol in self._pending_buy_symbols():
-            logger.info(f"BUY_BLOCKED_PENDING_ENTRY: {symbol} - reservation or pending buy already exists")
-            return False, "ENTRY_RESERVED_OR_PENDING"
+            own_res, _own_ns = self._own_entry_reservation(symbol, str(decision_id or ""))
+            own_reserved = bool(decision_id) and str(own_res.get("decision_id") or "") == str(decision_id or "")
+            if not own_reserved:
+                logger.info(f"BUY_BLOCKED_PENDING_ENTRY: {symbol} - reservation or pending buy already exists")
+                return False, "ENTRY_RESERVED_OR_PENDING"
         if active_count + pending_slots >= max_positions_limit:
             if PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK:
                 logger.info(
@@ -12452,15 +13248,35 @@ class PortfolioEngine:
 
         # CRITICAL: Check cash available (enforce conservation of money)
         # Pending entry reservations and in-flight BUY orders reduce free cash.
-        pending_notional = self._pending_buy_notional()
-        free_cash = float(self._available_balance) - pending_notional
+        # The submitting intent's own reservation is spendable.
+        from backend.services.day_entry_spendable import money
+
+        own_res, own_ns = self._own_entry_reservation(symbol, str(decision_id or ""))
+        own_reserved = bool(decision_id) and str(own_res.get("decision_id") or "") == str(decision_id or "")
+        pending_notional = self._pending_buy_notional(
+            exclude_symbol=own_ns if own_reserved else "",
+            exclude_decision_id=str(decision_id or "") if own_reserved else "",
+        )
+        free_cash = money(self._available_balance) - money(pending_notional)
         if free_cash <= 0:
-            logger.warning(f"BUY_BLOCKED_NO_CASH: {symbol} - available_balance=${self._available_balance:.2f} pending=${pending_notional:.2f}")
+            logger.warning(
+                "BUY_BLOCKED_NO_CASH: %s - available_balance=%s pending=%s",
+                symbol,
+                money(self._available_balance),
+                money(pending_notional),
+            )
             return False, "INSUFFICIENT_CASH"
 
-        if notional_usd > free_cash:
-            logger.info(f"BUY_BLOCKED_INSUFFICIENT_CASH: {symbol} - notional=${notional_usd:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_notional:.2f})")
-            return False, f"INSUFFICIENT_CASH: need ${notional_usd:.2f}, have ${free_cash:.2f}"
+        if money(notional_usd) - money("0.00000001") > free_cash:
+            logger.info(
+                "BUY_BLOCKED_INSUFFICIENT_CASH: %s - notional=%s > free=%s (available=%s pending=%s)",
+                symbol,
+                money(notional_usd),
+                free_cash,
+                money(self._available_balance),
+                money(pending_notional),
+            )
+            return False, f"INSUFFICIENT_CASH: need {money(notional_usd)} have {free_cash}"
 
         # Check portfolio risk cap (include reserved entry risk when present)
         total_open_risk = self._calculate_total_open_risk()
@@ -12478,18 +13294,28 @@ class PortfolioEngine:
         # account, position, cash, or risk rejection.
         if ENABLE_GOVERNANCE_ENFORCEMENT and not governance_risk_governor_shadow_only():
             try:
+                from backend.config.day_entry_execution import trailing_buy_mode_active
+
                 loss_hold_until = await self._get_loss_hold_until()
                 if loss_hold_until is not None and now_wall < float(loss_hold_until):
                     _, consec = await self.get_rolling_24h_risk_metrics()
                     if consec >= MAX_CONSEC_LOSSES:
                         self._last_governance_hold_reason = "HOLD_CONSEC_LOSSES"
-                        logger.warning(
-                            "BUY_BLOCKED_HOLD_CONSEC_LOSSES symbol=%s consec=%s remaining=%.0fs",
-                            symbol,
-                            consec,
-                            float(loss_hold_until) - now_wall,
-                        )
-                        return False, "HOLD_CONSEC_LOSSES"
+                        if trailing_buy_mode_active():
+                            logger.info(
+                                "HOLD_CONSEC_LOSSES_TELEMETRY symbol=%s consec=%s remaining=%.0fs (not an entry veto)",
+                                symbol,
+                                consec,
+                                float(loss_hold_until) - now_wall,
+                            )
+                        else:
+                            logger.warning(
+                                "BUY_BLOCKED_HOLD_CONSEC_LOSSES symbol=%s consec=%s remaining=%.0fs",
+                                symbol,
+                                consec,
+                                float(loss_hold_until) - now_wall,
+                            )
+                            return False, "HOLD_CONSEC_LOSSES"
             except Exception as _lh_err:
                 logger.debug("loss_hold check skipped: %s", _lh_err)
 
@@ -12697,6 +13523,26 @@ class PortfolioEngine:
 
             if exit_result:
                 exits_executed.append(exit_result)
+            else:
+                try:
+                    from backend.services.day_decision_state import (
+                        OPEN_POSITION_HOLD,
+                        build_hold_record,
+                        persist_hold_record,
+                    )
+
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=str(symbol),
+                            category=OPEN_POSITION_HOLD,
+                            reason="NO_EXIT_CONDITION",
+                            authority="monitor_all_positions/_check_exit_conditions",
+                            observed={"mark": current_price, "qty": float(getattr(position, "quantity", 0) or 0)},
+                        ),
+                    )
+                except Exception:
+                    logger.debug("hold-state open-position persist skipped", exc_info=True)
 
         self._exit_mark_price_source_stale = any_stale_marks
 
@@ -12889,8 +13735,35 @@ class PortfolioEngine:
                 managed.get("4h_bundle_present"),
                 managed.get("extreme_protection_fired"),
             )
-            profit_exit = exit_reason.startswith(EXIT_NET_PROFIT) or exit_reason == EXIT_PATH_EXECUTABLE_PROFIT
+            # EXIT_TAKE_PROFIT_1 is the authorized 1.4% coin-profile take-profit.
+            # It must map to ExitType.TAKE_PROFIT_1 (and therefore force_sell
+            # False) like the other profit exits; leaving it out would book a
+            # reached profit objective as a forced MANUAL exit.
+            from backend.services.day_controlled_exits import EXIT_TAKE_PROFIT_1
+
+            profit_exit = exit_reason.startswith(EXIT_NET_PROFIT) or exit_reason in (
+                EXIT_PATH_EXECUTABLE_PROFIT,
+                EXIT_TAKE_PROFIT_1,
+            )
             exit_type = ExitType.TAKE_PROFIT_1 if profit_exit else ExitType.MANUAL
+            from backend.services.day_controlled_exits import _trail_semantics
+            from backend.services.exit_decision_evidence import build_exit_decision_evidence
+
+            position._exit_decision_evidence = build_exit_decision_evidence(
+                controlling_exit_family=exit_reason,
+                trail_info=_trail_semantics(
+                    entry=entry_price,
+                    current_price=current_price,
+                    position=position,
+                    coin_profile=coin_profile,
+                    path_aware=True,
+                    atr_pct=0.01,
+                    bundle=bundle_obj,
+                ),
+                position=position,
+                executable_bid=float(current_price or 0.0) or None,
+                submitted_price=float(current_price or 0.0) or None,
+            )
             return await self.execute_sell_fifo(
                 symbol,
                 quantity,
@@ -12943,41 +13816,8 @@ class PortfolioEngine:
         # different achievable MFE distributions; global 0.4% starved wins on
         # low-vol coins pre-2026-08-10.
         _min_net_profit = float(_mnp_for_sym(symbol))
-        try:
-            from backend.services.day_trade_thesis import day_4h_structure_snapshot as _day_4h_snap
-        except Exception:
-            _day_4h_snap = lambda _b: {"htf_4h_rise_broken": False, "htf_4h_rise_intact": False, "4h_bundle_missing": True}  # noqa: E731
-        _snap4 = _day_4h_snap(bundle_obj)
-        if not _snap4.get("htf_4h_rise_broken"):
-            # Trend intact. Profit-taking stays reachable here on purpose: gating it
-            # behind a structure break means profit can only ever be booked after the
-            # move has already been given back. The floor keeps it from degrading into
-            # the scalp clips this engine is not supposed to take.
-            _intact_floor = day_intact_profit_floor(
-                entry_price=entry_price,
-                prior_4h_low=float(_snap4.get("prior_4h_low") or 0.0),
-                min_net_profit=_min_net_profit,
-            )
-            if net_pnl_pct < _intact_floor:
-                logger.info(
-                    "DAY_4H_HOLD_NO_SCALP_CLIP symbol=%s net_pct=%.6f intact_floor=%.6f intact=%s bundle_present=%s prior_4h_low=%s current_4h_close=%s skip=tp1_partial_and_leftover_net_profit",
-                    symbol,
-                    net_pnl_pct,
-                    _intact_floor,
-                    _snap4.get("htf_4h_rise_intact"),
-                    _snap4.get("4h_bundle_present"),
-                    _snap4.get("prior_4h_low"),
-                    _snap4.get("current_4h_close"),
-                )
-                return None
-            logger.warning(
-                "DAY_4H_INTACT_PROFIT_TAKE symbol=%s net_pct=%.6f >= intact_floor=%.6f prior_4h_low=%s current_4h_close=%s",
-                symbol,
-                net_pnl_pct,
-                _intact_floor,
-                _snap4.get("prior_4h_low"),
-                _snap4.get("current_4h_close"),
-            )
+        # 4H profit floor gate removed (2026-09-17). TP1 and net-profit exits
+        # fire on their own merit without 4H structure permission.
         if _tp1_enabled and not getattr(position, "tp1_hit", False):
             _tp1_price = float(getattr(position, "take_profit_1_price", 0) or 0)
             if _tp1_price > 0 and current_price >= _tp1_price and net_pnl_pct + 1e-12 >= _min_net_profit * 0.45:
@@ -15259,28 +16099,40 @@ class PortfolioEngine:
             _api_symbol,
             _slash_symbol,
             decide_day_bar,
+            next_executable_path_ev_symbol,
         )
         from backend.services.decision_book_tape import record_day_bar_authority
 
+        # Telemetry-only 4H labels: THESIS_ENTRY_4H_INVALIDATION / no_clear_thesis_4h_invalidation
+        # never restore 4H buy/sell authority.
         decision = decide_day_bar(db_path=str(self.db_path or ""), candidates=list(valid_candidates or []))
         with contextlib.suppress(Exception):
             record_day_bar_authority(decision)
         self._last_day_path_ev_decision = decision
         if not str(decision.get("selected_action") or "").upper().startswith("BUY"):
             return None, decision
-        want = _api_symbol(str(decision.get("selected_symbol") or ""))
-        found = None
-        for cand in list(valid_candidates or []) + list(getattr(self, "current_bar_candidates", None) or []):
-            if _api_symbol(getattr(cand, "symbol", "")) == want:
-                found = cand
-                break
-        if found is None:
+        pool = list(valid_candidates or []) + list(getattr(self, "current_bar_candidates", None) or [])
+        by_api: dict[str, Any] = {}
+        for cand in pool:
+            api = _api_symbol(getattr(cand, "symbol", ""))
+            if api and api not in by_api:
+                by_api[api] = cand
+        picked = next_executable_path_ev_symbol(decision, executable_symbols=set(by_api))
+        if picked is None:
             decision = dict(decision)
             decision["selected_action"] = "HOLD"
             decision["why_selected"] = "PATH_NET_NO_SCORED_CANDIDATE"
             decision["true_safety_reject_reason"] = "PATH_NET_NO_SCORED_CANDIDATE"
             self._last_day_path_ev_decision = decision
             return None, decision
+        want, auth_pick = picked
+        found = by_api[want]
+        if want != _api_symbol(str(decision.get("selected_symbol") or "")):
+            decision = dict(decision)
+            decision["selected_action"] = f"BUY_{want}"
+            decision["selected_symbol"] = want
+            decision["selected_ev"] = float(auth_pick)
+            decision["why_selected"] = "PATH_NET_FALLBACK_EXECUTABLE"
         found.decision_data = dict(found.decision_data or {})
         cand_ev = 0.0
         with contextlib.suppress(Exception):
@@ -15314,225 +16166,461 @@ class PortfolioEngine:
         bar_candidate_snapshot: list,
         pipeline_done: set[str],
     ) -> int:
-        """Fill remaining open DAY slots with other buy-intent symbols on the same bar.
-
-        Primary selection still ranks; this only executes extras already queued in
-        ``self._bar_extra_buy_candidates`` (unheld, buy-intent, ranked). Returns
-        how many additional buys executed.
-        """
+        """Old-rank extras do not execute. Trailing-buy is the only automated DAY BUY."""
         extras = list(getattr(self, "_bar_extra_buy_candidates", None) or [])
         self._bar_extra_buy_candidates = []
-        # Direct four-coin path-EV buys one coin or HOLD. Old-rank extras do not execute.
         if extras:
             logger.info("MULTI_BUY_SKIP_OLD_RANK extras=%s", [getattr(c, "symbol", "") for c in extras])
         return 0
+
+    async def _arm_trailing_buy_ranked_stream(
+        self,
+        *,
+        ranked_candidates: list[BuyCandidate],
+        stream_candidates: list[BuyCandidate],
+        bar_timestamp: int,
+        path_ev_decision: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Arm ranked top-4 candidates. Path-EV BUY/HOLD is telemetry only."""
+        from backend.config.redis_config import get_redis_client
+        from backend.services.day_trailing_buy import (
+            arm_selected_candidate,
+            available_economic_slots,
+            fresh_executable_book,
+            select_ranked_arm_stream,
+        )
+        from backend.services.day_trailing_buy_store import load_active_intents
+
+        pool = select_ranked_arm_stream(ranked_candidates, stream_candidates)
         try:
             max_pos = int(os.getenv("MAX_OPEN_POSITIONS", str(getattr(self, "max_positions", 4) or 4)))
         except Exception:
             max_pos = 4
-        filled = 0
-        for cand in extras:
-            if len(self.open_positions) >= max_pos:
-                break
-            if cand.symbol in self.open_positions:
-                continue
-            symbol = cand.symbol
-            try:
-                await self._entry_ensure_constraints(symbol)
-                equity = self._total_equity
-                perf = self.coin_performance.get(symbol)
-                sizing_mult = perf.sizing_multiplier if perf else 1.0
-                strategy_id_for_size = str((cand.decision_data or {}).get("live_ai_strategy") or "day").strip().lower()
-                top_meta_score = float((cand.decision_data or {}).get("final_selection_score") or (cand.decision_data or {}).get("selection_score") or cand.rank_score())
-                top_net_ev = self._estimate_candidate_net_expected_value(cand.decision_data or {}, symbol=str(symbol or ""))
-                from backend.services.day_direct_path_ev_authority import HOLD_EV as _MIN_EV
+        slots = available_economic_slots(
+            held=self._day_entry_held_count(),
+            pending_orders=len(self._pending_buy_order_symbols()),
+            max_positions=max_pos,
+        )
+        allowed, why = self._check_kill_switch_buy()
+        logger.info(
+            "TRAILING_BUY_STREAM_AUTHORITY path_ev_winner=%s path_ev_action=%s ranked=%s slots=%s kill_ok=%s",
+            (path_ev_decision or {}).get("path_ev_winner"),
+            (path_ev_decision or {}).get("selected_action"),
+            [getattr(c, "symbol", "") for c in pool],
+            slots,
+            allowed,
+        )
+        try:
+            from backend.services.day_decision_state import (
+                MODEL_HOLD_TELEMETRY,
+                NO_RANKED_CANDIDATE,
+                build_hold_record,
+                persist_hold_record,
+            )
 
-                if float(top_net_ev) <= _MIN_EV:
-                    logger.info("MULTI_BUY_SKIP_BELOW_EV_FLOOR symbol=%s net_ev=%.6f floor=%.6f", symbol, float(top_net_ev), _MIN_EV)
-                    continue
-                dyn_mult, _dyn_components, dyn_cap_reason = self._compute_dynamic_sizing_multiplier(
-                    symbol=symbol,
-                    strategy_id=strategy_id_for_size,
-                    final_profit_score=top_meta_score,
-                    net_expected_value=float(top_net_ev),
-                    confidence=float(cand.confidence or 0.0),
-                    decision_data=cand.decision_data or {},
-                    chop_score=float(cand.chop_score) if cand.chop_score is not None else None,
-                    coin_edge_score=float(cand.coin_edge_score) if cand.coin_edge_score is not None else None,
-                )
-                sizing_mult *= dyn_mult
-                quantity, stop_price, _risk_usd = self.calculate_position_size(symbol, equity, cand.atr, cand.current_price, sizing_mult, cand.confidence)
-                if quantity <= 0:
-                    logger.info(
-                        "MULTI_BUY_SKIP_SIZE symbol=%s dyn_cap_reason=%s",
-                        symbol,
-                        dyn_cap_reason,
+            if not pool:
+                for sym in DAY_TRADE_SYMBOLS:
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=str(sym),
+                            category=NO_RANKED_CANDIDATE,
+                            reason="no_usable_ranked_symbol",
+                            authority="trailing_buy_ranked_stream",
+                        ),
                     )
-                    continue
-                self._hydrate_buy_candidate_audit_from_redis_if_missing(cand)
-                explainability = TradeExplainability(
-                    trade_id="",
-                    symbol=symbol,
-                    side="BUY",
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                    ai_confidence=cand.confidence,
-                    trend_score=cand.trend_score,
-                    chop_score=cand.chop_score,
-                    coin_edge_score=cand.coin_edge_score,
-                    composite_score=cand.composite_score,
-                    regime=(cand.decision_data or {}).get("regime", "unknown"),
-                    price_structure_regime=cand.price_structure_regime,
-                    coin_win_rate_20=perf.win_rate_20 if perf else 0.5,
-                    coin_expectancy=perf.expectancy if perf else 0.0,
-                    portfolio_open_risk=self._calculate_total_open_risk(),
-                )
-                _dd = cand.decision_data or {}
-                # Keep Redis/artifact namespace on canonical day ML — AW family labels are
-                # attribution/shadow only when DAY_AW_OWNER is off (multi-buy was fetching
-                # ai_signal:allweather_breakout_pullback:* and missing setup stamps).
-                _sid = str(_dd.get("live_ai_strategy") or "day").strip().lower() or "day"
-                _aw_owner = os.getenv("DAY_AW_OWNER_ENABLED", "false").lower() in ("1", "true", "yes", "on")
-                if (not _aw_owner) and _sid in (
-                    "allweather_breakout_pullback",
-                    "allweather",
-                    "aw",
-                ):
-                    _sid = "day"
-                explainability.live_ai_strategy = _sid
-                # Same artifact + thesis stamps as primary bar buy — without these,
-                # ARTIFACT_CONTRACT / ENTRY_EXIT_MISSING_PRICE_OR_SETUP fail closed.
-                explainability.artifact_path = str(_dd.get("model_artifact_path") or "")
-                explainability.artifact_sha256 = str(_dd.get("artifact_sha256") or "")
-                _stamp_model_metadata_with_redis_fallback(explainability, _dd, symbol, _sid)
-                try:
-                    explainability.feature_version = int(_dd.get("feature_version") or 0)
-                except (TypeError, ValueError):
-                    explainability.feature_version = 0
-                try:
-                    explainability.feature_dim = int(_dd.get("feature_dim") or 0)
-                except (TypeError, ValueError):
-                    explainability.feature_dim = 0
-                explainability.setup_type = str(_dd.get("setup_type") or _dd.get("entry_thesis") or "")
-                explainability.entry_thesis = str(_dd.get("entry_thesis") or explainability.setup_type)
-                explainability.thesis_score = float(_safe_float(_dd.get("thesis_score"), 0.0))
-                explainability.thesis_invalid_level = float(_safe_float(_dd.get("thesis_invalid_level"), 0.0))
-                explainability.thesis_target_level = float(_safe_float(_dd.get("thesis_target_level"), 0.0))
-                explainability.entry_vwap = float(_safe_float(_dd.get("entry_vwap"), 0.0))
-                explainability.day_route_regime = str(_dd.get("day_route_regime") or _dd.get("regime") or "")
-                explainability.strategy_family = str(_dd.get("strategy_family") or "")
-                explainability.price_structure_regime = str(_dd.get("price_structure_regime") or getattr(cand, "price_structure_regime", "") or "")
-                try:
-                    _ebm = _dd.get("buy_margin")
-                    explainability.entry_buy_margin = float(_ebm) if _ebm not in (None, "") else None
-                except (TypeError, ValueError):
-                    explainability.entry_buy_margin = None
-                # P1B measurement stamps (multi-buy path)
-                for _attr, _key in (
-                    ("prob_buy", "prob_buy"),
-                    ("prob_hold", "prob_hold"),
-                    ("prob_sell", "prob_sell"),
-                ):
-                    try:
-                        _raw = _dd.get(_key)
-                        setattr(
-                            explainability,
-                            _attr,
-                            float(_raw) if _raw not in (None, "") else None,
+            else:
+                for cand in pool:
+                    dd = dict(getattr(cand, "decision_data", None) or {})
+                    side = str(dd.get("side") or dd.get("action") or "").upper()
+                    if side in {"HOLD", "SELL"}:
+                        persist_hold_record(
+                            str(self.db_path),
+                            build_hold_record(
+                                symbol=str(getattr(cand, "symbol", "") or ""),
+                                category=MODEL_HOLD_TELEMETRY,
+                                reason=f"model_side={side}",
+                                authority="rank_score/path_ev_telemetry",
+                                decision_id=str(getattr(cand, "decision_id", "") or ""),
+                                observed={"side": side, "confidence": getattr(cand, "confidence", None)},
+                            ),
                         )
-                    except (TypeError, ValueError):
-                        setattr(explainability, _attr, None)
-                explainability.quality_opinion_penalty = float(_safe_float(_dd.get("quality_opinion_penalty"), 0.0))
-                explainability.signal_side_penalty = float(_safe_float(_dd.get("signal_side_penalty"), 0.0))
-                explainability.rank_score = float(_safe_float(_dd.get("rank_score"), cand.rank_score()))
-                explainability.final_selection_score = float(_safe_float(_dd.get("final_selection_score"), explainability.rank_score))
-                explainability.selected_score = explainability.final_selection_score
-                explainability.selected_net_expected_value = float(_safe_float(_dd.get("selected_net_expected_value"), _safe_float(_dd.get("adjusted_ev"), 0.0)))
-                explainability.why_selected = str(_dd.get("why_selected") or "")
-                explainability.selection_key_used = str(_dd.get("selection_key_used") or "")
-                explainability.arbiter_winner_reason = str(_dd.get("why_selected") or _dd.get("arbiter_winner_reason") or "multi_buy_capacity_fill")
-                explainability.winner_symbol = str(_dd.get("winner_symbol") or symbol or "")
-                explainability.winner_score = float(_safe_float(_dd.get("winner_score"), explainability.final_selection_score))
-                explainability.runner_up_symbol = str(_dd.get("runner_up_symbol") or "")
-                explainability.runner_up_score = float(_safe_float(_dd.get("runner_up_score"), 0.0))
-                explainability.skipped_reason = str(_dd.get("skipped_reason") or "")
-                explainability.argmax_action = str(_dd.get("argmax_action") or "")
-                explainability.prediction = str(_dd.get("prediction") or _dd.get("argmax_action") or "")
-                explainability.side_signal = str(_dd.get("side") or _dd.get("action") or "")
-                _stamp_low_mfe_outcome_explain(explainability, _dd)
-                _stamp_day_bandit_explain(explainability, _dd)
-                _stamp_entry_confirmation_explain(explainability, _dd)
-                _stamp_htf_anchor_explain(explainability, _dd)
-                _stamp_liquidity_gate_explain(explainability, _dd)
-                with contextlib.suppress(Exception):
-                    from backend.services.entry_decision_authority import build_day_entry_provenance
-
-                    explainability.entry_provenance = build_day_entry_provenance(
-                        decision_data=_dd,
-                        symbol=str(symbol or ""),
-                        decision_id=str(getattr(cand, "decision_id", "") or ""),
-                        bar_timestamp=bar_timestamp,
-                        rank_score=explainability.final_selection_score,
-                        why_selected=str(explainability.why_selected or ""),
-                        direction_probability=explainability.prob_buy,
-                        feature_fingerprint=str(explainability.artifact_sha256 or explainability.feature_version or ""),
-                    )
-                    from backend.services.decision_book_tape import record_day_decision
-
-                    record_day_decision(symbol=str(symbol or ""), provenance=explainability.entry_provenance)
-                if not explainability.entry_thesis:
-                    logger.warning(
-                        "MULTI_BUY_MISSING_SETUP symbol=%s decision_id=%s dd_keys=%s",
-                        symbol,
-                        cand.decision_id,
-                        sorted(_dd.keys())[:40],
-                    )
-                exec_price = float(cand.current_price or 0.0)
-                with contextlib.suppress(Exception):
-                    from backend.config.redis_config import get_redis_client
-                    from backend.utils.symbols import to_exchange_symbol
-
-                    redis_client = get_redis_client()
-                    if redis_client:
-                        base_symbol = to_exchange_symbol(symbol).replace("USDT", "")
-                        price_str = redis_client.get(f"market:{base_symbol}")
-                        if price_str:
-                            if isinstance(price_str, str):
-                                price_json = json.loads(price_str)
-                                fresh = float(price_json["price"]) if isinstance(price_json, dict) and "price" in price_json else float(price_str)
-                            else:
-                                fresh = float(price_str)
-                            if fresh > 0:
-                                exec_price = fresh
-                extra_result = await self.execute_buy_fifo(
-                    symbol=symbol,
-                    quantity=quantity,
-                    price=exec_price,
-                    stop_price=stop_price,
-                    atr=cand.atr,
-                    confidence=cand.confidence,
-                    bar_timestamp=bar_timestamp,
-                    explainability=explainability,
-                    decision_id=cand.decision_id,
-                    sleeve=getattr(cand, "sleeve", "") or "",
+        except Exception:
+            logger.debug("hold-state rank persist skipped", exc_info=True)
+        armed_rows: list[dict[str, Any]] = []
+        preserved_rows: list[dict[str, Any]] = []
+        if not allowed:
+            logger.info("TRAILING_BUY_STREAM_BLOCKED %s", why)
+            try:
+                from backend.services.day_decision_state import (
+                    OPERATOR_CONTROL_BLOCK,
+                    build_hold_record,
+                    persist_hold_record,
                 )
-                if extra_result is not None:
-                    filled += 1
-                    if cand.decision_id:
-                        pipeline_done.add(str(cand.decision_id))
-                    logger.info(
-                        "MULTI_BUY_EXECUTED symbol=%s qty=%.6f price=%.4f decision_id=%s",
-                        symbol,
-                        float(quantity),
-                        float(exec_price),
-                        cand.decision_id,
+
+                for cand in pool or stream_candidates or ranked_candidates:
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=str(getattr(cand, "symbol", "") or ""),
+                            category=OPERATOR_CONTROL_BLOCK,
+                            reason=str(why or "KILL_OR_PAUSE"),
+                            authority="trailing_buy_ranked_stream",
+                            decision_id=str(getattr(cand, "decision_id", "") or ""),
+                        ),
                     )
-                else:
-                    logger.info("MULTI_BUY_BLOCKED symbol=%s decision_id=%s", symbol, cand.decision_id)
             except Exception:
-                logger.exception("MULTI_BUY_ERROR symbol=%s", symbol)
-        if filled:
-            logger.info("MULTI_BUY_DONE filled=%d open_positions=%d", filled, len(self.open_positions))
-        return filled
+                logger.debug("hold-state operator persist skipped", exc_info=True)
+            return {
+                "trailing_buy_armed": False,
+                "intents": [],
+                "preserved": [],
+                "blocked": str(why or "KILL_OR_PAUSE"),
+            }
+        redis_client = get_redis_client()
+        new_armed = 0
+        for candidate in pool:
+            if new_armed >= slots:
+                break
+            symbol = str(candidate.symbol or "")
+            block = self._day_path_ev_entry_block_reason(symbol, max_pos)
+            if block == "DUPLICATE_SAME_SYMBOL":
+                logger.info("TRAILING_BUY_STREAM_SKIP %s DUPLICATE_SAME_SYMBOL", symbol)
+                try:
+                    from backend.services.day_decision_state import (
+                        CAPITAL_OR_SLOT_BLOCK,
+                        OPEN_POSITION_HOLD,
+                        build_hold_record,
+                        persist_hold_record,
+                    )
+
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=symbol,
+                            category=OPEN_POSITION_HOLD,
+                            reason="DUPLICATE_SAME_SYMBOL",
+                            authority="trailing_buy_ranked_stream",
+                            decision_id=str(getattr(candidate, "decision_id", "") or ""),
+                        ),
+                    )
+                except Exception:
+                    logger.debug("hold-state duplicate persist skipped", exc_info=True)
+                continue
+            if block == "MAX_OPEN_LIMIT":
+                logger.info("TRAILING_BUY_STREAM_SKIP MAX_OPEN_LIMIT")
+                try:
+                    from backend.services.day_decision_state import (
+                        CAPITAL_OR_SLOT_BLOCK,
+                        build_hold_record,
+                        persist_hold_record,
+                    )
+
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=symbol,
+                            category=CAPITAL_OR_SLOT_BLOCK,
+                            reason="MAX_OPEN_LIMIT",
+                            authority="trailing_buy_ranked_stream",
+                            decision_id=str(getattr(candidate, "decision_id", "") or ""),
+                        ),
+                    )
+                except Exception:
+                    logger.debug("hold-state slot persist skipped", exc_info=True)
+                break
+            decision_id = str(candidate.decision_id or f"tb-stream-{_to_api_symbol(symbol)}-{int(bar_timestamp)}")
+            await self._entry_ensure_constraints(symbol)
+            perf = self.coin_performance.get(symbol)
+            sizing_mult = perf.sizing_multiplier if perf else 1.0
+            quantity, stop_price, _risk_usd = self.calculate_position_size(
+                symbol,
+                self._total_equity,
+                candidate.atr,
+                candidate.current_price,
+                sizing_mult,
+                candidate.confidence,
+            )
+            if quantity <= 0:
+                logger.info("TRAILING_BUY_STREAM_SKIP %s BUY_SKIP_SIZING", symbol)
+                try:
+                    from backend.services.day_decision_state import (
+                        CAPITAL_OR_SLOT_BLOCK,
+                        build_hold_record,
+                        persist_hold_record,
+                    )
+
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=symbol,
+                            category=CAPITAL_OR_SLOT_BLOCK,
+                            reason="BUY_SKIP_SIZING",
+                            authority="trailing_buy_ranked_stream",
+                            decision_id=decision_id,
+                            observed={"quantity": quantity},
+                        ),
+                    )
+                except Exception:
+                    logger.debug("hold-state sizing persist skipped", exc_info=True)
+                continue
+            book = fresh_executable_book(redis_client, symbol)
+            ask = float((book or {}).get("ask") or candidate.current_price or 0.0)
+            already_active = {str(row.get("symbol") or "") for row in load_active_intents(self.db_path)}
+            remaining_new = max(0, int(slots) - len(already_active))
+            from backend.services.day_entry_spendable import money, remaining_slot_cap, spendable_quote
+
+            free_cash = spendable_quote(
+                account_cash=getattr(self, "_available_balance", 0.0) or 0.0,
+                other_reservations=self._pending_buy_notional(),
+            )
+            cap = remaining_slot_cap(free_cash=free_cash, remaining_new_slots=remaining_new)
+            ask_m = money(ask)
+            qty_m = money(quantity)
+            reserved_notional = qty_m * ask_m if ask_m > 0 else money(0)
+            if ask_m > 0 and cap > 0 and reserved_notional > cap:
+                qty_m = cap / ask_m
+                reserved_notional = cap
+                quantity = float(qty_m)
+                logger.info(
+                    "TRAILING_BUY_STREAM_SLOT_CAP symbol=%s cap=%s ask=%.8f qty=%.8f remaining_new=%s",
+                    symbol,
+                    cap,
+                    ask,
+                    quantity,
+                    remaining_new,
+                )
+            if qty_m <= 0 or cap <= 0:
+                logger.info("TRAILING_BUY_STREAM_SKIP %s NO_REMAINING_SLOT_CASH", symbol)
+                try:
+                    from backend.services.day_decision_state import build_hold_record, classify_hold_category, persist_hold_record
+
+                    persist_hold_record(
+                        str(self.db_path),
+                        build_hold_record(
+                            symbol=symbol,
+                            category=classify_hold_category(reject_reason="NO_REMAINING_SLOT_CASH"),
+                            reason="NO_REMAINING_SLOT_CASH",
+                            authority="_arm_trailing_buy_ranked_stream",
+                            decision_id=str(getattr(candidate, "decision_id", "") or ""),
+                            observed={"cap": float(cap), "qty": float(qty_m), "ask": float(ask_m)},
+                            required={"remaining_slot_cash": ">0"},
+                        ),
+                    )
+                except Exception:
+                    logger.debug("hold-state slot-cash persist skipped", exc_info=True)
+                continue
+            explainability = TradeExplainability(
+                trade_id="",
+                symbol=symbol,
+                side="BUY",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                ai_confidence=candidate.confidence,
+                trend_score=candidate.trend_score,
+                chop_score=candidate.chop_score,
+                coin_edge_score=candidate.coin_edge_score,
+                composite_score=candidate.composite_score,
+                regime=(candidate.decision_data or {}).get("regime", "unknown"),
+                price_structure_regime=candidate.price_structure_regime,
+                coin_win_rate_20=perf.win_rate_20 if perf else 0.5,
+                coin_expectancy=perf.expectancy if perf else 0.0,
+                portfolio_open_risk=self._calculate_total_open_risk(),
+            )
+            explainability.live_ai_strategy = str((candidate.decision_data or {}).get("live_ai_strategy") or "day")
+            explainability.decision_id = decision_id
+            armed = await arm_selected_candidate(
+                self,
+                symbol=symbol,
+                quantity=quantity,
+                stop_price=stop_price,
+                atr=float(candidate.atr or 0.0),
+                confidence=float(candidate.confidence or 0.0),
+                bar_timestamp=int(bar_timestamp),
+                explainability=explainability,
+                decision_id=decision_id,
+                sleeve=getattr(candidate, "sleeve", "") or "",
+                decision_data=dict(candidate.decision_data or {}),
+                redis_client=redis_client,
+                reserved_notional=reserved_notional,
+            )
+            if not armed or not armed.get("trailing_buy_armed"):
+                continue
+            intent = dict(armed.get("intent") or {})
+            row = {
+                "symbol": symbol,
+                "intent_id": intent.get("intent_id"),
+                "decision_id": intent.get("decision_id") or decision_id,
+                "arm_ask": intent.get("arm_ask"),
+                "state": intent.get("status"),
+                "preserved": bool(armed.get("preserved")),
+            }
+            if armed.get("preserved") or armed.get("idempotent"):
+                preserved_rows.append(row)
+            else:
+                armed_rows.append(row)
+                new_armed += 1
+        active = load_active_intents(self.db_path)
+        first = (armed_rows or preserved_rows or [{}])[0]
+        logger.info(
+            "TRAILING_BUY_STREAM_RESULT new=%s preserved=%s active=%s symbols=%s",
+            len(armed_rows),
+            len(preserved_rows),
+            len(active),
+            [str(r.get("symbol") or "") for r in active],
+        )
+        return {
+            "trailing_buy_armed": bool(armed_rows or preserved_rows or active),
+            "symbol": first.get("symbol"),
+            "intent_id": first.get("intent_id"),
+            "decision_id": first.get("decision_id"),
+            "arm_ask": first.get("arm_ask"),
+            "intents": armed_rows + preserved_rows,
+            "preserved": preserved_rows,
+            "active_intent_count": len(active),
+        }
+
+    def _record_ranked_stream_decisions(
+        self,
+        *,
+        ranked_candidates: list[BuyCandidate],
+        bar_timestamp: int,
+        arm_result: dict[str, Any] | None,
+        path_ev_decision: dict[str, Any] | None,
+    ) -> None:
+        """Write one structured decision record per ranked candidate for this bar.
+
+        Every ranked symbol gets a row, armed or not, so a bar that produced no
+        BUY is distinguishable from a bar that was never evaluated.
+        """
+        with contextlib.suppress(Exception):
+            from backend.services.day_gate_telemetry import record_day_decision
+
+            result = dict(arm_result or {})
+            blocked = str(result.get("blocked") or "")
+            armed_by_decision: dict[str, dict[str, Any]] = {}
+            for row in result.get("intents") or []:
+                did = str((row or {}).get("decision_id") or "")
+                if did:
+                    armed_by_decision[did] = dict(row)
+            preserved_ids = {str((row or {}).get("decision_id") or "") for row in (result.get("preserved") or [])}
+
+            for cand in ranked_candidates or []:
+                did = str(getattr(cand, "decision_id", "") or "")
+                if not did:
+                    continue
+                dd = dict(getattr(cand, "decision_data", None) or {})
+                intent = armed_by_decision.get(did)
+                if blocked:
+                    final_decision, first_block = "reject", blocked
+                elif intent is not None:
+                    final_decision, first_block = "arm", ""
+                else:
+                    final_decision = "reject"
+                    first_block = str(dd.get("first_hard_block") or "") or "NOT_ARMED_THIS_BAR"
+
+                record_day_decision(
+                    self.db_path,
+                    decision_id=did,
+                    symbol=str(getattr(cand, "symbol", "") or ""),
+                    aw_valid=bool(dd.get("allweather_setup")),
+                    setup=str(dd.get("setup_type") or dd.get("allweather_setup") or ""),
+                    regime=str(dd.get("allweather_regime") or dd.get("aw_regime") or ""),
+                    gates=list(dd.get("gates_evaluated") or []),
+                    first_hard_block=first_block,
+                    ml_score=float(dd.get("buy_margin") or dd.get("ml_score") or 0.0) or None,
+                    ml_rank_adjustment=float(dd.get("ml_rank_adjustment") or 0.0) or None,
+                    final_decision=final_decision,
+                    strategy_version=str(dd.get("decision_policy_version") or "day_aw_owner_v1"),
+                    model_version=str(dd.get("artifact_sha256") or dd.get("model_version") or "")[:64],
+                    feature_version=str(dd.get("feature_version") or ""),
+                    artifact_version=str(dd.get("artifact_path") or "")[:128],
+                    detail={
+                        "bar_timestamp": int(bar_timestamp),
+                        "authority": "DAY_TRAILING_BUY_RANKED_STREAM",
+                        "intent_id": str((intent or {}).get("intent_id") or ""),
+                        "arm_ask": (intent or {}).get("arm_ask"),
+                        "preserved_intent": did in preserved_ids,
+                        "path_ev_winner": (path_ev_decision or {}).get("path_ev_winner"),
+                        "path_ev_telemetry_only": True,
+                    },
+                )
+
+    def _arm_trailing_buy(
+        self,
+        *,
+        symbol: str,
+        quantity: float,
+        price: float,
+        stop_price: float,
+        atr: float,
+        confidence: float,
+        bar_timestamp: int,
+        explainability: TradeExplainability,
+        decision_id: str = "",
+        sleeve: str = "",
+    ) -> dict[str, Any]:
+        """Arm one Trailing Buy. Not a position. Cooldown starts only on fill."""
+        from backend.services.day_trailing_buy import (
+            WAITING_FOR_PULLBACK_REVERSAL,
+            TrailingBuyArm,
+        )
+
+        key = normalize_symbol(symbol)
+        arms = self._trailing_buy_arms
+        existing = arms.get(key)
+        for other in list(arms):
+            if other != key:
+                arms.pop(other, None)
+                logger.info(
+                    "TRAILING_BUY_REPLACE from=%s to=%s status=%s",
+                    other,
+                    key,
+                    WAITING_FOR_PULLBACK_REVERSAL,
+                )
+        arm = TrailingBuyArm(
+            symbol=symbol,
+            decision_epoch=time.time(),
+            initial_ask=float(price),
+            quantity=float(quantity),
+            stop_price=float(stop_price),
+            atr=float(atr),
+            confidence=float(confidence),
+            bar_timestamp=int(bar_timestamp),
+            decision_id=str(decision_id or ""),
+            sleeve=str(sleeve or ""),
+            explainability=explainability,
+        )
+        if existing is not None:
+            prior_low = float(getattr(existing, "lowest_ask", 0.0) or 0.0)
+            if prior_low > 0:
+                arm.lowest_ask = min(float(arm.lowest_ask), prior_low)
+            arm.saw_lower_low = bool(getattr(existing, "saw_lower_low", False))
+        arms[key] = arm
+        logger.info(
+            "TRAILING_BUY_ARMED symbol=%s ask=%.6f trigger=%.6f status=%s decision_id=%s",
+            key,
+            float(arm.initial_ask),
+            float(arm.trigger_ask),
+            WAITING_FOR_PULLBACK_REVERSAL,
+            decision_id,
+        )
+        return {
+            "symbol": symbol,
+            "quantity": float(quantity),
+            "price": float(price),
+            "armed": True,
+            "status": WAITING_FOR_PULLBACK_REVERSAL,
+            "decision_id": str(decision_id or ""),
+            "lowest_ask": float(arm.lowest_ask),
+            "trigger_ask": float(arm.trigger_ask),
+        }
+
+    async def poll_trailing_buy_arms(self, bar_timestamp: int) -> dict[str, Any] | None:
+        """Unreachable legacy in-memory arm poll. Never submit an order from here."""
+        del bar_timestamp
+        logger.error("BUY_BLOCKED_LEGACY_IMMEDIATE_PATH poll_trailing_buy_arms is unreachable")
+        self.last_buy_reject_reason = "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH"
+        return None
 
     def _arm_trailing_buy(
         self,
@@ -15873,9 +16961,11 @@ class PortfolioEngine:
                 _entry_thesis = str((_tc.decision_data or {}).get("entry_thesis") or (_tc.decision_data or {}).get("setup_type") or "")
                 # No ML buy_margin bypass — thesis required for new opens (day_aw_owner_v1).
                 if _entry_thesis == SETUP_NO_CLEAR_THESIS and _tc.symbol not in self.open_positions:
-                    logger.info("THESIS_ENTRY_BLOCK: %s no clear thesis -> entry skipped", _tc.symbol)
-                    await self._bar_pipeline_terminal(_tc.decision_id, "BAR_PRE_RANK_FILTERED", pipeline_done)
-                    await self._record_learning_snapshot(_tc, "BLOCK", "NO_CLEAR_THESIS")
+                    logger.info(
+                        "THESIS_ENTRY_TELEMETRY: %s no clear thesis (not blocking ranked trailing-buy)",
+                        _tc.symbol,
+                    )
+                    await self._record_learning_snapshot(_tc, "HOLD", "NO_CLEAR_THESIS_TELEMETRY")
                     try:
                         from backend.services.day_gate_telemetry import record_gate_event
 
@@ -15883,13 +16973,31 @@ class PortfolioEngine:
                             self.db_path,
                             gate_id="THESIS_NO_CLEAR",
                             symbol=_tc.symbol,
-                            outcome="hard_blocked",
+                            outcome="telemetry",
                             setup=_entry_thesis,
                             decision_id=str(_tc.decision_id or ""),
                         )
                     except Exception:
                         pass
-                    continue
+                    try:
+                        from backend.services.day_decision_state import (
+                            MODEL_HOLD_TELEMETRY,
+                            build_hold_record,
+                            persist_hold_record,
+                        )
+
+                        persist_hold_record(
+                            str(self.db_path),
+                            build_hold_record(
+                                symbol=str(_tc.symbol),
+                                category=MODEL_HOLD_TELEMETRY,
+                                reason="NO_CLEAR_THESIS",
+                                authority="rank_score/path_ev_telemetry",
+                                decision_id=str(_tc.decision_id or ""),
+                            ),
+                        )
+                    except Exception:
+                        logger.debug("hold-state thesis persist skipped", exc_info=True)
                 _thesis_kept.append(_tc)
             valid_candidates = _thesis_kept
 
@@ -15951,7 +17059,7 @@ class PortfolioEngine:
                             self.db_path,
                             gate_id="AW_EVAL_ERROR",
                             symbol=_tc.symbol,
-                            outcome="hard_blocked",
+                            outcome="telemetry",
                             decision_id=str(_tc.decision_id or ""),
                         )
                         record_shadow_reject(
@@ -15967,14 +17075,22 @@ class PortfolioEngine:
                     _gates = self._apply_allweather_production_gates(_tc)
                     if _gates.get("allowed"):
                         _dd_stamp = dict(_tc.decision_data or {})
-                        _dd_stamp.setdefault("entry_owner", "allweather")
+                        _dd_stamp.setdefault("entry_owner", "trailing_buy")
+                        _dd_stamp["allweather_shadow_owner"] = "allweather"
                         _dd_stamp.setdefault("ml_role", "rank_size")
                         _dd_stamp.setdefault("decision_policy_version", "day_aw_owner_v1")
                         _dd_stamp["bar_closed"] = bool(getattr(_awbp_outcome, "bar_closed", True))
                         if getattr(_awbp_outcome, "closed_bar_ts", 0):
                             _dd_stamp["closed_bar_ts"] = int(_awbp_outcome.closed_bar_ts)
+                        _dd_stamp["allweather_telemetry_only"] = True
+                        _dd_stamp["allweather_bracket_exit"] = False
+                        if str(_dd_stamp.get("strategy_family") or "") in {
+                            "ALLWEATHER_BREAKOUT_PULLBACK",
+                            "allweather",
+                        }:
+                            _dd_stamp["allweather_strategy_family_shadow"] = _dd_stamp.get("strategy_family")
+                            _dd_stamp["strategy_family"] = "day"
                         _tc.decision_data = _dd_stamp
-                        _routed.append(_tc)
                         try:
                             from backend.services.day_gate_telemetry import record_gate_event
 
@@ -16006,7 +17122,7 @@ class PortfolioEngine:
                                 self.db_path,
                                 gate_id="AW_ROUTE_BLOCK",
                                 symbol=_tc.symbol,
-                                outcome="hard_blocked",
+                                outcome="telemetry",
                                 decision_id=str(_tc.decision_id or ""),
                                 detail=_block_r,
                             )
@@ -16057,7 +17173,7 @@ class PortfolioEngine:
                             self.db_path,
                             gate_id=_aw_gate,
                             symbol=_tc.symbol,
-                            outcome="hard_blocked",
+                            outcome="telemetry",
                             regime=str(_diag.get("regime") or ""),
                             decision_id=str(_tc.decision_id or ""),
                         )
@@ -16070,8 +17186,11 @@ class PortfolioEngine:
                         )
                     except Exception:
                         pass
-                # AW execution path is terminal — no ML margin fall-through (day_aw_owner_v1).
-                continue
+                # AW is telemetry only. Ranked trailing-buy remains the live entry stream.
+                logger.info(
+                    "ALLWEATHER_BP_TELEMETRY_ONLY symbol=%s (not blocking ranked trailing-buy)",
+                    _tc.symbol,
+                )
             if _awbp_active:
                 _awbp_outcome = await self._apply_allweather_breakout_pullback_candidate(_tc)
                 if getattr(_awbp_outcome, "ok", False) and not _awbp_exec:
@@ -16363,13 +17482,43 @@ class PortfolioEngine:
         if top_candidate is None:
             await self._emit_day_health_telemetry("DAY_PATH_EV_HOLD")
             logger.info(
-                "DAY_PATH_EV_HOLD winner=%s btc=%.6f eth=%.6f sol=%.6f xrp=%.6f old_nominee=%s",
+                "DAY_PATH_EV_HOLD winner=%s btc=%.6f eth=%.6f sol=%.6f xrp=%.6f old_nominee=%s (telemetry only — ranked trailing-buy still arms)",
                 (_day_auth or {}).get("path_ev_winner"),
                 float((_day_auth or {}).get("btc_path_ev") or 0),
                 float((_day_auth or {}).get("eth_path_ev") or 0),
                 float((_day_auth or {}).get("sol_path_ev") or 0),
                 float((_day_auth or {}).get("xrp_path_ev") or 0),
                 (_day_auth or {}).get("old_rank_nominee"),
+            )
+            try:
+                from backend.services.day_decision_state import (
+                    MODEL_HOLD_TELEMETRY,
+                    PATH_EV_TELEMETRY_KEY,
+                    build_hold_record,
+                    persist_hold_record,
+                )
+
+                # Universe-level model opinion, not a per-symbol state. Keying it by
+                # path_ev_winner put a fake "HOLD" symbol in the per-symbol map, and
+                # when a winner existed it wrote the unslashed form (XRPUSDT) alongside
+                # the real XRP/USDT entry. Keep it under one explicit non-symbol key.
+                persist_hold_record(
+                    str(self.db_path),
+                    build_hold_record(
+                        symbol=PATH_EV_TELEMETRY_KEY,
+                        category=MODEL_HOLD_TELEMETRY,
+                        reason="DAY_PATH_EV_HOLD",
+                        authority="rank_score/path_ev_telemetry",
+                        observed=dict(_day_auth or {}),
+                    ),
+                )
+            except Exception:
+                logger.debug("hold-state path-ev persist skipped", exc_info=True)
+            result = await self._arm_trailing_buy_ranked_stream(
+                ranked_candidates=valid_candidates,
+                stream_candidates=bar_candidate_snapshot,
+                bar_timestamp=int(bar_timestamp),
+                path_ev_decision=_day_auth,
             )
             self._persist_profit_cycle_state(
                 {
@@ -16378,15 +17527,27 @@ class PortfolioEngine:
                     "current_cycle": {
                         "leaderboard": [],
                         "leaderboard_len": 0,
-                        "selected_trade": False,
-                        "day_authority_mode": "direct_four_coin_path_ev",
+                        "selected_trade": bool(result and (result.get("armed") or result.get("trailing_buy_armed"))),
+                        "day_authority_mode": "trailing_buy_ranked_stream",
                         "old_rank_execution_authority": False,
+                        "path_ev_authoritative": False,
                         "path_ev_winner": (_day_auth or {}).get("path_ev_winner"),
                     },
                 }
             )
+            # DAY_TRAILING_BUY is the only automated BUY authority, and this branch is
+            # where it runs, so the structured decision record has to be written here.
+            # The record_day_decision() call further down is only reachable on the
+            # legacy direct-execute path, which left day_decision_records empty for
+            # every bar processed under trailing_buy mode.
+            self._record_ranked_stream_decisions(
+                ranked_candidates=valid_candidates,
+                bar_timestamp=int(bar_timestamp),
+                arm_result=result,
+                path_ev_decision=_day_auth,
+            )
             self.current_bar_candidates.clear()
-            return None
+            return result
         execution_sane_candidates: list[BuyCandidate] = [top_candidate]
         self._bar_extra_buy_candidates = []
 
@@ -16430,8 +17591,8 @@ class PortfolioEngine:
                     },
                 }
             )
-            self.current_bar_candidates.clear()
-            return None
+            # Duplicate on the path-EV nominee does not cancel the other three coins.
+            logger.info("DAY_PATH_EV_SAFETY duplicate nominee — trailing stream still evaluates remaining coins")
         try:
             _max_pos_bar = int(os.getenv("MAX_OPEN_POSITIONS", str(getattr(self, "max_positions", 4) or 4)))
         except Exception:
@@ -16459,8 +17620,7 @@ class PortfolioEngine:
                     },
                 }
             )
-            self.current_bar_candidates.clear()
-            return None
+            logger.info("DAY_PATH_EV_SAFETY max-open nominee — trailing stream still evaluates remaining coins")
 
         chosen, gov_hold = await self._apply_risk_governor([top_candidate])
         if gov_hold:
@@ -16656,9 +17816,7 @@ class PortfolioEngine:
                     pipeline_done=pipeline_done,
                 )
             await self._bar_pipeline_not_selected_others(bar_candidate_snapshot, top_candidate.decision_id or "", pipeline_done)
-            self.current_bar_candidates.clear()
-            self._bar_extra_buy_candidates = []
-            return None
+            logger.info("BAR_SIZING_ZERO telemetry only — ranked trailing-buy still arms remaining coins")
 
         # Align execution-time audit payload with the live Redis ML hash when the queued
         # candidate lacks context_audit_emit (stale enqueue / stale existing_pairs shortcut).
@@ -17060,27 +18218,6 @@ class PortfolioEngine:
             },
         )
 
-        # Fresh price lookup to avoid executing on stale signal price (can be up to 60s old)
-        exec_price = top_candidate.current_price
-        try:
-            from backend.config.redis_config import get_redis_client
-            from backend.utils.symbols import to_exchange_symbol
-
-            redis_client = get_redis_client()
-            if redis_client:
-                base_symbol = to_exchange_symbol(symbol).replace("USDT", "")
-                price_str = redis_client.get(f"market:{base_symbol}")
-                if price_str:
-                    if isinstance(price_str, str):
-                        price_json = json.loads(price_str)
-                        fresh = float(price_json["price"]) if isinstance(price_json, dict) and "price" in price_json else float(price_str)
-                    else:
-                        fresh = float(price_str)
-                    if fresh > 0:
-                        exec_price = fresh
-        except Exception as e:
-            logger.debug("FRESH_PRICE_LOOKUP: %s fallback to candidate price: %s", symbol, e)
-
         # Optional entry quality gate (setup_credit / RS floor/rank) — default OFF.
         from backend.config.day_entry_gates import day_entry_gates_enforced
         from backend.services.day_entry_quality_gate import evaluate_entry_quality, persist_last_bar_evaluation
@@ -17139,8 +18276,7 @@ class PortfolioEngine:
                     },
                 }
             )
-            self.current_bar_candidates.clear()
-            return None
+            logger.info("ENTRY_QUALITY telemetry only — ranked trailing-buy still arms")
 
         # Final EV discipline: selected candidate must have positive net expected value.
         # Default: no ML_EV_BYPASS (day_aw_owner_v1). Rollback only if DAY_ML_BYPASS_ENABLED=true.
@@ -17177,7 +18313,7 @@ class PortfolioEngine:
                     self.db_path,
                     gate_id="NEGATIVE_EV",
                     symbol=str(symbol),
-                    outcome="hard_blocked",
+                    outcome="telemetry",
                     setup=str((top_candidate.decision_data or {}).get("setup_type") or ""),
                     decision_id=str(top_candidate.decision_id or ""),
                 )
@@ -17217,9 +18353,9 @@ class PortfolioEngine:
                     },
                 }
             )
-            self.current_bar_candidates.clear()
-            return None
+            logger.info("BEST_CANDIDATE_BELOW_EV_FLOOR telemetry only — ranked trailing-buy still arms")
 
+<<<<<<< HEAD
         # Arm Trailing Buy. Fill happens on the first confirmed ask rebound.
         result = self._arm_trailing_buy(
             symbol=symbol,
@@ -17232,11 +18368,29 @@ class PortfolioEngine:
             explainability=explainability,
             decision_id=top_candidate.decision_id,
             sleeve=getattr(top_candidate, "sleeve", "") or "",
+=======
+        # Arm Trailing Buy for the ranked top-4 stream. Fill happens on rebound.
+        result = await self._arm_trailing_buy_ranked_stream(
+            ranked_candidates=valid_candidates,
+            stream_candidates=bar_candidate_snapshot,
+            bar_timestamp=int(bar_timestamp),
+            path_ev_decision=_day_auth,
+>>>>>>> origin/fix/candle-pipeline-4h-authority-20260917
         )
 
         # Paper Redis/cache sync is handled inside execute_buy_fifo (trade_id passed; no duplicate SQLite rows).
 
+<<<<<<< HEAD
         selected_disposition = "selected_trade_armed" if result is not None and result.get("armed") else ("selected_trade" if result is not None else "selected_no_trade")
+=======
+        armed_ok = bool(result is not None and (result.get("armed") or result.get("trailing_buy_armed")))
+        if armed_ok:
+            selected_disposition = "selected_trade_armed"
+        elif result is not None:
+            selected_disposition = "selected_trade"
+        else:
+            selected_disposition = "selected_no_trade"
+>>>>>>> origin/fix/candle-pipeline-4h-authority-20260917
         for _row in cycle_leaderboard:
             if _row.get("symbol") == top_candidate.symbol and str(_row.get("strategy_id")) == str(top_candidate.decision_data.get("live_ai_strategy") or "day"):
                 _row["disposition"] = selected_disposition
@@ -17247,7 +18401,11 @@ class PortfolioEngine:
         # NO_TRADE = ranked below the selected candidate. Execution unchanged.
         for _li, _lc in enumerate(valid_candidates):
             if _lc is top_candidate:
+<<<<<<< HEAD
                 if result is not None and result.get("armed"):
+=======
+                if result is not None and (result.get("armed") or result.get("trailing_buy_armed")):
+>>>>>>> origin/fix/candle-pipeline-4h-authority-20260917
                     _ldec = "ARMED"
                     _lreason = "trailing_buy_waiting"
                 elif result is not None:
@@ -17276,6 +18434,8 @@ class PortfolioEngine:
                     "selected_symbol": top_candidate.symbol,
                     "selected_strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
                     "selected_trade": bool(result is not None),
+                    "path_ev_authoritative": False,
+                    "day_authority_mode": "trailing_buy_ranked_stream",
                     "selected_candidate": {
                         "symbol": top_candidate.symbol,
                         "strategy_id": str(top_candidate.decision_data.get("live_ai_strategy") or "day"),
@@ -17318,12 +18478,24 @@ class PortfolioEngine:
             result = dict(result)
             result["decision_id"] = top_candidate.decision_id
 
+        # Cover every ranked symbol, not just the path-EV nominee. This branch used to
+        # record one row per bar, so three of the four coins had no decision row at all
+        # whenever path-EV named a winner. record_day_decision upserts on decision_id,
+        # so this runs first and the richer nominee record below overwrites its row.
+        self._record_ranked_stream_decisions(
+            ranked_candidates=valid_candidates,
+            bar_timestamp=int(bar_timestamp),
+            arm_result=result,
+            path_ev_decision=_day_auth,
+        )
+
         # Structured DAY decision record (authority + measurement)
         with contextlib.suppress(Exception):
             from backend.services.day_gate_telemetry import record_day_decision
 
             _dd_final = dict(getattr(top_candidate, "decision_data", None) or {})
             _gates_eval = list(_dd_final.get("gates_evaluated") or [])
+<<<<<<< HEAD
             if result is not None and result.get("armed"):
                 _final = "arm"
                 _first = ""
@@ -17331,8 +18503,27 @@ class PortfolioEngine:
                 _final = "execute"
                 _first = ""
             else:
+=======
+            # _arm_trailing_buy_ranked_stream returns "trailing_buy_armed", never
+            # "armed", and never a "quantity". Checking result.get("armed") made the
+            # "arm" label unreachable and sent every non-None result to "execute",
+            # so 559 of 1468 rows claimed an execution that never reached the
+            # exchange (approved_size NULL, no matching fill). Label the real outcome.
+            _armed_syms = {_to_api_symbol(str((_row or {}).get("symbol") or "")) for _row in (result or {}).get("intents") or []}
+            if result is None:
+>>>>>>> origin/fix/candle-pipeline-4h-authority-20260917
                 _final = "reject"
                 _first = str(_dd_final.get("first_hard_block") or "EXECUTION_GATE")
+            elif result.get("quantity") is not None:
+                _final = "execute"
+                _first = ""
+            elif result.get("armed") or result.get("trailing_buy_armed"):
+                _armed_here = _to_api_symbol(str(top_candidate.symbol or "")) in _armed_syms
+                _final = "arm" if _armed_here else "reject"
+                _first = "" if _armed_here else "NOT_ARMED_THIS_BAR"
+            else:
+                _final = "reject"
+                _first = str(result.get("blocked") or _dd_final.get("first_hard_block") or "NOT_ARMED_THIS_BAR")
             record_day_decision(
                 self.db_path,
                 decision_id=str(top_candidate.decision_id or f"bar_{bar_timestamp}_{top_candidate.symbol}"),
@@ -17352,7 +18543,9 @@ class PortfolioEngine:
                 model_version=str(_dd_final.get("artifact_sha256") or _dd_final.get("model_version") or "")[:64],
                 feature_version=str(_dd_final.get("feature_version") or ""),
                 artifact_version=str(_dd_final.get("artifact_path") or "")[:128],
-                mode="paper",
+                # mode omitted on purpose: record_day_decision resolves the real
+                # runtime account mode. Hardcoding "paper" stamped every record on
+                # this live account as paper.
                 detail={"bar_timestamp": int(bar_timestamp), "net_ev": float(top_net_ev)},
             )
         return result
@@ -18066,7 +19259,18 @@ class PortfolioEngine:
         requested_blocked = requested in pause_modes
         cb = bool(persisted.get("equity_circuit_breaker_active"))
         freeze = bool(persisted.get("daily_loss_freeze_active"))
-        failsafe_p = bool(persisted.get("account_failsafe_active"))
+        fs = self._canonical_failsafe_decision()
+        failsafe_p = bool(fs.get("tripped")) if fs.get("usable") else False
+        if memory_blocked and not requested_blocked and not cb and not freeze and not failsafe_p:
+            logger.info(
+                "KILL_SWITCH_MEMORY_RECONCILED: persisted=RESUME memory_was=%s reason_was=%s",
+                memory_mode,
+                self._kill_switch_reason,
+            )
+            self._kill_switch_mode = KillSwitchMode.RESUME
+            self._kill_switch_reason = ""
+            memory_mode = KillSwitchMode.RESUME.value
+            memory_blocked = False
         blocked = bool(memory_blocked or requested_blocked or cb or freeze or failsafe_p)
         active = None
         reasons: list[str] = []
@@ -18103,21 +19307,18 @@ class PortfolioEngine:
         """Honest capability flags. Process-alive is not the same as entries enabled."""
         ks = self.get_kill_switch_status()
         ctrl = self._effective_entry_control()
-        account_equity = float(getattr(self, "cash_balance", 0.0) or 0.0) + float(getattr(self, "_positions_value", 0.0) or 0.0)
-        from backend.services.circuit_breaker_service import account_failsafe_tripped
-
+        fs = self._canonical_failsafe_decision()
         principal = float(getattr(self, "principal", 0.0) or 0.0)
-        ledger_failsafe = account_failsafe_tripped(account_equity, principal)
-        # Persisted CB / leftover reason strings are not authority. Revalidate them
-        # against the same equity predicate execution uses, then drop stale latch.
+        nle = fs.get("nle")
         with contextlib.suppress(Exception):
             from backend.services.circuit_breaker_service import trading_circuit_breaker
 
-            trading_circuit_breaker.check_account_failsafe(account_equity, principal)
-        failsafe = bool(ledger_failsafe or ctrl.get("account_failsafe_persisted"))
+            if fs.get("usable") and nle is not None:
+                trading_circuit_breaker.check_account_failsafe(float(nle), principal)
+        failsafe = bool(fs.get("tripped"))
         failsafe_reason = ""
         if failsafe:
-            failsafe_reason = f"ACCOUNT_FAILSAFE equity=${account_equity:.2f} principal=${float(self.principal or 0.0):.2f} — MANUAL POSITION REVIEW REQUIRED"
+            failsafe_reason = f"ACCOUNT_FAILSAFE equity=${float(nle or 0):.2f} principal=${float(self.principal or 0.0):.2f} — MANUAL POSITION REVIEW REQUIRED"
         accounting: dict[str, Any] = {"ok": True, "orphans": []}
         try:
             from backend.services.atomic_execution_book import find_cash_position_disagreement
@@ -18126,6 +19327,13 @@ class PortfolioEngine:
         except Exception as exc:
             accounting = {"ok": False, "error": str(exc)[:200], "orphans": []}
         reasons: list[str] = []
+        from backend.config.day_entry_execution import trailing_buy_mode_status
+
+        mode_ok, mode_err, mode_name = trailing_buy_mode_status()
+        self.day_entry_execution_mode = mode_name
+        self.day_entry_execution_error = "" if mode_ok else mode_err
+        if not mode_ok:
+            reasons.append(mode_err)
         if self._trading_paused:
             reasons.append(f"trading_paused:{self._pause_reason}")
         if self._account_status != AccountStatus.HEALTHY:
@@ -18137,11 +19345,15 @@ class PortfolioEngine:
         if not accounting.get("ok", False):
             n_orphans = len(accounting.get("orphans") or [])
             reasons.append(f"accounting_disagreement:orphans={n_orphans}:diff={accounting.get('identity_diff')}")
-        day_entry = not self._trading_paused and self._account_status == AccountStatus.HEALTHY and bool(ctrl.get("effective_entry_permitted")) and not failsafe and bool(accounting.get("ok"))
+        day_entry = (
+            mode_ok and not self._trading_paused and self._account_status == AccountStatus.HEALTHY and bool(ctrl.get("effective_entry_permitted")) and not failsafe and bool(accounting.get("ok"))
+        )
         return {
             "process_alive": True,
             "accounting_healthy": bool(accounting.get("ok")),
             "day_entry_enabled": day_entry,
+            "day_entry_execution_mode": mode_name,
+            "day_entry_execution_error": "" if mode_ok else mode_err,
             "day_exit_enabled": not bool(ks.get("sells_blocked")),
             "kill_switch_mode": ctrl.get("requested_kill_mode") or ks.get("mode"),
             "kill_switch_reason": (failsafe_reason if failsafe else (ctrl.get("requested_kill_reason") or ks.get("reason"))),
@@ -18182,6 +19394,67 @@ class PortfolioEngine:
             "headline_realized_pnl": headline,
         }
 
+    def _persist_buy_reject_hold(self, symbol: str, *, decision_id: str = "", intent_id: str = "") -> None:
+        reason = str(getattr(self, "last_buy_reject_reason", "") or "")
+        if not reason:
+            return
+        try:
+            from backend.services.day_decision_state import build_hold_record, classify_hold_category, persist_hold_record
+
+            persist_hold_record(
+                str(self.db_path),
+                build_hold_record(
+                    symbol=str(symbol or ""),
+                    category=classify_hold_category(reject_reason=reason),
+                    reason=reason,
+                    authority="execute_buy_fifo",
+                    decision_id=str(decision_id or ""),
+                    intent_id=str(intent_id or ""),
+                ),
+            )
+        except Exception:
+            logger.debug("hold-state buy-reject persist skipped", exc_info=True)
+
+    def get_trailing_buy_intent_status(self) -> list[dict[str, Any]]:
+        try:
+            from backend.config.redis_config import get_redis_client
+            from backend.services.day_trailing_buy import load_operator_intents
+
+            return load_operator_intents(str(self.db_path), get_redis_client())
+        except Exception:
+            return []
+
+    def get_day_decision_holds(self) -> list[dict[str, Any]]:
+        try:
+            from backend.services.day_decision_state import load_hold_records
+
+            return load_hold_records(str(self.db_path))
+        except Exception:
+            return []
+
+    def _forward_scorecard_baseline_payload(self, account_equity: float) -> dict[str, Any]:
+        """Persist marked equity once as a forward baseline. Never overwrite principal."""
+        from backend.services.live_account_basis import load_operational_json, persist_operational_json
+
+        key = "forward_scorecard_baseline"
+        existing = {}
+        try:
+            existing = load_operational_json(str(self.db_path), key) or {}
+        except Exception:
+            existing = {}
+        if existing.get("equity") not in (None, ""):
+            return existing
+        payload = {
+            "equity": f"{float(account_equity):.8f}",
+            "principal_unchanged": f"{float(self.principal):.8f}",
+            "note": "forward marked-equity baseline; not contributed principal",
+        }
+        try:
+            persist_operational_json(str(self.db_path), key, payload)
+        except Exception:
+            pass
+        return payload
+
     def get_portfolio_status(self) -> dict[str, Any]:
         """
         Get full portfolio status for observability.
@@ -18210,7 +19483,9 @@ class PortfolioEngine:
         live_dust_value = 0.0
         for row in dust_list:
             try:
-                live_dust_value += float(row.get("market_value") or row.get("quantity", 0) or 0) * float(row.get("current_price") or row.get("entry_price") or 0)
+                qty = float(row.get("quantity") or 0)
+                mark = float(row.get("current_price") or row.get("entry_price") or 0)
+                live_dust_value += qty * mark
             except (TypeError, ValueError):
                 pass
         if live_dust_value <= 0:
@@ -18256,6 +19531,47 @@ class PortfolioEngine:
         )
         performance_equity = equity_views["performance_equity"]
         performance_equity_consistency_ok = abs(account_equity - performance_equity) < 1.0
+        from backend.services.live_account_basis import RECON_KEY, load_operational_json, trailing_buy_scorecard
+
+        recon_row = load_operational_json(str(self.db_path), RECON_KEY)
+        try:
+            recon_adj = float(recon_row.get("adjustment_usd") or 0)
+        except (TypeError, ValueError):
+            recon_adj = 0.0
+        from backend.services.live_exchange_equity import (
+            build_exchange_equity,
+            persist_current_dust_snapshot,
+            reconstruct_forward_baseline_dust,
+        )
+
+        active_marks = []
+        dust_marks = []
+        for symbol, pos in self.open_positions.items():
+            mark = float(self._position_mark_prices.get(symbol) or getattr(pos, "entry_price", 0) or 0)
+            exact = str(getattr(pos, "quantity_exact", "") or "")
+            qty = exact if exact else float(getattr(pos, "quantity", 0) or 0)
+            asset = symbol.split("/")[0] if "/" in symbol else symbol.replace("USDT", "")
+            row = {"symbol": symbol, "asset": asset, "quantity": qty, "mark": mark, "bid": mark, "executable_bid": mark, "market_value": float(qty) * mark}
+            if str(getattr(pos, "status", "ACTIVE") or "") == "DUST_PENDING":
+                dust_marks.append(row)
+            else:
+                active_marks.append(row)
+        baseline_dust = reconstruct_forward_baseline_dust(str(self.db_path))
+        exchange_equity = build_exchange_equity(
+            cash_usdt=self.cash_balance,
+            active_marks=active_marks,
+            dust_marks=dust_marks,
+            realized_strategy_pnl=mode_pnl["realized_pnl_live"],
+            unrealized_strategy_pnl=self._unrealized_pnl,
+            accounting_corrections=float(dust_adj or 0) + float(recon_adj or 0),
+            forward_baseline_cash=self.principal,
+            forward_baseline_dust_net=baseline_dust.get("net_liquidatable"),
+            baseline_dust_known=bool(baseline_dust.get("known")),
+        )
+        try:
+            persist_current_dust_snapshot(str(self.db_path), exchange_equity.get("dust_by_coin") or [])
+        except Exception:
+            pass
 
         return {
             # DAY mode (normal repaired strategy — no inventory recovery freeze)
@@ -18279,21 +19595,38 @@ class PortfolioEngine:
             "failsafe_active": capability["failsafe_active"],
             "accounting_healthy": capability["accounting_healthy"],
             "day_entry_enabled": capability["day_entry_enabled"],
+            "day_entry_execution_mode": capability.get("day_entry_execution_mode"),
+            "day_entry_execution_error": capability.get("day_entry_execution_error"),
+            "trailing_buy_intents": self.get_trailing_buy_intent_status(),
+            "day_decision_holds": self.get_day_decision_holds(),
             "day_exit_enabled": capability["day_exit_enabled"],
             "no_trade_reason": capability["no_trade_reason"],
             "process_alive": True,
             # POSITION SUMMARY
             "open_positions": positions_list,
             "positions": positions_list,
-            "positions_count": len(self.open_positions),
+            "positions_count": self._count_live_slots(),
             "max_positions": MAX_OPEN_POSITIONS,
-            "slots_used": len(self.open_positions),
-            "slots_open": max(0, MAX_OPEN_POSITIONS - len(self.open_positions)),
+            "slots_used": self._count_live_slots(),
+            "slots_open": max(0, MAX_OPEN_POSITIONS - self._count_live_slots()),
             # AUTHORITATIVE LEDGER (single meaning: account / cash+marks)
             "cash_balance": self.cash_balance,
+            "cash_usdt": float(exchange_equity["cash_usdt"]),
+            "active_position_market_value": float(exchange_equity["active_position_market_value"]),
+            "dust_market_value": float(exchange_equity["dust_market_value"]),
+            "dust_by_coin": exchange_equity["dust_by_coin"],
+            "gross_exchange_equity": float(exchange_equity["gross_exchange_equity"]),
+            "estimated_liquidation_cost": float(exchange_equity["estimated_liquidation_cost"]),
+            "net_liquidatable_equity": float(exchange_equity["net_liquidatable_equity"]),
+            "forward_net_equity_change": (float(exchange_equity["forward_net_equity_change"]) if exchange_equity.get("forward_net_equity_change") is not None else None),
+            "forward_cash_change": float(exchange_equity["forward_cash_change"]),
+            "realized_strategy_pnl": float(exchange_equity["realized_strategy_pnl"]),
+            "unrealized_strategy_pnl": float(exchange_equity["unrealized_strategy_pnl"]),
+            "accounting_corrections": float(exchange_equity["accounting_corrections"]),
+            "exchange_equity": exchange_equity,
             "positions_value": self._positions_value,
-            "total_equity": account_equity,
-            "account_equity": account_equity,
+            "total_equity": float(exchange_equity["gross_exchange_equity"]),
+            "account_equity": float(exchange_equity["gross_exchange_equity"]),
             "performance_equity": performance_equity,
             "principal_based_equity": performance_equity,
             "cash_plus_positions_equity": equity_views["cash_plus_positions_equity"],
@@ -18307,6 +19640,11 @@ class PortfolioEngine:
             "equity_check": account_equity_check,
             # P&L BREAKDOWN
             "principal": self.principal,
+            "forward_baseline_equity": float(self.principal or 0.0),
+            "forward_baseline_label": "forward baseline equity (adopted cash at SHA 9039923; not contributed principal)",
+            "lifetime_contributed_capital": "UNKNOWN",
+            "baseline_dust_known": bool(exchange_equity.get("baseline_dust_known")),
+            "equity_uncertainty": exchange_equity.get("uncertainty") or "",
             "account_execution_mode": mode_pnl["account_execution_mode"],
             "realized_pnl_ledger_stored": self._realized_pnl,
             "realized_pnl_live": mode_pnl["realized_pnl_live"],
@@ -18315,6 +19653,21 @@ class PortfolioEngine:
             "dust_adjustment_pnl": equity_views["dust_adjustment_pnl"],
             "realized_pnl": mode_pnl["headline_realized_pnl"],
             "unrealized_pnl": self._unrealized_pnl,
+            "contributed_principal": None,
+            "contributed_principal_label": "UNKNOWN — ledger principal column is the forward baseline, not an owner deposit",
+            "cash_reconciliation_adjustment_usd": recon_adj,
+            "trailing_buy_scorecard": trailing_buy_scorecard(
+                live_fills_since_anchor=mode_pnl["realized_pnl_live"],
+                current_equity=account_equity,
+                live_realized_pnl=mode_pnl["realized_pnl_live"],
+                live_unrealized_pnl=self._unrealized_pnl,
+            ),
+            "lifetime_live_return_usd": (float(exchange_equity["forward_net_equity_change"]) if exchange_equity.get("forward_net_equity_change") is not None else None),
+            "lifetime_live_return_label": (
+                "comparable net-liquidatable change vs forward baseline"
+                if exchange_equity.get("forward_net_equity_change") is not None
+                else "UNKNOWN: baseline dust cannot be reconstructed; cash-only change is not total-account P&L"
+            ),
             "dust_positions": dust_list,
             "live_dust_quantity": sum(float(getattr(p, "quantity", 0) or 0) for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") == "DUST_PENDING"),
             "live_dust_value": live_dust_value,
@@ -18363,6 +19716,20 @@ class PortfolioEngine:
             "sleeve_cutover": self.get_sleeve_cutover() if SLEEVE_ENABLED else None,
             # Explicit active router/sleeve state for the open book (never None for reporting)
             "active_sleeve_state": self._get_active_sleeve_state(),
+            "entry_reservations": [
+                {
+                    "symbol": str(sym),
+                    "decision_id": str((row or {}).get("decision_id") or ""),
+                    "notional": float((row or {}).get("notional") or 0.0),
+                    "sleeve": str((row or {}).get("sleeve") or ""),
+                }
+                for sym, row in (getattr(self, "_entry_reservations", None) or {}).items()
+            ],
+            "reservations_count": len(getattr(self, "_entry_reservations", None) or {}),
+            "day_mode_display": "DAY LIVE",
+            "scalp_mode_display": "SCALP PAPER",
+            "operator_mode_labels": {"day": "DAY LIVE", "scalp": "SCALP PAPER"},
+            "forward_scorecard_baseline": self._forward_scorecard_baseline_payload(account_equity),
             **get_live_test_api_fields(),
         }
 
@@ -19657,6 +21024,14 @@ class PortfolioEngine:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
+    def apply_external_capital_flow(self, amount: float, *, kind: str = "deposit") -> float:
+        """Deposits/withdrawals change contributed principal, not trading P&L."""
+        from backend.services.live_account_basis import apply_external_capital_flow
+
+        self.principal = float(apply_external_capital_flow(self.principal, amount))
+        logger.info("EXTERNAL_CAPITAL_FLOW kind=%s amount=%s principal=%s", kind, amount, self.principal)
+        return self.principal
+
     async def _persist_kill_switch(self) -> None:
         """Persist kill switch state to SQLite"""
 
@@ -19741,17 +21116,21 @@ class PortfolioEngine:
         )
         return any(trig.startswith(p) for p in protective_prefixes)
 
+    def _canonical_failsafe_decision(self) -> dict[str, Any]:
+        from backend.services.canonical_failsafe_equity import decide_account_failsafe
+
+        return decide_account_failsafe(getattr(self, "_canonical_nle_snapshot", None), getattr(self, "principal", 0.0))
+
     def _check_kill_switch_buy(self) -> tuple[bool, str]:
         """Check if buy is blocked by kill switch"""
-        from backend.services.circuit_breaker_service import account_failsafe_tripped
-
-        account_equity = float(getattr(self, "cash_balance", 0.0) or 0.0) + float(getattr(self, "_positions_value", 0.0) or 0.0)
+        fs = self._canonical_failsafe_decision()
         principal = float(getattr(self, "principal", 0.0) or 0.0)
-        if account_failsafe_tripped(account_equity, principal):
+        if fs.get("tripped"):
+            nle = fs.get("nle") or "0"
             reason = (
                 f"KILL_SWITCH_{KillSwitchMode.PAUSE_BUYS.value}: "
                 f"{self._CIRCUIT_BREAKER_REASON_PREFIX}ACCOUNT_FAILSAFE "
-                f"equity=${account_equity:.2f} principal=${principal:.2f} "
+                f"equity=${float(nle):.2f} principal=${principal:.2f} "
                 "— MANUAL POSITION REVIEW REQUIRED"
             )
             return False, reason
@@ -19785,11 +21164,10 @@ class PortfolioEngine:
 
     def get_kill_switch_status(self) -> dict[str, Any]:
         """Get current kill switch status"""
-        from backend.services.circuit_breaker_service import account_failsafe_tripped
-
-        account_equity = float(getattr(self, "cash_balance", 0.0) or 0.0) + float(getattr(self, "_positions_value", 0.0) or 0.0)
+        fs = self._canonical_failsafe_decision()
         principal = float(getattr(self, "principal", 0.0) or 0.0)
-        failsafe = account_failsafe_tripped(account_equity, principal)
+        failsafe = bool(fs.get("tripped"))
+        nle = fs.get("nle") or "0"
         ctrl = self._effective_entry_control()
         requested = str(ctrl.get("requested_kill_mode") or self._kill_switch_mode.value)
         effective_blocked = (not bool(ctrl.get("effective_entry_permitted"))) or failsafe
@@ -19798,7 +21176,7 @@ class PortfolioEngine:
             effective_mode = KillSwitchMode.PAUSE_BUYS.value
         reason = str(ctrl.get("requested_kill_reason") or self._kill_switch_reason or "")
         if failsafe:
-            reason = f"{self._CIRCUIT_BREAKER_REASON_PREFIX}ACCOUNT_FAILSAFE equity=${account_equity:.2f} principal=${principal:.2f} — MANUAL POSITION REVIEW REQUIRED"
+            reason = f"{self._CIRCUIT_BREAKER_REASON_PREFIX}ACCOUNT_FAILSAFE equity=${float(nle):.2f} principal=${principal:.2f} — MANUAL POSITION REVIEW REQUIRED"
         elif ctrl.get("blocking_reason"):
             reason = str(ctrl.get("blocking_reason"))
         return {
@@ -19826,29 +21204,64 @@ class PortfolioEngine:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         def _sync_get() -> float:
+            from backend.services.live_close_integrity import venue_backed_unique_aggregate_sql
+
             conn = sqlite3.connect(self.db_path)
             try:
                 cur = conn.cursor()
                 cur.execute(
-                    """
-                    SELECT COALESCE(SUM(pnl), 0)
-                    FROM paper_trades
-                    WHERE date(timestamp) = ? AND UPPER(side) = 'SELL'
-                      AND COALESCE(exit_type, '') NOT IN (
-                        'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
-                        'RESEARCH_RESET_EXIT', 'DUST_WRITEOFF'
-                      )
-                      AND COALESCE(is_synthetic, 0) = 0
-                    """,
-                    (today,),
+                    venue_backed_unique_aggregate_sql("AND date(t.timestamp) = ?"),
+                    (today, today),
                 )
                 row = cur.fetchone()
-                return float(row[0] or 0.0) if row else 0.0
+                return float(row[1] or 0.0) if row else 0.0
             finally:
                 conn.close()
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _sync_get)
+
+    async def _refresh_canonical_nle_snapshot(self) -> dict[str, Any]:
+        """Pull complete exchange balances + bids. Incomplete snapshots stay unusable."""
+        from backend.services.canonical_failsafe_equity import balances_from_live_payload, build_canonical_nle
+
+        balances: list[dict[str, Any]] = []
+        bids: dict[str, Any] = {}
+        source = "unavailable"
+        live = getattr(self, "_live_service", None)
+        if live is not None:
+            try:
+                raw = await live.get_balance("binanceus", force_refresh=True)
+                balances = balances_from_live_payload(raw)
+                if balances:
+                    source = "binanceus"
+                else:
+                    logger.warning("CANONICAL_NLE_BALANCE_UNPARSED keys=%s", list(raw) if isinstance(raw, dict) else type(raw))
+            except Exception as exc:
+                logger.warning("CANONICAL_NLE_BALANCE_FAILED err=%s", exc)
+            try:
+                needed: list[str] = []
+                for row in balances:
+                    asset = str(row.get("asset") or "").strip().upper()
+                    if not asset or asset in ("USDT", "USD", "BUSD", "USDC"):
+                        continue
+                    needed.append(f"{asset}/USDT")
+                for symbol in needed or ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]:
+                    bid, _src = await self._executable_bid(symbol, 0.0)
+                    if bid and float(bid) > 0:
+                        compact = symbol.replace("/", "").upper()
+                        bids[compact] = bid
+                        bids[compact.replace("USDT", "")] = bid
+            except Exception as exc:
+                logger.warning("CANONICAL_NLE_BID_FAILED err=%s", exc)
+        snap = build_canonical_nle(
+            balances=balances,
+            bids=bids,
+            reservations=sum(float((r or {}).get("notional") or 0.0) for r in (getattr(self, "_entry_reservations", None) or {}).values()),
+            source=source,
+        )
+        self._canonical_nle_snapshot = snap
+        return snap
 
     async def run_trading_circuit_breaker_check(self) -> dict[str, Any]:
         """
@@ -19868,31 +21281,40 @@ class PortfolioEngine:
             return {"skipped": True}
 
         realized_pnl_today = await self._realized_pnl_today_sync_free()
-        # Canonical account equity is cash + mark-to-market positions. Never trip
-        # ACCOUNT_FAILSAFE on a stale/low ledger total while cash+positions is healthy
-        # (Jul 31 incident: cash-only ~$3711 while book equity was ~$9900 → permanent PAUSE_BUYS).
-        account_equity = float(self.cash_balance or 0.0) + float(self._positions_value or 0.0)
-        ledger_equity = float(self._total_equity or 0.0)
-        if account_equity > 0:
-            total_equity = account_equity
-            if abs(account_equity - ledger_equity) > 1.0:
-                logger.warning(
-                    "CIRCUIT_BREAKER_EQUITY_SOURCE account=%.2f ledger=%.2f using_account=true",
-                    account_equity,
-                    ledger_equity,
-                )
+        await self._refresh_canonical_nle_snapshot()
+        fs = self._canonical_failsafe_decision()
+        if fs.get("usable") and fs.get("nle") is not None:
+            total_equity = float(fs["nle"])
         else:
-            total_equity = ledger_equity
+            total_equity = float(self.cash_balance or 0.0) + float(self._positions_value or 0.0)
+            logger.warning(
+                "CIRCUIT_BREAKER_NLE_UNUSABLE reason=%s cash=%s complete=%s stale=%s failsafe_suppressed=true",
+                fs.get("reason"),
+                (fs.get("snapshot") or {}).get("cash_usdt"),
+                (fs.get("snapshot") or {}).get("complete"),
+                (fs.get("snapshot") or {}).get("stale"),
+            )
         portfolio_data = {
             "total_equity": total_equity,
             "principal": float(self.principal),
             "realized_pnl_today": realized_pnl_today,
             "residual_pending": bool(self.has_exit_residual_pending()),
+            "failsafe_nle": fs,
         }
 
         result = await trading_circuit_breaker.check_all_hard_kills_async(portfolio_data)
         actions = result.get("actions", {})
         conditions = result.get("conditions", {})
+        if not fs.get("usable"):
+            conditions["account_failsafe"] = False
+            actions["close_all_positions"] = False
+            actions["pause_trading"] = bool(conditions.get("daily_loss_freeze") or conditions.get("equity_circuit_breaker"))
+        else:
+            conditions["account_failsafe"] = bool(fs.get("tripped"))
+            actions["close_all_positions"] = bool(fs.get("tripped"))
+            actions["pause_trading"] = bool(fs.get("tripped"))
+            if fs.get("tripped"):
+                actions["block_new_entries"] = True
         prefix = self._CIRCUIT_BREAKER_REASON_PREFIX
         set_by_cb = str(self._kill_switch_reason or "").startswith(prefix)
         session_high = float(getattr(trading_circuit_breaker, "session_high_equity", 0.0) or 0.0)
@@ -21163,7 +22585,13 @@ class PortfolioEngine:
 
                     pass_fail = "PASS" if not fail_reasons else "FAIL"
 
-                    daily_realized_pnl = float(total_r)
+                    from backend.services.execution_mode_service import is_live_execution_allowed_sync
+                    from backend.services.live_fill_economics import sum_realized_pnl_by_mode
+
+                    if is_live_execution_allowed_sync():
+                        daily_realized_pnl = sum_realized_pnl_by_mode(self.db_path, mode="live", day=today)
+                    else:
+                        daily_realized_pnl = float(total_r)
                     daily_total_pnl = daily_realized_pnl + daily_unrealized_delta
 
                     cursor.execute(
@@ -21291,14 +22719,11 @@ class PortfolioEngine:
             downtime = by_action.get("DOWNTIME_POSITION_CLEAR", {"count": 0, "pnl": 0.0})
             buys = by_action.get("BUY", {"count": 0, "pnl": 0.0})
 
+            from backend.services.live_close_integrity import venue_backed_unique_aggregate_sql
+
             cur.execute(
-                """
-                SELECT COUNT(*), COALESCE(SUM(pnl), 0)
-                FROM paper_trades
-                WHERE date(timestamp) = ? AND UPPER(side) = 'SELL'
-                  AND COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT', 'DUST_WRITEOFF') AND COALESCE(is_synthetic, 0) = 0
-                """,
-                (day,),
+                venue_backed_unique_aggregate_sql("AND date(t.timestamp) = ?"),
+                (day, day),
             )
             ai_sell_row = cur.fetchone()
             ai_paper_closes = int(ai_sell_row[0] or 0) if ai_sell_row else 0
@@ -21354,20 +22779,10 @@ class PortfolioEngine:
 
             closed_ai = ai["count"] if ai["count"] else ai_paper_closes
             cur.execute(
-                """
-                SELECT COALESCE(SUM(pnl), 0)
-                FROM paper_trades
-                WHERE date(timestamp) = ? AND UPPER(side) = 'SELL' AND pnl IS NOT NULL
-                  AND COALESCE(exit_type, '') NOT IN (
-                    'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
-                    'legacy_no_clear_position_clear', 'STALE_LIVE_GHOST_POSITION_CLEAR',
-                    'RESEARCH_RESET_EXIT'
-                  )
-                  AND COALESCE(is_synthetic, 0) = 0
-                """,
-                (day,),
+                venue_backed_unique_aggregate_sql("AND date(t.timestamp) = ?"),
+                (day, day),
             )
-            strategy_paper_today = float((cur.fetchone() or (0,))[0] or 0.0)
+            strategy_paper_today = float((cur.fetchone() or (0, 0))[1] or 0.0)
             return {
                 "ai_closed_trades": closed_ai,
                 "closed_ai_trades_today": closed_ai,
@@ -21449,6 +22864,15 @@ class PortfolioEngine:
 
         data = dict(zip(columns, row, strict=False))
         try:
+            from backend.services.live_fill_economics import sum_realized_pnl_by_mode
+
+            data["realized_pnl_audit_mixed"] = data.get("realized_pnl")
+            data["realized_pnl"] = sum_realized_pnl_by_mode(self.db_path, mode="live", day=today)
+            data["paper_realized_pnl_today"] = sum_realized_pnl_by_mode(self.db_path, mode="paper", day=today)
+            data["realized_pnl_source"] = "paper_trades.mode=live"
+        except Exception:
+            pass
+        try:
             breakdown = await asyncio.get_running_loop().run_in_executor(None, lambda: self._scoreboard_activity_breakdown_sync(today))
             data.update(breakdown)
         except sqlite3.OperationalError as exc:
@@ -21492,21 +22916,21 @@ class PortfolioEngine:
         risk_pct = (self._total_open_risk / self._total_equity * 100) if self._total_equity > 0 else 0
         risk_cap_pct = MAX_TOTAL_OPEN_RISK_PCT * 100
 
-        # F7: effective mode from runtime switch (EXECUTION_MODE + LIVE_TRADES_ALLOWED)
-        from backend.services.execution_mode_service import is_live_execution_allowed_sync
-
-        effective_live = self._live_service is not None and self._live_execution_enabled and is_live_execution_allowed_sync()
         from backend.config.live_test_mode import get_live_test_api_fields
+        from backend.services.operator_account_status import account_operator_labels
         from backend.services.operator_config_service import get_max_open_positions
 
-        mode = "LIVE" if effective_live else "PAPER"
+        labels = account_operator_labels(live_client_present=self._live_service is not None)
         capability = self.get_trading_capability_status()
         ks = self.get_kill_switch_status()
         return {
-            "mode": mode,
-            "live_execution_enabled": bool(self._live_execution_enabled),
-            "live_service_connected": bool(self._live_service is not None),
-            "real_orders_enabled": effective_live,
+            "mode": labels["mode"],
+            "account_execution_live": labels["account_execution_live"],
+            "live_execution_enabled": bool(labels["real_orders_enabled"]),
+            "live_service_connected": labels["live_service_connected"],
+            "real_orders_enabled": labels["real_orders_enabled"],
+            "day_entry_execution_mode": labels["day_entry_execution_mode"],
+            "trailing_buy_execution_mode": labels["trailing_buy_execution_mode"],
             "kill_switch": ks.get("mode"),
             "kill_switch_reason": capability.get("kill_switch_reason") or ks.get("reason"),
             "requested_kill_mode": capability.get("requested_kill_mode") or ks.get("requested_kill_mode"),
@@ -21527,7 +22951,12 @@ class PortfolioEngine:
             "cash_balance": round(self.cash_balance, 2),
             "positions_value": round(self._positions_value, 2),
             "total_equity": round(self._total_equity, 2),
-            "open_positions_count": len(self.open_positions),
+            "open_positions_count": self._count_live_slots(),
+            "slots_used": self._count_live_slots(),
+            "reservations_count": len(getattr(self, "_entry_reservations", None) or {}),
+            "day_mode_display": labels["day_mode_display"],
+            "scalp_mode_display": labels["scalp_mode_display"],
+            "operator_mode_labels": labels["operator_mode_labels"],
             "max_positions": get_max_open_positions(),
             "total_open_risk": round(self._total_open_risk, 2),
             "open_risk_pct": round(risk_pct, 2),

@@ -175,6 +175,21 @@ async def get_comprehensive_health() -> dict[str, Any]:
             },
             "recommendations": get_health_recommendations(memory_mb, cpu_percent),
         }
+        try:
+            from backend.database_schema import DATABASE_PATH
+            from backend.services.sqlite_large_table_retention import storage_report
+
+            health_status["storage"] = storage_report(DATABASE_PATH)
+            if str(health_status["storage"].get("severity") or "") in {"WARNING", "CRITICAL"}:
+                health_status["recommendations"].append(
+                    {
+                        "level": health_status["storage"]["severity"],
+                        "issue": f"Disk free {health_status['storage'].get('filesystem_free_gib')} GiB",
+                        "action": "Run authorized telemetry retention; never delete fills or candles",
+                    }
+                )
+        except Exception as exc:
+            health_status["storage"] = {"error": str(exc)[:200]}
 
         return health_status
 

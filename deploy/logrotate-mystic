@@ -1,0 +1,29 @@
+# Bounded rotation for Mystic process logs.
+#
+# start_mystic.sh redirects each process's stdout/stderr into logs/*.log with a
+# shell redirect, so the descriptor stays open for the life of the process and
+# Python's RotatingFileHandler does not apply. `copytruncate` is therefore
+# required: the active log is copied and then truncated in place, so the running
+# process keeps writing to the same descriptor and no log is deleted or renamed
+# out from under it. Because the copy is a separate file that nothing writes to,
+# it is safe to gzip it on the same pass rather than deferring a cycle.
+#
+# Install (as root on mystic-prod):
+#   cp /home/mystic/mystic/deploy/logrotate-mystic /etc/logrotate.d/mystic
+#   chmod 644 /etc/logrotate.d/mystic
+#   logrotate --debug /etc/logrotate.d/mystic    # verify only, changes nothing
+#   logrotate --force /etc/logrotate.d/mystic    # first rotation
+#
+# Bounded footprint: 20 MB active + 5 compressed backups per log. These logs are
+# repetitive line-oriented text and gzip at roughly 15-20x, so the steady state
+# is about 20 MB + 5 x ~1.2 MB = ~26 MB per rotating log.
+
+/home/mystic/mystic/logs/*.log {
+    size 20M
+    rotate 5
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su mystic mystic
+}

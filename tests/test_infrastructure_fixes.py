@@ -1,4 +1,5 @@
 import asyncio
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,10 @@ def test_db_default_path_and_engine_singleton(monkeypatch):
 
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("MYSTIC_DB_PATH", raising=False)
-    assert db._database_url() == f"sqlite:///{Path(database_schema.DATABASE_PATH).resolve()}"
+    resolved = Path(database_schema.DATABASE_PATH).resolve()
+    assert resolved != Path("/home/mystic/mystic/mystic_trading.db").resolve()
+    assert db._database_url() == f"sqlite:///{resolved}"
+    assert "/home/mystic/mystic/mystic_trading.db" not in db._database_url()
 
     db._engine = None
     first = db.get_engine()
@@ -21,6 +25,24 @@ def test_db_default_path_and_engine_singleton(monkeypatch):
     finally:
         first.dispose()
         db._engine = None
+
+
+def test_suite_env_never_points_at_canonical_book():
+    forbidden = str(Path("/home/mystic/mystic/mystic_trading.db").resolve())
+    for key in ("DATABASE_PATH", "DATABASE_URL", "MYSTIC_DB_PATH", "TRADING_DB_PATH", "MYSTIC_TRADING_DB_PATH"):
+        assert forbidden not in os.environ.get(key, "")
+
+
+def test_database_url_honors_database_path_env(monkeypatch, tmp_path):
+    from backend.services import db
+
+    isolated = tmp_path / "isolated_suite.db"
+    isolated.write_text("")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("MYSTIC_DB_PATH", raising=False)
+    monkeypatch.setenv("DATABASE_PATH", str(isolated))
+    assert db._database_url() == f"sqlite:///{isolated.resolve()}"
+    assert "/home/mystic/mystic/mystic_trading.db" not in db._database_url()
 
 
 def test_db_explicit_urls_remain_supported(monkeypatch):

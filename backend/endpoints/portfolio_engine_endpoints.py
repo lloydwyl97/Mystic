@@ -17,6 +17,7 @@ import contextlib
 import logging
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -71,6 +72,39 @@ def _ts_after_cutover(ts: str | None, cutover_epoch: int) -> bool:
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/portfolio-engine", tags=["Portfolio Engine"])
+
+
+def _authoritative_positions_value(ledger: dict[str, Any]) -> float:
+    """Marked-to-market position value from the ledger. Reporting only.
+
+    Prefers the authoritative scalar the ledger publishes. Falls back to summing a
+    `positions` collection only when one is actually present, so this never
+    reports 0.0 for an account that holds positions.
+    """
+    raw = (ledger or {}).get("positions_value")
+    if raw not in (None, ""):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    rows = (ledger or {}).get("positions")
+    if isinstance(rows, list) and rows:
+        total = 0.0
+        for pos in rows:
+            if not isinstance(pos, dict):
+                continue
+            value = pos.get("current_value")
+            if value in (None, ""):
+                try:
+                    value = float(pos.get("quantity") or 0) * float(pos.get("current_price") or 0)
+                except (TypeError, ValueError):
+                    value = 0.0
+            try:
+                total += float(value or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return total
+    return 0.0
 
 
 def _validate_accounting_identity(cash: float, positions: float, equity: float, realized: float, unrealized: float, total_pnl: float) -> dict[str, Any]:
@@ -134,7 +168,7 @@ async def _refresh_engine_from_sqlite_for_live(engine: Any, *, allow_mutations: 
 
 
 def _sqlite_open_positions_count_sync() -> int:
-    """Count open rows in portfolio_engine_positions (quantity > 0)."""
+    """Count live open rows. DUST_PENDING leftover quantity does not occupy a slot."""
     conn = None
     try:
         conn = connect_ro(DATABASE_PATH, timeout_sec=2.0)
@@ -142,7 +176,12 @@ def _sqlite_open_positions_count_sync() -> int:
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='portfolio_engine_positions'")
         if not cursor.fetchone():
             return 0
-        cursor.execute("SELECT COUNT(*) FROM portfolio_engine_positions WHERE quantity > 0")
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM portfolio_engine_positions
+            WHERE quantity > 0 AND COALESCE(status, 'ACTIVE') != 'DUST_PENDING'
+            """
+        )
         row = cursor.fetchone()
         return int(row[0] or 0) if row else 0
     except Exception as e:
@@ -216,7 +255,12 @@ def _read_operator_status_from_sqlite_sync() -> dict[str, Any] | None:
             cash_balance, total_equity, positions_value, account_status, trading_paused, pause_reason = row
             principal = 0.0
 
-        cursor.execute("SELECT COUNT(*) FROM portfolio_engine_positions WHERE quantity > 0")
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM portfolio_engine_positions
+            WHERE quantity > 0 AND COALESCE(status, 'ACTIVE') != 'DUST_PENDING'
+            """
+        )
         pos_row = cursor.fetchone()
         open_positions_count = pos_row[0] if pos_row else 0
 
@@ -297,6 +341,64 @@ async def _read_positions_for_risk_from_sqlite() -> list[dict[str, Any]]:
     return await asyncio.to_thread(_read_positions_for_risk_from_sqlite_sync)
 
 
+@router.get("/pnl-reconciliation")
+async def get_pnl_reconciliation(force: bool = False) -> dict[str, Any]:
+    """Live result reconciled against Binance.US fills, separated from paper.
+
+    ``paper_trades`` holds paper and live rows in one table and the stored
+    ``portfolio_engine_ledger.realized_pnl`` is a historical sum of both.
+    Reporting that total as performance credits the live account with
+    simulated profit earned before live execution began.
+
+    Returns three separated figures, the matched/unmatched fill counts,
+    exchange fees and the reconciliation window. Nothing is rewritten.
+    """
+    try:
+        from backend.database_schema import DATABASE_PATH
+        from backend.services.execution_mode_service import is_live_execution_allowed_sync
+        from backend.services.live_exchange_equity import equity_basis_from_db
+        from backend.services.live_pnl_reconciliation import (
+            account_basis_for_presentation,
+            get_reconciliation,
+            presentation_fields,
+        )
+
+        recon = await get_reconciliation(str(DATABASE_PATH), force=bool(force))
+        ledger = {}
+        try:
+            conn = sqlite3.connect(f"file:{DATABASE_PATH}?mode=ro", uri=True, timeout=5)
+            row = conn.execute("SELECT principal, cash_balance, total_equity FROM portfolio_engine_ledger WHERE id=1").fetchone()
+            conn.close()
+            if row:
+                ledger = {
+                    "principal": float(row[0] or 0.0),
+                    "cash_balance": float(row[1] or 0.0),
+                    "total_equity": float(row[2] or 0.0),
+                }
+        except Exception:
+            ledger = {}
+        return {
+            "success": True,
+            "data": recon,
+            "presentation": presentation_fields(
+                recon,
+                is_live=bool(is_live_execution_allowed_sync()),
+                **account_basis_for_presentation(
+                    str(DATABASE_PATH),
+                    **equity_basis_from_db(
+                        str(DATABASE_PATH),
+                        cash_usdt=float(ledger.get("cash_balance") or ledger.get("total_equity") or 0.0),
+                        principal=float(ledger.get("principal") or 0.0),
+                    ),
+                ),
+            ),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception("Error building live P&L reconciliation: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.get("/ledger")
 async def get_portfolio_ledger() -> dict[str, Any]:
     """
@@ -331,7 +433,10 @@ async def get_portfolio_ledger() -> dict[str, Any]:
         # BUG #30 FIX: Validate equity invariant
         # INVARIANT: total_equity should equal cash_balance + positions_value
         cash_balance = float(ledger.get("cash_balance", 0))
-        positions_value = sum(pos.get("current_value", pos.get("quantity", 0) * pos.get("current_price", 0)) for pos in ledger.get("positions", []))
+        # The ledger exposes the authoritative scalar `positions_value`; it has no
+        # `positions` collection. Summing that absent key yielded 0.0 and raised a
+        # false EQUITY INVARIANT BROKEN alarm on every call with an open position.
+        positions_value = _authoritative_positions_value(ledger)
         total_equity = float(ledger.get("total_equity", 0))
         expected_equity = cash_balance + positions_value
 
@@ -454,14 +559,51 @@ async def get_portfolio_performance() -> dict[str, Any]:
                 f"ACCOUNTING_MISMATCH in /performance: total_equity={total_equity:.2f} != cash={cash:.2f} + positions={positions:.2f}",
             )
 
+        # The displayed trading result is the exchange-reconciled live figure.
+        # Paper and the stored legacy total are reported beside it, never as
+        # live performance.
+        pnl_presentation: dict[str, Any] = {}
+        try:
+            from backend.services.live_exchange_equity import equity_basis_from_db
+            from backend.services.live_pnl_reconciliation import (
+                account_basis_for_presentation,
+                get_reconciliation,
+                presentation_fields,
+            )
+
+            # Cache only: /performance must not wait on exchange round trips.
+            # The dedicated /pnl-reconciliation poll refreshes the cache.
+            _recon = await get_reconciliation(str(DATABASE_PATH), cached_only=True)
+            pnl_presentation = presentation_fields(
+                _recon,
+                is_live=account_execution_mode == "live",
+                **account_basis_for_presentation(
+                    str(DATABASE_PATH),
+                    **equity_basis_from_db(
+                        str(DATABASE_PATH),
+                        cash_usdt=cash,
+                        principal=principal,
+                    ),
+                ),
+            )
+        except Exception as exc:
+            logger.warning("PNL_RECONCILIATION_UNAVAILABLE: %s", exc)
+            pnl_presentation = {
+                "primary_result_label": "LIVE (recorded, not exchange-reconciled)",
+                "primary_result_is_exchange_reconciled": False,
+                "reconciliation_error": str(exc)[:200],
+            }
+
         return {
             "success": True,
+            "pnl_presentation": pnl_presentation,
             "performance": {
                 "account_execution_mode": account_execution_mode,
                 "realized_pnl": realized_pnl,
                 "realized_pnl_live": realized_pnl_live,
                 "realized_pnl_paper_historical": realized_pnl_paper_historical,
                 "realized_pnl_ledger_stored": realized_pnl_ledger_stored,
+                "realized_pnl_ledger_stored_label": "LEGACY MIXED TOTAL (historical, not live profit)",
                 "unrealized_pnl": unrealized_pnl,
                 "total_pnl": total_pnl,
                 "component_pnl_sum": realized_pnl + unrealized_pnl,
@@ -572,14 +714,48 @@ async def get_portfolio_status() -> dict[str, Any]:
         except Exception as e:
             logger.debug("STATUS_DEGRADED_CHECK skipped: %s", e)
 
+        pnl_presentation: dict[str, Any] = {}
+        try:
+            from backend.database_schema import DATABASE_PATH
+            from backend.services.execution_mode_service import is_live_execution_allowed_sync
+            from backend.services.live_pnl_reconciliation import (
+                account_basis_for_presentation,
+                get_reconciliation,
+                presentation_fields,
+            )
+
+            _recon = await get_reconciliation(str(DATABASE_PATH), cached_only=True)
+            net_liq = status.get("net_liquidatable_equity")
+            pnl_presentation = presentation_fields(
+                _recon,
+                is_live=bool(is_live_execution_allowed_sync()),
+                **account_basis_for_presentation(
+                    str(DATABASE_PATH),
+                    current_equity=float(status.get("cash_usdt") or status.get("cash_balance") or 0.0),
+                    forward_baseline_equity=float(status.get("forward_baseline_equity") or status.get("principal") or 0.0),
+                    net_liquidatable_equity=float(net_liq) if net_liq is not None else None,
+                    baseline_dust_known=bool(status.get("baseline_dust_known")),
+                ),
+            )
+            status["pnl_presentation"] = pnl_presentation
+        except Exception as exc:
+            logger.warning("STATUS_PNL_RECONCILIATION_UNAVAILABLE: %s", exc)
+            pnl_presentation = {
+                "primary_result_label": "LIVE (recorded, not exchange-reconciled)",
+                "primary_result_is_exchange_reconciled": False,
+                "reconciliation_error": str(exc)[:200],
+            }
+            status["pnl_presentation"] = pnl_presentation
+
         # Ensure we show non-zero equity from adopted data
         return {
             "success": True,
             "data": status,
+            "pnl_presentation": pnl_presentation,
             "canonical_source": "portfolio_engine_ledger",
             "adopted_equity": status.get("total_equity", engine._total_equity),
             "adopted_cash": status.get("cash_balance", engine.cash_balance),
-            "adopted_positions": len(engine.open_positions),
+            "adopted_positions": engine._count_live_slots(),
             "dust_pending_positions_current": engine_status["dust_pending_positions_current"],
             "dust_drift_events_total": engine_status["dust_drift_events_total"],
             "dust_reconcile_runs_total": engine_status["dust_reconcile_runs_total"],
@@ -1939,9 +2115,10 @@ async def get_trade_drilldown(trade_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-@router.get("/model-panel")
-async def get_model_panel() -> dict[str, Any]:
-    """Read-only model/learning visibility per top-4 symbol (no auto-promotion)."""
+def _build_model_panel_sync() -> dict[str, Any]:
+    """Blocking model-panel build. Runs sklearn inference over every holdout row
+    for all four symbols and reads a multi-gigabyte SQLite file, so it must never
+    execute on the event loop."""
     try:
         from backend.database_schema import DATABASE_PATH
         from backend.services.ai_market_diagnostics import build_model_freshness_report
@@ -2031,7 +2208,46 @@ async def get_model_panel() -> dict[str, Any]:
         }
     except Exception as e:
         logger.exception("Error building model panel: %s", e)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        raise
+
+
+_MODEL_PANEL_TTL_SEC = 300.0
+_model_panel_cache: tuple[float, dict[str, Any]] | None = None
+_model_panel_lock = asyncio.Lock()
+
+
+@router.get("/model-panel")
+async def get_model_panel() -> dict[str, Any]:
+    """Read-only model/learning visibility per top-4 symbol (no auto-promotion).
+
+    The dashboard polls this on every background cycle. The build takes minutes,
+    so it is offloaded to a worker thread, served from a TTL cache, and guarded
+    by a single-flight lock; concurrent pollers share one build instead of
+    stacking copies of it.
+    """
+    global _model_panel_cache
+
+    def _fresh() -> dict[str, Any] | None:
+        cached = _model_panel_cache
+        if cached and (time.monotonic() - cached[0]) < _MODEL_PANEL_TTL_SEC:
+            return cached[1]
+        return None
+
+    hit = _fresh()
+    if hit is not None:
+        return hit
+
+    async with _model_panel_lock:
+        hit = _fresh()
+        if hit is not None:
+            return hit
+        try:
+            payload = await asyncio.to_thread(_build_model_panel_sync)
+        except Exception as e:
+            logger.exception("Error building model panel: %s", e)
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        _model_panel_cache = (time.monotonic(), payload)
+        return payload
 
 
 @router.get("/ai-signals-panel")
@@ -2150,9 +2366,11 @@ async def get_operator_status() -> dict[str, Any]:
         sqlite_data = await _read_operator_status_from_sqlite()
         if sqlite_data:
             status.update(sqlite_data)
-            from backend.services.circuit_breaker_service import account_failsafe_tripped, read_persisted_entry_control
+            from backend.services.canonical_failsafe_equity import decide_account_failsafe
+            from backend.services.circuit_breaker_service import read_persisted_entry_control
+            from backend.services.operator_account_status import account_operator_labels
 
-            ledger_equity = float(sqlite_data.get("cash_balance") or 0) + float(sqlite_data.get("positions_value") or 0)
+            status.update(account_operator_labels(live_client_present=bool(status.get("live_service_connected"))))
             principal = float(sqlite_data.get("principal") or 0)
             persisted = read_persisted_entry_control(DATABASE_PATH)
             status["requested_kill_mode"] = persisted.get("requested_kill_mode")
@@ -2160,8 +2378,9 @@ async def get_operator_status() -> dict[str, Any]:
             status["equity_circuit_breaker_active"] = bool(persisted.get("equity_circuit_breaker_active"))
             status["daily_loss_freeze_active"] = bool(persisted.get("daily_loss_freeze_active"))
             status["entry_control_updated_at"] = persisted.get("updated_at")
-            if account_failsafe_tripped(ledger_equity, principal) or persisted.get("account_failsafe_active"):
-                reason = f"ACCOUNT_FAILSAFE equity=${ledger_equity:.2f} principal=${principal:.2f} — MANUAL POSITION REVIEW REQUIRED"
+            fs = decide_account_failsafe(engine._canonical_nle_snapshot, principal)
+            if fs.get("tripped"):
+                reason = f"ACCOUNT_FAILSAFE equity=${float(fs.get('nle') or 0):.2f} principal=${principal:.2f} — MANUAL POSITION REVIEW REQUIRED"
                 status["kill_switch"] = "PAUSE_BUYS"
                 status["kill_switch_reason"] = reason
                 status["failsafe_active"] = True

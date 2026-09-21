@@ -96,14 +96,25 @@ class PerformanceAnalyticsService:
                     SELECT trade_id, symbol, quantity, price, entry_price,
                            pnl, pnl_pct, hold_time_seconds, fees_paid,
                            slippage_cost, exit_type, exit_r_multiple,
-                           timestamp, entry_timestamp, strategy
+                           timestamp, entry_timestamp, strategy, order_id
                     FROM paper_trades
                     WHERE side = 'SELL' AND pnl IS NOT NULL
-                      AND COALESCE(exit_type, '') NOT IN ('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR')
+                      AND COALESCE(mode, '') = 'live'
+                      AND TRIM(COALESCE(order_id, '')) != ''
+                      AND COALESCE(status, '') NOT IN ('dust_writeoff', 'pending', 'rejected')
+                      AND COALESCE(exit_type, '') NOT IN (
+                        'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
+                        'DUST_WRITEOFF', 'EXCHANGE_RECONCILE_CLOSE', 'HUMAN_MANUAL_SELL'
+                      )
                     ORDER BY timestamp ASC
                 """).fetchall()
                 loaded = 0
+                seen_oids: set[str] = set()
                 for row in sells:
+                    oid = str(row["order_id"] or "").strip()
+                    if not oid or oid in seen_oids:
+                        continue
+                    seen_oids.add(oid)
                     try:
                         exit_time = datetime.fromisoformat(row["timestamp"])
                         entry_ts = row["entry_timestamp"]

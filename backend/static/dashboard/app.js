@@ -62,6 +62,7 @@ const BACKGROUND_ENDPOINTS = [
     { path: "/api/portfolio-engine/model-panel", key: "modelPanel" },
     { path: "/api/ai-diagnostics/missed-opportunities?limit=30", key: "missedOpportunities" },
     { path: "/api/portfolio-engine/trading-economics", key: "tradingEconomics" },
+    { path: "/api/portfolio-engine/pnl-reconciliation", key: "pnlReconciliation" },
     { path: "/api/portfolio-engine/scoreboard?days=7", key: "scoreboard7d" },
     { path: "/api/scalp/status", key: "scalpStatus", timeoutMs: SCALP_STATUS_TIMEOUT_MS },
     { path: "/api/context/market-role/summary", key: "marketRoleSummary" },
@@ -203,6 +204,7 @@ function init() {
     initLiveBalanceWidget();
     initLiveTestCard();
     initRestartBanner();
+    initCanonicalCandles();
 }
 
 const ENDPOINT_FRESHNESS = {};
@@ -1009,6 +1011,9 @@ function updateUI(key, data, stale) {
         case "tradingEconomics":
             updateTradingEconomics(data);
             break;
+        case "pnlReconciliation":
+            updatePnlReconciliation(data, stale);
+            break;
         case "scalpStatus":
             updateScalpEngineStatus(data, stale);
             break;
@@ -1587,6 +1592,114 @@ function refreshEnginesPanelFromCache() {
     setPnlCard("eng-day-pnl", dayPnl, sb.trades);
     set("eng-day-scoreboard", sb.pass_fail || sb.status || "--");
     refreshCommandCenter();
+}
+
+// Trading result presentation. The primary figure is the live result
+// reconciled against Binance.US fills. Paper is shown separately and the
+// stored ledger total is labelled historical, because that value mixes
+// simulated paper profit with live results and is not trading performance.
+function updatePnlReconciliation(res, stale) {
+    const wrap = res && typeof res === "object" ? res : {};
+    const p = wrap.presentation || {};
+    const d = wrap.data || {};
+    if (!Object.keys(p).length) return;
+
+    const money = (v) => (v == null || Number.isNaN(Number(v)) ? "--" : (Number(v) >= 0 ? "+" : "") + "$" + Number(v).toFixed(2));
+    const signed = (id, v) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = money(v);
+        el.classList.remove("pnl-pos", "pnl-neg");
+        if (v != null && !Number.isNaN(Number(v))) el.classList.add(Number(v) >= 0 ? "pnl-pos" : "pnl-neg");
+    };
+
+    const reconciled = p.primary_result_is_exchange_reconciled === true;
+    signed("pnl-live-reconciled", reconciled ? p.live_reconciled_usd : p.live_recorded_usd);
+    const primaryEl = document.getElementById("pnl-live-reconciled");
+    if (primaryEl) {
+        primaryEl.title = reconciled
+            ? "Binance.US venue gross minus venue quote fees. The real trading result."
+            : "Exchange reconciliation unavailable — showing the engine's recorded live figure, which is not venue-confirmed.";
+    }
+    setCardText("pnl-live-source", reconciled ? "Binance.US reconciled" : "RECORDED ONLY — not venue-confirmed");
+    signed("pnl-live-recorded", p.live_recorded_usd);
+    signed("pnl-live-dust", p.live_dust_writeoff_usd);
+    signed("pnl-paper", p.paper_realized_usd);
+    signed("pnl-legacy", p.legacy_mixed_total_usd);
+
+    const legacyEl = document.getElementById("pnl-legacy");
+    if (legacyEl) {
+        // Never let the mixed total read as profit.
+        legacyEl.classList.remove("pnl-pos", "pnl-neg");
+        legacyEl.title = "Historical stored ledger value. Mixes paper with live. NOT live trading profit.";
+    }
+    const paperEl = document.getElementById("pnl-paper");
+    if (paperEl) paperEl.title = "Simulated trades only. Not live performance.";
+
+    setCardText("pnl-fees", p.exchange_fees_quote_usd != null ? "$" + Number(p.exchange_fees_quote_usd).toFixed(4) : "--");
+    setCardText("pnl-matched", (p.matched_recorded_rows != null ? p.matched_recorded_rows : "--") + " rows / " + (p.matched_fills != null ? p.matched_fills : "--") + " fills");
+    setCardText(
+        "pnl-unmatched",
+        (p.unmatched_recorded_rows != null ? p.unmatched_recorded_rows : "--") + " rows / " + (p.unmatched_venue_fills != null ? p.unmatched_venue_fills : "--") + " fills"
+    );
+    setCardText("pnl-coverage", p.qty_coverage_pct != null ? Number(p.qty_coverage_pct).toFixed(2) + "%" : "--");
+    const ws = String(p.reconciliation_window_start || "").slice(0, 19).replace("T", " ");
+    const we = String(p.reconciliation_window_end || "").slice(0, 19).replace("T", " ");
+    setCardText("pnl-window", ws && we ? ws + " → " + we : "--");
+    setCardText("pnl-mode", String(p.account_execution_mode || "--").toUpperCase());
+
+    const noteEl = document.getElementById("pnl-notes");
+    if (noteEl) {
+        const notes = Array.isArray(p.notes) ? p.notes.slice() : [];
+        if (p.reconciliation_error) notes.unshift("Reconciliation error: " + p.reconciliation_error);
+        if (p.reconciliation_stale || stale || d.cached) {
+            const age = d.cache_age_sec != null ? " (cache age " + Number(d.cache_age_sec).toFixed(0) + "s)" : "";
+            notes.push((p.reconciliation_stale ? "Showing last good reconciliation" : "Cached reconciliation") + age);
+        }
+        noteEl.innerHTML = "";
+        notes.forEach((n) => {
+            const li = document.createElement("li");
+            li.textContent = n;
+            noteEl.appendChild(li);
+        });
+    }
+
+    const tbody = document.getElementById("pnl-recon-tbody");
+    if (tbody) {
+        const rows = Array.isArray(d.per_symbol) ? d.per_symbol : [];
+        tbody.innerHTML = "";
+        if (!rows.length) {
+            const tr = document.createElement("tr");
+            const td = document.createElement("td");
+            td.colSpan = 8;
+            td.textContent = p.reconciliation_error ? "Reconciliation unavailable" : "Loading...";
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+        }
+        rows.forEach((s) => {
+            const tr = document.createElement("tr");
+            const cells = [
+                s.symbol,
+                s.venue_buy_fills + " / " + s.venue_sell_fills,
+                s.recorded_buy_rows + " / " + s.recorded_sell_rows,
+                "$" + Number(s.venue_buy_notional || 0).toFixed(2),
+                "$" + Number(s.venue_sell_notional || 0).toFixed(2),
+                money(s.venue_gross_usd),
+                "$" + Number(s.venue_fee_quote_usd || 0).toFixed(4),
+                Number(s.qty_coverage_pct || 0).toFixed(1) + "%",
+            ];
+            cells.forEach((c, i) => {
+                const td = document.createElement("td");
+                td.textContent = String(c);
+                if (i === 5) {
+                    const v = Number(s.venue_gross_usd || 0);
+                    td.classList.add(v >= 0 ? "pnl-pos" : "pnl-neg");
+                }
+                tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+        });
+    }
 }
 
 function updateTradingEconomics(res) {
@@ -2691,7 +2804,7 @@ function updateExecutionMode(data) {
             badge.className = "header__mode header__mode--clickable live-test";
             badge.dataset.effectiveMode = "live-test";
         } else if (effective === "live") {
-            badge.textContent = "LIVE";
+            badge.textContent = "DAY LIVE · SCALP PAPER";
             badge.className = "header__mode header__mode--clickable live";
             badge.dataset.effectiveMode = "live";
         } else {
@@ -2720,7 +2833,7 @@ function updateOperator(data) {
             badge.className = "header__mode header__mode--clickable live-test";
             badge.dataset.effectiveMode = "live-test";
         } else if (mode === "live") {
-            badge.textContent = "LIVE";
+            badge.textContent = "DAY LIVE · SCALP PAPER";
             badge.className = "header__mode header__mode--clickable live";
             badge.dataset.effectiveMode = "live";
         } else {
@@ -2745,6 +2858,22 @@ function updateOperator(data) {
     if (pos && pos.textContent === "--" && d.open_positions_count != null) pos.textContent = String(d.open_positions_count);
     const health = document.getElementById("status-health");
     if (health && d.account_status) health.textContent = d.account_status;
+    const trail = document.getElementById("status-trailing-buy");
+    if (trail) {
+        const intents = Array.isArray(d.trailing_buy_intents) ? d.trailing_buy_intents : [];
+        if (d.day_entry_execution_error) {
+            trail.textContent = String(d.day_entry_execution_error);
+        } else if (!intents.length) {
+            trail.textContent = (d.day_entry_execution_mode || "trailing_buy") + " idle";
+        } else {
+            trail.textContent = intents.map(function (row) {
+                return (row.symbol || "") + " " + (row.state || "") +
+                    " arm=" + (row.arm_ask != null ? Number(row.arm_ask) : "--") +
+                    " low=" + (row.lowest_ask != null ? Number(row.lowest_ask) : "--") +
+                    " reb=" + (row.rebound_bps != null ? Number(row.rebound_bps).toFixed(2) : "--");
+            }).join(" | ");
+        }
+    }
 }
 
 // positions: { positions: [...] }
@@ -3667,6 +3796,103 @@ function initLiveTestCard() {
             armRow.style.display = requireArm.checked ? "flex" : "none";
         });
     }
+}
+
+function initCanonicalCandles() {
+    const symbolEl = document.getElementById("candle-symbol");
+    const intervalEl = document.getElementById("candle-interval");
+    if (!symbolEl || !intervalEl) return;
+    const reload = function () { loadCanonicalCandles(); };
+    symbolEl.addEventListener("change", reload);
+    intervalEl.addEventListener("change", reload);
+    loadCanonicalCandles();
+    setInterval(loadCanonicalCandles, 20000);
+}
+
+async function loadCanonicalCandles() {
+    const symbolEl = document.getElementById("candle-symbol");
+    const intervalEl = document.getElementById("candle-interval");
+    const errEl = document.getElementById("candle-no-data");
+    const freshEl = document.getElementById("candle-freshness");
+    if (!symbolEl || !intervalEl) return;
+    const symbol = symbolEl.value;
+    const interval = intervalEl.value;
+    try {
+        const res = await fetch("/api/market/candles?symbol=" + encodeURIComponent(symbol) + "&interval=" + encodeURIComponent(interval) + "&limit=180");
+        const data = await res.json();
+        if (!data || !data.success || !Array.isArray(data.candles) || !data.candles.length) {
+            if (errEl) {
+                errEl.style.display = "block";
+                errEl.textContent = (data && data.error) ? String(data.error) : "No data";
+            }
+            if (freshEl) freshEl.textContent = "error";
+            return;
+        }
+        if (errEl) errEl.style.display = "none";
+        const fresh = data.freshness || {};
+        if (freshEl) {
+            freshEl.textContent = interval + " · " + data.candles.length + " bars · db_age=" +
+                (fresh.database_age_sec != null ? Number(fresh.database_age_sec).toFixed(0) + "s" : "--") +
+                " · source=" + (data.source || "canonical") +
+                (interval === "4h" ? " · TELEMETRY_ONLY_NO_TRADE_AUTHORITY" : "");
+        }
+        drawCanonicalCandles(data.candles);
+        recordEndpointFreshness("canonicalCandles", true);
+    } catch (e) {
+        if (errEl) {
+            errEl.style.display = "block";
+            errEl.textContent = "data error";
+        }
+        recordEndpointFreshness("canonicalCandles", false);
+    }
+}
+
+function drawCanonicalCandles(candles) {
+    const priceCanvas = document.getElementById("chart-canonical-candles");
+    const volCanvas = document.getElementById("chart-canonical-volume");
+    if (!priceCanvas || !volCanvas) return;
+    const priceCtx = priceCanvas.getContext("2d");
+    const volCtx = volCanvas.getContext("2d");
+    const w = priceCanvas.clientWidth || 640;
+    priceCanvas.width = w;
+    volCanvas.width = w;
+    const ph = priceCanvas.height;
+    const vh = volCanvas.height;
+    priceCtx.clearRect(0, 0, w, ph);
+    volCtx.clearRect(0, 0, w, vh);
+    const highs = candles.map(function (c) { return Number(c.high); });
+    const lows = candles.map(function (c) { return Number(c.low); });
+    const vols = candles.map(function (c) { return Number(c.volume) || 0; });
+    const minP = Math.min.apply(null, lows);
+    const maxP = Math.max.apply(null, highs);
+    const maxV = Math.max.apply(null, vols.concat([0]));
+    const pad = 8;
+    const span = (maxP - minP) || (maxP * 0.0001) || 1;
+    const slot = (w - pad * 2) / candles.length;
+    candles.forEach(function (c, i) {
+        const o = Number(c.open);
+        const h = Number(c.high);
+        const l = Number(c.low);
+        const cl = Number(c.close);
+        const v = Number(c.volume) || 0;
+        const x = pad + i * slot + slot / 2;
+        const y = function (p) { return pad + (1 - (p - minP) / span) * (ph - pad * 2); };
+        const up = cl >= o;
+        const forming = !!c.forming;
+        priceCtx.strokeStyle = forming ? "#f0b90b" : (up ? "#0ecb81" : "#f6465d");
+        priceCtx.fillStyle = priceCtx.strokeStyle;
+        priceCtx.beginPath();
+        priceCtx.moveTo(x, y(h));
+        priceCtx.lineTo(x, y(l));
+        priceCtx.stroke();
+        const top = y(Math.max(o, cl));
+        const bot = y(Math.min(o, cl));
+        const bodyH = Math.max(2, bot - top);
+        priceCtx.fillRect(x - Math.max(1, slot * 0.3), top, Math.max(2, slot * 0.6), bodyH);
+        const vhgt = maxV > 0 ? (v / maxV) * (vh - 4) : 0;
+        volCtx.fillStyle = v === 0 ? "#6e7681" : (up ? "#0ecb81" : "#f6465d");
+        volCtx.fillRect(x - Math.max(1, slot * 0.3), vh - vhgt, Math.max(2, slot * 0.6), Math.max(v === 0 ? 1 : 0, vhgt));
+    });
 }
 
 if (document.readyState === "loading") {

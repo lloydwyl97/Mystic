@@ -37,7 +37,7 @@ start_live_market_data
   → start_ai_signal_generator → models/active/day/{SYMBOL}_direction.pkl → ai_signal:day:{SYMBOL}
   → start_portfolio_engine_integration._signal_consumption_loop
       → add_buy_candidate (BUY side only; SELL side = ranking penalty telemetry)
-  → _bar_processor_loop → process_bar_candidates → execute_buy_fifo
+  → _bar_processor_loop → process_bar_candidates → trailing-buy intent → execute_buy_fifo
 ```
 
 **AI controls:** direction/confidence ranking, context nudge, rule-based entry thesis (`day_trade_thesis`), expectancy trust read, optional adaptive weight read (`ADAPTIVE_SCORE_WEIGHT_ENABLED`, default **false**).
@@ -87,7 +87,7 @@ when the scalp runner is not running (core mode).
 
 ```
 _signal_consumption_loop → add_buy_candidate
-_bar_processor_loop → process_bar_candidates → execute_buy_fifo
+_bar_processor_loop → process_bar_candidates → trailing-buy intent → execute_buy_fifo
 ```
 
 No HTTP buy. No Redis bridge buy. No `execute_buy_from_signal` (removed).

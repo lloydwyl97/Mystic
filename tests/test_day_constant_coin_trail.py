@@ -6,6 +6,7 @@ import inspect
 
 import pytest
 
+from backend.config.execution_cost_model import honest_all_in_rt_pct
 from backend.services.day_controlled_exits import (
     EXIT_DAY_4H_STRUCTURE_BREAK,
     EXIT_DAY_RISK_FLOOR,
@@ -64,14 +65,13 @@ def _broken_4h() -> list[list]:
 
 
 def test_coin_profile_trail_distances_locked():
-    assert get_coin_profile("BTCUSDT")["trail"] == pytest.approx(0.0025)
-    assert get_coin_profile("ETHUSDT")["trail"] == pytest.approx(0.0025)
-    assert get_coin_profile("SOLUSDT")["trail"] == pytest.approx(0.0025)
-    assert get_coin_profile("XRPUSDT")["trail"] == pytest.approx(0.0025)
-    assert COIN_PROFILES["BTCUSDT"]["trail"] == 0.0025
-    assert COIN_PROFILES["ETHUSDT"]["trail"] == 0.0025
-    assert COIN_PROFILES["SOLUSDT"]["trail"] == 0.0025
-    assert COIN_PROFILES["XRPUSDT"]["trail"] == 0.0025
+    shared = 0.0025
+    for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"):
+        assert get_coin_profile(symbol)["trail"] == pytest.approx(shared)
+        assert COIN_PROFILES[symbol]["trail"] == shared
+        assert COIN_PROFILES[symbol]["max_hold_min"] == 300
+        assert COIN_PROFILES[symbol]["tp"] == 0.014
+        assert COIN_PROFILES[symbol]["sl"] == 0.010
 
 
 @pytest.mark.parametrize(
@@ -100,7 +100,7 @@ def test_profile_distance_holds_after_half_and_one_pct_mfe(symbol, entry, trail_
         )
         refresh_trailing_stop(pos, high, profile)
         profile_trail = high * (1.0 - trail_pct)
-        be_floor = entry * 1.0005
+        be_floor = entry * (1.0 + max(0.0005, honest_all_in_rt_pct(symbol)))
         expected = max(profile_trail, be_floor)
         assert pos.trailing_stop_price == pytest.approx(expected, rel=1e-6)
         # Verify trail uses the coin-profile distance, not a MFE-tightened one.
@@ -142,7 +142,9 @@ def test_pullback_through_constant_trail_exits():
     assert out["reason"] == EXIT_TRAILING_STOP
 
 
-def test_fourh_break_still_exits():
+def test_fourh_break_no_longer_exits():
+    """4H removed from trading authority (2026-09-17). A broken 4H no longer
+    produces a sell; the position falls to the standard exit ladder."""
     pos = _Pos(entry_price=2312.0, highest_price=2400.0, trailing_stop_price=0.0, trail_pct=0.0020)
     out = evaluate_engine_managed_exit(
         position=pos,
@@ -152,7 +154,7 @@ def test_fourh_break_still_exits():
         coin_profile=get_coin_profile("ETHUSDT"),
         bundle={"4h": _broken_4h()},
     )
-    assert out["reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
+    assert out["reason"] != EXIT_DAY_4H_STRUCTURE_BREAK
 
 
 def test_risk_floor_still_exits():
@@ -202,6 +204,9 @@ def test_rebuy_and_late_rise_are_not_permission():
 
 
 def test_be_lift_still_fires_without_tightening():
-    pos = _Pos(entry_price=100.0, highest_price=100.32, stop_price=99.0, trailing_stop_price=99.0)
+    pos = _Pos(entry_price=100.0, highest_price=100.32, stop_price=99.0, trailing_stop_price=99.0, symbol="ETH/USDT")
     assert apply_break_even_and_mfe_trail(pos, 100.32) is True
-    assert pos.stop_price == pytest.approx(100.05, rel=1e-6)
+    # Break-even is entry plus ETH's honest round trip, so filling this
+    # stop is flat-to-positive. A fixed +0.05% sat below that cost.
+    expected = 100.0 * (1.0 + max(0.0005, honest_all_in_rt_pct("ETH/USDT")))
+    assert pos.stop_price == pytest.approx(expected, rel=1e-6)

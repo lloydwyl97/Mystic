@@ -7,8 +7,8 @@ Guards:
 4. Reversal setup with bearish HTF → rewarded.
 5. Missing MTF → neutral 0.5 credit per component (no punishment for data gap).
 6. Never hard-blocks: candidate_eligible stays True in all cases.
-7. thesis_size_factor / thesis_rank_delta compound multiplicatively / additively.
-8. Env DAY_HTF_ANCHOR_ENABLED=false → no-op with score=0.5.
+7. thesis_size_factor / thesis_rank_delta stay unchanged (telemetry only).
+8. Env DAY_HTF_ANCHOR_ENABLED cannot restore rank/size authority.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ import json
 import pytest
 
 from backend.services.day_htf_anchor import (
-    SIZE_FACTOR_AT_ZERO,
     apply_htf_anchor_to_decision_data,
     compute_htf_anchor,
     htf_anchor_enabled,
@@ -128,13 +127,13 @@ def test_multiplicative_size_and_additive_rank():
         "thesis_rank_delta": -0.05,
     }
     out = apply_htf_anchor_to_decision_data(dd)
-    anchor_size = float(out["htf_anchor_size_factor"])
-    assert out["thesis_size_factor"] == pytest.approx(max(SIZE_FACTOR_AT_ZERO, 0.80 * anchor_size), rel=1e-4)
-    assert out["thesis_rank_delta"] == pytest.approx(-0.05 + float(out["htf_anchor_rank_delta"]), rel=1e-4)
+    assert out["thesis_size_factor"] == pytest.approx(0.80, rel=1e-4)
+    assert out["thesis_rank_delta"] == pytest.approx(-0.05, rel=1e-4)
+    assert out["htf_anchor_authority"] == "TELEMETRY_ONLY_NO_TRADE_AUTHORITY"
 
 
 def test_disable_flag(monkeypatch):
-    monkeypatch.setenv("DAY_HTF_ANCHOR_ENABLED", "false")
+    monkeypatch.setenv("DAY_HTF_ANCHOR_ENABLED", "true")
     assert htf_anchor_enabled() is False
     dd = {
         "setup_type_canonical": "HTF_TREND_PULLBACK",
@@ -144,6 +143,6 @@ def test_disable_flag(monkeypatch):
     }
     out = apply_htf_anchor_to_decision_data(dd)
     assert out["htf_anchor_enabled"] is False
-    assert out["htf_anchor_score"] == 0.5
     assert out["thesis_size_factor"] == 0.80
     assert out["thesis_rank_delta"] == -0.02
+    assert out["htf_anchor_authority"] == "TELEMETRY_ONLY_NO_TRADE_AUTHORITY"

@@ -721,6 +721,21 @@ def build_churn_audit(db_path: str | Path, *, min_sell_id: int = CLEAN_INFRA_MIN
             "bear_range_entry_count": _regime_bear_range_count(trades),
             "positive_ev_negative_outcome_count": sum(1 for t in trades if (t.selected_ev or 0) > 0 and t.pnl < 0),
         }
+    for sym in DAY_UNIVERSAL_PENALTY_SYMBOLS:
+        symbol_reports.setdefault(
+            sym,
+            {
+                "total_trades": 0,
+                "realized_pnl": 0.0,
+                "metrics": _metrics([]),
+                "metrics_last_5": _metrics([]),
+                "metrics_last_10": _metrics([]),
+                "exit_reason_counts": {},
+                "setup_breakdown": {},
+                "bear_range_entry_count": 0,
+                "positive_ev_negative_outcome_count": 0,
+            },
+        )
 
     xrp = symbol_reports.get("XRP/USDT", {})
     xrp_setups = xrp.get("setup_breakdown", {})

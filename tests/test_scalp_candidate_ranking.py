@@ -98,7 +98,14 @@ def test_no_rejection_wick_below_min_tradeable():
 def test_not_near_support_below_wick_when_flat():
     wick = rank_setup_signal(_soft_sig("NO_REJECTION_WICK"), regime="range", ctx=_ctx())
     support = rank_setup_signal(_soft_sig("NOT_NEAR_SUPPORT"), regime="range", ctx=_ctx())
-    assert support.rank_score > wick.rank_score
+    # Live primary rank is EV_10s; identical empty books share that primary.
+    # Soft-reject ordering lives on the static residual, not the EV primary.
+    assert support.base_score is not None and wick.base_score is not None
+    assert support.base_score > wick.base_score
+    if support.rank_components and wick.rank_components:
+        assert support.rank_components["static_rank"] > wick.rank_components["static_rank"]
+    elif not support.rank_components:
+        assert support.rank_score > wick.rank_score
 
 
 def test_passed_signal_still_eligible():

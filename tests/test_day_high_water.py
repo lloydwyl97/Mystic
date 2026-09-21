@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from backend.config.execution_cost_model import honest_all_in_rt_pct
 from backend.services.canonical_mark_price import CanonicalMark
 from backend.services.day_controlled_exits import apply_break_even_and_mfe_trail, refresh_trailing_stop
 from backend.services.day_high_water import (
@@ -17,6 +18,20 @@ from backend.services.day_high_water import (
     usable_kline_high,
 )
 from backend.services.portfolio_engine import OpenPosition, PortfolioEngine
+
+
+def _be(entry: float, symbol: str) -> float:
+    """Break-even level: entry plus the honest round trip for the symbol.
+
+    A stop at the old fixed +0.05% sat below the 6-7.6 bps round trip on
+    this universe, so filling it was a guaranteed small loss.
+    """
+    return entry * (1.0 + max(0.0005, honest_all_in_rt_pct(symbol)))
+
+
+def _activation(entry: float, trail: float, symbol: str) -> float:
+    """High-water at which the ratchet is already profitable after costs."""
+    return entry * (1.0 + honest_all_in_rt_pct(symbol)) / (1.0 - trail)
 
 
 def test_fold_high_water_is_monotonic():
@@ -97,12 +112,19 @@ def test_trail_stays_unarmed_when_valid_high_below_activation():
     assert pos.highest_price < 1.4542 * 1.005
     # Break-even trigger (0.15%) lifts stop to entry+0.05% = 1.4549271
     # when MFE (0.254%) clears the trigger. Trail itself stays unarmed (below 0.5% activation).
-    assert pos.trailing_stop_price == pytest.approx(1.4542 * 1.0005, rel=1e-6)
+    assert pos.trailing_stop_price == pytest.approx(_be(1.4542, "XRP/USDT"), rel=1e-6)
     assert pos.trail_pct == pytest.approx(0.005)
 
 
 def test_btc_wick_between_mid_samples_captures_high_and_arms():
-    """Mark mid stays below activation; 1m high crosses it. Trail arms. No sell."""
+    """Mark mid stays below activation; the 1m high is still folded in. No sell.
+
+    This wick sits below the corrected activation, so the trail does not arm
+    and only the break-even lift applies. Arming at the old
+    ``entry * (1 + trail)`` would have put the ratchet at
+    ``entry * (1 - trail**2)`` — below entry — so the first trail exit after
+    activation was a structural loss.
+    """
     entry = 80114.0
     pos = SimpleNamespace(
         symbol="BTC/USDT",
@@ -117,17 +139,47 @@ def test_btc_wick_between_mid_samples_captures_high_and_arms():
     kline_high = 80435.11
     pos.highest_price = fold_high_water(pos.highest_price, mark, kline_high)
     assert pos.highest_price == pytest.approx(80435.11)
-    activation = entry * 1.004
-    assert pos.highest_price >= activation
+    activation = _activation(entry, 0.004, "BTC/USDT")
+    assert pos.highest_price < activation
     profile = {"trail": 0.0040, "sl": 0.008, "max_hold_min": 360}
     refresh_trailing_stop(pos, mark, profile)
     raw = 80435.11 * 0.996
-    be = entry * 1.0005
+    be = _be(entry, "BTC/USDT")
     assert raw < be
     assert pos.trailing_stop_price == pytest.approx(be)
     assert pos.trail_pct == pytest.approx(0.004)
     # mid is still above BE — activation does not sell
     assert mark > pos.trailing_stop_price
+
+
+def test_btc_wick_above_corrected_activation_arms_at_constant_distance():
+    """Above the corrected activation the trail arms at the coin distance.
+
+    The resulting ratchet is at or above entry plus the honest round trip, so
+    an exit there is flat-to-positive rather than a guaranteed small loss.
+    """
+    entry = 80114.0
+    trail = 0.004
+    activation = _activation(entry, trail, "BTC/USDT")
+    kline_high = activation * 1.002
+    pos = SimpleNamespace(
+        symbol="BTC/USDT",
+        entry_price=entry,
+        highest_price=entry,
+        trailing_stop_price=0.0,
+        stop_price=entry * 0.99,
+        trail_pct=trail,
+        day_route_regime_at_entry="bull",
+    )
+    mark = kline_high * 0.9995
+    pos.highest_price = fold_high_water(pos.highest_price, mark, kline_high)
+    assert pos.highest_price >= activation
+    refresh_trailing_stop(pos, mark, {"trail": trail, "sl": 0.008, "max_hold_min": 360})
+    assert pos.trail_pct == pytest.approx(trail)
+    dist = (pos.highest_price - pos.trailing_stop_price) / pos.highest_price
+    assert dist == pytest.approx(trail, abs=1e-6)
+    net = (pos.trailing_stop_price - entry) / entry - honest_all_in_rt_pct("BTC/USDT")
+    assert net >= -1e-12, f"armed trail ratchet nets {net * 1e4:.2f} bps"
 
 
 def test_constant_profiles_unchanged_after_high_fold():
@@ -153,7 +205,7 @@ def test_constant_profiles_unchanged_after_high_fold():
         assert pos.trail_pct == pytest.approx(trail)
         if pos.highest_price >= entry * (1.0 + trail) and pos.trailing_stop_price:
             dist = (pos.highest_price - pos.trailing_stop_price) / pos.highest_price
-            be = entry * 1.0005
+            be = _be(entry, symbol)
             if pos.trailing_stop_price > be + 1e-9:
                 assert dist == pytest.approx(trail, abs=1e-6)
 
@@ -214,12 +266,13 @@ async def test_monitor_folds_kline_high_and_does_not_sell_on_activation(tmp_path
         patch("backend.services.canonical_mark_price.fetch_canonical_mark", new=AsyncMock(return_value=mark)),
         patch("backend.services.day_high_water.load_feature_1m_candles", return_value=[]),
         patch("backend.services.ai_learning_ingestion.record_position_heartbeat"),
+        patch("backend.services.portfolio_engine.get_coin_profile", return_value={"tp": 0.014, "sl": 0.010, "trail": 0.004, "max_hold_min": 100000}),
     ):
         exits = await engine.monitor_all_positions({"BTC/USDT": 80399.41}, int(time.time()))
 
     assert pos.highest_price == pytest.approx(80435.11)
     assert pos.highest_price >= 80114.0 * 1.004
-    assert pos.trailing_stop_price == pytest.approx(80114.0 * 1.0005)
+    assert pos.trailing_stop_price == pytest.approx(_be(80114.0, "BTC/USDT"))
     assert pos.trail_pct == pytest.approx(0.004)
     assert engine.execute_sell_fifo.await_count == 0
     assert exits == []
@@ -278,6 +331,7 @@ async def test_monitor_rejects_entry_minute_kline_high(tmp_path, monkeypatch):
         patch("backend.services.canonical_mark_price.fetch_canonical_mark", new=AsyncMock(return_value=mark)),
         patch("backend.services.day_high_water.load_feature_1m_candles", return_value=[]),
         patch("backend.services.ai_learning_ingestion.record_position_heartbeat"),
+        patch("backend.services.portfolio_engine.get_coin_profile", return_value={"tp": 0.014, "sl": 0.010, "trail": 0.004, "max_hold_min": 100000}),
     ):
         await engine.monitor_all_positions({"BTC/USDT": 100.4}, int(time.time()))
     assert pos.highest_price == pytest.approx(100.4)

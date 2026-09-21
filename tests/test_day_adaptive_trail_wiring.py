@@ -18,7 +18,13 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
+from backend.config.execution_cost_model import honest_all_in_rt_pct
 from backend.services.day_controlled_exits import apply_break_even_and_mfe_trail
+
+# Break-even is entry plus the honest round trip for the symbol, so hitting it
+# is flat-to-positive. The old fixed +0.05% sat below BTC's 6.04 bps round trip
+# and guaranteed a small loss every time it filled.
+BE_LEVEL = 100.0 * (1.0 + max(0.0005, honest_all_in_rt_pct("BTC/USDT")))
 
 
 def _position(**overrides) -> SimpleNamespace:
@@ -44,7 +50,7 @@ def test_uses_adaptive_trail_when_arm_history_sufficient():
     ):
         changed = apply_break_even_and_mfe_trail(pos, current_price=101.4)
     assert changed is True
-    assert pos.trailing_stop_price == pytest.approx(100.05, rel=1e-9)
+    assert pos.trailing_stop_price == pytest.approx(BE_LEVEL, rel=1e-9)
     assert pos.trailing_stop_price != pos.highest_price * (1.0 - 0.0123)
 
 
@@ -57,7 +63,7 @@ def test_falls_back_to_fixed_tier_when_history_insufficient():
         changed = apply_break_even_and_mfe_trail(pos, current_price=101.4)
     assert changed is True
     # CONSTANT: no 0.20% tier-2 tighten. BE lift only.
-    assert pos.trailing_stop_price == pytest.approx(100.05, rel=1e-9)
+    assert pos.trailing_stop_price == pytest.approx(BE_LEVEL, rel=1e-9)
     assert abs(pos.trailing_stop_price - pos.highest_price * (1.0 - 0.0020)) > 1e-6
 
 
@@ -69,4 +75,4 @@ def test_never_crashes_when_adaptive_module_raises():
     ):
         changed = apply_break_even_and_mfe_trail(pos, current_price=101.4)
     assert changed is True
-    assert pos.trailing_stop_price == pytest.approx(100.05, rel=1e-9)
+    assert pos.trailing_stop_price == pytest.approx(BE_LEVEL, rel=1e-9)

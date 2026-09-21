@@ -7,8 +7,10 @@ from backend.services.day_direct_path_ev_authority import (
     HOLD_EV,
     OLD_RANK_EXECUTION_AUTHORITY,
     decide_day_bar,
+    next_executable_path_ev_symbol,
     old_rank_telemetry,
     post_cost_economics_ev,
+    ranked_path_ev_buys,
     select_action,
 )
 from backend.services.entry_decision_authority import build_day_entry_provenance, is_model_controlled
@@ -268,9 +270,48 @@ def test_post_cost_economics_ev_missing_fields_is_none():
     assert post_cost_economics_ev({"buy_margin": -0.2, "confidence": 0.9}) is None
 
 
+def test_incident_1300_sol_unexecutable_falls_to_xrp():
+    """2026-09-11T13:00Z: path-EV picked SOL; SOL had no executable candidate."""
+    decision = {
+        "btc_path_ev": -0.0009571720316197735,
+        "eth_path_ev": -0.00016798958423291395,
+        "sol_path_ev": 0.0005046437857096659,
+        "xrp_path_ev": 0.000134682280393094,
+        "hold_ev": 0.0,
+        "selected_symbol": "SOLUSDT",
+        "selected_action": "BUY_SOLUSDT",
+    }
+    assert ranked_path_ev_buys(decision)[0][0] == "SOLUSDT"
+    assert next_executable_path_ev_symbol(decision, executable_symbols=set()) is None
+    picked = next_executable_path_ev_symbol(decision, executable_symbols={"ETHUSDT", "XRPUSDT"})
+    assert picked == ("XRPUSDT", 0.000134682280393094)
+
+
+def test_incident_1330_all_positive_keeps_btc_when_present():
+    """2026-09-11T13:30Z: BTC won path-EV with a flat book; must not silent-HOLD."""
+    decision = {
+        "btc_path_ev": 0.0018646152459471145,
+        "eth_path_ev": 0.0006903490506395694,
+        "sol_path_ev": 0.0016925963589114446,
+        "xrp_path_ev": 0.0017840153889527941,
+        "hold_ev": 0.0,
+        "selected_symbol": "BTCUSDT",
+        "selected_action": "BUY_BTCUSDT",
+    }
+    picked = next_executable_path_ev_symbol(decision, executable_symbols={"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"})
+    assert picked is not None
+    assert picked[0] == "BTCUSDT"
+    fallback = next_executable_path_ev_symbol(decision, executable_symbols={"ETHUSDT"})
+    assert fallback == ("ETHUSDT", 0.0006903490506395694)
+
+
 def test_process_bar_uses_direct_selector_not_old_queue():
     src = open("backend/services/portfolio_engine.py", encoding="utf-8").read()
     assert "_select_direct_path_ev_candidate" in src
+    assert "next_executable_path_ev_symbol" in src
+    assert "PATH_NET_FALLBACK_EXECUTABLE" in src
+    assert "THESIS_ENTRY_4H_INVALIDATION" in src
+    assert "no_clear_thesis_4h_invalidation" in src
     assert "decide_day_bar" in src
     assert "record_day_bar_authority" in src
     assert "top_candidate = _buy_queue[0]" not in src

@@ -51,11 +51,13 @@ def test_4h_rise_broken_after_close_below_prior_low():
     assert htf_4h_rise_broken(bundle) is True
 
 
-def test_breakout_thesis_not_killed_by_15m_dip_while_4h_rising():
+def test_breakout_thesis_survives_when_5m_15m_above_threshold():
+    """4H removed from thesis invalidation (2026-09-17). BREAKOUT_CONTINUATION
+    now uses only 5m/15m alignment. Above-threshold values keep thesis valid."""
     bundle = {
         "4h": _rising_4h(),
-        "5m": {"ema_align": 0.20},
-        "15m": {"ema_align": 0.20},
+        "5m": {"ema_align": 0.50},
+        "15m": {"ema_align": 0.50},
     }
     assert (
         thesis_invalidated_live(
@@ -69,7 +71,29 @@ def test_breakout_thesis_not_killed_by_15m_dip_while_4h_rising():
     )
 
 
-def test_breakout_thesis_invalid_when_4h_structure_breaks():
+def test_breakout_thesis_invalidated_when_5m_15m_weak():
+    """4H removed from thesis invalidation (2026-09-17). BREAKOUT_CONTINUATION
+    now uses only 5m/15m alignment. Weak values invalidate the thesis."""
+    bundle = {
+        "4h": _rising_4h(),
+        "5m": {"ema_align": 0.20},
+        "15m": {"ema_align": 0.20},
+    }
+    assert (
+        thesis_invalidated_live(
+            SETUP_BREAKOUT_CONTINUATION,
+            mark=2380.0,
+            invalid_level=0.0,
+            bundle=bundle,
+            entry_price=2312.0,
+        )
+        is True
+    )
+
+
+def test_breakout_thesis_not_invalid_when_4h_structure_breaks():
+    """4H removed from thesis invalidation (2026-09-17). A 4H structure break
+    alone no longer invalidates BREAKOUT_CONTINUATION."""
     bundle = {"4h": _broken_4h()}
     assert (
         thesis_invalidated_live(
@@ -79,7 +103,7 @@ def test_breakout_thesis_invalid_when_4h_structure_breaks():
             bundle=bundle,
             entry_price=2312.0,
         )
-        is True
+        is False
     )
 
 
@@ -137,7 +161,7 @@ def test_block_late_4h_entry_when_bar_is_late():
 
 
 def test_intact_4h_slot_cap_blocks_third_name():
-    assert intact_4h_slot_blocked(open_intact=2, candidate_intact=True) is True
+    assert intact_4h_slot_blocked(open_intact=2, candidate_intact=True) is False
     assert intact_4h_slot_blocked(open_intact=1, candidate_intact=True) is False
     assert intact_4h_slot_blocked(open_intact=2, candidate_intact=False) is False
 
@@ -153,7 +177,11 @@ def test_allow_rebuy_after_tp1_when_4h_broke():
     assert why == ""
 
 
-def test_engine_maps_structure_break_not_tp1():
+def test_engine_does_not_exit_on_4h_structure_break():
+    """4H removed from trading authority (2026-09-17). A broken 4H no longer
+    produces EXIT_DAY_4H_STRUCTURE_BREAK; the position falls to the standard
+    exit ladder (giveback, stall, trail, etc.)."""
+
     class _P:
         entry_price = 2312.0
         highest_price = 2400.0
@@ -170,7 +198,6 @@ def test_engine_maps_structure_break_not_tp1():
         max_hold_min = 360
         day_route_regime_at_entry = ""
 
-    # Above the risk floor, so the structure break is what closes it — not the floor.
     out = evaluate_engine_managed_exit(
         position=_P(),
         current_price=2290.0,
@@ -179,7 +206,7 @@ def test_engine_maps_structure_break_not_tp1():
         coin_profile={"max_hold_min": 360, "trail": 0.005, "sl": 0.01},
         bundle={"4h": _broken_4h()},
     )
-    assert out["reason"] == EXIT_DAY_4H_STRUCTURE_BREAK
+    assert out["reason"] != EXIT_DAY_4H_STRUCTURE_BREAK
     assert "NET_PROFIT" not in out["reason"]
     assert "PATH_EXECUTABLE" not in out["reason"]
 
@@ -209,33 +236,30 @@ def test_allow_rebuy_after_non_profit_exit():
 
 
 def test_intact_trend_profit_floor_scales_with_structural_risk():
-    """A wider 4H structure means more risk carried, so more profit is required."""
+    """4H cannot change the live profit floor."""
     tight = day_intact_profit_floor(entry_price=100.0, prior_4h_low=99.0, min_net_profit=0.001)
     wide = day_intact_profit_floor(entry_price=100.0, prior_4h_low=95.0, min_net_profit=0.001)
-    assert wide > tight
+    assert tight == wide
 
 
 def test_intact_trend_profit_floor_never_degrades_into_a_scalp_clip():
-    """The original goal stands: DAY must not clip tiny profits on a live rise."""
     floor = day_intact_profit_floor(entry_price=100.0, prior_4h_low=99.9, min_net_profit=0.004)
     assert floor >= 0.008
 
 
 def test_intact_trend_profit_floor_is_capped_so_profit_stays_reachable():
-    """A distant 4H low must not put profit-taking permanently out of reach."""
     floor = day_intact_profit_floor(entry_price=100.0, prior_4h_low=50.0, min_net_profit=0.004)
     assert floor <= 0.025
 
 
 def test_small_gain_on_intact_trend_still_holds():
     floor = day_intact_profit_floor(entry_price=91.32, prior_4h_low=89.94, min_net_profit=0.005)
-    assert floor > 0.003561  # live SOL: +0.36% must not trigger a clip
+    assert floor > 0.003561
 
 
 def test_large_gain_on_intact_trend_now_takes_profit():
-    """Regression guard: profit was previously unreachable until the trend broke."""
     floor = day_intact_profit_floor(entry_price=1.3781, prior_4h_low=1.3157, min_net_profit=0.003)
-    assert floor <= 0.024626  # live XRP: +2.46% must be bookable while 4H is intact
+    assert floor <= 0.024626
 
 
 def test_profit_is_not_gated_behind_structure_break_in_source():

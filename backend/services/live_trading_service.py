@@ -10,6 +10,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 import ccxt
@@ -286,14 +287,14 @@ class LiveTradingService:
 
                         for balance in account_data.get("balances", []):
                             asset = balance.get("asset")
-                            free = float(balance.get("free", 0))
-                            locked = float(balance.get("locked", 0))
+                            free = Decimal(str(balance.get("free") or "0"))
+                            locked = Decimal(str(balance.get("locked") or "0"))
                             total = free + locked
 
                             if total > 0:
-                                total_balances[asset] = total
-                                free_balances[asset] = free
-                                used_balances[asset] = locked
+                                total_balances[asset] = format(total, "f")
+                                free_balances[asset] = format(free, "f")
+                                used_balances[asset] = format(locked, "f")
 
                         balances[EXCHANGE_ID] = {
                             "total": total_balances,
@@ -647,20 +648,84 @@ class LiveTradingService:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
-    async def fetch_order(self, exchange: str, order_id: str, symbol: str) -> dict[str, Any]:
-        """Fetch order status from exchange. For PARTIALLY_FILLED verification."""
+    async def fetch_order(self, exchange: str, order_id: str, symbol: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Fetch order status. Numeric ids use orderId; others use origClientOrderId."""
         try:
             await self._ensure_initialized()
             if exchange.lower() in {EXCHANGE_ID.lower(), "binance", "binanceus"} and self.binance:
                 pair = _to_binance_pair(symbol)
-                order = await asyncio.to_thread(self.binance.fetch_order, id=order_id, symbol=pair)
+                extra = dict(params or {})
+                ref = str(order_id or "").strip()
+                if ref.isdigit() and "origClientOrderId" not in extra:
+                    order = await asyncio.to_thread(self.binance.fetch_order, id=ref, symbol=pair)
+                else:
+                    cid = str(extra.get("origClientOrderId") or ref)
+                    order = await asyncio.to_thread(
+                        self.binance.fetch_order,
+                        None,
+                        pair,
+                        {"origClientOrderId": cid},
+                    )
                 return {
                     "status": "success",
                     "order": _order_fill_payload(order),
                 }
             return {"status": "error", "message": "Exchange not available"}
-        except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError) as e:
-            logger.exception("fetch_order %s: %s", order_id, e)
+        except Exception as e:
+            msg = str(e)
+            code = ""
+            if "code" in msg and "-2013" in msg:
+                code = "-2013"
+            elif "code" in msg and "-1100" in msg:
+                code = "-1100"
+            logger.info("fetch_order ref=%s code=%s err=%s", order_id, code or "?", msg[:200])
+            return {"status": "error", "message": msg, "code": code}
+
+    async def fetch_order_trades(self, exchange: str, symbol: str, order_id: str) -> dict[str, Any]:
+        """Fetch the venue's per-fill trade records for one order.
+
+        Binance.US ``GET /api/v3/myTrades`` is the authoritative source for
+        per-fill trade ids. The create-order reply carries them too, but only
+        that one reply does: ``GET /order`` omits fills, so a fill whose create
+        reply was discarded can only be reconciled here. Returns the trade ids
+        exactly as the venue reports them; nothing is synthesised.
+        """
+        try:
+            await self._ensure_initialized()
+            if exchange.lower() not in {EXCHANGE_ID.lower(), "binance", "binanceus"} or not self.binance:
+                return {"status": "error", "message": "Exchange not available"}
+            pair = _to_binance_pair(symbol)
+            trades = await asyncio.to_thread(
+                self.binance.fetch_my_trades,
+                symbol=pair,
+                params={"orderId": int(order_id)} if str(order_id).isdigit() else {},
+            )
+            out = []
+            for t in trades or []:
+                if not isinstance(t, dict):
+                    continue
+                info = t.get("info") if isinstance(t.get("info"), dict) else {}
+                oid = str(t.get("order") or info.get("orderId") or "")
+                if str(order_id) and oid and oid != str(order_id):
+                    continue
+                fee = t.get("fee") if isinstance(t.get("fee"), dict) else {}
+                out.append(
+                    {
+                        "trade_id": str(t.get("id") or info.get("id") or ""),
+                        "order_id": oid,
+                        "qty": t.get("amount") or info.get("qty"),
+                        "price": t.get("price") or info.get("price"),
+                        "quote_qty": t.get("cost") or info.get("quoteQty"),
+                        "commission": fee.get("cost") if fee else info.get("commission"),
+                        "commission_asset": fee.get("currency") if fee else info.get("commissionAsset"),
+                        "taker_or_maker": t.get("takerOrMaker"),
+                        "is_maker": (t.get("takerOrMaker") == "maker") if t.get("takerOrMaker") else info.get("isBuyerMaker"),
+                        "timestamp": t.get("timestamp") or info.get("time"),
+                    }
+                )
+            return {"status": "success", "trades": out}
+        except Exception as e:  # reconciliation must never raise into trading
+            logger.warning("fetch_order_trades %s %s: %s", symbol, order_id, e)
             return {"status": "error", "message": str(e)}
 
     async def cancel_order(self, exchange: str, order_id: str, symbol: str) -> dict[str, Any]:

@@ -60,7 +60,12 @@ def _position(*, symbol: str = "XRP/USDT", qty: float = 100.0, price: float = 1.
     )
 
 
-def _trade_bind(trade_id: str, symbol: str, qty: float, price: float) -> tuple:
+def _trade_bind(trade_id: str, symbol: str, qty: float, price: float, order_id: str | None = None) -> tuple:
+    """Bind tuple for the atomic OPEN, ending with the exchange order id.
+
+    ``order_id`` is the last column; a paper open has none, which is why the
+    default is None here.
+    """
     ts = "2026-08-14T00:00:00+00:00"
     return (
         trade_id,
@@ -85,6 +90,7 @@ def _trade_bind(trade_id: str, symbol: str, qty: float, price: float) -> tuple:
         None,
         "day",
         "{}",
+        order_id,
     )
 
 
@@ -281,6 +287,7 @@ def test_open_positions_swap_not_in_place_clear():
 
 
 def test_live_reconcile_cash_sync_does_not_ratchet_principal(monkeypatch):
+    monkeypatch.setenv("DAY_ENTRY_EXECUTION_MODE", "trailing_buy")
     monkeypatch.setenv("CASH_DRIFT_SYNC_ENABLED", "true")
     monkeypatch.setenv("CASH_DRIFT_THRESHOLD_USD", "1.00")
     monkeypatch.setenv("CASH_SYNC_REQUIRE_NO_OPEN_ORDERS", "false")
@@ -313,13 +320,15 @@ def test_status_exposes_failsafe_when_not_trading_paused():
         engine._kill_switch_mode = KillSwitchMode.PAUSE_BUYS
         engine._kill_switch_reason = "CB:ACCOUNT_FAILSAFE equity=$8040"
         cap = engine.get_trading_capability_status()
-        assert cap["failsafe_active"] is True
+        assert cap["failsafe_active"] is False
         assert cap["day_entry_enabled"] is False
         assert cap["no_trade_reason"]
-        assert "ACCOUNT_FAILSAFE" in cap["no_trade_reason"]
+        assert "ACCOUNT_FAILSAFE" in str(cap.get("kill_switch_reason") or cap.get("no_trade_reason") or "")
 
 
 def test_status_and_execution_agree_when_kill_switch_resume_but_equity_low():
+    from backend.services.canonical_failsafe_equity import build_canonical_nle
+
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "status_resume.db"
         engine = _init_engine(db, cash=25_000.0)
@@ -331,6 +340,17 @@ def test_status_and_execution_agree_when_kill_switch_resume_but_equity_low():
 
         engine._kill_switch_mode = KillSwitchMode.RESUME
         engine._kill_switch_reason = ""
+        # Incomplete cash-only book cannot trip.
+        cap0 = engine.get_trading_capability_status()
+        can0, _ = engine._check_kill_switch_buy()
+        assert cap0["failsafe_active"] is False
+        assert can0 is True
+        engine._canonical_nle_snapshot = build_canonical_nle(
+            balances=[{"asset": "USDT", "free": "20984.86", "locked": "0"}],
+            bids={},
+            as_of_epoch=1_000.0,
+            now_epoch=1_001.0,
+        )
         cap = engine.get_trading_capability_status()
         ks = engine.get_kill_switch_status()
         can_buy, reason = engine._check_kill_switch_buy()

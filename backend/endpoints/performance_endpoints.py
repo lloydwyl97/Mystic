@@ -33,6 +33,8 @@ _EXCLUDED_EXIT_TYPES = (
     "RESEARCH_RESET_EXIT",
     "legacy_no_clear_position_clear",
     "EXCHANGE_RECONCILE_CLOSE",
+    "DUST_WRITEOFF",
+    "HUMAN_MANUAL_SELL",
 )
 
 # ---------- Service Resolver ----------

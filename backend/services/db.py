@@ -32,10 +32,14 @@ _engine: Engine | None = None
 _SessionLocal: sessionmaker[Session] | None = None
 
 
+def _sqlite_file_url(path: str) -> str:
+    return f"sqlite:///{Path(path).expanduser().resolve()}"
+
+
 def _database_url() -> str:
     """
-    Prefer DATABASE_URL; fallback to local SQLite (MYSTIC_DB_PATH or mystic_trading.db).
-    Also normalize postgres:// to postgresql:// for SQLAlchemy.
+    Prefer DATABASE_URL; fallback to the same sqlite file as database_schema.DATABASE_PATH.
+    MYSTIC_DB_PATH overrides DATABASE_PATH. Normalize postgres:// to postgresql://.
     """
     url = (os.getenv("DATABASE_URL") or "").strip()
     if url:
@@ -43,13 +47,13 @@ def _database_url() -> str:
         if url.startswith("postgres://"):
             url = "postgresql://" + url[len("postgres://") :]
         return url
-    configured_path = (os.getenv("MYSTIC_DB_PATH") or "").strip()
+    mystic_path = (os.getenv("MYSTIC_DB_PATH") or "").strip()
+    if mystic_path:
+        return f"sqlite:///{mystic_path}"
+    configured_path = (os.getenv("DATABASE_PATH") or "").strip()
     if configured_path:
-        db_file = configured_path
-    else:
-        # Match backend.database_schema.DATABASE_PATH without depending on CWD.
-        db_file = str(Path(__file__).resolve().parents[2] / "mystic_trading.db")
-    return f"sqlite:///{db_file}"
+        return _sqlite_file_url(configured_path)
+    return _sqlite_file_url(str(Path(__file__).resolve().parents[2] / "mystic_trading.db"))
 
 
 def _bool_env(name: str, default: bool = False) -> bool:

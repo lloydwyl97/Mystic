@@ -16,7 +16,7 @@ Score components (weighted mean):
 * momentum         — recent price momentum sign vs setup direction
 * ema_stack        — EMA alignment consistent with the setup
 
-Feature flag: DAY_HTF_ANCHOR_ENABLED (default true).
+Feature flag: DAY_HTF_ANCHOR_ENABLED is ignored. 4H cannot rank or size.
 """
 
 from __future__ import annotations
@@ -49,7 +49,9 @@ SIZE_FACTOR_AT_HALF = 0.85
 
 
 def htf_anchor_enabled() -> bool:
-    return os.getenv("DAY_HTF_ANCHOR_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    """Env cannot restore 4H rank/size authority."""
+    _ = os.getenv("DAY_HTF_ANCHOR_ENABLED")
+    return False
 
 
 TREND_LONG_SETUPS = frozenset({SETUP_HTF_TREND_PULLBACK, SETUP_BREAKOUT_CONTINUATION})
@@ -203,18 +205,7 @@ def compute_htf_anchor(
     context_payload: dict[str, Any] | None = None,
     weights: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    """Compute HTF anchor score/rank_delta/size_factor for the candidate."""
-    if not htf_anchor_enabled():
-        return {
-            "htf_anchor_enabled": False,
-            "htf_anchor_score": 0.5,
-            "htf_anchor_state": "disabled",
-            "htf_anchor_reasons": "",
-            "htf_anchor_rank_delta": 0.0,
-            "htf_anchor_size_factor": 1.0,
-            "htf_anchor_family": "",
-            "htf_anchor_components": {},
-        }
+    """Compute HTF telemetry. Scores never compound into rank or size."""
     dd = dict(decision_data or {})
     w = dict(weights or DEFAULT_WEIGHTS)
     setup = str(dd.get("setup_type_canonical") or dd.get("setup_type") or dd.get("entry_thesis") or "")
@@ -224,12 +215,13 @@ def compute_htf_anchor(
     if context_payload and isinstance(context_payload.get("mtf"), dict):
         mtf = {**mtf, **context_payload["mtf"]}
     h1 = _tf_align(mtf, "1h") if isinstance(mtf.get("1h"), dict) else None
-    h4 = _tf_align(mtf, "4h") if isinstance(mtf.get("4h"), dict) else None
+    # 4H is telemetry storage only. Do not let it move the HTF score.
+    _ = _tf_align(mtf, "4h") if isinstance(mtf.get("4h"), dict) else None
 
     momentum = _safe_float(dd.get("price_momentum"), 0.0)
     ema = _safe_float(dd.get("ema_alignment"), _safe_float(dd.get("signal_ema_alignment"), 0.5))
 
-    h_c, h_r = _h1_h4_agreement_credit(h1, h4, family)
+    h_c, h_r = _h1_h4_agreement_credit(h1, None, family)
     m_c, m_r = _momentum_credit(momentum, family)
     e_c, e_r = _ema_stack_credit(ema, family)
 
@@ -254,7 +246,7 @@ def compute_htf_anchor(
     reasons_joined = ",".join(str(v["reason"]) for v in components.values())
 
     return {
-        "htf_anchor_enabled": True,
+        "htf_anchor_enabled": False,
         "htf_anchor_score": round(score, 5),
         "htf_anchor_state": state,
         "htf_anchor_reasons": reasons_joined,
@@ -262,6 +254,7 @@ def compute_htf_anchor(
         "htf_anchor_size_factor": round(_score_to_size_factor(score), 5),
         "htf_anchor_family": family,
         "htf_anchor_components": components,
+        "htf_anchor_authority": "TELEMETRY_ONLY_NO_TRADE_AUTHORITY",
     }
 
 
@@ -270,25 +263,12 @@ def apply_htf_anchor_to_decision_data(
     *,
     context_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Stamp HTF anchor fields onto decision_data and compound into
-    thesis_size_factor / thesis_rank_delta. Ranking-only side effects.
-    """
+    """Stamp HTF telemetry only. Never compounds rank or size."""
     result = compute_htf_anchor(decision_data, context_payload=context_payload)
     dd = dict(decision_data or {})
     for k, v in result.items():
         dd[k] = v
-    if result.get("htf_anchor_enabled"):
-        try:
-            prev_size = float(dd.get("thesis_size_factor") or 1.0)
-        except (TypeError, ValueError):
-            prev_size = 1.0
-        anchor_size = float(result["htf_anchor_size_factor"])
-        dd["thesis_size_factor"] = round(max(SIZE_FACTOR_AT_ZERO, prev_size * anchor_size), 5)
-        try:
-            prev_rank_delta = float(dd.get("thesis_rank_delta") or 0.0)
-        except (TypeError, ValueError):
-            prev_rank_delta = 0.0
-        dd["thesis_rank_delta"] = round(prev_rank_delta + float(result["htf_anchor_rank_delta"]), 5)
+    dd["htf_anchor_authority"] = "TELEMETRY_ONLY_NO_TRADE_AUTHORITY"
     dd["hard_block"] = bool(dd.get("hard_block") or False)
     dd["candidate_eligible"] = True
     return dd

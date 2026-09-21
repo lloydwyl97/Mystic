@@ -66,7 +66,7 @@ ALL_SETUP_TYPES = (
     RESEARCH_SHORT_BEAR_CONTINUATION,
 )
 
-HTF_TFS = ("15m", "30m", "1h", "4h")
+HTF_TFS = ("15m", "30m", "1h")
 LTF_TFS = ("1m", "5m")
 BREAKOUT_ALT_SYMBOLS = frozenset({"SOLUSDT", "XRPUSDT", "DOGEUSDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"})
 
@@ -734,7 +734,8 @@ def bear_regime_entry_adjustment(
 
     rank_pen = 0.0
     size_mult = 1.0
-    htf_bear = (h1 is not None and h1 < 0.42) and (h4 is not None and h4 < 0.40)
+    _ = (h1, h4)
+    htf_bear = False  # 4H cannot shrink rank/size; 1h is not a replacement gate
     ltf_bounce = (m5 is not None and m5 > 0.55) or (m15 is not None and m15 > 0.52)
     strong_breakout = setup_type == SETUP_BREAKOUT_CONTINUATION and _safe_float(dd.get("thesis_score"), 0.0) >= 0.65
 
@@ -1181,7 +1182,8 @@ def resolve_day_risk_floor_price(
     max_adverse = _floor_env("DAY_RISK_FLOOR_MAX_ADVERSE_PCT", 0.06)
     min_adverse = _floor_env("DAY_RISK_FLOOR_MIN_ADVERSE_PCT", 0.02)
 
-    levels = [float(x) for x in (thesis_invalid_level, prior_4h_low) if x and 0.0 < float(x) < entry]
+    del prior_4h_low  # 4H cannot set the live risk floor
+    levels = [float(x) for x in (thesis_invalid_level,) if x and 0.0 < float(x) < entry]
     if levels:
         candidate = min(levels) * (1.0 - buffer)
     else:
@@ -1380,21 +1382,14 @@ def apply_late_4h_rank_to_decision_data(decision_data: dict[str, Any], symbol: s
         signal = late_4h_rise_signal(read_cached_day_active_bundle_sync(symbol), time.time())
     except Exception:
         signal = ""
-    rank_d, size_f = late_4h_rank_size_adjust(signal)
+    _rank_d, _size_f = late_4h_rank_size_adjust(signal)
     dd["late_4h_rise_signal"] = signal
-    dd["late_4h_rank_delta"] = rank_d
-    dd["late_4h_size_factor"] = size_f
-    if signal:
-        try:
-            prev_rank = float(dd.get("thesis_rank_delta") or 0.0)
-        except (TypeError, ValueError):
-            prev_rank = 0.0
-        try:
-            prev_size = float(dd.get("thesis_size_factor") or 1.0)
-        except (TypeError, ValueError):
-            prev_size = 1.0
-        dd["thesis_rank_delta"] = round(prev_rank + rank_d, 5)
-        dd["thesis_size_factor"] = round(max(0.20, prev_size * size_f), 5)
+    # Telemetry only. 4H cannot change rank or size, even through these stamps.
+    dd["late_4h_rank_delta"] = 0.0
+    dd["late_4h_size_factor"] = 1.0
+    dd["late_4h_computed_rank_delta"] = _rank_d
+    dd["late_4h_computed_size_factor"] = _size_f
+    dd["late_4h_authority"] = "TELEMETRY_ONLY_NO_TRADE_AUTHORITY"
     dd["hard_block"] = bool(dd.get("hard_block") or False)
     if "candidate_eligible" not in dd:
         dd["candidate_eligible"] = True
@@ -1410,14 +1405,9 @@ def should_block_late_4h_rise_entry(
 
 
 def intact_4h_slot_blocked(*, open_intact: int, candidate_intact: bool, max_open: int = 2) -> bool:
-    """True when another intact-4H name would stack onto the same tape."""
-    if not candidate_intact:
-        return False
-    try:
-        cap = int(os.getenv("DAY_INTACT_4H_MAX_POSITIONS", str(max_open)) or max_open)
-    except (TypeError, ValueError):
-        cap = int(max_open)
-    return int(open_intact) >= max(1, cap)
+    """4H cannot consume a live slot. Env cannot restore this cap."""
+    _ = (open_intact, candidate_intact, max_open, os.getenv("DAY_INTACT_4H_MAX_POSITIONS"))
+    return False
 
 
 def thesis_invalidated_live(
@@ -1447,10 +1437,8 @@ def thesis_invalidated_live(
     if not isinstance(bundle, dict):
         return False
     if entry_thesis == SETUP_HTF_TREND_PULLBACK:
-        h1 = _bundle_tf_align(bundle, "1h")
-        h4 = _bundle_tf_align(bundle, "4h")
-        if h1 is not None and h4 is not None and h1 < 0.38 and h4 < 0.40:
-            return True
+        # 4H cannot invalidate. Do not substitute a 1h-only gate.
+        _ = (_bundle_tf_align(bundle, "1h"), _bundle_tf_align(bundle, "4h"))
     if entry_thesis == SETUP_VWAP_REVERSION:
         if entry_vwap > 0 and mark < entry_vwap * 0.993:
             return True
@@ -1458,11 +1446,8 @@ def thesis_invalidated_live(
         if m5 is not None and m5 < 0.35:
             return True
     if entry_thesis == SETUP_BREAKOUT_CONTINUATION:
-        # 4H still rising: a 15m dip is not thesis death on a vertical breakout.
-        if htf_4h_rise_intact(bundle):
-            return False
-        if htf_4h_rise_broken(bundle):
-            return True
+        # 4H removed from thesis invalidation (2026-09-17).
+        # Use only 5m/15m alignment for breakout continuation.
         m5 = _bundle_tf_align(bundle, "5m")
         m15 = _bundle_tf_align(bundle, "15m")
         if m5 is not None and m15 is not None and m5 < 0.42 and m15 < 0.45:
@@ -1487,8 +1472,7 @@ def evaluate_extreme_protection(
     gross_loss = (entry_price - mark) / entry_price
 
     h1 = _bundle_tf_align(bundle, "1h") if bundle else None
-    h4 = _bundle_tf_align(bundle, "4h") if bundle else None
-    htf_collapse = h1 is not None and h4 is not None and h1 < 0.28 and h4 < 0.28
+    htf_collapse = h1 is not None and h1 < 0.28
 
     catastrophic = False
     if (net_pnl_pct <= -loss_floor and htf_collapse) or (gross_loss >= flash_floor and htf_collapse):

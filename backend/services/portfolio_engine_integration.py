@@ -38,6 +38,8 @@ from backend.config.mystic_api_schedule import (
     SIGNAL_CONSUMER_INTERVAL_SEC,
 )
 from backend.database_schema import DATABASE_PATH
+from backend.services.day_4h_label_runner import run_label_batch as run_day_4h_label_batch
+from backend.services.day_clock_v2_research_cycle import run_clock_v2_v5_cycle as _run_clock_v2_v5_cycle
 from backend.services.gate_reason_codes import GateReason
 from backend.services.live_strategy_contracts import per_coin_artifact_file
 from backend.services.portfolio_engine import (
@@ -73,6 +75,10 @@ _EXIT_MONITOR_STALE_BD_SIGNATURE = "name 'bd' is not defined"
 # tracks live marks (same recompute as API /status) without write-on-read in FastAPI.
 _LEDGER_MTM_PERSIST_INTERVAL_SEC = LEDGER_MTM_PERSIST_INTERVAL_SEC
 _LEDGER_MTM_PERSIST_INITIAL_DELAY_SEC = 5.0
+
+# Offline DAY outcome labeling. Research-only cadence; nothing in the trade path waits on it.
+_DAY_4H_LABEL_INTERVAL_SEC = float(os.getenv("DAY_4H_LABEL_INTERVAL_SEC", "1800") or "1800")
+_DAY_4H_LABEL_INITIAL_DELAY_SEC = float(os.getenv("DAY_4H_LABEL_INITIAL_DELAY_SEC", "300") or "300")
 # Tracked base coins are the live DAY top-4, sourced from the single source of
 # truth in ``backend.config.trading_universe``. Do not hardcode here.
 from backend.config.trading_universe import TOP4_BASE_COINS as _TRACKED_TRADE_BASE_SYMBOLS
@@ -289,6 +295,7 @@ class PortfolioEngineIntegration:
         if not hasattr(self, "_monitor_task") or self._monitor_task is None:
             self._monitor_task = asyncio.create_task(self._position_monitor_loop(), name="portfolio_engine:monitor")
             self._bar_processor_task = asyncio.create_task(self._bar_processor_loop(), name="portfolio_engine:bar_processor")
+            self._trailing_buy_task = asyncio.create_task(self._trailing_buy_loop(), name="portfolio_engine:trailing_buy")
             # CRITICAL FIX: Start signal consumption loop - this was MISSING!
             self._signal_consumer_task = asyncio.create_task(self._signal_consumption_loop(), name="portfolio_engine:signal_consumer")
             # CRITICAL FIX: Start price publisher loop to feed Redis with live prices
@@ -302,6 +309,7 @@ class PortfolioEngineIntegration:
             self._paper_retention_task = asyncio.create_task(self._paper_retention_loop(), name="portfolio_engine:paper_retention")
             self._large_table_retention_task = asyncio.create_task(self._large_table_retention_loop(), name="portfolio_engine:large_table_retention")
             self._ledger_mtm_task = asyncio.create_task(self._ledger_mtm_persist_loop(), name="portfolio_engine:ledger_mtm_persist")
+            self._day_4h_label_task = asyncio.create_task(self._day_4h_label_loop(), name="portfolio_engine:day_4h_label")
             try:
                 from backend.services.simplified_pnl_observation import ENABLED as _PNLOB
 
@@ -325,6 +333,11 @@ class PortfolioEngineIntegration:
                 build["python"] or "n/a",
                 build["pid"],
             )
+            with contextlib.suppress(Exception):
+                from backend.services.day_trailing_buy import recover_trailing_buy_intents
+
+                if self.engine:
+                    await recover_trailing_buy_intents(self.engine)
             try:
                 from backend.services.portfolio_engine import DAY_MODE_ENABLED
 
@@ -373,6 +386,10 @@ class PortfolioEngineIntegration:
             self._bar_processor_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._bar_processor_task
+        if getattr(self, "_trailing_buy_task", None):
+            self._trailing_buy_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._trailing_buy_task
 
         # Stop signal consumer task
         if hasattr(self, "_signal_consumer_task") and self._signal_consumer_task:
@@ -416,6 +433,10 @@ class PortfolioEngineIntegration:
             self._ledger_mtm_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._ledger_mtm_task
+        if getattr(self, "_day_4h_label_task", None):
+            self._day_4h_label_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._day_4h_label_task
 
         if getattr(self, "_pnl_observation_task", None):
             self._pnl_observation_task.cancel()
@@ -1323,6 +1344,30 @@ class PortfolioEngineIntegration:
                 {"stage": "GATES", "gate_result": GateReason.PASS, "gate_reason": GateReason.CANDIDATE_ADDED},
             )
 
+    async def _trailing_buy_loop(self) -> None:
+        """Watch fresh market_book asks and advance durable trailing-buy intents."""
+        from backend.services.day_trailing_buy import cycle_trailing_buy_intents
+
+        while self.is_running:
+            try:
+                if self.engine:
+                    summary = await cycle_trailing_buy_intents(self.engine, self.redis_client)
+                    if int(summary.get("cycled") or 0) > 0:
+                        logger.info(
+                            "TRAILING_BUY_CYCLE mode_ok=%s cycled=%s submitted=%s filled=%s closed=%s error=%s",
+                            summary.get("mode_ok"),
+                            summary.get("cycled"),
+                            summary.get("submitted"),
+                            summary.get("filled"),
+                            summary.get("closed"),
+                            summary.get("error") or "",
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("TRAILING_BUY_CYCLE_ERROR")
+            await asyncio.sleep(1.0)
+
     async def _bar_processor_loop(self) -> None:
         """Process candidates at each bar close"""
         from backend.services.day_active_market_bundle import apply_day_bundle_stagger
@@ -1391,7 +1436,15 @@ class PortfolioEngineIntegration:
                                     except Exception as rd_e:
                                         logger.debug("PE_PENDING_CLEAR: %s: %s", b, rd_e, exc_info=True)
 
-                            if result:
+                            if result and result.get("trailing_buy_armed"):
+                                logger.info(
+                                    "BAR_TRAILING_BUY_ARMED: %s intent=%s arm_ask=%s intents=%s",
+                                    result.get("symbol"),
+                                    result.get("intent_id"),
+                                    result.get("arm_ask"),
+                                    result.get("intents") or result.get("active_intent_count"),
+                                )
+                            elif result:
                                 logger.info(f"BAR_EXECUTION: {result['symbol']} | qty={result['quantity']:.6f} @ ${result['price']:.4f}")
                                 decision_id = result.get("decision_id")
                                 if decision_id and self.redis_client:
@@ -2423,6 +2476,65 @@ class PortfolioEngineIntegration:
             await asyncio.sleep(_LARGE_TABLE_RETENTION_INTERVAL_SEC)
         logger.info("LARGE_TABLE_RETENTION: Stopped")
 
+    async def _day_4h_label_loop(self) -> None:
+        """
+        Offline outcome labeling for matured DAY ranking decisions.
+
+        Research/observability only: reads the decision ledger and the 1m tape and writes
+        `day_decision_outcome_labels`. It never reads or mutates ranking, sizing, exits,
+        the order path, or the book, and every failure is swallowed so a labeling problem
+        can never disturb trading.
+        """
+        logger.info(
+            "DAY_4H_LABEL: Starting loop (every %.0fs, initial delay %.0fs)",
+            _DAY_4H_LABEL_INTERVAL_SEC,
+            _DAY_4H_LABEL_INITIAL_DELAY_SEC,
+        )
+        await asyncio.sleep(_DAY_4H_LABEL_INITIAL_DELAY_SEC)
+        while self.is_running:
+            try:
+                if self.engine:
+                    db_path = self.engine.db_path
+                    loop = asyncio.get_running_loop()
+                    summary = await loop.run_in_executor(
+                        None,
+                        lambda path=db_path: run_day_4h_label_batch(path),
+                    )
+                    if summary.get("labels_written"):
+                        logger.info(
+                            "DAY_4H_LABEL: groups=%s labels=%s authoritative=%s reconstructed=%s errors=%s",
+                            summary.get("groups_scanned"),
+                            summary.get("labels_written"),
+                            summary.get("authoritative"),
+                            summary.get("reconstructed"),
+                            summary.get("errors"),
+                        )
+                    else:
+                        logger.debug("DAY_4H_LABEL: nothing matured")
+                    # CLOCK-V2 v5 research target (3h executable net) plus the
+                    # partition/experiment authority. Separate table, separate
+                    # partition; never reads the sealed 4H lock.
+                    v5 = await loop.run_in_executor(
+                        None,
+                        lambda path=db_path: _run_clock_v2_v5_cycle(path),
+                    )
+                    if v5.get("labels_written") or v5.get("planned_inserted"):
+                        logger.info(
+                            "DAY_CLOCK_V2_V5: groups=%s labels=%s valid=%s immature=%s planned_inserted=%s readiness=%s",
+                            v5.get("groups_scanned"),
+                            v5.get("labels_written"),
+                            v5.get("valid"),
+                            v5.get("immature"),
+                            v5.get("planned_inserted"),
+                            v5.get("readiness"),
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("DAY_4H_LABEL: %s", e)
+            await asyncio.sleep(_DAY_4H_LABEL_INTERVAL_SEC)
+        logger.info("DAY_4H_LABEL: Stopped")
+
     def get_status(self) -> dict[str, Any]:
         """Get integration status"""
         dust_pending = 0
@@ -2474,9 +2586,9 @@ async def start_portfolio_integration() -> PortfolioEngineIntegration:
 # BUG #L8 FIX: Removed placeholder migrate_from_old_service function that computed/discarded values
 # without performing actual migration. If migration is needed, implement it properly with:
 # 1. Actually use the computed ATR/stop values
-# 2. Call engine.execute_buy_fifo() or create Position objects
+# 2. Confirmed trailing-buy intents call engine.execute_buy_fifo()
 # 3. Persist to SQLite ledger
-# See portfolio_engine.py execute_buy_fifo for proper position creation flow.
+# See day_trailing_buy.py and portfolio_engine.py execute_buy_fifo.
 
 
 def calculate_atr_from_ohlcv(ohlcv: list[list]) -> float:

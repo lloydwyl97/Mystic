@@ -80,7 +80,7 @@ def test_gate_registry_classification_and_ownership():
     g = get_gate("AW_NO_SIGNAL")
     assert g is not None
     assert g.layer == "strategy_signal"
-    assert g.behavior == "hard_block"
+    assert g.behavior == "telemetry"
     assert g.reason_code == "AW_NO_SIGNAL"
     assert g.status == "enabled"
     ml = get_gate("ML_RANK_SIZE")
@@ -345,10 +345,10 @@ def test_pause_all_entries_alias_allows_sells():
 
 
 def test_prepare_path_aw_no_signal_terminal_policy():
-    """Under AW owner, NO_SIGNAL is hard_block in registry — ML rank gate is rank-only."""
+    """AW NO_SIGNAL is telemetry only — ML rank gate is rank-only."""
     aw = get_gate("AW_NO_SIGNAL")
     ml = get_gate("ML_RANK_SIZE")
-    assert aw.behavior == "hard_block"
+    assert aw.behavior == "telemetry"
     assert ml.behavior == "rank"
     assert aw.dependency == "strategy_critical"
 

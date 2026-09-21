@@ -106,19 +106,22 @@ def select_action(
 ) -> dict[str, Any]:
     """Highest EV among four coins and HOLD(0). Old rank is telemetry only."""
     hold_ev = HOLD_EV
-    pairs = [
-        ("BTCUSDT", float(scores.get("btc_path_ev") or HOLD_EV)),
-        ("ETHUSDT", float(scores.get("eth_path_ev") or HOLD_EV)),
-        ("SOLUSDT", float(scores.get("sol_path_ev") or HOLD_EV)),
-        ("XRPUSDT", float(scores.get("xrp_path_ev") or HOLD_EV)),
-        (HOLD_ACTION, hold_ev),
-    ]
+    valid_map = scores.get("valid") if isinstance(scores.get("valid"), dict) else None
+    pairs: list[tuple[str, float]] = []
+    for api, key in (("BTCUSDT", "btc"), ("ETHUSDT", "eth"), ("SOLUSDT", "sol"), ("XRPUSDT", "xrp")):
+        if valid_map is not None and not valid_map.get(key, False):
+            continue
+        pairs.append((api, float(scores.get(f"{key}_path_ev") or HOLD_EV)))
+    pairs.append((HOLD_ACTION, hold_ev))
     winner_name, winner_ev = max(pairs, key=lambda p: (p[1], 0 if p[0] == HOLD_ACTION else 1))
     if winner_ev <= hold_ev:
         selected_action = HOLD_ACTION
         selected_symbol = ""
         selected_ev = hold_ev
-        why = "HOLD_WINS"
+        if valid_map is not None and not any(valid_map.values()):
+            why = "PATH_INPUT_INVALID"
+        else:
+            why = "HOLD_WINS"
         path_ev_winner = HOLD_ACTION
     else:
         selected_action = f"BUY_{winner_name}"
@@ -155,6 +158,11 @@ def select_action(
         "selected_net_expected_value": selected_ev,
         "predicted_net_return": selected_ev,
         "hold_action_ev": hold_ev,
+        "valid": valid_map,
+        "path_input_by_symbol": scores.get("path_input_by_symbol") or {},
+        "legacy_winner": path_ev_winner,
+        "shadow_correct_btc_winner": scores.get("shadow_correct_btc_winner"),
+        "winner_disagreement": bool(scores.get("shadow_correct_btc_winner") and scores.get("shadow_correct_btc_winner") != path_ev_winner),
     }
 
 
@@ -173,6 +181,40 @@ def old_rank_telemetry(candidates: list[Any] | None) -> tuple[str, float | None]
 
     top = max(rows, key=_score)
     return _api_symbol(getattr(top, "symbol", "") or ""), _score(top)
+
+
+def ranked_path_ev_buys(decision: dict[str, Any]) -> list[tuple[str, float]]:
+    """Coins whose path-EV beats HOLD, highest first. Path-EV remains the authority."""
+    hold_ev = float(decision.get("hold_ev") if decision.get("hold_ev") is not None else HOLD_EV)
+    rows: list[tuple[str, float]] = []
+    for api, key in (("BTCUSDT", "btc"), ("ETHUSDT", "eth"), ("SOLUSDT", "sol"), ("XRPUSDT", "xrp")):
+        try:
+            ev = float(decision.get(f"{key}_path_ev") or HOLD_EV)
+        except (TypeError, ValueError):
+            ev = HOLD_EV
+        if ev > hold_ev:
+            rows.append((_api_symbol(api), ev))
+    rows.sort(key=lambda item: (-item[1], item[0]))
+    return rows
+
+
+def next_executable_path_ev_symbol(
+    decision: dict[str, Any],
+    *,
+    executable_symbols: set[str] | list[str],
+) -> tuple[str, float] | None:
+    """First path-EV winner that both beats HOLD and has an executable candidate.
+
+    Production recorded BUY_SOL / BUY_BTC while execution silently HOLDed when the
+    winner had no thesis candidate. That is not HOLD_WINS. Walk the scored list.
+    """
+    allowed = {_api_symbol(s) for s in executable_symbols if _api_symbol(s)}
+    if not allowed:
+        return None
+    for api, ev in ranked_path_ev_buys(decision):
+        if api in allowed:
+            return api, ev
+    return None
 
 
 _LEARNING_VETO_CONSEC = int(os.getenv("DAY_LEARNING_VETO_CONSEC_LOSSES", "3"))

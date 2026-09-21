@@ -91,7 +91,8 @@ def test_position_persist_includes_status_and_dust():
     assert '("status", "TEXT DEFAULT \'ACTIVE\'")' in src
     assert "dust_detected_at" in src
     assert "dust_qty_canonical" in src
-    assert "status, dust_detected_at, dust_qty_canonical, last_updated" in src.replace("\n", " ")
+    assert "status, dust_detected_at, dust_qty_canonical" in src.replace("\n", " ")
+    assert "entry_decision_id, entry_intent_id, entry_reservation_id" in src.replace("\n", " ")
 
 
 def test_paper_dust_persists_before_return():

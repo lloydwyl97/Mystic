@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=41">
+    <link rel="stylesheet" href="style.css?v=42">
 </head>
 <body>
     <!-- Feature 4: Restart Required Banner -->
@@ -56,6 +56,7 @@
             <div class="status-item"><span class="status-label">DAY Equity</span><span class="status-value" id="status-equity">--</span></div>
             <div class="status-item"><span class="status-label">DAY Positions</span><span class="status-value" id="status-positions">--</span></div>
             <div class="status-item"><span class="status-label">Account</span><span class="status-value" id="status-health">--</span></div>
+            <div class="status-item"><span class="status-label">Trailing buy</span><span class="status-value" id="status-trailing-buy">--</span></div>
         </section>
         <section class="status-bar status-bar--secondary">
             <div class="status-item"><span class="status-label">Risk</span><span class="status-value" id="status-risk">--</span></div>
@@ -73,6 +74,44 @@
             </section>
         </div>
 
+        <section class="widget widget--full" id="canonical-candle-widget" aria-label="Canonical market candles">
+            <h2 class="widget__title">Market candles</h2>
+            <p class="widget__subtitle">Canonical Binance.US OHLCV — every supported timeframe. Forming bars are marked. Zero-volume doji are real exchange prints, not missing data.</p>
+            <div class="candle-controls">
+                <label>Symbol
+                    <select id="candle-symbol">
+                        <option value="BTCUSDT">BTC/USDT</option>
+                        <option value="ETHUSDT">ETH/USDT</option>
+                        <option value="SOLUSDT">SOL/USDT</option>
+                        <option value="XRPUSDT">XRP/USDT</option>
+                    </select>
+                </label>
+                <label>Timeframe
+                    <select id="candle-interval">
+                        <option value="1m">1m</option>
+                        <option value="3m">3m</option>
+                        <option value="5m">5m</option>
+                        <option value="15m">15m</option>
+                        <option value="30m">30m</option>
+                        <option value="1h">1h</option>
+                        <option value="2h">2h</option>
+                        <option value="4h">4h</option>
+                        <option value="6h">6h</option>
+                        <option value="8h">8h</option>
+                        <option value="12h">12h</option>
+                        <option value="1d">1d</option>
+                        <option value="1w">1w</option>
+                    </select>
+                </label>
+                <span class="status-value" id="candle-freshness">--</span>
+            </div>
+            <div class="widget__chart-wrap candle-chart-wrap">
+                <canvas id="chart-canonical-candles" height="220"></canvas>
+                <canvas id="chart-canonical-volume" height="70"></canvas>
+                <p class="widget__no-data" id="candle-no-data">No data</p>
+            </div>
+        </section>
+
         <section class="widget widget--full">
             <h2 class="widget__title">System health</h2>
             <p class="widget__subtitle">Process heartbeats via pgrep — not hardcoded. Redis separate check.</p>
@@ -86,6 +125,54 @@
                 <div class="readiness-card"><span class="readiness-label">Learning engine</span><span class="readiness-value" id="ph-learning">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">SCALP runner</span><span class="readiness-value" id="ph-scalp">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Live data collector (retired)</span><span class="readiness-value" id="ph-live-data-collector">--</span></div>
+            </div>
+        </section>
+
+        <!-- Trading result: live exchange-reconciled is the primary figure. -->
+        <section class="widget widget--full" id="pnl-recon-widget" aria-label="Trading result, live exchange-reconciled">
+            <h2 class="widget__title">Trading result <span class="readiness-value" id="pnl-mode" style="font-size:0.85em;margin-left:8px;">--</span></h2>
+            <p class="widget__subtitle">The primary result is the LIVE figure reconciled against Binance.US fills. Paper is simulated and is never live performance. The legacy total is historical and mixes both.</p>
+            <div class="analytics-row">
+                <div class="mini-card mini-card--primary">
+                    <span class="mini-card__label">LIVE realized — exchange-reconciled</span>
+                    <span class="mini-card__value mini-card__value--lg" id="pnl-live-reconciled">--</span>
+                    <span class="mini-card__label" id="pnl-live-source">--</span>
+                </div>
+                <div class="mini-card">
+                    <span class="mini-card__label">PAPER realized (simulated, not live)</span>
+                    <span class="mini-card__value" id="pnl-paper">--</span>
+                </div>
+                <div class="mini-card mini-card--legacy">
+                    <span class="mini-card__label">LEGACY MIXED TOTAL — historical, not live profit</span>
+                    <span class="mini-card__value" id="pnl-legacy">--</span>
+                </div>
+            </div>
+            <div class="analytics-row">
+                <div class="mini-card"><span class="mini-card__label">Live recorded (engine, pre-reconciliation)</span><span class="mini-card__value" id="pnl-live-recorded">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Live dust write-offs</span><span class="mini-card__value" id="pnl-live-dust">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Exchange fees (quote)</span><span class="mini-card__value" id="pnl-fees">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Matched (rows / fills)</span><span class="mini-card__value" id="pnl-matched">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Unmatched</span><span class="mini-card__value" id="pnl-unmatched">--</span></div>
+                <div class="mini-card"><span class="mini-card__label">Qty coverage</span><span class="mini-card__value" id="pnl-coverage">--</span></div>
+                <div class="mini-card mini-card--span2"><span class="mini-card__label">Reconciliation window (UTC)</span><span class="mini-card__value" id="pnl-window">--</span></div>
+            </div>
+            <ul class="pnl-notes" id="pnl-notes"></ul>
+            <div class="widget__table-wrap widget__table-wrap--scroll">
+                <table class="positions-table" id="pnl-recon-table">
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>Venue fills B/S</th>
+                            <th>Recorded rows B/S</th>
+                            <th>Venue buy notional</th>
+                            <th>Venue sell notional</th>
+                            <th>Venue gross</th>
+                            <th>Venue fees</th>
+                            <th>Qty coverage</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pnl-recon-tbody"><tr><td colspan="8">Loading...</td></tr></tbody>
+                </table>
             </div>
         </section>
 
@@ -699,6 +786,6 @@
     </div>
 
     <script src="vendor/chart.umd.min.js?v=4.4.1"></script>
-    <script src="app.js?v=58"></script>
+    <script src="app.js?v=59"></script>
 </body>
 </html>

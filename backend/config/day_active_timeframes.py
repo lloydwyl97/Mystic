@@ -28,6 +28,11 @@ DAY_ACTIVE_TIMEFRAMES: Final[tuple[str, ...]] = (
     "1w",
 )
 
+# 3m is a canonical chart/store interval. It is not packed into the DAY feature vector.
+# 4h remains in DAY_ACTIVE_TIMEFRAMES for storage and display. It is not required
+# for a live DAY signal: a missing 4h bundle must not delay or block a BUY.
+DAY_REQUIRED_TIMEFRAMES: Final[tuple[str, ...]] = tuple(tf for tf in DAY_ACTIVE_TIMEFRAMES if tf != "4h")
+
 # Minimum closed bars required per TF before DAY AI may act (env overrides supported).
 _DEF_MIN: dict[str, int] = {
     "1m": 250,
@@ -89,6 +94,7 @@ __all__ = [
     "DAY_ACTIVE_TIMEFRAMES",
     "DAY_FEATURE_BUILDER_MIN_1M_BARS",
     "DAY_MONTH_CONTEXT_MIN_1D_BARS",
+    "DAY_REQUIRED_TIMEFRAMES",
     "fetch_limit_for_day_tf",
     "min_bars_for_day_tf",
 ]

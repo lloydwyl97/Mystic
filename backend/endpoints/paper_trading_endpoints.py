@@ -459,7 +459,7 @@ async def process_signals() -> dict[str, Any]:
     """Retired: Redis buy bridge removed. DAY buys run only via portfolio_engine_integration bar path."""
     raise HTTPException(
         status_code=410,
-        detail=("POST /api/paper-trading/process-signals is retired. DAY buys execute only through start_portfolio_engine_integration → process_bar_candidates → execute_buy_fifo."),
+        detail=("POST /api/paper-trading/process-signals is retired. DAY buys execute only through trailing-buy confirmed execute_buy_fifo."),
     )
 
 
@@ -682,7 +682,7 @@ async def place_paper_order(request: PlaceOrderRequest) -> dict[str, Any]:
         detail=(
             f"POST /api/paper-trading/orders ({side_upper}) is retired. "
             "Mystic does not accept dashboard or HTTP buy/sell orders. "
-            "BUY: bar-ranked execute_buy_fifo. SELL: exit monitor execute_sell_fifo."
+            "BUY: trailing-buy confirmed execute_buy_fifo. SELL: exit monitor execute_sell_fifo."
         ),
     )
 

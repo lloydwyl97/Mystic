@@ -2,6 +2,13 @@
 Binance.US WS Hydrator - LIVE ONLY
 Streams miniTicker + bookTicker for the Top-10 Binance.US symbols (no env overrides).
 Publishes prices, microstructure features, and rolls lightweight 1m/5m/15m candles.
+
+Gap policy:
+- Authoritative source: Binance.US kline_1m websocket stream (x=True closed bars).
+- On each closed kline event, flush the bar directly; do not wait for the next miniTicker.
+- On reconnect, backfill any missed closed bars from REST /api/v3/klines.
+- Forming bars (x=False) are NOT written to klines:{SYM}:1m.
+- No candles are fabricated; do not forward-fill.
 """
 
 from __future__ import annotations
@@ -16,6 +23,7 @@ import time
 from collections import deque
 from typing import Any
 
+import httpx
 import websockets
 
 # Import from single source of truth
@@ -58,6 +66,13 @@ class BinanceWSHydrator:
         self._ticks: dict[str, deque[tuple[float, float]]] = {}
         # In-process 1m candle builder per symbol: [start_ts, o, h, l, c, v]
         self._c1m: dict[str, list[float]] = {}
+        # Track last closed bar's open-timestamp (seconds) per symbol; used for gap detection and backfill
+        self._last_bar_ts: dict[str, int] = {}
+        # Per-symbol asyncio.Lock serialises the Redis read-modify-write cycle in
+        # _append_candle and _backfill_missing_bars.  Without this, two concurrent
+        # tasks (e.g. backfill + kline flush) can both read the same stale array
+        # before either writes back, producing duplicate timestamps.
+        self._kline_write_locks: dict[str, asyncio.Lock] = {}
         # Track background tasks for proper cleanup
         self._tasks: list[asyncio.Task[Any]] = []
 
@@ -103,6 +118,10 @@ class BinanceWSHydrator:
                     backoff = 2.0
                     with contextlib.suppress(ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
                         ws_reconnects_total.inc()
+                    # Backfill any closed bars that were missed during the disconnection gap.
+                    for _sym in SYMBOLS:
+                        with contextlib.suppress(Exception):
+                            await self._backfill_missing_bars(_sym)
                     while not self._stop.is_set():
                         msg = await asyncio.wait_for(ws.recv(), timeout=60)
                         data = json.loads(msg)
@@ -208,20 +227,31 @@ class BinanceWSHydrator:
                                 pass
 
                         elif "@kline_" in stream:
-                            # Kline stream provides OHLCV with volume
-                            # Format: {"e":"kline","s":"BTCUSDT","k":{"t":123,"o":"100","h":"101","l":"99","c":"100.5","v":"1234",...}}
+                            # Kline stream provides authoritative OHLCV per 1m bar.
+                            # When k["x"] == True the bar is closed and must be flushed immediately.
+                            # Forming bars (x=False) are used only to keep the in-memory OHLCV
+                            # up-to-date; they are NOT written to Redis.
                             k = payload.get("k")
                             if k:
                                 try:
                                     volume = float(k.get("v", 0))
 
-                                    # Update volume in current candle
+                                    # Update volume in current forming candle
                                     cur = self._c1m.get(sym)
                                     if cur and len(cur) == 6:
-                                        cur[5] = volume  # Update volume
+                                        cur[5] = volume
 
                                     with contextlib.suppress(ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
                                         ws_messages_total.labels(type="kline", symbol=sym).inc()
+
+                                    # Flush the bar to Redis when it is closed (x=True).
+                                    # This is the primary candle-write path; miniTicker is the fallback.
+                                    if k.get("x"):
+                                        task = await task_manager.create_task(
+                                            self._flush_closed_kline(sym, k),
+                                            name="binance_ws_hydrator:flush_closed_kline",
+                                        )
+                                        self._tasks.append(task)
                                 except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
                                     pass
 
@@ -321,50 +351,230 @@ class BinanceWSHydrator:
             pass
 
     async def _update_candles(self, sym: str, now_ts: float, px: float) -> None:
+        """Track the forming (in-progress) 1m candle from miniTicker price ticks.
+
+        This method ONLY maintains in-memory state (_c1m).  It does NOT write
+        anything to Redis.  Closed bars are persisted exclusively by
+        _flush_closed_kline (authoritative @kline_1m x=True events) and
+        _backfill_missing_bars (REST catch-up on reconnect).
+
+        Keeping the two responsibilities separate eliminates the dual-write race
+        where both the miniTicker and kline paths would call _append_candle for
+        the same minute and produce duplicate timestamps in the Redis array.
+        """
         try:
             if self._cg is None:
                 return
             start_ts = int(now_ts // 60) * 60
             cur = self._c1m.get(sym)
             if not cur or int(cur[0]) != start_ts:
-                # Flush previous candle if exists
-                if cur and len(cur) == 6:
-                    task = await task_manager.create_task(self._append_candle(sym, "1m", cur), name="binance_ws_hydrator:append_candle")
-                    self._tasks.append(task)
-                    # Possibly roll into 5m/15m on boundary
-                    await self._maybe_rollup(sym, int(cur[0]))
-                # Start new candle
+                # New minute: start a fresh forming candle.
+                # The previous minute's closed bar will be persisted by the
+                # @kline_1m x=True event, not here.
                 self._c1m[sym] = [float(start_ts), px, px, px, px, 0.0]
                 return
-            # Update existing candle
+            # Update the forming candle with the latest miniTicker price.
             cur[3] = min(cur[3], px)  # low
             cur[2] = max(cur[2], px)  # high
             cur[4] = px  # close
-            # volume unknown from miniTicker; keep 0.0
+            # Volume is updated by @kline_1m events; miniTicker carries no volume.
         except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
             pass
 
+    def _kline_lock(self, sym: str) -> asyncio.Lock:
+        """Return (creating if needed) the per-symbol write-lock for kline history."""
+        if sym not in self._kline_write_locks:
+            self._kline_write_locks[sym] = asyncio.Lock()
+        return self._kline_write_locks[sym]
+
     async def _append_candle(self, sym: str, interval: str, candle: list[float]) -> None:
+        """Write one candle to the Redis klines history.
+
+        Upserts by open-timestamp: if a row with the same bar_ts already exists it
+        is replaced in-place rather than appended.
+
+        The per-symbol asyncio.Lock (_kline_lock) serialises concurrent callers so
+        that two tasks cannot both read the same stale array and both append the same
+        timestamp before either write completes (read-modify-write race).
+        """
         try:
             if self._cg is None:
                 return
             r = self._cg.r  # type: ignore[attr-defined]
             key = f"klines:{sym}:{interval}"
+            bar_ts = candle[0]
+            row = [candle[0], candle[1], candle[2], candle[3], candle[4], candle[5]]
 
-            raw = await r.get(key)
-            arr = []
-            if raw:
-                try:
-                    arr = json.loads(raw)
-                except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
-                    arr = []
-            arr.append([candle[0], candle[1], candle[2], candle[3], candle[4], candle[5]])
-            # Trim to last 600
-            if len(arr) > 600:
-                arr = arr[-600:]
-            await r.set(key, json.dumps(arr), ex=900)
+            async with self._kline_lock(sym):
+                raw = await r.get(key)
+                arr: list[list[float]] = []
+                if raw:
+                    try:
+                        arr = json.loads(raw)
+                    except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
+                        arr = []
+                # Upsert: replace an existing row for this minute, or append if new.
+                existing_idx = next((i for i, r_row in enumerate(arr) if r_row[0] == bar_ts), None)
+                if existing_idx is not None:
+                    arr[existing_idx] = row
+                else:
+                    arr.append(row)
+                # Sort ascending by open-timestamp, then deduplicate: for any
+                # timestamp that appears more than once (possible if a prior race
+                # produced duplicates before the lock was in place), keep the last
+                # occurrence in the sorted order (= the most-recently-appended row,
+                # which carries the authoritative exchange kline volume and close).
+                arr.sort(key=lambda x: x[0])
+                ts_last_idx: dict[float, int] = {}
+                for i, r_row in enumerate(arr):
+                    ts_last_idx[r_row[0]] = i
+                if len(ts_last_idx) < len(arr):
+                    arr = [arr[ts_last_idx[ts]] for ts in sorted(ts_last_idx)]
+                # Trim to last 600
+                if len(arr) > 600:
+                    arr = arr[-600:]
+                await r.set(key, json.dumps(arr), ex=900)
         except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
             pass
+
+    async def _flush_closed_kline(self, sym: str, k: dict[str, Any]) -> None:
+        """Flush an exchange-authoritative closed 1m kline to Redis.
+
+        Uses OHLCV from the kline event directly.  Does NOT fabricate data.
+        Only called when k["x"] is True (bar is closed by the exchange).
+        """
+        try:
+            if self._cg is None:
+                return
+            bar_ts_ms = int(k.get("t") or 0)
+            if bar_ts_ms <= 0:
+                return
+            bar_ts = bar_ts_ms // 1000  # UTC open-time in seconds
+            o = float(k.get("o") or 0)
+            h = float(k.get("h") or 0)
+            lo = float(k.get("l") or 0)
+            c = float(k.get("c") or 0)
+            v = float(k.get("v") or 0)
+            if c <= 0:
+                return
+            # Avoid writing a bar older than what we already have
+            last = self._last_bar_ts.get(sym, 0)
+            if bar_ts <= last:
+                return
+            candle = [float(bar_ts), o, h, lo, c, v]
+            await self._append_candle(sym, "1m", candle)
+            try:
+                from backend.services.canonical_candle_pipeline import canonical_candle_pipeline
+
+                await canonical_candle_pipeline.ingest_klines(
+                    sym,
+                    "1m",
+                    [[bar_ts * 1000, o, h, lo, c, v]],
+                    persist=True,
+                )
+            except Exception as exc:
+                logger.debug("canonical 1m ingest from hydrator failed %s: %s", sym, exc)
+            self._last_bar_ts[sym] = bar_ts
+            # If the in-memory forming candle covers the same minute, discard it
+            # so the next miniTicker starts a fresh bar for the next minute.
+            cur = self._c1m.get(sym)
+            if cur and int(cur[0]) == bar_ts:
+                self._c1m.pop(sym, None)
+            await self._maybe_rollup(sym, bar_ts)
+        except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
+            pass
+
+    async def _backfill_missing_bars(self, sym: str) -> None:
+        """Fetch any closed 1m bars that were missed during a WS disconnection.
+
+        Only fills bars that are definitively closed (>= 60s before now).
+        Does NOT fabricate data; does NOT forward-fill; does NOT write forming bars.
+        """
+        try:
+            if self._cg is None:
+                return
+            last_ts = self._last_bar_ts.get(sym, 0)
+            if last_ts <= 0:
+                return
+            now_ts = int(time.time())
+            # Skip if fewer than 2 bars might be missing (at least 120s gap needed)
+            if now_ts - last_ts < 120:
+                return
+            # Backfill window: from the bar after last_ts to 1 full minute ago (closed bars only)
+            start_ms = (last_ts + 60) * 1000
+            end_ms = ((now_ts // 60) * 60 - 60) * 1000  # latest fully-closed bar
+            if end_ms < start_ms:
+                return
+            n_missing = (end_ms // 1000 - start_ms // 1000) // 60 + 1
+            if n_missing <= 0:
+                return
+            url = "https://api.binance.us/api/v3/klines"
+            params: dict[str, Any] = {
+                "symbol": sym,
+                "interval": "1m",
+                "startTime": start_ms,
+                "endTime": end_ms,
+                "limit": min(300, n_missing + 5),
+            }
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                data: list[Any] = resp.json()
+            if not data:
+                return
+            r = self._cg.r  # type: ignore[attr-defined]
+            # Acquire per-symbol lock: backfill does its own bulk read-modify-write
+            # and must not race with concurrent _append_candle calls.
+            async with self._kline_lock(sym):
+                raw = await r.get(f"klines:{sym}:1m")
+                arr: list[Any] = []
+                if raw:
+                    try:
+                        arr = json.loads(raw)
+                    except (ValueError, TypeError):
+                        arr = []
+                existing_ts: set[int] = {int(row[0]) for row in arr}
+                added = 0
+                for kline in data:
+                    bar_ts = int(kline[0]) // 1000
+                    if bar_ts in existing_ts:
+                        continue
+                    if float(kline[4] or 0) <= 0:
+                        continue  # skip zero-close bars
+                    candle = [
+                        float(bar_ts),
+                        float(kline[1]),
+                        float(kline[2]),
+                        float(kline[3]),
+                        float(kline[4]),
+                        float(kline[5]),
+                    ]
+                    arr.append(candle)
+                    existing_ts.add(bar_ts)
+                    added += 1
+                if added > 0:
+                    # Sort ascending, then deduplicate by open-timestamp keeping
+                    # the last occurrence (same policy as _append_candle) so that
+                    # any pre-existing duplicate rows are also cleaned up here.
+                    arr.sort(key=lambda x: x[0])
+                    ts_last_idx: dict[float, int] = {}
+                    for i, r_row in enumerate(arr):
+                        ts_last_idx[r_row[0]] = i
+                    if len(ts_last_idx) < len(arr):
+                        arr = [arr[ts_last_idx[ts]] for ts in sorted(ts_last_idx)]
+                    if len(arr) > 600:
+                        arr = arr[-600:]
+                    await r.set(f"klines:{sym}:1m", json.dumps(arr), ex=900)
+                    self._last_bar_ts[sym] = max(int(row[0]) for row in arr)
+                logger.info(
+                    "Backfilled %d missing 1m bars for %s (gap was %ds, last_ts=%d)",
+                    added,
+                    sym,
+                    now_ts - last_ts,
+                    last_ts,
+                )
+        except Exception as exc:
+            logger.debug("Backfill failed for %s: %s", sym, exc)
 
     async def _maybe_rollup(self, sym: str, last_start_ts: int) -> None:
         with contextlib.suppress(ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
@@ -384,26 +594,9 @@ class BinanceWSHydrator:
             kl = json.loads(raw)
             if not isinstance(kl, list) or len(kl) < 5:
                 return
-            # 5m roll every 5 minutes
-            if (last_start_ts % 300) == 240 and len(kl) >= 5:
-                chunk = kl[-5:]
-                ts0 = chunk[0][0]
-                o = float(chunk[0][1])
-                h = max(float(x[2]) for x in chunk)
-                low = min(float(x[3]) for x in chunk)
-                c = float(chunk[-1][4])
-                v = sum(float(x[5]) for x in chunk)
-                await self._append_candle(sym, "5m", [ts0, o, h, low, c, v])
-            # 15m roll every 15 minutes
-            if (last_start_ts % 900) == 840 and len(kl) >= 15:
-                chunk = kl[-15:]
-                ts0 = chunk[0][0]
-                o = float(chunk[0][1])
-                h = max(float(x[2]) for x in chunk)
-                low = min(float(x[3]) for x in chunk)
-                c = float(chunk[-1][4])
-                v = sum(float(x[5]) for x in chunk)
-                await self._append_candle(sym, "15m", [ts0, o, h, low, c, v])
+            # Higher-timeframe Redis/SQLite writes belong to canonical_candle_pipeline.
+            # The previous last-N 1m rollup was not UTC-bucket aligned.
+            return
         except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError):
             pass
 
