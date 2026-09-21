@@ -1,5 +1,5 @@
 #!/bin/bash
-# Mystic core-stack watchdog — checks the 7 canonical processes are alive.
+# Mystic core-stack watchdog — checks the canonical core processes are alive.
 # If any are missing, does a clean full restart via start_mystic.sh core
 # (the script itself stops everything first, so a partial-restart here
 # would fight it — a full restart is the correct, already-idempotent path).
@@ -55,7 +55,6 @@ PATTERNS=(
     "start_portfolio_engine_integration.py"
     "start_ai_market_context.py"
     "start_ai_learning.py"
-    "backend.services.binance_scalp.runner"
 )
 
 # Root crontab (*/3) and mystic crontab (*/5) both run this script. The flock

@@ -144,6 +144,8 @@ def test_core_startup_does_not_launch_paper_scalp():
     assert "# start_scalp || return 1  # DISABLED in core mode" in text
     assert "all|ai|collector|agents|ai_position_tracker|ai_outcome_bridge)" in text
     assert 'retired_mode "$MODE"' in text
+    watchdog = Path("watchdog_mystic.sh").read_text()
+    assert "backend.services.binance_scalp.runner" not in watchdog
 
 
 @pytest.mark.asyncio
