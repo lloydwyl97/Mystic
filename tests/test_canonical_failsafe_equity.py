@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from backend.services.canonical_failsafe_equity import build_canonical_nle, decide_account_failsafe
+from backend.services.canonical_failsafe_equity import (
+    balances_from_live_payload,
+    build_canonical_nle,
+    decide_account_failsafe,
+)
 
 
 def _complete_balances(usdt="220.00", btc="0.00002922"):
@@ -77,3 +81,29 @@ def test_reservations_do_not_reduce_equity():
     a = build_canonical_nle(balances=_complete_balances(), bids=_bids(), reservations=80, as_of_epoch=1, now_epoch=1)
     b = build_canonical_nle(balances=_complete_balances(), bids=_bids(), reservations=0, as_of_epoch=1, now_epoch=1)
     assert a["net_liquidatable_equity"] == b["net_liquidatable_equity"]
+
+
+def test_live_get_balance_payload_is_complete_nle_not_zero_cash():
+    raw = {
+        "status": "success",
+        "balance": {
+            "total": {"USDT": "221.27560086", "BTC": "0.00000907", "ETH": "0.00023132", "SOL": "0.013066", "XRP": "0.34804"},
+            "free": {"USDT": "221.27560086", "BTC": "0.00000907", "ETH": "0.00023132", "SOL": "0.013066", "XRP": "0.34804"},
+            "used": {"USDT": "0", "BTC": "0", "ETH": "0", "SOL": "0", "XRP": "0"},
+        },
+    }
+    rows = balances_from_live_payload(raw)
+    assert {r["asset"] for r in rows} == {"USDT", "BTC", "ETH", "SOL", "XRP"}
+    snap = build_canonical_nle(balances=rows, bids=_bids(), as_of_epoch=1, now_epoch=1)
+    assert snap["complete"] is True
+    assert float(snap["cash_usdt"]) > 220.0
+    out = decide_account_failsafe(snap, "228.07")
+    assert out["tripped"] is False
+    assert out["usable"] is True
+
+
+def test_unparsed_live_payload_is_not_complete_zero_cash():
+    rows = balances_from_live_payload({"status": "success", "balance": {"total": {}, "free": {}, "used": {}}})
+    snap = build_canonical_nle(balances=rows, bids=_bids(), as_of_epoch=1, now_epoch=1)
+    assert snap["complete"] is False
+    assert decide_account_failsafe(snap, "228.07")["tripped"] is False

@@ -46,6 +46,53 @@ def _free_locked(row: dict[str, Any]) -> tuple[Decimal, Decimal]:
     return free, locked
 
 
+def balances_from_live_payload(raw: object) -> list[dict[str, Any]]:
+    """Normalize LiveTradingService.get_balance / get_account_balance payloads.
+
+    get_balance returns ``{"status","balance":{"free","used","total"}}``.
+    get_account_balance returns ``{"balances":{"binanceus":{"free","used","total"}}}``.
+    An unparsed payload must not be treated as a complete zero-cash account.
+    """
+    if not isinstance(raw, dict):
+        return []
+
+    def _from_free_used(block: dict[str, Any]) -> list[dict[str, Any]]:
+        free = block.get("free") if isinstance(block.get("free"), dict) else {}
+        used = block.get("used") if isinstance(block.get("used"), dict) else {}
+        locked = block.get("locked") if isinstance(block.get("locked"), dict) else used
+        assets = set(free) | set(used) | set(locked)
+        return [{"asset": str(a), "free": free.get(a, 0), "locked": locked.get(a, 0)} for a in assets]
+
+    direct = raw.get("balance")
+    if isinstance(direct, dict) and isinstance(direct.get("free"), dict):
+        return _from_free_used(direct)
+
+    by_ex = raw.get("balances")
+    if isinstance(by_ex, list):
+        return [r for r in by_ex if isinstance(r, dict)]
+    if isinstance(by_ex, dict):
+        for item in by_ex.values():
+            if isinstance(item, dict) and isinstance(item.get("free"), dict):
+                return _from_free_used(item)
+        out: list[dict[str, Any]] = []
+        for asset, item in by_ex.items():
+            if isinstance(item, dict) and ("free" in item or "used" in item or "locked" in item):
+                out.append(
+                    {
+                        "asset": asset,
+                        "free": item.get("free"),
+                        "locked": item.get("used") if item.get("used") is not None else item.get("locked"),
+                    }
+                )
+        if out:
+            return out
+
+    info = raw.get("info")
+    if isinstance(info, dict) and isinstance(info.get("balances"), list):
+        return [r for r in info["balances"] if isinstance(r, dict)]
+    return []
+
+
 def build_canonical_nle(
     *,
     balances: list[dict[str, Any]] | None,

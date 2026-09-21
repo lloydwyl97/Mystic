@@ -21059,7 +21059,7 @@ class PortfolioEngine:
 
     async def _refresh_canonical_nle_snapshot(self) -> dict[str, Any]:
         """Pull complete exchange balances + bids. Incomplete snapshots stay unusable."""
-        from backend.services.canonical_failsafe_equity import build_canonical_nle
+        from backend.services.canonical_failsafe_equity import balances_from_live_payload, build_canonical_nle
 
         balances: list[dict[str, Any]] = []
         bids: dict[str, Any] = {}
@@ -21068,34 +21068,26 @@ class PortfolioEngine:
         if live is not None:
             try:
                 raw = await live.get_balance("binanceus", force_refresh=True)
-                rows = raw.get("balances") if isinstance(raw, dict) else raw
-                if isinstance(raw, dict) and isinstance(raw.get("info"), dict):
-                    rows = raw["info"].get("balances") or rows
-                if isinstance(rows, dict):
-                    for asset, item in rows.items():
-                        if isinstance(item, dict):
-                            balances.append({"asset": asset, "free": item.get("free"), "locked": item.get("used") or item.get("locked")})
-                        else:
-                            balances.append({"asset": asset, "free": item, "locked": 0})
-                elif isinstance(rows, list):
-                    balances = [r for r in rows if isinstance(r, dict)]
-                source = "binanceus"
+                balances = balances_from_live_payload(raw)
+                if balances:
+                    source = "binanceus"
+                else:
+                    logger.warning("CANONICAL_NLE_BALANCE_UNPARSED keys=%s", list(raw) if isinstance(raw, dict) else type(raw))
             except Exception as exc:
                 logger.warning("CANONICAL_NLE_BALANCE_FAILED err=%s", exc)
             try:
-                if hasattr(live, "fetch_tickers"):
-                    tickers = await live.fetch_tickers(["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"])
-                elif hasattr(live, "get_tickers"):
-                    tickers = await live.get_tickers()
-                else:
-                    tickers = {}
-                for symbol, row in (tickers or {}).items():
-                    bid = None
-                    if isinstance(row, dict):
-                        bid = row.get("bid") or row.get("bidPrice") or (row.get("info") or {}).get("bidPrice")
-                    if bid:
-                        bids[str(symbol).replace("/", "").upper()] = bid
-                        bids[str(symbol).split("/")[0].upper()] = bid
+                needed: list[str] = []
+                for row in balances:
+                    asset = str(row.get("asset") or "").strip().upper()
+                    if not asset or asset in ("USDT", "USD", "BUSD", "USDC"):
+                        continue
+                    needed.append(f"{asset}/USDT")
+                for symbol in needed or ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]:
+                    bid, _src = await self._executable_bid(symbol, 0.0)
+                    if bid and float(bid) > 0:
+                        compact = symbol.replace("/", "").upper()
+                        bids[compact] = bid
+                        bids[compact.replace("USDT", "")] = bid
             except Exception as exc:
                 logger.warning("CANONICAL_NLE_BID_FAILED err=%s", exc)
         snap = build_canonical_nle(
