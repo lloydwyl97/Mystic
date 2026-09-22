@@ -1507,17 +1507,21 @@ class PortfolioEngineIntegration:
             except Exception:
                 pass
 
-            # Symbols already open (any engine) — do not double-buy
+            # Symbols already open (any engine) — do not double-buy.
+            # DUST_PENDING positions are excluded: they are tiny remnants with no
+            # economic significance and must not block fresh DAY V2 entries.
+            # _can_open_position below serves as the hard gate for all new entries.
             already_open: set[str] = set()
             if self.engine and self.engine.open_positions:
-                for _s in self.engine.open_positions:
-                    already_open.add(str(_s).upper().replace("-", "").replace("/", ""))
+                for _s, _pos in self.engine.open_positions.items():
+                    if getattr(_pos, "status", "ACTIVE") != "DUST_PENDING":
+                        already_open.add(str(_s).upper().replace("-", "").replace("/", ""))
 
             for symbol in DAY_V2_UNIVERSE:
                 try:
                     norm = symbol.upper().replace("-", "").replace("/", "")
                     if norm in already_open:
-                        logger.debug("DAY_V2_SKIP_OPEN symbol=%s", symbol)
+                        logger.info("DAY_V2_SKIP_OPEN symbol=%s", symbol)
                         continue
 
                     # Build the DB key format (BTC-USDT or BTCUSDT or BTC/USDT)
@@ -1546,7 +1550,7 @@ class PortfolioEngineIntegration:
 
                     bars_15m = await _asyncio.to_thread(_load_bars_sync, db_path, db_sym_15m, "15m", 60)
                     if len(bars_15m) < 32:
-                        logger.debug("DAY_V2_SKIP_INSUFFICIENT_BARS symbol=%s bars_15m=%d", symbol, len(bars_15m))
+                        logger.info("DAY_V2_SKIP_INSUFFICIENT_BARS symbol=%s bars_15m=%d", symbol, len(bars_15m))
                         continue
 
                     bars_1h = await _asyncio.to_thread(_load_bars_sync, db_path, db_sym_15m, "1h", 20)
@@ -1554,7 +1558,7 @@ class PortfolioEngineIntegration:
 
                     signal = evaluate_entry_signal(symbol, bars_15m, bars_1h, bars_4h)
                     if signal is None:
-                        logger.debug("DAY_V2_NO_SIGNAL symbol=%s", symbol)
+                        logger.info("DAY_V2_NO_SIGNAL symbol=%s", symbol)
                         continue
 
                     # Check slot availability and cash
