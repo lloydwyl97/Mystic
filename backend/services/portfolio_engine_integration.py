@@ -1445,7 +1445,17 @@ class PortfolioEngineIntegration:
                                     result.get("intents") or result.get("active_intent_count"),
                                 )
                             elif result:
-                                logger.info(f"BAR_EXECUTION: {result['symbol']} | qty={result['quantity']:.6f} @ ${result['price']:.4f}")
+                                # result may be a fill dict (has 'quantity') or a stream
+                                # summary dict (has 'new'/'active' etc.) — use .get() safely.
+                                if result.get("quantity") is not None:
+                                    logger.info(
+                                        "BAR_EXECUTION: %s | qty=%.6f @ $%.4f",
+                                        result.get("symbol"),
+                                        float(result["quantity"]),
+                                        float(result.get("price", 0)),
+                                    )
+                                else:
+                                    logger.info("BAR_RESULT: %s", result)
                                 decision_id = result.get("decision_id")
                                 if decision_id and self.redis_client:
                                     await self.redis_client.set(f"executed:{decision_id}", "1", ex=86400)
