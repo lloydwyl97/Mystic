@@ -396,55 +396,10 @@ def restore_orphaned_day_buys(db_path: str | Path) -> list[dict[str, Any]]:
         conn.close()
 
 
-def resolve_scalp_database_path(repo_root: str, env_get) -> str:
-    """SCALP money tables live in their own file so they cannot lock DAY writers."""
-    explicit = (env_get("SCALP_DATABASE_PATH") or "").strip()
-    if explicit:
-        return explicit
-    return str(Path(repo_root) / "mystic_scalp.db")
-
-
-def migrate_scalp_money_database(day_db: str, scalp_db: str) -> dict[str, Any]:
-    """Ensure mystic_scalp.db exists. Never import leftover DAY-file scalp_* history.
-
-    Isolation is complete. Historical scalp rows on mystic_trading.db are
-    analysis-only. Copying them into the money DB contaminates clean
-    acceptance and trips the consecutive-loss breaker on pre-cutoff losses.
-    Learning tables stay on the DAY database.
-    """
-    from backend.services.binance_scalp.schema import init_scalp_schema
-
-    src_path = str(day_db)
-    dst_path = str(scalp_db)
-    Path(dst_path).parent.mkdir(parents=True, exist_ok=True)
-    init_scalp_schema(dst_path)
-
-    result: dict[str, Any] = {
-        "src": src_path,
-        "dst": dst_path,
-        "migrated": False,
-        "copied_tables": {},
-        "reason": "",
-    }
-    if not Path(src_path).exists():
-        result["reason"] = "day_db_missing"
-        return result
-
-    dst = _connect(dst_path, timeout=15.0)
-    try:
-        try:
-            existing = int(dst.execute("SELECT COUNT(*) FROM scalp_paper_trades").fetchone()[0] or 0)
-        except sqlite3.OperationalError:
-            existing = 0
-        if existing > 0:
-            result["reason"] = "already_populated"
-            result["existing_trades"] = existing
-            return result
-        result["reason"] = "isolation_complete_no_import"
-        result["existing_trades"] = existing
-        return result
-    finally:
-        dst.close()
+# resolve_scalp_database_path and migrate_scalp_money_database removed 2026-09-22.
+# The retired binance_scalp paper runner is no longer part of the production startup
+# path. mystic_scalp.db was archived off-host and deleted from Ocean.
+# Git history retains the original implementation.
 
 
 def assert_cash_plus_marks_equals_equity(db_path: str | Path, *, tolerance: float = 0.05) -> dict[str, Any]:

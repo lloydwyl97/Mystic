@@ -263,10 +263,11 @@ def test_paper_and_live_use_same_held_predicate():
     assert live._day_path_ev_entry_block_reason("ETH/USDT", 4) == "DUPLICATE_SAME_SYMBOL"
 
 
-def test_scalp_ranking_source_untouched():
-    src = Path("backend/services/binance_scalp/scalp_candidate_ranking.py").read_text(encoding="utf-8")
-    assert "DAY_ENTRY_HELD_SET" not in src
-    assert "_day_path_ev_entry_block_reason" not in src
+def test_portfolio_engine_uses_day_entry_held_set():
+    """portfolio_engine.py must use the correct held-set predicate (not naive symbol check)."""
+    src = Path("backend/services/portfolio_engine.py").read_text(encoding="utf-8")
+    assert "DAY_ENTRY_HELD_SET" in src
+    assert "_day_path_ev_entry_block_reason" in src
 
 
 def test_path_ev_uses_canonical_held_predicate():

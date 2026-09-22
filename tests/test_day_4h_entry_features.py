@@ -247,11 +247,8 @@ def test_candidate_btc_eth_sol_xrp_hold_and_66_constants():
     assert OCEAN_BOOK_COUNT == 66
 
 
-def test_scalp_and_ranker_unaffected():
-    scalp = open("backend/services/binance_scalp/scalp_candidate_ranking.py", encoding="utf-8").read()
+def test_day_authority_unaffected_by_4h_features():
     authority = open("backend/services/day_direct_path_ev_authority.py", encoding="utf-8").read()
-    assert "day_4h_entry_features" not in scalp
-    assert "day_4h_entry_telemetry" not in scalp
     assert "day_4h_entry_features" not in authority
     assert "htf_4h_rise_broken" not in authority
     scores = {"btc_path_ev": 0.01, "eth_path_ev": 0.0, "sol_path_ev": 0.0, "xrp_path_ev": 0.0, "path_net_status": "predicted"}

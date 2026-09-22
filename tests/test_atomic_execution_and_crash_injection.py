@@ -1,4 +1,4 @@
-"""Atomic OPEN/CLOSE, orphan restore, SCALP money-DB split, crash injection."""
+"""Atomic OPEN/CLOSE, orphan restore, crash injection."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from backend.database_schema import initialize_paper_trading_schema
 from backend.services.atomic_execution_book import (
     assert_cash_plus_marks_equals_equity,
     find_orphaned_day_buys,
-    migrate_scalp_money_database,
     restore_orphaned_day_buys,
 )
 from backend.services.portfolio_engine import OpenPosition, PortfolioEngine, Sleeve
@@ -479,39 +478,6 @@ def test_orphan_cash_restore_credits_identified_buys_only():
         assert find_orphaned_day_buys(str(db)) == []
 
 
-def test_scalp_money_db_migrate_copies_and_isolates():
-    with tempfile.TemporaryDirectory() as tmp:
-        day_db = Path(tmp) / "mystic_trading.db"
-        scalp_db = Path(tmp) / "mystic_scalp.db"
-        from backend.services.binance_scalp.schema import init_scalp_schema
-
-        init_scalp_schema(str(day_db), principal=1000.0)
-        with sqlite3.connect(str(day_db)) as conn:
-            conn.execute(
-                """
-                INSERT INTO scalp_paper_trades (trade_id, symbol, side, quantity, price, notional)
-                VALUES ('s1', 'BTCUSDT', 'SELL', 0.001, 100000, 100)
-                """
-            )
-            conn.commit()
-        result = migrate_scalp_money_database(str(day_db), str(scalp_db))
-        assert result["migrated"] is False
-        assert result["reason"] == "isolation_complete_no_import"
-        with sqlite3.connect(str(scalp_db)) as conn:
-            n = conn.execute("SELECT COUNT(*) FROM scalp_paper_trades").fetchone()[0]
-        assert n == 0
-        with sqlite3.connect(str(scalp_db)) as conn:
-            conn.execute(
-                """
-                INSERT INTO scalp_paper_trades (trade_id, symbol, side, quantity, price, notional)
-                VALUES ('live1', 'BTCUSDT', 'SELL', 0.001, 100000, 100)
-                """
-            )
-            conn.commit()
-        again = migrate_scalp_money_database(str(day_db), str(scalp_db))
-        assert again["reason"] == "already_populated"
-
-
 def test_learning_consume_affects_rank_delta():
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "learn.db"
@@ -539,48 +505,3 @@ def test_learning_consume_affects_rank_delta():
         assert learned["n"] >= 8
         assert learned["win_rate"] == 1.0
         assert learned["rank_delta"] > 0
-
-
-def test_simultaneous_day_and_scalp_writes_do_not_lock():
-    with tempfile.TemporaryDirectory() as tmp:
-        day_db = Path(tmp) / "mystic_trading.db"
-        scalp_db = Path(tmp) / "mystic_scalp.db"
-        engine = _init_engine(day_db)
-        from backend.services.binance_scalp.schema import init_scalp_schema
-
-        init_scalp_schema(str(scalp_db), principal=1000.0)
-        errors: list[str] = []
-
-        def day_writer() -> None:
-            try:
-                pos = _position(trade_id=f"day_{time.time_ns()}")
-                _commit(engine, pos, cash=9000.0, positions_value=1000.0)
-            except Exception as exc:
-                errors.append(f"day:{exc}")
-
-        def scalp_writer() -> None:
-            try:
-                with sqlite3.connect(str(scalp_db), timeout=5) as conn:
-                    conn.execute("BEGIN IMMEDIATE")
-                    conn.execute(
-                        """
-                        INSERT INTO scalp_paper_trades (trade_id, symbol, side, quantity, price, notional)
-                        VALUES (?, 'ETHUSDT', 'BUY', 0.01, 3000, 30)
-                        """,
-                        (f"scalp_{time.time_ns()}",),
-                    )
-                    conn.commit()
-            except Exception as exc:
-                errors.append(f"scalp:{exc}")
-
-        import threading
-
-        t1 = threading.Thread(target=day_writer)
-        t2 = threading.Thread(target=scalp_writer)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-        assert errors == []
-        proof = assert_cash_plus_marks_equals_equity(str(day_db))
-        assert proof["ok"] is True

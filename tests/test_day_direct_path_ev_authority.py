@@ -197,14 +197,12 @@ def test_true_safety_gates_still_in_execute_buy():
     assert "DAY_PATH_EV_SAFETY reject=MAX_OPEN_LIMIT" in src
 
 
-def test_scalp_authority_unchanged():
-    src = open("backend/services/binance_scalp/scalp_candidate_ranking.py", encoding="utf-8").read()
-    assert "def pick_best_global_candidate" in src
-    assert "HOLD_ACTION_EV" in src
-    assert "day_direct_path_ev_authority" not in src
-    from backend.services.binance_scalp.scalp_candidate_ranking import HOLD_ACTION_EV
-
-    assert HOLD_ACTION_EV == 0.0
+def test_day_exits_do_not_import_direct_path_ev():
+    """day_controlled_exits must not import day_direct_path_ev_authority (separate concerns)."""
+    auth = open("backend/services/day_direct_path_ev_authority.py", encoding="utf-8").read()
+    assert "day_controlled_exits" not in auth
+    assert "STALL" not in auth
+    assert "GIVEBACK" not in auth
 
 
 def test_day_exits_unchanged():

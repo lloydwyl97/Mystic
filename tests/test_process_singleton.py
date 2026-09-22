@@ -39,7 +39,6 @@ def test_start_mystic_has_lifecycle_lock_and_skip_guards():
         ("start_portfolio_engine_integration.py", "Portfolio Engine Integration"),
         ("start_ai_market_context.py", "AI Market Context"),
         ("start_ai_learning.py", "AI Learning"),
-        ("backend.services.binance_scalp.runner", "Scalp Paper Runner"),
     ):
         assert pattern in text
         assert f'refuse_duplicate_or_collapse "{pattern}"' in text
@@ -49,12 +48,9 @@ def test_start_mystic_has_lifecycle_lock_and_skip_guards():
     assert "stopping processes anyway" in stop
 
 
-def test_scalp_runner_and_context_and_learning_use_process_singleton():
-    runner = (REPO / "backend/services/binance_scalp/runner.py").read_text()
+def test_context_and_learning_use_process_singleton():
     context = (REPO / "start_ai_market_context.py").read_text()
     learning = (REPO / "start_ai_learning.py").read_text()
-    assert "acquire_process_singleton" in runner
-    assert "SCALP_RUNNER_PIDFILE" in runner
     assert "acquire_process_singleton" in context
     assert "AI_MARKET_CONTEXT_PIDFILE" in context
     assert "acquire_process_singleton" in learning

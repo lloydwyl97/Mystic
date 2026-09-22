@@ -101,26 +101,3 @@ def test_paper_dust_persists_before_return():
     assert idx > 0
     window = src[idx : idx + 500]
     assert "_persist_position_to_sqlite(position)" in window
-
-
-def test_scalp_dead_strategies_score_in_tradeable_band():
-    """Pass scores must clear SCALP_MIN_TRADEABLE_SCORE (1.45), matching working strategies."""
-    modules = [
-        "backend/services/binance_scalp/strategies/failed_breakout_reversal.py",
-        "backend/services/binance_scalp/strategies/failed_breakdown_reversal.py",
-        "backend/services/binance_scalp/strategies/compression_breakout.py",
-        "backend/services/binance_scalp/strategies/trend_pullback_micro.py",
-        "backend/services/binance_scalp/strategies/volume_impulse_continuation.py",
-    ]
-    for rel in modules:
-        body = (REPO / rel).read_text()
-        assert "score=0.5" not in body
-        assert "score=0.6" not in body
-        assert any(tok in body for tok in ("2.25", "2.35", "2.40", "2.45", "2.50"))
-
-
-def test_failed_breakout_requires_up_momentum_reclaim():
-    src = (REPO / "backend/services/binance_scalp/strategies/failed_breakout_reversal.py").read_text()
-    assert "NO_FAILED_BREAKOUT_RECLAIM" in src
-    assert "up_mom" in src
-    assert "down_mom" not in src

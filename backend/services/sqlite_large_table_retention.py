@@ -105,8 +105,9 @@ PROTECTED_TABLES: frozenset[str] = frozenset(
         "day_clock_v2_partition_registry",
         "day_clock_v2_outcome_labels",
         "day_clock_v2_outcome_labels_history",
-        # SCALP money file: ledger heal and the consecutive-loss breaker both
-        # sum historical SELL rows. Ageing those fills out would rewrite cash.
+        # Retired paper SCALP money tables (mystic_scalp.db removed 2026-09-22).
+        # Entries retained here as tombstones so retention logic ignores any
+        # residual rows if the tables still exist on an older schema version.
         "scalp_paper_trades",
         "scalp_paper_ledger",
         "scalp_paper_positions",
@@ -120,20 +121,13 @@ def iter_retention_db_paths(
     repo_root: str | Path | None = None,
     env_get: Any | None = None,
 ) -> list[Path]:
-    """DAY file plus mystic_scalp.db when it is a separate file on disk."""
-    day_path = Path(day_db)
-    paths = [day_path]
-    root = Path(repo_root) if repo_root is not None else day_path.resolve().parent
-    getter = env_get if env_get is not None else os.getenv
-    try:
-        from backend.services.atomic_execution_book import resolve_scalp_database_path
+    """Return the list of database paths subject to retention policy.
 
-        scalp_path = Path(resolve_scalp_database_path(str(root), getter))
-    except Exception:
-        scalp_path = root / "mystic_scalp.db"
-    if scalp_path.is_file() and scalp_path.resolve() != day_path.resolve():
-        paths.append(scalp_path)
-    return paths
+    mystic_scalp.db was removed 2026-09-22 after the paper runner retirement.
+    Only the main trading database remains.
+    """
+    day_path = Path(day_db)
+    return [day_path]
 
 
 # Learning rows a sealed lock may need to reproduce its dataset. Retention on these is

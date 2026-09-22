@@ -244,13 +244,3 @@ def test_mtm_persist_fetches_marks_outside_lock() -> None:
     lock_idx = source.index("_sqlite_writer_lock")
     persist_idx = source.index("_persist_ledger_to_sqlite")
     assert fetch_idx < lock_idx < persist_idx
-
-
-def test_scalp_sell_log_after_commit() -> None:
-    from backend.services.binance_scalp.paper_engine import BinanceScalpPaperEngine
-
-    exec_src = inspect.getsource(BinanceScalpPaperEngine._execute_sell)
-    tick_src = inspect.getsource(BinanceScalpPaperEngine.tick)
-    assert "_pending_sell_log" in exec_src
-    assert "SCALP_PAPER_SELL" in tick_src
-    assert tick_src.index("conn.commit()") < tick_src.index("SCALP_PAPER_SELL")

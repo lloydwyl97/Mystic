@@ -24,7 +24,7 @@ ACTIVE_PATTERNS=(
   "start_portfolio_engine_integration.py"
   "start_ai_learning.py"
   "start_ai_market_context.py"
-  "backend.services.binance_scalp.runner"
+  # backend.services.binance_scalp.runner REMOVED 2026-09-22 — paper runner retired
 )
 LEGACY_PATTERNS=(
   "live_data_collector.py"
