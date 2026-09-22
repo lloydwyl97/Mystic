@@ -105,8 +105,36 @@ PROTECTED_TABLES: frozenset[str] = frozenset(
         "day_clock_v2_partition_registry",
         "day_clock_v2_outcome_labels",
         "day_clock_v2_outcome_labels_history",
+        # SCALP money file: ledger heal and the consecutive-loss breaker both
+        # sum historical SELL rows. Ageing those fills out would rewrite cash.
+        "scalp_paper_trades",
+        "scalp_paper_ledger",
+        "scalp_paper_positions",
     }
 )
+
+
+def iter_retention_db_paths(
+    day_db: str | Path,
+    *,
+    repo_root: str | Path | None = None,
+    env_get: Any | None = None,
+) -> list[Path]:
+    """DAY file plus mystic_scalp.db when it is a separate file on disk."""
+    day_path = Path(day_db)
+    paths = [day_path]
+    root = Path(repo_root) if repo_root is not None else day_path.resolve().parent
+    getter = env_get if env_get is not None else os.getenv
+    try:
+        from backend.services.atomic_execution_book import resolve_scalp_database_path
+
+        scalp_path = Path(resolve_scalp_database_path(str(root), getter))
+    except Exception:
+        scalp_path = root / "mystic_scalp.db"
+    if scalp_path.is_file() and scalp_path.resolve() != day_path.resolve():
+        paths.append(scalp_path)
+    return paths
+
 
 # Learning rows a sealed lock may need to reproduce its dataset. Retention on these is
 # additionally floored by the oldest cutoff any uninspected lock still depends on.
@@ -268,13 +296,82 @@ def retention_dry_run(db_path: str | Path) -> dict[str, Any]:
 
 DISK_WARNING_FREE_GB = float(os.getenv("RETENTION_DISK_WARNING_FREE_GB", "5") or "5")
 DISK_CRITICAL_FREE_GB = float(os.getenv("RETENTION_DISK_CRITICAL_FREE_GB", "2") or "2")
+_LAST_DISK_ALERT_AT = 0.0
+
+
+def disk_pressure(db_path: str | Path) -> dict[str, Any]:
+    """Filesystem, database, and WAL sizes.
+
+    Never deletes a database. CRITICAL is an entry gate only; exits stay authorized.
+    """
+    path = Path(db_path)
+    root = path.parent if path.parent.exists() else Path("/")
+    usage = shutil.disk_usage(root)
+    free_gb = usage.free / 1024**3
+    wal = Path(str(path) + "-wal")
+    shm = Path(str(path) + "-shm")
+    if free_gb <= DISK_CRITICAL_FREE_GB:
+        severity = "CRITICAL"
+    elif free_gb <= DISK_WARNING_FREE_GB:
+        severity = "WARNING"
+    else:
+        severity = "OK"
+    return {
+        "db_path": str(path),
+        "db_bytes": path.stat().st_size if path.is_file() else 0,
+        "wal_bytes": wal.stat().st_size if wal.is_file() else 0,
+        "shm_bytes": shm.stat().st_size if shm.is_file() else 0,
+        "filesystem_free_gib": round(free_gb, 3),
+        "filesystem_used_pct": round(100.0 * usage.used / usage.total, 1) if usage.total else None,
+        "warning_free_gib": DISK_WARNING_FREE_GB,
+        "critical_free_gib": DISK_CRITICAL_FREE_GB,
+        "severity": severity,
+        "blocks_new_entries": severity == "CRITICAL",
+        "exits_retained": True,
+        "deletes_databases": False,
+    }
+
+
+def disk_blocks_new_entries(db_path: str | Path) -> tuple[bool, str]:
+    """Infrastructure gate for new entries. This function does not touch exits."""
+    report = disk_pressure(db_path)
+    if report["blocks_new_entries"]:
+        return (
+            True,
+            f"DISK_CRITICAL free_gib={report['filesystem_free_gib']} threshold_gib={DISK_CRITICAL_FREE_GB}",
+        )
+    return False, ""
+
+
+def note_disk_pressure(db_path: str | Path, *, min_interval_sec: float = 900.0) -> dict[str, Any]:
+    """Rate-limited warning/critical log. Does not delete files or pause exits."""
+    global _LAST_DISK_ALERT_AT
+    report = disk_pressure(db_path)
+    now = time.monotonic()
+    if report["severity"] == "OK" or (now - _LAST_DISK_ALERT_AT) < min_interval_sec:
+        return report
+    _LAST_DISK_ALERT_AT = now
+    message = "DISK_%s free_gib=%s used_pct=%s db_bytes=%s wal_bytes=%s blocks_new_entries=%s exits_retained=true deletes_databases=false"
+    args = (
+        report["severity"],
+        report["filesystem_free_gib"],
+        report["filesystem_used_pct"],
+        report["db_bytes"],
+        report["wal_bytes"],
+        report["blocks_new_entries"],
+    )
+    if report["severity"] == "CRITICAL":
+        logger.critical(message, *args)
+    else:
+        logger.warning(message, *args)
+    return report
 
 
 def storage_report(db_path: str | Path) -> dict[str, Any]:
     """Disk and learning-table growth, with a severity band.
 
-    Observability only. A rising band is not a trading gate and must never be used as a
-    reason to shorten the retention window; that requires separate, explicit evidence.
+    CRITICAL blocks new entries only. Existing positions keep exit authority.
+    Disk pressure never deletes a database and is not a reason to shorten retention.
     """
     path = Path(db_path)
     out: dict[str, Any] = {"db_path": str(path), "generated_at": datetime.now(timezone.utc).isoformat()}
@@ -284,6 +381,13 @@ def storage_report(db_path: str | Path) -> dict[str, Any]:
     usage = shutil.disk_usage(path.parent)
     free_gb = usage.free / 1024**3
     out["db_bytes"] = path.stat().st_size
+    wal = Path(str(path) + "-wal")
+    shm = Path(str(path) + "-shm")
+    out["wal_bytes"] = wal.stat().st_size if wal.is_file() else 0
+    out["shm_bytes"] = shm.stat().st_size if shm.is_file() else 0
+    out["blocks_new_entries"] = free_gb <= DISK_CRITICAL_FREE_GB
+    out["exits_retained"] = True
+    out["deletes_databases"] = False
     out["db_gib"] = round(out["db_bytes"] / 1024**3, 3)
     out["filesystem_total_gib"] = round(usage.total / 1024**3, 2)
     out["filesystem_free_gib"] = round(free_gb, 2)
@@ -328,7 +432,7 @@ def storage_report(db_path: str | Path) -> dict[str, Any]:
         out["severity"] = "WARNING"
     else:
         out["severity"] = "OK"
-    out["severity_note"] = "observability only; not a trading gate and not a reason to shorten retention"
+    out["severity_note"] = "CRITICAL blocks new entries only; exits stay authorized; databases are never deleted"
     return out
 
 

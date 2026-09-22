@@ -566,6 +566,7 @@ def test_logrotate_config_is_bounded_and_uses_copytruncate():
     assert "size 20M" in text
     assert "rotate 5" in text
     assert "/home/mystic/mystic/logs/*.log" in text
+    assert "/home/mystic/.cursor/debug.log" in text
     # copytruncate copies to a file nothing writes to, so compress on the same pass.
     assert "delaycompress" not in text
 

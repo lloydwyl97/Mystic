@@ -18,7 +18,8 @@
 # repetitive line-oriented text and gzip at roughly 15-20x, so the steady state
 # is about 20 MB + 5 x ~1.2 MB = ~26 MB per rotating log.
 
-/home/mystic/mystic/logs/*.log {
+/home/mystic/mystic/logs/*.log
+/home/mystic/.cursor/debug.log {
     size 20M
     rotate 5
     compress

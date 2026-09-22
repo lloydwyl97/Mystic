@@ -185,7 +185,7 @@ async def get_comprehensive_health() -> dict[str, Any]:
                     {
                         "level": health_status["storage"]["severity"],
                         "issue": f"Disk free {health_status['storage'].get('filesystem_free_gib')} GiB",
-                        "action": "Run authorized telemetry retention; never delete fills or candles",
+                        "action": ("CRITICAL blocks new entries only. Exits stay authorized. Do not delete a database."),
                     }
                 )
         except Exception as exc:

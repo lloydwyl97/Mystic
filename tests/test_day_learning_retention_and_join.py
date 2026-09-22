@@ -317,14 +317,18 @@ def test_dry_run_on_a_missing_database_is_not_an_exception(tmp_path):
 # ------------------------------------------------------------------------------------
 # storage monitoring
 # ------------------------------------------------------------------------------------
-def test_storage_report_bands_are_observability_only(tmp_path):
+def test_storage_report_critical_blocks_entries_and_keeps_exits(tmp_path):
     db = tmp_path / "size.db"
     _build_db(db, lock_cutoff=None, oldest_days=365)
 
     report = storage_report(db)
 
     assert report["severity"] in {"OK", "WARNING", "CRITICAL"}
-    assert "not a trading gate" in report["severity_note"]
+    assert report["deletes_databases"] is False
+    assert report["exits_retained"] is True
+    assert "exits stay authorized" in report["severity_note"]
+    assert "never deleted" in report["severity_note"]
+    assert report["blocks_new_entries"] is (report["severity"] == "CRITICAL")
     for horizon in (30, 60, 90):
         assert f"projection_{horizon}d_gib" in report
     assert report["db_bytes"] > 0

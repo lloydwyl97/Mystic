@@ -13102,6 +13102,13 @@ class PortfolioEngine:
         This is the SOLE execution gate. All buys MUST pass through this.
         """
         symbol = normalize_symbol(symbol)
+        from backend.services.sqlite_large_table_retention import disk_blocks_new_entries
+
+        disk_blocked, disk_reason = disk_blocks_new_entries(getattr(self, "db_path", "/") or "/")
+        if disk_blocked:
+            logger.warning("BUY_BLOCKED_DISK_CRITICAL: %s %s", symbol, disk_reason)
+            return False, disk_reason
+
         # CRITICAL: Check account status first
         if self._account_status == AccountStatus.OVERALLOCATED:
             if PORTFOLIO_LOCAL_SKIP_OVERALLOCATED_BLOCK:
@@ -21299,10 +21306,17 @@ class PortfolioEngine:
         the existing kill switch. Previously defined but never invoked —
         conditions were computed nowhere, so live trading had no automatic
         stop. Safe by design: only ever engages PAUSE_BUYS (blocks new
-        entries), never auto-blocks or force-sells existing positions —
+        entries), never auto-blocks or force-sells existing positions.
+        Disk pressure is logged here and enforced only in _can_open_position.
         account_failsafe additionally raises a CRITICAL log requiring manual
         review/closure rather than issuing unattended live sell orders.
         """
+        try:
+            from backend.services.sqlite_large_table_retention import note_disk_pressure
+
+            note_disk_pressure(getattr(self, "db_path", "/") or "/")
+        except Exception:
+            logger.debug("DISK_PRESSURE_CHECK_FAILED", exc_info=True)
         try:
             from backend.services.circuit_breaker_service import EQUITY_CIRCUIT_BREAKER_FRACTION, trading_circuit_breaker
         except Exception:
