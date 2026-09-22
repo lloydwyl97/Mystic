@@ -168,3 +168,36 @@ async def test_consecutive_losses_do_not_veto_when_trailing_buy_is_off(monkeypat
     allowed, reason = await engine._can_open_position("SOL/USDT", 40.0)
     assert allowed is True
     assert reason != "HOLD_CONSEC_LOSSES"
+
+
+@pytest.mark.asyncio
+async def test_restart_load_keeps_legacy_exit_only(tmp_path: Path):
+    from backend.services.day_v2.migrations import apply_all_migrations
+    from backend.services.portfolio_engine import OpenPosition, PortfolioEngine
+
+    db = tmp_path / "load.db"
+    engine = PortfolioEngine(db_path=str(db), principal=228.0, test_mode=True)
+    engine._ensure_db_schema()
+    apply_all_migrations(str(db))
+    pos = OpenPosition(
+        symbol="BTC/USDT",
+        quantity=0.00008,
+        entry_price=86000.0,
+        entry_time=time.time(),
+        trade_id="btc_legacy",
+        stop_price=85000.0,
+        take_profit_1_price=87000.0,
+        take_profit_2_price=0.0,
+        engine_id="LEGACY_EXIT_ONLY",
+        scalp_opportunity_id="",
+    )
+    await engine._persist_position_to_sqlite(pos)
+    restarted = PortfolioEngine(db_path=str(db), principal=228.0, test_mode=True)
+    restarted._ensure_db_schema()
+    await restarted._load_positions_from_sqlite(allow_mutations=False)
+    loaded = restarted.open_positions["BTC/USDT"]
+    assert loaded.engine_id == "LEGACY_EXIT_ONLY"
+    await restarted._persist_position_to_sqlite(loaded)
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT engine_id FROM portfolio_engine_positions WHERE symbol='BTC/USDT'").fetchone()
+    assert row[0] == "LEGACY_EXIT_ONLY"

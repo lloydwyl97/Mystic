@@ -7516,7 +7516,10 @@ class PortfolioEngine:
                 if not cursor.fetchone():
                     return []
 
-                cursor.execute("""
+                col_names = {str(r[1]) for r in cursor.execute("PRAGMA table_info(portfolio_engine_positions)")}
+                engine_expr = "COALESCE(engine_id, 'LEGACY_DAY_LIVE')" if "engine_id" in col_names else "'LEGACY_DAY_LIVE'"
+                opportunity_expr = "COALESCE(scalp_opportunity_id, '')" if "scalp_opportunity_id" in col_names else "''"
+                cursor.execute(f"""
                     SELECT symbol, quantity, entry_price, entry_time, trade_id,
                            stop_price, take_profit_1_price, take_profit_2_price,
                            trailing_stop_price, tp1_hit, highest_price,
@@ -7537,7 +7540,9 @@ class PortfolioEngine:
                            COALESCE(entry_reservation_id, ''),
                            COALESCE(entry_order_id, ''),
                            COALESCE(entry_client_order_id, ''),
-                           COALESCE(entry_fill_ids_json, '[]')
+                           COALESCE(entry_fill_ids_json, '[]'),
+                           {engine_expr},
+                           {opportunity_expr}
                     FROM portfolio_engine_positions
                 """)
                 rows = cursor.fetchall()
@@ -7638,6 +7643,8 @@ class PortfolioEngine:
                 entry_order_id=entry_order_id,
                 entry_client_order_id=entry_client_order_id,
                 entry_fill_ids_json=entry_fill_ids_json,
+                engine_id=str(row[33]) if len(row) > 33 and row[33] else "LEGACY_DAY_LIVE",
+                scalp_opportunity_id=str(row[34]) if len(row) > 34 and row[34] else "",
             )
             from backend.services.day_inventory_recovery import apply_legacy_tags_from_thesis
 
