@@ -40,8 +40,10 @@ def test_assert_no_live_authority_passes_for_candidates():
     assert_no_live_authority(EngineId.DAY_V2_SHADOW)
 
 
-def test_only_legacy_in_live_engine_ids():
-    assert {EngineId.LEGACY_DAY_LIVE} == LIVE_ENGINE_IDS
+def test_day_v2_live_and_legacy_in_live_engine_ids():
+    """DAY_V2_LIVE was promoted to LIVE on 2026-09-21 after qualifying replay."""
+    assert EngineId.LEGACY_DAY_LIVE in LIVE_ENGINE_IDS
+    assert EngineId.DAY_V2_LIVE in LIVE_ENGINE_IDS
 
 
 def test_candidates_in_shadow_engine_ids():

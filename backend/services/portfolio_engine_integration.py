@@ -1451,6 +1451,11 @@ class PortfolioEngineIntegration:
                                     await self.redis_client.set(f"executed:{decision_id}", "1", ex=86400)
                             else:
                                 logger.info("BAR_PROCESS: No trade executed this entry bar")
+
+                            # DAY V2 signal evaluation — runs on the same 15m boundary
+                            # as process_bar_candidates. Operates independently of the
+                            # Redis-based LEGACY/SCALP pipeline above.
+                            await self._process_day_v2_signals(entry_bar)
                         else:
                             logger.debug(
                                 "BAR_PROCESS: skip buys until next entry bar (last=%s interval=%ss)",
@@ -1469,6 +1474,129 @@ class PortfolioEngineIntegration:
             except Exception as e:
                 logger.exception(f"Error in bar processor: {e}")
                 await asyncio.sleep(5)
+
+    async def _process_day_v2_signals(self, entry_bar: int) -> None:
+        """Evaluate DAY V2 entry signals on the just-closed 15m bar.
+
+        Called immediately after process_bar_candidates on every 15m boundary.
+        For each symbol in DAY_V2_UNIVERSE:
+          - Skip if the symbol already has an open position (any engine).
+          - Skip if DAY_V2_ENABLED is False.
+          - Load the last 60 closed 15m bars + 1H + 4H bars from feature_ohlcv.
+          - Evaluate deterministic setup rules (no ML model).
+          - If a signal fires and cash/slot allow: arm a trailing-buy intent.
+        """
+        try:
+            from backend.services.day_v2.config import DAY_V2_ENABLED, DAY_V2_UNIVERSE
+
+            if not DAY_V2_ENABLED:
+                return
+
+            import sqlite3 as _sqlite3
+
+            from backend.services.day_v2.live_entry import create_day_v2_intent
+            from backend.services.day_v2.live_signal import evaluate_entry_signal
+
+            db_path = str(self.engine.db_path)
+            sym_sep = "-"  # detect separator used in feature_ohlcv
+            try:
+                with _sqlite3.connect(db_path) as _con:
+                    _row = _con.execute("SELECT symbol FROM feature_ohlcv LIMIT 1").fetchone()
+                    if _row and "/" in str(_row[0]):
+                        sym_sep = "/"
+            except Exception:
+                pass
+
+            # Symbols already open (any engine) — do not double-buy
+            already_open: set[str] = set()
+            if self.engine and self.engine.open_positions:
+                for _s in self.engine.open_positions:
+                    already_open.add(str(_s).upper().replace("-", "").replace("/", ""))
+
+            for symbol in DAY_V2_UNIVERSE:
+                try:
+                    norm = symbol.upper().replace("-", "").replace("/", "")
+                    if norm in already_open:
+                        logger.debug("DAY_V2_SKIP_OPEN symbol=%s", symbol)
+                        continue
+
+                    # Build the DB key format (BTC-USDT or BTCUSDT or BTC/USDT)
+                    if sym_sep == "-":
+                        db_sym_15m = f"{symbol[:3]}-{symbol[3:]}" if len(symbol) == 6 else symbol
+                        # Attempt exact match for longer symbols (SOLUSDT→SOL-USDT, XRPUSDT→XRP-USDT)
+                        db_sym_15m = symbol.replace("USDT", f"{sym_sep}USDT")
+                    elif sym_sep == "/":
+                        db_sym_15m = symbol.replace("USDT", "/USDT")
+                    else:
+                        db_sym_15m = symbol
+
+                    def _load_bars_sync(db: str, sym: str, interval: str, limit: int) -> list[dict]:
+                        try:
+                            with _sqlite3.connect(db) as con:
+                                rows = con.execute(
+                                    "SELECT ts, open, high, low, close, volume FROM feature_ohlcv WHERE symbol=? AND interval=? ORDER BY ts DESC LIMIT ?",
+                                    (sym, interval, limit),
+                                ).fetchall()
+                            # Reverse so oldest-first
+                            return [{"ts": r[0], "open": float(r[1]), "high": float(r[2]), "low": float(r[3]), "close": float(r[4]), "volume": float(r[5])} for r in reversed(rows)]
+                        except Exception:
+                            return []
+
+                    import asyncio as _asyncio
+
+                    bars_15m = await _asyncio.to_thread(_load_bars_sync, db_path, db_sym_15m, "15m", 60)
+                    if len(bars_15m) < 32:
+                        logger.debug("DAY_V2_SKIP_INSUFFICIENT_BARS symbol=%s bars_15m=%d", symbol, len(bars_15m))
+                        continue
+
+                    bars_1h = await _asyncio.to_thread(_load_bars_sync, db_path, db_sym_15m, "1h", 20)
+                    bars_4h = await _asyncio.to_thread(_load_bars_sync, db_path, db_sym_15m, "4h", 15)
+
+                    signal = evaluate_entry_signal(symbol, bars_15m, bars_1h, bars_4h)
+                    if signal is None:
+                        logger.debug("DAY_V2_NO_SIGNAL symbol=%s", symbol)
+                        continue
+
+                    # Check slot availability and cash
+                    ask_price = float(self.current_prices.get(norm) or self.current_prices.get(symbol) or 0.0)
+                    if ask_price <= 0:
+                        logger.warning("DAY_V2_NO_PRICE symbol=%s", symbol)
+                        continue
+
+                    # Compute position size via the engine's existing sizing logic
+                    atr_val = float(signal.atr or 0.0)
+                    qty, notional, _ = self.engine.calculate_position_size(
+                        symbol=norm,
+                        equity=float(self.engine.total_equity or self.engine.cash_balance or 0),
+                        atr=atr_val if atr_val > 0 else ask_price * 0.015,
+                        current_price=ask_price,
+                    )
+                    if qty <= 0 or notional <= 0:
+                        logger.warning("DAY_V2_ZERO_SIZE symbol=%s ask=%.6f atr=%.6f", symbol, ask_price, atr_val)
+                        continue
+
+                    # Gate through _can_open_position
+                    can_open, gate_reason = await self.engine._can_open_position(norm, notional)
+                    if not can_open:
+                        logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s", symbol, gate_reason)
+                        continue
+
+                    intent = create_day_v2_intent(db_path, signal, ask_price, qty)
+                    if intent:
+                        logger.warning(
+                            "DAY_V2_SIGNAL symbol=%s setup=%s opp=%s anchor=%.6f target=%.6f",
+                            symbol,
+                            signal.setup,
+                            signal.opportunity_id,
+                            signal.structural_anchor,
+                            signal.target_price,
+                        )
+
+                except Exception:
+                    logger.warning("DAY_V2_SIGNAL_ERROR symbol=%s", symbol, exc_info=True)
+
+        except Exception:
+            logger.warning("DAY_V2_PROCESS_ERROR", exc_info=True)
 
     async def _monitor_positions_once(self, *, refresh_market_data: bool = True) -> list[dict[str, Any]]:
         """

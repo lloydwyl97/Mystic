@@ -73,8 +73,6 @@ from backend.config.signal_thresholds import MIN_CONFIDENCE_BUY
 from backend.config.trading_economics import (
     BINANCE_US_TAKER_FEE_PCT,
     ESTIMATED_ROUNDTRIP_COST,
-    ESTIMATED_ROUNDTRIP_COST_PCT,
-    MIN_NET_PROFIT_TO_SELL,
     TAKER_FEE,
 )
 from backend.config.trading_economics import (
@@ -97,7 +95,7 @@ from backend.config.trading_universe import DAY_TRADE_SYMBOLS, get_trading_symbo
 from backend.database_schema import DATABASE_PATH, create_paper_trades_table
 from backend.services.ai_artifact_contract_gate import evaluate_signal_hash_artifact_contract
 from backend.services.ai_decision_contract import REDIS_KEY_AI_CONTEXT
-from backend.services.ai_entry_context_gate import get_ctx_fresh_max_age_sec, needs_context_audit_emit_refresh
+from backend.services.ai_entry_context_gate import needs_context_audit_emit_refresh
 from backend.services.decision_trace import log_decision_trace
 from backend.services.live_strategy_contracts import (
     live_ai_fail_closed_without_context,
@@ -4126,7 +4124,6 @@ class PortfolioEngine:
 
         try:
             from backend.config.redis_config import get_redis_client
-            from backend.utils.symbols import to_exchange_symbol
 
             redis_client = get_redis_client()
             if redis_client:
@@ -9860,6 +9857,22 @@ class PortfolioEngine:
                 if armed:
                     position.engine_id = str(armed.get("engine_id") or position.engine_id)
                     position.scalp_opportunity_id = str(armed.get("scalp_opportunity_id") or "")
+                    # For DAY V2 positions, populate thesis fields from the intent
+                    # so that the DAY V2 exit evaluator has structural anchor / target.
+                    if str(armed.get("engine_id") or "") == "DAY_V2":
+                        _d2_anchor = float(armed.get("thesis_invalid_level") or 0.0)
+                        if _d2_anchor > 0 and not float(getattr(position, "thesis_invalid_level", 0.0) or 0.0):
+                            position.thesis_invalid_level = _d2_anchor
+                        _d2_atr = float(armed.get("atr") or 0.0)
+                        if _d2_atr > 0 and not float(getattr(position, "atr_at_entry", 0.0) or 0.0):
+                            position.atr_at_entry = _d2_atr
+                        try:
+                            _d2_payload = json.loads(armed.get("payload_json") or "{}")
+                        except Exception:
+                            _d2_payload = {}
+                        _d2_target = float(_d2_payload.get("thesis_target_level") or 0.0)
+                        if _d2_target > 0 and not float(getattr(position, "thesis_target_level", 0.0) or 0.0):
+                            position.thesis_target_level = _d2_target
             except Exception:
                 logger.debug("SCALP_V2_INTENT_STAMP_SKIPPED %s", symbol, exc_info=True)
         if buy_mode == "live" and not position.scalp_opportunity_id:
@@ -13708,6 +13721,57 @@ class PortfolioEngine:
             )
             return None
 
+        # DAY V2 exit dispatch — runs before all legacy exits.
+        # Positions with engine_id='DAY_V2' use the five DAY V2 exit roles
+        # (catastrophic / structural / winner-trail / objective / time) and
+        # skip the SCALP V2 stall/giveback/profit logic below.
+        _pos_engine_id = str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE")
+        if _pos_engine_id == "DAY_V2":
+            try:
+                from backend.services.day_v2.live_exit_evaluator import evaluate_day_v2_exit
+
+                _bar_low_day_v2 = float(getattr(position, "lowest_price", 0.0) or current_price)
+                if _bar_low_day_v2 <= 0:
+                    _bar_low_day_v2 = float(current_price)
+                _day_v2_dec = evaluate_day_v2_exit(
+                    engine_id=_pos_engine_id,
+                    entry_price=entry_price,
+                    current_price=float(current_price),
+                    bar_low=_bar_low_day_v2,
+                    highest_price=float(getattr(position, "highest_price", 0.0) or entry_price),
+                    atr_at_entry=float(getattr(position, "atr_at_entry", 0.0) or 0.0),
+                    structural_anchor=float(getattr(position, "thesis_invalid_level", 0.0) or 0.0),
+                    target_price=float(getattr(position, "thesis_target_level", 0.0) or 0.0),
+                    entry_time=float(getattr(position, "entry_time", 0.0) or 0.0),
+                    estimated_roundtrip_cost=float(ESTIMATED_ROUNDTRIP_COST),
+                )
+                if _day_v2_dec and str(_day_v2_dec.get("action") or "") == "sell":
+                    _day_v2_reason = str(_day_v2_dec.get("reason") or "DAY_V2_EXIT")
+                    logger.warning(
+                        "DAY_V2_EXIT symbol=%s reason=%s detail=%s price=%.6f",
+                        symbol,
+                        _day_v2_reason,
+                        _day_v2_dec.get("detail"),
+                        current_price,
+                    )
+                    return await self.execute_sell_fifo(
+                        symbol,
+                        quantity,
+                        current_price,
+                        ExitType.MANUAL,
+                        _day_v2_reason,
+                        current_bar=current_bar,
+                        force_sell=True,
+                    )
+                # No DAY V2 exit condition met — hold.
+                return None
+            except Exception:
+                logger.warning(
+                    "DAY_V2_EXIT_EVAL_ERROR symbol=%s — falling through to legacy exits",
+                    symbol,
+                    exc_info=True,
+                )
+
         # All-weather bounded exit — ATR bracket only; never MIN_NET_PROFIT floor.
         try:
             from backend.services import allweather_breakout_pullback_adapter as _awbp
@@ -15555,7 +15619,7 @@ class PortfolioEngine:
         try:
             from backend.config.mystic_api_schedule import SELL_MARK_MAX_AGE_SECONDS
             from backend.config.redis_config import get_redis_client
-            from backend.utils.symbols import normalize_symbol, to_exchange_symbol
+            from backend.utils.symbols import normalize_symbol
 
             redis_client = get_redis_client()
             if not redis_client:
@@ -16173,7 +16237,6 @@ class PortfolioEngine:
         """DAY paper authority: four-coin path-EV vs HOLD. Old rank is telemetry only."""
         from backend.services.day_direct_path_ev_authority import (
             _api_symbol,
-            _slash_symbol,
             decide_day_bar,
             next_executable_path_ev_symbol,
         )
@@ -17427,8 +17490,6 @@ class PortfolioEngine:
             enrich_basket_relative_strength(valid_candidates)
             for _tc in valid_candidates:
                 try:
-                    from backend.services.day_ai_rank_enrichment import apply_intelligence_rank_delta_to_candidate
-
                     dd = dict(getattr(_tc, "decision_data", None) or {})
                     basket_delta = float(dd.get("basket_rs_rank_delta") or 0.0)
                     if basket_delta:

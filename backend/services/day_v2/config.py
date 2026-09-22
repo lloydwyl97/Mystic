@@ -69,18 +69,29 @@ DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED: int = _read_int("DAY_V2_STRUCTURAL_I
 # Universe — immutable, not overridable via env
 DAY_V2_UNIVERSE: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 
-# Catastrophic stop multiplier (ATR multiples)
+# Catastrophic stop multiplier (ATR multiples). Calibrated from qualifying replay.
 DAY_V2_CATASTROPHIC_ATR_MULTIPLIER: float = _read_float("DAY_V2_CATASTROPHIC_ATR_MULTIPLIER", default=3.0)
+
+# Winner trail — activated after MFE >= MIN_MFE_PCT; trails at max(floor, ATR_MULT * atr_pct)
+# Calibrated from qualifying replay (day_v2_replay.py @ a88479a).
+DAY_V2_WINNER_TRAIL_ATR_MULT: float = _read_float("DAY_V2_WINNER_TRAIL_ATR_MULT", default=1.5)
+DAY_V2_WINNER_TRAIL_FLOOR_PCT: float = _read_float("DAY_V2_WINNER_TRAIL_FLOOR_PCT", default=0.005)
+
+# Trailing-buy calibration for multi-hour entries (separate from SCALP V2 14/4 bps values)
+DAY_V2_MIN_DIP_BPS: float = _read_float("DAY_V2_MIN_DIP_BPS", default=20.0)
+DAY_V2_REBOUND_BPS: float = _read_float("DAY_V2_REBOUND_BPS", default=6.0)
+
+# Max notional per DAY V2 position; 0 = use calculate_position_size (preferred)
+DAY_V2_MAX_NOTIONAL_USD: float = _read_float("DAY_V2_MAX_NOTIONAL_USD", default=0.0)
 
 
 def get_day_v2_config() -> dict:
     """Return all DAY V2 config values as a dict.
 
     Raises RuntimeError if DAY_V2_ENABLED is not explicitly True.
-    This ensures shadow operation is an explicit opt-in.
     """
     if not DAY_V2_ENABLED:
-        raise RuntimeError("DAY_V2_ENABLED is not set to 'true'. DAY V2 config is disabled. Set DAY_V2_ENABLED=true in environment to enable shadow operation.")
+        raise RuntimeError("DAY_V2_ENABLED is not set to 'true'. Set DAY_V2_ENABLED=true in environment.")
     return {
         "DAY_V2_ENABLED": DAY_V2_ENABLED,
         "DAY_V2_PRIMARY_BAR_SECONDS": DAY_V2_PRIMARY_BAR_SECONDS,
@@ -88,7 +99,12 @@ def get_day_v2_config() -> dict:
         "DAY_V2_REGIME_BAR_SECONDS": DAY_V2_REGIME_BAR_SECONDS,
         "DAY_V2_MAX_HOLD_MINUTES": DAY_V2_MAX_HOLD_MINUTES,
         "DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT": DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT,
+        "DAY_V2_WINNER_TRAIL_ATR_MULT": DAY_V2_WINNER_TRAIL_ATR_MULT,
+        "DAY_V2_WINNER_TRAIL_FLOOR_PCT": DAY_V2_WINNER_TRAIL_FLOOR_PCT,
         "DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED": DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED,
         "DAY_V2_UNIVERSE": DAY_V2_UNIVERSE,
         "DAY_V2_CATASTROPHIC_ATR_MULTIPLIER": DAY_V2_CATASTROPHIC_ATR_MULTIPLIER,
+        "DAY_V2_MIN_DIP_BPS": DAY_V2_MIN_DIP_BPS,
+        "DAY_V2_REBOUND_BPS": DAY_V2_REBOUND_BPS,
+        "DAY_V2_MAX_NOTIONAL_USD": DAY_V2_MAX_NOTIONAL_USD,
     }

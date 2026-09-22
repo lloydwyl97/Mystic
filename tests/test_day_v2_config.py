@@ -100,8 +100,9 @@ def test_structural_invalidation_bars_default():
 
 def test_get_day_v2_config_fails_closed_when_disabled():
     """get_day_v2_config() raises RuntimeError when DAY_V2_ENABLED=False."""
-    from backend.services.day_v2.config import get_day_v2_config
+    from unittest.mock import patch
 
-    # By default, DAY_V2_ENABLED=False (not set in env), so this should raise
-    with pytest.raises(RuntimeError, match="DAY_V2_ENABLED"):
-        get_day_v2_config()
+    import backend.services.day_v2.config as _cfg
+
+    with patch.object(_cfg, "DAY_V2_ENABLED", False), pytest.raises(RuntimeError, match="DAY_V2_ENABLED"):
+        _cfg.get_day_v2_config()

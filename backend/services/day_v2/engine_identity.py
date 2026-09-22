@@ -3,6 +3,13 @@
 The _AUTHORITY_TABLE is the single auditable authority boundary. Changing
 LEGACY_DAY_LIVE to SHADOW or promoting a candidate to LIVE requires an
 explicit git commit with a clear message. It must never happen automatically.
+
+Promotion history:
+  2026-09-21  DAY_V2_LIVE promoted from SHADOW to LIVE.
+              Qualification: event-driven replay @ a88479a showed:
+              Validation PF 1.18, Untouched-OOS PF 1.60, both green.
+              Replay script: scripts/research/day_v2_replay.py
+              Live activation gated by DAY_V2_ENABLED=true env var.
 """
 
 import time
@@ -16,6 +23,9 @@ class EngineId(str, Enum):
     LEGACY_DAY_LIVE = "LEGACY_DAY_LIVE"
     SCALP_V2_CANDIDATE = "SCALP_V2_CANDIDATE"
     DAY_V2_SHADOW = "DAY_V2_SHADOW"
+    # Promoted 2026-09-21 after qualifying event-driven replay.
+    # engine_id stored on positions and intents is the string "DAY_V2".
+    DAY_V2_LIVE = "DAY_V2"
 
 
 class AuthorityLevel(str, Enum):
@@ -27,17 +37,21 @@ class AuthorityLevel(str, Enum):
 
 
 # Static authority table — the single source of truth.
-# Changing LEGACY_DAY_LIVE to SHADOW or promoting a candidate to LIVE
-# requires an explicit git commit with a clear message.
+# Changing an engine's level requires an explicit git commit.
 # This must never happen automatically.
 _AUTHORITY_TABLE: dict[EngineId, AuthorityLevel] = {
     EngineId.LEGACY_DAY_LIVE: AuthorityLevel.LIVE,
     EngineId.SCALP_V2_CANDIDATE: AuthorityLevel.SHADOW,
     EngineId.DAY_V2_SHADOW: AuthorityLevel.SHADOW,
+    # DAY_V2_LIVE has LIVE authority.  Gated at the application layer by
+    # the DAY_V2_ENABLED env var — when False the live signal and entry
+    # modules are not called. The table entry itself is always LIVE so
+    # that has_live_authority() returns accurate results for audit.
+    EngineId.DAY_V2_LIVE: AuthorityLevel.LIVE,
 }
 
 # Frozen sets for fast membership checks.
-LIVE_ENGINE_IDS: frozenset[EngineId] = frozenset({EngineId.LEGACY_DAY_LIVE})
+LIVE_ENGINE_IDS: frozenset[EngineId] = frozenset({EngineId.LEGACY_DAY_LIVE, EngineId.DAY_V2_LIVE})
 SHADOW_ENGINE_IDS: frozenset[EngineId] = frozenset({EngineId.SCALP_V2_CANDIDATE, EngineId.DAY_V2_SHADOW})
 
 
