@@ -744,6 +744,9 @@ def paper_trades_exit_type_label(exit_type: ExitType, exit_trigger: str) -> str:
     if exit_type == ExitType.TAKE_PROFIT_FULL:
         return ExitType.TAKE_PROFIT_FULL.value
     trig = str(exit_trigger or "").upper()
+    # DAY_V2 exit evaluator returns canonical reason strings — pass them through as-is.
+    if trig.startswith("DAY_V2_"):
+        return str(exit_trigger)
     if "DAY_4H_STRUCTURE_BREAK" in trig:
         return EXIT_DAY_4H_STRUCTURE_BREAK
     if "DAY_RISK_FLOOR" in trig:

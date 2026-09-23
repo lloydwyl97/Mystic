@@ -31,3 +31,17 @@ def test_operator_manual_and_flatten_labels_stay_distinct():
 
 def test_profit_exit_label_unchanged():
     assert paper_trades_exit_type_label(ExitType.TAKE_PROFIT_1, "NET_PROFIT_EXIT") == ExitType.TAKE_PROFIT_1.value
+
+
+def test_day_v2_exit_reasons_pass_through_unchanged():
+    """DAY_V2_* reasons must not collapse to MANUAL_EXIT."""
+    for reason in (
+        "DAY_V2_CATASTROPHIC_PROTECTION",
+        "DAY_V2_STRUCTURAL_INVALIDATION",
+        "DAY_V2_WINNER_PROTECTION",
+        "DAY_V2_OBJECTIVE_COMPLETE",
+        "DAY_V2_TIME_EXPIRATION",
+    ):
+        result = paper_trades_exit_type_label(ExitType.MANUAL, reason)
+        assert result == reason, f"expected {reason!r}, got {result!r}"
+        assert result != ExitType.MANUAL.value, f"{reason!r} collapsed to MANUAL"
