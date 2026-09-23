@@ -11337,8 +11337,9 @@ class PortfolioEngine:
                                 fees_paid, slippage_cost, exit_type, exit_r_multiple,
                                 timestamp, status, explainability_json, diagnostics_json, sleeve,
                                 exit_reason, entry_timestamp, decision_id, strategy_id,
-                                pnl_usd_net, pnl_pct_net, order_id
-                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                pnl_usd_net, pnl_pct_net, order_id,
+                                stop_price, take_profit_price
+                            ) VALUES (?, ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                             (
                                 sell_trade_id,
@@ -11367,6 +11368,10 @@ class PortfolioEngine:
                                 pnl_usd_net,
                                 pnl_pct_net,
                                 str((live_order_sell or {}).get("id") or "") or None,
+                                # Capture position-level stop and target at sell time
+                                # for post-exit counterfactual analysis (non-trading).
+                                float(getattr(position, "stop_price", 0.0) or 0.0) or None,
+                                float(getattr(position, "take_profit_1_price", 0.0) or 0.0) or None,
                             ),
                         )
                     else:

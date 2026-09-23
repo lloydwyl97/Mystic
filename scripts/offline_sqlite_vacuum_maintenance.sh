@@ -6,6 +6,9 @@ set -euo pipefail
 
 REPO_ROOT="/home/mystic/mystic"
 DB_PATH="${DB_PATH:-$REPO_ROOT/mystic_trading.db}"
+# mystic_scalp.db was retired in the paper-runner removal (2026-09-22).
+# The variable is kept for backward compat with any callers that set it, but
+# the file will not exist and maintain_one_db() will SKIP it gracefully.
 SCALP_DB_PATH="${SCALP_DB_PATH:-$REPO_ROOT/mystic_scalp.db}"
 VENV_PYTHON="${VENV_PYTHON:-$REPO_ROOT/venv/bin/python3}"
 AUTO_MANAGE=0
@@ -23,7 +26,7 @@ Usage: $(basename "$0") [--auto-manage-services] [--force-offline] [--keep-old-b
 
 Environment:
   DB_PATH       Path to mystic_trading.db (default: $DB_PATH)
-  SCALP_DB_PATH Path to mystic_scalp.db (default: $SCALP_DB_PATH)
+  SCALP_DB_PATH Path to mystic_scalp.db (retired; skipped if file absent)
   VENV_PYTHON   Python interpreter (default: venv)
 EOF
 }

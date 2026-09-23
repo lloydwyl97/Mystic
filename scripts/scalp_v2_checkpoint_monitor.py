@@ -270,13 +270,47 @@ def _load_qualifying_trades(conn: sqlite3.Connection) -> list[dict]:
     return [dict(zip(cols, r, strict=False)) for r in rows]
 
 
-def _load_post_exit_1m_bars(conn: sqlite3.Connection, symbol: str, exit_ts: str, limit: int) -> list[dict]:
-    """Load up to *limit* 1m bars starting from *exit_ts*.
+def _normalise_ts_for_feature_ohlcv(ts_str: str) -> str:
+    """Convert a paper_trades timestamp to the format stored in feature_ohlcv.
 
-    Returns an empty list when feature_ohlcv has no 1m rows for the symbol
-    (currently always empty on Ocean — verified 2026-09-22).
+    paper_trades uses ISO-8601 with a T separator and timezone offset:
+        '2026-09-23T01:36:06.830174+00:00'
+    feature_ohlcv stores timestamps with a space separator and no offset:
+        '2026-09-23 01:36:06.000000'
+
+    Without this normalisation the lexicographic comparison 'ts >= exit_ts'
+    always fails because ASCII T (84) > ASCII space (32), so every feature_ohlcv
+    row appears to come BEFORE the exit timestamp even when it is later.
     """
-    for sym in (symbol, symbol.replace("/", "-"), symbol.replace("/", "")):
+    # Replace T with space, drop subsecond + timezone, keep up to seconds.
+    ts = ts_str.replace("T", " ")
+    # Strip timezone offset (+00:00 or Z)
+    for sep in ("+", "Z"):
+        idx = ts.find(sep, 10)  # skip date portion
+        if idx != -1:
+            ts = ts[:idx]
+    # Truncate to 'YYYY-MM-DD HH:MM:SS' for a clean comparison floor
+    return ts[:19]
+
+
+def _load_post_exit_1m_bars(conn: sqlite3.Connection, symbol: str, exit_ts: str, limit: int) -> list[dict]:
+    """Load up to *limit* 1m bars from feature_ohlcv starting at *exit_ts*.
+
+    feature_ohlcv stores symbols as 'BTC-USDT' (hyphen) and timestamps as
+    '2026-09-23 01:36:06.000000' (space separator).  paper_trades stores
+    symbols as 'BTC/USDT' (slash) and timestamps in ISO-8601 with a T and
+    timezone offset.  Both mismatches are normalised before querying.
+
+    Returns an empty list when no matching rows exist.
+    """
+    normalised_ts = _normalise_ts_for_feature_ohlcv(exit_ts)
+    # Try symbol formats: 'ETH/USDT' → 'ETH-USDT' (stored format), then fallback variants
+    syms_to_try = [
+        symbol.replace("/", "-"),  # BTC/USDT → BTC-USDT  (primary on Ocean)
+        symbol,  # BTC/USDT as-is
+        symbol.replace("/", ""),  # BTCUSDT
+    ]
+    for sym in syms_to_try:
         rows = conn.execute(
             """
             SELECT ts, open, high, low, close
@@ -284,7 +318,7 @@ def _load_post_exit_1m_bars(conn: sqlite3.Connection, symbol: str, exit_ts: str,
             WHERE symbol=? AND interval='1m' AND ts >= ?
             ORDER BY ts ASC LIMIT ?
             """,
-            (sym, exit_ts, limit),
+            (sym, normalised_ts, limit),
         ).fetchall()
         if rows:
             return [{"ts": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4]} for r in rows]
@@ -335,10 +369,12 @@ def _compute_cf(trade: dict, post_bars: list[dict]) -> dict:
     missing_reasons: list[str] = []
     if not post_bars:
         missing_reasons.append("no_1m_bars_in_feature_ohlcv")
-    if stop <= 0 and tp <= 0:
+    stop_target_null = stop <= 0 and tp <= 0
+    if stop_target_null:
         missing_reasons.append("stop_price_and_take_profit_null_in_paper_trades")
 
-    if missing_reasons:
+    # Hard UNAVAILABLE: no 1m bars at all — cannot evaluate any alternative exit.
+    if not post_bars:
         return {
             "cf_status": "UNAVAILABLE",
             "cf_missing_data_reason": "; ".join(missing_reasons),
@@ -350,6 +386,11 @@ def _compute_cf(trade: dict, post_bars: list[dict]) -> dict:
             "cf_max_hold_sec": float(_PROD_MAX_HOLD_SEC),
             "cf_remaining_hold_sec": remaining_sec,
         }
+
+    # Partial: bars available but stop/target NULL.
+    # We can still compute the TIME_STOP_EXIT counterfactual (what price at
+    # end of remaining window) without knowing the stop or target levels.
+    # cf_status is COMPUTED_TIME_STOP_ONLY to distinguish from a full CF.
 
     # Approximate round-trip fee using recorded fee when available
     fee_est = abs(float(trade.get("fees_paid") or 0)) or (actual_exit_price * qty * 0.0002)
@@ -387,6 +428,8 @@ def _compute_cf(trade: dict, post_bars: list[dict]) -> dict:
             cf_exit_ts = bar_ts
             cf_exit_price = tp
             break
+        # When stop/target are NULL: skip individual bar triggers, fall through
+        # to TIME_STOP_EXIT at end of window (COMPUTED_TIME_STOP_ONLY).
 
     # If no trigger found within the remaining window, time stop fires at last bar
     if cf_exit_type is None:
@@ -425,9 +468,21 @@ def _compute_cf(trade: dict, post_bars: list[dict]) -> dict:
     cf_pnl = (cf_exit_price - ep) * qty - fee_est
     cf_saved = actual_pnl - cf_pnl  # positive means giveback saved money vs. alternative
 
+    # Determine final status
+    if cf_ambiguous:
+        final_status = "INTRABAR_AMBIGUOUS"
+        missing_note: str | None = "intrabar_stop_and_target_same_bar"
+    elif stop_target_null:
+        # Bars available, stop/target NULL: evaluated TIME_STOP only
+        final_status = "COMPUTED_TIME_STOP_ONLY"
+        missing_note = "stop_and_target_unavailable_time_stop_only"
+    else:
+        final_status = "COMPUTED"
+        missing_note = None
+
     return {
-        "cf_status": "INTRABAR_AMBIGUOUS" if cf_ambiguous else "COMPUTED",
-        "cf_missing_data_reason": "intrabar_stop_and_target_same_bar" if cf_ambiguous else None,
+        "cf_status": final_status,
+        "cf_missing_data_reason": missing_note,
         "cf_first_exit": cf_exit_type,
         "cf_exit_ts": cf_exit_ts,
         "cf_exit_price": round(cf_exit_price, 8),
@@ -459,7 +514,7 @@ def _capture_givebacks(conn: sqlite3.Connection, trades: list[dict]) -> None:
 
     existing: dict[str, str] = {r[0]: (r[1] or "PENDING") for r in conn.execute("SELECT trade_id, cf_status FROM scalp_v2_giveback_cf").fetchall()}
 
-    terminal_statuses = frozenset({"COMPUTED", "UNAVAILABLE", "INTRABAR_AMBIGUOUS"})
+    terminal_statuses = frozenset({"COMPUTED", "UNAVAILABLE", "INTRABAR_AMBIGUOUS", "COMPUTED_TIME_STOP_ONLY"})
     new_count = updated_count = 0
 
     for t in givebacks:
@@ -686,7 +741,7 @@ def _generate_report(trades: list[dict], conn: sqlite3.Connection, db_path: str)
     cf_cols = [d[0] for d in conn.execute("PRAGMA table_info(scalp_v2_giveback_cf)").fetchall()]
     cf_list = [dict(zip(cf_cols, r, strict=False)) for r in cf_rows]
 
-    computed_rows = [r for r in cf_list if (r.get("cf_status") or "") in ("COMPUTED", "INTRABAR_AMBIGUOUS")]
+    computed_rows = [r for r in cf_list if (r.get("cf_status") or "") in ("COMPUTED", "INTRABAR_AMBIGUOUS", "COMPUTED_TIME_STOP_ONLY")]
     unavailable_rows = [r for r in cf_list if (r.get("cf_status") or "") == "UNAVAILABLE"]
 
     cf_summary: dict[str, Any] = {
