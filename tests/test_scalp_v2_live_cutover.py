@@ -140,10 +140,22 @@ def test_paper_scalp_package_has_no_live_order_call():
 
 
 def test_core_startup_does_not_launch_paper_scalp():
+    """Paper scalp runner is fully retired (2026-09-22): not started, not callable.
+
+    _launch_scalp() and start_scalp() functions were removed.  The `scalp` mode
+    is now in the retired_mode case.  binance_scalp.runner is in LEGACY_PATTERNS
+    (killed on every core restart to clear any lingering instance).
+    """
     text = Path("start_mystic.sh").read_text()
-    assert "# start_scalp || return 1  # DISABLED in core mode" in text
-    assert "all|ai|collector|agents|ai_position_tracker|ai_outcome_bridge)" in text
+    # Neither _launch_scalp nor start_scalp function definitions exist.
+    assert "_launch_scalp()" not in text
+    assert "start_scalp()" not in text
+    assert "start_scalp ||" not in text
+    # `scalp` mode is now in the retired_mode case alongside `all` etc.
+    assert "all|ai|collector|agents|ai_position_tracker|ai_outcome_bridge|scalp)" in text
     assert 'retired_mode "$MODE"' in text
+    # binance_scalp.runner is stopped as a LEGACY_PATTERN on every core start.
+    assert "backend.services.binance_scalp.runner" in text
     watchdog = Path("watchdog_mystic.sh").read_text()
     assert "backend.services.binance_scalp.runner" not in watchdog
 

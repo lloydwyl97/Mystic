@@ -1,11 +1,10 @@
 #!/bin/bash
 # MYSTIC startup script
 # Modes:
-#   ./start_mystic.sh core|full  (canonical 24/7 — DAY top-4 + scalp paper, separate engines)
-#   ./start_mystic.sh scalp      (scalp runner only — starts backend/live_md if needed)
-#   ./start_mystic.sh backend|live_md|signal|portfolio|learning|ai_context|scalp
+#   ./start_mystic.sh core|full  (canonical 24/7 — SCALP V2 + DAY V2 live via portfolio engine)
+#   ./start_mystic.sh backend|live_md|signal|portfolio|learning|ai_context
 #
-# Retired (exit 1): all, ai, collector, agents, ai_position_tracker, ai_outcome_bridge
+# Retired (exit 1): all, ai, collector, agents, ai_position_tracker, ai_outcome_bridge, scalp
 
 set -u
 
@@ -125,6 +124,9 @@ LEGACY_PATTERNS=(
     "start_agent_orchestrator.py"
     "start_ai_position_tracker.py"
     "start_ai_outcome_bridge.py"
+    # Retired paper scalp runner (2026-09-22): stopped on every core restart
+    # so any lingering instance from before the paper removal is cleaned up.
+    "backend.services.binance_scalp.runner"
 )
 
 stop_by_pattern() {
@@ -338,25 +340,27 @@ start_ai_context() {
     fi
 }
 
-_launch_scalp() {
-    local scalp_paper="${SCALP_PAPER_ENABLED:-true}"
-    local scalp_auto_arm="${SCALP_PAPER_AUTO_ARM:-true}"
-    local scalp_fee="${SCALP_FEE_MODEL_VERIFIED:-true}"
-    echo "Starting Scalp Paper Runner (SCALP_PAPER_ENABLED=${scalp_paper} AUTO_ARM=${scalp_auto_arm})..."
-    nohup env SCALP_PAPER_ENABLED="${scalp_paper}" SCALP_PAPER_AUTO_ARM="${scalp_auto_arm}" \
-        SCALP_FEE_MODEL_VERIFIED="${scalp_fee}" \
-        "$PYTHON" -m backend.services.binance_scalp.runner > /home/mystic/mystic/logs/mystic_scalp.log 2>&1 9>&- &
-}
+# _launch_scalp / start_scalp removed 2026-09-22 — paper runner retired.
+# binance_scalp.runner is now in LEGACY_PATTERNS and is stopped by
+# stop_legacy_processes on every core restart.
 
-start_scalp() {
-    if refuse_duplicate_or_collapse "backend.services.binance_scalp.runner" "Scalp Paper Runner"; then
+start_checkpoint_monitor() {
+    # Read-only 100-trade SCALP V2 checkpoint monitor.
+    # PID-locked singleton: a second invocation exits immediately.
+    if refuse_duplicate_or_collapse "scalp_v2_checkpoint_monitor.py" "SCALP V2 Checkpoint Monitor"; then
         return 0
     fi
-    _launch_scalp
-    require_running "backend.services.binance_scalp.runner" "Scalp Paper Runner" "/home/mystic/mystic/logs/mystic_scalp.log" 20 1 || return 1
-    if ! assert_single_after_start "backend.services.binance_scalp.runner" "Scalp Paper Runner"; then
-        _launch_scalp
-        require_running "backend.services.binance_scalp.runner" "Scalp Paper Runner" "/home/mystic/mystic/logs/mystic_scalp.log" 20 1 || return 1
+    echo "Starting SCALP V2 Checkpoint Monitor..."
+    nohup "$PYTHON" scripts/scalp_v2_checkpoint_monitor.py --poll 120 \
+        > /home/mystic/mystic/logs/scalp_v2_monitor.log 2>&1 9>&- &
+    # Monitor is read-only and non-critical — do not gate startup on it
+    sleep 1
+    local n
+    n="$(process_count "scalp_v2_checkpoint_monitor.py")"
+    if [ "$n" -ge 1 ]; then
+        echo "OK: SCALP V2 Checkpoint Monitor started"
+    else
+        echo "WARN: SCALP V2 Checkpoint Monitor did not start (non-critical, continuing)"
     fi
 }
 
@@ -365,10 +369,8 @@ stop_signal() { stop_by_pattern "start_ai_signal_generator.py"; }
 stop_portfolio() { stop_by_pattern "start_portfolio_engine_integration.py"; }
 stop_learning() { stop_by_pattern "start_ai_learning.py"; }
 stop_ai_context() { stop_by_pattern "start_ai_market_context.py"; }
-stop_scalp() { stop_by_pattern "backend.services.binance_scalp.runner"; }
 
 stop_core_stack() {
-    stop_scalp
     stop_backend
     stop_live_md
     stop_signal
@@ -430,18 +432,18 @@ run_core_stack() {
     start_ai_context || return 1
     sleep 1
     start_learning || return 1
-    # SCALP V2 (2026-09-21): old paper binance_scalp.runner removed from core mode.
-    # The old runner had zero genuine-strategy-confirmed entries (all soft-rank).
-    # SCALP V2 replaces it with evidence-based exit calibration built into the main engine.
-    # To start the old runner explicitly: ./start_mystic.sh scalp
-    # start_scalp || return 1  # DISABLED in core mode
+    # SCALP V2 live order authority is built into the portfolio engine (execute_buy_fifo).
+    # The old paper binance_scalp.runner is fully retired (2026-09-22).
+    # 100-trade checkpoint monitor: read-only, PID-locked singleton.
+    start_checkpoint_monitor
 
     echo ""
     echo "=========================================="
-    echo "MYSTIC ${label} STACK STARTED (SCALP V2 live on the portfolio engine)"
+    echo "MYSTIC ${label} STACK STARTED (SCALP V2 + DAY V2 live)"
     echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
-    echo "Services: Backend + LiveMD + Signal + Portfolio + Context + Learning"
-    echo "SCALP V2: live order authority is the portfolio engine. Paper scalp is not started."
+    echo "Services: Backend + LiveMD + Signal + Portfolio + Context + Learning + Monitor"
+    echo "SCALP V2: live order authority via portfolio engine. Paper scalp removed."
+    echo "DAY V2:   live entry authority via trailing-buy intent machinery."
     echo "Ensure .env has EXTERNAL_SUPERVISOR_MODE=true"
     echo "=========================================="
 }
@@ -463,7 +465,7 @@ case "$MODE" in
         systemctl --user stop mystic.target 2>/dev/null || true
         run_core_stack "FULL" || exit 1
         ;;
-    all|ai|collector|agents|ai_position_tracker|ai_outcome_bridge)
+    all|ai|collector|agents|ai_position_tracker|ai_outcome_bridge|scalp)
         retired_mode "$MODE"
         ;;
     ai_context)
@@ -503,26 +505,9 @@ case "$MODE" in
         sleep 1
         start_backend || exit 1
         ;;
-    scalp)
-        echo "Mode: scalp (isolated — does not start/stop DAY portfolio stack)"
-        stop_scalp
-        sleep 1
-        ensure_redis
-        ensure_running_or_start "uvicorn backend.main:app" start_backend "Backend API" || exit 1
-        sleep 2
-        ensure_running_or_start "start_live_market_data.py" start_live_md "Live Market Data" || exit 1
-        sleep 2
-        start_scalp || exit 1
-        echo ""
-        echo "=========================================="
-        echo "MYSTIC SCALP STACK STARTED"
-        echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
-        echo "API: /api/scalp/status  /api/scalp/strategies"
-        echo "Log: /home/mystic/mystic/logs/mystic_scalp.log"
-        echo "=========================================="
-        ;;
+    # scalp mode was removed here — it is now in the retired_mode case above.
     *)
-        echo "Usage: $0 [core|full|scalp|backend|live_md|signal|portfolio|learning|ai_context]"
+        echo "Usage: $0 [core|full|backend|live_md|signal|portfolio|learning|ai_context]"
         exit 1
         ;;
 esac
