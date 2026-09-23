@@ -337,6 +337,20 @@ class PortfolioEngineIntegration:
                 from backend.services.day_trailing_buy import recover_trailing_buy_intents
 
                 if self.engine:
+                    # Apply DAY_STRUCTURAL_PULLBACK_V1 schema additions before
+                    # recovering intents so column writes in the recovery path succeed.
+                    try:
+                        from backend.services.day_v2.migrations import (
+                            cancel_old_policy_intents,
+                            run_day_v2_migrations,
+                        )
+
+                        run_day_v2_migrations(str(self.engine.db_path))
+                        _canceled = cancel_old_policy_intents(str(self.engine.db_path))
+                        if _canceled:
+                            logger.info("DAY_V2_STARTUP: retired %d old-policy intents", _canceled)
+                    except Exception:
+                        logger.warning("DAY_V2_STARTUP_MIGRATIONS_FAILED", exc_info=True)
                     await recover_trailing_buy_intents(self.engine)
             try:
                 from backend.services.portfolio_engine import DAY_MODE_ENABLED
@@ -1571,6 +1585,61 @@ class PortfolioEngineIntegration:
                         logger.info("DAY_V2_NO_SIGNAL symbol=%s", symbol)
                         continue
 
+                    # --- DAY_STRUCTURAL_PULLBACK_V1 gates (in order) ---
+
+                    # 1. Opportunity already consumed (SQLite is authoritative)
+                    try:
+                        from backend.services.day_v2.migrations import is_opportunity_consumed
+
+                        if is_opportunity_consumed(db_path, signal.opportunity_id):
+                            logger.info(
+                                "DAY_V2_OPP_CONSUMED symbol=%s opp=%s",
+                                symbol,
+                                signal.opportunity_id,
+                            )
+                            continue
+                    except Exception:
+                        logger.debug("DAY_V2_OPP_CONSUMED_CHECK_FAILED symbol=%s", symbol, exc_info=True)
+
+                    # 2. Frequency guard — rolling 24h caps (DAY V2 only)
+                    try:
+                        from backend.services.day_v2.frequency_guard import check_frequency_limit
+
+                        _freq_ok, _freq_reason = check_frequency_limit(db_path, symbol)
+                        if not _freq_ok:
+                            logger.info(
+                                "DAY_V2_FREQ_LIMIT symbol=%s reason=%s",
+                                symbol,
+                                _freq_reason,
+                            )
+                            continue
+                    except Exception:
+                        logger.debug("DAY_V2_FREQ_CHECK_FAILED symbol=%s", symbol, exc_info=True)
+
+                    # 3. Structural zone — setup-specific entry level required
+                    _zone = None
+                    _reclaim_level: float = 0.0
+                    try:
+                        from backend.services.day_v2.structural_entry import (
+                            evaluate_structural_zone,
+                        )
+
+                        _zone = evaluate_structural_zone(signal)
+                        if not _zone.valid:
+                            logger.info(
+                                "DAY_V2_STRUCTURAL_ZONE_INVALID symbol=%s setup=%s reason=%s — no fallback",
+                                symbol,
+                                signal.setup,
+                                _zone.reason,
+                            )
+                            continue
+                        _reclaim_level = float(_zone.reclaim_level or 0.0)
+                    except Exception:
+                        logger.warning("DAY_V2_STRUCTURAL_ZONE_ERROR symbol=%s", symbol, exc_info=True)
+                        continue
+
+                    # --- End DAY_STRUCTURAL_PULLBACK_V1 gates ---
+
                     # Check slot availability and cash
                     ask_price = float(self.current_prices.get(norm) or self.current_prices.get(symbol) or 0.0)
                     if ask_price <= 0:
@@ -1595,15 +1664,27 @@ class PortfolioEngineIntegration:
                         logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s", symbol, gate_reason)
                         continue
 
-                    intent = create_day_v2_intent(db_path, signal, ask_price, qty)
+                    intent = create_day_v2_intent(
+                        db_path,
+                        signal,
+                        ask_price,
+                        qty,
+                        structural_zone=_zone,
+                        reclaim_level=_reclaim_level,
+                        db_symbol=db_sym_15m,
+                    )
                     if intent:
                         logger.warning(
-                            "DAY_V2_SIGNAL symbol=%s setup=%s opp=%s anchor=%.6f target=%.6f",
+                            "DAY_V2_SIGNAL symbol=%s setup=%s opp=%s anchor=%.6f target=%.6f zone=[%.6f,%.6f] reclaim=%.6f policy=%s",
                             symbol,
                             signal.setup,
                             signal.opportunity_id,
                             signal.structural_anchor,
                             signal.target_price,
+                            float(_zone.zone_low),
+                            float(_zone.zone_high),
+                            _reclaim_level,
+                            "DAY_STRUCTURAL_PULLBACK_V1",
                         )
 
                 except Exception:

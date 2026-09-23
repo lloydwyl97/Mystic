@@ -942,16 +942,18 @@ async def test_soft_no_break_does_not_block_wait_dip(tmp_path, monkeypatch, capl
     )
     monkeypatch.setattr("backend.services.day_path_net.load_recent_bars", lambda *_a, **_k: [])
     with caplog.at_level("INFO"):
+        # Use a non-top-4 symbol: DAY_V2_UNIVERSE (BTC/ETH/SOL/XRP) is now reserved
+        # for the structural-pullback entry path; the ML arm runs on other symbols.
         out = await arm_selected_candidate(
             _arm_engine(tmp_path),
-            symbol="ETH/USDT",
+            symbol="LTC/USDT",
             quantity=0.0251,
-            stop_price=2433.0,
-            atr=31.8,
+            stop_price=75.0,
+            atr=1.8,
             confidence=0.5,
             bar_timestamp=1,
             explainability=_Expl(),
-            decision_id="day_ETHUSDT_nobreak",
+            decision_id="day_LTCUSDT_nobreak",
             sleeve="ACTIVE",
             decision_data={"setup_type": "VWAP_REVERSION"},
             redis_client=None,
@@ -1003,7 +1005,9 @@ async def test_four_ranked_slots_create_four_intents_without_orders(tmp_path, mo
     monkeypatch.setattr("backend.services.day_path_net.load_recent_bars", lambda *_a, **_k: [])
     engine = _arm_engine(tmp_path)
     armed = []
-    for sym in ("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"):
+    # Use non-top-4 symbols: DAY_V2_UNIVERSE (BTC/ETH/SOL/XRP) is reserved for
+    # the structural-pullback entry path; the ML arm operates on other symbols.
+    for sym in ("LTC/USDT", "ADA/USDT", "MATIC/USDT", "LINK/USDT"):
         out = await arm_selected_candidate(
             engine,
             symbol=sym,
@@ -1068,18 +1072,20 @@ def _expired_fields(symbol: str, *, arm: float, expires_at: float) -> dict:
 async def test_timeout_creates_successor_without_inherited_low(tmp_path, monkeypatch):
     monkeypatch.setenv("DAY_ENTRY_EXECUTION_MODE", "trailing_buy")
     engine = _arm_engine(tmp_path)
-    create_intent(engine.db_path, fields=_expired_fields("ETH/USDT", arm=2600.0, expires_at=time.time() - 1))
+    # Use a non-top-4 symbol: DAY_V2_UNIVERSE (BTC/ETH/SOL/XRP) blocks arm_selected_candidate
+    # so successors for those symbols would return None. LTC/USDT is unaffected.
+    create_intent(engine.db_path, fields=_expired_fields("LTC/USDT", arm=80.0, expires_at=time.time() - 1))
     monkeypatch.setattr(
         "backend.services.day_trailing_buy.sync_book_redis",
         lambda *_a, **_k: {},
     )
     monkeypatch.setattr(
         "backend.services.day_trailing_buy.read_market_book",
-        lambda *_a, **_k: {"ask": 2644.0, "bid": 2643.8, "fresh": True, "freshness_sec": 1.0},
+        lambda *_a, **_k: {"ask": 82.0, "bid": 81.9, "fresh": True, "freshness_sec": 1.0},
     )
     monkeypatch.setattr(
         "backend.services.day_trailing_buy.fresh_executable_book",
-        lambda *_a, **_k: {"ask": 2644.0, "bid": 2643.8, "midpoint": 2643.9, "spread_bps": 0.8, "fresh": True, "freshness_sec": 1.0},
+        lambda *_a, **_k: {"ask": 82.0, "bid": 81.9, "midpoint": 81.95, "spread_bps": 0.8, "fresh": True, "freshness_sec": 1.0},
     )
     monkeypatch.setattr("backend.services.day_path_net.load_recent_bars", lambda *_a, **_k: [])
     summary = await cycle_trailing_buy_intents(engine, redis_client=None)
@@ -1089,7 +1095,7 @@ async def test_timeout_creates_successor_without_inherited_low(tmp_path, monkeyp
     assert len(active) == 1
     nxt = active[0]
     assert nxt["status"] == WAIT_DIP
-    assert nxt["arm_ask"] == pytest.approx(2644.0)
+    assert nxt["arm_ask"] == pytest.approx(82.0)
     assert float(nxt["lowest_ask"] or 0) == 0.0
     assert nxt["intent_id"]
 

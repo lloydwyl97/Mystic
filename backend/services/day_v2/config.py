@@ -85,6 +85,14 @@ DAY_V2_REBOUND_BPS: float = _read_float("DAY_V2_REBOUND_BPS", default=6.0)
 DAY_V2_MAX_NOTIONAL_USD: float = _read_float("DAY_V2_MAX_NOTIONAL_USD", default=0.0)
 
 
+# ---------------------------------------------------------------------------
+# Entry policy version — written to every DAY V2 intent created under the
+# structural-pullback rule. Used by _submit_claimed to gate 5m confirmation.
+# ---------------------------------------------------------------------------
+
+DAY_STRUCTURAL_PULLBACK_V1: str = "DAY_STRUCTURAL_PULLBACK_V1"
+
+
 def get_day_v2_config() -> dict:
     """Return all DAY V2 config values as a dict.
 

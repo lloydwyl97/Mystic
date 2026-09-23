@@ -20,8 +20,10 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from typing import Any
 
 from backend.services.day_v2.config import (
+    DAY_STRUCTURAL_PULLBACK_V1,
     DAY_V2_ENABLED,
     DAY_V2_MAX_HOLD_MINUTES,
 )
@@ -35,6 +37,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DAY_V2_ENGINE_ID: str = "DAY_V2"
+
+# Opportunity lifetime: 60 minutes from signal detection.
+# Replaced DAY_V2_MAX_HOLD_MINUTES (300 min) for structural-pullback intents.
+STRUCTURAL_OPPORTUNITY_LIFETIME_SEC: float = 3600.0  # 60 minutes
 
 # Trailing-buy parameters: wait for a MIN_DIP decline then confirm a
 # REBOUND before entering. Multi-hour setups warrant more patience.
@@ -58,6 +64,10 @@ def create_day_v2_intent(
     signal: DayV2Signal,
     ask_price: float,
     quantity: float,
+    *,
+    structural_zone: Any | None = None,
+    reclaim_level: float = 0.0,
+    db_symbol: str = "",
 ) -> dict | None:
     """Arm a DAY V2 trailing-buy intent for the given signal.
 
@@ -75,7 +85,7 @@ def create_day_v2_intent(
     intent_id = str(uuid.uuid4())
     decision_id = str(uuid.uuid4())
     now = time.time()
-    expires_at = now + DAY_V2_MAX_HOLD_MINUTES * 60.0
+    expires_at = now + STRUCTURAL_OPPORTUNITY_LIFETIME_SEC  # 60-minute structural window
 
     # payload carries DAY V2-specific metadata that doesn't have a dedicated
     # column in day_trailing_buy_intents (target level, opportunity linkage).
@@ -87,9 +97,19 @@ def create_day_v2_intent(
         "h1_bullish": signal.h1_bullish,
         "signal_bar_ts": signal.signal_bar_ts,
         "atr_at_signal": signal.atr,
+        # Structural-pullback fields for 5m confirmation gate
+        "reclaim_level": reclaim_level,
+        "db_symbol": db_symbol or signal.symbol,
     }
 
     # create_intent reads symbol and decision_id from the fields dict.
+    # Derive structural_entry_level from zone if provided
+    _structural_entry_level: float = 0.0
+    if structural_zone is not None:
+        _zone_low = getattr(structural_zone, "zone_low", None)
+        if _zone_low is not None:
+            _structural_entry_level = float(_zone_low)
+
     fields: dict = {
         # Required by create_intent
         "symbol": signal.symbol,
@@ -97,6 +117,10 @@ def create_day_v2_intent(
         "intent_id": intent_id,
         # Identity
         "engine_id": DAY_V2_ENGINE_ID,
+        # Entry policy
+        "policy_version": DAY_STRUCTURAL_PULLBACK_V1,
+        # Structural entry level (for telemetry and 5m confirmation gate)
+        "structural_entry_level": _structural_entry_level,
         # Re-use scalp_opportunity_id column for the DAY opportunity ID.
         # The column name is a legacy artefact; the value here is the
         # canonical DAY V2 opportunity identifier.
@@ -142,7 +166,7 @@ def create_day_v2_intent(
         return None
 
     logger.warning(
-        "DAY_V2_INTENT_ARMED symbol=%s setup=%s opp=%s anchor=%.6f target=%.6f ask=%.6f qty=%.8f min_dip=%.0f rebound=%.0f expires_in=%.0fs intent_id=%s",
+        "DAY_V2_INTENT_ARMED symbol=%s setup=%s opp=%s anchor=%.6f target=%.6f ask=%.6f qty=%.8f min_dip=%.0f rebound=%.0f expires_in=%.0fs policy=%s intent_id=%s",
         signal.symbol,
         signal.setup,
         signal.opportunity_id,
@@ -153,6 +177,7 @@ def create_day_v2_intent(
         DAY_V2_MIN_DIP_BPS,
         DAY_V2_REBOUND_BPS,
         expires_at - now,
+        DAY_STRUCTURAL_PULLBACK_V1,
         str(intent.get("intent_id") or intent_id),
     )
     return intent

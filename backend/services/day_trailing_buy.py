@@ -464,6 +464,24 @@ async def arm_selected_candidate(
     if not ok:
         logger.error("DAY_ENTRY_EXECUTION_FAIL_CLOSED %s — HOLD/NO_NEW_ENTRY", err)
         return None
+
+    # DAY_V2_UNIVERSE symbols are reserved for the structural-pullback entry policy.
+    # The ML pipeline must not arm trailing-buy intents for them; DAY V2 creates
+    # its own intents via create_day_v2_intent with the correct parameters.
+    try:
+        from backend.services.day_v2.config import DAY_V2_UNIVERSE
+
+        _api_symbol = symbol.replace("/", "").replace("-", "").upper()
+        _universe_normed = {s.replace("/", "").replace("-", "").upper() for s in DAY_V2_UNIVERSE}
+        if _api_symbol in _universe_normed:
+            logger.info(
+                "ARM_CANDIDATE_DAY_V2_BLOCKED symbol=%s — DAY_V2 entry reserved for structural policy",
+                symbol,
+            )
+            return None
+    except Exception:
+        pass  # fail-open: do not block on import error
+
     existing = load_intent_by_symbol(engine.db_path, symbol)
     if existing and str(existing.get("status") or "") in {WAIT_DIP, TRAIL_LOW, SUBMITTING}:
         logger.info(
@@ -780,8 +798,76 @@ async def _pre_submit_safety(engine: Any, intent: dict[str, Any], ask: float) ->
     return True, ""
 
 
+def _update_intent_5m_telemetry(
+    db_path: str,
+    intent_id: str,
+    confirm: Any,
+) -> None:
+    """Write 5m confirmation telemetry columns to the intent row (best-effort)."""
+    try:
+        import sqlite3 as _sq3
+
+        with _sq3.connect(db_path) as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(day_trailing_buy_intents)").fetchall()}
+            updates: list[str] = ["updated_at=?"]
+            vals: list[Any] = [time.time()]
+            if "red_5m_seen" in cols:
+                updates.append("red_5m_seen=?")
+                vals.append(1 if (getattr(confirm, "red_bar_ts", 0) or 0) > 0 else 0)
+            if "reversal_candle_ts" in cols:
+                updates.append("reversal_candle_ts=?")
+                vals.append(float(getattr(confirm, "reclaim_bar_ts", 0) or 0))
+            if "reversal_level" in cols:
+                updates.append("reversal_level=?")
+                vals.append(float(getattr(confirm, "reclaim_level", 0) or 0))
+            if len(updates) > 1:
+                vals.append(intent_id)
+                conn.execute(
+                    f"UPDATE day_trailing_buy_intents SET {', '.join(updates)} WHERE intent_id=?",
+                    vals,
+                )
+                conn.commit()
+    except Exception:
+        logger.debug("_update_intent_5m_telemetry failed intent=%s", intent_id, exc_info=True)
+
+
 async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> dict[str, Any] | None:
     symbol = str(intent.get("symbol") or "")
+
+    # DAY_STRUCTURAL_PULLBACK_V1: gate submission on 5m confirmation pattern.
+    # When confirmation is absent the intent returns to TRAIL_LOW for the next cycle.
+    _policy = str(intent.get("policy_version") or "LEGACY")
+    try:
+        from backend.services.day_v2.config import DAY_STRUCTURAL_PULLBACK_V1 as _DSPV1
+
+        if _policy == _DSPV1:
+            from backend.services.day_v2.five_min_confirm import check_5m_confirmation
+
+            _payload = dict(intent.get("payload") or {})
+            _reclaim = float(_payload.get("reclaim_level") or 0.0)
+            _armed_at = float(intent.get("arm_ts") or 0.0)
+            _db_sym = str(_payload.get("db_symbol") or symbol)
+            confirm = check_5m_confirmation(
+                str(engine.db_path),
+                _db_sym,
+                _reclaim,
+                opportunity_armed_at=_armed_at,
+            )
+            if not confirm.confirmed:
+                logger.info(
+                    "DAY_V2_SUBMIT_HOLD_5M symbol=%s intent=%s reason=%s red_bar_ts=%.0f",
+                    symbol,
+                    intent.get("intent_id"),
+                    confirm.reason,
+                    float(getattr(confirm, "red_bar_ts", 0) or 0),
+                )
+                _update_intent_5m_telemetry(str(engine.db_path), str(intent["intent_id"]), confirm)
+                release_submitting_for_retry(str(engine.db_path), str(intent["intent_id"]))
+                return None
+    except Exception:
+        logger.debug("DAY_V2_5M_GATE_ERROR intent=%s", intent.get("intent_id"), exc_info=True)
+        # Fail-open: proceed to submit even if gate errors
+
     payload = dict(intent.get("payload") or {})
     explainability = _rebuild_explainability(payload, symbol)
     safe, reason = await _pre_submit_safety(engine, intent, ask)
@@ -833,6 +919,28 @@ async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> di
             order_accepted=True,
             current_ask=float(result.get("price") or ask),
         )
+        # Mark the DAY V2 opportunity consumed so it cannot re-arm on the next signal.
+        # SQLite is the authoritative durable record (Redis loss must not allow re-arm).
+        _iv = str(intent.get("policy_version") or "")
+        try:
+            from backend.services.day_v2.config import DAY_STRUCTURAL_PULLBACK_V1
+
+            if _iv == DAY_STRUCTURAL_PULLBACK_V1:
+                _fp = dict(intent.get("payload") or {})
+                _opp_id = str(_fp.get("day_opportunity_id") or "")
+                if _opp_id:
+                    from backend.services.day_v2.migrations import consume_opportunity
+
+                    consume_opportunity(
+                        str(engine.db_path),
+                        _opp_id,
+                        symbol,
+                        str(_fp.get("setup") or ""),
+                        trade_id=str(result.get("trade_id") or ""),
+                    )
+        except Exception:
+            logger.warning("DAY_V2_CONSUME_OPP_FAILED intent=%s", intent.get("intent_id"), exc_info=True)
+
         result = dict(result)
         result["entry_authority"] = ENTRY_AUTHORITY
         result["trailing_buy_intent_id"] = intent.get("intent_id")

@@ -102,6 +102,21 @@ def ensure_trailing_buy_schema(db_path: str | Path) -> None:
             conn.execute("ALTER TABLE day_trailing_buy_intents ADD COLUMN engine_id TEXT DEFAULT 'LEGACY_DAY_LIVE'")
         if "scalp_opportunity_id" not in cols:
             conn.execute("ALTER TABLE day_trailing_buy_intents ADD COLUMN scalp_opportunity_id TEXT DEFAULT ''")
+        # DAY_STRUCTURAL_PULLBACK_V1 columns (added idempotently)
+        if "policy_version" not in cols:
+            conn.execute("ALTER TABLE day_trailing_buy_intents ADD COLUMN policy_version TEXT DEFAULT 'LEGACY'")
+        if "structural_entry_level" not in cols:
+            conn.execute("ALTER TABLE day_trailing_buy_intents ADD COLUMN structural_entry_level REAL DEFAULT 0")
+        if "pullback_reached" not in cols:
+            conn.execute("ALTER TABLE day_trailing_buy_intents ADD COLUMN pullback_reached INTEGER DEFAULT 0")
+        if "red_5m_seen" not in cols:
+            conn.execute("ALTER TABLE day_trailing_buy_intents ADD COLUMN red_5m_seen INTEGER DEFAULT 0")
+        if "reversal_candle_ts" not in cols:
+            conn.execute("ALTER TABLE day_trailing_buy_intents ADD COLUMN reversal_candle_ts REAL DEFAULT 0")
+        if "reversal_level" not in cols:
+            conn.execute("ALTER TABLE day_trailing_buy_intents ADD COLUMN reversal_level REAL DEFAULT 0")
+        if "freq_limit_state" not in cols:
+            conn.execute("ALTER TABLE day_trailing_buy_intents ADD COLUMN freq_limit_state TEXT DEFAULT ''")
         conn.commit()
     finally:
         conn.close()
@@ -175,8 +190,22 @@ def create_intent(
             conn.commit()
             return True, "PRESERVED_EXISTING", cur
         payload = fields.get("payload") if isinstance(fields.get("payload"), dict) else {}
+        # Check which optional v2 columns exist (PRAGMA, safe for any schema version)
+        _cols_present = {r[1] for r in conn.execute("PRAGMA table_info(day_trailing_buy_intents)").fetchall()}
+        _has_policy = "policy_version" in _cols_present
+        _has_struct = "structural_entry_level" in _cols_present
+        _extra_cols = ""
+        _extra_vals: list[Any] = []
+        if _has_policy:
+            _extra_cols += ", policy_version"
+            _extra_vals.append(str(fields.get("policy_version") or "LEGACY"))
+        if _has_struct:
+            _extra_cols += ", structural_entry_level"
+            _extra_vals.append(float(fields.get("structural_entry_level") or 0.0))
+        _n_extra = len(_extra_vals)
+        _placeholders_extra = ("," + ",".join(["?"] * _n_extra)) if _n_extra else ""
         conn.execute(
-            """
+            f"""
             INSERT INTO day_trailing_buy_intents(
                 intent_id, decision_id, inference_id, symbol, setup, arm_ts,
                 arm_bid, arm_ask, arm_midpoint, decision_score, predicted_ev,
@@ -186,8 +215,8 @@ def create_intent(
                 fill_id, trade_id, reservation_id, order_accepted, quantity,
                 stop_price, atr, confidence, bar_timestamp, sleeve, notional_usd,
                 thesis_invalid_level, payload_json, created_at, updated_at,
-                engine_id, scalp_opportunity_id
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                engine_id, scalp_opportunity_id{_extra_cols}
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?{_placeholders_extra})
             """,
             (
                 intent_id,
@@ -231,6 +260,7 @@ def create_intent(
                 now,
                 str(fields.get("engine_id") or "LEGACY_DAY_LIVE"),
                 str(fields.get("scalp_opportunity_id") or ""),
+                *_extra_vals,
             ),
         )
         conn.commit()
