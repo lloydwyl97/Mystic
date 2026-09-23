@@ -216,11 +216,11 @@ def classify_positions(conn: sqlite3.Connection, day_trade_ids: set[str], dry_ru
     if "trade_id" in cols:
         placeholders = ",".join("?" * len(day_trade_ids))
         positions = conn.execute(
-            f"SELECT id, engine_id, symbol, trade_id FROM portfolio_engine_positions WHERE trade_id IN ({placeholders})",
+            f"SELECT symbol, engine_id, trade_id FROM portfolio_engine_positions WHERE trade_id IN ({placeholders})",
             list(day_trade_ids),
         ).fetchall()
     else:
-        # Fallback: match via buy_order_id / scalp_intent_id naming patterns.
+        # Fallback: match via entry_intent_id (some schema versions use that).
         positions = []
 
     for row in positions:
@@ -230,7 +230,7 @@ def classify_positions(conn: sqlite3.Connection, day_trade_ids: set[str], dry_ru
         audit_rows.append(
             _audit_row(
                 record_table="portfolio_engine_positions",
-                record_id=str(row["id"]),
+                record_id=str(row["symbol"]),
                 original_engine_id=orig_eid,
                 corrected_engine_id="DAY_V2",
                 cohort="PROVEN_DAY_V2",
@@ -240,7 +240,7 @@ def classify_positions(conn: sqlite3.Connection, day_trade_ids: set[str], dry_ru
                     "trade_id": row["trade_id"],
                     "original_engine_id": orig_eid,
                 },
-                source_record_ids=[str(row["id"]), str(row["trade_id"] or "")],
+                source_record_ids=[str(row["symbol"]), str(row["trade_id"] or "")],
                 dry_run=dry_run,
             )
         )
