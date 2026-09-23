@@ -76,24 +76,39 @@ def _ensure(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_scalp_v2_opp_symbol ON scalp_v2_opportunities(symbol, id)")
 
 
-def arm_opportunity(db_path: str | Path, symbol: str, setup: str, arm_price: float) -> tuple[str, bool]:
+def arm_opportunity(
+    db_path: str | Path,
+    symbol: str,
+    setup: str,
+    arm_price: float,
+    engine_id: str = SCALP_V2_ENGINE_ID,
+) -> tuple[str, bool]:
     """Return (opportunity_id, blocked).
 
-    Blocked means this arm is the same price zone as an opportunity that has
-    not been structurally reset. A different zone resets closed rows.
+    Blocked means this arm is the same price zone as an opportunity in the
+    SAME ENGINE that has not been structurally reset.  A different price zone
+    resets closed rows.
+
+    Deduplication is ENGINE-SCOPED: a DAY_V2 opportunity does not block a
+    SCALP_V2 arm for the same symbol (and vice versa).  Cross-engine symbol
+    exclusivity is enforced separately by position ownership (the first engine
+    to fill a lot owns that symbol; the second engine's submit is blocked by
+    _can_open_position / execute_buy_fifo before the order is placed).
     """
     opp = ScalpOpportunityId.from_intent(_sym(symbol), setup, "", arm_price=arm_price)
     sym = _sym(symbol)
+    eid = str(engine_id or SCALP_V2_ENGINE_ID)
     now = time.time()
     conn = sqlite3.connect(str(db_path), timeout=30)
     try:
         _ensure(conn)
+        # Engine-scoped deduplication: only look at rows for this engine.
         row = conn.execute(
             """
             SELECT id, opportunity_id, state FROM scalp_v2_opportunities
-            WHERE symbol=? ORDER BY id DESC LIMIT 1
+            WHERE symbol=? AND engine_id=? ORDER BY id DESC LIMIT 1
             """,
-            (sym,),
+            (sym, eid),
         ).fetchone()
         if row and row[1] == opp.canonical_id and row[2] in ("ARMED", "OPEN", "CLOSED"):
             conn.commit()
@@ -103,16 +118,16 @@ def arm_opportunity(db_path: str | Path, symbol: str, setup: str, arm_price: flo
                 """
                 UPDATE scalp_v2_opportunities
                 SET state='RESET', updated_at=?
-                WHERE symbol=? AND state='CLOSED'
+                WHERE symbol=? AND engine_id=? AND state='CLOSED'
                 """,
-                (now, sym),
+                (now, sym, eid),
             )
         existing = conn.execute(
             """
             SELECT id, state FROM scalp_v2_opportunities
-            WHERE symbol=? AND opportunity_id=? ORDER BY id DESC LIMIT 1
+            WHERE symbol=? AND opportunity_id=? AND engine_id=? ORDER BY id DESC LIMIT 1
             """,
-            (sym, opp.canonical_id),
+            (sym, opp.canonical_id, eid),
         ).fetchone()
         if existing and existing[1] == "RESET":
             conn.execute(
@@ -127,7 +142,7 @@ def arm_opportunity(db_path: str | Path, symbol: str, setup: str, arm_price: flo
                     state, engine_id, created_at, updated_at
                 ) VALUES (?,?,?,?, 'ARMED', ?, ?, ?)
                 """,
-                (sym, opp.canonical_id, opp.setup_family, opp.structural_anchor, SCALP_V2_ENGINE_ID, now, now),
+                (sym, opp.canonical_id, opp.setup_family, opp.structural_anchor, eid, now, now),
             )
         else:
             conn.commit()

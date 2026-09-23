@@ -538,9 +538,32 @@ async def arm_selected_candidate(
         logger.info("TRAILING_BUY_ARM_BLOCKED %s reservation=%s", symbol, reserve_reason)
         return None
     setup_name = str(decision_data.get("setup_type") or decision_data.get("entry_thesis") or getattr(explainability, "setup_type", "") or "")
-    from backend.services.scalp_v2.opportunity import SCALP_V2_ENGINE_ID, arm_opportunity
+    from backend.services.day_v2.engine_identity import DAY_V2_ENGINE_ID
+    from backend.services.scalp_v2.opportunity import arm_opportunity
 
-    opp_id, blocked = arm_opportunity(engine.db_path, symbol, setup_name, arm_bid or arm_ask)
+    # Cross-engine symbol exclusivity: if the same symbol is currently owned
+    # by a different engine (i.e., an open position exists whose engine_id is
+    # not DAY_V2), reject with a truthful reason rather than the accidental
+    # SAME_MOVE_OPPORTUNITY cross-suppression that commit 628c47f introduced.
+    open_positions = getattr(engine, "open_positions", None) or {}
+    ns_upper = symbol.upper().replace("/", "")
+    existing_pos = open_positions.get(symbol) or open_positions.get(ns_upper)
+    if existing_pos is not None:
+        pos_engine = str(getattr(existing_pos, "engine_id", "") or "")
+        pos_qty = float(getattr(existing_pos, "quantity", 0) or 0)
+        pos_status = str(getattr(existing_pos, "status", "ACTIVE") or "ACTIVE")
+        if pos_qty > 0 and pos_status != "DUST_PENDING" and pos_engine not in ("", DAY_V2_ENGINE_ID):
+            engine._release_entry_reservation(symbol, decision_id=str(decision_id or ""), reason="SYMBOL_OWNED_BY_OTHER_ENGINE")
+            logger.info(
+                "TRAILING_BUY_ARM_BLOCKED %s SYMBOL_OWNED_BY_OTHER_ENGINE owned_by=%s qty=%s",
+                symbol,
+                pos_engine,
+                pos_qty,
+            )
+            return None
+
+    # Engine-scoped opportunity deduplication for DAY_V2.
+    opp_id, blocked = arm_opportunity(engine.db_path, symbol, setup_name, arm_bid or arm_ask, engine_id=DAY_V2_ENGINE_ID)
     if blocked:
         engine._release_entry_reservation(symbol, decision_id=str(decision_id or ""), reason="SAME_MOVE_OPPORTUNITY")
         logger.info("TRAILING_BUY_ARM_BLOCKED %s SAME_MOVE_OPPORTUNITY id=%s", symbol, opp_id)
@@ -554,7 +577,7 @@ async def arm_selected_candidate(
             "inference_id": str(decision_data.get("ai_inference_log_id") or decision_data.get("inference_log_id") or ""),
             "symbol": symbol,
             "setup": setup_name,
-            "engine_id": SCALP_V2_ENGINE_ID,
+            "engine_id": DAY_V2_ENGINE_ID,
             "scalp_opportunity_id": opp_id,
             "arm_ts": now,
             "arm_bid": arm_bid,

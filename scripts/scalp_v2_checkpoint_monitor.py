@@ -221,7 +221,17 @@ def _set_state(conn: sqlite3.Connection, key: str, value: Any) -> None:
 
 
 def _load_qualifying_trades(conn: sqlite3.Connection) -> list[dict]:
-    """Load all qualifying SCALP V2 closed trades (read-only)."""
+    """Load all qualifying PROVEN_SCALP_V2 closed trades (read-only).
+
+    Engine-aware filter (added 2026-09-23):
+    Commit 628c47f caused DAY trailing-buy intents to be labelled engine_id='SCALP_V2'
+    from 2026-09-21 through 2026-09-22.  Those rows are in day_trailing_buy_intents
+    with matching trade_id values and must be excluded from the SCALP V2 count.
+    New DAY trades (post-repair) carry engine_id='DAY_V2' and are excluded by the
+    existing engine_id filter.  Historical DAY trades labelled 'LEGACY_DAY_LIVE' are
+    also excluded.  Only trades with engine_id='SCALP_V2' whose trade_id does NOT
+    appear in day_trailing_buy_intents are counted as PROVEN_SCALP_V2.
+    """
     rows = conn.execute(
         """
         SELECT
@@ -238,6 +248,13 @@ def _load_qualifying_trades(conn: sqlite3.Connection) -> list[dict]:
           AND status     = 'executed'
           AND pnl_usd_net IS NOT NULL
           AND (is_synthetic IS NULL OR is_synthetic != 1)
+          AND (
+              trade_id IS NULL
+              OR trade_id NOT IN (
+                  SELECT trade_id FROM day_trailing_buy_intents
+                  WHERE trade_id IS NOT NULL AND trade_id != ''
+              )
+          )
         ORDER BY id ASC
         """
     ).fetchall()

@@ -229,7 +229,7 @@ def create_intent(
                 json.dumps(payload, default=str),
                 now,
                 now,
-                str(fields.get("engine_id") or "SCALP_V2"),
+                str(fields.get("engine_id") or "LEGACY_DAY_LIVE"),
                 str(fields.get("scalp_opportunity_id") or ""),
             ),
         )

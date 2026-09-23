@@ -79,6 +79,13 @@ _AUTHORITY_TABLE: dict[EngineId, AuthorityLevel] = {
 LIVE_ENGINE_IDS: frozenset[EngineId] = frozenset({EngineId.LEGACY_DAY_LIVE, EngineId.DAY_V2_LIVE, EngineId.SCALP_V2_LIVE})
 SHADOW_ENGINE_IDS: frozenset[EngineId] = frozenset({EngineId.SCALP_V2_CANDIDATE, EngineId.DAY_V2_SHADOW})
 
+# Canonical engine_id string constants.
+# Use these in all trade-recording code paths so the string and the enum never
+# drift apart.  Import from here rather than hard-coding the literal string.
+DAY_V2_ENGINE_ID: str = EngineId.DAY_V2_LIVE.value  # "DAY_V2"
+SCALP_V2_ENGINE_ID: str = EngineId.SCALP_V2_LIVE.value  # "SCALP_V2"
+LEGACY_DAY_LIVE_ENGINE_ID: str = EngineId.LEGACY_DAY_LIVE.value  # "LEGACY_DAY_LIVE"
+
 
 def get_authority(engine_id: EngineId) -> AuthorityLevel:
     """Return the AuthorityLevel for the given engine."""
