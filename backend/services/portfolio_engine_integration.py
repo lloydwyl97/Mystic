@@ -1775,12 +1775,13 @@ class PortfolioEngineIntegration:
 
                     # Compute position size via the engine's existing sizing logic
                     atr_val = float(signal.atr or 0.0)
-                    qty, notional, _ = self.engine.calculate_position_size(
+                    qty, _stop_price, _risk = self.engine.calculate_position_size(
                         symbol=norm,
                         equity=float(self.engine._total_equity or self.engine.cash_balance or 0),
                         atr=atr_val if atr_val > 0 else ask_price * 0.015,
                         current_price=ask_price,
                     )
+                    notional = float(qty) * float(ask_price)
                     if qty <= 0 or notional <= 0:
                         logger.warning("DAY_V2_ZERO_SIZE symbol=%s ask=%.6f atr=%.6f", symbol, ask_price, atr_val)
                         continue
@@ -1788,7 +1789,9 @@ class PortfolioEngineIntegration:
                     # Gate through _can_open_position
                     can_open, gate_reason = await self.engine._can_open_position(norm, notional)
                     if not can_open:
-                        logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s", symbol, gate_reason)
+                        gate_label = "INSUFFICIENT_EXECUTABLE_CASH" if str(gate_reason).startswith("INSUFFICIENT_CASH") else str(gate_reason)
+                        record_day_decision(db_path, symbol, f"REJECTED:{gate_label}", cycle_ts=as_of, closest=signal.setup, unmet=[str(gate_reason)])
+                        logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s notional=%.4f", symbol, gate_reason, notional)
                         continue
 
                     from backend.services.two_engine_claim import claim_symbol, release_claim
@@ -1969,12 +1972,13 @@ class PortfolioEngineIntegration:
                     continue
                 atr_val = float((row or {}).get("atr") or 0)
                 equity = float(self.engine._total_equity or self.engine.cash_balance or 0)
-                qty, notional, _ = self.engine.calculate_position_size(
+                qty, _stop_price, _risk = self.engine.calculate_position_size(
                     symbol=norm,
                     equity=equity,
                     atr=atr_val if atr_val > 0 else arm_price * 0.015,
                     current_price=arm_price,
                 )
+                notional = float(qty) * float(arm_price)
                 max_notional = float(cfg.scalp_live_max_notional)
                 if notional > max_notional and arm_price > 0:
                     qty = max_notional / arm_price

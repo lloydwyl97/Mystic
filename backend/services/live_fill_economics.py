@@ -790,6 +790,12 @@ def sum_realized_pnl_by_mode(
     try:
         with sqlite3.connect(db_path, timeout=5) as conn:
             expr = _sell_pnl_expr(conn)
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(paper_trades)")}
+            ghost_filter = ""
+            if "order_id" in cols:
+                ghost_filter += " AND COALESCE(order_id, '') != ''"
+            if "counts_toward_realized" in cols:
+                ghost_filter += " AND COALESCE(counts_toward_realized, 1) = 1"
             sql = f"""
                 SELECT COALESCE(SUM({expr}), 0)
                 FROM paper_trades
@@ -801,6 +807,7 @@ def sum_realized_pnl_by_mode(
                     'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT',
                     'DUST_WRITEOFF'
                   )
+                  {ghost_filter}
             """
             params: list[Any] = [wanted]
             if day:
