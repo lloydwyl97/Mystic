@@ -178,6 +178,28 @@ def reap_expired_armed(
                 )
                 _release_once(conn, int(stale[0]), str(stale[5]), int(stale[6] or 0), str(stale[1]), release_reservation)
                 collapsed += 1
+        zoned = conn.execute(
+            """
+            SELECT id, symbol, structural_anchor, engine_id, created_at,
+                   COALESCE(reservation_id, ''), COALESCE(reservation_released, 0)
+            FROM scalp_v2_opportunities
+            WHERE state='ARMED'
+            ORDER BY created_at ASC, id ASC
+            """
+        ).fetchall()
+        by_zone: dict[tuple[str, str, str], list[tuple]] = {}
+        for row in zoned:
+            by_zone.setdefault((str(row[1]), str(row[2]), str(row[3])), []).append(row)
+        for group in by_zone.values():
+            if len(group) <= 1:
+                continue
+            for stale in group[:-1]:
+                conn.execute(
+                    "UPDATE scalp_v2_opportunities SET state='EXPIRED', updated_at=? WHERE id=? AND state='ARMED'",
+                    (moment, stale[0]),
+                )
+                _release_once(conn, int(stale[0]), str(stale[5]), int(stale[6] or 0), str(stale[1]), release_reservation)
+                collapsed += 1
         conn.commit()
         return {"expired": expired, "collapsed_duplicates": collapsed}
     finally:
@@ -262,10 +284,11 @@ def arm_opportunity(
         current = conn.execute(
             """
             SELECT id FROM scalp_v2_opportunities
-            WHERE symbol=? AND opportunity_id=? AND engine_id=? AND state IN ('ARMED', 'OPEN', 'CLOSED')
+            WHERE symbol=? AND engine_id=? AND structural_anchor=?
+              AND state IN ('ARMED', 'OPEN', 'CLOSED')
             ORDER BY id DESC LIMIT 1
             """,
-            (sym, opp.canonical_id, eid),
+            (sym, eid, opp.structural_anchor),
         ).fetchone()
         if current:
             conn.commit()

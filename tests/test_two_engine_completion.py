@@ -54,6 +54,35 @@ def test_reaper_expires_armed_and_restart_does_not_resurrect(tmp_path):
     assert inventory["expired"] >= 1
 
 
+def test_one_current_opportunity_per_price_zone(tmp_path):
+    from backend.services.scalp_v2.opportunity import arm_opportunity, reap_expired_armed
+
+    db = tmp_path / "zone.db"
+    _first, blocked_first = arm_opportunity(db, "SOL/USDT", "PULLBACK", 100.0)
+    _second, blocked_second = arm_opportunity(db, "SOL/USDT", "REBOUND", 100.05)
+    assert blocked_first is False
+    assert blocked_second is True
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """
+        INSERT INTO scalp_v2_opportunities(
+            symbol, opportunity_id, setup_family, structural_anchor,
+            state, engine_id, created_at, updated_at, version,
+            reservation_id, reservation_released, tracked_low
+        ) VALUES ('SOL/USDT', 'other-setup', 'REBOUND',
+                  (SELECT structural_anchor FROM scalp_v2_opportunities LIMIT 1),
+                  'ARMED', 'SCALP_V2', ?, ?, 1, 'res_dup', 0, NULL)
+        """,
+        (time.time() - 5, time.time() - 5),
+    )
+    conn.commit()
+    conn.close()
+    stats = reap_expired_armed(db, release_reservation=lambda _rid, _sym: None)
+    armed = sqlite3.connect(db).execute("SELECT COUNT(*) FROM scalp_v2_opportunities WHERE state='ARMED'").fetchone()[0]
+    assert armed == 1
+    assert stats["collapsed_duplicates"] >= 1
+
+
 def test_open_row_survives_reaper(tmp_path):
     from backend.services.scalp_v2.opportunity import SCALP_V2_OPP_EXPIRY_SEC, arm_opportunity, reap_expired_armed
 
