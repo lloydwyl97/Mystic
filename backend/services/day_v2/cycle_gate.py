@@ -20,11 +20,14 @@ def cycle_decision(
     book_stale_sec: float,
     already_evaluated: bool,
     retried: bool,
+    latest_bar_epoch: float | None = None,
+    required_open_epoch: float | None = None,
 ) -> dict[str, Any]:
     """Return proceed, retry, or one hard rejection for this causal cycle."""
     if already_evaluated:
         return {"action": "skip", "reason": "DUPLICATE_EVALUATION"}
-    candle_ready = completed_bar_count >= minimum_bars
+    candle_fresh = required_open_epoch is None or (latest_bar_epoch is not None and float(latest_bar_epoch) + 1.0 >= float(required_open_epoch))
+    candle_ready = completed_bar_count >= minimum_bars and candle_fresh
     price_ready = executable_price > 0 and (book_age_sec is None or book_age_sec <= book_stale_sec)
     if candle_ready and price_ready:
         return {"action": "proceed", "reason": "READY", "price": float(executable_price)}

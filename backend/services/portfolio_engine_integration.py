@@ -1660,6 +1660,8 @@ class PortfolioEngineIntegration:
 
                     bars_15m = await _asyncio.to_thread(_load, "15m", 60)
                     ask_price, book_age = await self._resolve_day_executable_price(symbol)
+                    required_open = float(as_of) - 900.0
+                    latest = float(bars_15m[-1]["ts_epoch"]) if bars_15m else None
                     gate = cycle_decision(
                         completed_bar_count=len(bars_15m),
                         minimum_bars=32,
@@ -1668,11 +1670,14 @@ class PortfolioEngineIntegration:
                         book_stale_sec=30.0,
                         already_evaluated=(symbol, int(as_of)) in seen,
                         retried=False,
+                        latest_bar_epoch=latest,
+                        required_open_epoch=required_open,
                     )
                     if gate["action"] == "retry":
                         await asyncio.sleep(0.4)
                         bars_15m = await _asyncio.to_thread(_load, "15m", 60)
                         ask_price, book_age = await self._resolve_day_executable_price(symbol)
+                        latest = float(bars_15m[-1]["ts_epoch"]) if bars_15m else None
                         gate = cycle_decision(
                             completed_bar_count=len(bars_15m),
                             minimum_bars=32,
@@ -1681,6 +1686,8 @@ class PortfolioEngineIntegration:
                             book_stale_sec=30.0,
                             already_evaluated=(symbol, int(as_of)) in seen,
                             retried=True,
+                            latest_bar_epoch=latest,
+                            required_open_epoch=required_open,
                         )
                     seen.add((symbol, int(as_of)))
                     if gate["action"] != "proceed":

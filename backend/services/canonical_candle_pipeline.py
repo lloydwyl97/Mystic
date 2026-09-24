@@ -47,6 +47,26 @@ from backend.services.canonical_candle_store import (
 
 logger = logging.getLogger(__name__)
 
+
+def next_refresh_pair(
+    pairs: list[tuple[str, str]],
+    next_due: dict[str, float],
+    now: float,
+) -> tuple[str, str, float]:
+    """Pick the soonest stream. Finer intervals win ties so 1w cannot stall 15m."""
+
+    def _key(pair: tuple[str, str]) -> tuple[float, int]:
+        symbol, interval = pair
+        stream = f"{api_symbol(symbol)}:{interval}"
+        rank = CANONICAL_CANDLE_INTERVALS.index(interval) if interval in CANONICAL_CANDLE_INTERVALS else 99
+        return (float(next_due.get(stream, 0.0)), rank)
+
+    symbol, interval = min(pairs, key=_key)
+    stream = f"{api_symbol(symbol)}:{interval}"
+    wait = max(0.0, float(next_due.get(stream, 0.0)) - float(now))
+    return symbol, interval, wait
+
+
 BINANCE_KLINES = "https://api.binance.us/api/v3/klines"
 WRITER_ROLE = "canonical_candle_pipeline"
 FetchFn = Callable[..., Awaitable[list[list[Any]]]]
@@ -402,11 +422,15 @@ class CanonicalCandlePipeline:
         }
 
     async def _refresh_loop(self) -> None:
-        idx = 0
         pairs = [(s, i) for s in CANONICAL_SYMBOLS for i in CANONICAL_CANDLE_INTERVALS]
+        trading = {"1m", "3m", "5m", "15m", "1h", "4h"}
+        now = time.time()
+        next_due = {self._stream_key(s, i): (0.0 if i in trading else now + refresh_sec(i)) for s, i in pairs}
         while self._running:
-            symbol, interval = pairs[idx % len(pairs)]
-            idx += 1
+            symbol, interval, wait = next_refresh_pair(pairs, next_due, time.time())
+            if wait > 0:
+                await asyncio.sleep(min(wait, 5.0))
+                continue
             try:
                 await self.refresh_live(symbol, interval)
             except asyncio.CancelledError:
@@ -414,7 +438,7 @@ class CanonicalCandlePipeline:
             except Exception as exc:
                 self._errors[self._stream_key(symbol, interval)] = str(exc)
                 logger.warning("canonical refresh failed %s %s: %s", symbol, interval, exc)
-            await asyncio.sleep(max(1.0, refresh_sec(interval) / len(CANONICAL_SYMBOLS)))
+            next_due[self._stream_key(symbol, interval)] = time.time() + refresh_sec(interval)
 
     async def _integrity_loop(self) -> None:
         while self._running:

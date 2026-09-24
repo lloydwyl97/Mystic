@@ -124,6 +124,47 @@ def test_blank_candle_is_not_zero_filled(tmp_path):
     assert bars[0]["volume"] == 10.0
 
 
+def test_cycle_gate_rejects_stale_boundary_candle():
+    from backend.services.day_v2.cycle_gate import HARD_MISSING_CANDLE, cycle_decision
+
+    boundary = 1_790_291_700.0
+    stale = cycle_decision(
+        completed_bar_count=40,
+        minimum_bars=32,
+        executable_price=1.53,
+        book_age_sec=1.0,
+        book_stale_sec=30,
+        already_evaluated=False,
+        retried=True,
+        latest_bar_epoch=boundary - 1800,
+        required_open_epoch=boundary - 900,
+    )
+    assert stale == {"action": "reject", "reason": HARD_MISSING_CANDLE}
+    fresh = cycle_decision(
+        completed_bar_count=40,
+        minimum_bars=32,
+        executable_price=1.53,
+        book_age_sec=1.0,
+        book_stale_sec=30,
+        already_evaluated=False,
+        retried=False,
+        latest_bar_epoch=boundary - 900,
+        required_open_epoch=boundary - 900,
+    )
+    assert fresh["action"] == "proceed"
+
+
+def test_refresh_schedule_does_not_let_weekly_block_15m():
+    from backend.services.canonical_candle_pipeline import next_refresh_pair
+
+    pairs = [("XRPUSDT", "15m"), ("XRPUSDT", "1w")]
+    now = 1_000_000.0
+    symbol, interval, wait = next_refresh_pair(pairs, {"XRPUSDT:15m": now, "XRPUSDT:1w": now}, now)
+    assert (symbol, interval, wait) == ("XRPUSDT", "15m", 0.0)
+    symbol, interval, wait = next_refresh_pair(pairs, {"XRPUSDT:15m": now + 30, "XRPUSDT:1w": now + 5}, now)
+    assert (symbol, interval, wait) == ("XRPUSDT", "1w", 5.0)
+
+
 def test_cycle_gate_retries_then_hard_rejects_missing_price():
     from backend.services.day_v2.cycle_gate import HARD_MISSING_PRICE, cycle_decision
 
