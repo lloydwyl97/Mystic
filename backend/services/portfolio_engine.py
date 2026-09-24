@@ -14138,6 +14138,60 @@ class PortfolioEngine:
                     exc_info=True,
                 )
 
+        # ── SCALP V2 exit dispatch ─────────────────────────────────────────────
+        # Positions with engine_id='SCALP_V2' use the five SCALP V2 exit roles
+        # (catastrophic / net-profit / giveback / stall / time) and skip DAY
+        # structural invalidation, DAY thesis objectives, DAY 300-min ceiling,
+        # and allweather bracket exits.  The exception path falls through to
+        # legacy exits as a safety net.
+        if _pos_engine_id == "SCALP_V2":
+            try:
+                from backend.services.scalp_v2.exit_evaluator import evaluate_scalp_v2_exit
+
+                _pnl_pct_sv2 = (current_price - entry_price) / entry_price
+                _net_pnl_sv2 = _pnl_pct_sv2 - ESTIMATED_ROUNDTRIP_COST
+                _entry_ts_sv2 = float(getattr(position, "entry_time", 0.0) or 0.0)
+                _hold_min_sv2 = max(0.0, (time.time() - _entry_ts_sv2) / 60.0) if _entry_ts_sv2 > 0 else 0.0
+                _bar_low_sv2 = float(getattr(position, "lowest_price", 0.0) or current_price)
+                if _bar_low_sv2 <= 0:
+                    _bar_low_sv2 = float(current_price)
+
+                _scalp_v2_dec = evaluate_scalp_v2_exit(
+                    position=position,
+                    current_price=float(current_price),
+                    net_pnl_pct=_net_pnl_sv2,
+                    hold_minutes=_hold_min_sv2,
+                    bar_low=_bar_low_sv2,
+                    symbol=symbol,
+                )
+                if str(_scalp_v2_dec.get("action") or "") == "sell":
+                    _scalp_v2_reason = str(_scalp_v2_dec.get("reason") or "SCALP_V2_EXIT")
+                    logger.warning(
+                        "SCALP_V2_EXIT symbol=%s reason=%s detail=%s price=%.6f",
+                        symbol,
+                        _scalp_v2_reason,
+                        _scalp_v2_dec.get("detail"),
+                        current_price,
+                    )
+                    return await self.execute_sell_fifo(
+                        symbol,
+                        quantity,
+                        current_price,
+                        ExitType.MANUAL,
+                        _scalp_v2_reason,
+                        current_bar=current_bar,
+                        force_sell=True,
+                    )
+                # No SCALP V2 exit condition met — hold. Do NOT fall through to
+                # allweather or legacy DAY exits.
+                return None
+            except Exception:
+                logger.warning(
+                    "SCALP_V2_EXIT_EVAL_ERROR symbol=%s — falling through to legacy exits",
+                    symbol,
+                    exc_info=True,
+                )
+
         # All-weather bounded exit — ATR bracket only; never MIN_NET_PROFIT floor.
         try:
             from backend.services import allweather_breakout_pullback_adapter as _awbp
@@ -14206,6 +14260,17 @@ class PortfolioEngine:
             bar_low = float(getattr(position, "lowest_price", 0.0) or current_price)
             if bar_low <= 0:
                 bar_low = float(current_price)
+
+        # Fail-closed for unknown engine IDs: do not apply legacy DAY exits to
+        # an engine we don't recognise.  Known legacy variants fall through.
+        _known_legacy_engines = frozenset({"LEGACY_DAY_LIVE", "LEGACY_EXIT_ONLY", ""})
+        if _pos_engine_id not in _known_legacy_engines:
+            logger.error(
+                "UNKNOWN_ENGINE_ID_FAIL_CLOSED symbol=%s engine_id=%s — holding position",
+                symbol,
+                _pos_engine_id,
+            )
+            return None
 
         from backend.services.day_controlled_exits import (
             EXIT_PATH_EXECUTABLE_PROFIT,

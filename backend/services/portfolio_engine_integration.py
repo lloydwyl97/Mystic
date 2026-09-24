@@ -1461,8 +1461,21 @@ class PortfolioEngineIntegration:
                                 entry_bar,
                                 self.entry_decision_interval,
                             )
+                            # LEGACY_DAY_LIVE_BUY_DISABLED (default true) — the legacy
+                            # trailing-buy stream is no longer the active entry authority.
+                            # DAY V2 (_process_day_v2_signals) and SCALP V2 (live entry
+                            # loop) are the only authorities that create new positions.
+                            # Set LEGACY_DAY_LIVE_BUY_DISABLED=false to re-enable.
+                            _legacy_buy_disabled = os.getenv("LEGACY_DAY_LIVE_BUY_DISABLED", "true").lower() not in ("0", "false", "no", "off")
                             try:
-                                result = await self.engine.process_bar_candidates(current_bar)
+                                if _legacy_buy_disabled:
+                                    logger.info(
+                                        "LEGACY_DAY_LIVE_BUY_DISABLED bar=%s — skipping process_bar_candidates",
+                                        entry_bar,
+                                    )
+                                    result = None
+                                else:
+                                    result = await self.engine.process_bar_candidates(current_bar)
                             finally:
                                 # Consume this entry window even if process_bar_candidates
                                 # raises after a partial fill. Retrying the same 15m bar

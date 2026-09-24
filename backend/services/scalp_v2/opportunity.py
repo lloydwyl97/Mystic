@@ -18,6 +18,13 @@ SCALP_V2_ENGINE_ID = "SCALP_V2"
 LEGACY_EXIT_ONLY = "LEGACY_EXIT_ONLY"
 _ZONE = 1.005  # 0.5% price zone. Leaving it is the structural reset.
 
+# ARMED opportunities older than this are considered stale (price zone moved on
+# without a fill). Reset them so a fresh arm in the same zone is permitted.
+# Default: 3600 s (60 min). Override with SCALP_V2_OPP_EXPIRY_SEC env var.
+import os as _os
+
+SCALP_V2_OPP_EXPIRY_SEC: float = float(_os.getenv("SCALP_V2_OPP_EXPIRY_SEC", "3600"))
+
 
 @dataclasses.dataclass(frozen=True)
 class ScalpOpportunityId:
@@ -105,14 +112,25 @@ def arm_opportunity(
         # Engine-scoped deduplication: only look at rows for this engine.
         row = conn.execute(
             """
-            SELECT id, opportunity_id, state FROM scalp_v2_opportunities
+            SELECT id, opportunity_id, state, created_at FROM scalp_v2_opportunities
             WHERE symbol=? AND engine_id=? ORDER BY id DESC LIMIT 1
             """,
             (sym, eid),
         ).fetchone()
         if row and row[1] == opp.canonical_id and row[2] in ("ARMED", "OPEN", "CLOSED"):
-            conn.commit()
-            return opp.canonical_id, True
+            # Time-based expiry: ARMED rows that never progressed to OPEN/CLOSED after
+            # SCALP_V2_OPP_EXPIRY_SEC seconds are stale. Reset them so a fresh arm is
+            # permitted. OPEN and CLOSED rows are still guarded (position is live or
+            # was live in this move).
+            if row[2] == "ARMED" and (now - float(row[3] or 0.0)) > SCALP_V2_OPP_EXPIRY_SEC:
+                conn.execute(
+                    "UPDATE scalp_v2_opportunities SET state='RESET', updated_at=? WHERE id=?",
+                    (now, row[0]),
+                )
+                # Fall through — create a fresh ARMED row for this opportunity.
+            else:
+                conn.commit()
+                return opp.canonical_id, True
         if row and row[1] != opp.canonical_id:
             conn.execute(
                 """
