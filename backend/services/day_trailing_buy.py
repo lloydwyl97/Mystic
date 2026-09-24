@@ -846,7 +846,20 @@ async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> di
             _payload = dict(intent.get("payload") or {})
             _reclaim = float(_payload.get("reclaim_level") or 0.0)
             _armed_at = float(intent.get("arm_ts") or 0.0)
-            _db_sym = str(_payload.get("db_symbol") or symbol)
+            # Resolve to the exact symbol format in feature_ohlcv (BTC-USDT on Ocean).
+            # Never fall back to a bare BTCUSDT that has zero rows in the DB.
+            from backend.services.day_v2.five_min_confirm import canonical_db_symbol as _canonical_db_symbol
+
+            _db_sym_hint = str(_payload.get("db_symbol") or "")
+            _db_sym = _canonical_db_symbol(_db_sym_hint or symbol, str(engine.db_path))
+            if _db_sym is None:
+                logger.warning(
+                    "DAY_V2_SUBMIT_HOLD_5M_NO_BARS symbol=%s hint=%s — no 5m rows found, rejecting entry",
+                    symbol,
+                    _db_sym_hint or symbol,
+                )
+                release_submitting_for_retry(str(engine.db_path), str(intent["intent_id"]))
+                return None
             confirm = check_5m_confirmation(
                 str(engine.db_path),
                 _db_sym,
@@ -855,11 +868,12 @@ async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> di
             )
             if not confirm.confirmed:
                 logger.info(
-                    "DAY_V2_SUBMIT_HOLD_5M symbol=%s intent=%s reason=%s red_bar_ts=%.0f",
+                    "DAY_V2_SUBMIT_HOLD_5M symbol=%s intent=%s reason=%s red_bar_ts=%.0f db_sym=%s",
                     symbol,
                     intent.get("intent_id"),
                     confirm.reason,
                     float(getattr(confirm, "red_bar_ts", 0) or 0),
+                    _db_sym,
                 )
                 _update_intent_5m_telemetry(str(engine.db_path), str(intent["intent_id"]), confirm)
                 release_submitting_for_retry(str(engine.db_path), str(intent["intent_id"]))

@@ -726,6 +726,31 @@ class ExitType(Enum):
     DUST_WRITEOFF = "DUST_WRITEOFF"
 
 
+def _resolve_scalp_mode_display() -> str:
+    """Return the human-readable SCALP mode label for the status API.
+
+    Reads structural_mode at call time so restarts with new env vars are
+    reflected immediately without restarting the whole engine.
+    """
+    try:
+        from backend.services.binance_scalp.config import get_scalp_config
+        from backend.services.binance_scalp.structural_mode import MODE_LIVE
+
+        cfg = get_scalp_config()
+        mode = cfg.resolved_structural_mode()
+        if mode == MODE_LIVE:
+            return "SCALP LIVE"
+        if mode == "STRUCTURAL_PAPER":
+            return "SCALP PAPER"
+        if mode == "STRUCTURAL_SHADOW":
+            return "SCALP SHADOW"
+        if mode == "DISABLED":
+            return "SCALP DISABLED"
+        return f"SCALP {mode}"
+    except Exception:
+        return "SCALP PAPER"
+
+
 def paper_trades_exit_type_label(exit_type: ExitType, exit_trigger: str) -> str:
     """DB/report label for paper_trades.exit_type — prefer engine trigger over MANUAL."""
     from backend.services.day_trade_thesis import (
@@ -8614,13 +8639,19 @@ class PortfolioEngine:
         atomic with respect to any other concurrent buy attempt for the same
         symbol, regardless of unrelated async scheduling/reload timing.
         """
-        from backend.config.day_entry_execution import ENTRY_AUTHORITY_TRAILING_BUY, trailing_buy_mode_active
+        from backend.config.day_entry_execution import (
+            ENTRY_AUTHORITY_SCALP_V2_LIVE,
+            ENTRY_AUTHORITY_TRAILING_BUY,
+            trailing_buy_mode_active,
+        )
 
-        if trailing_buy_mode_active() and str(entry_authority or "") != ENTRY_AUTHORITY_TRAILING_BUY:
+        _auth = str(entry_authority or "")
+        _scalp_v2_live_authority = _auth == ENTRY_AUTHORITY_SCALP_V2_LIVE
+        if trailing_buy_mode_active() and _auth != ENTRY_AUTHORITY_TRAILING_BUY and not _scalp_v2_live_authority:
             logger.error(
-                "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH symbol=%s authority=%s — trailing-buy is the only automated DAY BUY",
+                "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH symbol=%s authority=%s — trailing-buy or SCALP_V2_LIVE_ENTRY required",
                 symbol,
-                entry_authority or "missing",
+                _auth or "missing",
             )
             self.last_buy_reject_reason = "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH"
             self._persist_buy_reject_hold(symbol, decision_id=decision_id, intent_id=trailing_buy_intent_id)
@@ -19832,8 +19863,8 @@ class PortfolioEngine:
             ],
             "reservations_count": len(getattr(self, "_entry_reservations", None) or {}),
             "day_mode_display": "DAY LIVE",
-            "scalp_mode_display": "SCALP PAPER",
-            "operator_mode_labels": {"day": "DAY LIVE", "scalp": "SCALP PAPER"},
+            "scalp_mode_display": _resolve_scalp_mode_display(),
+            "operator_mode_labels": {"day": "DAY LIVE", "scalp": _resolve_scalp_mode_display()},
             "forward_scorecard_baseline": self._forward_scorecard_baseline_payload(account_equity),
             **get_live_test_api_fields(),
         }

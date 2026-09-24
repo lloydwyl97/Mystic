@@ -7,6 +7,10 @@ from typing import Final
 
 TRAILING_BUY_MODE: Final[str] = "trailing_buy"
 ENTRY_AUTHORITY_TRAILING_BUY: Final[str] = "DAY_TRAILING_BUY_CONFIRMED"
+# SCALP V2 live entries bypass the DAY trailing-buy gate.
+# They route directly through execute_buy_fifo with immediate execution
+# (no resting intent needed — SCALP entry is fill-or-reject, not trail).
+ENTRY_AUTHORITY_SCALP_V2_LIVE: Final[str] = "SCALP_V2_LIVE_ENTRY"
 VALID_ENTRY_MODES: Final[frozenset[str]] = frozenset({TRAILING_BUY_MODE})
 MODE_ENV: Final[str] = "DAY_ENTRY_EXECUTION_MODE"
 MAX_WAIT_ENV: Final[str] = "DAY_TRAILING_BUY_MAX_WAIT_SECONDS"
@@ -64,6 +68,7 @@ __all__ = [
     "BOOK_STALE_SEC",
     "DEFAULT_BOOK_STALE_SEC",
     "DEFAULT_MAX_WAIT_SECONDS",
+    "ENTRY_AUTHORITY_SCALP_V2_LIVE",
     "ENTRY_AUTHORITY_TRAILING_BUY",
     "MAX_WAIT_ENV",
     "MODE_ENV",

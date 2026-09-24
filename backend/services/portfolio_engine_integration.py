@@ -178,6 +178,7 @@ class PortfolioEngineIntegration:
         self._monitor_task: asyncio.Task | None = None
         self._bar_processor_task: asyncio.Task | None = None
         self._ledger_mtm_task: asyncio.Task | None = None
+        self._scalp_v2_task: asyncio.Task | None = None
 
         # Bar timing: 1m keeps cooldown/"N bars" semantics; entries decide on 15m closes.
         self.bar_interval = 60  # 1-minute bars (cooldown units)
@@ -187,6 +188,8 @@ class PortfolioEngineIntegration:
         self._exit_monitor_interval = max(5, EXIT_MONITOR_INTERVAL_SEC)
         self._price_publisher_interval = max(5, PRICE_PUBLISHER_INTERVAL_SEC)
         self._signal_consumer_interval = max(1, SIGNAL_CONSUMER_INTERVAL_SEC)
+        # SCALP V2 live entry loop cadence (seconds between evaluate_all() calls).
+        self._scalp_v2_entry_interval = int(os.getenv("SCALP_V2_ENTRY_INTERVAL_SEC", "60"))
 
         # Price cache for monitoring
         self.current_prices: dict[str, float] = {}
@@ -285,6 +288,23 @@ class PortfolioEngineIntegration:
         self.is_running = True
         logger.info("PortfolioEngineIntegration initialized (background tasks deferred)")
 
+        # Seed the canonical NLE snapshot immediately so the equity failsafe has a
+        # valid baseline from the first check cycle rather than logging
+        # ACCOUNT_FAILSAFE_SKIPPED reason=missing_nle_snapshot_cannot_compare on
+        # every monitor tick until the first run_trading_circuit_breaker_check completes.
+        if self.engine is not None:
+            try:
+                snap = await self.engine._refresh_canonical_nle_snapshot()
+                logger.info(
+                    "CANONICAL_NLE_SEED_OK usable=%s nle=%s cash_usdt=%s assets=%s",
+                    snap.get("usable"),
+                    snap.get("net_liquidatable_equity"),
+                    snap.get("cash_usdt"),
+                    len(snap.get("assets") or []),
+                )
+            except Exception:
+                logger.warning("CANONICAL_NLE_SEED_FAILED (non-fatal — will retry in first monitor tick)", exc_info=True)
+
     async def start(self) -> None:
         """Start the integration layer with background tasks"""
         if not self.is_running:
@@ -310,6 +330,10 @@ class PortfolioEngineIntegration:
             self._large_table_retention_task = asyncio.create_task(self._large_table_retention_loop(), name="portfolio_engine:large_table_retention")
             self._ledger_mtm_task = asyncio.create_task(self._ledger_mtm_persist_loop(), name="portfolio_engine:ledger_mtm_persist")
             self._day_4h_label_task = asyncio.create_task(self._day_4h_label_loop(), name="portfolio_engine:day_4h_label")
+            # SCALP V2 live entry loop — runs every SCALP_V2_ENTRY_INTERVAL_SEC.
+            # Only active when SCALP_LIVE=true AND SCALP_LIVE_ARMED=true (structural_mode=LIVE).
+            # No-ops silently when those flags are false so paper/test environments are unaffected.
+            self._scalp_v2_task = asyncio.create_task(self._scalp_v2_live_loop(), name="portfolio_engine:scalp_v2_live")
             try:
                 from backend.services.simplified_pnl_observation import ENABLED as _PNLOB
 
@@ -319,9 +343,11 @@ class PortfolioEngineIntegration:
             logger.info(
                 "PortfolioEngineIntegration background tasks started "
                 "(signal consumer, price publisher, binance sync, dust/live/canonical reconcile, "
-                "paper retention, large_table_retention every %.0fs, ledger_mtm_persist every %.0fs)",
+                "paper retention, large_table_retention every %.0fs, ledger_mtm_persist every %.0fs, "
+                "scalp_v2_live every %.0fs)",
                 _LARGE_TABLE_RETENTION_INTERVAL_SEC,
                 _LEDGER_MTM_PERSIST_INTERVAL_SEC,
+                self._scalp_v2_entry_interval,
             )
             # BUILD stamp: proves current code is running after restart (no old build)
             build = _get_build_stamp()
@@ -1692,6 +1718,182 @@ class PortfolioEngineIntegration:
 
         except Exception:
             logger.warning("DAY_V2_PROCESS_ERROR", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # SCALP V2 live entry loop
+    # ------------------------------------------------------------------
+
+    async def _scalp_v2_live_loop(self) -> None:
+        """Continuous SCALP V2 live entry loop.
+
+        Runs every SCALP_V2_ENTRY_INTERVAL_SEC (default 60s).
+        Silently no-ops unless structural_mode resolves to LIVE.
+        No paper/shadow execution occurs here — only genuine Binance.US entries.
+        """
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(30)  # Allow portfolio engine to fully initialise first
+        while True:
+            try:
+                await self._process_scalp_v2_signals()
+            except _asyncio.CancelledError:
+                break
+            except Exception:
+                logger.warning("SCALP_V2_LIVE_LOOP_ERROR", exc_info=True)
+            try:
+                await _asyncio.sleep(self._scalp_v2_entry_interval)
+            except _asyncio.CancelledError:
+                break
+
+    async def _process_scalp_v2_signals(self) -> None:
+        """Evaluate SCALP V2 entry signals and execute live entries.
+
+        Lifecycle per winning candidate:
+          signal → opportunity dedup → slot check → execute_buy_fifo (live order)
+          → fill confirmed → position stamped engine_id=SCALP_V2
+
+        Only active when SCALP_LIVE=true AND SCALP_LIVE_ARMED=true.
+        Cross-engine ownership: if a symbol is already held by a different engine
+        the entry is blocked with reason SYMBOL_OWNED_BY_OTHER_ENGINE.
+        """
+        import asyncio as _asyncio
+
+        if self.engine is None:
+            return
+
+        try:
+            from backend.services.binance_scalp.config import get_scalp_config
+            from backend.services.binance_scalp.structural_mode import live_entry_enabled
+
+            cfg = get_scalp_config()
+            mode = cfg.resolved_structural_mode()
+            if not live_entry_enabled(mode):
+                logger.debug("SCALP_V2_LIVE_SKIP mode=%s (not LIVE)", mode)
+                return
+        except Exception:
+            logger.debug("SCALP_V2_LIVE_CONFIG_ERROR", exc_info=True)
+            return
+
+        try:
+            from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
+            from backend.services.scalp_v2.opportunity import arm_opportunity
+
+            router = ScalpStrategyRouter(cfg)
+            now = time.time()
+            candidates = router.evaluate_all(epoch=now, notional_usd=float(cfg.scalp_live_max_notional))
+        except Exception:
+            logger.warning("SCALP_V2_ROUTER_ERROR", exc_info=True)
+            return
+
+        from backend.config.day_entry_execution import ENTRY_AUTHORITY_SCALP_V2_LIVE
+        from backend.services.day_v2.engine_identity import DAY_V2_ENGINE_ID
+
+        SCALP_V2_ENGINE = "SCALP_V2"
+
+        for row in candidates:
+            if not row.get("entry_eligible"):
+                continue
+
+            sym_raw = str(row.get("symbol") or "")
+            if not sym_raw:
+                continue
+
+            # Normalise to API symbol format (BTC/USDT)
+            norm = sym_raw.upper().replace("-", "/")
+            if "/" not in norm and norm.endswith("USDT"):
+                norm = norm[:-4] + "/USDT"
+
+            try:
+                # ── Cross-engine ownership guard ────────────────────────────
+                open_positions = self.engine.open_positions or {}
+                existing_pos = open_positions.get(norm)
+                if existing_pos is not None:
+                    pos_status = str(getattr(existing_pos, "status", "ACTIVE") or "ACTIVE")
+                    pos_qty = float(getattr(existing_pos, "quantity", 0) or 0)
+                    pos_engine = str(getattr(existing_pos, "engine_id", "") or "")
+                    if pos_qty > 0 and pos_status != "DUST_PENDING":
+                        if pos_engine != SCALP_V2_ENGINE:
+                            logger.info(
+                                "SCALP_V2_ENTRY_BLOCKED symbol=%s SYMBOL_OWNED_BY_OTHER_ENGINE engine=%s",
+                                norm,
+                                pos_engine,
+                            )
+                            continue
+                        # Same engine — already have a SCALP position; skip.
+                        logger.debug("SCALP_V2_ENTRY_BLOCKED symbol=%s SCALP_POSITION_ALREADY_OPEN", norm)
+                        continue
+
+                # ── Opportunity deduplication (engine-scoped) ───────────────
+                arm_price = float(row.get("rank_score") or 0)  # use snap for real price
+                snap = row.get("snap")
+                if snap is not None:
+                    arm_price = float(getattr(snap, "best_ask", 0) or getattr(snap, "mid_price", 0) or 0)
+                if arm_price <= 0:
+                    arm_price = float(self.current_prices.get(norm) or self.current_prices.get(sym_raw) or 0)
+                if arm_price <= 0:
+                    logger.warning("SCALP_V2_NO_PRICE symbol=%s", norm)
+                    continue
+
+                setup_name = str(row.get("best_setup") or "SCALP_STRUCTURAL")
+                opp_id, blocked = arm_opportunity(self.engine.db_path, norm, setup_name, arm_price, engine_id=SCALP_V2_ENGINE)
+                if blocked:
+                    logger.debug("SCALP_V2_ENTRY_BLOCKED symbol=%s SAME_MOVE_OPPORTUNITY opp=%s", norm, opp_id)
+                    continue
+
+                # ── Position sizing ─────────────────────────────────────────
+                atr_val = float(row.get("atr") or 0)
+                equity = float(self.engine.total_equity or self.engine.cash_balance or 0)
+                qty, notional, _ = self.engine.calculate_position_size(
+                    symbol=norm,
+                    equity=equity,
+                    atr=atr_val if atr_val > 0 else arm_price * 0.015,
+                    current_price=arm_price,
+                )
+                # Apply live notional cap from config
+                max_notional = float(cfg.scalp_live_max_notional)
+                if notional > max_notional:
+                    qty = max_notional / arm_price
+                    notional = max_notional
+                if qty <= 0 or notional <= 0:
+                    logger.warning("SCALP_V2_ZERO_SIZE symbol=%s", norm)
+                    continue
+
+                # ── Slot/cash gate ──────────────────────────────────────────
+                can_open, gate_reason = await self.engine._can_open_position(norm, notional)
+                if not can_open:
+                    logger.info("SCALP_V2_ENTRY_BLOCKED symbol=%s gate=%s", norm, gate_reason)
+                    continue
+
+                # ── Live order submission via portfolio engine ───────────────
+                logger.warning(
+                    "SCALP_V2_SIGNAL symbol=%s setup=%s opp=%s arm_price=%.6f notional=%.2f",
+                    norm,
+                    setup_name,
+                    opp_id,
+                    arm_price,
+                    notional,
+                )
+                result = await self.engine.execute_buy_fifo(
+                    norm,
+                    qty,
+                    arm_price,
+                    entry_authority=ENTRY_AUTHORITY_SCALP_V2_LIVE,
+                )
+                if result is not None:
+                    logger.warning(
+                        "SCALP_V2_ENTRY_FILLED symbol=%s opp=%s qty=%.8f price=%.6f",
+                        norm,
+                        opp_id,
+                        float(result.get("quantity") or qty),
+                        float(result.get("price") or arm_price),
+                    )
+                else:
+                    logger.info("SCALP_V2_ENTRY_REJECTED symbol=%s opp=%s", norm, opp_id)
+
+            except _asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("SCALP_V2_SIGNAL_ERROR symbol=%s", sym_raw, exc_info=True)
 
     async def _monitor_positions_once(self, *, refresh_market_data: bool = True) -> list[dict[str, Any]]:
         """

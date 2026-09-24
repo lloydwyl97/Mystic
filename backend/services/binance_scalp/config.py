@@ -70,9 +70,11 @@ class ScalpConfig:
         products_raw = os.getenv("SCALP_PRODUCTS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")
         products = tuple(p.strip().upper() for p in products_raw.split(",") if p.strip())
         prefix = (os.getenv("SCALP_REDIS_PREFIX", "scalp") or "scalp").strip().rstrip(":")
-        from backend.services.atomic_execution_book import resolve_scalp_database_path
+        # resolve_scalp_database_path removed 2026-09-22 — SCALP uses the
+        # main DATABASE_PATH (both DAY V2 and SCALP V2 share mystic_trading.db).
+        from backend.database_schema import DATABASE_PATH as _DATABASE_PATH
 
-        db = resolve_scalp_database_path(_REPO_ROOT, os.getenv)
+        db = os.getenv("DATABASE_PATH", _DATABASE_PATH)
         symbol_caps: dict[str, float] = {}
         raw_caps = (os.getenv("SCALP_SYMBOL_NOTIONAL_CAPS_JSON") or "").strip()
         if raw_caps:
@@ -168,9 +170,14 @@ class ScalpConfig:
         )
 
     def assert_no_live_trading(self) -> None:
-        """Structural process: exchange-live is impossible. Legacy flags refuse startup."""
+        """Refuse genuinely unsafe flags (market orders, calibration+live).
+
+        SCALP_LIVE=true + SCALP_LIVE_ARMED=true is the promoted live path and
+        is no longer refused here — it routes through the portfolio engine live
+        order path (execute_buy_fifo), not through the retired paper LP model.
+        """
         if self.allow_market_orders:
-            raise RuntimeError("SCALP_ALLOW_MARKET_ORDERS is refused in the structural process.")
+            raise RuntimeError("SCALP_ALLOW_MARKET_ORDERS is refused — use the portfolio engine live path.")
         if self.calibration_mode and self.scalp_live:
             raise RuntimeError("SCALP_CALIBRATION_MODE requires SCALP_LIVE=false")
         self.resolved_structural_mode()

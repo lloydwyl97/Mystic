@@ -22,11 +22,55 @@ load_synthetic_5m_bars(db_path, symbol, *, since_ts, now)
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Canonical symbol converter
+# ---------------------------------------------------------------------------
+
+_HYPHEN_FMT = re.compile(r"^([A-Z]{2,10})-USDT$")
+_SLASH_FMT = re.compile(r"^([A-Z]{2,10})/USDT$")
+_BARE_FMT = re.compile(r"^([A-Z]{2,10})USDT$")
+
+
+def canonical_db_symbol(symbol: str, db_path: str) -> str | None:
+    """Resolve *symbol* to the exact string stored in feature_ohlcv.
+
+    Tries BTC-USDT (hyphen) first (Ocean live format), then BTC/USDT, then
+    BTCUSDT.  Returns the first format that has at least one 5m row in the DB,
+    or None when no row exists (entry must be rejected — do not bypass gate).
+
+    Never returns a bare format that is known to have zero rows.
+    """
+    raw = str(symbol or "").strip().upper()
+    # Normalise to base asset only
+    base: str
+    if (m := _HYPHEN_FMT.match(raw)) or (m := _SLASH_FMT.match(raw)) or (m := _BARE_FMT.match(raw)):
+        base = m.group(1)
+    else:
+        base = raw.replace("-", "").replace("/", "").replace("USDT", "")
+    if not base:
+        return None
+    candidates = [f"{base}-USDT", f"{base}/USDT", f"{base}USDT"]
+    try:
+        with sqlite3.connect(db_path, timeout=5) as conn:
+            for cand in candidates:
+                row = conn.execute(
+                    "SELECT 1 FROM feature_ohlcv WHERE symbol=? AND interval='5m' LIMIT 1",
+                    (cand,),
+                ).fetchone()
+                if row:
+                    return cand
+    except Exception as exc:
+        logger.warning("canonical_db_symbol lookup failed symbol=%s: %s", symbol, exc)
+    return None
+
 
 # Set at module load time by inspecting the available bar intervals.
 # NATIVE_5M  = feature_ohlcv interval='5m' confirmed live (Ocean: 56k rows, up to today).
