@@ -124,6 +124,15 @@ def test_blank_candle_is_not_zero_filled(tmp_path):
     assert bars[0]["volume"] == 10.0
 
 
+def test_required_15m_open_uses_last_closed_bar():
+    from backend.services.day_v2.cycle_gate import required_15m_open
+
+    close_23_30 = 1_790_292_600.0
+    assert required_15m_open(close_23_30) == close_23_30 - 900
+    mid = close_23_30 + 300
+    assert required_15m_open(mid) == close_23_30 - 900
+
+
 def test_cycle_gate_rejects_stale_boundary_candle():
     from backend.services.day_v2.cycle_gate import HARD_MISSING_CANDLE, cycle_decision
 

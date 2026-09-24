@@ -1645,7 +1645,7 @@ class PortfolioEngineIntegration:
                     import asyncio as _asyncio
 
                     from backend.services.candle_contract import load_closed_bars
-                    from backend.services.day_v2.cycle_gate import cycle_decision
+                    from backend.services.day_v2.cycle_gate import cycle_decision, required_15m_open
                     from backend.services.day_v2.decision_log import record_day_decision
                     from backend.services.day_v2.live_signal import explain_no_signal
 
@@ -1660,7 +1660,7 @@ class PortfolioEngineIntegration:
 
                     bars_15m = await _asyncio.to_thread(_load, "15m", 60)
                     ask_price, book_age = await self._resolve_day_executable_price(symbol)
-                    required_open = float(as_of) - 900.0
+                    required_open = required_15m_open(as_of)
                     latest = float(bars_15m[-1]["ts_epoch"]) if bars_15m else None
                     gate = cycle_decision(
                         completed_bar_count=len(bars_15m),

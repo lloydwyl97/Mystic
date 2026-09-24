@@ -9,6 +9,16 @@ from typing import Any
 
 HARD_MISSING_PRICE = "MISSING_EXECUTABLE_PRICE"
 HARD_MISSING_CANDLE = "MISSING_COMPLETED_CANDLE"
+_FIFTEEN_MIN = 900
+
+
+def required_15m_open(as_of: float) -> float:
+    """Open time of the last 15m bar that has closed at as_of.
+
+    An unaligned clock must not demand a candle that has not closed yet.
+    """
+    aligned = (int(as_of) // _FIFTEEN_MIN) * _FIFTEEN_MIN
+    return float(aligned - _FIFTEEN_MIN)
 
 
 def cycle_decision(
