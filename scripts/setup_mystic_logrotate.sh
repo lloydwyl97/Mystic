@@ -29,8 +29,6 @@ cat > "$CONF" << 'EOF'
     missingok
     notifempty
     copytruncate
-    # Do NOT follow symlinks (no logs are symlinks).
-    nolinks
     # Owner / permissions preserved.
     su mystic mystic
 }

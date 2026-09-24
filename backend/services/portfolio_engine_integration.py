@@ -1775,10 +1775,13 @@ class PortfolioEngineIntegration:
             return
 
         try:
-            from backend.services.binance_scalp.scalp_strategy_router import ScalpStrategyRouter
+            from backend.services.binance_scalp.scalp_signal_engine import get_router
             from backend.services.scalp_v2.opportunity import arm_opportunity
 
-            router = ScalpStrategyRouter(cfg)
+            router = get_router()
+            if router is None:
+                logger.debug("SCALP_V2_LIVE_SKIP router=None (signal engine not initialised)")
+                return
             now = time.time()
             candidates = router.evaluate_all(epoch=now, notional_usd=float(cfg.scalp_live_max_notional))
         except Exception:
