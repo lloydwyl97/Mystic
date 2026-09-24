@@ -291,3 +291,137 @@ def evaluate_entry_signal(
         h1_bullish=h1_bullish,
         opportunity_id=_opportunity_id(symbol, setup_name, anchor),
     )
+
+
+def explain_no_signal(
+    symbol: str,
+    bars_15m: list[dict[str, Any]],
+    bars_1h: list[dict[str, Any]],
+    bars_4h: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Closest setup and the exact unmet conditions. Thresholds are unchanged."""
+    _ = symbol
+    if len(bars_15m) < 32:
+        return {"closest": "no_setup", "unmet": [f"bars_15m={len(bars_15m)}<32"], "checks": []}
+    idx = len(bars_15m) - 1
+    b0 = bars_15m[idx]
+    b1 = bars_15m[idx - 1]
+    b2 = bars_15m[idx - 2]
+    c0 = float(b0["close"])
+    l0 = float(b0["low"])
+    b1c = float(b1["close"])
+    b2c = float(b2["close"])
+    window_start = max(0, idx - 50)
+    closes = [float(b["close"]) for b in bars_15m[window_start : idx + 1]]
+    highs = [float(b["high"]) for b in bars_15m[window_start : idx + 1]]
+    lows = [float(b["low"]) for b in bars_15m[window_start : idx + 1]]
+    rsi = _rsi(closes, 14)
+    atr = _atr(highs, lows, closes, 14)
+    bb = _bb_pct(closes, 20, 2.0)
+    sma20 = _sma(closes, 20)
+    if rsi is None or atr is None or bb is None or sma20 is None:
+        return {"closest": "missing_stale_data", "unmet": ["indicator_unavailable"], "checks": []}
+    high20 = max(highs[-20:]) if len(highs) >= 20 else None
+    low20 = min(lows[-20:]) if len(lows) >= 20 else None
+    ts0 = b0["ts"]
+    regime = "neutral"
+    if bars_4h:
+        h4_past = [b for b in bars_4h if b["ts"] <= ts0]
+        if len(h4_past) >= 10:
+            h4_closes = [float(b["close"]) for b in h4_past[-11:]]
+            h4_sma10 = _sma(h4_closes, 10)
+            if h4_sma10:
+                if h4_closes[-1] > h4_sma10 * 1.005:
+                    regime = "bull"
+                elif h4_closes[-1] < h4_sma10 * 0.995:
+                    regime = "bear"
+    h1_bullish = False
+    if bars_1h:
+        h1_past = [b for b in bars_1h if b["ts"] <= ts0]
+        if len(h1_past) >= 5:
+            h1_closes = [float(b["close"]) for b in h1_past[-6:]]
+            h1_bullish = h1_closes[-1] > h1_closes[-5]
+    checks = [
+        {
+            "setup": SETUP_HTF_TREND_PULLBACK,
+            "unmet": [
+                item
+                for item, ok in (
+                    ("regime!=bull", regime == "bull"),
+                    ("1h_not_bullish", h1_bullish),
+                    ("not_green", c0 > b1c),
+                    ("not_near_sma20", c0 < sma20 * 1.005),
+                    ("rsi_not_30_55", 30 < rsi < 55),
+                )
+                if not ok
+            ],
+        },
+        {
+            "setup": SETUP_RANGE_BOUNCE,
+            "unmet": [
+                item
+                for item, ok in (
+                    ("regime_not_neutral_or_bear", regime in ("neutral", "bear")),
+                    ("no_low20", low20 is not None),
+                    ("not_green", c0 > b1c),
+                    ("not_near_range_low", low20 is not None and c0 < low20 * 1.005),
+                    ("bb_not_below_0.30", bb < 0.30),
+                    ("rsi_not_below_45", rsi < 45),
+                )
+                if not ok
+            ],
+        },
+        {
+            "setup": SETUP_BREAKOUT_CONTINUATION,
+            "unmet": [
+                item
+                for item, ok in (
+                    ("regime_not_bull_or_neutral", regime in ("bull", "neutral")),
+                    ("no_high20", high20 is not None),
+                    ("close_not_above_20bar_high", high20 is not None and c0 > high20 * 1.001),
+                    ("rsi_not_below_72", rsi < 72),
+                    ("not_two_up_bars", c0 > b1c > b2c),
+                )
+                if not ok
+            ],
+        },
+        {
+            "setup": SETUP_VWAP_REVERSION,
+            "unmet": [
+                item
+                for item, ok in (
+                    ("regime_not_bull_or_neutral", regime in ("bull", "neutral")),
+                    ("not_green", c0 > b1c),
+                    ("prior_not_red", b1c < b2c),
+                    ("rsi_not_20_40", 20 < rsi < 40),
+                    ("target_not_above_close", sma20 > c0 * 1.003),
+                )
+                if not ok
+            ],
+        },
+        {
+            "setup": SETUP_EXHAUSTION_MR,
+            "unmet": [
+                item
+                for item, ok in (
+                    ("prior_rsi_unavailable_or_not_below_45", (_rsi(closes[:-1], 14) or 100) < 45),
+                    ("prior_bar_not_spike", b1c > b2c * 1.02),
+                    ("not_retracing", c0 < b1c),
+                    ("rsi_not_below_50", rsi < 50),
+                    ("target_not_above_close", sma20 > c0 * 1.002),
+                )
+                if not ok
+            ],
+        },
+    ]
+    ranked = sorted(checks, key=lambda item: len(item["unmet"]))
+    closest = ranked[0]
+    return {
+        "closest": closest["setup"] if closest["unmet"] else "signaled",
+        "unmet": closest["unmet"],
+        "regime": regime,
+        "rsi": rsi,
+        "h1_bullish": h1_bullish,
+        "checks": checks,
+        "anchor_low": l0,
+    }

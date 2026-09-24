@@ -535,9 +535,11 @@ class ScalpStrategyRouter:
         def _one(sym: str) -> None:
             try:
                 self.klines.get(sym)
+                self.klines.get_3m(sym)
                 self.klines.get_5m(sym)
                 self.klines.get_15m(sym)
                 self.klines.get_1h(sym)
+                self.klines.get_4h(sym)
             except Exception as exc:
                 logger.warning("SCALP_PREFETCH_FAILED symbol=%s err=%s", sym, exc)
 

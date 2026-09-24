@@ -10,8 +10,12 @@ Untouched window 2026-09-20T23:14Z onward, n=16:
 
 Validation window 2026-09-19 through that cut, n=20:
   existing ladder -2.99, both off -4.54 (worst). No policy beat the existing
-  ladder on both validation and the untouched window. n=16 is not a reliable
-  replacement. Selected policy: keep giveback, stall, and the hard stop.
+  ladder on BOTH windows. n=16/20 is not a promotion.
+
+Stall and giveback were the premature exits. They stay off unless an operator
+sets SCALP_V2_STALL_EXIT_ENABLED or SCALP_V2_GIVEBACK_EXIT_ENABLED. The live
+SCALP ladder is catastrophic stop, net-profit clip, and the 120-minute time
+stop. DAY structural invalidation is not on this ladder.
 """
 
 from __future__ import annotations
@@ -22,18 +26,18 @@ SCALP_V2_ENGINE_ID = "SCALP_V2"
 LEGACY_ENGINE_ID = "LEGACY_DAY_LIVE"
 
 
-SELECTED_EXIT_POLICY = "preserve_giveback_stall_and_hard_stop"
+SELECTED_EXIT_POLICY = "catastrophic_net_profit_time_stop"
 
 
 def scalp_v2_stall_exit_enabled() -> bool:
-    """Keep stall. The untouched window liked disabling it; validation did not."""
-    raw = os.getenv("SCALP_V2_STALL_EXIT_ENABLED", "true")
+    """Off unless explicitly enabled. The untouched window treated stall as premature."""
+    raw = os.getenv("SCALP_V2_STALL_EXIT_ENABLED", "false")
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def scalp_v2_giveback_exit_enabled() -> bool:
-    """Keep giveback. Disabling it was not reliable out of sample."""
-    raw = os.getenv("SCALP_V2_GIVEBACK_EXIT_ENABLED", "true")
+    """Off unless explicitly enabled. Giveback is not an active SCALP exit."""
+    raw = os.getenv("SCALP_V2_GIVEBACK_EXIT_ENABLED", "false")
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 

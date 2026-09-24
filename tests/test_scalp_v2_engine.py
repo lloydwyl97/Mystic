@@ -82,11 +82,11 @@ def test_scalp_opportunity_id_ignores_clock_and_changes_with_anchor():
 # ---------------------------------------------------------------------------
 
 
-def test_scalp_v2_stall_enabled_by_default(monkeypatch):
+def test_scalp_v2_stall_disabled_by_default(monkeypatch):
     monkeypatch.delenv("SCALP_V2_STALL_EXIT_ENABLED", raising=False)
     from backend.services.scalp_v2.exit_calibration import scalp_v2_stall_exit_enabled
 
-    assert scalp_v2_stall_exit_enabled() is True
+    assert scalp_v2_stall_exit_enabled() is False
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +94,11 @@ def test_scalp_v2_stall_enabled_by_default(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_scalp_v2_giveback_enabled_by_default(monkeypatch):
+def test_scalp_v2_giveback_disabled_by_default(monkeypatch):
     monkeypatch.delenv("SCALP_V2_GIVEBACK_EXIT_ENABLED", raising=False)
     from backend.services.scalp_v2.exit_calibration import scalp_v2_giveback_exit_enabled
 
-    assert scalp_v2_giveback_exit_enabled() is True
+    assert scalp_v2_giveback_exit_enabled() is False
 
 
 # ---------------------------------------------------------------------------

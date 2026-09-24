@@ -25,7 +25,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from backend.config.day_entry_execution import ENTRY_AUTHORITY_DAY_V2_CONFIRMED
 from backend.services.portfolio_engine import PortfolioEngine
+
+_AUTH = {"entry_authority": ENTRY_AUTHORITY_DAY_V2_CONFIRMED}
 
 
 @pytest.mark.asyncio
@@ -42,8 +45,8 @@ async def test_concurrent_buys_for_same_symbol_are_serialized_by_the_lock():
     engine._execute_buy_fifo_locked = _fake_impl
 
     await asyncio.gather(
-        engine.execute_buy_fifo("BTC/USDT", 1.0, 100.0, 95.0, 1.0, 0.7, 0, None, decision_id="d1"),
-        engine.execute_buy_fifo("BTC/USDT", 1.0, 100.0, 95.0, 1.0, 0.7, 0, None, decision_id="d2"),
+        engine.execute_buy_fifo("BTC/USDT", 1.0, 100.0, 95.0, 1.0, 0.7, 0, None, decision_id="d1", **_AUTH),
+        engine.execute_buy_fifo("BTC/USDT", 1.0, 100.0, 95.0, 1.0, 0.7, 0, None, decision_id="d2", **_AUTH),
     )
 
     # Serialized: the second call's start must not appear before the first's end.
@@ -68,8 +71,8 @@ async def test_different_symbols_are_not_serialized_against_each_other():
 
     await asyncio.wait_for(
         asyncio.gather(
-            engine.execute_buy_fifo("BTC/USDT", 1.0, 100.0, 95.0, 1.0, 0.7, 0, None),
-            engine.execute_buy_fifo("ETH/USDT", 1.0, 100.0, 95.0, 1.0, 0.7, 0, None),
+            engine.execute_buy_fifo("BTC/USDT", 1.0, 100.0, 95.0, 1.0, 0.7, 0, None, **_AUTH),
+            engine.execute_buy_fifo("ETH/USDT", 1.0, 100.0, 95.0, 1.0, 0.7, 0, None, **_AUTH),
         ),
         timeout=2.0,
     )
@@ -81,9 +84,9 @@ async def test_lock_is_reused_across_calls_for_the_same_symbol():
     engine = PortfolioEngine(principal=25_000.0, test_mode=True)
     engine._execute_buy_fifo_locked = AsyncMock(return_value=None)
 
-    await engine.execute_buy_fifo("XRP/USDT", 1.0, 1.0, 0.9, 0.01, 0.6, 0, None)
+    await engine.execute_buy_fifo("XRP/USDT", 1.0, 1.0, 0.9, 0.01, 0.6, 0, None, **_AUTH)
     lock1 = engine._buy_execution_locks.get("XRP/USDT")
-    await engine.execute_buy_fifo("XRP/USDT", 1.0, 1.0, 0.9, 0.01, 0.6, 0, None)
+    await engine.execute_buy_fifo("XRP/USDT", 1.0, 1.0, 0.9, 0.01, 0.6, 0, None, **_AUTH)
     lock2 = engine._buy_execution_locks.get("XRP/USDT")
 
     assert lock1 is not None

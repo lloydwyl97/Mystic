@@ -4464,11 +4464,16 @@ class PortfolioEngine:
                         with connect_rw(self.db_path) as conn:
                             conn.execute("BEGIN IMMEDIATE")
                             cur = conn.cursor()
+                            from backend.services.scalp_v2.accounting_repair import ensure_repair_schema
+
+                            ensure_repair_schema(conn)
+                            live_filter = "AND COALESCE(mode, '')='live' AND COALESCE(order_id, '')!='' " if self._live_execution_enabled else ""
                             cur.execute(
                                 "SELECT SUM(pnl) FROM paper_trades WHERE side='SELL' AND pnl IS NOT NULL "
                                 "AND COALESCE(exit_type, '') NOT IN "
                                 "('ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT') "
-                                "AND COALESCE(is_synthetic, 0) = 0"
+                                "AND COALESCE(is_synthetic, 0) = 0 "
+                                "AND COALESCE(counts_toward_realized, 1) = 1 " + live_filter
                             )
                             row = cur.fetchone()
                             total = float(row[0] or 0.0) if row and row[0] is not None else 0.0
@@ -8639,22 +8644,19 @@ class PortfolioEngine:
         atomic with respect to any other concurrent buy attempt for the same
         symbol, regardless of unrelated async scheduling/reload timing.
         """
-        from backend.config.day_entry_execution import (
-            ENTRY_AUTHORITY_SCALP_V2_LIVE,
-            ENTRY_AUTHORITY_TRAILING_BUY,
-            trailing_buy_mode_active,
-        )
+        from backend.config.day_entry_execution import TOP4_LIVE_BUY_AUTHORITIES
 
         _auth = str(entry_authority or "")
-        _scalp_v2_live_authority = _auth == ENTRY_AUTHORITY_SCALP_V2_LIVE
-        if trailing_buy_mode_active() and _auth != ENTRY_AUTHORITY_TRAILING_BUY and not _scalp_v2_live_authority:
+        if _to_api_symbol(symbol) in DAY_TRADE_SYMBOLS and _auth not in TOP4_LIVE_BUY_AUTHORITIES:
             logger.error(
-                "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH symbol=%s authority=%s — trailing-buy or SCALP_V2_LIVE_ENTRY required",
+                "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH symbol=%s authority=%s BUY_BLOCKED_UNCONFIRMED_AUTHORITY — DAY_V2_CONFIRMED or SCALP_V2_CONFIRMED required",
                 symbol,
                 _auth or "missing",
             )
-            self.last_buy_reject_reason = "BUY_BLOCKED_LEGACY_IMMEDIATE_PATH"
-            self._persist_buy_reject_hold(symbol, decision_id=decision_id, intent_id=trailing_buy_intent_id)
+            self.last_buy_reject_reason = "BUY_BLOCKED_UNCONFIRMED_AUTHORITY"
+            persist = getattr(self, "_persist_buy_reject_hold", None)
+            if persist is not None:
+                persist(symbol, decision_id=decision_id, intent_id=trailing_buy_intent_id)
             return None
         normalized_symbol_for_lock = normalize_symbol(symbol)
         # PE-3: Hard-gate — only DAY_TRADE_SYMBOLS may execute buys.
@@ -8697,20 +8699,27 @@ class PortfolioEngine:
         atr: float = 0.0,
         setup_name: str = "SCALP_STRUCTURAL",
         opportunity_id: str = "",
+        entry_authority: str = "",
     ) -> dict[str, Any] | None:
         """SCALP V2 dedicated live BUY path.
 
-        Does NOT share DAY's position-slot budget, 4H-slot block, sleeve,
-        artifact-attribution, trailing-buy, or regime gates.
-        Uses the same ``execute_protected_limit_live`` infrastructure as DAY V2.
-
-        Returns a result dict on fill, None on any rejection.
+        Requires entry_authority SCALP_V2_CONFIRMED. engine_id alone is not
+        enough. Shares the combined four-position cap with DAY V2.
         """
         import contextlib
         from datetime import datetime, timezone
 
-        from backend.config.day_entry_execution import ENTRY_AUTHORITY_SCALP_V2_LIVE
+        from backend.config.day_entry_execution import (
+            ENTRY_AUTHORITY_SCALP_V2_CONFIRMED,
+            ENTRY_AUTHORITY_SCALP_V2_LIVE,
+        )
         from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
+        from backend.services.two_engine_claim import COMBINED_POSITION_CAP, claim_symbol, release_claim
+
+        if str(entry_authority or "") not in {ENTRY_AUTHORITY_SCALP_V2_CONFIRMED, ENTRY_AUTHORITY_SCALP_V2_LIVE}:
+            logger.error("SCALP_V2_BUY_BLOCKED symbol=%s UNKNOWN_ENGINE authority=%s", symbol, entry_authority or "missing")
+            self.last_buy_reject_reason = "UNKNOWN_ENGINE"
+            return None
 
         norm = normalize_symbol(symbol)
 
@@ -8720,30 +8729,28 @@ class PortfolioEngine:
             logger.warning("SCALP_V2_BUY_BLOCKED symbol=%s KILL_SWITCH reason=%s", norm, kill_reason)
             return None
 
-        # 2. SCALP-specific slot budget (SCALP_MAX_OPEN_POSITIONS, default 4)
-        scalp_open = sum(
-            1
-            for pos in self.open_positions.values()
-            if str(getattr(pos, "engine_id", "") or "") == SCALP_V2_ENGINE_ID and float(getattr(pos, "quantity", 0) or 0) > 0 and str(getattr(pos, "status", "ACTIVE") or "ACTIVE") != "DUST_PENDING"
-        )
-        max_scalp = int(os.getenv("SCALP_MAX_OPEN_POSITIONS", "4"))
-        if scalp_open >= max_scalp:
+        # 2. Combined slot budget shared with DAY. Dust does not consume a slot.
+        # A separate SCALP cap stacked on DAY's cap would allow eight positions.
+        combined_cap = min(COMBINED_POSITION_CAP, int(os.getenv("MAX_OPEN_POSITIONS", str(COMBINED_POSITION_CAP)) or COMBINED_POSITION_CAP))
+        held = self._day_entry_held_count()
+        if held >= combined_cap:
             logger.info(
-                "SCALP_V2_BUY_BLOCKED symbol=%s SCALP_MAX_POSITIONS scalp_open=%d/%d",
+                "SCALP_V2_BUY_BLOCKED symbol=%s MAX_COMBINED_POSITIONS held=%d cap=%d",
                 norm,
-                scalp_open,
-                max_scalp,
+                held,
+                combined_cap,
             )
+            self.last_buy_reject_reason = "MAX_COMBINED_POSITIONS"
             return None
-
-        # 3. No duplicate SCALP position in same symbol
         existing = self.open_positions.get(norm)
         if existing is not None:
             ex_engine = str(getattr(existing, "engine_id", "") or "")
             ex_qty = float(getattr(existing, "quantity", 0) or 0)
             ex_status = str(getattr(existing, "status", "ACTIVE") or "ACTIVE")
-            if ex_engine == SCALP_V2_ENGINE_ID and ex_qty > 0 and ex_status != "DUST_PENDING":
-                logger.debug("SCALP_V2_BUY_BLOCKED symbol=%s SCALP_POSITION_ALREADY_OPEN", norm)
+            if ex_qty > 0 and ex_status != "DUST_PENDING":
+                reason = "SYMBOL_OCCUPIED" if ex_engine == SCALP_V2_ENGINE_ID else "SYMBOL_OCCUPIED_BY_OTHER_ENGINE"
+                logger.info("SCALP_V2_BUY_BLOCKED symbol=%s %s engine=%s", norm, reason, ex_engine)
+                self.last_buy_reject_reason = reason
                 return None
 
         # 4. Normalize quantity to exchange constraints
@@ -8755,7 +8762,6 @@ class PortfolioEngine:
 
         # 5. Live-capable check
         from backend.config.live_test_mode import can_place_live_orders_sync
-        from backend.services.execution_mode_service import is_live_execution_allowed_sync
         from backend.services.protected_limit_execution import execute_protected_limit_live, run_protected_preflight
 
         if not (self._live_execution_enabled and self._live_service and can_place_live_orders_sync()[0]):
@@ -8791,7 +8797,26 @@ class PortfolioEngine:
                     notional,
                     free_cash,
                 )
+                self.last_buy_reject_reason = "INSUFFICIENT_EXECUTABLE_CASH"
                 return None
+
+            decision_key = str(opportunity_id or f"scalp_{exchange_sym}_{self._now_ms()}")
+            claimed, claim_reason, reservation_id = claim_symbol(
+                self.db_path,
+                norm,
+                SCALP_V2_ENGINE_ID,
+                decision_key,
+                notional,
+                positions=self.open_positions,
+                max_positions=combined_cap,
+            )
+            if not claimed:
+                self.last_buy_reject_reason = claim_reason or "SYMBOL_OCCUPIED"
+                logger.info("SCALP_V2_BUY_BLOCKED symbol=%s %s", norm, self.last_buy_reject_reason)
+                return None
+            from backend.services.scalp_v2.opportunity import bind_reservation
+
+            bind_reservation(self.db_path, norm, opportunity_id, reservation_id)
 
             logger.warning(
                 "SCALP_V2_LIVE_BUY symbol=%s qty=%.8f limit=%.8f opp=%s",
@@ -8808,7 +8833,9 @@ class PortfolioEngine:
                 limit_price=preflight.protected_limit_price,
             )
             if not live_order:
+                release_claim(self.db_path, reservation_id=reservation_id, decision_id=decision_key, symbol=norm)
                 logger.error("SCALP_V2_BUY_FAILED symbol=%s NOT_FILLED", norm)
+                self.last_buy_reject_reason = "EXCHANGE_REJECTED"
                 return None
 
             live_order = live_order if isinstance(live_order, dict) else {}
@@ -8882,12 +8909,16 @@ class PortfolioEngine:
                     order_id,
                     exc_info=True,
                 )
+                release_claim(self.db_path, reservation_id=reservation_id, decision_id=decision_key, symbol=norm)
                 return None
 
             # Commit memory after DB success
             self.cash_balance = new_cash
             self._positions_value = new_pv
             self._total_equity = new_eq
+            from backend.services.day_entry_reservations import consume_reservation
+
+            consume_reservation(self.db_path, reservation_id=reservation_id, decision_id=decision_key, symbol=norm)
 
             logger.warning(
                 "SCALP_V2_ENTRY_FILLED symbol=%s qty=%.8f price=%.6f fee=%.6f order_id=%s opp=%s",
@@ -8906,7 +8937,7 @@ class PortfolioEngine:
                 "order_id": order_id,
                 "engine_id": SCALP_V2_ENGINE_ID,
                 "opportunity_id": opportunity_id,
-                "entry_authority": ENTRY_AUTHORITY_SCALP_V2_LIVE,
+                "entry_authority": entry_authority or ENTRY_AUTHORITY_SCALP_V2_CONFIRMED,
             }
 
     def _scalp_v2_commit_buy_sync(
@@ -14132,11 +14163,12 @@ class PortfolioEngine:
                 # No DAY V2 exit condition met — hold.
                 return None
             except Exception:
-                logger.warning(
-                    "DAY_V2_EXIT_EVAL_ERROR symbol=%s — falling through to legacy exits",
+                logger.error(
+                    "DAY_V2_EXIT_EVAL_ERROR symbol=%s — fail closed, legacy exits not used",
                     symbol,
                     exc_info=True,
                 )
+                return None
 
         # ── SCALP V2 exit dispatch ─────────────────────────────────────────────
         # Positions with engine_id='SCALP_V2' use the five SCALP V2 exit roles
@@ -14186,11 +14218,12 @@ class PortfolioEngine:
                 # allweather or legacy DAY exits.
                 return None
             except Exception:
-                logger.warning(
-                    "SCALP_V2_EXIT_EVAL_ERROR symbol=%s — falling through to legacy exits",
+                logger.error(
+                    "SCALP_V2_EXIT_EVAL_ERROR symbol=%s — fail closed, legacy exits not used",
                     symbol,
                     exc_info=True,
                 )
+                return None
 
         # All-weather bounded exit — ATR bracket only; never MIN_NET_PROFIT floor.
         try:

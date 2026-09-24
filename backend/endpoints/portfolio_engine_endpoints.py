@@ -747,6 +747,21 @@ async def get_portfolio_status() -> dict[str, Any]:
             }
             status["pnl_presentation"] = pnl_presentation
 
+        try:
+            from backend.database_schema import DATABASE_PATH
+            from backend.services.candle_contract import candle_contract_matrix
+
+            books = {}
+            integration = get_portfolio_integration()
+            for key, px in (getattr(integration, "current_prices", {}) or {}).items():
+                text = str(key).upper().replace("/", "").replace("-", "")
+                if text.endswith("USDT"):
+                    books[f"{text[:-4]}-USDT"] = {"price": px, "ts": time.time(), "source": "integration_price_cache"}
+            status["candle_contract"] = candle_contract_matrix(str(DATABASE_PATH), books=books)
+        except Exception as exc:
+            logger.warning("STATUS_CANDLE_CONTRACT_UNAVAILABLE: %s", exc)
+            status["candle_contract"] = {"error": str(exc)[:200]}
+
         # Ensure we show non-zero equity from adopted data
         return {
             "success": True,

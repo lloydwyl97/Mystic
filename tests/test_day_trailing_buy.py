@@ -537,7 +537,23 @@ async def test_execute_buy_fifo_blocks_legacy_when_trailing_mode(monkeypatch):
     )
     assert out is None
     engine._execute_buy_fifo_locked.assert_not_called()
+    from backend.config.day_entry_execution import ENTRY_AUTHORITY_DAY_V2_CONFIRMED
+
     out2 = await PortfolioEngine.execute_buy_fifo(
+        engine,
+        "BTC/USDT",
+        1.0,
+        100.0,
+        95.0,
+        1.0,
+        0.7,
+        0,
+        None,
+        decision_id="d1",
+        entry_authority=ENTRY_AUTHORITY_DAY_V2_CONFIRMED,
+    )
+    assert out2 == {"trade_id": "x"}
+    trailing = await PortfolioEngine.execute_buy_fifo(
         engine,
         "BTC/USDT",
         1.0,
@@ -550,7 +566,7 @@ async def test_execute_buy_fifo_blocks_legacy_when_trailing_mode(monkeypatch):
         decision_id="d1",
         entry_authority=ENTRY_AUTHORITY_TRAILING_BUY,
     )
-    assert out2 == {"trade_id": "x"}
+    assert trailing is None
 
 
 def test_entry_authority_constant():

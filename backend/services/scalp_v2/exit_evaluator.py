@@ -1,13 +1,13 @@
 """SCALP V2 dedicated exit evaluator.
 
-Distinct from DAY V2 and legacy exits. Uses the calibrated policy from
-exit_calibration.py: preserve_giveback_stall_and_hard_stop.
+Distinct from DAY V2 and legacy exits. Active policy:
+catastrophic_net_profit_time_stop.
 
 Exit ladder (priority order):
   1. Catastrophic stop  — intra-bar adverse move >= SCALP_V2_CATASTROPHIC_PCT
   2. Net profit take    — net P&L >= scalp_v2_min_net_profit_pct (default 0.4%)
-  3. Giveback           — reached MFE, then reversed to net-negative
-  4. Stall              — flat/dead hold with confirmed adverse drift
+  3. Giveback           — off unless SCALP_V2_GIVEBACK_EXIT_ENABLED=true
+  4. Stall              — off unless SCALP_V2_STALL_EXIT_ENABLED=true
   5. Time stop          — hold >= SCALP_V2_TIME_STOP_MIN (default 120 min) and
                           still net-negative
 

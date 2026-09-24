@@ -2,7 +2,11 @@
 
 The id is symbol + setup family + a price-zone anchor. The clock is not part
 of the id. Closing a position keeps the row. A new entry in the same zone is
-blocked until price leaves that zone, which marks the closed opportunity reset.
+blocked until that current row is no longer ARMED or OPEN.
+
+Expired ARMED rows become EXPIRED. They are never deleted and never updated
+back to ARMED. A later entry in the same zone inserts a new row and does not
+inherit tracked_low.
 """
 
 from __future__ import annotations
@@ -10,20 +14,28 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import math
+import os
 import sqlite3
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 SCALP_V2_ENGINE_ID = "SCALP_V2"
 LEGACY_EXIT_ONLY = "LEGACY_EXIT_ONLY"
 _ZONE = 1.005  # 0.5% price zone. Leaving it is the structural reset.
 
-# ARMED opportunities older than this are considered stale (price zone moved on
-# without a fill). Reset them so a fresh arm in the same zone is permitted.
-# Default: 3600 s (60 min). Override with SCALP_V2_OPP_EXPIRY_SEC env var.
-import os as _os
+# ARMED opportunities older than this are stale. The live cycle reaps them
+# even when no new arm is attempted. Default: 3600 s.
+SCALP_V2_OPP_EXPIRY_SEC: float = float(os.getenv("SCALP_V2_OPP_EXPIRY_SEC", "3600"))
 
-SCALP_V2_OPP_EXPIRY_SEC: float = float(_os.getenv("SCALP_V2_OPP_EXPIRY_SEC", "3600"))
+_CURRENT_BLOCKING = ("ARMED", "OPEN", "CLOSED")
+_EXTRA_COLUMNS = (
+    ("version", "INTEGER NOT NULL DEFAULT 1"),
+    ("reservation_id", "TEXT NOT NULL DEFAULT ''"),
+    ("reservation_released", "INTEGER NOT NULL DEFAULT 0"),
+    ("tracked_low", "REAL"),
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,6 +93,118 @@ def _ensure(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_scalp_v2_opp_symbol ON scalp_v2_opportunities(symbol, id)")
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(scalp_v2_opportunities)")}
+    for name, decl in _EXTRA_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE scalp_v2_opportunities ADD COLUMN {name} {decl}")
+
+
+def _release_once(
+    conn: sqlite3.Connection,
+    row_id: int,
+    reservation_id: str,
+    released: int,
+    symbol: str,
+    release_reservation: Callable[[str, str], None] | None,
+) -> None:
+    if int(released or 0) == 1:
+        return
+    rid = str(reservation_id or "")
+    if rid and release_reservation is not None:
+        release_reservation(rid, symbol)
+    conn.execute(
+        "UPDATE scalp_v2_opportunities SET reservation_released=1, updated_at=? WHERE id=? AND reservation_released=0",
+        (time.time(), row_id),
+    )
+
+
+def reap_expired_armed(
+    db_path: str | Path,
+    *,
+    now: float | None = None,
+    expiry_sec: float | None = None,
+    release_reservation: Callable[[str, str], None] | None = None,
+) -> dict[str, int]:
+    """Expire every stale ARMED row. OPEN and CLOSED are never touched.
+
+    Duplicate current ARMED rows for the same symbol and price-zone keep only
+    the newest. Reservations on terminal rows are released at most once.
+    """
+    moment = float(now if now is not None else time.time())
+    limit = float(SCALP_V2_OPP_EXPIRY_SEC if expiry_sec is None else expiry_sec)
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    expired = 0
+    collapsed = 0
+    try:
+        _ensure(conn)
+        rows = conn.execute(
+            """
+            SELECT id, symbol, opportunity_id, created_at,
+                   COALESCE(reservation_id, ''), COALESCE(reservation_released, 0), engine_id
+            FROM scalp_v2_opportunities
+            WHERE state='ARMED'
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        for row in rows:
+            age = moment - float(row[3] or 0.0)
+            if age <= limit:
+                continue
+            conn.execute(
+                "UPDATE scalp_v2_opportunities SET state='EXPIRED', updated_at=? WHERE id=? AND state='ARMED'",
+                (moment, row[0]),
+            )
+            _release_once(conn, int(row[0]), str(row[4]), int(row[5] or 0), str(row[1]), release_reservation)
+            expired += 1
+        current = conn.execute(
+            """
+            SELECT id, symbol, opportunity_id, engine_id, created_at,
+                   COALESCE(reservation_id, ''), COALESCE(reservation_released, 0)
+            FROM scalp_v2_opportunities
+            WHERE state='ARMED'
+            ORDER BY created_at ASC, id ASC
+            """
+        ).fetchall()
+        grouped: dict[tuple[str, str, str], list[tuple]] = {}
+        for row in current:
+            grouped.setdefault((str(row[1]), str(row[2]), str(row[3])), []).append(row)
+        for group in grouped.values():
+            if len(group) <= 1:
+                continue
+            for stale in group[:-1]:
+                conn.execute(
+                    "UPDATE scalp_v2_opportunities SET state='EXPIRED', updated_at=? WHERE id=? AND state='ARMED'",
+                    (moment, stale[0]),
+                )
+                _release_once(conn, int(stale[0]), str(stale[5]), int(stale[6] or 0), str(stale[1]), release_reservation)
+                collapsed += 1
+        conn.commit()
+        return {"expired": expired, "collapsed_duplicates": collapsed}
+    finally:
+        conn.close()
+
+
+def bind_reservation(db_path: str | Path, symbol: str, opportunity_id: str, reservation_id: str) -> None:
+    if not opportunity_id or not reservation_id:
+        return
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        _ensure(conn)
+        conn.execute(
+            """
+            UPDATE scalp_v2_opportunities
+            SET reservation_id=?, reservation_released=0, updated_at=?
+            WHERE id=(
+                SELECT id FROM scalp_v2_opportunities
+                WHERE symbol=? AND opportunity_id=? AND state='ARMED'
+                ORDER BY id DESC LIMIT 1
+            )
+            """,
+            (str(reservation_id), time.time(), _sym(symbol), str(opportunity_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def arm_opportunity(
@@ -92,15 +216,8 @@ def arm_opportunity(
 ) -> tuple[str, bool]:
     """Return (opportunity_id, blocked).
 
-    Blocked means this arm is the same price zone as an opportunity in the
-    SAME ENGINE that has not been structurally reset.  A different price zone
-    resets closed rows.
-
-    Deduplication is ENGINE-SCOPED: a DAY_V2 opportunity does not block a
-    SCALP_V2 arm for the same symbol (and vice versa).  Cross-engine symbol
-    exclusivity is enforced separately by position ownership (the first engine
-    to fill a lot owns that symbol; the second engine's submit is blocked by
-    _can_open_position / execute_buy_fifo before the order is placed).
+    A fresh ARMED, OPEN, or CLOSED row in the same engine and price zone blocks.
+    An EXPIRED or RESET row does not block and is not resurrected.
     """
     opp = ScalpOpportunityId.from_intent(_sym(symbol), setup, "", arm_price=arm_price)
     sym = _sym(symbol)
@@ -109,29 +226,31 @@ def arm_opportunity(
     conn = sqlite3.connect(str(db_path), timeout=30)
     try:
         _ensure(conn)
-        # Engine-scoped deduplication: only look at rows for this engine.
         row = conn.execute(
             """
-            SELECT id, opportunity_id, state, created_at FROM scalp_v2_opportunities
-            WHERE symbol=? AND engine_id=? ORDER BY id DESC LIMIT 1
+            SELECT id, opportunity_id, state, created_at,
+                   COALESCE(reservation_id, ''), COALESCE(reservation_released, 0)
+            FROM scalp_v2_opportunities
+            WHERE symbol=? AND engine_id=? AND state IN ('ARMED', 'OPEN', 'CLOSED')
+            ORDER BY id DESC LIMIT 1
             """,
             (sym, eid),
         ).fetchone()
-        if row and row[1] == opp.canonical_id and row[2] in ("ARMED", "OPEN", "CLOSED"):
-            # Time-based expiry: ARMED rows that never progressed to OPEN/CLOSED after
-            # SCALP_V2_OPP_EXPIRY_SEC seconds are stale. Reset them so a fresh arm is
-            # permitted. OPEN and CLOSED rows are still guarded (position is live or
-            # was live in this move).
+        if row and row[1] == opp.canonical_id and row[2] in _CURRENT_BLOCKING:
             if row[2] == "ARMED" and (now - float(row[3] or 0.0)) > SCALP_V2_OPP_EXPIRY_SEC:
                 conn.execute(
-                    "UPDATE scalp_v2_opportunities SET state='RESET', updated_at=? WHERE id=?",
+                    "UPDATE scalp_v2_opportunities SET state='EXPIRED', updated_at=? WHERE id=? AND state='ARMED'",
                     (now, row[0]),
                 )
-                # Fall through — create a fresh ARMED row for this opportunity.
+                if str(row[4] or "") and int(row[5] or 0) == 0:
+                    conn.execute(
+                        "UPDATE scalp_v2_opportunities SET reservation_released=1 WHERE id=? AND reservation_released=0",
+                        (row[0],),
+                    )
             else:
                 conn.commit()
                 return opp.canonical_id, True
-        if row and row[1] != opp.canonical_id:
+        if row and row[1] != opp.canonical_id and row[2] == "CLOSED":
             conn.execute(
                 """
                 UPDATE scalp_v2_opportunities
@@ -140,31 +259,35 @@ def arm_opportunity(
                 """,
                 (now, sym, eid),
             )
-        existing = conn.execute(
+        current = conn.execute(
             """
-            SELECT id, state FROM scalp_v2_opportunities
-            WHERE symbol=? AND opportunity_id=? AND engine_id=? ORDER BY id DESC LIMIT 1
+            SELECT id FROM scalp_v2_opportunities
+            WHERE symbol=? AND opportunity_id=? AND engine_id=? AND state IN ('ARMED', 'OPEN', 'CLOSED')
+            ORDER BY id DESC LIMIT 1
             """,
             (sym, opp.canonical_id, eid),
         ).fetchone()
-        if existing and existing[1] == "RESET":
-            conn.execute(
-                "UPDATE scalp_v2_opportunities SET state='ARMED', updated_at=? WHERE id=?",
-                (now, existing[0]),
-            )
-        elif not existing or existing[1] not in ("ARMED", "OPEN", "CLOSED"):
-            conn.execute(
-                """
-                INSERT INTO scalp_v2_opportunities(
-                    symbol, opportunity_id, setup_family, structural_anchor,
-                    state, engine_id, created_at, updated_at
-                ) VALUES (?,?,?,?, 'ARMED', ?, ?, ?)
-                """,
-                (sym, opp.canonical_id, opp.setup_family, opp.structural_anchor, eid, now, now),
-            )
-        else:
+        if current:
             conn.commit()
             return opp.canonical_id, True
+        version_row = conn.execute(
+            """
+            SELECT COALESCE(MAX(version), 0) FROM scalp_v2_opportunities
+            WHERE symbol=? AND opportunity_id=? AND engine_id=?
+            """,
+            (sym, opp.canonical_id, eid),
+        ).fetchone()
+        version = int(version_row[0] or 0) + 1
+        conn.execute(
+            """
+            INSERT INTO scalp_v2_opportunities(
+                symbol, opportunity_id, setup_family, structural_anchor,
+                state, engine_id, created_at, updated_at, version,
+                reservation_id, reservation_released, tracked_low
+            ) VALUES (?,?,?,?, 'ARMED', ?, ?, ?, ?, '', 0, NULL)
+            """,
+            (sym, opp.canonical_id, opp.setup_family, opp.structural_anchor, eid, now, now, version),
+        )
         conn.commit()
         return opp.canonical_id, False
     finally:
@@ -179,7 +302,11 @@ def mark_opportunity_on(conn: sqlite3.Connection, symbol: str, opportunity_id: s
         """
         UPDATE scalp_v2_opportunities
         SET state=?, updated_at=?
-        WHERE symbol=? AND opportunity_id=? AND state!='RESET'
+        WHERE id=(
+            SELECT id FROM scalp_v2_opportunities
+            WHERE symbol=? AND opportunity_id=? AND state NOT IN ('RESET', 'EXPIRED')
+            ORDER BY id DESC LIMIT 1
+        )
         """,
         (state, time.time(), _sym(symbol), opportunity_id),
     )
@@ -194,3 +321,59 @@ def mark_opportunity(db_path: str | Path, symbol: str, opportunity_id: str, stat
         conn.commit()
     finally:
         conn.close()
+
+
+def opportunity_inventory(db_path: str | Path, *, now: float | None = None) -> dict[str, Any]:
+    """Current working state. Stale ARMED rows are reported as expired, not current."""
+    moment = float(now if now is not None else time.time())
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        _ensure(conn)
+        rows = conn.execute(
+            """
+            SELECT symbol, state, created_at, opportunity_id,
+                   COALESCE(reservation_id, ''), COALESCE(reservation_released, 0),
+                   structural_anchor
+            FROM scalp_v2_opportunities
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    armed_current = 0
+    armed_expired = 0
+    counts = {"RESET": 0, "OPEN": 0, "CLOSED": 0, "EXPIRED": 0}
+    by_symbol: dict[str, dict[str, int]] = {}
+    oldest_active_age = None
+    reservations: list[dict[str, Any]] = []
+    for sym, state, created, opp_id, rid, released, anchor in rows:
+        bucket = by_symbol.setdefault(str(sym), {"ARMED": 0, "EXPIRED": 0, "OPEN": 0, "CLOSED": 0, "RESET": 0})
+        age = moment - float(created or 0.0)
+        if state == "ARMED" and age > SCALP_V2_OPP_EXPIRY_SEC:
+            armed_expired += 1
+            bucket["EXPIRED"] += 1
+        elif state == "ARMED":
+            armed_current += 1
+            bucket["ARMED"] += 1
+            oldest_active_age = age if oldest_active_age is None else max(oldest_active_age, age)
+            if rid and int(released or 0) == 0:
+                reservations.append({"symbol": sym, "opportunity_id": opp_id, "reservation_id": rid, "anchor": anchor})
+        else:
+            counts[state] = counts.get(state, 0) + 1
+            key = "EXPIRED" if state == "EXPIRED" else state
+            if key in bucket:
+                bucket[key] += 1
+            if state == "OPEN":
+                oldest_active_age = age if oldest_active_age is None else max(oldest_active_age, age)
+                if rid and int(released or 0) == 0:
+                    reservations.append({"symbol": sym, "opportunity_id": opp_id, "reservation_id": rid, "anchor": anchor})
+    return {
+        "armed_current": armed_current,
+        "armed_expired": armed_expired,
+        "reset": counts.get("RESET", 0),
+        "open": counts.get("OPEN", 0),
+        "closed": counts.get("CLOSED", 0),
+        "expired": counts.get("EXPIRED", 0) + armed_expired,
+        "by_symbol": by_symbol,
+        "oldest_active_age_sec": oldest_active_age,
+        "active_reservations": reservations,
+    }

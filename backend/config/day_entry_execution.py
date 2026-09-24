@@ -11,6 +11,15 @@ ENTRY_AUTHORITY_TRAILING_BUY: Final[str] = "DAY_TRAILING_BUY_CONFIRMED"
 # They route directly through execute_buy_fifo with immediate execution
 # (no resting intent needed — SCALP entry is fill-or-reject, not trail).
 ENTRY_AUTHORITY_SCALP_V2_LIVE: Final[str] = "SCALP_V2_LIVE_ENTRY"
+ENTRY_AUTHORITY_SCALP_V2_CONFIRMED: Final[str] = "SCALP_V2_CONFIRMED"
+ENTRY_AUTHORITY_DAY_V2_CONFIRMED: Final[str] = "DAY_V2_CONFIRMED"
+TOP4_LIVE_BUY_AUTHORITIES: Final[frozenset[str]] = frozenset(
+    {
+        ENTRY_AUTHORITY_SCALP_V2_CONFIRMED,
+        ENTRY_AUTHORITY_DAY_V2_CONFIRMED,
+        ENTRY_AUTHORITY_SCALP_V2_LIVE,
+    }
+)
 VALID_ENTRY_MODES: Final[frozenset[str]] = frozenset({TRAILING_BUY_MODE})
 MODE_ENV: Final[str] = "DAY_ENTRY_EXECUTION_MODE"
 MAX_WAIT_ENV: Final[str] = "DAY_TRAILING_BUY_MAX_WAIT_SECONDS"
@@ -68,10 +77,13 @@ __all__ = [
     "BOOK_STALE_SEC",
     "DEFAULT_BOOK_STALE_SEC",
     "DEFAULT_MAX_WAIT_SECONDS",
+    "ENTRY_AUTHORITY_DAY_V2_CONFIRMED",
+    "ENTRY_AUTHORITY_SCALP_V2_CONFIRMED",
     "ENTRY_AUTHORITY_SCALP_V2_LIVE",
     "ENTRY_AUTHORITY_TRAILING_BUY",
     "MAX_WAIT_ENV",
     "MODE_ENV",
+    "TOP4_LIVE_BUY_AUTHORITIES",
     "TRAILING_BUY_MODE",
     "VALID_ENTRY_MODES",
     "is_trailing_buy_confirmed",

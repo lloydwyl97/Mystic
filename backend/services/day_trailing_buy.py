@@ -11,6 +11,7 @@ from typing import Any
 
 from backend.config.day_entry_execution import (
     BOOK_STALE_SEC,
+    ENTRY_AUTHORITY_DAY_V2_CONFIRMED,
     ENTRY_AUTHORITY_TRAILING_BUY,
     trailing_buy_max_wait_seconds,
     trailing_buy_mode_active,
@@ -879,8 +880,14 @@ async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> di
                 release_submitting_for_retry(str(engine.db_path), str(intent["intent_id"]))
                 return None
     except Exception:
-        logger.debug("DAY_V2_5M_GATE_ERROR intent=%s", intent.get("intent_id"), exc_info=True)
-        # Fail-open: proceed to submit even if gate errors
+        logger.warning("DAY_V2_5M_GATE_ERROR intent=%s — fail closed", intent.get("intent_id"), exc_info=True)
+        release_submitting_for_retry(str(engine.db_path), str(intent["intent_id"]))
+        return None
+
+    if str(intent.get("engine_id") or "") != "DAY_V2":
+        logger.error("LEGACY_TRAILING_BUY_FAIL_CLOSED symbol=%s engine=%s", symbol, intent.get("engine_id"))
+        mark_terminal(engine.db_path, str(intent["intent_id"]), CANCELED, reason="LEGACY_TRAILING_BUY_FAIL_CLOSED", current_ask=ask)
+        return None
 
     payload = dict(intent.get("payload") or {})
     explainability = _rebuild_explainability(payload, symbol)
@@ -904,7 +911,7 @@ async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> di
         explainability=explainability,
         decision_id=str(intent.get("decision_id") or ""),
         sleeve=str(intent.get("sleeve") or ""),
-        entry_authority=ENTRY_AUTHORITY,
+        entry_authority=ENTRY_AUTHORITY_DAY_V2_CONFIRMED,
         client_order_id=str(intent.get("client_order_id") or ""),
         trailing_buy_intent_id=str(intent.get("intent_id") or ""),
     )

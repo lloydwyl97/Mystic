@@ -42,9 +42,11 @@ DEFAULT_1M_LOOKBACK_MINUTES = int(os.getenv("SCALP_1M_BARS_LOOKBACK_MINUTES", "1
 _BARS_CACHE_KEY_PREFIX = "scalp:bars_cache:"
 _BARS_CACHE_TTL_SEC: dict[str, float] = {
     "1m": float(os.getenv("SCALP_BARS_CACHE_TTL_1M_SEC", "20")),
+    "3m": float(os.getenv("SCALP_BARS_CACHE_TTL_3M_SEC", "30")),
     "5m": float(os.getenv("SCALP_BARS_CACHE_TTL_5M_SEC", "45")),
     "15m": float(os.getenv("SCALP_BARS_CACHE_TTL_15M_SEC", "45")),
     "1h": float(os.getenv("SCALP_BARS_CACHE_TTL_1H_SEC", "300")),
+    "4h": float(os.getenv("SCALP_BARS_CACHE_TTL_4H_SEC", "300")),
 }
 
 
@@ -89,7 +91,7 @@ def _write_bars_cache(symbol: str, interval: str, minutes: int, bars: list[dict]
         pass
 
 
-_INTERVAL_SEC = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+_INTERVAL_SEC = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
 
 
 def closed_bars_only(bars: list[dict], *, interval_sec: int = 60) -> list[dict]:
@@ -197,11 +199,17 @@ class KlineCache:
     def get(self, symbol: str, *, minutes: int = DEFAULT_1M_LOOKBACK_MINUTES) -> list[dict]:
         return self._get_interval(symbol, "1m", minutes=minutes)
 
+    def get_3m(self, symbol: str, *, minutes: int = 180) -> list[dict]:
+        return self._get_interval(symbol, "3m", minutes=minutes)
+
     def get_5m(self, symbol: str, *, minutes: int = 240) -> list[dict]:
         return self._get_interval(symbol, "5m", minutes=minutes)
 
     def get_15m(self, symbol: str, *, minutes: int = 720) -> list[dict]:
         return self._get_interval(symbol, "15m", minutes=minutes)
+
+    def get_4h(self, symbol: str, *, minutes: int = 60 * 24 * 14) -> list[dict]:
+        return self._get_interval(symbol, "4h", minutes=minutes, ttl_sec=self._ttl_1h)
 
     def get_1h(self, symbol: str, *, minutes: int = DEFAULT_1H_LOOKBACK_MINUTES) -> list[dict]:
         return self._get_interval(symbol, "1h", minutes=minutes, ttl_sec=self._ttl_1h)

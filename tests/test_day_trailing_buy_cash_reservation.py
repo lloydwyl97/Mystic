@@ -368,6 +368,7 @@ async def test_eth_trigger_reaches_execute_buy_fifo(tmp_path):
 
     engine = _Eng()
     engine._trading_paused = False
+    intent["engine_id"] = "DAY_V2"
     out = await _submit_claimed(engine, intent, float(ETH_SUBMIT_ASK))
     assert out is not None
     assert called["symbol"] == "ETH/USDT"
@@ -424,6 +425,7 @@ async def test_xrp_trigger_reaches_execute_and_terminal_cash_does_not_retry(tmp_
         async def execute_buy_fifo(self, **kwargs):
             calls.append(kwargs)
 
+    intent["engine_id"] = "DAY_V2"
     out = await _submit_claimed(_Eng(), intent, float(XRP_SUBMIT_ASK))
     assert out is None
     assert len(calls) == 1
@@ -479,6 +481,7 @@ async def test_transient_failure_remains_retryable(tmp_path):
         async def execute_buy_fifo(self, **kwargs):
             return None
 
+    intent["engine_id"] = "DAY_V2"
     await _submit_claimed(_Eng(), intent, 99.0)
     again = load_intent(db, row["intent_id"])
     assert again["status"] == TRAIL_LOW
@@ -534,6 +537,7 @@ async def test_reservation_converts_once_and_terminal_releases_once(tmp_path):
             return {"order_id": "9", "price": 100.0, "trade_id": "ok"}
 
     engine = _Eng()
+    intent["engine_id"] = "DAY_V2"
     await _submit_claimed(engine, intent, 99.9)
     assert len(releases) == 0
     assert "SOL/USDT" not in engine._entry_reservations

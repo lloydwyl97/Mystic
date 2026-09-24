@@ -1538,6 +1538,51 @@ class PortfolioEngineIntegration:
                 logger.exception(f"Error in bar processor: {e}")
                 await asyncio.sleep(5)
 
+    async def _resolve_day_executable_price(self, symbol: str) -> tuple[float, float | None]:
+        """Return (ask, age_sec). Never substitutes zero for a missing book."""
+        norm = symbol.upper().replace("-", "").replace("/", "")
+        ccxt = f"{norm[:-4]}/USDT" if norm.endswith("USDT") else symbol
+        keys = (norm, symbol, ccxt, norm.replace("USDT", ""))
+        for key in keys:
+            px = float(self.current_prices.get(key) or 0.0)
+            if px > 0:
+                return px, 0.0
+        if self.redis_client is not None:
+            try:
+                raw = await self.redis_client.hget(f"price:{norm}", "v")
+                ts_raw = await self.redis_client.hget(f"price:{norm}", "timestamp")
+                if isinstance(raw, bytes):
+                    raw = raw.decode()
+                if isinstance(ts_raw, bytes):
+                    ts_raw = ts_raw.decode()
+                px = float(raw or 0.0)
+                age = None
+                if ts_raw:
+                    age = max(0.0, time.time() - float(ts_raw))
+                if px > 0:
+                    self.current_prices[norm] = px
+                    return px, age
+            except Exception:
+                logger.debug("DAY_V2_PRICE_REDIS_MISS symbol=%s", symbol, exc_info=True)
+        from backend.services.canonical_mark_price import fetch_canonical_mark
+
+        for attempt in (1, 2):
+            try:
+                mark = await fetch_canonical_mark(ccxt, use_cache=False)
+            except Exception:
+                mark = None
+            ask = float(getattr(mark, "ask", 0) or 0) if mark is not None else 0.0
+            if ask <= 0 and mark is not None:
+                ask = float(getattr(mark, "mark", 0) or 0)
+            if ask > 0:
+                stamped = float(getattr(mark, "timestamp", 0) or time.time())
+                self.current_prices[norm] = ask
+                self.current_prices[ccxt] = ask
+                return ask, max(0.0, time.time() - stamped)
+            if attempt == 1:
+                await asyncio.sleep(0.35)
+        return 0.0, None
+
     async def _process_day_v2_signals(self, entry_bar: int) -> None:
         """Evaluate DAY V2 entry signals on the just-closed 15m bar.
 
@@ -1597,31 +1642,74 @@ class PortfolioEngineIntegration:
                     else:
                         db_sym_15m = symbol
 
-                    def _load_bars_sync(db: str, sym: str, interval: str, limit: int) -> list[dict]:
-                        try:
-                            with _sqlite3.connect(db) as con:
-                                rows = con.execute(
-                                    "SELECT ts, open, high, low, close, volume FROM feature_ohlcv WHERE symbol=? AND interval=? ORDER BY ts DESC LIMIT ?",
-                                    (sym, interval, limit),
-                                ).fetchall()
-                            # Reverse so oldest-first
-                            return [{"ts": r[0], "open": float(r[1]), "high": float(r[2]), "low": float(r[3]), "close": float(r[4]), "volume": float(r[5])} for r in reversed(rows)]
-                        except Exception:
-                            return []
-
                     import asyncio as _asyncio
 
-                    bars_15m = await _asyncio.to_thread(_load_bars_sync, db_path, db_sym_15m, "15m", 60)
-                    if len(bars_15m) < 32:
-                        logger.info("DAY_V2_SKIP_INSUFFICIENT_BARS symbol=%s bars_15m=%d", symbol, len(bars_15m))
+                    from backend.services.candle_contract import load_closed_bars
+                    from backend.services.day_v2.cycle_gate import cycle_decision
+                    from backend.services.day_v2.decision_log import record_day_decision
+                    from backend.services.day_v2.live_signal import explain_no_signal
+
+                    as_of = float(entry_bar or time.time())
+                    seen = getattr(self, "_day_v2_evaluated", None)
+                    if seen is None:
+                        self._day_v2_evaluated = set()
+                        seen = self._day_v2_evaluated
+
+                    def _load(interval: str, limit: int, sym: str = db_sym_15m, moment: float = as_of) -> list[dict]:
+                        return load_closed_bars(db_path, sym, interval, limit, as_of=moment)
+
+                    bars_15m = await _asyncio.to_thread(_load, "15m", 60)
+                    ask_price, book_age = await self._resolve_day_executable_price(symbol)
+                    gate = cycle_decision(
+                        completed_bar_count=len(bars_15m),
+                        minimum_bars=32,
+                        executable_price=ask_price,
+                        book_age_sec=book_age,
+                        book_stale_sec=30.0,
+                        already_evaluated=(symbol, int(as_of)) in seen,
+                        retried=False,
+                    )
+                    if gate["action"] == "retry":
+                        await asyncio.sleep(0.4)
+                        bars_15m = await _asyncio.to_thread(_load, "15m", 60)
+                        ask_price, book_age = await self._resolve_day_executable_price(symbol)
+                        gate = cycle_decision(
+                            completed_bar_count=len(bars_15m),
+                            minimum_bars=32,
+                            executable_price=ask_price,
+                            book_age_sec=book_age,
+                            book_stale_sec=30.0,
+                            already_evaluated=(symbol, int(as_of)) in seen,
+                            retried=True,
+                        )
+                    seen.add((symbol, int(as_of)))
+                    if gate["action"] != "proceed":
+                        record_day_decision(db_path, symbol, gate["reason"], cycle_ts=as_of, closest="missing_stale_data", unmet=[gate["reason"]])
+                        logger.warning("DAY_V2_HARD_DATA_REJECT symbol=%s reason=%s", symbol, gate["reason"])
                         continue
 
-                    bars_1h = await _asyncio.to_thread(_load_bars_sync, db_path, db_sym_15m, "1h", 20)
-                    bars_4h = await _asyncio.to_thread(_load_bars_sync, db_path, db_sym_15m, "4h", 15)
+                    bars_1h = await _asyncio.to_thread(_load, "1h", 20)
+                    bars_4h = await _asyncio.to_thread(_load, "4h", 15)
 
                     signal = evaluate_entry_signal(symbol, bars_15m, bars_1h, bars_4h)
                     if signal is None:
-                        logger.info("DAY_V2_NO_SIGNAL symbol=%s", symbol)
+                        explained = explain_no_signal(symbol, bars_15m, bars_1h, bars_4h)
+                        record_day_decision(
+                            db_path,
+                            symbol,
+                            "NO_SIGNAL",
+                            cycle_ts=as_of,
+                            closest=str(explained.get("closest") or "no_setup"),
+                            unmet=list(explained.get("unmet") or []),
+                        )
+                        logger.info(
+                            "DAY_V2_NO_SIGNAL symbol=%s closest=%s unmet=%s regime=%s rsi=%s",
+                            symbol,
+                            explained.get("closest"),
+                            ",".join(explained.get("unmet") or []),
+                            explained.get("regime"),
+                            explained.get("rsi"),
+                        )
                         continue
 
                     # --- DAY_STRUCTURAL_PULLBACK_V1 gates (in order) ---
@@ -1679,10 +1767,10 @@ class PortfolioEngineIntegration:
 
                     # --- End DAY_STRUCTURAL_PULLBACK_V1 gates ---
 
-                    # Check slot availability and cash
-                    ask_price = float(self.current_prices.get(norm) or self.current_prices.get(symbol) or 0.0)
+                    # Executable price was resolved before the signal. Do not substitute zero.
                     if ask_price <= 0:
-                        logger.warning("DAY_V2_NO_PRICE symbol=%s", symbol)
+                        record_day_decision(db_path, symbol, "MISSING_EXECUTABLE_PRICE", cycle_ts=as_of, closest="missing_stale_data")
+                        logger.warning("DAY_V2_HARD_DATA_REJECT symbol=%s reason=MISSING_EXECUTABLE_PRICE", symbol)
                         continue
 
                     # Compute position size via the engine's existing sizing logic
@@ -1703,6 +1791,21 @@ class PortfolioEngineIntegration:
                         logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s", symbol, gate_reason)
                         continue
 
+                    from backend.services.two_engine_claim import claim_symbol, release_claim
+
+                    claimed, claim_reason, reservation_id = claim_symbol(
+                        db_path,
+                        norm,
+                        "DAY_V2",
+                        str(signal.opportunity_id),
+                        float(notional),
+                        positions=self.engine.open_positions,
+                    )
+                    if not claimed:
+                        record_day_decision(db_path, symbol, claim_reason, cycle_ts=as_of, closest=signal.setup)
+                        logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s", symbol, claim_reason)
+                        continue
+
                     intent = create_day_v2_intent(
                         db_path,
                         signal,
@@ -1713,6 +1816,7 @@ class PortfolioEngineIntegration:
                         db_symbol=db_sym_15m,
                     )
                     if intent:
+                        record_day_decision(db_path, symbol, "ARMED", cycle_ts=as_of, closest=signal.setup)
                         logger.warning(
                             "DAY_V2_SIGNAL symbol=%s setup=%s opp=%s anchor=%.6f target=%.6f zone=[%.6f,%.6f] reclaim=%.6f policy=%s",
                             symbol,
@@ -1725,6 +1829,9 @@ class PortfolioEngineIntegration:
                             _reclaim_level,
                             "DAY_STRUCTURAL_PULLBACK_V1",
                         )
+                    else:
+                        release_claim(db_path, reservation_id=reservation_id, decision_id=str(signal.opportunity_id), symbol=norm)
+                        record_day_decision(db_path, symbol, "INTENT_NOT_CREATED", cycle_ts=as_of, closest=signal.setup)
 
                 except Exception:
                     logger.warning("DAY_V2_SIGNAL_ERROR symbol=%s", symbol, exc_info=True)
@@ -1789,7 +1896,6 @@ class PortfolioEngineIntegration:
 
         try:
             from backend.services.binance_scalp.scalp_signal_engine import get_router
-            from backend.services.scalp_v2.opportunity import arm_opportunity
 
             router = get_router()
             if router is None:
@@ -1801,25 +1907,33 @@ class PortfolioEngineIntegration:
             logger.warning("SCALP_V2_ROUTER_ERROR", exc_info=True)
             return
 
-        from backend.services.day_v2.engine_identity import DAY_V2_ENGINE_ID
+        from backend.config.day_entry_execution import ENTRY_AUTHORITY_SCALP_V2_CONFIRMED
+        from backend.services.scalp_v2.decision_log import classify_scalp_candidate, record_scalp_decision
+        from backend.services.scalp_v2.opportunity import arm_opportunity, reap_expired_armed
 
         SCALP_V2_ENGINE = "SCALP_V2"
+        cycle_ts = time.time()
 
-        for row in candidates:
-            if not row.get("entry_eligible"):
-                continue
+        def _release(reservation_id: str, symbol: str) -> None:
+            from backend.services.two_engine_claim import release_claim
 
-            sym_raw = str(row.get("symbol") or "")
-            if not sym_raw:
-                continue
+            release_claim(self.engine.db_path, reservation_id=reservation_id, symbol=symbol)
 
-            # Normalise to API symbol format (BTC/USDT)
+        reap_expired_armed(self.engine.db_path, now=cycle_ts, release_reservation=_release)
+        by_symbol = {str(row.get("symbol") or "").upper().replace("-", "").replace("/", ""): row for row in candidates}
+        products = [str(s) for s in getattr(cfg, "products", [])] or list(by_symbol)
+        for sym_raw in products:
+            norm_key = sym_raw.upper().replace("-", "").replace("/", "")
+            row = by_symbol.get(norm_key)
             norm = sym_raw.upper().replace("-", "/")
             if "/" not in norm and norm.endswith("USDT"):
                 norm = norm[:-4] + "/USDT"
-
+            result_code, reason = classify_scalp_candidate(row)
             try:
-                # ── Cross-engine ownership guard ────────────────────────────
+                if result_code != "ARMED":
+                    record_scalp_decision(self.engine.db_path, norm, result_code, reason, cycle_ts=cycle_ts)
+                    logger.info("SCALP_V2_DECISION symbol=%s result=%s reason=%s", norm, result_code, reason)
+                    continue
                 open_positions = self.engine.open_positions or {}
                 existing_pos = open_positions.get(norm)
                 if existing_pos is not None:
@@ -1827,36 +1941,33 @@ class PortfolioEngineIntegration:
                     pos_qty = float(getattr(existing_pos, "quantity", 0) or 0)
                     pos_engine = str(getattr(existing_pos, "engine_id", "") or "")
                     if pos_qty > 0 and pos_status != "DUST_PENDING":
-                        if pos_engine != SCALP_V2_ENGINE:
-                            logger.info(
-                                "SCALP_V2_ENTRY_BLOCKED symbol=%s SYMBOL_OWNED_BY_OTHER_ENGINE engine=%s",
-                                norm,
-                                pos_engine,
-                            )
-                            continue
-                        # Same engine — already have a SCALP position; skip.
-                        logger.debug("SCALP_V2_ENTRY_BLOCKED symbol=%s SCALP_POSITION_ALREADY_OPEN", norm)
+                        occupied = "SYMBOL_OCCUPIED" if pos_engine == SCALP_V2_ENGINE else "SYMBOL_OCCUPIED_BY_OTHER_ENGINE"
+                        record_scalp_decision(self.engine.db_path, norm, f"REJECTED:{occupied}", occupied, cycle_ts=cycle_ts)
+                        logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:%s", norm, occupied)
                         continue
-
-                # ── Opportunity deduplication (engine-scoped) ───────────────
-                arm_price = float(row.get("rank_score") or 0)  # use snap for real price
-                snap = row.get("snap")
+                arm_price = 0.0
+                snap = (row or {}).get("snap")
                 if snap is not None:
                     arm_price = float(getattr(snap, "best_ask", 0) or getattr(snap, "mid_price", 0) or 0)
                 if arm_price <= 0:
                     arm_price = float(self.current_prices.get(norm) or self.current_prices.get(sym_raw) or 0)
                 if arm_price <= 0:
-                    logger.warning("SCALP_V2_NO_PRICE symbol=%s", norm)
+                    record_scalp_decision(self.engine.db_path, norm, "REJECTED:BOOK_STALE", "BOOK_STALE", cycle_ts=cycle_ts)
+                    logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:BOOK_STALE", norm)
                     continue
-
-                setup_name = str(row.get("best_setup") or "SCALP_STRUCTURAL")
+                setup_name = str((row or {}).get("best_setup") or "SCALP_STRUCTURAL")
                 opp_id, blocked = arm_opportunity(self.engine.db_path, norm, setup_name, arm_price, engine_id=SCALP_V2_ENGINE)
                 if blocked:
-                    logger.debug("SCALP_V2_ENTRY_BLOCKED symbol=%s SAME_MOVE_OPPORTUNITY opp=%s", norm, opp_id)
+                    record_scalp_decision(
+                        self.engine.db_path,
+                        norm,
+                        "REJECTED:PRICE_ZONE_ALREADY_ACTIVE",
+                        "PRICE_ZONE_ALREADY_ACTIVE",
+                        cycle_ts=cycle_ts,
+                    )
+                    logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:PRICE_ZONE_ALREADY_ACTIVE opp=%s", norm, opp_id)
                     continue
-
-                # ── Position sizing ─────────────────────────────────────────
-                atr_val = float(row.get("atr") or 0)
+                atr_val = float((row or {}).get("atr") or 0)
                 equity = float(self.engine.total_equity or self.engine.cash_balance or 0)
                 qty, notional, _ = self.engine.calculate_position_size(
                     symbol=norm,
@@ -1864,21 +1975,19 @@ class PortfolioEngineIntegration:
                     atr=atr_val if atr_val > 0 else arm_price * 0.015,
                     current_price=arm_price,
                 )
-                # Apply live notional cap from config
                 max_notional = float(cfg.scalp_live_max_notional)
-                if notional > max_notional:
+                if notional > max_notional and arm_price > 0:
                     qty = max_notional / arm_price
                     notional = max_notional
                 if qty <= 0 or notional <= 0:
-                    logger.warning("SCALP_V2_ZERO_SIZE symbol=%s", norm)
+                    record_scalp_decision(
+                        self.engine.db_path,
+                        norm,
+                        "REJECTED:INSUFFICIENT_EXECUTABLE_CASH",
+                        "INSUFFICIENT_EXECUTABLE_CASH",
+                        cycle_ts=cycle_ts,
+                    )
                     continue
-
-                # ── Log signal and submit via dedicated SCALP V2 path ───────
-                # Note: slot/cash gates are inside execute_scalp_v2_buy_live
-                # and use SCALP-specific budget (SCALP_MAX_OPEN_POSITIONS),
-                # NOT DAY's MAX_OPEN_POSITIONS.  DAY structural policy
-                # (trailing-buy, 4H slot block, sleeve, artifact attribution,
-                # regime gates) is NOT applied.
                 logger.warning(
                     "SCALP_V2_SIGNAL symbol=%s setup=%s opp=%s arm_price=%.6f notional=%.2f",
                     norm,
@@ -1894,8 +2003,10 @@ class PortfolioEngineIntegration:
                     atr=atr_val,
                     setup_name=setup_name,
                     opportunity_id=opp_id,
+                    entry_authority=ENTRY_AUTHORITY_SCALP_V2_CONFIRMED,
                 )
                 if result is not None:
+                    record_scalp_decision(self.engine.db_path, norm, "FILLED", "FILLED", cycle_ts=cycle_ts, detail=str(result.get("order_id") or ""))
                     logger.warning(
                         "SCALP_V2_ENTRY_FILLED symbol=%s opp=%s qty=%.8f price=%.6f order_id=%s",
                         norm,
@@ -1905,11 +2016,13 @@ class PortfolioEngineIntegration:
                         result.get("order_id", ""),
                     )
                 else:
-                    logger.info("SCALP_V2_ENTRY_REJECTED symbol=%s opp=%s", norm, opp_id)
-
+                    reject = str(getattr(self.engine, "last_buy_reject_reason", "") or "EXCHANGE_REJECTED")
+                    record_scalp_decision(self.engine.db_path, norm, f"REJECTED:{reject}", reject, cycle_ts=cycle_ts)
+                    logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:%s opp=%s", norm, reject, opp_id)
             except _asyncio.CancelledError:
                 raise
             except Exception:
+                record_scalp_decision(self.engine.db_path, norm, "FAILED", "FAILED", cycle_ts=cycle_ts)
                 logger.warning("SCALP_V2_SIGNAL_ERROR symbol=%s", sym_raw, exc_info=True)
 
     async def _monitor_positions_once(self, *, refresh_market_data: bool = True) -> list[dict[str, Any]]:

@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from backend.config.day_entry_execution import (
+    ENTRY_AUTHORITY_DAY_V2_CONFIRMED,
     ENTRY_AUTHORITY_TRAILING_BUY,
     is_trailing_buy_confirmed,
 )
@@ -266,7 +267,7 @@ async def test_sol_trailing_authority_reaches_execute_and_skips_soft_verdict(tmp
 
         async def execute_buy_fifo(self, **kwargs):
             called.update(kwargs)
-            assert kwargs["entry_authority"] == ENTRY_AUTHORITY_TRAILING_BUY
+            assert kwargs["entry_authority"] == ENTRY_AUTHORITY_DAY_V2_CONFIRMED
             adapter_calls.append(
                 {
                     "symbol": "SOLUSDT",
@@ -289,10 +290,11 @@ async def test_sol_trailing_authority_reaches_execute_and_skips_soft_verdict(tmp
         "backend.services.day_active_market_bundle.resolve_pre_buy_day_structure_bundle",
         return_value={},
     ):
+        intent["engine_id"] = "DAY_V2"
         out = await _submit_claimed(_Eng(), intent, float(SOL_TRIGGER_ASK))
     assert out is not None
     assert out["outcome"] == FILL_ADOPTED
-    assert called["entry_authority"] == ENTRY_AUTHORITY
+    assert called["entry_authority"] == ENTRY_AUTHORITY_DAY_V2_CONFIRMED
     assert called["client_order_id"] == SOL_CLIENT_ORDER_ID
     assert called["trailing_buy_intent_id"] == SOL_INTENT_ID
     assert called["symbol"] == "SOL/USDT"
@@ -351,6 +353,7 @@ async def test_sol_exchange_rejection_is_terminal_with_reason(tmp_path):
         "backend.services.day_active_market_bundle.resolve_pre_buy_day_structure_bundle",
         return_value={},
     ):
+        intent["engine_id"] = "DAY_V2"
         out = await _submit_claimed(engine, intent, float(SOL_TRIGGER_ASK))
     assert out is None
     assert len(calls) == 1
