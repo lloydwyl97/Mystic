@@ -1777,7 +1777,7 @@ class PortfolioEngineIntegration:
                     atr_val = float(signal.atr or 0.0)
                     qty, notional, _ = self.engine.calculate_position_size(
                         symbol=norm,
-                        equity=float(self.engine.total_equity or self.engine.cash_balance or 0),
+                        equity=float(self.engine._total_equity or self.engine.cash_balance or 0),
                         atr=atr_val if atr_val > 0 else ask_price * 0.015,
                         current_price=ask_price,
                     )
@@ -1968,7 +1968,7 @@ class PortfolioEngineIntegration:
                     logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:PRICE_ZONE_ALREADY_ACTIVE opp=%s", norm, opp_id)
                     continue
                 atr_val = float((row or {}).get("atr") or 0)
-                equity = float(self.engine.total_equity or self.engine.cash_balance or 0)
+                equity = float(self.engine._total_equity or self.engine.cash_balance or 0)
                 qty, notional, _ = self.engine.calculate_position_size(
                     symbol=norm,
                     equity=equity,
