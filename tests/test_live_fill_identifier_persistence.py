@@ -36,8 +36,10 @@ def test_engine_has_the_expected_number_of_paper_trades_inserts():
 
     This was 6. The dust-cleanup SELL insert was removed so leftover dust
     cannot create a completed live trade or invented realized P&L.
+    This is now 6 again: execute_scalp_v2_buy_live added a dedicated SCALP BUY
+    INSERT (_scalp_v2_commit_buy_sync) that includes order_id and uses mode='live'.
     """
-    assert len(_insert_statements()) == 5
+    assert len(_insert_statements()) == 6
 
 
 def test_every_insert_that_can_write_a_live_row_persists_order_id():

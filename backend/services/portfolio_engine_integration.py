@@ -1788,7 +1788,6 @@ class PortfolioEngineIntegration:
             logger.warning("SCALP_V2_ROUTER_ERROR", exc_info=True)
             return
 
-        from backend.config.day_entry_execution import ENTRY_AUTHORITY_SCALP_V2_LIVE
         from backend.services.day_v2.engine_identity import DAY_V2_ENGINE_ID
 
         SCALP_V2_ENGINE = "SCALP_V2"
@@ -1861,13 +1860,12 @@ class PortfolioEngineIntegration:
                     logger.warning("SCALP_V2_ZERO_SIZE symbol=%s", norm)
                     continue
 
-                # ── Slot/cash gate ──────────────────────────────────────────
-                can_open, gate_reason = await self.engine._can_open_position(norm, notional)
-                if not can_open:
-                    logger.info("SCALP_V2_ENTRY_BLOCKED symbol=%s gate=%s", norm, gate_reason)
-                    continue
-
-                # ── Live order submission via portfolio engine ───────────────
+                # ── Log signal and submit via dedicated SCALP V2 path ───────
+                # Note: slot/cash gates are inside execute_scalp_v2_buy_live
+                # and use SCALP-specific budget (SCALP_MAX_OPEN_POSITIONS),
+                # NOT DAY's MAX_OPEN_POSITIONS.  DAY structural policy
+                # (trailing-buy, 4H slot block, sleeve, artifact attribution,
+                # regime gates) is NOT applied.
                 logger.warning(
                     "SCALP_V2_SIGNAL symbol=%s setup=%s opp=%s arm_price=%.6f notional=%.2f",
                     norm,
@@ -1876,19 +1874,22 @@ class PortfolioEngineIntegration:
                     arm_price,
                     notional,
                 )
-                result = await self.engine.execute_buy_fifo(
+                result = await self.engine.execute_scalp_v2_buy_live(
                     norm,
                     qty,
                     arm_price,
-                    entry_authority=ENTRY_AUTHORITY_SCALP_V2_LIVE,
+                    atr=atr_val,
+                    setup_name=setup_name,
+                    opportunity_id=opp_id,
                 )
                 if result is not None:
                     logger.warning(
-                        "SCALP_V2_ENTRY_FILLED symbol=%s opp=%s qty=%.8f price=%.6f",
+                        "SCALP_V2_ENTRY_FILLED symbol=%s opp=%s qty=%.8f price=%.6f order_id=%s",
                         norm,
                         opp_id,
                         float(result.get("quantity") or qty),
                         float(result.get("price") or arm_price),
+                        result.get("order_id", ""),
                     )
                 else:
                     logger.info("SCALP_V2_ENTRY_REJECTED symbol=%s opp=%s", norm, opp_id)

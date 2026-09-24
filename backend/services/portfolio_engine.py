@@ -8684,6 +8684,333 @@ class PortfolioEngine:
                 self._persist_buy_reject_hold(symbol, decision_id=decision_id, intent_id=trailing_buy_intent_id)
             return bought
 
+    # ------------------------------------------------------------------
+    # SCALP V2 live entry — dedicated path, separate from DAY's gates
+    # ------------------------------------------------------------------
+
+    async def execute_scalp_v2_buy_live(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        *,
+        atr: float = 0.0,
+        setup_name: str = "SCALP_STRUCTURAL",
+        opportunity_id: str = "",
+    ) -> dict[str, Any] | None:
+        """SCALP V2 dedicated live BUY path.
+
+        Does NOT share DAY's position-slot budget, 4H-slot block, sleeve,
+        artifact-attribution, trailing-buy, or regime gates.
+        Uses the same ``execute_protected_limit_live`` infrastructure as DAY V2.
+
+        Returns a result dict on fill, None on any rejection.
+        """
+        import contextlib
+        from datetime import datetime, timezone
+
+        from backend.config.day_entry_execution import ENTRY_AUTHORITY_SCALP_V2_LIVE
+        from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
+
+        norm = normalize_symbol(symbol)
+
+        # 1. Kill switch
+        can_buy, kill_reason = self._check_kill_switch_buy()
+        if not can_buy:
+            logger.warning("SCALP_V2_BUY_BLOCKED symbol=%s KILL_SWITCH reason=%s", norm, kill_reason)
+            return None
+
+        # 2. SCALP-specific slot budget (SCALP_MAX_OPEN_POSITIONS, default 4)
+        scalp_open = sum(
+            1
+            for pos in self.open_positions.values()
+            if str(getattr(pos, "engine_id", "") or "") == SCALP_V2_ENGINE_ID and float(getattr(pos, "quantity", 0) or 0) > 0 and str(getattr(pos, "status", "ACTIVE") or "ACTIVE") != "DUST_PENDING"
+        )
+        max_scalp = int(os.getenv("SCALP_MAX_OPEN_POSITIONS", "4"))
+        if scalp_open >= max_scalp:
+            logger.info(
+                "SCALP_V2_BUY_BLOCKED symbol=%s SCALP_MAX_POSITIONS scalp_open=%d/%d",
+                norm,
+                scalp_open,
+                max_scalp,
+            )
+            return None
+
+        # 3. No duplicate SCALP position in same symbol
+        existing = self.open_positions.get(norm)
+        if existing is not None:
+            ex_engine = str(getattr(existing, "engine_id", "") or "")
+            ex_qty = float(getattr(existing, "quantity", 0) or 0)
+            ex_status = str(getattr(existing, "status", "ACTIVE") or "ACTIVE")
+            if ex_engine == SCALP_V2_ENGINE_ID and ex_qty > 0 and ex_status != "DUST_PENDING":
+                logger.debug("SCALP_V2_BUY_BLOCKED symbol=%s SCALP_POSITION_ALREADY_OPEN", norm)
+                return None
+
+        # 4. Normalize quantity to exchange constraints
+        qty_q, qty_reason, _est_notional = self._normalize_order_amount(symbol=norm, raw_qty=quantity, price=price, side="BUY")
+        if qty_reason != "ok":
+            logger.info("SCALP_V2_BUY_BLOCKED symbol=%s qty_reason=%s", norm, qty_reason)
+            return None
+        quantity = qty_q
+
+        # 5. Live-capable check
+        from backend.config.live_test_mode import can_place_live_orders_sync
+        from backend.services.execution_mode_service import is_live_execution_allowed_sync
+        from backend.services.protected_limit_execution import execute_protected_limit_live, run_protected_preflight
+
+        if not (self._live_execution_enabled and self._live_service and can_place_live_orders_sync()[0]):
+            logger.warning("SCALP_V2_BUY_BLOCKED symbol=%s LIVE_NOT_AVAILABLE", norm)
+            return None
+
+        # 6. Preflight — obtain protected limit price and cost model
+        exchange_sym = norm.replace("/", "")
+        preflight = await run_protected_preflight(
+            symbol=exchange_sym,
+            side="BUY",
+            quantity=quantity,
+            reference_price=price,
+            live_capable=True,
+        )
+        if not preflight.passed:
+            logger.info(
+                "SCALP_V2_BUY_BLOCKED symbol=%s PREFLIGHT_FAILED reason=%s",
+                norm,
+                preflight.reject_reason,
+            )
+            return None
+
+        notional = quantity * float(preflight.protected_limit_price or price)
+
+        # 7. Cash gate and live order inside the global cash lock
+        async with self._global_cash_lock:
+            free_cash = float(self._available_balance or 0)
+            if notional > free_cash:
+                logger.info(
+                    "SCALP_V2_BUY_BLOCKED symbol=%s INSUFFICIENT_CASH notional=%.4f free=%.4f",
+                    norm,
+                    notional,
+                    free_cash,
+                )
+                return None
+
+            logger.warning(
+                "SCALP_V2_LIVE_BUY symbol=%s qty=%.8f limit=%.8f opp=%s",
+                exchange_sym,
+                quantity,
+                preflight.protected_limit_price,
+                opportunity_id,
+            )
+            live_order = await execute_protected_limit_live(
+                self._live_service,
+                symbol=exchange_sym,
+                side="buy",
+                quantity=quantity,
+                limit_price=preflight.protected_limit_price,
+            )
+            if not live_order:
+                logger.error("SCALP_V2_BUY_FAILED symbol=%s NOT_FILLED", norm)
+                return None
+
+            live_order = live_order if isinstance(live_order, dict) else {}
+            with contextlib.suppress(Exception):
+                live_order = await self._verify_order_fill(live_order, exchange_sym, "buy")
+
+            filled_qty = float(live_order.get("filled") or quantity)
+            fill_price = float(live_order.get("average") or price)
+            order_id = str(live_order.get("id") or "")
+
+            # Commission
+            from backend.services.live_order_identity import extract_live_commission
+
+            fee = float(extract_live_commission(live_order, symbol=norm, fill_price=fill_price) or 0.0)
+            total_cost = filled_qty * fill_price + fee
+
+            # 8. Debit cash (inside lock)
+            now_ts = datetime.now(timezone.utc).isoformat()
+            trade_id = f"scalp_v2_{exchange_sym}_{self._now_ms()}"
+
+            new_cash = float(self.cash_balance) - total_cost
+            self._available_balance = new_cash
+
+            # 9. Create position (in-memory)
+            position = OpenPosition(
+                symbol=norm,
+                entry_price=fill_price,
+                quantity=filled_qty,
+                entry_time=time.time(),
+                status="ACTIVE",
+                atr_at_entry=atr,
+                entry_thesis=setup_name,
+                engine_id=SCALP_V2_ENGINE_ID,
+                scalp_opportunity_id=opportunity_id,
+                entry_order_id=order_id,
+            )
+            self.open_positions[norm] = position
+
+            # 10. Atomic DB commit
+            new_pv = float(self._positions_value) + filled_qty * fill_price
+            new_eq = new_cash + new_pv
+
+            import asyncio as _asyncio
+
+            try:
+                await _asyncio.to_thread(
+                    self._scalp_v2_commit_buy_sync,
+                    symbol=norm,
+                    quantity=filled_qty,
+                    fill_price=fill_price,
+                    fee=fee,
+                    order_id=order_id,
+                    atr=atr,
+                    setup_name=setup_name,
+                    opportunity_id=opportunity_id,
+                    trade_id=trade_id,
+                    timestamp=now_ts,
+                    cash_balance=new_cash,
+                    positions_value=new_pv,
+                    total_equity=new_eq,
+                    realized_pnl=float(self._realized_pnl),
+                    unrealized_pnl=float(self._unrealized_pnl),
+                )
+            except Exception:
+                # Rollback in-memory state; order was filled — log critical
+                del self.open_positions[norm]
+                self._available_balance = float(self.cash_balance)
+                logger.error(
+                    "SCALP_V2_BUY_COMMIT_FAILED symbol=%s order_id=%s — position removed from memory. MANUAL RECONCILIATION REQUIRED.",
+                    norm,
+                    order_id,
+                    exc_info=True,
+                )
+                return None
+
+            # Commit memory after DB success
+            self.cash_balance = new_cash
+            self._positions_value = new_pv
+            self._total_equity = new_eq
+
+            logger.warning(
+                "SCALP_V2_ENTRY_FILLED symbol=%s qty=%.8f price=%.6f fee=%.6f order_id=%s opp=%s",
+                norm,
+                filled_qty,
+                fill_price,
+                fee,
+                order_id,
+                opportunity_id,
+            )
+            return {
+                "symbol": norm,
+                "quantity": filled_qty,
+                "price": fill_price,
+                "fee": fee,
+                "order_id": order_id,
+                "engine_id": SCALP_V2_ENGINE_ID,
+                "opportunity_id": opportunity_id,
+                "entry_authority": ENTRY_AUTHORITY_SCALP_V2_LIVE,
+            }
+
+    def _scalp_v2_commit_buy_sync(
+        self,
+        *,
+        symbol: str,
+        quantity: float,
+        fill_price: float,
+        fee: float,
+        order_id: str,
+        atr: float,
+        setup_name: str,
+        opportunity_id: str,
+        trade_id: str,
+        timestamp: str,
+        cash_balance: float,
+        positions_value: float,
+        total_equity: float,
+        realized_pnl: float,
+        unrealized_pnl: float,
+    ) -> None:
+        """Atomic DB commit for SCALP V2 BUY: paper_trades + positions + ledger."""
+        from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
+        from backend.services.scalp_v2.identity_stamp import stamp_engine
+
+        def _op() -> None:
+            with connect_rw(self.db_path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                # paper_trades BUY row
+                conn.execute(
+                    """
+                    INSERT INTO paper_trades
+                        (trade_id, paper_run_id, mode, symbol, side,
+                         quantity, price, remaining_position,
+                         stop_price, atr_at_entry, fees_paid,
+                         timestamp, entry_timestamp, status,
+                         strategy_id, order_id)
+                    VALUES (?, 'scalp_v2_live', 'live', ?, 'BUY',
+                            ?, ?, ?,
+                            0, ?, ?,
+                            ?, ?, 'executed',
+                            'SCALP_V2', ?)
+                    """,
+                    (
+                        trade_id,
+                        symbol,
+                        quantity,
+                        fill_price,
+                        quantity,
+                        atr,
+                        fee,
+                        timestamp,
+                        timestamp,
+                        order_id,
+                    ),
+                )
+                # Stamp engine_id and opportunity_id on the paper_trades row
+                stamp_engine(conn, "paper_trades", "trade_id", trade_id, SCALP_V2_ENGINE_ID, opportunity_id)
+
+                # portfolio_engine_positions row
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO portfolio_engine_positions
+                        (symbol, quantity, entry_price, entry_time, trade_id,
+                         stop_price, atr_at_entry, confidence_at_entry,
+                         highest_price, lowest_price, engine_id, scalp_opportunity_id,
+                         entry_order_id, status, last_updated)
+                    VALUES (?, ?, ?, ?, ?,
+                            0, ?, 0.5,
+                            ?, ?, ?, ?,
+                            ?, 'ACTIVE', ?)
+                    """,
+                    (
+                        symbol,
+                        quantity,
+                        fill_price,
+                        time.time(),
+                        trade_id,
+                        atr,
+                        fill_price,
+                        fill_price,
+                        SCALP_V2_ENGINE_ID,
+                        opportunity_id,
+                        order_id,
+                        timestamp,
+                    ),
+                )
+
+                # Ledger update
+                conn.execute(
+                    """
+                    UPDATE portfolio_engine_ledger
+                    SET cash_balance=?, positions_value=?, total_equity=?,
+                        realized_pnl=?, unrealized_pnl=?, last_updated=?
+                    WHERE id=1
+                    """,
+                    (cash_balance, positions_value, total_equity, realized_pnl, unrealized_pnl, timestamp),
+                )
+                conn.commit()
+
+        from backend.database_schema import run_locked_retry
+
+        run_locked_retry(_op)
+
     async def _execute_buy_fifo_locked(
         self,
         symbol: str,
