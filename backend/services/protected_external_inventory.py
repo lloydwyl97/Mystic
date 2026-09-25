@@ -246,6 +246,52 @@ def protected_equity(db_path: str | Path, prices: dict[str, float] | None = None
     return market, cost
 
 
+def unsold_scalp_v2_lot(conn: sqlite3.Connection, symbol: str) -> dict[str, Any] | None:
+    """Latest live SCALP V2 BUY with a venue order id and unsold quantity.
+
+    That row is Mystic's own fill record. Reconciliation must restore it as a
+    strategy lot before any balance in the symbol is treated as external.
+    """
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "paper_trades" not in tables:
+        return None
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(paper_trades)")}
+    opp_expr = "COALESCE(scalp_opportunity_id, '')" if "scalp_opportunity_id" in cols else "''"
+    decision_expr = "COALESCE(decision_id, '')" if "decision_id" in cols else "''"
+    row = conn.execute(
+        f"""
+        SELECT trade_id, price, remaining_position, order_id, COALESCE(fees_paid, 0),
+               COALESCE(atr_at_entry, 0), {opp_expr}, {decision_expr}, COALESCE(entry_timestamp, timestamp, '')
+        FROM paper_trades
+        WHERE symbol=? AND UPPER(side)='BUY' AND COALESCE(paper_run_id, '')='scalp_v2_live'
+          AND COALESCE(mode, '')='live' AND COALESCE(order_id, '')!=''
+          AND COALESCE(remaining_position, 0) > 0
+        ORDER BY id DESC LIMIT 1
+        """,
+        (_norm(symbol),),
+    ).fetchone()
+    if row is None:
+        return None
+    entry_time = 0.0
+    try:
+        from datetime import datetime
+
+        entry_time = datetime.fromisoformat(str(row[8])).timestamp() if row[8] else 0.0
+    except ValueError:
+        entry_time = 0.0
+    return {
+        "trade_id": str(row[0]),
+        "price": float(row[1] or 0.0),
+        "remaining": float(row[2] or 0.0),
+        "order_id": str(row[3]),
+        "fee": float(row[4] or 0.0),
+        "atr": float(row[5] or 0.0),
+        "opportunity_id": str(row[6] or ""),
+        "decision_id": str(row[7] or ""),
+        "entry_time": entry_time,
+    }
+
+
 def should_align_paper_remaining(trade_id: str, entry_order_id: str, paper_order_exists: bool) -> bool:
     """Do not paint an imported or unmatched venue order onto an older paper lot."""
     if str(trade_id or "").startswith("reconcile_import_"):

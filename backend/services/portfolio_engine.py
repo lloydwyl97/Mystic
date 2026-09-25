@@ -2950,6 +2950,15 @@ class PortfolioEngine:
                     continue
                 from backend.services.protected_external_inventory import record_protected
 
+                restored = await self._restore_unsold_scalp_lot(symbol, free_qty, price, min_notional)
+                if restored > 0:
+                    imported_any = True
+                    residual = round(free_qty - restored, 12)
+                    if qty_step > 0:
+                        residual = self._floor_to_step(residual, qty_step)
+                    if residual <= qty_epsilon or residual * price < min_notional:
+                        continue
+                    track_qty = residual
                 source_id = f"reconcile_import_{symbol.replace('/', '_')}_{int(time.time())}"
                 with connect_managed(self.db_path) as conn:
                     record_protected(conn, symbol, track_qty, price, source_trade_id=source_id)
@@ -8839,45 +8848,62 @@ class PortfolioEngine:
             with contextlib.suppress(Exception):
                 live_order = await self._verify_order_fill(live_order, exchange_sym, "buy")
 
-            filled_qty = float(live_order.get("filled") or quantity)
-            fill_price = float(live_order.get("average") or price)
-            order_id = str(live_order.get("id") or "")
-
-            # Commission
-            from backend.services.live_order_identity import extract_live_commission
-
-            fee = float(extract_live_commission(live_order, symbol=norm, fill_price=fill_price) or 0.0)
-            total_cost = filled_qty * fill_price + fee
-
-            # 8. Debit cash (inside lock)
-            now_ts = datetime.now(timezone.utc).isoformat()
-            trade_id = f"scalp_v2_{exchange_sym}_{self._now_ms()}"
-
-            new_cash = float(self.cash_balance) - total_cost
-            self._available_balance = new_cash
-
-            # 9. Create position (in-memory)
-            position = OpenPosition(
-                symbol=norm,
-                entry_price=fill_price,
-                quantity=filled_qty,
-                entry_time=time.time(),
-                status="ACTIVE",
-                atr_at_entry=atr,
-                entry_thesis=setup_name,
-                engine_id=SCALP_V2_ENGINE_ID,
-                scalp_opportunity_id=opportunity_id,
-                entry_order_id=order_id,
-            )
-            self.open_positions[norm] = position
-
-            # 10. Atomic DB commit
-            new_pv = float(self._positions_value) + filled_qty * fill_price
-            new_eq = new_cash + new_pv
-
             import asyncio as _asyncio
 
+            from backend.services.day_entry_reservations import consume_reservation
+
+            order_id = str(live_order.get("id") or "")
+            gross_qty = float(live_order.get("filled") or quantity)
+            fill_price = float(live_order.get("average") or price)
+            filled_qty = gross_qty
+            fee = 0.0
+            now_ts = datetime.now(timezone.utc).isoformat()
+            trade_id = f"scalp_v2_{exchange_sym}_{self._now_ms()}"
+            client_order_id = str(live_order.get("clientOrderId") or (live_order.get("info") or {}).get("clientOrderId") or "")
             try:
+                from backend.services.live_fill_economics import apply_live_buy_economics, extract_live_commission
+
+                commission = extract_live_commission(live_order, symbol=norm, fill_price=fill_price)
+                filled_qty, fee, total_cost = apply_live_buy_economics(
+                    filled_qty=gross_qty,
+                    fill_price=fill_price,
+                    modeled_fee=gross_qty * fill_price * TAKER_FEE,
+                    commission=commission,
+                )
+
+                # 8. Debit cash (inside lock)
+                new_cash = float(self.cash_balance) - total_cost
+                self._available_balance = new_cash
+
+                # 9. Create position (in-memory)
+                position = OpenPosition(
+                    symbol=norm,
+                    quantity=filled_qty,
+                    entry_price=fill_price,
+                    entry_time=time.time(),
+                    trade_id=trade_id,
+                    stop_price=0.0,
+                    take_profit_1_price=0.0,
+                    take_profit_2_price=0.0,
+                    highest_price=fill_price,
+                    lowest_price=fill_price,
+                    atr_at_entry=atr,
+                    confidence_at_entry=0.5,
+                    status="ACTIVE",
+                    entry_fee=fee,
+                    entry_thesis=setup_name,
+                    entry_decision_id=decision_key,
+                    entry_reservation_id=str(reservation_id or ""),
+                    entry_order_id=order_id,
+                    entry_client_order_id=client_order_id,
+                    engine_id=SCALP_V2_ENGINE_ID,
+                    scalp_opportunity_id=opportunity_id,
+                )
+                self.open_positions[norm] = position
+
+                # 10. Atomic DB commit
+                new_pv = float(self._positions_value) + filled_qty * fill_price
+                new_eq = new_cash + new_pv
                 await _asyncio.to_thread(
                     self._scalp_v2_commit_buy_sync,
                     symbol=norm,
@@ -8895,26 +8921,54 @@ class PortfolioEngine:
                     total_equity=new_eq,
                     realized_pnl=float(self._realized_pnl),
                     unrealized_pnl=float(self._unrealized_pnl),
+                    decision_id=decision_key,
+                    reservation_id=str(reservation_id or ""),
+                    client_order_id=client_order_id,
+                    entry_time=float(position.entry_time),
                 )
             except Exception:
-                # Rollback in-memory state; order was filled — log critical
-                del self.open_positions[norm]
+                # The venue order is filled. Keep an order-id-backed BUY row so
+                # reconciliation restores this lot instead of calling it external.
+                self.open_positions.pop(norm, None)
                 self._available_balance = float(self.cash_balance)
                 logger.error(
-                    "SCALP_V2_BUY_COMMIT_FAILED symbol=%s order_id=%s — position removed from memory. MANUAL RECONCILIATION REQUIRED.",
+                    "SCALP_V2_BUY_POST_FILL_FAILED symbol=%s order_id=%s qty=%.8f price=%.8f — provenance row kept for reconciliation",
                     norm,
                     order_id,
+                    filled_qty,
+                    fill_price,
                     exc_info=True,
                 )
-                release_claim(self.db_path, reservation_id=reservation_id, decision_id=decision_key, symbol=norm)
+                try:
+                    await _asyncio.to_thread(
+                        self._scalp_v2_record_fill_provenance_sync,
+                        symbol=norm,
+                        quantity=filled_qty,
+                        fill_price=fill_price,
+                        fee=fee,
+                        order_id=order_id,
+                        atr=atr,
+                        opportunity_id=opportunity_id,
+                        decision_id=decision_key,
+                        trade_id=trade_id,
+                        timestamp=now_ts,
+                    )
+                except Exception:
+                    logger.critical(
+                        "SCALP_V2_FILL_PROVENANCE_LOST symbol=%s order_id=%s qty=%.8f — MANUAL RECONCILIATION REQUIRED",
+                        norm,
+                        order_id,
+                        filled_qty,
+                        exc_info=True,
+                    )
+                consume_reservation(self.db_path, reservation_id=reservation_id, decision_id=decision_key, symbol=norm)
+                self.last_buy_reject_reason = "POST_FILL_BIND_FAILED"
                 return None
 
             # Commit memory after DB success
             self.cash_balance = new_cash
             self._positions_value = new_pv
             self._total_equity = new_eq
-            from backend.services.day_entry_reservations import consume_reservation
-
             consume_reservation(self.db_path, reservation_id=reservation_id, decision_id=decision_key, symbol=norm)
 
             logger.warning(
@@ -8955,73 +9009,47 @@ class PortfolioEngine:
         total_equity: float,
         realized_pnl: float,
         unrealized_pnl: float,
+        decision_id: str = "",
+        reservation_id: str = "",
+        client_order_id: str = "",
+        entry_time: float | None = None,
     ) -> None:
         """Atomic DB commit for SCALP V2 BUY: paper_trades + positions + ledger."""
-        from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
-        from backend.services.scalp_v2.identity_stamp import stamp_engine
+        from backend.services.scalp_v2.opportunity import mark_opportunity_on
 
         def _op() -> None:
             with connect_rw(self.db_path) as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                # paper_trades BUY row
-                conn.execute(
-                    """
-                    INSERT INTO paper_trades
-                        (trade_id, paper_run_id, mode, symbol, side,
-                         quantity, price, remaining_position,
-                         stop_price, atr_at_entry, fees_paid,
-                         timestamp, entry_timestamp, status,
-                         strategy_id, order_id)
-                    VALUES (?, 'scalp_v2_live', 'live', ?, 'BUY',
-                            ?, ?, ?,
-                            0, ?, ?,
-                            ?, ?, 'executed',
-                            'SCALP_V2', ?)
-                    """,
-                    (
-                        trade_id,
-                        symbol,
-                        quantity,
-                        fill_price,
-                        quantity,
-                        atr,
-                        fee,
-                        timestamp,
-                        timestamp,
-                        order_id,
-                    ),
+                self._scalp_v2_insert_buy_row(
+                    conn,
+                    symbol=symbol,
+                    quantity=quantity,
+                    fill_price=fill_price,
+                    fee=fee,
+                    order_id=order_id,
+                    atr=atr,
+                    opportunity_id=opportunity_id,
+                    decision_id=decision_id,
+                    trade_id=trade_id,
+                    timestamp=timestamp,
                 )
-                # Stamp engine_id and opportunity_id on the paper_trades row
-                stamp_engine(conn, "paper_trades", "trade_id", trade_id, SCALP_V2_ENGINE_ID, opportunity_id)
-
-                # portfolio_engine_positions row
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO portfolio_engine_positions
-                        (symbol, quantity, entry_price, entry_time, trade_id,
-                         stop_price, atr_at_entry, confidence_at_entry,
-                         highest_price, lowest_price, engine_id, scalp_opportunity_id,
-                         entry_order_id, status, last_updated)
-                    VALUES (?, ?, ?, ?, ?,
-                            0, ?, 0.5,
-                            ?, ?, ?, ?,
-                            ?, 'ACTIVE', ?)
-                    """,
-                    (
-                        symbol,
-                        quantity,
-                        fill_price,
-                        time.time(),
-                        trade_id,
-                        atr,
-                        fill_price,
-                        fill_price,
-                        SCALP_V2_ENGINE_ID,
-                        opportunity_id,
-                        order_id,
-                        timestamp,
-                    ),
+                self._scalp_v2_write_position_row(
+                    conn,
+                    symbol=symbol,
+                    quantity=quantity,
+                    fill_price=fill_price,
+                    fee=fee,
+                    order_id=order_id,
+                    atr=atr,
+                    opportunity_id=opportunity_id,
+                    decision_id=decision_id,
+                    reservation_id=reservation_id,
+                    client_order_id=client_order_id,
+                    trade_id=trade_id,
+                    entry_time=float(entry_time if entry_time is not None else time.time()),
+                    timestamp=timestamp,
                 )
+                mark_opportunity_on(conn, symbol, opportunity_id, "OPEN")
 
                 # Ledger update
                 conn.execute(
@@ -9035,9 +9063,218 @@ class PortfolioEngine:
                 )
                 conn.commit()
 
-        from backend.database_schema import run_locked_retry
+        run_locked_retry(_op)
+
+    @staticmethod
+    def _scalp_v2_insert_buy_row(
+        conn: sqlite3.Connection,
+        *,
+        symbol: str,
+        quantity: float,
+        fill_price: float,
+        fee: float,
+        order_id: str,
+        atr: float,
+        opportunity_id: str,
+        decision_id: str,
+        trade_id: str,
+        timestamp: str,
+    ) -> None:
+        from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
+        from backend.services.scalp_v2.identity_stamp import stamp_engine
+
+        conn.execute(
+            """
+            INSERT INTO paper_trades
+                (trade_id, paper_run_id, mode, symbol, side,
+                 quantity, price, remaining_position,
+                 stop_price, atr_at_entry, fees_paid,
+                 timestamp, entry_timestamp, status,
+                 strategy_id, order_id, decision_id)
+            VALUES (?, 'scalp_v2_live', 'live', ?, 'BUY',
+                    ?, ?, ?,
+                    0, ?, ?,
+                    ?, ?, 'executed',
+                    'SCALP_V2', ?, ?)
+            """,
+            (
+                trade_id,
+                symbol,
+                quantity,
+                fill_price,
+                quantity,
+                atr,
+                fee,
+                timestamp,
+                timestamp,
+                order_id,
+                decision_id,
+            ),
+        )
+        stamp_engine(conn, "paper_trades", "trade_id", trade_id, SCALP_V2_ENGINE_ID, opportunity_id)
+
+    @staticmethod
+    def _scalp_v2_write_position_row(
+        conn: sqlite3.Connection,
+        *,
+        symbol: str,
+        quantity: float,
+        fill_price: float,
+        fee: float,
+        order_id: str,
+        atr: float,
+        opportunity_id: str,
+        decision_id: str,
+        reservation_id: str,
+        client_order_id: str,
+        trade_id: str,
+        entry_time: float,
+        timestamp: str,
+    ) -> None:
+        from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
+        from backend.services.scalp_v2.identity_stamp import stamp_engine
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO portfolio_engine_positions
+                (symbol, quantity, entry_price, entry_time, trade_id,
+                 stop_price, take_profit_1_price, take_profit_2_price,
+                 atr_at_entry, confidence_at_entry,
+                 highest_price, lowest_price, entry_fee,
+                 entry_decision_id, entry_reservation_id, entry_order_id, entry_client_order_id,
+                 status, last_updated)
+            VALUES (?, ?, ?, ?, ?,
+                    0, 0, 0,
+                    ?, 0.5,
+                    ?, ?, ?,
+                    ?, ?, ?, ?,
+                    'ACTIVE', ?)
+            """,
+            (
+                symbol,
+                quantity,
+                fill_price,
+                entry_time,
+                trade_id,
+                atr,
+                fill_price,
+                fill_price,
+                fee,
+                decision_id,
+                reservation_id,
+                order_id,
+                client_order_id,
+                timestamp,
+            ),
+        )
+        stamp_engine(conn, "portfolio_engine_positions", "symbol", symbol, SCALP_V2_ENGINE_ID, opportunity_id)
+
+    def _scalp_v2_record_fill_provenance_sync(
+        self,
+        *,
+        symbol: str,
+        quantity: float,
+        fill_price: float,
+        fee: float,
+        order_id: str,
+        atr: float,
+        opportunity_id: str,
+        decision_id: str,
+        trade_id: str,
+        timestamp: str,
+    ) -> None:
+        """Persist only the SCALP V2 BUY row after a post-fill failure."""
+
+        def _op() -> None:
+            with connect_rw(self.db_path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                exists = conn.execute("SELECT 1 FROM paper_trades WHERE trade_id=?", (trade_id,)).fetchone()
+                if exists is None:
+                    self._scalp_v2_insert_buy_row(
+                        conn,
+                        symbol=symbol,
+                        quantity=quantity,
+                        fill_price=fill_price,
+                        fee=fee,
+                        order_id=order_id,
+                        atr=atr,
+                        opportunity_id=opportunity_id,
+                        decision_id=decision_id,
+                        trade_id=trade_id,
+                        timestamp=timestamp,
+                    )
+                conn.commit()
 
         run_locked_retry(_op)
+
+    async def _restore_unsold_scalp_lot(self, symbol: str, free_qty: float, price: float, min_notional: float) -> float:
+        """Rebind an order-id-backed SCALP V2 BUY row that has no position. Returns the restored quantity."""
+        from backend.services.protected_external_inventory import ensure_schema as ensure_protected_schema
+        from backend.services.protected_external_inventory import unsold_scalp_v2_lot
+
+        with connect_managed(self.db_path) as conn:
+            lot = unsold_scalp_v2_lot(conn, symbol)
+        if lot is None:
+            return 0.0
+        qty = min(float(lot["remaining"]), float(free_qty))
+        if qty <= 0 or qty * float(price) < float(min_notional):
+            return 0.0
+        timestamp = datetime.now(timezone.utc).isoformat()
+        entry_time = float(lot["entry_time"] or time.time())
+
+        def _op() -> None:
+            with connect_rw(self.db_path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._scalp_v2_write_position_row(
+                    conn,
+                    symbol=symbol,
+                    quantity=qty,
+                    fill_price=float(lot["price"]),
+                    fee=float(lot["fee"]),
+                    order_id=str(lot["order_id"]),
+                    atr=float(lot["atr"]),
+                    opportunity_id=str(lot["opportunity_id"]),
+                    decision_id=str(lot["decision_id"]),
+                    reservation_id="",
+                    client_order_id="",
+                    trade_id=str(lot["trade_id"]),
+                    entry_time=entry_time,
+                    timestamp=timestamp,
+                )
+                ensure_protected_schema(conn)
+                conn.execute("DELETE FROM protected_external_inventory WHERE symbol=?", (symbol,))
+                conn.commit()
+
+        await asyncio.to_thread(run_locked_retry, _op)
+        from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
+
+        self.open_positions[symbol] = OpenPosition(
+            symbol=symbol,
+            quantity=qty,
+            entry_price=float(lot["price"]),
+            entry_time=entry_time,
+            trade_id=str(lot["trade_id"]),
+            stop_price=0.0,
+            take_profit_1_price=0.0,
+            take_profit_2_price=0.0,
+            highest_price=float(lot["price"]),
+            lowest_price=float(lot["price"]),
+            atr_at_entry=float(lot["atr"]),
+            confidence_at_entry=0.5,
+            entry_fee=float(lot["fee"]),
+            entry_decision_id=str(lot["decision_id"]),
+            entry_order_id=str(lot["order_id"]),
+            engine_id=SCALP_V2_ENGINE_ID,
+            scalp_opportunity_id=str(lot["opportunity_id"]),
+        )
+        logger.warning(
+            "SCALP_V2_OWNERSHIP_RESTORED symbol=%s qty=%.8f order_id=%s trade_id=%s",
+            symbol,
+            qty,
+            lot["order_id"],
+            lot["trade_id"],
+        )
+        return qty
 
     async def _execute_buy_fifo_locked(
         self,
