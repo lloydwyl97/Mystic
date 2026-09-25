@@ -117,15 +117,14 @@ def test_open_row_is_not_expired():
 # ---------------------------------------------------------------------------
 
 
-def test_different_zone_is_never_blocked():
-    """A substantially different price zone always creates a fresh arm."""
+def test_different_zone_does_not_create_a_second_actionable_row():
+    """One ARMED row per symbol. A second price zone stays historical until the first ends."""
     from backend.services.scalp_v2.opportunity import arm_opportunity
 
     db = _db()
     arm_opportunity(db, "BTC/USDT", "SCALP", 84000.0)
-    # Price moved 5% — different zone bucket
     _, blocked = arm_opportunity(db, "BTC/USDT", "SCALP", 88000.0)
-    assert not blocked, "A different price zone must not be blocked by an existing ARMED row"
+    assert blocked, "A second price zone must not become actionable while one ARMED row exists"
 
 
 # ---------------------------------------------------------------------------

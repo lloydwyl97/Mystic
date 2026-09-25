@@ -1525,6 +1525,7 @@ class PortfolioEngineIntegration:
                                 self.last_entry_bar_processed,
                                 self.entry_decision_interval,
                             )
+                            await self._process_day_v2_signals(int(self.last_entry_bar_processed or 0), pending_only=True)
 
                 # Sleep until next bar
                 next_bar = current_bar + self.bar_interval
@@ -1583,7 +1584,7 @@ class PortfolioEngineIntegration:
                 await asyncio.sleep(0.35)
         return 0.0, None
 
-    async def _process_day_v2_signals(self, entry_bar: int) -> None:
+    async def _process_day_v2_signals(self, entry_bar: int, *, pending_only: bool = False) -> None:
         """Evaluate DAY V2 entry signals on the just-closed 15m bar.
 
         Called immediately after process_bar_candidates on every 15m boundary.
@@ -1621,8 +1622,10 @@ class PortfolioEngineIntegration:
             # _can_open_position below serves as the hard gate for all new entries.
             already_open: set[str] = set()
             if self.engine and self.engine.open_positions:
+                from backend.services.protected_external_inventory import consumes_strategy_slot
+
                 for _s, _pos in self.engine.open_positions.items():
-                    if getattr(_pos, "status", "ACTIVE") != "DUST_PENDING":
+                    if consumes_strategy_slot(_pos):
                         already_open.add(str(_s).upper().replace("-", "").replace("/", ""))
 
             for symbol in DAY_V2_UNIVERSE:
@@ -1645,54 +1648,51 @@ class PortfolioEngineIntegration:
                     import asyncio as _asyncio
 
                     from backend.services.candle_contract import load_closed_bars
-                    from backend.services.day_v2.cycle_gate import cycle_decision, required_15m_open
+                    from backend.services.day_v2.cycle_gate import required_15m_open
                     from backend.services.day_v2.decision_log import record_day_decision
                     from backend.services.day_v2.live_signal import explain_no_signal
 
                     as_of = float(entry_bar or time.time())
-                    seen = getattr(self, "_day_v2_evaluated", None)
-                    if seen is None:
-                        self._day_v2_evaluated = set()
-                        seen = self._day_v2_evaluated
+                    from backend.services.day_v2.candle_wait import (
+                        claim_bar,
+                        claim_result,
+                        evaluate_candle_gate,
+                        note_pending,
+                        pending_symbols,
+                    )
+
+                    required_open = required_15m_open(as_of)
+                    if pending_only and symbol not in pending_symbols(db_path):
+                        continue
+                    if claim_result(db_path, symbol, required_open):
+                        continue
 
                     def _load(interval: str, limit: int, sym: str = db_sym_15m, moment: float = as_of) -> list[dict]:
                         return load_closed_bars(db_path, sym, interval, limit, as_of=moment)
 
                     bars_15m = await _asyncio.to_thread(_load, "15m", 60)
                     ask_price, book_age = await self._resolve_day_executable_price(symbol)
-                    required_open = required_15m_open(as_of)
                     latest = float(bars_15m[-1]["ts_epoch"]) if bars_15m else None
-                    gate = cycle_decision(
+                    gate = evaluate_candle_gate(
                         completed_bar_count=len(bars_15m),
                         minimum_bars=32,
+                        latest_open=latest,
+                        required_open=required_open,
                         executable_price=ask_price,
                         book_age_sec=book_age,
                         book_stale_sec=30.0,
-                        already_evaluated=(symbol, int(as_of)) in seen,
-                        retried=False,
-                        latest_bar_epoch=latest,
-                        required_open_epoch=required_open,
+                        now=time.time(),
                     )
-                    if gate["action"] == "retry":
-                        await asyncio.sleep(0.4)
-                        bars_15m = await _asyncio.to_thread(_load, "15m", 60)
-                        ask_price, book_age = await self._resolve_day_executable_price(symbol)
-                        latest = float(bars_15m[-1]["ts_epoch"]) if bars_15m else None
-                        gate = cycle_decision(
-                            completed_bar_count=len(bars_15m),
-                            minimum_bars=32,
-                            executable_price=ask_price,
-                            book_age_sec=book_age,
-                            book_stale_sec=30.0,
-                            already_evaluated=(symbol, int(as_of)) in seen,
-                            retried=True,
-                            latest_bar_epoch=latest,
-                            required_open_epoch=required_open,
-                        )
-                    seen.add((symbol, int(as_of)))
+                    if gate["action"] == "pending":
+                        note_pending(db_path, symbol, required_open)
+                        logger.info("DAY_V2_PENDING_CANDLE symbol=%s bar_open=%s", symbol, int(required_open))
+                        continue
                     if gate["action"] != "proceed":
-                        record_day_decision(db_path, symbol, gate["reason"], cycle_ts=as_of, closest="missing_stale_data", unmet=[gate["reason"]])
+                        if claim_bar(db_path, symbol, required_open, gate["reason"]):
+                            record_day_decision(db_path, symbol, gate["reason"], cycle_ts=as_of, closest="missing_stale_data", unmet=[gate["reason"]])
                         logger.warning("DAY_V2_HARD_DATA_REJECT symbol=%s reason=%s", symbol, gate["reason"])
+                        continue
+                    if not claim_bar(db_path, symbol, required_open, "PROCEEDING"):
                         continue
 
                     bars_1h = await _asyncio.to_thread(_load, "1h", 20)
@@ -1930,6 +1930,9 @@ class PortfolioEngineIntegration:
             release_claim(self.engine.db_path, reservation_id=reservation_id, symbol=symbol)
 
         reap_expired_armed(self.engine.db_path, now=cycle_ts, release_reservation=_release)
+        from backend.services.day_entry_reservations import release_orphan_reservations
+
+        release_orphan_reservations(self.engine.db_path, now=cycle_ts)
         by_symbol = {str(row.get("symbol") or "").upper().replace("-", "").replace("/", ""): row for row in candidates}
         products = [str(s) for s in getattr(cfg, "products", [])] or list(by_symbol)
         for sym_raw in products:
@@ -1971,11 +1974,11 @@ class PortfolioEngineIntegration:
                     record_scalp_decision(
                         self.engine.db_path,
                         norm,
-                        "REJECTED:PRICE_ZONE_ALREADY_ACTIVE",
-                        "PRICE_ZONE_ALREADY_ACTIVE",
+                        "REJECTED:SYMBOL_OPPORTUNITY_ALREADY_ACTIVE",
+                        "SYMBOL_OPPORTUNITY_ALREADY_ACTIVE",
                         cycle_ts=cycle_ts,
                     )
-                    logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:PRICE_ZONE_ALREADY_ACTIVE opp=%s", norm, opp_id)
+                    logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:SYMBOL_OPPORTUNITY_ALREADY_ACTIVE opp=%s", norm, opp_id)
                     continue
                 atr_val = float((row or {}).get("atr") or 0)
                 equity = float(self.engine._total_equity or self.engine.cash_balance or 0)

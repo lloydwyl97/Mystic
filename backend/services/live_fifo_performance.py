@@ -176,6 +176,22 @@ def fifo_exchange_performance(db_path: str | Path) -> dict[str, Any]:
                 if "exit_reason" in {str(r[1]) for r in conn.execute("PRAGMA table_info(paper_trades)")}
                 else 0
             )
-        return report.as_dict()
+        payload = report.as_dict()
+        payload.update(strategy_performance_status(payload))
+        return payload
     finally:
         conn.close()
+
+
+def strategy_performance_status(report: dict[str, Any]) -> dict[str, Any]:
+    """Matched lots are not a lifetime strategy result while sells remain unmatched."""
+    sell = float(report.get("exchange_sell_qty") or 0.0)
+    matched = float(report.get("matched_qty") or 0.0)
+    unmatched = float(report.get("unmatched_sell_qty") or 0.0)
+    coverage = (matched / sell) if sell > 0 else None
+    known = unmatched <= 1e-8 and sell > 0
+    return {
+        "coverage_qty": coverage,
+        "lifetime_strategy_performance_known": known,
+        "performance_statement": ("matched automated round trips" if known else "lifetime strategy performance is unknown"),
+    }

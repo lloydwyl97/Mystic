@@ -17,9 +17,15 @@ TOP4_LIVE_BUY_AUTHORITIES: Final[frozenset[str]] = frozenset(
     {
         ENTRY_AUTHORITY_SCALP_V2_CONFIRMED,
         ENTRY_AUTHORITY_DAY_V2_CONFIRMED,
-        ENTRY_AUTHORITY_SCALP_V2_LIVE,
     }
 )
+
+
+def accepted_live_buy_authority(authority: str) -> bool:
+    """Only the two confirmed authorities may submit a new live BUY."""
+    return str(authority or "") in TOP4_LIVE_BUY_AUTHORITIES
+
+
 VALID_ENTRY_MODES: Final[frozenset[str]] = frozenset({TRAILING_BUY_MODE})
 MODE_ENV: Final[str] = "DAY_ENTRY_EXECUTION_MODE"
 MAX_WAIT_ENV: Final[str] = "DAY_TRAILING_BUY_MAX_WAIT_SECONDS"

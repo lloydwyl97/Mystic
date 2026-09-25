@@ -23,13 +23,9 @@ def _norm(symbol: str) -> str:
 
 
 def held_slot_count(positions: dict, *, dust_status: str = "DUST_PENDING") -> int:
-    n = 0
-    for pos in (positions or {}).values():
-        status = str(getattr(pos, "status", "ACTIVE") or "ACTIVE")
-        qty = float(getattr(pos, "quantity", 0) or 0)
-        if qty > 0 and status != dust_status:
-            n += 1
-    return n
+    from backend.services.protected_external_inventory import consumes_strategy_slot
+
+    return sum(1 for pos in (positions or {}).values() if consumes_strategy_slot(pos) and str(getattr(pos, "status", "ACTIVE") or "ACTIVE") != dust_status)
 
 
 def symbol_owner(positions: dict, symbol: str, *, dust_status: str = "DUST_PENDING") -> str:
@@ -42,8 +38,9 @@ def symbol_owner(positions: dict, symbol: str, *, dust_status: str = "DUST_PENDI
     if pos is None:
         return ""
     status = str(getattr(pos, "status", "ACTIVE") or "ACTIVE")
-    qty = float(getattr(pos, "quantity", 0) or 0)
-    if qty <= 0 or status == dust_status:
+    from backend.services.protected_external_inventory import consumes_strategy_slot
+
+    if not consumes_strategy_slot(pos) or status == dust_status:
         return ""
     return str(getattr(pos, "engine_id", "") or "")
 

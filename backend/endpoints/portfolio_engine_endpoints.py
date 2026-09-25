@@ -635,6 +635,30 @@ async def get_portfolio_performance() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def _status_books() -> dict[str, dict[str, Any]]:
+    """Top of book from Redis. The API process does not own the integration price cache."""
+    books: dict[str, dict[str, Any]] = {}
+    try:
+        from backend.config.redis_config import get_redis_client
+        from backend.services.spread_book_telemetry import read_market_book
+
+        client = get_redis_client()
+        for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"):
+            book = read_market_book(client, symbol)
+            if not book:
+                continue
+            books[f"{symbol[:-4]}-USDT"] = {
+                "bid": book.get("bid") or book.get("best_bid"),
+                "ask": book.get("ask") or book.get("best_ask"),
+                "price": book.get("midpoint") or book.get("price"),
+                "ts": book.get("timestamp") or book.get("ts"),
+                "source": book.get("source") or "redis",
+            }
+    except Exception:
+        logger.debug("STATUS_BOOK_UNAVAILABLE", exc_info=True)
+    return books
+
+
 @router.get("/status")
 async def get_portfolio_status() -> dict[str, Any]:
     """
@@ -751,12 +775,7 @@ async def get_portfolio_status() -> dict[str, Any]:
             from backend.database_schema import DATABASE_PATH
             from backend.services.candle_contract import candle_contract_matrix
 
-            books = {}
-            integration = get_portfolio_integration()
-            for key, px in (getattr(integration, "current_prices", {}) or {}).items():
-                text = str(key).upper().replace("/", "").replace("-", "")
-                if text.endswith("USDT"):
-                    books[f"{text[:-4]}-USDT"] = {"price": px, "ts": time.time(), "source": "integration_price_cache"}
+            books = _status_books()
             status["candle_contract"] = candle_contract_matrix(str(DATABASE_PATH), books=books)
         except Exception as exc:
             logger.warning("STATUS_CANDLE_CONTRACT_UNAVAILABLE: %s", exc)

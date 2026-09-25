@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 
-def test_same_move_blocks_until_price_zone_changes(tmp_path: Path):
+def test_one_actionable_opportunity_per_symbol(tmp_path: Path):
     from backend.services.scalp_v2.opportunity import arm_opportunity, mark_opportunity
 
     db = tmp_path / "t.db"
@@ -21,12 +21,13 @@ def test_same_move_blocks_until_price_zone_changes(tmp_path: Path):
     assert again == oid
     assert blocked2 is True
     mark_opportunity(db, "ETH/USDT", oid, "CLOSED")
-    still, blocked3 = arm_opportunity(db, "ETH/USDT", "VWAP_REVERSION", 2701.0)
-    assert still == oid
-    assert blocked3 is True
-    moved, blocked4 = arm_opportunity(db, "ETH/USDT", "VWAP_REVERSION", 2900.0)
-    assert blocked4 is False
+    moved, blocked_after_close = arm_opportunity(db, "ETH/USDT", "VWAP_REVERSION", 2900.0)
+    assert blocked_after_close is False
     assert moved != oid
+    _third, blocked_while_armed = arm_opportunity(db, "ETH/USDT", "VWAP_REVERSION", 2910.0)
+    assert blocked_while_armed is True
+    states = [row[0] for row in sqlite3.connect(db).execute("SELECT state FROM scalp_v2_opportunities ORDER BY id")]
+    assert states == ["CLOSED", "ARMED"]
 
 
 def test_clock_does_not_create_a_new_opportunity():
@@ -339,15 +340,19 @@ def test_market_orders_still_refused_in_live_mode():
         )
 
 
-def test_scalp_v2_entry_authority_bypasses_trailing_buy_gate():
-    """ENTRY_AUTHORITY_SCALP_V2_LIVE is accepted by the trailing-buy gate check."""
+def test_scalp_v2_live_alias_does_not_authorize_a_buy():
+    """Historical SCALP_V2_LIVE_ENTRY stays a label. It cannot submit a new BUY."""
     from backend.config.day_entry_execution import (
+        ENTRY_AUTHORITY_DAY_V2_CONFIRMED,
+        ENTRY_AUTHORITY_SCALP_V2_CONFIRMED,
         ENTRY_AUTHORITY_SCALP_V2_LIVE,
-        ENTRY_AUTHORITY_TRAILING_BUY,
+        accepted_live_buy_authority,
     )
 
-    assert ENTRY_AUTHORITY_SCALP_V2_LIVE != ENTRY_AUTHORITY_TRAILING_BUY
     assert ENTRY_AUTHORITY_SCALP_V2_LIVE == "SCALP_V2_LIVE_ENTRY"
+    assert accepted_live_buy_authority(ENTRY_AUTHORITY_SCALP_V2_CONFIRMED)
+    assert accepted_live_buy_authority(ENTRY_AUTHORITY_DAY_V2_CONFIRMED)
+    assert not accepted_live_buy_authority(ENTRY_AUTHORITY_SCALP_V2_LIVE)
 
 
 def test_scalp_v2_live_checkpoint_rejects_pre_live_rows(tmp_path: Path):

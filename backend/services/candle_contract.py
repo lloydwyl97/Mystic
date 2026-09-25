@@ -50,6 +50,14 @@ def _parse_ts(value: object) -> float | None:
     return dt.timestamp()
 
 
+def _positive(value: object) -> float | None:
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return num if num > 0 else None
+
+
 def _non_null_ohlc(row: tuple) -> bool:
     return all(row[i] is not None for i in range(1, 5))
 
@@ -83,15 +91,26 @@ def candle_contract_matrix(
         for symbol in UNIVERSE:
             book = (books or {}).get(symbol) or (books or {}).get(symbol.replace("-", "")) or {}
             book_ts = _parse_ts(book.get("ts")) if book else None
-            book_px = book.get("price") if book else None
+            bid = _positive(book.get("bid"))
+            ask = _positive(book.get("ask"))
+            book_px = _positive(book.get("price"))
+            if book_px is None and bid is not None and ask is not None:
+                book_px = (bid + ask) / 2.0
+            spread = (ask - bid) if bid is not None and ask is not None else None
+            book_age = None if book_ts is None else max(0.0, moment - book_ts)
             cells.append(
                 {
                     "symbol": symbol,
                     "timeframe": "book",
+                    "bid": bid,
+                    "ask": ask,
+                    "spread": spread,
+                    "book_timestamp": book_ts,
+                    "book_age_sec": book_age,
                     "last_completed_ts": book_ts,
                     "forming_ts": None,
-                    "age_sec": None if book_ts is None else max(0.0, moment - book_ts),
-                    "ohlc_non_null": book_px is not None and float(book_px) > 0,
+                    "age_sec": book_age,
+                    "ohlc_non_null": book_px is not None,
                     "volume_non_null": None,
                     "expected_interval_sec": None,
                     "missing_bar_count": 0 if book_px else 1,
@@ -99,8 +118,8 @@ def candle_contract_matrix(
                     "cache_key": f"price:{symbol.replace('-', '')}",
                     "consumer": "SCALP_V2,DAY_V2",
                     "stale_threshold_sec": 30,
-                    "stale": book_ts is None or (moment - book_ts) > 30,
-                    "recovery": "fetch_canonical_mark_once_per_cycle",
+                    "stale": book_ts is None or (book_age or 0) > 30,
+                    "recovery": "fetch_canonical_mark_once_per_cycle" if book_px else "book_absent",
                 }
             )
             if not has:
@@ -129,7 +148,8 @@ def candle_contract_matrix(
                     gap = (_parse_ts(last[0]) or 0) - (_parse_ts(prev[0]) or 0)
                     if sec > 0 and gap > sec * 1.5:
                         missing = max(0, round(gap / sec) - 1)
-                age = None if last_ts is None else max(0.0, moment - (last_ts + sec))
+                age = None if last_ts is None else max(0.0, moment - last_ts)
+                close_age = None if last_ts is None else max(0.0, moment - (last_ts + sec))
                 stale_limit = sec * STALE_MULT
                 cells.append(
                     {
@@ -138,6 +158,7 @@ def candle_contract_matrix(
                         "last_completed_ts": last[0] if last else None,
                         "forming_ts": forming[0] if forming else None,
                         "age_sec": age,
+                        "close_age_sec": close_age,
                         "ohlc_non_null": bool(last) and _non_null_ohlc(last),
                         "volume_non_null": bool(last) and last[5] is not None,
                         "expected_interval_sec": sec,
@@ -146,7 +167,7 @@ def candle_contract_matrix(
                         "cache_key": f"feature_ohlcv:{symbol}:{interval}",
                         "consumer": CONSUMERS[interval],
                         "stale_threshold_sec": stale_limit,
-                        "stale": last_ts is None or (age or 0) > stale_limit,
+                        "stale": last_ts is None or (close_age or 0) > stale_limit,
                         "recovery": "skip_blank_row_wait_for_next_closed_bar" if last else "writer_has_not_committed",
                     }
                 )

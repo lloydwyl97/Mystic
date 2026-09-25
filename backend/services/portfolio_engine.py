@@ -2784,7 +2784,9 @@ class PortfolioEngine:
             for symbol, position in positions_snapshot:
                 api_sym = _to_api_symbol(symbol)
                 base_asset = api_sym[:-4] if api_sym.endswith("USDT") else api_sym  # SOLUSDT -> SOL
-                exchange_qty = float(total_balances.get(base_asset, 0) or 0)
+                from backend.services.protected_external_inventory import protected_quantity
+
+                exchange_qty = max(0.0, float(total_balances.get(base_asset, 0) or 0) - protected_quantity(self.db_path, symbol))
                 db_qty = position.quantity
                 await self._ensure_symbol_constraints(symbol)
                 constraints = self._symbol_constraints.get(symbol) or {}
@@ -2880,9 +2882,8 @@ class PortfolioEngine:
     ) -> None:
         """
         Import exchange balances that are not yet in engine positions.
-        Genuine leftovers are retained as DUST_PENDING (no BUY, no realized P&L).
-        If an unclosed mystic BUY exists for the symbol, reuse that trade_id
-        and fill price instead of minting reconcile_import_*.
+        Balances below dust stay dust. Larger unowned balances are
+        PROTECTED_EXTERNAL_INVENTORY. They are not strategy positions.
         Never adjust realized_pnl (do not treat as loss).
         """
         if not self._live_execution_enabled or not self._live_service:
@@ -2947,53 +2948,20 @@ class PortfolioEngine:
                         dust_reason or "dust",
                     )
                     continue
-                lot_tid = ""
-                lot_px = price
-                try:
-                    with connect_managed(self.db_path) as conn:
-                        row = conn.execute(
-                            """
-                            SELECT trade_id, price FROM paper_trades
-                            WHERE side = 'BUY'
-                              AND replace(replace(upper(symbol), '/', ''), '-', '')
-                                  = replace(replace(upper(?), '/', ''), '-', '')
-                              AND IFNULL(remaining_position, 0) > 1e-12
-                            ORDER BY id DESC LIMIT 1
-                            """,
-                            (symbol,),
-                        ).fetchone()
-                    if row:
-                        lot_tid = str(row[0] or "")
-                        if float(row[1] or 0) > 0:
-                            lot_px = float(row[1])
-                except Exception:
-                    lot_tid = ""
-                position = OpenPosition(
-                    symbol=symbol,
-                    quantity=track_qty,
-                    entry_price=lot_px,
-                    entry_time=time.time(),
-                    trade_id=lot_tid or f"reconcile_import_{symbol.replace('/', '_')}_{int(time.time())}",
-                    stop_price=price * 0.97,
-                    take_profit_1_price=price * 1.02,
-                    take_profit_2_price=price * 1.05,
-                    trailing_stop_price=price * 0.95,
-                    tp1_hit=False,
-                    highest_price=price,
-                    atr_at_entry=price * 0.015,
-                    entry_bar_timestamp=int(time.time()),
-                    confidence_at_entry=0.5,
-                )
-                self.open_positions[symbol] = position
-                await self._persist_position_to_sqlite(position)
+                from backend.services.protected_external_inventory import record_protected
+
+                source_id = f"reconcile_import_{symbol.replace('/', '_')}_{int(time.time())}"
+                with connect_managed(self.db_path) as conn:
+                    record_protected(conn, symbol, track_qty, price, source_trade_id=source_id)
+                    conn.commit()
                 imported_any = True
                 logger.info(
-                    "LIVE_RECONCILE_ASSET_IMPORTED symbol=%s qty=%s entry_price=%s trade_id=%s notional=%.2f",
+                    "PROTECTED_EXTERNAL_INVENTORY symbol=%s qty=%s mark=%s source=%s notional=%.2f",
                     symbol,
                     track_qty,
-                    lot_px,
-                    position.trade_id,
-                    track_qty * lot_px,
+                    price,
+                    source_id,
+                    track_qty * price,
                 )
             except Exception as e:
                 logger.warning("LIVE_RECONCILE_IMPORT_ERROR: %s %s", symbol, e)
@@ -4125,7 +4093,7 @@ class PortfolioEngine:
 
         cost_basis = sum(pos.entry_price * pos.quantity for pos in self.open_positions.values())
         if not self.open_positions:
-            return (0.0, 0.0)
+            return self._add_protected_equity(0.0, 0.0, prices)
 
         positions_value_market = 0.0
 
@@ -4148,7 +4116,7 @@ class PortfolioEngine:
                 p = prices.get(symbol) or prices.get(ns) or prices.get(base)
                 cp = float(p) if p is not None and float(p) > 0 else pos.entry_price
                 _accumulate(symbol, pos, cp)
-            return (positions_value_market, cost_basis)
+            return self._add_protected_equity(positions_value_market, cost_basis, prices)
 
         try:
             from backend.config.redis_config import get_redis_client
@@ -4170,7 +4138,17 @@ class PortfolioEngine:
             logger.warning("RECOMPUTE: Redis for prices: %s", e)
             for symbol, pos in self.open_positions.items():
                 _accumulate(symbol, pos, pos.entry_price)
-        return (positions_value_market, cost_basis)
+        return self._add_protected_equity(positions_value_market, cost_basis, prices)
+
+    def _add_protected_equity(self, market: float, cost: float, prices: dict[str, float] | None) -> tuple[float, float]:
+        try:
+            from backend.services.protected_external_inventory import protected_equity
+
+            extra_market, extra_cost = protected_equity(self.db_path, prices)
+            return market + extra_market, cost + extra_cost
+        except Exception:
+            logger.debug("PROTECTED_EQUITY_SKIPPED", exc_info=True)
+            return market, cost
 
     async def _fetch_live_mark_for_open_position(self, symbol: str) -> float:
         """
@@ -7537,6 +7515,11 @@ class PortfolioEngine:
             kwargs = {} if allow_mutations else {"timeout_sec": 3.0}
             with opener(self.db_path, **kwargs) as conn:
                 cursor = conn.cursor()
+                if allow_mutations:
+                    from backend.services.protected_external_inventory import reclassify_unowned_imports
+
+                    reclassify_unowned_imports(conn)
+                    conn.commit()
 
                 # Check if table exists
                 cursor.execute("""
@@ -8092,12 +8075,9 @@ class PortfolioEngine:
         ACTIVE and EXIT_RESIDUAL_PENDING with qty>0 are held.
         DUST_PENDING is leftover accounting and is never held for entry.
         """
-        if position is None:
-            return False
-        status = str(getattr(position, "status", "ACTIVE") or "ACTIVE")
-        if status == "DUST_PENDING":
-            return False
-        return float(getattr(position, "quantity", 0) or 0) > 0
+        from backend.services.protected_external_inventory import consumes_strategy_slot
+
+        return consumes_strategy_slot(position)
 
     def _day_entry_held_symbols(self) -> set[str]:
         return {normalize_symbol(sym) for sym, pos in self.open_positions.items() if self._day_position_blocks_new_entry(pos)}
@@ -8709,14 +8689,11 @@ class PortfolioEngine:
         import contextlib
         from datetime import datetime, timezone
 
-        from backend.config.day_entry_execution import (
-            ENTRY_AUTHORITY_SCALP_V2_CONFIRMED,
-            ENTRY_AUTHORITY_SCALP_V2_LIVE,
-        )
+        from backend.config.day_entry_execution import ENTRY_AUTHORITY_SCALP_V2_CONFIRMED
         from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
         from backend.services.two_engine_claim import COMBINED_POSITION_CAP, claim_symbol, release_claim
 
-        if str(entry_authority or "") not in {ENTRY_AUTHORITY_SCALP_V2_CONFIRMED, ENTRY_AUTHORITY_SCALP_V2_LIVE}:
+        if str(entry_authority or "") != ENTRY_AUTHORITY_SCALP_V2_CONFIRMED:
             logger.error("SCALP_V2_BUY_BLOCKED symbol=%s UNKNOWN_ENGINE authority=%s", symbol, entry_authority or "missing")
             self.last_buy_reject_reason = "UNKNOWN_ENGINE"
             return None
@@ -11126,6 +11103,22 @@ class PortfolioEngine:
         current_bar: bar close timestamp (seconds) for cooldown; from integration when sell is from exit monitor.
         Elite Hardening: Kill switch check + audit trail.
         """
+        from backend.services.protected_external_inventory import protected_quantity, strategy_sell_quantity
+
+        owned_qty = None
+        want = normalize_symbol(symbol)
+        for key, pos in self.open_positions.items():
+            if normalize_symbol(key) == want:
+                owned_qty = float(getattr(pos, "quantity", 0) or 0)
+                break
+        if owned_qty is None and protected_quantity(self.db_path, symbol) > 0:
+            logger.error("SELL_BLOCKED_PROTECTED_INVENTORY symbol=%s requested=%s", symbol, quantity)
+            return None
+        if owned_qty is not None:
+            quantity = strategy_sell_quantity(owned_qty, quantity)
+            if quantity <= 0 and protected_quantity(self.db_path, symbol) > 0:
+                logger.error("SELL_BLOCKED_PROTECTED_INVENTORY symbol=%s owned=%s", symbol, owned_qty)
+                return None
         # Capture pre-ledger for audit
         pre_ledger = {
             "cash_balance": self.cash_balance,
@@ -13002,13 +12995,9 @@ class PortfolioEngine:
 
     def _count_live_slots(self) -> int:
         """Occupied live slots: active positions/orders only. DUST_PENDING never counts."""
-        n = 0
-        for pos in self.open_positions.values():
-            if str(getattr(pos, "status", "ACTIVE") or "ACTIVE") == "DUST_PENDING":
-                continue
-            if float(getattr(pos, "quantity", 0) or 0) <= 0:
-                continue
-            n += 1
+        from backend.services.protected_external_inventory import consumes_strategy_slot
+
+        n = sum(1 for pos in self.open_positions.values() if consumes_strategy_slot(pos))
         pending = getattr(self, "_pending_buy_symbols", None)
         pending_syms = set()
         if callable(pending):
@@ -13022,7 +13011,7 @@ class PortfolioEngine:
             pass
         reservations = getattr(self, "_entry_reservations", None) or {}
         pending_syms |= {str(s) for s in reservations}
-        open_syms = {str(s) for s, p in self.open_positions.items() if str(getattr(p, "status", "ACTIVE") or "") != "DUST_PENDING"}
+        open_syms = {str(s) for s, p in self.open_positions.items() if consumes_strategy_slot(p)}
         n += len(pending_syms - open_syms)
         return n
 
@@ -14123,6 +14112,17 @@ class PortfolioEngine:
         # (catastrophic / structural / winner-trail / objective / time) and
         # skip the SCALP V2 stall/giveback/profit logic below.
         _pos_engine_id = str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE")
+        from backend.services.protected_external_inventory import exit_route
+
+        _exit_route = exit_route(_pos_engine_id)
+        if _exit_route in {"NONE", "FAIL_CLOSED"}:
+            logger.error(
+                "EXIT_ROUTE_CLOSED symbol=%s engine_id=%s route=%s",
+                symbol,
+                _pos_engine_id,
+                _exit_route,
+            )
+            return None
         if _pos_engine_id == "DAY_V2":
             try:
                 from backend.services.day_v2.live_exit_evaluator import evaluate_day_v2_exit

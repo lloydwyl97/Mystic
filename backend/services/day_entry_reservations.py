@@ -347,6 +347,127 @@ def active_symbols(db_path: str | Path) -> set[str]:
     return {str(r["symbol"]) for r in load_active_reservations(db_path)}
 
 
+def unreserved_cash(cash: float, open_order_commitments: float, active_reservation_notional: float) -> float:
+    """cash minus open-order commitments minus active reservations."""
+    return float(cash) - float(open_order_commitments) - float(active_reservation_notional)
+
+
+def _actionable_opportunity(conn: sqlite3.Connection, symbol: str, now: float) -> bool:
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "scalp_v2_opportunities" not in tables:
+        return False
+    from backend.services.scalp_v2.opportunity import SCALP_V2_OPP_EXPIRY_SEC
+
+    row = conn.execute(
+        """
+        SELECT created_at FROM scalp_v2_opportunities
+        WHERE symbol=? AND state='ARMED'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (symbol,),
+    ).fetchone()
+    if row is None:
+        return False
+    return (now - float(row[0] or 0.0)) <= float(SCALP_V2_OPP_EXPIRY_SEC)
+
+
+def _accepted_order(conn: sqlite3.Connection, symbol: str) -> str:
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "portfolio_engine_orders" not in tables:
+        return ""
+    row = conn.execute(
+        """
+        SELECT order_id FROM portfolio_engine_orders
+        WHERE symbol=?
+          AND UPPER(COALESCE(status, '')) NOT IN ('CANCELED', 'CANCELLED', 'FILLED', 'REJECTED', 'EXPIRED', 'CLOSED')
+        ORDER BY rowid DESC LIMIT 1
+        """,
+        (symbol,),
+    ).fetchone()
+    return "" if row is None else str(row[0] or "")
+
+
+def _strategy_position(conn: sqlite3.Connection, symbol: str) -> str:
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "portfolio_engine_positions" not in tables:
+        return ""
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(portfolio_engine_positions)")}
+    if "engine_id" not in cols:
+        return ""
+    row = conn.execute(
+        """
+        SELECT engine_id FROM portfolio_engine_positions
+        WHERE symbol=? AND COALESCE(quantity, 0) > 0
+          AND COALESCE(engine_id, '') IN ('DAY_V2', 'SCALP_V2')
+        LIMIT 1
+        """,
+        (symbol,),
+    ).fetchone()
+    return "" if row is None else str(row[0] or "")
+
+
+def release_orphan_reservations(db_path: str | Path, *, now: float | None = None) -> list[dict[str, Any]]:
+    """Release each ACTIVE reservation that has no actionable opportunity, order, or strategy lot.
+
+    A row is updated only while it is still ACTIVE, so a second call releases nothing.
+    """
+    ensure_reservation_schema(db_path)
+    moment = float(now if now is not None else time.time())
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    released: list[dict[str, Any]] = []
+    try:
+        rows = conn.execute(
+            """
+            SELECT reservation_id, symbol, COALESCE(sleeve, ''), COALESCE(decision_id, ''),
+                   created_at, notional_usd
+            FROM day_entry_reservations
+            WHERE status='ACTIVE'
+            """
+        ).fetchall()
+        for reservation_id, symbol, sleeve, decision_id, created_at, notional in rows:
+            sym = str(symbol)
+            order_id = _accepted_order(conn, sym)
+            position = _strategy_position(conn, sym)
+            actionable = _actionable_opportunity(conn, sym, moment)
+            if order_id:
+                continue
+            if position:
+                # The fill is already a position. Leaving the reservation ACTIVE
+                # would hold the same cash twice.
+                cur = conn.execute(
+                    "UPDATE day_entry_reservations SET status='CONSUMED', updated_at=? WHERE reservation_id=? AND status='ACTIVE'",
+                    (moment, reservation_id),
+                )
+                terminal = "CONSUMED"
+            elif actionable:
+                continue
+            else:
+                cur = conn.execute(
+                    "UPDATE day_entry_reservations SET status='RELEASED', updated_at=? WHERE reservation_id=? AND status='ACTIVE'",
+                    (moment, reservation_id),
+                )
+                terminal = "RELEASED"
+            if int(cur.rowcount or 0) != 1:
+                continue
+            released.append(
+                {
+                    "reservation_id": str(reservation_id),
+                    "symbol": sym,
+                    "engine": str(sleeve or ""),
+                    "decision_id": str(decision_id or ""),
+                    "created_at": float(created_at or 0.0),
+                    "desired_notional": float(notional or 0.0),
+                    "order_id": order_id,
+                    "position": position,
+                    "state": terminal,
+                }
+            )
+        conn.commit()
+        return released
+    finally:
+        conn.close()
+
+
 __all__ = [
     "STATUS_CONSUMED",
     "TERMINAL_STATUSES",
@@ -358,6 +479,8 @@ __all__ = [
     "ensure_reservation_schema",
     "expire_stale",
     "load_active_reservations",
+    "release_orphan_reservations",
     "release_reservation",
     "reservation_status",
+    "unreserved_cash",
 ]
