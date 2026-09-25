@@ -7434,6 +7434,26 @@ class PortfolioEngine:
                         if qty <= 0:
                             continue
                         tid = pos.trade_id or ""
+                        entry_order = str(getattr(pos, "entry_order_id", "") or "")
+                        paper_order_exists = False
+                        if entry_order:
+                            paper_order_exists = (
+                                cursor.execute(
+                                    "SELECT 1 FROM paper_trades WHERE side='BUY' AND order_id=? LIMIT 1",
+                                    (entry_order,),
+                                ).fetchone()
+                                is not None
+                            )
+                        from backend.services.protected_external_inventory import should_align_paper_remaining
+
+                        if not should_align_paper_remaining(tid, entry_order, paper_order_exists):
+                            logger.info(
+                                "FIFO_RECONCILE: skip paper rewrite symbol=%s trade_id=%s entry_order_id=%s",
+                                sym,
+                                tid,
+                                entry_order or "-",
+                            )
+                            continue
 
                         cursor.execute(
                             """

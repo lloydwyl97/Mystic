@@ -98,23 +98,24 @@ def _ensure(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE scalp_v2_opportunities ADD COLUMN {name} {decl}")
 
 
-def _release_once(
+def _queue_release(
     conn: sqlite3.Connection,
     row_id: int,
     reservation_id: str,
     released: int,
     symbol: str,
-    release_reservation: Callable[[str, str], None] | None,
+    queued: list[tuple[str, str]],
 ) -> None:
+    """Mark the row released inside this transaction. Call the callback after commit."""
     if int(released or 0) == 1:
         return
     rid = str(reservation_id or "")
-    if rid and release_reservation is not None:
-        release_reservation(rid, symbol)
     conn.execute(
         "UPDATE scalp_v2_opportunities SET reservation_released=1, updated_at=? WHERE id=? AND reservation_released=0",
         (time.time(), row_id),
     )
+    if rid:
+        queued.append((rid, symbol))
 
 
 def reap_expired_armed(
@@ -134,6 +135,8 @@ def reap_expired_armed(
     conn = sqlite3.connect(str(db_path), timeout=30)
     expired = 0
     collapsed = 0
+    queued: list[tuple[str, str]] = []
+    committed = False
     try:
         _ensure(conn)
         rows = conn.execute(
@@ -153,7 +156,7 @@ def reap_expired_armed(
                 "UPDATE scalp_v2_opportunities SET state='EXPIRED', updated_at=? WHERE id=? AND state='ARMED'",
                 (moment, row[0]),
             )
-            _release_once(conn, int(row[0]), str(row[4]), int(row[5] or 0), str(row[1]), release_reservation)
+            _queue_release(conn, int(row[0]), str(row[4]), int(row[5] or 0), str(row[1]), queued)
             expired += 1
         current = conn.execute(
             """
@@ -175,7 +178,7 @@ def reap_expired_armed(
                     "UPDATE scalp_v2_opportunities SET state='EXPIRED', updated_at=? WHERE id=? AND state='ARMED'",
                     (moment, stale[0]),
                 )
-                _release_once(conn, int(stale[0]), str(stale[5]), int(stale[6] or 0), str(stale[1]), release_reservation)
+                _queue_release(conn, int(stale[0]), str(stale[5]), int(stale[6] or 0), str(stale[1]), queued)
                 collapsed += 1
         zoned = conn.execute(
             """
@@ -197,7 +200,7 @@ def reap_expired_armed(
                     "UPDATE scalp_v2_opportunities SET state='EXPIRED', updated_at=? WHERE id=? AND state='ARMED'",
                     (moment, stale[0]),
                 )
-                _release_once(conn, int(stale[0]), str(stale[5]), int(stale[6] or 0), str(stale[1]), release_reservation)
+                _queue_release(conn, int(stale[0]), str(stale[5]), int(stale[6] or 0), str(stale[1]), queued)
                 collapsed += 1
         by_symbol_rows = conn.execute(
             """
@@ -218,12 +221,19 @@ def reap_expired_armed(
                     "UPDATE scalp_v2_opportunities SET state='EXPIRED', updated_at=? WHERE id=? AND state='ARMED'",
                     (moment, stale[0]),
                 )
-                _release_once(conn, int(stale[0]), str(stale[3]), int(stale[4] or 0), str(stale[1]), release_reservation)
+                _queue_release(conn, int(stale[0]), str(stale[3]), int(stale[4] or 0), str(stale[1]), queued)
                 collapsed += 1
         conn.commit()
-        return {"expired": expired, "collapsed_duplicates": collapsed}
+        committed = True
     finally:
         conn.close()
+    if committed and release_reservation is not None:
+        for reservation_id, symbol in queued:
+            try:
+                release_reservation(reservation_id, symbol)
+            except Exception:
+                continue
+    return {"expired": expired, "collapsed_duplicates": collapsed}
 
 
 def bind_reservation(db_path: str | Path, symbol: str, opportunity_id: str, reservation_id: str) -> None:

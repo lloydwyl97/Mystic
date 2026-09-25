@@ -240,6 +240,14 @@ def test_only_two_buy_authorities_are_accepted():
         assert not accepted_live_buy_authority(rejected)
 
 
+def test_imported_order_does_not_rewrite_an_older_paper_lot():
+    from backend.services.protected_external_inventory import should_align_paper_remaining
+
+    assert should_align_paper_remaining("reconcile_import_ETH_USDT_1", "1597036548", False) is False
+    assert should_align_paper_remaining("mystic_ETH/USDT_1790172572088", "1597036548", False) is False
+    assert should_align_paper_remaining("mystic_ETH/USDT_1790172572088", "1594719537", True) is True
+
+
 def test_unmatched_sells_make_lifetime_performance_unknown():
     status = strategy_performance_status({"exchange_sell_qty": 10.0, "matched_qty": 4.0, "unmatched_sell_qty": 6.0})
     assert status["lifetime_strategy_performance_known"] is False

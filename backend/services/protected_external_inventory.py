@@ -246,5 +246,12 @@ def protected_equity(db_path: str | Path, prices: dict[str, float] | None = None
     return market, cost
 
 
+def should_align_paper_remaining(trade_id: str, entry_order_id: str, paper_order_exists: bool) -> bool:
+    """Do not paint an imported or unmatched venue order onto an older paper lot."""
+    if str(trade_id or "").startswith("reconcile_import_"):
+        return False
+    return not (str(entry_order_id or "").strip() and not paper_order_exists)
+
+
 def is_strategy_engine(engine_id: str) -> bool:
     return str(engine_id or "") in _STRATEGY_ENGINES
