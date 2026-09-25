@@ -268,8 +268,8 @@ def arm_opportunity(
 ) -> tuple[str, bool]:
     """Return (opportunity_id, blocked).
 
-    One fresh ARMED or OPEN row per symbol blocks a successor. An expired ARMED
-    row is terminalized first and does not block. CLOSED history is left as-is.
+    One fresh ARMED row per symbol blocks a successor. OPEN and CLOSED history
+    stay unchanged and do not block. An expired ARMED row is terminalized first.
     """
     opp = ScalpOpportunityId.from_intent(_sym(symbol), setup, "", arm_price=arm_price)
     sym = _sym(symbol)
@@ -300,7 +300,7 @@ def arm_opportunity(
         current = conn.execute(
             """
             SELECT id FROM scalp_v2_opportunities
-            WHERE symbol=? AND engine_id=? AND state IN ('ARMED', 'OPEN')
+            WHERE symbol=? AND engine_id=? AND state='ARMED'
             ORDER BY id DESC LIMIT 1
             """,
             (sym, eid),

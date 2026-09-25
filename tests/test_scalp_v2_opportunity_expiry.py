@@ -107,9 +107,11 @@ def test_open_row_is_not_expired():
     conn.commit()
     conn.close()
 
-    # Same zone arm must be blocked — position is live
+    # Historical OPEN is not actionable and must not block a successor.
     _, blocked2 = arm_opportunity(db, "BTC/USDT", "SCALP", 84050.0)
-    assert blocked2, "OPEN row must block same-zone arm even when old"
+    assert blocked2 is False
+    states = [row[0] for row in sqlite3.connect(db).execute("SELECT state FROM scalp_v2_opportunities ORDER BY id")]
+    assert states == ["OPEN", "ARMED"]
 
 
 # ---------------------------------------------------------------------------
