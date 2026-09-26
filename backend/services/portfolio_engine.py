@@ -11443,15 +11443,16 @@ class PortfolioEngine:
         _raw_exit_trigger = str(exit_trigger or "")
         _exit_parts = split_day_exit_reasons(_raw_exit_trigger, exit_type_name=exit_type.name)
         exit_trigger = str(_exit_parts.get("canonical_exit_reason") or canonical_day_exit_reason(_raw_exit_trigger, exit_type_name=exit_type.name))
+        from backend.services.day_v2.live_exit_evaluator import day_v2_recorded_exit_reason
         from backend.services.scalp_v2.exit_evaluator import scalp_v2_recorded_exit_reason
 
         # Reporting label only; exit_trigger above still drives the sell gates.
-        _scalp_v2_recorded_reason = scalp_v2_recorded_exit_reason(_raw_exit_trigger)
-        record_exit_reason = _scalp_v2_recorded_reason or exit_trigger
+        _v2_recorded_reason = scalp_v2_recorded_exit_reason(_raw_exit_trigger) or day_v2_recorded_exit_reason(_raw_exit_trigger)
+        record_exit_reason = _v2_recorded_reason or exit_trigger
         # Stash on position for learning/attribution writers (not a strategy change).
         try:
             position._learning_raw_exit_reason = _exit_parts.get("raw_exit_reason")
-            position._learning_canonical_exit_reason = _scalp_v2_recorded_reason or _exit_parts.get("canonical_exit_reason")
+            position._learning_canonical_exit_reason = _v2_recorded_reason or _exit_parts.get("canonical_exit_reason")
             position._learning_dead_trade_reason = _exit_parts.get("dead_trade_reason")
         except Exception:
             pass
@@ -11819,7 +11820,7 @@ class PortfolioEngine:
                         original_explain = explain_obj.to_dict()
                     # Learning labels: raw STALL_EXIT_DEAD_NO_MFE + canonical STALL_EXIT.
                     _raw_lrn = getattr(position, "_learning_raw_exit_reason", None) or _raw_exit_trigger
-                    _canon_lrn = _scalp_v2_recorded_reason or getattr(position, "_learning_canonical_exit_reason", None) or exit_trigger
+                    _canon_lrn = _v2_recorded_reason or getattr(position, "_learning_canonical_exit_reason", None) or exit_trigger
                     _dead_lrn = getattr(position, "_learning_dead_trade_reason", None)
                     original_explain["raw_exit_reason"] = str(_raw_lrn or "")
                     original_explain["canonical_exit_reason"] = str(_canon_lrn or "")
@@ -13124,7 +13125,7 @@ class PortfolioEngine:
         # Resolve learning close reason from RAW engine trigger so DEAD_NO_MFE survives.
         _learn_trig = str(getattr(position, "_learning_raw_exit_reason", None) or _raw_exit_trigger or exit_trigger or "")
         ai_close_reason = self._resolve_learning_close_reason(exit_type, _learn_trig, force_sell=force_sell)
-        learning_close_reason = _scalp_v2_recorded_reason or ai_close_reason
+        learning_close_reason = _v2_recorded_reason or ai_close_reason
         entry_px = float(position.entry_price or 0.0)
         mark_px = sell_eval.get("mark_price")
         decision_mark_pnl_pct = float(sell_eval.get("net_exit_pct") or 0.0) if sell_eval.get("mark_price") is not None else None

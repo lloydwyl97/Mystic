@@ -39,6 +39,19 @@ WINNER_TRAIL_FLOOR_PCT: float = 0.005  # 0.5% minimum trail distance
 
 DAY_V2_ENGINE_ID: str = "DAY_V2"
 
+_DAY_V2_RECORDED_EXIT_REASONS: dict[str, str] = {
+    "DAY_V2_CATASTROPHIC_PROTECTION": "STOP_LOSS_EXIT",
+    "DAY_V2_STRUCTURAL_INVALIDATION": "THESIS_INVALIDATION_EXIT",
+    "DAY_V2_WINNER_PROTECTION": "TRAILING_STOP_EXIT",
+    "DAY_V2_OBJECTIVE_COMPLETE": "NET_PROFIT_EXIT",
+    "DAY_V2_TIME_EXPIRATION": "TIME_STOP_EXIT",
+}
+
+
+def day_v2_recorded_exit_reason(exit_trigger: str) -> str:
+    """Reporting label for a known DAY V2 exit trigger, else '' (caller keeps its existing label)."""
+    return _DAY_V2_RECORDED_EXIT_REASONS.get(str(exit_trigger or "").strip().upper(), "")
+
 
 def evaluate_day_v2_exit(
     *,

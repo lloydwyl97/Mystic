@@ -121,7 +121,7 @@ async def test_learning_label_fix_leaves_every_execution_input_unchanged(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_day_learning_label_unchanged(tmp_path):
+async def test_day_v2_learning_label_uses_day_mapping(tmp_path):
     run = await _run_sell(tmp_path, exit_type=ExitType.MANUAL, trigger="DAY_V2_TIME_EXPIRATION", engine_id="DAY_V2")
 
-    assert _learning_row(run.db_path)["close_reason"] == "MANUAL_EXIT"
+    assert _learning_row(run.db_path)["close_reason"] == "TIME_STOP_EXIT"

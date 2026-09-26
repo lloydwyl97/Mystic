@@ -183,7 +183,7 @@ async def test_unknown_scalp_reason_keeps_the_existing_manual_fallback(tmp_path)
     [
         (ExitType.MANUAL, "DAY_4H_STRUCTURE_BREAK_EXIT", ("DAY_4H_STRUCTURE_BREAK_EXIT", "DAY_4H_STRUCTURE_BREAK_EXIT")),
         (ExitType.TAKE_PROFIT_1, "NET_PROFIT_EXIT", ("NET_PROFIT_EXIT", "TP1")),
-        (ExitType.MANUAL, "DAY_V2_TIME_EXPIRATION", ("MANUAL_EXIT", "MANUAL")),
+        (ExitType.MANUAL, "DAY_V2_TIME_EXPIRATION", ("TIME_STOP_EXIT", "TIME_STOP_EXIT")),
     ],
 )
 async def test_day_sell_labels_unchanged(tmp_path, exit_type, trigger, stored):
