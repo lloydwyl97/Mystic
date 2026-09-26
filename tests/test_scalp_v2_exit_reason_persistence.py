@@ -6,6 +6,7 @@ import json
 import sqlite3
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -27,7 +28,9 @@ ENTRY = 60_000.0
 SELL = 60_300.0
 
 
-async def _sell(tmp_path: Path, *, exit_type: ExitType, trigger: str, engine_id: str) -> tuple[tuple, dict, str]:
+async def _run_sell(tmp_path: Path, *, exit_type: ExitType, trigger: str, engine_id: str) -> SimpleNamespace:
+    from backend.services import day_mandatory_exit_execution as mandatory
+
     db_path = tmp_path / "sell.db"
     trade_id = "scalp_v2_BTCUSDT_1"
     _init_test_db(db_path, cash=1_000.0)
@@ -80,18 +83,40 @@ async def _sell(tmp_path: Path, *, exit_type: ExitType, trigger: str, engine_id:
     gate = AsyncMock(return_value=_allowed_sell_eval(mark_price=SELL, avg_entry_price=ENTRY))
     preflight = MagicMock(passed=True, expected_avg_fill=SELL)
     preflight.to_audit_dict = MagicMock(return_value={"passed": True})
+    flatten = MagicMock(wraps=mandatory.is_mandatory_day_flatten)
+    residual = MagicMock(wraps=mandatory.mark_exit_residual_pending)
+    idempotency = MagicMock(wraps=engine._sell_idempotency_duplicate_sync)
+    live_order = AsyncMock()
     with (
         patch.object(engine, "_evaluate_sell_profitability", gate),
+        patch.object(engine, "_sell_idempotency_duplicate_sync", idempotency),
+        patch.object(mandatory, "is_mandatory_day_flatten", flatten),
+        patch.object(mandatory, "mark_exit_residual_pending", residual),
+        patch("backend.services.protected_limit_execution.execute_protected_limit_live", live_order),
         patch("backend.services.protected_limit_execution.run_protected_preflight", AsyncMock(return_value=preflight)),
         patch("backend.services.protected_limit_execution.USE_PROTECTED_LIMIT_EXECUTION", True),
         patch("backend.services.paper_trading_service.get_paper_trading_service", return_value=engine._paper_service),
     ):
         result = await engine.execute_sell_fifo("BTC/USDT", QTY, SELL, exit_type, trigger, force_sell=True)
 
-    assert result is not None
-    with sqlite3.connect(str(db_path)) as conn:
+    return SimpleNamespace(
+        db_path=str(db_path),
+        engine=engine,
+        result=result,
+        gate=gate,
+        flatten=flatten,
+        residual=residual,
+        idempotency=idempotency,
+        live_order=live_order,
+    )
+
+
+async def _sell(tmp_path: Path, *, exit_type: ExitType, trigger: str, engine_id: str) -> tuple[tuple, dict, str]:
+    run = await _run_sell(tmp_path, exit_type=exit_type, trigger=trigger, engine_id=engine_id)
+    assert run.result is not None
+    with sqlite3.connect(run.db_path) as conn:
         row = conn.execute("SELECT exit_reason, exit_type, explainability_json FROM paper_trades WHERE side='SELL' ORDER BY id DESC LIMIT 1").fetchone()
-    return row[:2], json.loads(row[2] or "{}"), str(gate.await_args.kwargs["exit_trigger"])
+    return row[:2], json.loads(row[2] or "{}"), str(run.gate.await_args.kwargs["exit_trigger"])
 
 
 @pytest.mark.parametrize(

@@ -11451,7 +11451,7 @@ class PortfolioEngine:
         # Stash on position for learning/attribution writers (not a strategy change).
         try:
             position._learning_raw_exit_reason = _exit_parts.get("raw_exit_reason")
-            position._learning_canonical_exit_reason = _exit_parts.get("canonical_exit_reason")
+            position._learning_canonical_exit_reason = _scalp_v2_recorded_reason or _exit_parts.get("canonical_exit_reason")
             position._learning_dead_trade_reason = _exit_parts.get("dead_trade_reason")
         except Exception:
             pass
@@ -12203,7 +12203,7 @@ class PortfolioEngine:
                                 strategy=_strat,
                                 realized_pnl_pct=_pnl_pct_val,
                                 hold_seconds=_hold_sec,
-                                exit_reason=str(exit_trigger or ""),
+                                exit_reason=str(record_exit_reason or ""),
                                 mfe_pct=_mfe_val,
                                 mae_pct=_mae_val,
                                 market_regime=_regime,
@@ -13124,6 +13124,7 @@ class PortfolioEngine:
         # Resolve learning close reason from RAW engine trigger so DEAD_NO_MFE survives.
         _learn_trig = str(getattr(position, "_learning_raw_exit_reason", None) or _raw_exit_trigger or exit_trigger or "")
         ai_close_reason = self._resolve_learning_close_reason(exit_type, _learn_trig, force_sell=force_sell)
+        learning_close_reason = _scalp_v2_recorded_reason or ai_close_reason
         entry_px = float(position.entry_price or 0.0)
         mark_px = sell_eval.get("mark_price")
         decision_mark_pnl_pct = float(sell_eval.get("net_exit_pct") or 0.0) if sell_eval.get("mark_price") is not None else None
@@ -13131,7 +13132,7 @@ class PortfolioEngine:
         if mark_px is not None and entry_px > 0 and quantity > 0:
             decision_mark_pnl_usd = (float(mark_px) - entry_px) * float(quantity)
         exit_reporting = {
-            "exit_reason": ai_close_reason,
+            "exit_reason": learning_close_reason,
             "decision_mark_price": mark_px,
             "decision_mark_pnl_pct": decision_mark_pnl_pct,
             "decision_mark_pnl_usd": decision_mark_pnl_usd,
@@ -13162,7 +13163,7 @@ class PortfolioEngine:
             self._record_learning_outcome(
                 symbol=normalized_symbol,
                 position=position,
-                close_reason=ai_close_reason,
+                close_reason=learning_close_reason,
                 manual_sell=False,
                 source=exit_trigger or exit_type.value,
                 exit_price=float(price),
@@ -13179,7 +13180,7 @@ class PortfolioEngine:
                 net_pnl=float(realized_pnl),
                 net_outcome_pct=float(pnl_pct),
                 hold_seconds=float(hold_time_seconds or 0.0),
-                reason=ai_close_reason,
+                reason=learning_close_reason,
             )
 
         # Track fees/slippage for scoreboard
