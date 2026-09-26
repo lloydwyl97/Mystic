@@ -76,6 +76,9 @@ _EXIT_MONITOR_STALE_BD_SIGNATURE = "name 'bd' is not defined"
 _LEDGER_MTM_PERSIST_INTERVAL_SEC = LEDGER_MTM_PERSIST_INTERVAL_SEC
 _LEDGER_MTM_PERSIST_INITIAL_DELAY_SEC = 5.0
 
+# DAY V2 executable-price freshness limit, shared by the resolver and the candle gate.
+_DAY_V2_EXECUTABLE_PRICE_STALE_SEC = 30.0
+
 # Offline DAY outcome labeling. Research-only cadence; nothing in the trade path waits on it.
 _DAY_4H_LABEL_INTERVAL_SEC = float(os.getenv("DAY_4H_LABEL_INTERVAL_SEC", "1800") or "1800")
 _DAY_4H_LABEL_INITIAL_DELAY_SEC = float(os.getenv("DAY_4H_LABEL_INITIAL_DELAY_SEC", "300") or "300")
@@ -1540,29 +1543,37 @@ class PortfolioEngineIntegration:
                 await asyncio.sleep(5)
 
     async def _resolve_day_executable_price(self, symbol: str) -> tuple[float, float | None]:
-        """Return (ask, age_sec). Never substitutes zero for a missing book."""
+        """Return (ask, age_sec). Never substitutes zero for a missing book.
+
+        Only timestamped sources are used. ``current_prices`` carries no timestamp and
+        is refreshed only for open positions, so it is never read here.
+        """
         norm = symbol.upper().replace("-", "").replace("/", "")
         ccxt = f"{norm[:-4]}/USDT" if norm.endswith("USDT") else symbol
-        keys = (norm, symbol, ccxt, norm.replace("USDT", ""))
-        for key in keys:
-            px = float(self.current_prices.get(key) or 0.0)
-            if px > 0:
-                return px, 0.0
         if self.redis_client is not None:
             try:
                 raw = await self.redis_client.hget(f"price:{norm}", "v")
                 ts_raw = await self.redis_client.hget(f"price:{norm}", "timestamp")
+                if not ts_raw:
+                    ts_raw = await self.redis_client.hget(f"price:{norm}", "ts")
                 if isinstance(raw, bytes):
                     raw = raw.decode()
                 if isinstance(ts_raw, bytes):
                     ts_raw = ts_raw.decode()
                 px = float(raw or 0.0)
-                age = None
-                if ts_raw:
-                    age = max(0.0, time.time() - float(ts_raw))
-                if px > 0:
-                    self.current_prices[norm] = px
-                    return px, age
+                if px > 0 and ts_raw:
+                    source_ts = float(ts_raw)
+                    age = max(0.0, time.time() - source_ts)
+                    if age <= _DAY_V2_EXECUTABLE_PRICE_STALE_SEC:
+                        self.current_prices[norm] = px
+                        logger.info(
+                            "DAY_V2_EXECUTABLE_PRICE symbol=%s price=%.8f source=redis_price_hash source_ts=%.3f age=%.3f",
+                            symbol,
+                            px,
+                            source_ts,
+                            age,
+                        )
+                        return px, age
             except Exception:
                 logger.debug("DAY_V2_PRICE_REDIS_MISS symbol=%s", symbol, exc_info=True)
         from backend.services.canonical_mark_price import fetch_canonical_mark
@@ -1575,11 +1586,20 @@ class PortfolioEngineIntegration:
             ask = float(getattr(mark, "ask", 0) or 0) if mark is not None else 0.0
             if ask <= 0 and mark is not None:
                 ask = float(getattr(mark, "mark", 0) or 0)
-            if ask > 0:
-                stamped = float(getattr(mark, "timestamp", 0) or time.time())
+            stamped = float(getattr(mark, "timestamp", 0) or 0) if mark is not None else 0.0
+            if ask > 0 and stamped > 0:
                 self.current_prices[norm] = ask
                 self.current_prices[ccxt] = ask
-                return ask, max(0.0, time.time() - stamped)
+                age = max(0.0, time.time() - stamped)
+                logger.info(
+                    "DAY_V2_EXECUTABLE_PRICE symbol=%s price=%.8f source=%s source_ts=%.3f age=%.3f",
+                    symbol,
+                    ask,
+                    getattr(mark, "source", "canonical_mark"),
+                    stamped,
+                    age,
+                )
+                return ask, age
             if attempt == 1:
                 await asyncio.sleep(0.35)
         return 0.0, None
@@ -1680,7 +1700,7 @@ class PortfolioEngineIntegration:
                         required_open=required_open,
                         executable_price=ask_price,
                         book_age_sec=book_age,
-                        book_stale_sec=30.0,
+                        book_stale_sec=_DAY_V2_EXECUTABLE_PRICE_STALE_SEC,
                         now=time.time(),
                     )
                     if gate["action"] == "pending":
@@ -1790,6 +1810,21 @@ class PortfolioEngineIntegration:
                     )
                     notional = float(qty) * float(ask_price)
                     if qty <= 0 or notional <= 0:
+                        record_day_decision(
+                            db_path,
+                            symbol,
+                            "REJECTED:INSUFFICIENT_EXECUTABLE_CASH",
+                            cycle_ts=as_of,
+                            closest=signal.setup,
+                            unmet=[
+                                "ZERO_SIZE",
+                                f"qty={float(qty):.8f}",
+                                f"notional={notional:.8f}",
+                                f"ask={ask_price:.8f}",
+                                f"atr={atr_val:.8f}",
+                                f"opportunity_id={signal.opportunity_id}",
+                            ],
+                        )
                         logger.warning("DAY_V2_ZERO_SIZE symbol=%s ask=%.6f atr=%.6f", symbol, ask_price, atr_val)
                         continue
 
