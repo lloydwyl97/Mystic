@@ -89,6 +89,50 @@ async def test_reconcile_drops_stale_row_so_new_scalp_lot_is_not_vanished(tmp_pa
     assert engine.open_positions["ETH/USDT"].quantity == pytest.approx(0.0095)
 
 
+@pytest.mark.asyncio
+async def test_unmatched_balance_alerts_once_not_every_reconcile(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr("backend.utils.alerts.broadcast_alert", sent)
+    engine = _reconcile_engine(tmp_path, monkeypatch)
+
+    await engine._import_missing_exchange_positions({"ETH": 0.02}, {"ETH": 0.02})
+    await engine._import_missing_exchange_positions({"ETH": 0.02}, {"ETH": 0.02})
+
+    assert sent.await_count == 1
+    assert "ETH/USDT" in sent.await_args.args[0]
+    assert "no Mystic fill record" in sent.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_restored_mystic_fill_does_not_alert(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from tests.test_scalp_v2_live_fill_ownership import _seed_buy
+
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr("backend.utils.alerts.broadcast_alert", sent)
+    engine = _reconcile_engine(tmp_path, monkeypatch)
+    _seed_buy(engine.db_path, remaining=0.0094981)
+
+    await engine._import_missing_exchange_positions({"ETH": 0.0094981}, {"ETH": 0.0094981})
+
+    assert sent.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_alert_failure_does_not_break_reconcile(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr("backend.utils.alerts.broadcast_alert", AsyncMock(side_effect=RuntimeError("down")))
+    engine = _reconcile_engine(tmp_path, monkeypatch)
+
+    await engine._import_missing_exchange_positions({"ETH": 0.02}, {"ETH": 0.02})
+
+    assert _one(engine.db_path, "SELECT quantity FROM protected_external_inventory WHERE symbol='ETH/USDT'")[0] == pytest.approx(0.02)
+
+
 def _exit(highest: float, current: float, atr: float = 1.2, cost: float = 0.0006):
     return evaluate_day_v2_exit(
         engine_id="DAY_V2",

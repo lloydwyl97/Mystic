@@ -2956,8 +2956,9 @@ class PortfolioEngine:
                         dust_reason or "dust",
                     )
                     continue
-                from backend.services.protected_external_inventory import record_protected
+                from backend.services.protected_external_inventory import protected_quantity, record_protected
 
+                already_flagged = protected_quantity(self.db_path, symbol) > 0
                 restored = await self._restore_unsold_scalp_lot(symbol, free_qty, price, min_notional)
                 if restored > 0:
                     imported_any = True
@@ -2980,6 +2981,8 @@ class PortfolioEngine:
                     source_id,
                     track_qty * price,
                 )
+                if not already_flagged:
+                    await self._alert_unmatched_exchange_balance(symbol, track_qty, price)
             except Exception as e:
                 logger.warning("LIVE_RECONCILE_IMPORT_ERROR: %s %s", symbol, e)
         if imported_any:
@@ -9214,6 +9217,24 @@ class PortfolioEngine:
                 conn.commit()
 
         run_locked_retry(_op)
+
+    async def _alert_unmatched_exchange_balance(self, symbol: str, quantity: float, price: float) -> None:
+        """An exchange balance with no Mystic fill record is a lost-ownership error, not a holding to keep quietly."""
+        notional = float(quantity) * float(price)
+        logger.error(
+            "UNMATCHED_EXCHANGE_BALANCE symbol=%s qty=%s mark=%s notional=%.2f engines_will_not_sell=1",
+            symbol,
+            quantity,
+            price,
+            notional,
+        )
+        message = f"MYSTIC ERROR: {symbol} balance {quantity} (~${notional:.2f}) on Binance.US has no Mystic fill record. DAY and SCALP will not sell it until it is resolved."
+        try:
+            from backend.utils.alerts import broadcast_alert
+
+            await asyncio.wait_for(broadcast_alert(message), timeout=15)
+        except Exception as e:
+            logger.warning("UNMATCHED_EXCHANGE_BALANCE_ALERT_FAILED symbol=%s err=%s", symbol, e)
 
     async def _restore_unsold_scalp_lot(self, symbol: str, free_qty: float, price: float, min_notional: float) -> float:
         """Rebind an order-id-backed SCALP V2 BUY row that has no position. Returns the restored quantity."""
