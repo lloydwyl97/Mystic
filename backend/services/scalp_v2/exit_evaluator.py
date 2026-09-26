@@ -55,6 +55,21 @@ SCALP_V2_EXIT_GIVEBACK = "SCALP_V2_GIVEBACK"
 SCALP_V2_EXIT_STALL = "SCALP_V2_STALL"
 SCALP_V2_EXIT_TIME_STOP = "SCALP_V2_TIME_STOP"
 
+# Reporting labels for paper_trades.exit_reason / exit_type. The raw SCALP_V2_*
+# trigger stays in explainability raw_exit_reason.
+_SCALP_V2_RECORDED_EXIT_REASONS: dict[str, str] = {
+    SCALP_V2_EXIT_CATASTROPHIC: "STOP_LOSS_EXIT",
+    SCALP_V2_EXIT_NET_PROFIT: "NET_PROFIT_EXIT",
+    SCALP_V2_EXIT_GIVEBACK: "GIVEBACK_EXIT",
+    SCALP_V2_EXIT_STALL: "STALL_EXIT",
+    SCALP_V2_EXIT_TIME_STOP: "TIME_STOP_EXIT",
+}
+
+
+def scalp_v2_recorded_exit_reason(exit_trigger: str) -> str:
+    """Reporting label for a known SCALP V2 exit trigger, else '' (caller keeps its existing label)."""
+    return _SCALP_V2_RECORDED_EXIT_REASONS.get(str(exit_trigger or "").strip().upper(), "")
+
 
 def evaluate_scalp_v2_exit(
     *,

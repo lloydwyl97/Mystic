@@ -11443,6 +11443,11 @@ class PortfolioEngine:
         _raw_exit_trigger = str(exit_trigger or "")
         _exit_parts = split_day_exit_reasons(_raw_exit_trigger, exit_type_name=exit_type.name)
         exit_trigger = str(_exit_parts.get("canonical_exit_reason") or canonical_day_exit_reason(_raw_exit_trigger, exit_type_name=exit_type.name))
+        from backend.services.scalp_v2.exit_evaluator import scalp_v2_recorded_exit_reason
+
+        # Reporting label only; exit_trigger above still drives the sell gates.
+        _scalp_v2_recorded_reason = scalp_v2_recorded_exit_reason(_raw_exit_trigger)
+        record_exit_reason = _scalp_v2_recorded_reason or exit_trigger
         # Stash on position for learning/attribution writers (not a strategy change).
         try:
             position._learning_raw_exit_reason = _exit_parts.get("raw_exit_reason")
@@ -11806,15 +11811,15 @@ class PortfolioEngine:
                     # Get explainability from original trade (must always persist exit_trigger for analysis)
                     explain_obj = self.trade_explanations.get(position.trade_id) if position.trade_id else None
                     original_explain: dict[str, Any] = {}
-                    exit_type_label = paper_trades_exit_type_label(exit_type, str(exit_trigger or ""))
+                    exit_type_label = paper_trades_exit_type_label(exit_type, str(record_exit_reason or ""))
                     if explain_obj is not None:
                         explain_obj.exit_type = exit_type_label
                         explain_obj.exit_r_multiple = r_multiple
-                        explain_obj.exit_trigger = exit_trigger
+                        explain_obj.exit_trigger = record_exit_reason
                         original_explain = explain_obj.to_dict()
                     # Learning labels: raw STALL_EXIT_DEAD_NO_MFE + canonical STALL_EXIT.
                     _raw_lrn = getattr(position, "_learning_raw_exit_reason", None) or _raw_exit_trigger
-                    _canon_lrn = getattr(position, "_learning_canonical_exit_reason", None) or exit_trigger
+                    _canon_lrn = _scalp_v2_recorded_reason or getattr(position, "_learning_canonical_exit_reason", None) or exit_trigger
                     _dead_lrn = getattr(position, "_learning_dead_trade_reason", None)
                     original_explain["raw_exit_reason"] = str(_raw_lrn or "")
                     original_explain["canonical_exit_reason"] = str(_canon_lrn or "")
@@ -11866,7 +11871,7 @@ class PortfolioEngine:
                             original_explain["feature_dim"] = 0
                     if not original_explain.get("live_ai_strategy"):
                         original_explain["live_ai_strategy"] = str(getattr(position, "entry_strategy_id", "") or "day")
-                    original_explain["exit_trigger"] = exit_trigger
+                    original_explain["exit_trigger"] = record_exit_reason
                     original_explain["exit_type"] = exit_type_label
                     if sell_preflight_audit:
                         original_explain.update(sell_preflight_audit)
@@ -11886,7 +11891,7 @@ class PortfolioEngine:
                     original_explain["sleeve"] = getattr(position, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value
                     original_explain["entry_confidence"] = getattr(position, "confidence_at_entry", 0.0) or 0.0
                     original_explain["hold_time_seconds"] = int(hold_time_seconds)
-                    original_explain["exit_reason_full"] = exit_trigger
+                    original_explain["exit_reason_full"] = record_exit_reason
                     if str(exit_trigger or "").upper().startswith("LEGACY_INVENTORY_CLEANUP"):
                         original_explain["legacy_pre_regime_router"] = bool(getattr(position, "legacy_pre_regime_router", False))
                         original_explain["opened_under_router"] = bool(getattr(position, "opened_under_router", False))
@@ -12003,7 +12008,7 @@ class PortfolioEngine:
                                 json.dumps(original_explain),
                                 json.dumps(sell_preflight_audit) if sell_preflight_audit else None,
                                 pos_sleeve,
-                                exit_trigger,
+                                record_exit_reason,
                                 entry_ts_bind or None,
                                 buy_decision_id or None,
                                 sell_strategy_id,
@@ -12047,7 +12052,7 @@ class PortfolioEngine:
                                 json.dumps(original_explain),
                                 json.dumps(sell_preflight_audit) if sell_preflight_audit else None,
                                 pos_sleeve,
-                                exit_trigger,
+                                record_exit_reason,
                                 entry_ts_bind or None,
                                 buy_decision_id or None,
                                 sell_strategy_id,
@@ -12133,7 +12138,7 @@ class PortfolioEngine:
                                 sell_trade_id,
                                 position_trade_id,
                                 sell_trade_id,
-                                str(exit_trigger),
+                                str(record_exit_reason),
                                 str(exit_type_val),
                                 json.dumps(
                                     {
