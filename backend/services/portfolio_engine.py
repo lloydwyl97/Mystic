@@ -2889,6 +2889,14 @@ class PortfolioEngine:
         if not self._live_execution_enabled or not self._live_service:
             return
         free = free_balances if free_balances is not None else total_balances
+        from backend.services.protected_external_inventory import shrink_to_exchange
+
+        strategy_qty = {normalize_symbol(sym): float(getattr(pos, "quantity", 0) or 0) for sym, pos in self.open_positions.items()}
+        with connect_managed(self.db_path) as conn:
+            shrunk = shrink_to_exchange(conn, total_balances, strategy_qty)
+            conn.commit()
+        for sym, old_qty, new_qty in shrunk:
+            logger.info("PROTECTED_EXTERNAL_INVENTORY_SHRUNK symbol=%s old_qty=%s new_qty=%s", sym, old_qty, new_qty)
         qty_epsilon = 1e-10
         imported_any = False
         for asset, total_qty in total_balances.items():

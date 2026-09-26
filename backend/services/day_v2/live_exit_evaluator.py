@@ -9,7 +9,8 @@ assert_no_live_authority() calls here.
 Exit priority (highest to lowest):
   1. CATASTROPHIC_PROTECTION  — intra-bar adverse move >= 3x ATR
   2. STRUCTURAL_INVALIDATION  — closed price below structural anchor (after 3+ bars)
-  3. WINNER_PROTECTION        — trail from highest price once MFE >= 0.8%
+  3. WINNER_PROTECTION        — trail from highest price once MFE >= 0.8%,
+                                never below break-even after round-trip costs
   4. OBJECTIVE_COMPLETE       — price reaches or exceeds target
   5. TIME_EXPIRATION          — hold >= 300 min and still net-negative
 
@@ -136,20 +137,22 @@ def evaluate_day_v2_exit(
         if mfe_pct >= DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT and atr_at_entry > 0:
             atr_pct = atr_at_entry / entry_price
             trail_distance = max(WINNER_TRAIL_FLOOR_PCT, WINNER_TRAIL_ATR_MULT * atr_pct)
-            trail_trigger = highest_price * (1.0 - trail_distance)
+            break_even = entry_price * (1.0 + max(0.0, estimated_roundtrip_cost))
+            trail_trigger = max(highest_price * (1.0 - trail_distance), break_even)
             if current_price <= trail_trigger:
                 logger.warning(
-                    "DAY_V2_WINNER_TRAIL mfe=%.3f%% trail=%.3f%% trigger=%.6f price=%.6f",
+                    "DAY_V2_WINNER_TRAIL mfe=%.3f%% trail=%.3f%% trigger=%.6f break_even=%.6f price=%.6f",
                     mfe_pct * 100,
                     trail_distance * 100,
                     trail_trigger,
+                    break_even,
                     current_price,
                 )
                 return {
                     "action": "sell",
                     "reason": "DAY_V2_WINNER_PROTECTION",
                     "exit_price_estimate": current_price,
-                    "detail": (f"mfe={mfe_pct * 100:.2f}% trail_dist={trail_distance * 100:.2f}% trigger={trail_trigger:.6f}"),
+                    "detail": (f"mfe={mfe_pct * 100:.2f}% trail_dist={trail_distance * 100:.2f}% trigger={trail_trigger:.6f} break_even={break_even:.6f}"),
                 }
 
     # Role 5: Objective complete

@@ -107,6 +107,40 @@ def record_protected(
     )
 
 
+def shrink_to_exchange(
+    conn: sqlite3.Connection,
+    total_balances: dict[str, float],
+    strategy_qty: dict[str, float],
+    min_notional: float = 1.0,
+) -> list[tuple[str, float, float]]:
+    """Cap each protected row at the exchange balance left after strategy lots.
+
+    Protected quantity is subtracted from the exchange balance when strategy
+    positions are reconciled, so a row that outlives its coins would make new
+    strategy lots look vanished. Rows whose remainder is below ``min_notional``
+    are deleted; dust retention owns that residue. Returns (symbol, old, new).
+    """
+    ensure_schema(conn)
+    changed: list[tuple[str, float, float]] = []
+    rows = conn.execute("SELECT symbol, quantity, cost_price FROM protected_external_inventory").fetchall()
+    for symbol, qty, price in rows:
+        sym = _norm(str(symbol))
+        base = sym.split("/", maxsplit=1)[0]
+        old = float(qty or 0.0)
+        held = max(0.0, float(total_balances.get(base, 0.0) or 0.0) - max(0.0, float(strategy_qty.get(sym, 0.0) or 0.0)))
+        new = min(old, held)
+        if new * float(price or 0.0) < float(min_notional) or new <= 0.0:
+            conn.execute("DELETE FROM protected_external_inventory WHERE symbol=?", (symbol,))
+            changed.append((sym, old, 0.0))
+        elif new < old:
+            conn.execute(
+                "UPDATE protected_external_inventory SET quantity=?, updated_at=? WHERE symbol=?",
+                (new, time.time(), symbol),
+            )
+            changed.append((sym, old, new))
+    return changed
+
+
 def _reservation_owner(conn: sqlite3.Connection, symbol: str) -> tuple[str, str, str] | None:
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if "day_entry_reservations" not in tables:
