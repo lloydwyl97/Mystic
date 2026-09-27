@@ -208,7 +208,7 @@ def _signal(symbol: str) -> SimpleNamespace:
 
 @pytest.fixture
 def day_cycle(monkeypatch):
-    state = {"signal": True, "intents": [], "claims": []}
+    state = {"signal": True, "submits": [], "claims": []}
     required_open = float(((ENTRY_BAR // 900) * 900) - 900)
     bars = [{"ts_epoch": required_open - 900 * i} for i in range(59, -1, -1)]
 
@@ -234,13 +234,13 @@ def day_cycle(monkeypatch):
         state["claims"].append(norm)
         return True, "", f"res_{norm}"
 
-    def _intent(db_path, signal, ask_price, qty, **kwargs):
-        state["intents"].append({"symbol": signal.symbol, "ask": ask_price, "qty": qty})
-        return {"intent_id": f"intent_{signal.symbol}"}
+    async def _submit(engine, *, signal, ask_price, quantity, **kwargs):
+        state["submits"].append({"symbol": signal.symbol, "ask": ask_price, "qty": quantity})
+        return {"order_id": f"order_{signal.symbol}", "trade_id": f"trade_{signal.symbol}", "price": ask_price, "quantity": quantity}
 
     monkeypatch.setattr("backend.services.two_engine_claim.claim_symbol", _claim)
     monkeypatch.setattr("backend.services.two_engine_claim.release_claim", lambda *_a, **_k: None)
-    monkeypatch.setattr("backend.services.day_v2.live_entry.create_day_v2_intent", _intent)
+    monkeypatch.setattr("backend.services.day_v2.live_entry.submit_day_v2_direct_entry", _submit)
 
     async def _no_mark(symbol, *, use_cache=True):
         return None
@@ -282,7 +282,7 @@ async def test_zero_size_candidate_records_decision_without_order(tmp_path, day_
         assert unmet[0] == "ZERO_SIZE"
         assert f"ask={LIVE[symbol]:.8f}" in unmet
         assert f"opportunity_id=opp_{symbol.lower()}" in unmet
-    assert day_cycle["intents"] == []
+    assert day_cycle["submits"] == []
     assert day_cycle["claims"] == []
 
 
@@ -309,16 +309,16 @@ async def test_no_signal_row_unchanged(tmp_path, day_cycle):
 
 
 @pytest.mark.asyncio
-async def test_nonzero_size_arms_intent_with_current_price(tmp_path, day_cycle):
+async def test_nonzero_size_submits_direct_with_current_price(tmp_path, day_cycle):
     integ = _integration(tmp_path, _fresh_redis(LIVE))
     integ.current_prices.update(STARTUP)
     integ.sizing_result = (0.5, 0.0, 1.0)
 
     await integ._process_day_v2_signals(ENTRY_BAR)
 
-    assert [r[2] for r in _decisions(integ.engine.db_path)] == ["ARMED"] * len(SYMBOLS)
+    assert [r[2] for r in _decisions(integ.engine.db_path)] == ["FILLED"] * len(SYMBOLS)
     assert [c["current_price"] for c in integ.sizing_calls] == [LIVE[s] for s in SYMBOLS]
-    assert day_cycle["intents"] == [{"symbol": s, "ask": LIVE[s], "qty": 0.5} for s in SYMBOLS]
+    assert day_cycle["submits"] == [{"symbol": s, "ask": LIVE[s], "qty": 0.5} for s in SYMBOLS]
 
 
 @pytest.mark.asyncio
@@ -333,4 +333,4 @@ async def test_stale_price_rejects_before_sizing(tmp_path, day_cycle):
 
     assert [r[2] for r in _decisions(integ.engine.db_path)] == ["MISSING_EXECUTABLE_PRICE"] * len(SYMBOLS)
     assert integ.sizing_calls == []
-    assert day_cycle["intents"] == []
+    assert day_cycle["submits"] == []

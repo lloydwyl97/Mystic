@@ -1623,7 +1623,6 @@ class PortfolioEngineIntegration:
 
             import sqlite3 as _sqlite3
 
-            from backend.services.day_v2.live_entry import create_day_v2_intent
             from backend.services.day_v2.live_signal import evaluate_entry_signal
 
             db_path = str(self.engine.db_path)
@@ -1851,19 +1850,41 @@ class PortfolioEngineIntegration:
                         logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s", symbol, claim_reason)
                         continue
 
-                    intent = create_day_v2_intent(
-                        db_path,
-                        signal,
-                        ask_price,
-                        qty,
+                    # DAY direct live entry: a qualified closed-15m setup proceeds
+                    # straight to protected execution. No WAIT_DIP, no dip /
+                    # rebound / retention bracket, no 5m confirmation, no TTL.
+                    import uuid as _uuid
+
+                    from backend.services.day_v2.live_entry import submit_day_v2_direct_entry
+
+                    _direct_decision_id = str(_uuid.uuid4())
+                    _filled = await submit_day_v2_direct_entry(
+                        self.engine,
+                        signal=signal,
+                        ask_price=ask_price,
+                        quantity=qty,
+                        stop_price=float(_stop_price or 0.0),
                         structural_zone=_zone,
                         reclaim_level=_reclaim_level,
                         db_symbol=db_sym_15m,
+                        decision_id=_direct_decision_id,
+                        sleeve="",
                     )
-                    if intent:
-                        record_day_decision(db_path, symbol, "ARMED", cycle_ts=as_of, closest=signal.setup)
+                    if _filled:
+                        record_day_decision(db_path, symbol, "FILLED", cycle_ts=as_of, closest=signal.setup)
+                        try:
+                            from backend.services.day_entry_reservations import consume_reservation
+
+                            consume_reservation(
+                                db_path,
+                                reservation_id=reservation_id,
+                                decision_id=str(signal.opportunity_id),
+                                symbol=norm,
+                            )
+                        except Exception:
+                            release_claim(db_path, reservation_id=reservation_id, decision_id=str(signal.opportunity_id), symbol=norm)
                         logger.warning(
-                            "DAY_V2_SIGNAL symbol=%s setup=%s opp=%s anchor=%.6f target=%.6f zone=[%.6f,%.6f] reclaim=%.6f policy=%s",
+                            "DAY_V2_SIGNAL symbol=%s setup=%s opp=%s anchor=%.6f target=%.6f zone=[%.6f,%.6f] reclaim=%.6f policy=%s bar_ts=%d",
                             symbol,
                             signal.setup,
                             signal.opportunity_id,
@@ -1872,11 +1893,31 @@ class PortfolioEngineIntegration:
                             float(_zone.zone_low),
                             float(_zone.zone_high),
                             _reclaim_level,
-                            "DAY_STRUCTURAL_PULLBACK_V1",
+                            "DAY_DIRECT_ENTRY_V1",
+                            int(signal.signal_bar_ts or 0),
                         )
                     else:
+                        _reject = str(getattr(self.engine, "last_buy_reject_reason", "") or "UNSPECIFIED")
                         release_claim(db_path, reservation_id=reservation_id, decision_id=str(signal.opportunity_id), symbol=norm)
-                        record_day_decision(db_path, symbol, "INTENT_NOT_CREATED", cycle_ts=as_of, closest=signal.setup)
+                        record_day_decision(
+                            db_path,
+                            symbol,
+                            f"SUBMIT_REJECTED:{_reject}",
+                            cycle_ts=as_of,
+                            closest=signal.setup,
+                            unmet=[
+                                f"exchange_code={_reject}",
+                                f"message={_reject}",
+                                f"symbol={symbol}",
+                                f"qty={float(qty):.8f}",
+                                f"price={ask_price:.8f}",
+                                f"notional={notional:.4f}",
+                                f"decision_id={_direct_decision_id}",
+                                f"opportunity_id={signal.opportunity_id}",
+                                f"bar_ts={int(signal.signal_bar_ts or 0)}",
+                            ],
+                        )
+                        logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s notional=%.4f", symbol, _reject, notional)
 
                 except Exception:
                     logger.warning("DAY_V2_SIGNAL_ERROR symbol=%s", symbol, exc_info=True)

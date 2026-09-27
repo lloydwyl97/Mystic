@@ -8646,6 +8646,8 @@ class PortfolioEngine:
         entry_authority: str = "",
         client_order_id: str = "",
         trailing_buy_intent_id: str = "",
+        fill_engine_id: str = "",
+        fill_opportunity_id: str = "",
     ) -> dict[str, Any] | None:
         """
         SOLE EXECUTION POINT FOR BUYS — thin locking wrapper.
@@ -8699,6 +8701,8 @@ class PortfolioEngine:
                 entry_authority=entry_authority,
                 client_order_id=client_order_id,
                 trailing_buy_intent_id=trailing_buy_intent_id,
+                fill_engine_id=fill_engine_id,
+                fill_opportunity_id=fill_opportunity_id,
             )
             if bought is None:
                 self._persist_buy_reject_hold(symbol, decision_id=decision_id, intent_id=trailing_buy_intent_id)
@@ -9380,6 +9384,8 @@ class PortfolioEngine:
         entry_authority: str = "",
         client_order_id: str = "",
         trailing_buy_intent_id: str = "",
+        fill_engine_id: str = "",
+        fill_opportunity_id: str = "",
     ) -> dict[str, Any] | None:
         """
         SOLE EXECUTION POINT FOR BUYS
@@ -10590,6 +10596,13 @@ class PortfolioEngine:
                             position.thesis_target_level = _d2_target
             except Exception:
                 logger.debug("SCALP_V2_INTENT_STAMP_SKIPPED %s", symbol, exc_info=True)
+        if not trailing_buy_intent_id and str(fill_engine_id or "") == "DAY_V2":
+            # Direct DAY V2 entry (no trailing intent): stamp DAY_V2 ownership
+            # and the opportunity linkage explicitly. Constrained to exactly
+            # "DAY_V2" so SCALP/legacy stamping is bit-identical.
+            position.engine_id = "DAY_V2"
+            if str(fill_opportunity_id or ""):
+                position.scalp_opportunity_id = str(fill_opportunity_id)
         if buy_mode == "live" and not position.scalp_opportunity_id:
             from backend.services.scalp_v2.opportunity import ScalpOpportunityId
 

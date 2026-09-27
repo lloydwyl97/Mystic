@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -54,6 +55,49 @@ class DayV2Signal:
     signal_bar_ts: int  # timestamp of the closed 15m bar that fired
     h1_bullish: bool
     opportunity_id: str  # deterministic 16-char hex ID for this opportunity
+
+
+def _signal_bar_ts(bar: dict[str, Any]) -> int:
+    """Resolve the completed signal-bar timestamp to epoch seconds (never 0 when known).
+
+    ``load_closed_bars`` returns the raw DB datetime string in ``ts`` and the
+    parsed epoch in ``ts_epoch``. Earlier code read ``ts`` as a number and
+    silently persisted ``signal_bar_ts = 0`` on every live intent. Prefer the
+    epoch field, then a numeric ``ts``, then a datetime-string parse.
+    """
+    for key in ("ts_epoch", "ts"):
+        value = bar.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and float(value) > 0:
+            return int(value)
+        if isinstance(value, str) and value.strip():
+            text = value.strip()
+            try:
+                num = float(text)
+                if num > 0:
+                    return int(num)
+            except (TypeError, ValueError):
+                pass
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    return int(datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).timestamp())
+                except ValueError:
+                    continue
+    return 0
+
+
+def _compare_ts(bar: dict[str, Any]) -> float:
+    """Epoch seconds for bar-ordering comparisons (mixed-format safe).
+
+    Production bars carry the raw DB string in ``ts``; synthetic/test bars
+    may carry numeric epochs. Comparing them directly raises TypeError and
+    kills the whole evaluation cycle, so normalize through ``_signal_bar_ts``.
+    """
+    try:
+        return float(_signal_bar_ts(bar))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _opportunity_id(symbol: str, setup: str, anchor: float) -> str:
@@ -166,9 +210,9 @@ def _detect_setup(
 
     # 4H regime: last 4H bar relative to 10-bar SMA
     regime = "neutral"
-    ts0 = b0["ts"]
+    ts0 = _compare_ts(b0)
     if bars_4h:
-        h4_past = [b for b in bars_4h if b["ts"] <= ts0]
+        h4_past = [b for b in bars_4h if _compare_ts(b) <= ts0]
         if len(h4_past) >= 10:
             h4_closes = [float(b["close"]) for b in h4_past[-11:]]
             h4_sma10 = _sma(h4_closes, 10)
@@ -182,7 +226,7 @@ def _detect_setup(
     # 1H context: last 1H close vs 5 bars ago
     h1_bullish = False
     if bars_1h:
-        h1_past = [b for b in bars_1h if b["ts"] <= ts0]
+        h1_past = [b for b in bars_1h if _compare_ts(b) <= ts0]
         if len(h1_past) >= 5:
             h1_closes = [float(b["close"]) for b in h1_past[-6:]]
             h1_bullish = h1_closes[-1] > h1_closes[-5]
@@ -278,7 +322,7 @@ def evaluate_entry_signal(
         return None
 
     setup_name, anchor, target, regime, h1_bullish = result
-    bar_ts = bars_15m[idx]["ts"]
+    bar_ts = _signal_bar_ts(bars_15m[idx])
 
     return DayV2Signal(
         symbol=symbol,
@@ -287,7 +331,7 @@ def evaluate_entry_signal(
         structural_anchor=anchor,
         target_price=target,
         atr=atr,
-        signal_bar_ts=int(bar_ts) if isinstance(bar_ts, (int, float)) else 0,
+        signal_bar_ts=int(bar_ts),
         h1_bullish=h1_bullish,
         opportunity_id=_opportunity_id(symbol, setup_name, anchor),
     )
@@ -323,10 +367,10 @@ def explain_no_signal(
         return {"closest": "missing_stale_data", "unmet": ["indicator_unavailable"], "checks": []}
     high20 = max(highs[-20:]) if len(highs) >= 20 else None
     low20 = min(lows[-20:]) if len(lows) >= 20 else None
-    ts0 = b0["ts"]
+    ts0 = _compare_ts(b0)
     regime = "neutral"
     if bars_4h:
-        h4_past = [b for b in bars_4h if b["ts"] <= ts0]
+        h4_past = [b for b in bars_4h if _compare_ts(b) <= ts0]
         if len(h4_past) >= 10:
             h4_closes = [float(b["close"]) for b in h4_past[-11:]]
             h4_sma10 = _sma(h4_closes, 10)
@@ -337,7 +381,7 @@ def explain_no_signal(
                     regime = "bear"
     h1_bullish = False
     if bars_1h:
-        h1_past = [b for b in bars_1h if b["ts"] <= ts0]
+        h1_past = [b for b in bars_1h if _compare_ts(b) <= ts0]
         if len(h1_past) >= 5:
             h1_closes = [float(b["close"]) for b in h1_past[-6:]]
             h1_bullish = h1_closes[-1] > h1_closes[-5]
