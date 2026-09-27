@@ -525,3 +525,47 @@ async def test_ocean_shape_scalp4_day_slots_open(tmp_path):
     assert eng._combined_held_count() == 3
     ok, reason = await eng._can_open_position("BTC/USDT", 40.0, engine_id=DAY)
     assert ok is True, reason
+
+
+# ---------------------------------------------------------------------------
+# 8. Restart safety: composite keys must not read as orphans
+# ---------------------------------------------------------------------------
+
+
+async def test_restart_orphan_sync_keeps_composite_lots(tmp_path):
+    """Regression: _detect_corruption compared composite memory keys against
+    bare-symbol SQL tables and dropped every live lot from memory on restart
+    (Ocean 2026-09-27: 4 SCALP lots dropped, then rewritten by restore with
+    reset high-waters and blanked provenance)."""
+    from backend.database_schema import initialize_paper_trading_schema
+
+    eng = _engine(tmp_path)
+    initialize_paper_trading_schema(str(tmp_path / "two_engine.db"))
+    for sym, tid in (("BTC/USDT", "s1"), ("ETH/USDT", "s2")):
+        pos = _lot(sym, SCALP, trade_id=tid)
+        eng.open_positions[make_position_key(SCALP, sym)] = pos
+        await eng._persist_position_to_sqlite(pos)
+        with sqlite3.connect(str(tmp_path / "two_engine.db")) as conn:
+            conn.execute(
+                "INSERT INTO paper_trades (trade_id, paper_run_id, mode, symbol, side, quantity, price, remaining_position, timestamp, status) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (tid, "scalp_v2_live", "live", sym, "BUY", 0.01, 100.0, 0.01, "2026-09-27T00:00:00+00:00", "executed"),
+            )
+            conn.commit()
+    corrupted, _ = await eng._detect_corruption()
+    assert corrupted is False
+    assert sorted(eng.open_positions) == ["SCALP_V2::BTC/USDT", "SCALP_V2::ETH/USDT"]
+
+
+def test_prune_coin_performance_uses_symbols_not_keys(tmp_path):
+    eng = _engine(tmp_path)
+    eng.open_positions[make_position_key(SCALP, "BTC/USDT")] = _lot("BTC/USDT", SCALP)
+    assert eng._prune_coin_performance() is None  # must not raise; held coin kept by symbol
+    from backend.services.portfolio_engine import CoinPerformance
+
+    eng.coin_performance = {
+        "BTC/USDT": CoinPerformance(symbol="BTC/USDT"),
+        **{f"C{i}/USDT": CoinPerformance(symbol=f"C{i}/USDT") for i in range(310)},
+    }
+    eng._prune_coin_performance()
+    assert "BTC/USDT" in eng.coin_performance
+    assert len(eng.coin_performance) <= 300

@@ -4032,8 +4032,13 @@ class PortfolioEngine:
                         )
 
                     if self.open_positions:
-                        engine_symbols = list(self.open_positions.keys())
-                        placeholders = ",".join("?" * len(engine_symbols))
+                        # Two-engine contract: memory keys are (engine_id, symbol);
+                        # SQL tables carry bare symbols — compare by symbol, but
+                        # drop/resolve by the exact memory key.
+                        engine_keys = list(self.open_positions.keys())
+                        key_symbols = [split_position_key(k)[1] or normalize_symbol(str(k)) for k in engine_keys]
+                        distinct_symbols = sorted(set(key_symbols))
+                        placeholders = ",".join("?" * len(distinct_symbols))
                         cursor.execute(
                             f"""
                             SELECT DISTINCT symbol
@@ -4042,40 +4047,43 @@ class PortfolioEngine:
                               AND side='BUY'
                               AND remaining_position > 0
                             """,
-                            engine_symbols,
+                            distinct_symbols,
                         )
                         paper_symbols = [row[0] for row in cursor.fetchall()]
-                        orphaned = set(engine_symbols) - set(paper_symbols)
+                        paper_set = set(paper_symbols)
+                        orphaned = [k for k, s in zip(engine_keys, key_symbols, strict=True) if s not in paper_set]
                         if orphaned:
                             canonical_rows = {}
                             try:
-                                orphan_placeholders = ",".join("?" * len(orphaned)) if orphaned else ""
+                                orphan_syms = sorted({split_position_key(k)[1] or normalize_symbol(str(k)) for k in orphaned})
+                                orphan_placeholders = ",".join("?" * len(orphan_syms)) if orphan_syms else ""
                                 if orphan_placeholders:
                                     for row in cursor.execute(
                                         f"SELECT symbol FROM portfolio_engine_positions WHERE symbol IN ({orphan_placeholders})",
-                                        list(orphaned),
+                                        orphan_syms,
                                     ):
                                         canonical_rows[str(row[0])] = True
                             except Exception:
                                 canonical_rows = {}
 
-                            for orphan_sym in orphaned:
-                                position = self.open_positions.get(orphan_sym)
+                            for orphan_key in orphaned:
+                                orphan_sym = split_position_key(str(orphan_key))[1] or normalize_symbol(str(orphan_key))
+                                position = self.open_positions.get(orphan_key)
                                 if position and orphan_sym not in canonical_rows:
                                     logger.warning(
                                         "ORPHAN_MEMORY_DROP: %s not in portfolio_engine_positions — drop from memory without ghost paper SELL",
-                                        orphan_sym,
+                                        orphan_key,
                                     )
-                                    del self.open_positions[orphan_sym]
+                                    del self.open_positions[orphan_key]
                                     continue
                                 if position and orphan_sym in canonical_rows:
                                     logger.warning(
                                         "ORPHAN_RECONCILE_SKIP: %s in portfolio_engine_positions but no paper FIFO lot — no ghost SELL",
-                                        orphan_sym,
+                                        orphan_key,
                                     )
                                     continue
                                 if position:
-                                    del self.open_positions[orphan_sym]
+                                    del self.open_positions[orphan_key]
                             conn.commit()
                             if orphaned:
                                 logger.warning(
@@ -7455,7 +7463,9 @@ class PortfolioEngine:
         """Cap coin_performance to COIN_PERFORMANCE_MAX_SYMBOLS; never prune open positions."""
         if len(self.coin_performance) <= COIN_PERFORMANCE_MAX_SYMBOLS:
             return
-        open_syms = set(self.open_positions.keys())
+        # Two-engine contract: compare by strategy symbol, not memory key —
+        # composite (engine::symbol) keys never equal bare coin symbols.
+        open_syms = {normalize_symbol(split_position_key(str(k))[1]) for k in self.open_positions}
         candidates = [(s, p.last_updated) for s, p in self.coin_performance.items() if s not in open_syms]
         if len(candidates) + len(open_syms) <= COIN_PERFORMANCE_MAX_SYMBOLS:
             return
@@ -19260,11 +19270,15 @@ class PortfolioEngine:
             except Exception:
                 pass
 
+        # Two-engine contract: DAY-side held symbols for rank preference and
+        # truthful why-text — a SCALP lot must not bury a DAY candidate.
+        _day_held_syms = self._engine_held_symbols("DAY_V2")
+
         def _ml_rank_key(c):
             """Score-primary peer ranking. Open-position is only a final tie-break.
 
-            Already-open symbols are filtered from execution later (one position per
-            symbol). They must not be demoted before final_selection_score, or a
+            Already-open symbols (same engine) are filtered from execution later
+            (one position per engine per symbol). They must not be demoted before final_selection_score, or a
             weaker unheld peer can win with a false score-victory reason.
             """
             d = c.decision_data or {}
@@ -19298,7 +19312,7 @@ class PortfolioEngine:
                 -conf,
                 -ts,  # fresher / later bar wins equal ties
                 # Prefer non-open only when all score/NEV/rank/margin/conf/ts ties.
-                c.symbol in self.open_positions,
+                normalize_symbol(str(c.symbol or "")) in _day_held_syms,
                 str(c.symbol or ""),
             )
 
@@ -19306,7 +19320,7 @@ class PortfolioEngine:
 
         from backend.services.symbol_setup_outcome_penalty import assign_v3_selection_ranks
 
-        assign_v3_selection_ranks(valid_candidates, open_symbols=set(self.open_positions.keys()))
+        assign_v3_selection_ranks(valid_candidates, open_symbols=set(_day_held_syms))
 
         unique_symbols = {c.symbol for c in valid_candidates}
         logger.info("BAR_CANDIDATES: %d unique symbols from %d valid candidates", len(unique_symbols), len(valid_candidates))
