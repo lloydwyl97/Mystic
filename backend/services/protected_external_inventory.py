@@ -6,6 +6,7 @@ do not enter strategy P&L, and cannot be sold by either engine.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -131,6 +132,8 @@ def shrink_to_exchange(
         new = min(old, held)
         if new * float(price or 0.0) < float(min_notional) or new <= 0.0:
             conn.execute("DELETE FROM protected_external_inventory WHERE symbol=?", (symbol,))
+            ensure_alert_state(conn)
+            conn.execute("DELETE FROM unmatched_balance_alert_state WHERE symbol=?", (sym,))
             changed.append((sym, old, 0.0))
         elif new < old:
             conn.execute(
@@ -139,6 +142,111 @@ def shrink_to_exchange(
             )
             changed.append((sym, old, new))
     return changed
+
+
+def ensure_alert_state(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS unmatched_balance_alert_state (
+            symbol TEXT PRIMARY KEY,
+            last_alerted_qty REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+
+
+_ALERT_QTY_REL_TOL = 0.001
+
+
+def _alert_generation_changed(old_qty: float, new_qty: float) -> bool:
+    return abs(float(new_qty) - float(old_qty)) > max(1e-9, _ALERT_QTY_REL_TOL * max(abs(float(new_qty)), abs(float(old_qty))))
+
+
+def should_alert_unmatched(conn: sqlite3.Connection, symbol: str, quantity: float) -> bool:
+    """Alert-once decision backed by state, not log rotation.
+
+    First appearance alerts. An identical repeat does not. A cleared balance
+    resets (shrink_to_exchange deletes the state row). A materially changed
+    quantity is a new generation and alerts again.
+    """
+    ensure_alert_state(conn)
+    sym = _norm(symbol)
+    row = conn.execute("SELECT last_alerted_qty FROM unmatched_balance_alert_state WHERE symbol=?", (sym,)).fetchone()
+    if row is None:
+        return True
+    return _alert_generation_changed(float(row[0] or 0.0), float(quantity or 0.0))
+
+
+def _dispatch_unmatched_alert(symbol: str, quantity: float, price: float, source: str) -> None:
+    """Fire-and-forget Discord/Telegram delivery. Never raises, never blocks reconcile."""
+    import asyncio
+    import threading
+
+    notional = float(quantity or 0.0) * float(price or 0.0)
+    message = f"MYSTIC ERROR: {symbol} balance {quantity} (~${notional:.2f}) on Binance.US has no Mystic fill record (source={source}). DAY and SCALP will not sell it until it is resolved."
+
+    def _send() -> None:
+        try:
+
+            async def _run() -> None:
+                from backend.utils.alerts import broadcast_alert
+
+                await asyncio.wait_for(broadcast_alert(message), timeout=15)
+
+            asyncio.run(_run())
+        except Exception as exc:
+            logging.getLogger(__name__).warning("UNMATCHED_EXCHANGE_BALANCE_ALERT_FAILED symbol=%s err=%s", symbol, exc)
+
+    thread = threading.Thread(target=_send, name=f"unmatched-alert-{symbol}", daemon=True)
+    thread.start()
+
+
+def handle_unmatched_balance(
+    conn: sqlite3.Connection,
+    symbol: str,
+    quantity: float,
+    price: float,
+    *,
+    source: str,
+) -> bool:
+    """Canonical alert decision for every path that creates unmatched inventory.
+
+    Logs UNMATCHED_EXCHANGE_BALANCE, sends Discord + Telegram once per
+    generation, preserves accounting, never sells. Returns True when alerted.
+    """
+    import logging as _logging
+    import time as _time
+
+    ensure_schema(conn)
+    ensure_alert_state(conn)
+    sym = _norm(symbol)
+    qty = float(quantity or 0.0)
+    if qty <= 0:
+        return False
+    if not should_alert_unmatched(conn, sym, qty):
+        return False
+    conn.execute(
+        """
+        INSERT INTO unmatched_balance_alert_state(symbol, last_alerted_qty, updated_at)
+        VALUES (?,?,?)
+        ON CONFLICT(symbol) DO UPDATE SET last_alerted_qty=excluded.last_alerted_qty, updated_at=excluded.updated_at
+        """,
+        (sym, qty, _time.time()),
+    )
+    _logging.getLogger(__name__).error(
+        "UNMATCHED_EXCHANGE_BALANCE symbol=%s qty=%s mark=%s notional=%.2f source=%s engines_will_not_sell=1",
+        sym,
+        quantity,
+        price,
+        qty * float(price or 0.0),
+        source,
+    )
+    try:
+        _dispatch_unmatched_alert(sym, qty, float(price or 0.0), source)
+    except Exception as exc:
+        _logging.getLogger(__name__).warning("UNMATCHED_EXCHANGE_BALANCE_ALERT_FAILED symbol=%s err=%s", sym, exc)
+    return True
 
 
 def _reservation_owner(conn: sqlite3.Connection, symbol: str) -> tuple[str, str, str] | None:
@@ -221,6 +329,13 @@ def reclassify_unowned_imports(conn: sqlite3.Connection) -> list[str]:
         )
         conn.execute("DELETE FROM portfolio_engine_positions WHERE symbol=?", (symbol,))
         moved.append(_norm(str(symbol)))
+        handle_unmatched_balance(
+            conn,
+            str(symbol),
+            float(qty or 0.0),
+            float(price or 0.0),
+            source="reclassify_unowned_imports",
+        )
     return moved
 
 

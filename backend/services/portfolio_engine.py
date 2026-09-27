@@ -2956,9 +2956,8 @@ class PortfolioEngine:
                         dust_reason or "dust",
                     )
                     continue
-                from backend.services.protected_external_inventory import protected_quantity, record_protected
+                from backend.services.protected_external_inventory import handle_unmatched_balance, record_protected
 
-                already_flagged = protected_quantity(self.db_path, symbol) > 0
                 restored = await self._restore_unsold_scalp_lot(symbol, free_qty, price, min_notional)
                 if restored > 0:
                     imported_any = True
@@ -2971,6 +2970,7 @@ class PortfolioEngine:
                 source_id = f"reconcile_import_{symbol.replace('/', '_')}_{int(time.time())}"
                 with connect_managed(self.db_path) as conn:
                     record_protected(conn, symbol, track_qty, price, source_trade_id=source_id)
+                    handle_unmatched_balance(conn, symbol, track_qty, price, source="reconcile_import")
                     conn.commit()
                 imported_any = True
                 logger.info(
@@ -2981,8 +2981,6 @@ class PortfolioEngine:
                     source_id,
                     track_qty * price,
                 )
-                if not already_flagged:
-                    await self._alert_unmatched_exchange_balance(symbol, track_qty, price)
             except Exception as e:
                 logger.warning("LIVE_RECONCILE_IMPORT_ERROR: %s %s", symbol, e)
         if imported_any:
@@ -8710,6 +8708,59 @@ class PortfolioEngine:
     # SCALP V2 live entry — dedicated path, separate from DAY's gates
     # ------------------------------------------------------------------
 
+    def _scalp_v2_record_buy_fill_identity(
+        self,
+        *,
+        live_order: dict,
+        symbol: str,
+        trade_id: str,
+        decision_id: str,
+        client_order_id: str,
+        fallback_qty: float,
+        fallback_price: float,
+        fee: float,
+        commission: Any = None,
+    ) -> bool:
+        """Persist a confirmed SCALP V2 BUY to the canonical live_exchange_fills ledger.
+
+        Never raises and never reverses ownership: a ledger failure keeps the
+        BUY, the position and the consumed reservation, and logs loudly.
+        Idempotent via the (venue, order, side, trade) unique identity.
+        """
+        try:
+            from backend.services.live_order_identity import extract_identity, record_fill
+
+            items = list(getattr(commission, "items", ()) or ())
+            identity = extract_identity(
+                live_order if isinstance(live_order, dict) else {},
+                symbol=symbol,
+                side="BUY",
+                mystic_trade_id=str(trade_id or ""),
+                decision_id=str(decision_id or ""),
+                client_order_id=str(client_order_id or ""),
+                fallback_qty=float(fallback_qty or 0.0),
+                fallback_price=float(fallback_price or 0.0),
+                fee_amount=float(fee or 0.0),
+                fee_items=items,
+                fee_from_exchange=bool(getattr(commission, "fee_from_exchange", False)),
+            )
+            ok = record_fill(self.db_path, identity)
+            if not ok:
+                logger.error(
+                    "SCALP_V2_BUY_FILL_LEDGER_FAILED symbol=%s order=%s trade=%s — position kept, MANUAL LEDGER CHECK REQUIRED",
+                    symbol,
+                    identity.exchange_order_id,
+                    trade_id,
+                )
+            return ok
+        except Exception:
+            logger.exception(
+                "SCALP_V2_BUY_FILL_LEDGER_FAILED symbol=%s trade=%s — position kept",
+                symbol,
+                trade_id,
+            )
+            return False
+
     async def execute_scalp_v2_buy_live(
         self,
         symbol: str,
@@ -8937,6 +8988,19 @@ class PortfolioEngine:
                     client_order_id=client_order_id,
                     entry_time=float(position.entry_time),
                 )
+                # Canonical exchange-fill ledger (never reverses ownership on failure).
+                await _asyncio.to_thread(
+                    self._scalp_v2_record_buy_fill_identity,
+                    live_order=live_order,
+                    symbol=norm,
+                    trade_id=trade_id,
+                    decision_id=decision_key,
+                    client_order_id=client_order_id,
+                    fallback_qty=gross_qty,
+                    fallback_price=fill_price,
+                    fee=fee,
+                    commission=commission,
+                )
             except Exception:
                 # The venue order is filled. Keep an order-id-backed BUY row so
                 # reconciliation restores this lot instead of calling it external.
@@ -8972,6 +9036,20 @@ class PortfolioEngine:
                         filled_qty,
                         exc_info=True,
                     )
+                try:
+                    self._scalp_v2_record_buy_fill_identity(
+                        live_order=live_order,
+                        symbol=norm,
+                        trade_id=trade_id,
+                        decision_id=decision_key,
+                        client_order_id=client_order_id,
+                        fallback_qty=gross_qty,
+                        fallback_price=fill_price,
+                        fee=fee,
+                        commission=locals().get("commission"),
+                    )
+                except Exception:
+                    logger.exception("SCALP_V2_BUY_FILL_LEDGER_FAILED symbol=%s trade=%s", norm, trade_id)
                 consume_reservation(self.db_path, reservation_id=reservation_id, decision_id=decision_key, symbol=norm)
                 self.last_buy_reject_reason = "POST_FILL_BIND_FAILED"
                 return None
@@ -9217,24 +9295,6 @@ class PortfolioEngine:
                 conn.commit()
 
         run_locked_retry(_op)
-
-    async def _alert_unmatched_exchange_balance(self, symbol: str, quantity: float, price: float) -> None:
-        """An exchange balance with no Mystic fill record is a lost-ownership error, not a holding to keep quietly."""
-        notional = float(quantity) * float(price)
-        logger.error(
-            "UNMATCHED_EXCHANGE_BALANCE symbol=%s qty=%s mark=%s notional=%.2f engines_will_not_sell=1",
-            symbol,
-            quantity,
-            price,
-            notional,
-        )
-        message = f"MYSTIC ERROR: {symbol} balance {quantity} (~${notional:.2f}) on Binance.US has no Mystic fill record. DAY and SCALP will not sell it until it is resolved."
-        try:
-            from backend.utils.alerts import broadcast_alert
-
-            await asyncio.wait_for(broadcast_alert(message), timeout=15)
-        except Exception as e:
-            logger.warning("UNMATCHED_EXCHANGE_BALANCE_ALERT_FAILED symbol=%s err=%s", symbol, e)
 
     async def _restore_unsold_scalp_lot(self, symbol: str, free_qty: float, price: float, min_notional: float) -> float:
         """Rebind an order-id-backed SCALP V2 BUY row that has no position. Returns the restored quantity."""

@@ -89,47 +89,133 @@ async def test_reconcile_drops_stale_row_so_new_scalp_lot_is_not_vanished(tmp_pa
     assert engine.open_positions["ETH/USDT"].quantity == pytest.approx(0.0095)
 
 
+def _capture_dispatch(monkeypatch):
+    from unittest.mock import MagicMock
+
+    sent = MagicMock()
+    monkeypatch.setattr("backend.services.protected_external_inventory._dispatch_unmatched_alert", sent)
+    return sent
+
+
 @pytest.mark.asyncio
 async def test_unmatched_balance_alerts_once_not_every_reconcile(tmp_path, monkeypatch):
-    from unittest.mock import AsyncMock
-
-    sent = AsyncMock(return_value=True)
-    monkeypatch.setattr("backend.utils.alerts.broadcast_alert", sent)
+    sent = _capture_dispatch(monkeypatch)
     engine = _reconcile_engine(tmp_path, monkeypatch)
 
     await engine._import_missing_exchange_positions({"ETH": 0.02}, {"ETH": 0.02})
     await engine._import_missing_exchange_positions({"ETH": 0.02}, {"ETH": 0.02})
 
-    assert sent.await_count == 1
-    assert "ETH/USDT" in sent.await_args.args[0]
-    assert "no Mystic fill record" in sent.await_args.args[0]
+    assert sent.call_count == 1
+    assert sent.call_args.args[0] == "ETH/USDT"
 
 
 @pytest.mark.asyncio
 async def test_restored_mystic_fill_does_not_alert(tmp_path, monkeypatch):
-    from unittest.mock import AsyncMock
-
     from tests.test_scalp_v2_live_fill_ownership import _seed_buy
 
-    sent = AsyncMock(return_value=True)
-    monkeypatch.setattr("backend.utils.alerts.broadcast_alert", sent)
+    sent = _capture_dispatch(monkeypatch)
     engine = _reconcile_engine(tmp_path, monkeypatch)
     _seed_buy(engine.db_path, remaining=0.0094981)
 
     await engine._import_missing_exchange_positions({"ETH": 0.0094981}, {"ETH": 0.0094981})
 
-    assert sent.await_count == 0
+    assert sent.call_count == 0
 
 
 @pytest.mark.asyncio
 async def test_alert_failure_does_not_break_reconcile(tmp_path, monkeypatch):
-    from unittest.mock import AsyncMock
+    from unittest.mock import MagicMock
 
-    monkeypatch.setattr("backend.utils.alerts.broadcast_alert", AsyncMock(side_effect=RuntimeError("down")))
+    monkeypatch.setattr(
+        "backend.services.protected_external_inventory._dispatch_unmatched_alert",
+        MagicMock(side_effect=RuntimeError("down")),
+    )
     engine = _reconcile_engine(tmp_path, monkeypatch)
 
     await engine._import_missing_exchange_positions({"ETH": 0.02}, {"ETH": 0.02})
 
+    assert _one(engine.db_path, "SELECT quantity FROM protected_external_inventory WHERE symbol='ETH/USDT'")[0] == pytest.approx(0.02)
+
+
+def _protected_conn() -> sqlite3.Connection:
+    from backend.services.protected_external_inventory import ensure_alert_state
+
+    conn = sqlite3.connect(":memory:")
+    ensure_schema(conn)
+    ensure_alert_state(conn)
+    return conn
+
+
+def test_reclassify_path_alerts_once(monkeypatch):
+    from backend.services.protected_external_inventory import (
+        handle_unmatched_balance,
+        reclassify_unowned_imports,
+    )
+
+    sent = _capture_dispatch(monkeypatch)
+    conn = _protected_conn()
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS portfolio_engine_positions
+           (symbol TEXT, quantity REAL, entry_price REAL, trade_id TEXT)"""
+    )
+    conn.execute("INSERT INTO portfolio_engine_positions VALUES ('ETH/USDT', 0.02, 2700.0, 'reconcile_import_ETH_USDT_1')")
+    conn.commit()
+
+    assert reclassify_unowned_imports(conn) == ["ETH/USDT"]
+    assert sent.call_count == 1
+    assert sent.call_args.args[0] == "ETH/USDT"
+    # Same generation again: no repeat.
+    assert handle_unmatched_balance(conn, "ETH/USDT", 0.02, 2700.0, source="reconcile_import") is False
+    assert sent.call_count == 1
+
+
+def test_balance_clears_then_reappears_alerts_again(monkeypatch):
+    from backend.services.protected_external_inventory import handle_unmatched_balance, record_protected, shrink_to_exchange
+
+    sent = _capture_dispatch(monkeypatch)
+    conn = _conn_with([("ETH/USDT", 0.02, 2700.0)])
+
+    assert handle_unmatched_balance(conn, "ETH/USDT", 0.02, 2700.0, source="reconcile_import") is True
+    assert sent.call_count == 1
+    # Balance sold: shrink deletes the row and resets alert state.
+    assert shrink_to_exchange(conn, {}, {}) == [("ETH/USDT", 0.02, 0.0)]
+    # Same balance returns later: alerts again.
+    record_protected(conn, "ETH/USDT", 0.02, 2700.0, source_trade_id="reconcile_import_new")
+    assert handle_unmatched_balance(conn, "ETH/USDT", 0.02, 2700.0, source="reconcile_import") is True
+    assert sent.call_count == 2
+
+
+def test_materially_increased_qty_alerts_again(monkeypatch):
+    from backend.services.protected_external_inventory import handle_unmatched_balance
+
+    sent = _capture_dispatch(monkeypatch)
+    conn = _protected_conn()
+
+    assert handle_unmatched_balance(conn, "ETH/USDT", 0.02, 2700.0, source="reconcile_import") is True
+    assert handle_unmatched_balance(conn, "ETH/USDT", 0.02, 2700.0, source="reconcile_import") is False
+    assert handle_unmatched_balance(conn, "ETH/USDT", 0.04, 2700.0, source="reconcile_import") is True
+    assert sent.call_count == 2
+
+
+def test_dust_qty_does_not_alert(monkeypatch):
+    from backend.services.protected_external_inventory import handle_unmatched_balance
+
+    sent = _capture_dispatch(monkeypatch)
+    conn = _protected_conn()
+
+    assert handle_unmatched_balance(conn, "ETH/USDT", 0.0, 2700.0, source="reconcile_import") is False
+    assert sent.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_unmatched_balance_is_never_auto_sold(tmp_path, monkeypatch):
+    _capture_dispatch(monkeypatch)
+    engine = _reconcile_engine(tmp_path, monkeypatch)
+
+    await engine._import_missing_exchange_positions({"ETH": 0.02}, {"ETH": 0.02})
+
+    assert "ETH/USDT" not in engine.open_positions
+    assert _one(engine.db_path, "SELECT COUNT(*) FROM portfolio_engine_positions")[0] == 0
     assert _one(engine.db_path, "SELECT quantity FROM protected_external_inventory WHERE symbol='ETH/USDT'")[0] == pytest.approx(0.02)
 
 
