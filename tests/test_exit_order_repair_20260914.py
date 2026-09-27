@@ -89,7 +89,7 @@ def test_sell_lock_serializes_same_symbol():
     in_flight = 0
     peak = 0
 
-    async def fake_locked(symbol, quantity, price, exit_type, exit_trigger, current_bar=None, force_sell=False):
+    async def fake_locked(symbol, quantity, price, exit_type, exit_trigger, current_bar=None, force_sell=False, **_k):
         nonlocal in_flight, peak
         in_flight += 1
         peak = max(peak, in_flight)

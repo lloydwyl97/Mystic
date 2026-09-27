@@ -32,12 +32,18 @@ def normalize_trade_state_symbol(symbol: str) -> str:
     return s
 
 
-def trade_state_redis_key(symbol: str) -> str:
-    """Redis hash key for per-symbol trade state (must match TradeStateStore)."""
-    return f"trade_state:{normalize_trade_state_symbol(symbol)}"
+def trade_state_redis_key(symbol: str, engine_id: str = "") -> str:
+    """Redis hash key for per-symbol trade state (must match TradeStateStore).
+
+    Two-engine contract: engine-scoped keys isolate DAY and SCALP state;
+    empty engine_id keeps the legacy bare-symbol key.
+    """
+    base = f"trade_state:{normalize_trade_state_symbol(symbol)}"
+    engine = str(engine_id or "").strip().upper()
+    return f"{base}:{engine}" if engine else base
 
 
-def clear_trade_state_redis_sync(symbol: str) -> None:
+def clear_trade_state_redis_sync(symbol: str, engine_id: str = "") -> None:
     """
     Delete trade_state:* for symbol when the portfolio engine has no matching open position.
     Sync client (orphan cleanup / thread paths).
@@ -48,9 +54,10 @@ def clear_trade_state_redis_sync(symbol: str) -> None:
         rc = get_redis_client()
         if not rc:
             return
-        key = trade_state_redis_key(symbol)
-        rc.delete(key)
-        logger.info("TRADE_STATE: cleared Redis key %s (sync)", key)
+        keys = [trade_state_redis_key(symbol, engine_id), trade_state_redis_key(symbol)]
+        for key in dict.fromkeys(keys):
+            rc.delete(key)
+        logger.info("TRADE_STATE: cleared Redis key %s (sync)", keys[0])
     except Exception as e:
         logger.warning("TRADE_STATE: clear_trade_state_redis_sync failed for %s: %s", symbol, e)
 
@@ -81,9 +88,9 @@ class TradeStateStore:
         """Normalize symbol to consistent format"""
         return normalize_trade_state_symbol(symbol)
 
-    def _get_state_key(self, symbol: str) -> str:
-        """Redis key for trade state"""
-        return f"trade_state:{self._normalize_symbol(symbol)}"
+    def _get_state_key(self, symbol: str, engine_id: str = "") -> str:
+        """Redis key for trade state (engine-scoped when engine_id given)."""
+        return trade_state_redis_key(symbol, engine_id)
 
     def _decode_redis_hash(self, data: dict) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -93,19 +100,25 @@ class TradeStateStore:
             out[key] = val
         return out
 
-    async def _fetch_state_data(self, symbol: str) -> dict[str, str]:
+    async def _fetch_state_data(self, symbol: str, engine_id: str = "") -> dict[str, str]:
         """Read trade-state hash from Redis (sync or async client) with local fallback."""
+        norm = self._normalize_symbol(symbol)
         if self.redis_client:
-            key = self._get_state_key(symbol)
+            key = self._get_state_key(symbol, engine_id)
             result = self.redis_client.hgetall(key)
             if inspect.isawaitable(result):
                 result = await result
             if result:
                 return self._decode_redis_hash(result)
-        local = self._local_state.get(symbol)
+        local = self._local_state.get(self._local_key(norm, engine_id))
         if isinstance(local, dict) and local:
             return {str(k): str(v) for k, v in local.items()}
         return {}
+
+    @staticmethod
+    def _local_key(symbol: str, engine_id: str = "") -> str:
+        engine = str(engine_id or "").strip().upper()
+        return f"{symbol}::{engine}" if engine else symbol
 
     async def allow_new_entry_async(
         self,
@@ -113,6 +126,7 @@ class TradeStateStore:
         side: str,
         now_ts: float,
         metrics: dict | None = None,
+        engine_id: str = "",
     ) -> tuple[bool, str]:
         """
         Check if new entry is allowed for symbol.
@@ -127,7 +141,7 @@ class TradeStateStore:
             return True, "SELL_ALLOWED"
 
         try:
-            state_data = await self._fetch_state_data(symbol)
+            state_data = await self._fetch_state_data(symbol, engine_id)
             if state_data:
                 state = state_data.get("state", "IDLE")
 
@@ -149,7 +163,7 @@ class TradeStateStore:
             )
             return True, f"GATE_ERROR_FAIL_OPEN:{type(e).__name__}"
 
-    def on_entry_fill(self, symbol: str, price: float, atr: float = 0.0) -> None:
+    def on_entry_fill(self, symbol: str, price: float, atr: float = 0.0, engine_id: str = "") -> None:
         """Record entry fill: IDLE -> IN_TRADE"""
         symbol = self._normalize_symbol(symbol)
 
@@ -164,11 +178,11 @@ class TradeStateStore:
             if self.redis_client:
                 # Use sync hset if available, otherwise store locally
                 try:
-                    self.redis_client.hset(self._get_state_key(symbol), mapping=state_data)
+                    self.redis_client.hset(self._get_state_key(symbol, engine_id), mapping=state_data)
                 except Exception:
                     pass
 
-            self._local_state[symbol] = state_data
+            self._local_state[self._local_key(symbol, engine_id)] = state_data
             logger.debug("TRADE_STATE: %s -> IN_TRADE @ $%.4f", symbol, price)
 
         except Exception as e:
@@ -180,6 +194,7 @@ class TradeStateStore:
         price: float,
         exit_reason: str,
         metrics: dict | None = None,
+        engine_id: str = "",
     ) -> None:
         """Record exit: IN_TRADE -> COOLDOWN"""
         symbol = self._normalize_symbol(symbol)
@@ -197,25 +212,23 @@ class TradeStateStore:
 
             if self.redis_client:
                 try:
-                    self.redis_client.hset(self._get_state_key(symbol), mapping=state_data)
+                    self.redis_client.hset(self._get_state_key(symbol, engine_id), mapping=state_data)
                     # Set TTL so cooldown state expires
-                    self.redis_client.expire(self._get_state_key(symbol), DEFAULT_EXIT_COOLDOWN_SEC + 60)
+                    self.redis_client.expire(self._get_state_key(symbol, engine_id), DEFAULT_EXIT_COOLDOWN_SEC + 60)
                 except Exception:
                     pass
 
-            self._local_state[symbol] = state_data
+            self._local_state[self._local_key(symbol, engine_id)] = state_data
             logger.debug("TRADE_STATE: %s -> COOLDOWN until %.0f (reason: %s)", symbol, cooldown_until, exit_reason)
 
         except Exception as e:
             logger.warning("on_exit error for %s: %s", symbol, e)
 
-    def get_state(self, symbol: str) -> TradeStateEnum:
+    def get_state(self, symbol: str, engine_id: str = "") -> TradeStateEnum:
         """Get current state for symbol"""
-        symbol = self._normalize_symbol(symbol)
-
         try:
             if self.redis_client:
-                state_data = self.redis_client.hgetall(self._get_state_key(symbol))
+                state_data = self.redis_client.hgetall(self._get_state_key(symbol, engine_id))
                 if state_data:
                     state = state_data.get("state") or state_data.get(b"state")
                     if isinstance(state, bytes):
@@ -252,10 +265,10 @@ def get_trade_state_store(redis_client: Any = None) -> TradeStateStore:
     return _store_instance
 
 
-def notify_exit(symbol: str, price: float, exit_reason: str, metrics: dict | None = None) -> None:
+def notify_exit(symbol: str, price: float, exit_reason: str, metrics: dict | None = None, engine_id: str = "") -> None:
     """Convenience function to notify exit"""
     store = get_trade_state_store()
-    store.on_exit(symbol, price, exit_reason, metrics)
+    store.on_exit(symbol, price, exit_reason, metrics, engine_id=engine_id)
 
 
 def assert_exit_cooldown(symbol: str, order_id: str = "", path: str = "") -> None:

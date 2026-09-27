@@ -72,7 +72,7 @@ async def test_successful_buy_writes_canonical_fill_row(tmp_path, monkeypatch):
     assert buy[2] == opp_id
     assert row["mystic_trade_id"] == buy[0]
     assert row["decision_id"] == opp_id
-    pos = engine.open_positions["ETH/USDT"]
+    pos = engine.open_positions["SCALP_V2::ETH/USDT"]
     assert pos.engine_id == "SCALP_V2" and pos.quantity > 0
     assert _one(engine.db_path, "SELECT COUNT(*) FROM day_entry_reservations WHERE status='ACTIVE'")[0] == 0
 
@@ -89,7 +89,7 @@ async def test_fill_ledger_failure_keeps_position_and_reservation(tmp_path, monk
     result = await _buy(engine, opp_id)
 
     assert result is not None
-    assert engine.open_positions["ETH/USDT"].quantity > 0
+    assert engine.open_positions["SCALP_V2::ETH/USDT"].quantity > 0
     assert _one(engine.db_path, "SELECT COUNT(*) FROM day_entry_reservations WHERE status='ACTIVE'")[0] == 0
     assert _one(engine.db_path, "SELECT COUNT(*) FROM paper_trades WHERE side='BUY'")[0] == 1
 

@@ -1827,8 +1827,9 @@ class PortfolioEngineIntegration:
                         logger.warning("DAY_V2_ZERO_SIZE symbol=%s ask=%.6f atr=%.6f", symbol, ask_price, atr_val)
                         continue
 
-                    # Gate through _can_open_position
-                    can_open, gate_reason = await self.engine._can_open_position(norm, notional)
+                    # Gate through _can_open_position (two-engine contract:
+                    # DAY slots are engine-scoped; SCALP lots never count).
+                    can_open, gate_reason = await self.engine._can_open_position(norm, notional, engine_id="DAY_V2")
                     if not can_open:
                         gate_label = "INSUFFICIENT_EXECUTABLE_CASH" if str(gate_reason).startswith("INSUFFICIENT_CASH") else str(gate_reason)
                         record_day_decision(db_path, symbol, f"REJECTED:{gate_label}", cycle_ts=as_of, closest=signal.setup, unmet=[str(gate_reason)])
@@ -1880,6 +1881,7 @@ class PortfolioEngineIntegration:
                                 reservation_id=reservation_id,
                                 decision_id=str(signal.opportunity_id),
                                 symbol=norm,
+                                sleeve="DAY_V2",
                             )
                         except Exception:
                             release_claim(db_path, reservation_id=reservation_id, decision_id=str(signal.opportunity_id), symbol=norm)
@@ -1898,7 +1900,13 @@ class PortfolioEngineIntegration:
                         )
                     else:
                         _reject = str(getattr(self.engine, "last_buy_reject_reason", "") or "UNSPECIFIED")
-                        release_claim(db_path, reservation_id=reservation_id, decision_id=str(signal.opportunity_id), symbol=norm)
+                        release_claim(
+                            db_path,
+                            reservation_id=reservation_id,
+                            decision_id=str(signal.opportunity_id),
+                            symbol=norm,
+                            engine_id="DAY_V2",
+                        )
                         record_day_decision(
                             db_path,
                             symbol,
@@ -2003,7 +2011,7 @@ class PortfolioEngineIntegration:
         def _release(reservation_id: str, symbol: str) -> None:
             from backend.services.two_engine_claim import release_claim
 
-            release_claim(self.engine.db_path, reservation_id=reservation_id, symbol=symbol)
+            release_claim(self.engine.db_path, reservation_id=reservation_id, symbol=symbol, engine_id="SCALP_V2")
 
         reap_expired_armed(self.engine.db_path, now=cycle_ts, release_reservation=_release)
         from backend.services.day_entry_reservations import release_orphan_reservations
@@ -2023,16 +2031,16 @@ class PortfolioEngineIntegration:
                     record_scalp_decision(self.engine.db_path, norm, result_code, reason, cycle_ts=cycle_ts)
                     logger.info("SCALP_V2_DECISION symbol=%s result=%s reason=%s", norm, result_code, reason)
                     continue
-                open_positions = self.engine.open_positions or {}
-                existing_pos = open_positions.get(norm)
+                # Two-engine contract: engine-scoped lookup. SCALP's own lot
+                # blocks (same-engine duplicate); a DAY-side lot on the same
+                # symbol never blocks SCALP.
+                existing_pos = self.engine._find_position(SCALP_V2_ENGINE, norm)
                 if existing_pos is not None:
                     pos_status = str(getattr(existing_pos, "status", "ACTIVE") or "ACTIVE")
                     pos_qty = float(getattr(existing_pos, "quantity", 0) or 0)
-                    pos_engine = str(getattr(existing_pos, "engine_id", "") or "")
                     if pos_qty > 0 and pos_status != "DUST_PENDING":
-                        occupied = "SYMBOL_OCCUPIED" if pos_engine == SCALP_V2_ENGINE else "SYMBOL_OCCUPIED_BY_OTHER_ENGINE"
-                        record_scalp_decision(self.engine.db_path, norm, f"REJECTED:{occupied}", occupied, cycle_ts=cycle_ts)
-                        logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:%s", norm, occupied)
+                        record_scalp_decision(self.engine.db_path, norm, "REJECTED:SYMBOL_OCCUPIED", "SYMBOL_OCCUPIED")
+                        logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:SYMBOL_OCCUPIED", norm)
                         continue
                 arm_price = 0.0
                 snap = (row or {}).get("snap")

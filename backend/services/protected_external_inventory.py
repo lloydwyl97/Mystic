@@ -267,7 +267,14 @@ def _reservation_owner(conn: sqlite3.Connection, symbol: str) -> tuple[str, str,
     return str(row[0]), str(row[1] or ""), str(row[2] or "")
 
 
-def _stamp_strategy_identity(conn: sqlite3.Connection, symbol: str, engine: str, decision_id: str, reservation_id: str) -> None:
+def _stamp_strategy_identity(
+    conn: sqlite3.Connection,
+    symbol: str,
+    engine: str,
+    decision_id: str,
+    reservation_id: str,
+    trade_id: str = "",
+) -> None:
     cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(portfolio_engine_positions)")}
     assignments: list[str] = []
     params: list[str] = []
@@ -285,6 +292,15 @@ def _stamp_strategy_identity(conn: sqlite3.Connection, symbol: str, engine: str,
             assignments.append(f"{column}=?")
             params.append(value)
     if not assignments:
+        return
+    if trade_id:
+        # Two-engine contract: stamp exactly this lot's row, never a sibling
+        # engine's same-symbol lot.
+        params.extend([symbol, trade_id])
+        conn.execute(
+            f"UPDATE portfolio_engine_positions SET {', '.join(assignments)} WHERE symbol=? AND trade_id=?",
+            params,
+        )
         return
     params.append(symbol)
     conn.execute(f"UPDATE portfolio_engine_positions SET {', '.join(assignments)} WHERE symbol=?", params)
@@ -317,7 +333,7 @@ def reclassify_unowned_imports(conn: sqlite3.Connection) -> list[str]:
             continue
         owner = _reservation_owner(conn, str(symbol))
         if owner is not None:
-            _stamp_strategy_identity(conn, str(symbol), owner[0], owner[1], owner[2])
+            _stamp_strategy_identity(conn, str(symbol), owner[0], owner[1], owner[2], str(trade_id or ""))
             continue
         record_protected(
             conn,
@@ -327,7 +343,10 @@ def reclassify_unowned_imports(conn: sqlite3.Connection) -> list[str]:
             source_trade_id=str(trade_id or ""),
             entry_order_id="",
         )
-        conn.execute("DELETE FROM portfolio_engine_positions WHERE symbol=?", (symbol,))
+        conn.execute(
+            "DELETE FROM portfolio_engine_positions WHERE symbol=? AND trade_id=?",
+            (symbol, str(trade_id or "")),
+        )
         moved.append(_norm(str(symbol)))
         handle_unmatched_balance(
             conn,

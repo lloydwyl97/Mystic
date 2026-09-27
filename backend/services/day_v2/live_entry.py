@@ -240,11 +240,34 @@ async def submit_day_v2_direct_entry(
         "bar_timestamp": int(signal.signal_bar_ts or 0),
         "thesis_invalid_level": float(signal.structural_anchor or 0.0),
         "sleeve": str(sleeve or ""),
+        "engine_id": DAY_V2_ENGINE_ID,
     }
     safe, safety_reason = await _pre_submit_safety(engine, pseudo_intent, ask)
     if not safe:
         engine.last_buy_outcome = f"DIRECT_SUBMIT_BLOCKED:{safety_reason}"
         logger.info("DAY_V2_DIRECT_SUBMIT_BLOCKED symbol=%s reason=%s", symbol, safety_reason)
+        return None
+
+    # Two-engine capital allocator: DAY deploys only within its remaining
+    # engine budget; physical free USDT (net of both engines' reservations)
+    # must cover the order. Grandfathered SCALP lots are never touched.
+    from backend.services.two_engine_capital import check_engine_budget
+
+    _budget_ok, _budget_reason, _ = check_engine_budget(
+        str(getattr(engine, "db_path", "") or ""),
+        DAY_V2_ENGINE_ID,
+        float(ask * qty),
+        float(getattr(engine, "_total_equity", 0) or 0),
+        float(getattr(engine, "_available_balance", 0) or 0),
+        getattr(engine, "open_positions", None) or {},
+    )
+    if not _budget_ok:
+        engine.last_buy_outcome = f"DIRECT_SUBMIT_BLOCKED:{_budget_reason}"
+        try:
+            engine.last_buy_reject_reason = _budget_reason
+        except Exception:
+            pass
+        logger.info("DAY_V2_DIRECT_SUBMIT_BLOCKED symbol=%s reason=%s", symbol, _budget_reason)
         return None
 
     from backend.services.portfolio_engine import TradeExplainability

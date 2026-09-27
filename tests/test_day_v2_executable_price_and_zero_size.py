@@ -41,7 +41,7 @@ def _integration(tmp_path, redis_client=None, *, open_positions=None):
         integ.sizing_calls.append(kwargs)
         return integ.sizing_result
 
-    async def _can_open(_symbol, _notional):
+    async def _can_open(_symbol, _notional, *args, **kwargs):
         return True, ""
 
     integ.sizing_result = (0.0, 0.0, 0.0)
@@ -51,6 +51,7 @@ def _integration(tmp_path, redis_client=None, *, open_positions=None):
         calculate_position_size=_size,
         _can_open_position=_can_open,
         _total_equity=228.0,
+        _available_balance=30.45,
         cash_balance=30.45,
     )
     return integ

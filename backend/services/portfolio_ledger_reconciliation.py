@@ -471,8 +471,10 @@ def repair_orphaned_buy_lot_via_position_merge(
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         sym_variants = (symbol.strip().upper(), symbol.strip().upper().replace("USDT", "/USDT") if "/" not in symbol.upper() else symbol.strip().upper().replace("/", ""))
+        # Two-engine contract: this paper-DAY repair tool only ever merges the
+        # DAY-side lot; a SCALP lot on the same symbol is independent inventory.
         pos_row = conn.execute(
-            "SELECT * FROM portfolio_engine_positions WHERE symbol IN (?, ?)",
+            "SELECT * FROM portfolio_engine_positions WHERE symbol IN (?, ?) AND COALESCE(engine_id, 'LEGACY_DAY_LIVE') IN ('DAY_V2', 'LEGACY_DAY_LIVE', 'LEGACY_EXIT_ONLY')",
             sym_variants,
         ).fetchone()
 
@@ -525,8 +527,9 @@ def repair_orphaned_buy_lot_via_position_merge(
                     atr_at_entry, entry_bar_timestamp, confidence_at_entry,
                     entry_fee, sleeve, entry_strategy_id,
                     repair_add_count, last_repair_add_ts, repair_add_trade_ids,
-                    average_entry_after_repair, original_position_cost, thesis_json, last_updated
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    average_entry_after_repair, original_position_cost, thesis_json,
+                    engine_id, last_updated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     stored_symbol,
@@ -552,6 +555,7 @@ def repair_orphaned_buy_lot_via_position_merge(
                     new_avg_entry,
                     new_cost,
                     json.dumps({"reconciliation_recovered": True, "note": "position recreated from transaction-tape replay after duplicate-buy incident"}),
+                    "LEGACY_DAY_LIVE",
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
@@ -592,6 +596,7 @@ def repair_orphaned_buy_lot_via_position_merge(
                     last_repair_add_ts = ?,
                     last_updated = ?
                 WHERE symbol = ?
+                  AND COALESCE(engine_id, 'LEGACY_DAY_LIVE') IN ('DAY_V2', 'LEGACY_DAY_LIVE', 'LEGACY_EXIT_ONLY')
                 """,
                 (
                     new_qty,

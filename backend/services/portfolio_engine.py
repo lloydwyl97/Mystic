@@ -167,6 +167,119 @@ _env_max = os.getenv("MAX_OPEN_POSITIONS") or os.getenv("MAX_POSITIONS")
 MAX_OPEN_POSITIONS = int(_env_max) if _env_max is not None else _DEFAULT_MAX_OPEN_POSITIONS
 _max_pos_source = "env" if _env_max is not None else "default"
 MAX_OPEN_PER_SYMBOL = 1  # Hard limit: never stack positions on same symbol
+# TWO-ENGINE CONTRACT (DAY_V2 + SCALP_V2 are independent engines):
+# each engine owns up to 4 slots; combined hard maximum is 8. Position identity
+# is (engine_id, symbol) — one lot per engine per symbol; cross-engine
+# same-symbol coexistence is allowed.
+DAY_MAX_OPEN_POSITIONS = 4
+SCALP_MAX_OPEN_POSITIONS = 4
+COMBINED_ENGINE_MAX_POSITIONS = 8
+POSITION_KEY_SEP = "::"
+
+
+def make_position_key(engine_id: str, symbol: str) -> str:
+    """Canonical in-memory position key: '<engine_id>::<normalized_symbol>'."""
+    engine = str(engine_id or "")
+    return f"{engine}{POSITION_KEY_SEP}{normalize_symbol(symbol)}"
+
+
+def split_position_key(key: str) -> tuple[str, str]:
+    """Split a position key back into (engine_id, symbol)."""
+    parts = str(key or "").rsplit(POSITION_KEY_SEP, 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return "", normalize_symbol(str(key or ""))
+
+
+DAY_SIDE_ENGINES = ("DAY_V2", "LEGACY_DAY_LIVE", "LEGACY_EXIT_ONLY")
+DAY_SIDE_ENGINES_SQL = "'DAY_V2','LEGACY_DAY_LIVE','LEGACY_EXIT_ONLY'"
+
+
+def _lot_owned_by_engine(pos: object, engine_id: str) -> bool:
+    """True when lot `pos` belongs to `engine_id` (legacy DAY mapping included)."""
+    engine = str(engine_id or "")
+    lot_engine = str(getattr(pos, "engine_id", "") or "")
+    return engine == lot_engine or (engine in ("", *DAY_SIDE_ENGINES) and lot_engine in ("", *DAY_SIDE_ENGINES))
+
+
+def _reservation_key(symbol: str, sleeve: str = "") -> str:
+    """In-memory reservation key: '<sleeve>::<symbol>' (sleeve-scoped) or bare symbol."""
+    ns = normalize_symbol(symbol)
+    sl = str(sleeve or "")
+    return f"{sl}{POSITION_KEY_SEP}{ns}" if sl else ns
+
+
+def _split_reservation_key(key: str) -> tuple[str, str]:
+    """Split a reservation key into (sleeve, symbol); legacy bare keys yield ('', symbol)."""
+    parts = str(key or "").rsplit(POSITION_KEY_SEP, 1)
+    if len(parts) == 2 and parts[1]:
+        return parts[0], normalize_symbol(parts[1])
+    return "", normalize_symbol(str(key or ""))
+
+
+def _sleeve_maps_to_engine(sleeve: str, engine_id: str) -> bool:
+    """Map a reservation sleeve to an engine. SCALP_V2 sleeve is SCALP; every
+    other sleeve (ACTIVE/CORE/legacy/empty) is DAY-side heritage."""
+    engine = str(engine_id or "")
+    sl = str(sleeve or "")
+    if sl == "SCALP_V2":
+        return engine in ("SCALP_V2", "")
+    return engine in ("", *DAY_SIDE_ENGINES)
+
+
+def _ensure_position_engine_identity(conn) -> None:
+    """Best-effort ensure of (engine_id, symbol) identity on the positions table.
+
+    Covers write paths that may run before _ensure_schema (tests, fresh DBs).
+    Idempotent; never raises.
+    """
+    try:
+        cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(portfolio_engine_positions)")}
+        if "engine_id" not in cols:
+            conn.execute("ALTER TABLE portfolio_engine_positions ADD COLUMN engine_id TEXT DEFAULT 'LEGACY_DAY_LIVE'")
+        if "scalp_opportunity_id" not in cols:
+            conn.execute("ALTER TABLE portfolio_engine_positions ADD COLUMN scalp_opportunity_id TEXT DEFAULT ''")
+        _ensure_position_composite_pk(conn)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_engine_symbol ON portfolio_engine_positions(engine_id, symbol)")
+    except Exception:
+        logging.getLogger(__name__).debug("ensure_position_engine_identity skipped", exc_info=True)
+
+
+def _ensure_position_composite_pk(conn) -> None:
+    """Rebuild portfolio_engine_positions with PRIMARY KEY (engine_id, symbol).
+
+    Required for DAY+SCALP same-symbol coexistence: the legacy bare-symbol PK
+    would reject the second engine's lot. Idempotent (skips when already
+    composite), transactional (runs inside the caller's transaction),
+    data-preserving (row-for-row copy, economics untouched). Never raises.
+    """
+    try:
+        cols = conn.execute("PRAGMA table_info(portfolio_engine_positions)").fetchall()
+        names = [str(c[1]) for c in cols]
+        if "engine_id" not in names or "symbol" not in names:
+            return
+        pk_cols = {str(c[1]) for c in cols if int(c[5] or 0) > 0}
+        if pk_cols == {"engine_id", "symbol"}:
+            return
+        defs: list[str] = []
+        for c in cols:
+            _name, _type = str(c[1]), str(c[2] or "TEXT")
+            _d = f'"{_name}" {_type}'
+            if _name in ("engine_id", "symbol") or int(c[3] or 0):
+                _d += " NOT NULL"
+            if c[4] is not None:
+                _d += f" DEFAULT {c[4]}"
+            defs.append(_d)
+        defs.append("PRIMARY KEY (engine_id, symbol)")
+        col_list = ", ".join(f'"{n}"' for n in names)
+        conn.execute(f"CREATE TABLE portfolio_engine_positions_new ({', '.join(defs)})")
+        conn.execute(f"INSERT INTO portfolio_engine_positions_new ({col_list}) SELECT {col_list} FROM portfolio_engine_positions")
+        conn.execute("DROP TABLE portfolio_engine_positions")
+        conn.execute("ALTER TABLE portfolio_engine_positions_new RENAME TO portfolio_engine_positions")
+        logging.getLogger(__name__).info("SCHEMA: rebuilt portfolio_engine_positions with PRIMARY KEY (engine_id, symbol)")
+    except Exception:
+        logging.getLogger(__name__).debug("ensure_position_composite_pk skipped", exc_info=True)
+
 
 # Risk Management (Phase 4)
 RISK_PER_TRADE_PCT = 0.04  # 4% of equity risked per trade (sized for profit on $10k account)
@@ -2781,7 +2894,33 @@ class PortfolioEngine:
             qty_epsilon = 1e-10
             positions_snapshot = list(self.open_positions.items())
             cleared_pause_for_mismatch = False
-            for symbol, position in positions_snapshot:
+            _reconciled_syms: set[str] = set()
+            for _key, _loop_pos in positions_snapshot:
+                # Two-engine contract: group by position symbol; multi-engine
+                # symbols reconcile by engine-sum, never per-lot vs full balance.
+                symbol = normalize_symbol(str(getattr(_loop_pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
+                if not symbol or symbol in _reconciled_syms:
+                    continue
+                _reconciled_syms.add(symbol)
+                _lots = self._symbol_lots(symbol)
+                if len(_lots) > 1:
+                    await self._ensure_symbol_constraints(symbol)
+                    _constraints = self._symbol_constraints.get(symbol) or {}
+                    _qty_step = float(_constraints.get("qty_step") or 0)
+                    from backend.services.protected_external_inventory import protected_quantity as _prot_qty
+
+                    _api = _to_api_symbol(symbol)
+                    _base = _api[:-4] if _api.endswith("USDT") else _api
+                    _exchange_qty = max(0.0, float(total_balances.get(_base, 0) or 0) - _prot_qty(self.db_path, symbol))
+                    await self._reconcile_dual_engine_lots(
+                        symbol=symbol,
+                        lots=_lots,
+                        exchange_qty=_exchange_qty,
+                        qty_step=_qty_step,
+                        source="bootstrap_reconcile",
+                    )
+                    continue
+                position = _lots[0] if _lots else _loop_pos
                 api_sym = _to_api_symbol(symbol)
                 base_asset = api_sym[:-4] if api_sym.endswith("USDT") else api_sym  # SOLUSDT -> SOL
                 from backend.services.protected_external_inventory import protected_quantity
@@ -2891,7 +3030,13 @@ class PortfolioEngine:
         free = free_balances if free_balances is not None else total_balances
         from backend.services.protected_external_inventory import shrink_to_exchange
 
-        strategy_qty = {normalize_symbol(sym): float(getattr(pos, "quantity", 0) or 0) for sym, pos in self.open_positions.items()}
+        # Two-engine contract: strategy qty is the SUM of all engine lots per
+        # symbol (composite dict keys must not collide or mis-normalize).
+        strategy_qty: dict[str, float] = {}
+        for pos in self.open_positions.values():
+            _sym = normalize_symbol(str(getattr(pos, "symbol", "") or ""))
+            if _sym:
+                strategy_qty[_sym] = strategy_qty.get(_sym, 0.0) + float(getattr(pos, "quantity", 0) or 0)
         with connect_managed(self.db_path) as conn:
             shrunk = shrink_to_exchange(conn, total_balances, strategy_qty)
             conn.commit()
@@ -2908,15 +3053,23 @@ class PortfolioEngine:
             if not self._symbol_in_fixed_universe(symbol):
                 continue
             exact_qty = str(total_qty)
-            if symbol in self.open_positions:
-                existing = self.open_positions[symbol]
-                if str(getattr(existing, "status", "") or "") == "DUST_PENDING":
+            _lots = self._symbol_lots(symbol)
+            if _lots:
+                _dust_lots = [p for p in _lots if str(getattr(p, "status", "") or "") == "DUST_PENDING"]
+                # Dust-retain only when every lot is dust; mixed books are
+                # aligned by the periodic loop (engine-sum), never rewritten here.
+                if _dust_lots and len(_dust_lots) == len(_lots):
+                    existing = _dust_lots[0]
                     await self._retain_exchange_dust(
                         symbol=symbol,
                         asset=str(asset),
                         quantity=exact_qty,
                         mark_hint=float(getattr(existing, "entry_price", 0) or 0),
                     )
+                    continue
+                # A live strategy lot owns this symbol: the periodic loop (not
+                # the importer) aligns any surplus by engine-sum. Importing
+                # here would re-protect already-owned inventory.
                 continue
             free_qty = float(free.get(asset, 0) or 0)
             if free_qty <= qty_epsilon:
@@ -3021,7 +3174,11 @@ class PortfolioEngine:
         if qty <= 0:
             return
         exact = format(qty, "f")
-        existing = self.open_positions.get(symbol)
+        # Two-engine contract: resolve dust lots by position ownership, never
+        # by a bare-symbol dict key.
+        _lots = self._symbol_lots(symbol)
+        _dust_lots = [p for p in _lots if str(getattr(p, "status", "") or "") == "DUST_PENDING"]
+        existing = _dust_lots[0] if _dust_lots else None
         action = should_import_exchange_dust(
             existing_status=str(getattr(existing, "status", "") or "") if existing else "",
             existing_trade_id=str(getattr(existing, "trade_id", "") or "") if existing else "",
@@ -3066,7 +3223,9 @@ class PortfolioEngine:
             dust_qty_canonical=float(qty),
             quantity_exact=exact,
         )
-        self.open_positions[symbol] = position
+        # Engine-less dust bucket: keyed under the empty engine so it never
+        # collides with (or blocks) either engine's live lot.
+        self.open_positions[make_position_key("", symbol)] = position
         await self._persist_position_to_sqlite(position)
         try:
             persist_current_dust_snapshot(
@@ -3075,6 +3234,79 @@ class PortfolioEngine:
             )
         except Exception:
             logger.debug("dust snapshot persist skipped", exc_info=True)
+
+    async def _reconcile_dual_engine_lots(
+        self,
+        *,
+        symbol: str,
+        lots: list,
+        exchange_qty: float,
+        qty_step: float,
+        source: str,
+    ) -> None:
+        """Reconcile a symbol held by multiple engine lots (DAY + SCALP).
+
+        Compares the EXCHANGE balance against the SUM of engine-owned lots —
+        never one lot against the full balance. Healthy sums are left
+        untouched (cost bases, high-waters, exit authorities preserved).
+        Surplus over the sum becomes protected dust; shortfalls are logged
+        (ENGINE_QTY_SHORTFALL) and left untouched — fail closed, never guess
+        which engine lost quantity. Vanished balances route each lot through
+        the standard vanish handler.
+        """
+        tol = (float(qty_step) / 2.0) if qty_step and float(qty_step) > 0 else 1e-9
+        engine_sum = sum(float(getattr(p, "quantity", 0) or 0) for p in lots)
+        snapped = self._floor_to_step(exchange_qty, float(qty_step)) if qty_step and float(qty_step) > 0 else exchange_qty
+        engines = sorted({str(getattr(p, "engine_id", "") or "") for p in lots})
+        if float(exchange_qty or 0) <= 1e-10:
+            for lot in lots:
+                await self._handle_vanished_exchange_position(symbol, lot, source=source)
+                self._metrics_reconciliation_adjustments += 1
+                logger.info(
+                    "REMOVED:%s ex_qty=0 status=%s engine=%s (dual-lot vanish)",
+                    symbol,
+                    getattr(lot, "status", "ACTIVE"),
+                    getattr(lot, "engine_id", ""),
+                )
+            return
+        if abs(engine_sum - snapped) <= tol:
+            logger.info(
+                "DUAL_LOT_HEALTHY symbol=%s engines=%s engine_sum=%.12g ex_qty=%.12g snapped=%.12g",
+                symbol,
+                engines,
+                engine_sum,
+                exchange_qty,
+                snapped,
+            )
+            return
+        if float(exchange_qty) > engine_sum + tol:
+            surplus = float(exchange_qty) - engine_sum
+            try:
+                from backend.services.day_entry_spendable import money as _money_surplus
+                from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
+
+                if float(_money_surplus(surplus)) > 0:
+                    stamp_protected_preexisting_dust(self.db_path, symbol, float(surplus))
+            except Exception:
+                logger.debug("PROTECTED_DUST_SURPLUS_SKIPPED %s", symbol, exc_info=True)
+            self._metrics_reconciliation_adjustments += 1
+            logger.info(
+                "DUAL_LOT_SURPLUS_PROTECTED symbol=%s engines=%s engine_sum=%.12g ex_qty=%.12g surplus=%.12g",
+                symbol,
+                engines,
+                engine_sum,
+                exchange_qty,
+                surplus,
+            )
+            return
+        self._metrics_reconciliation_adjustments += 1
+        logger.warning(
+            "ENGINE_QTY_SHORTFALL symbol=%s engines=%s engine_sum=%.12g ex_qty=%.12g — lots left untouched",
+            symbol,
+            engines,
+            engine_sum,
+            exchange_qty,
+        )
 
     async def run_live_reconcile(
         self,
@@ -3095,7 +3327,30 @@ class PortfolioEngine:
             return
         qty_epsilon = 1e-10
         positions_snapshot = list(self.open_positions.items())
-        for symbol, position in positions_snapshot:
+        _reconciled_syms: set[str] = set()
+        for _key, _loop_pos in positions_snapshot:
+            # Two-engine contract: group by position symbol; multi-engine
+            # symbols reconcile by engine-sum, never per-lot vs full balance.
+            symbol = normalize_symbol(str(getattr(_loop_pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
+            if not symbol or symbol in _reconciled_syms:
+                continue
+            _reconciled_syms.add(symbol)
+            _lots = self._symbol_lots(symbol)
+            if len(_lots) > 1:
+                await self._ensure_symbol_constraints(symbol)
+                _constraints = self._symbol_constraints.get(symbol) or {}
+                _qty_step = float(_constraints.get("qty_step") or 0)
+                _api = _to_api_symbol(symbol)
+                _base = _api[:-4] if _api.endswith("USDT") else _api
+                await self._reconcile_dual_engine_lots(
+                    symbol=symbol,
+                    lots=_lots,
+                    exchange_qty=float(total_balances.get(_base, 0) or 0),
+                    qty_step=_qty_step,
+                    source="periodic_reconcile",
+                )
+                continue
+            position = _lots[0] if _lots else _loop_pos
             api_sym = _to_api_symbol(symbol)
             base_asset = api_sym[:-4] if api_sym.endswith("USDT") else api_sym  # SOLUSDT -> SOL
             exchange_qty = float(total_balances.get(base_asset, 0) or 0)
@@ -3606,14 +3861,19 @@ class PortfolioEngine:
                 paper_service.positions.clear()
                 from datetime import datetime, timezone
 
-                for symbol, pos in self.open_positions.items():
-                    # Create a compatible position object for paper_service
+                for _key, pos in self.open_positions.items():
+                    # Create a compatible position object for paper_service.
+                    # Strategy symbol (never the composite memory key); in the
+                    # rare dual-lot paper case the last lot wins the paper mirror
+                    # (paper mode is not the live contract).
                     from backend.services.paper_trading_service import PaperPosition
+
+                    _psym = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
 
                     now = datetime.now(timezone.utc)
                     entry_dt = datetime.fromtimestamp(pos.entry_time, tz=timezone.utc) if pos.entry_time else now
                     paper_pos = PaperPosition(
-                        symbol=symbol,
+                        symbol=_psym,
                         quantity=pos.quantity,
                         average_price=pos.entry_price,
                         current_price=pos.entry_price,  # Will be updated on next tick
@@ -3622,8 +3882,8 @@ class PortfolioEngine:
                         created_at=entry_dt,
                         last_updated=now,
                     )
-                    paper_service.positions[symbol] = paper_pos
-                    logger.info(f"SYNC_TO_REDIS: Pushed {symbol} qty={pos.quantity:.6f}")
+                    paper_service.positions[_psym] = paper_pos
+                    logger.info(f"SYNC_TO_REDIS: Pushed {_psym} qty={pos.quantity:.6f}")
 
                 # Persist to Redis (if method exists)
                 try:
@@ -4128,7 +4388,10 @@ class PortfolioEngine:
             self._sleeve_market_notional_cache[slv] += current_price * pos.quantity
 
         if prices:
-            for symbol, pos in self.open_positions.items():
+            for _key, pos in self.open_positions.items():
+                # Two-engine contract: price identity is the strategy symbol,
+                # never the composite memory key.
+                symbol = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
                 base = symbol.split("/")[0] if "/" in symbol else symbol.replace("USDT", "")
                 ns = normalize_symbol(symbol)
                 p = prices.get(symbol) or prices.get(ns) or prices.get(base)
@@ -4141,7 +4404,8 @@ class PortfolioEngine:
 
             redis_client = get_redis_client()
             if redis_client:
-                for symbol, pos in self.open_positions.items():
+                for _key, pos in self.open_positions.items():
+                    symbol = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
                     try:
                         px = self._get_cached_market_price(symbol)
                         current_price = px if px > 0 else pos.entry_price
@@ -4150,11 +4414,13 @@ class PortfolioEngine:
                         logger.debug("RECOMPUTE: price for %s: %s", symbol, e)
                         _accumulate(symbol, pos, pos.entry_price)
             else:
-                for symbol, pos in self.open_positions.items():
+                for _key, pos in self.open_positions.items():
+                    symbol = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
                     _accumulate(symbol, pos, pos.entry_price)
         except Exception as e:
             logger.warning("RECOMPUTE: Redis for prices: %s", e)
-            for symbol, pos in self.open_positions.items():
+            for _key, pos in self.open_positions.items():
+                symbol = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
                 _accumulate(symbol, pos, pos.entry_price)
         return self._add_protected_equity(positions_value_market, cost_basis, prices)
 
@@ -4205,7 +4471,11 @@ class PortfolioEngine:
         if not self.open_positions:
             return prices
 
-        for symbol in list(self.open_positions):
+        for _key in list(self.open_positions):
+            # Two-engine contract: marks are keyed by strategy symbol so both
+            # engines' lots on one symbol share the same fresh mark.
+            _pos = self.open_positions.get(_key)
+            symbol = normalize_symbol(str(getattr(_pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
             ns = normalize_symbol(symbol)
             last_px = await self._fetch_live_mark_for_open_position(symbol)
             if last_px <= 0:
@@ -4705,6 +4975,9 @@ class PortfolioEngine:
         """)
 
         # POSITION STATE: Per-position tracking (survives restarts)
+        # NOTE: the two-engine migration below rebuilds this with composite
+        # PRIMARY KEY (engine_id, symbol) and appends the engine columns, so
+        # the base DDL stays minimal and column order is uniform everywhere.
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS portfolio_engine_positions (
                 symbol TEXT PRIMARY KEY,
@@ -4844,6 +5117,52 @@ class PortfolioEngine:
             )
         except Exception as e:
             logger.debug("original_position_cost backfill skipped: %s", e)
+
+        # TWO-ENGINE MIGRATION (DAY_V2 + SCALP_V2 hold independent lots):
+        # composite (engine_id, symbol) identity. Idempotent, transactional
+        # (runs inside the caller's schema transaction), backward-safe:
+        # existing rows keep bit-for-bit economics; unknown engines backfill
+        # from the latest BUY paper_trade carrying a known engine, otherwise
+        # stay LEGACY_DAY_LIVE. No history erased, no positions duplicated.
+        try:
+            cursor.execute("PRAGMA table_info(portfolio_engine_positions)")
+            mig_cols = {row[1] for row in cursor.fetchall()}
+            if "engine_id" not in mig_cols:
+                cursor.execute("ALTER TABLE portfolio_engine_positions ADD COLUMN engine_id TEXT DEFAULT 'LEGACY_DAY_LIVE'")
+                logger.info("SCHEMA: Added column engine_id to portfolio_engine_positions")
+            if "scalp_opportunity_id" not in mig_cols:
+                cursor.execute("ALTER TABLE portfolio_engine_positions ADD COLUMN scalp_opportunity_id TEXT DEFAULT ''")
+                logger.info("SCHEMA: Added column scalp_opportunity_id to portfolio_engine_positions")
+            try:
+                cursor.execute(
+                    """
+                    UPDATE portfolio_engine_positions
+                    SET engine_id = (
+                        SELECT t.engine_id FROM paper_trades AS t
+                        WHERE t.symbol = portfolio_engine_positions.symbol
+                          AND t.side = 'BUY'
+                          AND t.engine_id IN ('DAY_V2','SCALP_V2')
+                        ORDER BY t.rowid DESC LIMIT 1
+                    )
+                    WHERE (engine_id IS NULL OR engine_id = '' OR engine_id NOT IN ('DAY_V2','SCALP_V2','LEGACY_DAY_LIVE'))
+                      AND EXISTS (
+                        SELECT 1 FROM paper_trades AS t2
+                        WHERE t2.symbol = portfolio_engine_positions.symbol
+                          AND t2.side = 'BUY'
+                          AND t2.engine_id IN ('DAY_V2','SCALP_V2')
+                    )
+                    """
+                )
+                if cursor.rowcount:
+                    logger.info("SCHEMA: backfilled engine_id on %d position rows", cursor.rowcount)
+            except Exception as e:
+                logger.debug("engine_id paper_trade backfill skipped: %s", e)
+            # Composite PK rebuild (symbol PK -> (engine_id, symbol)) so two
+            # engine lots coexist. Idempotent; no-op when already composite.
+            _ensure_position_composite_pk(cursor)
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_engine_symbol ON portfolio_engine_positions(engine_id, symbol)")
+        except Exception as e:
+            logger.warning("TWO_ENGINE_MIGRATION failed: %s", e)
 
         # Sleeve column on paper_trades
         cursor.execute("PRAGMA table_info(paper_trades)")
@@ -5265,6 +5584,7 @@ class PortfolioEngine:
                 with connect_rw(self.db_path) as conn:
                     conn.execute("BEGIN IMMEDIATE")
                     cursor = conn.cursor()
+                    _ensure_position_engine_identity(conn)
 
                     timestamp = datetime.now(timezone.utc).isoformat()
 
@@ -5289,7 +5609,7 @@ class PortfolioEngine:
                     dust_qty = float(getattr(pos, "dust_qty_canonical", 0.0) or 0.0)
                     cursor.execute(
                         """
-                        INSERT OR REPLACE INTO portfolio_engine_positions (
+                        INSERT INTO portfolio_engine_positions (
                             symbol, quantity, entry_price, entry_time, trade_id,
                             stop_price, take_profit_1_price, take_profit_2_price,
                             trailing_stop_price, tp1_hit, highest_price, lowest_price,
@@ -5300,8 +5620,38 @@ class PortfolioEngine:
                             status, dust_detected_at, dust_qty_canonical,
                             entry_decision_id, entry_intent_id, entry_reservation_id,
                             entry_order_id, entry_client_order_id, entry_fill_ids_json,
+                            engine_id, scalp_opportunity_id,
                             last_updated
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(engine_id, symbol) DO UPDATE SET
+                            quantity=excluded.quantity, entry_price=excluded.entry_price,
+                            entry_time=excluded.entry_time, trade_id=excluded.trade_id,
+                            stop_price=excluded.stop_price,
+                            take_profit_1_price=excluded.take_profit_1_price,
+                            take_profit_2_price=excluded.take_profit_2_price,
+                            trailing_stop_price=excluded.trailing_stop_price,
+                            tp1_hit=excluded.tp1_hit, highest_price=excluded.highest_price,
+                            lowest_price=excluded.lowest_price, atr_at_entry=excluded.atr_at_entry,
+                            entry_bar_timestamp=excluded.entry_bar_timestamp,
+                            confidence_at_entry=excluded.confidence_at_entry,
+                            entry_fee=excluded.entry_fee, sleeve=excluded.sleeve,
+                            entry_strategy_id=excluded.entry_strategy_id,
+                            repair_add_count=excluded.repair_add_count,
+                            last_repair_add_ts=excluded.last_repair_add_ts,
+                            repair_add_trade_ids=excluded.repair_add_trade_ids,
+                            average_entry_after_repair=excluded.average_entry_after_repair,
+                            original_position_cost=excluded.original_position_cost,
+                            thesis_json=excluded.thesis_json, status=excluded.status,
+                            dust_detected_at=excluded.dust_detected_at,
+                            dust_qty_canonical=excluded.dust_qty_canonical,
+                            entry_decision_id=excluded.entry_decision_id,
+                            entry_intent_id=excluded.entry_intent_id,
+                            entry_reservation_id=excluded.entry_reservation_id,
+                            entry_order_id=excluded.entry_order_id,
+                            entry_client_order_id=excluded.entry_client_order_id,
+                            entry_fill_ids_json=excluded.entry_fill_ids_json,
+                            scalp_opportunity_id=excluded.scalp_opportunity_id,
+                            last_updated=excluded.last_updated
                     """,
                         (
                             pos.symbol,
@@ -5337,6 +5687,8 @@ class PortfolioEngine:
                             str(getattr(pos, "entry_order_id", "") or ""),
                             str(getattr(pos, "entry_client_order_id", "") or ""),
                             str(getattr(pos, "entry_fill_ids_json", "[]") or "[]"),
+                            str(getattr(pos, "engine_id", "") or "LEGACY_DAY_LIVE"),
+                            str(getattr(pos, "scalp_opportunity_id", "") or ""),
                             timestamp,
                         ),
                     )
@@ -5349,6 +5701,7 @@ class PortfolioEngine:
                         pos.symbol,
                         str(getattr(pos, "engine_id", "") or "LEGACY_DAY_LIVE"),
                         str(getattr(pos, "scalp_opportunity_id", "") or ""),
+                        scope_engine=str(getattr(pos, "engine_id", "") or "LEGACY_DAY_LIVE"),
                     )
                     conn.commit()
 
@@ -5424,7 +5777,7 @@ class PortfolioEngine:
                 dust_qty = float(getattr(position, "dust_qty_canonical", 0.0) or 0.0)
                 cursor.execute(
                     """
-                    INSERT OR REPLACE INTO portfolio_engine_positions (
+                    INSERT INTO portfolio_engine_positions (
                         symbol, quantity, entry_price, entry_time, trade_id,
                         stop_price, take_profit_1_price, take_profit_2_price,
                         trailing_stop_price, tp1_hit, highest_price, lowest_price,
@@ -5435,8 +5788,38 @@ class PortfolioEngine:
                         status, dust_detected_at, dust_qty_canonical,
                         entry_decision_id, entry_intent_id, entry_reservation_id,
                         entry_order_id, entry_client_order_id, entry_fill_ids_json,
+                        engine_id, scalp_opportunity_id,
                         last_updated
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(engine_id, symbol) DO UPDATE SET
+                        quantity=excluded.quantity, entry_price=excluded.entry_price,
+                        entry_time=excluded.entry_time, trade_id=excluded.trade_id,
+                        stop_price=excluded.stop_price,
+                        take_profit_1_price=excluded.take_profit_1_price,
+                        take_profit_2_price=excluded.take_profit_2_price,
+                        trailing_stop_price=excluded.trailing_stop_price,
+                        tp1_hit=excluded.tp1_hit, highest_price=excluded.highest_price,
+                        lowest_price=excluded.lowest_price, atr_at_entry=excluded.atr_at_entry,
+                        entry_bar_timestamp=excluded.entry_bar_timestamp,
+                        confidence_at_entry=excluded.confidence_at_entry,
+                        entry_fee=excluded.entry_fee, sleeve=excluded.sleeve,
+                        entry_strategy_id=excluded.entry_strategy_id,
+                        repair_add_count=excluded.repair_add_count,
+                        last_repair_add_ts=excluded.last_repair_add_ts,
+                        repair_add_trade_ids=excluded.repair_add_trade_ids,
+                        average_entry_after_repair=excluded.average_entry_after_repair,
+                        original_position_cost=excluded.original_position_cost,
+                        thesis_json=excluded.thesis_json, status=excluded.status,
+                        dust_detected_at=excluded.dust_detected_at,
+                        dust_qty_canonical=excluded.dust_qty_canonical,
+                        entry_decision_id=excluded.entry_decision_id,
+                        entry_intent_id=excluded.entry_intent_id,
+                        entry_reservation_id=excluded.entry_reservation_id,
+                        entry_order_id=excluded.entry_order_id,
+                        entry_client_order_id=excluded.entry_client_order_id,
+                        entry_fill_ids_json=excluded.entry_fill_ids_json,
+                        scalp_opportunity_id=excluded.scalp_opportunity_id,
+                        last_updated=excluded.last_updated
                     """,
                     (
                         position.symbol,
@@ -5472,9 +5855,12 @@ class PortfolioEngine:
                         str(getattr(position, "entry_order_id", "") or ""),
                         str(getattr(position, "entry_client_order_id", "") or ""),
                         str(getattr(position, "entry_fill_ids_json", "[]") or "[]"),
+                        str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE"),
+                        str(getattr(position, "scalp_opportunity_id", "") or ""),
                         timestamp,
                     ),
                 )
+                _ensure_position_engine_identity(conn)
                 from backend.services.scalp_v2.identity_stamp import stamp_engine
 
                 stamp_engine(
@@ -5484,6 +5870,7 @@ class PortfolioEngine:
                     position.symbol,
                     str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE"),
                     str(getattr(position, "scalp_opportunity_id", "") or ""),
+                    scope_engine=str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE"),
                 )
                 stamp_engine(
                     conn,
@@ -5569,14 +5956,32 @@ class PortfolioEngine:
         if getattr(self, "_inject_crash_after_buy_commit", False):
             raise RuntimeError("INJECTED_CRASH_AFTER_BUY_COMMIT")
 
-    async def _delete_position_from_sqlite(self, symbol: str) -> None:
-        """Delete position from SQLite when closed"""
+    async def _delete_position_from_sqlite(self, symbol: str, engine_id: str = "") -> None:
+        """Delete position from SQLite when closed.
+
+        engine_id="" keeps legacy symbol-wide semantics (cleanup callers).
+        An explicit engine_id scopes the DELETE to that engine's lot so a
+        sibling engine's same-symbol lot is never touched.
+        """
 
         def _sync_delete():
             def _op():
                 with connect_rw(self.db_path) as conn:
                     conn.execute("BEGIN IMMEDIATE")
-                    conn.execute("DELETE FROM portfolio_engine_positions WHERE symbol = ?", (symbol,))
+                    _ensure_position_engine_identity(conn)
+                    engine = str(engine_id or "")
+                    if not engine:
+                        conn.execute("DELETE FROM portfolio_engine_positions WHERE symbol = ?", (symbol,))
+                    elif engine in DAY_SIDE_ENGINES:
+                        conn.execute(
+                            "DELETE FROM portfolio_engine_positions WHERE symbol = ? AND COALESCE(engine_id,'LEGACY_DAY_LIVE') IN ('DAY_V2','LEGACY_DAY_LIVE','LEGACY_EXIT_ONLY')",
+                            (symbol,),
+                        )
+                    else:
+                        conn.execute(
+                            "DELETE FROM portfolio_engine_positions WHERE symbol = ? AND engine_id = ?",
+                            (symbol, engine),
+                        )
                     conn.commit()
 
             run_locked_retry(_op)
@@ -5738,22 +6143,24 @@ class PortfolioEngine:
 
         n = 0
         skip = normalize_symbol(exclude) if exclude else ""
-        for sym, pos in self.open_positions.items():
-            if skip and normalize_symbol(sym) == skip:
+        _open_syms = {normalize_symbol(str(getattr(p, "symbol", "") or "")) for p in self.open_positions.values()}
+        for _key, pos in self.open_positions.items():
+            _sym = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
+            if skip and _sym == skip:
                 continue
             if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
                 continue
             if float(getattr(pos, "quantity", 0) or 0) <= 0:
                 continue
             try:
-                if htf_4h_rise_intact_for_symbol(sym):
+                if htf_4h_rise_intact_for_symbol(_sym):
                     n += 1
             except Exception:
                 continue
         for psym in self._pending_buy_order_symbols():
             if skip and normalize_symbol(psym) == skip:
                 continue
-            if normalize_symbol(psym) in {normalize_symbol(s) for s in self.open_positions}:
+            if normalize_symbol(psym) in _open_syms:
                 continue
             try:
                 if htf_4h_rise_intact_for_symbol(psym):
@@ -6597,10 +7004,10 @@ class PortfolioEngine:
             BUY lot so accounting cannot pause entries.
           * True leftover dust with no recovered sell -> DUST_WRITEOFF.
 
-        Idempotent: if ``symbol`` is not present in ``open_positions`` the
+        Idempotent: if the lot is no longer present in ``open_positions`` the
         function returns immediately.
         """
-        if symbol not in self.open_positions:
+        if all(v is not position for v in self.open_positions.values()) and symbol not in self.open_positions:
             return
         pos_status = getattr(position, "status", "ACTIVE") or "ACTIVE"
         now_epoch = time.time()
@@ -6734,11 +7141,17 @@ class PortfolioEngine:
 
         sym_norm = normalize_symbol(symbol)
         async with self._deletion_lock:
-            if sym_norm in self.open_positions:
-                del self.open_positions[sym_norm]
+            # Two-engine contract: remove only this lot's key (a sibling
+            # engine's lot on the same symbol is independent inventory).
+            _manual_key = next(
+                (k for k, v in self.open_positions.items() if v is position),
+                make_position_key(str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE"), sym_norm),
+            )
+            if _manual_key in self.open_positions:
+                del self.open_positions[_manual_key]
             elif symbol in self.open_positions:
                 del self.open_positions[symbol]
-            await self._delete_position_from_sqlite(sym_norm)
+            await self._delete_position_from_sqlite(sym_norm, str(getattr(position, "engine_id", "") or ""))
             try:
                 if self._paper_service and sym_norm in getattr(self._paper_service, "positions", {}):
                     del self._paper_service.positions[sym_norm]
@@ -6861,13 +7274,21 @@ class PortfolioEngine:
         """
         async with self._deletion_lock:
             try:
-                if symbol not in self.open_positions:
+                # Two-engine contract: resolve this lot's composite key; never
+                # touch a sibling engine's lot on the same symbol.
+                _pos_key = next((k for k, v in self.open_positions.items() if v is position), None)
+                if _pos_key is None:
+                    _pos_key = make_position_key(
+                        str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE"),
+                        normalize_symbol(symbol),
+                    )
+                if _pos_key not in self.open_positions:
                     return  # Idempotent: already cleaned
                 if float(getattr(position, "quantity", 0) or 0) > 0:
                     position.status = "DUST_PENDING"
                     if float(getattr(position, "dust_qty_canonical", 0) or 0) <= 0:
                         position.dust_qty_canonical = float(position.quantity)
-                    self.open_positions[symbol] = position
+                    self.open_positions[_pos_key] = position
                     logger.info(
                         "DUST_PENDING_RETAIN: %s qty=%.12g (real residual, no writeoff)",
                         symbol,
@@ -6882,10 +7303,10 @@ class PortfolioEngine:
                 dust_notional = dust_qty * dust_entry if dust_qty > 0 and dust_entry > 0 else 0.0
                 hold_seconds = int(time.time() - position.entry_time) if position.entry_time else 0
 
-                del self.open_positions[symbol]
+                del self.open_positions[_pos_key]
                 await self._recompute_positions_values()
                 self._compute_total_open_risk()
-                await self._delete_position_from_sqlite(symbol)
+                await self._delete_position_from_sqlite(symbol, str(getattr(position, "engine_id", "") or ""))
 
                 # Dust leftover is inventory, not a completed live strategy close.
                 try:
@@ -7424,7 +7845,8 @@ class PortfolioEngine:
                     if "remaining_position" not in pt_cols or "trade_id" not in pt_cols:
                         return
 
-                    open_syms = set(self.open_positions.keys())
+                    open_syms = {normalize_symbol(str(getattr(p, "symbol", "") or "")) for p in self.open_positions.values()} | {split_position_key(str(k))[1] for k in self.open_positions}
+                    open_syms.discard("")
                     cutoff_iso = (datetime.now(timezone.utc) - timedelta(seconds=grace_sec)).isoformat()
 
                     cursor.execute(
@@ -7445,7 +7867,14 @@ class PortfolioEngine:
                                 psym,
                             )
 
-                    for sym, pos in self.open_positions.items():
+                    # Two-engine contract: paper remaining_position is aligned
+                    # per LOT (trade_id-anchored). Zeroing is scoped to exclude
+                    # every live lot's trade_id so a sibling engine's lot on
+                    # the same symbol is never zeroed.
+                    _live_tids = {str(getattr(p, "trade_id", "") or "") for p in self.open_positions.values()}
+                    _live_tids.discard("")
+                    for _key, pos in self.open_positions.items():
+                        sym = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
                         if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
                             continue
                         qty = float(pos.quantity or 0.0)
@@ -7473,13 +7902,24 @@ class PortfolioEngine:
                             )
                             continue
 
-                        cursor.execute(
-                            """
-                            UPDATE paper_trades SET remaining_position = 0
-                            WHERE symbol = ? AND side = 'BUY'
-                            """,
-                            (sym,),
-                        )
+                        if _live_tids:
+                            _placeholders = ",".join("?" * len(_live_tids))
+                            cursor.execute(
+                                f"""
+                                UPDATE paper_trades SET remaining_position = 0
+                                WHERE symbol = ? AND side = 'BUY'
+                                  AND trade_id NOT IN ({_placeholders})
+                                """,
+                                (sym, *_live_tids),
+                            )
+                        else:
+                            cursor.execute(
+                                """
+                                UPDATE paper_trades SET remaining_position = 0
+                                WHERE symbol = ? AND side = 'BUY'
+                                """,
+                                (sym,),
+                            )
                         cursor.execute(
                             """
                             UPDATE paper_trades SET remaining_position = ?
@@ -7494,17 +7934,35 @@ class PortfolioEngine:
                                 sym,
                             )
                         if cursor.rowcount == 0:
-                            cursor.execute(
-                                """
-                                UPDATE paper_trades SET remaining_position = ?
-                                WHERE id = (
-                                    SELECT id FROM paper_trades
-                                    WHERE symbol = ? AND side = 'BUY'
-                                    ORDER BY id DESC LIMIT 1
+                            # Fallback latest BUY, excluding sibling live lots'
+                            # trade_ids so attribution is never stolen.
+                            _other_tids = {t for t in _live_tids if t != tid}
+                            if _other_tids:
+                                _ph = ",".join("?" * len(_other_tids))
+                                cursor.execute(
+                                    f"""
+                                    UPDATE paper_trades SET remaining_position = ?
+                                    WHERE id = (
+                                        SELECT id FROM paper_trades
+                                        WHERE symbol = ? AND side = 'BUY'
+                                          AND trade_id NOT IN ({_ph})
+                                        ORDER BY id DESC LIMIT 1
+                                    )
+                                    """,
+                                    (qty, sym, *_other_tids),
                                 )
-                                """,
-                                (qty, sym),
-                            )
+                            else:
+                                cursor.execute(
+                                    """
+                                    UPDATE paper_trades SET remaining_position = ?
+                                    WHERE id = (
+                                        SELECT id FROM paper_trades
+                                        WHERE symbol = ? AND side = 'BUY'
+                                        ORDER BY id DESC LIMIT 1
+                                    )
+                                    """,
+                                    (qty, sym),
+                                )
                         if str(tid).startswith("reconcile_import_"):
                             lot = cursor.execute(
                                 """
@@ -7516,10 +7974,11 @@ class PortfolioEngine:
                                 (sym,),
                             ).fetchone()
                             if lot and lot[0] and str(lot[0]) != tid:
+                                _old_tid = str(tid)
                                 pos.trade_id = str(lot[0])
                                 cursor.execute(
-                                    "UPDATE portfolio_engine_positions SET trade_id = ? WHERE symbol = ?",
-                                    (pos.trade_id, sym),
+                                    "UPDATE portfolio_engine_positions SET trade_id = ? WHERE symbol = ? AND trade_id = ?",
+                                    (pos.trade_id, sym, _old_tid),
                                 )
                                 logger.info(
                                     "FIFO_RECONCILE: rebound %s trade_id %s -> %s",
@@ -7726,7 +8185,15 @@ class PortfolioEngine:
                 )
                 if allow_mutations:
                     await self._persist_position_to_sqlite(pos)
-            rebuilt[pos.symbol] = pos
+            # Two-engine contract: engine-stamped lots (DAY_V2 / SCALP_V2) are
+            # keyed (engine_id, symbol) so dual same-symbol lots coexist.
+            # DAY-side heritage rows (LEGACY_DAY_LIVE / LEGACY_EXIT_ONLY) keep
+            # the legacy bare-symbol key for backward compatibility.
+            _load_engine = str(getattr(pos, "engine_id", "") or "LEGACY_DAY_LIVE")
+            if _load_engine in ("", *DAY_SIDE_ENGINES):
+                rebuilt[normalized_symbol] = pos
+            else:
+                rebuilt[make_position_key(_load_engine, normalized_symbol)] = pos
             logger.debug(
                 "LOAD_POSITION: %s qty=%.6f entry=$%.4f (normalized from %s)",
                 pos.symbol,
@@ -7739,9 +8206,10 @@ class PortfolioEngine:
         try:
             from backend.services.live_exchange_equity import load_protected_preexisting_dust
 
-            for _sym, _pos in self.open_positions.items():
+            for _key, _pos in self.open_positions.items():
                 if float(getattr(_pos, "protected_dust_qty", 0) or 0) > 0:
                     continue
+                _sym = normalize_symbol(str(getattr(_pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
                 _pos.protected_dust_qty = float(load_protected_preexisting_dust(self.db_path, _sym))
         except Exception:
             logger.debug("PROTECTED_DUST_HYDRATE_SKIPPED", exc_info=True)
@@ -7774,8 +8242,9 @@ class PortfolioEngine:
         from backend.services.day_inventory_recovery import is_day_top4_symbol
 
         to_persist: list[Any] = []
-        for sym, pos in self.open_positions.items():
-            if not is_day_top4_symbol(sym):
+        for _key, pos in self.open_positions.items():
+            _sym = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
+            if not is_day_top4_symbol(_sym):
                 continue
             if getattr(pos, "opened_under_router", False):
                 continue
@@ -7784,7 +8253,7 @@ class PortfolioEngine:
                 pos.opened_under_router = False
                 logger.info(
                     "LEGACY_INVENTORY_TAG symbol=%s legacy_pre_regime_router=true opened_under_router=false",
-                    sym,
+                    _sym,
                 )
             to_persist.append(pos)
         for pos in to_persist:
@@ -8099,10 +8568,10 @@ class PortfolioEngine:
 
     def _count_open_day_top4_positions(self) -> int:
         n = 0
-        for sym, pos in self.open_positions.items():
+        for pos in self.open_positions.values():
             if not self._day_position_blocks_new_entry(pos):
                 continue
-            if _to_api_symbol(sym) in DAY_TRADE_SYMBOLS:
+            if _to_api_symbol(str(getattr(pos, "symbol", "") or "")) in DAY_TRADE_SYMBOLS:
                 n += 1
         return n
 
@@ -8118,22 +8587,90 @@ class PortfolioEngine:
         return consumes_strategy_slot(position)
 
     def _day_entry_held_symbols(self) -> set[str]:
-        return {normalize_symbol(sym) for sym, pos in self.open_positions.items() if self._day_position_blocks_new_entry(pos)}
+        return {normalize_symbol(str(getattr(pos, "symbol", "") or "")) for pos in self.open_positions.values() if self._day_position_blocks_new_entry(pos)}
 
     def _day_dust_symbols(self) -> set[str]:
-        return {normalize_symbol(sym) for sym, pos in self.open_positions.items() if str(getattr(pos, "status", "") or "") == "DUST_PENDING"}
+        return {normalize_symbol(str(getattr(pos, "symbol", "") or "")) for pos in self.open_positions.values() if str(getattr(pos, "status", "") or "") == "DUST_PENDING"}
 
     def _day_entry_held_count(self) -> int:
         return sum(1 for pos in self.open_positions.values() if self._day_position_blocks_new_entry(pos))
 
-    def _day_path_ev_entry_block_reason(self, symbol: str, max_open: int) -> str | None:
+    # ---- Two-engine identity: open_positions is keyed "<engine_id>::<symbol>" ----
+    @staticmethod
+    def _engine_of(pos: Any) -> str:
+        return str(getattr(pos, "engine_id", "") or "")
+
+    def _find_position(self, engine_id: str, symbol: str) -> Any | None:
+        """Return the lot owned by (engine_id, symbol), or None.
+
+        LEGACY_DAY_LIVE lots are DAY-side heritage: DAY_V2 lookups match them
+        (same-engine duplicate protection), SCALP_V2 lookups never do.
+        """
+        engine = str(engine_id or "")
+        norm = normalize_symbol(symbol)
+        pos = self.open_positions.get(make_position_key(engine, norm))
+        if pos is not None:
+            return pos
+        if engine in ("", *DAY_SIDE_ENGINES):
+            for cand in DAY_SIDE_ENGINES:
+                if cand == engine:
+                    continue
+                pos = self.open_positions.get(make_position_key(cand, norm))
+                if pos is not None:
+                    return pos
+        # Backward-compat: legacy bare-symbol keys from pre-migration state.
+        # Scoped by ownership: a DAY-side bare lot never resolves as a SCALP
+        # lot (and vice versa) — cross-engine lots must stay independent.
+        legacy = self.open_positions.get(norm)
+        if legacy is not None and _lot_owned_by_engine(legacy, engine):
+            return legacy
+        return None
+
+    def _symbol_lots(self, symbol: str) -> list[Any]:
+        """All engine lots on a symbol (cross-engine coexistence)."""
+        norm = normalize_symbol(symbol)
+        lots = [pos for key, pos in self.open_positions.items() if split_position_key(key)[1] == norm]
+        if not lots:
+            legacy = self.open_positions.get(norm)
+            if legacy is not None:
+                lots = [legacy]
+        return lots
+
+    def _engine_lots(self, engine_id: str) -> list[Any]:
+        engine = str(engine_id or "")
+        return [pos for pos in self.open_positions.values() if self._engine_of(pos) == engine]
+
+    def _engine_held_symbols(self, engine_id: str) -> set[str]:
+        engine = str(engine_id or "")
+        return {
+            normalize_symbol(str(getattr(pos, "symbol", "") or "") or split_position_key(key)[1])
+            for key, pos in self.open_positions.items()
+            if _lot_owned_by_engine(pos, engine) and self._day_position_blocks_new_entry(pos)
+        }
+
+    def _engine_held_count(self, engine_id: str) -> int:
+        """Slot-consuming lots owned by one engine (dust excluded).
+
+        DAY-side heritage (LEGACY_DAY_LIVE / LEGACY_EXIT_ONLY / "") counts
+        toward DAY_V2; SCALP_V2 counts only its own lots.
+        """
+        engine = str(engine_id or "")
+        return sum(1 for pos in self.open_positions.values() if _lot_owned_by_engine(pos, engine) and self._day_position_blocks_new_entry(pos))
+
+    def _combined_held_count(self) -> int:
+        """Slot-consuming lots across all engines (dust excluded). Hard max 8."""
+        return sum(1 for pos in self.open_positions.values() if self._day_position_blocks_new_entry(pos))
+
+    def _day_path_ev_entry_block_reason(self, symbol: str, max_open: int, *, engine_id: str = "DAY_V2") -> str | None:
         """Path-EV true-safety: duplicate ACTIVE/residual, or max-open of held slots.
 
+        Two-engine contract: scoped to the requesting engine's own lots — a
+        sibling engine's lot on the same symbol never blocks this engine.
         DUST_PENDING does not populate the held set and does not consume slots.
         """
-        if normalize_symbol(symbol) in self._day_entry_held_symbols():
+        if normalize_symbol(symbol) in self._engine_held_symbols(engine_id):
             return "DUPLICATE_SAME_SYMBOL"
-        if max_open > 0 and self._day_entry_held_count() >= max_open:
+        if max_open > 0 and self._engine_held_count(engine_id) >= max_open:
             return "MAX_OPEN_LIMIT"
         return None
 
@@ -8779,14 +9316,16 @@ class PortfolioEngine:
         """SCALP V2 dedicated live BUY path.
 
         Requires entry_authority SCALP_V2_CONFIRMED. engine_id alone is not
-        enough. Shares the combined four-position cap with DAY V2.
+        enough. Two-engine contract: SCALP owns up to 4 slots (combined hard
+        max 8); same-symbol coexistence with DAY lots is allowed; same-engine
+        duplicates are blocked; new entries obey the SCALP capital budget.
         """
         import contextlib
         from datetime import datetime, timezone
 
         from backend.config.day_entry_execution import ENTRY_AUTHORITY_SCALP_V2_CONFIRMED
         from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
-        from backend.services.two_engine_claim import COMBINED_POSITION_CAP, claim_symbol, release_claim
+        from backend.services.two_engine_claim import claim_symbol, release_claim
 
         if str(entry_authority or "") != ENTRY_AUTHORITY_SCALP_V2_CONFIRMED:
             logger.error("SCALP_V2_BUY_BLOCKED symbol=%s UNKNOWN_ENGINE authority=%s", symbol, entry_authority or "missing")
@@ -8801,28 +9340,35 @@ class PortfolioEngine:
             logger.warning("SCALP_V2_BUY_BLOCKED symbol=%s KILL_SWITCH reason=%s", norm, kill_reason)
             return None
 
-        # 2. Combined slot budget shared with DAY. Dust does not consume a slot.
-        # A separate SCALP cap stacked on DAY's cap would allow eight positions.
-        combined_cap = min(COMBINED_POSITION_CAP, int(os.getenv("MAX_OPEN_POSITIONS", str(COMBINED_POSITION_CAP)) or COMBINED_POSITION_CAP))
-        held = self._day_entry_held_count()
-        if held >= combined_cap:
+        # 2. Engine-scoped slot budget. SCALP owns up to 4 slots; combined hard
+        # max is 8. DAY lots never count against SCALP's four slots. Dust does
+        # not consume a slot.
+        scalp_held = self._engine_held_count(SCALP_V2_ENGINE_ID)
+        if scalp_held >= SCALP_MAX_OPEN_POSITIONS:
+            logger.info(
+                "SCALP_V2_BUY_BLOCKED symbol=%s ENGINE_MAX_POSITIONS held=%d cap=%d",
+                norm,
+                scalp_held,
+                SCALP_MAX_OPEN_POSITIONS,
+            )
+            self.last_buy_reject_reason = "ENGINE_MAX_POSITIONS"
+            return None
+        if self._combined_held_count() >= COMBINED_ENGINE_MAX_POSITIONS:
             logger.info(
                 "SCALP_V2_BUY_BLOCKED symbol=%s MAX_COMBINED_POSITIONS held=%d cap=%d",
                 norm,
-                held,
-                combined_cap,
+                self._combined_held_count(),
+                COMBINED_ENGINE_MAX_POSITIONS,
             )
             self.last_buy_reject_reason = "MAX_COMBINED_POSITIONS"
             return None
-        existing = self.open_positions.get(norm)
+        existing = self._find_position(SCALP_V2_ENGINE_ID, norm)
         if existing is not None:
-            ex_engine = str(getattr(existing, "engine_id", "") or "")
             ex_qty = float(getattr(existing, "quantity", 0) or 0)
             ex_status = str(getattr(existing, "status", "ACTIVE") or "ACTIVE")
             if ex_qty > 0 and ex_status != "DUST_PENDING":
-                reason = "SYMBOL_OCCUPIED" if ex_engine == SCALP_V2_ENGINE_ID else "SYMBOL_OCCUPIED_BY_OTHER_ENGINE"
-                logger.info("SCALP_V2_BUY_BLOCKED symbol=%s %s engine=%s", norm, reason, ex_engine)
-                self.last_buy_reject_reason = reason
+                logger.info("SCALP_V2_BUY_BLOCKED symbol=%s SYMBOL_OCCUPIED engine=%s", norm, SCALP_V2_ENGINE_ID)
+                self.last_buy_reject_reason = "SYMBOL_OCCUPIED"
                 return None
 
         # 4. Normalize quantity to exchange constraints
@@ -8859,7 +9405,25 @@ class PortfolioEngine:
 
         notional = quantity * float(preflight.protected_limit_price or price)
 
-        # 7. Cash gate and live order inside the global cash lock
+        # 7. Capital-allocator gate (two-engine contract): SCALP may deploy only
+        # within its remaining engine budget, and physical free USDT (net of
+        # both engines' reservations) must cover the order.
+        from backend.services.two_engine_capital import check_engine_budget
+
+        budget_ok, budget_reason, _snap = check_engine_budget(
+            self.db_path,
+            SCALP_V2_ENGINE_ID,
+            notional,
+            float(self._total_equity or 0),
+            float(self._available_balance or 0),
+            self.open_positions,
+        )
+        if not budget_ok:
+            logger.info("SCALP_V2_BUY_BLOCKED symbol=%s %s notional=%.4f", norm, budget_reason, notional)
+            self.last_buy_reject_reason = budget_reason
+            return None
+
+        # 8. Cash gate and live order inside the global cash lock
         async with self._global_cash_lock:
             free_cash = float(self._available_balance or 0)
             if notional > free_cash:
@@ -8880,7 +9444,6 @@ class PortfolioEngine:
                 decision_key,
                 notional,
                 positions=self.open_positions,
-                max_positions=combined_cap,
             )
             if not claimed:
                 self.last_buy_reject_reason = claim_reason or "SYMBOL_OCCUPIED"
@@ -8905,7 +9468,13 @@ class PortfolioEngine:
                 limit_price=preflight.protected_limit_price,
             )
             if not live_order:
-                release_claim(self.db_path, reservation_id=reservation_id, decision_id=decision_key, symbol=norm)
+                release_claim(
+                    self.db_path,
+                    reservation_id=reservation_id,
+                    decision_id=decision_key,
+                    symbol=norm,
+                    engine_id=SCALP_V2_ENGINE_ID,
+                )
                 logger.error("SCALP_V2_BUY_FAILED symbol=%s NOT_FILLED", norm)
                 self.last_buy_reject_reason = "EXCHANGE_REJECTED"
                 return None
@@ -8965,7 +9534,11 @@ class PortfolioEngine:
                     engine_id=SCALP_V2_ENGINE_ID,
                     scalp_opportunity_id=opportunity_id,
                 )
-                self.open_positions[norm] = position
+                self.open_positions[make_position_key(SCALP_V2_ENGINE_ID, norm)] = position
+                with contextlib.suppress(Exception):
+                    from backend.services.trade_state import get_trade_state_store
+
+                    get_trade_state_store().on_entry_fill(norm, float(fill_price), float(atr or 0.0), engine_id=SCALP_V2_ENGINE_ID)
 
                 # 10. Atomic DB commit
                 new_pv = float(self._positions_value) + filled_qty * fill_price
@@ -9008,7 +9581,7 @@ class PortfolioEngine:
             except Exception:
                 # The venue order is filled. Keep an order-id-backed BUY row so
                 # reconciliation restores this lot instead of calling it external.
-                self.open_positions.pop(norm, None)
+                self.open_positions.pop(make_position_key(SCALP_V2_ENGINE_ID, norm), None)
                 self._available_balance = float(self.cash_balance)
                 logger.error(
                     "SCALP_V2_BUY_POST_FILL_FAILED symbol=%s order_id=%s qty=%.8f price=%.8f — provenance row kept for reconciliation",
@@ -9054,7 +9627,13 @@ class PortfolioEngine:
                     )
                 except Exception:
                     logger.exception("SCALP_V2_BUY_FILL_LEDGER_FAILED symbol=%s trade=%s", norm, trade_id)
-                consume_reservation(self.db_path, reservation_id=reservation_id, decision_id=decision_key, symbol=norm)
+                consume_reservation(
+                    self.db_path,
+                    reservation_id=reservation_id,
+                    decision_id=decision_key,
+                    symbol=norm,
+                    sleeve=SCALP_V2_ENGINE_ID,
+                )
                 self.last_buy_reject_reason = "POST_FILL_BIND_FAILED"
                 return None
 
@@ -9062,7 +9641,13 @@ class PortfolioEngine:
             self.cash_balance = new_cash
             self._positions_value = new_pv
             self._total_equity = new_eq
-            consume_reservation(self.db_path, reservation_id=reservation_id, decision_id=decision_key, symbol=norm)
+            consume_reservation(
+                self.db_path,
+                reservation_id=reservation_id,
+                decision_id=decision_key,
+                symbol=norm,
+                sleeve=SCALP_V2_ENGINE_ID,
+            )
 
             logger.warning(
                 "SCALP_V2_ENTRY_FILLED symbol=%s qty=%.8f price=%.6f fee=%.6f order_id=%s opp=%s",
@@ -9227,21 +9812,35 @@ class PortfolioEngine:
         from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
         from backend.services.scalp_v2.identity_stamp import stamp_engine
 
+        _ensure_position_engine_identity(conn)
         conn.execute(
             """
-            INSERT OR REPLACE INTO portfolio_engine_positions
+            INSERT INTO portfolio_engine_positions
                 (symbol, quantity, entry_price, entry_time, trade_id,
                  stop_price, take_profit_1_price, take_profit_2_price,
                  atr_at_entry, confidence_at_entry,
                  highest_price, lowest_price, entry_fee,
                  entry_decision_id, entry_reservation_id, entry_order_id, entry_client_order_id,
-                 status, last_updated)
+                 status, engine_id, scalp_opportunity_id, last_updated)
             VALUES (?, ?, ?, ?, ?,
                     0, 0, 0,
                     ?, 0.5,
                     ?, ?, ?,
                     ?, ?, ?, ?,
-                    'ACTIVE', ?)
+                    'ACTIVE', ?, ?, ?)
+            ON CONFLICT(engine_id, symbol) DO UPDATE SET
+                quantity=excluded.quantity, entry_price=excluded.entry_price,
+                entry_time=excluded.entry_time, trade_id=excluded.trade_id,
+                atr_at_entry=excluded.atr_at_entry,
+                highest_price=excluded.highest_price, lowest_price=excluded.lowest_price,
+                entry_fee=excluded.entry_fee,
+                entry_decision_id=excluded.entry_decision_id,
+                entry_reservation_id=excluded.entry_reservation_id,
+                entry_order_id=excluded.entry_order_id,
+                entry_client_order_id=excluded.entry_client_order_id,
+                status=excluded.status,
+                scalp_opportunity_id=excluded.scalp_opportunity_id,
+                last_updated=excluded.last_updated
             """,
             (
                 symbol,
@@ -9257,10 +9856,20 @@ class PortfolioEngine:
                 reservation_id,
                 order_id,
                 client_order_id,
+                SCALP_V2_ENGINE_ID,
+                opportunity_id,
                 timestamp,
             ),
         )
-        stamp_engine(conn, "portfolio_engine_positions", "symbol", symbol, SCALP_V2_ENGINE_ID, opportunity_id)
+        stamp_engine(
+            conn,
+            "portfolio_engine_positions",
+            "symbol",
+            symbol,
+            SCALP_V2_ENGINE_ID,
+            opportunity_id,
+            scope_engine=SCALP_V2_ENGINE_ID,
+        )
 
     def _scalp_v2_record_fill_provenance_sync(
         self,
@@ -9341,7 +9950,9 @@ class PortfolioEngine:
         await asyncio.to_thread(run_locked_retry, _op)
         from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
 
-        self.open_positions[symbol] = OpenPosition(
+        # Two-engine contract: restored SCALP lot lives under its composite
+        # key so a DAY-side lot on the same symbol is never overwritten.
+        self.open_positions[make_position_key(SCALP_V2_ENGINE_ID, symbol)] = OpenPosition(
             symbol=symbol,
             quantity=qty,
             entry_price=float(lot["price"]),
@@ -10150,7 +10761,7 @@ class PortfolioEngine:
         # =================================================================
         # SOLE EXECUTION GATE - all discipline checks
         # =================================================================
-        can_open, block_reason = await self._can_open_position(symbol, total_cost, decision_id=str(decision_id or ""))
+        can_open, block_reason = await self._can_open_position(symbol, total_cost, decision_id=str(decision_id or ""), engine_id=str(fill_engine_id or ""))
         if not can_open:
             logger.warning(f"BUY_BLOCKED: {symbol} - {block_reason}")
             _gate_id = "CASH_OR_SLOTS"
@@ -10203,6 +10814,7 @@ class PortfolioEngine:
                 decision_id=str(decision_id or ""),
                 risk_usd=float(total_cost) * 0.02,
                 sleeve=str(_reserve_sleeve or ""),
+                engine_id=str(fill_engine_id or ""),
             )
             if not _ok_res:
                 logger.warning(f"BUY_BLOCKED_RESERVATION: {symbol} - {_res_reason}")
@@ -10480,7 +11092,9 @@ class PortfolioEngine:
         effective_sleeve = sleeve or assign_sleeve(normalized_symbol, confidence)
 
         _protected_dust = 0.0
-        _existing_lot = self.open_positions.get(normalized_symbol)
+        # Two-engine contract: dust lookup is engine-scoped (a sibling engine's
+        # lot on the same symbol is independent inventory, not our dust).
+        _existing_lot = self._find_position(str(fill_engine_id or "DAY_V2"), normalized_symbol)
         if _existing_lot is not None and str(getattr(_existing_lot, "status", "") or "").upper() == "DUST_PENDING":
             from backend.services.day_entry_spendable import money as _money_dust
             from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
@@ -10734,7 +11348,16 @@ class PortfolioEngine:
             self._positions_value = committed_positions_value
             self._total_equity = committed_equity
         next_positions = dict(self.open_positions)
-        next_positions[normalized_symbol] = position
+        # Two-engine contract: adopt under the composite (engine_id, symbol)
+        # key so a sibling engine's lot on the same symbol survives. Drop only
+        # same-lineage DAY-side keys (bare + DAY-side composites): this lot
+        # replaces its own lineage, never the other engine's lot.
+        _adopt_engine = str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE")
+        next_positions.pop(normalized_symbol, None)
+        for _cand in DAY_SIDE_ENGINES:
+            if _cand != _adopt_engine:
+                next_positions.pop(make_position_key(_cand, normalized_symbol), None)
+        next_positions[make_position_key(_adopt_engine, normalized_symbol)] = position
         self.open_positions = next_positions
         self._recently_added_symbols[normalized_symbol] = time.time()
         self.trade_explanations[trade_id] = explainability
@@ -10811,7 +11434,7 @@ class PortfolioEngine:
             with contextlib.suppress(Exception):
                 from backend.services.trade_state import get_trade_state_store
 
-                get_trade_state_store().on_entry_fill(symbol, float(fill_price), float(atr or 0.0))
+                get_trade_state_store().on_entry_fill(symbol, float(fill_price), float(atr or 0.0), engine_id=str(fill_engine_id or ""))
         self._update_strategy_capital_sleeve(
             strategy_id=str(buy_strategy_id or "day"),
             realized_pnl_delta=0.0,
@@ -11239,21 +11862,52 @@ class PortfolioEngine:
             "total_cost": total_cost,
         }
 
-    def _fetch_authoritative_open_position_sync(self, symbol: str) -> tuple[float, str, float] | None:
-        """Return (quantity, trade_id, entry_price) from portfolio_engine_positions or None."""
+    def _fetch_authoritative_open_position_sync(self, symbol: str, engine_id: str = "") -> tuple[float, str, float] | None:
+        """Return (quantity, trade_id, entry_price) from portfolio_engine_positions or None.
+
+        Engine-scoped: with engine_id set, only that engine's lot is returned
+        (legacy DAY mapping included); empty engine_id keeps legacy behavior
+        except it refuses on ambiguity (multiple live lots).
+        """
         normalized = normalize_symbol(symbol)
         try:
             with connect_rw(self.db_path) as conn:
-                row = conn.execute(
-                    """
-                    SELECT quantity, trade_id, entry_price
-                    FROM portfolio_engine_positions
-                    WHERE symbol = ? AND quantity > 0
-                      AND COALESCE(status, 'ACTIVE') != 'DUST_PENDING'
-                    LIMIT 1
-                    """,
-                    (normalized,),
-                ).fetchone()
+                engine = str(engine_id or "")
+                if engine in ("", *DAY_SIDE_ENGINES) and not engine:
+                    row = conn.execute(
+                        """
+                        SELECT quantity, trade_id, entry_price
+                        FROM portfolio_engine_positions
+                        WHERE symbol = ? AND quantity > 0
+                          AND COALESCE(status, 'ACTIVE') != 'DUST_PENDING'
+                        LIMIT 1
+                        """,
+                        (normalized,),
+                    ).fetchone()
+                elif engine in DAY_SIDE_ENGINES or not engine:
+                    row = conn.execute(
+                        """
+                        SELECT quantity, trade_id, entry_price
+                        FROM portfolio_engine_positions
+                        WHERE symbol = ? AND quantity > 0
+                          AND COALESCE(status, 'ACTIVE') != 'DUST_PENDING'
+                          AND COALESCE(engine_id,'LEGACY_DAY_LIVE') IN ('DAY_V2','LEGACY_DAY_LIVE','LEGACY_EXIT_ONLY')
+                        LIMIT 1
+                        """,
+                        (normalized,),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        """
+                        SELECT quantity, trade_id, entry_price
+                        FROM portfolio_engine_positions
+                        WHERE symbol = ? AND quantity > 0
+                          AND COALESCE(status, 'ACTIVE') != 'DUST_PENDING'
+                          AND engine_id = ?
+                        LIMIT 1
+                        """,
+                        (normalized, engine),
+                    ).fetchone()
             if not row:
                 return None
             qty, trade_id, entry_price = row
@@ -11278,14 +11932,26 @@ class PortfolioEngine:
     ) -> tuple[bool, float]:
         """Return (still_open, remaining_qty) for this entry lot from SQLite authority."""
         normalized = normalize_symbol(symbol)
-        sql = """
-            SELECT quantity, trade_id
-            FROM portfolio_engine_positions
-            WHERE symbol = ?
-        """
+        # Two-engine contract: anchor on the entry trade_id when known so a
+        # sibling engine's same-symbol lot can never satisfy this check.
+        _tid = str(entry_trade_id or "")
+        if _tid:
+            sql = """
+                SELECT quantity, trade_id
+                FROM portfolio_engine_positions
+                WHERE symbol = ? AND trade_id = ?
+            """
+            _params: tuple[Any, ...] = (normalized, _tid)
+        else:
+            sql = """
+                SELECT quantity, trade_id
+                FROM portfolio_engine_positions
+                WHERE symbol = ?
+            """
+            _params = (normalized,)
 
         def _read(cur) -> tuple[bool, float]:
-            row = cur.execute(sql, (normalized,)).fetchone()
+            row = cur.execute(sql, _params).fetchone()
             if not row:
                 return False, 0.0
             qty = float(row[0] or 0.0)
@@ -11412,6 +12078,7 @@ class PortfolioEngine:
             ExitType.MANUAL,
             EXIT_LEGACY_INVENTORY_CLEANUP,
             force_sell=True,
+            engine_id=str(getattr(position, "engine_id", "") or ""),
         )
         if result:
             result["legacy_cleanup"] = True
@@ -11428,6 +12095,7 @@ class PortfolioEngine:
         exit_trigger: str,
         current_bar: int | None = None,
         force_sell: bool = False,
+        engine_id: str = "",
     ) -> dict[str, Any] | None:
         """Serialize sells per symbol, then run the FIFO sell."""
         locks = getattr(self, "_sell_execution_locks", None)
@@ -11444,6 +12112,7 @@ class PortfolioEngine:
                 exit_trigger,
                 current_bar=current_bar,
                 force_sell=force_sell,
+                engine_id=engine_id,
             )
 
     async def _execute_sell_fifo_locked(
@@ -11455,21 +12124,50 @@ class PortfolioEngine:
         exit_trigger: str,
         current_bar: int | None = None,
         force_sell: bool = False,
+        engine_id: str = "",
     ) -> dict[str, Any] | None:
         """
         PHASE 1: Execute SELL with FIFO matching against BUY lots.
         Decrements remaining_position on matched BUY rows.
         current_bar: bar close timestamp (seconds) for cooldown; from integration when sell is from exit monitor.
         Elite Hardening: Kill switch check + audit trail.
+        Two-engine contract: engine_id selects the owning lot. Empty engine_id
+        resolves a lone lot (legacy behavior) but refuses on ambiguity.
         """
         from backend.services.protected_external_inventory import protected_quantity, strategy_sell_quantity
 
         owned_qty = None
         want = normalize_symbol(symbol)
-        for key, pos in self.open_positions.items():
-            if normalize_symbol(key) == want:
-                owned_qty = float(getattr(pos, "quantity", 0) or 0)
-                break
+        # Two-engine lot resolution: sell ONLY the requesting engine's lot.
+        lots = self._symbol_lots(want)
+        candidates = [p for p in lots if _lot_owned_by_engine(p, engine_id)] if str(engine_id or "") else list(lots)
+        if str(engine_id or "") and not candidates:
+            logger.warning(
+                "SELL_BLOCKED_NO_ENGINE_LOT symbol=%s engine=%s lots=%d",
+                symbol,
+                engine_id,
+                len(lots),
+            )
+            await self._record_reject(symbol, "SELL", "SELL_BLOCKED_NO_ENGINE_LOT", "EXECUTION_GATE")
+            return None
+        if not str(engine_id or "") and len(candidates) > 1:
+            logger.error(
+                "SELL_BLOCKED_AMBIGUOUS_LOT symbol=%s lots=%d — engine_id required",
+                symbol,
+                len(candidates),
+            )
+            await self._record_reject(symbol, "SELL", "SELL_BLOCKED_AMBIGUOUS_LOT", "EXECUTION_GATE")
+            return None
+        for pos in candidates:
+            owned_qty = float(getattr(pos, "quantity", 0) or 0)
+            break
+        # Two-engine contract: all memory/DB mutations below target ONLY this
+        # lot's key. A sibling engine's lot on the same symbol is never touched.
+        _sell_lot = candidates[0] if candidates else None
+        position_key = next(
+            (k for k, v in self.open_positions.items() if v is _sell_lot),
+            normalize_symbol(symbol),
+        )
         if owned_qty is None and protected_quantity(self.db_path, symbol) > 0:
             logger.error("SELL_BLOCKED_PROTECTED_INVENTORY symbol=%s requested=%s", symbol, quantity)
             return None
@@ -11501,7 +12199,7 @@ class PortfolioEngine:
             await self._record_reject(normalized_symbol, "SELL", "exit_already_in_progress", "EXECUTION_GATE")
             return None
 
-        open_row = await asyncio.to_thread(self._fetch_authoritative_open_position_sync, normalized_symbol)
+        open_row = await asyncio.to_thread(self._fetch_authoritative_open_position_sync, normalized_symbol, engine_id)
         if not open_row:
             logger.warning(
                 "SELL_IDEMPOTENCY_ALREADY_CLOSED: %s has no open row in portfolio_engine_positions",
@@ -11514,14 +12212,20 @@ class PortfolioEngine:
                 "EXECUTION_GATE",
             )
             async with self._deletion_lock:
-                self.open_positions.pop(normalized_symbol, None)
+                if self.open_positions.get(position_key) is _sell_lot:
+                    self.open_positions.pop(position_key, None)
             return None
 
         db_qty, db_trade_id, db_entry = open_row
-        position = self.open_positions.get(normalized_symbol)
+        position = self.open_positions.get(position_key)
         if not position:
             await self._load_positions_from_sqlite()
-            position = self.open_positions.get(normalized_symbol)
+            position = next(
+                (v for k, v in self.open_positions.items() if k == position_key),
+                None,
+            )
+            if position is None and _sell_lot is not None:
+                position = next((v for v in self.open_positions.values() if v is _sell_lot), None)
         if not position:
             logger.warning(
                 "SELL_REHYDRATE: sqlite open row for %s but engine memory empty after reload",
@@ -11805,15 +12509,48 @@ class PortfolioEngine:
                         return False
 
                     # PHASE 2 FIX: Use AUTHORITATIVE ledger (portfolio_engine_positions) not paper_trades
-                    # Since MAX_OPEN_PER_SYMBOL=1, there's exactly one position per symbol
-                    cursor.execute(
-                        """
-                        SELECT quantity, trade_id, entry_price
-                        FROM portfolio_engine_positions
-                        WHERE symbol = ?
-                    """,
-                        (normalized_symbol,),
-                    )
+                    # Two-engine contract: match THIS lot by entry trade_id
+                    # (unique per lot); fall back to symbol+engine, never to a
+                    # sibling engine's lot.
+                    _lot_trade_id = str(getattr(position, "trade_id", "") or "")
+                    _lot_engine = str(getattr(position, "engine_id", "") or "")
+                    if _lot_trade_id:
+                        cursor.execute(
+                            """
+                            SELECT quantity, trade_id, entry_price
+                            FROM portfolio_engine_positions
+                            WHERE trade_id = ?
+                        """,
+                            (_lot_trade_id,),
+                        )
+                    elif _lot_engine in DAY_SIDE_ENGINES:
+                        cursor.execute(
+                            """
+                            SELECT quantity, trade_id, entry_price
+                            FROM portfolio_engine_positions
+                            WHERE symbol = ?
+                              AND COALESCE(engine_id,'LEGACY_DAY_LIVE') IN ('DAY_V2','LEGACY_DAY_LIVE','LEGACY_EXIT_ONLY')
+                        """,
+                            (normalized_symbol,),
+                        )
+                    elif _lot_engine:
+                        cursor.execute(
+                            """
+                            SELECT quantity, trade_id, entry_price
+                            FROM portfolio_engine_positions
+                            WHERE symbol = ? AND engine_id = ?
+                        """,
+                            (normalized_symbol, _lot_engine),
+                        )
+                    else:
+                        cursor.execute(
+                            """
+                            SELECT quantity, trade_id, entry_price
+                            FROM portfolio_engine_positions
+                            WHERE symbol = ?
+                        """,
+                            (normalized_symbol,),
+                        )
 
                     position_row = cursor.fetchone()
                     if not position_row:
@@ -11853,7 +12590,8 @@ class PortfolioEngine:
                         conn.rollback()
                         return False
 
-                    # Update authoritative position quantity
+                    # Update authoritative position quantity (this lot only —
+                    # trade_id-anchored; a sibling engine's lot is never touched)
                     new_qty = available_qty - quantity
                     if new_qty > 0:
                         # Partial exit - update quantity
@@ -11861,14 +12599,14 @@ class PortfolioEngine:
                             """
                             UPDATE portfolio_engine_positions
                             SET quantity = ?, last_updated = ?
-                            WHERE symbol = ?
+                            WHERE trade_id = ?
                         """,
-                            (new_qty, timestamp, normalized_symbol),
+                            (new_qty, timestamp, position_trade_id),
                         )
                         logger.debug(f"FIFO_MATCH: {normalized_symbol} partial exit | sold {quantity}, remaining {new_qty}")
                     else:
                         # Full exit - DELETE position in same transaction as SELL record (Phase 1)
-                        cursor.execute("DELETE FROM portfolio_engine_positions WHERE symbol = ?", (normalized_symbol,))
+                        cursor.execute("DELETE FROM portfolio_engine_positions WHERE trade_id = ?", (position_trade_id,))
                         logger.debug(f"FIFO_MATCH: {normalized_symbol} full exit | sold {quantity}")
 
                     # Update paper_trades lot tracking by trade_id (Phase 1: trade_id-anchored, not ORDER BY/LIMIT)
@@ -12985,8 +13723,9 @@ class PortfolioEngine:
             position.entry_fee = max(0.0, (getattr(position, "entry_fee", 0) or 0) - entry_fee_pro_rata)
             if remaining_now <= 0.0:
                 async with self._deletion_lock:
-                    self.open_positions.pop(normalized_symbol, None)
-                    await self._delete_position_from_sqlite(normalized_symbol)
+                    if self.open_positions.get(position_key) is position:
+                        self.open_positions.pop(position_key, None)
+                    await self._delete_position_from_sqlite(normalized_symbol, engine_id)
                     await self._write_closed_lot_tombstone(
                         normalized_symbol,
                         entry_trade_id=str(position.trade_id or ""),
@@ -13001,8 +13740,9 @@ class PortfolioEngine:
             # Full close - remove position
             # BUG #28: Wrap deletion in lock
             async with self._deletion_lock:
-                del self.open_positions[normalized_symbol]
-                await self._delete_position_from_sqlite(normalized_symbol)
+                if position_key in self.open_positions and self.open_positions[position_key] is position:
+                    del self.open_positions[position_key]
+                await self._delete_position_from_sqlite(normalized_symbol, engine_id)
                 await self._write_closed_lot_tombstone(
                     normalized_symbol,
                     entry_trade_id=str(position.trade_id or ""),
@@ -13208,6 +13948,7 @@ class PortfolioEngine:
                     normalized_symbol,
                     float(fill_price),
                     str(exit_trigger or exit_type.value or "SELL"),
+                    engine_id=str(getattr(position, "engine_id", "") or ""),
                 )
         await self._persist_quality_cooldowns()
         cooldown_until = self._quality_filter_state.symbol_cooldowns.get(normalized_symbol, bar_ts) if self._bar_interval_seconds else bar_ts
@@ -13375,9 +14116,14 @@ class PortfolioEngine:
             pending_syms |= {str(s) for s in self._pending_buy_order_symbols()}
         except Exception:
             pass
-        reservations = getattr(self, "_entry_reservations", None) or {}
-        pending_syms |= {str(s) for s in reservations}
-        open_syms = {str(s) for s, p in self.open_positions.items() if consumes_strategy_slot(p)}
+        try:
+            for k in getattr(self, "_entry_reservations", None) or {}:
+                _sl, _sym = _split_reservation_key(str(k))
+                if _sym:
+                    pending_syms.add(_sym)
+        except Exception:
+            pass
+        open_syms = {split_position_key(str(s))[1] for s in self.open_positions}
         n += len(pending_syms - open_syms)
         return n
 
@@ -13675,8 +14421,28 @@ class PortfolioEngine:
 
     def _pending_buy_symbols(self) -> set[str]:
         reservations = getattr(self, "_entry_reservations", None) or {}
+        syms = set()
+        for k in reservations:
+            _sl, _sym = _split_reservation_key(str(k))
+            if _sym:
+                syms.add(_sym)
         armed = {normalize_symbol(s) for s in (getattr(self, "_trailing_buy_arms", None) or {})}
-        return set(reservations.keys()) | self._pending_buy_order_symbols() | armed
+        return syms | self._pending_buy_order_symbols() | armed
+
+    def _pending_buy_symbols_for_engine(self, engine_id: str) -> set[str]:
+        """Pending symbols attributable to one engine (its reservations; arms are DAY-side)."""
+        engine = str(engine_id or "")
+        out: set[str] = set()
+        for k in getattr(self, "_entry_reservations", None) or {}:
+            sl, sym = _split_reservation_key(str(k))
+            if sym and _sleeve_maps_to_engine(sl, engine):
+                out.add(sym)
+        if engine in ("", *DAY_SIDE_ENGINES):
+            out |= {normalize_symbol(s) for s in (getattr(self, "_trailing_buy_arms", None) or {})}
+        # In-flight BUY orders carry no engine tag: count conservatively toward
+        # the requesting engine (transient, seconds-lived).
+        out |= self._pending_buy_order_symbols()
+        return out
 
     def _pending_buy_notional(self, *, exclude_symbol: str = "", exclude_decision_id: str = ""):
         from backend.services.day_entry_spendable import money
@@ -13704,15 +14470,19 @@ class PortfolioEngine:
             n += qty * px
         return n
 
-    def _own_entry_reservation(self, symbol: str, decision_id: str = "") -> tuple[dict[str, Any], str]:
+    def _own_entry_reservation(self, symbol: str, decision_id: str = "", sleeve: str = "") -> tuple[dict[str, Any], str]:
         ns = normalize_symbol(symbol)
         reservations = getattr(self, "_entry_reservations", None) or {}
         did = str(decision_id or "").strip()
         if did:
             for key, row in reservations.items():
                 if str((row or {}).get("decision_id") or "") == did:
-                    return dict(row or {}), normalize_symbol(key) or ns
-        row = reservations.get(ns) or reservations.get(symbol) or {}
+                    _sl, _sym = _split_reservation_key(str(key))
+                    return dict(row or {}), _sym or ns
+        key = _reservation_key(ns, sleeve)
+        row = reservations.get(key)
+        if row is None and sleeve:
+            row = reservations.get(ns) or {}
         return dict(row or {}), ns
 
     def _try_reserve_entry(
@@ -13724,32 +14494,53 @@ class PortfolioEngine:
         risk_usd: float = 0.0,
         sleeve: str = "",
         ttl_sec: float | None = None,
+        engine_id: str = "",
     ) -> tuple[bool, str]:
         """Reserve cash/slot/symbol/risk/sleeve under caller-held `_global_cash_lock`.
 
         Persists to SQLite for restart recovery; idempotent on decision_id.
+        Two-engine contract: the in-memory key is (sleeve, symbol) so DAY and
+        SCALP reservations coexist; slot checks are engine-scoped.
         """
         ns = normalize_symbol(symbol)
         if not ns:
             return False, "INVALID_SYMBOL"
         did = str(decision_id or "").strip()
+        sleeve_val = str(sleeve or "")
+        # Effective engine: explicit param wins, else sleeve mapping, else legacy.
+        eff_engine = str(engine_id or "")
+        if not eff_engine:
+            eff_engine = "SCALP_V2" if sleeve_val == "SCALP_V2" else ("DAY_V2" if sleeve_val else "")
+        rkey = _reservation_key(ns, sleeve_val)
         # Idempotent: same decision_id already reserved
         if did:
             for _sym, r in (self._entry_reservations or {}).items():
                 if str((r or {}).get("decision_id") or "") == did:
                     return True, "IDEMPOTENT_EXISTING"
-        if ns in self._entry_reservations:
-            existing = self._entry_reservations[ns]
+        if rkey in self._entry_reservations:
+            existing = self._entry_reservations[rkey]
             if did and str((existing or {}).get("decision_id") or "") == did:
                 return True, "IDEMPOTENT_EXISTING"
             return False, "ENTRY_ALREADY_RESERVED"
         if ns in self._pending_buy_order_symbols():
             return False, "ENTRY_PENDING_ORDER"
-        active_count = self._day_entry_held_count()
-        pending_slots = len(self._pending_buy_symbols() - {normalize_symbol(s) for s in self.open_positions})
-        max_positions_limit = MAX_OPEN_POSITIONS
-        if active_count + pending_slots >= max_positions_limit:
-            return False, "MAX_POSITIONS_WITH_PENDING"
+        if eff_engine in ("DAY_V2", "SCALP_V2"):
+            engine_cap = SCALP_MAX_OPEN_POSITIONS if eff_engine == "SCALP_V2" else DAY_MAX_OPEN_POSITIONS
+            engine_held = self._engine_held_count(eff_engine)
+            engine_pending = len(self._pending_buy_symbols_for_engine(eff_engine) - self._engine_held_symbols(eff_engine))
+            if engine_held + engine_pending >= engine_cap:
+                return False, "MAX_POSITIONS_WITH_PENDING"
+            _held_syms = {split_position_key(k)[1] for k in self.open_positions}
+            if self._combined_held_count() + len(self._pending_buy_symbols() - _held_syms) >= COMBINED_ENGINE_MAX_POSITIONS:
+                return False, "MAX_POSITIONS_WITH_PENDING"
+            max_positions_limit = engine_cap
+        else:
+            active_count = self._day_entry_held_count()
+            _held_syms = {split_position_key(k)[1] for k in self.open_positions}
+            pending_slots = len(self._pending_buy_symbols() - _held_syms)
+            max_positions_limit = MAX_OPEN_POSITIONS
+            if active_count + pending_slots >= max_positions_limit:
+                return False, "MAX_POSITIONS_WITH_PENDING"
         from backend.services.day_entry_spendable import plan_reservation, spendable_quote
 
         pending_n = self._pending_buy_notional(exclude_decision_id=did)
@@ -13786,7 +14577,7 @@ class PortfolioEngine:
                 if not ok_p:
                     return False, reason_p
                 if reason_p == "IDEMPOTENT_EXISTING":
-                    self._entry_reservations[ns] = {
+                    self._entry_reservations[rkey] = {
                         "notional": float(notional_usd),
                         "risk_usd": float(risk_usd or 0.0),
                         "decision_id": did,
@@ -13797,7 +14588,7 @@ class PortfolioEngine:
                     return True, "IDEMPOTENT_EXISTING"
             except Exception as exc:
                 logger.warning("persistent reservation failed (in-memory only): %s", exc)
-        self._entry_reservations[ns] = {
+        self._entry_reservations[rkey] = {
             "notional": float(notional_usd),
             "risk_usd": float(risk_usd or 0.0),
             "decision_id": did,
@@ -13807,26 +14598,59 @@ class PortfolioEngine:
         }
         return True, "OK"
 
-    def _consume_entry_reservation(self, symbol: str, *, decision_id: str = "") -> None:
+    def _consume_entry_reservation(self, symbol: str, *, decision_id: str = "", sleeve: str = "") -> None:
         """A filled BUY spends the reservation. CONSUMED, not RELEASED."""
         ns = normalize_symbol(symbol)
-        meta = self._entry_reservations.pop(ns, None) or {}
+        meta: dict[str, Any] = {}
+        did = str(decision_id or "").strip()
+        if did:
+            for key, row in (self._entry_reservations or {}).items():
+                if str((row or {}).get("decision_id") or "") == did:
+                    meta = self._entry_reservations.pop(key, None) or {}
+                    break
+        if not meta:
+            meta = self._entry_reservations.pop(_reservation_key(ns, sleeve), None) or {}
+        if not meta:
+            meta = self._entry_reservations.pop(ns, None) or {}
         did = str(decision_id or meta.get("decision_id") or "")
         rid = str(meta.get("reservation_id") or "")
         with contextlib.suppress(Exception):
             from backend.services.day_entry_reservations import consume_reservation
 
-            consume_reservation(self.db_path, reservation_id=rid, decision_id=did, symbol=ns)
+            consume_reservation(
+                self.db_path,
+                reservation_id=rid,
+                decision_id=did,
+                symbol=ns,
+                sleeve=str(meta.get("sleeve") or sleeve or ""),
+            )
 
-    def _release_entry_reservation(self, symbol: str, *, decision_id: str = "", reason: str = "RELEASED") -> None:
+    def _release_entry_reservation(self, symbol: str, *, decision_id: str = "", reason: str = "RELEASED", sleeve: str = "") -> None:
         ns = normalize_symbol(symbol)
-        meta = self._entry_reservations.pop(ns, None) or {}
+        meta: dict[str, Any] = {}
+        did = str(decision_id or "").strip()
+        if did:
+            for key, row in (self._entry_reservations or {}).items():
+                if str((row or {}).get("decision_id") or "") == did:
+                    meta = self._entry_reservations.pop(key, None) or {}
+                    break
+        if not meta:
+            meta = self._entry_reservations.pop(_reservation_key(ns, sleeve), None) or {}
+        if not meta:
+            meta = self._entry_reservations.pop(ns, None) or {}
         did = str(decision_id or meta.get("decision_id") or "")
         rid = str(meta.get("reservation_id") or "")
         with contextlib.suppress(Exception):
             from backend.services.day_entry_reservations import release_reservation
 
-            release_reservation(self.db_path, reservation_id=rid, decision_id=did, symbol=ns, reason=reason)
+            release_reservation(
+                self.db_path,
+                reservation_id=rid,
+                decision_id=did,
+                symbol=ns,
+                reason=reason,
+                sleeve=str(meta.get("sleeve") or sleeve or ""),
+            )
 
     def _reload_entry_reservations_from_db(self) -> None:
         """Restart recovery for active entry reservations."""
@@ -13839,7 +14663,7 @@ class PortfolioEngine:
                 ns = normalize_symbol(str(r.get("symbol") or ""))
                 if not ns:
                     continue
-                self._entry_reservations[ns] = {
+                self._entry_reservations[_reservation_key(ns, str(r.get("sleeve") or ""))] = {
                     "notional": float(r.get("notional_usd") or 0.0),
                     "risk_usd": float(r.get("risk_usd") or 0.0),
                     "decision_id": str(r.get("decision_id") or ""),
@@ -13850,7 +14674,7 @@ class PortfolioEngine:
             if rows:
                 logger.info("DAY_RESERVATIONS_RECOVERED count=%s", len(rows))
 
-    async def _can_open_position(self, symbol: str, notional_usd: float, *, decision_id: str = "") -> tuple[bool, str]:
+    async def _can_open_position(self, symbol: str, notional_usd: float, *, decision_id: str = "", engine_id: str = "") -> tuple[bool, str]:
         """
         PHASE 2: Check if new position is allowed.
 
@@ -13859,12 +14683,14 @@ class PortfolioEngine:
         BLOCKS if:
         - Account is OVERALLOCATED or DELEVERAGING
         - Trading is paused
-        - Portfolio full (>= MAX_OPEN_POSITIONS)
-        - Symbol already open (max 1 per symbol)
+        - Engine full (>= its 4-slot cap) or combined book full (>= 8)
+        - Symbol already open for the SAME engine (max 1 per engine per symbol)
         - Insufficient cash (notional > available_cash)
         - Portfolio risk cap exceeded
 
         This is the SOLE execution gate. All buys MUST pass through this.
+        Two-engine contract: a sibling engine's lots never count against this
+        engine's cap and never block this engine's symbol.
         """
         symbol = normalize_symbol(symbol)
         from backend.services.sqlite_large_table_retention import disk_blocks_new_entries
@@ -13924,7 +14750,7 @@ class PortfolioEngine:
             try:
                 from backend.services.trade_state import get_trade_state_store
 
-                _ts_ok, _ts_reason = await get_trade_state_store().allow_new_entry_async(symbol, "buy", now_wall)
+                _ts_ok, _ts_reason = await get_trade_state_store().allow_new_entry_async(symbol, "buy", now_wall, engine_id=str(engine_id or ""))
                 if not _ts_ok:
                     logger.warning(
                         "BUY_BLOCKED_TRADE_STATE symbol=%s reason=%s",
@@ -13951,39 +14777,87 @@ class PortfolioEngine:
             except Exception as _ts_err:
                 logger.warning("trade_state gate error for %s: %s — allowing entry (fail-open)", symbol, _ts_err)
 
-        # Check max positions (hard limit: 10)
+        # Check max positions.
         # DUST_INVARIANT: Exclude DUST_PENDING from count - dust must not block new buys
         # Count pending entry reservations / pending BUY orders toward slot exposure.
-        active_count = self._day_entry_held_count()
-        pending_slot_symbols = self._pending_buy_symbols() - {normalize_symbol(s) for s in self.open_positions}
-        pending_slots = len(pending_slot_symbols)
-        max_positions_limit = MAX_OPEN_POSITIONS
+        # Two-engine contract: engine-scoped caps (4 each, 8 combined). A sibling
+        # engine's lots and pending never count against this engine's cap.
+        _held_syms_all = {split_position_key(k)[1] for k in self.open_positions}
         from backend.config.live_test_mode import live_test_max_open_positions_limit
         from backend.services.execution_mode_service import is_live_execution_allowed_sync
 
-        if is_live_execution_allowed_sync():
-            live_cap = live_test_max_open_positions_limit()
+        live_cap = live_test_max_open_positions_limit() if is_live_execution_allowed_sync() else None
+        if engine_id in ("DAY_V2", "SCALP_V2"):
+            engine_cap = SCALP_MAX_OPEN_POSITIONS if engine_id == "SCALP_V2" else DAY_MAX_OPEN_POSITIONS
+            if live_cap is not None:
+                # Live-test mode stays restrictive: it caps the whole book.
+                engine_cap = min(engine_cap, live_cap)
+            engine_held = self._engine_held_count(engine_id)
+            engine_pending_syms = self._pending_buy_symbols_for_engine(engine_id) - self._engine_held_symbols(engine_id)
+            if symbol in engine_pending_syms:
+                own_res, _own_ns = self._own_entry_reservation(symbol, str(decision_id or ""))
+                own_reserved = bool(decision_id) and str(own_res.get("decision_id") or "") == str(decision_id or "")
+                if not own_reserved:
+                    logger.info(f"BUY_BLOCKED_PENDING_ENTRY: {symbol} - reservation or pending buy already exists")
+                    return False, "ENTRY_RESERVED_OR_PENDING"
+            if engine_held + len(engine_pending_syms) >= engine_cap:
+                if PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK:
+                    logger.info(
+                        "QUALITY_TELEMETRY BUY_BLOCKED_ENGINE_MAX_POSITIONS would_block symbol=%s engine=%s active=%s pending=%s/%s (skip flag — not enforcing)",
+                        symbol,
+                        engine_id,
+                        engine_held,
+                        len(engine_pending_syms),
+                        engine_cap,
+                    )
+                else:
+                    logger.info(f"BUY_BLOCKED_ENGINE_MAX_POSITIONS: {symbol} - {engine_id} full (active={engine_held}, pending={len(engine_pending_syms)}, cap={engine_cap})")
+                    return False, "ENGINE_MAX_POSITIONS"
+            combined_cap = live_cap if live_cap is not None else COMBINED_ENGINE_MAX_POSITIONS
+            combined_held = self._combined_held_count()
+            combined_pending = len(self._pending_buy_symbols() - _held_syms_all)
+            if combined_held + combined_pending >= combined_cap:
+                if PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK:
+                    logger.info(
+                        "QUALITY_TELEMETRY BUY_BLOCKED_MAX_POSITIONS would_block symbol=%s active=%s pending_slots=%s total_open=%s/%s (skip flag — not enforcing)",
+                        symbol,
+                        combined_held,
+                        combined_pending,
+                        len(self.open_positions),
+                        combined_cap,
+                    )
+                else:
+                    logger.info(f"BUY_BLOCKED_MAX_POSITIONS: {symbol} - combined book full (active={combined_held}, pending_slots={combined_pending}, total={len(self.open_positions)}/{combined_cap})")
+                    return False, "MAX_POSITIONS_REACHED"
+            max_positions_limit = engine_cap
+            active_count = engine_held
+            pending_slots = len(engine_pending_syms)
+        else:
+            active_count = self._day_entry_held_count()
+            pending_slot_symbols = self._pending_buy_symbols() - _held_syms_all
+            pending_slots = len(pending_slot_symbols)
+            max_positions_limit = MAX_OPEN_POSITIONS
             if live_cap is not None:
                 max_positions_limit = live_cap
-        if symbol in self._pending_buy_symbols():
-            own_res, _own_ns = self._own_entry_reservation(symbol, str(decision_id or ""))
-            own_reserved = bool(decision_id) and str(own_res.get("decision_id") or "") == str(decision_id or "")
-            if not own_reserved:
-                logger.info(f"BUY_BLOCKED_PENDING_ENTRY: {symbol} - reservation or pending buy already exists")
-                return False, "ENTRY_RESERVED_OR_PENDING"
-        if active_count + pending_slots >= max_positions_limit:
-            if PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK:
-                logger.info(
-                    "QUALITY_TELEMETRY BUY_BLOCKED_MAX_POSITIONS would_block symbol=%s active=%s pending_slots=%s total_open=%s/%s (PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK=true — not enforcing)",
-                    symbol,
-                    active_count,
-                    pending_slots,
-                    len(self.open_positions),
-                    max_positions_limit,
-                )
-            else:
-                logger.info(f"BUY_BLOCKED_MAX_POSITIONS: {symbol} - portfolio full (active={active_count}, pending_slots={pending_slots}, total={len(self.open_positions)}/{max_positions_limit})")
-                return False, "MAX_POSITIONS_REACHED"
+            if symbol in self._pending_buy_symbols():
+                own_res, _own_ns = self._own_entry_reservation(symbol, str(decision_id or ""))
+                own_reserved = bool(decision_id) and str(own_res.get("decision_id") or "") == str(decision_id or "")
+                if not own_reserved:
+                    logger.info(f"BUY_BLOCKED_PENDING_ENTRY: {symbol} - reservation or pending buy already exists")
+                    return False, "ENTRY_RESERVED_OR_PENDING"
+            if active_count + pending_slots >= max_positions_limit:
+                if PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK:
+                    logger.info(
+                        "QUALITY_TELEMETRY BUY_BLOCKED_MAX_POSITIONS would_block symbol=%s active=%s pending_slots=%s total_open=%s/%s (PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK=true — not enforcing)",
+                        symbol,
+                        active_count,
+                        pending_slots,
+                        len(self.open_positions),
+                        max_positions_limit,
+                    )
+                else:
+                    logger.info(f"BUY_BLOCKED_MAX_POSITIONS: {symbol} - portfolio full (active={active_count}, pending_slots={pending_slots}, total={len(self.open_positions)}/{max_positions_limit})")
+                    return False, "MAX_POSITIONS_REACHED"
 
         slot_blocked, slot_why = self._intact_4h_slot_block(symbol)
         if slot_blocked:
@@ -13993,17 +14867,22 @@ class PortfolioEngine:
         # not a hard entry blocker — Mystic does not gate trades on regime opinion.
         # The genuine safety control is MAX_OPEN_POSITIONS (enforced above) and the
         # one-position-per-symbol check (enforced below).
-        if self._is_bear_day_regime() and symbol not in self.open_positions and _to_api_symbol(symbol) in DAY_TRADE_SYMBOLS and self._count_open_day_top4_positions() >= 1:
+        if self._is_bear_day_regime() and not self._symbol_lots(symbol) and _to_api_symbol(symbol) in DAY_TRADE_SYMBOLS and self._count_open_day_top4_positions() >= 1:
             logger.debug(
                 "QUALITY_TELEMETRY BEAR_REGIME_CORRELATION_CONTEXT symbol=%s open_day_top4=%s (not enforced — advisory only)",
                 symbol,
                 self._count_open_day_top4_positions(),
             )
 
-        # Check symbol not already open (max 1 per symbol)
+        # Check symbol not already open (max 1 per engine per symbol).
+        # Two-engine contract: only the requesting engine's lot blocks.
         # Dust/zero-size positions: cleanup and allow buy; never block on stale memory.
         # DUST_PENDING is leftover accounting — do not treat as held and do not flatten.
-        position = self.open_positions.get(symbol)
+        if engine_id in ("DAY_V2", "SCALP_V2"):
+            position = self._find_position(engine_id, symbol)
+        else:
+            _lots = self._symbol_lots(symbol)
+            position = _lots[0] if _lots else None
         if position is not None and str(getattr(position, "status", "ACTIVE") or "") == "DUST_PENDING":
             logger.info(
                 "DAY_ENTRY_DUST_NOT_HELD symbol=%s qty=%s (does not block new DAY BUY)",
@@ -14223,7 +15102,13 @@ class PortfolioEngine:
         # Skip DUST_PENDING - they are reconciled by dust_reconciliation_loop
         # === END DUST_INVARIANT_LOCK ===
         any_stale_marks = False
-        for symbol, position in list(self.open_positions.items()):
+        for _key, position in list(self.open_positions.items()):
+            # Two-engine contract: strategy symbol from the position, never the
+            # composite memory key. Each engine's lot is evaluated independently
+            # with its own exit authority.
+            symbol = normalize_symbol(str(getattr(position, "symbol", "") or "")) or split_position_key(str(_key))[1]
+            if not symbol:
+                continue
             if symbols is not None and symbol not in symbols:
                 continue
             if getattr(position, "status", "ACTIVE") == "DUST_PENDING":
@@ -14441,6 +15326,7 @@ class PortfolioEngine:
                 residual_reason,
                 current_bar=current_bar,
                 force_sell=True,
+                engine_id=str(getattr(position, "engine_id", "") or ""),
             )
 
         if not isinstance(current_price, (int, float)) or current_price <= 0.0:
@@ -14525,6 +15411,7 @@ class PortfolioEngine:
                         _day_v2_reason,
                         current_bar=current_bar,
                         force_sell=True,
+                        engine_id="DAY_V2",
                     )
                 # No DAY V2 exit condition met — hold.
                 return None
@@ -14579,6 +15466,7 @@ class PortfolioEngine:
                         _scalp_v2_reason,
                         current_bar=current_bar,
                         force_sell=True,
+                        engine_id="SCALP_V2",
                     )
                 # No SCALP V2 exit condition met — hold. Do NOT fall through to
                 # allweather or legacy DAY exits.
@@ -14641,6 +15529,7 @@ class PortfolioEngine:
                         str(_aw_dec.get("reason") or _awbp.EXIT_TIME_STOP),
                         current_bar=current_bar,
                         force_sell=True,
+                        engine_id=str(getattr(position, "engine_id", "") or ""),
                     )
                 # Fall through to engine-managed exits (stall/stop/time) — do not trap AW holds.
         except Exception:
@@ -14742,6 +15631,7 @@ class PortfolioEngine:
                 exit_reason,
                 current_bar=current_bar,
                 force_sell=exit_type == ExitType.MANUAL,
+                engine_id=str(getattr(position, "engine_id", "") or ""),
             )
 
         # Path-aware already decided hold. Do not leftover-clip a green intact rise
@@ -14810,6 +15700,7 @@ class PortfolioEngine:
                         "TP1_PARTIAL_EXIT",
                         current_bar=current_bar,
                         force_sell=False,
+                        engine_id=str(getattr(position, "engine_id", "") or ""),
                     )
                     if _tp1_result is not None:
                         # Latch TP1 only after the sell has committed. Failed preflight,
@@ -14902,6 +15793,7 @@ class PortfolioEngine:
             ExitType.TAKE_PROFIT_1,
             rationale,
             current_bar=current_bar,
+            engine_id=str(getattr(position, "engine_id", "") or ""),
         )
 
     # =========================================================================
@@ -17166,7 +18058,7 @@ class PortfolioEngine:
         except Exception:
             max_pos = 4
         slots = available_economic_slots(
-            held=self._day_entry_held_count(),
+            held=self._engine_held_count("DAY_V2"),
             pending_orders=len(self._pending_buy_order_symbols()),
             max_positions=max_pos,
         )
@@ -18519,7 +19411,7 @@ class PortfolioEngine:
                 top_candidate.decision_data = dict(top_candidate.decision_data or {})
                 top_candidate.decision_data["true_safety_reject_reason"] = reason
 
-        held_syms = self._day_entry_held_symbols()
+        held_syms = self._engine_held_symbols("DAY_V2")
         dust_syms = self._day_dust_symbols()
         logger.info(
             "DAY_ENTRY_HELD_SET active=%s dust=%s held=%s",
@@ -18562,7 +19454,7 @@ class PortfolioEngine:
             await self._emit_day_health_telemetry("BUY_SKIPPED_MAX_OPEN_LIMIT")
             logger.info(
                 "DAY_PATH_EV_SAFETY reject=MAX_OPEN_LIMIT open=%s max=%s dust=%s",
-                self._day_entry_held_count(),
+                self._engine_held_count("DAY_V2"),
                 _max_pos_bar,
                 sorted(self._day_dust_symbols()),
             )
@@ -20009,6 +20901,9 @@ class PortfolioEngine:
 
     def build_open_position_api_row(self, symbol: str, pos: Any) -> dict[str, Any]:
         """Unified open-position payload for /status, /positions, and dashboard-canonical."""
+        # Two-engine contract: callers may pass the composite memory key; the
+        # strategy symbol always comes from the position itself.
+        symbol = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(symbol))[1] or symbol
         mark = float(self._position_mark_prices.get(symbol, pos.entry_price) or pos.entry_price)
         q = float(pos.quantity or 0)
         ep = float(pos.entry_price or 0)
@@ -20106,6 +21001,8 @@ class PortfolioEngine:
             "exit_levels_are_advisory_metadata_only": bool((exit_preview or {}).get("path_aware_exit")),
             "engine_exit_preview": exit_preview,
             "sleeve": getattr(pos, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value,
+            "engine_id": str(getattr(pos, "engine_id", "") or ""),
+            "scalp_opportunity_id": str(getattr(pos, "scalp_opportunity_id", "") or ""),
             "status": getattr(pos, "status", "ACTIVE"),
             "entry_strategy_id": str(getattr(pos, "entry_strategy_id", "") or "day") or "day",
             "strategy_id": str(getattr(pos, "entry_strategy_id", "") or "day") or "day",
@@ -20845,11 +21742,18 @@ class PortfolioEngine:
                 matched = k
                 break
         open_pos = None
-        for k in keys:
-            pos = self.open_positions.get(k)
-            if pos is not None:
-                open_pos = self.build_open_position_api_row(k, pos)
-                break
+        # Two-engine contract: resolve lots by strategy symbol (composite keys
+        # never match bare variants). First lot wins for this per-coin view;
+        # the full book lists every lot via positions_list.
+        _lots = self._symbol_lots(normalize_symbol(symbol)) if symbol else []
+        if _lots:
+            open_pos = self.build_open_position_api_row(symbol, _lots[0])
+        else:
+            for k in keys:
+                pos = self.open_positions.get(k)
+                if pos is not None:
+                    open_pos = self.build_open_position_api_row(k, pos)
+                    break
         if open_pos is None:
             with contextlib.suppress(Exception):
                 with connect_managed(self.db_path) as conn:
@@ -20990,43 +21894,65 @@ class PortfolioEngine:
         """
         violations = []
 
-        # Invariant 1: Never more than MAX_OPEN_POSITIONS
+        # Invariant 1: Two-engine caps — max 4 lots per engine, max 8 combined.
+        # DUST_PENDING and dust-sized lots never count.
         filtered_open_positions_count = 0
-        for _sym, _pos in self.open_positions.items():
+        _engine_counts: dict[str, int] = {}
+        for _key, _pos in self.open_positions.items():
             if getattr(_pos, "status", "ACTIVE") == "DUST_PENDING":
                 continue
+            _sym_for_dust = normalize_symbol(str(getattr(_pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
             _dust_price = float(getattr(_pos, "entry_price", 0.0) or 0.0)
-            _is_dust, _, _, _ = self._dust_check(_sym, float(getattr(_pos, "quantity", 0.0) or 0.0), _dust_price)
+            _is_dust, _, _, _ = self._dust_check(_sym_for_dust, float(getattr(_pos, "quantity", 0.0) or 0.0), _dust_price)
             if _is_dust:
                 continue
             filtered_open_positions_count += 1
+            _eng = str(getattr(_pos, "engine_id", "") or "")
+            _engine_counts[_eng] = _engine_counts.get(_eng, 0) + 1
         logger.debug(
-            "OPEN_POSITION_COUNT_FILTERED: raw=%d filtered=%d max_open_positions=%d",
+            "OPEN_POSITION_COUNT_FILTERED: raw=%d filtered=%d combined_cap=%d engine_counts=%s",
             len(self.open_positions),
             filtered_open_positions_count,
-            MAX_OPEN_POSITIONS,
+            COMBINED_ENGINE_MAX_POSITIONS,
+            _engine_counts,
         )
-        if filtered_open_positions_count > MAX_OPEN_POSITIONS:
-            violations.append(f"POSITIONS_OVERFLOW: {filtered_open_positions_count} > {MAX_OPEN_POSITIONS}")
+        if filtered_open_positions_count > COMBINED_ENGINE_MAX_POSITIONS:
+            violations.append(f"POSITIONS_OVERFLOW: {filtered_open_positions_count} > {COMBINED_ENGINE_MAX_POSITIONS}")
+        for _eng, _cnt in _engine_counts.items():
+            _cap = SCALP_MAX_OPEN_POSITIONS if _eng == "SCALP_V2" else DAY_MAX_OPEN_POSITIONS
+            if _eng in ("DAY_V2", "SCALP_V2", "LEGACY_DAY_LIVE") and _cnt > _cap:
+                violations.append(f"ENGINE_POSITIONS_OVERFLOW: {_eng} {_cnt} > {_cap}")
 
-        # Invariant 2: No symbol stacking
-        normalized_symbol_groups: dict[str, list[str]] = {}
-        for raw_symbol, pos in self.open_positions.items():
+        # Invariant 2: No same-engine symbol stacking. Cross-engine same-symbol
+        # coexistence (DAY BTC + SCALP BTC) is the required architecture.
+        engine_symbol_groups: dict[str, list[str]] = {}
+        for raw_key, pos in self.open_positions.items():
             if getattr(pos, "status", "ACTIVE") == "DUST_PENDING":
                 continue
-            normalized = normalize_symbol(raw_symbol)
-            normalized_symbol_groups.setdefault(normalized, []).append(raw_symbol)
-        stacked_normalized = {k: v for k, v in normalized_symbol_groups.items() if len(v) > 1}
-        if stacked_normalized:
-            violations.append(f"SYMBOL_STACKING: normalized duplicates detected {stacked_normalized}")
+            eng = str(getattr(pos, "engine_id", "") or split_position_key(str(raw_key))[0])
+            normalized = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(raw_key))[1]
+            engine_symbol_groups.setdefault(f"{eng}::{normalized}", []).append(str(raw_key))
+        stacked = {k: v for k, v in engine_symbol_groups.items() if len(v) > 1}
+        if stacked:
+            violations.append(f"SYMBOL_STACKING: same-engine duplicates detected {stacked}")
 
         # Invariant 3: Memory positions match canonical positions table (PaperTradingService)
         # In test_mode, skip PaperTradingService checks for test isolation
         if not self.test_mode:
             canonical_positions = await self._get_canonical_positions()
-            # 1) Symbol set comparison uses FULL set (include DUST_PENDING) - dust must not cause false mismatch
-            memory_symbols_full = set(self.open_positions.keys())
-            canonical_symbols = set(canonical_positions.keys())
+            # 1) Symbol set comparison uses FULL set (include DUST_PENDING) - dust must not cause false mismatch.
+            # Two-engine contract: compare by strategy SYMBOL (both engines'
+            # lots on one symbol collapse to that symbol on both sides).
+            memory_symbols_full = {normalize_symbol(str(getattr(p, "symbol", "") or "")) for p in self.open_positions.values()}
+            memory_symbols_full |= {split_position_key(str(k))[1] for k in self.open_positions}
+            memory_symbols_full.discard("")
+            # Canonical keys may be composite (live) or bare symbols (paper
+            # SQLite) — normalize both to strategy symbols before comparing.
+            canonical_symbols = set()
+            for _ck in canonical_positions:
+                _csym = split_position_key(str(_ck))[1] or normalize_symbol(str(_ck))
+                if _csym:
+                    canonical_symbols.add(_csym)
 
             if memory_symbols_full != canonical_symbols:
                 missing_in_memory = canonical_symbols - memory_symbols_full
@@ -21052,13 +21978,16 @@ class PortfolioEngine:
                                 def _op() -> tuple[bool, dict[str, Any] | None]:
                                     with connect_rw(self.db_path) as conn:
                                         conn.row_factory = sqlite3.Row
-                                        pos_row = conn.execute(
+                                        # Two-engine contract: evaluate EVERY lot
+                                        # on the symbol; purge only lots with
+                                        # deterministic SELL evidence, never a
+                                        # sibling lot.
+                                        pos_rows = conn.execute(
                                             "SELECT * FROM portfolio_engine_positions WHERE symbol = ?",
                                             (sym,),
-                                        ).fetchone()
-                                        if not pos_row:
+                                        ).fetchall()
+                                        if not pos_rows:
                                             return True, None
-                                        entry_time = float(pos_row["entry_time"] or 0.0)
                                         sell_rows = conn.execute(
                                             """
                                             SELECT timestamp FROM paper_trades
@@ -21066,27 +21995,41 @@ class PortfolioEngine:
                                             """,
                                             (sym,),
                                         ).fetchall()
-                                        sell_after = None
-                                        for srow in sell_rows:
-                                            sell_epoch = 0.0
-                                            raw_ts = srow[0] if srow else None
-                                            if raw_ts is not None:
-                                                try:
-                                                    sell_epoch = float(raw_ts)
-                                                except (TypeError, ValueError):
+                                        remaining: dict[str, Any] | None = None
+                                        for pos_row in pos_rows:
+                                            entry_time = float(pos_row["entry_time"] or 0.0)
+                                            sell_after = None
+                                            for srow in sell_rows:
+                                                sell_epoch = 0.0
+                                                raw_ts = srow[0] if srow else None
+                                                if raw_ts is not None:
                                                     try:
-                                                        sell_epoch = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00")).timestamp()
-                                                    except Exception:
-                                                        sell_epoch = 0.0
-                                            if sell_epoch > entry_time + 1e-6:
-                                                sell_after = srow
-                                                break
-                                        if sell_after:
-                                            conn.execute("BEGIN IMMEDIATE")
-                                            conn.execute("DELETE FROM portfolio_engine_positions WHERE symbol = ?", (sym,))
-                                            conn.commit()
-                                            return True, None
-                                        return False, dict(pos_row)
+                                                        sell_epoch = float(raw_ts)
+                                                    except (TypeError, ValueError):
+                                                        try:
+                                                            sell_epoch = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00")).timestamp()
+                                                        except Exception:
+                                                            sell_epoch = 0.0
+                                                if sell_epoch > entry_time + 1e-6:
+                                                    sell_after = srow
+                                                    break
+                                            if sell_after:
+                                                _lot_tid = str(pos_row["trade_id"] or "")
+                                                if not _lot_tid:
+                                                    remaining = dict(pos_row)
+                                                    continue
+                                                conn.execute("BEGIN IMMEDIATE")
+                                                conn.execute(
+                                                    "DELETE FROM portfolio_engine_positions WHERE symbol = ? AND trade_id = ?",
+                                                    (sym, _lot_tid),
+                                                )
+                                                conn.commit()
+                                                continue
+                                            if remaining is None:
+                                                remaining = dict(pos_row)
+                                        if remaining is not None:
+                                            return False, remaining
+                                        return True, None
 
                                 return run_locked_retry(_op)
 

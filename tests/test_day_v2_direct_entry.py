@@ -64,13 +64,14 @@ class FakeEngine:
         self._trading_paused = False
         self._pause_reason = ""
         self._available_balance = 500.0
+        self._total_equity = 500.0
         self._entry_reservations: dict[str, Any] = {}
         self.buy_calls: list[dict[str, Any]] = []
 
     def _check_kill_switch_buy(self) -> tuple[bool, str]:
         return True, ""
 
-    async def _can_open_position(self, symbol: str, notional: float, *, decision_id: str = "") -> tuple[bool, str]:
+    async def _can_open_position(self, symbol: str, notional: float, *, decision_id: str = "", engine_id: str = "") -> tuple[bool, str]:
         return self._can_open
 
     def _pending_buy_order_symbols(self) -> set[str]:
@@ -314,23 +315,25 @@ class TestGuardsUnchanged:
         assert result is None
         assert engine.buy_calls == []
 
-    def test_cross_engine_ownership_still_blocks(self):
+    def test_cross_engine_ownership_no_longer_blocks(self):
+        """Two-engine contract: a SCALP lot on BTC does not stop a DAY claim."""
         from backend.services.two_engine_claim import claim_symbol
 
         db = _make_db()
         positions = {"BTC/USDT": SimpleNamespace(status="ACTIVE", engine_id="SCALP_V2", quantity=0.01)}
-        ok, reason, _ = claim_symbol(db, "BTCUSDT", "DAY_V2", "opp-1", 30.0, positions=positions)
-        assert ok is False
-        assert reason == "SYMBOL_OCCUPIED_BY_OTHER_ENGINE"
+        ok, reason, rid = claim_symbol(db, "BTCUSDT", "DAY_V2", "opp-1", 30.0, positions=positions)
+        assert ok is True, reason
+        assert rid
 
-    def test_max_combined_positions_still_blocks(self):
+    def test_scalp_book_does_not_consume_day_slots(self):
+        """Two-engine contract: 4 SCALP lots leave DAY's 4 slots untouched."""
         from backend.services.two_engine_claim import claim_symbol
 
         db = _make_db()
         positions = {f"C{i}/USDT": SimpleNamespace(status="ACTIVE", engine_id="SCALP_V2", quantity=1.0) for i in range(4)}
-        ok, reason, _ = claim_symbol(db, "BTCUSDT", "DAY_V2", "opp-1", 30.0, positions=positions)
-        assert ok is False
-        assert reason == "MAX_COMBINED_POSITIONS"
+        ok, reason, rid = claim_symbol(db, "BTCUSDT", "DAY_V2", "opp-1", 30.0, positions=positions)
+        assert ok is True, reason
+        assert rid
 
     def test_reservation_release_and_consume(self):
         from backend.services.day_entry_reservations import (

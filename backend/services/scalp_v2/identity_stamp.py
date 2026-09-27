@@ -24,10 +24,18 @@ def stamp_engine(
     key: str,
     engine_id: str,
     opportunity_id: str,
+    scope_engine: str | None = None,
 ) -> None:
     if not key:
         return
     _ensure(conn, table)
+    if scope_engine:
+        # Two-engine contract: never stamp a sibling engine's lot.
+        conn.execute(
+            f"UPDATE {table} SET engine_id=?, scalp_opportunity_id=? WHERE {key_col}=? AND engine_id=?",
+            (engine_id or "LEGACY_DAY_LIVE", opportunity_id or "", key, scope_engine),
+        )
+        return
     conn.execute(
         f"UPDATE {table} SET engine_id=?, scalp_opportunity_id=? WHERE {key_col}=?",
         (engine_id or "LEGACY_DAY_LIVE", opportunity_id or "", key),

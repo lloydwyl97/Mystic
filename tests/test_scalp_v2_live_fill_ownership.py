@@ -127,7 +127,7 @@ async def test_filled_buy_creates_a_durable_scalp_lot(tmp_path, monkeypatch):
     assert buy[3] == opp_id
     assert _one(engine.db_path, "SELECT state FROM scalp_v2_opportunities WHERE opportunity_id=?", (opp_id,))[0] == "OPEN"
     assert _one(engine.db_path, "SELECT status FROM day_entry_reservations WHERE reservation_id=?", (pos[5],))[0] == "CONSUMED"
-    assert engine.open_positions["ETH/USDT"].engine_id == "SCALP_V2"
+    assert engine.open_positions["SCALP_V2::ETH/USDT"].engine_id == "SCALP_V2"
 
 
 @pytest.mark.asyncio
@@ -139,7 +139,7 @@ async def test_restart_preserves_scalp_ownership_and_provenance(tmp_path, monkey
     engine.open_positions = {}
     await engine._load_positions_from_sqlite(allow_mutations=False)
 
-    pos = engine.open_positions["ETH/USDT"]
+    pos = engine.open_positions["SCALP_V2::ETH/USDT"]
     assert pos.engine_id == "SCALP_V2"
     assert pos.entry_order_id == ORDER_ID
     assert pos.entry_client_order_id == CLIENT_ID
@@ -205,7 +205,7 @@ async def test_reconciliation_restores_known_mystic_fill_instead_of_protecting_i
 
     await engine._import_missing_exchange_positions({"ETH": 0.0094981}, {"ETH": 0.0094981})
 
-    pos = engine.open_positions["ETH/USDT"]
+    pos = engine.open_positions["SCALP_V2::ETH/USDT"]
     assert pos.engine_id == "SCALP_V2"
     assert pos.entry_order_id == ORDER_ID
     assert pos.quantity == pytest.approx(0.0094981, abs=1e-12)
@@ -232,7 +232,7 @@ async def test_restore_uses_only_the_unsold_remainder_and_protects_the_rest(tmp_
 
     await engine._import_missing_exchange_positions({"ETH": 0.0150}, {"ETH": 0.0150})
 
-    assert engine.open_positions["ETH/USDT"].quantity == pytest.approx(0.005)
+    assert engine.open_positions["SCALP_V2::ETH/USDT"].quantity == pytest.approx(0.005)
     assert _one(engine.db_path, "SELECT quantity FROM protected_external_inventory WHERE symbol='ETH/USDT'")[0] == pytest.approx(0.01)
 
 

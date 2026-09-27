@@ -421,12 +421,33 @@ def _thesis_invalid(intent: dict[str, Any], ask: float) -> bool:
     return bool(level > 0 and ask > 0 and ask <= level)
 
 
-def _open_position_blocks_buy(engine: Any, symbol: str, ns: str) -> bool:
-    """True only for a held lot. DUST_PENDING leftover inventory never blocks a BUY."""
+def _open_position_blocks_buy(engine: Any, symbol: str, ns: str, engine_id: str = "DAY_V2") -> bool:
+    """True only for a held lot of the requesting engine.
+
+    DUST_PENDING leftover inventory never blocks a BUY. A sibling engine's
+    lot on the same symbol never blocks (two-engine contract); same-engine
+    duplicates still block.
+    """
     open_positions = getattr(engine, "open_positions", None) or {}
-    pos = open_positions.get(ns)
+    pos = None
+    find_fn = getattr(engine, "_find_position", None)
+    if callable(find_fn):
+        try:
+            pos = find_fn(engine_id or "DAY_V2", ns) or find_fn(engine_id or "DAY_V2", symbol)
+        except Exception:
+            pos = None
     if pos is None:
-        pos = open_positions.get(symbol)
+        pos = open_positions.get(ns)
+        if pos is None:
+            pos = open_positions.get(symbol)
+        if pos is not None:
+            # Legacy bare-symbol fallback: verify engine ownership inline
+            # (a sibling engine's lot must never block).
+            _lot_engine = str(getattr(pos, "engine_id", "") or "")
+            _want = str(engine_id or "DAY_V2")
+            _day_side = ("", "DAY_V2", "LEGACY_DAY_LIVE")
+            if _lot_engine != _want and not (_want in _day_side and _lot_engine in _day_side):
+                pos = None
     blocks_fn = getattr(engine, "_day_position_blocks_new_entry", None)
     if callable(blocks_fn):
         blocked = bool(blocks_fn(pos))
@@ -671,7 +692,7 @@ async def rearm_successor_after_expire(
         ns = CanonicalSymbolFormatter.to_canonical(symbol)
     except Exception:
         ns = symbol
-    if _open_position_blocks_buy(engine, symbol, ns):
+    if _open_position_blocks_buy(engine, symbol, ns, str(expired.get("engine_id") or "DAY_V2")):
         logger.info("TRAILING_BUY_SUCCESSOR_SKIPPED symbol=%s reason=POSITION_OPEN", symbol)
         return None
     payload = dict(expired.get("payload") or {})
@@ -744,6 +765,7 @@ async def _pre_submit_safety(engine: Any, intent: dict[str, Any], ask: float) ->
         symbol,
         float(intent.get("notional_usd") or 0.0),
         decision_id=str(intent.get("decision_id") or ""),
+        engine_id=str(intent.get("engine_id") or "DAY_V2"),
     )
     if not can_open:
         why = str(open_why or "CANNOT_OPEN")
@@ -782,7 +804,7 @@ async def _pre_submit_safety(engine: Any, intent: dict[str, Any], ask: float) ->
         ns = CanonicalSymbolFormatter.to_canonical(symbol)
     except Exception:
         ns = symbol
-    if _open_position_blocks_buy(engine, symbol, ns):
+    if _open_position_blocks_buy(engine, symbol, ns, str(intent.get("engine_id") or "DAY_V2")):
         return False, "POSITION_ALREADY_OPEN"
     pending = set(engine._pending_buy_order_symbols())
     if ns in pending or symbol in pending:
@@ -1154,6 +1176,7 @@ def _consume_intent_reservation(engine: Any, intent: dict[str, Any]) -> None:
             reservation_id=reservation_id,
             decision_id=decision_id,
             symbol=symbol,
+            sleeve=str(intent.get("engine_id") or intent.get("sleeve") or ""),
         )
     except Exception:
         logger.exception(
@@ -1163,11 +1186,16 @@ def _consume_intent_reservation(engine: Any, intent: dict[str, Any]) -> None:
         )
         return
     # Drop the in-memory hold too, or the engine keeps counting spent capital as
-    # reserved until the next reload.
+    # reserved until the next reload. Keys are (sleeve, symbol); pop every
+    # variant for this decision so dual-engine reservations never leak.
     with contextlib.suppress(Exception):
         from backend.services.portfolio_engine import normalize_symbol
 
-        engine._entry_reservations.pop(normalize_symbol(symbol), None)
+        _ns = normalize_symbol(symbol)
+        _res = getattr(engine, "_entry_reservations", None) or {}
+        for _k in [k for k, _r in _res.items() if str((_r or {}).get("decision_id") or "") == decision_id]:
+            _res.pop(_k, None)
+        _res.pop(_ns, None)
     if not consumed:
         logger.info(
             "RESERVATION_ALREADY_TERMINAL intent=%s reservation=%s — no second transition",

@@ -250,14 +250,14 @@ def test_retain_dust_restart_is_idempotent():
 
     async def _run():
         await engine._retain_exchange_dust(symbol="BTC/USDT", asset="BTC", quantity="0.00000997", mark_hint=80000.0)
-        first = engine.open_positions["BTC/USDT"].trade_id
+        first = engine.open_positions["::BTC/USDT"].trade_id
         await engine._retain_exchange_dust(symbol="BTC/USDT", asset="BTC", quantity="0.00000997", mark_hint=80000.0)
-        return first, engine.open_positions["BTC/USDT"].trade_id, len(engine.open_positions)
+        return first, engine.open_positions["::BTC/USDT"].trade_id, len(engine.open_positions)
 
     first, second, n = asyncio.run(_run())
     assert first == second == dust_trade_id("BTC/USDT")
     assert n == 1
-    assert engine.open_positions["BTC/USDT"].status == "DUST_PENDING"
+    assert engine.open_positions["::BTC/USDT"].status == "DUST_PENDING"
     assert engine._count_live_slots() == 0
 
 

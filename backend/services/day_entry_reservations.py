@@ -102,10 +102,13 @@ def create_reservation(
         if existing:
             conn.commit()
             return True, "IDEMPOTENT_EXISTING", str(existing[0])
-        # Symbol occupancy
+        # Symbol occupancy is ENGINE-SCOPED (two-engine contract): the same engine
+        # may not hold two ACTIVE reservations on one symbol, but DAY and SCALP
+        # reservations on the same symbol coexist (physical cash gates both).
+        sleeve_val = str(sleeve or "")
         sym_hit = conn.execute(
-            "SELECT reservation_id FROM day_entry_reservations WHERE symbol=? AND status='ACTIVE' LIMIT 1",
-            (sym,),
+            "SELECT reservation_id FROM day_entry_reservations WHERE symbol=? AND sleeve=? AND status='ACTIVE' LIMIT 1",
+            (sym, sleeve_val),
         ).fetchone()
         if sym_hit:
             conn.commit()
@@ -146,6 +149,7 @@ def release_reservation(
     decision_id: str = "",
     symbol: str = "",
     reason: str = "RELEASED",
+    sleeve: str = "",
 ) -> bool:
     """Idempotent release — safe to call twice."""
     ensure_reservation_schema(db_path)
@@ -166,10 +170,16 @@ def release_reservation(
             )
         elif symbol:
             sym = str(symbol).strip().upper().replace("-", "/")
-            conn.execute(
-                "UPDATE day_entry_reservations SET status=?, updated_at=? WHERE symbol=? AND status='ACTIVE'",
-                (status, now, sym),
-            )
+            if sleeve:
+                conn.execute(
+                    "UPDATE day_entry_reservations SET status=?, updated_at=? WHERE symbol=? AND sleeve=? AND status='ACTIVE'",
+                    (status, now, sym, str(sleeve)),
+                )
+            else:
+                conn.execute(
+                    "UPDATE day_entry_reservations SET status=?, updated_at=? WHERE symbol=? AND status='ACTIVE'",
+                    (status, now, sym),
+                )
         else:
             conn.commit()
             return False
@@ -185,6 +195,7 @@ def consume_reservation(
     reservation_id: str = "",
     decision_id: str = "",
     symbol: str = "",
+    sleeve: str = "",
 ) -> bool:
     """Mark a reservation CONSUMED because its order filled into a position.
 
@@ -215,10 +226,16 @@ def consume_reservation(
             )
         if (cur is None or not cur.rowcount) and symbol:
             sym = str(symbol).strip().upper().replace("-", "/")
-            cur = conn.execute(
-                "UPDATE day_entry_reservations SET status=?, updated_at=? WHERE symbol=? AND status='ACTIVE'",
-                (STATUS_CONSUMED, now, sym),
-            )
+            if sleeve:
+                cur = conn.execute(
+                    "UPDATE day_entry_reservations SET status=?, updated_at=? WHERE symbol=? AND sleeve=? AND status='ACTIVE'",
+                    (STATUS_CONSUMED, now, sym, str(sleeve)),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE day_entry_reservations SET status=?, updated_at=? WHERE symbol=? AND status='ACTIVE'",
+                    (STATUS_CONSUMED, now, sym),
+                )
         changed = int(cur.rowcount or 0) if cur is not None else 0
         conn.commit()
         if changed:

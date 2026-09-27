@@ -199,8 +199,12 @@ def test_cycle_gate_retries_then_hard_rejects_missing_price():
     assert second == {"action": "reject", "reason": HARD_MISSING_PRICE}
 
 
-def test_same_symbol_claim_lets_one_engine_win(tmp_path):
-    from backend.services.two_engine_claim import SYMBOL_OCCUPIED_BY_OTHER_ENGINE, claim_symbol
+def test_same_symbol_claim_allows_both_engines(tmp_path):
+    """Two-engine contract: DAY and SCALP reservations on one symbol coexist.
+
+    Same-engine duplicates still block with SYMBOL_OCCUPIED.
+    """
+    from backend.services.two_engine_claim import SYMBOL_OCCUPIED, claim_symbol
 
     db = tmp_path / "claim.db"
     results = []
@@ -215,10 +219,14 @@ def test_same_symbol_claim_lets_one_engine_win(tmp_path):
         thread.start()
     for thread in threads:
         thread.join()
-    oks = [row[0] for row in results]
-    reasons = [row[1] for row in results]
-    assert oks.count(True) == 1
-    assert SYMBOL_OCCUPIED_BY_OTHER_ENGINE in reasons
+    # Both engines win their own sleeve reservation.
+    assert [row[0] for row in results].count(True) == 2
+    rids = [row[2] for row in results]
+    assert all(rids) and len(set(rids)) == 2
+    # A second DAY claim on SOL is a same-engine duplicate.
+    ok_dup, reason_dup, _ = claim_symbol(db, "SOL/USDT", "DAY_V2", "dec-DAY_V2-2", 25.0)
+    assert ok_dup is False
+    assert reason_dup == SYMBOL_OCCUPIED
 
 
 def test_fifo_matches_quantity_and_leaves_unmatched_sell(tmp_path):
@@ -274,6 +282,7 @@ async def test_scalp_confirmed_reaches_adapter_once_and_unknown_authority_does_n
     engine = PortfolioEngine.__new__(PortfolioEngine)
     engine.open_positions = {}
     engine._available_balance = 200.0
+    engine._total_equity = 200.0
     engine._global_cash_lock = asyncio.Lock()
     engine.db_path = str(tmp_path / "live.db")
     engine.last_buy_reject_reason = ""
@@ -298,16 +307,16 @@ async def test_scalp_confirmed_reaches_adapter_once_and_unknown_authority_does_n
 
     ok, _reason, _rid = claim_symbol(engine.db_path, "BTC/USDT", "DAY_V2", "day-holds-btc", 25.0)
     assert ok is True
-    blocked = await engine.execute_scalp_v2_buy_live(
+    # Two-engine contract: DAY's reservation does NOT block SCALP's own lot —
+    # the SCALP buy proceeds to the execution adapter.
+    await engine.execute_scalp_v2_buy_live(
         "BTC/USDT",
         0.01,
         100.0,
-        opportunity_id="opp-blocked",
+        opportunity_id="opp-coexist",
         entry_authority="SCALP_V2_CONFIRMED",
     )
-    assert blocked is None
-    assert engine.last_buy_reject_reason == "SYMBOL_OCCUPIED_BY_OTHER_ENGINE"
-    adapter.assert_not_called()
+    assert adapter.await_count == 1
 
     reached = await engine.execute_scalp_v2_buy_live(
         "ETH/USDT",
@@ -317,7 +326,7 @@ async def test_scalp_confirmed_reaches_adapter_once_and_unknown_authority_does_n
         entry_authority="SCALP_V2_CONFIRMED",
     )
     assert reached is None
-    assert adapter.await_count == 1
+    assert adapter.await_count == 2
 
 
 @pytest.mark.asyncio

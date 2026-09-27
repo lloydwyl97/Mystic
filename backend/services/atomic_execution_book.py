@@ -49,6 +49,31 @@ def _norm_sym(symbol: str) -> str:
     return str(symbol or "").replace("/", "").replace("-", "").replace("_", "").upper()
 
 
+def _ensure_engine_identity(cur: sqlite3.Cursor) -> None:
+    """Best-effort (engine_id, symbol) identity for orphan restores.
+
+    Mirrors portfolio_engine._ensure_position_engine_identity without
+    importing the engine module (import-cycle safe). Never raises.
+    """
+    try:
+        cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(portfolio_engine_positions)").fetchall()}
+        if "engine_id" not in cols:
+            cur.execute("ALTER TABLE portfolio_engine_positions ADD COLUMN engine_id TEXT DEFAULT 'LEGACY_DAY_LIVE'")
+        if "scalp_opportunity_id" not in cols:
+            cur.execute("ALTER TABLE portfolio_engine_positions ADD COLUMN scalp_opportunity_id TEXT DEFAULT ''")
+        pk_cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(portfolio_engine_positions)").fetchall() if int(r[5] or 0) > 0}
+        if pk_cols != {"engine_id", "symbol"}:
+            try:
+                from backend.services.portfolio_engine import _ensure_position_composite_pk
+
+                _ensure_position_composite_pk(cur)
+            except Exception:
+                pass
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_engine_symbol ON portfolio_engine_positions(engine_id, symbol)")
+    except Exception:
+        logger.debug("_ensure_engine_identity skipped", exc_info=True)
+
+
 def _buy_closed_by_trade_id(conn: sqlite3.Connection, trade_id: str, symbol: str, buy_id: int) -> bool:
     """True only when THIS buy lot was closed — not when a later same-symbol sell exists."""
     tid = str(trade_id or "").strip()
@@ -300,6 +325,7 @@ def restore_orphaned_day_buys(db_path: str | Path) -> list[dict[str, Any]]:
     try:
         conn.execute("BEGIN IMMEDIATE")
         cur = conn.cursor()
+        _ensure_engine_identity(cur)
         for orphan in orphans:
             symbol = str(orphan.get("symbol") or "")
             qty = float(orphan.get("remaining_position") or orphan.get("quantity") or 0)
@@ -315,11 +341,15 @@ def restore_orphaned_day_buys(db_path: str | Path) -> list[dict[str, Any]]:
                     trade_id,
                 )
                 continue
+            # Two-engine contract: DAY orphans restore the DAY-side lot only.
+            # A SCALP lot on the same symbol must never suppress the restore
+            # nor be overwritten by it.
             existing = cur.execute(
                 """
                 SELECT quantity FROM portfolio_engine_positions
                 WHERE replace(replace(upper(symbol), '/', ''), '-', '')
                     = replace(replace(upper(?), '/', ''), '-', '')
+                  AND COALESCE(engine_id, 'LEGACY_DAY_LIVE') IN ('DAY_V2', 'LEGACY_DAY_LIVE', 'LEGACY_EXIT_ONLY')
                 """,
                 (symbol,),
             ).fetchone()
@@ -331,13 +361,21 @@ def restore_orphaned_day_buys(db_path: str | Path) -> list[dict[str, Any]]:
             )
             cur.execute(
                 """
-                INSERT OR REPLACE INTO portfolio_engine_positions (
+                INSERT INTO portfolio_engine_positions (
                     symbol, quantity, entry_price, entry_time, trade_id,
                     stop_price, take_profit_1_price, take_profit_2_price,
                     trailing_stop_price, tp1_hit, highest_price, lowest_price,
                     atr_at_entry, entry_bar_timestamp, confidence_at_entry,
-                    entry_fee, last_updated
-                ) VALUES (?, ?, ?, strftime('%s','now'), ?, ?, ?, ?, 0, 0, ?, ?, 0, 0, 0.5, 0, datetime('now'))
+                    entry_fee, engine_id, scalp_opportunity_id, last_updated
+                ) VALUES (?, ?, ?, strftime('%s','now'), ?, ?, ?, ?, 0, 0, ?, ?, 0, 0, 0.5, 0, 'DAY_V2', '', datetime('now'))
+                ON CONFLICT(engine_id, symbol) DO UPDATE SET
+                    quantity=excluded.quantity, entry_price=excluded.entry_price,
+                    entry_time=excluded.entry_time, trade_id=excluded.trade_id,
+                    stop_price=excluded.stop_price,
+                    take_profit_1_price=excluded.take_profit_1_price,
+                    take_profit_2_price=excluded.take_profit_2_price,
+                    highest_price=excluded.highest_price, lowest_price=excluded.lowest_price,
+                    engine_id=excluded.engine_id, last_updated=excluded.last_updated
                 """,
                 (
                     symbol,
