@@ -104,6 +104,11 @@ def is_meaningful_residual(
 
 
 def mark_exit_residual_pending(position: Any, reason: str) -> None:
+    # The resume sell must carry the strategy trigger (DAY_V2_* / SCALP_V2_*),
+    # not the display label it collapses to (MANUAL_EXIT).
+    raw = str(getattr(position, "_learning_raw_exit_reason", "") or "")
+    if raw.upper().startswith(("DAY_V2_", "SCALP_V2_")):
+        reason = raw
     position.status = STATUS_EXIT_RESIDUAL_PENDING
     position.exit_residual_reason = str(reason or "")
     import time

@@ -104,7 +104,8 @@ class PerformanceAnalyticsService:
                       AND COALESCE(status, '') NOT IN ('dust_writeoff', 'pending', 'rejected')
                       AND COALESCE(exit_type, '') NOT IN (
                         'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
-                        'DUST_WRITEOFF', 'EXCHANGE_RECONCILE_CLOSE', 'HUMAN_MANUAL_SELL'
+                        'DUST_WRITEOFF', 'EXCHANGE_RECONCILE_CLOSE', 'HUMAN_MANUAL_SELL',
+                        'MANUAL_UNMATCHED'
                       )
                     ORDER BY timestamp ASC
                 """).fetchall()

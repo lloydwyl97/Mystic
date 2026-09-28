@@ -113,19 +113,26 @@ def shrink_to_exchange(
     total_balances: dict[str, float],
     strategy_qty: dict[str, float],
     min_notional: float = 1.0,
+    skip_symbols: set[str] | frozenset[str] = frozenset(),
 ) -> list[tuple[str, float, float]]:
     """Cap each protected row at the exchange balance left after strategy lots.
 
+    ``strategy_qty`` must be fill-proven lot quantity: a lot that absorbed
+    exchange balance would otherwise make its protected row look sold.
     Protected quantity is subtracted from the exchange balance when strategy
     positions are reconciled, so a row that outlives its coins would make new
     strategy lots look vanished. Rows whose remainder is below ``min_notional``
-    are deleted; dust retention owns that residue. Returns (symbol, old, new).
+    are deleted; dust retention owns that residue. ``skip_symbols`` are left
+    untouched (their snapshot may predate an order). Returns (symbol, old, new).
     """
     ensure_schema(conn)
     changed: list[tuple[str, float, float]] = []
+    skip = {_norm(s) for s in skip_symbols}
     rows = conn.execute("SELECT symbol, quantity, cost_price FROM protected_external_inventory").fetchall()
     for symbol, qty, price in rows:
         sym = _norm(str(symbol))
+        if sym in skip:
+            continue
         base = sym.split("/", maxsplit=1)[0]
         old = float(qty or 0.0)
         held = max(0.0, float(total_balances.get(base, 0.0) or 0.0) - max(0.0, float(strategy_qty.get(sym, 0.0) or 0.0)))

@@ -169,12 +169,16 @@ async def test_canonical_reasons_on_scalp_positions_stay_unchanged(tmp_path, tri
 
 
 @pytest.mark.asyncio
-async def test_unknown_scalp_reason_keeps_the_existing_manual_fallback(tmp_path):
-    (exit_reason, exit_type), explain, gate_trigger = await _sell(tmp_path, exit_type=ExitType.MANUAL, trigger="SCALP_V2_EXIT", engine_id="SCALP_V2")
+async def test_unknown_scalp_reason_is_blocked_before_the_venue(tmp_path):
+    """SCALP V2 has no generic MANUAL_EXIT authority: the sell is refused, nothing is booked."""
+    run = await _run_sell(tmp_path, exit_type=ExitType.MANUAL, trigger="SCALP_V2_EXIT", engine_id="SCALP_V2")
 
-    assert (exit_reason, exit_type) == ("MANUAL_EXIT", "MANUAL")
-    assert explain["raw_exit_reason"] == "SCALP_V2_EXIT"
-    assert gate_trigger == "MANUAL_EXIT"
+    assert run.result is None
+    assert run.live_order.await_count == 0
+    reasons = [c.args[2] for c in run.engine._record_reject.await_args_list]
+    assert "MANUAL_EXIT_INVARIANT_VIOLATION" in reasons
+    with sqlite3.connect(run.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM paper_trades WHERE side='SELL'").fetchone()[0] == 0
 
 
 @pytest.mark.asyncio

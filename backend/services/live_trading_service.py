@@ -109,6 +109,18 @@ def _order_fill_payload(order: dict[str, Any] | None) -> dict[str, Any]:
     return payload
 
 
+def _mark_order_activity(svc: Any, symbol: str, inflight_delta: int) -> None:
+    """Record order activity on symbol and drop the balance cache that predates it."""
+    key = str(symbol or "").upper().replace("/", "").replace("-", "")
+    inflight = getattr(svc, "_orders_inflight", None)
+    activity = getattr(svc, "_order_activity_ts", None)
+    if inflight is None or activity is None:
+        return
+    inflight[key] = max(0, int(inflight.get(key, 0) or 0) + inflight_delta)
+    activity[key] = time.time()
+    svc._balance_cache = None
+
+
 class LiveTradingService:
     """Service for live trading operations with real APIs (Binance.US only)."""
 
@@ -137,6 +149,11 @@ class LiveTradingService:
         self._orders_cache: dict[str, Any] | None = None
         self._orders_cache_time: float = 0.0
         self._orders_cache_ttl: float = 10.0  # Cache for 10 seconds
+
+        # A balance snapshot taken around an order does not show that fill yet.
+        # Reconcile must not size lots or protected inventory from it.
+        self._order_activity_ts: dict[str, float] = {}
+        self._orders_inflight: dict[str, int] = {}
 
         # Check for API keys but DON'T authenticate yet
         if not self.binance_api_key or not self.binance_secret:
@@ -241,6 +258,7 @@ class LiveTradingService:
                 return self._balance_cache
 
             balances: dict[str, Any] = {}
+            fetched_at = time.time()
             await self._ensure_initialized()
             if self.binance:
                 try:
@@ -331,10 +349,11 @@ class LiveTradingService:
                 "status": "success",
                 "balances": balances,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "fetched_at": fetched_at,
                 "source": "live_trading_apis",
             }
             self._balance_cache = result
-            self._balance_cache_time = time.time()
+            self._balance_cache_time = fetched_at
         except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError) as e:
             logger.exception(f"Error fetching account balance: {e}")
             return {
@@ -372,7 +391,23 @@ class LiveTradingService:
         return {
             "status": "success",
             "balance": {"total": dict(total), "free": dict(free), "used": dict(used)},
+            "fetched_at": result.get("fetched_at"),
         }
+
+    @staticmethod
+    def _activity_key(symbol: str) -> str:
+        return str(symbol or "").upper().replace("/", "").replace("-", "")
+
+    def order_fence_active(self, symbol: str, since_ts: float | None) -> bool:
+        """True while an order is in flight for symbol, or one ran at/after since_ts."""
+        key = self._activity_key(symbol)
+        inflight = getattr(self, "_orders_inflight", {}) or {}
+        if int(inflight.get(key, 0) or 0) > 0:
+            return True
+        if since_ts is None:
+            return False
+        last = float((getattr(self, "_order_activity_ts", {}) or {}).get(key, 0.0) or 0.0)
+        return last >= float(since_ts)
 
     async def get_symbol_constraints(
         self,
@@ -593,6 +628,23 @@ class LiveTradingService:
         time_in_force: str | None = None,
     ) -> dict[str, Any]:
         """Place a new spot order on Binance.US. Accepts exchange EXCHANGE_ID (or 'binance' for back-compat)."""
+        _mark_order_activity(self, symbol, +1)
+        try:
+            return await LiveTradingService._place_order_unfenced(self, exchange, symbol, order_type, side, amount, price, client_order_id, time_in_force)
+        finally:
+            _mark_order_activity(self, symbol, -1)
+
+    async def _place_order_unfenced(
+        self,
+        exchange: str,
+        symbol: str,
+        order_type: str,
+        side: str,
+        amount: float,
+        price: float | None,
+        client_order_id: str | None,
+        time_in_force: str | None,
+    ) -> dict[str, Any]:
         try:
             # Lazy init - connect to Binance only when placing first trade
             await self._ensure_initialized()
@@ -651,6 +703,7 @@ class LiveTradingService:
 
     async def fetch_order(self, exchange: str, order_id: str, symbol: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Fetch order status. Numeric ids use orderId; others use origClientOrderId."""
+        _mark_order_activity(self, symbol, 0)
         try:
             await self._ensure_initialized()
             if exchange.lower() in {EXCHANGE_ID.lower(), "binance", "binanceus"} and self.binance:

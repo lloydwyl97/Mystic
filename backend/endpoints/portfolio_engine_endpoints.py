@@ -1444,7 +1444,7 @@ async def force_sync_from_binance(_: None = Depends(require_admin_key)) -> dict[
         pre_positions = len(engine.open_positions)
         pre_equity = engine._total_equity
 
-        balance_result = await live_svc.get_balance("binanceus")
+        balance_result = await live_svc.get_balance("binanceus", force_refresh=True)
         if balance_result.get("status") != "success":
             return {
                 "success": False,
@@ -1455,7 +1455,7 @@ async def force_sync_from_binance(_: None = Depends(require_admin_key)) -> dict[
         free_balances = balance_result.get("balance", {}).get("free", {}) or {}
         exchange_usdt = float(free_balances.get("USDT", 0) or 0)
         await engine.sync_cash_from_exchange(exchange_usdt, "FORCE_SYNC")
-        await engine.run_live_reconcile(total_balances, free_balances=free_balances)
+        await engine.run_live_reconcile(total_balances, free_balances=free_balances, snapshot_ts=balance_result.get("fetched_at"))
 
         return {
             "success": True,
@@ -1488,13 +1488,13 @@ async def sync_from_paper_trading(_: None = Depends(require_admin_key)) -> dict[
         # LIVE: if Binance-connected, run live reconcile first to import exchange positions
         if getattr(engine, "_live_execution_enabled", False) and getattr(engine, "_live_service", None):
             live_svc = engine._live_service
-            balance_result = await live_svc.get_balance("binanceus")
+            balance_result = await live_svc.get_balance("binanceus", force_refresh=True)
             if balance_result.get("status") == "success":
                 total_balances = balance_result.get("balance", {}).get("total", {}) or {}
                 free_balances = balance_result.get("balance", {}).get("free", {}) or {}
                 exchange_usdt = float(free_balances.get("USDT", 0) or 0)
                 await engine.sync_cash_from_exchange(exchange_usdt, "SYNC_LIVE")
-                await engine.run_live_reconcile(total_balances, free_balances=free_balances)
+                await engine.run_live_reconcile(total_balances, free_balances=free_balances, snapshot_ts=balance_result.get("fetched_at"))
                 return {
                     "success": True,
                     "message": "Re-synced from Binance US (live mode)",

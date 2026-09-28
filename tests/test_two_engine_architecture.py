@@ -646,10 +646,21 @@ async def test_dust_reconcile_reads_bare_symbol_from_engine_key(tmp_path, monkey
 
 
 async def test_dust_restore_excludes_sibling_and_protected_inventory(tmp_path, monkeypatch):
+    """The 0.10 SOL left after the sibling and protected rows is nobody's lot."""
     eng = _dust_engine(tmp_path, monkeypatch, sol_total=0.30, protected=0.05)
     eng.open_positions[make_position_key(DAY, "SOL/USDT")] = _lot("SOL/USDT", DAY, qty=0.15, price=121.68)
     await eng.run_dust_reconciliation({"SOL/USDT": 121.7})
     lot = eng.open_positions[make_position_key(SCALP, "SOL/USDT")]
-    assert lot.status == "ACTIVE"
-    assert lot.quantity == pytest.approx(0.10)
+    assert lot.status == "DUST_PENDING"
+    assert lot.quantity == pytest.approx(0.0131512)
     assert eng.open_positions[make_position_key(DAY, "SOL/USDT")].quantity == pytest.approx(0.15)
+
+
+async def test_dust_restore_to_active_is_capped_by_the_lots_own_fills(tmp_path, monkeypatch):
+    eng = _dust_engine(tmp_path, monkeypatch, sol_total=0.30, protected=0.05)
+    eng.open_positions[make_position_key(DAY, "SOL/USDT")] = _lot("SOL/USDT", DAY, qty=0.15, price=121.68)
+    monkeypatch.setattr(eng, "_fill_owned_qty", lambda p: 0.08 if p.engine_id == SCALP else None)
+    await eng.run_dust_reconciliation({"SOL/USDT": 121.7})
+    lot = eng.open_positions[make_position_key(SCALP, "SOL/USDT")]
+    assert lot.status == "ACTIVE"
+    assert lot.quantity == pytest.approx(0.08)

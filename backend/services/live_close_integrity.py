@@ -126,7 +126,7 @@ def classify_paper_sell_row(
         return CLASS_NON_VENUE_GHOST
     if "RECONCILE" in exit_type or "RECONCILE" in exit_reason or "RECOVERED" in str(row.get("trade_id") or "").upper():
         return CLASS_RECONCILE_MIRROR
-    if "HUMAN_MANUAL" in exit_type or "HUMAN_MANUAL" in exit_reason:
+    if "HUMAN_MANUAL" in exit_type or "HUMAN_MANUAL" in exit_reason or exit_type == CLASS_MANUAL_UNMATCHED:
         return CLASS_MANUAL_UNMATCHED
     if oid and seen_order_ids is not None and oid in seen_order_ids:
         return CLASS_DUPLICATE_MIRROR
@@ -325,7 +325,7 @@ def strategy_scorecard_sql_predicate(alias: str = "t") -> str:
         AND COALESCE({alias}.status, '') NOT IN ('dust_writeoff', 'pending', 'rejected')
         AND COALESCE({alias}.exit_type, '') NOT IN (
             'DUST_WRITEOFF', 'EXCHANGE_RECONCILE_CLOSE', 'HUMAN_MANUAL_SELL',
-            'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
+            'MANUAL_UNMATCHED', 'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR',
             'RESEARCH_RESET_EXIT', 'STALE_LIVE_GHOST_POSITION_CLEAR'
         )
         AND COALESCE({alias}.exit_reason, '') NOT IN (

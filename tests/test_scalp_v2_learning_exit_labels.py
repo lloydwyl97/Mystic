@@ -87,23 +87,24 @@ async def test_learning_outcome_uses_canonical_scalp_label_and_keeps_raw(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_unknown_scalp_reason_keeps_existing_learning_fallback(tmp_path):
+async def test_unknown_scalp_reason_writes_no_learning(tmp_path):
     run = await _run_sell(tmp_path, exit_type=ExitType.MANUAL, trigger="SCALP_V2_EXIT", engine_id="SCALP_V2")
 
-    row = _learning_row(run.db_path)
-    assert row["close_reason"] == "MANUAL_EXIT"
-    assert row["extra"]["raw_exit_reason"] == "SCALP_V2_EXIT"
-    assert _pattern_reason(run.db_path) == "MANUAL_EXIT"
+    assert run.result is None
+    with sqlite3.connect(run.db_path) as conn:
+        if _has_table(conn, "trade_learning_outcomes"):
+            assert conn.execute("SELECT COUNT(*) FROM trade_learning_outcomes").fetchone()[0] == 0
+    assert _pattern_reason(run.db_path) is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("trigger", "_expected"), FIVE)
 async def test_learning_label_fix_leaves_every_execution_input_unchanged(tmp_path, trigger, _expected):
-    """A known SCALP reason and the unmapped fallback must drive the sell identically."""
+    """A known SCALP reason drives the sell exactly like the generic MANUAL path of a legacy lot."""
     (tmp_path / "known").mkdir()
     (tmp_path / "fallback").mkdir()
     known = await _run_sell(tmp_path / "known", exit_type=ExitType.MANUAL, trigger=trigger, engine_id="SCALP_V2")
-    fallback = await _run_sell(tmp_path / "fallback", exit_type=ExitType.MANUAL, trigger="SCALP_V2_EXIT", engine_id="SCALP_V2")
+    fallback = await _run_sell(tmp_path / "fallback", exit_type=ExitType.MANUAL, trigger="SCALP_V2_EXIT", engine_id="")
 
     got = _execution_inputs(known)
     assert got == _execution_inputs(fallback)

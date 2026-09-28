@@ -3000,7 +3000,7 @@ class PortfolioEngineIntegration:
                     await asyncio.sleep(120)
                     continue
                 live_svc = self.engine._live_service
-                balance_result = await live_svc.get_balance("binanceus")
+                balance_result = await live_svc.get_balance("binanceus", force_refresh=True)
                 logger.info("LIVE_RECONCILE: balance_fetch binanceus (one per run)")
                 if balance_result.get("status") != "success":
                     await asyncio.sleep(120)
@@ -3009,7 +3009,11 @@ class PortfolioEngineIntegration:
                 free_balances = balance_result.get("balance", {}).get("free", {}) or {}
                 exchange_usdt = float(free_balances.get("USDT", 0) or 0)
                 await self.engine.sync_cash_from_exchange(exchange_usdt, "LIVE_RECONCILE")
-                await self.engine.run_live_reconcile(total_balances, free_balances=free_balances)
+                await self.engine.run_live_reconcile(
+                    total_balances,
+                    free_balances=free_balances,
+                    snapshot_ts=balance_result.get("fetched_at"),
+                )
             except asyncio.CancelledError:
                 break
             except Exception as e:

@@ -331,6 +331,9 @@ logger_bootstrap.info(
 logger_bootstrap.warning(f"🚨 LIVE TRADING SAFETY MODE ENABLED: position_multiplier={LIVE_TRADING_SAFETY_MULTIPLIER}, max_positions={MAX_OPEN_POSITIONS}")
 # =========================================================================
 MIN_POSITION_NOTIONAL = float(os.getenv("MIN_POSITION_NOTIONAL", "11.0"))  # Binance US min=10, use 11 for safety
+# Orders on a symbol within this many seconds of a balance snapshot fence it
+# out of reconcile: the snapshot may not show that fill yet.
+RECONCILE_ORDER_FENCE_SEC = 15.0
 MAX_POSITION_SIZE_USD = float(os.getenv("MAX_POSITION_SIZE_USD", "0"))  # 0 = disabled; set >0 to cap any single buy
 # Entry/roundtrip cost buffers for effective min notional (buy-side only uses ENTRY_COST_PCT)
 ENTRY_COST_PCT = float(os.getenv("ENTRY_COST_PCT", "0.0018"))  # Buy-side buffer
@@ -2954,6 +2957,7 @@ class PortfolioEngine:
                 from backend.services.protected_external_inventory import protected_quantity
 
                 exchange_qty = max(0.0, float(total_balances.get(base_asset, 0) or 0) - protected_quantity(self.db_path, symbol))
+                await self._enforce_lot_ownership([position])
                 db_qty = position.quantity
                 await self._ensure_symbol_constraints(symbol)
                 constraints = self._symbol_constraints.get(symbol) or {}
@@ -2989,7 +2993,10 @@ class PortfolioEngine:
                         continue
                     from backend.services.live_exchange_equity import exact_dust_quantity
 
-                    exact = exact_dust_quantity(total_balances.get(base_asset, exchange_qty))
+                    exact = exact_dust_quantity(exchange_qty)
+                    capped = self._ownership_capped_qty(position, float(exact))
+                    if capped + 1e-15 < float(exact):
+                        exact = Decimal(str(capped))
                     position.quantity = float(exact)
                     position.quantity_exact = format(exact, "f")
                     position.status = "DUST_PENDING"
@@ -3012,8 +3019,8 @@ class PortfolioEngine:
                             stamp_protected_preexisting_dust(self.db_path, symbol, surplus)
                     except Exception:
                         logger.debug("PROTECTED_DUST_SURPLUS_SKIPPED %s", symbol, exc_info=True)
-                elif abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
-                    position.quantity = snapped
+                elif abs(db_qty - self._ownership_capped_qty(position, snapped)) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
+                    position.quantity = self._ownership_capped_qty(position, snapped)
                     from backend.services.day_mandatory_exit_execution import STATUS_EXIT_RESIDUAL_PENDING
 
                     if str(getattr(position, "status", "") or "") != STATUS_EXIT_RESIDUAL_PENDING:
@@ -3021,7 +3028,7 @@ class PortfolioEngine:
                     position.dust_detected_at = 0.0
                     position.dust_qty_canonical = 0.0
                     await self._persist_position_to_sqlite(position)
-                    logger.info("UPDATED:%s db_qty=%.12g ex_qty=%.12g snapped=%.12g", symbol, db_qty, exchange_qty, snapped)
+                    logger.info("UPDATED:%s db_qty=%.12g ex_qty=%.12g snapped=%.12g new_qty=%.12g", symbol, db_qty, exchange_qty, snapped, position.quantity)
                     cleared_pause_for_mismatch = True
             if cleared_pause_for_mismatch and self._trading_paused and ("QUANTITY_MISMATCH" in (self._pause_reason or "") or "canonical" in (self._pause_reason or "").lower()):
                 self._trading_paused = False
@@ -3046,6 +3053,7 @@ class PortfolioEngine:
         self,
         total_balances: dict[str, float],
         free_balances: dict[str, float] | None = None,
+        snapshot_ts: float | None = None,
     ) -> None:
         """
         Import exchange balances that are not yet in engine positions.
@@ -3058,15 +3066,21 @@ class PortfolioEngine:
         free = free_balances if free_balances is not None else total_balances
         from backend.services.protected_external_inventory import shrink_to_exchange
 
+        fenced = {
+            normalize_symbol(f"{asset}/USDT")
+            for asset in list(total_balances) + [split_position_key(k)[1].split("/")[0] for k in self.open_positions]
+            if str(asset or "").upper() not in ("USDT", "USD", "BUSD", "USDC") and self._reconcile_fenced(normalize_symbol(f"{asset}/USDT"), snapshot_ts)
+        }
         # Two-engine contract: strategy qty is the SUM of all engine lots per
-        # symbol (composite dict keys must not collide or mis-normalize).
+        # symbol, each counted only up to its own fills.
         strategy_qty: dict[str, float] = {}
         for pos in self.open_positions.values():
             _sym = normalize_symbol(str(getattr(pos, "symbol", "") or ""))
             if _sym:
-                strategy_qty[_sym] = strategy_qty.get(_sym, 0.0) + float(getattr(pos, "quantity", 0) or 0)
+                _qty = float(getattr(pos, "quantity", 0) or 0)
+                strategy_qty[_sym] = strategy_qty.get(_sym, 0.0) + self._ownership_capped_qty(pos, _qty)
         with connect_managed(self.db_path) as conn:
-            shrunk = shrink_to_exchange(conn, total_balances, strategy_qty)
+            shrunk = shrink_to_exchange(conn, total_balances, strategy_qty, skip_symbols=fenced)
             conn.commit()
         for sym, old_qty, new_qty in shrunk:
             logger.info("PROTECTED_EXTERNAL_INVENTORY_SHRUNK symbol=%s old_qty=%s new_qty=%s", sym, old_qty, new_qty)
@@ -3080,20 +3094,19 @@ class PortfolioEngine:
             symbol = normalize_symbol(f"{asset}/USDT")
             if not self._symbol_in_fixed_universe(symbol):
                 continue
+            if symbol in fenced:
+                continue
             exact_qty = str(total_qty)
             _lots = self._symbol_lots(symbol)
             if _lots:
                 _dust_lots = [p for p in _lots if str(getattr(p, "status", "") or "") == "DUST_PENDING"]
-                # Dust-retain only when every lot is dust; mixed books are
-                # aligned by the periodic loop (engine-sum), never rewritten here.
+                # Every lot is dust: each keeps only its own fills. The
+                # balance above them is protected inventory, not lot quantity.
                 if _dust_lots and len(_dust_lots) == len(_lots):
-                    existing = _dust_lots[0]
-                    await self._retain_exchange_dust(
-                        symbol=symbol,
-                        asset=str(asset),
-                        quantity=exact_qty,
-                        mark_hint=float(getattr(existing, "entry_price", 0) or 0),
-                    )
+                    await self._enforce_lot_ownership(_dust_lots)
+                    await self._ensure_symbol_constraints(symbol)
+                    _step = float((self._symbol_constraints.get(symbol) or {}).get("qty_step") or 0)
+                    await self._sync_protected_remainder(symbol, float(total_qty or 0), _dust_lots, _step)
                     continue
                 # A live strategy lot owns this symbol: the periodic loop (not
                 # the importer) aligns any surplus by engine-sum. Importing
@@ -3223,6 +3236,10 @@ class PortfolioEngine:
             return
         now = time.time()
         if existing is not None and action == "update":
+            capped = self._ownership_capped_qty(existing, float(qty))
+            if capped + 1e-15 < float(qty):
+                qty = Decimal(str(capped))
+                exact = format(qty, "f")
             existing.quantity = float(qty)
             existing.quantity_exact = exact
             existing.dust_qty_canonical = float(qty)
@@ -3263,6 +3280,113 @@ class PortfolioEngine:
         except Exception:
             logger.debug("dust snapshot persist skipped", exc_info=True)
 
+    def _fill_owned_qty(self, position: Any) -> float | None:
+        """Net base quantity the lot's own venue fills hold. None without a BUY fill record."""
+        if not getattr(self, "_live_execution_enabled", False):
+            return None
+        from backend.services.engine_lot_ownership import fill_owned_quantity_at
+
+        owned = fill_owned_quantity_at(
+            str(self.db_path),
+            str(getattr(position, "trade_id", "") or ""),
+            str(getattr(position, "symbol", "") or ""),
+        )
+        return None if owned is None else float(owned)
+
+    def _ownership_capped_qty(self, position: Any, proposed: float) -> float:
+        from backend.services.engine_lot_ownership import capped_lot_quantity
+
+        owned = self._fill_owned_qty(position)
+        booked = float(getattr(position, "quantity", 0) or 0)
+        capped = capped_lot_quantity(proposed=proposed, booked=booked, owned=owned)
+        if capped + 1e-15 < float(proposed or 0):
+            logger.warning(
+                "LOT_QTY_OWNERSHIP_CAPPED symbol=%s engine=%s trade_id=%s proposed=%.12g booked=%.12g fill_owned=%s capped=%.12g",
+                getattr(position, "symbol", ""),
+                getattr(position, "engine_id", ""),
+                getattr(position, "trade_id", ""),
+                float(proposed or 0),
+                booked,
+                owned,
+                capped,
+            )
+        return capped
+
+    async def _enforce_lot_ownership(self, lots: list) -> None:
+        """Shrink any lot booked above its fill-proven quantity. Never grows a lot."""
+        for lot in lots:
+            owned = self._fill_owned_qty(lot)
+            booked = float(getattr(lot, "quantity", 0) or 0)
+            if owned is None or booked <= owned + 1e-12:
+                continue
+            logger.warning(
+                "LOT_OWNERSHIP_ENFORCED symbol=%s engine=%s trade_id=%s booked=%.12g fill_owned=%.12g",
+                getattr(lot, "symbol", ""),
+                getattr(lot, "engine_id", ""),
+                getattr(lot, "trade_id", ""),
+                booked,
+                owned,
+            )
+            lot.quantity = float(owned)
+            if str(getattr(lot, "status", "") or "") == "DUST_PENDING":
+                lot.quantity_exact = format(Decimal(str(owned)), "f")
+                lot.dust_qty_canonical = float(owned)
+            await self._persist_position_to_sqlite(lot)
+            self._metrics_reconciliation_adjustments += 1
+
+    def _reconcile_fenced(self, symbol: str, snapshot_ts: float | None) -> bool:
+        """A snapshot taken around an order on this symbol cannot size lots or protected inventory."""
+        fenced = False
+        fence = getattr(self._live_service, "order_fence_active", None)
+        if callable(fence):
+            since = float(snapshot_ts) - RECONCILE_ORDER_FENCE_SEC if snapshot_ts else None
+            try:
+                fenced = fence(_to_api_symbol(symbol), since) is True
+            except Exception:
+                fenced = False
+        lock = (getattr(self, "_sell_execution_locks", None) or {}).get(normalize_symbol(symbol))
+        if lock is not None and lock.locked():
+            fenced = True
+        if fenced:
+            logger.info("RECONCILE_ORDER_FENCE symbol=%s snapshot_ts=%s — skipped this run", symbol, snapshot_ts)
+        return fenced
+
+    async def _sync_protected_remainder(self, symbol: str, exchange_qty: float, lots: list, qty_step: float) -> None:
+        """Balance above the proven lots is protected inventory, never lot quantity."""
+        from backend.services.protected_external_inventory import handle_unmatched_balance, list_protected, record_protected
+
+        proven = sum(float(getattr(p, "quantity", 0) or 0) for p in lots)
+        remainder = round(float(exchange_qty or 0) - proven, 12)
+        if remainder <= 0:
+            return
+        sym = normalize_symbol(symbol)
+        row = next((r for r in list_protected(self.db_path) if normalize_symbol(str(r["symbol"])) == sym), None)
+        current = float(row["quantity"]) if row else 0.0
+        tol = float(qty_step) / 2.0 if qty_step and float(qty_step) > 0 else 1e-9
+        if remainder <= current + tol:
+            return
+        constraints = self._symbol_constraints.get(sym) or {}
+        min_notional = float(constraints.get("min_notional") or MIN_POSITION_NOTIONAL)
+        mark = float((getattr(self, "_position_mark_prices", None) or {}).get(sym) or 0.0)
+        if mark <= 0:
+            mark = next((float(getattr(p, "entry_price", 0) or 0) for p in lots if float(getattr(p, "entry_price", 0) or 0) > 0), 0.0)
+        if mark <= 0 or remainder * mark < min_notional:
+            return
+        added = remainder - current
+        cost = ((current * float(row["cost_price"])) + added * mark) / remainder if row else mark
+        with connect_managed(self.db_path) as conn:
+            record_protected(conn, sym, remainder, cost, source_trade_id=f"unexplained_remainder_{sym.replace('/', '_')}_{int(time.time())}")
+            handle_unmatched_balance(conn, sym, remainder, mark, source="reconcile_remainder")
+            conn.commit()
+        logger.warning(
+            "PROTECTED_UNEXPLAINED_REMAINDER symbol=%s exchange=%.12g proven_lots=%.12g protected_before=%.12g protected_after=%.12g",
+            sym,
+            float(exchange_qty),
+            proven,
+            current,
+            remainder,
+        )
+
     async def _reconcile_dual_engine_lots(
         self,
         *,
@@ -3283,6 +3407,7 @@ class PortfolioEngine:
         the standard vanish handler.
         """
         tol = (float(qty_step) / 2.0) if qty_step and float(qty_step) > 0 else 1e-9
+        await self._enforce_lot_ownership(lots)
         engine_sum = sum(float(getattr(p, "quantity", 0) or 0) for p in lots)
         snapped = self._floor_to_step(exchange_qty, float(qty_step)) if qty_step and float(qty_step) > 0 else exchange_qty
         engines = sorted({str(getattr(p, "engine_id", "") or "") for p in lots})
@@ -3334,6 +3459,7 @@ class PortfolioEngine:
                 exchange_qty,
                 surplus,
             )
+            await self._sync_protected_remainder(symbol, float(exchange_qty), lots, float(qty_step or 0))
             return
         self._metrics_reconciliation_adjustments += 1
         logger.warning(
@@ -3348,14 +3474,16 @@ class PortfolioEngine:
         self,
         total_balances: dict[str, float],
         free_balances: dict[str, float] | None = None,
+        snapshot_ts: float | None = None,
     ) -> None:
         """
         Periodic live reconcile: import missing exchange positions, then align
         all open_positions to Binance snapshot. One balance fetch per run (caller passes snapshot).
+        Symbols with an order around the snapshot are skipped for this run.
         """
         if not self._live_execution_enabled:
             return
-        await self._import_missing_exchange_positions(total_balances, free_balances)
+        await self._import_missing_exchange_positions(total_balances, free_balances, snapshot_ts=snapshot_ts)
         if not self.open_positions:
             self._last_live_reconcile_time = time.time()
             self._last_live_reconcile_actions = "periodic"
@@ -3371,6 +3499,8 @@ class PortfolioEngine:
             if not symbol or symbol in _reconciled_syms:
                 continue
             _reconciled_syms.add(symbol)
+            if self._reconcile_fenced(symbol, snapshot_ts):
+                continue
             _lots = self._symbol_lots(symbol)
             if len(_lots) > 1:
                 await self._ensure_symbol_constraints(symbol)
@@ -3390,6 +3520,7 @@ class PortfolioEngine:
             api_sym = _to_api_symbol(symbol)
             base_asset = api_sym[:-4] if api_sym.endswith("USDT") else api_sym  # SOLUSDT -> SOL
             exchange_qty = float(total_balances.get(base_asset, 0) or 0)
+            await self._enforce_lot_ownership([position])
             db_qty = position.quantity
             await self._ensure_symbol_constraints(symbol)
             constraints = self._symbol_constraints.get(symbol) or {}
@@ -3417,6 +3548,9 @@ class PortfolioEngine:
                 from backend.services.live_exchange_equity import exact_dust_quantity
 
                 exact = exact_dust_quantity(total_balances.get(base_asset, exchange_qty))
+                capped = self._ownership_capped_qty(position, float(exact))
+                if capped + 1e-15 < float(exact):
+                    exact = Decimal(str(capped))
                 position.quantity = float(exact)
                 position.quantity_exact = format(exact, "f")
                 position.status = "DUST_PENDING"
@@ -3425,6 +3559,7 @@ class PortfolioEngine:
                 await self._persist_position_to_sqlite(position)
                 self._metrics_reconciliation_adjustments += 1
                 logger.info("DUST_PENDING:%s ex_qty=%s reason=%s", symbol, exact, dust_reason or "below min")
+                await self._sync_protected_remainder(symbol, exchange_qty, [position], qty_step)
                 continue
             from backend.services.live_fill_economics import active_lot_keeps_booked_qty
 
@@ -3437,17 +3572,20 @@ class PortfolioEngine:
                     stamp_protected_preexisting_dust(self.db_path, symbol, max(surplus, 0))
                 except Exception:
                     logger.debug("PROTECTED_DUST_SURPLUS_SKIPPED %s", symbol, exc_info=True)
-            elif abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
-                position.quantity = snapped
-                from backend.services.day_mandatory_exit_execution import STATUS_EXIT_RESIDUAL_PENDING
+            else:
+                new_qty = self._ownership_capped_qty(position, snapped)
+                if abs(db_qty - new_qty) > (qty_step / 2.0 if qty_step > 0 else 1e-9):
+                    position.quantity = new_qty
+                    from backend.services.day_mandatory_exit_execution import STATUS_EXIT_RESIDUAL_PENDING
 
-                if str(getattr(position, "status", "") or "") != STATUS_EXIT_RESIDUAL_PENDING:
-                    position.status = "ACTIVE"
-                position.dust_detected_at = 0.0
-                position.dust_qty_canonical = 0.0
-                await self._persist_position_to_sqlite(position)
-                self._metrics_reconciliation_adjustments += 1
-                logger.info("UPDATED:%s db_qty=%.12g ex_qty=%.12g snapped=%.12g", symbol, db_qty, exchange_qty, snapped)
+                    if str(getattr(position, "status", "") or "") != STATUS_EXIT_RESIDUAL_PENDING:
+                        position.status = "ACTIVE"
+                    position.dust_detected_at = 0.0
+                    position.dust_qty_canonical = 0.0
+                    await self._persist_position_to_sqlite(position)
+                    self._metrics_reconciliation_adjustments += 1
+                    logger.info("UPDATED:%s db_qty=%.12g ex_qty=%.12g snapped=%.12g new_qty=%.12g", symbol, db_qty, exchange_qty, snapped, new_qty)
+            await self._sync_protected_remainder(symbol, exchange_qty, [position], qty_step)
         await self._recompute_positions_values()
         self._compute_total_open_risk()
         self._last_live_reconcile_time = time.time()
@@ -10012,6 +10150,11 @@ class PortfolioEngine:
         if lot is None:
             return 0.0
         qty = min(float(lot["remaining"]), float(free_qty))
+        from backend.services.engine_lot_ownership import fill_owned_quantity_at
+
+        owned = fill_owned_quantity_at(str(self.db_path), str(lot["trade_id"]), symbol)
+        if owned is not None:
+            qty = min(qty, float(owned))
         if qty <= 0 or qty * float(price) < float(min_notional):
             return 0.0
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -12260,6 +12403,7 @@ class PortfolioEngine:
             await self._record_reject(symbol, "SELL", "SELL_BLOCKED_AMBIGUOUS_LOT", "EXECUTION_GATE")
             return None
         for pos in candidates:
+            await self._enforce_lot_ownership([pos])
             owned_qty = float(getattr(pos, "quantity", 0) or 0)
             break
         # Two-engine contract: all memory/DB mutations below target ONLY this
@@ -12356,6 +12500,20 @@ class PortfolioEngine:
         # Reporting label only; exit_trigger above still drives the sell gates.
         _v2_recorded_reason = scalp_v2_recorded_exit_reason(_raw_exit_trigger) or day_v2_recorded_exit_reason(_raw_exit_trigger)
         record_exit_reason = _v2_recorded_reason or exit_trigger
+        from backend.services.engine_lot_ownership import is_generic_manual_strategy_exit
+
+        _lot_engine = str(getattr(position, "engine_id", "") or engine_id or "")
+        if is_generic_manual_strategy_exit(_lot_engine, record_exit_reason):
+            logger.critical(
+                "MANUAL_EXIT_INVARIANT_VIOLATION symbol=%s engine=%s trade_id=%s raw_trigger=%s qty=%.12g — no order placed",
+                normalized_symbol,
+                _lot_engine,
+                getattr(position, "trade_id", ""),
+                _raw_exit_trigger,
+                float(quantity or 0),
+            )
+            await self._record_reject(normalized_symbol, "SELL", "MANUAL_EXIT_INVARIANT_VIOLATION", "EXECUTION_GATE")
+            return None
         # Stash on position for learning/attribution writers (not a strategy change).
         try:
             position._learning_raw_exit_reason = _exit_parts.get("raw_exit_reason")
@@ -12461,7 +12619,42 @@ class PortfolioEngine:
             exit_type_name=exit_type.name,
         )
 
+        _venue_sell_budget: list[float] = []
+
         async def _protected_live_sell(qty: float) -> dict[str, Any] | None:
+            # Every venue SELL of this call draws on one budget: the lot's own
+            # fill-proven quantity. Mandatory, residual, dust and cleanup
+            # exits have no bypass.
+            if not _venue_sell_budget:
+                _owned = self._fill_owned_qty(position)
+                _booked = float(getattr(position, "quantity", 0) or 0)
+                _venue_sell_budget.append(min(_booked, _owned) if _owned is not None else _booked)
+            if float(qty or 0) > _venue_sell_budget[0] + 1e-15:
+                logger.error(
+                    "VENUE_SELL_OWNERSHIP_CAPPED %s requested=%.12g budget=%.12g trade_id=%s",
+                    normalized_symbol,
+                    float(qty or 0),
+                    _venue_sell_budget[0],
+                    getattr(position, "trade_id", ""),
+                )
+                qty = _venue_sell_budget[0]
+                constraints = self._symbol_constraints.get(normalized_symbol) or self._symbol_constraints.get(symbol) or {}
+                _step = float(constraints.get("qty_step") or 0)
+                if _step > 0:
+                    qty = self._floor_to_step(qty, _step)
+            if float(qty or 0) <= 0:
+                return None
+            order = await _protected_live_sell_uncapped(qty)
+            filled = 0.0
+            if isinstance(order, dict):
+                try:
+                    filled = float(order["filled"]) if order.get("filled") is not None else float(qty)
+                except (TypeError, ValueError):
+                    filled = float(qty)
+            _venue_sell_budget[0] = max(0.0, _venue_sell_budget[0] - filled)
+            return order
+
+        async def _protected_live_sell_uncapped(qty: float) -> dict[str, Any] | None:
             if mandatory_flatten:
                 constraints = self._symbol_constraints.get(normalized_symbol) or self._symbol_constraints.get(symbol) or {}
 
@@ -13179,8 +13372,18 @@ class PortfolioEngine:
             try:
                 exchange_symbol = _to_api_symbol(symbol)
 
+                _fill_owned_sell = self._fill_owned_qty(position)
+                if _fill_owned_sell is not None and actual_sold_qty > _fill_owned_sell:
+                    logger.warning(
+                        "SELL_QTY_OWNERSHIP_CAPPED %s requested=%.12g fill_owned=%.12g trade_id=%s",
+                        symbol,
+                        actual_sold_qty,
+                        _fill_owned_sell,
+                        getattr(position, "trade_id", ""),
+                    )
+                    actual_sold_qty = max(0.0, _fill_owned_sell)
                 try:
-                    balance = await self._live_service.get_balance("binanceus")
+                    balance = await self._live_service.get_balance("binanceus", force_refresh=True)
                     if balance.get("status") == "success":
                         free_balances = balance.get("balance", {}).get("free", {})
                         base_coin = exchange_symbol[:-4] if exchange_symbol.endswith("USDT") else exchange_symbol
@@ -13194,8 +13397,11 @@ class PortfolioEngine:
                         await self._ensure_symbol_constraints(symbol)
                         constraints = self._symbol_constraints.get(symbol) or {}
                         qty_step = float(constraints.get("qty_step") or 0)
+                        _net_active = float(position.quantity)
+                        if _fill_owned_sell is not None:
+                            _net_active = min(_net_active, _fill_owned_sell)
                         planned = plan_sell_quantity(
-                            net_active_qty=position.quantity,
+                            net_active_qty=_net_active,
                             exchange_free_qty=free_balance,
                             protected_dust_qty=protected,
                             qty_step=qty_step,
@@ -22442,15 +22648,18 @@ class PortfolioEngine:
             return
         try:
             # CRITICAL: Fetch balances ONCE per run (single API call), then reconcile all DUST_PENDING from snapshot
-            balance_result = await self._live_service.get_balance("binanceus")
+            balance_result = await self._live_service.get_balance("binanceus", force_refresh=True)
             if balance_result.get("status") != "success":
                 return
             total_balances = balance_result.get("balance", {}).get("total") or {}
+            snapshot_ts = balance_result.get("fetched_at")
             prices = current_prices or {}
             from backend.services.protected_external_inventory import protected_quantity
 
             for key, position in dust_pending:
                 _, symbol = split_position_key(key)
+                if self._reconcile_fenced(symbol, snapshot_ts):
+                    continue
                 base_coin = symbol.split("/")[0]
                 # The venue balance is shared: only the part no other lot or protected inventory owns is this lot's.
                 owned_elsewhere = sum(float(getattr(p, "quantity", 0) or 0) for k, p in self.open_positions.items() if p is not position and split_position_key(k)[1] == symbol)
@@ -22459,6 +22668,7 @@ class PortfolioEngine:
                 except Exception:
                     logger.debug("DUST_RECONCILE: protected quantity unavailable for %s", symbol)
                 canonical_qty = max(0.0, float(total_balances.get(base_coin, 0) or 0) - owned_elsewhere)
+                canonical_qty = self._ownership_capped_qty(position, canonical_qty)
                 price = float(prices.get(key, 0) or prices.get(symbol, 0) or 0)
                 if price <= 0 and self._paper_service and symbol in getattr(self._paper_service, "positions", {}):
                     price = float(getattr(self._paper_service.positions[symbol], "current_price", 0) or 0)

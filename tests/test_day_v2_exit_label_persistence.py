@@ -47,12 +47,17 @@ async def test_day_v2_sell_persists_actual_reason_not_manual(tmp_path, trigger, 
 
 
 @pytest.mark.asyncio
-async def test_unknown_day_v2_reason_keeps_the_existing_manual_fallback(tmp_path):
-    (exit_reason, exit_type), explain, gate_trigger = await _sell(tmp_path, exit_type=ExitType.MANUAL, trigger="DAY_V2_EXIT", engine_id="DAY_V2")
+async def test_unknown_day_v2_reason_is_blocked_before_the_venue(tmp_path):
+    """DAY V2 has no generic MANUAL_EXIT authority: the sell is refused, nothing is booked."""
+    run = await _run_sell(tmp_path, exit_type=ExitType.MANUAL, trigger="DAY_V2_EXIT", engine_id="DAY_V2")
 
-    assert (exit_reason, exit_type) == ("MANUAL_EXIT", "MANUAL")
-    assert explain["raw_exit_reason"] == "DAY_V2_EXIT"
-    assert gate_trigger == "MANUAL_EXIT"
+    assert run.result is None
+    assert run.live_order.await_count == 0
+    assert run.gate.await_count == 0
+    reasons = [c.args[2] for c in run.engine._record_reject.await_args_list]
+    assert "MANUAL_EXIT_INVARIANT_VIOLATION" in reasons
+    with sqlite3.connect(run.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM paper_trades WHERE side='SELL'").fetchone()[0] == 0
 
 
 @pytest.mark.asyncio
@@ -73,11 +78,11 @@ async def test_day_v2_learning_outcome_uses_canonical_label_and_keeps_raw(tmp_pa
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("trigger", "_expected"), FIVE)
 async def test_day_v2_label_fix_leaves_every_execution_input_unchanged(tmp_path, trigger, _expected):
-    """A known DAY V2 reason and the unmapped fallback must drive the sell identically."""
+    """A known DAY V2 reason drives the sell exactly like the generic MANUAL path of a legacy lot."""
     (tmp_path / "known").mkdir()
     (tmp_path / "fallback").mkdir()
     known = await _run_sell(tmp_path / "known", exit_type=ExitType.MANUAL, trigger=trigger, engine_id="DAY_V2")
-    fallback = await _run_sell(tmp_path / "fallback", exit_type=ExitType.MANUAL, trigger="DAY_V2_EXIT", engine_id="DAY_V2")
+    fallback = await _run_sell(tmp_path / "fallback", exit_type=ExitType.MANUAL, trigger="DAY_V2_EXIT", engine_id="")
 
     got = _execution_inputs(known)
     assert got == _execution_inputs(fallback)
@@ -98,9 +103,9 @@ async def test_day_v2_sell_quantities_and_prices_unchanged(tmp_path):
         row = conn.execute("SELECT quantity, price, pnl, engine_id, explainability_json FROM paper_trades WHERE side='SELL'").fetchone()
     fallback_dir = tmp_path / "fb"
     fallback_dir.mkdir()
-    fb = await _run_sell(fallback_dir, exit_type=ExitType.MANUAL, trigger="DAY_V2_EXIT", engine_id="DAY_V2")
+    fb = await _run_sell(fallback_dir, exit_type=ExitType.MANUAL, trigger="DAY_V2_EXIT", engine_id="")
     with sqlite3.connect(fb.db_path) as conn:
-        fb_row = conn.execute("SELECT quantity, price, pnl, engine_id FROM paper_trades WHERE side='SELL'").fetchone()
+        fb_row = conn.execute("SELECT quantity, price, pnl FROM paper_trades WHERE side='SELL'").fetchone()
 
-    assert row[:4] == fb_row
+    assert row[:3] == fb_row
     assert json.loads(row[4])["exit_reason_raw"] == "DAY_V2_TIME_EXPIRATION"

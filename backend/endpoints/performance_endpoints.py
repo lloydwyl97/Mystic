@@ -35,6 +35,7 @@ _EXCLUDED_EXIT_TYPES = (
     "EXCHANGE_RECONCILE_CLOSE",
     "DUST_WRITEOFF",
     "HUMAN_MANUAL_SELL",
+    "MANUAL_UNMATCHED",
 )
 
 # ---------- Service Resolver ----------
