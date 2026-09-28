@@ -569,3 +569,54 @@ def test_prune_coin_performance_uses_symbols_not_keys(tmp_path):
     eng._prune_coin_performance()
     assert "BTC/USDT" in eng.coin_performance
     assert len(eng.coin_performance) <= 300
+
+
+# ---------------------------------------------------------------------------
+# 9. Exit monitor: the live loop filters by engine keys
+# ---------------------------------------------------------------------------
+
+
+def _monitor_engine(tmp_path, monkeypatch) -> tuple[PortfolioEngine, AsyncMock]:
+    import backend.services.day_high_water as hw
+
+    monkeypatch.setattr(hw, "load_feature_1m_candles", lambda *_a, **_k: [])
+    eng = _engine(tmp_path)
+    eng.run_trading_circuit_breaker_check = AsyncMock()
+    eng._resolve_exit_monitor_mark = AsyncMock(return_value={"mark_used": 101.0})
+    eng._build_exit_check_telemetry = lambda *_a, **_k: {}
+    eng._log_exit_check_telemetry = lambda *_a, **_k: None
+    eng._persist_position_to_sqlite = AsyncMock()
+    eng._emit_day_health_telemetry = AsyncMock()
+    eng._learning_heartbeat_last = {"BTC/USDT": time.time()}
+    check = AsyncMock(return_value=None)
+    eng._check_exit_conditions = check
+    eng.open_positions[make_position_key(SCALP, "BTC/USDT")] = _lot("BTC/USDT", SCALP, price=100.0)
+    eng.open_positions[make_position_key(DAY, "BTC/USDT")] = _lot("BTC/USDT", DAY, price=100.0)
+    return eng, check
+
+
+async def test_exit_monitor_evaluates_lots_filtered_by_engine_key(tmp_path, monkeypatch):
+    """Regression: the integration exit loop passes composite keys as `symbols`;
+    matching them against bare symbols skipped every lot (Ocean 2026-09-27,
+    zero EXIT_CHECK_TELEMETRY after 1a867fb)."""
+    eng, check = _monitor_engine(tmp_path, monkeypatch)
+    keys = set(eng.open_positions)
+    bundles = {k: {"engine": k} for k in keys}
+    await eng.monitor_all_positions({}, 0, symbols=keys, hold_day_bundles=bundles, hold_day_missing={k: [] for k in keys})
+
+    evaluated = {c.args[0].engine_id: c.kwargs for c in check.await_args_list}
+    assert set(evaluated) == {SCALP, DAY}
+    assert evaluated[SCALP]["day_hold_bundle"] == {"engine": "SCALP_V2::BTC/USDT"}
+    assert evaluated[DAY]["day_hold_bundle"] == {"engine": "DAY_V2::BTC/USDT"}
+    assert evaluated[SCALP]["day_hold_missing"] == []
+    assert eng.open_positions["SCALP_V2::BTC/USDT"].highest_price == 101.0
+
+
+async def test_exit_monitor_single_key_filter_and_bare_symbol_filter(tmp_path, monkeypatch):
+    eng, check = _monitor_engine(tmp_path, monkeypatch)
+    await eng.monitor_all_positions({}, 0, symbols={"SCALP_V2::BTC/USDT"})
+    assert [c.args[0].engine_id for c in check.await_args_list] == [SCALP]
+
+    check.reset_mock()
+    await eng.monitor_all_positions({}, 0, symbols={"BTC/USDT"})
+    assert sorted(c.args[0].engine_id for c in check.await_args_list) == [DAY, SCALP]

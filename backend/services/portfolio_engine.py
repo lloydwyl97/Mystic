@@ -15119,7 +15119,8 @@ class PortfolioEngine:
             symbol = normalize_symbol(str(getattr(position, "symbol", "") or "")) or split_position_key(str(_key))[1]
             if not symbol:
                 continue
-            if symbols is not None and symbol not in symbols:
+            # Filters and hold maps may be keyed by engine key or by bare symbol.
+            if symbols is not None and _key not in symbols and symbol not in symbols:
                 continue
             if getattr(position, "status", "ACTIVE") == "DUST_PENDING":
                 continue
@@ -15231,7 +15232,9 @@ class PortfolioEngine:
 
             miss_kw: list[str] | None = None
             if hold_day_missing is not None:
-                raw_m = hold_day_missing.get(symbol)
+                raw_m = hold_day_missing.get(_key)
+                if raw_m is None:
+                    raw_m = hold_day_missing.get(symbol)
                 if raw_m is None:
                     raw_m = hold_day_missing.get(normalize_symbol(symbol))
                 if isinstance(raw_m, list):
@@ -15243,7 +15246,9 @@ class PortfolioEngine:
 
             day_bundle: dict[str, Any] | None = None
             if hold_day_bundles is not None:
-                raw_bd = hold_day_bundles.get(symbol)
+                raw_bd = hold_day_bundles.get(_key)
+                if raw_bd is None:
+                    raw_bd = hold_day_bundles.get(symbol)
                 if raw_bd is None:
                     raw_bd = hold_day_bundles.get(normalize_symbol(symbol))
                 if isinstance(raw_bd, dict):
