@@ -177,6 +177,24 @@ SCALP_MAX_OPEN_POSITIONS = 4
 COMBINED_ENGINE_MAX_POSITIONS = 8
 
 
+def retained_protected_after_sell(
+    *,
+    protected_before: float,
+    free_before: float | None,
+    sold_qty: float,
+    lot_residual_qty: float,
+) -> float:
+    """Protected qty still on the venue after a strategy sell of its own lot.
+
+    The sell never draws on protected inventory, so the stamp survives up to
+    what the venue can still hold beyond this lot's residual.
+    """
+    if free_before is None or protected_before <= 0.0:
+        return 0.0
+    left_beyond_lot = float(free_before) - float(sold_qty) - max(0.0, float(lot_residual_qty))
+    return max(0.0, round(min(float(protected_before), left_beyond_lot), 12))
+
+
 def _day_live_entry_path() -> str:
     """Live DAY entry path from code (DAY_ENTRY_EXECUTION_MODE only names the gate)."""
     try:
@@ -8047,12 +8065,17 @@ class PortfolioEngine:
         except Exception as e:
             logger.warning("FIFO_RECONCILE failed: %s", e, exc_info=True)
 
-    async def _load_positions_from_sqlite(self, *, allow_mutations: bool = True) -> int:
+    async def _load_positions_from_sqlite(self, *, allow_mutations: bool = True, during_sell: bool = False) -> int:
         """Load positions from SQLite. Returns count loaded.
 
         When ``allow_mutations=False`` (GET/status/dashboard reads): SELECT only —
         no FIFO_RECONCILE, no delete/persist/backfill writes.
+
+        A reload that overlaps a sell (in flight, or finished while rows were
+        being read) keeps the current in-memory book; only the sell itself may
+        rehydrate (``during_sell=True``).
         """
+        sell_seq_before = int(getattr(self, "_sell_seq", 0) or 0)
 
         def _sync_load():
             opener = connect_rw if allow_mutations else connect_ro
@@ -8107,6 +8130,13 @@ class PortfolioEngine:
 
         loop = asyncio.get_running_loop()
         rows = await loop.run_in_executor(None, _sync_load)
+        if not during_sell and (int(getattr(self, "_sells_inflight", 0) or 0) > 0 or int(getattr(self, "_sell_seq", 0) or 0) != sell_seq_before):
+            logger.info(
+                "LOAD_POSITIONS_DEFERRED sells_inflight=%s sell_seq_changed=%s — keeping in-memory book",
+                int(getattr(self, "_sells_inflight", 0) or 0),
+                int(getattr(self, "_sell_seq", 0) or 0) != sell_seq_before,
+            )
+            return len(self.open_positions)
 
         rebuilt: dict[str, OpenPosition] = {}
         for row in rows:
@@ -12160,16 +12190,24 @@ class PortfolioEngine:
             locks = self._sell_execution_locks
         lock = locks.setdefault(normalize_symbol(symbol), asyncio.Lock())
         async with lock:
-            return await self._execute_sell_fifo_locked(
-                symbol,
-                quantity,
-                price,
-                exit_type,
-                exit_trigger,
-                current_bar=current_bar,
-                force_sell=force_sell,
-                engine_id=engine_id,
-            )
+            # A SQLite reload that swaps open_positions mid-sell detaches the
+            # lot being sold: the post-fill qty cut lands on the orphan, the
+            # fresh object keeps the pre-sell qty and the next exit sells again.
+            self._sells_inflight = int(getattr(self, "_sells_inflight", 0) or 0) + 1
+            try:
+                return await self._execute_sell_fifo_locked(
+                    symbol,
+                    quantity,
+                    price,
+                    exit_type,
+                    exit_trigger,
+                    current_bar=current_bar,
+                    force_sell=force_sell,
+                    engine_id=engine_id,
+                )
+            finally:
+                self._sells_inflight = max(0, int(getattr(self, "_sells_inflight", 1) or 1) - 1)
+                self._sell_seq = int(getattr(self, "_sell_seq", 0) or 0) + 1
 
     async def _execute_sell_fifo_locked(
         self,
@@ -12275,7 +12313,7 @@ class PortfolioEngine:
         db_qty, db_trade_id, db_entry = open_row
         position = self.open_positions.get(position_key)
         if not position:
-            await self._load_positions_from_sqlite()
+            await self._load_positions_from_sqlite(during_sell=True)
             position = next(
                 (v for k, v in self.open_positions.items() if k == position_key),
                 None,
@@ -13124,6 +13162,8 @@ class PortfolioEngine:
         actual_sold_qty = quantity  # Default to requested quantity
         dust_writeoff = False
         live_order_sell = None
+        sell_free_before: float | None = None
+        sell_protected_before = 0.0
 
         from backend.config.live_test_mode import can_place_live_orders_sync
 
@@ -13153,6 +13193,8 @@ class PortfolioEngine:
                             protected_dust_qty=protected,
                             qty_step=qty_step,
                         )
+                        sell_free_before = free_balance
+                        sell_protected_before = float(protected)
                         if float(planned.sellable) + 1e-15 < quantity or protected > 0:
                             logger.warning(
                                 "LIVE_SELL_QTY_PROTECTED %s requested=%.8f net_active=%.8f free=%.8f protected=%.8f sellable=%.8f residual=%.8f",
@@ -13702,9 +13744,21 @@ class PortfolioEngine:
                 self._mtm_after_confirmed_sell(normalized_symbol, float(fill_price or price or 0.0))
                 await self._persist_ledger_to_sqlite()
                 try:
-                    from backend.services.live_exchange_equity import clear_protected_preexisting_dust
+                    from backend.services.live_exchange_equity import (
+                        clear_protected_preexisting_dust,
+                        stamp_protected_preexisting_dust,
+                    )
 
-                    clear_protected_preexisting_dust(self.db_path, normalized_symbol)
+                    keep = retained_protected_after_sell(
+                        protected_before=sell_protected_before,
+                        free_before=sell_free_before,
+                        sold_qty=float(quantity),
+                        lot_residual_qty=float(getattr(position, "quantity", 0.0) or 0.0),
+                    )
+                    if keep > 0.0:
+                        stamp_protected_preexisting_dust(self.db_path, normalized_symbol, keep)
+                    else:
+                        clear_protected_preexisting_dust(self.db_path, normalized_symbol)
                 except Exception:
                     logger.debug("PROTECTED_DUST_CLEAR_SKIPPED %s", normalized_symbol, exc_info=True)
 
