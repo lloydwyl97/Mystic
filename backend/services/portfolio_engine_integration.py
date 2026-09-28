@@ -3070,8 +3070,9 @@ class PortfolioEngineIntegration:
 
     async def _paper_retention_loop(self) -> None:
         """
-        Rolling window: every 15 minutes delete trade_performance and portfolio_engine_audit
-        rows older than PAPER_RETENTION_DAYS (default 90). paper_trades retention is handled
+        Rolling window: every 15 minutes delete trade_performance rows older than
+        PAPER_RETENTION_DAYS (default 90). portfolio_engine_audit is only aged out if
+        sqlite_large_table_retention.PROTECTED_TABLES stops protecting it. paper_trades retention is handled
         by sqlite_large_table_retention (batched, same 90-day window). Pure SQLite; no Binance.
         """
         keep_days = int(os.getenv("PAPER_RETENTION_DAYS", "90") or "90")
@@ -3100,11 +3101,14 @@ class PortfolioEngineIntegration:
                                     (cutoff,),
                                 )
                                 deleted_perf = cur.rowcount
-                                cur.execute(
-                                    "DELETE FROM portfolio_engine_audit WHERE ts < ?",
-                                    (cutoff,),
-                                )
-                                deleted_audit = cur.rowcount
+                                from backend.services.sqlite_large_table_retention import PROTECTED_TABLES
+
+                                if "portfolio_engine_audit" not in PROTECTED_TABLES:
+                                    cur.execute(
+                                        "DELETE FROM portfolio_engine_audit WHERE ts < ?",
+                                        (cutoff,),
+                                    )
+                                    deleted_audit = cur.rowcount
                                 # Laptop 24/7 hygiene: passive WAL checkpoint to bound -wal file growth without blocking writers.
                                 try:
                                     conn.execute("PRAGMA wal_checkpoint(PASSIVE);")

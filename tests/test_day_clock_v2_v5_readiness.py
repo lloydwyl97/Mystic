@@ -510,7 +510,7 @@ def test_new_retention_policies_are_documented_and_bounded():
 
     by_table = {p.table: p for p in RETENTION_POLICIES}
     micro = by_table["microstructure_feature_snapshots"]
-    assert micro.keep_days == 14
+    assert micro.keep_days == 3
     assert micro.ts_column == "ts_utc"
     assert micro.cutoff_format == "epoch_seconds"
     assert micro.keep_days * 86400 > 4 * 3600  # exceeds the longest research horizon
@@ -574,3 +574,14 @@ def test_logrotate_config_is_bounded_and_uses_copytruncate():
 @pytest.mark.parametrize("field", ["train", "promoted"])
 def test_no_v5_surface_ever_enables_training(field):
     assert planned_challenger_specification_v5()[field] is False
+
+
+def test_paper_retention_defers_to_protected_audit_table():
+    import inspect
+
+    from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
+    from backend.services.sqlite_large_table_retention import PROTECTED_TABLES
+
+    assert "portfolio_engine_audit" in PROTECTED_TABLES
+    src = inspect.getsource(PortfolioEngineIntegration._paper_retention_loop)
+    assert '"portfolio_engine_audit" not in PROTECTED_TABLES' in src

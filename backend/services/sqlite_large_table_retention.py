@@ -45,9 +45,8 @@ RETENTION_JUSTIFICATION: dict[str, str] = {
         "Write-only SCALP microstructure telemetry: the only code that touches this table is "
         "microstructure_engine (CREATE/INDEX/INSERT); nothing in backend, scripts or tests ever "
         "SELECTs it, no research artifact or sealed lock references it, and it is neither "
-        "protected nor lock-dependent. 14 days is two full weeks of order-book debugging, far "
-        "beyond the longest research label horizon in the system (4h) and beyond the DAY "
-        "position lifecycle. At ~67k rows/day and ~4.6 KB/row it is 81.6% of the database."
+        "protected nor lock-dependent. 3 days covers every SCALP hold and the longest research "
+        "label horizon in the system (4h) with room for a weekend of order-book debugging. At ~67k rows/day and ~4.6 KB/row it is 81.6% of the database."
     ),
     "scalp_shadow_rejects": (
         "SCALP shadow gate telemetry sampled per rejected setup. Not an order, fill, accounting "
@@ -61,7 +60,7 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     RetentionPolicy("ai_inference_log", "ts_utc", 90, "iso_utc"),
     RetentionPolicy("ai_context_snapshots", "ts_utc", 30, "iso_utc"),
     # 81.6% of the database and ~306 MB/day. Write-only telemetry with no reader.
-    RetentionPolicy("microstructure_feature_snapshots", "ts_utc", 14, "epoch_seconds"),
+    RetentionPolicy("microstructure_feature_snapshots", "ts_utc", 3, "epoch_seconds"),
     RetentionPolicy("scalp_shadow_rejects", "created_at", 30, "iso_utc"),
     # strategy_runtime_audit writes ~160k rows/day — keep only 3 days (~480k rows max)
     RetentionPolicy("strategy_runtime_audit", "ts_utc", 3, "iso_utc"),
