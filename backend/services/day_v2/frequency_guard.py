@@ -9,6 +9,8 @@ The window is computed from arm_ts (the time the intent was armed), not
 from updated_at, so the count accurately reflects when entries were decided.
 
 Filled intents are those with status='FILLED' and engine_id='DAY_V2'.
+Direct entries create no intent, so DAY_V2 BUY rows in paper_trades are also
+counted; the larger of the two counts applies (intent fills also write a BUY row).
 
 Fail-open: any DB error returns (True, "DB_ERROR_FAIL_OPEN") so a transient
 SQLite failure never silently blocks all trading.
@@ -33,48 +35,55 @@ DAY_V2_MAX_FILLS_TOTAL_24H: int = _TOTAL_CAP
 DAY_ENTRY_FREQUENCY_LIMIT: str = "DAY_ENTRY_FREQUENCY_LIMIT"
 
 
+def _count(conn: sqlite3.Connection, sql: str, params: list[object]) -> int:
+    """COUNT(*) query; a table missing on this database counts as zero."""
+    try:
+        row = conn.execute(sql, params).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        return 0
+    return int(row[0]) if row else 0
+
+
+_SYMBOL_MATCH = " AND UPPER(REPLACE(REPLACE(symbol, '/', ''), '-', '')) = UPPER(REPLACE(REPLACE(?, '/', ''), '-', ''))"
+
+
+def _filled_count(conn: sqlite3.Connection, symbol: str | None, cutoff: float) -> int:
+    intents_sql = "SELECT COUNT(*) FROM day_trailing_buy_intents WHERE engine_id=? AND status='FILLED' AND arm_ts >= ?"
+    buys_sql = """
+        SELECT COUNT(*) FROM paper_trades
+        WHERE engine_id=? AND UPPER(side)='BUY' AND status='executed'
+          AND (is_synthetic IS NULL OR is_synthetic != 1)
+          AND julianday(timestamp) >= julianday(?, 'unixepoch')
+    """
+    params: list[object] = [_DAY_V2_ENGINE_ID, cutoff]
+    if symbol is not None:
+        intents_sql += _SYMBOL_MATCH
+        buys_sql += _SYMBOL_MATCH
+        params.append(symbol)
+    return max(_count(conn, intents_sql, params), _count(conn, buys_sql, params))
+
+
 def check_frequency_limit(db_path: str, symbol: str) -> tuple[bool, str]:
     """Return (allowed, reason).
 
     allowed=True  means this symbol may proceed to arm a new intent.
     allowed=False means a cap has been reached; reason describes which one.
 
-    The window is [now - 86400, now] counted on arm_ts.
+    The window is [now - 86400, now].
     """
     cutoff = time.time() - _WINDOW_SEC
     try:
         with sqlite3.connect(db_path) as conn:
-            # Per-symbol count: filled DAY_V2 intents for this symbol in last 24h
-            sym_row = conn.execute(
-                """
-                SELECT COUNT(*) FROM day_trailing_buy_intents
-                WHERE engine_id=?
-                  AND UPPER(REPLACE(REPLACE(symbol, '/', ''), '-', '')) = UPPER(REPLACE(REPLACE(?, '/', ''), '-', ''))
-                  AND status='FILLED'
-                  AND arm_ts >= ?
-                """,
-                (_DAY_V2_ENGINE_ID, symbol, cutoff),
-            ).fetchone()
-            sym_count = int(sym_row[0]) if sym_row else 0
-
+            sym_count = _filled_count(conn, symbol, cutoff)
             if sym_count >= _PER_SYMBOL_CAP:
                 return (
                     False,
                     f"{DAY_ENTRY_FREQUENCY_LIMIT}:SYMBOL:{symbol}:{sym_count}/{_PER_SYMBOL_CAP}_in_24h",
                 )
 
-            # Total count: all filled DAY_V2 intents in last 24h
-            total_row = conn.execute(
-                """
-                SELECT COUNT(*) FROM day_trailing_buy_intents
-                WHERE engine_id=?
-                  AND status='FILLED'
-                  AND arm_ts >= ?
-                """,
-                (_DAY_V2_ENGINE_ID, cutoff),
-            ).fetchone()
-            total_count = int(total_row[0]) if total_row else 0
-
+            total_count = _filled_count(conn, None, cutoff)
             if total_count >= _TOTAL_CAP:
                 return (
                     False,

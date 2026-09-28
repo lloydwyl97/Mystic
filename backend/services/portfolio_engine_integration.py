@@ -165,6 +165,18 @@ def _get_build_stamp() -> dict[str, str]:
     return stamp
 
 
+def day_v2_held_symbols(open_positions: dict | None) -> set[str]:
+    """Bare symbols (e.g. SOLUSDT) where DAY already holds a lot; a SCALP lot never blocks DAY."""
+    from backend.services.portfolio_engine import _lot_owned_by_engine, split_position_key
+    from backend.services.protected_external_inventory import consumes_strategy_slot
+
+    held: set[str] = set()
+    for key, pos in (open_positions or {}).items():
+        if consumes_strategy_slot(pos) and _lot_owned_by_engine(pos, "DAY_V2"):
+            held.add(split_position_key(key)[1].upper().replace("-", "").replace("/", ""))
+    return held
+
+
 class PortfolioEngineIntegration:
     """
     Integration layer between existing services and Portfolio Engine.
@@ -1638,17 +1650,11 @@ class PortfolioEngineIntegration:
             except Exception:
                 pass
 
-            # Symbols already open (any engine) — do not double-buy.
+            # Symbols DAY already holds — do not double-buy.
             # DUST_PENDING positions are excluded: they are tiny remnants with no
             # economic significance and must not block fresh DAY V2 entries.
             # _can_open_position below serves as the hard gate for all new entries.
-            already_open: set[str] = set()
-            if self.engine and self.engine.open_positions:
-                from backend.services.protected_external_inventory import consumes_strategy_slot
-
-                for _s, _pos in self.engine.open_positions.items():
-                    if consumes_strategy_slot(_pos):
-                        already_open.add(str(_s).upper().replace("-", "").replace("/", ""))
+            already_open = day_v2_held_symbols(self.engine.open_positions if self.engine else None)
 
             for symbol in DAY_V2_UNIVERSE:
                 try:
@@ -1873,6 +1879,7 @@ class PortfolioEngineIntegration:
                         db_symbol=db_sym_15m,
                         decision_id=_direct_decision_id,
                         sleeve="",
+                        reservation_id=str(reservation_id or ""),
                     )
                     if _filled:
                         record_day_decision(db_path, symbol, "FILLED", cycle_ts=as_of, closest=signal.setup)

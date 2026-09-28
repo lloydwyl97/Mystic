@@ -200,6 +200,7 @@ async def submit_day_v2_direct_entry(
     db_symbol: str = "",
     decision_id: str = "",
     sleeve: str = "",
+    reservation_id: str = "",
 ) -> dict | None:
     """Submit a DAY V2 live BUY immediately after a qualified setup.
 
@@ -260,6 +261,7 @@ async def submit_day_v2_direct_entry(
         float(getattr(engine, "_total_equity", 0) or 0),
         float(getattr(engine, "_available_balance", 0) or 0),
         getattr(engine, "open_positions", None) or {},
+        exclude_reservation_id=str(reservation_id or ""),
     )
     if not _budget_ok:
         engine.last_buy_outcome = f"DIRECT_SUBMIT_BLOCKED:{_budget_reason}"
@@ -302,8 +304,10 @@ async def submit_day_v2_direct_entry(
         "structural_zone_high": float(getattr(structural_zone, "zone_high", 0.0) or 0.0),
     }
 
+    from backend.services.portfolio_engine import normalize_symbol
+
     result = await engine.execute_buy_fifo(
-        symbol=symbol,
+        symbol=normalize_symbol(symbol),
         quantity=qty,
         price=ask,
         stop_price=float(stop_price or 0.0),

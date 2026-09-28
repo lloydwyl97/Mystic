@@ -159,7 +159,7 @@ class TestDirectEntry:
         assert result is not None
         assert len(engine.buy_calls) == 1
         call = engine.buy_calls[0]
-        assert call["symbol"] == "BTCUSDT"
+        assert call["symbol"] == "BTC/USDT"
         assert call["price"] == pytest.approx(85000.0)
         assert call["entry_authority"] == "DAY_V2_CONFIRMED"
         assert result["entry_policy_version"] == DAY_DIRECT_ENTRY_V1

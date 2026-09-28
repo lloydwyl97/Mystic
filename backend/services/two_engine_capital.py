@@ -103,7 +103,7 @@ def _position_committed_cost(pos: object) -> float:
         return 0.0
 
 
-def _active_reservations_by_engine(db_path: str) -> dict[str, float]:
+def _active_reservations_by_engine(db_path: str, exclude_reservation_id: str = "") -> dict[str, float]:
     """Sum ACTIVE reservation notionals per engine sleeve. Never raises.
 
     Queries day_entry_reservations directly: the SCALP_V2 sleeve counts toward
@@ -117,7 +117,10 @@ def _active_reservations_by_engine(db_path: str) -> dict[str, float]:
             return totals
         conn = sqlite3.connect(str(db_path), timeout=10)
         try:
-            rows = conn.execute("SELECT sleeve, notional_usd, expires_at FROM day_entry_reservations WHERE status='ACTIVE'").fetchall()
+            rows = conn.execute(
+                "SELECT sleeve, notional_usd, expires_at FROM day_entry_reservations WHERE status='ACTIVE' AND reservation_id != ?",
+                (str(exclude_reservation_id or ""),),
+            ).fetchall()
         finally:
             conn.close()
         now = time.time()
@@ -143,6 +146,7 @@ def compute_snapshot(
     equity: float,
     free_cash: float,
     open_positions: dict | None = None,
+    exclude_reservation_id: str = "",
 ) -> CapitalSnapshot:
     """Build the canonical two-engine capital snapshot from CURRENT account state."""
     day_share, scalp_share = get_capital_shares()
@@ -168,7 +172,7 @@ def compute_snapshot(
         # Unknown/legacy engine lots consume physical cash but are not attributed
         # to either engine budget (they predate engine-scoped accounting).
 
-    res = _active_reservations_by_engine(db_path)
+    res = _active_reservations_by_engine(db_path, exclude_reservation_id)
     snap.day.committed_reservations = res[DAY_V2_ENGINE_ID]
     snap.scalp.committed_reservations = res[SCALP_V2_ENGINE_ID]
     snap.reservations_total = res[DAY_V2_ENGINE_ID] + res[SCALP_V2_ENGINE_ID]
@@ -186,6 +190,7 @@ def check_engine_budget(
     free_cash: float,
     open_positions: dict | None = None,
     fee_reserve: float = 0.0,
+    exclude_reservation_id: str = "",
 ) -> tuple[bool, str, CapitalSnapshot | None]:
     """Gate a prospective BUY of `order_cost` for `engine_id`.
 
@@ -194,9 +199,11 @@ def check_engine_budget(
       insufficient; PHYSICAL_CASH_TEMPORARILY_UNAVAILABLE when virtual budget
       exists but real free USDT (net of both engines' reservations and fee
       reserve) cannot cover the order; CAPITAL_CONFIG_INVALID on bad config.
+    `exclude_reservation_id` is the caller's own reservation for this order,
+    which must not be counted against it a second time.
     """
     try:
-        snap = compute_snapshot(db_path, equity, free_cash, open_positions)
+        snap = compute_snapshot(db_path, equity, free_cash, open_positions, exclude_reservation_id)
     except ValueError:
         return False, CAPITAL_CONFIG_INVALID, None
     budget = snap.for_engine(engine_id)
