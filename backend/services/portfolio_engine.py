@@ -22345,10 +22345,19 @@ class PortfolioEngine:
                 return
             total_balances = balance_result.get("balance", {}).get("total") or {}
             prices = current_prices or {}
-            for symbol, position in dust_pending:
+            from backend.services.protected_external_inventory import protected_quantity
+
+            for key, position in dust_pending:
+                _, symbol = split_position_key(key)
                 base_coin = symbol.split("/")[0]
-                canonical_qty = float(total_balances.get(base_coin, 0) or 0)
-                price = float(prices.get(symbol, 0) or 0)
+                # The venue balance is shared: only the part no other lot or protected inventory owns is this lot's.
+                owned_elsewhere = sum(float(getattr(p, "quantity", 0) or 0) for k, p in self.open_positions.items() if p is not position and split_position_key(k)[1] == symbol)
+                try:
+                    owned_elsewhere += float(protected_quantity(self.db_path, symbol) or 0)
+                except Exception:
+                    logger.debug("DUST_RECONCILE: protected quantity unavailable for %s", symbol)
+                canonical_qty = max(0.0, float(total_balances.get(base_coin, 0) or 0) - owned_elsewhere)
+                price = float(prices.get(key, 0) or prices.get(symbol, 0) or 0)
                 if price <= 0 and self._paper_service and symbol in getattr(self._paper_service, "positions", {}):
                     price = float(getattr(self._paper_service.positions[symbol], "current_price", 0) or 0)
                 if price <= 0:
@@ -22361,7 +22370,8 @@ class PortfolioEngine:
                     position.dust_qty_canonical = canonical_qty
                     if canonical_qty <= 0:
                         await self._remove_dust_position_canonical_cleanup(symbol, position)
-                        logger.warning("DUST_PENDING_EXIT: %s balance=0 removed from engine", symbol)
+                        if key not in self.open_positions:
+                            logger.warning("DUST_PENDING_EXIT: %s balance=0 removed from engine", key)
                     else:
                         logger.debug("DUST_RECONCILE: %s still dust qty=%.12g (keep DUST_PENDING)", symbol, canonical_qty)
                     continue

@@ -620,3 +620,36 @@ async def test_exit_monitor_single_key_filter_and_bare_symbol_filter(tmp_path, m
     check.reset_mock()
     await eng.monitor_all_positions({}, 0, symbols={"BTC/USDT"})
     assert sorted(c.args[0].engine_id for c in check.await_args_list) == [DAY, SCALP]
+
+
+def _dust_engine(tmp_path, monkeypatch, sol_total: float, protected: float = 0.0):
+    import backend.services.protected_external_inventory as pei
+
+    monkeypatch.setattr(pei, "protected_quantity", lambda *_a, **_k: protected)
+    eng = _engine(tmp_path)
+    eng._live_execution_enabled = True
+    eng._live_service = SimpleNamespace(get_balance=AsyncMock(return_value={"status": "success", "balance": {"total": {"SOL": sol_total}}}))
+    eng._ensure_symbol_constraints = AsyncMock()
+    eng._dust_check = lambda _s, qty, price: (qty * price < 5.0, 0, 0, 0)
+    eng.open_positions[make_position_key(SCALP, "SOL/USDT")] = _lot("SOL/USDT", SCALP, qty=0.0131512, price=121.68, status="DUST_PENDING")
+    return eng
+
+
+async def test_dust_reconcile_reads_bare_symbol_from_engine_key(tmp_path, monkeypatch):
+    """Regression: the composite key made the base coin 'SCALP_V2::SOL' (Ocean 2026-09-28)."""
+    eng = _dust_engine(tmp_path, monkeypatch, sol_total=0.0131512)
+    await eng.run_dust_reconciliation({"SOL/USDT": 121.7})
+    lot = eng.open_positions[make_position_key(SCALP, "SOL/USDT")]
+    eng._ensure_symbol_constraints.assert_awaited_with("SOL/USDT")
+    assert lot.status == "DUST_PENDING"
+    assert lot.dust_qty_canonical == pytest.approx(0.0131512)
+
+
+async def test_dust_restore_excludes_sibling_and_protected_inventory(tmp_path, monkeypatch):
+    eng = _dust_engine(tmp_path, monkeypatch, sol_total=0.30, protected=0.05)
+    eng.open_positions[make_position_key(DAY, "SOL/USDT")] = _lot("SOL/USDT", DAY, qty=0.15, price=121.68)
+    await eng.run_dust_reconciliation({"SOL/USDT": 121.7})
+    lot = eng.open_positions[make_position_key(SCALP, "SOL/USDT")]
+    assert lot.status == "ACTIVE"
+    assert lot.quantity == pytest.approx(0.10)
+    assert eng.open_positions[make_position_key(DAY, "SOL/USDT")].quantity == pytest.approx(0.15)
