@@ -3298,6 +3298,14 @@ class PortfolioEngine:
                 )
             return
         if abs(engine_sum - snapped) <= tol:
+            # A stamp above the real surplus makes free - protected < lot qty
+            # and strands the lot's exit (plan_sell_quantity sells 0).
+            try:
+                from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
+
+                stamp_protected_preexisting_dust(self.db_path, symbol, max(0.0, float(exchange_qty) - engine_sum))
+            except Exception:
+                logger.debug("PROTECTED_DUST_RESTAMP_SKIPPED %s", symbol, exc_info=True)
             logger.info(
                 "DUAL_LOT_HEALTHY symbol=%s engines=%s engine_sum=%.12g ex_qty=%.12g snapped=%.12g",
                 symbol,
@@ -3426,8 +3434,7 @@ class PortfolioEngine:
                     from backend.services.live_exchange_equity import stamp_protected_preexisting_dust
 
                     surplus = _money_surplus(exchange_qty) - _money_surplus(db_qty)
-                    if surplus > 0:
-                        stamp_protected_preexisting_dust(self.db_path, symbol, surplus)
+                    stamp_protected_preexisting_dust(self.db_path, symbol, max(surplus, 0))
                 except Exception:
                     logger.debug("PROTECTED_DUST_SURPLUS_SKIPPED %s", symbol, exc_info=True)
             elif abs(db_qty - snapped) > (qty_step / 2.0 if qty_step > 0 else 1e-9):

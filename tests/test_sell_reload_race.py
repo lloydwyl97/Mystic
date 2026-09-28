@@ -114,3 +114,35 @@ def test_protected_stamp_shrinks_to_what_the_venue_still_holds():
     assert keep == pytest.approx(30.0 - 22.5 - 0.09548)
     assert retained_protected_after_sell(protected_before=5.0, free_before=22.6, sold_qty=22.5, lot_residual_qty=0.1) == 0.0
     assert retained_protected_after_sell(protected_before=5.0, free_before=None, sold_qty=1.0, lot_residual_qty=0.0) == 0.0
+
+
+async def test_healthy_dual_lot_reconcile_drops_stale_protected_stamp(tmp_path):
+    from backend.services.live_exchange_equity import load_protected_preexisting_dust, stamp_protected_preexisting_dust
+
+    eng = _engine(tmp_path)
+    scalp = OpenPosition(
+        symbol="SOL/USDT",
+        quantity=0.2689462,
+        entry_price=122.18,
+        entry_time=time.time(),
+        trade_id="scalp_v2_SOLUSDT_1",
+        stop_price=120.0,
+        take_profit_1_price=123.0,
+        take_profit_2_price=124.0,
+        engine_id="SCALP_V2",
+    )
+    day = OpenPosition(
+        symbol="SOL/USDT",
+        quantity=0.000928,
+        entry_price=121.66,
+        entry_time=time.time(),
+        trade_id="mystic_SOLUSDT_1",
+        stop_price=120.0,
+        take_profit_1_price=123.0,
+        take_profit_2_price=124.0,
+        engine_id="DAY_V2",
+        status="DUST_PENDING",
+    )
+    stamp_protected_preexisting_dust(eng.db_path, "SOL/USDT", 0.3600972)
+    await eng._reconcile_dual_engine_lots(symbol="SOL/USDT", lots=[scalp, day], exchange_qty=0.2709714, qty_step=0.001, source="test")
+    assert float(load_protected_preexisting_dust(eng.db_path, "SOL/USDT")) == pytest.approx(0.2709714 - 0.2698742)
