@@ -1354,10 +1354,11 @@ def _ensure_scalp_outcomes_table(db_path: str) -> None:
 
 
 def ingest_scalp_outcomes(db_path: str = DATABASE_PATH) -> dict[str, int]:
-    """Ingest closed SCALP paper trade outcomes into scalp_learning_outcomes.
+    """Ingest closed SCALP outcomes into scalp_learning_outcomes.
 
-    Reads from trade_learning_outcomes (rows written by paper_engine._after_commit
-    with engine='binance_scalp_paper' in extra_json) and normalizes them into a
+    Reads trade_learning_outcomes rows owned by SCALP_V2 (extra_json.engine_id)
+    plus historical paper rows (engine='binance_scalp_paper'), excluding dust
+    closes, and normalizes them into a
     separate scalp_learning_outcomes table so the AI training pipeline can consume
     SCALP outcomes without mixing the DAY and SCALP datasets.
 
@@ -1376,7 +1377,11 @@ def ingest_scalp_outcomes(db_path: str = DATABASE_PATH) -> dict[str, int]:
                        net_profit_usd, net_profit_pct,
                        hold_seconds, close_reason, extra_json
                 FROM trade_learning_outcomes
-                WHERE extra_json LIKE '%binance_scalp_paper%'
+                WHERE (
+                        extra_json LIKE '%binance_scalp_paper%'
+                        OR (json_valid(extra_json) AND json_extract(extra_json, '$.engine_id') = 'SCALP_V2')
+                      )
+                  AND NOT (json_valid(extra_json) AND COALESCE(json_extract(extra_json, '$.is_dust'), 0) = 1)
                   AND exit_timestamp IS NOT NULL
                 ORDER BY id ASC
                 """

@@ -6534,9 +6534,9 @@ class PortfolioEngine:
             indicators_at_sell: dict[str, Any] | None = None
             timeframes_used: list[str] | None = None
             confidence_val: float | None = float(getattr(position, "confidence_at_entry", 0.0) or 0.0) or None
+            ex_payload: dict[str, Any] = {}
             try:
                 tid = str(getattr(position, "trade_id", "") or "")
-                ex_payload: dict[str, Any] = {}
                 if tid and tid in self.trade_explanations:
                     ex_payload = self.trade_explanations[tid].to_dict()
                 ctx_snap_obj: dict[str, Any] | None = None
@@ -6709,6 +6709,14 @@ class PortfolioEngine:
             except Exception:
                 logger.debug("LEARNING_ENRICH_FAILED symbol=%s", symbol, exc_info=True)
 
+            from backend.services.learning_provenance import learning_provenance
+
+            _prov = learning_provenance(self.db_path, position, close_reason, ex_payload if isinstance(ex_payload, dict) else {})
+            extra_payload.update(_prov)
+            if isinstance(rank_data, dict):
+                rank_data["live_ai_strategy"] = _prov["strategy"]
+                rank_data["engine_id"] = _prov["engine_id"]
+
             record = TradeLearningRecord(
                 symbol=symbol,
                 entry_timestamp=float(getattr(position, "entry_time", 0.0) or 0.0) or None,
@@ -6820,7 +6828,11 @@ class PortfolioEngine:
                     except (TypeError, ValueError):
                         _fv_i = 0
                     _ctx: dict[str, Any] = {
-                        "_live_ai_strategy": "day",
+                        "_live_ai_strategy": _prov["strategy"],
+                        "engine_id": _prov["engine_id"],
+                        "trade_id": _prov["trade_id"],
+                        "setup": _prov["setup"],
+                        "is_dust": _prov["is_dust"],
                         "decision_id": decision_id,
                     }
                     if _fv_i > 0:
@@ -6838,7 +6850,7 @@ class PortfolioEngine:
                     net_profit_pct=net_pct,
                     gross_pnl_pct=net_pct,
                     close_reason=close_reason,
-                    strategy_id=str(getattr(position, "entry_strategy_id", "") or "day") or "day",
+                    strategy_id=(_prov["label_strategy"] if _prov["label_strategy"] != "day" else (str(getattr(position, "entry_strategy_id", "") or "day") or "day")),
                     features_json=feats_json,
                     context_json=ctx_json,
                     explainability=ex_payload,
