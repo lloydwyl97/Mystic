@@ -443,7 +443,7 @@ run_core_stack() {
     echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
     echo "Services: Backend + LiveMD + Signal + Portfolio + Context + Learning + Monitor"
     echo "SCALP V2: live order authority via portfolio engine. Paper scalp removed."
-    echo "DAY V2:   live entry authority via trailing-buy intent machinery."
+    echo "DAY V2:   live entry authority via direct entry (submit_day_v2_direct_entry)."
     echo "Ensure .env has EXTERNAL_SUPERVISOR_MODE=true"
     echo "=========================================="
 }
