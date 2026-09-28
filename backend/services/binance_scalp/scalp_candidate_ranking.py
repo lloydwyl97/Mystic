@@ -29,6 +29,7 @@ from backend.services.binance_scalp.strategies.base import ScalpSetupSignal, Str
 from backend.services.binance_scalp.strategies.common import (
     check_spread,
     depth_check,
+    estimate_expected_move_pct,
     target_reachable,
 )
 
@@ -40,6 +41,8 @@ HARD_REJECT_REASONS: frozenset[str] = frozenset(
         "INSUFFICIENT_BARS",
         "STALE_DATA",
         "MOMENTUM_DATA_INSUFFICIENT",
+        "INSUFFICIENT_HISTORY",
+        "NO_EXECUTABLE_EDGE_ESTIMATE",
         "TARGET_NOT_REACHABLE",
         "NO_EXECUTABLE_NET_EDGE",
     }
@@ -205,6 +208,12 @@ class RankedCandidate:
     soft_reason: str | None = None
     reachability_surplus: float = 0.0
     selection_confidence: str = "normal"
+    # Executable edge on the canonical cost model (every non-blocked candidate).
+    # edge_source: "strategy" (structural projection) or "atr_estimate" (no projection).
+    expected_move_pct: float = 0.0
+    roundtrip_cost_pct: float = 0.0
+    net_edge_after_costs_pct: float = 0.0
+    edge_source: str = ""
     # Diagnostics (computed during scoring; may be None for hard-blocked or passed cases)
     base_score: float | None = None
     momentum_boost: float | None = None
@@ -282,6 +291,18 @@ def rank_setup_signal(
 
     regime_mult = _regime_mismatch_mult(sig.setup_name, regime)
     native = regime in STRATEGY_NATIVE_REGIMES.get(sig.setup_name, frozenset())
+    if getattr(ctx.mom, "insufficient_history", False):
+        # Missing measurement, not a flat market: no candidate may trade on it.
+        return RankedCandidate(
+            signal=sig,
+            rank_score=0.0,
+            entry_eligible=False,
+            hard_block="INSUFFICIENT_HISTORY",
+            regime=regime,
+            regime_native=native,
+            soft_reason=sig.reject_reason,
+            selection_confidence="blocked",
+        )
     confidence = "normal"
     base_score: float | None = None
     mom_boost: float | None = None
@@ -320,37 +341,59 @@ def rank_setup_signal(
         rank_score = (base_score + mom_boost) * regime_mult * arm_penalty_mult
         hard_block = None
 
+    # Every candidate is priced on the same executable-cost contract. Opinion
+    # rejects carry no structural projection, so they use the ATR-only estimate.
     expected = float(sig.expected_move_pct or 0.0)
-    reach_surplus = 0.0
-    reach_mult_val = 1.0
-    target_gap_val = 0.0
-    if expected > 0:
-        reach_mult_val, reach_surplus = _reachability_soft_mult(
-            ctx.econ,
-            spread_pct=ctx.snap.spread_pct,
-            impact_pct=impact,
-            expected_move_pct=expected,
-            soft_entry=not sig.passed,
+    edge_source = "strategy"
+    if expected <= 0:
+        expected = estimate_expected_move_pct(ctx.bars_1m, structural=0.0)
+        edge_source = "atr_estimate"
+    if expected <= 0:
+        return RankedCandidate(
+            signal=sig,
+            rank_score=0.0,
+            entry_eligible=False,
+            hard_block="NO_EXECUTABLE_EDGE_ESTIMATE",
+            regime=regime,
+            regime_native=native,
+            soft_reason=sig.reject_reason,
+            selection_confidence="blocked",
+            edge_source="unavailable",
         )
-        rank_score *= reach_mult_val
-        target_gap_val = reach_surplus
-        reachable = reach_mult_val > 0.5 and reach_surplus >= float(ctx.econ.min_projected_surplus_pct)
-        if not reachable and not sig.passed:
-            return RankedCandidate(
-                signal=sig,
-                rank_score=round(rank_score, 4),
-                entry_eligible=False,
-                hard_block="NO_EXECUTABLE_NET_EDGE",
-                regime=regime,
-                regime_native=native,
-                soft_reason=sig.reject_reason or "TARGET_NOT_REACHABLE",
-                reachability_surplus=reach_surplus,
-                selection_confidence="low_reachability",
-                base_score=base_score,
-                momentum_boost=mom_boost,
-                reachability_multiplier=reach_mult_val,
-                target_gap_pct=target_gap_val,
-            )
+    cost = float(ctx.econ.roundtrip_cost_pct(ctx.snap.spread_pct, impact, 0.0))
+    reach_mult_val, reach_surplus = _reachability_soft_mult(
+        ctx.econ,
+        spread_pct=ctx.snap.spread_pct,
+        impact_pct=impact,
+        expected_move_pct=expected,
+        soft_entry=not sig.passed,
+    )
+    rank_score *= reach_mult_val
+    target_gap_val = reach_surplus
+    reachable, _required = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
+    edge_fields = {
+        "expected_move_pct": expected,
+        "roundtrip_cost_pct": cost,
+        "net_edge_after_costs_pct": expected - cost,
+        "edge_source": edge_source,
+    }
+    if not reachable:
+        return RankedCandidate(
+            signal=sig,
+            rank_score=round(rank_score, 4),
+            entry_eligible=False,
+            hard_block="NO_EXECUTABLE_NET_EDGE",
+            regime=regime,
+            regime_native=native,
+            soft_reason=sig.reject_reason or "TARGET_NOT_REACHABLE",
+            reachability_surplus=reach_surplus,
+            selection_confidence="low_reachability",
+            base_score=base_score,
+            momentum_boost=mom_boost,
+            reachability_multiplier=reach_mult_val,
+            target_gap_pct=target_gap_val,
+            **edge_fields,
+        )
 
     min_score = _min_tradeable_score()
     # Soft-rank (sig.passed=False) still RANKS and may EXECUTE if mechanical
@@ -587,6 +630,7 @@ def rank_setup_signal(
         symbol_stall_risk=symbol_stall_risk,
         micro_ev=dict(micro_ev or {}),
         rank_components=dict(rank_components or {}),
+        **edge_fields,
     )
 
 
@@ -695,6 +739,7 @@ def pick_best_ranked(candidates: list[RankedCandidate]) -> RankedCandidate | Non
         pool,
         key=lambda c: (
             c.rank_score,
+            1 if c.signal.passed else 0,
             c.reachability_surplus,
             1 if c.regime_native else 0,
             _soft_base_score(c.soft_reason),

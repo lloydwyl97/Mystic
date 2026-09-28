@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 def _float_env(name: str, default: float) -> float:
@@ -45,6 +45,15 @@ class MomentumDiagnostics:
     realized_volatility_pct: float
     momentum_confirmed: bool
     flat_regime: bool
+    # Lookback windows ("15s"/"30s"/"60s") with no real sample near that age.
+    # Their *_change values are 0.0 but are NOT a measured flat market.
+    insufficient_windows: tuple[str, ...] = ()
+    # |sample_ts - (now - lookback)| per measured window, seconds.
+    sample_age_error_sec: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def insufficient_history(self) -> bool:
+        return bool(self.insufficient_windows)
 
     def as_dict(self) -> dict:
         return {
@@ -61,6 +70,8 @@ class MomentumDiagnostics:
             "realized_volatility_pct": self.realized_volatility_pct,
             "momentum_confirmed": self.momentum_confirmed,
             "flat_regime": self.flat_regime,
+            "insufficient_windows": list(self.insufficient_windows),
+            "sample_age_error_sec": dict(self.sample_age_error_sec),
         }
 
 
@@ -87,7 +98,8 @@ class MomentumTracker:
         while hist and hist[0][0] < cutoff:
             hist.popleft()
 
-    def _sample_at(self, symbol: str, now: float, age_sec: float) -> tuple[float, float] | None:
+    def _sample_at(self, symbol: str, now: float, age_sec: float) -> tuple[float, float, float] | None:
+        """(bid, mid, |age error|) of the sample nearest now-age_sec, within ±50% of age_sec."""
         hist = self._history.get(symbol)
         if not hist:
             return None
@@ -101,7 +113,7 @@ class MomentumTracker:
                 best = (ts, bid, mid)
         if best is None or best_delta > age_sec * 0.5:
             return None
-        return best[1], best[2]
+        return best[1], best[2], best_delta
 
     def diagnostics(self, symbol: str, now: float, bid: float, mid: float) -> MomentumDiagnostics:
         sym = symbol.strip().upper()
@@ -109,10 +121,17 @@ class MomentumTracker:
         sample_count = len(hist)
         history_sec = (now - hist[0][0]) if hist else 0.0
 
+        missing: list[str] = []
+        age_errors: dict[str, float] = {}
+
         def _chg(age: float, cur: float, field: str) -> float:
             old = self._sample_at(sym, now, age)
+            label = f"{int(age)}s"
             if old is None:
+                if label not in missing:
+                    missing.append(label)
                 return 0.0
+            age_errors[label] = round(old[2], 3)
             old_val = old[0] if field == "bid" else old[1]
             if old_val <= 0:
                 return 0.0
@@ -172,6 +191,8 @@ class MomentumTracker:
             history_sec=history_sec,
             recent_range_pct=recent_range,
             realized_volatility_pct=realized_vol,
-            momentum_confirmed=confirmed,
-            flat_regime=flat,
+            momentum_confirmed=confirmed and not missing,
+            flat_regime=flat and not missing,
+            insufficient_windows=tuple(missing),
+            sample_age_error_sec=age_errors,
         )

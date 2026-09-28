@@ -106,9 +106,10 @@ def classify_scalp_candidate(row: dict | None) -> tuple[str, str]:
     """Map a router row to exactly one terminal result and a reason code."""
     if not row:
         return "REJECTED:NO_CANDIDATE", "NO_CANDIDATE"
+    # Only mechanical/economic hard blocks decide; a soft strategy opinion
+    # (soft_reason) ranks the candidate but never holds or rejects it.
     hard = str(row.get("hard_block") or "")
-    soft = str(row.get("soft_reason") or "")
-    blob = f"{hard} {soft}".upper()
+    blob = hard.upper()
     mapping = (
         ("SPREAD", "SPREAD_TOO_WIDE"),
         ("BOOK_STALE", "BOOK_STALE"),
@@ -132,7 +133,7 @@ def classify_scalp_candidate(row: dict | None) -> tuple[str, str]:
             if code == "NO_REBOUND":
                 return "WAITING_FOR_REBOUND", code
             return f"REJECTED:{code}", code
-    if row.get("snap") is None and not row.get("entry_eligible") and not blob.strip():
+    if row.get("snap") is None and not row.get("entry_eligible") and not blob.strip() and not row.get("soft_reason"):
         return "REJECTED:BOOK_STALE", "BOOK_STALE"
     if not row.get("entry_eligible"):
         return "REJECTED:ENTRY_NOT_ELIGIBLE", "ENTRY_NOT_ELIGIBLE"

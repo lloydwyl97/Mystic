@@ -160,6 +160,8 @@ class ScalpStrategyRouter:
         if mom is None:
             self.momentum.record(sym, epoch, snap.best_bid, snap.mid)
             mom = self.momentum.diagnostics(sym, epoch, snap.best_bid, snap.mid)
+        meta["momentum_insufficient_windows"] = list(getattr(mom, "insufficient_windows", ()) or ())
+        meta["momentum_sample_age_error_sec"] = dict(getattr(mom, "sample_age_error_sec", {}) or {})
         bars = bars if bars is not None else self.klines.get(sym)
 
         ctx = StrategyMarketContext(
@@ -270,7 +272,10 @@ class ScalpStrategyRouter:
                 "base_score": getattr(r, "base_score", None),
                 "momentum_boost": getattr(r, "momentum_boost", None),
                 "reachability_multiplier": getattr(r, "reachability_multiplier", None),
-                "expected_move_pct": getattr(r.signal, "expected_move_pct", None),
+                "expected_move_pct": r.expected_move_pct,
+                "roundtrip_cost_pct": r.roundtrip_cost_pct,
+                "net_edge_after_costs_pct": r.net_edge_after_costs_pct,
+                "edge_source": r.edge_source,
                 "required_target_pct": getattr(r.signal, "required_target_pct", None),
                 "target_gap_pct": getattr(r, "target_gap_pct", None),
                 "regime": regime,
@@ -294,6 +299,9 @@ class ScalpStrategyRouter:
         meta["selection_confidence"] = best_ranked.selection_confidence
         meta["best_rank_score"] = best_ranked.rank_score
         meta["best_setup"] = best_ranked.signal.setup_name
+        meta["expected_move_pct"] = best_ranked.expected_move_pct
+        meta["net_edge_after_costs_pct"] = best_ranked.net_edge_after_costs_pct
+        meta["edge_source"] = best_ranked.edge_source
         entry_eligible = bool(best_ranked.entry_eligible)
         soft_reason = best_ranked.soft_reason
         hard_block = best_ranked.hard_block
@@ -515,12 +523,19 @@ class ScalpStrategyRouter:
             _LAST_RANKING_META_BY_SYMBOL[sym] = dict(row)
             _publish_ranking_meta_to_redis(sym, row, redis_url=self.config.redis_url, prefix=self.config.redis_key_prefix)
             logger.info(
-                "SCALP_EVAL_TIMING symbol=%s elapsed_ms=%.0f ev_ms=%s passed=%s reject=%s setups=%s",
+                "SCALP_EVAL_TIMING symbol=%s elapsed_ms=%.0f ev_ms=%s passed=%s reject=%s hard=%s setup=%s edge_src=%s exp_move=%.5f net_edge=%.5f mom_missing=%s mom_age_err=%s setups=%s",
                 sym,
                 (time.perf_counter() - t_sym) * 1000.0,
                 ev_ms,
                 bool(meta.get("strategy_passed")),
                 meta.get("soft_reason") or meta.get("hard_block") or "",
+                meta.get("hard_block") or "",
+                meta.get("best_setup") or "",
+                meta.get("edge_source") or "",
+                float(meta.get("expected_move_pct") or 0.0),
+                float(meta.get("net_edge_after_costs_pct") or 0.0),
+                ",".join(meta.get("momentum_insufficient_windows") or []) or "-",
+                ",".join(f"{k}:{v}" for k, v in (meta.get("momentum_sample_age_error_sec") or {}).items()) or "-",
                 ",".join(f"{k}={v}" for k, v in (meta.get("stage_ms") or {}).items()),
             )
 

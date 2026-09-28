@@ -101,12 +101,20 @@ def test_open_row_survives_reaper(tmp_path):
 def test_scalp_candidate_records_one_waiting_reason(tmp_path):
     from backend.services.scalp_v2.decision_log import classify_scalp_candidate, reason_counts, record_scalp_decision
 
-    result, reason = classify_scalp_candidate({"entry_eligible": False, "hard_block": None, "soft_reason": "NO_PULLBACK_RECOVERY"})
-    assert result == "WAITING_FOR_PULLBACK"
-    assert reason == "NO_PULLBACK"
+    result, reason = classify_scalp_candidate({"entry_eligible": False, "hard_block": "BOOK_STALE", "soft_reason": "NO_PULLBACK_RECOVERY"})
+    assert result == "REJECTED:BOOK_STALE"
+    assert reason == "BOOK_STALE"
     record_scalp_decision(tmp_path / "d.db", "ETH/USDT", result, reason, cycle_ts=10)
     counts = reason_counts(tmp_path / "d.db", since_ts=0)
-    assert counts["ETH/USDT"]["WAITING_FOR_PULLBACK"] == 1
+    assert counts["ETH/USDT"]["REJECTED:BOOK_STALE"] == 1
+
+
+def test_soft_strategy_opinion_never_holds_an_eligible_candidate():
+    from backend.services.scalp_v2.decision_log import classify_scalp_candidate
+
+    for soft in ("NO_PULLBACK_RECOVERY", "WEAK_REJECTION_WICK", "NO_REBOUND", "GREEN_CHASE"):
+        assert classify_scalp_candidate({"entry_eligible": True, "hard_block": None, "soft_reason": soft, "snap": object()}) == ("ARMED", "ARMED")
+    assert classify_scalp_candidate({"entry_eligible": False, "hard_block": None, "soft_reason": "NO_PULLBACK_RECOVERY"})[0] == "REJECTED:ENTRY_NOT_ELIGIBLE"
 
 
 def test_blank_candle_is_not_zero_filled(tmp_path):
