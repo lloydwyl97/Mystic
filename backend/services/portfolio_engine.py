@@ -6440,6 +6440,21 @@ class PortfolioEngine:
             return EXIT_MANUAL
         return canonical
 
+    def _two_engine_capital_status(self) -> dict[str, Any]:
+        try:
+            from backend.services.two_engine_capital import compute_snapshot, symbol_marks
+
+            snap = compute_snapshot(
+                self.db_path,
+                float(self._total_equity or 0),
+                float(self._available_balance or 0),
+                self.open_positions,
+                prices=symbol_marks(getattr(self, "_position_mark_prices", None)),
+            )
+            return snap.as_dict()
+        except Exception as exc:
+            return {"error": str(exc)[:200]}
+
     def _record_learning_outcome(
         self,
         *,
@@ -9440,7 +9455,7 @@ class PortfolioEngine:
         # 7. Capital-allocator gate (two-engine contract): SCALP may deploy only
         # within its remaining engine budget, and physical free USDT (net of
         # both engines' reservations) must cover the order.
-        from backend.services.two_engine_capital import check_engine_budget
+        from backend.services.two_engine_capital import check_engine_budget, symbol_marks
 
         budget_ok, budget_reason, _snap = check_engine_budget(
             self.db_path,
@@ -9449,6 +9464,7 @@ class PortfolioEngine:
             float(self._total_equity or 0),
             float(self._available_balance or 0),
             self.open_positions,
+            prices=symbol_marks(getattr(self, "_position_mark_prices", None)),
         )
         if not budget_ok:
             logger.info("SCALP_V2_BUY_BLOCKED symbol=%s %s notional=%.4f", norm, budget_reason, notional)
@@ -21471,6 +21487,7 @@ class PortfolioEngine:
             "day_entry_execution_mode": capability.get("day_entry_execution_mode"),
             "day_entry_execution_error": capability.get("day_entry_execution_error"),
             "day_entry_path": _day_live_entry_path(),
+            "two_engine_capital": self._two_engine_capital_status(),
             "trailing_buy_intents_live_authority": _day_live_entry_path() != "direct",
             "trailing_buy_intents": self.get_trailing_buy_intent_status(),
             "day_decision_holds": self.get_day_decision_holds(),

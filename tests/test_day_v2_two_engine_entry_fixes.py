@@ -131,3 +131,24 @@ def test_own_reservation_never_double_counts_at_any_equity(tmp_path, monkeypatch
     # a DAY reservation never consumes SCALP's half
     ok, _, snap = check_engine_budget(db, "SCALP_V2", notional, equity, equity, {})
     assert ok and snap.scalp.committed_reservations == 0.0
+
+
+def test_engine_targets_split_strategy_owned_equity_not_protected(tmp_path, monkeypatch):
+    import backend.services.two_engine_capital as tec
+    from backend.services.protected_external_inventory import record_protected
+
+    monkeypatch.setattr(tec, "get_capital_shares", lambda: (0.5, 0.5))
+    db = str(tmp_path / "cap.db")
+    conn = sqlite3.connect(db)
+    record_protected(conn, symbol="BTC/USDT", quantity=0.0005, cost_price=80000.0, source_trade_id="imp", entry_order_id="1")
+    conn.commit()
+    conn.close()
+    snap = tec.compute_snapshot(db, 300.0, 100.0, {}, prices={"BTC/USDT": 84000.0})
+    assert snap.protected_equity == pytest.approx(42.0)
+    assert snap.strategy_owned_equity == pytest.approx(258.0)
+    assert (snap.day_target, snap.scalp_target) == (pytest.approx(129.0), pytest.approx(129.0))
+    d = snap.as_dict()
+    assert d["total_account_equity"] == 300.0 and d["strategy_owned_equity"] == pytest.approx(258.0)
+    # physical free cash stays final even when the engine budget has room
+    ok, reason, _ = tec.check_engine_budget(db, "DAY_V2", 50.0, 300.0, 40.0, {}, prices={"BTC/USDT": 84000.0})
+    assert (ok, reason) == (False, tec.PHYSICAL_CASH_UNAVAILABLE)

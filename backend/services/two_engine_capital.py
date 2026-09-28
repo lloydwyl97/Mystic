@@ -83,6 +83,36 @@ class CapitalSnapshot:
     day: EngineBudget = field(default_factory=_default_day_budget)
     scalp: EngineBudget = field(default_factory=_default_scalp_budget)
     reservations_total: float = 0.0
+    protected_equity: float = 0.0
+
+    @property
+    def total_account_equity(self) -> float:
+        return self.equity
+
+    @property
+    def strategy_owned_equity(self) -> float:
+        return max(0.0, self.equity - self.protected_equity)
+
+    @property
+    def day_target(self) -> float:
+        return self.day.target_capital
+
+    @property
+    def scalp_target(self) -> float:
+        return self.scalp.target_capital
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "total_account_equity": self.total_account_equity,
+            "strategy_owned_equity": self.strategy_owned_equity,
+            "protected_equity": self.protected_equity,
+            "day_target": self.day_target,
+            "scalp_target": self.scalp_target,
+            "free_cash": self.free_cash,
+            "reservations_total": self.reservations_total,
+            "day_remaining": self.day.remaining_budget,
+            "scalp_remaining": self.scalp.remaining_budget,
+        }
 
     def for_engine(self, engine_id: str) -> EngineBudget:
         if str(engine_id or "") == SCALP_V2_ENGINE_ID:
@@ -141,19 +171,49 @@ def _active_reservations_by_engine(db_path: str, exclude_reservation_id: str = "
     return totals
 
 
+def symbol_marks(position_marks: dict | None) -> dict[str, float]:
+    """Engine per-lot marks (keys may be ENGINE::SYM) collapsed to bare symbols."""
+    out: dict[str, float] = {}
+    for key, mark in (position_marks or {}).items():
+        try:
+            out[str(key).split("::")[-1]] = float(mark)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _protected_market_value(db_path: str, prices: dict | None) -> float:
+    if not db_path or str(db_path) == ":memory:":
+        return 0.0
+    try:
+        from backend.services.protected_external_inventory import protected_equity
+
+        return max(0.0, float(protected_equity(db_path, prices)[0]))
+    except Exception:
+        return 0.0
+
+
 def compute_snapshot(
     db_path: str,
     equity: float,
     free_cash: float,
     open_positions: dict | None = None,
     exclude_reservation_id: str = "",
+    prices: dict | None = None,
 ) -> CapitalSnapshot:
-    """Build the canonical two-engine capital snapshot from CURRENT account state."""
+    """Build the canonical two-engine capital snapshot from CURRENT account state.
+
+    Engine targets split strategy-owned equity: total account equity minus
+    protected/unmatched external inventory, which neither engine owns.
+    Physical free cash remains the final constraint in check_engine_budget.
+    """
     day_share, scalp_share = get_capital_shares()
     equity_f = max(0.0, float(equity or 0))
     snap = CapitalSnapshot(equity=equity_f, free_cash=max(0.0, float(free_cash or 0)))
-    snap.day.target_capital = equity_f * day_share
-    snap.scalp.target_capital = equity_f * scalp_share
+    snap.protected_equity = min(equity_f, _protected_market_value(db_path, prices))
+    owned = snap.strategy_owned_equity
+    snap.day.target_capital = owned * day_share
+    snap.scalp.target_capital = owned * scalp_share
 
     for _key, pos in (open_positions or {}).items():
         try:
@@ -191,6 +251,7 @@ def check_engine_budget(
     open_positions: dict | None = None,
     fee_reserve: float = 0.0,
     exclude_reservation_id: str = "",
+    prices: dict | None = None,
 ) -> tuple[bool, str, CapitalSnapshot | None]:
     """Gate a prospective BUY of `order_cost` for `engine_id`.
 
@@ -203,7 +264,7 @@ def check_engine_budget(
     which must not be counted against it a second time.
     """
     try:
-        snap = compute_snapshot(db_path, equity, free_cash, open_positions, exclude_reservation_id)
+        snap = compute_snapshot(db_path, equity, free_cash, open_positions, exclude_reservation_id, prices)
     except ValueError:
         return False, CAPITAL_CONFIG_INVALID, None
     budget = snap.for_engine(engine_id)

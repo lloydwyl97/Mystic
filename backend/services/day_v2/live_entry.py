@@ -244,7 +244,7 @@ async def submit_day_v2_direct_entry(
     # Two-engine capital allocator: DAY deploys only within its remaining
     # engine budget; physical free USDT (net of both engines' reservations)
     # must cover the order. Grandfathered SCALP lots are never touched.
-    from backend.services.two_engine_capital import check_engine_budget
+    from backend.services.two_engine_capital import check_engine_budget, symbol_marks
 
     _budget_ok, _budget_reason, _ = check_engine_budget(
         str(getattr(engine, "db_path", "") or ""),
@@ -254,6 +254,7 @@ async def submit_day_v2_direct_entry(
         float(getattr(engine, "_available_balance", 0) or 0),
         getattr(engine, "open_positions", None) or {},
         exclude_reservation_id=str(reservation_id or ""),
+        prices=symbol_marks(getattr(engine, "_position_mark_prices", None)),
     )
     if not _budget_ok:
         engine.last_buy_outcome = f"DIRECT_SUBMIT_BLOCKED:{_budget_reason}"
