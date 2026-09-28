@@ -183,6 +183,17 @@ class ScalpMarketReader:
             pass
         return spread, imb
 
+    def read_top_of_book(self, symbol: str) -> tuple[float, float] | None:
+        """(best_bid, mid) from the websocket book only; never calls REST."""
+        ws_book = _read_ws_depth(self._redis, symbol_bus(symbol))
+        if ws_book is None:
+            return None
+        bids, asks, _age = ws_book
+        best_bid, best_ask = float(bids[0][0]), float(asks[0][0])
+        if best_bid <= 0 or best_ask < best_bid:
+            return None
+        return best_bid, (best_bid + best_ask) / 2.0
+
     def read(self, symbol: str) -> MarketSnapshot | None:
         bus = symbol_bus(symbol)
         base = symbol_base(bus)

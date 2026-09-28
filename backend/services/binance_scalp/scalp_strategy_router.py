@@ -436,6 +436,17 @@ class ScalpStrategyRouter:
             return REGIME_DATA_MISSING
         return REGIME_RANGE
 
+    def sample_momentum(self, *, epoch: float) -> int:
+        """Record top-of-book for every product so 15s/30s momentum has samples between evaluations."""
+        recorded = 0
+        for sym in self.config.products:
+            top = self.reader.read_top_of_book(sym)
+            if top is None:
+                continue
+            self.momentum.record(sym.strip().upper(), epoch, top[0], top[1])
+            recorded += 1
+        return recorded
+
     def evaluate_all(
         self,
         *,

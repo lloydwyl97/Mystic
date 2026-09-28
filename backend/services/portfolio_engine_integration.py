@@ -193,6 +193,8 @@ class PortfolioEngineIntegration:
         self._signal_consumer_interval = max(1, SIGNAL_CONSUMER_INTERVAL_SEC)
         # SCALP V2 live entry loop cadence (seconds between evaluate_all() calls).
         self._scalp_v2_entry_interval = int(os.getenv("SCALP_V2_ENTRY_INTERVAL_SEC", "60"))
+        self._scalp_momentum_sample_interval = max(1.0, float(os.getenv("SCALP_MOMENTUM_SAMPLE_SEC", "5")))
+        self._scalp_momentum_task: asyncio.Task | None = None
 
         # Price cache for monitoring
         self.current_prices: dict[str, float] = {}
@@ -337,6 +339,7 @@ class PortfolioEngineIntegration:
             # Only active when SCALP_LIVE=true AND SCALP_LIVE_ARMED=true (structural_mode=LIVE).
             # No-ops silently when those flags are false so paper/test environments are unaffected.
             self._scalp_v2_task = asyncio.create_task(self._scalp_v2_live_loop(), name="portfolio_engine:scalp_v2_live")
+            self._scalp_momentum_task = asyncio.create_task(self._scalp_momentum_sampler_loop(), name="portfolio_engine:scalp_momentum_sampler")
             try:
                 from backend.services.simplified_pnl_observation import ENABLED as _PNLOB
 
@@ -1956,6 +1959,34 @@ class PortfolioEngineIntegration:
                 logger.warning("SCALP_V2_LIVE_LOOP_ERROR", exc_info=True)
             try:
                 await _asyncio.sleep(self._scalp_v2_entry_interval)
+            except _asyncio.CancelledError:
+                break
+
+    async def _scalp_momentum_sampler_loop(self) -> None:
+        """Feed the SCALP momentum tracker between 60s evaluations.
+
+        The tracker only accepts a sample within ±50% of the lookback, so 15s/30s
+        momentum needs samples at least every ~7s. Websocket book only; no orders.
+        """
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(10)
+        while True:
+            try:
+                from backend.services.binance_scalp.config import get_scalp_config
+                from backend.services.binance_scalp.scalp_signal_engine import get_router
+                from backend.services.binance_scalp.structural_mode import live_entry_enabled
+
+                if live_entry_enabled(get_scalp_config().resolved_structural_mode()):
+                    router = get_router()
+                    if router is not None:
+                        router.sample_momentum(epoch=time.time())
+            except _asyncio.CancelledError:
+                break
+            except Exception:
+                logger.debug("SCALP_MOMENTUM_SAMPLER_ERROR", exc_info=True)
+            try:
+                await _asyncio.sleep(self._scalp_momentum_sample_interval)
             except _asyncio.CancelledError:
                 break
 
