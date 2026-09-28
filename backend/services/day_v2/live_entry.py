@@ -1,18 +1,12 @@
-"""DAY V2 live entry management.
+"""DAY V2 live entry.
 
-Creates trailing-buy intents in day_trailing_buy_intents with
-engine_id='DAY_V2'. Namespaced configuration; no SCALP V2 defaults
-are inherited.
+Live authority is ``submit_day_v2_direct_entry``: a qualified setup is sent
+immediately through ``execute_buy_fifo`` (DAY_V2_CONFIRMED). There is no
+WAIT_DIP, dip/rebound bracket, 5m confirmation or entry TTL on the live path.
 
-Calibrated trailing-buy values are from the qualifying replay
-(scripts/research/day_v2_replay.py @ a88479a):
-  - min_dip: 20 bps (multi-hour setup, more patience than 14-bps scalp)
-  - rebound:  6 bps (confirm reversal before arming)
-  - hold ceiling: 300 min (5 hours)
-
-One intent per symbol — the day_trailing_buy_store enforces this.
-If SCALP V2 already holds a symbol-level intent, DAY V2 will not arm
-that symbol until the existing intent expires or fills.
+``create_day_v2_intent`` is the retired trailing-buy intent builder. Nothing
+live calls it; it remains only so historical intent rows keep a writer
+under test.
 """
 
 from __future__ import annotations
@@ -42,13 +36,11 @@ DAY_V2_ENGINE_ID: str = "DAY_V2"
 # Distinct from DAY_STRUCTURAL_PULLBACK_V1 so forensics can separate the
 # direct-entry book from the historical trailing-buy book.
 DAY_DIRECT_ENTRY_V1: str = "DAY_DIRECT_ENTRY_V1"
+DAY_LIVE_ENTRY_PATH: str = "direct"
 
-# Opportunity lifetime: 60 minutes from signal detection.
-# Replaced DAY_V2_MAX_HOLD_MINUTES (300 min) for structural-pullback intents.
+# Retired trailing-buy intent parameters (create_day_v2_intent only).
 STRUCTURAL_OPPORTUNITY_LIFETIME_SEC: float = 3600.0  # 60 minutes
 
-# Trailing-buy parameters: wait for a MIN_DIP decline then confirm a
-# REBOUND before entering. Multi-hour setups warrant more patience.
 DAY_V2_MIN_DIP_BPS: float = 20.0  # minimum decline from arm price (bps)
 DAY_V2_REBOUND_BPS: float = 6.0  # minimum rebound from dip low (bps)
 

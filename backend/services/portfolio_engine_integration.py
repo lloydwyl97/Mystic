@@ -1778,7 +1778,10 @@ class PortfolioEngineIntegration:
                     except Exception:
                         logger.debug("DAY_V2_FREQ_CHECK_FAILED symbol=%s", symbol, exc_info=True)
 
-                    # 3. Structural zone — setup-specific entry level required
+                    # 3. Structural zone. Integrity only: an invalid zone means the
+                    # setup lacks its structural anchor/ATR/target (missing data) or
+                    # is unsupported. zone_low/zone_high/reclaim are diagnostic;
+                    # price is never required to sit inside the zone.
                     _zone = None
                     _reclaim_level: float = 0.0
                     try:
@@ -1789,7 +1792,7 @@ class PortfolioEngineIntegration:
                         _zone = evaluate_structural_zone(signal)
                         if not _zone.valid:
                             logger.info(
-                                "DAY_V2_STRUCTURAL_ZONE_INVALID symbol=%s setup=%s reason=%s — no fallback",
+                                "DAY_V2_STRUCTURAL_DATA_MISSING symbol=%s setup=%s reason=%s (integrity block; zone bounds are diagnostic)",
                                 symbol,
                                 signal.setup,
                                 _zone.reason,
@@ -1800,7 +1803,7 @@ class PortfolioEngineIntegration:
                         logger.warning("DAY_V2_STRUCTURAL_ZONE_ERROR symbol=%s", symbol, exc_info=True)
                         continue
 
-                    # --- End DAY_STRUCTURAL_PULLBACK_V1 gates ---
+                    # --- End DAY_DIRECT_ENTRY_V1 integrity checks ---
 
                     # Executable price was resolved before the signal. Do not substitute zero.
                     if ask_price <= 0:

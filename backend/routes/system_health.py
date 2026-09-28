@@ -299,8 +299,8 @@ def _process_running(pattern: str) -> bool:
 async def get_process_health() -> dict[str, Any]:
     """Read-only Mystic core process heartbeat (pgrep-based).
 
-    Core processes match ``./start_mystic.sh core`` (7 processes).
-    ``live_data_collector`` is retired/optional — OHLCV lives in live_market_data.
+    Core processes match ``./start_mystic.sh core``. ``live_data_collector`` and
+    the SCALP paper runner are retired; SCALP_V2 runs inside the portfolio engine.
     """
     checks = {
         "uvicorn": _process_running("uvicorn backend.main:app") or _process_running("backend.main:app"),
@@ -309,13 +309,17 @@ async def get_process_health() -> dict[str, Any]:
         "portfolio_engine": _process_running("start_portfolio_engine_integration.py"),
         "ai_market_context": _process_running("start_ai_market_context.py"),
         "ai_learning": _process_running("start_ai_learning.py"),
-        "scalp_runner": _process_running("backend.services.binance_scalp.runner"),
     }
     optional = {
         "live_data_collector": {
             "running": _process_running("live_data_collector.py"),
             "classification": "retired_optional",
             "note": "Not launched by start_mystic.sh core; OHLCV is provided by start_live_market_data.py.",
+        },
+        "scalp_runner": {
+            "running": _process_running("backend.services.binance_scalp.runner"),
+            "classification": "retired",
+            "note": "SCALP paper runner removed; SCALP_V2 runs inside start_portfolio_engine_integration.py.",
         },
     }
     redis_ok = False
@@ -326,14 +330,15 @@ async def get_process_health() -> dict[str, Any]:
         except Exception:
             redis_ok = False
     core_ok = checks["uvicorn"] and checks["portfolio_engine"]
-    all_ok = core_ok and checks["live_market_data"] and checks["ai_signal_generator"] and checks["ai_market_context"] and checks["ai_learning"] and checks["scalp_runner"]
+    all_ok = all(checks.values())
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "status": "healthy" if all_ok else ("degraded" if core_ok else "critical"),
         "redis": "ok" if redis_ok else "down",
         "processes": checks,
         "optional_processes": optional,
-        "core_process_count_expected": 7,
+        "core_process_count_expected": len(checks),
+        "core_process_count_running": sum(1 for v in checks.values() if v),
     }
 
 

@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 DAY_ACCEPTED_MODEL = "day_path_net_v1"
+# A decision that carries no model version is labelled as such, never as the
+# retired day_path_net_v1 artifact (models/day_path_net_v1.json is gone).
+DAY_UNVERSIONED_MODEL = "unversioned"
 SCALP_ACCEPTED_MODEL = "scalp_path_net_v1"
 DAY_POLICY = "day_path_aware_v1"
 SCALP_POLICY = "scalp_path_aware_v1"
@@ -162,7 +165,7 @@ def build_day_entry_provenance(
     mode = str(dd.get("day_authority_mode") or "")
     if mode in {"direct_four_coin_path_ev", "live_tape_learn_v1"} or (status in {"predicted", "live_tape"} and buy_ev is not None):
         policy = str(dd.get("path_aware_policy_id") or DAY_POLICY)
-        model_version = version or DAY_ACCEPTED_MODEL
+        model_version = version or DAY_UNVERSIONED_MODEL
         action_in = str(dd.get("selected_action") or "")
         if (buy_ev or 0) > HOLD_EV:
             selected_action = action_in if action_in.upper().startswith("BUY") else "BUY"
@@ -172,12 +175,12 @@ def build_day_entry_provenance(
             selection_reason = str(dd.get("why_selected") or "HOLD_WINS")
     elif status in ("unavailable_hold", "error_hold"):
         policy = DAY_POLICY
-        model_version = version or DAY_ACCEPTED_MODEL
+        model_version = version or DAY_UNVERSIONED_MODEL
         selected_action = "HOLD"
         selection_reason = "PATH_NET_UNAVAILABLE_HOLD"
     else:
         policy = DAY_POLICY
-        model_version = version or DAY_ACCEPTED_MODEL
+        model_version = version or DAY_UNVERSIONED_MODEL
         selected_action = "HOLD"
         selection_reason = "HOLD_WINS"
     opp = str(decision_id or "").strip() or f"{bar_timestamp}:{symbol}"

@@ -177,6 +177,16 @@ SCALP_MAX_OPEN_POSITIONS = 4
 COMBINED_ENGINE_MAX_POSITIONS = 8
 
 
+def _day_live_entry_path() -> str:
+    """Live DAY entry path from code (DAY_ENTRY_EXECUTION_MODE only names the gate)."""
+    try:
+        from backend.services.day_v2.live_entry import DAY_LIVE_ENTRY_PATH
+
+        return DAY_LIVE_ENTRY_PATH
+    except Exception:
+        return "unknown"
+
+
 def make_position_key(engine_id: str, symbol: str) -> str:
     """Canonical in-memory position key: '<engine_id>::<normalized_symbol>'."""
     engine = str(engine_id or "")
@@ -21448,6 +21458,8 @@ class PortfolioEngine:
             "day_entry_enabled": capability["day_entry_enabled"],
             "day_entry_execution_mode": capability.get("day_entry_execution_mode"),
             "day_entry_execution_error": capability.get("day_entry_execution_error"),
+            "day_entry_path": _day_live_entry_path(),
+            "trailing_buy_intents_live_authority": _day_live_entry_path() != "direct",
             "trailing_buy_intents": self.get_trailing_buy_intent_status(),
             "day_decision_holds": self.get_day_decision_holds(),
             "day_exit_enabled": capability["day_exit_enabled"],
