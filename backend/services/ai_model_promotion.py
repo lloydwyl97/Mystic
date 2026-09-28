@@ -541,46 +541,55 @@ def maybe_rollback_underperforming_model(
     min_samples: int = 20,
     db_path: str = DATABASE_PATH,
 ) -> tuple[bool, str]:
-    """Rollback active model when recent live net outcomes materially degrade."""
+    """Rollback the active model when its own live net outcomes materially degrade.
+
+    Only outcomes closed after the active model was promoted count, so a model is
+    never judged on trades another artifact selected, and it must accumulate
+    ``min_samples`` of its own outcomes before it can be rolled back. A model that
+    was itself rolled back for underperformance is never reinstated.
+    """
     ensure_ai_canonical_tables(db_path)
     sid = strategy_id.strip().lower()
     bus_sym, ccxt_sym = _symbol_forms(symbol)
     with sqlite3.connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT net_pnl_pct
-            FROM ai_outcome_training_rows
-            WHERE strategy_id = ?
-              AND UPPER(symbol) IN (?, ?)
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (sid, bus_sym.upper(), ccxt_sym.upper(), int(min_samples)),
-        ).fetchall()
-        if len(rows) < min_samples:
-            return False, "insufficient_live_samples"
-        avg_net = sum(float(r[0] or 0.0) for r in rows) / max(1, len(rows))
-        if avg_net >= -0.0015:
-            return False, "no_rollback_needed"
         active = conn.execute(
             """
-            SELECT model_id, path FROM ai_model_versions
+            SELECT model_id, path, COALESCE(promoted_at, created_at) FROM ai_model_versions
             WHERE strategy_id = ? AND symbol IN (?, ?) AND status = 'active'
             ORDER BY id DESC
             LIMIT 1
             """,
             (sid, bus_sym, ccxt_sym),
         ).fetchone()
+        if not active:
+            return False, "no_active_model"
+        rows = conn.execute(
+            """
+            SELECT net_pnl_pct
+            FROM ai_outcome_training_rows
+            WHERE strategy_id = ?
+              AND UPPER(symbol) IN (?, ?)
+              AND julianday(closed_at_utc) >= julianday(?)
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (sid, bus_sym.upper(), ccxt_sym.upper(), str(active[2] or ""), int(min_samples)),
+        ).fetchall()
+        if len(rows) < min_samples:
+            return False, "insufficient_live_samples"
+        avg_net = sum(float(r[0] or 0.0) for r in rows) / max(1, len(rows))
+        if avg_net >= -0.0015:
+            return False, "no_rollback_needed"
         prev = conn.execute(
             """
             SELECT model_id, path FROM ai_model_versions
-            WHERE strategy_id = ? AND symbol IN (?, ?) AND status IN ('archived', 'rollback')
+            WHERE strategy_id = ? AND symbol IN (?, ?) AND status = 'archived'
             ORDER BY COALESCE(retired_at, promoted_at, created_at) DESC, id DESC
             LIMIT 1
             """,
             (sid, bus_sym, ccxt_sym),
         ).fetchone()
-        if not active or not prev:
+        if not prev:
             return False, "no_previous_model"
         prev_path = str(prev[1] or "")
         if not prev_path or not os.path.exists(prev_path):
@@ -604,7 +613,7 @@ def maybe_rollback_underperforming_model(
                 active[0],
                 prev[0],
                 "live_underperformance",
-                json.dumps({"avg_recent_net_pnl_pct": avg_net}, separators=(",", ":")),
+                json.dumps({"avg_recent_net_pnl_pct": avg_net, "samples": len(rows), "since": str(active[2] or "")}, separators=(",", ":")),
             ),
         )
         conn.commit()

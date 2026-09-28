@@ -122,7 +122,7 @@ def test_rollback_matches_ccxt_outcome_symbol_and_restores_artifact(tmp_path: Pa
             ('day:BTCUSDT:prev', 'day', 'BTCUSDT', 5, 'prevhash', ?, 'archived',
              datetime('now'), datetime('now'), datetime('now')),
             ('day:BTCUSDT:cur',  'day', 'BTCUSDT', 5, 'curhash',  ?, 'active',
-             datetime('now'), datetime('now'), NULL)
+             '2026-07-31 00:00:00', '2026-07-31 00:00:00', NULL)
             """,
             (str(cand_prev), str(cand_cur)),
         )
@@ -179,3 +179,40 @@ def test_feature_version_no_longer_invents_five_on_missing():
 def test_rollback_logger_bound():
     src = (REPO / "backend/services/ai_model_promotion.py").read_text()
     assert "logger = logging.getLogger(__name__)" in src
+
+
+def _rollback_db(tmp_path: Path, *, promoted_at: str, prev_status: str = "archived") -> tuple[Path, Path]:
+    db = tmp_path / "rb.db"
+    ensure_ai_canonical_tables(str(db))
+    prev = tmp_path / "versions" / "day_BTCUSDT_prev.pkl"
+    cur = tmp_path / "versions" / "day_BTCUSDT_cur.pkl"
+    _write_artifact(prev, accuracy=0.66)
+    _write_artifact(cur, accuracy=0.40)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            INSERT INTO ai_model_versions (model_id, strategy_id, symbol, feature_version, artifact_hash, path, status, created_at, promoted_at, retired_at)
+            VALUES ('day:BTCUSDT:prev', 'day', 'BTCUSDT', 5, 'p', ?, ?, '2026-07-01', '2026-07-01', '2026-07-31'),
+                   ('day:BTCUSDT:cur', 'day', 'BTCUSDT', 5, 'c', ?, 'active', ?, ?, NULL)
+            """,
+            (str(prev), prev_status, str(cur), promoted_at, promoted_at),
+        )
+        for i in range(25):
+            conn.execute(
+                "INSERT INTO ai_outcome_training_rows (symbol, opened_at_utc, closed_at_utc, strategy_id, net_pnl_pct, ingested_at_utc) VALUES ('BTC/USDT', ?, ?, 'day', -0.01, datetime('now'))",
+                (f"2026-08-01T00:00:{i:02d}Z", f"2026-08-01T01:00:{i:02d}Z"),
+            )
+        conn.commit()
+    return db, tmp_path / "active.pkl"
+
+
+def test_rollback_ignores_outcomes_selected_by_a_previous_model(tmp_path: Path):
+    db, active = _rollback_db(tmp_path, promoted_at="2026-08-02 00:00:00")
+    with patch("backend.services.live_strategy_contracts.per_coin_artifact_file", return_value=active):
+        assert maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", min_samples=20, db_path=str(db)) == (False, "insufficient_live_samples")
+
+
+def test_rollback_never_reinstates_a_rolled_back_model(tmp_path: Path):
+    db, active = _rollback_db(tmp_path, promoted_at="2026-07-31 00:00:00", prev_status="rollback")
+    with patch("backend.services.live_strategy_contracts.per_coin_artifact_file", return_value=active):
+        assert maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", min_samples=20, db_path=str(db)) == (False, "no_previous_model")

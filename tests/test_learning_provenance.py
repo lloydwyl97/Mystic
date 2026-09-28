@@ -161,3 +161,14 @@ def test_live_close_writer_stamps_scalp_provenance(tmp_path, monkeypatch):
     extra = json.loads(conn.execute("SELECT extra_json FROM trade_learning_outcomes ORDER BY id DESC LIMIT 1").fetchone()[0])
     assert (extra["engine_id"], extra["strategy"], extra["setup"], extra["is_dust"]) == ("SCALP_V2", "scalp", "range_bounce_scalp", False)
     assert [r[0] for r in conn.execute("SELECT strategy_id FROM ai_outcome_training_rows")] == ["scalp"]
+
+
+def test_promotion_holdout_rows_are_excluded_from_training(monkeypatch):
+    import backend.ai_training_pipeline as tp
+    import backend.services.ai_model_promotion_holdout as hold
+
+    monkeypatch.setattr(hold, "holdout_window", lambda **k: {"ids": [3, 4], "n": 2, "min_id": 3, "max_id": 4} if k["symbol_bus"] == "BTCUSDT" else {"ids": [], "n": 0})
+    rows = [{"id": i} for i in range(1, 6)]
+    kept, windows = tp._exclude_promotion_holdout(rows, "day", 145, 5)
+    assert [r["id"] for r in kept] == [1, 2, 5]
+    assert windows["BTCUSDT"]["max_id"] == 4

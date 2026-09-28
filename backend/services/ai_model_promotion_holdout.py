@@ -72,6 +72,73 @@ def _outcome_label(row: sqlite3.Row) -> int:
     return y_label
 
 
+def _holdout_split(
+    sid: str,
+    bus: str,
+    ccxt: str,
+    feature_version: int,
+    feature_dim: int,
+    db_path: str,
+    holdout_fraction: float,
+) -> tuple[list[sqlite3.Row], int]:
+    """(holdout rows, total eligible). Holdout = chronologically last eligible rows."""
+    ensure_ai_canonical_tables(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, symbol, strategy_id, outcome_class, good_bad_memory_class, churn_flag,
+                   features_json, context_json, outcome_label, rank_snapshot_id,
+                   selected_net_expected_value, net_pnl_pct, actual_net_outcome, realized_pct, closed_at_utc
+            FROM ai_outcome_training_rows
+            WHERE strategy_id = ?
+              AND symbol IN (?, ?)
+              AND features_json IS NOT NULL
+            ORDER BY id ASC
+            """,
+            (sid, ccxt, bus),
+        ).fetchall()
+    eligible = [row for row in rows if _row_passes_filters(row, symbol_bus=bus, min_fv=feature_version, min_dim=feature_dim)]
+    total_eligible = len(eligible)
+    if total_eligible == 0:
+        return [], 0
+    if total_eligible >= TARGET_HOLDOUT_SAMPLES:
+        split_idx = total_eligible - TARGET_HOLDOUT_SAMPLES
+    else:
+        split_idx = max(1, int(total_eligible * (1.0 - holdout_fraction)))
+        if total_eligible - split_idx < MIN_HOLDOUT_SAMPLES:
+            split_idx = max(0, total_eligible - MIN_HOLDOUT_SAMPLES)
+    return eligible[split_idx:], total_eligible
+
+
+def holdout_window(
+    *,
+    strategy_id: str,
+    symbol_bus: str,
+    feature_version: int = FEATURE_VERSION_DAY_HTF,
+    feature_dim: int = FEATURE_DIM_V2,
+    db_path: str = DATABASE_PATH,
+    holdout_fraction: float = HOLDOUT_FRACTION,
+) -> dict[str, Any]:
+    """Row ids and time range of the promotion holdout. Training must exclude ``ids``."""
+    sid = (strategy_id or "day").strip().lower()
+    bus, ccxt = _symbol_forms(symbol_bus)
+    if bus not in TRADING_SYMBOLS:
+        return {"ids": [], "n": 0}
+    rows, _total = _holdout_split(sid, bus, ccxt, feature_version, feature_dim, db_path, holdout_fraction)
+    if len(rows) < MIN_HOLDOUT_SAMPLES:
+        return {"ids": [], "n": 0}
+    ids = [int(r["id"]) for r in rows]
+    return {
+        "ids": ids,
+        "n": len(ids),
+        "min_id": min(ids),
+        "max_id": max(ids),
+        "first_closed_at": str(rows[0]["closed_at_utc"] or ""),
+        "last_closed_at": str(rows[-1]["closed_at_utc"] or ""),
+    }
+
+
 def load_symbol_holdout_rows(
     *,
     strategy_id: str,
@@ -97,39 +164,9 @@ def load_symbol_holdout_rows(
     if bus not in TRADING_SYMBOLS:
         return empty
 
-    ensure_ai_canonical_tables(db_path)
-    eligible: list[sqlite3.Row] = []
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT id, symbol, strategy_id, outcome_class, good_bad_memory_class, churn_flag,
-                   features_json, context_json, outcome_label, rank_snapshot_id,
-                   selected_net_expected_value, net_pnl_pct, actual_net_outcome, realized_pct
-            FROM ai_outcome_training_rows
-            WHERE strategy_id = ?
-              AND symbol IN (?, ?)
-              AND features_json IS NOT NULL
-            ORDER BY id ASC
-            """,
-            (sid, ccxt, bus),
-        ).fetchall()
-
-    for row in rows:
-        if _row_passes_filters(row, symbol_bus=bus, min_fv=feature_version, min_dim=feature_dim):
-            eligible.append(row)
-
-    total_eligible = len(eligible)
+    holdout_rows, total_eligible = _holdout_split(sid, bus, ccxt, feature_version, feature_dim, db_path, holdout_fraction)
     if total_eligible == 0:
         return empty
-
-    if total_eligible >= TARGET_HOLDOUT_SAMPLES:
-        split_idx = total_eligible - TARGET_HOLDOUT_SAMPLES
-    else:
-        split_idx = max(1, int(total_eligible * (1.0 - holdout_fraction)))
-        if total_eligible - split_idx < MIN_HOLDOUT_SAMPLES:
-            split_idx = max(0, total_eligible - MIN_HOLDOUT_SAMPLES)
-    holdout_rows = eligible[split_idx:]
     if len(holdout_rows) < MIN_HOLDOUT_SAMPLES:
         return (
             np.array([]),
@@ -378,6 +415,8 @@ def build_holdout_validation_metrics(
         "active_holdout": {},
         "candidate_holdout": {},
     }
+    window = holdout_window(strategy_id=sid, symbol_bus=bus, feature_version=feature_version, feature_dim=feature_dim, db_path=db_path)
+    base["holdout_window"] = {k: v for k, v in window.items() if k != "ids"}
     if rf_val_samples is not None:
         base["rf_val_samples"] = int(rf_val_samples)
 

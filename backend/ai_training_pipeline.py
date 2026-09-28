@@ -402,6 +402,33 @@ def _outcome_exit_class_multiplier(row: dict[str, Any], y_label: int) -> float:
     return 1.0
 
 
+def _exclude_promotion_holdout(
+    outcome_rows: list[dict[str, Any]] | None,
+    strategy_id: str,
+    target_dim: int,
+    feature_version_used: int,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Drop the per-symbol promotion holdout rows so a candidate is never scored on its own training data."""
+    rows = list(outcome_rows or [])
+    windows: dict[str, dict[str, Any]] = {}
+    try:
+        from backend.config.trading_universe import TRADING_SYMBOLS
+        from backend.services.ai_model_promotion_holdout import holdout_window
+
+        fv = int(FEATURE_VERSION_DAY_HTF) if strategy_id == "day" else int(feature_version_used)
+        excluded: set[int] = set()
+        for sym in TRADING_SYMBOLS:
+            window = holdout_window(strategy_id=strategy_id, symbol_bus=sym, feature_version=fv, feature_dim=int(target_dim))
+            windows[sym] = window
+            excluded.update(window.get("ids") or [])
+    except Exception as exc:
+        logger.warning("PROMOTION_HOLDOUT_EXCLUDE_FAILED strategy=%s err=%s", strategy_id, exc)
+        return rows, windows
+    kept = [r for r in rows if int(r.get("id") or 0) not in excluded]
+    logger.info("PROMOTION_HOLDOUT_EXCLUDED strategy=%s excluded=%d kept=%d", strategy_id, len(rows) - len(kept), len(kept))
+    return kept, windows
+
+
 def _outcome_rows_to_xy_for_strategy(
     outcome_rows: list[dict[str, Any]],
     live_strategy_id: str,
@@ -1455,8 +1482,10 @@ class AITrainingDataPipeline:
 
                     X_oc = y_oc = sym_oc = np.array([])
                     w_oc = np.array([])
-                    if outcome_rows:
-                        X_oc, y_oc, sym_oc, w_oc = _outcome_rows_to_xy_for_strategy(outcome_rows, strat, target_dim=target_dim)
+                    train_outcome_rows, holdout_windows = _exclude_promotion_holdout(outcome_rows, strat, target_dim, feature_version_used)
+                    train_outcome_max_id = max((int(r.get("id") or 0) for r in train_outcome_rows), default=0)
+                    if train_outcome_rows:
+                        X_oc, y_oc, sym_oc, w_oc = _outcome_rows_to_xy_for_strategy(train_outcome_rows, strat, target_dim=target_dim)
                         if len(X_oc) > 0:
                             logger.info(
                                 "AI_OUTCOME_TRAIN: strategy=%s merging %d realized-outcome rows (dim=%d)",
@@ -1811,6 +1840,13 @@ class AITrainingDataPipeline:
                                 feature_dim=int(target_dim),
                                 rf_val_samples=len(X_val),
                             )
+                            _window = holdout_windows.get(sym) or {}
+                            validation_metrics["artifact_id"] = ver_path.name
+                            validation_metrics["train_outcome_max_id"] = train_outcome_max_id
+                            validation_metrics["holdout_excluded_from_training"] = bool(_window.get("n"))
+                            artifact["artifact_id"] = ver_path.name
+                            artifact["train_outcome_max_id"] = train_outcome_max_id
+                            artifact["holdout_window"] = validation_metrics.get("holdout_window") or {}
                             artifact["holdout_accuracy"] = validation_metrics.get("candidate_accuracy")
                             artifact["holdout_sample_count"] = validation_metrics.get("holdout_sample_count")
                             artifact["holdout_profit_after_cost"] = validation_metrics.get("candidate_profit_after_cost")
