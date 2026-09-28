@@ -268,3 +268,40 @@ def test_only_live_scalp_rows_with_a_venue_order_count_as_provenance(tmp_path):
     assert lot is not None
     assert lot["order_id"] == ORDER_ID
     assert lot["remaining"] == pytest.approx(0.009)
+
+
+def test_scalp_reentry_overwrites_original_position_cost(tmp_path):
+    from backend.services.portfolio_engine import PortfolioEngine
+
+    db = str(tmp_path / "cost.db")
+    _schema(db)
+    engine = PortfolioEngine.__new__(PortfolioEngine)
+    engine.db_path = db
+
+    def _write(qty, price, cost, trade_id):
+        conn = sqlite3.connect(db)
+        engine._scalp_v2_write_position_row(
+            conn,
+            symbol="ETH/USDT",
+            quantity=qty,
+            fill_price=price,
+            fee=0.0,
+            order_id=trade_id,
+            atr=1.0,
+            opportunity_id="opp",
+            decision_id="d",
+            reservation_id="",
+            client_order_id="",
+            trade_id=trade_id,
+            entry_time=1.0,
+            timestamp="2026-09-27T00:00:00+00:00",
+            original_cost=cost,
+        )
+        conn.commit()
+        row = conn.execute("SELECT quantity, original_position_cost FROM portfolio_engine_positions WHERE engine_id='SCALP_V2' AND symbol='ETH/USDT'").fetchall()
+        conn.close()
+        return row
+
+    assert _write(0.0144, 2675.0, 38.52, "t1") == [(0.0144, pytest.approx(38.52))]
+    assert _write(0.0171, 2671.0, 45.68, "t2") == [(0.0171, pytest.approx(45.68))]
+    assert _write(0.01, 2700.0, None, "t3") == [(0.01, pytest.approx(27.0))]

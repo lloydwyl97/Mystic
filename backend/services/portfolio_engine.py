@@ -9543,6 +9543,7 @@ class PortfolioEngine:
                     entry_client_order_id=client_order_id,
                     engine_id=SCALP_V2_ENGINE_ID,
                     scalp_opportunity_id=opportunity_id,
+                    original_position_cost=float(total_cost),
                 )
                 self.open_positions[make_position_key(SCALP_V2_ENGINE_ID, norm)] = position
                 with contextlib.suppress(Exception):
@@ -9574,6 +9575,7 @@ class PortfolioEngine:
                     reservation_id=str(reservation_id or ""),
                     client_order_id=client_order_id,
                     entry_time=float(position.entry_time),
+                    original_cost=float(total_cost),
                 )
                 # Canonical exchange-fill ledger (never reverses ownership on failure).
                 await _asyncio.to_thread(
@@ -9701,6 +9703,7 @@ class PortfolioEngine:
         reservation_id: str = "",
         client_order_id: str = "",
         entry_time: float | None = None,
+        original_cost: float | None = None,
     ) -> None:
         """Atomic DB commit for SCALP V2 BUY: paper_trades + positions + ledger."""
         from backend.services.scalp_v2.opportunity import mark_opportunity_on
@@ -9736,6 +9739,7 @@ class PortfolioEngine:
                     trade_id=trade_id,
                     entry_time=float(entry_time if entry_time is not None else time.time()),
                     timestamp=timestamp,
+                    original_cost=original_cost,
                 )
                 mark_opportunity_on(conn, symbol, opportunity_id, "OPEN")
 
@@ -9818,10 +9822,12 @@ class PortfolioEngine:
         trade_id: str,
         entry_time: float,
         timestamp: str,
+        original_cost: float | None = None,
     ) -> None:
         from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
         from backend.services.scalp_v2.identity_stamp import stamp_engine
 
+        cost = float(original_cost) if original_cost and float(original_cost) > 0 else float(quantity) * float(fill_price)
         _ensure_position_engine_identity(conn)
         conn.execute(
             """
@@ -9831,19 +9837,20 @@ class PortfolioEngine:
                  atr_at_entry, confidence_at_entry,
                  highest_price, lowest_price, entry_fee,
                  entry_decision_id, entry_reservation_id, entry_order_id, entry_client_order_id,
-                 status, engine_id, scalp_opportunity_id, last_updated)
+                 status, engine_id, scalp_opportunity_id, last_updated, original_position_cost)
             VALUES (?, ?, ?, ?, ?,
                     0, 0, 0,
                     ?, 0.5,
                     ?, ?, ?,
                     ?, ?, ?, ?,
-                    'ACTIVE', ?, ?, ?)
+                    'ACTIVE', ?, ?, ?, ?)
             ON CONFLICT(engine_id, symbol) DO UPDATE SET
                 quantity=excluded.quantity, entry_price=excluded.entry_price,
                 entry_time=excluded.entry_time, trade_id=excluded.trade_id,
                 atr_at_entry=excluded.atr_at_entry,
                 highest_price=excluded.highest_price, lowest_price=excluded.lowest_price,
                 entry_fee=excluded.entry_fee,
+                original_position_cost=excluded.original_position_cost,
                 entry_decision_id=excluded.entry_decision_id,
                 entry_reservation_id=excluded.entry_reservation_id,
                 entry_order_id=excluded.entry_order_id,
@@ -9869,6 +9876,7 @@ class PortfolioEngine:
                 SCALP_V2_ENGINE_ID,
                 opportunity_id,
                 timestamp,
+                cost,
             ),
         )
         stamp_engine(
