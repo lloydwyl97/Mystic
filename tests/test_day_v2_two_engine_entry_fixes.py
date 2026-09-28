@@ -104,3 +104,30 @@ async def test_direct_entry_passes_own_reservation_to_budget(monkeypatch):
     signal = SimpleNamespace(symbol="SOLUSDT", atr=1.0, signal_bar_ts=0, structural_anchor=119.0, setup="S", opportunity_id="o")
     assert await le.submit_day_v2_direct_entry(engine, signal=signal, ask_price=120.0, quantity=0.3, reservation_id="res-1") is None
     assert seen["exclude_reservation_id"] == "res-1"
+
+
+def test_day_btc_blocks_second_day_btc_while_scalp_btc_is_independent():
+    both = {"DAY_V2::BTC/USDT": _lot("DAY_V2"), "SCALP_V2::BTC/USDT": _lot("SCALP_V2")}
+    assert "BTCUSDT" in day_v2_held_symbols(both)
+    assert "BTCUSDT" not in day_v2_held_symbols({"SCALP_V2::BTC/USDT": _lot("SCALP_V2")})
+
+
+@pytest.mark.parametrize("equity", [200.0, 320.0, 500.0, 1000.0])
+def test_own_reservation_never_double_counts_at_any_equity(tmp_path, monkeypatch, equity):
+    import backend.services.two_engine_capital as tec
+
+    monkeypatch.setattr(tec, "get_capital_shares", lambda: (0.5, 0.5))
+    notional = round(equity * 0.5 * 0.9, 2)
+    db = str(tmp_path / "res.db")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE day_entry_reservations (reservation_id TEXT, sleeve TEXT, notional_usd REAL, expires_at REAL, status TEXT)")
+    conn.execute("INSERT INTO day_entry_reservations VALUES ('own', 'DAY_V2', ?, ?, 'ACTIVE')", (notional, time.time() + 3600))
+    conn.commit()
+    conn.close()
+    assert check_engine_budget(db, "DAY_V2", notional, equity, equity, {})[0] is False
+    ok, reason, snap = check_engine_budget(db, "DAY_V2", notional, equity, equity, {}, exclude_reservation_id="own")
+    assert (ok, reason) == (True, "")
+    assert snap.day.remaining_budget == pytest.approx(equity * 0.5)
+    # a DAY reservation never consumes SCALP's half
+    ok, _, snap = check_engine_budget(db, "SCALP_V2", notional, equity, equity, {})
+    assert ok and snap.scalp.committed_reservations == 0.0
