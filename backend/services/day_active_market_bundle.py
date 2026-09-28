@@ -21,6 +21,7 @@ from backend.config.day_active_timeframes import (
     min_bars_for_day_tf,
 )
 from backend.config.mystic_api_schedule import DAY_BUNDLE_CACHE_TTL_SEC
+from backend.utils.position_keys import venue_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 
 
 def _normalize_ccxt_symbol(ccxt_symbol: str) -> str:
-    s = str(ccxt_symbol or "").strip().upper()
+    s = venue_symbol(ccxt_symbol).strip().upper()
     if "/" in s:
         return s
     if s.endswith("USDT") and len(s) > 4:

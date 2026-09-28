@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import re
 
+from backend.utils.position_keys import venue_symbol
+
 # Valid quote currencies (Binance.US only supports USDT for crypto pairs)
 VALID_QUOTES = {"USDT", "USD", "BTC", "ETH"}
 DEFAULT_QUOTE = "USDT"
@@ -59,8 +61,8 @@ class CanonicalSymbolFormatter:
         if not symbol or not isinstance(symbol, str):
             raise SymbolFormatError(f"Invalid symbol: {symbol}")
 
-        # Clean and uppercase
-        s = str(symbol).strip().upper()
+        # Engine-scoped position keys ('SCALP_V2::BTC/USDT') parse as their market symbol.
+        s = venue_symbol(symbol).strip().upper()
 
         if not s:
             raise SymbolFormatError("Empty symbol after cleaning")

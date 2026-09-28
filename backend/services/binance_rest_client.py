@@ -26,6 +26,7 @@ from backend.utils.binance_weight_limiter import (
     BinanceWeightLimiter,
     CircuitOpen,
 )
+from backend.utils.position_keys import venue_symbol
 
 # Import from single source of truth
 try:
@@ -76,7 +77,7 @@ def _normalize_symbol(symbol: str) -> str:
     Normalize user input to raw 'BTCUSDT' form and enforce Top-10.
     Accepts 'BTCUSDT', 'BTC/USDT', 'BTC-USD' (mapped to USDT).
     """
-    s = symbol.strip().upper()
+    s = venue_symbol(symbol).strip().upper()
     if "/" in s:
         base, _quote = s.split("/", 1)
         s = f"{base}USDT"

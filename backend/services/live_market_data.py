@@ -48,6 +48,7 @@ from backend.utils.binance_weight_limiter import (
     CircuitOpenError,
     RateLimitedError,
 )
+from backend.utils.position_keys import venue_symbol
 
 # Optional imports - try at top level
 try:
@@ -73,7 +74,7 @@ def _to_ccxt_symbol(s: str) -> str:
         msg = "to_ccxt_symbol not available"
         raise RuntimeError(msg)
 
-    return to_ccxt_symbol(s)
+    return to_ccxt_symbol(venue_symbol(s))
 
 
 def _to_binance_pair(s: str) -> str:
@@ -82,7 +83,7 @@ def _to_binance_pair(s: str) -> str:
         msg = "symbol conversion functions not available"
         raise RuntimeError(msg)
 
-    return to_exchange_symbol(to_ccxt_symbol(s))
+    return to_exchange_symbol(to_ccxt_symbol(venue_symbol(s)))
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -493,7 +494,7 @@ class LiveMarketDataService:
         # Normalize symbol to proper CCXT format first
         from backend.utils.symbols import normalize_symbol
 
-        s = normalize_symbol(ccxt_symbol)
+        s = normalize_symbol(venue_symbol(ccxt_symbol))
         t: dict | None = None
         try:
             limiter = await self._get_limiter()
@@ -627,7 +628,7 @@ class LiveMarketDataService:
         """
         s = _to_ccxt_symbol(ccxt_symbol)
         cache_key = self._ohlcv_cache_key(s, timeframe, limit)
-        symbol = ccxt_symbol.replace("/", "").replace("-", "")
+        symbol = s.replace("/", "").replace("-", "")
         try:
             from backend.services.canonical_candle_store import load_aligned_candles
 

@@ -108,7 +108,9 @@ def to_exchange_symbol(symbol: str) -> str:
         if not symbol:
             return symbol
 
-        s = str(symbol).strip().upper()
+        from backend.utils.position_keys import venue_symbol
+
+        s = venue_symbol(symbol).strip().upper()
 
         # If contains slash, split and fix
         if "/" in s:

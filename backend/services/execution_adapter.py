@@ -44,6 +44,7 @@ from backend.config.trading_mode import (
 )
 from backend.config.trading_universe import DAY_TRADE_SYMBOLS
 from backend.utils.binance_limited_http import limited_binance_get
+from backend.utils.position_keys import venue_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ def _to_api_symbol(symbol: str) -> str:
     """Normalize any symbol form to Binance.US API form (BTCUSDT)."""
     if not symbol:
         return ""
-    s = symbol.replace("/", "").replace("-", "").replace("_", "").upper()
+    s = venue_symbol(symbol).replace("/", "").replace("-", "").replace("_", "").upper()
     if s.endswith("USD") and not s.endswith("USDT"):
         s = s[:-3] + "USDT"
     return s

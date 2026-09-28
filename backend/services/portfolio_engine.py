@@ -110,6 +110,7 @@ from backend.services.risk_governor import (
     CandidateInfo,
     RiskGovernor,
 )
+from backend.utils.position_keys import POSITION_KEY_SEP, split_engine_key, venue_symbol
 from backend.utils.sqlite_runtime import connect_managed, connect_ro, connect_rw, is_locked_error, run_locked_retry
 from backend.utils.symbols import normalize_symbol
 
@@ -174,7 +175,6 @@ MAX_OPEN_PER_SYMBOL = 1  # Hard limit: never stack positions on same symbol
 DAY_MAX_OPEN_POSITIONS = 4
 SCALP_MAX_OPEN_POSITIONS = 4
 COMBINED_ENGINE_MAX_POSITIONS = 8
-POSITION_KEY_SEP = "::"
 
 
 def make_position_key(engine_id: str, symbol: str) -> str:
@@ -185,10 +185,10 @@ def make_position_key(engine_id: str, symbol: str) -> str:
 
 def split_position_key(key: str) -> tuple[str, str]:
     """Split a position key back into (engine_id, symbol)."""
-    parts = str(key or "").rsplit(POSITION_KEY_SEP, 1)
-    if len(parts) == 2:
-        return parts[0], parts[1]
-    return "", normalize_symbol(str(key or ""))
+    s = str(key or "")
+    if POSITION_KEY_SEP in s:
+        return split_engine_key(s)
+    return "", normalize_symbol(s)
 
 
 DAY_SIDE_ENGINES = ("DAY_V2", "LEGACY_DAY_LIVE", "LEGACY_EXIT_ONLY")
@@ -493,7 +493,7 @@ def _to_api_symbol(symbol: str) -> str:
     """Normalize any internal symbol form to Binance.US API form (BTCUSDT)."""
     if not symbol:
         return symbol
-    s = symbol.replace("/", "").replace("-", "").replace("_", "").upper()
+    s = venue_symbol(symbol).replace("/", "").replace("-", "").replace("_", "").upper()
     return s
 
 
@@ -10906,7 +10906,7 @@ class PortfolioEngine:
         live_order_buy = None
         if self._live_execution_enabled and self._live_service and can_place_live_orders_sync()[0]:
             try:
-                exchange_symbol = symbol.replace("/", "")
+                exchange_symbol = _to_api_symbol(symbol)
                 logger.warning(
                     "LIVE_BUY: Protected limit %s qty=%.6f limit=%.8f",
                     exchange_symbol,

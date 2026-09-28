@@ -22,6 +22,7 @@ from backend.utils.binance_weight_limiter import (
     RateLimitedError,
 )
 from backend.utils.exceptions import APIError
+from backend.utils.position_keys import venue_symbol
 
 # Optional imports - try at top level
 try:
@@ -61,7 +62,7 @@ def _to_binance_pair(sym: str) -> str:
     symbols, and ``...USD`` quote forms; returns the canonical ``...USDT``
     Binance.US pair. Strings already in API form are returned unchanged.
     """
-    s = (sym or "").strip().upper()
+    s = venue_symbol(sym).strip().upper()
     if not s:
         return s
     s = s.replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
