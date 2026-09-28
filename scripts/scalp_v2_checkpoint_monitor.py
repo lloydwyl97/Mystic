@@ -754,9 +754,9 @@ def _generate_report(trades: list[dict], conn: sqlite3.Connection, db_path: str)
         }
 
     # --- Giveback counterfactual ---
-    cf_rows = conn.execute("SELECT * FROM scalp_v2_giveback_cf WHERE cf_audit_superseded = 0").fetchall()
-    cf_cols = [d[0] for d in conn.execute("PRAGMA table_info(scalp_v2_giveback_cf)").fetchall()]
-    cf_list = [dict(zip(cf_cols, r, strict=False)) for r in cf_rows]
+    cf_cur = conn.execute("SELECT * FROM scalp_v2_giveback_cf WHERE cf_audit_superseded = 0")
+    cf_cols = [d[0] for d in cf_cur.description]
+    cf_list = [dict(zip(cf_cols, r, strict=False)) for r in cf_cur.fetchall()]
 
     computed_rows = [r for r in cf_list if (r.get("cf_status") or "") in ("COMPUTED", "INTRABAR_AMBIGUOUS", "COMPUTED_TIME_STOP_ONLY")]
     unavailable_rows = [r for r in cf_list if (r.get("cf_status") or "") == "UNAVAILABLE"]
@@ -789,10 +789,10 @@ def _generate_report(trades: list[dict], conn: sqlite3.Connection, db_path: str)
         )
     cf_summary["rows"] = [
         {
-            "trade_id": r["trade_id"],
-            "symbol": r["symbol"],
+            "trade_id": r.get("trade_id") or "UNAVAILABLE",
+            "symbol": r.get("symbol"),
             "cf_status": r.get("cf_status"),
-            "actual_pnl": r["pnl_usd_net"],
+            "actual_pnl": r.get("pnl_usd_net"),
             "cf_pnl": r.get("cf_pnl_usd_net"),
             "cf_exit": r.get("cf_first_exit"),
             "cf_remaining_hold_sec": r.get("cf_remaining_hold_sec"),

@@ -167,3 +167,64 @@ def test_compute_cf_remaining_hold_sec_correct():
     # Actual hold = 600s; remaining = PROD_MAX_HOLD_SEC - 600
     expected_remaining = _PROD_MAX_HOLD_SEC - 600.0
     assert result["cf_remaining_hold_sec"] == pytest.approx(expected_remaining, abs=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint report generation
+# ---------------------------------------------------------------------------
+
+
+def _report_db() -> sqlite3.Connection:
+    from scripts.scalp_v2_checkpoint_monitor import _ensure_schema, _migrate_cf_schema
+
+    conn = sqlite3.connect(":memory:")
+    _ensure_schema(conn)
+    _migrate_cf_schema(conn)
+    conn.execute("CREATE TABLE portfolio_engine_ledger (id INTEGER PRIMARY KEY, principal REAL, cash_balance REAL, realized_pnl REAL, total_equity REAL)")
+    conn.execute("INSERT INTO portfolio_engine_ledger VALUES (1, 228.07, 121.36, 0.0, 256.21)")
+    return conn
+
+
+def _closed(symbol: str, pnl: float, exit_reason: str) -> dict:
+    return {
+        "symbol": symbol,
+        "pnl_usd_net": pnl,
+        "fees_paid": 0.01,
+        "hold_time_seconds": 600,
+        "timestamp": "2026-09-27T23:00:00+00:00",
+        "exit_reason": exit_reason,
+        "scalp_opportunity_id": "opp-1",
+    }
+
+
+def test_generate_report_reads_giveback_rows_by_column_name():
+    """Regression: columns came from PRAGMA table_info index (cid), so every
+    giveback row was keyed 0..N and report generation crashed with
+    KeyError: 'trade_id' at CHECKPOINT_100_REACHED (Ocean 2026-09-27)."""
+    from scripts.scalp_v2_checkpoint_monitor import _generate_report
+
+    conn = _report_db()
+    conn.execute(
+        "INSERT INTO scalp_v2_giveback_cf (trade_id, symbol, pnl_usd_net, cf_status, cf_pnl_usd_net, cf_first_exit, cf_saved_or_cost) VALUES (?,?,?,?,?,?,?)",
+        ("mystic_sell_BTC/USDT_1", "BTC/USDT", -0.05, "COMPUTED", 0.02, "NET_PROFIT", -0.07),
+    )
+    trades = [_closed("BTC/USDT", 0.10, "NET_PROFIT_EXIT"), _closed("ETH/USDT", -0.05, "GIVEBACK_EXIT")]
+
+    report = _generate_report(trades, conn, ":memory:")
+
+    cf = report["giveback_counterfactual"]
+    assert cf["cf_computed"] == 1
+    assert cf["computed_actual_total_pnl"] == pytest.approx(-0.05)
+    assert cf["rows"][0]["trade_id"] == "mystic_sell_BTC/USDT_1"
+    assert cf["rows"][0]["symbol"] == "BTC/USDT"
+
+
+def test_generate_report_marks_missing_trade_id_unavailable():
+    from scripts.scalp_v2_checkpoint_monitor import _generate_report
+
+    conn = _report_db()
+    conn.execute("INSERT INTO scalp_v2_giveback_cf (trade_id, symbol, pnl_usd_net, cf_status) VALUES (NULL, 'XRP/USDT', -0.01, 'UNAVAILABLE')")
+
+    report = _generate_report([_closed("XRP/USDT", -0.01, "GIVEBACK_EXIT")], conn, ":memory:")
+
+    assert report["giveback_counterfactual"]["rows"][0]["trade_id"] == "UNAVAILABLE"
