@@ -2026,6 +2026,19 @@ class PortfolioEngineIntegration:
             logger.debug("SCALP_V2_LIVE_CONFIG_ERROR", exc_info=True)
             return
 
+        from backend.services.scalp_v2.loss_breaker import check_scalp_loss_breaker
+        from backend.services.two_engine_capital import get_capital_shares
+
+        try:
+            scalp_share = get_capital_shares()[1]
+        except ValueError:
+            scalp_share = 0.5
+        principal = float(getattr(self.engine, "principal", 0.0) or 0.0) * scalp_share
+        breaker = check_scalp_loss_breaker(self.engine.db_path, cfg, principal=principal)
+        if breaker.halt:
+            logger.warning("SCALP_V2_BREAKER halt=True reason=%s until=%s %s", breaker.reason, breaker.recovery_until, breaker.detail)
+            return
+
         try:
             from backend.services.binance_scalp.scalp_signal_engine import get_router
 

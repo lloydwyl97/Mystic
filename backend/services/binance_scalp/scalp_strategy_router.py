@@ -293,6 +293,10 @@ class ScalpStrategyRouter:
         if best_ranked is None:
             meta["hard_block"] = "NO_CANDIDATES"
             return None, signals, meta
+        if best_ranked.signal.setup_name not in enabled_names and best_ranked.entry_eligible:
+            from dataclasses import replace as _replace_disabled
+
+            best_ranked = _replace_disabled(best_ranked, entry_eligible=False, hard_block="STRATEGY_NOT_ENABLED")
         meta["setup_evidence_delta"] = evidence_rank_delta(measurements)
 
         meta["reachability_surplus"] = best_ranked.reachability_surplus
