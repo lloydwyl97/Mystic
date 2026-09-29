@@ -193,6 +193,18 @@ def record_external_balance_event(
     return bool(cur.rowcount)
 
 
+def zero_lot_remaining(conn: sqlite3.Connection, source_trade_id: str) -> int:
+    """The venue no longer holds this lot's residue; its BUY row has nothing left."""
+    try:
+        cur = conn.execute(
+            "UPDATE paper_trades SET remaining_position=0 WHERE trade_id=? AND UPPER(side)='BUY' AND COALESCE(remaining_position,0)>0",
+            (str(source_trade_id or ""),),
+        )
+    except sqlite3.OperationalError:
+        return 0
+    return int(cur.rowcount or 0)
+
+
 def retire_held_dust(conn: sqlite3.Connection, source_trade_id: str, *, event_class: str, venue_ref: str = "") -> bool:
     if event_class not in EXTERNAL_EVENT_CLASSES:
         raise ValueError(f"not an external balance event class: {event_class}")
@@ -201,6 +213,8 @@ def retire_held_dust(conn: sqlite3.Connection, source_trade_id: str, *, event_cl
         f"UPDATE {DUST_TABLE} SET status=?, retired_class=?, retired_ref=?, retired_at=? WHERE source_trade_id=? AND status=?",
         (STATUS_RETIRED, event_class, str(venue_ref or ""), _now(), str(source_trade_id or ""), STATUS_HELD),
     )
+    if cur.rowcount:
+        zero_lot_remaining(conn, source_trade_id)
     return bool(cur.rowcount)
 
 

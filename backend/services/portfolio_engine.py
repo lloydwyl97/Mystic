@@ -7491,6 +7491,7 @@ class PortfolioEngine:
             ensure_schema,
             match_dust_conversion,
             record_external_balance_event,
+            zero_lot_remaining,
         )
 
         sym = normalize_symbol(symbol)
@@ -7536,6 +7537,7 @@ class PortfolioEngine:
                     venue_time_utc=str((match or {}).get("operate_time_utc") or ""),
                     evidence=match or {"venue_log": "unavailable" if rows is None else "no_matching_conversion"},
                 )
+                zero_lot_remaining(conn, trade_id)
                 conn.commit()
 
         await asyncio.to_thread(_write)

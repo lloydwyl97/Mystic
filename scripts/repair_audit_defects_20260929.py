@@ -44,6 +44,7 @@ from backend.services.engine_strategy_dust import (
     match_dust_conversion,
     record_external_balance_event,
     retire_held_dust,
+    zero_lot_remaining,
 )
 from backend.services.engine_strategy_dust import (
     ensure_schema as ensure_dust_schema,
@@ -354,7 +355,7 @@ def plan_inventory(conn: sqlite3.Connection, dust_log: list[dict[str, Any]]) -> 
     for p in conn.execute("SELECT engine_id, symbol, trade_id, quantity, entry_time, status FROM portfolio_engine_positions WHERE status='DUST_PENDING'").fetchall():
         conv = match_dust_conversion(dust_log, asset=str(p["symbol"]).split("/")[0], after_epoch=float(p["entry_time"] or 0.0))
         plan["phantom"].append({**dict(p), "conversion": conv})
-    xrp = next((o for o in plan["overwritten"] if o["symbol"] == "XRP/USDT"), None)
+    xrp = next((o for o in plan["overwritten"] if o["symbol"] == "XRP/USDT" and not o["exists"]), None)
     prot = conn.execute("SELECT symbol, quantity, cost_price, source_trade_id FROM protected_external_inventory WHERE symbol='XRP/USDT'").fetchone()
     if xrp and prot:
         plan["protected"].append({"symbol": "XRP/USDT", "before": float(prot["quantity"]), "after": round(float(prot["quantity"]) - float(xrp["qty"]), 12), "source_trade_id": prot["source_trade_id"]})
@@ -423,6 +424,11 @@ def apply_inventory(conn: sqlite3.Connection, plan: dict[str, Any], exchange_fre
         )
         conn.execute("DELETE FROM portfolio_engine_positions WHERE trade_id=? AND status='DUST_PENDING'", (p["trade_id"],))
         done.append(f"phantom {p['engine_id']} {p['symbol']} {p['trade_id']} {p['quantity']} -> RETIRED {EVENT_CONVERSION} tranId={conv['tran_id']}")
+    for (tid,) in conn.execute("SELECT DISTINCT source_trade_id FROM external_balance_events WHERE source_trade_id != ''").fetchall():
+        for (buy_id,) in conn.execute("SELECT id FROM paper_trades WHERE trade_id=? AND UPPER(side)='BUY' AND COALESCE(remaining_position,0)>0", (tid,)).fetchall():
+            _backup(conn, "paper_trades", "id", buy_id, "retired_lot_remaining_zero", REASON)
+        if zero_lot_remaining(conn, tid):
+            done.append(f"buy remaining_position -> 0 for retired {tid}")
     return done
 
 
@@ -467,6 +473,8 @@ async def fetch_chunk_truth(ex: Any, item: dict[str, Any]) -> dict[str, Any] | N
 
 def apply_chunk(conn: sqlite3.Connection, item: dict[str, Any], v: dict[str, Any]) -> dict[str, Any] | None:
     f, paper = item["fill"], item["paper"]
+    if conn.execute(f"SELECT 1 FROM {CHUNKS} WHERE sell_fill_row_id=? LIMIT 1", (f["id"],)).fetchone():
+        return None
     missing = fee_correction(float(f["fee_amount"] or 0.0), v)
     if missing is None:
         return None

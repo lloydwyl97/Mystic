@@ -170,6 +170,18 @@ def test_i_reentry_preserves_engine_dust(tmp_path):
         assert len(esd.held_lots(c, "XRP/USDT")) == 1
 
 
+def test_i2_retired_held_dust_leaves_no_remaining_on_its_buy(tmp_path):
+    db = _positions_db(tmp_path)
+    with sqlite3.connect(db) as c:
+        c.execute("CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, trade_id TEXT, side TEXT, remaining_position REAL)")
+        c.execute("INSERT INTO paper_trades VALUES (1,'old','BUY',0.0009166), (2,'other','BUY',0.5)")
+        c.execute("INSERT INTO portfolio_engine_positions VALUES ('SCALP_V2','SOL/USDT','old',0.0009166,200,'DUST_PENDING',1,'o1')")
+        esd.preserve_overwritten_dust(c, engine_id="SCALP_V2", symbol="SOL/USDT", new_trade_id="new")
+        assert esd.retire_held_dust(c, "old", event_class=esd.EVENT_CONVERSION, venue_ref="2468948737")
+        assert c.execute("SELECT remaining_position FROM paper_trades ORDER BY id").fetchall() == [(0,), (0.5,)]
+        assert not esd.retire_held_dust(c, "old", event_class=esd.EVENT_CONVERSION)
+
+
 def test_j_active_row_or_same_trade_is_not_preserved(tmp_path):
     db = _positions_db(tmp_path)
     with sqlite3.connect(db) as c:
@@ -262,6 +274,11 @@ def test_o_external_event_never_a_manual_sell(tmp_path):
 async def _phantom_engine(tmp_path, rows):
     db = tmp_path / "ph.db"
     _init_test_db(db, cash=1000.0)
+    with sqlite3.connect(db) as c:
+        c.execute(
+            "INSERT INTO paper_trades (trade_id, paper_run_id, mode, symbol, side, quantity, price, remaining_position, timestamp, status, strategy_id) "
+            "VALUES ('mystic_BTC/USDT_1790679671164', 'r', 'live', 'BTC/USDT', 'BUY', 0.00076985, 60000, 9.85e-06, datetime('now'), 'executed', 'day')"
+        )
     engine = PortfolioEngine(db_path=str(db), principal=1000.0, test_mode=True)
     await engine.initialize_from_db()
     pos = OpenPosition(
@@ -299,6 +316,8 @@ async def test_p_phantom_dust_retired_as_conversion_without_pnl_or_learning(tmp_
     assert await engine._retire_phantom_strategy_dust("BTC/USDT", pos, source="test") is True
     assert "DAY_V2::BTC/USDT" not in engine.open_positions
     assert _events(db) == [(esd.EVENT_CONVERSION, "2468948736", 9.85e-06)]
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT remaining_position FROM paper_trades WHERE trade_id=?", (pos.trade_id,)).fetchone()[0] == 0
     engine._record_learning_outcome.assert_not_awaited()
     engine._record_position_close_ledger.assert_not_awaited()
     engine.record_sell_cooldown.assert_not_called()
