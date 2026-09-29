@@ -402,6 +402,19 @@ def _outcome_exit_class_multiplier(row: dict[str, Any], y_label: int) -> float:
     return 1.0
 
 
+def training_label_boundary(outcome_rows: list[dict[str, Any]] | None, self_rows: list[dict[str, Any]] | None) -> tuple[int, int, int, int]:
+    """Identity of the labeled data a retrain would see.
+
+    Equal boundaries mean no new closed-trade outcome and no new labeled bar, so
+    a retrain would refit the same data and only churn candidates.
+    """
+    oc = list(outcome_rows or [])
+    sr = list(self_rows or [])
+    oc_max = max((int(r.get("id") or 0) for r in oc), default=0)
+    labeled = {(str(r.get("symbol") or ""), int(r.get("label_anchor_4h_open_ms") or 0)) for r in sr if isinstance(r, dict)}
+    return (oc_max, len(oc), max((a for _s, a in labeled), default=0), len(labeled))
+
+
 def _exclude_promotion_holdout(
     outcome_rows: list[dict[str, Any]] | None,
     strategy_id: str,
@@ -1484,6 +1497,13 @@ class AITrainingDataPipeline:
                     w_oc = np.array([])
                     train_outcome_rows, holdout_windows = _exclude_promotion_holdout(outcome_rows, strat, target_dim, feature_version_used)
                     train_outcome_max_id = max((int(r.get("id") or 0) for r in train_outcome_rows), default=0)
+                    boundary = training_label_boundary(outcome_rows, rows_with_sym)
+                    seen = self.__dict__.setdefault("_last_training_boundary", {})
+                    if seen.get(strat) == boundary:
+                        logger.info("NO_NEW_LABELS_SKIP strategy=%s boundary=%s", strat, boundary)
+                        self.performance_metrics["no_new_labels_skips"] = int(self.performance_metrics.get("no_new_labels_skips") or 0) + 1
+                        continue
+                    seen[strat] = boundary
                     if train_outcome_rows:
                         X_oc, y_oc, sym_oc, w_oc = _outcome_rows_to_xy_for_strategy(train_outcome_rows, strat, target_dim=target_dim)
                         if len(X_oc) > 0:
