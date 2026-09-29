@@ -7217,6 +7217,11 @@ class PortfolioEngine:
         """
         if all(v is not position for v in self.open_positions.values()) and symbol not in self.open_positions:
             return
+        from backend.services.protected_external_inventory import is_strategy_engine
+
+        if is_strategy_engine(str(getattr(position, "engine_id", "") or "")):
+            await self._handle_vanished_strategy_lot(symbol, position, source=source)
+            return
         pos_status = getattr(position, "status", "ACTIVE") or "ACTIVE"
         now_epoch = time.time()
         cooldown_until = now_epoch + float(POST_SELL_COOLDOWN_WALL_SEC)
@@ -7263,6 +7268,54 @@ class PortfolioEngine:
                 dust_notional=(float(position.quantity or 0.0) * float(position.entry_price or 0.0)),
             )
             return
+
+    async def _handle_vanished_strategy_lot(self, symbol: str, position: OpenPosition, *, source: str) -> None:
+        """A DAY_V2 / SCALP_V2 lot the exchange snapshot does not show.
+
+        Nobody sells strategy inventory outside Mystic, so this is never a
+        HUMAN_MANUAL_SELL. A lot whose own fills are fully sold is dropped with
+        no close row (its real SELL is already booked). Anything else is an
+        unexplained shortfall: the lot is kept, nothing is booked or learned.
+        """
+        owned = self._fill_owned_qty(position)
+        constraints = self._symbol_constraints.get(normalize_symbol(symbol)) or {}
+        step = float(constraints.get("qty_step") or 0)
+        tol = step / 2.0 if step > 0 else 1e-10
+        trade_id = str(getattr(position, "trade_id", "") or "")
+        engine_id = str(getattr(position, "engine_id", "") or "")
+        if owned is not None and owned <= tol:
+            async with self._deletion_lock:
+                key = next((k for k, v in self.open_positions.items() if v is position), None)
+                if key is not None:
+                    del self.open_positions[key]
+                await self._delete_position_from_sqlite(normalize_symbol(symbol), engine_id)
+                await self._recompute_positions_values()
+                self._compute_total_open_risk()
+                await self._persist_ledger_to_sqlite()
+            logger.warning(
+                "STRATEGY_LOT_FILLS_FULLY_SOLD symbol=%s engine=%s trade_id=%s booked=%.12g fill_owned=%.12g source=%s — lot dropped, no close booked",
+                symbol,
+                engine_id,
+                trade_id,
+                float(position.quantity or 0),
+                owned,
+                source,
+            )
+            return
+        seen = self.__dict__.setdefault("_vanish_alerted", {})
+        now = time.time()
+        if now - float(seen.get(trade_id, 0.0)) >= 600.0:
+            seen[trade_id] = now
+            logger.critical(
+                "STRATEGY_LOT_VANISH_UNEXPLAINED symbol=%s engine=%s trade_id=%s booked=%.12g fill_owned=%s source=%s — lot kept, no close booked",
+                symbol,
+                engine_id,
+                trade_id,
+                float(position.quantity or 0),
+                owned,
+                source,
+            )
+            await self._record_reject(normalize_symbol(symbol), "SELL", "STRATEGY_LOT_VANISH_UNEXPLAINED", "RECONCILE")
 
     async def _book_human_manual_sell_and_continue(
         self,
@@ -7445,19 +7498,13 @@ class PortfolioEngine:
                         str(fill.get("trade_id") or "") or None,
                     ),
                 )
+                # Only this lot's BUY: other engines' lots on the symbol stay open.
                 if buy_tid:
                     cur.execute(
                         """UPDATE paper_trades SET remaining_position = 0
                            WHERE trade_id = ? AND side = 'BUY'""",
                         (buy_tid,),
                     )
-                cur.execute(
-                    """UPDATE paper_trades SET remaining_position = 0
-                       WHERE side = 'BUY' AND remaining_position > 0
-                         AND replace(replace(upper(symbol), '/', ''), '-', '')
-                             = replace(replace(upper(?), '/', ''), '-', '')""",
-                    (normalized,),
-                )
                 conn.commit()
 
         loop = asyncio.get_running_loop()

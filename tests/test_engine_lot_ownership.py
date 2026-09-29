@@ -479,3 +479,70 @@ async def test_v_xrp_remainder_with_no_lot_stays_protected(tmp_path):
     assert not eng._symbol_lots("XRP/USDT")
     rows = {r["symbol"]: float(r["quantity"]) for r in list_protected(eng.db_path)}
     assert rows["XRP/USDT"] == pytest.approx(28.5)
+
+
+# ------------------------------------------- vanished lots are never human sells
+def _sell_rows(db: str) -> list[tuple]:
+    with sqlite3.connect(db) as conn:
+        return conn.execute("SELECT exit_type, symbol, quantity FROM paper_trades WHERE side='SELL'").fetchall()
+
+
+@pytest.mark.parametrize("engine_id", [DAY, SCALP])
+async def test_stale_snapshot_never_books_a_human_sell_for_a_strategy_lot(tmp_path, engine_id):
+    """Ocean rows 2622/2635: a lot bought 9-11s earlier looked vanished in a pre-fill snapshot."""
+    eng = _engine(tmp_path, {"XRP": 0.09548})
+    eng._record_reject = AsyncMock()
+    _fill(eng.db_path, "fresh_xrp", "XRP/USDT", "BUY", 26.3, 1.5046, fee=0.00526, fee_asset="XRP")
+    lot = _lot("XRP/USDT", engine_id, qty=26.29474, price=1.5046, trade_id="fresh_xrp")
+    eng.open_positions[make_position_key(engine_id, "XRP/USDT")] = lot
+    await eng._handle_vanished_exchange_position("XRP/USDT", lot, source="periodic_reconcile")
+    assert eng.open_positions[make_position_key(engine_id, "XRP/USDT")] is lot
+    assert lot.quantity == pytest.approx(26.29474)
+    assert _sell_rows(eng.db_path) == []
+    reasons = [c.args[2] for c in eng._record_reject.await_args_list]
+    assert "STRATEGY_LOT_VANISH_UNEXPLAINED" in reasons
+
+
+async def test_reconcile_zero_balance_keeps_strategy_lot_and_books_nothing(tmp_path):
+    eng = _engine(tmp_path, {"XRP": 0.0})
+    eng._record_reject = AsyncMock()
+    _fill(eng.db_path, "fresh_xrp", "XRP/USDT", "BUY", 26.3, 1.5046)
+    lot = _lot("XRP/USDT", SCALP, qty=26.3, price=1.5046, trade_id="fresh_xrp")
+    eng.open_positions[make_position_key(SCALP, "XRP/USDT")] = lot
+    await eng.run_live_reconcile({"XRP": 0.0}, free_balances={"XRP": 0.0})
+    assert make_position_key(SCALP, "XRP/USDT") in eng.open_positions
+    assert _sell_rows(eng.db_path) == []
+
+
+async def test_strategy_lot_fully_sold_by_its_own_fills_is_dropped_without_a_close(tmp_path):
+    eng = _engine(tmp_path)
+    eng._delete_position_from_sqlite = AsyncMock()
+    _fill(eng.db_path, "sold_eth", "ETH/USDT", "BUY", 0.0094, 2700.0)
+    _fill(eng.db_path, "sold_eth", "ETH/USDT", "SELL", 0.0094, 2710.0)
+    lot = _lot("ETH/USDT", SCALP, qty=0.00193746, status="DUST_PENDING", trade_id="sold_eth")
+    eng.open_positions[make_position_key(SCALP, "ETH/USDT")] = lot
+    await eng._handle_vanished_exchange_position("ETH/USDT", lot, source="periodic_reconcile")
+    assert make_position_key(SCALP, "ETH/USDT") not in eng.open_positions
+    assert _sell_rows(eng.db_path) == []
+    eng._delete_position_from_sqlite.assert_awaited_with("ETH/USDT", SCALP)
+
+
+async def test_legacy_human_close_row_never_zeroes_a_sibling_buy(tmp_path):
+    eng = _engine(tmp_path)
+    with sqlite3.connect(eng.db_path) as conn:
+        have = {r[1] for r in conn.execute("PRAGMA table_info(paper_trades)")}
+        for col in ("entry_price", "pnl", "pnl_pct", "hold_time_seconds", "fees_paid", "slippage_cost", "exit_type", "exit_reason", "strategy_id", "order_id"):
+            if col not in have:
+                conn.execute(f"ALTER TABLE paper_trades ADD COLUMN {col}")
+        for tid in ("legacy_xrp", "scalp_xrp"):
+            conn.execute(
+                "INSERT INTO paper_trades (trade_id, paper_run_id, mode, symbol, side, quantity, price, remaining_position, timestamp, status)"
+                " VALUES (?, 't', 'live', 'XRP/USDT', 'BUY', 10, 1.5, 10, '2026-09-28T00:00:00+00:00', 'executed')",
+                (tid,),
+            )
+    lot = _lot("XRP/USDT", "", qty=10.0, price=1.5, trade_id="legacy_xrp")
+    with patch("backend.services.portfolio_engine.get_paper_trading_service", return_value=MagicMock(paper_run_id="t")):
+        await eng._write_human_sell_close_row("XRP/USDT", lot, fill={}, source="periodic_reconcile")
+    with sqlite3.connect(eng.db_path) as conn:
+        remaining = dict(conn.execute("SELECT trade_id, remaining_position FROM paper_trades WHERE side='BUY'").fetchall())
+    assert remaining == {"legacy_xrp": 0.0, "scalp_xrp": 10.0}
