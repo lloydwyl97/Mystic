@@ -717,6 +717,9 @@ def _price_regime_behavior_split_enabled() -> bool:
 POST_SELL_COOLDOWN_BARS = int(os.getenv("POST_SELL_COOLDOWN_BARS", "40"))  # Block same symbol for N bars after sell (reduce churn)
 GLOBAL_SELL_COOLDOWN_BARS = int(os.getenv("GLOBAL_SELL_COOLDOWN_BARS", "10"))  # Block ALL buys for N bars after any sell
 POST_SELL_COOLDOWN_WALL_SEC = int(os.getenv("POST_SELL_COOLDOWN_WALL_SEC", "2400"))  # 40 min wall-clock backup
+# Strategy dust absent from the venue with no dust-conversion record is retired
+# as unattributed only after this much continuous absence.
+PHANTOM_DUST_UNATTRIBUTED_SEC = float(os.getenv("PHANTOM_DUST_UNATTRIBUTED_SEC", "1800"))
 GLOBAL_SELL_COOLDOWN_WALL_SEC = int(os.getenv("GLOBAL_SELL_COOLDOWN_WALL_SEC", "600"))  # 10 min wall-clock backup
 # Sell/loss-streak cooldowns enforce when ENABLE_COOLDOWN_ENFORCEMENT=true
 # (prod default via core_test_flags). Kill-switch: ENABLE_COOLDOWN_ENFORCEMENT=false.
@@ -867,6 +870,8 @@ class ExitType(Enum):
     TAKE_PROFIT_1 = "TP1"
     TAKE_PROFIT_FULL = "take_profit_full"
     MANUAL = "MANUAL"
+    # DAY_V2 / SCALP_V2 evaluator exit; exit_trigger carries the engine reason.
+    STRATEGY = "STRATEGY"
     DUST_WRITEOFF = "DUST_WRITEOFF"
 
 
@@ -2243,12 +2248,25 @@ def _stamp_low_mfe_outcome_explain(explainability: TradeExplainability, dd: dict
         explainability.outcome_low_mfe_stall_penalty_eval_json = "{}"
 
 
+def strategy_exit_type(exit_trigger: str) -> ExitType:
+    """STRATEGY for a recognised DAY_V2/SCALP_V2 trigger, MANUAL otherwise."""
+    from backend.services.day_v2.live_exit_evaluator import day_v2_recorded_exit_reason
+    from backend.services.scalp_v2.exit_evaluator import scalp_v2_recorded_exit_reason
+
+    trig = str(exit_trigger or "")
+    if scalp_v2_recorded_exit_reason(trig) or day_v2_recorded_exit_reason(trig):
+        return ExitType.STRATEGY
+    return ExitType.MANUAL
+
+
 def _exit_observation_family(exit_type: ExitType) -> str:
     """Collapse ExitType enum to TP / MANUAL / DUST / OTHER for PnL observation logs."""
     if exit_type in (ExitType.TAKE_PROFIT_1, ExitType.TAKE_PROFIT_FULL):
         return "TP"
     if exit_type == ExitType.MANUAL:
         return "MANUAL"
+    if exit_type == ExitType.STRATEGY:
+        return "STRATEGY"
     if exit_type == ExitType.DUST_WRITEOFF:
         return "DUST"
     return "OTHER"
@@ -3108,6 +3126,15 @@ class PortfolioEngine:
             if _sym:
                 _qty = float(getattr(pos, "quantity", 0) or 0)
                 strategy_qty[_sym] = strategy_qty.get(_sym, 0.0) + self._ownership_capped_qty(pos, _qty)
+        from backend.services.engine_strategy_dust import held_lots
+
+        held_by_symbol: dict[str, float] = {}
+        with contextlib.suppress(Exception):
+            for _h in held_lots(self.db_path):
+                _hs = normalize_symbol(str(_h["symbol"]))
+                held_by_symbol[_hs] = held_by_symbol.get(_hs, 0.0) + float(_h["quantity"] or 0.0)
+        for _hs, _hq in held_by_symbol.items():
+            strategy_qty[_hs] = strategy_qty.get(_hs, 0.0) + _hq
         with connect_managed(self.db_path) as conn:
             shrunk = shrink_to_exchange(conn, total_balances, strategy_qty, skip_symbols=fenced)
             conn.commit()
@@ -3125,7 +3152,7 @@ class PortfolioEngine:
                 continue
             if symbol in fenced:
                 continue
-            exact_qty = str(total_qty)
+            exact_qty = str(max(0.0, float(total_qty or 0) - held_by_symbol.get(symbol, 0.0)))
             _lots = self._symbol_lots(symbol)
             if _lots:
                 _dust_lots = [p for p in _lots if str(getattr(p, "status", "") or "") == "DUST_PENDING"]
@@ -3141,7 +3168,7 @@ class PortfolioEngine:
                 # the importer) aligns any surplus by engine-sum. Importing
                 # here would re-protect already-owned inventory.
                 continue
-            free_qty = float(free.get(asset, 0) or 0)
+            free_qty = max(0.0, float(free.get(asset, 0) or 0) - held_by_symbol.get(symbol, 0.0))
             if free_qty <= qty_epsilon:
                 continue
             try:
@@ -3396,7 +3423,8 @@ class PortfolioEngine:
         """Balance above the proven lots is protected inventory, never lot quantity."""
         from backend.services.protected_external_inventory import handle_unmatched_balance, list_protected, record_protected
 
-        proven = sum(float(getattr(p, "quantity", 0) or 0) for p in lots)
+        # Held engine dust is strategy inventory, never protected external inventory.
+        proven = sum(float(getattr(p, "quantity", 0) or 0) for p in lots) + self._held_engine_dust_qty(symbol)
         remainder = round(float(exchange_qty or 0) - proven, 12)
         if remainder <= 0:
             return
@@ -3450,6 +3478,7 @@ class PortfolioEngine:
         tol = (float(qty_step) / 2.0) if qty_step and float(qty_step) > 0 else 1e-9
         await self._enforce_lot_ownership(lots)
         engine_sum = sum(float(getattr(p, "quantity", 0) or 0) for p in lots)
+        held_dust = self._held_engine_dust_qty(symbol)
         snapped = self._floor_to_step(exchange_qty, float(qty_step)) if qty_step and float(qty_step) > 0 else exchange_qty
         engines = sorted({str(getattr(p, "engine_id", "") or "") for p in lots})
         if float(exchange_qty or 0) <= 1e-10:
@@ -3463,7 +3492,7 @@ class PortfolioEngine:
                     getattr(lot, "engine_id", ""),
                 )
             return
-        if abs(engine_sum - snapped) <= tol:
+        if abs(engine_sum + held_dust - snapped) <= tol:
             # A stamp above the real surplus makes free - protected < lot qty
             # and strands the lot's exit (plan_sell_quantity sells 0).
             try:
@@ -3481,7 +3510,7 @@ class PortfolioEngine:
                 snapped,
             )
             return
-        if float(exchange_qty) > engine_sum + tol:
+        if float(exchange_qty) > engine_sum + held_dust + tol:
             surplus = float(exchange_qty) - engine_sum
             try:
                 from backend.services.day_entry_spendable import money as _money_surplus
@@ -3628,6 +3657,16 @@ class PortfolioEngine:
                     self._metrics_reconciliation_adjustments += 1
                     logger.info("UPDATED:%s db_qty=%.12g ex_qty=%.12g snapped=%.12g new_qty=%.12g", symbol, db_qty, exchange_qty, snapped, new_qty)
             await self._sync_protected_remainder(symbol, exchange_qty, [position], qty_step)
+        with contextlib.suppress(Exception):
+            from backend.services.engine_strategy_dust import held_lots
+
+            for _sym in sorted({str(h["symbol"]) for h in held_lots(self.db_path)}):
+                if self._reconcile_fenced(_sym, snapshot_ts):
+                    continue
+                _api_h = _to_api_symbol(_sym)
+                _base_h = _api_h[:-4] if _api_h.endswith("USDT") else _api_h
+                _lots_qty = sum(float(getattr(p, "quantity", 0) or 0) for p in self._symbol_lots(_sym))
+                await self._reconcile_held_engine_dust(_sym, float(total_balances.get(_base_h, 0) or 0), _lots_qty)
         await self._recompute_positions_values()
         self._compute_total_open_risk()
         self._last_live_reconcile_time = time.time()
@@ -5831,6 +5870,23 @@ class PortfolioEngine:
                     status_val = str(getattr(pos, "status", "ACTIVE") or "ACTIVE")
                     dust_at = float(getattr(pos, "dust_detected_at", 0.0) or 0.0)
                     dust_qty = float(getattr(pos, "dust_qty_canonical", 0.0) or 0.0)
+                    from backend.services.engine_strategy_dust import preserve_overwritten_dust
+
+                    _kept = preserve_overwritten_dust(
+                        conn,
+                        engine_id=str(getattr(pos, "engine_id", "") or "LEGACY_DAY_LIVE"),
+                        symbol=pos.symbol,
+                        new_trade_id=str(pos.trade_id or ""),
+                    )
+                    if _kept:
+                        logger.warning(
+                            "ENGINE_DUST_PRESERVED engine=%s symbol=%s source_trade=%s qty=%.12g new_trade=%s",
+                            _kept["engine_id"],
+                            _kept["symbol"],
+                            _kept["source_trade_id"],
+                            _kept["quantity"],
+                            pos.trade_id,
+                        )
                     cursor.execute(
                         """
                         INSERT INTO portfolio_engine_positions (
@@ -6569,9 +6625,14 @@ class PortfolioEngine:
             EXIT_NET_PROFIT,
             canonical_day_exit_reason,
         )
+        from backend.services.day_v2.live_exit_evaluator import day_v2_recorded_exit_reason
+        from backend.services.scalp_v2.exit_evaluator import scalp_v2_recorded_exit_reason
 
         trig = str(exit_trigger or "").upper()
         full = (str(exit_trigger or "") + "|" + str(getattr(exit_type, "name", exit_type) or "")).upper()
+        _v2 = scalp_v2_recorded_exit_reason(str(exit_trigger or "")) or day_v2_recorded_exit_reason(str(exit_trigger or ""))
+        if _v2:
+            return _v2
 
         # Always map legacy AI_ labels to canonical for learning
         if "AI_NET_PROFIT" in full or "AI_NET_PROFIT_SELL" in full:
@@ -6640,7 +6701,7 @@ class PortfolioEngine:
             return EXIT_LEGACY_INVENTORY_CLEANUP
         if exit_type in (ExitType.TAKE_PROFIT_1, ExitType.TAKE_PROFIT_FULL):
             return EXIT_NET_PROFIT
-        if exit_type == ExitType.MANUAL and force_sell:
+        if exit_type in (ExitType.MANUAL, ExitType.STRATEGY) and force_sell:
             return canonical
         if exit_type == ExitType.MANUAL:
             return EXIT_MANUAL
@@ -7190,11 +7251,11 @@ class PortfolioEngine:
         Best-effort: never raises into the engine (see ai_pattern_memory.py).
         """
         from backend.services.ai_pattern_memory import build_pattern_vector, record_trade_pattern
-        from backend.services.learning_provenance import day_strategy_learning_allowed, engine_of, is_dust_close
+        from backend.services.learning_provenance import close_is_dust, day_strategy_learning_allowed, engine_of
 
         tid = str(getattr(position, "trade_id", "") or "")
         engine_id = engine_of(position)
-        if is_dust_close(reason, getattr(position, "status", "")) or not (engine_id == "SCALP_V2" or day_strategy_learning_allowed(engine_id, reason)):
+        if close_is_dust(position, reason) or not (engine_id == "SCALP_V2" or day_strategy_learning_allowed(engine_id, reason)):
             return
         ex_payload: dict[str, Any] = {}
         if tid and tid in self.trade_explanations:
@@ -7376,6 +7437,8 @@ class PortfolioEngine:
                 source,
             )
             return
+        if str(getattr(position, "status", "") or "").upper() == "DUST_PENDING" and await self._retire_phantom_strategy_dust(symbol, position, source=source):
+            return
         seen = self.__dict__.setdefault("_vanish_alerted", {})
         now = time.time()
         if now - float(seen.get(trade_id, 0.0)) >= 600.0:
@@ -7390,6 +7453,182 @@ class PortfolioEngine:
                 source,
             )
             await self._record_reject(normalize_symbol(symbol), "SELL", "STRATEGY_LOT_VANISH_UNEXPLAINED", "RECONCILE")
+
+    async def _venue_dust_conversions(self) -> list[dict[str, Any]] | None:
+        """Binance.US dust-conversion history (read-only), cached 5 minutes. None when unavailable."""
+        cache = self.__dict__.setdefault("_dust_log_cache", {"ts": 0.0, "rows": None})
+        if cache["rows"] is not None and time.time() - float(cache["ts"]) < 300.0:
+            return cache["rows"]
+        svc = self._live_service
+        if svc is None:
+            return None
+        try:
+            ensure = getattr(svc, "_ensure_initialized", None)
+            if ensure is not None:
+                await ensure()
+            ex = getattr(svc, "binance", None)
+            if ex is None:
+                return None
+            res = await asyncio.to_thread(ex.request, "asset/query/dust-logs", "sapi", "GET", {})
+            rows = list((res or {}).get("userDustConvertHistory") or [])
+        except Exception:
+            logger.warning("VENUE_DUST_LOG_UNAVAILABLE", exc_info=True)
+            return None
+        cache["ts"] = time.time()
+        cache["rows"] = rows
+        return rows
+
+    async def _retire_phantom_strategy_dust(self, symbol: str, position: OpenPosition, *, source: str) -> bool:
+        """Retire strategy dust the venue no longer holds. True when handled.
+
+        Only a venue dust-conversion record attributes the removal. Without one
+        the lot waits PHANTOM_DUST_UNATTRIBUTED_SEC of continuous absence before
+        it is retired as unattributed. No P&L, close row, learning, or cooldown.
+        """
+        from backend.services.engine_strategy_dust import (
+            EVENT_CONVERSION,
+            EVENT_UNATTRIBUTED,
+            ensure_schema,
+            match_dust_conversion,
+            record_external_balance_event,
+        )
+
+        sym = normalize_symbol(symbol)
+        api = _to_api_symbol(sym)
+        asset = api[:-4] if api.endswith("USDT") else api
+        trade_id = str(getattr(position, "trade_id", "") or "")
+        engine_id = str(getattr(position, "engine_id", "") or "")
+        qty = float(position.quantity or 0.0)
+        since = float(getattr(position, "entry_time", 0.0) or 0.0)
+        rows = await self._venue_dust_conversions()
+        match = match_dust_conversion(rows or [], asset=asset, after_epoch=since) if rows is not None else None
+        pending = self.__dict__.setdefault("_phantom_dust_first_absent", {})
+        now = time.time()
+        first = float(pending.setdefault(trade_id, now))
+        if match is not None:
+            event_class = EVENT_CONVERSION
+        elif now - first >= PHANTOM_DUST_UNATTRIBUTED_SEC:
+            event_class = EVENT_UNATTRIBUTED
+        else:
+            if now - first < 1.0:
+                logger.warning(
+                    "PHANTOM_DUST_AWAITING_ATTRIBUTION symbol=%s engine=%s trade_id=%s qty=%.12g venue_log=%s",
+                    sym,
+                    engine_id,
+                    trade_id,
+                    qty,
+                    "unavailable" if rows is None else "no_match",
+                )
+            return True
+
+        def _write() -> None:
+            with connect_managed(self.db_path) as conn:
+                ensure_schema(conn)
+                record_external_balance_event(
+                    conn,
+                    symbol=sym,
+                    quantity=qty,
+                    event_class=event_class,
+                    source=f"strategy_dust_vanish:{source}",
+                    engine_id=engine_id,
+                    source_trade_id=trade_id,
+                    venue_ref=str((match or {}).get("tran_id") or ""),
+                    venue_time_utc=str((match or {}).get("operate_time_utc") or ""),
+                    evidence=match or {"venue_log": "unavailable" if rows is None else "no_matching_conversion"},
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_write)
+        async with self._deletion_lock:
+            key = next((k for k, v in self.open_positions.items() if v is position), None)
+            if key is not None:
+                del self.open_positions[key]
+            await self._delete_position_from_sqlite(sym, engine_id)
+            await self._recompute_positions_values()
+            self._compute_total_open_risk()
+            await self._persist_ledger_to_sqlite()
+        pending.pop(trade_id, None)
+        logger.warning(
+            "PHANTOM_DUST_RETIRED symbol=%s engine=%s trade_id=%s qty=%.12g class=%s venue_ref=%s venue_time=%s — no P&L, no learning, no cooldown",
+            sym,
+            engine_id,
+            trade_id,
+            qty,
+            event_class,
+            (match or {}).get("tran_id", ""),
+            (match or {}).get("operate_time_utc", ""),
+        )
+        return True
+
+    async def _reconcile_held_engine_dust(self, symbol: str, exchange_total: float, lots_qty: float) -> None:
+        """Retire held engine dust the venue proves was converted away."""
+        from backend.services.engine_strategy_dust import (
+            EVENT_CONVERSION,
+            held_lots,
+            match_dust_conversion,
+            record_external_balance_event,
+            retire_held_dust,
+        )
+
+        sym = normalize_symbol(symbol)
+        held = held_lots(self.db_path, sym)
+        if not held:
+            return
+        held_sum = sum(float(h["quantity"] or 0.0) for h in held)
+        constraints = self._symbol_constraints.get(sym) or {}
+        step = float(constraints.get("qty_step") or 0)
+        tol = step / 2.0 if step > 0 else 1e-10
+        if float(exchange_total) + tol >= float(lots_qty) + held_sum:
+            return
+        rows = await self._venue_dust_conversions()
+        if not rows:
+            return
+        api = _to_api_symbol(sym)
+        asset = api[:-4] if api.endswith("USDT") else api
+        for h in held:
+            try:
+                since = float(json.loads(h.get("provenance_json") or "{}").get("entry_time") or 0.0)
+            except (TypeError, ValueError):
+                since = 0.0
+            match = match_dust_conversion(rows, asset=asset, after_epoch=since)
+            if match is None:
+                continue
+
+            def _write(h: dict[str, Any] = h, match: dict[str, Any] = match) -> None:
+                with connect_managed(self.db_path) as conn:
+                    record_external_balance_event(
+                        conn,
+                        symbol=sym,
+                        quantity=float(h["quantity"] or 0.0),
+                        event_class=EVENT_CONVERSION,
+                        source="held_engine_dust_reconcile",
+                        engine_id=str(h["engine_id"] or ""),
+                        source_trade_id=str(h["source_trade_id"] or ""),
+                        venue_ref=str(match.get("tran_id") or ""),
+                        venue_time_utc=str(match.get("operate_time_utc") or ""),
+                        evidence=match,
+                    )
+                    retire_held_dust(conn, str(h["source_trade_id"]), event_class=EVENT_CONVERSION, venue_ref=str(match.get("tran_id") or ""))
+                    conn.commit()
+
+            await asyncio.to_thread(_write)
+            logger.warning(
+                "HELD_ENGINE_DUST_RETIRED symbol=%s engine=%s source_trade=%s qty=%.12g class=%s venue_ref=%s",
+                sym,
+                h["engine_id"],
+                h["source_trade_id"],
+                float(h["quantity"] or 0.0),
+                EVENT_CONVERSION,
+                match.get("tran_id"),
+            )
+
+    def _held_engine_dust_qty(self, symbol: str) -> float:
+        from backend.services.engine_strategy_dust import held_quantity
+
+        try:
+            return float(held_quantity(self.db_path, normalize_symbol(symbol)))
+        except Exception:
+            return 0.0
 
     async def _book_human_manual_sell_and_continue(
         self,
@@ -7712,6 +7951,10 @@ class PortfolioEngine:
         """
         order_id = order.get("id")
         if not order_id or not self._live_service:
+            return order
+        if len(order.get("_mystic_order_ids") or []) > 1:
+            # Combined multi-order close: a GET on the last id would replace the
+            # aggregate filled/cost with that single chunk.
             return order
         order = await self._attach_venue_trades(order, exchange_symbol)
         status = (order.get("status") or "").lower()
@@ -8752,7 +8995,9 @@ class PortfolioEngine:
         return (None, "missing", None, False)
 
     def _is_emergency_sell(self, exit_type: ExitType, exit_trigger: str, force_sell: bool = False) -> bool:
-        if force_sell:
+        # A forced STRATEGY exit bypasses the net floor through strategy authority
+        # (see _evaluate_sell_profitability); it is only an emergency by trigger.
+        if force_sell and exit_type != ExitType.STRATEGY:
             return True
         trig = str(exit_trigger or "").strip().upper()
         if trig.startswith("EXTREME_PROTECTION"):
@@ -9358,12 +9603,13 @@ class PortfolioEngine:
         required_profit_buffer_pct = defaults["required_profit_buffer_pct"]
 
         emergency_flag = self._is_emergency_sell(exit_type, exit_trigger, force_sell=force_sell)
+        strategy_authority = bool(force_sell and exit_type == ExitType.STRATEGY)
         profit_style = self._is_profit_style_exit(exit_type, emergency_flag=emergency_flag)
         if STRICT_NO_NEGATIVE_SELLS:
             # Test mode: enforce net-positive gate on every sell branch.
             profit_style = True
 
-        if emergency_flag:
+        if emergency_flag or strategy_authority:
             # Thesis invalidation / risk cuts (and other emergency) must bypass the net-positive gate
             # even under STRICT_NO_NEGATIVE_SELLS, so a thesis break can actually cut (XRP preexisting).
             profit_style = False
@@ -9421,6 +9667,7 @@ class PortfolioEngine:
             "block_reason": block_reason,
             "decision_tag": decision_tag,
             "emergency_flag": bool(emergency_flag),
+            "strategy_authority": bool(strategy_authority),
             "measured_cost_sample_count": sample_count,
             "measured_cost_p75": float(measured_roundtrip_p75),
             "strict_no_negative_sells": bool(STRICT_NO_NEGATIVE_SELLS),
@@ -12487,6 +12734,10 @@ class PortfolioEngine:
             finally:
                 self._sells_inflight = max(0, int(getattr(self, "_sells_inflight", 1) or 1) - 1)
                 self._sell_seq = int(getattr(self, "_sell_seq", 0) or 0) + 1
+                _norm_sym = normalize_symbol(symbol)
+                for _key, _lot in list((getattr(self, "open_positions", None) or {}).items()):
+                    if split_position_key(_key)[1] == _norm_sym and getattr(_lot, "_close_provenance", None) is not None:
+                        _lot._close_provenance = None
 
     async def _execute_sell_fifo_locked(
         self,
@@ -12628,6 +12879,10 @@ class PortfolioEngine:
 
         # Reporting label only; exit_trigger above still drives the sell gates.
         _v2_recorded_reason = scalp_v2_recorded_exit_reason(_raw_exit_trigger) or day_v2_recorded_exit_reason(_raw_exit_trigger)
+        if _v2_recorded_reason and exit_type == ExitType.STRATEGY:
+            # canonical_day_exit_reason has no DAY_V2/SCALP_V2 mapping and would
+            # relabel an invalidation as NET_PROFIT_EXIT; keep the engine trigger.
+            exit_trigger = _raw_exit_trigger
         record_exit_reason = _v2_recorded_reason or exit_trigger
         from backend.services.engine_lot_ownership import is_generic_manual_strategy_exit
 
@@ -12650,6 +12905,9 @@ class PortfolioEngine:
             position._learning_dead_trade_reason = _exit_parts.get("dead_trade_reason")
         except Exception:
             pass
+        from backend.services.learning_provenance import capture_close_provenance
+
+        position._close_provenance = capture_close_provenance(position, exit_trigger=_raw_exit_trigger, sell_qty=float(quantity or 0.0))
 
         if quantity > position.quantity:
             logger.error(f"SELL_ERROR: Quantity {quantity} > position {position.quantity} for {symbol}")
@@ -12683,6 +12941,7 @@ class PortfolioEngine:
                     "allowed": bool(sell_eval["allowed"]),
                     "block_reason": sell_eval["block_reason"],
                     "emergency_flag": bool(sell_eval["emergency_flag"]),
+                    "strategy_authority": bool(sell_eval.get("strategy_authority")),
                     "measured_cost_sample_count": int(sell_eval["measured_cost_sample_count"]),
                     "measured_cost_p75": round(float(sell_eval["measured_cost_p75"]), 6),
                 },
@@ -12710,8 +12969,10 @@ class PortfolioEngine:
         if sell_eval.get("mark_price") is not None:
             price = float(sell_eval["mark_price"])
 
-        # Emergency exits (stop/time/thesis/trailing/extreme) bypass executable-fill floor.
-        emergency_sell = bool(sell_eval.get("emergency_flag"))
+        # Emergency exits (stop/time/thesis/trailing/extreme) and forced strategy
+        # exits bypass the executable-fill floor; only the log label differs.
+        strategy_authority_sell = bool(sell_eval.get("strategy_authority")) and not bool(sell_eval.get("emergency_flag"))
+        emergency_sell = bool(sell_eval.get("emergency_flag")) or strategy_authority_sell
 
         # SELL PRECISION: Reuse same normalization as buy path (BUG-2 fix)
         await self._entry_ensure_constraints(normalized_symbol)
@@ -12887,11 +13148,13 @@ class PortfolioEngine:
                 return None
             if not exec_check.passed and emergency_sell:
                 logger.warning(
-                    "SELL_EXECUTABLE_FILL_FORCED %s reason=%s exec_px=%.8f net_pct=%.6f (emergency bypass)",
+                    "SELL_EXECUTABLE_FILL_FORCED %s reason=%s trigger=%s exec_px=%.8f net_pct=%.6f %s",
                     normalized_symbol,
                     exec_check.reject_reason,
+                    exit_trigger,
                     exec_px,
                     exec_check.executable_net_pct,
+                    "(strategy exit authority)" if strategy_authority_sell else "(emergency bypass)",
                 )
             return await execute_protected_limit_live(
                 self._live_service,
@@ -13081,6 +13344,27 @@ class PortfolioEngine:
                         explain_obj.exit_r_multiple = r_multiple
                         explain_obj.exit_trigger = record_exit_reason
                         original_explain = explain_obj.to_dict()
+                    # A lot rehydrated after restart carries a thin explanation; the
+                    # BUY row and the engine's setup record are the setup source.
+                    if not any(str(original_explain.get(k) or "").strip() for k in ("setup_type_canonical", "setup_type", "entry_thesis")):
+                        with contextlib.suppress(Exception):
+                            cursor.execute(
+                                "SELECT explainability_json FROM paper_trades WHERE trade_id = ? AND UPPER(side) = 'BUY' ORDER BY id DESC LIMIT 1",
+                                (position_trade_id,),
+                            )
+                            _bx_row = cursor.fetchone()
+                            _bx = json.loads(_bx_row[0]) if _bx_row and _bx_row[0] else {}
+                            if isinstance(_bx, dict):
+                                for _k in ("setup_type_canonical", "setup_type_raw", "setup_type", "entry_thesis", "day_route_regime", "adaptive_regime", "regime"):
+                                    if str(_bx.get(_k) or "").strip() and not str(original_explain.get(_k) or "").strip():
+                                        original_explain[_k] = _bx[_k]
+                        if not any(str(original_explain.get(k) or "").strip() for k in ("setup_type_canonical", "setup_type", "entry_thesis")):
+                            from backend.services.learning_provenance import UNKNOWN_SETUP, resolve_setup
+
+                            _setup_src = resolve_setup(self.db_path, position, original_explain)
+                            if _setup_src and _setup_src != UNKNOWN_SETUP:
+                                original_explain["setup_type"] = _setup_src
+                                original_explain["setup_source"] = "engine_setup_record"
                     # Learning labels: raw STALL_EXIT_DEAD_NO_MFE + canonical STALL_EXIT.
                     _raw_lrn = getattr(position, "_learning_raw_exit_reason", None) or _raw_exit_trigger
                     _canon_lrn = _v2_recorded_reason or getattr(position, "_learning_canonical_exit_reason", None) or exit_trigger
@@ -13988,11 +14272,13 @@ class PortfolioEngine:
                 return None
             if not exec_check.passed and emergency_sell:
                 logger.warning(
-                    "SELL_EXECUTABLE_FILL_FORCED %s reason=%s exec_px=%.8f net_pct=%.6f (emergency bypass)",
+                    "SELL_EXECUTABLE_FILL_FORCED %s reason=%s trigger=%s exec_px=%.8f net_pct=%.6f %s",
                     normalized_symbol,
                     exec_check.reject_reason,
+                    exit_trigger,
                     fill_price,
                     exec_check.executable_net_pct,
+                    "(strategy exit authority)" if strategy_authority_sell else "(emergency bypass)",
                 )
 
         base_qty_reduction = 0.0
@@ -14455,6 +14741,10 @@ class PortfolioEngine:
                 sell_trade_id=str(sell_trade_id) or None,
                 detail=f"exit_trigger={exit_trigger};exit_type={exit_type.value};buy_trade_id={position.trade_id or ''}",
             )
+        _cprov = getattr(position, "_close_provenance", None)
+        if isinstance(_cprov, dict):
+            _cprov["residual_qty"] = max(0.0, float(getattr(position, "quantity", 0.0) or 0.0))
+            _cprov["sell_qty"] = float(quantity)
         with contextlib.suppress(Exception):
             self._record_learning_outcome(
                 symbol=normalized_symbol,
@@ -15779,7 +16069,7 @@ class PortfolioEngine:
                 symbol,
                 quantity,
                 current_price,
-                ExitType.MANUAL,
+                strategy_exit_type(residual_reason),
                 residual_reason,
                 current_bar=current_bar,
                 force_sell=True,
@@ -15864,7 +16154,7 @@ class PortfolioEngine:
                         symbol,
                         quantity,
                         current_price,
-                        ExitType.MANUAL,
+                        strategy_exit_type(_day_v2_reason),
                         _day_v2_reason,
                         current_bar=current_bar,
                         force_sell=True,
@@ -15919,7 +16209,7 @@ class PortfolioEngine:
                         symbol,
                         quantity,
                         current_price,
-                        ExitType.MANUAL,
+                        strategy_exit_type(_scalp_v2_reason),
                         _scalp_v2_reason,
                         current_bar=current_bar,
                         force_sell=True,

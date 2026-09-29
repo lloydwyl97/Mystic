@@ -69,6 +69,10 @@ def is_mandatory_day_flatten(
     et = str(exit_type_name or "").strip().upper()
     if "TP1" in trig or et == "TAKE_PROFIT_1":
         return False
+    # DAY_V2/SCALP_V2 exits keep their own trigger (e.g. SCALP_V2_NET_PROFIT);
+    # a forced strategy exit is a full flatten whatever the trigger says.
+    if force_sell and et == "STRATEGY":
+        return True
     if "NET_PROFIT" in trig and "TRAILING" not in trig and "4H" not in trig:
         return False
     if any(trig.startswith(str(p).upper()) for p in MANDATORY_FLATTEN_PREFIXES):
@@ -145,22 +149,93 @@ class MandatoryFlattenResult:
         return self.filled_qty > 0
 
 
+def _f(raw: Any) -> float:
+    try:
+        return float(raw or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _order_fee_pairs(order: dict[str, Any]) -> list[tuple[float, str]]:
+    fee = order.get("fee")
+    if isinstance(fee, dict) and _f(fee.get("cost")):
+        return [(_f(fee.get("cost")), str(fee.get("currency") or "").upper())]
+    out: list[tuple[float, str]] = []
+    for item in order.get("fees") or []:
+        if isinstance(item, dict) and _f(item.get("cost")):
+            out.append((_f(item.get("cost")), str(item.get("currency") or "").upper()))
+    return out
+
+
 def _combine_orders(orders: list[dict[str, Any]], requested: float) -> dict[str, Any] | None:
-    fills: list[tuple[float, float]] = []
+    """One venue view of a multi-order close: every chunk's fills, cost and fees.
+
+    Economics downstream read info.fills first, so each chunk's fills must be
+    present there; a chunk whose reply omits fills contributes one synthetic
+    fill built from its own order-level filled/average/fee.
+    """
+    used: list[dict[str, Any]] = []
     for o in orders:
-        fq = float(o.get("filled") or 0.0)
-        px = float(o.get("average") or o.get("price") or 0.0)
-        if fq > 0 and px > 0:
-            fills.append((fq, px))
-    if not fills:
+        if _f(o.get("filled")) > 0 and _f(o.get("average") or o.get("price")) > 0:
+            used.append(o)
+    if not used:
         return None
-    tot = sum(f[0] for f in fills)
-    vwap = sum(f[0] * f[1] for f in fills) / tot
-    last = dict(orders[-1])
+    tot = sum(_f(o.get("filled")) for o in used)
+    notional = sum(_f(o.get("filled")) * _f(o.get("average") or o.get("price")) for o in used)
+    vwap = notional / tot
+    cost = 0.0
+    order_ids: list[str] = []
+    fills: list[dict[str, Any]] = []
+    trades: list[dict[str, Any]] = []
+    fee_by_ccy: dict[str, float] = {}
+    for o in used:
+        fq = _f(o.get("filled"))
+        px = _f(o.get("average") or o.get("price"))
+        cost += _f(o.get("cost")) or fq * px
+        oid = str(o.get("id") or (o.get("info") or {}).get("orderId") or "").strip()
+        if oid and oid not in order_ids:
+            order_ids.append(oid)
+        info = o.get("info") if isinstance(o.get("info"), dict) else {}
+        chunk_fills = [dict(f) for f in (info.get("fills") or []) if isinstance(f, dict)]
+        if chunk_fills:
+            for f in chunk_fills:
+                f.setdefault("orderId", oid)
+                fills.append(f)
+                ccy = str(f.get("commissionAsset") or "").upper()
+                fee_by_ccy[ccy] = fee_by_ccy.get(ccy, 0.0) + _f(f.get("commission"))
+        else:
+            pairs = _order_fee_pairs(o)
+            for amt, ccy in pairs:
+                fee_by_ccy[ccy] = fee_by_ccy.get(ccy, 0.0) + amt
+            fills.append(
+                {
+                    "price": str(px),
+                    "qty": str(fq),
+                    "commission": str(sum(a for a, _c in pairs)),
+                    "commissionAsset": pairs[0][1] if pairs else "",
+                    "orderId": oid,
+                    "_mystic_synthetic": True,
+                }
+            )
+        for t in o.get("trades") or []:
+            if isinstance(t, dict):
+                trades.append(dict(t))
+    last = dict(used[-1])
+    info = dict(last.get("info") or {}) if isinstance(last.get("info"), dict) else {}
+    info["fills"] = fills
+    info["executedQty"] = str(tot)
+    info["cummulativeQuoteQty"] = str(cost)
+    last["info"] = info
+    last["trades"] = trades
     last["filled"] = tot
     last["average"] = vwap
+    last["cost"] = cost
+    fees = [{"cost": amt, "currency": ccy} for ccy, amt in fee_by_ccy.items() if amt]
+    last["fees"] = fees
+    last["fee"] = dict(fees[0]) if len(fees) == 1 else None
     last["amount"] = float(requested)
-    last["_mystic_mandatory_flatten_fills"] = len(fills)
+    last["_mystic_order_ids"] = order_ids
+    last["_mystic_mandatory_flatten_fills"] = len(used)
     last["_mystic_partial_fill"] = tot + 1e-12 < float(requested)
     last["_mystic_ioc_incomplete"] = bool(last.get("_mystic_partial_fill"))
     return last
