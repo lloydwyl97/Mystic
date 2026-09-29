@@ -242,6 +242,47 @@ async def test_m_engine_persist_keeps_dust_and_one_slot(tmp_path):
     assert engine._held_engine_dust_qty("XRP/USDT") == pytest.approx(0.09474)
 
 
+@pytest.mark.asyncio
+async def test_m2_dust_reconcile_never_hands_held_dust_to_a_lot(tmp_path):
+    from backend.services.protected_external_inventory import record_protected
+
+    db = tmp_path / "r.db"
+    _init_test_db(db, cash=1000.0)
+    engine = PortfolioEngine(db_path=str(db), principal=1000.0, test_mode=True)
+    await engine.initialize_from_db()
+    with sqlite3.connect(db) as c:
+        record_protected(c, "XRP/USDT", 2.27868, 1.48)
+        esd.ensure_schema(c)
+        c.execute(
+            f"INSERT INTO {esd.DUST_TABLE} (engine_id, symbol, source_trade_id, quantity, quantity_exact, entry_price, provenance_json, status, created_at) "
+            "VALUES ('SCALP_V2','XRP/USDT','held',0.09474,'0.09474',1.5,'{}','HELD','t')"
+        )
+    for engine_id, tid, qty in (("SCALP_V2", "scalp_lot", 0.09354), ("DAY_V2", "day_lot", 0.08804)):
+        p = OpenPosition(
+            symbol="XRP/USDT",
+            quantity=qty,
+            entry_price=1.5,
+            entry_time=time.time(),
+            trade_id=tid,
+            stop_price=0.0,
+            take_profit_1_price=0.0,
+            take_profit_2_price=0.0,
+            sleeve=Sleeve.ACTIVE.value,
+            engine_id=engine_id,
+        )
+        p.status = "DUST_PENDING"
+        engine.open_positions[f"{engine_id}::XRP/USDT"] = p
+    engine._live_execution_enabled = True
+    engine._live_service = MagicMock(get_balance=AsyncMock(return_value={"status": "success", "balance": {"total": {"XRP": 2.555}}, "fetched_at": time.time()}))
+    engine._reconcile_fenced = MagicMock(return_value=False)
+    engine._ensure_symbol_constraints = AsyncMock()
+    engine._dust_check = MagicMock(return_value=(True, 0.0, "", 0.0))
+    proposed: dict[str, float] = {}
+    engine._ownership_capped_qty = lambda pos, q: proposed.setdefault(pos.trade_id, q)
+    await engine.run_dust_reconciliation({"XRP/USDT": 1.55})
+    assert proposed == {"scalp_lot": pytest.approx(0.09354), "day_lot": pytest.approx(0.08804)}
+
+
 # --------------------------------------------------------- external balance
 
 DUST_LOG = [

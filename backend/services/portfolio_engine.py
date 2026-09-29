@@ -23092,6 +23092,7 @@ class PortfolioEngine:
                     owned_elsewhere += float(protected_quantity(self.db_path, symbol) or 0)
                 except Exception:
                     logger.debug("DUST_RECONCILE: protected quantity unavailable for %s", symbol)
+                owned_elsewhere += self._held_engine_dust_qty(symbol)
                 canonical_qty = max(0.0, float(total_balances.get(base_coin, 0) or 0) - owned_elsewhere)
                 canonical_qty = self._ownership_capped_qty(position, canonical_qty)
                 price = float(prices.get(key, 0) or prices.get(symbol, 0) or 0)
