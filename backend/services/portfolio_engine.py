@@ -6038,6 +6038,13 @@ class PortfolioEngine:
                     """,
                     trade_bind,
                 )
+                from backend.services.engine_strategy_dust import preserve_overwritten_dust
+
+                _kept = preserve_overwritten_dust(conn, engine_id=str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE"), symbol=symbol, new_trade_id=trade_id)
+                if _kept:
+                    logger.warning(
+                        "ENGINE_DUST_PRESERVED engine=%s symbol=%s source_trade=%s qty=%.12g new_trade=%s", _kept["engine_id"], _kept["symbol"], _kept["source_trade_id"], _kept["quantity"], trade_id
+                    )
                 timestamp = datetime.now(timezone.utc).isoformat()
                 entry_fee = getattr(position, "entry_fee", 0.0) or 0.0
                 sleeve_val = getattr(position, "sleeve", Sleeve.ACTIVE.value) or Sleeve.ACTIVE.value
@@ -10415,11 +10422,17 @@ class PortfolioEngine:
         timestamp: str,
         original_cost: float | None = None,
     ) -> None:
+        from backend.services.engine_strategy_dust import preserve_overwritten_dust
         from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
         from backend.services.scalp_v2.identity_stamp import stamp_engine
 
         cost = float(original_cost) if original_cost and float(original_cost) > 0 else float(quantity) * float(fill_price)
         _ensure_position_engine_identity(conn)
+        _kept = preserve_overwritten_dust(conn, engine_id=SCALP_V2_ENGINE_ID, symbol=symbol, new_trade_id=trade_id)
+        if _kept:
+            logger.warning(
+                "ENGINE_DUST_PRESERVED engine=%s symbol=%s source_trade=%s qty=%.12g new_trade=%s", _kept["engine_id"], _kept["symbol"], _kept["source_trade_id"], _kept["quantity"], trade_id
+            )
         conn.execute(
             """
             INSERT INTO portfolio_engine_positions
