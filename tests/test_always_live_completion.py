@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -114,6 +117,21 @@ async def test_ownership_cap_warning_is_not_repeated_for_the_same_lot(tmp_path, 
         assert eng._ownership_capped_qty(pos, 0.02) == pytest.approx(0.001)
     warnings = [r.message for r in caplog.records if "LOT_QTY_OWNERSHIP_CAPPED" in r.message]
     assert len(warnings) == 2
+
+
+def test_status_reads_a_fresh_reconcile_file_as_ownership_known(tmp_path, monkeypatch):
+    from backend.services.portfolio_engine import _configured_live_status
+
+    path = tmp_path / "reconcile.json"
+    path.write_text(json.dumps({"time_epoch": time.time(), "actions": "periodic"}))
+    monkeypatch.setenv("MYSTIC_RECONCILE_STATE_FILE", str(path))
+    monkeypatch.setenv("MYSTIC_TRADING_MODE", "live")
+    monkeypatch.setenv("EXECUTION_MODE", "live")
+    engine = SimpleNamespace(_ownership_state_known=False)
+    status = _configured_live_status(engine, {"effective_entry_permitted": True, "accounting_healthy": True, "kill_switch_mode": "RESUME"})
+    assert status["configured_mode"] == "LIVE"
+    assert status["entry_permitted"] is True
+    assert status["hard_safety_block"] == "none"
 
 
 def test_weight_backup_uses_the_real_table_name(tmp_path):

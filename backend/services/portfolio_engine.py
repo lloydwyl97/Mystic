@@ -2334,10 +2334,20 @@ class PriceCache:
         self._timestamps.clear()
 
 
+def _reconcile_state_is_fresh(max_age_sec: float = 180.0) -> bool:
+    """The trading process writes this file; the API process does not reconcile."""
+    path = os.getenv("MYSTIC_RECONCILE_STATE_FILE", "/home/mystic/mystic/logs/mystic_live_reconcile.json")
+    try:
+        payload = json.loads(Path(path).read_text())
+        return time.time() - float(payload.get("time_epoch") or 0.0) <= max_age_sec
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def _configured_live_status(engine: Any, capability: dict[str, Any]) -> dict[str, Any]:
     from backend.services.live_readiness_service import configured_live_contract
 
-    ownership_known = bool(getattr(engine, "_ownership_state_known", True))
+    ownership_known = bool(getattr(engine, "_ownership_state_known", False)) or _reconcile_state_is_fresh()
     blocked = "" if capability.get("effective_entry_permitted") else str(capability.get("blocking_reason") or capability.get("no_trade_reason") or "hard_safety")
     if not ownership_known:
         blocked = "OWNERSHIP_STATE_UNKNOWN"
