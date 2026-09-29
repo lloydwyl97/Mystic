@@ -109,6 +109,9 @@ def relabel_generic_manual_exit(conn: sqlite3.Connection, paper_trade_id: int) -
     except (TypeError, ValueError):
         raw = ""
     label = strategy_label_for(raw)
+    raw_upper = raw.strip().upper()
+    if not label and raw_upper.endswith("_EXIT") and raw_upper not in {"MANUAL_EXIT"}:
+        label = raw_upper
     if not label:
         return None
     _backup(conn, "paper_trades", "id", paper_trade_id, "relabel_strategy_exit", f"raw_exit_reason={raw}")

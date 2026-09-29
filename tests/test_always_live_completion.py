@@ -71,6 +71,49 @@ def test_day_close_still_writes_a_day_bandit_arm(tmp_path):
     assert n == 1
 
 
+def test_latest_bandit_update_inverts_exactly_after_decay():
+    from backend.services.day_outcome_bandit import PRIOR_ALPHA, PRIOR_BETA, _is_win, _weight, invert_latest_bandit_update
+
+    alpha, beta, wins, losses, total, n_obs = 4.5, 11.25, 8, 40, -3.2, 48
+    pnl, reason = -0.8891778613742858, "STOP_LOSS_EXIT"
+    assert _is_win(pnl, reason) is False
+    weight = _weight(pnl)
+    beta_after = beta + weight
+    n_after = n_obs + 1
+    alpha_stored = PRIOR_ALPHA + (alpha - PRIOR_ALPHA) * 0.92
+    beta_stored = PRIOR_BETA + (beta_after - PRIOR_BETA) * 0.92
+    restored = invert_latest_bandit_update(
+        alpha=alpha_stored,
+        beta=beta_stored,
+        wins=wins,
+        losses=losses + 1,
+        total_pnl=total + pnl,
+        n_obs=n_after,
+        pnl=pnl,
+        exit_reason=reason,
+    )
+    assert restored is not None
+    assert restored["n_obs"] == n_obs
+    assert restored["losses"] == losses
+    assert restored["alpha"] == pytest.approx(alpha)
+    assert restored["beta"] == pytest.approx(beta)
+    assert restored["total_pnl"] == pytest.approx(total)
+
+
+def test_legacy_structure_break_label_replaces_generic_manual(tmp_path):
+    from backend.services.ownership_repair import relabel_generic_manual_exit
+
+    db = tmp_path / "m.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, side TEXT, exit_reason TEXT, exit_type TEXT, explainability_json TEXT)")
+        conn.execute(
+            "INSERT INTO paper_trades VALUES (1, 'SELL', 'MANUAL_EXIT', 'MANUAL', ?)",
+            (json.dumps({"raw_exit_reason": "DAY_4H_STRUCTURE_BREAK_EXIT"}),),
+        )
+        assert relabel_generic_manual_exit(conn, 1) == "DAY_4H_STRUCTURE_BREAK_EXIT"
+        assert tuple(conn.execute("SELECT exit_reason, exit_type FROM paper_trades").fetchone()) == ("DAY_4H_STRUCTURE_BREAK_EXIT", "DAY_4H_STRUCTURE_BREAK_EXIT")
+
+
 def test_hard_safety_block_does_not_rewrite_configured_live_mode(monkeypatch):
     monkeypatch.setenv("MYSTIC_TRADING_MODE", "live")
     monkeypatch.setenv("TRADING_MODE", "live")

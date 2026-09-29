@@ -18,17 +18,25 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.services.day_outcome_bandit import LOSS_PNL_SCALE, MAX_WEIGHT, SLIDING_WINDOW, WIN_PNL_SCALE, _is_win, arm_key
-from backend.services.ownership_repair import revert_bandit_observation
+from backend.services.day_outcome_bandit import PRIOR_ALPHA, PRIOR_BETA, SLIDING_WINDOW, _is_win, _weight, invert_latest_bandit_update
+from backend.services.ownership_repair import _backup, relabel_generic_manual_exit
 
 REASON = "scalp_close_updated_day_bandit"
 UNRESOLVED = "UNRESOLVED_LEGACY_ATTRIBUTION"
 
 
-def _weight(pnl: float, n_obs: int) -> float:
-    scale = WIN_PNL_SCALE if pnl >= 0 else LOSS_PNL_SCALE
-    w = min(MAX_WEIGHT, 1.0 + abs(pnl) / scale)
-    return w * (0.92 if n_obs > SLIDING_WINDOW else 1.0)
+def _forward(alpha: float, beta: float, n_obs: int, pnl: float, exit_reason: str) -> tuple[float, float, int]:
+    win = _is_win(pnl, exit_reason)
+    weight = _weight(pnl)
+    if win:
+        alpha += weight
+    else:
+        beta += weight
+    n_obs += 1
+    if n_obs > SLIDING_WINDOW:
+        alpha = PRIOR_ALPHA + (alpha - PRIOR_ALPHA) * 0.92
+        beta = PRIOR_BETA + (beta - PRIOR_BETA) * 0.92
+    return alpha, beta, n_obs
 
 
 def _epoch(timestamp: str) -> float | None:
@@ -64,17 +72,24 @@ def main() -> int:
                 continue
             if not str(arm["arm_key"]).startswith(str(sell["symbol"]) + "|"):
                 continue
-            item = {
-                "arm": arm["arm_key"],
-                "sell_trade_id": sell["trade_id"],
-                "pnl": pnl,
-                "n_obs": int(arm["n_obs"]),
-                "win": _is_win(pnl, sell["exit_reason"]),
-                "weight_now": _weight(pnl, int(arm["n_obs"])),
-            }
-            # A windowed update also decays every older observation. That mix
-            # cannot be inverted from the stored arm, so it is not reversed.
-            (reversible if int(arm["n_obs"]) <= SLIDING_WINDOW else decayed).append(item)
+            restored = invert_latest_bandit_update(
+                alpha=float(arm["alpha"]),
+                beta=float(arm["beta"]),
+                wins=int(arm["wins"]),
+                losses=int(arm["losses"]),
+                total_pnl=float(arm["total_pnl"] or 0.0),
+                n_obs=int(arm["n_obs"]),
+                pnl=pnl,
+                exit_reason=str(sell["exit_reason"] or ""),
+            )
+            if restored is None:
+                decayed.append({"arm": arm["arm_key"], "sell_trade_id": sell["trade_id"], "reason": "counts_cannot_hold_observation"})
+                break
+            back_a, back_b, back_n = _forward(float(restored["alpha"]), float(restored["beta"]), int(restored["n_obs"]), pnl, str(sell["exit_reason"] or ""))
+            if abs(back_a - float(arm["alpha"])) > 1e-6 or abs(back_b - float(arm["beta"])) > 1e-6 or back_n != int(arm["n_obs"]):
+                decayed.append({"arm": arm["arm_key"], "sell_trade_id": sell["trade_id"], "reason": "round_trip_failed"})
+                break
+            reversible.append({"arm": arm["arm_key"], "sell_trade_id": sell["trade_id"], "pnl": pnl, "n_obs": int(arm["n_obs"]), "restored_n_obs": restored["n_obs"]})
             break
     matched_trades = {r["sell_trade_id"] for r in reversible + decayed}
     report = {
@@ -87,18 +102,42 @@ def main() -> int:
     print(json.dumps(report, indent=2, default=str))
     if not args.apply:
         return 0
+    manual = conn.execute("SELECT id FROM paper_trades WHERE upper(side)='SELL' AND exit_reason='MANUAL_EXIT'").fetchall()
     conn.execute("BEGIN IMMEDIATE")
     for item in reversible:
-        arm = conn.execute("SELECT n_obs, last_pnl, last_exit_reason FROM day_outcome_bandit_arms WHERE arm_key=?", (item["arm"],)).fetchone()
+        arm = conn.execute("SELECT * FROM day_outcome_bandit_arms WHERE arm_key=?", (item["arm"],)).fetchone()
         if arm is None or int(arm["n_obs"]) != int(item["n_obs"]) or abs(float(arm["last_pnl"] or 0) - item["pnl"]) > 1e-6:
             print("ABORT: arm changed", item["arm"])
             conn.rollback()
             return 3
-        revert_bandit_observation(conn, item["arm"], win=item["win"], weight_now=item["weight_now"], pnl=item["pnl"], restore_last=None, reason=REASON)
-        conn.execute("UPDATE day_outcome_bandit_arms SET last_exit_reason=? WHERE arm_key=?", (REASON, item["arm"]))
+        restored = invert_latest_bandit_update(
+            alpha=float(arm["alpha"]),
+            beta=float(arm["beta"]),
+            wins=int(arm["wins"]),
+            losses=int(arm["losses"]),
+            total_pnl=float(arm["total_pnl"] or 0.0),
+            n_obs=int(arm["n_obs"]),
+            pnl=item["pnl"],
+            exit_reason=str(arm["last_exit_reason"] or ""),
+        )
+        if restored is None:
+            print("ABORT: inverse rejected", item["arm"])
+            conn.rollback()
+            return 3
+        _backup(conn, "day_outcome_bandit_arms", "arm_key", item["arm"], "invert_latest_scalp_observation", REASON)
+        conn.execute(
+            """UPDATE day_outcome_bandit_arms
+               SET alpha=?, beta=?, wins=?, losses=?, total_pnl=?, n_obs=?, last_exit_reason=?
+               WHERE arm_key=?""",
+            (restored["alpha"], restored["beta"], restored["wins"], restored["losses"], restored["total_pnl"], restored["n_obs"], REASON, item["arm"]),
+        )
+    relabeled = []
+    for row in manual:
+        label = relabel_generic_manual_exit(conn, int(row["id"]))
+        if label:
+            relabeled.append({"id": row["id"], "label": label})
     conn.commit()
-    print("reversed", len(reversible), "unresolved", report[UNRESOLVED])
-    print("sample arm check", arm_key("SOL/USDT", "UNKNOWN", "range"))
+    print("reversed", len(reversible), "relabeled", relabeled, "unresolved", report[UNRESOLVED])
     return 0
 
 

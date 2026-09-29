@@ -152,6 +152,52 @@ def _weight(pnl: float) -> float:
     return float(min(MAX_WEIGHT, 1.0 + abs(float(pnl)) / (WIN_PNL_SCALE if pnl >= 0 else LOSS_PNL_SCALE)))
 
 
+def invert_latest_bandit_update(
+    *,
+    alpha: float,
+    beta: float,
+    wins: int,
+    losses: int,
+    total_pnl: float,
+    n_obs: int,
+    pnl: float,
+    exit_reason: str,
+) -> dict[str, float | int] | None:
+    """Remove the latest observation, including the decay that update applied.
+
+    Returns None when the stored counts cannot hold that observation.
+    """
+    if int(n_obs) < 1:
+        return None
+    win = _is_win(float(pnl), exit_reason)
+    weight = _weight(float(pnl))
+    restored_alpha = float(alpha)
+    restored_beta = float(beta)
+    if int(n_obs) > SLIDING_WINDOW:
+        restored_alpha = PRIOR_ALPHA + (restored_alpha - PRIOR_ALPHA) / 0.92
+        restored_beta = PRIOR_BETA + (restored_beta - PRIOR_BETA) / 0.92
+    restored_wins = int(wins)
+    restored_losses = int(losses)
+    if win:
+        restored_alpha -= weight
+        restored_wins -= 1
+    else:
+        restored_beta -= weight
+        restored_losses -= 1
+    if restored_wins < 0 or restored_losses < 0:
+        return None
+    if restored_alpha < PRIOR_ALPHA - 1e-6 or restored_beta < PRIOR_BETA - 1e-6:
+        return None
+    return {
+        "alpha": restored_alpha,
+        "beta": restored_beta,
+        "wins": restored_wins,
+        "losses": restored_losses,
+        "total_pnl": float(total_pnl) - float(pnl),
+        "n_obs": int(n_obs) - 1,
+    }
+
+
 def record_bandit_outcome(
     *,
     symbol: str,
