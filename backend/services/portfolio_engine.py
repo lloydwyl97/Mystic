@@ -2334,6 +2334,21 @@ class PriceCache:
         self._timestamps.clear()
 
 
+def _configured_live_status(engine: Any, capability: dict[str, Any]) -> dict[str, Any]:
+    from backend.services.live_readiness_service import configured_live_contract
+
+    ownership_known = bool(getattr(engine, "_ownership_state_known", True))
+    blocked = "" if capability.get("effective_entry_permitted") else str(capability.get("blocking_reason") or capability.get("no_trade_reason") or "hard_safety")
+    if not ownership_known:
+        blocked = "OWNERSHIP_STATE_UNKNOWN"
+    return configured_live_contract(
+        entry_permitted=bool(capability.get("effective_entry_permitted")) and ownership_known,
+        hard_safety_block=blocked,
+        kill_switch=str(capability.get("kill_switch_mode") or "RESUME"),
+        account_health="healthy" if capability.get("accounting_healthy") else "unhealthy",
+    )
+
+
 class PortfolioEngine:
     """
     Mystic Pro Portfolio Engine
@@ -2493,6 +2508,9 @@ class PortfolioEngine:
         # Live trading service for REAL MONEY execution
         self._live_service: LiveTradingService | None = None
         self._live_execution_enabled = LIVE_EXECUTION
+        # Live buys stay closed until the startup reconcile has loaded fills,
+        # lots, and protected inventory. Paper mode has no exchange book.
+        self._ownership_state_known = not bool(self._live_execution_enabled)
 
         # Exchange time offset (ms) for stale-signal/signature correction
         self.exchange_time_offset_ms: int = 0
@@ -3045,6 +3063,7 @@ class PortfolioEngine:
             self._compute_total_open_risk()
             self._last_live_reconcile_time = time.time()
             self._last_live_reconcile_actions = "bootstrap"
+            self._ownership_state_known = True
             self._write_reconcile_state_file("bootstrap")
         except Exception as e:
             logger.exception("LIVE_BOOTSTRAP_RECONCILE: %s", e)
@@ -3300,16 +3319,28 @@ class PortfolioEngine:
         booked = float(getattr(position, "quantity", 0) or 0)
         capped = capped_lot_quantity(proposed=proposed, booked=booked, owned=owned)
         if capped + 1e-15 < float(proposed or 0):
-            logger.warning(
-                "LOT_QTY_OWNERSHIP_CAPPED symbol=%s engine=%s trade_id=%s proposed=%.12g booked=%.12g fill_owned=%s capped=%.12g",
-                getattr(position, "symbol", ""),
-                getattr(position, "engine_id", ""),
-                getattr(position, "trade_id", ""),
-                float(proposed or 0),
-                booked,
-                owned,
-                capped,
+            signature = (
+                str(getattr(position, "symbol", "") or ""),
+                str(getattr(position, "engine_id", "") or ""),
+                str(getattr(position, "trade_id", "") or ""),
+                round(float(proposed or 0), 12),
+                round(booked, 12),
+                None if owned is None else round(float(owned), 12),
+                round(float(capped), 12),
             )
+            seen = self.__dict__.setdefault("_ownership_cap_logged", {})
+            if seen.get(signature[2] or signature[0]) != signature:
+                seen[signature[2] or signature[0]] = signature
+                logger.warning(
+                    "LOT_QTY_OWNERSHIP_CAPPED symbol=%s engine=%s trade_id=%s proposed=%.12g booked=%.12g fill_owned=%s capped=%.12g",
+                    signature[0],
+                    signature[1],
+                    signature[2],
+                    signature[3],
+                    signature[4],
+                    signature[5],
+                    signature[6],
+                )
         return capped
 
     async def _enforce_lot_ownership(self, lots: list) -> None:
@@ -3487,6 +3518,7 @@ class PortfolioEngine:
         if not self.open_positions:
             self._last_live_reconcile_time = time.time()
             self._last_live_reconcile_actions = "periodic"
+            self._ownership_state_known = True
             self._write_reconcile_state_file("periodic")
             return
         qty_epsilon = 1e-10
@@ -3590,6 +3622,7 @@ class PortfolioEngine:
         self._compute_total_open_risk()
         self._last_live_reconcile_time = time.time()
         self._last_live_reconcile_actions = "periodic"
+        self._ownership_state_known = True
         self._write_reconcile_state_file("periodic")
 
     def _cash_sync_skip_log(self, reason: str, **kwargs: object) -> None:
@@ -6926,6 +6959,7 @@ class PortfolioEngine:
                 extra=extra_payload,
             )
             record_trade_outcome(record, db_path=self.db_path, mode_override=(TradingMode.LIVE if self._live_execution_enabled else None))
+            opened_iso = None
             with contextlib.suppress(Exception):
                 from backend.services.ai_outcome_training_writer import record_outcome_training_row
                 from backend.services.ai_post_trade_feature_review import _lookup_entry_features
@@ -7017,24 +7051,26 @@ class PortfolioEngine:
                         _ctx["_feature_version"] = _fv_i
                         _ctx["feature_version"] = _fv_i
                     ctx_json = json.dumps(_ctx)
-                record_outcome_training_row(
-                    symbol=symbol,
-                    opened_at_utc=opened_iso or closed_iso,
-                    closed_at_utc=closed_iso,
-                    hold_seconds=record.hold_seconds,
-                    entry_price=entry_price or None,
-                    exit_price=float(exit_price) if exit_price is not None else None,
-                    net_profit_usd=float(realized_profit) if realized_profit is not None else None,
-                    net_profit_pct=net_pct,
-                    gross_pnl_pct=net_pct,
-                    close_reason=close_reason,
-                    strategy_id=(_prov["label_strategy"] if _prov["label_strategy"] != "day" else (str(getattr(position, "entry_strategy_id", "") or "day") or "day")),
-                    features_json=feats_json,
-                    context_json=ctx_json,
-                    explainability=ex_payload,
-                    manual_sell=manual_sell,
-                    db_path=self.db_path,
-                )
+                _skip_strategy_rows = bool(_prov.get("is_dust")) or str(close_reason or "").upper() in {"MANUAL_UNMATCHED", "HUMAN_MANUAL_SELL"} or str(close_reason or "").upper().startswith("FALSE_")
+                if not _skip_strategy_rows:
+                    record_outcome_training_row(
+                        symbol=symbol,
+                        opened_at_utc=opened_iso or closed_iso,
+                        closed_at_utc=closed_iso,
+                        hold_seconds=record.hold_seconds,
+                        entry_price=entry_price or None,
+                        exit_price=float(exit_price) if exit_price is not None else None,
+                        net_profit_usd=float(realized_profit) if realized_profit is not None else None,
+                        net_profit_pct=net_pct,
+                        gross_pnl_pct=net_pct,
+                        close_reason=close_reason,
+                        strategy_id=(_prov["label_strategy"] if _prov["label_strategy"] != "day" else (str(getattr(position, "entry_strategy_id", "") or "day") or "day")),
+                        features_json=feats_json,
+                        context_json=ctx_json,
+                        explainability=ex_payload,
+                        manual_sell=manual_sell,
+                        db_path=self.db_path,
+                    )
             with contextlib.suppress(Exception):
                 from backend.services.ai_post_trade_feature_review import record_post_trade_feature_review
 
@@ -7049,51 +7085,18 @@ class PortfolioEngine:
                     repair_add_count=int(getattr(position, "repair_add_count", 0) or 0),
                     db_path=self.db_path,
                 )
-            with contextlib.suppress(Exception):
-                from backend.services.ai_post_trade_feature_review import _lookup_entry_features
-                from backend.services.day_outcome_attribution import record_outcome_attribution
+            from backend.services.learning_provenance import day_strategy_learning_allowed
 
-                entry_feats = _lookup_entry_features(
-                    self.db_path,
-                    decision_id=str(ex_payload.get("decision_id") or ""),
+            if day_strategy_learning_allowed(_prov["engine_id"], close_reason, is_dust=bool(_prov.get("is_dust"))):
+                self._record_day_strategy_learning(
                     symbol=symbol,
-                    opened_at_utc=opened_iso,
-                )
-                record_outcome_attribution(
-                    trade_id=str(tid or getattr(position, "trade_id", "") or ""),
-                    symbol=symbol,
-                    explainability=ex_payload,
-                    net_profit_usd=float(realized_profit) if realized_profit is not None else None,
-                    net_profit_pct=net_pct,
+                    position=position,
                     close_reason=close_reason,
+                    realized_profit=realized_profit,
+                    net_pct=net_pct,
+                    ex_payload=ex_payload if isinstance(ex_payload, dict) else {},
                     hold_seconds=record.hold_seconds,
-                    entry_features=entry_feats,
-                    db_path=self.db_path,
-                )
-            with contextlib.suppress(Exception):
-                from backend.services.day_market_memory import update_market_memory_on_close_sync
-
-                update_market_memory_on_close_sync(
-                    symbol,
-                    setup=str(ex_payload.get("setup_type") or ex_payload.get("entry_thesis") or ""),
-                    net_pnl_pct=net_pct,
-                    close_reason=close_reason,
-                    outcome_class=str(ex_payload.get("outcome_reason") or ""),
-                )
-            # Promote/starve DAY arms from realized close (Thompson bandit).
-            with contextlib.suppress(Exception):
-                from backend.services.day_outcome_bandit import record_bandit_outcome
-
-                _setup = str(ex_payload.get("setup_type_canonical") or ex_payload.get("setup_type") or ex_payload.get("entry_thesis") or "")
-                _regime = str(ex_payload.get("day_route_regime") or ex_payload.get("regime") or "range")
-                record_bandit_outcome(
-                    symbol=symbol,
-                    setup=_setup,
-                    regime=_regime,
-                    pnl_usd=float(realized_profit) if realized_profit is not None else 0.0,
-                    exit_reason=str(close_reason or ""),
-                    db_path=self.db_path,
-                    trade_id=str(getattr(position, "trade_id", "") or ""),
+                    opened_iso=opened_iso,
                 )
         except Exception as e:
             logger.debug(
@@ -7101,6 +7104,63 @@ class PortfolioEngine:
                 symbol,
                 close_reason,
                 e,
+            )
+
+    def _record_day_strategy_learning(
+        self,
+        *,
+        symbol: str,
+        position: OpenPosition,
+        close_reason: str,
+        realized_profit: float | None,
+        net_pct: float | None,
+        ex_payload: dict[str, Any],
+        hold_seconds: int,
+        opened_iso: str | None,
+    ) -> None:
+        """DAY bandit, DAY attribution, and DAY setup memory. Never called for SCALP."""
+        with contextlib.suppress(Exception):
+            from backend.services.ai_post_trade_feature_review import _lookup_entry_features
+            from backend.services.day_outcome_attribution import record_outcome_attribution
+
+            entry_feats = _lookup_entry_features(
+                self.db_path,
+                decision_id=str(ex_payload.get("decision_id") or ""),
+                symbol=symbol,
+                opened_at_utc=opened_iso,
+            )
+            record_outcome_attribution(
+                trade_id=str(getattr(position, "trade_id", "") or ""),
+                symbol=symbol,
+                explainability=ex_payload,
+                net_profit_usd=float(realized_profit) if realized_profit is not None else None,
+                net_profit_pct=net_pct,
+                close_reason=close_reason,
+                hold_seconds=hold_seconds,
+                entry_features=entry_feats,
+                db_path=self.db_path,
+            )
+        with contextlib.suppress(Exception):
+            from backend.services.day_market_memory import update_market_memory_on_close_sync
+
+            update_market_memory_on_close_sync(
+                symbol,
+                setup=str(ex_payload.get("setup_type") or ex_payload.get("entry_thesis") or ""),
+                net_pnl_pct=net_pct,
+                close_reason=close_reason,
+                outcome_class=str(ex_payload.get("outcome_reason") or ""),
+            )
+        with contextlib.suppress(Exception):
+            from backend.services.day_outcome_bandit import record_bandit_outcome
+
+            record_bandit_outcome(
+                symbol=symbol,
+                setup=str(ex_payload.get("setup_type_canonical") or ex_payload.get("setup_type") or ex_payload.get("entry_thesis") or ""),
+                regime=str(ex_payload.get("day_route_regime") or ex_payload.get("regime") or "range"),
+                pnl_usd=float(realized_profit) if realized_profit is not None else 0.0,
+                exit_reason=str(close_reason or ""),
+                db_path=self.db_path,
+                trade_id=str(getattr(position, "trade_id", "") or ""),
             )
 
     def _record_trade_pattern_memory(
@@ -7120,12 +7180,16 @@ class PortfolioEngine:
         Best-effort: never raises into the engine (see ai_pattern_memory.py).
         """
         from backend.services.ai_pattern_memory import build_pattern_vector, record_trade_pattern
+        from backend.services.learning_provenance import day_strategy_learning_allowed, engine_of, is_dust_close
 
         tid = str(getattr(position, "trade_id", "") or "")
+        engine_id = engine_of(position)
+        if is_dust_close(reason, getattr(position, "status", "")) or not (engine_id == "SCALP_V2" or day_strategy_learning_allowed(engine_id, reason)):
+            return
         ex_payload: dict[str, Any] = {}
         if tid and tid in self.trade_explanations:
             ex_payload = self.trade_explanations[tid].to_dict()
-        strategy_id = str(getattr(position, "entry_strategy_id", "") or "day") or "day"
+        strategy_id = "scalp" if engine_id == "SCALP_V2" else (str(getattr(position, "entry_strategy_id", "") or "day") or "day")
         entry_ts = float(getattr(position, "entry_time", 0.0) or 0.0)
         entry_iso = datetime.fromtimestamp(entry_ts, tz=timezone.utc).isoformat() if entry_ts > 0 else ""
         vector = build_pattern_vector(
@@ -9484,6 +9548,10 @@ class PortfolioEngine:
             if persist is not None:
                 persist(symbol, decision_id=decision_id, intent_id=trailing_buy_intent_id)
             return None
+        if getattr(self, "_live_execution_enabled", False) and not getattr(self, "_ownership_state_known", True):
+            self.last_buy_reject_reason = "OWNERSHIP_STATE_UNKNOWN"
+            logger.warning("BUY_BLOCKED_OWNERSHIP_UNKNOWN symbol=%s", symbol)
+            return None
         normalized_symbol_for_lock = normalize_symbol(symbol)
         # PE-3: Hard-gate — only DAY_TRADE_SYMBOLS may execute buys.
         if _to_api_symbol(symbol) not in DAY_TRADE_SYMBOLS:
@@ -9599,6 +9667,10 @@ class PortfolioEngine:
         if str(entry_authority or "") != ENTRY_AUTHORITY_SCALP_V2_CONFIRMED:
             logger.error("SCALP_V2_BUY_BLOCKED symbol=%s UNKNOWN_ENGINE authority=%s", symbol, entry_authority or "missing")
             self.last_buy_reject_reason = "UNKNOWN_ENGINE"
+            return None
+        if getattr(self, "_live_execution_enabled", False) and not getattr(self, "_ownership_state_known", True):
+            self.last_buy_reject_reason = "OWNERSHIP_STATE_UNKNOWN"
+            logger.warning("SCALP_V2_BUY_BLOCKED symbol=%s OWNERSHIP_STATE_UNKNOWN", symbol)
             return None
 
         norm = normalize_symbol(symbol)
@@ -21802,6 +21874,7 @@ class PortfolioEngine:
             "day_entry_execution_error": capability.get("day_entry_execution_error"),
             "day_entry_path": _day_live_entry_path(),
             "two_engine_capital": self._two_engine_capital_status(),
+            "always_live": _configured_live_status(self, capability),
             "trailing_buy_intents_live_authority": _day_live_entry_path() != "direct",
             "trailing_buy_intents": self.get_trailing_buy_intent_status(),
             "day_decision_holds": self.get_day_decision_holds(),

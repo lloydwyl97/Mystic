@@ -89,7 +89,7 @@ def _restore_weights(conn: sqlite3.Connection, apply: bool, report: dict) -> Non
             if ok and apply:
                 key = f"{sid}|{sym}|{regime}|{comp}"
                 conn.execute("CREATE TEMP VIEW IF NOT EXISTS _w AS SELECT strategy_id||'|'||symbol||'|'||regime||'|'||component_name AS k, * FROM ai_strategy_score_weights")
-                _backup(conn, "_w", "k", key, "restore_adaptive_weight", reason)
+                _backup(conn, "_w", "k", key, "restore_adaptive_weight", reason, table_label="ai_strategy_score_weights")
                 conn.execute(
                     "UPDATE ai_strategy_score_weights SET weight=previous_weight WHERE LOWER(strategy_id)=? AND UPPER(symbol)=? AND LOWER(regime)=LOWER(?) AND component_name=?",
                     (sid, sym, regime, comp),

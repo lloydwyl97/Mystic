@@ -14,6 +14,33 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def configured_live_contract(
+    *,
+    entry_permitted: bool,
+    hard_safety_block: str,
+    kill_switch: str,
+    account_health: str,
+) -> dict[str, Any]:
+    """Configured production mode, separate from a temporary hard-safety block.
+
+    A safety pause never rewrites configured_mode. Both engines share that mode.
+    """
+    configured = (os.getenv("MYSTIC_TRADING_MODE") or os.getenv("TRADING_MODE") or os.getenv("EXECUTION_MODE") or "unconfigured").strip().lower()
+    execution = (os.getenv("EXECUTION_MODE") or configured).strip().lower()
+    live = configured == "live" and execution == "live"
+    block = str(hard_safety_block or "").strip() or "none"
+    return {
+        "configured_mode": "LIVE" if configured == "live" else configured.upper(),
+        "execution_mode": "LIVE" if execution == "live" else execution.upper(),
+        "day_live": live,
+        "scalp_live": live,
+        "entry_permitted": bool(entry_permitted) and live and block == "none",
+        "hard_safety_block": block,
+        "kill_switch": str(kill_switch or "RESUME"),
+        "account_health": str(account_health or "unknown"),
+    }
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name, "")
     if not raw:
@@ -239,4 +266,10 @@ async def build_live_readiness_report() -> dict[str, Any]:
         "sleeve_blocking_enabled": ENABLE_SLEEVE_BLOCKING,
         "sleeve_telemetry_only": not ENABLE_SLEEVE_BLOCKING,
         "exchange_probe_errors": exchange.get("errors", []),
+        "always_live": configured_live_contract(
+            entry_permitted=bool(permitted),
+            hard_safety_block="" if permitted else str(block_reason or "live_orders_blocked"),
+            kill_switch="unknown_from_this_probe",
+            account_health="ok" if exchange.get("binance_api_auth_status") == "ok" else str(exchange.get("binance_api_auth_status") or "unknown"),
+        ),
     }

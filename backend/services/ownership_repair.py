@@ -38,7 +38,16 @@ def ensure_backup_table(conn: sqlite3.Connection) -> None:
     )
 
 
-def _backup(conn: sqlite3.Connection, table: str, key_col: str, key: Any, action: str, reason: str) -> dict[str, Any] | None:
+def _backup(
+    conn: sqlite3.Connection,
+    table: str,
+    key_col: str,
+    key: Any,
+    action: str,
+    reason: str,
+    *,
+    table_label: str | None = None,
+) -> dict[str, Any] | None:
     ensure_backup_table(conn)
     conn.row_factory = sqlite3.Row
     row = conn.execute(f"SELECT * FROM {table} WHERE {key_col}=?", (key,)).fetchone()
@@ -47,7 +56,7 @@ def _backup(conn: sqlite3.Connection, table: str, key_col: str, key: Any, action
     data = dict(row)
     conn.execute(
         f"INSERT INTO {BACKUP_TABLE} (table_name, row_key, row_json, action, reason, backed_up_at) VALUES (?,?,?,?,?,?)",
-        (table, f"{key_col}={key}", json.dumps(data, default=str), action, reason, _now()),
+        (table_label or table, f"{key_col}={key}", json.dumps(data, default=str), action, reason, _now()),
     )
     return data
 

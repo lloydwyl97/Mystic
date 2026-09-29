@@ -18,9 +18,26 @@ import sqlite3
 from typing import Any
 
 SCALP_ENGINE = "SCALP_V2"
+DAY_ENGINE = "DAY_V2"
 LEGACY_ENGINE = "LEGACY_DAY_LIVE"
 UNKNOWN_SETUP = "UNKNOWN"
 DUST_LABEL = "dust"
+DAY_LEARNING_ENGINES = frozenset({DAY_ENGINE, LEGACY_ENGINE})
+_NO_STRATEGY_LEARNING = frozenset({"MANUAL_UNMATCHED", "HUMAN_MANUAL_SELL", "DUST_WRITEOFF"})
+
+
+def day_strategy_learning_allowed(engine_id: str, close_reason: str | None, *, is_dust: bool = False) -> bool:
+    """DAY bandit, DAY attribution, and DAY setup memory.
+
+    SCALP_V2 keeps its own learning rows and never updates those DAY structures.
+    Dust, unmatched closes, and accounting corrections update none of them.
+    """
+    if is_dust:
+        return False
+    reason = str(close_reason or "").strip().upper()
+    if reason in _NO_STRATEGY_LEARNING or reason.startswith("FALSE_"):
+        return False
+    return str(engine_id or "").strip().upper() in DAY_LEARNING_ENGINES
 
 
 def engine_of(position: Any) -> str:
