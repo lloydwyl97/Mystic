@@ -14,14 +14,17 @@
 #   logrotate --debug /etc/logrotate.d/mystic    # verify only, changes nothing
 #   logrotate --force /etc/logrotate.d/mystic    # first rotation
 #
-# Bounded footprint: 20 MB active + 5 compressed backups per log. These logs are
-# repetitive line-oriented text and gzip at roughly 15-20x, so the steady state
-# is about 20 MB + 5 x ~1.2 MB = ~26 MB per rotating log.
+# Retention: the 20 MB rule fires about hourly on the busiest logs, so the
+# backup count is the retention window. 60 backups keep at least 48 hours of
+# every log; maxage bounds the slow logs. Compressed backups measure 0.25-1.6 MB
+# each (mystic_portfolio.log is the largest), so the worst case is about
+# 20 MB active + 60 x 1.6 MB = ~116 MB per busy log, ~250 MB in total.
 
 /home/mystic/mystic/logs/*.log
 /home/mystic/.cursor/debug.log {
     size 20M
-    rotate 5
+    rotate 60
+    maxage 7
     compress
     missingok
     notifempty

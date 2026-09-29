@@ -564,7 +564,12 @@ def test_logrotate_config_is_bounded_and_uses_copytruncate():
     assert "copytruncate" in text
     assert "compress" in text
     assert "size 20M" in text
-    assert "rotate 5" in text
+    # Hourly size rotation: >= 48 backups keeps >= 48 hours of history.
+    import re
+
+    rotate = int(re.search(r"^\s*rotate\s+(\d+)", text, re.MULTILINE).group(1))
+    assert rotate >= 48
+    assert "maxage" in text
     assert "/home/mystic/mystic/logs/*.log" in text
     assert "/home/mystic/.cursor/debug.log" in text
     # copytruncate copies to a file nothing writes to, so compress on the same pass.

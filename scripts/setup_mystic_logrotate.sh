@@ -3,9 +3,8 @@
 #
 # Policy
 # ──────
-#   • Rotate daily when > 20 MB or weekly unconditionally.
-#   • Keep 7 rotated copies (7 days of history).
-#   • Compress rotated logs with gzip (saves ~90% space).
+#   • Installs deploy/logrotate-mystic (the canonical policy).
+#   • Rotate at 20 MB (checked hourly), keep 60 compressed copies (>= 48 h), maxage 7 days.
 #   • Never touch mystic_trading.db, *.db, *.db-wal, *.db-shm, *.json, *.bak*.
 #   • Safe to run multiple times (idempotent).
 #
@@ -19,20 +18,7 @@ LOG_DIR=/home/mystic/mystic/logs
 
 echo "Installing logrotate config → $CONF"
 
-cat > "$CONF" << 'EOF'
-/home/mystic/mystic/logs/*.log {
-    daily
-    size 20M
-    rotate 7
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-    # Owner / permissions preserved.
-    su mystic mystic
-}
-EOF
+cp "$(dirname "$0")/../deploy/logrotate-mystic" "$CONF"
 
 chmod 644 "$CONF"
 
@@ -55,5 +41,5 @@ ls -lh "$LOG_DIR"/ 2>/dev/null | sort -k5 -rh | head -20
 
 echo ""
 echo "Done. Logrotate installed at $CONF"
-echo "Logs retain: 7 compressed copies, daily/20MB trigger."
+echo "Logs retain: 60 compressed copies (>= 48 h), 20MB trigger, maxage 7 days."
 echo "Active log files are preserved via copytruncate (no restart required)."
