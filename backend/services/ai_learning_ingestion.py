@@ -1337,12 +1337,12 @@ CREATE INDEX IF NOT EXISTS ix_scalp_lo_symbol ON scalp_learning_outcomes(symbol,
 CREATE INDEX IF NOT EXISTS ix_scalp_lo_setup ON scalp_learning_outcomes(setup_name, exit_timestamp);
 """
 
-_scalp_outcomes_tables_ready = False
+_scalp_outcomes_tables_ready: set[str] = set()
 
 
 def _ensure_scalp_outcomes_table(db_path: str) -> None:
-    global _scalp_outcomes_tables_ready
-    if _scalp_outcomes_tables_ready:
+    key = str(db_path)
+    if key in _scalp_outcomes_tables_ready:
         return
     with sqlite3.connect(db_path) as conn:
         for stmt in _SCALP_OUTCOMES_SCHEMA.strip().split(";"):
@@ -1350,7 +1350,7 @@ def _ensure_scalp_outcomes_table(db_path: str) -> None:
             if s:
                 conn.execute(s)
         conn.commit()
-    _scalp_outcomes_tables_ready = True
+    _scalp_outcomes_tables_ready.add(key)
 
 
 def ingest_scalp_outcomes(db_path: str = DATABASE_PATH) -> dict[str, int]:

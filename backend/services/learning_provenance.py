@@ -6,7 +6,8 @@ both label a trade the same way:
 - engine_id: the lot's owner (DAY_V2, SCALP_V2, or LEGACY_DAY_LIVE when unset).
 - strategy: "scalp" for SCALP_V2, otherwise "day". Never "day" for SCALP.
 - setup: the entry setup, or "UNKNOWN" when no source records it.
-- is_dust: a dust close (DUST_WRITEOFF, or a DUST_PENDING lot being closed).
+- is_dust: a dust close (DUST_WRITEOFF, or a lot that was already DUST_PENDING
+  before the sell began; a residual left by a real sell does not count).
   Dust is an inventory artefact, not a strategy outcome, so label_strategy
   becomes "dust" and strategy learners (strategy_id='day'/'scalp') skip it.
 """
@@ -52,6 +53,45 @@ def is_dust_close(close_reason: str | None, position_status: str | None = None) 
     return str(close_reason or "").upper() == "DUST_WRITEOFF" or str(position_status or "").upper() == "DUST_PENDING"
 
 
+def capture_close_provenance(position: Any, *, exit_trigger: str, sell_qty: float) -> dict[str, Any]:
+    """Snapshot taken before the sell path mutates the lot.
+
+    The sell leaves a residual marked DUST_PENDING; reading status afterwards
+    would label a real strategy exit as a dust event.
+    """
+    engine_id = engine_of(position)
+    status = str(getattr(position, "status", "") or "").upper()
+    return {
+        "engine_id": engine_id,
+        "strategy": strategy_for_engine(engine_id),
+        "original_trade_id": str(getattr(position, "trade_id", "") or ""),
+        "exit_trigger": str(exit_trigger or ""),
+        "pre_close_status": status,
+        "pre_close_qty": float(getattr(position, "quantity", 0.0) or 0.0),
+        "sell_qty": float(sell_qty or 0.0),
+        "residual_qty": None,
+        "is_strategy_close": status != "DUST_PENDING",
+    }
+
+
+def close_provenance_of(position: Any) -> dict[str, Any] | None:
+    prov = getattr(position, "_close_provenance", None)
+    if not isinstance(prov, dict):
+        return None
+    if prov.get("original_trade_id") != str(getattr(position, "trade_id", "") or ""):
+        return None
+    return prov
+
+
+def close_is_dust(position: Any, close_reason: str | None) -> bool:
+    if str(close_reason or "").upper() == "DUST_WRITEOFF":
+        return True
+    prov = close_provenance_of(position)
+    if prov is not None:
+        return not bool(prov.get("is_strategy_close"))
+    return is_dust_close(close_reason, getattr(position, "status", ""))
+
+
 def _lookup_setup(db_path: str, engine_id: str, *, trade_id: str, opportunity_id: str) -> str:
     queries: list[tuple[str, tuple]] = []
     if engine_id == SCALP_ENGINE and opportunity_id:
@@ -95,8 +135,8 @@ def resolve_setup(db_path: str, position: Any, explain: dict | None = None) -> s
 def learning_provenance(db_path: str, position: Any, close_reason: str | None, explain: dict | None = None) -> dict[str, Any]:
     engine_id = engine_of(position)
     strategy = strategy_for_engine(engine_id)
-    dust = is_dust_close(close_reason, getattr(position, "status", ""))
-    return {
+    dust = close_is_dust(position, close_reason)
+    out: dict[str, Any] = {
         "engine_id": engine_id,
         "trade_id": str(getattr(position, "trade_id", "") or ""),
         "strategy": strategy,
@@ -104,3 +144,19 @@ def learning_provenance(db_path: str, position: Any, close_reason: str | None, e
         "is_dust": dust,
         "label_strategy": DUST_LABEL if dust else strategy,
     }
+    prov = close_provenance_of(position)
+    if prov is not None:
+        residual = prov.get("residual_qty")
+        if residual is None:
+            residual = float(getattr(position, "quantity", 0.0) or 0.0)
+        out.update(
+            {
+                "original_trade_id": prov.get("original_trade_id"),
+                "exit_trigger": prov.get("exit_trigger"),
+                "pre_close_status": prov.get("pre_close_status"),
+                "sell_qty": prov.get("sell_qty"),
+                "residual_qty": float(residual),
+                "is_strategy_close": bool(prov.get("is_strategy_close")) and not dust,
+            }
+        )
+    return out
