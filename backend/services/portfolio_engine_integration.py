@@ -2159,6 +2159,12 @@ class PortfolioEngineIntegration:
                 )
                 if result is not None:
                     record_scalp_decision(self.engine.db_path, norm, "FILLED", "FILLED", cycle_ts=cycle_ts, detail=str(result.get("order_id") or ""))
+                    try:
+                        from backend.services.scalp_v2.entry_context import build_entry_context, persist_entry_context
+
+                        persist_entry_context(self.engine.db_path, order_id=str(result.get("order_id") or ""), context=build_entry_context(row, cycle_ts=cycle_ts))
+                    except Exception:
+                        logger.debug("SCALP_V2_ENTRY_CONTEXT_SKIPPED symbol=%s", norm, exc_info=True)
                     logger.warning(
                         "SCALP_V2_ENTRY_FILLED symbol=%s opp=%s qty=%.8f price=%.6f order_id=%s",
                         norm,
