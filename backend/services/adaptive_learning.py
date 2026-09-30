@@ -89,6 +89,32 @@ MICRO_MODEL_TILT_MAX = 0.0015  # max absolute edge tilt the model can add (15 bp
 MICRO_MODEL_STD_ALPHA = 0.05  # EWMA rate for feature standardisation stats
 MICRO_MODEL_CONF_K = 20.0  # shrink the tilt by n/(n+K) so a cold model barely moves
 
+# Evidence-gated abstention (LIVE entry skip). This is the +55 bps "trade / no
+# trade" lever. It only ever SKIPS a candidate for the current cycle — it never
+# forces a trade and never overrides hard safety, which stays the floor beneath
+# it. Cold / low-confidence keys NEVER abstain, so on deploy behaviour is
+# identical to today and abstention only engages as real cost-adjusted negative
+# expectancy accrues per (engine, symbol, setup, regime). It is self-healing:
+# a setup whose learned net edge recovers above the margin trades again.
+# Kill-switch: ADAPTIVE_ABSTENTION_ENABLED=false disables it instantly, no redeploy.
+ABSTAIN_ENABLED = (os.getenv("ADAPTIVE_ABSTENTION_ENABLED", "true") or "true").strip().lower() in ("1", "true", "yes", "on")
+ABSTAIN_CONFIDENCE_FLOOR = float(os.getenv("ADAPTIVE_ABSTENTION_CONFIDENCE_FLOOR", "0.5") or "0.5")
+ABSTAIN_EDGE_MARGIN = float(os.getenv("ADAPTIVE_ABSTENTION_EDGE_MARGIN", "0.0005") or "0.0005")
+
+
+def _abstain(net_edge: float, confidence: float) -> tuple[bool, str]:
+    """Decide whether to skip a candidate on confident negative net expectancy.
+
+    Returns (abstain, reason). Cold or low-confidence keys return (False, "").
+    Skip-only: callers must never turn this into a forced trade, and it never
+    bypasses hard safety.
+    """
+    if not ABSTAIN_ENABLED:
+        return False, ""
+    if confidence >= ABSTAIN_CONFIDENCE_FLOOR and net_edge <= -ABSTAIN_EDGE_MARGIN:
+        return True, f"LEARNED_NEGATIVE_EDGE net={net_edge:.5f} conf={confidence:.2f}"
+    return False, ""
+
 
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, float(value)))
@@ -303,6 +329,10 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str) -> dict[str
     )
     lo, hi = SIZE_BOUNDS[DAY_ENGINE]
     confidence = n_eff / (PRIOR_STRENGTH + n_eff)
+    # Abstention reads the cost-adjusted forward markout (its mean goes negative
+    # with real evidence), gated by that metric's own sample confidence.
+    abstain_conf = forward["n"] / (PRIOR_STRENGTH + forward["n"])
+    abstain_flag, abstain_reason = _abstain(forward["mean"], abstain_conf)
     return {
         "adaptive_state_version": ADAPTIVE_STATE_VERSION,
         "engine_id": DAY_ENGINE,
@@ -312,6 +342,10 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str) -> dict[str
         "expected_move": expected,
         "expected_move_prior": mfe["prior"],
         "confidence": confidence,
+        "abstain": abstain_flag,
+        "abstain_reason": abstain_reason,
+        "abstain_net_edge": forward["mean"],
+        "abstain_confidence": abstain_conf,
         "uncertainty": mfe["prior"] * (1.0 - confidence),
         "mfe": mfe["mean"],
         "mae": mae["mean"],
@@ -468,6 +502,10 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features:
         "micro_tilt": round(micro_conf * micro_tilt, 6),
         "micro_tilt_raw": round(micro_tilt, 6),
         "micro_model_n": micro_n,
+        "abstain": _abstain(edge, confidence)[0],
+        "abstain_reason": _abstain(edge, confidence)[1],
+        "abstain_net_edge": edge,
+        "abstain_confidence": confidence,
     }
 
 
@@ -772,6 +810,7 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                             "size_mult": round(view["size_mult"], 4),
                             "objective_atr_mult": round(view["objective_atr_mult"], 4),
                             "confidence": round(view["confidence"], 3),
+                            "abstain": view["abstain"],
                             "n": view["n_mfe"],
                         }
                     )
@@ -786,6 +825,7 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                             "target_pct": round(view["target_pct"], 5),
                             "hold_min": round(view["hold_min"], 2),
                             "confidence": round(view["confidence"], 3),
+                            "abstain": view["abstain"],
                             "n": view["n_net"],
                         }
                     )

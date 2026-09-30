@@ -1846,6 +1846,15 @@ class PortfolioEngineIntegration:
         ask_price = cand["ask_price"]
         db_sym_15m = cand["db_symbol"]
         as_of = cand["as_of"]
+        # Evidence-gated abstention (LIVE skip). Only fires on confident,
+        # cost-adjusted negative expectancy for this setup/regime; cold keys
+        # never abstain. Skip-only — it never forces a trade and sits above,
+        # not around, hard safety.
+        _adapt = cand.get("adaptive") or {}
+        if isinstance(_adapt, dict) and _adapt.get("abstain"):
+            record_day_decision(db_path, symbol, "REJECTED:LEARNED_NEGATIVE_EDGE", cycle_ts=as_of, closest=str(_adapt.get("abstain_reason") or ""))
+            logger.info("DAY_V2_ABSTAIN symbol=%s reason=%s", symbol, _adapt.get("abstain_reason"))
+            return
         # Engine sizing, then clamped to what the DAY sleeve can still fund
         # (open DAY lots and live reservations included). SCALP capital is never used.
         atr_val = float(signal.atr or 0.0)
@@ -2185,6 +2194,13 @@ class PortfolioEngineIntegration:
                         record_scalp_decision(self.engine.db_path, norm, "REJECTED:SYMBOL_OCCUPIED", "SYMBOL_OCCUPIED")
                         logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:SYMBOL_OCCUPIED", norm)
                         continue
+                # Evidence-gated abstention (LIVE skip). Confident negative net
+                # expectancy only; cold keys never abstain. Skip-only, above hard safety.
+                _adapt = (row or {}).get("adaptive_decision") or {}
+                if isinstance(_adapt, dict) and _adapt.get("abstain"):
+                    record_scalp_decision(self.engine.db_path, norm, "REJECTED:LEARNED_NEGATIVE_EDGE", str(_adapt.get("abstain_reason") or ""), cycle_ts=cycle_ts)
+                    logger.info("SCALP_V2_ABSTAIN symbol=%s reason=%s", norm, _adapt.get("abstain_reason"))
+                    continue
                 arm_price = 0.0
                 snap = (row or {}).get("snap")
                 if snap is not None:

@@ -502,6 +502,51 @@ def test_micro_model_flows_through_resolve_and_scalp_decision(tmp_path):
     assert with_feats["expected_edge"] > without["expected_edge"]
 
 
+def test_abstention_cold_key_never_skips(tmp_path):
+    """On a cold key (no evidence) abstention must never fire — deploy safety."""
+    db = str(tmp_path / "t.db")
+    assert day_decision(db, "BTCUSDT", "HTF_TREND_PULLBACK", "")["abstain"] is False
+    assert scalp_decision(db, "BTCUSDT", "VWAP_EMA_RECLAIM", "")["abstain"] is False
+
+
+def test_abstention_fires_on_confident_negative_edge(tmp_path):
+    db = str(tmp_path / "t.db")
+    for _ in range(40):
+        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="markout_forward", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
+    d = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")
+    assert d["abstain"] is True
+    assert "LEARNED_NEGATIVE_EDGE" in d["abstain_reason"]
+    assert d["abstain_net_edge"] <= -0.0005
+    assert d["abstain_confidence"] >= 0.5
+    for _ in range(40):
+        observe(db, engine=SCALP, symbol="XRPUSDT", setup="RANGE_BOUNCE_SCALP", regime="", metric="trade_net", value=-0.01, strategy_version=SCALP_STRATEGY_VERSION)
+    s = scalp_decision(db, "XRPUSDT", "RANGE_BOUNCE_SCALP", "")
+    assert s["abstain"] is True
+    # A different, unobserved setup on the same symbol stays tradeable (skip is scoped).
+    assert scalp_decision(db, "XRPUSDT", "VWAP_EMA_RECLAIM", "")["abstain"] is False
+
+
+def test_abstention_kill_switch_disables_it(tmp_path, monkeypatch):
+    from backend.services import adaptive_learning as al
+
+    db = str(tmp_path / "t.db")
+    for _ in range(40):
+        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="markout_forward", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
+    assert day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")["abstain"] is True
+    monkeypatch.setattr(al, "ABSTAIN_ENABLED", False)
+    assert day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")["abstain"] is False
+
+
+def test_abstention_is_live_skip_only(tmp_path):
+    """Both engines enforce the skip in the live path, and only ever skip."""
+    from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
+
+    fund = inspect.getsource(PortfolioEngineIntegration._fund_day_v2_candidate)
+    assert "abstain" in fund and "REJECTED:LEARNED_NEGATIVE_EDGE" in fund and "return" in fund
+    scalp = inspect.getsource(PortfolioEngineIntegration._process_scalp_v2_signals)
+    assert "abstain" in scalp and "REJECTED:LEARNED_NEGATIVE_EDGE" in scalp and "continue" in scalp
+
+
 def test_micro_model_is_scalp_only_and_not_a_gate(tmp_path):
     db = str(tmp_path / "t.db")
     for _ in range(40):
