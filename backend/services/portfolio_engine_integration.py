@@ -1783,8 +1783,8 @@ class PortfolioEngineIntegration:
                             "as_of": as_of,
                         }
                     )
+                    from backend.config.trading_economics import canonical_roundtrip_cost_pct
                     from backend.services.adaptive_learning import market_regime_tag, record_candidate
-                    from backend.services.portfolio_engine import ESTIMATED_ROUNDTRIP_COST
 
                     # One regime key for the whole candidate lifecycle: the markout
                     # record, the entry decision, and the close all use this tag so
@@ -1799,7 +1799,7 @@ class PortfolioEngineIntegration:
                         setup=signal.setup,
                         regime=regime_tag,
                         ref_price=ask_price,
-                        roundtrip_cost=ESTIMATED_ROUNDTRIP_COST,
+                        roundtrip_cost=canonical_roundtrip_cost_pct(),
                         signaled=True,
                         evaluated_at=as_of,
                     )
@@ -1809,16 +1809,16 @@ class PortfolioEngineIntegration:
 
             if not candidates:
                 return
+            from backend.config.trading_economics import canonical_roundtrip_cost_pct
             from backend.services.adaptive_learning import day_decision, ohlcv_quote, resolve_markouts
             from backend.services.day_v2.ranking import rank_day_candidates
-            from backend.services.portfolio_engine import ESTIMATED_ROUNDTRIP_COST
 
             resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts))
             for cand in candidates:
                 sig = cand["signal"]
                 regime_tag = str(cand.get("regime_tag") or sig.regime or "")
                 cand["adaptive"] = day_decision(db_path, cand["symbol"], sig.setup, regime_tag)
-            ranked = rank_day_candidates(candidates, list(DAY_V2_UNIVERSE), ESTIMATED_ROUNDTRIP_COST)
+            ranked = rank_day_candidates(candidates, list(DAY_V2_UNIVERSE), canonical_roundtrip_cost_pct())
             logger.info(
                 "DAY_V2_RANKED %s",
                 " ".join(f"{c['rank']['position']}:{c['symbol']}:{c['signal'].setup}:edge={c['rank']['executable_objective_edge']:.5f}" for c in ranked),
@@ -2128,8 +2128,8 @@ class PortfolioEngineIntegration:
         from backend.services.day_entry_reservations import release_orphan_reservations
 
         release_orphan_reservations(self.engine.db_path, now=cycle_ts)
+        from backend.config.trading_economics import canonical_roundtrip_cost_pct
         from backend.services.adaptive_learning import market_regime_tag, ohlcv_quote, record_candidate, resolve_markouts, scalp_decision
-        from backend.services.portfolio_engine import ESTIMATED_ROUNDTRIP_COST
 
         resolve_markouts(self.engine.db_path, lambda sym, ts: ohlcv_quote(self.engine.db_path, sym, ts))
         by_symbol = {str(row.get("symbol") or "").upper().replace("-", "").replace("/", ""): row for row in candidates}
@@ -2165,7 +2165,7 @@ class PortfolioEngineIntegration:
                 setup=setup_name,
                 regime=regime,
                 ref_price=ref_price,
-                roundtrip_cost=ESTIMATED_ROUNDTRIP_COST,
+                roundtrip_cost=canonical_roundtrip_cost_pct(spread_pct=(float(micro_feats["spread_pct"]) if micro_feats.get("spread_pct") is not None else None)),
                 signaled=True,
                 features=micro_feats,
             )

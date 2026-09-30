@@ -19,28 +19,62 @@ from typing import Any
 from backend.services.day_v2.winner_contract import move_potential, objective_level
 
 
-def executable_objective_edge(signal: Any, ask_price: float, roundtrip_cost: float) -> float:
+def executable_objective_edge(
+    signal: Any,
+    ask_price: float,
+    roundtrip_cost: float,
+    *,
+    atr_mult: float = 1.0,
+    structural_emphasis: float = 1.0,
+) -> float:
     ask = float(ask_price or 0.0)
     if ask <= 0:
         return 0.0
     atr_1h = float(getattr(signal, "atr_1h", 0.0) or 0.0)
     structural = float(getattr(signal, "objective_structural", 0.0) or 0.0)
-    objective = objective_level(str(signal.setup), ask, atr_1h, structural)
+    objective = objective_level(
+        str(signal.setup),
+        ask,
+        atr_1h,
+        structural,
+        atr_mult=atr_mult,
+        structural_emphasis=structural_emphasis,
+    )
     return (objective - ask) / ask - max(0.0, float(roundtrip_cost or 0.0))
 
 
-def rank_components(signal: Any, ask_price: float, roundtrip_cost: float) -> dict[str, float]:
+def rank_components(
+    signal: Any,
+    ask_price: float,
+    roundtrip_cost: float,
+    *,
+    atr_mult: float = 1.0,
+    structural_emphasis: float = 1.0,
+) -> dict[str, float]:
     return {
-        "executable_objective_edge": round(executable_objective_edge(signal, ask_price, roundtrip_cost), 8),
+        "executable_objective_edge": round(
+            executable_objective_edge(
+                signal,
+                ask_price,
+                roundtrip_cost,
+                atr_mult=atr_mult,
+                structural_emphasis=structural_emphasis,
+            ),
+            8,
+        ),
         "move_potential_atr_1h": round(
             move_potential(
                 str(signal.setup),
                 float(ask_price or 0.0),
                 float(getattr(signal, "atr_1h", 0.0) or 0.0),
                 float(getattr(signal, "objective_structural", 0.0) or 0.0),
+                atr_mult=atr_mult,
+                structural_emphasis=structural_emphasis,
             ),
             6,
         ),
+        "objective_atr_mult": float(atr_mult),
+        "structural_emphasis": float(structural_emphasis),
     }
 
 
@@ -52,8 +86,16 @@ def rank_day_candidates(candidates: list[dict[str, Any]], universe: list[str] | 
     """
     order = {str(sym).upper(): i for i, sym in enumerate(universe)}
     for cand in candidates:
-        cand["rank"] = rank_components(cand["signal"], cand["ask_price"], roundtrip_cost)
         adaptive = cand.get("adaptive") or {}
+        atr_mult = float(adaptive.get("objective_atr_mult") or 1.0)
+        emphasis = float(adaptive.get("structural_emphasis") or 1.0)
+        cand["rank"] = rank_components(
+            cand["signal"],
+            cand["ask_price"],
+            roundtrip_cost,
+            atr_mult=atr_mult,
+            structural_emphasis=emphasis,
+        )
         cand["rank"]["expected_move"] = float(adaptive.get("expected_move") or 0.0)
         cand["rank"]["confidence"] = float(adaptive.get("confidence") or 0.0)
         cand["rank"]["size_mult"] = float(adaptive.get("size_mult") or 1.0)

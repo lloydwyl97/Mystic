@@ -13,6 +13,7 @@ from backend.services.adaptive_learning import (
     abstention_report,
     adaptive_state_report,
     calibration_report,
+    continuation_ratio,
     day_decision,
     learn_from_close,
     market_regime_tag,
@@ -577,6 +578,116 @@ def test_abstention_is_live_skip_only(tmp_path):
     assert "abstain" in fund and "REJECTED:LEARNED_NEGATIVE_EDGE" in fund and "return" in fund
     scalp = inspect.getsource(PortfolioEngineIntegration._process_scalp_v2_signals)
     assert "abstain" in scalp and "REJECTED:LEARNED_NEGATIVE_EDGE" in scalp and "continue" in scalp
+
+
+def test_markout_label_is_the_decision_horizon_not_the_best_future(tmp_path):
+    """A later, larger horizon must not become the learned forward label."""
+    import sqlite3
+
+    db = str(tmp_path / "t.db")
+    record_candidate(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="neutral", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=1_000.0)
+    conn = sqlite3.connect(db)
+    horizon = float(conn.execute("SELECT label_horizon FROM adaptive_candidate_markouts").fetchone()[0])
+    conn.close()
+    assert horizon in (15, 30, 60, 120, 240, 360)
+
+    def _quote(_sym, ts):
+        label_due = 1_000.0 + horizon * 60.0
+        if abs(ts - label_due) < 1:
+            return 101.0
+        return 110.0
+
+    assert resolve_markouts(db, _quote, now=1_000.0 + 400 * 60) == 1
+    conn = sqlite3.connect(db)
+    ewma, n = conn.execute("SELECT ewma, n FROM adaptive_metric_state WHERE metric='markout_forward'").fetchone()
+    conn.close()
+    causal = (101.0 - 100.0) / 100.0 - 0.0006
+    hindsight = (110.0 - 100.0) / 100.0 - 0.0006
+    assert n == pytest.approx(1.0)
+    assert ewma == pytest.approx(causal, abs=1e-9)
+    assert ewma != pytest.approx(hindsight, abs=1e-4)
+    # A second pass must not train the same markout again.
+    assert resolve_markouts(db, _quote, now=1_000.0 + 400 * 60) == 0
+    conn = sqlite3.connect(db)
+    n2 = conn.execute("SELECT n FROM adaptive_metric_state WHERE metric='markout_forward'").fetchone()[0]
+    conn.close()
+    assert n2 == pytest.approx(1.0)
+
+
+def test_scalp_micro_trains_on_the_causal_horizon_once(tmp_path):
+    import sqlite3
+
+    db = str(tmp_path / "t.db")
+    record_candidate(
+        db,
+        engine=SCALP,
+        symbol="ETHUSDT",
+        setup="VWAP_EMA_RECLAIM",
+        regime="",
+        ref_price=100.0,
+        roundtrip_cost=0.0006,
+        signaled=True,
+        evaluated_at=1_000.0,
+        features=_bull_book(),
+    )
+    conn = sqlite3.connect(db)
+    horizon = float(conn.execute("SELECT label_horizon FROM adaptive_candidate_markouts").fetchone()[0])
+    conn.close()
+    assert horizon in (30, 60, 120, 300, 600, 1200)
+
+    def _quote(_sym, ts):
+        if abs(ts - (1_000.0 + horizon)) < 1:
+            return 100.4
+        return 102.0
+
+    assert resolve_markouts(db, _quote, now=1_000.0 + 2000) == 1
+    assert resolve_markouts(db, _quote, now=1_000.0 + 2000) == 0
+    rep = adaptive_state_report(db)
+    assert rep["scalp_micro_model"]["n"] == 1
+    conn = sqlite3.connect(db)
+    ewma = conn.execute("SELECT ewma FROM adaptive_metric_state WHERE engine_id='SCALP_V2' AND metric='markout_forward'").fetchone()[0]
+    conn.close()
+    assert ewma == pytest.approx((100.4 - 100.0) / 100.0 - 0.0006, abs=1e-9)
+
+
+def test_continuation_is_progress_to_the_objective_not_net_green():
+    # A barely-green path that never approached the objective is not continuation.
+    assert continuation_ratio(entry_price=100.0, highest_price=100.2, objective=104.0) == pytest.approx(0.05)
+    assert continuation_ratio(entry_price=100.0, highest_price=104.0, objective=104.0) == pytest.approx(1.0)
+    assert continuation_ratio(entry_price=100.0, highest_price=106.0, objective=104.0) == pytest.approx(1.5)
+    assert continuation_ratio(entry_price=100.0, highest_price=100.0, objective=104.0) == 0.0
+
+
+def test_day_rank_uses_the_adaptive_objective(tmp_path):
+    sig = _sig(setup="RANGE_BOUNCE", atr_1h=1.0, structural=101.0)
+    adaptive = {"objective_atr_mult": 1.35, "structural_emphasis": 1.25, "expected_move": 0.0, "size_mult": 1.0, "confidence": 0.0}
+    ranked = rank_day_candidates([{"symbol": "BTCUSDT", "signal": sig, "ask_price": 100.0, "adaptive": adaptive}], ["BTCUSDT"], 0.0006)
+    objective = objective_level("RANGE_BOUNCE", 100.0, 1.0, 101.0, atr_mult=1.35, structural_emphasis=1.25)
+    untouched = objective_level("RANGE_BOUNCE", 100.0, 1.0, 101.0)
+    assert objective != untouched
+    assert ranked[0]["rank"]["executable_objective_edge"] == pytest.approx((objective - 100.0) / 100.0 - 0.0006, abs=1e-8)
+    assert ranked[0]["rank"]["objective_atr_mult"] == pytest.approx(1.35)
+
+
+def test_canonical_roundtrip_cost_counts_exit_half_spread_once():
+    from backend.config.trading_economics import (
+        ESTIMATED_ROUNDTRIP_COST,
+        ORDERBOOK_HALF_SPREAD_ESTIMATE,
+        SLIPPAGE_BUFFER,
+        TAKER_FEE,
+        canonical_roundtrip_cost_pct,
+    )
+    from backend.services.binance_scalp.economics import ScalpEconomics
+
+    flat = 2.0 * TAKER_FEE + 2.0 * SLIPPAGE_BUFFER + ORDERBOOK_HALF_SPREAD_ESTIMATE
+    assert canonical_roundtrip_cost_pct() == pytest.approx(flat)
+    assert pytest.approx(flat) == ESTIMATED_ROUNDTRIP_COST
+    # Measured full spread replaces the estimate; it is not added on top (half of it, once).
+    assert canonical_roundtrip_cost_pct(spread_pct=0.0002) == pytest.approx(2.0 * TAKER_FEE + 2.0 * SLIPPAGE_BUFFER + 0.0001)
+    # Fill-to-fill already contains the spread.
+    assert canonical_roundtrip_cost_pct(spread_pct=0.0) == pytest.approx(2.0 * TAKER_FEE + 2.0 * SLIPPAGE_BUFFER)
+    econ = ScalpEconomics.from_env()
+    assert econ.break_even_move_pct(0.0002, 0.0001, 0.0001) == pytest.approx(canonical_roundtrip_cost_pct(spread_pct=0.0002, buy_impact_pct=0.0001, sell_impact_pct=0.0001))
 
 
 def test_micro_model_is_scalp_only_and_not_a_gate(tmp_path):

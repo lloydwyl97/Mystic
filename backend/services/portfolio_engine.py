@@ -7063,6 +7063,20 @@ class PortfolioEngine:
                 _adapt_dec = _adapt_dec if isinstance(_adapt_dec, dict) else {}
                 _learn_setup = str(_adapt_dec.get("setup") or _prov.get("setup") or "")
                 _learn_regime = str(_adapt_dec.get("regime") or getattr(position, "day_route_regime_at_entry", "") or "")
+                _continuation = None
+                if str(_prov.get("engine_id") or "").upper() == "DAY_V2":
+                    from backend.services.adaptive_learning import continuation_ratio
+                    from backend.services.day_v2.winner_contract import objective_level
+
+                    _objective = objective_level(
+                        _learn_setup,
+                        float(entry_px or 0.0),
+                        float(getattr(position, "day_atr_1h_at_entry", 0.0) or 0.0),
+                        float(getattr(position, "day_objective_structural", 0.0) or 0.0),
+                        atr_mult=float(_adapt_dec.get("objective_atr_mult") or 1.0),
+                        structural_emphasis=float(_adapt_dec.get("structural_emphasis") or 1.0),
+                    )
+                    _continuation = continuation_ratio(entry_price=float(entry_px or 0.0), highest_price=float(hi or 0.0), objective=_objective)
                 learn_from_close(
                     self.db_path,
                     engine=str(_prov.get("engine_id") or ""),
@@ -7074,7 +7088,7 @@ class PortfolioEngine:
                     mfe_pct=_iwh.get("mfe_pct"),
                     mae_pct=_iwh.get("mae_pct"),
                     hold_min=(float(record.hold_seconds) / 60.0) if record.hold_seconds else None,
-                    continuation=1.0 if float(record.net_profit_pct or 0) > 0 else 0.0,
+                    continuation=_continuation,
                     version_current=bool(_prov.get("version_current")),
                     is_dust=bool(_prov.get("is_dust")),
                 )

@@ -3966,7 +3966,8 @@ function renderAbstention(data) {
         parts.push(
             engine + ": skipped " + (e.skips_in_window || 0) + " in " + (data.window_days || 7) + "d, " +
             (e.abstaining_keys || 0) + " keys abstaining (avg " + bps(e.avg_net_edge_abstained) + " avoided) vs " +
-            (e.active_keys || 0) + " trading (avg " + bps(e.avg_net_edge_active) + ")"
+            (e.active_keys || 0) + " trading (avg " + bps(e.avg_net_edge_active) + ")" +
+            (e.skipped_markouts ? "; skipped-markout avg " + bps(e.skipped_avg_forward) + " vs kept " + bps(e.kept_avg_forward) : "")
         );
     });
     const status = data.enabled ? "ON" : "OFF";

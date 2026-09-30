@@ -112,11 +112,27 @@ def objective_level(
     return max(level, floor)
 
 
-def move_potential(setup: str, ref_price: float, atr_1h: float, structural: float) -> float:
+def move_potential(
+    setup: str,
+    ref_price: float,
+    atr_1h: float,
+    structural: float,
+    *,
+    atr_mult: float = 1.0,
+    structural_emphasis: float = 1.0,
+) -> float:
     """Expected move to the objective in 1h-ATR units. Ranking telemetry only, never a gate."""
     if ref_price <= 0 or atr_1h <= 0:
         return 0.0
-    return (objective_level(setup, ref_price, atr_1h, structural) - ref_price) / atr_1h
+    level = objective_level(
+        setup,
+        ref_price,
+        atr_1h,
+        structural,
+        atr_mult=atr_mult,
+        structural_emphasis=structural_emphasis,
+    )
+    return (level - ref_price) / atr_1h
 
 
 def runner_stop(

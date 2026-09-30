@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -23,6 +24,8 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from backend.services.strategy_version import ADAPTIVE_STATE_VERSION, engine_versions
 
@@ -159,6 +162,7 @@ def current_strategy_version(engine: str) -> str:
 def _connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=15)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=15000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS adaptive_metric_state (
@@ -198,6 +202,9 @@ def _connect(db_path: str) -> sqlite3.Connection:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(adaptive_candidate_markouts)").fetchall()}
     if "features_json" not in cols:
         conn.execute("ALTER TABLE adaptive_candidate_markouts ADD COLUMN features_json TEXT NOT NULL DEFAULT '{}'")
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(adaptive_candidate_markouts)").fetchall()}
+    if "label_horizon" not in cols:
+        conn.execute("ALTER TABLE adaptive_candidate_markouts ADD COLUMN label_horizon REAL NOT NULL DEFAULT 0")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS adaptive_linear_model (
@@ -229,7 +236,7 @@ def observe(
         return False
     if str(strategy_version or "") != current_strategy_version(engine_id):
         return False
-    if value is None:
+    if value is None or not math.isfinite(float(value)):
         return False
     key = (engine_id, _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower(), metric)
     with _connect(db_path) as conn:
@@ -407,8 +414,17 @@ def _standardize(st: dict[str, Any], feats: dict[str, float]) -> dict[str, float
 def update_linear_model(db_path: str, engine: str, model: str, features: dict | None, target: float) -> None:
     """One online (normalised-LMS) step. Standardisation stats adapt via EWMA;
     weights are clamped. Trained on the same cost-adjusted markout target."""
+    raw = features if isinstance(features, dict) else {}
+    try:
+        age = float(raw.get("data_age_sec") or 0.0)
+    except (TypeError, ValueError):
+        age = 0.0
+    if age > 10.0:
+        return
     feats = _micro_features(features)
-    if not any(v != 0.0 for v in feats.values()):
+    if not any(math.isfinite(v) and v != 0.0 for v in feats.values()) or not math.isfinite(float(target)):
+        return
+    if any(not math.isfinite(v) for v in feats.values()):
         return
     engine_id = str(engine or "").upper()
     with _connect(db_path) as conn:
@@ -553,6 +569,105 @@ def learn_from_close(
     return wrote
 
 
+def continuation_ratio(*, entry_price: float, highest_price: float, objective: float) -> float:
+    """How far the trade traveled toward the entry-stamped objective.
+
+    0 = no favorable expansion. 1 = reached the objective. Above 1 = continued
+    past it. A small net-profitable exit that never approached the objective
+    stays near 0. Not a function of whether the close was green.
+    """
+    entry = float(entry_price or 0.0)
+    high = float(highest_price or 0.0)
+    goal = float(objective or 0.0)
+    if entry <= 0 or high <= 0 or goal <= entry:
+        return 0.0
+    return max(0.0, (high - entry) / (goal - entry))
+
+
+def _snap_horizon(target: float, grid: tuple[float, ...]) -> float:
+    """Closest grid horizon. Ties take the shorter one. Fixed before any future price."""
+    return float(min(grid, key=lambda h: (abs(float(h) - float(target)), float(h))))
+
+
+def _label_horizon_for(db_path: str, engine_id: str, symbol: str, setup: str, regime: str) -> float:
+    """Decision-time horizon. DAY uses the learned time-to-objective; SCALP uses the hold."""
+    if engine_id == SCALP_ENGINE:
+        view = scalp_decision(db_path, symbol, setup, regime)
+        return _snap_horizon(float(view["hold_min"]) * 60.0, SCALP_HORIZONS_SEC)
+    view = day_decision(db_path, symbol, setup, regime)
+    return _snap_horizon(float(view["time_to_mfe_min"]), DAY_HORIZONS_MIN)
+
+
+def _horizon_key(horizon: float) -> str:
+    h = float(horizon)
+    return str(int(h)) if abs(h - int(h)) < 1e-9 else str(h)
+
+
+def _forward_from_stored(row: sqlite3.Row) -> float | None:
+    """Causal forward return already stored on a markout row. Not a P&L."""
+    try:
+        marks = json.loads(row["markouts_json"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    horizon = float(row["label_horizon"] or 0)
+    if horizon <= 0:
+        horizon = 60.0 if str(row["engine_id"]) == DAY_ENGINE else 600.0
+    return _mark_at(marks if isinstance(marks, dict) else {}, horizon)
+
+
+def _mark_at(marks: dict, horizon: float) -> float | None:
+    raw = marks.get(_horizon_key(horizon))
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _stored_features(features: dict | None) -> str:
+    if not isinstance(features, dict) or not features:
+        return "{}"
+    feats = _micro_features(features)
+    if not any(v != 0.0 for v in feats.values()):
+        return "{}"
+    try:
+        age = float(features.get("data_age_sec") or 0.0)
+    except (TypeError, ValueError):
+        age = 0.0
+    if age > 0:
+        feats["data_age_sec"] = age
+    return json.dumps(feats, separators=(",", ":"))
+
+
+def _repair_adaptive_keys(conn: sqlite3.Connection) -> None:
+    """Fold slash-symbol duplicates onto the normalized key, and drop markout
+    rows whose sample count was inflated by re-training one unresolved candidate."""
+    rows = list(conn.execute("SELECT rowid, * FROM adaptive_metric_state"))
+    for row in rows:
+        norm = _norm_symbol(row["symbol"])
+        if norm == row["symbol"]:
+            continue
+        clash = conn.execute(
+            "SELECT rowid FROM adaptive_metric_state WHERE engine_id=? AND symbol=? AND setup=? AND regime=? AND metric=?",
+            (row["engine_id"], norm, row["setup"], row["regime"], row["metric"]),
+        ).fetchone()
+        if clash is None:
+            conn.execute("UPDATE adaptive_metric_state SET symbol=? WHERE rowid=?", (norm, row["rowid"]))
+        else:
+            conn.execute("DELETE FROM adaptive_metric_state WHERE rowid=?", (row["rowid"],))
+    inflated = list(conn.execute("SELECT rowid, engine_id, symbol, setup, regime, metric, n FROM adaptive_metric_state WHERE metric LIKE 'markout_%'"))
+    for row in inflated:
+        learned_n = conn.execute(
+            "SELECT COUNT(*) FROM adaptive_candidate_markouts WHERE learned=1 AND engine_id=? AND symbol=? AND setup=? AND regime=?",
+            (row["engine_id"], row["symbol"], row["setup"], row["regime"]),
+        ).fetchone()[0]
+        if float(row["n"]) > float(learned_n) + 1.5:
+            conn.execute("DELETE FROM adaptive_metric_state WHERE rowid=?", (row["rowid"],))
+    conn.commit()
+
+
 def record_candidate(
     db_path: str,
     *,
@@ -570,14 +685,15 @@ def record_candidate(
     version = current_strategy_version(engine_id)
     if not version or float(ref_price or 0) <= 0 or not str(setup or "").strip():
         return
-    feats_json = json.dumps(_micro_features(features), separators=(",", ":")) if features else "{}"
+    feats_json = _stored_features(features)
+    horizon = _label_horizon_for(db_path, engine_id, symbol, setup, regime)
     with _connect(db_path) as conn:
         conn.execute(
             """
             INSERT INTO adaptive_candidate_markouts (
                 engine_id, symbol, setup, regime, strategy_version, signaled,
-                ref_price, roundtrip_cost, evaluated_at, features_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ref_price, roundtrip_cost, evaluated_at, features_json, label_horizon
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 engine_id,
@@ -590,13 +706,20 @@ def record_candidate(
                 float(roundtrip_cost or 0),
                 float(evaluated_at or time.time()),
                 feats_json,
+                float(horizon),
             ),
         )
         conn.commit()
 
 
 def resolve_markouts(db_path: str, quote: Callable[[str, float], float | None], *, now: float | None = None) -> int:
-    """Fill due forward marks and fold them into markout metrics. Returns rows newly learned."""
+    """Fill due forward marks and fold the decision-time horizon into state.
+
+    Every horizon is stored. The learned label is the return at the horizon
+    stamped when the candidate was recorded — not the best later horizon.
+    A row is claimed (learned=1) before the state write so a locked retry
+    cannot train the same markout twice. Returns rows newly learned.
+    """
     moment = float(now if now is not None else time.time())
     learned = 0
     try:
@@ -604,65 +727,90 @@ def resolve_markouts(db_path: str, quote: Callable[[str, float], float | None], 
     except sqlite3.Error:
         return 0
     try:
+        with contextlib.suppress(sqlite3.Error):
+            _repair_adaptive_keys(conn)
         rows = conn.execute("SELECT * FROM adaptive_candidate_markouts WHERE resolved=0 ORDER BY id ASC LIMIT 200").fetchall()
         for row in rows:
-            engine_id = str(row["engine_id"])
-            horizons = DAY_HORIZONS_MIN if engine_id == DAY_ENGINE else SCALP_HORIZONS_SEC
-            unit = 60.0 if engine_id == DAY_ENGINE else 1.0
-            grace = 900.0 if engine_id == DAY_ENGINE else 60.0
-            marks = json.loads(row["markouts_json"] or "{}")
-            done = True
-            for horizon in horizons:
-                key = str(horizon)
-                if key in marks:
-                    continue
-                due = float(row["evaluated_at"]) + horizon * unit
-                if moment < due:
-                    done = False
-                    continue
-                price = quote(str(row["symbol"]), due)
-                if price is None and moment < due + grace:
-                    done = False
-                    continue
-                if price is None or float(row["ref_price"]) <= 0:
-                    marks[key] = None
+            try:
+                engine_id = str(row["engine_id"])
+                horizons = DAY_HORIZONS_MIN if engine_id == DAY_ENGINE else SCALP_HORIZONS_SEC
+                unit = 60.0 if engine_id == DAY_ENGINE else 1.0
+                grace = 900.0 if engine_id == DAY_ENGINE else 60.0
+                marks = json.loads(row["markouts_json"] or "{}")
+                done = True
+                for horizon in horizons:
+                    key = str(horizon)
+                    if key in marks:
+                        continue
+                    due = float(row["evaluated_at"]) + horizon * unit
+                    if moment < due:
+                        done = False
+                        continue
+                    try:
+                        price = quote(str(row["symbol"]), due)
+                    except Exception:
+                        price = None
+                    if price is None and moment < due + grace:
+                        done = False
+                        continue
+                    if price is None or float(row["ref_price"]) <= 0 or not math.isfinite(float(price or 0)):
+                        marks[key] = None
+                    else:
+                        marks[key] = (float(price) - float(row["ref_price"])) / float(row["ref_price"]) - float(row["roundtrip_cost"] or 0)
+                label_h = float(row["label_horizon"] or 0)
+                if label_h <= 0:
+                    label_h = 60.0 if engine_id == DAY_ENGINE else 600.0
+                forward = _mark_at(marks, label_h)
+                path = [_mark_at(marks, h) for h in horizons if h <= label_h + 1e-9]
+                path = [v for v in path if v is not None]
+                mae = max(0.0, -min(path)) if path else None
+                row_learned = int(row["learned"] or 0)
+                version_ok = str(row["strategy_version"]) == current_strategy_version(engine_id)
+                if forward is not None and not row_learned and version_ok:
+                    # Claim first. A failed state write must not re-train this row.
+                    cur = conn.execute(
+                        "UPDATE adaptive_candidate_markouts SET markouts_json=?, learned=1, resolved=? WHERE id=? AND learned=0",
+                        (json.dumps(marks), 1 if done else 0, row["id"]),
+                    )
+                    conn.commit()
+                    if cur.rowcount != 1:
+                        continue
+                    observe(
+                        db_path,
+                        engine=engine_id,
+                        symbol=row["symbol"],
+                        setup=row["setup"],
+                        regime=row["regime"],
+                        metric="markout_forward",
+                        value=forward,
+                        strategy_version=str(row["strategy_version"]),
+                    )
+                    if mae is not None:
+                        observe(
+                            db_path,
+                            engine=engine_id,
+                            symbol=row["symbol"],
+                            setup=row["setup"],
+                            regime=row["regime"],
+                            metric="markout_mae",
+                            value=mae,
+                            strategy_version=str(row["strategy_version"]),
+                        )
+                    if engine_id == SCALP_ENGINE:
+                        with contextlib.suppress(Exception):
+                            feats = json.loads(row["features_json"] or "{}")
+                            if isinstance(feats, dict) and feats:
+                                update_linear_model(db_path, SCALP_ENGINE, "micro_edge", feats, forward)
+                    learned += 1
                 else:
-                    marks[key] = (float(price) - float(row["ref_price"])) / float(row["ref_price"]) - float(row["roundtrip_cost"] or 0)
-            values = [float(v) for v in marks.values() if v is not None]
-            row_learned = int(row["learned"] or 0)
-            if done and values and not row_learned and str(row["strategy_version"]) == current_strategy_version(engine_id):
-                observe(
-                    db_path,
-                    engine=engine_id,
-                    symbol=row["symbol"],
-                    setup=row["setup"],
-                    regime=row["regime"],
-                    metric="markout_forward",
-                    value=max(values),
-                    strategy_version=str(row["strategy_version"]),
-                )
-                observe(
-                    db_path,
-                    engine=engine_id,
-                    symbol=row["symbol"],
-                    setup=row["setup"],
-                    regime=row["regime"],
-                    metric="markout_mae",
-                    value=max(0.0, -min(values)),
-                    strategy_version=str(row["strategy_version"]),
-                )
-                if engine_id == SCALP_ENGINE:
-                    with contextlib.suppress(Exception):
-                        feats = json.loads(row["features_json"] or "{}")
-                        if feats:
-                            update_linear_model(db_path, SCALP_ENGINE, "micro_edge", feats, max(values))
-                row_learned = 1
-                learned += 1
-            conn.execute(
-                "UPDATE adaptive_candidate_markouts SET markouts_json=?, learned=?, resolved=? WHERE id=?",
-                (json.dumps(marks), row_learned, 1 if done else 0, row["id"]),
-            )
-        conn.commit()
+                    conn.execute(
+                        "UPDATE adaptive_candidate_markouts SET markouts_json=?, learned=?, resolved=? WHERE id=?",
+                        (json.dumps(marks), row_learned, 1 if done else 0, row["id"]),
+                    )
+                    conn.commit()
+            except sqlite3.Error:
+                logger.warning("MARKOUT_RESOLVE_ROW_FAILED id=%s", row["id"])
+                continue
     finally:
         conn.close()
     return learned
@@ -963,6 +1111,40 @@ def abstention_report(db_path: str, window_days: float = 7.0) -> dict[str, Any]:
                 )
             avg_abstained = round(sum(r["net_edge"] for r in abstaining) / len(abstaining), 6) if abstaining else None
             avg_active = round(sum(r["net_edge"] for r in active) / len(active), 6) if active else None
+            # Subsequent candidate markouts: what the skipped opportunity's
+            # decision-time horizon actually did, versus candidates that were
+            # not skipped. Counterfactual marks, not realized P&L.
+            skip_events: list = []
+            mark_rows: list = []
+            with contextlib.suppress(sqlite3.Error):
+                skip_events = conn.execute(
+                    f"SELECT symbol, cycle_ts FROM {table} WHERE cycle_ts>=? AND result=?",
+                    (since, "REJECTED:LEARNED_NEGATIVE_EDGE"),
+                ).fetchall()
+            with contextlib.suppress(sqlite3.Error):
+                mark_rows = conn.execute(
+                    "SELECT symbol, setup, regime, evaluated_at, markouts_json, label_horizon, engine_id FROM adaptive_candidate_markouts WHERE engine_id=? AND evaluated_at>=?",
+                    (engine_id, since),
+                ).fetchall()
+            used: set[int] = set()
+            skipped_fw: list[float] = []
+            by_key: dict[tuple, list[float]] = {}
+            for ev in skip_events:
+                for i, m in enumerate(mark_rows):
+                    if i in used:
+                        continue
+                    same = _norm_symbol(ev["symbol"]) == _norm_symbol(m["symbol"])
+                    close_in_time = abs(float(ev["cycle_ts"]) - float(m["evaluated_at"])) <= 180.0
+                    if not (same and close_in_time):
+                        continue
+                    used.add(i)
+                    fw = _forward_from_stored(m)
+                    if fw is None:
+                        break
+                    skipped_fw.append(fw)
+                    by_key.setdefault((m["symbol"], m["setup"], m["regime"]), []).append(fw)
+                    break
+            kept_fw = [fw for i, m in enumerate(mark_rows) if i not in used and (fw := _forward_from_stored(m)) is not None]
             out["engines"][engine_id] = {
                 "skips_in_window": skips,
                 "abstaining_keys": len(abstaining),
@@ -971,6 +1153,11 @@ def abstention_report(db_path: str, window_days: float = 7.0) -> dict[str, Any]:
                 "avg_net_edge_active": avg_active,
                 "bps_avoided_per_skip": round(-avg_abstained * 10000.0, 2) if (avg_abstained is not None and avg_abstained < 0) else 0.0,
                 "abstaining": sorted(abstaining, key=lambda r: r["net_edge"])[:20],
+                "skipped_markouts": len(skipped_fw),
+                "skipped_avg_forward": round(sum(skipped_fw) / len(skipped_fw), 6) if skipped_fw else None,
+                "kept_markouts": len(kept_fw),
+                "kept_avg_forward": round(sum(kept_fw) / len(kept_fw), 6) if kept_fw else None,
+                "skipped_by_key": [{"symbol": k[0], "setup": k[1], "regime": k[2], "n": len(v), "avg_forward": round(sum(v) / len(v), 6)} for k, v in sorted(by_key.items())],
             }
     finally:
         conn.close()
@@ -997,6 +1184,7 @@ __all__ = [
     "abstention_report",
     "adaptive_state_report",
     "calibration_report",
+    "continuation_ratio",
     "day_decision",
     "estimate",
     "learn_from_close",

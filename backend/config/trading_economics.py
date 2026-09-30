@@ -74,19 +74,48 @@ TAKER_FEE: Final[float] = _env_float("TAKER_FEE", BINANCE_US_TAKER_FEE_PCT)
 SLIPPAGE_BUFFER: Final[float] = _env_float("SLIPPAGE_BUFFER", 0.0001)
 # Default order-book half-spread estimate (live measured via bookTicker; override via env).
 ORDERBOOK_HALF_SPREAD_ESTIMATE: Final[float] = _env_float("ORDERBOOK_HALF_SPREAD_ESTIMATE", 0.00006)
-# Round-trip for sell gate: 2x taker fee + 2x half-spread + 2x slippage buffer (no platform spread).
-_DEFAULT_ROUNDTRIP_NO_SPREAD: Final[float] = (2.0 * TAKER_FEE) + (2.0 * ORDERBOOK_HALF_SPREAD_ESTIMATE) + (2.0 * SLIPPAGE_BUFFER)
-# Round-trip cost for the sell gate (`_check_exit_conditions`): operator sets from
-# live Binance.US bid/ask (+fees+SLIPPAGE_BUFFER); default is fee+slippage only.
-ESTIMATED_ROUNDTRIP_COST: Final[float] = _env_float(
-    "ESTIMATED_ROUNDTRIP_COST",
-    _DEFAULT_ROUNDTRIP_NO_SPREAD,
-)
-# Must match `ESTIMATED_ROUNDTRIP_COST` unless deliberately split for reporting.
-ESTIMATED_ROUNDTRIP_COST_PCT: Final[float] = _env_float(
-    "ESTIMATED_ROUNDTRIP_COST_PCT",
-    ESTIMATED_ROUNDTRIP_COST,
-)
+
+
+def canonical_roundtrip_cost_pct(
+    *,
+    spread_pct: float | None = None,
+    buy_impact_pct: float = 0.0,
+    sell_impact_pct: float = 0.0,
+) -> float:
+    """One executable round-trip cost for every edge consumer.
+
+    Price convention: entry is the ask, later marks are trade/mid. That already
+    embeds the entry half-spread, so this adds the exit half exactly once —
+    half the measured full spread when the book is known, otherwise
+    ``ORDERBOOK_HALF_SPREAD_ESTIMATE``. Taker fee and the slippage buffer are
+    both sides. Impact is added only when a book walk supplies it. The flat
+    estimate and the live spread are never both included.
+    """
+    fee = 2.0 * TAKER_FEE
+    slip = 2.0 * SLIPPAGE_BUFFER
+    half = ORDERBOOK_HALF_SPREAD_ESTIMATE if spread_pct is None else max(0.0, float(spread_pct)) / 2.0
+    impact = max(0.0, float(buy_impact_pct or 0.0)) + max(0.0, float(sell_impact_pct or 0.0))
+    return fee + slip + half + impact
+
+
+# Flat canonical cost (no live book): 4.0 bps taker + 2.0 bps slippage + 0.6 bps
+# exit half-spread = 6.6 bps. A raw ESTIMATED_ROUNDTRIP_COST env value is not
+# an alternate formula — if it disagrees, it is ignored so consumers cannot split.
+_CANONICAL_FLAT_ROUNDTRIP: Final[float] = canonical_roundtrip_cost_pct()
+_env_roundtrip = os.getenv("ESTIMATED_ROUNDTRIP_COST", "")
+if _env_roundtrip:
+    try:
+        _env_roundtrip_f = float(_env_roundtrip)
+    except (TypeError, ValueError):
+        _env_roundtrip_f = _CANONICAL_FLAT_ROUNDTRIP
+    if abs(_env_roundtrip_f - _CANONICAL_FLAT_ROUNDTRIP) > 1e-12:
+        logger.warning(
+            "ESTIMATED_ROUNDTRIP_COST env %.6f ignored; canonical flat round-trip is %.6f (2*taker + 2*slippage + exit half-spread). Divergent env values omit or double-count spread.",
+            _env_roundtrip_f,
+            _CANONICAL_FLAT_ROUNDTRIP,
+        )
+ESTIMATED_ROUNDTRIP_COST: Final[float] = _CANONICAL_FLAT_ROUNDTRIP
+ESTIMATED_ROUNDTRIP_COST_PCT: Final[float] = _CANONICAL_FLAT_ROUNDTRIP
 
 # -- Sell thresholds ---------------------------------------------------------
 # Real net profit floor (fraction of cost basis) required to take profit.

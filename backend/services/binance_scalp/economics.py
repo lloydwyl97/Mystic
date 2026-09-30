@@ -95,11 +95,14 @@ class ScalpEconomics:
         entry_maker: bool | None = None,
         exit_maker: bool | None = None,
     ) -> float:
-        if entry_maker is None:
-            entry_maker = self.entry_is_maker
-        if exit_maker is None:
-            exit_maker = self.exit_is_maker
-        return self.roundtrip_fee_for_mode(entry_maker=entry_maker, exit_maker=exit_maker) + spread_pct + buy_impact_pct + sell_impact_pct + self.slippage_buffer_pct
+        _ = (entry_maker, exit_maker)  # one cost model; maker/taker flags do not fork it
+        from backend.config.trading_economics import canonical_roundtrip_cost_pct
+
+        return canonical_roundtrip_cost_pct(
+            spread_pct=spread_pct,
+            buy_impact_pct=buy_impact_pct,
+            sell_impact_pct=sell_impact_pct,
+        )
 
     def required_gross_move_for_min_edge_pct(
         self,
@@ -187,7 +190,14 @@ class ScalpEconomics:
         if entry_price <= 0:
             return -1.0
         gross = (sell_fill_price - entry_price) / entry_price
-        costs = self.entry_fee_pct() + self.exit_fee_pct() + self.slippage_buffer_pct * 2.0 + entry_buy_impact_pct + exit_sell_impact_pct
+        # Fill-to-fill already contains the spread. Do not add it again.
+        from backend.config.trading_economics import canonical_roundtrip_cost_pct
+
+        costs = canonical_roundtrip_cost_pct(
+            spread_pct=0.0,
+            buy_impact_pct=entry_buy_impact_pct,
+            sell_impact_pct=exit_sell_impact_pct,
+        )
         return gross - costs
 
     def projected_entry_edge_pct(self, spread_pct: float, order_book_imbalance: float) -> float:
