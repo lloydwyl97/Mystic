@@ -8,8 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from backend.services.adaptive_learning import (
+    adaptive_state_report,
+    calibration_report,
     day_decision,
     learn_from_close,
+    market_regime_tag,
     observe,
     record_candidate,
     resolve_markouts,
@@ -291,3 +294,119 @@ def test_close_learns_under_entry_stamped_key_reaches_next_candidate(tmp_path):
     pe_src = pathlib.Path(__import__("backend.services.portfolio_engine", fromlist=["__file__"]).__file__).read_text()
     assert '_adapt_dec.get("setup")' in pe_src
     assert '_adapt_dec.get("regime")' in pe_src
+
+
+# --- time decay --------------------------------------------------------------
+
+
+def test_observation_weight_decays_with_age(tmp_path):
+    """Stale evidence loses effective sample count; a fresh point still counts for 1."""
+    import time as _time
+
+    from backend.services import adaptive_learning as al
+
+    db = str(tmp_path / "t.db")
+    assert observe(db, engine=DAY, symbol="BTCUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_mfe", value=0.03, strategy_version=DAY_STRATEGY_VERSION)
+
+    # Backdate the stored row far beyond several half-lives.
+    with al._connect(db) as conn:
+        conn.execute("UPDATE adaptive_metric_state SET updated_at=? WHERE metric='trade_mfe'", ("2000-01-01T00:00:00Z",))
+        conn.commit()
+
+    before = day_decision(db, "BTCUSDT", "RANGE_BOUNCE", "")
+    assert observe(db, engine=DAY, symbol="BTCUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_mfe", value=0.03, strategy_version=DAY_STRATEGY_VERSION)
+    after = day_decision(db, "BTCUSDT", "RANGE_BOUNCE", "")
+    # Old n was decayed to ~0 before the new point, so n stays ~1, not 2.
+    assert after["n_mfe"] < 1.2
+    assert before["n_mfe"] == 1.0
+
+    # Fresh key with no age: no decay, second observation accumulates to ~2.
+    db2 = str(tmp_path / "u.db")
+    now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+    observe(db2, engine=DAY, symbol="ETHUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_mfe", value=0.03, strategy_version=DAY_STRATEGY_VERSION)
+    with al._connect(db2) as conn:
+        conn.execute("UPDATE adaptive_metric_state SET updated_at=?", (now,))
+        conn.commit()
+    observe(db2, engine=DAY, symbol="ETHUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_mfe", value=0.03, strategy_version=DAY_STRATEGY_VERSION)
+    assert day_decision(db2, "ETHUSDT", "RANGE_BOUNCE", "")["n_mfe"] > 1.8
+
+
+# --- regime tag --------------------------------------------------------------
+
+
+def test_market_regime_tag_shape_and_safe_fallback(tmp_path):
+    db = str(tmp_path / "t.db")
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE feature_ohlcv (id INTEGER PRIMARY KEY, symbol TEXT, interval TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL, ts TEXT)")
+    base = 1_790_000_000
+    # BTC 1h clearly rising, 24 bars.
+    ins_btc = "INSERT INTO feature_ohlcv (symbol, interval, open, high, low, close, volume, ts) VALUES (?,?,?,?,?,?,?,?)"
+    for i in range(24):
+        px = 100.0 + i
+        conn.execute(ins_btc, ("BTC-USDT", "1h", px, px + 1, px - 1, px, 1.0, str(base + i * 3600)))
+    # SOL 15m with an expanding range at the end (high vol).
+    ins = "INSERT INTO feature_ohlcv (symbol, interval, open, high, low, close, volume, ts) VALUES (?,?,?,?,?,?,?,?)"
+    for i in range(30):
+        spread = 0.2 if i < 24 else 3.0
+        conn.execute(ins, ("SOL-USDT", "15m", 50.0, 50.0 + spread, 50.0 - spread, 50.0, 1.0, str(base + i * 900)))
+    conn.commit()
+    conn.close()
+
+    tag = market_regime_tag(db, "SOLUSDT")
+    assert tag.startswith("btcup_")
+    assert tag.endswith("volhi")
+    # Missing data -> empty string, never raises.
+    assert market_regime_tag(db, "DOGEUSDT") == ""
+    assert market_regime_tag(str(tmp_path / "missing.db"), "BTCUSDT") == ""
+
+
+# --- read-only reports -------------------------------------------------------
+
+
+def test_adaptive_state_report_lists_current_keys(tmp_path):
+    db = str(tmp_path / "t.db")
+    observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="btcup_vollo", metric="trade_mfe", value=0.02, strategy_version=DAY_STRATEGY_VERSION)
+    observe(db, engine=SCALP, symbol="ETHUSDT", setup="VWAP", regime="", metric="trade_net", value=0.003, strategy_version=SCALP_STRATEGY_VERSION)
+    rep = adaptive_state_report(db)
+    assert rep["adaptive_state_version"]
+    assert rep["half_life_days"] > 0
+    day_rows = rep["engines"]["DAY_V2"]
+    scalp_rows = rep["engines"]["SCALP_V2"]
+    assert any(r["symbol"] == "XRPUSDT" and r["regime"] == "btcup_vollo" for r in day_rows)
+    assert any(r["symbol"] == "ETHUSDT" and "expected_edge" in r for r in scalp_rows)
+    # DAY learning must never leak into the SCALP listing and vice versa.
+    assert all("expected_move" in r for r in day_rows)
+    assert all("hold_min" in r for r in scalp_rows)
+
+
+def test_calibration_report_buckets_by_confidence_and_size(tmp_path):
+    import json
+    import sqlite3
+
+    from backend.services.strategy_version import DAY_ENTRY_CONTRACT_VERSION, DAY_EXIT_CONTRACT_VERSION
+
+    db = str(tmp_path / "t.db")
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, side TEXT, mode TEXT, engine_id TEXT, "
+        "strategy_version TEXT, entry_contract_version TEXT, exit_contract_version TEXT, "
+        "pnl_pct_net REAL, adaptive_decision_json TEXT)"
+    )
+    dec_hi = json.dumps({"confidence": 0.4, "size_mult": 1.2})
+    dec_lo = json.dumps({"confidence": 0.05, "size_mult": 0.8})
+    for pnl, dec in ((0.01, dec_hi), (0.008, dec_hi), (-0.02, dec_lo)):
+        conn.execute(
+            "INSERT INTO paper_trades (side, mode, engine_id, strategy_version, entry_contract_version, exit_contract_version, pnl_pct_net, adaptive_decision_json) "
+            "VALUES ('SELL','live','DAY_V2',?,?,?,?,?)",
+            (DAY_STRATEGY_VERSION, DAY_ENTRY_CONTRACT_VERSION, DAY_EXIT_CONTRACT_VERSION, pnl, dec),
+        )
+    conn.commit()
+    conn.close()
+    rep = calibration_report(db)
+    day = rep["engines"]["DAY_V2"]
+    assert day["conf>=0.30"]["n"] == 2
+    assert day["conf>=0.30"]["avg_net_pct"] > 0
+    assert day["conf<0.10"]["n"] == 1
+    assert day["conf<0.10"]["avg_net_pct"] < 0

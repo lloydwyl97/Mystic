@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from backend.services.strategy_version import ADAPTIVE_STATE_VERSION, engine_versions
@@ -61,9 +63,32 @@ TIGHTEN_BOUNDS = (0.75, 1.15)
 SCALP_TARGET_BOUNDS = (0.0015, 0.006)
 SCALP_HOLD_FLOOR_MIN = 4.0
 
+# Half-life for observation weight. Older evidence loses effective sample count
+# so the estimator tracks current market behaviour instead of averaging over a
+# stale regime forever. It never zeroes a key (the new observation always counts
+# for 1), so there is no min-trade gate and no forgetting to a hard stop.
+ADAPTIVE_HALF_LIFE_DAYS = float(os.getenv("ADAPTIVE_HALF_LIFE_DAYS", "14") or "14")
+
 
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, float(value)))
+
+
+def _parse_iso(ts: str) -> float | None:
+    try:
+        return datetime.strptime(str(ts), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _decay_factor(updated_at: str, now_epoch: float) -> float:
+    """Weight retained for a key's prior sample count, by age. 1.0 if age unknown."""
+    t0 = _parse_iso(updated_at)
+    half_life = ADAPTIVE_HALF_LIFE_DAYS * 86400.0
+    if t0 is None or half_life <= 0:
+        return 1.0
+    elapsed = max(0.0, float(now_epoch) - t0)
+    return float(0.5 ** (elapsed / half_life))
 
 
 def _norm_symbol(symbol: str) -> str:
@@ -147,13 +172,16 @@ def observe(
     key = (engine_id, _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower(), metric)
     with _connect(db_path) as conn:
         row = conn.execute(
-            "SELECT n, ewma FROM adaptive_metric_state WHERE engine_id=? AND symbol=? AND setup=? AND regime=? AND metric=?",
+            "SELECT n, ewma, updated_at FROM adaptive_metric_state WHERE engine_id=? AND symbol=? AND setup=? AND regime=? AND metric=?",
             key,
         ).fetchone()
         if row is None or float(row["n"]) <= 0:
             n, ewma = 1.0, float(value)
         else:
-            n = float(row["n"]) + 1.0
+            # Age out the prior sample count so stale evidence stops dominating,
+            # then fold in the new observation. The new point always counts for 1.
+            decay = _decay_factor(str(row["updated_at"] or ""), time.time())
+            n = float(row["n"]) * decay + 1.0
             ewma = (1.0 - EWMA_ALPHA) * float(row["ewma"]) + EWMA_ALPHA * float(value)
         conn.execute(
             """
@@ -484,6 +512,206 @@ def ohlcv_quote(db_path: str, symbol: str, epoch: float) -> float | None:
     return None
 
 
+def _ohlc_rows(conn: sqlite3.Connection, symbol: str, interval: str, limit: int) -> list[tuple[float, float, float, float]]:
+    """Newest-last (ts asc) high/low/close for a symbol+interval, across name variants."""
+    raw = str(symbol or "").upper().replace("-", "").replace("/", "")
+    for variant in (raw, raw.replace("USDT", "-USDT"), raw.replace("USDT", "/USDT")):
+        try:
+            rows = conn.execute(
+                "SELECT ts, high, low, close FROM feature_ohlcv WHERE symbol=? AND interval=? ORDER BY ts DESC LIMIT ?",
+                (variant, interval, int(limit)),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        if rows:
+            out = []
+            for _ts, hi, lo, cl in rows:
+                if hi is None or lo is None or cl is None:
+                    continue
+                out.append((float(hi), float(lo), float(cl)))
+            out.reverse()
+            return out
+    return []
+
+
+def _trend_bucket(conn: sqlite3.Connection, symbol: str, interval: str, lookback: int) -> str:
+    rows = _ohlc_rows(conn, symbol, interval, lookback)
+    if len(rows) < 4:
+        return ""
+    first = rows[0][2]
+    last = rows[-1][2]
+    if first <= 0:
+        return ""
+    change = (last - first) / first
+    if change >= 0.005:
+        return "up"
+    if change <= -0.005:
+        return "down"
+    return "flat"
+
+
+def _vol_bucket(conn: sqlite3.Connection, symbol: str) -> str:
+    rows = _ohlc_rows(conn, symbol, "15m", 30)
+    if len(rows) < 12:
+        return ""
+
+    def _atr(window: list[tuple[float, float, float]]) -> float:
+        trs = []
+        for i in range(1, len(window)):
+            hi, lo, _cl = window[i]
+            prev_c = window[i - 1][2]
+            trs.append(max(hi - lo, abs(hi - prev_c), abs(lo - prev_c)))
+        return sum(trs) / len(trs) if trs else 0.0
+
+    short = _atr(rows[-7:])
+    long = _atr(rows[-25:]) if len(rows) >= 25 else _atr(rows)
+    if long <= 0:
+        return ""
+    return "volhi" if short / long >= 1.15 else "vollo"
+
+
+def market_regime_tag(db_path: str, symbol: str) -> str:
+    """Coarse, inspectable regime key: BTC 1h trend + this symbol's 15m vol bucket.
+
+    Returns e.g. 'btcup_volhi'. Empty string when data is missing, so callers
+    fall back to whatever regime string they already had (never crashes, never
+    gates). Read/write alignment is preserved because the tag is stamped on the
+    entry decision and reused at close.
+    """
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+    except sqlite3.Error:
+        return ""
+    try:
+        btc = _trend_bucket(conn, "BTCUSDT", "1h", 24)
+        vol = _vol_bucket(conn, symbol)
+    finally:
+        conn.close()
+    if not btc or not vol:
+        return ""
+    return f"btc{btc}_{vol}"
+
+
+def adaptive_state_report(db_path: str) -> dict[str, Any]:
+    """Current learned state per engine, as the decision views the next candidate reads.
+
+    Read-only. Groups the distinct (symbol, setup, regime) keys that carry any
+    observations and returns the DAY/SCALP decision for each so a dashboard can
+    show exactly what learning currently changes and why.
+    """
+    out: dict[str, Any] = {"adaptive_state_version": ADAPTIVE_STATE_VERSION, "half_life_days": ADAPTIVE_HALF_LIFE_DAYS, "engines": {}}
+    try:
+        conn = _connect(db_path)
+    except sqlite3.Error:
+        return out
+    try:
+        for engine_id, decide in ((DAY_ENGINE, day_decision), (SCALP_ENGINE, scalp_decision)):
+            keys = conn.execute(
+                "SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? ORDER BY symbol, setup, regime",
+                (engine_id,),
+            ).fetchall()
+            rows = []
+            for k in keys:
+                view = decide(db_path, k["symbol"], k["setup"], k["regime"])
+                if engine_id == DAY_ENGINE:
+                    rows.append(
+                        {
+                            "symbol": k["symbol"],
+                            "setup": k["setup"],
+                            "regime": k["regime"],
+                            "expected_move": round(view["expected_move"], 6),
+                            "size_mult": round(view["size_mult"], 4),
+                            "objective_atr_mult": round(view["objective_atr_mult"], 4),
+                            "confidence": round(view["confidence"], 3),
+                            "n": view["n_mfe"],
+                        }
+                    )
+                else:
+                    rows.append(
+                        {
+                            "symbol": k["symbol"],
+                            "setup": k["setup"],
+                            "regime": k["regime"],
+                            "expected_edge": round(view["expected_edge"], 6),
+                            "size_mult": round(view["size_mult"], 4),
+                            "target_pct": round(view["target_pct"], 5),
+                            "hold_min": round(view["hold_min"], 2),
+                            "confidence": round(view["confidence"], 3),
+                            "n": view["n_net"],
+                        }
+                    )
+            out["engines"][engine_id] = rows
+    finally:
+        conn.close()
+    return out
+
+
+def calibration_report(db_path: str) -> dict[str, Any]:
+    """Do higher-confidence / larger-size entries realize better net? Read-only.
+
+    Buckets current-version SELL rows by the entry-stamped confidence and size
+    multiplier, and reports realized net %. Pure telemetry: it never gates a
+    trade, it only exposes whether the learned controls are calibrated.
+    """
+    from backend.services.strategy_version import is_current_version
+
+    out: dict[str, Any] = {"adaptive_state_version": ADAPTIVE_STATE_VERSION, "engines": {}}
+    try:
+        conn = sqlite3.connect(db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(paper_trades)")}
+    except sqlite3.Error:
+        return out
+    if "adaptive_decision_json" not in cols or "pnl_pct_net" not in cols:
+        conn.close()
+        return out
+
+    def _conf_bucket(c: float) -> str:
+        if c < 0.10:
+            return "conf<0.10"
+        if c < 0.30:
+            return "conf0.10-0.30"
+        return "conf>=0.30"
+
+    def _size_bucket(s: float) -> str:
+        if s < 0.90:
+            return "size<0.90"
+        if s <= 1.10:
+            return "size0.90-1.10"
+        return "size>1.10"
+
+    try:
+        rows = conn.execute(
+            "SELECT engine_id, strategy_version, entry_contract_version, exit_contract_version, "
+            "pnl_pct_net, adaptive_decision_json FROM paper_trades "
+            "WHERE UPPER(side)='SELL' AND LOWER(COALESCE(mode,''))='live' "
+            "AND adaptive_decision_json IS NOT NULL AND adaptive_decision_json != '' "
+            "AND pnl_pct_net IS NOT NULL"
+        ).fetchall()
+    except sqlite3.Error:
+        conn.close()
+        return out
+    conn.close()
+    agg: dict[str, dict[str, list[float]]] = {}
+    for row in rows:
+        engine = str(row["engine_id"] or "").upper()
+        if engine not in _PRIORS or not is_current_version(engine, row):
+            continue
+        try:
+            dec = json.loads(row["adaptive_decision_json"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        conf = float(dec.get("confidence") or 0.0)
+        size = float(dec.get("size_mult") or 1.0)
+        net = float(row["pnl_pct_net"])
+        eng = agg.setdefault(engine, {})
+        eng.setdefault(_conf_bucket(conf), []).append(net)
+        eng.setdefault(_size_bucket(size), []).append(net)
+    for engine, buckets in agg.items():
+        out["engines"][engine] = {b: {"n": len(v), "avg_net_pct": round(sum(v) / len(v), 6), "wins": sum(1 for x in v if x > 0)} for b, v in sorted(buckets.items())}
+    return out
+
+
 def persist_trade_adaptive(conn: sqlite3.Connection, trade_id: str, decision: dict[str, Any] | None) -> None:
     if not trade_id or not decision:
         return
@@ -497,12 +725,16 @@ def persist_trade_adaptive(conn: sqlite3.Connection, trade_id: str, decision: di
 
 
 __all__ = [
+    "ADAPTIVE_HALF_LIFE_DAYS",
     "ADAPTIVE_STATE_VERSION",
     "DAY_HORIZONS_MIN",
     "SCALP_HORIZONS_SEC",
+    "adaptive_state_report",
+    "calibration_report",
     "day_decision",
     "estimate",
     "learn_from_close",
+    "market_regime_tag",
     "observe",
     "ohlcv_quote",
     "persist_trade_adaptive",

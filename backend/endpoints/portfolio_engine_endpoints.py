@@ -677,6 +677,32 @@ async def get_performance_by_version() -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@router.get("/adaptive/state")
+async def get_adaptive_state() -> dict[str, Any]:
+    """Current learned adaptive state per engine, as the next candidate reads it. Read-only."""
+    try:
+        from backend.services.adaptive_learning import adaptive_state_report
+
+        data = await asyncio.to_thread(adaptive_state_report, os.getenv("TRADING_DB_PATH", DATABASE_PATH))
+        return {"success": True, "data": data}
+    except Exception as exc:
+        logger.exception("adaptive-state failed: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.get("/adaptive/calibration")
+async def get_adaptive_calibration() -> dict[str, Any]:
+    """Realized net by entry-stamped confidence and size bucket. Telemetry, never a gate."""
+    try:
+        from backend.services.adaptive_learning import calibration_report
+
+        data = await asyncio.to_thread(calibration_report, os.getenv("TRADING_DB_PATH", DATABASE_PATH))
+        return {"success": True, "data": data}
+    except Exception as exc:
+        logger.exception("adaptive-calibration failed: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @router.get("/status")
 async def get_portfolio_status() -> dict[str, Any]:
     """

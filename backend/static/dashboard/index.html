@@ -139,6 +139,18 @@
             </div>
         </section>
 
+        <section class="widget widget--full" id="adaptive-state-widget" aria-label="Current adaptive learning state">
+            <h2 class="widget__title">Adaptive learning state <span id="adaptive-state-note" style="font-size:0.8em;font-weight:normal;color:var(--muted,#888);"></span></h2>
+            <p class="widget__subtitle">What DAY and SCALP learning currently changes for the next live decision, per symbol/setup/regime. These change rank, size, target, hold and objective only — never a gate. Confidence and sample count decay with age so stale evidence fades.</p>
+            <div class="widget__table-wrap">
+                <table class="data-table">
+                    <thead><tr><th>Engine</th><th>Symbol</th><th>Setup</th><th>Regime</th><th>Exp move/edge</th><th>Size×</th><th>Target/Obj</th><th>Hold</th><th>Conf</th><th>n</th></tr></thead>
+                    <tbody id="adaptive-state-body"><tr><td colspan="10">--</td></tr></tbody>
+                </table>
+            </div>
+            <p class="widget__subtitle" id="adaptive-calibration-note" style="margin-top:8px;">Calibration: --</p>
+        </section>
+
         <!-- Trading result: live exchange-reconciled is the primary figure. -->
         <section class="widget widget--full" id="pnl-recon-widget" aria-label="Trading result, live exchange-reconciled">
             <h2 class="widget__title">Trading result <span class="readiness-value" id="pnl-mode" style="font-size:0.85em;margin-left:8px;">--</span></h2>

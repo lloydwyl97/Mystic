@@ -1783,15 +1783,21 @@ class PortfolioEngineIntegration:
                             "as_of": as_of,
                         }
                     )
-                    from backend.services.adaptive_learning import record_candidate
+                    from backend.services.adaptive_learning import market_regime_tag, record_candidate
                     from backend.services.portfolio_engine import ESTIMATED_ROUNDTRIP_COST
 
+                    # One regime key for the whole candidate lifecycle: the markout
+                    # record, the entry decision, and the close all use this tag so
+                    # they land on the same adaptive row. Falls back to the signal's
+                    # own regime string when market data is thin.
+                    regime_tag = market_regime_tag(db_path, symbol) or str(signal.regime or "")
+                    candidates[-1]["regime_tag"] = regime_tag
                     record_candidate(
                         db_path,
                         engine="DAY_V2",
                         symbol=symbol,
                         setup=signal.setup,
-                        regime=signal.regime,
+                        regime=regime_tag,
                         ref_price=ask_price,
                         roundtrip_cost=ESTIMATED_ROUNDTRIP_COST,
                         signaled=True,
@@ -1810,7 +1816,8 @@ class PortfolioEngineIntegration:
             resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts))
             for cand in candidates:
                 sig = cand["signal"]
-                cand["adaptive"] = day_decision(db_path, cand["symbol"], sig.setup, sig.regime)
+                regime_tag = str(cand.get("regime_tag") or sig.regime or "")
+                cand["adaptive"] = day_decision(db_path, cand["symbol"], sig.setup, regime_tag)
             ranked = rank_day_candidates(candidates, list(DAY_V2_UNIVERSE), ESTIMATED_ROUNDTRIP_COST)
             logger.info(
                 "DAY_V2_RANKED %s",
@@ -2112,7 +2119,7 @@ class PortfolioEngineIntegration:
         from backend.services.day_entry_reservations import release_orphan_reservations
 
         release_orphan_reservations(self.engine.db_path, now=cycle_ts)
-        from backend.services.adaptive_learning import ohlcv_quote, record_candidate, resolve_markouts, scalp_decision
+        from backend.services.adaptive_learning import market_regime_tag, ohlcv_quote, record_candidate, resolve_markouts, scalp_decision
         from backend.services.portfolio_engine import ESTIMATED_ROUNDTRIP_COST
 
         resolve_markouts(self.engine.db_path, lambda sym, ts: ohlcv_quote(self.engine.db_path, sym, ts))
@@ -2126,7 +2133,10 @@ class PortfolioEngineIntegration:
             if code != "ARMED" or not row:
                 return -1e9
             setup_name = str(row.get("best_setup") or "SCALP_STRUCTURAL")
-            regime = str(row.get("regime") or row.get("market_regime") or "")
+            # Same regime tag the DAY loop uses, so both engines learn on a real
+            # regime axis instead of an empty string. Stamped on the decision, so
+            # the close reuses it and the markout/read/close keys all match.
+            regime = market_regime_tag(self.engine.db_path, norm_key) or str(row.get("regime") or row.get("market_regime") or "")
             view = scalp_decision(self.engine.db_path, norm_key, setup_name, regime)
             row["adaptive_decision"] = view
             snap = row.get("snap")

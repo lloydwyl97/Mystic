@@ -3919,6 +3919,49 @@ async function loadVersionPerformance() {
     if (result.ok && result.data && result.data.data) renderVersionPerformance(result.data.data);
 }
 
+function renderAdaptiveState(data) {
+    const body = document.getElementById("adaptive-state-body");
+    if (!body || !data || !data.engines) return;
+    const note = document.getElementById("adaptive-state-note");
+    if (note) note.textContent = (data.adaptive_state_version || "") + (data.half_life_days ? " · half-life " + data.half_life_days + "d" : "");
+    const pct = (v) => (v === null || v === undefined ? "--" : (v * 100).toFixed(3) + "%");
+    const rows = [];
+    ["DAY_V2", "SCALP_V2"].forEach(function (engine) {
+        const list = data.engines[engine] || [];
+        list.forEach(function (r) {
+            const isDay = engine === "DAY_V2";
+            const move = isDay ? pct(r.expected_move) : pct(r.expected_edge);
+            const tgt = isDay ? "×" + (r.objective_atr_mult || 1).toFixed(2) : pct(r.target_pct);
+            const hold = isDay ? "--" : (r.hold_min || 0).toFixed(1) + "m";
+            rows.push(
+                "<tr><td>" + escapeHtml(engine) + "</td><td>" + escapeHtml(r.symbol || "") + "</td><td>" + escapeHtml(r.setup || "") + "</td><td>" + escapeHtml(r.regime || "-") + "</td><td>" + move + "</td><td>" + (r.size_mult || 1).toFixed(3) + "</td><td>" + tgt + "</td><td>" + hold + "</td><td>" + (r.confidence || 0).toFixed(3) + "</td><td>" + (r.n || 0) + "</td></tr>"
+            );
+        });
+    });
+    body.innerHTML = rows.length ? rows.join("") : "<tr><td colspan=\"10\">No current-version observations yet — decisions use priors (size ×1.00, no change).</td></tr>";
+}
+
+function renderAdaptiveCalibration(data) {
+    const el = document.getElementById("adaptive-calibration-note");
+    if (!el || !data || !data.engines) return;
+    const parts = [];
+    Object.keys(data.engines).forEach(function (engine) {
+        const b = data.engines[engine];
+        Object.keys(b).forEach(function (bucket) {
+            const s = b[bucket];
+            parts.push(engine + " " + bucket + ": " + (s.avg_net_pct >= 0 ? "+" : "") + (s.avg_net_pct * 100).toFixed(3) + "% (n=" + s.n + ", " + s.wins + "W)");
+        });
+    });
+    el.textContent = parts.length ? "Calibration — " + parts.join("  |  ") : "Calibration: no current-version closed trades with a stamped decision yet.";
+}
+
+async function loadAdaptiveState() {
+    const state = await fetchEndpoint("/api/portfolio-engine/adaptive/state");
+    if (state.ok && state.data && state.data.data) renderAdaptiveState(state.data.data);
+    const calib = await fetchEndpoint("/api/portfolio-engine/adaptive/calibration");
+    if (calib.ok && calib.data && calib.data.data) renderAdaptiveCalibration(calib.data.data);
+}
+
 if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
 } else {
@@ -3926,3 +3969,5 @@ if (document.readyState === "loading") {
 }
 loadVersionPerformance();
 setInterval(loadVersionPerformance, 60000);
+loadAdaptiveState();
+setInterval(loadAdaptiveState, 60000);
