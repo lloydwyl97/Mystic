@@ -10,6 +10,7 @@ import pytest
 from backend.services.adaptive_learning import (
     MICRO_MODEL_TILT_MAX,
     SCALP_MICRO_FEATURES,
+    abstention_report,
     adaptive_state_report,
     calibration_report,
     day_decision,
@@ -535,6 +536,37 @@ def test_abstention_kill_switch_disables_it(tmp_path, monkeypatch):
     assert day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")["abstain"] is True
     monkeypatch.setattr(al, "ABSTAIN_ENABLED", False)
     assert day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")["abstain"] is False
+
+
+def test_abstention_report_measures_value(tmp_path):
+    import sqlite3
+
+    db = str(tmp_path / "t.db")
+    # A confident negative-edge DAY key -> should show up as abstaining.
+    for _ in range(40):
+        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="markout_forward", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
+    # A healthy positive key -> stays active.
+    for _ in range(20):
+        observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="", metric="markout_forward", value=0.02, strategy_version=DAY_STRATEGY_VERSION)
+    # Record two live skip decisions in the DAY decision log within the window.
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE IF NOT EXISTS day_v2_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, cycle_ts REAL, result TEXT, closest TEXT DEFAULT '', unmet_json TEXT DEFAULT '[]')")
+    import time as _t
+
+    for _ in range(2):
+        conn.execute("INSERT INTO day_v2_decisions(symbol, cycle_ts, result) VALUES ('XRPUSDT', ?, 'REJECTED:LEARNED_NEGATIVE_EDGE')", (_t.time(),))
+    conn.commit()
+    conn.close()
+
+    rep = abstention_report(db, window_days=7.0)
+    assert rep["enabled"] in (True, False)
+    day = rep["engines"]["DAY_V2"]
+    assert day["skips_in_window"] == 2
+    assert day["abstaining_keys"] >= 1
+    assert day["active_keys"] >= 1
+    assert day["avg_net_edge_abstained"] < 0
+    assert day["bps_avoided_per_skip"] > 0
+    assert any(r["symbol"] == "XRPUSDT" for r in day["abstaining"])
 
 
 def test_abstention_is_live_skip_only(tmp_path):

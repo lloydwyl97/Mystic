@@ -3955,11 +3955,31 @@ function renderAdaptiveCalibration(data) {
     el.textContent = parts.length ? "Calibration — " + parts.join("  |  ") : "Calibration: no current-version closed trades with a stamped decision yet.";
 }
 
+function renderAbstention(data) {
+    const el = document.getElementById("adaptive-abstention-note");
+    if (!el || !data || !data.engines) return;
+    const bps = (v) => (v === null || v === undefined ? "--" : (v * 10000).toFixed(1) + "bps");
+    const parts = [];
+    ["DAY_V2", "SCALP_V2"].forEach(function (engine) {
+        const e = data.engines[engine];
+        if (!e) return;
+        parts.push(
+            engine + ": skipped " + (e.skips_in_window || 0) + " in " + (data.window_days || 7) + "d, " +
+            (e.abstaining_keys || 0) + " keys abstaining (avg " + bps(e.avg_net_edge_abstained) + " avoided) vs " +
+            (e.active_keys || 0) + " trading (avg " + bps(e.avg_net_edge_active) + ")"
+        );
+    });
+    const status = data.enabled ? "ON" : "OFF";
+    el.textContent = "Abstention [" + status + "] — " + (parts.length ? parts.join("  |  ") : "cold, nothing skipped yet (behaviour unchanged until evidence accrues).");
+}
+
 async function loadAdaptiveState() {
     const state = await fetchEndpoint("/api/portfolio-engine/adaptive/state");
     if (state.ok && state.data && state.data.data) renderAdaptiveState(state.data.data);
     const calib = await fetchEndpoint("/api/portfolio-engine/adaptive/calibration");
     if (calib.ok && calib.data && calib.data.data) renderAdaptiveCalibration(calib.data.data);
+    const abst = await fetchEndpoint("/api/portfolio-engine/adaptive/abstention");
+    if (abst.ok && abst.data && abst.data.data) renderAbstention(abst.data.data);
 }
 
 if (document.readyState === "loading") {

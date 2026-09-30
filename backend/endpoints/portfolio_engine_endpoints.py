@@ -703,6 +703,19 @@ async def get_adaptive_calibration() -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@router.get("/adaptive/abstention")
+async def get_adaptive_abstention(window_days: float = 7.0) -> dict[str, Any]:
+    """Is the live abstention skip earning its keep? Skip counts + net edge avoided. Read-only."""
+    try:
+        from backend.services.adaptive_learning import abstention_report
+
+        data = await asyncio.to_thread(abstention_report, os.getenv("TRADING_DB_PATH", DATABASE_PATH), window_days)
+        return {"success": True, "data": data}
+    except Exception as exc:
+        logger.exception("adaptive-abstention failed: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @router.get("/status")
 async def get_portfolio_status() -> dict[str, Any]:
     """

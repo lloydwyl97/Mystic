@@ -910,6 +910,73 @@ def calibration_report(db_path: str) -> dict[str, Any]:
     return out
 
 
+def abstention_report(db_path: str, window_days: float = 7.0) -> dict[str, Any]:
+    """Is the live abstention skip earning its keep? Read-only telemetry.
+
+    Per engine: how many candidates it skipped in the window, the keys that are
+    currently abstaining and their learned cost-adjusted net edge (what we are
+    avoiding), versus the keys still trading. When abstained keys average a
+    negative net edge and active keys do not, each skip is avoiding that loss.
+    Never a gate; pure measurement.
+    """
+    since = time.time() - float(window_days) * 86400.0
+    out: dict[str, Any] = {
+        "adaptive_state_version": ADAPTIVE_STATE_VERSION,
+        "enabled": ABSTAIN_ENABLED,
+        "confidence_floor": ABSTAIN_CONFIDENCE_FLOOR,
+        "edge_margin": ABSTAIN_EDGE_MARGIN,
+        "window_days": float(window_days),
+        "engines": {},
+    }
+    try:
+        conn = _connect(db_path)
+    except sqlite3.Error:
+        return out
+    try:
+        for engine_id, decide, table in (
+            (DAY_ENGINE, day_decision, "day_v2_decisions"),
+            (SCALP_ENGINE, scalp_decision, "scalp_v2_decisions"),
+        ):
+            keys = conn.execute(
+                "SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? ORDER BY symbol, setup, regime",
+                (engine_id,),
+            ).fetchall()
+            abstaining: list[dict[str, Any]] = []
+            active: list[dict[str, Any]] = []
+            for k in keys:
+                v = decide(db_path, k["symbol"], k["setup"], k["regime"])
+                rec = {
+                    "symbol": k["symbol"],
+                    "setup": k["setup"],
+                    "regime": k["regime"],
+                    "net_edge": round(float(v["abstain_net_edge"]), 6),
+                    "confidence": round(float(v["abstain_confidence"]), 3),
+                }
+                (abstaining if v["abstain"] else active).append(rec)
+            skips = 0
+            with contextlib.suppress(sqlite3.Error):
+                skips = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE cycle_ts>=? AND result=?",
+                        (since, "REJECTED:LEARNED_NEGATIVE_EDGE"),
+                    ).fetchone()[0]
+                )
+            avg_abstained = round(sum(r["net_edge"] for r in abstaining) / len(abstaining), 6) if abstaining else None
+            avg_active = round(sum(r["net_edge"] for r in active) / len(active), 6) if active else None
+            out["engines"][engine_id] = {
+                "skips_in_window": skips,
+                "abstaining_keys": len(abstaining),
+                "active_keys": len(active),
+                "avg_net_edge_abstained": avg_abstained,
+                "avg_net_edge_active": avg_active,
+                "bps_avoided_per_skip": round(-avg_abstained * 10000.0, 2) if (avg_abstained is not None and avg_abstained < 0) else 0.0,
+                "abstaining": sorted(abstaining, key=lambda r: r["net_edge"])[:20],
+            }
+    finally:
+        conn.close()
+    return out
+
+
 def persist_trade_adaptive(conn: sqlite3.Connection, trade_id: str, decision: dict[str, Any] | None) -> None:
     if not trade_id or not decision:
         return
@@ -927,6 +994,7 @@ __all__ = [
     "ADAPTIVE_STATE_VERSION",
     "DAY_HORIZONS_MIN",
     "SCALP_HORIZONS_SEC",
+    "abstention_report",
     "adaptive_state_report",
     "calibration_report",
     "day_decision",
