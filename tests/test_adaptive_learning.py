@@ -264,6 +264,27 @@ def test_close_learns_under_entry_stamped_key_reaches_next_candidate(tmp_path):
     stranded = scalp_decision(db, "ETHUSDT", "RANGE_BOUNCE_SCALP", entry_regime)
     assert stranded["n_net"] == 0
 
+    # Symbol axis: a close keyed 'ETH/USDT' must reach a read keyed 'ETHUSDT'.
+    base = scalp_decision(db, "SOLUSDT", entry_setup, entry_regime)
+    assert learn_from_close(
+        db,
+        engine=SCALP,
+        symbol="SOL/USDT",  # slash form, as a live close passes it
+        setup=entry_setup,
+        regime=entry_regime,
+        strategy_version=SCALP_STRATEGY_VERSION,
+        net_pct=0.004,
+        mfe_pct=0.005,
+        mae_pct=0.001,
+        hold_min=5.0,
+        continuation=1.0,
+        version_current=True,
+        is_dust=False,
+    )
+    reread = scalp_decision(db, "SOLUSDT", entry_setup, entry_regime)  # no-slash read
+    assert reread["expected_edge"] != base["expected_edge"]
+    assert reread["n_net"] == 1
+
     # The live close-path keys the learn call on the entry-stamped decision.
     import pathlib
 

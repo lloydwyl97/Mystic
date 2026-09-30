@@ -66,6 +66,16 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, float(value)))
 
 
+def _norm_symbol(symbol: str) -> str:
+    """Single symbol key form. Closes pass 'XRP/USDT'; ranking passes 'XRPUSDT'.
+
+    Both must land on the same adaptive row, so the separator is always stripped
+    before the key is built. Without this the realized-trade write and the next
+    candidate's read never meet.
+    """
+    return str(symbol or "").upper().replace("-", "").replace("/", "")
+
+
 def _prior(engine: str, metric: str) -> float:
     return float(_PRIORS.get(engine, {}).get(metric, 0.0))
 
@@ -134,7 +144,7 @@ def observe(
         return False
     if value is None:
         return False
-    key = (engine_id, str(symbol or "").upper(), str(setup or "").upper(), str(regime or "").lower(), metric)
+    key = (engine_id, _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower(), metric)
     with _connect(db_path) as conn:
         row = conn.execute(
             "SELECT n, ewma FROM adaptive_metric_state WHERE engine_id=? AND symbol=? AND setup=? AND regime=? AND metric=?",
@@ -175,7 +185,7 @@ def estimate(db_path: str, engine: str, symbol: str, setup: str, regime: str, me
         with _connect(db_path) as conn:
             specific = conn.execute(
                 "SELECT n, ewma FROM adaptive_metric_state WHERE engine_id=? AND symbol=? AND setup=? AND regime=? AND metric=?",
-                (engine_id, str(symbol or "").upper(), str(setup or "").upper(), str(regime or "").lower(), metric),
+                (engine_id, _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower(), metric),
             ).fetchone()
             pooled = conn.execute(
                 "SELECT COALESCE(SUM(n), 0), COALESCE(SUM(n * ewma), 0) FROM adaptive_metric_state WHERE engine_id=? AND setup=? AND metric=?",
@@ -362,7 +372,7 @@ def record_candidate(
             """,
             (
                 engine_id,
-                str(symbol or "").upper(),
+                _norm_symbol(symbol),
                 str(setup or "").upper(),
                 str(regime or "").lower(),
                 version,
