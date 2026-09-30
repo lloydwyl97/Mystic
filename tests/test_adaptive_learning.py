@@ -222,3 +222,51 @@ def test_v_through_ab_universe_slots_and_hard_safety():
     assert "SYMBOL_OCCUPIED" in scalp_src
     assert pytest.approx(0.015) == SCALP_V2_CATASTROPHIC_PCT
     assert "adverse_move >= SCALP_V2_CATASTROPHIC_PCT" in inspect.getsource(__import__("backend.services.scalp_v2.exit_evaluator", fromlist=["evaluate_scalp_v2_exit"]).evaluate_scalp_v2_exit)
+
+
+# --- close-path key alignment -------------------------------------------------
+
+
+def test_close_learns_under_entry_stamped_key_reaches_next_candidate(tmp_path):
+    """A closed SCALP outcome must update the SAME setup/regime the entry read.
+
+    The entry reads best_setup (e.g. SCALP_STRUCTURAL); the closed lot's
+    provenance can name the setup differently (e.g. range_bounce_scalp). The
+    close-path must learn under the entry-stamped key so the next candidate,
+    which reads best_setup, actually sees the update.
+    """
+    db = str(tmp_path / "t.db")
+    entry_setup, entry_regime = "SCALP_STRUCTURAL", ""
+    before = scalp_decision(db, "ETHUSDT", entry_setup, entry_regime)
+
+    # Provenance names the closed lot with a different setup string.
+    assert learn_from_close(
+        db,
+        engine=SCALP,
+        symbol="ETHUSDT",
+        setup=entry_setup,  # the key the entry stamped, not the provenance name
+        regime=entry_regime,
+        strategy_version=SCALP_STRATEGY_VERSION,
+        net_pct=0.006,
+        mfe_pct=0.007,
+        mae_pct=0.002,
+        hold_min=6.0,
+        continuation=1.0,
+        version_current=True,
+        is_dust=False,
+    )
+
+    after = scalp_decision(db, "ETHUSDT", entry_setup, entry_regime)
+    assert after["expected_edge"] != before["expected_edge"]
+    assert after["n_net"] == 1
+
+    # A read under the provenance name would NOT have seen it (proves the risk).
+    stranded = scalp_decision(db, "ETHUSDT", "RANGE_BOUNCE_SCALP", entry_regime)
+    assert stranded["n_net"] == 0
+
+    # The live close-path keys the learn call on the entry-stamped decision.
+    import pathlib
+
+    pe_src = pathlib.Path(__import__("backend.services.portfolio_engine", fromlist=["__file__"]).__file__).read_text()
+    assert '_adapt_dec.get("setup")' in pe_src
+    assert '_adapt_dec.get("regime")' in pe_src

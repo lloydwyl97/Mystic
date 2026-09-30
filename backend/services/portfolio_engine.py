@@ -7053,12 +7053,22 @@ class PortfolioEngine:
                 from backend.services.adaptive_learning import learn_from_close
 
                 _iwh = locals().get("indicators_while_holding") if isinstance(locals().get("indicators_while_holding"), dict) else {}
+                # Learn under the SAME setup/regime keys the entry read from the
+                # adaptive controller, so the realized outcome reaches the next
+                # candidate. resolve_setup() can name a closed lot differently
+                # (e.g. opportunity setup_family vs the ranking best_setup), which
+                # would otherwise strand the update under an unread key. Fall back
+                # to provenance/entry-regime when no decision was stamped.
+                _adapt_dec = getattr(position, "adaptive_decision", None)
+                _adapt_dec = _adapt_dec if isinstance(_adapt_dec, dict) else {}
+                _learn_setup = str(_adapt_dec.get("setup") or _prov.get("setup") or "")
+                _learn_regime = str(_adapt_dec.get("regime") or getattr(position, "day_route_regime_at_entry", "") or "")
                 learn_from_close(
                     self.db_path,
                     engine=str(_prov.get("engine_id") or ""),
                     symbol=symbol,
-                    setup=str(_prov.get("setup") or ""),
-                    regime=str(getattr(position, "day_route_regime_at_entry", "") or ""),
+                    setup=_learn_setup,
+                    regime=_learn_regime,
                     strategy_version=str(_prov.get("strategy_version") or ""),
                     net_pct=record.net_profit_pct,
                     mfe_pct=_iwh.get("mfe_pct"),
