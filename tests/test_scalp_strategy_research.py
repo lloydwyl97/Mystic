@@ -139,3 +139,25 @@ def test_micro_replay_skips_stale_next_snapshot():
         "ofi_5s": np.zeros(3),
     }
     assert smi.simulate(g, 0, smi.CONTRACTS[0], "BTC") is None
+
+
+def test_live_entry_exit_replay_stop_first_and_target_net():
+    import numpy as np
+
+    from scripts.research.scalp_live_entry_exit_replay import FEE, SLIP, ScalpExit, simulate
+    from scripts.research.scalp_strategy_research import SPREAD_BPS
+
+    t = np.arange(0, 60 * 60_000, 60_000)
+    flat = np.full(len(t), 100.0)
+    arr = {"t": t, "open": flat.copy(), "high": flat.copy(), "low": flat.copy(), "close": flat.copy()}
+    ct = ScalpExit("T", target_net=0.003, stop_pct=0.004, max_hold_min=30)
+    both = {k: v.copy() for k, v in arr.items()}
+    both["high"][2], both["low"][2] = 101.0, 99.0
+    assert simulate(both, 0, 100.0, "BTCUSDT", ct)["reason"] == "STOP"
+    up = {k: v.copy() for k, v in arr.items()}
+    up["high"][3] = 101.0
+    r = simulate(up, 0, 100.0, "BTCUSDT", ct)
+    assert r["reason"] == "TARGET" and r["net_bps"] == pytest.approx(30.0, abs=0.05)
+    r = simulate(arr, 0, 100.0, "BTCUSDT", ct)
+    hs = SPREAD_BPS["BTCUSDT"] / 2e4
+    assert r["reason"] == "TIME" and r["net_bps"] == pytest.approx(((1 - hs - SLIP) - 1 - FEE * (2 - hs - SLIP)) * 1e4)
