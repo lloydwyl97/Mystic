@@ -2135,29 +2135,25 @@ class PortfolioEngineIntegration:
         by_symbol = {str(row.get("symbol") or "").upper().replace("-", "").replace("/", ""): row for row in candidates}
         products = [str(s) for s in getattr(cfg, "products", [])] or list(by_symbol)
 
-        def _scalp_priority(sym_raw: str) -> float:
-            norm_key = sym_raw.upper().replace("-", "").replace("/", "")
-            row = by_symbol.get(norm_key)
-            code, _reason = classify_scalp_candidate(row)
-            if code != "ARMED" or not row:
-                return -1e9
-            setup_name = str(row.get("best_setup") or "SCALP_STRUCTURAL")
-            # Same regime tag the DAY loop uses, so both engines learn on a real
-            # regime axis instead of an empty string. Stamped on the decision, so
-            # the close reuses it and the markout/read/close keys all match.
-            regime = market_regime_tag(self.engine.db_path, norm_key) or str(row.get("regime") or row.get("market_regime") or "")
+        def _scalp_book(norm_key: str) -> dict:
             # Live book/flow features for the inspectable microstructure edge model.
-            micro_feats: dict = {}
+            # Stamped at evaluation time for armed and non-executed candidates.
             try:
                 from backend.services.microstructure_engine import compute_features as _cmf
 
-                micro_feats = _cmf(norm_key) or {}
+                return _cmf(norm_key) or {}
             except Exception:
-                micro_feats = {}
-            view = scalp_decision(self.engine.db_path, norm_key, setup_name, regime, features=micro_feats)
-            row["adaptive_decision"] = view
+                return {}
+
+        def _record_scalp_observation(row: dict, norm_key: str, *, signaled: bool) -> dict:
+            setup_name = str(row.get("best_setup") or "SCALP_STRUCTURAL")
+            regime = market_regime_tag(self.engine.db_path, norm_key) or str(row.get("regime") or row.get("market_regime") or "")
+            micro_feats = _scalp_book(norm_key)
             snap = row.get("snap")
             ref_price = float(getattr(snap, "best_ask", 0) or getattr(snap, "mid_price", 0) or 0) if snap is not None else 0.0
+            if ref_price <= 0:
+                slash = norm_key[:-4] + "/USDT" if norm_key.endswith("USDT") else norm_key
+                ref_price = float(self.current_prices.get(norm_key) or self.current_prices.get(slash) or 0)
             record_candidate(
                 self.engine.db_path,
                 engine="SCALP_V2",
@@ -2166,9 +2162,20 @@ class PortfolioEngineIntegration:
                 regime=regime,
                 ref_price=ref_price,
                 roundtrip_cost=canonical_roundtrip_cost_pct(spread_pct=(float(micro_feats["spread_pct"]) if micro_feats.get("spread_pct") is not None else None)),
-                signaled=True,
+                signaled=signaled,
                 features=micro_feats,
             )
+            return {"setup": setup_name, "regime": regime, "features": micro_feats, "ref_price": ref_price}
+
+        def _scalp_priority(sym_raw: str) -> float:
+            norm_key = sym_raw.upper().replace("-", "").replace("/", "")
+            row = by_symbol.get(norm_key)
+            code, _reason = classify_scalp_candidate(row)
+            if code != "ARMED" or not row:
+                return -1e9
+            stamped = _record_scalp_observation(row, norm_key, signaled=True)
+            view = scalp_decision(self.engine.db_path, norm_key, stamped["setup"], stamped["regime"], features=stamped["features"])
+            row["adaptive_decision"] = view
             return float(view["expected_edge"]) + 0.001 * float(view["confidence"])
 
         for sym_raw in sorted(products, key=_scalp_priority, reverse=True):
@@ -2180,6 +2187,8 @@ class PortfolioEngineIntegration:
             result_code, reason = classify_scalp_candidate(row)
             try:
                 if result_code != "ARMED":
+                    if row:
+                        _record_scalp_observation(row, norm_key, signaled=False)
                     record_scalp_decision(self.engine.db_path, norm, result_code, reason, cycle_ts=cycle_ts)
                     logger.info("SCALP_V2_DECISION symbol=%s result=%s reason=%s", norm, result_code, reason)
                     continue

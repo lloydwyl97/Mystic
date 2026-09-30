@@ -371,6 +371,32 @@ def test_market_regime_tag_shape_and_safe_fallback(tmp_path):
 # --- read-only reports -------------------------------------------------------
 
 
+def test_legacy_range_vwap_are_forensic_not_current(tmp_path):
+    db = str(tmp_path / "t.db")
+    observe(db, engine=SCALP, symbol="XRPUSDT", setup="RANGE", regime="", metric="trade_net", value=-0.01, strategy_version=SCALP_STRATEGY_VERSION)
+    observe(db, engine=SCALP, symbol="XRP/USDT", setup="VWAP", regime="", metric="trade_net", value=-0.004, strategy_version=SCALP_STRATEGY_VERSION)
+    observe(db, engine=SCALP, symbol="XRPUSDT", setup="RANGE_BOUNCE_SCALP", regime="btcup_vollo", metric="trade_net", value=0.002, strategy_version=SCALP_STRATEGY_VERSION)
+    rep = adaptive_state_report(db)
+    current = {(r["setup"], r["regime"]) for r in rep["engines"]["SCALP_V2"]}
+    assert ("RANGE", "") not in current
+    assert ("VWAP", "") not in current
+    assert ("RANGE_BOUNCE_SCALP", "btcup_vollo") in current
+    forensic = {r["setup"] for r in rep["forensic"]}
+    assert forensic == {"RANGE", "VWAP"}
+    ab = abstention_report(db)
+    shown = {r["setup"] for r in ab["engines"]["SCALP_V2"]["abstaining"]}
+    assert "RANGE" not in shown and "VWAP" not in shown
+    assert ab["engines"]["SCALP_V2"]["active_keys"] == 1
+    assert ab["engines"]["SCALP_V2"]["abstaining_keys"] == 0
+
+
+def test_day_longest_markout_horizon_is_six_hours():
+    from backend.services.adaptive_learning import DAY_HORIZONS_MIN
+
+    assert DAY_HORIZONS_MIN == (15, 30, 60, 120, 240, 360)
+    assert DAY_HORIZONS_MIN[-1] == 360
+
+
 def test_adaptive_state_report_lists_current_keys(tmp_path):
     db = str(tmp_path / "t.db")
     observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="btcup_vollo", metric="trade_mfe", value=0.02, strategy_version=DAY_STRATEGY_VERSION)
@@ -707,3 +733,5 @@ def test_micro_model_is_scalp_only_and_not_a_gate(tmp_path):
 
     loop = inspect.getsource(PortfolioEngineIntegration._process_scalp_v2_signals)
     assert "compute_features" in loop and "features=micro_feats" in loop
+    reject = loop.split('if result_code != "ARMED":', 1)[1].split("continue", 1)[0]
+    assert "_record_scalp_observation" in reject

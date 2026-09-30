@@ -36,6 +36,16 @@ MARKOUT_WEIGHT = 0.35
 DAY_ENGINE = "DAY_V2"
 SCALP_ENGINE = "SCALP_V2"
 
+# Pre-stamp history. These keys stay in the table for forensics and are never
+# copied onto current setup names. The current adaptive API does not list them
+# as live learning.
+FORENSIC_ADAPTIVE_KEYS = frozenset(
+    {
+        (SCALP_ENGINE, "XRPUSDT", "RANGE", ""),
+        (SCALP_ENGINE, "XRPUSDT", "VWAP", ""),
+    }
+)
+
 DAY_HORIZONS_MIN = (15, 30, 60, 120, 240, 360)
 SCALP_HORIZONS_SEC = (30, 60, 120, 300, 600, 1200)
 
@@ -138,6 +148,10 @@ def _decay_factor(updated_at: str, now_epoch: float) -> float:
         return 1.0
     elapsed = max(0.0, float(now_epoch) - t0)
     return float(0.5 ** (elapsed / half_life))
+
+
+def _is_forensic_key(engine_id: str, symbol: str, setup: str, regime: str) -> bool:
+    return (str(engine_id), _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower()) in FORENSIC_ADAPTIVE_KEYS
 
 
 def _norm_symbol(symbol: str) -> str:
@@ -934,7 +948,12 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
     observations and returns the DAY/SCALP decision for each so a dashboard can
     show exactly what learning currently changes and why.
     """
-    out: dict[str, Any] = {"adaptive_state_version": ADAPTIVE_STATE_VERSION, "half_life_days": ADAPTIVE_HALF_LIFE_DAYS, "engines": {}}
+    out: dict[str, Any] = {
+        "adaptive_state_version": ADAPTIVE_STATE_VERSION,
+        "half_life_days": ADAPTIVE_HALF_LIFE_DAYS,
+        "engines": {},
+        "forensic": [],
+    }
     try:
         conn = _connect(db_path)
     except sqlite3.Error:
@@ -947,6 +966,17 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
             ).fetchall()
             rows = []
             for k in keys:
+                if _is_forensic_key(engine_id, k["symbol"], k["setup"], k["regime"]):
+                    out["forensic"].append(
+                        {
+                            "engine_id": engine_id,
+                            "symbol": _norm_symbol(k["symbol"]),
+                            "setup": str(k["setup"] or "").upper(),
+                            "regime": str(k["regime"] or "").lower(),
+                            "classification": "legacy_pre_stamp",
+                        }
+                    )
+                    continue
                 view = decide(db_path, k["symbol"], k["setup"], k["regime"])
                 if engine_id == DAY_ENGINE:
                     rows.append(
@@ -1092,6 +1122,8 @@ def abstention_report(db_path: str, window_days: float = 7.0) -> dict[str, Any]:
             abstaining: list[dict[str, Any]] = []
             active: list[dict[str, Any]] = []
             for k in keys:
+                if _is_forensic_key(engine_id, k["symbol"], k["setup"], k["regime"]):
+                    continue
                 v = decide(db_path, k["symbol"], k["setup"], k["regime"])
                 rec = {
                     "symbol": k["symbol"],
