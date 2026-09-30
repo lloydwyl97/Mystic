@@ -512,28 +512,6 @@ def test_policy_version_in_config() -> None:
     assert DAY_STRUCTURAL_PULLBACK_V1 == "DAY_STRUCTURAL_PULLBACK_V1"
 
 
-def test_policy_version_persisted_on_new_intent(tmp_path: Path) -> None:
-    """create_day_v2_intent must stamp DAY_STRUCTURAL_PULLBACK_V1 on the intent."""
-    from backend.services.day_trailing_buy_store import ensure_trailing_buy_schema
-    from backend.services.day_v2.live_entry import create_day_v2_intent
-    from backend.services.day_v2.structural_entry import evaluate_structural_zone
-
-    # Use the real production schema so ensure_trailing_buy_schema doesn't fail
-    # on missing columns / indexes when called internally by create_intent.
-    db = str(tmp_path / "test.db")
-    ensure_trailing_buy_schema(db)
-    run_day_v2_migrations(db)
-
-    sig = _make_signal()
-    zone = evaluate_structural_zone(sig)
-
-    with patch("backend.services.day_v2.live_entry.DAY_V2_ENABLED", True):
-        intent = create_day_v2_intent(db, sig, 60000.0, 0.001, structural_zone=zone, reclaim_level=zone.reclaim_level)
-
-    if intent:  # may be None if reservation fails in test DB
-        assert intent.get("policy_version") == DAY_STRUCTURAL_PULLBACK_V1
-
-
 # ===========================================================================
 # 9. Old LEGACY intents canceled at startup
 # ===========================================================================

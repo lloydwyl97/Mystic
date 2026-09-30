@@ -1599,6 +1599,10 @@ class OpenPosition:
     opened_under_router: bool = False
     max_hold_min: int = 0
     trail_pct: float = 0.0
+    # DAY V2 structure-runner inputs stamped at entry (see day_v2.winner_contract).
+    day_exit_contract: str = ""
+    day_atr_1h_at_entry: float = 0.0
+    day_objective_structural: float = 0.0
     trail_activated: bool = False
     trail_activated_at: float = 0.0
     trail_activation_price: float = 0.0
@@ -1740,6 +1744,9 @@ class TradeExplainability:
     entry_vwap: float = 0.0
     thesis_trend_tf: str = ""
     day_route_regime: str = ""
+    day_exit_contract: str = ""
+    day_atr_1h: float = 0.0
+    day_objective_structural: float = 0.0
     strategy_family: str = ""
     outcome_penalty_applied: bool = False
     outcome_credit_applied: bool = False
@@ -8740,6 +8747,9 @@ class PortfolioEngine:
                 price_structure_regime_at_entry=str(thesis_payload.get("price_structure_regime_at_entry") or ""),
                 max_hold_min=int(thesis_payload.get("max_hold_min") or 0),
                 trail_pct=float(thesis_payload.get("trail_pct") or 0.0),
+                day_exit_contract=str(thesis_payload.get("day_exit_contract") or ""),
+                day_atr_1h_at_entry=float(thesis_payload.get("day_atr_1h_at_entry") or 0.0),
+                day_objective_structural=float(thesis_payload.get("day_objective_structural") or 0.0),
                 exit_residual_reason=str(thesis_payload.get("exit_residual_reason") or ""),
                 exit_residual_since=float(thesis_payload.get("exit_residual_since") or 0.0),
                 entry_decision_id=entry_decision_id,
@@ -11776,6 +11786,9 @@ class PortfolioEngine:
             legacy_pre_regime_router=False,
             opened_under_router=True,
             protected_dust_qty=_protected_dust,
+            day_exit_contract=str(getattr(explainability, "day_exit_contract", "") or ""),
+            day_atr_1h_at_entry=float(getattr(explainability, "day_atr_1h", 0.0) or 0.0),
+            day_objective_structural=float(getattr(explainability, "day_objective_structural", 0.0) or 0.0),
         )
         if live_order_buy and (live_order_buy.get("_mystic_partial_fill") or live_order_buy.get("_mystic_ioc_incomplete")):
             is_dust, _, dust_reason, _ = self._dust_check(normalized_symbol, quantity, fill_price)
@@ -16122,8 +16135,8 @@ class PortfolioEngine:
             return None
 
         # DAY V2 exit dispatch — runs before all legacy exits.
-        # Positions with engine_id='DAY_V2' use the five DAY V2 exit roles
-        # (catastrophic / structural / winner-trail / objective / time) and
+        # Positions with engine_id='DAY_V2' use the DAY V2 exit roles
+        # (catastrophic / structural / structure-runner ratchet / time) and
         # skip the SCALP V2 stall/giveback/profit logic below.
         _pos_engine_id = str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE")
         from backend.services.protected_external_inventory import exit_route
@@ -16155,6 +16168,9 @@ class PortfolioEngine:
                     target_price=float(getattr(position, "thesis_target_level", 0.0) or 0.0),
                     entry_time=float(getattr(position, "entry_time", 0.0) or 0.0),
                     estimated_roundtrip_cost=float(ESTIMATED_ROUNDTRIP_COST),
+                    setup=str(getattr(position, "entry_thesis", "") or ""),
+                    atr_1h_at_entry=float(getattr(position, "day_atr_1h_at_entry", 0.0) or 0.0),
+                    objective_structural=float(getattr(position, "day_objective_structural", 0.0) or 0.0),
                 )
                 if _day_v2_dec and str(_day_v2_dec.get("action") or "") == "sell":
                     _day_v2_reason = str(_day_v2_dec.get("reason") or "DAY_V2_EXIT")

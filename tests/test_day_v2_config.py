@@ -12,7 +12,6 @@ from backend.services.day_v2.config import (
     DAY_V2_REGIME_BAR_SECONDS,
     DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED,
     DAY_V2_UNIVERSE,
-    DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT,
 )
 
 
@@ -65,13 +64,6 @@ def test_default_regime_bar_is_14400():
 
 def test_default_max_hold_minutes():
     assert DAY_V2_MAX_HOLD_MINUTES == 300
-
-
-def test_default_winner_protection_min_mfe_is_above_legacy_trail():
-    """DAY V2 MFE gate (0.8%) must be above the legacy trail distance (~0.20-0.25%)."""
-    legacy_trail_estimate = 0.0025  # 0.25% — approximate legacy SOL/XRP trail
-    assert legacy_trail_estimate < DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT, f"DAY V2 MFE gate {DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT:.4%} must be above legacy trail ~{legacy_trail_estimate:.4%}"
-    assert pytest.approx(0.008) == DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT
 
 
 def test_invalid_env_var_raises_value_error(monkeypatch):

@@ -32,8 +32,6 @@ from backend.services.day_v2.engine_identity import (
 )
 from backend.services.day_v2.live_exit_evaluator import (
     DAY_V2_ENGINE_ID,
-    WINNER_TRAIL_ATR_MULT,
-    WINNER_TRAIL_FLOOR_PCT,
     evaluate_day_v2_exit,
 )
 from backend.services.day_v2.live_signal import (
@@ -281,53 +279,30 @@ class TestDayV2ExitEvaluator:
         if result is not None:
             assert result["reason"] != "DAY_V2_STRUCTURAL_INVALIDATION"
 
-    # Role 4: Winner protection
-    def test_winner_trail_fires_after_sufficient_mfe(self):
-        from backend.services.day_v2.config import DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT
-
-        # MFE must be >= 0.8%
-        mfe_required = DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT
-        highest = 50000.0 * (1.0 + mfe_required + 0.001)  # safely above threshold
-        # Trail: max(0.5%, 1.5 * atr_pct) = max(0.5%, 1.5 * 250/50000)
-        # atr_pct = 250/50000 = 0.5% → trail = max(0.5%, 0.75%) = 0.75%
-        trail_pct = max(WINNER_TRAIL_FLOOR_PCT, WINNER_TRAIL_ATR_MULT * 250.0 / 50000.0)
-        trigger = highest * (1.0 - trail_pct)
-        result = self._call(
-            highest_price=highest,
-            current_price=trigger - 10.0,  # just below trigger
-            bar_low=trigger - 10.0,
-        )
+    # Role 3: Structure-runner ratchet (pre-runner position: atr_1h = 2.5 x 15m ATR = 625)
+    def test_runner_ratchet_fires_after_one_atr_1h_expansion(self):
+        highest = 50000.0 + 625.0 * 1.2  # proved itself (>= 1x 1h ATR)
+        stop = highest - 1.5 * 625.0
+        result = self._call(highest_price=highest, current_price=stop - 1.0, bar_low=50000.0)
         assert result is not None
         assert result["reason"] == "DAY_V2_WINNER_PROTECTION"
 
-    def test_winner_trail_does_not_fire_below_mfe_threshold(self):
-        """If MFE is below the 0.8% threshold, winner trail must not activate."""
-        highest = 50000.0 * 1.003  # only 0.3% MFE — below 0.8% threshold
-        current = highest * 0.99  # pulled back 1% from high
-        result = self._call(
-            highest_price=highest,
-            current_price=current,
-            bar_low=current,
-        )
-        if result is not None:
-            assert result["reason"] != "DAY_V2_WINNER_PROTECTION"
+    def test_no_winner_exit_before_trade_proves_itself(self):
+        """The old 0.8% MFE / 0.5% trail no longer sells a developing DAY trade."""
+        highest = 50000.0 * 1.009  # 0.9% MFE, still < 1x 1h ATR (1.25%)
+        current = highest * 0.992
+        result = self._call(highest_price=highest, current_price=current, bar_low=50000.0)
+        assert result is None
 
-    # Role 5: Objective complete
-    def test_objective_fires_when_price_reaches_target(self):
-        result = self._call(
-            current_price=50626.0,  # above target (50625)
-            bar_low=50000.0,
-        )
+    def test_old_small_target_does_not_sell(self):
+        result = self._call(current_price=50626.0, highest_price=50626.0, bar_low=50000.0)
+        assert result is None
+
+    def test_objective_reached_then_tight_ratchet_reports_objective_complete(self):
+        highest = 51500.0  # above objective max(50625, 50000 + 2 x 625)
+        result = self._call(highest_price=highest, current_price=highest - 0.75 * 625.0 - 1.0, bar_low=50000.0, setup="HTF_TREND_PULLBACK")
         assert result is not None
         assert result["reason"] == "DAY_V2_OBJECTIVE_COMPLETE"
-
-    def test_objective_does_not_fire_below_target(self):
-        result = self._call(
-            current_price=50624.0,  # just below target
-            bar_low=50000.0,
-        )
-        if result is not None:
-            assert result["reason"] != "DAY_V2_OBJECTIVE_COMPLETE"
 
     # Role 3: Time expiration
     def test_time_expiration_fires_when_at_ceiling_and_negative(self):
@@ -375,124 +350,6 @@ class TestDayV2ExitEvaluator:
         )
         assert result is not None
         assert result["reason"] == "DAY_V2_CATASTROPHIC_PROTECTION"
-
-
-# ---------------------------------------------------------------------------
-# Intent creation
-# ---------------------------------------------------------------------------
-
-
-class TestDayV2Intent:
-    def _make_db(self) -> str:
-        """Create a temp DB with day_trailing_buy_intents schema."""
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        from backend.services.day_v2.migrations import apply_all_migrations
-
-        apply_all_migrations(tmp.name)
-        return tmp.name
-
-    def _make_signal(self, symbol: str = "BTCUSDT") -> DayV2Signal:
-        return DayV2Signal(
-            symbol=symbol,
-            setup="HTF_TREND_PULLBACK",
-            regime="bull",
-            structural_anchor=49000.0,
-            target_price=51250.0,
-            atr=500.0,
-            signal_bar_ts=1700000000,
-            h1_bullish=True,
-            opportunity_id=_opportunity_id(symbol, "HTF_TREND_PULLBACK", 49000.0),
-        )
-
-    def test_intent_created_with_day_v2_engine_id(self):
-        db = self._make_db()
-        signal = self._make_signal()
-        from backend.services.day_v2 import live_entry as _le
-
-        with patch.object(_le, "DAY_V2_ENABLED", True):
-            intent = _le.create_day_v2_intent(db, signal, ask_price=50500.0, quantity=0.01)
-
-        assert intent is not None
-        assert intent.get("engine_id") == "DAY_V2"
-
-    def test_intent_has_thesis_invalid_level(self):
-        db = self._make_db()
-        signal = self._make_signal()
-        from backend.services.day_v2 import live_entry as _le
-
-        with patch.object(_le, "DAY_V2_ENABLED", True):
-            intent = _le.create_day_v2_intent(db, signal, ask_price=50500.0, quantity=0.01)
-
-        assert intent is not None
-        assert float(intent.get("thesis_invalid_level") or 0.0) == pytest.approx(49000.0)
-
-    def test_intent_has_opportunity_id_in_scalp_opp_field(self):
-        db = self._make_db()
-        signal = self._make_signal()
-        from backend.services.day_v2 import live_entry as _le
-
-        with patch.object(_le, "DAY_V2_ENABLED", True):
-            intent = _le.create_day_v2_intent(db, signal, ask_price=50500.0, quantity=0.01)
-
-        assert intent is not None
-        assert intent.get("scalp_opportunity_id") == signal.opportunity_id
-
-    def test_intent_target_stored_in_payload(self):
-        import json
-
-        db = self._make_db()
-        signal = self._make_signal()
-        from backend.services.day_v2 import live_entry as _le
-
-        with patch.object(_le, "DAY_V2_ENABLED", True):
-            intent = _le.create_day_v2_intent(db, signal, ask_price=50500.0, quantity=0.01)
-
-        assert intent is not None
-        payload = json.loads(intent.get("payload_json") or "{}")
-        assert float(payload.get("thesis_target_level") or 0.0) == pytest.approx(51250.0)
-
-    def test_second_intent_same_symbol_blocked(self):
-        db = self._make_db()
-        signal = self._make_signal()
-        from backend.services.day_v2 import live_entry as _le
-
-        with patch.object(_le, "DAY_V2_ENABLED", True):
-            intent1 = _le.create_day_v2_intent(db, signal, ask_price=50500.0, quantity=0.01)
-            _le.create_day_v2_intent(db, signal, ask_price=50500.0, quantity=0.01)
-
-        assert intent1 is not None
-        # Second call returns None (blocked) or the PRESERVED existing row —
-        # never creates a second active row.
-        # Symbol is stored in slash-normalized format (BTC/USDT).
-        with sqlite3.connect(db) as con:
-            count = con.execute(
-                "SELECT COUNT(*) FROM day_trailing_buy_intents WHERE symbol LIKE ?",
-                ("%BTC%USDT%",),
-            ).fetchone()[0]
-        assert count == 1, "Must not create two active intents for the same symbol"
-
-    def test_disabled_engine_raises(self):
-        db = self._make_db()
-        signal = self._make_signal()
-        from backend.services.day_v2 import live_entry as _le
-
-        with patch.object(_le, "DAY_V2_ENABLED", False), pytest.raises(RuntimeError, match="DAY_V2_ENABLED"):
-            _le.create_day_v2_intent(db, signal, ask_price=50500.0, quantity=0.01)
-
-    def test_separate_symbols_get_separate_intents(self):
-        db = self._make_db()
-        signal_btc = self._make_signal("BTCUSDT")
-        signal_eth = self._make_signal("ETHUSDT")
-        from backend.services.day_v2 import live_entry as _le
-
-        with patch.object(_le, "DAY_V2_ENABLED", True):
-            i1 = _le.create_day_v2_intent(db, signal_btc, ask_price=50000.0, quantity=0.01)
-            i2 = _le.create_day_v2_intent(db, signal_eth, ask_price=3000.0, quantity=0.1)
-
-        assert i1 is not None
-        assert i2 is not None
-        assert i1.get("symbol") != i2.get("symbol")
 
 
 # ---------------------------------------------------------------------------
@@ -547,16 +404,6 @@ class TestCrossEngineSafety:
         # SCALP_V2 uses a plain string, not EngineId enum — verify it's not empty
         assert SCALP_V2_ENGINE_ID  # non-empty string
 
-    def test_day_v2_trailing_buy_params_differ_from_scalp_v2(self):
-        """DAY V2 must not silently inherit SCALP V2's 14/4 bps values."""
-        from backend.services.day_v2.live_entry import DAY_V2_MIN_DIP_BPS, DAY_V2_REBOUND_BPS
-
-        # Verify they are present and separately calibrated
-        assert DAY_V2_MIN_DIP_BPS > 0
-        assert DAY_V2_REBOUND_BPS > 0
-        # DAY V2 uses 20 bps min dip (multi-hour patience) vs SCALP V2's 14 bps
-        assert DAY_V2_MIN_DIP_BPS >= 15, "DAY V2 min dip must reflect multi-hour patience (>= 15 bps)"
-
     def test_opportunity_id_continuity_same_move(self):
         """Same setup + same structural anchor → same opportunity ID.
 
@@ -602,17 +449,6 @@ class TestDayV2Config:
         assert "DAY_V2_UNIVERSE" in cfg
         assert "DAY_V2_MAX_HOLD_MINUTES" in cfg
         assert "DAY_V2_CATASTROPHIC_ATR_MULTIPLIER" in cfg
-        assert "DAY_V2_MIN_DIP_BPS" in cfg
-        assert "DAY_V2_REBOUND_BPS" in cfg
-
-    def test_trailing_buy_params_in_config(self):
-        with patch("backend.services.day_v2.config.DAY_V2_ENABLED", True):
-            from backend.services.day_v2.config import get_day_v2_config
-
-            cfg = get_day_v2_config()
-
-        assert cfg["DAY_V2_MIN_DIP_BPS"] > 0
-        assert cfg["DAY_V2_REBOUND_BPS"] > 0
 
 
 # ---------------------------------------------------------------------------

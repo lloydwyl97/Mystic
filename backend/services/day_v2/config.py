@@ -60,9 +60,6 @@ DAY_V2_REGIME_BAR_SECONDS: int = _read_int("DAY_V2_REGIME_BAR_SECONDS", default=
 # Hold ceiling
 DAY_V2_MAX_HOLD_MINUTES: int = _read_int("DAY_V2_MAX_HOLD_MINUTES", default=300)  # 5H initial ceiling
 
-# Winner protection — trail only after meaningful development
-DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT: float = _read_float("DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT", default=0.008)  # 0.8%
-
 # Structural invalidation — require N closed 15m bars before firing
 DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED: int = _read_int("DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED", default=3)
 
@@ -71,15 +68,6 @@ DAY_V2_UNIVERSE: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 
 # Catastrophic stop multiplier (ATR multiples). Calibrated from qualifying replay.
 DAY_V2_CATASTROPHIC_ATR_MULTIPLIER: float = _read_float("DAY_V2_CATASTROPHIC_ATR_MULTIPLIER", default=3.0)
-
-# Winner trail — activated after MFE >= MIN_MFE_PCT; trails at max(floor, ATR_MULT * atr_pct)
-# Calibrated from qualifying replay (day_v2_replay.py @ a88479a).
-DAY_V2_WINNER_TRAIL_ATR_MULT: float = _read_float("DAY_V2_WINNER_TRAIL_ATR_MULT", default=1.5)
-DAY_V2_WINNER_TRAIL_FLOOR_PCT: float = _read_float("DAY_V2_WINNER_TRAIL_FLOOR_PCT", default=0.005)
-
-# Trailing-buy calibration for multi-hour entries (separate from SCALP V2 14/4 bps values)
-DAY_V2_MIN_DIP_BPS: float = _read_float("DAY_V2_MIN_DIP_BPS", default=20.0)
-DAY_V2_REBOUND_BPS: float = _read_float("DAY_V2_REBOUND_BPS", default=6.0)
 
 # Max notional per DAY V2 position; 0 = use calculate_position_size (preferred)
 DAY_V2_MAX_NOTIONAL_USD: float = _read_float("DAY_V2_MAX_NOTIONAL_USD", default=0.0)
@@ -106,13 +94,8 @@ def get_day_v2_config() -> dict:
         "DAY_V2_CONTEXT_BAR_SECONDS": DAY_V2_CONTEXT_BAR_SECONDS,
         "DAY_V2_REGIME_BAR_SECONDS": DAY_V2_REGIME_BAR_SECONDS,
         "DAY_V2_MAX_HOLD_MINUTES": DAY_V2_MAX_HOLD_MINUTES,
-        "DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT": DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT,
-        "DAY_V2_WINNER_TRAIL_ATR_MULT": DAY_V2_WINNER_TRAIL_ATR_MULT,
-        "DAY_V2_WINNER_TRAIL_FLOOR_PCT": DAY_V2_WINNER_TRAIL_FLOOR_PCT,
         "DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED": DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED,
         "DAY_V2_UNIVERSE": DAY_V2_UNIVERSE,
         "DAY_V2_CATASTROPHIC_ATR_MULTIPLIER": DAY_V2_CATASTROPHIC_ATR_MULTIPLIER,
-        "DAY_V2_MIN_DIP_BPS": DAY_V2_MIN_DIP_BPS,
-        "DAY_V2_REBOUND_BPS": DAY_V2_REBOUND_BPS,
         "DAY_V2_MAX_NOTIONAL_USD": DAY_V2_MAX_NOTIONAL_USD,
     }

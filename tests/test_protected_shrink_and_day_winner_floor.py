@@ -235,21 +235,26 @@ def _exit(highest: float, current: float, atr: float = 1.2, cost: float = 0.0006
 
 
 def test_winner_floor_exits_at_break_even_instead_of_riding_to_a_loss():
-    # MFE 0.9%, trail 1.8% puts the raw trigger at 99.08; the floor lifts it to 100.06.
-    result = _exit(highest=100.9, current=100.05)
+    # Pre-runner position: 1h ATR = 2.5 x 1.2 = 3.0. Armed at MFE 3.1 (>= 1x 1h ATR);
+    # raw trail 103.1 - 4.5 = 98.6 is lifted to break-even 100.06.
+    result = _exit(highest=103.1, current=100.05)
     assert result is not None and result["reason"] == "DAY_V2_WINNER_PROTECTION"
-    assert "break_even=100.060000" in result["detail"]
+    assert "stop=100.060000" in result["detail"]
 
 
 def test_winner_floor_holds_above_break_even():
-    assert _exit(highest=100.9, current=100.2) is None
+    assert _exit(highest=103.1, current=100.2) is None
 
 
-def test_wide_trail_on_big_winner_is_unchanged():
-    # MFE 5%, trail 1.8% -> trigger 103.11, far above break-even.
-    assert _exit(highest=105.0, current=103.5) is None
-    result = _exit(highest=105.0, current=103.0)
-    assert result is not None and "trigger=103.110000" in result["detail"]
+def test_small_mfe_is_not_sold_by_a_scalp_trail():
+    assert _exit(highest=100.9, current=100.05) is None
+
+
+def test_wide_trail_on_big_winner_tightens_only_after_objective():
+    # Objective = entry + 1.5 x 3.0 = 104.5 reached -> tight trail 0.75 x 3.0 -> stop 107.75.
+    assert _exit(highest=110.0, current=108.0) is None
+    result = _exit(highest=110.0, current=107.5)
+    assert result is not None and "stop=107.750000" in result["detail"]
 
 
 def test_below_mfe_gate_floor_does_not_apply():

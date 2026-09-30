@@ -54,7 +54,7 @@ def test_day_v2_does_not_import_live_execution():
         "backend.services.day_v2.config",
         "backend.services.day_v2.opportunity",
         "backend.services.day_v2.timeframe_authority",
-        "backend.services.day_v2.exit_roles",
+        "backend.services.day_v2.winner_contract",
     ]
 
     for mod_name in day_v2_modules:
@@ -75,9 +75,9 @@ def test_new_modules_have_no_side_effects_on_import():
     import backend.services.day_v2
     import backend.services.day_v2.config
     import backend.services.day_v2.engine_identity
-    import backend.services.day_v2.exit_roles
     import backend.services.day_v2.opportunity
     import backend.services.day_v2.timeframe_authority
+    import backend.services.day_v2.winner_contract
 
     after_attrs = set(dir(pe))
 

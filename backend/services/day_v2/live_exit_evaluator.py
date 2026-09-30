@@ -7,17 +7,17 @@ This is NOT shadow-only. It routes to real order execution. Do not add
 assert_no_live_authority() calls here.
 
 Exit priority (highest to lowest):
-  1. CATASTROPHIC_PROTECTION  — intra-bar adverse move >= 3x ATR
-  2. STRUCTURAL_INVALIDATION  — closed price below structural anchor (after 3+ bars)
-  3. WINNER_PROTECTION        — trail from highest price once MFE >= 0.8%,
-                                never below break-even after round-trip costs
-  4. OBJECTIVE_COMPLETE       — price reaches or exceeds target
-  5. TIME_EXPIRATION          — hold >= 300 min and still net-negative
+  1. CATASTROPHIC_PROTECTION  — adverse move from entry >= 3x 15m ATR
+  2. STRUCTURAL_INVALIDATION  — price below the setup's structural anchor (after 3+ bars)
+  3. WINNER_PROTECTION        — structure-runner ratchet (day_v2.winner_contract):
+                                armed only after 1x 1h-ATR favourable excursion,
+                                never below break-even after round-trip costs,
+                                only moves up. Reported as OBJECTIVE_COMPLETE when
+                                the setup objective was reached before the stop.
+  4. TIME_EXPIRATION          — hold >= 300 min, never armed, still net-negative
 
-Calibrated from qualifying replay (day_v2_replay.py @ a88479a):
-  MAX_HOLD = 300 min, CATASTRO_ATR_MULT = 3.0, MIN_MFE_FOR_WINNER = 0.8%
-  WINNER_TRAIL_ATR_MULT = 1.5, WINNER_TRAIL_FLOOR = 0.5%
-  STRUCTURAL_BARS = 3
+There is no fixed profit target: reaching the objective tightens the ratchet,
+it does not sell.
 """
 
 from __future__ import annotations
@@ -29,14 +29,14 @@ from backend.services.day_v2.config import (
     DAY_V2_CATASTROPHIC_ATR_MULTIPLIER,
     DAY_V2_MAX_HOLD_MINUTES,
     DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED,
-    DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT,
+)
+from backend.services.day_v2.winner_contract import (
+    LEGACY_ATR_1H_PER_ATR_15M,
+    objective_level,
+    runner_stop,
 )
 
 logger = logging.getLogger(__name__)
-
-# Winner-trail calibration — from qualifying replay
-WINNER_TRAIL_ATR_MULT: float = 1.5  # trail = max(floor, 1.5 x ATR)
-WINNER_TRAIL_FLOOR_PCT: float = 0.005  # 0.5% minimum trail distance
 
 DAY_V2_ENGINE_ID: str = "DAY_V2"
 
@@ -66,20 +66,28 @@ def evaluate_day_v2_exit(
     target_price: float,
     entry_time: float,
     estimated_roundtrip_cost: float,
+    setup: str = "",
+    atr_1h_at_entry: float = 0.0,
+    objective_structural: float = 0.0,
 ) -> dict | None:
     """Evaluate all DAY V2 exit roles.
 
     Args:
         engine_id: Must be "DAY_V2" or this function returns None.
         entry_price: Average fill price.
-        current_price: Current mark (closed 15m bar close or last tick).
-        bar_low: Low of the current monitoring period (for catastrophic check).
-        highest_price: Session high-watermark (for winner trail).
-        atr_at_entry: ATR measured at entry (absolute price units).
-        structural_anchor: Price below which thesis is invalid.
-        target_price: Objective completion price.
+        current_price: Current executable mark.
+        bar_low: Lowest price since entry (catastrophic check).
+        highest_price: High-water mark since entry (runner ratchet).
+        atr_at_entry: 15m ATR at entry (absolute price units).
+        structural_anchor: Price below which the thesis is invalid.
+        target_price: Entry-time setup target; objective fallback for
+            positions opened before the structural objective was stamped.
         entry_time: Unix epoch of position open.
         estimated_roundtrip_cost: Total cost fraction (e.g. 0.0006).
+        setup: Entry setup name (selects the objective ATR floor).
+        atr_1h_at_entry: 1h ATR at entry; 0 means a pre-runner position,
+            which uses LEGACY_ATR_1H_PER_ATR_15M x atr_at_entry.
+        objective_structural: Setup structural objective stamped at entry.
 
     Returns:
         {"action": "sell", "reason": str, "exit_price_estimate": float,
@@ -97,7 +105,7 @@ def evaluate_day_v2_exit(
     # Used only for the structural-invalidation guard (requires N closed bars).
     bars_held_approx = int(hold_minutes / 15.0)
 
-    # Role 1: Catastrophic protection — uses bar_low (intra-bar)
+    # Role 1: Catastrophic protection — uses the lowest price since entry
     if atr_at_entry > 0:
         adverse_move = (entry_price - max(bar_low, 0.0)) / entry_price
         catastro_pct = DAY_V2_CATASTROPHIC_ATR_MULTIPLIER * atr_at_entry / entry_price
@@ -131,48 +139,43 @@ def evaluate_day_v2_exit(
             "detail": (f"price={current_price:.6f} < anchor={structural_anchor:.6f} bars_approx={bars_held_approx}"),
         }
 
-    # Role 4: Winner protection — activated after meaningful MFE
-    if highest_price > entry_price:
-        mfe_pct = (highest_price - entry_price) / entry_price
-        if mfe_pct >= DAY_V2_WINNER_PROTECTION_MIN_MFE_PCT and atr_at_entry > 0:
-            atr_pct = atr_at_entry / entry_price
-            trail_distance = max(WINNER_TRAIL_FLOOR_PCT, WINNER_TRAIL_ATR_MULT * atr_pct)
-            break_even = entry_price * (1.0 + max(0.0, estimated_roundtrip_cost))
-            trail_trigger = max(highest_price * (1.0 - trail_distance), break_even)
-            if current_price <= trail_trigger:
-                logger.warning(
-                    "DAY_V2_WINNER_TRAIL mfe=%.3f%% trail=%.3f%% trigger=%.6f break_even=%.6f price=%.6f",
-                    mfe_pct * 100,
-                    trail_distance * 100,
-                    trail_trigger,
-                    break_even,
-                    current_price,
-                )
-                return {
-                    "action": "sell",
-                    "reason": "DAY_V2_WINNER_PROTECTION",
-                    "exit_price_estimate": current_price,
-                    "detail": (f"mfe={mfe_pct * 100:.2f}% trail_dist={trail_distance * 100:.2f}% trigger={trail_trigger:.6f} break_even={break_even:.6f}"),
-                }
-
-    # Role 5: Objective complete
-    if target_price > 0 and current_price >= target_price:
-        logger.info(
-            "DAY_V2_OBJECTIVE price=%.6f >= target=%.6f",
+    # Role 3: Structure-runner ratchet
+    atr_1h = float(atr_1h_at_entry or 0.0)
+    if atr_1h <= 0 and atr_at_entry > 0:
+        atr_1h = LEGACY_ATR_1H_PER_ATR_15M * atr_at_entry
+    structural = float(objective_structural or 0.0) or float(target_price or 0.0)
+    objective = objective_level(setup, entry_price, atr_1h, structural) if atr_1h > 0 else 0.0
+    runner = runner_stop(
+        entry_price=entry_price,
+        highest_price=highest_price,
+        atr_1h=atr_1h,
+        objective=objective,
+        estimated_roundtrip_cost=estimated_roundtrip_cost,
+    )
+    if runner["activated"] and current_price <= runner["stop"]:
+        reason = "DAY_V2_OBJECTIVE_COMPLETE" if runner["objective_reached"] else "DAY_V2_WINNER_PROTECTION"
+        mfe_pct = (max(highest_price, entry_price) - entry_price) / entry_price
+        logger.warning(
+            "DAY_V2_RUNNER_STOP reason=%s mfe=%.3f%% stop=%.6f objective=%.6f trail_atr_1h=%.2f price=%.6f",
+            reason,
+            mfe_pct * 100,
+            runner["stop"],
+            objective,
+            runner["trail_atr_1h"],
             current_price,
-            target_price,
         )
         return {
             "action": "sell",
-            "reason": "DAY_V2_OBJECTIVE_COMPLETE",
+            "reason": reason,
             "exit_price_estimate": current_price,
-            "detail": f"price={current_price:.6f} >= target={target_price:.6f}",
+            "detail": (f"mfe={mfe_pct * 100:.2f}% stop={runner['stop']:.6f} objective={objective:.6f} atr_1h={atr_1h:.6f} trail={runner['trail_atr_1h']}x"),
         }
 
-    # Role 3: Time expiration — only if still net-negative after costs
+    # Role 4: Time expiration — only a trade that never proved itself and is
+    # still net-negative after costs. An armed runner is never timed out.
     pnl_pct = (current_price - entry_price) / entry_price
     net_pnl = pnl_pct - estimated_roundtrip_cost
-    if hold_minutes >= DAY_V2_MAX_HOLD_MINUTES and net_pnl <= 0:
+    if hold_minutes >= DAY_V2_MAX_HOLD_MINUTES and net_pnl <= 0 and not runner["activated"]:
         logger.warning(
             "DAY_V2_TIME_EXPIRATION hold=%.1fmin >= %.0fmin net_pnl=%.4f%%",
             hold_minutes,

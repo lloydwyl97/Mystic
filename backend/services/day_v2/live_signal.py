@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from backend.services.day_v2.winner_contract import atr_from_bars, move_potential, structural_objective
+
 # ---------------------------------------------------------------------------
 # Setup family constants (must match replay and config)
 # ---------------------------------------------------------------------------
@@ -55,6 +57,9 @@ class DayV2Signal:
     signal_bar_ts: int  # timestamp of the closed 15m bar that fired
     h1_bullish: bool
     opportunity_id: str  # deterministic 16-char hex ID for this opportunity
+    atr_1h: float = 0.0  # 14-period ATR of closed 1h bars (runner distance unit)
+    objective_structural: float = 0.0  # setup-specific structural objective level
+    move_potential: float = 0.0  # objective distance in 1h-ATR units (ranking telemetry)
 
 
 def _signal_bar_ts(bar: dict[str, Any]) -> int:
@@ -323,6 +328,9 @@ def evaluate_entry_signal(
 
     setup_name, anchor, target, regime, h1_bullish = result
     bar_ts = _signal_bar_ts(bars_15m[idx])
+    atr_1h = atr_from_bars(bars_1h)
+    objective_struct = structural_objective(setup_name, bars_15m, bars_1h, bars_4h)
+    ref_price = float(bars_15m[idx]["close"])
 
     return DayV2Signal(
         symbol=symbol,
@@ -334,6 +342,9 @@ def evaluate_entry_signal(
         signal_bar_ts=int(bar_ts),
         h1_bullish=h1_bullish,
         opportunity_id=_opportunity_id(symbol, setup_name, anchor),
+        atr_1h=atr_1h,
+        objective_structural=objective_struct,
+        move_potential=move_potential(setup_name, ref_price, atr_1h, objective_struct),
     )
 
 
