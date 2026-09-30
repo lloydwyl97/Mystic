@@ -2137,7 +2137,15 @@ class PortfolioEngineIntegration:
             # regime axis instead of an empty string. Stamped on the decision, so
             # the close reuses it and the markout/read/close keys all match.
             regime = market_regime_tag(self.engine.db_path, norm_key) or str(row.get("regime") or row.get("market_regime") or "")
-            view = scalp_decision(self.engine.db_path, norm_key, setup_name, regime)
+            # Live book/flow features for the inspectable microstructure edge model.
+            micro_feats: dict = {}
+            try:
+                from backend.services.microstructure_engine import compute_features as _cmf
+
+                micro_feats = _cmf(norm_key) or {}
+            except Exception:
+                micro_feats = {}
+            view = scalp_decision(self.engine.db_path, norm_key, setup_name, regime, features=micro_feats)
             row["adaptive_decision"] = view
             snap = row.get("snap")
             ref_price = float(getattr(snap, "best_ask", 0) or getattr(snap, "mid_price", 0) or 0) if snap is not None else 0.0
@@ -2150,6 +2158,7 @@ class PortfolioEngineIntegration:
                 ref_price=ref_price,
                 roundtrip_cost=ESTIMATED_ROUNDTRIP_COST,
                 signaled=True,
+                features=micro_feats,
             )
             return float(view["expected_edge"]) + 0.001 * float(view["confidence"])
 

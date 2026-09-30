@@ -8,15 +8,19 @@ from types import SimpleNamespace
 import pytest
 
 from backend.services.adaptive_learning import (
+    MICRO_MODEL_TILT_MAX,
+    SCALP_MICRO_FEATURES,
     adaptive_state_report,
     calibration_report,
     day_decision,
     learn_from_close,
     market_regime_tag,
+    micro_edge_tilt,
     observe,
     record_candidate,
     resolve_markouts,
     scalp_decision,
+    update_linear_model,
 )
 from backend.services.day_v2.ranking import clamp_to_sleeve, rank_day_candidates
 from backend.services.day_v2.winner_contract import objective_level, runner_stop
@@ -410,3 +414,108 @@ def test_calibration_report_buckets_by_confidence_and_size(tmp_path):
     assert day["conf>=0.30"]["avg_net_pct"] > 0
     assert day["conf<0.10"]["n"] == 1
     assert day["conf<0.10"]["avg_net_pct"] < 0
+
+
+# --- SCALP microstructure edge model -----------------------------------------
+
+
+def _bull_book():
+    """Strong buy-side microstructure: positive pressure/flow, low adverse selection."""
+    return {
+        "microprice_pressure": 0.0008,
+        "obi_l5": 0.6,
+        "ofi_5s": 250.0,
+        "agg_flow_imbalance_5s": 0.5,
+        "adverse_selection_score": 0.05,
+        "spread_pct": 0.0004,
+    }
+
+
+def _bear_book():
+    return {
+        "microprice_pressure": -0.0008,
+        "obi_l5": -0.6,
+        "ofi_5s": -250.0,
+        "agg_flow_imbalance_5s": -0.5,
+        "adverse_selection_score": 0.6,
+        "spread_pct": 0.0012,
+    }
+
+
+def test_micro_model_cold_and_empty_return_zero_tilt(tmp_path):
+    db = str(tmp_path / "t.db")
+    # No model yet -> zero tilt regardless of features.
+    assert micro_edge_tilt(db, SCALP, _bull_book()) == (0.0, 0)
+    # Empty / all-zero features never train and never tilt.
+    update_linear_model(db, SCALP, "micro_edge", {}, 0.003)
+    assert micro_edge_tilt(db, SCALP, {}) == (0.0, 0)
+
+
+def test_micro_model_learns_direction_and_stays_bounded(tmp_path):
+    db = str(tmp_path / "t.db")
+    # Teach the model: bull books precede positive forward edge, bear books negative.
+    for _ in range(60):
+        update_linear_model(db, SCALP, "micro_edge", _bull_book(), 0.004)
+        update_linear_model(db, SCALP, "micro_edge", _bear_book(), -0.004)
+    bull_tilt, n = micro_edge_tilt(db, SCALP, _bull_book())
+    bear_tilt, _ = micro_edge_tilt(db, SCALP, _bear_book())
+    assert n >= 100
+    assert bull_tilt > bear_tilt
+    assert bull_tilt > 0 > bear_tilt
+    # Hard bound: the model can never move edge by more than the clamp.
+    assert abs(bull_tilt) <= MICRO_MODEL_TILT_MAX + 1e-12
+    assert abs(bear_tilt) <= MICRO_MODEL_TILT_MAX + 1e-12
+
+
+def test_micro_model_flows_through_resolve_and_scalp_decision(tmp_path):
+    db = str(tmp_path / "t.db")
+    # A resolved SCALP candidate with stored features trains the model.
+    record_candidate(
+        db,
+        engine=SCALP,
+        symbol="ETHUSDT",
+        setup="VWAP_EMA_RECLAIM",
+        regime="",
+        ref_price=100.0,
+        roundtrip_cost=0.0006,
+        signaled=True,
+        evaluated_at=1_000.0,
+        features=_bull_book(),
+    )
+    assert resolve_markouts(db, lambda _s, _t: 100.6, now=1_000.0 + 2000) == 1
+    rep = adaptive_state_report(db)
+    model = rep["scalp_micro_model"]
+    assert model["n"] >= 1
+    assert set(model["weights"]) == set(SCALP_MICRO_FEATURES)
+    # Give the model varied evidence so its standardiser is centred and it can
+    # express a directional tilt (a single sample centres exactly on itself).
+    for _ in range(40):
+        update_linear_model(db, SCALP, "micro_edge", _bull_book(), 0.004)
+        update_linear_model(db, SCALP, "micro_edge", _bear_book(), -0.004)
+    # scalp_decision with features reflects the tilt; without features it does not.
+    with_feats = scalp_decision(db, "ETHUSDT", "VWAP_EMA_RECLAIM", "", features=_bull_book())
+    without = scalp_decision(db, "ETHUSDT", "VWAP_EMA_RECLAIM", "")
+    assert without["micro_model_n"] == 0
+    assert without["micro_tilt"] == 0.0
+    assert with_feats["micro_model_n"] >= 1
+    assert with_feats["micro_tilt"] > 0.0
+    assert with_feats["expected_edge"] > without["expected_edge"]
+
+
+def test_micro_model_is_scalp_only_and_not_a_gate(tmp_path):
+    db = str(tmp_path / "t.db")
+    for _ in range(40):
+        update_linear_model(db, SCALP, "micro_edge", _bull_book(), 0.004)
+    # DAY never reads the SCALP micro model.
+    assert micro_edge_tilt(db, DAY, _bull_book()) == (0.0, 0)
+    # The model only shifts expected_edge (rank/size); it is not a hard gate.
+    from backend.services import adaptive_learning as al
+
+    src = inspect.getsource(al.scalp_decision)
+    assert "micro_edge_tilt" in src
+    assert "return None" not in src  # never abstains / blocks a candidate
+    # Live SCALP loop passes real book features into the model.
+    from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
+
+    loop = inspect.getsource(PortfolioEngineIntegration._process_scalp_v2_signals)
+    assert "compute_features" in loop and "features=micro_feats" in loop

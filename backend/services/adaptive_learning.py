@@ -14,6 +14,7 @@ ranking, sizing and exit calibration.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -68,6 +69,25 @@ SCALP_HOLD_FLOOR_MIN = 4.0
 # stale regime forever. It never zeroes a key (the new observation always counts
 # for 1), so there is no min-trade gate and no forgetting to a hard stop.
 ADAPTIVE_HALF_LIFE_DAYS = float(os.getenv("ADAPTIVE_HALF_LIFE_DAYS", "14") or "14")
+
+# SCALP microstructure edge model. A single inspectable online linear model
+# (normalised LMS) that learns how the current book/flow shifts the expected
+# forward edge, trained from the same cost-adjusted candidate markouts. Its
+# output is a bounded, zero-centred tilt on expected_edge (rank + size only) —
+# never the hard net-edge gate, so it can never become a permission bot.
+SCALP_MICRO_FEATURES = (
+    "microprice_pressure",
+    "obi_l5",
+    "ofi_5s",
+    "agg_flow_imbalance_5s",
+    "adverse_selection_score",
+    "spread_pct",
+)
+MICRO_MODEL_LR = 0.02  # learning rate for the online weight update
+MICRO_MODEL_W_MAX = 0.5  # per-feature weight clamp (keeps any one feature bounded)
+MICRO_MODEL_TILT_MAX = 0.0015  # max absolute edge tilt the model can add (15 bps)
+MICRO_MODEL_STD_ALPHA = 0.05  # EWMA rate for feature standardisation stats
+MICRO_MODEL_CONF_K = 20.0  # shrink the tilt by n/(n+K) so a cold model barely moves
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -142,8 +162,24 @@ def _connect(db_path: str) -> sqlite3.Connection:
             roundtrip_cost REAL NOT NULL,
             evaluated_at REAL NOT NULL,
             markouts_json TEXT NOT NULL DEFAULT '{}',
+            features_json TEXT NOT NULL DEFAULT '{}',
             learned INTEGER NOT NULL DEFAULT 0,
             resolved INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    # Migration: add features_json to pre-existing markout tables.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(adaptive_candidate_markouts)").fetchall()}
+    if "features_json" not in cols:
+        conn.execute("ALTER TABLE adaptive_candidate_markouts ADD COLUMN features_json TEXT NOT NULL DEFAULT '{}'")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS adaptive_linear_model (
+            engine_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (engine_id, model)
         )
         """
     )
@@ -293,7 +329,104 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str) -> dict[str
     }
 
 
-def scalp_decision(db_path: str, symbol: str, setup: str, regime: str) -> dict[str, Any]:
+def _micro_features(raw: dict | None) -> dict[str, float]:
+    """Pull the fixed SCALP microstructure vector out of a raw feature dict."""
+    raw = raw if isinstance(raw, dict) else {}
+    out: dict[str, float] = {}
+    for f in SCALP_MICRO_FEATURES:
+        try:
+            out[f] = float(raw.get(f) or 0.0)
+        except (TypeError, ValueError):
+            out[f] = 0.0
+    return out
+
+
+def _load_linear(conn: sqlite3.Connection, engine_id: str, model: str) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT payload FROM adaptive_linear_model WHERE engine_id=? AND model=?",
+        (engine_id, model),
+    ).fetchone()
+    if row and row["payload"]:
+        try:
+            st = json.loads(row["payload"])
+            if isinstance(st, dict):
+                st.setdefault("n", 0)
+                st.setdefault("bias", 0.0)
+                st.setdefault("w", {})
+                st.setdefault("mu", {})
+                st.setdefault("s2", {})
+                return st
+        except (ValueError, TypeError):
+            pass
+    return {"n": 0, "bias": 0.0, "w": {}, "mu": {}, "s2": {}}
+
+
+def _standardize(st: dict[str, Any], feats: dict[str, float]) -> dict[str, float]:
+    z: dict[str, float] = {}
+    for f, x in feats.items():
+        mu = float(st["mu"].get(f, 0.0))
+        s2 = float(st["s2"].get(f, 1.0))
+        z[f] = (x - mu) / math.sqrt(s2 + 1e-9)
+    return z
+
+
+def update_linear_model(db_path: str, engine: str, model: str, features: dict | None, target: float) -> None:
+    """One online (normalised-LMS) step. Standardisation stats adapt via EWMA;
+    weights are clamped. Trained on the same cost-adjusted markout target."""
+    feats = _micro_features(features)
+    if not any(v != 0.0 for v in feats.values()):
+        return
+    engine_id = str(engine or "").upper()
+    with _connect(db_path) as conn:
+        st = _load_linear(conn, engine_id, model)
+        a = MICRO_MODEL_STD_ALPHA
+        for f, x in feats.items():
+            mu = float(st["mu"].get(f, x))
+            new_mu = (1.0 - a) * mu + a * x
+            s2 = float(st["s2"].get(f, 1.0))
+            new_s2 = (1.0 - a) * s2 + a * (x - new_mu) ** 2
+            st["mu"][f] = new_mu
+            st["s2"][f] = max(new_s2, 1e-9)
+        z = _standardize(st, feats)
+        pred = float(st["bias"]) + sum(float(st["w"].get(f, 0.0)) * z[f] for f in feats)
+        err = float(target) - pred
+        st["bias"] = float(st["bias"]) + MICRO_MODEL_LR * err
+        for f in feats:
+            w = float(st["w"].get(f, 0.0)) + MICRO_MODEL_LR * err * z[f]
+            st["w"][f] = _clamp(w, -MICRO_MODEL_W_MAX, MICRO_MODEL_W_MAX)
+        st["n"] = int(st.get("n", 0)) + 1
+        conn.execute(
+            """
+            INSERT INTO adaptive_linear_model (engine_id, model, payload, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(engine_id, model) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at
+            """,
+            (engine_id, model, json.dumps(st, separators=(",", ":")), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+        )
+        conn.commit()
+
+
+def micro_edge_tilt(db_path: str, engine: str, features: dict | None) -> tuple[float, int]:
+    """Bounded, zero-centred microstructure edge tilt (excludes the bias/mean).
+    Returns (tilt, n). Empty features or a cold model return (0.0, 0)."""
+    feats = _micro_features(features)
+    if not any(v != 0.0 for v in feats.values()):
+        return 0.0, 0
+    engine_id = str(engine or "").upper()
+    try:
+        with _connect(db_path) as conn:
+            st = _load_linear(conn, engine_id, "micro_edge")
+    except sqlite3.Error:
+        return 0.0, 0
+    n = int(st.get("n", 0))
+    if n <= 0:
+        return 0.0, 0
+    z = _standardize(st, feats)
+    tilt = sum(float(st["w"].get(f, 0.0)) * z[f] for f in feats)
+    return _clamp(tilt, -MICRO_MODEL_TILT_MAX, MICRO_MODEL_TILT_MAX), n
+
+
+def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features: dict | None = None) -> dict[str, Any]:
     """What the next SCALP candidate reads. Ranking, size, target and hold only."""
     from backend.services.scalp_v2.exit_evaluator import SCALP_V2_TIME_STOP_MIN
 
@@ -307,6 +440,11 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str) -> dict[s
     lo, hi = SIZE_BOUNDS[SCALP_ENGINE]
     hard_hold = float(SCALP_V2_TIME_STOP_MIN)
     confidence = n_eff / (PRIOR_STRENGTH + n_eff)
+    # Bounded microstructure tilt: shrunk by the model's own sample count so a
+    # cold model barely moves rank/size. Never touches the hard net-edge gate.
+    micro_tilt, micro_n = micro_edge_tilt(db_path, SCALP_ENGINE, features)
+    micro_conf = micro_n / (micro_n + MICRO_MODEL_CONF_K) if micro_n > 0 else 0.0
+    edge = edge + micro_conf * micro_tilt
     return {
         "adaptive_state_version": ADAPTIVE_STATE_VERSION,
         "engine_id": SCALP_ENGINE,
@@ -327,6 +465,9 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str) -> dict[s
         "time_to_mfe_min": timing["mean"],
         "n_net": net["n"],
         "n_forward": forward["n"],
+        "micro_tilt": round(micro_conf * micro_tilt, 6),
+        "micro_tilt_raw": round(micro_tilt, 6),
+        "micro_model_n": micro_n,
     }
 
 
@@ -385,18 +526,20 @@ def record_candidate(
     roundtrip_cost: float,
     signaled: bool,
     evaluated_at: float | None = None,
+    features: dict | None = None,
 ) -> None:
     engine_id = str(engine or "").upper()
     version = current_strategy_version(engine_id)
     if not version or float(ref_price or 0) <= 0 or not str(setup or "").strip():
         return
+    feats_json = json.dumps(_micro_features(features), separators=(",", ":")) if features else "{}"
     with _connect(db_path) as conn:
         conn.execute(
             """
             INSERT INTO adaptive_candidate_markouts (
                 engine_id, symbol, setup, regime, strategy_version, signaled,
-                ref_price, roundtrip_cost, evaluated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ref_price, roundtrip_cost, evaluated_at, features_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 engine_id,
@@ -408,6 +551,7 @@ def record_candidate(
                 float(ref_price),
                 float(roundtrip_cost or 0),
                 float(evaluated_at or time.time()),
+                feats_json,
             ),
         )
         conn.commit()
@@ -469,6 +613,11 @@ def resolve_markouts(db_path: str, quote: Callable[[str, float], float | None], 
                     value=max(0.0, -min(values)),
                     strategy_version=str(row["strategy_version"]),
                 )
+                if engine_id == SCALP_ENGINE:
+                    with contextlib.suppress(Exception):
+                        feats = json.loads(row["features_json"] or "{}")
+                        if feats:
+                            update_linear_model(db_path, SCALP_ENGINE, "micro_edge", feats, max(values))
                 row_learned = 1
                 learned += 1
             conn.execute(
@@ -641,6 +790,15 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                         }
                     )
             out["engines"][engine_id] = rows
+        # Inspectable SCALP microstructure model: its learned weights and mean.
+        micro = _load_linear(conn, SCALP_ENGINE, "micro_edge")
+        out["scalp_micro_model"] = {
+            "n": int(micro.get("n", 0)),
+            "bias": round(float(micro.get("bias", 0.0)), 6),
+            "tilt_max": MICRO_MODEL_TILT_MAX,
+            "features": SCALP_MICRO_FEATURES,
+            "weights": {f: round(float(micro.get("w", {}).get(f, 0.0)), 4) for f in SCALP_MICRO_FEATURES},
+        }
     finally:
         conn.close()
     return out
@@ -735,10 +893,12 @@ __all__ = [
     "estimate",
     "learn_from_close",
     "market_regime_tag",
+    "micro_edge_tilt",
     "observe",
     "ohlcv_quote",
     "persist_trade_adaptive",
     "record_candidate",
     "resolve_markouts",
     "scalp_decision",
+    "update_linear_model",
 ]
