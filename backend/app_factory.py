@@ -576,6 +576,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("[LIFESPAN] AggTradeCollector start failed: %s", e)
 
+    # Taker-fee reconciliation: confirm the configured taker fee (and therefore
+    # the round-trip cost / net-edge gate) matches what the exchange actually
+    # charges this account. Runs in a thread so the signed HTTP call never
+    # blocks the event loop; best-effort and never a gate.
+    try:
+        import asyncio as _asyncio
+
+        from backend.config.trading_economics import reconcile_taker_fee
+
+        rec = await _asyncio.to_thread(reconcile_taker_fee)
+        logger.info("[LIFESPAN] Taker-fee reconcile: %s", rec)
+    except Exception as e:
+        logger.warning("[LIFESPAN] Taker-fee reconcile failed: %s", e)
+
     # ----------------------------------------------------------------
     # Single-process production: embed DAY context + ML training + signals
     # (when EXTERNAL_SUPERVISOR_MODE=false this process owns supervision).

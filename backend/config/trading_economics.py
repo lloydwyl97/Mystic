@@ -237,6 +237,85 @@ def is_net_profit_acceptable(
     return not (MIN_PROFIT_AFTER_COSTS_USD > 0.0 and net_profit_usd < MIN_PROFIT_AFTER_COSTS_USD)
 
 
+def fetch_account_taker_fee(timeout: float = 10.0) -> float | None:
+    """Actual account taker commission (as a fraction) from Binance.US, or None.
+
+    This is the authoritative rate the account is charged, independent of any
+    fill, read from GET /api/v3/account (``commissionRates.taker``, falling back
+    to the integer ``takerCommission`` in 0.0001 units). Best effort: returns
+    None on missing credentials, a non-whitelisted IP, or any network error.
+    Never raises and never logs secrets.
+    """
+    import hashlib
+    import hmac
+    import json as _json
+    import time as _time
+    import urllib.parse
+    import urllib.request
+
+    key = os.getenv("BINANCE_US_API_KEY") or os.getenv("BINANCE_API_KEY") or ""
+    secret = os.getenv("BINANCE_US_SECRET_KEY") or os.getenv("BINANCE_SECRET") or ""
+    if not key or not secret:
+        return None
+    try:
+        params = {"timestamp": int(_time.time() * 1000), "recvWindow": 10000}
+        query = urllib.parse.urlencode(params)
+        query += "&signature=" + hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        url = f"https://api.binance.us/api/v3/account?{query}"
+        req = urllib.request.Request(url, headers={"X-MBX-APIKEY": key})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = _json.load(resp)
+    except Exception:
+        return None
+    rates = data.get("commissionRates") or {}
+    try:
+        if rates.get("taker") is not None:
+            return float(rates["taker"])
+        taker_commission = data.get("takerCommission")
+        if taker_commission is not None:
+            return float(taker_commission) / 10000.0
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def reconcile_taker_fee(tolerance: float = 0.00005) -> dict[str, Any]:
+    """Compare the exchange's actual account taker fee to configured TAKER_FEE.
+
+    Logs a WARNING when they diverge beyond ``tolerance`` (default 0.5 bps) so
+    an operator knows the net-edge gate and round-trip cost are calibrated to
+    the wrong taker fee. Read-only: never changes config, never blocks trading.
+    """
+    actual = fetch_account_taker_fee()
+    result: dict[str, Any] = {
+        "configured_taker_fee": TAKER_FEE,
+        "actual_taker_fee": actual,
+        "reconciled": actual is not None,
+        "diverged": False,
+        "delta_bps": None,
+        "roundtrip_cost": ESTIMATED_ROUNDTRIP_COST,
+    }
+    if actual is None:
+        logger.info("TAKER_FEE_RECONCILE skipped: no exchange rate available (creds / IP whitelist / network)")
+        return result
+    delta = actual - TAKER_FEE
+    result["delta_bps"] = round(delta * 10000.0, 3)
+    if abs(delta) > tolerance:
+        result["diverged"] = True
+        logger.warning(
+            "TAKER_FEE_MISMATCH configured=%.4f%% actual=%.4f%% delta=%+.3f bps — the net-edge gate "
+            "and round-trip cost (%.4f%%) are calibrated to the wrong taker fee; update TAKER_FEE / "
+            "ESTIMATED_ROUNDTRIP_COST (env) or verify the account fee tier before trusting profit gates",
+            TAKER_FEE * 100.0,
+            actual * 100.0,
+            result["delta_bps"],
+            ESTIMATED_ROUNDTRIP_COST * 100.0,
+        )
+    else:
+        logger.info("TAKER_FEE_RECONCILE ok configured=%.4f%% actual=%.4f%%", TAKER_FEE * 100.0, actual * 100.0)
+    return result
+
+
 def log_trading_economics_at_startup() -> TradingEconomicsSnapshot:
     snap = get_trading_economics()
     logger.warning(
