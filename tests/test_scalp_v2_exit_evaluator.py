@@ -187,91 +187,60 @@ def test_net_profit_take_does_not_fire_below_threshold():
 # ---------------------------------------------------------------------------
 
 
-def test_time_stop_fires_when_net_negative_past_ceiling():
-    """Hold >= 120 min and net-negative triggers time stop."""
-    from backend.services.scalp_v2.exit_evaluator import (
-        SCALP_V2_EXIT_TIME_STOP,
-        evaluate_scalp_v2_exit,
-    )
-
-    with patch.dict(
-        os.environ,
-        {
-            "SCALP_V2_TIME_STOP_MIN": "120",
-            "SCALP_V2_GIVEBACK_EXIT_ENABLED": "false",
-            "SCALP_V2_STALL_EXIT_ENABLED": "false",
-            "SCALP_V2_MIN_NET_PROFIT_PCT": "0.004",
-            "SCALP_V2_CATASTROPHIC_PCT": "0.99",  # disable catastrophic
-        },
-    ):
-        pos = _make_position(cost_basis=100.0, highest_price=100.05)
-        result = evaluate_scalp_v2_exit(
-            position=pos,
-            current_price=99.8,
-            net_pnl_pct=-0.003,
-            hold_minutes=121.0,  # past 120 min ceiling
-            bar_low=99.8,
-        )
-    assert result.get("action") == "sell"
-    assert result.get("reason") == SCALP_V2_EXIT_TIME_STOP
-
-
-def test_time_stop_does_not_fire_when_net_positive():
-    """Hold >= 120 min but net-positive: time stop must NOT fire."""
-    from backend.services.scalp_v2.exit_evaluator import evaluate_scalp_v2_exit
-
-    with patch.dict(
-        os.environ,
-        {
-            "SCALP_V2_TIME_STOP_MIN": "120",
-            "SCALP_V2_GIVEBACK_EXIT_ENABLED": "false",
-            "SCALP_V2_STALL_EXIT_ENABLED": "false",
-            "SCALP_V2_MIN_NET_PROFIT_PCT": "0.004",
-            "SCALP_V2_CATASTROPHIC_PCT": "0.99",
-        },
-    ):
-        pos = _make_position(cost_basis=100.0, highest_price=100.5)
-        result = evaluate_scalp_v2_exit(
-            position=pos,
-            current_price=100.3,
-            net_pnl_pct=0.001,  # net-positive (but below profit-take threshold)
-            hold_minutes=200.0,
-            bar_low=100.3,
-        )
-    # Should hold (time stop only fires on net-negative)
-    assert result.get("action") != "sell" or result.get("reason") != "SCALP_V2_TIME_STOP"
-
-
-def test_time_stop_uses_scalp_ceiling_not_day_ceiling():
-    """SCALP time ceiling (120 min) is much shorter than DAY (300 min)."""
+def test_time_stop_fires_past_scalp_horizon():
+    """A scalp ends at the SCALP horizon even when the loss is inside the adverse bound."""
     from backend.services.scalp_v2.exit_evaluator import (
         SCALP_V2_EXIT_TIME_STOP,
         SCALP_V2_TIME_STOP_MIN,
         evaluate_scalp_v2_exit,
     )
 
-    # Default ceiling should be 120, not 300
-    assert float(os.environ.get("SCALP_V2_TIME_STOP_MIN", "120")) < 300
+    pos = _make_position(cost_basis=100.0, highest_price=100.05)
+    result = evaluate_scalp_v2_exit(
+        position=pos,
+        current_price=99.95,
+        net_pnl_pct=-0.0005,
+        hold_minutes=SCALP_V2_TIME_STOP_MIN + 1,
+        bar_low=99.95,
+    )
+    assert result.get("action") == "sell"
+    assert result.get("reason") == SCALP_V2_EXIT_TIME_STOP
 
-    with patch.dict(
-        os.environ,
-        {
-            "SCALP_V2_TIME_STOP_MIN": "120",
-            "SCALP_V2_GIVEBACK_EXIT_ENABLED": "false",
-            "SCALP_V2_STALL_EXIT_ENABLED": "false",
-            "SCALP_V2_MIN_NET_PROFIT_PCT": "0.004",
-            "SCALP_V2_CATASTROPHIC_PCT": "0.99",
-        },
-    ):
-        pos = _make_position(cost_basis=100.0, highest_price=100.05)
-        # 150 min hold — past SCALP ceiling but below DAY's 300 min
-        result = evaluate_scalp_v2_exit(
-            position=pos,
-            current_price=99.8,
-            net_pnl_pct=-0.003,
-            hold_minutes=150.0,
-            bar_low=99.8,
-        )
+
+def test_horizon_exits_a_small_winner_too():
+    """The horizon is not a negative-only time stop. A small green scalp still ends."""
+    from backend.services.scalp_v2.exit_evaluator import SCALP_V2_EXIT_TIME_STOP, SCALP_V2_TIME_STOP_MIN, evaluate_scalp_v2_exit
+
+    pos = _make_position(cost_basis=100.0, highest_price=100.5)
+    result = evaluate_scalp_v2_exit(
+        position=pos,
+        current_price=100.1,
+        net_pnl_pct=0.001,
+        hold_minutes=SCALP_V2_TIME_STOP_MIN + 1,
+        bar_low=100.0,
+    )
+    assert result.get("action") == "sell"
+    assert result.get("reason") == SCALP_V2_EXIT_TIME_STOP
+
+
+def test_time_stop_uses_scalp_ceiling_not_day_ceiling():
+    """SCALP horizon is a short hold, far under DAY's 300 minute ceiling."""
+    from backend.services.scalp_v2.exit_evaluator import (
+        SCALP_V2_EXIT_TIME_STOP,
+        SCALP_V2_TIME_STOP_MIN,
+        evaluate_scalp_v2_exit,
+    )
+
+    assert SCALP_V2_TIME_STOP_MIN <= 30
+    assert SCALP_V2_TIME_STOP_MIN < 300
+    pos = _make_position(cost_basis=100.0, highest_price=100.05)
+    result = evaluate_scalp_v2_exit(
+        position=pos,
+        current_price=99.95,
+        net_pnl_pct=-0.0005,
+        hold_minutes=float(SCALP_V2_TIME_STOP_MIN) + 5,
+        bar_low=99.95,
+    )
     assert result.get("action") == "sell"
     assert result.get("reason") == SCALP_V2_EXIT_TIME_STOP
 
@@ -298,15 +267,13 @@ def test_scalp_exit_does_not_call_day_structural_invalidation():
 
 
 def test_scalp_holds_within_ceiling_without_condition():
-    """Without any exit condition triggered, returns hold."""
+    """Inside the horizon, with no target and no adverse stop, the scalp holds."""
     from backend.services.scalp_v2.exit_evaluator import evaluate_scalp_v2_exit
 
     with patch.dict(
         os.environ,
         {
             "SCALP_V2_MIN_NET_PROFIT_PCT": "0.004",
-            "SCALP_V2_CATASTROPHIC_PCT": "0.99",
-            "SCALP_V2_TIME_STOP_MIN": "120",
             "SCALP_V2_GIVEBACK_EXIT_ENABLED": "false",
             "SCALP_V2_STALL_EXIT_ENABLED": "false",
         },
@@ -317,6 +284,6 @@ def test_scalp_holds_within_ceiling_without_condition():
             current_price=100.0,
             net_pnl_pct=-0.001,
             hold_minutes=10.0,
-            bar_low=99.9,
+            bar_low=100.0,
         )
     assert result.get("action") == "hold"

@@ -13,9 +13,14 @@ Validation window 2026-09-19 through that cut, n=20:
   ladder on BOTH windows. n=16/20 is not a promotion.
 
 Stall and giveback were the premature exits. They stay off unless an operator
-sets SCALP_V2_STALL_EXIT_ENABLED or SCALP_V2_GIVEBACK_EXIT_ENABLED. The live
-SCALP ladder is catastrophic stop, net-profit clip, and the 120-minute time
-stop. DAY structural invalidation is not on this ladder.
+sets SCALP_V2_STALL_EXIT_ENABLED or SCALP_V2_GIVEBACK_EXIT_ENABLED.
+
+The live SCALP ladder is the short-horizon scalp contract: catastrophic stop,
+the SCALP net-profit target (SCALP_NET_PROFIT_TARGET_PCT, 0.25%), the SCALP
+adverse bound (SCALP_PATH_MAX_ADVERSE_NET_PCT, 0.15%), and the SCALP horizon
+(SCALP_HOLD_MAX_MINUTES, 20 min). The earlier 0.4% target / 120-minute
+negative-only time stop let scalps sit for hours on a target the entry never
+certified. DAY structural invalidation is not on this ladder.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ SCALP_V2_ENGINE_ID = "SCALP_V2"
 LEGACY_ENGINE_ID = "LEGACY_DAY_LIVE"
 
 
-SELECTED_EXIT_POLICY = "catastrophic_net_profit_time_stop"
+SELECTED_EXIT_POLICY = "target_stop_horizon"
 
 
 def scalp_v2_stall_exit_enabled() -> bool:
@@ -42,10 +47,23 @@ def scalp_v2_giveback_exit_enabled() -> bool:
 
 
 def scalp_v2_min_net_profit_pct(symbol: str = "") -> float:
-    """Minimum net profit to take. Must clear ESTIMATED_ROUNDTRIP_COST.
-    Default: 0.004 (0.4%) — same as legacy. Can tune per symbol."""
+    """Net profit to take: the SCALP net-profit target entries are admitted against.
+
+    SCALP_V2_MIN_NET_PROFIT_PCT overrides; otherwise SCALP_NET_PROFIT_TARGET_PCT
+    (default 0.0025), the same value binance_scalp.economics uses to require
+    that the expected move reaches target + costs before entry.
+    """
     _ = symbol  # reserved for per-symbol tuning
-    return float(os.getenv("SCALP_V2_MIN_NET_PROFIT_PCT", "0.004"))
+    return float(os.getenv("SCALP_V2_MIN_NET_PROFIT_PCT") or os.getenv("SCALP_NET_PROFIT_TARGET_PCT") or "0.0025")
+
+
+def scalp_v2_max_adverse_net_pct(symbol: str = "") -> float:
+    """Net loss (positive magnitude) at which a scalp is cut: SCALP_PATH_MAX_ADVERSE_NET_PCT."""
+    _ = symbol  # reserved for per-symbol tuning
+    try:
+        return abs(float(os.getenv("SCALP_PATH_MAX_ADVERSE_NET_PCT", "0.0015")))
+    except (TypeError, ValueError):
+        return 0.0015
 
 
 def scalp_v2_trail_pct(symbol: str = "") -> float:

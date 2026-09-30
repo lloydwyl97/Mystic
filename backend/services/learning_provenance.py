@@ -144,6 +144,9 @@ def learning_provenance(db_path: str, position: Any, close_reason: str | None, e
         "is_dust": dust,
         "label_strategy": DUST_LABEL if dust else strategy,
     }
+    from backend.services.strategy_version import lot_versions
+
+    out.update(lot_versions(db_path, engine_id, out["trade_id"]))
     prov = close_provenance_of(position)
     if prov is not None:
         residual = prov.get("residual_qty")

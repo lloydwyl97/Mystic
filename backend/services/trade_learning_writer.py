@@ -80,6 +80,16 @@ CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_close_reason
     ON {TABLE_NAME}(close_reason, mode, exit_timestamp);
 """
 
+# Rows written before these columns existed keep '' and are legacy for learning.
+PROVENANCE_COLUMNS: tuple[str, ...] = (
+    "engine_id",
+    "setup",
+    "strategy_version",
+    "entry_contract_version",
+    "exit_contract_version",
+    "code_sha",
+)
+
 
 def _ensure_table(db_path: str = DATABASE_PATH) -> None:
     def _op() -> None:
@@ -90,6 +100,10 @@ def _ensure_table(db_path: str = DATABASE_PATH) -> None:
                 stmt = raw_stmt.strip()
                 if stmt:
                     cursor.execute(stmt)
+            cols = {str(r[1]) for r in cursor.execute(f"PRAGMA table_info({TABLE_NAME})")}
+            for col in PROVENANCE_COLUMNS:
+                if col not in cols:
+                    cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN {col} TEXT DEFAULT ''")
             conn.commit()
 
     run_locked_retry(_op)
@@ -203,7 +217,9 @@ def record_trade_outcome(
                         cooldown_state_json,
                         manual_sell_flag, close_reason,
                         dust_remaining_qty, dust_remaining_notional_usdt,
-                        realized_profit_unknown, extra_json
+                        realized_profit_unknown, extra_json,
+                        engine_id, setup, strategy_version,
+                        entry_contract_version, exit_contract_version, code_sha
                     ) VALUES (
                         datetime('now'), ?, ?,
                         ?, ?,
@@ -219,7 +235,9 @@ def record_trade_outcome(
                         ?,
                         ?, ?,
                         ?, ?,
-                        ?, ?
+                        ?, ?,
+                        ?, ?, ?,
+                        ?, ?, ?
                     )
                     """,
                     (
@@ -249,6 +267,7 @@ def record_trade_outcome(
                         float(record.dust_remaining_notional_usdt or 0.0),
                         1 if record.realized_profit_unknown else 0,
                         _json(record.extra),
+                        *(str((record.extra or {}).get(col) or "") for col in PROVENANCE_COLUMNS),
                     ),
                 )
                 conn.commit()
@@ -393,8 +412,12 @@ def consume_setup_outcomes_for_ranking(
     *,
     limit: int = 40,
     features: dict[str, Any] | None = None,
+    engine_id: str | None = None,
 ) -> dict[str, Any]:
     """Read closed trade_learning_outcomes for a setup (all four coins).
+
+    With ``engine_id``, only that engine's current-version outcomes are read;
+    legacy mixed-version rows never feed current ranking.
 
     When ``features`` is provided, outcomes that share volatility / momentum /
     MFE / hold / exit / regime buckets are weighted more heavily. This is the
@@ -419,6 +442,14 @@ def consume_setup_outcomes_for_ranking(
     if not setup_u:
         return out
     current = _row_feature_state(features or {}, features or {}, features or {}, str((features or {}).get("exit_reason") or ""))
+    version_sql = ""
+    version_params: tuple[str, ...] = ()
+    if engine_id:
+        from backend.services.strategy_version import learning_version_filter
+
+        predicate, params = learning_version_filter(engine_id)
+        version_sql = f" AND engine_id = ? AND {predicate}"
+        version_params = (str(engine_id).upper(), *params)
     try:
         _ensure_table(db_path)
         conn = sqlite3.connect(db_path, timeout=10)
@@ -429,10 +460,10 @@ def consume_setup_outcomes_for_ranking(
                 SELECT net_profit_usd, extra_json, rank_data_json, close_reason,
                        hold_seconds, indicators_while_holding_json
                 FROM {TABLE_NAME}
-                WHERE realized_profit_unknown = 0 AND net_profit_usd IS NOT NULL
+                WHERE realized_profit_unknown = 0 AND net_profit_usd IS NOT NULL{version_sql}
                 ORDER BY id DESC LIMIT ?
                 """,
-                (max(20, int(limit) * 6),),
+                (*version_params, max(20, int(limit) * 6)),
             ).fetchall()
         finally:
             conn.close()

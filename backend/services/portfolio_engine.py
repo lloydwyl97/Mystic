@@ -6046,7 +6046,12 @@ class PortfolioEngine:
                     trade_bind,
                 )
                 from backend.services.engine_strategy_dust import preserve_overwritten_dust
+                from backend.services.strategy_version import stamp_buy_version
 
+                stamp_buy_version(conn, trade_id, str(getattr(position, "engine_id", "") or ""))
+                from backend.services.adaptive_learning import persist_trade_adaptive
+
+                persist_trade_adaptive(conn, trade_id, getattr(position, "adaptive_decision", None))
                 _kept = preserve_overwritten_dust(conn, engine_id=str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE"), symbol=symbol, new_trade_id=trade_id)
                 if _kept:
                     logger.warning(
@@ -7044,6 +7049,27 @@ class PortfolioEngine:
                 extra=extra_payload,
             )
             record_trade_outcome(record, db_path=self.db_path, mode_override=(TradingMode.LIVE if self._live_execution_enabled else None))
+            try:
+                from backend.services.adaptive_learning import learn_from_close
+
+                _iwh = locals().get("indicators_while_holding") if isinstance(locals().get("indicators_while_holding"), dict) else {}
+                learn_from_close(
+                    self.db_path,
+                    engine=str(_prov.get("engine_id") or ""),
+                    symbol=symbol,
+                    setup=str(_prov.get("setup") or ""),
+                    regime=str(getattr(position, "day_route_regime_at_entry", "") or ""),
+                    strategy_version=str(_prov.get("strategy_version") or ""),
+                    net_pct=record.net_profit_pct,
+                    mfe_pct=_iwh.get("mfe_pct"),
+                    mae_pct=_iwh.get("mae_pct"),
+                    hold_min=(float(record.hold_seconds) / 60.0) if record.hold_seconds else None,
+                    continuation=1.0 if float(record.net_profit_pct or 0) > 0 else 0.0,
+                    version_current=bool(_prov.get("version_current")),
+                    is_dust=bool(_prov.get("is_dust")),
+                )
+            except Exception:
+                logger.debug("ADAPTIVE_CLOSE_LEARN_SKIPPED symbol=%s", symbol, exc_info=True)
             opened_iso = None
             with contextlib.suppress(Exception):
                 from backend.services.ai_outcome_training_writer import record_outcome_training_row
@@ -8764,6 +8790,7 @@ class PortfolioEngine:
             from backend.services.day_inventory_recovery import apply_legacy_tags_from_thesis
 
             apply_legacy_tags_from_thesis(pos, thesis_payload)
+            pos.adaptive_decision = dict(thesis_payload.get("adaptive_decision") or {})
             # Backfill regime/setup from any keys present in stored thesis_json (for older positions)
             if not getattr(pos, "day_route_regime_at_entry", ""):
                 pos.day_route_regime_at_entry = str(
@@ -9925,6 +9952,7 @@ class PortfolioEngine:
         setup_name: str = "SCALP_STRUCTURAL",
         opportunity_id: str = "",
         entry_authority: str = "",
+        adaptive_decision: dict | None = None,
     ) -> dict[str, Any] | None:
         """SCALP V2 dedicated live BUY path.
 
@@ -10153,6 +10181,7 @@ class PortfolioEngine:
                     scalp_opportunity_id=opportunity_id,
                     original_position_cost=float(total_cost),
                 )
+                position.adaptive_decision = dict(adaptive_decision or {})
                 self.open_positions[make_position_key(SCALP_V2_ENGINE_ID, norm)] = position
                 with contextlib.suppress(Exception):
                     from backend.services.trade_state import get_trade_state_store
@@ -10184,6 +10213,7 @@ class PortfolioEngine:
                     client_order_id=client_order_id,
                     entry_time=float(position.entry_time),
                     original_cost=float(total_cost),
+                    adaptive_decision=position.adaptive_decision,
                 )
                 # Canonical exchange-fill ledger (never reverses ownership on failure).
                 await _asyncio.to_thread(
@@ -10312,6 +10342,7 @@ class PortfolioEngine:
         client_order_id: str = "",
         entry_time: float | None = None,
         original_cost: float | None = None,
+        adaptive_decision: dict | None = None,
     ) -> None:
         """Atomic DB commit for SCALP V2 BUY: paper_trades + positions + ledger."""
         from backend.services.scalp_v2.opportunity import mark_opportunity_on
@@ -10331,6 +10362,7 @@ class PortfolioEngine:
                     decision_id=decision_id,
                     trade_id=trade_id,
                     timestamp=timestamp,
+                    adaptive_decision=adaptive_decision,
                 )
                 self._scalp_v2_write_position_row(
                     conn,
@@ -10348,6 +10380,7 @@ class PortfolioEngine:
                     entry_time=float(entry_time if entry_time is not None else time.time()),
                     timestamp=timestamp,
                     original_cost=original_cost,
+                    adaptive_decision=adaptive_decision,
                 )
                 mark_opportunity_on(conn, symbol, opportunity_id, "OPEN")
 
@@ -10379,6 +10412,7 @@ class PortfolioEngine:
         decision_id: str,
         trade_id: str,
         timestamp: str,
+        adaptive_decision: dict | None = None,
     ) -> None:
         from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
         from backend.services.scalp_v2.identity_stamp import stamp_engine
@@ -10412,6 +10446,12 @@ class PortfolioEngine:
             ),
         )
         stamp_engine(conn, "paper_trades", "trade_id", trade_id, SCALP_V2_ENGINE_ID, opportunity_id)
+        from backend.services.strategy_version import stamp_buy_version
+
+        stamp_buy_version(conn, trade_id, SCALP_V2_ENGINE_ID)
+        from backend.services.adaptive_learning import persist_trade_adaptive
+
+        persist_trade_adaptive(conn, trade_id, adaptive_decision)
 
     @staticmethod
     def _scalp_v2_write_position_row(
@@ -10431,6 +10471,7 @@ class PortfolioEngine:
         entry_time: float,
         timestamp: str,
         original_cost: float | None = None,
+        adaptive_decision: dict | None = None,
     ) -> None:
         from backend.services.engine_strategy_dust import preserve_overwritten_dust
         from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
@@ -10502,6 +10543,15 @@ class PortfolioEngine:
             opportunity_id,
             scope_engine=SCALP_V2_ENGINE_ID,
         )
+        if adaptive_decision:
+            import json as _json
+
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(portfolio_engine_positions)")}
+            if "thesis_json" in cols:
+                conn.execute(
+                    "UPDATE portfolio_engine_positions SET thesis_json=? WHERE trade_id=? AND engine_id=?",
+                    (_json.dumps({"adaptive_decision": adaptive_decision}, separators=(",", ":")), trade_id, SCALP_V2_ENGINE_ID),
+                )
 
     def _scalp_v2_record_fill_provenance_sync(
         self,
@@ -11790,6 +11840,7 @@ class PortfolioEngine:
             day_atr_1h_at_entry=float(getattr(explainability, "day_atr_1h", 0.0) or 0.0),
             day_objective_structural=float(getattr(explainability, "day_objective_structural", 0.0) or 0.0),
         )
+        position.adaptive_decision = dict(getattr(explainability, "adaptive_decision", None) or {})
         if live_order_buy and (live_order_buy.get("_mystic_partial_fill") or live_order_buy.get("_mystic_ioc_incomplete")):
             is_dust, _, dust_reason, _ = self._dust_check(normalized_symbol, quantity, fill_price)
             if is_dust:
@@ -13646,6 +13697,12 @@ class PortfolioEngine:
                         str(getattr(position, "engine_id", "") or "LEGACY_EXIT_ONLY"),
                         str(getattr(position, "scalp_opportunity_id", "") or ""),
                     )
+                    from backend.services.strategy_version import stamp_sell_version
+
+                    _sell_versions = stamp_sell_version(conn, sell_trade_id, str(position_trade_id or ""), str(getattr(position, "engine_id", "") or ""))
+                    from backend.services.adaptive_learning import persist_trade_adaptive
+
+                    persist_trade_adaptive(conn, sell_trade_id, getattr(position, "adaptive_decision", None))
                     if getattr(position, "scalp_opportunity_id", ""):
                         from backend.services.scalp_v2.opportunity import mark_opportunity_on
 
@@ -13770,6 +13827,8 @@ class PortfolioEngine:
                             _mfe_val = float(mfe_pct) if mfe_pct is not None else None
                             _mae_val = float(mae_pct) if mae_pct is not None else None
                             _strat = str(sell_strategy_id or buy_row_strategy_id or "day")
+                            if _sell_versions.get("version_current") == "1":
+                                _strat = f"{_strat}@{_sell_versions['strategy_version']}"
                             _regime = str(original_explain.get("market_regime") or "unknown")
                             _record_outcome(
                                 self.db_path,
@@ -16157,6 +16216,7 @@ class PortfolioEngine:
                 _bar_low_day_v2 = float(getattr(position, "lowest_price", 0.0) or current_price)
                 if _bar_low_day_v2 <= 0:
                     _bar_low_day_v2 = float(current_price)
+                _adapt = getattr(position, "adaptive_decision", None) or {}
                 _day_v2_dec = evaluate_day_v2_exit(
                     engine_id=_pos_engine_id,
                     entry_price=entry_price,
@@ -16171,6 +16231,11 @@ class PortfolioEngine:
                     setup=str(getattr(position, "entry_thesis", "") or ""),
                     atr_1h_at_entry=float(getattr(position, "day_atr_1h_at_entry", 0.0) or 0.0),
                     objective_structural=float(getattr(position, "day_objective_structural", 0.0) or 0.0),
+                    objective_atr_mult=float((_adapt or {}).get("objective_atr_mult") or 1.0),
+                    structural_emphasis=float((_adapt or {}).get("structural_emphasis") or 1.0),
+                    runner_activation_mult=float((_adapt or {}).get("runner_activation_mult") or 1.0),
+                    runner_trail_mult=float((_adapt or {}).get("runner_trail_mult") or 1.0),
+                    runner_tighten_mult=float((_adapt or {}).get("runner_tighten_mult") or 1.0),
                 )
                 if _day_v2_dec and str(_day_v2_dec.get("action") or "") == "sell":
                     _day_v2_reason = str(_day_v2_dec.get("reason") or "DAY_V2_EXIT")
@@ -16202,11 +16267,10 @@ class PortfolioEngine:
                 return None
 
         # ── SCALP V2 exit dispatch ─────────────────────────────────────────────
-        # Positions with engine_id='SCALP_V2' use the five SCALP V2 exit roles
-        # (catastrophic / net-profit / giveback / stall / time) and skip DAY
-        # structural invalidation, DAY thesis objectives, DAY 300-min ceiling,
-        # and allweather bracket exits.  The exception path falls through to
-        # legacy exits as a safety net.
+        # Positions with engine_id='SCALP_V2' use the SCALP V2 short-horizon
+        # ladder (catastrophic / net-profit target / adverse stop / horizon) and
+        # skip DAY structural invalidation, DAY thesis objectives, DAY 300-min
+        # ceiling, and allweather bracket exits. Errors fail closed (hold).
         if _pos_engine_id == "SCALP_V2":
             try:
                 from backend.services.scalp_v2.exit_evaluator import evaluate_scalp_v2_exit

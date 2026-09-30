@@ -69,6 +69,11 @@ def evaluate_day_v2_exit(
     setup: str = "",
     atr_1h_at_entry: float = 0.0,
     objective_structural: float = 0.0,
+    objective_atr_mult: float = 1.0,
+    structural_emphasis: float = 1.0,
+    runner_activation_mult: float = 1.0,
+    runner_trail_mult: float = 1.0,
+    runner_tighten_mult: float = 1.0,
 ) -> dict | None:
     """Evaluate all DAY V2 exit roles.
 
@@ -144,13 +149,16 @@ def evaluate_day_v2_exit(
     if atr_1h <= 0 and atr_at_entry > 0:
         atr_1h = LEGACY_ATR_1H_PER_ATR_15M * atr_at_entry
     structural = float(objective_structural or 0.0) or float(target_price or 0.0)
-    objective = objective_level(setup, entry_price, atr_1h, structural) if atr_1h > 0 else 0.0
+    objective = objective_level(setup, entry_price, atr_1h, structural, atr_mult=objective_atr_mult, structural_emphasis=structural_emphasis) if atr_1h > 0 else 0.0
     runner = runner_stop(
         entry_price=entry_price,
         highest_price=highest_price,
         atr_1h=atr_1h,
         objective=objective,
         estimated_roundtrip_cost=estimated_roundtrip_cost,
+        activation_mult=runner_activation_mult,
+        trail_mult=runner_trail_mult,
+        tighten_mult=runner_tighten_mult,
     )
     if runner["activated"] and current_price <= runner["stop"]:
         reason = "DAY_V2_OBJECTIVE_COMPLETE" if runner["objective_reached"] else "DAY_V2_WINNER_PROTECTION"

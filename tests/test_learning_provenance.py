@@ -67,7 +67,13 @@ def test_scalp_close_never_tagged_day(tmp_path):
     db = _db(tmp_path)
     pos = SimpleNamespace(engine_id="SCALP_V2", trade_id="sc1", scalp_opportunity_id="opp1", entry_thesis="", status="ACTIVE")
     prov = learning_provenance(db, pos, "NET_PROFIT_EXIT", {"setup_type_canonical": "HTF_TREND_PULLBACK"})
-    assert prov == {"engine_id": "SCALP_V2", "trade_id": "sc1", "strategy": "scalp", "setup": "range_bounce_scalp", "is_dust": False, "label_strategy": "scalp"}
+    assert prov["engine_id"] == "SCALP_V2"
+    assert prov["trade_id"] == "sc1"
+    assert prov["strategy"] == "scalp"
+    assert prov["setup"] == "range_bounce_scalp"
+    assert prov["is_dust"] is False
+    assert prov["label_strategy"] == "scalp"
+    assert prov["strategy"] != "day"
 
 
 def test_day_setup_and_unknown_and_dust(tmp_path):

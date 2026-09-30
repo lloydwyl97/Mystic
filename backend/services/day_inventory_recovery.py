@@ -44,6 +44,7 @@ def thesis_json_for_position(pos: Any) -> dict[str, Any]:
         "day_exit_contract": str(getattr(pos, "day_exit_contract", "") or ""),
         "day_atr_1h_at_entry": float(getattr(pos, "day_atr_1h_at_entry", 0.0) or 0.0),
         "day_objective_structural": float(getattr(pos, "day_objective_structural", 0.0) or 0.0),
+        "adaptive_decision": dict(getattr(pos, "adaptive_decision", None) or {}),
         "legacy_pre_regime_router": bool(getattr(pos, "legacy_pre_regime_router", False)),
         "opened_under_router": bool(getattr(pos, "opened_under_router", False)),
         "exit_residual_reason": str(getattr(pos, "exit_residual_reason", "") or ""),

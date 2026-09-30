@@ -362,7 +362,7 @@ def test_scalp_exit_does_not_apply_day_structure_or_default_stall():
         position=pos,
         current_price=100.05,
         net_pnl_pct=-0.001,
-        hold_minutes=30.0,
+        hold_minutes=10.0,
         bar_low=99.9,
     )
     assert result.get("action") == "hold"

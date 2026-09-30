@@ -72,13 +72,14 @@ def test_old_entry_target_is_not_a_sell_level():
 
 
 def test_structural_objective_per_setup():
-    b15 = [_bar(100, 100 + i * 0.1, 99 - i * 0.05, 100) for i in range(20)]
+    b15 = [_bar(100, 100 + i * 0.1, 99 - i * 0.05, 100) for i in range(21)]
     b1h = [_bar(100, 101, 99, 95.0 + i * 0.5) for i in range(20)]
     b4h = [_bar(100, 104.0 + (i % 3), 99, 100) for i in range(15)]
-    high20 = max(b["high"] for b in b15)
-    low20 = min(b["low"] for b in b15)
+    high20 = max(b["high"] for b in b15[-20:])
+    prior_high = max(b["high"] for b in b15[:-1])
+    prior_low = min(b["low"] for b in b15[:-1])
     assert structural_objective("HTF_TREND_PULLBACK", b15, b1h, b4h) == pytest.approx(max(b["high"] for b in b4h[-6:]))
-    assert structural_objective("BREAKOUT_CONTINUATION", b15, b1h, b4h) == pytest.approx(high20 + (high20 - low20))
+    assert structural_objective("BREAKOUT_CONTINUATION", b15, b1h, b4h) == pytest.approx(prior_high + (prior_high - prior_low))
     assert structural_objective("RANGE_BOUNCE", b15, b1h, b4h) == pytest.approx(high20)
     mean1h = sum(b["close"] for b in b1h) / 20
     assert structural_objective("VWAP_REVERSION", b15, b1h, b4h) == pytest.approx(mean1h)

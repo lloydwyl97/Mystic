@@ -125,32 +125,6 @@ def migration_engine_id_trailing_buy_intents(conn: sqlite3.Connection) -> dict[s
     return results
 
 
-def migration_day_v2_shadow_observations(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Create the day_v2_shadow_observations table (read-only accumulator)."""
-    created = False
-    if not _table_exists(conn, "day_v2_shadow_observations"):
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS day_v2_shadow_observations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                opportunity_id TEXT,
-                state TEXT NOT NULL,
-                exit_role_evaluated TEXT,
-                exit_should_fire INTEGER,
-                net_pnl_pct REAL,
-                hold_minutes REAL,
-                bar_ts TEXT,
-                recorded_at TEXT DEFAULT (datetime('now'))
-            )
-            """
-        )
-        conn.commit()
-        logger.info("migration: created table day_v2_shadow_observations")
-        created = True
-    return {"created": created}
-
-
 # ---------------------------------------------------------------------------
 # Migration registry and runner
 # ---------------------------------------------------------------------------
@@ -334,7 +308,6 @@ _MIGRATIONS: list[tuple[str, Any]] = [
     ("engine_id_positions", migration_engine_id_positions),
     ("engine_id_paper_trades", migration_engine_id_paper_trades),
     ("engine_id_trailing_buy_intents", migration_engine_id_trailing_buy_intents),
-    ("day_v2_shadow_observations", migration_day_v2_shadow_observations),
     ("legacy_exit_only", migration_legacy_exit_only),
 ]
 

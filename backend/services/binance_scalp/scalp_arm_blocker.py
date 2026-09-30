@@ -1,15 +1,9 @@
-"""Adaptive per-arm scalp block based on recent-30d PnL history.
+"""Per-arm negative-expectancy flag for SCALP ranking.
 
-Data from 2026-08-09 audit: SOL/vwap_ema_reclaim (5 trades, -$1.77, 20% wins)
-and SOL/range_bounce_scalp (3 trades, -$2.60, 33% wins) were bleeding while
-BTC arms were net-positive. Without a data-driven blocker the scalper keeps
-firing the losing SOL setups.
-
-This module returns a `hard_block` label for `(symbol, setup)` combinations
-whose recent-window win rate + avg PnL indicate a bleed. The block is time-
-limited (default 6h) so an arm can prove itself again after enough elapsed
-market conditions. Never blocks arms with fewer than `min_obs` samples so
-new setups get a chance to gather data.
+Flags `(symbol, setup)` arms whose current-version outcomes show a low win
+rate and negative average PnL. The caller applies it as a rank multiplier,
+never as an entry block. Only current SCALP strategy-version outcomes are read;
+legacy mixed-version history never flags an arm.
 
 Env knobs:
   SCALP_ARM_BLOCKER_ENABLED=true  (kill switch)
@@ -91,18 +85,22 @@ def _query_arm_stats(
     lb = int(lookback_days or _lookback_days())
     since_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - lb * 86400))
     out = {"n": 0, "wins": 0, "total_pnl_usd": 0.0, "avg_pnl_usd": 0.0, "win_rate": 0.0}
+    from backend.services.strategy_version import learning_version_filter
+
+    version_sql, version_params = learning_version_filter("SCALP_V2")
     try:
         with sqlite3.connect(db_path, timeout=5.0) as conn:
-            # ai_signal / scalp_learning_outcomes carries setup_name + net_pnl_usd.
+            # Current-version outcomes only: legacy mixed-version rows never rank an arm.
             rows = conn.execute(
-                """
+                f"""
                 SELECT net_pnl_usd
                 FROM scalp_learning_outcomes
                 WHERE symbol = ?
                   AND lower(setup_name) = lower(?)
                   AND ingested_at >= ?
+                  AND {version_sql}
                 """,
-                (symbol, setup, since_iso),
+                (symbol, setup, since_iso, *version_params),
             ).fetchall()
     except sqlite3.Error:
         return out

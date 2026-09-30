@@ -659,6 +659,24 @@ def _status_books() -> dict[str, dict[str, Any]]:
     return books
 
 
+@router.get("/performance/by-version")
+async def get_performance_by_version() -> dict[str, Any]:
+    """Current-version vs legacy closed-trade performance per engine. Read-only.
+
+    Current = BUY stamped with the engine's current strategy + entry contract and
+    closed under the current exit contract. Legacy = everything else (retained,
+    never current performance). Counts carry no permission consequence.
+    """
+    try:
+        from backend.services.strategy_version import performance_by_version
+
+        data = await asyncio.to_thread(performance_by_version, os.getenv("TRADING_DB_PATH", DATABASE_PATH))
+        return {"success": True, "data": data}
+    except Exception as exc:
+        logger.exception("performance-by-version failed: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @router.get("/status")
 async def get_portfolio_status() -> dict[str, Any]:
     """

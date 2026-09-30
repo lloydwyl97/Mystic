@@ -61,20 +61,25 @@ def structural_objective(
     """Setup-specific structural level the move is expected to reach.
 
     HTF_TREND_PULLBACK: prior 4h swing high (last 6 closed 4h bars).
-    BREAKOUT_CONTINUATION: measured move (20-bar 15m range projected above its high).
+    BREAKOUT_CONTINUATION: measured move (the broken range of the 20 closed bars
+        before the signal bar, projected above its high).
     RANGE_BOUNCE: opposing range boundary (20-bar 15m high).
     VWAP_REVERSION / EXHAUSTION_MR: 1h mean (last 20 closed 1h closes).
     """
     try:
         if setup == "HTF_TREND_PULLBACK":
             return max(float(b["high"]) for b in bars_4h[-6:]) if bars_4h else 0.0
+        if setup == "BREAKOUT_CONTINUATION":
+            prior = bars_15m[-21:-1]
+            if len(prior) < 20:
+                return 0.0
+            prior_high = max(float(b["high"]) for b in prior)
+            prior_low = min(float(b["low"]) for b in prior)
+            return prior_high + (prior_high - prior_low)
         w15 = bars_15m[-20:]
         if not w15:
             return 0.0
         high20 = max(float(b["high"]) for b in w15)
-        low20 = min(float(b["low"]) for b in w15)
-        if setup == "BREAKOUT_CONTINUATION":
-            return high20 + (high20 - low20)
         if setup == "RANGE_BOUNCE":
             return high20
         w1h = bars_1h[-20:]
@@ -83,11 +88,28 @@ def structural_objective(
         return 0.0
 
 
-def objective_level(setup: str, entry_price: float, atr_1h: float, structural: float) -> float:
-    """Objective = max(structural level, entry + k x 1h ATR). Never a fixed percentage."""
+def objective_level(
+    setup: str,
+    entry_price: float,
+    atr_1h: float,
+    structural: float,
+    *,
+    atr_mult: float = 1.0,
+    structural_emphasis: float = 1.0,
+) -> float:
+    """Objective = max(structural level, entry + k x 1h ATR). Never a fixed percentage.
+
+    ``atr_mult`` and ``structural_emphasis`` are bounded adaptive calibrations.
+    Defaults of 1 leave the structure-runner contract unchanged.
+    """
     k = _OBJECTIVE_ATR_FLOOR.get(str(setup or ""), _DEFAULT_OBJECTIVE_ATR_FLOOR)
+    k *= max(0.75, min(1.35, float(atr_mult or 1.0)))
     floor = entry_price + k * max(0.0, atr_1h)
-    return max(float(structural or 0.0), floor)
+    level = float(structural or 0.0)
+    if level > entry_price > 0:
+        emphasis = max(0.85, min(1.25, float(structural_emphasis or 1.0)))
+        level = entry_price + (level - entry_price) * emphasis
+    return max(level, floor)
 
 
 def move_potential(setup: str, ref_price: float, atr_1h: float, structural: float) -> float:
@@ -104,14 +126,25 @@ def runner_stop(
     atr_1h: float,
     objective: float,
     estimated_roundtrip_cost: float,
+    activation_mult: float = 1.0,
+    trail_mult: float = 1.0,
+    tighten_mult: float = 1.0,
 ) -> dict[str, Any]:
-    """Current ratchet state. ``stop`` is 0.0 until the trade has proven itself."""
+    """Current ratchet state. ``stop`` is 0.0 until the trade has proven itself.
+
+    Multipliers are fixed for the life of the trade (stamped at entry). The stop
+    is still a non-decreasing function of the high-water mark.
+    """
     hwm = max(float(highest_price or 0.0), float(entry_price or 0.0))
-    activated = atr_1h > 0 and entry_price > 0 and (hwm - entry_price) >= RUNNER_ACTIVATION_ATR_1H * atr_1h
+    activation = RUNNER_ACTIVATION_ATR_1H * max(0.80, min(1.25, float(activation_mult or 1.0)))
+    activated = atr_1h > 0 and entry_price > 0 and (hwm - entry_price) >= activation * atr_1h
     objective_reached = objective > 0 and hwm >= objective
     if not activated:
         return {"activated": False, "objective_reached": objective_reached, "stop": 0.0, "trail_atr_1h": 0.0}
-    trail_mult = RUNNER_TIGHT_TRAIL_ATR_1H if objective_reached else RUNNER_TRAIL_ATR_1H
+    if objective_reached:
+        trail = RUNNER_TIGHT_TRAIL_ATR_1H * max(0.75, min(1.15, float(tighten_mult or 1.0)))
+    else:
+        trail = RUNNER_TRAIL_ATR_1H * max(0.80, min(1.20, float(trail_mult or 1.0)))
     break_even = entry_price * (1.0 + max(0.0, estimated_roundtrip_cost))
-    stop = max(break_even, hwm - trail_mult * atr_1h)
-    return {"activated": True, "objective_reached": objective_reached, "stop": stop, "trail_atr_1h": trail_mult}
+    stop = max(break_even, hwm - trail * atr_1h)
+    return {"activated": True, "objective_reached": objective_reached, "stop": stop, "trail_atr_1h": trail}

@@ -128,6 +128,17 @@
             </div>
         </section>
 
+        <section class="widget widget--full" id="version-perf-widget" aria-label="Performance by strategy version">
+            <h2 class="widget__title">Performance by strategy version</h2>
+            <p class="widget__subtitle">CURRENT = trades opened and closed under the running strategy version. LEGACY = earlier mixed versions, kept for accounting and forensics only. <span id="version-adaptive-note"></span></p>
+            <div class="widget__table-wrap">
+                <table class="data-table">
+                    <thead><tr><th>Engine</th><th>Bucket</th><th>Version</th><th>RT</th><th>W/L</th><th>Net</th><th>PF</th><th>Expectancy</th><th>Avg win</th><th>Avg loss</th></tr></thead>
+                    <tbody id="version-perf-body"><tr><td colspan="10">--</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+
         <!-- Trading result: live exchange-reconciled is the primary figure. -->
         <section class="widget widget--full" id="pnl-recon-widget" aria-label="Trading result, live exchange-reconciled">
             <h2 class="widget__title">Trading result <span class="readiness-value" id="pnl-mode" style="font-size:0.85em;margin-left:8px;">--</span></h2>

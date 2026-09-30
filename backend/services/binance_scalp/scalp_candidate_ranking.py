@@ -446,37 +446,17 @@ def rank_setup_signal(
         if hit:
             _stats = cached_stats
         else:
-            _stats = _learn_cache_set(stats_key, _gls(_db, sig.symbol, "scalp"))
+            from backend.services.strategy_version import SCALP_STRATEGY_VERSION
+
+            _stats = _learn_cache_set(stats_key, _gls(_db, sig.symbol, f"SCALP_V2@{SCALP_STRATEGY_VERSION}"))
         role_samples = _stats.sample_count
         role_conf_status = _stats.confidence_status
-        learned_adj = round(max(-0.02, min(0.02, _stats.learned_adjustment)), 5)
         with contextlib.suppress(Exception):
-            from backend.services.trade_learning_writer import consume_setup_outcomes_for_ranking
+            from backend.services.adaptive_learning import scalp_decision
 
-            consume_key = f"consume:{sig.setup_name}"
-            hit_c, cached_learned = _learn_cache_get(consume_key)
-            if hit_c:
-                _learned = cached_learned
-            else:
-                _learned = _learn_cache_set(
-                    consume_key,
-                    consume_setup_outcomes_for_ranking(
-                        _db,
-                        sig.setup_name,
-                        features={
-                            "volatility": getattr(ctx.mom, "realized_volatility_pct", None),
-                            "momentum": getattr(ctx.mom, "mid_change_60s", None),
-                            "regime": regime,
-                            "model_probability": sig.confidence,
-                            "market_regime": regime,
-                        },
-                    ),
-                )
-            if _learned.get("consumed") and int(_learned.get("n") or 0) >= 8:
-                learned_adj = round(
-                    max(-0.04, min(0.04, learned_adj + float(_learned.get("rank_delta") or 0.0))),
-                    5,
-                )
+            _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
+            _view = scalp_decision(_db, sig.symbol, sig.setup_name, regime)
+            learned_adj = round(max(-0.04, min(0.04, (_view["expected_edge"] - _view["edge_prior"]) * 8.0)), 5)
 
     # Real microstructure features — ranking only, never eligibility.
     # select_v2: EV_10s is the primary four-coin key (frozen validation).

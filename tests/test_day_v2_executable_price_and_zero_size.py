@@ -319,7 +319,10 @@ async def test_nonzero_size_submits_direct_with_current_price(tmp_path, day_cycl
 
     assert [r[2] for r in _decisions(integ.engine.db_path)] == ["FILLED"] * len(SYMBOLS)
     assert [c["current_price"] for c in integ.sizing_calls] == [LIVE[s] for s in SYMBOLS]
-    assert day_cycle["submits"] == [{"symbol": s, "ask": LIVE[s], "qty": 0.5} for s in SYMBOLS]
+    from backend.services.day_v2.ranking import clamp_to_sleeve
+
+    remaining = 228.0 * 0.5
+    assert day_cycle["submits"] == [{"symbol": s, "ask": LIVE[s], "qty": clamp_to_sleeve(0.5, LIVE[s], remaining)} for s in SYMBOLS]
 
 
 @pytest.mark.asyncio

@@ -390,6 +390,9 @@ class PortfolioEngineIntegration:
                         )
 
                         run_day_v2_migrations(str(self.engine.db_path))
+                        from backend.services.strategy_version import register_version_boundaries
+
+                        logger.info("STRATEGY_VERSION_BOUNDARY %s", register_version_boundaries(str(self.engine.db_path)))
                         _canceled = cancel_old_policy_intents(str(self.engine.db_path))
                         if _canceled:
                             logger.info("DAY_V2_STARTUP: retired %d old-policy intents", _canceled)
@@ -1471,7 +1474,6 @@ class PortfolioEngineIntegration:
                         await self._monitor_positions_once(refresh_market_data=False)
 
                         entry_bar = int(current_time / self.entry_decision_interval) * self.entry_decision_interval
-                        result = None
                         if entry_bar > self.last_entry_bar_processed:
                             # 15m (default) entry decisions; pass 1m current_bar for cooldown math.
                             logger.info(
@@ -1479,26 +1481,10 @@ class PortfolioEngineIntegration:
                                 entry_bar,
                                 self.entry_decision_interval,
                             )
-                            # LEGACY_DAY_LIVE_BUY_DISABLED (default true) — the legacy
-                            # trailing-buy stream is no longer the active entry authority.
                             # DAY V2 (_process_day_v2_signals) and SCALP V2 (live entry
                             # loop) are the only authorities that create new positions.
-                            # Set LEGACY_DAY_LIVE_BUY_DISABLED=false to re-enable.
-                            _legacy_buy_disabled = os.getenv("LEGACY_DAY_LIVE_BUY_DISABLED", "true").lower() not in ("0", "false", "no", "off")
-                            try:
-                                if _legacy_buy_disabled:
-                                    logger.info(
-                                        "LEGACY_DAY_LIVE_BUY_DISABLED bar=%s — skipping process_bar_candidates",
-                                        entry_bar,
-                                    )
-                                    result = None
-                                else:
-                                    result = await self.engine.process_bar_candidates(current_bar)
-                            finally:
-                                # Consume this entry window even if process_bar_candidates
-                                # raises after a partial fill. Retrying the same 15m bar
-                                # on later 1m ticks can double-buy.
-                                self.last_entry_bar_processed = entry_bar
+                            # The legacy bar-candidate stream has no entry path.
+                            self.last_entry_bar_processed = entry_bar
 
                             if self.redis_client and cand_buses:
                                 for b in set(cand_buses):
@@ -1507,35 +1493,7 @@ class PortfolioEngineIntegration:
                                     except Exception as rd_e:
                                         logger.debug("PE_PENDING_CLEAR: %s: %s", b, rd_e, exc_info=True)
 
-                            if result and result.get("trailing_buy_armed"):
-                                logger.info(
-                                    "BAR_TRAILING_BUY_ARMED: %s intent=%s arm_ask=%s intents=%s",
-                                    result.get("symbol"),
-                                    result.get("intent_id"),
-                                    result.get("arm_ask"),
-                                    result.get("intents") or result.get("active_intent_count"),
-                                )
-                            elif result:
-                                # result may be a fill dict (has 'quantity') or a stream
-                                # summary dict (has 'new'/'active' etc.) — use .get() safely.
-                                if result.get("quantity") is not None:
-                                    logger.info(
-                                        "BAR_EXECUTION: %s | qty=%.6f @ $%.4f",
-                                        result.get("symbol"),
-                                        float(result["quantity"]),
-                                        float(result.get("price", 0)),
-                                    )
-                                else:
-                                    logger.info("BAR_RESULT: %s", result)
-                                decision_id = result.get("decision_id")
-                                if decision_id and self.redis_client:
-                                    await self.redis_client.set(f"executed:{decision_id}", "1", ex=86400)
-                            else:
-                                logger.info("BAR_PROCESS: No trade executed this entry bar")
-
-                            # DAY V2 signal evaluation — runs on the same 15m boundary
-                            # as process_bar_candidates. Operates independently of the
-                            # Redis-based LEGACY/SCALP pipeline above.
+                            # DAY V2 signal evaluation on the 15m entry boundary.
                             await self._process_day_v2_signals(entry_bar)
                         else:
                             logger.debug(
@@ -1622,13 +1580,14 @@ class PortfolioEngineIntegration:
     async def _process_day_v2_signals(self, entry_bar: int, *, pending_only: bool = False) -> None:
         """Evaluate DAY V2 entry signals on the just-closed 15m bar.
 
-        Called immediately after process_bar_candidates on every 15m boundary.
-        For each symbol in DAY_V2_UNIVERSE:
-          - Skip if the symbol already has an open position (any engine).
-          - Skip if DAY_V2_ENABLED is False.
-          - Load the last 60 closed 15m bars + 1H + 4H bars from feature_ohlcv.
-          - Evaluate deterministic setup rules (no ML model).
-          - If a signal fires and cash/slot allow: arm a trailing-buy intent.
+        Runs on every 15m entry boundary, in two phases:
+          1. Collect: for each symbol in DAY_V2_UNIVERSE not already held by DAY,
+             load closed 15m/1H/4H bars, evaluate the five deterministic setups,
+             and apply the integrity checks (consumed opportunity, frequency,
+             structural data, executable price).
+          2. Fund in rank order: candidates are ordered by ``rank_day_candidates``
+             (ranking only, never a gate), sized from the remaining DAY sleeve,
+             and submitted through the hard safety gates.
         """
         try:
             from backend.services.day_v2.config import DAY_V2_ENABLED, DAY_V2_UNIVERSE
@@ -1656,6 +1615,7 @@ class PortfolioEngineIntegration:
             # _can_open_position below serves as the hard gate for all new entries.
             already_open = day_v2_held_symbols(self.engine.open_positions if self.engine else None)
 
+            candidates: list[dict[str, Any]] = []
             for symbol in DAY_V2_UNIVERSE:
                 try:
                     norm = symbol.upper().replace("-", "").replace("/", "")
@@ -1811,140 +1771,221 @@ class PortfolioEngineIntegration:
                         logger.warning("DAY_V2_HARD_DATA_REJECT symbol=%s reason=MISSING_EXECUTABLE_PRICE", symbol)
                         continue
 
-                    # Compute position size via the engine's existing sizing logic
-                    atr_val = float(signal.atr or 0.0)
-                    qty, _stop_price, _risk = self.engine.calculate_position_size(
-                        symbol=norm,
-                        equity=float(self.engine._total_equity or self.engine.cash_balance or 0),
-                        atr=atr_val if atr_val > 0 else ask_price * 0.015,
-                        current_price=ask_price,
+                    candidates.append(
+                        {
+                            "symbol": symbol,
+                            "norm": norm,
+                            "signal": signal,
+                            "zone": _zone,
+                            "reclaim_level": _reclaim_level,
+                            "ask_price": ask_price,
+                            "db_symbol": db_sym_15m,
+                            "as_of": as_of,
+                        }
                     )
-                    notional = float(qty) * float(ask_price)
-                    if qty <= 0 or notional <= 0:
-                        record_day_decision(
-                            db_path,
-                            symbol,
-                            "REJECTED:INSUFFICIENT_EXECUTABLE_CASH",
-                            cycle_ts=as_of,
-                            closest=signal.setup,
-                            unmet=[
-                                "ZERO_SIZE",
-                                f"qty={float(qty):.8f}",
-                                f"notional={notional:.8f}",
-                                f"ask={ask_price:.8f}",
-                                f"atr={atr_val:.8f}",
-                                f"opportunity_id={signal.opportunity_id}",
-                            ],
-                        )
-                        logger.warning("DAY_V2_ZERO_SIZE symbol=%s ask=%.6f atr=%.6f", symbol, ask_price, atr_val)
-                        continue
+                    from backend.services.adaptive_learning import record_candidate
+                    from backend.services.portfolio_engine import ESTIMATED_ROUNDTRIP_COST
 
-                    # Gate through _can_open_position (two-engine contract:
-                    # DAY slots are engine-scoped; SCALP lots never count).
-                    can_open, gate_reason = await self.engine._can_open_position(norm, notional, engine_id="DAY_V2")
-                    if not can_open:
-                        gate_label = "INSUFFICIENT_EXECUTABLE_CASH" if str(gate_reason).startswith("INSUFFICIENT_CASH") else str(gate_reason)
-                        record_day_decision(db_path, symbol, f"REJECTED:{gate_label}", cycle_ts=as_of, closest=signal.setup, unmet=[str(gate_reason)])
-                        logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s notional=%.4f", symbol, gate_reason, notional)
-                        continue
-
-                    from backend.services.two_engine_claim import claim_symbol, release_claim
-
-                    claimed, claim_reason, reservation_id = claim_symbol(
+                    record_candidate(
                         db_path,
-                        norm,
-                        "DAY_V2",
-                        str(signal.opportunity_id),
-                        float(notional),
-                        positions=self.engine.open_positions,
+                        engine="DAY_V2",
+                        symbol=symbol,
+                        setup=signal.setup,
+                        regime=signal.regime,
+                        ref_price=ask_price,
+                        roundtrip_cost=ESTIMATED_ROUNDTRIP_COST,
+                        signaled=True,
+                        evaluated_at=as_of,
                     )
-                    if not claimed:
-                        record_day_decision(db_path, symbol, claim_reason, cycle_ts=as_of, closest=signal.setup)
-                        logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s", symbol, claim_reason)
-                        continue
-
-                    # DAY direct live entry: a qualified closed-15m setup proceeds
-                    # straight to protected execution. No WAIT_DIP, no dip /
-                    # rebound / retention bracket, no 5m confirmation, no TTL.
-                    import uuid as _uuid
-
-                    from backend.services.day_v2.live_entry import submit_day_v2_direct_entry
-
-                    _direct_decision_id = str(_uuid.uuid4())
-                    _filled = await submit_day_v2_direct_entry(
-                        self.engine,
-                        signal=signal,
-                        ask_price=ask_price,
-                        quantity=qty,
-                        stop_price=float(_stop_price or 0.0),
-                        structural_zone=_zone,
-                        reclaim_level=_reclaim_level,
-                        db_symbol=db_sym_15m,
-                        decision_id=_direct_decision_id,
-                        sleeve="",
-                        reservation_id=str(reservation_id or ""),
-                    )
-                    if _filled:
-                        record_day_decision(db_path, symbol, "FILLED", cycle_ts=as_of, closest=signal.setup)
-                        try:
-                            from backend.services.day_entry_reservations import consume_reservation
-
-                            consume_reservation(
-                                db_path,
-                                reservation_id=reservation_id,
-                                decision_id=str(signal.opportunity_id),
-                                symbol=norm,
-                                sleeve="DAY_V2",
-                            )
-                        except Exception:
-                            release_claim(db_path, reservation_id=reservation_id, decision_id=str(signal.opportunity_id), symbol=norm)
-                        logger.warning(
-                            "DAY_V2_SIGNAL symbol=%s setup=%s opp=%s anchor=%.6f target=%.6f zone=[%.6f,%.6f] reclaim=%.6f policy=%s bar_ts=%d",
-                            symbol,
-                            signal.setup,
-                            signal.opportunity_id,
-                            signal.structural_anchor,
-                            signal.target_price,
-                            float(_zone.zone_low),
-                            float(_zone.zone_high),
-                            _reclaim_level,
-                            "DAY_DIRECT_ENTRY_V1",
-                            int(signal.signal_bar_ts or 0),
-                        )
-                    else:
-                        _reject = str(getattr(self.engine, "last_buy_reject_reason", "") or "UNSPECIFIED")
-                        release_claim(
-                            db_path,
-                            reservation_id=reservation_id,
-                            decision_id=str(signal.opportunity_id),
-                            symbol=norm,
-                            engine_id="DAY_V2",
-                        )
-                        record_day_decision(
-                            db_path,
-                            symbol,
-                            f"SUBMIT_REJECTED:{_reject}",
-                            cycle_ts=as_of,
-                            closest=signal.setup,
-                            unmet=[
-                                f"exchange_code={_reject}",
-                                f"message={_reject}",
-                                f"symbol={symbol}",
-                                f"qty={float(qty):.8f}",
-                                f"price={ask_price:.8f}",
-                                f"notional={notional:.4f}",
-                                f"decision_id={_direct_decision_id}",
-                                f"opportunity_id={signal.opportunity_id}",
-                                f"bar_ts={int(signal.signal_bar_ts or 0)}",
-                            ],
-                        )
-                        logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s notional=%.4f", symbol, _reject, notional)
 
                 except Exception:
                     logger.warning("DAY_V2_SIGNAL_ERROR symbol=%s", symbol, exc_info=True)
 
+            if not candidates:
+                return
+            from backend.services.adaptive_learning import day_decision, ohlcv_quote, resolve_markouts
+            from backend.services.day_v2.ranking import rank_day_candidates
+            from backend.services.portfolio_engine import ESTIMATED_ROUNDTRIP_COST
+
+            resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts))
+            for cand in candidates:
+                sig = cand["signal"]
+                cand["adaptive"] = day_decision(db_path, cand["symbol"], sig.setup, sig.regime)
+            ranked = rank_day_candidates(candidates, list(DAY_V2_UNIVERSE), ESTIMATED_ROUNDTRIP_COST)
+            logger.info(
+                "DAY_V2_RANKED %s",
+                " ".join(f"{c['rank']['position']}:{c['symbol']}:{c['signal'].setup}:edge={c['rank']['executable_objective_edge']:.5f}" for c in ranked),
+            )
+            for cand in ranked:
+                try:
+                    await self._fund_day_v2_candidate(cand, db_path)
+                except Exception:
+                    logger.warning("DAY_V2_SIGNAL_ERROR symbol=%s", cand.get("symbol"), exc_info=True)
+
         except Exception:
             logger.warning("DAY_V2_PROCESS_ERROR", exc_info=True)
+
+    async def _fund_day_v2_candidate(self, cand: dict[str, Any], db_path: str) -> None:
+        """Size one ranked DAY V2 candidate from the remaining DAY sleeve and submit it."""
+        from backend.services.day_v2.decision_log import record_day_decision
+        from backend.services.day_v2.ranking import clamp_to_sleeve
+        from backend.services.two_engine_capital import compute_snapshot, symbol_marks
+
+        symbol = cand["symbol"]
+        norm = cand["norm"]
+        signal = cand["signal"]
+        _zone = cand["zone"]
+        _reclaim_level = cand["reclaim_level"]
+        ask_price = cand["ask_price"]
+        db_sym_15m = cand["db_symbol"]
+        as_of = cand["as_of"]
+        # Engine sizing, then clamped to what the DAY sleeve can still fund
+        # (open DAY lots and live reservations included). SCALP capital is never used.
+        atr_val = float(signal.atr or 0.0)
+        qty, _stop_price, _risk = self.engine.calculate_position_size(
+            symbol=norm,
+            equity=float(self.engine._total_equity or self.engine.cash_balance or 0),
+            atr=atr_val if atr_val > 0 else ask_price * 0.015,
+            current_price=ask_price,
+        )
+        sized_qty = float(qty)
+        adapt = cand.get("adaptive") or {}
+        size_mult = float(adapt.get("size_mult") or 1.0)
+        snap = compute_snapshot(
+            db_path,
+            float(getattr(self.engine, "_total_equity", 0) or 0),
+            float(getattr(self.engine, "_available_balance", 0) or 0),
+            getattr(self.engine, "open_positions", None) or {},
+            prices=symbol_marks(getattr(self.engine, "_position_mark_prices", None)),
+        )
+        day_remaining = float(snap.day.remaining_budget)
+        qty = clamp_to_sleeve(sized_qty * size_mult, ask_price, day_remaining)
+        notional = float(qty) * float(ask_price)
+        cand["rank"]["sized_notional"] = round(sized_qty * float(ask_price), 4)
+        cand["rank"]["day_sleeve_remaining"] = round(day_remaining, 4)
+        cand["rank"]["funded_notional"] = round(notional, 4)
+        if qty <= 0 or notional <= 0:
+            record_day_decision(
+                db_path,
+                symbol,
+                "REJECTED:ENGINE_BUDGET_EXHAUSTED" if sized_qty > 0 else "REJECTED:INSUFFICIENT_EXECUTABLE_CASH",
+                cycle_ts=as_of,
+                closest=signal.setup,
+                unmet=[
+                    "ZERO_SIZE",
+                    f"day_sleeve_remaining={day_remaining:.4f}",
+                    f"qty={float(qty):.8f}",
+                    f"notional={notional:.8f}",
+                    f"ask={ask_price:.8f}",
+                    f"atr={atr_val:.8f}",
+                    f"opportunity_id={signal.opportunity_id}",
+                ],
+            )
+            logger.warning("DAY_V2_ZERO_SIZE symbol=%s ask=%.6f atr=%.6f", symbol, ask_price, atr_val)
+            return
+
+        # Gate through _can_open_position (two-engine contract:
+        # DAY slots are engine-scoped; SCALP lots never count).
+        can_open, gate_reason = await self.engine._can_open_position(norm, notional, engine_id="DAY_V2")
+        if not can_open:
+            gate_label = "INSUFFICIENT_EXECUTABLE_CASH" if str(gate_reason).startswith("INSUFFICIENT_CASH") else str(gate_reason)
+            record_day_decision(db_path, symbol, f"REJECTED:{gate_label}", cycle_ts=as_of, closest=signal.setup, unmet=[str(gate_reason)])
+            logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s notional=%.4f", symbol, gate_reason, notional)
+            return
+
+        from backend.services.two_engine_claim import claim_symbol, release_claim
+
+        claimed, claim_reason, reservation_id = claim_symbol(
+            db_path,
+            norm,
+            "DAY_V2",
+            str(signal.opportunity_id),
+            float(notional),
+            positions=self.engine.open_positions,
+        )
+        if not claimed:
+            record_day_decision(db_path, symbol, claim_reason, cycle_ts=as_of, closest=signal.setup)
+            logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s", symbol, claim_reason)
+            return
+
+        # DAY direct live entry: a closed-15m setup that passed the hard gates
+        # proceeds straight to protected execution. No WAIT_DIP, no dip /
+        # rebound / retention bracket, no 5m confirmation, no TTL.
+        import uuid as _uuid
+
+        from backend.services.day_v2.live_entry import submit_day_v2_direct_entry
+
+        _direct_decision_id = str(_uuid.uuid4())
+        _filled = await submit_day_v2_direct_entry(
+            self.engine,
+            signal=signal,
+            ask_price=ask_price,
+            quantity=qty,
+            stop_price=float(_stop_price or 0.0),
+            structural_zone=_zone,
+            reclaim_level=_reclaim_level,
+            db_symbol=db_sym_15m,
+            decision_id=_direct_decision_id,
+            sleeve="",
+            reservation_id=str(reservation_id or ""),
+            rank=cand.get("rank"),
+            adaptive=cand.get("adaptive"),
+        )
+        if _filled:
+            record_day_decision(db_path, symbol, "FILLED", cycle_ts=as_of, closest=signal.setup)
+            try:
+                from backend.services.day_entry_reservations import consume_reservation
+
+                consume_reservation(
+                    db_path,
+                    reservation_id=reservation_id,
+                    decision_id=str(signal.opportunity_id),
+                    symbol=norm,
+                    sleeve="DAY_V2",
+                )
+            except Exception:
+                release_claim(db_path, reservation_id=reservation_id, decision_id=str(signal.opportunity_id), symbol=norm)
+            logger.warning(
+                "DAY_V2_SIGNAL symbol=%s setup=%s opp=%s anchor=%.6f target=%.6f zone=[%.6f,%.6f] reclaim=%.6f policy=%s bar_ts=%d",
+                symbol,
+                signal.setup,
+                signal.opportunity_id,
+                signal.structural_anchor,
+                signal.target_price,
+                float(_zone.zone_low),
+                float(_zone.zone_high),
+                _reclaim_level,
+                "DAY_DIRECT_ENTRY_V1",
+                int(signal.signal_bar_ts or 0),
+            )
+        else:
+            _reject = str(getattr(self.engine, "last_buy_reject_reason", "") or "UNSPECIFIED")
+            release_claim(
+                db_path,
+                reservation_id=reservation_id,
+                decision_id=str(signal.opportunity_id),
+                symbol=norm,
+                engine_id="DAY_V2",
+            )
+            record_day_decision(
+                db_path,
+                symbol,
+                f"SUBMIT_REJECTED:{_reject}",
+                cycle_ts=as_of,
+                closest=signal.setup,
+                unmet=[
+                    f"exchange_code={_reject}",
+                    f"message={_reject}",
+                    f"symbol={symbol}",
+                    f"qty={float(qty):.8f}",
+                    f"price={ask_price:.8f}",
+                    f"notional={notional:.4f}",
+                    f"decision_id={_direct_decision_id}",
+                    f"opportunity_id={signal.opportunity_id}",
+                    f"bar_ts={int(signal.signal_bar_ts or 0)}",
+                ],
+            )
+            logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s notional=%.4f", symbol, _reject, notional)
 
     # ------------------------------------------------------------------
     # SCALP V2 live entry loop
@@ -2071,9 +2112,38 @@ class PortfolioEngineIntegration:
         from backend.services.day_entry_reservations import release_orphan_reservations
 
         release_orphan_reservations(self.engine.db_path, now=cycle_ts)
+        from backend.services.adaptive_learning import ohlcv_quote, record_candidate, resolve_markouts, scalp_decision
+        from backend.services.portfolio_engine import ESTIMATED_ROUNDTRIP_COST
+
+        resolve_markouts(self.engine.db_path, lambda sym, ts: ohlcv_quote(self.engine.db_path, sym, ts))
         by_symbol = {str(row.get("symbol") or "").upper().replace("-", "").replace("/", ""): row for row in candidates}
         products = [str(s) for s in getattr(cfg, "products", [])] or list(by_symbol)
-        for sym_raw in products:
+
+        def _scalp_priority(sym_raw: str) -> float:
+            norm_key = sym_raw.upper().replace("-", "").replace("/", "")
+            row = by_symbol.get(norm_key)
+            code, _reason = classify_scalp_candidate(row)
+            if code != "ARMED" or not row:
+                return -1e9
+            setup_name = str(row.get("best_setup") or "SCALP_STRUCTURAL")
+            regime = str(row.get("regime") or row.get("market_regime") or "")
+            view = scalp_decision(self.engine.db_path, norm_key, setup_name, regime)
+            row["adaptive_decision"] = view
+            snap = row.get("snap")
+            ref_price = float(getattr(snap, "best_ask", 0) or getattr(snap, "mid_price", 0) or 0) if snap is not None else 0.0
+            record_candidate(
+                self.engine.db_path,
+                engine="SCALP_V2",
+                symbol=norm_key,
+                setup=setup_name,
+                regime=regime,
+                ref_price=ref_price,
+                roundtrip_cost=ESTIMATED_ROUNDTRIP_COST,
+                signaled=True,
+            )
+            return float(view["expected_edge"]) + 0.001 * float(view["confidence"])
+
+        for sym_raw in sorted(products, key=_scalp_priority, reverse=True):
             norm_key = sym_raw.upper().replace("-", "").replace("/", "")
             row = by_symbol.get(norm_key)
             norm = sym_raw.upper().replace("-", "/")
@@ -2128,6 +2198,9 @@ class PortfolioEngineIntegration:
                 )
                 notional = float(qty) * float(arm_price)
                 max_notional = float(cfg.scalp_live_max_notional)
+                view = (row or {}).get("adaptive_decision") or {}
+                qty *= float(view.get("size_mult") or 1.0)
+                notional = float(qty) * float(arm_price)
                 if notional > max_notional and arm_price > 0:
                     qty = max_notional / arm_price
                     notional = max_notional
@@ -2156,6 +2229,7 @@ class PortfolioEngineIntegration:
                     setup_name=setup_name,
                     opportunity_id=opp_id,
                     entry_authority=ENTRY_AUTHORITY_SCALP_V2_CONFIRMED,
+                    adaptive_decision=view or None,
                 )
                 if result is not None:
                     record_scalp_decision(self.engine.db_path, norm, "FILLED", "FILLED", cycle_ts=cycle_ts, detail=str(result.get("order_id") or ""))

@@ -1,7 +1,9 @@
 """DAY V2 live signal evaluation.
 
-Port of the deterministic signal detection logic from the qualifying
-event-driven replay (scripts/research/day_v2_replay.py @ a88479a).
+Deterministic setup detection, originally ported from the event-driven
+replay (scripts/research/day_v2_replay.py @ a88479a). BREAKOUT_CONTINUATION
+breaks the prior 20 closed bars' high; EXHAUSTION_MR is a long reversal after
+a downside momentum spike.
 
 Only closed OHLCV bars are consumed — no look-ahead. Returns DayV2Signal
 or None. The caller is responsible for ensuring the bar list is ordered
@@ -42,6 +44,23 @@ ENABLED_SETUPS: frozenset[str] = frozenset(
         SETUP_EXHAUSTION_MR,
     }
 )
+
+BREAKOUT_LOOKBACK_BARS = 20
+BREAKOUT_BUFFER = 1.001
+EXHAUSTION_SPIKE_PCT = 0.02
+
+
+def prior_structure_high(highs: list[float], lookback: int = BREAKOUT_LOOKBACK_BARS) -> float | None:
+    """Highest high of the ``lookback`` closed bars before the last (signal) bar."""
+    if len(highs) < lookback + 1:
+        return None
+    return max(highs[-(lookback + 1) : -1])
+
+
+def prior_structure_low(lows: list[float], lookback: int = BREAKOUT_LOOKBACK_BARS) -> float | None:
+    if len(lows) < lookback + 1:
+        return None
+    return min(lows[-(lookback + 1) : -1])
 
 
 @dataclass(frozen=True)
@@ -207,8 +226,8 @@ def _detect_setup(
     atr = _atr(highs_15m, lows_15m, closes_15m, 14)
     bb = _bb_pct(closes_15m, 20, 2.0)
     sma20 = _sma(closes_15m, 20)
-    high20 = max(highs_15m[-20:]) if len(highs_15m) >= 20 else None
     low20 = min(lows_15m[-20:]) if len(lows_15m) >= 20 else None
+    prior_high = prior_structure_high(highs_15m)
 
     if rsi is None or atr is None or bb is None or sma20 is None:
         return None
@@ -254,9 +273,10 @@ def _detect_setup(
         return (SETUP_RANGE_BOUNCE, anchor, target, regime, h1_bullish)
 
     # 3. BREAKOUT_CONTINUATION
-    # Decisive close above 20-bar high, two consecutive up bars
-    if regime in ("bull", "neutral") and high20 is not None and c0 > high20 * 1.001 and rsi < 72 and c0 > b1c > b2c and SETUP_BREAKOUT_CONTINUATION in ENABLED_SETUPS:
-        anchor = high20 * 0.995
+    # Decisive close above the high of the 20 closed bars BEFORE the signal bar,
+    # two consecutive up bars. The signal bar is excluded from the level it breaks.
+    if regime in ("bull", "neutral") and prior_high is not None and c0 > prior_high * BREAKOUT_BUFFER and rsi < 72 and c0 > b1c > b2c and SETUP_BREAKOUT_CONTINUATION in ENABLED_SETUPS:
+        anchor = prior_high * 0.995
         target = c0 + 2.0 * atr
         return (SETUP_BREAKOUT_CONTINUATION, anchor, target, regime, h1_bullish)
 
@@ -268,11 +288,12 @@ def _detect_setup(
         if target > c0 * 1.003:
             return (SETUP_VWAP_REVERSION, anchor, target, regime, h1_bullish)
 
-    # 5. EXHAUSTION_MR
-    # Prior spike up (>2%), now retracing to SMA20
+    # 5. EXHAUSTION_MR — long mean reversion after a downside momentum spike.
+    # The prior bar closed >= 2% below the bar before it with RSI already weak
+    # (capitulation); the signal bar reverses up. Target is the SMA20 mean above.
     closes_prior = closes_15m[:-1]
     rsi_prior = _rsi(closes_prior, 14) if len(closes_prior) >= 15 else None
-    if rsi_prior is not None and rsi_prior < 45 and b1c > b2c * 1.02 and c0 < b1c and rsi < 50 and SETUP_EXHAUSTION_MR in ENABLED_SETUPS:
+    if rsi_prior is not None and rsi_prior < 45 and b1c < b2c * (1.0 - EXHAUSTION_SPIKE_PCT) and c0 > b1c and rsi < 50 and SETUP_EXHAUSTION_MR in ENABLED_SETUPS:
         anchor = l0 * 0.997
         target = sma20
         if target > c0 * 1.002:
@@ -376,8 +397,8 @@ def explain_no_signal(
     sma20 = _sma(closes, 20)
     if rsi is None or atr is None or bb is None or sma20 is None:
         return {"closest": "missing_stale_data", "unmet": ["indicator_unavailable"], "checks": []}
-    high20 = max(highs[-20:]) if len(highs) >= 20 else None
     low20 = min(lows[-20:]) if len(lows) >= 20 else None
+    prior_high = prior_structure_high(highs)
     ts0 = _compare_ts(b0)
     regime = "neutral"
     if bars_4h:
@@ -432,8 +453,8 @@ def explain_no_signal(
                 item
                 for item, ok in (
                     ("regime_not_bull_or_neutral", regime in ("bull", "neutral")),
-                    ("no_high20", high20 is not None),
-                    ("close_not_above_20bar_high", high20 is not None and c0 > high20 * 1.001),
+                    ("no_prior_high20", prior_high is not None),
+                    ("close_not_above_prior_20bar_high", prior_high is not None and c0 > prior_high * BREAKOUT_BUFFER),
                     ("rsi_not_below_72", rsi < 72),
                     ("not_two_up_bars", c0 > b1c > b2c),
                 )
@@ -460,8 +481,8 @@ def explain_no_signal(
                 item
                 for item, ok in (
                     ("prior_rsi_unavailable_or_not_below_45", (_rsi(closes[:-1], 14) or 100) < 45),
-                    ("prior_bar_not_spike", b1c > b2c * 1.02),
-                    ("not_retracing", c0 < b1c),
+                    ("prior_bar_not_downside_spike", b1c < b2c * (1.0 - EXHAUSTION_SPIKE_PCT)),
+                    ("not_reversing_up", c0 > b1c),
                     ("rsi_not_below_50", rsi < 50),
                     ("target_not_above_close", sma20 > c0 * 1.002),
                 )

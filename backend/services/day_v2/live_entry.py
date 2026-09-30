@@ -1,7 +1,7 @@
 """DAY V2 live entry.
 
-Live authority is ``submit_day_v2_direct_entry``: a qualified setup is sent
-immediately through ``execute_buy_fifo`` (DAY_V2_CONFIRMED). There is no
+Live authority is ``submit_day_v2_direct_entry``: a detected setup that passed
+the hard safety gates is sent immediately through ``execute_buy_fifo`` (DAY_V2_CONFIRMED). There is no
 WAIT_DIP, dip/rebound bracket, 5m confirmation or entry TTL.
 """
 
@@ -41,8 +41,10 @@ async def submit_day_v2_direct_entry(
     decision_id: str = "",
     sleeve: str = "",
     reservation_id: str = "",
+    rank: dict[str, Any] | None = None,
+    adaptive: dict[str, Any] | None = None,
 ) -> dict | None:
-    """Submit a DAY V2 live BUY immediately after a qualified setup.
+    """Submit a DAY V2 live BUY immediately after a detected setup.
 
     No WAIT_DIP, no dip/rebound/retention bracket, no 5m confirmation, no
     entry TTL. Hard safety is identical to the trailing-submit path: the
@@ -60,6 +62,7 @@ async def submit_day_v2_direct_entry(
     from backend.config.day_entry_execution import ENTRY_AUTHORITY_DAY_V2_CONFIRMED
     from backend.services.day_trailing_buy import _pre_submit_safety
     from backend.services.day_v2.winner_contract import DAY_EXIT_CONTRACT_RUNNER
+    from backend.services.strategy_version import version_provenance
 
     symbol = str(signal.symbol or "")
     ask = float(ask_price or 0.0)
@@ -129,6 +132,7 @@ async def submit_day_v2_direct_entry(
     exp.day_atr_1h = float(getattr(signal, "atr_1h", 0.0) or 0.0)
     exp.day_objective_structural = float(getattr(signal, "objective_structural", 0.0) or 0.0)
     exp.day_exit_contract = DAY_EXIT_CONTRACT_RUNNER
+    exp.adaptive_decision = dict(adaptive or {})
     exp.regime = str(signal.regime or "unknown")
     exp.decision_id = did
     exp.ai_confidence = 1.0
@@ -136,7 +140,7 @@ async def submit_day_v2_direct_entry(
         "entry_policy_version": DAY_DIRECT_ENTRY_V1,
         "model_version": "day_deterministic_v1",
         "selected_action": f"BUY_{symbol}",
-        "selection_reason": "QUALIFIED_SETUP_DIRECT_ENTRY",
+        "selection_reason": "SETUP_DIRECT_ENTRY",
         "strategy": "day",
         "setup": str(signal.setup or ""),
         "regime": str(signal.regime or ""),
@@ -151,6 +155,8 @@ async def submit_day_v2_direct_entry(
         "atr_1h": float(getattr(signal, "atr_1h", 0.0) or 0.0),
         "objective_structural": float(getattr(signal, "objective_structural", 0.0) or 0.0),
         "move_potential_atr_1h": float(getattr(signal, "move_potential", 0.0) or 0.0),
+        **version_provenance(DAY_V2_ENGINE_ID),
+        "rank": dict(rank or {}),
     }
 
     from backend.services.portfolio_engine import normalize_symbol

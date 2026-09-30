@@ -1349,8 +1349,15 @@ def _ensure_scalp_outcomes_table(db_path: str) -> None:
             s = stmt.strip()
             if s:
                 conn.execute(s)
+        cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(scalp_learning_outcomes)")}
+        for col in _SCALP_VERSION_COLUMNS:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE scalp_learning_outcomes ADD COLUMN {col} TEXT DEFAULT ''")
         conn.commit()
     _scalp_outcomes_tables_ready.add(key)
+
+
+_SCALP_VERSION_COLUMNS: tuple[str, ...] = ("strategy_version", "entry_contract_version", "exit_contract_version")
 
 
 def ingest_scalp_outcomes(db_path: str = DATABASE_PATH) -> dict[str, int]:
@@ -1407,8 +1414,9 @@ def ingest_scalp_outcomes(db_path: str = DATABASE_PATH) -> dict[str, int]:
                         (ingested_at, source_id, symbol, setup_name,
                          entry_timestamp, exit_timestamp, entry_price, exit_price,
                          quantity, fees_paid, slippage_cost,
-                         net_pnl_usd, net_pnl_pct, hold_seconds, exit_reason)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         net_pnl_usd, net_pnl_pct, hold_seconds, exit_reason,
+                         strategy_version, entry_contract_version, exit_contract_version)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         """,
                         (
                             _now_iso(),
@@ -1426,6 +1434,7 @@ def ingest_scalp_outcomes(db_path: str = DATABASE_PATH) -> dict[str, int]:
                             float(row["net_profit_pct"] or 0),
                             float(row["hold_seconds"] or 0),
                             str(row["close_reason"] or ""),
+                            *(str(extra.get(col) or "") for col in _SCALP_VERSION_COLUMNS),
                         ),
                     )
                     counters["ingested"] += 1

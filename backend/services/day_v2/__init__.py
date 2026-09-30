@@ -1,7 +1,7 @@
-"""DAY V2 shadow-only package.
+"""DAY V2 live engine package.
 
-No code in this package may place, cancel, or mutate live orders, positions,
-cash balances, or accounting. All engines default to SHADOW or DISABLED.
-Only LEGACY_DAY_LIVE retains existing production authority and it is never
-instantiated from this package.
+Five deterministic setups on closed 15m bars (live_signal), same-bar ranking
+(ranking), direct live entry through execute_buy_fifo (live_entry), and the
+structure-runner exit (live_exit_evaluator / winner_contract). This is the only
+DAY entry, ownership and exit path.
 """

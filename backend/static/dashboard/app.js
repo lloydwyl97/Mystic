@@ -3895,8 +3895,34 @@ function drawCanonicalCandles(candles) {
     });
 }
 
+function renderVersionPerformance(data) {
+    const body = document.getElementById("version-perf-body");
+    if (!body || !data || !data.engines) return;
+    const note = document.getElementById("version-adaptive-note");
+    if (note) note.textContent = data.adaptive_state_version ? "Adaptive state " + data.adaptive_state_version + " is read by the next DAY and SCALP decision. Counts do not gate trading." : "";
+    const money = (v) => (v === null || v === undefined ? "--" : (v >= 0 ? "+$" : "-$") + Math.abs(v).toFixed(2));
+    const rows = [];
+    Object.keys(data.engines).forEach(function (engine) {
+        const e = data.engines[engine];
+        [["CURRENT", e.current, e.strategy_version + (e.current_version_start_utc ? " since " + e.current_version_start_utc.slice(0, 16) + "Z" : "")], ["LEGACY", e.legacy, "mixed earlier versions"]].forEach(function (item) {
+            const s = item[1] || {};
+            rows.push(
+                "<tr><td>" + escapeHtml(engine) + "</td><td>" + item[0] + "</td><td>" + escapeHtml(item[2]) + "</td><td>" + (s.round_trips || 0) + "</td><td>" + (s.wins || 0) + "/" + (s.losses || 0) + "</td><td>" + money(s.net_usd) + "</td><td>" + (s.profit_factor === null || s.profit_factor === undefined ? "--" : s.profit_factor.toFixed(2)) + "</td><td>" + money(s.expectancy_usd) + "</td><td>" + money(s.avg_win_usd) + "</td><td>" + money(s.avg_loss_usd) + "</td></tr>"
+            );
+        });
+    });
+    body.innerHTML = rows.join("");
+}
+
+async function loadVersionPerformance() {
+    const result = await fetchEndpoint("/api/portfolio-engine/performance/by-version");
+    if (result.ok && result.data && result.data.data) renderVersionPerformance(result.data.data);
+}
+
 if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
 } else {
     init();
 }
+loadVersionPerformance();
+setInterval(loadVersionPerformance, 60000);

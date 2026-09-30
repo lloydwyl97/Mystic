@@ -212,7 +212,7 @@ def test_migration_is_idempotent():
         assert "scalp_opportunity_id" in cols_pt
         assert "engine_id" in cols_ti
         assert "scalp_opportunity_id" in cols_ti
-        assert "day_v2_shadow_observations" in tables
+        assert "day_v2_shadow_observations" not in tables
     finally:
         from pathlib import Path
 

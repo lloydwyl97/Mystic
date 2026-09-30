@@ -344,25 +344,6 @@ start_ai_context() {
 # binance_scalp.runner is now in LEGACY_PATTERNS and is stopped by
 # stop_legacy_processes on every core restart.
 
-start_checkpoint_monitor() {
-    # Read-only 100-trade SCALP V2 checkpoint monitor.
-    # PID-locked singleton: a second invocation exits immediately.
-    if refuse_duplicate_or_collapse "scalp_v2_checkpoint_monitor.py" "SCALP V2 Checkpoint Monitor"; then
-        return 0
-    fi
-    echo "Starting SCALP V2 Checkpoint Monitor..."
-    nohup "$PYTHON" scripts/scalp_v2_checkpoint_monitor.py --poll 120 \
-        > /home/mystic/mystic/logs/scalp_v2_monitor.log 2>&1 9>&- &
-    # Monitor is read-only and non-critical — do not gate startup on it
-    sleep 1
-    local n
-    n="$(process_count "scalp_v2_checkpoint_monitor.py")"
-    if [ "$n" -ge 1 ]; then
-        echo "OK: SCALP V2 Checkpoint Monitor started"
-    else
-        echo "WARN: SCALP V2 Checkpoint Monitor did not start (non-critical, continuing)"
-    fi
-}
 
 stop_live_md() { stop_by_pattern "start_live_market_data.py"; }
 stop_signal() { stop_by_pattern "start_ai_signal_generator.py"; }
@@ -434,14 +415,12 @@ run_core_stack() {
     start_learning || return 1
     # SCALP V2 live order authority is built into the portfolio engine (execute_buy_fifo).
     # The old paper binance_scalp.runner is fully retired (2026-09-22).
-    # 100-trade checkpoint monitor: read-only, PID-locked singleton.
-    start_checkpoint_monitor
 
     echo ""
     echo "=========================================="
     echo "MYSTIC ${label} STACK STARTED (SCALP V2 + DAY V2 live)"
     echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8000/dashboard/"
-    echo "Services: Backend + LiveMD + Signal + Portfolio + Context + Learning + Monitor"
+    echo "Services: Backend + LiveMD + Signal + Portfolio + Context + Learning"
     echo "SCALP V2: live order authority via portfolio engine. Paper scalp removed."
     echo "DAY V2:   live entry authority via direct entry (submit_day_v2_direct_entry)."
     echo "Ensure .env has EXTERNAL_SUPERVISOR_MODE=true"
