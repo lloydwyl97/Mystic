@@ -267,3 +267,46 @@ def decide_account_failsafe(
         "threshold": str(threshold) if threshold is not None else None,
         "snapshot": snap,
     }
+
+
+def persist_canonical_nle_snapshot(db_path: str, snapshot: dict[str, Any]) -> None:
+    """Share the producer snapshot with the API process. One row, overwritten."""
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS canonical_nle_snapshot (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO canonical_nle_snapshot(id, payload, updated_at) VALUES (1, ?, datetime('now')) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at",
+            (json.dumps(snapshot),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_canonical_nle_snapshot(db_path: str) -> dict[str, Any] | None:
+    """Return the last snapshot written by the trading process, or None."""
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        row = conn.execute("SELECT payload FROM canonical_nle_snapshot WHERE id=1").fetchone()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None
+    loaded = json.loads(row[0])
+    return loaded if isinstance(loaded, dict) else None

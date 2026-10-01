@@ -2457,7 +2457,7 @@ async def get_operator_status() -> dict[str, Any]:
         sqlite_data = await _read_operator_status_from_sqlite()
         if sqlite_data:
             status.update(sqlite_data)
-            from backend.services.canonical_failsafe_equity import decide_account_failsafe
+            from backend.services.canonical_failsafe_equity import decide_account_failsafe, load_canonical_nle_snapshot
             from backend.services.circuit_breaker_service import read_persisted_entry_control
             from backend.services.operator_account_status import account_operator_labels
 
@@ -2469,7 +2469,8 @@ async def get_operator_status() -> dict[str, Any]:
             status["equity_circuit_breaker_active"] = bool(persisted.get("equity_circuit_breaker_active"))
             status["daily_loss_freeze_active"] = bool(persisted.get("daily_loss_freeze_active"))
             status["entry_control_updated_at"] = persisted.get("updated_at")
-            fs = decide_account_failsafe(engine._canonical_nle_snapshot, principal)
+            nle_snap = engine._canonical_nle_snapshot or load_canonical_nle_snapshot(DATABASE_PATH)
+            fs = decide_account_failsafe(nle_snap, principal)
             if fs.get("tripped"):
                 reason = f"ACCOUNT_FAILSAFE equity=${float(fs.get('nle') or 0):.2f} principal=${principal:.2f} — MANUAL POSITION REVIEW REQUIRED"
                 status["kill_switch"] = "PAUSE_BUYS"

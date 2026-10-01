@@ -280,10 +280,13 @@ class TestDayV2ExitEvaluator:
             assert result["reason"] != "DAY_V2_STRUCTURAL_INVALIDATION"
 
     # Role 3: Structure-runner ratchet (pre-runner position: atr_1h = 2.5 x 15m ATR = 625)
-    def test_runner_ratchet_fires_after_one_atr_1h_expansion(self):
-        highest = 50000.0 + 625.0 * 1.2  # proved itself (>= 1x 1h ATR)
+    def test_runner_ratchet_fires_after_trail_locks_profit(self):
+        early = 50000.0 + 625.0 * 1.2
+        early_trail = early - 1.5 * 625.0
+        assert self._call(highest_price=early, current_price=early_trail - 1.0, bar_low=50000.0) is None
+        highest = 50000.0 * 1.0006 + 1.5 * 625.0 + 1.0
         stop = highest - 1.5 * 625.0
-        result = self._call(highest_price=highest, current_price=stop - 1.0, bar_low=50000.0)
+        result = self._call(highest_price=highest, current_price=stop - 1.0, bar_low=50000.0, setup="HTF_TREND_PULLBACK", objective_structural=50000.0)
         assert result is not None
         assert result["reason"] == "DAY_V2_WINNER_PROTECTION"
 
@@ -305,7 +308,7 @@ class TestDayV2ExitEvaluator:
         assert result["reason"] == "DAY_V2_OBJECTIVE_COMPLETE"
 
     # Role 3: Time expiration
-    def test_time_expiration_fires_when_at_ceiling_and_negative(self):
+    def test_time_expiration_does_not_sell(self):
         from backend.services.day_v2.config import DAY_V2_MAX_HOLD_MINUTES
 
         result = self._call(
@@ -314,8 +317,7 @@ class TestDayV2ExitEvaluator:
             bar_low=49950.0,
             highest_price=49990.0,
         )
-        assert result is not None
-        assert result["reason"] == "DAY_V2_TIME_EXPIRATION"
+        assert result is None
 
     def test_time_expiration_does_not_fire_when_profitable(self):
         from backend.services.day_v2.config import DAY_V2_MAX_HOLD_MINUTES
@@ -473,7 +475,7 @@ class TestClosedBarAuthority:
             bar_low=catastro_px - 10,  # low went below threshold
             highest_price=entry,
             atr_at_entry=atr,
-            structural_anchor=entry * 0.97,
+            structural_anchor=49600.0,
             target_price=entry * 1.05,
             entry_time=time.time() - 30 * 60,
             estimated_roundtrip_cost=0.0006,

@@ -136,5 +136,8 @@ def classify_scalp_candidate(row: dict | None) -> tuple[str, str]:
     if row.get("snap") is None and not row.get("entry_eligible") and not blob.strip() and not row.get("soft_reason"):
         return "REJECTED:BOOK_STALE", "BOOK_STALE"
     if not row.get("entry_eligible"):
+        if blob.strip():
+            code = blob.split()[0][:64]
+            return f"REJECTED:{code}", code
         return "REJECTED:ENTRY_NOT_ELIGIBLE", "ENTRY_NOT_ELIGIBLE"
     return "ARMED", "ARMED"

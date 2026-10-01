@@ -310,6 +310,10 @@ def test_o_external_event_never_a_manual_sell(tmp_path):
                 esd.record_external_balance_event(c, symbol="BTC/USDT", quantity=1e-5, event_class=bad, source="t")
         assert esd.record_external_balance_event(c, symbol="BTC/USDT", quantity=1e-5, event_class=esd.EVENT_CONVERSION, source="t", source_trade_id="a", venue_ref="1")
         assert not esd.record_external_balance_event(c, symbol="BTC/USDT", quantity=1e-5, event_class=esd.EVENT_CONVERSION, source="t", source_trade_id="a", venue_ref="1")
+        names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "paper_trades" not in names
+        assert "scalp_learning_outcomes" not in names
+        assert "trade_learning_outcomes" not in names
 
 
 async def _phantom_engine(tmp_path, rows):

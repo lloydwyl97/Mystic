@@ -117,12 +117,18 @@ def test_move_potential_is_not_an_entry_gate():
 # --- winner ratchet -----------------------------------------------------------
 
 
-def test_ratchet_arms_only_after_one_atr_1h():
+def test_ratchet_arms_only_when_trail_locks_profit():
     below = runner_stop(entry_price=ENTRY, highest_price=ENTRY + 0.99 * ATR1H, atr_1h=ATR1H, objective=103.0, estimated_roundtrip_cost=COST)
-    at = runner_stop(entry_price=ENTRY, highest_price=ENTRY + RUNNER_ACTIVATION_ATR_1H * ATR1H, atr_1h=ATR1H, objective=103.0, estimated_roundtrip_cost=COST)
+    at_activation = runner_stop(entry_price=ENTRY, highest_price=ENTRY + RUNNER_ACTIVATION_ATR_1H * ATR1H, atr_1h=ATR1H, objective=103.0, estimated_roundtrip_cost=COST)
     assert below["activated"] is False and below["stop"] == 0.0
-    assert at["activated"] is True
-    assert at["stop"] >= ENTRY * (1 + COST)
+    # Activation distance is 1.0 ATR and the trail is 1.5 ATR, so the first
+    # arming high still computes a trail below entry. That must not sell.
+    assert at_activation["activated"] is False and at_activation["stop"] == 0.0
+    hwm = ENTRY * (1 + COST) + RUNNER_TRAIL_ATR_1H * ATR1H + 0.01
+    armed = runner_stop(entry_price=ENTRY, highest_price=hwm, atr_1h=ATR1H, objective=103.0, estimated_roundtrip_cost=COST)
+    assert armed["activated"] is True
+    assert armed["stop"] == pytest.approx(hwm - RUNNER_TRAIL_ATR_1H * ATR1H)
+    assert armed["stop"] > ENTRY * (1 + COST)
 
 
 def test_ratchet_only_moves_up():
@@ -150,25 +156,29 @@ def test_ratchet_exit_and_objective_labels():
     assert _exit(highest_price=hi, current_price=stop - 0.01)["reason"] == "DAY_V2_OBJECTIVE_COMPLETE"
 
 
-def test_ratchet_never_below_break_even_after_costs():
+def test_winner_protection_does_not_substitute_break_even():
     hi = ENTRY + 1.05 * ATR1H
-    dec = _exit(highest_price=hi, current_price=ENTRY * (1 + COST) - 0.001)
-    assert dec is not None and dec["reason"] == "DAY_V2_WINNER_PROTECTION"
+    state = runner_stop(entry_price=ENTRY, highest_price=hi, atr_1h=ATR1H, objective=103.0, estimated_roundtrip_cost=COST)
+    assert state["activated"] is False and state["stop"] == 0.0
+    assert _exit(highest_price=hi, current_price=ENTRY * (1 + COST) - 0.001) is None
 
 
-def test_pre_runner_position_uses_scaled_15m_atr():
+def test_pre_runner_position_does_not_scratch_at_break_even():
     atr1h = LEGACY_ATR_1H_PER_ATR_15M * ATR15
     hi = ENTRY + 1.01 * atr1h
     dec = _exit(atr_1h_at_entry=0.0, objective_structural=0.0, highest_price=hi, current_price=hi - RUNNER_TRAIL_ATR_1H * atr1h - 0.01)
-    assert dec is not None and dec["reason"] == "DAY_V2_WINNER_PROTECTION"
+    assert dec is None
 
 
 # --- loss protection unchanged -----------------------------------------------
 
 
-def test_catastrophic_stop_still_fires_at_three_atr_15m():
-    assert _exit(bar_low=ENTRY - 3.0 * ATR15 - 0.01, current_price=99.0)["reason"] == "DAY_V2_CATASTROPHIC_PROTECTION"
-    assert _exit(bar_low=ENTRY - 3.0 * ATR15 + 0.05, current_price=99.0) is None
+def test_catastrophic_stop_still_fires_outside_the_anchor():
+    # Anchor 98.5 plus one 15m ATR (0.4) is farther than 3x ATR (1.2).
+    outside = ENTRY - ((ENTRY - 98.5) + ATR15) - 0.01
+    inside = ENTRY - 3.0 * ATR15 - 0.01
+    assert _exit(bar_low=outside, current_price=outside)["reason"] == "DAY_V2_CATASTROPHIC_PROTECTION"
+    assert _exit(bar_low=inside, current_price=99.0) is None
 
 
 def test_thesis_invalidation_still_fires():
@@ -185,12 +195,11 @@ def test_time_stop_waits_a_day_trader_hold():
     assert early is None
 
 
-def test_time_stop_only_on_unarmed_net_negative():
+def test_clock_cannot_sell_a_structurally_valid_day_trade():
     late = time.time() - (DAY_V2_MAX_HOLD_MINUTES + 5) * 60
-    assert _exit(current_price=99.9, entry_time=late)["reason"] == "DAY_V2_TIME_EXPIRATION"
+    assert _exit(current_price=99.9, entry_time=late) is None
     assert _exit(current_price=100.3, entry_time=late) is None
-    armed_hi = ENTRY + 1.2 * ATR1H
-    assert _exit(current_price=armed_hi - 0.1, highest_price=armed_hi, entry_time=time.time() - 900 * 60) is None
+    assert _exit(current_price=99.9, bar_low=99.5, highest_price=100.2, entry_time=time.time() - 900 * 60, structural_anchor=98.5) is None
 
 
 # --- universe / slots ---------------------------------------------------------
@@ -264,3 +273,83 @@ def test_scalp_net_edge_safety_is_a_hard_block():
     src = inspect.getsource(protected_preflight)
     assert protected_preflight.NET_EDGE_BELOW_MIN == "NET_EDGE_BELOW_MIN"
     assert "expected_net <= 0 or expected_net < econ.min_net_edge_pct" in src
+
+
+def test_observed_day_trades_do_not_scratch_at_break_even():
+    cost = 0.00066
+    sol = runner_stop(entry_price=117.67, highest_price=119.59, atr_1h=1.4986, objective=120.67, estimated_roundtrip_cost=cost, trail_mult=0.949, activation_mult=1.25)
+    eth_2702 = runner_stop(entry_price=2682.21, highest_price=2698.795, atr_1h=11.476, objective=2737.68, estimated_roundtrip_cost=cost)
+    assert sol["activated"] is False and sol["stop"] == 0.0
+    assert eth_2702["activated"] is False and eth_2702["stop"] == 0.0
+    eth_2696 = runner_stop(entry_price=2699.05, highest_price=2721.9, atr_1h=13.6686, objective=2726.39, estimated_roundtrip_cost=cost)
+    trail_2696 = 2721.9 - 1.5 * 13.6686
+    assert trail_2696 > 2699.05 * (1 + cost)
+    assert eth_2696["activated"] is True
+    assert eth_2696["stop"] == pytest.approx(trail_2696)
+    btc = runner_stop(entry_price=83567.12, highest_price=84098.2, atr_1h=296.11, objective=84159.0, estimated_roundtrip_cost=cost, trail_mult=0.806, activation_mult=1.25)
+    trail_2704 = 84098.2 - 1.5 * 0.806 * 296.11
+    assert btc["activated"] is True
+    assert btc["stop"] == pytest.approx(trail_2704)
+    assert btc["stop"] > 83567.12 * (1 + cost)
+
+
+def test_adaptive_multipliers_cannot_arm_a_below_cost_trail():
+    scratch = runner_stop(entry_price=100.0, highest_price=101.0, atr_1h=1.0, objective=110.0, estimated_roundtrip_cost=0.00066, activation_mult=0.80, trail_mult=1.20)
+    assert scratch["activated"] is False
+    hwm = 100.0 * 1.00066 + 1.5 * 0.80 + 0.01
+    locked = runner_stop(entry_price=100.0, highest_price=hwm, atr_1h=1.0, objective=110.0, estimated_roundtrip_cost=0.00066, activation_mult=1.25, trail_mult=0.80)
+    assert locked["activated"] is True
+    assert locked["stop"] > 100.0 * 1.00066
+    later = runner_stop(entry_price=100.0, highest_price=hwm + 1.0, atr_1h=1.0, objective=110.0, estimated_roundtrip_cost=0.00066, activation_mult=1.25, trail_mult=0.80)
+    assert later["stop"] >= locked["stop"]
+
+
+def test_quiet_15m_atr_cannot_front_run_the_structural_anchor():
+    from backend.services.day_v2.live_exit_evaluator import catastrophic_threshold_price
+
+    threshold = catastrophic_threshold_price(1.505, 0.00380, 1.4939925)
+    assert threshold < 1.4939925
+    assert threshold == pytest.approx(1.505 - ((1.505 - 1.4939925) + 0.00380))
+    quiet = _exit(
+        entry_price=1.505,
+        current_price=1.4932,
+        bar_low=1.4932,
+        highest_price=1.50995,
+        atr_at_entry=0.00380,
+        structural_anchor=1.4939925,
+        atr_1h_at_entry=0.009586,
+        entry_time=time.time() - 60 * 60,
+    )
+    assert quiet is not None
+    assert quiet["reason"] == "DAY_V2_STRUCTURAL_INVALIDATION"
+    hard = _exit(
+        entry_price=1.505,
+        current_price=1.4900,
+        bar_low=1.4900,
+        highest_price=1.50995,
+        atr_at_entry=0.00380,
+        structural_anchor=1.4939925,
+        atr_1h_at_entry=0.009586,
+        entry_time=time.time() - 60 * 60,
+    )
+    assert hard["reason"] == "DAY_V2_CATASTROPHIC_PROTECTION"
+    assert catastrophic_threshold_price(100.0, 0.4, 0.0) == pytest.approx(98.8)
+
+
+def test_scalp_soft_opinions_do_not_veto_and_history_is_market_data():
+    from backend.services.binance_scalp.momentum_tracker import MomentumDiagnostics
+    from backend.services.binance_scalp.scalp_arm_blocker import arm_blocked
+    from backend.services.binance_scalp.scalp_candidate_ranking import HARD_REJECT_REASONS
+    from backend.services.scalp_v2.decision_log import classify_scalp_candidate
+
+    soft = {"NOT_NEAR_SUPPORT", "NO_REJECTION_WICK", "WEAK_REJECTION_WICK", "MOMENTUM_NOT_FLIPPED", "RANGE_TOO_WIDE", "REGIME_BLOCKED"}
+    assert soft.isdisjoint(HARD_REJECT_REASONS)
+    hard = {"SPREAD_TOO_WIDE", "DEPTH_OR_IMPACT_FAIL", "NO_EXECUTABLE_NET_EDGE", "NO_EXECUTABLE_EDGE_ESTIMATE", "INSUFFICIENT_BARS", "INSUFFICIENT_HISTORY", "STALE_DATA"}
+    assert hard <= HARD_REJECT_REASONS
+    assert classify_scalp_candidate({"entry_eligible": True, "hard_block": None, "soft_reason": "NOT_NEAR_SUPPORT"})[0] == "ARMED"
+    assert classify_scalp_candidate({"entry_eligible": False, "hard_block": "NO_EXECUTABLE_NET_EDGE"})[0] == "REJECTED:NO_EXECUTABLE_NET_EDGE"
+    assert classify_scalp_candidate({"entry_eligible": False, "hard_block": "INSUFFICIENT_HISTORY"})[0] == "REJECTED:INSUFFICIENT_HISTORY"
+    assert "insufficient_windows" in inspect.getsource(MomentumDiagnostics)
+    blocked, _reason, stats = arm_blocked("ZZZUSDT", "range_bounce_scalp", db_path=":memory:")
+    assert blocked is False
+    assert int(stats.get("n") or 0) == 0

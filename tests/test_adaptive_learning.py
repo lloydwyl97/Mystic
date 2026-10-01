@@ -98,8 +98,8 @@ def test_g_h_ratchet_never_loosens_and_hard_stops_stay():
     dec = evaluate_day_v2_exit(
         engine_id="DAY_V2",
         entry_price=100.0,
-        current_price=98.0,
-        bar_low=98.0,
+        current_price=96.5,
+        bar_low=96.5,
         highest_price=100.0,
         atr_at_entry=0.4,
         structural_anchor=97.0,

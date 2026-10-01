@@ -24023,6 +24023,12 @@ class PortfolioEngine:
             source=source,
         )
         self._canonical_nle_snapshot = snap
+        try:
+            from backend.services.canonical_failsafe_equity import persist_canonical_nle_snapshot
+
+            persist_canonical_nle_snapshot(self.db_path, snap)
+        except Exception as exc:
+            logger.warning("CANONICAL_NLE_PERSIST_FAILED err=%s", exc)
         return snap
 
     async def run_trading_circuit_breaker_check(self) -> dict[str, Any]:

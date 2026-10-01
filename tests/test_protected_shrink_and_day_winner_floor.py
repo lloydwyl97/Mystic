@@ -234,12 +234,13 @@ def _exit(highest: float, current: float, atr: float = 1.2, cost: float = 0.0006
     )
 
 
-def test_winner_floor_exits_at_break_even_instead_of_riding_to_a_loss():
-    # Pre-runner position: 1h ATR = 2.5 x 1.2 = 3.0. Armed at MFE 3.1 (>= 1x 1h ATR);
-    # raw trail 103.1 - 4.5 = 98.6 is lifted to break-even 100.06.
-    result = _exit(highest=103.1, current=100.05)
-    assert result is not None and result["reason"] == "DAY_V2_WINNER_PROTECTION"
-    assert "stop=100.060000" in result["detail"]
+def test_winner_floor_does_not_substitute_break_even():
+    # Pre-runner position: 1h ATR = 2.5 x 1.2 = 3.0. At MFE 3.1 the wide trail
+    # is 103.1 - 4.5 = 98.6, below break-even. That must not sell.
+    assert _exit(highest=103.1, current=100.05) is None
+    result = _exit(highest=105.0, current=102.0)
+    assert result is not None and result["reason"] == "DAY_V2_OBJECTIVE_COMPLETE"
+    assert "stop=100.060000" not in result["detail"]
 
 
 def test_winner_floor_holds_above_break_even():

@@ -68,6 +68,9 @@ DAY_V2_UNIVERSE: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 
 # Catastrophic stop multiplier (ATR multiples). Calibrated from qualifying replay.
 DAY_V2_CATASTROPHIC_ATR_MULTIPLIER: float = _read_float("DAY_V2_CATASTROPHIC_ATR_MULTIPLIER", default=3.0)
+# One primary-bar (15m) ATR beyond the setup anchor. Same unit as the 3x rule
+# and the HTF anchor. Not a percent, and not env-tunable.
+DAY_V2_CATASTROPHIC_ANCHOR_BUFFER_ATR: float = 1.0
 
 # Max notional per DAY V2 position; 0 = use calculate_position_size (preferred)
 DAY_V2_MAX_NOTIONAL_USD: float = _read_float("DAY_V2_MAX_NOTIONAL_USD", default=0.0)

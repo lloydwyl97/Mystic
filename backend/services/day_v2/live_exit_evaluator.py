@@ -7,15 +7,19 @@ This is NOT shadow-only. It routes to real order execution. Do not add
 assert_no_live_authority() calls here.
 
 Exit priority (highest to lowest):
-  1. CATASTROPHIC_PROTECTION  — adverse move from entry >= 3x 15m ATR
+  1. CATASTROPHIC_PROTECTION  — adverse move beyond max(3x 15m ATR,
+                                distance from entry to the structural anchor
+                                plus one 15m ATR). Quiet ATR cannot fire inside
+                                the structural region.
   2. STRUCTURAL_INVALIDATION  — price below the setup's structural anchor (after 3+ bars)
   3. WINNER_PROTECTION        — structure-runner ratchet (day_v2.winner_contract):
-                                armed only after 1x 1h-ATR favourable excursion,
-                                never below break-even after round-trip costs,
-                                only moves up. Reported as OBJECTIVE_COMPLETE when
-                                the setup objective was reached before the stop.
-  4. TIME_EXPIRATION          — hold >= 300 min, never armed, still net-negative
+                                live only when the computed ATR trail itself is
+                                above break-even after round-trip cost. A trail
+                                still at or below that level is not replaced
+                                with break-even. Reported as OBJECTIVE_COMPLETE
+                                when the setup objective was reached before the stop.
 
+Elapsed hold is telemetry only. It is not a sell authority.
 There is no fixed profit target: reaching the objective tightens the ratchet,
 it does not sell.
 """
@@ -26,6 +30,7 @@ import logging
 import time
 
 from backend.services.day_v2.config import (
+    DAY_V2_CATASTROPHIC_ANCHOR_BUFFER_ATR,
     DAY_V2_CATASTROPHIC_ATR_MULTIPLIER,
     DAY_V2_MAX_HOLD_MINUTES,
     DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED,
@@ -39,6 +44,21 @@ from backend.services.day_v2.winner_contract import (
 logger = logging.getLogger(__name__)
 
 DAY_V2_ENGINE_ID: str = "DAY_V2"
+
+
+def catastrophic_threshold_price(entry_price: float, atr_at_entry: float, structural_anchor: float) -> float:
+    """Price at which catastrophic protection fires.
+
+    The distance is the larger of 3x 15m ATR and (entry-to-anchor plus one
+    15m ATR). Missing or non-positive anchors keep the 3x ATR distance so
+    hard safety is not removed.
+    """
+    atr_distance = DAY_V2_CATASTROPHIC_ATR_MULTIPLIER * max(0.0, atr_at_entry)
+    if entry_price > 0 and atr_at_entry > 0 and 0.0 < structural_anchor < entry_price:
+        outside_structure = (entry_price - structural_anchor) + DAY_V2_CATASTROPHIC_ANCHOR_BUFFER_ATR * atr_at_entry
+        atr_distance = max(atr_distance, outside_structure)
+    return entry_price - atr_distance
+
 
 _DAY_V2_RECORDED_EXIT_REASONS: dict[str, str] = {
     "DAY_V2_CATASTROPHIC_PROTECTION": "STOP_LOSS_EXIT",
@@ -110,12 +130,14 @@ def evaluate_day_v2_exit(
     # Used only for the structural-invalidation guard (requires N closed bars).
     bars_held_approx = int(hold_minutes / 15.0)
 
-    # Role 1: Catastrophic protection — uses the lowest price since entry
+    # Role 1: Catastrophic protection — uses the lowest price since entry.
+    # Sits outside the structural anchor when that anchor is known, so a quiet
+    # 15m ATR cannot front-run normal thesis invalidation.
     if atr_at_entry > 0:
-        adverse_move = (entry_price - max(bar_low, 0.0)) / entry_price
-        catastro_pct = DAY_V2_CATASTROPHIC_ATR_MULTIPLIER * atr_at_entry / entry_price
-        if adverse_move >= catastro_pct:
-            exit_px = entry_price * (1.0 - catastro_pct)
+        exit_px = catastrophic_threshold_price(entry_price, atr_at_entry, structural_anchor)
+        if max(bar_low, 0.0) <= exit_px:
+            adverse_move = (entry_price - max(bar_low, 0.0)) / entry_price
+            catastro_pct = (entry_price - exit_px) / entry_price
             logger.warning(
                 "DAY_V2_CATASTROPHIC symbol=? adverse=%.4f%% threshold=%.4f%% exit_est=%.6f",
                 adverse_move * 100,
@@ -126,7 +148,7 @@ def evaluate_day_v2_exit(
                 "action": "sell",
                 "reason": "DAY_V2_CATASTROPHIC_PROTECTION",
                 "exit_price_estimate": exit_px,
-                "detail": (f"adverse={adverse_move * 100:.2f}% >= {catastro_pct * 100:.2f}% ({DAY_V2_CATASTROPHIC_ATR_MULTIPLIER}x ATR)"),
+                "detail": (f"adverse={adverse_move * 100:.2f}% >= {catastro_pct * 100:.2f}% (outside anchor or {DAY_V2_CATASTROPHIC_ATR_MULTIPLIER}x ATR)"),
             }
 
     # Role 2: Structural invalidation — only fires after N closed bars
@@ -179,22 +201,13 @@ def evaluate_day_v2_exit(
             "detail": (f"mfe={mfe_pct * 100:.2f}% stop={runner['stop']:.6f} objective={objective:.6f} atr_1h={atr_1h:.6f} trail={runner['trail_atr_1h']}x"),
         }
 
-    # Role 4: Time expiration — only a trade that never proved itself and is
-    # still net-negative after costs. An armed runner is never timed out.
-    pnl_pct = (current_price - entry_price) / entry_price
-    net_pnl = pnl_pct - estimated_roundtrip_cost
-    if hold_minutes >= DAY_V2_MAX_HOLD_MINUTES and net_pnl <= 0 and not runner["activated"]:
-        logger.warning(
-            "DAY_V2_TIME_EXPIRATION hold=%.1fmin >= %.0fmin net_pnl=%.4f%%",
+    if hold_minutes >= DAY_V2_MAX_HOLD_MINUTES:
+        logger.debug(
+            "DAY_V2_HOLD_TELEMETRY hold=%.1fmin ceiling=%.0fmin price=%.6f anchor=%.6f",
             hold_minutes,
             DAY_V2_MAX_HOLD_MINUTES,
-            net_pnl * 100,
+            current_price,
+            structural_anchor,
         )
-        return {
-            "action": "sell",
-            "reason": "DAY_V2_TIME_EXPIRATION",
-            "exit_price_estimate": current_price,
-            "detail": (f"hold={hold_minutes:.0f}min net_pnl={net_pnl * 100:.2f}%"),
-        }
 
     return None  # no exit condition met

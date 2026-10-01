@@ -6,6 +6,8 @@ from backend.services.canonical_failsafe_equity import (
     balances_from_live_payload,
     build_canonical_nle,
     decide_account_failsafe,
+    load_canonical_nle_snapshot,
+    persist_canonical_nle_snapshot,
 )
 
 
@@ -100,6 +102,17 @@ def test_live_get_balance_payload_is_complete_nle_not_zero_cash():
     out = decide_account_failsafe(snap, "228.07")
     assert out["tripped"] is False
     assert out["usable"] is True
+
+
+def test_nle_snapshot_is_readable_by_another_process(tmp_path):
+    snap = build_canonical_nle(balances=_complete_balances(), bids=_bids(), as_of_epoch=1, now_epoch=1)
+    db = str(tmp_path / "nle.db")
+    persist_canonical_nle_snapshot(db, snap)
+    loaded = load_canonical_nle_snapshot(db)
+    assert loaded is not None
+    assert loaded["usable"] is True
+    assert decide_account_failsafe(loaded, "228.07")["reason"] != "missing_nle_snapshot_cannot_compare"
+    assert load_canonical_nle_snapshot(str(tmp_path / "missing.db")) is None
 
 
 def test_unparsed_live_payload_is_not_complete_zero_cash():

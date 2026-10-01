@@ -146,21 +146,32 @@ def runner_stop(
     trail_mult: float = 1.0,
     tighten_mult: float = 1.0,
 ) -> dict[str, Any]:
-    """Current ratchet state. ``stop`` is 0.0 until the trade has proven itself.
+    """Current ratchet state. ``stop`` is 0.0 until the trail itself locks profit.
 
-    Multipliers are fixed for the life of the trade (stamped at entry). The stop
-    is still a non-decreasing function of the high-water mark.
+    A favourable move that arms the activation distance is not enough. The
+    computed trail (high-water minus the adaptive ATR trail) must sit strictly
+    above break-even after executable round-trip cost. A trail that is still
+    at or below that level is not replaced with break-even; the position stays
+    under structural protection. Once live, the stop is the computed trail and
+    only moves up with the high-water mark or a tighter post-objective trail.
     """
     hwm = max(float(highest_price or 0.0), float(entry_price or 0.0))
     activation = RUNNER_ACTIVATION_ATR_1H * max(0.80, min(1.25, float(activation_mult or 1.0)))
-    activated = atr_1h > 0 and entry_price > 0 and (hwm - entry_price) >= activation * atr_1h
+    meaningful = atr_1h > 0 and entry_price > 0 and (hwm - entry_price) >= activation * atr_1h
     objective_reached = objective > 0 and hwm >= objective
-    if not activated:
+    if not meaningful:
         return {"activated": False, "objective_reached": objective_reached, "stop": 0.0, "trail_atr_1h": 0.0}
     if objective_reached:
         trail = RUNNER_TIGHT_TRAIL_ATR_1H * max(0.75, min(1.15, float(tighten_mult or 1.0)))
     else:
         trail = RUNNER_TRAIL_ATR_1H * max(0.80, min(1.20, float(trail_mult or 1.0)))
-    break_even = entry_price * (1.0 + max(0.0, estimated_roundtrip_cost))
-    stop = max(break_even, hwm - trail * atr_1h)
-    return {"activated": True, "objective_reached": objective_reached, "stop": stop, "trail_atr_1h": trail}
+    computed_trail = hwm - trail * atr_1h
+    breakeven_after_cost = entry_price * (1.0 + max(0.0, estimated_roundtrip_cost))
+    if computed_trail <= breakeven_after_cost:
+        return {"activated": False, "objective_reached": objective_reached, "stop": 0.0, "trail_atr_1h": 0.0}
+    return {
+        "activated": True,
+        "objective_reached": objective_reached,
+        "stop": computed_trail,
+        "trail_atr_1h": trail,
+    }

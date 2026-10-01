@@ -89,7 +89,9 @@ class OrderBookCollector:
             streams = [f"{symbol.lower()}usdt@depth20@100ms" for symbol in self.symbols]
 
             # Connect to WebSocket with explicit timeout
-            async with websockets.connect(self.ws_url, open_timeout=30, ping_interval=20, ping_timeout=20) as websocket:
+            # Binance.US often answers protocol pings late. A 20s timeout equal
+            # to the ping interval closed healthy streams with 1011.
+            async with websockets.connect(self.ws_url, open_timeout=30, ping_interval=20, ping_timeout=60) as websocket:
                 self.websocket = websocket
 
                 # Subscribe to streams
