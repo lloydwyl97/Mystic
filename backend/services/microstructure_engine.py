@@ -102,10 +102,19 @@ class _SymbolState:
     # Cumulative OFI increments (ts, increment) so window sums are cheap.
     ofi_hist: deque[tuple[float, float]] = field(default_factory=lambda: deque(maxlen=_SNAPSHOT_MAXLEN))
     last_db_persist_ts: float = 0.0
+    # Book/tape identity: bumped on every recorded snapshot / trade print.
+    depth_seq: int = 0
+    trade_seq: int = 0
+    # Features for (depth_seq, trade_seq), before the time-dependent fields
+    # (data_age_sec, Redis tape overlay, cross-market) refreshed on every read.
+    feat_key: tuple[int, int] | None = None
+    feat_base: dict[str, Any] | None = None
+    feat_needs_tape_overlay: bool = False
 
 
 _STATE: dict[str, _SymbolState] = {}
 _TABLE_READY = False
+_COMPUTE_STATS: dict[str, int] = {"orderbook_messages": 0, "feature_computations": 0, "feature_reuses": 0}
 
 
 def _state_for(symbol: str) -> _SymbolState:
@@ -301,6 +310,8 @@ def record_snapshot(
         ofi_inc = _ofi_increment(prev, sample)
         st.ofi_hist.append((t, ofi_inc))
     st.depth_hist.append(sample)
+    st.depth_seq += 1
+    _COMPUTE_STATS["orderbook_messages"] += 1
     _evict_old(st.depth_hist, t)
     _evict_old(st.ofi_hist, t)
 
@@ -333,6 +344,7 @@ def record_agg_trade(symbol: str, qty: float, is_buyer_maker: bool, ts: float | 
     t = float(ts if ts is not None else _now())
     st = _state_for(symbol)
     st.trade_hist.append((t, q, bool(is_buyer_maker)))
+    st.trade_seq += 1
     _evict_old(st.trade_hist, t)
 
 
@@ -395,6 +407,23 @@ def compute_features(symbol: str) -> dict[str, Any]:
     if st is None or not st.depth_hist:
         return _features_from_redis(symbol)
 
+    key = (st.depth_seq, st.trade_seq)
+    if st.feat_key == key and st.feat_base is not None:
+        _COMPUTE_STATS["feature_reuses"] += 1
+        out = dict(st.feat_base)
+        out["data_age_sec"] = max(0.0, _now() - float(out["ts"]))
+    else:
+        out, st.feat_needs_tape_overlay = _compute_book_features(symbol, st)
+        _COMPUTE_STATS["feature_computations"] += 1
+        st.feat_key, st.feat_base = key, dict(out)
+    if st.feat_needs_tape_overlay:
+        _overlay_redis_tape(out, symbol)
+    _attach_cross_market(out, symbol)
+    return out
+
+
+def _compute_book_features(symbol: str, st: _SymbolState) -> tuple[dict[str, Any], bool]:
+    """(book/tape features, whether the Redis tape overlay applies)."""
     now_ts = st.depth_hist[-1].ts
     latest = st.depth_hist[-1]
     mid = (latest.bid_px + latest.ask_px) / 2.0
@@ -477,10 +506,7 @@ def compute_features(symbol: str) -> dict[str, Any]:
         out[f"ask_replenished_{tag}"] = round(ask_added, 8)
 
     _enrich_micro_scores(out, depth_samples, trade_samples, now_ts, latest, mid)
-    if not trade_samples:
-        _overlay_redis_tape(out, symbol)
-    _attach_cross_market(out, symbol)
-    return out
+    return out, not trade_samples
 
 
 def _overlay_redis_tape(out: dict[str, Any], symbol: str) -> None:
@@ -627,7 +653,14 @@ def get_microstructure_ranking_delta(symbol: str) -> float:
     on any error or insufficient data. This is an EV/ranking input only.
     """
     try:
-        feats = compute_features(symbol)
+        return ranking_delta_from_features(compute_features(symbol))
+    except Exception:
+        return 0.0
+
+
+def ranking_delta_from_features(feats: dict[str, Any]) -> float:
+    """``get_microstructure_ranking_delta`` for an already-computed feature dict."""
+    try:
         if not feats or feats.get("data_age_sec", 999) > 10.0:
             return 0.0
         ofi_5s = float(feats.get("ofi_5s", 0.0))
@@ -730,7 +763,7 @@ def _persist_row(symbol: str, feats: dict[str, Any]) -> None:
                     feats.get("agg_flow_imbalance_5s", 0.0),
                     feats.get("bid_cancelled_5s", 0.0),
                     feats.get("ask_cancelled_5s", 0.0),
-                    get_microstructure_ranking_delta(symbol),
+                    ranking_delta_from_features(feats),
                     _json.dumps(feats, default=str),
                 ),
             )
@@ -755,8 +788,9 @@ async def publish_to_redis_async(symbol: str, redis_client: Any, *, ttl_sec: int
 
     base = _base(symbol)
     try:
+        delta = ranking_delta_from_features(feats)
         full_mapping = {k: str(v) for k, v in feats.items() if k != "symbol"}
-        full_mapping["ranking_delta"] = str(get_microstructure_ranking_delta(symbol))
+        full_mapping["ranking_delta"] = str(delta)
         pipe = redis_client.pipeline(transaction=True)
         pipe.hset(f"microstructure:{base}", mapping=full_mapping)
         pipe.expire(f"microstructure:{base}", ttl_sec)
@@ -773,7 +807,7 @@ async def publish_to_redis_async(symbol: str, redis_client: Any, *, ttl_sec: int
             "adverse_selection_score": str(feats.get("adverse_selection_score", 0.0)),
             "bid_absorption_score": str(feats.get("bid_absorption_score", 0.0)),
             "ask_absorption_score": str(feats.get("ask_absorption_score", 0.0)),
-            "microstructure_ranking_delta": str(get_microstructure_ranking_delta(symbol)),
+            "microstructure_ranking_delta": str(delta),
             "microstructure_json": _json.dumps(feats, default=str)[:4000],
         }
         pipe.hset(f"orderbook:{base}", mapping=compact)
@@ -784,8 +818,16 @@ async def publish_to_redis_async(symbol: str, redis_client: Any, *, ttl_sec: int
         return False
 
 
+def compute_stats() -> dict[str, float]:
+    """Order-book messages vs full feature computations since process start."""
+    msgs = _COMPUTE_STATS["orderbook_messages"]
+    comps = _COMPUTE_STATS["feature_computations"]
+    return {**_COMPUTE_STATS, "feature_computations_per_message": round(comps / msgs, 4) if msgs else 0.0}
+
+
 def get_stats() -> dict[str, Any]:
     return {
+        **compute_stats(),
         "symbols_tracked": list(_STATE.keys()),
         "depth_samples": {s: len(st.depth_hist) for s, st in _STATE.items()},
         "trade_samples": {s: len(st.trade_hist) for s, st in _STATE.items()},
@@ -798,11 +840,13 @@ __all__ = [
     "WINDOWS_SEC",
     "aggressor_is_sell",
     "compute_features",
+    "compute_stats",
     "get_microstructure_ranking_delta",
     "get_stats",
     "imbalance_at_depth",
     "microprice",
     "publish_to_redis_async",
+    "ranking_delta_from_features",
     "record_agg_trade",
     "record_snapshot",
 ]

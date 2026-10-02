@@ -250,6 +250,13 @@ def load_aligned_candles(
         else:
             stmt = select(FeatureOHLCV).where(and_(*conds)).order_by(asc(FeatureOHLCV.ts))
             rows = list(session.execute(stmt).scalars().all())
+    out = _aligned_candles_from_rows(symbol, interval, rows)
+    if limit is not None and limit > 0:
+        out = out[-int(limit) :]
+    return out
+
+
+def _aligned_candles_from_rows(symbol: str, interval: str, rows: list[Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     seen: set[int] = set()
     for row in rows:
@@ -273,8 +280,6 @@ def load_aligned_candles(
                 source="sqlite",
             )
         )
-    if limit is not None and limit > 0:
-        out = out[-int(limit) :]
     return out
 
 
@@ -285,9 +290,21 @@ def continuity_report(
     start_ms: int,
     end_completed_ms: int,
 ) -> dict[str, Any]:
+    return continuity_scan(symbol, interval, start_ms=start_ms, end_completed_ms=end_completed_ms)[0]
+
+
+def continuity_scan(
+    symbol: str,
+    interval: str,
+    *,
+    start_ms: int,
+    end_completed_ms: int,
+) -> tuple[dict[str, Any], list[int]]:
+    """(continuity report, every missing open_ms) from one read of the window."""
     db_sym = db_symbol(symbol)
     raw_open_ms: list[int] = []
     invalid_boundary = 0
+    rows: list[dict[str, Any]] | None = None
     try:
         with SessionLocal() as session:
             conds = [
@@ -296,29 +313,32 @@ def continuity_report(
                 FeatureOHLCV.ts >= open_dt_from_ms(start_ms),
                 FeatureOHLCV.ts <= open_dt_from_ms(end_completed_ms),
             ]
-            stamps = session.execute(select(FeatureOHLCV.ts).where(and_(*conds)).order_by(asc(FeatureOHLCV.ts))).scalars().all()
-        for ts in stamps:
-            open_ms = open_ms_from_dt(ts)
+            db_rows = list(session.execute(select(FeatureOHLCV).where(and_(*conds)).order_by(asc(FeatureOHLCV.ts))).scalars().all())
+        for row in db_rows:
+            open_ms = open_ms_from_dt(row.ts)
             if open_ms is None or not is_aligned_open_ms(open_ms, interval):
                 invalid_boundary += 1
                 continue
             raw_open_ms.append(int(open_ms))
+        rows = _aligned_candles_from_rows(symbol, interval, db_rows)
     except Exception as exc:
         logger.debug("continuity raw-timestamp scan failed %s %s: %s", symbol, interval, exc)
         raw_open_ms = []
         invalid_boundary = 0
-    rows = load_aligned_candles(symbol, interval, start_ms=start_ms, end_ms=end_completed_ms)
+    if rows is None:
+        rows = load_aligned_candles(symbol, interval, start_ms=start_ms, end_ms=end_completed_ms)
     have = [int(r["open_ms"]) for r in rows]
     if not raw_open_ms:
         raw_open_ms = list(have)
     expected = expected_open_ms_range(start_ms, end_completed_ms, interval)
     have_set = set(have)
+    expected_set = set(expected)
     missing = [ts for ts in expected if ts not in have_set]
-    extra = [ts for ts in have if ts not in set(expected)]
+    extra = [ts for ts in have if ts not in expected_set]
     duplicates = len(raw_open_ms) - len(set(raw_open_ms))
     out_of_order = sum(1 for i in range(1, len(have)) if have[i] < have[i - 1])
     latest = rows[-1] if rows else None
-    return {
+    report = {
         "symbol": api_symbol(symbol),
         "interval": interval,
         "row_count": len(rows),
@@ -338,6 +358,7 @@ def continuity_report(
         "newest_completed_ms": have[-1] if have else None,
         "latest_ohlcv": latest,
     }
+    return report, missing
 
 
 def earliest_aligned_1m_open_ms() -> int | None:

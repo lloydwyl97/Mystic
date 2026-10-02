@@ -38,6 +38,7 @@ class OrderBookCollector:
         self.symbols = []
         self.websocket = None
         self._last_heartbeat_ts = 0.0
+        self._last_compute_log_ts = 0.0
 
         # Top-4 Binance.US trading symbols only (Mystic day-trade scope)
         symbols_str = os.getenv("TRADING_SYMBOLS", "BTC,ETH,SOL,XRP")
@@ -209,13 +210,24 @@ class OrderBookCollector:
         self._last_heartbeat_ts = now
         try:
             from backend.config.redis_config import get_shared_redis_async
+            from backend.services.microstructure_engine import compute_stats
             from backend.services.task_health_monitor import beat
 
+            micro = compute_stats()
             await beat(
                 "order_book_collector:ws_messages",
                 get_shared_redis_async(),
-                extra={"last_symbol": symbol, "messages_received": self.stats["messages_received"]},
+                extra={"last_symbol": symbol, "messages_received": self.stats["messages_received"], **micro},
             )
+            if now - self._last_compute_log_ts >= 600.0:
+                self._last_compute_log_ts = now
+                logger.info(
+                    "MICROSTRUCTURE_COMPUTE_STATS orderbook_messages=%d feature_computations=%d feature_computations_per_message=%.4f feature_reuses=%d",
+                    micro["orderbook_messages"],
+                    micro["feature_computations"],
+                    micro["feature_computations_per_message"],
+                    micro["feature_reuses"],
+                )
         except Exception:
             pass
 

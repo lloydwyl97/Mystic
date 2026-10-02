@@ -1,0 +1,15 @@
+// Mystic: security updates install automatically, but nothing restarts Mystic's
+// dependencies mid-trading and the host never reboots on its own. The reboot is left
+// to scripts/mystic_maintenance.py, which waits until the book is flat.
+//
+// Install (as root on mystic-prod):
+//   cp /home/mystic/mystic/deploy/apt-52mystic-unattended-upgrades /etc/apt/apt.conf.d/52mystic-unattended-upgrades
+//   unattended-upgrade --dry-run --debug 2>&1 | tail
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+// redis-server's maintainer script restarts Redis during the upgrade itself, which
+// interrupts every Mystic process. It is upgraded in the safe reboot window instead.
+Unattended-Upgrade::Package-Blacklist {
+    "redis-server";
+    "redis-tools";
+};

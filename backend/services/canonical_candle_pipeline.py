@@ -31,6 +31,7 @@ from backend.config.canonical_candle_intervals import (
 from backend.services.canonical_candle_store import (
     api_symbol,
     continuity_report,
+    continuity_scan,
     earliest_aligned_1m_open_ms,
     expected_open_ms_range,
     load_aligned_candles,
@@ -236,12 +237,7 @@ class CanonicalCandlePipeline:
         return {"symbol": api_symbol(symbol), "interval": interval, "fetched": fetched, "pages": pages}
 
     async def repair_gaps(self, symbol: str, interval: str, start_ms: int, end_ms: int) -> dict[str, Any]:
-        report = continuity_report(symbol, interval, start_ms=start_ms, end_completed_ms=end_ms)
-        missing = list(report.get("missing_timestamps") or [])
-        if report["missing_count"] > 50:
-            expected = expected_open_ms_range(start_ms, end_ms, interval)
-            have = {int(r["open_ms"]) for r in load_aligned_candles(symbol, interval, start_ms=start_ms, end_ms=end_ms)}
-            missing = [ts for ts in expected if ts not in have]
+        report, missing = continuity_scan(symbol, interval, start_ms=start_ms, end_completed_ms=end_ms)
         repaired = 0
         if missing:
             # Fetch contiguous missing spans instead of one-bar requests.
@@ -260,8 +256,9 @@ class CanonicalCandlePipeline:
             for a, b in spans:
                 result = await self.backfill_range(symbol, interval, a, b + width - 1)
                 repaired += int(result.get("fetched") or 0)
-        after = continuity_report(symbol, interval, start_ms=start_ms, end_completed_ms=end_ms)
-        return {"before": report, "after": after, "repaired_fetched": repaired}
+        # Nothing was fetched or written, so a re-scan would read the same rows.
+        after = continuity_report(symbol, interval, start_ms=start_ms, end_completed_ms=end_ms) if missing else report
+        return {"before": report, "after": after, "repaired_fetched": repaired, "start_ms": int(start_ms), "end_ms": end_ms}
 
     def canonical_start_ms(self) -> int:
         if self._cached_start_ms is not None:
@@ -337,8 +334,8 @@ class CanonicalCandlePipeline:
         for symbol in symbols:
             for interval in CANONICAL_CANDLE_INTERVALS:
                 end_ms = self._completed_open_ms(interval)
-                await self.repair_gaps(symbol, interval, start_ms, end_ms)
-                rows.append(await self.write_integrity(symbol, interval, start_ms=start_ms))
+                repair = await self.repair_gaps(symbol, interval, start_ms, end_ms)
+                rows.append(await self.write_integrity(symbol, interval, start_ms=start_ms, repair=repair))
                 await asyncio.sleep(0.05)
         return rows
 
@@ -351,10 +348,15 @@ class CanonicalCandlePipeline:
             await self.repair_gaps(symbol, interval, self._recent_window_start_ms(interval), end_ms)
         return ingested
 
-    async def write_integrity(self, symbol: str, interval: str, *, start_ms: int | None = None) -> dict[str, Any]:
+    async def write_integrity(self, symbol: str, interval: str, *, start_ms: int | None = None, repair: dict[str, Any] | None = None) -> dict[str, Any]:
+        """``repair`` is a just-finished ``repair_gaps`` result for the same window; its
+        post-repair report is reused when it covers exactly this window."""
         start = int(start_ms if start_ms is not None else self.canonical_start_ms())
         end_ms = self._completed_open_ms(interval)
-        report = continuity_report(symbol, interval, start_ms=start, end_completed_ms=end_ms)
+        if repair is not None and repair.get("end_ms") == end_ms and repair.get("start_ms") == start:
+            report = repair["after"]
+        else:
+            report = continuity_report(symbol, interval, start_ms=start, end_completed_ms=end_ms)
         now = time.time()
         source_open = self._source_ts.get(self._stream_key(symbol, interval))
         newest = report.get("newest_completed_ms")
@@ -450,8 +452,8 @@ class CanonicalCandlePipeline:
                     for interval in CANONICAL_CANDLE_INTERVALS:
                         end_ms = self._completed_open_ms(interval)
                         start_ms = self._recent_window_start_ms(interval)
-                        await self.repair_gaps(symbol, interval, start_ms, end_ms)
-                        await self.write_integrity(symbol, interval, start_ms=start_ms)
+                        repair = await self.repair_gaps(symbol, interval, start_ms, end_ms)
+                        await self.write_integrity(symbol, interval, start_ms=start_ms, repair=repair)
                         await asyncio.sleep(0.2)
             except asyncio.CancelledError:
                 break

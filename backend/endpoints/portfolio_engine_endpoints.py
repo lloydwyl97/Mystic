@@ -838,6 +838,15 @@ async def get_portfolio_status() -> dict[str, Any]:
             logger.warning("STATUS_CANDLE_CONTRACT_UNAVAILABLE: %s", exc)
             status["candle_contract"] = {"error": str(exc)[:200]}
 
+        try:
+            from backend.services.microstructure_engine import compute_stats
+            from backend.services.mystic_maintenance import maintenance_status_summary
+
+            status["maintenance"] = maintenance_status_summary()
+            status["microstructure_compute"] = compute_stats()
+        except Exception as exc:
+            status["maintenance"] = {"error": str(exc)[:200]}
+
         # Ensure we show non-zero equity from adopted data
         return {
             "success": True,

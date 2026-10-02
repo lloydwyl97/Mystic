@@ -1,0 +1,15 @@
+# Mystic automatic maintenance (disk guard, backups, temp/log retention, WAL, safe reboot).
+#
+# Install (as root on mystic-prod):
+#   cp /home/mystic/mystic/deploy/cron.d-mystic-maintenance /etc/cron.d/mystic-maintenance
+#   chmod 644 /etc/cron.d/mystic-maintenance
+#
+# Runs as root so it can tidy root-owned temp files and reboot; DB work drops to the
+# mystic user. The job takes its own flock, so a slow run (daily backup) never overlaps
+# the next one, and it is measure-only while a deploy lock is held.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PYTHONDONTWRITEBYTECODE=1
+
+17 * * * * root cd /home/mystic/mystic && nice -n 19 ionice -c3 venv/bin/python3 scripts/mystic_maintenance.py run >> logs/maintenance.log 2>&1
+@reboot root sleep 240 && cd /home/mystic/mystic && venv/bin/python3 scripts/mystic_maintenance.py post-reboot-verify >> logs/maintenance.log 2>&1
