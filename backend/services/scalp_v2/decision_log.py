@@ -143,10 +143,10 @@ def classify_scalp_candidate(row: dict | None) -> tuple[str, str]:
     # The canonical executable edge owns economic permission. An eligible row
     # that does not carry a positive one cannot arm, whatever produced it.
     edge = row.get("executable_edge")
-    if not isinstance(edge, dict) or edge.get("edge_after_cost_pct") is None:
+    if not isinstance(edge, dict) or edge.get("final_executable_edge_pct") is None:
         return "REJECTED:NO_EXECUTABLE_EDGE_ESTIMATE", "NO_EXECUTABLE_EDGE_ESTIMATE"
     try:
-        positive = float(edge["edge_after_cost_pct"]) > float(edge.get("reject_threshold_pct") or 0.0)
+        positive = float(edge["final_executable_edge_pct"]) > float(edge.get("reject_threshold_pct") or 0.0)
     except (TypeError, ValueError):
         positive = False
     if not positive:

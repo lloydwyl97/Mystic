@@ -120,11 +120,12 @@ def test_g_h_ratchet_never_loosens_and_hard_stops_stay():
 def test_j_p_scalp_markout_and_next_candidate(tmp_path):
     db = str(tmp_path / "t.db")
     before = scalp_decision(db, "ETHUSDT", "VWAP_EMA_RECLAIM", "")
-    record_candidate(db, engine=SCALP, symbol="ETHUSDT", setup="VWAP_EMA_RECLAIM", regime="", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=1_000.0)
+    record_candidate(db, engine=SCALP, symbol="ETHUSDT", setup="VWAP_EMA_RECLAIM", regime="", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=1_000.0, raw_expected_move=0.003)
     assert resolve_markouts(db, lambda _s, _t: 100.4, now=1_000.0 + 2000) == 1
     after = scalp_decision(db, "ETHUSDT", "VWAP_EMA_RECLAIM", "")
     assert after["n_forward"] >= 1
-    assert after["expected_edge"] != before["expected_edge"]
+    assert after["n_residual"] >= 1
+    assert after["adaptive_residual"] != before["adaptive_residual"]
     from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 
     src = inspect.getsource(PortfolioEngineIntegration._process_scalp_v2_signals)
@@ -133,10 +134,10 @@ def test_j_p_scalp_markout_and_next_candidate(tmp_path):
 
 def test_k_l_m_n_o_scalp_loss_win_hold_size_and_rank(tmp_path):
     db = str(tmp_path / "t.db")
-    observe(db, engine=SCALP, symbol="XRPUSDT", setup="RANGE_BOUNCE_SCALP", regime="", metric="trade_mae", value=0.004, strategy_version=SCALP_STRATEGY_VERSION)
+    observe(db, engine=SCALP, symbol="XRPUSDT", setup="RANGE_BOUNCE_SCALP", regime="", metric="markout_mae", value=0.004, strategy_version=SCALP_STRATEGY_VERSION)
     observe(db, engine=SCALP, symbol="BTCUSDT", setup="VWAP_EMA_RECLAIM", regime="", metric="trade_mfe", value=0.005, strategy_version=SCALP_STRATEGY_VERSION)
     observe(db, engine=SCALP, symbol="SOLUSDT", setup="RANGE_BOUNCE_SCALP", regime="", metric="trade_time_to_mfe_min", value=5.0, strategy_version=SCALP_STRATEGY_VERSION)
-    observe(db, engine=SCALP, symbol="ETHUSDT", setup="VWAP_EMA_RECLAIM", regime="", metric="trade_net", value=0.004, strategy_version=SCALP_STRATEGY_VERSION)
+    observe(db, engine=SCALP, symbol="ETHUSDT", setup="VWAP_EMA_RECLAIM", regime="", metric="edge_residual", value=0.004, strategy_version=SCALP_STRATEGY_VERSION)
     xrp = scalp_decision(db, "XRPUSDT", "RANGE_BOUNCE_SCALP", "")
     btc = scalp_decision(db, "BTCUSDT", "VWAP_EMA_RECLAIM", "")
     sol = scalp_decision(db, "SOLUSDT", "RANGE_BOUNCE_SCALP", "")
@@ -146,13 +147,14 @@ def test_k_l_m_n_o_scalp_loss_win_hold_size_and_rank(tmp_path):
     assert btc["target_pct"] <= 0.006
     assert sol["hold_min"] < sol["hold_hard_max_min"]
     assert sol["hold_min"] >= 4.0
-    assert eth["size_mult"] > 1.0
-    assert eth["size_mult"] <= 1.25
-    order = sorted(
-        [("BTCUSDT", btc), ("ETHUSDT", eth), ("SOLUSDT", sol), ("XRPUSDT", xrp)],
-        key=lambda item: -(item[1]["expected_edge"] + 0.001 * item[1]["confidence"]),
-    )
-    assert order[0][0] == "ETHUSDT"
+    from backend.services.scalp_v2.executable_edge import scalp_executable_edge
+
+    edges = {sym: scalp_executable_edge(view, raw_expected_move_pct=0.002, spread_pct=0.0001, impact_pct=0.0) for sym, view in (("BTCUSDT", btc), ("ETHUSDT", eth), ("SOLUSDT", sol), ("XRPUSDT", xrp))}
+    assert edges["ETHUSDT"].adaptive_residual_pct > 0
+    assert edges["XRPUSDT"].size_mult < edges["BTCUSDT"].size_mult
+    assert all(0.50 <= e.size_mult <= 1.25 for e in edges.values())
+    order = sorted(edges, key=lambda sym: -(edges[sym].final_executable_edge_pct + 0.001 * edges[sym].confidence))
+    assert order[0] == "ETHUSDT"
     from backend.services.scalp_v2.exit_evaluator import evaluate_scalp_v2_exit
 
     pos = SimpleNamespace(engine_id="SCALP_V2", entry_price=100.0, highest_price=100.0, lowest_price=100.0, symbol="SOLUSDT", adaptive_decision=sol)
@@ -167,14 +169,14 @@ def test_q_r_engines_do_not_contaminate(tmp_path):
     db = str(tmp_path / "t.db")
     observe(db, engine=DAY, symbol="BTCUSDT", setup="BREAKOUT_CONTINUATION", regime="bull", metric="trade_mfe", value=0.05, strategy_version=DAY_STRATEGY_VERSION)
     scalp_before = scalp_decision(db, "BTCUSDT", "BREAKOUT_CONTINUATION", "bull")
-    observe(db, engine=SCALP, symbol="BTCUSDT", setup="BREAKOUT_CONTINUATION", regime="bull", metric="trade_net", value=-0.01, strategy_version=SCALP_STRATEGY_VERSION)
+    observe(db, engine=SCALP, symbol="BTCUSDT", setup="BREAKOUT_CONTINUATION", regime="bull", metric="edge_residual", value=-0.01, strategy_version=SCALP_STRATEGY_VERSION)
     day_after = day_decision(db, "BTCUSDT", "BREAKOUT_CONTINUATION", "bull")
     scalp_after = scalp_decision(db, "BTCUSDT", "BREAKOUT_CONTINUATION", "bull")
     assert day_after["mfe"] > 0.012
-    assert scalp_before["expected_edge"] == pytest.approx(scalp_decision(db, "ETHUSDT", "OTHER", "")["edge_prior"]) or scalp_before["n_net"] == 0
-    assert scalp_after["n_net"] == 1
+    assert scalp_before["adaptive_residual"] == 0.0 and scalp_before["n_residual"] == 0
+    assert scalp_after["n_residual"] == 1
     assert day_after["n_mfe"] == 1
-    assert scalp_after["expected_edge"] < scalp_before["expected_edge"]
+    assert scalp_after["adaptive_residual"] < scalp_before["adaptive_residual"]
 
 
 # --- S / T / U ---------------------------------------------------------------
@@ -266,7 +268,7 @@ def test_close_learns_under_entry_stamped_key_reaches_next_candidate(tmp_path):
     )
 
     after = scalp_decision(db, "ETHUSDT", entry_setup, entry_regime)
-    assert after["expected_edge"] != before["expected_edge"]
+    assert after["target_pct"] != before["target_pct"]
     assert after["n_net"] == 1
 
     # A read under the provenance name would NOT have seen it (proves the risk).
@@ -291,7 +293,7 @@ def test_close_learns_under_entry_stamped_key_reaches_next_candidate(tmp_path):
         is_dust=False,
     )
     reread = scalp_decision(db, "SOLUSDT", entry_setup, entry_regime)  # no-slash read
-    assert reread["expected_edge"] != base["expected_edge"]
+    assert reread["target_pct"] != base["target_pct"]
     assert reread["n_net"] == 1
 
     # The live close-path keys the learn call on the entry-stamped decision.
@@ -407,7 +409,7 @@ def test_adaptive_state_report_lists_current_keys(tmp_path):
     day_rows = rep["engines"]["DAY_V2"]
     scalp_rows = rep["engines"]["SCALP_V2"]
     assert any(r["symbol"] == "XRPUSDT" and r["regime"] == "btcup_vollo" for r in day_rows)
-    assert any(r["symbol"] == "ETHUSDT" and "expected_edge" in r for r in scalp_rows)
+    assert any(r["symbol"] == "ETHUSDT" and "adaptive_residual" in r for r in scalp_rows)
     # DAY learning must never leak into the SCALP listing and vice versa.
     assert all("expected_move" in r for r in day_rows)
     assert all("hold_min" in r for r in scalp_rows)
@@ -509,6 +511,7 @@ def test_micro_model_flows_through_resolve_and_scalp_decision(tmp_path):
         signaled=True,
         evaluated_at=1_000.0,
         features=_bull_book(),
+        raw_expected_move=0.003,
     )
     assert resolve_markouts(db, lambda _s, _t: 100.6, now=1_000.0 + 2000) == 1
     rep = adaptive_state_report(db)
@@ -527,7 +530,7 @@ def test_micro_model_flows_through_resolve_and_scalp_decision(tmp_path):
     assert without["micro_tilt"] == 0.0
     assert with_feats["micro_model_n"] >= 1
     assert with_feats["micro_tilt"] > 0.0
-    assert with_feats["expected_edge"] > without["expected_edge"]
+    assert with_feats["micro_residual"] > without["micro_residual"]
 
 
 def test_abstention_cold_key_never_skips(tmp_path):
@@ -597,13 +600,15 @@ def test_abstention_report_measures_value(tmp_path):
 
 
 def test_abstention_is_live_skip_only(tmp_path):
-    """Both engines enforce the skip in the live path, and only ever skip."""
+    """DAY enforces the skip live. SCALP keeps it as telemetry: its canonical
+    executable edge is the single negative-edge gate."""
     from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 
     fund = inspect.getsource(PortfolioEngineIntegration._fund_day_v2_candidate)
     assert "abstain" in fund and "REJECTED:LEARNED_NEGATIVE_EDGE" in fund and "return" in fund
     scalp = inspect.getsource(PortfolioEngineIntegration._process_scalp_v2_signals)
-    assert "abstain" in scalp and "REJECTED:LEARNED_NEGATIVE_EDGE" in scalp and "continue" in scalp
+    assert "LEARNED_NEGATIVE_EDGE" not in scalp
+    assert "NO_EXECUTABLE_NET_EDGE" in inspect.getsource(__import__("backend.services.scalp_v2.decision_log", fromlist=["classify_scalp_candidate"]).classify_scalp_candidate)
 
 
 def test_markout_label_is_the_decision_horizon_not_the_best_future(tmp_path):
@@ -655,6 +660,7 @@ def test_scalp_micro_trains_on_the_causal_horizon_once(tmp_path):
         signaled=True,
         evaluated_at=1_000.0,
         features=_bull_book(),
+        raw_expected_move=0.003,
     )
     conn = sqlite3.connect(db)
     horizon = float(conn.execute("SELECT label_horizon FROM adaptive_candidate_markouts").fetchone()[0])

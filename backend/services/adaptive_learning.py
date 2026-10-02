@@ -64,9 +64,34 @@ _PRIORS: dict[str, dict[str, float]] = {
         "trade_net": 0.0015,
         "trade_time_to_mfe_min": 8.0,
         "markout_forward": 0.0015,
+        # Gross adverse price excursion of the candidate path over its committed
+        # horizon (SCALP). This is the live risk estimate.
         "markout_mae": 0.0015,
+        # Realized net markout minus the decision-time base executable edge
+        # (raw expected move - cost), kept per raw-move source because an ATR
+        # estimate and a strategy structural claim carry different biases.
+        # Neutral cold prior: no evidence, no adjustment.
+        "edge_residual": 0.0,
+        "edge_residual_strategy": 0.0,
     },
 }
+
+# Bound on the learned residual added to a SCALP candidate's base executable
+# edge. Equal to the raw expected-move cap, so evidence can cancel a full claim.
+SCALP_RESIDUAL_MAX = 0.006
+STRATEGY_RAW_SOURCE = "strategy"
+
+
+def residual_metric(raw_move_source: str | None) -> str:
+    """Residual key for a raw-move source: strategy structural claims vs ATR estimates."""
+    return "edge_residual_strategy" if str(raw_move_source or "").lower() == STRATEGY_RAW_SOURCE else "edge_residual"
+
+
+# Metrics folded as a decayed running mean (weight 1/n) instead of the fast EWMA.
+# Causal calibration on current-version SCALP markouts: a 0.25 EWMA residual
+# tracks the last few labels and produced 4x more positive predictions with no
+# better realization; the running mean converges to the key's actual bias.
+MEAN_FORM_METRICS = frozenset({"edge_residual", "edge_residual_strategy"})
 
 SIZE_BOUNDS = {"DAY_V2": (0.55, 1.35), "SCALP_V2": (0.50, 1.25)}
 OBJECTIVE_ATR_BOUNDS = (0.75, 1.35)
@@ -84,10 +109,10 @@ SCALP_HOLD_FLOOR_MIN = 4.0
 ADAPTIVE_HALF_LIFE_DAYS = float(os.getenv("ADAPTIVE_HALF_LIFE_DAYS", "14") or "14")
 
 # SCALP microstructure edge model. A single inspectable online linear model
-# (normalised LMS) that learns how the current book/flow shifts the expected
-# forward edge, trained from the same cost-adjusted candidate markouts. Its
-# output is a bounded, zero-centred tilt on expected_edge (rank + size only) —
-# never the hard net-edge gate, so it can never become a permission bot.
+# (normalised LMS) that learns how the current book/flow shifts the candidate's
+# edge residual (realized net markout minus base executable edge). Its output is
+# a bounded, zero-centred residual on the base edge; it can lower a candidate
+# but never lift one whose base edge plus learned residual is not positive.
 SCALP_MICRO_FEATURES = (
     "microprice_pressure",
     "obi_l5",
@@ -102,8 +127,8 @@ MICRO_MODEL_TILT_MAX = 0.0015  # max absolute edge tilt the model can add (15 bp
 MICRO_MODEL_STD_ALPHA = 0.05  # EWMA rate for feature standardisation stats
 MICRO_MODEL_CONF_K = 20.0  # shrink the tilt by n/(n+K) so a cold model barely moves
 
-# Evidence-gated abstention (LIVE entry skip). This is the +55 bps "trade / no
-# trade" lever. It only ever SKIPS a candidate for the current cycle — it never
+# Evidence-gated abstention. DAY: live entry skip. SCALP: telemetry only — the
+# canonical executable edge is SCALP's single negative-edge gate. It never
 # forces a trade and never overrides hard safety, which stays the floor beneath
 # it. Cold / low-confidence keys NEVER abstain, so on deploy behaviour is
 # identical to today and abstention only engages as real cost-adjusted negative
@@ -219,6 +244,10 @@ def _connect(db_path: str) -> sqlite3.Connection:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(adaptive_candidate_markouts)").fetchall()}
     if "label_horizon" not in cols:
         conn.execute("ALTER TABLE adaptive_candidate_markouts ADD COLUMN label_horizon REAL NOT NULL DEFAULT 0")
+    if "raw_expected_move" not in cols:
+        conn.execute("ALTER TABLE adaptive_candidate_markouts ADD COLUMN raw_expected_move REAL")
+    if "raw_move_source" not in cols:
+        conn.execute("ALTER TABLE adaptive_candidate_markouts ADD COLUMN raw_move_source TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS adaptive_linear_model (
@@ -243,8 +272,13 @@ def observe(
     metric: str,
     value: float,
     strategy_version: str,
+    now: float | None = None,
 ) -> bool:
-    """Fold one current-version observation into the key. Returns False for any other version."""
+    """Fold one current-version observation into the key. Returns False for any other version.
+
+    ``now`` is the observation time (defaults to wall clock); a chronological
+    rebuild passes each label's own time so decay matches live learning.
+    """
     engine_id = str(engine or "").upper()
     if engine_id not in _PRIORS or metric not in _PRIORS[engine_id]:
         return False
@@ -253,6 +287,7 @@ def observe(
     if value is None or not math.isfinite(float(value)):
         return False
     key = (engine_id, _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower(), metric)
+    moment = float(now if now is not None else time.time())
     with _connect(db_path) as conn:
         row = conn.execute(
             "SELECT n, ewma, updated_at FROM adaptive_metric_state WHERE engine_id=? AND symbol=? AND setup=? AND regime=? AND metric=?",
@@ -263,9 +298,10 @@ def observe(
         else:
             # Age out the prior sample count so stale evidence stops dominating,
             # then fold in the new observation. The new point always counts for 1.
-            decay = _decay_factor(str(row["updated_at"] or ""), time.time())
+            decay = _decay_factor(str(row["updated_at"] or ""), moment)
             n = float(row["n"]) * decay + 1.0
-            ewma = (1.0 - EWMA_ALPHA) * float(row["ewma"]) + EWMA_ALPHA * float(value)
+            alpha = 1.0 / n if metric in MEAN_FORM_METRICS else EWMA_ALPHA
+            ewma = (1.0 - alpha) * float(row["ewma"]) + alpha * float(value)
         conn.execute(
             """
             INSERT INTO adaptive_metric_state (engine_id, symbol, setup, regime, metric, n, ewma, updated_at)
@@ -273,7 +309,7 @@ def observe(
             ON CONFLICT(engine_id, symbol, setup, regime, metric) DO UPDATE SET
                 n=excluded.n, ewma=excluded.ewma, updated_at=excluded.updated_at
             """,
-            (*key, n, ewma, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+            (*key, n, ewma, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))),
         )
         conn.commit()
     return True
@@ -491,52 +527,69 @@ def micro_edge_tilt(db_path: str, engine: str, features: dict | None) -> tuple[f
 
 
 def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features: dict | None = None) -> dict[str, Any]:
-    """What the next SCALP candidate reads. Ranking, size, target and hold only."""
+    """Learned adjustments for the next SCALP candidate. Never an edge by itself.
+
+    The candidate's own base executable edge (raw expected move - live cost) is
+    built in scalp_v2.executable_edge. This view supplies the bounded learned
+    residual and microstructure residual added to it, plus confidence, risk,
+    target and hold. A cold key contributes a residual of exactly 0.
+    """
     from backend.services.scalp_v2.exit_evaluator import SCALP_V2_TIME_STOP_MIN
 
+    residual = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "edge_residual")
+    residual_strategy = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "edge_residual_strategy")
     net = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "trade_net")
     mfe = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "trade_mfe")
-    mae = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "trade_mae")
+    path_mae = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "markout_mae")
     timing = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "trade_time_to_mfe_min")
     forward = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "markout_forward")
-    edge, n_eff = _blend([(net["mean"], net["n"]), (forward["mean"], forward["n"] * MARKOUT_WEIGHT)], net["prior"])
     learned_mfe, _ = _blend([(mfe["mean"], mfe["n"]), (max(0.0, forward["mean"]), forward["n"] * MARKOUT_WEIGHT)], mfe["prior"])
-    lo, hi = SIZE_BOUNDS[SCALP_ENGINE]
     hard_hold = float(SCALP_V2_TIME_STOP_MIN)
-    confidence = n_eff / (PRIOR_STRENGTH + n_eff)
-    # Bounded microstructure tilt: shrunk by the model's own sample count so a
-    # cold model barely moves the edge. It is part of expected_edge, which the
-    # canonical executable edge (scalp_v2.executable_edge) uses for eligibility.
+    confidence = float(residual["confidence"])
+    adaptive_residual = _clamp(residual["mean"], -SCALP_RESIDUAL_MAX, SCALP_RESIDUAL_MAX)
+    # Bounded microstructure residual: shrunk by the model's own sample count so
+    # a cold model barely moves the edge. Zero-centred (excludes the model bias).
     micro_tilt, micro_n = micro_edge_tilt(db_path, SCALP_ENGINE, features)
     micro_conf = micro_n / (micro_n + MICRO_MODEL_CONF_K) if micro_n > 0 else 0.0
-    edge = edge + micro_conf * micro_tilt
+    micro_residual = micro_conf * micro_tilt
+    # Telemetry only: the canonical executable edge is the single live negative-edge gate.
+    learned = forward if forward["n"] > 0 else net
+    learned_net = learned["mean"]
+    abstain, abstain_reason = _abstain(learned_net, learned["confidence"])
     return {
         "adaptive_state_version": ADAPTIVE_STATE_VERSION,
         "engine_id": SCALP_ENGINE,
         "symbol": str(symbol or "").upper(),
         "setup": str(setup or "").upper(),
         "regime": str(regime or "").lower(),
-        "expected_edge": edge,
-        "edge_prior": net["prior"],
+        "adaptive_residual": adaptive_residual,
+        "adaptive_residual_raw": residual["mean"],
+        "n_residual": residual["n"],
+        "adaptive_residual_strategy": _clamp(residual_strategy["mean"], -SCALP_RESIDUAL_MAX, SCALP_RESIDUAL_MAX),
+        "n_residual_strategy": residual_strategy["n"],
+        "confidence_strategy": float(residual_strategy["confidence"]),
+        "micro_residual": micro_residual,
+        "micro_tilt": round(micro_residual, 6),
+        "micro_tilt_raw": round(micro_tilt, 6),
+        "micro_model_n": micro_n,
         "confidence": confidence,
-        "uncertainty": abs(net["prior"]) * (1.0 - confidence),
         "mfe": learned_mfe,
-        "mae": mae["mean"],
+        "mae": path_mae["mean"],
         "target_pct": _clamp(learned_mfe, *SCALP_TARGET_BOUNDS),
         "hold_min": _clamp(timing["mean"], SCALP_HOLD_FLOOR_MIN, hard_hold),
         "hold_hard_max_min": hard_hold,
-        "size_mult": _clamp(1.0 + 0.40 * _tilt(edge, net["prior"]), lo, hi),
-        "risk_estimate": mae["mean"],
+        "size_mult": 1.0,
+        "risk_estimate": path_mae["mean"],
+        "risk_source": "markout_mae_gross_path",
+        "n_risk": path_mae["n"],
         "time_to_mfe_min": timing["mean"],
         "n_net": net["n"],
         "n_forward": forward["n"],
-        "micro_tilt": round(micro_conf * micro_tilt, 6),
-        "micro_tilt_raw": round(micro_tilt, 6),
-        "micro_model_n": micro_n,
-        "abstain": _abstain(edge, confidence)[0],
-        "abstain_reason": _abstain(edge, confidence)[1],
-        "abstain_net_edge": edge,
-        "abstain_confidence": confidence,
+        "abstain": abstain,
+        "abstain_reason": abstain_reason,
+        "abstain_net_edge": learned_net,
+        "abstain_confidence": learned["confidence"],
+        "abstain_live_veto": False,
     }
 
 
@@ -695,6 +748,8 @@ def record_candidate(
     signaled: bool,
     evaluated_at: float | None = None,
     features: dict | None = None,
+    raw_expected_move: float | None = None,
+    raw_move_source: str | None = None,
 ) -> None:
     engine_id = str(engine or "").upper()
     version = current_strategy_version(engine_id)
@@ -702,13 +757,17 @@ def record_candidate(
         return
     feats_json = _stored_features(features)
     horizon = _label_horizon_for(db_path, engine_id, symbol, setup, regime)
+    raw_move: float | None = None
+    with contextlib.suppress(TypeError, ValueError):
+        raw_move = float(raw_expected_move) if raw_expected_move is not None and float(raw_expected_move) > 0 else None
     with _connect(db_path) as conn:
         conn.execute(
             """
             INSERT INTO adaptive_candidate_markouts (
                 engine_id, symbol, setup, regime, strategy_version, signaled,
-                ref_price, roundtrip_cost, evaluated_at, features_json, label_horizon
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ref_price, roundtrip_cost, evaluated_at, features_json, label_horizon,
+                raw_expected_move, raw_move_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 engine_id,
@@ -722,18 +781,52 @@ def record_candidate(
                 float(evaluated_at or time.time()),
                 feats_json,
                 float(horizon),
+                raw_move,
+                str(raw_move_source) if raw_move is not None and raw_move_source else None,
             ),
         )
         conn.commit()
 
 
-def resolve_markouts(db_path: str, quote: Callable[[str, float], float | None], *, now: float | None = None) -> int:
+def scalp_edge_residual(*, forward_net: float, raw_expected_move: float, roundtrip_cost: float) -> float:
+    """Realized net markout minus the decision-time base executable edge."""
+    return float(forward_net) - (float(raw_expected_move) - float(roundtrip_cost))
+
+
+def scalp_gross_path_mae(*, ref_price: float, roundtrip_cost: float, marks: list[float], path_low: float | None) -> float | None:
+    """Gross adverse excursion from the entry reference over the committed horizon.
+
+    ``marks`` are net forward marks (cost already subtracted); they are put back
+    into gross price units before combining with the bar-low path.
+    """
+    if ref_price <= 0:
+        return None
+    prices = [float(ref_price) * (1.0 + float(m) + float(roundtrip_cost)) for m in marks]
+    if path_low is not None and math.isfinite(float(path_low)) and float(path_low) > 0:
+        prices.append(float(path_low))
+    if not prices:
+        return None
+    return max(0.0, (float(ref_price) - min(prices)) / float(ref_price))
+
+
+def resolve_markouts(
+    db_path: str,
+    quote: Callable[[str, float], float | None],
+    *,
+    now: float | None = None,
+    path_low: Callable[[str, float, float], float | None] | None = None,
+) -> int:
     """Fill due forward marks and fold the decision-time horizon into state.
 
     Every horizon is stored. The learned label is the return at the horizon
     stamped when the candidate was recorded — not the best later horizon.
     A row is claimed (learned=1) before the state write so a locked retry
     cannot train the same markout twice. Returns rows newly learned.
+
+    SCALP rows also learn the edge residual (label minus the decision-time base
+    executable edge) and the gross path MAE over the committed horizon, which
+    is the live risk estimate. ``path_low(symbol, start, end)`` supplies the
+    bar-low path when available.
     """
     moment = float(now if now is not None else time.time())
     learned = 0
@@ -779,6 +872,20 @@ def resolve_markouts(db_path: str, quote: Callable[[str, float], float | None], 
                 path = [_mark_at(marks, h) for h in horizons if h <= label_h + 1e-9]
                 path = [v for v in path if v is not None]
                 mae = max(0.0, -min(path)) if path else None
+                residual = None
+                micro_target = forward
+                if engine_id == SCALP_ENGINE:
+                    low = None
+                    if path_low is not None and forward is not None:
+                        with contextlib.suppress(Exception):
+                            low = path_low(str(row["symbol"]), float(row["evaluated_at"]), float(row["evaluated_at"]) + label_h)
+                    mae = scalp_gross_path_mae(ref_price=float(row["ref_price"]), roundtrip_cost=float(row["roundtrip_cost"] or 0), marks=path, path_low=low)
+                    cols = row.keys()
+                    raw_move = row["raw_expected_move"] if "raw_expected_move" in cols else None
+                    raw_source = row["raw_move_source"] if "raw_move_source" in cols else None
+                    if forward is not None and raw_move is not None and float(raw_move) > 0:
+                        residual = scalp_edge_residual(forward_net=forward, raw_expected_move=float(raw_move), roundtrip_cost=float(row["roundtrip_cost"] or 0))
+                    micro_target = residual
                 row_learned = int(row["learned"] or 0)
                 version_ok = str(row["strategy_version"]) == current_strategy_version(engine_id)
                 if forward is not None and not row_learned and version_ok:
@@ -811,11 +918,22 @@ def resolve_markouts(db_path: str, quote: Callable[[str, float], float | None], 
                             value=mae,
                             strategy_version=str(row["strategy_version"]),
                         )
-                    if engine_id == SCALP_ENGINE:
+                    if residual is not None:
+                        observe(
+                            db_path,
+                            engine=engine_id,
+                            symbol=row["symbol"],
+                            setup=row["setup"],
+                            regime=row["regime"],
+                            metric=residual_metric(raw_source),
+                            value=residual,
+                            strategy_version=str(row["strategy_version"]),
+                        )
+                    if engine_id == SCALP_ENGINE and micro_target is not None:
                         with contextlib.suppress(Exception):
                             feats = json.loads(row["features_json"] or "{}")
                             if isinstance(feats, dict) and feats:
-                                update_linear_model(db_path, SCALP_ENGINE, "micro_edge", feats, forward)
+                                update_linear_model(db_path, SCALP_ENGINE, "micro_edge", feats, micro_target)
                     learned += 1
                 else:
                     conn.execute(
@@ -857,6 +975,30 @@ def ohlcv_quote(db_path: str, symbol: str, epoch: float) -> float | None:
                         continue
                     if opened <= epoch < opened + sec + 2:
                         return float(close)
+    finally:
+        conn.close()
+    return None
+
+
+def ohlcv_low_between(db_path: str, symbol: str, start: float, end: float) -> float | None:
+    """Lowest 1m low over bars opening in [start, end). The decision-minute bar is excluded."""
+    raw = str(symbol or "").upper().replace("-", "").replace("/", "")
+    lo_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(math.ceil(float(start) / 60.0) * 60.0))
+    hi_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(end)))
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        for variant in (raw, raw.replace("USDT", "-USDT"), raw.replace("USDT", "/USDT")):
+            row = conn.execute(
+                "SELECT MIN(low) FROM feature_ohlcv WHERE symbol=? AND interval='1m' AND ts>=? AND ts<?",
+                (variant, lo_s, hi_s),
+            ).fetchone()
+            if row and row[0] is not None:
+                return float(row[0])
+    except sqlite3.Error:
+        return None
     finally:
         conn.close()
     return None
@@ -999,13 +1141,13 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                             "symbol": k["symbol"],
                             "setup": k["setup"],
                             "regime": k["regime"],
-                            "expected_edge": round(view["expected_edge"], 6),
-                            "size_mult": round(view["size_mult"], 4),
+                            "adaptive_residual": round(view["adaptive_residual"], 6),
+                            "risk_estimate": round(view["risk_estimate"], 6),
                             "target_pct": round(view["target_pct"], 5),
                             "hold_min": round(view["hold_min"], 2),
                             "confidence": round(view["confidence"], 3),
                             "abstain": view["abstain"],
-                            "n": view["n_net"],
+                            "n": view["n_residual"],
                         }
                     )
             out["engines"][engine_id] = rows

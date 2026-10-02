@@ -199,6 +199,7 @@ def candidate_executable_edge(
     spread_pct: float,
     impact_pct: float,
     micro_feats: dict | None,
+    edge_source: str = "atr_estimate",
 ) -> tuple[Any, dict, str]:
     """(ExecutableEdge, stamped adaptive view, adaptive regime) for one candidate."""
     from backend.services.adaptive_learning import scalp_decision
@@ -206,7 +207,7 @@ def candidate_executable_edge(
 
     regime_key = _adaptive_regime(db_path, symbol)
     view = scalp_decision(db_path, symbol.upper().replace("/", "").replace("-", ""), setup, regime_key, features=micro_feats or {})
-    edge = scalp_executable_edge(view, raw_expected_move_pct=raw_expected_move_pct, spread_pct=spread_pct, impact_pct=impact_pct)
+    edge = scalp_executable_edge(view, raw_expected_move_pct=raw_expected_move_pct, spread_pct=spread_pct, impact_pct=impact_pct, edge_source=edge_source)
     return edge, stamp_view(view, edge), regime_key
 
 
@@ -383,6 +384,7 @@ def rank_setup_signal(
             spread_pct=ctx.snap.spread_pct,
             impact_pct=impact,
             micro_feats=micro_feats,
+            edge_source=edge_source,
         )
     except Exception:
         # Fail closed: an edge that cannot be priced cannot be traded.
@@ -398,13 +400,13 @@ def rank_setup_signal(
             expected_move_pct=expected,
             edge_source=edge_source,
         )
-    reach_surplus = float(edge.edge_after_cost_pct)
+    reach_surplus = float(edge.final_executable_edge_pct)
     reach_mult_val = _edge_soft_mult(reach_surplus, soft_entry=not sig.passed)
     rank_score *= reach_mult_val
     target_gap_val = reach_surplus
     edge_fields = {
         "expected_move_pct": expected,
-        "roundtrip_cost_pct": float(edge.canonical_cost_pct),
+        "roundtrip_cost_pct": float(edge.live_cost_pct),
         "net_edge_after_costs_pct": reach_surplus,
         "edge_source": edge_source,
         "executable_edge": edge.as_dict(),
@@ -485,7 +487,7 @@ def rank_setup_signal(
             _stats = _learn_cache_set(stats_key, _gls(_db, sig.symbol, f"SCALP_V2@{SCALP_STRATEGY_VERSION}"))
         role_samples = _stats.sample_count
         role_conf_status = _stats.confidence_status
-    learned_adj = round(max(-0.04, min(0.04, (edge.edge_after_cost_pct - edge.edge_prior_pct) * 8.0)), 5)
+    learned_adj = round(max(-0.04, min(0.04, edge.final_executable_edge_pct * 8.0)), 5)
 
     # select_v2: EV_10s is the primary four-coin key (frozen validation).
     # DAY get_microstructure_ranking_delta is not used here.

@@ -346,7 +346,7 @@ def test_scalp_soft_opinions_do_not_veto_and_history_is_market_data():
     assert soft.isdisjoint(HARD_REJECT_REASONS)
     hard = {"SPREAD_TOO_WIDE", "DEPTH_OR_IMPACT_FAIL", "NO_EXECUTABLE_NET_EDGE", "NO_EXECUTABLE_EDGE_ESTIMATE", "INSUFFICIENT_BARS", "INSUFFICIENT_HISTORY", "STALE_DATA"}
     assert hard <= HARD_REJECT_REASONS
-    assert classify_scalp_candidate({"entry_eligible": True, "hard_block": None, "soft_reason": "NOT_NEAR_SUPPORT", "executable_edge": {"edge_after_cost_pct": 0.0004}})[0] == "ARMED"
+    assert classify_scalp_candidate({"entry_eligible": True, "hard_block": None, "soft_reason": "NOT_NEAR_SUPPORT", "executable_edge": {"final_executable_edge_pct": 0.0004}})[0] == "ARMED"
     assert classify_scalp_candidate({"entry_eligible": False, "hard_block": "NO_EXECUTABLE_NET_EDGE"})[0] == "REJECTED:NO_EXECUTABLE_NET_EDGE"
     assert classify_scalp_candidate({"entry_eligible": False, "hard_block": "INSUFFICIENT_HISTORY"})[0] == "REJECTED:INSUFFICIENT_HISTORY"
     assert "insufficient_windows" in inspect.getsource(MomentumDiagnostics)

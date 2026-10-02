@@ -113,7 +113,8 @@ def test_soft_strategy_opinion_never_holds_an_eligible_candidate():
     from backend.services.scalp_v2.decision_log import classify_scalp_candidate
 
     for soft in ("NO_PULLBACK_RECOVERY", "WEAK_REJECTION_WICK", "NO_REBOUND", "GREEN_CHASE"):
-        assert classify_scalp_candidate({"entry_eligible": True, "hard_block": None, "soft_reason": soft, "snap": object(), "executable_edge": {"edge_after_cost_pct": 0.0004}}) == ("ARMED", "ARMED")
+        armed = {"entry_eligible": True, "hard_block": None, "soft_reason": soft, "snap": object(), "executable_edge": {"final_executable_edge_pct": 0.0004}}
+        assert classify_scalp_candidate(armed) == ("ARMED", "ARMED")
     assert classify_scalp_candidate({"entry_eligible": False, "hard_block": None, "soft_reason": "NO_PULLBACK_RECOVERY"})[0] == "REJECTED:ENTRY_NOT_ELIGIBLE"
 
 

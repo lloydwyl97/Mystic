@@ -1810,10 +1810,10 @@ class PortfolioEngineIntegration:
             if not candidates:
                 return
             from backend.config.trading_economics import canonical_roundtrip_cost_pct
-            from backend.services.adaptive_learning import day_decision, ohlcv_quote, resolve_markouts
+            from backend.services.adaptive_learning import day_decision, ohlcv_low_between, ohlcv_quote, resolve_markouts
             from backend.services.day_v2.ranking import rank_day_candidates
 
-            resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts))
+            resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts), path_low=lambda sym, a, b: ohlcv_low_between(db_path, sym, a, b))
             for cand in candidates:
                 sig = cand["signal"]
                 regime_tag = str(cand.get("regime_tag") or sig.regime or "")
@@ -2129,10 +2129,14 @@ class PortfolioEngineIntegration:
 
         release_orphan_reservations(self.engine.db_path, now=cycle_ts)
         from backend.config.trading_economics import canonical_roundtrip_cost_pct
-        from backend.services.adaptive_learning import market_regime_tag, ohlcv_quote, record_candidate, resolve_markouts
+        from backend.services.adaptive_learning import market_regime_tag, ohlcv_low_between, ohlcv_quote, record_candidate, resolve_markouts
         from backend.services.scalp_v2.executable_edge import decision_detail
 
-        resolve_markouts(self.engine.db_path, lambda sym, ts: ohlcv_quote(self.engine.db_path, sym, ts))
+        resolve_markouts(
+            self.engine.db_path,
+            lambda sym, ts: ohlcv_quote(self.engine.db_path, sym, ts),
+            path_low=lambda sym, a, b: ohlcv_low_between(self.engine.db_path, sym, a, b),
+        )
         by_symbol = {str(row.get("symbol") or "").upper().replace("-", "").replace("/", ""): row for row in candidates}
         products = [str(s) for s in getattr(cfg, "products", [])] or list(by_symbol)
 
@@ -2165,6 +2169,8 @@ class PortfolioEngineIntegration:
                 roundtrip_cost=canonical_roundtrip_cost_pct(spread_pct=(float(micro_feats["spread_pct"]) if micro_feats.get("spread_pct") is not None else None)),
                 signaled=signaled,
                 features=micro_feats,
+                raw_expected_move=(row.get("executable_edge") or {}).get("raw_expected_move_pct"),
+                raw_move_source=(row.get("executable_edge") or {}).get("raw_move_source"),
             )
             return {"setup": setup_name, "regime": regime, "features": micro_feats, "ref_price": ref_price}
 
@@ -2179,7 +2185,7 @@ class PortfolioEngineIntegration:
             # eligibility, priority and size read the same numbers.
             view = row.get("adaptive_decision") or {}
             edge = row.get("executable_edge") or {}
-            return float(edge.get("edge_after_cost_pct") or 0.0) + 0.001 * float(view.get("confidence") or 0.0)
+            return float(edge.get("final_executable_edge_pct") or 0.0) + 0.001 * float(view.get("confidence") or 0.0)
 
         for sym_raw in sorted(products, key=_scalp_priority, reverse=True):
             norm_key = sym_raw.upper().replace("-", "").replace("/", "")
@@ -2206,20 +2212,6 @@ class PortfolioEngineIntegration:
                         record_scalp_decision(self.engine.db_path, norm, "REJECTED:SYMBOL_OCCUPIED", "SYMBOL_OCCUPIED", cycle_ts=cycle_ts, detail=decision_detail(row))
                         logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:SYMBOL_OCCUPIED", norm)
                         continue
-                # Evidence-gated abstention (LIVE skip). Confident negative net
-                # expectancy only; cold keys never abstain. Skip-only, above hard safety.
-                _adapt = (row or {}).get("adaptive_decision") or {}
-                if isinstance(_adapt, dict) and _adapt.get("abstain"):
-                    record_scalp_decision(
-                        self.engine.db_path,
-                        norm,
-                        "REJECTED:LEARNED_NEGATIVE_EDGE",
-                        str(_adapt.get("abstain_reason") or ""),
-                        cycle_ts=cycle_ts,
-                        detail=decision_detail(row),
-                    )
-                    logger.info("SCALP_V2_ABSTAIN symbol=%s reason=%s", norm, _adapt.get("abstain_reason"))
-                    continue
                 arm_price = 0.0
                 snap = (row or {}).get("snap")
                 if snap is not None:
