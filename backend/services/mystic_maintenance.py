@@ -875,11 +875,19 @@ def http_json(url: str, *, timeout: float = 15.0) -> tuple[int, dict[str, Any] |
         return 0, None
 
 
-def exchange_open_orders_count() -> int | None:
-    """Open Binance.US orders via the existing readiness probe. ``None`` = unknown."""
+def exchange_open_orders_count(env_file: Path | None = None) -> int | None:
+    """Open Binance.US orders via the existing readiness probe. ``None`` = unknown.
+
+    Cron does not inherit the app environment, so credentials are loaded from the same
+    ``.env`` start_mystic.sh sources (in-process only; never logged).
+    """
     import asyncio
 
     try:
+        if env_file is not None and env_file.is_file():
+            from dotenv import load_dotenv
+
+            load_dotenv(env_file, override=False)
         from backend.services.live_readiness_service import _fetch_exchange_account_auth
 
         res = asyncio.run(_fetch_exchange_account_auth())
@@ -976,7 +984,7 @@ def maybe_reboot(
     upgrade_held: Callable[[list[str]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     fetch_status = fetch_status or (lambda: http_json(cfg.status_url))
-    open_orders = open_orders or exchange_open_orders_count
+    open_orders = open_orders or (lambda: exchange_open_orders_count(cfg.repo / ".env"))
     held = (held_pending or held_upgrades_pending)()
     required = cfg.reboot_flag.exists() or bool(held)
     out: dict[str, Any] = {"reboot_required": required, "reboot_flag": cfg.reboot_flag.exists(), "held_upgrades": held, "rebooted": False}

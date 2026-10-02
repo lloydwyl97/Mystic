@@ -408,3 +408,27 @@ def test_deploy_lock_makes_run_measure_only(cfg):
     out = m.run_maintenance(cfg, dry_run=False, owner_task=_owner_task_direct(cfg), reboot_fn=lambda: {})
     assert out["skipped"].startswith("deploy_lock_held")
     assert all(p.exists() for p in files)
+
+
+def test_open_orders_probe_loads_env_file_and_unknown_on_auth_failure(tmp_path, monkeypatch):
+    import backend.services.live_readiness_service as lrs
+
+    env = tmp_path / ".env"
+    env.write_text("MAINT_TEST_PROBE_KEY=loaded\n")
+    monkeypatch.delenv("MAINT_TEST_PROBE_KEY", raising=False)
+    seen = {}
+
+    async def ok():
+        seen["key"] = os.environ.get("MAINT_TEST_PROBE_KEY")
+        return {"binance_api_auth_status": "ok", "errors": [], "open_binance_orders_count": 2}
+
+    monkeypatch.setattr(lrs, "_fetch_exchange_account_auth", ok)
+    assert m.exchange_open_orders_count(env) == 2
+    assert seen["key"] == "loaded"
+
+    async def missing():
+        return {"binance_api_auth_status": "missing_keys", "errors": ["missing"], "open_binance_orders_count": 0}
+
+    monkeypatch.setattr(lrs, "_fetch_exchange_account_auth", missing)
+    assert m.exchange_open_orders_count(env) is None
+    monkeypatch.delenv("MAINT_TEST_PROBE_KEY", raising=False)
