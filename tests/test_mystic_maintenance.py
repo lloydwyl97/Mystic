@@ -104,6 +104,11 @@ def test_backup_create_verify_compress_round_trip(cfg):
     [info] = m.list_backups(cfg.backup_dir)
     assert info.verified and not info.compressed
     assert oct(info.path.stat().st_mode & 0o777) == "0o600"
+    assert sorted(p.name for p in cfg.backup_dir.iterdir()) == sorted([info.path.name, info.manifest_path.name])
+    conn = sqlite3.connect(info.path)
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    assert conn.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0] == 50
+    conn.close()
     out = m.compress_backup(info, owner=cfg.owner)
     assert out["status"] == "ok"
     [gz] = m.list_backups(cfg.backup_dir)

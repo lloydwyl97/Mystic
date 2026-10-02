@@ -522,6 +522,9 @@ def create_backup(cfg: MaintConfig, *, dry_run: bool, reason: str = "scheduled")
         dst = sqlite3.connect(str(partial))
         try:
             src.backup(dst)
+            # A self-contained single file: no -wal/-shm sidecars appear when it is read
+            # (the app re-enables WAL on its own connections after a restore).
+            dst.execute("PRAGMA journal_mode=DELETE")
         finally:
             dst.close()
             src.close()
@@ -551,6 +554,9 @@ def create_backup(cfg: MaintConfig, *, dry_run: bool, reason: str = "scheduled")
     except Exception as exc:
         partial.unlink(missing_ok=True)
         return {"status": "error", "error": str(exc)[:300]}
+    finally:
+        for suffix in ("-wal", "-shm", "-journal"):
+            Path(f"{partial}{suffix}").unlink(missing_ok=True)
     out = {"status": "ok", "path": str(final), "bytes": manifest["bytes"], "elapsed_sec": round(time.monotonic() - started, 1)}
     logger.info("MAINT backup_created %s", json.dumps(out))
     return out
