@@ -105,7 +105,7 @@ def test_live_get_balance_payload_is_complete_nle_not_zero_cash():
 
 
 def test_nle_snapshot_is_readable_by_another_process(tmp_path):
-    snap = build_canonical_nle(balances=_complete_balances(), bids=_bids(), as_of_epoch=1, now_epoch=1)
+    snap = build_canonical_nle(balances=_complete_balances(), bids=_bids())
     db = str(tmp_path / "nle.db")
     persist_canonical_nle_snapshot(db, snap)
     loaded = load_canonical_nle_snapshot(db)
@@ -113,6 +113,30 @@ def test_nle_snapshot_is_readable_by_another_process(tmp_path):
     assert loaded["usable"] is True
     assert decide_account_failsafe(loaded, "228.07")["reason"] != "missing_nle_snapshot_cannot_compare"
     assert load_canonical_nle_snapshot(str(tmp_path / "missing.db")) is None
+
+
+def test_persisted_nle_snapshot_goes_stale_at_read_time(tmp_path):
+    snap = build_canonical_nle(balances=_complete_balances(), bids=_bids(), as_of_epoch=1000.0, now_epoch=1000.0)
+    db = str(tmp_path / "nle.db")
+    persist_canonical_nle_snapshot(db, snap)
+    fresh = load_canonical_nle_snapshot(db, now_epoch=1030.0)
+    old = load_canonical_nle_snapshot(db, now_epoch=1000.0 + 600.0)
+    assert fresh["usable"] is True
+    assert old["stale"] is True and old["usable"] is False
+    assert decide_account_failsafe(old, "228.07")["reason"] == "stale_nle_cannot_compare"
+
+
+def test_engine_failsafe_reads_shared_snapshot_when_memory_is_empty(tmp_path):
+    from types import SimpleNamespace
+
+    from backend.services.portfolio_engine import PortfolioEngine
+
+    db = str(tmp_path / "nle.db")
+    persist_canonical_nle_snapshot(db, build_canonical_nle(balances=_complete_balances(), bids=_bids()))
+    fake = SimpleNamespace(_canonical_nle_snapshot=None, db_path=db, principal=228.07)
+    out = PortfolioEngine._canonical_failsafe_decision(fake)
+    assert out["reason"] != "missing_nle_snapshot_cannot_compare"
+    assert out["usable"] is True
 
 
 def test_unparsed_live_payload_is_not_complete_zero_cash():

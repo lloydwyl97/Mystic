@@ -23879,9 +23879,15 @@ class PortfolioEngine:
         return any(trig.startswith(p) for p in protective_prefixes)
 
     def _canonical_failsafe_decision(self) -> dict[str, Any]:
-        from backend.services.canonical_failsafe_equity import decide_account_failsafe
+        from backend.services.canonical_failsafe_equity import decide_account_failsafe, load_canonical_nle_snapshot
 
-        return decide_account_failsafe(getattr(self, "_canonical_nle_snapshot", None), getattr(self, "principal", 0.0))
+        snap = getattr(self, "_canonical_nle_snapshot", None)
+        if not snap:
+            try:
+                snap = load_canonical_nle_snapshot(self.db_path)
+            except Exception as exc:
+                logger.warning("CANONICAL_NLE_LOAD_FAILED err=%s", exc)
+        return decide_account_failsafe(snap, getattr(self, "principal", 0.0))
 
     def _check_kill_switch_buy(self) -> tuple[bool, str]:
         """Check if buy is blocked by kill switch"""

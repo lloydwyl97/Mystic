@@ -294,8 +294,12 @@ def persist_canonical_nle_snapshot(db_path: str, snapshot: dict[str, Any]) -> No
         conn.close()
 
 
-def load_canonical_nle_snapshot(db_path: str) -> dict[str, Any] | None:
-    """Return the last snapshot written by the trading process, or None."""
+def load_canonical_nle_snapshot(db_path: str, *, now_epoch: float | None = None) -> dict[str, Any] | None:
+    """Return the last snapshot written by the trading process, or None.
+
+    Age and usability are recomputed at read time, so an old row can never be
+    compared as if it were fresh.
+    """
     import json
     import sqlite3
 
@@ -309,4 +313,12 @@ def load_canonical_nle_snapshot(db_path: str) -> dict[str, Any] | None:
     if not row or not row[0]:
         return None
     loaded = json.loads(row[0])
-    return loaded if isinstance(loaded, dict) else None
+    if not isinstance(loaded, dict):
+        return None
+    now = float(now_epoch if now_epoch is not None else time.time())
+    age = max(0.0, now - float(loaded.get("as_of_epoch") or 0.0))
+    stale = age > STALE_AFTER_SEC
+    loaded["age_sec"] = age
+    loaded["stale"] = stale
+    loaded["usable"] = bool(loaded.get("complete") and not stale and loaded.get("net_liquidatable_equity") is not None)
+    return loaded
