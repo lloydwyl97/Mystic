@@ -43,7 +43,9 @@ class TrendPullbackMicroStrategy:
         if not (pullback and resume):
             return reject_signal(ctx, self.name, "NO_MICRO_PULLBACK")
 
-        expected = estimate_expected_move_pct(bars, structural=0.0025, atr_mult=0.60, cap_pct=0.006)
+        structural = 0.0025
+
+        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.60, cap_pct=0.006)
         reachable, _ = target_reachable(
             ctx.econ,
             spread_pct=ctx.snap.spread_pct,
@@ -51,7 +53,7 @@ class TrendPullbackMicroStrategy:
             expected_move_pct=expected,
         )
         if not reachable:
-            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
+            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
 
         cur = ctx.snap.mid
         score = 2.25 + max(0.0, mom.mid_change_15s) * 4000.0 + abs(cur - ema5) / max(ema5, 1e-12) * 200.0
@@ -63,6 +65,7 @@ class TrendPullbackMicroStrategy:
             entry_reason=f"micro_pullback_ema5_{ema5:.6f}",
             invalidation_reason="pullback_fails_to_resume",
             expected_move_pct=expected,
+            directional_move_pct=structural,
             impact_pct=impact,
             limit_buy=fill,
             setup_context={"ema5": ema5},

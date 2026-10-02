@@ -24,6 +24,10 @@ class ScalpSetupSignal:
     passed: bool
     reject_reason: str | None
     setup_context: dict[str, Any] = field(default_factory=dict)
+    # The strategy's own directional projection (structural target distance).
+    # ``expected_move_pct`` blends in ATR as a magnitude floor; ATR is not a
+    # direction, so only this field may seed the executable edge. 0 = no claim.
+    directional_move_pct: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -43,6 +47,7 @@ class ScalpSetupSignal:
             "passed": self.passed,
             "reject_reason": self.reject_reason,
             "setup_context": self.setup_context,
+            "directional_move_pct": self.directional_move_pct,
         }
 
 

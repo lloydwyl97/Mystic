@@ -43,7 +43,9 @@ class CompressionBreakoutStrategy:
         if not expansion:
             return reject_signal(ctx, self.name, "NO_COMPRESSION_BREAK")
 
-        expected = estimate_expected_move_pct(bars, structural=0.0030, atr_mult=0.70, cap_pct=0.006)
+        structural = 0.0030
+
+        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.70, cap_pct=0.006)
         reachable, _ = target_reachable(
             ctx.econ,
             spread_pct=ctx.snap.spread_pct,
@@ -51,7 +53,7 @@ class CompressionBreakoutStrategy:
             expected_move_pct=expected,
         )
         if not reachable:
-            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
+            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
 
         score = 2.50 + max(0.0, 1.4 - range_pct * 200.0) * 0.15 + (vol_recent / max(vol_prior, 1e-12)) * 0.08
         return pass_signal(
@@ -62,6 +64,7 @@ class CompressionBreakoutStrategy:
             entry_reason=f"compression_break_range_{range_pct:.5f}",
             invalidation_reason="no_follow_through_or_vol_fades",
             expected_move_pct=expected,
+            directional_move_pct=structural,
             impact_pct=impact,
             limit_buy=fill,
             setup_context={"range_pct": range_pct},

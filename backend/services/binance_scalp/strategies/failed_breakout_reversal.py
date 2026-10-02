@@ -47,7 +47,9 @@ class FailedBreakoutReversalStrategy:
         if not (probed and rejected_below_high and up_mom):
             return reject_signal(ctx, self.name, "NO_FAILED_BREAKOUT_RECLAIM")
 
-        expected = estimate_expected_move_pct(bars, structural=0.0022, atr_mult=0.60, cap_pct=0.006)
+        structural = 0.0022
+
+        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.60, cap_pct=0.006)
         reachable, _ = target_reachable(
             ctx.econ,
             spread_pct=ctx.snap.spread_pct,
@@ -55,7 +57,7 @@ class FailedBreakoutReversalStrategy:
             expected_move_pct=expected,
         )
         if not reachable:
-            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
+            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
 
         # Same score band as working strategies (~2.0-3.0+); floor is SCALP_MIN_TRADEABLE_SCORE=1.45.
         score = 2.35 + max(0.0, (high - cur) / high) * 280.0 + mom.mid_change_15s * 3500.0
@@ -67,6 +69,7 @@ class FailedBreakoutReversalStrategy:
             entry_reason=f"failed_breakout_reclaim_{high:.6f}",
             invalidation_reason="reclaim_fails_or_momentum_fades",
             expected_move_pct=expected,
+            directional_move_pct=structural,
             impact_pct=impact,
             limit_buy=fill,
             setup_context={"failed_high": high},

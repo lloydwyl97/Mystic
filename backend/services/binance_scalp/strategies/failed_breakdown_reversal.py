@@ -48,7 +48,9 @@ class FailedBreakdownReversalStrategy:
         if not (reclaimed and vol_ok and mom_ok):
             return reject_signal(ctx, self.name, "NO_REVERSAL_CONFIRM")
 
-        expected = estimate_expected_move_pct(bars, structural=0.0028, atr_mult=0.65, cap_pct=0.006)
+        structural = 0.0028
+
+        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.65, cap_pct=0.006)
         reachable, _ = target_reachable(
             ctx.econ,
             spread_pct=ctx.snap.spread_pct,
@@ -56,7 +58,7 @@ class FailedBreakdownReversalStrategy:
             expected_move_pct=expected,
         )
         if not reachable:
-            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
+            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
 
         # Align pass score with working strategies (~2.0-3.0+ vs floor 1.45).
         score = 2.45 + max(0.0, (cur - sweep_low) / max(sweep_low, 1e-12)) * 350.0 + (vol_recent / vol_prior) * 0.12
@@ -68,6 +70,7 @@ class FailedBreakdownReversalStrategy:
             entry_reason=f"failed_breakdown_reclaim_{sweep_low:.6f}",
             invalidation_reason="reclaim_fails_or_momentum_fades",
             expected_move_pct=expected,
+            directional_move_pct=structural,
             impact_pct=impact,
             limit_buy=fill,
             setup_context={"sweep_low": sweep_low, "vol_ratio": vol_recent / vol_prior},

@@ -45,7 +45,7 @@ class OrderbookTapeScalpStrategy:
         expected = estimate_expected_move_pct(ctx.bars_1m, structural=structural, atr_mult=0.50, cap_pct=0.006)
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
-            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
+            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
 
         score = 2.0 + imb * 10 + mom.bid_change_15s * 4000
         return pass_signal(
@@ -56,6 +56,7 @@ class OrderbookTapeScalpStrategy:
             entry_reason=f"bid_imbalance={imb:.3f}_bid_stepping",
             invalidation_reason="bid_pressure_gone_price_rollover",
             expected_move_pct=expected,
+            directional_move_pct=structural,
             impact_pct=impact,
             limit_buy=fill,
             setup_context={"imbalance": imb, "bid_qty_top5": bid_qty, "ask_qty_top5": ask_qty},

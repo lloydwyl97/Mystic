@@ -49,10 +49,12 @@ class BreakoutMomentumStrategy:
         if move_from_low > 0.006:
             return reject_signal(ctx, self.name, "MOVE_EXHAUSTED_CHASE")
 
-        expected = estimate_expected_move_pct(bars, structural=min(range_pct * 0.55, 0.005), atr_mult=0.65, cap_pct=0.006)
+        structural = min(range_pct * 0.55, 0.005)
+
+        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.65, cap_pct=0.006)
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
-            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
+            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
 
         score = 3.0 + vol_expansion + move_from_low * 200 + mom.bid_change_15s * 5000
         return pass_signal(
@@ -63,6 +65,7 @@ class BreakoutMomentumStrategy:
             entry_reason=f"breakout_above_{breakout_level:.6f}_vol_x{vol_expansion:.2f}",
             invalidation_reason="price_below_breakout_level_with_negative_momentum",
             expected_move_pct=expected,
+            directional_move_pct=structural,
             impact_pct=impact,
             limit_buy=fill,
             setup_context={

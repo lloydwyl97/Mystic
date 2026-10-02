@@ -3499,7 +3499,10 @@ class PortfolioEngine:
                     getattr(lot, "engine_id", ""),
                 )
             return
-        if abs(engine_sum + held_dust - snapped) <= tol:
+        owned = engine_sum + held_dust
+        # Dust lots are sub-step by nature: an exact match against the raw
+        # balance is healthy even when the step-floored balance differs.
+        if abs(owned - float(exchange_qty)) <= max(1e-12, 1e-9 * float(exchange_qty)) or abs(owned - snapped) <= tol:
             # A stamp above the real surplus makes free - protected < lot qty
             # and strands the lot's exit (plan_sell_quantity sells 0).
             try:
@@ -4762,6 +4765,55 @@ class PortfolioEngine:
                 prices[ns] = last_px
 
         return prices
+
+    async def _scalp_exit_quote(self, symbol: str, *, executable_quote_only: bool = False) -> tuple[dict[str, Any] | None, float | None]:
+        """(mark fields, executable best bid) for a SCALP lot's exit check.
+
+        Primary: the SCALP websocket depth book (<= SCALP_WS_DEPTH_MAX_AGE_SEC
+        old, no REST). Fallback on the full pass: the canonical REST mark and
+        its bookTicker bid when fresh. A stale or bid-less quote returns no
+        executable bid, and the exit branch logs that it is pricing from mark.
+        """
+        quote = None
+        try:
+            reader = getattr(self, "_scalp_book_reader", None)
+            if reader is None:
+                from backend.services.binance_scalp.market_reader import ScalpMarketReader
+
+                reader = ScalpMarketReader()
+                self._scalp_book_reader = reader
+            quote = reader.read_top_of_book(symbol)
+        except Exception:
+            quote = None
+        if quote is not None:
+            bid, mid = float(quote[0]), float(quote[1])
+            now = time.time()
+            return (
+                {
+                    "mark_used": mid,
+                    "mark_source": "scalp_ws_depth_mid",
+                    "mark_timestamp": now,
+                    "mark_age_seconds": 0.0,
+                    "price_source_stale": False,
+                    "stale_mark_used": False,
+                    "bid": bid,
+                    "ask": 2.0 * mid - bid,
+                    "mid": mid,
+                    "last": None,
+                    "kline_1m_close": None,
+                    "kline_1m_high": None,
+                    "kline_1m_open_time": None,
+                    "canonical_source": "scalp_ws_depth",
+                    "symbol_format": normalize_symbol(symbol),
+                },
+                bid,
+            )
+        if executable_quote_only:
+            return None, None
+        fields = await self._resolve_exit_monitor_mark(symbol)
+        bid = fields.get("bid")
+        fresh_bid = float(bid) if isinstance(bid, (int, float)) and bid > 0 and not fields.get("price_source_stale") else None
+        return fields, fresh_bid
 
     async def _resolve_exit_monitor_mark(self, symbol: str) -> dict[str, Any]:
         """
@@ -15938,15 +15990,22 @@ class PortfolioEngine:
         *,
         hold_day_bundles: dict[str, dict[str, Any]] | None = None,
         hold_day_missing: dict[str, list[str]] | None = None,
+        engine_ids: frozenset[str] | None = None,
+        executable_quote_only: bool = False,
     ) -> list[dict]:
         """
         PHASE 3: Monitor ALL open positions for exit conditions.
         No tracking-set skips - iterates actual open_positions from DB rebuild.
+
+        ``engine_ids`` scopes the pass to those engines' lots (the SCALP fast
+        pass). ``executable_quote_only`` skips a SCALP lot with no fresh
+        websocket book instead of spending REST on it; the full pass covers it.
         """
-        try:
-            await self.run_trading_circuit_breaker_check()
-        except Exception:
-            logger.warning("CIRCUIT_BREAKER_CHECK_FAILED: continuing position monitoring", exc_info=True)
+        if engine_ids is None:
+            try:
+                await self.run_trading_circuit_breaker_check()
+            except Exception:
+                logger.warning("CIRCUIT_BREAKER_CHECK_FAILED: continuing position monitoring", exc_info=True)
 
         exits_executed = []
 
@@ -15967,8 +16026,17 @@ class PortfolioEngine:
                 continue
             if getattr(position, "status", "ACTIVE") == "DUST_PENDING":
                 continue
+            _lot_engine = str(getattr(position, "engine_id", "") or "")
+            if engine_ids is not None and _lot_engine not in engine_ids:
+                continue
 
-            mark_info = await self._resolve_exit_monitor_mark(symbol)
+            executable_bid: float | None = None
+            if _lot_engine == "SCALP_V2":
+                mark_info, executable_bid = await self._scalp_exit_quote(symbol, executable_quote_only=executable_quote_only)
+                if mark_info is None:
+                    continue
+            else:
+                mark_info = await self._resolve_exit_monitor_mark(symbol)
             telemetry = self._build_exit_check_telemetry(position, mark_info)
             self._log_exit_check_telemetry(telemetry)
 
@@ -16103,6 +16171,7 @@ class PortfolioEngine:
                 current_bar,
                 day_hold_bundle=day_bundle,
                 day_hold_missing=miss_kw,
+                executable_bid=executable_bid,
             )
 
             if exit_result:
@@ -16142,6 +16211,7 @@ class PortfolioEngine:
         *,
         day_hold_bundle: dict[str, Any] | None = None,
         day_hold_missing: list[str] | None = None,
+        executable_bid: float | None = None,
     ) -> dict[str, Any] | None:
         """
         Shared paper/live exit manager for DAY top-4 positions.
@@ -16297,10 +16367,18 @@ class PortfolioEngine:
         # ceiling, and allweather bracket exits. Errors fail closed (hold).
         if _pos_engine_id == "SCALP_V2":
             try:
-                from backend.services.scalp_v2.exit_evaluator import evaluate_scalp_v2_exit
+                from backend.services.scalp_v2.exit_evaluator import evaluate_scalp_v2_exit, scalp_v2_net_pnl_at_bid_pct
 
-                _pnl_pct_sv2 = (current_price - entry_price) / entry_price
-                _net_pnl_sv2 = _pnl_pct_sv2 - ESTIMATED_ROUNDTRIP_COST
+                if executable_bid is not None and executable_bid > 0:
+                    current_price = float(executable_bid)
+                    _net_pnl_sv2 = scalp_v2_net_pnl_at_bid_pct(entry_price, current_price)
+                else:
+                    logger.warning(
+                        "SCALP_V2_EXIT_NO_EXECUTABLE_BID symbol=%s mark=%.8f — net from mark with full round-trip cost",
+                        symbol,
+                        float(current_price),
+                    )
+                    _net_pnl_sv2 = (current_price - entry_price) / entry_price - ESTIMATED_ROUNDTRIP_COST
                 _entry_ts_sv2 = float(getattr(position, "entry_time", 0.0) or 0.0)
                 _hold_min_sv2 = max(0.0, (time.time() - _entry_ts_sv2) / 60.0) if _entry_ts_sv2 > 0 else 0.0
                 _bar_low_sv2 = float(getattr(position, "lowest_price", 0.0) or current_price)

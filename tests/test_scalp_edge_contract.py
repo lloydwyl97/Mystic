@@ -53,7 +53,7 @@ def _ctx(bars: list[dict], mom=None) -> StrategyMarketContext:
     )
 
 
-def _sig(*, passed: bool, reason: str | None, expected: float = 0.0, setup: str = "range_bounce_scalp") -> ScalpSetupSignal:
+def _sig(*, passed: bool, reason: str | None, expected: float = 0.0, setup: str = "range_bounce_scalp", directional: float | None = None) -> ScalpSetupSignal:
     return ScalpSetupSignal(
         symbol="BTC/USDT",
         side="BUY",
@@ -71,6 +71,7 @@ def _sig(*, passed: bool, reason: str | None, expected: float = 0.0, setup: str 
         passed=passed,
         reject_reason=reason,
         setup_context={"reject_class": "opinion"} if not passed else {},
+        directional_move_pct=expected if directional is None else directional,
     )
 
 
@@ -100,11 +101,20 @@ def test_insufficient_history_is_hard_block():
     assert "INSUFFICIENT_HISTORY" in HARD_REJECT_REASONS
 
 
-def test_soft_reject_gets_atr_edge_estimate_and_stays_soft():
+def test_opinion_reject_has_no_directional_edge_source_even_with_wide_atr():
     rc = rank_setup_signal(_sig(passed=False, reason="NOT_NEAR_SUPPORT"), regime="RANGE", ctx=_ctx(_bars(30, 0.012)))
-    assert rc.edge_source == "atr_estimate"
-    assert rc.expected_move_pct > 0
-    assert rc.executable_edge["raw_expected_move_pct"] == rc.expected_move_pct
+    assert rc.volatility_move_pct > 0.001
+    assert rc.edge_source == "NONE"
+    assert rc.expected_move_pct == 0.0
+    assert rc.hard_block == "NO_EXECUTABLE_EDGE_ESTIMATE"
+    assert not rc.entry_eligible
+
+
+def test_soft_reject_with_strategy_claim_keeps_its_directional_edge():
+    rc = rank_setup_signal(_sig(passed=False, reason="TARGET_NOT_REACHABLE", directional=0.004), regime="RANGE", ctx=_ctx(_bars(30, 0.012)))
+    assert rc.edge_source == "STRATEGY_CLAIM"
+    assert rc.executable_edge["raw_move_source"] == "STRATEGY_CLAIM"
+    assert rc.executable_edge["raw_expected_move_pct"] == rc.expected_move_pct == 0.004
     assert rc.net_edge_after_costs_pct == rc.executable_edge["final_executable_edge_pct"]
     assert rc.roundtrip_cost_pct == rc.executable_edge["live_cost_pct"]
     assert rc.hard_block is None
@@ -113,7 +123,7 @@ def test_soft_reject_gets_atr_edge_estimate_and_stays_soft():
 
 def test_raw_move_below_cost_needs_learned_evidence(monkeypatch):
     ctx = _ctx(_bars(30, 0.0004))
-    rc = rank_setup_signal(_sig(passed=False, reason="NOT_NEAR_SUPPORT"), regime="RANGE", ctx=ctx)
+    rc = rank_setup_signal(_sig(passed=False, reason="TARGET_NOT_REACHABLE", directional=0.0004), regime="RANGE", ctx=ctx)
     assert rc.executable_edge["base_executable_edge_pct"] < 0
     assert rc.executable_edge["adaptive_residual_pct"] == 0.0
     assert rc.hard_block == "NO_EXECUTABLE_NET_EDGE"
@@ -125,10 +135,10 @@ def test_raw_move_below_cost_needs_learned_evidence(monkeypatch):
 
     def offset(*args, **kwargs):
         view = real(*args, **kwargs)
-        return {**view, "adaptive_residual": 0.002, "micro_residual": 0.0}
+        return {**view, "adaptive_residual_strategy": 0.002, "micro_residual": 0.0}
 
     monkeypatch.setattr(al, "scalp_decision", offset)
-    rc = rank_setup_signal(_sig(passed=False, reason="NOT_NEAR_SUPPORT"), regime="RANGE", ctx=ctx)
+    rc = rank_setup_signal(_sig(passed=False, reason="TARGET_NOT_REACHABLE", directional=0.0004), regime="RANGE", ctx=ctx)
     assert rc.executable_edge["final_executable_edge_pct"] > 0
     assert rc.entry_eligible
 
@@ -140,7 +150,7 @@ def test_no_edge_estimate_possible_is_hard_block():
 
 def test_passed_signal_uses_strategy_projection():
     rc = rank_setup_signal(_sig(passed=True, reason=None, expected=0.006), regime="RANGE", ctx=_ctx(_bars(30, 0.0004)))
-    assert rc.edge_source == "strategy"
+    assert rc.edge_source == "STRATEGY_CLAIM"
     assert rc.expected_move_pct == 0.006
     assert rc.entry_eligible
 

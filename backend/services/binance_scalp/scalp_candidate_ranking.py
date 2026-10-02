@@ -31,6 +31,7 @@ from backend.services.binance_scalp.strategies.common import (
     depth_check,
     estimate_expected_move_pct,
 )
+from backend.services.scalp_v2.raw_move_source import NO_RAW_MOVE_SOURCE, STRATEGY_CLAIM
 
 # Hard safety — never trade through these. NO_EXECUTABLE_NET_EDGE is set only by
 # the canonical executable edge (scalp_v2.executable_edge); a strategy's own
@@ -199,7 +200,7 @@ def candidate_executable_edge(
     spread_pct: float,
     impact_pct: float,
     micro_feats: dict | None,
-    edge_source: str = "atr_estimate",
+    edge_source: str,
 ) -> tuple[Any, dict, str]:
     """(ExecutableEdge, stamped adaptive view, adaptive regime) for one candidate."""
     from backend.services.adaptive_learning import scalp_decision
@@ -223,11 +224,13 @@ class RankedCandidate:
     reachability_surplus: float = 0.0
     selection_confidence: str = "normal"
     # Executable edge on the canonical cost model (every non-blocked candidate).
-    # edge_source: "strategy" (structural projection) or "atr_estimate" (no projection).
+    # edge_source: STRATEGY_CLAIM (directional structural projection) or NONE.
+    # volatility_move_pct is the ATR magnitude — context only, never the edge.
     expected_move_pct: float = 0.0
     roundtrip_cost_pct: float = 0.0
     net_edge_after_costs_pct: float = 0.0
     edge_source: str = ""
+    volatility_move_pct: float = 0.0
     # Diagnostics (computed during scoring; may be None for hard-blocked or passed cases)
     base_score: float | None = None
     momentum_boost: float | None = None
@@ -349,13 +352,12 @@ def rank_setup_signal(
         rank_score = (base_score + mom_boost) * regime_mult * arm_penalty_mult
         hard_block = None
 
-    # Every candidate is priced on the same executable-cost contract. Opinion
-    # rejects carry no structural projection, so they use the ATR-only estimate.
-    expected = float(sig.expected_move_pct or 0.0)
-    edge_source = "strategy"
-    if expected <= 0:
-        expected = estimate_expected_move_pct(ctx.bars_1m, structural=0.0)
-        edge_source = "atr_estimate"
+    # Every candidate is priced on the same executable-cost contract, from the
+    # strategy's directional claim. ATR is magnitude, not direction: it stays
+    # volatility context and never stands in for a missing claim.
+    expected = float(getattr(sig, "directional_move_pct", 0.0) or 0.0)
+    volatility_move = estimate_expected_move_pct(ctx.bars_1m, structural=0.0)
+    edge_source = STRATEGY_CLAIM if expected > 0 else NO_RAW_MOVE_SOURCE
     if expected <= 0:
         return RankedCandidate(
             signal=sig,
@@ -366,7 +368,8 @@ def rank_setup_signal(
             regime_native=native,
             soft_reason=sig.reject_reason,
             selection_confidence="blocked",
-            edge_source="unavailable",
+            edge_source=edge_source,
+            volatility_move_pct=volatility_move,
         )
     micro_feats: dict = {}
     with contextlib.suppress(Exception):
@@ -399,6 +402,7 @@ def rank_setup_signal(
             selection_confidence="blocked",
             expected_move_pct=expected,
             edge_source=edge_source,
+            volatility_move_pct=volatility_move,
         )
     reach_surplus = float(edge.final_executable_edge_pct)
     reach_mult_val = _edge_soft_mult(reach_surplus, soft_entry=not sig.passed)
@@ -409,6 +413,7 @@ def rank_setup_signal(
         "roundtrip_cost_pct": float(edge.live_cost_pct),
         "net_edge_after_costs_pct": reach_surplus,
         "edge_source": edge_source,
+        "volatility_move_pct": volatility_move,
         "executable_edge": edge.as_dict(),
         "adaptive_decision": adaptive_view,
         "adaptive_regime": adaptive_regime,

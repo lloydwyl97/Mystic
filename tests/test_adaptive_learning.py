@@ -137,7 +137,7 @@ def test_k_l_m_n_o_scalp_loss_win_hold_size_and_rank(tmp_path):
     observe(db, engine=SCALP, symbol="XRPUSDT", setup="RANGE_BOUNCE_SCALP", regime="", metric="markout_mae", value=0.004, strategy_version=SCALP_STRATEGY_VERSION)
     observe(db, engine=SCALP, symbol="BTCUSDT", setup="VWAP_EMA_RECLAIM", regime="", metric="trade_mfe", value=0.005, strategy_version=SCALP_STRATEGY_VERSION)
     observe(db, engine=SCALP, symbol="SOLUSDT", setup="RANGE_BOUNCE_SCALP", regime="", metric="trade_time_to_mfe_min", value=5.0, strategy_version=SCALP_STRATEGY_VERSION)
-    observe(db, engine=SCALP, symbol="ETHUSDT", setup="VWAP_EMA_RECLAIM", regime="", metric="edge_residual", value=0.004, strategy_version=SCALP_STRATEGY_VERSION)
+    observe(db, engine=SCALP, symbol="ETHUSDT", setup="VWAP_EMA_RECLAIM", regime="", metric="edge_residual_strategy", value=0.004, strategy_version=SCALP_STRATEGY_VERSION)
     xrp = scalp_decision(db, "XRPUSDT", "RANGE_BOUNCE_SCALP", "")
     btc = scalp_decision(db, "BTCUSDT", "VWAP_EMA_RECLAIM", "")
     sol = scalp_decision(db, "SOLUSDT", "RANGE_BOUNCE_SCALP", "")
@@ -149,7 +149,10 @@ def test_k_l_m_n_o_scalp_loss_win_hold_size_and_rank(tmp_path):
     assert sol["hold_min"] >= 4.0
     from backend.services.scalp_v2.executable_edge import scalp_executable_edge
 
-    edges = {sym: scalp_executable_edge(view, raw_expected_move_pct=0.002, spread_pct=0.0001, impact_pct=0.0) for sym, view in (("BTCUSDT", btc), ("ETHUSDT", eth), ("SOLUSDT", sol), ("XRPUSDT", xrp))}
+    edges = {
+        sym: scalp_executable_edge(view, raw_expected_move_pct=0.002, spread_pct=0.0001, impact_pct=0.0, edge_source="STRATEGY_CLAIM")
+        for sym, view in (("BTCUSDT", btc), ("ETHUSDT", eth), ("SOLUSDT", sol), ("XRPUSDT", xrp))
+    }
     assert edges["ETHUSDT"].adaptive_residual_pct > 0
     assert edges["XRPUSDT"].size_mult < edges["BTCUSDT"].size_mult
     assert all(0.50 <= e.size_mult <= 1.25 for e in edges.values())
@@ -512,6 +515,7 @@ def test_micro_model_flows_through_resolve_and_scalp_decision(tmp_path):
         evaluated_at=1_000.0,
         features=_bull_book(),
         raw_expected_move=0.003,
+        raw_move_source="STRATEGY_CLAIM",
     )
     assert resolve_markouts(db, lambda _s, _t: 100.6, now=1_000.0 + 2000) == 1
     rep = adaptive_state_report(db)
@@ -661,6 +665,7 @@ def test_scalp_micro_trains_on_the_causal_horizon_once(tmp_path):
         evaluated_at=1_000.0,
         features=_bull_book(),
         raw_expected_move=0.003,
+        raw_move_source="STRATEGY_CLAIM",
     )
     conn = sqlite3.connect(db)
     horizon = float(conn.execute("SELECT label_horizon FROM adaptive_candidate_markouts").fetchone()[0])

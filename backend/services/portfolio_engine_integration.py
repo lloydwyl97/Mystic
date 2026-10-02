@@ -2170,7 +2170,7 @@ class PortfolioEngineIntegration:
                 signaled=signaled,
                 features=micro_feats,
                 raw_expected_move=(row.get("executable_edge") or {}).get("raw_expected_move_pct"),
-                raw_move_source=(row.get("executable_edge") or {}).get("raw_move_source"),
+                raw_move_source=(row.get("executable_edge") or {}).get("raw_move_source") or (row.get("rank_meta") or {}).get("edge_source") or "NONE",
             )
             return {"setup": setup_name, "regime": regime, "features": micro_feats, "ref_price": ref_price}
 
@@ -2312,10 +2312,13 @@ class PortfolioEngineIntegration:
                 record_scalp_decision(self.engine.db_path, norm, "FAILED", "FAILED", cycle_ts=cycle_ts, detail=decision_detail(row))
                 logger.warning("SCALP_V2_SIGNAL_ERROR symbol=%s", sym_raw, exc_info=True)
 
-    async def _monitor_positions_once(self, *, refresh_market_data: bool = True) -> list[dict[str, Any]]:
+    async def _monitor_positions_once(self, *, refresh_market_data: bool = True, engine_ids: frozenset[str] | None = None) -> list[dict[str, Any]]:
         """
         Single-iteration helper for monitoring positions (used by tests).
         Returns list of exit results.
+
+        ``engine_ids`` runs a scoped pass over those engines' lots only (the
+        SCALP fast pass): no REST price refresh, no DAY bundles, no repair adds.
         """
         if not self.engine:
             return []
@@ -2349,8 +2352,8 @@ class PortfolioEngineIntegration:
                 if exit_fail_closed:
                     return []
 
-        # Refresh prices
-        await self._refresh_prices()
+        if engine_ids is None:
+            await self._refresh_prices()
 
         # Canonical alignment: engine.open_positions can drift from portfolio_engine_positions
         # (e.g. filtered-dict monitor restore + sell bookkeeping, or prior reconcile).
@@ -2382,6 +2385,9 @@ class PortfolioEngineIntegration:
                 logger.debug(f"EXIT_MONITORING: Skipping {symbol} in cooldown ({remaining:.0f}s remaining)")
                 continue
 
+            if engine_ids is not None and str(getattr(position, "engine_id", "") or "") not in engine_ids:
+                continue
+
             filtered_positions[symbol] = position
 
         # Record live candles for open/bought symbols only (sell-side monitoring source of truth).
@@ -2391,7 +2397,7 @@ class PortfolioEngineIntegration:
             with contextlib.suppress(Exception):
                 await self._record_position_candle_snapshots(set(filtered_positions.keys()))
 
-        if filtered_positions:
+        if filtered_positions and engine_ids is None:
             try:
                 from backend.services.day_active_market_bundle import (
                     async_fetch_day_active_ohlcv_bundle,
@@ -2457,11 +2463,13 @@ class PortfolioEngineIntegration:
                 self.current_prices,
                 current_bar,
                 symbols=set(filtered_positions.keys()),
-                hold_day_bundles=hold_bds,
-                hold_day_missing=hold_ms,
+                hold_day_bundles=hold_bds if engine_ids is None else None,
+                hold_day_missing=hold_ms if engine_ids is None else None,
+                engine_ids=engine_ids,
+                executable_quote_only=engine_ids is not None,
             )
 
-            if filtered_positions and self.engine:
+            if filtered_positions and self.engine and engine_ids is None:
                 with contextlib.suppress(Exception):
                     repair_results = await self.engine.process_repair_adds_once(
                         self.current_prices,
@@ -2676,6 +2684,30 @@ class PortfolioEngineIntegration:
 
             logger.warning(f"EXIT_FAILED: {symbol} failure #{failure_count} - cooldown for {cooldown_seconds}s | Error: {error_msg}")
 
+    def _has_active_scalp_lot(self) -> bool:
+        if not self.engine:
+            return False
+        return any(
+            str(getattr(p, "engine_id", "") or "") == "SCALP_V2" and getattr(p, "status", "ACTIVE") != "DUST_PENDING" and float(getattr(p, "quantity", 0.0) or 0.0) > 0
+            for p in list(self.engine.open_positions.values())
+        )
+
+    async def _scalp_fast_exit_wait(self, wait_sec: float) -> None:
+        """Wait out the full-pass interval, checking active SCALP lots on the SCALP cadence."""
+        from backend.services.scalp_v2.exit_evaluator import SCALP_V2_EXIT_MONITOR_INTERVAL_SEC
+
+        fast = max(0.5, float(SCALP_V2_EXIT_MONITOR_INTERVAL_SEC))
+        deadline = time.monotonic() + max(0.0, float(wait_sec))
+        while self.is_running:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(fast, remaining))
+            if time.monotonic() >= deadline:
+                return
+            if self._has_active_scalp_lot():
+                await self._monitor_positions_once(refresh_market_data=False, engine_ids=frozenset({"SCALP_V2"}))
+
     async def _position_monitor_loop(self) -> None:
         """Monitor positions and execute exits"""
         await self._purge_stale_bd_exit_hard_pause_state()
@@ -2687,7 +2719,7 @@ class PortfolioEngineIntegration:
                 from backend.config.protected_execution import MANDATORY_EXIT_PENDING_RETRY_SEC
 
                 pending = bool(self.engine and self.engine.has_exit_residual_pending())
-                await asyncio.sleep(float(MANDATORY_EXIT_PENDING_RETRY_SEC) if pending else self._exit_monitor_interval)
+                await self._scalp_fast_exit_wait(float(MANDATORY_EXIT_PENDING_RETRY_SEC) if pending else self._exit_monitor_interval)
 
             except asyncio.CancelledError:
                 break

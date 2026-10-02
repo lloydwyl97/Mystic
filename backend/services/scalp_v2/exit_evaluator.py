@@ -76,6 +76,24 @@ _SCALP_V2_RECORDED_EXIT_REASONS: dict[str, str] = {
     SCALP_V2_EXIT_TIME_STOP: "TIME_STOP_EXIT",
 }
 
+# Exit cadence for open SCALP lots inside the existing exit-monitor loop. The
+# shared 45s cadence let an adverse move run 6-13 bp past the stop before it
+# was seen on ~100s holds.
+SCALP_V2_EXIT_MONITOR_INTERVAL_SEC: float = float(os.getenv("SCALP_V2_EXIT_MONITOR_INTERVAL_SEC", "2.0"))
+
+
+def scalp_v2_net_pnl_at_bid_pct(entry_price: float, executable_bid: float) -> float:
+    """Net P&L if the lot is sold at the executable best bid now.
+
+    Same units as realized net (sell price vs entry fill, net of costs): the
+    entry ask and the exit half-spread are already in the two prices, so only
+    the taker fees and slippage allowance of the canonical round trip remain.
+    """
+    from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, ORDERBOOK_HALF_SPREAD_ESTIMATE
+
+    entry = float(entry_price)
+    return (float(executable_bid) - entry) / entry - (float(ESTIMATED_ROUNDTRIP_COST) - float(ORDERBOOK_HALF_SPREAD_ESTIMATE))
+
 
 def scalp_v2_adverse_net_threshold_pct(symbol: str, adaptive_decision: dict | None) -> float:
     """Net-P&L adverse stop distance for an open SCALP position.

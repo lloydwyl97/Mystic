@@ -100,26 +100,29 @@ def scalp_executable_edge(
     raw_expected_move_pct: float,
     spread_pct: float | None,
     impact_pct: float,
-    edge_source: str = "atr_estimate",
+    edge_source: str,
 ) -> ExecutableEdge:
     """Canonical SCALP executable net edge for the current candidate at the live book.
 
-    ``view`` is ``adaptive_learning.scalp_decision(...)`` computed with the live
-    microstructure features; it supplies residuals, confidence and risk only.
+    ``raw_expected_move_pct`` must be a directional claim (``raw_move_source``);
+    a volatility magnitude is refused. ``view`` is ``adaptive_learning.scalp_decision(...)``
+    computed with the live microstructure features; it supplies residuals,
+    confidence and risk only.
     """
+    from backend.services.scalp_v2.raw_move_source import is_directional, normalize_raw_move_source
+
+    source = normalize_raw_move_source(edge_source)
+    if not is_directional(source):
+        raise ValueError(f"raw move source {source} is not a directional claim")
     raw = max(0.0, _f(raw_expected_move_pct))
     cost = canonical_roundtrip_cost_pct(spread_pct=spread_pct, buy_impact_pct=max(0.0, _f(impact_pct)), sell_impact_pct=0.0)
     base = raw - cost
-    from backend.services.adaptive_learning import STRATEGY_RAW_SOURCE
-
-    source = STRATEGY_RAW_SOURCE if str(edge_source or "").lower() == STRATEGY_RAW_SOURCE else "atr_estimate"
-    suffix = "_strategy" if source == STRATEGY_RAW_SOURCE else ""
-    adaptive = _f(view.get(f"adaptive_residual{suffix}"))
+    adaptive = _f(view.get("adaptive_residual_strategy"))
     micro_model = _f(view.get("micro_residual"))
     pre_micro = base + adaptive
     micro = micro_model if (pre_micro > REJECT_THRESHOLD_PCT or micro_model < 0) else 0.0
     final = pre_micro + micro
-    confidence = _f(view.get(f"confidence{suffix}"))
+    confidence = _f(view.get("confidence_strategy"))
     risk = _f(view.get("risk_estimate"))
     return ExecutableEdge(
         raw_expected_move_pct=raw,
@@ -131,7 +134,7 @@ def scalp_executable_edge(
         micro_residual_pct=micro,
         final_executable_edge_pct=final,
         confidence=confidence,
-        n_residual=_f(view.get(f"n_residual{suffix}")),
+        n_residual=_f(view.get("n_residual_strategy")),
         target_pct=_f(view.get("target_pct")),
         hold_min=_f(view.get("hold_min")),
         risk_estimate_pct=risk,
@@ -187,7 +190,11 @@ def decision_detail(row: dict[str, Any] | None, **extra: Any) -> str:
         meta = row.get("rank_meta") or {}
         payload["edge_computed"] = False
         payload["raw_expected_move"] = round(_f(meta.get("expected_move_pct")), 8)
+        payload["raw_move_source"] = str(meta.get("edge_source") or "NONE")
         payload["hard_block"] = str(row.get("hard_block") or meta.get("hard_block") or "")
+    vol = (row.get("rank_meta") or {}).get("volatility_move_pct")
+    if isinstance(vol, (int, float)):
+        payload["volatility_move"] = round(float(vol), 8)
     payload["setup"] = str(row.get("best_setup") or "")
     payload["regime"] = str(row.get("adaptive_regime") or "")
     payload.update({k: v for k, v in extra.items() if v is not None})

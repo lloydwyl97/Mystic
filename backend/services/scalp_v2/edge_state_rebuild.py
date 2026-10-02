@@ -22,6 +22,7 @@ from collections.abc import Callable
 from typing import Any
 
 from backend.services import adaptive_learning as al
+from backend.services.scalp_v2.raw_move_source import is_directional, normalize_raw_move_source
 
 REBUILT_METRICS = ("edge_residual", "edge_residual_strategy", "markout_mae")
 MICRO_MODEL = "micro_edge"
@@ -132,7 +133,7 @@ def rebuild_scalp_edge_state(
         stored = row["raw_expected_move"] if "raw_expected_move" in cols else None
         if stored is not None and float(stored) > 0:
             source = row["raw_move_source"] if "raw_move_source" in cols else None
-            raw_by_id[idx] = (float(stored), str(source or "atr_estimate"))
+            raw_by_id[idx] = (float(stored), normalize_raw_move_source(source))
         else:
             raw_by_id[idx] = raw_move_for(row)
         horizon = float(row["label_horizon"] or 0) or 600.0
@@ -171,7 +172,7 @@ def rebuild_scalp_edge_state(
         residual = al.scalp_edge_residual(forward_net=forward, raw_expected_move=raw, roundtrip_cost=float(row["roundtrip_cost"] or 0))
         if al.observe(db_path, metric=al.residual_metric(source), value=residual, **common):
             stats["residual_obs"] += 1
-        if isinstance(feats, dict) and feats:
+        if isinstance(feats, dict) and feats and is_directional(source):
             al.update_linear_model(db_path, engine, MICRO_MODEL, feats, residual)
             stats["micro_updates"] += 1
     stats["backups"] = backups

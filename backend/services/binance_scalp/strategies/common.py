@@ -50,6 +50,11 @@ def estimate_expected_move_pct(
     return min(max(raw, 0.0), float(cap_pct))
 
 
+def directional_claim_pct(structural: float, cap_pct: float = 0.006) -> float:
+    """A strategy's structural projection as a directional raw move (no ATR floor)."""
+    return min(max(float(structural or 0.0), 0.0), float(cap_pct))
+
+
 def spread_cap(econ: ScalpEconomics, config: ScalpConfig, symbol: str) -> float:
     if uses_paper_spread_caps(
         scalp_live=config.scalp_live,
@@ -101,6 +106,7 @@ def reject_signal(
     score: float = 0.0,
     confidence: float = 0.0,
     mechanical: bool = True,
+    directional_move: float = 0.0,
 ) -> ScalpSetupSignal:
     """Build a failed signal.
 
@@ -128,6 +134,7 @@ def reject_signal(
         passed=False,
         reject_reason=reason,
         setup_context=ctx_map,
+        directional_move_pct=directional_claim_pct(directional_move),
     )
 
 
@@ -143,6 +150,7 @@ def pass_signal(
     impact_pct: float,
     limit_buy: float,
     setup_context: dict,
+    directional_move_pct: float = 0.0,
 ) -> ScalpSetupSignal:
     return ScalpSetupSignal(
         symbol=ctx.symbol,
@@ -161,4 +169,5 @@ def pass_signal(
         passed=True,
         reject_reason=None,
         setup_context=setup_context,
+        directional_move_pct=directional_claim_pct(directional_move_pct),
     )

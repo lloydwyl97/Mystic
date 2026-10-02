@@ -39,7 +39,7 @@ def _cold_view(tmp_path, name="cold.db"):
     return al.scalp_decision(str(tmp_path / name), KEY["symbol"], KEY["setup"], KEY["regime"], None)
 
 
-def _edge(view, raw, spread=SPREAD, impact=0.0, edge_source="atr_estimate"):
+def _edge(view, raw, spread=SPREAD, impact=0.0, edge_source="STRATEGY_CLAIM"):
     return scalp_executable_edge(view, raw_expected_move_pct=raw, spread_pct=spread, impact_pct=impact, edge_source=edge_source)
 
 
@@ -115,9 +115,9 @@ def test_raw_below_cost_needs_evidence_based_residual(tmp_path):
     raw = canonical_roundtrip_cost_pct(spread_pct=SPREAD) - 0.0002
     cold = al.scalp_decision(db, KEY["symbol"], KEY["setup"], KEY["regime"], None)
     assert not _edge(cold, raw).eligible
-    _observe(db, "edge_residual", 0.0012, n=12)
+    _observe(db, "edge_residual_strategy", 0.0012, n=12)
     learned = al.scalp_decision(db, KEY["symbol"], KEY["setup"], KEY["regime"], None)
-    assert learned["adaptive_residual"] > 0.0002
+    assert learned["adaptive_residual_strategy"] > 0.0002
     up = _edge(learned, raw)
     assert up.base_executable_edge_pct < 0 < up.final_executable_edge_pct
     assert up.eligible
@@ -125,7 +125,7 @@ def test_raw_below_cost_needs_evidence_based_residual(tmp_path):
 
 def test_negative_residual_evidence_lowers_a_positive_base_edge(tmp_path):
     db = str(tmp_path / "neg.db")
-    _observe(db, "edge_residual", -0.0015, n=12)
+    _observe(db, "edge_residual_strategy", -0.0015, n=12)
     view = al.scalp_decision(db, KEY["symbol"], KEY["setup"], KEY["regime"], None)
     edge = _edge(view, canonical_roundtrip_cost_pct(spread_pct=SPREAD) + 0.0004)
     assert edge.base_executable_edge_pct > 0
@@ -141,20 +141,54 @@ def test_residual_is_bounded_by_the_raw_claim_cap(tmp_path):
     assert view["adaptive_residual_strategy"] == pytest.approx(-0.006)
 
 
-def test_strategy_claims_and_atr_estimates_learn_separate_residuals(tmp_path):
+def test_strategy_claim_residual_is_not_contaminated_by_atr_rows(tmp_path):
     db = str(tmp_path / "source.db")
+    _observe(db, "edge_residual", 0.005, n=60)
+    view = al.scalp_decision(db, KEY["symbol"], KEY["setup"], KEY["regime"], None)
+    assert view["adaptive_residual"] > 0.004
+    claim = _edge(view, 0.003)
+    assert claim.raw_move_source == "STRATEGY_CLAIM"
+    assert claim.adaptive_residual_pct == 0.0
     _observe(db, "edge_residual_strategy", -0.005, n=60)
     view = al.scalp_decision(db, KEY["symbol"], KEY["setup"], KEY["regime"], None)
-    claim = _edge(view, 0.006, edge_source="strategy")
-    atr = _edge(view, 0.0012, edge_source="atr_estimate")
-    assert claim.raw_move_source == "strategy" and atr.raw_move_source == "atr_estimate"
-    assert claim.adaptive_residual_pct < -0.004
-    assert atr.adaptive_residual_pct == 0.0
-    assert claim.base_executable_edge_pct > 0.005
-    assert claim.final_executable_edge_pct < claim.base_executable_edge_pct - 0.004
-    assert al.residual_metric("strategy") == "edge_residual_strategy"
-    assert al.residual_metric("atr_estimate") == "edge_residual"
+    assert _edge(view, 0.003).adaptive_residual_pct < -0.004
+    assert al.residual_metric("STRATEGY_CLAIM") == al.residual_metric("strategy") == "edge_residual_strategy"
+    assert al.residual_metric("ATR_ESTIMATE") == al.residual_metric("atr_estimate") == "edge_residual"
     assert {"edge_residual", "edge_residual_strategy"} <= al.MEAN_FORM_METRICS
+
+
+@pytest.mark.parametrize("source", ["ATR_ESTIMATE", "atr_estimate", "NONE", "unavailable", ""])
+def test_atr_or_missing_source_cannot_be_a_directional_raw_edge(tmp_path, source):
+    with pytest.raises(ValueError):
+        _edge(_cold_view(tmp_path), 0.004, edge_source=source)
+
+
+def test_atr_markouts_do_not_train_the_micro_residual(tmp_path):
+    db = str(tmp_path / "micro.db")
+    t0 = 1_790_000_000.0
+    for i, src in enumerate(("ATR_ESTIMATE", "NONE")):
+        al.record_candidate(
+            db,
+            engine=al.SCALP_ENGINE,
+            symbol=KEY["symbol"],
+            setup=KEY["setup"],
+            regime=KEY["regime"],
+            ref_price=100.0,
+            roundtrip_cost=ESTIMATED_ROUNDTRIP_COST,
+            signaled=False,
+            evaluated_at=t0 + i * 60,
+            features={"obi_l5": 0.2, "spread_pct": 0.00004},
+            raw_expected_move=0.0008 if src != "NONE" else None,
+            raw_move_source=src,
+        )
+    al.resolve_markouts(db, lambda _s, _t: 100.2, now=t0 + 5000, path_low=lambda _s, _a, _b: 99.9)
+    with sqlite3.connect(db) as conn:
+        sources = {r[0] for r in conn.execute("SELECT raw_move_source FROM adaptive_candidate_markouts")}
+        micro = conn.execute("SELECT COUNT(*) FROM adaptive_linear_model").fetchone()[0] if conn.execute("SELECT name FROM sqlite_master WHERE name='adaptive_linear_model'").fetchone() else 0
+        strategy_n = conn.execute("SELECT COUNT(*) FROM adaptive_metric_state WHERE metric='edge_residual_strategy'").fetchone()[0]
+    assert sources == {"ATR_ESTIMATE", "NONE"}
+    assert micro == 0
+    assert strategy_n == 0
 
 
 def test_residual_is_a_running_mean_not_a_fast_ewma(tmp_path):
@@ -167,19 +201,19 @@ def test_residual_is_a_running_mean_not_a_fast_ewma(tmp_path):
 
 
 def test_confidence_changes_size_not_permission():
-    base = {"adaptive_residual": 0.0, "micro_residual": 0.0, "risk_estimate": 0.0015}
-    lo = _edge({**base, "confidence": 0.0}, 0.0012)
-    hi = _edge({**base, "confidence": 0.95}, 0.0012)
+    base = {"adaptive_residual_strategy": 0.0, "micro_residual": 0.0, "risk_estimate": 0.0015}
+    lo = _edge({**base, "confidence_strategy": 0.0}, 0.0012)
+    hi = _edge({**base, "confidence_strategy": 0.95}, 0.0012)
     assert lo.eligible and hi.eligible
     assert lo.final_executable_edge_pct == hi.final_executable_edge_pct
     assert lo.size_mult < hi.size_mult
-    lo_neg = _edge({**base, "confidence": 0.0}, 0.0003)
-    hi_neg = _edge({**base, "confidence": 0.95}, 0.0003)
+    lo_neg = _edge({**base, "confidence_strategy": 0.0}, 0.0003)
+    hi_neg = _edge({**base, "confidence_strategy": 0.95}, 0.0003)
     assert not lo_neg.eligible and not hi_neg.eligible
 
 
 def test_size_reads_final_edge_and_learned_risk_within_bounds():
-    view = {"adaptive_residual": 0.0, "micro_residual": 0.0, "confidence": 0.5}
+    view = {"adaptive_residual_strategy": 0.0, "micro_residual": 0.0, "confidence_strategy": 0.5}
     tight = _edge({**view, "risk_estimate": 0.0005}, 0.0015)
     wide = _edge({**view, "risk_estimate": 0.004}, 0.0015)
     assert tight.size_mult > wide.size_mult
@@ -192,7 +226,7 @@ def test_size_reads_final_edge_and_learned_risk_within_bounds():
 
 
 def test_final_edge_starts_from_current_candidate_move():
-    view = {"adaptive_residual": 0.0003, "micro_residual": -0.0001}
+    view = {"adaptive_residual_strategy": 0.0003, "micro_residual": -0.0001}
     a = _edge(view, 0.0010, spread=0.0001, impact=0.00005)
     b = _edge(view, 0.0014, spread=0.0001, impact=0.00005)
     cost = canonical_roundtrip_cost_pct(spread_pct=0.0001, buy_impact_pct=0.00005)
@@ -203,7 +237,7 @@ def test_final_edge_starts_from_current_candidate_move():
 
 
 def test_adaptive_and_micro_residuals_are_separate_from_base():
-    view = {"adaptive_residual": 0.0002, "micro_residual": 0.0001}
+    view = {"adaptive_residual_strategy": 0.0002, "micro_residual": 0.0001}
     e = _edge(view, 0.0012)
     d = e.as_dict()
     for key in ("raw_expected_move_pct", "live_cost_pct", "base_executable_edge_pct", "adaptive_residual_pct", "micro_residual_pct", "final_executable_edge_pct", "confidence"):
@@ -214,14 +248,14 @@ def test_adaptive_and_micro_residuals_are_separate_from_base():
 
 
 def test_micro_cannot_lift_a_non_positive_candidate():
-    e = _edge({"adaptive_residual": 0.0, "micro_residual": 0.0015}, canonical_roundtrip_cost_pct(spread_pct=SPREAD) - 0.0002)
+    e = _edge({"adaptive_residual_strategy": 0.0, "micro_residual": 0.0015}, canonical_roundtrip_cost_pct(spread_pct=SPREAD) - 0.0002)
     assert e.micro_residual_model_pct == pytest.approx(0.0015)
     assert e.micro_residual_pct == 0.0
     assert not e.eligible
-    down = _edge({"adaptive_residual": 0.0, "micro_residual": -0.0015}, canonical_roundtrip_cost_pct(spread_pct=SPREAD) + 0.0002)
+    down = _edge({"adaptive_residual_strategy": 0.0, "micro_residual": -0.0015}, canonical_roundtrip_cost_pct(spread_pct=SPREAD) + 0.0002)
     assert down.micro_residual_pct == pytest.approx(-0.0015)
     assert not down.eligible
-    lifted = _edge({"adaptive_residual": 0.0004, "micro_residual": 0.0005}, canonical_roundtrip_cost_pct(spread_pct=SPREAD) - 0.0002)
+    lifted = _edge({"adaptive_residual_strategy": 0.0004, "micro_residual": 0.0005}, canonical_roundtrip_cost_pct(spread_pct=SPREAD) - 0.0002)
     assert lifted.micro_residual_pct == pytest.approx(0.0005)
     assert lifted.eligible
 
@@ -270,7 +304,7 @@ def test_non_positive_final_edge_cannot_arm_even_if_marked_eligible(edge):
 def test_ranked_negative_final_edge_is_hard_blocked(monkeypatch):
     _patch_view(monkeypatch, adaptive_residual=0.0, adaptive_residual_strategy=-0.003, micro_residual=0.0)
     rc = rank_setup_signal(_sig(passed=True, reason=None, expected=0.0025), regime="RANGE", ctx=_ctx(_bars(30, 0.012)))
-    assert rc.executable_edge["raw_move_source"] == "strategy"
+    assert rc.executable_edge["raw_move_source"] == "STRATEGY_CLAIM"
     assert rc.executable_edge["base_executable_edge_pct"] > 0
     assert rc.executable_edge["final_executable_edge_pct"] < 0
     assert rc.hard_block == "NO_EXECUTABLE_NET_EDGE"
@@ -429,7 +463,7 @@ def test_rebuild_walk_forward_is_causal(tmp_path):
 
 
 def test_reject_rows_store_edge_deficit(tmp_path):
-    rc = rank_setup_signal(_sig(passed=False, reason="NOT_NEAR_SUPPORT"), regime="RANGE", ctx=_ctx(_bars(30, 0.0004)))
+    rc = rank_setup_signal(_sig(passed=False, reason="TARGET_NOT_REACHABLE", directional=0.0004), regime="RANGE", ctx=_ctx(_bars(30, 0.0004)))
     row = _row(rc)
     code, reason = classify_scalp_candidate(row)
     assert code == "REJECTED:NO_EXECUTABLE_NET_EDGE"

@@ -81,7 +81,7 @@ class VwapEmaReclaimStrategy:
         expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.70, cap_pct=0.006)
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
-            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
+            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
 
         score = 2.35 + (cur - vwap) / vwap * 450 + (ema_fast - ema_slow) / ema_slow * 280
         return pass_signal(
@@ -92,6 +92,7 @@ class VwapEmaReclaimStrategy:
             entry_reason=f"vwap_reclaim vwap={vwap:.4f} ema_fast>{ema_slow:.4f}",
             invalidation_reason="lost_vwap_or_ema_with_no_recovery",
             expected_move_pct=expected,
+            directional_move_pct=structural,
             impact_pct=impact,
             limit_buy=fill,
             setup_context={"vwap": vwap, "ema_fast": ema_fast, "ema_slow": ema_slow, "prior_low": prior_low},

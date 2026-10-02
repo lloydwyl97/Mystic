@@ -5,11 +5,13 @@ Run with the app stopped. Backs up adaptive_metric_state and adaptive_linear_mod
 to suffixed tables first, then rebuilds edge residuals, gross path MAE and the
 micro model. Nothing else is modified.
 
-Decision-time raw expected move per candidate:
+Decision-time raw move and source per candidate:
   - stored on the markout row (rows recorded after this version), else
-  - exact value from the filled trade's entry context (signaled rows), else
-  - closed-bar ATR estimate (opinion-path rows; this is ranking's own formula), else
-  - unknown: the row teaches risk only.
+  - exact value and source from the filled trade's entry context, else
+  - closed-bar ATR estimate labelled ATR_ESTIMATE (forensic residual only;
+    ATR is not a directional claim), else
+  - NONE: the row teaches risk only.
+Only directional (STRATEGY_CLAIM) residuals train the live residual and micro model.
 
   scripts/rebuild_scalp_edge_state.py --db mystic_trading.db --backup-suffix 20261002 [--calibration-out f.json]
 """
@@ -26,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.services.scalp_v2.edge_state_rebuild import OhlcvPath, rebuild_scalp_edge_state
 from backend.services.scalp_v2.executable_edge import scalp_executable_edge
+from backend.services.scalp_v2.raw_move_source import ATR_ESTIMATE, NO_RAW_MOVE_SOURCE, is_directional, normalize_raw_move_source
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 FILL_MATCH_SEC = 5.0
@@ -52,7 +55,7 @@ def _fill_raws(db: str) -> list[tuple[str, float, float, str]]:
                 raw, cyc = float(ctx["expected_move_pct"]), float(ctx["cycle_ts"])
             except (KeyError, TypeError, ValueError):
                 continue
-            out.append((str(sym).upper().replace("/", "").replace("-", ""), cyc, raw, str(ctx.get("edge_source") or "atr_estimate")))
+            out.append((str(sym).upper().replace("/", "").replace("-", ""), cyc, raw, normalize_raw_move_source(ctx.get("edge_source") or "atr_estimate")))
     finally:
         conn.close()
     return out
@@ -68,6 +71,7 @@ def main() -> int:
     path = OhlcvPath(args.db, SYMBOLS)
     fills = _fill_raws(args.db)
     sources = {"fill_exact": 0, "atr_reconstructed": 0, "signaled_unknown": 0}
+    by_source: dict[str, int] = {}
 
     def raw_move_for(row: sqlite3.Row) -> tuple[float | None, str]:
         sym, at = str(row["symbol"]), float(row["evaluated_at"])
@@ -77,38 +81,41 @@ def main() -> int:
             return match[0][2], match[0][3]
         if int(row["signaled"] or 0):
             sources["signaled_unknown"] += 1
-            return None, "strategy"
+            return None, NO_RAW_MOVE_SOURCE
         sources["atr_reconstructed"] += 1
-        return path.raw_expected_move(sym, at), "atr_estimate"
+        return path.raw_expected_move(sym, at), ATR_ESTIMATE
 
     preds: list[dict] = []
 
     def on_decision(row: sqlite3.Row, view: dict, raw: float | None, source: str) -> None:
+        by_source[source] = by_source.get(source, 0) + 1
         if args.calibration_out is None:
+            return
+        from backend.services.adaptive_learning import _forward_from_stored
+
+        base = {
+            "id": row["id"],
+            "symbol": row["symbol"],
+            "setup": row["setup"],
+            "regime": row["regime"],
+            "t": row["evaluated_at"],
+            "signaled": row["signaled"],
+            "horizon": row["label_horizon"],
+            "raw": raw,
+            "source": source,
+            "realized": _forward_from_stored(row),
+        }
+        if not is_directional(source) or not raw:
+            preds.append({**base, "final_executable_edge_pct": None})
             return
         feats = json.loads(row["features_json"] or "{}")
         sp = feats.get("spread_pct")
-        edge = scalp_executable_edge(view, raw_expected_move_pct=raw or 0.0, spread_pct=float(sp) if sp is not None else None, impact_pct=0.0, edge_source=source)
-        from backend.services.adaptive_learning import _forward_from_stored
-
-        preds.append(
-            {
-                "id": row["id"],
-                "symbol": row["symbol"],
-                "setup": row["setup"],
-                "regime": row["regime"],
-                "t": row["evaluated_at"],
-                "signaled": row["signaled"],
-                "horizon": row["label_horizon"],
-                "raw": raw,
-                "source": source,
-                **{k: edge.as_dict()[k] for k in CALIBRATION_FIELDS},
-                "realized": _forward_from_stored(row),
-            }
-        )
+        edge = scalp_executable_edge(view, raw_expected_move_pct=raw, spread_pct=float(sp) if sp is not None else None, impact_pct=0.0, edge_source=source)
+        preds.append({**base, **{k: edge.as_dict()[k] for k in CALIBRATION_FIELDS}})
 
     stats = rebuild_scalp_edge_state(args.db, raw_move_for=raw_move_for, path_low=path.low_between, backup_suffix=args.backup_suffix, on_decision=on_decision)
     stats["raw_sources"] = sources
+    stats["candidates_by_source"] = by_source
     if args.calibration_out:
         Path(args.calibration_out).write_text(json.dumps({"stats": stats, "preds": preds}))
     print(json.dumps(stats))

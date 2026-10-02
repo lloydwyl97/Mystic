@@ -90,7 +90,7 @@ class RangeBounceScalpStrategy:
         expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.65, cap_pct=0.006)
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
-            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
+            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
 
         # Deweight vs other setups (paper: range bounce net-negative vs peers).
         # Still entry-eligible when sig.passed — lower rank only.
@@ -104,6 +104,7 @@ class RangeBounceScalpStrategy:
             entry_reason=f"support_bounce_{support:.6f}_wick={wick_rejection:.4f}",
             invalidation_reason="support_break_no_recovery",
             expected_move_pct=expected,
+            directional_move_pct=structural,
             impact_pct=impact,
             limit_buy=fill,
             setup_context={

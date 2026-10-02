@@ -27,6 +27,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+from backend.services.scalp_v2.raw_move_source import is_directional, normalize_raw_move_source
 from backend.services.strategy_version import ADAPTIVE_STATE_VERSION, engine_versions
 
 PRIOR_STRENGTH = 8.0
@@ -79,12 +80,12 @@ _PRIORS: dict[str, dict[str, float]] = {
 # Bound on the learned residual added to a SCALP candidate's base executable
 # edge. Equal to the raw expected-move cap, so evidence can cancel a full claim.
 SCALP_RESIDUAL_MAX = 0.006
-STRATEGY_RAW_SOURCE = "strategy"
 
 
 def residual_metric(raw_move_source: str | None) -> str:
-    """Residual key for a raw-move source: strategy structural claims vs ATR estimates."""
-    return "edge_residual_strategy" if str(raw_move_source or "").lower() == STRATEGY_RAW_SOURCE else "edge_residual"
+    """Residual key per raw-move source. Only the strategy-claim residual is live;
+    ``edge_residual`` (ATR-estimate rows) is forensic and never read by eligibility."""
+    return "edge_residual_strategy" if is_directional(raw_move_source) else "edge_residual"
 
 
 # Metrics folded as a decayed running mean (weight 1/n) instead of the fast EWMA.
@@ -782,7 +783,7 @@ def record_candidate(
                 feats_json,
                 float(horizon),
                 raw_move,
-                str(raw_move_source) if raw_move is not None and raw_move_source else None,
+                normalize_raw_move_source(raw_move_source) if raw_move_source else None,
             ),
         )
         conn.commit()
@@ -885,7 +886,9 @@ def resolve_markouts(
                     raw_source = row["raw_move_source"] if "raw_move_source" in cols else None
                     if forward is not None and raw_move is not None and float(raw_move) > 0:
                         residual = scalp_edge_residual(forward_net=forward, raw_expected_move=float(raw_move), roundtrip_cost=float(row["roundtrip_cost"] or 0))
-                    micro_target = residual
+                    # Only a directional claim's residual trains the micro residual;
+                    # forensic ATR-estimate residuals must not shape live edge.
+                    micro_target = residual if is_directional(raw_source) else None
                 row_learned = int(row["learned"] or 0)
                 version_ok = str(row["strategy_version"]) == current_strategy_version(engine_id)
                 if forward is not None and not row_learned and version_ok:

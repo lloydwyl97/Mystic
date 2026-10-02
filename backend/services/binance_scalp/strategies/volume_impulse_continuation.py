@@ -41,7 +41,9 @@ class VolumeImpulseContinuationStrategy:
         if not (impulse and price_up):
             return reject_signal(ctx, self.name, "NO_VOLUME_IMPULSE")
 
-        expected = estimate_expected_move_pct(bars, structural=0.0026, atr_mult=0.70, cap_pct=0.006)
+        structural = 0.0026
+
+        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.70, cap_pct=0.006)
         reachable, _ = target_reachable(
             ctx.econ,
             spread_pct=ctx.snap.spread_pct,
@@ -49,7 +51,7 @@ class VolumeImpulseContinuationStrategy:
             expected_move_pct=expected,
         )
         if not reachable:
-            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact)
+            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
 
         vol_ratio = vol_recent / max(vol_prior, 1e-12)
         mom = ctx.mom
@@ -62,6 +64,7 @@ class VolumeImpulseContinuationStrategy:
             entry_reason=f"volume_impulse_{vol_ratio:.2f}x",
             invalidation_reason="impulse_fails_to_continue",
             expected_move_pct=expected,
+            directional_move_pct=structural,
             impact_pct=impact,
             limit_buy=fill,
             setup_context={"vol_ratio": vol_ratio},

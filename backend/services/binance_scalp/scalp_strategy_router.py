@@ -306,6 +306,7 @@ class ScalpStrategyRouter:
         meta["expected_move_pct"] = best_ranked.expected_move_pct
         meta["net_edge_after_costs_pct"] = best_ranked.net_edge_after_costs_pct
         meta["edge_source"] = best_ranked.edge_source
+        meta["volatility_move_pct"] = best_ranked.volatility_move_pct
         meta["executable_edge"] = dict(best_ranked.executable_edge or {})
         meta["adaptive_decision"] = dict(best_ranked.adaptive_decision or {})
         meta["adaptive_regime"] = str(best_ranked.adaptive_regime or "")
