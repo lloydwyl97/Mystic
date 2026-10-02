@@ -505,7 +505,8 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features:
     hard_hold = float(SCALP_V2_TIME_STOP_MIN)
     confidence = n_eff / (PRIOR_STRENGTH + n_eff)
     # Bounded microstructure tilt: shrunk by the model's own sample count so a
-    # cold model barely moves rank/size. Never touches the hard net-edge gate.
+    # cold model barely moves the edge. It is part of expected_edge, which the
+    # canonical executable edge (scalp_v2.executable_edge) uses for eligibility.
     micro_tilt, micro_n = micro_edge_tilt(db_path, SCALP_ENGINE, features)
     micro_conf = micro_n / (micro_n + MICRO_MODEL_CONF_K) if micro_n > 0 else 0.0
     edge = edge + micro_conf * micro_tilt

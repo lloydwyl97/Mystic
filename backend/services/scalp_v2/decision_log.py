@@ -75,7 +75,7 @@ def record_scalp_decision(
         _ensure(conn)
         conn.execute(
             "INSERT INTO scalp_v2_decisions(symbol, cycle_ts, result, reason, detail) VALUES (?,?,?,?,?)",
-            (str(symbol), moment, str(result), str(reason), str(detail or "")[:500]),
+            (str(symbol), moment, str(result), str(reason), str(detail or "")[:2000]),
         )
         conn.commit()
     finally:
@@ -140,4 +140,15 @@ def classify_scalp_candidate(row: dict | None) -> tuple[str, str]:
             code = blob.split()[0][:64]
             return f"REJECTED:{code}", code
         return "REJECTED:ENTRY_NOT_ELIGIBLE", "ENTRY_NOT_ELIGIBLE"
+    # The canonical executable edge owns economic permission. An eligible row
+    # that does not carry a positive one cannot arm, whatever produced it.
+    edge = row.get("executable_edge")
+    if not isinstance(edge, dict) or edge.get("edge_after_cost_pct") is None:
+        return "REJECTED:NO_EXECUTABLE_EDGE_ESTIMATE", "NO_EXECUTABLE_EDGE_ESTIMATE"
+    try:
+        positive = float(edge["edge_after_cost_pct"]) > float(edge.get("reject_threshold_pct") or 0.0)
+    except (TypeError, ValueError):
+        positive = False
+    if not positive:
+        return "REJECTED:NO_EXECUTABLE_NET_EDGE", "NO_EXECUTABLE_NET_EDGE"
     return "ARMED", "ARMED"

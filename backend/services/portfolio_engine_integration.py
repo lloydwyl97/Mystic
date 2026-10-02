@@ -2129,7 +2129,8 @@ class PortfolioEngineIntegration:
 
         release_orphan_reservations(self.engine.db_path, now=cycle_ts)
         from backend.config.trading_economics import canonical_roundtrip_cost_pct
-        from backend.services.adaptive_learning import market_regime_tag, ohlcv_quote, record_candidate, resolve_markouts, scalp_decision
+        from backend.services.adaptive_learning import market_regime_tag, ohlcv_quote, record_candidate, resolve_markouts
+        from backend.services.scalp_v2.executable_edge import decision_detail
 
         resolve_markouts(self.engine.db_path, lambda sym, ts: ohlcv_quote(self.engine.db_path, sym, ts))
         by_symbol = {str(row.get("symbol") or "").upper().replace("-", "").replace("/", ""): row for row in candidates}
@@ -2147,7 +2148,7 @@ class PortfolioEngineIntegration:
 
         def _record_scalp_observation(row: dict, norm_key: str, *, signaled: bool) -> dict:
             setup_name = str(row.get("best_setup") or "SCALP_STRUCTURAL")
-            regime = market_regime_tag(self.engine.db_path, norm_key) or str(row.get("regime") or row.get("market_regime") or "")
+            regime = str(row.get("adaptive_regime") or "") or market_regime_tag(self.engine.db_path, norm_key) or str(row.get("regime") or row.get("market_regime") or "")
             micro_feats = _scalp_book(norm_key)
             snap = row.get("snap")
             ref_price = float(getattr(snap, "best_ask", 0) or getattr(snap, "mid_price", 0) or 0) if snap is not None else 0.0
@@ -2173,10 +2174,12 @@ class PortfolioEngineIntegration:
             code, _reason = classify_scalp_candidate(row)
             if code != "ARMED" or not row:
                 return -1e9
-            stamped = _record_scalp_observation(row, norm_key, signaled=True)
-            view = scalp_decision(self.engine.db_path, norm_key, stamped["setup"], stamped["regime"], features=stamped["features"])
-            row["adaptive_decision"] = view
-            return float(view["expected_edge"]) + 0.001 * float(view["confidence"])
+            _record_scalp_observation(row, norm_key, signaled=True)
+            # The view the canonical executable edge was priced from at ranking;
+            # eligibility, priority and size read the same numbers.
+            view = row.get("adaptive_decision") or {}
+            edge = row.get("executable_edge") or {}
+            return float(edge.get("edge_after_cost_pct") or 0.0) + 0.001 * float(view.get("confidence") or 0.0)
 
         for sym_raw in sorted(products, key=_scalp_priority, reverse=True):
             norm_key = sym_raw.upper().replace("-", "").replace("/", "")
@@ -2189,7 +2192,7 @@ class PortfolioEngineIntegration:
                 if result_code != "ARMED":
                     if row:
                         _record_scalp_observation(row, norm_key, signaled=False)
-                    record_scalp_decision(self.engine.db_path, norm, result_code, reason, cycle_ts=cycle_ts)
+                    record_scalp_decision(self.engine.db_path, norm, result_code, reason, cycle_ts=cycle_ts, detail=decision_detail(row))
                     logger.info("SCALP_V2_DECISION symbol=%s result=%s reason=%s", norm, result_code, reason)
                     continue
                 # Two-engine contract: engine-scoped lookup. SCALP's own lot
@@ -2200,14 +2203,21 @@ class PortfolioEngineIntegration:
                     pos_status = str(getattr(existing_pos, "status", "ACTIVE") or "ACTIVE")
                     pos_qty = float(getattr(existing_pos, "quantity", 0) or 0)
                     if pos_qty > 0 and pos_status != "DUST_PENDING":
-                        record_scalp_decision(self.engine.db_path, norm, "REJECTED:SYMBOL_OCCUPIED", "SYMBOL_OCCUPIED")
+                        record_scalp_decision(self.engine.db_path, norm, "REJECTED:SYMBOL_OCCUPIED", "SYMBOL_OCCUPIED", cycle_ts=cycle_ts, detail=decision_detail(row))
                         logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:SYMBOL_OCCUPIED", norm)
                         continue
                 # Evidence-gated abstention (LIVE skip). Confident negative net
                 # expectancy only; cold keys never abstain. Skip-only, above hard safety.
                 _adapt = (row or {}).get("adaptive_decision") or {}
                 if isinstance(_adapt, dict) and _adapt.get("abstain"):
-                    record_scalp_decision(self.engine.db_path, norm, "REJECTED:LEARNED_NEGATIVE_EDGE", str(_adapt.get("abstain_reason") or ""), cycle_ts=cycle_ts)
+                    record_scalp_decision(
+                        self.engine.db_path,
+                        norm,
+                        "REJECTED:LEARNED_NEGATIVE_EDGE",
+                        str(_adapt.get("abstain_reason") or ""),
+                        cycle_ts=cycle_ts,
+                        detail=decision_detail(row),
+                    )
                     logger.info("SCALP_V2_ABSTAIN symbol=%s reason=%s", norm, _adapt.get("abstain_reason"))
                     continue
                 arm_price = 0.0
@@ -2217,7 +2227,7 @@ class PortfolioEngineIntegration:
                 if arm_price <= 0:
                     arm_price = float(self.current_prices.get(norm) or self.current_prices.get(sym_raw) or 0)
                 if arm_price <= 0:
-                    record_scalp_decision(self.engine.db_path, norm, "REJECTED:BOOK_STALE", "BOOK_STALE", cycle_ts=cycle_ts)
+                    record_scalp_decision(self.engine.db_path, norm, "REJECTED:BOOK_STALE", "BOOK_STALE", cycle_ts=cycle_ts, detail=decision_detail(row))
                     logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:BOOK_STALE", norm)
                     continue
                 setup_name = str((row or {}).get("best_setup") or "SCALP_STRUCTURAL")
@@ -2229,6 +2239,7 @@ class PortfolioEngineIntegration:
                         "REJECTED:SYMBOL_OPPORTUNITY_ALREADY_ACTIVE",
                         "SYMBOL_OPPORTUNITY_ALREADY_ACTIVE",
                         cycle_ts=cycle_ts,
+                        detail=decision_detail(row, opportunity_id=opp_id),
                     )
                     logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:SYMBOL_OPPORTUNITY_ALREADY_ACTIVE opp=%s", norm, opp_id)
                     continue
@@ -2255,6 +2266,7 @@ class PortfolioEngineIntegration:
                         "REJECTED:INSUFFICIENT_EXECUTABLE_CASH",
                         "INSUFFICIENT_EXECUTABLE_CASH",
                         cycle_ts=cycle_ts,
+                        detail=decision_detail(row, notional=notional),
                     )
                     continue
                 logger.warning(
@@ -2276,7 +2288,14 @@ class PortfolioEngineIntegration:
                     adaptive_decision=view or None,
                 )
                 if result is not None:
-                    record_scalp_decision(self.engine.db_path, norm, "FILLED", "FILLED", cycle_ts=cycle_ts, detail=str(result.get("order_id") or ""))
+                    record_scalp_decision(
+                        self.engine.db_path,
+                        norm,
+                        "FILLED",
+                        "FILLED",
+                        cycle_ts=cycle_ts,
+                        detail=decision_detail(row, order_id=str(result.get("order_id") or ""), notional=notional),
+                    )
                     try:
                         from backend.services.scalp_v2.entry_context import build_entry_context, persist_entry_context
 
@@ -2293,12 +2312,12 @@ class PortfolioEngineIntegration:
                     )
                 else:
                     reject = str(getattr(self.engine, "last_buy_reject_reason", "") or "EXCHANGE_REJECTED")
-                    record_scalp_decision(self.engine.db_path, norm, f"REJECTED:{reject}", reject, cycle_ts=cycle_ts)
+                    record_scalp_decision(self.engine.db_path, norm, f"REJECTED:{reject}", reject, cycle_ts=cycle_ts, detail=decision_detail(row, opportunity_id=opp_id))
                     logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:%s opp=%s", norm, reject, opp_id)
             except _asyncio.CancelledError:
                 raise
             except Exception:
-                record_scalp_decision(self.engine.db_path, norm, "FAILED", "FAILED", cycle_ts=cycle_ts)
+                record_scalp_decision(self.engine.db_path, norm, "FAILED", "FAILED", cycle_ts=cycle_ts, detail=decision_detail(row))
                 logger.warning("SCALP_V2_SIGNAL_ERROR symbol=%s", sym_raw, exc_info=True)
 
     async def _monitor_positions_once(self, *, refresh_market_data: bool = True) -> list[dict[str, Any]]:

@@ -104,13 +104,29 @@ def test_soft_reject_gets_atr_edge_estimate_and_stays_soft():
     rc = rank_setup_signal(_sig(passed=False, reason="NOT_NEAR_SUPPORT"), regime="RANGE", ctx=_ctx(_bars(30, 0.012)))
     assert rc.edge_source == "atr_estimate"
     assert rc.expected_move_pct > 0
-    assert rc.net_edge_after_costs_pct == rc.expected_move_pct - rc.roundtrip_cost_pct
+    assert rc.executable_edge["raw_expected_move_pct"] == rc.expected_move_pct
+    assert rc.net_edge_after_costs_pct == rc.executable_edge["edge_after_cost_pct"]
+    assert rc.roundtrip_cost_pct == rc.executable_edge["canonical_cost_pct"]
     assert rc.hard_block is None
     assert rc.entry_eligible
 
 
-def test_soft_reject_without_edge_is_blocked_not_bypassed():
-    rc = rank_setup_signal(_sig(passed=False, reason="NOT_NEAR_SUPPORT"), regime="RANGE", ctx=_ctx(_bars(30, 0.0004)))
+def test_small_raw_claim_does_not_decide_permission(monkeypatch):
+    ctx = _ctx(_bars(30, 0.0004))
+    rc = rank_setup_signal(_sig(passed=False, reason="NOT_NEAR_SUPPORT"), regime="RANGE", ctx=ctx)
+    assert rc.executable_edge["edge_after_cost_pct"] > 0
+    assert rc.entry_eligible
+
+    import backend.services.adaptive_learning as al
+
+    real = al.scalp_decision
+
+    def negative(*args, **kwargs):
+        view = real(*args, **kwargs)
+        return {**view, "expected_edge": -0.0004, "micro_tilt": 0.0}
+
+    monkeypatch.setattr(al, "scalp_decision", negative)
+    rc = rank_setup_signal(_sig(passed=False, reason="NOT_NEAR_SUPPORT"), regime="RANGE", ctx=ctx)
     assert rc.hard_block == "NO_EXECUTABLE_NET_EDGE"
     assert not rc.entry_eligible
 

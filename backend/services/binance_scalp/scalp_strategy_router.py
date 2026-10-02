@@ -306,6 +306,9 @@ class ScalpStrategyRouter:
         meta["expected_move_pct"] = best_ranked.expected_move_pct
         meta["net_edge_after_costs_pct"] = best_ranked.net_edge_after_costs_pct
         meta["edge_source"] = best_ranked.edge_source
+        meta["executable_edge"] = dict(best_ranked.executable_edge or {})
+        meta["adaptive_decision"] = dict(best_ranked.adaptive_decision or {})
+        meta["adaptive_regime"] = str(best_ranked.adaptive_regime or "")
         entry_eligible = bool(best_ranked.entry_eligible)
         soft_reason = best_ranked.soft_reason
         hard_block = best_ranked.hard_block
@@ -499,6 +502,9 @@ class ScalpStrategyRouter:
                 "hard_block": meta.get("hard_block"),
                 "best_setup": meta.get("best_setup"),
                 "soft_reason": meta.get("soft_reason"),
+                "executable_edge": meta.get("executable_edge") or {},
+                "adaptive_decision": meta.get("adaptive_decision") or {},
+                "adaptive_regime": meta.get("adaptive_regime") or "",
                 "reachability_surplus": meta.get("reachability_surplus"),
                 "selection_confidence": meta.get("selection_confidence"),
                 # EV-sizing inputs (scalp_dynamic_sizing.py) — never gates.

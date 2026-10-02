@@ -3,17 +3,18 @@
 Distinct from DAY V2 and legacy exits. Active policy: target_stop_horizon
 (contract SCALP_V2_TARGET_STOP_HORIZON_V1).
 
-A scalp is admitted only when its expected move reaches the SCALP net-profit
-target after costs (binance_scalp.economics.target_reachable). The exit takes
-exactly that target, cuts a scalp that moves against it by the SCALP adverse
-bound, and ends every scalp at the SCALP horizon. It never holds for hours.
+A scalp is admitted only when its canonical executable net edge is positive
+(scalp_v2.executable_edge). The exit takes the adaptive target, cuts a scalp
+that moves against it by the learned adverse distance (never wider than the
+SCALP adverse bound), and ends every scalp at the SCALP horizon. It never
+holds for hours.
 
 Exit ladder (priority order):
   1. Catastrophic stop  — intra-bar adverse move >= SCALP_V2_CATASTROPHIC_PCT (1.5%)
   2. Net profit take    — net P&L >= scalp_v2_min_net_profit_pct
                           (SCALP_NET_PROFIT_TARGET_PCT, default 0.25%)
-  3. Adverse stop       — net P&L <= -scalp_v2_max_adverse_net_pct
-                          (SCALP_PATH_MAX_ADVERSE_NET_PCT, default 0.15%)
+  3. Adverse stop       — net P&L <= -min(SCALP_PATH_MAX_ADVERSE_NET_PCT,
+                          learned gross MAE + round-trip cost)
   4. Giveback           — off unless SCALP_V2_GIVEBACK_EXIT_ENABLED=true
   5. Stall              — off unless SCALP_V2_STALL_EXIT_ENABLED=true
   6. Horizon            — hold >= SCALP_V2_TIME_STOP_MIN (SCALP_HOLD_MAX_MINUTES,
@@ -74,6 +75,28 @@ _SCALP_V2_RECORDED_EXIT_REASONS: dict[str, str] = {
     SCALP_V2_EXIT_STALL: "STALL_EXIT",
     SCALP_V2_EXIT_TIME_STOP: "TIME_STOP_EXIT",
 }
+
+
+def scalp_v2_adverse_net_threshold_pct(symbol: str, adaptive_decision: dict | None) -> float:
+    """Net-P&L adverse stop distance for an open SCALP position.
+
+    ``risk_estimate`` is the learned gross MAE (price excursion from entry). The
+    evaluator compares against net P&L, which already carries the canonical
+    round-trip cost, so the learned distance is that excursion plus the cost.
+    The contract bound (SCALP_PATH_MAX_ADVERSE_NET_PCT) is the ceiling: learned
+    risk can tighten the stop, never widen it.
+    """
+    from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST
+
+    contract_adverse = scalp_v2_max_adverse_net_pct(symbol)
+    adapt = adaptive_decision if isinstance(adaptive_decision, dict) else {}
+    try:
+        learned_mae = float(adapt.get("risk_estimate") or 0.0)
+    except (TypeError, ValueError):
+        learned_mae = 0.0
+    if learned_mae <= 0:
+        return contract_adverse
+    return min(contract_adverse, learned_mae + float(ESTIMATED_ROUNDTRIP_COST))
 
 
 def scalp_v2_recorded_exit_reason(exit_trigger: str) -> str:
@@ -169,9 +192,7 @@ def evaluate_scalp_v2_exit(
         # ──────────────────────────────────────────────────────────────────
         # Role 3: Adverse stop — the scalp moved against the thesis; fail fast
         # ──────────────────────────────────────────────────────────────────
-        contract_adverse = scalp_v2_max_adverse_net_pct(sym)
-        learned_mae = float(adapt.get("risk_estimate") or 0.0)
-        max_adverse = min(contract_adverse, learned_mae) if learned_mae > 0 else contract_adverse
+        max_adverse = scalp_v2_adverse_net_threshold_pct(sym, adapt)
         if max_adverse > 0 and net_pnl_pct <= -max_adverse:
             logger.warning(
                 "SCALP_V2_ADVERSE_STOP symbol=%s net_pnl=%.4f%% <= -%.4f%%",

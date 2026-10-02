@@ -81,9 +81,13 @@ def target_reachable(
     impact_pct: float,
     expected_move_pct: float,
 ) -> tuple[bool, float]:
-    req = econ.entry_required_gross_edge_pct(spread_pct, impact_pct, 0.0)
-    surplus = expected_move_pct - req
-    return surplus >= econ.min_projected_surplus_pct, req
+    """Does the strategy's own gross move claim cover the executable round-trip cost?
+
+    A setup label only. Entry permission is the canonical executable edge in
+    scalp_v2.executable_edge; this claim never admits or rejects a trade.
+    """
+    cost = econ.roundtrip_cost_pct(spread_pct, impact_pct, 0.0)
+    return expected_move_pct > cost, cost
 
 
 def reject_signal(

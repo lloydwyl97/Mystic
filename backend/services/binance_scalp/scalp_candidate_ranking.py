@@ -30,10 +30,11 @@ from backend.services.binance_scalp.strategies.common import (
     check_spread,
     depth_check,
     estimate_expected_move_pct,
-    target_reachable,
 )
 
-# Hard safety — never trade through these.
+# Hard safety — never trade through these. NO_EXECUTABLE_NET_EDGE is set only by
+# the canonical executable edge (scalp_v2.executable_edge); a strategy's own
+# gross-move claim (TARGET_NOT_REACHABLE) ranks, it does not admit or reject.
 HARD_REJECT_REASONS: frozenset[str] = frozenset(
     {
         "SPREAD_TOO_WIDE",
@@ -43,10 +44,12 @@ HARD_REJECT_REASONS: frozenset[str] = frozenset(
         "MOMENTUM_DATA_INSUFFICIENT",
         "INSUFFICIENT_HISTORY",
         "NO_EXECUTABLE_EDGE_ESTIMATE",
-        "TARGET_NOT_REACHABLE",
         "NO_EXECUTABLE_NET_EDGE",
     }
 )
+
+# Soft-entry rank reference for a thin positive executable edge (rank only).
+_SOFT_EDGE_REFERENCE_PCT = 0.0008
 
 # Soft setup misses → partial rank score (failed checks are not tradeable edge).
 # Prior report: NO_REJECTION_WICK dominated scratches; NOT_NEAR_SUPPORT had more winners.
@@ -164,37 +167,47 @@ def _soft_momentum_boost(ctx: StrategyMarketContext) -> float:
     return min(0.05, raw * 0.4)
 
 
-def _reachability_soft_mult(
-    econ: Any,
+def _edge_soft_mult(executable_net_edge_pct: float, *, soft_entry: bool) -> float:
+    """Rank penalty for soft entries whose canonical executable edge is thin. Never a gate."""
+    if not soft_entry:
+        return 1.0
+    ref = _SOFT_EDGE_REFERENCE_PCT
+    if executable_net_edge_pct >= ref * 2.0:
+        return 1.0
+    if executable_net_edge_pct <= 0:
+        return 0.5
+    return max(0.55, min(1.0, executable_net_edge_pct / ref))
+
+
+def _adaptive_regime(db_path: str, symbol: str) -> str:
+    """Regime key the adaptive learner writes and reads for this symbol (cached)."""
+    key = f"adaptive_regime:{symbol}"
+    hit, cached = _learn_cache_get(key)
+    if hit:
+        return str(cached or "")
+    from backend.services.adaptive_learning import market_regime_tag
+
+    return str(_learn_cache_set(key, market_regime_tag(db_path, symbol.upper().replace("/", "").replace("-", "")) or ""))
+
+
+def candidate_executable_edge(
     *,
+    symbol: str,
+    setup: str,
+    db_path: str,
+    raw_expected_move_pct: float,
     spread_pct: float,
     impact_pct: float,
-    expected_move_pct: float,
-    soft_entry: bool,
-) -> tuple[float, float]:
-    """Penalize soft entries whose projected move barely clears break-even."""
-    if expected_move_pct <= 0:
-        return 1.0, 0.0
-    reachable, req = target_reachable(
-        econ,
-        spread_pct=spread_pct,
-        impact_pct=impact_pct,
-        expected_move_pct=expected_move_pct,
-    )
-    surplus = expected_move_pct - req
-    if not reachable:
-        if soft_entry:
-            return 0.45, surplus
-        # Passed strategies already verified reachability at signal time.
-        return 1.0, surplus
-    if not soft_entry:
-        return 1.0, surplus
-    min_soft = max(float(econ.min_projected_surplus_pct) * 2.5, 0.0008)
-    if surplus >= min_soft * 2.0:
-        return 1.0, surplus
-    if surplus <= 0:
-        return 0.5, surplus
-    return max(0.55, min(1.0, surplus / min_soft)), surplus
+    micro_feats: dict | None,
+) -> tuple[Any, dict, str]:
+    """(ExecutableEdge, stamped adaptive view, adaptive regime) for one candidate."""
+    from backend.services.adaptive_learning import scalp_decision
+    from backend.services.scalp_v2.executable_edge import scalp_executable_edge, stamp_view
+
+    regime_key = _adaptive_regime(db_path, symbol)
+    view = scalp_decision(db_path, symbol.upper().replace("/", "").replace("-", ""), setup, regime_key, features=micro_feats or {})
+    edge = scalp_executable_edge(view, raw_expected_move_pct=raw_expected_move_pct, spread_pct=spread_pct, impact_pct=impact_pct)
+    return edge, stamp_view(view, edge), regime_key
 
 
 @dataclass(frozen=True)
@@ -234,6 +247,11 @@ class RankedCandidate:
     # Observability only — already computed during ranking; never a gate.
     micro_ev: dict[str, Any] = field(default_factory=dict)
     rank_components: dict[str, Any] = field(default_factory=dict)
+    # Canonical executable edge (scalp_v2.executable_edge) and the adaptive view
+    # stamped with its size — the values eligibility, rank and size all read.
+    executable_edge: dict[str, Any] = field(default_factory=dict)
+    adaptive_decision: dict[str, Any] = field(default_factory=dict)
+    adaptive_regime: str = ""
 
 
 def rank_setup_signal(
@@ -314,23 +332,12 @@ def rank_setup_signal(
         hard_block = None
     else:
         reason = sig.reject_reason or ""
-        if reason in HARD_REJECT_REASONS or reason.startswith("STRATEGY_ERROR"):
+        if (reason in HARD_REJECT_REASONS and reason != "NO_EXECUTABLE_NET_EDGE") or reason.startswith("STRATEGY_ERROR"):
             return RankedCandidate(
                 signal=sig,
                 rank_score=0.0,
                 entry_eligible=False,
                 hard_block=reason or "HARD_REJECT",
-                regime=regime,
-                regime_native=native,
-                soft_reason=reason,
-                selection_confidence="blocked",
-            )
-        if reason == "TARGET_NOT_REACHABLE":
-            return RankedCandidate(
-                signal=sig,
-                rank_score=0.0,
-                entry_eligible=False,
-                hard_block="NO_EXECUTABLE_NET_EDGE",
                 regime=regime,
                 regime_native=native,
                 soft_reason=reason,
@@ -360,24 +367,51 @@ def rank_setup_signal(
             selection_confidence="blocked",
             edge_source="unavailable",
         )
-    cost = float(ctx.econ.roundtrip_cost_pct(ctx.snap.spread_pct, impact, 0.0))
-    reach_mult_val, reach_surplus = _reachability_soft_mult(
-        ctx.econ,
-        spread_pct=ctx.snap.spread_pct,
-        impact_pct=impact,
-        expected_move_pct=expected,
-        soft_entry=not sig.passed,
-    )
+    micro_feats: dict = {}
+    with contextlib.suppress(Exception):
+        from backend.services.microstructure_engine import compute_features as _cmf
+
+        micro_feats = _cmf(sig.symbol) or {}
+    try:
+        from backend.services.binance_scalp.config import get_scalp_config
+
+        edge, adaptive_view, adaptive_regime = candidate_executable_edge(
+            symbol=sig.symbol,
+            setup=sig.setup_name,
+            db_path=get_scalp_config().database_path,
+            raw_expected_move_pct=expected,
+            spread_pct=ctx.snap.spread_pct,
+            impact_pct=impact,
+            micro_feats=micro_feats,
+        )
+    except Exception:
+        # Fail closed: an edge that cannot be priced cannot be traded.
+        return RankedCandidate(
+            signal=sig,
+            rank_score=0.0,
+            entry_eligible=False,
+            hard_block="NO_EXECUTABLE_EDGE_ESTIMATE",
+            regime=regime,
+            regime_native=native,
+            soft_reason=sig.reject_reason,
+            selection_confidence="blocked",
+            expected_move_pct=expected,
+            edge_source=edge_source,
+        )
+    reach_surplus = float(edge.edge_after_cost_pct)
+    reach_mult_val = _edge_soft_mult(reach_surplus, soft_entry=not sig.passed)
     rank_score *= reach_mult_val
     target_gap_val = reach_surplus
-    reachable, _required = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
     edge_fields = {
         "expected_move_pct": expected,
-        "roundtrip_cost_pct": cost,
-        "net_edge_after_costs_pct": expected - cost,
+        "roundtrip_cost_pct": float(edge.canonical_cost_pct),
+        "net_edge_after_costs_pct": reach_surplus,
         "edge_source": edge_source,
+        "executable_edge": edge.as_dict(),
+        "adaptive_decision": adaptive_view,
+        "adaptive_regime": adaptive_regime,
     }
-    if not reachable:
+    if not edge.eligible:
         return RankedCandidate(
             signal=sig,
             rank_score=round(rank_score, 4),
@@ -385,9 +419,9 @@ def rank_setup_signal(
             hard_block="NO_EXECUTABLE_NET_EDGE",
             regime=regime,
             regime_native=native,
-            soft_reason=sig.reject_reason or "TARGET_NOT_REACHABLE",
+            soft_reason=sig.reject_reason,
             reachability_surplus=reach_surplus,
-            selection_confidence="low_reachability",
+            selection_confidence="no_executable_net_edge",
             base_score=base_score,
             momentum_boost=mom_boost,
             reachability_multiplier=reach_mult_val,
@@ -451,22 +485,11 @@ def rank_setup_signal(
             _stats = _learn_cache_set(stats_key, _gls(_db, sig.symbol, f"SCALP_V2@{SCALP_STRATEGY_VERSION}"))
         role_samples = _stats.sample_count
         role_conf_status = _stats.confidence_status
-        with contextlib.suppress(Exception):
-            from backend.services.adaptive_learning import scalp_decision
+    learned_adj = round(max(-0.04, min(0.04, (edge.edge_after_cost_pct - edge.edge_prior_pct) * 8.0)), 5)
 
-            _db = os.getenv("TRADING_DB_PATH", "/home/mystic/mystic/mystic_trading.db")
-            _view = scalp_decision(_db, sig.symbol, sig.setup_name, regime)
-            learned_adj = round(max(-0.04, min(0.04, (_view["expected_edge"] - _view["edge_prior"]) * 8.0)), 5)
-
-    # Real microstructure features — ranking only, never eligibility.
     # select_v2: EV_10s is the primary four-coin key (frozen validation).
     # DAY get_microstructure_ranking_delta is not used here.
     micro_adj = 0.0
-    micro_feats: dict = {}
-    with contextlib.suppress(Exception):
-        from backend.services.microstructure_engine import compute_features as _cmf
-
-        micro_feats = _cmf(sig.symbol) or {}
 
     micro_learn_adj = 0.0
     micro_learn: dict = {}
