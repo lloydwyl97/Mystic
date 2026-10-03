@@ -101,21 +101,96 @@ def _read_depth_cache(r: redis.Redis, sym: str) -> tuple[list[list[float]], list
         return None
 
 
-def publish_ws_depth(symbol: str, bids: list[list[float]], asks: list[list[float]]) -> None:
+def publish_ws_depth(
+    symbol: str,
+    bids: list[list[float]],
+    asks: list[list[float]],
+    last_update_id: int | None = None,
+) -> None:
     """Publish the live depth20@100ms book for SCALP fills (runner is another process).
 
     Does not change DAY ranking or trails. Best-effort Redis write.
+    An update id older than or equal to the id already stored is not written:
+    a delayed snapshot must not replace the current book.
     """
     if not bids or not asks:
         return
     bus = symbol_bus(symbol)
     try:
         r = redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"), decode_responses=True)
-        payload = json.dumps({"fetched_at": time.time(), "bids": bids, "asks": asks, "source": "websocket"})
-        r.set(f"{_WS_DEPTH_KEY_PREFIX}{bus}", payload, ex=5)
+        key = f"{_WS_DEPTH_KEY_PREFIX}{bus}"
+        if last_update_id is not None and not _update_id_is_newer(r, key, int(last_update_id)):
+            return
+        payload = json.dumps(
+            {
+                "fetched_at": time.time(),
+                "bids": bids,
+                "asks": asks,
+                "source": "websocket",
+                "last_update_id": int(last_update_id) if last_update_id is not None else None,
+            }
+        )
+        r.set(key, payload, ex=5)
         r.set(f"{_DEPTH_CACHE_KEY_PREFIX}{bus}", payload, ex=max(5, int(SCALP_DEPTH_CACHE_TTL_SEC * 2)))
     except Exception:
         pass
+
+
+def _update_id_is_newer(r: redis.Redis, key: str, update_id: int) -> bool:
+    """False when Redis already holds this id or a newer one."""
+    try:
+        raw = r.get(key)
+        if not raw:
+            return True
+        prev = json.loads(raw).get("last_update_id")
+        if prev is None:
+            return True
+        return int(update_id) > int(prev)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return True
+
+
+def book_behind_recent_tape(redis_client: redis.Redis, symbol: str, best_ask: float, *, now: float | None = None) -> bool:
+    """True when this ask cannot be the book the exchange just traded.
+
+    A sale still inside the tape freshness window, printed more than the SCALP
+    adverse bound above this ask, means the book is not current. A missing or
+    older tape is not a conflict. The adverse bound is not widened.
+    """
+    if redis_client is None or best_ask <= 0:
+        return False
+    bus = symbol_bus(symbol)
+    try:
+        rows = redis_client.xrevrange(f"scalp:tape:{bus}", count=1)
+    except Exception:
+        return False
+    if not rows:
+        return False
+    _sid, fields = rows[0]
+    if not isinstance(fields, dict):
+        return False
+    from backend.services.binance_scalp.structural_tape import DEFAULT_STALE_SEC, parse_agg_payload
+
+    event = parse_agg_payload(
+        {
+            "s": fields.get("s") or bus,
+            "a": fields.get("a"),
+            "p": fields.get("p"),
+            "q": fields.get("q"),
+            "m": fields.get("m") in {1, "1", "true", "True"},
+            "T": fields.get("T"),
+        }
+    )
+    if event is None:
+        return False
+    now_ts = time.time() if now is None else float(now)
+    age = now_ts - event.trade_ts
+    if age > DEFAULT_STALE_SEC or age < -1.5:
+        return False
+    from backend.services.scalp_v2.exit_calibration import scalp_v2_max_adverse_net_pct
+
+    bound = float(scalp_v2_max_adverse_net_pct(bus)) * event.price
+    return (event.price - float(best_ask)) >= bound
 
 
 def _read_ws_depth(r: redis.Redis, sym: str) -> tuple[list[list[float]], list[list[float]], float] | None:

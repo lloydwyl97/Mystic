@@ -2384,6 +2384,19 @@ def _configured_live_status(engine: Any, capability: dict[str, Any]) -> dict[str
     )
 
 
+def _book_not_current_executable(reader: Any, symbol: str, best_ask: float) -> bool:
+    """True when the ask is too far below a recent sale to be the live book."""
+    redis_client = getattr(reader, "_redis", None)
+    if redis_client is None:
+        return False
+    try:
+        from backend.services.binance_scalp.market_reader import book_behind_recent_tape
+
+        return book_behind_recent_tape(redis_client, symbol, best_ask)
+    except Exception:
+        return False
+
+
 class PortfolioEngine:
     """
     Mystic Pro Portfolio Engine
@@ -4771,10 +4784,11 @@ class PortfolioEngine:
 
         Primary: the SCALP websocket depth book (<= SCALP_WS_DEPTH_MAX_AGE_SEC
         old, no REST). Fallback on the full pass: the canonical REST mark and
-        its bookTicker bid when fresh. A stale or bid-less quote returns no
-        executable bid, and the exit branch logs that it is pricing from mark.
+        its bookTicker bid when fresh. A stale, bid-less, or non-current book
+        returns no executable bid, so the normal adverse stop cannot fire.
         """
         quote = None
+        reader = None
         try:
             reader = getattr(self, "_scalp_book_reader", None)
             if reader is None:
@@ -4787,32 +4801,45 @@ class PortfolioEngine:
             quote = None
         if quote is not None:
             bid, mid = float(quote[0]), float(quote[1])
-            now = time.time()
-            return (
-                {
-                    "mark_used": mid,
-                    "mark_source": "scalp_ws_depth_mid",
-                    "mark_timestamp": now,
-                    "mark_age_seconds": 0.0,
-                    "price_source_stale": False,
-                    "stale_mark_used": False,
-                    "bid": bid,
-                    "ask": 2.0 * mid - bid,
-                    "mid": mid,
-                    "last": None,
-                    "kline_1m_close": None,
-                    "kline_1m_high": None,
-                    "kline_1m_open_time": None,
-                    "canonical_source": "scalp_ws_depth",
-                    "symbol_format": normalize_symbol(symbol),
-                },
-                bid,
-            )
+            ask = 2.0 * mid - bid
+            if _book_not_current_executable(reader, symbol, ask):
+                logger.warning(
+                    "SCALP_V2_ADVERSE_BOOK_NOT_CURRENT symbol=%s bid=%.8f ask=%.8f",
+                    symbol,
+                    bid,
+                    ask,
+                )
+                quote = None
+            else:
+                now = time.time()
+                return (
+                    {
+                        "mark_used": mid,
+                        "mark_source": "scalp_ws_depth_mid",
+                        "mark_timestamp": now,
+                        "mark_age_seconds": 0.0,
+                        "price_source_stale": False,
+                        "stale_mark_used": False,
+                        "bid": bid,
+                        "ask": ask,
+                        "mid": mid,
+                        "last": None,
+                        "kline_1m_close": None,
+                        "kline_1m_high": None,
+                        "kline_1m_open_time": None,
+                        "canonical_source": "scalp_ws_depth",
+                        "symbol_format": normalize_symbol(symbol),
+                    },
+                    bid,
+                )
         if executable_quote_only:
             return None, None
         fields = await self._resolve_exit_monitor_mark(symbol)
         bid = fields.get("bid")
         fresh_bid = float(bid) if isinstance(bid, (int, float)) and bid > 0 and not fields.get("price_source_stale") else None
+        ask = fields.get("ask")
+        if fresh_bid is not None and isinstance(ask, (int, float)) and _book_not_current_executable(reader, symbol, float(ask)):
+            fresh_bid = None
         return fields, fresh_bid
 
     async def _resolve_exit_monitor_mark(self, symbol: str) -> dict[str, Any]:
@@ -16392,6 +16419,7 @@ class PortfolioEngine:
                     hold_minutes=_hold_min_sv2,
                     bar_low=_bar_low_sv2,
                     symbol=symbol,
+                    allow_adverse_stop=executable_bid is not None and float(executable_bid) > 0,
                 )
                 if str(_scalp_v2_dec.get("action") or "") == "sell":
                     _scalp_v2_reason = str(_scalp_v2_dec.get("reason") or "SCALP_V2_EXIT")

@@ -177,7 +177,7 @@ class OrderBookCollector:
             with contextlib.suppress(Exception):
                 from backend.services.binance_scalp.market_reader import publish_ws_depth
 
-                publish_ws_depth(symbol, top_bids, top_asks)
+                publish_ws_depth(symbol, top_bids, top_asks, last_update_id=last_update_id)
 
             self.stats["messages_received"] += 1
             self.stats["order_books_processed"] += 1

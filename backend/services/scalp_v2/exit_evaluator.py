@@ -131,6 +131,7 @@ def evaluate_scalp_v2_exit(
     bar_low: float,
     coin_profile: dict | None = None,
     symbol: str = "",
+    allow_adverse_stop: bool = True,
 ) -> dict[str, Any]:
     """Evaluate all SCALP V2 exit roles for an open SCALP position.
 
@@ -208,10 +209,12 @@ def evaluate_scalp_v2_exit(
             }
 
         # ──────────────────────────────────────────────────────────────────
-        # Role 3: Adverse stop — the scalp moved against the thesis; fail fast
+        # Role 3: Adverse stop — the scalp moved against the thesis; fail fast.
+        # A stale, crossed, or non-current book must not take this exit.
+        # Catastrophic protection above is unchanged.
         # ──────────────────────────────────────────────────────────────────
         max_adverse = scalp_v2_adverse_net_threshold_pct(sym, adapt)
-        if max_adverse > 0 and net_pnl_pct <= -max_adverse:
+        if allow_adverse_stop and max_adverse > 0 and net_pnl_pct <= -max_adverse:
             logger.warning(
                 "SCALP_V2_ADVERSE_STOP symbol=%s net_pnl=%.4f%% <= -%.4f%%",
                 sym,
