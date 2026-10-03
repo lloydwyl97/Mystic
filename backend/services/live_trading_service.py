@@ -161,7 +161,7 @@ class LiveTradingService:
             return
 
         # Just log that we're ready - DON'T connect yet
-        logger.info(f"[INFO] Live trading service ready (lazy init) - API key: {self.binance_api_key[:8]}...")
+        logger.info("[INFO] Live trading service ready (lazy init) - API key configured")
 
     async def _ensure_initialized(self) -> bool:
         """Lazy initialization - only connect to Binance when actually needed (async version)."""

@@ -143,7 +143,8 @@ class ScalpConfig:
             structural_breaker_timeout_rate=float(os.getenv("SCALP_STRUCTURAL_BREAKER_TIMEOUT_RATE", "0.50") or "0.50"),
             structural_breaker_recovery_sec=int(os.getenv("SCALP_STRUCTURAL_BREAKER_RECOVERY_SEC", "1800") or "1800"),
             scalp_live_armed=_bool("SCALP_LIVE_ARMED", False),
-            scalp_live_max_notional=float(os.getenv("SCALP_LIVE_MAX_NOTIONAL", "50.0")),
+            # Optional absolute emergency ceiling. 0 = none; order size comes from the SCALP sleeve.
+            scalp_live_max_notional=float(os.getenv("SCALP_LIVE_MAX_NOTIONAL", "0") or "0"),
             scalp_live_max_open=int(os.getenv("SCALP_LIVE_MAX_OPEN", "2")),
             symbol_notional_caps=symbol_caps,
         )

@@ -35,6 +35,7 @@ from backend.services.day_decision_observability import TABLE_CANDIDATES, TABLE_
 from backend.services.day_direct_path_ev_authority import select_action
 
 BASE = 1788400000
+SCORECARD_NOW = datetime.fromtimestamp(BASE + 6 * 3600, tz=timezone.utc)
 COINS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 
 
@@ -411,7 +412,7 @@ def test_scorecard_reports_new_metrics_and_breakdowns(tmp_path):
     db = tmp_path / "score.db"
     _make_db(db, groups=2)
     run_label_batch(db, now_epoch=BASE + 6 * 3600)
-    report = build_scorecard(db, window="30d")
+    report = build_scorecard(db, window="30d", now=SCORECARD_NOW)
     for key in (
         "cost_cover_rate",
         "BE_rate",
@@ -444,10 +445,20 @@ def test_scorecard_reports_new_metrics_and_breakdowns(tmp_path):
     assert report["label_missing"] == 0
 
 
+def test_scorecard_window_excludes_rows_older_than_window(tmp_path):
+    db = tmp_path / "aged.db"
+    _make_db(db, groups=2)
+    run_label_batch(db, now_epoch=BASE + 6 * 3600)
+    assert build_scorecard(db, window="30d", now=SCORECARD_NOW)["label_coverage"] == 2
+    aged = build_scorecard(db, window="30d", now=SCORECARD_NOW + timedelta(days=31))
+    assert aged["label_coverage"] == 0
+    assert aged["generated_at"] == (SCORECARD_NOW + timedelta(days=31)).isoformat()
+
+
 def test_scorecard_handles_no_labels(tmp_path):
     db = tmp_path / "nolabels.db"
     _make_db(db, groups=1)
-    report = build_scorecard(db, window="30d")
+    report = build_scorecard(db, window="30d", now=SCORECARD_NOW)
     assert report["label_coverage"] == 0
     assert report["average_net_bps"] is None
     assert breakdowns([]) != {}

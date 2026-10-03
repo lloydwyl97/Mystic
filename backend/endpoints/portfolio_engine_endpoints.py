@@ -192,6 +192,12 @@ def _sqlite_open_positions_count_sync() -> int:
             conn.close()
 
 
+def _engine_active_position_count(engine: Any) -> int:
+    """In-memory positions counted the same way as the SQLite count: DUST_PENDING excluded."""
+    positions = getattr(engine, "open_positions", {}) or {}
+    return sum(1 for pos in positions.values() if getattr(pos, "status", "ACTIVE") != "DUST_PENDING")
+
+
 async def _ensure_engine_positions_match_sqlite(engine: Any, *, allow_mutations: bool = False) -> int:
     """
     Ensure in-process engine memory matches SQLite before API responses.
@@ -204,7 +210,7 @@ async def _ensure_engine_positions_match_sqlite(engine: Any, *, allow_mutations:
     """
     await _refresh_engine_from_sqlite_for_live(engine, allow_mutations=allow_mutations)
     sqlite_count = await asyncio.to_thread(_sqlite_open_positions_count_sync)
-    engine_count = len(getattr(engine, "open_positions", {}) or {})
+    engine_count = _engine_active_position_count(engine)
     if engine_count != sqlite_count and hasattr(engine, "_load_positions_from_sqlite"):
         try:
             await engine._load_positions_from_sqlite(allow_mutations=allow_mutations)
@@ -216,7 +222,7 @@ async def _ensure_engine_positions_match_sqlite(engine: Any, *, allow_mutations:
                     await engine._recompute_positions_values(None, allow_network_mtm=False)
         except Exception as e:
             logger.warning("POSITIONS_SQLITE_RESYNC failed: %s", e)
-        engine_count = len(getattr(engine, "open_positions", {}) or {})
+        engine_count = _engine_active_position_count(engine)
     if engine_count != sqlite_count:
         logger.warning(
             "POSITIONS_COUNT_MISMATCH: engine=%s sqlite=%s",
@@ -765,10 +771,11 @@ async def get_portfolio_status() -> dict[str, Any]:
         sqlite_count = await asyncio.to_thread(_sqlite_open_positions_count_sync)
         status["positions"] = status.get("open_positions", [])
         status["sqlite_open_positions_count"] = sqlite_count
-        if status.get("positions_count", 0) != sqlite_count:
+        status_position_rows = len(status.get("open_positions") or [])
+        if status_position_rows != sqlite_count:
             logger.warning(
-                "STATUS_POSITIONS_MISMATCH: positions_count=%s sqlite=%s",
-                status.get("positions_count"),
+                "STATUS_POSITIONS_MISMATCH: position_rows=%s sqlite=%s",
+                status_position_rows,
                 sqlite_count,
             )
         engine_status = get_portfolio_integration().get_status()
@@ -940,9 +947,10 @@ async def get_open_positions() -> dict[str, Any]:
     """
     Get all open positions with the fields Mystic actually uses.
 
-    Mystic sells ONLY when real net profit after costs is confirmed.
+    DAY_V2 exits follow the live DAY_V2 contract described in position_exit_policy.
     """
     try:
+        from backend.services.day_v2.live_exit_evaluator import day_v2_exit_policy
         from backend.services.portfolio_engine import ensure_portfolio_engine_readable
 
         engine = await ensure_portfolio_engine_readable()
@@ -968,18 +976,12 @@ async def get_open_positions() -> dict[str, Any]:
                 "positions": positions,
                 "count": len(positions),
                 "max_positions": engine.get_max_open_positions(),
-                "position_exit_policy": {
-                    "automated_sells_triggered_by": "executable_net_profit_after_costs_only",
-                    "stop_tp_fields_are_advisory_metadata_only": True,
-                },
+                "position_exit_policy": day_v2_exit_policy(),
             },
             "positions": positions,
             "count": len(positions),
             "max_positions": engine.get_max_open_positions(),
-            "position_exit_policy": {
-                "automated_sells_triggered_by": "executable_net_profit_after_costs_only",
-                "stop_tp_fields_are_advisory_metadata_only": True,
-            },
+            "position_exit_policy": day_v2_exit_policy(),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:

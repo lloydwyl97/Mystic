@@ -36,7 +36,11 @@ from backend.services.day_v2.config import (
     DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED,
 )
 from backend.services.day_v2.winner_contract import (
+    DAY_EXIT_CONTRACT_RUNNER,
     LEGACY_ATR_1H_PER_ATR_15M,
+    RUNNER_ACTIVATION_ATR_1H,
+    RUNNER_TIGHT_TRAIL_ATR_1H,
+    RUNNER_TRAIL_ATR_1H,
     objective_level,
     runner_stop,
 )
@@ -72,6 +76,146 @@ _DAY_V2_RECORDED_EXIT_REASONS: dict[str, str] = {
 def day_v2_recorded_exit_reason(exit_trigger: str) -> str:
     """Reporting label for a known DAY V2 exit trigger, else '' (caller keeps its existing label)."""
     return _DAY_V2_RECORDED_EXIT_REASONS.get(str(exit_trigger or "").strip().upper(), "")
+
+
+def _runner_state(
+    *,
+    entry_price: float,
+    highest_price: float,
+    atr_at_entry: float,
+    target_price: float,
+    estimated_roundtrip_cost: float,
+    setup: str,
+    atr_1h_at_entry: float,
+    objective_structural: float,
+    objective_atr_mult: float,
+    structural_emphasis: float,
+    runner_activation_mult: float,
+    runner_trail_mult: float,
+    runner_tighten_mult: float,
+) -> tuple[float, float, dict]:
+    """(1h ATR, objective, runner_stop state) exactly as the live exit evaluates them."""
+    atr_1h = float(atr_1h_at_entry or 0.0)
+    if atr_1h <= 0 and atr_at_entry > 0:
+        atr_1h = LEGACY_ATR_1H_PER_ATR_15M * atr_at_entry
+    structural = float(objective_structural or 0.0) or float(target_price or 0.0)
+    objective = objective_level(setup, entry_price, atr_1h, structural, atr_mult=objective_atr_mult, structural_emphasis=structural_emphasis) if atr_1h > 0 else 0.0
+    runner = runner_stop(
+        entry_price=entry_price,
+        highest_price=highest_price,
+        atr_1h=atr_1h,
+        objective=objective,
+        estimated_roundtrip_cost=estimated_roundtrip_cost,
+        activation_mult=runner_activation_mult,
+        trail_mult=runner_trail_mult,
+        tighten_mult=runner_tighten_mult,
+    )
+    return atr_1h, objective, runner
+
+
+def day_v2_exit_policy() -> dict:
+    """Status description of the DAY_V2 live exit contract."""
+    return {
+        "exit_contract": DAY_EXIT_CONTRACT_RUNNER,
+        "automated_sells_triggered_by": "day_v2_live_exit_contract",
+        "exit_paths": [
+            "DAY_V2_CATASTROPHIC_PROTECTION",
+            "DAY_V2_STRUCTURAL_INVALIDATION",
+            "DAY_V2_WINNER_PROTECTION",
+            "DAY_V2_OBJECTIVE_COMPLETE",
+        ],
+        "catastrophic_basis": (f"low <= entry - max({DAY_V2_CATASTROPHIC_ATR_MULTIPLIER}x 15m ATR, entry-to-anchor + {DAY_V2_CATASTROPHIC_ANCHOR_BUFFER_ATR}x 15m ATR)"),
+        "structural_invalidation_bars_required": DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED,
+        "runner_activation_atr_1h": RUNNER_ACTIVATION_ATR_1H,
+        "runner_trail_atr_1h": RUNNER_TRAIL_ATR_1H,
+        "runner_tight_trail_atr_1h": RUNNER_TIGHT_TRAIL_ATR_1H,
+        "runner_requires_trail_above_breakeven_after_cost": True,
+        "hold_time_is_exit_authority": False,
+        "time_exit_sell_path_active": False,
+        "fixed_take_profit_active": False,
+        "stop_tp_fields_drive_engine_exits": False,
+        "code_path": "monitor_all_positions -> _check_exit_conditions -> evaluate_day_v2_exit",
+    }
+
+
+def preview_day_v2_exit(
+    *,
+    entry_price: float,
+    current_price: float,
+    highest_price: float,
+    atr_at_entry: float,
+    structural_anchor: float,
+    target_price: float,
+    entry_time: float,
+    estimated_roundtrip_cost: float,
+    setup: str = "",
+    atr_1h_at_entry: float = 0.0,
+    objective_structural: float = 0.0,
+    objective_atr_mult: float = 1.0,
+    structural_emphasis: float = 1.0,
+    runner_activation_mult: float = 1.0,
+    runner_trail_mult: float = 1.0,
+    runner_tighten_mult: float = 1.0,
+    now: float | None = None,
+) -> dict:
+    """Read-only status view of the DAY_V2 exit contract. Never an exit decision.
+
+    Levels come from the same functions ``evaluate_day_v2_exit`` uses. There is
+    no time exit, fixed take-profit, or percentage stop in this contract.
+    """
+    ts = time.time() if now is None else float(now)
+    hold_minutes = max(0.0, (ts - entry_time) / 60.0) if entry_time > 0 else 0.0
+    bars_held_approx = int(hold_minutes / 15.0)
+    catastrophic = catastrophic_threshold_price(entry_price, atr_at_entry, structural_anchor) if entry_price > 0 and atr_at_entry > 0 else None
+    atr_1h, objective, runner = _runner_state(
+        entry_price=entry_price,
+        highest_price=highest_price,
+        atr_at_entry=atr_at_entry,
+        target_price=target_price,
+        estimated_roundtrip_cost=estimated_roundtrip_cost,
+        setup=setup,
+        atr_1h_at_entry=atr_1h_at_entry,
+        objective_structural=objective_structural,
+        objective_atr_mult=objective_atr_mult,
+        structural_emphasis=structural_emphasis,
+        runner_activation_mult=runner_activation_mult,
+        runner_trail_mult=runner_trail_mult,
+        runner_tighten_mult=runner_tighten_mult,
+    )
+    activation_mult = RUNNER_ACTIVATION_ATR_1H * max(0.80, min(1.25, float(runner_activation_mult or 1.0)))
+    arming_price = entry_price + activation_mult * atr_1h if atr_1h > 0 and entry_price > 0 else None
+    structural_active = structural_anchor > 0 and bars_held_approx >= DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED
+    if runner["activated"]:
+        authority = "DAY_V2_OBJECTIVE_COMPLETE" if runner["objective_reached"] else "DAY_V2_WINNER_PROTECTION"
+        next_exit = f"price <= runner stop {runner['stop']:.6f}"
+    elif structural_active:
+        authority = "DAY_V2_STRUCTURAL_INVALIDATION"
+        next_exit = f"price < structural anchor {structural_anchor:.6f}"
+    else:
+        authority = "DAY_V2_CATASTROPHIC_PROTECTION"
+        next_exit = f"low <= catastrophic {catastrophic:.6f}" if catastrophic else "no executable exit level (missing entry ATR)"
+    return {
+        "exit_contract": DAY_EXIT_CONTRACT_RUNNER,
+        "catastrophic_price": catastrophic,
+        "structural_anchor": structural_anchor if structural_anchor > 0 else None,
+        "structural_invalidation_active": bool(structural_active),
+        "structural_invalidation_bars_required": DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED,
+        "bars_held_approx": bars_held_approx,
+        "atr_1h": atr_1h or None,
+        "objective_price": objective or None,
+        "objective_reached": bool(runner["objective_reached"]),
+        "runner_arming_price": arming_price,
+        "runner_activated": bool(runner["activated"]),
+        "runner_stop": runner["stop"] or None,
+        "runner_trail_atr_1h": runner["trail_atr_1h"] or None,
+        "high_water": max(float(highest_price or 0.0), float(entry_price or 0.0)) or None,
+        "current_exit_authority": authority,
+        "next_executable_exit_condition": next_exit,
+        "hold_minutes": round(hold_minutes, 2),
+        "hold_time_is_exit_authority": False,
+        "time_exit": None,
+        "fixed_take_profit": None,
+    }
 
 
 def evaluate_day_v2_exit(
@@ -167,20 +311,20 @@ def evaluate_day_v2_exit(
         }
 
     # Role 3: Structure-runner ratchet
-    atr_1h = float(atr_1h_at_entry or 0.0)
-    if atr_1h <= 0 and atr_at_entry > 0:
-        atr_1h = LEGACY_ATR_1H_PER_ATR_15M * atr_at_entry
-    structural = float(objective_structural or 0.0) or float(target_price or 0.0)
-    objective = objective_level(setup, entry_price, atr_1h, structural, atr_mult=objective_atr_mult, structural_emphasis=structural_emphasis) if atr_1h > 0 else 0.0
-    runner = runner_stop(
+    atr_1h, objective, runner = _runner_state(
         entry_price=entry_price,
         highest_price=highest_price,
-        atr_1h=atr_1h,
-        objective=objective,
+        atr_at_entry=atr_at_entry,
+        target_price=target_price,
         estimated_roundtrip_cost=estimated_roundtrip_cost,
-        activation_mult=runner_activation_mult,
-        trail_mult=runner_trail_mult,
-        tighten_mult=runner_tighten_mult,
+        setup=setup,
+        atr_1h_at_entry=atr_1h_at_entry,
+        objective_structural=objective_structural,
+        objective_atr_mult=objective_atr_mult,
+        structural_emphasis=structural_emphasis,
+        runner_activation_mult=runner_activation_mult,
+        runner_trail_mult=runner_trail_mult,
+        runner_tighten_mult=runner_tighten_mult,
     )
     if runner["activated"] and current_price <= runner["stop"]:
         reason = "DAY_V2_OBJECTIVE_COMPLETE" if runner["objective_reached"] else "DAY_V2_WINNER_PROTECTION"

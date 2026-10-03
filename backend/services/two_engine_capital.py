@@ -242,6 +242,27 @@ def compute_snapshot(
     return snap
 
 
+def scalp_order_notional(
+    snap: CapitalSnapshot,
+    *,
+    slots: int,
+    size_mult: float = 1.0,
+    emergency_max_notional: float = 0.0,
+) -> float:
+    """SCALP order notional: sleeve / slots x adaptive size, inside the remaining sleeve.
+
+    ``emergency_max_notional`` is an absolute ceiling only when explicitly
+    configured (> 0). The engine-budget and physical-cash gates still run at
+    order time.
+    """
+    base = snap.scalp.target_capital / max(1, int(slots))
+    notional = max(0.0, base * float(size_mult or 1.0))
+    notional = min(notional, max(0.0, snap.scalp.remaining_budget))
+    if float(emergency_max_notional or 0.0) > 0:
+        notional = min(notional, float(emergency_max_notional))
+    return notional
+
+
 def check_engine_budget(
     db_path: str,
     engine_id: str,

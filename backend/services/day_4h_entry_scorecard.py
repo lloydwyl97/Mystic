@@ -519,9 +519,9 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def window_since(window: str) -> datetime | None:
+def window_since(window: str, *, now: datetime | None = None) -> datetime | None:
     raw = str(window or "").strip().lower()
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     if raw in {"24h", "1d"}:
         return now - timedelta(hours=24)
     if raw in {"7d", "7day", "7days"}:
@@ -531,9 +531,11 @@ def window_since(window: str) -> datetime | None:
     return None
 
 
-def build_scorecard(db_path: str | Path, *, window: str = "24h") -> dict[str, Any]:
-    rows = load_scorecard_rows(db_path, since=window_since(window))
-    return {"window": window, "generated_at": datetime.now(timezone.utc).isoformat(), **summarize(rows)}
+def build_scorecard(db_path: str | Path, *, window: str = "24h", now: datetime | None = None) -> dict[str, Any]:
+    """``now`` anchors the window; defaults to the wall clock."""
+    ref = now or datetime.now(timezone.utc)
+    rows = load_scorecard_rows(db_path, since=window_since(window, now=ref))
+    return {"window": window, "generated_at": ref.isoformat(), **summarize(rows)}
 
 
 __all__ = [

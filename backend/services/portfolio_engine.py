@@ -219,6 +219,12 @@ def split_position_key(key: str) -> tuple[str, str]:
     return "", normalize_symbol(s)
 
 
+def _day_v2_exit_policy() -> dict[str, Any]:
+    from backend.services.day_v2.live_exit_evaluator import day_v2_exit_policy
+
+    return day_v2_exit_policy()
+
+
 DAY_SIDE_ENGINES = ("DAY_V2", "LEGACY_DAY_LIVE", "LEGACY_EXIT_ONLY")
 DAY_SIDE_ENGINES_SQL = "'DAY_V2','LEGACY_DAY_LIVE','LEGACY_EXIT_ONLY'"
 
@@ -8129,8 +8135,11 @@ class PortfolioEngine:
             if not merged.get("trades") and order.get("trades"):
                 merged["trades"] = order["trades"]
             merged["info"] = _merge_info_preserving_fills(order.get("info"), fetched.get("info"))
-            if order.get("_mystic_latency") and not merged.get("_mystic_latency"):
-                merged["_mystic_latency"] = order["_mystic_latency"]
+            from backend.services.protected_limit_execution import ORDER_AUDIT_KEYS
+
+            for audit_key in ORDER_AUDIT_KEYS:
+                if order.get(audit_key) and not merged.get(audit_key):
+                    merged[audit_key] = order[audit_key]
             order = merged
             if new_status in ("closed", "filled", "canceled", "cancelled", "expired"):
                 break
@@ -8507,7 +8516,9 @@ class PortfolioEngine:
                 logger.warning(f"TEST_MODE: Ignoring SQLite ledger with principal=${loaded_principal:.2f} (test principal=${self.principal:.2f}) - starting fresh for isolation")
                 return False
 
-            self.principal = row[0]
+            from backend.services.external_capital_flows import resolve_principal
+
+            self.principal = resolve_principal(self.db_path, row[0]) if not self.test_mode else row[0]
             # LIVE 24/7: Use ledger values as initial state (reconcile loop corrects from Binance).
             # Do NOT force cash=0 - that manufactured guaranteed EQUITY_ALT_MISMATCH.
             self.cash_balance = row[1]
@@ -13353,12 +13364,17 @@ class PortfolioEngine:
                     exec_check.executable_net_pct,
                     "(strategy exit authority)" if strategy_authority_sell else "(emergency bypass)",
                 )
-            return await execute_protected_limit_live(
-                self._live_service,
-                symbol=_to_api_symbol(symbol),
-                side="sell",
-                quantity=qty,
-                limit_price=pf.protected_limit_price,
+            from backend.services.protected_limit_execution import stamp_preflight
+
+            return stamp_preflight(
+                await execute_protected_limit_live(
+                    self._live_service,
+                    symbol=_to_api_symbol(symbol),
+                    side="sell",
+                    quantity=qty,
+                    limit_price=pf.protected_limit_price,
+                ),
+                pf,
             )
 
         hold_time_seconds = time.time() - position.entry_time
@@ -14509,9 +14525,11 @@ class PortfolioEngine:
                     sell_preflight_audit = {}
                 sell_preflight_audit["live_commission"] = comm.to_dict()
                 with contextlib.suppress(Exception):
-                    from backend.services.protected_limit_execution import execution_latency_fields
+                    from backend.services.protected_limit_execution import execution_latency_fields, preflight_audit_fields
 
                     sell_preflight_audit["execution_latency"] = execution_latency_fields(live_order_sell)
+                    for audit_key, audit_value in preflight_audit_fields(live_order_sell).items():
+                        sell_preflight_audit.setdefault(audit_key, audit_value)
                 if comm.fee_from_exchange:
                     logger.info(
                         "LIVE_SELL_EXCHANGE_FEE %s fee_usd=%.8f proceeds=%.8f",
@@ -21946,7 +21964,7 @@ class PortfolioEngine:
             winner_score = float(getattr(ex, "winner_score", 0.0) or 0.0) or None
             runner_up_score = float(getattr(ex, "runner_up_score", 0.0) or 0.0) or None
             setup_type = str(getattr(ex, "setup_type", "") or getattr(ex, "entry_thesis", "") or setup_type)
-        return {
+        row = {
             "symbol": symbol,
             "quantity": q,
             "entry_price": ep,
@@ -22007,6 +22025,56 @@ class PortfolioEngine:
             "price_structure_regime_at_entry": str(getattr(pos, "price_structure_regime_at_entry", "") or ""),
             "regime": str(getattr(pos, "day_route_regime_at_entry", None) or getattr(pos, "price_structure_regime_at_entry", None) or ""),
             "trail_pct": float(getattr(pos, "trail_pct", 0.0) or 0.0),
+        }
+        if str(getattr(pos, "engine_id", "") or "") == "DAY_V2":
+            row.update(self._day_v2_status_preview_fields(pos, mark))
+        return row
+
+    def _day_v2_status_preview_fields(self, pos: Any, mark: float) -> dict[str, Any]:
+        """Status fields for a DAY_V2 position, from the live DAY_V2 exit contract."""
+        from backend.services.day_v2.live_exit_evaluator import preview_day_v2_exit
+
+        ep = float(pos.entry_price or 0)
+        adapt = getattr(pos, "adaptive_decision", None) or {}
+        preview = preview_day_v2_exit(
+            entry_price=ep,
+            current_price=float(mark),
+            highest_price=float(getattr(pos, "highest_price", 0.0) or ep),
+            atr_at_entry=float(getattr(pos, "atr_at_entry", 0.0) or 0.0),
+            structural_anchor=float(getattr(pos, "thesis_invalid_level", 0.0) or 0.0),
+            target_price=float(getattr(pos, "thesis_target_level", 0.0) or 0.0),
+            entry_time=float(getattr(pos, "entry_time", 0.0) or 0.0),
+            estimated_roundtrip_cost=float(ESTIMATED_ROUNDTRIP_COST),
+            setup=str(getattr(pos, "entry_thesis", "") or ""),
+            atr_1h_at_entry=float(getattr(pos, "day_atr_1h_at_entry", 0.0) or 0.0),
+            objective_structural=float(getattr(pos, "day_objective_structural", 0.0) or 0.0),
+            objective_atr_mult=float(adapt.get("objective_atr_mult") or 1.0),
+            structural_emphasis=float(adapt.get("structural_emphasis") or 1.0),
+            runner_activation_mult=float(adapt.get("runner_activation_mult") or 1.0),
+            runner_trail_mult=float(adapt.get("runner_trail_mult") or 1.0),
+            runner_tighten_mult=float(adapt.get("runner_tighten_mult") or 1.0),
+        )
+        catastrophic = preview["catastrophic_price"]
+        return {
+            "high_water": preview["high_water"],
+            "trail_activation": preview["runner_arming_price"],
+            "trail_distance": (preview["runner_trail_atr_1h"] or 0.0) * (preview["atr_1h"] or 0.0) or None,
+            "executable_trailing_stop": preview["runner_stop"],
+            "trailing_stop_price": preview["runner_stop"] or 0.0,
+            "hard_stop": catastrophic,
+            "stop_price": catastrophic or 0.0,
+            "stop_loss": catastrophic or 0.0,
+            "current_exit_authority": preview["current_exit_authority"],
+            "next_executable_exit_condition": preview["next_executable_exit_condition"],
+            "max_hold_min": None,
+            "take_profit_1_price": None,
+            "take_profit_2_price": None,
+            "take_profit": None,
+            "tp1_hit": False,
+            "trail_pct": None,
+            "eligible_for_net_profit_exit": False,
+            "exit_levels_are_advisory_metadata_only": False,
+            "engine_exit_preview": preview,
         }
 
     def enrich_open_position_rows_from_buy_explain(self, positions_rows: list[dict[str, Any]]) -> None:
@@ -22514,26 +22582,7 @@ class PortfolioEngine:
             "open_risk_pct": (total_risk / account_equity * 100) if account_equity > 0 else 0,
             "max_total_risk_pct": MAX_TOTAL_OPEN_RISK_PCT * 100,
             # EXIT POLICY (metadata vs automated sells)
-            "position_exit_policy": {
-                "automated_sells_triggered_by": "engine_managed_exits_shared_paper_live",
-                "exit_paths": [
-                    "STOP_LOSS_EXIT",
-                    "TRAILING_STOP_EXIT",
-                    "THESIS_INVALIDATION_EXIT",
-                    "GIVEBACK_EXIT",
-                    "STALL_EXIT",
-                    "STALL_EXIT_DEAD_NO_MFE",
-                    "TIME_STOP_EXIT",
-                    "FAILED_RECLAIM_EXIT",
-                    "EXTREME_PROTECTION_EXIT",
-                    "NET_PROFIT_EXIT",
-                ],
-                "stop_tp_fields_drive_engine_exits": True,
-                "stop_loss_sell_path_active": True,
-                "time_exit_sell_path_active": True,
-                "trailing_stop_sell_path_active": True,
-                "code_path": "monitor_all_positions -> _check_exit_conditions -> evaluate_engine_managed_exit",
-            },
+            "position_exit_policy": _day_v2_exit_policy(),
             # CONFIG
             "risk_per_trade_pct": RISK_PER_TRADE_PCT * 100,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -22623,7 +22672,8 @@ class PortfolioEngine:
             "equity_diff": abs(total_equity - equity_check_canonical),
             "equity_alt_ok": equity_alt_ok,
             # METADATA
-            "open_positions_count": len(self.open_positions),
+            "open_positions_count": sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") != "DUST_PENDING"),
+            "dust_pending_count": sum(1 for p in self.open_positions.values() if getattr(p, "status", "ACTIVE") == "DUST_PENDING"),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -26431,11 +26481,7 @@ class PortfolioEngine:
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "consistency_ok": len(violations) == 0,
             "consistency_violations": violations,
-            "position_exit_policy": {
-                "automated_sells_triggered_by": "engine_managed_exits_shared_paper_live",
-                "stop_tp_fields_drive_engine_exits": True,
-                "code_path": "monitor_all_positions -> _check_exit_conditions -> evaluate_engine_managed_exit",
-            },
+            "position_exit_policy": _day_v2_exit_policy(),
             "regime": regime_payload,
             "positions": {"positions": positions_rows, "count": n_open, "source": "portfolio_engine_canonical"},
             "performance": {"performance": perf_block, "trades": trades_data[:30]},

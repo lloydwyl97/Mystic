@@ -390,8 +390,8 @@ async def _fetch_newsapi_corpus(
                 "language": "en",
                 "sortBy": "publishedAt",
                 "pageSize": page_size,
-                "apiKey": key,
             },
+            headers={"X-Api-Key": key},
         )
         await _record_api_call(redis_client)
         if resp.status_code == 429:

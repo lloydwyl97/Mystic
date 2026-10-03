@@ -1,12 +1,16 @@
-"""Redact secrets (Telegram bot tokens, etc.) from log records."""
+"""Redact secrets (Telegram bot tokens, API keys, request signatures) from log records."""
 
 from __future__ import annotations
 
 import logging
 import re
 
-_TELEGRAM_BOT_RE = re.compile(r"(https?://api\.telegram\.org/bot)([^/\s]+)(/[^\s]*)?")
+_TELEGRAM_BOT_RE = re.compile(r"(https?://api\.telegram\.org/(?:file/)?bot)([^/\s]+)(/[^\s]*)?")
 _BOT_TOKENISH_RE = re.compile(r"\b(\d{6,}:[A-Za-z0-9_-]{20,})\b")
+_SECRET_QUERY_RE = re.compile(
+    r"([?&](?:api_?key|access_token|auth_token|token|key|signature|secret|client_secret|password|listenKey)=)[^&\s\"'#]+",
+    re.IGNORECASE,
+)
 
 
 def redact_secrets(text: str) -> str:
@@ -14,36 +18,53 @@ def redact_secrets(text: str) -> str:
         return text
     out = _TELEGRAM_BOT_RE.sub(r"\1***\3", text)
     out = _BOT_TOKENISH_RE.sub("***", out)
+    out = _SECRET_QUERY_RE.sub(r"\1***", out)
     return out
+
+
+def _redact_record(record: logging.LogRecord) -> None:
+    """Render the message once and redact it.
+
+    Arguments are frequently non-str objects (httpx passes ``httpx.URL``), so
+    redacting only str arguments misses request URLs.
+    """
+    try:
+        message = record.getMessage()
+    except Exception:
+        return
+    redacted = redact_secrets(message)
+    if redacted != message:
+        record.msg = redacted
+        record.args = None
 
 
 class SecretRedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            if isinstance(record.msg, str):
-                record.msg = redact_secrets(record.msg)
-            if record.args:
-                if isinstance(record.args, dict):
-                    record.args = {k: redact_secrets(v) if isinstance(v, str) else v for k, v in record.args.items()}
-                elif isinstance(record.args, tuple):
-                    record.args = tuple(redact_secrets(a) if isinstance(a, str) else a for a in record.args)
-        except Exception:
-            pass
+        _redact_record(record)
         return True
 
 
+_factory_installed = False
+
+
 def install_secret_redacting_filter() -> None:
+    """Redact every record at creation, whichever logger or handler emits it."""
+    global _factory_installed
+    if not _factory_installed:
+        base_factory = logging.getLogRecordFactory()
+
+        def _factory(*args, **kwargs) -> logging.LogRecord:
+            record = base_factory(*args, **kwargs)
+            _redact_record(record)
+            return record
+
+        logging.setLogRecordFactory(_factory)
+        _factory_installed = True
     filt = SecretRedactingFilter()
-    root = logging.getLogger()
-    if not any(isinstance(f, SecretRedactingFilter) for f in root.filters):
-        root.addFilter(filt)
-    # httpx logs request URLs at INFO on its own logger
-    httpx_logger = logging.getLogger("httpx")
-    if not any(isinstance(f, SecretRedactingFilter) for f in httpx_logger.filters):
-        httpx_logger.addFilter(filt)
-    httpcore_logger = logging.getLogger("httpcore")
-    if not any(isinstance(f, SecretRedactingFilter) for f in httpcore_logger.filters):
-        httpcore_logger.addFilter(filt)
+    for name in ("", "httpx", "httpcore"):
+        lg = logging.getLogger(name)
+        if not any(isinstance(f, SecretRedactingFilter) for f in lg.filters):
+            lg.addFilter(filt)
 
 
 __all__ = ["SecretRedactingFilter", "install_secret_redacting_filter", "redact_secrets"]

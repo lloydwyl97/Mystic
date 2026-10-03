@@ -27,6 +27,7 @@ from backend.services.day_trade_thesis import (
     EXIT_DAY_RISK_FLOOR,
     EXIT_TRAILING_STOP,
 )
+from backend.services.protected_limit_execution import PREFLIGHT_AUDIT_KEY, PREFLIGHT_CHUNKS_KEY, stamp_preflight
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +235,9 @@ def _combine_orders(orders: list[dict[str, Any]], requested: float) -> dict[str,
     last["fees"] = fees
     last["fee"] = dict(fees[0]) if len(fees) == 1 else None
     last["amount"] = float(requested)
+    chunk_preflights = [dict(o[PREFLIGHT_AUDIT_KEY]) for o in used if isinstance(o.get(PREFLIGHT_AUDIT_KEY), dict)]
+    if chunk_preflights:
+        last[PREFLIGHT_CHUNKS_KEY] = chunk_preflights
     last["_mystic_order_ids"] = order_ids
     last["_mystic_mandatory_flatten_fills"] = len(used)
     last["_mystic_partial_fill"] = tot + 1e-12 < float(requested)
@@ -278,7 +282,7 @@ async def run_mandatory_exit_ioc_loop(
         if chunk <= 0 or limit <= 0:
             out.abandoned_reason = "no_executable_chunk"
             continue
-        order = await place_ioc(chunk, limit)
+        order = stamp_preflight(await place_ioc(chunk, limit), pf)
         filled = float((order or {}).get("filled") or 0.0)
         if order is None or filled <= 0:
             logger.warning(

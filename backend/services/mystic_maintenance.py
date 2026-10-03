@@ -490,8 +490,9 @@ def select_retained(
     return keep
 
 
-def sqlite_integrity(path: Path) -> str:
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+def sqlite_integrity(path: Path, *, immutable: bool = False) -> str:
+    # immutable: never create -wal/-shm sidecars or take locks on a finished backup file.
+    conn = sqlite3.connect(f"file:{path}?mode=ro{'&immutable=1' if immutable else ''}", uri=True)
     try:
         rows = conn.execute("PRAGMA integrity_check").fetchall()
     finally:
@@ -562,6 +563,65 @@ def create_backup(cfg: MaintConfig, *, dry_run: bool, reason: str = "scheduled")
     return out
 
 
+ADOPT_MIN_AGE_SEC = 600
+# Not created by this module, so retention may compress but never deletes it.
+ADOPTED_REASON = "adopted_unverified"
+
+
+def verify_unverified_backups(
+    cfg: MaintConfig,
+    *,
+    dry_run: bool,
+    opened: set[str] | None = None,
+    limit: int = 1,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Verify backups published without a manifest (e.g. a deploy-time ``.backup()``).
+
+    A file that passes integrity_check gets a manifest and joins normal retention; a
+    failing one is reported and left in place. Files still being written (recent mtime,
+    open by a process) and compressed files are not touched. At most ``limit`` per run.
+    """
+    ref = (now or utc_now()).timestamp()
+    pending = [b for b in list_backups(cfg.backup_dir) if not b.manifest and not b.compressed]
+    out: dict[str, Any] = {"status": "ok", "unverified_found": len(pending), "verified": [], "failed": [], "deferred": []}
+    for info in pending:
+        if len(out["verified"]) + len(out["failed"]) >= limit:
+            out["deferred"].append(info.path.name)
+            continue
+        if ref - info.path.stat().st_mtime < ADOPT_MIN_AGE_SEC or _is_open(info.path, opened if opened is not None else open_paths()):
+            out["deferred"].append(info.path.name)
+            continue
+        if dry_run:
+            out["verified"].append({"name": info.path.name, "dry_run": True})
+            continue
+        try:
+            integrity = sqlite_integrity(info.path, immutable=True)
+        except sqlite3.Error as exc:
+            integrity = f"unreadable: {exc}"
+        if integrity != "ok":
+            out["failed"].append({"name": info.path.name, "integrity": integrity[:200]})
+            out["status"] = "error"
+            out["error"] = f"unverified backup failed integrity_check: {info.path.name}"
+            continue
+        manifest = {
+            "name": info.path.name,
+            "source": "external_backup_adopted",
+            "created_utc": _iso(info.ts),
+            "verified_utc": _iso(utc_now()),
+            "integrity": "ok",
+            "sha256": sha256_file(info.path),
+            "bytes": info.path.stat().st_size,
+            "compressed": False,
+            "reason": ADOPTED_REASON,
+        }
+        _write_json_atomic(manifest_path_for(info.path), manifest)
+        _chown(manifest_path_for(info.path), cfg.owner)
+        out["verified"].append({"name": info.path.name, "sha256": manifest["sha256"]})
+        logger.info("MAINT backup_verified %s", json.dumps({"name": info.path.name, "reason": ADOPTED_REASON}))
+    return out
+
+
 def compress_backup(info: BackupInfo, *, owner: str = "mystic") -> dict[str, Any]:
     """gzip a verified backup; the original is removed only after the round trip matches."""
     src = info.path
@@ -620,6 +680,8 @@ def apply_backup_retention(
     errors: list[str] = []
     for b in backups:
         if b.path in keep or not b.verified or b.path.name in pinned or (newest and b.path == newest.path):
+            continue
+        if b.manifest.get("reason") == ADOPTED_REASON:
             continue
         if _is_open(b.path, opened):
             _action(actions, "skip_open_backup", b.path, dry_run=dry_run)
@@ -1223,6 +1285,9 @@ def run_maintenance(
                 report["backup_create"] = owner_task("backup-create", *(["--dry-run"] if dry_run else []))
                 if report["backup_create"].get("status") == "error":
                     report["errors"].append(f"backup: {report['backup_create'].get('error')}")
+            report["backup_verify"] = owner_task("backup-verify", *(["--dry-run"] if dry_run else []))
+            if report["backup_verify"].get("status") == "error":
+                report["errors"].append(f"backup_verify: {report['backup_verify'].get('error')}")
             # In-process (root) so files held open by any user's process are visible.
             report["backup_retention"] = apply_backup_retention(cfg, mode=mode, dry_run=dry_run, opened=opened)
             report["errors"] += report["backup_retention"].get("errors", [])

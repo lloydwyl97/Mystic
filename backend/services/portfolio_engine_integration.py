@@ -2099,6 +2099,28 @@ class PortfolioEngineIntegration:
             logger.warning("SCALP_V2_BREAKER halt=True reason=%s until=%s %s", breaker.reason, breaker.recovery_until, breaker.detail)
             return
 
+        from backend.services.portfolio_engine import SCALP_MAX_OPEN_POSITIONS
+        from backend.services.two_engine_capital import compute_snapshot, scalp_order_notional, symbol_marks
+
+        def _scalp_capital():
+            return compute_snapshot(
+                self.engine.db_path,
+                float(self.engine._total_equity or 0),
+                float(self.engine._available_balance or 0),
+                self.engine.open_positions,
+                prices=symbol_marks(getattr(self.engine, "_position_mark_prices", None)),
+            )
+
+        try:
+            base_notional = scalp_order_notional(
+                _scalp_capital(),
+                slots=SCALP_MAX_OPEN_POSITIONS,
+                emergency_max_notional=float(cfg.scalp_live_max_notional or 0.0),
+            )
+        except ValueError:
+            logger.warning("SCALP_V2_LIVE_SKIP CAPITAL_CONFIG_INVALID")
+            return
+
         try:
             from backend.services.binance_scalp.scalp_signal_engine import get_router
 
@@ -2107,7 +2129,7 @@ class PortfolioEngineIntegration:
                 logger.debug("SCALP_V2_LIVE_SKIP router=None (signal engine not initialised)")
                 return
             now = time.time()
-            candidates = router.evaluate_all(epoch=now, notional_usd=float(cfg.scalp_live_max_notional))
+            candidates = router.evaluate_all(epoch=now, notional_usd=float(base_notional))
         except Exception:
             logger.warning("SCALP_V2_ROUTER_ERROR", exc_info=True)
             return
@@ -2236,21 +2258,17 @@ class PortfolioEngineIntegration:
                     logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:SYMBOL_OPPORTUNITY_ALREADY_ACTIVE opp=%s", norm, opp_id)
                     continue
                 atr_val = float((row or {}).get("atr") or 0)
-                equity = float(self.engine._total_equity or self.engine.cash_balance or 0)
-                qty, _stop_price, _risk = self.engine.calculate_position_size(
-                    symbol=norm,
-                    equity=equity,
-                    atr=atr_val if atr_val > 0 else arm_price * 0.015,
-                    current_price=arm_price,
-                )
-                notional = float(qty) * float(arm_price)
-                max_notional = float(cfg.scalp_live_max_notional)
                 view = (row or {}).get("adaptive_decision") or {}
-                qty *= float(view.get("size_mult") or 1.0)
-                notional = float(qty) * float(arm_price)
-                if notional > max_notional and arm_price > 0:
-                    qty = max_notional / arm_price
-                    notional = max_notional
+                try:
+                    notional = scalp_order_notional(
+                        _scalp_capital(),
+                        slots=SCALP_MAX_OPEN_POSITIONS,
+                        size_mult=float(view.get("size_mult") or 1.0),
+                        emergency_max_notional=float(cfg.scalp_live_max_notional or 0.0),
+                    )
+                except ValueError:
+                    notional = 0.0
+                qty = notional / float(arm_price) if arm_price > 0 else 0.0
                 if qty <= 0 or notional <= 0:
                     record_scalp_decision(
                         self.engine.db_path,
@@ -3046,9 +3064,18 @@ class PortfolioEngineIntegration:
                                     logger.warning(f"BINANCE_SYNC: USDT drift detected! Binance=${binance_usdt:.2f}, Local=${local_cash:.2f}")
                                     drift_detected = True
 
+                                from backend.services.balance_residuals import classify_fiat_residual
+
                                 # Check positions (Phase 6: forgive dust when Binance has qty but local has 0)
                                 for asset, binance_qty in binance_balances.items():
                                     if asset == "USDT":
+                                        continue
+                                    fiat = classify_fiat_residual(conn, asset, binance_qty)
+                                    if fiat == "MATCHED":
+                                        continue
+                                    if fiat == "CHANGED":
+                                        logger.warning(f"BINANCE_SYNC: {asset} fiat residual changed! Binance={binance_qty:.4f}")
+                                        drift_detected = True
                                         continue
                                     local_qty = local_positions.get(asset, 0)
                                     if abs(binance_qty - local_qty) <= 0.01:
@@ -3116,6 +3143,11 @@ class PortfolioEngineIntegration:
                 except Exception as e:
                     logger.warning(f"BINANCE_SYNC: Error - {e}")
 
+                try:
+                    await self._sync_external_capital_flows(api_key, api_secret)
+                except Exception as e:
+                    logger.warning("EXTERNAL_CAPITAL_FLOW_SYNC_FAILED: %s", e)
+
                 # Check every 5 minutes
                 await asyncio.sleep(300)
 
@@ -3126,6 +3158,43 @@ class PortfolioEngineIntegration:
                 await asyncio.sleep(300)
 
         logger.info("BINANCE_SYNC: Stopped")
+
+    async def _sync_external_capital_flows(self, api_key: str, api_secret: str) -> None:
+        """Venue deposits/withdrawals -> capital baseline, each flow exactly once.
+
+        A failed endpoint read changes nothing; recorded flows are never re-applied.
+        """
+        import hashlib
+        import hmac
+
+        import httpx
+
+        from backend.services.external_capital_flows import BASELINE_ADOPTED_MS, VENUE_FLOW_ENDPOINTS, parse_endpoint, sync_flows
+        from backend.utils.binance_weight_limiter import BinanceWeightLimiter
+
+        if self.engine is None or not api_key or not api_secret:
+            return
+        start_ms = max(BASELINE_ADOPTED_MS - 86_400_000, int((time.time() - 89 * 86400) * 1000))
+        limiter = await BinanceWeightLimiter.create()
+        flows = []
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            for path, direction, kind in VENUE_FLOW_ENDPOINTS:
+                params = {"startTime": start_ms, "recvWindow": 10000, "timestamp": int(time.time() * 1000)}
+                if kind == "fiat":
+                    params = {"fiatCurrency": "USD", **params}
+                query = "&".join(f"{k}={v}" for k, v in params.items())
+                signature = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+                await limiter.consume(path, weight=1, wait=True, timeout=8.0)
+                resp = await client.get(f"https://api.binance.us{path}?{query}&signature={signature}", headers={"X-MBX-APIKEY": api_key})
+                if resp.status_code != 200:
+                    logger.warning("EXTERNAL_CAPITAL_FLOW_READ_FAILED path=%s status=%s", path, resp.status_code)
+                    return
+                flows.extend(parse_endpoint(kind, direction, resp.json()))
+        new, baseline = await asyncio.to_thread(sync_flows, self.engine.db_path, flows)
+        if baseline is not None and abs(float(self.engine.principal or 0.0) - baseline) > 1e-9:
+            logger.warning("EXTERNAL_CAPITAL_BASELINE principal %.8f -> %.8f (new_flows=%d)", float(self.engine.principal or 0.0), baseline, len(new))
+            self.engine.principal = baseline
+            await self.engine._persist_ledger_to_sqlite()
 
     async def _dust_reconciliation_loop(self) -> None:
         """

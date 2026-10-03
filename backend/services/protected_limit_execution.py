@@ -789,6 +789,29 @@ def _ms_to_sec(raw: Any) -> float | None:
     return v / 1000.0 if v > 0 else None
 
 
+PREFLIGHT_AUDIT_KEY = "_mystic_preflight"
+PREFLIGHT_CHUNKS_KEY = "_mystic_preflight_chunks"
+ORDER_AUDIT_KEYS = ("_mystic_latency", PREFLIGHT_AUDIT_KEY, PREFLIGHT_CHUNKS_KEY)
+
+
+def stamp_preflight(order: dict[str, Any] | None, preflight: Any) -> dict[str, Any] | None:
+    """Attach the preflight audit (book freshness included) that priced this order."""
+    if isinstance(order, dict) and hasattr(preflight, "to_audit_dict"):
+        order[PREFLIGHT_AUDIT_KEY] = preflight.to_audit_dict()
+    return order
+
+
+def preflight_audit_fields(order: dict[str, Any] | None) -> dict[str, Any]:
+    """Sell-row audit fields from the preflight(s) stamped on a live order."""
+    if not isinstance(order, dict):
+        return {}
+    out: dict[str, Any] = dict(order.get(PREFLIGHT_AUDIT_KEY) or {})
+    chunks = [dict(c) for c in (order.get(PREFLIGHT_CHUNKS_KEY) or []) if isinstance(c, dict)]
+    if chunks:
+        out["preflight_chunks"] = chunks
+    return out
+
+
 def _stamp_latency(order: dict[str, Any], submit_ts: float, response_ts: float) -> dict[str, Any]:
     if isinstance(order, dict):
         order["_mystic_latency"] = {"order_submit_timestamp": submit_ts, "order_response_timestamp": response_ts}
@@ -803,13 +826,21 @@ def execution_latency_fields(order: dict[str, Any] | None) -> dict[str, Any]:
     info = order.get("info") if isinstance(order.get("info"), dict) else {}
     ack_ts = _ms_to_sec(info.get("transactTime")) or _ms_to_sec(order.get("timestamp"))
     fill_times = [t for t in (_ms_to_sec(tr.get("timestamp")) for tr in (order.get("trades") or []) if isinstance(tr, dict)) if t]
+    fill_source = "venue_trades" if fill_times else ""
     fill_ts = max(fill_times) if fill_times else _ms_to_sec(order.get("lastTradeTimestamp"))
+    if fill_ts and not fill_source:
+        fill_source = "last_trade_timestamp"
+    if not fill_ts and info.get("fills") and _ms_to_sec(info.get("transactTime")):
+        # A FULL response's fills matched at transactTime; they carry no own time.
+        fill_ts = _ms_to_sec(info.get("transactTime"))
+        fill_source = "full_response_transact_time"
     submit_ts = lat.get("order_submit_timestamp")
     out: dict[str, Any] = {
         "order_submit_timestamp": submit_ts,
         "order_response_timestamp": lat.get("order_response_timestamp"),
         "exchange_ack_timestamp": ack_ts,
         "fill_timestamp": fill_ts,
+        "fill_timestamp_source": fill_source or None,
     }
     if submit_ts and ack_ts:
         out["submit_to_ack_ms"] = (ack_ts - float(submit_ts)) * 1000.0
