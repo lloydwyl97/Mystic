@@ -5,20 +5,30 @@ from __future__ import annotations
 import logging
 import re
 
-_TELEGRAM_BOT_RE = re.compile(r"(https?://api\.telegram\.org/(?:file/)?bot)([^/\s]+)(/[^\s]*)?")
+_TELEGRAM_BOT_RE = re.compile(r"(https?://api\.telegram\.org/(?:file/)?bot)(?!\*\*\*|\[REDACTED_SECRET\])([^/\s]+)(/[^\s]*)?")
 _BOT_TOKENISH_RE = re.compile(r"\b(\d{6,}:[A-Za-z0-9_-]{20,})\b")
 _SECRET_QUERY_RE = re.compile(
-    r"([?&](?:api_?key|access_token|auth_token|token|key|signature|secret|client_secret|password|listenKey)=)[^&\s\"'#]+",
+    r"([?&](?:api_?key|access_token|auth_token|token|key|signature|secret|client_secret|password|listenKey)=)"
+    r"(?!\*\*\*|\[REDACTED_SECRET\])[^&\s\"'#]+",
     re.IGNORECASE,
 )
+_HEADER_SECRET_RE = re.compile(r"(?i)\b((?:authorization|x-mbx-apikey|x-api-key|api-key)\s*[:=]\s*)(?:bearer\s+)?\S+")
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9\-._~+/]{8,}={0,2}")
 
 
-def redact_secrets(text: str) -> str:
+def credential_shape_count(text: str) -> int:
+    """How many credential-shaped values a line still contains. Not the values."""
+    return len(_TELEGRAM_BOT_RE.findall(text)) + len(_BOT_TOKENISH_RE.findall(text)) + len(_SECRET_QUERY_RE.findall(text))
+
+
+def redact_secrets(text: str, *, replacement: str = "***") -> str:
     if not text:
         return text
-    out = _TELEGRAM_BOT_RE.sub(r"\1***\3", text)
-    out = _BOT_TOKENISH_RE.sub("***", out)
-    out = _SECRET_QUERY_RE.sub(r"\1***", out)
+    out = _TELEGRAM_BOT_RE.sub(rf"\1{replacement}\3", text)
+    out = _BOT_TOKENISH_RE.sub(replacement, out)
+    out = _SECRET_QUERY_RE.sub(rf"\1{replacement}", out)
+    out = _HEADER_SECRET_RE.sub(rf"\1{replacement}", out)
+    out = _BEARER_RE.sub(f"Bearer {replacement}", out)
     return out
 
 

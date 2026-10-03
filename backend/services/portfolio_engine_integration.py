@@ -3041,15 +3041,20 @@ class PortfolioEngineIntegration:
                             for balance in data.get("balances", []):
                                 asset = balance["asset"]
                                 free = float(balance["free"])
-                                if free > 0.001:  # Ignore dust
-                                    binance_balances[asset] = free
+                                locked = float(balance.get("locked") or 0.0)
+                                # USDT is compared with ledger cash (free). Coin assets compare
+                                # the whole wallet quantity, including any amount locked in an order.
+                                physical = free if asset == "USDT" else free + locked
+                                if physical > 0.001:  # Ignore dust
+                                    binance_balances[asset] = physical
 
                             # Compare with local DB - BUG #41 FIX: Use context manager for proper cleanup
                             with sqlite3.connect(DATABASE_PATH) as conn:
                                 c = conn.cursor()
 
-                                c.execute("SELECT symbol, quantity FROM portfolio_engine_positions")
-                                local_positions = {row[0].split("/")[0]: row[1] for row in c.fetchall()}
+                                from backend.services.balance_sync_ownership import load_asset_ownership, quantity_drift
+
+                                owned_by_asset = load_asset_ownership(conn)
 
                                 c.execute("SELECT cash_balance FROM portfolio_engine_ledger ORDER BY id DESC LIMIT 1")
                                 local_cash = c.fetchone()
@@ -3077,8 +3082,17 @@ class PortfolioEngineIntegration:
                                         logger.warning(f"BINANCE_SYNC: {asset} fiat residual changed! Binance={binance_qty:.4f}")
                                         drift_detected = True
                                         continue
-                                    local_qty = local_positions.get(asset, 0)
-                                    if abs(binance_qty - local_qty) <= 0.01:
+                                    book = owned_by_asset.get(asset)
+                                    local_qty = book.total if book else 0.0
+                                    if not quantity_drift(binance_qty, local_qty):
+                                        if book is not None and len(book.components) > 1:
+                                            logger.info(
+                                                "BINANCE_SYNC_OWNERSHIP %s Binance=%.8f owned=%.8f %s",
+                                                asset,
+                                                binance_qty,
+                                                local_qty,
+                                                book.report(),
+                                            )
                                         continue
                                     # Drift: only forgive if local has 0 and Binance qty is dust
                                     if local_qty <= 0.01:
@@ -3122,17 +3136,29 @@ class PortfolioEngineIntegration:
                                                 binance_qty,
                                             )
                                             continue
-                                    logger.warning(f"BINANCE_SYNC: {asset} drift! Binance={binance_qty:.4f}, Local={local_qty:.4f}")
+                                    components = book.report() if book else ""
+                                    logger.warning(
+                                        "BINANCE_SYNC: %s drift! Binance=%.8f owned=%.8f %s",
+                                        asset,
+                                        binance_qty,
+                                        local_qty,
+                                        components,
+                                    )
                                     drift_detected = True
 
                                 # Check for positions we have locally but not on Binance
-                                for asset, local_qty in local_positions.items():
-                                    if asset not in binance_balances and local_qty > 0.01:
-                                        logger.warning(f"BINANCE_SYNC: {asset} exists locally ({local_qty:.4f}) but NOT on Binance!")
+                                for asset, book in owned_by_asset.items():
+                                    if asset not in binance_balances and book.total > 0.01:
+                                        logger.warning(
+                                            "BINANCE_SYNC: %s exists locally (%.8f) but NOT on Binance! %s",
+                                            asset,
+                                            book.total,
+                                            book.report(),
+                                        )
                                         drift_detected = True
 
                                 if not drift_detected:
-                                    logger.info(f"BINANCE_SYNC: OK - Balances match (USDT=${binance_usdt:.2f}, {len(local_positions)} positions)")
+                                    logger.info(f"BINANCE_SYNC: OK - Balances match (USDT=${binance_usdt:.2f}, {len(owned_by_asset)} assets)")
                                 else:
                                     logger.warning("BINANCE_SYNC: Drift detected - consider manual sync")
                         else:

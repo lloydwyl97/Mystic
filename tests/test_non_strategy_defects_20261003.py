@@ -131,7 +131,9 @@ def test_pre_baseline_deposit_is_audited_not_applied(tmp_path):
 def test_withdrawal_lowers_baseline_including_fees(tmp_path):
     db = _ledger_db(tmp_path)
     payload = {
-        "assetLogRecordList": [{"orderId": "w1", "orderStatus": "Successful", "fiatCurrency": "USD", "amount": "100", "transactionFee": "1.5", "platformFee": "0.5", "createTime": 1790976766999}]
+        "assetLogRecordList": [
+            {"orderId": "w1", "orderStatus": "Successful", "fiatCurrency": "USD", "amount": "100", "transactionFee": "1.5", "platformFee": "0.5", "createTime": 1790976766999}
+        ]
     }
     _, base = ecf.sync_flows(db, ecf.parse_endpoint("fiat", ecf.WITHDRAWAL, payload))
     assert base == pytest.approx(float(TRAILING_BUY_ANCHOR_EQUITY) - 102.0)
