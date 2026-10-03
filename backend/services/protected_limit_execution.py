@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import time
 from dataclasses import asdict, dataclass, field
@@ -43,6 +44,8 @@ from backend.utils.symbols import normalize_symbol
 
 logger = logging.getLogger(__name__)
 
+_PREFLIGHT_FRESHNESS: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("_PREFLIGHT_FRESHNESS", default=None)
+
 # Last preflight telemetry (engine/API reads via get_last_execution_protection_state)
 _last_state: dict[str, Any] = {
     "last_preflight_passed": None,
@@ -75,8 +78,9 @@ class ProtectedPreflightResult:
     reference_price: float = 0.0
     quantity: float = 0.0
     execution_mode: str = ""
-    book_age_sec: float = 0.0
+    book_age_sec: float | None = None
     executable_qty: float = 0.0
+    book_freshness: dict[str, Any] = field(default_factory=dict)
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_audit_dict(self) -> dict[str, Any]:
@@ -90,7 +94,106 @@ class ProtectedPreflightResult:
             "execution_mode": self.execution_mode,
             "book_age_sec": self.book_age_sec,
             "reject_reason": self.reject_reason,
+            "book_freshness": dict(self.book_freshness),
         }
+
+
+@dataclass
+class ExecutableBook:
+    """One REST depth snapshot plus the identity and timing that date it."""
+
+    bids: list[list[float]]
+    asks: list[list[float]]
+    last_update_id: int | None
+    source_ts: float | None
+    receive_ts: float | None
+    exchange_ts: float | None = None
+
+
+@dataclass
+class _AcceptedBook:
+    update_id: int
+    source_ts: float
+    receive_ts: float
+
+
+# Newest depth identity accepted per symbol in this process. An older id is
+# rejected; a repeated id keeps the age of its first observation.
+_ACCEPTED_BOOKS: dict[str, _AcceptedBook] = {}
+
+FRESHNESS_FRESH = "FRESH"
+FRESHNESS_STALE = "STALE"
+FRESHNESS_OUT_OF_ORDER = "OUT_OF_ORDER"
+FRESHNESS_MISSING_UPDATE_ID = "MISSING_UPDATE_ID"
+FRESHNESS_MISSING_SOURCE_TS = "MISSING_SOURCE_TS"
+
+
+def reset_book_identity() -> None:
+    _ACCEPTED_BOOKS.clear()
+
+
+def assess_book_freshness(
+    symbol: str,
+    book: ExecutableBook,
+    *,
+    now: float | None = None,
+    max_age_sec: float | None = None,
+) -> dict[str, Any]:
+    """Age of the book update used for execution, not of local processing.
+
+    Age runs from the exchange event time when present, else from the send
+    time of the request that first returned this update id. A late response,
+    a repeated id, or an older id cannot look fresher than the exchange book.
+    """
+    processing_ts = time.time() if now is None else float(now)
+    cap = float(ORDERBOOK_MAX_AGE_SEC if max_age_sec is None else max_age_sec)
+    sym = normalize_symbol(symbol)
+    out: dict[str, Any] = {
+        "source_book_timestamp": None,
+        "exchange_book_timestamp": book.exchange_ts,
+        "request_sent_timestamp": book.source_ts,
+        "local_receive_timestamp": book.receive_ts,
+        "processing_timestamp": processing_ts,
+        "book_age_ms": None,
+        "last_update_id": book.last_update_id,
+        "accepted_update_id": None,
+        "duplicate_update_id": False,
+        "max_age_ms": cap * 1000.0,
+        "freshness_result": FRESHNESS_STALE,
+    }
+    if book.last_update_id is None:
+        out["freshness_result"] = FRESHNESS_MISSING_UPDATE_ID
+        return out
+    source_ts = book.exchange_ts if book.exchange_ts and book.exchange_ts > 0 else book.source_ts
+    if source_ts is None or source_ts <= 0:
+        out["freshness_result"] = FRESHNESS_MISSING_SOURCE_TS
+        return out
+    update_id = int(book.last_update_id)
+    prev = _ACCEPTED_BOOKS.get(sym)
+    if prev is not None and update_id < prev.update_id:
+        out["accepted_update_id"] = prev.update_id
+        out["source_book_timestamp"] = float(source_ts)
+        out["book_age_ms"] = (processing_ts - float(source_ts)) * 1000.0
+        out["freshness_result"] = FRESHNESS_OUT_OF_ORDER
+        return out
+    if prev is not None and update_id == prev.update_id:
+        out["duplicate_update_id"] = True
+        source_ts = min(float(source_ts), prev.source_ts)
+    else:
+        _ACCEPTED_BOOKS[sym] = _AcceptedBook(
+            update_id=update_id,
+            source_ts=float(source_ts),
+            receive_ts=float(book.receive_ts or processing_ts),
+        )
+    out["accepted_update_id"] = update_id
+    out["source_book_timestamp"] = float(source_ts)
+    age_sec = processing_ts - float(source_ts)
+    out["book_age_ms"] = age_sec * 1000.0
+    if age_sec < 0 or age_sec > cap:
+        out["freshness_result"] = FRESHNESS_STALE
+        return out
+    out["freshness_result"] = FRESHNESS_FRESH
+    return out
 
 
 def get_last_execution_protection_state(*, taker_fee: float | None = None) -> dict[str, Any]:
@@ -286,7 +389,7 @@ def evaluate_executable_sell_profit(
     return base
 
 
-async def _fetch_order_book(ccxt_symbol: str) -> tuple[list[list[float]], list[list[float]], float] | None:
+async def _fetch_order_book(ccxt_symbol: str) -> ExecutableBook | None:
     """Fetch L2 via live_market_data service (existing path, depth limit capped)."""
     try:
         from backend.services.live_market_data import live_market_data_service
@@ -298,7 +401,14 @@ async def _fetch_order_book(ccxt_symbol: str) -> tuple[list[list[float]], list[l
         asks = ob.get("asks") or []
         if not bids or not asks:
             return None
-        return bids, asks, 0.0
+        return ExecutableBook(
+            bids=bids,
+            asks=asks,
+            last_update_id=ob.get("last_update_id"),
+            source_ts=ob.get("request_sent_ts"),
+            receive_ts=ob.get("received_ts"),
+            exchange_ts=ob.get("exchange_ts"),
+        )
     except Exception as ex:
         logger.warning("PROTECTED_EXEC order book fetch failed %s: %s", ccxt_symbol, ex)
         return None
@@ -314,6 +424,7 @@ def _fail(
     quantity: float,
     **extra: Any,
 ) -> ProtectedPreflightResult:
+    freshness = dict(_PREFLIGHT_FRESHNESS.get() or {})
     res = ProtectedPreflightResult(
         passed=False,
         reject_reason=reason,
@@ -322,6 +433,8 @@ def _fail(
         reference_price=reference_price,
         quantity=quantity,
         execution_mode=execution_mode,
+        book_age_sec=(freshness["book_age_ms"] / 1000.0) if freshness.get("book_age_ms") is not None else None,
+        book_freshness=freshness,
         diagnostics=extra,
     )
     _update_last_state(res)
@@ -386,8 +499,9 @@ async def run_protected_preflight(
             detail="invalid_qty_or_price",
         )
 
+    _PREFLIGHT_FRESHNESS.set({})
     fetched = await _fetch_order_book(ns)
-    if fetched is None:
+    if fetched is None or not fetched.bids or not fetched.asks:
         return _fail(
             ns,
             side_u,
@@ -397,8 +511,19 @@ async def run_protected_preflight(
             quantity=quantity,
         )
 
-    bids, asks, book_age = fetched
-    if book_age > ORDERBOOK_MAX_AGE_SEC:
+    bids, asks = fetched.bids, fetched.asks
+    freshness = assess_book_freshness(ns, fetched)
+    try:
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+    except (TypeError, ValueError, IndexError):
+        best_bid = best_ask = 0.0
+    freshness["best_bid"] = best_bid
+    freshness["best_ask"] = best_ask
+    freshness["spread"] = best_ask - best_bid
+    _PREFLIGHT_FRESHNESS.set(freshness)
+    book_age = freshness["book_age_ms"] / 1000.0 if freshness.get("book_age_ms") is not None else None
+    if freshness["freshness_result"] != FRESHNESS_FRESH:
         return _fail(
             ns,
             side_u,
@@ -407,11 +532,11 @@ async def run_protected_preflight(
             reference_price=reference_price,
             quantity=quantity,
             book_age_sec=book_age,
+            freshness_result=freshness["freshness_result"],
         )
 
-    best_bid = float(bids[0][0])
-    best_ask = float(asks[0][0])
-    if best_bid <= 0 or best_ask <= 0 or best_ask < best_bid:
+    if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
+        freshness["freshness_result"] = "INVALID_TOP_OF_BOOK"
         return _fail(
             ns,
             side_u,
@@ -585,6 +710,7 @@ async def run_protected_preflight(
         quantity=float(executable_qty if side_u == "SELL" and flatten else quantity),
         execution_mode=exec_mode,
         book_age_sec=book_age,
+        book_freshness=dict(freshness),
         executable_qty=float(executable_qty if side_u == "SELL" else quantity),
         diagnostics={"mandatory_exit": flatten, "allow_chunk": chunk_ok, "impact_cap": impact_cap},
     )
@@ -655,6 +781,43 @@ def _merge_info_preserving_fills(original: Any, fetched: Any) -> Any:
     return merged
 
 
+def _ms_to_sec(raw: Any) -> float | None:
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return v / 1000.0 if v > 0 else None
+
+
+def _stamp_latency(order: dict[str, Any], submit_ts: float, response_ts: float) -> dict[str, Any]:
+    if isinstance(order, dict):
+        order["_mystic_latency"] = {"order_submit_timestamp": submit_ts, "order_response_timestamp": response_ts}
+    return order
+
+
+def execution_latency_fields(order: dict[str, Any] | None) -> dict[str, Any]:
+    """Submit / ack / fill times for one live order. Telemetry only."""
+    if not isinstance(order, dict):
+        return {}
+    lat = order.get("_mystic_latency") if isinstance(order.get("_mystic_latency"), dict) else {}
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    ack_ts = _ms_to_sec(info.get("transactTime")) or _ms_to_sec(order.get("timestamp"))
+    fill_times = [t for t in (_ms_to_sec(tr.get("timestamp")) for tr in (order.get("trades") or []) if isinstance(tr, dict)) if t]
+    fill_ts = max(fill_times) if fill_times else _ms_to_sec(order.get("lastTradeTimestamp"))
+    submit_ts = lat.get("order_submit_timestamp")
+    out: dict[str, Any] = {
+        "order_submit_timestamp": submit_ts,
+        "order_response_timestamp": lat.get("order_response_timestamp"),
+        "exchange_ack_timestamp": ack_ts,
+        "fill_timestamp": fill_ts,
+    }
+    if submit_ts and ack_ts:
+        out["submit_to_ack_ms"] = (ack_ts - float(submit_ts)) * 1000.0
+    if submit_ts and fill_ts:
+        out["submit_to_fill_ms"] = (fill_ts - float(submit_ts)) * 1000.0
+    return out
+
+
 async def execute_protected_limit_live(
     live_service: Any,
     *,
@@ -682,6 +845,7 @@ async def execute_protected_limit_live(
             params: dict[str, Any] = {}
             if tif == "IOC":
                 params["timeInForce"] = "IOC"
+            submit_ts = time.time()
             result = await live_service.place_order(
                 exchange="binanceus",
                 symbol=exchange_symbol,
@@ -693,6 +857,7 @@ async def execute_protected_limit_live(
                 time_in_force=tif if tif == "IOC" else None,
             )
         except TypeError:
+            submit_ts = time.time()
             result = await live_service.place_order(
                 exchange="binanceus",
                 symbol=exchange_symbol,
@@ -711,10 +876,12 @@ async def execute_protected_limit_live(
                 continue
             return None
 
+        response_ts = time.time()
         order = result.get("order") or {}
         order_id = str(order.get("id") or "")
         if order_id:
             order = await _enrich_live_order_fills(live_service, order, exchange_symbol)
+        _stamp_latency(order, submit_ts, response_ts)
         filled = float(order.get("filled") or 0.0)
         amount = float(order.get("amount") or quantity)
 
@@ -754,10 +921,10 @@ async def execute_protected_limit_live(
             amount = float(o.get("amount") or quantity)
             status = str(o.get("status") or "").lower()
             if filled + 1e-12 >= amount and filled > 0:
-                return o
+                return _stamp_latency(o, submit_ts, response_ts)
             if status in ("closed", "filled") and filled > 0:
                 if PROTECTED_LIMIT_ALLOW_PARTIAL or filled + 1e-12 >= amount:
-                    return o
+                    return _stamp_latency(o, submit_ts, response_ts)
                 break
             if status in ("canceled", "cancelled", "expired", "rejected"):
                 break
@@ -777,7 +944,7 @@ async def execute_protected_limit_live(
         if filled > 0:
             last["_mystic_partial_fill"] = True
             last["_mystic_ioc_incomplete"] = True
-            return last
+            return _stamp_latency(last, submit_ts, response_ts)
         return None
 
     return None

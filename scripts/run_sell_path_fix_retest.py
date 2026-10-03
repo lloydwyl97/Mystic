@@ -190,9 +190,12 @@ async def main() -> None:
     profitable_px = entry * (1.0 + ESTIMATED_ROUNDTRIP_COST + MIN_NET_PROFIT_TO_SELL + 0.002)
 
     async def _stub_book(_sym: str):
+        from backend.services.protected_limit_execution import ExecutableBook
+
+        now = time.time()
         bids = [[profitable_px, qty * 3.0]]
         asks = [[profitable_px * 1.0004, qty * 3.0]]
-        return bids, asks, 0.0
+        return ExecutableBook(bids=bids, asks=asks, last_update_id=int(now * 1000), source_ts=now, receive_ts=now)
 
     pos = await _run_xrp_sell_attempt(pos_db, stub_book=_stub_book)
     REPORT["positive_test"] = pos

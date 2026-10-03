@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -25,6 +26,7 @@ from backend.services.day_mandatory_exit_execution import (
 from backend.services.protected_limit_execution import (
     PRICE_IMPACT_TOO_HIGH,
     SPREAD_TOO_WIDE,
+    ExecutableBook,
     run_protected_preflight,
     walk_book_within_impact,
 )
@@ -37,7 +39,8 @@ SOL_MIN_NOTIONAL = 1.0
 
 
 def _book(bids, asks):
-    return (bids, asks, 0.0)
+    now = time.time()
+    return ExecutableBook(bids=bids, asks=asks, last_update_id=time.monotonic_ns(), source_ts=now, receive_ts=now)
 
 
 @pytest.mark.asyncio

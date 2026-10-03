@@ -799,11 +799,24 @@ class LiveMarketDataService:
                     "options": {"defaultType": "spot"},
                 },
             )
+            call_started = time.time()
             ob = await asyncio.to_thread(public_client.fetch_order_book, s, limit)
+            received_ts = time.time()
+            # Binance.US REST depth carries lastUpdateId but no event time. The
+            # depth request's send time is the oldest the snapshot can be.
+            sent_ms = getattr(public_client, "lastRestRequestTimestamp", None)
+            request_sent_ts = call_started
+            if isinstance(sent_ms, (int, float)) and call_started <= float(sent_ms) / 1000.0 <= received_ts:
+                request_sent_ts = float(sent_ms) / 1000.0
+            nonce = ob.get("nonce")
             return {
                 "bids": ob.get("bids", [])[:limit],
                 "asks": ob.get("asks", [])[:limit],
                 "fetch_failed": False,
+                "last_update_id": int(nonce) if isinstance(nonce, (int, float)) else None,
+                "exchange_ts": (float(ob["timestamp"]) / 1000.0) if isinstance(ob.get("timestamp"), (int, float)) else None,
+                "request_sent_ts": request_sent_ts,
+                "received_ts": received_ts,
             }
         except (
             ValueError,

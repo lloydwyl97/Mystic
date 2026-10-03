@@ -2384,6 +2384,14 @@ def _configured_live_status(engine: Any, capability: dict[str, Any]) -> dict[str
     )
 
 
+def _order_submitted_iso(order: Any) -> str:
+    lat = order.get("_mystic_latency") if isinstance(order, dict) else None
+    ts = lat.get("order_submit_timestamp") if isinstance(lat, dict) else None
+    if not isinstance(ts, (int, float)) or ts <= 0:
+        return ""
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+
+
 def _book_not_current_executable(reader: Any, symbol: str, best_ask: float) -> bool:
     """True when the ask is too far below a recent sale to be the live book."""
     redis_client = getattr(reader, "_redis", None)
@@ -8121,6 +8129,8 @@ class PortfolioEngine:
             if not merged.get("trades") and order.get("trades"):
                 merged["trades"] = order["trades"]
             merged["info"] = _merge_info_preserving_fills(order.get("info"), fetched.get("info"))
+            if order.get("_mystic_latency") and not merged.get("_mystic_latency"):
+                merged["_mystic_latency"] = order["_mystic_latency"]
             order = merged
             if new_status in ("closed", "filled", "canceled", "cancelled", "expired"):
                 break
@@ -11757,6 +11767,10 @@ class PortfolioEngine:
                 )
                 slippage_cost = (fill_price - price) * quantity
                 protected_audit["live_commission"] = comm.to_dict()
+                with contextlib.suppress(Exception):
+                    from backend.services.protected_limit_execution import execution_latency_fields
+
+                    protected_audit["execution_latency"] = execution_latency_fields(live_order_buy)
                 if live_order_buy.get("_mystic_partial_fill") or live_order_buy.get("_mystic_ioc_incomplete"):
                     logger.warning(
                         "LIVE_PARTIAL_FILL_ADOPTED %s filled=%.8f fee_usd=%.8f fee_from_exchange=%s — requested entry unsuccessful, inventory tracked",
@@ -11787,6 +11801,7 @@ class PortfolioEngine:
                         intent_id=str(trailing_buy_intent_id or ""),
                         decision_id=str(decision_id or ""),
                         client_order_id=str(client_order_id or ""),
+                        submitted_at=_order_submitted_iso(live_order_buy),
                         fallback_qty=float(quantity),
                         fallback_price=float(fill_price),
                         fee_amount=float(fee),
@@ -14493,6 +14508,10 @@ class PortfolioEngine:
                 if sell_preflight_audit is None:
                     sell_preflight_audit = {}
                 sell_preflight_audit["live_commission"] = comm.to_dict()
+                with contextlib.suppress(Exception):
+                    from backend.services.protected_limit_execution import execution_latency_fields
+
+                    sell_preflight_audit["execution_latency"] = execution_latency_fields(live_order_sell)
                 if comm.fee_from_exchange:
                     logger.info(
                         "LIVE_SELL_EXCHANGE_FEE %s fee_usd=%.8f proceeds=%.8f",
@@ -14523,6 +14542,7 @@ class PortfolioEngine:
                         side="SELL",
                         mystic_trade_id=str(getattr(position, "trade_id", "") or ""),
                         decision_id=str(getattr(position, "decision_id", "") or ""),
+                        submitted_at=_order_submitted_iso(live_order_sell),
                         fallback_qty=float(quantity),
                         fallback_price=float(fill_price),
                         fee_amount=float(fee),
