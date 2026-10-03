@@ -11,6 +11,8 @@ import sqlite3
 from dataclasses import dataclass, field
 
 QTY_TOLERANCE = 0.01
+# The unit tolerance alone hides BTC/ETH gaps worth hundreds of dollars; a priced gap above this is drift.
+NOTIONAL_TOLERANCE_USD = 1.0
 _CASH_ASSETS = frozenset({"USDT", "USD", "USDC", "BUSD"})
 
 
@@ -83,5 +85,25 @@ def load_asset_ownership(conn: sqlite3.Connection) -> dict[str, AssetOwnership]:
     return books
 
 
-def quantity_drift(exchange_qty: float, owned_qty: float, *, tolerance: float = QTY_TOLERANCE) -> bool:
-    return abs(float(exchange_qty or 0.0) - float(owned_qty or 0.0)) > float(tolerance)
+def material(quantity: float, price: float = 0.0, *, tolerance: float = QTY_TOLERANCE, notional_tolerance: float = NOTIONAL_TOLERANCE_USD) -> bool:
+    """Above the unit tolerance, or worth more than the notional tolerance at ``price``.
+
+    Without a price only the unit tolerance applies.
+    """
+    qty = abs(float(quantity or 0.0))
+    if qty > float(tolerance):
+        return True
+    px = float(price or 0.0)
+    return px > 0 and qty * px > float(notional_tolerance)
+
+
+def quantity_drift(
+    exchange_qty: float,
+    owned_qty: float,
+    *,
+    tolerance: float = QTY_TOLERANCE,
+    price: float = 0.0,
+    notional_tolerance: float = NOTIONAL_TOLERANCE_USD,
+) -> bool:
+    diff = float(exchange_qty or 0.0) - float(owned_qty or 0.0)
+    return material(diff, price, tolerance=tolerance, notional_tolerance=notional_tolerance)

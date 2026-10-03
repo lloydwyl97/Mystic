@@ -3036,7 +3036,7 @@ class PortfolioEngineIntegration:
 
                         if response.status_code == 200:
                             data = response.json()
-                            binance_balances = {}
+                            wallet: dict[str, float] = {}
 
                             for balance in data.get("balances", []):
                                 asset = balance["asset"]
@@ -3045,16 +3045,23 @@ class PortfolioEngineIntegration:
                                 # USDT is compared with ledger cash (free). Coin assets compare
                                 # the whole wallet quantity, including any amount locked in an order.
                                 physical = free if asset == "USDT" else free + locked
-                                if physical > 0.001:  # Ignore dust
-                                    binance_balances[asset] = physical
+                                if physical > 0:
+                                    wallet[asset] = physical
 
                             # Compare with local DB - BUG #41 FIX: Use context manager for proper cleanup
                             with sqlite3.connect(DATABASE_PATH) as conn:
                                 c = conn.cursor()
 
-                                from backend.services.balance_sync_ownership import load_asset_ownership, quantity_drift
+                                from backend.services.balance_sync_ownership import load_asset_ownership, material, quantity_drift
 
                                 owned_by_asset = load_asset_ownership(conn)
+
+                                def _mark(asset: str) -> float:
+                                    return float(self.current_prices.get(f"{asset}/USDT") or self.current_prices.get(f"{asset}USDT") or 0.0)
+
+                                # Unowned dust is ignored; an owned asset or one worth more than the
+                                # notional tolerance is always compared, whatever its unit size.
+                                binance_balances = {a: q for a, q in wallet.items() if q > 0.001 or a in owned_by_asset or material(q, _mark(a))}
 
                                 c.execute("SELECT cash_balance FROM portfolio_engine_ledger ORDER BY id DESC LIMIT 1")
                                 local_cash = c.fetchone()
@@ -3084,7 +3091,8 @@ class PortfolioEngineIntegration:
                                         continue
                                     book = owned_by_asset.get(asset)
                                     local_qty = book.total if book else 0.0
-                                    if not quantity_drift(binance_qty, local_qty):
+                                    mark = _mark(asset)
+                                    if not quantity_drift(binance_qty, local_qty, price=mark):
                                         if book is not None and len(book.components) > 1:
                                             logger.info(
                                                 "BINANCE_SYNC_OWNERSHIP %s Binance=%.8f owned=%.8f %s",
@@ -3095,7 +3103,7 @@ class PortfolioEngineIntegration:
                                             )
                                         continue
                                     # Drift: only forgive if local has 0 and Binance qty is dust
-                                    if local_qty <= 0.01:
+                                    if not material(local_qty, mark):
                                         symbol = f"{asset}/USDT"
                                         is_dust = False
                                         if self.engine:
@@ -3148,7 +3156,7 @@ class PortfolioEngineIntegration:
 
                                 # Check for positions we have locally but not on Binance
                                 for asset, book in owned_by_asset.items():
-                                    if asset not in binance_balances and book.total > 0.01:
+                                    if asset not in binance_balances and material(book.total, _mark(asset)):
                                         logger.warning(
                                             "BINANCE_SYNC: %s exists locally (%.8f) but NOT on Binance! %s",
                                             asset,
