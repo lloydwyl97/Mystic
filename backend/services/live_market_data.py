@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import random
+import socket
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -66,6 +67,29 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
+
+# Transient REST failures retry. Programmer errors and cancellation do not.
+MARKET_DATA_TRANSPORT_BACKOFF_START_SEC = 1.0
+MARKET_DATA_TRANSPORT_BACKOFF_CAP_SEC = 30.0
+
+
+def is_transient_market_data_transport_error(exc: BaseException) -> bool:
+    """True for a network/timeout/5xx failure the REST pollers can retry."""
+    if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+        return False
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = getattr(exc, "response", None)
+        status = int(getattr(response, "status_code", 0) or 0)
+        return status >= 500
+    return isinstance(exc, (httpx.TransportError, TimeoutError, ConnectionError, socket.gaierror))
+
+
+def next_market_data_transport_backoff(current: float) -> float:
+    """Double the pause, starting at 1s and never exceeding the cap."""
+    cur = float(current or 0.0)
+    if cur <= 0.0:
+        return MARKET_DATA_TRANSPORT_BACKOFF_START_SEC
+    return min(MARKET_DATA_TRANSPORT_BACKOFF_CAP_SEC, cur * 2.0)
 
 
 def _to_ccxt_symbol(s: str) -> str:
@@ -166,6 +190,8 @@ class LiveMarketDataService:
         self._ohlcv_stale_fallback_used: int = 0
         self._ticker_idx = 0
         self._ohlcv_idx = 0
+        self._ticker_transport_backoff = 0.0
+        self._ohlcv_transport_backoff = 0.0
         self._limiter: BinanceWeightLimiter | None = None
         self._limiter_lock = asyncio.Lock()
         self._cache_guard: Any | None = None
@@ -298,11 +324,38 @@ class LiveMarketDataService:
 
     # ---------------- loops ----------------
 
+    def _poll_pause(
+        self,
+        *,
+        interval: float,
+        elapsed: float,
+        backoff: float,
+        transport_failed: bool,
+        succeeded: bool,
+    ) -> tuple[float, float]:
+        """Normal cadence on success. Bounded backoff only when the whole cycle failed."""
+        if transport_failed and not succeeded:
+            backoff = next_market_data_transport_backoff(backoff)
+        elif succeeded:
+            backoff = 0.0
+        pause = max(0.0, float(interval) - elapsed)
+        if transport_failed and not succeeded:
+            pause = max(pause, backoff)
+        return pause, backoff
+
+    def _log_transport_cycle(self, loop_name: str, errors: list[str]) -> None:
+        if not errors:
+            return
+        # Class name and count only. Exception text can contain the request URL.
+        logger.warning("LIVE_MD_%s_TRANSPORT failures=%s error=%s", loop_name, len(errors), errors[0])
+
     async def _ticker_loop(self) -> None:
         # Startup jitter to prevent synchronized bursts after restart
         await asyncio.sleep(2.0 + random.random() * 2.0)
         while self._running:
             t0 = time.time()
+            transport_errors: list[str] = []
+            succeeded = False
             try:
                 # Check if CCXT client is available
                 if not self.binance:
@@ -325,7 +378,8 @@ class LiveMarketDataService:
 
                 sem = asyncio.Semaphore(max(1, self.ticker_max_conc))
 
-                async def _fetch(sym: str, semaphore=sem, limiter=limiter) -> None:
+                async def _fetch(sym: str, semaphore=sem, limiter=limiter, errors=transport_errors) -> None:
+                    nonlocal succeeded
                     try:
                         async with semaphore:
                             # Use direct Binance US API call instead of CCXT to avoid margin endpoint issues
@@ -364,7 +418,10 @@ class LiveMarketDataService:
                             async with self._lock:
                                 self._ticker_cache[sym] = ticker_data
                                 self._ticker_cache_at[sym] = time.time()
+                            succeeded = True
                             logger.debug(f"Fetched ticker for {sym}: ${ticker_data.get('last', 0)}")
+                    except asyncio.CancelledError:
+                        raise
                     except (RateLimitedError, CircuitOpenError) as e:
                         logger.warning("Rate limited fetching ticker for %s: %s", sym, e)
                     except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError) as e:
@@ -373,16 +430,37 @@ class LiveMarketDataService:
                             logger.warning(f"[WARNING] Ticker fetch disabled for {sym}: API key issue - {e}")
                         else:
                             logger.debug(f"ticker fetch failed {sym}: {e}")
+                    except Exception as exc:
+                        if not is_transient_market_data_transport_error(exc):
+                            raise
+                        errors.append(type(exc).__name__)
 
                 tasks = [await task_manager.create_task(_fetch(s), name="live_market_data:ticker_fetch") for s in batch]
                 await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not is_transient_market_data_transport_error(exc):
+                    raise
+                transport_errors.append(type(exc).__name__)
             finally:
+                self._log_transport_cycle("TICKER", transport_errors)
                 elapsed = max(0.0, time.time() - t0)
-                await asyncio.sleep(max(0.0, self.ticker_interval - elapsed))
+                pause, self._ticker_transport_backoff = self._poll_pause(
+                    interval=self.ticker_interval,
+                    elapsed=elapsed,
+                    backoff=self._ticker_transport_backoff,
+                    transport_failed=bool(transport_errors),
+                    succeeded=succeeded,
+                )
+                await asyncio.sleep(pause)
 
     async def _ohlcv_loop(self) -> None:
         while self._running:
             t0 = time.time()
+            transport_errors: list[str] = []
+            succeeded = False
+            persisted_any = False
             try:
                 # Check if CCXT client is available
                 if not self.binance:
@@ -404,10 +482,9 @@ class LiveMarketDataService:
                 limiter = await self._get_limiter()
 
                 sem = asyncio.Semaphore(max(1, self.ohlcv_max_conc))
-                persisted_any = False
 
-                async def _fetch(sym: str, semaphore=sem, limiter=limiter) -> None:
-                    nonlocal persisted_any
+                async def _fetch(sym: str, semaphore=sem, limiter=limiter, errors=transport_errors) -> None:
+                    nonlocal persisted_any, succeeded
                     try:
                         async with semaphore:
                             # Use direct Binance US API call instead of CCXT to avoid margin endpoint issues
@@ -448,9 +525,12 @@ class LiveMarketDataService:
 
                             async with self._lock:
                                 self._ohlcv_cache[sym] = ohlcv
+                            succeeded = True
                             if await self._persist_latest_1m_candle(sym, ohlcv):
                                 persisted_any = True
                             logger.debug(f"Fetched {len(ohlcv)} candles for {sym}")
+                    except asyncio.CancelledError:
+                        raise
                     except (RateLimitedError, CircuitOpenError) as e:
                         logger.warning("Rate limited fetching klines for %s: %s", sym, e)
                     except (ValueError, TypeError, AttributeError, KeyError, IndexError, RuntimeError) as e:
@@ -459,6 +539,10 @@ class LiveMarketDataService:
                             logger.warning(f"[WARNING] OHLCV fetch disabled for {sym}: API key issue - {e}")
                         else:
                             logger.debug(f"ohlcv fetch failed {sym}: {e}")
+                    except Exception as exc:
+                        if not is_transient_market_data_transport_error(exc):
+                            raise
+                        errors.append(type(exc).__name__)
 
                 tasks = [await task_manager.create_task(_fetch(s), name="live_market_data:ohlcv_fetch") for s in batch]
                 await asyncio.gather(*tasks)
@@ -474,9 +558,23 @@ class LiveMarketDataService:
                     )
                 except Exception:
                     pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not is_transient_market_data_transport_error(exc):
+                    raise
+                transport_errors.append(type(exc).__name__)
             finally:
+                self._log_transport_cycle("OHLCV", transport_errors)
                 elapsed = max(0.0, time.time() - t0)
-                await asyncio.sleep(max(0.0, self.ohlcv_interval - elapsed))
+                pause, self._ohlcv_transport_backoff = self._poll_pause(
+                    interval=self.ohlcv_interval,
+                    elapsed=elapsed,
+                    backoff=self._ohlcv_transport_backoff,
+                    transport_failed=bool(transport_errors),
+                    succeeded=succeeded,
+                )
+                await asyncio.sleep(pause)
 
     # ---------------- getters ----------------
 

@@ -35,6 +35,15 @@ if [ ! -x "$PYTHON" ]; then
     exit 1
 fi
 
+# Move a non-empty process log aside before a truncating restart redirect.
+# *.prerestart* is compressed and deleted by the existing maintenance retention.
+preserve_log() {
+    local log="$1"
+    if [ -s "$log" ]; then
+        mv -- "$log" "${log}.prerestart.$(date -u +%Y%m%dT%H%M%SZ).$$"
+    fi
+}
+
 export REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379/0}"
 export DATABASE_URL="${DATABASE_URL:-sqlite:////home/mystic/mystic/mystic_trading.db}"
 export PAPER_TRADING_INITIAL_BALANCE="${PAPER_TRADING_INITIAL_BALANCE:-10000.0}"
@@ -235,6 +244,7 @@ start_backend() {
     fi
 
     echo "Starting Backend API..."
+    preserve_log /home/mystic/mystic/logs/mystic_backend.log
     nohup "$PYTHON" -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 > /home/mystic/mystic/logs/mystic_backend.log 2>&1 9>&- &
     local i
     for ((i=1; i<=30; i++)); do
@@ -266,6 +276,7 @@ start_live_md() {
         return 0
     fi
     echo "Starting Live Market Data loops..."
+    preserve_log /home/mystic/mystic/logs/mystic_live_md.log
     nohup "$PYTHON" start_live_market_data.py > /home/mystic/mystic/logs/mystic_live_md.log 2>&1 9>&- &
     require_running "start_live_market_data.py" "Live Market Data" "/home/mystic/mystic/logs/mystic_live_md.log" 20 1 || return 1
     if ! assert_single_after_start "start_live_market_data.py" "Live Market Data"; then
@@ -279,6 +290,7 @@ start_signal() {
         return 0
     fi
     echo "Starting AI Signal Generator..."
+    preserve_log /home/mystic/mystic/logs/mystic_signal.log
     nohup "$PYTHON" start_ai_signal_generator.py > /home/mystic/mystic/logs/mystic_signal.log 2>&1 9>&- &
     require_running "start_ai_signal_generator.py" "AI Signal Generator" "/home/mystic/mystic/logs/mystic_signal.log" 20 1 || return 1
     if ! assert_single_after_start "start_ai_signal_generator.py" "AI Signal Generator"; then
@@ -294,6 +306,7 @@ start_portfolio() {
     fi
     echo "Starting Portfolio Engine Integration..."
     if [ "$log_mode" = "truncate" ]; then
+        preserve_log /home/mystic/mystic/logs/mystic_portfolio.log
         nohup "$PYTHON" start_portfolio_engine_integration.py > /home/mystic/mystic/logs/mystic_portfolio.log 2>&1 9>&- &
     else
         nohup "$PYTHON" start_portfolio_engine_integration.py >> /home/mystic/mystic/logs/mystic_portfolio.log 2>&1 9>&- &
@@ -307,6 +320,7 @@ start_portfolio() {
 
 _launch_learning() {
     echo "Starting AI Learning..."
+    preserve_log /home/mystic/mystic/logs/mystic_learning.log
     nice -n 10 nohup env \
         DAY_HISTORICAL_TRAIN_BASES="BTC,ETH,SOL,XRP" \
         DAY_HISTORICAL_TAIL_4H_BARS="480" \
@@ -332,6 +346,7 @@ start_ai_context() {
         return 0
     fi
     echo "Starting AI Market Context..."
+    preserve_log /home/mystic/mystic/logs/mystic_ai_context.log
     nohup "$PYTHON" start_ai_market_context.py > /home/mystic/mystic/logs/mystic_ai_context.log 2>&1 9>&- &
     require_running "start_ai_market_context.py" "AI Market Context" "/home/mystic/mystic/logs/mystic_ai_context.log" 20 1 || return 1
     if ! assert_single_after_start "start_ai_market_context.py" "AI Market Context"; then

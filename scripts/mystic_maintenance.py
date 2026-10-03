@@ -17,6 +17,9 @@ import logging
 import sys
 from pathlib import Path
 
+# Root cron imports this process. Do not leave root-owned bytecode in the repo.
+sys.dont_write_bytecode = True
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.services import mystic_maintenance as m
