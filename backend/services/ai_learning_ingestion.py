@@ -1032,6 +1032,18 @@ def missed_move_rank_adjustments(
 # =========================================================================
 
 
+def _layout_reconstruction_incomplete(ctx_json: Any) -> bool:
+    """Inference rows whose HTF inputs could not be rebuilt stay forensic only."""
+    s = str(ctx_json or "")
+    if "_htf_rebuild" not in s:
+        return False
+    try:
+        marker = (json.loads(s) or {}).get("_htf_rebuild") or {}
+    except (TypeError, ValueError):
+        return True
+    return bool(marker.get("legacy_4h_kept") or marker.get("layout_reconstruction_incomplete"))
+
+
 def _features_for_decision_ids(
     conn: sqlite3.Connection,
     decision_ids: list[str],
@@ -1042,17 +1054,21 @@ def _features_for_decision_ids(
     if not decision_ids:
         return out
     chunk = 400
+    has_ctx = any(r[1] == "ctx_json" for r in conn.execute("PRAGMA table_info(ai_inference_log)"))
+    ctx_col = "ctx_json" if has_ctx else "NULL"
     for i in range(0, len(decision_ids), chunk):
         ids = decision_ids[i : i + chunk]
         q = ",".join("?" for _ in ids)
         rows = conn.execute(
             f"""
-            SELECT decision_id, features_json, feature_version FROM ai_inference_log
+            SELECT decision_id, features_json, feature_version, {ctx_col} FROM ai_inference_log
             WHERE decision_id IN ({q}) AND features_json IS NOT NULL
             """,
             ids,
         ).fetchall()
-        for did, fj, fv in rows:
+        for did, fj, fv, cj in rows:
+            if _layout_reconstruction_incomplete(cj):
+                continue
             try:
                 if int(fv or 0) < min_feature_version:
                     continue
@@ -1076,9 +1092,11 @@ def tier_c_training_rows(
     feature_dim: int = 145,
     min_feature_version: int = 5,
     db_path: str = DATABASE_PATH,
+    known_before_utc: str | None = None,
 ) -> tuple[list[list[float]], list[int]]:
     """Labeled candidate snapshots → (X, y). Label 1 = forward path reached
-    the net-profit target without breaching invalidation."""
+    the net-profit target without breaching invalidation. ``known_before_utc``
+    keeps only labels finalized before that instant."""
     ensure_learning_ingestion_tables(db_path)
     sid = (strategy_id or "day").strip().lower()
     xs: list[list[float]] = []
@@ -1091,9 +1109,10 @@ def tier_c_training_rows(
                 FROM ai_candidate_snapshots
                 WHERE label_status='LABELED' AND strategy_id=? AND symbol IN (?, ?)
                   AND decision_id != '' AND would_hit_target IS NOT NULL
+                  AND (? IS NULL OR julianday(labeled_at_utc) <= julianday(?))
                 ORDER BY epoch_ms DESC LIMIT 3000
                 """,
-                (sid, symbol, _ccxt(symbol)),
+                (sid, symbol, _ccxt(symbol), known_before_utc, known_before_utc),
             ).fetchall()
             dids = [str(r[0]) for r in rows]
             feats_map = _features_for_decision_ids(conn, dids, feature_dim, min_feature_version)
@@ -1109,6 +1128,18 @@ def tier_c_training_rows(
     return xs, ys
 
 
+def _iso_to_ms(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace(" ", "T").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
 def tier_b_training_rows(
     *,
     strategy_id: str,
@@ -1117,6 +1148,7 @@ def tier_b_training_rows(
     min_feature_version: int = 5,
     min_hold_seconds: float = 4 * 3600,
     db_path: str = DATABASE_PATH,
+    known_before_utc: str | None = None,
 ) -> tuple[list[list[float]], list[int]]:
     """Open-trade MFE/MAE path labels → (X, y). For each trade with enough
     hold time, label 1 if the path's MFE cleared the net-profit floor after
@@ -1125,21 +1157,22 @@ def tier_b_training_rows(
     (strategy_id or "day").strip().lower()
     xs: list[list[float]] = []
     ys: list[int] = []
+    cutoff_ms = _iso_to_ms(known_before_utc)
     try:
         with sqlite3.connect(db_path, timeout=15) as conn:
             rows = conn.execute(
                 """
                 SELECT h.trade_id, MAX(h.mfe_pct) AS mfe, MAX(h.hold_seconds) AS hold_sec,
-                       MIN(h.epoch_ms) AS first_ms, h.symbol
+                       MIN(h.epoch_ms) AS first_ms, h.symbol, MAX(h.epoch_ms) AS last_ms
                 FROM ai_position_heartbeats h
                 WHERE h.symbol IN (?, ?)
                 GROUP BY h.trade_id
-                HAVING hold_sec >= ?
+                HAVING hold_sec >= ? AND (? IS NULL OR last_ms <= ?)
                 ORDER BY first_ms DESC LIMIT 500
                 """,
-                (symbol, _ccxt(symbol), float(min_hold_seconds)),
+                (symbol, _ccxt(symbol), float(min_hold_seconds), cutoff_ms, cutoff_ms),
             ).fetchall()
-            for _trade_id, mfe, _hold, first_ms, sym in rows:
+            for _trade_id, mfe, _hold, first_ms, sym, _last_ms in rows:
                 snap = conn.execute(
                     """
                     SELECT decision_id FROM ai_candidate_snapshots

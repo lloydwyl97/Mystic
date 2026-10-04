@@ -36,125 +36,75 @@ def _write_artifact(path: Path, *, accuracy: float = 0.6, feature_version: int =
     path.write_bytes(pickle.dumps(payload))
 
 
-def test_promote_archives_prior_active_and_keeps_candidate_path(tmp_path: Path):
-    db = tmp_path / "lifecycle.db"
-    ensure_ai_canonical_tables(str(db))
-    cand1 = tmp_path / "versions" / "day_BTCUSDT_1.pkl"
-    cand2 = tmp_path / "versions" / "day_BTCUSDT_2.pkl"
-    active = tmp_path / "active" / "day_BTCUSDT_direction.pkl"
-    _write_artifact(cand1, accuracy=0.55)
-    _write_artifact(cand2, accuracy=0.70)
-    _write_artifact(active, accuracy=0.50)
+def _servable(path: Path, threshold: float) -> Path:
+    import numpy as np
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.tree import DecisionTreeClassifier
 
-    metrics = {
-        "holdout_status": "OK",
-        "holdout_sample_count": 40,
-        "candidate_accuracy": 0.70,
-        "active_accuracy": 0.50,
-        "candidate_profit_after_cost": 0.002,
-        "active_profit_after_cost": 0.0005,
-        "candidate_bad_trade_rate": 0.2,
-        "active_bad_trade_rate": 0.3,
-        "holdout_buy_label_count": 10,
-        "promotion_path": "unit_test",
-        "candidate_holdout": {
-            "buy_signal_count": 12,
-            "hold_signal_count": 28,
-            "buy_precision_if_followed": 0.62,
-        },
-        "active_holdout": {
-            "buy_signal_count": 8,
-            "hold_signal_count": 32,
-            "buy_precision_if_followed": 0.40,
-        },
+    x0 = np.array([-5.0, -1.0, threshold - 0.01, threshold + 0.01, 50.0])
+    X = np.zeros((len(x0), 145))
+    X[:, 0] = x0
+    art = {
+        "model": DecisionTreeClassifier(max_depth=1, random_state=0).fit(X, (x0 > threshold).astype(int)),
+        "scaler": StandardScaler(with_mean=False, with_std=False).fit(np.zeros((2, 145))),
+        "feature_version": 5,
+        "feature_dim": 145,
+        "live_strategy_id": "day",
+        "accuracy": threshold,
+        "training_data_end": "2026-01-01T00:00:00+00:00",
     }
-
-    with patch(
-        "backend.services.ai_model_promotion.evaluate_signal_hash_artifact_contract",
-        return_value=(True, None, {}),
-    ):
-        ok1, _ = register_candidate_and_maybe_promote(
-            strategy_id="day",
-            symbol="BTCUSDT",
-            candidate_path=cand1,
-            active_path=active,
-            validation_metrics=metrics,
-            db_path=str(db),
-        )
-        ok2, _ = register_candidate_and_maybe_promote(
-            strategy_id="day",
-            symbol="BTCUSDT",
-            candidate_path=cand2,
-            active_path=active,
-            validation_metrics=metrics,
-            db_path=str(db),
-        )
-
-    assert ok1 is True and ok2 is True
-    with sqlite3.connect(db) as conn:
-        actives = conn.execute("SELECT path, status FROM ai_model_versions WHERE status='active'").fetchall()
-        archived = conn.execute("SELECT path, status FROM ai_model_versions WHERE status='archived'").fetchall()
-    assert len(actives) == 1
-    assert str(cand2) in actives[0][0]
-    assert len(archived) >= 1
-    assert any(str(cand1) in row[0] for row in archived)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(pickle.dumps(art))
+    return path
 
 
-def test_rollback_matches_ccxt_outcome_symbol_and_restores_artifact(tmp_path: Path):
-    db = tmp_path / "rollback.db"
-    ensure_ai_canonical_tables(str(db))
-    cand_prev = tmp_path / "versions" / "day_BTCUSDT_prev.pkl"
-    cand_cur = tmp_path / "versions" / "day_BTCUSDT_cur.pkl"
+def test_promote_archives_prior_active_and_records_registry_path(tmp_path: Path):
+    from backend.services import ai_model_registry as registry
     from backend.services.live_strategy_contracts import per_coin_artifact_file
 
-    active = per_coin_artifact_file(tmp_path / "active", "day", "BTCUSDT")
-    _write_artifact(cand_prev, accuracy=0.66)
-    _write_artifact(cand_cur, accuracy=0.40)
-    _write_artifact(active, accuracy=0.40)
-
+    db = tmp_path / "lifecycle.db"
+    ensure_ai_canonical_tables(str(db))
+    active_dir = tmp_path / "models" / "active"
+    active = _servable(per_coin_artifact_file(active_dir, "day", "BTCUSDT"), 1e6)
+    cand1 = _servable(tmp_path / "versions" / "day_BTCUSDT_1.pkl", 0.5)
+    cand2 = _servable(tmp_path / "versions" / "day_BTCUSDT_2.pkl", 0.7)
+    registry.set_promotion_enabled("day", True, "test", registry.registry_root(active_dir))
+    metrics = {
+        "holdout_sample_count": 40,
+        "candidate_holdout": {"buy_signal_count": 12},
+        "holdout_window": {"first_opened_at": "2026-02-01T00:00:00+00:00", "n": 40},
+        "paired_decision": {"verdict": "PROMOTE", "promote": True, "n": 40},
+    }
+    with patch("backend.services.ai_model_promotion.evaluate_signal_hash_artifact_contract", return_value=(True, None, {})):
+        ok1, _ = register_candidate_and_maybe_promote(strategy_id="day", symbol="BTCUSDT", candidate_path=cand1, active_path=active, validation_metrics=metrics, db_path=str(db))
+        ok2, _ = register_candidate_and_maybe_promote(strategy_id="day", symbol="BTCUSDT", candidate_path=cand2, active_path=active, validation_metrics=metrics, db_path=str(db))
+    assert ok1 is True and ok2 is True
+    sha1, sha2 = registry.sha256_file(cand1), registry.sha256_file(cand2)
     with sqlite3.connect(db) as conn:
-        conn.execute(
-            """
-            INSERT INTO ai_model_versions
-            (model_id, strategy_id, symbol, feature_version, artifact_hash, path, status,
-             created_at, promoted_at, retired_at)
-            VALUES
-            ('day:BTCUSDT:prev', 'day', 'BTCUSDT', 5, 'prevhash', ?, 'archived',
-             datetime('now'), datetime('now'), datetime('now')),
-            ('day:BTCUSDT:cur',  'day', 'BTCUSDT', 5, 'curhash',  ?, 'active',
-             '2026-07-31 00:00:00', '2026-07-31 00:00:00', NULL)
-            """,
-            (str(cand_prev), str(cand_cur)),
-        )
-        for i in range(25):
-            conn.execute(
-                """
-                INSERT INTO ai_outcome_training_rows
-                (symbol, opened_at_utc, closed_at_utc, strategy_id, net_pnl_pct, ingested_at_utc)
-                VALUES ('BTC/USDT', ?, ?, 'day', ?, datetime('now'))
-                """,
-                (f"2026-08-01T00:00:{i:02d}Z", f"2026-08-01T01:00:{i:02d}Z", -0.01),
-            )
-        conn.commit()
+        actives = conn.execute("SELECT path FROM ai_model_versions WHERE status='active'").fetchall()
+        archived = conn.execute("SELECT path FROM ai_model_versions WHERE status='archived'").fetchall()
+    assert len(actives) == 1 and sha2 in actives[0][0]
+    assert any(sha1 in row[0] and Path(row[0]).exists() for row in archived)
+    assert registry.read_pointer("day", "BTCUSDT", "PREVIOUS", registry.registry_root(active_dir))["sha256"] == sha1
 
-    with patch(
-        "backend.services.live_strategy_contracts.per_coin_artifact_file",
-        return_value=active,
-    ):
-        ok, reason = maybe_rollback_underperforming_model(
-            strategy_id="day",
-            symbol="BTCUSDT",
-            min_samples=20,
-            db_path=str(db),
-        )
-    assert ok is True, reason
-    assert reason == "rollback_executed"
-    with sqlite3.connect(db) as conn:
-        statuses = dict(conn.execute("SELECT model_id, status FROM ai_model_versions").fetchall())
-    assert statuses["day:BTCUSDT:prev"] == "active"
-    assert statuses["day:BTCUSDT:cur"] == "rollback"
-    restored = pickle.loads(active.read_bytes())
-    assert float(restored.get("accuracy") or 0) == 0.66
+
+def test_rollback_restores_registry_previous_artifact(tmp_path: Path):
+    from backend.services import ai_model_registry as registry
+    from backend.services.live_strategy_contracts import per_coin_artifact_file
+
+    db = tmp_path / "rollback.db"
+    ensure_ai_canonical_tables(str(db))
+    active_dir = tmp_path / "models" / "active"
+    root = registry.registry_root(active_dir)
+    active = _servable(per_coin_artifact_file(active_dir, "day", "BTCUSDT"), 0.66)
+    prev_bytes = active.read_bytes()
+    registry.set_promotion_enabled("day", True, "test", root)
+    assert registry.promote_atomic("day", "BTCUSDT", _servable(tmp_path / "versions" / "cur.pkl", 0.4), active, root=root)[0]
+    _seed_losses(db, "2099-01-01")
+    ok, reason = maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", min_samples=20, db_path=str(db), active_dir=active_dir)
+    assert (ok, reason) == (True, "rollback_executed")
+    assert active.read_bytes() == prev_bytes
+    assert maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", min_samples=20, db_path=str(db), active_dir=active_dir)[1] in ("no_previous_model", "insufficient_live_samples")
 
 
 def test_fail_open_fallback_removed_from_pipeline():
@@ -181,38 +131,41 @@ def test_rollback_logger_bound():
     assert "logger = logging.getLogger(__name__)" in src
 
 
-def _rollback_db(tmp_path: Path, *, promoted_at: str, prev_status: str = "archived") -> tuple[Path, Path]:
-    db = tmp_path / "rb.db"
-    ensure_ai_canonical_tables(str(db))
-    prev = tmp_path / "versions" / "day_BTCUSDT_prev.pkl"
-    cur = tmp_path / "versions" / "day_BTCUSDT_cur.pkl"
-    _write_artifact(prev, accuracy=0.66)
-    _write_artifact(cur, accuracy=0.40)
+def _seed_losses(db: Path, day: str) -> None:
     with sqlite3.connect(db) as conn:
-        conn.execute(
-            """
-            INSERT INTO ai_model_versions (model_id, strategy_id, symbol, feature_version, artifact_hash, path, status, created_at, promoted_at, retired_at)
-            VALUES ('day:BTCUSDT:prev', 'day', 'BTCUSDT', 5, 'p', ?, ?, '2026-07-01', '2026-07-01', '2026-07-31'),
-                   ('day:BTCUSDT:cur', 'day', 'BTCUSDT', 5, 'c', ?, 'active', ?, ?, NULL)
-            """,
-            (str(prev), prev_status, str(cur), promoted_at, promoted_at),
-        )
         for i in range(25):
             conn.execute(
                 "INSERT INTO ai_outcome_training_rows (symbol, opened_at_utc, closed_at_utc, strategy_id, net_pnl_pct, ingested_at_utc) VALUES ('BTC/USDT', ?, ?, 'day', -0.01, datetime('now'))",
-                (f"2026-08-01T00:00:{i:02d}Z", f"2026-08-01T01:00:{i:02d}Z"),
+                (f"{day}T00:00:{i:02d}Z", f"{day}T01:00:{i:02d}Z"),
             )
         conn.commit()
-    return db, tmp_path / "active.pkl"
+
+
+def _promoted_pair(tmp_path: Path) -> tuple[Path, Path, Path]:
+    from backend.services import ai_model_registry as registry
+    from backend.services.live_strategy_contracts import per_coin_artifact_file
+
+    db = tmp_path / "rb.db"
+    ensure_ai_canonical_tables(str(db))
+    active_dir = tmp_path / "models" / "active"
+    root = registry.registry_root(active_dir)
+    active = _servable(per_coin_artifact_file(active_dir, "day", "BTCUSDT"), 0.66)
+    registry.set_promotion_enabled("day", True, "test", root)
+    assert registry.promote_atomic("day", "BTCUSDT", _servable(tmp_path / "versions" / "cur.pkl", 0.4), active, root=root)[0]
+    return db, active_dir, active
 
 
 def test_rollback_ignores_outcomes_selected_by_a_previous_model(tmp_path: Path):
-    db, active = _rollback_db(tmp_path, promoted_at="2026-08-02 00:00:00")
-    with patch("backend.services.live_strategy_contracts.per_coin_artifact_file", return_value=active):
-        assert maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", min_samples=20, db_path=str(db)) == (False, "insufficient_live_samples")
+    db, active_dir, _active = _promoted_pair(tmp_path)
+    _seed_losses(db, "2026-08-01")
+    assert maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", min_samples=20, db_path=str(db), active_dir=active_dir) == (False, "insufficient_live_samples")
 
 
 def test_rollback_never_reinstates_a_rolled_back_model(tmp_path: Path):
-    db, active = _rollback_db(tmp_path, promoted_at="2026-07-31 00:00:00", prev_status="rollback")
-    with patch("backend.services.live_strategy_contracts.per_coin_artifact_file", return_value=active):
-        assert maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", min_samples=20, db_path=str(db)) == (False, "no_previous_model")
+    from backend.services import ai_model_registry as registry
+
+    db, active_dir, active = _promoted_pair(tmp_path)
+    root = registry.registry_root(active_dir)
+    assert registry.rollback_to_previous("day", "BTCUSDT", active, reason="test", root=root)[0]
+    _seed_losses(db, "2099-01-01")
+    assert maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", min_samples=20, db_path=str(db), active_dir=active_dir) == (False, "no_previous_model")

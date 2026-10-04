@@ -1,4 +1,4 @@
-"""AI continuous-improvement wiring: stale-refresh promotion + pattern backfill."""
+"""AI continuous-improvement wiring: ties (stale or fresh) keep the incumbent + pattern backfill."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def _write_artifact(path: Path, *, accuracy: float, trained_at: str | None = Non
     path.write_bytes(pickle.dumps({k: v for k, v in payload.items() if k != "model"}))
 
 
-def test_stale_tie_promotes_equal_candidate(tmp_path, monkeypatch):
+def test_stale_tie_never_promotes(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL_STALE_HOURS", "1")
     monkeypatch.setenv("MODEL_PROMOTION_ACCURACY_MIN_MARGIN", "0.01")
     active = tmp_path / "active" / "BTCUSDT_direction.pkl"
@@ -67,8 +67,8 @@ def test_stale_tie_promotes_equal_candidate(tmp_path, monkeypatch):
         validation_metrics=metrics,
         db_path=str(db),
     )
-    assert promoted is True
-    assert reason == "stale_refresh_tie"
+    assert promoted is False
+    assert reason.startswith("keep_incumbent:")
 
 
 def test_fresh_tie_still_rejects(tmp_path, monkeypatch):
@@ -108,7 +108,7 @@ def test_fresh_tie_still_rejects(tmp_path, monkeypatch):
         db_path=str(db),
     )
     assert promoted is False
-    assert reason == "candidate_not_improved_over_active"
+    assert reason.startswith("keep_incumbent:")
 
 
 def test_pattern_memory_backfill_from_outcomes(tmp_path):

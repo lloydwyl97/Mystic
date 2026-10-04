@@ -40,6 +40,7 @@ logs/
 
 # Large model artifacts (retrain locally; active models are small and tracked)
 models/versions/
+models/registry/
 models/training_data/
 models/checkpoints/
 models/cache/

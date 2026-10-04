@@ -135,7 +135,7 @@ def _holdout_split(
             """
             SELECT id, symbol, strategy_id, outcome_class, good_bad_memory_class, churn_flag,
                    features_json, context_json, outcome_label, rank_snapshot_id,
-                   selected_net_expected_value, net_pnl_pct, actual_net_outcome, realized_pct, closed_at_utc
+                   selected_net_expected_value, net_pnl_pct, actual_net_outcome, realized_pct, opened_at_utc, closed_at_utc
             FROM ai_outcome_training_rows
             WHERE strategy_id = ?
               AND symbol IN (?, ?)
@@ -176,9 +176,10 @@ def holdout_window(
         return {"ids": [], "n": 0}
     cutoff = incumbent_seen_cutoff(active_path)
     rows, _total = _holdout_split(sid, bus, ccxt, feature_version, feature_dim, db_path, holdout_fraction, cutoff)
-    if len(rows) < MIN_HOLDOUT_SAMPLES:
-        return {"ids": [], "n": 0, "incumbent_seen_cutoff": cutoff, "forward_rows": len(rows)}
+    if not rows:
+        return {"ids": [], "n": 0, "incumbent_seen_cutoff": cutoff, "forward_rows": 0}
     ids = [int(r["id"]) for r in rows]
+    opened = sorted(str(r["opened_at_utc"] or "") for r in rows if r["opened_at_utc"])
     return {
         "ids": ids,
         "n": len(ids),
@@ -186,6 +187,7 @@ def holdout_window(
         "max_id": max(ids),
         "first_closed_at": str(rows[0]["closed_at_utc"] or ""),
         "last_closed_at": str(rows[-1]["closed_at_utc"] or ""),
+        "first_opened_at": opened[0] if opened else str(rows[0]["closed_at_utc"] or ""),
         "incumbent_seen_cutoff": cutoff,
     }
 
@@ -220,7 +222,7 @@ def load_symbol_holdout_rows(
     holdout_rows, total_eligible = _holdout_split(sid, bus, ccxt, feature_version, feature_dim, db_path, holdout_fraction, incumbent_seen_cutoff(active_path))
     if total_eligible == 0:
         return empty
-    if len(holdout_rows) < MIN_HOLDOUT_SAMPLES:
+    if not holdout_rows:
         return (
             np.array([]),
             np.array([]),
@@ -248,7 +250,7 @@ def load_symbol_holdout_rows(
         nets.append(float(net))
         gbs.append(str(row["good_bad_memory_class"] or "").strip().upper())
 
-    if len(xs) < MIN_HOLDOUT_SAMPLES:
+    if not xs:
         return (
             np.array([]),
             np.array([]),
@@ -265,6 +267,57 @@ def load_symbol_holdout_rows(
     )
 
 
+def load_forward_rows(
+    *,
+    strategy_id: str,
+    symbol_bus: str,
+    opened_after_utc: str,
+    feature_version: int = FEATURE_VERSION_DAY_HTF,
+    feature_dim: int = FEATURE_DIM_V2,
+    db_path: str = DATABASE_PATH,
+) -> dict[str, Any]:
+    """Closed outcomes whose trade opened strictly after ``opened_after_utc`` (a model's training-data end)."""
+    sid = (strategy_id or "day").strip().lower()
+    bus, ccxt = _symbol_forms(symbol_bus)
+    uri = f"file:{db_path}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, symbol, strategy_id, outcome_class, good_bad_memory_class, churn_flag,
+                   features_json, context_json, outcome_label, rank_snapshot_id,
+                   selected_net_expected_value, net_pnl_pct, actual_net_outcome, realized_pct, opened_at_utc, closed_at_utc
+            FROM ai_outcome_training_rows
+            WHERE strategy_id = ? AND symbol IN (?, ?) AND features_json IS NOT NULL
+              AND julianday(opened_at_utc) > julianday(?)
+            ORDER BY id ASC
+            """,
+            (sid, ccxt, bus, opened_after_utc),
+        ).fetchall()
+    rows = [r for r in rows if _row_passes_filters(r, symbol_bus=bus, min_fv=feature_version, min_dim=feature_dim)]
+    xs, ys, nets, gbs, ids = [], [], [], [], []
+    from backend.services.day_feature_health import zero_learning_blocked_feature_dims
+
+    for r in rows:
+        net = _row_net_pnl(r)
+        if net is None:
+            continue
+        xs.append(zero_learning_blocked_feature_dims([float(x) for x in json.loads(r["features_json"])]))
+        ys.append(_outcome_label(r))
+        nets.append(float(net))
+        gbs.append(str(r["good_bad_memory_class"] or "").strip().upper())
+        ids.append(int(r["id"]))
+    return {
+        "X": np.asarray(xs, dtype=np.float64),
+        "y": np.asarray(ys, dtype=np.int64),
+        "nets": np.asarray(nets, dtype=np.float64),
+        "good_bad": np.asarray(gbs, dtype=object),
+        "ids": ids,
+        "first_closed_at": str(rows[0]["closed_at_utc"]) if rows else None,
+        "last_closed_at": str(rows[-1]["closed_at_utc"]) if rows else None,
+    }
+
+
 def _load_artifact(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -279,6 +332,19 @@ def _load_artifact(path: Path) -> dict[str, Any] | None:
     if model is None or scaler is None:
         return None
     return payload
+
+
+def artifact_predictions(artifact_path: Path | None, X: np.ndarray) -> np.ndarray | None:
+    """Per-row predictions of one artifact on the holdout matrix (None if unservable)."""
+    if artifact_path is None or len(X) == 0:
+        return None
+    art = _load_artifact(Path(artifact_path))
+    if art is None:
+        return None
+    try:
+        return np.asarray(art["model"].predict(art["scaler"].transform(X)), dtype=np.int64).reshape(-1)
+    except Exception:
+        return None
 
 
 def evaluate_artifact_on_holdout(
@@ -474,9 +540,7 @@ def build_holdout_validation_metrics(
     if rf_val_samples is not None:
         base["rf_val_samples"] = int(rf_val_samples)
 
-    # Tiered fallback (Tier C): when real closed-trade holdout is too scarce,
-    # evaluate candidate vs active on labeled rejected/no-trade forward-return
-    # rows. Classification accuracy only — never mixed into real PnL metrics.
+    # Tier C synthetic comparison: diagnostic only, never promotion authority.
     if holdout_low_confidence:
         base.update(
             _tiered_holdout_comparison(
@@ -490,8 +554,19 @@ def build_holdout_validation_metrics(
             )
         )
 
-    if holdout_count < MIN_HOLDOUT_SAMPLES:
+    if holdout_count == 0:
         return base
+
+    from backend.services.ai_model_promotion_decision import compare_paired
+
+    c_preds = artifact_predictions(candidate_path, X)
+    a_preds = artifact_predictions(active_path, X) if active_path is not None and active_path.exists() else None
+    if c_preds is not None and a_preds is not None:
+        base["paired_decision"] = compare_paired(c_preds, a_preds, nets, gbs, y)
+    elif c_preds is None:
+        base["paired_decision"] = {"verdict": "CANDIDATE_UNSERVABLE", "promote": False, "n": holdout_count}
+    else:
+        base["paired_decision"] = {"verdict": "NO_INCUMBENT", "promote": False, "n": holdout_count}
 
     candidate_holdout = evaluate_artifact_on_holdout(candidate_path, X, y, nets, gbs)
     active_holdout: dict[str, Any]
@@ -560,6 +635,7 @@ __all__ = [
     "MIN_HOLDOUT_CONFIDENCE_SAMPLES",
     "MIN_HOLDOUT_SAMPLES",
     "TARGET_HOLDOUT_SAMPLES",
+    "artifact_predictions",
     "build_holdout_validation_metrics",
     "evaluate_artifact_on_holdout",
     "incumbent_seen_cutoff",

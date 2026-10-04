@@ -5,6 +5,7 @@ Collects real trade data and market signals for AI learning and model training
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -448,6 +449,74 @@ def _exclude_promotion_holdout(
     kept = [r for r in rows if int(r.get("id") or 0) not in excluded]
     logger.info("PROMOTION_HOLDOUT_EXCLUDED strategy=%s excluded=%d kept=%d", strategy_id, len(rows) - len(kept), len(kept))
     return kept, windows
+
+
+def _utc_ms(raw: Any) -> int | None:
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace(" ", "T").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _purge_after_holdout_start(
+    self_rows: list[dict[str, Any]],
+    outcome_rows: list[dict[str, Any]],
+    holdout_windows: dict[str, dict[str, Any]],
+    bar_ms: int = 4 * 3600 * 1000,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Keep only training information fully known before each symbol's holdout opened.
+
+    Self-supervised rows are dropped once their anchor bar closes after the first
+    holdout entry (their labels read later anchors, so truncating the series also
+    truncates label look-ahead); outcome rows are dropped once they close after it.
+    Returns the purged rows plus per-symbol ``training_data_end`` and fingerprint.
+    """
+    cutoffs = {sym: _utc_ms(w.get("first_opened_at")) for sym, w in holdout_windows.items() if w.get("n")}
+
+    def _sym(raw: Any) -> str:
+        return _canonical_training_pair_symbol(str(raw or ""))
+
+    kept_self = []
+    for r in self_rows:
+        cut = cutoffs.get(_sym(r.get("symbol")))
+        if cut is not None:
+            anchor = int(r.get("label_anchor_4h_open_ms") or 0)
+            known_at = anchor + bar_ms if anchor > 0 else _utc_ms(r.get("timestamp"))
+            if known_at is None or known_at > cut:
+                continue
+        kept_self.append(r)
+    kept_oc = []
+    for r in outcome_rows:
+        cut = cutoffs.get(_sym(r.get("symbol")))
+        if cut is not None:
+            closed = _utc_ms(r.get("closed_at_utc"))
+            if closed is None or closed > cut:
+                continue
+        kept_oc.append(r)
+    info: dict[str, dict[str, Any]] = {}
+    for sym in {_sym(r.get("symbol")) for r in kept_self} | {_sym(r.get("symbol")) for r in kept_oc} | set(cutoffs):
+        anchors = sorted(int(r.get("label_anchor_4h_open_ms") or 0) for r in kept_self if _sym(r.get("symbol")) == sym)
+        ids = sorted(int(r.get("id") or 0) for r in kept_oc if _sym(r.get("symbol")) == sym)
+        digest = hashlib.sha256(json.dumps([anchors, ids]).encode()).hexdigest()
+        cut = cutoffs.get(sym)
+        info[sym] = {
+            "training_data_end": datetime.fromtimestamp(cut / 1000, tz=timezone.utc).isoformat() if cut is not None else None,
+            "training_fingerprint": digest,
+            "training_window": {
+                "self_rows": len(anchors),
+                "first_anchor_ms": anchors[0] if anchors else None,
+                "last_anchor_ms": anchors[-1] if anchors else None,
+                "outcome_rows": len(ids),
+                "outcome_max_id": ids[-1] if ids else None,
+            },
+        }
+    return kept_self, kept_oc, info
 
 
 def _outcome_rows_to_xy_for_strategy(
@@ -1494,7 +1563,9 @@ class AITrainingDataPipeline:
                     else:
                         rows_with_sym = [r for r in features if isinstance(r, dict) and r.get("symbol") and isinstance(r.get("features"), (list, tuple)) and len(r["features"]) == target_dim]
 
-                    X_self, y_self, sym_self = build_xy_arrays_for_live_strategy(rows_with_sym, strat, target_dim=target_dim)
+                    train_outcome_rows, holdout_windows = _exclude_promotion_holdout(outcome_rows, strat, target_dim, feature_version_used)
+                    train_self_rows, train_outcome_rows, training_info = _purge_after_holdout_start(rows_with_sym, train_outcome_rows, holdout_windows)
+                    X_self, y_self, sym_self = build_xy_arrays_for_live_strategy(train_self_rows, strat, target_dim=target_dim)
                     if len(X_self) == 0 and target_dim == _FEATURE_DIM_V2:
                         logger.warning(
                             "PER_COIN_TRAIN: strategy=%s zero v2 self-supervised rows — day/day rely on outcome merge or cache warm-up",
@@ -1503,7 +1574,6 @@ class AITrainingDataPipeline:
 
                     X_oc = y_oc = sym_oc = np.array([])
                     w_oc = np.array([])
-                    train_outcome_rows, holdout_windows = _exclude_promotion_holdout(outcome_rows, strat, target_dim, feature_version_used)
                     train_outcome_max_id = max((int(r.get("id") or 0) for r in train_outcome_rows), default=0)
                     boundary = training_label_boundary(outcome_rows, rows_with_sym)
                     seen = self.__dict__.setdefault("_last_training_boundary", {})
@@ -1598,8 +1668,9 @@ class AITrainingDataPipeline:
                                     tier_c_training_rows,
                                 )
 
-                                xb, yb = await asyncio.to_thread(tier_b_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim)
-                                xc, yc = await asyncio.to_thread(tier_c_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim)
+                                known_before = (training_info.get(sym) or {}).get("training_data_end")
+                                xb, yb = await asyncio.to_thread(tier_b_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim, known_before_utc=known_before)
+                                xc, yc = await asyncio.to_thread(tier_c_training_rows, strategy_id=strat, symbol=sym, feature_dim=target_dim, known_before_utc=known_before)
                                 tier_b_n, tier_c_n = len(yb), len(yc)
                                 tier_x = [*xb, *xc]
                                 tier_y = [*[int(v) for v in yb], *[int(v) for v in yc]]
@@ -1874,6 +1945,9 @@ class AITrainingDataPipeline:
                             validation_metrics["holdout_excluded_from_training"] = bool(_window.get("n"))
                             artifact["artifact_id"] = ver_path.name
                             artifact["train_outcome_max_id"] = train_outcome_max_id
+                            artifact.update(training_info.get(sym) or {})
+                            if not artifact.get("training_data_end"):
+                                artifact["training_data_end"] = datetime.now(timezone.utc).isoformat()
                             artifact["holdout_window"] = validation_metrics.get("holdout_window") or {}
                             artifact["holdout_accuracy"] = validation_metrics.get("candidate_accuracy")
                             artifact["holdout_sample_count"] = validation_metrics.get("holdout_sample_count")

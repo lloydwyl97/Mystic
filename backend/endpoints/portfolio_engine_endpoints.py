@@ -2217,6 +2217,22 @@ async def get_trade_drilldown(trade_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def _model_governance_status(symbol: str) -> dict[str, Any]:
+    try:
+        from pathlib import Path
+
+        from backend.services.ai_model_registry import symbol_status
+        from backend.services.live_strategy_contracts import per_coin_artifact_file
+        from backend.utils.path_helpers import ensure_model_directories
+
+        bus = symbol.upper().replace("/", "")
+        bus = bus if bus.endswith("USDT") else f"{bus}USDT"
+        active_dir = Path(ensure_model_directories()["active"])
+        return symbol_status("day", bus, per_coin_artifact_file(active_dir, "day", bus))
+    except Exception as exc:
+        return {"error": type(exc).__name__}
+
+
 def _build_model_panel_sync() -> dict[str, Any]:
     """Blocking model-panel build. Runs sklearn inference over every holdout row
     for all four symbols and reads a multi-gigabyte SQLite file, so it must never
@@ -2297,6 +2313,7 @@ def _build_model_panel_sync() -> dict[str, Any]:
                         "blend_w_gbm": meta.get("active_blend_w_gbm"),
                         "confidence_calibrated": meta.get("active_confidence_calibrated"),
                         "feature_importance_weakest": meta.get("active_feature_importance_weakest"),
+                        "governance": _model_governance_status(str(sym)),
                     }
                 )
         return {
