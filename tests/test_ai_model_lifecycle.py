@@ -100,11 +100,11 @@ def test_rollback_restores_registry_previous_artifact(tmp_path: Path):
     prev_bytes = active.read_bytes()
     registry.set_promotion_enabled("day", True, "test", root)
     assert registry.promote_atomic("day", "BTCUSDT", _servable(tmp_path / "versions" / "cur.pkl", 0.4), active, root=root)[0]
-    _seed_losses(db, "2099-01-01")
-    ok, reason = maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", min_samples=20, db_path=str(db), active_dir=active_dir)
+    _seed_losses(db, "2099-01-01", version=_active_version(active_dir))
+    ok, reason = maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", db_path=str(db), active_dir=active_dir)
     assert (ok, reason) == (True, "rollback_executed")
     assert active.read_bytes() == prev_bytes
-    assert maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", min_samples=20, db_path=str(db), active_dir=active_dir)[1] in ("no_previous_model", "insufficient_live_samples")
+    assert maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", db_path=str(db), active_dir=active_dir)[1] in ("no_previous_model", "no_attributable_live_outcomes")
 
 
 def test_fail_open_fallback_removed_from_pipeline():
@@ -131,12 +131,20 @@ def test_rollback_logger_bound():
     assert "logger = logging.getLogger(__name__)" in src
 
 
-def _seed_losses(db: Path, day: str) -> None:
+def _active_version(active_dir: Path) -> str:
+    from backend.services import ai_model_registry as registry
+
+    return str(registry.read_pointer("day", "BTCUSDT", "ACTIVE", registry.registry_root(active_dir)).get("version") or "")
+
+
+def _seed_losses(db: Path, day: str, *, version: str = "", n: int = 25) -> None:
+    attribution = {"ml_model_attribution": {"model_version": version, "attributable": True, "rank_contribution": 1.0}} if version else {}
     with sqlite3.connect(db) as conn:
-        for i in range(25):
+        for i in range(n):
             conn.execute(
-                "INSERT INTO ai_outcome_training_rows (symbol, opened_at_utc, closed_at_utc, strategy_id, net_pnl_pct, ingested_at_utc) VALUES ('BTC/USDT', ?, ?, 'day', -0.01, datetime('now'))",
-                (f"{day}T00:00:{i:02d}Z", f"{day}T01:00:{i:02d}Z"),
+                "INSERT INTO ai_outcome_training_rows (symbol, opened_at_utc, closed_at_utc, strategy_id, net_pnl_pct, ingested_at_utc, score_components_json) "
+                "VALUES ('BTC/USDT', ?, ?, 'day', -0.01, datetime('now'), ?)",
+                (f"{day}T00:00:{i:02d}Z", f"{day}T01:00:{i:02d}Z", json.dumps(attribution)),
             )
         conn.commit()
 
@@ -157,8 +165,8 @@ def _promoted_pair(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 def test_rollback_ignores_outcomes_selected_by_a_previous_model(tmp_path: Path):
     db, active_dir, _active = _promoted_pair(tmp_path)
-    _seed_losses(db, "2026-08-01")
-    assert maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", min_samples=20, db_path=str(db), active_dir=active_dir) == (False, "insufficient_live_samples")
+    _seed_losses(db, "2026-08-01", version=_active_version(active_dir))
+    assert maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", db_path=str(db), active_dir=active_dir) == (False, "no_attributable_live_outcomes")
 
 
 def test_rollback_never_reinstates_a_rolled_back_model(tmp_path: Path):
@@ -167,5 +175,5 @@ def test_rollback_never_reinstates_a_rolled_back_model(tmp_path: Path):
     db, active_dir, active = _promoted_pair(tmp_path)
     root = registry.registry_root(active_dir)
     assert registry.rollback_to_previous("day", "BTCUSDT", active, reason="test", root=root)[0]
-    _seed_losses(db, "2099-01-01")
-    assert maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", min_samples=20, db_path=str(db), active_dir=active_dir) == (False, "no_previous_model")
+    _seed_losses(db, "2099-01-01", version=_active_version(active_dir))
+    assert maybe_rollback_underperforming_model(strategy_id="day", symbol="BTCUSDT", db_path=str(db), active_dir=active_dir) == (False, "no_previous_model")

@@ -31,18 +31,36 @@ CREATE TABLE IF NOT EXISTS documented_balance_residuals (
 """
 
 
+def _fiat_flow_after(conn: sqlite3.Connection, asset: str, recorded_at: str) -> str:
+    """flow_id of a venue fiat flow of ``asset`` newer than ``recorded_at`` (UTC), else ""."""
+    try:
+        row = conn.execute(
+            """
+            SELECT flow_id FROM external_capital_flows
+            WHERE UPPER(asset)=? AND source='binanceus_fiat'
+              AND venue_time_ms > CAST(strftime('%s', ?) AS INTEGER) * 1000
+            ORDER BY venue_time_ms DESC LIMIT 1
+            """,
+            (asset, recorded_at),
+        ).fetchone()
+    except sqlite3.Error:
+        return ""
+    return str(row[0]) if row else ""
+
+
 def classify_fiat_residual(conn: sqlite3.Connection, asset: str, exchange_qty: float) -> str:
     """Return MATCHED, CHANGED, or "" when ``asset`` is not a fiat residual asset.
 
     First sight of a small fiat balance records it (MATCHED). Afterwards only the
-    recorded quantity matches; any other quantity is CHANGED.
+    recorded quantity matches. A new small remainder is re-recorded only when a
+    venue fiat deposit/withdrawal was recorded after it; any other change is CHANGED.
     """
     code = str(asset or "").upper()
     if code not in FIAT_RESIDUAL_ASSETS:
         return ""
     qty = float(exchange_qty or 0.0)
     conn.execute(_SCHEMA)
-    row = conn.execute("SELECT residual_qty FROM documented_balance_residuals WHERE symbol=?", (code,)).fetchone()
+    row = conn.execute("SELECT residual_qty, updated_at FROM documented_balance_residuals WHERE symbol=?", (code,)).fetchone()
     if row is None:
         if qty > FIAT_RESIDUAL_MAX:
             return "CHANGED"
@@ -52,4 +70,14 @@ def classify_fiat_residual(conn: sqlite3.Connection, asset: str, exchange_qty: f
         )
         logger.info("BALANCE_RESIDUAL_CLASSIFIED asset=%s qty=%.8f note=%s", code, qty, FIAT_RESIDUAL_NOTE)
         return "MATCHED"
-    return "MATCHED" if abs(qty - float(row[0] or 0.0)) <= FIAT_RESIDUAL_TOLERANCE else "CHANGED"
+    if abs(qty - float(row[0] or 0.0)) <= FIAT_RESIDUAL_TOLERANCE:
+        return "MATCHED"
+    flow_id = _fiat_flow_after(conn, code, str(row[1] or "")) if qty <= FIAT_RESIDUAL_MAX else ""
+    if not flow_id:
+        return "CHANGED"
+    conn.execute(
+        "UPDATE documented_balance_residuals SET exchange_qty=?, residual_qty=?, updated_at=datetime('now') WHERE symbol=?",
+        (qty, qty, code),
+    )
+    logger.info("BALANCE_RESIDUAL_RECLASSIFIED asset=%s qty=%.8f previous=%.8f after_flow=%s", code, qty, float(row[0] or 0.0), flow_id)
+    return "MATCHED"

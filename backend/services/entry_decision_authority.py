@@ -24,6 +24,7 @@ HOLD_EV = 0.0
 PROVENANCE_KEYS = (
     "entry_policy_version",
     "model_version",
+    "ml_model_attribution",
     "prediction_timestamp",
     "predicted_net_return",
     "p_positive_net",

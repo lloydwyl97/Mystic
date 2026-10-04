@@ -244,18 +244,49 @@ def register_candidate_and_maybe_promote(
     return promote, reason
 
 
+ROLLBACK_Z = 1.645
+
+
+def attributable_live_evidence(rows: list[tuple[Any, Any]], model_version: str) -> dict[str, Any]:
+    """Split live outcomes into model-attributable evidence and telemetry.
+
+    ``rows`` are ``(net_pnl_pct, score_components_json)``. Only an outcome whose
+    decision recorded that ``model_version`` changed its score, rank, size or
+    action counts. The verdict is ``HARMFUL`` only when the upper confidence
+    bound of the attributable mean net is below zero.
+    """
+    from backend.services.day_model_attribution import attributable_to
+
+    nets: list[float] = []
+    for net, comps in rows:
+        if attributable_to(comps, model_version):
+            nets.append(float(net or 0.0))
+    out: dict[str, Any] = {"live_outcomes": len(rows), "attributable": len(nets), "telemetry_only": len(rows) - len(nets)}
+    if not nets:
+        out["verdict"] = "NO_ATTRIBUTABLE_EVIDENCE"
+        return out
+    n = len(nets)
+    mean = sum(nets) / n
+    sample_var = sum((x - mean) ** 2 for x in nets) / (n - 1) if n > 1 else 0.0
+    var = max(sample_var, sum(x * x for x in nets) / n)
+    ucb = mean + ROLLBACK_Z * (var / n) ** 0.5
+    out.update(mean_net=mean, ucb=ucb, verdict="HARMFUL" if ucb < 0 else "NOT_PROVEN_HARMFUL")
+    return out
+
+
 def maybe_rollback_underperforming_model(
     *,
     strategy_id: str,
     symbol: str,
-    min_samples: int = 20,
     db_path: str = DATABASE_PATH,
     active_dir: Path | None = None,
 ) -> tuple[bool, str]:
-    """Report-only unless auto-promotion is enabled; restores the registry PREVIOUS pointer.
+    """Roll back to the registry PREVIOUS artifact only on attributable harm.
 
-    Live DAY outcomes are not chosen by the advisory model, so they are reported
-    for observability but only switch artifacts when governance allows it.
+    A live outcome is evidence against the serving model only when its decision
+    recorded that this model version changed score, rank, size or action. Every
+    other outcome is telemetry and has no rollback authority. Suppressed while
+    auto-promotion is disabled.
     """
     from backend.services import ai_model_registry as registry
     from backend.services.live_strategy_contracts import per_coin_artifact_file
@@ -280,29 +311,30 @@ def maybe_rollback_underperforming_model(
             return False, "no_active_model"
         rows = conn.execute(
             """
-            SELECT net_pnl_pct
+            SELECT net_pnl_pct, score_components_json
             FROM ai_outcome_training_rows
             WHERE strategy_id = ?
               AND UPPER(symbol) IN (?, ?)
               AND julianday(closed_at_utc) >= julianday(?)
-            ORDER BY id DESC
-            LIMIT ?
             """,
-            (sid, bus_sym.upper(), ccxt_sym.upper(), since, int(min_samples)),
+            (sid, bus_sym.upper(), ccxt_sym.upper(), since),
         ).fetchall()
-    if len(rows) < min_samples:
-        return False, "insufficient_live_samples"
-    avg_net = sum(float(r[0] or 0.0) for r in rows) / max(1, len(rows))
-    if avg_net >= -0.0015:
+    serving = str(ptr.get("version") or "")
+    if not serving and active_pkl_path.exists():
+        serving = _hash_file(active_pkl_path)[:16]
+    evidence = attributable_live_evidence([(r[0], r[1]) for r in rows], serving)
+    if evidence["verdict"] == "NO_ATTRIBUTABLE_EVIDENCE":
+        return False, "no_attributable_live_outcomes"
+    if evidence["verdict"] != "HARMFUL":
         return False, "no_rollback_needed"
     prev = registry.read_pointer(sid, bus_sym, "PREVIOUS", reg_root)
     if not prev or registry.was_rolled_back(sid, bus_sym, str(prev.get("version") or ""), reg_root):
         return False, "no_previous_model"
     enabled, _ = registry.promotion_enabled(sid, reg_root)
     if not enabled:
-        registry.append_event(sid, bus_sym, {"event": "rollback_suppressed", "reason": "promotion_disabled", "avg_recent_net_pnl_pct": avg_net, "samples": len(rows)}, reg_root)
+        registry.append_event(sid, bus_sym, {"event": "rollback_suppressed", "reason": "promotion_disabled", "evidence": evidence}, reg_root)
         return False, "rollback_suppressed_promotion_disabled"
-    ok, why = registry.rollback_to_previous(sid, bus_sym, active_pkl_path, reason=f"live_underperformance avg_net={avg_net:.6f}", root=reg_root)
+    ok, why = registry.rollback_to_previous(sid, bus_sym, active_pkl_path, reason=f"attributable_live_harm mean_net={evidence['mean_net']:.6f} ucb={evidence['ucb']:.6f}", root=reg_root)
     if not ok:
         return False, why
     with sqlite3.connect(db_path) as conn:
@@ -316,8 +348,8 @@ def maybe_rollback_underperforming_model(
                 bus_sym,
                 ptr.get("version"),
                 registry.read_pointer(sid, bus_sym, "ACTIVE", reg_root).get("version"),
-                "live_underperformance",
-                json.dumps({"avg_recent_net_pnl_pct": avg_net, "samples": len(rows)}, separators=(",", ":")),
+                "attributable_live_harm",
+                json.dumps(evidence, separators=(",", ":")),
             ),
         )
         conn.commit()

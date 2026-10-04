@@ -3022,6 +3022,13 @@ class PortfolioEngineIntegration:
                     await asyncio.sleep(300)
                     continue
 
+                # Venue deposits/withdrawals are recorded before the balance comparison
+                # so the residual check sees a flow that landed this cycle.
+                try:
+                    await self._sync_external_capital_flows(api_key, api_secret)
+                except Exception as e:
+                    logger.warning("EXTERNAL_CAPITAL_FLOW_SYNC_FAILED: %s", e)
+
                 # Query Binance account balance
                 try:
                     timestamp = int(time.time() * 1000)
@@ -3178,11 +3185,6 @@ class PortfolioEngineIntegration:
                     logger.warning("BINANCE_SYNC: API timeout")
                 except Exception as e:
                     logger.warning(f"BINANCE_SYNC: Error - {e}")
-
-                try:
-                    await self._sync_external_capital_flows(api_key, api_secret)
-                except Exception as e:
-                    logger.warning("EXTERNAL_CAPITAL_FLOW_SYNC_FAILED: %s", e)
 
                 # Check every 5 minutes
                 await asyncio.sleep(300)

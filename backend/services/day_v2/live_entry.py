@@ -126,6 +126,13 @@ async def submit_day_v2_direct_entry(
 
     from backend.services.portfolio_engine import TradeExplainability
 
+    try:
+        from backend.services.day_model_attribution import day_v2_decision_attribution
+
+        ml_attribution: dict[str, Any] = day_v2_decision_attribution(symbol)
+    except Exception:
+        ml_attribution = {"attributable": False, "reason": "ATTRIBUTION_UNAVAILABLE"}
+
     exp = TradeExplainability(
         trade_id="",
         symbol=symbol,
@@ -164,6 +171,7 @@ async def submit_day_v2_direct_entry(
         "move_potential_atr_1h": float(getattr(signal, "move_potential", 0.0) or 0.0),
         **version_provenance(DAY_V2_ENGINE_ID),
         "rank": dict(rank or {}),
+        "ml_model_attribution": ml_attribution,
     }
 
     from backend.services.portfolio_engine import normalize_symbol

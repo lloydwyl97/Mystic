@@ -1072,11 +1072,7 @@ class AITrainingDataPipeline:
             rollbacks = 0
             for strat in train_strategy_ids():
                 for sym in TRADING_SYMBOLS:
-                    ok, reason = maybe_rollback_underperforming_model(
-                        strategy_id=strat,
-                        symbol=str(sym),
-                        min_samples=int(os.getenv("AI_MODEL_ROLLBACK_MIN_SAMPLES", "20")),
-                    )
+                    ok, reason = maybe_rollback_underperforming_model(strategy_id=strat, symbol=str(sym))
                     if ok:
                         rollbacks += 1
                         logger.warning("MODEL_ROLLBACK_EXECUTED: strategy=%s symbol=%s reason=%s", strat, sym, reason)

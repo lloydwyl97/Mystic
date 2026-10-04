@@ -281,11 +281,14 @@ def test_auto_rollback_suppressed_while_promotion_disabled(models):
     registry.set_promotion_enabled("day", True, "test", models["root"])
     assert registry.promote_atomic("day", SYM, cand, models["active"], root=models["root"])[0]
     registry.set_promotion_enabled("day", False, "freeze", models["root"])
+    version = registry.read_pointer("day", SYM, "ACTIVE", models["root"])["version"]
+    comps = json.dumps({"ml_model_attribution": {"model_version": version, "attributable": True, "rank_contribution": 1.0}})
     with sqlite3.connect(models["db"]) as conn:
         for i in range(25):
             conn.execute(
-                "INSERT INTO ai_outcome_training_rows (symbol, opened_at_utc, closed_at_utc, strategy_id, net_pnl_pct, ingested_at_utc) VALUES (?, ?, ?, 'day', -0.01, datetime('now'))",
-                (SYM, f"2099-01-01T00:00:{i:02d}Z", f"2099-01-01T01:00:{i:02d}Z"),
+                "INSERT INTO ai_outcome_training_rows (symbol, opened_at_utc, closed_at_utc, strategy_id, net_pnl_pct, ingested_at_utc, score_components_json) "
+                "VALUES (?, ?, ?, 'day', -0.01, datetime('now'), ?)",
+                (SYM, f"2099-01-01T00:00:{i:02d}Z", f"2099-01-01T01:00:{i:02d}Z", comps),
             )
         conn.commit()
     live = models["active"].read_bytes()

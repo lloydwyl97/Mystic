@@ -20,16 +20,18 @@ _CASH_ASSETS = frozenset({"USDT", "USD", "USDC", "BUSD"})
 class AssetOwnership:
     total: float = 0.0
     components: list[tuple[str, str, float]] = field(default_factory=list)
+    refs: list[str] = field(default_factory=list)
 
-    def add(self, engine: str, status: str, quantity: float) -> None:
+    def add(self, engine: str, status: str, quantity: float, ref: str = "") -> None:
         qty = float(quantity or 0.0)
         if qty <= 0:
             return
         self.components.append((str(engine or ""), str(status or "ACTIVE"), qty))
+        self.refs.append(str(ref or ""))
         self.total += qty
 
     def report(self) -> str:
-        return ", ".join(f"{engine or 'UNSCOPED'} {status}={qty:.8f}" for engine, status, qty in self.components)
+        return ", ".join(f"{engine or 'UNSCOPED'} {status}{f'[{ref}]' if ref else ''}={qty:.8f}" for (engine, status, qty), ref in zip(self.components, self.refs, strict=True))
 
 
 def asset_code(symbol: str) -> str:
@@ -71,10 +73,13 @@ def load_asset_ownership(conn: sqlite3.Connection) -> dict[str, AssetOwnership]:
                 book(code).add(str(engine_id or ""), str(status_value or "ACTIVE"), float(quantity or 0.0))
 
     if _table_exists(conn, "engine_strategy_dust"):
-        for engine_id, symbol, quantity in conn.execute("SELECT engine_id, symbol, quantity FROM engine_strategy_dust WHERE status='HELD' AND quantity > 0"):
+        ref_col = "source_trade_id" if "source_trade_id" in _columns(conn, "engine_strategy_dust") else "''"
+        for engine_id, symbol, quantity, source_trade_id in conn.execute(
+            f"SELECT engine_id, symbol, quantity, {ref_col} FROM engine_strategy_dust WHERE status='HELD' AND quantity > 0 ORDER BY rowid"
+        ):
             code = asset_code(str(symbol or ""))
             if code and code not in _CASH_ASSETS:
-                book(code).add(str(engine_id or ""), "HELD_DUST", float(quantity or 0.0))
+                book(code).add(str(engine_id or ""), "HELD_DUST", float(quantity or 0.0), ref=str(source_trade_id or "").rsplit("_", 1)[-1])
 
     if _table_exists(conn, "protected_external_inventory"):
         for symbol, quantity in conn.execute("SELECT symbol, quantity FROM protected_external_inventory WHERE quantity > 0"):

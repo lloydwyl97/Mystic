@@ -248,6 +248,7 @@ def record_outcome_training_row(
             "block_scores_json": ex.get("block_scores_json"),
             "intelligence_rank_delta": ex.get("intelligence_rank_delta"),
             "outcome_attribution_reason": attribution_reason,
+            "ml_model_attribution": ex.get("ml_model_attribution"),
         }
 
         values: dict[str, Any] = {
