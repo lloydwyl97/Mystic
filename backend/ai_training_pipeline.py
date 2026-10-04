@@ -429,9 +429,17 @@ def _exclude_promotion_holdout(
         from backend.services.ai_model_promotion_holdout import holdout_window
 
         fv = int(FEATURE_VERSION_DAY_HTF) if strategy_id == "day" else int(feature_version_used)
+        active_dir = Path(ensure_model_directories()["active"])
         excluded: set[int] = set()
         for sym in TRADING_SYMBOLS:
-            window = holdout_window(strategy_id=strategy_id, symbol_bus=sym, feature_version=fv, feature_dim=int(target_dim))
+            active_path = per_coin_artifact_file(active_dir, strategy_id, sym)
+            window = holdout_window(
+                strategy_id=strategy_id,
+                symbol_bus=sym,
+                feature_version=fv,
+                feature_dim=int(target_dim),
+                active_path=active_path if active_path.exists() else None,
+            )
             windows[sym] = window
             excluded.update(window.get("ids") or [])
     except Exception as exc:

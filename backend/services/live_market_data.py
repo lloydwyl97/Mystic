@@ -756,7 +756,9 @@ class LiveMarketDataService:
         recovered = False
 
         def _fail_payload(err: str | None = None) -> dict[str, Any]:
-            stale = self._stale_ohlcv_fallback(cache_key)
+            # The cache key carries no end time: a point-in-time request must
+            # never be answered with latest rows, nor feed latest requests.
+            stale = self._stale_ohlcv_fallback(cache_key) if end_time_ms is None else None
             if stale is not None:
                 self._ohlcv_stale_fallback_used += 1
                 self._ohlcv_fetch_success += 1
@@ -830,7 +832,8 @@ class LiveMarketDataService:
                 logger.exception("get_ohlcv failed %s %s limit=%s: %s", s, timeframe, limit, e)
             return _fail_payload(type(e).__name__)
         else:
-            self._store_ohlcv_cache(cache_key, ohlcv)
+            if end_time_ms is None:
+                self._store_ohlcv_cache(cache_key, ohlcv)
             self._ohlcv_fetch_success += 1
             return {
                 "rows": ohlcv,

@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from backend.config.canonical_candle_intervals import align_open_ms, interval_ms
 from backend.config.day_active_timeframes import DAY_ACTIVE_TIMEFRAMES, min_bars_for_day_tf
 from backend.services.day_active_market_bundle import (
     _fetch_day_active_ohlcv_bundle_raw,
@@ -14,8 +15,11 @@ from backend.services.day_active_market_bundle import (
 from backend.services.day_trade_thesis import DAY_4H_MS, current_utc_4h_open_ms
 
 
-def _rows(n: int) -> list[list]:
-    return [[i, 1.0, 1.0, 1.0, 1.0, 1.0] for i in range(n)]
+def _rows(n: int, tf: str = "1m") -> list[list]:
+    """``n`` completed bars of ``tf`` ending at the newest closed bar."""
+    width = interval_ms(tf)
+    last_closed = align_open_ms(int(time.time() * 1000), tf) - width
+    return [[last_closed - (n - 1 - i) * width, 1.0, 1.0, 1.0, 1.0, 1.0] for i in range(n)]
 
 
 class _Svc:
@@ -28,8 +32,8 @@ class _Svc:
 
 @pytest.mark.asyncio
 async def test_empty_live_fetch_reuses_complete_prior_tf():
-    prior = {tf: _rows(min_bars_for_day_tf(tf) + 10) for tf in DAY_ACTIVE_TIMEFRAMES}
-    prior_ts = dict.fromkeys(DAY_ACTIVE_TIMEFRAMES, 1.0)
+    prior = {tf: _rows(min_bars_for_day_tf(tf) + 10, tf) for tf in DAY_ACTIVE_TIMEFRAMES}
+    prior_ts = dict.fromkeys(DAY_ACTIVE_TIMEFRAMES, time.time() - 5000.0)
     svc = _Svc({"1m": [], "5m": [], "15m": [], "30m": [], "1h": prior["1h"], "4h": prior["4h"], "8h": prior["8h"], "12h": prior["12h"], "1d": prior["1d"], "1w": prior["1w"]})
     bundle, _ = await _fetch_day_active_ohlcv_bundle_raw(
         svc,
@@ -69,7 +73,7 @@ async def test_4h_refetched_on_utc_bar_boundary_inside_ttl():
     stale_4h = [[prev - (n4 - 1 - i) * DAY_4H_MS, 1.0, 1.0, 1.0, 1.0, 1.0] for i in range(n4)]
     fresh_4h = list(stale_4h)
     fresh_4h.append([cur, 2.0, 2.0, 2.0, 2.0, 1.0])
-    prior = {tf: _rows(min_bars_for_day_tf(tf) + 10) for tf in DAY_ACTIVE_TIMEFRAMES}
+    prior = {tf: _rows(min_bars_for_day_tf(tf) + 10, tf) for tf in DAY_ACTIVE_TIMEFRAMES}
     prior["4h"] = stale_4h
     prior_ts = dict.fromkeys(DAY_ACTIVE_TIMEFRAMES, now - 60.0)
     fetched = {"4h": 0}

@@ -45,12 +45,19 @@ if sys.platform == "win32":
 import asyncio
 import logging
 import sys
+import time
 
 # ONE sink: stdout only (caller redirects stdout/stderr to /tmp/mystic_portfolio.log)
 # Remove any FileHandler for that path to avoid duplicate writes
 TARGET_LOG = "/tmp/mystic_portfolio.log"
 FMT = "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s"
-DFMT = "%H:%M:%S"
+DFMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _utc_formatter() -> logging.Formatter:
+    fmt = logging.Formatter(FMT, datefmt=DFMT)
+    fmt.converter = time.gmtime
+    return fmt
 
 
 def _remove_file_handler_for_target(log: logging.Logger, target: str) -> None:
@@ -100,7 +107,10 @@ for h in list(root.handlers):
         except Exception:
             pass
 if not root.handlers:
-    logging.basicConfig(level=logging.INFO, format=FMT, datefmt=DFMT, stream=sys.stdout)
+    _root_sh = logging.StreamHandler(sys.stdout)
+    _root_sh.setFormatter(_utc_formatter())
+    root.addHandler(_root_sh)
+    root.setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +125,7 @@ for h in list(_int_log.handlers):
     except Exception:
         pass
 _sh = logging.StreamHandler(sys.stdout)
-_sh.setFormatter(logging.Formatter(FMT, datefmt=DFMT))
+_sh.setFormatter(_utc_formatter())
 _sh.setLevel(logging.INFO)
 _int_log.addHandler(_sh)
 # Collapse duplicate stream handlers created by imported modules.

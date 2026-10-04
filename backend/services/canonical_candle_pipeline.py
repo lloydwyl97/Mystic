@@ -72,6 +72,18 @@ BINANCE_KLINES = "https://api.binance.us/api/v3/klines"
 WRITER_ROLE = "canonical_candle_pipeline"
 FetchFn = Callable[..., Awaitable[list[list[Any]]]]
 
+# The retained 1m history only spans ~60 days, so 1m aggregation alone can never
+# give DAY its required 60 daily / 24 weekly bars. These streams are backfilled
+# from exchange-native klines to the DAY bundle depth instead.
+HTF_HISTORY_INTERVALS: tuple[str, ...] = ("1d", "1w")
+HTF_DEPTH_RETRY_SEC = 6 * 3600
+
+
+def htf_history_depth(interval: str) -> int:
+    from backend.config.day_active_timeframes import fetch_limit_for_day_tf, min_bars_for_day_tf
+
+    return max(min_bars_for_day_tf(interval), fetch_limit_for_day_tf(interval))
+
 
 class CanonicalCandlePipeline:
     def __init__(self) -> None:
@@ -85,6 +97,7 @@ class CanonicalCandlePipeline:
         self._fetch_fn: FetchFn | None = None
         self._cached_start_ms: int | None = None
         self._hydrate_done = False
+        self._htf_depth_attempt: dict[str, float] = {}
 
     def set_fetch_fn(self, fn: FetchFn | None) -> None:
         self._fetch_fn = fn
@@ -260,6 +273,45 @@ class CanonicalCandlePipeline:
         after = continuity_report(symbol, interval, start_ms=start_ms, end_completed_ms=end_ms) if missing else report
         return {"before": report, "after": after, "repaired_fetched": repaired, "start_ms": int(start_ms), "end_ms": end_ms}
 
+    async def ensure_htf_history_depth(self, symbols: list[str] | None = None, *, force: bool = False) -> list[dict[str, Any]]:
+        """Backfill 1d/1w completed bars to DAY bundle depth when the store is short.
+
+        A short stream is retried at most every ``HTF_DEPTH_RETRY_SEC`` so a symbol
+        the exchange cannot serve that deep does not refetch every loop.
+        """
+        results: list[dict[str, Any]] = []
+        for symbol in symbols or list(CANONICAL_SYMBOLS):
+            for interval in HTF_HISTORY_INTERVALS:
+                key = self._stream_key(symbol, interval)
+                target = htf_history_depth(interval)
+                end_ms = self._completed_open_ms(interval)
+                start_ms = align_open_ms(end_ms - (target - 1) * interval_ms(interval), interval)
+                have = len(load_aligned_candles(symbol, interval, start_ms=start_ms, end_ms=end_ms))
+                row: dict[str, Any] = {"symbol": api_symbol(symbol), "interval": interval, "target": target, "before": have}
+                if have >= target:
+                    row["action"] = "ok"
+                    results.append(row)
+                    continue
+                if not force and time.time() - self._htf_depth_attempt.get(key, 0.0) < HTF_DEPTH_RETRY_SEC:
+                    row["action"] = "retry_later"
+                    results.append(row)
+                    continue
+                self._htf_depth_attempt[key] = time.time()
+                fill = await self.backfill_range(symbol, interval, start_ms, end_ms + interval_ms(interval) - 1)
+                after = len(load_aligned_candles(symbol, interval, start_ms=start_ms, end_ms=end_ms))
+                row.update({"action": "backfilled", "fetched": fill.get("fetched"), "pages": fill.get("pages"), "after": after})
+                logger.info(
+                    "CANONICAL_HTF_DEPTH_BACKFILL symbol=%s interval=%s before=%s after=%s target=%s pages=%s",
+                    row["symbol"],
+                    interval,
+                    have,
+                    after,
+                    target,
+                    fill.get("pages"),
+                )
+                results.append(row)
+        return results
+
     def canonical_start_ms(self) -> int:
         if self._cached_start_ms is not None:
             return int(self._cached_start_ms)
@@ -321,6 +373,10 @@ class CanonicalCandlePipeline:
                     await self.publish_redis(symbol, interval, aggregated[-200:], None)
                 out["streams"].append({"symbol": symbol, "interval": interval, "aggregated": len(aggregated)})
                 await asyncio.sleep(0.05)
+        try:
+            out["htf_depth"] = await self.ensure_htf_history_depth(symbols, force=True)
+        except Exception as exc:
+            logger.warning("canonical HTF depth backfill failed: %s", exc)
         # Full-history integrity is operator-triggered. Running it inside
         # startup saturates SQLite and blocks the live API.
         self._hydrate_done = True
@@ -447,6 +503,12 @@ class CanonicalCandlePipeline:
             if not self._hydrate_done:
                 await asyncio.sleep(5)
                 continue
+            try:
+                await self.ensure_htf_history_depth()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("canonical HTF depth backfill failed: %s", exc)
             try:
                 for symbol in CANONICAL_SYMBOLS:
                     for interval in CANONICAL_CANDLE_INTERVALS:

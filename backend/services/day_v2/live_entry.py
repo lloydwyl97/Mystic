@@ -28,6 +28,12 @@ DAY_LIVE_ENTRY_PATH: str = "direct"
 DAY_V2_MAX_NOTIONAL_USD: float = float(_os.environ.get("DAY_V2_MAX_NOTIONAL_USD", "0"))
 
 
+def day_v2_submit_reject_reason(engine: Any) -> str:
+    """Reason label for a DAY V2 submit that returned no fill (telemetry only)."""
+    failure = str(getattr(engine, "last_buy_failure_reason", "") or "")
+    return failure or str(getattr(engine, "last_buy_reject_reason", "") or "") or "UNSPECIFIED"
+
+
 async def submit_day_v2_direct_entry(
     engine: Any,
     *,
@@ -56,6 +62,7 @@ async def submit_day_v2_direct_entry(
     """
     if not DAY_V2_ENABLED:
         raise RuntimeError("DAY_V2_ENABLED is False — live entry disabled")
+    engine.last_buy_failure_reason = ""
 
     import uuid as _uuid
 
@@ -183,7 +190,7 @@ async def submit_day_v2_direct_entry(
             "DAY_V2_DIRECT_SUBMIT_REJECTED symbol=%s setup=%s reject=%s",
             symbol,
             signal.setup,
-            str(getattr(engine, "last_buy_reject_reason", "") or "UNSPECIFIED"),
+            day_v2_submit_reject_reason(engine),
         )
         return None
 

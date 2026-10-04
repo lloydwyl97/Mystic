@@ -9963,6 +9963,9 @@ class PortfolioEngine:
         """
         from backend.config.day_entry_execution import TOP4_LIVE_BUY_AUTHORITIES
 
+        # Telemetry only: last_buy_reject_reason drives trailing-buy retry policy, so
+        # execution failures that never set it are labelled here instead.
+        self.last_buy_failure_reason = ""
         _auth = str(entry_authority or "")
         if _to_api_symbol(symbol) in DAY_TRADE_SYMBOLS and _auth not in TOP4_LIVE_BUY_AUTHORITIES:
             logger.error(
@@ -11725,6 +11728,7 @@ class PortfolioEngine:
 
                 if not live_order_buy:
                     error_msg = "PROTECTED_LIMIT_BUY_NOT_FILLED"
+                    self.last_buy_failure_reason = error_msg
                     logger.error("LIVE_BUY_FAILED: %s - %s", exchange_symbol, error_msg)
                     await self._record_reject(
                         symbol,
@@ -11750,6 +11754,7 @@ class PortfolioEngine:
                 avg_price = live_order_buy.get("average")
                 if not filled_qty or float(filled_qty) <= 0:
                     error_msg = "PROTECTED_LIMIT_BUY_NOT_FILLED"
+                    self.last_buy_failure_reason = error_msg
                     logger.error("LIVE_BUY_FAILED: %s - %s", exchange_symbol, error_msg)
                     await self._record_reject(
                         symbol,

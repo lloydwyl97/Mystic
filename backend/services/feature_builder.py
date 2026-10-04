@@ -249,6 +249,21 @@ def _true_range(hi: np.ndarray, lo: np.ndarray, cl: np.ndarray) -> np.ndarray:
     return np.maximum(hi[1:] - lo[1:], np.maximum(np.abs(hi[1:] - cl[:-1]), np.abs(lo[1:] - cl[:-1])))
 
 
+def daily_calendar_changes(ohlcv_1d: list[list] | None) -> dict[str, float]:
+    """change_24h / change_7d / change_30d from native daily closes (only keys with enough bars)."""
+    out: dict[str, float] = {}
+    if not ohlcv_1d or len(ohlcv_1d) < 2:
+        return out
+    dcl = np.asarray([float(c[4]) for c in ohlcv_1d], dtype=float)
+    if dcl.size >= 2 and float(dcl[-2]) != 0.0:
+        out["change_24h"] = float((dcl[-1] - dcl[-2]) / dcl[-2])
+    if dcl.size >= 8 and float(dcl[-8]) != 0.0:
+        out["change_7d"] = float((dcl[-1] - dcl[-8]) / dcl[-8])
+    if dcl.size >= 31 and float(dcl[-31]) != 0.0:
+        out["change_30d"] = float((dcl[-1] - dcl[-31]) / dcl[-31])
+    return out
+
+
 def build_feature_dict_from_ohlcv(
     *,
     symbol_ccxt: str,
@@ -307,14 +322,7 @@ def build_feature_dict_from_ohlcv(
     out["change_30d"] = _chg(43200)
 
     # True calendar horizons from native 1d series (overrides 1m-based zeros when 1m depth is < horizon).
-    if ohlcv_1d and len(ohlcv_1d) >= 2:
-        dcl = np.asarray([float(c[4]) for c in ohlcv_1d], dtype=float)
-        if dcl.size >= 2 and float(dcl[-2]) != 0.0:
-            out["change_24h"] = float((dcl[-1] - dcl[-2]) / dcl[-2])
-        if dcl.size >= 8 and float(dcl[-8]) != 0.0:
-            out["change_7d"] = float((dcl[-1] - dcl[-8]) / dcl[-8])
-        if dcl.size >= 31 and float(dcl[-31]) != 0.0:
-            out["change_30d"] = float((dcl[-1] - dcl[-31]) / dcl[-31])
+    out.update(daily_calendar_changes(ohlcv_1d))
 
     pr_n = min(14, int(cl.size))
     if pr_n >= 1:

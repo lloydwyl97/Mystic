@@ -24,13 +24,17 @@ _socket.getaddrinfo = _ipv4_only_getaddrinfo
 import asyncio
 import logging
 import sys
+import time
 
 if not logging.getLogger().handlers:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
-        datefmt="%H:%M:%S",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
     )
+    for _h in logging.getLogger().handlers:
+        if _h.formatter is not None:
+            _h.formatter.converter = time.gmtime
 logger = logging.getLogger(__name__)
 
 # Ensure backend is on path when run from mystic/

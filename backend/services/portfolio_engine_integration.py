@@ -1975,7 +1975,9 @@ class PortfolioEngineIntegration:
                 int(signal.signal_bar_ts or 0),
             )
         else:
-            _reject = str(getattr(self.engine, "last_buy_reject_reason", "") or "UNSPECIFIED")
+            from backend.services.day_v2.live_entry import day_v2_submit_reject_reason
+
+            _reject = day_v2_submit_reject_reason(self.engine)
             release_claim(
                 db_path,
                 reservation_id=reservation_id,

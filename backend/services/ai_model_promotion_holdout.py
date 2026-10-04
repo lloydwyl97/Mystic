@@ -11,6 +11,7 @@ import json
 import os
 import pickle
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +73,49 @@ def _outcome_label(row: sqlite3.Row) -> int:
     return y_label
 
 
+def _parse_utc(raw: Any) -> datetime | None:
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00").replace(" ", "T", 1))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def incumbent_seen_cutoff(active_path: Path | None) -> dict[str, Any]:
+    """Outcome rows the incumbent could see when it was trained or selected.
+
+    An incumbent scored on rows it was trained on, or promoted for scoring well
+    on, carries a home-field advantage over a candidate that never saw them.
+    """
+    art = _load_artifact(active_path) if active_path is not None else None
+    if art is None:
+        return {}
+    window = art.get("holdout_window") if isinstance(art.get("holdout_window"), dict) else {}
+    ids = [v for v in (art.get("train_outcome_max_id"), window.get("max_id")) if v not in (None, "")]
+    trained_at = _parse_utc(art.get("trained_at"))
+    out: dict[str, Any] = {}
+    if ids:
+        out["seen_max_id"] = max(int(v) for v in ids)
+    if trained_at is not None:
+        out["trained_at"] = trained_at.isoformat()
+    return out
+
+
+def _row_unseen_by_incumbent(row: sqlite3.Row, cutoff: dict[str, Any]) -> bool:
+    seen_max_id = cutoff.get("seen_max_id")
+    if seen_max_id is not None and int(row["id"]) <= int(seen_max_id):
+        return False
+    trained_at = _parse_utc(cutoff.get("trained_at"))
+    if trained_at is not None:
+        closed = _parse_utc(row["closed_at_utc"])
+        if closed is None or closed <= trained_at:
+            return False
+    return True
+
+
 def _holdout_split(
     sid: str,
     bus: str,
@@ -80,8 +124,10 @@ def _holdout_split(
     feature_dim: int,
     db_path: str,
     holdout_fraction: float,
+    seen_cutoff: dict[str, Any] | None = None,
 ) -> tuple[list[sqlite3.Row], int]:
-    """(holdout rows, total eligible). Holdout = chronologically last eligible rows."""
+    """(holdout rows, total eligible). Holdout = chronologically last eligible rows
+    that closed after everything the incumbent saw (``seen_cutoff``)."""
     ensure_ai_canonical_tables(db_path)
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -99,6 +145,8 @@ def _holdout_split(
             (sid, ccxt, bus),
         ).fetchall()
     eligible = [row for row in rows if _row_passes_filters(row, symbol_bus=bus, min_fv=feature_version, min_dim=feature_dim)]
+    if seen_cutoff:
+        eligible = [row for row in eligible if _row_unseen_by_incumbent(row, seen_cutoff)]
     total_eligible = len(eligible)
     if total_eligible == 0:
         return [], 0
@@ -119,15 +167,17 @@ def holdout_window(
     feature_dim: int = FEATURE_DIM_V2,
     db_path: str = DATABASE_PATH,
     holdout_fraction: float = HOLDOUT_FRACTION,
+    active_path: Path | None = None,
 ) -> dict[str, Any]:
     """Row ids and time range of the promotion holdout. Training must exclude ``ids``."""
     sid = (strategy_id or "day").strip().lower()
     bus, ccxt = _symbol_forms(symbol_bus)
     if bus not in TRADING_SYMBOLS:
         return {"ids": [], "n": 0}
-    rows, _total = _holdout_split(sid, bus, ccxt, feature_version, feature_dim, db_path, holdout_fraction)
+    cutoff = incumbent_seen_cutoff(active_path)
+    rows, _total = _holdout_split(sid, bus, ccxt, feature_version, feature_dim, db_path, holdout_fraction, cutoff)
     if len(rows) < MIN_HOLDOUT_SAMPLES:
-        return {"ids": [], "n": 0}
+        return {"ids": [], "n": 0, "incumbent_seen_cutoff": cutoff, "forward_rows": len(rows)}
     ids = [int(r["id"]) for r in rows]
     return {
         "ids": ids,
@@ -136,6 +186,7 @@ def holdout_window(
         "max_id": max(ids),
         "first_closed_at": str(rows[0]["closed_at_utc"] or ""),
         "last_closed_at": str(rows[-1]["closed_at_utc"] or ""),
+        "incumbent_seen_cutoff": cutoff,
     }
 
 
@@ -147,10 +198,12 @@ def load_symbol_holdout_rows(
     feature_dim: int = FEATURE_DIM_V2,
     db_path: str = DATABASE_PATH,
     holdout_fraction: float = HOLDOUT_FRACTION,
+    active_path: Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
     """
     Return holdout X, y, net_pnl, good_bad flags, and total eligible count.
-    Holdout = chronologically last ``holdout_fraction`` of eligible outcome rows.
+    Holdout = chronologically last ``holdout_fraction`` of eligible outcome rows
+    the incumbent at ``active_path`` never saw.
     """
     sid = (strategy_id or "day").strip().lower()
     bus, ccxt = _symbol_forms(symbol_bus)
@@ -164,7 +217,7 @@ def load_symbol_holdout_rows(
     if bus not in TRADING_SYMBOLS:
         return empty
 
-    holdout_rows, total_eligible = _holdout_split(sid, bus, ccxt, feature_version, feature_dim, db_path, holdout_fraction)
+    holdout_rows, total_eligible = _holdout_split(sid, bus, ccxt, feature_version, feature_dim, db_path, holdout_fraction, incumbent_seen_cutoff(active_path))
     if total_eligible == 0:
         return empty
     if len(holdout_rows) < MIN_HOLDOUT_SAMPLES:
@@ -396,6 +449,7 @@ def build_holdout_validation_metrics(
         feature_version=feature_version,
         feature_dim=feature_dim,
         db_path=db_path,
+        active_path=active_path,
     )
     holdout_count = len(y)
     holdout_low_confidence = holdout_count < MIN_HOLDOUT_CONFIDENCE_SAMPLES
@@ -415,7 +469,7 @@ def build_holdout_validation_metrics(
         "active_holdout": {},
         "candidate_holdout": {},
     }
-    window = holdout_window(strategy_id=sid, symbol_bus=bus, feature_version=feature_version, feature_dim=feature_dim, db_path=db_path)
+    window = holdout_window(strategy_id=sid, symbol_bus=bus, feature_version=feature_version, feature_dim=feature_dim, db_path=db_path, active_path=active_path)
     base["holdout_window"] = {k: v for k, v in window.items() if k != "ids"}
     if rf_val_samples is not None:
         base["rf_val_samples"] = int(rf_val_samples)
@@ -508,5 +562,6 @@ __all__ = [
     "TARGET_HOLDOUT_SAMPLES",
     "build_holdout_validation_metrics",
     "evaluate_artifact_on_holdout",
+    "incumbent_seen_cutoff",
     "load_symbol_holdout_rows",
 ]

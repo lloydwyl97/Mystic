@@ -58,6 +58,88 @@ def _tf_refresh_interval_sec(tf: str) -> float:
     return _TF_REFRESH_TIER_SEC.get(tf, DAY_BUNDLE_CACHE_TTL_SEC)
 
 
+# Higher timeframes whose rows carry an explicit data-age contract. A row set is
+# only as current as min(fetch time, newest bar close): a bar that was still
+# forming when fetched is frozen at the fetch moment, not at its close.
+HTF_AGE_CONTROLLED: tuple[str, ...] = ("4h", "8h", "12h", "1d", "1w")
+_HTF_MAX_DATA_AGE_SEC: dict[str, float] = {
+    "4h": 6 * 3600.0,
+    "8h": 12 * 3600.0,
+    "12h": 18 * 3600.0,
+    "1d": 36 * 3600.0,
+    "1w": 8 * 86400.0,
+}
+HTF_STATE_FRESH = "fresh"
+HTF_STATE_REUSED = "reused"
+HTF_STATE_STALE = "stale"
+HTF_STATE_INSUFFICIENT = "insufficient"
+
+
+def htf_max_data_age_sec(tf: str) -> float:
+    raw = os.getenv(f"DAY_HTF_MAX_DATA_AGE_SEC_{tf.upper()}", "").strip()
+    if raw:
+        try:
+            return max(60.0, float(raw))
+        except ValueError:
+            pass
+    return _HTF_MAX_DATA_AGE_SEC.get(tf, float("inf"))
+
+
+def htf_rows_data_as_of(tf: str, rows: list[list] | None, fetched_at: float) -> tuple[float | None, int | None]:
+    """(data_as_of_epoch, newest_bar_open_ms) for a TF row set fetched at ``fetched_at``."""
+    from backend.config.canonical_candle_intervals import interval_ms
+
+    if not isinstance(rows, list) or not rows:
+        return None, None
+    last = rows[-1]
+    if not isinstance(last, (list, tuple)) or not last:
+        return None, None
+    try:
+        open_ms = int(float(last[0]))
+    except (TypeError, ValueError):
+        return None, None
+    close_sec = (open_ms + interval_ms(tf)) / 1000.0
+    return min(float(fetched_at), close_sec), open_ms
+
+
+def htf_tf_meta(tf: str, rows: list[list] | None, fetched_at: float, *, source: str, state: str, now: float) -> dict[str, Any]:
+    as_of, open_ms = htf_rows_data_as_of(tf, rows, fetched_at)
+    return {
+        "timeframe": tf,
+        "bars": len(rows) if isinstance(rows, list) else 0,
+        "last_bar_open_ms": open_ms,
+        "data_as_of": as_of,
+        "data_age_sec": None if as_of is None else round(max(0.0, now - as_of), 1),
+        "cache_age_sec": round(max(0.0, now - float(fetched_at)), 1) if fetched_at else None,
+        "max_data_age_sec": htf_max_data_age_sec(tf),
+        "source": source,
+        "state": state,
+    }
+
+
+def completed_rows_asof(tf: str, rows: list[list], end_ms: int) -> list[list]:
+    """Bars fully closed by ``end_ms`` (inclusive). Exchange ``endTime`` returns the bar
+    containing ``end_ms`` with its final OHLC, which would leak future prices."""
+    from backend.config.canonical_candle_intervals import interval_ms
+
+    width = interval_ms(tf)
+    out: list[list] = []
+    for r in rows:
+        try:
+            if int(float(r[0])) + width <= int(end_ms) + 1:
+                out.append(r)
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def htf_rows_within_age(tf: str, rows: list[list] | None, fetched_at: float, now: float) -> bool:
+    if tf not in HTF_AGE_CONTROLLED:
+        return True
+    as_of, _ = htf_rows_data_as_of(tf, rows, fetched_at)
+    return as_of is not None and (now - as_of) <= htf_max_data_age_sec(tf)
+
+
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
         v = float(x)
@@ -120,8 +202,8 @@ def _bundle_cache_usable(bundle: dict[str, list[list]], fetched_at: float) -> bo
 
 async def _read_bundle_cache_full(
     ccxt_symbol: str,
-) -> tuple[dict[str, list[list]], dict[str, float], float] | None:
-    """Internal: returns (bundle, tf_fetched_at, fetched_at) or None.
+) -> tuple[dict[str, list[list]], dict[str, float], float, dict[str, dict[str, Any]]] | None:
+    """Internal: returns (bundle, tf_fetched_at, fetched_at, tf_meta) or None.
 
     Used by the fetch path to determine which timeframes are still within
     their own refresh tier and can be reused without hitting Binance again.
@@ -146,7 +228,9 @@ async def _read_bundle_cache_full(
             bundle["_month_vec"] = list(bundle_raw["_month_vec"])
         tf_fetched_at_raw = payload.get("tf_fetched_at") or {}
         tf_fetched_at = {tf: float(tf_fetched_at_raw.get(tf, fetched_at)) for tf in DAY_ACTIVE_TIMEFRAMES}
-        return bundle, tf_fetched_at, fetched_at
+        tf_meta_raw = payload.get("tf_meta")
+        tf_meta = {str(k): dict(v) for k, v in tf_meta_raw.items() if isinstance(v, dict)} if isinstance(tf_meta_raw, dict) else {}
+        return bundle, tf_fetched_at, fetched_at, tf_meta
     except Exception as exc:
         logger.debug("DAY_BUNDLE_CACHE_READ_FAIL %s: %s", ccxt_symbol, exc)
         return None
@@ -156,7 +240,7 @@ async def _read_bundle_cache(ccxt_symbol: str) -> dict[str, list[list]] | None:
     full = await _read_bundle_cache_full(ccxt_symbol)
     if full is None:
         return None
-    bundle, _tf_fetched_at, fetched_at = full
+    bundle, _tf_fetched_at, fetched_at, _tf_meta = full
     validate_day_active_bundle(bundle)
     if not _bundle_cache_usable(bundle, fetched_at):
         return None
@@ -169,6 +253,7 @@ async def _write_bundle_cache(
     bundle: dict[str, list[list]],
     *,
     tf_fetched_at: dict[str, float] | None = None,
+    tf_meta: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     try:
         from backend.config.redis_config import get_shared_redis_async
@@ -185,6 +270,7 @@ async def _write_bundle_cache(
                 "ccxt_symbol": _normalize_ccxt_symbol(ccxt_symbol),
                 "bundle": serializable,
                 "tf_fetched_at": tf_ts,
+                "tf_meta": tf_meta or {},
             }
         )
         r = await get_shared_redis_async()
@@ -313,6 +399,8 @@ async def _fetch_day_active_ohlcv_bundle_raw(
     *,
     prior_bundle: dict[str, list[list]] | None = None,
     prior_tf_fetched_at: dict[str, float] | None = None,
+    prior_tf_meta: dict[str, dict[str, Any]] | None = None,
+    tf_meta_out: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, list[list]], dict[str, float]]:
     """Pull DAY_ACTIVE_TF from the live service (exchange-native only).
 
@@ -321,18 +409,29 @@ async def _fetch_day_active_ohlcv_bundle_raw(
     being refetched — slower TFs cannot change faster than their own
     candle-close cadence, so this eliminates redundant Binance calls with no
     freshness loss. Returns (bundle, tf_fetched_at) for the caller to persist.
+
+    ``HTF_AGE_CONTROLLED`` timeframes older than ``htf_max_data_age_sec`` are
+    never served: a stale fetch or prior copy leaves that TF empty so the
+    bundle fails its contract instead of presenting old bars as current.
+    Per-TF state lands in ``tf_meta_out`` when provided.
     """
     sym = _normalize_ccxt_symbol(ccxt_symbol)
     out: dict[str, list[list]] = {}
     tf_fetched_at: dict[str, float] = {}
+    meta: dict[str, dict[str, Any]] = tf_meta_out if tf_meta_out is not None else {}
     now = time.time()
     critical_tfs = {"1m", "5m", "15m"}
     prior_bundle = prior_bundle or {}
     prior_tf_fetched_at = prior_tf_fetched_at or {}
+    prior_tf_meta = prior_tf_meta or {}
+    with_meta = getattr(svc, "get_ohlcv_with_meta", None)
+    with_meta = with_meta if asyncio.iscoroutinefunction(with_meta) else None
     for tf in DAY_ACTIVE_TIMEFRAMES:
         prior_rows = prior_bundle.get(tf)
         prior_ts = prior_tf_fetched_at.get(tf, 0.0)
-        still_fresh = isinstance(prior_rows, list) and len(prior_rows) >= min_bars_for_day_tf(tf) and (now - prior_ts) < _tf_refresh_interval_sec(tf)
+        prior_source = str((prior_tf_meta.get(tf) or {}).get("source") or "cache")
+        prior_in_age = htf_rows_within_age(tf, prior_rows, prior_ts, now)
+        still_fresh = isinstance(prior_rows, list) and len(prior_rows) >= min_bars_for_day_tf(tf) and (now - prior_ts) < _tf_refresh_interval_sec(tf) and prior_in_age
         if still_fresh and tf == "4h":
             from backend.services.day_trade_thesis import fourh_requires_boundary_refresh
 
@@ -341,12 +440,19 @@ async def _fetch_day_active_ohlcv_bundle_raw(
         if still_fresh:
             out[tf] = prior_rows
             tf_fetched_at[tf] = prior_ts
+            meta[tf] = htf_tf_meta(tf, prior_rows, prior_ts, source=prior_source, state=HTF_STATE_FRESH, now=now)
             continue
         lim = fetch_limit_for_day_tf(tf)
         rows: list[list] = []
+        source = "live_service"
         for attempt in range(2):
             try:
-                raw = await svc.get_ohlcv(sym, tf, lim)
+                if with_meta is not None:
+                    fetched = await with_meta(sym, tf, lim)
+                    raw = fetched.get("rows") if isinstance(fetched, dict) else None
+                    source = str((fetched or {}).get("endpoint") or source)
+                else:
+                    raw = await svc.get_ohlcv(sym, tf, lim)
                 rows = list(raw) if isinstance(raw, list) else []
             except Exception as e:
                 logger.debug("DAY_BUNDLE_TF_FAIL %s %s %s attempt=%s", sym, tf, e, attempt + 1)
@@ -357,10 +463,15 @@ async def _fetch_day_active_ohlcv_bundle_raw(
         need = min_bars_for_day_tf(tf)
         fetched_n = len(rows) if isinstance(rows, list) else 0
         prior_n = len(prior_rows) if isinstance(prior_rows, list) else 0
-        # A failed/empty live fetch is not proof the market has no bars.
-        # Keep a complete prior TF so a rate-limit or 451 cannot flap the
-        # DAY active contract while Redis/context already hold those TFs.
-        if fetched_n < need and prior_n >= need:
+        fetched_in_age = htf_rows_within_age(tf, rows, now, now)
+        if fetched_n >= need and fetched_in_age:
+            out[tf] = rows
+            tf_fetched_at[tf] = now
+            meta[tf] = htf_tf_meta(tf, rows, now, source=source, state=HTF_STATE_FRESH, now=now)
+        elif prior_n >= need and prior_in_age:
+            # A failed/short live fetch is not proof the market has no bars.
+            # Keep a complete prior TF, bounded by its data age, so a rate-limit
+            # or 451 cannot flap the DAY active contract.
             logger.warning(
                 "DAY_BUNDLE_TF_EMPTY_REUSE_PRIOR %s %s fetched=%s need=%s prior=%s",
                 sym,
@@ -370,10 +481,30 @@ async def _fetch_day_active_ohlcv_bundle_raw(
                 prior_n,
             )
             out[tf] = prior_rows
-            tf_fetched_at[tf] = prior_ts or now
+            tf_fetched_at[tf] = prior_ts
+            meta[tf] = htf_tf_meta(tf, prior_rows, prior_ts, source=prior_source, state=HTF_STATE_REUSED, now=now)
+        elif tf in HTF_AGE_CONTROLLED and max(fetched_n, prior_n) >= need:
+            stale_rows, stale_ts, stale_src = (rows, now, source) if fetched_n >= need else (prior_rows, prior_ts, prior_source)
+            stale_meta = htf_tf_meta(tf, stale_rows, stale_ts, source=stale_src, state=HTF_STATE_STALE, now=now)
+            logger.warning(
+                "DAY_BUNDLE_TF_STALE %s %s data_age_sec=%s max_sec=%s source=%s fetched=%s prior=%s need=%s",
+                sym,
+                tf,
+                stale_meta["data_age_sec"],
+                stale_meta["max_data_age_sec"],
+                stale_src,
+                fetched_n,
+                prior_n,
+                need,
+            )
+            out[tf] = []
+            tf_fetched_at[tf] = now
+            stale_meta["bars"] = 0
+            meta[tf] = stale_meta
         else:
             out[tf] = rows
             tf_fetched_at[tf] = now
+            meta[tf] = htf_tf_meta(tf, rows, now, source=source, state=HTF_STATE_INSUFFICIENT if fetched_n < need else HTF_STATE_FRESH, now=now)
     # 3m is canonical chart/store data attached for consumers; not a DAY vector dim.
     try:
         rows_3m = await svc.get_ohlcv(sym, "3m", 300)
@@ -417,18 +548,51 @@ async def async_fetch_day_active_ohlcv_bundle(
         prior_full = await _read_bundle_cache_full(sym)
         prior_bundle = prior_full[0] if prior_full else None
         prior_tf_fetched_at = prior_full[1] if prior_full else None
+        prior_tf_meta = prior_full[3] if prior_full else None
 
         logger.debug("DAY_BUNDLE_FETCH %s force=%s", sym, force_refresh)
+        tf_meta: dict[str, dict[str, Any]] = {}
         bundle, tf_fetched_at = await _fetch_day_active_ohlcv_bundle_raw(
             svc,
             sym,
             prior_bundle=prior_bundle,
             prior_tf_fetched_at=prior_tf_fetched_at,
+            prior_tf_meta=prior_tf_meta,
+            tf_meta_out=tf_meta,
         )
         ok, _ = validate_day_active_bundle(dict(bundle))
         if ok or len(bundle.get("1m") or []) >= 30:
-            await _write_bundle_cache(sym, bundle, tf_fetched_at=tf_fetched_at)
+            await _write_bundle_cache(sym, bundle, tf_fetched_at=tf_fetched_at, tf_meta=tf_meta)
         return bundle
+
+
+def read_day_bundle_htf_state_sync(ccxt_symbol: str) -> dict[str, dict[str, Any]]:
+    """Persisted per-TF state (timeframe, last bar, cache/data age, source, state)
+    for the HTF age-controlled timeframes, with ages recomputed at read time."""
+    try:
+        from backend.config.redis_config import get_shared_redis_sync
+
+        r = get_shared_redis_sync()
+        raw = r.get(_bundle_cache_key(ccxt_symbol)) if r else None
+        if not raw:
+            return {}
+        payload = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+    except Exception as exc:
+        logger.debug("DAY_BUNDLE_HTF_STATE_READ_FAIL %s: %s", ccxt_symbol, exc)
+        return {}
+    now = time.time()
+    out: dict[str, dict[str, Any]] = {}
+    for tf, m in (payload.get("tf_meta") or {}).items():
+        if tf not in HTF_AGE_CONTROLLED or not isinstance(m, dict):
+            continue
+        row = dict(m)
+        as_of = row.get("data_as_of")
+        if isinstance(as_of, (int, float)):
+            row["data_age_sec"] = round(max(0.0, now - float(as_of)), 1)
+            if row.get("state") != HTF_STATE_STALE and now - float(as_of) > htf_max_data_age_sec(tf):
+                row["state"] = HTF_STATE_STALE
+        out[tf] = row
+    return out
 
 
 async def async_fetch_day_active_ohlcv_bundle_asof(svc: Any, ccxt_symbol: str, end_time_ms: int) -> dict[str, list[list]]:
@@ -445,7 +609,7 @@ async def async_fetch_day_active_ohlcv_bundle_asof(svc: Any, ccxt_symbol: str, e
         try:
             lim = fetch_limit_for_day_tf(tf)
             raw = await svc.get_ohlcv(sym, tf, lim, end_time_ms=end_ms)
-            return tf, list(raw) if isinstance(raw, list) else []
+            return tf, completed_rows_asof(tf, list(raw) if isinstance(raw, list) else [], end_ms)
         except Exception as e:
             logger.debug("DAY_BUNDLE_ASOF_TF_FAIL %s %s et=%s %s", sym, tf, end_ms, e)
             return tf, []
@@ -459,7 +623,10 @@ __all__ = [
     "async_fetch_day_active_ohlcv_bundle",
     "async_fetch_day_active_ohlcv_bundle_asof",
     "async_read_cached_day_active_bundle",
+    "htf_max_data_age_sec",
+    "htf_rows_within_age",
     "month_context_four_from_daily",
     "read_cached_day_active_bundle_sync",
+    "read_day_bundle_htf_state_sync",
     "validate_day_active_bundle",
 ]
