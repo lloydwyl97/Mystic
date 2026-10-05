@@ -1216,6 +1216,11 @@ def maintenance_status_summary(cfg: MaintConfig | None = None) -> dict[str, Any]
     disk = s.get("disk_after") or s.get("disk_before") or {}
     backup = s.get("backup_retention") or {}
     reboot = s.get("reboot") or {}
+    verified_utc = backup.get("newest_verified_utc")
+    newest = newest_verified(list_backups(cfg.backup_dir))
+    catalog_utc = newest.manifest.get("verified_utc") if newest else None
+    if catalog_utc and (not verified_utc or str(catalog_utc) > str(verified_utc)):
+        verified_utc = catalog_utc
     return {
         "last_maintenance_utc": s.get("finished_utc"),
         "dry_run": s.get("dry_run"),
@@ -1224,7 +1229,7 @@ def maintenance_status_summary(cfg: MaintConfig | None = None) -> dict[str, Any]
         "free_gb": disk.get("fs_free_gb"),
         "live_db_gb": round((disk.get("live_db_bytes") or 0) / GIB, 3) if disk else None,
         "backup_gb": round((disk.get("backup_bytes") or 0) / GIB, 3) if disk else None,
-        "last_backup_verified_utc": backup.get("newest_verified_utc"),
+        "last_backup_verified_utc": verified_utc,
         "last_retention_run_utc": s.get("finished_utc") if backup else None,
         "bytes_reclaimed": s.get("bytes_reclaimed"),
         "reboot_required": reboot.get("reboot_required"),
@@ -1313,6 +1318,11 @@ def _finish(cfg: MaintConfig, report: dict[str, Any], *, dry_run: bool) -> dict[
     prev = read_status(cfg)
     if "post_reboot_verify" in prev and "post_reboot_verify" not in report:
         report["post_reboot_verify"] = prev["post_reboot_verify"]
+    # A deploy-lock skip returns before retention runs. Replacing the status
+    # file with that partial report cleared newest_verified_utc (Ocean 2026-10-05
+    # 01:17) even though verified backups were still in the catalog.
+    if "backup_retention" not in report and prev.get("backup_retention"):
+        report["backup_retention"] = prev["backup_retention"]
     if not dry_run:
         _write_json_atomic(cfg.status_path, report, mode=0o644)
         _chown(cfg.status_path, cfg.owner)

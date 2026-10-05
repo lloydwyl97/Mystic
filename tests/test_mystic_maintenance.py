@@ -415,6 +415,32 @@ def test_deploy_lock_makes_run_measure_only(cfg):
     assert all(p.exists() for p in files)
 
 
+def test_deploy_lock_skip_keeps_the_verified_backup_stamp(cfg):
+    """Ocean 2026-10-05 01:17: a deploy-lock skip replaced the status and cleared last_backup_verified_utc."""
+    _live_db(cfg, rows=3)
+    first = m.run_maintenance(cfg, dry_run=False, allow_reboot=False, owner_task=_owner_task_direct(cfg))
+    stamped = first["backup_retention"]["newest_verified_utc"]
+    assert stamped
+    cfg.deploy_locks[1].write_text("deploy")
+    skipped = m.run_maintenance(cfg, dry_run=False, allow_reboot=False, owner_task=_owner_task_direct(cfg))
+    assert skipped["skipped"].startswith("deploy_lock_held")
+    assert skipped["backup_retention"]["newest_verified_utc"] == stamped
+    assert m.maintenance_status_summary(cfg)["last_backup_verified_utc"] == stamped
+
+
+def test_status_reads_a_newer_catalog_stamp_than_the_stored_report(cfg):
+    _write = {
+        "finished_utc": "2026-10-05T01:17:01Z",
+        "backup_retention": {"newest_verified_utc": "2026-10-04T20:29:27Z"},
+        "disk_after": {"mode": "normal", "fs_used_pct": 73.0, "fs_free_gb": 12.0, "live_db_bytes": 0, "backup_bytes": 0},
+    }
+    cfg.status_path.write_text(json.dumps(_write))
+    later = datetime(2026, 10, 5, 2, 40, tzinfo=timezone.utc)
+    _fake_backup(cfg, later)
+    summary = m.maintenance_status_summary(cfg)
+    assert summary["last_backup_verified_utc"] == m._iso(later)
+
+
 def test_open_orders_probe_loads_env_file_and_unknown_on_auth_failure(tmp_path, monkeypatch):
     import backend.services.live_readiness_service as lrs
 
