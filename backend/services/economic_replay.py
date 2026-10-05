@@ -282,6 +282,10 @@ class RepairedDayPolicy:
 
         return rank_day_candidates(rows, list(DAY_SYMBOLS), cost)
 
+    def allocates(self, adaptive: dict[str, Any]) -> bool:
+        """Same economic stop as live: non-positive learned net is not funded."""
+        return float(adaptive.get("expected_net") or 0.0) > 0.0
+
     def forward_horizon_min(self, adaptive: dict[str, Any]) -> float | None:
         return None
 
@@ -420,7 +424,8 @@ def simulate_day(
             adaptive = decisions[id(c)]
             label = day_lifecycle(c, adaptive, store, roundtrip_cost=roundtrip_cost, now=now)
             final = bool(label.get("final")) and label.get("net") is not None
-            filled = state == "QUALIFIED" and open_count < max_slots and final
+            admits = getattr(policy, "allocates", None)
+            filled = state == "QUALIFIED" and open_count < max_slots and final and (admits is None or admits(adaptive))
             size = float(adaptive.get("size_mult") or 1.0)
             records.append(
                 {

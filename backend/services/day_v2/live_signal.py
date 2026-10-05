@@ -348,11 +348,25 @@ def evaluate_entry_signal(
         return None
 
     setup_name, anchor, target, regime, h1_bullish = result
-    bar_ts = _signal_bar_ts(bars_15m[idx])
+    return _pack_signal(symbol, setup_name, regime, anchor, target, atr, int(_signal_bar_ts(bars_15m[idx])), h1_bullish, bars_15m, bars_1h, bars_4h)
+
+
+def _pack_signal(
+    symbol: str,
+    setup_name: str,
+    regime: str,
+    anchor: float,
+    target: float,
+    atr: float,
+    bar_ts: int,
+    h1_bullish: bool,
+    bars_15m: list[dict[str, Any]],
+    bars_1h: list[dict[str, Any]],
+    bars_4h: list[dict[str, Any]],
+) -> DayV2Signal:
     atr_1h = atr_from_bars(bars_1h)
     objective_struct = structural_objective(setup_name, bars_15m, bars_1h, bars_4h)
-    ref_price = float(bars_15m[idx]["close"])
-
+    ref_price = float(bars_15m[-1]["close"])
     return DayV2Signal(
         symbol=symbol,
         setup=setup_name,
@@ -360,13 +374,77 @@ def evaluate_entry_signal(
         structural_anchor=anchor,
         target_price=target,
         atr=atr,
-        signal_bar_ts=int(bar_ts),
+        signal_bar_ts=bar_ts,
         h1_bullish=h1_bullish,
         opportunity_id=_opportunity_id(symbol, setup_name, anchor),
         atr_1h=atr_1h,
         objective_structural=objective_struct,
         move_potential=move_potential(setup_name, ref_price, atr_1h, objective_struct),
     )
+
+
+def context_entry_signals(
+    symbol: str,
+    bars_15m: list[dict[str, Any]],
+    bars_1h: list[dict[str, Any]],
+    bars_4h: list[dict[str, Any]],
+) -> list[DayV2Signal]:
+    """One structural candidate per setup family.
+
+    RSI, candle color, regime and trend are stored as the candidate's context.
+    They do not decide whether the candidate exists. A family is omitted only
+    when its structural objective cannot be formed from the closed bars.
+    """
+    if len(bars_15m) < 32:
+        return []
+    try:
+        idx = len(bars_15m) - 1
+        b0 = bars_15m[idx]
+        c0 = float(b0["close"])
+        l0 = float(b0["low"])
+        window_start = max(0, idx - 50)
+        closes = [float(b["close"]) for b in bars_15m[window_start : idx + 1]]
+        highs = [float(b["high"]) for b in bars_15m[window_start : idx + 1]]
+        lows = [float(b["low"]) for b in bars_15m[window_start : idx + 1]]
+    except (KeyError, TypeError, ValueError):
+        return []
+    atr = _atr(highs, lows, closes, 14)
+    sma20 = _sma(closes, 20)
+    if not atr or atr <= 0 or c0 <= 0 or sma20 is None:
+        return []
+    ts0 = _compare_ts(b0)
+    regime = "neutral"
+    if bars_4h:
+        h4_past = [b for b in bars_4h if _compare_ts(b) <= ts0]
+        if len(h4_past) >= 10:
+            h4_closes = [float(b["close"]) for b in h4_past[-11:]]
+            h4_sma10 = _sma(h4_closes, 10)
+            if h4_sma10:
+                if h4_closes[-1] > h4_sma10 * 1.005:
+                    regime = "bull"
+                elif h4_closes[-1] < h4_sma10 * 0.995:
+                    regime = "bear"
+    h1_bullish = False
+    if bars_1h:
+        h1_past = [b for b in bars_1h if _compare_ts(b) <= ts0]
+        if len(h1_past) >= 5:
+            h1_closes = [float(b["close"]) for b in h1_past[-6:]]
+            h1_bullish = h1_closes[-1] > h1_closes[-5]
+    low20 = min(lows[-20:]) if len(lows) >= 20 else None
+    prior_high = prior_structure_high(highs)
+    bar_ts = int(_signal_bar_ts(b0))
+    specs: list[tuple[str, float, float]] = []
+    if SETUP_HTF_TREND_PULLBACK in ENABLED_SETUPS:
+        specs.append((SETUP_HTF_TREND_PULLBACK, c0 - 1.5 * atr, c0 + 2.5 * atr))
+    if low20 is not None and SETUP_RANGE_BOUNCE in ENABLED_SETUPS:
+        specs.append((SETUP_RANGE_BOUNCE, low20 * 0.995, c0 + 2.0 * atr))
+    if prior_high is not None and SETUP_BREAKOUT_CONTINUATION in ENABLED_SETUPS:
+        specs.append((SETUP_BREAKOUT_CONTINUATION, prior_high * 0.995, c0 + 2.0 * atr))
+    if sma20 > c0 * 1.003 and SETUP_VWAP_REVERSION in ENABLED_SETUPS:
+        specs.append((SETUP_VWAP_REVERSION, l0 * 0.998, sma20))
+    if sma20 > c0 * 1.002 and SETUP_EXHAUSTION_MR in ENABLED_SETUPS:
+        specs.append((SETUP_EXHAUSTION_MR, l0 * 0.997, sma20))
+    return [_pack_signal(symbol, name, regime, anchor, target, atr, bar_ts, h1_bullish, bars_15m, bars_1h, bars_4h) for name, anchor, target in specs]
 
 
 def explain_no_signal(
@@ -500,4 +578,60 @@ def explain_no_signal(
         "h1_bullish": h1_bullish,
         "checks": checks,
         "anchor_low": l0,
+    }
+
+
+def day_state_features(bars_15m: list[dict[str, Any]], bars_1h: list[dict[str, Any]], setup: str) -> dict[str, float]:
+    """Causal state of the last closed bar. Setup is one feature, not an edge.
+
+    Every input is known at the decision. An unavailable indicator yields an
+    empty dict, and an empty dict adds nothing to the learned net.
+    """
+    if len(bars_15m) < 32:
+        return {}
+    try:
+        closes = [float(b["close"]) for b in bars_15m[-51:]]
+    except (KeyError, TypeError, ValueError):
+        return {}
+    try:
+        highs = [float(b["high"]) for b in bars_15m[-51:]]
+        lows = [float(b["low"]) for b in bars_15m[-51:]]
+    except (KeyError, TypeError, ValueError):
+        return {}
+    price = closes[-1]
+    if price <= 0:
+        return {}
+    rsi = _rsi(closes, 14)
+    atr = _atr(highs, lows, closes, 14)
+    bb = _bb_pct(closes, 20, 2.0)
+    sma20 = _sma(closes, 20)
+    if rsi is None or atr is None or bb is None or sma20 is None:
+        return {}
+    h1_ret = 0.0
+    atr_1h = 0.0
+    if len(bars_1h) >= 6:
+        h1 = [float(b["close"]) for b in bars_1h[-6:]]
+        if h1[0] > 0:
+            h1_ret = (h1[-1] - h1[0]) / h1[0]
+        h1_atr = _atr([float(b["high"]) for b in bars_1h[-16:]], [float(b["low"]) for b in bars_1h[-16:]], [float(b["close"]) for b in bars_1h[-16:]], 14)
+        if h1_atr and price > 0:
+            atr_1h = h1_atr / price
+    low20 = min(lows[-20:])
+    high20 = max(highs[-20:])
+    span = high20 - low20
+    name = str(setup or "").upper()
+    return {
+        "atr15_pct": atr / price,
+        "atr1h_pct": atr_1h,
+        "rsi": rsi / 100.0,
+        "bb_pct": bb,
+        "sma20_dist": (price - sma20) / price,
+        "h1_ret": h1_ret,
+        "bar_return": (price - closes[-2]) / price,
+        "range_location": (price - low20) / span if span > 0 else 0.5,
+        "setup_htf": 1.0 if name == SETUP_HTF_TREND_PULLBACK else 0.0,
+        "setup_range": 1.0 if name == SETUP_RANGE_BOUNCE else 0.0,
+        "setup_breakout": 1.0 if name == SETUP_BREAKOUT_CONTINUATION else 0.0,
+        "setup_vwap": 1.0 if name == SETUP_VWAP_REVERSION else 0.0,
+        "setup_exhaustion": 1.0 if name == SETUP_EXHAUSTION_MR else 0.0,
     }

@@ -332,15 +332,7 @@ class ScalpStrategyRouter:
                 mtf_conflict_reason = mtf_conflict_reason or "MTF_15M_NOT_ALIGNED_RANKED"
                 mtf_penalty_mult *= float(os.getenv("SCALP_MTF_15M_CONFLICT_RANK_MULT", "0.55"))
             if mtf_penalty_mult < 1.0:
-                # MTF is a residual handicap only. Multiplying a typically
-                # negative EV_10s primary would invert the penalty.
-                old_score = float(best_ranked.rank_score)
-                primary = float((getattr(best_ranked, "rank_components", None) or {}).get("EV_10s") or old_score)
-                tie = old_score - primary
-                rank_score_penalized = round(primary + tie * mtf_penalty_mult, 8)
-                from dataclasses import replace as _replace
-
-                best_ranked = _replace(best_ranked, rank_score=rank_score_penalized)
+                # Recorded context. It does not rewrite the learned net rank.
                 soft_reason = soft_reason or mtf_conflict_reason
                 selection_confidence = f"{selection_confidence}_mtf_conflict_ranked"
                 with contextlib.suppress(Exception):

@@ -31,7 +31,7 @@ from backend.services.binance_scalp.strategies.common import (
     depth_check,
     estimate_expected_move_pct,
 )
-from backend.services.scalp_v2.raw_move_source import NO_RAW_MOVE_SOURCE, STRATEGY_CLAIM
+from backend.services.scalp_v2.raw_move_source import STRATEGY_CLAIM
 
 # Hard safety — never trade through these. NO_EXECUTABLE_NET_EDGE is set only by
 # the canonical executable edge (scalp_v2.executable_edge); a strategy's own
@@ -207,7 +207,9 @@ def candidate_executable_edge(
     from backend.services.scalp_v2.executable_edge import scalp_executable_edge, stamp_view
 
     regime_key = _adaptive_regime(db_path, symbol)
-    view = scalp_decision(db_path, symbol.upper().replace("/", "").replace("-", ""), setup, regime_key, features=micro_feats or {})
+    feats = dict(micro_feats or {})
+    feats["structural_projection"] = float(raw_expected_move_pct or 0.0)
+    view = scalp_decision(db_path, symbol.upper().replace("/", "").replace("-", ""), setup, regime_key, features=feats)
     edge = scalp_executable_edge(view, raw_expected_move_pct=raw_expected_move_pct, spread_pct=spread_pct, impact_pct=impact_pct, edge_source=edge_source)
     return edge, stamp_view(view, edge), regime_key
 
@@ -352,26 +354,13 @@ def rank_setup_signal(
         rank_score = (base_score + mom_boost) * regime_mult * arm_penalty_mult
         hard_block = None
 
-    # Every candidate with a strategy projection is priced on the same
-    # executable-cost contract. The projection is a calibration input, possibly
-    # 0; ATR is magnitude, not direction, and never stands in for a claim.
+    # Geometry is a feature. A setup that did not "pass" is still priced:
+    # the learned gross mean, not the claim family, is the expected move.
+    # Cold evidence prices the move at 0, so the net after cost is negative
+    # and the candidate does not trade. Missing the pricer fails closed.
     expected = float(getattr(sig, "directional_move_pct", 0.0) or 0.0)
     volatility_move = estimate_expected_move_pct(ctx.bars_1m, structural=0.0)
-    has_claim = bool(getattr(sig, "claim_available", False)) or expected > 0
-    edge_source = STRATEGY_CLAIM if has_claim else NO_RAW_MOVE_SOURCE
-    if not has_claim:
-        return RankedCandidate(
-            signal=sig,
-            rank_score=0.0,
-            entry_eligible=False,
-            hard_block="NO_EXECUTABLE_EDGE_ESTIMATE",
-            regime=regime,
-            regime_native=native,
-            soft_reason=sig.reject_reason,
-            selection_confidence="blocked",
-            edge_source=edge_source,
-            volatility_move_pct=volatility_move,
-        )
+    edge_source = STRATEGY_CLAIM
     micro_feats: dict = {}
     with contextlib.suppress(Exception):
         from backend.services.microstructure_engine import compute_features as _cmf
@@ -542,6 +531,11 @@ def rank_setup_signal(
         )
     if not rank_components:
         rank_score = round(rank_score + live_ctx_adj + learned_adj + micro_adj + micro_learn_adj + feature_adj, 4)
+    # The handcrafted score and its opinion multipliers are telemetry.
+    # Selection rank is the learned executable net.
+    handcrafted_rank = rank_score
+    rank_score = float(edge.final_executable_edge_pct)
+    rank_components["handcrafted_rank"] = handcrafted_rank
 
     # Measurement: counters only — never flips eligibility (scalp_strategy_owner_v2).
     # Outcome is "hard_blocked" ONLY for mechanical safety (hard_block set).
@@ -753,68 +747,21 @@ def pick_best_ranked(candidates: list[RankedCandidate]) -> RankedCandidate | Non
         pool,
         key=lambda c: (
             c.rank_score,
-            1 if c.signal.passed else 0,
-            c.reachability_surplus,
-            1 if c.regime_native else 0,
-            _soft_base_score(c.soft_reason),
-            c.signal.confidence,
+            # Identity only. A geometric pass, native regime, soft score,
+            # or confidence is not a preference when the learned nets match.
+            str(c.signal.setup_name or ""),
         ),
     )
 
 
-def _role_ranking_delta(row: dict[str, Any]) -> float:
-    """
-    Market-role intelligence delta for SCALP tie-breaking.
-    Reads Redis ai_context (cross-process). Range ±0.06. Never a gate.
-    """
-    sym = str(row.get("symbol") or "")
-    with contextlib.suppress(Exception):
-        from backend.services.market_role_intelligence import fetch_role_ranking_delta_from_redis
-
-        return max(-0.06, min(0.06, fetch_role_ranking_delta_from_redis(sym)))
-    return 0.0
-
-
 def _global_tie_key(row: dict[str, Any]) -> tuple:
-    """Secondary sort when rank scores cluster — not spread/BTC order."""
-    meta = row.get("rank_meta") or {}
-    soft = str(meta.get("soft_reason") or row.get("soft_reason") or "")
-    soft_tier = _soft_base_score(soft.split(":", maxsplit=1)[0] if soft else None)
-    intel = row.get("intelligence") or {}
-    mem_delta = float(intel.get("memory_rank_delta") or 0)
-    # Do not treat win_rate=0.0 as missing (falsy) and fall through to dollar PnL.
-    _wr = intel.get("recent_scalp_win_rate")
-    if _wr is None:
-        win_rate = float(intel.get("same_scalp_setup_today_net_pnl") or 0)
-    else:
-        try:
-            win_rate = float(_wr)
-        except (TypeError, ValueError):
-            win_rate = 0.0
-    regime_native = 1 if meta.get("regime_native") else 0
-    mom = row.get("mom")
-    m15 = float(getattr(mom, "mid_change_15s", 0) or 0) if mom else 0.0
-    m30 = float(getattr(mom, "mid_change_30s", 0) or 0) if mom else 0.0
+    """Secondary sort when learned nets cluster. Identity only, not an opinion."""
     sig = row.get("signal")
-    passed = 1 if getattr(sig, "passed", False) else 0
-    reach = float(meta.get("reachability_surplus") or 0)
-    str(row.get("symbol") or "")
-    # Rank the opportunity, never the coin identity.
-    sym_penalty = 0.0
-    # Market-role intelligence soft delta (affects tie-breaking only, not eligibility)
-    role_delta = _role_ranking_delta(row)
+    setup = str(getattr(sig, "setup_name", "") or row.get("best_setup") or "")
     return (
-        passed,
-        regime_native,
-        soft_tier,
-        reach,
-        mem_delta,
-        win_rate,
-        m30,
-        m15,
-        sym_penalty,
-        role_delta,
-        float(row.get("rank_score") or 0),
+        float(row.get("rank_score") or 0.0),
+        setup,
+        str(row.get("symbol") or ""),
     )
 
 

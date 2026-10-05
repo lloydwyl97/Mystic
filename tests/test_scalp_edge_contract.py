@@ -101,12 +101,12 @@ def test_insufficient_history_is_hard_block():
     assert "INSUFFICIENT_HISTORY" in HARD_REJECT_REASONS
 
 
-def test_opinion_reject_has_no_directional_edge_source_even_with_wide_atr():
+def test_opinion_reject_is_priced_and_cold_net_does_not_trade():
     rc = rank_setup_signal(_sig(passed=False, reason="NOT_NEAR_SUPPORT"), regime="RANGE", ctx=_ctx(_bars(30, 0.012)))
     assert rc.volatility_move_pct > 0.001
-    assert rc.edge_source == "NONE"
+    assert rc.edge_source == "STRATEGY_CLAIM"
     assert rc.expected_move_pct == 0.0
-    assert rc.hard_block == "NO_EXECUTABLE_EDGE_ESTIMATE"
+    assert rc.hard_block == "NO_EXECUTABLE_NET_EDGE"
     assert not rc.entry_eligible
 
 
@@ -152,9 +152,10 @@ def test_raw_move_below_cost_needs_learned_evidence(monkeypatch):
     assert rc.entry_eligible
 
 
-def test_no_edge_estimate_possible_is_hard_block():
+def test_opinion_reject_without_projection_is_still_an_economic_decision():
     rc = rank_setup_signal(_sig(passed=False, reason="NOT_NEAR_SUPPORT"), regime="RANGE", ctx=_ctx(_bars(5, 0.012)))
-    assert rc.hard_block == "NO_EXECUTABLE_EDGE_ESTIMATE"
+    assert rc.edge_source == "STRATEGY_CLAIM"
+    assert rc.hard_block == "NO_EXECUTABLE_NET_EDGE"
 
 
 def test_passed_signal_uses_strategy_projection(monkeypatch):
@@ -168,7 +169,7 @@ def test_passed_signal_uses_strategy_projection(monkeypatch):
     assert rc.entry_eligible
 
 
-def test_strategy_pass_wins_an_ev_tie_over_soft_reject():
+def test_equal_learned_edge_does_not_prefer_a_geometric_pass():
     ctx = _ctx(_bars(30, 0.012))
     soft = rank_setup_signal(_sig(passed=False, reason="NOT_NEAR_SUPPORT", setup="vwap_ema_reclaim"), regime="RANGE", ctx=ctx)
     good = rank_setup_signal(_sig(passed=True, reason=None, expected=0.006), regime="RANGE", ctx=ctx)
@@ -176,4 +177,6 @@ def test_strategy_pass_wins_an_ev_tie_over_soft_reject():
 
     soft = replace(soft, rank_score=0.1, reachability_surplus=0.01)
     good = replace(good, rank_score=0.1, reachability_surplus=0.0)
-    assert pick_best_ranked([soft, good]).signal.passed is True
+    chosen = pick_best_ranked([soft, good])
+    assert chosen.signal.passed is False
+    assert chosen.signal.setup_name == "vwap_ema_reclaim"

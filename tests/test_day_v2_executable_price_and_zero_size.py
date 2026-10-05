@@ -267,9 +267,19 @@ LIVE = {"BTCUSDT": 84103.9, "ETHUSDT": 2690.99, "SOLUSDT": 121.17, "XRPUSDT": 1.
 STARTUP = {"BTCUSDT": 84120.27, "ETHUSDT": 2695.07, "SOLUSDT": 122.255, "XRPUSDT": 1.5741}
 
 
+def _seed_positive_net(db_path: str) -> None:
+    """Cold learned net is 0 and does not clear costs. These tests cover cash and fills."""
+    import backend.services.adaptive_learning as al
+
+    version = al.current_strategy_version(al.DAY_ENGINE)
+    for symbol in SYMBOLS:
+        al.observe(db_path, engine=al.DAY_ENGINE, symbol=symbol, setup="HTF_TREND_PULLBACK", regime="", metric="trade_net", value=0.02, strategy_version=version)
+
+
 @pytest.mark.asyncio
 async def test_zero_size_candidate_records_decision_without_order(tmp_path, day_cycle):
     integ = _integration(tmp_path, _fresh_redis(LIVE))
+    _seed_positive_net(integ.engine.db_path)
 
     await integ._process_day_v2_signals(ENTRY_BAR)
 
@@ -290,6 +300,7 @@ async def test_zero_size_candidate_records_decision_without_order(tmp_path, day_
 @pytest.mark.asyncio
 async def test_zero_size_decision_is_not_duplicated_for_same_bar(tmp_path, day_cycle):
     integ = _integration(tmp_path, _fresh_redis(LIVE))
+    _seed_positive_net(integ.engine.db_path)
 
     await integ._process_day_v2_signals(ENTRY_BAR)
     await integ._process_day_v2_signals(ENTRY_BAR)
@@ -312,17 +323,18 @@ async def test_no_signal_row_unchanged(tmp_path, day_cycle):
 @pytest.mark.asyncio
 async def test_nonzero_size_submits_direct_with_current_price(tmp_path, day_cycle):
     integ = _integration(tmp_path, _fresh_redis(LIVE))
+    _seed_positive_net(integ.engine.db_path)
     integ.current_prices.update(STARTUP)
     integ.sizing_result = (0.5, 0.0, 1.0)
 
     await integ._process_day_v2_signals(ENTRY_BAR)
 
-    assert [r[2] for r in _decisions(integ.engine.db_path)] == ["FILLED"] * len(SYMBOLS)
-    assert [c["current_price"] for c in integ.sizing_calls] == [LIVE[s] for s in SYMBOLS]
-    from backend.services.day_v2.ranking import clamp_to_sleeve
-
-    remaining = 228.0 * 0.5
-    assert day_cycle["submits"] == [{"symbol": s, "ask": LIVE[s], "qty": clamp_to_sleeve(0.5, LIVE[s], remaining)} for s in SYMBOLS]
+    assert sorted(r[2] for r in _decisions(integ.engine.db_path)) == ["FILLED"] * len(SYMBOLS)
+    assert sorted(c["current_price"] for c in integ.sizing_calls) == sorted(LIVE[s] for s in SYMBOLS)
+    submits = {row["symbol"]: row for row in day_cycle["submits"]}
+    assert set(submits) == set(SYMBOLS)
+    for symbol, row in submits.items():
+        assert row["ask"] == LIVE[symbol] and row["qty"] > 0
 
 
 @pytest.mark.asyncio

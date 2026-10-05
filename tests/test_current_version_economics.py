@@ -252,7 +252,7 @@ def test_near_qualified_recording_is_wired_and_bounded():
     src = inspect.getsource(PortfolioEngineIntegration._process_day_v2_signals)
     assert "CANDIDATE_NEAR_QUALIFIED" in src and "len(unmet) == 1" in src and "closest in ENABLED_SETUPS" in src
     assert "self._record_day_v2_candidate(db_path, cand, CANDIDATE_QUALIFIED)" in src
-    assert "self._record_day_v2_candidate(db_path, cand, CANDIDATE_QUALIFIED_BLOCKED)" in src
+    assert "check_frequency_limit" not in src
     helper = inspect.getsource(PortfolioEngineIntegration._record_day_v2_candidate)
     assert "candidate_state=state" in helper and "lifecycle=LifecycleParams.from_signal(" in helper and "opportunity_id=" in helper
 

@@ -117,9 +117,7 @@ class ScalpConfig:
                 for s in (
                     os.getenv(
                         "SCALP_DISABLED_STRATEGIES",
-                        # Ocean paper proof: only setups that ever produced genuine
-                        # fills. Others were 100% STRATEGY_NO_SIGNAL / soft-rank noise.
-                        "breakout_momentum,orderbook_tape_scalp,failed_breakdown_reversal,compression_breakout,volume_impulse_continuation,trend_pullback_micro,failed_breakout_reversal",
+                        "",
                     )
                     or ""
                 ).split(",")

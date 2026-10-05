@@ -616,11 +616,13 @@ def day_size_mult(expected_net: float, risk: float) -> float:
     return _clamp(1.0 + 0.30 * tilt, lo, hi)
 
 
-def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, now: float | None = None) -> dict[str, Any]:
+def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features: dict | None = None, now: float | None = None) -> dict[str, Any]:
     """What the next DAY candidate reads. Ranking, size, objective and runner only.
 
-    Expected net edge after costs is the rank score and sets the bounded size;
-    learned move potential (MFE) sets the objective. Neither removes a candidate.
+    Expected net edge after costs is the hierarchical realized net. It is the
+    rank score and sets the bounded size. Learned move potential (MFE) sets the
+    objective. Ranking never removes a candidate. ``features`` are recorded with
+    the candidate; they do not change this number.
     """
     from backend.config.trading_economics import canonical_roundtrip_cost_pct
 
@@ -630,23 +632,33 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, now: flo
     continuation = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_continuation", now=now)
     forward = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "markout_forward", now=now)
     net = day_net_expectancy(db_path, symbol, setup, regime, now=now)
+    _ = features
+    expected = float(net["mean"])
     cost = canonical_roundtrip_cost_pct()
-    size_mult = day_size_mult(net["mean"], max(0.0, mae["mean"]) + cost)
-    abstain_flag, abstain_reason = _abstain(net["mean"])
-    # DAY makes no directional claim: the objective distance is a target that
-    # only breaks ranking ties, so the whole expected gross is learned evidence.
+    size_mult = day_size_mult(expected, max(0.0, mae["mean"]) + cost)
+    abstain_flag, abstain_reason = _abstain(expected)
+    # The objective distance only breaks ranking ties. The economic quantity is
+    # the hierarchical realized net. State features are recorded, not scored.
     economic = {
         "engine_id": DAY_ENGINE,
         "economic_version": current_economic_version(DAY_ENGINE),
         "raw_expected_move": 0.0,
-        "calibration_adjustment": net["mean"] + cost,
-        "expected_gross": net["mean"] + cost,
+        "hierarchical_net": net["mean"],
+        "state_tilt": 0.0,
+        "state_model_n": 0.0,
+        "learned_expected_gross_return": expected + cost,
+        "calibration_adjustment": expected + cost,
+        "expected_gross": expected + cost,
         "expected_cost": cost,
-        "adaptive_correction": net["mean"] - net["prior"],
+        "learned_expected_net_return": expected,
+        "adaptive_correction": expected - net["prior"],
         "uncertainty": net["sd"],
+        "downside": mae["mean"],
+        "confidence_weight": net["confidence"],
         "setup_expected_edge": net["levels"]["setup"],
         "correlation_adjustment": {"applied": False, "edge": 0.0, "size_mult": 1.0},
-        "expected_net_edge": net["mean"],
+        "expected_net_edge": expected,
+        "final_learned_net_edge": expected,
         "size_effect": size_mult - 1.0,
         "levels": {lvl: round(v, 6) for lvl, v in net["levels"].items()},
         "level_weights": {lvl: round(v, 3) for lvl, v in net["level_weights"].items()},
@@ -662,13 +674,13 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, now: flo
         "regime": str(regime or "").lower(),
         "expected_move": mfe["mean"],
         "expected_move_prior": mfe["prior"],
-        "expected_net": net["mean"],
+        "expected_net": expected,
         "expected_net_parent": net["parent"],
         "net_confidence": net["confidence"],
         "confidence": net["confidence"],
         "abstain": abstain_flag,
         "abstain_reason": abstain_reason,
-        "abstain_net_edge": net["mean"],
+        "abstain_net_edge": expected,
         "abstain_confidence": net["confidence"],
         "abstain_live_veto": False,
         "uncertainty": net["sd"],
@@ -1022,6 +1034,8 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features:
         "micro_tilt": round(micro_residual, 6),
         "micro_tilt_raw": round(micro_tilt, 6),
         "micro_model_n": micro_n,
+        "state_tilt": 0.0,
+        "state_model_n": 0.0,
         "claim_gross_mean": claim["claim_gross_mean"],
         "claim_gross_setup": claim["claim_gross_setup"],
         "claim_gross_levels": {lvl: round(v, 6) for lvl, v in claim["claim_gross_levels"].items()},

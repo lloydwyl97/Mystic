@@ -1653,7 +1653,7 @@ class PortfolioEngineIntegration:
                     from backend.services.candle_contract import load_closed_bars
                     from backend.services.day_v2.cycle_gate import required_15m_open
                     from backend.services.day_v2.decision_log import record_day_decision
-                    from backend.services.day_v2.live_signal import ENABLED_SETUPS, explain_no_signal
+                    from backend.services.day_v2.live_signal import ENABLED_SETUPS, day_state_features, explain_no_signal
 
                     as_of = float(entry_bar or time.time())
                     from backend.services.day_v2.candle_wait import (
@@ -1701,8 +1701,18 @@ class PortfolioEngineIntegration:
                     bars_1h = await _asyncio.to_thread(_load, "1h", 20)
                     bars_4h = await _asyncio.to_thread(_load, "4h", 15)
 
-                    signal = evaluate_entry_signal(symbol, bars_15m, bars_1h, bars_4h)
-                    if signal is None:
+                    fired = evaluate_entry_signal(symbol, bars_15m, bars_1h, bars_4h)
+                    from backend.services.day_v2.live_signal import context_entry_signals
+
+                    contexts = context_entry_signals(symbol, bars_15m, bars_1h, bars_4h)
+                    signals: list[Any] = []
+                    seen: set[str] = set()
+                    for signal in ([fired] if fired is not None else []) + contexts:
+                        if signal is None or signal.setup in seen:
+                            continue
+                        seen.add(signal.setup)
+                        signals.append(signal)
+                    if not signals:
                         explained = explain_no_signal(symbol, bars_15m, bars_1h, bars_4h)
                         closest = str(explained.get("closest") or "no_setup")
                         unmet = list(explained.get("unmet") or [])
@@ -1738,97 +1748,24 @@ class PortfolioEngineIntegration:
                                 logger.debug("DAY_V2_NEAR_QUALIFIED_RECORD_FAILED symbol=%s", symbol, exc_info=True)
                         continue
 
-                    # --- DAY_STRUCTURAL_PULLBACK_V1 gates (in order) ---
-
-                    # 1. Opportunity already consumed (SQLite is authoritative)
-                    try:
-                        from backend.services.day_v2.migrations import is_opportunity_consumed
-
-                        if is_opportunity_consumed(db_path, signal.opportunity_id):
-                            logger.info(
-                                "DAY_V2_OPP_CONSUMED symbol=%s opp=%s",
-                                symbol,
-                                signal.opportunity_id,
-                            )
-                            continue
-                    except Exception:
-                        logger.debug("DAY_V2_OPP_CONSUMED_CHECK_FAILED symbol=%s", symbol, exc_info=True)
-
-                    # 2. Structural zone. Integrity only: an invalid zone means the
-                    # setup lacks its structural anchor/ATR/target (missing data) or
-                    # is unsupported. zone_low/zone_high/reclaim are diagnostic;
-                    # price is never required to sit inside the zone.
-                    _zone = None
-                    _reclaim_level: float = 0.0
-                    try:
-                        from backend.services.day_v2.structural_entry import (
-                            evaluate_structural_zone,
-                        )
-
-                        _zone = evaluate_structural_zone(signal)
-                        if not _zone.valid:
-                            logger.info(
-                                "DAY_V2_STRUCTURAL_DATA_MISSING symbol=%s setup=%s reason=%s (integrity block; zone bounds are diagnostic)",
-                                symbol,
-                                signal.setup,
-                                _zone.reason,
-                            )
-                            continue
-                        _reclaim_level = float(_zone.reclaim_level or 0.0)
-                    except Exception:
-                        logger.warning("DAY_V2_STRUCTURAL_ZONE_ERROR symbol=%s", symbol, exc_info=True)
-                        continue
-
-                    # --- End DAY_DIRECT_ENTRY_V1 integrity checks ---
-
-                    # Executable price was resolved before the signal. Do not substitute zero.
                     if ask_price <= 0:
                         record_day_decision(db_path, symbol, "MISSING_EXECUTABLE_PRICE", cycle_ts=as_of, closest="missing_stale_data")
                         logger.warning("DAY_V2_HARD_DATA_REJECT symbol=%s reason=MISSING_EXECUTABLE_PRICE", symbol)
                         continue
 
-                    from backend.services.adaptive_learning import market_regime_tag
-
-                    # One regime key for the whole candidate lifecycle: the markout
-                    # record, the entry decision, and the close all use this tag so
-                    # they land on the same adaptive row. Blank when market data is
-                    # thin: an unknown regime learns only at coin+setup and setup level.
-                    cand = {
-                        "symbol": symbol,
-                        "norm": norm,
-                        "signal": signal,
-                        "zone": _zone,
-                        "reclaim_level": _reclaim_level,
-                        "ask_price": ask_price,
-                        "db_symbol": db_sym_15m,
-                        "as_of": as_of,
-                        "regime_tag": market_regime_tag(db_path, symbol) or "",
-                    }
-
-                    # 3. Frequency guard — rolling 24h caps (DAY V2 only). A capped
-                    # signal is the same contract, so its lifecycle is learnable.
-                    try:
-                        from backend.services.day_v2.frequency_guard import check_frequency_limit
-
-                        _freq_ok, _freq_reason = check_frequency_limit(db_path, symbol)
-                        if not _freq_ok:
-                            logger.info(
-                                "DAY_V2_FREQ_LIMIT symbol=%s reason=%s",
-                                symbol,
-                                _freq_reason,
-                            )
-                            try:
-                                from backend.services.adaptive_learning import CANDIDATE_QUALIFIED_BLOCKED, day_decision
-
-                                cand["adaptive"] = day_decision(db_path, symbol, signal.setup, cand["regime_tag"])
-                                self._record_day_v2_candidate(db_path, cand, CANDIDATE_QUALIFIED_BLOCKED)
-                            except Exception:
-                                logger.debug("DAY_V2_BLOCKED_RECORD_FAILED symbol=%s", symbol, exc_info=True)
-                            continue
-                    except Exception:
-                        logger.debug("DAY_V2_FREQ_CHECK_FAILED symbol=%s", symbol, exc_info=True)
-
-                    candidates.append(cand)
+                    for signal in signals:
+                        self._admit_day_context_candidate(
+                            candidates,
+                            db_path=db_path,
+                            symbol=symbol,
+                            norm=norm,
+                            signal=signal,
+                            ask_price=ask_price,
+                            db_sym_15m=db_sym_15m,
+                            as_of=as_of,
+                            bars_15m=bars_15m,
+                            bars_1h=bars_1h,
+                        )
 
                 except Exception:
                     logger.warning("DAY_V2_SIGNAL_ERROR symbol=%s", symbol, exc_info=True)
@@ -1842,7 +1779,7 @@ class PortfolioEngineIntegration:
             resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts), path_low=lambda sym, a, b: ohlcv_low_between(db_path, sym, a, b))
             for cand in candidates:
                 sig = cand["signal"]
-                cand["adaptive"] = day_decision(db_path, cand["symbol"], sig.setup, str(cand.get("regime_tag") or ""))
+                cand["adaptive"] = day_decision(db_path, cand["symbol"], sig.setup, str(cand.get("regime_tag") or ""), features=cand.get("state_features"))
             ranked = rank_day_candidates(candidates, list(DAY_V2_UNIVERSE), canonical_roundtrip_cost_pct())
             logger.info(
                 "DAY_V2_RANKED %s",
@@ -1851,6 +1788,9 @@ class PortfolioEngineIntegration:
                     for c in ranked
                 ),
             )
+            alts = [{"symbol": c["symbol"], "setup": c["signal"].setup, "expected_net": c["rank"]["expected_net"], "position": c["rank"]["position"]} for c in ranked]
+            for cand in ranked:
+                cand["alternatives"] = [a for a in alts if a["symbol"] != cand["symbol"] or a["setup"] != cand["signal"].setup]
             for cand in ranked:
                 try:
                     cand["markout_id"] = self._record_day_v2_candidate(db_path, cand, CANDIDATE_QUALIFIED)
@@ -1864,6 +1804,67 @@ class PortfolioEngineIntegration:
 
         except Exception:
             logger.warning("DAY_V2_PROCESS_ERROR", exc_info=True)
+
+    @staticmethod
+    def _admit_day_context_candidate(
+        candidates: list[dict[str, Any]],
+        *,
+        db_path: str,
+        symbol: str,
+        norm: str,
+        signal: Any,
+        ask_price: float,
+        db_sym_15m: str,
+        as_of: float,
+        bars_15m: list[dict[str, Any]],
+        bars_1h: list[dict[str, Any]],
+    ) -> None:
+        """Add one structural DAY context. Setup opinions are not a veto.
+
+        A consumed opportunity or a missing structural anchor is integrity.
+        A rolling fill-count cap is not.
+        """
+        try:
+            from backend.services.day_v2.migrations import is_opportunity_consumed
+
+            if is_opportunity_consumed(db_path, signal.opportunity_id):
+                logger.info("DAY_V2_OPP_CONSUMED symbol=%s opp=%s", symbol, signal.opportunity_id)
+                return
+        except Exception:
+            logger.debug("DAY_V2_OPP_CONSUMED_CHECK_FAILED symbol=%s", symbol, exc_info=True)
+        try:
+            from backend.services.day_v2.structural_entry import evaluate_structural_zone
+
+            zone = evaluate_structural_zone(signal)
+            if not zone.valid:
+                logger.info(
+                    "DAY_V2_STRUCTURAL_DATA_MISSING symbol=%s setup=%s reason=%s (integrity block; zone bounds are diagnostic)",
+                    symbol,
+                    signal.setup,
+                    zone.reason,
+                )
+                return
+            reclaim_level = float(zone.reclaim_level or 0.0)
+        except Exception:
+            logger.warning("DAY_V2_STRUCTURAL_ZONE_ERROR symbol=%s", symbol, exc_info=True)
+            return
+        from backend.services.adaptive_learning import market_regime_tag
+        from backend.services.day_v2.live_signal import day_state_features
+
+        candidates.append(
+            {
+                "symbol": symbol,
+                "norm": norm,
+                "signal": signal,
+                "zone": zone,
+                "reclaim_level": reclaim_level,
+                "ask_price": ask_price,
+                "db_symbol": db_sym_15m,
+                "as_of": as_of,
+                "regime_tag": market_regime_tag(db_path, symbol) or "",
+                "state_features": day_state_features(bars_15m, bars_1h, signal.setup),
+            }
+        )
 
     @staticmethod
     def _record_day_v2_candidate(db_path: str, cand: dict[str, Any], state: str) -> int | None:
@@ -1886,6 +1887,7 @@ class PortfolioEngineIntegration:
                 "executable_objective_edge": rank.get("executable_objective_edge"),
                 "rank_effect": {"score": rank.get("score"), "position": rank.get("position"), "of": rank.get("of"), "tie_break_objective_edge": rank.get("executable_objective_edge")},
                 "size_mult": adaptive.get("size_mult"),
+                "alternatives": cand.get("alternatives") or [],
             }
         )
         return record_candidate(
@@ -1902,6 +1904,7 @@ class PortfolioEngineIntegration:
             lifecycle=LifecycleParams.from_signal(signal, entry_price=float(cand["ask_price"]), entry_time=float(cand["as_of"]), adaptive=adaptive),
             economic=economic,
             opportunity_id=str(signal.opportunity_id or ""),
+            features=cand.get("state_features") or None,
         )
 
     async def _fund_day_v2_candidate(self, cand: dict[str, Any], db_path: str) -> None:
@@ -1918,6 +1921,20 @@ class PortfolioEngineIntegration:
         ask_price = cand["ask_price"]
         db_sym_15m = cand["db_symbol"]
         as_of = cand["as_of"]
+        # Non-positive learned net after costs does not get capital. The
+        # candidate is already recorded and still trains. Cold is neutral (0),
+        # so it does not clear costs.
+        if float((cand.get("adaptive") or {}).get("expected_net") or 0.0) <= 0.0:
+            record_day_decision(
+                db_path,
+                symbol,
+                "REJECTED:NO_EXECUTABLE_NET_EDGE",
+                cycle_ts=as_of,
+                closest=signal.setup,
+                unmet=[f"expected_net={float((cand.get('adaptive') or {}).get('expected_net') or 0.0):.6f}"],
+            )
+            logger.info("DAY_V2_NO_NET_EDGE symbol=%s setup=%s", symbol, signal.setup)
+            return
         # Engine sizing, then clamped to what the DAY sleeve can still fund
         # (open DAY lots and live reservations included). SCALP capital is never used.
         atr_val = float(signal.atr or 0.0)
@@ -2279,6 +2296,9 @@ class PortfolioEngineIntegration:
             setup_name = str(row.get("best_setup") or "SCALP_STRUCTURAL")
             regime = str(row.get("adaptive_regime") or "") or market_regime_tag(self.engine.db_path, norm_key) or ""
             micro_feats = _scalp_book(norm_key)
+            raw_move = (row.get("executable_edge") or {}).get("raw_expected_move_pct")
+            if raw_move is not None:
+                micro_feats = {**micro_feats, "structural_projection": float(raw_move or 0.0)}
             snap = row.get("snap")
             ref_price = float(getattr(snap, "best_ask", 0) or getattr(snap, "mid_price", 0) or 0) if snap is not None else 0.0
             if ref_price <= 0:

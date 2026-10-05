@@ -60,6 +60,7 @@ class ExecutableEdge:
     micro_residual_unweighted_pct: float = 0.0
     uncertainty_pct: float = 0.0
     economic_version: str = ""
+    state_tilt_pct: float = 0.0
 
     @property
     def eligible(self) -> bool:
@@ -93,6 +94,10 @@ class ExecutableEdge:
             "micro_unweighted": self.micro_residual_unweighted_pct,
             "pre_micro_edge": self.pre_micro_edge_pct,
             "uncertainty": self.uncertainty_pct,
+            "backoff_gross": self.calibrated_move_pct - self.state_tilt_pct,
+            "learned_expected_gross": self.expected_move_pct,
+            "learned_expected_net": self.final_executable_edge_pct,
+            "final_learned_net_edge": self.final_executable_edge_pct,
             "expected_net_edge": self.final_executable_edge_pct,
             "size_effect": self.size_mult - 1.0,
             "eligible": self.eligible,
@@ -195,6 +200,7 @@ def scalp_executable_edge(
         micro_residual_unweighted_pct=_f(view.get("micro_residual_unweighted"), micro_model),
         uncertainty_pct=_f(view.get("claim_uncertainty")),
         economic_version=str(view.get("economic_version") or ""),
+        state_tilt_pct=_f(view.get("state_tilt")),
     )
 
 
