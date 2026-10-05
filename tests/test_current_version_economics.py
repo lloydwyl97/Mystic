@@ -333,6 +333,20 @@ def test_scalp_learns_from_unfilled_claims_with_decision_time_inputs_only(tmp_pa
     assert al.scalp_decision(db, *SCALP_KEY)["n_claim"] == pytest.approx(1.0)
 
 
+def test_scalp_breaker_blocks_entries_without_stopping_learning():
+    src = inspect.getsource(PortfolioEngineIntegration._process_scalp_v2_signals)
+    warning = src.index("SCALP_V2_BREAKER halt=True")
+    assert "return" not in src[warning : src.index("from backend.services.portfolio_engine import SCALP_MAX_OPEN_POSITIONS")]
+    loop = src[src.index("for sym_raw in sorted(products") :]
+    halt = loop.index("if breaker.halt:")
+    assert loop.index('if result_code != "ARMED":') < halt < loop.index("existing_pos = self.engine._find_position(")
+    assert halt < loop.index("arm_opportunity(") < loop.index("execute_scalp_v2_buy_live(")
+    halted_branch = loop[halt : loop.index("existing_pos = self.engine._find_position(")]
+    assert 'f"REJECTED:{halt_reason}"' in halted_branch and "continue" in halted_branch
+    before_loop = src[: src.index("for sym_raw in sorted(products")]
+    assert before_loop.index("check_scalp_loss_breaker(") < before_loop.index("resolve_markouts,") < before_loop.index("record_candidate(")
+
+
 def test_scalp_stays_enabled_and_admission_is_economic_only():
     assert REJECT_THRESHOLD_PCT == 0.0
     import backend.services.scalp_v2.executable_edge as ee

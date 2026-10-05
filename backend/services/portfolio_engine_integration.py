@@ -2140,8 +2140,9 @@ class PortfolioEngineIntegration:
         self._scalp_v2_halt_reason = str(breaker.reason or "BREAKER") if breaker.halt else ""
         self._scalp_v2_halt_until = str(breaker.recovery_until or "") if breaker.halt else ""
         if breaker.halt:
+            # Entries are blocked per candidate below. Ranking, candidate records
+            # and markouts continue so learning does not stop during a halt.
             logger.warning("SCALP_V2_BREAKER halt=True reason=%s until=%s %s", breaker.reason, breaker.recovery_until, breaker.detail)
-            return
 
         from backend.services.portfolio_engine import SCALP_MAX_OPEN_POSITIONS
         from backend.services.two_engine_capital import compute_snapshot, scalp_order_notional, symbol_marks
@@ -2268,6 +2269,11 @@ class PortfolioEngineIntegration:
                         _record_scalp_observation(row, norm_key, signaled=False)
                     record_scalp_decision(self.engine.db_path, norm, result_code, reason, cycle_ts=cycle_ts, detail=decision_detail(row))
                     logger.info("SCALP_V2_DECISION symbol=%s result=%s reason=%s", norm, result_code, reason)
+                    continue
+                if breaker.halt:
+                    halt_reason = str(breaker.reason or "LOSS_BREAKER")
+                    record_scalp_decision(self.engine.db_path, norm, f"REJECTED:{halt_reason}", halt_reason, cycle_ts=cycle_ts, detail=decision_detail(row))
+                    logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:%s", norm, halt_reason)
                     continue
                 # Two-engine contract: engine-scoped lookup. SCALP's own lot
                 # blocks (same-engine duplicate); a DAY-side lot on the same
