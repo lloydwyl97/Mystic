@@ -131,6 +131,31 @@ async def test_filled_buy_creates_a_durable_scalp_lot(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_commit_never_exposes_the_lot_beside_pre_debit_cash(tmp_path, monkeypatch):
+    """Ocean 2026-10-05 01:39: MTM persisted pre-buy cash plus the new XRP lot, $143.97 of equity that did not exist."""
+    from backend.services.portfolio_engine import PortfolioEngine
+
+    engine = _engine(tmp_path, monkeypatch, AsyncMock(return_value=_filled_order()))
+    opp_id = _arm(engine)
+    real_commit = PortfolioEngine._scalp_v2_commit_buy_sync
+    seen = []
+
+    def _commit(self, **kwargs):
+        book = sum(p.quantity * p.entry_price for p in engine.open_positions.values())
+        seen.append((engine.cash_balance + book, getattr(engine, "_buys_inflight", None)))
+        real_commit(self, **kwargs)
+
+    monkeypatch.setattr(PortfolioEngine, "_scalp_v2_commit_buy_sync", _commit)
+    assert await _buy(engine, opp_id) is not None
+
+    assert seen == [(pytest.approx(100.0), 1)]
+    lot = engine.open_positions["SCALP_V2::ETH/USDT"]
+    assert engine._total_equity == pytest.approx(engine.cash_balance + lot.quantity * lot.entry_price)
+    assert engine._buys_inflight == 0
+    assert engine._buy_seq == 1
+
+
+@pytest.mark.asyncio
 async def test_restart_preserves_scalp_ownership_and_provenance(tmp_path, monkeypatch):
     engine = _engine(tmp_path, monkeypatch, AsyncMock(return_value=_filled_order()))
     opp_id = _arm(engine)

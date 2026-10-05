@@ -5063,7 +5063,11 @@ class PortfolioEngine:
         resolved_prices = self._resolve_mtm_prices(prices)
         if not resolved_prices and self.open_positions and allow_network_mtm:
             resolved_prices = await self._fetch_mtm_prices_for_open_positions()
+        buy_seq_before = int(getattr(self, "_buy_seq", 0) or 0)
         positions_value_market, cost_basis = await asyncio.to_thread(self._compute_positions_value_and_cost_basis, resolved_prices)
+        if int(getattr(self, "_buy_seq", 0) or 0) != buy_seq_before:
+            logger.debug("RECOMPUTE_DISCARDED: a buy published while positions were valued")
+            return
         self._positions_value = positions_value_market
         self._cost_basis = cost_basis
         self._unrealized_pnl = self._positions_value - self._cost_basis
@@ -8774,17 +8778,33 @@ class PortfolioEngine:
         except Exception as e:
             logger.warning("FIFO_RECONCILE failed: %s", e, exc_info=True)
 
+    @contextlib.contextmanager
+    def _buy_commit_window(self):
+        """Span a BUY from its SQLite commit to publishing its lot and cash debit in memory.
+
+        Inside the window SQLite already holds the lot while memory still holds
+        the pre-debit cash; a reload or valuation that straddles it pairs the two
+        and MTM persists the lot's notional as equity.
+        """
+        self._buys_inflight = int(getattr(self, "_buys_inflight", 0) or 0) + 1
+        try:
+            yield
+        finally:
+            self._buys_inflight = max(0, int(getattr(self, "_buys_inflight", 1) or 1) - 1)
+            self._buy_seq = int(getattr(self, "_buy_seq", 0) or 0) + 1
+
     async def _load_positions_from_sqlite(self, *, allow_mutations: bool = True, during_sell: bool = False) -> int:
         """Load positions from SQLite. Returns count loaded.
 
         When ``allow_mutations=False`` (GET/status/dashboard reads): SELECT only —
         no FIFO_RECONCILE, no delete/persist/backfill writes.
 
-        A reload that overlaps a sell (in flight, or finished while rows were
-        being read) keeps the current in-memory book; only the sell itself may
-        rehydrate (``during_sell=True``).
+        A reload that overlaps a sell or a buy commit (in flight, or finished
+        while rows were being read) keeps the current in-memory book; only the
+        sell itself may rehydrate (``during_sell=True``).
         """
         sell_seq_before = int(getattr(self, "_sell_seq", 0) or 0)
+        buy_seq_before = int(getattr(self, "_buy_seq", 0) or 0)
 
         def _sync_load():
             opener = connect_rw if allow_mutations else connect_ro
@@ -8839,11 +8859,17 @@ class PortfolioEngine:
 
         loop = asyncio.get_running_loop()
         rows = await loop.run_in_executor(None, _sync_load)
-        if not during_sell and (int(getattr(self, "_sells_inflight", 0) or 0) > 0 or int(getattr(self, "_sell_seq", 0) or 0) != sell_seq_before):
+        sells_inflight = int(getattr(self, "_sells_inflight", 0) or 0)
+        sell_seq_changed = int(getattr(self, "_sell_seq", 0) or 0) != sell_seq_before
+        buys_inflight = int(getattr(self, "_buys_inflight", 0) or 0)
+        buy_seq_changed = int(getattr(self, "_buy_seq", 0) or 0) != buy_seq_before
+        if not during_sell and (sells_inflight > 0 or sell_seq_changed or buys_inflight > 0 or buy_seq_changed):
             logger.info(
-                "LOAD_POSITIONS_DEFERRED sells_inflight=%s sell_seq_changed=%s — keeping in-memory book",
-                int(getattr(self, "_sells_inflight", 0) or 0),
-                int(getattr(self, "_sell_seq", 0) or 0) != sell_seq_before,
+                "LOAD_POSITIONS_DEFERRED sells_inflight=%s sell_seq_changed=%s buys_inflight=%s buy_seq_changed=%s — keeping in-memory book",
+                sells_inflight,
+                sell_seq_changed,
+                buys_inflight,
+                buy_seq_changed,
             )
             return len(self.open_positions)
 
@@ -10343,39 +10369,46 @@ class PortfolioEngine:
                     original_position_cost=float(total_cost),
                 )
                 position.adaptive_decision = dict(adaptive_decision or {})
-                self.open_positions[make_position_key(SCALP_V2_ENGINE_ID, norm)] = position
                 with contextlib.suppress(Exception):
                     from backend.services.trade_state import get_trade_state_store
 
                     get_trade_state_store().on_entry_fill(norm, float(fill_price), float(atr or 0.0), engine_id=SCALP_V2_ENGINE_ID)
 
-                # 10. Atomic DB commit
+                # 10. Atomic DB commit, then publish lot and cash together
                 new_pv = float(self._positions_value) + filled_qty * fill_price
                 new_eq = new_cash + new_pv
-                await _asyncio.to_thread(
-                    self._scalp_v2_commit_buy_sync,
-                    symbol=norm,
-                    quantity=filled_qty,
-                    fill_price=fill_price,
-                    fee=fee,
-                    order_id=order_id,
-                    atr=atr,
-                    setup_name=setup_name,
-                    opportunity_id=opportunity_id,
-                    trade_id=trade_id,
-                    timestamp=now_ts,
-                    cash_balance=new_cash,
-                    positions_value=new_pv,
-                    total_equity=new_eq,
-                    realized_pnl=float(self._realized_pnl),
-                    unrealized_pnl=float(self._unrealized_pnl),
-                    decision_id=decision_key,
-                    reservation_id=str(reservation_id or ""),
-                    client_order_id=client_order_id,
-                    entry_time=float(position.entry_time),
-                    original_cost=float(total_cost),
-                    adaptive_decision=position.adaptive_decision,
-                )
+                with self._buy_commit_window():
+                    await _asyncio.to_thread(
+                        self._scalp_v2_commit_buy_sync,
+                        symbol=norm,
+                        quantity=filled_qty,
+                        fill_price=fill_price,
+                        fee=fee,
+                        order_id=order_id,
+                        atr=atr,
+                        setup_name=setup_name,
+                        opportunity_id=opportunity_id,
+                        trade_id=trade_id,
+                        timestamp=now_ts,
+                        cash_balance=new_cash,
+                        positions_value=new_pv,
+                        total_equity=new_eq,
+                        realized_pnl=float(self._realized_pnl),
+                        unrealized_pnl=float(self._unrealized_pnl),
+                        decision_id=decision_key,
+                        reservation_id=str(reservation_id or ""),
+                        client_order_id=client_order_id,
+                        entry_time=float(position.entry_time),
+                        original_cost=float(total_cost),
+                        adaptive_decision=position.adaptive_decision,
+                    )
+                    next_positions = dict(self.open_positions)
+                    next_positions[make_position_key(SCALP_V2_ENGINE_ID, norm)] = position
+                    self.open_positions = next_positions
+                    self.cash_balance = new_cash
+                    self._available_balance = max(0.0, new_cash)
+                    self._positions_value = new_pv
+                    self._total_equity = new_eq
                 # Canonical exchange-fill ledger (never reverses ownership on failure).
                 await _asyncio.to_thread(
                     self._scalp_v2_record_buy_fill_identity,
@@ -10448,10 +10481,6 @@ class PortfolioEngine:
                 self.last_buy_reject_reason = "POST_FILL_BIND_FAILED"
                 return None
 
-            # Commit memory after DB success
-            self.cash_balance = new_cash
-            self._positions_value = new_pv
-            self._total_equity = new_eq
             consume_reservation(
                 self.db_path,
                 reservation_id=reservation_id,
@@ -12148,76 +12177,77 @@ class PortfolioEngine:
             # tied back to the venue without guessing by quantity and time.
             str((live_order_buy or {}).get("id") or "") or None,
         )
-        try:
-            await asyncio.to_thread(
-                self._commit_atomic_day_open_sync,
-                trade_bind=trade_bind,
-                position=position,
-                cash_balance=committed_cash,
-                positions_value=committed_positions_value,
-                realized_pnl=float(self._realized_pnl),
-                unrealized_pnl=float(self._unrealized_pnl),
-                total_equity=committed_equity,
-                pre_ledger=pre_ledger,
-                fee=fee,
-                slippage_cost=slippage_cost,
-                quantity=quantity,
-                fill_price=fill_price,
-                symbol=symbol,
-                trade_id=trade_id,
-                entry_reason=explainability.regime if explainability else "unknown",
-                sleeve=effective_sleeve,
-            )
-        except Exception:
-            logger.error("BUY_ABORTED: atomic OPEN failed for %s — cash NOT debited, no position", symbol, exc_info=True)
-            if _entry_reserved:
-                self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
-                _entry_reserved = False
-            return None
-        with contextlib.suppress(Exception):
-            from backend.services.entry_fill_telemetry import (
-                build_entry_reference_telemetry,
-                persist_entry_reference_row,
-            )
-
-            _tel = build_entry_reference_telemetry(
-                best_bid=float(getattr(preflight, "best_bid", 0.0) or 0.0),
-                best_ask=float(getattr(preflight, "best_ask", 0.0) or 0.0),
-                submitted_order_price=float(getattr(preflight, "protected_limit_price", 0.0) or price or 0.0),
-                fill_price=float(fill_price),
-                decision_ts=_entry_ref_decision_ts,
-                fill_ts=time.time(),
-                live_order=live_order_buy if isinstance(live_order_buy, dict) else None,
-            )
-            with connect_rw(self.db_path) as _tel_conn:
-                persist_entry_reference_row(
-                    _tel_conn,
+        with self._buy_commit_window():
+            try:
+                await asyncio.to_thread(
+                    self._commit_atomic_day_open_sync,
+                    trade_bind=trade_bind,
+                    position=position,
+                    cash_balance=committed_cash,
+                    positions_value=committed_positions_value,
+                    realized_pnl=float(self._realized_pnl),
+                    unrealized_pnl=float(self._unrealized_pnl),
+                    total_equity=committed_equity,
+                    pre_ledger=pre_ledger,
+                    fee=fee,
+                    slippage_cost=slippage_cost,
+                    quantity=quantity,
+                    fill_price=fill_price,
+                    symbol=symbol,
                     trade_id=trade_id,
-                    telemetry=_tel,
-                    context_snapshot_json=_ctx_snapshot,
-                    diagnostics_json=json.dumps(protected_audit),
+                    entry_reason=explainability.regime if explainability else "unknown",
+                    sleeve=effective_sleeve,
                 )
-                _tel_conn.commit()
+            except Exception:
+                logger.error("BUY_ABORTED: atomic OPEN failed for %s — cash NOT debited, no position", symbol, exc_info=True)
+                if _entry_reserved:
+                    self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
+                    _entry_reserved = False
+                return None
+            with contextlib.suppress(Exception):
+                from backend.services.entry_fill_telemetry import (
+                    build_entry_reference_telemetry,
+                    persist_entry_reference_row,
+                )
 
-        async with self._global_cash_lock:
-            self._consume_entry_reservation(symbol, decision_id=str(decision_id or ""))
-            _entry_reserved = False
-            self.cash_balance = committed_cash
-            self._available_balance = max(0.0, self.cash_balance)
-            self._positions_value = committed_positions_value
-            self._total_equity = committed_equity
-        next_positions = dict(self.open_positions)
-        # Two-engine contract: adopt under the composite (engine_id, symbol)
-        # key so a sibling engine's lot on the same symbol survives. Drop only
-        # same-lineage DAY-side keys (bare + DAY-side composites): this lot
-        # replaces its own lineage, never the other engine's lot.
-        _adopt_engine = str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE")
-        next_positions.pop(normalized_symbol, None)
-        for _cand in DAY_SIDE_ENGINES:
-            if _cand != _adopt_engine:
-                next_positions.pop(make_position_key(_cand, normalized_symbol), None)
-        next_positions[make_position_key(_adopt_engine, normalized_symbol)] = position
-        self.open_positions = next_positions
+                _tel = build_entry_reference_telemetry(
+                    best_bid=float(getattr(preflight, "best_bid", 0.0) or 0.0),
+                    best_ask=float(getattr(preflight, "best_ask", 0.0) or 0.0),
+                    submitted_order_price=float(getattr(preflight, "protected_limit_price", 0.0) or price or 0.0),
+                    fill_price=float(fill_price),
+                    decision_ts=_entry_ref_decision_ts,
+                    fill_ts=time.time(),
+                    live_order=live_order_buy if isinstance(live_order_buy, dict) else None,
+                )
+                with connect_rw(self.db_path) as _tel_conn:
+                    persist_entry_reference_row(
+                        _tel_conn,
+                        trade_id=trade_id,
+                        telemetry=_tel,
+                        context_snapshot_json=_ctx_snapshot,
+                        diagnostics_json=json.dumps(protected_audit),
+                    )
+                    _tel_conn.commit()
+
+            async with self._global_cash_lock:
+                self._consume_entry_reservation(symbol, decision_id=str(decision_id or ""))
+                _entry_reserved = False
+                self.cash_balance = committed_cash
+                self._available_balance = max(0.0, self.cash_balance)
+                self._positions_value = committed_positions_value
+                self._total_equity = committed_equity
+            next_positions = dict(self.open_positions)
+            # Two-engine contract: adopt under the composite (engine_id, symbol)
+            # key so a sibling engine's lot on the same symbol survives. Drop only
+            # same-lineage DAY-side keys (bare + DAY-side composites): this lot
+            # replaces its own lineage, never the other engine's lot.
+            _adopt_engine = str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE")
+            next_positions.pop(normalized_symbol, None)
+            for _cand in DAY_SIDE_ENGINES:
+                if _cand != _adopt_engine:
+                    next_positions.pop(make_position_key(_cand, normalized_symbol), None)
+            next_positions[make_position_key(_adopt_engine, normalized_symbol)] = position
+            self.open_positions = next_positions
         self._recently_added_symbols[normalized_symbol] = time.time()
         self.trade_explanations[trade_id] = explainability
         self._prune_trade_explanations()
