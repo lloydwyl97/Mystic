@@ -4,14 +4,17 @@ One number decides SCALP entry eligibility, rank and size. It starts from the
 current candidate and the live book:
 
     base_executable_edge  = raw expected move - live cost (fees, slippage, spread, impact)
-    final_executable_edge = base_executable_edge + adaptive_residual + micro_residual
+    final_executable_edge = base_executable_edge + adaptive_residual + claim_residual + micro_residual
 
 ``adaptive_residual`` is the learned, bounded mean of (realized net markout -
 base executable edge) for the candidate's key and raw-move source (ATR
 estimate or strategy structural claim); a cold key contributes 0.
-``micro_residual`` is the existing bounded microstructure tilt. It may lower a
-candidate, but it cannot lift one whose base edge plus learned residual is not
-already positive.
+``claim_residual`` = (claim_capture - 1) x (base edge - the key's mean claimed
+base edge). The residual is a mean over all claim sizes; claim_capture is the
+learned share of a claim's excess that realizes, so an outsized claim is not
+admitted on its size alone. Cold, claim_capture is 1 and this term is 0.
+``micro_residual`` is the existing bounded microstructure tilt. Both terms may
+lower a candidate, but neither can lift one that is not already positive.
 
 ``final_executable_edge <= 0`` is hard economic safety (NO_EXECUTABLE_NET_EDGE).
 Anything above zero stays eligible. Confidence, risk and the final edge set
@@ -50,6 +53,8 @@ class ExecutableEdge:
     spread_pct: float
     impact_pct: float
     reject_threshold_pct: float = REJECT_THRESHOLD_PCT
+    claim_capture: float = 1.0
+    claim_residual_pct: float = 0.0
 
     @property
     def eligible(self) -> bool:
@@ -118,8 +123,12 @@ def scalp_executable_edge(
     cost = canonical_roundtrip_cost_pct(spread_pct=spread_pct, buy_impact_pct=max(0.0, _f(impact_pct)), sell_impact_pct=0.0)
     base = raw - cost
     adaptive = _f(view.get("adaptive_residual_strategy"))
+    capture = max(0.0, min(1.0, _f(view.get("claim_capture"), 1.0)))
+    claim_model = (capture - 1.0) * (base - _f(view.get("claim_base_mean")))
+    pre_claim = base + adaptive
+    claim = claim_model if (pre_claim > REJECT_THRESHOLD_PCT or claim_model < 0) else 0.0
     micro_model = _f(view.get("micro_residual"))
-    pre_micro = base + adaptive
+    pre_micro = pre_claim + claim
     micro = micro_model if (pre_micro > REJECT_THRESHOLD_PCT or micro_model < 0) else 0.0
     final = pre_micro + micro
     confidence = _f(view.get("confidence_strategy"))
@@ -141,6 +150,8 @@ def scalp_executable_edge(
         size_mult=scalp_size_mult(final, confidence, risk, cost),
         spread_pct=_f(spread_pct),
         impact_pct=max(0.0, _f(impact_pct)),
+        claim_capture=capture,
+        claim_residual_pct=claim,
     )
 
 
@@ -159,6 +170,8 @@ _DETAIL_KEYS: tuple[tuple[str, str], ...] = (
     ("live_cost", "live_cost_pct"),
     ("base_executable_edge", "base_executable_edge_pct"),
     ("adaptive_residual", "adaptive_residual_pct"),
+    ("claim_capture", "claim_capture"),
+    ("claim_residual", "claim_residual_pct"),
     ("micro_residual", "micro_residual_pct"),
     ("micro_residual_model", "micro_residual_model_pct"),
     ("final_executable_edge", "final_executable_edge_pct"),

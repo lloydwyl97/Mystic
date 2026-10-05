@@ -726,9 +726,22 @@ async def get_adaptive_calibration() -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@router.get("/adaptive/day-candidate-markouts")
+async def get_day_candidate_markouts(window_days: float = 7.0) -> dict[str, Any]:
+    """Current-version DAY candidate markouts by decision state and setup. Read-only."""
+    try:
+        from backend.services.adaptive_learning import day_candidate_markout_report
+
+        data = await asyncio.to_thread(day_candidate_markout_report, os.getenv("TRADING_DB_PATH", DATABASE_PATH), window_days)
+        return {"success": True, "data": data}
+    except Exception as exc:
+        logger.exception("day-candidate-markouts failed: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @router.get("/adaptive/abstention")
 async def get_adaptive_abstention(window_days: float = 7.0) -> dict[str, Any]:
-    """Is the live abstention skip earning its keep? Skip counts + net edge avoided. Read-only."""
+    """Keys carrying a learned negative net expectancy (telemetry, no live veto). Read-only."""
     try:
         from backend.services.adaptive_learning import abstention_report
 

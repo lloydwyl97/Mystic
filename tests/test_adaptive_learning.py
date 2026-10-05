@@ -51,7 +51,8 @@ def test_a_i_day_markout_updates_state_and_next_candidate_reads_it(tmp_path):
     after = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "neutral")
     assert learned == 1
     assert after["n_forward"] >= 1
-    assert after["expected_move"] != before["expected_move"]
+    assert after["expected_net"] > before["expected_net"] == 0.0
+    assert after["size_mult"] > before["size_mult"]
     from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 
     assert "day_decision" in inspect.getsource(PortfolioEngineIntegration._process_day_v2_signals)
@@ -65,6 +66,7 @@ def test_b_c_d_e_f_day_outcome_moves_rank_size_objective_and_runner(tmp_path):
     assert observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="bull", metric="trade_mfe", value=0.04, strategy_version=DAY_STRATEGY_VERSION)
     assert observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="bull", metric="trade_continuation", value=0.9, strategy_version=DAY_STRATEGY_VERSION)
     assert observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="bull", metric="trade_time_to_mfe_min", value=40.0, strategy_version=DAY_STRATEGY_VERSION)
+    assert observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="bull", metric="trade_net", value=0.01, strategy_version=DAY_STRATEGY_VERSION)
     assert observe(db, engine=DAY, symbol="SOLUSDT", setup="RANGE_BOUNCE", regime="bear", metric="trade_mae", value=0.02, strategy_version=DAY_STRATEGY_VERSION)
     btc = day_decision(db, "BTCUSDT", "HTF_TREND_PULLBACK", "bull")
     sol = day_decision(db, "SOLUSDT", "RANGE_BOUNCE", "bear")
@@ -603,16 +605,23 @@ def test_abstention_report_measures_value(tmp_path):
     assert any(r["symbol"] == "XRPUSDT" for r in day["abstaining"])
 
 
-def test_abstention_is_live_skip_only(tmp_path):
-    """DAY enforces the skip live. SCALP keeps it as telemetry: its canonical
-    executable edge is the single negative-edge gate."""
+def test_learned_negative_edge_flag_is_telemetry_on_both_engines(tmp_path):
+    """Neither engine vetoes on the learned flag. DAY carries learned net
+    expectancy into size and rank; SCALP gates on its canonical executable edge."""
     from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 
     fund = inspect.getsource(PortfolioEngineIntegration._fund_day_v2_candidate)
-    assert "abstain" in fund and "REJECTED:LEARNED_NEGATIVE_EDGE" in fund and "return" in fund
+    assert "LEARNED_NEGATIVE_EDGE" not in fund and "abstain" not in fund
+    assert "size_mult" in fund
     scalp = inspect.getsource(PortfolioEngineIntegration._process_scalp_v2_signals)
     assert "LEARNED_NEGATIVE_EDGE" not in scalp
     assert "NO_EXECUTABLE_NET_EDGE" in inspect.getsource(__import__("backend.services.scalp_v2.decision_log", fromlist=["classify_scalp_candidate"]).classify_scalp_candidate)
+    db = str(tmp_path / "t.db")
+    for _ in range(40):
+        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_net", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
+    d = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")
+    assert d["abstain"] is True and d["abstain_live_veto"] is False
+    assert d["size_mult"] < 1.0
 
 
 def test_markout_label_is_the_decision_horizon_not_the_best_future(tmp_path):

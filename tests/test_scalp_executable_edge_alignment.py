@@ -330,7 +330,7 @@ def test_no_duplicate_negative_edge_live_gate_in_scalp_loop():
     from backend.services import portfolio_engine_integration as pei
 
     src = inspect.getsource(pei)
-    assert src.count("REJECTED:LEARNED_NEGATIVE_EDGE") == 1  # DAY's own abstention only
+    assert src.count("REJECTED:LEARNED_NEGATIVE_EDGE") == 0  # learned flag is telemetry on both engines
     assert "SCALP_V2_ABSTAIN" not in src
     assert re.search(r"(?<!\w)scalp_decision\(", src) is None
     assert "detail=decision_detail(row" in src
@@ -505,12 +505,14 @@ def test_detail_is_never_empty_for_hard_blocks_before_edge():
 
 
 def test_day_priors_and_decision_unchanged():
+    # Net quantities (realized trade net, cost-adjusted forward markout) are neutral.
     assert al._PRIORS[al.DAY_ENGINE] == {
         "trade_mfe": 0.012,
         "trade_mae": 0.006,
         "trade_time_to_mfe_min": 90.0,
         "trade_continuation": 0.45,
-        "markout_forward": 0.012,
+        "trade_net": 0.0,
+        "markout_forward": 0.0,
         "markout_mae": 0.006,
     }
     src = inspect.getsource(al.day_decision)

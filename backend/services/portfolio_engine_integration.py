@@ -1653,7 +1653,7 @@ class PortfolioEngineIntegration:
                     from backend.services.candle_contract import load_closed_bars
                     from backend.services.day_v2.cycle_gate import required_15m_open
                     from backend.services.day_v2.decision_log import record_day_decision
-                    from backend.services.day_v2.live_signal import explain_no_signal
+                    from backend.services.day_v2.live_signal import ENABLED_SETUPS, explain_no_signal
 
                     as_of = float(entry_bar or time.time())
                     from backend.services.day_v2.candle_wait import (
@@ -1704,22 +1704,38 @@ class PortfolioEngineIntegration:
                     signal = evaluate_entry_signal(symbol, bars_15m, bars_1h, bars_4h)
                     if signal is None:
                         explained = explain_no_signal(symbol, bars_15m, bars_1h, bars_4h)
-                        record_day_decision(
-                            db_path,
-                            symbol,
-                            "NO_SIGNAL",
-                            cycle_ts=as_of,
-                            closest=str(explained.get("closest") or "no_setup"),
-                            unmet=list(explained.get("unmet") or []),
-                        )
+                        closest = str(explained.get("closest") or "no_setup")
+                        unmet = list(explained.get("unmet") or [])
+                        record_day_decision(db_path, symbol, "NO_SIGNAL", cycle_ts=as_of, closest=closest, unmet=unmet)
                         logger.info(
                             "DAY_V2_NO_SIGNAL symbol=%s closest=%s unmet=%s regime=%s rsi=%s",
                             symbol,
-                            explained.get("closest"),
-                            ",".join(explained.get("unmet") or []),
+                            closest,
+                            ",".join(unmet),
                             explained.get("regime"),
                             explained.get("rsi"),
                         )
+                        if len(unmet) == 1 and closest in ENABLED_SETUPS and ask_price > 0:
+                            # Near-qualified: causal markout evidence from the same
+                            # executable price, never folded into decision state.
+                            try:
+                                from backend.config.trading_economics import canonical_roundtrip_cost_pct
+                                from backend.services.adaptive_learning import CANDIDATE_NEAR_QUALIFIED, market_regime_tag, record_candidate
+
+                                record_candidate(
+                                    db_path,
+                                    engine="DAY_V2",
+                                    symbol=symbol,
+                                    setup=closest,
+                                    regime=market_regime_tag(db_path, symbol) or str(explained.get("regime") or ""),
+                                    ref_price=ask_price,
+                                    roundtrip_cost=canonical_roundtrip_cost_pct(),
+                                    signaled=False,
+                                    evaluated_at=as_of,
+                                    candidate_state=CANDIDATE_NEAR_QUALIFIED,
+                                )
+                            except Exception:
+                                logger.debug("DAY_V2_NEAR_QUALIFIED_RECORD_FAILED symbol=%s", symbol, exc_info=True)
                         continue
 
                     # --- DAY_STRUCTURAL_PULLBACK_V1 gates (in order) ---
@@ -1799,7 +1815,7 @@ class PortfolioEngineIntegration:
                         }
                     )
                     from backend.config.trading_economics import canonical_roundtrip_cost_pct
-                    from backend.services.adaptive_learning import market_regime_tag, record_candidate
+                    from backend.services.adaptive_learning import CANDIDATE_QUALIFIED, market_regime_tag, record_candidate
 
                     # One regime key for the whole candidate lifecycle: the markout
                     # record, the entry decision, and the close all use this tag so
@@ -1817,6 +1833,7 @@ class PortfolioEngineIntegration:
                         roundtrip_cost=canonical_roundtrip_cost_pct(),
                         signaled=True,
                         evaluated_at=as_of,
+                        candidate_state=CANDIDATE_QUALIFIED,
                     )
 
                 except Exception:
@@ -1861,15 +1878,6 @@ class PortfolioEngineIntegration:
         ask_price = cand["ask_price"]
         db_sym_15m = cand["db_symbol"]
         as_of = cand["as_of"]
-        # Evidence-gated abstention (LIVE skip). Only fires on confident,
-        # cost-adjusted negative expectancy for this setup/regime; cold keys
-        # never abstain. Skip-only — it never forces a trade and sits above,
-        # not around, hard safety.
-        _adapt = cand.get("adaptive") or {}
-        if isinstance(_adapt, dict) and _adapt.get("abstain"):
-            record_day_decision(db_path, symbol, "REJECTED:LEARNED_NEGATIVE_EDGE", cycle_ts=as_of, closest=str(_adapt.get("abstain_reason") or ""))
-            logger.info("DAY_V2_ABSTAIN symbol=%s reason=%s", symbol, _adapt.get("abstain_reason"))
-            return
         # Engine sizing, then clamped to what the DAY sleeve can still fund
         # (open DAY lots and live reservations included). SCALP capital is never used.
         atr_val = float(signal.atr or 0.0)

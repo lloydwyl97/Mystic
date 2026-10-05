@@ -1,7 +1,7 @@
 """Rebuild SCALP derived edge/risk state from current-version candidate markouts.
 
 Derived estimators only: ``edge_residual``, ``markout_mae`` (gross path MAE, the
-live risk estimate) and the ``micro_edge`` model for SCALP_V2. Every other
+live risk estimate), the claim capture moments and the ``micro_edge`` model for SCALP_V2. Every other
 metric, every DAY row, ownership, accounting and trade history are untouched.
 Both state tables are copied to backup tables before anything is deleted.
 
@@ -24,7 +24,7 @@ from typing import Any
 from backend.services import adaptive_learning as al
 from backend.services.scalp_v2.raw_move_source import is_directional, normalize_raw_move_source
 
-REBUILT_METRICS = ("edge_residual", "edge_residual_strategy", "markout_mae")
+REBUILT_METRICS = ("edge_residual", "edge_residual_strategy", "markout_mae", *al.CLAIM_MOMENT_METRICS)
 MICRO_MODEL = "micro_edge"
 
 
@@ -172,6 +172,17 @@ def rebuild_scalp_edge_state(
         residual = al.scalp_edge_residual(forward_net=forward, raw_expected_move=raw, roundtrip_cost=float(row["roundtrip_cost"] or 0))
         if al.observe(db_path, metric=al.residual_metric(source), value=residual, **common):
             stats["residual_obs"] += 1
+        if is_directional(source):
+            al.learn_claim_label(
+                db_path,
+                symbol=row["symbol"],
+                setup=row["setup"],
+                regime=row["regime"],
+                strategy_version=row["strategy_version"],
+                base_edge=raw - float(row["roundtrip_cost"] or 0),
+                residual=residual,
+                now=moment,
+            )
         if isinstance(feats, dict) and feats and is_directional(source):
             al.update_linear_model(db_path, engine, MICRO_MODEL, feats, residual)
             stats["micro_updates"] += 1
