@@ -1754,22 +1754,7 @@ class PortfolioEngineIntegration:
                     except Exception:
                         logger.debug("DAY_V2_OPP_CONSUMED_CHECK_FAILED symbol=%s", symbol, exc_info=True)
 
-                    # 2. Frequency guard — rolling 24h caps (DAY V2 only)
-                    try:
-                        from backend.services.day_v2.frequency_guard import check_frequency_limit
-
-                        _freq_ok, _freq_reason = check_frequency_limit(db_path, symbol)
-                        if not _freq_ok:
-                            logger.info(
-                                "DAY_V2_FREQ_LIMIT symbol=%s reason=%s",
-                                symbol,
-                                _freq_reason,
-                            )
-                            continue
-                    except Exception:
-                        logger.debug("DAY_V2_FREQ_CHECK_FAILED symbol=%s", symbol, exc_info=True)
-
-                    # 3. Structural zone. Integrity only: an invalid zone means the
+                    # 2. Structural zone. Integrity only: an invalid zone means the
                     # setup lacks its structural anchor/ATR/target (missing data) or
                     # is unsupported. zone_low/zone_high/reclaim are diagnostic;
                     # price is never required to sit inside the zone.
@@ -1802,39 +1787,48 @@ class PortfolioEngineIntegration:
                         logger.warning("DAY_V2_HARD_DATA_REJECT symbol=%s reason=MISSING_EXECUTABLE_PRICE", symbol)
                         continue
 
-                    candidates.append(
-                        {
-                            "symbol": symbol,
-                            "norm": norm,
-                            "signal": signal,
-                            "zone": _zone,
-                            "reclaim_level": _reclaim_level,
-                            "ask_price": ask_price,
-                            "db_symbol": db_sym_15m,
-                            "as_of": as_of,
-                        }
-                    )
-                    from backend.config.trading_economics import canonical_roundtrip_cost_pct
-                    from backend.services.adaptive_learning import CANDIDATE_QUALIFIED, market_regime_tag, record_candidate
+                    from backend.services.adaptive_learning import market_regime_tag
 
                     # One regime key for the whole candidate lifecycle: the markout
                     # record, the entry decision, and the close all use this tag so
                     # they land on the same adaptive row. Falls back to the signal's
                     # own regime string when market data is thin.
-                    regime_tag = market_regime_tag(db_path, symbol) or str(signal.regime or "")
-                    candidates[-1]["regime_tag"] = regime_tag
-                    record_candidate(
-                        db_path,
-                        engine="DAY_V2",
-                        symbol=symbol,
-                        setup=signal.setup,
-                        regime=regime_tag,
-                        ref_price=ask_price,
-                        roundtrip_cost=canonical_roundtrip_cost_pct(),
-                        signaled=True,
-                        evaluated_at=as_of,
-                        candidate_state=CANDIDATE_QUALIFIED,
-                    )
+                    cand = {
+                        "symbol": symbol,
+                        "norm": norm,
+                        "signal": signal,
+                        "zone": _zone,
+                        "reclaim_level": _reclaim_level,
+                        "ask_price": ask_price,
+                        "db_symbol": db_sym_15m,
+                        "as_of": as_of,
+                        "regime_tag": market_regime_tag(db_path, symbol) or str(signal.regime or ""),
+                    }
+
+                    # 3. Frequency guard — rolling 24h caps (DAY V2 only). A capped
+                    # signal is the same contract, so its lifecycle is learnable.
+                    try:
+                        from backend.services.day_v2.frequency_guard import check_frequency_limit
+
+                        _freq_ok, _freq_reason = check_frequency_limit(db_path, symbol)
+                        if not _freq_ok:
+                            logger.info(
+                                "DAY_V2_FREQ_LIMIT symbol=%s reason=%s",
+                                symbol,
+                                _freq_reason,
+                            )
+                            try:
+                                from backend.services.adaptive_learning import CANDIDATE_QUALIFIED_BLOCKED, day_decision
+
+                                cand["adaptive"] = day_decision(db_path, symbol, signal.setup, cand["regime_tag"])
+                                self._record_day_v2_candidate(db_path, cand, CANDIDATE_QUALIFIED_BLOCKED)
+                            except Exception:
+                                logger.debug("DAY_V2_BLOCKED_RECORD_FAILED symbol=%s", symbol, exc_info=True)
+                            continue
+                    except Exception:
+                        logger.debug("DAY_V2_FREQ_CHECK_FAILED symbol=%s", symbol, exc_info=True)
+
+                    candidates.append(cand)
 
                 except Exception:
                     logger.warning("DAY_V2_SIGNAL_ERROR symbol=%s", symbol, exc_info=True)
@@ -1842,7 +1836,7 @@ class PortfolioEngineIntegration:
             if not candidates:
                 return
             from backend.config.trading_economics import canonical_roundtrip_cost_pct
-            from backend.services.adaptive_learning import day_decision, ohlcv_low_between, ohlcv_quote, resolve_markouts
+            from backend.services.adaptive_learning import CANDIDATE_QUALIFIED, day_decision, ohlcv_low_between, ohlcv_quote, resolve_markouts
             from backend.services.day_v2.ranking import rank_day_candidates
 
             resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts), path_low=lambda sym, a, b: ohlcv_low_between(db_path, sym, a, b))
@@ -1853,8 +1847,16 @@ class PortfolioEngineIntegration:
             ranked = rank_day_candidates(candidates, list(DAY_V2_UNIVERSE), canonical_roundtrip_cost_pct())
             logger.info(
                 "DAY_V2_RANKED %s",
-                " ".join(f"{c['rank']['position']}:{c['symbol']}:{c['signal'].setup}:edge={c['rank']['executable_objective_edge']:.5f}" for c in ranked),
+                " ".join(
+                    f"{c['rank']['position']}:{c['symbol']}:{c['signal'].setup}:net={c['rank']['expected_net']:.5f}:size={c['rank']['size_mult']:.3f}:edge={c['rank']['executable_objective_edge']:.5f}"
+                    for c in ranked
+                ),
             )
+            for cand in ranked:
+                try:
+                    cand["markout_id"] = self._record_day_v2_candidate(db_path, cand, CANDIDATE_QUALIFIED)
+                except Exception:
+                    logger.debug("DAY_V2_CANDIDATE_RECORD_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
             for cand in ranked:
                 try:
                     await self._fund_day_v2_candidate(cand, db_path)
@@ -1863,6 +1865,44 @@ class PortfolioEngineIntegration:
 
         except Exception:
             logger.warning("DAY_V2_PROCESS_ERROR", exc_info=True)
+
+    @staticmethod
+    def _record_day_v2_candidate(db_path: str, cand: dict[str, Any], state: str) -> int | None:
+        """Persist one qualified DAY candidate: lifecycle inputs at the decision ask,
+        the decision-time expected-net-edge breakdown and its rank."""
+        from backend.config.trading_economics import canonical_roundtrip_cost_pct
+        from backend.services.adaptive_learning import record_candidate
+        from backend.services.day_v2.lifecycle_sim import LifecycleParams
+
+        signal = cand["signal"]
+        adaptive = cand.get("adaptive") or {}
+        economic = dict(adaptive.get("economic") or {})
+        rank = cand.get("rank") or {}
+        economic.update(
+            {
+                "candidate_state": state,
+                "rank_score": rank.get("score"),
+                "rank_position": rank.get("position"),
+                "rank_of": rank.get("of"),
+                "executable_objective_edge": rank.get("executable_objective_edge"),
+                "size_mult": adaptive.get("size_mult"),
+            }
+        )
+        return record_candidate(
+            db_path,
+            engine="DAY_V2",
+            symbol=cand["symbol"],
+            setup=signal.setup,
+            regime=str(cand.get("regime_tag") or signal.regime or ""),
+            ref_price=float(cand["ask_price"]),
+            roundtrip_cost=canonical_roundtrip_cost_pct(),
+            signaled=True,
+            evaluated_at=float(cand["as_of"]),
+            candidate_state=state,
+            lifecycle=LifecycleParams.from_signal(signal, entry_price=float(cand["ask_price"]), entry_time=float(cand["as_of"]), adaptive=adaptive),
+            economic=economic,
+            opportunity_id=str(signal.opportunity_id or ""),
+        )
 
     async def _fund_day_v2_candidate(self, cand: dict[str, Any], db_path: str) -> None:
         """Size one ranked DAY V2 candidate from the remaining DAY sleeve and submit it."""
@@ -1972,6 +2012,12 @@ class PortfolioEngineIntegration:
         )
         if _filled:
             record_day_decision(db_path, symbol, "FILLED", cycle_ts=as_of, closest=signal.setup)
+            try:
+                from backend.services.adaptive_learning import mark_candidate_filled
+
+                mark_candidate_filled(db_path, cand.get("markout_id"))
+            except Exception:
+                logger.debug("DAY_V2_CANDIDATE_FILLED_MARK_FAILED symbol=%s", symbol, exc_info=True)
             try:
                 from backend.services.day_entry_reservations import consume_reservation
 
@@ -2200,11 +2246,21 @@ class PortfolioEngineIntegration:
         from backend.services.scalp_v2.executable_edge import decision_detail
 
         markout_db = self.engine.db_path
+
+        def _tick_quote(sym: str, start: float, end: float) -> float | None:
+            # Last tape print after the decision and within the horizon; None when
+            # the sparse top-4 tape printed nothing in that window.
+            from backend.services.day_order_flow_tape import read_tape
+
+            prints = [p for p in read_tape(sym, since_ts=start, until_ts=end) if p.trade_ts > start]
+            return prints[-1].price if prints else None
+
         await _asyncio.to_thread(
             resolve_markouts,
             markout_db,
             lambda sym, ts: ohlcv_quote(markout_db, sym, ts),
             path_low=lambda sym, a, b: ohlcv_low_between(markout_db, sym, a, b),
+            tick_quote=_tick_quote,
         )
         by_symbol = {str(row.get("symbol") or "").upper().replace("-", "").replace("/", ""): row for row in candidates}
         products = [str(s) for s in getattr(cfg, "products", [])] or list(by_symbol)
@@ -2240,6 +2296,7 @@ class PortfolioEngineIntegration:
                 features=micro_feats,
                 raw_expected_move=(row.get("executable_edge") or {}).get("raw_expected_move_pct"),
                 raw_move_source=(row.get("executable_edge") or {}).get("raw_move_source") or (row.get("rank_meta") or {}).get("edge_source") or "NONE",
+                economic=(row.get("executable_edge") or {}).get("economic"),
             )
             return {"setup": setup_name, "regime": regime, "features": micro_feats, "ref_price": ref_price}
 

@@ -1,15 +1,25 @@
 """Online adaptive state for DAY_V2 and SCALP_V2.
 
-One framework, two engines. A row is keyed by engine, symbol, setup and regime,
-so DAY observations never update SCALP and SCALP observations never update DAY.
-Each estimate is a shrunk mean: ``(prior_strength * prior + n * ewma) / (prior_strength + n)``.
-With no observations the estimate is the prior and confidence is 0. There is no
-minimum-trade gate and no profit-factor gate. Legacy strategy versions are
-refused at write time.
+One framework, two engines. A row is keyed by engine, economic version, symbol,
+setup, regime and metric, so DAY observations never update SCALP, and state
+learned under another contract, anchor or learner format is never read. The
+economic version (``strategy_version.economic_version``) is stamped on every
+state row and candidate row; evidence decided before the engine's economic
+anchor never moves state.
 
-Realized closes update ``trade_*`` metrics. Candidate markouts update
-``markout_*`` metrics. Decisions blend the two. Both are consumed by live
-ranking, sizing and exit calibration.
+Estimates are hierarchical. A key (symbol + setup + regime) shrinks toward the
+related evidence of the same setup (same symbol or same regime), which shrinks
+toward the setup, which shrinks toward the engine, which shrinks toward the
+prior. Each observation is counted at exactly one level, and each level's
+weight is its decayed sample count against ``PRIOR_STRENGTH``: thin specific
+evidence leans on the broader levels, informative specific evidence dominates.
+There is no minimum-trade gate and no profit-factor gate.
+
+Realized closes update ``trade_*`` metrics. DAY candidates update
+``lifecycle_net`` (the live exit contract replayed from the decision ask) and
+the fixed-horizon ``markout_*`` diagnostics. SCALP claims update the claim
+calibration. Decisions blend these continuously; DAY net expectancy sets
+bounded size and rank, SCALP calibration sets the executable edge.
 """
 
 from __future__ import annotations
@@ -28,11 +38,15 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 from backend.services.scalp_v2.raw_move_source import is_directional, normalize_raw_move_source
-from backend.services.strategy_version import ADAPTIVE_STATE_VERSION, engine_versions
+from backend.services.strategy_version import ADAPTIVE_STATE_VERSION, economic_anchor, economic_version, engine_versions
 
 PRIOR_STRENGTH = 8.0
 EWMA_ALPHA = 0.25
 MARKOUT_WEIGHT = 0.35
+# DAY lifecycle labels replay the live exit contract on 1m bars; against the
+# realized post-anchor closes they correlate 0.94. They count slightly below a
+# realized close so simulated evidence never outweighs the same amount of fills.
+LIFECYCLE_WEIGHT = 0.75
 
 DAY_ENGINE = "DAY_V2"
 SCALP_ENGINE = "SCALP_V2"
@@ -56,10 +70,12 @@ _PRIORS: dict[str, dict[str, float]] = {
         "trade_mae": 0.006,
         "trade_time_to_mfe_min": 90.0,
         "trade_continuation": 0.45,
-        # Net quantities (realized trade net after costs, cost-adjusted forward
-        # markout) start neutral: no edge is assumed before evidence. The MFE
-        # prior is a path maximum, not a net return, and must not seed them.
+        # Net quantities (realized trade net after costs, lifecycle net,
+        # cost-adjusted forward markout) start neutral: no edge is assumed
+        # before evidence. The MFE prior is a path maximum, not a net return,
+        # and must not seed them.
         "trade_net": 0.0,
+        "lifecycle_net": 0.0,
         "markout_forward": 0.0,
         "markout_mae": 0.006,
     },
@@ -83,15 +99,25 @@ _PRIORS: dict[str, dict[str, float]] = {
         "claim_base_edge_sq": 0.0,
         "claim_residual": 0.0,
         "claim_base_edge_x_residual": 0.0,
+        # Decayed moments of (decision-time micro tilt, what the edge before micro
+        # missed) for the learned micro weight.
+        "micro_tilt_sq": 0.0,
+        "micro_tilt_x_miss": 0.0,
     },
 }
 
 CLAIM_MOMENT_METRICS = ("claim_base_edge", "claim_base_edge_sq", "claim_residual", "claim_base_edge_x_residual")
+MICRO_WEIGHT_METRICS = ("micro_tilt_sq", "micro_tilt_x_miss")
+MICRO_WEIGHT_KEY = ("", "MICRO_MODEL", "")
 
-# DAY candidate markout states. NEAR_QUALIFIED rows (one entry condition short)
-# are resolved for evidence and never folded into decision state.
+# DAY candidate states. QUALIFIED: the setup fired and passed integrity checks.
+# QUALIFIED_BLOCKED: it fired but a capacity rule (24h frequency cap) stopped
+# it; same contract, so its lifecycle is learnable. NEAR_QUALIFIED: one entry
+# condition short; resolved for evidence and never folded into decision state.
 CANDIDATE_QUALIFIED = "QUALIFIED"
+CANDIDATE_QUALIFIED_BLOCKED = "QUALIFIED_BLOCKED"
 CANDIDATE_NEAR_QUALIFIED = "NEAR_QUALIFIED"
+LEARNABLE_DAY_STATES = frozenset({"", CANDIDATE_QUALIFIED, CANDIDATE_QUALIFIED_BLOCKED})
 
 # Bound on the learned residual added to a SCALP candidate's base executable
 # edge. Equal to the raw expected-move cap, so evidence can cancel a full claim.
@@ -108,9 +134,15 @@ def residual_metric(raw_move_source: str | None) -> str:
 # Causal calibration on current-version SCALP markouts: a 0.25 EWMA residual
 # tracks the last few labels and produced 4x more positive predictions with no
 # better realization; the running mean converges to the key's actual bias.
-MEAN_FORM_METRICS = frozenset({"edge_residual", "edge_residual_strategy", *CLAIM_MOMENT_METRICS})
+MEAN_FORM_METRICS = frozenset({"edge_residual", "edge_residual_strategy", "lifecycle_net", "trade_net", *CLAIM_MOMENT_METRICS, *MICRO_WEIGHT_METRICS})
 
 SIZE_BOUNDS = {"DAY_V2": (0.55, 1.35), "SCALP_V2": (0.50, 1.25)}
+# Prior information on the SCALP claim slope, in claim-variance units: a key's
+# within-key claim spread must reach PRIOR_STRENGTH claims of this variance to
+# weigh as much as the parent slope.
+CLAIM_SLOPE_PRIOR_VAR = 0.0008**2
+# Prior information on the micro weight, in tilt-variance units (typical tilt ~2 bps).
+MICRO_WEIGHT_PRIOR_VAR = 0.0002**2
 OBJECTIVE_ATR_BOUNDS = (0.75, 1.35)
 STRUCTURAL_EMPHASIS_BOUNDS = (0.85, 1.25)
 ACTIVATION_BOUNDS = (0.80, 1.25)
@@ -119,11 +151,13 @@ TIGHTEN_BOUNDS = (0.75, 1.15)
 SCALP_TARGET_BOUNDS = (0.0015, 0.006)
 SCALP_HOLD_FLOOR_MIN = 4.0
 
-# Half-life for observation weight. Older evidence loses effective sample count
-# so the estimator tracks current market behaviour instead of averaging over a
-# stale regime forever. It never zeroes a key (the new observation always counts
-# for 1), so there is no min-trade gate and no forgetting to a hard stop.
+# Half-life for observation weight, per engine. Older evidence loses effective
+# sample count, at write time and at read time, so a key that stops receiving
+# evidence relaxes toward its parent and a losing state can recover. SCALP
+# resolves hundreds of claims a day, DAY about ten, so SCALP forgets faster.
+# It never zeroes a key, so there is no min-trade gate and no hard stop.
 ADAPTIVE_HALF_LIFE_DAYS = float(os.getenv("ADAPTIVE_HALF_LIFE_DAYS", "14") or "14")
+SCALP_HALF_LIFE_DAYS = float(os.getenv("ADAPTIVE_SCALP_HALF_LIFE_DAYS", "3") or "3")
 
 # SCALP microstructure edge model. A single inspectable online linear model
 # (normalised LMS) that learns how the current book/flow shifts the candidate's
@@ -174,14 +208,25 @@ def _parse_iso(ts: str) -> float | None:
         return None
 
 
-def _decay_factor(updated_at: str, now_epoch: float) -> float:
+def half_life_days(engine: str) -> float:
+    return SCALP_HALF_LIFE_DAYS if str(engine or "").upper() == SCALP_ENGINE else ADAPTIVE_HALF_LIFE_DAYS
+
+
+def _decay_factor(updated_at: str, now_epoch: float, engine: str = DAY_ENGINE) -> float:
     """Weight retained for a key's prior sample count, by age. 1.0 if age unknown."""
     t0 = _parse_iso(updated_at)
-    half_life = ADAPTIVE_HALF_LIFE_DAYS * 86400.0
+    half_life = half_life_days(engine) * 86400.0
     if t0 is None or half_life <= 0:
         return 1.0
     elapsed = max(0.0, float(now_epoch) - t0)
     return float(0.5 ** (elapsed / half_life))
+
+
+def _data_clock(rows: list[sqlite3.Row]) -> float:
+    """Newest evidence time among ``rows``: reads decay older keys against the
+    latest information, so identical state always reads identically."""
+    stamps = [t for r in rows if (t := _parse_iso(str(r["updated_at"] or ""))) is not None]
+    return max(stamps) if stamps else 0.0
 
 
 def _is_forensic_key(engine_id: str, symbol: str, setup: str, regime: str) -> bool:
@@ -207,25 +252,65 @@ def current_strategy_version(engine: str) -> str:
     return str(versions["strategy_version"]) if versions else ""
 
 
+def current_economic_version(engine: str) -> str:
+    return economic_version(str(engine or "").upper())
+
+
+def anchor_epoch(engine: str) -> float:
+    anchor = economic_anchor(str(engine or "").upper())
+    return float(anchor["epoch"]) if anchor else 0.0
+
+
+_STATE_DDL = """
+    CREATE TABLE IF NOT EXISTS adaptive_metric_state (
+        engine_id TEXT NOT NULL,
+        economic_version TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        setup TEXT NOT NULL,
+        regime TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        n REAL NOT NULL,
+        ewma REAL NOT NULL,
+        m2 REAL NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (engine_id, economic_version, symbol, setup, regime, metric)
+    )
+"""
+LEGACY_STATE_TABLE = "adaptive_metric_state_legacy"
+
+
+def _migrate_state_table(conn: sqlite3.Connection) -> None:
+    """Move an unversioned state table aside (forensic) and create the versioned one.
+
+    Runs once per database. The legacy rows mixed contract versions and are
+    never read as economic state again; they stay in ``adaptive_metric_state_legacy``.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(adaptive_metric_state)").fetchall()}
+    if cols and "economic_version" in cols:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(adaptive_metric_state)").fetchall()}
+        if cols and "economic_version" not in cols:
+            name = LEGACY_STATE_TABLE
+            suffix = 1
+            while conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (name,)).fetchone():
+                suffix += 1
+                name = f"{LEGACY_STATE_TABLE}_{suffix}"
+            conn.execute(f"ALTER TABLE adaptive_metric_state RENAME TO {name}")
+        conn.execute(_STATE_DDL)
+        conn.execute("COMMIT")
+    except sqlite3.Error:
+        conn.execute("ROLLBACK")
+        raise
+
+
 def _connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=15000")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS adaptive_metric_state (
-            engine_id TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            setup TEXT NOT NULL,
-            regime TEXT NOT NULL,
-            metric TEXT NOT NULL,
-            n REAL NOT NULL,
-            ewma REAL NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (engine_id, symbol, setup, regime, metric)
-        )
-        """
-    )
+    _migrate_state_table(conn)
+    conn.execute(_STATE_DDL)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS adaptive_candidate_markouts (
@@ -259,10 +344,23 @@ def _connect(db_path: str) -> sqlite3.Connection:
         conn.execute("ALTER TABLE adaptive_candidate_markouts ADD COLUMN raw_move_source TEXT")
     if "candidate_state" not in cols:
         conn.execute("ALTER TABLE adaptive_candidate_markouts ADD COLUMN candidate_state TEXT NOT NULL DEFAULT ''")
+    # Economic version, DAY lifecycle inputs, decision-time economics, the
+    # opportunity identity (one learnable label per opportunity) and fill state.
+    for col, ddl in (
+        ("economic_version", "TEXT NOT NULL DEFAULT ''"),
+        ("lifecycle_json", "TEXT NOT NULL DEFAULT ''"),
+        ("economic_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("opportunity_id", "TEXT NOT NULL DEFAULT ''"),
+        ("filled", "INTEGER NOT NULL DEFAULT 0"),
+        ("lifecycle_learned", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE adaptive_candidate_markouts ADD COLUMN {col} {ddl}")
     # resolve_markouts runs every SCALP cycle; without these, its key repair and
     # unresolved scan are full table scans that grow with the markout history.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_key ON adaptive_candidate_markouts(engine_id, symbol, setup, regime, learned)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_unresolved ON adaptive_candidate_markouts(resolved, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_opportunity ON adaptive_candidate_markouts(engine_id, opportunity_id)")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS adaptive_linear_model (
@@ -289,10 +387,12 @@ def observe(
     strategy_version: str,
     now: float | None = None,
 ) -> bool:
-    """Fold one current-version observation into the key. Returns False for any other version.
+    """Fold one current-version observation into the key under the current economic version.
 
-    ``now`` is the observation time (defaults to wall clock); a chronological
-    rebuild passes each label's own time so decay matches live learning.
+    Returns False for another strategy version, an unknown metric or a value
+    that is not finite. ``now`` is the observation time (defaults to wall clock);
+    a chronological rebuild passes each label's own time so decay matches live
+    learning. The decayed second moment ``m2`` feeds the reported uncertainty.
     """
     engine_id = str(engine or "").upper()
     if engine_id not in _PRIORS or metric not in _PRIORS[engine_id]:
@@ -301,85 +401,153 @@ def observe(
         return False
     if value is None or not math.isfinite(float(value)):
         return False
-    key = (engine_id, _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower(), metric)
+    value = float(value)
+    key = (engine_id, current_economic_version(engine_id), _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower(), metric)
     moment = float(now if now is not None else time.time())
     with _connect(db_path) as conn:
         row = conn.execute(
-            "SELECT n, ewma, updated_at FROM adaptive_metric_state WHERE engine_id=? AND symbol=? AND setup=? AND regime=? AND metric=?",
+            "SELECT n, ewma, m2, updated_at FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND symbol=? AND setup=? AND regime=? AND metric=?",
             key,
         ).fetchone()
         if row is None or float(row["n"]) <= 0:
-            n, ewma = 1.0, float(value)
+            n, mean, m2 = 1.0, value, 0.0
         else:
             # Age out the prior sample count so stale evidence stops dominating,
             # then fold in the new observation. The new point always counts for 1.
-            decay = _decay_factor(str(row["updated_at"] or ""), moment)
+            decay = _decay_factor(str(row["updated_at"] or ""), moment, engine_id)
             n = float(row["n"]) * decay + 1.0
             alpha = 1.0 / n if metric in MEAN_FORM_METRICS else EWMA_ALPHA
-            ewma = (1.0 - alpha) * float(row["ewma"]) + alpha * float(value)
+            delta = value - float(row["ewma"])
+            mean = float(row["ewma"]) + alpha * delta
+            m2 = max(0.0, float(row["m2"] or 0.0)) * decay + delta * (value - mean)
         conn.execute(
             """
-            INSERT INTO adaptive_metric_state (engine_id, symbol, setup, regime, metric, n, ewma, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(engine_id, symbol, setup, regime, metric) DO UPDATE SET
-                n=excluded.n, ewma=excluded.ewma, updated_at=excluded.updated_at
+            INSERT INTO adaptive_metric_state (engine_id, economic_version, symbol, setup, regime, metric, n, ewma, m2, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(engine_id, economic_version, symbol, setup, regime, metric) DO UPDATE SET
+                n=excluded.n, ewma=excluded.ewma, m2=excluded.m2, updated_at=excluded.updated_at
             """,
-            (*key, n, ewma, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))),
+            (*key, n, mean, max(0.0, m2), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))),
         )
         conn.commit()
     return True
 
 
-def estimate(db_path: str, engine: str, symbol: str, setup: str, regime: str, metric: str) -> dict[str, Any]:
-    """Shrunk mean for one key. Parent is the same engine+setup across symbols, then the prior."""
-    engine_id = str(engine or "").upper()
-    prior = _prior(engine_id, metric)
-    empty = {
-        "mean": prior,
-        "n": 0.0,
-        "prior": prior,
-        "confidence": 0.0,
-        "version": ADAPTIVE_STATE_VERSION,
-    }
-    if engine_id not in _PRIORS:
-        return empty
+# Hierarchy levels, broadest first, nested: ENGINE is every row of the engine,
+# SETUP every row of the key's setup, RELATED the setup's rows sharing the
+# key's symbol or regime, KEY the exact key. ``_level_of`` gives the innermost
+# level a row belongs to. Estimates pool within the key's setup only: another
+# setup's evidence never moves this setup's value or confidence. The ENGINE
+# figure is reported for audit and feeds the outcome dispersion.
+LATTICE_LEVELS = ("engine", "setup", "related", "key")
+# Relevance of each level to the key, for the reported confidence/uncertainty only.
+_LEVEL_RELEVANCE = {"engine": 0.0, "setup": 0.25, "related": 0.5, "key": 1.0}
+
+
+def _level_of(row: sqlite3.Row, sym: str, stp: str, reg: str) -> str:
+    if str(row["setup"] or "").upper() != stp:
+        return "engine"
+    same_sym = _norm_symbol(row["symbol"]) == sym
+    same_reg = str(row["regime"] or "").lower() == reg
+    if same_sym and same_reg:
+        return "key"
+    return "related" if (same_sym or same_reg) else "setup"
+
+
+def _state_rows(db_path: str, engine_id: str, metrics: tuple[str, ...]) -> list[sqlite3.Row]:
+    """Current-economic-version state rows of one engine for the given metrics."""
     try:
         with _connect(db_path) as conn:
-            specific = conn.execute(
-                "SELECT n, ewma FROM adaptive_metric_state WHERE engine_id=? AND symbol=? AND setup=? AND regime=? AND metric=?",
-                (engine_id, _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower(), metric),
-            ).fetchone()
-            pooled = conn.execute(
-                "SELECT COALESCE(SUM(n), 0), COALESCE(SUM(n * ewma), 0) FROM adaptive_metric_state WHERE engine_id=? AND setup=? AND metric=?",
-                (engine_id, str(setup or "").upper(), metric),
-            ).fetchone()
+            return conn.execute(
+                f"SELECT symbol, setup, regime, metric, n, ewma, m2, updated_at FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND metric IN ({','.join('?' * len(metrics))})",
+                (engine_id, current_economic_version(engine_id), *metrics),
+            ).fetchall()
     except sqlite3.Error:
-        return empty
-    spec_n = float(specific["n"]) if specific else 0.0
-    spec_mean = float(specific["ewma"]) if specific else prior
-    pool_n = float(pooled[0] or 0.0)
-    pool_sum = float(pooled[1] or 0.0)
-    sib_n = max(0.0, pool_n - spec_n)
-    sib_sum = pool_sum - spec_n * spec_mean
-    parent = (PRIOR_STRENGTH * prior + sib_sum) / (PRIOR_STRENGTH + sib_n)
-    mean = (PRIOR_STRENGTH * parent + spec_n * spec_mean) / (PRIOR_STRENGTH + spec_n)
+        return []
+
+
+def _lattice(
+    rows: list[sqlite3.Row],
+    *,
+    engine_id: str,
+    symbol: str,
+    setup: str,
+    regime: str,
+    weights: dict[str, float],
+    prior: float,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Hierarchical posterior mean of a (weighted) metric set at one key.
+
+    Evidence is decayed sample count times the metric weight. Starting from the
+    prior, each nested level from SETUP to KEY is the mean of all evidence
+    inside it, shrunk toward the level above by ``PRIOR_STRENGTH / (PRIOR_STRENGTH + W)``.
+    With no evidence at a level the parent passes through unchanged. There is no
+    sample floor. The ENGINE level (all setups) is computed for audit only.
+    """
+    sym, stp, reg = _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower()
+    moment = float(now) if now is not None else _data_clock(rows)
+    acc = {lvl: [0.0, 0.0, 0.0] for lvl in LATTICE_LEVELS}
+    key_n: dict[str, float] = dict.fromkeys(weights, 0.0)
+    for row in rows:
+        metric_w = float(weights.get(str(row["metric"]), 0.0))
+        raw_n = float(row["n"] or 0.0)
+        if metric_w <= 0 or raw_n <= 0 or _is_forensic_key(engine_id, row["symbol"], row["setup"], row["regime"]):
+            continue
+        n = raw_n * _decay_factor(str(row["updated_at"] or ""), moment, engine_id)
+        mean = float(row["ewma"])
+        var = max(0.0, float(row["m2"] or 0.0)) / raw_n
+        level = _level_of(row, sym, stp, reg)
+        w = metric_w * n
+        bucket = acc[level]
+        bucket[0] += w
+        bucket[1] += w * mean
+        bucket[2] += w * (var + mean * mean)
+        if level == "key":
+            key_n[str(row["metric"])] += n
+    mu = prior
+    level_means: dict[str, float] = {}
+    nested_w: dict[str, float] = {}
+    for i, level in enumerate(LATTICE_LEVELS):
+        inner = LATTICE_LEVELS[i:]
+        w = sum(acc[lvl][0] for lvl in inner)
+        s = sum(acc[lvl][1] for lvl in inner)
+        nested_w[level] = w
+        if level == "engine":
+            level_means[level] = (PRIOR_STRENGTH * prior + s) / (PRIOR_STRENGTH + w)
+            continue
+        mu = (PRIOR_STRENGTH * mu + s) / (PRIOR_STRENGTH + w)
+        level_means[level] = mu
+    total_w = nested_w["engine"]
+    sigma2 = 0.0
+    if total_w > 0:
+        m1 = sum(b[1] for b in acc.values()) / total_w
+        sigma2 = max(0.0, sum(b[2] for b in acc.values()) / total_w - m1 * m1)
+    relevant = sum(acc[lvl][0] * _LEVEL_RELEVANCE[lvl] for lvl in LATTICE_LEVELS)
     return {
-        "mean": mean,
-        "n": spec_n,
+        "mean": mu,
         "prior": prior,
-        "parent": parent,
-        "confidence": spec_n / (PRIOR_STRENGTH + spec_n),
+        "parent": level_means["related"],
+        "levels": level_means,
+        "level_weights": nested_w,
+        "key_weight": acc["key"][0],
+        "pooled_weight": nested_w["setup"] - acc["key"][0],
+        "key_n": key_n,
+        "n": sum(key_n.values()),
+        "confidence": relevant / (PRIOR_STRENGTH + relevant),
+        "sd": math.sqrt(sigma2 / (PRIOR_STRENGTH + relevant)) if sigma2 > 0 else 0.0,
         "version": ADAPTIVE_STATE_VERSION,
     }
 
 
-def _blend(parts: list[tuple[float, float]], prior: float) -> tuple[float, float]:
-    weighted = [(mean, weight) for mean, weight in parts if weight > 0]
-    if not weighted:
-        return prior, 0.0
-    weight = sum(item[1] for item in weighted)
-    mean = (PRIOR_STRENGTH * prior + sum(m * w for m, w in weighted)) / (PRIOR_STRENGTH + weight)
-    return mean, weight
+def estimate(db_path: str, engine: str, symbol: str, setup: str, regime: str, metric: str, *, now: float | None = None) -> dict[str, Any]:
+    """Hierarchical shrunk mean of one metric at one key (see ``_lattice``)."""
+    engine_id = str(engine or "").upper()
+    prior = _prior(engine_id, metric)
+    if engine_id not in _PRIORS:
+        return {"mean": prior, "n": 0.0, "prior": prior, "parent": prior, "confidence": 0.0, "sd": 0.0, "version": ADAPTIVE_STATE_VERSION}
+    rows = _state_rows(db_path, engine_id, (metric,))
+    return _lattice(rows, engine_id=engine_id, symbol=symbol, setup=setup, regime=regime, weights={metric: 1.0}, prior=prior, now=now)
 
 
 def _tilt(mean: float, prior: float) -> float:
@@ -388,78 +556,88 @@ def _tilt(mean: float, prior: float) -> float:
     return math.tanh((mean - prior) / abs(prior))
 
 
-# DAY net expectancy reads two separately learned net quantities: realized trade
-# net (production lifecycle, costs once) and the counterfactual forward markout
-# of qualified candidates, down-weighted by MARKOUT_WEIGHT. They stay separate
-# metrics; only this read combines them.
-DAY_NET_PARTS: tuple[tuple[str, float], ...] = (("trade_net", 1.0), ("markout_forward", MARKOUT_WEIGHT))
+# DAY net expectancy reads two separately learned measurements of the same
+# economic quantity, net after costs under the live exit contract: realized
+# trade net (filled opportunities) and the lifecycle replay of unfilled
+# qualified candidates (LIFECYCLE_WEIGHT). An opportunity contributes one or
+# the other, never both. Fixed-horizon markouts are diagnostics only: a DAY
+# position is not closed at a fixed clock, and the 60m markout misjudged
+# setups whose lifecycle runs for hours.
+DAY_NET_PARTS: tuple[tuple[str, float], ...] = (("trade_net", 1.0), ("lifecycle_net", LIFECYCLE_WEIGHT))
 
 
-def day_net_expectancy(db_path: str, symbol: str, setup: str, regime: str) -> dict[str, Any]:
-    """Learned DAY net expectancy for one key: the key shrunk toward the same
-    setup's other keys, which shrink toward the neutral prior (as ``estimate``).
+def day_net_expectancy(db_path: str, symbol: str, setup: str, regime: str, *, now: float | None = None) -> dict[str, Any]:
+    """Expected DAY net edge after costs for one key, pooled hierarchically
+    (key -> same setup sharing symbol or regime -> setup -> engine -> 0).
     No sample-count floor: one observation moves the posterior by its weight."""
-    sym = _norm_symbol(symbol)
-    stp = str(setup or "").upper()
-    reg = str(regime or "").lower()
     weights = dict(DAY_NET_PARTS)
-    prior = _prior(DAY_ENGINE, "trade_net")
-    spec_n = spec_sum = sib_n = sib_sum = 0.0
-    n_metric = dict.fromkeys(weights, 0.0)
-    try:
-        with _connect(db_path) as conn:
-            rows = conn.execute(
-                f"SELECT symbol, regime, metric, n, ewma FROM adaptive_metric_state WHERE engine_id=? AND setup=? AND metric IN ({','.join('?' * len(weights))})",
-                (DAY_ENGINE, stp, *weights),
-            ).fetchall()
-    except sqlite3.Error:
-        rows = []
-    for row in rows:
-        n = float(row["n"] or 0.0)
-        w = weights[row["metric"]] * n
-        if _norm_symbol(row["symbol"]) == sym and str(row["regime"] or "").lower() == reg:
-            spec_n += w
-            spec_sum += w * float(row["ewma"])
-            n_metric[row["metric"]] += n
-        else:
-            sib_n += w
-            sib_sum += w * float(row["ewma"])
-    parent = (PRIOR_STRENGTH * prior + sib_sum) / (PRIOR_STRENGTH + sib_n)
+    lat = _lattice(
+        _state_rows(db_path, DAY_ENGINE, tuple(weights)),
+        engine_id=DAY_ENGINE,
+        symbol=symbol,
+        setup=setup,
+        regime=regime,
+        weights=weights,
+        prior=_prior(DAY_ENGINE, "trade_net"),
+        now=now,
+    )
     return {
-        "mean": (PRIOR_STRENGTH * parent + spec_sum) / (PRIOR_STRENGTH + spec_n),
-        "parent": parent,
-        "prior": prior,
-        "n_trade": n_metric["trade_net"],
-        "n_forward": n_metric["markout_forward"],
-        "weight": spec_n,
-        "pooled_weight": sib_n,
-        "confidence": spec_n / (PRIOR_STRENGTH + spec_n),
+        "mean": lat["mean"],
+        "parent": lat["parent"],
+        "prior": lat["prior"],
+        "levels": lat["levels"],
+        "level_weights": lat["level_weights"],
+        "n_trade": lat["key_n"]["trade_net"],
+        "n_lifecycle": lat["key_n"]["lifecycle_net"],
+        "weight": lat["key_weight"],
+        "pooled_weight": lat["pooled_weight"],
+        "confidence": lat["confidence"],
+        "sd": lat["sd"],
     }
 
 
-def day_decision(db_path: str, symbol: str, setup: str, regime: str) -> dict[str, Any]:
+def day_size_mult(expected_net: float, risk: float) -> float:
+    """Bounded size from expected net per unit of adverse risk (as SCALP sizes
+    its final edge). Negative evidence shrinks toward the floor; it never blocks."""
+    lo, hi = SIZE_BOUNDS[DAY_ENGINE]
+    tilt = math.tanh(float(expected_net) / risk) if risk > 0 else 0.0
+    return _clamp(1.0 + 0.30 * tilt, lo, hi)
+
+
+def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, now: float | None = None) -> dict[str, Any]:
     """What the next DAY candidate reads. Ranking, size, objective and runner only.
 
-    Learned net expectancy sets the bounded size tilt and joins the rank score;
+    Expected net edge after costs is the rank score and sets the bounded size;
     learned move potential (MFE) sets the objective. Neither removes a candidate.
     """
     from backend.config.trading_economics import canonical_roundtrip_cost_pct
 
-    mfe = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_mfe")
-    mae = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_mae")
-    timing = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_time_to_mfe_min")
-    continuation = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_continuation")
-    forward = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "markout_forward")
-    net = day_net_expectancy(db_path, symbol, setup, regime)
-    n_eff = mfe["n"] + forward["n"] * MARKOUT_WEIGHT
-    lo, hi = SIZE_BOUNDS[DAY_ENGINE]
-    confidence = n_eff / (PRIOR_STRENGTH + n_eff)
-    # Expectancy per unit of adverse risk, as SCALP sizes its final edge.
-    risk = max(0.0, mae["mean"]) + canonical_roundtrip_cost_pct()
-    net_tilt = math.tanh(net["mean"] / risk) if risk > 0 else 0.0
+    mfe = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_mfe", now=now)
+    mae = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_mae", now=now)
+    timing = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_time_to_mfe_min", now=now)
+    continuation = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "trade_continuation", now=now)
+    forward = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "markout_forward", now=now)
+    net = day_net_expectancy(db_path, symbol, setup, regime, now=now)
+    cost = canonical_roundtrip_cost_pct()
+    size_mult = day_size_mult(net["mean"], max(0.0, mae["mean"]) + cost)
     abstain_flag, abstain_reason = _abstain(net["mean"])
+    economic = {
+        "engine_id": DAY_ENGINE,
+        "economic_version": current_economic_version(DAY_ENGINE),
+        "expected_gross": net["mean"] + cost,
+        "expected_cost": cost,
+        "adaptive_correction": net["mean"] - net["prior"],
+        "uncertainty": net["sd"],
+        "expected_net_edge": net["mean"],
+        "size_effect": size_mult - 1.0,
+        "levels": {lvl: round(v, 6) for lvl, v in net["levels"].items()},
+        "level_weights": {lvl: round(v, 3) for lvl, v in net["level_weights"].items()},
+        "n_trade": round(net["n_trade"], 3),
+        "n_lifecycle": round(net["n_lifecycle"], 3),
+    }
     return {
         "adaptive_state_version": ADAPTIVE_STATE_VERSION,
+        "economic_version": current_economic_version(DAY_ENGINE),
         "engine_id": DAY_ENGINE,
         "symbol": str(symbol or "").upper(),
         "setup": str(setup or "").upper(),
@@ -469,18 +647,19 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str) -> dict[str
         "expected_net": net["mean"],
         "expected_net_parent": net["parent"],
         "net_confidence": net["confidence"],
-        "confidence": confidence,
+        "confidence": net["confidence"],
         "abstain": abstain_flag,
         "abstain_reason": abstain_reason,
         "abstain_net_edge": net["mean"],
         "abstain_confidence": net["confidence"],
         "abstain_live_veto": False,
-        "uncertainty": mfe["prior"] * (1.0 - confidence),
+        "uncertainty": net["sd"],
+        "economic": economic,
         "mfe": mfe["mean"],
         "mae": mae["mean"],
         "time_to_mfe_min": timing["mean"],
         "continuation": continuation["mean"],
-        "size_mult": _clamp(1.0 + 0.30 * net_tilt, lo, hi),
+        "size_mult": size_mult,
         "objective_atr_mult": _clamp(1.0 + 0.35 * _tilt(mfe["mean"], mfe["prior"]), *OBJECTIVE_ATR_BOUNDS),
         "structural_emphasis": _clamp(1.0 + 0.15 * _tilt(mfe["mean"], mfe["prior"]), *STRUCTURAL_EMPHASIS_BOUNDS),
         "runner_activation_mult": _clamp(timing["mean"] / timing["prior"], *ACTIVATION_BOUNDS),
@@ -505,10 +684,15 @@ def _micro_features(raw: dict | None) -> dict[str, float]:
     return out
 
 
+def _model_key(engine_id: str, model: str) -> str:
+    """Linear models are scoped to the economic version like metric state."""
+    return f"{model}@{current_economic_version(engine_id)}"
+
+
 def _load_linear(conn: sqlite3.Connection, engine_id: str, model: str) -> dict[str, Any]:
     row = conn.execute(
         "SELECT payload FROM adaptive_linear_model WHERE engine_id=? AND model=?",
-        (engine_id, model),
+        (engine_id, _model_key(engine_id, model)),
     ).fetchone()
     if row and row["payload"]:
         try:
@@ -534,7 +718,7 @@ def _standardize(st: dict[str, Any], feats: dict[str, float]) -> dict[str, float
     return z
 
 
-def update_linear_model(db_path: str, engine: str, model: str, features: dict | None, target: float) -> None:
+def update_linear_model(db_path: str, engine: str, model: str, features: dict | None, target: float, *, now: float | None = None) -> None:
     """One online (normalised-LMS) step. Standardisation stats adapt via EWMA;
     weights are clamped. Trained on the same cost-adjusted markout target."""
     raw = features if isinstance(features, dict) else {}
@@ -574,7 +758,7 @@ def update_linear_model(db_path: str, engine: str, model: str, features: dict | 
             VALUES (?, ?, ?, ?)
             ON CONFLICT(engine_id, model) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at
             """,
-            (engine_id, model, json.dumps(st, separators=(",", ":")), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+            (engine_id, _model_key(engine_id, model), json.dumps(st, separators=(",", ":")), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time()))),
         )
         conn.commit()
 
@@ -597,6 +781,42 @@ def micro_edge_tilt(db_path: str, engine: str, features: dict | None) -> tuple[f
     z = _standardize(st, feats)
     tilt = sum(float(st["w"].get(f, 0.0)) * z[f] for f in feats)
     return _clamp(tilt, -MICRO_MODEL_TILT_MAX, MICRO_MODEL_TILT_MAX), n
+
+
+def learn_micro_weight(db_path: str, *, strategy_version: str, tilt: float, miss: float, now: float | None = None) -> bool:
+    """Fold one resolved claim into the micro-weight moments.
+
+    ``tilt`` is the decision-time micro term before the weight; ``miss`` is the
+    realized label minus the executable edge before micro (what micro had to
+    explain). A zero tilt carries no information and is skipped.
+    """
+    t, e = float(tilt), float(miss)
+    if t == 0.0 or not (math.isfinite(t) and math.isfinite(e)):
+        return False
+    sym, stp, reg = MICRO_WEIGHT_KEY
+    wrote = False
+    for metric, value in zip(MICRO_WEIGHT_METRICS, (t * t, t * e), strict=True):
+        wrote = observe(db_path, engine=SCALP_ENGINE, symbol=sym, setup=stp, regime=reg, metric=metric, value=value, strategy_version=strategy_version, now=now) or wrote
+    return wrote
+
+
+def micro_weight(db_path: str, *, now: float | None = None) -> dict[str, float]:
+    """Learned weight on the micro term, in [0, 1], prior 1.
+
+    Ridge regression of ``miss`` on ``tilt`` toward slope 1: the micro model
+    keeps its full weight until resolved claims show its tilt does not explain
+    what the edge before micro missed, then the weight falls continuously,
+    down to 0 when the tilt points the wrong way. It can never amplify.
+    """
+    rows = [r for r in _state_rows(db_path, SCALP_ENGINE, MICRO_WEIGHT_METRICS) if (str(r["symbol"]), str(r["setup"]), str(r["regime"])) == MICRO_WEIGHT_KEY]
+    moment = float(now) if now is not None else _data_clock(rows)
+    stats = {str(r["metric"]): (float(r["n"] or 0.0) * _decay_factor(str(r["updated_at"] or ""), moment, SCALP_ENGINE), float(r["ewma"])) for r in rows}
+    n_tt, m_tt = stats.get("micro_tilt_sq", (0.0, 0.0))
+    n_te, m_te = stats.get("micro_tilt_x_miss", (0.0, 0.0))
+    info = PRIOR_STRENGTH * MICRO_WEIGHT_PRIOR_VAR
+    sum_tt = n_tt * max(0.0, m_tt)
+    sum_te = n_te * m_te
+    return {"weight": _clamp((info + sum_te) / (info + sum_tt), 0.0, 1.0), "n": n_tt, "slope_raw": (sum_te / sum_tt) if sum_tt > 0 else 1.0}
 
 
 def learn_claim_label(
@@ -623,82 +843,101 @@ def learn_claim_label(
     return wrote
 
 
-def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str) -> dict[str, Any]:
+def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, *, now: float | None = None) -> dict[str, Any]:
     """How much of a strategy claim's base edge shows up in realized net.
 
-    The key residual alone assumes realized net moves 1:1 with the claimed base
-    edge. ``claim_capture`` = 1 + the pooled within-key slope of residual on base
-    edge across the setup, shrunk toward 1 by its within-key degrees of freedom
-    and kept in [0, 1]. Cold, it is exactly 1 (no change to the edge).
+    The mean residual alone assumes realized net moves 1:1 with the claimed base
+    edge. ``claim_capture`` = 1 + the within-key slope of residual on base edge,
+    estimated down the same within-setup hierarchy as every other estimate
+    (setup -> related -> key). At each level the slope is a ridge estimate toward
+    its parent slope with ``PRIOR_STRENGTH`` claims of variance ``CLAIM_SLOPE_PRIOR_VAR``
+    as the parent's weight; the top parent is slope 0 (capture 1). Kept in
+    [0, 1]. ``claim_base_mean`` is the hierarchical mean claimed base edge, the
+    point where the slope pivots. Cold: capture 1, no change to the edge.
     """
-    sym = _norm_symbol(symbol)
-    reg = str(regime or "").lower()
-    try:
-        with _connect(db_path) as conn:
-            rows = conn.execute(
-                f"SELECT symbol, regime, metric, n, ewma FROM adaptive_metric_state WHERE engine_id=? AND setup=? AND metric IN ({','.join('?' * len(CLAIM_MOMENT_METRICS))})",
-                (SCALP_ENGINE, str(setup or "").upper(), *CLAIM_MOMENT_METRICS),
-            ).fetchall()
-    except sqlite3.Error:
-        rows = []
-    keys: dict[tuple[str, str], dict[str, float]] = {}
-    for row in rows:
-        rec = keys.setdefault((_norm_symbol(row["symbol"]), str(row["regime"] or "").lower()), {})
-        rec[row["metric"]] = float(row["ewma"])
-        rec["n"] = min(rec.get("n", math.inf), float(row["n"] or 0.0))
-    cov = var = dof = total_n = total_base = 0.0
+    sym, stp, reg = _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower()
+    claim_rows = _state_rows(db_path, SCALP_ENGINE, CLAIM_MOMENT_METRICS)
+    moment = float(now) if now is not None else _data_clock(claim_rows)
+    keys: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in claim_rows:
+        if _is_forensic_key(SCALP_ENGINE, row["symbol"], row["setup"], row["regime"]):
+            continue
+        rec = keys.setdefault((_norm_symbol(row["symbol"]), str(row["setup"] or "").upper(), str(row["regime"] or "").lower()), {"row": row})
+        rec[str(row["metric"])] = float(row["ewma"])
+        rec["n"] = min(rec.get("n", math.inf), float(row["n"] or 0.0) * _decay_factor(str(row["updated_at"] or ""), moment, SCALP_ENGINE))
+    acc = {lvl: [0.0, 0.0, 0.0, 0.0] for lvl in LATTICE_LEVELS}
     for rec in keys.values():
-        if any(m not in rec for m in CLAIM_MOMENT_METRICS):
+        if any(m not in rec for m in CLAIM_MOMENT_METRICS) or rec["n"] <= 0:
             continue
         n = rec["n"]
         b = rec["claim_base_edge"]
-        cov += n * (rec["claim_base_edge_x_residual"] - b * rec["claim_residual"])
-        var += n * max(0.0, rec["claim_base_edge_sq"] - b * b)
-        dof += max(0.0, n - 1.0)
-        total_n += n
-        total_base += n * b
-    slope = cov / var if var > 0 else 0.0
-    own = keys.get((sym, reg)) or {}
-    if own.get("n", 0.0) > 0 and "claim_base_edge" in own:
-        base_mean = own["claim_base_edge"]
-    else:
-        base_mean = total_base / total_n if total_n > 0 else 0.0
+        bucket = acc[_level_of(rec["row"], sym, stp, reg)]
+        bucket[0] += n
+        bucket[1] += n * b
+        bucket[2] += n * (rec["claim_base_edge_x_residual"] - b * rec["claim_residual"])
+        bucket[3] += n * max(0.0, rec["claim_base_edge_sq"] - b * b)
+    slope_info = PRIOR_STRENGTH * CLAIM_SLOPE_PRIOR_VAR
+    slope = 0.0
+    center: float | None = None
+    nested_w: dict[str, float] = {}
+    for i, level in enumerate(LATTICE_LEVELS):
+        w, sb, cov, var = (sum(acc[lvl][j] for lvl in LATTICE_LEVELS[i:]) for j in range(4))
+        nested_w[level] = w
+        if level == "engine":
+            continue
+        slope = (slope_info * slope + cov) / (slope_info + var)
+        if w > 0:
+            center = sb / w if center is None else (PRIOR_STRENGTH * center + sb) / (PRIOR_STRENGTH + w)
     return {
-        "claim_capture": _clamp(1.0 + slope * dof / (dof + PRIOR_STRENGTH), 0.0, 1.0),
+        "claim_capture": _clamp(1.0 + slope, 0.0, 1.0),
         "claim_slope": slope,
-        "claim_base_mean": base_mean,
-        "claim_dof": dof,
-        "n_claim": total_n,
+        "claim_base_mean": center if center is not None else 0.0,
+        "claim_key_n": acc["key"][0],
+        "n_claim": nested_w["setup"],
+        "claim_level_weights": nested_w,
     }
 
 
-def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features: dict | None = None) -> dict[str, Any]:
+def _blend(parts: list[tuple[float, float]], prior: float) -> tuple[float, float]:
+    weighted = [(mean, weight) for mean, weight in parts if weight > 0]
+    if not weighted:
+        return prior, 0.0
+    weight = sum(item[1] for item in weighted)
+    mean = (PRIOR_STRENGTH * prior + sum(m * w for m, w in weighted)) / (PRIOR_STRENGTH + weight)
+    return mean, weight
+
+
+def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features: dict | None = None, *, now: float | None = None) -> dict[str, Any]:
     """Learned adjustments for the next SCALP candidate. Never an edge by itself.
 
     The candidate's own base executable edge (raw expected move - live cost) is
-    built in scalp_v2.executable_edge. This view supplies the bounded learned
-    residual and microstructure residual added to it, plus confidence, risk,
-    target and hold. A cold key contributes a residual of exactly 0.
+    built in scalp_v2.executable_edge. This view supplies the hierarchical mean
+    residual, the claim calibration (capture slope and pivot) and the weighted
+    microstructure residual added to it, plus confidence, risk, target and hold.
+    A cold key contributes a residual of exactly 0.
     """
     from backend.services.scalp_v2.exit_evaluator import SCALP_V2_TIME_STOP_MIN
 
-    residual = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "edge_residual")
-    residual_strategy = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "edge_residual_strategy")
-    net = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "trade_net")
-    mfe = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "trade_mfe")
-    path_mae = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "markout_mae")
-    timing = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "trade_time_to_mfe_min")
-    forward = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "markout_forward")
+    residual = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "edge_residual", now=now)
+    residual_strategy = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "edge_residual_strategy", now=now)
+    net = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "trade_net", now=now)
+    mfe = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "trade_mfe", now=now)
+    path_mae = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "markout_mae", now=now)
+    timing = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "trade_time_to_mfe_min", now=now)
+    forward = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "markout_forward", now=now)
     learned_mfe, _ = _blend([(mfe["mean"], mfe["n"]), (max(0.0, forward["mean"]), forward["n"] * MARKOUT_WEIGHT)], mfe["prior"])
     hard_hold = float(SCALP_V2_TIME_STOP_MIN)
     confidence = float(residual["confidence"])
     adaptive_residual = _clamp(residual["mean"], -SCALP_RESIDUAL_MAX, SCALP_RESIDUAL_MAX)
     # Bounded microstructure residual: shrunk by the model's own sample count so
-    # a cold model barely moves the edge. Zero-centred (excludes the model bias).
+    # a cold model barely moves the edge, then by the learned micro weight.
+    # Zero-centred (excludes the model bias).
     micro_tilt, micro_n = micro_edge_tilt(db_path, SCALP_ENGINE, features)
     micro_conf = micro_n / (micro_n + MICRO_MODEL_CONF_K) if micro_n > 0 else 0.0
-    micro_residual = micro_conf * micro_tilt
-    claim = scalp_claim_calibration(db_path, symbol, setup, regime)
+    micro_unweighted = micro_conf * micro_tilt
+    weight = micro_weight(db_path, now=now)
+    micro_residual = micro_unweighted * weight["weight"]
+    claim = scalp_claim_calibration(db_path, symbol, setup, regime, now=now)
     # Telemetry only: the canonical executable edge is the single live negative-edge gate.
     learned = forward if forward["n"] > 0 else net
     learned_net = learned["mean"]
@@ -715,14 +954,20 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features:
         "adaptive_residual_strategy": _clamp(residual_strategy["mean"], -SCALP_RESIDUAL_MAX, SCALP_RESIDUAL_MAX),
         "n_residual_strategy": residual_strategy["n"],
         "confidence_strategy": float(residual_strategy["confidence"]),
+        "residual_uncertainty": float(residual_strategy["sd"]),
+        "residual_levels": {lvl: round(v, 6) for lvl, v in residual_strategy.get("levels", {}).items()},
+        "economic_version": current_economic_version(SCALP_ENGINE),
         "micro_residual": micro_residual,
+        "micro_residual_unweighted": micro_unweighted,
+        "micro_weight": weight["weight"],
+        "micro_weight_n": weight["n"],
         "micro_tilt": round(micro_residual, 6),
         "micro_tilt_raw": round(micro_tilt, 6),
         "micro_model_n": micro_n,
         "claim_capture": claim["claim_capture"],
         "claim_slope": claim["claim_slope"],
         "claim_base_mean": claim["claim_base_mean"],
-        "claim_dof": claim["claim_dof"],
+        "claim_key_n": claim["claim_key_n"],
         "n_claim": claim["n_claim"],
         "confidence": confidence,
         "mfe": learned_mfe,
@@ -760,11 +1005,16 @@ def learn_from_close(
     continuation: float | None,
     version_current: bool,
     is_dust: bool,
+    entered_at: float | None = None,
+    now: float | None = None,
 ) -> bool:
-    """Realized-trade update. Dust and non-current versions do not move state."""
+    """Realized-trade update. Dust, non-current versions and positions entered
+    before the engine's economic anchor do not move state."""
     if is_dust or not version_current:
         return False
     engine_id = str(engine or "").upper()
+    if entered_at is not None and float(entered_at) < anchor_epoch(engine_id):
+        return False
     wrote = False
     if engine_id == DAY_ENGINE:
         pairs = (
@@ -786,7 +1036,7 @@ def learn_from_close(
     for metric, value in pairs:
         if value is None:
             continue
-        wrote = observe(db_path, engine=engine_id, symbol=symbol, setup=setup, regime=regime, metric=metric, value=float(value), strategy_version=strategy_version) or wrote
+        wrote = observe(db_path, engine=engine_id, symbol=symbol, setup=setup, regime=regime, metric=metric, value=float(value), strategy_version=strategy_version, now=now) or wrote
     return wrote
 
 
@@ -809,9 +1059,13 @@ def seed_day_trade_net(db_path: str, entered_since: str, *, apply: bool = False)
         conn = sqlite3.connect(db_path, timeout=15)
         conn.row_factory = sqlite3.Row
         try:
+            state_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(adaptive_metric_state)")}
             if (
-                conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='adaptive_metric_state'").fetchone()
-                and conn.execute("SELECT 1 FROM adaptive_metric_state WHERE engine_id=? AND metric='trade_net' LIMIT 1", (DAY_ENGINE,)).fetchone()
+                "economic_version" in state_cols
+                and conn.execute(
+                    "SELECT 1 FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND metric='trade_net' LIMIT 1",
+                    (DAY_ENGINE, current_economic_version(DAY_ENGINE)),
+                ).fetchone()
             ):
                 out["refused"] = "DAY_TRADE_NET_STATE_EXISTS"
                 return out
@@ -928,6 +1182,14 @@ def _mark_at(marks: dict, horizon: float) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def _economic_of(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        econ = json.loads(row["economic_json"] or "{}")
+    except (TypeError, ValueError, IndexError):
+        return {}
+    return econ if isinstance(econ, dict) else {}
+
+
 def _stored_features(features: dict | None) -> str:
     if not isinstance(features, dict) or not features:
         return "{}"
@@ -944,28 +1206,17 @@ def _stored_features(features: dict | None) -> str:
 
 
 def _repair_adaptive_keys(conn: sqlite3.Connection) -> None:
-    """Fold slash-symbol duplicates onto the normalized key, and drop markout
-    rows whose sample count was inflated by re-training one unresolved candidate."""
-    rows = list(conn.execute("SELECT rowid, * FROM adaptive_metric_state"))
+    """Fold separator-symbol duplicates onto the normalized key."""
+    rows = list(conn.execute("SELECT rowid, * FROM adaptive_metric_state WHERE symbol LIKE '%/%' OR symbol LIKE '%-%'"))
     for row in rows:
         norm = _norm_symbol(row["symbol"])
-        if norm == row["symbol"]:
-            continue
         clash = conn.execute(
-            "SELECT rowid FROM adaptive_metric_state WHERE engine_id=? AND symbol=? AND setup=? AND regime=? AND metric=?",
-            (row["engine_id"], norm, row["setup"], row["regime"], row["metric"]),
+            "SELECT rowid FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND symbol=? AND setup=? AND regime=? AND metric=?",
+            (row["engine_id"], row["economic_version"], norm, row["setup"], row["regime"], row["metric"]),
         ).fetchone()
         if clash is None:
             conn.execute("UPDATE adaptive_metric_state SET symbol=? WHERE rowid=?", (norm, row["rowid"]))
         else:
-            conn.execute("DELETE FROM adaptive_metric_state WHERE rowid=?", (row["rowid"],))
-    inflated = list(conn.execute("SELECT rowid, engine_id, symbol, setup, regime, metric, n FROM adaptive_metric_state WHERE metric LIKE 'markout_%'"))
-    for row in inflated:
-        learned_n = conn.execute(
-            "SELECT COUNT(*) FROM adaptive_candidate_markouts WHERE learned=1 AND engine_id=? AND symbol=? AND setup=? AND regime=?",
-            (row["engine_id"], row["symbol"], row["setup"], row["regime"]),
-        ).fetchone()[0]
-        if float(row["n"]) > float(learned_n) + 1.5:
             conn.execute("DELETE FROM adaptive_metric_state WHERE rowid=?", (row["rowid"],))
     conn.commit()
 
@@ -985,8 +1236,18 @@ def record_candidate(
     raw_expected_move: float | None = None,
     raw_move_source: str | None = None,
     candidate_state: str = "",
+    lifecycle: Any = None,
+    economic: dict | None = None,
+    opportunity_id: str = "",
 ) -> int | None:
-    """Store one decision-time candidate for causal forward markouts. Returns the row id."""
+    """Store one decision-time candidate for causal forward markouts. Returns the row id.
+
+    ``lifecycle`` (DAY ``LifecycleParams``) makes the row a lifecycle candidate:
+    the live exit contract is replayed from its decision ask once bars exist.
+    ``economic`` is the decision-time expected-net-edge breakdown, persisted for
+    audit and, for SCALP, the micro-weight label. ``opportunity_id`` groups
+    repeated signals of one DAY opportunity; only its first record is learnable.
+    """
     engine_id = str(engine or "").upper()
     version = current_strategy_version(engine_id)
     if not version or float(ref_price or 0) <= 0 or not str(setup or "").strip():
@@ -996,14 +1257,20 @@ def record_candidate(
     raw_move: float | None = None
     with contextlib.suppress(TypeError, ValueError):
         raw_move = float(raw_expected_move) if raw_expected_move is not None and float(raw_expected_move) > 0 else None
+    lifecycle_json = ""
+    if lifecycle is not None:
+        with contextlib.suppress(AttributeError, TypeError, ValueError):
+            lifecycle_json = lifecycle.to_json() if hasattr(lifecycle, "to_json") else json.dumps(dict(lifecycle), separators=(",", ":"))
+    economic_json = json.dumps(economic, separators=(",", ":"), default=str) if isinstance(economic, dict) else "{}"
     with _connect(db_path) as conn:
         cur = conn.execute(
             """
             INSERT INTO adaptive_candidate_markouts (
                 engine_id, symbol, setup, regime, strategy_version, signaled,
                 ref_price, roundtrip_cost, evaluated_at, features_json, label_horizon,
-                raw_expected_move, raw_move_source, candidate_state
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                raw_expected_move, raw_move_source, candidate_state,
+                economic_version, lifecycle_json, economic_json, opportunity_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 engine_id,
@@ -1020,10 +1287,42 @@ def record_candidate(
                 raw_move,
                 normalize_raw_move_source(raw_move_source) if raw_move_source else None,
                 str(candidate_state or "").upper(),
+                current_economic_version(engine_id),
+                lifecycle_json,
+                economic_json,
+                str(opportunity_id or ""),
             ),
         )
         conn.commit()
         return int(cur.lastrowid) if cur.lastrowid is not None else None
+
+
+def mark_candidate_filled(db_path: str, row_id: int | None) -> bool:
+    """Flag a recorded candidate as filled: its realized close carries the
+    opportunity, so the opportunity's lifecycle label is never also learned."""
+    if not row_id:
+        return False
+    try:
+        with _connect(db_path) as conn:
+            cur = conn.execute("UPDATE adaptive_candidate_markouts SET filled=1 WHERE id=?", (int(row_id),))
+            conn.commit()
+            return cur.rowcount == 1
+    except sqlite3.Error:
+        return False
+
+
+def _opportunity_learnable(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
+    """First record of an unfilled opportunity under the row's economic version."""
+    if int(row["filled"] or 0):
+        return False
+    opp = str(row["opportunity_id"] or "")
+    if not opp:
+        return True
+    first = conn.execute(
+        "SELECT MIN(id), MAX(filled) FROM adaptive_candidate_markouts WHERE engine_id=? AND opportunity_id=? AND economic_version=?",
+        (row["engine_id"], opp, row["economic_version"]),
+    ).fetchone()
+    return first is not None and int(first[0] or 0) == int(row["id"]) and not int(first[1] or 0)
 
 
 def scalp_edge_residual(*, forward_net: float, raw_expected_move: float, roundtrip_cost: float) -> float:
@@ -1047,26 +1346,61 @@ def scalp_gross_path_mae(*, ref_price: float, roundtrip_cost: float, marks: list
     return max(0.0, (float(ref_price) - min(prices)) / float(ref_price))
 
 
+SCALP_TICK_HORIZONS_SEC = (1, 5, 10)
+
+
+def _lifecycle_label(row: sqlite3.Row, *, moment: float, bars_1m: Callable[[str, float, float], list]) -> dict[str, Any]:
+    from backend.services.day_v2.lifecycle_sim import DAY_LIFECYCLE_MAX_MIN, LifecycleParams, simulate_lifecycle
+
+    params = LifecycleParams.from_json(row["lifecycle_json"])
+    if params is None:
+        return {"final": True, "net": None, "reason": "BAD_LIFECYCLE_PARAMS"}
+    start = float(params.entry_time)
+    end = min(moment, start + DAY_LIFECYCLE_MAX_MIN * 60.0) + 60.0
+    try:
+        bars = bars_1m(str(row["symbol"]), start, end)
+    except Exception:
+        bars = []
+    return simulate_lifecycle(params, bars, roundtrip_cost=float(row["roundtrip_cost"] or 0), now=moment)
+
+
 def resolve_markouts(
     db_path: str,
     quote: Callable[[str, float], float | None],
     *,
     now: float | None = None,
     path_low: Callable[[str, float, float], float | None] | None = None,
+    bars_1m: Callable[[str, float, float], list] | None = None,
+    tick_quote: Callable[[str, float, float], float | None] | None = None,
 ) -> int:
-    """Fill due forward marks and fold the decision-time horizon into state.
+    """Fill due forward marks and fold the decision-time labels into state.
 
-    Every horizon is stored. The learned label is the return at the horizon
-    stamped when the candidate was recorded — not the best later horizon.
-    A row is claimed (learned=1) before the state write so a locked retry
-    cannot train the same markout twice. Returns rows newly learned.
+    Every horizon is stored. The learned fixed-horizon label is the return at
+    the horizon stamped when the candidate was recorded, not the best later
+    horizon. A row is claimed (learned=1 / lifecycle_learned=1) before the state
+    write so a locked retry cannot train the same label twice. Only rows stamped
+    with the engine's current economic version are learned. Returns rows newly
+    learned on the fixed-horizon label.
 
     SCALP rows also learn the edge residual (label minus the decision-time base
-    executable edge) and the gross path MAE over the committed horizon, which
-    is the live risk estimate. ``path_low(symbol, start, end)`` supplies the
-    bar-low path when available.
+    executable edge), the claim calibration, the micro weight and the gross path
+    MAE over the committed horizon, which is the live risk estimate.
+    ``path_low(symbol, start, end)`` supplies the bar-low path when available;
+    ``tick_quote(symbol, start, end)`` the last tape print in a window, for the
+    1/5/10 s marks where the tape has one.
+
+    DAY rows recorded with lifecycle inputs replay the live exit contract from
+    the decision ask over ``bars_1m(symbol, start, end)`` (stored 1m OHLCV by
+    default). Once final, the first record of an opportunity that was never
+    filled learns ``lifecycle_net``.
     """
     moment = float(now if now is not None else time.time())
+    if bars_1m is None:
+        from backend.services.day_v2.lifecycle_sim import ohlcv_bars_1m
+
+        def bars_1m(sym: str, start: float, end: float) -> list:
+            return ohlcv_bars_1m(db_path, sym, start, end)
+
     learned = 0
     try:
         conn = _connect(db_path)
@@ -1083,6 +1417,8 @@ def resolve_markouts(
                 unit = 60.0 if engine_id == DAY_ENGINE else 1.0
                 grace = 900.0 if engine_id == DAY_ENGINE else 60.0
                 marks = json.loads(row["markouts_json"] or "{}")
+                ref = float(row["ref_price"])
+                cost = float(row["roundtrip_cost"] or 0)
                 done = True
                 for horizon in horizons:
                     key = str(horizon)
@@ -1099,10 +1435,30 @@ def resolve_markouts(
                     if price is None and moment < due + grace:
                         done = False
                         continue
-                    if price is None or float(row["ref_price"]) <= 0 or not math.isfinite(float(price or 0)):
+                    if price is None or ref <= 0 or not math.isfinite(float(price or 0)):
                         marks[key] = None
                     else:
-                        marks[key] = (float(price) - float(row["ref_price"])) / float(row["ref_price"]) - float(row["roundtrip_cost"] or 0)
+                        marks[key] = (float(price) - ref) / ref - cost
+                if engine_id == SCALP_ENGINE and tick_quote is not None:
+                    for horizon in SCALP_TICK_HORIZONS_SEC:
+                        key = f"{horizon}s"
+                        if key in marks:
+                            continue
+                        due = float(row["evaluated_at"]) + horizon
+                        if moment < due:
+                            done = False
+                            continue
+                        tick = None
+                        with contextlib.suppress(Exception):
+                            tick = tick_quote(str(row["symbol"]), float(row["evaluated_at"]), due)
+                        valid = tick is not None and ref > 0 and math.isfinite(float(tick)) and float(tick) > 0
+                        marks[key] = (float(tick) - ref) / ref - cost if valid else None
+                if engine_id == DAY_ENGINE and str(row["lifecycle_json"] or "") and not isinstance(marks.get("lifecycle"), dict):
+                    life_label = _lifecycle_label(row, moment=moment, bars_1m=bars_1m)
+                    if life_label.get("final"):
+                        marks["lifecycle"] = {k: life_label.get(k) for k in ("net", "gross", "reason", "minutes", "mfe", "mae", "censored")}
+                    else:
+                        done = False
                 label_h = float(row["label_horizon"] or 0)
                 if label_h <= 0:
                     label_h = 60.0 if engine_id == DAY_ENGINE else 600.0
@@ -1131,16 +1487,17 @@ def resolve_markouts(
                     # forensic ATR-estimate residuals must not shape live edge.
                     micro_target = residual if is_directional(raw_source) else None
                 row_learned = int(row["learned"] or 0)
-                version_ok = str(row["strategy_version"]) == current_strategy_version(engine_id)
-                if forward is not None and not row_learned and version_ok and learnable:
+                version_ok = str(row["strategy_version"]) == current_strategy_version(engine_id) and str(row["economic_version"] or "") == current_economic_version(engine_id)
+                learn_fixed = forward is not None and not row_learned and version_ok and learnable
+                if learn_fixed:
                     # Claim first. A failed state write must not re-train this row.
                     cur = conn.execute(
                         "UPDATE adaptive_candidate_markouts SET markouts_json=?, learned=1, resolved=? WHERE id=? AND learned=0",
                         (json.dumps(marks), 1 if done else 0, row["id"]),
                     )
                     conn.commit()
-                    if cur.rowcount != 1:
-                        continue
+                    learn_fixed = cur.rowcount == 1
+                if learn_fixed:
                     observe(
                         db_path,
                         engine=engine_id,
@@ -1150,6 +1507,7 @@ def resolve_markouts(
                         metric="markout_forward",
                         value=forward,
                         strategy_version=str(row["strategy_version"]),
+                        now=moment,
                     )
                     if mae is not None:
                         observe(
@@ -1161,6 +1519,7 @@ def resolve_markouts(
                             metric="markout_mae",
                             value=mae,
                             strategy_version=str(row["strategy_version"]),
+                            now=moment,
                         )
                     if residual is not None:
                         observe(
@@ -1172,6 +1531,7 @@ def resolve_markouts(
                             metric=residual_metric(raw_source),
                             value=residual,
                             strategy_version=str(row["strategy_version"]),
+                            now=moment,
                         )
                         if is_directional(raw_source) and raw_move is not None:
                             learn_claim_label(
@@ -1182,19 +1542,52 @@ def resolve_markouts(
                                 strategy_version=str(row["strategy_version"]),
                                 base_edge=float(raw_move) - float(row["roundtrip_cost"] or 0),
                                 residual=residual,
+                                now=moment,
                             )
                     if engine_id == SCALP_ENGINE and micro_target is not None:
                         with contextlib.suppress(Exception):
                             feats = json.loads(row["features_json"] or "{}")
                             if isinstance(feats, dict) and feats:
-                                update_linear_model(db_path, SCALP_ENGINE, "micro_edge", feats, micro_target)
+                                update_linear_model(db_path, SCALP_ENGINE, "micro_edge", feats, micro_target, now=moment)
+                        econ = _economic_of(row)
+                        if "micro_unweighted" in econ and "pre_micro_edge" in econ:
+                            learn_micro_weight(
+                                db_path,
+                                strategy_version=str(row["strategy_version"]),
+                                tilt=float(econ["micro_unweighted"]),
+                                miss=float(forward) - float(econ["pre_micro_edge"]),
+                                now=moment,
+                            )
                     learned += 1
-                else:
-                    conn.execute(
-                        "UPDATE adaptive_candidate_markouts SET markouts_json=?, learned=?, resolved=? WHERE id=?",
-                        (json.dumps(marks), row_learned, 1 if done else 0, row["id"]),
-                    )
+                life = marks.get("lifecycle")
+                if (
+                    engine_id == DAY_ENGINE
+                    and isinstance(life, dict)
+                    and life.get("net") is not None
+                    and version_ok
+                    and state in LEARNABLE_DAY_STATES
+                    and not int(row["lifecycle_learned"] or 0)
+                    and _opportunity_learnable(conn, row)
+                ):
+                    cur = conn.execute("UPDATE adaptive_candidate_markouts SET lifecycle_learned=1 WHERE id=? AND lifecycle_learned=0", (row["id"],))
                     conn.commit()
+                    if cur.rowcount == 1:
+                        observe(
+                            db_path,
+                            engine=DAY_ENGINE,
+                            symbol=row["symbol"],
+                            setup=row["setup"],
+                            regime=row["regime"],
+                            metric="lifecycle_net",
+                            value=float(life["net"]),
+                            strategy_version=str(row["strategy_version"]),
+                            now=moment,
+                        )
+                conn.execute(
+                    "UPDATE adaptive_candidate_markouts SET markouts_json=?, resolved=? WHERE id=?",
+                    (json.dumps(marks), 1 if done else 0, row["id"]),
+                )
+                conn.commit()
             except sqlite3.Error:
                 logger.warning("MARKOUT_RESOLVE_ROW_FAILED id=%s", row["id"])
                 continue
@@ -1258,14 +1651,18 @@ def ohlcv_low_between(db_path: str, symbol: str, start: float, end: float) -> fl
     return None
 
 
-def _ohlc_rows(conn: sqlite3.Connection, symbol: str, interval: str, limit: int) -> list[tuple[float, float, float, float]]:
-    """Newest-last (ts asc) high/low/close for a symbol+interval, across name variants."""
+def _ohlc_rows(conn: sqlite3.Connection, symbol: str, interval: str, limit: int, as_of: float | None = None) -> list[tuple[float, float, float, float]]:
+    """Newest-last (ts asc) high/low/close for a symbol+interval, across name variants.
+
+    ``as_of`` restricts to bars opened before that epoch (historical replay).
+    """
     raw = str(symbol or "").upper().replace("-", "").replace("/", "")
+    before = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(as_of))) if as_of is not None else "9999"
     for variant in (raw, raw.replace("USDT", "-USDT"), raw.replace("USDT", "/USDT")):
         try:
             rows = conn.execute(
-                "SELECT ts, high, low, close FROM feature_ohlcv WHERE symbol=? AND interval=? ORDER BY ts DESC LIMIT ?",
-                (variant, interval, int(limit)),
+                "SELECT ts, high, low, close FROM feature_ohlcv WHERE symbol=? AND interval=? AND ts<? ORDER BY ts DESC LIMIT ?",
+                (variant, interval, before, int(limit)),
             ).fetchall()
         except sqlite3.Error:
             return []
@@ -1280,8 +1677,8 @@ def _ohlc_rows(conn: sqlite3.Connection, symbol: str, interval: str, limit: int)
     return []
 
 
-def _trend_bucket(conn: sqlite3.Connection, symbol: str, interval: str, lookback: int) -> str:
-    rows = _ohlc_rows(conn, symbol, interval, lookback)
+def _trend_bucket(conn: sqlite3.Connection, symbol: str, interval: str, lookback: int, as_of: float | None = None) -> str:
+    rows = _ohlc_rows(conn, symbol, interval, lookback, as_of)
     if len(rows) < 4:
         return ""
     first = rows[0][2]
@@ -1296,8 +1693,8 @@ def _trend_bucket(conn: sqlite3.Connection, symbol: str, interval: str, lookback
     return "flat"
 
 
-def _vol_bucket(conn: sqlite3.Connection, symbol: str) -> str:
-    rows = _ohlc_rows(conn, symbol, "15m", 30)
+def _vol_bucket(conn: sqlite3.Connection, symbol: str, as_of: float | None = None) -> str:
+    rows = _ohlc_rows(conn, symbol, "15m", 30, as_of)
     if len(rows) < 12:
         return ""
 
@@ -1316,21 +1713,22 @@ def _vol_bucket(conn: sqlite3.Connection, symbol: str) -> str:
     return "volhi" if short / long >= 1.15 else "vollo"
 
 
-def market_regime_tag(db_path: str, symbol: str) -> str:
+def market_regime_tag(db_path: str, symbol: str, as_of: float | None = None) -> str:
     """Coarse, inspectable regime key: BTC 1h trend + this symbol's 15m vol bucket.
 
     Returns e.g. 'btcup_volhi'. Empty string when data is missing, so callers
     fall back to whatever regime string they already had (never crashes, never
     gates). Read/write alignment is preserved because the tag is stamped on the
-    entry decision and reused at close.
+    entry decision and reused at close. ``as_of`` evaluates it from bars opened
+    before that epoch (historical replay); live callers read the newest bars.
     """
     try:
         conn = sqlite3.connect(db_path, timeout=5)
     except sqlite3.Error:
         return ""
     try:
-        btc = _trend_bucket(conn, "BTCUSDT", "1h", 24)
-        vol = _vol_bucket(conn, symbol)
+        btc = _trend_bucket(conn, "BTCUSDT", "1h", 24, as_of)
+        vol = _vol_bucket(conn, symbol, as_of)
     finally:
         conn.close()
     if not btc or not vol:
@@ -1348,6 +1746,8 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
     out: dict[str, Any] = {
         "adaptive_state_version": ADAPTIVE_STATE_VERSION,
         "half_life_days": ADAPTIVE_HALF_LIFE_DAYS,
+        "half_life_days_by_engine": {DAY_ENGINE: half_life_days(DAY_ENGINE), SCALP_ENGINE: half_life_days(SCALP_ENGINE)},
+        "economic_versions": {DAY_ENGINE: current_economic_version(DAY_ENGINE), SCALP_ENGINE: current_economic_version(SCALP_ENGINE)},
         "engines": {},
         "forensic": [],
     }
@@ -1358,8 +1758,8 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
     try:
         for engine_id, decide in ((DAY_ENGINE, day_decision), (SCALP_ENGINE, scalp_decision)):
             keys = conn.execute(
-                "SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? ORDER BY symbol, setup, regime",
-                (engine_id,),
+                "SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND setup != ? ORDER BY symbol, setup, regime",
+                (engine_id, current_economic_version(engine_id), MICRO_WEIGHT_KEY[1]),
             ).fetchall()
             rows = []
             for k in keys:
@@ -1383,6 +1783,7 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                             "regime": k["regime"],
                             "expected_move": round(view["expected_move"], 6),
                             "expected_net": round(view["expected_net"], 6),
+                            "uncertainty": round(view["uncertainty"], 6),
                             "size_mult": round(view["size_mult"], 4),
                             "objective_atr_mult": round(view["objective_atr_mult"], 4),
                             "confidence": round(view["confidence"], 3),
@@ -1390,7 +1791,9 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                             "abstain": view["abstain"],
                             "n": view["n_mfe"],
                             "n_trade_net": view["n_trade_net"],
+                            "n_lifecycle": view["economic"]["n_lifecycle"],
                             "n_forward": view["n_forward"],
+                            "levels": view["economic"]["levels"],
                         }
                     )
                 else:
@@ -1401,8 +1804,10 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                             "regime": k["regime"],
                             "adaptive_residual": round(view["adaptive_residual"], 6),
                             "adaptive_residual_strategy": round(view["adaptive_residual_strategy"], 6),
+                            "residual_uncertainty": round(view["residual_uncertainty"], 6),
                             "claim_capture": round(view["claim_capture"], 4),
                             "claim_base_mean": round(view["claim_base_mean"], 6),
+                            "micro_weight": round(view["micro_weight"], 4),
                             "risk_estimate": round(view["risk_estimate"], 6),
                             "target_pct": round(view["target_pct"], 5),
                             "hold_min": round(view["hold_min"], 2),
@@ -1420,6 +1825,7 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
             "tilt_max": MICRO_MODEL_TILT_MAX,
             "features": SCALP_MICRO_FEATURES,
             "weights": {f: round(float(micro.get("w", {}).get(f, 0.0)), 4) for f in SCALP_MICRO_FEATURES},
+            "learned_weight": {k: round(float(v), 4) for k, v in micro_weight(db_path).items()},
         }
     finally:
         conn.close()
@@ -1519,8 +1925,8 @@ def abstention_report(db_path: str, window_days: float = 7.0) -> dict[str, Any]:
             (SCALP_ENGINE, scalp_decision, "scalp_v2_decisions"),
         ):
             keys = conn.execute(
-                "SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? ORDER BY symbol, setup, regime",
-                (engine_id,),
+                "SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND setup != ? ORDER BY symbol, setup, regime",
+                (engine_id, current_economic_version(engine_id), MICRO_WEIGHT_KEY[1]),
             ).fetchall()
             abstaining: list[dict[str, Any]] = []
             active: list[dict[str, Any]] = []
@@ -1603,13 +2009,21 @@ def day_candidate_markout_report(db_path: str, window_days: float = 7.0) -> dict
     """Causal DAY candidate markouts by decision state and setup. Read-only.
 
     Current strategy version only. NEAR_QUALIFIED rows were one entry condition
-    short (evidence, never learned). Qualified rows are SELECTED when the same
-    bar's DAY decision was FILLED and REJECTED otherwise. Values are net of the
-    stamped round-trip cost from the decision-time executable price.
+    short (evidence, never learned). BLOCKED rows qualified but hit a capacity
+    rule. Other qualified rows are SELECTED when filled (or the same bar's DAY
+    decision was FILLED) and REJECTED otherwise. Values are net of the stamped
+    round-trip cost from the decision-time executable price; ``lifecycle`` is
+    the live exit contract replayed from that price.
     """
     since = time.time() - float(window_days) * 86400.0
     version = current_strategy_version(DAY_ENGINE)
-    out: dict[str, Any] = {"strategy_version": version, "window_days": float(window_days), "horizons_min": list(DAY_HORIZONS_MIN), "states": {}}
+    out: dict[str, Any] = {
+        "strategy_version": version,
+        "economic_version": current_economic_version(DAY_ENGINE),
+        "window_days": float(window_days),
+        "horizons_min": list(DAY_HORIZONS_MIN),
+        "states": {},
+    }
     try:
         conn = sqlite3.connect(db_path, timeout=10)
         conn.row_factory = sqlite3.Row
@@ -1620,8 +2034,10 @@ def day_candidate_markout_report(db_path: str, window_days: float = 7.0) -> dict
         if not cols:
             return out
         state_col = "candidate_state" if "candidate_state" in cols else "''"
+        filled_col = "filled" if "filled" in cols else "0"
         rows = conn.execute(
-            f"SELECT symbol, setup, evaluated_at, markouts_json, {state_col} AS state FROM adaptive_candidate_markouts WHERE engine_id=? AND strategy_version=? AND evaluated_at>=?",
+            f"SELECT symbol, setup, evaluated_at, markouts_json, {state_col} AS state, {filled_col} AS filled "
+            "FROM adaptive_candidate_markouts WHERE engine_id=? AND strategy_version=? AND evaluated_at>=?",
             (DAY_ENGINE, version, since),
         ).fetchall()
         results: dict[tuple[str, float], str] = {}
@@ -1635,18 +2051,24 @@ def day_candidate_markout_report(db_path: str, window_days: float = 7.0) -> dict
     agg: dict[str, dict[str, dict[str, list[float]]]] = {}
     for row in rows:
         state = str(row["state"] or "")
-        if state != CANDIDATE_NEAR_QUALIFIED:
+        if state == CANDIDATE_QUALIFIED_BLOCKED:
+            state = "BLOCKED"
+        elif state != CANDIDATE_NEAR_QUALIFIED:
             result = results.get((_norm_symbol(row["symbol"]), float(row["evaluated_at"])), "")
-            state = "SELECTED" if result == "FILLED" else "REJECTED"
+            state = "SELECTED" if (int(row["filled"] or 0) or result == "FILLED") else "REJECTED"
         try:
             marks = json.loads(row["markouts_json"] or "{}")
         except (TypeError, ValueError):
             continue
+        marks = marks if isinstance(marks, dict) else {}
         per_h = agg.setdefault(state, {}).setdefault(str(row["setup"] or ""), {})
         for h in DAY_HORIZONS_MIN:
-            value = _mark_at(marks if isinstance(marks, dict) else {}, h)
+            value = _mark_at(marks, h)
             if value is not None:
                 per_h.setdefault(str(h), []).append(value)
+        life = marks.get("lifecycle")
+        if isinstance(life, dict) and life.get("net") is not None:
+            per_h.setdefault("lifecycle", []).append(float(life["net"]))
     for state, setups in agg.items():
         out["states"][state] = {
             setup: {
@@ -1656,7 +2078,7 @@ def day_candidate_markout_report(db_path: str, window_days: float = 7.0) -> dict
                     "median": round(sorted(v)[len(v) // 2], 6),
                     "positive_rate": round(sum(1 for x in v if x > 0) / len(v), 3),
                 }
-                for h, v in sorted(per_h.items(), key=lambda kv: float(kv[0]))
+                for h, v in sorted(per_h.items(), key=lambda kv: (kv[0] == "lifecycle", float(kv[0]) if kv[0] != "lifecycle" else 0.0))
             }
             for setup, per_h in sorted(setups.items())
         }
@@ -1680,18 +2102,24 @@ __all__ = [
     "ADAPTIVE_STATE_VERSION",
     "DAY_HORIZONS_MIN",
     "SCALP_HORIZONS_SEC",
+    "SCALP_TICK_HORIZONS_SEC",
     "abstention_report",
     "adaptive_state_report",
     "calibration_report",
     "continuation_ratio",
+    "current_economic_version",
     "day_candidate_markout_report",
     "day_decision",
     "day_net_expectancy",
+    "day_size_mult",
     "estimate",
     "learn_claim_label",
     "learn_from_close",
+    "learn_micro_weight",
+    "mark_candidate_filled",
     "market_regime_tag",
     "micro_edge_tilt",
+    "micro_weight",
     "observe",
     "ohlcv_quote",
     "persist_trade_adaptive",

@@ -4,13 +4,18 @@ Orders the candidates that fired on one closed 15m bar so the strongest is
 funded first when the DAY sleeve cannot fund all of them. Ranking decides
 order only; it never removes a candidate.
 
-Score, highest first:
-  1. executable net edge to the setup objective: (objective - ask) / ask minus
+Order, highest first:
+  1. expected net edge after costs (``day_decision``): the candidate's
+     hierarchically pooled current-version evidence, realized closes and
+     lifecycle replays of unfilled qualified candidates. Cold, it is 0;
+  2. executable net edge to the setup objective: (objective - ask) / ask minus
      the estimated round-trip cost, where objective is the same level the
-     structure runner manages to (max(structural level, ask + k x 1h ATR)),
-     plus the candidate's learned net expectancy (``day_decision``);
-  2. move potential in 1h-ATR units (the same distance, volatility-normalised);
-  3. DAY universe order (deterministic tie-break).
+     structure runner manages to (max(structural level, ask + k x 1h ATR));
+  3. move potential in 1h-ATR units (the same distance, volatility-normalised);
+  4. DAY universe order (deterministic tie-break).
+
+The objective distance is a target, not evidence of edge, so it only orders
+candidates whose expected net edge is equal (e.g. all cold).
 """
 
 from __future__ import annotations
@@ -82,9 +87,9 @@ def rank_components(
 def rank_day_candidates(candidates: list[dict[str, Any]], universe: list[str] | tuple[str, ...], roundtrip_cost: float) -> list[dict[str, Any]]:
     """Return every candidate, highest rank first. Adaptive state reorders; it never removes.
 
-    A candidate may carry ``adaptive`` from ``day_decision``. Its learned net
-    expectancy is added to the structural edge. Without it, order is the
-    structural edge alone.
+    A candidate may carry ``adaptive`` from ``day_decision``; its expected net
+    edge is the score. Without it every score is 0 and the structural edge
+    orders the bar.
     """
     order = {str(sym).upper(): i for i, sym in enumerate(universe)}
     for cand in candidates:
@@ -100,13 +105,15 @@ def rank_day_candidates(candidates: list[dict[str, Any]], universe: list[str] | 
         )
         cand["rank"]["expected_move"] = float(adaptive.get("expected_move") or 0.0)
         cand["rank"]["expected_net"] = float(adaptive.get("expected_net") or 0.0)
+        cand["rank"]["uncertainty"] = float(adaptive.get("uncertainty") or 0.0)
         cand["rank"]["confidence"] = float(adaptive.get("confidence") or 0.0)
         cand["rank"]["size_mult"] = float(adaptive.get("size_mult") or 1.0)
-        cand["rank"]["score"] = cand["rank"]["executable_objective_edge"] + cand["rank"]["expected_net"]
+        cand["rank"]["score"] = cand["rank"]["expected_net"]
     ranked = sorted(
         candidates,
         key=lambda c: (
             -c["rank"]["score"],
+            -c["rank"]["executable_objective_edge"],
             -c["rank"]["move_potential_atr_1h"],
             order.get(str(c["symbol"]).upper(), len(order)),
         ),

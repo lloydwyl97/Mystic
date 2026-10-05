@@ -505,13 +505,14 @@ def test_detail_is_never_empty_for_hard_blocks_before_edge():
 
 
 def test_day_priors_and_decision_unchanged():
-    # Net quantities (realized trade net, cost-adjusted forward markout) are neutral.
+    # Net quantities (realized trade net, lifecycle net, cost-adjusted forward markout) are neutral.
     assert al._PRIORS[al.DAY_ENGINE] == {
         "trade_mfe": 0.012,
         "trade_mae": 0.006,
         "trade_time_to_mfe_min": 90.0,
         "trade_continuation": 0.45,
         "trade_net": 0.0,
+        "lifecycle_net": 0.0,
         "markout_forward": 0.0,
         "markout_mae": 0.006,
     }

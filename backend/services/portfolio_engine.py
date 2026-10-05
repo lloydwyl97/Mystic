@@ -7222,6 +7222,7 @@ class PortfolioEngine:
                     continuation=_continuation,
                     version_current=bool(_prov.get("version_current")),
                     is_dust=bool(_prov.get("is_dust")),
+                    entered_at=record.entry_timestamp,
                 )
             except Exception:
                 logger.debug("ADAPTIVE_CLOSE_LEARN_SKIPPED symbol=%s", symbol, exc_info=True)

@@ -252,7 +252,10 @@ def test_candidate_markouts_are_causal(tmp_path):
 def test_near_qualified_recording_is_wired_and_bounded():
     src = inspect.getsource(PortfolioEngineIntegration._process_day_v2_signals)
     assert "CANDIDATE_NEAR_QUALIFIED" in src and "len(unmet) == 1" in src and "closest in ENABLED_SETUPS" in src
-    assert "candidate_state=CANDIDATE_QUALIFIED" in src
+    assert "self._record_day_v2_candidate(db_path, cand, CANDIDATE_QUALIFIED)" in src
+    assert "self._record_day_v2_candidate(db_path, cand, CANDIDATE_QUALIFIED_BLOCKED)" in src
+    helper = inspect.getsource(PortfolioEngineIntegration._record_day_v2_candidate)
+    assert "candidate_state=state" in helper and "lifecycle=LifecycleParams.from_signal(" in helper and "opportunity_id=" in helper
 
 
 # --- SCALP: claim calibration, learning without fills ---------------------------
@@ -276,7 +279,8 @@ def test_uninformative_claims_lose_their_size_advantage(tmp_path):
         al.observe(db, engine=SCALP, symbol=SCALP_KEY[0], setup=SCALP_KEY[1], regime=SCALP_KEY[2], metric="edge_residual_strategy", value=residual, strategy_version=version)
     view = al.scalp_decision(db, *SCALP_KEY)
     assert view["claim_capture"] < 0.2
-    assert view["claim_base_mean"] == pytest.approx(0.00095)
+    # Time decay weights the newest claims fractionally more than the plain mean.
+    assert view["claim_base_mean"] == pytest.approx(0.00095, rel=1e-4)
     outsized = _edge_for_base(view, 0.0030)
     assert outsized.base_executable_edge_pct + outsized.adaptive_residual_pct > 0.0
     assert outsized.claim_residual_pct < 0.0

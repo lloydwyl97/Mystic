@@ -33,7 +33,19 @@ SCALP_ENTRY_CONTRACT_VERSION = "SCALP_V2_STRATEGY_PASS_NET_EDGE_V1"
 SCALP_EXIT_CONTRACT_VERSION = "SCALP_V2_TARGET_STOP_HORIZON_V1"
 
 ACCOUNTING_CONTRACT_VERSION = "TWO_ENGINE_FIFO_NET_V1"
-ADAPTIVE_STATE_VERSION = "ADAPTIVE_ONLINE_V1"
+ADAPTIVE_STATE_VERSION = "ADAPTIVE_ONLINE_V2"
+
+# Economic anchors: the first commit after which an engine's entry signal, cost
+# model, markout definitions and exit contract are all unchanged. Only evidence
+# decided at or after the anchor may move economic state; earlier rows stay
+# forensic. DAY: 7ab0f13 removed the DAY clock sells (closes before it carry the
+# current exit version string but a retired exit path). SCALP: a222109 follows
+# the claim contract (30a9a4f), the stale-book exit fix (7e45d86) and the
+# order-book staleness fix (0b60a7e) that changed micro features and costs.
+ECONOMIC_ANCHORS: dict[str, tuple[str, str]] = {
+    DAY_ENGINE: ("7ab0f13", "2026-10-01T21:41:15Z"),
+    SCALP_ENGINE: ("a222109", "2026-10-05T02:02:29Z"),
+}
 
 VERSION_COLUMNS: tuple[str, ...] = (
     "strategy_version",
@@ -78,6 +90,29 @@ def current_code_sha() -> str:
 def engine_versions(engine_id: str) -> dict[str, str] | None:
     versions = _ENGINE_VERSIONS.get(str(engine_id or "").strip().upper())
     return dict(versions) if versions else None
+
+
+def economic_anchor(engine_id: str) -> dict[str, Any] | None:
+    """{"commit", "at", "epoch"} for the engine's current economic anchor, else None."""
+    anchor = ECONOMIC_ANCHORS.get(str(engine_id or "").strip().upper())
+    if not anchor:
+        return None
+    commit, at = anchor
+    return {"commit": commit, "at": at, "epoch": datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp()}
+
+
+def economic_version(engine_id: str) -> str:
+    """Tag carried by every row of economic state: contracts, anchor and learner format.
+
+    State written under any other tag is never read, so a contract change, a new
+    anchor or a new learner format starts from evidence of that version only.
+    """
+    engine = str(engine_id or "").strip().upper()
+    versions = _ENGINE_VERSIONS.get(engine)
+    anchor = ECONOMIC_ANCHORS.get(engine)
+    if not versions or not anchor:
+        return ""
+    return "|".join((versions["strategy_version"], versions["entry_contract_version"], versions["exit_contract_version"], anchor[0], ADAPTIVE_STATE_VERSION))
 
 
 def version_provenance(engine_id: str) -> dict[str, str]:

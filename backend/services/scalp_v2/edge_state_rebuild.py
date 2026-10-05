@@ -1,9 +1,12 @@
 """Rebuild SCALP derived edge/risk state from current-version candidate markouts.
 
 Derived estimators only: ``edge_residual``, ``markout_mae`` (gross path MAE, the
-live risk estimate), the claim capture moments and the ``micro_edge`` model for SCALP_V2. Every other
-metric, every DAY row, ownership, accounting and trade history are untouched.
-Both state tables are copied to backup tables before anything is deleted.
+live risk estimate), the claim capture moments and the ``micro_edge`` model for SCALP_V2,
+all under the current economic version. Rows recorded before the SCALP economic
+anchor or under another economic version are not read. Every other metric,
+every DAY row, other versions' state, ownership, accounting and trade history
+are untouched. Both state tables are copied to backup tables before anything is
+deleted. ``economic_state_rebuild`` rebuilds the full current version.
 
 The replay is chronological and causal: a candidate's label is folded in at
 ``evaluated_at + label_horizon``, and an optional ``on_decision`` callback sees
@@ -109,21 +112,24 @@ def rebuild_scalp_edge_state(
     """
     engine = al.SCALP_ENGINE
     version = al.current_strategy_version(engine)
+    economic = al.current_economic_version(engine)
+    anchor = al.anchor_epoch(engine)
     backups = backup_state(db_path, backup_suffix) if backup_suffix else {}
     with al._connect(db_path) as conn:
         conn.execute(
-            f"DELETE FROM adaptive_metric_state WHERE engine_id=? AND metric IN ({','.join('?' * len(REBUILT_METRICS))})",
-            (engine, *REBUILT_METRICS),
+            f"DELETE FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND metric IN ({','.join('?' * len(REBUILT_METRICS))})",
+            (engine, economic, *REBUILT_METRICS),
         )
-        conn.execute("DELETE FROM adaptive_linear_model WHERE engine_id=? AND model=?", (engine, MICRO_MODEL))
+        conn.execute("DELETE FROM adaptive_linear_model WHERE engine_id=? AND model=?", (engine, al._model_key(engine, MICRO_MODEL)))
         conn.commit()
         rows = conn.execute(
-            "SELECT * FROM adaptive_candidate_markouts WHERE engine_id=? AND strategy_version=? AND learned=1 ORDER BY id",
-            (engine, version),
+            "SELECT * FROM adaptive_candidate_markouts WHERE engine_id=? AND strategy_version=? AND learned=1 "
+            "AND (economic_version=? OR (COALESCE(economic_version,'')='' AND evaluated_at>=?)) ORDER BY id",
+            (engine, version, economic, anchor),
         ).fetchall()
         legacy = conn.execute(
-            "SELECT COUNT(*) FROM adaptive_candidate_markouts WHERE engine_id=? AND strategy_version!=?",
-            (engine, version),
+            "SELECT COUNT(*) FROM adaptive_candidate_markouts WHERE engine_id=? AND NOT (strategy_version=? AND (economic_version=? OR (COALESCE(economic_version,'')='' AND evaluated_at>=?)))",
+            (engine, version, economic, anchor),
         ).fetchone()[0]
 
     events: list[tuple[float, int, int]] = []
@@ -152,7 +158,7 @@ def rebuild_scalp_edge_state(
             feats = {}
         if kind == 1:
             if on_decision is not None:
-                on_decision(row, al.scalp_decision(db_path, row["symbol"], row["setup"], row["regime"], feats), raw, source)
+                on_decision(row, al.scalp_decision(db_path, row["symbol"], row["setup"], row["regime"], feats, now=moment), raw, source)
             continue
         forward = al._forward_from_stored(row)
         if forward is None:
@@ -184,7 +190,7 @@ def rebuild_scalp_edge_state(
                 now=moment,
             )
         if isinstance(feats, dict) and feats and is_directional(source):
-            al.update_linear_model(db_path, engine, MICRO_MODEL, feats, residual)
+            al.update_linear_model(db_path, engine, MICRO_MODEL, feats, residual, now=moment)
             stats["micro_updates"] += 1
     stats["backups"] = backups
     return stats

@@ -44,13 +44,25 @@ def _cand(symbol, adaptive=None):
 
 
 def test_a_i_day_markout_updates_state_and_next_candidate_reads_it(tmp_path):
+    from backend.services.day_v2.lifecycle_sim import LifecycleParams
+
     db = str(tmp_path / "t.db")
     before = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "neutral")
     record_candidate(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="neutral", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=1_000.0)
     learned = resolve_markouts(db, lambda _s, _t: 103.0, now=1_000.0 + 400 * 60)
-    after = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "neutral")
+    diagnostic = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "neutral")
     assert learned == 1
-    assert after["n_forward"] >= 1
+    assert diagnostic["n_forward"] >= 1
+    # A fixed-horizon markout is a DAY diagnostic: it never moves expected net.
+    assert diagnostic["expected_net"] == before["expected_net"] == 0.0
+    # The candidate's lifecycle under the live exit contract does.
+    params = LifecycleParams(setup="RANGE_BOUNCE", entry_price=100.0, entry_time=10_000.0, atr_15m=0.4, structural_anchor=99.0, target_price=103.0, atr_1h=1.0, objective_structural=103.0)
+    record_candidate(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="neutral", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=10_000.0, lifecycle=params)
+    px = [100.0 + 0.01 * min(i, 300) for i in range(730)]
+    bars = [(10_000.0 + 60.0 * i, p, p + 0.05, p - 0.02, p + 0.01) for i, p in enumerate(px)]
+    resolve_markouts(db, lambda _s, _t: 103.0, now=10_000.0 + 731 * 60, bars_1m=lambda _s, a, b: [bar for bar in bars if a <= bar[0] < b])
+    after = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "neutral")
+    assert after["economic"]["n_lifecycle"] == pytest.approx(1.0)
     assert after["expected_net"] > before["expected_net"] == 0.0
     assert after["size_mult"] > before["size_mult"]
     from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
@@ -549,7 +561,7 @@ def test_abstention_cold_key_never_skips(tmp_path):
 def test_abstention_fires_on_confident_negative_edge(tmp_path):
     db = str(tmp_path / "t.db")
     for _ in range(40):
-        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="markout_forward", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
+        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="lifecycle_net", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
     d = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")
     assert d["abstain"] is True
     assert "LEARNED_NEGATIVE_EDGE" in d["abstain_reason"]
@@ -568,7 +580,7 @@ def test_abstention_kill_switch_disables_it(tmp_path, monkeypatch):
 
     db = str(tmp_path / "t.db")
     for _ in range(40):
-        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="markout_forward", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
+        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="lifecycle_net", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
     assert day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")["abstain"] is True
     monkeypatch.setattr(al, "ABSTAIN_ENABLED", False)
     assert day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")["abstain"] is False
@@ -580,10 +592,10 @@ def test_abstention_report_measures_value(tmp_path):
     db = str(tmp_path / "t.db")
     # A confident negative-edge DAY key -> should show up as abstaining.
     for _ in range(40):
-        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="markout_forward", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
+        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="lifecycle_net", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
     # A healthy positive key -> stays active.
     for _ in range(20):
-        observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="", metric="markout_forward", value=0.02, strategy_version=DAY_STRATEGY_VERSION)
+        observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="", metric="lifecycle_net", value=0.02, strategy_version=DAY_STRATEGY_VERSION)
     # Record two live skip decisions in the DAY decision log within the window.
     conn = sqlite3.connect(db)
     conn.execute("CREATE TABLE IF NOT EXISTS day_v2_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, cycle_ts REAL, result TEXT, closest TEXT DEFAULT '', unmet_json TEXT DEFAULT '[]')")

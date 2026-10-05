@@ -238,6 +238,7 @@ def evaluate_day_v2_exit(
     runner_activation_mult: float = 1.0,
     runner_trail_mult: float = 1.0,
     runner_tighten_mult: float = 1.0,
+    now: float | None = None,
 ) -> dict | None:
     """Evaluate all DAY V2 exit roles.
 
@@ -257,6 +258,8 @@ def evaluate_day_v2_exit(
         atr_1h_at_entry: 1h ATR at entry; 0 means a pre-runner position,
             which uses LEGACY_ATR_1H_PER_ATR_15M x atr_at_entry.
         objective_structural: Setup structural objective stamped at entry.
+        now: Evaluation clock (defaults to wall clock). The lifecycle
+            simulator passes each bar's close time.
 
     Returns:
         {"action": "sell", "reason": str, "exit_price_estimate": float,
@@ -268,7 +271,7 @@ def evaluate_day_v2_exit(
     if entry_price <= 0 or current_price <= 0:
         return None
 
-    now = time.time()
+    now = time.time() if now is None else float(now)
     hold_minutes = max(0.0, (now - entry_time) / 60.0) if entry_time > 0 else 0.0
     # Approximate closed-15m-bar count from wall-clock hold time.
     # Used only for the structural-invalidation guard (requires N closed bars).

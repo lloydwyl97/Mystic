@@ -13,8 +13,11 @@ estimate or strategy structural claim); a cold key contributes 0.
 base edge). The residual is a mean over all claim sizes; claim_capture is the
 learned share of a claim's excess that realizes, so an outsized claim is not
 admitted on its size alone. Cold, claim_capture is 1 and this term is 0.
-``micro_residual`` is the existing bounded microstructure tilt. Both terms may
-lower a candidate, but neither can lift one that is not already positive.
+``micro_residual`` is the bounded microstructure tilt times its learned weight
+in [0, 1] (the weight falls when resolved claims show the tilt does not explain
+what the calibrated edge missed). Both terms may lower a candidate, but neither
+can lift one that is not already positive. All learned terms are read from
+state of the current economic version, pooled hierarchically.
 
 ``final_executable_edge <= 0`` is hard economic safety (NO_EXECUTABLE_NET_EDGE).
 Anything above zero stays eligible. Confidence, risk and the final edge set
@@ -55,10 +58,40 @@ class ExecutableEdge:
     reject_threshold_pct: float = REJECT_THRESHOLD_PCT
     claim_capture: float = 1.0
     claim_residual_pct: float = 0.0
+    micro_weight: float = 1.0
+    micro_residual_unweighted_pct: float = 0.0
+    uncertainty_pct: float = 0.0
+    economic_version: str = ""
 
     @property
     def eligible(self) -> bool:
         return self.final_executable_edge_pct > self.reject_threshold_pct
+
+    @property
+    def pre_micro_edge_pct(self) -> float:
+        return self.final_executable_edge_pct - self.micro_residual_pct
+
+    def economic(self) -> dict[str, Any]:
+        """Expected net edge after costs, in the language DAY uses as well."""
+        return {
+            "engine_id": "SCALP_V2",
+            "economic_version": self.economic_version,
+            "expected_gross": self.edge_before_cost_pct,
+            "expected_cost": self.live_cost_pct,
+            "raw_claim": self.raw_expected_move_pct,
+            "adaptive_correction": self.adaptive_residual_pct + self.claim_residual_pct + self.micro_residual_pct,
+            "adaptive_residual": self.adaptive_residual_pct,
+            "claim_residual": self.claim_residual_pct,
+            "claim_capture": self.claim_capture,
+            "micro_residual": self.micro_residual_pct,
+            "micro_weight": self.micro_weight,
+            "micro_unweighted": self.micro_residual_unweighted_pct,
+            "pre_micro_edge": self.pre_micro_edge_pct,
+            "uncertainty": self.uncertainty_pct,
+            "expected_net_edge": self.final_executable_edge_pct,
+            "size_effect": self.size_mult - 1.0,
+            "eligible": self.eligible,
+        }
 
     @property
     def deficit_to_zero_pct(self) -> float:
@@ -74,6 +107,7 @@ class ExecutableEdge:
         out["deficit_to_zero_pct"] = self.deficit_to_zero_pct
         out["reject_deficit_pct"] = self.deficit_to_zero_pct
         out["eligible"] = self.eligible
+        out["economic"] = self.economic()
         return out
 
 
@@ -152,6 +186,10 @@ def scalp_executable_edge(
         impact_pct=max(0.0, _f(impact_pct)),
         claim_capture=capture,
         claim_residual_pct=claim,
+        micro_weight=max(0.0, min(1.0, _f(view.get("micro_weight"), 1.0))),
+        micro_residual_unweighted_pct=_f(view.get("micro_residual_unweighted"), micro_model),
+        uncertainty_pct=_f(view.get("residual_uncertainty")),
+        economic_version=str(view.get("economic_version") or ""),
     )
 
 
@@ -174,6 +212,10 @@ _DETAIL_KEYS: tuple[tuple[str, str], ...] = (
     ("claim_residual", "claim_residual_pct"),
     ("micro_residual", "micro_residual_pct"),
     ("micro_residual_model", "micro_residual_model_pct"),
+    ("micro_weight", "micro_weight"),
+    ("micro_residual_unweighted", "micro_residual_unweighted_pct"),
+    ("uncertainty", "uncertainty_pct"),
+    ("economic_version", "economic_version"),
     ("final_executable_edge", "final_executable_edge_pct"),
     ("confidence", "confidence"),
     ("n_residual", "n_residual"),
