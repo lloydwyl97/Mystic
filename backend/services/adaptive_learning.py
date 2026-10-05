@@ -249,6 +249,10 @@ def _connect(db_path: str) -> sqlite3.Connection:
         conn.execute("ALTER TABLE adaptive_candidate_markouts ADD COLUMN raw_expected_move REAL")
     if "raw_move_source" not in cols:
         conn.execute("ALTER TABLE adaptive_candidate_markouts ADD COLUMN raw_move_source TEXT")
+    # resolve_markouts runs every SCALP cycle; without these, its key repair and
+    # unresolved scan are full table scans that grow with the markout history.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_key ON adaptive_candidate_markouts(engine_id, symbol, setup, regime, learned)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_unresolved ON adaptive_candidate_markouts(resolved, id)")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS adaptive_linear_model (

@@ -23,22 +23,27 @@ def account_execution_is_live() -> bool:
 
 
 def scalp_is_paper() -> bool:
-    raw = _env_mode("SCALP_TRADING_MODE", "SCALP_MODE", "BINANCE_SCALP_MODE")
-    if raw:
-        return raw in {"paper", "structural_paper", "off", "disabled"}
-    return True
+    """Same authority the SCALP_V2 live loop uses to arm live entries."""
+    try:
+        from backend.services.binance_scalp.config import get_scalp_config
+        from backend.services.binance_scalp.structural_mode import live_entry_enabled
+
+        return not live_entry_enabled(get_scalp_config().resolved_structural_mode())
+    except Exception:
+        return True
 
 
 def account_operator_labels(*, live_client_present: bool = False) -> dict[str, Any]:
     day_live = account_execution_is_live()
+    scalp_label = "SCALP PAPER" if scalp_is_paper() else "SCALP LIVE"
     return {
         "mode": "LIVE" if day_live else "PAPER",
         "account_execution_live": day_live,
         "day_mode_display": "DAY LIVE" if day_live else "DAY PAPER",
-        "scalp_mode_display": "SCALP PAPER" if scalp_is_paper() else "SCALP LIVE",
+        "scalp_mode_display": scalp_label,
         "operator_mode_labels": {
             "day": "DAY LIVE" if day_live else "DAY PAPER",
-            "scalp": "SCALP PAPER" if scalp_is_paper() else "SCALP LIVE",
+            "scalp": scalp_label,
         },
         "live_service_connected": bool(day_live or live_client_present),
         "real_orders_enabled": bool(day_live),

@@ -127,6 +127,7 @@ def test_catastrophic_still_fires_without_an_adverse_quote() -> None:
 def test_older_depth_update_does_not_replace_the_book(monkeypatch) -> None:
     mem = _MemRedis()
     monkeypatch.setattr("backend.services.binance_scalp.market_reader.redis.from_url", lambda *_a, **_k: mem)
+    monkeypatch.setattr("backend.services.binance_scalp.market_reader._WS_DEPTH_REDIS", None)
     publish_ws_depth("SOLUSDT", [[117.88, 1.0]], [[117.89, 1.0]], last_update_id=200)
     publish_ws_depth("SOLUSDT", [[117.75, 1.0]], [[117.76, 1.0]], last_update_id=100)
     stored = json.loads(mem.store["scalp:ws_depth:SOLUSDT"])

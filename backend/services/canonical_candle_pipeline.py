@@ -164,9 +164,7 @@ class CanonicalCandlePipeline:
 
     def _completed_open_ms(self, interval: str, now_ms: int | None = None) -> int:
         now_ms = int(now_ms if now_ms is not None else self._now_ms())
-        width = interval_ms(interval)
-        forming = (now_ms // width) * width
-        return forming - width
+        return align_open_ms(now_ms, interval) - interval_ms(interval)
 
     async def _redis(self) -> Any:
         from backend.config.redis_config import get_shared_redis_async

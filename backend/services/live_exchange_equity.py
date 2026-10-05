@@ -275,11 +275,18 @@ def backfill_provable_fill_identities(
     recorded: list[dict[str, Any]],
     venue_fills: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Write live_exchange_fills only when symbol+side+order id already agree."""
-    from backend.services.live_order_identity import OrderIdentity, record_fill
+    """Write live_exchange_fills only when symbol+side+order id already agree.
+
+    A venue order that already has an identity row is never recorded again: a live
+    SELL row carries the position's trade id, so a second row keyed by the
+    paper_trades sell id would duplicate the same fill.
+    """
+    from backend.services.live_order_identity import OrderIdentity, fill_blank_exchange_timestamps, record_fill, recorded_order_sides
 
     written: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
+    recorded_sides = recorded_order_sides(db_path)
+    blank_stamps: list[tuple[str, str, str]] = []
     rec_by_order: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in recorded:
         oid = str(row.get("order_id") or "").strip()
@@ -301,6 +308,13 @@ def backfill_provable_fill_identities(
         trade_id = str(fill.get("id") or fill.get("venue_trade_id") or "").strip()
         if not trade_id:
             continue
+        event_ts = _venue_fill_timestamp(fill)
+        done = {"symbol": key[0], "side": key[1], "exchange_order_id": oid, "venue_trade_id": trade_id}
+        if (oid, key[1]) in recorded_sides:
+            if recorded_sides[(oid, key[1])] and event_ts:
+                blank_stamps.append((event_ts, oid, key[1]))
+            written.append(done)
+            continue
         qty = float(fill.get("qty") or fill.get("amount") or 0.0)
         cost = float(fill.get("cost") or 0.0)
         px = float(fill.get("price") or 0.0)
@@ -320,12 +334,25 @@ def backfill_provable_fill_identities(
             fee_asset=str(fill.get("fee_ccy") or ""),
             fee_from_exchange=True,
             mystic_trade_id=str(row.get("trade_id") or row.get("local_id") or ""),
-            event_ts_exchange=str(fill.get("timestamp") or ""),
+            event_ts_exchange=event_ts,
             raw={"source": "provable_order_id_backfill", "venue_trade_id": trade_id},
         )
         if record_fill(db_path, identity):
-            written.append({"symbol": key[0], "side": key[1], "exchange_order_id": oid, "venue_trade_id": trade_id})
+            written.append(done)
+    fill_blank_exchange_timestamps(db_path, blank_stamps)
     return written
+
+
+def _venue_fill_timestamp(fill: dict[str, Any]) -> str:
+    """Venue fill time as ISO. Reconciliation fills carry epoch-ms ``ts``; ``timestamp`` may be ISO or epoch-ms."""
+    from backend.services.live_order_identity import iso_or_blank
+
+    raw = fill.get("timestamp")
+    if raw is None or raw == "":
+        raw = fill.get("ts")
+    if isinstance(raw, (int, float)) or (isinstance(raw, str) and raw.strip().isdigit()):
+        return iso_or_blank(float(raw) / 1000.0)
+    return str(raw or "").strip()
 
 
 def backfill_exchange_reconciled_orders(

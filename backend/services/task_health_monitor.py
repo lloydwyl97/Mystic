@@ -27,6 +27,9 @@ from typing import Any
 _HEARTBEAT_KEY_PREFIX = "task_heartbeat:"
 _DEFAULT_TTL_SEC = 600
 
+# Beaten once per completed SCALP_V2 entry cycle (portfolio engine integration).
+SCALP_V2_LIVE_LOOP_TASK = "scalp_v2:live_loop"
+
 # Expected max silence (seconds) before a registered task is considered STALE.
 # Conservative thresholds — tuned to the task's normal cadence with headroom
 # for transient network/exchange hiccups, not tight enough to false-alarm.
@@ -34,7 +37,7 @@ CRITICAL_TASK_THRESHOLDS_SEC: dict[str, float] = {
     "order_book_collector:ws_messages": 60.0,
     "agg_trade_collector:ws_messages": 180.0,
     "live_market_data:ohlcv_loop": 180.0,
-    "scalp_runner:tick": 60.0,
+    SCALP_V2_LIVE_LOOP_TASK: 180.0,
 }
 
 
@@ -87,6 +90,33 @@ def beat_sync(task_name: str, redis_client: Any, *, extra: dict[str, Any] | None
         pipe.execute()
     except Exception:
         pass
+
+
+def read_heartbeat_sync(task_name: str, redis_client: Any) -> dict[str, str] | None:
+    """Heartbeat hash for ``task_name`` (sync redis client); None if never beaten or unreadable."""
+    if redis_client is None:
+        return None
+    try:
+        raw = redis_client.hgetall(f"{_HEARTBEAT_KEY_PREFIX}{task_name}")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    return {(k.decode() if isinstance(k, bytes) else str(k)): (v.decode() if isinstance(v, bytes) else str(v)) for k, v in raw.items()}
+
+
+def heartbeat_age_sync(task_name: str, redis_client: Any) -> float | None:
+    """Seconds since ``task_name`` last beat (sync redis client); None if never beaten or unreadable."""
+    return heartbeat_age(read_heartbeat_sync(task_name, redis_client))
+
+
+def heartbeat_age(beat_hash: dict[str, str] | None) -> float | None:
+    if not beat_hash:
+        return None
+    try:
+        return max(0.0, time.time() - float(beat_hash["last_beat_epoch"]))
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _status_for(age_sec: float | None, threshold_sec: float | None) -> str:
@@ -175,8 +205,12 @@ async def get_task_health(redis_client: Any, *, task_names: tuple[str, ...] | No
 
 __all__ = [
     "CRITICAL_TASK_THRESHOLDS_SEC",
+    "SCALP_V2_LIVE_LOOP_TASK",
     "TaskHealth",
     "beat",
     "beat_sync",
     "get_task_health",
+    "heartbeat_age",
+    "heartbeat_age_sync",
+    "read_heartbeat_sync",
 ]

@@ -38,6 +38,7 @@ import random
 import sqlite3
 import time
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_FLOOR, Decimal
@@ -234,6 +235,39 @@ def _lot_owned_by_engine(pos: object, engine_id: str) -> bool:
     engine = str(engine_id or "")
     lot_engine = str(getattr(pos, "engine_id", "") or "")
     return engine == lot_engine or (engine in ("", *DAY_SIDE_ENGINES) and lot_engine in ("", *DAY_SIDE_ENGINES))
+
+
+def strategy_slot_invariants(positions: Iterable[tuple[Any, Any]]) -> dict[str, dict[str, Any]]:
+    """position_limit / no_stacking over (key, lot) pairs under the two-engine contract.
+
+    Dust and protected inventory take no slot. Identity is (engine, symbol), so
+    DAY and SCALP holding the same symbol is not stacking.
+    """
+    from backend.services.protected_external_inventory import consumes_strategy_slot
+
+    lots: list[tuple[str, str]] = []
+    for key, pos in positions:
+        if not consumes_strategy_slot(pos):
+            continue
+        key_engine, key_symbol = split_position_key(str(key))
+        lots.append((str(getattr(pos, "engine_id", "") or key_engine), normalize_symbol(str(getattr(pos, "symbol", "") or "")) or key_symbol))
+    day_held = sum(1 for engine, _ in lots if engine in ("", *DAY_SIDE_ENGINES))
+    scalp_held = sum(1 for engine, _ in lots if engine == "SCALP_V2")
+    return {
+        "position_limit": {
+            "ok": len(lots) <= COMBINED_ENGINE_MAX_POSITIONS and day_held <= DAY_MAX_OPEN_POSITIONS and scalp_held <= SCALP_MAX_OPEN_POSITIONS,
+            "current": len(lots),
+            "max": COMBINED_ENGINE_MAX_POSITIONS,
+            "by_engine": {
+                "DAY_V2": {"current": day_held, "max": DAY_MAX_OPEN_POSITIONS},
+                "SCALP_V2": {"current": scalp_held, "max": SCALP_MAX_OPEN_POSITIONS},
+            },
+        },
+        "no_stacking": {
+            "ok": len(lots) == len(set(lots)),
+            "symbols": [symbol for _, symbol in lots],
+        },
+    }
 
 
 def _reservation_key(symbol: str, sleeve: str = "") -> str:
@@ -26549,16 +26583,14 @@ class PortfolioEngine:
         equity_diff = self._total_equity - equity_check
         equity_ok = abs(equity_diff) < 1.0
 
-        # Position limit invariant
-        position_ok = len(self.open_positions) <= MAX_OPEN_POSITIONS
+        slot_invariants = strategy_slot_invariants(self.open_positions.items())
+        position_ok = slot_invariants["position_limit"]["ok"]
 
         # Risk cap invariant
         risk_cap = self._total_equity * MAX_TOTAL_OPEN_RISK_PCT
         risk_ok = self._total_open_risk <= risk_cap * 1.1  # 10% tolerance
 
-        # Symbol stacking invariant
-        symbols = list(self.open_positions.keys())
-        stacking_ok = len(symbols) == len(set(symbols))
+        stacking_ok = slot_invariants["no_stacking"]["ok"]
 
         # Regime guards
         # Note: "unknown" regime is acceptable at startup - don't fail readiness for it
@@ -26595,21 +26627,14 @@ class PortfolioEngine:
                 "actual": equity_check,
                 "diff": round(equity_diff, 4),
             },
-            "position_limit": {
-                "ok": position_ok,
-                "current": len(self.open_positions),
-                "max": MAX_OPEN_POSITIONS,
-            },
+            "position_limit": slot_invariants["position_limit"],
             "risk_cap": {
                 "ok": risk_ok,
                 "current_risk": round(self._total_open_risk, 2),
                 "max_risk": round(risk_cap, 2),
                 "pct_used": round(self._total_open_risk / risk_cap * 100, 1) if risk_cap > 0 else 0,
             },
-            "no_stacking": {
-                "ok": stacking_ok,
-                "symbols": symbols,
-            },
+            "no_stacking": slot_invariants["no_stacking"],
             "regime_guard": {
                 "ok": regime_ok,
                 "regime": getattr(self._regime_state, "regime", "unknown"),

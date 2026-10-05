@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import math
@@ -21,6 +22,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +72,11 @@ logger = logging.getLogger(__name__)
 
 # Historic exit-monitor bug: misleading Redis alerts if left behind after code fix
 _EXIT_MONITOR_STALE_BD_SIGNATURE = "name 'bd' is not defined"
+
+
+def _sample_scalp_momentum(router: Any) -> int:
+    """Stamp the sample when the worker runs it, not when it was queued behind an evaluation."""
+    return router.sample_momentum(epoch=time.time())
 
 
 # Supervisor-only: persist portfolio_engine_ledger MTM fields on a fixed cadence so SQLite
@@ -207,6 +215,9 @@ class PortfolioEngineIntegration:
         self._scalp_v2_entry_interval = int(os.getenv("SCALP_V2_ENTRY_INTERVAL_SEC", "60"))
         self._scalp_momentum_sample_interval = max(1.0, float(os.getenv("SCALP_MOMENTUM_SAMPLE_SEC", "5")))
         self._scalp_momentum_task: asyncio.Task | None = None
+        self._scalp_router_executor: ThreadPoolExecutor | None = None
+        self._scalp_v2_halt_reason = ""
+        self._scalp_v2_halt_until = ""
 
         # Price cache for monitoring
         self.current_prices: dict[str, float] = {}
@@ -512,6 +523,10 @@ class PortfolioEngineIntegration:
                 emit_periodic_summary(ledger_realized_pnl=float(getattr(self.engine, "_realized_pnl", 0.0)))
         except Exception:
             logger.debug("PNL_OBS shutdown summary skipped", exc_info=True)
+
+        if self._scalp_router_executor is not None:
+            self._scalp_router_executor.shutdown(wait=False, cancel_futures=True)
+            self._scalp_router_executor = None
 
         # ================================================================
         # PHASE 4 FIX #6: USE TRY-FINALLY FOR GUARANTEED REDIS CLEANUP
@@ -2018,10 +2033,17 @@ class PortfolioEngineIntegration:
         """
         import asyncio as _asyncio
 
+        from backend.services.task_health_monitor import SCALP_V2_LIVE_LOOP_TASK, beat
+
         await _asyncio.sleep(30)  # Allow portfolio engine to fully initialise first
         while True:
             try:
                 await self._process_scalp_v2_signals()
+                await beat(
+                    SCALP_V2_LIVE_LOOP_TASK,
+                    self.redis_client,
+                    extra={"interval_sec": self._scalp_v2_entry_interval, "halt_reason": self._scalp_v2_halt_reason, "halt_until": self._scalp_v2_halt_until},
+                )
             except _asyncio.CancelledError:
                 break
             except Exception:
@@ -2030,6 +2052,16 @@ class PortfolioEngineIntegration:
                 await _asyncio.sleep(self._scalp_v2_entry_interval)
             except _asyncio.CancelledError:
                 break
+
+    async def _run_scalp_router(self, call: Callable[[], Any]) -> Any:
+        """Run blocking SCALP router work off the event loop.
+
+        One worker: the router's momentum history is not thread-safe, so
+        evaluate_all and sample_momentum must never overlap.
+        """
+        if self._scalp_router_executor is None:
+            self._scalp_router_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scalp-router")
+        return await asyncio.get_running_loop().run_in_executor(self._scalp_router_executor, call)
 
     async def _scalp_momentum_sampler_loop(self) -> None:
         """Feed the SCALP momentum tracker between 60s evaluations.
@@ -2049,7 +2081,7 @@ class PortfolioEngineIntegration:
                 if live_entry_enabled(get_scalp_config().resolved_structural_mode()):
                     router = get_router()
                     if router is not None:
-                        router.sample_momentum(epoch=time.time())
+                        await self._run_scalp_router(functools.partial(_sample_scalp_momentum, router))
             except _asyncio.CancelledError:
                 break
             except Exception:
@@ -2097,6 +2129,8 @@ class PortfolioEngineIntegration:
             scalp_share = 0.5
         principal = float(getattr(self.engine, "principal", 0.0) or 0.0) * scalp_share
         breaker = check_scalp_loss_breaker(self.engine.db_path, cfg, principal=principal)
+        self._scalp_v2_halt_reason = str(breaker.reason or "BREAKER") if breaker.halt else ""
+        self._scalp_v2_halt_until = str(breaker.recovery_until or "") if breaker.halt else ""
         if breaker.halt:
             logger.warning("SCALP_V2_BREAKER halt=True reason=%s until=%s %s", breaker.reason, breaker.recovery_until, breaker.detail)
             return
@@ -2131,7 +2165,7 @@ class PortfolioEngineIntegration:
                 logger.debug("SCALP_V2_LIVE_SKIP router=None (signal engine not initialised)")
                 return
             now = time.time()
-            candidates = router.evaluate_all(epoch=now, notional_usd=float(base_notional))
+            candidates = await self._run_scalp_router(functools.partial(router.evaluate_all, epoch=now, notional_usd=float(base_notional)))
         except Exception:
             logger.warning("SCALP_V2_ROUTER_ERROR", exc_info=True)
             return
@@ -2156,10 +2190,12 @@ class PortfolioEngineIntegration:
         from backend.services.adaptive_learning import market_regime_tag, ohlcv_low_between, ohlcv_quote, record_candidate, resolve_markouts
         from backend.services.scalp_v2.executable_edge import decision_detail
 
-        resolve_markouts(
-            self.engine.db_path,
-            lambda sym, ts: ohlcv_quote(self.engine.db_path, sym, ts),
-            path_low=lambda sym, a, b: ohlcv_low_between(self.engine.db_path, sym, a, b),
+        markout_db = self.engine.db_path
+        await _asyncio.to_thread(
+            resolve_markouts,
+            markout_db,
+            lambda sym, ts: ohlcv_quote(markout_db, sym, ts),
+            path_low=lambda sym, a, b: ohlcv_low_between(markout_db, sym, a, b),
         )
         by_symbol = {str(row.get("symbol") or "").upper().replace("-", "").replace("/", ""): row for row in candidates}
         products = [str(s) for s in getattr(cfg, "products", [])] or list(by_symbol)

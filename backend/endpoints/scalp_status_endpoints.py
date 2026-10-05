@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,70 +34,44 @@ def _rows(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[dict[s
     return [dict(r) for r in cur.fetchall()]
 
 
-def _scalp_runner_active() -> bool:
-    """True iff the scalp paper runner process is actually running."""
-    import subprocess
+def _live_db_path() -> str:
+    """Live SCALP_V2 books into the portfolio engine database."""
+    from backend.database_schema import DATABASE_PATH
 
+    return DATABASE_PATH
+
+
+def _live_redis() -> Any:
     try:
-        res = subprocess.run(
-            ["pgrep", "-f", "backend.services.binance_scalp.runner"],
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-        return res.returncode == 0
+        from backend.config.redis_config import get_shared_redis_sync
+
+        return get_shared_redis_sync()
     except Exception:
-        return False
+        return None
 
 
 @router.get("/status")
 def scalp_status(*, warm: int = 0) -> dict:
-    """Read-only scalp engine status — isolated from DAY top-four.
+    """Live SCALP_V2 status — loop heartbeat, latest decisions, open lots, realized P&L.
 
-    Fast path only: reads the Redis snapshot published by the paper runner.
-    Never rebuilds via REST depth / klines / strategy router / long SQLite.
     ``warm`` is accepted for API compatibility but does not trigger a rebuild.
     """
     _ = warm  # ignored — GET must not cold-build
-    active = _scalp_runner_active()
-    if not active:
+    try:
+        from backend.services.scalp_v2.live_dashboard import live_status
+
+        return live_status(_live_db_path(), _live_redis())
+    except Exception as exc:
+        logger.exception("scalp_status live read failed: %s", exc)
         return {
             "runner_active": False,
             "engine": "scalp",
-            "scalp_engaged": False,
-            "snapshot_available": False,
-            "stale": True,
-            "reason": "RUNNER_INACTIVE",
-            "operational_summary": {"operational_mode": "runner_dead"},
-            "pnl_summary": {"engine": "scalp"},
-            "note": "Scalp paper runner is not running. Start with './start_mystic.sh core' or 'scalp'.",
-        }
-
-    try:
-        from backend.services.binance_scalp.scalp_status_cache import get_cached_scalp_status
-
-        # Read-only Redis snapshot — never rebuilds market state on GET.
-        snapshot = get_cached_scalp_status(warm_rounds=0)
-        pnl = snapshot.pop("pnl_summary", None) or {"engine": "scalp"}
-        return {
-            "runner_active": True,
-            "engine": "scalp",
-            "pnl_summary": pnl,
-            **snapshot,
-        }
-    except Exception as exc:
-        logger.exception("scalp_status fast-path failed: %s", exc)
-        return {
-            "runner_active": True,
-            "engine": "scalp",
-            "snapshot_available": False,
-            "stale": True,
-            "reason": "SCALP_STATUS_SNAPSHOT_MISSING",
+            "reason": "SCALP_STATUS_READ_FAILED",
             "pnl_summary": {"engine": "scalp"},
             "overall_decision": "DEGRADED",
             "top_blocker": "STATUS_READ_FAILED",
             "status_error": str(exc)[:240],
-            "note": "Scalp status snapshot unavailable — retry shortly. Other /api/scalp/* endpoints may still work.",
+            "note": "SCALP status read failed — retry shortly.",
         }
 
 
@@ -239,54 +211,13 @@ def scalp_entry_telemetry() -> dict:
 
 @router.get("/positions")
 def scalp_positions() -> dict[str, Any]:
-    """Open scalp paper positions (read-only) with live lifecycle fields."""
-    try:
-        with _ro_conn() as conn:
-            open_rows = _rows(
-                conn,
-                """
-                SELECT symbol, quantity, entry_price, entry_time, entry_time_epoch,
-                       trade_id, status, state, diagnostics_json, last_state_reason,
-                       max_favorable_pct, stale_review_count, session_low_bid
-                FROM scalp_paper_positions
-                WHERE status = 'OPEN'
-                ORDER BY entry_time_epoch DESC
-                """,
-            )
-            ledger = _rows(
-                conn,
-                """
-                SELECT principal, cash_balance, positions_value, realized_pnl,
-                       unrealized_pnl, total_equity, updated_at
-                FROM scalp_paper_ledger WHERE id = 1
-                """,
-            )
-        now = time.time()
-        for row in open_rows:
-            epoch = float(row.get("entry_time_epoch") or 0)
-            row["hold_seconds"] = round(max(0.0, now - epoch), 1) if epoch else None
-            diag_raw = row.get("diagnostics_json")
-            if diag_raw:
-                try:
-                    diag = json.loads(diag_raw)
-                    row["setup"] = diag.get("setup_name") or diag.get("setup")
-                except (json.JSONDecodeError, TypeError):
-                    row["setup"] = None
-            else:
-                row["setup"] = None
-        from backend.services.binance_scalp.scalp_position_lifecycle import enrich_open_scalp_positions
+    """Open live SCALP_V2 lots (dust excluded), read-only."""
+    from backend.services.scalp_v2.live_dashboard import live_positions
 
-        enriched = enrich_open_scalp_positions(open_rows)
-        for row in enriched:
-            row.pop("diagnostics_json", None)
-        return {
-            "engine": "scalp",
-            "open_count": len(enriched),
-            "positions": enriched,
-            "ledger": ledger[0] if ledger else None,
-        }
-    except FileNotFoundError as exc:
-        return {"engine": "scalp", "open_count": 0, "positions": [], "ledger": None, "note": str(exc)}
+    try:
+        return live_positions(_live_db_path())
+    except sqlite3.Error as exc:
+        return {"engine": "scalp", "open_count": 0, "positions": [], "ledger": None, "note": str(exc)[:240]}
 
 
 @router.get("/trades")
@@ -294,65 +225,35 @@ def scalp_trades(
     limit: int = Query(50, ge=1, le=500),
     days: int | None = Query(None, ge=1, le=365),
 ) -> dict[str, Any]:
-    """Recent scalp paper trades (read-only)."""
+    """Recent live SCALP_V2 fills (read-only)."""
+    from backend.services.scalp_v2.live_dashboard import live_trades
+
     try:
-        with _ro_conn() as conn:
-            if days is not None:
-                rows = _rows(
-                    conn,
-                    """
-                    SELECT trade_id, symbol, side, quantity, price, notional,
-                           fee_usd, pnl_usd, pnl_pct, exit_reason, created_at
-                    FROM scalp_paper_trades
-                    WHERE datetime(created_at) >= datetime('now', ?)
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                    """,
-                    (f"-{int(days)} days", limit),
-                )
-            else:
-                rows = _rows(
-                    conn,
-                    """
-                    SELECT trade_id, symbol, side, quantity, price, notional,
-                           fee_usd, pnl_usd, pnl_pct, exit_reason, created_at
-                    FROM scalp_paper_trades
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                )
-        return {"engine": "scalp", "count": len(rows), "trades": rows}
-    except FileNotFoundError as exc:
-        return {"engine": "scalp", "count": 0, "trades": [], "note": str(exc)}
+        return live_trades(_live_db_path(), limit=limit, days=days)
+    except sqlite3.Error as exc:
+        return {"engine": "scalp", "count": 0, "trades": [], "note": str(exc)[:240]}
 
 
 @router.get("/scoreboard")
 def scalp_scoreboard(days: int = Query(7, ge=1, le=90)) -> dict[str, Any]:
-    """Daily scalp scoreboard rollup (read-only)."""
+    """Daily live SCALP_V2 realized rollup (UTC days, read-only)."""
+    from backend.services.scalp_v2.live_dashboard import live_scoreboard
+
     try:
-        with _ro_conn() as conn:
-            rows = _rows(
-                conn,
-                """
-                SELECT day, trades, wins, losses, net_pnl, updated_at
-                FROM scalp_scoreboard_daily
-                ORDER BY day DESC
-                LIMIT ?
-                """,
-                (days,),
-            )
-        return {"engine": "scalp", "days": days, "rows": rows}
-    except FileNotFoundError as exc:
-        return {"engine": "scalp", "days": days, "rows": [], "note": str(exc)}
+        return live_scoreboard(_live_db_path(), days=days)
+    except sqlite3.Error as exc:
+        return {"engine": "scalp", "days": days, "rows": [], "note": str(exc)[:240]}
 
 
 @router.get("/attribution")
 def scalp_attribution(days: int | None = Query(None, ge=1, le=365)) -> dict[str, Any]:
-    """Closed scalp PnL attribution by symbol, setup, regime, exit, hold, and cost burden."""
-    from backend.services.binance_scalp.scalp_attribution_report import build_scalp_attribution_report
+    """Closed live SCALP_V2 PnL attribution by symbol, setup, regime, exit, hold, and cost burden."""
+    from backend.services.scalp_v2.live_dashboard import live_attribution
 
-    return build_scalp_attribution_report(days=days)
+    try:
+        return live_attribution(_live_db_path(), days=days)
+    except sqlite3.Error as exc:
+        return {"engine": "scalp", "error": str(exc)[:200], "rows": []}
 
 
 @router.get("/learning-summary")
@@ -391,7 +292,9 @@ def scalp_learning_summary(limit: int = Query(20, ge=1, le=200)) -> dict[str, An
                 """,
                 (limit,),
             )
-            sell_count = conn.execute("SELECT COUNT(*) FROM scalp_paper_trades WHERE side='SELL'").fetchone()[0]
+        from backend.services.scalp_v2.live_dashboard import live_closed_sell_count
+
+        sell_count = live_closed_sell_count(_live_db_path())
         return {
             "engine": "scalp",
             "closed_sells": int(sell_count),

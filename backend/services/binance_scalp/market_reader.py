@@ -101,6 +101,22 @@ def _read_depth_cache(r: redis.Redis, sym: str) -> tuple[list[list[float]], list
         return None
 
 
+_WS_DEPTH_REDIS: redis.Redis | None = None
+
+
+def _ws_depth_redis() -> redis.Redis:
+    """One client for the depth publisher: it runs on the collector's event loop for every snapshot."""
+    global _WS_DEPTH_REDIS
+    if _WS_DEPTH_REDIS is None:
+        _WS_DEPTH_REDIS = redis.from_url(
+            os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
+            decode_responses=True,
+            socket_timeout=2.0,
+            socket_connect_timeout=2.0,
+        )
+    return _WS_DEPTH_REDIS
+
+
 def publish_ws_depth(
     symbol: str,
     bids: list[list[float]],
@@ -117,7 +133,7 @@ def publish_ws_depth(
         return
     bus = symbol_bus(symbol)
     try:
-        r = redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"), decode_responses=True)
+        r = _ws_depth_redis()
         key = f"{_WS_DEPTH_KEY_PREFIX}{bus}"
         if last_update_id is not None and not _update_id_is_newer(r, key, int(last_update_id)):
             return

@@ -25,6 +25,23 @@ from backend.services.task_manager import task_manager
 
 logger = logging.getLogger(__name__)
 
+_STREAM_KEY = '"stream"'
+
+
+def _stream_name(message: str | bytes) -> str | None:
+    """Combined-stream name of a frame, read without decoding the depth payload."""
+    if isinstance(message, bytes):
+        message = message.decode("utf-8", "replace")
+    key = message.find(_STREAM_KEY)
+    if key < 0:
+        return None
+    colon = message.find(":", key + len(_STREAM_KEY))
+    start = message.find('"', colon + 1) if colon >= 0 else -1
+    if start < 0 or message[colon + 1 : start].strip():
+        return None
+    end = message.find('"', start + 1)
+    return message[start + 1 : end] if end > start + 1 else None
+
 
 class OrderBookCollector:
     """
@@ -48,6 +65,7 @@ class OrderBookCollector:
         self.stats = {
             "messages_received": 0,
             "order_books_processed": 0,
+            "snapshots_superseded": 0,
             "errors": 0,
             "reconnects": 0,
             "last_error": None,
@@ -100,16 +118,31 @@ class OrderBookCollector:
                 await websocket.send(json.dumps(subscribe_msg))
                 logger.info(f"Subscribed to {len(streams)} order book streams")
 
-                # Listen for messages
-                async for message in websocket:
-                    if not self.is_running:
-                        break
-
-                    try:
-                        await self._process_message(message)
-                    except Exception as e:
-                        logger.debug(f"Error processing message: {e}")
-                        self.stats["errors"] += 1
+                # Drain the socket continuously and process only the newest snapshot
+                # per stream. Processing every snapshot in order falls behind in busy
+                # markets: old books get published with a fresh timestamp, and the
+                # undrained socket delays keepalive pongs until the connection drops (1011).
+                latest: dict[str, str] = {}
+                ready = asyncio.Event()
+                worker = asyncio.create_task(self._process_latest(latest, ready), name="order_book_collector:process_latest")
+                try:
+                    async for message in websocket:
+                        if not self.is_running:
+                            break
+                        if worker.done():
+                            worker.result()
+                        stream = _stream_name(message)
+                        if stream is None:
+                            continue
+                        self.stats["messages_received"] += 1
+                        if stream in latest:
+                            self.stats["snapshots_superseded"] += 1
+                        latest[stream] = message
+                        ready.set()
+                finally:
+                    worker.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await worker
 
         except websockets.exceptions.WebSocketException as e:
             logger.warning(f"WebSocket connection error: {e}")
@@ -118,6 +151,18 @@ class OrderBookCollector:
             err_msg = str(e).strip() or type(e).__name__
             logger.warning("WebSocket error: %s, reconnecting", err_msg)
             raise
+
+    async def _process_latest(self, latest: dict[str, str], ready: asyncio.Event) -> None:
+        while True:
+            await ready.wait()
+            ready.clear()
+            while latest:
+                _stream, message = latest.popitem()
+                try:
+                    await self._process_message(message)
+                except Exception as e:
+                    logger.debug(f"Error processing message: {e}")
+                    self.stats["errors"] += 1
 
     async def _process_message(self, message: str) -> None:
         """
@@ -179,7 +224,6 @@ class OrderBookCollector:
 
                 publish_ws_depth(symbol, top_bids, top_asks, last_update_id=last_update_id)
 
-            self.stats["messages_received"] += 1
             self.stats["order_books_processed"] += 1
             await self._heartbeat_throttled(symbol)
 

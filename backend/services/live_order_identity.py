@@ -503,6 +503,37 @@ def all_order_ids(db_path: str) -> set[str]:
     return {str(r["exchange_order_id"]) for r in rows if r.get("exchange_order_id")}
 
 
+def recorded_order_sides(db_path: str) -> dict[tuple[str, str], bool]:
+    """Every recorded (exchange order id, side), mapped to whether a row for it lacks the venue timestamp."""
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10) as conn:
+            rows = conn.execute(f"SELECT exchange_order_id, UPPER(side), COALESCE(event_ts_exchange, '') FROM {TABLE}").fetchall()
+    except sqlite3.Error:
+        return {}
+    out: dict[tuple[str, str], bool] = {}
+    for oid, side, stamp in rows:
+        key = (str(oid), str(side))
+        out[key] = out.get(key, False) or not str(stamp).strip()
+    return out
+
+
+def fill_blank_exchange_timestamps(db_path: str, stamps: list[tuple[str, str, str]]) -> int:
+    """Set ``(event_ts_exchange, order id, side)`` where the recorded venue timestamp is blank. Never overwrites."""
+    if not stamps:
+        return 0
+    try:
+        with sqlite3.connect(db_path, timeout=15) as conn:
+            cur = conn.executemany(
+                f"UPDATE {TABLE} SET event_ts_exchange = ? WHERE exchange_order_id = ? AND UPPER(side) = ? AND COALESCE(event_ts_exchange, '') = ''",
+                stamps,
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+    except sqlite3.Error as exc:
+        logger.error("LIVE_FILL_TIMESTAMP_BACKFILL_FAILED rows=%d: %s", len(stamps), exc)
+        return 0
+
+
 def record_exchange_reconciled(
     db_path: str,
     *,

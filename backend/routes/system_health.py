@@ -310,6 +310,18 @@ async def get_process_health() -> dict[str, Any]:
         "ai_market_context": _process_running("start_ai_market_context.py"),
         "ai_learning": _process_running("start_ai_learning.py"),
     }
+    from backend.services.task_health_monitor import CRITICAL_TASK_THRESHOLDS_SEC, SCALP_V2_LIVE_LOOP_TASK, heartbeat_age_sync
+
+    client = None
+    redis_ok = False
+    if get_shared_redis_sync:
+        try:
+            client = get_shared_redis_sync()
+            redis_ok = client is not None and client.ping()
+        except Exception:
+            redis_ok = False
+    scalp_age = heartbeat_age_sync(SCALP_V2_LIVE_LOOP_TASK, client) if redis_ok else None
+    scalp_threshold = CRITICAL_TASK_THRESHOLDS_SEC[SCALP_V2_LIVE_LOOP_TASK]
     optional = {
         "live_data_collector": {
             "running": _process_running("live_data_collector.py"),
@@ -321,14 +333,14 @@ async def get_process_health() -> dict[str, Any]:
             "classification": "retired",
             "note": "SCALP paper runner removed; SCALP_V2 runs inside start_portfolio_engine_integration.py.",
         },
+        "scalp_v2_live_loop": {
+            "running": scalp_age is not None and scalp_age <= scalp_threshold,
+            "age_sec": round(scalp_age, 1) if scalp_age is not None else None,
+            "threshold_sec": scalp_threshold,
+            "classification": "in_process",
+            "note": "SCALP_V2 entry loop heartbeat inside start_portfolio_engine_integration.py.",
+        },
     }
-    redis_ok = False
-    if get_shared_redis_sync:
-        try:
-            client = get_shared_redis_sync()
-            redis_ok = client is not None and client.ping()
-        except Exception:
-            redis_ok = False
     core_ok = checks["uvicorn"] and checks["portfolio_engine"]
     all_ok = all(checks.values())
     return {

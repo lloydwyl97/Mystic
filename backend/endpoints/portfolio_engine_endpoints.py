@@ -19,6 +19,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -31,6 +32,7 @@ from backend.services.portfolio_engine import (
     compute_position_risk_usd,
     get_portfolio_engine,
     initialize_portfolio_engine,
+    strategy_slot_invariants,
 )
 from backend.services.portfolio_engine_integration import get_portfolio_integration
 from backend.utils.sqlite_runtime import connect_ro, is_locked_error
@@ -345,6 +347,21 @@ def _build_position_risk_rows(positions: list[dict[str, Any]], equity: float) ->
 async def _read_positions_for_risk_from_sqlite() -> list[dict[str, Any]]:
     """Async wrapper for _read_positions_for_risk_from_sqlite_sync."""
     return await asyncio.to_thread(_read_positions_for_risk_from_sqlite_sync)
+
+
+def _read_position_lots_from_sqlite_sync() -> list[SimpleNamespace] | None:
+    """Open position rows with the fields slot accounting needs; None when unreadable."""
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        rows = conn.execute("SELECT symbol, engine_id, status, quantity FROM portfolio_engine_positions WHERE quantity > 0").fetchall()
+        return [SimpleNamespace(symbol=row[0] or "", engine_id=row[1] or "", status=row[2] or "ACTIVE", quantity=float(row[3] or 0)) for row in rows]
+    except Exception as e:
+        logger.debug("Position lots SQLite read failed: %s", e)
+        return None
+    finally:
+        if conn:
+            conn.close()
 
 
 @router.get("/pnl-reconciliation")
@@ -2631,24 +2648,15 @@ async def get_invariants_detail() -> dict[str, Any]:
     try:
         engine = get_portfolio_engine()
         invariants = engine.get_invariants_status()
-        sqlite_positions = await _read_positions_for_risk_from_sqlite()
-        sqlite_count = len(sqlite_positions)
-        sqlite_symbols = [p["symbol"] for p in sqlite_positions]
-
-        # Override position data with SQLite (matches positions table)
-        if "position_limit" in invariants:
-            pl = invariants["position_limit"]
-            mx = int(pl.get("max", 10) or 10)
-            invariants["position_limit"] = {
-                "ok": sqlite_count <= mx,
-                "current": sqlite_count,
-                "max": mx,
-            }
-        if "no_stacking" in invariants:
-            invariants["no_stacking"] = {
-                "ok": len(sqlite_symbols) == len(set(sqlite_symbols)),
-                "symbols": sqlite_symbols,
-            }
+        lots = await asyncio.to_thread(_read_position_lots_from_sqlite_sync)
+        if lots is not None:
+            overridden = strategy_slot_invariants((lot.symbol, lot) for lot in lots)
+            invariants.update(overridden)
+            failed = [key for key in invariants.get("snapshot_failed_keys", []) if key not in overridden]
+            failed += [key for key, check in overridden.items() if not check["ok"]]
+            invariants["snapshot_failed_keys"] = failed
+            invariants["snapshot_failed_count"] = len(failed)
+            invariants["all_ok"] = not failed
 
         return {
             "success": True,

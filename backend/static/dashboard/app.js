@@ -1483,7 +1483,7 @@ function updateProcessHealth(res) {
     setStatus("ph-portfolio", procs.portfolio_engine);
     setStatus("ph-context", procs.ai_market_context);
     setStatus("ph-learning", procs.ai_learning);
-    setStatus("ph-scalp", procs.scalp_runner);
+    setStatus("ph-scalp", (optional.scalp_v2_live_loop || {}).running === true);
     const ldcEl = document.getElementById("ph-live-data-collector");
     if (ldcEl) {
         const ldc = optional.live_data_collector || {};
