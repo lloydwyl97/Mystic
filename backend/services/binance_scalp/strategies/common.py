@@ -51,7 +51,7 @@ def estimate_expected_move_pct(
 
 
 def directional_claim_pct(structural: float, cap_pct: float = 0.006) -> float:
-    """A strategy's structural projection as a directional raw move (no ATR floor)."""
+    """A strategy's structural projection clipped to [0, cap]: no ATR, no floor."""
     return min(max(float(structural or 0.0), 0.0), float(cap_pct))
 
 
@@ -106,13 +106,14 @@ def reject_signal(
     score: float = 0.0,
     confidence: float = 0.0,
     mechanical: bool = True,
-    directional_move: float = 0.0,
+    directional_move: float | None = None,
 ) -> ScalpSetupSignal:
     """Build a failed signal.
 
     Mechanical/economic rejects keep score=0 and disappear from execution.
     Opinion rejects should pass setup_context features and a continuous score
-    so ranking can learn; they must not vanish as information.
+    so ranking can learn; they must not vanish as information. A reject that
+    already computed its structural projection passes it as ``directional_move``.
     """
     ctx_map = dict(setup_context or {})
     ctx_map["reject_class"] = "mechanical" if mechanical else "opinion"
@@ -134,7 +135,8 @@ def reject_signal(
         passed=False,
         reject_reason=reason,
         setup_context=ctx_map,
-        directional_move_pct=directional_claim_pct(directional_move),
+        directional_move_pct=directional_claim_pct(directional_move or 0.0),
+        claim_available=directional_move is not None,
     )
 
 
@@ -170,4 +172,5 @@ def pass_signal(
         reject_reason=None,
         setup_context=setup_context,
         directional_move_pct=directional_claim_pct(directional_move_pct),
+        claim_available=True,
     )

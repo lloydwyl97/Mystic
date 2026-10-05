@@ -34,6 +34,9 @@ SCALP_EXIT_CONTRACT_VERSION = "SCALP_V2_TARGET_STOP_HORIZON_V1"
 
 ACCOUNTING_CONTRACT_VERSION = "TWO_ENGINE_FIFO_NET_V1"
 ADAPTIVE_STATE_VERSION = "ADAPTIVE_ONLINE_V2"
+# Learner format per engine. A format change re-tags only that engine's state.
+# SCALP V3: the claim is calibrated from realized gross moves with a zero prior.
+ADAPTIVE_FORMATS: dict[str, str] = {DAY_ENGINE: ADAPTIVE_STATE_VERSION, SCALP_ENGINE: "ADAPTIVE_ONLINE_V3"}
 
 # Economic anchors: the first commit after which an engine's entry signal, cost
 # model, markout definitions and exit contract are all unchanged. Only evidence
@@ -101,6 +104,10 @@ def economic_anchor(engine_id: str) -> dict[str, Any] | None:
     return {"commit": commit, "at": at, "epoch": datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp()}
 
 
+def adaptive_format(engine_id: str) -> str:
+    return ADAPTIVE_FORMATS.get(str(engine_id or "").strip().upper(), ADAPTIVE_STATE_VERSION)
+
+
 def economic_version(engine_id: str) -> str:
     """Tag carried by every row of economic state: contracts, anchor and learner format.
 
@@ -112,7 +119,7 @@ def economic_version(engine_id: str) -> str:
     anchor = ECONOMIC_ANCHORS.get(engine)
     if not versions or not anchor:
         return ""
-    return "|".join((versions["strategy_version"], versions["entry_contract_version"], versions["exit_contract_version"], anchor[0], ADAPTIVE_STATE_VERSION))
+    return "|".join((versions["strategy_version"], versions["entry_contract_version"], versions["exit_contract_version"], anchor[0], adaptive_format(engine)))
 
 
 def version_provenance(engine_id: str) -> dict[str, str]:
@@ -125,7 +132,7 @@ def version_provenance(engine_id: str) -> dict[str, str]:
         **versions,
         "code_sha": current_code_sha(),
         "accounting_contract_version": ACCOUNTING_CONTRACT_VERSION,
-        "adaptive_state_version": ADAPTIVE_STATE_VERSION,
+        "adaptive_state_version": adaptive_format(engine_id),
     }
 
 
@@ -314,6 +321,7 @@ def performance_by_version(db_path: str) -> dict[str, Any]:
     for engine_id, versions in _ENGINE_VERSIONS.items():
         out["engines"][engine_id] = {
             **versions,
+            "adaptive_state_version": adaptive_format(engine_id),
             "current_version_start_utc": current_version_start(db_path, engine_id),
             "current": _stats(buckets.get((engine_id, True), [])),
             "legacy": _stats(buckets.get((engine_id, False), [])),
@@ -329,6 +337,7 @@ def performance_by_version(db_path: str) -> dict[str, Any]:
 
 __all__ = [
     "ACCOUNTING_CONTRACT_VERSION",
+    "ADAPTIVE_FORMATS",
     "DAY_ENTRY_CONTRACT_VERSION",
     "DAY_EXIT_CONTRACT_VERSION",
     "DAY_STRATEGY_VERSION",
@@ -336,6 +345,7 @@ __all__ = [
     "SCALP_EXIT_CONTRACT_VERSION",
     "SCALP_STRATEGY_VERSION",
     "VERSION_COLUMNS",
+    "adaptive_format",
     "current_code_sha",
     "current_version_start",
     "engine_versions",

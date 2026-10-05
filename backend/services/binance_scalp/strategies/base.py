@@ -24,10 +24,13 @@ class ScalpSetupSignal:
     passed: bool
     reject_reason: str | None
     setup_context: dict[str, Any] = field(default_factory=dict)
-    # The strategy's own directional projection (structural target distance).
-    # ``expected_move_pct`` blends in ATR as a magnitude floor; ATR is not a
-    # direction, so only this field may seed the executable edge. 0 = no claim.
+    # The strategy's own structural projection, clipped to [0, cap]. It is a
+    # feature of the calibrated expected move, never the expected move itself:
+    # ``expected_move_pct`` blends in ATR and floors for the reachability label,
+    # and neither ATR nor a target floor is a direction. ``claim_available`` is
+    # True once the strategy produced a projection, including a 0 one.
     directional_move_pct: float = 0.0
+    claim_available: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -48,6 +51,7 @@ class ScalpSetupSignal:
             "reject_reason": self.reject_reason,
             "setup_context": self.setup_context,
             "directional_move_pct": self.directional_move_pct,
+            "claim_available": self.claim_available,
         }
 
 

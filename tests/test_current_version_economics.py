@@ -53,21 +53,20 @@ def _cand(symbol, setup, adaptive):
     return {"symbol": symbol, "signal": sig, "ask_price": 100.0, "adaptive": adaptive}
 
 
-def _claim(db, base, residual, version=None):
+def _claim(db, raw, gross, version=None):
     return al.learn_claim_label(
         db,
         symbol=SCALP_KEY[0],
         setup=SCALP_KEY[1],
         regime=SCALP_KEY[2],
         strategy_version=version or al.current_strategy_version(SCALP),
-        base_edge=base,
-        residual=residual,
+        raw=raw,
+        gross=gross,
     )
 
 
-def _edge_for_base(view, base):
-    cost = canonical_roundtrip_cost_pct(spread_pct=SPREAD, buy_impact_pct=0.0, sell_impact_pct=0.0)
-    return scalp_executable_edge(view, raw_expected_move_pct=base + cost, spread_pct=SPREAD, impact_pct=0.0, edge_source="STRATEGY_CLAIM")
+def _edge_for_raw(view, raw):
+    return scalp_executable_edge(view, raw_expected_move_pct=raw, spread_pct=SPREAD, impact_pct=0.0, edge_source="STRATEGY_CLAIM")
 
 
 # --- DAY: continuous learned effects, no sample-count gate --------------------
@@ -261,47 +260,46 @@ def test_near_qualified_recording_is_wired_and_bounded():
 # --- SCALP: claim calibration, learning without fills ---------------------------
 
 
-def test_cold_claim_capture_changes_nothing(tmp_path):
+def test_cold_claim_calibration_credits_nothing(tmp_path):
     view = al.scalp_decision(str(tmp_path / "c.db"), *SCALP_KEY)
-    assert view["claim_capture"] == 1.0 and view["n_claim"] == 0.0
-    edge = _edge_for_base(view, 0.003)
-    assert edge.claim_capture == 1.0 and edge.claim_residual_pct == 0.0
+    assert view["claim_capture"] == 0.0 and view["n_claim"] == 0.0
+    edge = _edge_for_raw(view, 0.003)
+    assert edge.claim_capture == 0.0 and edge.expected_move_pct == 0.0
     assert edge.final_executable_edge_pct == pytest.approx(edge.base_executable_edge_pct + edge.adaptive_residual_pct + edge.micro_residual_pct)
+    assert edge.final_executable_edge_pct == pytest.approx(-edge.live_cost_pct)
 
 
 def test_uninformative_claims_lose_their_size_advantage(tmp_path):
     db = str(tmp_path / "t.db")
-    version = al.current_strategy_version(SCALP)
     for i in range(60):
-        base = 0.0005 + 0.0001 * (i % 10)
-        residual = -0.0005 - base
-        assert _claim(db, base, residual)
-        al.observe(db, engine=SCALP, symbol=SCALP_KEY[0], setup=SCALP_KEY[1], regime=SCALP_KEY[2], metric="edge_residual_strategy", value=residual, strategy_version=version)
+        assert _claim(db, 0.0005 + 0.0001 * (i % 10), 0.0002)
     view = al.scalp_decision(db, *SCALP_KEY)
     assert view["claim_capture"] < 0.2
     # Time decay weights the newest claims fractionally more than the plain mean.
-    assert view["claim_base_mean"] == pytest.approx(0.00095, rel=1e-4)
-    outsized = _edge_for_base(view, 0.0030)
-    assert outsized.base_executable_edge_pct + outsized.adaptive_residual_pct > 0.0
-    assert outsized.claim_residual_pct < 0.0
+    assert view["claim_raw_center"] == pytest.approx(0.00095, rel=1e-3)
+    outsized = _edge_for_raw(view, 0.0030)
+    small = _edge_for_raw(view, 0.0005)
+    assert outsized.expected_move_pct - small.expected_move_pct < 0.2 * (0.0030 - 0.0005)
     assert outsized.final_executable_edge_pct <= REJECT_THRESHOLD_PCT
-    small = _edge_for_base(view, 0.0005)
-    assert small.claim_residual_pct == 0.0
     assert small.final_executable_edge_pct <= REJECT_THRESHOLD_PCT
 
 
 def test_informative_claims_keep_capture_and_recover(tmp_path):
     db = str(tmp_path / "t.db")
     for i in range(60):
-        assert _claim(db, 0.0005 + 0.0001 * (i % 10), -0.0002)
-    assert al.scalp_decision(db, *SCALP_KEY)["claim_capture"] == pytest.approx(1.0)
+        raw = 0.0005 + 0.0001 * (i % 10)
+        assert _claim(db, raw, raw - 0.0002)
+    view = al.scalp_decision(db, *SCALP_KEY)
+    assert view["claim_capture"] > 0.5
+    assert _edge_for_raw(view, 0.0030).final_executable_edge_pct > REJECT_THRESHOLD_PCT
+    assert _edge_for_raw(view, 0.0001).final_executable_edge_pct <= REJECT_THRESHOLD_PCT
     noisy = str(tmp_path / "noisy.db")
     for i in range(30):
-        base = 0.0005 + 0.0001 * (i % 10)
-        _claim(noisy, base, -0.0005 - base)
+        _claim(noisy, 0.0005 + 0.0001 * (i % 10), 0.0002)
     low = al.scalp_decision(noisy, *SCALP_KEY)["claim_capture"]
     for i in range(300):
-        _claim(noisy, 0.0005 + 0.0001 * (i % 10), -0.0002)
+        raw = 0.0005 + 0.0001 * (i % 10)
+        _claim(noisy, raw, raw - 0.0002)
     assert al.scalp_decision(noisy, *SCALP_KEY)["claim_capture"] > low
 
 
@@ -331,8 +329,8 @@ def test_scalp_learns_from_unfilled_claims_with_decision_time_inputs_only(tmp_pa
     assert after == before
     base = 0.003 - 0.0007
     realized = 0.001 - 0.0007
-    assert state["claim_base_edge"] == pytest.approx(base)
-    assert state["claim_residual"] == pytest.approx(realized - base)
+    assert state["claim_raw"] == pytest.approx(0.003)
+    assert state["claim_gross"] == pytest.approx(realized + 0.0007)
     assert state["edge_residual_strategy"] == pytest.approx(realized - base)
     assert al.scalp_decision(db, *SCALP_KEY)["n_claim"] == pytest.approx(1.0)
 
@@ -383,6 +381,7 @@ def test_legacy_versions_never_reach_current_state_or_reports(tmp_path):
     )
     assert not _day_obs(db, "trade_net", -0.05, version="legacy")
     assert not _claim(db, 0.001, -0.003, version="legacy")
+    assert al.scalp_decision(db, *SCALP_KEY)["n_claim"] == 0.0
     assert _day(db)["expected_net"] == 0.0
     _record_day(db, "BTCUSDT", "BREAKOUT_CONTINUATION", al.CANDIDATE_QUALIFIED)
     with sqlite3.connect(db) as conn:

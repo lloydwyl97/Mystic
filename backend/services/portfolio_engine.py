@@ -7189,11 +7189,13 @@ class PortfolioEngine:
                 # candidate. resolve_setup() can name a closed lot differently
                 # (e.g. opportunity setup_family vs the ranking best_setup), which
                 # would otherwise strand the update under an unread key. Fall back
-                # to provenance/entry-regime when no decision was stamped.
+                # to provenance for the setup when no decision was stamped. The
+                # regime stays blank when unknown: route regimes are a different
+                # vocabulary and must not enter regime-specific state.
                 _adapt_dec = getattr(position, "adaptive_decision", None)
                 _adapt_dec = _adapt_dec if isinstance(_adapt_dec, dict) else {}
                 _learn_setup = str(_adapt_dec.get("setup") or _prov.get("setup") or "")
-                _learn_regime = str(_adapt_dec.get("regime") or getattr(position, "day_route_regime_at_entry", "") or "")
+                _learn_regime = str(_adapt_dec.get("regime") or "")
                 _continuation = None
                 if str(_prov.get("engine_id") or "").upper() == "DAY_V2":
                     from backend.services.adaptive_learning import continuation_ratio

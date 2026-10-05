@@ -1727,7 +1727,7 @@ class PortfolioEngineIntegration:
                                     engine="DAY_V2",
                                     symbol=symbol,
                                     setup=closest,
-                                    regime=market_regime_tag(db_path, symbol) or str(explained.get("regime") or ""),
+                                    regime=market_regime_tag(db_path, symbol) or "",
                                     ref_price=ask_price,
                                     roundtrip_cost=canonical_roundtrip_cost_pct(),
                                     signaled=False,
@@ -1791,8 +1791,8 @@ class PortfolioEngineIntegration:
 
                     # One regime key for the whole candidate lifecycle: the markout
                     # record, the entry decision, and the close all use this tag so
-                    # they land on the same adaptive row. Falls back to the signal's
-                    # own regime string when market data is thin.
+                    # they land on the same adaptive row. Blank when market data is
+                    # thin: an unknown regime learns only at coin+setup and setup level.
                     cand = {
                         "symbol": symbol,
                         "norm": norm,
@@ -1802,7 +1802,7 @@ class PortfolioEngineIntegration:
                         "ask_price": ask_price,
                         "db_symbol": db_sym_15m,
                         "as_of": as_of,
-                        "regime_tag": market_regime_tag(db_path, symbol) or str(signal.regime or ""),
+                        "regime_tag": market_regime_tag(db_path, symbol) or "",
                     }
 
                     # 3. Frequency guard — rolling 24h caps (DAY V2 only). A capped
@@ -1842,8 +1842,7 @@ class PortfolioEngineIntegration:
             resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts), path_low=lambda sym, a, b: ohlcv_low_between(db_path, sym, a, b))
             for cand in candidates:
                 sig = cand["signal"]
-                regime_tag = str(cand.get("regime_tag") or sig.regime or "")
-                cand["adaptive"] = day_decision(db_path, cand["symbol"], sig.setup, regime_tag)
+                cand["adaptive"] = day_decision(db_path, cand["symbol"], sig.setup, str(cand.get("regime_tag") or ""))
             ranked = rank_day_candidates(candidates, list(DAY_V2_UNIVERSE), canonical_roundtrip_cost_pct())
             logger.info(
                 "DAY_V2_RANKED %s",
@@ -1885,6 +1884,7 @@ class PortfolioEngineIntegration:
                 "rank_position": rank.get("position"),
                 "rank_of": rank.get("of"),
                 "executable_objective_edge": rank.get("executable_objective_edge"),
+                "rank_effect": {"score": rank.get("score"), "position": rank.get("position"), "of": rank.get("of"), "tie_break_objective_edge": rank.get("executable_objective_edge")},
                 "size_mult": adaptive.get("size_mult"),
             }
         )
@@ -1893,7 +1893,7 @@ class PortfolioEngineIntegration:
             engine="DAY_V2",
             symbol=cand["symbol"],
             setup=signal.setup,
-            regime=str(cand.get("regime_tag") or signal.regime or ""),
+            regime=str(cand.get("regime_tag") or ""),
             ref_price=float(cand["ask_price"]),
             roundtrip_cost=canonical_roundtrip_cost_pct(),
             signaled=True,
@@ -2277,7 +2277,7 @@ class PortfolioEngineIntegration:
 
         def _record_scalp_observation(row: dict, norm_key: str, *, signaled: bool) -> dict:
             setup_name = str(row.get("best_setup") or "SCALP_STRUCTURAL")
-            regime = str(row.get("adaptive_regime") or "") or market_regime_tag(self.engine.db_path, norm_key) or str(row.get("regime") or row.get("market_regime") or "")
+            regime = str(row.get("adaptive_regime") or "") or market_regime_tag(self.engine.db_path, norm_key) or ""
             micro_feats = _scalp_book(norm_key)
             snap = row.get("snap")
             ref_price = float(getattr(snap, "best_ask", 0) or getattr(snap, "mid_price", 0) or 0) if snap is not None else 0.0

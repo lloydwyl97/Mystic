@@ -92,23 +92,23 @@ def test_scalp_overprediction_is_learned_downward_from_rejected_claims(tmp_path)
     db = str(tmp_path / "s.db")
     raw = 0.0012
     cold = _edge(al.scalp_decision(db, *SKEY, now=T0), raw)
-    assert cold.final_executable_edge_pct > REJECT_THRESHOLD_PCT
-    end = _scalp_claims(db, 30, start=T0, raw=raw, exit_price=100.0)
+    assert cold.expected_move_pct == 0.0
+    assert cold.final_executable_edge_pct == pytest.approx(-COST)
+    end = _scalp_claims(db, 30, start=T0, raw=raw, exit_price=99.9, step=1300.0)
     view = al.scalp_decision(db, *SKEY, now=end)
     warm = _edge(view, raw)
-    realized = -COST
-    assert view["n_residual_strategy"] > 0 and view["n_claim"] > 0
-    assert view["adaptive_residual_strategy"] < 0
-    assert abs(warm.final_executable_edge_pct - realized) < 0.25 * abs(cold.final_executable_edge_pct - realized)
+    realized = -0.001 - COST
+    assert view["n_claim"] > 0 and view["claim_gross_setup"] < 0
+    assert abs(warm.final_executable_edge_pct - realized) < 0.5 * abs(cold.final_executable_edge_pct - realized)
     assert warm.final_executable_edge_pct <= REJECT_THRESHOLD_PCT
 
 
 def test_one_scalp_claim_already_moves_the_edge(tmp_path):
     db = str(tmp_path / "s.db")
-    end = _scalp_claims(db, 1, start=T0, raw=0.0012, exit_price=100.0)
+    end = _scalp_claims(db, 1, start=T0, raw=0.0012, exit_price=100.4)
     view = al.scalp_decision(db, *SKEY, now=end)
-    assert view["n_residual_strategy"] == pytest.approx(1.0, rel=1e-2)
-    assert -0.0012 < view["adaptive_residual_strategy"] < 0.0
+    assert view["n_claim"] == pytest.approx(1.0, rel=1e-2)
+    assert 0.0 < view["claim_gross_setup"] < 0.004
 
 
 def test_negative_final_edge_cannot_arm_a_live_order(tmp_path):
@@ -135,12 +135,13 @@ def test_scalp_cost_units_are_counted_once(tmp_path):
     end = _scalp_claims(db, 1, start=T0, raw=raw, exit_price=100.1)
     with sqlite3.connect(db) as conn:
         state = dict(conn.execute("SELECT metric, ewma FROM adaptive_metric_state WHERE engine_id='SCALP_V2' AND setup=?", (SKEY[1],)).fetchall())
-    # realized net (0.10% gross - cost) minus the claimed base edge (raw - cost): the cost cancels.
-    assert state["claim_residual"] == pytest.approx(0.001 - raw)
-    assert state["claim_base_edge"] == pytest.approx(raw - COST)
+    # The label is the gross move: realized net (0.10% gross - cost) plus the decision cost, once.
+    assert state["claim_gross"] == pytest.approx(0.001)
+    assert state["claim_raw"] == pytest.approx(raw)
+    assert state["claim_raw_x_gross"] == pytest.approx(raw * 0.001)
     edge = _edge(al.scalp_decision(db, *SKEY, now=end), raw)
     econ = edge.economic()
-    assert edge.base_executable_edge_pct == pytest.approx(raw - COST)
+    assert edge.base_executable_edge_pct == pytest.approx(edge.calibrated_move_pct - COST)
     assert econ["expected_cost"] == pytest.approx(COST)
     assert econ["expected_gross"] - econ["expected_cost"] == pytest.approx(econ["expected_net_edge"])
     assert econ["economic_version"] == al.current_economic_version(SCALP)
@@ -160,10 +161,10 @@ def test_micro_weight_is_bounded_and_falls_when_micro_misleads(tmp_path):
 
 
 def test_micro_cannot_lift_a_non_positive_edge_and_its_tilt_is_capped(tmp_path):
-    lifted = _edge({"adaptive_residual_strategy": -0.002, "micro_residual": 0.0015, "claim_capture": 1.0}, 0.0012)
+    lifted = _edge({"claim_gross_setup": -0.0008, "claim_gross_mean": -0.0008, "micro_residual": 0.0015}, 0.0012)
     assert lifted.micro_residual_pct == 0.0
     assert lifted.final_executable_edge_pct <= REJECT_THRESHOLD_PCT
-    damped = _edge({"adaptive_residual_strategy": 0.0, "micro_residual": -0.0003, "claim_capture": 1.0}, 0.0030)
+    damped = _edge({"claim_gross_setup": 0.003, "claim_gross_mean": 0.003, "micro_residual": -0.0003}, 0.0030)
     assert damped.micro_residual_pct == pytest.approx(-0.0003)
     db = str(tmp_path / "c.db")
     for i in range(200):

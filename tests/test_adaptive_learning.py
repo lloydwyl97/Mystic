@@ -15,6 +15,7 @@ from backend.services.adaptive_learning import (
     calibration_report,
     continuation_ratio,
     day_decision,
+    learn_claim_label,
     learn_from_close,
     market_regime_tag,
     micro_edge_tilt,
@@ -133,10 +134,11 @@ def test_g_h_ratchet_never_loosens_and_hard_stops_stay():
 
 def test_j_p_scalp_markout_and_next_candidate(tmp_path):
     db = str(tmp_path / "t.db")
-    before = scalp_decision(db, "ETHUSDT", "VWAP_EMA_RECLAIM", "")
-    record_candidate(db, engine=SCALP, symbol="ETHUSDT", setup="VWAP_EMA_RECLAIM", regime="", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=1_000.0, raw_expected_move=0.003)
+    before = scalp_decision(db, "ETHUSDT", "VWAP_EMA_RECLAIM", "btcup_vollo")
+    reg = "btcup_vollo"
+    record_candidate(db, engine=SCALP, symbol="ETHUSDT", setup="VWAP_EMA_RECLAIM", regime=reg, ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=1_000.0, raw_expected_move=0.003)
     assert resolve_markouts(db, lambda _s, _t: 100.4, now=1_000.0 + 2000) == 1
-    after = scalp_decision(db, "ETHUSDT", "VWAP_EMA_RECLAIM", "")
+    after = scalp_decision(db, "ETHUSDT", "VWAP_EMA_RECLAIM", "btcup_vollo")
     assert after["n_forward"] >= 1
     assert after["n_residual"] >= 1
     assert after["adaptive_residual"] != before["adaptive_residual"]
@@ -148,14 +150,15 @@ def test_j_p_scalp_markout_and_next_candidate(tmp_path):
 
 def test_k_l_m_n_o_scalp_loss_win_hold_size_and_rank(tmp_path):
     db = str(tmp_path / "t.db")
-    observe(db, engine=SCALP, symbol="XRPUSDT", setup="RANGE_BOUNCE_SCALP", regime="", metric="markout_mae", value=0.004, strategy_version=SCALP_STRATEGY_VERSION)
-    observe(db, engine=SCALP, symbol="BTCUSDT", setup="VWAP_EMA_RECLAIM", regime="", metric="trade_mfe", value=0.005, strategy_version=SCALP_STRATEGY_VERSION)
-    observe(db, engine=SCALP, symbol="SOLUSDT", setup="RANGE_BOUNCE_SCALP", regime="", metric="trade_time_to_mfe_min", value=5.0, strategy_version=SCALP_STRATEGY_VERSION)
-    observe(db, engine=SCALP, symbol="ETHUSDT", setup="VWAP_EMA_RECLAIM", regime="", metric="edge_residual_strategy", value=0.004, strategy_version=SCALP_STRATEGY_VERSION)
-    xrp = scalp_decision(db, "XRPUSDT", "RANGE_BOUNCE_SCALP", "")
-    btc = scalp_decision(db, "BTCUSDT", "VWAP_EMA_RECLAIM", "")
-    sol = scalp_decision(db, "SOLUSDT", "RANGE_BOUNCE_SCALP", "")
-    eth = scalp_decision(db, "ETHUSDT", "VWAP_EMA_RECLAIM", "")
+    reg = "btcup_vollo"
+    observe(db, engine=SCALP, symbol="XRPUSDT", setup="RANGE_BOUNCE_SCALP", regime=reg, metric="markout_mae", value=0.004, strategy_version=SCALP_STRATEGY_VERSION)
+    observe(db, engine=SCALP, symbol="BTCUSDT", setup="VWAP_EMA_RECLAIM", regime=reg, metric="trade_mfe", value=0.005, strategy_version=SCALP_STRATEGY_VERSION)
+    observe(db, engine=SCALP, symbol="SOLUSDT", setup="RANGE_BOUNCE_SCALP", regime=reg, metric="trade_time_to_mfe_min", value=5.0, strategy_version=SCALP_STRATEGY_VERSION)
+    learn_claim_label(db, symbol="ETHUSDT", setup="VWAP_EMA_RECLAIM", regime=reg, strategy_version=SCALP_STRATEGY_VERSION, raw=0.002, gross=0.004)
+    xrp = scalp_decision(db, "XRPUSDT", "RANGE_BOUNCE_SCALP", reg)
+    btc = scalp_decision(db, "BTCUSDT", "VWAP_EMA_RECLAIM", reg)
+    sol = scalp_decision(db, "SOLUSDT", "RANGE_BOUNCE_SCALP", reg)
+    eth = scalp_decision(db, "ETHUSDT", "VWAP_EMA_RECLAIM", reg)
     assert xrp["risk_estimate"] > xrp["mae"] * 0 + 0.0015
     assert btc["target_pct"] > 0.0025
     assert btc["target_pct"] <= 0.006
@@ -264,7 +267,7 @@ def test_close_learns_under_entry_stamped_key_reaches_next_candidate(tmp_path):
     which reads best_setup, actually sees the update.
     """
     db = str(tmp_path / "t.db")
-    entry_setup, entry_regime = "SCALP_STRUCTURAL", ""
+    entry_setup, entry_regime = "SCALP_STRUCTURAL", "btcup_vollo"
     before = scalp_decision(db, "ETHUSDT", entry_setup, entry_regime)
 
     # Provenance names the closed lot with a different setup string.
@@ -331,16 +334,17 @@ def test_observation_weight_decays_with_age(tmp_path):
     from backend.services import adaptive_learning as al
 
     db = str(tmp_path / "t.db")
-    assert observe(db, engine=DAY, symbol="BTCUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_mfe", value=0.03, strategy_version=DAY_STRATEGY_VERSION)
+    reg = "btcup_vollo"
+    assert observe(db, engine=DAY, symbol="BTCUSDT", setup="RANGE_BOUNCE", regime=reg, metric="trade_mfe", value=0.03, strategy_version=DAY_STRATEGY_VERSION)
 
     # Backdate the stored row far beyond several half-lives.
     with al._connect(db) as conn:
         conn.execute("UPDATE adaptive_metric_state SET updated_at=? WHERE metric='trade_mfe'", ("2000-01-01T00:00:00Z",))
         conn.commit()
 
-    before = day_decision(db, "BTCUSDT", "RANGE_BOUNCE", "")
-    assert observe(db, engine=DAY, symbol="BTCUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_mfe", value=0.03, strategy_version=DAY_STRATEGY_VERSION)
-    after = day_decision(db, "BTCUSDT", "RANGE_BOUNCE", "")
+    before = day_decision(db, "BTCUSDT", "RANGE_BOUNCE", reg)
+    assert observe(db, engine=DAY, symbol="BTCUSDT", setup="RANGE_BOUNCE", regime=reg, metric="trade_mfe", value=0.03, strategy_version=DAY_STRATEGY_VERSION)
+    after = day_decision(db, "BTCUSDT", "RANGE_BOUNCE", reg)
     # Old n was decayed to ~0 before the new point, so n stays ~1, not 2.
     assert after["n_mfe"] < 1.2
     assert before["n_mfe"] == 1.0
@@ -348,12 +352,12 @@ def test_observation_weight_decays_with_age(tmp_path):
     # Fresh key with no age: no decay, second observation accumulates to ~2.
     db2 = str(tmp_path / "u.db")
     now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
-    observe(db2, engine=DAY, symbol="ETHUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_mfe", value=0.03, strategy_version=DAY_STRATEGY_VERSION)
+    observe(db2, engine=DAY, symbol="ETHUSDT", setup="RANGE_BOUNCE", regime=reg, metric="trade_mfe", value=0.03, strategy_version=DAY_STRATEGY_VERSION)
     with al._connect(db2) as conn:
         conn.execute("UPDATE adaptive_metric_state SET updated_at=?", (now,))
         conn.commit()
-    observe(db2, engine=DAY, symbol="ETHUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_mfe", value=0.03, strategy_version=DAY_STRATEGY_VERSION)
-    assert day_decision(db2, "ETHUSDT", "RANGE_BOUNCE", "")["n_mfe"] > 1.8
+    observe(db2, engine=DAY, symbol="ETHUSDT", setup="RANGE_BOUNCE", regime=reg, metric="trade_mfe", value=0.03, strategy_version=DAY_STRATEGY_VERSION)
+    assert day_decision(db2, "ETHUSDT", "RANGE_BOUNCE", reg)["n_mfe"] > 1.8
 
 
 # --- regime tag --------------------------------------------------------------
@@ -426,7 +430,7 @@ def test_adaptive_state_report_lists_current_keys(tmp_path):
     day_rows = rep["engines"]["DAY_V2"]
     scalp_rows = rep["engines"]["SCALP_V2"]
     assert any(r["symbol"] == "XRPUSDT" and r["regime"] == "btcup_vollo" for r in day_rows)
-    assert any(r["symbol"] == "ETHUSDT" and "adaptive_residual" in r for r in scalp_rows)
+    assert any(r["symbol"] == "ETHUSDT" and {"claim_gross_mean", "claim_capture"} <= set(r) for r in scalp_rows)
     # DAY learning must never leak into the SCALP listing and vice versa.
     assert all("expected_move" in r for r in day_rows)
     assert all("hold_min" in r for r in scalp_rows)
@@ -530,6 +534,7 @@ def test_micro_model_flows_through_resolve_and_scalp_decision(tmp_path):
         features=_bull_book(),
         raw_expected_move=0.003,
         raw_move_source="STRATEGY_CLAIM",
+        economic={"pre_micro_edge": -0.0006, "micro_unweighted": 0.0},
     )
     assert resolve_markouts(db, lambda _s, _t: 100.6, now=1_000.0 + 2000) == 1
     rep = adaptive_state_report(db)
@@ -687,6 +692,7 @@ def test_scalp_micro_trains_on_the_causal_horizon_once(tmp_path):
         features=_bull_book(),
         raw_expected_move=0.003,
         raw_move_source="STRATEGY_CLAIM",
+        economic={"pre_micro_edge": -0.0006, "micro_unweighted": 0.0},
     )
     conn = sqlite3.connect(db)
     horizon = float(conn.execute("SELECT label_horizon FROM adaptive_candidate_markouts").fetchone()[0])

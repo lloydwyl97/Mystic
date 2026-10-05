@@ -37,8 +37,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from backend.services.scalp_v2.raw_move_source import is_directional, normalize_raw_move_source
-from backend.services.strategy_version import ADAPTIVE_STATE_VERSION, economic_anchor, economic_version, engine_versions
+from backend.services.scalp_v2.raw_move_source import STRATEGY_CLAIM, is_directional, normalize_raw_move_source
+from backend.services.strategy_version import ADAPTIVE_STATE_VERSION, adaptive_format, economic_anchor, economic_version, engine_versions
 
 PRIOR_STRENGTH = 8.0
 EWMA_ALPHA = 0.25
@@ -88,17 +88,19 @@ _PRIORS: dict[str, dict[str, float]] = {
         # Gross adverse price excursion of the candidate path over its committed
         # horizon (SCALP). This is the live risk estimate.
         "markout_mae": 0.0015,
-        # Realized net markout minus the decision-time base executable edge
-        # (raw expected move - cost), kept per raw-move source because an ATR
-        # estimate and a strategy structural claim carry different biases.
-        # Neutral cold prior: no evidence, no adjustment.
+        # Realized net markout minus (raw projection - cost): the bias of the raw
+        # strategy projection, per raw-move source. Diagnostic only; the edge
+        # reads the claim calibration below.
         "edge_residual": 0.0,
         "edge_residual_strategy": 0.0,
-        # Decayed moments of (claim base edge, residual) for the claim capture slope.
-        "claim_base_edge": 0.0,
-        "claim_base_edge_sq": 0.0,
-        "claim_residual": 0.0,
-        "claim_base_edge_x_residual": 0.0,
+        # Decayed moments of (strategy projection, realized gross move) for the
+        # claim calibration. Gross = net markout + the decision-time cost. Zero
+        # priors: no move is expected and the projection carries no weight
+        # until resolved claims show it predicts the move.
+        "claim_raw": 0.0,
+        "claim_raw_sq": 0.0,
+        "claim_gross": 0.0,
+        "claim_raw_x_gross": 0.0,
         # Decayed moments of (decision-time micro tilt, what the edge before micro
         # missed) for the learned micro weight.
         "micro_tilt_sq": 0.0,
@@ -106,7 +108,7 @@ _PRIORS: dict[str, dict[str, float]] = {
     },
 }
 
-CLAIM_MOMENT_METRICS = ("claim_base_edge", "claim_base_edge_sq", "claim_residual", "claim_base_edge_x_residual")
+CLAIM_MOMENT_METRICS = ("claim_raw", "claim_raw_sq", "claim_gross", "claim_raw_x_gross")
 MICRO_WEIGHT_METRICS = ("micro_tilt_sq", "micro_tilt_x_miss")
 MICRO_WEIGHT_KEY = ("", "MICRO_MODEL", "")
 
@@ -119,14 +121,15 @@ CANDIDATE_QUALIFIED_BLOCKED = "QUALIFIED_BLOCKED"
 CANDIDATE_NEAR_QUALIFIED = "NEAR_QUALIFIED"
 LEARNABLE_DAY_STATES = frozenset({"", CANDIDATE_QUALIFIED, CANDIDATE_QUALIFIED_BLOCKED})
 
-# Bound on the learned residual added to a SCALP candidate's base executable
-# edge. Equal to the raw expected-move cap, so evidence can cancel a full claim.
+# Bound on the SCALP key's learned gross move against its setup's (the adaptive
+# residual). Equal to the claim cap.
 SCALP_RESIDUAL_MAX = 0.006
 
 
 def residual_metric(raw_move_source: str | None) -> str:
-    """Residual key per raw-move source. Only the strategy-claim residual is live;
-    ``edge_residual`` (ATR-estimate rows) is forensic and never read by eligibility."""
+    """Residual key per raw-move source. Both are forensic (realized net minus the
+    claim taken at face value); eligibility reads the claim calibration instead.
+    ``edge_residual`` (ATR-estimate rows) never touches a strategy claim."""
     return "edge_residual_strategy" if is_directional(raw_move_source) else "edge_residual"
 
 
@@ -361,6 +364,7 @@ def _connect(db_path: str) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_key ON adaptive_candidate_markouts(engine_id, symbol, setup, regime, learned)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_unresolved ON adaptive_candidate_markouts(resolved, id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_opportunity ON adaptive_candidate_markouts(engine_id, opportunity_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_symbol_time ON adaptive_candidate_markouts(engine_id, symbol, evaluated_at)")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS adaptive_linear_model (
@@ -386,13 +390,16 @@ def observe(
     value: float,
     strategy_version: str,
     now: float | None = None,
+    weight: float = 1.0,
 ) -> bool:
     """Fold one current-version observation into the key under the current economic version.
 
-    Returns False for another strategy version, an unknown metric or a value
-    that is not finite. ``now`` is the observation time (defaults to wall clock);
-    a chronological rebuild passes each label's own time so decay matches live
-    learning. The decayed second moment ``m2`` feeds the reported uncertainty.
+    Returns False for another strategy version, an unknown metric, a value that
+    is not finite or a non-positive weight. ``now`` is the observation time
+    (defaults to wall clock); a chronological rebuild passes each label's own
+    time so decay matches live learning. ``weight`` is the observation's share
+    of one independent sample (mean-form metrics). The decayed second moment
+    ``m2`` feeds the reported uncertainty.
     """
     engine_id = str(engine or "").upper()
     if engine_id not in _PRIORS or metric not in _PRIORS[engine_id]:
@@ -400,6 +407,9 @@ def observe(
     if str(strategy_version or "") != current_strategy_version(engine_id):
         return False
     if value is None or not math.isfinite(float(value)):
+        return False
+    w = float(weight) if metric in MEAN_FORM_METRICS else 1.0
+    if not (math.isfinite(w) and w > 0):
         return False
     value = float(value)
     key = (engine_id, current_economic_version(engine_id), _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower(), metric)
@@ -410,16 +420,16 @@ def observe(
             key,
         ).fetchone()
         if row is None or float(row["n"]) <= 0:
-            n, mean, m2 = 1.0, value, 0.0
+            n, mean, m2 = w, value, 0.0
         else:
             # Age out the prior sample count so stale evidence stops dominating,
-            # then fold in the new observation. The new point always counts for 1.
+            # then fold in the new observation at its weight.
             decay = _decay_factor(str(row["updated_at"] or ""), moment, engine_id)
-            n = float(row["n"]) * decay + 1.0
-            alpha = 1.0 / n if metric in MEAN_FORM_METRICS else EWMA_ALPHA
+            n = float(row["n"]) * decay + w
+            alpha = w / n if metric in MEAN_FORM_METRICS else EWMA_ALPHA
             delta = value - float(row["ewma"])
             mean = float(row["ewma"]) + alpha * delta
-            m2 = max(0.0, float(row["m2"] or 0.0)) * decay + delta * (value - mean)
+            m2 = max(0.0, float(row["m2"] or 0.0)) * decay + w * delta * (value - mean)
         conn.execute(
             """
             INSERT INTO adaptive_metric_state (engine_id, economic_version, symbol, setup, regime, metric, n, ewma, m2, updated_at)
@@ -445,10 +455,12 @@ _LEVEL_RELEVANCE = {"engine": 0.0, "setup": 0.25, "related": 0.5, "key": 1.0}
 
 
 def _level_of(row: sqlite3.Row, sym: str, stp: str, reg: str) -> str:
+    """Innermost level of ``row`` for the key. A blank regime is unknown, not a
+    regime: it never matches, so blank rows count at coin + setup and setup only."""
     if str(row["setup"] or "").upper() != stp:
         return "engine"
     same_sym = _norm_symbol(row["symbol"]) == sym
-    same_reg = str(row["regime"] or "").lower() == reg
+    same_reg = bool(reg) and str(row["regime"] or "").lower() == reg
     if same_sym and same_reg:
         return "key"
     return "related" if (same_sym or same_reg) else "setup"
@@ -621,13 +633,19 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, now: flo
     cost = canonical_roundtrip_cost_pct()
     size_mult = day_size_mult(net["mean"], max(0.0, mae["mean"]) + cost)
     abstain_flag, abstain_reason = _abstain(net["mean"])
+    # DAY makes no directional claim: the objective distance is a target that
+    # only breaks ranking ties, so the whole expected gross is learned evidence.
     economic = {
         "engine_id": DAY_ENGINE,
         "economic_version": current_economic_version(DAY_ENGINE),
+        "raw_expected_move": 0.0,
+        "calibration_adjustment": net["mean"] + cost,
         "expected_gross": net["mean"] + cost,
         "expected_cost": cost,
         "adaptive_correction": net["mean"] - net["prior"],
         "uncertainty": net["sd"],
+        "setup_expected_edge": net["levels"]["setup"],
+        "correlation_adjustment": {"applied": False, "edge": 0.0, "size_mult": 1.0},
         "expected_net_edge": net["mean"],
         "size_effect": size_mult - 1.0,
         "levels": {lvl: round(v, 6) for lvl, v in net["levels"].items()},
@@ -636,7 +654,7 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, now: flo
         "n_lifecycle": round(net["n_lifecycle"], 3),
     }
     return {
-        "adaptive_state_version": ADAPTIVE_STATE_VERSION,
+        "adaptive_state_version": adaptive_format(DAY_ENGINE),
         "economic_version": current_economic_version(DAY_ENGINE),
         "engine_id": DAY_ENGINE,
         "symbol": str(symbol or "").upper(),
@@ -718,9 +736,12 @@ def _standardize(st: dict[str, Any], feats: dict[str, float]) -> dict[str, float
     return z
 
 
-def update_linear_model(db_path: str, engine: str, model: str, features: dict | None, target: float, *, now: float | None = None) -> None:
-    """One online (normalised-LMS) step. Standardisation stats adapt via EWMA;
-    weights are clamped. Trained on the same cost-adjusted markout target."""
+def update_linear_model(db_path: str, engine: str, model: str, features: dict | None, target: float, *, now: float | None = None, weight: float = 1.0) -> None:
+    """One online (normalised-LMS) step, scaled by the sample's ``weight`` in [0, 1].
+    Standardisation stats adapt via EWMA; weights are clamped."""
+    step = _clamp(float(weight), 0.0, 1.0) if math.isfinite(float(weight)) else 0.0
+    if step <= 0:
+        return
     raw = features if isinstance(features, dict) else {}
     try:
         age = float(raw.get("data_age_sec") or 0.0)
@@ -736,7 +757,8 @@ def update_linear_model(db_path: str, engine: str, model: str, features: dict | 
     engine_id = str(engine or "").upper()
     with _connect(db_path) as conn:
         st = _load_linear(conn, engine_id, model)
-        a = MICRO_MODEL_STD_ALPHA
+        a = MICRO_MODEL_STD_ALPHA * step
+        lr = MICRO_MODEL_LR * step
         for f, x in feats.items():
             mu = float(st["mu"].get(f, x))
             new_mu = (1.0 - a) * mu + a * x
@@ -747,11 +769,11 @@ def update_linear_model(db_path: str, engine: str, model: str, features: dict | 
         z = _standardize(st, feats)
         pred = float(st["bias"]) + sum(float(st["w"].get(f, 0.0)) * z[f] for f in feats)
         err = float(target) - pred
-        st["bias"] = float(st["bias"]) + MICRO_MODEL_LR * err
+        st["bias"] = float(st["bias"]) + lr * err
         for f in feats:
-            w = float(st["w"].get(f, 0.0)) + MICRO_MODEL_LR * err * z[f]
+            w = float(st["w"].get(f, 0.0)) + lr * err * z[f]
             st["w"][f] = _clamp(w, -MICRO_MODEL_W_MAX, MICRO_MODEL_W_MAX)
-        st["n"] = int(st.get("n", 0)) + 1
+        st["n"] = float(st.get("n", 0)) + step
         conn.execute(
             """
             INSERT INTO adaptive_linear_model (engine_id, model, payload, updated_at)
@@ -763,9 +785,10 @@ def update_linear_model(db_path: str, engine: str, model: str, features: dict | 
         conn.commit()
 
 
-def micro_edge_tilt(db_path: str, engine: str, features: dict | None) -> tuple[float, int]:
+def micro_edge_tilt(db_path: str, engine: str, features: dict | None) -> tuple[float, float]:
     """Bounded, zero-centred microstructure edge tilt (excludes the bias/mean).
-    Returns (tilt, n). Empty features or a cold model return (0.0, 0)."""
+    Returns (tilt, n), n the weighted sample count. Empty features or a cold
+    model return (0.0, 0)."""
     feats = _micro_features(features)
     if not any(v != 0.0 for v in feats.values()):
         return 0.0, 0
@@ -775,7 +798,7 @@ def micro_edge_tilt(db_path: str, engine: str, features: dict | None) -> tuple[f
             st = _load_linear(conn, engine_id, "micro_edge")
     except sqlite3.Error:
         return 0.0, 0
-    n = int(st.get("n", 0))
+    n = float(st.get("n", 0) or 0)
     if n <= 0:
         return 0.0, 0
     z = _standardize(st, feats)
@@ -783,7 +806,7 @@ def micro_edge_tilt(db_path: str, engine: str, features: dict | None) -> tuple[f
     return _clamp(tilt, -MICRO_MODEL_TILT_MAX, MICRO_MODEL_TILT_MAX), n
 
 
-def learn_micro_weight(db_path: str, *, strategy_version: str, tilt: float, miss: float, now: float | None = None) -> bool:
+def learn_micro_weight(db_path: str, *, strategy_version: str, tilt: float, miss: float, now: float | None = None, weight: float = 1.0) -> bool:
     """Fold one resolved claim into the micro-weight moments.
 
     ``tilt`` is the decision-time micro term before the weight; ``miss`` is the
@@ -796,7 +819,7 @@ def learn_micro_weight(db_path: str, *, strategy_version: str, tilt: float, miss
     sym, stp, reg = MICRO_WEIGHT_KEY
     wrote = False
     for metric, value in zip(MICRO_WEIGHT_METRICS, (t * t, t * e), strict=True):
-        wrote = observe(db_path, engine=SCALP_ENGINE, symbol=sym, setup=stp, regime=reg, metric=metric, value=value, strategy_version=strategy_version, now=now) or wrote
+        wrote = observe(db_path, engine=SCALP_ENGINE, symbol=sym, setup=stp, regime=reg, metric=metric, value=value, strategy_version=strategy_version, now=now, weight=weight) or wrote
     return wrote
 
 
@@ -826,38 +849,58 @@ def learn_claim_label(
     setup: str,
     regime: str,
     strategy_version: str,
-    base_edge: float,
-    residual: float,
+    raw: float,
+    gross: float,
     now: float | None = None,
+    weight: float = 1.0,
 ) -> bool:
-    """Fold one resolved strategy claim into the key's (base edge, residual) moments.
+    """Fold one resolved strategy claim into the key's (projection, gross) moments.
 
-    ``base_edge`` is the decision-time raw claim minus cost; ``residual`` is the
-    realized label minus that base edge.
+    ``raw`` is the decision-time structural projection (>= 0, 0 included);
+    ``gross`` is the realized gross move, net markout plus the decision-time cost;
+    ``weight`` is the claim's label uniqueness (``claim_uniqueness``).
     """
-    b = float(base_edge)
-    r = float(residual)
+    b = float(raw)
+    g = float(gross)
     wrote = False
-    for metric, value in zip(CLAIM_MOMENT_METRICS, (b, b * b, r, b * r), strict=True):
-        wrote = observe(db_path, engine=SCALP_ENGINE, symbol=symbol, setup=setup, regime=regime, metric=metric, value=value, strategy_version=strategy_version, now=now) or wrote
+    for metric, value in zip(CLAIM_MOMENT_METRICS, (b, b * b, g, b * g), strict=True):
+        wrote = observe(db_path, engine=SCALP_ENGINE, symbol=symbol, setup=setup, regime=regime, metric=metric, value=value, strategy_version=strategy_version, now=now, weight=weight) or wrote
     return wrote
 
 
-def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, *, now: float | None = None) -> dict[str, Any]:
-    """How much of a strategy claim's base edge shows up in realized net.
+def claim_uniqueness(conn: sqlite3.Connection, row: sqlite3.Row, horizon_sec: float) -> float:
+    """Share of a SCALP claim's label window not covered by the previous claim on
+    the same symbol, min(1, gap / horizon). Claims whose windows overlap share one
+    forward price path, so a burst of claims counts about once per horizon."""
+    if horizon_sec <= 0:
+        return 1.0
+    prev = conn.execute(
+        "SELECT MAX(evaluated_at) FROM adaptive_candidate_markouts WHERE engine_id=? AND symbol=? AND raw_move_source=? AND economic_version=? AND (evaluated_at<? OR (evaluated_at=? AND id<?))",
+        (SCALP_ENGINE, row["symbol"], STRATEGY_CLAIM, row["economic_version"], row["evaluated_at"], row["evaluated_at"], row["id"]),
+    ).fetchone()
+    if prev is None or prev[0] is None:
+        return 1.0
+    return _clamp((float(row["evaluated_at"]) - float(prev[0])) / float(horizon_sec), 0.0, 1.0)
 
-    The mean residual alone assumes realized net moves 1:1 with the claimed base
-    edge. ``claim_capture`` = 1 + the within-key slope of residual on base edge,
-    estimated down the same within-setup hierarchy as every other estimate
-    (setup -> related -> key). At each level the slope is a ridge estimate toward
-    its parent slope with ``PRIOR_STRENGTH`` claims of variance ``CLAIM_SLOPE_PRIOR_VAR``
-    as the parent's weight; the top parent is slope 0 (capture 1). Kept in
-    [0, 1]. ``claim_base_mean`` is the hierarchical mean claimed base edge, the
-    point where the slope pivots. Cold: capture 1, no change to the edge.
+
+def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, *, now: float | None = None) -> dict[str, Any]:
+    """Expected gross directional move of a strategy claim, learned from realized moves.
+
+    E[gross | projection] = gross mean + capture x (projection - projection mean).
+    The gross mean is the usual hierarchical posterior of ``claim_gross``
+    (setup -> related -> key) from prior 0. ``claim_capture`` is the within-key
+    slope of gross on the projection, a ridge estimate at each level toward its
+    parent with ``PRIOR_STRENGTH`` claims of variance ``CLAIM_SLOPE_PRIOR_VAR``
+    as the parent's weight, from slope 0 at the top, kept in [0, 1]. Cold, the
+    expected move is 0 whatever the projection: target geometry, ATR or a floor
+    is never a move by itself. ``claim_raw_center`` is the hierarchical mean
+    projection, the slope's pivot. Claim labels arrive weighted by their
+    uniqueness, so ``n`` counts independent windows rather than overlapping ones.
     """
     sym, stp, reg = _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower()
     claim_rows = _state_rows(db_path, SCALP_ENGINE, CLAIM_MOMENT_METRICS)
     moment = float(now) if now is not None else _data_clock(claim_rows)
+    gross = _lattice(claim_rows, engine_id=SCALP_ENGINE, symbol=symbol, setup=setup, regime=regime, weights={"claim_gross": 1.0}, prior=0.0, now=moment)
     keys: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in claim_rows:
         if _is_forensic_key(SCALP_ENGINE, row["symbol"], row["setup"], row["regime"]):
@@ -870,12 +913,12 @@ def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, 
         if any(m not in rec for m in CLAIM_MOMENT_METRICS) or rec["n"] <= 0:
             continue
         n = rec["n"]
-        b = rec["claim_base_edge"]
+        b = rec["claim_raw"]
         bucket = acc[_level_of(rec["row"], sym, stp, reg)]
         bucket[0] += n
         bucket[1] += n * b
-        bucket[2] += n * (rec["claim_base_edge_x_residual"] - b * rec["claim_residual"])
-        bucket[3] += n * max(0.0, rec["claim_base_edge_sq"] - b * b)
+        bucket[2] += n * (rec["claim_raw_x_gross"] - b * rec["claim_gross"])
+        bucket[3] += n * max(0.0, rec["claim_raw_sq"] - b * b)
     slope_info = PRIOR_STRENGTH * CLAIM_SLOPE_PRIOR_VAR
     slope = 0.0
     center: float | None = None
@@ -889,13 +932,33 @@ def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, 
         if w > 0:
             center = sb / w if center is None else (PRIOR_STRENGTH * center + sb) / (PRIOR_STRENGTH + w)
     return {
-        "claim_capture": _clamp(1.0 + slope, 0.0, 1.0),
+        "claim_gross_mean": gross["mean"],
+        "claim_gross_setup": gross["levels"]["setup"],
+        "claim_gross_levels": gross["levels"],
+        "claim_capture": _clamp(slope, 0.0, 1.0),
         "claim_slope": slope,
-        "claim_base_mean": center if center is not None else 0.0,
+        "claim_raw_center": center if center is not None else 0.0,
         "claim_key_n": acc["key"][0],
         "n_claim": nested_w["setup"],
         "claim_level_weights": nested_w,
+        "claim_confidence": gross["confidence"],
+        "claim_uncertainty": gross["sd"],
     }
+
+
+def scalp_expected_gross(view: dict[str, Any], raw: float) -> dict[str, float]:
+    """Calibrated expected gross move of a claim with projection ``raw`` under ``view``.
+
+    ``calibrated``: the setup-level gross mean plus the learned capture of the
+    projection's deviation from its mean. ``adaptive``: the key's gross mean
+    against its setup's, bounded by ``SCALP_RESIDUAL_MAX``. Their sum is the
+    expected directional move; it may be 0 or negative.
+    """
+    capture = _clamp(float(view.get("claim_capture") or 0.0), 0.0, 1.0)
+    setup_mean = float(view.get("claim_gross_setup") or 0.0)
+    calibrated = setup_mean + capture * (max(0.0, float(raw or 0.0)) - float(view.get("claim_raw_center") or 0.0))
+    adaptive = _clamp(float(view.get("claim_gross_mean") or 0.0) - setup_mean, -SCALP_RESIDUAL_MAX, SCALP_RESIDUAL_MAX)
+    return {"capture": capture, "calibrated": calibrated, "adaptive": adaptive, "expected": calibrated + adaptive}
 
 
 def _blend(parts: list[tuple[float, float]], prior: float) -> tuple[float, float]:
@@ -908,13 +971,13 @@ def _blend(parts: list[tuple[float, float]], prior: float) -> tuple[float, float
 
 
 def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features: dict | None = None, *, now: float | None = None) -> dict[str, Any]:
-    """Learned adjustments for the next SCALP candidate. Never an edge by itself.
+    """Learned inputs for the next SCALP candidate. Never an edge by itself.
 
-    The candidate's own base executable edge (raw expected move - live cost) is
-    built in scalp_v2.executable_edge. This view supplies the hierarchical mean
-    residual, the claim calibration (capture slope and pivot) and the weighted
-    microstructure residual added to it, plus confidence, risk, target and hold.
-    A cold key contributes a residual of exactly 0.
+    scalp_v2.executable_edge prices the candidate: calibrated expected move
+    (``scalp_claim_calibration`` via ``scalp_expected_gross``) - live cost +
+    bounded micro residual. This view supplies the calibration, the weighted
+    microstructure residual, confidence, risk, target and hold. Cold, the
+    expected move is 0 and the micro residual is 0.
     """
     from backend.services.scalp_v2.exit_evaluator import SCALP_V2_TIME_STOP_MIN
 
@@ -927,8 +990,6 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features:
     forward = estimate(db_path, SCALP_ENGINE, symbol, setup, regime, "markout_forward", now=now)
     learned_mfe, _ = _blend([(mfe["mean"], mfe["n"]), (max(0.0, forward["mean"]), forward["n"] * MARKOUT_WEIGHT)], mfe["prior"])
     hard_hold = float(SCALP_V2_TIME_STOP_MIN)
-    confidence = float(residual["confidence"])
-    adaptive_residual = _clamp(residual["mean"], -SCALP_RESIDUAL_MAX, SCALP_RESIDUAL_MAX)
     # Bounded microstructure residual: shrunk by the model's own sample count so
     # a cold model barely moves the edge, then by the learned micro weight.
     # Zero-centred (excludes the model bias).
@@ -943,19 +1004,16 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features:
     learned_net = learned["mean"]
     abstain, abstain_reason = _abstain(learned_net)
     return {
-        "adaptive_state_version": ADAPTIVE_STATE_VERSION,
+        "adaptive_state_version": adaptive_format(SCALP_ENGINE),
         "engine_id": SCALP_ENGINE,
         "symbol": str(symbol or "").upper(),
         "setup": str(setup or "").upper(),
         "regime": str(regime or "").lower(),
-        "adaptive_residual": adaptive_residual,
+        "adaptive_residual": _clamp(residual["mean"], -SCALP_RESIDUAL_MAX, SCALP_RESIDUAL_MAX),
         "adaptive_residual_raw": residual["mean"],
         "n_residual": residual["n"],
-        "adaptive_residual_strategy": _clamp(residual_strategy["mean"], -SCALP_RESIDUAL_MAX, SCALP_RESIDUAL_MAX),
-        "n_residual_strategy": residual_strategy["n"],
-        "confidence_strategy": float(residual_strategy["confidence"]),
-        "residual_uncertainty": float(residual_strategy["sd"]),
-        "residual_levels": {lvl: round(v, 6) for lvl, v in residual_strategy.get("levels", {}).items()},
+        "raw_claim_bias": residual_strategy["mean"],
+        "n_raw_claim_bias": residual_strategy["n"],
         "economic_version": current_economic_version(SCALP_ENGINE),
         "micro_residual": micro_residual,
         "micro_residual_unweighted": micro_unweighted,
@@ -964,12 +1022,16 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features:
         "micro_tilt": round(micro_residual, 6),
         "micro_tilt_raw": round(micro_tilt, 6),
         "micro_model_n": micro_n,
+        "claim_gross_mean": claim["claim_gross_mean"],
+        "claim_gross_setup": claim["claim_gross_setup"],
+        "claim_gross_levels": {lvl: round(v, 6) for lvl, v in claim["claim_gross_levels"].items()},
         "claim_capture": claim["claim_capture"],
         "claim_slope": claim["claim_slope"],
-        "claim_base_mean": claim["claim_base_mean"],
+        "claim_raw_center": claim["claim_raw_center"],
         "claim_key_n": claim["claim_key_n"],
         "n_claim": claim["n_claim"],
-        "confidence": confidence,
+        "claim_uncertainty": claim["claim_uncertainty"],
+        "confidence": claim["claim_confidence"],
         "mfe": learned_mfe,
         "mae": path_mae["mean"],
         "target_pct": _clamp(learned_mfe, *SCALP_TARGET_BOUNDS),
@@ -1256,7 +1318,7 @@ def record_candidate(
     horizon = _label_horizon_for(db_path, engine_id, symbol, setup, regime)
     raw_move: float | None = None
     with contextlib.suppress(TypeError, ValueError):
-        raw_move = float(raw_expected_move) if raw_expected_move is not None and float(raw_expected_move) > 0 else None
+        raw_move = max(0.0, float(raw_expected_move)) if raw_expected_move is not None and math.isfinite(float(raw_expected_move)) else None
     lifecycle_json = ""
     if lifecycle is not None:
         with contextlib.suppress(AttributeError, TypeError, ValueError):
@@ -1382,9 +1444,10 @@ def resolve_markouts(
     with the engine's current economic version are learned. Returns rows newly
     learned on the fixed-horizon label.
 
-    SCALP rows also learn the edge residual (label minus the decision-time base
-    executable edge), the claim calibration, the micro weight and the gross path
-    MAE over the committed horizon, which is the live risk estimate.
+    SCALP claim rows (admitted or not) also learn the claim calibration (the
+    projection and the realized gross move), the raw-claim bias, the micro model
+    and weight on what the decision-time edge before micro missed, and the gross
+    path MAE over the committed horizon, which is the live risk estimate.
     ``path_low(symbol, start, end)`` supplies the bar-low path when available;
     ``tick_quote(symbol, start, end)`` the last tape print in a window, for the
     1/5/10 s marks where the tape has one.
@@ -1467,6 +1530,7 @@ def resolve_markouts(
                 path = [v for v in path if v is not None]
                 mae = max(0.0, -min(path)) if path else None
                 residual = None
+                uniqueness = 1.0
                 micro_target = forward
                 cols = row.keys()
                 state = str(row["candidate_state"] or "") if "candidate_state" in cols else ""
@@ -1481,11 +1545,17 @@ def resolve_markouts(
                     mae = scalp_gross_path_mae(ref_price=float(row["ref_price"]), roundtrip_cost=float(row["roundtrip_cost"] or 0), marks=path, path_low=low)
                     raw_move = row["raw_expected_move"] if "raw_expected_move" in cols else None
                     raw_source = row["raw_move_source"] if "raw_move_source" in cols else None
-                    if forward is not None and raw_move is not None and float(raw_move) > 0:
+                    if is_directional(raw_source):
+                        # A claim row with no stored projection is a 0 projection.
+                        raw_move = max(0.0, float(raw_move)) if raw_move is not None else 0.0
+                    if forward is not None and raw_move is not None and (is_directional(raw_source) or float(raw_move) > 0):
                         residual = scalp_edge_residual(forward_net=forward, raw_expected_move=float(raw_move), roundtrip_cost=float(row["roundtrip_cost"] or 0))
-                    # Only a directional claim's residual trains the micro residual;
-                    # forensic ATR-estimate residuals must not shape live edge.
-                    micro_target = residual if is_directional(raw_source) else None
+                    # The micro model learns what the decision-time edge before micro
+                    # missed, on claim rows only; ATR-estimate rows never shape live edge.
+                    pre_micro = _economic_of(row).get("pre_micro_edge")
+                    micro_target = float(forward) - float(pre_micro) if (forward is not None and is_directional(raw_source) and isinstance(pre_micro, (int, float))) else None
+                    if is_directional(raw_source) and forward is not None:
+                        uniqueness = claim_uniqueness(conn, row, label_h)
                 row_learned = int(row["learned"] or 0)
                 version_ok = str(row["strategy_version"]) == current_strategy_version(engine_id) and str(row["economic_version"] or "") == current_economic_version(engine_id)
                 learn_fixed = forward is not None and not row_learned and version_ok and learnable
@@ -1540,15 +1610,16 @@ def resolve_markouts(
                                 setup=row["setup"],
                                 regime=row["regime"],
                                 strategy_version=str(row["strategy_version"]),
-                                base_edge=float(raw_move) - float(row["roundtrip_cost"] or 0),
-                                residual=residual,
+                                raw=float(raw_move),
+                                gross=float(forward) + float(row["roundtrip_cost"] or 0),
                                 now=moment,
+                                weight=uniqueness,
                             )
                     if engine_id == SCALP_ENGINE and micro_target is not None:
                         with contextlib.suppress(Exception):
                             feats = json.loads(row["features_json"] or "{}")
                             if isinstance(feats, dict) and feats:
-                                update_linear_model(db_path, SCALP_ENGINE, "micro_edge", feats, micro_target, now=moment)
+                                update_linear_model(db_path, SCALP_ENGINE, "micro_edge", feats, micro_target, now=moment, weight=uniqueness)
                         econ = _economic_of(row)
                         if "micro_unweighted" in econ and "pre_micro_edge" in econ:
                             learn_micro_weight(
@@ -1557,6 +1628,7 @@ def resolve_markouts(
                                 tilt=float(econ["micro_unweighted"]),
                                 miss=float(forward) - float(econ["pre_micro_edge"]),
                                 now=moment,
+                                weight=uniqueness,
                             )
                     learned += 1
                 life = marks.get("lifecycle")
@@ -1745,6 +1817,7 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
     """
     out: dict[str, Any] = {
         "adaptive_state_version": ADAPTIVE_STATE_VERSION,
+        "adaptive_state_versions": {DAY_ENGINE: adaptive_format(DAY_ENGINE), SCALP_ENGINE: adaptive_format(SCALP_ENGINE)},
         "half_life_days": ADAPTIVE_HALF_LIFE_DAYS,
         "half_life_days_by_engine": {DAY_ENGINE: half_life_days(DAY_ENGINE), SCALP_ENGINE: half_life_days(SCALP_ENGINE)},
         "economic_versions": {DAY_ENGINE: current_economic_version(DAY_ENGINE), SCALP_ENGINE: current_economic_version(SCALP_ENGINE)},
@@ -1802,18 +1875,19 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                             "symbol": k["symbol"],
                             "setup": k["setup"],
                             "regime": k["regime"],
-                            "adaptive_residual": round(view["adaptive_residual"], 6),
-                            "adaptive_residual_strategy": round(view["adaptive_residual_strategy"], 6),
-                            "residual_uncertainty": round(view["residual_uncertainty"], 6),
+                            "claim_gross_mean": round(view["claim_gross_mean"], 6),
+                            "claim_gross_setup": round(view["claim_gross_setup"], 6),
                             "claim_capture": round(view["claim_capture"], 4),
-                            "claim_base_mean": round(view["claim_base_mean"], 6),
+                            "claim_raw_center": round(view["claim_raw_center"], 6),
+                            "claim_uncertainty": round(view["claim_uncertainty"], 6),
+                            "raw_claim_bias": round(view["raw_claim_bias"], 6),
                             "micro_weight": round(view["micro_weight"], 4),
                             "risk_estimate": round(view["risk_estimate"], 6),
                             "target_pct": round(view["target_pct"], 5),
                             "hold_min": round(view["hold_min"], 2),
                             "confidence": round(view["confidence"], 3),
                             "abstain": view["abstain"],
-                            "n": view["n_residual"],
+                            "n": view["claim_key_n"],
                         }
                     )
             out["engines"][engine_id] = rows
@@ -2127,6 +2201,7 @@ __all__ = [
     "resolve_markouts",
     "scalp_claim_calibration",
     "scalp_decision",
+    "scalp_expected_gross",
     "seed_day_trade_net",
     "update_linear_model",
 ]

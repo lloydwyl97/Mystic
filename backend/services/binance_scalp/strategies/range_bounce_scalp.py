@@ -15,6 +15,15 @@ from backend.services.binance_scalp.strategies.common import (
 )
 
 
+def bounce_projection(bars: list[dict], cur: float) -> float:
+    """Structural projection of a support bounce: distance to the high of the
+    last 15 closed bars, (high - price) / price. May be <= 0."""
+    if cur <= 0 or not bars:
+        return 0.0
+    window = bars[-15:] if len(bars) >= 15 else bars
+    return (max(b["high"] for b in window) - cur) / cur
+
+
 class RangeBounceScalpStrategy:
     name = "range_bounce_scalp"
 
@@ -85,12 +94,13 @@ class RangeBounceScalpStrategy:
         recovery = (cur - support) / cur if cur > 0 else 0
         # Project toward range high (bounce target), not a hard 0.25% micro-cap
         # that sits at/below net_profit_target and always fails reachability.
-        to_high = (hi - cur) / cur if cur > 0 else 0.0
-        structural = max(to_high, recovery + 0.0008)
-        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.65, cap_pct=0.006)
+        to_high = bounce_projection(bars, cur)
+        # Reachability label only; the directional claim is the bare projection.
+        reach_geometry = max(to_high, recovery + 0.0008)
+        expected = estimate_expected_move_pct(bars, structural=reach_geometry, atr_mult=0.65, cap_pct=0.006)
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
-            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
+            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=to_high)
 
         # Deweight vs other setups (paper: range bounce net-negative vs peers).
         # Still entry-eligible when sig.passed — lower rank only.
@@ -104,7 +114,7 @@ class RangeBounceScalpStrategy:
             entry_reason=f"support_bounce_{support:.6f}_wick={wick_rejection:.4f}",
             invalidation_reason="support_break_no_recovery",
             expected_move_pct=expected,
-            directional_move_pct=structural,
+            directional_move_pct=to_high,
             impact_pct=impact,
             limit_buy=fill,
             setup_context={

@@ -204,7 +204,7 @@ def tag_regimes(db_path: str, cands: list[DayCandidate]) -> None:
             continue
         key = (c.symbol, c.decided_at)
         if key not in cache:
-            cache[key] = market_regime_tag(db_path, c.symbol, as_of=c.decided_at) or str(c.regime_signal or "")
+            cache[key] = market_regime_tag(db_path, c.symbol, as_of=c.decided_at) or ""
         c.regime_tag = cache[key]
 
 
@@ -497,8 +497,45 @@ def day_report(trades: list[dict[str, Any]], folds: list[tuple[float, float]]) -
 # --------------------------------------------------------------------------- SCALP
 
 
-def load_scalp_rows(db_path: str, since: float, until: float, strategy_version: str) -> list[dict[str, Any]]:
-    """Recorded SCALP candidates in [since, until), oldest first, with decision-time inputs."""
+def unfloored_claim(c: dict[str, Any], store: BarStore) -> float | None:
+    """The claim the current strategies make for a row recorded when VWAP reclaim
+    floored its projection at 12 bps and range bounce claimed recovery + 8 bps.
+
+    Exact where the recorded value was the projection itself (above the floor);
+    otherwise the projection rebuilt from the 15 1m bars closed by the decision,
+    priced at the decision ask, and bounded by the recorded value. None when the
+    bars are missing.
+    """
+    import bisect
+
+    from backend.services.binance_scalp.strategies.common import directional_claim_pct
+    from backend.services.binance_scalp.strategies.range_bounce_scalp import bounce_projection
+    from backend.services.binance_scalp.strategies.vwap_ema_reclaim import _REACH_MIN_PCT, reclaim_projection
+
+    recorded, setup, cur = float(c["raw"]), str(c["setup"]).upper(), float(c["ref"])
+    if setup == "VWAP_EMA_RECLAIM" and recorded > _REACH_MIN_PCT + 1e-9:
+        return recorded
+    if setup not in ("VWAP_EMA_RECLAIM", "RANGE_BOUNCE_SCALP"):
+        return recorded
+    key = (c["symbol"], "1m")
+    hi = bisect.bisect_right(store.epochs.get(key, []), float(c["t"]) - 60.0)
+    bars = store.bars.get(key, [])[max(0, hi - 15) : hi]
+    if setup == "VWAP_EMA_RECLAIM":
+        return min(directional_claim_pct(reclaim_projection(bars, cur)), recorded) if len(bars) >= 15 else None
+    if len(bars) < 10:
+        return None
+    to_high = directional_claim_pct(bounce_projection(bars, cur))
+    return recorded if abs(to_high - recorded) < 5e-5 else min(to_high, recorded)
+
+
+def load_scalp_rows(db_path: str, since: float, until: float, strategy_version: str, *, store: BarStore | None = None, unfloor_unless_version: str | None = None) -> list[dict[str, Any]]:
+    """Recorded SCALP candidates in [since, until), oldest first, with decision-time inputs.
+
+    Every row with a strategy-claim source is a claim, a 0 projection included.
+    With ``store``, claim rows recorded under any economic version other than
+    ``unfloor_unless_version`` carry ``unfloored_claim`` as ``raw`` (``raw_recorded``
+    keeps the stored value; ``unfloor_missing`` flags a row without bars, priced at 0).
+    """
     from backend.services.scalp_v2.raw_move_source import is_directional, normalize_raw_move_source
 
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -516,26 +553,31 @@ def load_scalp_rows(db_path: str, since: float, until: float, strategy_version: 
             feats = json.loads(r["features_json"] or "{}")
         except (TypeError, ValueError):
             feats = {}
-        raw = float(r["raw_expected_move"] or 0.0) if r["raw_expected_move"] is not None else 0.0
+        raw = max(0.0, float(r["raw_expected_move"])) if r["raw_expected_move"] is not None else 0.0
         source = normalize_raw_move_source(r["raw_move_source"]) if r["raw_move_source"] else "NONE"
         spread = feats.get("spread_pct") if isinstance(feats, dict) else None
-        out.append(
-            {
-                "id": int(r["id"]),
-                "symbol": str(r["symbol"]),
-                "setup": str(r["setup"]),
-                "regime": str(r["regime"]),
-                "t": float(r["evaluated_at"]),
-                "ref": float(r["ref_price"]),
-                "cost": float(r["roundtrip_cost"] or 0.0),
-                "signaled": bool(r["signaled"]),
-                "raw": raw,
-                "source": source,
-                "directional": is_directional(source) and raw > 0,
-                "features": feats if isinstance(feats, dict) else {},
-                "spread": float(spread) if spread is not None else None,
-            }
-        )
+        c = {
+            "id": int(r["id"]),
+            "symbol": str(r["symbol"]),
+            "setup": str(r["setup"]),
+            "regime": str(r["regime"]),
+            "t": float(r["evaluated_at"]),
+            "ref": float(r["ref_price"]),
+            "cost": float(r["roundtrip_cost"] or 0.0),
+            "signaled": bool(r["signaled"]),
+            "raw": raw,
+            "raw_recorded": raw,
+            "unfloor_missing": False,
+            "source": source,
+            "directional": is_directional(source),
+            "features": feats if isinstance(feats, dict) else {},
+            "spread": float(spread) if spread is not None else None,
+        }
+        if store is not None and c["directional"] and str(r["economic_version"] or "") != str(unfloor_unless_version or ""):
+            claim = unfloored_claim(c, store)
+            c["unfloor_missing"] = claim is None
+            c["raw"] = 0.0 if claim is None else claim
+        out.append(c)
     return out
 
 
@@ -579,13 +621,14 @@ class ScalpPolicy:
     """One SCALP learner version: its own scalp_decision, executable edge,
     record_candidate and resolve_markouts, writing to its own state DB."""
 
-    def __init__(self, name: str, db_path: str, learner: ModuleType, edge_module: ModuleType, store: BarStore) -> None:
+    def __init__(self, name: str, db_path: str, learner: ModuleType, edge_module: ModuleType, store: BarStore, *, full_api: bool | None = None) -> None:
         self.name = name
         self.al = learner
         self.edge_mod = edge_module
         self.db = db_path
         self.store = store
-        self.repaired = name == "repaired"
+        # full_api: the learner takes ``now=`` and persists the decision-time economics.
+        self.repaired = (name == "repaired") if full_api is None else bool(full_api)
 
     def view(self, c: dict[str, Any], now: float) -> dict[str, Any]:
         if self.repaired:
@@ -606,7 +649,7 @@ class ScalpPolicy:
             "signaled": c["signaled"],
             "evaluated_at": c["t"],
             "features": c["features"],
-            "raw_expected_move": c["raw"] or None,
+            "raw_expected_move": c["raw"] if c["directional"] else (c["raw"] or None),
             "raw_move_source": c["source"],
         }
         if self.repaired:
@@ -655,6 +698,9 @@ def simulate_scalp(rows: list[dict[str, Any]], policy: ScalpPolicy, *, now: floa
                     "t": c["t"],
                     "symbol": c["symbol"],
                     "setup": c["setup"],
+                    "regime": c["regime"],
+                    "raw": c["raw"],
+                    "cost": c["cost"],
                     "final": final,
                     "base": float(edge.base_executable_edge_pct),
                     "micro": float(edge.micro_residual_pct),
@@ -672,6 +718,7 @@ def simulate_scalp(rows: list[dict[str, Any]], policy: ScalpPolicy, *, now: floa
                             "setup": c["setup"],
                             "entry": c["t"],
                             "net": float(out["net"]),
+                            "cost": c["cost"],
                             "size": float(edge.size_mult),
                             "reason": out["reason"],
                             "expected_net": final,
@@ -719,6 +766,46 @@ def micro_value(preds: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _avg_ranks(values: list[float]) -> list[float]:
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = (i + j) / 2.0 + 1.0
+        i = j + 1
+    return ranks
+
+
+def discrimination(preds: list[dict[str, Any]], label_key: str = "label") -> dict[str, Any]:
+    """How well ``final`` orders claims by realized ``label_key``, independent of
+    how many are admitted: tie-corrected Spearman correlation, AUC for a positive
+    label, and the mean realized label of the top fifth by ``final``."""
+    rows = [p for p in preds if p.get(label_key) is not None]
+    if len(rows) < 3:
+        return {"claims": len(rows)}
+    finals = [p["final"] for p in rows]
+    labels = [p[label_key] for p in rows]
+    rf, rl = _avg_ranks(finals), _avg_ranks(labels)
+    mf, ml = statistics.fmean(rf), statistics.fmean(rl)
+    cov = sum((a - mf) * (b - ml) for a, b in zip(rf, rl, strict=True))
+    den = math.sqrt(sum((a - mf) ** 2 for a in rf) * sum((b - ml) ** 2 for b in rl))
+    pos = [r for r, lab in zip(rf, labels, strict=True) if lab > 0]
+    n_pos, n_neg = len(pos), len(rows) - len(pos)
+    auc = (sum(pos) - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg) if n_pos and n_neg else None
+    top = sorted(rows, key=lambda p: p["final"], reverse=True)[: max(1, len(rows) // 5)]
+    return {
+        "claims": len(rows),
+        "spearman": cov / den if den > 0 else 0.0,
+        "auc_positive": auc,
+        "top_fifth_label_bps": statistics.fmean([p[label_key] for p in top]) * 1e4,
+        "all_label_bps": statistics.fmean(labels) * 1e4,
+    }
+
+
 def scalp_report(result: dict[str, Any], folds: list[tuple[float, float]]) -> dict[str, Any]:
     preds = [p for p in result["predictions"] if p.get("label") is not None]
     admitted = [p for p in preds if p["admitted"]]
@@ -732,6 +819,7 @@ def scalp_report(result: dict[str, Any], folds: list[tuple[float, float]]) -> di
     trades = sorted(result["trades"], key=lambda r: r["entry"])
     later = [t for t in trades if folds and t["entry"] >= folds[0][1]]
     later_preds = [p for p in preds if folds and p["t"] >= folds[0][1]]
+    sized = [(t["net"], t.get("cost", 0.0), t["size"]) for t in trades]
     out = {
         "claims_scored": len(preds),
         "claims_admitted": len(admitted),
@@ -740,6 +828,10 @@ def scalp_report(result: dict[str, Any], folds: list[tuple[float, float]]) -> di
         "predicted_net_bps_admitted": mean(admitted, "final"),
         "realized_label_bps_admitted": mean(admitted, "label"),
         "realized_label_bps_all": mean(preds, "label"),
+        "predicted_gross_bps_all": statistics.fmean([p["final"] + p.get("cost", 0.0) for p in preds]) * 1e4 if preds else None,
+        "realized_gross_bps_all": statistics.fmean([p["label"] + p.get("cost", 0.0) for p in preds]) * 1e4 if preds else None,
+        "trade_gross": sum((n + c) * s for n, c, s in sized),
+        "trade_cost": sum(c * s for _n, c, s in sized),
         "after_first_fold": {
             "claims_scored": len(later_preds),
             "claims_admitted": sum(1 for p in later_preds if p["admitted"]),
@@ -751,6 +843,10 @@ def scalp_report(result: dict[str, Any], folds: list[tuple[float, float]]) -> di
         "trades": summarize_returns([t["net"] for t in trades], [t["size"] for t in trades]),
         "folds": [summarize_returns([t["net"] for t in trades if lo <= t["entry"] < hi], [t["size"] for t in trades if lo <= t["entry"] < hi]) for lo, hi in folds],
         "fold_bias_bps": [bias([p for p in preds if lo <= p["t"] < hi]) for lo, hi in folds],
+        "rmse_bps_all": math.sqrt(statistics.fmean([(p["final"] - p["label"]) ** 2 for p in preds])) * 1e4 if preds else None,
+        "discrimination": discrimination(preds, "label"),
+        "discrimination_own_horizon": discrimination(result["predictions"], "label_own_horizon"),
+        "fold_discrimination": [discrimination([p for p in preds if lo <= p["t"] < hi], "label") for lo, hi in folds],
         "micro": micro_value(preds),
     }
     out["trades"]["unweighted_mean_net_bps"] = statistics.fmean([t["net"] for t in trades]) * 1e4 if trades else 0.0
@@ -839,6 +935,50 @@ def run_replay(db_path: str, *, baseline_sha: str, repo: str | Path, now: float 
     return out
 
 
+def run_scalp_replay(db_path: str, *, baseline_sha: str, repo: str | Path, now: float | None = None, folds: int = 4) -> dict[str, Any]:
+    """SCALP at ``baseline_sha`` on the recorded claims, the same code on unfloored
+    claims, and the working tree on unfloored claims, over the same candidates.
+    Each starts empty at the SCALP anchor, learns causally from every claim
+    (admitted or not) and trades by the exit contract."""
+    import time as _time
+
+    from backend.services import adaptive_learning as al
+    from backend.services.scalp_v2 import executable_edge as edge_mod
+    from backend.services.strategy_version import economic_anchor
+
+    moment = float(now if now is not None else _time.time())
+    baseline = load_baseline_modules(baseline_sha, repo)
+    anchor = float(economic_anchor(SCALP_ENGINE)["epoch"])
+    store = BarStore(db_path, DAY_SYMBOLS, since=anchor - 86400)
+    version = al.current_strategy_version(SCALP_ENGINE)
+    recorded = load_scalp_rows(db_path, anchor, moment, version)
+    unfloored = load_scalp_rows(db_path, anchor, moment, version, store=store, unfloor_unless_version=al.current_economic_version(SCALP_ENGINE))
+    bounds = chronological_folds(anchor, moment, folds)
+    claims = [c for c in unfloored if c["directional"]]
+    out: dict[str, Any] = {
+        "now": moment,
+        "baseline_sha": baseline_sha,
+        "anchor": anchor,
+        "folds": bounds,
+        "rows": len(unfloored),
+        "claims": len(claims),
+        "claims_unfloor_missing": sum(1 for c in claims if c["unfloor_missing"]),
+        "claims_changed": sum(1 for c in claims if abs(c["raw"] - c["raw_recorded"]) > 1e-12),
+        "policies": {},
+    }
+    scratch = "/dev/shm" if Path("/dev/shm").is_dir() else None
+    with tempfile.TemporaryDirectory(prefix="scalp_replay_", dir=scratch) as tmp:
+        runs = (
+            (f"A_{baseline_sha}", recorded, ScalpPolicy("baseline", f"{tmp}/a.db", baseline["adaptive_learning"], baseline["executable_edge"], store, full_api=True)),
+            (f"A_{baseline_sha}_unfloored", unfloored, ScalpPolicy("baseline", f"{tmp}/a2.db", baseline["adaptive_learning"], baseline["executable_edge"], store, full_api=True)),
+            ("B_calibrated", unfloored, ScalpPolicy("repaired", f"{tmp}/b.db", al, edge_mod, store)),
+        )
+        for name, rows, policy in runs:
+            result = simulate_scalp(rows, policy, now=moment)
+            out["policies"][name] = {**scalp_report(result, bounds), "trade_list": result["trades"], "predictions": result["predictions"]}
+    return out
+
+
 __all__ = [
     "BarStore",
     "BaselineDayPolicy",
@@ -848,16 +988,19 @@ __all__ = [
     "chronological_folds",
     "day_lifecycle",
     "day_report",
+    "discrimination",
     "iso_epoch",
     "label_day_lifecycles",
     "load_baseline_modules",
     "load_scalp_rows",
     "reconstruct_day_candidates",
     "run_replay",
+    "run_scalp_replay",
     "scalp_exit_sim",
     "scalp_report",
     "simulate_day",
     "simulate_scalp",
     "summarize_returns",
     "tag_regimes",
+    "unfloored_claim",
 ]

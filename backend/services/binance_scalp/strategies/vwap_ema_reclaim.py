@@ -33,6 +33,19 @@ def _ema(values: list[float], period: int) -> float:
     return ema
 
 
+def reclaim_projection(bars: list[dict], cur: float) -> float:
+    """Structural projection of a reclaim: depth of the pullback below the 15-bar
+    VWAP, (vwap - lowest low of the last 5 closed bars) / price. May be <= 0."""
+    if cur <= 0 or len(bars) < 15:
+        return 0.0
+    prior_low = min(b["low"] for b in bars[-5:])
+    return (_vwap(bars[-15:]) - prior_low) / cur
+
+
+# Reachability label only: a reclaim's target geometry is never below this.
+_REACH_MIN_PCT = 0.0012
+
+
 class VwapEmaReclaimStrategy:
     name = "vwap_ema_reclaim"
 
@@ -76,12 +89,11 @@ class VwapEmaReclaimStrategy:
         if not mom_ok:
             return reject_signal(ctx, self.name, "NO_PULLBACK_RECOVERY")
 
-        structural = (vwap - prior_low) / cur if cur > 0 else 0.001
-        structural = max(structural, 0.0012)
-        expected = estimate_expected_move_pct(bars, structural=structural, atr_mult=0.70, cap_pct=0.006)
+        projection = reclaim_projection(bars, cur)
+        expected = estimate_expected_move_pct(bars, structural=max(projection, _REACH_MIN_PCT), atr_mult=0.70, cap_pct=0.006)
         reachable, _ = target_reachable(ctx.econ, spread_pct=ctx.snap.spread_pct, impact_pct=impact, expected_move_pct=expected)
         if not reachable:
-            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=structural)
+            return reject_signal(ctx, self.name, "TARGET_NOT_REACHABLE", expected_move=expected, impact=impact, directional_move=projection)
 
         score = 2.35 + (cur - vwap) / vwap * 450 + (ema_fast - ema_slow) / ema_slow * 280
         return pass_signal(
@@ -92,7 +104,7 @@ class VwapEmaReclaimStrategy:
             entry_reason=f"vwap_reclaim vwap={vwap:.4f} ema_fast>{ema_slow:.4f}",
             invalidation_reason="lost_vwap_or_ema_with_no_recovery",
             expected_move_pct=expected,
-            directional_move_pct=structural,
+            directional_move_pct=projection,
             impact_pct=impact,
             limit_buy=fill,
             setup_context={"vwap": vwap, "ema_fast": ema_fast, "ema_slow": ema_slow, "prior_low": prior_low},

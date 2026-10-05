@@ -12,12 +12,15 @@ in order, through the same functions the live loop uses:
   rows for the live resolver.
 - SCALP recorded candidates re-scored at their decision time and resolved at
   their stamped horizon (residual, claim calibration, micro model and weight,
-  risk), plus SCALP realized closes at close time. The production rows are
-  stamped with the economic version and whether their label is already in the
-  rebuilt state, so the live resolver never counts one twice.
+  risk), plus SCALP realized closes at close time. Claims recorded under an
+  earlier economic version are restated as the claim the current strategies
+  make. The production rows are stamped with the economic version and whether
+  their label is already in the rebuilt state, so the live resolver never
+  counts one twice.
 
 Idempotent: the current version's state, linear model and rebuilt candidate
 rows are replaced. Refuses once live candidates of the current version exist.
+``rebuild_scalp`` does the SCALP half alone, for a SCALP learner-format change.
 """
 
 from __future__ import annotations
@@ -224,21 +227,189 @@ def rebuild_day(
     return {"counts": counts, "pending": pending}
 
 
-def _live_current_rows(db_path: str) -> int:
-    from backend.services.adaptive_learning import current_economic_version
-
+def _live_version_rows(db_path: str, versions: tuple[str, ...]) -> int:
     conn = sqlite3.connect(db_path, timeout=15)
     try:
         cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(adaptive_candidate_markouts)")}
         if "economic_version" not in cols:
             return 0
+        marks = ",".join("?" for _ in versions)
         row = conn.execute(
-            "SELECT COUNT(*) FROM adaptive_candidate_markouts WHERE economic_version IN (?, ?) AND INSTR(COALESCE(economic_json,''), ?)=0",
-            (current_economic_version(DAY_ENGINE), current_economic_version(SCALP_ENGINE), REBUILT_MARK),
+            f"SELECT COUNT(*) FROM adaptive_candidate_markouts WHERE economic_version IN ({marks}) AND INSTR(COALESCE(economic_json,''), ?)=0",
+            (*versions, REBUILT_MARK),
         ).fetchone()
         return int(row[0] or 0)
     finally:
         conn.close()
+
+
+def _live_current_rows(db_path: str) -> int:
+    from backend.services.adaptive_learning import current_economic_version
+
+    return _live_version_rows(db_path, (current_economic_version(DAY_ENGINE), current_economic_version(SCALP_ENGINE)))
+
+
+def _learn_scalp_close(db: str, close: dict[str, Any]) -> None:
+    from backend.services.adaptive_learning import learn_from_close
+
+    learn_from_close(
+        db,
+        engine=SCALP_ENGINE,
+        symbol=close["symbol"],
+        setup=close["setup"],
+        regime=close["regime"],
+        strategy_version=close["strategy_version"],
+        net_pct=close["net"],
+        mfe_pct=close["mfe"],
+        mae_pct=close["mae"],
+        hold_min=close["minutes"],
+        continuation=None,
+        version_current=True,
+        is_dust=False,
+        entered_at=close["entered_at"],
+        now=close["closed_at"],
+    )
+
+
+def _scalp_scratch(db_path: str, store: BarStore, scratch_db: str, *, anchor: float, now: float) -> dict[str, Any]:
+    """SCALP's current version rebuilt into ``scratch_db``: every recorded candidate
+    re-scored at its decision time and resolved at its horizon, realized closes at
+    close time. Claim rows recorded under another economic version carry the claim
+    the current strategies make (``unfloored_claim``). Returns the scratch state,
+    micro model and one production-row stamp per candidate:
+    (economic_version, economic_json, learned, raw_expected_move or None, id)."""
+    from backend.services import adaptive_learning as al
+    from backend.services.scalp_v2 import executable_edge as edge_mod
+
+    version = al.current_economic_version(SCALP_ENGINE)
+    closes = actual_closes(db_path, SCALP_ENGINE, anchor, store)
+    rows = load_scalp_rows(db_path, anchor, now, al.current_strategy_version(SCALP_ENGINE), store=store, unfloor_unless_version=version)
+    policy = ScalpPolicy("repaired", scratch_db, al, edge_mod, store)
+    result = simulate_scalp(rows, policy, now=now, events=[(c["closed_at"], lambda c=c: _learn_scalp_close(scratch_db, c)) for c in closes])
+    conn = sqlite3.connect(scratch_db)
+    conn.row_factory = sqlite3.Row
+    try:
+        scratch_rows = {int(r["id"]): r for r in conn.execute("SELECT id, learned, economic_json FROM adaptive_candidate_markouts")}
+        state = conn.execute("SELECT * FROM adaptive_metric_state WHERE engine_id=? AND economic_version=?", (SCALP_ENGINE, version)).fetchall()
+        model = conn.execute("SELECT * FROM adaptive_linear_model WHERE engine_id=? AND model=?", (SCALP_ENGINE, al._model_key(SCALP_ENGINE, "micro_edge"))).fetchone()
+    finally:
+        conn.close()
+    stamps: list[tuple[str, str, int, float | None, int]] = []
+    for c in rows:
+        sid = result["scratch_ids"].get(c["id"])
+        srow = scratch_rows.get(int(sid)) if sid is not None else None
+        if srow is None:
+            continue
+        econ = json.loads(srow["economic_json"] or "{}") or {}
+        econ["rebuilt"] = True
+        if c["directional"]:
+            econ["raw_claim_recorded"] = c["raw_recorded"]
+        stamps.append((version, json.dumps(econ, separators=(",", ":"), default=str), int(srow["learned"] or 0), c["raw"] if c["directional"] else None, c["id"]))
+    claims = [c for c in rows if c["directional"]]
+    return {
+        "version": version,
+        "rows": rows,
+        "closes": closes,
+        "result": result,
+        "state": state,
+        "model": model,
+        "stamps": stamps,
+        "summary": {
+            "scalp_economic_version": version,
+            "scalp_rows": len(rows),
+            "scalp_claims": len(claims),
+            "scalp_claims_restated": sum(1 for c in claims if abs(c["raw"] - c["raw_recorded"]) > 1e-12),
+            "scalp_claims_without_bars": sum(1 for c in claims if c["unfloor_missing"]),
+            "scalp_rows_learned": sum(1 for s in stamps if s[2]),
+            "scalp_closes": len(closes),
+            "scalp_state_rows": len(state),
+            "scalp_admitted_in_rebuild": sum(1 for p in result["predictions"] if p["admitted"]),
+            "micro_model_n": float(json.loads(model["payload"]).get("n", 0)) if model is not None else 0,
+            "micro_weight": al.micro_weight(scratch_db, now=now),
+        },
+    }
+
+
+def _write_scalp(conn: sqlite3.Connection, scratch: dict[str, Any]) -> None:
+    from backend.services import adaptive_learning as al
+
+    conn.execute("DELETE FROM adaptive_metric_state WHERE engine_id=? AND economic_version=?", (SCALP_ENGINE, scratch["version"]))
+    for r in scratch["state"]:
+        conn.execute(
+            "INSERT INTO adaptive_metric_state (engine_id, economic_version, symbol, setup, regime, metric, n, ewma, m2, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (r["engine_id"], r["economic_version"], r["symbol"], r["setup"], r["regime"], r["metric"], r["n"], r["ewma"], r["m2"], r["updated_at"]),
+        )
+    conn.execute("DELETE FROM adaptive_linear_model WHERE engine_id=? AND model=?", (SCALP_ENGINE, al._model_key(SCALP_ENGINE, "micro_edge")))
+    model = scratch["model"]
+    if model is not None:
+        conn.execute("INSERT INTO adaptive_linear_model (engine_id, model, payload, updated_at) VALUES (?, ?, ?, ?)", (model["engine_id"], model["model"], model["payload"], model["updated_at"]))
+    conn.executemany(
+        "UPDATE adaptive_candidate_markouts SET economic_version=?, economic_json=?, learned=?, raw_expected_move=COALESCE(?, raw_expected_move) WHERE id=?",
+        scratch["stamps"],
+    )
+
+
+def _scalp_setup_summary(db_path: str, now: float) -> dict[str, Any]:
+    from backend.services import adaptive_learning as al
+
+    conn = sqlite3.connect(db_path)
+    try:
+        setups = sorted(
+            {str(r[0]) for r in conn.execute("SELECT DISTINCT setup FROM adaptive_metric_state WHERE engine_id=? AND economic_version=?", (SCALP_ENGINE, al.current_economic_version(SCALP_ENGINE)))}
+        )
+    finally:
+        conn.close()
+    out: dict[str, Any] = {}
+    for setup in setups:
+        claim = al.scalp_claim_calibration(db_path, "", setup, "", now=now)
+        out[setup] = {
+            "claim_gross_setup_bps": round(claim["claim_gross_setup"] * 1e4, 2),
+            "claim_capture": round(claim["claim_capture"], 4),
+            "claim_weight": round(claim["n_claim"], 2),
+        }
+    return out
+
+
+def rebuild_scalp(db_path: str, *, now: float | None = None, apply: bool = False, workdir: str | None = None) -> dict[str, Any]:
+    """Rebuild (``apply``) or dry-run SCALP's current economic version only.
+
+    For a SCALP learner-format change: DAY state and rows are untouched. The
+    stored claim of a restated row is kept in its ``economic_json`` as
+    ``raw_claim_recorded`` and ``raw_expected_move`` holds the restated claim,
+    so rows the live resolver has not yet labelled learn the same claim.
+    Refuses once live rows of the version exist.
+    """
+    from backend.services import adaptive_learning as al
+    from backend.services.strategy_version import economic_anchor
+
+    moment = float(now if now is not None else time.time())
+    version = al.current_economic_version(SCALP_ENGINE)
+    out: dict[str, Any] = {"now": moment, "applied": False, "refused": "", "scalp_economic_version": version}
+    live = _live_version_rows(db_path, (version,))
+    if live:
+        out["refused"] = f"LIVE_SCALP_VERSION_ROWS={live}"
+        return out
+    anchor = float(economic_anchor(SCALP_ENGINE)["epoch"])
+    store = BarStore(db_path, DAY_SYMBOLS, since=anchor - 86400)
+    scratch_root = workdir or ("/dev/shm" if Path("/dev/shm").is_dir() else None)
+    with tempfile.TemporaryDirectory(prefix="scalp_rebuild_", dir=scratch_root) as tmp:
+        scratch = _scalp_scratch(db_path, store, f"{tmp}/scalp.db", anchor=anchor, now=moment)
+        out.update(scratch["summary"])
+        out["scalp_setups"] = _scalp_setup_summary(f"{tmp}/scalp.db", moment)
+        if not apply:
+            return out
+        conn = al._connect(db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _write_scalp(conn, scratch)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        out["applied"] = True
+    return out
 
 
 def _setup_summary(db_path: str, now: float) -> dict[str, Any]:
@@ -267,7 +438,6 @@ def rebuild(db_path: str, *, now: float | None = None, apply: bool = False, work
     from backend.config.trading_economics import canonical_roundtrip_cost_pct
     from backend.services import adaptive_learning as al
     from backend.services.day_v2.lifecycle_sim import LifecycleParams
-    from backend.services.scalp_v2 import executable_edge as edge_mod
     from backend.services.strategy_version import economic_anchor
 
     moment = float(now if now is not None else time.time())
@@ -283,73 +453,26 @@ def rebuild(db_path: str, *, now: float | None = None, apply: bool = False, work
     cands, _near = reconstruct_day_candidates(db_path, day_anchor, moment, store)
     tag_regimes(db_path, cands)
     day_fills = actual_closes(db_path, DAY_ENGINE, day_anchor, store)
-    scalp_closes = actual_closes(db_path, SCALP_ENGINE, scalp_anchor, store)
-    rows = load_scalp_rows(db_path, scalp_anchor, moment, al.current_strategy_version(SCALP_ENGINE))
-    day_version, scalp_version = al.current_economic_version(DAY_ENGINE), al.current_economic_version(SCALP_ENGINE)
+    day_version = al.current_economic_version(DAY_ENGINE)
     scratch_root = workdir or ("/dev/shm" if Path("/dev/shm").is_dir() else None)
     with tempfile.TemporaryDirectory(prefix="econ_rebuild_", dir=scratch_root) as tmp:
-        day_db, scalp_db = f"{tmp}/day.db", f"{tmp}/scalp.db"
+        day_db = f"{tmp}/day.db"
         day_policy = RepairedDayPolicy(day_db)
         day = rebuild_day(cands, day_fills, store, day_policy, roundtrip_cost=cost, now=moment)
-        scalp_policy = ScalpPolicy("repaired", scalp_db, al, edge_mod, store)
-
-        def scalp_close(close: dict[str, Any]) -> None:
-            al.learn_from_close(
-                scalp_db,
-                engine=SCALP_ENGINE,
-                symbol=close["symbol"],
-                setup=close["setup"],
-                regime=close["regime"],
-                strategy_version=close["strategy_version"],
-                net_pct=close["net"],
-                mfe_pct=close["mfe"],
-                mae_pct=close["mae"],
-                hold_min=close["minutes"],
-                continuation=None,
-                version_current=True,
-                is_dust=False,
-                entered_at=close["entered_at"],
-                now=close["closed_at"],
-            )
-
-        scalp = simulate_scalp(rows, scalp_policy, now=moment, events=[(c["closed_at"], lambda c=c: scalp_close(c)) for c in scalp_closes])
-        sconn = sqlite3.connect(scalp_db)
-        sconn.row_factory = sqlite3.Row
-        try:
-            scratch_rows = {int(r["id"]): r for r in sconn.execute("SELECT id, learned, lifecycle_learned, economic_json FROM adaptive_candidate_markouts")}
-            scalp_state = sconn.execute("SELECT * FROM adaptive_metric_state WHERE engine_id=? AND economic_version=?", (SCALP_ENGINE, scalp_version)).fetchall()
-            model = sconn.execute("SELECT * FROM adaptive_linear_model WHERE engine_id=? AND model=?", (SCALP_ENGINE, al._model_key(SCALP_ENGINE, "micro_edge"))).fetchone()
-        finally:
-            sconn.close()
+        scalp = _scalp_scratch(db_path, store, f"{tmp}/scalp.db", anchor=scalp_anchor, now=moment)
         dconn = sqlite3.connect(day_db)
         dconn.row_factory = sqlite3.Row
         try:
             day_state = dconn.execute("SELECT * FROM adaptive_metric_state WHERE engine_id=? AND economic_version=?", (DAY_ENGINE, day_version)).fetchall()
         finally:
             dconn.close()
-        stamps: list[tuple[str, str, int, int]] = []
-        for prod_id, sid in scalp["scratch_ids"].items():
-            srow = scratch_rows.get(int(sid)) if sid is not None else None
-            if srow is None:
-                continue
-            econ = json.loads(srow["economic_json"] or "{}") or {}
-            econ["rebuilt"] = True
-            stamps.append((scalp_version, json.dumps(econ, separators=(",", ":"), default=str), int(srow["learned"] or 0), prod_id))
         out.update(
             {
                 "day_economic_version": day_version,
-                "scalp_economic_version": scalp_version,
                 "day": day["counts"],
                 "day_candidates": len(cands),
                 "day_state_rows": len(day_state),
-                "scalp_rows": len(rows),
-                "scalp_claims": sum(1 for r in rows if r["directional"]),
-                "scalp_rows_learned": sum(1 for s in stamps if s[2]),
-                "scalp_closes": len(scalp_closes),
-                "scalp_state_rows": len(scalp_state),
-                "scalp_admitted_in_rebuild": sum(1 for p in scalp["predictions"] if p["admitted"]),
-                "micro_model_n": int(json.loads(model["payload"]).get("n", 0)) if model is not None else 0,
-                "micro_weight": al.micro_weight(scalp_db, now=moment),
+                **scalp["summary"],
                 "day_setups": _setup_summary(day_db, moment),
             }
         )
@@ -358,19 +481,14 @@ def rebuild(db_path: str, *, now: float | None = None, apply: bool = False, work
         conn = al._connect(db_path)
         try:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute("DELETE FROM adaptive_metric_state WHERE economic_version IN (?, ?)", (day_version, scalp_version))
-            for r in [*day_state, *scalp_state]:
+            conn.execute("DELETE FROM adaptive_metric_state WHERE engine_id=? AND economic_version=?", (DAY_ENGINE, day_version))
+            for r in day_state:
                 conn.execute(
                     "INSERT INTO adaptive_metric_state (engine_id, economic_version, symbol, setup, regime, metric, n, ewma, m2, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (r["engine_id"], r["economic_version"], r["symbol"], r["setup"], r["regime"], r["metric"], r["n"], r["ewma"], r["m2"], r["updated_at"]),
                 )
-            conn.execute("DELETE FROM adaptive_linear_model WHERE engine_id=? AND model=?", (SCALP_ENGINE, al._model_key(SCALP_ENGINE, "micro_edge")))
-            if model is not None:
-                conn.execute(
-                    "INSERT INTO adaptive_linear_model (engine_id, model, payload, updated_at) VALUES (?, ?, ?, ?)", (model["engine_id"], model["model"], model["payload"], model["updated_at"])
-                )
             conn.execute("DELETE FROM adaptive_candidate_markouts WHERE engine_id=? AND economic_version=? AND INSTR(COALESCE(economic_json,''), ?)>0", (DAY_ENGINE, day_version, REBUILT_MARK))
-            conn.executemany("UPDATE adaptive_candidate_markouts SET economic_version=?, economic_json=?, learned=? WHERE id=?", stamps)
+            _write_scalp(conn, scalp)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -402,4 +520,4 @@ def rebuild(db_path: str, *, now: float | None = None, apply: bool = False, work
     return out
 
 
-__all__ = ["REBUILT_MARK", "actual_closes", "rebuild", "rebuild_day"]
+__all__ = ["REBUILT_MARK", "actual_closes", "rebuild", "rebuild_day", "rebuild_scalp"]

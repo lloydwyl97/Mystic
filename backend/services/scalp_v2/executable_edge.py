@@ -3,21 +3,19 @@
 One number decides SCALP entry eligibility, rank and size. It starts from the
 current candidate and the live book:
 
-    base_executable_edge  = raw expected move - live cost (fees, slippage, spread, impact)
-    final_executable_edge = base_executable_edge + adaptive_residual + claim_residual + micro_residual
+    calibrated_move       = setup gross mean + claim_capture x (raw projection - projection mean)
+    base_executable_edge  = calibrated_move - live cost (fees, slippage, spread, impact)
+    final_executable_edge = base_executable_edge + adaptive_residual + micro_residual
 
-``adaptive_residual`` is the learned, bounded mean of (realized net markout -
-base executable edge) for the candidate's key and raw-move source (ATR
-estimate or strategy structural claim); a cold key contributes 0.
-``claim_residual`` = (claim_capture - 1) x (base edge - the key's mean claimed
-base edge). The residual is a mean over all claim sizes; claim_capture is the
-learned share of a claim's excess that realizes, so an outsized claim is not
-admitted on its size alone. Cold, claim_capture is 1 and this term is 0.
-``micro_residual`` is the bounded microstructure tilt times its learned weight
-in [0, 1] (the weight falls when resolved claims show the tilt does not explain
-what the calibrated edge missed). Both terms may lower a candidate, but neither
-can lift one that is not already positive. All learned terms are read from
-state of the current economic version, pooled hierarchically.
+The raw projection is the strategy's structural target distance. It is a
+feature, never the expected move: the gross mean and ``claim_capture`` are
+learned from realized gross moves of claims (admitted or not) with zero priors,
+so geometry, ATR or a floor alone produces an expected move of 0 and a
+candidate priced at minus its cost. ``adaptive_residual`` is the key's gross
+mean against its setup's, bounded. ``micro_residual`` is the bounded
+microstructure tilt times its learned weight in [0, 1]; it may lower a
+candidate but never lifts one that is not already positive. All learned terms
+are read from state of the current economic version, pooled hierarchically.
 
 ``final_executable_edge <= 0`` is hard economic safety (NO_EXECUTABLE_NET_EDGE).
 Anything above zero stays eligible. Confidence, risk and the final edge set
@@ -56,8 +54,8 @@ class ExecutableEdge:
     spread_pct: float
     impact_pct: float
     reject_threshold_pct: float = REJECT_THRESHOLD_PCT
-    claim_capture: float = 1.0
-    claim_residual_pct: float = 0.0
+    claim_capture: float = 0.0
+    calibrated_move_pct: float = 0.0
     micro_weight: float = 1.0
     micro_residual_unweighted_pct: float = 0.0
     uncertainty_pct: float = 0.0
@@ -71,18 +69,25 @@ class ExecutableEdge:
     def pre_micro_edge_pct(self) -> float:
         return self.final_executable_edge_pct - self.micro_residual_pct
 
+    @property
+    def expected_move_pct(self) -> float:
+        """Calibrated expected directional move before micro: setup level plus key residual."""
+        return self.calibrated_move_pct + self.adaptive_residual_pct
+
     def economic(self) -> dict[str, Any]:
         """Expected net edge after costs, in the language DAY uses as well."""
         return {
             "engine_id": "SCALP_V2",
             "economic_version": self.economic_version,
+            "raw_claim": self.raw_expected_move_pct,
+            "calibrated_move": self.calibrated_move_pct,
+            "calibration_adjustment": self.expected_move_pct - self.raw_expected_move_pct,
+            "claim_capture": self.claim_capture,
+            "adaptive_residual": self.adaptive_residual_pct,
+            "setup_expected_edge": self.base_executable_edge_pct,
             "expected_gross": self.edge_before_cost_pct,
             "expected_cost": self.live_cost_pct,
-            "raw_claim": self.raw_expected_move_pct,
-            "adaptive_correction": self.adaptive_residual_pct + self.claim_residual_pct + self.micro_residual_pct,
-            "adaptive_residual": self.adaptive_residual_pct,
-            "claim_residual": self.claim_residual_pct,
-            "claim_capture": self.claim_capture,
+            "adaptive_correction": self.edge_before_cost_pct - self.raw_expected_move_pct,
             "micro_residual": self.micro_residual_pct,
             "micro_weight": self.micro_weight,
             "micro_unweighted": self.micro_residual_unweighted_pct,
@@ -103,6 +108,7 @@ class ExecutableEdge:
 
     def as_dict(self) -> dict[str, Any]:
         out = asdict(self)
+        out["expected_move_pct"] = self.expected_move_pct
         out["edge_before_cost_pct"] = self.edge_before_cost_pct
         out["deficit_to_zero_pct"] = self.deficit_to_zero_pct
         out["reject_deficit_pct"] = self.deficit_to_zero_pct
@@ -143,11 +149,14 @@ def scalp_executable_edge(
 ) -> ExecutableEdge:
     """Canonical SCALP executable net edge for the current candidate at the live book.
 
-    ``raw_expected_move_pct`` must be a directional claim (``raw_move_source``);
-    a volatility magnitude is refused. ``view`` is ``adaptive_learning.scalp_decision(...)``
-    computed with the live microstructure features; it supplies residuals,
-    confidence and risk only.
+    ``raw_expected_move_pct`` is the strategy's structural projection
+    (``raw_move_source`` must be a directional claim; a volatility magnitude is
+    refused). It enters only through the learned calibration. ``view`` is
+    ``adaptive_learning.scalp_decision(...)`` computed with the live
+    microstructure features; it supplies the calibration, micro residual,
+    confidence and risk.
     """
+    from backend.services.adaptive_learning import scalp_expected_gross
     from backend.services.scalp_v2.raw_move_source import is_directional, normalize_raw_move_source
 
     source = normalize_raw_move_source(edge_source)
@@ -155,40 +164,36 @@ def scalp_executable_edge(
         raise ValueError(f"raw move source {source} is not a directional claim")
     raw = max(0.0, _f(raw_expected_move_pct))
     cost = canonical_roundtrip_cost_pct(spread_pct=spread_pct, buy_impact_pct=max(0.0, _f(impact_pct)), sell_impact_pct=0.0)
-    base = raw - cost
-    adaptive = _f(view.get("adaptive_residual_strategy"))
-    capture = max(0.0, min(1.0, _f(view.get("claim_capture"), 1.0)))
-    claim_model = (capture - 1.0) * (base - _f(view.get("claim_base_mean")))
-    pre_claim = base + adaptive
-    claim = claim_model if (pre_claim > REJECT_THRESHOLD_PCT or claim_model < 0) else 0.0
+    move = scalp_expected_gross(view, raw)
+    base = move["calibrated"] - cost
+    pre_micro = base + move["adaptive"]
     micro_model = _f(view.get("micro_residual"))
-    pre_micro = pre_claim + claim
     micro = micro_model if (pre_micro > REJECT_THRESHOLD_PCT or micro_model < 0) else 0.0
     final = pre_micro + micro
-    confidence = _f(view.get("confidence_strategy"))
+    confidence = _f(view.get("confidence"))
     risk = _f(view.get("risk_estimate"))
     return ExecutableEdge(
         raw_expected_move_pct=raw,
         raw_move_source=source,
         live_cost_pct=cost,
         base_executable_edge_pct=base,
-        adaptive_residual_pct=adaptive,
+        adaptive_residual_pct=move["adaptive"],
         micro_residual_model_pct=micro_model,
         micro_residual_pct=micro,
         final_executable_edge_pct=final,
         confidence=confidence,
-        n_residual=_f(view.get("n_residual_strategy")),
+        n_residual=_f(view.get("n_claim")),
         target_pct=_f(view.get("target_pct")),
         hold_min=_f(view.get("hold_min")),
         risk_estimate_pct=risk,
         size_mult=scalp_size_mult(final, confidence, risk, cost),
         spread_pct=_f(spread_pct),
         impact_pct=max(0.0, _f(impact_pct)),
-        claim_capture=capture,
-        claim_residual_pct=claim,
+        claim_capture=move["capture"],
+        calibrated_move_pct=move["calibrated"],
         micro_weight=max(0.0, min(1.0, _f(view.get("micro_weight"), 1.0))),
         micro_residual_unweighted_pct=_f(view.get("micro_residual_unweighted"), micro_model),
-        uncertainty_pct=_f(view.get("residual_uncertainty")),
+        uncertainty_pct=_f(view.get("claim_uncertainty")),
         economic_version=str(view.get("economic_version") or ""),
     )
 
@@ -209,7 +214,8 @@ _DETAIL_KEYS: tuple[tuple[str, str], ...] = (
     ("base_executable_edge", "base_executable_edge_pct"),
     ("adaptive_residual", "adaptive_residual_pct"),
     ("claim_capture", "claim_capture"),
-    ("claim_residual", "claim_residual_pct"),
+    ("calibrated_move", "calibrated_move_pct"),
+    ("expected_move", "expected_move_pct"),
     ("micro_residual", "micro_residual_pct"),
     ("micro_residual_model", "micro_residual_model_pct"),
     ("micro_weight", "micro_weight"),

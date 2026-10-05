@@ -11,7 +11,7 @@ Decision-time raw move and source per candidate:
   - closed-bar ATR estimate labelled ATR_ESTIMATE (forensic residual only;
     ATR is not a directional claim), else
   - NONE: the row teaches risk only.
-Only directional (STRATEGY_CLAIM) residuals train the live residual and micro model.
+Only directional (STRATEGY_CLAIM) rows train the claim calibration and micro model.
 
   scripts/rebuild_scalp_edge_state.py --db mystic_trading.db --backup-suffix 20261002 [--calibration-out f.json]
 """
@@ -105,7 +105,7 @@ def main() -> int:
             "source": source,
             "realized": _forward_from_stored(row),
         }
-        if not is_directional(source) or not raw:
+        if not is_directional(source) or raw is None:
             preds.append({**base, "final_executable_edge_pct": None})
             return
         feats = json.loads(row["features_json"] or "{}")

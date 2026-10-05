@@ -352,13 +352,14 @@ def rank_setup_signal(
         rank_score = (base_score + mom_boost) * regime_mult * arm_penalty_mult
         hard_block = None
 
-    # Every candidate is priced on the same executable-cost contract, from the
-    # strategy's directional claim. ATR is magnitude, not direction: it stays
-    # volatility context and never stands in for a missing claim.
+    # Every candidate with a strategy projection is priced on the same
+    # executable-cost contract. The projection is a calibration input, possibly
+    # 0; ATR is magnitude, not direction, and never stands in for a claim.
     expected = float(getattr(sig, "directional_move_pct", 0.0) or 0.0)
     volatility_move = estimate_expected_move_pct(ctx.bars_1m, structural=0.0)
-    edge_source = STRATEGY_CLAIM if expected > 0 else NO_RAW_MOVE_SOURCE
-    if expected <= 0:
+    has_claim = bool(getattr(sig, "claim_available", False)) or expected > 0
+    edge_source = STRATEGY_CLAIM if has_claim else NO_RAW_MOVE_SOURCE
+    if not has_claim:
         return RankedCandidate(
             signal=sig,
             rank_score=0.0,
@@ -614,6 +615,9 @@ def rank_setup_signal(
                 detail=f"arm_penalty_mult={arm_penalty_mult}",
             )
 
+    economic = edge_fields["executable_edge"].get("economic")
+    if isinstance(economic, dict):
+        economic["rank_effect"] = {"edge_multiplier": round(float(reach_mult_val), 6), "edge_adjustment": learned_adj, "rank_score": rank_score}
     return RankedCandidate(
         signal=sig,
         rank_score=rank_score,

@@ -110,13 +110,31 @@ def test_opinion_reject_has_no_directional_edge_source_even_with_wide_atr():
     assert not rc.entry_eligible
 
 
-def test_soft_reject_with_strategy_claim_keeps_its_directional_edge():
-    rc = rank_setup_signal(_sig(passed=False, reason="TARGET_NOT_REACHABLE", directional=0.004), regime="RANGE", ctx=_ctx(_bars(30, 0.012)))
+def _learned_gross(monkeypatch, gross: float) -> None:
+    """Every view carries a calibration that learned ``gross`` as the claims' realized move."""
+    import backend.services.adaptive_learning as al
+
+    real = al.scalp_decision
+
+    def learned(*args, **kwargs):
+        view = real(*args, **kwargs)
+        return {**view, "claim_gross_setup": gross, "claim_gross_mean": gross, "micro_residual": 0.0}
+
+    monkeypatch.setattr(al, "scalp_decision", learned)
+
+
+def test_soft_reject_with_strategy_claim_keeps_its_directional_edge(monkeypatch):
+    ctx = _ctx(_bars(30, 0.012))
+    rc = rank_setup_signal(_sig(passed=False, reason="TARGET_NOT_REACHABLE", directional=0.004), regime="RANGE", ctx=ctx)
     assert rc.edge_source == "STRATEGY_CLAIM"
     assert rc.executable_edge["raw_move_source"] == "STRATEGY_CLAIM"
     assert rc.executable_edge["raw_expected_move_pct"] == rc.expected_move_pct == 0.004
     assert rc.net_edge_after_costs_pct == rc.executable_edge["final_executable_edge_pct"]
     assert rc.roundtrip_cost_pct == rc.executable_edge["live_cost_pct"]
+    # Priced on the economic contract, not refused as unestimable; cold, the claim earns nothing.
+    assert rc.hard_block == "NO_EXECUTABLE_NET_EDGE"
+    _learned_gross(monkeypatch, 0.004)
+    rc = rank_setup_signal(_sig(passed=False, reason="TARGET_NOT_REACHABLE", directional=0.004), regime="RANGE", ctx=ctx)
     assert rc.hard_block is None
     assert rc.entry_eligible
 
@@ -128,16 +146,7 @@ def test_raw_move_below_cost_needs_learned_evidence(monkeypatch):
     assert rc.executable_edge["adaptive_residual_pct"] == 0.0
     assert rc.hard_block == "NO_EXECUTABLE_NET_EDGE"
     assert not rc.entry_eligible
-
-    import backend.services.adaptive_learning as al
-
-    real = al.scalp_decision
-
-    def offset(*args, **kwargs):
-        view = real(*args, **kwargs)
-        return {**view, "adaptive_residual_strategy": 0.002, "micro_residual": 0.0}
-
-    monkeypatch.setattr(al, "scalp_decision", offset)
+    _learned_gross(monkeypatch, 0.002)
     rc = rank_setup_signal(_sig(passed=False, reason="TARGET_NOT_REACHABLE", directional=0.0004), regime="RANGE", ctx=ctx)
     assert rc.executable_edge["final_executable_edge_pct"] > 0
     assert rc.entry_eligible
@@ -148,10 +157,14 @@ def test_no_edge_estimate_possible_is_hard_block():
     assert rc.hard_block == "NO_EXECUTABLE_EDGE_ESTIMATE"
 
 
-def test_passed_signal_uses_strategy_projection():
+def test_passed_signal_uses_strategy_projection(monkeypatch):
     rc = rank_setup_signal(_sig(passed=True, reason=None, expected=0.006), regime="RANGE", ctx=_ctx(_bars(30, 0.0004)))
     assert rc.edge_source == "STRATEGY_CLAIM"
     assert rc.expected_move_pct == 0.006
+    assert rc.executable_edge["expected_move_pct"] == 0.0
+    assert not rc.entry_eligible
+    _learned_gross(monkeypatch, 0.003)
+    rc = rank_setup_signal(_sig(passed=True, reason=None, expected=0.006), regime="RANGE", ctx=_ctx(_bars(30, 0.0004)))
     assert rc.entry_eligible
 
 

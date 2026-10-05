@@ -1,8 +1,8 @@
 """Rebuild SCALP derived edge/risk state from current-version candidate markouts.
 
 Derived estimators only: ``edge_residual``, ``markout_mae`` (gross path MAE, the
-live risk estimate), the claim capture moments and the ``micro_edge`` model for SCALP_V2,
-all under the current economic version. Rows recorded before the SCALP economic
+live risk estimate), the claim calibration moments and the ``micro_edge`` model
+for SCALP_V2, all under the current economic version. Rows recorded before the SCALP economic
 anchor or under another economic version are not read. Every other metric,
 every DAY row, other versions' state, ownership, accounting and trade history
 are untouched. Both state tables are copied to backup tables before anything is
@@ -134,18 +134,28 @@ def rebuild_scalp_edge_state(
 
     events: list[tuple[float, int, int]] = []
     raw_by_id: dict[int, tuple[float | None, str]] = {}
+    pre_micro: dict[int, float] = {}
     for idx, row in enumerate(rows):
         cols = row.keys()
         stored = row["raw_expected_move"] if "raw_expected_move" in cols else None
-        if stored is not None and float(stored) > 0:
-            source = row["raw_move_source"] if "raw_move_source" in cols else None
-            raw_by_id[idx] = (float(stored), normalize_raw_move_source(source))
+        source = normalize_raw_move_source(row["raw_move_source"] if "raw_move_source" in cols else None)
+        if stored is not None and (float(stored) > 0 or is_directional(source)):
+            raw_by_id[idx] = (max(0.0, float(stored)), source)
         else:
             raw_by_id[idx] = raw_move_for(row)
         horizon = float(row["label_horizon"] or 0) or 600.0
         events.append((float(row["evaluated_at"]), 1, idx))
         events.append((float(row["evaluated_at"]) + horizon, 0, idx))
     events.sort()
+    uniqueness: dict[int, float] = {}
+    last_claim: dict[str, float] = {}
+    for idx in sorted(range(len(rows)), key=lambda i: (float(rows[i]["evaluated_at"]), int(rows[i]["id"]))):
+        if not is_directional(raw_by_id[idx][1]):
+            continue
+        sym, at = str(rows[idx]["symbol"]), float(rows[idx]["evaluated_at"])
+        horizon = float(rows[idx]["label_horizon"] or 0) or 600.0
+        uniqueness[idx] = 1.0 if sym not in last_claim else max(0.0, min(1.0, (at - last_claim[sym]) / horizon))
+        last_claim[sym] = at
 
     stats = {"rows": len(rows), "legacy_rows_ignored": int(legacy), "residual_obs": 0, "risk_obs": 0, "micro_updates": 0, "no_raw": 0, "no_label": 0}
     for moment, kind, idx in events:
@@ -157,8 +167,11 @@ def rebuild_scalp_edge_state(
         except (TypeError, ValueError):
             feats = {}
         if kind == 1:
+            view = al.scalp_decision(db_path, row["symbol"], row["setup"], row["regime"], feats, now=moment)
+            if raw is not None and is_directional(source):
+                pre_micro[idx] = al.scalp_expected_gross(view, raw)["expected"] - float(row["roundtrip_cost"] or 0)
             if on_decision is not None:
-                on_decision(row, al.scalp_decision(db_path, row["symbol"], row["setup"], row["regime"], feats, now=moment), raw, source)
+                on_decision(row, view, raw, source)
             continue
         forward = al._forward_from_stored(row)
         if forward is None:
@@ -185,12 +198,13 @@ def rebuild_scalp_edge_state(
                 setup=row["setup"],
                 regime=row["regime"],
                 strategy_version=row["strategy_version"],
-                base_edge=raw - float(row["roundtrip_cost"] or 0),
-                residual=residual,
+                raw=raw,
+                gross=forward + float(row["roundtrip_cost"] or 0),
                 now=moment,
+                weight=uniqueness.get(idx, 1.0),
             )
-        if isinstance(feats, dict) and feats and is_directional(source):
-            al.update_linear_model(db_path, engine, MICRO_MODEL, feats, residual, now=moment)
+        if isinstance(feats, dict) and feats and idx in pre_micro:
+            al.update_linear_model(db_path, engine, MICRO_MODEL, feats, forward - pre_micro[idx], now=moment, weight=uniqueness.get(idx, 1.0))
             stats["micro_updates"] += 1
     stats["backups"] = backups
     return stats
