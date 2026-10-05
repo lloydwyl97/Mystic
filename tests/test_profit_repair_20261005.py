@@ -408,6 +408,24 @@ def test_loss_memory_decays_so_later_evidence_can_recover(tmp_path):
     assert _day(fresh, "XRPUSDT", "RANGE_BOUNCE", "r", at=T0)["expected_net"] < 0.0
 
 
+def test_regime_tag_reads_production_datetime_bars_live_and_as_of(tmp_path):
+    db = str(tmp_path / "bars.db")
+
+    def stamp(epoch):
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(epoch)) + ".000000"
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE feature_ohlcv (id INTEGER NOT NULL, symbol VARCHAR(32), interval VARCHAR(8), open FLOAT, high FLOAT, low FLOAT, close FLOAT, volume FLOAT, ts DATETIME, PRIMARY KEY (id))"
+        )
+        hourly = [("BTC-USDT", "1h", 100.0 + i, 100.5 + i, 99.5 + i, 100.0 + i, 1.0, stamp(T0 - 3600 * (30 - i))) for i in range(30)]
+        quarter = [("BTC-USDT", "15m", 120.0, 120.4, 119.6, 120.0, 1.0, stamp(T0 - 900 * (40 - i))) for i in range(40)]
+        conn.executemany("INSERT INTO feature_ohlcv (symbol, interval, open, high, low, close, volume, ts) VALUES (?,?,?,?,?,?,?,?)", hourly + quarter)
+    assert al.market_regime_tag(db, "BTCUSDT").startswith("btcup_")
+    assert al.market_regime_tag(db, "BTCUSDT", as_of=T0 - 3600).startswith("btcup_")
+    assert al.market_regime_tag(db, "BTCUSDT", as_of=T0 - 3600 * 27) == ""
+
+
 def test_decisions_read_the_data_clock_not_the_wall_clock(tmp_path):
     db = str(tmp_path / "w.db")
     for _ in range(4):

@@ -1655,15 +1655,15 @@ def _ohlc_rows(conn: sqlite3.Connection, symbol: str, interval: str, limit: int,
     """Newest-last (ts asc) high/low/close for a symbol+interval, across name variants.
 
     ``as_of`` restricts to bars opened before that epoch (historical replay).
+    Live reads carry no bound: ``ts`` is DATETIME (numeric affinity), so a
+    numeric-looking sentinel would compare below every text timestamp.
     """
     raw = str(symbol or "").upper().replace("-", "").replace("/", "")
-    before = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(as_of))) if as_of is not None else "9999"
+    bound = () if as_of is None else (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(as_of))),)
+    sql = f"SELECT ts, high, low, close FROM feature_ohlcv WHERE symbol=? AND interval=?{' AND ts<?' if bound else ''} ORDER BY ts DESC LIMIT ?"
     for variant in (raw, raw.replace("USDT", "-USDT"), raw.replace("USDT", "/USDT")):
         try:
-            rows = conn.execute(
-                "SELECT ts, high, low, close FROM feature_ohlcv WHERE symbol=? AND interval=? AND ts<? ORDER BY ts DESC LIMIT ?",
-                (variant, interval, before, int(limit)),
-            ).fetchall()
+            rows = conn.execute(sql, (variant, interval, *bound, int(limit))).fetchall()
         except sqlite3.Error:
             return []
         if rows:
