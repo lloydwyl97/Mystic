@@ -12,7 +12,7 @@ feature, never the expected move: the gross mean and ``claim_capture`` are
 learned from realized gross moves of claims (admitted or not) with zero priors,
 so geometry, ATR or a floor alone produces an expected move of 0 and a
 candidate priced at minus its cost. ``adaptive_residual`` is the key's gross
-mean against its setup's, bounded. ``micro_residual`` is the bounded
+mean against its setup's, bounded and never positive. ``micro_residual`` is the bounded
 microstructure tilt times its learned weight in [0, 1]; it may lower a
 candidate but never lifts one that is not already positive. All learned terms
 are read from state of the current economic version, pooled hierarchically.

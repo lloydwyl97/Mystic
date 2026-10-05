@@ -155,3 +155,17 @@ def test_universe_slots_and_exits_are_unchanged():
     src = inspect.getsource(PortfolioEngineIntegration._fund_day_v2_candidate)
     assert "NO_EXECUTABLE_NET_EDGE" in src
     assert "check_frequency_limit" not in inspect.getsource(PortfolioEngineIntegration._process_day_v2_signals)
+
+
+def test_unfired_day_contexts_are_unlearnable_shadow_evidence(tmp_path):
+    import sqlite3
+
+    db = str(tmp_path / "shadow.db")
+    PortfolioEngineIntegration._record_day_context_shadow(db, symbol="XRPUSDT", setup="BREAKOUT_CONTINUATION", ask_price=1.5, as_of=T0)
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute("SELECT signaled, candidate_state, filled FROM adaptive_candidate_markouts WHERE engine_id='DAY_V2'").fetchall()
+    assert rows == [(0, al.CANDIDATE_NEAR_QUALIFIED, 0)]
+    assert al.CANDIDATE_NEAR_QUALIFIED not in al.LEARNABLE_DAY_STATES
+    src = inspect.getsource(PortfolioEngineIntegration._process_day_v2_signals)
+    assert "if signal is not fired:" in src
+    assert src.index("_record_day_context_shadow") < src.index("self._admit_day_context_candidate(")

@@ -1753,7 +1753,11 @@ class PortfolioEngineIntegration:
                         logger.warning("DAY_V2_HARD_DATA_REJECT symbol=%s reason=MISSING_EXECUTABLE_PRICE", symbol)
                         continue
 
+                    # Unfired structural contexts are shadow evidence only; funding them lost out of sample.
                     for signal in signals:
+                        if signal is not fired:
+                            self._record_day_context_shadow(db_path, symbol=symbol, setup=signal.setup, ask_price=ask_price, as_of=as_of)
+                            continue
                         self._admit_day_context_candidate(
                             candidates,
                             db_path=db_path,
@@ -1804,6 +1808,27 @@ class PortfolioEngineIntegration:
 
         except Exception:
             logger.warning("DAY_V2_PROCESS_ERROR", exc_info=True)
+
+    @staticmethod
+    def _record_day_context_shadow(db_path: str, *, symbol: str, setup: str, ask_price: float, as_of: float) -> None:
+        try:
+            from backend.config.trading_economics import canonical_roundtrip_cost_pct
+            from backend.services.adaptive_learning import CANDIDATE_NEAR_QUALIFIED, market_regime_tag, record_candidate
+
+            record_candidate(
+                db_path,
+                engine="DAY_V2",
+                symbol=symbol,
+                setup=setup,
+                regime=market_regime_tag(db_path, symbol) or "",
+                ref_price=ask_price,
+                roundtrip_cost=canonical_roundtrip_cost_pct(),
+                signaled=False,
+                evaluated_at=as_of,
+                candidate_state=CANDIDATE_NEAR_QUALIFIED,
+            )
+        except Exception:
+            logger.debug("DAY_V2_CONTEXT_SHADOW_RECORD_FAILED symbol=%s", symbol, exc_info=True)
 
     @staticmethod
     def _admit_day_context_candidate(

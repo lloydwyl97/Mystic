@@ -149,10 +149,10 @@ def test_negative_gross_evidence_prices_a_large_projection_below_cost(tmp_path):
     assert not edge.eligible
 
 
-def test_key_residual_is_bounded_by_the_residual_cap():
+def test_key_residual_is_bounded_and_can_only_lower():
     assert al.SCALP_RESIDUAL_MAX == 0.006
     assert al.scalp_expected_gross(_view(0.0, -0.05), 0.002)["adaptive"] == pytest.approx(-0.006)
-    assert al.scalp_expected_gross(_view(0.0, 0.05), 0.002)["adaptive"] == pytest.approx(0.006)
+    assert al.scalp_expected_gross(_view(0.0, 0.05), 0.002)["adaptive"] == 0.0
 
 
 def test_atr_rows_never_reach_the_claim_calibration(tmp_path):
@@ -241,19 +241,19 @@ def test_size_reads_final_edge_and_learned_risk_within_bounds():
 
 
 def test_final_edge_starts_from_the_current_candidates_calibrated_move():
-    view = _view(0.0008, 0.0011, claim_capture=0.5, claim_raw_center=0.0010, micro_residual=-0.0001)
+    view = _view(0.0008, 0.0005, claim_capture=0.5, claim_raw_center=0.0010, micro_residual=-0.0001)
     a = _edge(view, 0.0010, spread=0.0001, impact=0.00005)
     b = _edge(view, 0.0014, spread=0.0001, impact=0.00005)
     cost = canonical_roundtrip_cost_pct(spread_pct=0.0001, buy_impact_pct=0.00005)
     assert a.live_cost_pct == pytest.approx(cost)
     assert a.calibrated_move_pct == pytest.approx(0.0008)
     assert a.base_executable_edge_pct == pytest.approx(0.0008 - cost)
-    assert a.final_executable_edge_pct == pytest.approx(0.0008 - cost + 0.0003 - 0.0001)
+    assert a.final_executable_edge_pct == pytest.approx(0.0008 - cost - 0.0003 - 0.0001)
     assert b.final_executable_edge_pct - a.final_executable_edge_pct == pytest.approx(0.5 * 0.0004)
 
 
 def test_adaptive_and_micro_residuals_are_separate_from_base():
-    e = _edge(_view(0.003, 0.0032, micro_residual=0.0001), 0.0012)
+    e = _edge(_view(0.003, 0.0028, micro_residual=0.0001), 0.0012)
     d = e.as_dict()
     keys = ("raw_expected_move_pct", "calibrated_move_pct", "expected_move_pct", "live_cost_pct", "base_executable_edge_pct")
     keys += ("adaptive_residual_pct", "micro_residual_pct", "final_executable_edge_pct", "confidence")
@@ -261,7 +261,7 @@ def test_adaptive_and_micro_residuals_are_separate_from_base():
         assert key in d
     assert d["base_executable_edge_pct"] == pytest.approx(d["calibrated_move_pct"] - d["live_cost_pct"])
     assert d["calibrated_move_pct"] == pytest.approx(0.003)
-    assert d["adaptive_residual_pct"] == pytest.approx(0.0002)
+    assert d["adaptive_residual_pct"] == pytest.approx(-0.0002)
     assert d["micro_residual_pct"] == pytest.approx(0.0001)
 
 
@@ -274,9 +274,10 @@ def test_micro_cannot_lift_a_non_positive_candidate():
     down = _edge(_view(cost + 0.0002, micro_residual=-0.0015), 0.002)
     assert down.micro_residual_pct == pytest.approx(-0.0015)
     assert not down.eligible
-    lifted = _edge(_view(cost - 0.0002, cost + 0.0002, micro_residual=0.0005), 0.002)
-    assert lifted.micro_residual_pct == pytest.approx(0.0005)
-    assert lifted.eligible
+    key_above = _edge(_view(cost - 0.0002, cost + 0.0002, micro_residual=0.0005), 0.002)
+    assert key_above.adaptive_residual_pct == 0.0
+    assert key_above.micro_residual_pct == 0.0
+    assert not key_above.eligible
 
 
 def test_micro_model_clamp_is_unchanged():
