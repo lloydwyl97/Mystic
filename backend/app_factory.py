@@ -13,7 +13,6 @@ import contextlib
 import logging
 import os
 import sys
-import tracemalloc
 
 # CRITICAL FIX: Force IPv4 for ALL connections (Binance US requirement)
 # Binance US returns error: {"code":-71012,"msg":"IPv6 not supported"}
@@ -390,13 +389,6 @@ SKIP_HEAVY_SERVICES = os.getenv("SKIP_HEAVY_SERVICES", "0").lower() in ("1", "tr
 async def lifespan(app: FastAPI):
     """Startup/shutdown. Starts portfolio integration in this process so /api/portfolio-engine/status and canonical reconcile share the same engine."""
     logger.info("[LIFESPAN] Backend starting")
-
-    # Minimal setup - just prepare for API requests
-    try:
-        tracemalloc.start()
-        logger.debug("Tracemalloc enabled for debugging")
-    except Exception as e:
-        logger.debug(f"Tracemalloc failed: {e}")
 
     # ================================================================
     # BUG #6 FIX: CENTRALIZED SCHEMA INITIALIZATION (BEFORE all services)

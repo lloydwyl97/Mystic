@@ -4,6 +4,7 @@ dust-aware position invariants."""
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import json
@@ -12,6 +13,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -756,3 +758,17 @@ def test_blank_timestamp_fill_never_overwrites_a_recorded_venue_time(tmp_path):
     assert recorded_order_sides(db) == {("77", "BUY"): False}
     assert fill_blank_exchange_timestamps(db, [("2030-01-01T00:00:00+00:00", "77", "BUY")]) == 0
     assert fills_for_order(db, "77")[0]["event_ts_exchange"] == "2026-10-04T22:02:59.039000+00:00"
+
+
+# ------------------------------------------------- API process allocation tracing
+
+
+def test_backend_app_never_enables_allocation_tracing():
+    """The API process hosts the depth collector and every endpoint; tracing multiplies the cost of each allocation there."""
+    tree = ast.parse((Path(__file__).resolve().parents[1] / "backend" / "app_factory.py").read_text())
+    starts = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "start" and isinstance(node.func.value, ast.Name) and node.func.value.id == "tracemalloc"
+    ]
+    assert starts == []
