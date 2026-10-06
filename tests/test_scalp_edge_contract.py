@@ -97,8 +97,8 @@ def test_insufficient_history_is_hard_block():
     tr = MomentumTracker()
     tr.record("BTCUSDT", 1000.0, 100.0, 100.0)
     rc = rank_setup_signal(_sig(passed=False, reason="NOT_NEAR_SUPPORT"), regime="RANGE", ctx=_ctx(_bars(30, 0.012), mom=tr.diagnostics("BTCUSDT", 1000.0, 100.0, 100.0)))
-    assert rc.hard_block == "INSUFFICIENT_HISTORY"
-    assert "INSUFFICIENT_HISTORY" in HARD_REJECT_REASONS
+    assert rc.hard_block == "MISSING_REQUIRED_MEASUREMENT"
+    assert "MISSING_REQUIRED_MEASUREMENT" in HARD_REJECT_REASONS
 
 
 def test_opinion_reject_is_priced_and_cold_net_does_not_trade():

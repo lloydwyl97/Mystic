@@ -43,7 +43,7 @@ HARD_REJECT_REASONS: frozenset[str] = frozenset(
         "INSUFFICIENT_BARS",
         "STALE_DATA",
         "MOMENTUM_DATA_INSUFFICIENT",
-        "INSUFFICIENT_HISTORY",
+        "MISSING_REQUIRED_MEASUREMENT",
         "NO_EXECUTABLE_EDGE_ESTIMATE",
         "NO_EXECUTABLE_NET_EDGE",
     }
@@ -321,7 +321,7 @@ def rank_setup_signal(
             signal=sig,
             rank_score=0.0,
             entry_eligible=False,
-            hard_block="INSUFFICIENT_HISTORY",
+            hard_block="MISSING_REQUIRED_MEASUREMENT",
             regime=regime,
             regime_native=native,
             soft_reason=sig.reject_reason,

@@ -496,6 +496,7 @@ def _lattice(
     weights: dict[str, float],
     prior: float,
     now: float | None = None,
+    include_engine: bool = False,
 ) -> dict[str, Any]:
     """Hierarchical posterior mean of a (weighted) metric set at one key.
 
@@ -503,7 +504,8 @@ def _lattice(
     prior, each nested level from SETUP to KEY is the mean of all evidence
     inside it, shrunk toward the level above by ``PRIOR_STRENGTH / (PRIOR_STRENGTH + W)``.
     With no evidence at a level the parent passes through unchanged. There is no
-    sample floor. The ENGINE level (all setups) is computed for audit only.
+    sample floor. The ENGINE level moves the posterior only when
+    ``include_engine`` is set. Entry estimates leave it off.
     """
     sym, stp, reg = _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower()
     moment = float(now) if now is not None else _data_clock(rows)
@@ -533,7 +535,7 @@ def _lattice(
         w = sum(acc[lvl][0] for lvl in inner)
         s = sum(acc[lvl][1] for lvl in inner)
         nested_w[level] = w
-        if level == "engine":
+        if level == "engine" and not include_engine:
             level_means[level] = (PRIOR_STRENGTH * prior + s) / (PRIOR_STRENGTH + w)
             continue
         mu = (PRIOR_STRENGTH * mu + s) / (PRIOR_STRENGTH + w)
@@ -560,14 +562,29 @@ def _lattice(
     }
 
 
-def estimate(db_path: str, engine: str, symbol: str, setup: str, regime: str, metric: str, *, now: float | None = None) -> dict[str, Any]:
-    """Hierarchical shrunk mean of one metric at one key (see ``_lattice``)."""
+def estimate(
+    db_path: str,
+    engine: str,
+    symbol: str,
+    setup: str,
+    regime: str,
+    metric: str,
+    *,
+    now: float | None = None,
+    include_engine: bool = False,
+) -> dict[str, Any]:
+    """Hierarchical shrunk mean of one metric at one key (see ``_lattice``).
+
+    ``include_engine`` lets continuation borrow across setups of the same
+    engine. Entry estimates leave it false, so one setup's trades never move
+    another setup's expected net.
+    """
     engine_id = str(engine or "").upper()
     prior = _prior(engine_id, metric)
     if engine_id not in _PRIORS:
         return {"mean": prior, "n": 0.0, "prior": prior, "parent": prior, "confidence": 0.0, "sd": 0.0, "version": ADAPTIVE_STATE_VERSION}
     rows = _state_rows(db_path, engine_id, (metric,))
-    return _lattice(rows, engine_id=engine_id, symbol=symbol, setup=setup, regime=regime, weights={metric: 1.0}, prior=prior, now=now)
+    return _lattice(rows, engine_id=engine_id, symbol=symbol, setup=setup, regime=regime, weights={metric: 1.0}, prior=prior, now=now, include_engine=include_engine)
 
 
 def _tilt(mean: float, prior: float) -> float:
@@ -667,7 +684,7 @@ def continuation_terminal(
     engine_id = str(engine or "").upper()
     if engine_id not in _PRIORS:
         return None
-    remaining = estimate(db_path, engine_id, symbol, setup, regime, hold_remaining_metric(mark), now=now)
+    remaining = estimate(db_path, engine_id, symbol, setup, regime, hold_remaining_metric(mark), now=now, include_engine=True)
     mean = float(remaining["mean"])
     if not math.isfinite(mean):
         return None

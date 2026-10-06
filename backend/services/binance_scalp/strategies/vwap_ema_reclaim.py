@@ -79,7 +79,7 @@ class VwapEmaReclaimStrategy:
 
         mom = ctx.mom
         if mom.insufficient_history:
-            return reject_signal(ctx, self.name, "INSUFFICIENT_HISTORY")
+            return reject_signal(ctx, self.name, "MISSING_REQUIRED_MEASUREMENT")
         # Paper: require reclaim impulse without demanding perfect 60s lift
         # (strict >0 on 60s was a major NO_PULLBACK_RECOVERY reject pile).
         if ctx.config.scalp_paper_enabled:

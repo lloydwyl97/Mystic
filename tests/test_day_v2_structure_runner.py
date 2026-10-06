@@ -344,11 +344,12 @@ def test_scalp_soft_opinions_do_not_veto_and_history_is_market_data():
 
     soft = {"NOT_NEAR_SUPPORT", "NO_REJECTION_WICK", "WEAK_REJECTION_WICK", "MOMENTUM_NOT_FLIPPED", "RANGE_TOO_WIDE", "REGIME_BLOCKED"}
     assert soft.isdisjoint(HARD_REJECT_REASONS)
-    hard = {"SPREAD_TOO_WIDE", "DEPTH_OR_IMPACT_FAIL", "NO_EXECUTABLE_NET_EDGE", "NO_EXECUTABLE_EDGE_ESTIMATE", "INSUFFICIENT_BARS", "INSUFFICIENT_HISTORY", "STALE_DATA"}
+    hard = {"SPREAD_TOO_WIDE", "DEPTH_OR_IMPACT_FAIL", "NO_EXECUTABLE_NET_EDGE", "NO_EXECUTABLE_EDGE_ESTIMATE", "INSUFFICIENT_BARS", "MISSING_REQUIRED_MEASUREMENT", "STALE_DATA"}
     assert hard <= HARD_REJECT_REASONS
     assert classify_scalp_candidate({"entry_eligible": True, "hard_block": None, "soft_reason": "NOT_NEAR_SUPPORT", "executable_edge": {"final_executable_edge_pct": 0.0004}})[0] == "ARMED"
     assert classify_scalp_candidate({"entry_eligible": False, "hard_block": "NO_EXECUTABLE_NET_EDGE"})[0] == "REJECTED:NO_EXECUTABLE_NET_EDGE"
-    assert classify_scalp_candidate({"entry_eligible": False, "hard_block": "INSUFFICIENT_HISTORY"})[0] == "REJECTED:INSUFFICIENT_HISTORY"
+    assert classify_scalp_candidate({"entry_eligible": False, "hard_block": "MISSING_REQUIRED_MEASUREMENT"})[0] == "REJECTED:MISSING_REQUIRED_MEASUREMENT"
+    assert classify_scalp_candidate({"entry_eligible": False, "hard_block": "INSUFFICIENT_HISTORY"})[0] == "REJECTED:MISSING_REQUIRED_MEASUREMENT"
     assert "insufficient_windows" in inspect.getsource(MomentumDiagnostics)
     blocked, _reason, stats = arm_blocked("ZZZUSDT", "range_bounce_scalp", db_path=":memory:")
     assert blocked is False

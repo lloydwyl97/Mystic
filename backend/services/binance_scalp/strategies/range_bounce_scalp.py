@@ -80,7 +80,7 @@ class RangeBounceScalpStrategy:
 
         mom = ctx.mom
         if mom.insufficient_history:
-            return reject_signal(ctx, self.name, "INSUFFICIENT_HISTORY")
+            return reject_signal(ctx, self.name, "MISSING_REQUIRED_MEASUREMENT")
         if not (mom.bid_change_15s > 0 and mom.mid_change_15s > 0 and mom.mid_change_30s > 0):
             return reject_signal(ctx, self.name, "MOMENTUM_NOT_FLIPPED")
         if mom.bid_change_60s < -0.0001:
