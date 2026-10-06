@@ -6,7 +6,7 @@
   mystic_maintenance.py status                           print the last run summary
 
 Owner-only subcommands (invoked by ``run`` via runuser so DB files stay mystic-owned):
-  backup-create [--dry-run] | backup-verify [--dry-run] | backup-retention --mode M [--dry-run] | db-report [--dry-run] | db-retention [--dry-run]
+  backup-create [--dry-run] | backup-verify [--dry-run] | backup-adopt [--dry-run] | backup-retention --mode M [--dry-run] | db-report [--dry-run] | db-retention [--dry-run]
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from backend.services import mystic_maintenance as m
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("task", choices=["run", "post-reboot-verify", "status", "backup-create", "backup-verify", "backup-retention", "db-report", "db-retention"])
+    parser.add_argument("task", choices=["run", "post-reboot-verify", "status", "backup-create", "backup-verify", "backup-adopt", "backup-retention", "db-report", "db-retention"])
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-reboot", action="store_true")
     parser.add_argument("--mode", default="normal", choices=["normal", "aggressive", "critical"])
@@ -47,6 +47,8 @@ def main(argv: list[str] | None = None) -> int:
         out = m.create_backup(cfg, dry_run=args.dry_run)
     elif args.task == "backup-verify":
         out = m.verify_unverified_backups(cfg, dry_run=args.dry_run)
+    elif args.task == "backup-adopt":
+        out = m.adopt_deploy_snapshots(cfg, dry_run=args.dry_run)
     elif args.task == "backup-retention":
         out = m.apply_backup_retention(cfg, mode=args.mode, dry_run=args.dry_run, opened=m.open_paths())
     elif args.task == "db-report":

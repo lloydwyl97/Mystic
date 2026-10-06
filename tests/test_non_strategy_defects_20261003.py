@@ -482,7 +482,8 @@ def test_fresh_or_open_backup_is_deferred(mcfg):
     assert out["deferred"] == [fresh.name]
 
 
-def test_adopted_backup_is_never_deleted_by_retention(mcfg):
+def test_adopted_backup_follows_retention_unless_pinned(mcfg):
+    """Ocean 2026-10-06: two adopted Oct 3 backups were immortal. Only a pin keeps one forever."""
     adopted = _sqlite_backup(mcfg, NOW - timedelta(days=40))
     m.verify_unverified_backups(mcfg, dry_run=False, opened=set())
     for d in range(0, 20):
@@ -490,7 +491,10 @@ def test_adopted_backup_is_never_deleted_by_retention(mcfg):
         m.manifest_path_for(p).write_text(json.dumps({"integrity": "ok", "sha256": m.sha256_file(p), "reason": "scheduled"}))
     res = m.apply_backup_retention(mcfg, mode="aggressive", dry_run=True, opened=set(), now=NOW, compress=lambda _info: {"status": "ok"})
     deleted = {Path(a["path"]).name for a in res.get("actions", []) if a.get("action") == "delete_backup"}
-    assert deleted
+    assert adopted.name in deleted
+    (mcfg.backup_dir / f"{adopted.name}.pin").write_text("")
+    res = m.apply_backup_retention(mcfg, mode="aggressive", dry_run=True, opened=set(), now=NOW, compress=lambda _info: {"status": "ok"})
+    deleted = {Path(a["path"]).name for a in res.get("actions", []) if a.get("action") == "delete_backup"}
     assert adopted.name not in deleted
 
 

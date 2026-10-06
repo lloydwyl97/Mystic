@@ -564,8 +564,11 @@ def create_backup(cfg: MaintConfig, *, dry_run: bool, reason: str = "scheduled")
 
 
 ADOPT_MIN_AGE_SEC = 600
-# Not created by this module, so retention may compress but never deletes it.
+# Not created by this module. Once verified it follows the same keep/compress/delete
+# policy as scheduled backups; a pin is the only way to keep one forever.
 ADOPTED_REASON = "adopted_unverified"
+DEPLOY_SNAPSHOT_REASON = "deploy_snapshot"
+DEPLOY_SNAPSHOT_GLOB = "mystic_trading*.db"
 
 
 def verify_unverified_backups(
@@ -620,6 +623,109 @@ def verify_unverified_backups(
         out["verified"].append({"name": info.path.name, "sha256": manifest["sha256"]})
         logger.info("MAINT backup_verified %s", json.dumps({"name": info.path.name, "reason": ADOPTED_REASON}))
     return out
+
+
+def deploy_snapshot_candidates(cfg: MaintConfig) -> list[Path]:
+    """Raw DB snapshots left in the backups root (or one directory below) by deploys."""
+    root = cfg.backups_root
+    found: list[Path] = []
+    if not root.is_dir():
+        return found
+    for entry in sorted(root.iterdir()):
+        if entry.is_symlink() or entry == cfg.backup_dir:
+            continue
+        children = sorted(entry.iterdir()) if entry.is_dir() else [entry]
+        found += [p for p in children if p.is_file() and not p.is_symlink() and fnmatch.fnmatch(p.name, DEPLOY_SNAPSHOT_GLOB)]
+    live = cfg.live_db.resolve()
+    return [p for p in found if p.resolve() != live]
+
+
+def _catalog_path(cfg: MaintConfig, ts: datetime) -> Path:
+    while True:
+        final = cfg.backup_dir / backup_name(ts)
+        if not final.exists() and not Path(f"{final}.gz").exists() and not manifest_path_for(final).exists():
+            return final
+        ts += timedelta(seconds=1)
+
+
+def adopt_deploy_snapshots(
+    cfg: MaintConfig,
+    *,
+    dry_run: bool,
+    opened: set[str] | None = None,
+    limit: int = 1,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Move verified deploy-time snapshots into the catalog so retention manages them.
+
+    Integrity and SHA-256 are proven before the move; a failing file is reported and
+    left where it is. Recent, open, WAL-pending or cross-filesystem files are skipped.
+    """
+    ref = (now or utc_now()).timestamp()
+    pending = deploy_snapshot_candidates(cfg)
+    out: dict[str, Any] = {"status": "ok", "found": len(pending), "adopted": [], "failed": [], "deferred": [], "skipped": []}
+    if pending and not dry_run:
+        cfg.backup_dir.mkdir(parents=True, exist_ok=True)
+    for path in pending:
+        if len(out["adopted"]) + len(out["failed"]) >= limit:
+            out["deferred"].append(str(path))
+            continue
+        st = path.stat()
+        if ref - st.st_mtime < ADOPT_MIN_AGE_SEC or _is_open(path, opened if opened is not None else open_paths()):
+            out["deferred"].append(str(path))
+            continue
+        wal = Path(f"{path}-wal")
+        if wal.exists() and wal.stat().st_size > 0:
+            out["skipped"].append({"path": str(path), "reason": "wal_not_empty"})
+            continue
+        if cfg.backup_dir.exists() and st.st_dev != cfg.backup_dir.stat().st_dev:
+            out["skipped"].append({"path": str(path), "reason": "other_filesystem"})
+            continue
+        ts = datetime.fromtimestamp(int(st.st_mtime), tz=timezone.utc)
+        final = _catalog_path(cfg, ts)
+        if dry_run:
+            out["adopted"].append({"origin": str(path), "name": final.name, "bytes": st.st_size, "dry_run": True})
+            continue
+        try:
+            integrity = sqlite_integrity(path, immutable=True)
+        except sqlite3.Error as exc:
+            integrity = f"unreadable: {exc}"
+        if integrity != "ok":
+            out["failed"].append({"path": str(path), "integrity": integrity[:200]})
+            out["status"] = "error"
+            out["error"] = f"deploy snapshot failed integrity_check: {path}"
+            continue
+        manifest = {
+            "name": final.name,
+            "source": DEPLOY_SNAPSHOT_REASON,
+            "origin": str(path),
+            "created_utc": _iso(ts),
+            "verified_utc": _iso(utc_now()),
+            "integrity": "ok",
+            "sha256": sha256_file(path),
+            "bytes": st.st_size,
+            "compressed": False,
+            "reason": DEPLOY_SNAPSHOT_REASON,
+        }
+        _write_json_atomic(manifest_path_for(final), manifest)
+        path.rename(final)
+        for suffix in ("-wal", "-shm"):
+            Path(f"{path}{suffix}").unlink(missing_ok=True)
+        _chown(final, cfg.owner)
+        _chown(manifest_path_for(final), cfg.owner)
+        out["adopted"].append({"origin": str(path), "name": final.name, "sha256": manifest["sha256"], "bytes": st.st_size})
+        logger.info("MAINT deploy_snapshot_adopted %s", json.dumps({"origin": str(path), "name": final.name}))
+    return out
+
+
+def unmanaged_backups(cfg: MaintConfig) -> list[dict[str, Any]]:
+    """Everything in the backups root outside the catalog, largest first, so nothing hides."""
+    root = cfg.backups_root
+    if not root.is_dir():
+        return []
+    now = time.time()
+    rows = [{"name": p.name, "bytes": _size(p), "age_days": round((now - _newest_mtime(p)) / 86400.0, 2)} for p in root.iterdir() if p != cfg.backup_dir and not p.is_symlink()]
+    return sorted(rows, key=lambda r: r["bytes"], reverse=True)
 
 
 def compress_backup(info: BackupInfo, *, owner: str = "mystic") -> dict[str, Any]:
@@ -681,8 +787,6 @@ def apply_backup_retention(
     for b in backups:
         if b.path in keep or not b.verified or b.path.name in pinned or (newest and b.path == newest.path):
             continue
-        if b.manifest.get("reason") == ADOPTED_REASON:
-            continue
         if _is_open(b.path, opened):
             _action(actions, "skip_open_backup", b.path, dry_run=dry_run)
             continue
@@ -707,8 +811,11 @@ def apply_backup_retention(
             reclaimed += size - int(res.get("bytes_after") or 0)
         else:
             errors.append(f"compress {b.path.name}: {res.get('error')}")
+    unmanaged = unmanaged_backups(cfg)
     return {
         "backups": len(backups),
+        "unmanaged": unmanaged,
+        "unmanaged_bytes": sum(r["bytes"] for r in unmanaged),
         "kept": sorted(p.name for p in keep),
         "pinned": sorted(n for n in pinned if BACKUP_RE.match(n)),
         "newest_verified": newest.path.name if newest else None,
@@ -1229,6 +1336,7 @@ def maintenance_status_summary(cfg: MaintConfig | None = None) -> dict[str, Any]
         "free_gb": disk.get("fs_free_gb"),
         "live_db_gb": round((disk.get("live_db_bytes") or 0) / GIB, 3) if disk else None,
         "backup_gb": round((disk.get("backup_bytes") or 0) / GIB, 3) if disk else None,
+        "backup_unmanaged_gb": round((backup.get("unmanaged_bytes") or 0) / GIB, 3) if backup else None,
         "last_backup_verified_utc": verified_utc,
         "last_retention_run_utc": s.get("finished_utc") if backup else None,
         "bytes_reclaimed": s.get("bytes_reclaimed"),
@@ -1295,6 +1403,9 @@ def run_maintenance(
             report["backup_verify"] = owner_task("backup-verify", *(["--dry-run"] if dry_run else []))
             if report["backup_verify"].get("status") == "error":
                 report["errors"].append(f"backup_verify: {report['backup_verify'].get('error')}")
+            report["backup_adopt"] = owner_task("backup-adopt", *(["--dry-run"] if dry_run else []))
+            if report["backup_adopt"].get("status") == "error":
+                report["errors"].append(f"backup_adopt: {report['backup_adopt'].get('error')}")
             # In-process (root) so files held open by any user's process are visible.
             report["backup_retention"] = apply_backup_retention(cfg, mode=mode, dry_run=dry_run, opened=opened)
             report["errors"] += report["backup_retention"].get("errors", [])
