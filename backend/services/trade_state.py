@@ -149,6 +149,12 @@ class TradeStateStore:
                     return False, "ALREADY_IN_TRADE"
 
                 if state == "COOLDOWN":
+                    engine = str(engine_id or "").strip().upper()
+                    # A fixed post-exit wait is a frequency rule. DAY and SCALP
+                    # re-entry is controlled by learned value, slots, and cash.
+                    # IN_TRADE above still blocks a second lot in the same engine.
+                    if engine in {"DAY_V2", "SCALP_V2"}:
+                        return True, "ENTRY_ALLOWED"
                     cooldown_until = float(state_data.get("cooldown_until", 0) or 0)
                     if now_ts < cooldown_until:
                         return False, f"COOLDOWN_ACTIVE_UNTIL_{int(cooldown_until)}"

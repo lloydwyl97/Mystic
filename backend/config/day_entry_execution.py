@@ -69,6 +69,17 @@ def is_trailing_buy_confirmed(entry_authority: object) -> bool:
     return str(entry_authority or "") == ENTRY_AUTHORITY_TRAILING_BUY
 
 
+def learned_exit_contract_buy(entry_authority: object = "", fill_engine_id: object = "") -> bool:
+    """True when the live exit contract is catastrophic protection plus learned continuation.
+
+    Legacy thesis, stop, time, and reclaim checks are not that contract, so they
+    must not reject the buy.
+    """
+    engine = str(fill_engine_id or "").strip().upper()
+    authority = str(entry_authority or "")
+    return engine in {"DAY_V2", "SCALP_V2"} or authority in TOP4_LIVE_BUY_AUTHORITIES
+
+
 def trailing_buy_max_wait_seconds() -> int:
     raw = str(os.getenv(MAX_WAIT_ENV, str(DEFAULT_MAX_WAIT_SECONDS)) or "").strip()
     try:

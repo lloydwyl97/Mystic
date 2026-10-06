@@ -11161,7 +11161,12 @@ class PortfolioEngine:
 
         # =================================================================
         # ENTRY/EXIT CONSISTENCY — block buys the exit manager would cut immediately
+        # DAY_V2 / SCALP_V2 exits are catastrophic plus learned continuation.
+        # A legacy thesis/stop/time "would sell immediately" result is telemetry.
         # =================================================================
+        from backend.config.day_entry_execution import learned_exit_contract_buy
+
+        learned_contract = learned_exit_contract_buy(entry_authority, fill_engine_id)
         try:
             from backend.services.day_controlled_exits import evaluate_pre_buy_exit_consistency
             from backend.services.day_regime_router import _mtf_bundle, classify_day_regime
@@ -11212,9 +11217,9 @@ class PortfolioEngine:
                 context_payload=ctx_payload_ec,
                 thesis_score=float(getattr(explainability, "thesis_score", 0.0) or 0.0),
             )
-            if not consistency.get("allowed") and trailing_confirmed:
+            if not consistency.get("allowed") and (trailing_confirmed or learned_contract):
                 logger.info(
-                    "TELEMETRY_ENTRY_EXIT_CONSISTENCY symbol=%s reason=%s (DAY_TRAILING_BUY_CONFIRMED — not enforced)",
+                    "TELEMETRY_ENTRY_EXIT_CONSISTENCY symbol=%s reason=%s (learned exit contract — not enforced)",
                     symbol,
                     consistency.get("block_reason"),
                 )
@@ -11247,25 +11252,32 @@ class PortfolioEngine:
                     )
                 return None
         except Exception as exc:
-            logger.exception("BUY_BLOCKED_ENTRY_EXIT_CONSISTENCY_ERROR symbol=%s err=%s", symbol, exc)
-            await self._record_reject(
-                symbol,
-                "BUY",
-                f"entry_exit_consistency_error:{exc!s}",
-                "ENTRY_EXIT_INCONSISTENT",
-                decision_id=decision_id,
-                explainability=explainability,
-            )
-            if decision_id:
-                await self._update_pipeline_decision(
-                    decision_id,
-                    {
-                        "stage": "EXECUTION",
-                        "execution_result": "NOT_EXECUTED",
-                        "execution_reason": "ENTRY_EXIT_INCONSISTENT:gate_error",
-                    },
+            if trailing_confirmed or learned_contract:
+                logger.info(
+                    "TELEMETRY_ENTRY_EXIT_CONSISTENCY_ERROR symbol=%s err=%s (learned exit contract — not enforced)",
+                    symbol,
+                    exc,
                 )
-            return None
+            else:
+                logger.exception("BUY_BLOCKED_ENTRY_EXIT_CONSISTENCY_ERROR symbol=%s err=%s", symbol, exc)
+                await self._record_reject(
+                    symbol,
+                    "BUY",
+                    f"entry_exit_consistency_error:{exc!s}",
+                    "ENTRY_EXIT_INCONSISTENT",
+                    decision_id=decision_id,
+                    explainability=explainability,
+                )
+                if decision_id:
+                    await self._update_pipeline_decision(
+                        decision_id,
+                        {
+                            "stage": "EXECUTION",
+                            "execution_result": "NOT_EXECUTED",
+                            "execution_reason": "ENTRY_EXIT_INCONSISTENT:gate_error",
+                        },
+                    )
+                return None
 
         bm_payload = {"buy_margin": getattr(explainability, "entry_buy_margin", None)}
         buy_margin_exec = resolve_buy_margin_from_payload(bm_payload)
