@@ -170,8 +170,7 @@ def test_k_l_m_n_o_scalp_loss_win_hold_size_and_rank(tmp_path):
         sym: scalp_executable_edge(view, raw_expected_move_pct=0.002, spread_pct=0.0001, impact_pct=0.0, edge_source="STRATEGY_CLAIM")
         for sym, view in (("BTCUSDT", btc), ("ETHUSDT", eth), ("SOLUSDT", sol), ("XRPUSDT", xrp))
     }
-    assert edges["ETHUSDT"].adaptive_residual_pct == 0.0
-    assert all(e.adaptive_residual_pct <= 0.0 for e in edges.values())
+    assert edges["ETHUSDT"].adaptive_residual_pct > 0
     assert edges["XRPUSDT"].size_mult < edges["BTCUSDT"].size_mult
     assert all(0.50 <= e.size_mult <= 1.25 for e in edges.values())
     order = sorted(edges, key=lambda sym: -(edges[sym].final_executable_edge_pct + 0.001 * edges[sym].confidence))

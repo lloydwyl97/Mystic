@@ -1753,11 +1753,10 @@ class PortfolioEngineIntegration:
                         logger.warning("DAY_V2_HARD_DATA_REJECT symbol=%s reason=MISSING_EXECUTABLE_PRICE", symbol)
                         continue
 
-                    # Unfired structural contexts are shadow evidence only; funding them lost out of sample.
+                    # Every representable state is priced. The detector names one state of a
+                    # family; the others keep their own learned key and stay at the neutral
+                    # prior until their own results are a positive net.
                     for signal in signals:
-                        if signal is not fired:
-                            self._record_day_context_shadow(db_path, symbol=symbol, setup=signal.setup, ask_price=ask_price, as_of=as_of)
-                            continue
                         self._admit_day_context_candidate(
                             candidates,
                             db_path=db_path,
@@ -1769,6 +1768,7 @@ class PortfolioEngineIntegration:
                             as_of=as_of,
                             bars_15m=bars_15m,
                             bars_1h=bars_1h,
+                            detector_fired=signal is fired,
                         )
 
                 except Exception:
@@ -1783,7 +1783,8 @@ class PortfolioEngineIntegration:
             resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts), path_low=lambda sym, a, b: ohlcv_low_between(db_path, sym, a, b))
             for cand in candidates:
                 sig = cand["signal"]
-                cand["adaptive"] = day_decision(db_path, cand["symbol"], sig.setup, str(cand.get("regime_tag") or ""), features=cand.get("state_features"))
+                cand["adaptive"] = day_decision(db_path, cand["symbol"], str(cand.get("learned_setup") or sig.setup), str(cand.get("regime_tag") or ""), features=cand.get("state_features"))
+                cand["adaptive"]["geometry_setup"] = sig.setup
             ranked = rank_day_candidates(candidates, list(DAY_V2_UNIVERSE), canonical_roundtrip_cost_pct())
             logger.info(
                 "DAY_V2_RANKED %s",
@@ -1810,27 +1811,6 @@ class PortfolioEngineIntegration:
             logger.warning("DAY_V2_PROCESS_ERROR", exc_info=True)
 
     @staticmethod
-    def _record_day_context_shadow(db_path: str, *, symbol: str, setup: str, ask_price: float, as_of: float) -> None:
-        try:
-            from backend.config.trading_economics import canonical_roundtrip_cost_pct
-            from backend.services.adaptive_learning import CANDIDATE_NEAR_QUALIFIED, market_regime_tag, record_candidate
-
-            record_candidate(
-                db_path,
-                engine="DAY_V2",
-                symbol=symbol,
-                setup=setup,
-                regime=market_regime_tag(db_path, symbol) or "",
-                ref_price=ask_price,
-                roundtrip_cost=canonical_roundtrip_cost_pct(),
-                signaled=False,
-                evaluated_at=as_of,
-                candidate_state=CANDIDATE_NEAR_QUALIFIED,
-            )
-        except Exception:
-            logger.debug("DAY_V2_CONTEXT_SHADOW_RECORD_FAILED symbol=%s", symbol, exc_info=True)
-
-    @staticmethod
     def _admit_day_context_candidate(
         candidates: list[dict[str, Any]],
         *,
@@ -1843,6 +1823,7 @@ class PortfolioEngineIntegration:
         as_of: float,
         bars_15m: list[dict[str, Any]],
         bars_1h: list[dict[str, Any]],
+        detector_fired: bool = False,
     ) -> None:
         """Add one structural DAY context. Setup opinions are not a veto.
 
@@ -1873,7 +1854,7 @@ class PortfolioEngineIntegration:
         except Exception:
             logger.warning("DAY_V2_STRUCTURAL_ZONE_ERROR symbol=%s", symbol, exc_info=True)
             return
-        from backend.services.adaptive_learning import market_regime_tag
+        from backend.services.adaptive_learning import day_learned_setup, market_regime_tag
         from backend.services.day_v2.live_signal import day_state_features
 
         candidates.append(
@@ -1881,6 +1862,7 @@ class PortfolioEngineIntegration:
                 "symbol": symbol,
                 "norm": norm,
                 "signal": signal,
+                "learned_setup": day_learned_setup(signal.setup, detector_fired=detector_fired),
                 "zone": zone,
                 "reclaim_level": reclaim_level,
                 "ask_price": ask_price,
@@ -1919,7 +1901,7 @@ class PortfolioEngineIntegration:
             db_path,
             engine="DAY_V2",
             symbol=cand["symbol"],
-            setup=signal.setup,
+            setup=str(cand.get("learned_setup") or signal.setup),
             regime=str(cand.get("regime_tag") or ""),
             ref_price=float(cand["ask_price"]),
             roundtrip_cost=canonical_roundtrip_cost_pct(),

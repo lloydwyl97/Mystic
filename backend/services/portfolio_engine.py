@@ -7198,11 +7198,11 @@ class PortfolioEngine:
                 _learn_regime = str(_adapt_dec.get("regime") or "")
                 _continuation = None
                 if str(_prov.get("engine_id") or "").upper() == "DAY_V2":
-                    from backend.services.adaptive_learning import continuation_ratio
+                    from backend.services.adaptive_learning import continuation_ratio, day_geometry_setup
                     from backend.services.day_v2.winner_contract import objective_level
 
                     _objective = objective_level(
-                        _learn_setup,
+                        day_geometry_setup(str(_adapt_dec.get("geometry_setup") or _learn_setup)),
                         float(entry_px or 0.0),
                         float(getattr(position, "day_atr_1h_at_entry", 0.0) or 0.0),
                         float(getattr(position, "day_objective_structural", 0.0) or 0.0),

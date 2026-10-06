@@ -157,15 +157,42 @@ def test_universe_slots_and_exits_are_unchanged():
     assert "check_frequency_limit" not in inspect.getsource(PortfolioEngineIntegration._process_day_v2_signals)
 
 
-def test_unfired_day_contexts_are_unlearnable_shadow_evidence(tmp_path):
-    import sqlite3
-
-    db = str(tmp_path / "shadow.db")
-    PortfolioEngineIntegration._record_day_context_shadow(db, symbol="XRPUSDT", setup="BREAKOUT_CONTINUATION", ask_price=1.5, as_of=T0)
-    with sqlite3.connect(db) as conn:
-        rows = conn.execute("SELECT signaled, candidate_state, filled FROM adaptive_candidate_markouts WHERE engine_id='DAY_V2'").fetchall()
-    assert rows == [(0, al.CANDIDATE_NEAR_QUALIFIED, 0)]
-    assert al.CANDIDATE_NEAR_QUALIFIED not in al.LEARNABLE_DAY_STATES
+def test_unfired_market_state_is_priced_and_does_not_inherit_the_fired_setup(tmp_path):
+    db = str(tmp_path / "pop.db")
+    fired_key = al.day_learned_setup("BREAKOUT_CONTINUATION", detector_fired=True)
+    market_key = al.day_learned_setup("BREAKOUT_CONTINUATION", detector_fired=False)
+    assert fired_key == "BREAKOUT_CONTINUATION"
+    assert market_key != fired_key
+    assert al.day_geometry_setup(market_key) == "BREAKOUT_CONTINUATION"
+    for _ in range(12):
+        al.observe(db, engine=DAY, symbol="XRPUSDT", setup=fired_key, regime="btcup_vollo", metric="trade_net", value=0.02, strategy_version=al.current_strategy_version(DAY), now=T0)
+    fired = al.day_decision(db, "XRPUSDT", fired_key, "btcup_vollo", now=T0)
+    market = al.day_decision(db, "XRPUSDT", market_key, "btcup_vollo", now=T0)
+    assert fired["expected_net"] > 0.0
+    assert market["expected_net"] == 0.0
     src = inspect.getsource(PortfolioEngineIntegration._process_day_v2_signals)
-    assert "if signal is not fired:" in src
-    assert src.index("_record_day_context_shadow") < src.index("self._admit_day_context_candidate(")
+    assert "if signal is not fired:" not in src
+    assert "detector_fired=signal is fired" in src
+
+
+def test_market_state_can_outrank_a_deteriorating_setup_without_a_code_change(tmp_path):
+    db = str(tmp_path / "rank.db")
+    ver = al.current_strategy_version(DAY)
+    fired_key = al.day_learned_setup("RANGE_BOUNCE", detector_fired=True)
+    market_key = al.day_learned_setup("BREAKOUT_CONTINUATION", detector_fired=False)
+    for _ in range(10):
+        al.observe(db, engine=DAY, symbol="BTCUSDT", setup=fired_key, regime="btcup_vollo", metric="trade_net", value=0.01, strategy_version=ver, now=T0)
+    winner = al.day_decision(db, "BTCUSDT", fired_key, "btcup_vollo", now=T0)
+    quiet = al.day_decision(db, "ETHUSDT", market_key, "btcup_vollo", now=T0)
+    ranked = rank_day_candidates([_cand("BTCUSDT", "RANGE_BOUNCE", winner), _cand("ETHUSDT", "BREAKOUT_CONTINUATION", quiet)], DAY_V2_UNIVERSE, 0.00066)
+    assert ranked[0]["symbol"] == "BTCUSDT"
+    for _ in range(16):
+        al.observe(db, engine=DAY, symbol="BTCUSDT", setup=fired_key, regime="btcup_vollo", metric="trade_net", value=-0.02, strategy_version=ver, now=T0)
+        al.observe(db, engine=DAY, symbol="ETHUSDT", setup=market_key, regime="btcup_vollo", metric="lifecycle_net", value=0.01, strategy_version=ver, now=T0)
+    faded = al.day_decision(db, "BTCUSDT", fired_key, "btcup_vollo", now=T0)
+    emerged = al.day_decision(db, "ETHUSDT", market_key, "btcup_vollo", now=T0)
+    assert emerged["expected_net"] > 0.0 > faded["expected_net"]
+    assert emerged["size_mult"] > faded["size_mult"]
+    ranked = rank_day_candidates([_cand("BTCUSDT", "RANGE_BOUNCE", faded), _cand("ETHUSDT", "BREAKOUT_CONTINUATION", emerged)], DAY_V2_UNIVERSE, 0.00066)
+    assert ranked[0]["symbol"] == "ETHUSDT"
+    assert ranked[0]["adaptive"]["setup"] == market_key

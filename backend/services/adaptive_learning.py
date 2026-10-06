@@ -120,6 +120,10 @@ CANDIDATE_QUALIFIED = "QUALIFIED"
 CANDIDATE_QUALIFIED_BLOCKED = "QUALIFIED_BLOCKED"
 CANDIDATE_NEAR_QUALIFIED = "NEAR_QUALIFIED"
 LEARNABLE_DAY_STATES = frozenset({"", CANDIDATE_QUALIFIED, CANDIDATE_QUALIFIED_BLOCKED})
+# A representable market state the handcrafted detector did not fire. It is a
+# separate learned population, not a funding ban: cold, its expectancy is the
+# neutral prior, and capital follows only once that expectancy is a positive net.
+DAY_MARKET_STATE_SUFFIX = "__MARKET"
 
 # Bound on the SCALP key's learned gross move against its setup's (the adaptive
 # residual). Equal to the claim cap.
@@ -608,6 +612,27 @@ def day_net_expectancy(db_path: str, symbol: str, setup: str, regime: str, *, no
     }
 
 
+def day_learned_setup(setup: str, *, detector_fired: bool) -> str:
+    """Population key for one DAY state.
+
+    The detector names a tighter state of the same family. An unfired structural
+    state does not inherit that state's evidence, and the suffix is not a
+    permission bit: ``day_decision`` prices either key the same way.
+    """
+    name = str(setup or "").upper()
+    if name.endswith(DAY_MARKET_STATE_SUFFIX):
+        name = name[: -len(DAY_MARKET_STATE_SUFFIX)]
+    return name if detector_fired else f"{name}{DAY_MARKET_STATE_SUFFIX}"
+
+
+def day_geometry_setup(setup: str) -> str:
+    """Setup family used for structure and the exit objective, without the learned-population suffix."""
+    name = str(setup or "").upper()
+    if name.endswith(DAY_MARKET_STATE_SUFFIX):
+        return name[: -len(DAY_MARKET_STATE_SUFFIX)]
+    return name
+
+
 def day_size_mult(expected_net: float, risk: float) -> float:
     """Bounded size from expected net per unit of adverse risk (as SCALP sizes
     its final edge). Negative evidence shrinks toward the floor; it never blocks."""
@@ -963,15 +988,14 @@ def scalp_expected_gross(view: dict[str, Any], raw: float) -> dict[str, float]:
 
     ``calibrated``: the setup-level gross mean plus the learned capture of the
     projection's deviation from its mean. ``adaptive``: the key's gross mean
-    against its setup's, bounded by ``SCALP_RESIDUAL_MAX`` and one-sided: a key
-    below its setup lowers the move, a key above it never lifts it (a lifting
-    key residual showed no out-of-sample skill and only selected noise). Their
-    sum is the expected directional move; it may be 0 or negative.
+    against its setup's, bounded by ``SCALP_RESIDUAL_MAX`` on both sides. A key
+    that has earned more than its setup raises the move; one that has earned
+    less lowers it. Their sum is the one expected directional move.
     """
     capture = _clamp(float(view.get("claim_capture") or 0.0), 0.0, 1.0)
     setup_mean = float(view.get("claim_gross_setup") or 0.0)
     calibrated = setup_mean + capture * (max(0.0, float(raw or 0.0)) - float(view.get("claim_raw_center") or 0.0))
-    adaptive = _clamp(float(view.get("claim_gross_mean") or 0.0) - setup_mean, -SCALP_RESIDUAL_MAX, 0.0)
+    adaptive = _clamp(float(view.get("claim_gross_mean") or 0.0) - setup_mean, -SCALP_RESIDUAL_MAX, SCALP_RESIDUAL_MAX)
     return {"capture": capture, "calibrated": calibrated, "adaptive": adaptive, "expected": calibrated + adaptive}
 
 
