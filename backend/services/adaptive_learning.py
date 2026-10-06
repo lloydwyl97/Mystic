@@ -1651,7 +1651,17 @@ def resolve_markouts(
     try:
         with contextlib.suppress(sqlite3.Error):
             _repair_adaptive_keys(conn)
-        rows = conn.execute("SELECT * FROM adaptive_candidate_markouts WHERE resolved=0 ORDER BY id ASC LIMIT 200").fetchall()
+        # One window per engine: DAY rows wait up to the lifecycle censor, so a
+        # shared oldest-first window fills with them and starves SCALP labels.
+        # Rows still owed their primary label go first inside each window.
+        rows = []
+        for window_engine in (DAY_ENGINE, SCALP_ENGINE):
+            rows.extend(
+                conn.execute(
+                    "SELECT * FROM adaptive_candidate_markouts WHERE resolved=0 AND engine_id=? ORDER BY learned ASC, id ASC LIMIT 200",
+                    (window_engine,),
+                ).fetchall()
+            )
         for row in rows:
             try:
                 engine_id = str(row["engine_id"])
@@ -1857,7 +1867,25 @@ def ohlcv_quote(db_path: str, symbol: str, epoch: float) -> float | None:
         conn = sqlite3.connect(db_path, timeout=5)
     except sqlite3.Error:
         return None
+    lo_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(epoch) - 62.0))
+    hi_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(epoch) + 1.0))
     try:
+        # The bar covering ``epoch`` by time, so a late resolve reads the same
+        # minute as a prompt one instead of falling off a newest-bars window.
+        for variant in variants:
+            try:
+                rows = conn.execute(
+                    "SELECT ts, close FROM feature_ohlcv WHERE symbol=? AND interval='1m' AND ts>=? AND ts<? ORDER BY ts DESC",
+                    (variant, lo_s, hi_s),
+                ).fetchall()
+            except sqlite3.Error:
+                return None
+            for ts, close in rows:
+                opened = _parse_ts(ts)
+                if opened is None or close is None:
+                    continue
+                if opened <= epoch < opened + 62:
+                    return float(close)
         for interval, sec in (("1m", 60), ("15m", 900)):
             for variant in variants:
                 try:
