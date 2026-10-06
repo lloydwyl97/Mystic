@@ -11417,6 +11417,7 @@ class PortfolioEngine:
 
         if reason != "ok":
             logger.info(f"BUY_BLOCKED_EXCHANGE: {symbol} raw_qty={quantity} qty_q={qty_q} reason={reason} est_notional={est_notional}")
+            self.last_buy_failure_reason = f"EXCHANGE_CONSTRAINT:{reason}"
             await self._record_reject(
                 symbol,
                 "BUY",

@@ -528,3 +528,17 @@ def test_no_fill_label_does_not_touch_execution_reason():
         window = src[s : s + 400]
         assert "self.last_buy_failure_reason = error_msg" in window
         assert "last_buy_reject_reason" not in window, "trailing-buy retry classification must stay unchanged"
+
+
+def test_exchange_constraint_block_names_its_reason():
+    """Ocean 2026-10-06 04:01: a $0.24 sleeve remainder was blocked locally but logged UNSPECIFIED."""
+    from backend.services.day_v2.live_entry import day_v2_submit_reject_reason
+
+    src = (REPO / "backend/services/portfolio_engine.py").read_text()
+    s = src.index('logger.info(f"BUY_BLOCKED_EXCHANGE:')
+    window = src[s : src.index("return None", s)]
+    assert 'self.last_buy_failure_reason = f"EXCHANGE_CONSTRAINT:{reason}"' in window
+    assert "last_buy_reject_reason" not in window, "trailing-buy retry classification must stay unchanged"
+    eng = _Eng()
+    eng.last_buy_failure_reason = "EXCHANGE_CONSTRAINT:below_min_notional"
+    assert day_v2_submit_reject_reason(eng) == "EXCHANGE_CONSTRAINT:below_min_notional"
