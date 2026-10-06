@@ -2295,15 +2295,72 @@ def _stamp_low_mfe_outcome_explain(explainability: TradeExplainability, dd: dict
         explainability.outcome_low_mfe_stall_penalty_eval_json = "{}"
 
 
-def _open_expected_terminal(db_path: str, engine_id: str, symbol: str, setup: str, regime: str, unrealized_net: float) -> float | None:
+def _open_expected_terminal(
+    db_path: str,
+    engine_id: str,
+    symbol: str,
+    setup: str,
+    regime: str,
+    unrealized_net: float,
+    features: dict | None = None,
+) -> float | None:
     """Learned terminal net from the current mark plus continuation value. Missing state stays neutral."""
     try:
         from backend.services.adaptive_learning import continuation_terminal
 
-        return continuation_terminal(db_path, engine_id, symbol, setup, regime, unrealized_net)
+        return continuation_terminal(db_path, engine_id, symbol, setup, regime, unrealized_net, features=features)
     except Exception:
         logger.debug("EXPECTED_TERMINAL_UNAVAILABLE symbol=%s", symbol, exc_info=True)
     return None
+
+
+def _previous_heartbeat_net(db_path: str | None, trade_id: str | None) -> float | None:
+    """Net at the prior heartbeat. The latest row is the current state, so the slope uses the one before it."""
+    if not db_path or not trade_id:
+        return None
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except Exception:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT net_unrealized_pct FROM ai_position_heartbeats WHERE trade_id=? ORDER BY epoch_ms DESC LIMIT 1 OFFSET 1",
+            (str(trade_id),),
+        ).fetchone()
+    except Exception:
+        return None
+    finally:
+        conn.close()
+    if not row or row[0] is None:
+        return None
+    try:
+        value = float(row[0])
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _continuation_features(position: Any, *, entry_price: float, mark: float, net: float, db_path: str | None = None) -> dict[str, float]:
+    """Position state for the continuation surface. Missing fields stay at 0 and are not a gate."""
+    from backend.services.continuation_surface import state_features
+
+    highest = float(getattr(position, "highest_price", 0.0) or entry_price)
+    lowest = float(getattr(position, "lowest_price", 0.0) or mark)
+    entry_time = float(getattr(position, "entry_time", 0.0) or 0.0)
+    gross_mfe = ((highest - entry_price) / entry_price) if entry_price and highest else 0.0
+    gross_mae = ((entry_price - lowest) / entry_price) if entry_price and lowest else 0.0
+    return state_features(
+        entry=entry_price,
+        mark=mark,
+        net=net,
+        mfe=max(0.0, gross_mfe),
+        mae=max(0.0, gross_mae),
+        high_water=max(highest, mark, entry_price),
+        prev_net=_previous_heartbeat_net(db_path, getattr(position, "trade_id", None)),
+        age_sec=max(0.0, time.time() - entry_time) if entry_time else 0.0,
+    )
 
 
 def _hold_unrealized_marks(db_path: str, trade_id: str) -> list[float]:
@@ -16488,7 +16545,15 @@ class PortfolioEngine:
                 _adapt = getattr(position, "adaptive_decision", None) or {}
                 _day_setup = str((_adapt or {}).get("setup") or getattr(position, "entry_thesis", "") or "")
                 _day_unreal = (float(current_price) - entry_price) / entry_price - float(ESTIMATED_ROUNDTRIP_COST)
-                _terminal = _open_expected_terminal(self.db_path, "DAY_V2", symbol, _day_setup, str((_adapt or {}).get("regime") or ""), _day_unreal)
+                _terminal = _open_expected_terminal(
+                    self.db_path,
+                    "DAY_V2",
+                    symbol,
+                    _day_setup,
+                    str((_adapt or {}).get("regime") or ""),
+                    _day_unreal,
+                    _continuation_features(position, entry_price=entry_price, mark=float(current_price), net=_day_unreal, db_path=self.db_path),
+                )
                 _day_v2_dec = evaluate_day_v2_exit(
                     engine_id=_pos_engine_id,
                     entry_price=entry_price,
@@ -16571,6 +16636,7 @@ class PortfolioEngine:
                     str((_scalp_adapt or {}).get("setup") or getattr(position, "entry_thesis", "") or ""),
                     str((_scalp_adapt or {}).get("regime") or ""),
                     _net_pnl_sv2,
+                    _continuation_features(position, entry_price=entry_price, mark=float(current_price), net=_net_pnl_sv2, db_path=self.db_path),
                 )
                 _scalp_v2_dec = evaluate_scalp_v2_exit(
                     position=position,

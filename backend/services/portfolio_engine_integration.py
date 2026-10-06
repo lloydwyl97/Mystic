@@ -1781,6 +1781,12 @@ class PortfolioEngineIntegration:
             from backend.services.day_v2.ranking import rank_day_candidates
 
             resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts), path_low=lambda sym, a, b: ohlcv_low_between(db_path, sym, a, b))
+            try:
+                from backend.services.continuation_backfill import fold_recent_advantages
+
+                fold_recent_advantages(db_path)
+            except Exception:
+                logger.debug("CONTINUATION_FOLD_SKIPPED", exc_info=True)
             for cand in candidates:
                 sig = cand["signal"]
                 cand["adaptive"] = day_decision(db_path, cand["symbol"], str(cand.get("learned_setup") or sig.setup), str(cand.get("regime_tag") or ""), features=cand.get("state_features"))

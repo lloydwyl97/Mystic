@@ -34,6 +34,13 @@ from backend.services.adaptive_learning import (
     hold_remaining_metric,
     learned_hold_or_exit,
 )
+from backend.services.continuation_surface import (
+    ADVANTAGE_VERSION,
+    ContinuationMemory,
+    horizons_for,
+    record_advantage,
+    state_features,
+)
 from backend.services.day_v2.lifecycle_sim import ohlcv_bars_1m
 from backend.services.day_v2.live_exit_evaluator import catastrophic_threshold_price
 from backend.services.scalp_v2.exit_evaluator import SCALP_V2_CATASTROPHIC_PCT
@@ -132,7 +139,7 @@ def _decision(raw: str | None) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def load_positions(db_path: str) -> tuple[list[Position], Counter]:
+def load_positions(db_path: str, *, active_since: float | None = None) -> tuple[list[Position], Counter]:
     """Current-version positions entered at or after the engine's economic anchor."""
     skipped: Counter = Counter()
     try:
@@ -172,6 +179,9 @@ def load_positions(db_path: str) -> tuple[list[Position], Counter]:
                 (engine, buy["symbol"], buy["entry_timestamp"]),
             ).fetchone()
             exit_time = _epoch(sell["timestamp"]) if sell else None
+            if active_since is not None and exit_time is not None and exit_time < active_since:
+                skipped[(engine, "outside_recent_window")] += 1
+                continue
             exit_price = float(sell["price"] or 0.0) if sell and sell["price"] else None
             if exit_price is not None and exit_price <= 0:
                 exit_price = None
@@ -743,6 +753,531 @@ def _replay_report(
             "folds": folds,
             "oos_actual_net": sum(actuals[p.trade_id]["net"] for p in later),
             "oos_learned_net": sum(exited[p.trade_id]["net"] for p in later if p.trade_id in exited),
+            "oos_actual": _summarize([actuals[p.trade_id] for p in later]),
+            "oos_learned": _summarize([exited[p.trade_id] for p in later if p.trade_id in exited]),
             "oos_improved": (sum(exited[p.trade_id]["net"] for p in later if p.trade_id in exited) > sum(actuals[p.trade_id]["net"] for p in later)) if later else False,
         }
     return report
+
+
+@dataclass(frozen=True)
+class AdvantageLabel:
+    engine: str
+    symbol: str
+    setup: str
+    regime: str
+    trade_id: str
+    snapshot_time: float
+    label_time: float
+    horizon: int
+    advantage: float
+    weight: float
+    features: dict[str, float]
+
+
+def _safety_price(position: Position) -> float | None:
+    """Price at which catastrophic protection would already have exited. None when it cannot fire."""
+    if position.engine == SCALP_ENGINE:
+        return position.entry_price * (1.0 - SCALP_V2_CATASTROPHIC_PCT)
+    if position.atr <= 0:
+        return None
+    return catastrophic_threshold_price(position.entry_price, position.atr, position.anchor)
+
+
+def _price_at_horizon(position: Position, snap: Snapshot, horizon: int, bars: list[tuple[float, float, float, float, float]], *, as_of: float) -> tuple[float, float] | None:
+    """(mark, label_time) for one horizon, or None when that mark was not stored.
+
+    A later bar after the historical exit is a real counterfactual. A path that
+    would have hit catastrophic protection is labeled at that safety price.
+    """
+    target = snap.time + horizon
+    if target > as_of + 1e-6:
+        return None
+    safety = _safety_price(position)
+    if safety is not None:
+        for opened, _o, _h, low, _close in bars:
+            if snap.time <= opened < target and low <= safety:
+                return safety, opened + 60.0
+    if horizon < _BAR_HORIZON_FLOOR_SEC:
+        band = 0.5 * horizon
+        nearest: tuple[float, float] | None = None
+        points: list[tuple[float, float]] = [(later.time, later.mark) for later in position.snapshots if snap.time < later.time <= as_of]
+        if position.closed and position.exit_time and position.exit_price and snap.time < position.exit_time <= as_of:
+            points.append((position.exit_time, position.exit_price))
+        for moment, price in points:
+            if abs(moment - target) > band:
+                continue
+            if nearest is None or abs(moment - target) < abs(nearest[0] - target):
+                nearest = (moment, price)
+        if nearest is None:
+            return None
+        if safety is not None and nearest[1] <= safety:
+            return safety, nearest[0]
+        return nearest[1], nearest[0]
+    bar = _bar_covering(bars, target)
+    if bar is None or bar[0] < snap.time:
+        return None
+    if safety is not None and bar[3] <= safety:
+        return safety, bar[0] + 60.0
+    return bar[4], bar[0] + 60.0
+
+
+def _path_features(position: Position, snap: Snapshot, prev_net: float | None) -> dict[str, float]:
+    return state_features(
+        entry=position.entry_price,
+        mark=snap.mark,
+        net=snap.net,
+        mfe=snap.mfe,
+        mae=snap.mae,
+        high_water=snap.high_water,
+        prev_net=prev_net,
+        age_sec=max(0.0, snap.time - position.entry_time),
+    )
+
+
+def advantage_labels_for(position: Position, bars: list[tuple[float, float, float, float, float]], *, as_of: float) -> tuple[list[AdvantageLabel], Counter]:
+    """One label per stored horizon. Missing marks are omitted, not filled in."""
+    skipped: Counter = Counter()
+    drafts: list[tuple[Snapshot, int, float, float, dict[str, float]]] = []
+    prev_net: float | None = None
+    for snap in position.snapshots:
+        if snap.time > as_of:
+            skipped[(position.engine, "snapshot_after_as_of")] += 1
+            continue
+        features = _path_features(position, snap, prev_net)
+        found = False
+        for horizon in horizons_for(position.engine):
+            marked = _price_at_horizon(position, snap, horizon, bars, as_of=as_of)
+            if marked is None:
+                skipped[(position.engine, "horizon_unavailable")] += 1
+                continue
+            price, label_time = marked
+            if label_time <= snap.time or label_time > as_of + 1e-6:
+                skipped[(position.engine, "horizon_unavailable")] += 1
+                continue
+            advantage = _net(position.entry_price, price) - snap.net
+            if not math.isfinite(advantage):
+                skipped[(position.engine, "non_finite_label")] += 1
+                continue
+            drafts.append((snap, horizon, label_time, advantage, features))
+            found = True
+        if not found:
+            skipped[(position.engine, "snapshot_without_future")] += 1
+        prev_net = snap.net
+    if not drafts:
+        return [], skipped
+    # Weight by time since the previous state so a burst of heartbeats is one path, not many samples.
+    ordered = [snap for snap in position.snapshots if snap.time <= as_of]
+    gap_of = {}
+    previous_time = position.entry_time
+    for snap in ordered:
+        gap_of[snap.time] = max(snap.time - previous_time, 1.0)
+        previous_time = snap.time
+    present = {item[0].time for item in drafts}
+    total = sum(gap_of[moment] for moment in present)
+    counts: Counter = Counter(item[0].time for item in drafts)
+    labels: list[AdvantageLabel] = []
+    for snap, horizon, label_time, advantage, features in drafts:
+        share = (gap_of[snap.time] / total) / counts[snap.time] if total else 0.0
+        labels.append(
+            AdvantageLabel(
+                engine=position.engine,
+                symbol=position.symbol,
+                setup=position.setup,
+                regime=position.regime,
+                trade_id=position.trade_id,
+                snapshot_time=snap.time,
+                label_time=label_time,
+                horizon=horizon,
+                advantage=advantage,
+                weight=share,
+                features=features,
+            )
+        )
+    return labels, skipped
+
+
+def build_advantage_labels(db_path: str, *, as_of: float | None = None) -> tuple[list[AdvantageLabel], dict[str, Any]]:
+    clock = float(as_of if as_of is not None else time.time())
+    positions, skipped = load_positions(db_path)
+    span: dict[str, tuple[float, float]] = {}
+    for position in positions:
+        start, end = span.get(position.symbol, (position.entry_time, clock))
+        span[position.symbol] = (min(start, position.entry_time), max(end, position.exit_time or clock, clock))
+    bars_cache = {symbol: ohlcv_bars_1m(db_path, symbol, start, end + 60.0) for symbol, (start, end) in span.items()}
+    labels: list[AdvantageLabel] = []
+    usable_positions: Counter = Counter()
+    usable_snapshots: Counter = Counter()
+    for position in positions:
+        found, more = advantage_labels_for(position, bars_cache.get(position.symbol, []), as_of=clock)
+        skipped.update(more)
+        if found:
+            usable_positions[position.engine] += 1
+            usable_snapshots[position.engine] += len({item.snapshot_time for item in found})
+            labels.extend(found)
+        else:
+            skipped[(position.engine, "position_without_label")] += 1
+    labels.sort(key=lambda item: (item.label_time, item.trade_id, item.snapshot_time, item.horizon))
+    inventory = _inventory(positions, skipped, usable_positions, usable_snapshots, [])
+    for engine in (DAY_ENGINE, SCALP_ENGINE):
+        inventory[engine]["observations"] = sum(1 for item in labels if item.engine == engine)
+        inventory[engine]["learning_version"] = ADVANTAGE_VERSION
+    return labels, inventory
+
+
+def continuation_predicts(prediction: dict[str, Any] | None) -> bool:
+    """True when predicted hold advantage ranks with the realized advantage.
+
+    Approximately zero rank means the surface does not yet know hold from exit.
+    This is the deployment check, not a live sample gate.
+    """
+    pred = prediction or {}
+    try:
+        rank = float(pred.get("rank_correlation"))
+        accuracy = float(pred.get("hold_exit_accuracy"))
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(rank) or not math.isfinite(accuracy):
+        return False
+    return rank >= 0.10 and accuracy > 0.5
+
+
+def continuation_accepts(repaired: dict[str, Any], legacy: dict[str, Any]) -> bool:
+    """Repaired OOS net beats the installed continuation without a material drawdown increase."""
+    try:
+        new_net = float(repaired["net"])
+        old_net = float(legacy["net"])
+        new_dd = float(repaired["dd"])
+        old_dd = float(legacy["dd"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in (new_net, old_net, new_dd, old_dd)):
+        return False
+    if int(repaired.get("trades") or 0) <= 0 or int(legacy.get("trades") or 0) <= 0:
+        return False
+    if new_net <= old_net:
+        return False
+    material = max(0.005, abs(old_dd) * 0.10)
+    return new_dd <= old_dd + material
+
+
+def _spearman(pairs: list[tuple[float, float]]) -> float | None:
+    if len(pairs) < 3:
+        return None
+
+    def ranks(values: list[float]) -> list[float]:
+        order = sorted(range(len(values)), key=lambda index: values[index])
+        out = [0.0] * len(values)
+        for rank, index in enumerate(order):
+            out[index] = float(rank)
+        return out
+
+    xs = ranks([item[0] for item in pairs])
+    ys = ranks([item[1] for item in pairs])
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=True))
+    den = math.sqrt(sum((x - mx) ** 2 for x in xs) * sum((y - my) ** 2 for y in ys))
+    if den <= 0:
+        return None
+    return num / den
+
+
+def _feature_series(position: Position, bars: list[tuple[float, float, float, float, float]], path: list[tuple[float, float, float]]) -> dict[float, dict[str, float]]:
+    """State at each path time, using only bars and heartbeats already reached."""
+    entry = position.entry_price
+    mfe = 0.0
+    mae = 0.0
+    high = entry
+    prev_net: float | None = None
+    index = 0
+    series: dict[float, dict[str, float]] = {}
+    snaps = [snap for snap in position.snapshots if snap.time >= position.entry_time]
+    snap_i = 0
+    for moment, mark, _low in path:
+        while snap_i < len(snaps) and snaps[snap_i].time <= moment:
+            mfe = max(mfe, snaps[snap_i].mfe)
+            mae = max(mae, snaps[snap_i].mae)
+            high = max(high, snaps[snap_i].high_water)
+            snap_i += 1
+        while index < len(bars) and bars[index][0] < moment:
+            opened, _o, high_px, low_px, _close = bars[index]
+            if opened >= position.entry_time:
+                mfe = max(mfe, (high_px - entry) / entry)
+                mae = max(mae, 0.0, (entry - low_px) / entry)
+                high = max(high, high_px)
+            index += 1
+        net = _net(entry, mark)
+        series[moment] = state_features(entry=entry, mark=mark, net=net, mfe=mfe, mae=mae, high_water=max(high, mark), prev_net=prev_net, age_sec=max(0.0, moment - position.entry_time))
+        prev_net = net
+    return series
+
+
+def walk_advantage(db_path: str, *, as_of: float | None = None) -> dict[str, Any]:
+    """Causal same-entry replay of the horizon advantage surface against the recorded exits."""
+    clock = float(as_of if as_of is not None else time.time())
+    labels, inventory = build_advantage_labels(db_path, as_of=clock)
+    positions, _skipped = load_positions(db_path)
+    closed = [p for p in positions if p.closed and p.exit_time is not None and p.exit_time <= clock]
+    if not closed:
+        return {"inventory": inventory, "engines": {}}
+    earliest = min(p.entry_time for p in closed)
+    bars_cache = {symbol: ohlcv_bars_1m(db_path, symbol, earliest, clock + 60.0) for symbol in {p.symbol for p in closed}}
+    events: list[tuple[float, int, str, Any]] = [(item.label_time, 0, "learn", item) for item in labels]
+    paths: dict[str, list[tuple[float, float, float]]] = {}
+    feature_series: dict[str, dict[float, dict[str, float]]] = {}
+    for position in closed:
+        path = _path_points(position, bars_cache.get(position.symbol, []), clock)
+        paths[position.trade_id] = path
+        feature_series[position.trade_id] = _feature_series(position, bars_cache.get(position.symbol, []), path)
+        events.extend((point[0], 1, "decide", (position, point)) for point in path)
+    events.sort(key=lambda item: (item[0], item[1], item[2]))
+    surface = ContinuationMemory()
+    policies = ("best", "blended")
+    exited: dict[str, dict[str, dict[str, Any]]] = {name: {} for name in policies}
+    reasons: dict[str, Counter] = {name: Counter() for name in policies}
+    actuals = {position.trade_id: _actual_row(position, bars_cache.get(position.symbol, [])) for position in closed}
+    pending: dict[tuple[str, float], dict[str, Any]] = {}
+    pairs: dict[str, list[tuple[float, float]]] = {engine: [] for engine in (DAY_ENGINE, SCALP_ENGINE)}
+    label_index = {(item.trade_id, item.snapshot_time, item.horizon): item for item in labels}
+    for _when, _order, kind, payload in events:
+        if kind == "learn":
+            surface.update(payload.engine, payload.symbol, payload.setup, payload.regime, payload.horizon, payload.features, payload.advantage, payload.weight, payload.label_time)
+            continue
+        position, point = payload
+        moment, mark, low = point
+        if moment + 1e-6 < position.entry_time:
+            continue
+        features = feature_series[position.trade_id].get(moment) or {}
+        catastrophic = _catastrophic(position, mark, low)
+        for name in policies:
+            if position.trade_id in exited[name]:
+                continue
+            reason = "CATASTROPHIC" if catastrophic else None
+            pred = 0.0
+            chosen: int | None = None
+            if reason is None:
+                pred, chosen = surface.advantage(position.engine, position.symbol, position.setup, position.regime, features, moment, how=name)
+                if pred < 0.0:
+                    reason = "LEARNED"
+            if reason is None and position.exit_time is not None and moment + 1e-6 < position.exit_time:
+                if name == "best" and chosen is not None and any(abs(snap.time - moment) < 1.0 for snap in position.snapshots):
+                    realized = label_index.get((position.trade_id, min(position.snapshots, key=lambda snap: abs(snap.time - moment)).time, chosen))
+                    if realized is not None:
+                        pending[(position.trade_id, moment)] = {"engine": position.engine, "pred": pred, "realized": realized.advantage}
+                continue
+            if reason is None and moment + 60.0 < clock:
+                continue
+            if reason is None:
+                reason = "DATA_END"
+            reasons[name][(position.engine, reason)] += 1
+            exited[name][position.trade_id] = _learned_row(position, moment, mark, reason, bars_cache.get(position.symbol, []))
+    for position in closed:
+        for name in policies:
+            if position.trade_id in exited[name]:
+                continue
+            last = paths[position.trade_id][-1]
+            reasons[name][(position.engine, "DATA_END")] += 1
+            exited[name][position.trade_id] = _learned_row(position, last[0], last[1], "DATA_END", bars_cache.get(position.symbol, []))
+    for rec in pending.values():
+        pairs[rec["engine"]].append((rec["pred"], rec["realized"]))
+    report: dict[str, Any] = {"inventory": inventory, "engines": {}, "version": ADVANTAGE_VERSION}
+    for engine in (DAY_ENGINE, SCALP_ENGINE):
+        rows = sorted((p for p in closed if p.engine == engine), key=lambda p: p.entry_time)
+        width = max(1, len(rows) // 4) if rows else 1
+        later = rows[width:] if len(rows) > width else []
+        block: dict[str, Any] = {"actual": _summarize([actuals[p.trade_id] for p in rows]), "observations": inventory[engine]["observations"]}
+        scored = pairs[engine]
+        correct = [1 for pred, realized in scored if (pred > 0) == (realized > 0) and pred != 0 and realized != 0]
+        called = [1 for pred, realized in scored if pred != 0 and realized != 0]
+        ordered = sorted(scored, key=lambda item: item[0])
+        tercile = max(1, len(ordered) // 3) if ordered else 1
+        bottom = ordered[:tercile]
+        top = ordered[-tercile:] if ordered else []
+        block["prediction"] = {
+            "pairs": len(scored),
+            "rank_correlation": _spearman(scored),
+            "hold_exit_accuracy": (sum(correct) / len(called)) if called else None,
+            "bottom_realized": (sum(item[1] for item in bottom) / len(bottom)) if bottom else None,
+            "top_realized": (sum(item[1] for item in top) / len(top)) if top else None,
+        }
+        for name in policies:
+            learned = [exited[name][p.trade_id] for p in rows]
+            later_rows = [exited[name][p.trade_id] for p in later]
+            later_actual = [actuals[p.trade_id] for p in later]
+            folds = []
+            for index in range(0, len(rows), width):
+                chunk = rows[index : index + width]
+                folds.append(
+                    {
+                        "actual": _summarize([actuals[p.trade_id] for p in chunk]),
+                        "learned": _summarize([exited[name][p.trade_id] for p in chunk]),
+                    }
+                )
+            block[name] = {
+                "learned": _summarize(learned),
+                "oos": _summarize(later_rows),
+                "oos_actual": _summarize(later_actual),
+                "classes": dict(Counter(_classify(exited[name][pos.trade_id], actuals[pos.trade_id]) for pos in rows)),
+                "learned_reasons": {reason: count for (eng, reason), count in sorted(reasons[name].items()) if eng == engine},
+                "oos_improved_vs_actual": (sum(item["net"] for item in later_rows) > sum(item["net"] for item in later_actual)) if later else False,
+                "folds": folds,
+                "held_under_one_minute": sum(1 for row in learned if float(row["hold_min"]) < 1.0),
+            }
+        report["engines"][engine] = block
+    return report
+
+
+def train_surface(labels: list[AdvantageLabel]) -> ContinuationMemory:
+    """Replay horizon labels in label-time order into one surface."""
+    surface = ContinuationMemory()
+    ordered = sorted(labels, key=lambda item: (item.label_time, item.trade_id, item.snapshot_time, item.horizon))
+    for item in ordered:
+        surface.update(item.engine, item.symbol, item.setup, item.regime, item.horizon, item.features, item.advantage, item.weight, item.label_time)
+    return surface
+
+
+def write_surface(state_db: str, surface: ContinuationMemory) -> dict[str, int]:
+    """Store a trained surface in one transaction. Entry metrics are not written."""
+    from backend.services.continuation_surface import SURFACE_MODEL
+
+    wrote = {DAY_ENGINE: 0, SCALP_ENGINE: 0}
+    conn = _connect(state_db)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for key, row in surface.rows.items():
+            engine_id, economic, symbol, setup, regime, metric = key
+            conn.execute(
+                """
+                INSERT INTO adaptive_metric_state
+                (engine_id, economic_version, symbol, setup, regime, metric, n, ewma, m2, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(engine_id, economic_version, symbol, setup, regime, metric) DO UPDATE SET
+                    n=excluded.n, ewma=excluded.ewma, m2=excluded.m2, updated_at=excluded.updated_at
+                """,
+                (engine_id, economic, symbol, setup, regime, metric, row["n"], row["ewma"], row["m2"], row["updated_at"]),
+            )
+            wrote[engine_id] = wrote.get(engine_id, 0) + 1
+        horizons: dict[str, dict[str, Any]] = {}
+        updated: dict[str, str] = {}
+        for (engine_id, horizon), stats in surface.ridge.items():
+            horizons.setdefault(engine_id, {})[str(int(horizon))] = stats
+            updated[engine_id] = str(stats.get("updated_at") or "")
+        for engine_id, payload in horizons.items():
+            model = f"{SURFACE_MODEL}@{current_economic_version(engine_id)}"
+            conn.execute(
+                """
+                INSERT INTO adaptive_linear_model (engine_id, model, payload, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(engine_id, model) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at
+                """,
+                (engine_id, model, json.dumps({"horizons": payload}, separators=(",", ":")), updated.get(engine_id) or ""),
+            )
+        conn.execute("COMMIT")
+        return wrote
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def remember_labels(db_path: str, labels: list[AdvantageLabel]) -> None:
+    """Mark horizon labels already folded so a later pass does not train them again."""
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS continuation_advantage_log (
+                engine_id TEXT NOT NULL,
+                trade_id TEXT NOT NULL,
+                snapshot_time REAL NOT NULL,
+                horizon INTEGER NOT NULL,
+                PRIMARY KEY (engine_id, trade_id, snapshot_time, horizon)
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO continuation_advantage_log (engine_id, trade_id, snapshot_time, horizon) VALUES (?,?,?,?)",
+            [(item.engine, item.trade_id, item.snapshot_time, item.horizon) for item in labels],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_LAST_FOLD = 0.0
+
+
+def fold_recent_advantages(db_path: str, *, now: float | None = None) -> int:
+    """Fold horizon labels that have elapsed since the surface was installed.
+
+    No-op until an advantage surface is the live continuation authority.
+    One position's labels keep the same shared weight. Already-folded labels are skipped.
+    """
+    global _LAST_FOLD
+    from backend.services.continuation_surface import advantage_authority
+
+    active = {engine for engine in (DAY_ENGINE, SCALP_ENGINE) if advantage_authority(db_path, engine)}
+    if not active:
+        return 0
+    moment = float(now if now is not None else time.time())
+    if moment - _LAST_FOLD < 60.0:
+        return 0
+    _LAST_FOLD = moment
+    positions, _skipped = load_positions(db_path, active_since=moment - 13 * 3600.0)
+    positions = [position for position in positions if position.engine in active]
+    if not positions:
+        return 0
+    span: dict[str, tuple[float, float]] = {}
+    for position in positions:
+        start, end = span.get(position.symbol, (position.entry_time, moment))
+        span[position.symbol] = (min(start, position.entry_time), max(end, position.exit_time or moment, moment))
+    bars_cache = {symbol: ohlcv_bars_1m(db_path, symbol, start, end + 60.0) for symbol, (start, end) in span.items()}
+    fresh: list[AdvantageLabel] = []
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS continuation_advantage_log (
+                engine_id TEXT NOT NULL,
+                trade_id TEXT NOT NULL,
+                snapshot_time REAL NOT NULL,
+                horizon INTEGER NOT NULL,
+                PRIMARY KEY (engine_id, trade_id, snapshot_time, horizon)
+            )
+            """
+        )
+        known = {(row[0], row[1], float(row[2]), int(row[3])) for row in conn.execute("SELECT engine_id, trade_id, snapshot_time, horizon FROM continuation_advantage_log")}
+    finally:
+        conn.close()
+    for position in positions:
+        found, _more = advantage_labels_for(position, bars_cache.get(position.symbol, []), as_of=moment)
+        for item in found:
+            if item.engine not in active:
+                continue
+            if (item.engine, item.trade_id, item.snapshot_time, item.horizon) not in known:
+                fresh.append(item)
+    if not fresh:
+        return 0
+    persist_advantage(db_path, fresh)
+    remember_labels(db_path, fresh)
+    return len(fresh)
+
+
+def persist_advantage(state_db: str, labels: list[AdvantageLabel]) -> dict[str, int]:
+    wrote = {DAY_ENGINE: 0, SCALP_ENGINE: 0}
+    for item in labels:
+        if record_advantage(
+            state_db,
+            engine=item.engine,
+            symbol=item.symbol,
+            setup=item.setup,
+            regime=item.regime,
+            horizon=item.horizon,
+            features=item.features,
+            advantage=item.advantage,
+            weight=item.weight,
+            now=item.label_time,
+        ):
+            wrote[item.engine] += 1
+    return wrote

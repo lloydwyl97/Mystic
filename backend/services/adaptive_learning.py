@@ -112,6 +112,13 @@ _PRIORS: dict[str, dict[str, float]] = {
     },
 }
 
+# Continuation horizons, in seconds. Priors are 0: no hold and no exit is assumed.
+# These metrics are not read by entry ranking or sizing.
+HOLD_ADVANTAGE_HORIZONS = (30, 60, 120, 300, 600, 900, 1200, 1800, 3600, 7200, 14400, 21600, 43200)
+for _engine_priors in _PRIORS.values():
+    for _horizon in HOLD_ADVANTAGE_HORIZONS:
+        _engine_priors[f"hold_adv_{_horizon}"] = 0.0
+
 CLAIM_MOMENT_METRICS = ("claim_raw", "claim_raw_sq", "claim_gross", "claim_raw_x_gross")
 MICRO_WEIGHT_METRICS = ("micro_tilt_sq", "micro_tilt_x_miss")
 MICRO_WEIGHT_KEY = ("", "MICRO_MODEL", "")
@@ -145,7 +152,20 @@ def residual_metric(raw_move_source: str | None) -> str:
 # Causal calibration on current-version SCALP markouts: a 0.25 EWMA residual
 # tracks the last few labels and produced 4x more positive predictions with no
 # better realization; the running mean converges to the key's actual bias.
-MEAN_FORM_METRICS = frozenset({"edge_residual", "edge_residual_strategy", "lifecycle_net", "trade_net", "hold_remaining_up", "hold_remaining_down", *CLAIM_MOMENT_METRICS, *MICRO_WEIGHT_METRICS})
+_HOLD_ADVANTAGE_METRICS = tuple(f"hold_adv_{horizon}" for horizon in HOLD_ADVANTAGE_HORIZONS)
+MEAN_FORM_METRICS = frozenset(
+    {
+        "edge_residual",
+        "edge_residual_strategy",
+        "lifecycle_net",
+        "trade_net",
+        "hold_remaining_up",
+        "hold_remaining_down",
+        *CLAIM_MOMENT_METRICS,
+        *MICRO_WEIGHT_METRICS,
+        *_HOLD_ADVANTAGE_METRICS,
+    }
+)
 
 SIZE_BOUNDS = {"DAY_V2": (0.55, 1.35), "SCALP_V2": (0.50, 1.25)}
 # Prior information on the SCALP claim slope, in claim-variance units: a key's
@@ -668,6 +688,7 @@ def continuation_terminal(
     unrealized_net: float,
     *,
     now: float | None = None,
+    features: dict | None = None,
 ) -> float | None:
     """Expected net if the position is kept, from the current mark plus learned remaining value.
 
@@ -684,6 +705,15 @@ def continuation_terminal(
     engine_id = str(engine or "").upper()
     if engine_id not in _PRIORS:
         return None
+    from backend.services.continuation_surface import advantage_authority, installed_aggregator, surface_advantage
+
+    moment = float(now if now is not None else time.time())
+    if advantage_authority(db_path, engine_id):
+        state = features if isinstance(features, dict) else {"net": mark}
+        advantage = surface_advantage(db_path, engine_id, symbol, setup, regime, state, moment, how=installed_aggregator(db_path, engine_id))
+        if advantage is None or not math.isfinite(float(advantage)):
+            return mark
+        return mark + float(advantage)
     remaining = estimate(db_path, engine_id, symbol, setup, regime, hold_remaining_metric(mark), now=now, include_engine=True)
     mean = float(remaining["mean"])
     if not math.isfinite(mean):

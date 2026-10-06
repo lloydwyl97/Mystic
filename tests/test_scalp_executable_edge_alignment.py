@@ -525,7 +525,20 @@ def test_detail_is_never_empty_for_hard_blocks_before_edge():
 
 def test_day_priors_and_decision_unchanged():
     # Net quantities (realized trade net, lifecycle net, cost-adjusted forward markout) are neutral.
-    assert al._PRIORS[al.DAY_ENGINE] == {
+    priors = al._PRIORS[al.DAY_ENGINE]
+    original = (
+        "trade_mfe",
+        "trade_mae",
+        "trade_time_to_mfe_min",
+        "trade_continuation",
+        "trade_net",
+        "lifecycle_net",
+        "hold_remaining_up",
+        "hold_remaining_down",
+        "markout_forward",
+        "markout_mae",
+    )
+    assert {key: priors[key] for key in original} == {
         "trade_mfe": 0.012,
         "trade_mae": 0.006,
         "trade_time_to_mfe_min": 90.0,
@@ -537,6 +550,7 @@ def test_day_priors_and_decision_unchanged():
         "markout_forward": 0.0,
         "markout_mae": 0.006,
     }
+    assert priors["hold_adv_900"] == 0.0
     src = inspect.getsource(al.day_decision)
     assert "edge_residual" not in src and "executable_edge" not in src
 
