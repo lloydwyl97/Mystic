@@ -11,7 +11,7 @@ from backend.services.binance_scalp.market_reader import (
     book_behind_recent_tape,
     publish_ws_depth,
 )
-from backend.services.scalp_v2.exit_evaluator import SCALP_V2_EXIT_ADVERSE, SCALP_V2_EXIT_CATASTROPHIC, evaluate_scalp_v2_exit
+from backend.services.scalp_v2.exit_evaluator import SCALP_V2_EXIT_CATASTROPHIC, evaluate_scalp_v2_exit
 
 
 class _MemRedis:
@@ -84,7 +84,7 @@ def test_older_sale_does_not_reject_a_tracked_book() -> None:
     assert book_behind_recent_tape(mem, "SOLUSDT", 117.85, now=now) is False  # type: ignore[arg-type]
 
 
-def test_current_bid_still_triggers_adverse_stop() -> None:
+def test_current_bid_does_not_sell_on_the_old_adverse_distance() -> None:
     result = evaluate_scalp_v2_exit(
         position=_pos(),
         current_price=117.75,
@@ -94,8 +94,19 @@ def test_current_bid_still_triggers_adverse_stop() -> None:
         symbol="SOL/USDT",
         allow_adverse_stop=True,
     )
-    assert result.get("action") == "sell"
-    assert result.get("reason") == SCALP_V2_EXIT_ADVERSE
+    assert result.get("action") == "hold"
+    worse = evaluate_scalp_v2_exit(
+        position=_pos(),
+        current_price=117.75,
+        net_pnl_pct=-0.0022,
+        hold_minutes=0.5,
+        bar_low=117.90,
+        symbol="SOL/USDT",
+        allow_adverse_stop=True,
+        expected_terminal_net=-0.01,
+    )
+    assert worse.get("action") == "sell"
+    assert worse.get("reason") == "SCALP_V2_LEARNED_CONTINUATION"
 
 
 def test_non_current_book_does_not_trigger_adverse_stop() -> None:

@@ -13,8 +13,8 @@ learned from realized gross moves of claims (admitted or not) with zero priors,
 so geometry, ATR or a floor alone produces an expected move of 0 and a
 candidate priced at minus its cost. ``adaptive_residual`` is the key's gross
 mean against its setup's, bounded on both sides. ``micro_residual`` is the bounded
-microstructure tilt times its learned weight in [0, 1]; it may lower a
-candidate but never lifts one that is not already positive. All learned terms
+microstructure tilt times its learned weight in [0, 1]. It raises or
+lowers the estimate with the evidence. All learned terms
 are read from state of the current economic version, pooled hierarchically.
 
 ``final_executable_edge <= 0`` is hard economic safety (NO_EXECUTABLE_NET_EDGE).
@@ -173,7 +173,7 @@ def scalp_executable_edge(
     base = move["calibrated"] - cost
     pre_micro = base + move["adaptive"]
     micro_model = _f(view.get("micro_residual"))
-    micro = micro_model if (pre_micro > REJECT_THRESHOLD_PCT or micro_model < 0) else 0.0
+    micro = micro_model
     final = pre_micro + micro
     confidence = _f(view.get("confidence"))
     risk = _f(view.get("risk_estimate"))

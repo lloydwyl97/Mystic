@@ -552,9 +552,7 @@ def test_submitted_orders_not_canceled(tmp_path: Path) -> None:
 def test_day_v2_exit_reasons_pass_through_unchanged() -> None:
     for reason in (
         "DAY_V2_CATASTROPHIC_PROTECTION",
-        "DAY_V2_STRUCTURAL_INVALIDATION",
-        "DAY_V2_WINNER_PROTECTION",
-        "DAY_V2_OBJECTIVE_COMPLETE",
+        "DAY_V2_LEARNED_CONTINUATION",
         "DAY_V2_TIME_EXPIRATION",
     ):
         result = paper_trades_exit_type_label(ExitType.MANUAL, reason)

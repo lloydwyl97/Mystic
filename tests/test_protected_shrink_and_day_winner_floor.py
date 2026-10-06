@@ -238,9 +238,7 @@ def test_winner_floor_does_not_substitute_break_even():
     # Pre-runner position: 1h ATR = 2.5 x 1.2 = 3.0. At MFE 3.1 the wide trail
     # is 103.1 - 4.5 = 98.6, below break-even. That must not sell.
     assert _exit(highest=103.1, current=100.05) is None
-    result = _exit(highest=105.0, current=102.0)
-    assert result is not None and result["reason"] == "DAY_V2_OBJECTIVE_COMPLETE"
-    assert "stop=100.060000" not in result["detail"]
+    assert _exit(highest=105.0, current=102.0) is None
 
 
 def test_winner_floor_holds_above_break_even():
@@ -251,11 +249,10 @@ def test_small_mfe_is_not_sold_by_a_scalp_trail():
     assert _exit(highest=100.9, current=100.05) is None
 
 
-def test_wide_trail_on_big_winner_tightens_only_after_objective():
-    # Objective = entry + 1.5 x 3.0 = 104.5 reached -> tight trail 0.75 x 3.0 -> stop 107.75.
+def test_wide_trail_on_big_winner_does_not_sell():
+    # A runner stop is state. It does not sell unless continuation is worse.
     assert _exit(highest=110.0, current=108.0) is None
-    result = _exit(highest=110.0, current=107.5)
-    assert result is not None and "stop=107.750000" in result["detail"]
+    assert _exit(highest=110.0, current=107.5) is None
 
 
 def test_below_mfe_gate_floor_does_not_apply():

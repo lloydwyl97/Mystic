@@ -31,7 +31,7 @@ import math
 import os
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -76,6 +76,8 @@ _PRIORS: dict[str, dict[str, float]] = {
         # and must not seed them.
         "trade_net": 0.0,
         "lifecycle_net": 0.0,
+        "hold_remaining_up": 0.0,
+        "hold_remaining_down": 0.0,
         "markout_forward": 0.0,
         "markout_mae": 0.006,
     },
@@ -83,6 +85,8 @@ _PRIORS: dict[str, dict[str, float]] = {
         "trade_mfe": 0.0025,
         "trade_mae": 0.0015,
         "trade_net": 0.0015,
+        "hold_remaining_up": 0.0,
+        "hold_remaining_down": 0.0,
         "trade_time_to_mfe_min": 8.0,
         "markout_forward": 0.0015,
         # Gross adverse price excursion of the candidate path over its committed
@@ -141,7 +145,7 @@ def residual_metric(raw_move_source: str | None) -> str:
 # Causal calibration on current-version SCALP markouts: a 0.25 EWMA residual
 # tracks the last few labels and produced 4x more positive predictions with no
 # better realization; the running mean converges to the key's actual bias.
-MEAN_FORM_METRICS = frozenset({"edge_residual", "edge_residual_strategy", "lifecycle_net", "trade_net", *CLAIM_MOMENT_METRICS, *MICRO_WEIGHT_METRICS})
+MEAN_FORM_METRICS = frozenset({"edge_residual", "edge_residual_strategy", "lifecycle_net", "trade_net", "hold_remaining_up", "hold_remaining_down", *CLAIM_MOMENT_METRICS, *MICRO_WEIGHT_METRICS})
 
 SIZE_BOUNDS = {"DAY_V2": (0.55, 1.35), "SCALP_V2": (0.50, 1.25)}
 # Prior information on the SCALP claim slope, in claim-variance units: a key's
@@ -633,6 +637,64 @@ def day_geometry_setup(setup: str) -> str:
     return name
 
 
+def hold_remaining_metric(unrealized_net: float) -> str:
+    """Which continuation posterior the current mark reads. The sign is state, not a gate."""
+    return "hold_remaining_up" if float(unrealized_net) > 0.0 else "hold_remaining_down"
+
+
+def continuation_terminal(
+    db_path: str,
+    engine: str,
+    symbol: str,
+    setup: str,
+    regime: str,
+    unrealized_net: float,
+    *,
+    now: float | None = None,
+) -> float | None:
+    """Expected net if the position is kept, from the current mark plus learned remaining value.
+
+    Remaining value is a neutral prior of 0, so a cold state holds. Negative
+    evidence that keeping the position gave back money makes the terminal worse
+    than cashing out. Later positive evidence raises it again.
+    """
+    try:
+        mark = float(unrealized_net)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(mark):
+        return None
+    engine_id = str(engine or "").upper()
+    if engine_id not in _PRIORS:
+        return None
+    remaining = estimate(db_path, engine_id, symbol, setup, regime, hold_remaining_metric(mark), now=now)
+    mean = float(remaining["mean"])
+    if not math.isfinite(mean):
+        return None
+    return mark + mean
+
+
+def learned_hold_or_exit(*, expected_terminal_net: float | None, unrealized_net: float) -> str:
+    """Compare cashing out now with the learned terminal net of this state.
+
+    ``exit`` when the learned terminal is worse than the net available now.
+    A missing or non-finite terminal is neutral, so the position holds.
+    Age is not an input.
+    """
+    if expected_terminal_net is None:
+        return "hold"
+    try:
+        terminal = float(expected_terminal_net)
+        mark = float(unrealized_net)
+    except (TypeError, ValueError):
+        return "hold"
+    if not math.isfinite(terminal) or not math.isfinite(mark):
+        return "hold"
+    if terminal < mark:
+        return "exit"
+    return "hold"
+
+
 def day_size_mult(expected_net: float, risk: float) -> float:
     """Bounded size from expected net per unit of adverse risk (as SCALP sizes
     its final edge). Negative evidence shrinks toward the floor; it never blocks."""
@@ -1109,6 +1171,7 @@ def learn_from_close(
     is_dust: bool,
     entered_at: float | None = None,
     now: float | None = None,
+    unrealized_marks: Sequence[float] | None = None,
 ) -> bool:
     """Realized-trade update. Dust, non-current versions and positions entered
     before the engine's economic anchor do not move state."""
@@ -1139,6 +1202,35 @@ def learn_from_close(
         if value is None:
             continue
         wrote = observe(db_path, engine=engine_id, symbol=symbol, setup=setup, regime=regime, metric=metric, value=float(value), strategy_version=strategy_version, now=now) or wrote
+    if net_pct is not None and unrealized_marks:
+        clean: list[float] = []
+        for raw in unrealized_marks:
+            try:
+                mark = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(mark):
+                clean.append(mark)
+        step = max(1, len(clean) // 8)
+        sampled = clean[::step][:8]
+        if sampled:
+            share = 1.0 / len(sampled)
+            for mark in sampled:
+                wrote = (
+                    observe(
+                        db_path,
+                        engine=engine_id,
+                        symbol=symbol,
+                        setup=setup,
+                        regime=regime,
+                        metric=hold_remaining_metric(mark),
+                        value=float(net_pct) - mark,
+                        strategy_version=strategy_version,
+                        now=now,
+                        weight=share,
+                    )
+                    or wrote
+                )
     return wrote
 
 

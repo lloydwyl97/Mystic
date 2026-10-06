@@ -160,12 +160,13 @@ def test_micro_weight_is_bounded_and_falls_when_micro_misleads(tmp_path):
     assert al.micro_weight(helpful, now=T0 + 40)["weight"] == pytest.approx(1.0)
 
 
-def test_micro_cannot_lift_a_non_positive_edge_and_its_tilt_is_capped(tmp_path):
+def test_micro_moves_both_ways_and_its_tilt_is_capped(tmp_path):
     lifted = _edge({"claim_gross_setup": -0.0008, "claim_gross_mean": -0.0008, "micro_residual": 0.0015}, 0.0012)
-    assert lifted.micro_residual_pct == 0.0
-    assert lifted.final_executable_edge_pct <= REJECT_THRESHOLD_PCT
+    assert lifted.micro_residual_pct == pytest.approx(0.0015)
+    assert lifted.final_executable_edge_pct == pytest.approx(lifted.base_executable_edge_pct + lifted.adaptive_residual_pct + 0.0015)
     damped = _edge({"claim_gross_setup": 0.003, "claim_gross_mean": 0.003, "micro_residual": -0.0003}, 0.0030)
     assert damped.micro_residual_pct == pytest.approx(-0.0003)
+    assert damped.final_executable_edge_pct < damped.base_executable_edge_pct + damped.adaptive_residual_pct
     db = str(tmp_path / "c.db")
     for i in range(200):
         al.update_linear_model(db, SCALP, "micro_edge", {"ofi": 1.0 + (i % 3)}, 0.05, now=T0 + i)

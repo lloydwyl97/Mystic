@@ -2295,6 +2295,43 @@ def _stamp_low_mfe_outcome_explain(explainability: TradeExplainability, dd: dict
         explainability.outcome_low_mfe_stall_penalty_eval_json = "{}"
 
 
+def _open_expected_terminal(db_path: str, engine_id: str, symbol: str, setup: str, regime: str, unrealized_net: float) -> float | None:
+    """Learned terminal net from the current mark plus continuation value. Missing state stays neutral."""
+    try:
+        from backend.services.adaptive_learning import continuation_terminal
+
+        return continuation_terminal(db_path, engine_id, symbol, setup, regime, unrealized_net)
+    except Exception:
+        logger.debug("EXPECTED_TERMINAL_UNAVAILABLE symbol=%s", symbol, exc_info=True)
+    return None
+
+
+def _hold_unrealized_marks(db_path: str, trade_id: str) -> list[float]:
+    """Causal open-position marks for continuation learning. Missing rows teach nothing."""
+    if not trade_id:
+        return []
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        try:
+            rows = conn.execute(
+                "SELECT net_unrealized_pct FROM ai_position_heartbeats WHERE trade_id=? ORDER BY epoch_ms",
+                (trade_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+    marks: list[float] = []
+    for row in rows:
+        try:
+            mark = float(row[0])
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(mark):
+            marks.append(mark)
+    return marks
+
+
 def strategy_exit_type(exit_trigger: str) -> ExitType:
     """STRATEGY for a recognised DAY_V2/SCALP_V2 trigger, MANUAL otherwise."""
     from backend.services.day_v2.live_exit_evaluator import day_v2_recorded_exit_reason
@@ -7225,6 +7262,7 @@ class PortfolioEngine:
                     version_current=bool(_prov.get("version_current")),
                     is_dust=bool(_prov.get("is_dust")),
                     entered_at=record.entry_timestamp,
+                    unrealized_marks=_hold_unrealized_marks(self.db_path, str(getattr(position, "trade_id", "") or "")),
                 )
             except Exception:
                 logger.debug("ADAPTIVE_CLOSE_LEARN_SKIPPED symbol=%s", symbol, exc_info=True)
@@ -16424,10 +16462,10 @@ class PortfolioEngine:
             )
             return None
 
-        # DAY V2 exit dispatch — runs before all legacy exits.
-        # Positions with engine_id='DAY_V2' use the DAY V2 exit roles
-        # (catastrophic / structural / structure-runner ratchet / time) and
-        # skip the SCALP V2 stall/giveback/profit logic below.
+            # DAY V2 exit dispatch — runs before all legacy exits.
+        # Positions with engine_id='DAY_V2' use catastrophic protection and
+        # the learned continuation comparison. Structure, objective and age
+        # stay on the position as state. They do not sell by themselves.
         _pos_engine_id = str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE")
         from backend.services.protected_external_inventory import exit_route
 
@@ -16448,6 +16486,9 @@ class PortfolioEngine:
                 if _bar_low_day_v2 <= 0:
                     _bar_low_day_v2 = float(current_price)
                 _adapt = getattr(position, "adaptive_decision", None) or {}
+                _day_setup = str((_adapt or {}).get("setup") or getattr(position, "entry_thesis", "") or "")
+                _day_unreal = (float(current_price) - entry_price) / entry_price - float(ESTIMATED_ROUNDTRIP_COST)
+                _terminal = _open_expected_terminal(self.db_path, "DAY_V2", symbol, _day_setup, str((_adapt or {}).get("regime") or ""), _day_unreal)
                 _day_v2_dec = evaluate_day_v2_exit(
                     engine_id=_pos_engine_id,
                     entry_price=entry_price,
@@ -16467,6 +16508,7 @@ class PortfolioEngine:
                     runner_activation_mult=float((_adapt or {}).get("runner_activation_mult") or 1.0),
                     runner_trail_mult=float((_adapt or {}).get("runner_trail_mult") or 1.0),
                     runner_tighten_mult=float((_adapt or {}).get("runner_tighten_mult") or 1.0),
+                    expected_terminal_net=_terminal,
                 )
                 if _day_v2_dec and str(_day_v2_dec.get("action") or "") == "sell":
                     _day_v2_reason = str(_day_v2_dec.get("reason") or "DAY_V2_EXIT")
@@ -16498,10 +16540,9 @@ class PortfolioEngine:
                 return None
 
         # ── SCALP V2 exit dispatch ─────────────────────────────────────────────
-        # Positions with engine_id='SCALP_V2' use the SCALP V2 short-horizon
-        # ladder (catastrophic / net-profit target / adverse stop / horizon) and
-        # skip DAY structural invalidation, DAY thesis objectives, DAY 300-min
-        # ceiling, and allweather bracket exits. Errors fail closed (hold).
+        # Positions with engine_id='SCALP_V2' use catastrophic protection and
+        # the learned continuation comparison. Elapsed time, a fixed target
+        # and a fixed adverse distance do not sell. Errors fail closed (hold).
         if _pos_engine_id == "SCALP_V2":
             try:
                 from backend.services.scalp_v2.exit_evaluator import evaluate_scalp_v2_exit, scalp_v2_net_pnl_at_bid_pct
@@ -16522,6 +16563,15 @@ class PortfolioEngine:
                 if _bar_low_sv2 <= 0:
                     _bar_low_sv2 = float(current_price)
 
+                _scalp_adapt = getattr(position, "adaptive_decision", None) or {}
+                _scalp_terminal = _open_expected_terminal(
+                    self.db_path,
+                    "SCALP_V2",
+                    symbol,
+                    str((_scalp_adapt or {}).get("setup") or getattr(position, "entry_thesis", "") or ""),
+                    str((_scalp_adapt or {}).get("regime") or ""),
+                    _net_pnl_sv2,
+                )
                 _scalp_v2_dec = evaluate_scalp_v2_exit(
                     position=position,
                     current_price=float(current_price),
@@ -16530,6 +16580,7 @@ class PortfolioEngine:
                     bar_low=_bar_low_sv2,
                     symbol=symbol,
                     allow_adverse_stop=executable_bid is not None and float(executable_bid) > 0,
+                    expected_terminal_net=_scalp_terminal,
                 )
                 if str(_scalp_v2_dec.get("action") or "") == "sell":
                     _scalp_v2_reason = str(_scalp_v2_dec.get("reason") or "SCALP_V2_EXIT")

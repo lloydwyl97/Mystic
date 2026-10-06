@@ -242,11 +242,10 @@ def test_h_scalp_exit_is_target_stop_horizon():
     target = cal.scalp_v2_min_net_profit_pct()
     stop = cal.scalp_v2_max_adverse_net_pct()
     assert 0 < stop < target < 0.004
-    assert _scalp_exit(target, 3)["reason"] == ev.SCALP_V2_EXIT_NET_PROFIT
-    assert _scalp_exit(-stop, 3)["reason"] == ev.SCALP_V2_EXIT_ADVERSE
-    assert _scalp_exit(0.001, 5)["action"] == "hold"
-    assert _scalp_exit(0.001, ev.SCALP_V2_TIME_STOP_MIN)["reason"] == ev.SCALP_V2_EXIT_TIME_STOP
-    assert _scalp_exit(-0.0005, ev.SCALP_V2_TIME_STOP_MIN)["reason"] == ev.SCALP_V2_EXIT_TIME_STOP
+    assert _scalp_exit(target, 3)["action"] == "hold"
+    assert _scalp_exit(-stop, 3)["action"] == "hold"
+    assert _scalp_exit(0.001, ev.SCALP_V2_TIME_STOP_MIN)["action"] == "hold"
+    assert _scalp_exit(-0.0005, ev.SCALP_V2_TIME_STOP_MIN)["action"] == "hold"
 
 
 def test_h_scalp_target_is_the_entry_economics_target(monkeypatch):

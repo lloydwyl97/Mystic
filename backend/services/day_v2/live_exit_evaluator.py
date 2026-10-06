@@ -6,22 +6,14 @@ dict or None. Called from portfolio_engine._check_exit_conditions.
 This is NOT shadow-only. It routes to real order execution. Do not add
 assert_no_live_authority() calls here.
 
-Exit priority (highest to lowest):
-  1. CATASTROPHIC_PROTECTION  — adverse move beyond max(3x 15m ATR,
-                                distance from entry to the structural anchor
-                                plus one 15m ATR). Quiet ATR cannot fire inside
-                                the structural region.
-  2. STRUCTURAL_INVALIDATION  — price below the setup's structural anchor (after 3+ bars)
-  3. WINNER_PROTECTION        — structure-runner ratchet (day_v2.winner_contract):
-                                live only when the computed ATR trail itself is
-                                above break-even after round-trip cost. A trail
-                                still at or below that level is not replaced
-                                with break-even. Reported as OBJECTIVE_COMPLETE
-                                when the setup objective was reached before the stop.
+Exit priority:
+  1. CATASTROPHIC_PROTECTION — adverse move beyond max(3x 15m ATR,
+     distance from entry to the structural anchor plus one 15m ATR).
+  2. LEARNED_CONTINUATION — the learned terminal net of this state is worse
+     than the net available now. Structural anchor, objective and the runner
+     are position features. They do not sell by themselves.
 
 Elapsed hold is telemetry only. It is not a sell authority.
-There is no fixed profit target: reaching the objective tightens the ratchet,
-it does not sell.
 """
 
 from __future__ import annotations
@@ -69,6 +61,7 @@ _DAY_V2_RECORDED_EXIT_REASONS: dict[str, str] = {
     "DAY_V2_STRUCTURAL_INVALIDATION": "THESIS_INVALIDATION_EXIT",
     "DAY_V2_WINNER_PROTECTION": "TRAILING_STOP_EXIT",
     "DAY_V2_OBJECTIVE_COMPLETE": "NET_PROFIT_EXIT",
+    "DAY_V2_LEARNED_CONTINUATION": "LEARNED_CONTINUATION_EXIT",
     "DAY_V2_TIME_EXPIRATION": "TIME_STOP_EXIT",
 }
 
@@ -120,9 +113,7 @@ def day_v2_exit_policy() -> dict:
         "automated_sells_triggered_by": "day_v2_live_exit_contract",
         "exit_paths": [
             "DAY_V2_CATASTROPHIC_PROTECTION",
-            "DAY_V2_STRUCTURAL_INVALIDATION",
-            "DAY_V2_WINNER_PROTECTION",
-            "DAY_V2_OBJECTIVE_COMPLETE",
+            "DAY_V2_LEARNED_CONTINUATION",
         ],
         "catastrophic_basis": (f"low <= entry - max({DAY_V2_CATASTROPHIC_ATR_MULTIPLIER}x 15m ATR, entry-to-anchor + {DAY_V2_CATASTROPHIC_ANCHOR_BUFFER_ATR}x 15m ATR)"),
         "structural_invalidation_bars_required": DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED,
@@ -186,8 +177,8 @@ def preview_day_v2_exit(
     arming_price = entry_price + activation_mult * atr_1h if atr_1h > 0 and entry_price > 0 else None
     structural_active = structural_anchor > 0 and bars_held_approx >= DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED
     if runner["activated"]:
-        authority = "DAY_V2_OBJECTIVE_COMPLETE" if runner["objective_reached"] else "DAY_V2_WINNER_PROTECTION"
-        next_exit = f"price <= runner stop {runner['stop']:.6f}"
+        authority = "DAY_V2_LEARNED_CONTINUATION"
+        next_exit = "learned terminal net < unrealized net"
     elif structural_active:
         authority = "DAY_V2_STRUCTURAL_INVALIDATION"
         next_exit = f"price < structural anchor {structural_anchor:.6f}"
@@ -238,6 +229,7 @@ def evaluate_day_v2_exit(
     runner_activation_mult: float = 1.0,
     runner_trail_mult: float = 1.0,
     runner_tighten_mult: float = 1.0,
+    expected_terminal_net: float | None = None,
     now: float | None = None,
 ) -> dict | None:
     """Evaluate all DAY V2 exit roles.
@@ -273,9 +265,6 @@ def evaluate_day_v2_exit(
 
     now = time.time() if now is None else float(now)
     hold_minutes = max(0.0, (now - entry_time) / 60.0) if entry_time > 0 else 0.0
-    # Approximate closed-15m-bar count from wall-clock hold time.
-    # Used only for the structural-invalidation guard (requires N closed bars).
-    bars_held_approx = int(hold_minutes / 15.0)
 
     # Role 1: Catastrophic protection — uses the lowest price since entry.
     # Sits outside the structural anchor when that anchor is known, so a quiet
@@ -298,54 +287,21 @@ def evaluate_day_v2_exit(
                 "detail": (f"adverse={adverse_move * 100:.2f}% >= {catastro_pct * 100:.2f}% (outside anchor or {DAY_V2_CATASTROPHIC_ATR_MULTIPLIER}x ATR)"),
             }
 
-    # Role 2: Structural invalidation — only fires after N closed bars
-    if structural_anchor > 0 and bars_held_approx >= DAY_V2_STRUCTURAL_INVALIDATION_BARS_CLOSED and current_price < structural_anchor:
-        logger.warning(
-            "DAY_V2_STRUCTURAL price=%.6f < anchor=%.6f bars_approx=%d",
-            current_price,
-            structural_anchor,
-            bars_held_approx,
-        )
-        return {
-            "action": "sell",
-            "reason": "DAY_V2_STRUCTURAL_INVALIDATION",
-            "exit_price_estimate": current_price,
-            "detail": (f"price={current_price:.6f} < anchor={structural_anchor:.6f} bars_approx={bars_held_approx}"),
-        }
+    unrealized_net = (current_price - entry_price) / entry_price - float(estimated_roundtrip_cost or 0.0)
+    from backend.services.adaptive_learning import learned_hold_or_exit
 
-    # Role 3: Structure-runner ratchet
-    atr_1h, objective, runner = _runner_state(
-        entry_price=entry_price,
-        highest_price=highest_price,
-        atr_at_entry=atr_at_entry,
-        target_price=target_price,
-        estimated_roundtrip_cost=estimated_roundtrip_cost,
-        setup=setup,
-        atr_1h_at_entry=atr_1h_at_entry,
-        objective_structural=objective_structural,
-        objective_atr_mult=objective_atr_mult,
-        structural_emphasis=structural_emphasis,
-        runner_activation_mult=runner_activation_mult,
-        runner_trail_mult=runner_trail_mult,
-        runner_tighten_mult=runner_tighten_mult,
-    )
-    if runner["activated"] and current_price <= runner["stop"]:
-        reason = "DAY_V2_OBJECTIVE_COMPLETE" if runner["objective_reached"] else "DAY_V2_WINNER_PROTECTION"
-        mfe_pct = (max(highest_price, entry_price) - entry_price) / entry_price
-        logger.warning(
-            "DAY_V2_RUNNER_STOP reason=%s mfe=%.3f%% stop=%.6f objective=%.6f trail_atr_1h=%.2f price=%.6f",
-            reason,
-            mfe_pct * 100,
-            runner["stop"],
-            objective,
-            runner["trail_atr_1h"],
+    if learned_hold_or_exit(expected_terminal_net=expected_terminal_net, unrealized_net=unrealized_net) == "exit":
+        logger.info(
+            "DAY_V2_LEARNED_CONTINUATION price=%.6f unrealized=%.5f terminal=%.5f",
             current_price,
+            unrealized_net,
+            float(expected_terminal_net or 0.0),
         )
         return {
             "action": "sell",
-            "reason": reason,
+            "reason": "DAY_V2_LEARNED_CONTINUATION",
             "exit_price_estimate": current_price,
-            "detail": (f"mfe={mfe_pct * 100:.2f}% stop={runner['stop']:.6f} objective={objective:.6f} atr_1h={atr_1h:.6f} trail={runner['trail_atr_1h']}x"),
+            "detail": f"unrealized={unrealized_net:.6f} terminal={float(expected_terminal_net):.6f}",
         }
 
     if hold_minutes >= DAY_V2_MAX_HOLD_MINUTES:

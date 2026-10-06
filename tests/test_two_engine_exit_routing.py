@@ -205,23 +205,30 @@ def test_unknown_engine_id_returns_empty_from_scalp_evaluator():
 # ---------------------------------------------------------------------------
 
 
-def test_scalp_net_profit_exit_has_scalp_reason():
-    import os
-
+def test_scalp_fixed_profit_holds_and_a_worse_terminal_uses_a_scalp_reason():
     from backend.services.scalp_v2.exit_evaluator import evaluate_scalp_v2_exit
 
-    with patch.dict(os.environ, {"SCALP_V2_MIN_NET_PROFIT_PCT": "0.001"}):
-        pos = _make_scalp_position(100.0)
-        result = evaluate_scalp_v2_exit(
-            position=pos,
-            current_price=100.2,
-            net_pnl_pct=0.001,
-            hold_minutes=5.0,
-            bar_low=100.1,
-        )
-    assert result.get("action") == "sell"
-    assert "SCALP_V2" in str(result.get("reason", ""))
-    assert "DAY" not in str(result.get("reason", "")).upper()
+    pos = _make_scalp_position(100.0)
+    held = evaluate_scalp_v2_exit(
+        position=pos,
+        current_price=100.2,
+        net_pnl_pct=0.001,
+        hold_minutes=5.0,
+        bar_low=100.1,
+        expected_terminal_net=0.01,
+    )
+    assert held.get("action") == "hold"
+    sold = evaluate_scalp_v2_exit(
+        position=pos,
+        current_price=100.2,
+        net_pnl_pct=0.001,
+        hold_minutes=5.0,
+        bar_low=100.1,
+        expected_terminal_net=-0.01,
+    )
+    assert sold.get("action") == "sell"
+    assert sold.get("reason") == "SCALP_V2_LEARNED_CONTINUATION"
+    assert "DAY" not in str(sold.get("reason", "")).upper()
 
 
 # ---------------------------------------------------------------------------

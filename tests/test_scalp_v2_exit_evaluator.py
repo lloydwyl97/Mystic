@@ -139,24 +139,28 @@ def test_catastrophic_does_not_fire_on_small_adverse():
 # ---------------------------------------------------------------------------
 
 
-def test_net_profit_take_fires_at_threshold():
-    """Net P&L >= 0.4% triggers profit take."""
-    from backend.services.scalp_v2.exit_evaluator import (
-        SCALP_V2_EXIT_NET_PROFIT,
-        evaluate_scalp_v2_exit,
-    )
+def test_a_fixed_profit_threshold_does_not_sell():
+    from backend.services.scalp_v2.exit_evaluator import evaluate_scalp_v2_exit
 
     with patch.dict(os.environ, {"SCALP_V2_MIN_NET_PROFIT_PCT": "0.004"}):
         pos = _make_position(cost_basis=100.0, highest_price=101.0)
         result = evaluate_scalp_v2_exit(
             position=pos,
             current_price=100.5,
-            net_pnl_pct=0.004,  # exactly at threshold
+            net_pnl_pct=0.004,
             hold_minutes=5.0,
             bar_low=100.3,
         )
-    assert result.get("action") == "sell"
-    assert result.get("reason") == SCALP_V2_EXIT_NET_PROFIT
+    assert result.get("action") == "hold"
+    sold = evaluate_scalp_v2_exit(
+        position=pos,
+        current_price=100.5,
+        net_pnl_pct=0.004,
+        hold_minutes=5.0,
+        bar_low=100.3,
+        expected_terminal_net=0.0,
+    )
+    assert sold.get("reason") == "SCALP_V2_LEARNED_CONTINUATION"
 
 
 def test_net_profit_take_does_not_fire_below_threshold():
@@ -188,12 +192,7 @@ def test_net_profit_take_does_not_fire_below_threshold():
 
 
 def test_time_stop_fires_past_scalp_horizon():
-    """A scalp ends at the SCALP horizon even when the loss is inside the adverse bound."""
-    from backend.services.scalp_v2.exit_evaluator import (
-        SCALP_V2_EXIT_TIME_STOP,
-        SCALP_V2_TIME_STOP_MIN,
-        evaluate_scalp_v2_exit,
-    )
+    from backend.services.scalp_v2.exit_evaluator import SCALP_V2_TIME_STOP_MIN, evaluate_scalp_v2_exit
 
     pos = _make_position(cost_basis=100.0, highest_price=100.05)
     result = evaluate_scalp_v2_exit(
@@ -203,13 +202,11 @@ def test_time_stop_fires_past_scalp_horizon():
         hold_minutes=SCALP_V2_TIME_STOP_MIN + 1,
         bar_low=99.95,
     )
-    assert result.get("action") == "sell"
-    assert result.get("reason") == SCALP_V2_EXIT_TIME_STOP
+    assert result.get("action") == "hold"
 
 
 def test_horizon_exits_a_small_winner_too():
-    """The horizon is not a negative-only time stop. A small green scalp still ends."""
-    from backend.services.scalp_v2.exit_evaluator import SCALP_V2_EXIT_TIME_STOP, SCALP_V2_TIME_STOP_MIN, evaluate_scalp_v2_exit
+    from backend.services.scalp_v2.exit_evaluator import SCALP_V2_TIME_STOP_MIN, evaluate_scalp_v2_exit
 
     pos = _make_position(cost_basis=100.0, highest_price=100.5)
     result = evaluate_scalp_v2_exit(
@@ -219,17 +216,20 @@ def test_horizon_exits_a_small_winner_too():
         hold_minutes=SCALP_V2_TIME_STOP_MIN + 1,
         bar_low=100.0,
     )
-    assert result.get("action") == "sell"
-    assert result.get("reason") == SCALP_V2_EXIT_TIME_STOP
+    assert result.get("action") == "hold"
+    sold = evaluate_scalp_v2_exit(
+        position=pos,
+        current_price=100.1,
+        net_pnl_pct=0.001,
+        hold_minutes=1.0,
+        bar_low=100.0,
+        expected_terminal_net=-0.001,
+    )
+    assert sold.get("reason") == "SCALP_V2_LEARNED_CONTINUATION"
 
 
 def test_time_stop_uses_scalp_ceiling_not_day_ceiling():
-    """SCALP horizon is a short hold, far under DAY's 300 minute ceiling."""
-    from backend.services.scalp_v2.exit_evaluator import (
-        SCALP_V2_EXIT_TIME_STOP,
-        SCALP_V2_TIME_STOP_MIN,
-        evaluate_scalp_v2_exit,
-    )
+    from backend.services.scalp_v2.exit_evaluator import SCALP_V2_TIME_STOP_MIN, evaluate_scalp_v2_exit
 
     assert SCALP_V2_TIME_STOP_MIN <= 30
     assert SCALP_V2_TIME_STOP_MIN < 300
@@ -241,8 +241,7 @@ def test_time_stop_uses_scalp_ceiling_not_day_ceiling():
         hold_minutes=float(SCALP_V2_TIME_STOP_MIN) + 5,
         bar_low=99.95,
     )
-    assert result.get("action") == "sell"
-    assert result.get("reason") == SCALP_V2_EXIT_TIME_STOP
+    assert result.get("action") == "hold"
 
 
 # ---------------------------------------------------------------------------

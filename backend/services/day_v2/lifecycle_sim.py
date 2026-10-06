@@ -1,13 +1,14 @@
 """Causal DAY V2 lifecycle label for a qualified candidate.
 
 A fixed-horizon markout asks where price was N minutes after the decision. A
-DAY position is not held for a fixed time: the live exit contract (catastrophic
-protection, structural invalidation, structure runner) decides when it leaves.
-This walks closed 1m bars after the decision through that same contract
-(``evaluate_day_v2_exit`` with an explicit clock) and returns the net return a
-fill at the decision ask would have realized after the canonical round-trip
-cost. A position still open at ``DAY_LIFECYCLE_MAX_MIN`` is marked at that
-bar's close and flagged censored.
+DAY position is not held for a fixed time: live exits are catastrophic
+protection and, when a continuation terminal is stamped, the learned
+comparison of that terminal with the mark. This walks closed 1m bars after
+the decision through that contract (``evaluate_day_v2_exit`` with an explicit
+clock) and returns the net return a fill at the decision ask would have
+realized after the canonical round-trip cost. A position still open at
+``DAY_LIFECYCLE_MAX_MIN`` is marked at that bar's close and flagged censored.
+That horizon is a label censor, not a live sell.
 
 Only bars opening at or after the decision are read, and a label is final only
 once its exit or its horizon has passed, so it can never inform the decision
@@ -49,6 +50,7 @@ class LifecycleParams:
     runner_activation_mult: float = 1.0
     runner_trail_mult: float = 1.0
     runner_tighten_mult: float = 1.0
+    expected_terminal_net: float | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -91,6 +93,9 @@ class LifecycleParams:
             runner_activation_mult=mult("runner_activation_mult"),
             runner_trail_mult=mult("runner_trail_mult"),
             runner_tighten_mult=mult("runner_tighten_mult"),
+            # Entry expectancy is not the continuation forecast. A missing
+            # terminal holds until catastrophic protection or the label censor.
+            expected_terminal_net=None,
         )
 
 
@@ -148,6 +153,7 @@ def simulate_lifecycle(
             runner_activation_mult=float(params.runner_activation_mult),
             runner_trail_mult=float(params.runner_trail_mult),
             runner_tighten_mult=float(params.runner_tighten_mult),
+            expected_terminal_net=params.expected_terminal_net,
             now=t_close,
         )
         if decision:

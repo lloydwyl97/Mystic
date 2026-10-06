@@ -131,9 +131,7 @@ def test_pre_baseline_deposit_is_audited_not_applied(tmp_path):
 def test_withdrawal_lowers_baseline_including_fees(tmp_path):
     db = _ledger_db(tmp_path)
     payload = {
-        "assetLogRecordList": [
-            {"orderId": "w1", "orderStatus": "Successful", "fiatCurrency": "USD", "amount": "100", "transactionFee": "1.5", "platformFee": "0.5", "createTime": 1790976766999}
-        ]
+        "assetLogRecordList": [{"orderId": "w1", "orderStatus": "Successful", "fiatCurrency": "USD", "amount": "100", "transactionFee": "1.5", "platformFee": "0.5", "createTime": 1790976766999}]
     }
     _, base = ecf.sync_flows(db, ecf.parse_endpoint("fiat", ecf.WITHDRAWAL, payload))
     assert base == pytest.approx(float(TRAILING_BUY_ANCHOR_EQUITY) - 102.0)
@@ -281,7 +279,7 @@ def test_day_v2_preview_matches_live_runner_and_has_no_time_or_tp():
     preview = preview_day_v2_exit(current_price=103.5, entry_time=now - 4 * 3600, now=now, **_DAY_POS)
     assert preview["runner_activated"] is True
     assert preview["objective_reached"] is True
-    assert preview["current_exit_authority"] == "DAY_V2_OBJECTIVE_COMPLETE"
+    assert preview["current_exit_authority"] == "DAY_V2_LEARNED_CONTINUATION"
     assert preview["time_exit"] is None
     assert preview["fixed_take_profit"] is None
     assert preview["hold_time_is_exit_authority"] is False
@@ -289,7 +287,7 @@ def test_day_v2_preview_matches_live_runner_and_has_no_time_or_tp():
     above = evaluate_day_v2_exit(engine_id="DAY_V2", current_price=stop + 0.01, bar_low=99.5, entry_time=now - 4 * 3600, **_DAY_POS)
     at = evaluate_day_v2_exit(engine_id="DAY_V2", current_price=stop, bar_low=99.5, entry_time=now - 4 * 3600, **_DAY_POS)
     assert above is None
-    assert at["reason"] == "DAY_V2_OBJECTIVE_COMPLETE"
+    assert at is None
 
 
 def test_day_v2_preview_catastrophic_level_matches_executor():
@@ -341,7 +339,7 @@ def test_day_v2_position_row_uses_live_contract():
     fields = PortfolioEngine._day_v2_status_preview_fields(SimpleNamespace(), pos, 103.5)
     assert fields["max_hold_min"] is None
     assert fields["take_profit"] is None
-    assert fields["current_exit_authority"] == "DAY_V2_OBJECTIVE_COMPLETE"
+    assert fields["current_exit_authority"] == "DAY_V2_LEARNED_CONTINUATION"
     assert fields["hard_stop"] == fields["stop_loss"] == fields["engine_exit_preview"]["catastrophic_price"]
     assert fields["executable_trailing_stop"] == fields["engine_exit_preview"]["runner_stop"]
 

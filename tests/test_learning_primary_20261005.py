@@ -146,6 +146,153 @@ def test_scalp_losses_lower_edge_and_size_and_wins_restore_them(tmp_path):
     assert back.size_mult >= down.size_mult
 
 
+def test_continuation_exits_when_holding_is_worse_and_holds_when_it_is_better():
+    from backend.services.day_v2.live_exit_evaluator import evaluate_day_v2_exit
+    from backend.services.scalp_v2.exit_evaluator import evaluate_scalp_v2_exit
+
+    assert al.learned_hold_or_exit(expected_terminal_net=None, unrealized_net=0.01) == "hold"
+    assert al.learned_hold_or_exit(expected_terminal_net=0.0, unrealized_net=0.0) == "hold"
+    worse = al.learned_hold_or_exit(expected_terminal_net=-0.01, unrealized_net=-0.001)
+    better = al.learned_hold_or_exit(expected_terminal_net=0.02, unrealized_net=-0.001)
+    assert worse == "exit" and better == "hold"
+    day = evaluate_day_v2_exit(
+        engine_id="DAY_V2",
+        entry_price=100.0,
+        current_price=100.2,
+        bar_low=100.0,
+        highest_price=100.2,
+        atr_at_entry=1.0,
+        structural_anchor=99.0,
+        target_price=103.0,
+        entry_time=T0,
+        estimated_roundtrip_cost=0.0006,
+        now=T0 + 3600,
+        expected_terminal_net=-0.002,
+    )
+    assert day["reason"] == "DAY_V2_LEARNED_CONTINUATION"
+    held = evaluate_day_v2_exit(
+        engine_id="DAY_V2",
+        entry_price=100.0,
+        current_price=99.5,
+        bar_low=99.5,
+        highest_price=100.0,
+        atr_at_entry=1.0,
+        structural_anchor=90.0,
+        target_price=103.0,
+        entry_time=T0,
+        estimated_roundtrip_cost=0.0006,
+        now=T0 + 50 * 60,
+        expected_terminal_net=0.01,
+    )
+    assert held is None
+    from types import SimpleNamespace
+
+    pos = SimpleNamespace(engine_id="SCALP_V2", cost_basis=100.0, entry_price=100.0, highest_price=100.0, lowest_price=100.0, symbol="ETHUSDT", adaptive_decision={})
+    early = evaluate_scalp_v2_exit(position=pos, current_price=100.0, net_pnl_pct=-0.001, hold_minutes=3.0, bar_low=100.0, expected_terminal_net=-0.01)
+    assert early["reason"] == "SCALP_V2_LEARNED_CONTINUATION"
+    stayed = evaluate_scalp_v2_exit(position=pos, current_price=100.0, net_pnl_pct=0.002, hold_minutes=40.0, bar_low=100.0, expected_terminal_net=0.01)
+    assert stayed["action"] == "hold"
+
+
+def test_later_positive_terminal_stops_the_early_exit():
+    assert al.learned_hold_or_exit(expected_terminal_net=-0.02, unrealized_net=-0.004) == "exit"
+    assert al.learned_hold_or_exit(expected_terminal_net=0.01, unrealized_net=-0.004) == "hold"
+
+
+def test_continuation_learns_both_directions_without_a_config_change(tmp_path):
+    db = str(tmp_path / "cont.db")
+    day_ver = al.current_strategy_version(al.DAY_ENGINE)
+    scalp_ver = al.current_strategy_version(al.SCALP_ENGINE)
+
+    def day_term(mark: float) -> float:
+        return float(al.continuation_terminal(db, al.DAY_ENGINE, "SOLUSDT", "RANGE_BOUNCE", "neutral", mark, now=T0))
+
+    def scalp_term(mark: float) -> float:
+        return float(al.continuation_terminal(db, al.SCALP_ENGINE, "ETHUSDT", "VWAP_EMA_RECLAIM", "neutral", mark, now=T0))
+
+    assert day_term(0.008) == pytest.approx(0.008)
+    assert scalp_term(-0.003) == pytest.approx(-0.003)
+    assert al.learned_hold_or_exit(expected_terminal_net=day_term(0.008), unrealized_net=0.008) == "hold"
+    assert al.learned_hold_or_exit(expected_terminal_net=scalp_term(-0.003), unrealized_net=-0.003) == "hold"
+
+    common = {"version_current": True, "is_dust": False, "continuation": None}
+    assert al.learn_from_close(
+        db,
+        engine=al.DAY_ENGINE,
+        symbol="SOLUSDT",
+        setup="RANGE_BOUNCE",
+        regime="neutral",
+        strategy_version=day_ver,
+        net_pct=-0.002,
+        mfe_pct=0.01,
+        mae_pct=0.004,
+        hold_min=30,
+        now=T0,
+        unrealized_marks=[0.008],
+        **common,
+    )
+    green_after_loss = day_term(0.008)
+    assert green_after_loss < 0.008
+    assert al.learned_hold_or_exit(expected_terminal_net=green_after_loss, unrealized_net=0.008) == "exit"
+    for _ in range(6):
+        al.learn_from_close(
+            db,
+            engine=al.DAY_ENGINE,
+            symbol="SOLUSDT",
+            setup="RANGE_BOUNCE",
+            regime="neutral",
+            strategy_version=day_ver,
+            net_pct=0.02,
+            mfe_pct=0.03,
+            mae_pct=0.002,
+            hold_min=40,
+            now=T0 + 100,
+            unrealized_marks=[0.008],
+            **common,
+        )
+    green_recovered = day_term(0.008)
+    assert green_recovered > green_after_loss
+    assert al.learned_hold_or_exit(expected_terminal_net=green_recovered, unrealized_net=0.008) == "hold"
+
+    al.learn_from_close(
+        db,
+        engine=al.SCALP_ENGINE,
+        symbol="ETHUSDT",
+        setup="VWAP_EMA_RECLAIM",
+        regime="neutral",
+        strategy_version=scalp_ver,
+        net_pct=-0.012,
+        mfe_pct=0.001,
+        mae_pct=0.012,
+        hold_min=5,
+        now=T0,
+        unrealized_marks=[-0.003],
+        **common,
+    )
+    red_worse = scalp_term(-0.003)
+    assert red_worse < -0.003
+    assert al.learned_hold_or_exit(expected_terminal_net=red_worse, unrealized_net=-0.003) == "exit"
+    for _ in range(6):
+        al.learn_from_close(
+            db,
+            engine=al.SCALP_ENGINE,
+            symbol="ETHUSDT",
+            setup="VWAP_EMA_RECLAIM",
+            regime="neutral",
+            strategy_version=scalp_ver,
+            net_pct=0.004,
+            mfe_pct=0.006,
+            mae_pct=0.003,
+            hold_min=8,
+            now=T0 + 200,
+            unrealized_marks=[-0.003],
+            **common,
+        )
+    red_recovered = scalp_term(-0.003)
+    assert red_recovered > red_worse
+    assert al.learned_hold_or_exit(expected_terminal_net=red_recovered, unrealized_net=-0.003) == "hold"
+
+
 def test_universe_slots_and_exits_are_unchanged():
     assert DAY_V2_UNIVERSE == ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
     assert (pe.DAY_MAX_OPEN_POSITIONS, pe.SCALP_MAX_OPEN_POSITIONS) == (4, 4)

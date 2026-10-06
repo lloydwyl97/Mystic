@@ -146,14 +146,12 @@ def test_ratchet_tightens_after_objective():
     assert post["stop"] == pytest.approx(103.2 - RUNNER_TIGHT_TRAIL_ATR_1H * ATR1H)
 
 
-def test_ratchet_exit_and_objective_labels():
+def test_ratchet_levels_do_not_sell_and_a_worse_terminal_does():
     hi = 102.5
     stop = hi - RUNNER_TRAIL_ATR_1H * ATR1H
-    assert _exit(highest_price=hi, current_price=stop + 0.01) is None
-    assert _exit(highest_price=hi, current_price=stop - 0.01)["reason"] == "DAY_V2_WINNER_PROTECTION"
-    hi = 104.0
-    stop = hi - RUNNER_TIGHT_TRAIL_ATR_1H * ATR1H
-    assert _exit(highest_price=hi, current_price=stop - 0.01)["reason"] == "DAY_V2_OBJECTIVE_COMPLETE"
+    assert _exit(highest_price=hi, current_price=stop - 0.01) is None
+    sold = _exit(highest_price=hi, current_price=101.0, expected_terminal_net=-0.01)
+    assert sold["reason"] == "DAY_V2_LEARNED_CONTINUATION"
 
 
 def test_winner_protection_does_not_substitute_break_even():
@@ -181,9 +179,10 @@ def test_catastrophic_stop_still_fires_outside_the_anchor():
     assert _exit(bar_low=inside, current_price=99.0) is None
 
 
-def test_thesis_invalidation_still_fires():
-    assert _exit(current_price=98.4, bar_low=98.9)["reason"] == "DAY_V2_STRUCTURAL_INVALIDATION"
-    assert _exit(current_price=98.4, bar_low=98.9, entry_time=time.time() - 20 * 60) is None
+def test_price_under_the_anchor_holds_until_the_learned_terminal_or_catastrophe():
+    assert _exit(current_price=98.4, bar_low=98.9) is None
+    sold = _exit(current_price=98.4, bar_low=98.9, expected_terminal_net=-0.05)
+    assert sold["reason"] == "DAY_V2_LEARNED_CONTINUATION"
 
 
 # --- time stop is not a scalp time stop ---------------------------------------
@@ -244,12 +243,14 @@ def _scalp_pos(**kw):
     return SimpleNamespace(**base)
 
 
-def test_scalp_time_stop_is_short_horizon():
+def test_scalp_age_does_not_sell():
     from backend.services.scalp_v2.exit_evaluator import SCALP_V2_TIME_STOP_MIN, evaluate_scalp_v2_exit
 
     assert SCALP_V2_TIME_STOP_MIN < DAY_V2_MAX_HOLD_MINUTES
     dec = evaluate_scalp_v2_exit(position=_scalp_pos(), current_price=99.8, net_pnl_pct=-0.0026, hold_minutes=SCALP_V2_TIME_STOP_MIN + 1, bar_low=99.8)
-    assert dec.get("action") == "sell"
+    assert dec.get("action") == "hold"
+    sold = evaluate_scalp_v2_exit(position=_scalp_pos(), current_price=99.8, net_pnl_pct=-0.0026, hold_minutes=3, bar_low=99.8, expected_terminal_net=-0.02)
+    assert sold.get("reason") == "SCALP_V2_LEARNED_CONTINUATION"
 
 
 def test_scalp_loss_containment():
@@ -320,8 +321,7 @@ def test_quiet_15m_atr_cannot_front_run_the_structural_anchor():
         atr_1h_at_entry=0.009586,
         entry_time=time.time() - 60 * 60,
     )
-    assert quiet is not None
-    assert quiet["reason"] == "DAY_V2_STRUCTURAL_INVALIDATION"
+    assert quiet is None
     hard = _exit(
         entry_price=1.505,
         current_price=1.4900,

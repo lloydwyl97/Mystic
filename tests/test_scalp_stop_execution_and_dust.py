@@ -13,7 +13,7 @@ import pytest
 from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST, ORDERBOOK_HALF_SPREAD_ESTIMATE
 from backend.services.portfolio_engine import make_position_key
 from backend.services.scalp_v2 import exit_evaluator as ev
-from backend.services.scalp_v2.exit_evaluator import SCALP_V2_EXIT_ADVERSE, scalp_v2_net_pnl_at_bid_pct
+from backend.services.scalp_v2.exit_evaluator import scalp_v2_net_pnl_at_bid_pct
 from tests.test_two_engine_architecture import DAY, SCALP, _engine, _lot
 
 
@@ -84,25 +84,36 @@ async def test_full_pass_falls_back_to_rest_bid_only_when_fresh(tmp_path, monkey
     assert check.await_args_list[0].kwargs["executable_bid"] is None
 
 
-async def test_adverse_stop_fires_on_bid_while_mid_is_above_trigger(tmp_path, caplog):
+async def test_old_adverse_distance_holds_and_a_worse_terminal_sells_the_bid(tmp_path, caplog, monkeypatch):
     eng = _engine(tmp_path)
     eng.execute_sell_fifo = AsyncMock(return_value={"status": "sold"})
     lot = _lot("ETH/USDT", SCALP, price=100.0)
-    lot.adaptive_decision = {"risk_estimate": 0.003}
+    lot.adaptive_decision = {"risk_estimate": 0.003, "setup": "VWAP_EMA_RECLAIM", "regime": "neutral"}
     lot.entry_time = time.time() - 60
     lot.highest_price = lot.lowest_price = 100.0
-    mid = 99.95  # mid net -11.6 bp: holds
-    bid = 99.86  # bid net -20 bp: past the 15 bp contract
+    mid = 99.95
+    bid = 99.86
+    terms = [None]
+
+    def _terminal(*_args, **_kwargs):
+        return terms[0]
+
+    monkeypatch.setattr("backend.services.portfolio_engine._open_expected_terminal", _terminal)
+    await eng._check_exit_conditions(lot, mid, 0, executable_bid=bid)
+    eng.execute_sell_fifo.assert_not_awaited()
+    terms[0] = -0.05
     await eng._check_exit_conditions(lot, mid, 0, executable_bid=bid)
     eng.execute_sell_fifo.assert_awaited_once()
     args = eng.execute_sell_fifo.await_args
     assert args.args[2] == bid
-    assert args.args[4] == SCALP_V2_EXIT_ADVERSE
+    assert args.args[4] == "SCALP_V2_LEARNED_CONTINUATION"
 
+    terms[0] = None
     eng.execute_sell_fifo.reset_mock()
     with caplog.at_level(logging.WARNING):
         await eng._check_exit_conditions(lot, mid, 0, executable_bid=None)
     assert "SCALP_V2_EXIT_NO_EXECUTABLE_BID" in caplog.text
+    eng.execute_sell_fifo.assert_not_awaited()
 
 
 async def test_scalp_fast_exit_wait_runs_scalp_passes_between_full_passes(monkeypatch):

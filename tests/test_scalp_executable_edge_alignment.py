@@ -265,18 +265,14 @@ def test_adaptive_and_micro_residuals_are_separate_from_base():
     assert d["micro_residual_pct"] == pytest.approx(0.0001)
 
 
-def test_micro_cannot_lift_a_non_positive_candidate():
+def test_micro_moves_the_edge_in_both_directions():
     cost = canonical_roundtrip_cost_pct(spread_pct=SPREAD)
-    e = _edge(_view(cost - 0.0002, micro_residual=0.0015), 0.002)
-    assert e.micro_residual_model_pct == pytest.approx(0.0015)
-    assert e.micro_residual_pct == 0.0
-    assert not e.eligible
+    lifted = _edge(_view(cost - 0.0002, micro_residual=0.0015), 0.002)
+    assert lifted.micro_residual_pct == pytest.approx(0.0015)
+    assert lifted.final_executable_edge_pct > 0 and lifted.eligible
     down = _edge(_view(cost + 0.0002, micro_residual=-0.0015), 0.002)
     assert down.micro_residual_pct == pytest.approx(-0.0015)
-    assert not down.eligible
-    lifted = _edge(_view(cost - 0.0002, cost + 0.0002, micro_residual=0.0005), 0.002)
-    assert lifted.micro_residual_pct == pytest.approx(0.0005)
-    assert lifted.eligible
+    assert down.final_executable_edge_pct < 0 and not down.eligible
 
 
 def test_micro_model_clamp_is_unchanged():
@@ -431,11 +427,10 @@ def _eval(risk, net):
     return evaluate_scalp_v2_exit(position=_pos(risk), current_price=100.0 * (1 + net + ESTIMATED_ROUNDTRIP_COST), net_pnl_pct=net, hold_minutes=2.0, bar_low=99.95, symbol="ETHUSDT")
 
 
-def test_adverse_stop_uses_adaptive_risk_live():
-    assert _eval(0.0003, -0.0009).get("reason") != SCALP_V2_EXIT_ADVERSE
-    assert _eval(0.0003, -0.0010).get("reason") == SCALP_V2_EXIT_ADVERSE
-    assert _eval(0.003, -0.0014).get("reason") != SCALP_V2_EXIT_ADVERSE
-    assert _eval(0.003, -0.0015).get("reason") == SCALP_V2_EXIT_ADVERSE
+def test_adverse_distance_does_not_sell_and_a_worse_terminal_does():
+    assert _eval(0.0003, -0.0010).get("action") == "hold"
+    sold = evaluate_scalp_v2_exit(position=_pos(0.0003), current_price=100.0, net_pnl_pct=-0.001, hold_minutes=2.0, bar_low=99.95, symbol="ETHUSDT", expected_terminal_net=-0.01)
+    assert sold.get("reason") == "SCALP_V2_LEARNED_CONTINUATION"
 
 
 def test_rebuild_uses_only_current_version_evidence_and_keeps_other_state(tmp_path):
@@ -537,6 +532,8 @@ def test_day_priors_and_decision_unchanged():
         "trade_continuation": 0.45,
         "trade_net": 0.0,
         "lifecycle_net": 0.0,
+        "hold_remaining_up": 0.0,
+        "hold_remaining_down": 0.0,
         "markout_forward": 0.0,
         "markout_mae": 0.006,
     }

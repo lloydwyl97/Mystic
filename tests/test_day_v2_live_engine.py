@@ -256,8 +256,7 @@ class TestDayV2ExitEvaluator:
             entry_time=time.time() - 46 * 60,
             bar_low=49799.0,
         )
-        assert result is not None
-        assert result["reason"] == "DAY_V2_STRUCTURAL_INVALIDATION"
+        assert result is None
 
     def test_structural_does_not_fire_before_3_bars(self):
         # entry_time 20 min ago → bars_held_approx = 1
@@ -287,8 +286,7 @@ class TestDayV2ExitEvaluator:
         highest = 50000.0 * 1.0006 + 1.5 * 625.0 + 1.0
         stop = highest - 1.5 * 625.0
         result = self._call(highest_price=highest, current_price=stop - 1.0, bar_low=50000.0, setup="HTF_TREND_PULLBACK", objective_structural=50000.0)
-        assert result is not None
-        assert result["reason"] == "DAY_V2_WINNER_PROTECTION"
+        assert result is None
 
     def test_no_winner_exit_before_trade_proves_itself(self):
         """The old 0.8% MFE / 0.5% trail no longer sells a developing DAY trade."""
@@ -304,8 +302,7 @@ class TestDayV2ExitEvaluator:
     def test_objective_reached_then_tight_ratchet_reports_objective_complete(self):
         highest = 51500.0  # above objective max(50625, 50000 + 2 x 625)
         result = self._call(highest_price=highest, current_price=highest - 0.75 * 625.0 - 1.0, bar_low=50000.0, setup="HTF_TREND_PULLBACK")
-        assert result is not None
-        assert result["reason"] == "DAY_V2_OBJECTIVE_COMPLETE"
+        assert result is None
 
     # Role 3: Time expiration
     def test_time_expiration_does_not_sell(self):

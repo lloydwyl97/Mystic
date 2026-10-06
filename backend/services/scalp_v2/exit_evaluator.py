@@ -4,21 +4,16 @@ Distinct from DAY V2 and legacy exits. Active policy: target_stop_horizon
 (contract SCALP_V2_TARGET_STOP_HORIZON_V1).
 
 A scalp is admitted only when its canonical executable net edge is positive
-(scalp_v2.executable_edge). The exit takes the adaptive target, cuts a scalp
-that moves against it by the learned adverse distance (never wider than the
-SCALP adverse bound), and ends every scalp at the SCALP horizon. It never
-holds for hours.
+(scalp_v2.executable_edge). While open, catastrophic protection sells. The
+economic exit sells only when the learned terminal net of this state is worse
+than the net available now. Elapsed time, a fixed target and a fixed adverse
+distance are not sell authority.
 
-Exit ladder (priority order):
-  1. Catastrophic stop  — intra-bar adverse move >= SCALP_V2_CATASTROPHIC_PCT (1.5%)
-  2. Net profit take    — net P&L >= scalp_v2_min_net_profit_pct
-                          (SCALP_NET_PROFIT_TARGET_PCT, default 0.25%)
-  3. Adverse stop       — net P&L <= -min(SCALP_PATH_MAX_ADVERSE_NET_PCT,
-                          learned gross MAE + round-trip cost)
-  4. Giveback           — off unless SCALP_V2_GIVEBACK_EXIT_ENABLED=true
-  5. Stall              — off unless SCALP_V2_STALL_EXIT_ENABLED=true
-  6. Horizon            — hold >= SCALP_V2_TIME_STOP_MIN (SCALP_HOLD_MAX_MINUTES,
-                          default 20 min), whatever the sign
+Exit ladder:
+  1. Catastrophic stop — intra-bar adverse move >= SCALP_V2_CATASTROPHIC_PCT (1.5%)
+  2. Learned continuation — learned terminal net < net available now
+  3. Giveback — off unless SCALP_V2_GIVEBACK_EXIT_ENABLED=true
+  4. Stall — off unless SCALP_V2_STALL_EXIT_ENABLED=true
 
 SCALP V2 does NOT use:
   - DAY structural invalidation (no 4H/1H thesis anchor on a scalp)
@@ -41,7 +36,6 @@ from typing import Any
 from backend.services.scalp_v2.exit_calibration import (
     scalp_v2_giveback_exit_enabled,
     scalp_v2_max_adverse_net_pct,
-    scalp_v2_min_net_profit_pct,
     scalp_v2_stall_exit_enabled,
 )
 
@@ -74,6 +68,7 @@ _SCALP_V2_RECORDED_EXIT_REASONS: dict[str, str] = {
     SCALP_V2_EXIT_GIVEBACK: "GIVEBACK_EXIT",
     SCALP_V2_EXIT_STALL: "STALL_EXIT",
     SCALP_V2_EXIT_TIME_STOP: "TIME_STOP_EXIT",
+    "SCALP_V2_LEARNED_CONTINUATION": "LEARNED_CONTINUATION_EXIT",
 }
 
 # Exit cadence for open SCALP lots inside the existing exit-monitor loop. The
@@ -132,6 +127,7 @@ def evaluate_scalp_v2_exit(
     coin_profile: dict | None = None,
     symbol: str = "",
     allow_adverse_stop: bool = True,
+    expected_terminal_net: float | None = None,
 ) -> dict[str, Any]:
     """Evaluate all SCALP V2 exit roles for an open SCALP position.
 
@@ -169,8 +165,6 @@ def evaluate_scalp_v2_exit(
             lowest_price = min(current_price, entry_price)
 
         sym = symbol or str(getattr(position, "symbol", "") or "")
-        adapt = getattr(position, "adaptive_decision", None)
-        adapt = adapt if isinstance(adapt, dict) else {}
 
         # ──────────────────────────────────────────────────────────────────
         # Role 1: Catastrophic stop — intra-bar adverse move
@@ -191,40 +185,19 @@ def evaluate_scalp_v2_exit(
                     "detail": (f"adverse={adverse_move * 100:.2f}% >= {SCALP_V2_CATASTROPHIC_PCT * 100:.2f}% bar_low={_effective_low:.6f} entry={entry_price:.6f}"),
                 }
 
-        # ──────────────────────────────────────────────────────────────────
-        # Role 2: Net profit take
-        # ──────────────────────────────────────────────────────────────────
-        min_net = float(adapt.get("target_pct") or scalp_v2_min_net_profit_pct(sym))
-        if net_pnl_pct >= min_net:
-            logger.info(
-                "SCALP_V2_PROFIT_TAKE symbol=%s net_pnl=%.4f%% >= min=%.4f%%",
-                sym,
-                net_pnl_pct * 100,
-                min_net * 100,
-            )
-            return {
-                "action": "sell",
-                "reason": SCALP_V2_EXIT_NET_PROFIT,
-                "detail": f"net_pnl={net_pnl_pct * 100:.3f}% >= min={min_net * 100:.3f}%",
-            }
+        from backend.services.adaptive_learning import learned_hold_or_exit
 
-        # ──────────────────────────────────────────────────────────────────
-        # Role 3: Adverse stop — the scalp moved against the thesis; fail fast.
-        # A stale, crossed, or non-current book must not take this exit.
-        # Catastrophic protection above is unchanged.
-        # ──────────────────────────────────────────────────────────────────
-        max_adverse = scalp_v2_adverse_net_threshold_pct(sym, adapt)
-        if allow_adverse_stop and max_adverse > 0 and net_pnl_pct <= -max_adverse:
-            logger.warning(
-                "SCALP_V2_ADVERSE_STOP symbol=%s net_pnl=%.4f%% <= -%.4f%%",
+        if learned_hold_or_exit(expected_terminal_net=expected_terminal_net, unrealized_net=net_pnl_pct) == "exit":
+            logger.info(
+                "SCALP_V2_LEARNED_CONTINUATION symbol=%s net_pnl=%.4f%% terminal=%.4f%%",
                 sym,
                 net_pnl_pct * 100,
-                max_adverse * 100,
+                float(expected_terminal_net or 0.0) * 100,
             )
             return {
                 "action": "sell",
-                "reason": SCALP_V2_EXIT_ADVERSE,
-                "detail": f"net_pnl={net_pnl_pct * 100:.3f}% <= -{max_adverse * 100:.3f}%",
+                "reason": "SCALP_V2_LEARNED_CONTINUATION",
+                "detail": f"net_pnl={net_pnl_pct:.6f} terminal={float(expected_terminal_net):.6f}",
             }
 
         # ──────────────────────────────────────────────────────────────────
@@ -291,25 +264,6 @@ def evaluate_scalp_v2_exit(
                     }
             except Exception:
                 logger.debug("SCALP_V2_STALL_EVAL_ERROR symbol=%s", sym, exc_info=True)
-
-        # ──────────────────────────────────────────────────────────────────
-        # Role 6: Horizon — a scalp ends at the SCALP horizon, win or lose
-        # ──────────────────────────────────────────────────────────────────
-        hold_limit = float(adapt.get("hold_min") or SCALP_V2_TIME_STOP_MIN)
-        hold_limit = min(float(SCALP_V2_TIME_STOP_MIN), max(0.0, hold_limit))
-        if hold_minutes >= hold_limit:
-            logger.warning(
-                "SCALP_V2_TIME_STOP symbol=%s hold=%.1fmin >= %.0fmin net_pnl=%.4f%%",
-                sym,
-                hold_minutes,
-                hold_limit,
-                net_pnl_pct * 100,
-            )
-            return {
-                "action": "sell",
-                "reason": SCALP_V2_EXIT_TIME_STOP,
-                "detail": (f"hold={hold_minutes:.0f}min >= {hold_limit:.0f}min net_pnl={net_pnl_pct * 100:.2f}%"),
-            }
 
         return {"action": "hold", "reason": "SCALP_V2_HOLD"}
 

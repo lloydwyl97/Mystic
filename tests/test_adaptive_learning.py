@@ -179,7 +179,7 @@ def test_k_l_m_n_o_scalp_loss_win_hold_size_and_rank(tmp_path):
 
     pos = SimpleNamespace(engine_id="SCALP_V2", entry_price=100.0, highest_price=100.0, lowest_price=100.0, symbol="SOLUSDT", adaptive_decision=sol)
     dec = evaluate_scalp_v2_exit(position=pos, current_price=100.05, net_pnl_pct=0.0002, hold_minutes=sol["hold_min"], bar_low=100.0)
-    assert dec["reason"] == "SCALP_V2_TIME_STOP"
+    assert dec["action"] == "hold"
 
 
 # --- Q / R -------------------------------------------------------------------
