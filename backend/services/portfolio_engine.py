@@ -7320,6 +7320,7 @@ class PortfolioEngine:
                     is_dust=bool(_prov.get("is_dust")),
                     entered_at=record.entry_timestamp,
                     unrealized_marks=_hold_unrealized_marks(self.db_path, str(getattr(position, "trade_id", "") or "")),
+                    opportunity_id=str(getattr(position, "scalp_opportunity_id", "") or ""),
                 )
             except Exception:
                 logger.debug("ADAPTIVE_CLOSE_LEARN_SKIPPED symbol=%s", symbol, exc_info=True)

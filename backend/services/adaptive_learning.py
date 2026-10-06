@@ -16,10 +16,14 @@ evidence leans on the broader levels, informative specific evidence dominates.
 There is no minimum-trade gate and no profit-factor gate.
 
 Realized closes update ``trade_*`` metrics. DAY candidates update
-``lifecycle_net`` (the live exit contract replayed from the decision ask) and
-the fixed-horizon ``markout_*`` diagnostics. SCALP claims update the claim
-calibration. Decisions blend these continuously; DAY net expectancy sets
-bounded size and rank, SCALP calibration sets the executable edge.
+``lifecycle_net`` (the market path replayed from the decision ask to
+catastrophic protection or the label censor) and the fixed-horizon
+``markout_*`` diagnostics. SCALP claims update the claim calibration. Both are
+market opportunity. ``policy_gap`` is what Mystic's own exit policy realized on
+a filled opportunity minus that opportunity's market label; adding it turns
+market opportunity into expected realized result under the policy. DAY net
+expectancy sets bounded size and rank, the SCALP executable edge sets
+eligibility, rank and size, and both are in policy units.
 """
 
 from __future__ import annotations
@@ -43,9 +47,11 @@ from backend.services.strategy_version import ADAPTIVE_STATE_VERSION, adaptive_f
 PRIOR_STRENGTH = 8.0
 EWMA_ALPHA = 0.25
 MARKOUT_WEIGHT = 0.35
-# DAY lifecycle labels replay the live exit contract on 1m bars; against the
-# realized post-anchor closes they correlate 0.94. They count slightly below a
-# realized close so simulated evidence never outweighs the same amount of fills.
+# DAY lifecycle labels replay the market path on 1m bars without a learned
+# continuation terminal, so they hold to catastrophic protection or the censor.
+# Entry reads them after the learned policy gap moves them into policy units.
+# They count slightly below a realized close so simulated evidence never
+# outweighs the same amount of fills.
 LIFECYCLE_WEIGHT = 0.75
 
 DAY_ENGINE = "DAY_V2"
@@ -76,6 +82,8 @@ _PRIORS: dict[str, dict[str, float]] = {
         # and must not seed them.
         "trade_net": 0.0,
         "lifecycle_net": 0.0,
+        # Realized net of a filled opportunity minus its own lifecycle label.
+        "policy_gap": 0.0,
         "hold_remaining_up": 0.0,
         "hold_remaining_down": 0.0,
         "markout_forward": 0.0,
@@ -85,6 +93,9 @@ _PRIORS: dict[str, dict[str, float]] = {
         "trade_mfe": 0.0025,
         "trade_mae": 0.0015,
         "trade_net": 0.0015,
+        # Realized net of a filled claim minus its forward net markout at the
+        # claim's label horizon.
+        "policy_gap": 0.0,
         "hold_remaining_up": 0.0,
         "hold_remaining_down": 0.0,
         "trade_time_to_mfe_min": 8.0,
@@ -159,6 +170,7 @@ MEAN_FORM_METRICS = frozenset(
         "edge_residual_strategy",
         "lifecycle_net",
         "trade_net",
+        "policy_gap",
         "hold_remaining_up",
         "hold_remaining_down",
         *CLAIM_MOMENT_METRICS,
@@ -384,6 +396,8 @@ def _connect(db_path: str) -> sqlite3.Connection:
         ("opportunity_id", "TEXT NOT NULL DEFAULT ''"),
         ("filled", "INTEGER NOT NULL DEFAULT 0"),
         ("lifecycle_learned", "INTEGER NOT NULL DEFAULT 0"),
+        ("realized_net", "REAL"),
+        ("policy_learned", "INTEGER NOT NULL DEFAULT 0"),
     ):
         if col not in cols:
             conn.execute(f"ALTER TABLE adaptive_candidate_markouts ADD COLUMN {col} {ddl}")
@@ -613,29 +627,67 @@ def _tilt(mean: float, prior: float) -> float:
     return math.tanh((mean - prior) / abs(prior))
 
 
-# DAY net expectancy reads two separately learned measurements of the same
-# economic quantity, net after costs under the live exit contract: realized
-# trade net (filled opportunities) and the lifecycle replay of unfilled
-# qualified candidates (LIFECYCLE_WEIGHT). An opportunity contributes one or
-# the other, never both. Fixed-horizon markouts are diagnostics only: a DAY
-# position is not closed at a fixed clock, and the 60m markout misjudged
-# setups whose lifecycle runs for hours.
+# DAY net expectancy is the expected realized net after costs under Mystic's
+# live policy. Realized trade net (filled opportunities) is already in those
+# units. The lifecycle replay of unfilled qualified candidates
+# (LIFECYCLE_WEIGHT) is market opportunity, so each of its rows enters shifted
+# by the learned policy gap. An opportunity contributes one or the other, never
+# both. Fixed-horizon markouts are diagnostics only: a DAY position is not
+# closed at a fixed clock, and the 60m markout misjudged setups whose lifecycle
+# runs for hours.
 DAY_NET_PARTS: tuple[tuple[str, float], ...] = (("trade_net", 1.0), ("lifecycle_net", LIFECYCLE_WEIGHT))
 
 
+def policy_gap(db_path: str, engine: str, symbol: str, setup: str, regime: str, *, now: float | None = None, rows: list | None = None) -> dict[str, Any]:
+    """Learned realized-minus-market gap of the live policy at one key.
+
+    The exit policy is shared by every setup of the engine, so the estimate
+    borrows engine-wide evidence. Prior 0: a cold engine is priced at its market
+    label. Fee-losing fills push it down and fills that beat their market label
+    push it up.
+    """
+    engine_id = str(engine or "").upper()
+    if rows is None:
+        rows = _state_rows(db_path, engine_id, ("policy_gap",))
+    gap_rows = [r for r in rows if str(r["metric"]) == "policy_gap"]
+    return _lattice(gap_rows, engine_id=engine_id, symbol=symbol, setup=setup, regime=regime, weights={"policy_gap": 1.0}, prior=_prior(engine_id, "policy_gap"), now=now, include_engine=True)
+
+
+def _shifted(row: Any, shift: float) -> dict[str, Any]:
+    out = dict(row)
+    out["ewma"] = float(row["ewma"]) + float(shift)
+    return out
+
+
 def day_net_expectancy(db_path: str, symbol: str, setup: str, regime: str, *, now: float | None = None) -> dict[str, Any]:
-    """Expected DAY net edge after costs for one key, pooled hierarchically
-    (key -> same setup sharing symbol or regime -> setup -> engine -> 0).
-    No sample-count floor: one observation moves the posterior by its weight."""
+    """Expected DAY net edge after costs under the live policy for one key,
+    pooled hierarchically (key -> same setup sharing symbol or regime -> setup -> 0).
+    No sample-count floor: one observation moves the posterior by its weight.
+    ``market_alpha`` is the same posterior of the unshifted lifecycle labels."""
     weights = dict(DAY_NET_PARTS)
+    rows = _state_rows(db_path, DAY_ENGINE, (*weights, "policy_gap"))
+    now = float(now) if now is not None else _data_clock(rows)
+    gap = policy_gap(db_path, DAY_ENGINE, symbol, setup, regime, now=now, rows=rows)
+    shift = float(gap["mean"])
+    net_rows = [_shifted(r, shift) if str(r["metric"]) == "lifecycle_net" else r for r in rows if str(r["metric"]) in weights]
     lat = _lattice(
-        _state_rows(db_path, DAY_ENGINE, tuple(weights)),
+        net_rows,
         engine_id=DAY_ENGINE,
         symbol=symbol,
         setup=setup,
         regime=regime,
         weights=weights,
         prior=_prior(DAY_ENGINE, "trade_net"),
+        now=now,
+    )
+    market = _lattice(
+        [r for r in rows if str(r["metric"]) == "lifecycle_net"],
+        engine_id=DAY_ENGINE,
+        symbol=symbol,
+        setup=setup,
+        regime=regime,
+        weights={"lifecycle_net": LIFECYCLE_WEIGHT},
+        prior=_prior(DAY_ENGINE, "lifecycle_net"),
         now=now,
     )
     return {
@@ -650,6 +702,9 @@ def day_net_expectancy(db_path: str, symbol: str, setup: str, regime: str, *, no
         "pooled_weight": lat["pooled_weight"],
         "confidence": lat["confidence"],
         "sd": lat["sd"],
+        "market_alpha": market["mean"],
+        "policy_gap": shift,
+        "n_policy_gap": gap["level_weights"]["engine"],
     }
 
 
@@ -798,6 +853,10 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
         "level_weights": {lvl: round(v, 3) for lvl, v in net["level_weights"].items()},
         "n_trade": round(net["n_trade"], 3),
         "n_lifecycle": round(net["n_lifecycle"], 3),
+        "market_alpha": net["market_alpha"],
+        "policy_gap": net["policy_gap"],
+        "n_policy_gap": round(net["n_policy_gap"], 3),
+        "policy_value": expected,
     }
     return {
         "adaptive_state_version": adaptive_format(DAY_ENGINE),
@@ -1146,6 +1205,7 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features:
     weight = micro_weight(db_path, now=now)
     micro_residual = micro_unweighted * weight["weight"]
     claim = scalp_claim_calibration(db_path, symbol, setup, regime, now=now)
+    gap = policy_gap(db_path, SCALP_ENGINE, symbol, setup, regime, now=now)
     # Telemetry only: the canonical executable edge is the single live negative-edge gate.
     learned = forward if forward["n"] > 0 else net
     learned_net = learned["mean"]
@@ -1181,6 +1241,8 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features:
         "n_claim": claim["n_claim"],
         "claim_uncertainty": claim["claim_uncertainty"],
         "confidence": claim["claim_confidence"],
+        "policy_gap": gap["mean"],
+        "n_policy_gap": gap["level_weights"]["engine"],
         "mfe": learned_mfe,
         "mae": path_mae["mean"],
         "target_pct": _clamp(learned_mfe, *SCALP_TARGET_BOUNDS),
@@ -1219,15 +1281,19 @@ def learn_from_close(
     entered_at: float | None = None,
     now: float | None = None,
     unrealized_marks: Sequence[float] | None = None,
+    opportunity_id: str = "",
 ) -> bool:
     """Realized-trade update. Dust, non-current versions and positions entered
-    before the engine's economic anchor do not move state."""
+    before the engine's economic anchor do not move state. ``opportunity_id``
+    links the close to its filled candidate for the policy gap."""
     if is_dust or not version_current:
         return False
     engine_id = str(engine or "").upper()
     if entered_at is not None and float(entered_at) < anchor_epoch(engine_id):
         return False
     wrote = False
+    if net_pct is not None and opportunity_id:
+        wrote = record_policy_outcome(db_path, engine=engine_id, opportunity_id=opportunity_id, net_pct=float(net_pct), now=now) or wrote
     if engine_id == DAY_ENGINE:
         pairs = (
             ("trade_net", net_pct),
@@ -1363,6 +1429,115 @@ def seed_day_trade_net(db_path: str, entered_since: str, *, apply: bool = False)
                 now=trade["closed_at"],
             )
         out["applied"] = True
+    return out
+
+
+POLICY_SEED_EXCLUDED_EXITS = ("DUST_WRITEOFF", "HUMAN_MANUAL_SELL", "MANUAL_UNMATCHED")
+
+
+def seed_policy_gap(db_path: str, engine: str, *, apply: bool = False) -> dict[str, Any]:
+    """Replay current-version closes of ``engine`` into ``policy_gap``, in time order.
+
+    Each close entered at or after the economic anchor is linked to its own
+    candidate row: DAY by the filled row of its opportunity (the SELL written
+    within 30 s of the learned close), SCALP by the admitted claim on the same
+    symbol recorded in the 30 s before its entry. The
+    realized net is the one ``learn_from_close`` learned. Each gap is folded at
+    the later of the close and the market label's resolution. Refuses once any
+    ``policy_gap`` state exists for the engine; a row already learned is never
+    learned twice. Dry run unless ``apply``.
+    """
+    engine_id = str(engine or "").upper()
+    out: dict[str, Any] = {"engine": engine_id, "applied": False, "refused": "", "pairs": []}
+    if engine_id not in _PRIORS:
+        out["refused"] = "UNKNOWN_ENGINE"
+        return out
+    version = current_economic_version(engine_id)
+    anchor = anchor_epoch(engine_id)
+    plan: list[dict[str, Any]] = []
+    try:
+        conn = _connect(db_path)
+        try:
+            if conn.execute(
+                "SELECT 1 FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND metric='policy_gap' LIMIT 1",
+                (engine_id, version),
+            ).fetchone():
+                out["refused"] = "POLICY_GAP_STATE_EXISTS"
+                return out
+            excluded = ",".join("?" * len(POLICY_SEED_EXCLUDED_EXITS))
+            outcomes = conn.execute(
+                f"SELECT symbol, entry_timestamp, exit_timestamp, net_profit_pct, close_reason FROM trade_learning_outcomes "
+                f"WHERE UPPER(COALESCE(engine_id,''))=? AND entry_timestamp>=? AND net_profit_pct IS NOT NULL AND COALESCE(close_reason,'') NOT IN ({excluded}) ORDER BY exit_timestamp",
+                (engine_id, anchor, *POLICY_SEED_EXCLUDED_EXITS),
+            ).fetchall()
+            for outcome in outcomes:
+                entered, closed = float(outcome["entry_timestamp"]), float(outcome["exit_timestamp"])
+                symbol = str(outcome["symbol"] or "")
+                sell = conn.execute(
+                    "SELECT scalp_opportunity_id FROM paper_trades WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,''))=? AND symbol=? "
+                    "AND ABS(strftime('%s', substr(timestamp, 1, 19)) - ?) <= 30 ORDER BY ABS(strftime('%s', substr(timestamp, 1, 19)) - ?) LIMIT 1",
+                    (engine_id, symbol, closed, closed),
+                ).fetchone()
+                opp = str(sell["scalp_opportunity_id"] or "") if sell is not None else ""
+                if engine_id == DAY_ENGINE:
+                    row = (
+                        conn.execute(
+                            "SELECT * FROM adaptive_candidate_markouts WHERE engine_id=? AND opportunity_id=? AND filled=1 AND economic_version=? ORDER BY id ASC LIMIT 1",
+                            (engine_id, opp, version),
+                        ).fetchone()
+                        if opp
+                        else None
+                    )
+                else:
+                    row = conn.execute(
+                        "SELECT * FROM adaptive_candidate_markouts WHERE engine_id=? AND symbol=? AND signaled=1 AND economic_version=? AND evaluated_at BETWEEN ? AND ? "
+                        "ORDER BY evaluated_at DESC LIMIT 1",
+                        (engine_id, _norm_symbol(symbol), version, entered - 30.0, entered + 1.0),
+                    ).fetchone()
+                if row is None or int(row["policy_learned"] or 0):
+                    continue
+                marks = json.loads(row["markouts_json"] or "{}")
+                market = _market_label(engine_id, row, marks)
+                if market is None:
+                    # Stored now; resolve_markouts learns it once the label is final.
+                    out.setdefault("pending", []).append({"row_id": int(row["id"]), "opportunity_id": opp, "realized_net": float(outcome["net_profit_pct"])})
+                    continue
+                if engine_id == DAY_ENGINE:
+                    life = marks.get("lifecycle") if isinstance(marks.get("lifecycle"), dict) else {}
+                    resolved_at = float(row["evaluated_at"]) + float(life.get("minutes") or 0.0) * 60.0
+                else:
+                    resolved_at = float(row["evaluated_at"]) + (float(row["label_horizon"] or 0) or 600.0)
+                plan.append(
+                    {
+                        "row_id": int(row["id"]),
+                        "opportunity_id": opp,
+                        "symbol": _norm_symbol(symbol),
+                        "setup": str(row["setup"]),
+                        "regime": str(row["regime"]),
+                        "close_reason": str(outcome["close_reason"] or ""),
+                        "realized_net": float(outcome["net_profit_pct"]),
+                        "market_label": market,
+                        "gap": float(outcome["net_profit_pct"]) - market,
+                        "at": max(closed, resolved_at),
+                    }
+                )
+            plan.sort(key=lambda p: p["at"])
+            out["pairs"] = plan
+            if apply:
+                for pair in [*plan, *out.get("pending", [])]:
+                    conn.execute(
+                        "UPDATE adaptive_candidate_markouts SET filled=1, realized_net=?, opportunity_id=CASE WHEN ?<>'' THEN ? ELSE opportunity_id END WHERE id=?",
+                        (pair["realized_net"], pair["opportunity_id"], pair["opportunity_id"], pair["row_id"]),
+                    )
+                    conn.commit()
+                    if "at" in pair:
+                        row = conn.execute("SELECT * FROM adaptive_candidate_markouts WHERE id=?", (pair["row_id"],)).fetchone()
+                        _learn_policy_gap(conn, db_path, row, json.loads(row["markouts_json"] or "{}"), pair["realized_net"], pair["at"])
+                out["applied"] = True
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError) as exc:
+        out["refused"] = f"READ_FAILED {type(exc).__name__}"
     return out
 
 
@@ -1549,6 +1724,86 @@ def mark_candidate_filled(db_path: str, row_id: int | None) -> bool:
             conn.commit()
             return cur.rowcount == 1
     except sqlite3.Error:
+        return False
+
+
+def link_candidate_fill(db_path: str, row_id: int | None, opportunity_id: str = "") -> bool:
+    """Flag a recorded candidate as filled under the position's opportunity id,
+    so the position's close finds the candidate's market label."""
+    if not row_id:
+        return False
+    try:
+        with _connect(db_path) as conn:
+            cur = conn.execute(
+                "UPDATE adaptive_candidate_markouts SET filled=1, opportunity_id=CASE WHEN ?<>'' THEN ? ELSE opportunity_id END WHERE id=?",
+                (str(opportunity_id or ""), str(opportunity_id or ""), int(row_id)),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+    except sqlite3.Error:
+        return False
+
+
+def _market_label(engine_id: str, row: Any, marks: dict) -> float | None:
+    """The filled candidate's own market label: DAY lifecycle net, SCALP forward
+    net at the claim's label horizon. None until it is final."""
+    if engine_id == DAY_ENGINE:
+        life = marks.get("lifecycle")
+        value = life.get("net") if isinstance(life, dict) else None
+    else:
+        label_h = float(row["label_horizon"] or 0) or 600.0
+        value = _mark_at(marks, label_h)
+    try:
+        out = float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    return out if out is not None and math.isfinite(out) else None
+
+
+def _learn_policy_gap(conn: sqlite3.Connection, db_path: str, row: Any, marks: dict, realized: float, moment: float) -> bool:
+    """Fold realized minus the row's market label into ``policy_gap`` once."""
+    engine_id = str(row["engine_id"])
+    market = _market_label(engine_id, row, marks)
+    if market is None or not math.isfinite(float(realized)):
+        return False
+    if str(row["strategy_version"]) != current_strategy_version(engine_id) or str(row["economic_version"] or "") != current_economic_version(engine_id):
+        return False
+    cur = conn.execute("UPDATE adaptive_candidate_markouts SET policy_learned=1 WHERE id=? AND policy_learned=0", (row["id"],))
+    conn.commit()
+    if cur.rowcount != 1:
+        return False
+    return observe(
+        db_path,
+        engine=engine_id,
+        symbol=row["symbol"],
+        setup=row["setup"],
+        regime=row["regime"],
+        metric="policy_gap",
+        value=float(realized) - market,
+        strategy_version=str(row["strategy_version"]),
+        now=moment,
+    )
+
+
+def record_policy_outcome(db_path: str, *, engine: str, opportunity_id: str, net_pct: float, now: float | None = None) -> bool:
+    """Store a close's realized net on its filled candidate; learn the gap if the
+    market label is already final (otherwise ``resolve_markouts`` learns it)."""
+    engine_id = str(engine or "").upper()
+    if engine_id not in _PRIORS or not opportunity_id or not math.isfinite(float(net_pct)):
+        return False
+    moment = float(now if now is not None else time.time())
+    try:
+        with _connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM adaptive_candidate_markouts WHERE engine_id=? AND opportunity_id=? AND filled=1 AND economic_version=? ORDER BY id ASC LIMIT 1",
+                (engine_id, str(opportunity_id), current_economic_version(engine_id)),
+            ).fetchone()
+            if row is None or row["realized_net"] is not None:
+                return False
+            conn.execute("UPDATE adaptive_candidate_markouts SET realized_net=? WHERE id=?", (float(net_pct), row["id"]))
+            conn.commit()
+            return _learn_policy_gap(conn, db_path, row, json.loads(row["markouts_json"] or "{}"), float(net_pct), moment)
+    except (sqlite3.Error, ValueError):
         return False
 
 
@@ -1844,6 +2099,8 @@ def resolve_markouts(
                             strategy_version=str(row["strategy_version"]),
                             now=moment,
                         )
+                if int(row["filled"] or 0) and row["realized_net"] is not None and not int(row["policy_learned"] or 0):
+                    _learn_policy_gap(conn, db_path, row, marks, float(row["realized_net"]), moment)
                 conn.execute(
                     "UPDATE adaptive_candidate_markouts SET markouts_json=?, resolved=? WHERE id=?",
                     (json.dumps(marks), 1 if done else 0, row["id"]),
@@ -2397,6 +2654,7 @@ __all__ = [
     "learn_claim_label",
     "learn_from_close",
     "learn_micro_weight",
+    "link_candidate_fill",
     "mark_candidate_filled",
     "market_regime_tag",
     "micro_edge_tilt",
@@ -2404,7 +2662,9 @@ __all__ = [
     "observe",
     "ohlcv_quote",
     "persist_trade_adaptive",
+    "policy_gap",
     "record_candidate",
+    "record_policy_outcome",
     "resolve_markouts",
     "scalp_claim_calibration",
     "scalp_decision",

@@ -5,7 +5,8 @@ current candidate and the live book:
 
     calibrated_move       = setup gross mean + claim_capture x (raw projection - projection mean)
     base_executable_edge  = calibrated_move - live cost (fees, slippage, spread, impact)
-    final_executable_edge = base_executable_edge + adaptive_residual + micro_residual
+    market_edge           = base_executable_edge + adaptive_residual + micro_residual
+    final_executable_edge = market_edge + policy_gap
 
 The raw projection is the strategy's structural target distance. It is a
 feature, never the expected move: the gross mean and ``claim_capture`` are
@@ -14,8 +15,11 @@ so geometry, ATR or a floor alone produces an expected move of 0 and a
 candidate priced at minus its cost. ``adaptive_residual`` is the key's gross
 mean against its setup's, bounded on both sides. ``micro_residual`` is the bounded
 microstructure tilt times its learned weight in [0, 1]. It raises or
-lowers the estimate with the evidence. All learned terms
-are read from state of the current economic version, pooled hierarchically.
+lowers the estimate with the evidence. ``market_edge`` is the expected net
+markout at the claim's horizon. ``policy_gap`` is what filled claims realized
+under Mystic's own exit policy minus their forward markout, so the final edge
+is the expected realized result if Mystic enters now. All learned terms are
+read from state of the current economic version, pooled hierarchically.
 
 ``final_executable_edge <= 0`` is hard economic safety (NO_EXECUTABLE_NET_EDGE).
 Anything above zero stays eligible. Confidence, risk and the final edge set
@@ -61,14 +65,21 @@ class ExecutableEdge:
     uncertainty_pct: float = 0.0
     economic_version: str = ""
     state_tilt_pct: float = 0.0
+    policy_gap_pct: float = 0.0
+    n_policy_gap: float = 0.0
 
     @property
     def eligible(self) -> bool:
         return self.final_executable_edge_pct > self.reject_threshold_pct
 
     @property
+    def market_edge_pct(self) -> float:
+        return self.final_executable_edge_pct - self.policy_gap_pct
+
+    @property
     def pre_micro_edge_pct(self) -> float:
-        return self.final_executable_edge_pct - self.micro_residual_pct
+        """Market edge before micro: what the micro model is trained against."""
+        return self.market_edge_pct - self.micro_residual_pct
 
     @property
     def expected_move_pct(self) -> float:
@@ -93,6 +104,10 @@ class ExecutableEdge:
             "micro_weight": self.micro_weight,
             "micro_unweighted": self.micro_residual_unweighted_pct,
             "pre_micro_edge": self.pre_micro_edge_pct,
+            "market_edge": self.market_edge_pct,
+            "policy_gap": self.policy_gap_pct,
+            "n_policy_gap": self.n_policy_gap,
+            "policy_value": self.final_executable_edge_pct,
             "uncertainty": self.uncertainty_pct,
             "backoff_gross": self.calibrated_move_pct - self.state_tilt_pct,
             "learned_expected_gross": self.expected_move_pct,
@@ -118,6 +133,7 @@ class ExecutableEdge:
         out["deficit_to_zero_pct"] = self.deficit_to_zero_pct
         out["reject_deficit_pct"] = self.deficit_to_zero_pct
         out["eligible"] = self.eligible
+        out["market_edge_pct"] = self.market_edge_pct
         out["economic"] = self.economic()
         return out
 
@@ -174,7 +190,8 @@ def scalp_executable_edge(
     pre_micro = base + move["adaptive"]
     micro_model = _f(view.get("micro_residual"))
     micro = micro_model
-    final = pre_micro + micro
+    gap = _f(view.get("policy_gap"))
+    final = pre_micro + micro + gap
     confidence = _f(view.get("confidence"))
     risk = _f(view.get("risk_estimate"))
     return ExecutableEdge(
@@ -201,6 +218,8 @@ def scalp_executable_edge(
         uncertainty_pct=_f(view.get("claim_uncertainty")),
         economic_version=str(view.get("economic_version") or ""),
         state_tilt_pct=_f(view.get("state_tilt")),
+        policy_gap_pct=gap,
+        n_policy_gap=_f(view.get("n_policy_gap")),
     )
 
 
@@ -226,6 +245,8 @@ _DETAIL_KEYS: tuple[tuple[str, str], ...] = (
     ("micro_residual_model", "micro_residual_model_pct"),
     ("micro_weight", "micro_weight"),
     ("micro_residual_unweighted", "micro_residual_unweighted_pct"),
+    ("market_edge", "market_edge_pct"),
+    ("policy_gap", "policy_gap_pct"),
     ("uncertainty", "uncertainty_pct"),
     ("economic_version", "economic_version"),
     ("final_executable_edge", "final_executable_edge_pct"),

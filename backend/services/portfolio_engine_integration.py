@@ -2317,7 +2317,7 @@ class PortfolioEngineIntegration:
             if ref_price <= 0:
                 slash = norm_key[:-4] + "/USDT" if norm_key.endswith("USDT") else norm_key
                 ref_price = float(self.current_prices.get(norm_key) or self.current_prices.get(slash) or 0)
-            record_candidate(
+            markout_id = record_candidate(
                 self.engine.db_path,
                 engine="SCALP_V2",
                 symbol=norm_key,
@@ -2331,7 +2331,9 @@ class PortfolioEngineIntegration:
                 raw_move_source=(row.get("executable_edge") or {}).get("raw_move_source") or (row.get("rank_meta") or {}).get("edge_source") or "NONE",
                 economic=(row.get("executable_edge") or {}).get("economic"),
             )
-            return {"setup": setup_name, "regime": regime, "features": micro_feats, "ref_price": ref_price}
+            if signaled:
+                row["markout_id"] = markout_id
+            return {"setup": setup_name, "regime": regime, "features": micro_feats, "ref_price": ref_price, "markout_id": markout_id}
 
         def _scalp_priority(sym_raw: str) -> float:
             norm_key = sym_raw.upper().replace("-", "").replace("/", "")
@@ -2454,6 +2456,12 @@ class PortfolioEngineIntegration:
                         persist_entry_context(self.engine.db_path, order_id=str(result.get("order_id") or ""), context=build_entry_context(row, cycle_ts=cycle_ts))
                     except Exception:
                         logger.debug("SCALP_V2_ENTRY_CONTEXT_SKIPPED symbol=%s", norm, exc_info=True)
+                    try:
+                        from backend.services.adaptive_learning import link_candidate_fill
+
+                        link_candidate_fill(self.engine.db_path, (row or {}).get("markout_id"), str(opp_id or ""))
+                    except Exception:
+                        logger.debug("SCALP_V2_CANDIDATE_FILLED_MARK_FAILED symbol=%s", norm, exc_info=True)
                     logger.warning(
                         "SCALP_V2_ENTRY_FILLED symbol=%s opp=%s qty=%.8f price=%.6f order_id=%s",
                         norm,
