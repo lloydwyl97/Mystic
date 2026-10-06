@@ -415,6 +415,15 @@ def test_deploy_lock_makes_run_measure_only(cfg):
     assert all(p.exists() for p in files)
 
 
+def test_due_backup_skipped_for_space_is_reported_as_an_error(cfg, monkeypatch):
+    """Ocean 2026-10-06: 5.3 GB free < 4.0 GB x 1.05 + 2 GB reserve, yet the run reported errors: []."""
+    _live_db(cfg, rows=3)
+    monkeypatch.setattr(cfg, "backup_free_reserve_bytes", 10**18)
+    out = m.run_maintenance(cfg, dry_run=False, allow_reboot=False, owner_task=_owner_task_direct(cfg))
+    assert out["backup_create"]["status"] == "skipped"
+    assert "backup_due_not_written: insufficient_free_space" in out["errors"]
+
+
 def test_deploy_lock_skip_keeps_the_verified_backup_stamp(cfg):
     """Ocean 2026-10-05 01:17: a deploy-lock skip replaced the status and cleared last_backup_verified_utc."""
     _live_db(cfg, rows=3)

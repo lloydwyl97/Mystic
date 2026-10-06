@@ -1290,6 +1290,8 @@ def run_maintenance(
                 report["backup_create"] = owner_task("backup-create", *(["--dry-run"] if dry_run else []))
                 if report["backup_create"].get("status") == "error":
                     report["errors"].append(f"backup: {report['backup_create'].get('error')}")
+                elif report["backup_create"].get("status") == "skipped":
+                    report["errors"].append(f"backup_due_not_written: {report['backup_create'].get('reason')}")
             report["backup_verify"] = owner_task("backup-verify", *(["--dry-run"] if dry_run else []))
             if report["backup_verify"].get("status") == "error":
                 report["errors"].append(f"backup_verify: {report['backup_verify'].get('error')}")
