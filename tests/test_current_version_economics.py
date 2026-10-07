@@ -17,7 +17,7 @@ from backend.services.day_v2.live_signal import ENABLED_SETUPS
 from backend.services.day_v2.ranking import rank_day_candidates
 from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 from backend.services.scalp_v2.executable_edge import REJECT_THRESHOLD_PCT, scalp_executable_edge
-from backend.services.strategy_version import DAY_STRATEGY_VERSION
+from backend.services.strategy_version import DAY_STRATEGY_VERSION, exit_policy_anchor
 
 DAY = al.DAY_ENGINE
 SCALP = al.SCALP_ENGINE
@@ -139,6 +139,8 @@ def test_realized_and_counterfactual_learning_stay_separate(tmp_path):
         continuation=0.1,
         version_current=True,
         is_dust=False,
+        entered_at=float(exit_policy_anchor(DAY)["epoch"]) + 60.0,
+        exit_reason="LEARNED_CONTINUATION_EXIT",
     )
     _record_day(db, "ETHUSDT", "RANGE_BOUNCE", al.CANDIDATE_QUALIFIED)
     assert al.resolve_markouts(db, lambda _s, _t: 101.0, now=1_000.0 + 400 * 60) == 1
@@ -167,16 +169,18 @@ def test_trade_net_seed_replays_only_current_post_anchor_closes_once(tmp_path):
 
     db = str(tmp_path / "t.db")
     keys = json.dumps({"setup": "BREAKOUT_CONTINUATION", "regime": "btcup_volhi"})
-    sell = {"side": "SELL", "symbol": "BTC/USDT", "entry_price": 100.0, "price": 99.0, "exit_reason": "STOP_LOSS_EXIT", "timestamp": "2026-10-05T14:34:01"}
+    sell = {"side": "SELL", "symbol": "BTC/USDT", "entry_price": 100.0, "price": 99.0, "exit_reason": "LEARNED_CONTINUATION_EXIT", "timestamp": "2026-10-06T14:34:01"}
     _paper_trades(
         db,
         [
-            {"trade_id": "b1", "decision_id": "d1", "side": "BUY", "symbol": "BTC/USDT", "timestamp": "2026-10-05T14:16:08", "adaptive_decision_json": keys},
-            {**sell, "trade_id": "s1", "decision_id": "d1", "entry_timestamp": "2026-10-05T14:16:08"},
+            {"trade_id": "b1", "decision_id": "d1", "side": "BUY", "symbol": "BTC/USDT", "timestamp": "2026-10-06T14:16:08", "adaptive_decision_json": keys},
+            {**sell, "trade_id": "s1", "decision_id": "d1", "entry_timestamp": "2026-10-06T14:16:08"},
+            {"trade_id": "b4", "decision_id": "d4", "side": "BUY", "symbol": "BTC/USDT", "timestamp": "2026-10-05T14:16:08", "adaptive_decision_json": keys},
+            {**sell, "trade_id": "s4", "decision_id": "d4", "entry_timestamp": "2026-10-05T14:16:08", "exit_reason": "STOP_LOSS_EXIT"},
             {"trade_id": "b0", "decision_id": "d0", "side": "BUY", "symbol": "BTC/USDT", "timestamp": "2026-10-05T01:30:10", "adaptive_decision_json": keys},
             {**sell, "trade_id": "s0", "decision_id": "d0", "entry_timestamp": "2026-10-05T01:30:10"},
-            {**sell, "trade_id": "s2", "decision_id": "d1", "entry_timestamp": "2026-10-05T14:16:08", "strategy_version": "legacy"},
-            {**sell, "trade_id": "s3", "decision_id": "d1", "entry_timestamp": "2026-10-05T14:16:08", "exit_reason": "DUST_WRITEOFF"},
+            {**sell, "trade_id": "s2", "decision_id": "d1", "entry_timestamp": "2026-10-06T14:16:08", "strategy_version": "legacy"},
+            {**sell, "trade_id": "s3", "decision_id": "d1", "entry_timestamp": "2026-10-06T14:16:08", "exit_reason": "DUST_WRITEOFF"},
         ],
     )
     dry = al.seed_day_trade_net(db, "2026-10-05T02:02:29")

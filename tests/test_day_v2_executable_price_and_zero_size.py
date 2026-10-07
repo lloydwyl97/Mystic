@@ -284,7 +284,7 @@ async def test_zero_size_candidate_records_decision_without_order(tmp_path, day_
     await integ._process_day_v2_signals(ENTRY_BAR)
 
     rows = _decisions(integ.engine.db_path)
-    assert [r[0] for r in rows] == list(SYMBOLS)
+    assert sorted(r[0] for r in rows) == sorted(SYMBOLS)
     for symbol, cycle_ts, result, closest, unmet_json in rows:
         unmet = json.loads(unmet_json)
         assert cycle_ts == float(ENTRY_BAR)

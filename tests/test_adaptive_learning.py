@@ -27,7 +27,7 @@ from backend.services.adaptive_learning import (
 )
 from backend.services.day_v2.ranking import clamp_to_sleeve, rank_day_candidates
 from backend.services.day_v2.winner_contract import objective_level, runner_stop
-from backend.services.strategy_version import DAY_STRATEGY_VERSION, SCALP_STRATEGY_VERSION
+from backend.services.strategy_version import DAY_STRATEGY_VERSION, SCALP_STRATEGY_VERSION, exit_policy_anchor
 
 DAY = "DAY_V2"
 SCALP = "SCALP_V2"
@@ -285,6 +285,8 @@ def test_close_learns_under_entry_stamped_key_reaches_next_candidate(tmp_path):
         continuation=1.0,
         version_current=True,
         is_dust=False,
+        entered_at=float(exit_policy_anchor(SCALP)["epoch"]) + 60.0,
+        exit_reason="LEARNED_CONTINUATION_EXIT",
     )
 
     after = scalp_decision(db, "ETHUSDT", entry_setup, entry_regime)
@@ -311,6 +313,8 @@ def test_close_learns_under_entry_stamped_key_reaches_next_candidate(tmp_path):
         continuation=1.0,
         version_current=True,
         is_dust=False,
+        entered_at=float(exit_policy_anchor(SCALP)["epoch"]) + 60.0,
+        exit_reason="LEARNED_CONTINUATION_EXIT",
     )
     reread = scalp_decision(db, "SOLUSDT", entry_setup, entry_regime)  # no-slash read
     assert reread["target_pct"] != base["target_pct"]

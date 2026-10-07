@@ -42,7 +42,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 from backend.services.scalp_v2.raw_move_source import STRATEGY_CLAIM, is_directional, normalize_raw_move_source
-from backend.services.strategy_version import ADAPTIVE_STATE_VERSION, adaptive_format, economic_anchor, economic_version, engine_versions
+from backend.services.strategy_version import ADAPTIVE_STATE_VERSION, adaptive_format, current_lifecycle_label, economic_anchor, economic_version, engine_versions, exit_contract_of
 
 PRIOR_STRENGTH = 8.0
 EWMA_ALPHA = 0.25
@@ -249,6 +249,23 @@ def _parse_iso(ts: str) -> float | None:
         return datetime.strptime(str(ts), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
     except (ValueError, TypeError):
         return None
+
+
+def _epoch_any(value: Any) -> float | None:
+    """Epoch seconds from an epoch number or an ISO timestamp (naive is UTC)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = None
+    if number is not None and math.isfinite(number):
+        return number
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def half_life_days(engine: str) -> float:
@@ -1282,18 +1299,24 @@ def learn_from_close(
     now: float | None = None,
     unrealized_marks: Sequence[float] | None = None,
     opportunity_id: str = "",
+    exit_reason: str | None = None,
+    candidate_id: int | None = None,
 ) -> bool:
-    """Realized-trade update. Dust, non-current versions and positions entered
-    before the engine's economic anchor do not move state. ``opportunity_id``
-    links the close to its filled candidate for the policy gap."""
+    """Realized-trade update. Dust, non-current versions, positions entered
+    before the engine's economic anchor and closes of a retired exit policy
+    (``exit_contract_of`` not CURRENT) do not move state. ``candidate_id`` (the
+    entry's own row) or ``opportunity_id`` links the close to its filled
+    candidate for the policy gap."""
     if is_dust or not version_current:
         return False
     engine_id = str(engine or "").upper()
     if entered_at is not None and float(entered_at) < anchor_epoch(engine_id):
         return False
+    if exit_contract_of(engine_id, entered_at=entered_at, exit_reason=exit_reason) != "CURRENT":
+        return False
     wrote = False
-    if net_pct is not None and opportunity_id:
-        wrote = record_policy_outcome(db_path, engine=engine_id, opportunity_id=opportunity_id, net_pct=float(net_pct), now=now) or wrote
+    if net_pct is not None and (opportunity_id or candidate_id):
+        wrote = record_policy_outcome(db_path, engine=engine_id, opportunity_id=opportunity_id, net_pct=float(net_pct), now=now, candidate_id=candidate_id) or wrote
     if engine_id == DAY_ENGINE:
         pairs = (
             ("trade_net", net_pct),
@@ -1382,6 +1405,8 @@ def seed_day_trade_net(db_path: str, entered_since: str, *, apply: bool = False)
             ).fetchall()
             for sell in sells:
                 if not is_current_version(DAY_ENGINE, sell) or "DUST" in str(sell["exit_reason"] or "").upper():
+                    continue
+                if exit_contract_of(DAY_ENGINE, entered_at=_epoch_any(sell["entry_timestamp"]), exit_reason=sell["exit_reason"]) != "CURRENT":
                     continue
                 entry, exit_px = float(sell["entry_price"] or 0.0), float(sell["price"] or 0.0)
                 buy = conn.execute(
@@ -1472,6 +1497,8 @@ def seed_policy_gap(db_path: str, engine: str, *, apply: bool = False) -> dict[s
             ).fetchall()
             for outcome in outcomes:
                 entered, closed = float(outcome["entry_timestamp"]), float(outcome["exit_timestamp"])
+                if exit_contract_of(engine_id, entered_at=entered, exit_reason=outcome["close_reason"]) != "CURRENT":
+                    continue
                 symbol = str(outcome["symbol"] or "")
                 sell = conn.execute(
                     "SELECT scalp_opportunity_id FROM paper_trades WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,''))=? AND symbol=? "
@@ -1746,10 +1773,11 @@ def link_candidate_fill(db_path: str, row_id: int | None, opportunity_id: str = 
 
 def _market_label(engine_id: str, row: Any, marks: dict) -> float | None:
     """The filled candidate's own market label: DAY lifecycle net, SCALP forward
-    net at the claim's label horizon. None until it is final."""
+    net at the claim's label horizon. None until it is final, and for a DAY
+    label produced by a retired exit policy."""
     if engine_id == DAY_ENGINE:
         life = marks.get("lifecycle")
-        value = life.get("net") if isinstance(life, dict) else None
+        value = life.get("net") if isinstance(life, dict) and current_lifecycle_label(life.get("reason")) else None
     else:
         label_h = float(row["label_horizon"] or 0) or 600.0
         value = _mark_at(marks, label_h)
@@ -1785,19 +1813,30 @@ def _learn_policy_gap(conn: sqlite3.Connection, db_path: str, row: Any, marks: d
     )
 
 
-def record_policy_outcome(db_path: str, *, engine: str, opportunity_id: str, net_pct: float, now: float | None = None) -> bool:
+def record_policy_outcome(db_path: str, *, engine: str, opportunity_id: str, net_pct: float, now: float | None = None, candidate_id: int | None = None) -> bool:
     """Store a close's realized net on its filled candidate; learn the gap if the
-    market label is already final (otherwise ``resolve_markouts`` learns it)."""
+    market label is already final (otherwise ``resolve_markouts`` learns it).
+
+    The candidate is the entry's own row (``candidate_id``), else the newest
+    filled row of the opportunity still without a realized net: one opportunity
+    can be filled again after an earlier position closed."""
     engine_id = str(engine or "").upper()
-    if engine_id not in _PRIORS or not opportunity_id or not math.isfinite(float(net_pct)):
+    if engine_id not in _PRIORS or not (opportunity_id or candidate_id) or not math.isfinite(float(net_pct)):
         return False
     moment = float(now if now is not None else time.time())
     try:
         with _connect(db_path) as conn:
-            row = conn.execute(
-                "SELECT * FROM adaptive_candidate_markouts WHERE engine_id=? AND opportunity_id=? AND filled=1 AND economic_version=? ORDER BY id ASC LIMIT 1",
-                (engine_id, str(opportunity_id), current_economic_version(engine_id)),
-            ).fetchone()
+            row = None
+            if candidate_id:
+                row = conn.execute(
+                    "SELECT * FROM adaptive_candidate_markouts WHERE id=? AND engine_id=? AND filled=1 AND economic_version=?",
+                    (int(candidate_id), engine_id, current_economic_version(engine_id)),
+                ).fetchone()
+            if row is None and opportunity_id:
+                row = conn.execute(
+                    "SELECT * FROM adaptive_candidate_markouts WHERE engine_id=? AND opportunity_id=? AND filled=1 AND economic_version=? AND realized_net IS NULL ORDER BY id DESC LIMIT 1",
+                    (engine_id, str(opportunity_id), current_economic_version(engine_id)),
+                ).fetchone()
             if row is None or row["realized_net"] is not None:
                 return False
             conn.execute("UPDATE adaptive_candidate_markouts SET realized_net=? WHERE id=?", (float(net_pct), row["id"]))
@@ -1960,7 +1999,10 @@ def resolve_markouts(
                             tick = tick_quote(str(row["symbol"]), float(row["evaluated_at"]), due)
                         valid = tick is not None and ref > 0 and math.isfinite(float(tick)) and float(tick) > 0
                         marks[key] = (float(tick) - ref) / ref - cost if valid else None
-                if engine_id == DAY_ENGINE and str(row["lifecycle_json"] or "") and not isinstance(marks.get("lifecycle"), dict):
+                stored_life = marks.get("lifecycle")
+                if engine_id == DAY_ENGINE and str(row["lifecycle_json"] or "") and not (isinstance(stored_life, dict) and current_lifecycle_label(stored_life.get("reason"))):
+                    # A label stored under a retired exit policy is replayed under the current one.
+                    marks.pop("lifecycle", None)
                     life_label = _lifecycle_label(row, moment=moment, bars_1m=bars_1m)
                     if life_label.get("final"):
                         marks["lifecycle"] = {k: life_label.get(k) for k in ("net", "gross", "reason", "minutes", "mfe", "mae", "censored")}
@@ -2080,6 +2122,7 @@ def resolve_markouts(
                     engine_id == DAY_ENGINE
                     and isinstance(life, dict)
                     and life.get("net") is not None
+                    and current_lifecycle_label(life.get("reason"))
                     and version_ok
                     and state in LEARNABLE_DAY_STATES
                     and not int(row["lifecycle_learned"] or 0)
@@ -2623,6 +2666,176 @@ def day_candidate_markout_report(db_path: str, window_days: float = 7.0) -> dict
     return out
 
 
+CLOSE_LINEAGE_VERSION = "CLOSE_LINEAGE_V1"
+_CONTINUATION_LEARNER_TTL_SEC = 300.0
+_continuation_learner_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+
+
+def _finite(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def entry_lineage(
+    *,
+    engine: str,
+    candidate_id: Any,
+    opportunity_id: str,
+    rank_position: Any = None,
+    rank_of: Any = None,
+    rank_score: Any = None,
+    size_mult: Any = None,
+) -> dict[str, Any]:
+    """Stable entry identity stamped on the adaptive decision before the order."""
+    try:
+        cand = int(candidate_id) if candidate_id is not None else None
+    except (TypeError, ValueError):
+        cand = None
+    return {
+        "engine_id": str(engine or "").upper(),
+        "candidate_id": cand,
+        "opportunity_id": str(opportunity_id or ""),
+        "rank_position": int(rank_position) if _finite(rank_position) is not None else None,
+        "rank_of": int(rank_of) if _finite(rank_of) is not None else None,
+        "rank_score": _finite(rank_score),
+        "size_mult": _finite(size_mult),
+    }
+
+
+def continuation_learner(db_path: str, engine: str) -> dict[str, Any]:
+    """Version of the continuation state the exit read (installed meta and authority)."""
+    engine_id = str(engine or "").upper()
+    key = (str(db_path), engine_id)
+    hit = _continuation_learner_cache.get(key)
+    now = time.time()
+    if hit is not None and now - hit[0] < _CONTINUATION_LEARNER_TTL_SEC:
+        return dict(hit[1])
+    out: dict[str, Any] = {"economic_version": current_economic_version(engine_id), "learning_version": "", "source": "", "installed_at": ""}
+    with contextlib.suppress(Exception):
+        from backend.services.continuation_surface import advantage_authority, installed_aggregator
+
+        authority = bool(advantage_authority(db_path, engine_id))
+        out["authority"] = "HOLD_ADVANTAGE" if authority else "HOLD_REMAINING"
+        if authority:
+            out["aggregator"] = str(installed_aggregator(db_path, engine_id) or "")
+    with contextlib.suppress(sqlite3.Error):
+        conn = sqlite3.connect(db_path, timeout=5)
+        try:
+            row = conn.execute(
+                "SELECT learning_version, source, updated_at FROM continuation_learning_meta WHERE engine_id=? AND economic_version=?",
+                (engine_id, out["economic_version"]),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is not None:
+            out.update({"learning_version": str(row[0] or ""), "source": str(row[1] or ""), "installed_at": str(row[2] or "")})
+    _continuation_learner_cache[key] = (now, dict(out))
+    return out
+
+
+def continuation_snapshot(db_path: str, engine: str, *, mark_net: Any, terminal_net: Any, action: str, reason: str, at: float | None = None) -> dict[str, Any]:
+    """The latest hold-vs-exit reading of an open position, kept for its close lineage."""
+    mark = _finite(mark_net)
+    terminal = _finite(terminal_net)
+    return {
+        "learner": continuation_learner(db_path, engine),
+        "at": float(at if at is not None else time.time()),
+        "mark_net": mark,
+        "terminal_net": terminal,
+        "hold_advantage": (terminal - mark) if terminal is not None and mark is not None else None,
+        "action": str(action or ""),
+        "reason": str(reason or ""),
+    }
+
+
+def close_lineage(
+    decision: dict[str, Any] | None,
+    *,
+    engine: str,
+    symbol: str,
+    position_trade_id: str,
+    sell_trade_id: str,
+    opportunity_id: str,
+    entry_price: Any,
+    exit_price: Any,
+    fees_usd: Any,
+    net_usd: Any,
+    net_pct: Any,
+    hold_seconds: Any,
+    raw_exit_reason: str,
+    exit_reason: str,
+    entered_at: Any,
+    closed_at: Any,
+    continuation: dict[str, Any] | None,
+    versions: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Entry decision, continuation reading, exit and realized result of one close, by stable ids."""
+    decision = decision if isinstance(decision, dict) else {}
+    engine_id = str(engine or "").upper()
+    entry = decision.get("lineage") if isinstance(decision.get("lineage"), dict) else {}
+    if engine_id == SCALP_ENGINE:
+        edge = decision.get("executable_edge") if isinstance(decision.get("executable_edge"), dict) else {}
+        econ = edge.get("economic") if isinstance(edge.get("economic"), dict) else {}
+        market = econ.get("market_edge", edge.get("market_edge_pct"))
+        value = econ.get("policy_value", decision.get("final_executable_edge"))
+    else:
+        econ = decision.get("economic") if isinstance(decision.get("economic"), dict) else {}
+        market = econ.get("market_alpha")
+        value = econ.get("policy_value", decision.get("expected_net"))
+    entry_px, exit_px = _finite(entry_price), _finite(exit_price)
+    gross = (exit_px - entry_px) / entry_px if entry_px and exit_px is not None else None
+    entered = _epoch_any(entered_at)
+    return {
+        "lineage_version": CLOSE_LINEAGE_VERSION,
+        "engine_id": engine_id,
+        "symbol": str(symbol or "").upper(),
+        "position_trade_id": str(position_trade_id or ""),
+        "sell_trade_id": str(sell_trade_id or ""),
+        "opportunity_id": str(opportunity_id or entry.get("opportunity_id") or ""),
+        "entry": {
+            "candidate_id": entry.get("candidate_id"),
+            "economic_version": str(decision.get("economic_version") or ""),
+            "adaptive_state_version": str(decision.get("adaptive_state_version") or ""),
+            "setup": str(decision.get("setup") or ""),
+            "regime": str(decision.get("regime") or ""),
+            "market_alpha": _finite(market),
+            "policy_gap": _finite(econ.get("policy_gap")),
+            "policy_value": _finite(value),
+            "rank_position": entry.get("rank_position"),
+            "rank_of": entry.get("rank_of"),
+            "rank_score": entry.get("rank_score"),
+            "size_mult": _finite(entry.get("size_mult", decision.get("size_mult"))),
+        },
+        "continuation": dict(continuation) if isinstance(continuation, dict) else None,
+        "exit": {
+            "raw_reason": str(raw_exit_reason or ""),
+            "reason": str(exit_reason or ""),
+            "contract": exit_contract_of(engine_id, entered_at=entered, exit_reason=str(raw_exit_reason or exit_reason or "")),
+            "price": exit_px,
+            "closed_at": _epoch_any(closed_at),
+        },
+        "realized": {
+            "entry_price": entry_px,
+            "gross_pct": gross,
+            "fees_usd": _finite(fees_usd),
+            "net_usd": _finite(net_usd),
+            "net_pct": _finite(net_pct),
+            "hold_seconds": _finite(hold_seconds),
+        },
+        "versions": {k: str(v) for k, v in (versions or {}).items() if v is not None},
+    }
+
+
+def with_close_lineage(decision: dict[str, Any] | None, lineage: dict[str, Any]) -> dict[str, Any]:
+    """The SELL row's adaptive decision: the entry decision plus its close lineage."""
+    out = dict(decision) if isinstance(decision, dict) else {}
+    out["close_lineage"] = lineage
+    return out
+
+
 def persist_trade_adaptive(conn: sqlite3.Connection, trade_id: str, decision: dict[str, Any] | None) -> None:
     if not trade_id or not decision:
         return
@@ -2638,18 +2851,23 @@ def persist_trade_adaptive(conn: sqlite3.Connection, trade_id: str, decision: di
 __all__ = [
     "ADAPTIVE_HALF_LIFE_DAYS",
     "ADAPTIVE_STATE_VERSION",
+    "CLOSE_LINEAGE_VERSION",
     "DAY_HORIZONS_MIN",
     "SCALP_HORIZONS_SEC",
     "SCALP_TICK_HORIZONS_SEC",
     "abstention_report",
     "adaptive_state_report",
     "calibration_report",
+    "close_lineage",
+    "continuation_learner",
     "continuation_ratio",
+    "continuation_snapshot",
     "current_economic_version",
     "day_candidate_markout_report",
     "day_decision",
     "day_net_expectancy",
     "day_size_mult",
+    "entry_lineage",
     "estimate",
     "learn_claim_label",
     "learn_from_close",
@@ -2671,4 +2889,5 @@ __all__ = [
     "scalp_expected_gross",
     "seed_day_trade_net",
     "update_linear_model",
+    "with_close_lineage",
 ]

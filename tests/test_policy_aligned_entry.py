@@ -16,13 +16,15 @@ import backend.services.adaptive_learning as al
 from backend.config.day_entry_execution import learned_exit_contract_buy
 from backend.services.scalp_v2 import exit_evaluator
 from backend.services.scalp_v2.executable_edge import scalp_executable_edge
-from backend.services.strategy_version import DAY_STRATEGY_VERSION
+from backend.services.strategy_version import DAY_STRATEGY_VERSION, exit_policy_anchor
 
 DAY = al.DAY_ENGINE
 SCALP = al.SCALP_ENGINE
 DAY_KEY = ("BTCUSDT", "RANGE_BOUNCE", "btcdown_vollo")
 SCALP_KEY = ("ETHUSDT", "RANGE_BOUNCE_SCALP", "btcflat_vollo")
 COST = 0.0006
+# Entered under the current exit policy, closed by its learned continuation.
+CURRENT_ENTRY = float(exit_policy_anchor(DAY)["epoch"]) + 60.0
 
 
 def _day_obs(db, metric, value, key=DAY_KEY):
@@ -65,6 +67,8 @@ def _close(db, engine, opp, net, key):
         version_current=True,
         is_dust=False,
         opportunity_id=opp,
+        entered_at=CURRENT_ENTRY,
+        exit_reason="LEARNED_CONTINUATION_EXIT",
     )
 
 
@@ -249,7 +253,7 @@ def test_seed_policy_gap_learns_existing_fills_once(tmp_path):
     db = str(tmp_path / "t.db")
     _filled_day_row(db, "OPP9", lifecycle_net=0.0100)
     _seed_tables(db)
-    anchor = al.anchor_epoch(DAY)
+    anchor = CURRENT_ENTRY
     with sqlite3.connect(db) as conn:
         conn.execute(
             "INSERT INTO trade_learning_outcomes (engine_id, symbol, entry_timestamp, exit_timestamp, net_profit_pct, close_reason) VALUES ('DAY_V2','BTC/USDT',?,?,?, 'LEARNED_CONTINUATION_EXIT')",

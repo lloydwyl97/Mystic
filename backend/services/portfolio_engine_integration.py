@@ -2025,6 +2025,19 @@ class PortfolioEngineIntegration:
         from backend.services.day_v2.live_entry import submit_day_v2_direct_entry
 
         _direct_decision_id = str(_uuid.uuid4())
+        if isinstance(cand.get("adaptive"), dict):
+            from backend.services.adaptive_learning import entry_lineage
+
+            _rank = cand.get("rank") or {}
+            cand["adaptive"]["lineage"] = entry_lineage(
+                engine="DAY_V2",
+                candidate_id=cand.get("markout_id"),
+                opportunity_id=str(signal.opportunity_id),
+                rank_position=_rank.get("position"),
+                rank_of=_rank.get("of"),
+                rank_score=_rank.get("score"),
+                size_mult=size_mult,
+            )
         _filled = await submit_day_v2_direct_entry(
             self.engine,
             signal=signal,
@@ -2348,7 +2361,9 @@ class PortfolioEngineIntegration:
             edge = row.get("executable_edge") or {}
             return float(edge.get("final_executable_edge_pct") or 0.0) + 0.001 * float(view.get("confidence") or 0.0)
 
-        for sym_raw in sorted(products, key=_scalp_priority, reverse=True):
+        _priorities = {sym_raw: _scalp_priority(sym_raw) for sym_raw in products}
+        _armed_rank = sorted((s for s in products if _priorities[s] > -1e9), key=_priorities.__getitem__, reverse=True)
+        for sym_raw in sorted(products, key=_priorities.__getitem__, reverse=True):
             norm_key = sym_raw.upper().replace("-", "").replace("/", "")
             row = by_symbol.get(norm_key)
             norm = sym_raw.upper().replace("-", "/")
@@ -2431,6 +2446,21 @@ class PortfolioEngineIntegration:
                     arm_price,
                     notional,
                 )
+                if view:
+                    from backend.services.adaptive_learning import entry_lineage
+
+                    view = {
+                        **view,
+                        "lineage": entry_lineage(
+                            engine=SCALP_V2_ENGINE,
+                            candidate_id=(row or {}).get("markout_id"),
+                            opportunity_id=str(opp_id or ""),
+                            rank_position=(_armed_rank.index(sym_raw) + 1) if sym_raw in _armed_rank else None,
+                            rank_of=len(_armed_rank),
+                            rank_score=_priorities.get(sym_raw),
+                            size_mult=view.get("size_mult"),
+                        ),
+                    }
                 result = await self.engine.execute_scalp_v2_buy_live(
                     norm,
                     qty,

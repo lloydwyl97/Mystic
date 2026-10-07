@@ -20,6 +20,7 @@ from backend.services.day_v2.live_signal import ENABLED_SETUPS, day_state_featur
 from backend.services.day_v2.ranking import rank_day_candidates
 from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 from backend.services.scalp_v2 import exit_evaluator as scalp_exits
+from backend.services.strategy_version import exit_policy_anchor
 
 DAY = al.DAY_ENGINE
 T0 = 1_791_200_000.0
@@ -215,7 +216,8 @@ def test_continuation_learns_both_directions_without_a_config_change(tmp_path):
     assert al.learned_hold_or_exit(expected_terminal_net=day_term(0.008), unrealized_net=0.008) == "hold"
     assert al.learned_hold_or_exit(expected_terminal_net=scalp_term(-0.003), unrealized_net=-0.003) == "hold"
 
-    common = {"version_current": True, "is_dust": False, "continuation": None}
+    current = float(exit_policy_anchor(al.DAY_ENGINE)["epoch"]) + 60.0
+    common = {"version_current": True, "is_dust": False, "continuation": None, "entered_at": current, "exit_reason": "LEARNED_CONTINUATION_EXIT"}
     assert al.learn_from_close(
         db,
         engine=al.DAY_ENGINE,

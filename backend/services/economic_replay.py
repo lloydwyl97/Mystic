@@ -259,6 +259,17 @@ def load_baseline_modules(sha: str, repo: str | Path) -> dict[str, ModuleType]:
     return out
 
 
+def _simulated_exit_authority(reason: Any) -> str:
+    """Exit authority of a simulated DAY lifecycle close. A horizon mark is a
+    position the learned continuation was still holding."""
+    from backend.services.strategy_version import current_lifecycle_label
+
+    text = str(reason or "")
+    if current_lifecycle_label(text) and text.startswith("HORIZON_MARK"):
+        return "DAY_V2_LEARNED_CONTINUATION"
+    return text
+
+
 class RepairedDayPolicy:
     """The repaired learner: hierarchical expected net over realized closes and
     lifecycle replays of unfilled qualified candidates; rank and size from it."""
@@ -304,7 +315,9 @@ class RepairedDayPolicy:
             continuation=label.get("continuation"),
             version_current=True,
             is_dust=False,
+            entered_at=c.decided_at,
             now=at,
+            exit_reason=_simulated_exit_authority(label.get("reason")),
         )
 
     def learn_lifecycle(self, c: DayCandidate, label: dict[str, Any], at: float) -> None:

@@ -50,6 +50,25 @@ ECONOMIC_ANCHORS: dict[str, tuple[str, str]] = {
     SCALP_ENGINE: ("a222109", "2026-10-05T02:02:29Z"),
 }
 
+# Exit-policy anchors: the commit after which an engine's normal exits are only
+# catastrophic protection and the learned hold-vs-exit comparison (abe4c23).
+# The exit contract string did not change there, so a close is classified by
+# its entry time and the exit authority that produced it. Closes of a retired
+# exit policy stay forensic: they never teach policy outcomes (realized net,
+# policy gap, remaining value after a mark) to current state.
+EXIT_POLICY_ANCHORS: dict[str, tuple[str, str]] = {
+    DAY_ENGINE: ("abe4c23", "2026-10-06T02:33:49Z"),
+    SCALP_ENGINE: ("abe4c23", "2026-10-06T02:33:49Z"),
+}
+# Raw exit triggers and their recorded labels that the current exit policy emits.
+CURRENT_EXIT_AUTHORITIES: dict[str, frozenset[str]] = {
+    DAY_ENGINE: frozenset({"DAY_V2_CATASTROPHIC_PROTECTION", "DAY_V2_LEARNED_CONTINUATION", "STOP_LOSS_EXIT", "LEARNED_CONTINUATION_EXIT"}),
+    SCALP_ENGINE: frozenset({"SCALP_V2_CATASTROPHIC_STOP", "SCALP_V2_LEARNED_CONTINUATION", "STOP_LOSS_EXIT", "LEARNED_CONTINUATION_EXIT"}),
+}
+# Exit reasons the DAY lifecycle label emits under the current exit policy (no
+# terminal stamped: catastrophic protection or the label censor).
+CURRENT_LIFECYCLE_REASONS: frozenset[str] = frozenset({"DAY_V2_CATASTROPHIC_PROTECTION", "HORIZON_MARK", "HORIZON_MARK_PARTIAL"})
+
 VERSION_COLUMNS: tuple[str, ...] = (
     "strategy_version",
     "entry_contract_version",
@@ -102,6 +121,32 @@ def economic_anchor(engine_id: str) -> dict[str, Any] | None:
         return None
     commit, at = anchor
     return {"commit": commit, "at": at, "epoch": datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp()}
+
+
+def exit_policy_anchor(engine_id: str) -> dict[str, Any] | None:
+    """{"commit", "at", "epoch"} for the engine's current exit policy, else None."""
+    anchor = EXIT_POLICY_ANCHORS.get(str(engine_id or "").strip().upper())
+    if not anchor:
+        return None
+    commit, at = anchor
+    return {"commit": commit, "at": at, "epoch": datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp()}
+
+
+def exit_contract_of(engine_id: str, *, entered_at: float | None, exit_reason: str | None) -> str:
+    """CURRENT when the close was entered under the current exit policy and that
+    policy's authority closed it, else RETIRED (UNKNOWN without the inputs)."""
+    engine = str(engine_id or "").strip().upper()
+    anchor = exit_policy_anchor(engine)
+    if anchor is None or entered_at is None or not exit_reason:
+        return "UNKNOWN"
+    if float(entered_at) < float(anchor["epoch"]):
+        return "RETIRED"
+    return "CURRENT" if str(exit_reason).strip().upper() in CURRENT_EXIT_AUTHORITIES.get(engine, frozenset()) else "RETIRED"
+
+
+def current_lifecycle_label(reason: str | None) -> bool:
+    """A DAY lifecycle label was produced by the current exit policy."""
+    return str(reason or "").strip().upper() in CURRENT_LIFECYCLE_REASONS
 
 
 def adaptive_format(engine_id: str) -> str:
@@ -338,17 +383,23 @@ def performance_by_version(db_path: str) -> dict[str, Any]:
 __all__ = [
     "ACCOUNTING_CONTRACT_VERSION",
     "ADAPTIVE_FORMATS",
+    "CURRENT_EXIT_AUTHORITIES",
+    "CURRENT_LIFECYCLE_REASONS",
     "DAY_ENTRY_CONTRACT_VERSION",
     "DAY_EXIT_CONTRACT_VERSION",
     "DAY_STRATEGY_VERSION",
+    "EXIT_POLICY_ANCHORS",
     "SCALP_ENTRY_CONTRACT_VERSION",
     "SCALP_EXIT_CONTRACT_VERSION",
     "SCALP_STRATEGY_VERSION",
     "VERSION_COLUMNS",
     "adaptive_format",
     "current_code_sha",
+    "current_lifecycle_label",
     "current_version_start",
     "engine_versions",
+    "exit_contract_of",
+    "exit_policy_anchor",
     "is_current_version",
     "learning_version_filter",
     "lot_versions",

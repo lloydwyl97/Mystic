@@ -25,6 +25,7 @@ from backend.services.day_v2.ranking import rank_day_candidates
 from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 from backend.services.scalp_v2.decision_log import classify_scalp_candidate
 from backend.services.scalp_v2.executable_edge import REJECT_THRESHOLD_PCT, scalp_executable_edge
+from backend.services.strategy_version import exit_policy_anchor
 
 DAY, SCALP = al.DAY_ENGINE, al.SCALP_ENGINE
 T0 = 1_791_200_000.0  # after both economic anchors
@@ -317,8 +318,9 @@ def test_range_and_trend_move_only_with_their_own_evidence(tmp_path):
         continuation=0.1,
         version_current=True,
         is_dust=False,
-        entered_at=T0,
+        entered_at=max(T0, float(exit_policy_anchor(DAY)["epoch"])),
         now=T0,
+        exit_reason="LEARNED_CONTINUATION_EXIT",
     )
     assert snapshot() == before
     _life(db, 0.01, symbol="ETHUSDT", setup="RANGE_BOUNCE")

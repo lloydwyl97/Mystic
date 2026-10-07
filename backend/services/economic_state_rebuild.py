@@ -48,6 +48,7 @@ from backend.services.economic_replay import (
     simulate_scalp,
     tag_regimes,
 )
+from backend.services.strategy_version import current_lifecycle_label, exit_contract_of
 
 REBUILT_MARK = '"rebuilt":true'
 
@@ -115,6 +116,8 @@ def actual_closes(db_path: str, engine_id: str, since: float, store: BarStore) -
                     "mae": (entry - low) / entry,
                     "minutes": (closed - entered) / 60.0,
                     "high": high,
+                    "exit_reason": str(sell["exit_reason"] or ""),
+                    "opportunity_id": str(sell["scalp_opportunity_id"] or "") if "scalp_opportunity_id" in set(sell.keys()) else "",
                 }
             )
     finally:
@@ -152,7 +155,7 @@ def rebuild_day(
     consumed: dict[str, float] = {}
     first_record: set[str] = set()
     pending: list[dict[str, Any]] = []
-    counts = {"closes": 0, "lifecycles": 0, "records": 0, "blocked": 0, "pending": 0, "fills_matched": sum(1 for m in matched.values() if m is not None), "fills": len(fills)}
+    counts = {"closes": 0, "lifecycles": 0, "policy_gaps": 0, "records": 0, "blocked": 0, "pending": 0, "fills_matched": sum(1 for m in matched.values() if m is not None), "fills": len(fills)}
 
     def learn_close(fill: dict[str, Any], cand: DayCandidate | None) -> None:
         continuation = None
@@ -176,8 +179,19 @@ def rebuild_day(
             is_dust=False,
             entered_at=fill["entered_at"],
             now=fill["closed_at"],
+            exit_reason=fill.get("exit_reason"),
         )
         counts["closes"] += 1
+        if cand is not None and exit_contract_of(DAY_ENGINE, entered_at=fill["entered_at"], exit_reason=fill.get("exit_reason")) == "CURRENT":
+            label = day_lifecycle(cand, fill["decision"], store, roundtrip_cost=roundtrip_cost, now=now)
+            if label.get("final") and label.get("net") is not None and current_lifecycle_label(label.get("reason")):
+                at = max(float(fill["closed_at"]), float(label["exit_time"]))
+                if at <= now:
+                    heapq.heappush(heap, (at, next(seq), lambda c=cand, gap=float(fill["net"]) - float(label["net"]), at=at: learn_gap(c, gap, at)))
+
+    def learn_gap(c: DayCandidate, gap: float, at: float) -> None:
+        policy.al.observe(policy.db, engine=DAY_ENGINE, symbol=c.symbol, setup=c.setup, regime=c.regime_tag, metric="policy_gap", value=gap, strategy_version=policy.version, now=at)
+        counts["policy_gaps"] += 1
 
     def learn_lifecycle(c: DayCandidate, label: dict[str, Any]) -> None:
         filled_at = consumed.get(c.opportunity_id)
@@ -268,7 +282,43 @@ def _learn_scalp_close(db: str, close: dict[str, Any]) -> None:
         is_dust=False,
         entered_at=close["entered_at"],
         now=close["closed_at"],
+        exit_reason=close.get("exit_reason"),
     )
+
+
+def _scalp_policy_gaps(scratch_db: str, rows: list[dict[str, Any]], closes: list[dict[str, Any]], scratch_ids: dict[int, int | None], *, now: float) -> int:
+    """Realized minus the admitted claim's own-horizon markout, for current-policy
+    closes, folded in time order at the later of the close and the label."""
+    from backend.services import adaptive_learning as al
+
+    gaps: list[tuple[float, dict[str, Any], float]] = []
+    conn = sqlite3.connect(scratch_db)
+    conn.row_factory = sqlite3.Row
+    try:
+        for close in closes:
+            if exit_contract_of(SCALP_ENGINE, entered_at=close["entered_at"], exit_reason=close.get("exit_reason")) != "CURRENT":
+                continue
+            claims = [c for c in rows if c["directional"] and c["symbol"] == close["symbol"] and close["entered_at"] - 30.0 <= c["t"] <= close["entered_at"] + 1.0]
+            if not claims:
+                continue
+            claim = max(claims, key=lambda c: c["t"])
+            sid = scratch_ids.get(claim["id"])
+            row = conn.execute("SELECT * FROM adaptive_candidate_markouts WHERE id=?", (sid,)).fetchone() if sid is not None else None
+            if row is None:
+                continue
+            market = al._market_label(SCALP_ENGINE, row, json.loads(row["markouts_json"] or "{}"))
+            if market is None:
+                continue
+            at = max(float(close["closed_at"]), float(row["evaluated_at"]) + (float(row["label_horizon"] or 0) or 600.0))
+            if at <= now:
+                gaps.append((at, dict(row), float(close["net"]) - market))
+    finally:
+        conn.close()
+    for at, row, gap in sorted(gaps, key=lambda g: g[0]):
+        al.observe(
+            scratch_db, engine=SCALP_ENGINE, symbol=row["symbol"], setup=row["setup"], regime=row["regime"], metric="policy_gap", value=gap, strategy_version=str(row["strategy_version"]), now=at
+        )
+    return len(gaps)
 
 
 def _scalp_scratch(db_path: str, store: BarStore, scratch_db: str, *, anchor: float, now: float) -> dict[str, Any]:
@@ -286,6 +336,7 @@ def _scalp_scratch(db_path: str, store: BarStore, scratch_db: str, *, anchor: fl
     rows = load_scalp_rows(db_path, anchor, now, al.current_strategy_version(SCALP_ENGINE), store=store, unfloor_unless_version=version)
     policy = ScalpPolicy("repaired", scratch_db, al, edge_mod, store)
     result = simulate_scalp(rows, policy, now=now, events=[(c["closed_at"], lambda c=c: _learn_scalp_close(scratch_db, c)) for c in closes])
+    policy_gaps = _scalp_policy_gaps(scratch_db, rows, closes, result["scratch_ids"], now=now)
     conn = sqlite3.connect(scratch_db)
     conn.row_factory = sqlite3.Row
     try:
@@ -322,6 +373,7 @@ def _scalp_scratch(db_path: str, store: BarStore, scratch_db: str, *, anchor: fl
             "scalp_claims_without_bars": sum(1 for c in claims if c["unfloor_missing"]),
             "scalp_rows_learned": sum(1 for s in stamps if s[2]),
             "scalp_closes": len(closes),
+            "scalp_policy_gaps": policy_gaps,
             "scalp_state_rows": len(state),
             "scalp_admitted_in_rebuild": sum(1 for p in result["predictions"] if p["admitted"]),
             "micro_model_n": float(json.loads(model["payload"]).get("n", 0)) if model is not None else 0,
@@ -520,4 +572,484 @@ def rebuild(db_path: str, *, now: float | None = None, apply: bool = False, work
     return out
 
 
-__all__ = ["REBUILT_MARK", "actual_closes", "rebuild", "rebuild_day", "rebuild_scalp"]
+# --------------------------------------------------------------------------- regeneration
+#
+# ``regenerate`` rebuilds an engine's derived economic state on a live
+# database from its authoritative rows: the recorded candidate rows (their
+# stored markouts, inputs and decision-time economics), the realized closes in
+# ``trade_learning_outcomes`` and the 1m bars. Every label reaches a scratch
+# learner at the moment it became knowable, through ``resolve_markouts``,
+# ``learn_from_close`` and ``record_policy_outcome`` themselves, so the rebuilt
+# state follows the live version and exit-contract rules. DAY evidence from
+# before the first recorded candidate is the bar reconstruction ``rebuild``
+# uses. Continuation state (``hold_*``) and ``trade_continuation`` are kept.
+
+PRESERVED_METRICS: tuple[str, ...] = ("trade_continuation",)
+PRESERVED_METRIC_PREFIXES: tuple[str, ...] = ("hold_adv_", "hold_remaining_")
+_LINK_WINDOW_SEC = 30.0
+
+
+def preserved_metric(metric: str) -> bool:
+    """State ``regenerate`` keeps as it is."""
+    name = str(metric or "")
+    return name in PRESERVED_METRICS or name.startswith(PRESERVED_METRIC_PREFIXES)
+
+
+def _json(raw: Any) -> dict[str, Any]:
+    try:
+        out = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return out if isinstance(out, dict) else {}
+
+
+def realized_closes(db_path: str, engine_id: str) -> list[dict[str, Any]]:
+    """Realized closes as the live close learner received them, in close order.
+
+    One per ``trade_learning_outcomes`` row of the engine entered at or after its
+    economic anchor (manual and dust write-offs excluded): the learned realized
+    net, MFE/MAE while holding, hold time, close reason and versions, keyed by
+    the entry decision's setup and regime, with the SELL's opportunity id.
+    """
+    from backend.services import adaptive_learning as al
+
+    engine = str(engine_id or "").upper()
+    anchor = al.anchor_epoch(engine)
+    excluded = al.POLICY_SEED_EXCLUDED_EXITS
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    out: list[dict[str, Any]] = []
+    try:
+        marks = ",".join("?" * len(excluded))
+        outcomes = conn.execute(
+            f"SELECT * FROM trade_learning_outcomes WHERE UPPER(COALESCE(engine_id,''))=? AND entry_timestamp>=? AND net_profit_pct IS NOT NULL "
+            f"AND COALESCE(close_reason,'') NOT IN ({marks}) ORDER BY exit_timestamp",
+            (engine, anchor, *excluded),
+        ).fetchall()
+        for o in outcomes:
+            extra = _json(o["extra_json"])
+            holding = _json(o["indicators_while_holding_json"])
+            entered, closed = float(o["entry_timestamp"]), float(o["exit_timestamp"])
+            sell = conn.execute(
+                "SELECT trade_id, decision_id, scalp_opportunity_id FROM paper_trades WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,''))=? AND symbol=? "
+                "AND ABS(strftime('%s', substr(timestamp, 1, 19)) - ?) <= ? ORDER BY ABS(strftime('%s', substr(timestamp, 1, 19)) - ?) LIMIT 1",
+                (engine, o["symbol"], closed, _LINK_WINDOW_SEC, closed),
+            ).fetchone()
+            buy = None
+            if sell is not None:
+                buy = conn.execute(
+                    "SELECT trade_id, adaptive_decision_json FROM paper_trades WHERE UPPER(side)='BUY' AND UPPER(COALESCE(engine_id,''))=? "
+                    "AND ((COALESCE(decision_id,'')!='' AND decision_id=?) OR trade_id=?) ORDER BY rowid DESC LIMIT 1",
+                    (engine, sell["decision_id"], sell["trade_id"]),
+                ).fetchone()
+            decision = _json(buy["adaptive_decision_json"]) if buy is not None else {}
+            setup = str(decision.get("setup") or o["setup"] or "")
+            if not setup:
+                continue
+            hold = o["hold_seconds"]
+            out.append(
+                {
+                    "symbol": al._norm_symbol(o["symbol"]),
+                    "setup": setup,
+                    "regime": str(decision.get("regime") or ""),
+                    "strategy_version": str(extra.get("strategy_version") or o["strategy_version"] or ""),
+                    "version_current": bool(extra.get("version_current")),
+                    "is_dust": bool(extra.get("is_dust")),
+                    "net": float(o["net_profit_pct"]),
+                    "mfe": holding.get("mfe_pct"),
+                    "mae": holding.get("mae_pct"),
+                    "hold_min": float(hold) / 60.0 if hold else None,
+                    "entered_at": entered,
+                    "closed_at": closed,
+                    "exit_reason": str(o["close_reason"] or ""),
+                    "contract": exit_contract_of(engine, entered_at=entered, exit_reason=str(o["close_reason"] or "")),
+                    "opportunity_id": str(sell["scalp_opportunity_id"] or "") if sell is not None else "",
+                    "position_trade_id": str(extra.get("original_trade_id") or (buy["trade_id"] if buy is not None else "") or ""),
+                }
+            )
+    finally:
+        conn.close()
+    return out
+
+
+def _candidate_rows(db_path: str, engine_id: str) -> list[dict[str, Any]]:
+    from backend.services import adaptive_learning as al
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM adaptive_candidate_markouts WHERE engine_id=? AND economic_version=? ORDER BY id",
+            (engine_id, al.current_economic_version(engine_id)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def link_closes(engine_id: str, rows: list[dict[str, Any]], closes: list[dict[str, Any]]) -> dict[int, int]:
+    """Close index -> its own candidate row id. DAY: the filled row of the close's
+    opportunity. SCALP: the admitted claim on the symbol recorded in the 30 s before entry."""
+    links: dict[int, int] = {}
+    if engine_id == DAY_ENGINE:
+        first_fill: dict[str, int] = {}
+        for r in rows:
+            opp = str(r.get("opportunity_id") or "")
+            if opp and int(r.get("filled") or 0) and opp not in first_fill:
+                first_fill[opp] = int(r["id"])
+        for i, close in enumerate(closes):
+            row_id = first_fill.get(str(close.get("opportunity_id") or ""))
+            if row_id is not None:
+                links[i] = row_id
+        return links
+    by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        if int(r.get("signaled") or 0):
+            by_symbol[str(r["symbol"])].append(r)
+    used: set[int] = set()
+    for i, close in enumerate(closes):
+        found = [r for r in by_symbol.get(close["symbol"], []) if close["entered_at"] - _LINK_WINDOW_SEC <= float(r["evaluated_at"]) <= close["entered_at"] + 1.0 and int(r["id"]) not in used]
+        if found:
+            row = max(found, key=lambda r: (float(r["evaluated_at"]), int(r["id"])))
+            links[i] = int(row["id"])
+            used.add(int(row["id"]))
+    return links
+
+
+def _due_marks(stored: dict[str, Any], evaluated_at: float, unit: float, until: float) -> dict[str, Any]:
+    """The stored forward marks already due at ``until`` (lifecycle excluded)."""
+    out: dict[str, Any] = {}
+    for key, value in stored.items():
+        if key == "lifecycle":
+            continue
+        try:
+            due = evaluated_at + (float(key[:-1]) if key.endswith("s") else float(key) * unit)
+        except ValueError:
+            continue
+        if due <= until + 1e-9:
+            out[key] = value
+    return out
+
+
+def _lifecycle_final_at(label: dict[str, Any], params: Any) -> float | None:
+    from backend.services.day_v2.lifecycle_sim import DAY_LIFECYCLE_GRACE_SEC, DAY_LIFECYCLE_MAX_MIN
+
+    if not label.get("final"):
+        return None
+    horizon_end = float(params.entry_time) + DAY_LIFECYCLE_MAX_MIN * 60.0 if params is not None else None
+    reason = str(label.get("reason") or "")
+    if reason == "HORIZON_MARK_PARTIAL" or label.get("net") is None:
+        return (horizon_end + DAY_LIFECYCLE_GRACE_SEC) if horizon_end is not None else None
+    return float(label.get("exit_time") or 0.0) or None
+
+
+def _replay(
+    source_db: str,
+    scratch_db: str,
+    engine_id: str,
+    rows: list[dict[str, Any]],
+    closes: list[dict[str, Any]],
+    *,
+    now: float,
+    closes_after: float,
+    resimulate: bool,
+) -> dict[str, Any]:
+    """Feed the scratch learner every row label and close at its knowable time."""
+    from backend.services import adaptive_learning as al
+    from backend.services.day_v2.lifecycle_sim import LifecycleParams, ohlcv_bars_1m
+
+    def bars(sym: str, start: float, end: float) -> list:
+        return ohlcv_bars_1m(source_db, sym, start, end)
+
+    def low(sym: str, start: float, end: float) -> float | None:
+        return al.ohlcv_low_between(source_db, sym, start, end)
+
+    unit = 60.0 if engine_id == DAY_ENGINE else 1.0
+    default_h = 60.0 if engine_id == DAY_ENGINE else 600.0
+    conn = al._connect(scratch_db)
+    cols = [str(r[1]) for r in conn.execute("PRAGMA table_info(adaptive_candidate_markouts)")]
+    blank = {"markouts_json": "{}", "learned": 0, "resolved": 1, "lifecycle_learned": 0, "policy_learned": 0, "realized_net": None, "filled": 0}
+    for r in rows:
+        values = {c: (blank[c] if c in blank else r.get(c)) for c in cols if c in r or c in blank}
+        conn.execute(f"INSERT INTO adaptive_candidate_markouts ({','.join(values)}) VALUES ({','.join('?' * len(values))})", tuple(values.values()))
+    conn.commit()
+    links = link_closes(engine_id, rows, closes)
+    linked_rows = {row_id: i for i, row_id in links.items()}
+    events: list[tuple[float, int, str, Any]] = []
+    counts = {"rows": len(rows), "closes": 0, "closes_current": 0, "closes_retired": 0, "links": len(links), "labels": 0, "lifecycles_pending": 0, "lifecycles_resimulated": 0}
+    for r in rows:
+        row_id = int(r["id"])
+        stored = _json(r.get("markouts_json"))
+        evaluated = float(r["evaluated_at"])
+        if int(r.get("filled") or 0) or row_id in linked_rows:
+            close = closes[linked_rows[row_id]] if row_id in linked_rows else None
+            fill_at = float(close["entered_at"]) if close is not None else evaluated
+            opp = str((close or {}).get("opportunity_id") or r.get("opportunity_id") or "") or f"row:{row_id}"
+            if close is not None and not close.get("opportunity_id"):
+                close["opportunity_id"] = opp
+            events.append((max(evaluated, fill_at), 0, "fill", (row_id, opp)))
+        label_h = float(r.get("label_horizon") or 0) or default_h
+        t_fix = evaluated + label_h * unit
+        if t_fix <= now:
+            events.append((t_fix, 1, "label", (row_id, t_fix)))
+        if engine_id == DAY_ENGINE and str(r.get("lifecycle_json") or ""):
+            params = LifecycleParams.from_json(r["lifecycle_json"])
+            if resimulate:
+                label = al._lifecycle_label(r, moment=now, bars_1m=bars)
+                old = stored.get("lifecycle") if isinstance(stored.get("lifecycle"), dict) else {}
+                if label.get("final") and old.get("net") != label.get("net"):
+                    counts["lifecycles_resimulated"] += 1
+            else:
+                life = stored.get("lifecycle")
+                label = {"final": True, **life} if isinstance(life, dict) else {"final": False}
+                if label.get("final") and params is not None:
+                    label["exit_time"] = float(params.entry_time) + float(life.get("minutes") or 0.0) * 60.0
+            final_at = _lifecycle_final_at(label, params)
+            if final_at is None or final_at > now:
+                counts["lifecycles_pending"] += 1
+            else:
+                events.append((max(final_at, evaluated), 1, "life", (row_id, max(final_at, evaluated), None if resimulate else stored.get("lifecycle"))))
+    for i, close in enumerate(closes):
+        if close["closed_at"] > closes_after and close["closed_at"] <= now:
+            events.append((close["closed_at"], 2, "close", i))
+    events.sort(key=lambda e: (e[0], e[1]))
+    by_id = {int(r["id"]): r for r in rows}
+
+    def stage(row_id: int, until: float, lifecycle: dict | None) -> None:
+        r = by_id[row_id]
+        current = _json(conn.execute("SELECT markouts_json FROM adaptive_candidate_markouts WHERE id=?", (row_id,)).fetchone()[0])
+        marks = {**_due_marks(_json(r.get("markouts_json")), float(r["evaluated_at"]), unit, until), **{k: v for k, v in current.items() if k == "lifecycle"}}
+        life_json = str(r.get("lifecycle_json") or "")
+        if lifecycle is not None:
+            marks["lifecycle"] = lifecycle
+        elif not resimulate and "lifecycle" not in marks:
+            life_json = ""
+        conn.execute("UPDATE adaptive_candidate_markouts SET markouts_json=?, lifecycle_json=?, resolved=0 WHERE id=?", (json.dumps(marks), life_json, row_id))
+
+    staged: list[int] = []
+
+    def flush(moment: float) -> None:
+        if not staged:
+            return
+        conn.commit()
+        al.resolve_markouts(scratch_db, lambda _sym, _ts: None, now=moment, path_low=low, bars_1m=bars)
+        marks = ",".join("?" * len(staged))
+        conn.execute(f"UPDATE adaptive_candidate_markouts SET resolved=1 WHERE id IN ({marks})", staged)
+        for row_id in staged:
+            conn.execute("UPDATE adaptive_candidate_markouts SET lifecycle_json=? WHERE id=?", (str(by_id[row_id].get("lifecycle_json") or ""), row_id))
+        conn.commit()
+        counts["labels"] += len(staged)
+        staged.clear()
+
+    current_t = None
+    for t, _order, kind, payload in events:
+        if current_t is not None and (t != current_t or kind not in {"life", "label"} or len(staged) >= 150):
+            flush(current_t)
+        current_t = t
+        if kind == "fill":
+            row_id, opp = payload
+            conn.execute("UPDATE adaptive_candidate_markouts SET filled=1, opportunity_id=? WHERE id=?", (opp, row_id))
+            conn.commit()
+        elif kind in ("label", "life"):
+            row_id = payload[0]
+            stage(row_id, payload[1], payload[2] if kind == "life" else None)
+            staged.append(row_id)
+        else:
+            close = closes[payload]
+            counts["closes"] += 1
+            counts["closes_current" if close["contract"] == "CURRENT" else "closes_retired"] += 1
+            al.learn_from_close(
+                scratch_db,
+                engine=engine_id,
+                symbol=close["symbol"],
+                setup=close["setup"],
+                regime=close["regime"],
+                strategy_version=close["strategy_version"],
+                net_pct=close["net"],
+                mfe_pct=close["mfe"],
+                mae_pct=close["mae"],
+                hold_min=close["hold_min"],
+                continuation=None,
+                version_current=close["version_current"],
+                is_dust=close["is_dust"],
+                entered_at=close["entered_at"],
+                now=close["closed_at"],
+                opportunity_id=str(close.get("opportunity_id") or ""),
+                exit_reason=close["exit_reason"],
+                candidate_id=links.get(payload),
+            )
+    if current_t is not None:
+        flush(current_t)
+    conn.close()
+    return counts
+
+
+def _engine_state(db_path: str, engine_id: str) -> list[dict[str, Any]]:
+    from backend.services import adaptive_learning as al
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM adaptive_metric_state WHERE engine_id=? AND economic_version=?",
+                (engine_id, al.current_economic_version(engine_id)),
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def decision_snapshot(db_path: str, engine_id: str, rows: list[dict[str, Any]], *, now: float) -> dict[tuple[str, str, str], dict[str, float]]:
+    """What the next candidate of each recorded key would read: DAY market alpha,
+    policy gap, policy value and size; SCALP market edge, policy gap, final
+    executable policy value and size, from the row's own claim and features."""
+    from backend.services import adaptive_learning as al
+    from backend.services.scalp_v2 import executable_edge as edge_mod
+    from backend.services.scalp_v2.raw_move_source import is_directional
+
+    out: dict[tuple[str, str, str], dict[str, float]] = {}
+    for r in rows:
+        key = (str(r["symbol"]), str(r["setup"]), str(r["regime"]))
+        if key in out:
+            continue
+        if engine_id == DAY_ENGINE:
+            d = al.day_decision(db_path, *key, now=now)
+            econ = d["economic"]
+            out[key] = {"market_alpha": econ["market_alpha"], "policy_gap": econ["policy_gap"], "policy_value": econ["policy_value"], "size_mult": d["size_mult"], "risk": d["mae"]}
+            continue
+        if not is_directional(r.get("raw_move_source")):
+            continue
+        view = al.scalp_decision(db_path, *key, _json(r.get("features_json")), now=now)
+        edge = edge_mod.scalp_executable_edge(view, raw_expected_move_pct=float(r.get("raw_expected_move") or 0.0), spread_pct=None, impact_pct=0.0, edge_source=str(r.get("raw_move_source") or ""))
+        out[key] = {"market_edge": edge.market_edge_pct, "policy_gap": edge.policy_gap_pct, "policy_value": edge.final_executable_edge_pct, "size_mult": edge.size_mult, "risk": edge.risk_estimate_pct}
+    return out
+
+
+def compare_snapshots(before: dict, after: dict) -> dict[str, Any]:
+    """Largest absolute difference per field over the keys both snapshots price."""
+    keys = sorted(set(before) & set(after))
+    fields = sorted({f for k in keys for f in before[k]})
+    worst = {f: max((abs(float(after[k][f]) - float(before[k][f])) for k in keys), default=0.0) for f in fields}
+    where = {f: "|".join(max(keys, key=lambda k, f=f: abs(float(after[k][f]) - float(before[k][f])))) for f in fields if keys}
+    return {"keys": len(keys), "max_abs_diff": worst, "max_abs_diff_key": where}
+
+
+def regenerate(
+    db_path: str,
+    engine_id: str,
+    *,
+    now: float | None = None,
+    apply: bool = False,
+    workdir: str | None = None,
+    resimulate: bool = True,
+) -> dict[str, Any]:
+    """Rebuild ``engine_id``'s derived economic state from its authoritative rows.
+
+    Dry run unless ``apply`` (run it with the portfolio engine stopped). Applied,
+    the engine's current-version state other than ``preserved_metric`` rows and
+    the SCALP micro model are replaced, and each candidate row is stamped with
+    whether its labels are in the rebuilt state, so the live resolver learns only
+    labels that are still pending. ``resimulate`` replays DAY lifecycle labels
+    under the current exit policy instead of reading the stored label.
+    """
+    from backend.config.trading_economics import canonical_roundtrip_cost_pct
+    from backend.services import adaptive_learning as al
+    from backend.services.strategy_version import economic_anchor
+
+    engine = str(engine_id or "").upper()
+    moment = float(now if now is not None else time.time())
+    version = al.current_economic_version(engine)
+    out: dict[str, Any] = {"engine": engine, "economic_version": version, "now": moment, "applied": False}
+    rows = _candidate_rows(db_path, engine)
+    closes = realized_closes(db_path, engine)
+    live_rows = [r for r in rows if REBUILT_MARK not in str(r.get("economic_json") or "")]
+    cutoff = min((float(r["evaluated_at"]) for r in live_rows), default=moment)
+    scratch_root = workdir or ("/dev/shm" if Path("/dev/shm").is_dir() else None)
+    with tempfile.TemporaryDirectory(prefix="econ_regen_", dir=scratch_root) as tmp:
+        scratch = f"{tmp}/{engine.lower()}.db"
+        al._connect(scratch).close()
+        closes_after = float("-inf")
+        if engine == DAY_ENGINE:
+            anchor = float(economic_anchor(DAY_ENGINE)["epoch"])
+            store = BarStore(db_path, DAY_SYMBOLS, since=anchor - 10 * 86400)
+            cands, _near = reconstruct_day_candidates(db_path, anchor, cutoff, store)
+            tag_regimes(db_path, cands)
+            boot = rebuild_day(cands, actual_closes(db_path, DAY_ENGINE, anchor, store), store, RepairedDayPolicy(scratch), roundtrip_cost=canonical_roundtrip_cost_pct(), now=cutoff)
+            out["bootstrap"] = {"until": cutoff, **boot["counts"]}
+            closes_after = cutoff
+        out["replay"] = _replay(db_path, scratch, engine, rows, closes, now=moment, closes_after=closes_after, resimulate=resimulate)
+        before = _engine_state(db_path, engine)
+        after = _engine_state(scratch, engine)
+        recent = rows[-400:]
+        out["decisions"] = compare_snapshots(decision_snapshot(db_path, engine, recent, now=moment), decision_snapshot(scratch, engine, recent, now=moment))
+        out["metrics"] = {
+            m: {"before_n": round(sum(float(r["n"]) for r in before if r["metric"] == m), 3), "after_n": round(sum(float(r["n"]) for r in after if r["metric"] == m), 3)}
+            for m in sorted({r["metric"] for r in before} | {r["metric"] for r in after})
+            if not preserved_metric(m)
+        }
+        if not apply:
+            return out
+        sconn = sqlite3.connect(scratch)
+        sconn.row_factory = sqlite3.Row
+        try:
+            flags = {int(r["id"]): r for r in sconn.execute("SELECT id, learned, lifecycle_learned, policy_learned, realized_net, markouts_json FROM adaptive_candidate_markouts")}
+            model = sconn.execute("SELECT * FROM adaptive_linear_model WHERE engine_id=? AND model=?", (engine, al._model_key(engine, "micro_edge"))).fetchone()
+        finally:
+            sconn.close()
+        conn = al._connect(db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for r in conn.execute("SELECT DISTINCT metric FROM adaptive_metric_state WHERE engine_id=? AND economic_version=?", (engine, version)).fetchall():
+                if not preserved_metric(r[0]):
+                    conn.execute("DELETE FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND metric=?", (engine, version, r[0]))
+            for r in after:
+                if preserved_metric(r["metric"]):
+                    continue
+                conn.execute(
+                    "INSERT INTO adaptive_metric_state (engine_id, economic_version, symbol, setup, regime, metric, n, ewma, m2, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (r["engine_id"], r["economic_version"], r["symbol"], r["setup"], r["regime"], r["metric"], r["n"], r["ewma"], r["m2"], r["updated_at"]),
+                )
+            if engine == SCALP_ENGINE:
+                conn.execute("DELETE FROM adaptive_linear_model WHERE engine_id=? AND model=?", (engine, al._model_key(engine, "micro_edge")))
+                if model is not None:
+                    conn.execute(
+                        "INSERT INTO adaptive_linear_model (engine_id, model, payload, updated_at) VALUES (?,?,?,?)", (model["engine_id"], model["model"], model["payload"], model["updated_at"])
+                    )
+            for r in rows:
+                f = flags.get(int(r["id"]))
+                if f is None:
+                    continue
+                marks = _json(r.get("markouts_json"))
+                life = _json(f["markouts_json"]).get("lifecycle")
+                if engine == DAY_ENGINE and resimulate and isinstance(life, dict):
+                    marks["lifecycle"] = life
+                conn.execute(
+                    "UPDATE adaptive_candidate_markouts SET learned=?, lifecycle_learned=?, policy_learned=?, realized_net=COALESCE(?, realized_net), markouts_json=? WHERE id=?",
+                    (int(f["learned"] or 0), int(f["lifecycle_learned"] or 0), int(f["policy_learned"] or 0), f["realized_net"], json.dumps(marks), int(r["id"])),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        out["applied"] = True
+    return out
+
+
+__all__ = [
+    "PRESERVED_METRICS",
+    "REBUILT_MARK",
+    "actual_closes",
+    "compare_snapshots",
+    "decision_snapshot",
+    "link_closes",
+    "preserved_metric",
+    "realized_closes",
+    "rebuild",
+    "rebuild_day",
+    "rebuild_scalp",
+    "regenerate",
+]

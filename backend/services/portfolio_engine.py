@@ -7321,6 +7321,8 @@ class PortfolioEngine:
                     entered_at=record.entry_timestamp,
                     unrealized_marks=_hold_unrealized_marks(self.db_path, str(getattr(position, "trade_id", "") or "")),
                     opportunity_id=str(getattr(position, "scalp_opportunity_id", "") or ""),
+                    exit_reason=str(close_reason or ""),
+                    candidate_id=(_adapt_dec.get("lineage") or {}).get("candidate_id") if isinstance(_adapt_dec.get("lineage"), dict) else None,
                 )
             except Exception:
                 logger.debug("ADAPTIVE_CLOSE_LEARN_SKIPPED symbol=%s", symbol, exc_info=True)
@@ -14015,9 +14017,35 @@ class PortfolioEngine:
                     from backend.services.strategy_version import stamp_sell_version
 
                     _sell_versions = stamp_sell_version(conn, sell_trade_id, str(position_trade_id or ""), str(getattr(position, "engine_id", "") or ""))
-                    from backend.services.adaptive_learning import persist_trade_adaptive
+                    from backend.services.adaptive_learning import close_lineage, persist_trade_adaptive, with_close_lineage
 
-                    persist_trade_adaptive(conn, sell_trade_id, getattr(position, "adaptive_decision", None))
+                    _entry_decision = getattr(position, "adaptive_decision", None)
+                    _lineage_engine = str(getattr(position, "engine_id", "") or "")
+                    if _entry_decision and _lineage_engine in {"DAY_V2", "SCALP_V2"}:
+                        _entry_decision = with_close_lineage(
+                            _entry_decision,
+                            close_lineage(
+                                _entry_decision,
+                                engine=_lineage_engine,
+                                symbol=symbol,
+                                position_trade_id=str(position_trade_id or ""),
+                                sell_trade_id=sell_trade_id,
+                                opportunity_id=str(getattr(position, "scalp_opportunity_id", "") or ""),
+                                entry_price=position.entry_price,
+                                exit_price=price_val,
+                                fees_usd=_total_fees,
+                                net_usd=pnl_usd_net,
+                                net_pct=pnl_pct_net,
+                                hold_seconds=hold_time_seconds,
+                                raw_exit_reason=_raw_exit_trigger,
+                                exit_reason=str(record_exit_reason or ""),
+                                entered_at=float(getattr(position, "entry_time", 0.0) or 0.0) or None,
+                                closed_at=time.time(),
+                                continuation=getattr(position, "continuation_last", None),
+                                versions=_sell_versions if isinstance(_sell_versions, dict) else None,
+                            ),
+                        )
+                    persist_trade_adaptive(conn, sell_trade_id, _entry_decision)
                     if getattr(position, "scalp_opportunity_id", ""):
                         from backend.services.scalp_v2.opportunity import mark_opportunity_on
 
@@ -16589,6 +16617,17 @@ class PortfolioEngine:
                     runner_tighten_mult=float((_adapt or {}).get("runner_tighten_mult") or 1.0),
                     expected_terminal_net=_terminal,
                 )
+                with contextlib.suppress(Exception):
+                    from backend.services.adaptive_learning import continuation_snapshot
+
+                    position.continuation_last = continuation_snapshot(
+                        self.db_path,
+                        "DAY_V2",
+                        mark_net=_day_unreal,
+                        terminal_net=_terminal,
+                        action=str((_day_v2_dec or {}).get("action") or "hold"),
+                        reason=str((_day_v2_dec or {}).get("reason") or ""),
+                    )
                 if _day_v2_dec and str(_day_v2_dec.get("action") or "") == "sell":
                     _day_v2_reason = str(_day_v2_dec.get("reason") or "DAY_V2_EXIT")
                     logger.warning(
@@ -16662,6 +16701,17 @@ class PortfolioEngine:
                     allow_adverse_stop=executable_bid is not None and float(executable_bid) > 0,
                     expected_terminal_net=_scalp_terminal,
                 )
+                with contextlib.suppress(Exception):
+                    from backend.services.adaptive_learning import continuation_snapshot
+
+                    position.continuation_last = continuation_snapshot(
+                        self.db_path,
+                        "SCALP_V2",
+                        mark_net=_net_pnl_sv2,
+                        terminal_net=_scalp_terminal,
+                        action=str(_scalp_v2_dec.get("action") or "hold"),
+                        reason=str(_scalp_v2_dec.get("reason") or ""),
+                    )
                 if str(_scalp_v2_dec.get("action") or "") == "sell":
                     _scalp_v2_reason = str(_scalp_v2_dec.get("reason") or "SCALP_V2_EXIT")
                     logger.warning(

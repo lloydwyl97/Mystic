@@ -44,7 +44,7 @@ from backend.services.continuation_surface import (
 from backend.services.day_v2.lifecycle_sim import ohlcv_bars_1m
 from backend.services.day_v2.live_exit_evaluator import catastrophic_threshold_price
 from backend.services.scalp_v2.exit_evaluator import SCALP_V2_CATASTROPHIC_PCT
-from backend.services.strategy_version import economic_anchor, economic_version, is_current_version
+from backend.services.strategy_version import economic_anchor, economic_version, exit_contract_of, is_current_version
 
 LEARNING_VERSION = "CONTINUATION_REMAINING_V1"
 SOURCE = "current_version_heartbeat_and_ohlcv"
@@ -268,11 +268,25 @@ def _bar_covering(bars: list[tuple[float, float, float, float, float]], moment: 
     return None
 
 
-def observations_for(position: Position, bars: list[tuple[float, float, float, float, float]], *, as_of: float) -> tuple[list[Observation], Counter]:
-    """Labels for one position. A horizon with no stored mark is skipped, not filled in."""
+def position_contract(position: Position) -> str:
+    """Exit contract of a closed position (``OPEN`` while it is held)."""
+    if not position.closed:
+        return "OPEN"
+    return exit_contract_of(position.engine, entered_at=position.entry_time, exit_reason=position.exit_reason)
+
+
+def observations_for(position: Position, bars: list[tuple[float, float, float, float, float]], *, as_of: float, current_contract_only: bool = False) -> tuple[list[Observation], Counter]:
+    """Labels for one position. A horizon with no stored mark is skipped, not filled in.
+
+    With ``current_contract_only`` a close under a retired exit contract gives no
+    ``exit_fill`` label: that exit is not what holding leads to now. Its
+    market-path labels stay."""
     skipped: Counter = Counter()
     raw: list[Observation] = []
     exit_net = _net(position.entry_price, position.exit_price) if position.closed and position.exit_price else None
+    if exit_net is not None and current_contract_only and position_contract(position) != "CURRENT":
+        exit_net = None
+        skipped[(position.engine, "retired_exit_contract_fill")] += 1
     for snap in position.snapshots:
         if snap.time > as_of:
             skipped[(position.engine, "snapshot_after_as_of")] += 1
@@ -329,7 +343,7 @@ def observations_for(position: Position, bars: list[tuple[float, float, float, f
     return [Observation(**{**obs.__dict__, "weight": share}) for obs in raw], skipped
 
 
-def build_observations(db_path: str, *, as_of: float | None = None) -> tuple[list[Observation], dict[str, Any]]:
+def build_observations(db_path: str, *, as_of: float | None = None, current_contract_only: bool = False) -> tuple[list[Observation], dict[str, Any]]:
     """Every usable current-version continuation label at or before ``as_of``."""
     clock = float(as_of if as_of is not None else time.time())
     positions, skipped = load_positions(db_path)
@@ -342,7 +356,7 @@ def build_observations(db_path: str, *, as_of: float | None = None) -> tuple[lis
     usable_positions: Counter = Counter()
     usable_snapshots: Counter = Counter()
     for position in positions:
-        found, more = observations_for(position, bars_cache.get(position.symbol, []), as_of=clock)
+        found, more = observations_for(position, bars_cache.get(position.symbol, []), as_of=clock, current_contract_only=current_contract_only)
         skipped.update(more)
         if found:
             usable_positions[position.engine] += 1
@@ -548,6 +562,166 @@ def install_continuation(target_db: str, state_db: str, inventory: dict[str, Any
     finally:
         src.close()
         dst.close()
+
+
+def _heartbeat_marks(db_path: str, trade_id: str) -> list[float]:
+    if not trade_id:
+        return []
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute("SELECT net_unrealized_pct FROM ai_position_heartbeats WHERE trade_id=? ORDER BY epoch_ms", (trade_id,)).fetchall()
+    finally:
+        conn.close()
+    marks: list[float] = []
+    for (raw,) in rows:
+        try:
+            mark = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(mark):
+            marks.append(mark)
+    return marks
+
+
+def _hold_rows(db_path: str, engine: str) -> list[sqlite3.Row]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(
+            "SELECT * FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND metric IN ('hold_remaining_up','hold_remaining_down')",
+            (engine, economic_version(engine)),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def rebuild_hold_remaining(
+    db_path: str,
+    engine: str,
+    *,
+    now: float | None = None,
+    apply: bool = False,
+    workdir: str | None = None,
+    current_contract_only: bool = True,
+) -> dict[str, Any]:
+    """Rebuild ``hold_remaining_*`` the way it was learned, under the current exit contract.
+
+    The installed backfill (labels known at the install time in
+    ``continuation_learning_meta``) followed by each later close's heartbeat
+    marks through ``learn_from_close``. A close under a retired exit contract
+    teaches neither: raw rows stay as they are. Dry run unless ``apply`` (run it
+    with the portfolio engine stopped). Engines whose installed continuation is
+    not ``CONTINUATION_REMAINING_V1`` are left alone.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from backend.services import adaptive_learning as al
+    from backend.services.economic_state_rebuild import realized_closes
+
+    engine_id = str(engine or "").upper()
+    moment = float(now if now is not None else time.time())
+    out: dict[str, Any] = {"engine": engine_id, "now": moment, "applied": False}
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        meta = conn.execute(
+            "SELECT learning_version, source, updated_at FROM continuation_learning_meta WHERE engine_id=? AND economic_version=?",
+            (engine_id, economic_version(engine_id)),
+        ).fetchone()
+    except sqlite3.Error:
+        meta = None
+    finally:
+        conn.close()
+    if meta is None or str(meta[0]) != LEARNING_VERSION:
+        out["skipped"] = f"installed continuation is {meta[0] if meta else 'none'}"
+        return out
+    installed_at = _epoch(meta[2])
+    if installed_at is None:
+        out["skipped"] = "install time unknown"
+        return out
+    out["installed_at"] = installed_at
+    plain, _ = build_observations(db_path, as_of=installed_at)
+    observations, inventory = build_observations(db_path, as_of=installed_at, current_contract_only=current_contract_only)
+    observations = [obs for obs in observations if obs.engine == engine_id]
+    out["backfill"] = {
+        "observations": len(observations),
+        "dropped_retired_exit_fill": sum(1 for obs in plain if obs.engine == engine_id) - len(observations),
+        "by_source": dict(Counter(obs.source for obs in observations)),
+    }
+    closes = [c for c in realized_closes(db_path, engine_id) if installed_at < float(c["closed_at"]) <= moment]
+    scratch_root = workdir or ("/dev/shm" if Path("/dev/shm").is_dir() else None)
+    with tempfile.TemporaryDirectory(prefix="hold_remaining_", dir=scratch_root) as tmp:
+        scratch = f"{tmp}/state.db"
+        _connect(scratch).close()
+        write_observations(scratch, observations)
+        taught = Counter()
+        for close in closes:
+            contract = close["contract"] if current_contract_only else "CURRENT"
+            taught[contract] += 1
+            if contract != "CURRENT":
+                continue
+            al.learn_from_close(
+                scratch,
+                engine=engine_id,
+                symbol=close["symbol"],
+                setup=close["setup"],
+                regime=close["regime"],
+                strategy_version=close["strategy_version"],
+                net_pct=close["net"],
+                mfe_pct=close["mfe"],
+                mae_pct=close["mae"],
+                hold_min=close["hold_min"],
+                continuation=None,
+                version_current=close["version_current"],
+                is_dust=close["is_dust"],
+                entered_at=close["entered_at"],
+                now=close["closed_at"],
+                unrealized_marks=_heartbeat_marks(db_path, close["position_trade_id"]),
+                exit_reason=close["exit_reason"],
+            )
+        out["closes_after_install"] = dict(taught)
+        before = _hold_rows(db_path, engine_id)
+        after = _hold_rows(scratch, engine_id)
+        key = lambda r: (r["symbol"], r["setup"], r["regime"], r["metric"])  # noqa: E731
+        old = {key(r): r for r in before}
+        new = {key(r): r for r in after}
+        shared = set(old) & set(new)
+        out["state"] = {
+            "rows_before": len(before),
+            "rows_after": len(after),
+            "n_before": round(sum(float(r["n"]) for r in before), 3),
+            "n_after": round(sum(float(r["n"]) for r in after), 3),
+            "shared_rows": len(shared),
+            "max_abs_mean_diff": max((abs(float(new[k]["ewma"]) - float(old[k]["ewma"])) for k in shared), default=0.0),
+        }
+        if not apply:
+            return out
+        dst = sqlite3.connect(db_path, timeout=30)
+        try:
+            dst.execute("BEGIN IMMEDIATE")
+            dst.execute(
+                "DELETE FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND metric IN ('hold_remaining_up','hold_remaining_down')",
+                (engine_id, economic_version(engine_id)),
+            )
+            dst.executemany(
+                "INSERT INTO adaptive_metric_state (engine_id, economic_version, symbol, setup, regime, metric, n, ewma, m2, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [(r["engine_id"], r["economic_version"], r["symbol"], r["setup"], r["regime"], r["metric"], r["n"], r["ewma"], r["m2"], r["updated_at"]) for r in after],
+            )
+            dst.execute(
+                "UPDATE continuation_learning_meta SET source=?, observations=? WHERE engine_id=? AND economic_version=?",
+                (f"{SOURCE}|current_exit_contract", len(observations), engine_id, economic_version(engine_id)),
+            )
+            dst.execute("COMMIT")
+        except Exception:
+            dst.execute("ROLLBACK")
+            raise
+        finally:
+            dst.close()
+        out["applied"] = True
+        out["inventory"] = inventory.get(engine_id, {})
+    return out
 
 
 def _catastrophic(position: Position, mark: float, low: float) -> bool:
