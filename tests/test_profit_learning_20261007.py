@@ -57,6 +57,30 @@ def test_live_30s_and_60s_use_the_aligned_bid(tmp_path):
     assert abs(marks["60"] - ((100.4 - 100.0) / 100.0 - 0.0006)) < 1e-12
 
 
+def test_bid_mark_does_not_charge_the_exit_half_spread_twice(tmp_path):
+    db = str(tmp_path / "t.db")
+    _book(db, T0 + 28.0, 99.988)
+    # Ask entry. Full spread 1.2 bps is inside the bid. Stored cost adds the 0.6 bps exit half on top of 6 bps of fee and slippage.
+    row_id = al.record_candidate(
+        db, engine=SCALP, symbol="BTCUSDT", setup="CLAIM", regime="r", ref_price=100.0, roundtrip_cost=0.00066, signaled=True, evaluated_at=T0
+    )
+    al.resolve_markouts(db, lambda _s, _t: 130.0, now=T0 + 200)
+    marks = _marks(db, row_id)
+    assert abs(marks["30"] - ((99.988 - 100.0) / 100.0 - 0.0006)) < 1e-12
+    assert marks["30"] > (99.988 - 100.0) / 100.0 - 0.00066
+
+
+def test_calibration_folds_as_a_running_mean(tmp_path):
+    db = str(tmp_path / "t.db")
+    version = al.current_strategy_version(DAY)
+    moment = T0
+    assert al.observe(db, engine=DAY, symbol="SOLUSDT", setup="EXHAUSTION_MR", regime="r", metric="policy_calibration", value=-0.01, strategy_version=version, now=moment)
+    assert al.observe(db, engine=DAY, symbol="SOLUSDT", setup="EXHAUSTION_MR", regime="r", metric="policy_calibration", value=0.0, strategy_version=version, now=moment)
+    with sqlite3.connect(db) as conn:
+        ewma = conn.execute("SELECT ewma FROM adaptive_metric_state WHERE metric='policy_calibration'").fetchone()[0]
+    assert abs(ewma - (-0.005)) < 1e-12
+
+
 def test_a_print_after_the_horizon_stays_missing(tmp_path):
     db = str(tmp_path / "t.db")
     _book(db, T0 + 40.0, 101.0)

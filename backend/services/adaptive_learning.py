@@ -177,6 +177,7 @@ MEAN_FORM_METRICS = frozenset(
         "lifecycle_net",
         "trade_net",
         "policy_gap",
+        "policy_calibration",
         "hold_remaining_up",
         "hold_remaining_down",
         *CLAIM_MOMENT_METRICS,
@@ -1960,6 +1961,21 @@ def _lifecycle_label(row: sqlite3.Row, *, moment: float, bars_1m: Callable[[str,
     return simulate_lifecycle(params, bars, roundtrip_cost=float(row["roundtrip_cost"] or 0), now=moment)
 
 
+def executable_bid_net(ref: float, bid: float, stored_cost: float) -> float:
+    """Return from an ask entry to a later bid, minus costs the bid does not already contain.
+
+    ``canonical_roundtrip_cost_pct`` adds the exit half-spread because a mid or
+    trade mark does not include it. The bid already includes that half, so
+    subtracting the stored cost again would charge it twice. Fee and slippage
+    stay. A stored cost at or below that fee-and-slippage floor is unchanged.
+    """
+    from backend.config.trading_economics import SLIPPAGE_BUFFER, TAKER_FEE
+
+    beyond = 2.0 * float(TAKER_FEE) + 2.0 * float(SLIPPAGE_BUFFER)
+    exit_half = max(0.0, float(stored_cost) - beyond)
+    return (float(bid) - float(ref)) / float(ref) - (float(stored_cost) - exit_half)
+
+
 def executable_bid_at(db_path: str, symbol: str, target: float, horizon: int) -> float | None:
     """Bid aligned to ``target``. A later bar close is not a substitute."""
     from backend.services.full_state_research import scalp_observations
@@ -1989,7 +2005,7 @@ def _repair_short_marks(db_path: str, row: Any, marks: dict) -> None:
         with contextlib.suppress(Exception):
             price = executable_bid_at(db_path, str(row["symbol"]), float(row["evaluated_at"]) + horizon, horizon)
         if price is not None and ref > 0:
-            marks[key] = (float(price) - ref) / ref - cost
+            marks[key] = executable_bid_net(ref, float(price), cost)
         elif not learned:
             marks.pop(key, None)
 
@@ -2121,6 +2137,8 @@ def resolve_markouts(
                         continue
                     if price is None or ref <= 0 or not math.isfinite(float(price or 0)):
                         marks[key] = None
+                    elif engine_id == SCALP_ENGINE and int(horizon) in (30, 60):
+                        marks[key] = executable_bid_net(ref, float(price), cost)
                     else:
                         marks[key] = (float(price) - ref) / ref - cost
                 if engine_id == SCALP_ENGINE and tick_quote is not None:
