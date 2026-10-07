@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -567,3 +568,168 @@ def test_post_exit_horizons_update_the_hold_learner_when_they_resolve(tmp_path):
     after = al.estimate(db, DAY, "XRPUSDT", "EXHAUSTION_MR__MARKET", "btcdown_vollo", "hold_adv_900")
     assert after["n"] > before
     assert re.search(r"\bmin_hold\b", inspect.getsource(advantage_labels_for), re.IGNORECASE) is None
+
+
+def _calibration_state(db: str) -> tuple[int, float | None, float | None]:
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT COUNT(*), SUM(n), SUM(ewma) FROM adaptive_metric_state WHERE metric='policy_calibration'").fetchone()
+    count = int(row[0] or 0)
+    if count == 0:
+        return 0, None, None
+    return count, float(row[1]), float(row[2])
+
+
+def test_a_crash_between_the_flag_and_the_observation_learns_once_for_both_engines(tmp_path):
+    predicted, realized = 0.002, -0.001
+    cases = ((DAY, "BTCUSDT", "EXHAUSTION_MR__MARKET"), (SCALP, "ETHUSDT", "CLAIM"))
+    real_fold = al._fold_observation
+    for engine, symbol, setup in cases:
+        db = str(tmp_path / f"{engine}.db")
+        row_id = al.record_candidate(
+            db,
+            engine=engine,
+            symbol=symbol,
+            setup=setup,
+            regime="btcdown_vollo",
+            ref_price=100.0,
+            roundtrip_cost=0.002,
+            signaled=True,
+            evaluated_at=T0,
+            economic={"policy_value": predicted},
+            opportunity_id=f"CRASH-{engine}",
+        )
+        assert al.mark_candidate_filled(db, row_id)
+
+        def boom(conn, _db=db, _row_id=row_id, **kwargs):
+            del conn, kwargs
+            other = sqlite3.connect(_db)
+            try:
+                flag = other.execute("SELECT calibration_learned FROM adaptive_candidate_markouts WHERE id=?", (_row_id,)).fetchone()[0]
+                stored = other.execute("SELECT COUNT(*) FROM adaptive_metric_state WHERE metric='policy_calibration'").fetchone()[0]
+            finally:
+                other.close()
+            assert int(flag) == 0
+            assert int(stored) == 0
+            raise RuntimeError("crash between flag and observation")
+
+        al._fold_observation = boom
+        try:
+            try:
+                al.record_policy_outcome(db, engine=engine, opportunity_id=f"CRASH-{engine}", net_pct=realized, now=T0, candidate_id=row_id)
+            except RuntimeError as exc:
+                assert "crash between flag and observation" in str(exc)
+            else:
+                raise AssertionError(engine)
+        finally:
+            al._fold_observation = real_fold
+        with sqlite3.connect(db) as conn:
+            flag, net = conn.execute("SELECT calibration_learned, realized_net FROM adaptive_candidate_markouts WHERE id=?", (row_id,)).fetchone()
+        assert int(flag) == 0
+        assert net is not None
+        assert _calibration_state(db)[0] == 0
+        conn = al._connect(db)
+        try:
+            row = conn.execute("SELECT * FROM adaptive_candidate_markouts WHERE id=?", (row_id,)).fetchone()
+            assert al._learn_policy_calibration(conn, db, row, realized, T0) is True
+            row = conn.execute("SELECT * FROM adaptive_candidate_markouts WHERE id=?", (row_id,)).fetchone()
+            assert al._learn_policy_calibration(conn, db, row, realized, T0) is False
+        finally:
+            conn.close()
+        count, sample_n, ewma = _calibration_state(db)
+        assert count == 1
+        assert sample_n is not None and abs(sample_n - 1.0) < 1e-9
+        assert ewma is not None and abs(ewma - (realized - predicted)) < 1e-12
+        with sqlite3.connect(db) as conn:
+            flag = conn.execute("SELECT calibration_learned FROM adaptive_candidate_markouts WHERE id=?", (row_id,)).fetchone()[0]
+        assert int(flag) == 1
+
+
+def test_a_flagged_close_without_an_observation_is_folded_once(tmp_path):
+    db = str(tmp_path / "repair.db")
+    predicted, realized = 0.003, -0.002
+    entered = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc).timestamp()
+    row_id = al.record_candidate(
+        db,
+        engine=DAY,
+        symbol="BTCUSDT",
+        setup="RANGE_BOUNCE__MARKET",
+        regime="btcflat_volhi",
+        ref_price=100.0,
+        roundtrip_cost=0.002,
+        signaled=True,
+        evaluated_at=entered,
+        economic={"policy_value": predicted},
+        opportunity_id="REPAIR",
+    )
+    assert al.mark_candidate_filled(db, row_id)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE adaptive_candidate_markouts SET realized_net=?, calibration_learned=1 WHERE id=?", (realized, row_id))
+        conn.execute("CREATE TABLE paper_trades (symbol TEXT, side TEXT, engine_id TEXT, timestamp TEXT, entry_timestamp TEXT, exit_reason TEXT)")
+        conn.execute(
+            "INSERT INTO paper_trades VALUES (?,?,?,?,?,?)",
+            ("BTC/USDT", "SELL", DAY, "2026-10-06T12:05:00Z", "2026-10-06T12:00:00Z", "LEARNED_CONTINUATION_EXIT"),
+        )
+    al._calibration_backfilled.discard(os.path.abspath(db))
+    al.backfill_close_calibration(db)
+    count, sample_n, ewma = _calibration_state(db)
+    assert count == 1
+    assert sample_n is not None and abs(sample_n - 1.0) < 1e-9
+    assert ewma is not None and abs(ewma - (realized - predicted)) < 1e-12
+    assert _flags(db, row_id) == (1, 0)
+    al._calibration_backfilled.discard(os.path.abspath(db))
+    assert al.backfill_close_calibration(db) == 0
+    count2, sample_n2, ewma2 = _calibration_state(db)
+    assert count2 == 1
+    assert sample_n2 == sample_n
+    assert ewma2 == ewma
+
+
+def test_a_flag_without_a_forecast_is_cleared_and_an_existing_observation_is_not_duplicated(tmp_path):
+    db = str(tmp_path / "clear.db")
+    version = al.current_strategy_version(DAY)
+    assert al.observe(
+        db,
+        engine=DAY,
+        symbol="ETHUSDT",
+        setup="VWAP_REVERSION__MARKET",
+        regime="btcdown_vollo",
+        metric="policy_calibration",
+        value=-0.004,
+        strategy_version=version,
+        now=T0,
+    )
+    kept = al.record_candidate(
+        db,
+        engine=DAY,
+        symbol="ETHUSDT",
+        setup="VWAP_REVERSION__MARKET",
+        regime="btcdown_vollo",
+        ref_price=100.0,
+        roundtrip_cost=0.002,
+        signaled=True,
+        evaluated_at=T0,
+        economic={"policy_value": 0.001},
+        opportunity_id="KEPT",
+    )
+    assert al.mark_candidate_filled(db, kept)
+    empty = al.record_candidate(
+        db,
+        engine=DAY,
+        symbol="SOLUSDT",
+        setup="RANGE_BOUNCE__MARKET",
+        regime="btcflat_vollo",
+        ref_price=100.0,
+        roundtrip_cost=0.002,
+        signaled=True,
+        evaluated_at=T0,
+        opportunity_id="EMPTY",
+    )
+    assert al.mark_candidate_filled(db, empty)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE adaptive_candidate_markouts SET realized_net=?, calibration_learned=1 WHERE id IN (?, ?)", (-0.001, kept, empty))
+    before = _calibration_state(db)
+    al._calibration_backfilled.discard(os.path.abspath(db))
+    al.backfill_close_calibration(db)
+    assert _calibration_state(db) == before
+    assert _flags(db, kept) == (1, 0)
+    assert _flags(db, empty) == (0, 0)

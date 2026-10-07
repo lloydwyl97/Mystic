@@ -4814,7 +4814,11 @@ class PortfolioEngine:
         self._sleeve_unrealized_cache = {Sleeve.CORE.value: 0.0, Sleeve.ACTIVE.value: 0.0}
         self._sleeve_market_notional_cache = {Sleeve.CORE.value: 0.0, Sleeve.ACTIVE.value: 0.0}
 
-        cost_basis = sum(pos.entry_price * pos.quantity for pos in self.open_positions.values())
+        cost_basis = 0.0
+        for _cost_key, _cost_pos in self.open_positions.items():
+            if not position_mtm_symbol(_cost_pos, str(_cost_key)):
+                continue
+            cost_basis += _cost_pos.entry_price * _cost_pos.quantity
         if not self.open_positions:
             return self._add_protected_equity(0.0, 0.0, prices)
 
@@ -4835,8 +4839,11 @@ class PortfolioEngine:
         if prices:
             for _key, pos in self.open_positions.items():
                 # Two-engine contract: price identity is the strategy symbol,
-                # never the composite memory key.
-                symbol = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
+                # never the composite memory key. An empty symbol is skipped
+                # so one malformed lot cannot abort the rest of the book.
+                symbol = position_mtm_symbol(pos, str(_key))
+                if not symbol:
+                    continue
                 base = symbol.split("/")[0] if "/" in symbol else symbol.replace("USDT", "")
                 ns = normalize_symbol(symbol)
                 p = prices.get(symbol) or prices.get(ns) or prices.get(base)
@@ -4850,7 +4857,9 @@ class PortfolioEngine:
             redis_client = get_redis_client()
             if redis_client:
                 for _key, pos in self.open_positions.items():
-                    symbol = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
+                    symbol = position_mtm_symbol(pos, str(_key))
+                    if not symbol:
+                        continue
                     try:
                         px = self._get_cached_market_price(symbol)
                         current_price = px if px > 0 else pos.entry_price
@@ -4860,12 +4869,16 @@ class PortfolioEngine:
                         _accumulate(symbol, pos, pos.entry_price)
             else:
                 for _key, pos in self.open_positions.items():
-                    symbol = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
+                    symbol = position_mtm_symbol(pos, str(_key))
+                    if not symbol:
+                        continue
                     _accumulate(symbol, pos, pos.entry_price)
         except Exception as e:
             logger.warning("RECOMPUTE: Redis for prices: %s", e)
             for _key, pos in self.open_positions.items():
-                symbol = normalize_symbol(str(getattr(pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
+                symbol = position_mtm_symbol(pos, str(_key))
+                if not symbol:
+                    continue
                 _accumulate(symbol, pos, pos.entry_price)
         return self._add_protected_equity(positions_value_market, cost_basis, prices)
 

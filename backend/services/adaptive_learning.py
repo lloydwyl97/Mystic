@@ -431,8 +431,9 @@ def _connect(db_path: str) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE adaptive_candidate_markouts ADD COLUMN {col} {ddl}")
     if "calibration_learned" not in cols:
         conn.execute("ALTER TABLE adaptive_candidate_markouts ADD COLUMN calibration_learned INTEGER NOT NULL DEFAULT 0")
-        # The previous learner wrote calibration in the same step as policy_gap.
-        # Those rows already contain the observation; do not write it again.
+        # Rows that finished the old combined step are not calibration candidates
+        # for the close-time backfill. A flag with no metric row is repaired
+        # later, one key at a time, and is not treated as already observed.
         conn.execute("UPDATE adaptive_candidate_markouts SET calibration_learned=1 WHERE policy_learned=1 AND calibration_learned=0")
         conn.commit()
     # resolve_markouts runs every SCALP cycle; without these, its key repair and
@@ -484,39 +485,136 @@ def observe(
         return False
     if value is None or not math.isfinite(float(value)):
         return False
+    with _connect(db_path) as conn:
+        folded = _fold_observation(
+            conn,
+            engine=engine,
+            symbol=symbol,
+            setup=setup,
+            regime=regime,
+            metric=metric,
+            value=value,
+            strategy_version=strategy_version,
+            now=now,
+            weight=weight,
+        )
+        if folded:
+            conn.commit()
+    return folded
+
+
+def _fold_observation(
+    conn: sqlite3.Connection,
+    *,
+    engine: str,
+    symbol: str,
+    setup: str,
+    regime: str,
+    metric: str,
+    value: float,
+    strategy_version: str,
+    now: float | None = None,
+    weight: float = 1.0,
+) -> bool:
+    """Fold one observation on ``conn`` without committing.
+
+    Callers own the transaction. ``observe`` commits its own connection.
+    The close-time calibration learner commits this write together with the
+    learned flag."""
+    engine_id = str(engine or "").upper()
+    if engine_id not in _PRIORS or metric not in _PRIORS[engine_id]:
+        return False
+    if str(strategy_version or "") != current_strategy_version(engine_id):
+        return False
+    if value is None or not math.isfinite(float(value)):
+        return False
     w = float(weight) if metric in MEAN_FORM_METRICS else 1.0
     if not (math.isfinite(w) and w > 0):
         return False
     value = float(value)
     key = (engine_id, current_economic_version(engine_id), _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower(), metric)
     moment = float(now if now is not None else time.time())
-    with _connect(db_path) as conn:
-        row = conn.execute(
-            "SELECT n, ewma, m2, updated_at FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND symbol=? AND setup=? AND regime=? AND metric=?",
-            key,
-        ).fetchone()
-        if row is None or float(row["n"]) <= 0:
-            n, mean, m2 = w, value, 0.0
-        else:
-            # Age out the prior sample count so stale evidence stops dominating,
-            # then fold in the new observation at its weight.
-            decay = _decay_factor(str(row["updated_at"] or ""), moment, engine_id)
-            n = float(row["n"]) * decay + w
-            alpha = w / n if metric in MEAN_FORM_METRICS else EWMA_ALPHA
-            delta = value - float(row["ewma"])
-            mean = float(row["ewma"]) + alpha * delta
-            m2 = max(0.0, float(row["m2"] or 0.0)) * decay + w * delta * (value - mean)
-        conn.execute(
-            """
-            INSERT INTO adaptive_metric_state (engine_id, economic_version, symbol, setup, regime, metric, n, ewma, m2, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(engine_id, economic_version, symbol, setup, regime, metric) DO UPDATE SET
-                n=excluded.n, ewma=excluded.ewma, m2=excluded.m2, updated_at=excluded.updated_at
-            """,
-            (*key, n, mean, max(0.0, m2), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))),
-        )
-        conn.commit()
+    row = conn.execute(
+        "SELECT n, ewma, m2, updated_at FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND symbol=? AND setup=? AND regime=? AND metric=?",
+        key,
+    ).fetchone()
+    if row is None or float(row["n"]) <= 0:
+        n, mean, m2 = w, value, 0.0
+    else:
+        # Age out the prior sample count so stale evidence stops dominating,
+        # then fold in the new observation at its weight.
+        decay = _decay_factor(str(row["updated_at"] or ""), moment, engine_id)
+        n = float(row["n"]) * decay + w
+        alpha = w / n if metric in MEAN_FORM_METRICS else EWMA_ALPHA
+        delta = value - float(row["ewma"])
+        mean = float(row["ewma"]) + alpha * delta
+        m2 = max(0.0, float(row["m2"] or 0.0)) * decay + w * delta * (value - mean)
+    conn.execute(
+        """
+        INSERT INTO adaptive_metric_state (engine_id, economic_version, symbol, setup, regime, metric, n, ewma, m2, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(engine_id, economic_version, symbol, setup, regime, metric) DO UPDATE SET
+            n=excluded.n, ewma=excluded.ewma, m2=excluded.m2, updated_at=excluded.updated_at
+        """,
+        (*key, n, mean, max(0.0, m2), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))),
+    )
     return True
+
+
+def _claim_and_fold(
+    conn: sqlite3.Connection,
+    *,
+    row_id: int,
+    flag: str,
+    engine: str,
+    symbol: str,
+    setup: str,
+    regime: str,
+    metric: str,
+    value: float,
+    strategy_version: str,
+    moment: float,
+) -> bool:
+    """Set one learned flag and fold its observation in a single savepoint.
+
+    A crash before release leaves the flag unset and the observation unwritten.
+    A later retry writes both once. Releasing the outermost savepoint commits
+    both; a nested savepoint waits for the caller's commit, which then persists
+    both or neither."""
+    if flag == "calibration_learned":
+        claim = "UPDATE adaptive_candidate_markouts SET calibration_learned=1 WHERE id=? AND calibration_learned=0"
+    elif flag == "policy_learned":
+        claim = "UPDATE adaptive_candidate_markouts SET policy_learned=1 WHERE id=? AND policy_learned=0"
+    else:
+        return False
+    conn.execute("SAVEPOINT mystic_learn")
+    try:
+        cur = conn.execute(claim, (int(row_id),))
+        if cur.rowcount != 1:
+            conn.execute("ROLLBACK TO mystic_learn")
+            conn.execute("RELEASE mystic_learn")
+            return False
+        folded = _fold_observation(
+            conn,
+            engine=engine,
+            symbol=symbol,
+            setup=setup,
+            regime=regime,
+            metric=metric,
+            value=value,
+            strategy_version=strategy_version,
+            now=moment,
+        )
+        if not folded:
+            conn.execute("ROLLBACK TO mystic_learn")
+            conn.execute("RELEASE mystic_learn")
+            return False
+        conn.execute("RELEASE mystic_learn")
+        return True
+    except Exception:
+        conn.execute("ROLLBACK TO mystic_learn")
+        conn.execute("RELEASE mystic_learn")
+        raise
 
 
 # Hierarchy levels, broadest first, nested: ENGINE is every row of the engine,
@@ -1896,7 +1994,11 @@ def observe_policy_calibration(
 
 
 def _learn_policy_calibration(conn: sqlite3.Connection, db_path: str, row: Any, realized: float, moment: float) -> bool:
-    """Fold one close into ``policy_calibration`` at the close. Exactly once."""
+    """Fold one close into ``policy_calibration`` at the close. Exactly once.
+
+    The learned flag and the observation commit together. A crash leaves the
+    close unlearned so the next pass can write both."""
+    del db_path
     engine_id = str(row["engine_id"])
     if not math.isfinite(float(realized)):
         return False
@@ -1905,46 +2007,45 @@ def _learn_policy_calibration(conn: sqlite3.Connection, db_path: str, row: Any, 
     predicted = _predicted_policy_value(row)
     if predicted is None:
         return False
-    cur = conn.execute("UPDATE adaptive_candidate_markouts SET calibration_learned=1 WHERE id=? AND calibration_learned=0", (row["id"],))
-    conn.commit()
-    if cur.rowcount != 1:
-        return False
-    return observe_policy_calibration(
-        db_path,
+    return _claim_and_fold(
+        conn,
+        row_id=int(row["id"]),
+        flag="calibration_learned",
         engine=engine_id,
         symbol=str(row["symbol"]),
         setup=str(row["setup"]),
         regime=str(row["regime"]),
-        realized=float(realized),
-        predicted=predicted,
-        now=float(moment),
+        metric="policy_calibration",
+        value=float(realized) - float(predicted),
+        strategy_version=current_strategy_version(engine_id),
+        moment=float(moment),
     )
 
 
 def _learn_policy_gap(conn: sqlite3.Connection, db_path: str, row: Any, marks: dict, realized: float, moment: float) -> bool:
     """Fold realized minus the row's market label into ``policy_gap`` once.
 
-    This waits until that label is final. It does not write ``policy_calibration``."""
+    This waits until that label is final. It does not write ``policy_calibration``.
+    The flag and the gap observation commit together."""
+    del db_path
     engine_id = str(row["engine_id"])
     market = _market_label(engine_id, row, marks)
     if market is None or not math.isfinite(float(realized)):
         return False
     if str(row["strategy_version"]) != current_strategy_version(engine_id) or str(row["economic_version"] or "") != current_economic_version(engine_id):
         return False
-    cur = conn.execute("UPDATE adaptive_candidate_markouts SET policy_learned=1 WHERE id=? AND policy_learned=0", (row["id"],))
-    conn.commit()
-    if cur.rowcount != 1:
-        return False
-    return observe(
-        db_path,
+    return _claim_and_fold(
+        conn,
+        row_id=int(row["id"]),
+        flag="policy_learned",
         engine=engine_id,
-        symbol=row["symbol"],
-        setup=row["setup"],
-        regime=row["regime"],
+        symbol=str(row["symbol"]),
+        setup=str(row["setup"]),
+        regime=str(row["regime"]),
         metric="policy_gap",
-        value=float(realized) - market,
+        value=float(realized) - float(market),
         strategy_version=str(row["strategy_version"]),
-        now=moment,
+        moment=float(moment),
     )
 
 
@@ -1967,9 +2068,12 @@ def _calibration_backfill_floor() -> float:
     return float(parsed if parsed is not None else 0.0)
 
 
-def _close_moment(conn: sqlite3.Connection, row: Any) -> float | None:
-    """Sell time of this filled candidate when the close is a current-policy exit
-    at or after the calibration repair. None leaves the row unlearned."""
+def _close_moment(conn: sqlite3.Connection, row: Any, *, apply_floor: bool = True) -> float | None:
+    """Sell time of this filled candidate when the close is a current-policy exit.
+
+    The close-time backfill also requires the sell to be at or after the
+    calibration repair. ``apply_floor=False`` is the mismatch repair: a flagged
+    current-policy close is eligible at its own sell time."""
     engine_id = str(row["engine_id"])
     symbol = _norm_symbol(row["symbol"])
     try:
@@ -2008,7 +2112,7 @@ def _close_moment(conn: sqlite3.Connection, row: Any) -> float | None:
         return None
     entered = best_entered
     closed = best_closed
-    if closed < _calibration_backfill_floor():
+    if apply_floor and closed < _calibration_backfill_floor():
         return None
     if exit_contract_of(engine_id, entered_at=entered, exit_reason=reason) != "CURRENT":
         return None
@@ -2018,11 +2122,96 @@ def _close_moment(conn: sqlite3.Connection, row: Any) -> float | None:
 _calibration_backfilled: set[str] = set()
 
 
+def _calibration_identity(row: Any) -> tuple[str, str, str, str, str] | None:
+    """Current-version key of one candidate, or None when the row is another contract."""
+    engine_id = str(row["engine_id"])
+    if str(row["strategy_version"]) != current_strategy_version(engine_id) or str(row["economic_version"] or "") != current_economic_version(engine_id):
+        return None
+    return (
+        engine_id,
+        current_economic_version(engine_id),
+        _norm_symbol(row["symbol"]),
+        str(row["setup"] or "").upper(),
+        str(row["regime"] or "").lower(),
+    )
+
+
+def repair_marked_calibration_without_observation(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Restore the learned-or-not invariant for current-version closes.
+
+    A key with no ``policy_calibration`` row is not observed. Every flagged
+    close on that key that has a stored forecast and a current-policy sell is
+    folded once, in one savepoint, at its sell time. A flagged close that
+    cannot be an observation has the flag cleared. A key that already has an
+    observation is left unchanged, so a second pass cannot duplicate it.
+    Fills, accounting and lifecycle history are not written."""
+    rows = conn.execute("SELECT * FROM adaptive_candidate_markouts WHERE filled=1 AND realized_net IS NOT NULL AND calibration_learned=1").fetchall()
+    groups: dict[tuple[str, str, str, str, str], list[Any]] = {}
+    for row in rows:
+        identity = _calibration_identity(row)
+        if identity is None:
+            continue
+        groups.setdefault(identity, []).append(row)
+    folded = 0
+    cleared = 0
+    for identity, members in groups.items():
+        present = conn.execute(
+            "SELECT 1 FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND symbol=? AND setup=? AND regime=? AND metric='policy_calibration'",
+            identity,
+        ).fetchone()
+        if present is not None:
+            continue
+        ready: list[tuple[float, int, Any, float, float]] = []
+        for row in members:
+            predicted = _predicted_policy_value(row)
+            moment = _close_moment(conn, row, apply_floor=False)
+            try:
+                realized = float(row["realized_net"])
+            except (TypeError, ValueError):
+                realized = float("nan")
+            if predicted is None or moment is None or not math.isfinite(realized):
+                cur = conn.execute("UPDATE adaptive_candidate_markouts SET calibration_learned=0 WHERE id=? AND calibration_learned=1", (row["id"],))
+                conn.commit()
+                cleared += int(cur.rowcount or 0)
+                continue
+            ready.append((float(moment), int(row["id"]), row, float(predicted), realized))
+        if not ready:
+            continue
+        ready.sort()
+        conn.execute("SAVEPOINT mystic_calibration_repair")
+        try:
+            wrote = 0
+            for moment, _row_id, row, predicted, realized in ready:
+                ok = _fold_observation(
+                    conn,
+                    engine=str(row["engine_id"]),
+                    symbol=str(row["symbol"]),
+                    setup=str(row["setup"]),
+                    regime=str(row["regime"]),
+                    metric="policy_calibration",
+                    value=realized - predicted,
+                    strategy_version=str(row["strategy_version"]),
+                    now=moment,
+                )
+                if not ok:
+                    raise RuntimeError("calibration observation rejected")
+                wrote += 1
+            conn.execute("RELEASE mystic_calibration_repair")
+            folded += wrote
+        except Exception:
+            conn.execute("ROLLBACK TO mystic_calibration_repair")
+            conn.execute("RELEASE mystic_calibration_repair")
+            logger.warning("CALIBRATION_REPAIR_KEY_FAILED symbol=%s setup=%s regime=%s", identity[2], identity[3], identity[4])
+    if folded or cleared:
+        logger.info("CALIBRATION_REPAIR folded=%s cleared=%s", folded, cleared)
+    return folded, cleared
+
+
 def backfill_close_calibration(db_path: str) -> int:
     """Teach calibration for current-policy closes the lifecycle wait skipped.
 
-    One observation per filled candidate. Rows that already learned calibration,
-    including through the old combined gap step, are left unchanged. Fills,
+    One observation per filled candidate. A close already marked learned is
+    repaired only when its key has no calibration observation. Fills,
     accounting and lifecycle history are not written."""
     key = os.path.abspath(db_path)
     if key in _calibration_backfilled:
@@ -2030,6 +2219,7 @@ def backfill_close_calibration(db_path: str) -> int:
     taught = 0
     conn = _connect(db_path)
     try:
+        repair_marked_calibration_without_observation(conn)
         rows = conn.execute("SELECT * FROM adaptive_candidate_markouts WHERE filled=1 AND realized_net IS NOT NULL AND calibration_learned=0").fetchall()
         for row in rows:
             moment = _close_moment(conn, row)
