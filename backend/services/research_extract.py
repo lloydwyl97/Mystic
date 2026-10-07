@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-RESEARCH_EXTRACT_VERSION = "RESEARCH_EXTRACT_V2"
+RESEARCH_EXTRACT_VERSION = "RESEARCH_EXTRACT_V3"
 BAR_LOOKBACK_SEC = 10 * 86400
 VECTOR_LOOKBACK_SEC = 86400
 
@@ -87,6 +87,8 @@ def table_specs() -> tuple[TableSpec, ...]:
         TableSpec("decision_book_tape", "ts_utc >= :vectors_iso AND ts_utc <= :now_iso", "vectors"),
         TableSpec("day_agg_trades", "trade_time_ms >= :vectors_ms AND trade_time_ms <= :now_ms", "vectors"),
         TableSpec("book_queue_chunks", "chunk_start >= :vectors AND chunk_start <= :now", "vectors"),
+        TableSpec("research_market_states", "decision_ts >= :vectors AND decision_ts <= :now", "vectors"),
+        TableSpec("research_market_labels", "decision_ts >= :vectors AND decision_ts <= :now", "vectors"),
     )
 
 

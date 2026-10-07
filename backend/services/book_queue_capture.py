@@ -387,6 +387,58 @@ def queue_features(snaps: list[dict[str, Any]], *, depth: int = 5) -> dict[str, 
     return out
 
 
+def queue_features_asof(db_path: str, symbol: str, at: float, lookback_sec: float = 30.0, *, depth: int = 5) -> dict[str, float]:
+    """Queue features from snapshots knowable at ``at``. A later update is excluded."""
+    snaps = [s for s in load_chunks(db_path, symbol, at - lookback_sec, at + 1e-9) if s["ts"] <= at]
+    return queue_features(snaps, depth=depth)
+
+
+def queue_health(db_path: str) -> dict[str, Any]:
+    """Capture counters. Empty when the table does not exist yet."""
+    empty: dict[str, Any] = {
+        "chunks": 0,
+        "usable": 0,
+        "duplicates": 0,
+        "out_of_order": 0,
+        "crossed": 0,
+        "max_gap_ms": 0,
+        "payload_bytes": 0,
+        "hours": 0.0,
+        "symbols": {},
+    }
+    with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+        try:
+            rows = conn.execute(
+                f"SELECT symbol, COUNT(*), SUM(usable), SUM(n_dup), SUM(n_out_of_order), SUM(n_crossed), "
+                f"MAX(max_gap_ms), SUM(LENGTH(payload)), MIN(chunk_start), MAX(chunk_start) FROM {TABLE} GROUP BY symbol"
+            ).fetchall()
+        except sqlite3.Error:
+            return empty
+    lo = hi = None
+    for sym, n, usable, dups, ooo, crossed, gap, nbytes, start, end in rows:
+        empty["symbols"][str(sym)] = {
+            "chunks": int(n),
+            "usable": int(usable or 0),
+            "duplicates": int(dups or 0),
+            "out_of_order": int(ooo or 0),
+            "crossed": int(crossed or 0),
+            "max_gap_ms": int(gap or 0),
+        }
+        empty["chunks"] += int(n)
+        empty["usable"] += int(usable or 0)
+        empty["duplicates"] += int(dups or 0)
+        empty["out_of_order"] += int(ooo or 0)
+        empty["crossed"] += int(crossed or 0)
+        empty["max_gap_ms"] = max(empty["max_gap_ms"], int(gap or 0))
+        empty["payload_bytes"] += int(nbytes or 0)
+        lo = start if lo is None else min(lo, start)
+        hi = end if hi is None else max(hi, end)
+    if lo is not None and hi is not None:
+        empty["hours"] = max(0.0, (float(hi) + CHUNK_SEC - float(lo)) / 3600.0)
+    empty["usable_pct"] = (100.0 * empty["usable"] / empty["chunks"]) if empty["chunks"] else None
+    return empty
+
+
 def load_chunks(db_path: str, symbol: str, start: float, end: float, *, usable_only: bool = True) -> list[dict[str, Any]]:
     """Decoded snapshots of ``symbol`` in [start, end), skipping unusable chunks."""
     with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
@@ -402,4 +454,16 @@ def load_chunks(db_path: str, symbol: str, start: float, end: float, *, usable_o
     return out
 
 
-__all__ = ["BOOK_QUEUE_VERSION", "STALE_GAP_MS", "TABLE", "BookQueueCapture", "capture", "decode", "load_chunks", "queue_features", "record_depth"]
+__all__ = [
+    "BOOK_QUEUE_VERSION",
+    "STALE_GAP_MS",
+    "TABLE",
+    "BookQueueCapture",
+    "capture",
+    "decode",
+    "load_chunks",
+    "queue_features",
+    "queue_features_asof",
+    "queue_health",
+    "record_depth",
+]

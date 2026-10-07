@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 
 from backend.services.continuation_surface import ADVANTAGE_VERSION, DAY_ADVANTAGE_HORIZONS, SCALP_ADVANTAGE_HORIZONS, state_features
+from backend.services.horizon_alignment import max_early_sec
 
 CF_KIND = "COUNTERFACTUAL_EXECUTABLE"
 REAL_KIND = "REAL_FILL"
@@ -72,8 +73,12 @@ def states_for(
         prev_net = net
         labels: dict[str, float] = {}
         for h in horizons:
-            f = int(np.searchsorted(ts, s + h, side="left"))
-            if f < len(ts) and ts[f] - (s + h) <= match_tol_sec:
+            target = s + h
+            f = int(np.searchsorted(ts, target, side="right")) - 1
+            # Last print at or before the horizon, inside the early tolerance.
+            # A print after the horizon is not a fallback.
+            early = min(float(match_tol_sec), max_early_sec(h))
+            if f >= 0 and ts[f] <= target and target - float(ts[f]) <= early:
                 labels[str(h)] = float(px[f] / entry_px - 1.0 - cost) - net
         if labels:
             out.append(
@@ -135,7 +140,16 @@ def day_states(
     for t, ask in entries:
         out.extend(
             states_for(
-                path, engine="DAY_V2", symbol=symbol, entry_t=float(t), entry_px=float(ask), cost=cost, step_sec=step_sec, max_age_sec=max_age_sec, horizons=DAY_ADVANTAGE_HORIZONS, match_tol_sec=120.0
+                path,
+                engine="DAY_V2",
+                symbol=symbol,
+                entry_t=float(t),
+                entry_px=float(ask),
+                cost=cost,
+                step_sec=step_sec,
+                max_age_sec=max_age_sec,
+                horizons=DAY_ADVANTAGE_HORIZONS,
+                match_tol_sec=120.0,
             )
         )
     return out

@@ -2,11 +2,12 @@
 """SCALP direct executable move research on a research extract. Research only.
 
 Label: buy at the ask of a 5 s microstructure snapshot, sell at the bid of
-the first snapshot at or after t+h. That gross already pays the spread; net
-subtracts the remaining taker fees and slippage buffer. A label is dropped
-when the book was stale, crossed, or the snapshot stream has a gap inside
-[t, t+h]. Features are the same snapshot's derived book/flow state plus past
-mid returns, so every input is known at t.
+the last snapshot at or before t+h and inside that horizon's early tolerance.
+A later snapshot is not used. 30s and 60s never fall back to a 1-minute bar
+close. Net subtracts taker fees and slippage; the spread is already in the
+bid/ask. A label is dropped when the book was stale, crossed, gapped, or no
+snapshot sits inside the tolerance. Features are that snapshot's state plus
+past mid returns, all known at t.
 
 The geometric strategy claim is tested only as an input: its rank against the
 executable move, and whether adding it to the snapshot model changes OOS rank.
@@ -27,10 +28,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.services import edge_research as er
+from backend.services.horizon_alignment import max_early_sec
 
 HORIZONS = (30, 60, 120, 300, 600, 1200)
 MAX_GAP_SEC = 30.0
-MATCH_TOL_SEC = 10.0
 MAX_DATA_AGE_SEC = 2.0
 DROP = {"ts", "symbol", "best_bid", "best_ask", "mid", "microprice", "sample_count"}
 PAST = (30, 60, 300, 900)
@@ -76,10 +77,13 @@ def load(db: str) -> dict[str, dict]:
 
 
 def labels(s: dict, h: float) -> tuple[np.ndarray, np.ndarray]:
+    """Bid at or before t+h, never a later snapshot and never a bar close."""
     ts = s["ts"]
-    j = np.searchsorted(ts, ts + h, side="left")
+    target = ts + h
+    j = np.searchsorted(ts, target, side="right") - 1
     jj = np.clip(j, 0, len(ts) - 1)
-    ok = (j < len(ts)) & (ts[jj] - (ts + h) <= MATCH_TOL_SEC) & (s["bad"][jj] == s["bad"]) & s["usable"] & s["usable"][jj]
+    early = max_early_sec(h)
+    ok = (j >= 0) & (ts[jj] <= target) & ((target - ts[jj]) <= early) & (s["bad"][jj] == s["bad"]) & s["usable"] & s["usable"][jj]
     gross = np.where(ok, s["bid"][jj] / s["ask"] - 1.0, np.nan)
     return gross, ok
 
@@ -154,8 +158,9 @@ def claim_study(db: str, data: dict, cost: float, folds: int) -> dict:
             i = int(np.searchsorted(s["ts"], float(t), side="right") - 1)
             if i < 0 or float(t) - s["ts"][i] > 5.0:
                 continue
-            j = int(np.searchsorted(s["ts"], s["ts"][i] + h, side="left"))
-            if j >= len(s["ts"]) or s["ts"][j] - (s["ts"][i] + h) > MATCH_TOL_SEC or s["bad"][j] != s["bad"][i] or not (s["usable"][i] and s["usable"][j]):
+            target = float(s["ts"][i]) + h
+            j = int(np.searchsorted(s["ts"], target, side="right")) - 1
+            if j < 0 or s["ts"][j] > target or target - s["ts"][j] > max_early_sec(h) or s["bad"][j] != s["bad"][i] or not (s["usable"][i] and s["usable"][j]):
                 continue
             g = float(s["bid"][j] / s["ask"][i] - 1.0)
             recs.append(er.Row(t=float(t), group=int(float(t) // 5), symbol=str(sym), x=np.concatenate([s["X"][i], [float(claim)]]), label=g, label_ts=float(t) + h, extra={"claim": float(claim)}))

@@ -42,17 +42,27 @@ class RetentionPolicy:
 # debug needs — never from disk pressure alone.
 RETENTION_JUSTIFICATION: dict[str, str] = {
     "microstructure_feature_snapshots": (
-        "Write-only SCALP microstructure telemetry: the only code that touches this table is "
-        "microstructure_engine (CREATE/INDEX/INSERT); nothing in backend, scripts or tests ever "
-        "SELECTs it, no research artifact or sealed lock references it, and it is neither "
-        "protected nor lock-dependent. 3 days covers every SCALP hold and the longest research "
-        "label horizon in the system (4h) with room for a weekend of order-book debugging. At ~67k rows/day and ~4.6 KB/row it is 81.6% of the database."
+        "SCALP microstructure telemetry written by microstructure_engine. Research extracts and "
+        "the full-state label resolver read it offline; no live order decision reads it. 3 days "
+        "covers every SCALP hold and the longest SCALP research horizon (20m) with room for a "
+        "weekend of order-book debugging. At ~67k rows/day and ~4.6 KB/row it is most of the database."
     ),
     "book_queue_chunks": (
         "Compressed per-minute L1-L20 depth history (keyframe + level diffs + update ids) for "
         "offline queue, maker-fill and continuation research. Read only by research extracts; no "
         "live decision reads it. Measured ~38 MB/day for four symbols, so 7 days (~0.27 GB) "
         "keeps a full week of queue history for maker-fill research at a small disk cost."
+    ),
+    "research_market_states": (
+        "Research-only full-market-state rows, one per symbol per decision interval, written "
+        "whether or not a setup fired. No live decision reads them. DAY is 16 rows/hour and "
+        "SCALP is a 30s sample (480 rows/hour). Together about 0.02 GB/day, so 7 days stays "
+        "under a tenth of a gigabyte, inside the 5 GB free-space warning."
+    ),
+    "research_market_labels": (
+        "Market-opportunity labels for research_market_states (executable bid over ask at each "
+        "horizon). Not live P&L. Kept 7 days with the states they describe; the longest DAY "
+        "horizon is 12h, so a week covers resolution plus a re-run."
     ),
     "scalp_shadow_rejects": (
         "SCALP shadow gate telemetry sampled per rejected setup. Not an order, fill, accounting "
@@ -68,6 +78,8 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     # 81.6% of the database and ~306 MB/day. Write-only telemetry with no reader.
     RetentionPolicy("microstructure_feature_snapshots", "ts_utc", 3, "epoch_seconds"),
     RetentionPolicy("book_queue_chunks", "chunk_start", 7, "epoch_seconds"),
+    RetentionPolicy("research_market_states", "decision_ts", 7, "epoch_seconds"),
+    RetentionPolicy("research_market_labels", "decision_ts", 7, "epoch_seconds"),
     RetentionPolicy("scalp_shadow_rejects", "created_at", 30, "iso_utc"),
     # strategy_runtime_audit writes ~160k rows/day — keep only 3 days (~480k rows max)
     RetentionPolicy("strategy_runtime_audit", "ts_utc", 3, "iso_utc"),

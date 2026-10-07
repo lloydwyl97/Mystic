@@ -55,6 +55,80 @@ def spearman(a: Sequence[float], b: Sequence[float]) -> float | None:
     return float(np.corrcoef(rank(a), rank(b))[0, 1])
 
 
+def trajectory_weights(keys: Sequence[Any]) -> np.ndarray:
+    """One unit of weight per trajectory, shared equally by its rows.
+
+    A trajectory that emits 1,000 heartbeat rows then counts the same as a
+    trajectory that emits one. The weights sum to the number of trajectories,
+    which is the effective independent sample.
+    """
+    counts: dict[Any, int] = defaultdict(int)
+    for key in keys:
+        counts[key] += 1
+    return np.array([1.0 / counts[key] for key in keys], dtype=float)
+
+
+def effective_independent_weight(weights: Sequence[float]) -> float:
+    return float(np.sum(np.asarray(weights, dtype=float)))
+
+
+def weighted_spearman(a: Sequence[float], b: Sequence[float], weights: Sequence[float]) -> float | None:
+    """Spearman correlation with one weight per row (cluster-safe rank)."""
+    x = np.asarray(a, dtype=float)
+    y = np.asarray(b, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(w) & (w > 0)
+    x, y, w = x[mask], y[mask], w[mask]
+    if len(x) < 3 or np.all(x == x[0]) or np.all(y == y[0]):
+        return None
+    return _weighted_pearson(rank(x), rank(y), w)
+
+
+def _weighted_pearson(x: np.ndarray, y: np.ndarray, weights: np.ndarray) -> float | None:
+    w = np.asarray(weights, dtype=float)
+    total = float(w.sum())
+    if total <= 0:
+        return None
+    w = w / total
+    mx, my = float(np.sum(w * x)), float(np.sum(w * y))
+    cov = float(np.sum(w * (x - mx) * (y - my)))
+    vx = float(np.sum(w * (x - mx) ** 2))
+    vy = float(np.sum(w * (y - my) ** 2))
+    if vx <= 0 or vy <= 0:
+        return None
+    return cov / math.sqrt(vx * vy)
+
+
+def weighted_top(score: Sequence[float], gross: Sequence[float], weights: Sequence[float], cost: float, fraction: float) -> dict[str, float] | None:
+    """Gross and net of the highest-scored fraction of total weight."""
+    s = np.asarray(score, dtype=float)
+    g = np.asarray(gross, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    mask = np.isfinite(s) & np.isfinite(g) & np.isfinite(w) & (w > 0)
+    s, g, w = s[mask], g[mask], w[mask]
+    total = float(w.sum())
+    if total <= 0 or len(s) < 5:
+        return None
+    order = np.argsort(s)
+    w, g = w[order], g[order]
+    top = np.cumsum(w) > (1.0 - fraction) * total
+    gw = float(w[top].sum())
+    if gw <= 0:
+        return None
+    mean = float(np.sum(w[top] * g[top]) / gw)
+    return {"gross": mean, "net": mean - float(cost)}
+
+
+def row_weights(rows: Sequence[Row]) -> np.ndarray | None:
+    """Per-row research weights. ``None`` when every row weighs 1 (unweighted fit)."""
+    if not rows or not any("weight" in r.extra for r in rows):
+        return None
+    w = np.array([float(r.extra.get("weight", 1.0)) for r in rows], dtype=float)
+    if np.allclose(w, 1.0):
+        return None
+    return w
+
+
 def ranking_metrics(rows: Sequence[Row], score: Sequence[float]) -> dict[str, Any]:
     """Per decision point: chosen (top score), best, worst and regret, in label units."""
     groups: dict[Any, list[int]] = defaultdict(list)
@@ -187,9 +261,16 @@ def fit_ridge(train: Sequence[Row], alphas: Sequence[float] = (1.0, 10.0, 100.0,
         y = np.array([r.label for r in rows])
         st = Standardizer(X)
         Z = st(X)
-        mu = y.mean()
-        w = np.linalg.solve(Z.T @ Z + alpha * np.eye(Z.shape[1]), Z.T @ (y - mu))
-        return lambda rs: st(np.stack([r.x for r in rs])) @ w + mu
+        wts = row_weights(rows)
+        if wts is None:
+            mu = float(y.mean())
+            coef = np.linalg.solve(Z.T @ Z + alpha * np.eye(Z.shape[1]), Z.T @ (y - mu))
+        else:
+            mu = float(np.average(y, weights=wts))
+            sw = np.sqrt(wts)
+            zw, yw = Z * sw[:, None], (y - mu) * sw
+            coef = np.linalg.solve(zw.T @ zw + alpha * np.eye(Z.shape[1]), zw.T @ yw)
+        return lambda rs: st(np.stack([r.x for r in rs])) @ coef + mu
 
     a, b = _inner_split(train)
     best = alphas[-1]
@@ -206,7 +287,8 @@ def fit_huber(train: Sequence[Row]) -> Callable[[Sequence[Row]], np.ndarray]:
     y = np.array([r.label for r in train])
     st = Standardizer(X)
     scale = float(np.std(y)) or 1.0
-    m = HuberRegressor(epsilon=1.35, alpha=1.0, max_iter=500).fit(st(X), y / scale)
+    wts = row_weights(train)
+    m = HuberRegressor(epsilon=1.35, alpha=1.0, max_iter=500).fit(st(X), y / scale, sample_weight=wts)
     return lambda rs: m.predict(st(np.stack([r.x for r in rs]))) * scale
 
 
@@ -215,7 +297,8 @@ def fit_tree(train: Sequence[Row]) -> Callable[[Sequence[Row]], np.ndarray]:
 
     X = np.stack([r.x for r in train])
     y = np.array([r.label for r in train])
-    m = HistGradientBoostingRegressor(max_depth=3, max_iter=150, learning_rate=0.05, min_samples_leaf=max(20, len(y) // 50), l2_regularization=1.0, loss="absolute_error", random_state=0).fit(X, y)
+    m = HistGradientBoostingRegressor(max_depth=3, max_iter=150, learning_rate=0.05, min_samples_leaf=max(20, len(y) // 50), l2_regularization=1.0, loss="absolute_error", random_state=0)
+    m.fit(X, y, sample_weight=row_weights(train))
     return lambda rs: m.predict(np.stack([r.x for r in rs]))
 
 
@@ -361,6 +444,7 @@ __all__ = [
     "book_stats",
     "calibrate",
     "closed_loop",
+    "effective_independent_weight",
     "evaluate_arm",
     "fit_hierarchical",
     "fit_huber",
@@ -372,6 +456,10 @@ __all__ = [
     "online_sgd",
     "quintiles",
     "ranking_metrics",
+    "row_weights",
     "spearman",
     "summarize",
+    "trajectory_weights",
+    "weighted_spearman",
+    "weighted_top",
 ]

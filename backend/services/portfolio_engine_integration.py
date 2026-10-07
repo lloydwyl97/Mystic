@@ -1615,6 +1615,10 @@ class PortfolioEngineIntegration:
             from backend.services.day_v2.live_signal import evaluate_entry_signal
 
             db_path = str(self.engine.db_path)
+            with contextlib.suppress(Exception):
+                from backend.services.full_state_research import tick_day_research
+
+                tick_day_research(db_path, float(entry_bar or time.time()))
             sym_sep = "-"  # detect separator used in feature_ohlcv
             try:
                 with _sqlite3.connect(db_path) as _con:
@@ -1703,6 +1707,11 @@ class PortfolioEngineIntegration:
                     bars_4h = await _asyncio.to_thread(_load, "4h", 15)
 
                     fired = evaluate_entry_signal(symbol, bars_15m, bars_1h, bars_4h)
+                    if fired is not None:
+                        with contextlib.suppress(Exception):
+                            from backend.services.full_state_research import annotate_setup
+
+                            annotate_setup(db_path, "DAY_V2", symbol, as_of, str(fired.setup))
                     from backend.services.day_v2.live_signal import context_entry_signals
 
                     contexts = context_entry_signals(symbol, bars_15m, bars_1h, bars_4h)
@@ -2313,6 +2322,10 @@ class PortfolioEngineIntegration:
         )
         by_symbol = {str(row.get("symbol") or "").upper().replace("-", "").replace("/", ""): row for row in candidates}
         products = [str(s) for s in getattr(cfg, "products", [])] or list(by_symbol)
+        with contextlib.suppress(Exception):
+            from backend.services.full_state_research import tick_scalp_research
+
+            tick_scalp_research(markout_db, products, cycle_ts)
 
         def _scalp_book(norm_key: str) -> dict:
             # Live book/flow features for the inspectable microstructure edge model.
