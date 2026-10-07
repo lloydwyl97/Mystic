@@ -640,6 +640,15 @@ def deploy_snapshot_candidates(cfg: MaintConfig) -> list[Path]:
     return [p for p in found if p.resolve() != live]
 
 
+def _checkpoint_snapshot(path: Path) -> None:
+    """Fold a snapshot's WAL into the database so the file stands alone."""
+    conn = sqlite3.connect(str(path), timeout=60)
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+
 def _catalog_path(cfg: MaintConfig, ts: datetime) -> Path:
     while True:
         final = cfg.backup_dir / backup_name(ts)
@@ -658,8 +667,10 @@ def adopt_deploy_snapshots(
 ) -> dict[str, Any]:
     """Move verified deploy-time snapshots into the catalog so retention manages them.
 
-    Integrity and SHA-256 are proven before the move; a failing file is reported and
-    left where it is. Recent, open, WAL-pending or cross-filesystem files are skipped.
+    A non-empty WAL is checkpointed into the database, then the file is integrity
+    checked, hashed, cataloged and compressed. The raw snapshot and its WAL are
+    removed only after the gzip round trip matches. Recent, open or cross-filesystem
+    files are skipped. Nothing is skipped only because a WAL exists.
     """
     ref = (now or utc_now()).timestamp()
     pending = deploy_snapshot_candidates(cfg)
@@ -675,17 +686,28 @@ def adopt_deploy_snapshots(
             out["deferred"].append(str(path))
             continue
         wal = Path(f"{path}-wal")
-        if wal.exists() and wal.stat().st_size > 0:
-            out["skipped"].append({"path": str(path), "reason": "wal_not_empty"})
-            continue
+        wal_pending = wal.exists() and wal.stat().st_size > 0
         if cfg.backup_dir.exists() and st.st_dev != cfg.backup_dir.stat().st_dev:
             out["skipped"].append({"path": str(path), "reason": "other_filesystem"})
             continue
         ts = datetime.fromtimestamp(int(st.st_mtime), tz=timezone.utc)
         final = _catalog_path(cfg, ts)
         if dry_run:
-            out["adopted"].append({"origin": str(path), "name": final.name, "bytes": st.st_size, "dry_run": True})
+            out["adopted"].append({"origin": str(path), "name": final.name, "bytes": st.st_size, "wal": wal_pending, "dry_run": True})
             continue
+        if wal_pending:
+            try:
+                _checkpoint_snapshot(path)
+            except sqlite3.Error as exc:
+                out["failed"].append({"path": str(path), "integrity": f"wal_checkpoint:{exc}"[:200]})
+                out["status"] = "error"
+                out["error"] = f"deploy snapshot wal checkpoint failed: {path}"
+                continue
+            if wal.exists() and wal.stat().st_size > 0:
+                out["failed"].append({"path": str(path), "integrity": "wal_checkpoint_incomplete"})
+                out["status"] = "error"
+                out["error"] = f"deploy snapshot wal checkpoint incomplete: {path}"
+                continue
         try:
             integrity = sqlite_integrity(path, immutable=True)
         except sqlite3.Error as exc:
@@ -695,6 +717,7 @@ def adopt_deploy_snapshots(
             out["status"] = "error"
             out["error"] = f"deploy snapshot failed integrity_check: {path}"
             continue
+        digest = sha256_file(path)
         manifest = {
             "name": final.name,
             "source": DEPLOY_SNAPSHOT_REASON,
@@ -702,9 +725,10 @@ def adopt_deploy_snapshots(
             "created_utc": _iso(ts),
             "verified_utc": _iso(utc_now()),
             "integrity": "ok",
-            "sha256": sha256_file(path),
-            "bytes": st.st_size,
+            "sha256": digest,
+            "bytes": path.stat().st_size,
             "compressed": False,
+            "wal_checkpointed": wal_pending,
             "reason": DEPLOY_SNAPSHOT_REASON,
         }
         _write_json_atomic(manifest_path_for(final), manifest)
@@ -713,8 +737,16 @@ def adopt_deploy_snapshots(
             Path(f"{path}{suffix}").unlink(missing_ok=True)
         _chown(final, cfg.owner)
         _chown(manifest_path_for(final), cfg.owner)
-        out["adopted"].append({"origin": str(path), "name": final.name, "sha256": manifest["sha256"], "bytes": st.st_size})
-        logger.info("MAINT deploy_snapshot_adopted %s", json.dumps({"origin": str(path), "name": final.name}))
+        if wal_pending:
+            info = next((b for b in list_backups(cfg.backup_dir) if b.path == final), None)
+            compressed = compress_backup(info, owner=cfg.owner) if info is not None else {"status": "error", "error": "catalog miss"}
+            if compressed.get("status") != "ok":
+                out["failed"].append({"path": str(final), "integrity": f"compress:{compressed.get('error')}"[:200]})
+                out["status"] = "error"
+                out["error"] = f"deploy snapshot compress failed: {final}"
+                continue
+        out["adopted"].append({"origin": str(path), "name": final.name, "sha256": digest, "bytes": manifest["bytes"], "compressed": wal_pending})
+        logger.info("MAINT deploy_snapshot_adopted %s", json.dumps({"origin": str(path), "name": final.name, "compressed": wal_pending}))
     return out
 
 
@@ -1161,7 +1193,10 @@ def maybe_reboot(
     fetch_status = fetch_status or (lambda: http_json(cfg.status_url))
     open_orders = open_orders or (lambda: exchange_open_orders_count(cfg.repo / ".env"))
     held = (held_pending or held_upgrades_pending)()
-    required = cfg.reboot_flag.exists() or bool(held)
+    # Held packages are reported. They are not a reboot reason: their maintainer
+    # scripts restart services the book depends on, and a pending upgrade of a
+    # blacklisted package must not make the host reboot-eligible.
+    required = cfg.reboot_flag.exists()
     out: dict[str, Any] = {"reboot_required": required, "reboot_flag": cfg.reboot_flag.exists(), "held_upgrades": held, "rebooted": False}
     if not required:
         out["deferral_reason"] = None
@@ -1199,11 +1234,9 @@ def maybe_reboot(
     if reasons:
         out["deferral_reason"] = ",".join(reasons)
         return out
-    if held:
-        out["held_upgrade"] = (upgrade_held or _upgrade_held_packages)(held)
     marker = {
         "requested_utc": _iso(utc_now()),
-        "reason": "reboot-required" if out["reboot_flag"] else "held_upgrades",
+        "reason": "reboot-required",
         "pkgs": _read_text(Path(f"{cfg.reboot_flag}.pkgs")),
         "held_upgrades": held,
     }

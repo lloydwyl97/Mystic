@@ -338,6 +338,29 @@ def test_no_reboot_when_not_required(cfg):
     assert calls == {"reboot": 0, "backup": 0} and out["reboot_required"] is False
 
 
+def test_held_redis_upgrade_is_reported_and_does_not_reboot(cfg):
+    calls = {"reboot": 0, "upgrade": 0}
+
+    def upgrade(pkgs):
+        calls["upgrade"] += 1
+        return {"packages": pkgs}
+
+    out = m.maybe_reboot(
+        cfg,
+        dry_run=False,
+        fetch_status=lambda: (200, _status()),
+        open_orders=lambda: 0,
+        make_backup=lambda: {"status": "ok"},
+        reboot=lambda: calls.__setitem__("reboot", calls["reboot"] + 1),
+        held_pending=lambda: ["redis-server", "redis-tools"],
+        upgrade_held=upgrade,
+    )
+    assert out["reboot_required"] is False and out["rebooted"] is False
+    assert out["held_upgrades"] == ["redis-server", "redis-tools"]
+    assert calls == {"reboot": 0, "upgrade": 0}
+    assert not cfg.reboot_marker.exists()
+
+
 # --- orchestration ------------------------------------------------------------------
 
 

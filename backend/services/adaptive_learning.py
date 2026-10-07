@@ -84,6 +84,9 @@ _PRIORS: dict[str, dict[str, float]] = {
         "lifecycle_net": 0.0,
         # Realized net of a filled opportunity minus its own lifecycle label.
         "policy_gap": 0.0,
+        # Realized policy net minus the policy value predicted at entry.
+        # Prior 0. Losses pull the next forecast down; wins can pull it up.
+        "policy_calibration": 0.0,
         "hold_remaining_up": 0.0,
         "hold_remaining_down": 0.0,
         "markout_forward": 0.0,
@@ -96,6 +99,9 @@ _PRIORS: dict[str, dict[str, float]] = {
         # Realized net of a filled claim minus its forward net markout at the
         # claim's label horizon.
         "policy_gap": 0.0,
+        # Realized policy net minus the policy value predicted at entry.
+        # Prior 0. Losses pull the next forecast down; wins can pull it up.
+        "policy_calibration": 0.0,
         "hold_remaining_up": 0.0,
         "hold_remaining_down": 0.0,
         "trade_time_to_mfe_min": 8.0,
@@ -670,6 +676,29 @@ def policy_gap(db_path: str, engine: str, symbol: str, setup: str, regime: str, 
     return _lattice(gap_rows, engine_id=engine_id, symbol=symbol, setup=setup, regime=regime, weights={"policy_gap": 1.0}, prior=_prior(engine_id, "policy_gap"), now=now, include_engine=True)
 
 
+def policy_calibration(db_path: str, engine: str, symbol: str, setup: str, regime: str, *, now: float | None = None, rows: list | None = None) -> dict[str, Any]:
+    """Shrunk mean of realized policy net minus the policy value predicted at entry.
+
+    Prior 0. A loss below its forecast pulls the next forecast down. A result
+    above its forecast can pull the next forecast up. There is no fixed offset.
+    """
+    engine_id = str(engine or "").upper()
+    if rows is None:
+        rows = _state_rows(db_path, engine_id, ("policy_calibration",))
+    cal_rows = [r for r in rows if str(r["metric"]) == "policy_calibration"]
+    return _lattice(
+        cal_rows,
+        engine_id=engine_id,
+        symbol=symbol,
+        setup=setup,
+        regime=regime,
+        weights={"policy_calibration": 1.0},
+        prior=_prior(engine_id, "policy_calibration"),
+        now=now,
+        include_engine=True,
+    )
+
+
 def _shifted(row: Any, shift: float) -> dict[str, Any]:
     out = dict(row)
     out["ewma"] = float(row["ewma"]) + float(shift)
@@ -685,6 +714,7 @@ def day_net_expectancy(db_path: str, symbol: str, setup: str, regime: str, *, no
     rows = _state_rows(db_path, DAY_ENGINE, (*weights, "policy_gap"))
     now = float(now) if now is not None else _data_clock(rows)
     gap = policy_gap(db_path, DAY_ENGINE, symbol, setup, regime, now=now, rows=rows)
+    calibration = policy_calibration(db_path, DAY_ENGINE, symbol, setup, regime, now=now)
     shift = float(gap["mean"])
     net_rows = [_shifted(r, shift) if str(r["metric"]) == "lifecycle_net" else r for r in rows if str(r["metric"]) in weights]
     lat = _lattice(
@@ -708,7 +738,6 @@ def day_net_expectancy(db_path: str, symbol: str, setup: str, regime: str, *, no
         now=now,
     )
     return {
-        "mean": lat["mean"],
         "parent": lat["parent"],
         "prior": lat["prior"],
         "levels": lat["levels"],
@@ -722,6 +751,10 @@ def day_net_expectancy(db_path: str, symbol: str, setup: str, regime: str, *, no
         "market_alpha": market["mean"],
         "policy_gap": shift,
         "n_policy_gap": gap["level_weights"]["engine"],
+        "uncalibrated_mean": lat["mean"],
+        "policy_calibration": float(calibration["mean"]),
+        "n_policy_calibration": calibration["level_weights"]["engine"],
+        "mean": lat["mean"] + float(calibration["mean"]),
     }
 
 
@@ -873,6 +906,9 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
         "market_alpha": net["market_alpha"],
         "policy_gap": net["policy_gap"],
         "n_policy_gap": round(net["n_policy_gap"], 3),
+        "uncalibrated_policy_value": net["uncalibrated_mean"],
+        "policy_calibration": net["policy_calibration"],
+        "n_policy_calibration": round(net["n_policy_calibration"], 3),
         "policy_value": expected,
     }
     return {
@@ -1223,6 +1259,7 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features:
     micro_residual = micro_unweighted * weight["weight"]
     claim = scalp_claim_calibration(db_path, symbol, setup, regime, now=now)
     gap = policy_gap(db_path, SCALP_ENGINE, symbol, setup, regime, now=now)
+    calibration = policy_calibration(db_path, SCALP_ENGINE, symbol, setup, regime, now=now)
     # Telemetry only: the canonical executable edge is the single live negative-edge gate.
     learned = forward if forward["n"] > 0 else net
     learned_net = learned["mean"]
@@ -1260,6 +1297,8 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features:
         "confidence": claim["claim_confidence"],
         "policy_gap": gap["mean"],
         "n_policy_gap": gap["level_weights"]["engine"],
+        "policy_calibration": calibration["mean"],
+        "n_policy_calibration": calibration["level_weights"]["engine"],
         "mfe": learned_mfe,
         "mae": path_mae["mean"],
         "target_pct": _clamp(learned_mfe, *SCALP_TARGET_BOUNDS),
@@ -1808,7 +1847,7 @@ def _learn_policy_gap(conn: sqlite3.Connection, db_path: str, row: Any, marks: d
     conn.commit()
     if cur.rowcount != 1:
         return False
-    return observe(
+    learned_gap = observe(
         db_path,
         engine=engine_id,
         symbol=row["symbol"],
@@ -1819,6 +1858,20 @@ def _learn_policy_gap(conn: sqlite3.Connection, db_path: str, row: Any, marks: d
         strategy_version=str(row["strategy_version"]),
         now=moment,
     )
+    predicted = _economic_of(row).get("policy_value")
+    if isinstance(predicted, int | float) and math.isfinite(float(predicted)):
+        observe(
+            db_path,
+            engine=engine_id,
+            symbol=row["symbol"],
+            setup=row["setup"],
+            regime=row["regime"],
+            metric="policy_calibration",
+            value=float(realized) - float(predicted),
+            strategy_version=str(row["strategy_version"]),
+            now=moment,
+        )
+    return learned_gap
 
 
 def record_policy_outcome(db_path: str, *, engine: str, opportunity_id: str, net_pct: float, now: float | None = None, candidate_id: int | None = None) -> bool:
@@ -1907,6 +1960,75 @@ def _lifecycle_label(row: sqlite3.Row, *, moment: float, bars_1m: Callable[[str,
     return simulate_lifecycle(params, bars, roundtrip_cost=float(row["roundtrip_cost"] or 0), now=moment)
 
 
+def executable_bid_at(db_path: str, symbol: str, target: float, horizon: int) -> float | None:
+    """Bid aligned to ``target``. A later bar close is not a substitute."""
+    from backend.services.full_state_research import scalp_observations
+    from backend.services.horizon_alignment import align_observation
+
+    aligned = align_observation(scalp_observations(db_path, symbol, float(target), int(horizon)), float(target), int(horizon))
+    if aligned.get("status") != "OK" or aligned.get("source") == "bar_close":
+        return None
+    price = aligned.get("price")
+    if price is None or not math.isfinite(float(price)) or float(price) <= 0:
+        return None
+    return float(price)
+
+
+def _repair_short_marks(db_path: str, row: Any, marks: dict) -> None:
+    """Replace stored 30s/60s marks with an executable bid, or drop an unlearned leak."""
+    if str(row["engine_id"]) != SCALP_ENGINE:
+        return
+    ref = float(row["ref_price"] or 0)
+    cost = float(row["roundtrip_cost"] or 0)
+    learned = int(row["learned"] or 0)
+    for horizon in (30, 60):
+        key = str(horizon)
+        if key not in marks:
+            continue
+        price = None
+        with contextlib.suppress(Exception):
+            price = executable_bid_at(db_path, str(row["symbol"]), float(row["evaluated_at"]) + horizon, horizon)
+        if price is not None and ref > 0:
+            marks[key] = (float(price) - ref) / ref - cost
+        elif not learned:
+            marks.pop(key, None)
+
+
+def repair_stored_short_marks(db_path: str, *, limit: int = 500) -> int:
+    """Rewrite stored 30s/60s marks from an executable bid. Does not retrain state."""
+    changed = 0
+    try:
+        conn = _connect(db_path)
+    except sqlite3.Error:
+        return 0
+    try:
+        rows = conn.execute(
+            """SELECT id, engine_id, symbol, ref_price, roundtrip_cost, evaluated_at, learned, markouts_json
+               FROM adaptive_candidate_markouts WHERE engine_id=?
+               AND (markouts_json LIKE '%"30"%' OR markouts_json LIKE '%"60"%')
+               ORDER BY id DESC LIMIT ?""",
+            (SCALP_ENGINE, int(limit)),
+        ).fetchall()
+        for row in rows:
+            marks = json.loads(row["markouts_json"] or "{}")
+            before = json.dumps(marks, sort_keys=True)
+            _repair_short_marks(db_path, row, marks)
+            if json.dumps(marks, sort_keys=True) == before:
+                continue
+            conn.execute("UPDATE adaptive_candidate_markouts SET markouts_json=? WHERE id=?", (json.dumps(marks), row["id"]))
+            changed += 1
+        if changed:
+            conn.commit()
+    except sqlite3.Error:
+        return changed
+    finally:
+        conn.close()
+    return changed
+
+
+_short_marks_repaired = False
+
+
 def resolve_markouts(
     db_path: str,
     quote: Callable[[str, float], float | None],
@@ -1938,7 +2060,11 @@ def resolve_markouts(
     default). Once final, the first record of an opportunity that was never
     filled learns ``lifecycle_net``.
     """
+    global _short_marks_repaired
     moment = float(now if now is not None else time.time())
+    if not _short_marks_repaired:
+        repair_stored_short_marks(db_path)
+        _short_marks_repaired = True
     if bars_1m is None:
         from backend.services.day_v2.lifecycle_sim import ohlcv_bars_1m
 
@@ -1971,6 +2097,7 @@ def resolve_markouts(
                 unit = 60.0 if engine_id == DAY_ENGINE else 1.0
                 grace = 900.0 if engine_id == DAY_ENGINE else 60.0
                 marks = json.loads(row["markouts_json"] or "{}")
+                _repair_short_marks(db_path, row, marks)
                 ref = float(row["ref_price"])
                 cost = float(row["roundtrip_cost"] or 0)
                 done = True
@@ -1983,7 +2110,10 @@ def resolve_markouts(
                         done = False
                         continue
                     try:
-                        price = quote(str(row["symbol"]), due)
+                        if engine_id == SCALP_ENGINE and int(horizon) in (30, 60):
+                            price = executable_bid_at(db_path, str(row["symbol"]), due, int(horizon))
+                        else:
+                            price = quote(str(row["symbol"]), due)
                     except Exception:
                         price = None
                     if price is None and moment < due + grace:

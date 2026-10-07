@@ -67,6 +67,7 @@ class ExecutableEdge:
     state_tilt_pct: float = 0.0
     policy_gap_pct: float = 0.0
     n_policy_gap: float = 0.0
+    policy_calibration_pct: float = 0.0
 
     @property
     def eligible(self) -> bool:
@@ -74,7 +75,7 @@ class ExecutableEdge:
 
     @property
     def market_edge_pct(self) -> float:
-        return self.final_executable_edge_pct - self.policy_gap_pct
+        return self.final_executable_edge_pct - self.policy_gap_pct - self.policy_calibration_pct
 
     @property
     def pre_micro_edge_pct(self) -> float:
@@ -107,6 +108,7 @@ class ExecutableEdge:
             "market_edge": self.market_edge_pct,
             "policy_gap": self.policy_gap_pct,
             "n_policy_gap": self.n_policy_gap,
+            "policy_calibration": self.policy_calibration_pct,
             "policy_value": self.final_executable_edge_pct,
             "uncertainty": self.uncertainty_pct,
             "backoff_gross": self.calibrated_move_pct - self.state_tilt_pct,
@@ -191,7 +193,8 @@ def scalp_executable_edge(
     micro_model = _f(view.get("micro_residual"))
     micro = micro_model
     gap = _f(view.get("policy_gap"))
-    final = pre_micro + micro + gap
+    calibration = _f(view.get("policy_calibration"))
+    final = pre_micro + micro + gap + calibration
     confidence = _f(view.get("confidence"))
     risk = _f(view.get("risk_estimate"))
     return ExecutableEdge(
@@ -220,6 +223,7 @@ def scalp_executable_edge(
         state_tilt_pct=_f(view.get("state_tilt")),
         policy_gap_pct=gap,
         n_policy_gap=_f(view.get("n_policy_gap")),
+        policy_calibration_pct=calibration,
     )
 
 

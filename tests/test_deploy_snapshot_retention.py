@@ -6,8 +6,10 @@ Ocean 2026-10-06: 15 GB of raw ``mystic_trading-pre-<sha>.db`` and bundle snapsh
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
+import shutil
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -66,7 +68,8 @@ def test_loose_and_bundle_snapshots_are_verified_and_cataloged(cfg):
     backups = {b.manifest["origin"]: b for b in m.list_backups(cfg.backup_dir)}
     for origin, info in backups.items():
         assert info.verified and info.manifest["reason"] == m.DEPLOY_SNAPSHOT_REASON
-        assert info.manifest["sha256"] == sha[Path(origin).name] == m.sha256_file(info.path)
+        payload = m.sha256_file(info.path, opener=lambda p: gzip.open(p, "rb")) if info.compressed else m.sha256_file(info.path)
+        assert info.manifest["sha256"] == sha[Path(origin).name] == payload
         assert int(info.ts.timestamp()) == int(datetime.strptime(info.manifest["created_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
     assert backups[str(loose)].ts == (NOW - timedelta(hours=11)).replace(microsecond=0)
 
@@ -96,14 +99,37 @@ def test_recent_open_wal_pending_and_dry_run_are_not_moved(cfg):
     os.utime(recent, ((NOW - timedelta(hours=1)).timestamp(),) * 2)
     out = m.adopt_deploy_snapshots(cfg, dry_run=False, opened={str(recent)}, now=NOW)
     assert out["deferred"] == [str(recent)] and recent.exists()
-    Path(f"{recent}-wal").write_bytes(b"w" * 32)
-    out = m.adopt_deploy_snapshots(cfg, dry_run=False, opened=set(), now=NOW)
-    assert out["skipped"] == [{"path": str(recent), "reason": "wal_not_empty"}] and recent.exists()
-    Path(f"{recent}-wal").write_bytes(b"")
     out = m.adopt_deploy_snapshots(cfg, dry_run=True, opened=set(), now=NOW)
     assert out["adopted"][0]["dry_run"] and recent.exists() and m.list_backups(cfg.backup_dir) == []
     _adopt_all(cfg)
     assert not recent.exists() and not Path(f"{recent}-wal").exists()
+
+
+def test_wal_snapshot_is_checkpointed_compressed_and_removed(cfg, tmp_path):
+    src = tmp_path / "live.db"
+    conn = sqlite3.connect(src)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("CREATE TABLE t (v TEXT)")
+    conn.execute("INSERT INTO t VALUES ('from-wal')")
+    conn.commit()
+    path = cfg.backups_root / "mystic_trading-pre-wal.db"
+    shutil.copy(src, path)
+    shutil.copy(Path(f"{src}-wal"), Path(f"{path}-wal"))
+    conn.close()
+    wal = Path(f"{path}-wal")
+    assert wal.stat().st_size > 0
+    os.utime(path, ((NOW - timedelta(hours=2)).timestamp(),) * 2)
+    out = m.adopt_deploy_snapshots(cfg, dry_run=False, opened=set(), now=NOW)
+    assert out["status"] == "ok" and out["adopted"][0]["compressed"] is True
+    assert not path.exists() and not wal.exists() and not Path(f"{path}-shm").exists()
+    info = m.list_backups(cfg.backup_dir)[0]
+    assert info.compressed and info.verified
+    restored = cfg.backup_dir / "roundtrip.db"
+    restored.write_bytes(gzip.open(info.path, "rb").read())
+    with sqlite3.connect(restored) as check:
+        assert check.execute("SELECT v FROM t").fetchone()[0] == "from-wal"
+    assert m.sha256_file(info.path, opener=lambda p: gzip.open(p, "rb")) == info.manifest["sha256"]
 
 
 def test_adopted_snapshots_are_not_immortal_but_newest_and_pins_survive(cfg):

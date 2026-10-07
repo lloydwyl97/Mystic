@@ -334,6 +334,13 @@ def queue_features(snaps: list[dict[str, Any]], *, depth: int = 5) -> dict[str, 
             "ask_slope_bps",
             "bid_concentration",
             "ask_concentration",
+            "imbalance_l1",
+            "imbalance_depth",
+            "cancel_pressure",
+            "absorption",
+            "fragility",
+            "book_recovery",
+            "adverse_selection_bps",
             "n",
         ),
         0.0,
@@ -384,6 +391,23 @@ def queue_features(snaps: list[dict[str, Any]], *, depth: int = 5) -> dict[str, 
         out["micro_disp_mean_bps"] = sum(disp) / len(disp)
         out["micro_disp_last_bps"] = disp[-1]
     out["n"] = float(len(snaps))
+    out["cancel_pressure"] = out["bid_remove"] + out["ask_remove"]
+    out["book_recovery"] = out["bid_replenish"] + out["ask_replenish"]
+    out["absorption"] = out["book_recovery"] - (out["bid_depletions"] + out["ask_depletions"])
+    out["fragility"] = (out["bid_depletions"] + out["ask_depletions"]) / max(out["n"], 1.0)
+    out["adverse_selection_bps"] = out["micro_disp_last_bps"] * (out["ask_depletions"] - out["bid_depletions"])
+    if bids and asks:
+        bq0, aq0 = float(bids[0][1]), float(asks[0][1])
+        out["imbalance_l1"] = (bq0 - aq0) / (bq0 + aq0) if (bq0 + aq0) > 0 else 0.0
+        used = 0
+        acc = 0.0
+        for i in range(max(len(bids), len(asks))):
+            bv = float(bids[i][1]) if i < len(bids) else 0.0
+            av = float(asks[i][1]) if i < len(asks) else 0.0
+            if bv + av > 0:
+                acc += (bv - av) / (bv + av)
+                used += 1
+        out["imbalance_depth"] = acc / used if used else 0.0
     return out
 
 

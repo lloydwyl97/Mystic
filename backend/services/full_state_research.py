@@ -330,18 +330,19 @@ def capture_scalp_cycle(db_path: str, symbols: list[str] | tuple[str, ...], now:
             book = {}
         bid, ask = float(book.get("best_bid") or 0), float(book.get("best_ask") or 0)
         ask_ok = ask if ask > bid > 0 else None
+        observed = float(now)
         record_state(
             db_path,
             engine=SCALP_ENGINE,
             symbol=sym,
-            decision_ts=float(bucket),
-            feature_ts=float(book.get("ts") or now) if book else None,
+            decision_ts=observed,
+            feature_ts=observed if book else None,
             features=_scalp_features(sym, book, db_path, float(now)) if book else {},
             setup_label=NO_SETUP,
             context={"sample_sec": SCALP_SAMPLE_SEC},
             entry_ask=ask_ok,
             entry_bid=bid if ask_ok else None,
-            entry_obs_ts=float(book.get("ts") or now) if ask_ok else None,
+            entry_obs_ts=observed if ask_ok else None,
             entry_source="book_ask" if ask_ok else None,
             cost=cost,
         )
