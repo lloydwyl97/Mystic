@@ -220,6 +220,23 @@ def split_position_key(key: str) -> tuple[str, str]:
     return "", normalize_symbol(s)
 
 
+def position_mtm_symbol(pos: object, key: str) -> str:
+    """Symbol to price one open lot. Empty when neither the lot nor its key has one.
+
+    An empty lot symbol must not raise: that used to abort post-commit MTM for
+    the whole book, so the ledger persist after a filled buy never ran.
+    """
+    raw = str(getattr(pos, "symbol", "") or "").strip()
+    fallback = split_engine_key(str(key or ""))[1] if POSITION_KEY_SEP in str(key or "") else ""
+    candidate = raw or fallback
+    if not candidate:
+        return ""
+    try:
+        return normalize_symbol(candidate)
+    except ValueError:
+        return ""
+
+
 def _day_v2_exit_policy() -> dict[str, Any]:
     from backend.services.day_v2.live_exit_evaluator import day_v2_exit_policy
 
@@ -4903,7 +4920,10 @@ class PortfolioEngine:
             # Two-engine contract: marks are keyed by strategy symbol so both
             # engines' lots on one symbol share the same fresh mark.
             _pos = self.open_positions.get(_key)
-            symbol = normalize_symbol(str(getattr(_pos, "symbol", "") or "")) or split_position_key(str(_key))[1]
+            symbol = position_mtm_symbol(_pos, str(_key))
+            if not symbol:
+                logger.warning("MTM_SKIP_EMPTY_SYMBOL key=%s", _key)
+                continue
             ns = normalize_symbol(symbol)
             last_px = await self._fetch_live_mark_for_open_position(symbol)
             if last_px <= 0:

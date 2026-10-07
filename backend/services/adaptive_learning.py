@@ -53,6 +53,10 @@ MARKOUT_WEIGHT = 0.35
 # They count slightly below a realized close so simulated evidence never
 # outweighs the same amount of fills.
 LIFECYCLE_WEIGHT = 0.75
+# Closes before the current calibration learner was live are not replayed into
+# it. Later compatible closes with a stored prediction and no calibration
+# observation are. This bounds the repair; it is not a sample-size gate.
+CALIBRATION_BACKFILL_FROM = "2026-10-07T15:25:25Z"
 
 DAY_ENGINE = "DAY_V2"
 SCALP_ENGINE = "SCALP_V2"
@@ -425,6 +429,12 @@ def _connect(db_path: str) -> sqlite3.Connection:
     ):
         if col not in cols:
             conn.execute(f"ALTER TABLE adaptive_candidate_markouts ADD COLUMN {col} {ddl}")
+    if "calibration_learned" not in cols:
+        conn.execute("ALTER TABLE adaptive_candidate_markouts ADD COLUMN calibration_learned INTEGER NOT NULL DEFAULT 0")
+        # The previous learner wrote calibration in the same step as policy_gap.
+        # Those rows already contain the observation; do not write it again.
+        conn.execute("UPDATE adaptive_candidate_markouts SET calibration_learned=1 WHERE policy_learned=1 AND calibration_learned=0")
+        conn.commit()
     # resolve_markouts runs every SCALP cycle; without these, its key repair and
     # unresolved scan are full table scans that grow with the markout history.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_key ON adaptive_candidate_markouts(engine_id, symbol, setup, regime, learned)")
@@ -1346,7 +1356,8 @@ def learn_from_close(
     before the engine's economic anchor and closes of a retired exit policy
     (``exit_contract_of`` not CURRENT) do not move state. ``candidate_id`` (the
     entry's own row) or ``opportunity_id`` links the close to its filled
-    candidate for the policy gap."""
+    candidate so calibration learns at the close and the policy gap learns when
+    its market label is final."""
     if is_dust or not version_current:
         return False
     engine_id = str(engine or "").upper()
@@ -1836,8 +1847,84 @@ def _market_label(engine_id: str, row: Any, marks: dict) -> float | None:
     return out if out is not None and math.isfinite(out) else None
 
 
+def predicted_policy_value(decision: dict | None) -> float | None:
+    """Policy value the entry actually issued. None when it was not stored."""
+    econ = decision.get("economic") if isinstance(decision, dict) else None
+    raw = econ.get("policy_value") if isinstance(econ, dict) else None
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        return None
+    value = float(raw)
+    return value if math.isfinite(value) else None
+
+
+def _predicted_policy_value(row: Any) -> float | None:
+    raw = _economic_of(row).get("policy_value")
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        return None
+    value = float(raw)
+    return value if math.isfinite(value) else None
+
+
+def observe_policy_calibration(
+    db_path: str,
+    *,
+    engine: str,
+    symbol: str,
+    setup: str,
+    regime: str,
+    realized: float,
+    predicted: float,
+    now: float,
+) -> bool:
+    """One running-mean observation of realized net minus the entry forecast.
+
+    Prior 0, both signs, no sample floor and no added penalty. The market
+    lifecycle label is not an input."""
+    if not math.isfinite(float(realized)) or not math.isfinite(float(predicted)):
+        return False
+    return observe(
+        db_path,
+        engine=str(engine or "").upper(),
+        symbol=symbol,
+        setup=setup,
+        regime=regime,
+        metric="policy_calibration",
+        value=float(realized) - float(predicted),
+        strategy_version=current_strategy_version(str(engine or "").upper()),
+        now=float(now),
+    )
+
+
+def _learn_policy_calibration(conn: sqlite3.Connection, db_path: str, row: Any, realized: float, moment: float) -> bool:
+    """Fold one close into ``policy_calibration`` at the close. Exactly once."""
+    engine_id = str(row["engine_id"])
+    if not math.isfinite(float(realized)):
+        return False
+    if str(row["strategy_version"]) != current_strategy_version(engine_id) or str(row["economic_version"] or "") != current_economic_version(engine_id):
+        return False
+    predicted = _predicted_policy_value(row)
+    if predicted is None:
+        return False
+    cur = conn.execute("UPDATE adaptive_candidate_markouts SET calibration_learned=1 WHERE id=? AND calibration_learned=0", (row["id"],))
+    conn.commit()
+    if cur.rowcount != 1:
+        return False
+    return observe_policy_calibration(
+        db_path,
+        engine=engine_id,
+        symbol=str(row["symbol"]),
+        setup=str(row["setup"]),
+        regime=str(row["regime"]),
+        realized=float(realized),
+        predicted=predicted,
+        now=float(moment),
+    )
+
+
 def _learn_policy_gap(conn: sqlite3.Connection, db_path: str, row: Any, marks: dict, realized: float, moment: float) -> bool:
-    """Fold realized minus the row's market label into ``policy_gap`` once."""
+    """Fold realized minus the row's market label into ``policy_gap`` once.
+
+    This waits until that label is final. It does not write ``policy_calibration``."""
     engine_id = str(row["engine_id"])
     market = _market_label(engine_id, row, marks)
     if market is None or not math.isfinite(float(realized)):
@@ -1848,7 +1935,7 @@ def _learn_policy_gap(conn: sqlite3.Connection, db_path: str, row: Any, marks: d
     conn.commit()
     if cur.rowcount != 1:
         return False
-    learned_gap = observe(
+    return observe(
         db_path,
         engine=engine_id,
         symbol=row["symbol"],
@@ -1859,25 +1946,113 @@ def _learn_policy_gap(conn: sqlite3.Connection, db_path: str, row: Any, marks: d
         strategy_version=str(row["strategy_version"]),
         now=moment,
     )
-    predicted = _economic_of(row).get("policy_value")
-    if isinstance(predicted, int | float) and math.isfinite(float(predicted)):
-        observe(
-            db_path,
-            engine=engine_id,
-            symbol=row["symbol"],
-            setup=row["setup"],
-            regime=row["regime"],
-            metric="policy_calibration",
-            value=float(realized) - float(predicted),
-            strategy_version=str(row["strategy_version"]),
-            now=moment,
-        )
-    return learned_gap
+
+
+def _utc_epoch(value: Any) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    elif "+" not in text[10:] and not text.endswith("Z"):
+        text = text.replace(" ", "T", 1) + "+00:00"
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
+def _calibration_backfill_floor() -> float:
+    parsed = _utc_epoch(CALIBRATION_BACKFILL_FROM)
+    return float(parsed if parsed is not None else 0.0)
+
+
+def _close_moment(conn: sqlite3.Connection, row: Any) -> float | None:
+    """Sell time of this filled candidate when the close is a current-policy exit
+    at or after the calibration repair. None leaves the row unlearned."""
+    engine_id = str(row["engine_id"])
+    symbol = _norm_symbol(row["symbol"])
+    try:
+        evaluated = float(row["evaluated_at"] or 0.0)
+    except (TypeError, ValueError):
+        return None
+    try:
+        sells = conn.execute(
+            "SELECT exit_reason, timestamp AS closed_at, entry_timestamp AS entered_at FROM paper_trades "
+            "WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,''))=? AND REPLACE(REPLACE(UPPER(symbol),'/',''),'-','')=?",
+            (engine_id, symbol),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    best = None
+    best_gap = None
+    best_entered = None
+    best_closed = None
+    for sell in sells:
+        entered = _utc_epoch(sell["entered_at"])
+        closed = _utc_epoch(sell["closed_at"])
+        if entered is None or closed is None:
+            continue
+        gap = abs(entered - evaluated)
+        if gap > 1200.0:
+            continue
+        if best_gap is None or gap < best_gap:
+            best = sell
+            best_gap = gap
+            best_entered = entered
+            best_closed = closed
+    if best is None or best_entered is None or best_closed is None:
+        return None
+    reason = str(best["exit_reason"] or "")
+    if "DUST" in reason.upper():
+        return None
+    entered = best_entered
+    closed = best_closed
+    if closed < _calibration_backfill_floor():
+        return None
+    if exit_contract_of(engine_id, entered_at=entered, exit_reason=reason) != "CURRENT":
+        return None
+    return closed
+
+
+_calibration_backfilled: set[str] = set()
+
+
+def backfill_close_calibration(db_path: str) -> int:
+    """Teach calibration for current-policy closes the lifecycle wait skipped.
+
+    One observation per filled candidate. Rows that already learned calibration,
+    including through the old combined gap step, are left unchanged. Fills,
+    accounting and lifecycle history are not written."""
+    key = os.path.abspath(db_path)
+    if key in _calibration_backfilled:
+        return 0
+    taught = 0
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute("SELECT * FROM adaptive_candidate_markouts WHERE filled=1 AND realized_net IS NOT NULL AND calibration_learned=0").fetchall()
+        for row in rows:
+            moment = _close_moment(conn, row)
+            if moment is None:
+                continue
+            try:
+                realized = float(row["realized_net"])
+            except (TypeError, ValueError):
+                continue
+            if _learn_policy_calibration(conn, db_path, row, realized, moment):
+                taught += 1
+    finally:
+        conn.close()
+    _calibration_backfilled.add(key)
+    return taught
 
 
 def record_policy_outcome(db_path: str, *, engine: str, opportunity_id: str, net_pct: float, now: float | None = None, candidate_id: int | None = None) -> bool:
-    """Store a close's realized net on its filled candidate; learn the gap if the
-    market label is already final (otherwise ``resolve_markouts`` learns it).
+    """Store a close's realized net and learn calibration immediately.
+
+    ``policy_gap`` is learned in the same call only when the market label is
+    already final. Otherwise ``resolve_markouts`` learns the gap later and does
+    not observe calibration again.
 
     The candidate is the entry's own row (``candidate_id``), else the newest
     filled row of the opportunity still without a realized net: one opportunity
@@ -1903,7 +2078,10 @@ def record_policy_outcome(db_path: str, *, engine: str, opportunity_id: str, net
                 return False
             conn.execute("UPDATE adaptive_candidate_markouts SET realized_net=? WHERE id=?", (float(net_pct), row["id"]))
             conn.commit()
-            return _learn_policy_gap(conn, db_path, row, json.loads(row["markouts_json"] or "{}"), float(net_pct), moment)
+            marks = json.loads(row["markouts_json"] or "{}")
+            calibrated = _learn_policy_calibration(conn, db_path, row, float(net_pct), moment)
+            gap = _learn_policy_gap(conn, db_path, row, marks, float(net_pct), moment)
+            return bool(calibrated or gap)
     except (sqlite3.Error, ValueError):
         return False
 
@@ -2081,6 +2259,10 @@ def resolve_markouts(
     if not _short_marks_repaired:
         repair_stored_short_marks(db_path)
         _short_marks_repaired = True
+    try:
+        backfill_close_calibration(db_path)
+    except (sqlite3.Error, ValueError):
+        logger.warning("CALIBRATION_BACKFILL_FAILED", exc_info=True)
     if bars_1m is None:
         from backend.services.day_v2.lifecycle_sim import ohlcv_bars_1m
 
@@ -2298,6 +2480,9 @@ def resolve_markouts(
                             strategy_version=str(row["strategy_version"]),
                             now=moment,
                         )
+                if int(row["filled"] or 0) and row["realized_net"] is not None and not int(row["calibration_learned"] or 0):
+                    if float(row["evaluated_at"] or 0.0) >= _calibration_backfill_floor():
+                        _learn_policy_calibration(conn, db_path, row, float(row["realized_net"]), moment)
                 if int(row["filled"] or 0) and row["realized_net"] is not None and not int(row["policy_learned"] or 0):
                     _learn_policy_gap(conn, db_path, row, marks, float(row["realized_net"]), moment)
                 conn.execute(

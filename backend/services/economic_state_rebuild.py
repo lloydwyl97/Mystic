@@ -155,7 +155,17 @@ def rebuild_day(
     consumed: dict[str, float] = {}
     first_record: set[str] = set()
     pending: list[dict[str, Any]] = []
-    counts = {"closes": 0, "lifecycles": 0, "policy_gaps": 0, "records": 0, "blocked": 0, "pending": 0, "fills_matched": sum(1 for m in matched.values() if m is not None), "fills": len(fills)}
+    counts = {
+        "closes": 0,
+        "lifecycles": 0,
+        "policy_gaps": 0,
+        "policy_calibrations": 0,
+        "records": 0,
+        "blocked": 0,
+        "pending": 0,
+        "fills_matched": sum(1 for m in matched.values() if m is not None),
+        "fills": len(fills),
+    }
 
     def learn_close(fill: dict[str, Any], cand: DayCandidate | None) -> None:
         continuation = None
@@ -182,12 +192,25 @@ def rebuild_day(
             exit_reason=fill.get("exit_reason"),
         )
         counts["closes"] += 1
-        if cand is not None and exit_contract_of(DAY_ENGINE, entered_at=fill["entered_at"], exit_reason=fill.get("exit_reason")) == "CURRENT":
-            label = day_lifecycle(cand, fill["decision"], store, roundtrip_cost=roundtrip_cost, now=now)
-            if label.get("final") and label.get("net") is not None and current_lifecycle_label(label.get("reason")):
-                at = max(float(fill["closed_at"]), float(label["exit_time"]))
-                if at <= now:
-                    heapq.heappush(heap, (at, next(seq), lambda c=cand, gap=float(fill["net"]) - float(label["net"]), at=at: learn_gap(c, gap, at)))
+        if exit_contract_of(DAY_ENGINE, entered_at=fill["entered_at"], exit_reason=fill.get("exit_reason")) == "CURRENT":
+            predicted = policy.al.predicted_policy_value(fill.get("decision"))
+            if predicted is not None and policy.al.observe_policy_calibration(
+                policy.db,
+                engine=DAY_ENGINE,
+                symbol=fill["symbol"],
+                setup=fill["setup"],
+                regime=fill["regime"],
+                realized=float(fill["net"]),
+                predicted=predicted,
+                now=float(fill["closed_at"]),
+            ):
+                counts["policy_calibrations"] += 1
+            if cand is not None:
+                label = day_lifecycle(cand, fill["decision"], store, roundtrip_cost=roundtrip_cost, now=now)
+                if label.get("final") and label.get("net") is not None and current_lifecycle_label(label.get("reason")):
+                    at = max(float(fill["closed_at"]), float(label["exit_time"]))
+                    if at <= now:
+                        heapq.heappush(heap, (at, next(seq), lambda c=cand, gap=float(fill["net"]) - float(label["net"]), at=at: learn_gap(c, gap, at)))
 
     def learn_gap(c: DayCandidate, gap: float, at: float) -> None:
         policy.al.observe(policy.db, engine=DAY_ENGINE, symbol=c.symbol, setup=c.setup, regime=c.regime_tag, metric="policy_gap", value=gap, strategy_version=policy.version, now=at)
@@ -264,7 +287,7 @@ def _live_current_rows(db_path: str) -> int:
 
 
 def _learn_scalp_close(db: str, close: dict[str, Any]) -> None:
-    from backend.services.adaptive_learning import learn_from_close
+    from backend.services.adaptive_learning import learn_from_close, observe_policy_calibration, predicted_policy_value
 
     learn_from_close(
         db,
@@ -283,6 +306,19 @@ def _learn_scalp_close(db: str, close: dict[str, Any]) -> None:
         entered_at=close["entered_at"],
         now=close["closed_at"],
         exit_reason=close.get("exit_reason"),
+    )
+    predicted = predicted_policy_value(close.get("decision"))
+    if predicted is None or exit_contract_of(SCALP_ENGINE, entered_at=close["entered_at"], exit_reason=close.get("exit_reason")) != "CURRENT":
+        return
+    observe_policy_calibration(
+        db,
+        engine=SCALP_ENGINE,
+        symbol=close["symbol"],
+        setup=close["setup"],
+        regime=close["regime"],
+        realized=float(close["net"]),
+        predicted=predicted,
+        now=float(close["closed_at"]),
     )
 
 
@@ -978,7 +1014,14 @@ def decision_snapshot(db_path: str, engine_id: str, rows: list[dict[str, Any]], 
         if engine_id == DAY_ENGINE:
             d = al.day_decision(db_path, *key, now=now)
             econ = d["economic"]
-            out[key] = {"market_alpha": econ["market_alpha"], "policy_gap": econ["policy_gap"], "policy_value": econ["policy_value"], "size_mult": d["size_mult"], "risk": d["mae"]}
+            out[key] = {
+                "market_alpha": econ["market_alpha"],
+                "policy_gap": econ["policy_gap"],
+                "policy_calibration": econ["policy_calibration"],
+                "policy_value": econ["policy_value"],
+                "size_mult": d["size_mult"],
+                "risk": d["mae"],
+            }
             continue
         if not is_directional(r.get("raw_move_source")):
             continue
@@ -1055,7 +1098,10 @@ def regenerate(
         sconn = sqlite3.connect(scratch)
         sconn.row_factory = sqlite3.Row
         try:
-            flags = {int(r["id"]): r for r in sconn.execute("SELECT id, learned, lifecycle_learned, policy_learned, realized_net, markouts_json FROM adaptive_candidate_markouts")}
+            flags = {
+                int(r["id"]): r
+                for r in sconn.execute("SELECT id, learned, lifecycle_learned, policy_learned, calibration_learned, realized_net, markouts_json FROM adaptive_candidate_markouts")
+            }
             model = sconn.execute("SELECT * FROM adaptive_linear_model WHERE engine_id=? AND model=?", (engine, al._model_key(engine, "micro_edge"))).fetchone()
         finally:
             sconn.close()
@@ -1087,8 +1133,17 @@ def regenerate(
                 if engine == DAY_ENGINE and resimulate and isinstance(life, dict):
                     marks["lifecycle"] = life
                 conn.execute(
-                    "UPDATE adaptive_candidate_markouts SET learned=?, lifecycle_learned=?, policy_learned=?, realized_net=COALESCE(?, realized_net), markouts_json=? WHERE id=?",
-                    (int(f["learned"] or 0), int(f["lifecycle_learned"] or 0), int(f["policy_learned"] or 0), f["realized_net"], json.dumps(marks), int(r["id"])),
+                    "UPDATE adaptive_candidate_markouts SET learned=?, lifecycle_learned=?, policy_learned=?, calibration_learned=?, "
+                    "realized_net=COALESCE(?, realized_net), markouts_json=? WHERE id=?",
+                    (
+                        int(f["learned"] or 0),
+                        int(f["lifecycle_learned"] or 0),
+                        int(f["policy_learned"] or 0),
+                        int(f["calibration_learned"] or 0),
+                        f["realized_net"],
+                        json.dumps(marks),
+                        int(r["id"]),
+                    ),
                 )
             conn.commit()
         except Exception:
