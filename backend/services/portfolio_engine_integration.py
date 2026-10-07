@@ -1675,6 +1675,7 @@ class PortfolioEngineIntegration:
 
                     bars_15m = await _asyncio.to_thread(_load, "15m", 60)
                     ask_price, book_age = await self._resolve_day_executable_price(symbol)
+                    ask_at = time.time()
                     latest = float(bars_15m[-1]["ts_epoch"]) if bars_15m else None
                     gate = evaluate_candle_gate(
                         completed_bar_count=len(bars_15m),
@@ -1769,6 +1770,7 @@ class PortfolioEngineIntegration:
                             bars_15m=bars_15m,
                             bars_1h=bars_1h,
                             detector_fired=signal is fired,
+                            ask_at=ask_at,
                         )
 
                 except Exception:
@@ -1830,6 +1832,7 @@ class PortfolioEngineIntegration:
         bars_15m: list[dict[str, Any]],
         bars_1h: list[dict[str, Any]],
         detector_fired: bool = False,
+        ask_at: float | None = None,
     ) -> None:
         """Add one structural DAY context. Setup opinions are not a veto.
 
@@ -1874,6 +1877,7 @@ class PortfolioEngineIntegration:
                 "ask_price": ask_price,
                 "db_symbol": db_sym_15m,
                 "as_of": as_of,
+                "ask_at": float(ask_at if ask_at is not None else max(as_of, time.time())),
                 "regime_tag": market_regime_tag(db_path, symbol) or "",
                 "state_features": day_state_features(bars_15m, bars_1h, signal.setup),
             }
@@ -1914,7 +1918,9 @@ class PortfolioEngineIntegration:
             signaled=True,
             evaluated_at=float(cand["as_of"]),
             candidate_state=state,
-            lifecycle=LifecycleParams.from_signal(signal, entry_price=float(cand["ask_price"]), entry_time=float(cand["as_of"]), adaptive=adaptive),
+            # The label path starts when the ask was observed, not at the bar
+            # boundary: the first minute's earlier high/low was never tradable.
+            lifecycle=LifecycleParams.from_signal(signal, entry_price=float(cand["ask_price"]), entry_time=float(cand.get("ask_at") or cand["as_of"]), adaptive=adaptive),
             economic=economic,
             opportunity_id=str(signal.opportunity_id or ""),
             features=cand.get("state_features") or None,

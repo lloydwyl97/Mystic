@@ -543,7 +543,8 @@ def _evaluate_strategy_router(
                 "momentum_boost": best_ranked_row.get("momentum_boost"),
                 "reachability_multiplier": best_ranked_row.get("reachability_multiplier"),
                 "reachability_surplus_pct": meta.get("reachability_surplus"),
-                "expected_move_pct": best_ranked_row.get("expected_move_pct") or row.get("expected_gross_move"),
+                # Strategy geometry (target distance blended with ATR/floors), not a forecast.
+                "geometric_target_distance_pct": best_ranked_row.get("expected_move_pct") or row.get("expected_gross_move"),
                 "required_target_pct": best_ranked_row.get("required_target_pct"),
                 "target_gap_pct": best_ranked_row.get("target_gap_pct"),
                 "predicted_net_return": row.get("predicted_net_return") or row.get("expected_net_ev"),

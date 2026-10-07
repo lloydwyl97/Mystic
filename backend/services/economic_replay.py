@@ -131,23 +131,37 @@ class DayCandidate:
     recorded_ask: bool
     lifecycle: dict[str, Any] = field(default_factory=dict)
     regime_tag: str = ""
+    ask_at: float | None = None
 
     @property
     def opportunity_id(self) -> str:
         return str(getattr(self.signal, "opportunity_id", "") or f"{self.symbol}:{self.setup}:{self.decided_at}")
 
+    @property
+    def entry_time(self) -> float:
+        """When the ask was observable; the label path starts here, never earlier."""
+        return max(float(self.decided_at), float(self.ask_at)) if self.ask_at is not None else float(self.decided_at)
 
-def _recorded_day_asks(db_path: str, since: float) -> dict[tuple[str, int], tuple[float, str]]:
-    """(symbol, 15m bar) -> (decision ask, regime tag) for DAY candidates the live system recorded."""
+
+def _recorded_entry_time(lifecycle_json: str | None) -> float | None:
+    try:
+        value = float((json.loads(lifecycle_json or "") or {}).get("entry_time"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _recorded_day_asks(db_path: str, since: float) -> dict[tuple[str, int], tuple[float, str, float | None]]:
+    """(symbol, 15m bar) -> (decision ask, regime tag, ask time) for DAY candidates the live system recorded."""
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = conn.execute(
-            "SELECT symbol, evaluated_at, ref_price, regime FROM adaptive_candidate_markouts WHERE engine_id='DAY_V2' AND signaled=1 AND evaluated_at>=?",
+            "SELECT symbol, evaluated_at, ref_price, regime, lifecycle_json FROM adaptive_candidate_markouts WHERE engine_id='DAY_V2' AND signaled=1 AND evaluated_at>=?",
             (since,),
         ).fetchall()
     finally:
         conn.close()
-    return {(str(s), int(float(t) // 900)): (float(p), str(r or "")) for s, t, p, r in rows}
+    return {(str(s), int(float(t) // 900)): (float(p), str(r or ""), _recorded_entry_time(lj)) for s, t, p, r, lj in rows}
 
 
 def reconstruct_day_candidates(db_path: str, since: float, until: float, store: BarStore, *, half_spread: float = 0.00006) -> tuple[list[DayCandidate], list[dict[str, Any]]]:
@@ -174,7 +188,7 @@ def reconstruct_day_candidates(db_path: str, since: float, until: float, store: 
             if sig is not None:
                 rec = recorded.get(key)
                 ask = rec[0] if rec else float(b15[-1]["close"]) * (1.0 + half_spread)
-                out.append(DayCandidate(sym, t, sig.setup, sig.regime, ask, sig, rec is not None, regime_tag=rec[1] if rec else ""))
+                out.append(DayCandidate(sym, t, sig.setup, sig.regime, ask, sig, rec is not None, regime_tag=rec[1] if rec else "", ask_at=rec[2] if rec else None))
             else:
                 exp = explain_no_signal(sym, b15, b1h, b4h)
                 unmet = list(exp.get("unmet") or [])
@@ -189,8 +203,8 @@ def label_day_lifecycles(cands: list[DayCandidate], store: BarStore, *, roundtri
     from backend.services.day_v2.lifecycle_sim import DAY_LIFECYCLE_MAX_MIN, LifecycleParams, simulate_lifecycle
 
     for c in cands:
-        params = LifecycleParams.from_signal(c.signal, entry_price=c.ask, entry_time=c.decided_at, adaptive=adaptive_for(c) if adaptive_for else None)
-        path = store.minute_path(c.symbol, c.decided_at, c.decided_at + DAY_LIFECYCLE_MAX_MIN * 60 + 60)
+        params = LifecycleParams.from_signal(c.signal, entry_price=c.ask, entry_time=c.entry_time, adaptive=adaptive_for(c) if adaptive_for else None)
+        path = store.minute_path(c.symbol, c.entry_time, c.entry_time + DAY_LIFECYCLE_MAX_MIN * 60 + 60)
         c.lifecycle = simulate_lifecycle(params, path, roundtrip_cost=roundtrip_cost, now=now)
 
 
@@ -214,8 +228,8 @@ def day_lifecycle(c: DayCandidate, adaptive: dict | None, store: BarStore, *, ro
     from backend.services.day_v2.lifecycle_sim import DAY_LIFECYCLE_MAX_MIN, LifecycleParams, simulate_lifecycle
     from backend.services.day_v2.winner_contract import objective_level
 
-    params = LifecycleParams.from_signal(c.signal, entry_price=c.ask, entry_time=c.decided_at, adaptive=adaptive)
-    path = store.minute_path(c.symbol, c.decided_at, c.decided_at + DAY_LIFECYCLE_MAX_MIN * 60 + 60)
+    params = LifecycleParams.from_signal(c.signal, entry_price=c.ask, entry_time=c.entry_time, adaptive=adaptive)
+    path = store.minute_path(c.symbol, c.entry_time, c.entry_time + DAY_LIFECYCLE_MAX_MIN * 60 + 60)
     label = simulate_lifecycle(params, path, roundtrip_cost=roundtrip_cost, now=now)
     if label.get("final") and label.get("net") is not None:
         objective = objective_level(

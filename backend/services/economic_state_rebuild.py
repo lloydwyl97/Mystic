@@ -562,7 +562,7 @@ def rebuild(db_path: str, *, now: float | None = None, apply: bool = False, work
                 signaled=True,
                 evaluated_at=c.decided_at,
                 candidate_state=p["state"],
-                lifecycle=LifecycleParams.from_signal(c.signal, entry_price=c.ask, entry_time=c.decided_at, adaptive=adaptive),
+                lifecycle=LifecycleParams.from_signal(c.signal, entry_price=c.ask, entry_time=c.entry_time, adaptive=adaptive),
                 economic=economic,
                 opportunity_id=c.opportunity_id,
             ):
@@ -630,19 +630,9 @@ def realized_closes(db_path: str, engine_id: str) -> list[dict[str, Any]]:
             extra = _json(o["extra_json"])
             holding = _json(o["indicators_while_holding_json"])
             entered, closed = float(o["entry_timestamp"]), float(o["exit_timestamp"])
-            sell = conn.execute(
-                "SELECT trade_id, decision_id, scalp_opportunity_id FROM paper_trades WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,''))=? AND symbol=? "
-                "AND ABS(strftime('%s', substr(timestamp, 1, 19)) - ?) <= ? ORDER BY ABS(strftime('%s', substr(timestamp, 1, 19)) - ?) LIMIT 1",
-                (engine, o["symbol"], closed, _LINK_WINDOW_SEC, closed),
-            ).fetchone()
-            buy = None
-            if sell is not None:
-                buy = conn.execute(
-                    "SELECT trade_id, adaptive_decision_json FROM paper_trades WHERE UPPER(side)='BUY' AND UPPER(COALESCE(engine_id,''))=? "
-                    "AND ((COALESCE(decision_id,'')!='' AND decision_id=?) OR trade_id=?) ORDER BY rowid DESC LIMIT 1",
-                    (engine, sell["decision_id"], sell["trade_id"]),
-                ).fetchone()
+            buy, sell = _close_rows(conn, engine, o["symbol"], str(extra.get("original_trade_id") or ""), closed)
             decision = _json(buy["adaptive_decision_json"]) if buy is not None else {}
+            sell_decision = _json(sell["adaptive_decision_json"]) if sell is not None else {}
             setup = str(decision.get("setup") or o["setup"] or "")
             if not setup:
                 continue
@@ -663,13 +653,69 @@ def realized_closes(db_path: str, engine_id: str) -> list[dict[str, Any]]:
                     "closed_at": closed,
                     "exit_reason": str(o["close_reason"] or ""),
                     "contract": exit_contract_of(engine, entered_at=entered, exit_reason=str(o["close_reason"] or "")),
-                    "opportunity_id": str(sell["scalp_opportunity_id"] or "") if sell is not None else "",
+                    "opportunity_id": str((sell["scalp_opportunity_id"] if sell is not None else "") or (buy["scalp_opportunity_id"] if buy is not None else "") or ""),
                     "position_trade_id": str(extra.get("original_trade_id") or (buy["trade_id"] if buy is not None else "") or ""),
+                    "candidate_id": _lineage_candidate(sell_decision, decision),
                 }
             )
     finally:
         conn.close()
     return out
+
+
+_TRADE_COLUMNS = "trade_id, decision_id, scalp_opportunity_id, adaptive_decision_json"
+
+
+def _close_rows(conn: sqlite3.Connection, engine: str, symbol: str, position_trade_id: str, closed: float) -> tuple[Any, Any]:
+    """(BUY, SELL) of one realized close, by identity first.
+
+    The position's own BUY (``original_trade_id``) and the SELL sharing its
+    decision id; a live exit's realized timestamp can trail its SELL row by more
+    than any fixed window. Without that identity, the nearest SELL on the
+    symbol inside ``_LINK_WINDOW_SEC`` and its BUY.
+    """
+    buy = None
+    if position_trade_id:
+        buy = conn.execute(
+            f"SELECT {_TRADE_COLUMNS} FROM paper_trades WHERE UPPER(side)='BUY' AND UPPER(COALESCE(engine_id,''))=? AND trade_id=? ORDER BY rowid DESC LIMIT 1",
+            (engine, position_trade_id),
+        ).fetchone()
+    if buy is not None and str(buy["decision_id"] or ""):
+        sell = conn.execute(
+            f"SELECT {_TRADE_COLUMNS} FROM paper_trades WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,''))=? AND decision_id=? "
+            "ORDER BY ABS(strftime('%s', substr(timestamp, 1, 19)) - ?) LIMIT 1",
+            (engine, buy["decision_id"], closed),
+        ).fetchone()
+        if sell is not None:
+            return buy, sell
+    sell = conn.execute(
+        f"SELECT {_TRADE_COLUMNS} FROM paper_trades WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,''))=? AND symbol=? "
+        "AND ABS(strftime('%s', substr(timestamp, 1, 19)) - ?) <= ? ORDER BY ABS(strftime('%s', substr(timestamp, 1, 19)) - ?) LIMIT 1",
+        (engine, symbol, closed, _LINK_WINDOW_SEC, closed),
+    ).fetchone()
+    if sell is not None and buy is None:
+        buy = conn.execute(
+            f"SELECT {_TRADE_COLUMNS} FROM paper_trades WHERE UPPER(side)='BUY' AND UPPER(COALESCE(engine_id,''))=? "
+            "AND ((COALESCE(decision_id,'')!='' AND decision_id=?) OR trade_id=?) ORDER BY rowid DESC LIMIT 1",
+            (engine, sell["decision_id"], sell["trade_id"]),
+        ).fetchone()
+    return buy, sell
+
+
+def _lineage_candidate(*decisions: dict[str, Any]) -> int | None:
+    """The entry's own candidate row id from SELL close lineage or BUY entry lineage."""
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            continue
+        close = decision.get("close_lineage")
+        entry = close.get("entry") if isinstance(close, dict) else None
+        for source in (entry, decision.get("lineage")):
+            if isinstance(source, dict) and source.get("candidate_id") not in (None, ""):
+                try:
+                    return int(source["candidate_id"])
+                except (TypeError, ValueError):
+                    continue
+    return None
 
 
 def _candidate_rows(db_path: str, engine_id: str) -> list[dict[str, Any]]:
@@ -688,26 +734,41 @@ def _candidate_rows(db_path: str, engine_id: str) -> list[dict[str, Any]]:
 
 
 def link_closes(engine_id: str, rows: list[dict[str, Any]], closes: list[dict[str, Any]]) -> dict[int, int]:
-    """Close index -> its own candidate row id. DAY: the filled row of the close's
-    opportunity. SCALP: the admitted claim on the symbol recorded in the 30 s before entry."""
+    """Close index -> its own candidate row id.
+
+    The close's lineage ``candidate_id`` when it names a current row. Otherwise
+    DAY: the opportunity's fills in order, one per close (an opportunity can be
+    filled again after an earlier position closed); SCALP: the admitted claim on
+    the symbol recorded in the 30 s before entry."""
     links: dict[int, int] = {}
+    ids = {int(r["id"]) for r in rows}
+    used: set[int] = set()
+    for i, close in enumerate(closes):
+        cand = close.get("candidate_id")
+        if cand is not None and int(cand) in ids and int(cand) not in used:
+            links[i] = int(cand)
+            used.add(int(cand))
     if engine_id == DAY_ENGINE:
-        first_fill: dict[str, int] = {}
+        fills: dict[str, list[int]] = defaultdict(list)
         for r in rows:
             opp = str(r.get("opportunity_id") or "")
-            if opp and int(r.get("filled") or 0) and opp not in first_fill:
-                first_fill[opp] = int(r["id"])
+            if opp and int(r.get("filled") or 0):
+                fills[opp].append(int(r["id"]))
         for i, close in enumerate(closes):
-            row_id = first_fill.get(str(close.get("opportunity_id") or ""))
-            if row_id is not None:
-                links[i] = row_id
+            if i in links:
+                continue
+            free = [row_id for row_id in fills.get(str(close.get("opportunity_id") or ""), []) if row_id not in used]
+            if free:
+                links[i] = free[0]
+                used.add(free[0])
         return links
     by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         if int(r.get("signaled") or 0):
             by_symbol[str(r["symbol"])].append(r)
-    used: set[int] = set()
     for i, close in enumerate(closes):
+        if i in links:
+            continue
         found = [r for r in by_symbol.get(close["symbol"], []) if close["entered_at"] - _LINK_WINDOW_SEC <= float(r["evaluated_at"]) <= close["entered_at"] + 1.0 and int(r["id"]) not in used]
         if found:
             row = max(found, key=lambda r: (float(r["evaluated_at"]), int(r["id"])))

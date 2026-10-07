@@ -48,6 +48,12 @@ RETENTION_JUSTIFICATION: dict[str, str] = {
         "protected nor lock-dependent. 3 days covers every SCALP hold and the longest research "
         "label horizon in the system (4h) with room for a weekend of order-book debugging. At ~67k rows/day and ~4.6 KB/row it is 81.6% of the database."
     ),
+    "book_queue_chunks": (
+        "Compressed per-minute L1-L20 depth history (keyframe + level diffs + update ids) for "
+        "offline queue, maker-fill and continuation research. Read only by research extracts; no "
+        "live decision reads it. Measured ~38 MB/day for four symbols, so 7 days (~0.27 GB) "
+        "keeps a full week of queue history for maker-fill research at a small disk cost."
+    ),
     "scalp_shadow_rejects": (
         "SCALP shadow gate telemetry sampled per rejected setup. Not an order, fill, accounting "
         "or clock-v2 artifact and not referenced by any sealed lock. 30 days keeps a full month "
@@ -61,6 +67,7 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     RetentionPolicy("ai_context_snapshots", "ts_utc", 30, "iso_utc"),
     # 81.6% of the database and ~306 MB/day. Write-only telemetry with no reader.
     RetentionPolicy("microstructure_feature_snapshots", "ts_utc", 3, "epoch_seconds"),
+    RetentionPolicy("book_queue_chunks", "chunk_start", 7, "epoch_seconds"),
     RetentionPolicy("scalp_shadow_rejects", "created_at", 30, "iso_utc"),
     # strategy_runtime_audit writes ~160k rows/day — keep only 3 days (~480k rows max)
     RetentionPolicy("strategy_runtime_audit", "ts_utc", 3, "iso_utc"),

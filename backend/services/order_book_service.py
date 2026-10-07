@@ -283,6 +283,10 @@ class OrderBookService:
             asks: List of [price, quantity] for asks
         """
         try:
+            with contextlib.suppress(Exception):
+                from backend.services.book_queue_capture import record_depth
+
+                record_depth(symbol, bids, asks, last_update_id)
             # Ensure Redis connection exists
             if not self.redis:
                 self.redis = get_redis_service()

@@ -1633,9 +1633,17 @@ def _economic_of(row: sqlite3.Row) -> dict[str, Any]:
     return econ if isinstance(econ, dict) else {}
 
 
-def _stored_features(features: dict | None) -> str:
+def _stored_features(features: dict | None, engine_id: str = SCALP_ENGINE) -> str:
     if not isinstance(features, dict) or not features:
         return "{}"
+    if engine_id == DAY_ENGINE:
+        # Decision-time DAY state, kept for research. No DAY learner reads it.
+        day: dict[str, float] = {}
+        for k, v in features.items():
+            with contextlib.suppress(TypeError, ValueError):
+                if math.isfinite(float(v)):
+                    day[str(k)] = float(v)
+        return json.dumps(day, separators=(",", ":"), sort_keys=True) if day else "{}"
     feats = _micro_features(features)
     if not any(v != 0.0 for v in feats.values()):
         return "{}"
@@ -1695,7 +1703,7 @@ def record_candidate(
     version = current_strategy_version(engine_id)
     if not version or float(ref_price or 0) <= 0 or not str(setup or "").strip():
         return None
-    feats_json = _stored_features(features)
+    feats_json = _stored_features(features, engine_id)
     horizon = _label_horizon_for(db_path, engine_id, symbol, setup, regime)
     raw_move: float | None = None
     with contextlib.suppress(TypeError, ValueError):
