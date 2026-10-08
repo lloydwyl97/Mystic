@@ -376,6 +376,34 @@ def _migrate_state_table(conn: sqlite3.Connection) -> None:
         raise
 
 
+# ``policy_calibration`` observes realized net minus the entry's base forecast
+# (``uncalibrated_policy_value``). State learned under the former target
+# (realized minus the already-calibrated forecast) is replaced once.
+CALIBRATION_TARGET = "ENTRY_BASE_RESIDUAL_V1"
+_CALIBRATION_META_DDL = "CREATE TABLE IF NOT EXISTS adaptive_calibration_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+_calibration_target_checked: set[str] = set()
+
+
+def _calibration_target_current(conn: sqlite3.Connection) -> bool:
+    conn.execute(_CALIBRATION_META_DDL)
+    row = conn.execute("SELECT value FROM adaptive_calibration_meta WHERE key='target'").fetchone()
+    return row is not None and str(row[0]) == CALIBRATION_TARGET
+
+
+def _mark_fresh_calibration_target(conn: sqlite3.Connection, db_path: str) -> None:
+    """A store with no calibration state has nothing learned under the old target."""
+    key = os.path.abspath(db_path)
+    if key in _calibration_target_checked:
+        return
+    _calibration_target_checked.add(key)
+    if _calibration_target_current(conn):
+        return
+    present = conn.execute("SELECT 1 FROM adaptive_metric_state WHERE metric='policy_calibration' LIMIT 1").fetchone()
+    if present is None:
+        conn.execute("INSERT OR REPLACE INTO adaptive_calibration_meta (key, value) VALUES ('target', ?)", (CALIBRATION_TARGET,))
+    conn.commit()
+
+
 def _connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=15)
     conn.row_factory = sqlite3.Row
@@ -436,6 +464,9 @@ def _connect(db_path: str) -> sqlite3.Connection:
         # later, one key at a time, and is not treated as already observed.
         conn.execute("UPDATE adaptive_candidate_markouts SET calibration_learned=1 WHERE policy_learned=1 AND calibration_learned=0")
         conn.commit()
+    if "calibration_target" not in cols:
+        conn.execute("ALTER TABLE adaptive_candidate_markouts ADD COLUMN calibration_target REAL")
+    _mark_fresh_calibration_target(conn, db_path)
     # resolve_markouts runs every SCALP cycle; without these, its key repair and
     # unresolved scan are full table scans that grow with the markout history.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_markouts_key ON adaptive_candidate_markouts(engine_id, symbol, setup, regime, learned)")
@@ -580,16 +611,19 @@ def _claim_and_fold(
     A crash before release leaves the flag unset and the observation unwritten.
     A later retry writes both once. Releasing the outermost savepoint commits
     both; a nested savepoint waits for the caller's commit, which then persists
-    both or neither."""
+    both or neither. A calibration claim also stores the observed target on the
+    row, so a rebuild can replay it without recomputing the entry forecast."""
     if flag == "calibration_learned":
-        claim = "UPDATE adaptive_candidate_markouts SET calibration_learned=1 WHERE id=? AND calibration_learned=0"
+        claim = "UPDATE adaptive_candidate_markouts SET calibration_learned=1, calibration_target=? WHERE id=? AND calibration_learned=0"
+        params: tuple = (float(value), int(row_id))
     elif flag == "policy_learned":
         claim = "UPDATE adaptive_candidate_markouts SET policy_learned=1 WHERE id=? AND policy_learned=0"
+        params = (int(row_id),)
     else:
         return False
     conn.execute("SAVEPOINT mystic_learn")
     try:
-        cur = conn.execute(claim, (int(row_id),))
+        cur = conn.execute(claim, params)
         if cur.rowcount != 1:
             conn.execute("ROLLBACK TO mystic_learn")
             conn.execute("RELEASE mystic_learn")
@@ -786,10 +820,11 @@ def policy_gap(db_path: str, engine: str, symbol: str, setup: str, regime: str, 
 
 
 def policy_calibration(db_path: str, engine: str, symbol: str, setup: str, regime: str, *, now: float | None = None, rows: list | None = None) -> dict[str, Any]:
-    """Shrunk mean of realized policy net minus the policy value predicted at entry.
+    """Shrunk mean of realized policy net minus the entry's base (uncalibrated) forecast.
 
-    Prior 0. A loss below its forecast pulls the next forecast down. A result
-    above its forecast can pull the next forecast up. There is no fixed offset.
+    Added to the base forecast, it is the learned estimate of that base's
+    residual. Prior 0. A result below its base pulls the next forecast down,
+    one above it can pull the next forecast up. There is no fixed offset.
     """
     engine_id = str(engine or "").upper()
     if rows is None:
@@ -1014,6 +1049,7 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
         "n_lifecycle": round(net["n_lifecycle"], 3),
         "market_alpha": net["market_alpha"],
         "policy_gap": net["policy_gap"],
+        "lifecycle_policy_estimate": net["market_alpha"] + net["policy_gap"],
         "n_policy_gap": round(net["n_policy_gap"], 3),
         "uncalibrated_policy_value": net["uncalibrated_mean"],
         "policy_calibration": net["policy_calibration"],
@@ -1945,22 +1981,42 @@ def _market_label(engine_id: str, row: Any, marks: dict) -> float | None:
     return out if out is not None and math.isfinite(out) else None
 
 
-def predicted_policy_value(decision: dict | None) -> float | None:
-    """Policy value the entry actually issued. None when it was not stored."""
-    econ = decision.get("economic") if isinstance(decision, dict) else None
-    raw = econ.get("policy_value") if isinstance(econ, dict) else None
+def _finite_number(raw: Any) -> float | None:
     if isinstance(raw, bool) or not isinstance(raw, int | float):
         return None
     value = float(raw)
     return value if math.isfinite(value) else None
 
 
-def _predicted_policy_value(row: Any) -> float | None:
-    raw = _economic_of(row).get("policy_value")
-    if isinstance(raw, bool) or not isinstance(raw, int | float):
+def entry_base_forecast_of(econ: Any) -> float | None:
+    """Policy value the entry issued before calibration, from its own stored fields.
+
+    The stored ``uncalibrated_policy_value`` when present. Otherwise the issued
+    value less the calibration it applied. An entry with no
+    ``policy_calibration`` field was issued before calibration existed, so the
+    issued value is the base. None when the stored fields do not prove it.
+    """
+    if not isinstance(econ, dict):
         return None
-    value = float(raw)
-    return value if math.isfinite(value) else None
+    base = _finite_number(econ.get("uncalibrated_policy_value"))
+    if base is not None:
+        return base
+    issued = _finite_number(econ.get("policy_value"))
+    if issued is None:
+        return None
+    if "policy_calibration" not in econ:
+        return issued
+    applied = _finite_number(econ.get("policy_calibration"))
+    return None if applied is None else issued - applied
+
+
+def entry_base_forecast(decision: dict | None) -> float | None:
+    """``entry_base_forecast_of`` for a stored decision (``{"economic": ...}``)."""
+    return entry_base_forecast_of(decision.get("economic") if isinstance(decision, dict) else None)
+
+
+def _entry_base_forecast(row: Any) -> float | None:
+    return entry_base_forecast_of(_economic_of(row))
 
 
 def observe_policy_calibration(
@@ -1971,14 +2027,17 @@ def observe_policy_calibration(
     setup: str,
     regime: str,
     realized: float,
-    predicted: float,
+    base: float,
     now: float,
 ) -> bool:
-    """One running-mean observation of realized net minus the entry forecast.
+    """One running-mean observation of realized net minus the entry's base forecast.
 
-    Prior 0, both signs, no sample floor and no added penalty. The market
-    lifecycle label is not an input."""
-    if not math.isfinite(float(realized)) or not math.isfinite(float(predicted)):
+    ``base`` is the forecast before calibration. The calibration is added to that
+    base, so it must learn the base's residual: measuring against the calibrated
+    forecast would make it learn only what it has not yet corrected and settle at
+    part of the error. Prior 0, both signs, no sample floor and no added penalty.
+    The market lifecycle label is not an input."""
+    if not math.isfinite(float(realized)) or not math.isfinite(float(base)):
         return False
     return observe(
         db_path,
@@ -1987,7 +2046,7 @@ def observe_policy_calibration(
         setup=setup,
         regime=regime,
         metric="policy_calibration",
-        value=float(realized) - float(predicted),
+        value=float(realized) - float(base),
         strategy_version=current_strategy_version(str(engine or "").upper()),
         now=float(now),
     )
@@ -1996,16 +2055,17 @@ def observe_policy_calibration(
 def _learn_policy_calibration(conn: sqlite3.Connection, db_path: str, row: Any, realized: float, moment: float) -> bool:
     """Fold one close into ``policy_calibration`` at the close. Exactly once.
 
-    The learned flag and the observation commit together. A crash leaves the
-    close unlearned so the next pass can write both."""
+    The target is realized net minus the base forecast stored at entry. The
+    learned flag, the stored target and the observation commit together. A crash
+    leaves the close unlearned so the next pass can write all three."""
     del db_path
     engine_id = str(row["engine_id"])
     if not math.isfinite(float(realized)):
         return False
     if str(row["strategy_version"]) != current_strategy_version(engine_id) or str(row["economic_version"] or "") != current_economic_version(engine_id):
         return False
-    predicted = _predicted_policy_value(row)
-    if predicted is None:
+    base = _entry_base_forecast(row)
+    if base is None:
         return False
     return _claim_and_fold(
         conn,
@@ -2016,7 +2076,7 @@ def _learn_policy_calibration(conn: sqlite3.Connection, db_path: str, row: Any, 
         setup=str(row["setup"]),
         regime=str(row["regime"]),
         metric="policy_calibration",
-        value=float(realized) - float(predicted),
+        value=float(realized) - float(base),
         strategy_version=current_strategy_version(engine_id),
         moment=float(moment),
     )
@@ -2163,25 +2223,25 @@ def repair_marked_calibration_without_observation(conn: sqlite3.Connection) -> t
             continue
         ready: list[tuple[float, int, Any, float, float]] = []
         for row in members:
-            predicted = _predicted_policy_value(row)
+            base = _entry_base_forecast(row)
             moment = _close_moment(conn, row, apply_floor=False)
             try:
                 realized = float(row["realized_net"])
             except (TypeError, ValueError):
                 realized = float("nan")
-            if predicted is None or moment is None or not math.isfinite(realized):
+            if base is None or moment is None or not math.isfinite(realized):
                 cur = conn.execute("UPDATE adaptive_candidate_markouts SET calibration_learned=0 WHERE id=? AND calibration_learned=1", (row["id"],))
                 conn.commit()
                 cleared += int(cur.rowcount or 0)
                 continue
-            ready.append((float(moment), int(row["id"]), row, float(predicted), realized))
+            ready.append((float(moment), int(row["id"]), row, float(base), realized))
         if not ready:
             continue
         ready.sort()
         conn.execute("SAVEPOINT mystic_calibration_repair")
         try:
             wrote = 0
-            for moment, _row_id, row, predicted, realized in ready:
+            for moment, row_id, row, base, realized in ready:
                 ok = _fold_observation(
                     conn,
                     engine=str(row["engine_id"]),
@@ -2189,12 +2249,13 @@ def repair_marked_calibration_without_observation(conn: sqlite3.Connection) -> t
                     setup=str(row["setup"]),
                     regime=str(row["regime"]),
                     metric="policy_calibration",
-                    value=realized - predicted,
+                    value=realized - base,
                     strategy_version=str(row["strategy_version"]),
                     now=moment,
                 )
                 if not ok:
                     raise RuntimeError("calibration observation rejected")
+                conn.execute("UPDATE adaptive_candidate_markouts SET calibration_target=? WHERE id=?", (realized - base, row_id))
                 wrote += 1
             conn.execute("RELEASE mystic_calibration_repair")
             folded += wrote
@@ -2207,19 +2268,83 @@ def repair_marked_calibration_without_observation(conn: sqlite3.Connection) -> t
     return folded, cleared
 
 
+def rebuild_policy_calibration(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Replace current-version calibration state with base-residual observations.
+
+    Every current-version filled close with a current-policy sell and an entry
+    base forecast its own stored fields prove is folded once, in sell-time
+    order, as realized minus that base. Its flag is set and its target stored.
+    A flagged close that cannot be proven is unflagged. State, flags, targets
+    and the target marker commit in one transaction. Fills, accounting,
+    lifecycle history and ``policy_gap`` are not written."""
+    conn.execute(_CALIBRATION_META_DDL)
+    rows = conn.execute("SELECT * FROM adaptive_candidate_markouts WHERE filled=1 AND realized_net IS NOT NULL").fetchall()
+    ready: list[tuple[float, int, Any, float]] = []
+    unproven: list[int] = []
+    for row in rows:
+        if _calibration_identity(row) is None:
+            continue
+        base = _entry_base_forecast(row)
+        moment = _close_moment(conn, row, apply_floor=False)
+        realized = _finite_number(row["realized_net"])
+        if base is None or moment is None or realized is None:
+            if int(row["calibration_learned"] or 0):
+                unproven.append(int(row["id"]))
+            continue
+        ready.append((float(moment), int(row["id"]), row, realized - base))
+    ready.sort(key=lambda item: (item[0], item[1]))
+    conn.execute("SAVEPOINT mystic_calibration_rebuild")
+    try:
+        for engine_id in _PRIORS:
+            conn.execute(
+                "DELETE FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND metric='policy_calibration'",
+                (engine_id, current_economic_version(engine_id)),
+            )
+        for moment, row_id, row, target in ready:
+            ok = _fold_observation(
+                conn,
+                engine=str(row["engine_id"]),
+                symbol=str(row["symbol"]),
+                setup=str(row["setup"]),
+                regime=str(row["regime"]),
+                metric="policy_calibration",
+                value=target,
+                strategy_version=str(row["strategy_version"]),
+                now=moment,
+            )
+            if not ok:
+                raise RuntimeError("calibration observation rejected")
+            conn.execute("UPDATE adaptive_candidate_markouts SET calibration_learned=1, calibration_target=? WHERE id=?", (target, row_id))
+        for row_id in unproven:
+            conn.execute("UPDATE adaptive_candidate_markouts SET calibration_learned=0, calibration_target=NULL WHERE id=?", (row_id,))
+        conn.execute("INSERT OR REPLACE INTO adaptive_calibration_meta (key, value) VALUES ('target', ?)", (CALIBRATION_TARGET,))
+        conn.execute("RELEASE mystic_calibration_rebuild")
+    except Exception:
+        conn.execute("ROLLBACK TO mystic_calibration_rebuild")
+        conn.execute("RELEASE mystic_calibration_rebuild")
+        raise
+    conn.commit()
+    logger.info("CALIBRATION_REBUILD target=%s folded=%s unflagged=%s", CALIBRATION_TARGET, len(ready), len(unproven))
+    return len(ready), len(unproven)
+
+
 def backfill_close_calibration(db_path: str) -> int:
     """Teach calibration for current-policy closes the lifecycle wait skipped.
 
-    One observation per filled candidate. A close already marked learned is
-    repaired only when its key has no calibration observation. Fills,
-    accounting and lifecycle history are not written."""
+    One observation per filled candidate. State learned under an earlier
+    target is rebuilt once. A close already marked learned is repaired only
+    when its key has no calibration observation. Fills, accounting and
+    lifecycle history are not written."""
     key = os.path.abspath(db_path)
     if key in _calibration_backfilled:
         return 0
     taught = 0
     conn = _connect(db_path)
     try:
-        repair_marked_calibration_without_observation(conn)
+        if _calibration_target_current(conn):
+            repair_marked_calibration_without_observation(conn)
+        else:
+            rebuild_policy_calibration(conn)
         rows = conn.execute("SELECT * FROM adaptive_candidate_markouts WHERE filled=1 AND realized_net IS NOT NULL AND calibration_learned=0").fetchall()
         for row in rows:
             moment = _close_moment(conn, row)

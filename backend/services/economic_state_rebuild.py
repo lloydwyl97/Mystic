@@ -193,15 +193,15 @@ def rebuild_day(
         )
         counts["closes"] += 1
         if exit_contract_of(DAY_ENGINE, entered_at=fill["entered_at"], exit_reason=fill.get("exit_reason")) == "CURRENT":
-            predicted = policy.al.predicted_policy_value(fill.get("decision"))
-            if predicted is not None and policy.al.observe_policy_calibration(
+            base = policy.al.entry_base_forecast(fill.get("decision"))
+            if base is not None and policy.al.observe_policy_calibration(
                 policy.db,
                 engine=DAY_ENGINE,
                 symbol=fill["symbol"],
                 setup=fill["setup"],
                 regime=fill["regime"],
                 realized=float(fill["net"]),
-                predicted=predicted,
+                base=base,
                 now=float(fill["closed_at"]),
             ):
                 counts["policy_calibrations"] += 1
@@ -287,7 +287,7 @@ def _live_current_rows(db_path: str) -> int:
 
 
 def _learn_scalp_close(db: str, close: dict[str, Any]) -> None:
-    from backend.services.adaptive_learning import learn_from_close, observe_policy_calibration, predicted_policy_value
+    from backend.services.adaptive_learning import entry_base_forecast, learn_from_close, observe_policy_calibration
 
     learn_from_close(
         db,
@@ -307,8 +307,8 @@ def _learn_scalp_close(db: str, close: dict[str, Any]) -> None:
         now=close["closed_at"],
         exit_reason=close.get("exit_reason"),
     )
-    predicted = predicted_policy_value(close.get("decision"))
-    if predicted is None or exit_contract_of(SCALP_ENGINE, entered_at=close["entered_at"], exit_reason=close.get("exit_reason")) != "CURRENT":
+    base = entry_base_forecast(close.get("decision"))
+    if base is None or exit_contract_of(SCALP_ENGINE, entered_at=close["entered_at"], exit_reason=close.get("exit_reason")) != "CURRENT":
         return
     observe_policy_calibration(
         db,
@@ -317,7 +317,7 @@ def _learn_scalp_close(db: str, close: dict[str, Any]) -> None:
         setup=close["setup"],
         regime=close["regime"],
         realized=float(close["net"]),
-        predicted=predicted,
+        base=base,
         now=float(close["closed_at"]),
     )
 

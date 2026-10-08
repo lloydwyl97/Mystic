@@ -109,6 +109,7 @@ class ExecutableEdge:
             "policy_gap": self.policy_gap_pct,
             "n_policy_gap": self.n_policy_gap,
             "policy_calibration": self.policy_calibration_pct,
+            "uncalibrated_policy_value": self.final_executable_edge_pct - self.policy_calibration_pct,
             "policy_value": self.final_executable_edge_pct,
             "uncertainty": self.uncertainty_pct,
             "backoff_gross": self.calibrated_move_pct - self.state_tilt_pct,

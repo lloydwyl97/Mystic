@@ -247,6 +247,39 @@ DAY_SIDE_ENGINES = ("DAY_V2", "LEGACY_DAY_LIVE", "LEGACY_EXIT_ONLY")
 DAY_SIDE_ENGINES_SQL = "'DAY_V2','LEGACY_DAY_LIVE','LEGACY_EXIT_ONLY'"
 
 
+def _bare_key_rank(pos: object) -> tuple[bool, bool, bool]:
+    from backend.services.live_exchange_equity import is_dust_import_id
+
+    return (
+        str(getattr(pos, "status", "") or "") != "DUST_PENDING",
+        str(getattr(pos, "engine_id", "") or "") == "DAY_V2",
+        not is_dust_import_id(str(getattr(pos, "trade_id", "") or "")),
+    )
+
+
+def _place_day_side_lot(book: dict, symbol: str, pos: object) -> None:
+    """Key a DAY-side lot under the bare symbol without displacing another row.
+
+    DAY_V2 and heritage rows (exchange dust buckets, legacy lots) share the bare
+    key. Two committed rows on one symbol both stay in the book: the live lot
+    keeps the bare key and the other goes under its own engine key (an
+    exchange dust bucket under the empty engine, as when it was created).
+    """
+    from backend.services.live_exchange_equity import is_dust_import_id
+
+    held = book.get(symbol)
+    if held is None:
+        book[symbol] = pos
+        return
+    keep, other = (held, pos) if _bare_key_rank(held) >= _bare_key_rank(pos) else (pos, held)
+    book[symbol] = keep
+    engine = "" if is_dust_import_id(str(getattr(other, "trade_id", "") or "")) else str(getattr(other, "engine_id", "") or "")
+    key = make_position_key(engine, symbol)
+    if key in book:
+        key = make_position_key(str(getattr(other, "engine_id", "") or "LEGACY_DAY_LIVE"), symbol)
+    book[key] = other
+
+
 def _lot_owned_by_engine(pos: object, engine_id: str) -> bool:
     """True when lot `pos` belongs to `engine_id` (legacy DAY mapping included)."""
     engine = str(engine_id or "")
@@ -3347,6 +3380,11 @@ class PortfolioEngine:
                 # the importer) aligns any surplus by engine-sum. Importing
                 # here would re-protect already-owned inventory.
                 continue
+            if self._committed_lot_rows(symbol):
+                # A committed lot the in-memory book has not loaded owns this
+                # balance; importing it would represent it twice.
+                logger.info("LIVE_RECONCILE_IMPORT_DEFERRED symbol=%s reason=committed_lot_not_in_book", symbol)
+                continue
             free_qty = max(0.0, float(free.get(asset, 0) or 0) - held_by_symbol.get(symbol, 0.0))
             if free_qty <= qty_epsilon:
                 continue
@@ -3598,12 +3636,37 @@ class PortfolioEngine:
             logger.info("RECONCILE_ORDER_FENCE symbol=%s snapshot_ts=%s — skipped this run", symbol, snapshot_ts)
         return fenced
 
+    def _committed_lot_rows(self, symbol: str) -> list[tuple[str, float]]:
+        """(trade_id, quantity) of every committed lot row on the symbol, any engine."""
+        try:
+            with connect_ro(self.db_path, timeout_sec=3.0) as conn:
+                rows = conn.execute(
+                    "SELECT trade_id, quantity FROM portfolio_engine_positions WHERE symbol=?",
+                    (normalize_symbol(symbol),),
+                ).fetchall()
+        except Exception:
+            return []
+        return [(str(r[0] or ""), float(r[1] or 0.0)) for r in rows]
+
+    def _proven_lot_qty(self, symbol: str, lots: list) -> float:
+        """Lot quantity owned on the symbol: the passed lots, the in-memory book and committed rows.
+
+        Each lot counts once by trade id. A committed fill that the in-memory book
+        has not loaded yet still owns its quantity."""
+        by_trade: dict[str, float] = {}
+        for pos in list(lots) + self._symbol_lots(symbol):
+            tid = str(getattr(pos, "trade_id", "") or "") or f"mem:{id(pos)}"
+            by_trade[tid] = max(by_trade.get(tid, 0.0), float(getattr(pos, "quantity", 0) or 0))
+        for tid, qty in self._committed_lot_rows(symbol):
+            by_trade[tid] = max(by_trade.get(tid, 0.0), qty)
+        return sum(by_trade.values())
+
     async def _sync_protected_remainder(self, symbol: str, exchange_qty: float, lots: list, qty_step: float) -> None:
         """Balance above the proven lots is protected inventory, never lot quantity."""
         from backend.services.protected_external_inventory import handle_unmatched_balance, list_protected, record_protected
 
         # Held engine dust is strategy inventory, never protected external inventory.
-        proven = sum(float(getattr(p, "quantity", 0) or 0) for p in lots) + self._held_engine_dust_qty(symbol)
+        proven = self._proven_lot_qty(symbol, lots) + self._held_engine_dust_qty(symbol)
         remainder = round(float(exchange_qty or 0) - proven, 12)
         if remainder <= 0:
             return
@@ -3634,6 +3697,46 @@ class PortfolioEngine:
             current,
             remainder,
         )
+
+    async def _shrink_unproven_dust_bucket(self, symbol: str, lots: list, excess: float) -> bool:
+        """Cap an exchange dust bucket so owned quantity never exceeds the balance.
+
+        The bucket is imported exchange leftover with no fill of its own. When
+        fill-backed lots and held engine dust already account for the balance,
+        the bucket's overlap is the same coins counted twice. Returns True when
+        the bucket absorbed the whole excess; fill-backed lots are never cut."""
+        from backend.services.live_exchange_equity import is_dust_import_id
+
+        buckets = [p for p in lots if is_dust_import_id(str(getattr(p, "trade_id", "") or ""))]
+        if excess <= 0 or not buckets:
+            return False
+        bucket = buckets[0]
+        held = float(getattr(bucket, "quantity", 0) or 0)
+        if excess > held + max(1e-12, 1e-9 * held):
+            return False
+        remaining = round(held - excess, 12)
+        tid = str(bucket.trade_id)
+        if remaining <= 1e-12:
+            await asyncio.to_thread(self._delete_lot_row_by_trade_id, symbol, tid)
+            for key in [k for k, p in self.open_positions.items() if p is bucket]:
+                self.open_positions.pop(key, None)
+        else:
+            bucket.quantity = remaining
+            bucket.quantity_exact = format(Decimal(str(remaining)), "f")
+            bucket.dust_qty_canonical = remaining
+            await self._persist_position_to_sqlite(bucket)
+        self._metrics_reconciliation_adjustments += 1
+        logger.warning("DUST_BUCKET_OVERLAP_REMOVED symbol=%s trade_id=%s bucket=%.12g overlap=%.12g remaining=%.12g", symbol, tid, held, excess, max(remaining, 0.0))
+        return True
+
+    def _delete_lot_row_by_trade_id(self, symbol: str, trade_id: str) -> None:
+        def _op():
+            with connect_rw(self.db_path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("DELETE FROM portfolio_engine_positions WHERE symbol=? AND trade_id=?", (normalize_symbol(symbol), str(trade_id)))
+                conn.commit()
+
+        run_locked_retry(_op)
 
     async def _reconcile_dual_engine_lots(
         self,
@@ -3712,6 +3815,8 @@ class PortfolioEngine:
                 surplus,
             )
             await self._sync_protected_remainder(symbol, float(exchange_qty), lots, float(qty_step or 0))
+            return
+        if await self._shrink_unproven_dust_bucket(symbol, lots, owned - float(exchange_qty)):
             return
         self._metrics_reconciliation_adjustments += 1
         logger.warning(
@@ -9141,7 +9246,7 @@ class PortfolioEngine:
             # the legacy bare-symbol key for backward compatibility.
             _load_engine = str(getattr(pos, "engine_id", "") or "LEGACY_DAY_LIVE")
             if _load_engine in ("", *DAY_SIDE_ENGINES):
-                rebuilt[normalized_symbol] = pos
+                _place_day_side_lot(rebuilt, normalized_symbol, pos)
             else:
                 rebuilt[make_position_key(_load_engine, normalized_symbol)] = pos
             logger.debug(
