@@ -126,10 +126,24 @@ def entry_snapshot(
     """
     econ = economics if isinstance(economics, dict) else {}
     horizons = _horizon_snapshot(db_path, engine, symbol, setup, regime, now)
+    version, source = "", ""
+    try:
+        meta = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        found = meta.execute(
+            "SELECT learning_version, source FROM continuation_learning_meta WHERE engine_id=? AND economic_version=?",
+            (str(engine), current_economic_version(engine)),
+        ).fetchone()
+        meta.close()
+        if found:
+            version, source = str(found[0] or ""), str(found[1] or "")
+    except sqlite3.Error:
+        found = None
     return {
         "economic_version": current_economic_version(engine),
         "strategy_version": current_strategy_version(engine),
-        "continuation_version": ADVANTAGE_VERSION,
+        "continuation_version": version,
+        "continuation_source": source,
+        "advantage_authority": version == ADVANTAGE_VERSION,
         "aggregator": installed_aggregator(db_path, engine),
         "horizons": horizons,
         "issued": {
