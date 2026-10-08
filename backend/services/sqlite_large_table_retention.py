@@ -76,6 +76,14 @@ RETENTION_JUSTIFICATION: dict[str, str] = {
         "Research comparison of live entry, direct policy, and the best policy outcome "
         "for one four-coin decision. Not an order and not account P&L. Kept 14 days with the episodes."
     ),
+    "policy_challenger_scores": (
+        "Research scoreboard for state-conditioned policy models. Predictions were stored before "
+        "the outcome. Not an order and not account P&L. Kept 14 days with the episodes."
+    ),
+    "policy_horizon_marks": (
+        "Executable bids recorded after a research exit, so continuation can be compared with "
+        "holding longer. Not an order. Kept 14 days with the episode."
+    ),
     "scalp_shadow_rejects": (
         "SCALP shadow gate telemetry sampled per rejected setup. Not an order, fill, accounting "
         "or clock-v2 artifact and not referenced by any sealed lock. 30 days keeps a full month "
@@ -95,6 +103,8 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     RetentionPolicy("policy_episodes", "decided_at", 14, "epoch_seconds"),
     RetentionPolicy("policy_episode_checks", "checked_at", 14, "epoch_seconds"),
     RetentionPolicy("policy_group_scores", "scored_at", 14, "epoch_seconds"),
+    RetentionPolicy("policy_challenger_scores", "decided_at", 14, "epoch_seconds"),
+    RetentionPolicy("policy_horizon_marks", "marked_at", 14, "epoch_seconds"),
     RetentionPolicy("scalp_shadow_rejects", "created_at", 30, "iso_utc"),
     # strategy_runtime_audit writes ~160k rows/day — keep only 3 days (~480k rows max)
     RetentionPolicy("strategy_runtime_audit", "ts_utc", 3, "iso_utc"),

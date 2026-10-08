@@ -2355,11 +2355,11 @@ class PortfolioEngineIntegration:
                 return None
             return value if math.isfinite(value) else None
 
-        rank_of = {}
+        peer_values = {}
         for _sym in products:
             _key = _sym.upper().replace("-", "").replace("/", "")
-            rank_of[_key] = _policy_rank_value(by_symbol.get(_key))
-        _rank_order = sorted(rank_of, key=lambda key: (rank_of[key] is not None, rank_of[key] if rank_of[key] is not None else -1e99), reverse=True)
+            peer_values[_key] = _policy_rank_value(by_symbol.get(_key))
+        _rank_order = sorted(peer_values, key=lambda key: (peer_values[key] is not None, peer_values[key] if peer_values[key] is not None else -1e99), reverse=True)
         rank_of = {key: position for position, key in enumerate(_rank_order, start=1)}
 
         def _record_scalp_observation(row: dict, norm_key: str, *, signaled: bool, decision_code: str = "", decision_reason: str = "") -> dict:
@@ -2418,6 +2418,8 @@ class PortfolioEngineIntegration:
                     funded=armed,
                     reject_reason="" if armed else (decision_reason or decision_code or "NO_EXECUTABLE_NET_EDGE"),
                     decision_group_id=f"SCALP_V2:{float(cycle_ts):.6f}",
+                    features=micro_feats,
+                    peers=[value for key, value in peer_values.items() if key != norm_key and value is not None],
                 )
             except Exception:
                 logger.debug("POLICY_EPISODE_OPEN_FAILED symbol=%s", norm_key, exc_info=True)

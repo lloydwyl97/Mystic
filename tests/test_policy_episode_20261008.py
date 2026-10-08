@@ -313,6 +313,156 @@ def test_day_and_scalp_direct_state_stay_separate_and_rebuild(tmp_path, monkeypa
     assert rebuilt == live
 
 
+def test_state_prediction_is_frozen_before_the_outcome_and_engines_stay_separate(tmp_path, monkeypatch):
+    from backend.services import policy_state_learner as sl
+
+    db = str(tmp_path / "e.db")
+    pe.open_episode(
+        db,
+        candidate_id=1,
+        engine=DAY,
+        symbol="BTCUSDT",
+        setup="S",
+        regime="r",
+        entry_ask=100.0,
+        roundtrip_cost=0.00066,
+        economics={"policy_value": 0.01, "market_alpha": 0.02},
+        features={"atr15_pct": 0.01, "h1_ret": 0.03},
+        now=T0,
+    )
+
+    def _down(_db, _e, _s, _u, _r, unrealized, now=None, features=None):
+        del _db, _e, _s, _u, _r, now, features
+        return float(unrealized) - 0.01
+
+    monkeypatch.setattr(pe, "continuation_terminal", _down)
+    pe.advance_episodes(db, lambda _symbol: 99.0, now=T0 + 40.0)
+    with sqlite3.connect(db) as conn:
+        first = json.loads(conn.execute("SELECT snapshot_json FROM policy_episodes WHERE candidate_id=1").fetchone()[0])
+    assert first["state_predictions"]["n"] == 0.0
+    pe.open_episode(
+        db,
+        candidate_id=2,
+        engine=DAY,
+        symbol="ETHUSDT",
+        setup="S",
+        regime="r",
+        entry_ask=100.0,
+        roundtrip_cost=0.00066,
+        economics={"policy_value": -0.01, "market_alpha": -0.02},
+        features={"atr15_pct": 0.02},
+        now=T0 + 80.0,
+    )
+    pe.open_episode(
+        db,
+        candidate_id=3,
+        engine="SCALP_V2",
+        symbol="BTCUSDT",
+        setup="S",
+        regime="r",
+        entry_ask=100.0,
+        roundtrip_cost=0.00066,
+        economics={"policy_value": 0.01},
+        features={"obi_l5": 0.4},
+        now=T0 + 80.0,
+    )
+    with sqlite3.connect(db) as conn:
+        day = json.loads(conn.execute("SELECT snapshot_json FROM policy_episodes WHERE candidate_id=2").fetchone()[0])
+        scalp = json.loads(conn.execute("SELECT snapshot_json FROM policy_episodes WHERE candidate_id=3").fetchone()[0])
+        unchanged = json.loads(conn.execute("SELECT snapshot_json FROM policy_episodes WHERE candidate_id=1").fetchone()[0])
+    assert day["state_predictions"]["n"] == 1.0
+    assert scalp["state_predictions"]["n"] == 0.0
+    assert unchanged["state_predictions"]["n"] == 0.0
+    assert "policy_state_learner" not in inspect.getsource(al.day_net_expectancy)
+    names = sl.feature_names(DAY)
+    idx = names.index("market_alpha")
+    train = []
+    target = []
+    for value in (0.01, -0.01, 0.02, -0.02, 0.015, -0.015, 0.012, -0.008):
+        row = [0.0] * len(names)
+        row[idx] = value * 5.0
+        train.append(row)
+        target.append(value)
+    probe = [0.0] * len(names)
+    probe[idx] = 0.05
+    pred = sl._predict_row(sl._matrix(train), __import__("numpy").array(target), __import__("numpy").array(probe), names, None)
+    assert abs(pred["ridge"] - 0.01) < abs(pred["ridge_no_alpha"] - 0.01)
+
+
+def test_scoreboard_uses_the_stored_prediction_and_counts_misses(tmp_path):
+    from backend.services.policy_state_learner import score_predictions
+
+    scored = score_predictions([0.01, -0.01, -0.02, -0.03], [-0.002, 0.004, -0.001, -0.001])
+    assert scored["fp_count"] == 1 and scored["fp_net"] == pytest.approx(-0.002)
+    assert scored["missed_count"] == 1 and scored["missed_net"] == pytest.approx(0.004)
+    assert scored["selected_net"] == pytest.approx(-0.002)
+    assert scored["oracle_positive"] == pytest.approx(0.004)
+    db = str(tmp_path / "e.db")
+    for i, symbol in enumerate(pe.UNIVERSE):
+        pe.open_episode(
+            db,
+            candidate_id=i + 1,
+            engine=DAY,
+            symbol=symbol,
+            setup="S",
+            regime="r",
+            entry_ask=10.0,
+            roundtrip_cost=0.00066,
+            economics={"policy_value": 0.01},
+            now=T0,
+            decision_group_id="g",
+        )
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE policy_episodes SET status=?, net=?, learned=1, exit_at=? WHERE candidate_id=?", (pe.CLOSED, 0.001 * (i - 1), T0 + 10.0, i + 1))
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        pe._score_ready_groups(conn, T0 + 11.0)
+        conn.commit()
+        n = conn.execute("SELECT COUNT(*) FROM policy_challenger_scores").fetchone()[0]
+        positions = conn.execute("SELECT name FROM sqlite_master WHERE name='portfolio_engine_positions'").fetchone()
+    assert n >= 1 and positions is None
+
+
+def test_relative_target_uses_only_completed_prior_groups():
+    from backend.services.policy_state_learner import _relative_training
+
+    grouped = {"done": [([1.0], 0.002, "BTCUSDT"), ([1.0], -0.004, "ETHUSDT"), ([0.0], 0.001, "SOLUSDT"), ([0.0], 0.001, "XRPUSDT")], "open": [([9.0], 0.5, "BTCUSDT")]}
+    train = _relative_training(grouped)
+    assert train is not None and len(train[1]) == 4
+    assert float(sum(train[1])) == pytest.approx(0.0)
+
+
+def test_a_later_bid_does_not_rewrite_the_policy_result(tmp_path):
+    db = str(tmp_path / "e.db")
+    pe.open_episode(db, candidate_id=1, engine=DAY, symbol="BTCUSDT", setup="S", regime="r", entry_ask=100.0, roundtrip_cost=0.00066, now=T0)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE policy_episodes SET status=?, net=?, exit_at=?, learned=1 WHERE candidate_id=1", (pe.CLOSED, -0.001, T0))
+        conn.row_factory = sqlite3.Row
+        from backend.services.policy_state_learner import record_due_horizons
+
+        record_due_horizons(conn, lambda _symbol: 101.0, T0 + 120.0)
+        conn.commit()
+        net, mark = conn.execute("SELECT net, (SELECT net FROM policy_horizon_marks) FROM policy_episodes").fetchone()
+    assert net == pytest.approx(-0.001)
+    assert mark != pytest.approx(net)
+
+
+def test_no_hardcoded_rule_and_no_promotion():
+    import re
+
+    from backend.services import policy_state_learner as sl
+    from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
+
+    src = inspect.getsource(sl)
+    assert re.search(r"if\s+rsi\b", src, re.IGNORECASE) is None
+    assert "rsi >" not in src
+    for word in ("min_hold", "min_trades", "blacklist"):
+        assert re.search(rf"\b{word}\b", src, re.IGNORECASE) is None
+    fund = inspect.getsource(PortfolioEngineIntegration._fund_day_v2_candidate)
+    assert "policy_state_learner" not in fund
+    assert "state_predictions" not in fund
+
+
 def test_recovery_does_not_invent_a_direct_prediction(tmp_path):
     db = str(tmp_path / "e.db")
     _open(db)

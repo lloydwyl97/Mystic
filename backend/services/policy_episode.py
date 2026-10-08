@@ -164,6 +164,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE policy_episodes ADD COLUMN {name} {decl}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_policy_episodes_open ON policy_episodes(status, decided_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_policy_episodes_group ON policy_episodes(decision_group_id, symbol)")
+    from backend.services.policy_state_learner import ensure_schema as ensure_state_schema
+
+    ensure_state_schema(conn)
     conn.execute(
         """
         UPDATE policy_episodes
@@ -359,6 +362,8 @@ def open_episode(
     decision_group_id: str | None = None,
     funded: bool = False,
     reject_reason: str = "",
+    features: dict[str, Any] | None = None,
+    peers: list[float] | None = None,
 ) -> int | None:
     """Open one research episode. Invalid asks are skipped. A second call is a no-op."""
     ask = float(entry_ask or 0.0)
@@ -384,6 +389,16 @@ def open_episode(
         entry_ask=ask,
         roundtrip_cost=cost,
     )
+    try:
+        from backend.services.policy_state_learner import freeze_prediction
+
+        issued = dict(snap.get("issued") or {})
+        issued["expected_cost"] = cost
+        frozen = freeze_prediction(db_path, engine=engine, features=features, issued=issued, symbol=symbol, peers=peers)
+        snap["state_features"] = frozen["features"]
+        snap["state_predictions"] = frozen["predictions"]
+    except Exception:
+        logger.debug("POLICY_STATE_PREDICT_FAILED", exc_info=True)
     prediction_at = _num((snap.get("direct_policy") or {}).get("prediction_at"))
     conn = _connect(db_path)
     try:
@@ -592,10 +607,13 @@ def _score_group(conn: sqlite3.Connection, group_id: str, moment: float) -> None
         primaries.append(
             {
                 "symbol": symbol,
+                "engine": str(chosen["engine_id"]),
+                "decided_at": float(chosen["decided_at"]),
                 "episode_id": int(chosen["id"]),
                 "net": float(chosen["net"]),
                 "live": _num(issued.get("policy_value")),
                 "direct": _num(direct.get("mean")),
+                "state": snap.get("state_predictions") if isinstance(snap.get("state_predictions"), dict) else {},
             }
         )
     nets = [row["net"] for row in primaries]
@@ -644,6 +662,12 @@ def _score_group(conn: sqlite3.Connection, group_id: str, moment: float) -> None
             moment,
         ),
     )
+    try:
+        from backend.services.policy_state_learner import score_group
+
+        score_group(conn, group_id, primaries, moment)
+    except Exception:
+        logger.debug("POLICY_CHALLENGER_SCORE_FAILED", exc_info=True)
 
 
 def _refresh_summary(conn: sqlite3.Connection, engine: str, moment: float) -> None:
@@ -885,6 +909,12 @@ def advance_episodes(
             # opens the database itself, and an open write here would wait on it.
             conn.commit()
         _score_ready_groups(conn, moment)
+        try:
+            from backend.services.policy_state_learner import record_due_horizons
+
+            record_due_horizons(conn, bid_at, moment)
+        except Exception:
+            logger.debug("POLICY_HORIZON_MARK_FAILED", exc_info=True)
         conn.commit()
     finally:
         conn.close()
@@ -931,6 +961,11 @@ def open_recorded_day(db_path: str, cand: dict[str, Any], candidate_id: int | No
     moment = float(cand.get("as_of") or time.time())
     value = _num((econ or {}).get("policy_value"))
     funded = value is not None and value > 0.0
+    peers = []
+    for alt in cand.get("alternatives") or []:
+        peer = _num(alt.get("expected_net")) if isinstance(alt, dict) else None
+        if peer is not None:
+            peers.append(peer)
     return open_episode(
         db_path,
         candidate_id=int(candidate_id),
@@ -947,6 +982,8 @@ def open_recorded_day(db_path: str, cand: dict[str, Any], candidate_id: int | No
         decision_group_id=f"{DAY_ENGINE}:{moment:.6f}",
         funded=funded,
         reject_reason="" if funded else "NO_EXECUTABLE_NET_EDGE",
+        features=cand.get("state_features") if isinstance(cand.get("state_features"), dict) else None,
+        peers=peers,
     )
 
 
@@ -982,6 +1019,8 @@ def open_recorded_scalp(
     funded: bool = False,
     reject_reason: str = "",
     decision_group_id: str | None = None,
+    features: dict[str, Any] | None = None,
+    peers: list[float] | None = None,
 ) -> int | None:
     if not candidate_id:
         return None
@@ -1002,6 +1041,8 @@ def open_recorded_scalp(
         decision_group_id=decision_group_id or f"{SCALP_ENGINE}:{moment:.6f}",
         funded=funded,
         reject_reason=reject_reason,
+        features=features,
+        peers=peers,
     )
 
 
