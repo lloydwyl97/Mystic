@@ -1469,6 +1469,38 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features:
     }
 
 
+def close_learning_net_pct(
+    *,
+    fill_net_pct: float | None = None,
+    exit_price: float | None = None,
+    entry_price: float = 0.0,
+    flat_cost: float = 0.0,
+) -> float | None:
+    """Net a close teaches the entry learner.
+
+    A venue fill net is the actual executable result after the fill price and
+    the fees that fill paid. It is used as-is. The mark-minus-flat-cost figure
+    is only the fallback when no fill net was recorded, so a ticker that equals
+    the entry cannot replace the fill with the model round-trip.
+    """
+    if fill_net_pct is not None:
+        try:
+            filled = float(fill_net_pct)
+        except (TypeError, ValueError):
+            filled = float("nan")
+        if math.isfinite(filled):
+            return filled
+    try:
+        exit_px = float(exit_price) if exit_price is not None else float("nan")
+        entry = float(entry_price)
+        cost = float(flat_cost)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(exit_px) and math.isfinite(entry) and entry > 0.0 and math.isfinite(cost)):
+        return None
+    return (exit_px - entry) / entry - cost
+
+
 def learn_from_close(
     db_path: str,
     *,
@@ -3519,6 +3551,7 @@ __all__ = [
     "abstention_report",
     "adaptive_state_report",
     "calibration_report",
+    "close_learning_net_pct",
     "close_lineage",
     "continuation_learner",
     "continuation_ratio",

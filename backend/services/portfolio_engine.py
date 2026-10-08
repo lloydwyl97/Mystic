@@ -7119,6 +7119,7 @@ class PortfolioEngine:
         dust_qty: float = 0.0,
         dust_notional: float = 0.0,
         exit_reporting: dict[str, Any] | None = None,
+        actual_net_pct: float | None = None,
     ) -> None:
         """
         Unified learning sink for non-AI close events (HUMAN_MANUAL_SELL,
@@ -7136,10 +7137,15 @@ class PortfolioEngine:
 
             entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
             qty = float(getattr(position, "quantity", 0.0) or 0.0)
-            net_pct: float | None = None
-            if exit_price is not None and entry_price > 0 and qty > 0 and realized_profit is not None:
-                gross_pct = (float(exit_price) - entry_price) / entry_price
-                net_pct = gross_pct - ESTIMATED_ROUNDTRIP_COST
+            from backend.services.adaptive_learning import close_learning_net_pct
+
+            net_pct = close_learning_net_pct(fill_net_pct=actual_net_pct)
+            if net_pct is None and exit_price is not None and entry_price > 0 and qty > 0 and realized_profit is not None:
+                net_pct = close_learning_net_pct(
+                    exit_price=float(exit_price),
+                    entry_price=entry_price,
+                    flat_cost=float(ESTIMATED_ROUNDTRIP_COST),
+                )
             reporting = dict(exit_reporting or {})
             decision_mark_pnl_pct = reporting.get("decision_mark_pnl_pct")
             reporting.get("decision_mark_pnl_usd")
@@ -15327,11 +15333,12 @@ class PortfolioEngine:
                 close_reason=learning_close_reason,
                 manual_sell=False,
                 source=exit_trigger or exit_type.value,
-                exit_price=float(price),
+                exit_price=float(fill_price),
                 realized_profit=float(realized_pnl),
                 cooldown_until=wall_cooldown_until,
                 fill_found=True,
                 exit_reporting=exit_reporting,
+                actual_net_pct=float(pnl_pct_net),
             )
 
         with contextlib.suppress(Exception):
