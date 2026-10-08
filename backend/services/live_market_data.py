@@ -261,15 +261,23 @@ class LiveMarketDataService:
         self._tasks = [
             await task_manager.create_task(self._ticker_loop(), name="live_market_data:ticker_loop"),
             await task_manager.create_task(self._ohlcv_loop(), name="live_market_data:ohlcv_loop"),
-            await task_manager.create_task(self._external_discovery(), name="live_market_data:external_discovery"),
         ]
+        from backend.config.research_flags import cross_venue_research_enabled
+
+        if cross_venue_research_enabled():
+            self._tasks.append(await task_manager.create_task(self._external_discovery(), name="live_market_data:external_discovery"))
         try:
             from backend.services.canonical_candle_pipeline import canonical_candle_pipeline
 
             await canonical_candle_pipeline.start()
         except Exception as exc:
             logger.warning("canonical candle pipeline start failed: %s", exc)
-        logger.info("LiveMarketDataService started (Binance.US books plus Coinbase and Kraken discovery)")
+        from backend.config.research_flags import cross_venue_research_enabled
+
+        if cross_venue_research_enabled():
+            logger.info("LiveMarketDataService started (Binance.US books; Coinbase and Kraken research on)")
+        else:
+            logger.info("LiveMarketDataService started (Binance.US books; outside-venue research off)")
 
     async def _external_discovery(self) -> None:
         """Outside-venue prices. A socket failure stays in this task."""

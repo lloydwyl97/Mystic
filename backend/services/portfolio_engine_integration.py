@@ -1819,9 +1819,12 @@ class PortfolioEngineIntegration:
                 except Exception:
                     logger.debug("DAY_V2_CANDIDATE_RECORD_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
                 try:
-                    from backend.services.policy_episode import open_recorded_day
+                    from backend.config.research_flags import policy_research_enabled
 
-                    open_recorded_day(db_path, cand, cand.get("markout_id"))
+                    if policy_research_enabled():
+                        from backend.services.policy_episode import open_recorded_day
+
+                        open_recorded_day(db_path, cand, cand.get("markout_id"))
                 except Exception:
                     logger.debug("POLICY_EPISODE_OPEN_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
             for cand in ranked:
@@ -2394,6 +2397,10 @@ class PortfolioEngineIntegration:
             if signaled:
                 row["markout_id"] = markout_id
             try:
+                from backend.config.research_flags import policy_research_enabled
+
+                if not policy_research_enabled():
+                    return {"setup": setup_name, "regime": regime, "features": micro_feats, "ref_price": ref_price, "markout_id": markout_id}
                 from backend.services.policy_episode import open_recorded_scalp
 
                 live_value = None
@@ -2992,9 +2999,12 @@ class PortfolioEngineIntegration:
                 await self._monitor_positions_once(refresh_market_data=False)
                 if self.engine is not None:
                     try:
-                        from backend.services.policy_episode import advance_live
+                        from backend.config.research_flags import policy_research_enabled
 
-                        advance_live(self.engine.db_path)
+                        if policy_research_enabled():
+                            from backend.services.policy_episode import advance_live
+
+                            advance_live(self.engine.db_path)
                     except Exception:
                         logger.debug("POLICY_EPISODE_ADVANCE_FAILED", exc_info=True)
 
