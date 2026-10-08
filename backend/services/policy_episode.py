@@ -399,6 +399,14 @@ def open_episode(
         snap["state_predictions"] = frozen["predictions"]
     except Exception:
         logger.debug("POLICY_STATE_PREDICT_FAILED", exc_info=True)
+    try:
+        from backend.services.external_policy_learn import capture_external
+
+        external = capture_external(db_path, str(engine), str(symbol))
+        if external is not None:
+            snap["external_discovery"] = external
+    except Exception:
+        logger.debug("EXTERNAL_DISCOVERY_SNAPSHOT_FAILED", exc_info=True)
     prediction_at = _num((snap.get("direct_policy") or {}).get("prediction_at"))
     episode_id = None
     conn = _connect(db_path)
@@ -506,6 +514,9 @@ def _close(conn: sqlite3.Connection, row: sqlite3.Row, *, kind: str, net: float,
             conn.execute("RELEASE mystic_policy_episode")
             return
         _learn(conn, row, float(net), moment)
+        from backend.services.external_policy_learn import apply_external_outcome
+
+        apply_external_outcome(conn, row, float(net), moment)
         if kind == REAL:
             _record_parity(conn, row, float(net), moment)
         conn.execute("RELEASE mystic_policy_episode")

@@ -261,6 +261,7 @@ class LiveMarketDataService:
         self._tasks = [
             await task_manager.create_task(self._ticker_loop(), name="live_market_data:ticker_loop"),
             await task_manager.create_task(self._ohlcv_loop(), name="live_market_data:ohlcv_loop"),
+            await task_manager.create_task(self._external_discovery(), name="live_market_data:external_discovery"),
         ]
         try:
             from backend.services.canonical_candle_pipeline import canonical_candle_pipeline
@@ -268,7 +269,18 @@ class LiveMarketDataService:
             await canonical_candle_pipeline.start()
         except Exception as exc:
             logger.warning("canonical candle pipeline start failed: %s", exc)
-        logger.info("LiveMarketDataService started (Binance.US only; canonical candle writer)")
+        logger.info("LiveMarketDataService started (Binance.US books plus Coinbase and Kraken discovery)")
+
+    async def _external_discovery(self) -> None:
+        """Outside-venue prices. A socket failure stays in this task."""
+        try:
+            from backend.services.external_venue_feed import external_discovery_loop
+
+            await external_discovery_loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("external discovery stopped", exc_info=True)
 
     async def _get_limiter(self) -> BinanceWeightLimiter:
         """Return shared Binance weight limiter for market data REST calls."""
