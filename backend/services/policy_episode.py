@@ -400,6 +400,7 @@ def open_episode(
     except Exception:
         logger.debug("POLICY_STATE_PREDICT_FAILED", exc_info=True)
     prediction_at = _num((snap.get("direct_policy") or {}).get("prediction_at"))
+    episode_id = None
     conn = _connect(db_path)
     try:
         ensure_schema(conn)
@@ -438,9 +439,16 @@ def open_episode(
             )
         conn.commit()
         row = conn.execute("SELECT id FROM policy_episodes WHERE candidate_id=?", (int(candidate_id),)).fetchone()
-        return None if row is None else int(row[0])
+        episode_id = None if row is None else int(row[0])
     finally:
         conn.close()
+    try:
+        from backend.services.policy_group_learner import attach_group_prediction
+
+        attach_group_prediction(db_path, group, str(engine))
+    except Exception:
+        logger.debug("POLICY_GROUP_PREDICT_FAILED", exc_info=True)
+    return episode_id
 
 
 def decision_from_check(unrealized: float, advantage: float | None) -> str:
@@ -614,6 +622,7 @@ def _score_group(conn: sqlite3.Connection, group_id: str, moment: float) -> None
                 "live": _num(issued.get("policy_value")),
                 "direct": _num(direct.get("mean")),
                 "state": snap.get("state_predictions") if isinstance(snap.get("state_predictions"), dict) else {},
+                "group_predictions": snap.get("group_predictions") if isinstance(snap.get("group_predictions"), dict) else {},
             }
         )
     nets = [row["net"] for row in primaries]
@@ -666,6 +675,9 @@ def _score_group(conn: sqlite3.Connection, group_id: str, moment: float) -> None
         from backend.services.policy_state_learner import score_group
 
         score_group(conn, group_id, primaries, moment)
+        from backend.services.policy_group_learner import score_stored_group
+
+        score_stored_group(conn, group_id, primaries, moment)
     except Exception:
         logger.debug("POLICY_CHALLENGER_SCORE_FAILED", exc_info=True)
 
