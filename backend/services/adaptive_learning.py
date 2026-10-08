@@ -91,6 +91,8 @@ _PRIORS: dict[str, dict[str, float]] = {
         # Realized policy net minus the policy value predicted at entry.
         # Prior 0. Losses pull the next forecast down; wins can pull it up.
         "policy_calibration": 0.0,
+        # Research-only mean of resolved policy-episode nets. Entry ranking does not read it.
+        "direct_policy_net": 0.0,
         "hold_remaining_up": 0.0,
         "hold_remaining_down": 0.0,
         "markout_forward": 0.0,
@@ -106,6 +108,8 @@ _PRIORS: dict[str, dict[str, float]] = {
         # Realized policy net minus the policy value predicted at entry.
         # Prior 0. Losses pull the next forecast down; wins can pull it up.
         "policy_calibration": 0.0,
+        # Research-only mean of resolved policy-episode nets. SCALP entry does not read it.
+        "direct_policy_net": 0.0,
         "hold_remaining_up": 0.0,
         "hold_remaining_down": 0.0,
         "trade_time_to_mfe_min": 8.0,
@@ -182,6 +186,7 @@ MEAN_FORM_METRICS = frozenset(
         "trade_net",
         "policy_gap",
         "policy_calibration",
+        "direct_policy_net",
         "hold_remaining_up",
         "hold_remaining_down",
         *CLAIM_MOMENT_METRICS,

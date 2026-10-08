@@ -1818,6 +1818,12 @@ class PortfolioEngineIntegration:
                     cand["markout_id"] = self._record_day_v2_candidate(db_path, cand, CANDIDATE_QUALIFIED)
                 except Exception:
                     logger.debug("DAY_V2_CANDIDATE_RECORD_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
+                try:
+                    from backend.services.policy_episode import open_recorded_day
+
+                    open_recorded_day(db_path, cand, cand.get("markout_id"))
+                except Exception:
+                    logger.debug("POLICY_EPISODE_OPEN_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
             for cand in ranked:
                 try:
                     await self._fund_day_v2_candidate(cand, db_path)
@@ -2365,6 +2371,22 @@ class PortfolioEngineIntegration:
             )
             if signaled:
                 row["markout_id"] = markout_id
+            try:
+                from backend.services.policy_episode import open_recorded_scalp
+
+                open_recorded_scalp(
+                    self.engine.db_path,
+                    candidate_id=markout_id,
+                    symbol=norm_key,
+                    setup=setup_name,
+                    regime=regime,
+                    entry_ask=ref_price,
+                    roundtrip_cost=canonical_roundtrip_cost_pct(spread_pct=(float(micro_feats["spread_pct"]) if micro_feats.get("spread_pct") is not None else None)),
+                    economics=(row.get("executable_edge") or {}).get("economic") if isinstance((row.get("executable_edge") or {}).get("economic"), dict) else None,
+                    now=float(cycle_ts),
+                )
+            except Exception:
+                logger.debug("POLICY_EPISODE_OPEN_FAILED symbol=%s", norm_key, exc_info=True)
             return {"setup": setup_name, "regime": regime, "features": micro_feats, "ref_price": ref_price, "markout_id": markout_id}
 
         def _scalp_priority(sym_raw: str) -> float:
@@ -2932,6 +2954,13 @@ class PortfolioEngineIntegration:
         while self.is_running:
             try:
                 await self._monitor_positions_once(refresh_market_data=False)
+                if self.engine is not None:
+                    try:
+                        from backend.services.policy_episode import advance_live
+
+                        advance_live(self.engine.db_path)
+                    except Exception:
+                        logger.debug("POLICY_EPISODE_ADVANCE_FAILED", exc_info=True)
 
                 from backend.config.protected_execution import MANDATORY_EXIT_PENDING_RETRY_SEC
 

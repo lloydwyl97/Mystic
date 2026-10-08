@@ -64,6 +64,14 @@ RETENTION_JUSTIFICATION: dict[str, str] = {
         "horizon). Not live P&L. Kept 7 days with the states they describe; the longest DAY "
         "horizon is 12h, so a week covers resolution plus a re-run."
     ),
+    "policy_episodes": (
+        "Research-only virtual positions. They are not orders, cash, or account P&L. "
+        "14 days covers continuation resolution and a replay of the entry-time policy trace."
+    ),
+    "policy_episode_checks": (
+        "Immutable continuation decisions for policy episodes. Kept with the episodes, 14 days. "
+        "A replay reads these rows and does not recompute them on a later model."
+    ),
     "scalp_shadow_rejects": (
         "SCALP shadow gate telemetry sampled per rejected setup. Not an order, fill, accounting "
         "or clock-v2 artifact and not referenced by any sealed lock. 30 days keeps a full month "
@@ -80,6 +88,8 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     RetentionPolicy("book_queue_chunks", "chunk_start", 7, "epoch_seconds"),
     RetentionPolicy("research_market_states", "decision_ts", 7, "epoch_seconds"),
     RetentionPolicy("research_market_labels", "decision_ts", 7, "epoch_seconds"),
+    RetentionPolicy("policy_episodes", "decided_at", 14, "epoch_seconds"),
+    RetentionPolicy("policy_episode_checks", "checked_at", 14, "epoch_seconds"),
     RetentionPolicy("scalp_shadow_rejects", "created_at", 30, "iso_utc"),
     # strategy_runtime_audit writes ~160k rows/day — keep only 3 days (~480k rows max)
     RetentionPolicy("strategy_runtime_audit", "ts_utc", 3, "iso_utc"),
