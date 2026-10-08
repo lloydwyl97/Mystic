@@ -299,10 +299,11 @@ def _closed_rows(db_path: str, engine: str) -> list[sqlite3.Row]:
         return list(
             conn.execute(
                 """
-                SELECT symbol, decided_at, exit_at, net, decision_group_id, snapshot_json
-                FROM policy_episodes
-                WHERE engine_id=? AND status='CLOSED' AND net IS NOT NULL
-                ORDER BY exit_at DESC, id DESC
+                SELECT e.symbol, e.decided_at, e.exit_at, e.net, e.decision_group_id, e.snapshot_json, m.features_json
+                FROM policy_episodes e
+                LEFT JOIN adaptive_candidate_markouts m ON m.id = e.candidate_id
+                WHERE e.engine_id=? AND e.status='CLOSED' AND e.net IS NOT NULL
+                ORDER BY e.exit_at DESC, e.id DESC
                 LIMIT ?
                 """,
                 (str(engine), MAX_TRAIN),
@@ -312,6 +313,28 @@ def _closed_rows(db_path: str, engine: str) -> list[sqlite3.Row]:
         return []
     finally:
         conn.close()
+
+
+def _training_vector(row: sqlite3.Row, engine: str) -> list[float] | None:
+    """Feature vector known at the decision. The resolved net is not an input."""
+    names = feature_names(engine)
+    stored = _stored_x(str(row["snapshot_json"]))
+    if stored is not None and len(stored) == len(names):
+        return stored
+    try:
+        snap = json.loads(row["snapshot_json"] or "{}")
+        try:
+            raw_feats = row["features_json"]
+        except IndexError:
+            raw_feats = "{}"
+        feats = json.loads(raw_feats or "{}")
+    except (json.JSONDecodeError, IndexError):
+        return None
+    issued = snap.get("issued") if isinstance(snap, dict) and isinstance(snap.get("issued"), dict) else {}
+    issued = dict(issued)
+    if isinstance(snap, dict):
+        issued.setdefault("expected_cost", snap.get("expected_cost"))
+    return vector(engine, feats if isinstance(feats, dict) else {}, issued, str(row["symbol"]), None)
 
 
 def _stored_x(raw: str) -> list[float] | None:
@@ -345,7 +368,7 @@ def freeze_prediction(
     ys: list[float] = []
     groups: dict[str, list[tuple[list[float], float, str]]] = {}
     for row in prior:
-        feat = _stored_x(str(row["snapshot_json"]))
+        feat = _training_vector(row, engine)
         if feat is None or len(feat) != len(names):
             continue
         xs.append(feat)
