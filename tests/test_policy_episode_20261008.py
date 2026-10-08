@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import sqlite3
 
 import pytest
@@ -175,3 +176,153 @@ def test_no_trade_opinion_and_no_sample_gate():
     src = inspect.getsource(pe)
     for word in ("rsi", "min_hold", "min_trades", "blacklist"):
         assert re.search(rf"\b{word}\b", src, re.IGNORECASE) is None
+
+
+def _prediction(db: str) -> float:
+    with sqlite3.connect(db) as conn:
+        raw = conn.execute("SELECT snapshot_json FROM policy_episodes").fetchone()[0]
+    return json.loads(raw)["direct_policy"]["mean"]
+
+
+def test_prediction_is_stored_before_the_outcome_and_is_not_rewritten(tmp_path, monkeypatch):
+    db = str(tmp_path / "e.db")
+    _open(db)
+    before = _prediction(db)
+    with sqlite3.connect(db) as conn:
+        prediction_at, exit_at = conn.execute("SELECT prediction_at, exit_at FROM policy_episodes").fetchone()
+        snap = json.loads(conn.execute("SELECT snapshot_json FROM policy_episodes").fetchone()[0])
+    assert prediction_at == pytest.approx(T0)
+    assert exit_at is None
+    assert snap["direct_policy"]["source"] == pe.PREDICTION_SOURCE
+    assert snap["issued"]["policy_value"] == pytest.approx(0.001)
+    assert snap["episode_id"] == 1
+
+    def _down(_db, _e, _s, _u, _r, unrealized, now=None, features=None):
+        del _db, _e, _s, _u, _r, now, features
+        return float(unrealized) - 0.01
+
+    monkeypatch.setattr(pe, "continuation_terminal", _down)
+    pe.advance_episodes(db, lambda _symbol: 99.0, now=T0 + 40.0)
+    with sqlite3.connect(db) as conn:
+        after = json.loads(conn.execute("SELECT snapshot_json FROM policy_episodes").fetchone()[0])
+        exit_at, learned, n = conn.execute(
+            "SELECT e.exit_at, e.learned, s.n FROM policy_episodes e JOIN adaptive_metric_state s ON s.metric='direct_policy_net'"
+        ).fetchone()
+    assert after["direct_policy"]["mean"] == pytest.approx(before)
+    assert after["direct_policy"]["prediction_at"] < exit_at
+    assert learned == 1 and n == pytest.approx(1.0)
+
+
+def test_four_symbols_share_one_decision_group_and_rank_on_stored_predictions(tmp_path):
+    db = str(tmp_path / "e.db")
+    values = {"BTCUSDT": 0.004, "ETHUSDT": 0.001, "SOLUSDT": -0.002, "XRPUSDT": 0.003}
+    nets = {"BTCUSDT": -0.0002, "ETHUSDT": 0.0008, "SOLUSDT": 0.0001, "XRPUSDT": 0.0004}
+    for i, symbol in enumerate(pe.UNIVERSE):
+        pe.open_episode(
+            db,
+            candidate_id=i + 1,
+            engine=DAY,
+            symbol=symbol,
+            setup="S",
+            regime="r",
+            entry_ask=10.0,
+            roundtrip_cost=0.00066,
+            economics={"policy_value": values[symbol], "market_alpha": -0.01, "policy_gap": 0.02, "uncalibrated_policy_value": 0.005, "policy_calibration": -0.001},
+            now=T0,
+            decision_group_id="DAY_V2:test",
+            funded=values[symbol] > 0,
+        )
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE policy_episodes SET status=?, net=?, learned=1, exit_at=? WHERE candidate_id=?", (pe.CLOSED, nets[symbol], T0 + 30.0, i + 1))
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        pe._score_ready_groups(conn, T0 + 31.0)
+        conn.commit()
+        groups = {row[0] for row in conn.execute("SELECT decision_group_id FROM policy_episodes")}
+        score = conn.execute("SELECT best_net, live_selected_net, direct_selected_net, oracle_net, predictions_complete FROM policy_group_scores").fetchone()
+    assert groups == {"DAY_V2:test"}
+    assert score[4] == 1
+    assert score[0] == pytest.approx(max(nets.values()))
+    # Live prefers BTC (0.004). Direct predictions are still the prior, so direct abstains.
+    assert score[1] == pytest.approx(nets["BTCUSDT"])
+    assert score[2] == pytest.approx(0.0)
+    assert score[3] == pytest.approx(max(nets.values()))
+    assert "m15" not in inspect.getsource(pe._score_group)
+
+
+def test_a_real_hold_keeps_the_continuation_check_and_closes_on_the_accounting_net(tmp_path, monkeypatch):
+    db = str(tmp_path / "e.db")
+    row_id = al.record_candidate(
+        db,
+        engine=DAY,
+        symbol="BTCUSDT",
+        setup="S",
+        regime="r",
+        ref_price=100.0,
+        roundtrip_cost=0.00066,
+        signaled=True,
+        evaluated_at=T0,
+        economic={"policy_value": 0.001},
+    )
+    pe.open_episode(db, candidate_id=row_id, engine=DAY, symbol="BTCUSDT", setup="S", regime="r", entry_ask=100.0, roundtrip_cost=0.00066, now=T0)
+    assert al.mark_candidate_filled(db, row_id)
+
+    def _down(_db, _e, _s, _u, _r, unrealized, now=None, features=None):
+        del _db, _e, _s, _u, _r, now, features
+        return float(unrealized) - 0.02
+
+    monkeypatch.setattr(pe, "continuation_terminal", _down)
+    pe.advance_episodes(db, lambda _symbol: 99.0, now=T0 + 30.0)
+    with sqlite3.connect(db) as conn:
+        status, learned, action = conn.execute(
+            "SELECT e.status, e.learned, c.action FROM policy_episodes e JOIN policy_episode_checks c ON c.episode_id=e.id"
+        ).fetchone()
+    assert status == pe.OPEN and learned == 0 and action == "exit"
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE adaptive_candidate_markouts SET realized_net=? WHERE id=?", (-0.0004, row_id))
+    pe.advance_episodes(db, lambda _symbol: 50.0, now=T0 + 90.0)
+    with sqlite3.connect(db) as conn:
+        kind, net, checks = conn.execute(
+            "SELECT kind, net, (SELECT COUNT(*) FROM policy_episode_checks) FROM policy_episodes"
+        ).fetchone()
+        parity = conn.execute("SELECT accounting_net, last_check_action FROM policy_fill_parity").fetchone()
+    assert kind == pe.REAL and net == pytest.approx(-0.0004) and checks == 1
+    assert parity[0] == pytest.approx(-0.0004) and parity[1] == "exit"
+
+
+def test_day_and_scalp_direct_state_stay_separate_and_rebuild(tmp_path, monkeypatch):
+    db = str(tmp_path / "e.db")
+    other = str(tmp_path / "rebuild.db")
+
+    def _down(_db, _e, _s, _u, _r, unrealized, now=None, features=None):
+        del _db, _e, _s, _u, _r, now, features
+        return float(unrealized) - 0.01
+
+    monkeypatch.setattr(pe, "continuation_terminal", _down)
+    pe.open_episode(db, candidate_id=1, engine="SCALP_V2", symbol="BTCUSDT", setup="S", regime="r", entry_ask=100.0, roundtrip_cost=0.00066, now=T0)
+    pe.advance_episodes(db, lambda _symbol: 101.0, now=T0 + 30.0)
+    pe.open_episode(db, candidate_id=2, engine=DAY, symbol="ETHUSDT", setup="S", regime="r", entry_ask=100.0, roundtrip_cost=0.00066, now=T0 + 60.0)
+    pe.advance_episodes(db, lambda _symbol: 99.0, now=T0 + 100.0)
+    with sqlite3.connect(db) as conn:
+        engines = {row[0] for row in conn.execute("SELECT engine_id FROM adaptive_metric_state WHERE metric='direct_policy_net'")}
+        live = conn.execute("SELECT engine_id, symbol, ewma, n FROM adaptive_metric_state WHERE metric='direct_policy_net' ORDER BY engine_id, symbol").fetchall()
+    assert engines == {"DAY_V2", "SCALP_V2"}
+    assert pe.rebuild_direct_policy(db, other) == 2
+    with sqlite3.connect(other) as conn:
+        rebuilt = conn.execute("SELECT engine_id, symbol, ewma, n FROM adaptive_metric_state WHERE metric='direct_policy_net' ORDER BY engine_id, symbol").fetchall()
+    assert rebuilt == live
+
+
+def test_recovery_does_not_invent_a_direct_prediction(tmp_path):
+    db = str(tmp_path / "e.db")
+    _open(db)
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        raw = json.loads(conn.execute("SELECT snapshot_json FROM policy_episodes").fetchone()[0])
+        raw.pop("direct_policy")
+        conn.execute("UPDATE policy_episodes SET snapshot_json=?, recovered=0", (json.dumps(raw),))
+        pe._recover_issued(conn)
+        conn.commit()
+        restored = json.loads(conn.execute("SELECT snapshot_json FROM policy_episodes").fetchone()[0])
+    assert "direct_policy" not in restored
+    assert restored["issued"]["policy_value"] == pytest.approx(0.001)

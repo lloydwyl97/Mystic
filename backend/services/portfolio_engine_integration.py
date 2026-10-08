@@ -2343,11 +2343,33 @@ class PortfolioEngineIntegration:
             except Exception:
                 return {}
 
-        def _record_scalp_observation(row: dict, norm_key: str, *, signaled: bool) -> dict:
+        from backend.services.policy_episode import economics_of as _policy_economics
+
+        def _policy_rank_value(row: dict | None) -> float | None:
+            econ = _policy_economics((row or {}).get("executable_edge"))
+            if not isinstance(econ, dict):
+                return None
+            try:
+                value = float(econ.get("policy_value"))
+            except (TypeError, ValueError):
+                return None
+            return value if math.isfinite(value) else None
+
+        rank_of = {}
+        for _sym in products:
+            _key = _sym.upper().replace("-", "").replace("/", "")
+            rank_of[_key] = _policy_rank_value(by_symbol.get(_key))
+        _rank_order = sorted(rank_of, key=lambda key: (rank_of[key] is not None, rank_of[key] if rank_of[key] is not None else -1e99), reverse=True)
+        rank_of = {key: position for position, key in enumerate(_rank_order, start=1)}
+
+        def _record_scalp_observation(row: dict, norm_key: str, *, signaled: bool, decision_code: str = "", decision_reason: str = "") -> dict:
             setup_name = str(row.get("best_setup") or "SCALP_STRUCTURAL")
             regime = str(row.get("adaptive_regime") or "") or market_regime_tag(self.engine.db_path, norm_key) or ""
             micro_feats = _scalp_book(norm_key)
-            raw_move = (row.get("executable_edge") or {}).get("raw_expected_move_pct")
+            edge = row.get("executable_edge")
+            edge_dict = edge if isinstance(edge, dict) else {}
+            econ = _policy_economics(edge)
+            raw_move = edge_dict.get("raw_expected_move_pct")
             if raw_move is not None:
                 micro_feats = {**micro_feats, "structural_projection": float(raw_move or 0.0)}
             snap = row.get("snap")
@@ -2365,15 +2387,22 @@ class PortfolioEngineIntegration:
                 roundtrip_cost=canonical_roundtrip_cost_pct(spread_pct=(float(micro_feats["spread_pct"]) if micro_feats.get("spread_pct") is not None else None)),
                 signaled=signaled,
                 features=micro_feats,
-                raw_expected_move=(row.get("executable_edge") or {}).get("raw_expected_move_pct"),
-                raw_move_source=(row.get("executable_edge") or {}).get("raw_move_source") or (row.get("rank_meta") or {}).get("edge_source") or "NONE",
-                economic=(row.get("executable_edge") or {}).get("economic"),
+                raw_expected_move=edge_dict.get("raw_expected_move_pct"),
+                raw_move_source=edge_dict.get("raw_move_source") or (row.get("rank_meta") or {}).get("edge_source") or "NONE",
+                economic=econ,
             )
             if signaled:
                 row["markout_id"] = markout_id
             try:
                 from backend.services.policy_episode import open_recorded_scalp
 
+                live_value = None
+                if isinstance(econ, dict):
+                    try:
+                        live_value = float(econ.get("policy_value"))
+                    except (TypeError, ValueError):
+                        live_value = None
+                armed = decision_code in ("", "ARMED") and live_value is not None and live_value > 0.0
                 open_recorded_scalp(
                     self.engine.db_path,
                     candidate_id=markout_id,
@@ -2382,8 +2411,13 @@ class PortfolioEngineIntegration:
                     regime=regime,
                     entry_ask=ref_price,
                     roundtrip_cost=canonical_roundtrip_cost_pct(spread_pct=(float(micro_feats["spread_pct"]) if micro_feats.get("spread_pct") is not None else None)),
-                    economics=(row.get("executable_edge") or {}).get("economic") if isinstance((row.get("executable_edge") or {}).get("economic"), dict) else None,
+                    economics=econ,
                     now=float(cycle_ts),
+                    rank_position=rank_of.get(norm_key),
+                    size_mult=(econ.get("size_mult") if isinstance(econ, dict) else None) or edge_dict.get("size_mult"),
+                    funded=armed,
+                    reject_reason="" if armed else (decision_reason or decision_code or "NO_EXECUTABLE_NET_EDGE"),
+                    decision_group_id=f"SCALP_V2:{float(cycle_ts):.6f}",
                 )
             except Exception:
                 logger.debug("POLICY_EPISODE_OPEN_FAILED symbol=%s", norm_key, exc_info=True)
@@ -2395,7 +2429,7 @@ class PortfolioEngineIntegration:
             code, _reason = classify_scalp_candidate(row)
             if code != "ARMED" or not row:
                 return -1e9
-            _record_scalp_observation(row, norm_key, signaled=True)
+            _record_scalp_observation(row, norm_key, signaled=True, decision_code="ARMED", decision_reason="ARMED")
             # The view the canonical executable edge was priced from at ranking;
             # eligibility, priority and size read the same numbers.
             view = row.get("adaptive_decision") or {}
@@ -2414,7 +2448,7 @@ class PortfolioEngineIntegration:
             try:
                 if result_code != "ARMED":
                     if row:
-                        _record_scalp_observation(row, norm_key, signaled=False)
+                        _record_scalp_observation(row, norm_key, signaled=False, decision_code=result_code, decision_reason=reason)
                     record_scalp_decision(self.engine.db_path, norm, result_code, reason, cycle_ts=cycle_ts, detail=decision_detail(row))
                     logger.info("SCALP_V2_DECISION symbol=%s result=%s reason=%s", norm, result_code, reason)
                     continue
