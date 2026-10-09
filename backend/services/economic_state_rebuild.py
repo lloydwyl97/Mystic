@@ -65,10 +65,10 @@ def _iso_epoch(value: Any) -> float | None:
 
 def actual_closes(db_path: str, engine_id: str, since: float, store: BarStore) -> list[dict[str, Any]]:
     """Realized closes of ``engine_id`` entered at or after ``since``, as the live
-    close learner sees them: net = gross - estimated round-trip cost, keys from the
-    entry's adaptive decision, MFE/MAE from 1m bars over the hold."""
+    close learner sees them: the SELL's fill net, else gross - estimated round-trip
+    cost, keys from the entry's adaptive decision, MFE/MAE from 1m bars over the hold."""
     from backend.config.trading_economics import ESTIMATED_ROUNDTRIP_COST
-    from backend.services.adaptive_learning import _norm_symbol
+    from backend.services.adaptive_learning import _norm_symbol, close_learning_net_pct
     from backend.services.strategy_version import is_current_version
 
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -111,7 +111,12 @@ def actual_closes(db_path: str, engine_id: str, since: float, store: BarStore) -
                     "entered_at": entered,
                     "closed_at": closed,
                     "entry_price": entry,
-                    "net": (exit_px - entry) / entry - ESTIMATED_ROUNDTRIP_COST,
+                    "net": close_learning_net_pct(
+                        fill_net_pct=sell["pnl_pct_net"] if "pnl_pct_net" in set(sell.keys()) else None,
+                        exit_price=exit_px,
+                        entry_price=entry,
+                        flat_cost=float(ESTIMATED_ROUNDTRIP_COST),
+                    ),
                     "mfe": (high - entry) / entry,
                     "mae": (entry - low) / entry,
                     "minutes": (closed - entered) / 60.0,
@@ -667,6 +672,7 @@ def realized_closes(db_path: str, engine_id: str) -> list[dict[str, Any]]:
             holding = _json(o["indicators_while_holding_json"])
             entered, closed = float(o["entry_timestamp"]), float(o["exit_timestamp"])
             buy, sell = _close_rows(conn, engine, o["symbol"], str(extra.get("original_trade_id") or ""), closed)
+            fill_net = al.close_learning_net_pct(fill_net_pct=sell["pnl_pct_net"] if sell is not None and "pnl_pct_net" in set(sell.keys()) else None)
             decision = _json(buy["adaptive_decision_json"]) if buy is not None else {}
             sell_decision = _json(sell["adaptive_decision_json"]) if sell is not None else {}
             setup = str(decision.get("setup") or o["setup"] or "")
@@ -681,7 +687,7 @@ def realized_closes(db_path: str, engine_id: str) -> list[dict[str, Any]]:
                     "strategy_version": str(extra.get("strategy_version") or o["strategy_version"] or ""),
                     "version_current": bool(extra.get("version_current")),
                     "is_dust": bool(extra.get("is_dust")),
-                    "net": float(o["net_profit_pct"]),
+                    "net": fill_net if fill_net is not None else float(o["net_profit_pct"]),
                     "mfe": holding.get("mfe_pct"),
                     "mae": holding.get("mae_pct"),
                     "hold_min": float(hold) / 60.0 if hold else None,
@@ -710,28 +716,30 @@ def _close_rows(conn: sqlite3.Connection, engine: str, symbol: str, position_tra
     than any fixed window. Without that identity, the nearest SELL on the
     symbol inside ``_LINK_WINDOW_SEC`` and its BUY.
     """
+    columns = _TRADE_COLUMNS
+    if "pnl_pct_net" in {str(r[1]) for r in conn.execute("PRAGMA table_info(paper_trades)")}:
+        columns = f"{_TRADE_COLUMNS}, pnl_pct_net"
     buy = None
     if position_trade_id:
         buy = conn.execute(
-            f"SELECT {_TRADE_COLUMNS} FROM paper_trades WHERE UPPER(side)='BUY' AND UPPER(COALESCE(engine_id,''))=? AND trade_id=? ORDER BY rowid DESC LIMIT 1",
+            f"SELECT {columns} FROM paper_trades WHERE UPPER(side)='BUY' AND UPPER(COALESCE(engine_id,''))=? AND trade_id=? ORDER BY rowid DESC LIMIT 1",
             (engine, position_trade_id),
         ).fetchone()
     if buy is not None and str(buy["decision_id"] or ""):
         sell = conn.execute(
-            f"SELECT {_TRADE_COLUMNS} FROM paper_trades WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,''))=? AND decision_id=? "
-            "ORDER BY ABS(strftime('%s', substr(timestamp, 1, 19)) - ?) LIMIT 1",
+            f"SELECT {columns} FROM paper_trades WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,''))=? AND decision_id=? ORDER BY ABS(strftime('%s', substr(timestamp, 1, 19)) - ?) LIMIT 1",
             (engine, buy["decision_id"], closed),
         ).fetchone()
         if sell is not None:
             return buy, sell
     sell = conn.execute(
-        f"SELECT {_TRADE_COLUMNS} FROM paper_trades WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,''))=? AND symbol=? "
+        f"SELECT {columns} FROM paper_trades WHERE UPPER(side)='SELL' AND UPPER(COALESCE(engine_id,''))=? AND symbol=? "
         "AND ABS(strftime('%s', substr(timestamp, 1, 19)) - ?) <= ? ORDER BY ABS(strftime('%s', substr(timestamp, 1, 19)) - ?) LIMIT 1",
         (engine, symbol, closed, _LINK_WINDOW_SEC, closed),
     ).fetchone()
     if sell is not None and buy is None:
         buy = conn.execute(
-            f"SELECT {_TRADE_COLUMNS} FROM paper_trades WHERE UPPER(side)='BUY' AND UPPER(COALESCE(engine_id,''))=? "
+            f"SELECT {columns} FROM paper_trades WHERE UPPER(side)='BUY' AND UPPER(COALESCE(engine_id,''))=? "
             "AND ((COALESCE(decision_id,'')!='' AND decision_id=?) OR trade_id=?) ORDER BY rowid DESC LIMIT 1",
             (engine, sell["decision_id"], sell["trade_id"]),
         ).fetchone()
@@ -865,7 +873,17 @@ def _replay(
     default_h = 60.0 if engine_id == DAY_ENGINE else 600.0
     conn = al._connect(scratch_db)
     cols = [str(r[1]) for r in conn.execute("PRAGMA table_info(adaptive_candidate_markouts)")]
-    blank = {"markouts_json": "{}", "learned": 0, "resolved": 1, "lifecycle_learned": 0, "policy_learned": 0, "realized_net": None, "filled": 0}
+    blank = {
+        "markouts_json": "{}",
+        "learned": 0,
+        "resolved": 1,
+        "lifecycle_learned": 0,
+        "policy_learned": 0,
+        "calibration_learned": 0,
+        "calibration_target": None,
+        "realized_net": None,
+        "filled": 0,
+    }
     for r in rows:
         values = {c: (blank[c] if c in blank else r.get(c)) for c in cols if c in r or c in blank}
         conn.execute(f"INSERT INTO adaptive_candidate_markouts ({','.join(values)}) VALUES ({','.join('?' * len(values))})", tuple(values.values()))
@@ -1098,10 +1116,7 @@ def regenerate(
         sconn = sqlite3.connect(scratch)
         sconn.row_factory = sqlite3.Row
         try:
-            flags = {
-                int(r["id"]): r
-                for r in sconn.execute("SELECT id, learned, lifecycle_learned, policy_learned, calibration_learned, realized_net, markouts_json FROM adaptive_candidate_markouts")
-            }
+            flags = {int(r["id"]): r for r in sconn.execute("SELECT id, learned, lifecycle_learned, policy_learned, calibration_learned, realized_net, markouts_json FROM adaptive_candidate_markouts")}
             model = sconn.execute("SELECT * FROM adaptive_linear_model WHERE engine_id=? AND model=?", (engine, al._model_key(engine, "micro_edge"))).fetchone()
         finally:
             sconn.close()
