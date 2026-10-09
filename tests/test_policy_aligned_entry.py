@@ -1,8 +1,7 @@
 """Entry learns expected realized result under Mystic's own exit policy.
 
-Market labels (DAY lifecycle replay, SCALP forward markouts) stay market
-opportunity. ``policy_gap`` is a filled opportunity's realized net minus its own
-market label; DAY expectancy and the SCALP executable edge add it.
+Market labels stay diagnostics. SCALP still adds its policy gap to the
+executable edge. DAY entry reads realized trade net, not that gap.
 """
 
 from __future__ import annotations
@@ -106,33 +105,37 @@ def _edge(view):
 # --- DAY: entry target is policy value, market alpha is kept separately -------
 
 
-def test_day_entry_target_is_policy_value_not_the_market_path(tmp_path):
+def test_day_entry_target_is_realized_policy_net_not_the_lifecycle_path(tmp_path):
     db = str(tmp_path / "t.db")
     for _ in range(6):
         _day_obs(db, "lifecycle_net", 0.0050)
-    before = al.day_net_expectancy(db, *DAY_KEY)
-    assert before["mean"] > 0 and before["policy_gap"] == 0.0
-    assert before["market_alpha"] == before["mean"]
+        _day_obs(db, "policy_gap", 0.0200)
+    untouched = al.day_net_expectancy(db, *DAY_KEY)
+    assert untouched["mean"] == 0.0
+    assert untouched["market_alpha"] > 0.0
+    assert untouched["policy_gap"] > 0.0
 
-    _filled_day_row(db, "OPP1", lifecycle_net=0.0050)
-    assert _close(db, DAY, "OPP1", -0.0006, DAY_KEY)
+    for _ in range(4):
+        _day_obs(db, "trade_net", -0.0006)
     after = al.day_net_expectancy(db, *DAY_KEY)
-    assert after["policy_gap"] < 0
-    assert after["mean"] < before["mean"]
-    assert abs(after["market_alpha"] - before["market_alpha"]) < 1e-12
+    assert after["mean"] < 0.0
+    assert abs(after["market_alpha"] - untouched["market_alpha"]) < 1e-12
+    assert abs(after["policy_gap"] - untouched["policy_gap"]) < 1e-12
     decision = al.day_decision(db, *DAY_KEY)
     econ = decision["economic"]
+    assert econ["policy_base"] == "trade_net"
     assert econ["policy_value"] == decision["expected_net"]
-    assert econ["market_alpha"] > econ["policy_value"]
+    assert abs(econ["policy_value"] - (econ["uncalibrated_policy_value"] + econ["policy_calibration"])) < 1e-12
 
 
-def test_day_positive_lifecycle_fill_raises_future_entry_value(tmp_path):
+def test_day_realized_policy_fill_raises_future_entry_value(tmp_path):
     db = str(tmp_path / "t.db")
     for _ in range(6):
         _day_obs(db, "lifecycle_net", 0.0010)
     before = al.day_net_expectancy(db, *DAY_KEY)["mean"]
-    _filled_day_row(db, "OPP2", lifecycle_net=0.0010)
-    assert _close(db, DAY, "OPP2", 0.0060, DAY_KEY)
+    assert before == 0.0
+    for _ in range(4):
+        _day_obs(db, "trade_net", 0.0060)
     assert al.day_net_expectancy(db, *DAY_KEY)["mean"] > before
 
 

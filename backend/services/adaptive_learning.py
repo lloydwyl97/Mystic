@@ -91,6 +91,10 @@ _PRIORS: dict[str, dict[str, float]] = {
         # Realized policy net minus the policy value predicted at entry.
         # Prior 0. Losses pull the next forecast down; wins can pull it up.
         "policy_calibration": 0.0,
+        # Residual of realized policy net versus the trade_net base. The older
+        # policy_calibration posterior was trained on the lifecycle-plus-gap base
+        # and is not added to the live entry value.
+        "trade_net_calibration": 0.0,
         # Research-only mean of resolved policy-episode nets. Entry ranking does not read it.
         "direct_policy_net": 0.0,
         "hold_remaining_up": 0.0,
@@ -186,6 +190,7 @@ MEAN_FORM_METRICS = frozenset(
         "trade_net",
         "policy_gap",
         "policy_calibration",
+        "trade_net_calibration",
         "direct_policy_net",
         "hold_remaining_up",
         "hold_remaining_down",
@@ -798,15 +803,14 @@ def _tilt(mean: float, prior: float) -> float:
     return math.tanh((mean - prior) / abs(prior))
 
 
-# DAY net expectancy is the expected realized net after costs under Mystic's
-# live policy. Realized trade net (filled opportunities) is already in those
-# units. The lifecycle replay of unfilled qualified candidates
-# (LIFECYCLE_WEIGHT) is market opportunity, so each of its rows enters shifted
-# by the learned policy gap. An opportunity contributes one or the other, never
-# both. Fixed-horizon markouts are diagnostics only: a DAY position is not
-# closed at a fixed clock, and the 60m markout misjudged setups whose lifecycle
-# runs for hours.
-DAY_NET_PARTS: tuple[tuple[str, float], ...] = (("trade_net", 1.0), ("lifecycle_net", LIFECYCLE_WEIGHT))
+# Live DAY entry authority is the hierarchical posterior of realized current-policy
+# net (``trade_net``) plus ``trade_net_calibration``, the residual of later closes
+# against that same base. ``lifecycle_net`` and ``policy_gap`` stay recorded.
+# They are a 12-hour market label and the gap between that label and the short
+# exit policy. Adding the gap back onto the lifecycle label is not the value of
+# entering under the exit that actually runs.
+DAY_POLICY_BASE = "trade_net"
+DAY_NET_PARTS: tuple[tuple[str, float], ...] = (("trade_net", 1.0),)
 
 
 def policy_gap(db_path: str, engine: str, symbol: str, setup: str, regime: str, *, now: float | None = None, rows: list | None = None) -> dict[str, Any]:
@@ -848,33 +852,37 @@ def policy_calibration(db_path: str, engine: str, symbol: str, setup: str, regim
     )
 
 
-def _shifted(row: Any, shift: float) -> dict[str, Any]:
-    out = dict(row)
-    out["ewma"] = float(row["ewma"]) + float(shift)
-    return out
-
-
 def day_net_expectancy(db_path: str, symbol: str, setup: str, regime: str, *, now: float | None = None) -> dict[str, Any]:
-    """Expected DAY net edge after costs under the live policy for one key,
-    pooled hierarchically (key -> same setup sharing symbol or regime -> setup -> 0).
-    No sample-count floor: one observation moves the posterior by its weight.
-    ``market_alpha`` is the same posterior of the unshifted lifecycle labels."""
-    weights = dict(DAY_NET_PARTS)
-    rows = _state_rows(db_path, DAY_ENGINE, (*weights, "policy_gap"))
+    """Expected realized net of the live DAY exit policy for one key.
+
+    The base is the hierarchical posterior of ``trade_net`` (key, then the
+    same setup sharing symbol or regime, then the setup, prior 0). ``trade_net_calibration``
+    is the learned residual of closes against that base. Lifecycle labels and
+    ``policy_gap`` are reported and are not added.
+    """
+    rows = _state_rows(db_path, DAY_ENGINE, ("trade_net", "lifecycle_net", "policy_gap", "trade_net_calibration"))
     now = float(now) if now is not None else _data_clock(rows)
     gap = policy_gap(db_path, DAY_ENGINE, symbol, setup, regime, now=now, rows=rows)
-    calibration = policy_calibration(db_path, DAY_ENGINE, symbol, setup, regime, now=now)
-    shift = float(gap["mean"])
-    net_rows = [_shifted(r, shift) if str(r["metric"]) == "lifecycle_net" else r for r in rows if str(r["metric"]) in weights]
     lat = _lattice(
-        net_rows,
+        [r for r in rows if str(r["metric"]) == "trade_net"],
         engine_id=DAY_ENGINE,
         symbol=symbol,
         setup=setup,
         regime=regime,
-        weights=weights,
+        weights={"trade_net": 1.0},
         prior=_prior(DAY_ENGINE, "trade_net"),
         now=now,
+    )
+    calibration = _lattice(
+        [r for r in rows if str(r["metric"]) == "trade_net_calibration"],
+        engine_id=DAY_ENGINE,
+        symbol=symbol,
+        setup=setup,
+        regime=regime,
+        weights={"trade_net_calibration": 1.0},
+        prior=_prior(DAY_ENGINE, "trade_net_calibration"),
+        now=now,
+        include_engine=True,
     )
     market = _lattice(
         [r for r in rows if str(r["metric"]) == "lifecycle_net"],
@@ -892,13 +900,13 @@ def day_net_expectancy(db_path: str, symbol: str, setup: str, regime: str, *, no
         "levels": lat["levels"],
         "level_weights": lat["level_weights"],
         "n_trade": lat["key_n"]["trade_net"],
-        "n_lifecycle": lat["key_n"]["lifecycle_net"],
+        "n_lifecycle": market["key_n"]["lifecycle_net"],
         "weight": lat["key_weight"],
         "pooled_weight": lat["pooled_weight"],
         "confidence": lat["confidence"],
         "sd": lat["sd"],
         "market_alpha": market["mean"],
-        "policy_gap": shift,
+        "policy_gap": float(gap["mean"]),
         "n_policy_gap": gap["level_weights"]["engine"],
         "uncalibrated_mean": lat["mean"],
         "policy_calibration": float(calibration["mean"]),
@@ -1052,6 +1060,7 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
         "level_weights": {lvl: round(v, 3) for lvl, v in net["level_weights"].items()},
         "n_trade": round(net["n_trade"], 3),
         "n_lifecycle": round(net["n_lifecycle"], 3),
+        "policy_base": DAY_POLICY_BASE,
         "market_alpha": net["market_alpha"],
         "policy_gap": net["policy_gap"],
         "lifecycle_policy_estimate": net["market_alpha"] + net["policy_gap"],
@@ -2104,6 +2113,10 @@ def _learn_policy_calibration(conn: sqlite3.Connection, db_path: str, row: Any, 
     base = _entry_base_forecast(row)
     if base is None:
         return False
+    # Only a base that was itself the trade_net posterior may train the live
+    # residual. A lifecycle-plus-gap base stays on the forensic metric.
+    econ = _economic_of(row)
+    metric = "trade_net_calibration" if engine_id == DAY_ENGINE and str(econ.get("policy_base") or "") == DAY_POLICY_BASE else "policy_calibration"
     return _claim_and_fold(
         conn,
         row_id=int(row["id"]),
@@ -2112,7 +2125,7 @@ def _learn_policy_calibration(conn: sqlite3.Connection, db_path: str, row: Any, 
         symbol=str(row["symbol"]),
         setup=str(row["setup"]),
         regime=str(row["regime"]),
-        metric="policy_calibration",
+        metric=metric,
         value=float(realized) - float(base),
         strategy_version=current_strategy_version(engine_id),
         moment=float(moment),

@@ -153,6 +153,31 @@ def held_quantity(db_path_or_conn: str | sqlite3.Connection, symbol: str) -> flo
     return float(sum(float(r["quantity"] or 0.0) for r in held_lots(db_path_or_conn, symbol)))
 
 
+def held_inventory_equity(db_path: str, prices: dict[str, float] | None, open_trade_ids: set[str]) -> tuple[float, float]:
+    """Market value and cost of HELD dust not already marked as an open lot.
+
+    These coins are owned. They are not an active strategy position, so the
+    caller adds them to account equity and not to a sleeve's realized P&L.
+    """
+    market = 0.0
+    cost = 0.0
+    marks = prices or {}
+    for lot in held_lots(db_path):
+        if str(lot.get("source_trade_id") or "") in open_trade_ids:
+            continue
+        qty = float(lot.get("quantity") or 0.0)
+        basis = float(lot.get("entry_price") or 0.0)
+        if qty <= 0 or basis < 0:
+            continue
+        sym = str(lot.get("symbol") or "")
+        base = sym.split("/", maxsplit=1)[0]
+        mark = marks.get(sym) or marks.get(base) or marks.get(sym.replace("/", "")) or basis
+        px = float(mark) if mark and float(mark) > 0 else basis
+        market += qty * px
+        cost += qty * basis
+    return market, cost
+
+
 def record_external_balance_event(
     conn: sqlite3.Connection,
     *,

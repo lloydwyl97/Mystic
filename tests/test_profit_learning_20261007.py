@@ -139,9 +139,11 @@ def test_a_loss_lowers_the_next_forecast_and_a_win_can_raise_it(tmp_path):
     setup = "EXHAUSTION_MR"
     before = al.day_decision(db, "SOLUSDT", setup, "btcdown_vollo")["expected_net"]
     _day_close(db, setup, 0.0044, -0.00107, "OPP-LOSS")
+    assert al.observe(db, engine=DAY, symbol="SOLUSDT", setup=setup, regime="btcdown_vollo", metric="trade_net", value=-0.00107, strategy_version=al.current_strategy_version(DAY), now=T0)
     after_loss = al.day_decision(db, "SOLUSDT", setup, "btcdown_vollo")["expected_net"]
     assert after_loss < before
     _day_close(db, setup, after_loss, after_loss + 0.02, "OPP-WIN")
+    assert al.observe(db, engine=DAY, symbol="SOLUSDT", setup=setup, regime="btcdown_vollo", metric="trade_net", value=after_loss + 0.02, strategy_version=al.current_strategy_version(DAY), now=T0)
     after_win = al.day_decision(db, "SOLUSDT", setup, "btcdown_vollo")["expected_net"]
     assert after_win > after_loss
 
@@ -294,8 +296,9 @@ def test_calibration_updates_at_close_without_a_lifecycle_label(tmp_path):
     n, ewma = _calibration_row(db)
     assert abs(n - 1.0) < 1e-9
     assert abs(ewma - (realized - predicted)) < 1e-12
+    assert al.observe(db, engine=DAY, symbol="XRPUSDT", setup=setup, regime=regime, metric="trade_net", value=realized, strategy_version=al.current_strategy_version(DAY), now=T0)
     after = al.day_decision(db, "XRPUSDT", setup, regime)["expected_net"]
-    assert after < before
+    assert after > before
     predicted_win = after
     realized_win = predicted_win + 0.004
     row_win = al.record_candidate(
@@ -313,6 +316,7 @@ def test_calibration_updates_at_close_without_a_lifecycle_label(tmp_path):
     )
     assert al.mark_candidate_filled(db, row_win)
     assert al.record_policy_outcome(db, engine=DAY, opportunity_id="CLOSE-2", net_pct=realized_win, candidate_id=row_win, now=T0 + 940.0)
+    assert al.observe(db, engine=DAY, symbol="XRPUSDT", setup=setup, regime=regime, metric="trade_net", value=realized_win, strategy_version=al.current_strategy_version(DAY), now=T0 + 940.0)
     assert al.day_decision(db, "XRPUSDT", setup, regime)["expected_net"] > after
 
 

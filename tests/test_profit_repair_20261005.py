@@ -40,7 +40,7 @@ def _iso(epoch: float) -> str:
 
 
 def _life(db, value, *, symbol="BTCUSDT", setup="BREAKOUT_CONTINUATION", regime="btcup_volhi", at=T0):
-    return al.observe(db, engine=DAY, symbol=symbol, setup=setup, regime=regime, metric="lifecycle_net", value=value, strategy_version=al.current_strategy_version(DAY), now=at)
+    return al.observe(db, engine=DAY, symbol=symbol, setup=setup, regime=regime, metric="trade_net", value=value, strategy_version=al.current_strategy_version(DAY), now=at)
 
 
 def _day(db, symbol="BTCUSDT", setup="BREAKOUT_CONTINUATION", regime="btcup_volhi", at=T0):

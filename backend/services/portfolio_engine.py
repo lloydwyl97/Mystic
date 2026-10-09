@@ -4992,10 +4992,20 @@ class PortfolioEngine:
             from backend.services.protected_external_inventory import protected_equity
 
             extra_market, extra_cost = protected_equity(self.db_path, prices)
-            return market + extra_market, cost + extra_cost
+            market += extra_market
+            cost += extra_cost
         except Exception:
             logger.debug("PROTECTED_EQUITY_SKIPPED", exc_info=True)
-            return market, cost
+        try:
+            from backend.services.engine_strategy_dust import held_inventory_equity
+
+            open_ids = {str(getattr(pos, "trade_id", "") or "") for pos in self.open_positions.values()}
+            dust_market, dust_cost = held_inventory_equity(self.db_path, prices, open_ids)
+            market += dust_market
+            cost += dust_cost
+        except Exception:
+            logger.debug("HELD_DUST_EQUITY_SKIPPED", exc_info=True)
+        return market, cost
 
     async def _fetch_live_mark_for_open_position(self, symbol: str) -> float:
         """

@@ -64,8 +64,12 @@ def test_a_i_day_markout_updates_state_and_next_candidate_reads_it(tmp_path):
     resolve_markouts(db, lambda _s, _t: 103.0, now=10_000.0 + 731 * 60, bars_1m=lambda _s, a, b: [bar for bar in bars if a <= bar[0] < b])
     after = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "neutral")
     assert after["economic"]["n_lifecycle"] == pytest.approx(1.0)
-    assert after["expected_net"] > before["expected_net"] == 0.0
-    assert after["size_mult"] > before["size_mult"]
+    # The lifecycle label is diagnostic. Live entry value follows trade_net.
+    assert after["expected_net"] == before["expected_net"] == 0.0
+    assert observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="neutral", metric="trade_net", value=0.01, strategy_version=DAY_STRATEGY_VERSION)
+    funded = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "neutral")
+    assert funded["expected_net"] > 0.0
+    assert funded["size_mult"] > before["size_mult"]
     from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 
     assert "day_decision" in inspect.getsource(PortfolioEngineIntegration._process_day_v2_signals)
@@ -570,7 +574,7 @@ def test_abstention_cold_key_never_skips(tmp_path):
 def test_abstention_fires_on_confident_negative_edge(tmp_path):
     db = str(tmp_path / "t.db")
     for _ in range(40):
-        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="lifecycle_net", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
+        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_net", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
     d = day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")
     assert d["abstain"] is True
     assert "LEARNED_NEGATIVE_EDGE" in d["abstain_reason"]
@@ -589,7 +593,7 @@ def test_abstention_kill_switch_disables_it(tmp_path, monkeypatch):
 
     db = str(tmp_path / "t.db")
     for _ in range(40):
-        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="lifecycle_net", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
+        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_net", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
     assert day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")["abstain"] is True
     monkeypatch.setattr(al, "ABSTAIN_ENABLED", False)
     assert day_decision(db, "XRPUSDT", "RANGE_BOUNCE", "")["abstain"] is False
@@ -601,10 +605,10 @@ def test_abstention_report_measures_value(tmp_path):
     db = str(tmp_path / "t.db")
     # A confident negative-edge DAY key -> should show up as abstaining.
     for _ in range(40):
-        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="lifecycle_net", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
+        observe(db, engine=DAY, symbol="XRPUSDT", setup="RANGE_BOUNCE", regime="", metric="trade_net", value=-0.02, strategy_version=DAY_STRATEGY_VERSION)
     # A healthy positive key -> stays active.
     for _ in range(20):
-        observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="", metric="lifecycle_net", value=0.02, strategy_version=DAY_STRATEGY_VERSION)
+        observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="", metric="trade_net", value=0.02, strategy_version=DAY_STRATEGY_VERSION)
     # Record two live skip decisions in the DAY decision log within the window.
     conn = sqlite3.connect(db)
     conn.execute("CREATE TABLE IF NOT EXISTS day_v2_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, cycle_ts REAL, result TEXT, closest TEXT DEFAULT '', unmet_json TEXT DEFAULT '[]')")

@@ -55,7 +55,7 @@ def test_one_loss_moves_the_next_decision(tmp_path):
 def test_repeated_losses_lower_rank_and_size_and_later_wins_recover(tmp_path):
     db = str(tmp_path / "r.db")
     for _ in range(8):
-        al.observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="btcup_vollo", metric="lifecycle_net", value=-0.008, strategy_version=al.current_strategy_version(DAY), now=T0)
+        al.observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="btcup_vollo", metric="trade_net", value=-0.008, strategy_version=al.current_strategy_version(DAY), now=T0)
     weak = al.day_decision(db, "BTCUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", now=T0)
     other = al.day_decision(db, "ETHUSDT", "RANGE_BOUNCE", "btcup_vollo", now=T0)
     ranked = rank_day_candidates([_cand("BTCUSDT", "HTF_TREND_PULLBACK", weak), _cand("ETHUSDT", "RANGE_BOUNCE", other)], DAY_V2_UNIVERSE, 0.00066)
@@ -63,7 +63,7 @@ def test_repeated_losses_lower_rank_and_size_and_later_wins_recover(tmp_path):
     assert weak["size_mult"] < 1.0
     assert weak["expected_net"] < 0
     for _ in range(24):
-        al.observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="btcup_vollo", metric="lifecycle_net", value=0.012, strategy_version=al.current_strategy_version(DAY), now=T0)
+        al.observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="btcup_vollo", metric="trade_net", value=0.012, strategy_version=al.current_strategy_version(DAY), now=T0)
     recovered = al.day_decision(db, "BTCUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", now=T0)
     assert recovered["expected_net"] > 0.0 > weak["expected_net"]
     assert recovered["size_mult"] > weak["size_mult"]
@@ -72,7 +72,7 @@ def test_repeated_losses_lower_rank_and_size_and_later_wins_recover(tmp_path):
 def test_a_rejected_lifecycle_changes_the_next_ranking(tmp_path):
     db = str(tmp_path / "a.db")
     al.observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="btcup_vollo", metric="trade_net", value=-0.004, strategy_version=al.current_strategy_version(DAY), now=T0)
-    al.observe(db, engine=DAY, symbol="SOLUSDT", setup="RANGE_BOUNCE", regime="btcup_vollo", metric="lifecycle_net", value=0.003, strategy_version=al.current_strategy_version(DAY), now=T0)
+    al.observe(db, engine=DAY, symbol="SOLUSDT", setup="RANGE_BOUNCE", regime="btcup_vollo", metric="trade_net", value=0.003, strategy_version=al.current_strategy_version(DAY), now=T0)
     btc = al.day_decision(db, "BTCUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", now=T0)
     sol = al.day_decision(db, "SOLUSDT", "RANGE_BOUNCE", "btcup_vollo", now=T0)
     ranked = rank_day_candidates([_cand("BTCUSDT", "HTF_TREND_PULLBACK", btc), _cand("SOLUSDT", "RANGE_BOUNCE", sol)], DAY_V2_UNIVERSE, 0.00066)
@@ -337,7 +337,7 @@ def test_market_state_can_outrank_a_deteriorating_setup_without_a_code_change(tm
     assert ranked[0]["symbol"] == "BTCUSDT"
     for _ in range(16):
         al.observe(db, engine=DAY, symbol="BTCUSDT", setup=fired_key, regime="btcup_vollo", metric="trade_net", value=-0.02, strategy_version=ver, now=T0)
-        al.observe(db, engine=DAY, symbol="ETHUSDT", setup=market_key, regime="btcup_vollo", metric="lifecycle_net", value=0.01, strategy_version=ver, now=T0)
+        al.observe(db, engine=DAY, symbol="ETHUSDT", setup=market_key, regime="btcup_vollo", metric="trade_net", value=0.01, strategy_version=ver, now=T0)
     faded = al.day_decision(db, "BTCUSDT", fired_key, "btcup_vollo", now=T0)
     emerged = al.day_decision(db, "ETHUSDT", market_key, "btcup_vollo", now=T0)
     assert emerged["expected_net"] > 0.0 > faded["expected_net"]
