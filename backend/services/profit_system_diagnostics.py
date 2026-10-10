@@ -194,6 +194,15 @@ def _rolling_profit_health(conn: sqlite3.Connection, *, window: int = 200) -> di
     }
 
 
+def _exact_policy_counts(db_path: str) -> dict[str, int]:
+    try:
+        from backend.services.exact_policy_capture import capture_counts
+
+        return capture_counts(db_path)
+    except Exception:
+        return {"open": 0, "real": 0, "counterfactual": 0, "non_parity": 0}
+
+
 def get_profit_system_diagnostics(db_path: str = DATABASE_PATH) -> dict[str, Any]:
     with sqlite3.connect(db_path) as conn:
         day = _load_latest_snapshot(conn, "day")
@@ -347,4 +356,5 @@ def get_profit_system_diagnostics(db_path: str = DATABASE_PATH) -> dict[str, Any
         "context_freshness": context_block["rows"],
         "context_freshness_summary": context_block["summary"],
         "rolling_profit_health": rolling_profit,
+        "exact_policy": _exact_policy_counts(db_path),
     }

@@ -16734,44 +16734,27 @@ class PortfolioEngine:
             return None
         if _pos_engine_id == "DAY_V2":
             try:
-                from backend.services.day_v2.live_exit_evaluator import evaluate_day_v2_exit
+                from backend.services.exact_policy_capture import live_day_decision, record_live_check
 
-                _bar_low_day_v2 = float(getattr(position, "lowest_price", 0.0) or current_price)
-                if _bar_low_day_v2 <= 0:
-                    _bar_low_day_v2 = float(current_price)
-                _adapt = getattr(position, "adaptive_decision", None) or {}
-                _day_setup = str((_adapt or {}).get("setup") or getattr(position, "entry_thesis", "") or "")
-                _day_unreal = (float(current_price) - entry_price) / entry_price - float(ESTIMATED_ROUNDTRIP_COST)
-                _terminal = _open_expected_terminal(
-                    self.db_path,
-                    "DAY_V2",
-                    symbol,
-                    _day_setup,
-                    str((_adapt or {}).get("regime") or ""),
-                    _day_unreal,
-                    _continuation_features(position, entry_price=entry_price, mark=float(current_price), net=_day_unreal, db_path=self.db_path),
-                )
-                _day_v2_dec = evaluate_day_v2_exit(
-                    engine_id=_pos_engine_id,
-                    entry_price=entry_price,
-                    current_price=float(current_price),
-                    bar_low=_bar_low_day_v2,
-                    highest_price=float(getattr(position, "highest_price", 0.0) or entry_price),
-                    atr_at_entry=float(getattr(position, "atr_at_entry", 0.0) or 0.0),
-                    structural_anchor=float(getattr(position, "thesis_invalid_level", 0.0) or 0.0),
-                    target_price=float(getattr(position, "thesis_target_level", 0.0) or 0.0),
-                    entry_time=float(getattr(position, "entry_time", 0.0) or 0.0),
-                    estimated_roundtrip_cost=float(ESTIMATED_ROUNDTRIP_COST),
-                    setup=str(getattr(position, "entry_thesis", "") or ""),
-                    atr_1h_at_entry=float(getattr(position, "day_atr_1h_at_entry", 0.0) or 0.0),
-                    objective_structural=float(getattr(position, "day_objective_structural", 0.0) or 0.0),
-                    objective_atr_mult=float((_adapt or {}).get("objective_atr_mult") or 1.0),
-                    structural_emphasis=float((_adapt or {}).get("structural_emphasis") or 1.0),
-                    runner_activation_mult=float((_adapt or {}).get("runner_activation_mult") or 1.0),
-                    runner_trail_mult=float((_adapt or {}).get("runner_trail_mult") or 1.0),
-                    runner_tighten_mult=float((_adapt or {}).get("runner_tighten_mult") or 1.0),
-                    expected_terminal_net=_terminal,
-                )
+                _packed = live_day_decision(self.db_path, position, float(current_price), float(ESTIMATED_ROUNDTRIP_COST))
+                _day_unreal = _packed["net"]
+                _terminal = _packed["terminal"]
+                _day_v2_dec = _packed["decision"]
+                _lineage = getattr(position, "adaptive_decision", None) or {}
+                _lineage = _lineage.get("lineage") if isinstance(_lineage, dict) else None
+                _candidate_id = (_lineage or {}).get("candidate_id") if isinstance(_lineage, dict) else None
+                try:
+                    record_live_check(
+                        self.db_path,
+                        candidate_id=_candidate_id,
+                        trade_id=str(getattr(position, "trade_id", "") or ""),
+                        symbol=symbol,
+                        decision=_packed,
+                        bid=float(executable_bid) if executable_bid is not None and float(executable_bid) > 0 else None,
+                        ask=None,
+                    )
+                except Exception:
+                    logger.debug("EXACT_POLICY_LIVE_CHECK_SKIPPED symbol=%s", symbol, exc_info=True)
                 with contextlib.suppress(Exception):
                     from backend.services.adaptive_learning import continuation_snapshot
 
@@ -16792,7 +16775,7 @@ class PortfolioEngine:
                         _day_v2_dec.get("detail"),
                         current_price,
                     )
-                    return await self.execute_sell_fifo(
+                    _sold = await self.execute_sell_fifo(
                         symbol,
                         quantity,
                         current_price,
@@ -16802,6 +16785,15 @@ class PortfolioEngine:
                         force_sell=True,
                         engine_id="DAY_V2",
                     )
+                    try:
+                        _fill = float((_sold or {}).get("price") or 0.0) if isinstance(_sold, dict) else 0.0
+                        if _fill > 0 and _candidate_id:
+                            from backend.services.exact_policy_capture import note_real_fill_price
+
+                            note_real_fill_price(self.db_path, _candidate_id, fill_price=_fill, exit_reason=_day_v2_reason)
+                    except Exception:
+                        logger.debug("EXACT_POLICY_FILL_NOTE_SKIPPED symbol=%s", symbol, exc_info=True)
+                    return _sold
                 # No DAY V2 exit condition met — hold.
                 return None
             except Exception:

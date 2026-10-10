@@ -258,9 +258,19 @@ def installed_aggregator(db_path: str, engine: str) -> str:
     return how if how in {"best", "blended"} else "best"
 
 
-def surface_advantage(db_path: str, engine: str, symbol: str, setup: str, regime: str, features: dict[str, float] | None, now: float, *, how: str = "best") -> float | None:
-    """Live read of the installed surface. None when this engine has no advantage rows."""
-    informed: list[tuple[float, float]] = []
+def surface_trace(
+    db_path: str,
+    engine: str,
+    symbol: str,
+    setup: str,
+    regime: str,
+    features: dict[str, float] | None,
+    now: float,
+    *,
+    how: str = "best",
+) -> dict[str, Any] | None:
+    """Same surface read as ``surface_advantage``, with the horizon pieces kept."""
+    informed: list[dict[str, Any]] = []
     engine_id = str(engine or "").upper()
     ridge = _load_ridge(db_path, engine_id)
     for horizon in horizons_for(engine_id):
@@ -270,13 +280,31 @@ def surface_advantage(db_path: str, engine: str, symbol: str, setup: str, regime
         if evidence <= 0:
             continue
         stats = ridge.get(str(horizon)) or _blank_ridge()
-        informed.append((float(view["mean"]) + _ridge_dot(stats, features, now, engine_id), evidence))
+        posterior = float(view["mean"])
+        ridge_dot = _ridge_dot(stats, features, now, engine_id)
+        informed.append(
+            {
+                "horizon": int(horizon),
+                "posterior": posterior,
+                "ridge": ridge_dot,
+                "evidence": evidence,
+                "value": posterior + ridge_dot,
+            }
+        )
     if not informed:
         return None
     if how == "blended":
-        weight = sum(item[1] for item in informed)
-        return sum(item[0] * item[1] for item in informed) / weight
-    return max(item[0] for item in informed)
+        weight = sum(float(item["evidence"]) for item in informed)
+        advantage = sum(float(item["value"]) * float(item["evidence"]) for item in informed) / weight
+    else:
+        advantage = max(float(item["value"]) for item in informed)
+    return {"advantage": float(advantage), "how": how, "horizons": informed, "coordinates": feature_vector(features)}
+
+
+def surface_advantage(db_path: str, engine: str, symbol: str, setup: str, regime: str, features: dict[str, float] | None, now: float, *, how: str = "best") -> float | None:
+    """Live read of the installed surface. None when this engine has no advantage rows."""
+    trace = surface_trace(db_path, engine, symbol, setup, regime, features, now, how=how)
+    return None if trace is None else float(trace["advantage"])
 
 
 def _model_key(engine_id: str) -> str:

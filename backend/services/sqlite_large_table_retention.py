@@ -35,6 +35,7 @@ class RetentionPolicy:
     ts_column: str
     keep_days: int
     cutoff_format: str  # "iso_utc" | "feature_ohlcv" | "epoch_seconds"
+    predicate: str = ""
 
 
 # Documented justification for each window. Retention length is chosen from
@@ -108,8 +109,8 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     RetentionPolicy("book_queue_chunks", "chunk_start", 7, "epoch_seconds"),
     RetentionPolicy("research_market_states", "decision_ts", 7, "epoch_seconds"),
     RetentionPolicy("research_market_labels", "decision_ts", 7, "epoch_seconds"),
-    RetentionPolicy("policy_episodes", "decided_at", 14, "epoch_seconds"),
-    RetentionPolicy("policy_episode_checks", "checked_at", 14, "epoch_seconds"),
+    RetentionPolicy("policy_episodes", "decided_at", 14, "epoch_seconds", "status='CLOSED'"),
+    RetentionPolicy("policy_episode_checks", "checked_at", 14, "epoch_seconds", "episode_id NOT IN (SELECT id FROM policy_episodes WHERE status='OPEN')"),
     RetentionPolicy("policy_group_scores", "scored_at", 14, "epoch_seconds"),
     RetentionPolicy("policy_challenger_scores", "decided_at", 14, "epoch_seconds"),
     RetentionPolicy("policy_horizon_marks", "marked_at", 14, "epoch_seconds"),
@@ -319,7 +320,12 @@ def retention_dry_run(db_path: str | Path) -> dict[str, Any]:
             entry["cutoff"] = cutoff
             entry["lock_floor_applied"] = bool(floor and floor <= cutoff)
             entry["rows"] = int(conn.execute(f"SELECT COUNT(*) FROM {policy.table}").fetchone()[0])
-            entry["rows_to_delete"] = int(conn.execute(f"SELECT COUNT(*) FROM {policy.table} WHERE {policy.ts_column} < ?", (cutoff,)).fetchone()[0])
+            entry["rows_to_delete"] = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {policy.table} WHERE {policy.ts_column} < ?{(' AND ' + policy.predicate) if policy.predicate else ''}",
+                    (cutoff,),
+                ).fetchone()[0]
+            )
             entry["newest_row_to_delete"] = conn.execute(
                 f"SELECT MAX({policy.ts_column}) FROM {policy.table} WHERE {policy.ts_column} < ?",
                 (cutoff,),
@@ -493,7 +499,7 @@ def _delete_one_batch(
         DELETE FROM {policy.table}
         WHERE rowid IN (
             SELECT rowid FROM {policy.table}
-            WHERE {policy.ts_column} < ?
+            WHERE {policy.ts_column} < ?{(" AND " + policy.predicate) if policy.predicate else ""}
             LIMIT ?
         )
     """

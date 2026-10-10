@@ -1827,6 +1827,12 @@ class PortfolioEngineIntegration:
                         open_recorded_day(db_path, cand, cand.get("markout_id"))
                 except Exception:
                     logger.debug("POLICY_EPISODE_OPEN_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
+                try:
+                    from backend.services.exact_policy_capture import open_exact_episode
+
+                    open_exact_episode(db_path, cand, cand.get("markout_id"))
+                except Exception:
+                    logger.debug("EXACT_POLICY_OPEN_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
             for cand in ranked:
                 try:
                     await self._fund_day_v2_candidate(cand, db_path)
@@ -1946,6 +1952,15 @@ class PortfolioEngineIntegration:
 
     async def _fund_day_v2_candidate(self, cand: dict[str, Any], db_path: str) -> None:
         """Size one ranked DAY V2 candidate from the remaining DAY sleeve and submit it."""
+
+        def _note_exact(path: str, candidate: dict[str, Any], *, funded: bool, reason: str, trade_id: str = "") -> None:
+            try:
+                from backend.services.exact_policy_capture import note_disposition
+
+                note_disposition(path, candidate.get("markout_id"), funded=funded, reason=reason, trade_id=trade_id)
+            except Exception:
+                logger.debug("EXACT_POLICY_DISPOSITION_FAILED symbol=%s", candidate.get("symbol"), exc_info=True)
+
         from backend.services.day_v2.decision_log import record_day_decision
         from backend.services.day_v2.ranking import clamp_to_sleeve
         from backend.services.two_engine_capital import compute_snapshot, symbol_marks
@@ -1971,6 +1986,7 @@ class PortfolioEngineIntegration:
                 unmet=[f"expected_net={float((cand.get('adaptive') or {}).get('expected_net') or 0.0):.6f}"],
             )
             logger.info("DAY_V2_NO_NET_EDGE symbol=%s setup=%s", symbol, signal.setup)
+            _note_exact(db_path, cand, funded=False, reason="NO_EXECUTABLE_NET_EDGE")
             return
         # Engine sizing, then clamped to what the DAY sleeve can still fund
         # (open DAY lots and live reservations included). SCALP capital is never used.
@@ -2015,6 +2031,7 @@ class PortfolioEngineIntegration:
                 ],
             )
             logger.warning("DAY_V2_ZERO_SIZE symbol=%s ask=%.6f atr=%.6f", symbol, ask_price, atr_val)
+            _note_exact(db_path, cand, funded=False, reason="ZERO_SIZE")
             return
 
         # Gate through _can_open_position (two-engine contract:
@@ -2024,6 +2041,7 @@ class PortfolioEngineIntegration:
             gate_label = "INSUFFICIENT_EXECUTABLE_CASH" if str(gate_reason).startswith("INSUFFICIENT_CASH") else str(gate_reason)
             record_day_decision(db_path, symbol, f"REJECTED:{gate_label}", cycle_ts=as_of, closest=signal.setup, unmet=[str(gate_reason)])
             logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s notional=%.4f", symbol, gate_reason, notional)
+            _note_exact(db_path, cand, funded=False, reason=str(gate_reason))
             return
 
         from backend.services.two_engine_claim import claim_symbol, release_claim
@@ -2039,6 +2057,7 @@ class PortfolioEngineIntegration:
         if not claimed:
             record_day_decision(db_path, symbol, claim_reason, cycle_ts=as_of, closest=signal.setup)
             logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s", symbol, claim_reason)
+            _note_exact(db_path, cand, funded=False, reason=str(claim_reason))
             return
 
         # DAY direct live entry: a closed-15m setup that passed the hard gates
@@ -2085,6 +2104,19 @@ class PortfolioEngineIntegration:
                 mark_candidate_filled(db_path, cand.get("markout_id"))
             except Exception:
                 logger.debug("DAY_V2_CANDIDATE_FILLED_MARK_FAILED symbol=%s", symbol, exc_info=True)
+            _trade_id = ""
+            try:
+                from backend.utils.symbols import normalize_symbol as _norm_symbol
+
+                _want = _norm_symbol(symbol)
+                for _pos in (self.engine.open_positions or {}).values():
+                    _pos_symbol = _norm_symbol(str(getattr(_pos, "symbol", "") or ""))
+                    if str(getattr(_pos, "engine_id", "") or "") == "DAY_V2" and _pos_symbol == _want:
+                        _trade_id = str(getattr(_pos, "trade_id", "") or "")
+                        break
+            except Exception:
+                _trade_id = ""
+            _note_exact(db_path, cand, funded=True, reason="FILLED", trade_id=_trade_id)
             try:
                 from backend.services.day_entry_reservations import consume_reservation
 
@@ -2140,6 +2172,7 @@ class PortfolioEngineIntegration:
                 ],
             )
             logger.info("DAY_V2_ENTRY_BLOCKED symbol=%s reason=%s notional=%.4f", symbol, _reject, notional)
+            _note_exact(db_path, cand, funded=False, reason=str(_reject))
 
     # ------------------------------------------------------------------
     # SCALP V2 live entry loop
@@ -3005,6 +3038,9 @@ class PortfolioEngineIntegration:
                             from backend.services.policy_episode import advance_live
 
                             advance_live(self.engine.db_path)
+                        from backend.services.exact_policy_capture import advance_exact_episodes
+
+                        advance_exact_episodes(self.engine.db_path)
                     except Exception:
                         logger.debug("POLICY_EPISODE_ADVANCE_FAILED", exc_info=True)
 
