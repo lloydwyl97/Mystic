@@ -2894,6 +2894,15 @@ class PortfolioEngine:
         self._load_churn_guard_state()
         if not self.test_mode:
             try:
+                from backend.services.continuation_checkpoint import recover_continuation
+
+                recovery = recover_continuation(self.db_path)
+                if recovery.get("status") != "ok":
+                    logger.critical("CONTINUATION_RECOVERY_FAILED %s", recovery)
+            except Exception:
+                logger.exception("CONTINUATION_RECOVERY_FAILED")
+        if not self.test_mode:
+            try:
                 from backend.services.live_fill_economics import apply_first_xrp_rt_correction
 
                 apply_first_xrp_rt_correction(self.db_path)

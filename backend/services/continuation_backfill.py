@@ -1439,26 +1439,37 @@ def fold_recent_advantages(db_path: str, *, now: float | None = None) -> int:
 def fold_advantages_once(db_path: str, labels: list[AdvantageLabel]) -> int:
     """Log and fold each horizon label in one savepoint, so a crash or retry folds it exactly once."""
     folded = 0
+    from backend.services.continuation_checkpoint import ensure_event_columns
+    from backend.services.continuation_surface import ADVANTAGE_VERSION
+
     conn = _connect(db_path)
     try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS continuation_advantage_log (
-                engine_id TEXT NOT NULL,
-                trade_id TEXT NOT NULL,
-                snapshot_time REAL NOT NULL,
-                horizon INTEGER NOT NULL,
-                PRIMARY KEY (engine_id, trade_id, snapshot_time, horizon)
-            )
-            """
-        )
+        ensure_event_columns(conn)
         conn.commit()
         for item in labels:
             conn.execute("SAVEPOINT advantage_fold")
             try:
                 cur = conn.execute(
-                    "INSERT OR IGNORE INTO continuation_advantage_log (engine_id, trade_id, snapshot_time, horizon) VALUES (?,?,?,?)",
-                    (item.engine, item.trade_id, item.snapshot_time, item.horizon),
+                    """
+                    INSERT OR IGNORE INTO continuation_advantage_log (
+                        engine_id, trade_id, snapshot_time, horizon, symbol, setup, regime,
+                        features_json, advantage, weight, label_time, feature_version
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        item.engine,
+                        item.trade_id,
+                        item.snapshot_time,
+                        item.horizon,
+                        item.symbol,
+                        item.setup,
+                        item.regime,
+                        json.dumps(item.features, separators=(",", ":"), sort_keys=True),
+                        float(item.advantage),
+                        float(item.weight),
+                        float(item.label_time),
+                        ADVANTAGE_VERSION,
+                    ),
                 )
                 if cur.rowcount == 1:
                     record_advantage(

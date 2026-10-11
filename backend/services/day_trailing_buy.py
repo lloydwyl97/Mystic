@@ -753,6 +753,11 @@ def _rebuild_explainability(payload: dict[str, Any], symbol: str) -> Any:
 
 
 async def _pre_submit_safety(engine: Any, intent: dict[str, Any], ask: float) -> tuple[bool, str]:
+    from backend.services.continuation_checkpoint import day_entry_block_reason
+
+    blocked = day_entry_block_reason(str(getattr(engine, "db_path", "") or ""))
+    if blocked:
+        return False, blocked
     symbol = str(intent.get("symbol") or "")
     if _api(symbol) not in DAY_TRADE_SYMBOLS:
         return False, "SYMBOL_NOT_EXECUTABLE"
