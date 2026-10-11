@@ -173,9 +173,7 @@ def learner_state_id(db_path: str) -> str:
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
-            row = conn.execute(
-                "SELECT payload, updated_at FROM adaptive_linear_model WHERE engine_id='DAY_V2' AND model LIKE 'continuation_surface%' ORDER BY updated_at DESC LIMIT 1"
-            ).fetchone()
+            row = conn.execute("SELECT payload, updated_at FROM adaptive_linear_model WHERE engine_id='DAY_V2' AND model LIKE 'continuation_surface%' ORDER BY updated_at DESC LIMIT 1").fetchone()
         finally:
             conn.close()
         if row:
@@ -241,6 +239,11 @@ def _book(symbol: str) -> tuple[float | None, float | None]:
     if age > float(BOOK_STALE_SEC) or bid <= 0.0:
         return None, None
     return bid, ask if ask > 0 else None
+
+
+def executable_book(symbol: str) -> tuple[float | None, float | None]:
+    """Fresh (bid, ask) both DAY continuation paths decide on, or (None, None)."""
+    return _book(symbol)
 
 
 def open_exact_episode(db_path: str, cand: dict[str, Any], candidate_id: int | None) -> int | None:
@@ -346,7 +349,7 @@ def open_exact_episode(db_path: str, cand: dict[str, Any], candidate_id: int | N
             return None if row is None else int(row[0])
         return int(cur.lastrowid)
     except sqlite3.Error:
-        logger.debug("EXACT_POLICY_OPEN_FAILED", exc_info=True)
+        logger.warning("EXACT_POLICY_OPEN_FAILED candidate=%s", candidate_id, exc_info=True)
         return None
     finally:
         conn.close()
@@ -370,7 +373,7 @@ def note_disposition(db_path: str, candidate_id: int | None, *, funded: bool, re
         )
         conn.commit()
     except sqlite3.Error:
-        logger.debug("EXACT_POLICY_DISPOSITION_FAILED", exc_info=True)
+        logger.warning("EXACT_POLICY_DISPOSITION_FAILED candidate=%s", candidate_id, exc_info=True)
     finally:
         conn.close()
 
@@ -606,7 +609,7 @@ def advance_exact_episodes(db_path: str, *, now: float | None = None, limit: int
                 stats["exited"] += 1
             conn.commit()
     except sqlite3.Error:
-        logger.debug("EXACT_POLICY_ADVANCE_FAILED", exc_info=True)
+        logger.warning("EXACT_POLICY_ADVANCE_FAILED", exc_info=True)
     finally:
         conn.close()
     return stats

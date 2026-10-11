@@ -11648,14 +11648,15 @@ class PortfolioEngine:
         # basis while its cash had already been spent. The execute_buy_fifo
         # per-symbol lock now serializes concurrent attempts; this fresh read
         # additionally catches the case where memory itself is stale.
-        mem_pos = self.open_positions.get(normalized_symbol)
+        _buy_engine = str(fill_engine_id or "DAY_V2")
+        mem_pos = self._find_position(_buy_engine, normalized_symbol)
         already_open_in_memory = self._day_position_blocks_new_entry(mem_pos)
         already_open_in_db = False
         if not already_open_in_memory:
-            db_row = await asyncio.to_thread(self._fetch_authoritative_open_position_sync, normalized_symbol)
+            db_row = await asyncio.to_thread(self._fetch_authoritative_open_position_sync, normalized_symbol, _buy_engine)
             already_open_in_db = db_row is not None
         if already_open_in_memory or already_open_in_db:
-            open_qty = float(self.open_positions[normalized_symbol].quantity) if already_open_in_memory else float(db_row[0])
+            open_qty = float(mem_pos.quantity) if already_open_in_memory else float(db_row[0])
             logger.info(
                 "BUY_BLOCKED_ALREADY_OPEN: symbol=%s open_qty=%.8f source=%s (HOLD existing position)",
                 normalized_symbol,
@@ -12055,6 +12056,7 @@ class PortfolioEngine:
                     side="buy",
                     quantity=quantity,
                     limit_price=preflight.protected_limit_price,
+                    client_order_id=str(client_order_id or "") or None,
                 )
 
                 if not live_order_buy:
@@ -12202,6 +12204,19 @@ class PortfolioEngine:
                     _entry_reserved = False
                 return None
 
+        if buy_mode == "live" and not live_order_buy:
+            # Live mode with no venue order (live service down or gate closed):
+            # a ledger fill here would be inventory the exchange never delivered.
+            reason = "LIVE_ORDER_NOT_SENT"
+            logger.error("BUY_BLOCKED_%s: %s live_enabled=%s service=%s", reason, symbol, self._live_execution_enabled, bool(self._live_service))
+            await self._record_reject(symbol, "BUY", reason, reason, decision_id=decision_id, explainability=explainability)
+            if decision_id:
+                await self._update_pipeline_decision(decision_id, {"stage": "EXECUTION", "execution_result": "NOT_EXECUTED", "execution_reason": reason})
+            if _entry_reserved:
+                self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
+                _entry_reserved = False
+            return None
+
         # Final cash invariant must pass before any executed trade row is committed.
         # Keep this entry's reservation active so concurrent buys cannot consume its cash
         # between this check and the debit below.
@@ -12210,7 +12225,17 @@ class PortfolioEngine:
             from backend.services.day_entry_spendable import money as _money_cash
 
             free_cash = float(_money_cash(self._available_balance) - _money_cash(pending_other))
-            if total_cost > free_cash:
+            if total_cost > free_cash and live_order_buy:
+                # The venue already filled and debited the cash. Dropping the row
+                # here would leave owned coins no engine tracks or exits.
+                logger.critical(
+                    "CASH_INVARIANT_AFTER_LIVE_FILL: %s total_cost=$%.2f > free=$%.2f order=%s — recording the venue fill",
+                    symbol,
+                    total_cost,
+                    free_cash,
+                    str(live_order_buy.get("id") or ""),
+                )
+            elif total_cost > free_cash:
                 reason = f"total_cost=${total_cost:.2f} > free=${free_cash:.2f} (available=${self._available_balance:.2f} pending=${pending_other:.2f})"
                 logger.error(f"BUY_BLOCKED_CASH_INVARIANT: {symbol} - {reason}")
                 await self._record_reject(
@@ -16734,9 +16759,11 @@ class PortfolioEngine:
             return None
         if _pos_engine_id == "DAY_V2":
             try:
-                from backend.services.exact_policy_capture import live_day_decision, record_live_check
+                from backend.services.exact_policy_capture import executable_book, live_day_decision, record_live_check
 
-                _packed = live_day_decision(self.db_path, position, float(current_price), float(ESTIMATED_ROUNDTRIP_COST))
+                _book_bid, _book_ask = executable_book(symbol)
+                _decision_price = float(_book_bid) if _book_bid else float(current_price)
+                _packed = live_day_decision(self.db_path, position, _decision_price, float(ESTIMATED_ROUNDTRIP_COST))
                 _day_unreal = _packed["net"]
                 _terminal = _packed["terminal"]
                 _day_v2_dec = _packed["decision"]
@@ -16750,8 +16777,8 @@ class PortfolioEngine:
                         trade_id=str(getattr(position, "trade_id", "") or ""),
                         symbol=symbol,
                         decision=_packed,
-                        bid=float(executable_bid) if executable_bid is not None and float(executable_bid) > 0 else None,
-                        ask=None,
+                        bid=_book_bid,
+                        ask=_book_ask,
                     )
                 except Exception:
                     logger.debug("EXACT_POLICY_LIVE_CHECK_SKIPPED symbol=%s", symbol, exc_info=True)
@@ -22549,7 +22576,8 @@ class PortfolioEngine:
         freeze = bool(persisted.get("daily_loss_freeze_active"))
         fs = self._canonical_failsafe_decision()
         failsafe_p = bool(fs.get("tripped")) if fs.get("usable") else False
-        if memory_blocked and not requested_blocked and not cb and not freeze and not failsafe_p:
+        unreadable = bool(persisted.get("read_failed"))
+        if memory_blocked and not requested_blocked and not cb and not freeze and not failsafe_p and not unreadable:
             logger.info(
                 "KILL_SWITCH_MEMORY_RECONCILED: persisted=RESUME memory_was=%s reason_was=%s",
                 memory_mode,
@@ -22559,9 +22587,12 @@ class PortfolioEngine:
             self._kill_switch_reason = ""
             memory_mode = KillSwitchMode.RESUME.value
             memory_blocked = False
-        blocked = bool(memory_blocked or requested_blocked or cb or freeze or failsafe_p)
+        blocked = bool(memory_blocked or requested_blocked or cb or freeze or failsafe_p or unreadable)
         active = None
         reasons: list[str] = []
+        if unreadable:
+            reasons.append("entry_control_unreadable")
+            active = "entry_control_unreadable"
         if requested_blocked or memory_blocked:
             mode = requested if requested_blocked else memory_mode
             reasons.append(f"kill_switch:{mode}:{requested_reason}")

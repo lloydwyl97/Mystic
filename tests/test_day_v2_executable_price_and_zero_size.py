@@ -24,8 +24,8 @@ class FakeRedis:
     def __init__(self) -> None:
         self.hashes: dict[str, dict[str, str]] = {}
 
-    def set_price(self, norm: str, price: float, ts: float, *, field: str = "timestamp") -> None:
-        self.hashes[f"price:{norm}"] = {"v": str(price), field: str(ts)}
+    def set_price(self, norm: str, price: float, ts: float) -> None:
+        self.hashes[f"market_book:{norm}"] = {"ask": str(price), "timestamp": str(ts)}
 
     async def hget(self, key: str, field: str):
         return self.hashes.get(key, {}).get(field)
@@ -146,15 +146,28 @@ async def test_reading_does_not_reset_age(tmp_path, no_canonical):
 
 
 @pytest.mark.asyncio
-async def test_redis_ts_field_is_accepted_as_timestamp(tmp_path, no_canonical):
+async def test_midpoint_price_hash_is_not_the_ask(tmp_path, no_canonical):
     redis = FakeRedis()
-    redis.set_price("XRPUSDT", 1.541, time.time() - 3.0, field="ts")
+    now = time.time()
+    redis.hashes["price:XRPUSDT"] = {"v": "1.398", "timestamp": str(now)}
+    redis.hashes["market_book:XRPUSDT"] = {"bid": "1.3979", "ask": "1.3981", "midpoint": "1.398", "timestamp": str(now - 1.0)}
     integ = _integration(tmp_path, redis)
 
-    px, age = await integ._resolve_day_executable_price("XRPUSDT")
+    px, _age = await integ._resolve_day_executable_price("XRPUSDT")
 
-    assert px == 1.541
-    assert 2.5 <= age <= 6.0
+    assert px == 1.3981
+
+
+@pytest.mark.asyncio
+async def test_quote_without_ask_is_missing_not_the_mark(tmp_path, monkeypatch):
+    async def _mark(symbol, *, use_cache=True):
+        return SimpleNamespace(ask=0.0, mark=2690.96, timestamp=time.time(), source="ticker_24h_last")
+
+    monkeypatch.setattr(canonical_mark_price, "fetch_canonical_mark", _mark)
+    monkeypatch.setattr("backend.services.portfolio_engine_integration.asyncio.sleep", _no_sleep)
+    integ = _integration(tmp_path, FakeRedis())
+
+    assert await integ._resolve_day_executable_price("ETHUSDT") == (0.0, None)
 
 
 @pytest.mark.asyncio

@@ -814,7 +814,10 @@ def read_persisted_entry_control(db_path: str) -> dict[str, Any]:
                     if data.get("updated_at"):
                         out["updated_at"] = data.get("updated_at")
     except Exception:
-        logger.debug("read_persisted_entry_control failed", exc_info=True)
+        logger.warning("read_persisted_entry_control failed", exc_info=True)
+        out["read_failed"] = True
+        out["entry_permitted"] = False
+        out["blocking_reason"] = "ENTRY_CONTROL_UNREADABLE"
         return out
     finally:
         conn.close()

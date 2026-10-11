@@ -11,6 +11,7 @@ import contextlib
 import contextvars
 import logging
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -868,9 +869,14 @@ async def execute_protected_limit_live(
     side_l = side.lower()
     timeout = float(PROTECTED_LIMIT_ORDER_TIMEOUT_SEC)
     poll_interval = 0.5
+    # Binance clientOrderId: at most 36 of [A-Za-z0-9._:/-]. One id per attempt,
+    # so a failed IOC can be looked up at the venue before any second order.
+    base_cid = "".join(ch for ch in str(client_order_id or uuid.uuid4().hex) if ch.isalnum())[:32] or uuid.uuid4().hex
 
     # Try IOC first (full fill or cancel); fall back to GTC+timeout if unsupported.
     for tif in ("IOC", "GTC"):
+        attempt_cid = f"{base_cid}-{tif[0].lower()}"
+        submit_ts = time.time()
         try:
             await live_service._ensure_initialized()
             params: dict[str, Any] = {}
@@ -884,7 +890,7 @@ async def execute_protected_limit_live(
                 side=side_l,
                 amount=quantity,
                 price=limit_price,
-                client_order_id=client_order_id,
+                client_order_id=attempt_cid,
                 time_in_force=tif if tif == "IOC" else None,
             )
         except TypeError:
@@ -896,16 +902,36 @@ async def execute_protected_limit_live(
                 side=side_l,
                 amount=quantity,
                 price=limit_price,
-                client_order_id=client_order_id,
+                client_order_id=attempt_cid,
             )
         except Exception as ex:
             logger.warning("PROTECTED_LIMIT_LIVE place failed tif=%s %s: %s", tif, exchange_symbol, ex)
-            continue
+            result = None
 
         if not result or result.get("status") != "success":
-            if tif == "IOC":
+            if tif != "IOC":
+                return None
+            # An error reply does not prove the IOC never reached the venue.
+            # A second order is sent only when the venue says this id does not exist.
+            await asyncio.sleep(poll_interval)
+            try:
+                probe = await live_service.fetch_order("binanceus", attempt_cid, exchange_symbol)
+            except Exception as ex:
+                probe = {"status": "error", "message": str(ex)}
+            if probe.get("status") == "success" and probe.get("order"):
+                logger.warning("PROTECTED_LIMIT_IOC_FOUND_AFTER_ERROR %s %s cid=%s", side_l, exchange_symbol, attempt_cid)
+                result = {"status": "success", "order": probe.get("order")}
+            elif str(probe.get("code") or "") == "-2013":
                 continue
-            return None
+            else:
+                logger.error(
+                    "PROTECTED_LIMIT_IOC_UNCONFIRMED %s %s cid=%s — no second order without venue confirmation: %s",
+                    side_l,
+                    exchange_symbol,
+                    attempt_cid,
+                    str(probe.get("message") or "")[:200],
+                )
+                return None
 
         response_ts = time.time()
         order = result.get("order") or {}

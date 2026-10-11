@@ -55,7 +55,7 @@ except Exception as e:
     except Exception as e2:
         print(f"[ERROR] Fallback .env loading also failed: {e2}")
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -1103,7 +1103,12 @@ def create_app() -> FastAPI:
         Used when critical bugs or issues are detected.
         """
         pause_trading()
-        return {"status": "paused", "message": "Live trading is now PAUSED - no new trades will execute", "timestamp": datetime.now(timezone.utc).isoformat()}
+        from backend.services.portfolio_engine import get_portfolio_engine
+
+        persisted = await get_portfolio_engine().set_kill_switch("PAUSE_BUYS", "api_system_pause_trading")
+        if not persisted.get("success", True):
+            raise HTTPException(status_code=500, detail=f"kill switch not persisted: {persisted.get('error')}")
+        return {"status": "paused", "message": "New entries are PAUSED (persisted PAUSE_BUYS); exits keep running", "timestamp": datetime.now(timezone.utc).isoformat()}
 
     @app.post("/api/system/resume-trading")
     async def resume_trading_endpoint(_: None = Depends(require_admin_key)):
@@ -1112,7 +1117,12 @@ def create_app() -> FastAPI:
         Should only be called after critical issues are resolved.
         """
         resume_trading()
-        return {"status": "resumed", "message": "Live trading is now RESUMED - trades can execute", "timestamp": datetime.now(timezone.utc).isoformat()}
+        from backend.services.portfolio_engine import get_portfolio_engine
+
+        persisted = await get_portfolio_engine().set_kill_switch("RESUME", "api_system_resume_trading")
+        if not persisted.get("success", True):
+            raise HTTPException(status_code=500, detail=f"kill switch not persisted: {persisted.get('error')}")
+        return {"status": "resumed", "message": "Entries RESUMED (persisted kill switch RESUME)", "timestamp": datetime.now(timezone.utc).isoformat()}
 
     @app.post("/api/system/restart")
     async def restart_service_endpoint(_: None = Depends(require_admin_key)):

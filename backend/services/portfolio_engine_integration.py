@@ -1534,16 +1534,16 @@ class PortfolioEngineIntegration:
         """Return (ask, age_sec). Never substitutes zero for a missing book.
 
         Only timestamped sources are used. ``current_prices`` carries no timestamp and
-        is refreshed only for open positions, so it is never read here.
+        is refreshed only for open positions, so it is never read here. ``price:{SYMBOL}``
+        holds the midpoint, so the ask comes from ``market_book:{SYMBOL}`` and a quote
+        without an ask is missing, not replaced by the mark.
         """
         norm = symbol.upper().replace("-", "").replace("/", "")
         ccxt = f"{norm[:-4]}/USDT" if norm.endswith("USDT") else symbol
         if self.redis_client is not None:
             try:
-                raw = await self.redis_client.hget(f"price:{norm}", "v")
-                ts_raw = await self.redis_client.hget(f"price:{norm}", "timestamp")
-                if not ts_raw:
-                    ts_raw = await self.redis_client.hget(f"price:{norm}", "ts")
+                raw = await self.redis_client.hget(f"market_book:{norm}", "ask")
+                ts_raw = await self.redis_client.hget(f"market_book:{norm}", "timestamp")
                 if isinstance(raw, bytes):
                     raw = raw.decode()
                 if isinstance(ts_raw, bytes):
@@ -1555,7 +1555,7 @@ class PortfolioEngineIntegration:
                     if age <= _DAY_V2_EXECUTABLE_PRICE_STALE_SEC:
                         self.current_prices[norm] = px
                         logger.info(
-                            "DAY_V2_EXECUTABLE_PRICE symbol=%s price=%.8f source=redis_price_hash source_ts=%.3f age=%.3f",
+                            "DAY_V2_EXECUTABLE_PRICE symbol=%s price=%.8f source=redis_market_book_ask source_ts=%.3f age=%.3f",
                             symbol,
                             px,
                             source_ts,
@@ -1572,8 +1572,6 @@ class PortfolioEngineIntegration:
             except Exception:
                 mark = None
             ask = float(getattr(mark, "ask", 0) or 0) if mark is not None else 0.0
-            if ask <= 0 and mark is not None:
-                ask = float(getattr(mark, "mark", 0) or 0)
             stamped = float(getattr(mark, "timestamp", 0) or 0) if mark is not None else 0.0
             if ask > 0 and stamped > 0:
                 self.current_prices[norm] = ask
@@ -1832,7 +1830,7 @@ class PortfolioEngineIntegration:
 
                     open_exact_episode(db_path, cand, cand.get("markout_id"))
                 except Exception:
-                    logger.debug("EXACT_POLICY_OPEN_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
+                    logger.warning("EXACT_POLICY_OPEN_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
             for cand in ranked:
                 try:
                     await self._fund_day_v2_candidate(cand, db_path)
@@ -1959,7 +1957,7 @@ class PortfolioEngineIntegration:
 
                 note_disposition(path, candidate.get("markout_id"), funded=funded, reason=reason, trade_id=trade_id)
             except Exception:
-                logger.debug("EXACT_POLICY_DISPOSITION_FAILED symbol=%s", candidate.get("symbol"), exc_info=True)
+                logger.warning("EXACT_POLICY_DISPOSITION_FAILED symbol=%s", candidate.get("symbol"), exc_info=True)
 
         from backend.services.day_v2.decision_log import record_day_decision
         from backend.services.day_v2.ranking import clamp_to_sleeve

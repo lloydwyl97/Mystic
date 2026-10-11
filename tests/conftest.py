@@ -34,6 +34,9 @@ os.environ.setdefault("SCALP_PAPER_AUTO_ARM", "true")
 
 def _ensure_isolated_schema(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Rows left by an earlier session make store-backed tests depend on run history.
+    for leftover in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        leftover.unlink(missing_ok=True)
     from backend.database_schema import create_paper_trades_table, ensure_paper_trades_columns
 
     create_paper_trades_table(str(path))
