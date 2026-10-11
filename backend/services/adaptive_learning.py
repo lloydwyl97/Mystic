@@ -29,6 +29,7 @@ eligibility, rank and size, and both are in policy units.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 import math
@@ -509,8 +510,11 @@ def observe(
     strategy_version: str,
     now: float | None = None,
     weight: float = 1.0,
+    conn: sqlite3.Connection | None = None,
 ) -> bool:
     """Fold one current-version observation into the key under the current economic version.
+
+    With ``conn`` the fold joins the caller's transaction and is not committed here.
 
     Returns False for another strategy version, an unknown metric, a value that
     is not finite or a non-positive weight. ``now`` is the observation time
@@ -526,21 +530,24 @@ def observe(
         return False
     if value is None or not math.isfinite(float(value)):
         return False
-    with _connect(db_path) as conn:
-        folded = _fold_observation(
-            conn,
-            engine=engine,
-            symbol=symbol,
-            setup=setup,
-            regime=regime,
-            metric=metric,
-            value=value,
-            strategy_version=strategy_version,
-            now=now,
-            weight=weight,
-        )
+    fold = functools.partial(
+        _fold_observation,
+        engine=engine,
+        symbol=symbol,
+        setup=setup,
+        regime=regime,
+        metric=metric,
+        value=value,
+        strategy_version=strategy_version,
+        now=now,
+        weight=weight,
+    )
+    if conn is not None:
+        return fold(conn)
+    with _connect(db_path) as own:
+        folded = fold(own)
         if folded:
-            conn.commit()
+            own.commit()
     return folded
 
 
@@ -1153,9 +1160,20 @@ def _standardize(st: dict[str, Any], feats: dict[str, float]) -> dict[str, float
     return z
 
 
-def update_linear_model(db_path: str, engine: str, model: str, features: dict | None, target: float, *, now: float | None = None, weight: float = 1.0) -> None:
+def update_linear_model(
+    db_path: str,
+    engine: str,
+    model: str,
+    features: dict | None,
+    target: float,
+    *,
+    now: float | None = None,
+    weight: float = 1.0,
+    conn: sqlite3.Connection | None = None,
+) -> None:
     """One online (normalised-LMS) step, scaled by the sample's ``weight`` in [0, 1].
-    Standardisation stats adapt via EWMA; weights are clamped."""
+    Standardisation stats adapt via EWMA; weights are clamped. With ``conn`` the
+    step joins the caller's transaction and is not committed here."""
     step = _clamp(float(weight), 0.0, 1.0) if math.isfinite(float(weight)) else 0.0
     if step <= 0:
         return
@@ -1172,34 +1190,41 @@ def update_linear_model(db_path: str, engine: str, model: str, features: dict | 
     if any(not math.isfinite(v) for v in feats.values()):
         return
     engine_id = str(engine or "").upper()
-    with _connect(db_path) as conn:
-        st = _load_linear(conn, engine_id, model)
-        a = MICRO_MODEL_STD_ALPHA * step
-        lr = MICRO_MODEL_LR * step
-        for f, x in feats.items():
-            mu = float(st["mu"].get(f, x))
-            new_mu = (1.0 - a) * mu + a * x
-            s2 = float(st["s2"].get(f, 1.0))
-            new_s2 = (1.0 - a) * s2 + a * (x - new_mu) ** 2
-            st["mu"][f] = new_mu
-            st["s2"][f] = max(new_s2, 1e-9)
-        z = _standardize(st, feats)
-        pred = float(st["bias"]) + sum(float(st["w"].get(f, 0.0)) * z[f] for f in feats)
-        err = float(target) - pred
-        st["bias"] = float(st["bias"]) + lr * err
-        for f in feats:
-            w = float(st["w"].get(f, 0.0)) + lr * err * z[f]
-            st["w"][f] = _clamp(w, -MICRO_MODEL_W_MAX, MICRO_MODEL_W_MAX)
-        st["n"] = float(st.get("n", 0)) + step
-        conn.execute(
-            """
-            INSERT INTO adaptive_linear_model (engine_id, model, payload, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(engine_id, model) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at
-            """,
-            (engine_id, _model_key(engine_id, model), json.dumps(st, separators=(",", ":")), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time()))),
-        )
-        conn.commit()
+    if conn is not None:
+        _linear_step(conn, engine_id, model, feats, target, step, now)
+        return
+    with _connect(db_path) as own:
+        _linear_step(own, engine_id, model, feats, target, step, now)
+        own.commit()
+
+
+def _linear_step(conn: sqlite3.Connection, engine_id: str, model: str, feats: dict[str, float], target: float, step: float, now: float | None) -> None:
+    st = _load_linear(conn, engine_id, model)
+    a = MICRO_MODEL_STD_ALPHA * step
+    lr = MICRO_MODEL_LR * step
+    for f, x in feats.items():
+        mu = float(st["mu"].get(f, x))
+        new_mu = (1.0 - a) * mu + a * x
+        s2 = float(st["s2"].get(f, 1.0))
+        new_s2 = (1.0 - a) * s2 + a * (x - new_mu) ** 2
+        st["mu"][f] = new_mu
+        st["s2"][f] = max(new_s2, 1e-9)
+    z = _standardize(st, feats)
+    pred = float(st["bias"]) + sum(float(st["w"].get(f, 0.0)) * z[f] for f in feats)
+    err = float(target) - pred
+    st["bias"] = float(st["bias"]) + lr * err
+    for f in feats:
+        w = float(st["w"].get(f, 0.0)) + lr * err * z[f]
+        st["w"][f] = _clamp(w, -MICRO_MODEL_W_MAX, MICRO_MODEL_W_MAX)
+    st["n"] = float(st.get("n", 0)) + step
+    conn.execute(
+        """
+        INSERT INTO adaptive_linear_model (engine_id, model, payload, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(engine_id, model) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at
+        """,
+        (engine_id, _model_key(engine_id, model), json.dumps(st, separators=(",", ":")), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time()))),
+    )
 
 
 def micro_edge_tilt(db_path: str, engine: str, features: dict | None) -> tuple[float, float]:
@@ -1223,7 +1248,16 @@ def micro_edge_tilt(db_path: str, engine: str, features: dict | None) -> tuple[f
     return _clamp(tilt, -MICRO_MODEL_TILT_MAX, MICRO_MODEL_TILT_MAX), n
 
 
-def learn_micro_weight(db_path: str, *, strategy_version: str, tilt: float, miss: float, now: float | None = None, weight: float = 1.0) -> bool:
+def learn_micro_weight(
+    db_path: str,
+    *,
+    strategy_version: str,
+    tilt: float,
+    miss: float,
+    now: float | None = None,
+    weight: float = 1.0,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
     """Fold one resolved claim into the micro-weight moments.
 
     ``tilt`` is the decision-time micro term before the weight; ``miss`` is the
@@ -1236,7 +1270,7 @@ def learn_micro_weight(db_path: str, *, strategy_version: str, tilt: float, miss
     sym, stp, reg = MICRO_WEIGHT_KEY
     wrote = False
     for metric, value in zip(MICRO_WEIGHT_METRICS, (t * t, t * e), strict=True):
-        wrote = observe(db_path, engine=SCALP_ENGINE, symbol=sym, setup=stp, regime=reg, metric=metric, value=value, strategy_version=strategy_version, now=now, weight=weight) or wrote
+        wrote = observe(db_path, engine=SCALP_ENGINE, symbol=sym, setup=stp, regime=reg, metric=metric, value=value, strategy_version=strategy_version, now=now, weight=weight, conn=conn) or wrote
     return wrote
 
 
@@ -1270,6 +1304,7 @@ def learn_claim_label(
     gross: float,
     now: float | None = None,
     weight: float = 1.0,
+    conn: sqlite3.Connection | None = None,
 ) -> bool:
     """Fold one resolved strategy claim into the key's (projection, gross) moments.
 
@@ -1281,7 +1316,22 @@ def learn_claim_label(
     g = float(gross)
     wrote = False
     for metric, value in zip(CLAIM_MOMENT_METRICS, (b, b * b, g, b * g), strict=True):
-        wrote = observe(db_path, engine=SCALP_ENGINE, symbol=symbol, setup=setup, regime=regime, metric=metric, value=value, strategy_version=strategy_version, now=now, weight=weight) or wrote
+        wrote = (
+            observe(
+                db_path,
+                engine=SCALP_ENGINE,
+                symbol=symbol,
+                setup=setup,
+                regime=regime,
+                metric=metric,
+                value=value,
+                strategy_version=strategy_version,
+                now=now,
+                weight=weight,
+                conn=conn,
+            )
+            or wrote
+        )
     return wrote
 
 
@@ -1510,6 +1560,23 @@ def close_learning_net_pct(
     return (exit_px - entry) / entry - cost
 
 
+_CLOSE_LEDGER_DDL = """
+CREATE TABLE IF NOT EXISTS adaptive_close_learned (
+    engine_id TEXT NOT NULL,
+    close_key TEXT NOT NULL,
+    learned_at REAL NOT NULL,
+    PRIMARY KEY (engine_id, close_key)
+)
+"""
+
+
+def _close_already_learned(db_path: str, engine_id: str, close_key: str) -> bool:
+    with _connect(db_path) as conn:
+        conn.execute(_CLOSE_LEDGER_DDL)
+        row = conn.execute("SELECT 1 FROM adaptive_close_learned WHERE engine_id=? AND close_key=?", (engine_id, str(close_key))).fetchone()
+    return row is not None
+
+
 def learn_from_close(
     db_path: str,
     *,
@@ -1531,13 +1598,15 @@ def learn_from_close(
     opportunity_id: str = "",
     exit_reason: str | None = None,
     candidate_id: int | None = None,
+    close_key: str = "",
 ) -> bool:
     """Realized-trade update. Dust, non-current versions, positions entered
     before the engine's economic anchor and closes of a retired exit policy
     (``exit_contract_of`` not CURRENT) do not move state. ``candidate_id`` (the
     entry's own row) or ``opportunity_id`` links the close to its filled
     candidate so calibration learns at the close and the policy gap learns when
-    its market label is final."""
+    its market label is final. A ``close_key`` (the lot's trade id) is learned
+    once: its ledger row and every metric fold commit together."""
     if is_dust or not version_current:
         return False
     engine_id = str(engine or "").upper()
@@ -1546,6 +1615,8 @@ def learn_from_close(
     if exit_contract_of(engine_id, entered_at=entered_at, exit_reason=exit_reason) != "CURRENT":
         return False
     wrote = False
+    if close_key and _close_already_learned(db_path, engine_id, close_key):
+        return False
     if net_pct is not None and (opportunity_id or candidate_id):
         wrote = record_policy_outcome(db_path, engine=engine_id, opportunity_id=opportunity_id, net_pct=float(net_pct), now=now, candidate_id=candidate_id) or wrote
     if engine_id == DAY_ENGINE:
@@ -1565,10 +1636,7 @@ def learn_from_close(
         )
     else:
         return False
-    for metric, value in pairs:
-        if value is None:
-            continue
-        wrote = observe(db_path, engine=engine_id, symbol=symbol, setup=setup, regime=regime, metric=metric, value=float(value), strategy_version=strategy_version, now=now) or wrote
+    folds: list[dict[str, Any]] = [{"metric": metric, "value": float(value)} for metric, value in pairs if value is not None]
     if net_pct is not None and unrealized_marks:
         clean: list[float] = []
         for raw in unrealized_marks:
@@ -1582,22 +1650,32 @@ def learn_from_close(
         sampled = clean[::step][:8]
         if sampled:
             share = 1.0 / len(sampled)
-            for mark in sampled:
-                wrote = (
-                    observe(
-                        db_path,
-                        engine=engine_id,
-                        symbol=symbol,
-                        setup=setup,
-                        regime=regime,
-                        metric=hold_remaining_metric(mark),
-                        value=float(net_pct) - mark,
-                        strategy_version=strategy_version,
-                        now=now,
-                        weight=share,
-                    )
-                    or wrote
-                )
+            folds.extend({"metric": hold_remaining_metric(mark), "value": float(net_pct) - mark, "weight": share} for mark in sampled)
+    key = {"engine": engine_id, "symbol": symbol, "setup": setup, "regime": regime, "strategy_version": strategy_version, "now": now}
+    if not close_key:
+        for fold in folds:
+            wrote = observe(db_path, **key, **fold) or wrote
+        return wrote
+    with _connect(db_path) as conn:
+        conn.execute(_CLOSE_LEDGER_DDL)
+        conn.execute("SAVEPOINT close_learn")
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO adaptive_close_learned (engine_id, close_key, learned_at) VALUES (?,?,?)",
+                (engine_id, str(close_key), float(now if now is not None else time.time())),
+            )
+            if cur.rowcount != 1:
+                conn.execute("ROLLBACK TO close_learn")
+                conn.execute("RELEASE close_learn")
+                return wrote
+            for fold in folds:
+                wrote = observe(db_path, **key, **fold, conn=conn) or wrote
+            conn.execute("RELEASE close_learn")
+        except Exception:
+            conn.execute("ROLLBACK TO close_learn")
+            conn.execute("RELEASE close_learn")
+            raise
+        conn.commit()
     return wrote
 
 
@@ -2075,8 +2153,12 @@ def observe_policy_calibration(
     realized: float,
     base: float,
     now: float,
+    policy_base: str = "",
 ) -> bool:
     """One running-mean observation of realized net minus the entry's base forecast.
+
+    ``policy_base`` is the entry's stored base; a trade_net base trains the live
+    ``trade_net_calibration``, as ``_calibration_metric`` does for live closes.
 
     ``base`` is the forecast before calibration. The calibration is added to that
     base, so it must learn the base's residual: measuring against the calibrated
@@ -2091,11 +2173,19 @@ def observe_policy_calibration(
         symbol=symbol,
         setup=setup,
         regime=regime,
-        metric="policy_calibration",
+        metric="trade_net_calibration" if str(engine or "").upper() == DAY_ENGINE and str(policy_base or "") == DAY_POLICY_BASE else "policy_calibration",
         value=float(realized) - float(base),
         strategy_version=current_strategy_version(str(engine or "").upper()),
         now=float(now),
     )
+
+
+def _calibration_metric(row: Any) -> str:
+    """Which calibration a close trains. Only a base that was itself the trade_net
+    posterior trains the live residual; any other base stays on the forensic metric."""
+    engine_id = str(row["engine_id"])
+    econ = _economic_of(row)
+    return "trade_net_calibration" if engine_id == DAY_ENGINE and str(econ.get("policy_base") or "") == DAY_POLICY_BASE else "policy_calibration"
 
 
 def _learn_policy_calibration(conn: sqlite3.Connection, db_path: str, row: Any, realized: float, moment: float) -> bool:
@@ -2113,10 +2203,7 @@ def _learn_policy_calibration(conn: sqlite3.Connection, db_path: str, row: Any, 
     base = _entry_base_forecast(row)
     if base is None:
         return False
-    # Only a base that was itself the trade_net posterior may train the live
-    # residual. A lifecycle-plus-gap base stays on the forensic metric.
-    econ = _economic_of(row)
-    metric = "trade_net_calibration" if engine_id == DAY_ENGINE and str(econ.get("policy_base") or "") == DAY_POLICY_BASE else "policy_calibration"
+    metric = _calibration_metric(row)
     return _claim_and_fold(
         conn,
         row_id=int(row["id"]),
@@ -2256,18 +2343,20 @@ def repair_marked_calibration_without_observation(conn: sqlite3.Connection) -> t
     observation is left unchanged, so a second pass cannot duplicate it.
     Fills, accounting and lifecycle history are not written."""
     rows = conn.execute("SELECT * FROM adaptive_candidate_markouts WHERE filled=1 AND realized_net IS NOT NULL AND calibration_learned=1").fetchall()
-    groups: dict[tuple[str, str, str, str, str], list[Any]] = {}
+    groups: dict[tuple[tuple[str, str, str, str, str], str], list[Any]] = {}
     for row in rows:
         identity = _calibration_identity(row)
         if identity is None:
             continue
-        groups.setdefault(identity, []).append(row)
+        groups.setdefault((identity, _calibration_metric(row)), []).append(row)
     folded = 0
     cleared = 0
-    for identity, members in groups.items():
+    for (identity, cal_metric), members in groups.items():
+        # The presence check reads the metric this close trains, so a close already
+        # learned into trade_net_calibration is never folded again elsewhere.
         present = conn.execute(
-            "SELECT 1 FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND symbol=? AND setup=? AND regime=? AND metric='policy_calibration'",
-            identity,
+            "SELECT 1 FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND symbol=? AND setup=? AND regime=? AND metric=?",
+            (*identity, cal_metric),
         ).fetchone()
         if present is not None:
             continue
@@ -2298,7 +2387,7 @@ def repair_marked_calibration_without_observation(conn: sqlite3.Connection) -> t
                     symbol=str(row["symbol"]),
                     setup=str(row["setup"]),
                     regime=str(row["regime"]),
-                    metric="policy_calibration",
+                    metric=cal_metric,
                     value=realized - base,
                     strategy_version=str(row["strategy_version"]),
                     now=moment,
@@ -2347,7 +2436,7 @@ def rebuild_policy_calibration(conn: sqlite3.Connection) -> tuple[int, int]:
     try:
         for engine_id in _PRIORS:
             conn.execute(
-                "DELETE FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND metric='policy_calibration'",
+                "DELETE FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND metric IN ('policy_calibration', 'trade_net_calibration')",
                 (engine_id, current_economic_version(engine_id)),
             )
         for moment, row_id, row, target in ready:
@@ -2357,7 +2446,7 @@ def rebuild_policy_calibration(conn: sqlite3.Connection) -> tuple[int, int]:
                 symbol=str(row["symbol"]),
                 setup=str(row["setup"]),
                 regime=str(row["regime"]),
-                metric="policy_calibration",
+                metric=_calibration_metric(row),
                 value=target,
                 strategy_version=str(row["strategy_version"]),
                 now=moment,
@@ -2588,6 +2677,59 @@ def repair_stored_short_marks(db_path: str, *, limit: int = 500) -> int:
 _short_marks_repaired = False
 
 
+def _fold_markout_labels(
+    conn: sqlite3.Connection,
+    db_path: str,
+    row: sqlite3.Row,
+    *,
+    engine_id: str,
+    forward: float,
+    mae: float | None,
+    residual: float | None,
+    raw_source: Any,
+    raw_move: Any,
+    uniqueness: float,
+    micro_target: float | None,
+    micro_feats: dict | None,
+    moment: float,
+) -> None:
+    """Every state write of one resolved markout, on the caller's transaction."""
+    version = str(row["strategy_version"])
+    key = {"engine": engine_id, "symbol": row["symbol"], "setup": row["setup"], "regime": row["regime"], "strategy_version": version, "now": moment, "conn": conn}
+    observe(db_path, metric="markout_forward", value=forward, **key)
+    if mae is not None:
+        observe(db_path, metric="markout_mae", value=mae, **key)
+    if residual is not None:
+        observe(db_path, metric=residual_metric(raw_source), value=residual, **key)
+        if is_directional(raw_source) and raw_move is not None:
+            learn_claim_label(
+                db_path,
+                symbol=row["symbol"],
+                setup=row["setup"],
+                regime=row["regime"],
+                strategy_version=version,
+                raw=float(raw_move),
+                gross=float(forward) + float(row["roundtrip_cost"] or 0),
+                now=moment,
+                weight=uniqueness,
+                conn=conn,
+            )
+    if engine_id == SCALP_ENGINE and micro_target is not None:
+        if micro_feats:
+            update_linear_model(db_path, SCALP_ENGINE, "micro_edge", micro_feats, micro_target, now=moment, weight=uniqueness, conn=conn)
+        econ = _economic_of(row)
+        if "micro_unweighted" in econ and "pre_micro_edge" in econ:
+            learn_micro_weight(
+                db_path,
+                strategy_version=version,
+                tilt=float(econ["micro_unweighted"]),
+                miss=float(forward) - float(econ["pre_micro_edge"]),
+                now=moment,
+                weight=uniqueness,
+                conn=conn,
+            )
+
+
 def resolve_markouts(
     db_path: str,
     quote: Callable[[str, float], float | None],
@@ -2749,76 +2891,45 @@ def resolve_markouts(
                 version_ok = str(row["strategy_version"]) == current_strategy_version(engine_id) and str(row["economic_version"] or "") == current_economic_version(engine_id)
                 learn_fixed = forward is not None and not row_learned and version_ok and learnable
                 if learn_fixed:
-                    # Claim first. A failed state write must not re-train this row.
-                    cur = conn.execute(
-                        "UPDATE adaptive_candidate_markouts SET markouts_json=?, learned=1, resolved=? WHERE id=? AND learned=0",
-                        (json.dumps(marks), 1 if done else 0, row["id"]),
-                    )
-                    conn.commit()
-                    learn_fixed = cur.rowcount == 1
-                if learn_fixed:
-                    observe(
-                        db_path,
-                        engine=engine_id,
-                        symbol=row["symbol"],
-                        setup=row["setup"],
-                        regime=row["regime"],
-                        metric="markout_forward",
-                        value=forward,
-                        strategy_version=str(row["strategy_version"]),
-                        now=moment,
-                    )
-                    if mae is not None:
-                        observe(
-                            db_path,
-                            engine=engine_id,
-                            symbol=row["symbol"],
-                            setup=row["setup"],
-                            regime=row["regime"],
-                            metric="markout_mae",
-                            value=mae,
-                            strategy_version=str(row["strategy_version"]),
-                            now=moment,
-                        )
-                    if residual is not None:
-                        observe(
-                            db_path,
-                            engine=engine_id,
-                            symbol=row["symbol"],
-                            setup=row["setup"],
-                            regime=row["regime"],
-                            metric=residual_metric(raw_source),
-                            value=residual,
-                            strategy_version=str(row["strategy_version"]),
-                            now=moment,
-                        )
-                        if is_directional(raw_source) and raw_move is not None:
-                            learn_claim_label(
-                                db_path,
-                                symbol=row["symbol"],
-                                setup=row["setup"],
-                                regime=row["regime"],
-                                strategy_version=str(row["strategy_version"]),
-                                raw=float(raw_move),
-                                gross=float(forward) + float(row["roundtrip_cost"] or 0),
-                                now=moment,
-                                weight=uniqueness,
-                            )
+                    micro_feats: dict | None = None
                     if engine_id == SCALP_ENGINE and micro_target is not None:
-                        with contextlib.suppress(Exception):
-                            feats = json.loads(row["features_json"] or "{}")
-                            if isinstance(feats, dict) and feats:
-                                update_linear_model(db_path, SCALP_ENGINE, "micro_edge", feats, micro_target, now=moment, weight=uniqueness)
-                        econ = _economic_of(row)
-                        if "micro_unweighted" in econ and "pre_micro_edge" in econ:
-                            learn_micro_weight(
+                        with contextlib.suppress(ValueError, TypeError):
+                            parsed = json.loads(row["features_json"] or "{}")
+                            micro_feats = parsed if isinstance(parsed, dict) and parsed else None
+                    # The claim and every fold commit together. A crash leaves the row
+                    # unclaimed and the state untouched, so the retry learns it once.
+                    conn.execute("SAVEPOINT markout_learn")
+                    try:
+                        cur = conn.execute(
+                            "UPDATE adaptive_candidate_markouts SET markouts_json=?, learned=1, resolved=? WHERE id=? AND learned=0",
+                            (json.dumps(marks), 1 if done else 0, row["id"]),
+                        )
+                        learn_fixed = cur.rowcount == 1
+                        if learn_fixed:
+                            _fold_markout_labels(
+                                conn,
                                 db_path,
-                                strategy_version=str(row["strategy_version"]),
-                                tilt=float(econ["micro_unweighted"]),
-                                miss=float(forward) - float(econ["pre_micro_edge"]),
-                                now=moment,
-                                weight=uniqueness,
+                                row,
+                                engine_id=engine_id,
+                                forward=forward,
+                                mae=mae,
+                                residual=residual,
+                                raw_source=raw_source,
+                                raw_move=raw_move,
+                                uniqueness=uniqueness,
+                                micro_target=micro_target,
+                                micro_feats=micro_feats,
+                                moment=moment,
                             )
+                        else:
+                            conn.execute("ROLLBACK TO markout_learn")
+                        conn.execute("RELEASE markout_learn")
+                    except Exception:
+                        conn.execute("ROLLBACK TO markout_learn")
+                        conn.execute("RELEASE markout_learn")
+                        raise
+                    conn.commit()
+                if learn_fixed:
                     learned += 1
                 life = marks.get("lifecycle")
                 if (
@@ -2831,20 +2942,28 @@ def resolve_markouts(
                     and not int(row["lifecycle_learned"] or 0)
                     and _opportunity_learnable(conn, row)
                 ):
-                    cur = conn.execute("UPDATE adaptive_candidate_markouts SET lifecycle_learned=1 WHERE id=? AND lifecycle_learned=0", (row["id"],))
+                    conn.execute("SAVEPOINT lifecycle_learn")
+                    try:
+                        cur = conn.execute("UPDATE adaptive_candidate_markouts SET lifecycle_learned=1 WHERE id=? AND lifecycle_learned=0", (row["id"],))
+                        if cur.rowcount == 1:
+                            observe(
+                                db_path,
+                                engine=DAY_ENGINE,
+                                symbol=row["symbol"],
+                                setup=row["setup"],
+                                regime=row["regime"],
+                                metric="lifecycle_net",
+                                value=float(life["net"]),
+                                strategy_version=str(row["strategy_version"]),
+                                now=moment,
+                                conn=conn,
+                            )
+                        conn.execute("RELEASE lifecycle_learn")
+                    except Exception:
+                        conn.execute("ROLLBACK TO lifecycle_learn")
+                        conn.execute("RELEASE lifecycle_learn")
+                        raise
                     conn.commit()
-                    if cur.rowcount == 1:
-                        observe(
-                            db_path,
-                            engine=DAY_ENGINE,
-                            symbol=row["symbol"],
-                            setup=row["setup"],
-                            regime=row["regime"],
-                            metric="lifecycle_net",
-                            value=float(life["net"]),
-                            strategy_version=str(row["strategy_version"]),
-                            now=moment,
-                        )
                 if int(row["filled"] or 0) and row["realized_net"] is not None and not int(row["calibration_learned"] or 0):
                     if float(row["evaluated_at"] or 0.0) >= _calibration_backfill_floor():
                         _learn_policy_calibration(conn, db_path, row, float(row["realized_net"]), moment)

@@ -345,8 +345,11 @@ def record_advantage(
     advantage: float,
     weight: float,
     now: float,
+    conn: Any = None,
 ) -> bool:
-    """Fold one horizon advantage into the live surface. Does not touch entry metrics."""
+    """Fold one horizon advantage into the live surface. Does not touch entry metrics.
+
+    With ``conn`` both writes join the caller's transaction and are not committed here."""
     from backend.services.adaptive_learning import _connect
 
     engine_id = str(engine or "").upper()
@@ -361,10 +364,13 @@ def record_advantage(
         strategy_version=current_strategy_version(engine_id),
         now=now,
         weight=weight,
+        conn=conn,
     )
     if not ok:
         return False
-    conn = _connect(db_path)
+    own = conn is None
+    if own:
+        conn = _connect(db_path)
     try:
         key = _model_key(engine_id)
         row = conn.execute("SELECT payload FROM adaptive_linear_model WHERE engine_id=? AND model=?", (engine_id, key)).fetchone()
@@ -386,9 +392,11 @@ def record_advantage(
             """,
             (engine_id, key, json.dumps(payload, separators=(",", ":")), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))),
         )
-        conn.commit()
+        if own:
+            conn.commit()
     finally:
-        conn.close()
+        if own:
+            conn.close()
     return True
 
 

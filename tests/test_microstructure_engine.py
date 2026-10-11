@@ -13,6 +13,8 @@ import time
 
 import pytest
 
+_REAL_FEATURES_FROM_REDIS = importlib.import_module("backend.services.microstructure_engine")._features_from_redis
+
 
 @pytest.fixture(autouse=True)
 def _fresh_state(monkeypatch):
@@ -246,10 +248,29 @@ def test_stale_redis_features_are_not_authoritative(monkeypatch):
 
     class _R:
         def hgetall(self, key):
-            return {"data_age_sec": "99", "ofi_5s": "9"}
+            return {"data_age_sec": "99", "ts": str(time.time()), "ofi_5s": "9"}
 
     monkeypatch.setattr("backend.config.redis_config.get_shared_redis_sync", _R)
-    assert m._features_from_redis("ETHUSDT") == {}
+    assert m is not None
+    assert _REAL_FEATURES_FROM_REDIS("ETHUSDT") == {}
+
+
+def test_redis_features_are_aged_from_their_publish_time(monkeypatch):
+    from backend.services import microstructure_engine as m
+
+    stamp = {"ts": time.time() - 25.0}
+
+    class _R:
+        def hgetall(self, key):
+            return {"data_age_sec": "0.01", "ts": str(stamp["ts"]), "ofi_5s": "9"}
+
+    monkeypatch.setattr("backend.config.redis_config.get_shared_redis_sync", _R)
+    monkeypatch.setattr(m, "_attach_cross_market", lambda *_a, **_k: None)
+    assert _REAL_FEATURES_FROM_REDIS("ETHUSDT") == {}
+
+    stamp["ts"] = time.time() - 1.0
+    fresh = _REAL_FEATURES_FROM_REDIS("ETHUSDT")
+    assert fresh["ofi_5s"] == 9.0 and fresh["data_age_sec"] < 10.0
 
 
 def test_get_stats_reports_tracked_symbols():

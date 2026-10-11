@@ -208,6 +208,7 @@ def rebuild_day(
                 realized=float(fill["net"]),
                 base=base,
                 now=float(fill["closed_at"]),
+                policy_base=str(((fill.get("decision") or {}).get("economic") or {}).get("policy_base") or "") if isinstance(fill.get("decision"), dict) else "",
             ):
                 counts["policy_calibrations"] += 1
             if cand is not None:

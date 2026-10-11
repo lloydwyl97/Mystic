@@ -209,8 +209,8 @@ def run_day_v2_migrations(db_path: str) -> dict[str, Any]:
 def is_opportunity_consumed(db_path: str, opportunity_id: str) -> bool:
     """Return True if the opportunity has been consumed (filled) in this session.
 
-    Fails open (returns False) on any DB error so a DB issue never blocks trading.
-    SQLite is the authoritative durable record — Redis loss cannot re-arm a consumed
+    An unreadable record is treated as consumed: re-arming a filled opportunity
+    is a duplicate entry, while skipping one bar is not. SQLite is the authoritative durable record — Redis loss cannot re-arm a consumed
     opportunity.
     """
     if not opportunity_id:
@@ -225,8 +225,8 @@ def is_opportunity_consumed(db_path: str, opportunity_id: str) -> bool:
             return False
         return bool(int(row[0]))
     except Exception as exc:
-        logger.warning("is_opportunity_consumed DB error (fail-open): %s", exc)
-        return False
+        logger.warning("is_opportunity_consumed DB error (fail-closed): %s", exc)
+        return True
 
 
 def consume_opportunity(

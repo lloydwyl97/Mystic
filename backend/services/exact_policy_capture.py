@@ -41,6 +41,8 @@ NET_VERSION = "EXACT_POLICY_NET_V2"
 # not a missed tick. The missing checks are not invented.
 DOWNTIME_GAP_SEC = 180.0
 ADVANCE_LIMIT = 120
+# A disposition is written within one funding pass; an hour without one is lost.
+DISPOSITION_GRACE_SEC = 3600.0
 
 _EPISODE_COLUMNS = (
     ("capture_version", "TEXT"),
@@ -500,6 +502,23 @@ def advance_exact_episodes(db_path: str, *, now: float | None = None, limit: int
         for row in funded:
             if _close_real_if_resolved(conn, row, moment):
                 stats["real"] += 1
+        # A candidate whose fund/refuse disposition was never written cannot be labelled
+        # truthfully. Close it visibly instead of leaving it OPEN forever.
+        orphaned = conn.execute(
+            """
+            UPDATE policy_episodes
+            SET status='CLOSED', exit_reason='DISPOSITION_MISSING', exit_at=?, label_available_at=?,
+                parity_status='NON_PARITY', non_parity_reason='DISPOSITION_MISSING', train_eligible=0, learned=1
+            WHERE capture_version=? AND status=? AND engine_id='DAY_V2' AND funded IS NULL AND decided_at < ?
+            """,
+            (moment, moment, CAPTURE, OPEN, moment - DISPOSITION_GRACE_SEC),
+        )
+        stats["disposition_missing"] = int(orphaned.rowcount or 0)
+        # Commit even a no-op UPDATE: its open write transaction would block the
+        # learner-state write that learner_state_id makes on its own connection.
+        conn.commit()
+        if orphaned.rowcount:
+            logger.warning("EXACT_POLICY_DISPOSITION_MISSING closed=%d", orphaned.rowcount)
         rows = conn.execute(
             """
             SELECT * FROM policy_episodes

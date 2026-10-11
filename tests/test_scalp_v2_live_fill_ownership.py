@@ -328,5 +328,11 @@ def test_scalp_reentry_overwrites_original_position_cost(tmp_path):
         return row
 
     assert _write(0.0144, 2675.0, 38.52, "t1") == [(0.0144, pytest.approx(38.52))]
-    assert _write(0.0171, 2671.0, 45.68, "t2") == [(0.0171, pytest.approx(45.68))]
+    with pytest.raises(sqlite3.IntegrityError, match="ACTIVE_LOT_EXISTS"):
+        _write(0.0171, 2671.0, 45.68, "t2")
+    assert _write(0.0144, 2675.0, 40.0, "t1") == [(0.0144, pytest.approx(40.0))]
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE portfolio_engine_positions SET quantity=0, status='CLOSED' WHERE engine_id='SCALP_V2' AND symbol='ETH/USDT'")
+    conn.commit()
+    conn.close()
     assert _write(0.01, 2700.0, None, "t3") == [(0.01, pytest.approx(27.0))]

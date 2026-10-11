@@ -185,6 +185,25 @@ def day_v2_held_symbols(open_positions: dict | None) -> set[str]:
     return held
 
 
+LABEL_RESOLVE_INTERVAL_SEC = 60.0
+
+
+def resolve_learning_labels(db_path: str) -> None:
+    """Fold every due markout label and continuation advantage. Exactly once per label."""
+    from backend.services.adaptive_learning import ohlcv_low_between, ohlcv_quote, resolve_markouts
+
+    try:
+        resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts), path_low=lambda sym, a, b: ohlcv_low_between(db_path, sym, a, b))
+    except Exception:
+        logger.warning("MARKOUT_RESOLVE_FAILED", exc_info=True)
+    try:
+        from backend.services.continuation_backfill import fold_recent_advantages
+
+        fold_recent_advantages(db_path)
+    except Exception:
+        logger.warning("CONTINUATION_FOLD_FAILED", exc_info=True)
+
+
 class PortfolioEngineIntegration:
     """
     Integration layer between existing services and Portfolio Engine.
@@ -213,6 +232,7 @@ class PortfolioEngineIntegration:
         self._signal_consumer_interval = max(1, SIGNAL_CONSUMER_INTERVAL_SEC)
         # SCALP V2 live entry loop cadence (seconds between evaluate_all() calls).
         self._scalp_v2_entry_interval = int(os.getenv("SCALP_V2_ENTRY_INTERVAL_SEC", "60"))
+        self._last_label_resolve = 0.0
         self._scalp_momentum_sample_interval = max(1.0, float(os.getenv("SCALP_MOMENTUM_SAMPLE_SEC", "5")))
         self._scalp_momentum_task: asyncio.Task | None = None
         self._scalp_router_executor: ThreadPoolExecutor | None = None
@@ -1783,19 +1803,14 @@ class PortfolioEngineIntegration:
                 except Exception:
                     logger.warning("DAY_V2_SIGNAL_ERROR symbol=%s", symbol, exc_info=True)
 
+            # Labels are due on their own clock; a bar with no DAY candidate still resolves them.
+            resolve_learning_labels(db_path)
             if not candidates:
                 return
             from backend.config.trading_economics import canonical_roundtrip_cost_pct
-            from backend.services.adaptive_learning import CANDIDATE_QUALIFIED, day_decision, ohlcv_low_between, ohlcv_quote, resolve_markouts
+            from backend.services.adaptive_learning import CANDIDATE_QUALIFIED, day_decision
             from backend.services.day_v2.ranking import rank_day_candidates
 
-            resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts), path_low=lambda sym, a, b: ohlcv_low_between(db_path, sym, a, b))
-            try:
-                from backend.services.continuation_backfill import fold_recent_advantages
-
-                fold_recent_advantages(db_path)
-            except Exception:
-                logger.debug("CONTINUATION_FOLD_SKIPPED", exc_info=True)
             for cand in candidates:
                 sig = cand["signal"]
                 cand["adaptive"] = day_decision(db_path, cand["symbol"], str(cand.get("learned_setup") or sig.setup), str(cand.get("regime_tag") or ""), features=cand.get("state_features"))
@@ -2191,6 +2206,14 @@ class PortfolioEngineIntegration:
         while True:
             try:
                 await self._process_scalp_v2_signals()
+                # SCALP labels and folds must not wait for a DAY bar with candidates.
+                last = float(getattr(self, "_last_label_resolve", 0.0) or 0.0)
+                if time.time() - last >= LABEL_RESOLVE_INTERVAL_SEC:
+                    self._last_label_resolve = time.time()
+                    engine = getattr(self, "engine", None)
+                    db_path = getattr(engine, "db_path", None) if engine is not None else None
+                    if db_path:
+                        await _asyncio.to_thread(resolve_learning_labels, str(db_path))
                 await beat(
                     SCALP_V2_LIVE_LOOP_TASK,
                     self.redis_client,

@@ -987,8 +987,27 @@ async def execute_protected_limit_live(
                 break
 
         if order_id:
-            with contextlib.suppress(Exception):
-                await live_service.cancel_order("binanceus", order_id, exchange_symbol)
+            closed = False
+            for _attempt in range(3):
+                with contextlib.suppress(Exception):
+                    await live_service.cancel_order("binanceus", order_id, exchange_symbol)
+                try:
+                    st = await live_service.fetch_order("binanceus", order_id, exchange_symbol)
+                except Exception:
+                    st = {}
+                if st.get("status") == "success":
+                    last = st.get("order") or last
+                    if str((st.get("order") or {}).get("status") or "").lower() in ("canceled", "cancelled", "closed", "filled", "expired", "rejected"):
+                        closed = True
+                        break
+                await asyncio.sleep(poll_interval)
+            if not closed:
+                # A resting order the engine does not track can fill later. Stop entries until reviewed.
+                logger.critical("PROTECTED_LIMIT_CANCEL_UNCONFIRMED %s %s order_id=%s — entries paused", side_l, exchange_symbol, order_id)
+                with contextlib.suppress(Exception):
+                    from backend.services.portfolio_engine import get_portfolio_engine
+
+                    await get_portfolio_engine().set_kill_switch("PAUSE_BUYS", f"CANCEL_UNCONFIRMED:{exchange_symbol}:{order_id}")
             last = await _enrich_live_order_fills(live_service, last, exchange_symbol)
             filled = float(last.get("filled") or filled or 0.0)
         logger.warning(

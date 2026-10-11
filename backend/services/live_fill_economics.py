@@ -50,6 +50,7 @@ class LiveCommission:
     fee_from_exchange: bool = False
     base_qty_reduction: float = 0.0
     quote_commission_usd: float = 0.0
+    unpriced_assets: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -57,8 +58,17 @@ class LiveCommission:
             "quote_commission_usd": round(float(self.quote_commission_usd), 8),
             "fee_from_exchange": bool(self.fee_from_exchange),
             "base_qty_reduction": float(self.base_qty_reduction),
+            "unpriced_assets": list(self.unpriced_assets),
             "items": list(self.items),
         }
+
+    def economic_fee(self, modeled_fee: float) -> float:
+        """USD fee for P&L. A commission in a third asset (BNB) is not free; it is charged at the model rate."""
+        if not self.fee_from_exchange:
+            return float(modeled_fee)
+        if self.unpriced_assets:
+            return max(float(self.usd), float(modeled_fee))
+        return float(self.usd)
 
 
 def _base_asset(symbol: str) -> str:
@@ -168,6 +178,7 @@ def extract_live_commission(
     base_qty = 0.0
     detail: list[dict[str, Any]] = []
     px = float(fill_price or 0.0)
+    unpriced: list[str] = []
     for amount, asset in items:
         if not asset or asset in {"USDT", "USD", "BUSD"}:
             usd += amount
@@ -180,6 +191,7 @@ def extract_live_commission(
         else:
             # Unknown asset (e.g. BNB). Keep the raw item; do not invent a FX rate.
             conv = 0.0
+            unpriced.append(asset)
         detail.append({"amount": amount, "asset": asset, "usd": round(conv, 8)})
     return LiveCommission(
         usd=float(usd),
@@ -187,6 +199,7 @@ def extract_live_commission(
         fee_from_exchange=True,
         base_qty_reduction=float(base_qty),
         quote_commission_usd=float(quote_usd),
+        unpriced_assets=tuple(unpriced),
     )
 
 
@@ -206,7 +219,7 @@ def apply_live_buy_economics(
         received = filled - money(commission.base_qty_reduction or 0)
         if received < 0:
             received = Decimal("0")
-        fee = money(commission.usd)
+        fee = money(commission.economic_fee(float(modeled_fee)))
         cash = filled * px + money(commission.quote_commission_usd or 0)
         return float(received), float(fee), float(cash)
     modeled = money(modeled_fee)
@@ -750,11 +763,10 @@ def apply_live_sell_economics(
     """Return (fee_usd, proceeds). Do not also subtract modeled slippage."""
     qty = float(quantity)
     px = float(fill_price or 0.0)
-    if commission.fee_from_exchange:
-        fee = float(commission.usd)
-    else:
-        fee = float(modeled_fee)
-    return fee, (qty * px) - fee
+    fee = commission.economic_fee(float(modeled_fee))
+    # A third-asset commission is not taken from the quote proceeds.
+    paid_from_proceeds = float(commission.usd) if commission.fee_from_exchange else fee
+    return fee, (qty * px) - paid_from_proceeds
 
 
 def live_round_trip_net(

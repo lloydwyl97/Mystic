@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import math
@@ -204,6 +205,22 @@ def _day_live_entry_path() -> str:
         return DAY_LIVE_ENTRY_PATH
     except Exception:
         return "unknown"
+
+
+class ReconcileStateUnknownError(RuntimeError):
+    """Ownership state could not be read; reconcile must skip rather than act on a default."""
+
+
+def refuse_active_lot_overwrite(conn: sqlite3.Connection, *, engine_id: str, symbol: str, new_trade_id: str) -> None:
+    """Raise inside the open transaction rather than let the (engine_id, symbol) upsert
+    replace another trade's live lot. A dust remnant or the same trade may be rewritten."""
+    row = conn.execute(
+        "SELECT trade_id, quantity, COALESCE(status, 'ACTIVE') FROM portfolio_engine_positions WHERE engine_id=? AND symbol=?",
+        (str(engine_id), normalize_symbol(symbol)),
+    ).fetchone()
+    if row is None or float(row[1] or 0.0) <= 0.0 or str(row[2]).upper() == "DUST_PENDING" or str(row[0] or "") == str(new_trade_id or ""):
+        return
+    raise sqlite3.IntegrityError(f"ACTIVE_LOT_EXISTS engine={engine_id} symbol={symbol} trade={row[0]} new={new_trade_id}")
 
 
 def make_position_key(engine_id: str, symbol: str) -> str:
@@ -816,8 +833,6 @@ GLOBAL_SELL_COOLDOWN_WALL_SEC = int(os.getenv("GLOBAL_SELL_COOLDOWN_WALL_SEC", "
 # Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
 PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK = os.getenv("PORTFOLIO_LOCAL_SKIP_MAX_POSITIONS_BLOCK", "false").lower() == "true"
 # Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
-PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK = os.getenv("PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK", "false").lower() == "true"
-# Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
 PORTFOLIO_LOCAL_SKIP_ADD_TO_POSITION_BLOCK = os.getenv("PORTFOLIO_LOCAL_SKIP_ADD_TO_POSITION_BLOCK", "false").lower() == "true"
 # Local staged testing only (deploy/core_only_local.env). Default false — production never sets this.
 PORTFOLIO_LOCAL_SKIP_OVERALLOCATED_BLOCK = os.getenv("PORTFOLIO_LOCAL_SKIP_OVERALLOCATED_BLOCK", "false").lower() == "true"
@@ -834,7 +849,12 @@ PORTFOLIO_LOCAL_SKIP_BAR_ATR_EXEC_SANITY = os.getenv("PORTFOLIO_LOCAL_SKIP_BAR_A
 LOSS_STREAK_LOOKBACK = int(os.getenv("LOSS_STREAK_LOOKBACK", "6"))  # Win-rate circuit breaker lookback
 LOSS_STREAK_MIN_WIN_RATE = float(os.getenv("LOSS_STREAK_MIN_WIN_RATE", "0.20"))  # Min 20% wins or pause
 LOSS_STREAK_PAUSE_SEC = int(os.getenv("LOSS_STREAK_PAUSE_SEC", "7200"))  # 2h pause when win rate too low
-CHURN_GUARD_MAX_SEC = int(os.getenv("CHURN_GUARD_MAX_SEC", "14400"))  # 4h max hard block, then auto-clear
+CHURN_GUARD_MAX_SEC = int(os.getenv("CHURN_GUARD_MAX_SEC", "14400"))
+# A dual-lot shortfall worth more than this pauses entries until reconcile is healthy.
+SHORTFALL_PAUSE_USD = 1.0
+SHORTFALL_PAUSE_PREFIX = "ENGINE_QTY_SHORTFALL:"
+# The signed wallet snapshot is refreshed every 5 minutes; three missed refreshes is stale.
+SIGNED_SNAPSHOT_MAX_AGE_SEC = 900.0  # 4h max hard block, then auto-clear
 
 MAX_BUYS_PER_HOUR = int(os.getenv("MAX_BUYS_PER_HOUR", "3"))  # Portfolio pacing
 HOURLY_OVERFLOW_CONF_DELTA = float(os.getenv("HOURLY_OVERFLOW_CONF_DELTA", "0.03"))
@@ -3216,6 +3236,7 @@ class PortfolioEngine:
 
                 exchange_qty = max(0.0, float(total_balances.get(base_asset, 0) or 0) - protected_quantity(self.db_path, symbol))
                 await self._enforce_lot_ownership([position])
+                self._check_single_lot_shortfall(symbol, position, exchange_qty)
                 db_qty = position.quantity
                 await self._ensure_symbol_constraints(symbol)
                 constraints = self._symbol_constraints.get(symbol) or {}
@@ -3380,7 +3401,12 @@ class PortfolioEngine:
                 # the importer) aligns any surplus by engine-sum. Importing
                 # here would re-protect already-owned inventory.
                 continue
-            if self._committed_lot_rows(symbol):
+            try:
+                committed = self._committed_lot_rows(symbol)
+            except ReconcileStateUnknownError:
+                logger.warning("LIVE_RECONCILE_IMPORT_SKIPPED symbol=%s reason=committed_lots_unreadable", symbol)
+                continue
+            if committed:
                 # A committed lot the in-memory book has not loaded owns this
                 # balance; importing it would represent it twice.
                 logger.info("LIVE_RECONCILE_IMPORT_DEFERRED symbol=%s reason=committed_lot_not_in_book", symbol)
@@ -3628,7 +3654,8 @@ class PortfolioEngine:
             try:
                 fenced = fence(_to_api_symbol(symbol), since) is True
             except Exception:
-                fenced = False
+                # An unreadable fence may hide an in-flight order; skip this run.
+                fenced = True
         lock = (getattr(self, "_sell_execution_locks", None) or {}).get(normalize_symbol(symbol))
         if lock is not None and lock.locked():
             fenced = True
@@ -3644,8 +3671,8 @@ class PortfolioEngine:
                     "SELECT trade_id, quantity FROM portfolio_engine_positions WHERE symbol=?",
                     (normalize_symbol(symbol),),
                 ).fetchall()
-        except Exception:
-            return []
+        except Exception as exc:
+            raise ReconcileStateUnknownError(f"committed lots unreadable for {symbol}") from exc
         return [(str(r[0] or ""), float(r[1] or 0.0)) for r in rows]
 
     def _proven_lot_qty(self, symbol: str, lots: list) -> float:
@@ -3666,7 +3693,11 @@ class PortfolioEngine:
         from backend.services.protected_external_inventory import handle_unmatched_balance, list_protected, record_protected
 
         # Held engine dust is strategy inventory, never protected external inventory.
-        proven = self._proven_lot_qty(symbol, lots) + self._held_engine_dust_qty(symbol)
+        try:
+            proven = self._proven_lot_qty(symbol, lots) + self._held_engine_dust_qty(symbol)
+        except ReconcileStateUnknownError:
+            logger.warning("PROTECTED_REMAINDER_SKIPPED symbol=%s reason=ownership_unreadable", symbol)
+            return
         remainder = round(float(exchange_qty or 0) - proven, 12)
         if remainder <= 0:
             return
@@ -3760,7 +3791,11 @@ class PortfolioEngine:
         tol = (float(qty_step) / 2.0) if qty_step and float(qty_step) > 0 else 1e-9
         await self._enforce_lot_ownership(lots)
         engine_sum = sum(float(getattr(p, "quantity", 0) or 0) for p in lots)
-        held_dust = self._held_engine_dust_qty(symbol)
+        try:
+            held_dust = self._held_engine_dust_qty(symbol)
+        except ReconcileStateUnknownError:
+            logger.warning("DUAL_LOT_RECONCILE_SKIPPED symbol=%s reason=held_dust_unreadable", symbol)
+            return
         snapped = self._floor_to_step(exchange_qty, float(qty_step)) if qty_step and float(qty_step) > 0 else exchange_qty
         engines = sorted({str(getattr(p, "engine_id", "") or "") for p in lots})
         if float(exchange_qty or 0) <= 1e-10:
@@ -3794,6 +3829,7 @@ class PortfolioEngine:
                 exchange_qty,
                 snapped,
             )
+            self._clear_shortfall_pause(symbol)
             return
         if float(exchange_qty) > engine_sum + held_dust + tol:
             surplus = float(exchange_qty) - engine_sum
@@ -3815,6 +3851,7 @@ class PortfolioEngine:
                 surplus,
             )
             await self._sync_protected_remainder(symbol, float(exchange_qty), lots, float(qty_step or 0))
+            self._clear_shortfall_pause(symbol)
             return
         if await self._shrink_unproven_dust_bucket(symbol, lots, owned - float(exchange_qty)):
             return
@@ -3826,6 +3863,38 @@ class PortfolioEngine:
             engine_sum,
             exchange_qty,
         )
+        # Fill-capped lots cannot be cut without guessing which engine lost coins, so a
+        # material shortfall pauses entries on both engines until the book agrees again.
+        mark = float((getattr(self, "_position_mark_prices", None) or {}).get(symbol) or 0.0) or next(
+            (float(getattr(p, "entry_price", 0) or 0) for p in lots if float(getattr(p, "entry_price", 0) or 0) > 0), 0.0
+        )
+        if (owned - float(exchange_qty)) * mark > SHORTFALL_PAUSE_USD:
+            if not self._trading_paused:
+                self._trading_paused = True
+                self._pause_reason = f"{SHORTFALL_PAUSE_PREFIX}{symbol}"
+            logger.critical("ENGINE_QTY_SHORTFALL_PAUSE symbol=%s missing=%.12g usd=%.2f", symbol, owned - float(exchange_qty), (owned - float(exchange_qty)) * mark)
+
+    def _check_single_lot_shortfall(self, symbol: str, position: Any, exchange_qty: float) -> None:
+        """Lot plus held engine dust above the balance is never cut by guessing; it pauses entries."""
+        try:
+            held = float(self._held_engine_dust_qty(symbol) or 0.0)
+        except ReconcileStateUnknownError:
+            return
+        missing = float(getattr(position, "quantity", 0.0) or 0.0) + held - float(exchange_qty or 0.0)
+        mark = float((getattr(self, "_position_mark_prices", None) or {}).get(symbol) or 0.0) or float(getattr(position, "entry_price", 0.0) or 0.0)
+        if held > 0 and missing * mark > SHORTFALL_PAUSE_USD:
+            if not self._trading_paused:
+                self._trading_paused = True
+                self._pause_reason = f"{SHORTFALL_PAUSE_PREFIX}{symbol}"
+            logger.critical("ENGINE_QTY_SHORTFALL_PAUSE symbol=%s lot=%.12g held_dust=%.12g ex_qty=%.12g usd=%.2f", symbol, float(position.quantity or 0.0), held, exchange_qty, missing * mark)
+        elif missing * mark <= SHORTFALL_PAUSE_USD:
+            self._clear_shortfall_pause(symbol)
+
+    def _clear_shortfall_pause(self, symbol: str) -> None:
+        if self._trading_paused and str(self._pause_reason or "") == f"{SHORTFALL_PAUSE_PREFIX}{symbol}":
+            self._trading_paused = False
+            self._pause_reason = ""
+            logger.warning("ENGINE_QTY_SHORTFALL_CLEARED symbol=%s", symbol)
 
     async def run_live_reconcile(
         self,
@@ -6425,6 +6494,7 @@ class PortfolioEngine:
                 from backend.services.adaptive_learning import persist_trade_adaptive
 
                 persist_trade_adaptive(conn, trade_id, getattr(position, "adaptive_decision", None))
+                refuse_active_lot_overwrite(conn, engine_id=str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE"), symbol=symbol, new_trade_id=trade_id)
                 _kept = preserve_overwritten_dust(conn, engine_id=str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE"), symbol=symbol, new_trade_id=trade_id)
                 if _kept:
                     logger.warning(
@@ -7477,9 +7547,10 @@ class PortfolioEngine:
                     opportunity_id=str(getattr(position, "scalp_opportunity_id", "") or ""),
                     exit_reason=str(close_reason or ""),
                     candidate_id=(_adapt_dec.get("lineage") or {}).get("candidate_id") if isinstance(_adapt_dec.get("lineage"), dict) else None,
+                    close_key=str(getattr(position, "trade_id", "") or ""),
                 )
             except Exception:
-                logger.debug("ADAPTIVE_CLOSE_LEARN_SKIPPED symbol=%s", symbol, exc_info=True)
+                logger.warning("ADAPTIVE_CLOSE_LEARN_SKIPPED symbol=%s", symbol, exc_info=True)
             opened_iso = None
             with contextlib.suppress(Exception):
                 from backend.services.ai_outcome_training_writer import record_outcome_training_row
@@ -8079,8 +8150,8 @@ class PortfolioEngine:
 
         try:
             return float(held_quantity(self.db_path, normalize_symbol(symbol)))
-        except Exception:
-            return 0.0
+        except Exception as exc:
+            raise ReconcileStateUnknownError(f"held engine dust unreadable for {symbol}") from exc
 
     async def _book_human_manual_sell_and_continue(
         self,
@@ -9360,8 +9431,8 @@ class PortfolioEngine:
                             fee_val = float(row[0])
                             pos.entry_fee = fee_val
                             cursor.execute(
-                                "UPDATE portfolio_engine_positions SET entry_fee = ? WHERE symbol = ?",
-                                (fee_val, pos.symbol),
+                                "UPDATE portfolio_engine_positions SET entry_fee = ? WHERE trade_id = ?",
+                                (fee_val, pos.trade_id),
                             )
                             conn.commit()
                             logger.info(f"BACKFILL_ENTRY_FEE: {pos.symbol} trade_id={pos.trade_id} entry_fee=${fee_val:.4f}")
@@ -10426,6 +10497,15 @@ class PortfolioEngine:
         if not can_buy:
             logger.warning("SCALP_V2_BUY_BLOCKED symbol=%s KILL_SWITCH reason=%s", norm, kill_reason)
             return None
+        # An account-level pause (invariant violation, accounting disagreement) stops both engines.
+        if getattr(self, "_trading_paused", False):
+            self.last_buy_reject_reason = "TRADING_PAUSED"
+            logger.warning(
+                "SCALP_V2_BUY_BLOCKED symbol=%s TRADING_PAUSED reason=%s",
+                norm,
+                getattr(self, "_pause_reason", ""),
+            )
+            return None
 
         # 2. Engine-scoped slot budget. SCALP owns up to 4 slots; combined hard
         # max is 8. DAY lots never count against SCALP's four slots. Dust does
@@ -10568,8 +10648,11 @@ class PortfolioEngine:
                 return None
 
             live_order = live_order if isinstance(live_order, dict) else {}
-            with contextlib.suppress(Exception):
+            try:
                 live_order = await self._verify_order_fill(live_order, exchange_sym, "buy")
+            except Exception:
+                # The venue reply already carries filled/average; verification only enriches it.
+                logger.warning("SCALP_V2_FILL_VERIFY_FAILED symbol=%s order=%s", norm, live_order.get("id"), exc_info=True)
 
             import asyncio as _asyncio
 
@@ -10924,6 +11007,7 @@ class PortfolioEngine:
 
         cost = float(original_cost) if original_cost and float(original_cost) > 0 else float(quantity) * float(fill_price)
         _ensure_position_engine_identity(conn)
+        refuse_active_lot_overwrite(conn, engine_id=SCALP_V2_ENGINE_ID, symbol=symbol, new_trade_id=trade_id)
         _kept = preserve_overwritten_dust(conn, engine_id=SCALP_V2_ENGINE_ID, symbol=symbol, new_trade_id=trade_id)
         if _kept:
             logger.warning(
@@ -12363,7 +12447,10 @@ class PortfolioEngine:
         position.entry_intent_id = str(trailing_buy_intent_id or "")
         from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
 
-        position.engine_id = SCALP_V2_ENGINE_ID if buy_mode == "live" else str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE")
+        # Trailing intents are DAY_V2 only, so an intent whose row fails to load stays DAY.
+        position.engine_id = str(fill_engine_id or "") or (
+            "DAY_V2" if trailing_buy_intent_id else (SCALP_V2_ENGINE_ID if buy_mode == "live" else str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE"))
+        )
         position.scalp_opportunity_id = ""
         if trailing_buy_intent_id:
             try:
@@ -12390,7 +12477,7 @@ class PortfolioEngine:
                         if _d2_target > 0 and not float(getattr(position, "thesis_target_level", 0.0) or 0.0):
                             position.thesis_target_level = _d2_target
             except Exception:
-                logger.debug("SCALP_V2_INTENT_STAMP_SKIPPED %s", symbol, exc_info=True)
+                logger.warning("TRAILING_INTENT_STAMP_SKIPPED %s engine=%s", symbol, position.engine_id, exc_info=True)
         if not trailing_buy_intent_id and str(fill_engine_id or "") == "DAY_V2":
             # Direct DAY V2 entry (no trailing intent): stamp DAY_V2 ownership
             # and the opportunity linkage explicitly. Constrained to exactly
@@ -12471,32 +12558,47 @@ class PortfolioEngine:
             str((live_order_buy or {}).get("id") or "") or None,
         )
         with self._buy_commit_window():
-            try:
-                await asyncio.to_thread(
-                    self._commit_atomic_day_open_sync,
-                    trade_bind=trade_bind,
-                    position=position,
-                    cash_balance=committed_cash,
-                    positions_value=committed_positions_value,
-                    realized_pnl=float(self._realized_pnl),
-                    unrealized_pnl=float(self._unrealized_pnl),
-                    total_equity=committed_equity,
-                    pre_ledger=pre_ledger,
-                    fee=fee,
-                    slippage_cost=slippage_cost,
-                    quantity=quantity,
-                    fill_price=fill_price,
-                    symbol=symbol,
-                    trade_id=trade_id,
-                    entry_reason=explainability.regime if explainability else "unknown",
-                    sleeve=effective_sleeve,
-                )
-            except Exception:
-                logger.error("BUY_ABORTED: atomic OPEN failed for %s — cash NOT debited, no position", symbol, exc_info=True)
-                if _entry_reserved:
-                    self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
-                    _entry_reserved = False
-                return None
+            _commit = functools.partial(
+                self._commit_atomic_day_open_sync,
+                trade_bind=trade_bind,
+                position=position,
+                cash_balance=committed_cash,
+                positions_value=committed_positions_value,
+                realized_pnl=float(self._realized_pnl),
+                unrealized_pnl=float(self._unrealized_pnl),
+                total_equity=committed_equity,
+                pre_ledger=pre_ledger,
+                fee=fee,
+                slippage_cost=slippage_cost,
+                quantity=quantity,
+                fill_price=fill_price,
+                symbol=symbol,
+                trade_id=trade_id,
+                entry_reason=explainability.regime if explainability else "unknown",
+                sleeve=effective_sleeve,
+            )
+            # The OPEN transaction rolls back whole, so a venue fill may retry it.
+            _attempts = 3 if live_order_buy else 1
+            for _attempt in range(_attempts):
+                try:
+                    await asyncio.to_thread(_commit)
+                    break
+                except Exception:
+                    if _attempt + 1 < _attempts:
+                        logger.warning("BUY_COMMIT_RETRY: %s attempt=%d", symbol, _attempt + 1, exc_info=True)
+                        await asyncio.sleep(0.5 * (_attempt + 1))
+                        continue
+                    if live_order_buy:
+                        _order_ref = str(live_order_buy.get("id") or "")
+                        logger.critical("UNBOOKED_LIVE_FILL: %s order=%s qty=%.8f — entries paused until reviewed", symbol, _order_ref, quantity, exc_info=True)
+                        with contextlib.suppress(Exception):
+                            await self.set_kill_switch("PAUSE_BUYS", f"UNBOOKED_LIVE_FILL:{symbol}:{_order_ref}")
+                    else:
+                        logger.error("BUY_ABORTED: atomic OPEN failed for %s — cash NOT debited, no position", symbol, exc_info=True)
+                    if _entry_reserved:
+                        self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
+                        _entry_reserved = False
+                    return None
             with contextlib.suppress(Exception):
                 from backend.services.entry_fill_telemetry import (
                     build_entry_reference_telemetry,
@@ -13056,16 +13158,20 @@ class PortfolioEngine:
             with connect_rw(self.db_path) as conn:
                 engine = str(engine_id or "")
                 if engine in ("", *DAY_SIDE_ENGINES) and not engine:
-                    row = conn.execute(
+                    rows = conn.execute(
                         """
                         SELECT quantity, trade_id, entry_price
                         FROM portfolio_engine_positions
                         WHERE symbol = ? AND quantity > 0
                           AND COALESCE(status, 'ACTIVE') != 'DUST_PENDING'
-                        LIMIT 1
+                        LIMIT 2
                         """,
                         (normalized,),
-                    ).fetchone()
+                    ).fetchall()
+                    if len(rows) > 1:
+                        logger.warning("AUTHORITATIVE_LOT_AMBIGUOUS symbol=%s lots=%d — no engine given, refusing to pick one", normalized, len(rows))
+                        return None
+                    row = rows[0] if rows else None
                 elif engine in DAY_SIDE_ENGINES or not engine:
                     row = conn.execute(
                         """
@@ -16267,64 +16373,11 @@ class PortfolioEngine:
                 logger.info("AUTO_DUST_CLEANUP: symbol=%s qty=%s", symbol, qty_log)
                 # Treat as no position; fall through to cash/risk checks.
             else:
-                # Safety: verify exchange free balance before blocking.
-                base_asset = symbol.split("/", maxsplit=1)[0]
-                try:
-                    if self._live_service:
-                        balance_result = await self._live_service.get_balance("binanceus")
-                        if balance_result.get("status") == "success":
-                            free_balances = balance_result.get("balance", {}).get("free", {}) or {}
-                            free_balance = float(free_balances.get(base_asset, 0) or 0)
-                            # DUST_INVARIANT: If exchange has 0 or dust (below min_notional), cleanup local position
-                            price_for_dust = getattr(position, "entry_price", 0) or 0
-                            if price_for_dust <= 0:
-                                price_for_dust = 1.0  # fallback for dust check
-                            ex_is_dust, _, _, _ = self._dust_check(symbol, free_balance, price_for_dust)
-                            if free_balance <= qty_epsilon or ex_is_dust:
-                                qty_log = position.quantity
-                                await self._remove_dust_position_canonical_cleanup(symbol, position)
-                                logger.info(
-                                    "AUTO_DUST_CLEANUP: symbol=%s qty=%s (exchange_free=%s dust=%s)",
-                                    symbol,
-                                    qty_log,
-                                    free_balance,
-                                    ex_is_dust,
-                                )
-                                # Treat as no position; fall through.
-                            elif PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK:
-                                logger.info(
-                                    "QUALITY_TELEMETRY BUY_BLOCKED_SYMBOL_EXISTS would_block symbol=%s (PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK=true — not enforcing)",
-                                    symbol,
-                                )
-                            else:
-                                logger.info(f"BUY_BLOCKED_SYMBOL_EXISTS: {symbol} - already has open position")
-                                return False, "POSITION_ALREADY_OPEN"
-                        elif PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK:
-                            logger.info(
-                                "QUALITY_TELEMETRY BUY_BLOCKED_SYMBOL_EXISTS would_block symbol=%s (PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK=true — not enforcing)",
-                                symbol,
-                            )
-                        else:
-                            logger.info(f"BUY_BLOCKED_SYMBOL_EXISTS: {symbol} - already has open position")
-                            return False, "POSITION_ALREADY_OPEN"
-                    elif PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK:
-                        logger.info(
-                            "QUALITY_TELEMETRY BUY_BLOCKED_SYMBOL_EXISTS would_block symbol=%s (PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK=true — not enforcing)",
-                            symbol,
-                        )
-                    else:
-                        logger.info(f"BUY_BLOCKED_SYMBOL_EXISTS: {symbol} - already has open position")
-                        return False, "POSITION_ALREADY_OPEN"
-                except Exception as e:
-                    logger.warning("BUY_GATE: exchange balance check failed for %s: %s", symbol, e)
-                    if PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK:
-                        logger.info(
-                            "QUALITY_TELEMETRY BUY_BLOCKED_SYMBOL_EXISTS would_block symbol=%s (PORTFOLIO_LOCAL_SKIP_DUPLICATE_SYMBOL_BLOCK=true — not enforcing)",
-                            symbol,
-                        )
-                    else:
-                        logger.info(f"BUY_BLOCKED_SYMBOL_EXISTS: {symbol} - already has open position")
-                        return False, "POSITION_ALREADY_OPEN"
+                # The coin's free balance is shared with the other engine and excludes
+                # coins locked in a resting sell, so it never demotes a live lot here.
+                # Vanished coins are handled by the fill-capped reconciler.
+                logger.info("BUY_BLOCKED_SYMBOL_EXISTS: %s engine=%s - already has open position", symbol, engine_id)
+                return False, "POSITION_ALREADY_OPEN"
 
         # CRITICAL: Check cash available (enforce conservation of money)
         # Pending entry reservations and in-flight BUY orders reduce free cash.
@@ -16690,7 +16743,13 @@ class PortfolioEngine:
         quantity = float(position.quantity or 0.0)
 
         from backend.services.day_mandatory_exit_execution import is_exit_residual_pending
+        from backend.services.protected_external_inventory import exit_route as _residual_route
 
+        # A residual resume is still an exit: only an engine with its own exit authority may sell.
+        _residual_engine_ok = _residual_route(str(getattr(position, "engine_id", "") or "")) in ("DAY_V2", "SCALP_V2")
+        if is_exit_residual_pending(position) and not _residual_engine_ok:
+            logger.warning("EXIT_RESIDUAL_FAIL_CLOSED symbol=%s engine=%s", symbol, getattr(position, "engine_id", ""))
+            return None
         if is_exit_residual_pending(position) and quantity > 0 and isinstance(current_price, (int, float)) and current_price > 0:
             residual_reason = str(getattr(position, "exit_residual_reason", "") or "TRAILING_STOP_EXIT")
             logger.warning(
@@ -16767,6 +16826,11 @@ class PortfolioEngine:
                 _day_unreal = _packed["net"]
                 _terminal = _packed["terminal"]
                 _day_v2_dec = _packed["decision"]
+                if not _book_bid and _day_v2_dec and str(_day_v2_dec.get("reason") or "") == "DAY_V2_LEARNED_CONTINUATION":
+                    # Same rule as refused episodes: no executable bid, no learned decision.
+                    # Catastrophic protection still acts on the mark.
+                    logger.warning("DAY_V2_LEARNED_EXIT_DEFERRED_NO_BOOK symbol=%s mark=%.8f", symbol, float(current_price))
+                    _day_v2_dec = None
                 _lineage = getattr(position, "adaptive_decision", None) or {}
                 _lineage = _lineage.get("lineage") if isinstance(_lineage, dict) else None
                 _candidate_id = (_lineage or {}).get("candidate_id") if isinstance(_lineage, dict) else None
@@ -18815,34 +18879,17 @@ class PortfolioEngine:
                         val = _hget(h, "v") or _hget(h, "price")
                         ts_raw = _hget(h, "timestamp") or _hget(h, "ts")
                         px = _safe_float(val, 0.0)
-                        if px > 0:
-                            age = 0.0
-                            if ts_raw:
-                                try:
-                                    age = max(0.0, time.time() - float(ts_raw))
-                                except Exception:
-                                    age = 0.0
+                        if px > 0 and ts_raw:
+                            # An untimestamped price has no proven age, so it is never fresh.
+                            try:
+                                age = max(0.0, time.time() - float(ts_raw))
+                            except (TypeError, ValueError):
+                                age = float("inf")
                             if age <= max_age:
                                 self._price_cache.set(ns, px)
                                 return px
-                    # string or legacy json
-                    raw = redis_client.get(key)
-                    if raw is not None:
-                        if isinstance(raw, bytes):
-                            raw = raw.decode("utf-8", errors="ignore")
-                        txt = str(raw).strip()
-                        px = 0.0
-                        if txt.startswith("{") and txt.endswith("}"):
-                            try:
-                                payload = json.loads(txt)
-                                px = _safe_float(payload.get("price") or payload.get("v"), 0.0)
-                            except Exception:
-                                px = 0.0
-                        else:
-                            px = _safe_float(txt, 0.0)
-                        if px > 0:
-                            self._price_cache.set(ns, px)
-                            return px
+                        continue
+                    # Legacy string/json keys carry no timestamp; they are not a fresh mark.
                 except Exception:
                     continue
 
@@ -22823,22 +22870,31 @@ class PortfolioEngine:
 
     def _signed_equity_matches(self, account_equity: float) -> bool:
         """False when ledger coins exceed the signed wallet by more than $1, or cash diverges by more than $1."""
+        # A live book must be proven against the wallet; missing, stale or unreadable
+        # evidence is not agreement. Paper mode writes no signed snapshot.
+        unproven = not bool(getattr(self, "_live_execution_enabled", False))
         try:
             import sqlite3
 
             from backend.services.balance_sync_ownership import load_asset_ownership, phantom_assets
             from backend.services.live_account_basis import load_operational_json
         except Exception:
-            return True
+            return unproven
         snap = load_operational_json(str(self.db_path), "signed_balance_snapshot") or {}
         signed = snap.get("balances") if isinstance(snap.get("balances"), dict) else {}
         if not signed:
-            return True
+            return unproven
+        try:
+            observed = float(snap.get("observed_at") or 0.0)
+        except (TypeError, ValueError):
+            observed = 0.0
+        if time.time() - observed > SIGNED_SNAPSHOT_MAX_AGE_SEC:
+            return unproven
         try:
             with sqlite3.connect(str(self.db_path), timeout=5) as conn:
                 owned = {asset: book.total for asset, book in load_asset_ownership(conn).items()}
         except sqlite3.Error:
-            return True
+            return unproven
         prices: dict[str, float] = {}
         for asset in set(owned) | set(signed):
             if asset == "USDT":
@@ -23920,7 +23976,11 @@ class PortfolioEngine:
                     owned_elsewhere += float(protected_quantity(self.db_path, symbol) or 0)
                 except Exception:
                     logger.debug("DUST_RECONCILE: protected quantity unavailable for %s", symbol)
-                owned_elsewhere += self._held_engine_dust_qty(symbol)
+                try:
+                    owned_elsewhere += self._held_engine_dust_qty(symbol)
+                except ReconcileStateUnknownError:
+                    logger.warning("DUST_RECONCILE_SKIPPED symbol=%s reason=held_dust_unreadable", symbol)
+                    continue
                 canonical_qty = max(0.0, float(total_balances.get(base_coin, 0) or 0) - owned_elsewhere)
                 canonical_qty = self._ownership_capped_qty(position, canonical_qty)
                 price = float(prices.get(key, 0) or prices.get(symbol, 0) or 0)
@@ -24613,6 +24673,9 @@ class PortfolioEngine:
                 "— MANUAL POSITION REVIEW REQUIRED"
             )
             return False, reason
+        if getattr(self, "_live_execution_enabled", False) and not fs.get("usable"):
+            # The failsafe cannot be evaluated, so a live entry would run unprotected.
+            return False, f"ACCOUNT_VALUATION_UNPROVEN: {fs.get('reason') or 'no usable NLE'}"
         ctrl = self._effective_entry_control()
         if not ctrl.get("effective_entry_permitted"):
             mode = str(ctrl.get("requested_kill_mode") or self._kill_switch_mode.value)
@@ -25489,13 +25552,8 @@ class PortfolioEngine:
         if self._regime_state.drawdown_guard_active:
             return False, f"DRAWDOWN_GUARD: equity drawdown {self._regime_state.current_drawdown_pct * 100:.2f}%"
 
-        # Check churn guard (blocks buys when cost/gross-profit ratio has been
-        # sustained above CHURN_RATIO_LIMIT — previously computed by
-        # _update_churn_guard() but never enforced here, only surfaced on
-        # dashboards. This was silently allowing over-trading on choppy days.)
-        if getattr(self._regime_state, "churn_guard_active", False):
-            return False, f"CHURN_GUARD: cost/gross-profit ratio {self._regime_state.churn_ratio:.2f} exceeded limit"
-
+        # CHURN_GUARD (recent cost/gross-profit ratio) is a performance opinion,
+        # not an integrity check. It stays dashboard telemetry and never blocks.
         return True, ""
 
     def get_metrics(self) -> dict[str, Any]:

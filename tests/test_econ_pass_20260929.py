@@ -56,7 +56,12 @@ def test_scalp_v2_rewrite_of_same_active_lot_holds_nothing(tmp_path):
     engine = _init_engine(db)
     with sqlite3.connect(db) as conn:
         _scalp_write(engine, conn, "scalp_v2_XRPUSDT_a", 10.0)
-        _scalp_write(engine, conn, "scalp_v2_XRPUSDT_b", 11.0)
+        with pytest.raises(sqlite3.IntegrityError, match="ACTIVE_LOT_EXISTS"):
+            _scalp_write(engine, conn, "scalp_v2_XRPUSDT_b", 11.0)
+        assert conn.execute("SELECT trade_id, quantity FROM portfolio_engine_positions WHERE engine_id='SCALP_V2' AND symbol='XRP/USDT'").fetchone() == (
+            "scalp_v2_XRPUSDT_a",
+            10.0,
+        )
         assert esd.held_lots(conn, "XRP/USDT") == []
 
 

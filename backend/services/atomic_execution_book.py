@@ -140,8 +140,11 @@ def find_orphaned_day_buys(db_path: str | Path) -> list[dict[str, Any]]:
     conn = _connect(path, readonly=True, timeout=2.0)
     try:
         try:
+            trade_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(paper_trades)")}
+            # Only DAY-side lots are restored as DAY_V2; a SCALP orphan is not DAY inventory.
+            day_only = "AND COALESCE(NULLIF(t.engine_id, ''), 'LEGACY_DAY_LIVE') IN ('DAY_V2', 'LEGACY_DAY_LIVE', 'LEGACY_EXIT_ONLY')" if "engine_id" in trade_cols else ""
             buys = conn.execute(
-                """
+                f"""
                 SELECT t.id, t.trade_id, t.symbol, t.quantity,
                        IFNULL(t.remaining_position, 0) AS remaining_raw,
                        CASE WHEN IFNULL(t.remaining_position, 0) > 1e-12
@@ -151,6 +154,7 @@ def find_orphaned_day_buys(db_path: str | Path) -> list[dict[str, Any]]:
                 FROM paper_trades t
                 WHERE upper(t.side) = 'BUY'
                   AND IFNULL(t.quantity, 0) > 1e-12
+                  {day_only}
                 ORDER BY t.id
                 """
             ).fetchall()

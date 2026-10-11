@@ -1433,9 +1433,57 @@ def fold_recent_advantages(db_path: str, *, now: float | None = None) -> int:
                 fresh.append(item)
     if not fresh:
         return 0
-    persist_advantage(db_path, fresh)
-    remember_labels(db_path, fresh)
-    return len(fresh)
+    return fold_advantages_once(db_path, fresh)
+
+
+def fold_advantages_once(db_path: str, labels: list[AdvantageLabel]) -> int:
+    """Log and fold each horizon label in one savepoint, so a crash or retry folds it exactly once."""
+    folded = 0
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS continuation_advantage_log (
+                engine_id TEXT NOT NULL,
+                trade_id TEXT NOT NULL,
+                snapshot_time REAL NOT NULL,
+                horizon INTEGER NOT NULL,
+                PRIMARY KEY (engine_id, trade_id, snapshot_time, horizon)
+            )
+            """
+        )
+        conn.commit()
+        for item in labels:
+            conn.execute("SAVEPOINT advantage_fold")
+            try:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO continuation_advantage_log (engine_id, trade_id, snapshot_time, horizon) VALUES (?,?,?,?)",
+                    (item.engine, item.trade_id, item.snapshot_time, item.horizon),
+                )
+                if cur.rowcount == 1:
+                    record_advantage(
+                        db_path,
+                        engine=item.engine,
+                        symbol=item.symbol,
+                        setup=item.setup,
+                        regime=item.regime,
+                        horizon=item.horizon,
+                        features=item.features,
+                        advantage=item.advantage,
+                        weight=item.weight,
+                        now=item.label_time,
+                        conn=conn,
+                    )
+                    folded += 1
+                conn.execute("RELEASE advantage_fold")
+            except Exception:
+                conn.execute("ROLLBACK TO advantage_fold")
+                conn.execute("RELEASE advantage_fold")
+                raise
+            conn.commit()
+    finally:
+        conn.close()
+    return folded
 
 
 def persist_advantage(state_db: str, labels: list[AdvantageLabel]) -> dict[str, int]:

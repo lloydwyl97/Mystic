@@ -389,9 +389,17 @@ def _features_from_redis(symbol: str) -> dict[str, Any]:
             out[key] = float(val)
         except (TypeError, ValueError):
             out[key] = val
-    age = float(out.get("data_age_sec") or 999)
+    try:
+        published = float(out.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        published = 0.0
+    if published <= 0.0:
+        return {}
+    # data_age_sec was measured at publish time; the hash lives 30s, so age it now.
+    age = max(float(out.get("data_age_sec") or 0.0), 0.0) + max(0.0, time.time() - published)
     if age > 10.0:
         return {}
+    out["data_age_sec"] = age
     _attach_cross_market(out, symbol)
     return out
 

@@ -61,5 +61,27 @@ def _ensure_isolated_schema(path: Path) -> None:
 
 _ensure_isolated_schema(_ISOLATED)
 
+
+def _refuse_exchange_order(*_args, **_kwargs):
+    raise RuntimeError("tests must not send exchange orders; inject a fake live service")
+
+
+def _block_exchange_orders() -> None:
+    """The only live sender is ccxt create/cancel. A test that reaches it fails instead of trading."""
+    try:
+        import ccxt
+    except ImportError:
+        return
+    for name in ("Exchange", "binance", "binanceus"):
+        cls = getattr(ccxt, name, None)
+        if cls is None:
+            continue
+        for method in ("create_order", "cancel_order", "create_market_order", "create_limit_order"):
+            if hasattr(cls, method):
+                setattr(cls, method, _refuse_exchange_order)
+
+
+_block_exchange_orders()
+
 if Path(os.environ["DATABASE_PATH"]).resolve() in _FORBIDDEN:
     raise RuntimeError("tests refused to use the production/canonical trading database")
