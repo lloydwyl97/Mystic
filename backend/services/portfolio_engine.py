@@ -22743,6 +22743,106 @@ class PortfolioEngine:
             pass
         return payload
 
+    def _held_and_protected_marks(self) -> list[dict[str, Any]]:
+        """Coins owned outside the open-lot rows. Counted once, at the lot basis when no live mark exists."""
+        rows: list[dict[str, Any]] = []
+        marks = getattr(self, "_position_mark_prices", {}) or {}
+        try:
+            from backend.services.engine_strategy_dust import held_lots
+            from backend.services.protected_external_inventory import list_protected
+        except Exception:
+            return rows
+        for lot in held_lots(self.db_path):
+            symbol = str(lot.get("symbol") or "")
+            qty = float(lot.get("quantity") or 0.0)
+            basis = float(lot.get("entry_price") or 0.0)
+            px = float(marks.get(symbol) or basis or 0.0)
+            if qty <= 0 or px <= 0:
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "asset": symbol.split("/", maxsplit=1)[0],
+                    "quantity": qty,
+                    "executable_bid": px,
+                    "mark": px,
+                    "market_value": qty * px,
+                    "status": "HELD",
+                }
+            )
+        for lot in list_protected(self.db_path):
+            symbol = str(lot.get("symbol") or "")
+            qty = float(lot.get("quantity") or 0.0)
+            basis = float(lot.get("cost_price") or 0.0)
+            px = float(marks.get(symbol) or basis or 0.0)
+            if qty <= 0 or px <= 0:
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "asset": symbol.split("/", maxsplit=1)[0],
+                    "quantity": qty,
+                    "executable_bid": px,
+                    "mark": px,
+                    "market_value": qty * px,
+                    "status": "PROTECTED",
+                }
+            )
+        return rows
+
+    def _signed_equity_matches(self, account_equity: float) -> bool:
+        """False when ledger coins exceed the signed wallet by more than $1, or cash diverges by more than $1."""
+        try:
+            import sqlite3
+
+            from backend.services.balance_sync_ownership import load_asset_ownership, phantom_assets
+            from backend.services.live_account_basis import load_operational_json
+        except Exception:
+            return True
+        snap = load_operational_json(str(self.db_path), "signed_balance_snapshot") or {}
+        signed = snap.get("balances") if isinstance(snap.get("balances"), dict) else {}
+        if not signed:
+            return True
+        try:
+            with sqlite3.connect(str(self.db_path), timeout=5) as conn:
+                owned = {asset: book.total for asset, book in load_asset_ownership(conn).items()}
+        except sqlite3.Error:
+            return True
+        prices: dict[str, float] = {}
+        for asset in set(owned) | set(signed):
+            if asset == "USDT":
+                continue
+            prices[asset] = self._asset_mark(asset)
+        if phantom_assets(owned, {k: float(v) for k, v in signed.items()}, prices):
+            return False
+        try:
+            signed_cash = float(signed.get("USDT") or 0.0)
+        except (TypeError, ValueError):
+            signed_cash = 0.0
+        if abs(signed_cash - float(self.cash_balance)) > 1.0:
+            return False
+        signed_total = signed_cash
+        priced = True
+        for asset, qty in signed.items():
+            if asset == "USDT":
+                continue
+            px = prices.get(asset) or 0.0
+            if px <= 0:
+                priced = False
+                continue
+            signed_total += float(qty) * px
+        if not priced:
+            return True
+        return abs(float(account_equity) - signed_total) <= 1.0
+
+    def _asset_mark(self, asset: str) -> float:
+        marks = getattr(self, "_position_mark_prices", {}) or {}
+        for key in (f"{asset}/USDT", f"{asset}USDT", asset):
+            px = marks.get(key)
+            if px and float(px) > 0:
+                return float(px)
+        return 0.0
+
     def get_portfolio_status(self) -> dict[str, Any]:
         """
         Get full portfolio status for observability.
@@ -22784,8 +22884,9 @@ class PortfolioEngine:
         # Account equity: cash + MTM positions (matches engine._total_equity / persisted ledger row)
         account_equity = self._total_equity
         account_equity_check = self.cash_balance + self._positions_value
-        # Canonical operational identity used by dashboard/risk endpoints.
-        equity_invariant_ok = abs(account_equity - account_equity_check) < 1.0
+        # Internal identity plus signed physical truth. A ledger that marks coins
+        # the exchange does not hold is not healthy.
+        equity_invariant_ok = abs(account_equity - account_equity_check) < 1.0 and self._signed_equity_matches(account_equity)
 
         total_risk = self._calculate_total_open_risk()
         self._log_capital_concentration(account_equity)
@@ -22844,6 +22945,7 @@ class PortfolioEngine:
                 dust_marks.append(row)
             else:
                 active_marks.append(row)
+        dust_marks.extend(self._held_and_protected_marks())
         baseline_dust = reconstruct_forward_baseline_dust(str(self.db_path))
         exchange_equity = build_exchange_equity(
             cash_usdt=self.cash_balance,

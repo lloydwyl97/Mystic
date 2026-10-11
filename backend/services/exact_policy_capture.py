@@ -34,6 +34,9 @@ from backend.services.policy_episode import (
 logger = logging.getLogger(__name__)
 
 CAPTURE = "EXACT_POLICY_V1"
+# Supervised label matches a real fill: ask-to-bid price change minus the signed
+# taker commission on each side. The slippage buffer stays a planning input.
+NET_VERSION = "EXACT_POLICY_NET_V2"
 # Live exit monitor is on the order of half a minute. A gap past this is downtime,
 # not a missed tick. The missing checks are not invented.
 DOWNTIME_GAP_SEC = 180.0
@@ -53,6 +56,9 @@ _EPISODE_COLUMNS = (
     ("last_check_at", "REAL"),
     ("train_eligible", "INTEGER NOT NULL DEFAULT 0"),
     ("train_applied", "INTEGER NOT NULL DEFAULT 0"),
+    ("planning_net", "REAL"),
+    ("policy_net_version", "TEXT"),
+    ("label_taker_fee", "REAL"),
 )
 _CHECK_COLUMNS = (
     ("bid", "REAL"),
@@ -80,6 +86,26 @@ _PARITY_COLUMNS = (
 )
 
 
+def realized_policy_net(entry_ask: float, exit_bid: float, taker_fee: float) -> float:
+    """Same net as a live fill: price change minus exchange commission on each side.
+
+    ``entry_ask`` and ``exit_bid`` already contain the spread. The slippage
+    buffer is not a commission and is not subtracted here.
+    """
+    entry = float(entry_ask)
+    exit_px = float(exit_bid)
+    if entry <= 0.0:
+        return 0.0
+    taker = max(0.0, float(taker_fee))
+    return (exit_px - entry) / entry - taker - taker * (exit_px / entry)
+
+
+def economic_opportunity_key(symbol: str, decided_at: float) -> tuple[str, int]:
+    """One market path. Several setup rows at the same bar share this key."""
+    bar = int(float(decided_at) // 900.0) * 900
+    return canon_symbol(symbol), bar
+
+
 def ensure_capture_schema(conn: sqlite3.Connection) -> None:
     conn.execute(EPISODE_DDL)
     conn.execute(CHECK_DDL)
@@ -101,6 +127,31 @@ def ensure_capture_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _recompute_realized_labels(conn)
+
+
+def _recompute_realized_labels(conn: sqlite3.Connection) -> None:
+    """Rewrite derived nets from stored ask/bid. Gross and the old planning net stay."""
+    rows = conn.execute(
+        """
+        SELECT id, entry_ask, exit_bid, net, planning_net
+        FROM policy_episodes
+        WHERE capture_version=? AND exit_bid IS NOT NULL AND COALESCE(policy_net_version, '')!=?
+        """,
+        (CAPTURE, NET_VERSION),
+    ).fetchall()
+    for row in rows:
+        entry = float(row[1] or 0.0)
+        exit_bid = float(row[2] or 0.0)
+        planning = row[4] if row[4] is not None else row[3]
+        conn.execute(
+            """
+            UPDATE policy_episodes
+            SET planning_net=?, net=?, policy_net_version=?, label_taker_fee=?
+            WHERE id=?
+            """,
+            (planning, realized_policy_net(entry, exit_bid, TAKER_FEE), NET_VERSION, float(TAKER_FEE), int(row[0])),
+        )
 
 
 def _add_columns(conn: sqlite3.Connection, table: str, columns: tuple[tuple[str, str], ...]) -> None:
@@ -524,12 +575,14 @@ def advance_exact_episodes(db_path: str, *, now: float | None = None, limit: int
             stats["checked"] += 1
             if decision["action"] == "exit":
                 gross = (bid - entry) / entry
-                net = executable_bid_net(entry, bid, float(row["roundtrip_cost"] or ESTIMATED_ROUNDTRIP_COST))
+                planning = executable_bid_net(entry, bid, float(row["roundtrip_cost"] or ESTIMATED_ROUNDTRIP_COST))
+                net = realized_policy_net(entry, bid, TAKER_FEE)
                 reason = str(decision["reason"] or "LEARNED_CONTINUATION_EXIT")
                 conn.execute(
                     """
                     UPDATE policy_episodes
                     SET status='CLOSED', kind=?, exit_bid=?, exit_at=?, exit_reason=?, gross=?, net=?,
+                        planning_net=?, policy_net_version=?, label_taker_fee=?,
                         hold_sec=?, label_available_at=?, train_eligible=?, learned=1
                     WHERE id=? AND status=?
                     """,
@@ -540,6 +593,9 @@ def advance_exact_episodes(db_path: str, *, now: float | None = None, limit: int
                         reason,
                         gross,
                         net,
+                        planning,
+                        NET_VERSION,
+                        float(TAKER_FEE),
                         moment - float(row["decided_at"]),
                         moment,
                         0 if downtime or str(row["parity_status"] or "") == "NON_PARITY" else 1,

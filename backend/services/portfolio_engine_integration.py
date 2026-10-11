@@ -3364,6 +3364,16 @@ class PortfolioEngineIntegration:
                                 physical = free if asset == "USDT" else free + locked
                                 if physical > 0:
                                     wallet[asset] = physical
+                            try:
+                                from backend.services.live_account_basis import persist_operational_json
+
+                                persist_operational_json(
+                                    str(self.engine.db_path) if self.engine is not None else DATABASE_PATH,
+                                    "signed_balance_snapshot",
+                                    {"balances": wallet, "observed_at": time.time()},
+                                )
+                            except Exception:
+                                logger.debug("SIGNED_BALANCE_SNAPSHOT_SKIPPED", exc_info=True)
 
                             # Compare with local DB - BUG #41 FIX: Use context manager for proper cleanup
                             with sqlite3.connect(DATABASE_PATH) as conn:

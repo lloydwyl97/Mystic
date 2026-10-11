@@ -102,6 +102,21 @@ def material(quantity: float, price: float = 0.0, *, tolerance: float = QTY_TOLE
     return px > 0 and qty * px > float(notional_tolerance)
 
 
+def phantom_assets(
+    owned: dict[str, float],
+    signed: dict[str, float],
+    prices: dict[str, float] | None = None,
+) -> list[str]:
+    """Assets whose ledger quantity exceeds the signed exchange quantity by more than $1."""
+    marks = prices or {}
+    out: list[str] = []
+    for asset, qty in owned.items():
+        excess = float(qty or 0.0) - float(signed.get(asset) or 0.0)
+        if excess > 0.0 and material(excess, float(marks.get(asset) or 0.0)):
+            out.append(str(asset))
+    return out
+
+
 def quantity_drift(
     exchange_qty: float,
     owned_qty: float,

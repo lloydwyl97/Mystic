@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
+from backend.services.adaptive_learning import executable_bid_net
 from backend.services.day_v2.day_policy_decision import decide_day_continuation
 from backend.services.exact_policy_capture import (
     CAPTURE,
+    NET_VERSION,
     advance_exact_episodes,
     capture_counts,
+    economic_opportunity_key,
     note_disposition,
     note_real_fill_price,
     open_exact_episode,
+    realized_policy_net,
 )
 from backend.services.policy_episode import COUNTERFACTUAL, REAL
 
@@ -289,6 +295,67 @@ def test_live_and_counterfactual_call_the_same_evaluator():
     assert live["action"] == direct["action"] == "hold"
     assert live["reason"] == direct["reason"]
     assert live["features"] == direct["features"]
+
+
+def test_realized_label_charges_exchange_fees_and_keeps_the_planning_buffer(tmp_path, monkeypatch):
+    db = str(tmp_path / "t.db")
+    monkeypatch.setattr("backend.services.exact_policy_capture._book", lambda _symbol: (100.0, 100.0))
+
+    def _terminal(*args, **kwargs):
+        net = kwargs.get("unrealized_net", args[5] if len(args) > 5 else 0.0)
+        return float(net) - 0.01
+
+    monkeypatch.setattr("backend.services.adaptive_learning.continuation_terminal", _terminal)
+    open_exact_episode(db, _cand(), 21)
+    note_disposition(db, 21, funded=False, reason="NO_EXECUTABLE_NET_EDGE")
+    advance_exact_episodes(db, now=1_000_040.0)
+    conn = sqlite3.connect(db)
+    net, planning, version, taker = conn.execute("SELECT net, planning_net, policy_net_version, label_taker_fee FROM policy_episodes").fetchone()
+    assert version == NET_VERSION
+    assert net == pytest.approx(realized_policy_net(100.0, 100.0, taker))
+    assert net == pytest.approx(-0.0004)
+    assert planning == pytest.approx(executable_bid_net(100.0, 100.0, 0.00066))
+    assert planning < net
+
+
+def test_recompute_preserves_ask_bid_and_replaces_only_the_derived_net(tmp_path):
+    db = str(tmp_path / "t.db")
+    open_exact_episode(db, _cand(ask_price=100.0), 22)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """
+        UPDATE policy_episodes
+        SET status='CLOSED', exit_bid=99.5, gross=-0.005, net=-0.0056, label_available_at=1
+        WHERE candidate_id=22
+        """
+    )
+    conn.commit()
+    conn.close()
+    from backend.services.exact_policy_capture import ensure_capture_schema
+    from backend.services.policy_episode import _connect
+
+    conn = _connect(db)
+    ensure_capture_schema(conn)
+    conn.commit()
+    row = conn.execute("SELECT entry_ask, exit_bid, gross, planning_net, net, policy_net_version FROM policy_episodes").fetchone()
+    conn.close()
+    assert row[0] == 100.0 and row[1] == 99.5 and row[2] == -0.005
+    assert row[3] == -0.0056
+    assert row[4] == pytest.approx(realized_policy_net(100.0, 99.5, 0.0002))
+    assert row[5] == NET_VERSION
+
+
+def test_same_bar_setups_are_one_economic_opportunity():
+    bar = 1_791_603_000.0
+    assert economic_opportunity_key("BTCUSDT", bar) == economic_opportunity_key("BTC/USDT", bar + 10)
+    assert economic_opportunity_key("ETHUSDT", bar) != economic_opportunity_key("BTCUSDT", bar)
+
+
+def test_phantom_inventory_fails_when_ledger_coins_exceed_the_exchange():
+    from backend.services.balance_sync_ownership import phantom_assets
+
+    assert phantom_assets({"BTC": 0.001}, {"BTC": 0.0}, {"BTC": 83000.0}) == ["BTC"]
+    assert phantom_assets({"BTC": 0.00078724}, {"BTC": 0.00078724}, {"BTC": 83000.0}) == []
 
 
 def test_capture_does_not_touch_orders_scalp_or_other_venues():
