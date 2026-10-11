@@ -22859,7 +22859,9 @@ class PortfolioEngine:
                 continue
             px = prices.get(asset) or 0.0
             if px <= 0:
-                priced = False
+                # Unowned venue dust (BNB, USD) has no ledger value to compare.
+                if float(owned.get(asset) or 0.0) > 0.0:
+                    priced = False
                 continue
             signed_total += float(qty) * px
         if not priced:

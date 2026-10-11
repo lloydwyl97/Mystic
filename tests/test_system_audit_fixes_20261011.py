@@ -206,6 +206,60 @@ def test_executable_book_is_fresh_or_absent(monkeypatch):
     assert epc.executable_book("XRPUSDT") == (None, None)
 
 
+def _equity_engine(tmp_path, *, positions=(), dust=(), protected=(), signed, cash):
+    import json
+
+    from backend.services.portfolio_engine import PortfolioEngine
+
+    db = tmp_path / "eq.db"
+    c = sqlite3.connect(db)
+    c.execute("create table portfolio_engine_positions(symbol text, quantity real, engine_id text, status text)")
+    c.execute("create table engine_strategy_dust(engine_id text, symbol text, quantity real, source_trade_id text, status text)")
+    c.execute("create table protected_external_inventory(symbol text, quantity real)")
+    c.execute("create table operational_state(key text primary key, value_json text)")
+    c.executemany("insert into portfolio_engine_positions values (?,?,?,?)", positions)
+    c.executemany("insert into engine_strategy_dust values (?,?,?,?,'HELD')", dust)
+    c.executemany("insert into protected_external_inventory values (?,?)", protected)
+    c.execute("insert into operational_state values ('signed_balance_snapshot', ?)", (json.dumps({"balances": signed}),))
+    c.commit()
+    c.close()
+    engine = PortfolioEngine.__new__(PortfolioEngine)
+    engine.db_path = str(db)
+    engine.cash_balance = cash
+    engine._position_mark_prices = {"BTC/USDT": 83000.0}
+    owned = sum(p[1] for p in positions) + sum(x[2] for x in dust) + sum(p[1] for p in protected)
+    return engine, cash + owned * 83000.0
+
+
+_LOT = ("BTC/USDT", 0.001, "DAY_V2", "ACTIVE")
+_TEN = 10.0 / 83000.0
+
+
+@pytest.mark.parametrize(
+    ("case", "kwargs", "expected"),
+    [
+        ("consistent", {"positions": [_LOT], "signed": {"USDT": 1000.0, "BTC": 0.001}}, True),
+        ("phantom $10", {"positions": [("BTC/USDT", 0.001 + _TEN, "DAY_V2", "ACTIVE")], "signed": {"USDT": 1000.0, "BTC": 0.001}}, False),
+        ("missing $10", {"positions": [_LOT], "signed": {"USDT": 1000.0, "BTC": 0.001 + _TEN}}, False),
+        ("missing $10 with unowned BNB", {"positions": [_LOT], "signed": {"USDT": 1000.0, "BTC": 0.001 + _TEN, "BNB": 0.01}}, False),
+        ("cash $5 off", {"positions": [_LOT], "signed": {"USDT": 1005.0, "BTC": 0.001}}, False),
+        (
+            "duplicate dust",
+            {
+                "positions": [("BTC/USDT", 0.00015, "DAY_V2", "DUST_PENDING")],
+                "dust": [("DAY_V2", "BTC/USDT", 0.00015, "mystic_BTC/USDT_1")],
+                "signed": {"USDT": 1000.0, "BTC": 0.00015},
+            },
+            False,
+        ),
+        ("stale protected", {"positions": [_LOT], "protected": [("BTC/USDT", 0.00015)], "signed": {"USDT": 1000.0, "BTC": 0.001}}, False),
+    ],
+)
+def test_signed_equity_invariant_fails_every_material_defect(tmp_path, case, kwargs, expected):
+    engine, equity = _equity_engine(tmp_path, cash=1000.0, **kwargs)
+    assert engine._signed_equity_matches(equity) is expected, case
+
+
 @pytest.mark.asyncio
 async def test_system_pause_endpoint_persists_the_kill_switch(monkeypatch):
     from backend import app_factory
