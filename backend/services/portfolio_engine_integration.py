@@ -1594,18 +1594,19 @@ class PortfolioEngineIntegration:
             ask = float(getattr(mark, "ask", 0) or 0) if mark is not None else 0.0
             stamped = float(getattr(mark, "timestamp", 0) or 0) if mark is not None else 0.0
             if ask > 0 and stamped > 0:
-                self.current_prices[norm] = ask
-                self.current_prices[ccxt] = ask
                 age = max(0.0, time.time() - stamped)
-                logger.info(
-                    "DAY_V2_EXECUTABLE_PRICE symbol=%s price=%.8f source=%s source_ts=%.3f age=%.3f",
-                    symbol,
-                    ask,
-                    getattr(mark, "source", "canonical_mark"),
-                    stamped,
-                    age,
-                )
-                return ask, age
+                if age <= _DAY_V2_EXECUTABLE_PRICE_STALE_SEC:
+                    self.current_prices[norm] = ask
+                    self.current_prices[ccxt] = ask
+                    logger.info(
+                        "DAY_V2_EXECUTABLE_PRICE symbol=%s price=%.8f source=%s source_ts=%.3f age=%.3f",
+                        symbol,
+                        ask,
+                        getattr(mark, "source", "canonical_mark"),
+                        stamped,
+                        age,
+                    )
+                    return ask, age
             if attempt == 1:
                 await asyncio.sleep(0.35)
         return 0.0, None
@@ -1983,7 +1984,21 @@ class PortfolioEngineIntegration:
         signal = cand["signal"]
         _zone = cand["zone"]
         _reclaim_level = cand["reclaim_level"]
-        ask_price = cand["ask_price"]
+        ask_price, book_age = await self._resolve_day_executable_price(symbol)
+        if ask_price <= 0 or book_age is None or book_age > _DAY_V2_EXECUTABLE_PRICE_STALE_SEC:
+            record_day_decision(
+                db_path,
+                symbol,
+                "REJECTED:STALE_EXECUTABLE_ASK",
+                cycle_ts=cand["as_of"],
+                closest=signal.setup,
+                unmet=[f"ask={ask_price}", f"age={book_age}"],
+            )
+            logger.warning("DAY_V2_STALE_EXECUTABLE_ASK symbol=%s ask=%.8f age=%s", symbol, ask_price, book_age)
+            _note_exact(db_path, cand, funded=False, reason="STALE_EXECUTABLE_ASK")
+            return
+        cand["ask_price"] = ask_price
+        cand["ask_at"] = time.time()
         db_sym_15m = cand["db_symbol"]
         as_of = cand["as_of"]
         # Non-positive learned net after costs does not get capital. The

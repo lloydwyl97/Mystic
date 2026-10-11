@@ -2930,6 +2930,10 @@ class PortfolioEngine:
                     logger.critical("STARTUP_ORPHAN_RESTORE count=%d", len(restored))
                     await self._load_positions_from_sqlite()
                     await self._load_ledger_from_sqlite()
+                held = await self.restore_filled_asset_custody()
+                if held:
+                    await self._load_positions_from_sqlite()
+                    await self._load_ledger_from_sqlite()
             except Exception:
                 logger.exception("STARTUP_ORPHAN_RESTORE_FAILED")
             try:
@@ -5574,6 +5578,10 @@ class PortfolioEngine:
                 restored = restore_orphaned_day_buys(self.db_path)
                 if restored:
                     logger.critical("ISOLATED_INIT_ORPHAN_RESTORE count=%d", len(restored))
+                    await self._load_positions_from_sqlite()
+                    await self._load_ledger_from_sqlite()
+                held = await self.restore_filled_asset_custody()
+                if held:
                     await self._load_positions_from_sqlite()
                     await self._load_ledger_from_sqlite()
             except Exception:
@@ -9119,6 +9127,91 @@ class PortfolioEngine:
             self._buys_inflight = max(0, int(getattr(self, "_buys_inflight", 1) or 1) - 1)
             self._buy_seq = int(getattr(self, "_buy_seq", 0) or 0) + 1
 
+    async def restore_filled_asset_custody(self) -> int:
+        """Book each venue fill whose open transaction never committed. Once."""
+        from backend.services.filled_asset_custody import (
+            QUARANTINED_FILLED_ASSET,
+            RECOVERED_ACTIVE_LOT,
+            mark,
+            open_rows,
+            position_owned,
+        )
+
+        booked = 0
+        for row in open_rows(self.db_path):
+            engine_id = str(row["engine_id"])
+            trade_id = str(row["trade_id"])
+            try:
+                with connect_rw(self.db_path) as conn:
+                    owned = position_owned(
+                        conn,
+                        engine_id=engine_id,
+                        trade_id=trade_id,
+                        exchange_order_id=str(row["exchange_order_id"] or ""),
+                    )
+                if owned:
+                    mark(self.db_path, engine_id=engine_id, trade_id=trade_id, status=RECOVERED_ACTIVE_LOT, cash_applied=1)
+                    continue
+                position = OpenPosition(
+                    symbol=str(row["symbol"]),
+                    quantity=float(row["quantity"]),
+                    entry_price=float(row["fill_price"]),
+                    entry_time=time.time(),
+                    trade_id=trade_id,
+                    stop_price=0.0,
+                    take_profit_1_price=0.0,
+                    take_profit_2_price=0.0,
+                    highest_price=float(row["fill_price"]),
+                    lowest_price=float(row["fill_price"]),
+                    entry_fee=float(row["fee"] or 0.0),
+                    original_position_cost=float(row["cash_debit"] or 0.0),
+                    entry_order_id=str(row["exchange_order_id"] or ""),
+                    entry_client_order_id=str(row["client_order_id"] or ""),
+                    engine_id=engine_id,
+                    status="ACTIVE",
+                )
+                await self._persist_position_to_sqlite(position)
+                debit = float(row["cash_debit"] or 0.0)
+                if debit > 0 and not int(row["cash_applied"] or 0):
+                    with connect_rw(self.db_path) as conn:
+                        ledger = conn.execute("SELECT 1 FROM portfolio_engine_ledger WHERE id=1").fetchone()
+                        if ledger is not None:
+                            notional = float(row["quantity"]) * float(row["fill_price"])
+                            conn.execute(
+                                """
+                                UPDATE portfolio_engine_ledger
+                                SET cash_balance = cash_balance - ?,
+                                    positions_value = positions_value + ?,
+                                    total_equity = total_equity + ?
+                                WHERE id=1
+                                """,
+                                (debit, notional, notional - debit),
+                            )
+                            conn.commit()
+                mark(self.db_path, engine_id=engine_id, trade_id=trade_id, status=RECOVERED_ACTIVE_LOT, cash_applied=1)
+                booked += 1
+                logger.critical(
+                    "RECOVERED_ACTIVE_LOT engine=%s symbol=%s trade=%s qty=%.8f order=%s",
+                    engine_id,
+                    row["symbol"],
+                    trade_id,
+                    float(row["quantity"]),
+                    row["exchange_order_id"],
+                )
+            except Exception:
+                mark(self.db_path, engine_id=engine_id, trade_id=trade_id, status=QUARANTINED_FILLED_ASSET)
+                self._trading_paused = True
+                self._pause_reason = f"UNBOOKED_LIVE_FILL:{row['symbol']}:{row['exchange_order_id']}"
+                logger.critical(
+                    "QUARANTINED_FILLED_ASSET engine=%s symbol=%s trade=%s qty=%.8f",
+                    engine_id,
+                    row["symbol"],
+                    trade_id,
+                    float(row["quantity"]),
+                    exc_info=True,
+                )
+        return booked
+
     async def _load_positions_from_sqlite(self, *, allow_mutations: bool = True, during_sell: bool = False) -> int:
         """Load positions from SQLite. Returns count loaded.
 
@@ -9431,8 +9524,8 @@ class PortfolioEngine:
                             fee_val = float(row[0])
                             pos.entry_fee = fee_val
                             cursor.execute(
-                                "UPDATE portfolio_engine_positions SET entry_fee = ? WHERE trade_id = ?",
-                                (fee_val, pos.trade_id),
+                                "UPDATE portfolio_engine_positions SET entry_fee = ? WHERE trade_id = ? AND engine_id = ?",
+                                (fee_val, pos.trade_id, str(getattr(pos, "engine_id", "") or "")),
                             )
                             conn.commit()
                             logger.info(f"BACKFILL_ENTRY_FEE: {pos.symbol} trade_id={pos.trade_id} entry_fee=${fee_val:.4f}")
@@ -10763,6 +10856,21 @@ class PortfolioEngine:
             except Exception:
                 # The venue order is filled. Keep an order-id-backed BUY row so
                 # reconciliation restores this lot instead of calling it external.
+                from backend.services.filled_asset_custody import remember as _remember_scalp_fill
+
+                with contextlib.suppress(Exception):
+                    _remember_scalp_fill(
+                        self.db_path,
+                        engine_id=SCALP_V2_ENGINE_ID,
+                        symbol=norm,
+                        trade_id=trade_id,
+                        quantity=float(filled_qty),
+                        fill_price=float(fill_price),
+                        fee=float(fee),
+                        cash_debit=float(total_cost),
+                        client_order_id=str(client_order_id or ""),
+                        exchange_order_id=str(order_id or ""),
+                    )
                 self.open_positions.pop(make_position_key(SCALP_V2_ENGINE_ID, norm), None)
                 self._available_balance = float(self.cash_balance)
                 logger.error(
@@ -10817,6 +10925,7 @@ class PortfolioEngine:
                     sleeve=SCALP_V2_ENGINE_ID,
                 )
                 self.last_buy_reject_reason = "POST_FILL_BIND_FAILED"
+                await self.restore_filled_asset_custody()
                 return None
 
             consume_reservation(
@@ -11817,6 +11926,10 @@ class PortfolioEngine:
         from backend.services.protected_limit_execution import execute_protected_limit_live, run_protected_preflight
 
         live_capable = bool(self._live_execution_enabled and self._live_service and is_live_execution_allowed_sync() and can_place_live_orders_sync()[0])
+        if live_capable and str(fill_engine_id or "") not in {"DAY_V2", "SCALP_V2"}:
+            logger.error("BUY_BLOCKED_ENGINE_IDENTITY symbol=%s engine=%s", normalized_symbol, fill_engine_id or "missing")
+            await self._record_reject(symbol, "BUY", "ENGINE_IDENTITY_MISSING", "ENGINE_IDENTITY_MISSING", decision_id=decision_id, explainability=explainability)
+            return None
         _entry_ref_decision_ts = time.time()
         preflight = await run_protected_preflight(
             symbol=normalized_symbol,
@@ -12557,6 +12670,25 @@ class PortfolioEngine:
             # tied back to the venue without guessing by quantity and time.
             str((live_order_buy or {}).get("id") or "") or None,
         )
+        if live_order_buy:
+            from backend.services.filled_asset_custody import RECOVERED_ACTIVE_LOT
+            from backend.services.filled_asset_custody import mark as _mark_custody
+            from backend.services.filled_asset_custody import remember as _remember_fill
+
+            _remember_fill(
+                self.db_path,
+                engine_id=str(position.engine_id or ""),
+                symbol=symbol,
+                trade_id=trade_id,
+                quantity=float(quantity),
+                fill_price=float(fill_price),
+                fee=float(fee or 0.0),
+                cash_debit=float(total_cost),
+                client_order_id=str(client_order_id or ""),
+                exchange_order_id=str(live_order_buy.get("id") or ""),
+            )
+        else:
+            _mark_custody = None
         with self._buy_commit_window():
             _commit = functools.partial(
                 self._commit_atomic_day_open_sync,
@@ -12579,6 +12711,7 @@ class PortfolioEngine:
             )
             # The OPEN transaction rolls back whole, so a venue fill may retry it.
             _attempts = 3 if live_order_buy else 1
+            _unbooked_order = ""
             for _attempt in range(_attempts):
                 try:
                     await asyncio.to_thread(_commit)
@@ -12589,60 +12722,70 @@ class PortfolioEngine:
                         await asyncio.sleep(0.5 * (_attempt + 1))
                         continue
                     if live_order_buy:
-                        _order_ref = str(live_order_buy.get("id") or "")
-                        logger.critical("UNBOOKED_LIVE_FILL: %s order=%s qty=%.8f — entries paused until reviewed", symbol, _order_ref, quantity, exc_info=True)
-                        with contextlib.suppress(Exception):
-                            await self.set_kill_switch("PAUSE_BUYS", f"UNBOOKED_LIVE_FILL:{symbol}:{_order_ref}")
-                    else:
-                        logger.error("BUY_ABORTED: atomic OPEN failed for %s — cash NOT debited, no position", symbol, exc_info=True)
+                        _unbooked_order = str(live_order_buy.get("id") or "")
+                        logger.critical("UNBOOKED_LIVE_FILL: %s order=%s qty=%.8f — booking the stored fill", symbol, _unbooked_order, quantity, exc_info=True)
+                        break
+                    logger.error("BUY_ABORTED: atomic OPEN failed for %s — cash NOT debited, no position", symbol, exc_info=True)
                     if _entry_reserved:
                         self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
                         _entry_reserved = False
                     return None
-            with contextlib.suppress(Exception):
-                from backend.services.entry_fill_telemetry import (
-                    build_entry_reference_telemetry,
-                    persist_entry_reference_row,
-                )
-
-                _tel = build_entry_reference_telemetry(
-                    best_bid=float(getattr(preflight, "best_bid", 0.0) or 0.0),
-                    best_ask=float(getattr(preflight, "best_ask", 0.0) or 0.0),
-                    submitted_order_price=float(getattr(preflight, "protected_limit_price", 0.0) or price or 0.0),
-                    fill_price=float(fill_price),
-                    decision_ts=_entry_ref_decision_ts,
-                    fill_ts=time.time(),
-                    live_order=live_order_buy if isinstance(live_order_buy, dict) else None,
-                )
-                with connect_rw(self.db_path) as _tel_conn:
-                    persist_entry_reference_row(
-                        _tel_conn,
-                        trade_id=trade_id,
-                        telemetry=_tel,
-                        context_snapshot_json=_ctx_snapshot,
-                        diagnostics_json=json.dumps(protected_audit),
+            if live_order_buy and _mark_custody is not None and not _unbooked_order:
+                _mark_custody(self.db_path, engine_id=str(position.engine_id or ""), trade_id=trade_id, status=RECOVERED_ACTIVE_LOT, cash_applied=1)
+            if not _unbooked_order:
+                with contextlib.suppress(Exception):
+                    from backend.services.entry_fill_telemetry import (
+                        build_entry_reference_telemetry,
+                        persist_entry_reference_row,
                     )
-                    _tel_conn.commit()
 
-            async with self._global_cash_lock:
-                self._consume_entry_reservation(symbol, decision_id=str(decision_id or ""))
+                    _tel = build_entry_reference_telemetry(
+                        best_bid=float(getattr(preflight, "best_bid", 0.0) or 0.0),
+                        best_ask=float(getattr(preflight, "best_ask", 0.0) or 0.0),
+                        submitted_order_price=float(getattr(preflight, "protected_limit_price", 0.0) or price or 0.0),
+                        fill_price=float(fill_price),
+                        decision_ts=_entry_ref_decision_ts,
+                        fill_ts=time.time(),
+                        live_order=live_order_buy if isinstance(live_order_buy, dict) else None,
+                    )
+                    with connect_rw(self.db_path) as _tel_conn:
+                        persist_entry_reference_row(
+                            _tel_conn,
+                            trade_id=trade_id,
+                            telemetry=_tel,
+                            context_snapshot_json=_ctx_snapshot,
+                            diagnostics_json=json.dumps(protected_audit),
+                        )
+                        _tel_conn.commit()
+
+                async with self._global_cash_lock:
+                    self._consume_entry_reservation(symbol, decision_id=str(decision_id or ""))
+                    _entry_reserved = False
+                    self.cash_balance = committed_cash
+                    self._available_balance = max(0.0, self.cash_balance)
+                    self._positions_value = committed_positions_value
+                    self._total_equity = committed_equity
+                next_positions = dict(self.open_positions)
+                # Two-engine contract: adopt under the composite (engine_id, symbol)
+                # key so a sibling engine's lot on the same symbol survives. Drop only
+                # same-lineage DAY-side keys (bare + DAY-side composites): this lot
+                # replaces its own lineage, never the other engine's lot.
+                _adopt_engine = str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE")
+                next_positions.pop(normalized_symbol, None)
+                for _cand in DAY_SIDE_ENGINES:
+                    if _cand != _adopt_engine:
+                        next_positions.pop(make_position_key(_cand, normalized_symbol), None)
+                next_positions[make_position_key(_adopt_engine, normalized_symbol)] = position
+                self.open_positions = next_positions
+        if _unbooked_order:
+            await self.restore_filled_asset_custody()
+            if str(self._pause_reason or "").startswith("UNBOOKED_LIVE_FILL:"):
+                with contextlib.suppress(Exception):
+                    await self.set_kill_switch("PAUSE_BUYS", self._pause_reason)
+            if _entry_reserved:
+                self._release_entry_reservation(symbol, decision_id=str(decision_id or ""))
                 _entry_reserved = False
-                self.cash_balance = committed_cash
-                self._available_balance = max(0.0, self.cash_balance)
-                self._positions_value = committed_positions_value
-                self._total_equity = committed_equity
-            next_positions = dict(self.open_positions)
-            # Two-engine contract: adopt under the composite (engine_id, symbol)
-            # key so a sibling engine's lot on the same symbol survives. Drop only
-            # same-lineage DAY-side keys (bare + DAY-side composites): this lot
-            # replaces its own lineage, never the other engine's lot.
-            _adopt_engine = str(getattr(position, "engine_id", "") or "LEGACY_DAY_LIVE")
-            next_positions.pop(normalized_symbol, None)
-            for _cand in DAY_SIDE_ENGINES:
-                if _cand != _adopt_engine:
-                    next_positions.pop(make_position_key(_cand, normalized_symbol), None)
-            next_positions[make_position_key(_adopt_engine, normalized_symbol)] = position
-            self.open_positions = next_positions
+            return None
         self._recently_added_symbols[normalized_symbol] = time.time()
         self.trade_explanations[trade_id] = explainability
         self._prune_trade_explanations()

@@ -738,6 +738,13 @@ async def lifespan(app: FastAPI):
         logger.info("[LIFESPAN] Backend shutdown complete")
 
 
+def _debug_env_restricted() -> bool:
+    """Production name lists stay off this unauthenticated route."""
+    is_debug = os.getenv("DEBUG", "0").lower() in ("1", "true", "yes")
+    is_production = os.getenv("PRODUCTION", "0").lower() in ("1", "true", "yes") or os.getenv("ENVIRONMENT", "").lower() == "production"
+    return is_production and not is_debug
+
+
 def create_app() -> FastAPI:
     logger.info("CREATE_APP FUNCTION CALLED")
     try:
@@ -945,10 +952,7 @@ def create_app() -> FastAPI:
     async def debug_env():
         """Debug endpoint to check environment variables - SECURED"""
         # HIGH PRIORITY FIX: Only expose debug info in development mode
-        is_debug = os.getenv("DEBUG", "0").lower() in ("1", "true", "yes")
-        is_production = os.getenv("PRODUCTION", "0").lower() in ("1", "true", "yes")
-
-        if is_production and not is_debug:
+        if _debug_env_restricted():
             return {
                 "status": "restricted",
                 "message": "Debug endpoint disabled in production",

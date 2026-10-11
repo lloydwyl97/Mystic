@@ -248,7 +248,7 @@ def test_stale_redis_features_are_not_authoritative(monkeypatch):
 
     class _R:
         def hgetall(self, key):
-            return {"data_age_sec": "99", "ts": str(time.time()), "ofi_5s": "9"}
+            return {"data_age_sec": "0.01", "ts": str(time.time() - 30.0), "ofi_5s": "9"}
 
     monkeypatch.setattr("backend.config.redis_config.get_shared_redis_sync", _R)
     assert m is not None
@@ -271,6 +271,16 @@ def test_redis_features_are_aged_from_their_publish_time(monkeypatch):
     stamp["ts"] = time.time() - 1.0
     fresh = _REAL_FEATURES_FROM_REDIS("ETHUSDT")
     assert fresh["ofi_5s"] == 9.0 and fresh["data_age_sec"] < 10.0
+
+    stamp["ts"] = time.time() + 30.0
+    assert _REAL_FEATURES_FROM_REDIS("ETHUSDT") == {}
+
+    class _Missing:
+        def hgetall(self, key):
+            return {"ofi_5s": "9"}
+
+    monkeypatch.setattr("backend.config.redis_config.get_shared_redis_sync", _Missing)
+    assert _REAL_FEATURES_FROM_REDIS("ETHUSDT") == {}
 
 
 def test_get_stats_reports_tracked_symbols():

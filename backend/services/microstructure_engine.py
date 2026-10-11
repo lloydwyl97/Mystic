@@ -393,10 +393,10 @@ def _features_from_redis(symbol: str) -> dict[str, Any]:
         published = float(out.get("ts") or 0.0)
     except (TypeError, ValueError):
         published = 0.0
-    if published <= 0.0:
+    if published <= 0.0 or published > time.time() + 1.0:
         return {}
-    # data_age_sec was measured at publish time; the hash lives 30s, so age it now.
-    age = max(float(out.get("data_age_sec") or 0.0), 0.0) + max(0.0, time.time() - published)
+    # Age is now minus the measurement timestamp. A future stamp is not fresh.
+    age = max(0.0, time.time() - published)
     if age > 10.0:
         return {}
     out["data_age_sec"] = age
@@ -418,12 +418,17 @@ def compute_features(symbol: str) -> dict[str, Any]:
     key = (st.depth_seq, st.trade_seq)
     if st.feat_key == key and st.feat_base is not None:
         _COMPUTE_STATS["feature_reuses"] += 1
+        measured = float(st.feat_base.get("ts") or 0.0)
+        if measured <= 0.0 or measured > _now() + 1.0:
+            return {}
         out = dict(st.feat_base)
-        out["data_age_sec"] = max(0.0, _now() - float(out["ts"]))
+        out["data_age_sec"] = max(0.0, _now() - measured)
     else:
         out, st.feat_needs_tape_overlay = _compute_book_features(symbol, st)
         _COMPUTE_STATS["feature_computations"] += 1
         st.feat_key, st.feat_base = key, dict(out)
+    if float(out.get("ts") or 0.0) > _now() + 1.0:
+        return {}
     if st.feat_needs_tape_overlay:
         _overlay_redis_tape(out, symbol)
     _attach_cross_market(out, symbol)

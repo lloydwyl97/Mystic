@@ -936,6 +936,7 @@ async def _submit_claimed(engine: Any, intent: dict[str, Any], ask: float) -> di
         entry_authority=ENTRY_AUTHORITY_DAY_V2_CONFIRMED,
         client_order_id=str(intent.get("client_order_id") or ""),
         trailing_buy_intent_id=str(intent.get("intent_id") or ""),
+        fill_engine_id="DAY_V2",
     )
     if result:
         # The order filled, so the reservation became a position. CONSUMED, not
