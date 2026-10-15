@@ -19,6 +19,7 @@ import logging
 import os
 import random
 import socket
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -99,6 +100,30 @@ def _to_ccxt_symbol(s: str) -> str:
         raise RuntimeError(msg)
 
     return to_ccxt_symbol(venue_symbol(s))
+
+
+_PUBLIC_BOOK_CLIENT: Any = None
+_PUBLIC_BOOK_LOCK = threading.Lock()
+
+
+def _fetch_public_order_book(symbol: str, limit: int) -> tuple[dict[str, Any], float, float, Any]:
+    """One reused public client, so a depth read does not first reload every market.
+
+    Serialized so ``lastRestRequestTimestamp`` belongs to this call's request.
+    """
+    global _PUBLIC_BOOK_CLIENT
+    with _PUBLIC_BOOK_LOCK:
+        if _PUBLIC_BOOK_CLIENT is None:
+            _PUBLIC_BOOK_CLIENT = ccxt.binanceus({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+        client = _PUBLIC_BOOK_CLIENT
+        try:
+            call_started = time.time()
+            ob = client.fetch_order_book(symbol, limit)
+            received_ts = time.time()
+        except Exception:
+            _PUBLIC_BOOK_CLIENT = None
+            raise
+        return ob, call_started, received_ts, getattr(client, "lastRestRequestTimestamp", None)
 
 
 def _to_binance_pair(s: str) -> str:
@@ -913,19 +938,9 @@ class LiveMarketDataService:
     async def get_order_book(self, symbol: str, limit: int = 10) -> dict[str, Any]:
         s = _to_ccxt_symbol(symbol)
         try:
-            # Use public-only client for orderbook (no API keys needed)
-            public_client = ccxt.binanceus(
-                {
-                    "enableRateLimit": True,
-                    "options": {"defaultType": "spot"},
-                },
-            )
-            call_started = time.time()
-            ob = await asyncio.to_thread(public_client.fetch_order_book, s, limit)
-            received_ts = time.time()
+            ob, call_started, received_ts, sent_ms = await asyncio.to_thread(_fetch_public_order_book, s, limit)
             # Binance.US REST depth carries lastUpdateId but no event time. The
             # depth request's send time is the oldest the snapshot can be.
-            sent_ms = getattr(public_client, "lastRestRequestTimestamp", None)
             request_sent_ts = call_started
             if isinstance(sent_ms, (int, float)) and call_started <= float(sent_ms) / 1000.0 <= received_ts:
                 request_sent_ts = float(sent_ms) / 1000.0

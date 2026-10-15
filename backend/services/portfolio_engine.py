@@ -10693,33 +10693,49 @@ class PortfolioEngine:
             return None
 
         # Hard executable-edge rule at the order boundary: the ranked edge is
-        # repriced from the book just read, not the evaluation snapshot.
+        # repriced from the book just read, not the evaluation snapshot. The
+        # REST book has no event time, so the exchange-timestamped tape bounds
+        # the ask from below.
+        from backend.config.protected_execution import ORDERBOOK_MAX_AGE_SEC
+        from backend.services.day_order_flow_tape import read_tape
+        from backend.services.scalp_v2.executable_edge import tape_ask_floor
+
+        book_ask = float(preflight.best_ask or 0.0)
+        tape_now = time.time()
+        tape_prints = await asyncio.to_thread(read_tape, norm, since_ts=tape_now - float(ORDERBOOK_MAX_AGE_SEC))
+        tape_ask = tape_ask_floor(tape_prints, now=tape_now, window_sec=float(ORDERBOOK_MAX_AGE_SEC))
         boundary = edge_at_order_boundary(
             (adaptive_decision or {}).get("executable_edge"),
             arm_price=price,
-            best_ask=preflight.best_ask,
+            best_ask=max(book_ask, tape_ask or 0.0),
             spread_pct=preflight.spread_pct,
             impact_pct=preflight.price_impact_pct,
         )
+        if boundary is not None:
+            boundary.update(book_ask=book_ask, tape_ask=tape_ask, book_behind_tape=bool(tape_ask is not None and tape_ask > book_ask))
         if boundary is None or not boundary["eligible"]:
             self.last_buy_reject_reason = "EDGE_UNPROVEN_AT_ORDER" if boundary is None else "EDGE_DECAYED_AT_ORDER"
             logger.warning(
-                "SCALP_V2_BUY_BLOCKED symbol=%s %s arm=%.8f ask=%s boundary=%s opp=%s",
+                "SCALP_V2_BUY_BLOCKED symbol=%s %s arm=%.8f book_ask=%s tape_ask=%s boundary=%s opp=%s",
                 norm,
                 self.last_buy_reject_reason,
                 float(price),
-                preflight.best_ask,
+                book_ask,
+                tape_ask,
                 boundary,
                 opportunity_id,
             )
             return None
         logger.info(
-            "SCALP_V2_EDGE_AT_ORDER symbol=%s ranked=%.8f now=%.8f drift=%.8f cost_now=%.8f book_age=%s",
+            "SCALP_V2_EDGE_AT_ORDER symbol=%s ranked=%.8f now=%.8f drift=%.8f cost_now=%.8f book_ask=%.8f tape_ask=%s book_behind_tape=%s book_age=%s",
             norm,
             boundary["ranked_edge"],
             boundary["edge_now"],
             boundary["ask_drift"],
             boundary["cost_now"],
+            book_ask,
+            tape_ask,
+            boundary["book_behind_tape"],
             preflight.book_age_sec,
         )
 

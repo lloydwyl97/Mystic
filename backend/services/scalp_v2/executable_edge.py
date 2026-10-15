@@ -328,6 +328,19 @@ def edge_at_order_boundary(
     }
 
 
+def tape_ask_floor(prints: list[Any], *, now: float, window_sec: float) -> float | None:
+    """Lowest ask the exchange-timestamped tape still allows: the newest print in the window.
+
+    Binance.US REST depth carries no event time, so a lagging snapshot can show
+    an ask the market already traded through. A print at p means the ask was
+    at least p when it printed. None when the tape printed nothing in the window.
+    """
+    recent = [p for p in prints if _f(getattr(p, "trade_ts", 0.0)) >= now - window_sec and _f(getattr(p, "price", 0.0)) > 0]
+    if not recent:
+        return None
+    return _f(max(recent, key=lambda p: _f(p.trade_ts)).price)
+
+
 __all__ = [
     "REJECT_THRESHOLD_PCT",
     "ExecutableEdge",
@@ -336,4 +349,5 @@ __all__ = [
     "scalp_executable_edge",
     "scalp_size_mult",
     "stamp_view",
+    "tape_ask_floor",
 ]

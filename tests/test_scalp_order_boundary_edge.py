@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from backend.services import protected_limit_execution as ple
-from backend.services.scalp_v2.executable_edge import edge_at_order_boundary
+from backend.services.day_order_flow_tape import TapePrint
+from backend.services.scalp_v2.executable_edge import edge_at_order_boundary, tape_ask_floor
 
 # SOL 2026-10-15 14:48Z: ranked +4.36 bps at ask 104.36; a bid traded at 104.44 at 14:48:16,
 # so the ask at submission was at least 104.45.
@@ -50,7 +52,31 @@ def test_unusable_inputs_prove_nothing(edge, arm, ask):
     assert edge_at_order_boundary(edge, arm_price=arm, best_ask=ask, spread_pct=0.0001, impact_pct=0.0) is None
 
 
-def _engine(tmp_path, monkeypatch, *, best_ask, adapter):
+# Mystic's own tape for SOL, offsets from submission (14:48:17.98); each print
+# was in Redis ~80 ms after it traded.
+SOL_TAPE = ((-3.96, 104.36, False), (-3.66, 104.41, False), (-1.80, 104.44, True), (-1.41, 104.42, True))
+
+
+def _sol_tape(now: float) -> list[TapePrint]:
+    return [TapePrint(trade_ts=now + dt, price=px, qty=0.5, is_buyer_maker=m) for dt, px, m in SOL_TAPE]
+
+
+def test_tape_floor_is_the_newest_print_in_the_window():
+    now = 1_000.0
+    assert tape_ask_floor(_sol_tape(now), now=now, window_sec=5.0) == 104.42
+    assert tape_ask_floor(_sol_tape(now), now=now, window_sec=1.0) is None
+    assert tape_ask_floor([], now=now, window_sec=5.0) is None
+
+
+def test_sol_incident_stale_book_alone_passes_but_the_tape_refuses():
+    stale_book = edge_at_order_boundary(SOL_EDGE, arm_price=104.36, best_ask=104.36, spread_pct=0.000096, impact_pct=0.000031)
+    assert stale_book["eligible"] is True
+    floor = tape_ask_floor(_sol_tape(1_000.0), now=1_000.0, window_sec=5.0)
+    with_tape = edge_at_order_boundary(SOL_EDGE, arm_price=104.36, best_ask=max(104.36, floor), spread_pct=0.000096, impact_pct=0.000031)
+    assert with_tape["eligible"] is False
+
+
+def _engine(tmp_path, monkeypatch, *, best_ask, adapter, tape=None):
     from backend.services.portfolio_engine import PortfolioEngine
 
     engine = PortfolioEngine.__new__(PortfolioEngine)
@@ -69,6 +95,7 @@ def _engine(tmp_path, monkeypatch, *, best_ask, adapter):
     monkeypatch.setattr("backend.config.live_test_mode.can_place_live_orders_sync", lambda: (True, ""))
     monkeypatch.setattr("backend.services.protected_limit_execution.run_protected_preflight", AsyncMock(return_value=preflight))
     monkeypatch.setattr("backend.services.protected_limit_execution.execute_protected_limit_live", adapter)
+    monkeypatch.setattr("backend.services.day_order_flow_tape.read_tape", lambda *_a, **_k: tape(time.time()) if tape else [])
     return engine
 
 
@@ -91,6 +118,45 @@ async def test_decayed_edge_sends_no_order(tmp_path, monkeypatch):
     assert await _buy(engine, {"executable_edge": SOL_EDGE}) is None
     adapter.assert_not_called()
     assert engine.last_buy_reject_reason == "EDGE_DECAYED_AT_ORDER"
+
+
+@pytest.mark.asyncio
+async def test_sol_incident_replay_sends_no_order(tmp_path, monkeypatch):
+    adapter = AsyncMock(return_value=None)
+    engine = _engine(tmp_path, monkeypatch, best_ask=104.36, adapter=adapter, tape=_sol_tape)
+
+    assert await _buy(engine, {"executable_edge": SOL_EDGE}) is None
+    adapter.assert_not_called()
+    assert engine.last_buy_reject_reason == "EDGE_DECAYED_AT_ORDER"
+
+
+@pytest.mark.asyncio
+async def test_silent_tape_falls_back_to_the_book(tmp_path, monkeypatch):
+    adapter = AsyncMock(return_value=None)
+    engine = _engine(tmp_path, monkeypatch, best_ask=104.36, adapter=adapter)
+
+    await _buy(engine, {"executable_edge": SOL_EDGE})
+    adapter.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_public_book_client_is_built_once(monkeypatch):
+    from backend.services import live_market_data as lmd
+
+    built = []
+
+    class _Client:
+        def __init__(self, *_a, **_k):
+            built.append(self)
+
+        def fetch_order_book(self, *_a, **_k):
+            self.lastRestRequestTimestamp = int(time.time() * 1000)
+            return {"bids": [[104.35, 1.0]], "asks": [[104.36, 1.0]], "nonce": 1}
+
+    monkeypatch.setattr(lmd.ccxt, "binanceus", _Client)
+    for _ in range(3):
+        assert (await lmd.live_market_data_service.get_order_book("SOL/USDT", limit=5))["fetch_failed"] is False
+    assert len(built) == 1
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 from pathlib import Path
+
+import pytest
 
 _FORBIDDEN = {
     Path("/home/mystic/mystic/mystic_trading.db").resolve(),
@@ -82,6 +85,21 @@ def _block_exchange_orders() -> None:
 
 
 _block_exchange_orders()
+
+
+def _drop_public_book_client() -> None:
+    module = sys.modules.get("backend.services.live_market_data")
+    if module is not None:
+        module._PUBLIC_BOOK_CLIENT = None
+
+
+@pytest.fixture(autouse=True)
+def _fresh_public_book_client():
+    """A cached public depth client would carry one test's fake into the next."""
+    _drop_public_book_client()
+    yield
+    _drop_public_book_client()
+
 
 if Path(os.environ["DATABASE_PATH"]).resolve() in _FORBIDDEN:
     raise RuntimeError("tests refused to use the production/canonical trading database")

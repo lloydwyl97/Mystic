@@ -65,6 +65,7 @@ def _engine(tmp_path, monkeypatch, adapter):
     monkeypatch.setattr("backend.services.execution_mode_service.is_live_execution_allowed_sync", lambda: True)
     monkeypatch.setattr("backend.services.protected_limit_execution.run_protected_preflight", AsyncMock(return_value=preflight))
     monkeypatch.setattr("backend.services.protected_limit_execution.execute_protected_limit_live", adapter)
+    monkeypatch.setattr("backend.services.day_order_flow_tape.read_tape", lambda *_a, **_k: [])
     return engine
 
 
