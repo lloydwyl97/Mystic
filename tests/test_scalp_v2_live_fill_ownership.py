@@ -60,7 +60,7 @@ def _engine(tmp_path, monkeypatch, adapter):
     engine._live_service = object()
     engine._now_ms = lambda: 1790309062000
     engine._verify_order_fill = AsyncMock(side_effect=lambda order, *_a: order)
-    preflight = MagicMock(passed=True, protected_limit_price=2676.23, reject_reason="")
+    preflight = MagicMock(passed=True, protected_limit_price=2676.23, reject_reason="", best_ask=2676.23, spread_pct=0.0001, price_impact_pct=0.0, book_age_sec=0.1)
     monkeypatch.setattr("backend.config.live_test_mode.can_place_live_orders_sync", lambda: (True, ""))
     monkeypatch.setattr("backend.services.execution_mode_service.is_live_execution_allowed_sync", lambda: True)
     monkeypatch.setattr("backend.services.protected_limit_execution.run_protected_preflight", AsyncMock(return_value=preflight))
@@ -84,6 +84,7 @@ async def _buy(engine, opp_id):
         atr=10.0,
         opportunity_id=opp_id,
         entry_authority="SCALP_V2_CONFIRMED",
+        adaptive_decision={"executable_edge": {"final_executable_edge_pct": 0.001, "live_cost_pct": 0.0007}},
     )
 
 

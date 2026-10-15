@@ -301,7 +301,8 @@ async def test_scalp_confirmed_reaches_adapter_once_and_unknown_authority_does_n
     engine._live_execution_enabled = True
     engine._live_service = object()
     engine._now_ms = lambda: 1
-    preflight = MagicMock(passed=True, protected_limit_price=100.0, reject_reason="")
+    preflight = MagicMock(passed=True, protected_limit_price=100.0, reject_reason="", best_ask=100.0, spread_pct=0.0001, price_impact_pct=0.0, book_age_sec=0.1)
+    edge = {"executable_edge": {"final_executable_edge_pct": 0.001, "live_cost_pct": 0.0007}}
     adapter = AsyncMock(return_value=None)
     monkeypatch.setattr("backend.config.live_test_mode.can_place_live_orders_sync", lambda: (True, ""))
     monkeypatch.setattr("backend.services.execution_mode_service.is_live_execution_allowed_sync", lambda: True)
@@ -324,6 +325,7 @@ async def test_scalp_confirmed_reaches_adapter_once_and_unknown_authority_does_n
         100.0,
         opportunity_id="opp-coexist",
         entry_authority="SCALP_V2_CONFIRMED",
+        adaptive_decision=edge,
     )
     assert adapter.await_count == 1
 
@@ -333,6 +335,7 @@ async def test_scalp_confirmed_reaches_adapter_once_and_unknown_authority_does_n
         100.0,
         opportunity_id="opp-eth",
         entry_authority="SCALP_V2_CONFIRMED",
+        adaptive_decision=edge,
     )
     assert reached is None
     assert adapter.await_count == 2

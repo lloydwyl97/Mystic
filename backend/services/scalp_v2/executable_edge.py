@@ -294,10 +294,45 @@ def decision_detail(row: dict[str, Any] | None, **extra: Any) -> str:
     return json.dumps(payload, separators=(",", ":"), default=str)
 
 
+def edge_at_order_boundary(
+    edge: dict[str, Any] | None,
+    *,
+    arm_price: float,
+    best_ask: float,
+    spread_pct: float | None,
+    impact_pct: float,
+) -> dict[str, Any] | None:
+    """Reprice the ranked final edge at the book read just before submission.
+
+    The ranked cost is swapped for the cost of the current spread and impact,
+    and an ask that has risen since arming is charged in full. A lower ask is
+    never credited. None when the ranked edge or either price is unusable.
+    """
+    if not isinstance(edge, dict) or "final_executable_edge_pct" not in edge or "live_cost_pct" not in edge:
+        return None
+    arm, ask = _f(arm_price), _f(best_ask)
+    if arm <= 0 or ask <= 0:
+        return None
+    ranked = _f(edge.get("final_executable_edge_pct"))
+    ranked_cost = _f(edge.get("live_cost_pct"))
+    cost_now = canonical_roundtrip_cost_pct(spread_pct=spread_pct, buy_impact_pct=max(0.0, _f(impact_pct)), sell_impact_pct=0.0)
+    drift = max(0.0, (ask - arm) / arm)
+    edge_now = ranked + ranked_cost - cost_now - drift
+    return {
+        "ranked_edge": ranked,
+        "ranked_cost": ranked_cost,
+        "cost_now": cost_now,
+        "ask_drift": drift,
+        "edge_now": edge_now,
+        "eligible": edge_now > REJECT_THRESHOLD_PCT,
+    }
+
+
 __all__ = [
     "REJECT_THRESHOLD_PCT",
     "ExecutableEdge",
     "decision_detail",
+    "edge_at_order_boundary",
     "scalp_executable_edge",
     "scalp_size_mult",
     "stamp_view",

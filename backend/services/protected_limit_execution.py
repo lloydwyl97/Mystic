@@ -47,6 +47,18 @@ logger = logging.getLogger(__name__)
 
 _PREFLIGHT_FRESHNESS: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("_PREFLIGHT_FRESHNESS", default=None)
 
+LIVE_OUTCOME_EXPIRED_UNFILLED = "EXPIRED_UNFILLED"
+LIVE_OUTCOME_TIMEOUT_CANCELED_UNFILLED = "TIMEOUT_CANCELED_UNFILLED"
+LIVE_OUTCOME_EXCHANGE_REJECTED = "EXCHANGE_REJECTED"
+LIVE_OUTCOME_UNCONFIRMED = "ORDER_UNCONFIRMED"
+_LIVE_ORDER_OUTCOME: contextvars.ContextVar[str] = contextvars.ContextVar("_LIVE_ORDER_OUTCOME", default="")
+
+
+def last_live_order_outcome() -> str:
+    """Why the last execute_protected_limit_live in this context returned None."""
+    return _LIVE_ORDER_OUTCOME.get()
+
+
 # Last preflight telemetry (engine/API reads via get_last_execution_protection_state)
 _last_state: dict[str, Any] = {
     "last_preflight_passed": None,
@@ -867,6 +879,7 @@ async def execute_protected_limit_live(
 
     exchange_symbol = to_exchange_symbol(symbol).replace("/", "")
     side_l = side.lower()
+    _LIVE_ORDER_OUTCOME.set("")
     timeout = float(PROTECTED_LIMIT_ORDER_TIMEOUT_SEC)
     poll_interval = 0.5
     # Binance clientOrderId: at most 36 of [A-Za-z0-9._:/-]. One id per attempt,
@@ -910,6 +923,7 @@ async def execute_protected_limit_live(
 
         if not result or result.get("status") != "success":
             if tif != "IOC":
+                _LIVE_ORDER_OUTCOME.set(LIVE_OUTCOME_EXCHANGE_REJECTED)
                 return None
             # An error reply does not prove the IOC never reached the venue.
             # A second order is sent only when the venue says this id does not exist.
@@ -931,6 +945,7 @@ async def execute_protected_limit_live(
                     attempt_cid,
                     str(probe.get("message") or "")[:200],
                 )
+                _LIVE_ORDER_OUTCOME.set(LIVE_OUTCOME_UNCONFIRMED)
                 return None
 
         response_ts = time.time()
@@ -963,6 +978,8 @@ async def execute_protected_limit_live(
                 order["_mystic_partial_fill"] = True
                 order["_mystic_ioc_incomplete"] = True
                 return order
+            rejected = str(order.get("status") or "").lower() == "rejected"
+            _LIVE_ORDER_OUTCOME.set(LIVE_OUTCOME_EXCHANGE_REJECTED if rejected else LIVE_OUTCOME_EXPIRED_UNFILLED)
             return None
 
         deadline = time.time() + timeout
@@ -1021,6 +1038,8 @@ async def execute_protected_limit_live(
             last["_mystic_partial_fill"] = True
             last["_mystic_ioc_incomplete"] = True
             return _stamp_latency(last, submit_ts, response_ts)
+        _LIVE_ORDER_OUTCOME.set(LIVE_OUTCOME_TIMEOUT_CANCELED_UNFILLED)
         return None
 
+    _LIVE_ORDER_OUTCOME.set(LIVE_OUTCOME_EXCHANGE_REJECTED)
     return None

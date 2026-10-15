@@ -10597,6 +10597,7 @@ class PortfolioEngine:
         from backend.services.scalp_v2.exit_calibration import SCALP_V2_ENGINE_ID
         from backend.services.two_engine_claim import claim_symbol, release_claim
 
+        self.last_buy_reject_reason = ""
         if str(entry_authority or "") != ENTRY_AUTHORITY_SCALP_V2_CONFIRMED:
             logger.error("SCALP_V2_BUY_BLOCKED symbol=%s UNKNOWN_ENGINE authority=%s", symbol, entry_authority or "missing")
             self.last_buy_reject_reason = "UNKNOWN_ENGINE"
@@ -10612,6 +10613,7 @@ class PortfolioEngine:
         can_buy, kill_reason = self._check_kill_switch_buy()
         if not can_buy:
             logger.warning("SCALP_V2_BUY_BLOCKED symbol=%s KILL_SWITCH reason=%s", norm, kill_reason)
+            self.last_buy_reject_reason = "KILL_OR_PAUSE"
             return None
         # An account-level pause (invariant violation, accounting disagreement) stops both engines.
         if getattr(self, "_trading_paused", False):
@@ -10658,15 +10660,18 @@ class PortfolioEngine:
         qty_q, qty_reason, _est_notional = self._normalize_order_amount(symbol=norm, raw_qty=quantity, price=price, side="BUY")
         if qty_reason != "ok":
             logger.info("SCALP_V2_BUY_BLOCKED symbol=%s qty_reason=%s", norm, qty_reason)
+            self.last_buy_reject_reason = f"ORDER_SIZE_INVALID:{qty_reason}"
             return None
         quantity = qty_q
 
         # 5. Live-capable check
         from backend.config.live_test_mode import can_place_live_orders_sync
-        from backend.services.protected_limit_execution import execute_protected_limit_live, run_protected_preflight
+        from backend.services.protected_limit_execution import execute_protected_limit_live, last_live_order_outcome, run_protected_preflight
+        from backend.services.scalp_v2.executable_edge import edge_at_order_boundary
 
         if not (self._live_execution_enabled and self._live_service and can_place_live_orders_sync()[0]):
             logger.warning("SCALP_V2_BUY_BLOCKED symbol=%s LIVE_NOT_AVAILABLE", norm)
+            self.last_buy_reject_reason = "LIVE_NOT_AVAILABLE"
             return None
 
         # 6. Preflight — obtain protected limit price and cost model
@@ -10684,7 +10689,39 @@ class PortfolioEngine:
                 norm,
                 preflight.reject_reason,
             )
+            self.last_buy_reject_reason = f"PREFLIGHT_FAILED:{preflight.reject_reason}"
             return None
+
+        # Hard executable-edge rule at the order boundary: the ranked edge is
+        # repriced from the book just read, not the evaluation snapshot.
+        boundary = edge_at_order_boundary(
+            (adaptive_decision or {}).get("executable_edge"),
+            arm_price=price,
+            best_ask=preflight.best_ask,
+            spread_pct=preflight.spread_pct,
+            impact_pct=preflight.price_impact_pct,
+        )
+        if boundary is None or not boundary["eligible"]:
+            self.last_buy_reject_reason = "EDGE_UNPROVEN_AT_ORDER" if boundary is None else "EDGE_DECAYED_AT_ORDER"
+            logger.warning(
+                "SCALP_V2_BUY_BLOCKED symbol=%s %s arm=%.8f ask=%s boundary=%s opp=%s",
+                norm,
+                self.last_buy_reject_reason,
+                float(price),
+                preflight.best_ask,
+                boundary,
+                opportunity_id,
+            )
+            return None
+        logger.info(
+            "SCALP_V2_EDGE_AT_ORDER symbol=%s ranked=%.8f now=%.8f drift=%.8f cost_now=%.8f book_age=%s",
+            norm,
+            boundary["ranked_edge"],
+            boundary["edge_now"],
+            boundary["ask_drift"],
+            boundary["cost_now"],
+            preflight.book_age_sec,
+        )
 
         notional = quantity * float(preflight.protected_limit_price or price)
 
@@ -10759,8 +10796,8 @@ class PortfolioEngine:
                     symbol=norm,
                     engine_id=SCALP_V2_ENGINE_ID,
                 )
-                logger.error("SCALP_V2_BUY_FAILED symbol=%s NOT_FILLED", norm)
-                self.last_buy_reject_reason = "EXCHANGE_REJECTED"
+                self.last_buy_reject_reason = last_live_order_outcome() or "EXCHANGE_REJECTED"
+                logger.error("SCALP_V2_BUY_FAILED symbol=%s NOT_FILLED outcome=%s", norm, self.last_buy_reject_reason)
                 return None
 
             live_order = live_order if isinstance(live_order, dict) else {}
