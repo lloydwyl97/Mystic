@@ -191,6 +191,18 @@ def _adaptive_regime(db_path: str, symbol: str) -> str:
     return str(_learn_cache_set(key, market_regime_tag(db_path, symbol.upper().replace("/", "").replace("-", "")) or ""))
 
 
+def _scalp_entry_value(db_path: str, symbol: str, setup: str, regime: str, entry: dict) -> float:
+    """Learned advantage of keeping a lot filled now.
+
+    Before a value model is installed for the current economics nothing has been
+    learned, so the advantage is 0 and the entry is priced at minus its cost.
+    """
+    from backend.services.scalp_v2.continuation_value import entry_value
+
+    learned = entry_value(db_path, symbol, setup, regime, entry)
+    return 0.0 if learned is None else learned
+
+
 def candidate_executable_edge(
     *,
     symbol: str,
@@ -204,7 +216,6 @@ def candidate_executable_edge(
 ) -> tuple[Any, dict, str]:
     """(ExecutableEdge, stamped adaptive view, adaptive regime) for one candidate."""
     from backend.services.adaptive_learning import scalp_decision
-    from backend.services.scalp_v2.continuation_value import entry_value
     from backend.services.scalp_v2.executable_edge import scalp_executable_edge, stamp_view
 
     regime_key = _adaptive_regime(db_path, symbol)
@@ -218,7 +229,8 @@ def candidate_executable_edge(
         spread_pct=spread_pct,
         impact_pct=impact_pct,
         edge_source=edge_source,
-        value_of=lambda entry: entry_value(db_path, sym, setup, regime_key, entry),
+        value_of=lambda entry: _scalp_entry_value(db_path, sym, setup, regime_key, entry),
+        micro_features=feats,
     )
     return edge, stamp_view(view, edge), regime_key
 

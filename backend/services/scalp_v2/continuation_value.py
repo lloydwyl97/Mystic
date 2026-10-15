@@ -13,16 +13,20 @@ catastrophic protection is labeled at the stop price and has no later states.
 A label is learned only after its horizon has elapsed.
 
 The state is continuous: net on each side of zero, adverse depth, favorable
-excursion, giveback and age, with the entry's edge terms and the candidate's
-symbol, setup and regime. Keep while the best informed horizon has positive
+excursion, giveback and age, with the entry's edge terms, the order book and
+tape at entry (fading with age), and the candidate's symbol, setup and regime. Keep while the best informed horizon has positive
 expected advantage; sell when it is negative. No sample floor, no threshold.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -32,6 +36,8 @@ import numpy as np
 
 from backend.services.adaptive_learning import PRIOR_STRENGTH, SCALP_ENGINE, _connect, _norm_symbol, current_economic_version, half_life_days
 from backend.services.scalp_v2.exit_evaluator import SCALP_V2_CATASTROPHIC_PCT
+
+logger = logging.getLogger(__name__)
 
 VALUE_VERSION = "SCALP_VALUE_V1"
 MODEL = "scalp_value"
@@ -59,6 +65,17 @@ SETUPS = (
 TRENDS = ("up", "down", "flat")
 ENTRY_KEYS = ("calibrated", "adaptive", "micro", "raw_claim", "cost")
 _ENTRY_SOURCES = {"calibrated": "calibrated_move", "adaptive": "adaptive_residual", "micro": "micro_residual", "raw_claim": "raw_claim", "cost": "expected_cost"}
+# Order book and tape at entry, each scaled to roughly unit range.
+MICRO_KEYS = ("obi", "ofi", "flow", "adverse", "pressure", "spread")
+_MICRO_ENCODE = {
+    "obi": ("obi_l5", lambda v: v),
+    "ofi": ("ofi_5s", lambda v: math.tanh(v / 2.0)),
+    "flow": ("agg_flow_imbalance_5s", lambda v: v),
+    "adverse": ("adverse_selection_score", lambda v: 5.0 * v),
+    "pressure": ("microprice_pressure", lambda v: 1e4 * v),
+    "spread": ("spread_pct", lambda v: 1e4 * v),
+}
+MICRO_SOURCES = tuple(src for src, _ in _MICRO_ENCODE.values())
 # Knots of the continuous piecewise-linear net term, in bps.
 NET_KNOTS_BPS = (-130, -100, -60, -30, -15, -8, -4, 0, 4, 10, 30)
 FEATURES: tuple[str, ...] = (
@@ -71,6 +88,7 @@ FEATURES: tuple[str, ...] = (
     "age_log",
     *(f"entry_{key}" for key in ENTRY_KEYS),
     *(f"entry_{key}_fresh" for key in ENTRY_KEYS),
+    *(f"micro_{key}_fresh" for key in MICRO_KEYS),
     *(f"sym_{sym}" for sym in SYMBOLS),
     *(f"setup_{name}" for name in SETUPS),
     *(f"btc_{trend}" for trend in TRENDS),
@@ -96,10 +114,24 @@ def _regime_parts(regime: str) -> tuple[str, str]:
     return trend, vol
 
 
+def micro_state(features: dict | None) -> dict[str, float]:
+    """Encoded order book and tape at entry. Missing features are 0."""
+    feats = features if isinstance(features, dict) else {}
+    return {f"m_{key}": encode(_finite(feats.get(src))) for key, (src, encode) in _MICRO_ENCODE.items()}
+
+
+def micro_raw(features: dict | None) -> dict[str, float]:
+    """The stored subset of live microstructure features the value model reads."""
+    feats = features if isinstance(features, dict) else {}
+    return {src: _finite(feats.get(src)) for src in MICRO_SOURCES}
+
+
 def entry_state(economic: dict | None) -> dict[str, float]:
-    """Entry edge terms from a stored or live ``economic`` block. Missing terms are 0."""
+    """Entry terms from a stored or live ``economic`` block, with its ``entry_micro``. Missing terms are 0."""
     econ = economic if isinstance(economic, dict) else {}
-    return {key: _finite(econ.get(src)) for key, src in _ENTRY_SOURCES.items()}
+    out = {key: _finite(econ.get(src)) for key, src in _ENTRY_SOURCES.items()}
+    out.update(micro_state(econ.get("entry_micro")))
+    return out
 
 
 def entry_position_state(cost: float) -> dict[str, float]:
@@ -125,6 +157,7 @@ def vector(state: dict, entry: dict, symbol: str, setup: str, regime: str) -> np
     terms = [_finite(entry.get(key)) * _SCALE for key in ENTRY_KEYS]
     values += terms
     values += [term / (1.0 + age) for term in terms]
+    values += [_finite(entry.get(f"m_{key}")) / (1.0 + age) for key in MICRO_KEYS]
     values += [1.0 if sym == s else 0.0 for s in SYMBOLS]
     values += [1.0 if name == s else 0.0 for s in SETUPS]
     values += [1.0 if trend == t else 0.0 for t in TRENDS]
@@ -167,6 +200,14 @@ class Candidate:
     entry: dict[str, float] = field(default_factory=dict)
 
 
+def _json_dict(text: Any) -> dict:
+    try:
+        parsed = json.loads(text) if text else {}
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def load_candidates(db_path: str, start: float, end: float) -> list[Candidate]:
     """Current-version SCALP candidates evaluated in [start, end), oldest first."""
     try:
@@ -176,7 +217,7 @@ def load_candidates(db_path: str, start: float, end: float) -> list[Candidate]:
     try:
         rows = conn.execute(
             """
-            SELECT id, symbol, setup, regime, evaluated_at, ref_price, roundtrip_cost, economic_json
+            SELECT id, symbol, setup, regime, evaluated_at, ref_price, roundtrip_cost, economic_json, features_json
             FROM adaptive_candidate_markouts
             WHERE engine_id=? AND economic_version=? AND evaluated_at>=? AND evaluated_at<? AND ref_price>0
             ORDER BY evaluated_at, id
@@ -188,12 +229,10 @@ def load_candidates(db_path: str, start: float, end: float) -> list[Candidate]:
     finally:
         conn.close()
     out: list[Candidate] = []
-    for cid, symbol, setup, regime, evaluated, ref, cost, econ in rows:
-        try:
-            parsed = json.loads(econ) if econ else {}
-        except ValueError:
-            parsed = {}
-        out.append(Candidate(int(cid), _norm_symbol(symbol), str(setup or ""), str(regime or ""), float(evaluated), float(ref), _finite(cost), entry_state(parsed)))
+    for cid, symbol, setup, regime, evaluated, ref, cost, econ, feats in rows:
+        parsed, micro = _json_dict(econ), _json_dict(feats)
+        entry = {**entry_state(parsed), **micro_state(micro)}
+        out.append(Candidate(int(cid), _norm_symbol(symbol), str(setup or ""), str(regime or ""), float(evaluated), float(ref), _finite(cost), entry))
     return out
 
 
@@ -289,15 +328,35 @@ def _half_life_sec() -> float:
     return half_life_days(SCALP_ENGINE) * 86400.0
 
 
-def _evidence_ridge(a: np.ndarray, b: np.ndarray, yy: float, n: float, iterations: int = 50) -> np.ndarray | None:
+def _group_of(name: str) -> str:
+    if name == "net" or name.startswith("net_over_"):
+        return "net"
+    if name in ("mfe", "mae", "giveback", "age_log"):
+        return "path"
+    if name.startswith("entry_"):
+        return "entry_fresh" if name.endswith("_fresh") else "entry"
+    for prefix, group in (("micro_", "micro"), ("sym_", "symbol"), ("setup_", "setup"), ("btc_", "regime"), ("vol_", "regime")):
+        if name.startswith(prefix):
+            return group
+    return name
+
+
+GROUPS: tuple[str, ...] = tuple(dict.fromkeys(_group_of(name) for name in FEATURES[1:]))
+_GROUP_INDEX = np.asarray([GROUPS.index(_group_of(name)) for name in FEATURES[1:]], dtype=int)
+_STRENGTH_BOUNDS = (1e-8, 1e12)
+
+
+def _evidence_ridge(a: np.ndarray, b: np.ndarray, yy: float, n: float, iterations: int = 100) -> np.ndarray | None:
     """Ridge with an unpenalised mean and prior 0 on every state term.
 
     Labels share price paths and are weighted to their information content, so
-    ``n`` is an effective count. The mean advantage is estimated freely. The
-    noise variance and the state-term prior variance are re-estimated from the
-    sufficient statistics (evidence maximisation), so a state effect counts
-    only as far as the data separates it from noise. ``FEATURES[0]`` is the
-    constant 1, so ``a[0, 0]`` is the weight total.
+    ``n`` is an effective count. The mean advantage is estimated freely. Each
+    feature family (net, path, entry terms, fading entry terms, order book and
+    tape, symbol, setup, regime) has its own prior variance, and those and the
+    noise variance are re-estimated from the sufficient statistics (evidence
+    maximisation). A family counts only as far as the data separates it from
+    noise, and one informative family is not drowned by uninformative ones.
+    ``FEATURES[0]`` is the constant 1, so ``a[0, 0]`` is the weight total.
     """
     total = float(a[0, 0])
     if n <= 0 or total <= 0:
@@ -315,33 +374,33 @@ def _evidence_ridge(a: np.ndarray, b: np.ndarray, yy: float, n: float, iteration
 
 
 def _shrunk(a: np.ndarray, b: np.ndarray, yy: float, n: float, iterations: int) -> np.ndarray | None:
-    try:
-        eig, vec = np.linalg.eigh(a)
-    except np.linalg.LinAlgError:
-        return None
-    eig = np.maximum(eig, 0.0)
-    proj = vec.T @ b
-    strength = float(PRIOR_STRENGTH)
+    lo, hi = _STRENGTH_BOUNDS
+    groups = _GROUP_INDEX if len(_GROUP_INDEX) == len(b) else np.zeros(len(b), dtype=int)
+    strength = np.full(int(groups.max()) + 1, float(PRIOR_STRENGTH))
     beta = np.zeros_like(b)
     for _ in range(iterations):
-        coef = proj / (eig + strength)
-        beta = vec @ coef
-        fitted = float(np.sum(eig * coef * coef))
-        resid = max(yy - 2.0 * float(coef @ proj) + fitted, 1e-18)
-        gamma = float(np.sum(eig / (eig + strength)))
-        noise = resid / max(n - gamma, 1.0)
-        signal = float(coef @ coef) / max(gamma, 1e-9)
-        if signal <= 0:
-            break
-        updated = noise / signal
-        if not math.isfinite(updated):
-            break
-        converged = abs(updated - strength) <= 1e-6 * strength
+        try:
+            cov = np.linalg.inv(a + np.diag(strength[groups]))
+        except np.linalg.LinAlgError:
+            return None
+        beta = cov @ b
+        resid = max(yy - 2.0 * float(beta @ b) + float(beta @ a @ beta), 1e-18)
+        gamma = 1.0 - strength[groups] * np.diag(cov)
+        noise = resid / max(n - float(gamma.sum()), 1.0)
+        updated = strength.copy()
+        for g in range(len(strength)):
+            mask = groups == g
+            size = float(beta[mask] @ beta[mask])
+            used = float(gamma[mask].sum())
+            updated[g] = hi if size <= 0 or used <= 0 else min(hi, max(lo, noise * used / size))
+        converged = np.all(np.abs(np.log(updated) - np.log(strength)) <= 1e-5)
         strength = updated
         if converged:
             break
-    coef = proj / (eig + strength)
-    beta = vec @ coef
+    try:
+        beta = np.linalg.solve(a + np.diag(strength[groups]), b)
+    except np.linalg.LinAlgError:
+        return None
     return beta if np.all(np.isfinite(beta)) else None
 
 
@@ -351,6 +410,7 @@ class ValueModel:
     def __init__(self) -> None:
         width = len(FEATURES)
         self.clock = 0.0
+        self.meta: dict[str, Any] = {}
         self.stats: dict[int, dict[str, Any]] = {h: {"a": np.zeros((width, width)), "b": np.zeros(width), "yy": 0.0, "n": 0.0, "t": 0.0} for h in HORIZONS_SEC}
         self._beta: dict[int, np.ndarray] = {}
 
@@ -410,6 +470,7 @@ class ValueModel:
             "version": VALUE_VERSION,
             "features": list(FEATURES),
             "clock": self.clock,
+            "meta": self.meta,
             "horizons": {str(h): {"a": st["a"].tolist(), "b": st["b"].tolist(), "yy": st["yy"], "n": st["n"], "t": st["t"]} for h, st in self.stats.items()},
         }
 
@@ -419,6 +480,7 @@ class ValueModel:
             return None
         model = cls()
         model.clock = _finite(payload.get("clock"))
+        model.meta = dict(payload.get("meta") or {})
         for key, raw in (payload.get("horizons") or {}).items():
             horizon = int(key)
             if horizon not in model.stats:
@@ -535,7 +597,7 @@ def _labels_for(
     return out
 
 
-def build(db_path: str, *, as_of: float | None = None, state_db: str | None = None, chunk: int = 2000) -> dict[str, Any]:
+def build(db_path: str, *, as_of: float | None = None, state_db: str | None = None, chunk: int = 500) -> dict[str, Any]:
     """Train from every current-version candidate whose labels have elapsed, and install it."""
     clock = float(as_of if as_of is not None else time.time()) - LABEL_LAG_SEC
     candidates = load_candidates(db_path, 0.0, clock)
@@ -551,36 +613,102 @@ def build(db_path: str, *, as_of: float | None = None, state_db: str | None = No
                 counts[item[0]] += 1
             model.fold(labels, clock)
     model.clock = clock
+    model.meta = {"built_at": time.time(), "build_candidates": len(candidates), "folded_at": time.time(), "last_folded": sum(counts.values())}
     save_model(state_db or db_path, model)
     return {"version": VALUE_VERSION, "clock": clock, "candidates": len(candidates), "labels": {str(h): n for h, n in counts.items()}}
 
 
 _FOLD_LOCK = threading.Lock()
 _LAST_FOLD: dict[str, float] = {}
+_BOOTSTRAP: dict[str, subprocess.Popen] = {}
+BUILD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "scripts", "scalp_value_build.py")
 
 
-def fold_due(db_path: str, *, now: float | None = None) -> int:
-    """Fold labels whose horizon elapsed since the model's clock. No-op without a model.
+def bootstrap(db_path: str) -> bool:
+    """Start one background build for the current economics. True while it runs.
 
-    The clock and the statistics are written together, so a label is folded once.
+    The build runs in its own low-priority process so its memory is returned
+    when it finishes; nothing is folded until it has installed the model.
+    """
+    running = _BOOTSTRAP.get(db_path)
+    if running is not None:
+        if running.poll() is None:
+            return True
+        _BOOTSTRAP.pop(db_path, None)
+        logger.warning("SCALP_VALUE_BOOTSTRAP_FINISHED rc=%s installed=%s", running.returncode, load_model(db_path, fresh=True) is not None)
+        return False
+    cmd = [sys.executable, os.path.normpath(BUILD_SCRIPT), "--db", db_path]
+    try:
+        _BOOTSTRAP[db_path] = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=(lambda: os.nice(10)) if hasattr(os, "nice") else None,  # noqa: PLW1509
+        )
+    except OSError:
+        logger.warning("SCALP_VALUE_BOOTSTRAP_FAILED", exc_info=True)
+        return False
+    logger.warning("SCALP_VALUE_BOOTSTRAP_STARTED key=%s", model_key())
+    return True
+
+
+def fold_due(db_path: str, *, now: float | None = None, start_build: bool = True) -> int:
+    """Fold labels whose horizon elapsed since the model's clock.
+
+    Without a model for the current economics a background build is started
+    instead. The clock and the statistics are written together, so a label is
+    folded once.
     """
     moment = float(now if now is not None else time.time())
     if moment - _LAST_FOLD.get(db_path, 0.0) < FOLD_INTERVAL_SEC:
         return 0
     _LAST_FOLD[db_path] = moment
     with _FOLD_LOCK:
+        if db_path in _BOOTSTRAP and bootstrap(db_path):
+            return 0
         model = load_model(db_path, fresh=True)
         if model is None:
+            if start_build:
+                bootstrap(db_path)
             return 0
         hi = moment - LABEL_LAG_SEC
         lo = model.clock
         if hi <= lo:
             return 0
+        started = time.monotonic()
         labels = _labels_for(db_path, load_candidates(db_path, lo - SPAN_SEC, hi), lo, hi)
         folded = model.fold(labels, hi)
         model.clock = hi
+        model.meta.update({"folded_at": time.time(), "last_folded": folded, "last_fold_ms": round((time.monotonic() - started) * 1000.0, 1)})
         save_model(db_path, model)
         return folded
+
+
+def status(db_path: str, *, now: float | None = None) -> dict[str, Any]:
+    """Installed state of the SCALP value model, for operators. Reads only."""
+    moment = float(now if now is not None else time.time())
+    model = load_model(db_path, fresh=True)
+    out: dict[str, Any] = {"key": model_key(), "version": VALUE_VERSION, "installed": model is not None}
+    if model is None:
+        return out
+    horizons = {}
+    for horizon in HORIZONS_SEC:
+        beta = model.beta(horizon)
+        horizons[str(horizon)] = {
+            "effective_n": round(float(model.stats[horizon]["n"]), 1),
+            "mean_advantage_bps": None if beta is None else round(float(beta[0]) * 1e4, 3),
+            "state_terms_norm_bps": None if beta is None else round(float(np.linalg.norm(beta[1:])) * 1e4, 3),
+        }
+    out.update(
+        {
+            "clock": model.clock,
+            "label_lag_sec": round(moment - model.clock, 1),
+            "stalled": moment - model.clock > LABEL_LAG_SEC + 10.0 * FOLD_INTERVAL_SEC,
+            "horizons": horizons,
+            **model.meta,
+        }
+    )
+    return out
 
 
 __all__ = [
@@ -593,6 +721,7 @@ __all__ = [
     "ValueModel",
     "authority",
     "bars_from",
+    "bootstrap",
     "build",
     "candidate_labels",
     "density",
@@ -603,8 +732,11 @@ __all__ = [
     "horizon_gross",
     "load_candidates",
     "load_model",
+    "micro_raw",
+    "micro_state",
     "path_state",
     "save_model",
+    "status",
     "value",
     "vector",
 ]

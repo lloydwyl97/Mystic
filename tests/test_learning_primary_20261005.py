@@ -256,6 +256,7 @@ def test_continuation_learns_both_directions_without_a_config_change(tmp_path):
     assert green_recovered > green_after_loss
     assert al.learned_hold_or_exit(expected_terminal_net=green_recovered, unrealized_net=0.008) == "hold"
 
+    # SCALP continuation is its learned value model, not the pooled binary hold metric.
     al.learn_from_close(
         db,
         engine=al.SCALP_ENGINE,
@@ -271,28 +272,7 @@ def test_continuation_learns_both_directions_without_a_config_change(tmp_path):
         unrealized_marks=[-0.003],
         **common,
     )
-    red_worse = scalp_term(-0.003)
-    assert red_worse < -0.003
-    assert al.learned_hold_or_exit(expected_terminal_net=red_worse, unrealized_net=-0.003) == "exit"
-    for _ in range(6):
-        al.learn_from_close(
-            db,
-            engine=al.SCALP_ENGINE,
-            symbol="ETHUSDT",
-            setup="VWAP_EMA_RECLAIM",
-            regime="neutral",
-            strategy_version=scalp_ver,
-            net_pct=0.004,
-            mfe_pct=0.006,
-            mae_pct=0.003,
-            hold_min=8,
-            now=T0 + 200,
-            unrealized_marks=[-0.003],
-            **common,
-        )
-    red_recovered = scalp_term(-0.003)
-    assert red_recovered > red_worse
-    assert al.learned_hold_or_exit(expected_terminal_net=red_recovered, unrealized_net=-0.003) == "hold"
+    assert scalp_term(-0.003) == pytest.approx(-0.003)
 
 
 def test_universe_slots_and_exits_are_unchanged():

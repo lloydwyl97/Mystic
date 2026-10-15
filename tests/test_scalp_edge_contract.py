@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from backend.services.binance_scalp import scalp_candidate_ranking
 from backend.services.binance_scalp.economics import ScalpEconomics
 from backend.services.binance_scalp.market_reader import MarketSnapshot
 from backend.services.binance_scalp.momentum_tracker import MomentumTracker
@@ -123,6 +124,10 @@ def _learned_gross(monkeypatch, gross: float) -> None:
     monkeypatch.setattr(al, "scalp_decision", learned)
 
 
+def _learned_value(monkeypatch, advantage: float) -> None:
+    monkeypatch.setattr(scalp_candidate_ranking, "_scalp_entry_value", lambda *_args: advantage)
+
+
 def test_soft_reject_with_strategy_claim_keeps_its_directional_edge(monkeypatch):
     ctx = _ctx(_bars(30, 0.012))
     rc = rank_setup_signal(_sig(passed=False, reason="TARGET_NOT_REACHABLE", directional=0.004), regime="RANGE", ctx=ctx)
@@ -133,7 +138,12 @@ def test_soft_reject_with_strategy_claim_keeps_its_directional_edge(monkeypatch)
     assert rc.roundtrip_cost_pct == rc.executable_edge["live_cost_pct"]
     # Priced on the economic contract, not refused as unestimable; cold, the claim earns nothing.
     assert rc.hard_block == "NO_EXECUTABLE_NET_EDGE"
+    # A learned claim raises the claim's market edge; only the learned value of the lot admits it.
     _learned_gross(monkeypatch, 0.004)
+    rc = rank_setup_signal(_sig(passed=False, reason="TARGET_NOT_REACHABLE", directional=0.004), regime="RANGE", ctx=ctx)
+    assert rc.executable_edge["market_edge_pct"] > 0
+    assert rc.hard_block == "NO_EXECUTABLE_NET_EDGE"
+    _learned_value(monkeypatch, 0.002)
     rc = rank_setup_signal(_sig(passed=False, reason="TARGET_NOT_REACHABLE", directional=0.004), regime="RANGE", ctx=ctx)
     assert rc.hard_block is None
     assert rc.entry_eligible
@@ -147,6 +157,10 @@ def test_raw_move_below_cost_needs_learned_evidence(monkeypatch):
     assert rc.hard_block == "NO_EXECUTABLE_NET_EDGE"
     assert not rc.entry_eligible
     _learned_gross(monkeypatch, 0.002)
+    rc = rank_setup_signal(_sig(passed=False, reason="TARGET_NOT_REACHABLE", directional=0.0004), regime="RANGE", ctx=ctx)
+    assert rc.executable_edge["market_edge_pct"] > 0
+    assert not rc.entry_eligible
+    _learned_value(monkeypatch, 0.002)
     rc = rank_setup_signal(_sig(passed=False, reason="TARGET_NOT_REACHABLE", directional=0.0004), regime="RANGE", ctx=ctx)
     assert rc.executable_edge["final_executable_edge_pct"] > 0
     assert rc.entry_eligible
@@ -165,6 +179,10 @@ def test_passed_signal_uses_strategy_projection(monkeypatch):
     assert rc.executable_edge["expected_move_pct"] == 0.0
     assert not rc.entry_eligible
     _learned_gross(monkeypatch, 0.003)
+    rc = rank_setup_signal(_sig(passed=True, reason=None, expected=0.006), regime="RANGE", ctx=_ctx(_bars(30, 0.0004)))
+    assert rc.executable_edge["market_edge_pct"] > 0
+    assert not rc.entry_eligible
+    _learned_value(monkeypatch, 0.002)
     rc = rank_setup_signal(_sig(passed=True, reason=None, expected=0.006), regime="RANGE", ctx=_ctx(_bars(30, 0.0004)))
     assert rc.entry_eligible
 

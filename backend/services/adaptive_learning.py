@@ -963,7 +963,9 @@ def continuation_terminal(
 
     Remaining value is a neutral prior of 0, so a cold state holds. Negative
     evidence that keeping the position gave back money makes the terminal worse
-    than cashing out. Later positive evidence raises it again.
+    than cashing out. Later positive evidence raises it again. SCALP reads its
+    learned continuation value over the full position state; before one is
+    installed for the current economics its advantage is 0.
     """
     try:
         mark = float(unrealized_net)
@@ -977,13 +979,13 @@ def continuation_terminal(
     from backend.services.continuation_surface import advantage_authority, installed_aggregator, surface_advantage
 
     moment = float(now if now is not None else time.time())
-    if engine_id == SCALP_ENGINE and isinstance(features, dict):
+    if engine_id == SCALP_ENGINE:
         from backend.services.scalp_v2 import continuation_value
 
-        entry = features.get("entry_economic")
-        read = continuation_value.value(db_path, symbol, setup, regime, features, continuation_value.entry_state(entry if isinstance(entry, dict) else None))
-        if read is not None:
-            return mark + float(read["advantage"])
+        state = features if isinstance(features, dict) else {"net": mark}
+        entry = state.get("entry_economic")
+        read = continuation_value.value(db_path, symbol, setup, regime, state, continuation_value.entry_state(entry if isinstance(entry, dict) else None))
+        return mark + (float(read["advantage"]) if read is not None else 0.0)
     if advantage_authority(db_path, engine_id):
         state = features if isinstance(features, dict) else {"net": mark}
         advantage = surface_advantage(db_path, engine_id, symbol, setup, regime, state, moment, how=installed_aggregator(db_path, engine_id))

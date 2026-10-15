@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from backend.config.trading_economics import canonical_roundtrip_cost_pct
@@ -77,6 +77,7 @@ class ExecutableEdge:
     policy_calibration_pct: float = 0.0
     entry_value_pct: float | None = None
     value_version: str = ""
+    entry_micro: dict[str, float] = field(default_factory=dict)
 
     @property
     def eligible(self) -> bool:
@@ -122,6 +123,7 @@ class ExecutableEdge:
             "policy_value": self.final_executable_edge_pct,
             "entry_value": self.entry_value_pct,
             "value_version": self.value_version,
+            "entry_micro": dict(self.entry_micro),
             "uncertainty": self.uncertainty_pct,
             "backoff_gross": self.calibrated_move_pct - self.state_tilt_pct,
             "learned_expected_gross": self.expected_move_pct,
@@ -182,6 +184,7 @@ def scalp_executable_edge(
     impact_pct: float,
     edge_source: str,
     value_of: Callable[[dict[str, float]], float | None] | None = None,
+    micro_features: dict | None = None,
 ) -> ExecutableEdge:
     """Canonical SCALP executable net edge for the current candidate at the live book.
 
@@ -192,6 +195,7 @@ def scalp_executable_edge(
     microstructure features; it supplies the calibration, micro residual,
     confidence and risk. ``value_of`` maps the entry terms to the learned
     advantage of keeping a lot filled now; None keeps the claim-based edge.
+    ``micro_features`` is the live book and tape the value model reads at entry.
     """
     from backend.services.adaptive_learning import scalp_expected_gross
     from backend.services.scalp_v2.raw_move_source import is_directional, normalize_raw_move_source
@@ -208,10 +212,14 @@ def scalp_executable_edge(
     micro = micro_model
     gap = _f(view.get("policy_gap"))
     calibration = _f(view.get("policy_calibration"))
+    from backend.services.scalp_v2.continuation_value import micro_raw, micro_state
+
+    entry_micro = micro_raw(micro_features)
     entry_value = None
     value_version = ""
     if value_of is not None:
-        entry_value = value_of({"calibrated": move["calibrated"], "adaptive": move["adaptive"], "micro": micro, "raw_claim": raw, "cost": cost})
+        entry = {"calibrated": move["calibrated"], "adaptive": move["adaptive"], "micro": micro, "raw_claim": raw, "cost": cost}
+        entry_value = value_of({**entry, **micro_state(entry_micro)})
     if entry_value is not None and math.isfinite(float(entry_value)):
         from backend.services.scalp_v2.continuation_value import VALUE_VERSION
 
@@ -253,6 +261,7 @@ def scalp_executable_edge(
         policy_calibration_pct=calibration,
         entry_value_pct=entry_value,
         value_version=value_version,
+        entry_micro=entry_micro,
     )
 
 

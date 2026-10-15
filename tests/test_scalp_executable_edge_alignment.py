@@ -301,6 +301,7 @@ def test_eligibility_reads_final_edge_computed_exactly_once(monkeypatch):
         return out
 
     monkeypatch.setattr(ee, "scalp_executable_edge", counting)
+    monkeypatch.setattr(ranking, "_scalp_entry_value", lambda *_args: 0.002)
     _patch_view(monkeypatch, **_view(0.006))
     rc = rank_setup_signal(_sig(passed=True, reason=None, expected=0.006), regime="RANGE", ctx=_ctx(_bars(30, 0.012)))
     assert len(calls) == 1

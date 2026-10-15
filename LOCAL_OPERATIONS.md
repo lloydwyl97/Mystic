@@ -68,6 +68,19 @@ Shared cadence constants: `backend/config/mystic_api_schedule.py`
 
 See `docs/SCALP_MICROSTRUCTURE.md`. Exit review cadence `SCALP_EXIT_INTERVAL_SEC` (default 0.25s); rank cadence `SCALP_RANK_INTERVAL_SEC` (default 1s). Do not set `SCALP_LOOP_SEC=0.1`.
 
+## SCALP learned value (SCALP_VALUE_V1)
+
+- SCALP keep-vs-sell and entry read one learned model: `backend/services/scalp_v2/continuation_value.py`.
+  Entry final edge = learned value of the just-filled lot − live cost; the claim's `market_edge` is kept for comparison only.
+- No model for the current economics: entries price at −cost (none admitted), exits hold neutrally, and the
+  integration starts a background build. The binary `hold_remaining_*` metric is not used for SCALP.
+- Manual build (app stopped): `venv/bin/python3 scripts/scalp_value_build.py --db mystic_trading.db`
+- Status: `curl -s http://localhost:8000/api/portfolio-engine/adaptive/scalp-value | jq .data`
+  (`stalled: true` or `SCALP_VALUE_FOLD_FAILED` in the logs means the learner is not advancing).
+- Causal replay: `venv/bin/python3 scripts/research/scalp_value_replay.py --db <copy> --start ... --end ...`
+- 2026-10-15 finding: only entry-time order flow carries evidence (~+1.4 bps at 2m) against ~6 bps cost,
+  so the model admits nothing. Do not add gates to change that.
+
 ## Backup reference
 
 Final cleanup backup (2026-05-24):  

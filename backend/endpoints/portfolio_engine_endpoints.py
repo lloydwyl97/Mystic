@@ -739,6 +739,19 @@ async def get_day_candidate_markouts(window_days: float = 7.0) -> dict[str, Any]
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@router.get("/adaptive/scalp-value")
+async def get_scalp_value_status() -> dict[str, Any]:
+    """SCALP learned continuation value: installed, label clock, effective samples, mean advantage. Read-only."""
+    try:
+        from backend.services.scalp_v2.continuation_value import status
+
+        data = await asyncio.to_thread(status, os.getenv("TRADING_DB_PATH", DATABASE_PATH))
+        return {"success": True, "data": data}
+    except Exception as exc:
+        logger.exception("scalp-value status failed: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @router.get("/adaptive/abstention")
 async def get_adaptive_abstention(window_days: float = 7.0) -> dict[str, Any]:
     """Keys carrying a learned negative net expectancy (telemetry, no live veto). Read-only."""
