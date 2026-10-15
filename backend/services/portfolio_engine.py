@@ -6235,13 +6235,20 @@ class PortfolioEngine:
 
                     cursor.execute(
                         """
-                        INSERT OR REPLACE INTO portfolio_engine_ledger (
+                        INSERT INTO portfolio_engine_ledger (
                             id, principal, cash_balance, positions_value,
                             realized_pnl, unrealized_pnl, total_equity,
                             account_status, trading_paused, pause_reason,
                             last_updated, version
                         ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                             COALESCE((SELECT version FROM portfolio_engine_ledger WHERE id=1), 0) + 1)
+                        ON CONFLICT(id) DO UPDATE SET
+                            principal = excluded.principal, cash_balance = excluded.cash_balance,
+                            positions_value = excluded.positions_value, realized_pnl = excluded.realized_pnl,
+                            unrealized_pnl = excluded.unrealized_pnl, total_equity = excluded.total_equity,
+                            account_status = excluded.account_status, trading_paused = excluded.trading_paused,
+                            pause_reason = excluded.pause_reason, last_updated = excluded.last_updated,
+                            version = excluded.version
                     """,
                         (
                             self.principal,
@@ -6645,13 +6652,20 @@ class PortfolioEngine:
                     mark_opportunity_on(conn, position.symbol, str(position.scalp_opportunity_id), "OPEN")
                 cursor.execute(
                     """
-                    INSERT OR REPLACE INTO portfolio_engine_ledger (
+                    INSERT INTO portfolio_engine_ledger (
                         id, principal, cash_balance, positions_value,
                         realized_pnl, unrealized_pnl, total_equity,
                         account_status, trading_paused, pause_reason,
                         last_updated, version
                     ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         COALESCE((SELECT version FROM portfolio_engine_ledger WHERE id=1), 0) + 1)
+                    ON CONFLICT(id) DO UPDATE SET
+                        principal = excluded.principal, cash_balance = excluded.cash_balance,
+                        positions_value = excluded.positions_value, realized_pnl = excluded.realized_pnl,
+                        unrealized_pnl = excluded.unrealized_pnl, total_equity = excluded.total_equity,
+                        account_status = excluded.account_status, trading_paused = excluded.trading_paused,
+                        pause_reason = excluded.pause_reason, last_updated = excluded.last_updated,
+                        version = excluded.version
                     """,
                     (
                         self.principal,
