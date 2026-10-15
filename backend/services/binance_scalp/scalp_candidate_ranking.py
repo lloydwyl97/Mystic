@@ -204,13 +204,22 @@ def candidate_executable_edge(
 ) -> tuple[Any, dict, str]:
     """(ExecutableEdge, stamped adaptive view, adaptive regime) for one candidate."""
     from backend.services.adaptive_learning import scalp_decision
+    from backend.services.scalp_v2.continuation_value import entry_value
     from backend.services.scalp_v2.executable_edge import scalp_executable_edge, stamp_view
 
     regime_key = _adaptive_regime(db_path, symbol)
+    sym = symbol.upper().replace("/", "").replace("-", "")
     feats = dict(micro_feats or {})
     feats["structural_projection"] = float(raw_expected_move_pct or 0.0)
-    view = scalp_decision(db_path, symbol.upper().replace("/", "").replace("-", ""), setup, regime_key, features=feats)
-    edge = scalp_executable_edge(view, raw_expected_move_pct=raw_expected_move_pct, spread_pct=spread_pct, impact_pct=impact_pct, edge_source=edge_source)
+    view = scalp_decision(db_path, sym, setup, regime_key, features=feats)
+    edge = scalp_executable_edge(
+        view,
+        raw_expected_move_pct=raw_expected_move_pct,
+        spread_pct=spread_pct,
+        impact_pct=impact_pct,
+        edge_source=edge_source,
+        value_of=lambda entry: entry_value(db_path, sym, setup, regime_key, entry),
+    )
     return edge, stamp_view(view, edge), regime_key
 
 

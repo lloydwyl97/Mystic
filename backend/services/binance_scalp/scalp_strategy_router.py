@@ -498,6 +498,8 @@ class ScalpStrategyRouter:
                 "executable_edge": meta.get("executable_edge") or {},
                 "adaptive_decision": meta.get("adaptive_decision") or {},
                 "adaptive_regime": meta.get("adaptive_regime") or "",
+                "evaluated_at": time.time(),
+                "book_age_sec": float(getattr(snap, "orderbook_age_sec", 0.0) or 0.0),
                 "reachability_surplus": meta.get("reachability_surplus"),
                 "selection_confidence": meta.get("selection_confidence"),
                 # EV-sizing inputs (scalp_dynamic_sizing.py) — never gates.

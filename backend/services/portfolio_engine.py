@@ -17139,6 +17139,8 @@ class PortfolioEngine:
                     _bar_low_sv2 = float(current_price)
 
                 _scalp_adapt = getattr(position, "adaptive_decision", None) or {}
+                _scalp_state = _continuation_features(position, entry_price=entry_price, mark=float(current_price), net=_net_pnl_sv2, db_path=self.db_path)
+                _scalp_state["entry_economic"] = ((_scalp_adapt or {}).get("executable_edge") or {}).get("economic")
                 _scalp_terminal = _open_expected_terminal(
                     self.db_path,
                     "SCALP_V2",
@@ -17146,7 +17148,7 @@ class PortfolioEngine:
                     str((_scalp_adapt or {}).get("setup") or getattr(position, "entry_thesis", "") or ""),
                     str((_scalp_adapt or {}).get("regime") or ""),
                     _net_pnl_sv2,
-                    _continuation_features(position, entry_price=entry_price, mark=float(current_price), net=_net_pnl_sv2, db_path=self.db_path),
+                    _scalp_state,
                 )
                 _scalp_v2_dec = evaluate_scalp_v2_exit(
                     position=position,

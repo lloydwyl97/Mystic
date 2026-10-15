@@ -977,6 +977,13 @@ def continuation_terminal(
     from backend.services.continuation_surface import advantage_authority, installed_aggregator, surface_advantage
 
     moment = float(now if now is not None else time.time())
+    if engine_id == SCALP_ENGINE and isinstance(features, dict):
+        from backend.services.scalp_v2 import continuation_value
+
+        entry = features.get("entry_economic")
+        read = continuation_value.value(db_path, symbol, setup, regime, features, continuation_value.entry_state(entry if isinstance(entry, dict) else None))
+        if read is not None:
+            return mark + float(read["advantage"])
     if advantage_authority(db_path, engine_id):
         state = features if isinstance(features, dict) else {"net": mark}
         advantage = surface_advantage(db_path, engine_id, symbol, setup, regime, state, moment, how=installed_aggregator(db_path, engine_id))

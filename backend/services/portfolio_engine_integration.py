@@ -2398,6 +2398,10 @@ class PortfolioEngineIntegration:
             path_low=lambda sym, a, b: ohlcv_low_between(markout_db, sym, a, b),
             tick_quote=_tick_quote,
         )
+        with contextlib.suppress(Exception):
+            from backend.services.scalp_v2.continuation_value import fold_due
+
+            await _asyncio.to_thread(fold_due, markout_db)
         by_symbol = {str(row.get("symbol") or "").upper().replace("-", "").replace("/", ""): row for row in candidates}
         products = [str(s) for s in getattr(cfg, "products", [])] or list(by_symbol)
         with contextlib.suppress(Exception):

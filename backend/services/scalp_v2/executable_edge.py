@@ -8,6 +8,12 @@ current candidate and the live book:
     market_edge           = base_executable_edge + adaptive_residual + micro_residual
     final_executable_edge = market_edge + policy_gap
 
+When a SCALP value model is installed, the final edge is instead the learned
+continuation value of the lot just filled at the ask, minus the live cost:
+the same function that later decides whether to keep it. ``policy_gap`` and
+``policy_calibration`` are then 0, and ``market_edge`` stays the claim's own
+estimate for comparison.
+
 The raw projection is the strategy's structural target distance. It is a
 feature, never the expected move: the gross mean and ``claim_capture`` are
 learned from realized gross moves of claims (admitted or not) with zero priors,
@@ -30,6 +36,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -68,6 +75,8 @@ class ExecutableEdge:
     policy_gap_pct: float = 0.0
     n_policy_gap: float = 0.0
     policy_calibration_pct: float = 0.0
+    entry_value_pct: float | None = None
+    value_version: str = ""
 
     @property
     def eligible(self) -> bool:
@@ -75,7 +84,7 @@ class ExecutableEdge:
 
     @property
     def market_edge_pct(self) -> float:
-        return self.final_executable_edge_pct - self.policy_gap_pct - self.policy_calibration_pct
+        return self.base_executable_edge_pct + self.adaptive_residual_pct + self.micro_residual_pct
 
     @property
     def pre_micro_edge_pct(self) -> float:
@@ -111,6 +120,8 @@ class ExecutableEdge:
             "policy_calibration": self.policy_calibration_pct,
             "uncalibrated_policy_value": self.final_executable_edge_pct - self.policy_calibration_pct,
             "policy_value": self.final_executable_edge_pct,
+            "entry_value": self.entry_value_pct,
+            "value_version": self.value_version,
             "uncertainty": self.uncertainty_pct,
             "backoff_gross": self.calibrated_move_pct - self.state_tilt_pct,
             "learned_expected_gross": self.expected_move_pct,
@@ -170,6 +181,7 @@ def scalp_executable_edge(
     spread_pct: float | None,
     impact_pct: float,
     edge_source: str,
+    value_of: Callable[[dict[str, float]], float | None] | None = None,
 ) -> ExecutableEdge:
     """Canonical SCALP executable net edge for the current candidate at the live book.
 
@@ -178,7 +190,8 @@ def scalp_executable_edge(
     refused). It enters only through the learned calibration. ``view`` is
     ``adaptive_learning.scalp_decision(...)`` computed with the live
     microstructure features; it supplies the calibration, micro residual,
-    confidence and risk.
+    confidence and risk. ``value_of`` maps the entry terms to the learned
+    advantage of keeping a lot filled now; None keeps the claim-based edge.
     """
     from backend.services.adaptive_learning import scalp_expected_gross
     from backend.services.scalp_v2.raw_move_source import is_directional, normalize_raw_move_source
@@ -195,7 +208,20 @@ def scalp_executable_edge(
     micro = micro_model
     gap = _f(view.get("policy_gap"))
     calibration = _f(view.get("policy_calibration"))
-    final = pre_micro + micro + gap + calibration
+    entry_value = None
+    value_version = ""
+    if value_of is not None:
+        entry_value = value_of({"calibrated": move["calibrated"], "adaptive": move["adaptive"], "micro": micro, "raw_claim": raw, "cost": cost})
+    if entry_value is not None and math.isfinite(float(entry_value)):
+        from backend.services.scalp_v2.continuation_value import VALUE_VERSION
+
+        entry_value = float(entry_value)
+        value_version = VALUE_VERSION
+        gap = calibration = 0.0
+        final = entry_value - cost
+    else:
+        entry_value = None
+        final = pre_micro + micro + gap + calibration
     confidence = _f(view.get("confidence"))
     risk = _f(view.get("risk_estimate"))
     return ExecutableEdge(
@@ -225,6 +251,8 @@ def scalp_executable_edge(
         policy_gap_pct=gap,
         n_policy_gap=_f(view.get("n_policy_gap")),
         policy_calibration_pct=calibration,
+        entry_value_pct=entry_value,
+        value_version=value_version,
     )
 
 
@@ -252,6 +280,9 @@ _DETAIL_KEYS: tuple[tuple[str, str], ...] = (
     ("micro_residual_unweighted", "micro_residual_unweighted_pct"),
     ("market_edge", "market_edge_pct"),
     ("policy_gap", "policy_gap_pct"),
+    ("policy_calibration", "policy_calibration_pct"),
+    ("entry_value", "entry_value_pct"),
+    ("value_version", "value_version"),
     ("uncertainty", "uncertainty_pct"),
     ("economic_version", "economic_version"),
     ("final_executable_edge", "final_executable_edge_pct"),
@@ -290,6 +321,9 @@ def decision_detail(row: dict[str, Any] | None, **extra: Any) -> str:
         payload["volatility_move"] = round(float(vol), 8)
     payload["setup"] = str(row.get("best_setup") or "")
     payload["regime"] = str(row.get("adaptive_regime") or "")
+    for key in ("evaluated_at", "book_age_sec"):
+        if isinstance(row.get(key), (int, float)):
+            payload[key] = round(float(row[key]), 3)
     payload.update({k: v for k, v in extra.items() if v is not None})
     return json.dumps(payload, separators=(",", ":"), default=str)
 
