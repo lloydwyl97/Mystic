@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -153,11 +154,18 @@ def held_quantity(db_path_or_conn: str | sqlite3.Connection, symbol: str) -> flo
     return float(sum(float(r["quantity"] or 0.0) for r in held_lots(db_path_or_conn, symbol)))
 
 
-def held_inventory_equity(db_path: str, prices: dict[str, float] | None, open_trade_ids: set[str]) -> tuple[float, float]:
+def held_inventory_equity(
+    db_path: str,
+    prices: dict[str, float] | None,
+    open_trade_ids: set[str],
+    mark: Callable[[str], float] | None = None,
+) -> tuple[float, float]:
     """Market value and cost of HELD dust not already marked as an open lot.
 
     These coins are owned. They are not an active strategy position, so the
     caller adds them to account equity and not to a sleeve's realized P&L.
+    ``mark(symbol)`` prices a symbol missing from ``prices``; cost basis is the
+    last resort.
     """
     market = 0.0
     cost = 0.0
@@ -171,8 +179,8 @@ def held_inventory_equity(db_path: str, prices: dict[str, float] | None, open_tr
             continue
         sym = str(lot.get("symbol") or "")
         base = sym.split("/", maxsplit=1)[0]
-        mark = marks.get(sym) or marks.get(base) or marks.get(sym.replace("/", "")) or basis
-        px = float(mark) if mark and float(mark) > 0 else basis
+        found = marks.get(sym) or marks.get(base) or marks.get(sym.replace("/", "")) or (mark(sym) if mark else 0.0)
+        px = float(found) if found and float(found) > 0 else basis
         market += qty * px
         cost += qty * basis
     return market, cost

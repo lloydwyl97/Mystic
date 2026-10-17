@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -404,8 +405,15 @@ def list_protected(db_path: str | Path) -> list[dict[str, Any]]:
     ]
 
 
-def protected_equity(db_path: str | Path, prices: dict[str, float] | None = None) -> tuple[float, float]:
-    """Return (market_value, cost) so total equity includes this inventory."""
+def protected_equity(
+    db_path: str | Path,
+    prices: dict[str, float] | None = None,
+    mark: Callable[[str], float] | None = None,
+) -> tuple[float, float]:
+    """Return (market_value, cost) so total equity includes this inventory.
+
+    ``mark(symbol)`` prices a symbol missing from ``prices``; cost basis is the last resort.
+    """
     market = 0.0
     cost = 0.0
     marks = prices or {}
@@ -414,8 +422,8 @@ def protected_equity(db_path: str | Path, prices: dict[str, float] | None = None
         basis = float(row["cost_price"])
         sym = str(row["symbol"])
         base = sym.split("/", maxsplit=1)[0]
-        mark = marks.get(sym) or marks.get(base) or marks.get(sym.replace("/", "")) or basis
-        px = float(mark) if mark and float(mark) > 0 else basis
+        found = marks.get(sym) or marks.get(base) or marks.get(sym.replace("/", "")) or (mark(sym) if mark else 0.0)
+        px = float(found) if found and float(found) > 0 else basis
         market += qty * px
         cost += qty * basis
     return market, cost

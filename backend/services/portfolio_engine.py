@@ -5069,11 +5069,23 @@ class PortfolioEngine:
                 _accumulate(symbol, pos, pos.entry_price)
         return self._add_protected_equity(positions_value_market, cost_basis, prices)
 
+    def _inventory_mark(self, symbol: str) -> float:
+        """Mark for owned inventory outside an open lot: this pass's position marks, then the fresh Redis price."""
+        marks = getattr(self, "_position_mark_prices", {}) or {}
+        for key in (symbol, normalize_symbol(symbol), symbol.replace("/", "")):
+            px = marks.get(key)
+            if px and float(px) > 0:
+                return float(px)
+        try:
+            return float(self._get_cached_market_price(symbol) or 0.0)
+        except Exception:
+            return 0.0
+
     def _add_protected_equity(self, market: float, cost: float, prices: dict[str, float] | None) -> tuple[float, float]:
         try:
             from backend.services.protected_external_inventory import protected_equity
 
-            extra_market, extra_cost = protected_equity(self.db_path, prices)
+            extra_market, extra_cost = protected_equity(self.db_path, prices, self._inventory_mark)
             market += extra_market
             cost += extra_cost
         except Exception:
@@ -5082,7 +5094,7 @@ class PortfolioEngine:
             from backend.services.engine_strategy_dust import held_inventory_equity
 
             open_ids = {str(getattr(pos, "trade_id", "") or "") for pos in self.open_positions.values()}
-            dust_market, dust_cost = held_inventory_equity(self.db_path, prices, open_ids)
+            dust_market, dust_cost = held_inventory_equity(self.db_path, prices, open_ids, self._inventory_mark)
             market += dust_market
             cost += dust_cost
         except Exception:

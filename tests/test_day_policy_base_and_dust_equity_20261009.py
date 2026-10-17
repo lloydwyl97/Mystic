@@ -124,3 +124,46 @@ def test_held_dust_is_valued_once_and_an_open_lot_is_not_repeated(tmp_path):
     assert market == pytest.approx(0.5 * 2500.0)
     assert cost == pytest.approx(0.5 * 2400.0)
     assert "SOL" not in json.dumps({"market": market})
+
+
+def _held_btc_db(tmp_path):
+    db = str(tmp_path / "h.db")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE engine_strategy_dust (
+                id INTEGER PRIMARY KEY, engine_id TEXT, symbol TEXT, source_trade_id TEXT,
+                quantity REAL, quantity_exact TEXT, entry_price REAL, provenance_json TEXT,
+                status TEXT, retired_class TEXT, retired_ref TEXT, created_at TEXT, retired_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO engine_strategy_dust (engine_id, symbol, source_trade_id, quantity, entry_price, status, created_at) VALUES (?,?,?,?,?,?,?)",
+            ("SCALP_V2", "BTC/USDT", "held", 0.001, 84000.0, "HELD", "2026-10-15T00:00:00Z"),
+        )
+    return db
+
+
+def test_held_dust_without_supplied_prices_reads_the_live_mark(tmp_path):
+    db = _held_btc_db(tmp_path)
+    market, cost = held_inventory_equity(db, None, set(), lambda sym: 81600.0 if sym == "BTC/USDT" else 0.0)
+    assert market == pytest.approx(0.001 * 81600.0)
+    assert cost == pytest.approx(0.001 * 84000.0)
+    market, _ = held_inventory_equity(db, None, set(), lambda _sym: 0.0)
+    assert market == pytest.approx(0.001 * 84000.0)
+
+
+def test_status_read_marks_held_dust_like_the_writer(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from backend.services.portfolio_engine import PortfolioEngine
+
+    db = _held_btc_db(tmp_path)
+    engine = SimpleNamespace(db_path=db, open_positions={}, _position_mark_prices={})
+    engine._get_cached_market_price = lambda sym: 81600.0 if "BTC" in sym else 0.0
+    engine._inventory_mark = lambda sym: PortfolioEngine._inventory_mark(engine, sym)
+    status_read = PortfolioEngine._add_protected_equity(engine, 0.0, 0.0, None)
+    writer = PortfolioEngine._add_protected_equity(engine, 0.0, 0.0, {"BTC/USDT": 81600.0})
+    assert status_read[0] == pytest.approx(writer[0]) == pytest.approx(0.001 * 81600.0)
+    assert status_read[1] == pytest.approx(writer[1])

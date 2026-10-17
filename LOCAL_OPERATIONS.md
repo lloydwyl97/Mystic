@@ -6,7 +6,7 @@
 
 | Action | Command |
 |--------|---------|
-| **Start (use this)** | `cd /home/mystic/mystic && ./start_mystic.sh core` (DAY top-4 + scalp paper) |
+| **Start (use this)** | `cd /home/mystic/mystic && ./start_mystic.sh core` (DAY V2 + SCALP V2, top-4) |
 | Same as core | `./start_mystic.sh full` |
 | Stop | `cd /home/mystic/mystic && ./stop_mystic.sh` |
 | Desktop shortcut | `~/Desktop/Start Mystic.desktop` → runs **core** |
@@ -23,24 +23,29 @@ See **CANONICAL_SYSTEM.md** for the full active path, API honesty table, and qua
 4. `start_portfolio_engine_integration.py`
 5. `start_ai_market_context.py`
 6. `start_ai_learning.py`
-7. `backend.services.binance_scalp.runner` (scalp paper — isolated from DAY)
 
-DAY and scalp are **separate engines**. Dashboard shows them separately; PnL is not mixed.
-Scalp `NEAR_PASS` / spread blockers are scalp diagnostics only, not DAY faults.
+That is the whole core stack: six processes. SCALP V2 runs inside the portfolio engine
+(`start_portfolio_engine_integration.py`); the old paper `binance_scalp.runner` was retired 2026-09-22
+and `start_mystic.sh` stops any lingering instance.
 
-Requires: Redis running, `.env` with `EXTERNAL_SUPERVISOR_MODE=true`, paper mode unless explicitly switched.
+DAY and SCALP are **separate engines**. Dashboard shows them separately; PnL is not mixed.
+
+Requires: Redis running, `.env` with `EXTERNAL_SUPERVISOR_MODE=true`. This VM runs `TRADING_MODE=paper`,
+`SCALP_LIVE=false`; production (Ocean) runs live — see the Ocean operations rule.
 
 Note: `live_data_collector.py`, `start_ai_ml_trading.py`, and `start_agent_orchestrator.py` are retired stubs — OHLCV runs in `start_live_market_data.py`. Process-health reports `live_data_collector` under `optional_processes` as `retired_optional`; it is not required for a healthy core stack.
 
 ## Trading design (do not drift)
 
-- **Paper mode** default; `LIVE_TRADES_ALLOWED=false` unless explicitly changed
-- **Top-4 DAY only:** BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT
-- **Buy:** 15m entry decisions (`DAY_ENTRY_BAR_SEC=900`) → `process_bar_candidates` arms a trailing-buy intent → confirmed rebound submits through `execute_buy_fifo` (`DAY_TRAILING_BUY_CONFIRMED`)
-- **Sell:** exit loop → `monitor_all_positions` → `_check_exit_conditions` via `day_controlled_exits` (net profit, stop/trail, stall, giveback, time-stop, thesis/extreme)
-- **Hold ceilings:** BTC/ETH ~6h, SOL/XRP ~5h (`COIN_PROFILES.max_hold_min`); stall/giveback retuned for multi-hour day trades
-- **Learning:** `trade_learning_outcomes` + market-role outcome learner from closed trades
-- **No:** soft-rank SCALP entries, replacement churn, bridge BUY, fallback buys
+- **Top-4 only:** BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT
+- **DAY V2 entry:** 15m bars → learned net-edge decision (`day_v2_decisions`) → direct entry
+  (`backend/services/day_v2/live_entry.py`, `submit_day_v2_direct_entry`); status reports `day_entry_path=direct`
+- **DAY exit:** exit loop → `monitor_all_positions` → `_check_exit_conditions` via `day_controlled_exits`
+- **SCALP V2:** entry and keep-vs-sell both read the learned value model (below); orders go through
+  `execute_buy_fifo` with the order-boundary repricing check (`EDGE_DECAYED_AT_ORDER`)
+- **Learning:** `trade_learning_outcomes`, `adaptive_candidate_markouts` and the adaptive state
+- **No:** soft-rank SCALP entries, replacement churn, bridge BUY, fallback buys, DAY adverse stop-loss
+  (SCALP keeps only its catastrophic protection)
 
 ## Dead services (removed / disabled — do not rebuild)
 
@@ -57,7 +62,7 @@ Active keys to preserve: all four `ai_signal:day:*` and `ai_context:*` for top-4
 
 ## Logs and dashboard
 
-- Logs: `/home/mystic/mystic/logs/mystic_*.log` (backend, live_md, signal, portfolio, learning, ai_context, scalp)
+- Logs: `/home/mystic/mystic/logs/mystic_*.log` (backend, live_md, signal, portfolio, learning, ai_context)
 - Dashboard: `http://127.0.0.1:8000/dashboard/`
 
 ## API timing
