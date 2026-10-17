@@ -40,9 +40,7 @@ def _book(db: str, ts: float, bid: float) -> None:
 
 def test_live_30s_and_60s_ignore_a_later_candle_close(tmp_path):
     db = str(tmp_path / "t.db")
-    row_id = al.record_candidate(
-        db, engine=SCALP, symbol="BTCUSDT", setup="CLAIM", regime="r", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=T0
-    )
+    row_id = al.record_candidate(db, engine=SCALP, symbol="BTCUSDT", setup="CLAIM", regime="r", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=T0)
     al.resolve_markouts(db, lambda _s, _t: 130.0, now=T0 + 200)
     marks = _marks(db, row_id)
     assert marks["30"] is None and marks["60"] is None
@@ -53,9 +51,7 @@ def test_live_30s_and_60s_use_the_aligned_bid(tmp_path):
     db = str(tmp_path / "t.db")
     _book(db, T0 + 28.0, 100.2)
     _book(db, T0 + 58.0, 100.4)
-    row_id = al.record_candidate(
-        db, engine=SCALP, symbol="BTCUSDT", setup="CLAIM", regime="r", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=T0
-    )
+    row_id = al.record_candidate(db, engine=SCALP, symbol="BTCUSDT", setup="CLAIM", regime="r", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=T0)
     al.resolve_markouts(db, lambda _s, _t: 130.0, now=T0 + 200)
     marks = _marks(db, row_id)
     assert abs(marks["30"] - ((100.2 - 100.0) / 100.0 - 0.0006)) < 1e-12
@@ -66,9 +62,7 @@ def test_bid_mark_does_not_charge_the_exit_half_spread_twice(tmp_path):
     db = str(tmp_path / "t.db")
     _book(db, T0 + 28.0, 99.988)
     # Ask entry. Full spread 1.2 bps is inside the bid. Stored cost adds the 0.6 bps exit half on top of 6 bps of fee and slippage.
-    row_id = al.record_candidate(
-        db, engine=SCALP, symbol="BTCUSDT", setup="CLAIM", regime="r", ref_price=100.0, roundtrip_cost=0.00066, signaled=True, evaluated_at=T0
-    )
+    row_id = al.record_candidate(db, engine=SCALP, symbol="BTCUSDT", setup="CLAIM", regime="r", ref_price=100.0, roundtrip_cost=0.00066, signaled=True, evaluated_at=T0)
     al.resolve_markouts(db, lambda _s, _t: 130.0, now=T0 + 200)
     marks = _marks(db, row_id)
     assert abs(marks["30"] - ((99.988 - 100.0) / 100.0 - 0.0006)) < 1e-12
@@ -89,18 +83,14 @@ def test_calibration_folds_as_a_running_mean(tmp_path):
 def test_a_print_after_the_horizon_stays_missing(tmp_path):
     db = str(tmp_path / "t.db")
     _book(db, T0 + 40.0, 101.0)
-    row_id = al.record_candidate(
-        db, engine=SCALP, symbol="BTCUSDT", setup="CLAIM", regime="r", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=T0
-    )
+    row_id = al.record_candidate(db, engine=SCALP, symbol="BTCUSDT", setup="CLAIM", regime="r", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=T0)
     al.resolve_markouts(db, lambda _s, _t: 130.0, now=T0 + 200)
     assert _marks(db, row_id)["30"] is None
 
 
 def test_stored_short_mark_is_rebuilt_from_the_bid(tmp_path):
     db = str(tmp_path / "t.db")
-    row_id = al.record_candidate(
-        db, engine=SCALP, symbol="BTCUSDT", setup="CLAIM", regime="r", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=T0
-    )
+    row_id = al.record_candidate(db, engine=SCALP, symbol="BTCUSDT", setup="CLAIM", regime="r", ref_price=100.0, roundtrip_cost=0.0006, signaled=True, evaluated_at=T0)
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE adaptive_candidate_markouts SET markouts_json=? WHERE id=?", (json.dumps({"30": 0.25, "60": 0.25}), row_id))
     _book(db, T0 + 28.0, 100.2)
@@ -137,14 +127,14 @@ def _day_close(db: str, setup: str, predicted: float, realized: float, opp: str)
 def test_a_loss_lowers_the_next_forecast_and_a_win_can_raise_it(tmp_path):
     db = str(tmp_path / "t.db")
     setup = "EXHAUSTION_MR"
-    before = al.day_decision(db, "SOLUSDT", setup, "btcdown_vollo")["expected_net"]
+    before = al.day_decision(db, "SOLUSDT", setup, "btcdown_vollo")["economic"]["trade_net_value"]
     _day_close(db, setup, 0.0044, -0.00107, "OPP-LOSS")
     assert al.observe(db, engine=DAY, symbol="SOLUSDT", setup=setup, regime="btcdown_vollo", metric="trade_net", value=-0.00107, strategy_version=al.current_strategy_version(DAY), now=T0)
-    after_loss = al.day_decision(db, "SOLUSDT", setup, "btcdown_vollo")["expected_net"]
+    after_loss = al.day_decision(db, "SOLUSDT", setup, "btcdown_vollo")["economic"]["trade_net_value"]
     assert after_loss < before
     _day_close(db, setup, after_loss, after_loss + 0.02, "OPP-WIN")
     assert al.observe(db, engine=DAY, symbol="SOLUSDT", setup=setup, regime="btcdown_vollo", metric="trade_net", value=after_loss + 0.02, strategy_version=al.current_strategy_version(DAY), now=T0)
-    after_win = al.day_decision(db, "SOLUSDT", setup, "btcdown_vollo")["expected_net"]
+    after_win = al.day_decision(db, "SOLUSDT", setup, "btcdown_vollo")["economic"]["trade_net_value"]
     assert after_win > after_loss
 
 
@@ -275,7 +265,7 @@ def test_calibration_updates_at_close_without_a_lifecycle_label(tmp_path):
     db = str(tmp_path / "t.db")
     setup, regime = "EXHAUSTION_MR__MARKET", "btcdown_vollo"
     predicted, realized = 0.002742, 0.001092
-    before = al.day_decision(db, "XRPUSDT", setup, regime)["expected_net"]
+    before = al.day_decision(db, "XRPUSDT", setup, regime)["economic"]["trade_net_value"]
     row_id = al.record_candidate(
         db,
         engine=DAY,
@@ -297,7 +287,7 @@ def test_calibration_updates_at_close_without_a_lifecycle_label(tmp_path):
     assert abs(n - 1.0) < 1e-9
     assert abs(ewma - (realized - predicted)) < 1e-12
     assert al.observe(db, engine=DAY, symbol="XRPUSDT", setup=setup, regime=regime, metric="trade_net", value=realized, strategy_version=al.current_strategy_version(DAY), now=T0)
-    after = al.day_decision(db, "XRPUSDT", setup, regime)["expected_net"]
+    after = al.day_decision(db, "XRPUSDT", setup, regime)["economic"]["trade_net_value"]
     assert after > before
     predicted_win = after
     realized_win = predicted_win + 0.004
@@ -317,7 +307,7 @@ def test_calibration_updates_at_close_without_a_lifecycle_label(tmp_path):
     assert al.mark_candidate_filled(db, row_win)
     assert al.record_policy_outcome(db, engine=DAY, opportunity_id="CLOSE-2", net_pct=realized_win, candidate_id=row_win, now=T0 + 940.0)
     assert al.observe(db, engine=DAY, symbol="XRPUSDT", setup=setup, regime=regime, metric="trade_net", value=realized_win, strategy_version=al.current_strategy_version(DAY), now=T0 + 940.0)
-    assert al.day_decision(db, "XRPUSDT", setup, regime)["expected_net"] > after
+    assert al.day_decision(db, "XRPUSDT", setup, regime)["economic"]["trade_net_value"] > after
 
 
 def test_lifecycle_resolution_learns_the_gap_once_and_does_not_recalibrate(tmp_path):
@@ -382,9 +372,7 @@ def test_backfill_teaches_a_missed_close_once_and_skips_one_already_learned(tmp_
     assert al.mark_candidate_filled(db, row_id)
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE adaptive_candidate_markouts SET realized_net=? WHERE id=?", (realized, row_id))
-        conn.execute(
-            "CREATE TABLE paper_trades (symbol TEXT, side TEXT, engine_id TEXT, timestamp TEXT, entry_timestamp TEXT, exit_reason TEXT)"
-        )
+        conn.execute("CREATE TABLE paper_trades (symbol TEXT, side TEXT, engine_id TEXT, timestamp TEXT, entry_timestamp TEXT, exit_reason TEXT)")
         conn.execute(
             "INSERT INTO paper_trades VALUES (?,?,?,?,?,?)",
             ("BTC/USDT", "SELL", DAY, "2026-10-07T15:40:00Z", "2026-10-07T15:28:45Z", "LEARNED_CONTINUATION_EXIT"),
@@ -416,9 +404,7 @@ def test_backfill_ignores_a_close_before_the_repair_and_a_retired_exit(tmp_path)
     assert al.mark_candidate_filled(db, row_id)
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE adaptive_candidate_markouts SET realized_net=? WHERE id=?", (-0.001, row_id))
-        conn.execute(
-            "CREATE TABLE paper_trades (symbol TEXT, side TEXT, engine_id TEXT, timestamp TEXT, entry_timestamp TEXT, exit_reason TEXT)"
-        )
+        conn.execute("CREATE TABLE paper_trades (symbol TEXT, side TEXT, engine_id TEXT, timestamp TEXT, entry_timestamp TEXT, exit_reason TEXT)")
         conn.execute(
             "INSERT INTO paper_trades VALUES (?,?,?,?,?,?)",
             ("ETH/USDT", "SELL", DAY, "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z", "LEARNED_CONTINUATION_EXIT"),
@@ -435,9 +421,7 @@ def test_rows_that_already_learned_the_gap_are_not_calibrated_again(tmp_path):
             "strategy_version TEXT, signaled INTEGER, ref_price REAL, roundtrip_cost REAL, evaluated_at REAL, markouts_json TEXT, "
             "features_json TEXT, learned INTEGER, resolved INTEGER, label_horizon REAL, policy_learned INTEGER, realized_net REAL, economic_json TEXT)"
         )
-        conn.execute(
-            "INSERT INTO adaptive_candidate_markouts VALUES (1,'DAY_V2','BTCUSDT','S','r','v',1,1,0,1,'{}','{}',0,0,0,1,-0.01,'{\"policy_value\":0.002}')"
-        )
+        conn.execute("INSERT INTO adaptive_candidate_markouts VALUES (1,'DAY_V2','BTCUSDT','S','r','v',1,1,0,1,'{}','{}',0,0,0,1,-0.01,'{\"policy_value\":0.002}')")
     al._connect(db).close()
     with sqlite3.connect(db) as conn:
         flag = conn.execute("SELECT calibration_learned FROM adaptive_candidate_markouts WHERE id=1").fetchone()[0]

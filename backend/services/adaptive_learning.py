@@ -810,13 +810,17 @@ def _tilt(mean: float, prior: float) -> float:
     return math.tanh((mean - prior) / abs(prior))
 
 
-# Live DAY entry authority is the hierarchical posterior of realized current-policy
-# net (``trade_net``) plus ``trade_net_calibration``, the residual of later closes
-# against that same base. ``lifecycle_net`` and ``policy_gap`` stay recorded.
-# They are a 12-hour market label and the gap between that label and the short
-# exit policy. Adding the gap back onto the lifecycle label is not the value of
-# entering under the exit that actually runs.
+# ``trade_net`` plus ``trade_net_calibration`` is the realized net of the installed
+# exit policy. It is recorded beside every DAY candidate and is not the entry value:
+# its labels are produced by the continuation surface's own exits, so pricing entry
+# with it makes the entry learn whatever hold the exit chose. ``lifecycle_net`` and
+# ``policy_gap`` stay recorded.
 DAY_POLICY_BASE = "trade_net"
+# Live DAY entry value: the continuation surface read at the just-filled state.
+# A filled position starts at net = -round-trip cost and is worth that plus the
+# learned advantage of holding it, which is exactly what the first continuation
+# check compares. Entry and continuation therefore price one objective.
+DAY_ENTRY_VALUE_BASE = "continuation_value"
 DAY_NET_PARTS: tuple[tuple[str, float], ...] = (("trade_net", 1.0),)
 
 
@@ -1028,13 +1032,39 @@ def day_size_mult(expected_net: float, risk: float) -> float:
     return _clamp(1.0 + 0.30 * tilt, lo, hi)
 
 
+def day_entry_value(db_path: str, symbol: str, setup: str, regime: str, *, cost: float, now: float | None = None) -> dict[str, Any]:
+    """Learned terminal net of a DAY position at the moment it fills.
+
+    The fresh state is net = -cost with no excursion, age 0. Its value is that net
+    plus the installed continuation advantage, read with the same surface and
+    aggregator the live continuation check uses. With no installed surface or no
+    evidence the advantage is 0, so the value is -cost and does not clear costs.
+    """
+    from backend.services.continuation_surface import advantage_authority, horizons_for, installed_aggregator, metric_name, state_features, surface_advantage
+
+    if now is None:
+        moment = _data_clock(_state_rows(db_path, DAY_ENGINE, tuple(metric_name(h) for h in horizons_for(DAY_ENGINE))))
+    else:
+        moment = float(now)
+    net = -float(cost)
+    state = state_features(entry=1.0, mark=1.0, net=net, mfe=0.0, mae=0.0, high_water=1.0, prev_net=None, age_sec=0.0)
+    authority = advantage_authority(db_path, DAY_ENGINE)
+    how = installed_aggregator(db_path, DAY_ENGINE) if authority else ""
+    advantage = surface_advantage(db_path, DAY_ENGINE, symbol, setup, regime, state, moment, how=how) if authority else None
+    informed = advantage is not None and math.isfinite(float(advantage))
+    held = float(advantage) if informed else 0.0
+    return {"value": net + held, "net": net, "advantage": held, "informed": informed, "how": how, "state": state}
+
+
 def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features: dict | None = None, now: float | None = None) -> dict[str, Any]:
     """What the next DAY candidate reads. Ranking, size, objective and runner only.
 
-    Expected net edge after costs is the hierarchical realized net. It is the
-    rank score and sets the bounded size. Learned move potential (MFE) sets the
-    objective. Ranking never removes a candidate. ``features`` are recorded with
-    the candidate; they do not change this number.
+    Expected net edge after costs is the learned terminal net of the just-filled
+    position (``day_entry_value``), the same quantity the first continuation check
+    compares. It is the rank score and sets the bounded size. Learned move
+    potential (MFE) sets the objective. Ranking never removes a candidate. The
+    realized-close posterior (``trade_net``) is recorded as a diagnostic.
+    ``features`` are recorded with the candidate; they do not change this number.
     """
     from backend.config.trading_economics import canonical_roundtrip_cost_pct
 
@@ -1045,12 +1075,12 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
     forward = estimate(db_path, DAY_ENGINE, symbol, setup, regime, "markout_forward", now=now)
     net = day_net_expectancy(db_path, symbol, setup, regime, now=now)
     _ = features
-    expected = float(net["mean"])
     cost = canonical_roundtrip_cost_pct()
+    entry = day_entry_value(db_path, symbol, setup, regime, cost=cost, now=now)
+    expected = float(entry["value"])
     size_mult = day_size_mult(expected, max(0.0, mae["mean"]) + cost)
-    abstain_flag, abstain_reason = _abstain(expected)
-    # The objective distance only breaks ranking ties. The economic quantity is
-    # the hierarchical realized net. State features are recorded, not scored.
+    abstain_flag, abstain_reason = _abstain(expected) if entry["informed"] else (False, "")
+    # The objective distance only breaks ranking ties.
     economic = {
         "engine_id": DAY_ENGINE,
         "economic_version": current_economic_version(DAY_ENGINE),
@@ -1076,15 +1106,23 @@ def day_decision(db_path: str, symbol: str, setup: str, regime: str, *, features
         "level_weights": {lvl: round(v, 3) for lvl, v in net["level_weights"].items()},
         "n_trade": round(net["n_trade"], 3),
         "n_lifecycle": round(net["n_lifecycle"], 3),
-        "policy_base": DAY_POLICY_BASE,
+        "policy_base": DAY_ENTRY_VALUE_BASE,
         "market_alpha": net["market_alpha"],
         "policy_gap": net["policy_gap"],
         "lifecycle_policy_estimate": net["market_alpha"] + net["policy_gap"],
         "n_policy_gap": round(net["n_policy_gap"], 3),
-        "uncalibrated_policy_value": net["uncalibrated_mean"],
-        "policy_calibration": net["policy_calibration"],
-        "n_policy_calibration": round(net["n_policy_calibration"], 3),
+        "uncalibrated_policy_value": expected,
+        "policy_calibration": 0.0,
+        "n_policy_calibration": 0.0,
         "policy_value": expected,
+        "continuation_entry_net": entry["net"],
+        "continuation_entry_advantage": entry["advantage"],
+        "continuation_entry_informed": entry["informed"],
+        "continuation_entry_how": entry["how"],
+        "trade_net_value": net["mean"],
+        "trade_net_uncalibrated": net["uncalibrated_mean"],
+        "trade_net_calibration": net["policy_calibration"],
+        "n_trade_net_calibration": round(net["n_policy_calibration"], 3),
     }
     return {
         "adaptive_state_version": adaptive_format(DAY_ENGINE),

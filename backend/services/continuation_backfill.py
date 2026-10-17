@@ -16,7 +16,7 @@ import math
 import sqlite3
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -1380,13 +1380,104 @@ def remember_labels(db_path: str, labels: list[AdvantageLabel]) -> None:
 
 
 _LAST_FOLD = 0.0
+_LABEL_WINDOW_SEC = 13 * 3600.0
+OPPORTUNITY_PREFIX = "opp:"
+
+
+def opportunity_positions(db_path: str, *, since: float) -> list[tuple[Position, float]]:
+    """Every refused executable DAY candidate as a fresh position at its decision.
+
+    The state is the just-filled position: entry at the recorded ask, mark at the
+    recorded bid, age 0. Its horizon labels come from the same 1m marks as a held
+    position's, so the surface keeps learning the value of entering while DAY is
+    flat. Each (symbol, bar) market path carries total weight 1, shared by the
+    setups priced on it; the returned float is that path share. Only refused
+    candidates (funded=0) fold: a funded one is labelled by its real position, and
+    an undecided one may still become funded.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT symbol, setup, regime, decided_at, entry_ask, entry_bid, funded, snapshot_json
+            FROM policy_episodes
+            WHERE capture_version='EXACT_POLICY_V1' AND engine_id=? AND decided_at>=?
+            ORDER BY decided_at, id
+            """,
+            (DAY_ENGINE, float(since)),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+    paths: Counter = Counter()
+    for row in rows:
+        paths[(_norm_symbol(str(row["symbol"])), int(float(row["decided_at"]) // 900))] += 1
+    out: list[tuple[Position, float]] = []
+    for row in rows:
+        if row["funded"] is None or int(row["funded"]) != 0:
+            continue
+        try:
+            ask = float(row["entry_ask"] or 0.0)
+            bid = float(row["entry_bid"] or 0.0)
+            decided = float(row["decided_at"])
+        except (TypeError, ValueError):
+            continue
+        if ask <= 0.0 or bid <= 0.0 or bid > ask:
+            continue
+        symbol = _norm_symbol(str(row["symbol"]))
+        setup = str(row["setup"] or "")
+        if not setup:
+            continue
+        snap = _decision(row["snapshot_json"])
+        try:
+            atr = float(snap.get("atr_15m") or 0.0)
+            anchor = float(snap.get("structural_anchor") or 0.0)
+        except (TypeError, ValueError):
+            atr, anchor = 0.0, 0.0
+        bar = int(decided // 900)
+        out.append(
+            (
+                Position(
+                    engine=DAY_ENGINE,
+                    trade_id=f"{OPPORTUNITY_PREFIX}{symbol}:{bar * 900}:{setup}",
+                    symbol=symbol,
+                    setup=setup,
+                    regime=str(row["regime"] or ""),
+                    entry_price=ask,
+                    entry_time=decided,
+                    exit_time=None,
+                    exit_price=None,
+                    exit_reason="",
+                    atr=atr,
+                    anchor=anchor,
+                    snapshots=[Snapshot(time=decided, net=_net(ask, bid), mark=bid, mfe=0.0, mae=max(0.0, (ask - bid) / ask), hold_sec=0.0, high_water=ask)],
+                    closed=False,
+                ),
+                1.0 / paths[(symbol, bar)],
+            )
+        )
+    return out
+
+
+def opportunity_labels_for(position: Position, path_share: float, bars: list[tuple[float, float, float, float, float]], *, as_of: float) -> list[AdvantageLabel]:
+    """Horizon labels of one fresh opportunity. Weight is fixed per horizon, so a
+    label folded early carries the same weight as one that matures later."""
+    found, _skipped = advantage_labels_for(position, bars, as_of=as_of)
+    weight = float(path_share) / len(horizons_for(position.engine))
+    return [replace(item, weight=weight) for item in found]
 
 
 def fold_recent_advantages(db_path: str, *, now: float | None = None) -> int:
     """Fold horizon labels that have elapsed since the surface was installed.
 
     No-op until an advantage surface is the live continuation authority.
-    One position's labels keep the same shared weight. Already-folded labels are skipped.
+    One position's labels keep the same shared weight. DAY also folds every
+    refused executable opportunity at its entry state. Already-folded labels are skipped.
     """
     global _LAST_FOLD
     from backend.services.continuation_surface import advantage_authority
@@ -1398,16 +1489,25 @@ def fold_recent_advantages(db_path: str, *, now: float | None = None) -> int:
     if moment - _LAST_FOLD < 60.0:
         return 0
     _LAST_FOLD = moment
-    positions, _skipped = load_positions(db_path, active_since=moment - 13 * 3600.0)
+    positions, _skipped = load_positions(db_path, active_since=moment - _LABEL_WINDOW_SEC)
     positions = [position for position in positions if position.engine in active]
-    if not positions:
+    opportunities = opportunity_positions(db_path, since=moment - _LABEL_WINDOW_SEC) if DAY_ENGINE in active else []
+    if not positions and not opportunities:
         return 0
     span: dict[str, tuple[float, float]] = {}
-    for position in positions:
+    for position in positions + [item[0] for item in opportunities]:
         start, end = span.get(position.symbol, (position.entry_time, moment))
         span[position.symbol] = (min(start, position.entry_time), max(end, position.exit_time or moment, moment))
     bars_cache = {symbol: ohlcv_bars_1m(db_path, symbol, start, end + 60.0) for symbol, (start, end) in span.items()}
-    fresh: list[AdvantageLabel] = []
+    candidates: list[AdvantageLabel] = []
+    for position in positions:
+        found, _more = advantage_labels_for(position, bars_cache.get(position.symbol, []), as_of=moment)
+        candidates.extend(item for item in found if item.engine in active)
+    for position, share in opportunities:
+        candidates.extend(opportunity_labels_for(position, share, bars_cache.get(position.symbol, []), as_of=moment))
+    if not candidates:
+        return 0
+    earliest = min(item.snapshot_time for item in candidates)
     conn = _connect(db_path)
     try:
         conn.execute(
@@ -1421,16 +1521,13 @@ def fold_recent_advantages(db_path: str, *, now: float | None = None) -> int:
             )
             """
         )
-        known = {(row[0], row[1], float(row[2]), int(row[3])) for row in conn.execute("SELECT engine_id, trade_id, snapshot_time, horizon FROM continuation_advantage_log")}
+        known = {
+            (row[0], row[1], float(row[2]), int(row[3]))
+            for row in conn.execute("SELECT engine_id, trade_id, snapshot_time, horizon FROM continuation_advantage_log WHERE snapshot_time>=?", (earliest - 1.0,))
+        }
     finally:
         conn.close()
-    for position in positions:
-        found, _more = advantage_labels_for(position, bars_cache.get(position.symbol, []), as_of=moment)
-        for item in found:
-            if item.engine not in active:
-                continue
-            if (item.engine, item.trade_id, item.snapshot_time, item.horizon) not in known:
-                fresh.append(item)
+    fresh = [item for item in candidates if (item.engine, item.trade_id, item.snapshot_time, item.horizon) not in known]
     if not fresh:
         return 0
     return fold_advantages_once(db_path, fresh)

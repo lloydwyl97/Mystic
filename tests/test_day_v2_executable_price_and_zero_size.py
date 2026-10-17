@@ -281,12 +281,11 @@ STARTUP = {"BTCUSDT": 84120.27, "ETHUSDT": 2695.07, "SOLUSDT": 122.255, "XRPUSDT
 
 
 def _seed_positive_net(db_path: str) -> None:
-    """Cold learned net is 0 and does not clear costs. These tests cover cash and fills."""
-    import backend.services.adaptive_learning as al
+    """Cold entry value is -cost and does not clear costs. These tests cover cash and fills."""
+    from tests.day_entry_value_support import teach_entry
 
-    version = al.current_strategy_version(al.DAY_ENGINE)
     for symbol in SYMBOLS:
-        al.observe(db_path, engine=al.DAY_ENGINE, symbol=symbol, setup="HTF_TREND_PULLBACK", regime="", metric="trade_net", value=0.02, strategy_version=version)
+        teach_entry(db_path, symbol, "HTF_TREND_PULLBACK", "", 0.02)
 
 
 @pytest.mark.asyncio

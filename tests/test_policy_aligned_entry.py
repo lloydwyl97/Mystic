@@ -11,6 +11,8 @@ import json
 import re
 import sqlite3
 
+import pytest
+
 import backend.services.adaptive_learning as al
 from backend.config.day_entry_execution import learned_exit_contract_buy
 from backend.services.scalp_v2 import exit_evaluator
@@ -123,9 +125,12 @@ def test_day_entry_target_is_realized_policy_net_not_the_lifecycle_path(tmp_path
     assert abs(after["policy_gap"] - untouched["policy_gap"]) < 1e-12
     decision = al.day_decision(db, *DAY_KEY)
     econ = decision["economic"]
-    assert econ["policy_base"] == "trade_net"
+    assert econ["policy_base"] == al.DAY_ENTRY_VALUE_BASE
     assert econ["policy_value"] == decision["expected_net"]
     assert abs(econ["policy_value"] - (econ["uncalibrated_policy_value"] + econ["policy_calibration"])) < 1e-12
+    # The realized-close posterior is recorded beside the entry value, not as it.
+    assert econ["trade_net_value"] == pytest.approx(after["mean"])
+    assert econ["policy_value"] == pytest.approx(econ["continuation_entry_net"] + econ["continuation_entry_advantage"])
 
 
 def test_day_realized_policy_fill_raises_future_entry_value(tmp_path):

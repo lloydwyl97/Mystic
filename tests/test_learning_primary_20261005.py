@@ -1,5 +1,5 @@
-"""The learner that actually runs: a realized loss changes the next DAY rank
-and size, a rejected lifecycle does too, and a setup name is not an edge.
+"""The learner that actually runs: learned entry-state continuation value changes
+the next DAY rank and size, and a setup name is not an edge.
 
 State features are recorded with the candidate. They do not change the
 expected net. A walk-forward that withheld capital whenever that net was
@@ -21,8 +21,17 @@ from backend.services.day_v2.ranking import rank_day_candidates
 from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 from backend.services.scalp_v2 import exit_evaluator as scalp_exits
 from backend.services.strategy_version import exit_policy_anchor
+from tests.day_entry_value_support import teach_entry
 
 DAY = al.DAY_ENGINE
+
+
+def al_cost() -> float:
+    from backend.config.trading_economics import canonical_roundtrip_cost_pct
+
+    return canonical_roundtrip_cost_pct()
+
+
 T0 = 1_791_200_000.0
 
 
@@ -36,7 +45,7 @@ def _cand(symbol: str, setup: str, adaptive: dict) -> dict:
 def test_cold_setups_are_neutral_and_the_name_is_not_an_edge(tmp_path):
     db = str(tmp_path / "c.db")
     nets = [al.day_decision(db, "BTCUSDT", setup, "", now=T0)["expected_net"] for setup in sorted(ENABLED_SETUPS)]
-    assert nets == [0.0] * len(nets)
+    assert nets == [pytest.approx(-al_cost())] * len(nets)
     assert "if n <" not in inspect.getsource(al.day_decision)
     for banned in ("HTF bad", "RANGE good"):
         assert banned not in inspect.getsource(al.day_decision)
@@ -45,9 +54,9 @@ def test_cold_setups_are_neutral_and_the_name_is_not_an_edge(tmp_path):
 def test_one_loss_moves_the_next_decision(tmp_path):
     db = str(tmp_path / "o.db")
     before = al.day_decision(db, "SOLUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", now=T0)
-    al.observe(db, engine=DAY, symbol="SOLUSDT", setup="HTF_TREND_PULLBACK", regime="btcup_vollo", metric="trade_net", value=-0.01, strategy_version=al.current_strategy_version(DAY), now=T0)
+    teach_entry(db, "SOLUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", -0.01, now=T0)
     after = al.day_decision(db, "SOLUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", now=T0)
-    assert after["expected_net"] < before["expected_net"] == 0.0
+    assert after["expected_net"] < before["expected_net"] == pytest.approx(-al_cost())
     assert after["size_mult"] < before["size_mult"]
     assert after["economic"]["final_learned_net_edge"] == pytest.approx(after["expected_net"])
 
@@ -55,7 +64,7 @@ def test_one_loss_moves_the_next_decision(tmp_path):
 def test_repeated_losses_lower_rank_and_size_and_later_wins_recover(tmp_path):
     db = str(tmp_path / "r.db")
     for _ in range(8):
-        al.observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="btcup_vollo", metric="trade_net", value=-0.008, strategy_version=al.current_strategy_version(DAY), now=T0)
+        teach_entry(db, "BTCUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", -0.008, now=T0)
     weak = al.day_decision(db, "BTCUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", now=T0)
     other = al.day_decision(db, "ETHUSDT", "RANGE_BOUNCE", "btcup_vollo", now=T0)
     ranked = rank_day_candidates([_cand("BTCUSDT", "HTF_TREND_PULLBACK", weak), _cand("ETHUSDT", "RANGE_BOUNCE", other)], DAY_V2_UNIVERSE, 0.00066)
@@ -63,7 +72,7 @@ def test_repeated_losses_lower_rank_and_size_and_later_wins_recover(tmp_path):
     assert weak["size_mult"] < 1.0
     assert weak["expected_net"] < 0
     for _ in range(24):
-        al.observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="btcup_vollo", metric="trade_net", value=0.012, strategy_version=al.current_strategy_version(DAY), now=T0)
+        teach_entry(db, "BTCUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", 0.012, now=T0)
     recovered = al.day_decision(db, "BTCUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", now=T0)
     assert recovered["expected_net"] > 0.0 > weak["expected_net"]
     assert recovered["size_mult"] > weak["size_mult"]
@@ -71,8 +80,8 @@ def test_repeated_losses_lower_rank_and_size_and_later_wins_recover(tmp_path):
 
 def test_a_rejected_lifecycle_changes_the_next_ranking(tmp_path):
     db = str(tmp_path / "a.db")
-    al.observe(db, engine=DAY, symbol="BTCUSDT", setup="HTF_TREND_PULLBACK", regime="btcup_vollo", metric="trade_net", value=-0.004, strategy_version=al.current_strategy_version(DAY), now=T0)
-    al.observe(db, engine=DAY, symbol="SOLUSDT", setup="RANGE_BOUNCE", regime="btcup_vollo", metric="trade_net", value=0.003, strategy_version=al.current_strategy_version(DAY), now=T0)
+    teach_entry(db, "BTCUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", -0.004, now=T0)
+    teach_entry(db, "SOLUSDT", "RANGE_BOUNCE", "btcup_vollo", 0.003, now=T0)
     btc = al.day_decision(db, "BTCUSDT", "HTF_TREND_PULLBACK", "btcup_vollo", now=T0)
     sol = al.day_decision(db, "SOLUSDT", "RANGE_BOUNCE", "btcup_vollo", now=T0)
     ranked = rank_day_candidates([_cand("BTCUSDT", "HTF_TREND_PULLBACK", btc), _cand("SOLUSDT", "RANGE_BOUNCE", sol)], DAY_V2_UNIVERSE, 0.00066)
@@ -294,11 +303,12 @@ def test_unfired_market_state_is_priced_and_does_not_inherit_the_fired_setup(tmp
     assert market_key != fired_key
     assert al.day_geometry_setup(market_key) == "BREAKOUT_CONTINUATION"
     for _ in range(12):
-        al.observe(db, engine=DAY, symbol="XRPUSDT", setup=fired_key, regime="btcup_vollo", metric="trade_net", value=0.02, strategy_version=al.current_strategy_version(DAY), now=T0)
+        teach_entry(db, "XRPUSDT", fired_key, "btcup_vollo", 0.02, now=T0)
     fired = al.day_decision(db, "XRPUSDT", fired_key, "btcup_vollo", now=T0)
     market = al.day_decision(db, "XRPUSDT", market_key, "btcup_vollo", now=T0)
     assert fired["expected_net"] > 0.0
-    assert market["expected_net"] == 0.0
+    # Only engine-wide continuation evidence is shared; the fired setup's own evidence is not.
+    assert market["expected_net"] < fired["expected_net"]
     src = inspect.getsource(PortfolioEngineIntegration._process_day_v2_signals)
     assert "if signal is not fired:" not in src
     assert "detector_fired=signal is fired" in src
@@ -306,18 +316,17 @@ def test_unfired_market_state_is_priced_and_does_not_inherit_the_fired_setup(tmp
 
 def test_market_state_can_outrank_a_deteriorating_setup_without_a_code_change(tmp_path):
     db = str(tmp_path / "rank.db")
-    ver = al.current_strategy_version(DAY)
     fired_key = al.day_learned_setup("RANGE_BOUNCE", detector_fired=True)
     market_key = al.day_learned_setup("BREAKOUT_CONTINUATION", detector_fired=False)
     for _ in range(10):
-        al.observe(db, engine=DAY, symbol="BTCUSDT", setup=fired_key, regime="btcup_vollo", metric="trade_net", value=0.01, strategy_version=ver, now=T0)
+        teach_entry(db, "BTCUSDT", fired_key, "btcup_vollo", 0.01, now=T0)
     winner = al.day_decision(db, "BTCUSDT", fired_key, "btcup_vollo", now=T0)
     quiet = al.day_decision(db, "ETHUSDT", market_key, "btcup_vollo", now=T0)
     ranked = rank_day_candidates([_cand("BTCUSDT", "RANGE_BOUNCE", winner), _cand("ETHUSDT", "BREAKOUT_CONTINUATION", quiet)], DAY_V2_UNIVERSE, 0.00066)
     assert ranked[0]["symbol"] == "BTCUSDT"
     for _ in range(16):
-        al.observe(db, engine=DAY, symbol="BTCUSDT", setup=fired_key, regime="btcup_vollo", metric="trade_net", value=-0.02, strategy_version=ver, now=T0)
-        al.observe(db, engine=DAY, symbol="ETHUSDT", setup=market_key, regime="btcup_vollo", metric="trade_net", value=0.01, strategy_version=ver, now=T0)
+        teach_entry(db, "BTCUSDT", fired_key, "btcup_vollo", -0.02, now=T0)
+        teach_entry(db, "ETHUSDT", market_key, "btcup_vollo", 0.01, now=T0)
     faded = al.day_decision(db, "BTCUSDT", fired_key, "btcup_vollo", now=T0)
     emerged = al.day_decision(db, "ETHUSDT", market_key, "btcup_vollo", now=T0)
     assert emerged["expected_net"] > 0.0 > faded["expected_net"]

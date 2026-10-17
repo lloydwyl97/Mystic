@@ -18,6 +18,7 @@ from backend.services.day_v2.ranking import rank_day_candidates
 from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
 from backend.services.scalp_v2.executable_edge import REJECT_THRESHOLD_PCT, scalp_executable_edge
 from backend.services.strategy_version import DAY_STRATEGY_VERSION, exit_policy_anchor
+from tests.day_entry_value_support import teach_entry
 
 DAY = al.DAY_ENGINE
 SCALP = al.SCALP_ENGINE
@@ -27,6 +28,10 @@ SPREAD = 0.00002
 
 def _day_obs(db, metric, value, *, symbol="BTCUSDT", setup="BREAKOUT_CONTINUATION", regime="btcup_volhi", version=DAY_STRATEGY_VERSION):
     return al.observe(db, engine=DAY, symbol=symbol, setup=setup, regime=regime, metric=metric, value=value, strategy_version=version)
+
+
+def _teach(db, value, *, symbol="BTCUSDT", setup="BREAKOUT_CONTINUATION", regime="btcup_volhi"):
+    teach_entry(db, symbol, setup, regime, value)
 
 
 def _day(db, symbol="BTCUSDT", setup="BREAKOUT_CONTINUATION", regime="btcup_volhi"):
@@ -76,25 +81,25 @@ def test_one_day_outcome_already_moves_size_with_no_count_floor(tmp_path):
     db = str(tmp_path / "t.db")
     assert not hasattr(al, "ABSTAIN_CONFIDENCE_FLOOR")
     cold = _day(db)
-    assert cold["expected_net"] == 0.0 and cold["size_mult"] == 1.0 and cold["abstain"] is False
-    _day_obs(db, "trade_net", -0.004)
+    assert cold["expected_net"] == pytest.approx(-canonical_roundtrip_cost_pct()) and cold["abstain"] is False
+    _teach(db, -0.004)
     one = _day(db)
-    assert one["n_trade_net"] == pytest.approx(1.0)
-    assert one["expected_net"] < 0.0
-    assert one["size_mult"] < 1.0
+    assert one["economic"]["continuation_entry_informed"] is True
+    assert one["expected_net"] < cold["expected_net"]
+    assert one["size_mult"] < cold["size_mult"]
     # Evidence strength, not a trade count, sets the telemetry flag.
     strong = str(tmp_path / "strong.db")
-    _day_obs(strong, "trade_net", -0.08)
+    _teach(strong, -0.08)
     assert _day(strong)["abstain"] is True
 
 
 def test_negative_expectancy_lowers_rank_and_size_then_recovers(tmp_path):
     db = str(tmp_path / "t.db")
     for value in (-0.01, -0.008, -0.012):
-        _day_obs(db, "trade_net", value, setup="RANGE_BOUNCE")
+        _teach(db, value, setup="RANGE_BOUNCE")
     weak = _day(db, setup="RANGE_BOUNCE")
     neutral = _day(db, symbol="ETHUSDT", setup="HTF_TREND_PULLBACK")
-    assert weak["size_mult"] < neutral["size_mult"] == 1.0
+    assert weak["size_mult"] < neutral["size_mult"]
     ranked = rank_day_candidates(
         [_cand("BTCUSDT", "RANGE_BOUNCE", weak), _cand("ETHUSDT", "RANGE_BOUNCE", neutral)],
         ["BTCUSDT", "ETHUSDT"],
@@ -103,7 +108,7 @@ def test_negative_expectancy_lowers_rank_and_size_then_recovers(tmp_path):
     assert [c["symbol"] for c in ranked] == ["ETHUSDT", "BTCUSDT"]
     assert ranked[1]["rank"]["expected_net"] == pytest.approx(weak["expected_net"])
     for _ in range(12):
-        _day_obs(db, "trade_net", 0.012, setup="RANGE_BOUNCE")
+        _teach(db, 0.012, setup="RANGE_BOUNCE")
     recovered = _day(db, setup="RANGE_BOUNCE")
     assert recovered["expected_net"] > 0.0
     assert recovered["size_mult"] > 1.0
@@ -386,7 +391,7 @@ def test_legacy_versions_never_reach_current_state_or_reports(tmp_path):
     assert not _day_obs(db, "trade_net", -0.05, version="legacy")
     assert not _claim(db, 0.001, -0.003, version="legacy")
     assert al.scalp_decision(db, *SCALP_KEY)["n_claim"] == 0.0
-    assert _day(db)["expected_net"] == 0.0
+    assert _day(db)["expected_net"] == pytest.approx(-canonical_roundtrip_cost_pct())
     _record_day(db, "BTCUSDT", "BREAKOUT_CONTINUATION", al.CANDIDATE_QUALIFIED)
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE adaptive_candidate_markouts SET strategy_version='legacy'")

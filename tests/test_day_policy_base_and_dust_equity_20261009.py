@@ -1,4 +1,4 @@
-"""DAY live entry follows realized policy net. Account equity counts owned dust once."""
+"""DAY live entry follows the continuation value of the fresh position. Account equity counts owned dust once."""
 
 from __future__ import annotations
 
@@ -26,10 +26,10 @@ def test_lifecycle_and_policy_gap_do_not_fund_a_day_entry(tmp_path):
         _obs(db, "policy_gap", 0.01)
         _obs(db, "policy_calibration", -0.003)
     decision = al.day_decision(db, *KEY)
-    assert decision["expected_net"] == 0.0
+    assert decision["expected_net"] == pytest.approx(-decision["economic"]["expected_cost"])
     assert decision["economic"]["policy_gap"] > 0.0
     assert decision["economic"]["market_alpha"] > 0.0
-    assert decision["economic"]["policy_base"] == "trade_net"
+    assert decision["economic"]["policy_base"] == al.DAY_ENTRY_VALUE_BASE
 
 
 def test_trade_net_sets_the_base_and_its_own_calibration_adjusts_it(tmp_path):

@@ -26,6 +26,7 @@ from backend.services.portfolio_engine_integration import PortfolioEngineIntegra
 from backend.services.scalp_v2.decision_log import classify_scalp_candidate
 from backend.services.scalp_v2.executable_edge import REJECT_THRESHOLD_PCT, scalp_executable_edge
 from backend.services.strategy_version import exit_policy_anchor
+from tests.day_entry_value_support import teach_entry
 
 DAY, SCALP = al.DAY_ENGINE, al.SCALP_ENGINE
 T0 = 1_791_200_000.0  # after both economic anchors
@@ -40,7 +41,8 @@ def _iso(epoch: float) -> str:
 
 
 def _life(db, value, *, symbol="BTCUSDT", setup="BREAKOUT_CONTINUATION", regime="btcup_volhi", at=T0):
-    return al.observe(db, engine=DAY, symbol=symbol, setup=setup, regime=regime, metric="trade_net", value=value, strategy_version=al.current_strategy_version(DAY), now=at)
+    """Entry-state continuation evidence: the learned value of holding a fresh DAY position."""
+    teach_entry(db, symbol, setup, regime, value, now=at)
 
 
 def _day(db, symbol="BTCUSDT", setup="BREAKOUT_CONTINUATION", regime="btcup_volhi", at=T0):
@@ -273,7 +275,8 @@ def test_day_hierarchy_pools_key_related_then_setup(tmp_path):
     setup_only = _day(db, "ETHUSDT", "RANGE_BOUNCE", "r3")
     other_setup = _day(db, "BTCUSDT", "HTF_TREND_PULLBACK", "r1")
     assert own["expected_net"] < related["expected_net"] < setup_only["expected_net"] < 0.0
-    assert (other_setup["expected_net"], other_setup["size_mult"]) == (0.0, 1.0)
+    # Another setup shares only the engine-wide level.
+    assert other_setup["expected_net"] > setup_only["expected_net"]
     assert set(own["economic"]["levels"]) == {"engine", "setup", "related", "key"}
 
 
@@ -284,7 +287,7 @@ def test_breakout_losses_lower_rank_and_size_then_later_gains_restore_it(tmp_pat
     now = T0 + 6 * 3600
     breakout = _day(db, at=now)
     rng = _day(db, "ETHUSDT", "RANGE_BOUNCE", at=now)
-    assert breakout["size_mult"] < 1.0 == rng["size_mult"]
+    assert breakout["size_mult"] < rng["size_mult"]
     ranked = rank_day_candidates([_cand("BTCUSDT", "BREAKOUT_CONTINUATION", breakout), _cand("ETHUSDT", "RANGE_BOUNCE", rng)], ["BTCUSDT", "ETHUSDT"], 0.00066)
     assert [c["symbol"] for c in ranked] == ["ETHUSDT", "BTCUSDT"]
     later = T0 + 20 * 86400
@@ -301,9 +304,13 @@ def test_range_and_trend_move_only_with_their_own_evidence(tmp_path):
     def snapshot():
         return {k: {f: al.day_decision(db, *k, now=T0)[f] for f in LIVE_DAY_FIELDS} for k in keys}
 
-    before = snapshot()
+    cold = snapshot()
     for _ in range(10):
         _life(db, -0.02)
+    before = snapshot()
+    breakout = al.day_decision(db, "BTCUSDT", "BREAKOUT_CONTINUATION", "btcup_volhi", now=T0)
+    assert all(breakout["expected_net"] < before[k]["expected_net"] <= cold[k]["expected_net"] for k in keys)
+    # A realized close is a diagnostic for entry value; it moves none of these keys.
     assert al.learn_from_close(
         db,
         engine=DAY,
@@ -324,7 +331,7 @@ def test_range_and_trend_move_only_with_their_own_evidence(tmp_path):
     )
     assert snapshot() == before
     _life(db, 0.01, symbol="ETHUSDT", setup="RANGE_BOUNCE")
-    assert al.day_decision(db, "ETHUSDT", "RANGE_BOUNCE", "btcup_volhi", now=T0)["expected_net"] > 0.0
+    assert al.day_decision(db, "ETHUSDT", "RANGE_BOUNCE", "btcup_volhi", now=T0)["expected_net"] > before[("ETHUSDT", "RANGE_BOUNCE", "btcup_volhi")]["expected_net"]
 
 
 def test_one_day_label_moves_the_decision_with_no_count_gate(tmp_path):
@@ -346,7 +353,8 @@ def test_legacy_and_other_version_state_never_move_decisions(tmp_path):
         )
         conn.execute("INSERT INTO adaptive_metric_state VALUES ('DAY_V2','BTCUSDT','RANGE_BOUNCE','r','trade_net',50,-0.05,0,?)", (_iso(T0),))
     cold = _day(db, "BTCUSDT", "RANGE_BOUNCE", "r")
-    assert (cold["expected_net"], cold["size_mult"]) == (0.0, 1.0)
+    cold_value = -cold["economic"]["expected_cost"]
+    assert cold["expected_net"] == pytest.approx(cold_value)
     with sqlite3.connect(db) as conn:
         assert conn.execute(f"SELECT COUNT(*) FROM {al.LEGACY_STATE_TABLE}").fetchone()[0] == 1
         conn.execute(
@@ -354,7 +362,7 @@ def test_legacy_and_other_version_state_never_move_decisions(tmp_path):
             "VALUES ('DAY_V2','OLD','BTCUSDT','RANGE_BOUNCE','r','lifecycle_net',50,-0.05,0,?)",
             (_iso(T0),),
         )
-    assert _day(db, "BTCUSDT", "RANGE_BOUNCE", "r")["expected_net"] == 0.0
+    assert _day(db, "BTCUSDT", "RANGE_BOUNCE", "r")["expected_net"] == pytest.approx(cold_value)
     close = {
         "engine": DAY,
         "symbol": "BTCUSDT",
@@ -376,7 +384,7 @@ def test_legacy_and_other_version_state_never_move_decisions(tmp_path):
         conn.execute("UPDATE adaptive_candidate_markouts SET economic_version='' WHERE id=?", (rid,))
     al.resolve_markouts(db, lambda _s, _t: 90.0, now=T0 + 400 * 60)
     stale = _day(db, "BTCUSDT", "RANGE_BOUNCE", "r", at=T0 + 400 * 60)
-    assert (stale["expected_net"], stale["n_forward"]) == (0.0, 0.0)
+    assert stale["expected_net"] == pytest.approx(cold_value) and stale["n_forward"] == 0.0
 
 
 def test_adaptive_values_enter_live_ranking_and_sizing(tmp_path):

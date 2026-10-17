@@ -292,7 +292,7 @@ def open_exact_episode(db_path: str, cand: dict[str, Any], candidate_id: int | N
         "regime": str(cand.get("regime_tag") or ""),
         "expected_net": adaptive.get("expected_net"),
         "uncalibrated_policy_value": economic.get("uncalibrated_policy_value"),
-        "trade_net_calibration": economic.get("policy_calibration"),
+        "trade_net_calibration": economic.get("trade_net_calibration", economic.get("policy_calibration")),
         "rank_position": rank.get("position"),
         "size_mult": adaptive.get("size_mult"),
         "entry_ask": ask,
