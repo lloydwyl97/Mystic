@@ -3333,6 +3333,7 @@ class PortfolioEngine:
             self._available_balance = max(0.0, usdt_free)
             # Recompute equity with fresh Binance cash. Never overwrite contributed principal.
             self._total_equity = self.cash_balance + self._positions_value
+            await self._reconcile_shortfall_pause(total_balances)
             await self._persist_ledger_to_sqlite()
             self._compute_total_open_risk()
             self._last_live_reconcile_time = time.time()
@@ -3903,11 +3904,62 @@ class PortfolioEngine:
         elif missing * mark <= SHORTFALL_PAUSE_USD:
             self._clear_shortfall_pause(symbol)
 
-    def _clear_shortfall_pause(self, symbol: str) -> None:
-        if self._trading_paused and str(self._pause_reason or "") == f"{SHORTFALL_PAUSE_PREFIX}{symbol}":
+    def _clear_shortfall_pause(self, symbol: str) -> bool:
+        sym = normalize_symbol(symbol)
+        if self._trading_paused and normalize_symbol(str(self._pause_reason or "").removeprefix(SHORTFALL_PAUSE_PREFIX)) == sym and str(self._pause_reason or "").startswith(SHORTFALL_PAUSE_PREFIX):
             self._trading_paused = False
             self._pause_reason = ""
-            logger.warning("ENGINE_QTY_SHORTFALL_CLEARED symbol=%s", symbol)
+            logger.warning("ENGINE_QTY_SHORTFALL_CLEARED symbol=%s", sym)
+            return True
+        return False
+
+    async def _reconcile_shortfall_pause(self, total_balances: dict[str, float], snapshot_ts: float | None = None) -> None:
+        """Clear or retain an ``ENGINE_QTY_SHORTFALL:<sym>`` pause against the signed wallet.
+
+        Runs even when the position book is flat: retiring converted dust or
+        closing the last lot leaves ``open_positions`` empty before the per-lot
+        loop could clear the pause. Never touches any other pause reason, kill
+        switch, circuit breaker, or freeze.
+        """
+        reason = str(self._pause_reason or "")
+        if not self._trading_paused or not reason.startswith(SHORTFALL_PAUSE_PREFIX):
+            return
+        paused_sym = normalize_symbol(reason[len(SHORTFALL_PAUSE_PREFIX) :])
+        if not paused_sym or self._reconcile_fenced(paused_sym, snapshot_ts):
+            return
+        try:
+            from backend.services.atomic_execution_book import find_cash_position_disagreement
+            from backend.services.filled_asset_custody import open_rows as _custody_open_rows
+            from backend.services.protected_external_inventory import protected_quantity
+
+            if _custody_open_rows(self.db_path):
+                return
+            if not find_cash_position_disagreement(self.db_path).get("ok", False):
+                return
+            universe = {normalize_symbol(s) for s in ("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT")} | {paused_sym}
+            for sym in sorted(universe):
+                await self._ensure_symbol_constraints(sym)
+                constraints = self._symbol_constraints.get(sym) or {}
+                step = float(constraints.get("qty_step") or 0.0)
+                tol = step / 2.0 if step > 0 else 1e-9
+                api = _to_api_symbol(sym)
+                base = api[:-4] if api.endswith("USDT") else api
+                exchange_qty = max(0.0, float(total_balances.get(base, 0.0) or 0.0) - float(protected_quantity(self.db_path, sym) or 0.0))
+                snapped = self._floor_to_step(exchange_qty, step) if step > 0 else exchange_qty
+                lots = self._symbol_lots(sym)
+                owned = self._proven_lot_qty(sym, lots) + self._held_engine_dust_qty(sym)
+                if owned <= float(exchange_qty) + max(1e-12, 1e-9 * float(exchange_qty)) or owned <= float(snapped) + tol:
+                    continue
+                mark = float((getattr(self, "_position_mark_prices", None) or {}).get(sym) or 0.0) or next(
+                    (float(getattr(p, "entry_price", 0) or 0) for p in lots if float(getattr(p, "entry_price", 0) or 0) > 0), 0.0
+                )
+                if mark <= 0 or (owned - float(exchange_qty)) * mark > SHORTFALL_PAUSE_USD:
+                    return
+        except Exception:
+            logger.warning("SHORTFALL_PAUSE_RECONCILE_SKIPPED reason=%s", reason, exc_info=True)
+            return
+        if self._clear_shortfall_pause(paused_sym):
+            await self._persist_ledger_to_sqlite()
 
     async def run_live_reconcile(
         self,
@@ -3923,7 +3975,18 @@ class PortfolioEngine:
         if not self._live_execution_enabled:
             return
         await self._import_missing_exchange_positions(total_balances, free_balances, snapshot_ts=snapshot_ts)
+        with contextlib.suppress(Exception):
+            from backend.services.engine_strategy_dust import held_lots
+
+            for _sym in sorted({str(h["symbol"]) for h in held_lots(self.db_path)}):
+                if self._reconcile_fenced(_sym, snapshot_ts):
+                    continue
+                _api_h = _to_api_symbol(_sym)
+                _base_h = _api_h[:-4] if _api_h.endswith("USDT") else _api_h
+                _lots_qty = sum(float(getattr(p, "quantity", 0) or 0) for p in self._symbol_lots(_sym))
+                await self._reconcile_held_engine_dust(_sym, float(total_balances.get(_base_h, 0) or 0), _lots_qty)
         if not self.open_positions:
+            await self._reconcile_shortfall_pause(total_balances, snapshot_ts)
             self._last_live_reconcile_time = time.time()
             self._last_live_reconcile_actions = "periodic"
             self._ownership_state_known = True
@@ -4038,6 +4101,7 @@ class PortfolioEngine:
                 await self._reconcile_held_engine_dust(_sym, float(total_balances.get(_base_h, 0) or 0), _lots_qty)
         await self._recompute_positions_values()
         self._compute_total_open_risk()
+        await self._reconcile_shortfall_pause(total_balances, snapshot_ts)
         self._last_live_reconcile_time = time.time()
         self._last_live_reconcile_actions = "periodic"
         self._ownership_state_known = True
