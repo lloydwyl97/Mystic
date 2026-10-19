@@ -2443,10 +2443,11 @@ class PortfolioEngineIntegration:
         def _record_scalp_observation(row: dict, norm_key: str, *, signaled: bool, decision_code: str = "", decision_reason: str = "") -> dict:
             setup_name = str(row.get("best_setup") or "SCALP_STRUCTURAL")
             regime = str(row.get("adaptive_regime") or "") or market_regime_tag(self.engine.db_path, norm_key) or ""
-            micro_feats = _scalp_book(norm_key)
             edge = row.get("executable_edge")
             edge_dict = edge if isinstance(edge, dict) else {}
             econ = _policy_economics(edge)
+            entry_micro = (econ.get("entry_micro") if isinstance(econ, dict) else None) or edge_dict.get("entry_micro")
+            micro_feats = dict(entry_micro) if isinstance(entry_micro, dict) and entry_micro else _scalp_book(norm_key)
             raw_move = edge_dict.get("raw_expected_move_pct")
             if raw_move is not None:
                 micro_feats = {**micro_feats, "structural_projection": float(raw_move or 0.0)}
@@ -2464,6 +2465,7 @@ class PortfolioEngineIntegration:
                 ref_price=ref_price,
                 roundtrip_cost=canonical_roundtrip_cost_pct(spread_pct=(float(micro_feats["spread_pct"]) if micro_feats.get("spread_pct") is not None else None)),
                 signaled=signaled,
+                evaluated_at=float(cycle_ts),
                 features=micro_feats,
                 raw_expected_move=edge_dict.get("raw_expected_move_pct"),
                 raw_move_source=edge_dict.get("raw_move_source") or (row.get("rank_meta") or {}).get("edge_source") or "NONE",

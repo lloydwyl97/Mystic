@@ -266,3 +266,44 @@ def test_live_wiring_passes_entry_economics_and_folds_every_cycle():
     integration_src = inspect.getsource(portfolio_engine_integration)
     assert "await _asyncio.to_thread(fold_due, markout_db)" in integration_src
     assert "SCALP_VALUE_FOLD_FAILED" in integration_src
+
+
+def test_load_candidates_preserves_decision_time_entry_micro_over_later_features(tmp_path):
+    db = str(tmp_path / "m.db")
+    adaptive_learning.record_candidate(
+        db,
+        engine="SCALP_V2",
+        symbol="BTCUSDT",
+        setup="FAILED_BREAKOUT_REVERSAL",
+        regime="btcflat_volhi",
+        ref_price=100.0,
+        roundtrip_cost=COST,
+        signaled=False,
+        evaluated_at=T0,
+        features={"obi_l5": -0.5, "ofi_5s": -4.0},
+        economic={"calibrated_move": 0.0008, "entry_micro": {"obi_l5": 0.6, "ofi_5s": 2.0}},
+    )
+    (cand,) = cv.load_candidates(db, T0 - 1.0, T0 + 1.0)
+    assert cand.entry["m_obi"] == pytest.approx(0.6)
+    assert cand.entry["m_ofi"] == pytest.approx(np.tanh(1.0))
+
+
+def test_scalp_claim_regime_isolation_and_value_fading(tmp_path):
+    db = str(tmp_path / "iso.db")
+    ver = adaptive_learning.current_strategy_version("SCALP_V2")
+    for _ in range(30):
+        adaptive_learning.learn_claim_label(db, symbol="ETHUSDT", setup="FAILED_BREAKOUT_REVERSAL", regime="btcdown_vollo", strategy_version=ver, raw=0.002, gross=-0.004, now=T0)
+    for _ in range(5):
+        adaptive_learning.learn_claim_label(db, symbol="XRPUSDT", setup="FAILED_BREAKOUT_REVERSAL", regime="btcflat_volhi", strategy_version=ver, raw=0.002, gross=0.0012, now=T0)
+    cal = adaptive_learning.scalp_claim_calibration(db, "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", now=T0)
+    assert cal["claim_gross_mean"] > COST
+    model = cv.ValueModel()
+    x = cv.vector(cv.entry_position_state(COST), {"cost": COST}, "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi")
+    model.fold([(120, x, 0.0, T0, 1.0)] * 20, T0)
+    ent = {"calibrated": cal["claim_gross_setup"], "adaptive": cal["claim_gross_mean"] - cal["claim_gross_setup"], "cost": COST}
+    ev0 = cv.entry_value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", ent, model=model)
+    hold0 = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", cv.entry_position_state(COST), ent, model=model)["advantage"]
+    hold10 = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", _state(0.0, age=10.0), ent, model=model)["advantage"]
+    assert ev0 == pytest.approx(hold0)
+    assert ev0 > COST
+    assert abs(hold10) < 1e-6

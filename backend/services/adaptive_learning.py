@@ -730,6 +730,7 @@ def _lattice(
     acc_same_reg = {lvl: [0.0, 0.0, 0.0] for lvl in LATTICE_LEVELS}
     key_n: dict[str, float] = dict.fromkeys(weights, 0.0)
     is_hold_adv = bool(weights) and all(str(m).startswith("hold_adv_") for m in weights)
+    is_claim_gross = bool(weights) and set(weights) == {"claim_gross"}
     for row in rows:
         metric_w = float(weights.get(str(row["metric"]), 0.0))
         raw_n = float(row["n"] or 0.0)
@@ -754,7 +755,8 @@ def _lattice(
     ps = (PRIOR_STRENGTH / float(len(HOLD_ADVANTAGE_HORIZONS))) if is_hold_adv else PRIOR_STRENGTH
     w_same_reg = acc_same_reg["related"][0] + acc_same_reg["key"][0]
     w_other = sum(acc[lvl][0] for lvl in LATTICE_LEVELS) - w_same_reg
-    isolate_regime = is_hold_adv and w_same_reg > 0.0 and w_other > 0.0
+    isolate_regime = (is_hold_adv or is_claim_gross) and w_same_reg > 0.0 and w_other > 0.0
+    ps_reg = (PRIOR_STRENGTH / 3.2) if is_claim_gross else ps
     mu = prior
     level_means: dict[str, float] = {}
     nested_w: dict[str, float] = {}
@@ -772,7 +774,7 @@ def _lattice(
                 continue
             w_reg = sum(acc_same_reg[lvl][0] for lvl in inner)
             s_reg = sum(acc_same_reg[lvl][1] for lvl in inner)
-            mu = (ps * mu + s_reg) / (ps + w_reg)
+            mu = (ps_reg * mu + s_reg) / (ps_reg + w_reg)
             level_means[level] = mu
             continue
         mu = (ps * mu + s) / (ps + w)

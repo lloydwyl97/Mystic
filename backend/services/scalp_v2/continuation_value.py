@@ -231,7 +231,7 @@ def load_candidates(db_path: str, start: float, end: float) -> list[Candidate]:
     out: list[Candidate] = []
     for cid, symbol, setup, regime, evaluated, ref, cost, econ, feats in rows:
         parsed, micro = _json_dict(econ), _json_dict(feats)
-        entry = {**entry_state(parsed), **micro_state(micro)}
+        entry = {**micro_state(micro), **entry_state(parsed)}
         out.append(Candidate(int(cid), _norm_symbol(symbol), str(setup or ""), str(regime or ""), float(evaluated), float(ref), _finite(cost), entry))
     return out
 
@@ -563,9 +563,14 @@ def value(db_path: str, symbol: str, setup: str, regime: str, state: dict, entry
     use = model if model is not None else load_model(db_path)
     if use is None:
         return None
-    per = use.horizon_values(vector(state, entry or {}, symbol, setup, regime))
+    ent = entry if isinstance(entry, dict) else {}
+    per = use.horizon_values(vector(state, ent, symbol, setup, regime))
     if not per:
         return {"advantage": 0.0, "horizon": None, "horizons": {}, "version": VALUE_VERSION}
+    age = max(0.0, _finite((state or {}).get("age_min")))
+    claim_rem = (_finite(ent.get("calibrated")) + _finite(ent.get("adaptive"))) * max(0.0, 1.0 - age / 10.0)
+    if claim_rem != 0.0:
+        per = {h: v + claim_rem for h, v in per.items()}
     best = max(per, key=per.__getitem__)
     return {"advantage": per[best], "horizon": best, "horizons": per, "version": VALUE_VERSION}
 
