@@ -756,7 +756,7 @@ def _lattice(
     w_same_reg = acc_same_reg["related"][0] + acc_same_reg["key"][0]
     w_other = sum(acc[lvl][0] for lvl in LATTICE_LEVELS) - w_same_reg
     isolate_regime = (is_hold_adv or is_claim_gross) and w_same_reg > 0.0 and w_other > 0.0
-    ps_reg = (PRIOR_STRENGTH / 3.2) if is_claim_gross else ps
+    ps_reg = (PRIOR_STRENGTH / float(len(LATTICE_LEVELS))) if is_claim_gross else ps
     mu = prior
     level_means: dict[str, float] = {}
     nested_w: dict[str, float] = {}

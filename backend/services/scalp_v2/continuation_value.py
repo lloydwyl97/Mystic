@@ -94,6 +94,8 @@ FEATURES: tuple[str, ...] = (
     *(f"btc_{trend}" for trend in TRENDS),
     "vol_hi",
 )
+_DIRECT_CLAIM_KEYS: frozenset[str] = frozenset({"calibrated", "adaptive"})
+_DIRECT_CLAIM_INDICES: tuple[int, ...] = tuple(i for i, name in enumerate(FEATURES) if name in ("entry_calibrated", "entry_adaptive", "entry_calibrated_fresh", "entry_adaptive_fresh"))
 
 
 def _finite(value: Any) -> float:
@@ -154,7 +156,7 @@ def vector(state: dict, entry: dict, symbol: str, setup: str, regime: str) -> np
         _finite(state.get("giveback")) * _SCALE,
         math.log1p(age),
     ]
-    terms = [_finite(entry.get(key)) * _SCALE for key in ENTRY_KEYS]
+    terms = [0.0 if key in _DIRECT_CLAIM_KEYS else _finite(entry.get(key)) * _SCALE for key in ENTRY_KEYS]
     values += terms
     values += [term / (1.0 + age) for term in terms]
     values += [_finite(entry.get(f"m_{key}")) / (1.0 + age) for key in MICRO_KEYS]
@@ -231,7 +233,9 @@ def load_candidates(db_path: str, start: float, end: float) -> list[Candidate]:
     out: list[Candidate] = []
     for cid, symbol, setup, regime, evaluated, ref, cost, econ, feats in rows:
         parsed, micro = _json_dict(econ), _json_dict(feats)
-        entry = {**micro_state(micro), **entry_state(parsed)}
+        raw_entry_micro = parsed.get("entry_micro")
+        merged_micro = {**micro, **raw_entry_micro} if isinstance(raw_entry_micro, dict) and raw_entry_micro else micro
+        entry = {**entry_state(parsed), **micro_state(merged_micro)}
         out.append(Candidate(int(cid), _norm_symbol(symbol), str(setup or ""), str(regime or ""), float(evaluated), float(ref), _finite(cost), entry))
     return out
 
@@ -457,10 +461,14 @@ class ValueModel:
 
     def horizon_values(self, x: np.ndarray) -> dict[int, float]:
         out: dict[int, float] = {}
+        x_clean = np.asarray(x, dtype=float)
+        if x_clean.shape == (len(FEATURES),):
+            x_clean = x_clean.copy()
+            x_clean[list(_DIRECT_CLAIM_INDICES)] = 0.0
         for horizon in HORIZONS_SEC:
             beta = self.beta(horizon)
             if beta is not None:
-                value = float(x @ beta)
+                value = float(x_clean @ beta)
                 if math.isfinite(value):
                     out[horizon] = value
         return out

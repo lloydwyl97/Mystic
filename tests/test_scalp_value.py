@@ -283,9 +283,24 @@ def test_load_candidates_preserves_decision_time_entry_micro_over_later_features
         features={"obi_l5": -0.5, "ofi_5s": -4.0},
         economic={"calibrated_move": 0.0008, "entry_micro": {"obi_l5": 0.6, "ofi_5s": 2.0}},
     )
-    (cand,) = cv.load_candidates(db, T0 - 1.0, T0 + 1.0)
-    assert cand.entry["m_obi"] == pytest.approx(0.6)
-    assert cand.entry["m_ofi"] == pytest.approx(np.tanh(1.0))
+    adaptive_learning.record_candidate(
+        db,
+        engine="SCALP_V2",
+        symbol="ETHUSDT",
+        setup="FAILED_BREAKOUT_REVERSAL",
+        regime="btcflat_volhi",
+        ref_price=100.0,
+        roundtrip_cost=COST,
+        signaled=False,
+        evaluated_at=T0 + 1.0,
+        features={"obi_l5": 0.35, "ofi_5s": 2.0},
+        economic={"calibrated_move": 0.0008},
+    )
+    c1, c2 = cv.load_candidates(db, T0 - 1.0, T0 + 2.0)
+    assert c1.entry["m_obi"] == pytest.approx(0.6)
+    assert c1.entry["m_ofi"] == pytest.approx(np.tanh(1.0))
+    assert c2.entry["m_obi"] == pytest.approx(0.35)
+    assert c2.entry["m_ofi"] == pytest.approx(np.tanh(1.0))
 
 
 def test_scalp_claim_regime_isolation_and_value_fading(tmp_path):
@@ -297,13 +312,52 @@ def test_scalp_claim_regime_isolation_and_value_fading(tmp_path):
         adaptive_learning.learn_claim_label(db, symbol="XRPUSDT", setup="FAILED_BREAKOUT_REVERSAL", regime="btcflat_volhi", strategy_version=ver, raw=0.002, gross=0.0012, now=T0)
     cal = adaptive_learning.scalp_claim_calibration(db, "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", now=T0)
     assert cal["claim_gross_mean"] > COST
+    cold_cal = adaptive_learning.scalp_claim_calibration(db, "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "unseen_regime", now=T0)
+    assert cold_cal["claim_gross_mean"] < 0.0
     model = cv.ValueModel()
     x = cv.vector(cv.entry_position_state(COST), {"cost": COST}, "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi")
     model.fold([(120, x, 0.0, T0, 1.0)] * 20, T0)
     ent = {"calibrated": cal["claim_gross_setup"], "adaptive": cal["claim_gross_mean"] - cal["claim_gross_setup"], "cost": COST}
+    claim_total = ent["calibrated"] + ent["adaptive"]
     ev0 = cv.entry_value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", ent, model=model)
     hold0 = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", cv.entry_position_state(COST), ent, model=model)["advantage"]
+    hold2 = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", _state(0.0, age=2.0), ent, model=model)["advantage"]
+    hold5 = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", _state(0.0, age=5.0), ent, model=model)["advantage"]
     hold10 = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", _state(0.0, age=10.0), ent, model=model)["advantage"]
     assert ev0 == pytest.approx(hold0)
+    assert hold2 == pytest.approx(0.8 * claim_total, abs=1e-6)
+    assert hold5 == pytest.approx(0.5 * claim_total, abs=1e-6)
     assert ev0 > COST
     assert abs(hold10) < 1e-6
+
+
+def test_claim_expectation_cannot_double_count_even_with_nonzero_betas():
+    model = cv.ValueModel()
+    x0 = cv.vector(cv.entry_position_state(COST), {"calibrated": 0.0008, "adaptive": 0.0002, "cost": COST}, "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi")
+    for idx in cv._DIRECT_CLAIM_INDICES:
+        assert x0[idx] == 0.0
+    model.fold([(120, x0, 0.0, T0, 1.0)] * 20, T0)
+    ent = {"calibrated": 0.0008, "adaptive": 0.0, "cost": COST}
+    baseline = cv.entry_value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", ent, model=model)
+    cf = cv.ValueModel.from_payload(model.to_payload())
+    cf._beta = {h: model.beta(h).copy() for h in cv.HORIZONS_SEC if model.beta(h) is not None}
+    for idx in cv._DIRECT_CLAIM_INDICES:
+        cf._beta[120][idx] = 0.5
+    counterfactual = cv.entry_value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", ent, model=cf)
+    assert baseline == pytest.approx(0.0008, abs=1e-6)
+    assert counterfactual == pytest.approx(baseline, abs=1e-12)
+
+
+def test_no_minimum_hold_and_no_fixed_10m_exit():
+    model = cv.ValueModel()
+    x0 = cv.vector(cv.entry_position_state(COST), {"cost": COST}, "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi")
+    model.fold([(120, x0, -0.0005, T0, 1.0)] * 40, T0)
+    ent_small = {"calibrated": 0.0003, "adaptive": 0.0, "cost": COST}
+    early = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", _state(-COST, age=5.0), ent_small, model=model)
+    assert adaptive_learning.learned_hold_or_exit(expected_terminal_net=-COST + early["advantage"], unrealized_net=-COST) == "exit"
+
+    pos_model = cv.ValueModel()
+    pos_model.fold([(120, x0, 0.0004, T0, 1.0)] * 40, T0)
+    post10 = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", _state(0.0, age=10.0), ent_small, model=pos_model)
+    assert post10["advantage"] > 0.0
+    assert adaptive_learning.learned_hold_or_exit(expected_terminal_net=post10["advantage"], unrealized_net=0.0) == "hold"
