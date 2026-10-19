@@ -727,7 +727,9 @@ def _lattice(
     sym, stp, reg = _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower()
     moment = float(now) if now is not None else _data_clock(rows)
     acc = {lvl: [0.0, 0.0, 0.0] for lvl in LATTICE_LEVELS}
+    acc_same_reg = {lvl: [0.0, 0.0, 0.0] for lvl in LATTICE_LEVELS}
     key_n: dict[str, float] = dict.fromkeys(weights, 0.0)
+    is_hold_adv = bool(weights) and all(str(m).startswith("hold_adv_") for m in weights)
     for row in rows:
         metric_w = float(weights.get(str(row["metric"]), 0.0))
         raw_n = float(row["n"] or 0.0)
@@ -742,8 +744,17 @@ def _lattice(
         bucket[0] += w
         bucket[1] += w * mean
         bucket[2] += w * (var + mean * mean)
+        if str(row["setup"] or "").upper() == stp and bool(reg) and str(row["regime"] or "").lower() == reg:
+            sb = acc_same_reg[level]
+            sb[0] += w
+            sb[1] += w * mean
+            sb[2] += w * (var + mean * mean)
         if level == "key":
             key_n[str(row["metric"])] += n
+    ps = (PRIOR_STRENGTH / float(len(HOLD_ADVANTAGE_HORIZONS))) if is_hold_adv else PRIOR_STRENGTH
+    w_same_reg = acc_same_reg["related"][0] + acc_same_reg["key"][0]
+    w_other = sum(acc[lvl][0] for lvl in LATTICE_LEVELS) - w_same_reg
+    isolate_regime = is_hold_adv and w_same_reg > 0.0 and w_other > 0.0
     mu = prior
     level_means: dict[str, float] = {}
     nested_w: dict[str, float] = {}
@@ -753,9 +764,18 @@ def _lattice(
         s = sum(acc[lvl][1] for lvl in inner)
         nested_w[level] = w
         if level == "engine" and not include_engine:
-            level_means[level] = (PRIOR_STRENGTH * prior + s) / (PRIOR_STRENGTH + w)
+            level_means[level] = (ps * prior + s) / (ps + w)
             continue
-        mu = (PRIOR_STRENGTH * mu + s) / (PRIOR_STRENGTH + w)
+        if isolate_regime:
+            if level in ("engine", "setup"):
+                level_means[level] = (ps * mu + s) / (ps + w)
+                continue
+            w_reg = sum(acc_same_reg[lvl][0] for lvl in inner)
+            s_reg = sum(acc_same_reg[lvl][1] for lvl in inner)
+            mu = (ps * mu + s_reg) / (ps + w_reg)
+            level_means[level] = mu
+            continue
+        mu = (ps * mu + s) / (ps + w)
         level_means[level] = mu
     total_w = nested_w["engine"]
     sigma2 = 0.0

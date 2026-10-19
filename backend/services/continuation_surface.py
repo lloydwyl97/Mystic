@@ -140,7 +140,10 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
     _decay_ridge(stats, now, engine)
     if float(stats.get("n") or 0.0) <= 0:
         return 0.0
-    z = np.asarray(_standardize(stats, feature_vector(features)), dtype=float)
+    vec = feature_vector(features)
+    if all(abs(v) <= 1e-12 for v in vec[1:]):
+        return 0.0
+    z = np.asarray(_standardize(stats, vec), dtype=float)
     xtx = np.asarray(stats["xtx"], dtype=float) + float(PRIOR_STRENGTH) * np.eye(len(FEATURE_NAMES))
     xty = np.asarray(stats["xty"], dtype=float)
     try:

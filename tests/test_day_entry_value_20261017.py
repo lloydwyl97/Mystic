@@ -144,3 +144,31 @@ def test_opportunity_labels_fold_once_with_path_weight(tmp_path, monkeypatch):
     d = al.day_decision(db, *KEY, now=as_of)
     assert d["economic"]["continuation_entry_informed"] is True
     assert d["expected_net"] > -canonical_roundtrip_cost_pct()
+
+
+def test_fresh_entry_has_zero_excursion_tilt_while_open_position_uses_ridge(tmp_path):
+    db = str(tmp_path / "ridge_fresh.db")
+    install_day_surface(db)
+    cost = canonical_roundtrip_cost_pct()
+    for step in range(10):
+        aged = cs.state_features(entry=100.0, mark=99.0, net=-0.01 - 0.001 * step, mfe=0.001, mae=0.01 + 0.001 * step, high_water=100.1, prev_net=-0.009, age_sec=600.0 + 60.0 * step)
+        for h in cs.DAY_ADVANTAGE_HORIZONS:
+            cs.record_advantage(db, engine="DAY_V2", symbol="ETHUSDT", setup="RANGE_BOUNCE", regime="other_reg", horizon=h, features=aged, advantage=-0.03, weight=1.0, now=T0 + step)
+    teach_entry(db, "SOLUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", 0.004, times=2, now=T0 + 20)
+    fresh = cs.state_features(entry=1.0, mark=1.0, net=-cost, mfe=0.0, mae=0.0, high_water=1.0, prev_net=None, age_sec=0.0)
+    trace_fresh = cs.surface_trace(db, "DAY_V2", "SOLUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", fresh, T0 + 20, how="blended")
+    assert trace_fresh is not None
+    assert all(item["ridge"] == 0.0 for item in trace_fresh["horizons"])
+    d = al.day_decision(db, "SOLUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", now=T0 + 20)
+    assert d["expected_net"] > 0.0
+
+
+def test_regime_isolation_prevents_other_regime_losses_from_crushing_positive_regime_edge(tmp_path):
+    db = str(tmp_path / "reg_iso.db")
+    teach_entry(db, "BTCUSDT", "VWAP_REVERSION__MARKET", "btcup_volhi", -0.04, times=20, now=T0)
+    teach_entry(db, "ETHUSDT", "RANGE_BOUNCE__MARKET", "btcdown_vollo", -0.04, times=20, now=T0)
+    teach_entry(db, "SOLUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", 0.004, times=2, now=T0)
+    pos_reg = al.day_decision(db, "SOLUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", now=T0)
+    neg_reg = al.day_decision(db, "BTCUSDT", "VWAP_REVERSION__MARKET", "btcup_volhi", now=T0)
+    assert pos_reg["expected_net"] > 0.0
+    assert neg_reg["expected_net"] < 0.0
