@@ -97,6 +97,10 @@ async def submit_day_v2_direct_entry(
     safe, safety_reason = await _pre_submit_safety(engine, pseudo_intent, ask)
     if not safe:
         engine.last_buy_outcome = f"DIRECT_SUBMIT_BLOCKED:{safety_reason}"
+        try:
+            engine.last_buy_reject_reason = safety_reason
+        except Exception:
+            pass
         logger.info("DAY_V2_DIRECT_SUBMIT_BLOCKED symbol=%s reason=%s", symbol, safety_reason)
         return None
 

@@ -95,7 +95,9 @@ FEATURES: tuple[str, ...] = (
     "vol_hi",
 )
 _DIRECT_CLAIM_KEYS: frozenset[str] = frozenset({"calibrated", "adaptive"})
-_DIRECT_CLAIM_INDICES: tuple[int, ...] = tuple(i for i, name in enumerate(FEATURES) if name in ("entry_calibrated", "entry_adaptive", "entry_calibrated_fresh", "entry_adaptive_fresh"))
+_DIRECT_CLAIM_INDICES: tuple[int, ...] = tuple(
+    i for i, name in enumerate(FEATURES) if name in ("entry_calibrated", "entry_adaptive", "entry_calibrated_fresh", "entry_adaptive_fresh") or name.startswith(("sym_", "setup_", "btc_", "vol_"))
+)
 
 
 def _finite(value: Any) -> float:
@@ -142,11 +144,9 @@ def entry_position_state(cost: float) -> dict[str, float]:
 
 
 def vector(state: dict, entry: dict, symbol: str, setup: str, regime: str) -> np.ndarray:
+    _ = (symbol, setup, regime)
     net = _finite(state.get("net")) * _SCALE
     age = max(0.0, _finite(state.get("age_min")))
-    trend, vol = _regime_parts(regime)
-    sym = _norm_symbol(symbol)
-    name = str(setup or "").upper()
     values = [
         1.0,
         net,
@@ -157,13 +157,14 @@ def vector(state: dict, entry: dict, symbol: str, setup: str, regime: str) -> np
         math.log1p(age),
     ]
     terms = [0.0 if key in _DIRECT_CLAIM_KEYS else _finite(entry.get(key)) * _SCALE for key in ENTRY_KEYS]
+    fresh_scale = (1.0 / (1.0 + age)) if age < 20.0 else 0.0
     values += terms
-    values += [term / (1.0 + age) for term in terms]
-    values += [_finite(entry.get(f"m_{key}")) / (1.0 + age) for key in MICRO_KEYS]
-    values += [1.0 if sym == s else 0.0 for s in SYMBOLS]
-    values += [1.0 if name == s else 0.0 for s in SETUPS]
-    values += [1.0 if trend == t else 0.0 for t in TRENDS]
-    values.append(1.0 if vol == "hi" else 0.0)
+    values += [term * fresh_scale for term in terms]
+    values += [_finite(entry.get(f"m_{key}")) * fresh_scale for key in MICRO_KEYS]
+    values += [0.0 for _ in SYMBOLS]
+    values += [0.0 for _ in SETUPS]
+    values += [0.0 for _ in TRENDS]
+    values.append(0.0)
     return np.asarray(values, dtype=float)
 
 
@@ -453,7 +454,13 @@ class ValueModel:
         if float(st["n"]) <= 0:
             return None
         if horizon not in self._beta:
-            beta = _evidence_ridge(st["a"], st["b"], float(st["yy"]), float(st["n"]))
+            a = st["a"].copy()
+            b = st["b"].copy()
+            idx = list(_DIRECT_CLAIM_INDICES)
+            a[idx, :] = 0.0
+            a[:, idx] = 0.0
+            b[idx] = 0.0
+            beta = _evidence_ridge(a, b, float(st["yy"]), float(st["n"]))
             if beta is None:
                 return None
             self._beta[horizon] = beta
@@ -576,7 +583,8 @@ def value(db_path: str, symbol: str, setup: str, regime: str, state: dict, entry
     if not per:
         return {"advantage": 0.0, "horizon": None, "horizons": {}, "version": VALUE_VERSION}
     age = max(0.0, _finite((state or {}).get("age_min")))
-    claim_rem = (_finite(ent.get("calibrated")) + _finite(ent.get("adaptive"))) * max(0.0, 1.0 - age / 10.0)
+    net = _finite((state or {}).get("net"))
+    claim_rem = (_finite(ent.get("calibrated")) + _finite(ent.get("adaptive"))) * max(0.0, 1.0 - age / 10.0) - max(0.0, net)
     if claim_rem != 0.0:
         per = {h: v + claim_rem for h, v in per.items()}
     best = max(per, key=per.__getitem__)

@@ -361,3 +361,8 @@ def test_no_minimum_hold_and_no_fixed_10m_exit():
     post10 = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", _state(0.0, age=10.0), ent_small, model=pos_model)
     assert post10["advantage"] > 0.0
     assert adaptive_learning.learned_hold_or_exit(expected_terminal_net=post10["advantage"], unrealized_net=0.0) == "hold"
+
+    # When already-realized net profit exceeds remaining claim + model residual, continuation exits to harvest profit.
+    prof = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", _state(0.0050, age=2.0), {"calibrated": 0.0008, "adaptive": 0.0, "cost": COST}, model=model)
+    assert prof["advantage"] < 0.0
+    assert adaptive_learning.learned_hold_or_exit(expected_terminal_net=0.0050 + prof["advantage"], unrealized_net=0.0050) == "exit"
