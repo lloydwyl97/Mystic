@@ -122,8 +122,10 @@ def _standardize(stats: dict[str, Any], values: list[float]) -> list[float]:
 def _update_ridge(stats: dict[str, Any], features: dict[str, float] | None, target: float, weight: float, now: float, engine: str) -> None:
     if not math.isfinite(target) or not math.isfinite(weight) or weight <= 0:
         return
-    _decay_ridge(stats, now, engine)
     values = feature_vector(features)
+    if float(values[6]) <= 1e-12 or all(abs(v) <= 1e-12 for v in values[1:]):
+        return
+    _decay_ridge(stats, now, engine)
     z = _standardize(stats, values)
     for i, value in enumerate(values):
         stats["sum_x"][i] = float(stats["sum_x"][i]) + weight * value
@@ -141,7 +143,7 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
     if float(stats.get("n") or 0.0) <= 0:
         return 0.0
     vec = feature_vector(features)
-    if all(abs(v) <= 1e-12 for v in vec[1:]):
+    if float(vec[6]) <= 1e-12 or all(abs(v) <= 1e-12 for v in vec[1:]):
         return 0.0
     z = np.asarray(_standardize(stats, vec), dtype=float)
     xtx = np.asarray(stats["xtx"], dtype=float) + float(PRIOR_STRENGTH) * np.eye(len(FEATURE_NAMES))

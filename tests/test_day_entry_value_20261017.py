@@ -172,3 +172,18 @@ def test_regime_isolation_prevents_other_regime_losses_from_crushing_positive_re
     neg_reg = al.day_decision(db, "BTCUSDT", "VWAP_REVERSION__MARKET", "btcup_volhi", now=T0)
     assert pos_reg["expected_net"] > 0.0
     assert neg_reg["expected_net"] < 0.0
+
+
+def test_age_zero_opportunity_rows_do_not_corrupt_intra_hold_ridge(tmp_path):
+    db = str(tmp_path / "opp_ridge.db")
+    install_day_surface(db)
+    for i in range(50):
+        opp_feat = cs.state_features(entry=100.0, mark=99.98, net=-0.00066, mfe=0.0, mae=0.0002, high_water=100.0, prev_net=None, age_sec=0.0)
+        cs.record_advantage(db, engine="DAY_V2", symbol="SOLUSDT", setup="RANGE_BOUNCE__MARKET", regime="btcflat_volhi", horizon=3600, features=opp_feat, advantage=0.005, weight=1.0, now=T0 + i)
+    ridge = cs._load_ridge(db, "DAY_V2")
+    assert float((ridge.get("3600") or {}).get("n") or 0.0) == 0.0
+
+    f_fresh = cs.state_features(entry=100.0, mark=99.98, net=-0.00066, mfe=0.0, mae=0.0002, high_water=100.0, prev_net=None, age_sec=0.0)
+    tr0 = cs.surface_trace(db, "DAY_V2", "SOLUSDT", "RANGE_BOUNCE__MARKET", "btcflat_volhi", f_fresh, T0 + 60)
+    assert tr0["advantage"] > 0.0
+    assert all(item["ridge"] == 0.0 for item in tr0["horizons"])
