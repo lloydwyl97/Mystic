@@ -358,11 +358,11 @@ def test_no_minimum_hold_and_no_fixed_10m_exit():
 
     pos_model = cv.ValueModel()
     pos_model.fold([(120, x0, 0.0004, T0, 1.0)] * 40, T0)
-    post10 = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", _state(0.0, age=10.0), ent_small, model=pos_model)
+    post10 = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", _state(0.0, age=10.0), {"cost": COST}, model=pos_model)
     assert post10["advantage"] > 0.0
     assert adaptive_learning.learned_hold_or_exit(expected_terminal_net=post10["advantage"], unrealized_net=0.0) == "hold"
 
-    # When already-realized net profit exceeds remaining claim + model residual, continuation exits to harvest profit.
+    # A profitable position at age=2m is NOT dumped merely because net > 0 while claim_rem remains positive.
     prof = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", _state(0.0050, age=2.0), {"calibrated": 0.0008, "adaptive": 0.0, "cost": COST}, model=model)
-    assert prof["advantage"] < 0.0
-    assert adaptive_learning.learned_hold_or_exit(expected_terminal_net=0.0050 + prof["advantage"], unrealized_net=0.0050) == "exit"
+    assert prof["advantage"] == pytest.approx(0.8 * 0.0008 - 0.0005, abs=1e-6)
+    assert adaptive_learning.learned_hold_or_exit(expected_terminal_net=0.0050 + prof["advantage"], unrealized_net=0.0050) == "hold"

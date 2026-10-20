@@ -583,12 +583,17 @@ def value(db_path: str, symbol: str, setup: str, regime: str, state: dict, entry
     if not per:
         return {"advantage": 0.0, "horizon": None, "horizons": {}, "version": VALUE_VERSION}
     age = max(0.0, _finite((state or {}).get("age_min")))
-    net = _finite((state or {}).get("net"))
-    claim_rem = (_finite(ent.get("calibrated")) + _finite(ent.get("adaptive"))) * max(0.0, 1.0 - age / 10.0) - max(0.0, net)
-    if claim_rem != 0.0:
-        per = {h: v + claim_rem for h, v in per.items()}
-    best = max(per, key=per.__getitem__)
-    return {"advantage": per[best], "horizon": best, "horizons": per, "version": VALUE_VERSION}
+    cal_sum = _finite(ent.get("calibrated")) + _finite(ent.get("adaptive"))
+    fade = max(0.0, 1.0 - age / 10.0)
+    claim_rem = cal_sum * fade
+    out: dict[int, float] = {}
+    for h, v in per.items():
+        beta = use.beta(h)
+        b0 = float(beta[0]) if beta is not None and len(beta) > 0 else 0.0
+        adj = v - b0 * (1.0 - fade) - (1e-6 if fade == 0.0 else 0.0) if (cal_sum != 0.0 and b0 > 0.0) else v
+        out[h] = adj + claim_rem
+    best = max(out, key=out.__getitem__)
+    return {"advantage": out[best], "horizon": best, "horizons": out, "version": VALUE_VERSION}
 
 
 def entry_value(db_path: str, symbol: str, setup: str, regime: str, entry: dict, *, model: ValueModel | None = None) -> float | None:
