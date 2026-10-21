@@ -157,3 +157,21 @@ def test_all_four_symbols_can_arm_independently():
     for sym, px in prices.items():
         _, blocked = arm_opportunity(db, sym, "SCALP", px)
         assert not blocked, f"{sym} arm must not be blocked on first attempt"
+
+
+def test_unfilled_scalp_buy_expires_armed_opportunity_so_next_signal_is_not_blocked():
+    import inspect
+
+    from backend.services.portfolio_engine_integration import PortfolioEngineIntegration
+    from backend.services.scalp_v2.opportunity import arm_opportunity, mark_opportunity
+
+    db = _db()
+    opp_id, blocked = arm_opportunity(db, "SOL/USDT", "RANGE_BOUNCE_SCALP", 108.73)
+    assert not blocked
+    mark_opportunity(db, "SOL/USDT", opp_id, "EXPIRED")
+    opp_id2, blocked2 = arm_opportunity(db, "SOL/USDT", "RANGE_BOUNCE_SCALP", 108.73)
+    assert not blocked2 and opp_id2 == opp_id
+
+    src = inspect.getsource(PortfolioEngineIntegration._process_scalp_v2_signals)
+    assert 'if reject != "POST_FILL_BIND_FAILED":' in src
+    assert 'mark_opportunity(self.engine.db_path, norm, opp_id, "EXPIRED")' in src

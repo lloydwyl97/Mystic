@@ -2363,7 +2363,7 @@ class PortfolioEngineIntegration:
 
         from backend.config.day_entry_execution import ENTRY_AUTHORITY_SCALP_V2_CONFIRMED
         from backend.services.scalp_v2.decision_log import classify_scalp_candidate, record_scalp_decision
-        from backend.services.scalp_v2.opportunity import arm_opportunity, reap_expired_armed
+        from backend.services.scalp_v2.opportunity import arm_opportunity, mark_opportunity, reap_expired_armed
 
         SCALP_V2_ENGINE = "SCALP_V2"
         cycle_ts = time.time()
@@ -2590,6 +2590,7 @@ class PortfolioEngineIntegration:
                     notional = 0.0
                 qty = notional / float(arm_price) if arm_price > 0 else 0.0
                 if qty <= 0 or notional <= 0:
+                    mark_opportunity(self.engine.db_path, norm, opp_id, "EXPIRED")
                     record_scalp_decision(
                         self.engine.db_path,
                         norm,
@@ -2663,6 +2664,8 @@ class PortfolioEngineIntegration:
                     )
                 else:
                     reject = str(getattr(self.engine, "last_buy_reject_reason", "") or "EXCHANGE_REJECTED")
+                    if reject != "POST_FILL_BIND_FAILED":
+                        mark_opportunity(self.engine.db_path, norm, opp_id, "EXPIRED")
                     record_scalp_decision(self.engine.db_path, norm, f"REJECTED:{reject}", reject, cycle_ts=cycle_ts, detail=decision_detail(row, opportunity_id=opp_id))
                     logger.info("SCALP_V2_DECISION symbol=%s result=REJECTED:%s opp=%s", norm, reject, opp_id)
             except _asyncio.CancelledError:
