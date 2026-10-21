@@ -362,3 +362,21 @@ async def test_stale_price_rejects_before_sizing(tmp_path, day_cycle):
     assert [r[2] for r in _decisions(integ.engine.db_path)] == ["MISSING_EXECUTABLE_PRICE"] * len(SYMBOLS)
     assert integ.sizing_calls == []
     assert day_cycle["submits"] == []
+
+
+@pytest.mark.asyncio
+async def test_residual_sleeve_crumb_below_ten_dollars_rejects_as_budget_exhausted(tmp_path, day_cycle, monkeypatch):
+    integ = _integration(tmp_path, _fresh_redis(LIVE))
+    _seed_positive_net(integ.engine.db_path)
+    integ.sizing_result = (0.1, 0.0, 1.0)
+    monkeypatch.setattr(
+        "backend.services.two_engine_capital.compute_snapshot",
+        lambda *_a, **_k: SimpleNamespace(day=SimpleNamespace(remaining_budget=1.75)),
+    )
+
+    await integ._process_day_v2_signals(ENTRY_BAR)
+
+    rows = {r[0]: r[2] for r in _decisions(integ.engine.db_path)}
+    assert rows["BTCUSDT"] == "REJECTED:ENGINE_BUDGET_EXHAUSTED"
+    assert rows["ETHUSDT"] == "REJECTED:ENGINE_BUDGET_EXHAUSTED"
+    assert rows["SOLUSDT"] == "REJECTED:ENGINE_BUDGET_EXHAUSTED"

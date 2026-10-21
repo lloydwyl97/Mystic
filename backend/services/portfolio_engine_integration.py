@@ -2036,7 +2036,9 @@ class PortfolioEngineIntegration:
             prices=symbol_marks(getattr(self.engine, "_position_mark_prices", None)),
         )
         day_remaining = float(snap.day.remaining_budget)
-        qty = clamp_to_sleeve(sized_qty * size_mult, ask_price, day_remaining)
+        target_qty = float(sized_qty * size_mult)
+        target_notional = target_qty * float(ask_price)
+        qty = 0.0 if (target_notional >= 10.0 and day_remaining < 10.0) else clamp_to_sleeve(target_qty, ask_price, day_remaining)
         notional = float(qty) * float(ask_price)
         cand["rank"]["sized_notional"] = round(sized_qty * float(ask_price), 4)
         cand["rank"]["day_sleeve_remaining"] = round(day_remaining, 4)
