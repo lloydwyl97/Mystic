@@ -1445,17 +1445,25 @@ def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, 
         rec[str(row["metric"])] = float(row["ewma"])
         rec["n"] = min(rec.get("n", math.inf), float(row["n"] or 0.0) * _decay_factor(str(row["updated_at"] or ""), moment, SCALP_ENGINE))
     acc = {lvl: [0.0, 0.0, 0.0, 0.0] for lvl in LATTICE_LEVELS}
-    for rec in keys.values():
+    acc_same_reg = {lvl: [0.0, 0.0, 0.0, 0.0] for lvl in LATTICE_LEVELS}
+    for (_r_sym, r_stp, r_reg), rec in keys.items():
         if any(m not in rec for m in CLAIM_MOMENT_METRICS) or rec["n"] <= 0:
             continue
         n = rec["n"]
         b = rec["claim_raw"]
-        bucket = acc[_level_of(rec["row"], sym, stp, reg)]
-        bucket[0] += n
-        bucket[1] += n * b
-        bucket[2] += n * (rec["claim_raw_x_gross"] - b * rec["claim_gross"])
-        bucket[3] += n * max(0.0, rec["claim_raw_sq"] - b * b)
-    slope_info = PRIOR_STRENGTH * CLAIM_SLOPE_PRIOR_VAR
+        lvl = _level_of(rec["row"], sym, stp, reg)
+        targets = [acc, acc_same_reg] if (r_stp == stp and bool(reg) and r_reg == reg) else [acc]
+        for target_acc in targets:
+            bucket = target_acc[lvl]
+            bucket[0] += n
+            bucket[1] += n * b
+            bucket[2] += n * (rec["claim_raw_x_gross"] - b * rec["claim_gross"])
+            bucket[3] += n * max(0.0, rec["claim_raw_sq"] - b * b)
+    w_same_reg = acc_same_reg["related"][0] + acc_same_reg["key"][0]
+    w_other = sum(acc[lvl][0] for lvl in LATTICE_LEVELS) - w_same_reg
+    isolate_regime = w_same_reg > 0.0 and w_other > 0.0
+    ps_reg = PRIOR_STRENGTH / float(len(LATTICE_LEVELS))
+    slope_info = (ps_reg if isolate_regime else PRIOR_STRENGTH) * CLAIM_SLOPE_PRIOR_VAR
     slope = 0.0
     center: float | None = None
     nested_w: dict[str, float] = {}
@@ -1463,6 +1471,14 @@ def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, 
         w, sb, cov, var = (sum(acc[lvl][j] for lvl in LATTICE_LEVELS[i:]) for j in range(4))
         nested_w[level] = w
         if level == "engine":
+            continue
+        if isolate_regime:
+            if level == "setup":
+                continue
+            w_r, sb_r, cov_r, var_r = (sum(acc_same_reg[lvl][j] for lvl in LATTICE_LEVELS[i:]) for j in range(4))
+            slope = (slope_info * slope + cov_r) / (slope_info + var_r)
+            if w_r > 0:
+                center = sb_r / w_r if center is None else (ps_reg * center + sb_r) / (ps_reg + w_r)
             continue
         slope = (slope_info * slope + cov) / (slope_info + var)
         if w > 0:

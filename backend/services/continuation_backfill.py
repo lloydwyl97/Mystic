@@ -1490,7 +1490,7 @@ def fold_recent_advantages(db_path: str, *, now: float | None = None) -> int:
         return 0
     _LAST_FOLD = moment
     positions, _skipped = load_positions(db_path, active_since=moment - _LABEL_WINDOW_SEC)
-    positions = [position for position in positions if position.engine in active]
+    positions = [position for position in positions if position.engine in active and position.closed]
     opportunities = opportunity_positions(db_path, since=moment - _LABEL_WINDOW_SEC) if DAY_ENGINE in active else []
     if not positions and not opportunities:
         return 0
@@ -1502,7 +1502,19 @@ def fold_recent_advantages(db_path: str, *, now: float | None = None) -> int:
     candidates: list[AdvantageLabel] = []
     for position in positions:
         found, _more = advantage_labels_for(position, bars_cache.get(position.symbol, []), as_of=moment)
-        candidates.extend(item for item in found if item.engine in active)
+        if not found:
+            continue
+        gap_of: dict[float, float] = {}
+        prev_t = position.entry_time
+        for snap in position.snapshots:
+            gap_of[snap.time] = max(snap.time - prev_t, 1.0)
+            prev_t = snap.time
+        total_gap = sum(gap_of.values()) or 1.0
+        n_horizons = max(1, len(horizons_for(position.engine)))
+        for item in found:
+            if item.engine in active:
+                w_fixed = (gap_of.get(item.snapshot_time, 1.0) / total_gap) / n_horizons
+                candidates.append(replace(item, weight=w_fixed))
     for position, share in opportunities:
         candidates.extend(opportunity_labels_for(position, share, bars_cache.get(position.symbol, []), as_of=moment))
     if not candidates:

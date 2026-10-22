@@ -187,3 +187,72 @@ def test_age_zero_opportunity_rows_do_not_corrupt_intra_hold_ridge(tmp_path):
     tr0 = cs.surface_trace(db, "DAY_V2", "SOLUSDT", "RANGE_BOUNCE__MARKET", "btcflat_volhi", f_fresh, T0 + 60)
     assert tr0["advantage"] > 0.0
     assert all(item["ridge"] == 0.0 for item in tr0["horizons"])
+
+
+def test_fold_recent_advantages_skips_open_positions_and_bounds_closed_position_weights(tmp_path, monkeypatch):
+    db = str(tmp_path / "harm.db")
+    install_day_surface(db)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """
+        CREATE TABLE paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id TEXT, engine_id TEXT, symbol TEXT, side TEXT,
+            entry_price REAL, price REAL, entry_timestamp TEXT, timestamp TEXT,
+            strategy_version TEXT, entry_contract_version TEXT, exit_contract_version TEXT,
+            adaptive_decision_json TEXT, atr_at_entry REAL, exit_reason TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE ai_position_heartbeats (
+            epoch_ms INTEGER, ts_utc TEXT, trade_id TEXT, mark REAL,
+            net_unrealized_pct REAL, mfe_pct REAL, mae_pct REAL,
+            hold_seconds REAL, highest_since_entry REAL
+        )
+        """
+    )
+    conn.execute("CREATE TABLE feature_ohlcv (symbol TEXT, interval TEXT, ts TEXT, open REAL, high REAL, low REAL, close REAL)")
+    ver = ("DAY_V2_FIVE_SETUP_RUNNER_V1", "DAY_V2_ENTRY_PRIOR_STRUCTURE_V1", "DAY_V2_STRUCTURE_RUNNER_V1")
+    iso0 = datetime.datetime.fromtimestamp(T0, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute(
+        """
+        INSERT INTO paper_trades (
+            trade_id, engine_id, symbol, side, entry_price, price, entry_timestamp, timestamp,
+            strategy_version, entry_contract_version, exit_contract_version, adaptive_decision_json, atr_at_entry
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        ("open_t1", "DAY_V2", "SOL/USDT", "BUY", 100.0, 100.0, iso0, iso0, *ver, json.dumps({"setup": "VWAP_REVERSION__MARKET", "regime": "btcup_vollo"}), 1.0),
+    )
+    for k in range(1, 6):
+        ts_k = T0 + k * 300.0
+        iso_k = datetime.datetime.fromtimestamp(ts_k, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute("INSERT INTO ai_position_heartbeats VALUES (?,?,?,?,?,?,?,?,?)", (int(ts_k * 1000), iso_k, "open_t1", 101.0, 0.009, 0.01, 0.0, k * 300.0, 101.0))
+    for i in range(120):
+        opened = T0 + i * 60
+        conn.execute("INSERT INTO feature_ohlcv VALUES (?,?,?,?,?,?,?)", ("SOL-USDT", "1m", _bar_ts(opened), 101.0, 101.0, 101.0, 101.0))
+    conn.commit()
+
+    # While open_t1 has no SELL row (not closed), fold_recent_advantages must not fold it
+    monkeypatch.setattr(cb, "_LAST_FOLD", 0.0)
+    assert cb.fold_recent_advantages(db, now=T0 + 3600.0) == 0
+
+    # Once closed, incremental folds across time must never exceed 1/7 weight on h=900s
+    iso_sell = datetime.datetime.fromtimestamp(T0 + 1800.0, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute(
+        """
+        INSERT INTO paper_trades (
+            trade_id, engine_id, symbol, side, entry_price, price, entry_timestamp, timestamp,
+            strategy_version, entry_contract_version, exit_contract_version, adaptive_decision_json, atr_at_entry, exit_reason
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        ("sell_t1", "DAY_V2", "SOL/USDT", "SELL", 100.0, 101.0, iso0, iso_sell, *ver, json.dumps({"setup": "VWAP_REVERSION__MARKET", "regime": "btcup_vollo"}), 1.0, "LEARNED_CONTINUATION_EXIT"),
+    )
+    conn.commit()
+    for step_t in (T0 + 2200.0, T0 + 2600.0, T0 + 3600.0):
+        monkeypatch.setattr(cb, "_LAST_FOLD", 0.0)
+        cb.fold_recent_advantages(db, now=step_t)
+    sum_w_900 = conn.execute("SELECT SUM(weight) FROM continuation_advantage_log WHERE trade_id='open_t1' AND horizon=900").fetchone()[0]
+    conn.close()
+    assert sum_w_900 == pytest.approx(1.0 / len(cs.DAY_ADVANTAGE_HORIZONS), rel=1e-6)
