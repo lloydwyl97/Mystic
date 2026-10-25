@@ -184,9 +184,15 @@ def test_age_zero_opportunity_rows_do_not_corrupt_intra_hold_ridge(tmp_path):
     assert float((ridge.get("3600") or {}).get("n") or 0.0) == 0.0
 
     f_fresh = cs.state_features(entry=100.0, mark=99.98, net=-0.00066, mfe=0.0, mae=0.0002, high_water=100.0, prev_net=None, age_sec=0.0)
+    f_half = cs.state_features(entry=100.0, mark=99.98, net=-0.00066, mfe=0.0, mae=0.0002, high_water=100.0, prev_net=None, age_sec=1800.0)
+    f_elapsed = cs.state_features(entry=100.0, mark=99.98, net=-0.00066, mfe=0.0, mae=0.0002, high_water=100.0, prev_net=None, age_sec=3600.0)
     tr0 = cs.surface_trace(db, "DAY_V2", "SOLUSDT", "RANGE_BOUNCE__MARKET", "btcflat_volhi", f_fresh, T0 + 60)
+    tr_half = cs.surface_trace(db, "DAY_V2", "SOLUSDT", "RANGE_BOUNCE__MARKET", "btcflat_volhi", f_half, T0 + 60)
+    tr_end = cs.surface_trace(db, "DAY_V2", "SOLUSDT", "RANGE_BOUNCE__MARKET", "btcflat_volhi", f_elapsed, T0 + 60)
     assert tr0["advantage"] > 0.0
     assert all(item["ridge"] == 0.0 for item in tr0["horizons"])
+    assert tr_half["advantage"] == pytest.approx(0.5 * tr0["advantage"], rel=1e-6)
+    assert tr_end["advantage"] == pytest.approx(0.0, abs=1e-9)
 
 
 def test_fold_recent_advantages_skips_open_positions_and_bounds_closed_position_weights(tmp_path, monkeypatch):

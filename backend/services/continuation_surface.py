@@ -146,7 +146,8 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
     if float(vec[6]) <= 1e-12 or all(abs(v) <= 1e-12 for v in vec[1:]):
         return 0.0
     z = np.asarray(_standardize(stats, vec), dtype=float)
-    xtx = np.asarray(stats["xtx"], dtype=float) + float(PRIOR_STRENGTH) * np.eye(len(FEATURE_NAMES))
+    ps = float(PRIOR_STRENGTH) / float(max(1, len(horizons_for(engine))))
+    xtx = np.asarray(stats["xtx"], dtype=float) + ps * np.eye(len(FEATURE_NAMES))
     xty = np.asarray(stats["xty"], dtype=float)
     try:
         beta = np.linalg.solve(xtx, xty)
@@ -286,6 +287,9 @@ def surface_trace(
             continue
         stats = ridge.get(str(horizon)) or _blank_ridge()
         posterior = float(view["mean"])
+        age_sec = max(0.0, float((features or {}).get("age_min") or 0.0)) * 60.0
+        if posterior > 0.0 and age_sec > 0.0 and int(horizon) > 0:
+            posterior = posterior * max(0.0, 1.0 - age_sec / float(horizon))
         ridge_dot = _ridge_dot(stats, features, now, engine_id)
         informed.append(
             {
