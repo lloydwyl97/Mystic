@@ -245,3 +245,32 @@ def test_no_time_rule_sample_gate_or_entry_change():
     assert "hold_adv" not in inspect.getsource(scalp_executable_edge)
     assert pytest.approx(0.015) == SCALP_V2_CATASTROPHIC_PCT
     assert catastrophic_threshold_price(100.0, 1.0, 0.0) == pytest.approx(97.0)
+
+
+def test_ridge_dot_clamps_negative_net_subsidy_and_fades_positive_posterior_by_one_hour(tmp_path):
+    stats = cs._blank_ridge()
+    # Train negative beta[0] (winner saturation: higher net -> lower remaining advantage)
+    cs._update_ridge(stats, {"net": 0.0040, "mfe": 0.0050, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, -0.0030, 5.0, T0, "DAY_V2")
+    cs._update_ridge(stats, {"net": 0.0010, "mfe": 0.0050, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, 0.0010, 5.0, T0, "DAY_V2")
+    at_mean = cs._ridge_dot(stats, {"net": 0.0025, "mfe": 0.0050, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, T0, "DAY_V2")
+    deep_loser = cs._ridge_dot(stats, {"net": -0.0080, "mfe": 0.0050, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, T0, "DAY_V2")
+    # Deeply negative net must not receive a positive hold subsidy above mean net when beta[0] < 0
+    assert deep_loser == pytest.approx(at_mean)
+
+    path = _db(tmp_path)
+    cs.record_advantage(
+        path,
+        engine="DAY_V2",
+        symbol="XRPUSDT",
+        setup="BREAKOUT_CONTINUATION",
+        regime="btcup_volhi",
+        horizon=43200,
+        features={"net": -0.002, "age_min": 0.0},
+        advantage=0.0050,
+        weight=5.0,
+        now=T0,
+    )
+    trace_entry = cs.surface_trace(path, "DAY_V2", "XRPUSDT", "BREAKOUT_CONTINUATION", "btcup_volhi", {"net": -0.002, "age_min": 0.0}, T0, how="blended")
+    trace_65m = cs.surface_trace(path, "DAY_V2", "XRPUSDT", "BREAKOUT_CONTINUATION", "btcup_volhi", {"net": -0.005, "mfe": 0.001, "mae": 0.004, "age_min": 65.0}, T0, how="blended")
+    assert trace_entry is not None and trace_entry["advantage"] > 0.0
+    assert trace_65m is not None and trace_65m["advantage"] == pytest.approx(0.0)

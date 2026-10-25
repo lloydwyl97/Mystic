@@ -153,6 +153,8 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
         beta = np.linalg.solve(xtx, xty)
     except np.linalg.LinAlgError:
         return 0.0
+    if float(beta[0]) < 0.0 and float(z[0]) < 0.0:
+        z[0] = 0.0
     dot = float(z @ beta)
     return dot if math.isfinite(dot) else 0.0
 
@@ -288,8 +290,9 @@ def surface_trace(
         stats = ridge.get(str(horizon)) or _blank_ridge()
         posterior = float(view["mean"])
         age_sec = max(0.0, float((features or {}).get("age_min") or 0.0)) * 60.0
-        if posterior > 0.0 and age_sec > 0.0 and int(horizon) > 0:
-            posterior = posterior * max(0.0, 1.0 - age_sec / float(horizon))
+        fade_horizon = min(float(horizon), 3600.0)
+        if posterior > 0.0 and age_sec > 0.0 and fade_horizon > 0.0:
+            posterior = posterior * max(0.0, 1.0 - age_sec / fade_horizon)
         ridge_dot = _ridge_dot(stats, features, now, engine_id)
         informed.append(
             {
