@@ -306,20 +306,19 @@ def surface_trace(
     """Same surface read as ``surface_advantage``, with the horizon pieces kept."""
     informed: list[dict[str, Any]] = []
     engine_id = str(engine or "").upper()
-    ridge = _load_ridge(db_path, engine_id)
+    age_sec = max(0.0, float((features or {}).get("age_min") or 0.0)) * 60.0
+    ridge = _load_ridge(db_path, engine_id) if age_sec > 0.0 else {}
     for horizon in horizons_for(engine_id):
         metric = metric_name(horizon)
         view = estimate(db_path, engine_id, symbol, setup, regime, metric, now=now, include_engine=True)
         evidence = float(view.get("level_weights", {}).get("engine") or 0.0)
         if evidence <= 0:
             continue
-        stats = ridge.get(str(horizon)) or _blank_ridge()
         posterior = float(view["mean"])
-        age_sec = max(0.0, float((features or {}).get("age_min") or 0.0)) * 60.0
         fade_horizon = min(float(horizon), 3600.0)
         if posterior > 0.0 and age_sec > 0.0 and fade_horizon > 0.0:
             posterior = posterior * max(0.0, 1.0 - age_sec / fade_horizon)
-        ridge_dot = _ridge_dot(stats, features, now, engine_id)
+        ridge_dot = _ridge_dot(ridge.get(str(horizon)) or _blank_ridge(), features, now, engine_id) if age_sec > 0.0 else 0.0
         informed.append(
             {
                 "horizon": int(horizon),

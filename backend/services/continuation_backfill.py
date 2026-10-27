@@ -480,6 +480,9 @@ def write_observations(state_db: str, observations: list[Observation]) -> dict[s
         conn.commit()
     finally:
         conn.close()
+    from backend.services.adaptive_learning import _invalidate_adaptive_caches
+
+    _invalidate_adaptive_caches()
     return wrote
 
 

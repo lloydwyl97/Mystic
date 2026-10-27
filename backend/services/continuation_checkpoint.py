@@ -358,6 +358,12 @@ def _install_document(conn: sqlite3.Connection, document: dict[str, Any]) -> Non
                 int(meta.get("observations") or 0),
             ),
         )
+    from backend.services.adaptive_learning import _invalidate_adaptive_caches
+    from backend.services.continuation_surface import _META_CACHE, _RIDGE_CACHE
+
+    _RIDGE_CACHE.clear()
+    _META_CACHE.clear()
+    _invalidate_adaptive_caches()
 
 
 def events_after(conn: sqlite3.Connection, last_event_id: int, engine: str = DAY_ENGINE) -> list[dict[str, Any]]:

@@ -296,6 +296,7 @@ def half_life_days(engine: str) -> float:
     return SCALP_HALF_LIFE_DAYS if str(engine or "").upper() == SCALP_ENGINE else ADAPTIVE_HALF_LIFE_DAYS
 
 
+@functools.lru_cache(maxsize=32768)
 def _decay_factor(updated_at: str, now_epoch: float, engine: str = DAY_ENGINE) -> float:
     """Weight retained for a key's prior sample count, by age. 1.0 if age unknown."""
     t0 = _parse_iso(updated_at)
@@ -313,10 +314,12 @@ def _data_clock(rows: list[sqlite3.Row]) -> float:
     return max(stamps) if stamps else 0.0
 
 
+@functools.lru_cache(maxsize=4096)
 def _is_forensic_key(engine_id: str, symbol: str, setup: str, regime: str) -> bool:
     return (str(engine_id), _norm_symbol(symbol), str(setup or "").upper(), str(regime or "").lower()) in FORENSIC_ADAPTIVE_KEYS
 
 
+@functools.lru_cache(maxsize=1024)
 def _norm_symbol(symbol: str) -> str:
     """Single symbol key form. Closes pass 'XRP/USDT'; ranking passes 'XRPUSDT'.
 
@@ -719,6 +722,8 @@ def _db_stamp(db_path: str) -> tuple[str, int, int]:
     ap = os.path.abspath(db_path)
     with contextlib.suppress(OSError):
         st = Path(ap).stat()
+        if Path(f"{ap}-wal").exists():
+            return (ap, int(st.st_ino), 1 if st.st_size > 0 else 0)
         return (ap, int(st.st_mtime_ns), int(st.st_size))
     return (ap, 0, 0)
 
@@ -3287,7 +3292,7 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
     ckey = (*_db_stamp(db_path), "state", 0.0)
     now_mono = time.monotonic()
     hit = _REPORT_CACHE.get(ckey)
-    if hit is not None and (now_mono - hit[0]) < 15.0:
+    if hit is not None and (now_mono - hit[0]) < 30.0:
         return hit[1]
     out: dict[str, Any] = {
         "adaptive_state_version": ADAPTIVE_STATE_VERSION,
@@ -3304,6 +3309,8 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
         return out
     try:
         for engine_id, decide in ((DAY_ENGINE, day_decision), (SCALP_ENGINE, scalp_decision)):
+            all_eng_rows = _state_rows(db_path, engine_id, tuple(_PRIORS[engine_id]))
+            eng_clock = _data_clock(all_eng_rows) or None
             keys = conn.execute(
                 "SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND setup != ? ORDER BY symbol, setup, regime",
                 (engine_id, current_economic_version(engine_id), MICRO_WEIGHT_KEY[1]),
@@ -3321,7 +3328,7 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                         }
                     )
                     continue
-                view = decide(db_path, k["symbol"], k["setup"], k["regime"])
+                view = decide(db_path, k["symbol"], k["setup"], k["regime"], now=eng_clock)
                 if engine_id == DAY_ENGINE:
                     rows.append(
                         {
@@ -3336,6 +3343,8 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                             "confidence": round(view["confidence"], 3),
                             "net_confidence": round(view["net_confidence"], 3),
                             "abstain": view["abstain"],
+                            "abstain_net_edge": round(float(view["abstain_net_edge"]), 6),
+                            "abstain_confidence": round(float(view["abstain_confidence"]), 3),
                             "n": view["n_mfe"],
                             "n_trade_net": view["n_trade_net"],
                             "n_lifecycle": view["economic"]["n_lifecycle"],
@@ -3362,6 +3371,8 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                             "hold_min": round(view["hold_min"], 2),
                             "confidence": round(view["confidence"], 3),
                             "abstain": view["abstain"],
+                            "abstain_net_edge": round(float(view["abstain_net_edge"]), 6),
+                            "abstain_confidence": round(float(view["abstain_confidence"]), 3),
                             "n": view["claim_key_n"],
                         }
                     )
@@ -3459,7 +3470,7 @@ def abstention_report(db_path: str, window_days: float = 7.0) -> dict[str, Any]:
     ckey = (*_db_stamp(db_path), "abstention", float(window_days))
     now_mono = time.monotonic()
     hit = _REPORT_CACHE.get(ckey)
-    if hit is not None and (now_mono - hit[0]) < 15.0:
+    if hit is not None and (now_mono - hit[0]) < 30.0:
         return hit[1]
     since = time.time() - float(window_days) * 86400.0
     out: dict[str, Any] = {
@@ -3470,33 +3481,27 @@ def abstention_report(db_path: str, window_days: float = 7.0) -> dict[str, Any]:
         "window_days": float(window_days),
         "engines": {},
     }
+    state_rep = adaptive_state_report(db_path)
     try:
         conn = _connect(db_path)
     except sqlite3.Error:
         return out
     try:
-        for engine_id, decide, table in (
+        for engine_id, _decide, table in (
             (DAY_ENGINE, day_decision, "day_v2_decisions"),
             (SCALP_ENGINE, scalp_decision, "scalp_v2_decisions"),
         ):
-            keys = conn.execute(
-                "SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND setup != ? ORDER BY symbol, setup, regime",
-                (engine_id, current_economic_version(engine_id), MICRO_WEIGHT_KEY[1]),
-            ).fetchall()
             abstaining: list[dict[str, Any]] = []
             active: list[dict[str, Any]] = []
-            for k in keys:
-                if _is_forensic_key(engine_id, k["symbol"], k["setup"], k["regime"]):
-                    continue
-                v = decide(db_path, k["symbol"], k["setup"], k["regime"])
+            for k in state_rep.get("engines", {}).get(engine_id, []):
                 rec = {
                     "symbol": k["symbol"],
                     "setup": k["setup"],
                     "regime": k["regime"],
-                    "net_edge": round(float(v["abstain_net_edge"]), 6),
-                    "confidence": round(float(v["abstain_confidence"]), 3),
+                    "net_edge": round(float(k.get("abstain_net_edge") or 0.0), 6),
+                    "confidence": round(float(k.get("abstain_confidence") or 0.0), 3),
                 }
-                (abstaining if v["abstain"] else active).append(rec)
+                (abstaining if k.get("abstain") else active).append(rec)
             skips = 0
             with contextlib.suppress(sqlite3.Error):
                 skips = int(
