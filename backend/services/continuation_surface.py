@@ -142,7 +142,16 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
     _decay_ridge(stats, now, engine)
     if float(stats.get("n") or 0.0) <= 0:
         return 0.0
-    vec = feature_vector(features)
+    raw_ft = dict(features or {})
+    if float(raw_ft.get("age_min") or 0.0) > 1e-12:
+        mfe_v = max(0.0, float(raw_ft.get("mfe") or 0.0))
+        mae_v = max(0.0, float(raw_ft.get("mae") or 0.0))
+        gb_v = max(0.0, float(raw_ft.get("giveback") or 0.0))
+        net_v = float(raw_ft.get("net") or 0.0)
+        raw_ft["net"] = max(net_v, mfe_v - 0.00066)
+        if mfe_v >= 0.0020:
+            raw_ft["mae"] = max(mae_v, gb_v)
+    vec = feature_vector(raw_ft)
     if float(vec[6]) <= 1e-12 or all(abs(v) <= 1e-12 for v in vec[1:]):
         return 0.0
     z = np.asarray(_standardize(stats, vec), dtype=float)
@@ -153,8 +162,12 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
         beta = np.linalg.solve(xtx, xty)
     except np.linalg.LinAlgError:
         return 0.0
-    if float(beta[0]) < 0.0 and float(z[0]) < 0.0:
-        z[0] = 0.0
+    for idx_f in (0, 1, 5):
+        if float(beta[idx_f]) < 0.0 and float(z[idx_f]) < 0.0:
+            z[idx_f] = 0.0
+    for idx_a in (2, 3, 4):
+        if float(beta[idx_a]) > 0.0 and float(z[idx_a]) > 0.0:
+            z[idx_a] = 0.0
     dot = float(z @ beta)
     return dot if math.isfinite(dot) else 0.0
 
@@ -306,8 +319,10 @@ def surface_trace(
     if not informed:
         return None
     if how == "blended":
-        weight = sum(float(item["evidence"]) for item in informed)
-        advantage = sum(float(item["value"]) * float(item["evidence"]) for item in informed) / weight
+        base_h = float(min(horizons_for(engine_id)))
+        weights = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** 0.35) for item in informed]
+        weight = sum(weights)
+        advantage = sum(float(item["value"]) * w for item, w in zip(informed, weights, strict=True)) / weight
     else:
         advantage = max(float(item["value"]) for item in informed)
     return {"advantage": float(advantage), "how": how, "horizons": informed, "coordinates": feature_vector(features)}

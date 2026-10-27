@@ -250,12 +250,16 @@ def test_no_time_rule_sample_gate_or_entry_change():
 def test_ridge_dot_clamps_negative_net_subsidy_and_fades_positive_posterior_by_one_hour(tmp_path):
     stats = cs._blank_ridge()
     # Train negative beta[0] (winner saturation: higher net -> lower remaining advantage)
-    cs._update_ridge(stats, {"net": 0.0040, "mfe": 0.0050, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, -0.0030, 5.0, T0, "DAY_V2")
-    cs._update_ridge(stats, {"net": 0.0010, "mfe": 0.0050, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, 0.0010, 5.0, T0, "DAY_V2")
-    at_mean = cs._ridge_dot(stats, {"net": 0.0025, "mfe": 0.0050, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, T0, "DAY_V2")
-    deep_loser = cs._ridge_dot(stats, {"net": -0.0080, "mfe": 0.0050, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, T0, "DAY_V2")
+    cs._update_ridge(stats, {"net": 0.0040, "mfe": 0.0010, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, -0.0030, 5.0, T0, "DAY_V2")
+    cs._update_ridge(stats, {"net": 0.0010, "mfe": 0.0010, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, 0.0010, 5.0, T0, "DAY_V2")
+    at_mean = cs._ridge_dot(stats, {"net": 0.0025, "mfe": 0.0010, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, T0, "DAY_V2")
+    deep_loser = cs._ridge_dot(stats, {"net": -0.0080, "mfe": 0.0005, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, T0, "DAY_V2")
     # Deeply negative net must not receive a positive hold subsidy above mean net when beta[0] < 0
     assert deep_loser == pytest.approx(at_mean)
+    # Giving back profit from a +40bps peak must not relieve saturation above the peak state
+    at_peak = cs._ridge_dot(stats, {"net": 0.0040, "mfe": 0.00466, "mae": 0.0010, "giveback": 0.0, "dist_high": 0.0, "slope": 0.0, "age_min": 10.0}, T0, "DAY_V2")
+    after_giveback = cs._ridge_dot(stats, {"net": 0.0010, "mfe": 0.00466, "mae": 0.0010, "giveback": 0.0030, "dist_high": 0.0030, "slope": -0.0010, "age_min": 10.0}, T0, "DAY_V2")
+    assert after_giveback <= at_peak + 1e-12
 
     path = _db(tmp_path)
     cs.record_advantage(

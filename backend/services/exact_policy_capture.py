@@ -431,6 +431,24 @@ def record_live_check(
             except Exception:
                 logger.debug("EXACT_POLICY_STATE_ID_FAILED", exc_info=True)
         _insert_check(conn, episode_id, symbol, decision, bid, ask, candidate_id)
+        feats = decision.get("features") if isinstance(decision.get("features"), dict) else {}
+        conn.execute(
+            """
+            UPDATE policy_episodes
+            SET mfe=MAX(COALESCE(mfe, 0.0), ?),
+                mae=MAX(COALESCE(mae, 0.0), ?),
+                prev_net=?,
+                last_check_at=?
+            WHERE id=?
+            """,
+            (
+                _float(feats.get("mfe")),
+                _float(feats.get("mae")),
+                _float(decision.get("net")),
+                float(decision.get("at") or time.time()),
+                episode_id,
+            ),
+        )
         conn.commit()
     except sqlite3.Error:
         logger.debug("EXACT_POLICY_LIVE_CHECK_FAILED", exc_info=True)
@@ -646,14 +664,10 @@ def _close_real_if_resolved(conn: sqlite3.Connection, row: sqlite3.Row, moment: 
         "SELECT checked_at, action, reason, bid FROM policy_episode_checks WHERE episode_id=? ORDER BY checked_at DESC LIMIT 1",
         (int(row["id"]),),
     ).fetchone()
-    conn.execute(
-        """
-        UPDATE policy_episodes
-        SET status='CLOSED', kind=?, net=?, exit_at=?, label_available_at=?, learned=1, train_eligible=0, train_applied=0
-        WHERE id=? AND status=?
-        """,
-        (REAL, net, moment, moment, int(row["id"]), OPEN),
-    )
+    excursions = conn.execute(
+        "SELECT MAX(mfe) AS max_mfe, MAX(mae) AS max_mae FROM policy_episode_checks WHERE episode_id=?",
+        (int(row["id"]),),
+    ).fetchone()
     audit_reason = "" if last is None else str(last["reason"] or "")
     trigger_bid = None if last is None else last["bid"]
     existing = conn.execute(
@@ -661,6 +675,25 @@ def _close_real_if_resolved(conn: sqlite3.Connection, row: sqlite3.Row, moment: 
         (int(row["id"]),),
     ).fetchone()
     real_reason = "" if existing is None or existing["exit_reason_real"] is None else str(existing["exit_reason_real"])
+    resolved_reason = real_reason or audit_reason or "LEARNED_CONTINUATION_EXIT"
+    exit_ts = float(last["checked_at"]) if (last is not None and last["checked_at"] is not None) else moment
+    decided_ts = float(row["decided_at"] or exit_ts)
+    hold_s = max(0.0, exit_ts - decided_ts)
+    max_mfe = _float(excursions["max_mfe"]) if excursions is not None else 0.0
+    max_mae = _float(excursions["max_mae"]) if excursions is not None else 0.0
+    conn.execute(
+        """
+        UPDATE policy_episodes
+        SET status='CLOSED', kind=?, net=?, exit_at=?, label_available_at=?,
+            mfe=MAX(COALESCE(mfe, 0.0), ?), mae=MAX(COALESCE(mae, 0.0), ?),
+            exit_reason=COALESCE(NULLIF(exit_reason, ''), ?),
+            exit_bid=COALESCE(exit_bid, ?),
+            hold_sec=COALESCE(hold_sec, ?),
+            learned=1, train_eligible=0, train_applied=0
+        WHERE id=? AND status=?
+        """,
+        (REAL, net, moment, moment, max_mfe, max_mae, resolved_reason, trigger_bid, hold_s, int(row["id"]), OPEN),
+    )
     if audit_reason and real_reason:
         policy_match = 1 if audit_reason == real_reason else 0
     elif last is not None and str(last["action"] or "") == "exit":

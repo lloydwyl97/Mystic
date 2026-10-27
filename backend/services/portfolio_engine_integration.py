@@ -2060,8 +2060,12 @@ class PortfolioEngineIntegration:
                     f"opportunity_id={signal.opportunity_id}",
                 ],
             )
-            logger.warning("DAY_V2_ZERO_SIZE symbol=%s ask=%.6f atr=%.6f", symbol, ask_price, atr_val)
-            _note_exact(db_path, cand, funded=False, reason="ZERO_SIZE")
+            if sized_qty > 0:
+                logger.info("DAY_V2_BUDGET_EXHAUSTED symbol=%s remaining=%.4f target_notional=%.4f", symbol, day_remaining, target_notional)
+                _note_exact(db_path, cand, funded=False, reason="ENGINE_BUDGET_EXHAUSTED")
+            else:
+                logger.warning("DAY_V2_ZERO_SIZE symbol=%s ask=%.6f atr=%.6f", symbol, ask_price, atr_val)
+                _note_exact(db_path, cand, funded=False, reason="ZERO_SIZE")
             return
 
         # Gate through _can_open_position (two-engine contract:
