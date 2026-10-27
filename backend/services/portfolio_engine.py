@@ -23771,14 +23771,16 @@ class PortfolioEngine:
         try:
             with connect_managed(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(paper_trades)").fetchall()}
+                adp_sql = "adaptive_decision_json" if "adaptive_decision_json" in cols else "NULL AS adaptive_decision_json"
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT trade_id, symbol, side, quantity, price, pnl, timestamp,
-                           exit_reason, exit_type, explainability_json
+                           exit_reason, exit_type, explainability_json, {adp_sql}
                     FROM paper_trades
                     WHERE COALESCE(status, 'executed') IN ('executed', 'filled', '')
                       AND COALESCE(exit_type, '') NOT IN (
-                          'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT'
+                          'ADMIN_POSITION_CLEAR', 'STALE_PRE_CORRECTION_POSITION_CLEAR', 'RESEARCH_RESET_EXIT', 'DUST_WRITEOFF'
                       )
                     ORDER BY id DESC
                     LIMIT ?
@@ -23793,6 +23795,20 @@ class PortfolioEngine:
                         parsed = json.loads(raw) if isinstance(raw, str) else raw
                         if isinstance(parsed, dict):
                             ex = parsed
+                adp: dict[str, Any] = {}
+                raw_adp = row["adaptive_decision_json"]
+                if raw_adp:
+                    with contextlib.suppress(Exception):
+                        parsed_adp = json.loads(raw_adp) if isinstance(raw_adp, str) else raw_adp
+                        if isinstance(parsed_adp, dict):
+                            adp = parsed_adp
+                setup_val = ex.get("setup_type") or ex.get("entry_thesis") or adp.get("geometry_setup") or adp.get("setup") or ""
+                reg_val = ex.get("day_route_regime") or ex.get("regime") or adp.get("regime") or ""
+                score_val = ex.get("final_selection_score") if ex.get("final_selection_score") is not None else adp.get("expected_net")
+                sel_key = ex.get("selection_key_used") or (f"{adp.get('symbol', '')}:{adp.get('setup', '')}:{reg_val}".strip(":") if adp.get("setup") else "")
+                why_val = ex.get("why_selected") or (
+                    f"net={(float(adp.get('expected_net') or 0) * 1e4):+.1f}bps size_x={float(adp.get('size_mult') or 1):.2f}" if adp.get("expected_net") is not None else (row["exit_reason"] or "")
+                )
                 out.append(
                     {
                         "trade_id": row["trade_id"],
@@ -23805,16 +23821,16 @@ class PortfolioEngine:
                         "exit_reason": row["exit_reason"] or ex.get("exit_trigger") or "",
                         "exit_type": row["exit_type"] or ex.get("exit_type") or "",
                         "exit_trigger": ex.get("exit_trigger") or row["exit_reason"] or "",
-                        "regime": ex.get("day_route_regime") or ex.get("regime") or "",
-                        "setup_type": ex.get("setup_type") or ex.get("entry_thesis") or "",
-                        "entry_thesis": ex.get("entry_thesis") or ex.get("setup_type") or "",
-                        "why_selected": ex.get("why_selected") or "",
-                        "selection_key_used": ex.get("selection_key_used") or "",
-                        "final_selection_score": ex.get("final_selection_score"),
+                        "regime": reg_val,
+                        "setup_type": setup_val,
+                        "entry_thesis": setup_val,
+                        "why_selected": why_val,
+                        "selection_key_used": sel_key,
+                        "final_selection_score": score_val,
                         "winner_score": ex.get("winner_score"),
                         "runner_up_score": ex.get("runner_up_score"),
-                        "mfe_pct": ex.get("mfe_pct"),
-                        "mae_pct": ex.get("mae_pct"),
+                        "mfe_pct": ex.get("mfe_pct") if ex.get("mfe_pct") is not None else adp.get("mfe"),
+                        "mae_pct": ex.get("mae_pct") if ex.get("mae_pct") is not None else adp.get("mae"),
                         "entry_reason": (f"qty={row['quantity']} @ {row['price']}" if row["quantity"] is not None else ""),
                     }
                 )

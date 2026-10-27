@@ -38,6 +38,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -266,6 +267,7 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, float(value)))
 
 
+@functools.lru_cache(maxsize=8192)
 def _parse_iso(ts: str) -> float | None:
     try:
         return datetime.strptime(str(ts), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
@@ -415,10 +417,29 @@ def _mark_fresh_calibration_target(conn: sqlite3.Connection, db_path: str) -> No
     conn.commit()
 
 
+_schema_initialized_dbs: set[tuple[str, int]] = set()
+_STATE_ROWS_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, list[sqlite3.Row]]]] = {}
+_REPORT_CACHE: dict[tuple[str, str, float], tuple[float, dict[str, Any]]] = {}
+
+
+def _invalidate_adaptive_caches(db_path: str | None = None) -> None:
+    _STATE_ROWS_CACHE.clear()
+    _REPORT_CACHE.clear()
+
+
 def _connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=15000")
+    abs_key = os.path.abspath(db_path)
+    ino = 0
+    size = 0
+    with contextlib.suppress(OSError):
+        st = Path(abs_key).stat()
+        ino = int(st.st_ino)
+        size = int(st.st_size)
+    if size > 0 and (abs_key, ino) in _schema_initialized_dbs:
+        return conn
     _migrate_state_table(conn)
     conn.execute(_STATE_DDL)
     conn.execute(
@@ -495,6 +516,8 @@ def _connect(db_path: str) -> sqlite3.Connection:
         )
         """
     )
+    if ino > 0:
+        _schema_initialized_dbs.add((abs_key, ino))
     return conn
 
 
@@ -606,6 +629,7 @@ def _fold_observation(
         """,
         (*key, n, mean, max(0.0, m2), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))),
     )
+    _invalidate_adaptive_caches()
     return True
 
 
@@ -691,14 +715,42 @@ def _level_of(row: sqlite3.Row, sym: str, stp: str, reg: str) -> str:
     return "related" if (same_sym or same_reg) else "setup"
 
 
+def _db_stamp(db_path: str) -> tuple[str, int, int]:
+    ap = os.path.abspath(db_path)
+    with contextlib.suppress(OSError):
+        st = Path(ap).stat()
+        return (ap, int(st.st_mtime_ns), int(st.st_size))
+    return (ap, 0, 0)
+
+
 def _state_rows(db_path: str, engine_id: str, metrics: tuple[str, ...]) -> list[sqlite3.Row]:
     """Current-economic-version state rows of one engine for the given metrics."""
+    eco = current_economic_version(engine_id)
+    ckey = (*_db_stamp(db_path), engine_id, eco)
+    now_mono = time.monotonic()
+    hit = _STATE_ROWS_CACHE.get(ckey)
+    if hit is not None and (now_mono - hit[0]) < 2.0:
+        by_m = hit[1]
+        out: list[sqlite3.Row] = []
+        for m in metrics:
+            out.extend(by_m.get(m, ()))
+        return out
     try:
         with _connect(db_path) as conn:
-            return conn.execute(
-                f"SELECT symbol, setup, regime, metric, n, ewma, m2, updated_at FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND metric IN ({','.join('?' * len(metrics))})",
-                (engine_id, current_economic_version(engine_id), *metrics),
+            all_rows = conn.execute(
+                "SELECT symbol, setup, regime, metric, n, ewma, m2, updated_at FROM adaptive_metric_state WHERE engine_id=? AND economic_version=?",
+                (engine_id, eco),
             ).fetchall()
+        by_metric: dict[str, list[sqlite3.Row]] = {}
+        for r in all_rows:
+            by_metric.setdefault(str(r["metric"]), []).append(r)
+        if len(_STATE_ROWS_CACHE) > 32:
+            _STATE_ROWS_CACHE.clear()
+        _STATE_ROWS_CACHE[ckey] = (now_mono, by_metric)
+        result: list[sqlite3.Row] = []
+        for m in metrics:
+            result.extend(by_metric.get(m, ()))
+        return result
     except sqlite3.Error:
         return []
 
@@ -3232,6 +3284,11 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
     observations and returns the DAY/SCALP decision for each so a dashboard can
     show exactly what learning currently changes and why.
     """
+    ckey = (*_db_stamp(db_path), "state", 0.0)
+    now_mono = time.monotonic()
+    hit = _REPORT_CACHE.get(ckey)
+    if hit is not None and (now_mono - hit[0]) < 15.0:
+        return hit[1]
     out: dict[str, Any] = {
         "adaptive_state_version": ADAPTIVE_STATE_VERSION,
         "adaptive_state_versions": {DAY_ENGINE: adaptive_format(DAY_ENGINE), SCALP_ENGINE: adaptive_format(SCALP_ENGINE)},
@@ -3292,6 +3349,7 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                             "symbol": k["symbol"],
                             "setup": k["setup"],
                             "regime": k["regime"],
+                            "expected_edge": round(view["claim_gross_mean"], 6),
                             "claim_gross_mean": round(view["claim_gross_mean"], 6),
                             "claim_gross_setup": round(view["claim_gross_setup"], 6),
                             "claim_capture": round(view["claim_capture"], 4),
@@ -3320,6 +3378,7 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
         }
     finally:
         conn.close()
+    _REPORT_CACHE[ckey] = (now_mono, out)
     return out
 
 
@@ -3397,6 +3456,11 @@ def abstention_report(db_path: str, window_days: float = 7.0) -> dict[str, Any]:
     window and their counterfactual markouts. Neither engine vetoes on the flag:
     DAY moves size and rank, SCALP gates on its canonical executable edge.
     """
+    ckey = (*_db_stamp(db_path), "abstention", float(window_days))
+    now_mono = time.monotonic()
+    hit = _REPORT_CACHE.get(ckey)
+    if hit is not None and (now_mono - hit[0]) < 15.0:
+        return hit[1]
     since = time.time() - float(window_days) * 86400.0
     out: dict[str, Any] = {
         "adaptive_state_version": ADAPTIVE_STATE_VERSION,
@@ -3453,11 +3517,13 @@ def abstention_report(db_path: str, window_days: float = 7.0) -> dict[str, Any]:
                     f"SELECT symbol, cycle_ts FROM {table} WHERE cycle_ts>=? AND result=?",
                     (since, "REJECTED:LEARNED_NEGATIVE_EDGE"),
                 ).fetchall()
-            with contextlib.suppress(sqlite3.Error):
-                mark_rows = conn.execute(
-                    "SELECT symbol, setup, regime, evaluated_at, markouts_json, label_horizon, engine_id FROM adaptive_candidate_markouts WHERE engine_id=? AND evaluated_at>=?",
-                    (engine_id, since),
-                ).fetchall()
+            if skip_events:
+                with contextlib.suppress(sqlite3.Error):
+                    mark_rows = conn.execute(
+                        "SELECT symbol, setup, regime, evaluated_at, markouts_json, label_horizon, engine_id "
+                        "FROM adaptive_candidate_markouts WHERE engine_id=? AND evaluated_at>=? ORDER BY id DESC LIMIT 2000",
+                        (engine_id, since),
+                    ).fetchall()
             used: set[int] = set()
             skipped_fw: list[float] = []
             by_key: dict[tuple, list[float]] = {}
@@ -3493,6 +3559,7 @@ def abstention_report(db_path: str, window_days: float = 7.0) -> dict[str, Any]:
             }
     finally:
         conn.close()
+    _REPORT_CACHE[ckey] = (now_mono, out)
     return out
 
 

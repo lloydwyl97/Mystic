@@ -59,8 +59,17 @@ def _api_key_present() -> tuple[bool, str]:
     return True, "configured"
 
 
+_EXCHANGE_AUTH_CACHE: tuple[float, dict[str, Any]] | None = None
+_EXCHANGE_AUTH_TTL_SEC: float = 180.0
+
+
 async def _fetch_exchange_account_auth() -> dict[str, Any]:
-    """Signed Binance.US account probe — permissions and USDT balance only."""
+    """Signed Binance.US account probe — permissions and USDT balance only (cached 180s to protect 1200 weight limit)."""
+    global _EXCHANGE_AUTH_CACHE
+    now_mono = time.monotonic()
+    if _EXCHANGE_AUTH_CACHE is not None and (now_mono - _EXCHANGE_AUTH_CACHE[0]) < _EXCHANGE_AUTH_TTL_SEC:
+        return dict(_EXCHANGE_AUTH_CACHE[1])
+
     import hashlib
     import hmac
 
@@ -133,6 +142,8 @@ async def _fetch_exchange_account_auth() -> dict[str, Any]:
         out["errors"].append(str(exc)[:120])
         logger.debug("live readiness exchange probe failed: %s", exc)
 
+    if out.get("binance_api_auth_status") == "ok":
+        _EXCHANGE_AUTH_CACHE = (now_mono, dict(out))
     return out
 
 
@@ -209,7 +220,7 @@ async def build_live_readiness_report() -> dict[str, Any]:
     usdt = exchange.get("usdt_free_balance")
     if usdt is not None and float(usdt) <= 0:
         blockers.append("USDT free balance is zero")
-    if not live_fields.get("live_test_manual_arm") and live_fields.get("live_test_require_manual_arm"):
+    if live_fields.get("live_test_mode") and not live_fields.get("live_test_manual_arm") and live_fields.get("live_test_require_manual_arm"):
         blockers.append("LIVE_TEST_MANUAL_ARM not set")
     if not permitted:
         blockers.append(f"live_orders_blocked:{block_reason or 'unknown'}")

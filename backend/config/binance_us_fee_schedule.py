@@ -35,11 +35,24 @@ UNIVERSAL_TAKER_FEE_PCT: Final[float] = 0.0002
 TOP_FOUR_SYMBOLS: Final[tuple[str, ...]] = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 
 
+_FEE_VERIFICATION_CACHE: tuple[float, dict[str, Any]] | None = None
+
+
 def fetch_book_spread_half_pct(symbol: str) -> float:
-    """Live half-spread from bookTicker (fraction of mid)."""
+    """Live half-spread from Redis orderbook cache first, falling back to bookTicker."""
+    try:
+        from backend.services.exact_policy_capture import executable_book
+
+        bid, ask = executable_book(symbol)
+        if bid and ask and bid > 0 and ask >= bid:
+            mid = (bid + ask) / 2.0
+            if mid > 0:
+                return (ask - bid) / mid / 2.0
+    except Exception:
+        pass
     try:
         proc = subprocess.run(
-            ["curl", "-s", "--max-time", "15", f"https://api.binance.us/api/v3/ticker/bookTicker?symbol={symbol}"],
+            ["curl", "-s", "--max-time", "5", f"https://api.binance.us/api/v3/ticker/bookTicker?symbol={symbol}"],
             capture_output=True,
             text=True,
             check=False,
@@ -59,6 +72,12 @@ def fetch_book_spread_half_pct(symbol: str) -> float:
 
 def verify_top_four_pairs() -> dict[str, Any]:
     """Verify top-four pairs on Binance.US; return tier + fee assignment with evidence."""
+    import time
+
+    global _FEE_VERIFICATION_CACHE
+    now_mono = time.monotonic()
+    if _FEE_VERIFICATION_CACHE is not None and (now_mono - _FEE_VERIFICATION_CACHE[0]) < 600.0:
+        return _FEE_VERIFICATION_CACHE[1]
     pairs: dict[str, Any] = {}
     for api_sym in TOP_FOUR_SYMBOLS:
         display = f"{api_sym[:-4]}/USDT"
@@ -79,7 +98,7 @@ def verify_top_four_pairs() -> dict[str, Any]:
             "platform_spread": 0.0,
             "notes": ("Advanced Spot: no platform spread per Binance.US fees page. Universal 0.02% taker per Apr 2026 blog (not Tier-0 0.01%)."),
         }
-    return {
+    res = {
         "exchange": EXCHANGE_NAME,
         "verified_at": datetime.now(timezone.utc).isoformat(),
         "fee_schedule_effective_date": FEE_SCHEDULE_EFFECTIVE_DATE,
@@ -94,3 +113,5 @@ def verify_top_four_pairs() -> dict[str, Any]:
             "select pairs (e.g. BNB/USD per blog); top-four USDT are universal 0.02%."
         ),
     }
+    _FEE_VERIFICATION_CACHE = (now_mono, res)
+    return res

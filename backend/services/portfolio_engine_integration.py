@@ -2227,6 +2227,11 @@ class PortfolioEngineIntegration:
         while True:
             try:
                 await self._process_scalp_v2_signals()
+                await beat(
+                    SCALP_V2_LIVE_LOOP_TASK,
+                    self.redis_client,
+                    extra={"interval_sec": self._scalp_v2_entry_interval, "halt_reason": self._scalp_v2_halt_reason, "halt_until": self._scalp_v2_halt_until},
+                )
                 # SCALP labels and folds must not wait for a DAY bar with candidates.
                 last = float(getattr(self, "_last_label_resolve", 0.0) or 0.0)
                 if time.time() - last >= LABEL_RESOLVE_INTERVAL_SEC:
@@ -2235,11 +2240,6 @@ class PortfolioEngineIntegration:
                     db_path = getattr(engine, "db_path", None) if engine is not None else None
                     if db_path:
                         await _asyncio.to_thread(resolve_learning_labels, str(db_path))
-                await beat(
-                    SCALP_V2_LIVE_LOOP_TASK,
-                    self.redis_client,
-                    extra={"interval_sec": self._scalp_v2_entry_interval, "halt_reason": self._scalp_v2_halt_reason, "halt_until": self._scalp_v2_halt_until},
-                )
             except _asyncio.CancelledError:
                 break
             except Exception:

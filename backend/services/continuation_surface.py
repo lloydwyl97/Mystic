@@ -242,10 +242,21 @@ class ContinuationMemory:
 HOLD_ADVANTAGE_METRICS = frozenset(metric_name(horizon) for horizon in HOLD_ADVANTAGE_HORIZONS)
 
 
+_RIDGE_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_META_CACHE: dict[tuple[str, str], tuple[float, tuple[str, str] | None]] = {}
+
+
 def _meta_row(db_path: str, engine: str) -> tuple[str, str] | None:
     import sqlite3
 
+    from backend.services.adaptive_learning import _db_stamp
+
     engine_id = str(engine or "").upper()
+    ckey = (*_db_stamp(db_path), engine_id)
+    now_mono = time.monotonic()
+    hit = _META_CACHE.get(ckey)
+    if hit is not None and (now_mono - hit[0]) < 2.0:
+        return hit[1]
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.Error:
@@ -259,9 +270,11 @@ def _meta_row(db_path: str, engine: str) -> tuple[str, str] | None:
         return None
     finally:
         conn.close()
-    if not row:
-        return None
-    return str(row[0] or ""), str(row[1] or "")
+    res = (str(row[0] or ""), str(row[1] or "")) if row else None
+    if len(_META_CACHE) > 32:
+        _META_CACHE.clear()
+    _META_CACHE[ckey] = (now_mono, res)
+    return res
 
 
 def advantage_authority(db_path: str, engine: str) -> bool:
@@ -339,8 +352,15 @@ def _model_key(engine_id: str) -> str:
 
 
 def _load_ridge(db_path: str, engine_id: str) -> dict[str, Any]:
-    from backend.services.adaptive_learning import _connect
+    import copy
 
+    from backend.services.adaptive_learning import _connect, _db_stamp
+
+    ckey = (*_db_stamp(db_path), engine_id)
+    now_mono = time.monotonic()
+    hit = _RIDGE_CACHE.get(ckey)
+    if hit is not None and (now_mono - hit[0]) < 2.0:
+        return copy.deepcopy(hit[1])
     try:
         conn = _connect(db_path)
     except Exception:
@@ -351,13 +371,18 @@ def _load_ridge(db_path: str, engine_id: str) -> dict[str, Any]:
         return {}
     finally:
         conn.close()
+    if len(_RIDGE_CACHE) > 32:
+        _RIDGE_CACHE.clear()
     if not row or not row["payload"]:
+        _RIDGE_CACHE[ckey] = (now_mono, {})
         return {}
     try:
         payload = json.loads(row["payload"])
     except (TypeError, ValueError):
         return {}
-    return payload.get("horizons") or {} if isinstance(payload, dict) else {}
+    res = (payload.get("horizons") or {}) if isinstance(payload, dict) else {}
+    _RIDGE_CACHE[ckey] = (now_mono, res)
+    return copy.deepcopy(res)
 
 
 def record_advantage(
@@ -424,6 +449,7 @@ def record_advantage(
     finally:
         if own:
             conn.close()
+    _RIDGE_CACHE.clear()
     return True
 
 
@@ -431,7 +457,7 @@ def install_surface(target_db: str, state_db: str, inventory: dict[str, Any], *,
     """Copy advantage rows and the ridge. Trades, fills and entry metrics stay."""
     import sqlite3
 
-    from backend.services.adaptive_learning import _connect
+    from backend.services.adaptive_learning import _connect, _invalidate_adaptive_caches
 
     _connect(target_db).close()
     src = sqlite3.connect(state_db)
@@ -515,6 +541,9 @@ def install_surface(target_db: str, state_db: str, inventory: dict[str, Any], *,
                 ),
             )
         dst.execute("COMMIT")
+        _RIDGE_CACHE.clear()
+        _META_CACHE.clear()
+        _invalidate_adaptive_caches()
         return installed
     except Exception:
         dst.execute("ROLLBACK")

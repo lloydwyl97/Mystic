@@ -1,5 +1,5 @@
 // Mystic Operator Console — dual-engine DAY + SCALP dashboard
-const DASHBOARD_VERSION = 57;
+const DASHBOARD_VERSION = 61;
 const REFRESH_MS = 90000;
 const CANONICAL_REFRESH_MS = 30000;
 const SECONDARY_POLL_MS = 3000;
@@ -31,16 +31,15 @@ const LAZY_TAB_ENDPOINTS = {
         { path: "/api/portfolio-engine/decisions", key: "decisions" },
         { path: "/api/portfolio-engine/rejects", key: "rejects" },
         { path: "/api/portfolio-engine/ai-signals-panel", key: "aiSignalsPanel" },
+        { path: "/api/portfolio-engine/market-data-readiness", key: "marketDataReadiness" },
     ],
     scalp: [
         { path: "/api/scalp/status", key: "scalpStatus", timeoutMs: SCALP_STATUS_TIMEOUT_MS },
-        { path: "/api/scalp/strategies", key: "scalpStrategies" },
         { path: "/api/scalp/positions", key: "scalpPositions" },
         { path: "/api/scalp/trades?limit=100", key: "scalpTrades" },
         { path: "/api/scalp/scoreboard?days=14", key: "scalpScoreboard" },
         { path: "/api/scalp/attribution", key: "scalpAttribution" },
         { path: "/api/scalp/learning-summary", key: "scalpLearning" },
-        { path: "/api/scalp/telemetry", key: "scalpTelemetry" },
     ],
     marketlens: [
         { path: "/api/public/mystic-marketlens-feed", key: "marketlensFeed" },
@@ -338,12 +337,8 @@ function applyTradeFilters() {
 const MARKET_READINESS_REFRESH_MS = 90000;
 
 function startMarketReadinessPolling() {
-    const ep = {
-        path: "/api/portfolio-engine/market-data-readiness",
-        key: "marketDataReadiness",
-    };
-    setTimeout(() => pollOne(ep), 6000);
-    setInterval(() => pollOne(ep), MARKET_READINESS_REFRESH_MS);
+    // Only poll market-data-readiness lazily when the DAY Engine tab is opened
+    // to protect the Binance.US 1200/min API weight budget.
 }
 
 function initRefreshButton() {
@@ -806,6 +801,7 @@ function startPolling() {
         bootstrapDone = true;
         pollOne({ path: "/api/system/health/quick", key: "systemHealth" });
         pollOne({ path: "/api/system/process-health", key: "processHealth" });
+        pollOne({ path: "/api/portfolio-engine/decisions", key: "decisions" });
         pollOne(LAZY_TAB_ENDPOINTS.scalp[0]);
     }
     bootstrap();
@@ -1483,17 +1479,9 @@ function updateProcessHealth(res) {
     setStatus("ph-portfolio", procs.portfolio_engine);
     setStatus("ph-context", procs.ai_market_context);
     setStatus("ph-learning", procs.ai_learning);
-    setStatus("ph-scalp", (optional.scalp_v2_live_loop || {}).running === true);
-    const ldcEl = document.getElementById("ph-live-data-collector");
-    if (ldcEl) {
-        const ldc = optional.live_data_collector || {};
-        const running = ldc.running === true || procs.live_data_collector === true;
-        ldcEl.textContent = running ? "UP (optional)" : "RETIRED";
-        ldcEl.title = ldc.note || "Retired/optional — not part of start_mystic.sh core; OHLCV via live_market_data.";
-        ldcEl.classList.remove("status-up", "status-down");
-        // Retired is expected — do not paint as DOWN/red.
-        if (running) ldcEl.classList.add("status-up");
-    }
+    const scalpLoop = optional.scalp_v2_live_loop || {};
+    const scalpOk = scalpLoop.running === true || (procs.portfolio_engine === true && scalpLoop.age_sec == null);
+    setStatus("ph-scalp", scalpOk);
     const redisEl = document.getElementById("ph-redis");
     if (redisEl) {
         const ok = res && res.redis === "ok";
@@ -1563,7 +1551,12 @@ function refreshCommandCenter() {
         set("cc-day-decision", op.no_trade_reason || dh.capital_idle_reason);
     }
     const lr = window._lastLiveReadiness || {};
-    set("cc-live-ready", lr.ready_for_tiny_live_test === true ? "READY" : (lr.live_orders_block_reason || (lr.live_readiness_blockers || [])[0] || "--"));
+    const isLiveReady = lr.ready_for_full_live === true || lr.ready_for_tiny_live_test === true || lr.live_orders_permitted === true;
+    set("cc-live-ready", isLiveReady ? "READY (LIVE)" : (lr.live_orders_block_reason || (lr.live_readiness_blockers || [])[0] || "--"));
+    const scalpUnrealEl = document.getElementById("cc-scalp-unrealized");
+    if (scalpUnrealEl && scalpUnrealEl.textContent === "--" && window._lastScalpStatus && window._lastScalpStatus.open_scalp_positions === 0) {
+        scalpUnrealEl.textContent = "$0.00";
+    }
 }
 
 /** DAY + account slice of engines panel (called from canonical + scoreboard). */
@@ -2344,6 +2337,12 @@ function updateLiveReadiness(res) {
     set("lr-tiny-ready", yn(d.ready_for_tiny_live_test), !d.ready_for_tiny_live_test);
     set("lr-full-ready", yn(d.ready_for_full_live), !d.ready_for_full_live);
     set("lr-usdt", d.usdt_free_balance != null ? Number(d.usdt_free_balance).toFixed(2) : "?", d.usdt_free_balance != null && Number(d.usdt_free_balance) <= 0);
+    if (d.usdt_free_balance != null) {
+        const liveUsdtEl = document.getElementById("live-binance-usdt");
+        if (liveUsdtEl) liveUsdtEl.textContent = "$" + Number(d.usdt_free_balance).toFixed(2);
+        const liveSyncEl = document.getElementById("live-balance-sync-time");
+        if (liveSyncEl && liveSyncEl.textContent === "--") liveSyncEl.textContent = new Date().toLocaleTimeString();
+    }
     set("lr-can-trade", d.can_trade != null ? yn(d.can_trade) : "?");
     set("lr-can-withdraw", d.can_withdraw != null ? yn(d.can_withdraw) : "?", d.can_withdraw === true);
     set("lr-open-orders", d.open_binance_orders_count != null ? d.open_binance_orders_count : "?");
@@ -2804,7 +2803,8 @@ function updateExecutionMode(data) {
             badge.className = "header__mode header__mode--clickable live-test";
             badge.dataset.effectiveMode = "live-test";
         } else if (effective === "live") {
-            badge.textContent = "DAY LIVE · SCALP PAPER";
+            const scalpLive = !(window._lastScalpStatus && window._lastScalpStatus.scalp_live === false);
+            badge.textContent = scalpLive ? "DAY LIVE · SCALP LIVE" : "DAY LIVE · SCALP PAPER";
             badge.className = "header__mode header__mode--clickable live";
             badge.dataset.effectiveMode = "live";
         } else {
@@ -2833,7 +2833,8 @@ function updateOperator(data) {
             badge.className = "header__mode header__mode--clickable live-test";
             badge.dataset.effectiveMode = "live-test";
         } else if (mode === "live") {
-            badge.textContent = "DAY LIVE · SCALP PAPER";
+            const scalpLive = !(window._lastScalpStatus && window._lastScalpStatus.scalp_live === false);
+            badge.textContent = scalpLive ? "DAY LIVE · SCALP LIVE" : "DAY LIVE · SCALP PAPER";
             badge.className = "header__mode header__mode--clickable live";
             badge.dataset.effectiveMode = "live";
         } else {
@@ -3923,21 +3924,32 @@ function renderAdaptiveState(data) {
     const body = document.getElementById("adaptive-state-body");
     if (!body || !data || !data.engines) return;
     const note = document.getElementById("adaptive-state-note");
-    if (note) note.textContent = (data.adaptive_state_version || "") + (data.half_life_days ? " · half-life " + data.half_life_days + "d" : "");
-    const pct = (v) => (v === null || v === undefined ? "--" : (v * 100).toFixed(3) + "%");
+    const pct = (v) => (v === null || v === undefined ? "--" : (v >= 0 ? "+" : "") + (v * 100).toFixed(3) + "%");
     const rows = [];
+    let totalKeys = 0;
     ["DAY_V2", "SCALP_V2"].forEach(function (engine) {
-        const list = data.engines[engine] || [];
-        list.forEach(function (r) {
+        const list = (data.engines[engine] || []).slice();
+        totalKeys += list.length;
+        const active = list.filter(function (r) {
+            return (Number(r.n || 0) > 0) || (Number(r.n_trade_net || 0) > 0);
+        });
+        const useList = (active.length ? active : list).sort(function (a, b) {
+            return Number(b.n_trade_net || b.n || 0) - Number(a.n_trade_net || a.n || 0);
+        }).slice(0, 20);
+        useList.forEach(function (r) {
             const isDay = engine === "DAY_V2";
-            const move = isDay ? pct(r.expected_move) : pct(r.expected_edge);
+            const move = isDay ? pct(r.expected_net != null ? r.expected_net : r.expected_move) : pct(r.expected_edge != null ? r.expected_edge : r.claim_gross_mean);
             const tgt = isDay ? "×" + (r.objective_atr_mult || 1).toFixed(2) : pct(r.target_pct);
-            const hold = isDay ? "--" : (r.hold_min || 0).toFixed(1) + "m";
+            const hold = isDay ? "surface" : (r.hold_min || 0).toFixed(1) + "m";
+            const nVal = isDay ? (r.n_trade_net != null && r.n_trade_net > 0 ? r.n_trade_net : (r.n || 0)) : (r.n || 0);
             rows.push(
-                "<tr><td>" + escapeHtml(engine) + "</td><td>" + escapeHtml(r.symbol || "") + "</td><td>" + escapeHtml(r.setup || "") + "</td><td>" + escapeHtml(r.regime || "-") + "</td><td>" + move + "</td><td>" + (r.size_mult || 1).toFixed(3) + "</td><td>" + tgt + "</td><td>" + hold + "</td><td>" + (r.confidence || 0).toFixed(3) + "</td><td>" + (r.n || 0) + "</td></tr>"
+                "<tr><td>" + escapeHtml(engine) + "</td><td>" + escapeHtml(r.symbol || "") + "</td><td>" + escapeHtml(r.setup || "") + "</td><td>" + escapeHtml(r.regime || "-") + "</td><td>" + move + "</td><td>" + (r.size_mult || 1).toFixed(3) + "</td><td>" + tgt + "</td><td>" + hold + "</td><td>" + (r.confidence || 0).toFixed(3) + "</td><td>" + Number(nVal).toFixed(1) + "</td></tr>"
             );
         });
     });
+    if (note) {
+        note.textContent = (data.adaptive_state_version || "") + (data.half_life_days ? " · half-life " + data.half_life_days + "d" : "") + (totalKeys ? " · top " + rows.length + " of " + totalKeys + " keys" : "");
+    }
     body.innerHTML = rows.length ? rows.join("") : "<tr><td colspan=\"10\">No current-version observations yet — decisions use priors (size ×1.00, no change).</td></tr>";
 }
 

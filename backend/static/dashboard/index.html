@@ -123,8 +123,7 @@
                 <div class="readiness-card"><span class="readiness-label">Portfolio engine</span><span class="readiness-value" id="ph-portfolio">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Context engine</span><span class="readiness-value" id="ph-context">--</span></div>
                 <div class="readiness-card"><span class="readiness-label">Learning engine</span><span class="readiness-value" id="ph-learning">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">SCALP runner</span><span class="readiness-value" id="ph-scalp">--</span></div>
-                <div class="readiness-card"><span class="readiness-label">Live data collector (retired)</span><span class="readiness-value" id="ph-live-data-collector">--</span></div>
+                <div class="readiness-card"><span class="readiness-label">SCALP V2 loop</span><span class="readiness-value" id="ph-scalp">--</span></div>
             </div>
         </section>
 
@@ -486,10 +485,6 @@
             <pre id="scalp-router-pre" class="panel-pre">--</pre>
         </section>
         <section class="widget widget--full">
-            <h2 class="widget__title">Ranking-only inventory (retired, isolated)</h2>
-            <pre id="scalp-strategies-pre" class="panel-pre">--</pre>
-        </section>
-        <section class="widget widget--full">
             <h2 class="widget__title">SCALP recent trades</h2>
             <div class="widget__table-wrap widget__table-wrap--scroll">
                 <table class="positions-table">
@@ -553,7 +548,7 @@
             </div>
             <div class="widget widget--half" data-engine="scalp">
                 <h2 class="widget__title">Open SCALP positions</h2>
-                <p class="widget__subtitle">SCALP paper ledger — separate from DAY.</p>
+                <p class="widget__subtitle">SCALP V2 live ledger — separate from DAY.</p>
                 <div class="widget__table-wrap">
                     <table class="positions-table">
                         <thead><tr><th>Symbol</th><th>Setup</th><th>Entry</th><th>Net PnL</th><th>Hold (s)</th><th>State</th><th>Next exit</th></tr></thead>
@@ -810,6 +805,6 @@
     </div>
 
     <script src="vendor/chart.umd.min.js?v=4.4.1"></script>
-    <script src="app.js?v=60"></script>
+    <script src="app.js?v=61"></script>
 </body>
 </html>

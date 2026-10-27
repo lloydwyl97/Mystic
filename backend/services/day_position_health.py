@@ -367,8 +367,17 @@ def build_portfolio_health(
                 idle_reason = f"SPREAD_PREFLIGHT_TIGHT_CAP_ONLY_{spread_passing[0]}_PASSES"
             else:
                 idle_reason = "SPREAD_PREFLIGHT_BLOCKS_ALL_SYMBOLS"
-        elif last_execution_block and str(last_execution_block.get("reject_reason") or "").startswith("SPREAD"):
-            idle_reason = f"LAST_EXEC_BLOCKED_{last_execution_block.get('reject_reason')}"
+        elif idle_reason == "CAPITAL_AVAILABLE_AWAITING_BAR_ENTRY":
+            with contextlib.suppress(Exception), sqlite3.connect(f"file:{DATABASE_PATH}?mode=ro", uri=True, timeout=3) as conn:
+                row_d = conn.execute("SELECT result, cycle_ts FROM day_v2_decisions ORDER BY cycle_ts DESC, id DESC LIMIT 4").fetchall()
+                if row_d:
+                    results = [str(r[0] or "") for r in row_d]
+                    if "FILLED" in results:
+                        idle_reason = "FILLED_ON_LATEST_BAR"
+                    else:
+                        top_r = next((r.replace("REJECTED:", "") for r in results if r), "")
+                        if top_r:
+                            idle_reason = top_r
 
     return {
         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
