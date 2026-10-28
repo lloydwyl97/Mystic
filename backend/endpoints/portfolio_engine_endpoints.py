@@ -2062,7 +2062,33 @@ async def get_recent_rejects(limit: int = 50) -> dict[str, Any]:
         limit = min(limit, 500)
 
         engine = get_portfolio_engine()
-        rejects = await engine._get_recent_rejects(limit)
+        rejects = list(await engine._get_recent_rejects(limit))
+        try:
+            with sqlite3.connect(f"file:{DATABASE_PATH}?mode=ro", uri=True, timeout=3) as conn:
+                conn.row_factory = sqlite3.Row
+                for r in conn.execute(
+                    "SELECT symbol, cycle_ts, result, closest, unmet_json FROM day_v2_decisions WHERE result != 'FILLED' ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ):
+                    ts_iso = datetime.fromtimestamp(float(r["cycle_ts"] or 0), tz=timezone.utc).isoformat() if r["cycle_ts"] else ""
+                    res_str = str(r["result"] or "REJECTED")
+                    filter_n = "DAY_V2_ENTRY" if res_str.startswith("REJECTED:") else "DAY_V2_SIGNAL"
+                    reason_s = res_str.replace("REJECTED:", "")
+                    if r["closest"]:
+                        reason_s = f"{reason_s} ({r['closest']})"
+                    rejects.append(
+                        {
+                            "ts": ts_iso,
+                            "symbol": r["symbol"],
+                            "side": "BUY",
+                            "filter_name": filter_n,
+                            "reason": reason_s,
+                        }
+                    )
+            rejects.sort(key=lambda x: str(x.get("ts") or x.get("timestamp") or ""), reverse=True)
+            rejects = rejects[:limit]
+        except Exception:
+            pass
 
         return {
             "success": True,
@@ -2425,10 +2451,43 @@ async def get_ai_signals_panel() -> dict[str, Any]:
         with sqlite3.connect(DATABASE_PATH, timeout=5) as conn:
             conn.row_factory = sqlite3.Row
             for sym in TRADING_SYMBOLS:
-                # ai_candidate_snapshots.symbol is stored in CCXT format ("BTC/USDT"),
-                # while TRADING_SYMBOLS is bus format ("BTCUSDT") — same mismatch
-                # handled by ai_market_context._to_ccxt elsewhere in the pipeline.
                 ccxt_sym = sym if "/" in sym else (f"{sym[:-4]}/USDT" if sym.endswith("USDT") else sym)
+                v2_row = conn.execute(
+                    """
+                    SELECT symbol, setup, regime, evaluated_at, economic_json, features_json
+                    FROM adaptive_candidate_markouts
+                    WHERE engine_id = 'DAY_V2' AND symbol IN (?, ?)
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (sym, ccxt_sym),
+                ).fetchone()
+                if v2_row is not None and v2_row["evaluated_at"]:
+                    import json as _json
+
+                    eco = {}
+                    with contextlib.suppress(Exception):
+                        eco = _json.loads(v2_row["economic_json"] or "{}")
+                    exp_net = float(eco.get("expected_net_edge") or 0.0)
+                    as_of_iso = datetime.fromtimestamp(float(v2_row["evaluated_at"]), tz=timezone.utc).isoformat()
+                    per_symbol.append(
+                        {
+                            "symbol": sym,
+                            "available": True,
+                            "as_of": as_of_iso,
+                            "decision": "QUALIFIED" if exp_net > 0 else "NO_NET_EDGE",
+                            "confidence": eco.get("confidence_weight"),
+                            "day_route_regime": v2_row["regime"] or None,
+                            "chart_pattern_label": v2_row["setup"] or None,
+                            "chart_pattern_score": round(exp_net * 1e4, 2),
+                            "model_disagreement": eco.get("uncertainty"),
+                            "cross_sectional_rank_delta": eco.get("executable_objective_edge"),
+                            "setup_score": round(exp_net * 1e4, 2),
+                            "execution_rank_delta": eco.get("size_effect"),
+                            "meta_trust_multiplier": eco.get("size_mult"),
+                        }
+                    )
+                    continue
                 row = conn.execute(
                     """
                     SELECT symbol, ts_utc, decision, confidence, day_route_regime,

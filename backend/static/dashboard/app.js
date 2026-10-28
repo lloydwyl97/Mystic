@@ -1,5 +1,5 @@
 // Mystic Operator Console — dual-engine DAY + SCALP dashboard
-const DASHBOARD_VERSION = 61;
+const DASHBOARD_VERSION = 62;
 const REFRESH_MS = 90000;
 const CANONICAL_REFRESH_MS = 30000;
 const SECONDARY_POLL_MS = 3000;
@@ -347,18 +347,13 @@ function initRefreshButton() {
     btn.addEventListener("click", function () {
         btn.disabled = true;
         btn.textContent = "…";
-        const promises = [pollOne(CANONICAL_ENDPOINT)].concat(
-            ENDPOINTS.map(function (ep, i) {
-                return new Promise(function (resolve) {
-                    setTimeout(function () { resolve(pollOne(ep)); }, i * 400);
-                });
-            })
-        ).concat([
-            pollOne({
-                path: "/api/portfolio-engine/market-data-readiness",
-                key: "marketDataReadiness",
-            }),
-        ]);
+    const promises = [pollOne(CANONICAL_ENDPOINT)].concat(
+        BACKGROUND_ENDPOINTS.map(function (ep, i) {
+            return new Promise(function (resolve) {
+                setTimeout(function () { resolve(pollOne(ep)); }, i * 250);
+            });
+        })
+    );
         Promise.all(promises).then(function () {
             btn.textContent = "↻";
             btn.disabled = false;
@@ -1054,6 +1049,12 @@ function updateScalpEngineStatus(res, stale) {
     const statusLabel = stale ? (active ? "RUNNING (stale)" : "STOPPED (stale)") : (active ? "RUNNING" : "STOPPED");
     set("eng-scalp-status", statusLabel);
     set("scalp-runner", statusLabel);
+    const phScalpEl = document.getElementById("ph-scalp");
+    if (phScalpEl && !stale) {
+        phScalpEl.textContent = active ? "UP" : "DOWN";
+        phScalpEl.classList.remove("status-up", "status-down");
+        phScalpEl.classList.add(active ? "status-up" : "status-down");
+    }
     ["eng-scalp-status", "scalp-runner"].forEach(function (id) {
         const el = document.getElementById(id);
         if (!el) return;

@@ -258,50 +258,23 @@ def scalp_attribution(days: int | None = Query(None, ge=1, le=365)) -> dict[str,
 
 @router.get("/learning-summary")
 def scalp_learning_summary(limit: int = Query(20, ge=1, le=200)) -> dict[str, Any]:
-    """Scalp learning tables — attribution, post-trade reviews, strategy weights."""
+    """Scalp learning tables — live SCALP_V2 attribution, value model status, and setup performance."""
     try:
-        with _ro_conn() as conn:
-            reviews = _rows(
-                conn,
-                """
-                SELECT trade_id, symbol, closed_at_utc, review_json, ingested_at_utc
-                FROM scalp_post_trade_feature_reviews
-                ORDER BY closed_at_utc DESC
-                LIMIT ?
-                """,
-                (limit,),
-            )
-            weights = _rows(
-                conn,
-                """
-                SELECT symbol, regime, component_name, weight, sample_count,
-                       good_count, bad_count, net_expectancy, updated_at
-                FROM scalp_strategy_score_weights
-                ORDER BY updated_at DESC, weight DESC
-                LIMIT 100
-                """,
-            )
-            attribution = _rows(
-                conn,
-                """
-                SELECT trade_id, symbol, micro_regime, scalp_setup, outcome_reason,
-                       net_pnl_after_fees, exit_reason, created_at
-                FROM scalp_outcome_attribution
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            )
-        from backend.services.scalp_v2.live_dashboard import live_closed_sell_count
+        from backend.services.scalp_v2.continuation_value import status as value_status
+        from backend.services.scalp_v2.live_dashboard import live_attribution, live_closed_sell_count, live_trades
 
-        sell_count = live_closed_sell_count(_live_db_path())
+        db = _live_db_path()
+        sell_count = live_closed_sell_count(db)
+        attr = live_attribution(db, days=14)
+        recent = [t for t in (live_trades(db, limit=limit * 2).get("trades") or []) if str(t.get("side") or "").upper() == "SELL"][:limit]
+        val_stat = value_status(db)
         return {
             "engine": "scalp",
             "closed_sells": int(sell_count),
             "first_close_ready": int(sell_count) > 0,
-            "outcome_attribution": attribution,
-            "post_trade_reviews": reviews,
-            "strategy_score_weights": weights,
+            "outcome_attribution": recent,
+            "post_trade_reviews": [val_stat] if val_stat else [],
+            "strategy_score_weights": attr.get("by_setup") or [],
         }
     except FileNotFoundError as exc:
         return {

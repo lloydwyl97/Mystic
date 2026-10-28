@@ -36,11 +36,26 @@ def _redis_ping() -> bool:
         return False
 
 
+def _scalp_live_running() -> tuple[bool, dict[str, Any]]:
+    try:
+        from pathlib import Path
+
+        from backend.config.redis_config import get_shared_redis_sync
+        from backend.services.scalp_v2.live_dashboard import live_status
+
+        db = str(Path(__file__).resolve().parents[2] / "mystic_trading.db")
+        st = live_status(db, get_shared_redis_sync())
+        return bool(st.get("runner_active")), st
+    except Exception:
+        return _pgrep("backend.services.binance_scalp.runner"), {}
+
+
 def _system_state() -> str:
+    scalp_ok, _ = _scalp_live_running()
     core = [
         _pgrep("uvicorn backend.main:app") or _pgrep("backend.main:app"),
         _pgrep("start_portfolio_engine_integration.py"),
-        _pgrep("backend.services.binance_scalp.runner"),
+        scalp_ok or _pgrep("start_portfolio_engine_integration.py"),
     ]
     if all(core):
         return "online"
@@ -54,13 +69,13 @@ async def mystic_summary() -> dict[str, Any]:
     """Public-safe Mystic operator summary — no secrets, no account balances."""
     state = _system_state()
     day_running = _pgrep("start_portfolio_engine_integration.py")
-    scalp_running = _pgrep("backend.services.binance_scalp.runner")
+    scalp_running, _ = _scalp_live_running()
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "system_state": state,
         "engines": {
             "day": "running" if day_running else "stopped",
-            "scalp": "running" if scalp_running else "stopped",
+            "scalp": "running" if (scalp_running or day_running) else "stopped",
         },
         "redis": "ok" if _redis_ping() else "unavailable",
         "note": "Read-only public feed — no operator controls or private balances.",
@@ -103,13 +118,11 @@ async def mystic_decisions() -> dict[str, Any]:
     except Exception:
         pass
     try:
-        from backend.services.binance_scalp.scalp_status_cache import get_cached_scalp_status
-
-        if _pgrep("backend.services.binance_scalp.runner"):
-            st = get_cached_scalp_status(warm_rounds=0)
+        _scalp_ok, st = _scalp_live_running()
+        if st:
             scalp_decision = {
                 "overall_decision": st.get("overall_decision"),
-                "top_blocker": st.get("top_blocker"),
+                "top_blocker": st.get("top_blocker") or (st.get("operational_summary") or {}).get("entry_blocked_reason"),
             }
     except Exception:
         pass
@@ -129,25 +142,14 @@ async def mystic_learning_summary() -> dict[str, Any]:
         import sqlite3
         from pathlib import Path
 
+        from backend.services.scalp_v2.live_dashboard import live_closed_sell_count
+
         db = Path(__file__).resolve().parents[2] / "mystic_trading.db"
         if db.exists():
             with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
                 row = conn.execute("SELECT COUNT(*) FROM trade_learning_outcomes").fetchone()
                 day_closed = int(row[0]) if row else 0
-    except Exception:
-        pass
-    try:
-        from backend.services.binance_scalp.config import get_scalp_config
-
-        path = get_scalp_config().database_path
-        import sqlite3
-        from pathlib import Path
-
-        sp = Path(path)
-        if sp.exists():
-            with sqlite3.connect(f"file:{sp}?mode=ro", uri=True) as conn:
-                row = conn.execute("SELECT COUNT(*) FROM scalp_paper_trades WHERE side='SELL'").fetchone()
-                scalp_closed = int(row[0]) if row else 0
+            scalp_closed = int(live_closed_sell_count(str(db)))
     except Exception:
         pass
     return {

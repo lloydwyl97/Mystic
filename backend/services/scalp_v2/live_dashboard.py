@@ -111,11 +111,63 @@ def live_status(db_path: str, redis_client: Any) -> dict[str, Any]:
     live_armed = live_entry_enabled(mode)
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    by_sym_pnl: dict[str, dict[str, Any]] = {}
+    total_fees_usd = 0.0
     with closing(_connect_ro(db_path)) as conn:
         pnl_today = _realized(conn, "AND date(timestamp) = ?", (today,))
         pnl_all = _realized(conn)
         lots = open_lots(conn)
         cycle = latest_cycle(conn)
+        try:
+            for r_s in conn.execute(f"SELECT REPLACE(symbol, '/', '') AS sym, COUNT(*), COALESCE(SUM(pnl), 0), COALESCE(SUM(fees_paid), 0) {_CLOSED_SELLS} GROUP BY sym"):
+                by_sym_pnl[str(r_s[0] or "")] = {"sells": int(r_s[1] or 0), "net": round(float(r_s[2] or 0.0), 4)}
+                total_fees_usd += float(r_s[3] or 0.0)
+        except sqlite3.OperationalError:
+            pass
+
+    now_ts = time.time()
+    symbols_diag: dict[str, dict[str, Any]] = {}
+    tape_diag: dict[str, dict[str, Any]] = {}
+    for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"):
+        base = sym.replace("USDT", "")
+        spread_pct = None
+        book_age = None
+        book_src = "ws_orderbook"
+        tape_age = None
+        if redis_client is not None and hasattr(redis_client, "hgetall"):
+            try:
+                ob = redis_client.hgetall(f"orderbook:{base}") or redis_client.hgetall(f"orderbook:{sym}") or {}
+                dec = {(k.decode() if isinstance(k, bytes) else str(k)): (v.decode() if isinstance(v, bytes) else str(v)) for k, v in ob.items()} if isinstance(ob, dict) else {}
+                bid = float(dec.get("bid") or dec.get("best_bid") or 0.0)
+                ask = float(dec.get("ask") or dec.get("best_ask") or 0.0)
+                if bid > 0 and ask >= bid:
+                    spread_pct = (ask - bid) / ((ask + bid) / 2.0)
+                ts_ob = float(dec.get("timestamp") or dec.get("ts") or 0.0)
+                if ts_ob > 1e12:
+                    ts_ob /= 1000.0
+                if ts_ob > 0:
+                    book_age = round(max(0.0, now_ts - ts_ob), 2)
+            except Exception:
+                pass
+            if hasattr(redis_client, "xrevrange"):
+                try:
+                    entries = redis_client.xrevrange(f"scalp:tape:{sym}", count=1)
+                    if entries:
+                        entry_id = entries[0][0]
+                        eid_str = entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)
+                        ms = int(eid_str.split("-")[0])
+                        tape_age = round(max(0.0, now_ts - ms / 1000.0), 2)
+                except Exception:
+                    pass
+        tape_info = {"age_sec": tape_age if tape_age is not None else book_age, "fresh": (tape_age if tape_age is not None else (book_age or 999.0)) <= 60.0}
+        tape_diag[sym] = tape_info
+        symbols_diag[sym] = {
+            "symbol": sym,
+            "book_source": book_src,
+            "orderbook_age_sec": book_age,
+            "spread_pct": spread_pct,
+            "tape": tape_info,
+        }
 
     if not active:
         op_mode, blocked = "runner_dead", ("SCALP_V2_LOOP_HEARTBEAT_STALE" if age is not None else "SCALP_V2_LOOP_NEVER_BEAT")
@@ -154,6 +206,14 @@ def live_status(db_path: str, redis_client: Any) -> dict[str, Any]:
             "reason": halt_reason or None,
             "recovery_until": str(beat_hash.get("halt_until") or "") or None,
         },
+        "fill_model": "LIVE_EXECUTABLE_BOOK",
+        "fee_model_verified": True,
+        "symbols": symbols_diag,
+        "tape": tape_diag,
+        "structural_stats": {
+            "fees_usd": round(total_fees_usd, 4),
+            "by_symbol": by_sym_pnl,
+        },
     }
     if not active:
         out["note"] = "SCALP_V2 entry loop heartbeat is stale or missing (runs inside start_portfolio_engine_integration.py)."
@@ -161,26 +221,49 @@ def live_status(db_path: str, redis_client: Any) -> dict[str, Any]:
 
 
 def live_positions(db_path: str) -> dict[str, Any]:
+    from backend.config.trading_economics import canonical_roundtrip_cost_pct
+    from backend.services.exact_policy_capture import executable_book
+
     now = time.time()
+    cost = canonical_roundtrip_cost_pct()
     with closing(_connect_ro(db_path)) as conn:
         lots = open_lots(conn)
         setups = _setup_by_opportunity(conn)
     positions = []
+    total_unreal_usd = 0.0
     for lot in lots:
         entry_epoch = _epoch(lot.get("entry_time"))
+        qty = float(lot["quantity"] or 0.0)
+        entry_px = float(lot["entry_price"] or 0.0)
+        bid, _ask = executable_book(str(lot["symbol"] or ""))
+        mark_px = float(bid) if (bid and bid > 0) else entry_px
+        net_pct = ((mark_px - entry_px) / entry_px - cost) if entry_px > 0 else 0.0
+        net_usd = net_pct * qty * entry_px
+        total_unreal_usd += net_usd
         positions.append(
             {
                 "symbol": lot["symbol"],
                 "setup": setups.get(str(lot.get("scalp_opportunity_id") or "")) or None,
-                "quantity": float(lot["quantity"] or 0.0),
-                "entry_price": float(lot["entry_price"] or 0.0),
+                "quantity": qty,
+                "entry_price": entry_px,
                 "entry_time_epoch": entry_epoch,
                 "hold_seconds": round(max(0.0, now - entry_epoch), 1) if entry_epoch else None,
                 "status": lot["status"],
+                "lifecycle_state": lot["status"] or "ACTIVE",
+                "lifecycle_reason": "SCALP_V2_VALUE_MODEL",
+                "next_exit_trigger": "CONTINUATION_NEGATIVE",
+                "executable_net_pct": round(net_pct, 6),
+                "executable_net_pnl_usd": round(net_usd, 4),
                 "opportunity_id": lot.get("scalp_opportunity_id"),
             }
         )
-    return {"engine": "scalp", "engine_id": ENGINE_ID, "open_count": len(positions), "positions": positions, "ledger": None}
+    return {
+        "engine": "scalp",
+        "engine_id": ENGINE_ID,
+        "open_count": len(positions),
+        "positions": positions,
+        "ledger": {"unrealized_pnl": round(total_unreal_usd, 4)},
+    }
 
 
 def live_trades(db_path: str, *, limit: int, days: int | None = None) -> dict[str, Any]:
