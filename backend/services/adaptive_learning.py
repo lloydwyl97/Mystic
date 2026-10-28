@@ -788,6 +788,15 @@ def _lattice(
     key_n: dict[str, float] = dict.fromkeys(weights, 0.0)
     is_hold_adv = bool(weights) and all(str(m).startswith("hold_adv_") for m in weights)
     is_claim_gross = bool(weights) and set(weights) == {"claim_gross"}
+    if is_hold_adv and engine_id == DAY_ENGINE:
+        scaled_weights: dict[str, float] = {}
+        for m, w in weights.items():
+            try:
+                h = float(str(m).split("_")[-1])
+                scaled_weights[m] = float(w) * (min(1.0, 900.0 / max(900.0, h)) ** 0.5)
+            except ValueError:
+                scaled_weights[m] = float(w)
+        weights = scaled_weights
     for row in rows:
         metric_w = float(weights.get(str(row["metric"]), 0.0))
         raw_n = float(row["n"] or 0.0)
