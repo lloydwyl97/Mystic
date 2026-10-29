@@ -788,7 +788,7 @@ def _lattice(
     key_n: dict[str, float] = dict.fromkeys(weights, 0.0)
     is_hold_adv = bool(weights) and all(str(m).startswith("hold_adv_") for m in weights)
     is_claim_gross = bool(weights) and set(weights) == {"claim_gross"}
-    if is_hold_adv and engine_id == DAY_ENGINE:
+    if is_hold_adv and engine_id == DAY_ENGINE and len(weights) > 1:
         scaled_weights: dict[str, float] = {}
         for m, w in weights.items():
             try:

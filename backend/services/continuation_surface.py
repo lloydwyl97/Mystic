@@ -144,13 +144,16 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
         return 0.0
     raw_ft = dict(features or {})
     if float(raw_ft.get("age_min") or 0.0) > 1e-12:
+        age_m = float(raw_ft.get("age_min") or 0.0)
         mfe_v = max(0.0, float(raw_ft.get("mfe") or 0.0))
         mae_v = max(0.0, float(raw_ft.get("mae") or 0.0))
         gb_v = max(0.0, float(raw_ft.get("giveback") or 0.0))
         net_v = float(raw_ft.get("net") or 0.0)
-        raw_ft["net"] = max(net_v, mfe_v - 0.00066)
-        if mfe_v >= 0.0020:
-            raw_ft["mae"] = max(mae_v, gb_v)
+        curr_mae = min(mae_v, max(0.0, -net_v - 0.00066)) if mae_v > 0.0 else max(0.0, -net_v - 0.00066)
+        raw_ft["mae"] = curr_mae if (age_m >= 12.0 and mfe_v < 0.0004) else (0.40 * curr_mae)
+        if mfe_v >= 0.0040 and gb_v >= 0.25 * mfe_v:
+            raw_ft["net"] = max(net_v, mfe_v - 0.00066)
+            raw_ft["mae"] = max(raw_ft["mae"], 1.5 * gb_v)
     vec = feature_vector(raw_ft)
     if float(vec[6]) <= 1e-12 or all(abs(v) <= 1e-12 for v in vec[1:]):
         return 0.0
@@ -315,9 +318,10 @@ def surface_trace(
         if evidence <= 0:
             continue
         posterior = float(view["mean"])
-        fade_horizon = min(float(horizon), 3600.0)
-        if posterior > 0.0 and age_sec > 0.0 and fade_horizon > 0.0:
-            posterior = posterior * max(0.0, 1.0 - age_sec / fade_horizon)
+        fade_horizon = float(horizon)
+        rem_fade = max(0.0, 1.0 - age_sec / fade_horizon) if (age_sec > 0.0 and fade_horizon > 0.0) else 1.0
+        if posterior > 0.0 and age_sec > 0.0:
+            posterior = posterior * rem_fade
         ridge_dot = _ridge_dot(ridge.get(str(horizon)) or _blank_ridge(), features, now, engine_id) if age_sec > 0.0 else 0.0
         informed.append(
             {
@@ -325,6 +329,7 @@ def surface_trace(
                 "posterior": posterior,
                 "ridge": ridge_dot,
                 "evidence": evidence,
+                "rem_fade": max(0.10, rem_fade),
                 "value": posterior + ridge_dot,
             }
         )
@@ -332,7 +337,7 @@ def surface_trace(
         return None
     if how == "blended":
         base_h = float(min(horizons_for(engine_id)))
-        weights = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** 0.35) for item in informed]
+        weights = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** 0.15) * float(item.get("rem_fade", 1.0)) for item in informed]
         weight = sum(weights)
         advantage = sum(float(item["value"]) * w for item, w in zip(informed, weights, strict=True)) / weight
     else:

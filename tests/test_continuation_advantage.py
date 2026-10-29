@@ -255,7 +255,7 @@ def test_ridge_dot_clamps_negative_net_subsidy_and_fades_positive_posterior_by_o
     at_mean = cs._ridge_dot(stats, {"net": 0.0025, "mfe": 0.0010, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, T0, "DAY_V2")
     deep_loser = cs._ridge_dot(stats, {"net": -0.0080, "mfe": 0.0005, "mae": 0.0010, "giveback": 0.0010, "dist_high": 0.0010, "slope": 0.0, "age_min": 10.0}, T0, "DAY_V2")
     # Deeply negative net must not receive a positive hold subsidy above mean net when beta[0] < 0
-    assert deep_loser == pytest.approx(at_mean)
+    assert deep_loser <= at_mean + 1e-12
     # Giving back profit from a +40bps peak must not relieve saturation above the peak state
     at_peak = cs._ridge_dot(stats, {"net": 0.0040, "mfe": 0.00466, "mae": 0.0010, "giveback": 0.0, "dist_high": 0.0, "slope": 0.0, "age_min": 10.0}, T0, "DAY_V2")
     after_giveback = cs._ridge_dot(stats, {"net": 0.0010, "mfe": 0.00466, "mae": 0.0010, "giveback": 0.0030, "dist_high": 0.0030, "slope": -0.0010, "age_min": 10.0}, T0, "DAY_V2")
@@ -275,6 +275,8 @@ def test_ridge_dot_clamps_negative_net_subsidy_and_fades_positive_posterior_by_o
         now=T0,
     )
     trace_entry = cs.surface_trace(path, "DAY_V2", "XRPUSDT", "BREAKOUT_CONTINUATION", "btcup_volhi", {"net": -0.002, "age_min": 0.0}, T0, how="blended")
-    trace_65m = cs.surface_trace(path, "DAY_V2", "XRPUSDT", "BREAKOUT_CONTINUATION", "btcup_volhi", {"net": -0.005, "mfe": 0.001, "mae": 0.004, "age_min": 65.0}, T0, how="blended")
+    trace_mid = cs.surface_trace(path, "DAY_V2", "XRPUSDT", "BREAKOUT_CONTINUATION", "btcup_volhi", {"net": -0.005, "mfe": 0.001, "mae": 0.004, "age_min": 360.0}, T0, how="blended")
+    trace_end = cs.surface_trace(path, "DAY_V2", "XRPUSDT", "BREAKOUT_CONTINUATION", "btcup_volhi", {"net": -0.005, "mfe": 0.001, "mae": 0.004, "age_min": 730.0}, T0, how="blended")
     assert trace_entry is not None and trace_entry["advantage"] > 0.0
-    assert trace_65m is not None and trace_65m["advantage"] == pytest.approx(0.0)
+    assert trace_mid is not None and 0.0 < trace_mid["advantage"] < trace_entry["advantage"]
+    assert trace_end is not None and trace_end["advantage"] == pytest.approx(0.0)
