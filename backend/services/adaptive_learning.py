@@ -1517,12 +1517,13 @@ def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, 
             continue
         n = rec["n"]
         b = rec["claim_raw"]
+        b_center = (rec["claim_raw_sq"] / b) if (b > 1e-9 and rec["claim_raw_sq"] > 4.0 * b * b) else b
         lvl = _level_of(rec["row"], sym, stp, reg)
         targets = [acc, acc_same_reg] if (r_stp == stp and bool(reg) and r_reg == reg) else [acc]
         for target_acc in targets:
             bucket = target_acc[lvl]
             bucket[0] += n
-            bucket[1] += n * b
+            bucket[1] += n * b_center
             bucket[2] += n * (rec["claim_raw_x_gross"] - b * rec["claim_gross"])
             bucket[3] += n * max(0.0, rec["claim_raw_sq"] - b * b)
     w_same_reg = acc_same_reg["related"][0] + acc_same_reg["key"][0]

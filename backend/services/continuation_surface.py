@@ -169,8 +169,8 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
         if float(beta[idx_f]) < 0.0 and float(z[idx_f]) < 0.0:
             z[idx_f] = 0.0
     for idx_a in (2, 3, 4):
-        if float(beta[idx_a]) > 0.0 and float(z[idx_a]) > 0.0:
-            z[idx_a] = 0.0
+        if float(beta[idx_a]) > 0.0:
+            beta[idx_a] = 0.0
     dot = float(z @ beta)
     return dot if math.isfinite(dot) else 0.0
 
@@ -337,7 +337,8 @@ def surface_trace(
         return None
     if how == "blended":
         base_h = float(min(horizons_for(engine_id)))
-        weights = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** 0.15) * float(item.get("rem_fade", 1.0)) for item in informed]
+        h_exp = 0.85 if age_sec <= 0.0 else 0.15
+        weights = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** h_exp) * float(item.get("rem_fade", 1.0)) for item in informed]
         weight = sum(weights)
         advantage = sum(float(item["value"]) * w for item, w in zip(informed, weights, strict=True)) / weight
     else:
