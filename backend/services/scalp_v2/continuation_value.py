@@ -583,9 +583,13 @@ def value(db_path: str, symbol: str, setup: str, regime: str, state: dict, entry
     if not per:
         return {"advantage": 0.0, "horizon": None, "horizons": {}, "version": VALUE_VERSION}
     age = max(0.0, _finite((state or {}).get("age_min")))
+    mfe_v = max(0.0, _finite((state or {}).get("mfe")))
+    gb_v = max(0.0, _finite((state or {}).get("giveback")))
+    net_v = _finite((state or {}).get("net"))
     cal_sum = _finite(ent.get("calibrated")) + _finite(ent.get("adaptive"))
     fade = max(0.0, 1.0 - age / 10.0)
-    claim_rem = cal_sum * fade
+    ro_drag = (cal_sum + 0.0010) if (age > 0.0 and mfe_v >= 0.0020 and gb_v >= 0.35 * mfe_v and net_v > 0.0) else 0.0
+    claim_rem = cal_sum * fade - ro_drag
     out: dict[int, float] = {}
     for h, v in per.items():
         beta = use.beta(h)

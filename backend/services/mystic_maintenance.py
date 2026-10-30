@@ -1352,6 +1352,7 @@ def read_status(cfg: MaintConfig | None = None) -> dict[str, Any]:
 
 def maintenance_status_summary(cfg: MaintConfig | None = None) -> dict[str, Any]:
     """Compact block for the portfolio status endpoint."""
+    cfg = cfg or MaintConfig()
     s = read_status(cfg)
     disk = s.get("disk_after") or s.get("disk_before") or {}
     backup = s.get("backup_retention") or {}
