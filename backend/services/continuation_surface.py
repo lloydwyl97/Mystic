@@ -341,6 +341,9 @@ def surface_trace(
         weights = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** h_exp) * float(item.get("rem_fade", 1.0)) for item in informed]
         weight = sum(weights)
         advantage = sum(float(item["value"]) * w for item, w in zip(informed, weights, strict=True)) / weight
+        if age_sec <= 0.0 and len(informed) > 1:
+            short_v = next((float(item["value"]) for item in informed if int(item["horizon"]) == int(base_h)), advantage)
+            advantage = min(float(advantage), short_v)
     else:
         advantage = max(float(item["value"]) for item in informed)
     return {"advantage": float(advantage), "how": how, "horizons": informed, "coordinates": feature_vector(features)}

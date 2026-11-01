@@ -1506,11 +1506,10 @@ def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, 
     pol_cal_rows = _state_rows(db_path, SCALP_ENGINE, ("policy_calibration",))
     key_pol_cal = 0.0
     for prow in pol_cal_rows:
-        if _norm_symbol(prow["symbol"]) == sym and str(prow["setup"] or "").upper() == stp and str(prow["regime"] or "").lower() == reg:
-            pn = float(prow["n"] or 0.0) * _decay_factor(str(prow["updated_at"] or ""), moment, SCALP_ENGINE)
-            if pn >= 1.8 and float(prow["ewma"] or 0.0) < 0.0:
+        if float(prow["n"] or 0.0) >= 1.8 and float(prow["ewma"] or 0.0) < 0.0:
+            if _norm_symbol(prow["symbol"]) == sym and str(prow["setup"] or "").upper() == stp and str(prow["regime"] or "").lower() == reg:
                 key_pol_cal = float(prow["ewma"])
-            break
+                break
     keys: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in claim_rows:
         if _is_forensic_key(SCALP_ENGINE, row["symbol"], row["setup"], row["regime"]):
