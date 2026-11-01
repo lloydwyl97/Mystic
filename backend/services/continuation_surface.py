@@ -143,6 +143,9 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
     if float(stats.get("n") or 0.0) <= 0:
         return 0.0
     raw_ft = dict(features or {})
+    mfe_v = 0.0
+    gb_v = 0.0
+    net_v = 0.0
     if float(raw_ft.get("age_min") or 0.0) > 1e-12:
         age_m = float(raw_ft.get("age_min") or 0.0)
         mfe_v = max(0.0, float(raw_ft.get("mfe") or 0.0))
@@ -151,9 +154,8 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
         net_v = float(raw_ft.get("net") or 0.0)
         curr_mae = min(mae_v, max(0.0, -net_v - 0.00066)) if mae_v > 0.0 else max(0.0, -net_v - 0.00066)
         raw_ft["mae"] = curr_mae if (age_m >= 12.0 and mfe_v < 0.0004) else (0.40 * curr_mae)
-        if mfe_v >= 0.0040 and gb_v >= 0.25 * mfe_v:
-            raw_ft["net"] = max(net_v, mfe_v - 0.00066)
-            raw_ft["mae"] = max(raw_ft["mae"], 1.5 * gb_v)
+        if mfe_v >= 0.0020 and gb_v >= 0.25 * mfe_v:
+            raw_ft["mae"] = max(raw_ft["mae"], 2.5 * gb_v)
     vec = feature_vector(raw_ft)
     if float(vec[6]) <= 1e-12 or all(abs(v) <= 1e-12 for v in vec[1:]):
         return 0.0
@@ -165,6 +167,10 @@ def _ridge_dot(stats: dict[str, Any], features: dict[str, float] | None, now: fl
         beta = np.linalg.solve(xtx, xty)
     except np.linalg.LinAlgError:
         return 0.0
+    if mfe_v >= 0.0020 and gb_v >= 0.25 * mfe_v and float(beta[0]) < 0.0:
+        peak_vec = list(vec)
+        peak_vec[0] = max(net_v, mfe_v - 0.00066)
+        z[0] = float(_standardize(stats, peak_vec)[0])
     for idx_f in (0, 1, 5):
         if float(beta[idx_f]) < 0.0 and float(z[idx_f]) < 0.0:
             z[idx_f] = 0.0
@@ -344,6 +350,13 @@ def surface_trace(
         if age_sec <= 0.0 and len(informed) > 1:
             short_v = next((float(item["value"]) for item in informed if int(item["horizon"]) == int(base_h)), advantage)
             advantage = min(float(advantage), short_v)
+        elif age_sec > 0.0 and features:
+            mfe_now = max(0.0, float(features.get("mfe") or 0.0))
+            gb_now = max(0.0, float(features.get("giveback") or 0.0))
+            net_now = float(features.get("net") or 0.0)
+            slp_now = float(features.get("slope") or 0.0)
+            if mfe_now >= 0.0020 and gb_now >= 0.35 * mfe_now and net_now > 0.0 and slp_now <= 0.0:
+                advantage = min(float(advantage), -1e-5)
     else:
         advantage = max(float(item["value"]) for item in informed)
     return {"advantage": float(advantage), "how": how, "horizons": informed, "coordinates": feature_vector(features)}

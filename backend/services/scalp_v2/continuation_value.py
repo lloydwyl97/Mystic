@@ -460,9 +460,12 @@ class ValueModel:
             a[idx, :] = 0.0
             a[:, idx] = 0.0
             b[idx] = 0.0
-            beta = _evidence_ridge(a, b, float(st["yy"]), float(st["n"]))
+            scale = (6.0 * float(horizon) / float(BAR_SEC)) if float(self.stats.get(300, {}).get("n") or 0.0) > 0.0 else 1.0
+            beta = _evidence_ridge(a * scale, b * scale, float(st["yy"]) * scale, float(st["n"]) * scale)
             if beta is None:
                 return None
+            if float(beta[15]) > 0.0:
+                beta[15] = 0.0
             self._beta[horizon] = beta
         return self._beta[horizon]
 
@@ -585,10 +588,9 @@ def value(db_path: str, symbol: str, setup: str, regime: str, state: dict, entry
     age = max(0.0, _finite((state or {}).get("age_min")))
     mfe_v = max(0.0, _finite((state or {}).get("mfe")))
     gb_v = max(0.0, _finite((state or {}).get("giveback")))
-    net_v = _finite((state or {}).get("net"))
     cal_sum = _finite(ent.get("calibrated")) + _finite(ent.get("adaptive"))
     fade = max(0.0, 1.0 - age / 10.0)
-    ro_drag = (cal_sum + 0.0010) if (age > 0.0 and mfe_v >= 0.0020 and gb_v >= 0.35 * mfe_v and net_v > 0.0) else 0.0
+    ro_drag = (cal_sum + 0.0010) if (age > 0.0 and mfe_v >= 0.0015 and gb_v >= 0.35 * mfe_v) else 0.0
     claim_rem = cal_sum * fade - ro_drag
     out: dict[int, float] = {}
     for h, v in per.items():

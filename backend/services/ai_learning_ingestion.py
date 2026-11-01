@@ -436,6 +436,8 @@ def record_position_heartbeat(
     thesis_valid: bool | None = None,
     thesis_score: float = 0.0,
     entry_vwap: float = 0.0,
+    highest_price: float = 0.0,
+    lowest_price: float = 0.0,
     db_path: str = DATABASE_PATH,
 ) -> None:
     """Persist one open-position learning heartbeat (sync)."""
@@ -453,8 +455,8 @@ def record_position_heartbeat(
             ).fetchone()
             prev_hi = float(row[0]) if row and row[0] else entry_price
             prev_lo = float(row[1]) if row and row[1] else entry_price
-            hi = max(prev_hi, mark)
-            lo = min(prev_lo, mark)
+            hi = max(prev_hi, mark, float(highest_price or 0.0))
+            lo = min(prev_lo, mark, float(lowest_price)) if float(lowest_price or 0.0) > 0 else min(prev_lo, mark)
             mfe = (hi - entry_price) / entry_price
             mae = (entry_price - lo) / entry_price
             dist_target = ((thesis_target_level - mark) / mark) if thesis_target_level > 0 else None

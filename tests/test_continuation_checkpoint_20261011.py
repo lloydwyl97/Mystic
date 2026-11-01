@@ -478,12 +478,85 @@ def test_zero_non_claims_and_overlapping_day_horizons_and_end_to_end_loops(tmp_p
     )
     assert hold_dec["action"] == "hold"
 
-    # 4. SCALP profitable rollover lock-in in continuation_value
+    # 4. SCALP profitable rollover lock-in in continuation_value (including fast rollover past 0)
     s_model = cv.ValueModel()
     x0 = cv.vector(cv.entry_position_state(cost), {"cost": cost}, "SOLUSDT", "ORDERBOOK_TAPE_SCALP", "btcdown_volhi")
     s_model.fold([(120, x0, 0.0002, _NOW, 1.0)] * 20, _NOW)
     ent = {"calibrated": 0.0018, "adaptive": 0.0004, "cost": cost}
     rising = cv.value("unused", "SOLUSDT", "ORDERBOOK_TAPE_SCALP", "btcdown_volhi", {"net": 0.0025, "mfe": 0.0032, "mae": 0.0, "giveback": 0.0002, "age_min": 3.0}, ent, model=s_model)
     rolled = cv.value("unused", "SOLUSDT", "ORDERBOOK_TAPE_SCALP", "btcdown_volhi", {"net": 0.0012, "mfe": 0.0032, "mae": 0.0, "giveback": 0.0014, "age_min": 3.0}, ent, model=s_model)
+    rolled_red = cv.value("unused", "SOLUSDT", "ORDERBOOK_TAPE_SCALP", "btcdown_volhi", {"net": -0.0010, "mfe": 0.0032, "mae": 0.0005, "giveback": 0.0032, "age_min": 3.0}, ent, model=s_model)
     assert rising["advantage"] > 0.0
     assert rolled["advantage"] < 0.0
+    assert rolled_red["advantage"] < 0.0
+
+    # 5. DAY rollover lock-in when mfe >= 20 bps, giveback >= 35% * mfe, net > 0, and slope <= 0
+    day_ro = decide_day_continuation(
+        db,
+        symbol="XRPUSDT",
+        setup="BREAKOUT_CONTINUATION__MARKET",
+        regime="btcdown_volhi",
+        entry_price=1.0000,
+        mark=1.0015,
+        low=0.9998,
+        high=1.0035,
+        prev_net=0.0020,
+        age_sec=600.0,
+        atr_at_entry=0.0050,
+        structural_anchor=0.9900,
+        target_price=1.0150,
+        entry_time=_NOW,
+        roundtrip_cost=cost,
+        now=_NOW + 600.0,
+    )
+    assert day_ro["action"] == "exit"
+
+    # 6. SCALP ValueModel multi-horizon information retention under fractional _label_weight
+    import numpy as np
+
+    from backend.services.ai_learning_ingestion import record_position_heartbeat
+    from backend.services.mystic_maintenance import maintenance_status_summary
+
+    rng = np.random.default_rng(11)
+    vm = cv.ValueModel()
+    for h in cv.HORIZONS_SEC:
+        w = (60.0 / float(h)) / 22.0
+        rows_h = []
+        for _ in range(400):
+            net_s = -rng.uniform(0.0, 0.012)
+            mfe_s = rng.uniform(0.0, 0.006)
+            mae_s = max(0.0, -net_s - cost)
+            gb_s = rng.uniform(0.0, mfe_s)
+            age_s = rng.uniform(0.5, 20.0)
+            st_s = {"net": net_s, "mfe": mfe_s, "mae": mae_s, "giveback": gb_s, "age_min": age_s}
+            ent_s = {"cost": cost, "m_ofi": rng.normal(0.0, 1.0), "m_adverse": rng.uniform(0.0, 1.0)}
+            x_s = cv.vector(st_s, ent_s, "SOLUSDT", "ORDERBOOK_TAPE_SCALP", "btcdown_volhi")
+            y_s = -0.25 * (net_s + 0.003) + 0.0008 * ent_s["m_ofi"] - 0.0006 * ent_s["m_adverse"] + rng.normal(0.0, 0.0005)
+            rows_h.append((h, x_s, y_s, _NOW, w))
+        vm.fold(rows_h, _NOW)
+    for h in cv.HORIZONS_SEC:
+        bh = vm.beta(h)
+        assert bh is not None
+        assert sum(1 for v in bh[1:] if abs(float(v)) > 1e-8) >= 8
+        assert float(bh[15]) <= 0.0
+
+    # 7. maintenance_status_summary(cfg=None) does not raise NoneType backup_dir error
+    ms = maintenance_status_summary(None)
+    assert isinstance(ms, dict) and "error" not in ms
+
+    # 8. record_position_heartbeat preserves intra-interval highest_price and lowest_price watermarks
+    record_position_heartbeat(
+        symbol="SOL/USDT",
+        trade_id="test_hb_4064",
+        entry_price=94.99,
+        mark=94.96,
+        entry_time_epoch=_NOW - 300.0,
+        highest_price=95.41,
+        lowest_price=94.795,
+        db_path=db,
+    )
+    hb_row = sqlite3.connect(db).execute("SELECT highest_since_entry, lowest_since_entry, mfe_pct, mae_pct FROM ai_position_heartbeats WHERE trade_id='test_hb_4064'").fetchone()
+    assert hb_row is not None
+    assert hb_row[0] == pytest.approx(95.41)
+    assert hb_row[1] == pytest.approx(94.795)
+    assert hb_row[2] == pytest.approx((95.41 - 94.99) / 94.99)
