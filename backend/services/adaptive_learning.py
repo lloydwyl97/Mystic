@@ -960,7 +960,6 @@ def day_net_expectancy(db_path: str, symbol: str, setup: str, regime: str, *, no
     ``policy_gap`` are reported and are not added.
     """
     rows = _state_rows(db_path, DAY_ENGINE, ("trade_net", "lifecycle_net", "policy_gap", "trade_net_calibration"))
-    now = float(now) if now is not None else _data_clock(rows)
     gap = policy_gap(db_path, DAY_ENGINE, symbol, setup, regime, now=now, rows=rows)
     lat = _lattice(
         [r for r in rows if str(r["metric"]) == "trade_net"],
@@ -3326,8 +3325,7 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
         return out
     try:
         for engine_id, decide in ((DAY_ENGINE, day_decision), (SCALP_ENGINE, scalp_decision)):
-            all_eng_rows = _state_rows(db_path, engine_id, tuple(_PRIORS[engine_id]))
-            eng_clock = _data_clock(all_eng_rows) or None
+            _state_rows(db_path, engine_id, tuple(_PRIORS[engine_id]))
             keys = conn.execute(
                 "SELECT DISTINCT symbol, setup, regime FROM adaptive_metric_state WHERE engine_id=? AND economic_version=? AND setup != ? ORDER BY symbol, setup, regime",
                 (engine_id, current_economic_version(engine_id), MICRO_WEIGHT_KEY[1]),
@@ -3345,7 +3343,7 @@ def adaptive_state_report(db_path: str) -> dict[str, Any]:
                         }
                     )
                     continue
-                view = decide(db_path, k["symbol"], k["setup"], k["regime"], now=eng_clock)
+                view = decide(db_path, k["symbol"], k["setup"], k["regime"])
                 if engine_id == DAY_ENGINE:
                     rows.append(
                         {

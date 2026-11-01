@@ -1384,8 +1384,15 @@ class RealTimeAISignalGenerator:
                 "context_fresh": "1" if ctx_fresh else "0",
                 "content_fresh": "1",
                 "signal_content_stale": "0",
+                "stale": "0",
                 "content_age_sec": "0",
                 "ttl_preserve_skip_reason": "",
+                "reason": "",
+                "reject_reason": "",
+                "action": canonical_side,
+                "signal": canonical_side,
+                "source": "ai_signal_generator",
+                "updated_at": str(time.time()),
                 "context_audit_emit": json.dumps(ctx_defaulted_audit, separators=(",", ":")),
             }
             if sid0 == "day" and feature_health_sidecar:

@@ -531,3 +531,25 @@ def recover_continuation(db_path: str, engine: str = DAY_ENGINE) -> dict[str, An
     finally:
         conn.close()
     return {"status": RECOVERY_FAILED, "reason": "mismatch", "checkpoint_id": saved["id"]}
+
+
+def sync_checkpoint_if_present(db_path: str, engine: str = DAY_ENGINE) -> dict[str, Any] | None:
+    """When ``db_path`` already tracks a continuation checkpoint for ``engine``,
+    write a fresh checkpoint after an intentional surface/ridge install or rebuild
+    and mark recovery OK so the next restart does not fail closed on stale state.
+    """
+    conn = _connect(db_path)
+    try:
+        saved = latest_checkpoint(conn, engine)
+    finally:
+        conn.close()
+    if saved is None:
+        return None
+    written = write_checkpoint(db_path, engine)
+    conn = _connect(db_path)
+    try:
+        _mark(conn, engine, RECOVERY_OK, f"checkpoint {written['id']} synced after surface update")
+        conn.commit()
+    finally:
+        conn.close()
+    return written

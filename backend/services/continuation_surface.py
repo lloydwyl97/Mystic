@@ -552,10 +552,14 @@ def install_surface(target_db: str, state_db: str, inventory: dict[str, Any], *,
         _RIDGE_CACHE.clear()
         _META_CACHE.clear()
         _invalidate_adaptive_caches()
-        return installed
     except Exception:
         dst.execute("ROLLBACK")
         raise
     finally:
         src.close()
         dst.close()
+    from backend.services.continuation_checkpoint import sync_checkpoint_if_present
+
+    for engine in engines:
+        sync_checkpoint_if_present(target_db, engine)
+    return installed

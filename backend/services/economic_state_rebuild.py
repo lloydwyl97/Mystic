@@ -502,6 +502,7 @@ def rebuild_scalp(db_path: str, *, now: float | None = None, apply: bool = False
             raise
         finally:
             conn.close()
+        al._invalidate_adaptive_caches(db_path)
         out["applied"] = True
     return out
 
@@ -610,6 +611,7 @@ def rebuild(db_path: str, *, now: float | None = None, apply: bool = False, work
             ):
                 inserted += 1
         out["day_pending_inserted"] = inserted
+        al._invalidate_adaptive_caches(db_path)
         out["applied"] = True
     return out
 
@@ -1167,6 +1169,7 @@ def regenerate(
             raise
         finally:
             conn.close()
+        al._invalidate_adaptive_caches(db_path)
         out["applied"] = True
     return out
 
