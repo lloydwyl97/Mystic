@@ -845,6 +845,28 @@ def _lattice(
             continue
         mu = (ps * mu + s) / (ps + w)
         level_means[level] = mu
+    if is_hold_adv and engine_id == DAY_ENGINE and stp.endswith(DAY_MARKET_STATE_SUFFIX):
+        w_cr = 0.0
+        s_cr = 0.0
+        n_stp_cr = 0
+        for row in rows:
+            metric_w = float(weights.get(str(row["metric"]), 0.0))
+            raw_n = float(row["n"] or 0.0)
+            if metric_w <= 0 or raw_n <= 0:
+                continue
+            r_sym = _norm_symbol(row["symbol"])
+            r_stp = str(row["setup"] or "").upper()
+            r_reg = str(row["regime"] or "").lower()
+            if r_sym == sym and r_reg == reg and r_stp.endswith(DAY_MARKET_STATE_SUFFIX):
+                w = metric_w * raw_n * _decay_factor(str(row["updated_at"] or ""), moment, engine_id)
+                w_cr += w
+                s_cr += w * float(row["ewma"])
+                if r_stp != stp:
+                    n_stp_cr += 1
+        if n_stp_cr > 0 and w_cr > 0.0:
+            m_cr = s_cr / w_cr
+            mu = 0.75 * mu + 0.25 * m_cr + (0.25 * m_cr if m_cr < 0.0 else 0.0)
+            level_means["key"] = mu
     total_w = nested_w["engine"]
     sigma2 = 0.0
     if total_w > 0:
@@ -1503,12 +1525,32 @@ def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, 
     moment = float(now) if now is not None else _data_clock(claim_rows)
     gross = _lattice(claim_rows, engine_id=SCALP_ENGINE, symbol=symbol, setup=setup, regime=regime, weights={"claim_gross": 1.0}, prior=0.0, now=moment)
     pol_cal_rows = _state_rows(db_path, SCALP_ENGINE, ("policy_calibration",))
-    key_pol_cal = 0.0
+    pol_cal_lat = policy_calibration(db_path, SCALP_ENGINE, symbol, setup, regime, now=moment, rows=pol_cal_rows)
+    key_pol_cal = min(0.0, float(pol_cal_lat["mean"]))
     for prow in pol_cal_rows:
-        if float(prow["n"] or 0.0) >= 1.8 and float(prow["ewma"] or 0.0) < 0.0:
-            if _norm_symbol(prow["symbol"]) == sym and str(prow["setup"] or "").upper() == stp and str(prow["regime"] or "").lower() == reg:
-                key_pol_cal = float(prow["ewma"])
-                break
+        if _norm_symbol(prow["symbol"]) == sym and str(prow["setup"] or "").upper() == stp and str(prow["regime"] or "").lower() == reg:
+            pn = float(prow["n"] or 0.0)
+            pewma = float(prow["ewma"] or 0.0)
+            if pn > 0.0 and pewma < 0.0:
+                cell_cal = pewma if pn >= 1.8 else pewma * (pn / (1.0 + pn))
+                key_pol_cal = min(key_pol_cal, cell_cal)
+            break
+    gross_mean = float(gross["mean"])
+    setup_mean = float(gross["levels"]["setup"])
+    n_reg_keys = len({_norm_symbol(r["symbol"]) for r in claim_rows if str(r["setup"] or "").upper() == stp and str(r["regime"] or "").lower() == reg and float(r["n"] or 0.0) > 0.0})
+    if n_reg_keys > 1 and gross_mean > 0.0:
+        ps_std = PRIOR_STRENGTH / float(len(LATTICE_LEVELS))
+        mu_std = 0.0
+        for lvl in ("setup", "related", "key"):
+            w_l = float(gross["level_weights"][lvl])
+            inner_lvls = LATTICE_LEVELS[LATTICE_LEVELS.index(lvl) :]
+            s_l = sum(
+                float(r["n"] or 0.0) * _decay_factor(str(r["updated_at"] or ""), moment, SCALP_ENGINE) * float(r["ewma"])
+                for r in claim_rows
+                if str(r["metric"]) == "claim_gross" and _level_of(r, sym, stp, reg) in inner_lvls
+            )
+            mu_std = (ps_std * mu_std + s_l) / (ps_std + w_l)
+        gross_mean = mu_std
     keys: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in claim_rows:
         if _is_forensic_key(SCALP_ENGINE, row["symbol"], row["setup"], row["regime"]):
@@ -1557,8 +1599,9 @@ def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, 
         if w > 0:
             center = sb / w if center is None else (PRIOR_STRENGTH * center + sb) / (PRIOR_STRENGTH + w)
     return {
-        "claim_gross_mean": gross["mean"] + key_pol_cal,
-        "claim_gross_setup": gross["levels"]["setup"],
+        "claim_gross_mean": gross_mean + key_pol_cal,
+        "claim_gross_uncalibrated": float(gross["mean"]),
+        "claim_gross_setup": setup_mean,
         "claim_gross_levels": gross["levels"],
         "claim_capture": _clamp(slope, 0.0, 1.0),
         "claim_slope": slope,
@@ -1568,6 +1611,7 @@ def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, 
         "claim_level_weights": nested_w,
         "claim_confidence": gross["confidence"],
         "claim_uncertainty": gross["sd"],
+        "key_policy_calibration": key_pol_cal,
     }
 
 
@@ -1582,9 +1626,21 @@ def scalp_expected_gross(view: dict[str, Any], raw: float) -> dict[str, float]:
     """
     capture = _clamp(float(view.get("claim_capture") or 0.0), 0.0, 1.0)
     setup_mean = float(view.get("claim_gross_setup") or 0.0)
-    calibrated = setup_mean + capture * (max(0.0, float(raw or 0.0)) - float(view.get("claim_raw_center") or 0.0))
+    raw_v = max(0.0, float(raw or 0.0))
+    center_v = float(view.get("claim_raw_center") or 0.0)
+    slope_mult = 0.12 if ("key_policy_calibration" in view and center_v > 0.0 and raw_v >= center_v) else 1.0
+    calibrated = setup_mean + slope_mult * capture * (raw_v - center_v)
     adaptive = _clamp(float(view.get("claim_gross_mean") or 0.0) - setup_mean, -SCALP_RESIDUAL_MAX, SCALP_RESIDUAL_MAX)
-    return {"capture": capture, "calibrated": calibrated, "adaptive": adaptive, "expected": calibrated + adaptive}
+    return {
+        "capture": capture,
+        "calibrated": calibrated,
+        "adaptive": adaptive,
+        "expected": calibrated + adaptive,
+        "key_policy_calibration": float(view.get("key_policy_calibration") or 0.0),
+        "uncalibrated_gross": float(view.get("claim_gross_uncalibrated") or view.get("claim_gross_mean") or 0.0),
+        "uncalibrated_slope_term": capture * (raw_v - center_v),
+        "setup_gross": setup_mean,
+    }
 
 
 def _blend(parts: list[tuple[float, float]], prior: float) -> tuple[float, float]:
@@ -1661,6 +1717,7 @@ def scalp_decision(db_path: str, symbol: str, setup: str, regime: str, features:
         "claim_key_n": claim["claim_key_n"],
         "n_claim": claim["n_claim"],
         "claim_uncertainty": claim["claim_uncertainty"],
+        "key_policy_calibration": claim.get("key_policy_calibration", 0.0),
         "confidence": claim["claim_confidence"],
         "policy_gap": gap["mean"],
         "n_policy_gap": gap["level_weights"]["engine"],
@@ -2850,6 +2907,7 @@ def _fold_markout_labels(
     micro_target: float | None,
     micro_feats: dict | None,
     moment: float,
+    marks: dict | None = None,
 ) -> None:
     """Every state write of one resolved markout, on the caller's transaction."""
     version = str(row["strategy_version"])
@@ -2860,6 +2918,13 @@ def _fold_markout_labels(
     if residual is not None:
         observe(db_path, metric=residual_metric(raw_source), value=residual, **key)
         if is_directional(raw_source) and raw_move is not None:
+            claim_fwd = float(forward)
+            if engine_id == SCALP_ENGINE:
+                with contextlib.suppress(Exception):
+                    mk_d = marks if isinstance(marks, dict) else json.loads(row["markouts_json"] or "{}")
+                    m300 = _mark_at(mk_d, 300.0)
+                    if m300 is not None and math.isfinite(float(m300)) and round(float(row["label_horizon"] or 600.0)) == 600:
+                        claim_fwd = 0.45 * float(m300) + 0.55 * float(forward)
             learn_claim_label(
                 db_path,
                 symbol=row["symbol"],
@@ -2867,7 +2932,7 @@ def _fold_markout_labels(
                 regime=row["regime"],
                 strategy_version=version,
                 raw=float(raw_move),
-                gross=float(forward) + float(row["roundtrip_cost"] or 0),
+                gross=claim_fwd + float(row["roundtrip_cost"] or 0),
                 now=moment,
                 weight=uniqueness,
                 conn=conn,
@@ -3078,6 +3143,7 @@ def resolve_markouts(
                                 micro_target=micro_target,
                                 micro_feats=micro_feats,
                                 moment=moment,
+                                marks=marks,
                             )
                         else:
                             conn.execute("ROLLBACK TO markout_learn")

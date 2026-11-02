@@ -589,17 +589,28 @@ def value(db_path: str, symbol: str, setup: str, regime: str, state: dict, entry
     mfe_v = max(0.0, _finite((state or {}).get("mfe")))
     gb_v = max(0.0, _finite((state or {}).get("giveback")))
     cal_sum = _finite(ent.get("calibrated")) + _finite(ent.get("adaptive"))
+    uncal_gross = _finite(ent.get("uncalibrated_gross"))
+    hold_cal_sum = uncal_gross + _finite(ent.get("uncalibrated_slope_term")) if uncal_gross != 0.0 else cal_sum
     fade = max(0.0, 1.0 - age / 10.0)
-    ro_drag = (cal_sum + 0.0010) if (age > 0.0 and mfe_v >= 0.0015 and gb_v >= 0.35 * mfe_v) else 0.0
-    claim_rem = cal_sum * fade - ro_drag
+    ro_drag = (hold_cal_sum + 0.0010) if (age > 0.0 and mfe_v >= 0.0015 and gb_v >= 0.35 * mfe_v) else 0.0
+    claim_rem = (cal_sum if age <= 0.0 else hold_cal_sum) * fade - ro_drag
     out: dict[int, float] = {}
     for h, v in per.items():
         beta = use.beta(h)
         b0 = float(beta[0]) if beta is not None and len(beta) > 0 else 0.0
-        adj = v - b0 * (1.0 - fade) - (1e-6 if fade == 0.0 else 0.0) if (cal_sum != 0.0 and b0 > 0.0) else v
+        adj = v - b0 * (1.0 - fade) - (1e-6 if fade == 0.0 else 0.0) if (hold_cal_sum != 0.0 and b0 > 0.0) else v
         out[h] = adj + claim_rem
     best = max(out, key=out.__getitem__)
-    return {"advantage": out[best], "horizon": best, "horizons": out, "version": VALUE_VERSION}
+    best_adv = out[best]
+    if age <= 0.0 and 120 in per and 300 in per and len(per) > 1 and max(per.values()) != min(per.values()):
+        v120 = float(per[120])
+        v300 = float(per[300])
+        v600 = float(per.get(600, min(v120, v300)))
+        min_short = min(v120, v300)
+        min_med = min(v120, v300, v600)
+        vm_entry = 0.80 * 0.5 * (v120 + v300) + min(0.0, min_short) + (0.50 * min_med if min_med < 0.0 else 0.0)
+        best_adv = vm_entry + claim_rem
+    return {"advantage": best_adv, "horizon": best, "horizons": out, "version": VALUE_VERSION}
 
 
 def entry_value(db_path: str, symbol: str, setup: str, regime: str, entry: dict, *, model: ValueModel | None = None) -> float | None:

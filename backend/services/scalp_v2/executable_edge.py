@@ -218,7 +218,17 @@ def scalp_executable_edge(
     entry_value = None
     value_version = ""
     if value_of is not None:
-        entry = {"calibrated": move["calibrated"], "adaptive": move["adaptive"], "micro": micro, "raw_claim": raw, "cost": cost}
+        entry = {
+            "calibrated": move["calibrated"],
+            "adaptive": move["adaptive"],
+            "micro": micro,
+            "raw_claim": raw,
+            "cost": cost,
+            "key_policy_calibration": _f(move.get("key_policy_calibration")),
+            "uncalibrated_gross": _f(move.get("uncalibrated_gross")),
+            "uncalibrated_slope_term": _f(move.get("uncalibrated_slope_term")),
+            "setup_gross": _f(move.get("setup_gross")),
+        }
         entry_value = value_of({**entry, **micro_state(entry_micro)})
     if entry_value is not None and math.isfinite(float(entry_value)):
         from backend.services.scalp_v2.continuation_value import VALUE_VERSION

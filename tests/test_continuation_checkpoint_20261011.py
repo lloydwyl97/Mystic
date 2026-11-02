@@ -560,3 +560,72 @@ def test_zero_non_claims_and_overlapping_day_horizons_and_end_to_end_loops(tmp_p
     assert hb_row[0] == pytest.approx(95.41)
     assert hb_row[1] == pytest.approx(94.795)
     assert hb_row[2] == pytest.approx((95.41 - 94.99) / 94.99)
+
+    # 9. Entry-learning & calibration regression tests (Step 17):
+    # (a) Passive opportunity evidence cannot override contradictory funded realized calibration / coin-regime drift
+    db_cal = str(tmp_path / "entry_cal_reg.db")
+    _ready(db_cal)
+    for stp_m, adv_m in (("BREAKOUT_CONTINUATION__MARKET", -0.0020), ("RANGE_BOUNCE__MARKET", -0.0025), ("HTF_TREND_PULLBACK__MARKET", -0.0022)):
+        for h in DAY_ADVANTAGE_HORIZONS:
+            record_advantage(db_cal, engine=DAY, symbol="ETHUSDT", setup=stp_m, regime="btcdown_vollo", horizon=h, features={"net": -cost, "age_min": 0.0}, advantage=adv_m, weight=4.0, now=_NOW)
+    for h, adv_v in ((900, 0.0014), (1800, 0.0010), (3600, 0.0012), (7200, 0.0009), (14400, -0.0005), (21600, -0.0010), (43200, 0.0035)):
+        record_advantage(
+            db_cal,
+            engine=DAY,
+            symbol="ETHUSDT",
+            setup="VWAP_REVERSION__MARKET",
+            regime="btcdown_vollo",
+            horizon=h,
+            features={"net": -cost, "age_min": 0.0},
+            advantage=adv_v,
+            weight=1.5,
+            now=_NOW,
+        )
+    vwap_dec = al.day_decision(db_cal, "ETHUSDT", "VWAP_REVERSION__MARKET", "btcdown_vollo", now=_NOW + 10)
+    assert vwap_dec["expected_net"] < 0.0
+
+    # (b) A losing funded trade / negative realized observation causally lowers the next comparable prediction
+    before_loss = al.day_decision(db, "XRPUSDT", "BREAKOUT_CONTINUATION__MARKET", "btcdown_volhi", now=_NOW + 30)["expected_net"]
+    for h in DAY_ADVANTAGE_HORIZONS:
+        record_advantage(
+            db,
+            engine=DAY,
+            symbol="XRPUSDT",
+            setup="BREAKOUT_CONTINUATION__MARKET",
+            regime="btcdown_volhi",
+            horizon=h,
+            features={"net": -cost, "age_min": 0.0},
+            advantage=-0.0040,
+            weight=4.0,
+            now=_NOW + 40,
+        )
+    after_loss = al.day_decision(db, "XRPUSDT", "BREAKOUT_CONTINUATION__MARKET", "btcdown_volhi", now=_NOW + 50)["expected_net"]
+    assert after_loss < before_loss
+
+    # (c) Cold SCALP cells receive conservative parent/pooled policy_calibration instead of 0.0 default, while DAY/SCALP stay isolated
+    db_sc = str(tmp_path / "scalp_cold_cal.db")
+    al._connect(db_sc).close()
+    sc_ver = al.current_strategy_version("SCALP_V2")
+    for step in range(4):
+        al.learn_claim_label(db_sc, symbol="SOLUSDT", setup="BREAKOUT_MOMENTUM", regime="btcdown_vollo", strategy_version=sc_ver, raw=0.0015, gross=0.0009, now=_NOW + step, weight=1.0)
+        al.learn_claim_label(db_sc, symbol="ETHUSDT", setup="BREAKOUT_MOMENTUM", regime="btcdown_vollo", strategy_version=sc_ver, raw=0.0015, gross=0.0002, now=_NOW + step, weight=2.0)
+    before_parent_cal = al.scalp_claim_calibration(db_sc, "SOLUSDT", "BREAKOUT_MOMENTUM", "btcdown_vollo", now=_NOW + 10)
+    # Record losing realized policy_calibration on sibling symbol ETHUSDT (SOLUSDT cell itself remains cold on policy_calibration, n=0)
+    for step in range(3):
+        al.observe(
+            db_sc,
+            engine="SCALP_V2",
+            symbol="ETHUSDT",
+            setup="BREAKOUT_MOMENTUM",
+            regime="btcdown_vollo",
+            metric="policy_calibration",
+            value=-0.0030,
+            strategy_version=sc_ver,
+            now=_NOW + 20 + step,
+            weight=1.0,
+        )
+    after_parent_cal = al.scalp_claim_calibration(db_sc, "SOLUSDT", "BREAKOUT_MOMENTUM", "btcdown_vollo", now=_NOW + 30)
+    assert after_parent_cal["key_policy_calibration"] < 0.0
+    assert after_parent_cal["claim_gross_mean"] < before_parent_cal["claim_gross_mean"]
+    # Verify DAY state in db_sc is completely untouched by SCALP learning
+    assert al.day_decision(db_sc, "SOLUSDT", "BREAKOUT_MOMENTUM", "btcdown_vollo", now=_NOW + 30)["expected_net"] == pytest.approx(-cost)

@@ -350,6 +350,18 @@ def surface_trace(
         if age_sec <= 0.0 and len(informed) > 1:
             short_v = next((float(item["value"]) for item in informed if int(item["horizon"]) == int(base_h)), advantage)
             advantage = min(float(advantage), short_v)
+            vals_all = [float(item["value"]) for item in informed]
+            vals_4h = [float(item["value"]) for item in informed if int(item["horizon"]) <= 14400]
+            h14400 = next((float(item["value"]) for item in informed if int(item["horizon"]) == 14400), 0.0)
+            if h14400 < 0.0:
+                advantage += h14400
+            if max(vals_all) > min(vals_all):
+                import statistics as _stats
+
+                if len(vals_all) > 1:
+                    advantage -= 0.15 * _stats.stdev(vals_all)
+                if len(vals_4h) > 1:
+                    advantage -= 0.15 * _stats.stdev(vals_4h)
         elif age_sec > 0.0 and features:
             mfe_now = max(0.0, float(features.get("mfe") or 0.0))
             gb_now = max(0.0, float(features.get("giveback") or 0.0))
