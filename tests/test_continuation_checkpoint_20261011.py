@@ -629,3 +629,124 @@ def test_zero_non_claims_and_overlapping_day_horizons_and_end_to_end_loops(tmp_p
     assert after_parent_cal["claim_gross_mean"] < before_parent_cal["claim_gross_mean"]
     # Verify DAY state in db_sc is completely untouched by SCALP learning
     assert al.day_decision(db_sc, "SOLUSDT", "BREAKOUT_MOMENTUM", "btcdown_vollo", now=_NOW + 30)["expected_net"] == pytest.approx(-cost)
+
+
+def test_scalp_symmetric_claim_damping_and_hold_policy_calibration_20261102(tmp_path):
+    import numpy as np
+
+    from backend.services import adaptive_learning as al
+    from backend.services.continuation_surface import surface_trace
+    from backend.services.scalp_v2 import continuation_value as cv
+
+    # Test 1: Symmetric 0.12 claim slope damping across raw > center, raw == center, raw < center, and raw == 0
+    setup_mean = 0.000383
+    gross_mean = 0.000446
+    capture = 0.50
+    center_v = 0.000726
+    key_pol_cal = -0.000252
+    view = {
+        "claim_gross_mean": gross_mean + key_pol_cal,
+        "claim_gross_uncalibrated": gross_mean,
+        "claim_gross_setup": setup_mean,
+        "claim_capture": capture,
+        "claim_raw_center": center_v,
+        "key_policy_calibration": key_pol_cal,
+    }
+    for raw_v in (0.001200, center_v, 0.000400, 0.0):
+        move = al.scalp_expected_gross(view, raw_v)
+        expected_cal = setup_mean + 0.12 * capture * (raw_v - center_v)
+        assert move["calibrated"] == pytest.approx(expected_cal, abs=1e-12)
+        assert move["expected"] == pytest.approx((gross_mean + key_pol_cal) + 0.12 * capture * (raw_v - center_v), abs=1e-12)
+
+    # Test 2: Position with key_policy_calibration < 0 includes it at entry (age = 0) AND during hold (age > 0)
+    vm = cv.ValueModel()
+    rng = np.random.default_rng(20261102)
+    cost = 0.0006015
+    for h in cv.HORIZONS_SEC:
+        w = (60.0 / float(h)) / 22.0
+        rows_h = []
+        for _ in range(120):
+            net_s = rng.uniform(-0.002, 0.002)
+            st_s = {"net": net_s, "mfe": max(0.0, net_s + cost), "mae": max(0.0, -net_s - cost), "giveback": 0.0, "age_min": rng.uniform(0.5, 10.0)}
+            ent_s = {"cost": cost}
+            x_s = cv.vector(st_s, ent_s, "BTCUSDT", "BREAKOUT_MOMENTUM", "btcdown_vollo")
+            rows_h.append((h, x_s, 0.0002 - 0.15 * net_s, _NOW, w))
+        vm.fold(rows_h, _NOW)
+
+    view_zero_cal = {**view, "claim_gross_mean": gross_mean, "key_policy_calibration": 0.0}
+    move_neg = al.scalp_expected_gross(view, 0.0)
+    move_zero = al.scalp_expected_gross(view_zero_cal, 0.0)
+    ent_neg = {
+        "calibrated": move_neg["calibrated"],
+        "adaptive": move_neg["adaptive"],
+        "raw_claim": 0.0,
+        "cost": cost,
+        "key_policy_calibration": move_neg["key_policy_calibration"],
+        "uncalibrated_gross": move_neg["uncalibrated_gross"],
+        "uncalibrated_slope_term": move_neg["uncalibrated_slope_term"],
+    }
+    ent_zero = {
+        "calibrated": move_zero["calibrated"],
+        "adaptive": move_zero["adaptive"],
+        "raw_claim": 0.0,
+        "cost": cost,
+        "key_policy_calibration": 0.0,
+        "uncalibrated_gross": move_zero["uncalibrated_gross"],
+        "uncalibrated_slope_term": move_zero["uncalibrated_slope_term"],
+    }
+    ev_neg = cv.entry_value("unused", "BTCUSDT", "BREAKOUT_MOMENTUM", "btcdown_vollo", ent_neg, model=vm)
+    ev_zero = cv.entry_value("unused", "BTCUSDT", "BREAKOUT_MOMENTUM", "btcdown_vollo", ent_zero, model=vm)
+    assert ev_neg - ev_zero == pytest.approx(key_pol_cal, abs=1e-12)
+
+    hold_state = {"net": 0.000077, "mfe": 0.000678, "mae": 0.0, "giveback": 0.0, "age_min": 3.58}
+    fade_358 = 1.0 - 3.58 / 10.0
+    hv_neg = cv.value("unused", "BTCUSDT", "BREAKOUT_MOMENTUM", "btcdown_vollo", hold_state, ent_neg, model=vm)["advantage"]
+    hv_zero = cv.value("unused", "BTCUSDT", "BREAKOUT_MOMENTUM", "btcdown_vollo", hold_state, ent_zero, model=vm)["advantage"]
+    assert hv_neg - hv_zero == pytest.approx(key_pol_cal * fade_358, abs=1e-12)
+
+    # Test 3: Deterministic reproduction of trade 82654 lifecycle (key_policy_calibration = -2.52 bps exits at age=3.58m for +0.77 bps instead of holding)
+    ent_82654_repaired = {
+        "calibrated": 0.0000383 - 0.12 * 0.0003229,
+        "adaptive": (0.0003082 + key_pol_cal) - 0.0000383,
+        "raw_claim": 0.0,
+        "cost": cost,
+        "key_policy_calibration": key_pol_cal,
+        "uncalibrated_gross": 0.0003082,
+        "uncalibrated_slope_term": -0.0003229,
+    }
+    ent_82654_dropped = {**ent_82654_repaired, "key_policy_calibration": 0.0}
+    # At age = 3.58m (u_net = +0.77 bps, mfe = +6.78 bps), ValueModel horizon max is +0.75 bps:
+    # Without key_policy_calibration: hold_cal_sum = -0.147 bps -> advantage = +0.75 - 0.147 * 0.642 = +0.656 bps > 0 (fails to exit)
+    # With key_policy_calibration = -2.52 bps: hold_cal_sum = -2.667 bps -> advantage = +0.75 - 2.667 * 0.642 = -0.962 bps < 0 (exits at +0.77 bps)
+    adv_dropped_358 = 0.000075 + (ent_82654_dropped["uncalibrated_gross"] + ent_82654_dropped["uncalibrated_slope_term"] + ent_82654_dropped["key_policy_calibration"]) * fade_358
+    adv_repaired_358 = 0.000075 + (ent_82654_repaired["uncalibrated_gross"] + ent_82654_repaired["uncalibrated_slope_term"] + ent_82654_repaired["key_policy_calibration"]) * fade_358
+    assert adv_dropped_358 > 0.0
+    assert adv_repaired_358 < 0.0
+    read_rep = cv.value("unused", "BTCUSDT", "BREAKOUT_MOMENTUM", "btcdown_vollo", hold_state, ent_82654_repaired, model=vm)
+    read_drp = cv.value("unused", "BTCUSDT", "BREAKOUT_MOMENTUM", "btcdown_vollo", hold_state, ent_82654_dropped, model=vm)
+    assert read_rep["advantage"] - read_drp["advantage"] == pytest.approx(key_pol_cal * fade_358, abs=1e-12)
+
+    # Test 4 & Test 5: DAY_V2 outputs are byte/value-identical and completely isolated from SCALP_V2 adaptive state
+    db_iso = str(tmp_path / "day_scalp_iso.db")
+    _ready(db_iso)
+    day_before = al.day_decision(db_iso, "BTCUSDT", "BREAKOUT_CONTINUATION", "btcup_vollo", now=_NOW + 5)
+    trace_before = surface_trace(db_iso, DAY, "BTCUSDT", "BREAKOUT_CONTINUATION", "btcup_vollo", {"net": 0.001, "mfe": 0.002, "mae": 0.0005, "giveback": 0.001, "age_min": 15.0}, _NOW + 5)
+    sc_ver = al.current_strategy_version("SCALP_V2")
+    for i in range(6):
+        al.learn_claim_label(db_iso, symbol="BTCUSDT", setup="BREAKOUT_MOMENTUM", regime="btcup_vollo", strategy_version=sc_ver, raw=0.0010, gross=0.0008, now=_NOW + i, weight=1.0)
+        al.observe(
+            db_iso,
+            engine="SCALP_V2",
+            symbol="BTCUSDT",
+            setup="BREAKOUT_MOMENTUM",
+            regime="btcup_vollo",
+            metric="policy_calibration",
+            value=-0.0020,
+            strategy_version=sc_ver,
+            now=_NOW + i,
+            weight=1.0,
+        )
+    day_after = al.day_decision(db_iso, "BTCUSDT", "BREAKOUT_CONTINUATION", "btcup_vollo", now=_NOW + 5)
+    trace_after = surface_trace(db_iso, DAY, "BTCUSDT", "BREAKOUT_CONTINUATION", "btcup_vollo", {"net": 0.001, "mfe": 0.002, "mae": 0.0005, "giveback": 0.001, "age_min": 15.0}, _NOW + 5)
+    assert json.dumps(day_before, sort_keys=True) == json.dumps(day_after, sort_keys=True)
+    assert json.dumps(trace_before, sort_keys=True) == json.dumps(trace_after, sort_keys=True)

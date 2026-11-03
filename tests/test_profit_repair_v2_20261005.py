@@ -200,7 +200,7 @@ def test_rejected_claims_update_the_calibration(tmp_path):
 def test_causal_evidence_recovers_a_supported_claim_and_a_1bp_claim_stays_negative(tmp_path):
     db = str(tmp_path / "p.db")
     raws = [0.0005 + 0.0001 * (i % 21) for i in range(63)]
-    end = _claim_rows(db, raws, gross_of=lambda raw: raw - 0.0001)
+    end = _claim_rows(db, raws, gross_of=lambda raw: raw - 0.0008)
     view = al.scalp_decision(db, *SKEY, now=end)
     assert view["claim_capture"] > 0.5
     supported = _edge(view, 0.0015)

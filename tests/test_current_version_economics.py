@@ -297,7 +297,7 @@ def test_informative_claims_keep_capture_and_recover(tmp_path):
     db = str(tmp_path / "t.db")
     for i in range(60):
         raw = 0.0005 + 0.0001 * (i % 10)
-        assert _claim(db, raw, raw - 0.0002)
+        assert _claim(db, raw, raw - 0.0003)
     view = al.scalp_decision(db, *SCALP_KEY)
     assert view["claim_capture"] > 0.5
     assert _edge_for_raw(view, 0.0030).final_executable_edge_pct > REJECT_THRESHOLD_PCT

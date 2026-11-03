@@ -590,7 +590,8 @@ def value(db_path: str, symbol: str, setup: str, regime: str, state: dict, entry
     gb_v = max(0.0, _finite((state or {}).get("giveback")))
     cal_sum = _finite(ent.get("calibrated")) + _finite(ent.get("adaptive"))
     uncal_gross = _finite(ent.get("uncalibrated_gross"))
-    hold_cal_sum = uncal_gross + _finite(ent.get("uncalibrated_slope_term")) if uncal_gross != 0.0 else cal_sum
+    key_pol_cal = _finite(ent.get("key_policy_calibration"))
+    hold_cal_sum = uncal_gross + _finite(ent.get("uncalibrated_slope_term")) + key_pol_cal if uncal_gross != 0.0 else cal_sum
     fade = max(0.0, 1.0 - age / 10.0)
     ro_drag = (hold_cal_sum + 0.0010) if (age > 0.0 and mfe_v >= 0.0015 and gb_v >= 0.35 * mfe_v) else 0.0
     claim_rem = (cal_sum if age <= 0.0 else hold_cal_sum) * fade - ro_drag
