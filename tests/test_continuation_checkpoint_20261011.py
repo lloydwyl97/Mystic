@@ -531,7 +531,7 @@ def test_zero_non_claims_and_overlapping_day_horizons_and_end_to_end_loops(tmp_p
             st_s = {"net": net_s, "mfe": mfe_s, "mae": mae_s, "giveback": gb_s, "age_min": age_s}
             ent_s = {"cost": cost, "m_ofi": rng.normal(0.0, 1.0), "m_adverse": rng.uniform(0.0, 1.0)}
             x_s = cv.vector(st_s, ent_s, "SOLUSDT", "ORDERBOOK_TAPE_SCALP", "btcdown_volhi")
-            y_s = -0.25 * (net_s + 0.003) + 0.0008 * ent_s["m_ofi"] - 0.0006 * ent_s["m_adverse"] + rng.normal(0.0, 0.0005)
+            y_s = 0.25 * (net_s + 0.003) + 0.0008 * ent_s["m_ofi"] - 0.0006 * ent_s["m_adverse"] + rng.normal(0.0, 0.0005)
             rows_h.append((h, x_s, y_s, _NOW, w))
         vm.fold(rows_h, _NOW)
     for h in cv.HORIZONS_SEC:
@@ -539,6 +539,7 @@ def test_zero_non_claims_and_overlapping_day_horizons_and_end_to_end_loops(tmp_p
         assert bh is not None
         assert sum(1 for v in bh[1:] if abs(float(v)) > 1e-8) >= 8
         assert float(bh[15]) <= 0.0
+        assert float(bh[14]) <= 0.0
 
     # 7. maintenance_status_summary(cfg=None) does not raise NoneType backup_dir error
     ms = maintenance_status_summary(None)

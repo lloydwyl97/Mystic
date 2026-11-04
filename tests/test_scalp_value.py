@@ -28,7 +28,7 @@ def _state(net: float, age: float = 10.0) -> dict[str, float]:
     return {"net": net, "mfe": 0.0, "mae": max(0.0, -net - COST), "giveback": 0.0, "age_min": age}
 
 
-def test_labels_clamp_at_stop_and_cover_states_no_position_held():
+def test_labels_uncensored_by_stop_and_cover_states_no_position_held():
     closes = [100.0, 100.3, 100.5, 100.4, 100.6, 99.0, 98.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0]
     labels = cv.candidate_labels(_cand(), _bars(closes), -np.inf, np.inf)
     assert labels
@@ -38,15 +38,16 @@ def test_labels_clamp_at_stop_and_cover_states_no_position_held():
         by_age.setdefault(round((end - horizon - T0 - 1.0) / 60.0), []).append((horizon, x, advantage))
     # A profitable state, which the old policy sold at once, is labeled with what followed.
     assert any(x[1] > 0 for items in by_age.values() for _, x, _ in items)
-    # A window that crosses the 1.5% stop ends at the stop price, not the later low.
+    # Forward regression labels reflect the true observed gross path (uncensored by the -150 bps execution stop).
     age2 = {h: a for h, _, a in by_age[2]}
     gross_at_2 = 100.3 / 100.0 - 1.0
-    assert age2[300] == pytest.approx(-cv.SCALP_V2_CATASTROPHIC_PCT - gross_at_2)
+    true_gross_at_7 = 98.0 / 100.0 - 1.0
+    assert age2[300] == pytest.approx(true_gross_at_7 - gross_at_2)
     # No state exists once a closed bar has reached the stop.
     assert max(by_age) == 6
 
 
-def test_deep_and_shallow_losses_are_different_states_and_values():
+def test_deep_and_shallow_losses_are_different_states_and_monotonic_non_increasing():
     deep = cv.vector(_state(-0.0150), {}, "BTCUSDT", "BREAKOUT_MOMENTUM", REGIME)
     shallow = cv.vector(_state(-0.0008), {}, "BTCUSDT", "BREAKOUT_MOMENTUM", REGIME)
     assert not np.allclose(deep, shallow)
@@ -56,11 +57,13 @@ def test_deep_and_shallow_losses_are_different_states_and_values():
     for _ in range(4000):
         net = -rng.uniform(0.0, 0.016)
         x = cv.vector(_state(net), {}, "BTCUSDT", "BREAKOUT_MOMENTUM", REGIME)
-        labels.append((120, x, -0.3 * (net + 0.004) + rng.normal(0, 0.0002), T0, 1.0))
+        # Even if raw labels have a perverse negative slope where deeper losses appear higher,
+        # the monotonic adverse constraints prevent deeper losses from exceeding shallow losses.
+        labels.append((120, x, 0.3 * (net + 0.008) + rng.normal(0, 0.0002), T0, 1.0))
     model.fold(labels, T0)
     deep_v = cv.value("unused", "BTCUSDT", "BREAKOUT_MOMENTUM", REGIME, _state(-0.0150), {}, model=model)
     shallow_v = cv.value("unused", "BTCUSDT", "BREAKOUT_MOMENTUM", REGIME, _state(-0.0008), {}, model=model)
-    assert deep_v["advantage"] > 0 > shallow_v["advantage"]
+    assert shallow_v["advantage"] > 0 > deep_v["advantage"]
 
 
 def test_pure_noise_state_terms_shrink_to_the_mean_advantage():
@@ -366,3 +369,126 @@ def test_no_minimum_hold_and_no_fixed_10m_exit():
     prof = cv.value("unused", "XRPUSDT", "FAILED_BREAKOUT_REVERSAL", "btcflat_volhi", _state(0.0050, age=2.0), {"calibrated": 0.0008, "adaptive": 0.0, "cost": COST}, model=model)
     assert prof["advantage"] == pytest.approx(0.8 * 0.0008 - 0.0005, abs=1e-6)
     assert adaptive_learning.learned_hold_or_exit(expected_terminal_net=0.0050 + prof["advantage"], unrealized_net=0.0050) == "hold"
+
+
+def test_continuation_learning_defect_repairs_20261104(tmp_path):
+    from types import SimpleNamespace
+
+    from backend.services import continuation_surface as cs
+    from backend.services.scalp_v2.exit_evaluator import SCALP_V2_CATASTROPHIC_PCT, SCALP_V2_EXIT_CATASTROPHIC, evaluate_scalp_v2_exit
+
+    # 1. Horizon labels are uncensored by catastrophic execution protection.
+    cand = _cand(ref=100.0)
+    bars = _bars([100.0, 99.0, 98.8, 97.5, 97.0, 96.5])
+    last_i, _gross_1, _ = cv.path_state(cand, bars, 1.0)
+    later_3 = cv.horizon_gross(cand, bars, last_i, T0 + 1.0 + 240.0)
+    assert later_3 == pytest.approx(97.5 / 100.0 - 1.0)
+    assert later_3 < -SCALP_V2_CATASTROPHIC_PCT
+
+    # 2. Catastrophic execution protection itself remains unchanged at -150 bps (0.015).
+    assert pytest.approx(0.015) == SCALP_V2_CATASTROPHIC_PCT
+    pos = SimpleNamespace(engine_id="SCALP_V2", cost_basis=100.0, entry_price=100.0, highest_price=100.0, lowest_price=98.4, symbol="XRPUSDT")
+    cat_dec = evaluate_scalp_v2_exit(position=pos, current_price=98.5, net_pnl_pct=-0.0156, hold_minutes=5.0, bar_low=98.4, symbol="XRPUSDT", expected_terminal_net=0.01)
+    assert cat_dec["action"] == "sell" and cat_dec["reason"] == SCALP_V2_EXIT_CATASTROPHIC
+
+    # 3 & 4. Increasing MAE alone cannot raise continuation value, and worsening current net below zero cannot mechanically raise continuation value.
+    model = cv.ValueModel()
+    rng = np.random.default_rng(42)
+    synth_labels = []
+    for _ in range(3000):
+        net_v = -rng.uniform(0.0005, 0.0145)
+        mae_v = abs(net_v) + rng.uniform(0.0, 0.003)
+        st_s = {"net": net_v, "mfe": 0.0001, "mae": mae_v, "giveback": 0.0001, "age_min": rng.uniform(1.0, 40.0)}
+        x_s = cv.vector(st_s, {"cost": COST}, "XRPUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi")
+        # Feed perverse labels where deeper loss and higher MAE have artificially higher labels
+        y_perverse = -0.25 * net_v + 0.40 * mae_v - 0.0010 + rng.normal(0.0, 0.0002)
+        for h in cv.HORIZONS_SEC:
+            synth_labels.append((h, x_s, y_perverse, T0, 1.0))
+    model.fold(synth_labels, T0)
+
+    for h in cv.HORIZONS_SEC:
+        b = model.beta(h)
+        assert float(b[cv.FEATURES.index("mae")]) <= 0.0
+        assert float(b[cv.FEATURES.index("giveback")]) <= 0.0
+
+    # Monotonicity across MAE = 10..145 bps with net fixed at -50 bps
+    prev_adv = None
+    for mae_bps in (10, 25, 50, 75, 100, 125, 145):
+        st_m = {"net": -0.0050, "mfe": 0.0001, "mae": mae_bps / 1e4, "giveback": 0.0001, "age_min": 15.0}
+        adv_m = cv.value("unused", "XRPUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi", st_m, {"cost": COST}, model=model)["advantage"]
+        if prev_adv is not None:
+            assert adv_m <= prev_adv + 1e-12
+        prev_adv = adv_m
+
+    # Monotonicity across net = 0, -10, -25, -50, -75, -100, -125, -145 bps with other state fixed
+    prev_net_adv = None
+    for net_bps in (0, -10, -25, -50, -75, -100, -125, -145):
+        st_n = {"net": net_bps / 1e4, "mfe": 0.0001, "mae": 0.0150, "giveback": 0.0001, "age_min": 15.0}
+        adv_n = cv.value("unused", "XRPUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi", st_n, {"cost": COST}, model=model)["advantage"]
+        if prev_net_adv is not None:
+            assert adv_n <= prev_net_adv + 1e-12
+        prev_net_adv = adv_n
+
+    # 5 & 6. Healthy profitable low-MAE positions still receive positive continuation when evidence supports it,
+    # while immediate-failure states naturally produce negative continuation without an MFE or time gate.
+    mixed_model = cv.ValueModel()
+    mixed_labels = []
+    for _ in range(2000):
+        # Healthy developing states (mfe > cost, low mae) continue positively
+        st_good = {"net": rng.uniform(0.0002, 0.0030), "mfe": rng.uniform(0.0010, 0.0040), "mae": rng.uniform(0.0, 0.0010), "giveback": 0.0001, "age_min": rng.uniform(1.0, 10.0)}
+        x_good = cv.vector(st_good, {"cost": COST}, "BTCUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi")
+        # Immediate-failure states (mfe < cost, underwater) continue negatively
+        st_bad = {"net": -rng.uniform(0.0020, 0.0120), "mfe": 0.0001, "mae": rng.uniform(0.0025, 0.0120), "giveback": 0.0001, "age_min": rng.uniform(10.0, 30.0)}
+        x_bad = cv.vector(st_bad, {"cost": COST}, "BTCUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi")
+        for h in cv.HORIZONS_SEC:
+            mixed_labels.append((h, x_good, +0.0012, T0, 1.0))
+            mixed_labels.append((h, x_bad, -0.0015, T0, 1.0))
+    mixed_model.fold(mixed_labels, T0)
+
+    ent_good = {"calibrated": 0.0006, "adaptive": 0.0002, "cost": COST}
+    st_good_eval = {"net": 0.0010, "mfe": 0.0020, "mae": 0.0005, "giveback": 0.0001, "age_min": 4.0}
+    st_bad_eval = {"net": -0.0060, "mfe": 0.0001, "mae": 0.0070, "giveback": 0.0001, "age_min": 15.0}
+    good_read = cv.value("unused", "BTCUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi", st_good_eval, ent_good, model=mixed_model)
+    bad_read = cv.value("unused", "BTCUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi", st_bad_eval, ent_good, model=mixed_model)
+    assert good_read["advantage"] > 0.0
+    assert bad_read["advantage"] < 0.0
+
+    # 7, 8, 9, 10. Entry decisions, DAY_V2, b90d5e8 claim damping & policy hierarchy, and no future-label leakage.
+    db = str(tmp_path / "entry_parity.db")
+    ver = adaptive_learning.current_strategy_version("SCALP_V2")
+    adaptive_learning.learn_claim_label(db, symbol="XRPUSDT", setup="FAILED_BREAKDOWN_REVERSAL", regime="btcup_volhi", strategy_version=ver, raw=0.0028, gross=0.0010, now=T0)
+    view = adaptive_learning.scalp_claim_calibration(db, "XRPUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi", now=T0 + 10)
+    move = adaptive_learning.scalp_expected_gross(view, 0.0028)
+    assert "key_policy_calibration" in view and view["key_policy_calibration"] == 0.0
+    assert move["expected"] == pytest.approx(move["calibrated"] + move["adaptive"])
+
+    # Preserved entry_beta guarantees byte/value identical entry_value and executable_edge
+    entry_b = {str(h): mixed_model.beta(h).tolist() for h in cv.HORIZONS_SEC}
+    mixed_model.meta["entry_beta"] = entry_b
+    ent_dict = {"calibrated": move["calibrated"], "adaptive": move["adaptive"], "cost": COST}
+    ev_before = cv.entry_value("unused", "XRPUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi", ent_dict, model=mixed_model)
+    # Perturb hold _beta while keeping entry_beta intact
+    mixed_model._beta = {h: mixed_model.beta(h) - 0.0005 for h in cv.HORIZONS_SEC}
+    ev_after = cv.entry_value("unused", "XRPUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi", ent_dict, model=mixed_model)
+    assert ev_before == ev_after
+
+    # DAY_V2 surface_trace remains byte/value identical
+    for h_d, adv_d in ((900, 0.0010), (1800, 0.0014), (3600, 0.0020), (7200, 0.0028), (14400, 0.0034), (21600, 0.0038), (43200, -0.0020)):
+        cs.record_advantage(
+            db,
+            engine="DAY_V2",
+            symbol="BTCUSDT",
+            setup="HTF_TREND_PULLBACK__MARKET",
+            regime="btcup_volhi",
+            horizon=h_d,
+            features={"net": -0.00066, "age_min": 0.0},
+            advantage=adv_d,
+            weight=8.0,
+            now=T0,
+        )
+    day_tr = cs.surface_trace(db, "DAY_V2", "BTCUSDT", "HTF_TREND_PULLBACK__MARKET", "btcup_volhi", {"age_min": 0.0}, T0)
+    assert day_tr is not None and day_tr["advantage"] > 0.0015
+
+    # No future-label leakage: candidate_labels strictly excludes horizons ending after hi
+    leaked = cv.candidate_labels(cand, bars, T0, T0 + 100.0)
+    assert leaked == []

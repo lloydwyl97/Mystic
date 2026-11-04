@@ -268,14 +268,12 @@ def path_state(candidate: Candidate, bars: Bars, age_min: float) -> tuple[int, f
 
 
 def horizon_gross(candidate: Candidate, bars: Bars, last: int, end: float) -> float | None:
-    """Gross of the virtual lot at ``end``: the stop price if the path reached it after bar ``last``."""
+    """True observed forward gross return of the virtual lot at ``end`` (uncensored by execution stops)."""
+    _ = last
     closes_at = bars.closes_at
     k = int(np.searchsorted(closes_at, end, side="right")) - 1
     if k < 0 or closes_at[k] <= end - BAR_SEC:
         return None
-    start = max(last + 1, int(np.searchsorted(bars.opened, candidate.t0, side="left")))
-    if k >= start and float(bars.low[start : k + 1].min()) <= candidate.ref * (1.0 - SCALP_V2_CATASTROPHIC_PCT):
-        return -SCALP_V2_CATASTROPHIC_PCT
     return float(bars.close[k]) / candidate.ref - 1.0
 
 
@@ -466,17 +464,41 @@ class ValueModel:
                 return None
             if float(beta[15]) > 0.0:
                 beta[15] = 0.0
+            if float(beta[14]) > 0.0:
+                beta[14] = 0.0
+            knots_z = [kn / 10.0 for kn in NET_KNOTS_BPS]
+            slopes = [float(beta[1])]
+            for j in range(len(NET_KNOTS_BPS)):
+                slopes.append(slopes[-1] + float(beta[2 + j]))
+            n_underwater_segs = sum(1 for kn in NET_KNOTS_BPS if kn <= 0)
+            if any(s < 0.0 for s in slopes[:n_underwater_segs]):
+                anchor_z = -1.2
+                f_anchor = float(beta[0]) + float(beta[1]) * anchor_z + sum(float(beta[2 + j]) * max(0.0, anchor_z - knots_z[j]) for j in range(len(knots_z)))
+                new_slopes = [max(0.0, s) if k < n_underwater_segs else s for k, s in enumerate(slopes)]
+                beta[1] = new_slopes[0]
+                for j in range(len(NET_KNOTS_BPS)):
+                    beta[2 + j] = new_slopes[j + 1] - new_slopes[j]
+                f_anchor_no_b0 = float(beta[1]) * anchor_z + sum(float(beta[2 + j]) * max(0.0, anchor_z - knots_z[j]) for j in range(len(knots_z)))
+                beta[0] = f_anchor - f_anchor_no_b0
             self._beta[horizon] = beta
         return self._beta[horizon]
 
-    def horizon_values(self, x: np.ndarray) -> dict[int, float]:
+    def entry_beta(self, horizon: int) -> np.ndarray | None:
+        raw_map = self.meta.get("entry_beta")
+        if isinstance(raw_map, dict) and str(horizon) in raw_map:
+            arr = np.asarray(raw_map[str(horizon)], dtype=float)
+            if arr.shape == (len(FEATURES),) and np.all(np.isfinite(arr)):
+                return arr
+        return self.beta(horizon)
+
+    def horizon_values(self, x: np.ndarray, *, entry_only: bool = False) -> dict[int, float]:
         out: dict[int, float] = {}
         x_clean = np.asarray(x, dtype=float)
         if x_clean.shape == (len(FEATURES),):
             x_clean = x_clean.copy()
             x_clean[list(_DIRECT_CLAIM_INDICES)] = 0.0
         for horizon in HORIZONS_SEC:
-            beta = self.beta(horizon)
+            beta = self.entry_beta(horizon) if entry_only else self.beta(horizon)
             if beta is not None:
                 value = float(x_clean @ beta)
                 if math.isfinite(value):
@@ -582,10 +604,10 @@ def value(db_path: str, symbol: str, setup: str, regime: str, state: dict, entry
     if use is None:
         return None
     ent = entry if isinstance(entry, dict) else {}
-    per = use.horizon_values(vector(state, ent, symbol, setup, regime))
+    age = max(0.0, _finite((state or {}).get("age_min")))
+    per = use.horizon_values(vector(state, ent, symbol, setup, regime), entry_only=(age <= 0.0))
     if not per:
         return {"advantage": 0.0, "horizon": None, "horizons": {}, "version": VALUE_VERSION}
-    age = max(0.0, _finite((state or {}).get("age_min")))
     mfe_v = max(0.0, _finite((state or {}).get("mfe")))
     gb_v = max(0.0, _finite((state or {}).get("giveback")))
     cal_sum = _finite(ent.get("calibrated")) + _finite(ent.get("adaptive"))
