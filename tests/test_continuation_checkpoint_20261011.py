@@ -750,3 +750,248 @@ def test_scalp_symmetric_claim_damping_and_hold_policy_calibration_20261102(tmp_
     trace_after = surface_trace(db_iso, DAY, "BTCUSDT", "BREAKOUT_CONTINUATION", "btcup_vollo", {"net": 0.001, "mfe": 0.002, "mae": 0.0005, "giveback": 0.001, "age_min": 15.0}, _NOW + 5)
     assert json.dumps(day_before, sort_keys=True) == json.dumps(day_after, sort_keys=True)
     assert json.dumps(trace_before, sort_keys=True) == json.dumps(trace_after, sort_keys=True)
+
+
+def test_day_term_structure_and_scalp_policy_calibration_deadlock_repairs_20261104(tmp_path):
+    from backend.services import adaptive_learning as al
+    from backend.services.continuation_surface import DAY_ADVANTAGE_HORIZONS, record_advantage, surface_trace
+    from backend.services.scalp_v2 import continuation_value as cv
+
+    cost = 0.00066
+
+    # =========================================================================
+    # DAY REGRESSION TESTS (1 - 4)
+    # =========================================================================
+    # 1. Coherent positive 15m-4h upward term structure is not penalized as dispersion
+    #    merely because longer horizons are stronger, and stale negative 12h does not destroy it.
+    db_up = str(tmp_path / "day_upward.db")
+    _ready(db_up)
+    upward_vals = {900: 0.000452, 1800: 0.000751, 3600: 0.001014, 7200: 0.001662, 14400: 0.002181, 21600: 0.003058, 43200: 0.001653}
+    for h, v in upward_vals.items():
+        record_advantage(
+            db_up,
+            engine=DAY,
+            symbol="BTCUSDT",
+            setup="EXHAUSTION_MR",
+            regime="btcdown_volhi",
+            horizon=h,
+            features={"net": -cost, "age_min": 0.0},
+            advantage=v,
+            weight=80.0,
+            now=_NOW,
+        )
+    tr_up = surface_trace(db_up, DAY, "BTCUSDT", "EXHAUSTION_MR", "btcdown_volhi", {"net": -cost, "age_min": 0.0}, _NOW + 1, how="blended")
+    assert tr_up is not None
+    h900_up = next(float(item["value"]) for item in tr_up["horizons"] if int(item["horizon"]) == 900)
+    assert tr_up["advantage"] > h900_up
+    assert tr_up["advantage"] > cost
+
+    # Stale negative 12h posterior on coherent positive 15m-6h VWAP_REVERSION does not destroy entry
+    eth_vwap_vals = {900: 0.000832, 1800: 0.000571, 3600: 0.001322, 7200: 0.000335, 14400: 0.001562, 21600: 0.001800, 43200: -0.002467}
+    for h, v in eth_vwap_vals.items():
+        record_advantage(
+            db_up,
+            engine=DAY,
+            symbol="ETHUSDT",
+            setup="VWAP_REVERSION",
+            regime="btcdown_volhi",
+            horizon=h,
+            features={"net": -cost, "age_min": 0.0},
+            advantage=v,
+            weight=80.0,
+            now=_NOW,
+        )
+    tr_eth_vwap = surface_trace(db_up, DAY, "ETHUSDT", "VWAP_REVERSION", "btcdown_volhi", {"net": -cost, "age_min": 0.0}, _NOW + 1, how="blended")
+    assert tr_eth_vwap is not None
+    assert tr_eth_vwap["advantage"] > cost
+
+    # 2. Opposing-sign / negative longer-horizon structure (+8, +7, +2, -10, -25 bps) remains strongly penalized
+    down_vals = {900: 0.00080, 1800: 0.00070, 3600: 0.00020, 7200: -0.00100, 14400: -0.00250, 21600: -0.00250, 43200: -0.00250}
+    for h, v in down_vals.items():
+        record_advantage(
+            db_up,
+            engine=DAY,
+            symbol="SOLUSDT",
+            setup="RANGE_BOUNCE",
+            regime="btcup_vollo",
+            horizon=h,
+            features={"net": -cost, "age_min": 0.0},
+            advantage=v,
+            weight=80.0,
+            now=_NOW,
+        )
+    tr_down = surface_trace(db_up, DAY, "SOLUSDT", "RANGE_BOUNCE", "btcup_vollo", {"net": -cost, "age_min": 0.0}, _NOW + 1, how="blended")
+    assert tr_down is not None
+    assert tr_down["advantage"] < -0.0040
+
+    # 3. Old 6h/12h overlap subsidy remains prevented (e.g. ERA_5 SOL EXHAUSTION_MR with h900=+4.55, h14400=+20.60, h43200=+58.31 bps)
+    overlap_vals = {900: 0.000455, 1800: 0.000699, 3600: 0.001518, 7200: 0.003097, 14400: 0.002060, 21600: 0.003459, 43200: 0.005831}
+    for h, v in overlap_vals.items():
+        record_advantage(
+            db_up,
+            engine=DAY,
+            symbol="SOLUSDT",
+            setup="EXHAUSTION_MR",
+            regime="btcdown_volhi",
+            horizon=h,
+            features={"net": -cost, "age_min": 0.0},
+            advantage=v,
+            weight=80.0,
+            now=_NOW,
+        )
+    tr_overlap = surface_trace(db_up, DAY, "SOLUSDT", "EXHAUSTION_MR", "btcdown_volhi", {"net": -cost, "age_min": 0.0}, _NOW + 1, how="blended")
+    assert tr_overlap is not None
+    assert tr_overlap["advantage"] < cost
+
+    # 4. Previous ERA_3 low-conviction losing cohort (e.g. h900=+2.35, h1800=+0.90, h3600=+3.52, h7200=-0.50, h14400=+9.00, h21600=+30.63) remains rejected
+    era3_vals = {900: 0.000235, 1800: 0.000090, 3600: 0.000352, 7200: -0.000050, 14400: 0.000900, 21600: 0.003063, 43200: 0.002442}
+    for h in DAY_ADVANTAGE_HORIZONS:
+        record_advantage(
+            db_up,
+            engine=DAY,
+            symbol="XRPUSDT",
+            setup="HTF_TREND_PULLBACK",
+            regime="btcdown_vollo",
+            horizon=h,
+            features={"net": -cost, "age_min": 0.0},
+            advantage=era3_vals[h],
+            weight=80.0,
+            now=_NOW,
+        )
+    tr_era3 = surface_trace(db_up, DAY, "XRPUSDT", "HTF_TREND_PULLBACK", "btcdown_vollo", {"net": -cost, "age_min": 0.0}, _NOW + 1, how="blended")
+    assert tr_era3 is not None
+    assert tr_era3["advantage"] < 0.0
+
+    # =========================================================================
+    # SCALP REGRESSION TESTS (1 - 6)
+    # =========================================================================
+    db_sc = str(tmp_path / "scalp_deadlock_repair.db")
+    al._connect(db_sc).close()
+    sc_ver = al.current_strategy_version("SCALP_V2")
+
+    # Seed heavy negative policy_calibration on OTHER setups (simulating stale October engine-wide -7.41 bps prior)
+    for other_stp in ("FAILED_BREAKOUT_REVERSAL", "BREAKOUT_MOMENTUM", "VWAP_EMA_RECLAIM"):
+        for step in range(15):
+            al.observe(
+                db_sc,
+                engine="SCALP_V2",
+                symbol="ETHUSDT",
+                setup=other_stp,
+                regime="btcdown_volhi",
+                metric="policy_calibration",
+                value=-0.0020,
+                strategy_version=sc_ver,
+                now=_NOW + step,
+                weight=1.0,
+            )
+
+    # 1. Cold setup/cell (TREND_PULLBACK_MICRO) does NOT inherit other setups' engine-wide negative policy_calibration
+    for step in range(8):
+        al.learn_claim_label(
+            db_sc,
+            symbol="BTCUSDT",
+            setup="TREND_PULLBACK_MICRO",
+            regime="btcup_volhi",
+            strategy_version=sc_ver,
+            raw=0.0020,
+            gross=0.0009,
+            now=_NOW + 20 + step,
+            weight=1.0,
+        )
+    cold_cal = al.scalp_claim_calibration(db_sc, "BTCUSDT", "TREND_PULLBACK_MICRO", "btcup_volhi", now=_NOW + 30)
+    assert cold_cal["key_policy_calibration"] == pytest.approx(0.0, abs=1e-12)
+    assert cold_cal["claim_gross_mean"] == pytest.approx(cold_cal["claim_gross_uncalibrated"], abs=1e-12)
+
+    # 2. Exact/setup negative realized evidence still lowers comparable future entries within the same setup
+    sibling_cal = al.scalp_claim_calibration(db_sc, "SOLUSDT", "FAILED_BREAKOUT_REVERSAL", "btcdown_volhi", now=_NOW + 30)
+    exact_cal = al.scalp_claim_calibration(db_sc, "ETHUSDT", "FAILED_BREAKOUT_REVERSAL", "btcdown_volhi", now=_NOW + 30)
+    assert sibling_cal["key_policy_calibration"] < -0.0005
+    assert exact_cal["key_policy_calibration"] <= sibling_cal["key_policy_calibration"] < -0.0015
+
+    # 3. Old zero-dilution / FAILED_BREAKOUT_REVERSAL / raw=0 BREAKOUT_MOMENTUM losing cohorts remain rejected
+    for step in range(8):
+        al.learn_claim_label(
+            db_sc,
+            symbol="ETHUSDT",
+            setup="FAILED_BREAKOUT_REVERSAL",
+            regime="btcdown_volhi",
+            strategy_version=sc_ver,
+            raw=0.0022,
+            gross=0.0003,
+            now=_NOW + 20 + step,
+            weight=1.0,
+        )
+        al.learn_claim_label(
+            db_sc,
+            symbol="BTCUSDT",
+            setup="BREAKOUT_MOMENTUM",
+            regime="btcflat_volhi",
+            strategy_version=sc_ver,
+            raw=0.0012,
+            gross=0.0003,
+            now=_NOW + 20 + step,
+            weight=1.0,
+        )
+    fbr_view = al.scalp_claim_calibration(db_sc, "ETHUSDT", "FAILED_BREAKOUT_REVERSAL", "btcdown_volhi", now=_NOW + 35)
+    fbr_move = al.scalp_expected_gross(fbr_view, 0.0022)
+    assert fbr_move["expected"] - cost < 0.0
+
+    bm_view = al.scalp_claim_calibration(db_sc, "BTCUSDT", "BREAKOUT_MOMENTUM", "btcflat_volhi", now=_NOW + 35)
+    bm_move_raw0 = al.scalp_expected_gross(bm_view, 0.0)
+    assert bm_move_raw0["expected"] - cost < 0.0
+
+    # 4. Positive claim cells can become reachable when current evidence genuinely overcomes specific negative calibration
+    for step in range(12):
+        al.learn_claim_label(
+            db_sc,
+            symbol="XRPUSDT",
+            setup="FAILED_BREAKDOWN_REVERSAL",
+            regime="btcup_volhi",
+            strategy_version=sc_ver,
+            raw=0.0028,
+            gross=0.0014,
+            now=_NOW + 40 + step,
+            weight=1.0,
+        )
+    al.observe(
+        db_sc,
+        engine="SCALP_V2",
+        symbol="SOLUSDT",
+        setup="FAILED_BREAKDOWN_REVERSAL",
+        regime="btcflat_volhi",
+        metric="policy_calibration",
+        value=-0.0015,
+        strategy_version=sc_ver,
+        now=_NOW,
+        weight=1.0,
+    )
+    pos_view = al.scalp_claim_calibration(db_sc, "XRPUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi", now=_NOW + 60)
+    pos_move = al.scalp_expected_gross(pos_view, 0.0028)
+    assert pos_view["key_policy_calibration"] < 0.0
+    assert pos_move["expected"] > cost
+
+    # 5 & 6. 1d29a26 symmetric 0.12 claim damping and hold key_policy_calibration preservation remain unchanged
+    m_above = al.scalp_expected_gross(pos_view, pos_view["claim_raw_center"] + 0.0005)
+    m_below = al.scalp_expected_gross(pos_view, max(0.0, pos_view["claim_raw_center"] - 0.0005))
+    assert m_above["calibrated"] - pos_view["claim_gross_setup"] == pytest.approx(0.12 * pos_view["claim_capture"] * 0.0005, abs=1e-12)
+    assert pos_view["claim_gross_setup"] - m_below["calibrated"] == pytest.approx(0.12 * pos_view["claim_capture"] * 0.0005, abs=1e-12)
+
+    vm = cv.ValueModel()
+    hold_st = {"net": 0.0001, "mfe": 0.0005, "mae": 0.0, "giveback": 0.0, "age_min": 4.0}
+    ent_with = {
+        "calibrated": pos_move["calibrated"],
+        "adaptive": pos_move["adaptive"],
+        "raw_claim": 0.0028,
+        "cost": cost,
+        "key_policy_calibration": pos_move["key_policy_calibration"],
+        "uncalibrated_gross": pos_move["uncalibrated_gross"],
+        "uncalibrated_slope_term": pos_move["uncalibrated_slope_term"],
+    }
+    ent_without = {**ent_with, "key_policy_calibration": 0.0}
+    # Fold one dummy observation so ValueModel has informed horizons
+    x_d = cv.vector(hold_st, ent_with, "XRPUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi")
+    for h in cv.HORIZONS_SEC:
+        vm.fold([(h, x_d, 0.0001, _NOW, 1.0)], _NOW)
+    v_with = cv.value("unused", "XRPUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi", hold_st, ent_with, model=vm)["advantage"]
+    v_without = cv.value("unused", "XRPUSDT", "FAILED_BREAKDOWN_REVERSAL", "btcup_volhi", hold_st, ent_without, model=vm)["advantage"]
+    assert v_with - v_without == pytest.approx(pos_move["key_policy_calibration"] * 0.60, abs=1e-12)

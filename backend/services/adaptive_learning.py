@@ -1525,11 +1525,21 @@ def scalp_claim_calibration(db_path: str, symbol: str, setup: str, regime: str, 
     moment = float(now) if now is not None else _data_clock(claim_rows)
     gross = _lattice(claim_rows, engine_id=SCALP_ENGINE, symbol=symbol, setup=setup, regime=regime, weights={"claim_gross": 1.0}, prior=0.0, now=moment)
     pol_cal_rows = _state_rows(db_path, SCALP_ENGINE, ("policy_calibration",))
-    pol_cal_lat = policy_calibration(db_path, SCALP_ENGINE, symbol, setup, regime, now=moment, rows=pol_cal_rows)
+    pol_cal_lat = _lattice(
+        [r for r in pol_cal_rows if str(r["metric"]) == "policy_calibration"],
+        engine_id=SCALP_ENGINE,
+        symbol=symbol,
+        setup=setup,
+        regime=regime,
+        weights={"policy_calibration": 1.0},
+        prior=_prior(SCALP_ENGINE, "policy_calibration"),
+        now=moment,
+        include_engine=False,
+    )
     key_pol_cal = min(0.0, float(pol_cal_lat["mean"]))
     for prow in pol_cal_rows:
         if _norm_symbol(prow["symbol"]) == sym and str(prow["setup"] or "").upper() == stp and str(prow["regime"] or "").lower() == reg:
-            pn = float(prow["n"] or 0.0)
+            pn = float(prow["n"] or 0.0) * _decay_factor(str(prow["updated_at"] or ""), moment, SCALP_ENGINE)
             pewma = float(prow["ewma"] or 0.0)
             if pn > 0.0 and pewma < 0.0:
                 cell_cal = pewma if pn >= 1.8 else pewma * (pn / (1.0 + pn))

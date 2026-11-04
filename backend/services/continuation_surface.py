@@ -343,32 +343,51 @@ def surface_trace(
         return None
     if how == "blended":
         base_h = float(min(horizons_for(engine_id)))
-        h_exp = 0.85 if age_sec <= 0.0 else 0.15
-        weights = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** h_exp) * float(item.get("rem_fade", 1.0)) for item in informed]
-        weight = sum(weights)
-        advantage = sum(float(item["value"]) * w for item, w in zip(informed, weights, strict=True)) / weight
         if age_sec <= 0.0 and len(informed) > 1:
-            short_v = next((float(item["value"]) for item in informed if int(item["horizon"]) == int(base_h)), advantage)
-            advantage = min(float(advantage), short_v)
-            vals_all = [float(item["value"]) for item in informed]
-            vals_4h = [float(item["value"]) for item in informed if int(item["horizon"]) <= 14400]
-            h14400 = next((float(item["value"]) for item in informed if int(item["horizon"]) == 14400), 0.0)
-            if h14400 < 0.0:
-                advantage += h14400
-            if max(vals_all) > min(vals_all):
-                import statistics as _stats
+            inf_4h = [item for item in informed if int(item["horizon"]) <= 14400] or informed
+            ws_4h = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** 0.85) for item in inf_4h]
+            blended_4h = sum(float(item["value"]) * w for item, w in zip(inf_4h, ws_4h, strict=True)) / sum(ws_4h)
+            vals_4h = [float(item["value"]) for item in inf_4h]
+            short_v = next((float(item["value"]) for item in inf_4h if int(item["horizon"]) == int(base_h)), vals_4h[0])
+            min_4h = min(vals_4h)
+            h14400 = next((float(item["value"]) for item in inf_4h if int(item["horizon"]) == 14400), vals_4h[-1])
+            h21600 = next((float(item["value"]) for item in informed if int(item["horizon"]) == 21600), h14400)
+            h43200 = next((float(item["value"]) for item in informed if int(item["horizon"]) == 43200), h21600)
+            import statistics as _stats
 
-                if len(vals_all) > 1:
-                    advantage -= 0.15 * _stats.stdev(vals_all)
-                if len(vals_4h) > 1:
-                    advantage -= 0.15 * _stats.stdev(vals_4h)
+            downs_4h = [max(vals_4h[: k + 1]) - vals_4h[k] for k in range(len(vals_4h))]
+            down_4h = _stats.stdev(downs_4h) if len(downs_4h) > 1 and max(downs_4h) > min(downs_4h) else 0.0
+            if short_v <= 0.0 or min_4h <= 0.0:
+                advantage = min(blended_4h, short_v, min_4h)
+                if h14400 < 0.0:
+                    advantage += h14400
+                if len(vals_4h) > 1 and max(vals_4h) > min(vals_4h):
+                    advantage -= 0.15 * _stats.stdev(vals_4h) + 0.15 * down_4h
+            else:
+                if down_4h <= 1e-9 and h21600 >= h14400 and h43200 <= h21600 and h14400 <= 5.0 * short_v:
+                    advantage = blended_4h
+                else:
+                    advantage = min(blended_4h, short_v)
+                advantage -= 0.15 * down_4h
+                if h43200 > h14400:
+                    vals_long = [*vals_4h, h21600, h43200]
+                    advantage -= 0.15 * _stats.stdev(vals_long)
+                elif h21600 < h14400:
+                    advantage -= 0.15 * (h14400 - h21600)
         elif age_sec > 0.0 and features:
+            weights = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** 0.15) * float(item.get("rem_fade", 1.0)) for item in informed]
+            weight = sum(weights)
+            advantage = sum(float(item["value"]) * w for item, w in zip(informed, weights, strict=True)) / weight
             mfe_now = max(0.0, float(features.get("mfe") or 0.0))
             gb_now = max(0.0, float(features.get("giveback") or 0.0))
             net_now = float(features.get("net") or 0.0)
             slp_now = float(features.get("slope") or 0.0)
             if mfe_now >= 0.0020 and gb_now >= 0.35 * mfe_now and net_now > 0.0 and slp_now <= 0.0:
                 advantage = min(float(advantage), -1e-5)
+        else:
+            weights = [float(item["evidence"]) * ((base_h / max(base_h, float(item["horizon"]))) ** (0.85 if age_sec <= 0.0 else 0.15)) * float(item.get("rem_fade", 1.0)) for item in informed]
+            weight = sum(weights)
+            advantage = sum(float(item["value"]) * w for item, w in zip(informed, weights, strict=True)) / weight
     else:
         advantage = max(float(item["value"]) for item in informed)
     return {"advantage": float(advantage), "how": how, "horizons": informed, "coordinates": feature_vector(features)}
