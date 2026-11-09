@@ -21,6 +21,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -188,20 +189,28 @@ def day_v2_held_symbols(open_positions: dict | None) -> set[str]:
 LABEL_RESOLVE_INTERVAL_SEC = 60.0
 
 
+_LABEL_RESOLVE_LOCK = threading.Lock()
+
+
 def resolve_learning_labels(db_path: str) -> None:
     """Fold every due markout label and continuation advantage. Exactly once per label."""
-    from backend.services.adaptive_learning import ohlcv_low_between, ohlcv_quote, resolve_markouts
-
+    if not _LABEL_RESOLVE_LOCK.acquire(blocking=False):
+        return
     try:
-        resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts), path_low=lambda sym, a, b: ohlcv_low_between(db_path, sym, a, b))
-    except Exception:
-        logger.warning("MARKOUT_RESOLVE_FAILED", exc_info=True)
-    try:
-        from backend.services.continuation_backfill import fold_recent_advantages
+        from backend.services.adaptive_learning import ohlcv_low_between, ohlcv_quote, resolve_markouts
 
-        fold_recent_advantages(db_path)
-    except Exception:
-        logger.warning("CONTINUATION_FOLD_FAILED", exc_info=True)
+        try:
+            resolve_markouts(db_path, lambda sym, ts: ohlcv_quote(db_path, sym, ts), path_low=lambda sym, a, b: ohlcv_low_between(db_path, sym, a, b))
+        except Exception:
+            logger.warning("MARKOUT_RESOLVE_FAILED", exc_info=True)
+        try:
+            from backend.services.continuation_backfill import fold_recent_advantages
+
+            fold_recent_advantages(db_path)
+        except Exception:
+            logger.warning("CONTINUATION_FOLD_FAILED", exc_info=True)
+    finally:
+        _LABEL_RESOLVE_LOCK.release()
 
 
 class PortfolioEngineIntegration:
@@ -1637,7 +1646,7 @@ class PortfolioEngineIntegration:
             with contextlib.suppress(Exception):
                 from backend.services.full_state_research import tick_day_research
 
-                tick_day_research(db_path, float(entry_bar or time.time()))
+                await asyncio.to_thread(tick_day_research, db_path, float(entry_bar or time.time()))
             sym_sep = "-"  # detect separator used in feature_ohlcv
             try:
                 with _sqlite3.connect(db_path) as _con:
@@ -1805,18 +1814,27 @@ class PortfolioEngineIntegration:
                     logger.warning("DAY_V2_SIGNAL_ERROR symbol=%s", symbol, exc_info=True)
 
             # Labels are due on their own clock; a bar with no DAY candidate still resolves them.
-            resolve_learning_labels(db_path)
+            await asyncio.to_thread(lambda: resolve_learning_labels(db_path))
             if not candidates:
                 return
             from backend.config.trading_economics import canonical_roundtrip_cost_pct
             from backend.services.adaptive_learning import CANDIDATE_QUALIFIED, day_decision
             from backend.services.day_v2.ranking import rank_day_candidates
 
-            for cand in candidates:
-                sig = cand["signal"]
-                cand["adaptive"] = day_decision(db_path, cand["symbol"], str(cand.get("learned_setup") or sig.setup), str(cand.get("regime_tag") or ""), features=cand.get("state_features"))
-                cand["adaptive"]["geometry_setup"] = sig.setup
-            ranked = rank_day_candidates(candidates, list(DAY_V2_UNIVERSE), canonical_roundtrip_cost_pct())
+            def _score_and_rank_day() -> list[dict[str, Any]]:
+                for cand in candidates:
+                    sig = cand["signal"]
+                    cand["adaptive"] = day_decision(
+                        db_path,
+                        cand["symbol"],
+                        str(cand.get("learned_setup") or sig.setup),
+                        str(cand.get("regime_tag") or ""),
+                        features=cand.get("state_features"),
+                    )
+                    cand["adaptive"]["geometry_setup"] = sig.setup
+                return rank_day_candidates(candidates, list(DAY_V2_UNIVERSE), canonical_roundtrip_cost_pct())
+
+            ranked = await asyncio.to_thread(_score_and_rank_day)
             logger.info(
                 "DAY_V2_RANKED %s",
                 " ".join(
@@ -1827,26 +1845,30 @@ class PortfolioEngineIntegration:
             alts = [{"symbol": c["symbol"], "setup": c["signal"].setup, "expected_net": c["rank"]["expected_net"], "position": c["rank"]["position"]} for c in ranked]
             for cand in ranked:
                 cand["alternatives"] = [a for a in alts if a["symbol"] != cand["symbol"] or a["setup"] != cand["signal"].setup]
-            for cand in ranked:
-                try:
-                    cand["markout_id"] = self._record_day_v2_candidate(db_path, cand, CANDIDATE_QUALIFIED)
-                except Exception:
-                    logger.debug("DAY_V2_CANDIDATE_RECORD_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
-                try:
-                    from backend.config.research_flags import policy_research_enabled
 
-                    if policy_research_enabled():
-                        from backend.services.policy_episode import open_recorded_day
+            def _record_day_batch() -> None:
+                for cand in ranked:
+                    try:
+                        cand["markout_id"] = self._record_day_v2_candidate(db_path, cand, CANDIDATE_QUALIFIED)
+                    except Exception:
+                        logger.debug("DAY_V2_CANDIDATE_RECORD_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
+                    try:
+                        from backend.config.research_flags import policy_research_enabled
 
-                        open_recorded_day(db_path, cand, cand.get("markout_id"))
-                except Exception:
-                    logger.debug("POLICY_EPISODE_OPEN_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
-                try:
-                    from backend.services.exact_policy_capture import open_exact_episode
+                        if policy_research_enabled():
+                            from backend.services.policy_episode import open_recorded_day
 
-                    open_exact_episode(db_path, cand, cand.get("markout_id"))
-                except Exception:
-                    logger.warning("EXACT_POLICY_OPEN_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
+                            open_recorded_day(db_path, cand, cand.get("markout_id"))
+                    except Exception:
+                        logger.debug("POLICY_EPISODE_OPEN_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
+                    try:
+                        from backend.services.exact_policy_capture import open_exact_episode
+
+                        open_exact_episode(db_path, cand, cand.get("markout_id"))
+                    except Exception:
+                        logger.warning("EXACT_POLICY_OPEN_FAILED symbol=%s", cand.get("symbol"), exc_info=True)
+
+            await asyncio.to_thread(_record_day_batch)
             for cand in ranked:
                 try:
                     await self._fund_day_v2_candidate(cand, db_path)
@@ -2415,7 +2437,7 @@ class PortfolioEngineIntegration:
         with contextlib.suppress(Exception):
             from backend.services.full_state_research import tick_scalp_research
 
-            tick_scalp_research(markout_db, products, cycle_ts)
+            await _asyncio.to_thread(tick_scalp_research, markout_db, products, cycle_ts)
 
         def _scalp_book(norm_key: str) -> dict:
             # Live book/flow features for the inspectable microstructure edge model.

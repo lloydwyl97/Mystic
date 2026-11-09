@@ -2851,6 +2851,8 @@ def _repair_short_marks(db_path: str, row: Any, marks: dict) -> None:
     """Replace stored 30s/60s marks with an executable bid, or drop an unlearned leak."""
     if str(row["engine_id"]) != SCALP_ENGINE:
         return
+    if marks.get("_short_bid") is True:
+        return
     ref = float(row["ref_price"] or 0)
     cost = float(row["roundtrip_cost"] or 0)
     learned = int(row["learned"] or 0)
@@ -2865,6 +2867,8 @@ def _repair_short_marks(db_path: str, row: Any, marks: dict) -> None:
             marks[key] = executable_bid_net(ref, float(price), cost)
         elif not learned:
             marks.pop(key, None)
+    if "30" in marks and "60" in marks and marks.get("30") is not None and marks.get("60") is not None:
+        marks["_short_bid"] = True
 
 
 def repair_stored_short_marks(db_path: str, *, limit: int = 500) -> int:
@@ -3003,6 +3007,7 @@ def resolve_markouts(
         backfill_close_calibration(db_path)
     except (sqlite3.Error, ValueError):
         logger.warning("CALIBRATION_BACKFILL_FAILED", exc_info=True)
+    default_bars_1m = bars_1m is None
     if bars_1m is None:
         from backend.services.day_v2.lifecycle_sim import ohlcv_bars_1m
 
@@ -3028,6 +3033,32 @@ def resolve_markouts(
                     (window_engine,),
                 ).fetchall()
             )
+        if default_bars_1m:
+            from backend.services.day_v2.lifecycle_sim import DAY_LIFECYCLE_MAX_MIN, LifecycleParams, ohlcv_bars_1m
+
+            spans_by_sym: dict[str, tuple[float, float]] = {}
+            for r in rows:
+                if str(r["engine_id"]) != DAY_ENGINE or not str(r["lifecycle_json"] or ""):
+                    continue
+                params = LifecycleParams.from_json(r["lifecycle_json"])
+                if params is None:
+                    continue
+                sym_k = str(r["symbol"] or "").upper().replace("-", "").replace("/", "")
+                s_lo = float(params.entry_time)
+                s_hi = min(moment, s_lo + DAY_LIFECYCLE_MAX_MIN * 60.0) + 60.0
+                prev_lo, prev_hi = spans_by_sym.get(sym_k, (s_lo, s_hi))
+                spans_by_sym[sym_k] = (min(prev_lo, s_lo), max(prev_hi, s_hi))
+            bars_by_sym = {sym_k: ohlcv_bars_1m(db_path, sym_k, lo, hi) for sym_k, (lo, hi) in spans_by_sym.items()}
+
+            def bars_1m(sym: str, start: float, end: float) -> list:
+                sym_k = str(sym or "").upper().replace("-", "").replace("/", "")
+                cached = bars_by_sym.get(sym_k)
+                if cached is None:
+                    return ohlcv_bars_1m(db_path, sym, start, end)
+                lo_t = math.floor(float(start) / 60.0) * 60.0
+                hi_t = float(end)
+                return [b for b in cached if lo_t <= b[0] < hi_t]
+
         for row in rows:
             try:
                 engine_id = str(row["engine_id"])

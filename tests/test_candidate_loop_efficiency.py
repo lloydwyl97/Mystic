@@ -226,3 +226,142 @@ def test_missing_or_nonfinite_quote_is_retried_until_valid(tmp_path: Path):
         n, ewma = conn.execute("SELECT n, ewma FROM adaptive_metric_state WHERE metric='markout_forward'").fetchone()
     assert n == pytest.approx(1.0)
     assert ewma == pytest.approx((101.0 - 100.0) / 100.0 - 0.0006)
+
+
+def test_batched_lifecycle_bars_match_per_row_and_mid_savepoint_failure_recovers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import backend.services.adaptive_learning as al
+    from backend.services.day_v2.lifecycle_sim import LifecycleParams, ohlcv_bars_1m
+
+    db_a = str(tmp_path / "batch_a.db")
+    db_b = str(tmp_path / "batch_b.db")
+    for db in (db_a, db_b):
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                """
+                CREATE TABLE feature_ohlcv (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT, interval TEXT, ts TEXT,
+                    open REAL, high REAL, low REAL, close REAL, volume REAL
+                )
+                """
+            )
+            for m in range(70):
+                t = 1_794_000_000 + m * 60
+                import time as _time
+
+                ts_s = _time.strftime("%Y-%m-%d %H:%M:%S.000000", _time.gmtime(t))
+                for sym, px in (("BTC-USDT", 75_000.0 + m * 25.0), ("ETH-USDT", 2_140.0 + m * 1.5)):
+                    conn.execute(
+                        "INSERT INTO feature_ohlcv (symbol, interval, ts, open, high, low, close, volume) VALUES (?, '1m', ?, ?, ?, ?, ?, 10.0)",
+                        (sym, ts_s, px, px * 1.003, px * 0.998, px * 1.001),
+                    )
+            conn.commit()
+        for idx, (sym, reg, opp) in enumerate(
+            (
+                ("BTCUSDT", "btcflat_vollo", "OPP_BTC_1"),
+                ("BTCUSDT", "btcdown_volhi", "OPP_BTC_2"),
+                ("ETHUSDT", "btcdown_vollo", "OPP_ETH_1"),
+            )
+        ):
+            t_eval = 1_794_000_000.0 + idx * 60.0
+            lp = LifecycleParams(
+                setup="BREAKOUT_CONTINUATION",
+                entry_price=75_000.0 if "BTC" in sym else 2_140.0,
+                entry_time=t_eval,
+                atr_15m=120.0 if "BTC" in sym else 8.0,
+                structural_anchor=74_400.0 if "BTC" in sym else 2_110.0,
+                target_price=76_200.0 if "BTC" in sym else 2_200.0,
+                atr_1h=300.0 if "BTC" in sym else 18.0,
+                objective_structural=76_200.0 if "BTC" in sym else 2_200.0,
+            )
+            record_candidate(
+                db,
+                engine="DAY_V2",
+                symbol=sym,
+                setup="BREAKOUT_CONTINUATION",
+                regime=reg,
+                ref_price=lp.entry_price,
+                roundtrip_cost=0.00066,
+                signaled=True,
+                evaluated_at=t_eval,
+                candidate_state="QUALIFIED",
+                lifecycle=lp,
+                opportunity_id=opp,
+            )
+
+    now = 1_794_000_000.0 + 400 * 60.0
+    assert resolve_markouts(db_a, lambda s, t: al.ohlcv_quote(db_a, s, t), now=now) == 3
+    assert (
+        resolve_markouts(
+            db_b,
+            lambda s, t: al.ohlcv_quote(db_b, s, t),
+            now=now,
+            bars_1m=lambda s, a, b: ohlcv_bars_1m(db_b, s, a, b),
+        )
+        == 3
+    )
+    with sqlite3.connect(db_a) as ca, sqlite3.connect(db_b) as cb:
+        state_a = ca.execute("SELECT symbol, setup, regime, metric, n, ewma, m2 FROM adaptive_metric_state ORDER BY 1,2,3,4").fetchall()
+        state_b = cb.execute("SELECT symbol, setup, regime, metric, n, ewma, m2 FROM adaptive_metric_state ORDER BY 1,2,3,4").fetchall()
+        marks_a = ca.execute("SELECT id, learned, lifecycle_learned, markouts_json FROM adaptive_candidate_markouts ORDER BY id").fetchall()
+        marks_b = cb.execute("SELECT id, learned, lifecycle_learned, markouts_json FROM adaptive_candidate_markouts ORDER BY id").fetchall()
+    assert state_a == state_b
+    assert marks_a == marks_b
+
+    db_crash = str(tmp_path / "crash.db")
+    record_candidate(
+        db_crash,
+        engine="DAY_V2",
+        symbol="SOLUSDT",
+        setup="RANGE_BOUNCE",
+        regime="btcdown_volhi",
+        ref_price=87.0,
+        roundtrip_cost=0.00066,
+        signaled=True,
+        evaluated_at=1_000.0,
+    )
+    orig_fold = al._fold_markout_labels
+
+    def _boom(*args, **kwargs):
+        raise sqlite3.OperationalError("simulated mid-savepoint crash")
+
+    monkeypatch.setattr(al, "_fold_markout_labels", _boom)
+    assert resolve_markouts(db_crash, lambda _s, _t: 88.0, now=1_000.0 + 400 * 60.0) == 0
+    with sqlite3.connect(db_crash) as conn:
+        assert conn.execute("SELECT learned FROM adaptive_candidate_markouts").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM adaptive_metric_state").fetchone()[0] == 0
+
+    monkeypatch.setattr(al, "_fold_markout_labels", orig_fold)
+    assert resolve_markouts(db_crash, lambda _s, _t: 88.0, now=1_000.0 + 400 * 60.0) == 1
+    assert resolve_markouts(db_crash, lambda _s, _t: 88.0, now=1_000.0 + 400 * 60.0) == 0
+    with sqlite3.connect(db_crash) as conn:
+        assert conn.execute("SELECT n FROM adaptive_metric_state WHERE metric='markout_forward'").fetchone()[0] == pytest.approx(1.0)
+
+
+async def test_offloaded_label_resolution_does_not_block_event_loop_ticks(tmp_path: Path):
+    import asyncio
+    import time as _time
+
+    from backend.services.portfolio_engine_integration import resolve_learning_labels
+
+    db = _paper_db(tmp_path)
+    ticks = 0
+    stop = False
+
+    async def _ticker():
+        nonlocal ticks
+        while not stop:
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    task = asyncio.create_task(_ticker())
+    t0 = _time.perf_counter()
+    await asyncio.gather(
+        asyncio.to_thread(resolve_learning_labels, db),
+        asyncio.to_thread(resolve_learning_labels, db),
+    )
+    elapsed = _time.perf_counter() - t0
+    stop = True
+    await task
+    assert ticks >= 1
+    assert elapsed < 5.0
