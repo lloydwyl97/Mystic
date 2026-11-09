@@ -321,6 +321,57 @@ def test_cached_only_never_hits_the_venue(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert out["error"], "an unfetched reconciliation must not read as a real zero result"
 
 
+def test_trade_pages_do_not_stop_at_one_thousand() -> None:
+    """SOL and XRP each have more than 1000 live fills. One page is not the tape."""
+    from backend.services.live_pnl_reconciliation import collect_paged_trades
+
+    def fetch(since: int) -> list[dict]:
+        start = 0 if since <= 1 else since
+        # 1000 trades at distinct timestamps, then 169 more.
+        if start <= 1:
+            return [{"id": str(i), "timestamp": i} for i in range(1, 1001)]
+        if start == 1000:
+            return [{"id": str(i), "timestamp": i} for i in range(1000, 1169)]
+        return []
+
+    trades = collect_paged_trades(fetch, 1)
+    assert len(trades) == 1168
+    assert trades[-1]["id"] == "1168"
+
+
+def test_dust_proceeds_credit_usdt_once_and_ignore_the_service_charge() -> None:
+    from backend.services.live_pnl_reconciliation import dust_conversion_proceeds_usd
+
+    logs = [
+        {
+            "operateTime": 200,
+            "userAssetDribbletDetails": [
+                {"tranId": "1", "operateTime": 200, "fromAsset": "XRP", "toAsset": "USDT", "amount": "28.63", "transferredAmount": "38.37", "serviceChargeAmount": "2.02"},
+                {"tranId": "1", "operateTime": 200, "fromAsset": "XRP", "toAsset": "USDT", "amount": "28.63", "transferredAmount": "38.37", "serviceChargeAmount": "2.02"},
+                {"tranId": "2", "operateTime": 50, "fromAsset": "BTC", "toAsset": "USDT", "amount": "0.01", "transferredAmount": "100", "serviceChargeAmount": "1"},
+                {"tranId": "3", "operateTime": 200, "fromAsset": "DOGE", "toAsset": "USDT", "amount": "5", "transferredAmount": "1", "serviceChargeAmount": "0"},
+            ],
+        }
+    ]
+    assert dust_conversion_proceeds_usd(logs, 100) == pytest.approx(38.37)
+
+
+def test_primary_uses_fill_tape_plus_dust_proceeds_when_both_are_known() -> None:
+    fields = presentation_fields(
+        {
+            "ok": True,
+            "error": "",
+            "live_reconciled_usd": -323.58,
+            "live_economic_usd": -159.92,
+            "live_recorded_usd": -150.57,
+            "live_dust_writeoff_usd": -154.24,
+        },
+        is_live=True,
+    )
+    assert fields["primary_result_usd"] == pytest.approx(-159.92)
+    assert "dust-conversion" in fields["primary_result_label"]
+
+
 def test_unfetched_reconciliation_is_not_presented_as_zero() -> None:
     """A cold cache must not paint recorded P&L, fees, or match counts as zero."""
     import backend.services.live_pnl_reconciliation as mod

@@ -947,6 +947,57 @@ def summarize_live_fill_latency(db_path: str, *, limit: int = 200) -> dict[str, 
     }
 
 
+def summarize_candidate_batch_ms(db_path: str, *, limit: int = 200) -> dict[str, Any]:
+    """Duration of recorded SCALP evaluation batches. Null until a batch is stamped.
+
+    Older decisions have no timing block. They are not filled in. One batch
+    stamps every symbol, so each start time counts once.
+    """
+    window = max(1, int(limit))
+    durations: list[float] = []
+    seen: set[float] = set()
+    rows: list[Any] = []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = conn.execute(
+                """
+                SELECT detail FROM scalp_v2_decisions
+                WHERE id > (SELECT COALESCE(MAX(id), 0) FROM scalp_v2_decisions) - ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (window, window),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        logger.debug("CANDIDATE_BATCH_TIMING_READ_FAILED", exc_info=True)
+    for row in rows:
+        detail = row[0] if row else None
+        try:
+            payload = json.loads(detail or "{}")
+        except (TypeError, ValueError):
+            continue
+        timing = payload.get("timing") if isinstance(payload, dict) else None
+        if not isinstance(timing, dict):
+            continue
+        try:
+            start_s = float(timing.get("eval_batch_start"))
+            end_s = float(timing.get("eval_batch_end"))
+        except (TypeError, ValueError):
+            continue
+        duration = (end_s - start_s) * 1000.0
+        if duration < 0 or duration > 120_000 or start_s in seen:
+            continue
+        seen.add(start_s)
+        durations.append(duration)
+    stats = _latency_stats(durations)
+    stats["metric"] = "candidate_batch_ms"
+    stats["source"] = "scalp_v2_decisions.timing" if durations else "not_stored"
+    return stats
+
+
 async def execute_protected_limit_live(
     live_service: Any,
     *,

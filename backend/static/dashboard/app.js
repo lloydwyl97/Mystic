@@ -1608,14 +1608,15 @@ function updatePnlReconciliation(res, stale) {
     };
 
     const reconciled = p.primary_result_is_exchange_reconciled === true;
-    signed("pnl-live-reconciled", reconciled ? p.live_reconciled_usd : p.live_recorded_usd);
+    const primaryValue = p.primary_result_usd != null ? p.primary_result_usd : (reconciled ? p.live_reconciled_usd : p.live_recorded_usd);
+    signed("pnl-live-reconciled", primaryValue);
     const primaryEl = document.getElementById("pnl-live-reconciled");
     if (primaryEl) {
-        primaryEl.title = reconciled
-            ? "Binance.US venue gross minus venue quote fees. The real trading result."
-            : "Exchange reconciliation unavailable — showing the engine's recorded live figure, which is not venue-confirmed.";
+        primaryEl.title = p.primary_result_label || (reconciled
+            ? "Binance.US fill tape plus dust-conversion USDT credited."
+            : "Exchange reconciliation unavailable — showing the engine's recorded live figure, which is not venue-confirmed.");
     }
-    setCardText("pnl-live-source", reconciled ? "Binance.US reconciled" : "RECORDED ONLY — not venue-confirmed");
+    setCardText("pnl-live-source", reconciled ? (p.primary_result_label || "Binance.US reconciled") : "RECORDED ONLY — not venue-confirmed");
     signed("pnl-live-recorded", p.live_recorded_usd);
     signed("pnl-live-dust", p.live_dust_writeoff_usd);
     signed("pnl-paper", p.paper_realized_usd);
@@ -2582,6 +2583,7 @@ function updateLatency(data) {
             "signal_to_order p95_ms: " + show(dtem.p95),
             "submit_to_ack avg_ms: " + show(ack.avg) + " p95: " + show(ack.p95) + " n: " + show(ack.samples),
             "submit_to_fill avg_ms: " + show(fill.avg) + " p95: " + show(fill.p95) + " n: " + show(fill.samples),
+            "candidate_batch avg_ms: " + show((d.candidate_batch_ms || {}).avg) + " p95: " + show((d.candidate_batch_ms || {}).p95) + " n: " + show((d.candidate_batch_ms || {}).samples),
         ];
         detailEl.textContent = lines.join("\n");
     }

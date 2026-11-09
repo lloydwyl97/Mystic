@@ -27075,6 +27075,8 @@ class PortfolioEngine:
             },
             "order_submit_to_ack_ms": execution_latency["order_submit_to_ack_ms"],
             "order_submit_to_fill_ms": execution_latency["order_submit_to_fill_ms"],
+            "candidate_batch_ms": execution_latency.get("candidate_batch_ms")
+            or {"avg": None, "p50": None, "p95": None, "p99": None, "max": None, "samples": 0, "metric": "candidate_batch_ms", "source": "not_stored"},
             "health_flag": health_flag,
             "stale_symbol_count": stale_count,
             "total_symbols": len(TRADING_SYMBOLS),
@@ -27083,9 +27085,11 @@ class PortfolioEngine:
 
     async def _get_execution_latency(self) -> dict:
         """Rolling submit-to-ack and submit-to-fill from stored live orders."""
-        from backend.services.protected_limit_execution import summarize_live_fill_latency
+        from backend.services.protected_limit_execution import summarize_candidate_batch_ms, summarize_live_fill_latency
 
-        return await asyncio.to_thread(summarize_live_fill_latency, self.db_path)
+        fills = await asyncio.to_thread(summarize_live_fill_latency, self.db_path)
+        fills["candidate_batch_ms"] = await asyncio.to_thread(summarize_candidate_batch_ms, self.db_path)
+        return fills
 
     async def get_audit_export(self, hours: int = 24) -> list[dict]:
         """Export audit records for last N hours"""

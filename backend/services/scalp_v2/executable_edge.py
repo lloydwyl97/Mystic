@@ -343,6 +343,9 @@ def decision_detail(row: dict[str, Any] | None, **extra: Any) -> str:
     for key in ("evaluated_at", "book_age_sec"):
         if isinstance(row.get(key), (int, float)):
             payload[key] = round(float(row[key]), 3)
+    timing = row.get("_timing")
+    if isinstance(timing, dict) and timing:
+        payload["timing"] = {key: round(float(val), 6) for key, val in timing.items() if isinstance(val, (int, float)) and not isinstance(val, bool)}
     payload.update({k: v for k, v in extra.items() if v is not None})
     return json.dumps(payload, separators=(",", ":"), default=str)
 

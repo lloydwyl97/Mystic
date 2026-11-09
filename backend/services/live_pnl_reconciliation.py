@@ -88,10 +88,17 @@ class LivePnlReconciliation:
     window_start: str = ""
     window_end: str = ""
 
-    # The real trading result: venue fills only.
+    # Fill tape: sell quote - buy quote - quote fees. Base-asset commission is
+    # already inside the quote spent and the quantity received, so it is not
+    # subtracted again.
     live_reconciled_usd: float = 0.0
     live_venue_gross_usd: float = 0.0
     live_venue_fee_quote_usd: float = 0.0
+    # USDT credited by Binance dust conversion of top-4 base in the same window.
+    # None when the dust log could not be read. Not a second fee.
+    live_dust_conversion_proceeds_usd: float | None = None
+    # Fill tape plus dust-conversion proceeds. None until both parts are known.
+    live_economic_usd: float | None = None
 
     # What the engine recorded for mode=live, for comparison.
     live_recorded_usd: float = 0.0
@@ -287,8 +294,101 @@ def read_recorded_live(db_path: str) -> dict[str, Any]:
     return out
 
 
+_DUST_ASSETS = frozenset({"BTC", "ETH", "SOL", "XRP"})
+_MAX_TRADE_PAGES = 50
+
+
+def collect_paged_trades(fetch_page: Any, since_ms: int, *, page_size: int = 1000, max_pages: int = _MAX_TRADE_PAGES) -> list[dict[str, Any]]:
+    """Follow a trade-id window until a short page. Same-millisecond rows are kept.
+
+    ``fetch_page(since_ms)`` returns one page. The next page starts at the latest
+    timestamp already seen so a full page does not drop siblings that share it.
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    since = int(since_ms)
+    for _ in range(max(1, int(max_pages))):
+        batch = list(fetch_page(since) or [])
+        if not batch:
+            break
+        added = 0
+        max_ts = since
+        for trade in batch:
+            trade_id = str(trade.get("id") or "")
+            try:
+                trade_ts = int(trade.get("timestamp") or 0)
+            except (TypeError, ValueError):
+                trade_ts = 0
+            max_ts = max(max_ts, trade_ts)
+            if trade_id and trade_id not in seen:
+                seen.add(trade_id)
+                out.append(trade)
+                added += 1
+        if len(batch) < int(page_size):
+            break
+        nxt = max_ts if added else max_ts + 1
+        if nxt <= since:
+            nxt = since + 1
+        since = nxt
+    return out
+
+
+def dust_conversion_proceeds_usd(logs: list[dict[str, Any]] | None, since_ms: int, *, assets: frozenset[str] = _DUST_ASSETS) -> float:
+    """USDT credited for converting top-4 base after ``since_ms``.
+
+    ``transferredAmount`` is the USDT that landed. The service charge is already
+    excluded from it, so this does not subtract the charge again. One tranId
+    counts once.
+    """
+    seen: set[str] = set()
+    total = 0.0
+    for row in logs or []:
+        details = row.get("userAssetDribbletDetails") if isinstance(row, dict) else None
+        for detail in details or []:
+            if not isinstance(detail, dict):
+                continue
+            try:
+                moment = int(detail.get("operateTime") or row.get("operateTime") or 0)
+            except (TypeError, ValueError):
+                moment = 0
+            if moment < int(since_ms):
+                continue
+            if str(detail.get("toAsset") or "").upper() != "USDT":
+                continue
+            if str(detail.get("fromAsset") or "").upper() not in assets:
+                continue
+            tran = str(detail.get("tranId") or "")
+            if tran:
+                if tran in seen:
+                    continue
+                seen.add(tran)
+            try:
+                total += float(detail.get("transferredAmount") or 0.0)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
+def _ccxt_fill(trade: dict[str, Any]) -> dict[str, Any]:
+    fee = trade.get("fee") or {}
+    return {
+        "id": str(trade.get("id") or ""),
+        "order": str(trade.get("order") or ""),
+        "side": str(trade.get("side") or "").upper(),
+        "qty": float(trade.get("amount") or 0.0),
+        "cost": float(trade.get("cost") or 0.0),
+        "ts": int(trade.get("timestamp") or 0),
+        "fee_cost": float(fee.get("cost") or 0.0),
+        "fee_ccy": str(fee.get("currency") or "").upper(),
+    }
+
+
 async def _fetch_venue_fills(since_ms: int) -> dict[str, Any]:
-    """Binance.US fills per DAY symbol since ``since_ms``. Read-only."""
+    """Binance.US fills per DAY symbol since ``since_ms``. Read-only.
+
+    One request returns at most 1000 trades. SOL and XRP both exceed that in
+    the live window, so every symbol is paged until a short page.
+    """
     from backend.services.live_trading_service import LiveTradingService, _to_binance_pair
 
     svc = LiveTradingService()
@@ -300,27 +400,22 @@ async def _fetch_venue_fills(since_ms: int) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for sym in DAY_SYMBOLS:
         pair = _to_binance_pair(sym)
+
+        def _page(start: int, _pair: str = pair) -> list[dict[str, Any]]:
+            return list(ex.fetch_my_trades(_pair, start, 1000) or [])
+
         try:
-            trades = await asyncio.to_thread(ex.fetch_my_trades, pair, since_ms, 1000)
+            trades = await asyncio.to_thread(collect_paged_trades, _page, int(since_ms))
         except Exception as exc:  # one symbol failing must not void the rest
             result[sym] = {"error": str(exc)[:200], "fills": []}
             continue
-        fills = []
-        for t in trades or []:
-            fee = t.get("fee") or {}
-            fills.append(
-                {
-                    "id": str(t.get("id") or ""),
-                    "order": str(t.get("order") or ""),
-                    "side": str(t.get("side") or "").upper(),
-                    "qty": float(t.get("amount") or 0.0),
-                    "cost": float(t.get("cost") or 0.0),
-                    "ts": int(t.get("timestamp") or 0),
-                    "fee_cost": float(fee.get("cost") or 0.0),
-                    "fee_ccy": str(fee.get("currency") or "").upper(),
-                }
-            )
-        result[sym] = {"fills": fills}
+        result[sym] = {"fills": [_ccxt_fill(t) for t in trades]}
+    try:
+        dust_logs = await asyncio.to_thread(ex.request, "asset/query/dust-logs", "sapi", "GET", {})
+        history = list((dust_logs or {}).get("userDustConvertHistory") or [])
+        result["_dust_proceeds_usd"] = dust_conversion_proceeds_usd(history, int(since_ms))
+    except Exception as exc:
+        result["_dust_error"] = str(exc)[:200]
     return result
 
 
@@ -543,6 +638,12 @@ async def build_reconciliation(db_path: str) -> LivePnlReconciliation:
     # Venue gross already nets base-asset commission out of received quantity;
     # quote-denominated commission is charged on top and must be subtracted.
     out.live_reconciled_usd = out.live_venue_gross_usd - out.live_venue_fee_quote_usd
+    if "_dust_proceeds_usd" in venue:
+        proceeds = float(venue.get("_dust_proceeds_usd") or 0.0)
+        out.live_dust_conversion_proceeds_usd = proceeds
+        out.live_economic_usd = out.live_reconciled_usd + proceeds
+    elif venue.get("_dust_error"):
+        out.notes.append(f"Dust-conversion log unavailable ({venue.get('_dust_error')}); economic USDT is not asserted.")
 
     from backend.services.live_exchange_equity import cap_qty_coverage_pct
 
@@ -557,7 +658,17 @@ async def build_reconciliation(db_path: str) -> LivePnlReconciliation:
         )
     elif out.id_matched_rows:
         out.notes.append(f"{out.id_matched_rows} row(s) reconciled exactly by exchange order id; the remainder are paired by quantity and time.")
-    if abs(out.live_reconciled_usd - out.live_recorded_usd) > 1.0:
+    if out.live_economic_usd is not None and out.live_dust_conversion_proceeds_usd is not None:
+        out.notes.append(
+            "Fill tape "
+            f"${out.live_reconciled_usd:,.2f} plus dust-conversion USDT "
+            f"${out.live_dust_conversion_proceeds_usd:,.2f} = economic "
+            f"${out.live_economic_usd:,.2f}. "
+            f"Recorded closed-trade P&L is ${out.live_recorded_usd:,.2f} and the "
+            f"dust write-off of cost basis is ${out.live_dust_writeoff_usd:,.2f}. "
+            "Those are per-lot books, not the fungible USDT change."
+        )
+    elif abs(out.live_reconciled_usd - out.live_recorded_usd) > 1.0:
         out.notes.append(f"Recorded live P&L (${out.live_recorded_usd:,.2f}) differs from the exchange-reconciled result (${out.live_reconciled_usd:,.2f}).")
     out.notes.append("LEGACY MIXED TOTAL is historical and mixes paper with live. It is not live trading profit.")
     out.ok = True
@@ -694,9 +805,14 @@ def presentation_fields(
     comparable_change = None
     if is_live and baseline_dust_known and net_liquidatable_equity is not None and baseline is not None:
         comparable_change = float(net_liquidatable_equity) - float(baseline)
+    economic = recon.get("live_economic_usd")
     if comparable_change is not None:
         primary = comparable_change
         label = "LIVE NET LIQUIDATABLE CHANGE vs comparable forward baseline"
+        primary_is_recon = True
+    elif reconciled_ok and isinstance(economic, (int, float)):
+        primary = float(economic)
+        label = "LIVE (fill tape plus dust-conversion USDT credited; not deposits or withdrawals)"
         primary_is_recon = True
     elif fill_tape is not None:
         primary = fill_tape

@@ -2385,6 +2385,10 @@ class PortfolioEngineIntegration:
                 return
             now = time.time()
             candidates = await self._run_scalp_router(functools.partial(router.evaluate_all, epoch=now, notional_usd=float(base_notional)))
+            eval_done = time.time()
+            for row in candidates or []:
+                if isinstance(row, dict):
+                    row["_timing"] = {"eval_batch_start": now, "eval_batch_end": eval_done}
         except Exception:
             logger.warning("SCALP_V2_ROUTER_ERROR", exc_info=True)
             return
