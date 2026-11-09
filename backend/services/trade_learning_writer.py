@@ -104,6 +104,9 @@ def _ensure_table(db_path: str = DATABASE_PATH) -> None:
             for col in PROVENANCE_COLUMNS:
                 if col not in cols:
                     cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN {col} TEXT DEFAULT ''")
+            if "event_key" not in cols:
+                cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN event_key TEXT")
+            cursor.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS ux_trade_learning_outcomes_event_key ON {TABLE_NAME}(event_key) WHERE event_key IS NOT NULL AND event_key != ''")
             conn.commit()
 
     run_locked_retry(_op)
@@ -148,6 +151,7 @@ class TradeLearningRecord:
     dust_remaining_qty: float = 0.0
     dust_remaining_notional_usdt: float = 0.0
     realized_profit_unknown: bool = False
+    event_key: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def normalize(self) -> TradeLearningRecord:
@@ -200,8 +204,9 @@ def record_trade_outcome(
             with connect_rw(db_path) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 cursor = conn.cursor()
-                cursor.execute(
-                    f"""
+                try:
+                    cursor.execute(
+                        f"""
                     INSERT INTO {TABLE_NAME} (
                         written_at_utc, mode, symbol,
                         entry_timestamp, exit_timestamp,
@@ -219,7 +224,8 @@ def record_trade_outcome(
                         dust_remaining_qty, dust_remaining_notional_usdt,
                         realized_profit_unknown, extra_json,
                         engine_id, setup, strategy_version,
-                        entry_contract_version, exit_contract_version, code_sha
+                        entry_contract_version, exit_contract_version, code_sha,
+                        event_key
                     ) VALUES (
                         datetime('now'), ?, ?,
                         ?, ?,
@@ -237,39 +243,46 @@ def record_trade_outcome(
                         ?, ?,
                         ?, ?,
                         ?, ?, ?,
-                        ?, ?, ?
+                        ?, ?, ?,
+                        ?
                     )
                     """,
-                    (
-                        mode_value,
-                        record.symbol,
-                        record.entry_timestamp,
-                        record.exit_timestamp,
-                        record.entry_price,
-                        record.exit_price,
-                        record.quantity,
-                        record.fees_paid,
-                        record.slippage_cost,
-                        record.net_profit_usd,
-                        record.net_profit_pct,
-                        record.hold_seconds,
-                        record.decision_reason,
-                        record.confidence,
-                        _json(record.rank_data),
-                        _json(record.indicators_at_entry),
-                        _json(record.indicators_while_holding),
-                        _json(record.indicators_at_sell),
-                        _json(record.timeframes_used),
-                        _json(record.cooldown_state),
-                        1 if record.manual_sell_flag else 0,
-                        record.close_reason,
-                        float(record.dust_remaining_qty or 0.0),
-                        float(record.dust_remaining_notional_usdt or 0.0),
-                        1 if record.realized_profit_unknown else 0,
-                        _json(record.extra),
-                        *(str((record.extra or {}).get(col) or "") for col in PROVENANCE_COLUMNS),
-                    ),
-                )
+                        (
+                            mode_value,
+                            record.symbol,
+                            record.entry_timestamp,
+                            record.exit_timestamp,
+                            record.entry_price,
+                            record.exit_price,
+                            record.quantity,
+                            record.fees_paid,
+                            record.slippage_cost,
+                            record.net_profit_usd,
+                            record.net_profit_pct,
+                            record.hold_seconds,
+                            record.decision_reason,
+                            record.confidence,
+                            _json(record.rank_data),
+                            _json(record.indicators_at_entry),
+                            _json(record.indicators_while_holding),
+                            _json(record.indicators_at_sell),
+                            _json(record.timeframes_used),
+                            _json(record.cooldown_state),
+                            1 if record.manual_sell_flag else 0,
+                            record.close_reason,
+                            float(record.dust_remaining_qty or 0.0),
+                            float(record.dust_remaining_notional_usdt or 0.0),
+                            1 if record.realized_profit_unknown else 0,
+                            _json(record.extra),
+                            *(str((record.extra or {}).get(col) or "") for col in PROVENANCE_COLUMNS),
+                            record.event_key,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    with contextlib.suppress(Exception):
+                        conn.rollback()
+                    logger.info("LEARNING_WRITE_ALREADY_BOOKED symbol=%s event_key=%s", record.symbol, record.event_key)
+                    return True
                 conn.commit()
             return True
 

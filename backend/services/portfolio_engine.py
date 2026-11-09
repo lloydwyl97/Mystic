@@ -6164,6 +6164,9 @@ class PortfolioEngine:
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_position_close_ledger_symbol ON position_close_ledger(symbol, closed_at_epoch DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_position_close_ledger_cooldown ON position_close_ledger(symbol, cooldown_until)")
+        from backend.services.dust_writeoff_identity import ensure_dust_event_schema
+
+        ensure_dust_event_schema(cursor.connection)
 
         # Add kill_switch_mode column to ledger if not exists
         cursor.execute("PRAGMA table_info(portfolio_engine_ledger)")
@@ -6855,6 +6858,7 @@ class PortfolioEngine:
         exit_price: float | None = None,
         sell_trade_id: str | None = None,
         detail: str | None = None,
+        event_key: str | None = None,
     ) -> None:
         """Persist a position close + cooldown row.
 
@@ -6871,33 +6875,43 @@ class PortfolioEngine:
 
         def _sync_insert() -> None:
             def _op() -> None:
+                from backend.services.dust_writeoff_identity import ensure_dust_event_schema
+
                 with connect_rw(self.db_path) as conn:
+                    ensure_dust_event_schema(conn)
                     conn.execute("BEGIN IMMEDIATE")
-                    conn.execute(
-                        """
-                        INSERT INTO position_close_ledger (
-                            symbol, closed_at, closed_at_epoch, close_reason,
-                            manual_sell, realized_profit, realized_profit_unknown,
-                            cooldown_until, quantity, entry_price, exit_price,
-                            sell_trade_id, detail
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            sym,
-                            closed_at_iso,
-                            now_epoch,
-                            str(close_reason or "").strip().upper(),
-                            1 if manual_sell else 0,
-                            None if realized_profit is None else float(realized_profit),
-                            rp_unknown,
-                            float(cooldown_until),
-                            None if quantity is None else float(quantity),
-                            None if entry_price is None else float(entry_price),
-                            None if exit_price is None else float(exit_price),
-                            sell_trade_id,
-                            detail,
-                        ),
-                    )
+                    try:
+                        conn.execute(
+                            """
+                            INSERT INTO position_close_ledger (
+                                symbol, closed_at, closed_at_epoch, close_reason,
+                                manual_sell, realized_profit, realized_profit_unknown,
+                                cooldown_until, quantity, entry_price, exit_price,
+                                sell_trade_id, detail, event_key
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                sym,
+                                closed_at_iso,
+                                now_epoch,
+                                str(close_reason or "").strip().upper(),
+                                1 if manual_sell else 0,
+                                None if realized_profit is None else float(realized_profit),
+                                rp_unknown,
+                                float(cooldown_until),
+                                None if quantity is None else float(quantity),
+                                None if entry_price is None else float(entry_price),
+                                None if exit_price is None else float(exit_price),
+                                sell_trade_id,
+                                detail,
+                                event_key,
+                            ),
+                        )
+                    except sqlite3.IntegrityError:
+                        with contextlib.suppress(Exception):
+                            conn.rollback()
+                        logger.info("DUST_WRITEOFF_ALREADY_BOOKED symbol=%s event_key=%s", sym, event_key)
+                        return
                     conn.commit()
 
             run_locked_retry(_op)
@@ -7307,6 +7321,7 @@ class PortfolioEngine:
         dust_notional: float = 0.0,
         exit_reporting: dict[str, Any] | None = None,
         actual_net_pct: float | None = None,
+        event_key: str | None = None,
     ) -> None:
         """
         Unified learning sink for non-AI close events (HUMAN_MANUAL_SELL,
@@ -7597,6 +7612,7 @@ class PortfolioEngine:
                 dust_remaining_qty=float(dust_qty or 0.0),
                 dust_remaining_notional_usdt=float(dust_notional or 0.0),
                 realized_profit_unknown=not fill_found and close_reason != "DUST_WRITEOFF" and realized_profit is None,
+                event_key=event_key,
                 cooldown_state={
                     "cooldown_until": cooldown_until,
                     "post_sell_cooldown_wall_sec": POST_SELL_COOLDOWN_WALL_SEC,
@@ -7960,6 +7976,75 @@ class PortfolioEngine:
             lambda: persist_recovered_close(packet, db_path=self.db_path),
         )
 
+    async def _record_dust_writeoff_once(
+        self,
+        symbol: str,
+        position: OpenPosition,
+        *,
+        quantity: float,
+        source: str,
+        cooldown_until: float,
+    ) -> None:
+        """Book one DUST_WRITEOFF for this lot and quantity. Later passes no-op."""
+        from backend.services.dust_writeoff_identity import dust_writeoff_books, dust_writeoff_event_key
+
+        engine_id = str(getattr(position, "engine_id", "") or "")
+        trade_id = str(getattr(position, "trade_id", "") or "")
+        entry_time = float(getattr(position, "entry_time", 0.0) or 0.0)
+        entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
+
+        def _books() -> tuple[bool, bool]:
+            with connect_managed(self.db_path) as conn:
+                return dust_writeoff_books(
+                    conn,
+                    engine_id=engine_id,
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    quantity=quantity,
+                    entry_time=entry_time,
+                )
+
+        ledger_done, learning_done = _books()
+        if ledger_done and learning_done:
+            logger.info(
+                "DUST_WRITEOFF_ALREADY_BOOKED symbol=%s engine=%s trade_id=%s qty=%.12g",
+                normalize_symbol(symbol),
+                engine_id or "LEGACY_DAY_LIVE",
+                trade_id,
+                quantity,
+            )
+            return
+        key = dust_writeoff_event_key(engine_id=engine_id, trade_id=trade_id, symbol=symbol, quantity=quantity)
+        if not ledger_done:
+            await self._record_position_close_ledger(
+                symbol,
+                close_reason="DUST_WRITEOFF",
+                manual_sell=False,
+                cooldown_until=cooldown_until,
+                realized_profit=None,
+                quantity=quantity,
+                entry_price=entry_price,
+                exit_price=None,
+                sell_trade_id=None,
+                detail=f"event_key={key};source={source}",
+                event_key=key,
+            )
+        if not learning_done:
+            self._record_learning_outcome(
+                symbol=symbol,
+                position=position,
+                close_reason="DUST_WRITEOFF",
+                manual_sell=False,
+                source=source,
+                exit_price=None,
+                realized_profit=None,
+                cooldown_until=cooldown_until,
+                fill_found=False,
+                dust_qty=quantity,
+                dust_notional=quantity * entry_price,
+                event_key=key,
+            )
+
     async def _handle_vanished_exchange_position(
         self,
         symbol: str,
@@ -7976,7 +8061,8 @@ class PortfolioEngine:
           * True leftover dust with no recovered sell -> DUST_WRITEOFF.
 
         Idempotent: if the lot is no longer present in ``open_positions`` the
-        function returns immediately.
+        function returns immediately. A retained DUST_PENDING quantity is one
+        dust lifecycle: the close ledger and the learning table record it once.
         """
         if all(v is not position for v in self.open_positions.values()) and symbol not in self.open_positions:
             return
@@ -8004,31 +8090,18 @@ class PortfolioEngine:
             )
             return
         if pos_status == "DUST_PENDING":
+            qty_before = float(position.quantity or 0.0)
             await self._remove_dust_position_canonical_cleanup(symbol, position)
-            await self._record_position_close_ledger(
+            still_held = any(v is position for v in self.open_positions.values()) and float(position.quantity or 0.0) > 0
+            identity_qty = float(position.quantity or 0.0) if still_held else qty_before
+            if identity_qty <= 0:
+                return
+            await self._record_dust_writeoff_once(
                 symbol,
-                close_reason="DUST_WRITEOFF",
-                manual_sell=False,
-                cooldown_until=cooldown_until,
-                realized_profit=None,
-                quantity=float(position.quantity or 0.0),
-                entry_price=float(position.entry_price or 0.0),
-                exit_price=None,
-                sell_trade_id=None,
-                detail=f"source={source}",
-            )
-            self._record_learning_outcome(
-                symbol=symbol,
-                position=position,
-                close_reason="DUST_WRITEOFF",
-                manual_sell=False,
+                position,
+                quantity=identity_qty,
                 source=source,
-                exit_price=None,
-                realized_profit=None,
                 cooldown_until=cooldown_until,
-                fill_found=False,
-                dust_qty=float(position.quantity or 0.0),
-                dust_notional=(float(position.quantity or 0.0) * float(position.entry_price or 0.0)),
             )
             return
 
