@@ -3054,10 +3054,12 @@ def resolve_markouts(
                             price = quote(str(row["symbol"]), due)
                     except Exception:
                         price = None
+                    if price is not None and (not math.isfinite(float(price)) or float(price) <= 0):
+                        price = None
                     if price is None and moment < due + grace:
                         done = False
                         continue
-                    if price is None or ref <= 0 or not math.isfinite(float(price or 0)):
+                    if price is None or ref <= 0:
                         marks[key] = None
                     elif engine_id == SCALP_ENGINE and int(horizon) in (30, 60):
                         marks[key] = executable_bid_net(ref, float(price), cost)

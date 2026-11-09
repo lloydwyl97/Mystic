@@ -93,8 +93,14 @@ def _slash_symbol(symbol: str) -> str:
     return sym
 
 
+_TRAILING_BUY_SCHEMA_READY: set[str] = set()
+
+
 def ensure_trailing_buy_schema(db_path: str | Path) -> None:
-    conn = sqlite3.connect(str(db_path), timeout=30)
+    key = str(db_path)
+    if key in _TRAILING_BUY_SCHEMA_READY:
+        return
+    conn = sqlite3.connect(key, timeout=30)
     try:
         conn.executescript(SCHEMA_SQL)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(day_trailing_buy_intents)")}
@@ -118,6 +124,7 @@ def ensure_trailing_buy_schema(db_path: str | Path) -> None:
         if "freq_limit_state" not in cols:
             conn.execute("ALTER TABLE day_trailing_buy_intents ADD COLUMN freq_limit_state TEXT DEFAULT ''")
         conn.commit()
+        _TRAILING_BUY_SCHEMA_READY.add(key)
     finally:
         conn.close()
 

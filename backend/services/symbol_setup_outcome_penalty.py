@@ -183,10 +183,75 @@ def _extract_mfe_mae(explain: dict[str, Any]) -> tuple[float | None, float | Non
     return mfe, mae
 
 
+_CLOSED_TRADES_CACHE: dict[tuple[str, int], tuple[tuple[Any, ...], list[ClosedTradeRow]]] = {}
+_EXPLAIN_PARSE_CACHE: dict[tuple[int, int, str], tuple[str, str, float | None, float | None, float | None, str, float]] = {}
+
+
+def _closed_trades_content_stamp(conn: sqlite3.Connection, min_sell_id: int) -> tuple[Any, ...]:
+    row = conn.execute(
+        """
+        SELECT COUNT(*),
+               COALESCE(MAX(id), 0),
+               COALESCE(SUM(id * length(COALESCE(explainability_json, ''))), 0),
+               COALESCE(SUM(pnl), 0.0),
+               COALESCE(SUM(hold_time_seconds), 0.0),
+               COALESCE(SUM(length(COALESCE(exit_reason, ''))), 0),
+               COALESCE(MAX(COALESCE(timestamp, '')), ''),
+               COALESCE(SUM(id * unicode(substr(COALESCE(explainability_json, ' '), 1, 1))), 0),
+               COALESCE(SUM(id * unicode(substr(COALESCE(explainability_json, ' '), -2, 1))), 0)
+        FROM paper_trades
+        WHERE side = 'SELL'
+          AND id >= ?
+          AND COALESCE(is_synthetic, 0) = 0
+        """,
+        (min_sell_id,),
+    ).fetchone()
+    if row is None:
+        return (0, 0, 0, 0.0, 0.0, 0, "", 0, 0)
+    return (
+        int(row[0] or 0),
+        int(row[1] or 0),
+        int(row[2] or 0),
+        round(float(row[3] or 0.0), 8),
+        round(float(row[4] or 0.0), 4),
+        int(row[5] or 0),
+        str(row[6] or ""),
+        int(row[7] or 0),
+        int(row[8] or 0),
+    )
+
+
+def _parsed_sell_explain(sell_id: int, raw_explain: Any, exit_reason: Any, hold_time_seconds: Any) -> tuple[str, str, float | None, float | None, float | None, str, float]:
+    raw_s = raw_explain if isinstance(raw_explain, str) else ""
+    key = (int(sell_id), len(raw_s), raw_s[:64] + raw_s[-64:] if raw_s else "")
+    cached = _EXPLAIN_PARSE_CACHE.get(key)
+    if cached is not None and raw_s:
+        setup, regime, selected_ev, mfe, mae, raw_exit_from_json, json_hold = cached
+    else:
+        explain = _parse_explain(raw_explain)
+        setup, regime, selected_ev = _extract_setup_regime_ev(explain)
+        mfe, mae = _extract_mfe_mae(explain)
+        raw_exit_from_json = str(explain.get("raw_exit_reason") or explain.get("exit_reason_raw") or explain.get("exit_trigger") or "")
+        json_hold = float(explain.get("hold_time_seconds") or explain.get("time_in_trade_sec") or 0)
+        if raw_s:
+            if len(_EXPLAIN_PARSE_CACHE) > 4096:
+                _EXPLAIN_PARSE_CACHE.clear()
+            _EXPLAIN_PARSE_CACHE[key] = (setup, regime, selected_ev, mfe, mae, raw_exit_from_json, json_hold)
+    hold_sec = float(hold_time_seconds or json_hold or 0)
+    hold_min = hold_sec / 60.0 if hold_sec > 0 else 75.0
+    raw_exit = raw_exit_from_json or str(exit_reason or "")
+    return setup, regime, selected_ev, mfe, mae, raw_exit, hold_min
+
+
 def _load_closed_trades(db_path: str | Path, *, min_sell_id: int = CLEAN_INFRA_MIN_SELL_ID) -> list[ClosedTradeRow]:
+    key = (str(db_path), int(min_sell_id))
     rows: list[ClosedTradeRow] = []
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
+        stamp = _closed_trades_content_stamp(conn, int(min_sell_id))
+        cached = _CLOSED_TRADES_CACHE.get(key)
+        if cached is not None and cached[0] == stamp:
+            return list(cached[1])
         cur = conn.execute(
             """
             SELECT id, symbol, pnl, exit_reason, timestamp, entry_price, price,
@@ -200,12 +265,12 @@ def _load_closed_trades(db_path: str | Path, *, min_sell_id: int = CLEAN_INFRA_M
             (min_sell_id,),
         )
         for r in cur.fetchall():
-            explain = _parse_explain(r["explainability_json"])
-            setup, regime, selected_ev = _extract_setup_regime_ev(explain)
-            hold_sec = float(r["hold_time_seconds"] or explain.get("hold_time_seconds") or explain.get("time_in_trade_sec") or 0)
-            hold_min = hold_sec / 60.0 if hold_sec > 0 else 75.0
-            mfe, mae = _extract_mfe_mae(explain)
-            raw_exit = str(explain.get("raw_exit_reason") or explain.get("exit_reason_raw") or explain.get("exit_trigger") or r["exit_reason"] or "")
+            setup, regime, selected_ev, mfe, mae, raw_exit, hold_min = _parsed_sell_explain(
+                int(r["id"]),
+                r["explainability_json"],
+                r["exit_reason"],
+                r["hold_time_seconds"],
+            )
             rows.append(
                 ClosedTradeRow(
                     sell_id=int(r["id"]),
@@ -223,6 +288,9 @@ def _load_closed_trades(db_path: str | Path, *, min_sell_id: int = CLEAN_INFRA_M
                     worth_taking=None,
                 )
             )
+        if len(_CLOSED_TRADES_CACHE) > 16:
+            _CLOSED_TRADES_CACHE.clear()
+        _CLOSED_TRADES_CACHE[key] = (stamp, list(rows))
     return rows
 
 

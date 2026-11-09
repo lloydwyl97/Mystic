@@ -1380,7 +1380,7 @@ _ADAPTIVE_COMPONENT_BOUNDS: dict[str, tuple[float, float]] = {
 }
 
 
-def _adaptive_weights_enabled() -> bool:
+def _adaptive_weights_enabled(db_path: str | None = None) -> bool:
     """Soft rank nudge from ai_strategy_score_weights. Auto-on when learned rows exist."""
     env = os.getenv("ADAPTIVE_SCORE_WEIGHT_ENABLED", "").strip().lower()
     if env in ("0", "false", "no", "off"):
@@ -1390,7 +1390,7 @@ def _adaptive_weights_enabled() -> bool:
     try:
         from backend.services.ai_strategy_score_weight_writer import adaptive_weights_row_count
 
-        return adaptive_weights_row_count() > 0
+        return adaptive_weights_row_count(db_path=db_path) > 0 if db_path else adaptive_weights_row_count() > 0
     except Exception:
         return False
 
@@ -17747,8 +17747,10 @@ class PortfolioEngine:
         small (bounded by 13 components x n strategies x n symbols x n regimes)
         so the entire load is cheap. Loader failure is non-fatal and treated
         as "no learned weights" (neutral)."""
-        if not _adaptive_weights_enabled():
+        env = os.getenv("ADAPTIVE_SCORE_WEIGHT_ENABLED", "").strip().lower()
+        if env in ("0", "false", "no", "off"):
             self._adaptive_weights_cache = {}
+            self._adaptive_weights_loaded_at = 0.0
             return
         now = time.time()
         if not force and (now - self._adaptive_weights_loaded_at) < self._adaptive_weights_refresh_sec and self._adaptive_weights_loaded_at > 0.0:
@@ -17787,9 +17789,12 @@ class PortfolioEngine:
         Returns an empty dict when the table is empty, the row is missing, or
         adaptive weighting is disabled — callers must treat empty as neutral.
         """
-        if not _adaptive_weights_enabled():
+        env = os.getenv("ADAPTIVE_SCORE_WEIGHT_ENABLED", "").strip().lower()
+        if env in ("0", "false", "no", "off"):
             return {}
         self._refresh_adaptive_weights_cache()
+        if not self._adaptive_weights_cache and not _adaptive_weights_enabled(self.db_path):
+            return {}
         sid = (strategy_id or "day").strip().lower()
         sym = (symbol or "").upper().replace("/", "")
         reg = _normalize_regime(regime)
@@ -17964,29 +17969,26 @@ class PortfolioEngine:
                     snapshot["bad_cut_low_mfe_count"] = bad_cut_low_mfe_count
                     snapshot["bad_cut_low_mfe_ratio"] = (bad_cut_low_mfe_count / bad_cut_count) if bad_cut_count > 0 else 0.0
                     snapshot["bad_cut_share_of_bad"] = (bad_cut_count / bad_recent) if bad_recent > 0 else 0.0
-        except Exception:
-            pass
-        try:
-            with connect_managed(self.db_path) as conn:
-                peer_row = conn.execute(
-                    """
-                    SELECT
-                        SUM(CASE WHEN (UPPER(peer_symbol)=UPPER(?) OR UPPER(peer_symbol)=UPPER(?)) THEN 1 ELSE 0 END) AS peer_seen,
-                        SUM(CASE WHEN (UPPER(peer_symbol)=UPPER(?) OR UPPER(peer_symbol)=UPPER(?)) AND peer_outperformed_selected=1 THEN 1 ELSE 0 END) AS peer_outperf,
-                        SUM(CASE WHEN (UPPER(selected_symbol)=UPPER(?) OR UPPER(selected_symbol)=UPPER(?)) THEN 1 ELSE 0 END) AS selected_seen,
-                        SUM(CASE WHEN (UPPER(selected_symbol)=UPPER(?) OR UPPER(selected_symbol)=UPPER(?)) AND selected_was_wrong=1 THEN 1 ELSE 0 END) AS selected_wrong
-                    FROM ai_peer_shadow_outcomes
-                    WHERE LOWER(strategy_id)=LOWER(?)
-                    """,
-                    (sym_slash, sym_noslash, sym_slash, sym_noslash, sym_slash, sym_noslash, sym_slash, sym_noslash, sid),
-                ).fetchone()
-                if peer_row:
-                    peer_seen = float(peer_row[0] or 0.0)
-                    peer_out = float(peer_row[1] or 0.0)
-                    selected_seen = float(peer_row[2] or 0.0)
-                    selected_wrong = float(peer_row[3] or 0.0)
-                    snapshot["peer_outperf_ratio"] = (peer_out / peer_seen) if peer_seen > 0 else 0.5
-                    snapshot["selected_wrong_ratio"] = (selected_wrong / selected_seen) if selected_seen > 0 else 0.5
+                with contextlib.suppress(Exception):
+                    peer_row = conn.execute(
+                        """
+                        SELECT
+                            SUM(CASE WHEN (UPPER(peer_symbol)=UPPER(?) OR UPPER(peer_symbol)=UPPER(?)) THEN 1 ELSE 0 END) AS peer_seen,
+                            SUM(CASE WHEN (UPPER(peer_symbol)=UPPER(?) OR UPPER(peer_symbol)=UPPER(?)) AND peer_outperformed_selected=1 THEN 1 ELSE 0 END) AS peer_outperf,
+                            SUM(CASE WHEN (UPPER(selected_symbol)=UPPER(?) OR UPPER(selected_symbol)=UPPER(?)) THEN 1 ELSE 0 END) AS selected_seen,
+                            SUM(CASE WHEN (UPPER(selected_symbol)=UPPER(?) OR UPPER(selected_symbol)=UPPER(?)) AND selected_was_wrong=1 THEN 1 ELSE 0 END) AS selected_wrong
+                        FROM ai_peer_shadow_outcomes
+                        WHERE LOWER(strategy_id)=LOWER(?)
+                        """,
+                        (sym_slash, sym_noslash, sym_slash, sym_noslash, sym_slash, sym_noslash, sym_slash, sym_noslash, sid),
+                    ).fetchone()
+                    if peer_row:
+                        peer_seen = float(peer_row[0] or 0.0)
+                        peer_out = float(peer_row[1] or 0.0)
+                        selected_seen = float(peer_row[2] or 0.0)
+                        selected_wrong = float(peer_row[3] or 0.0)
+                        snapshot["peer_outperf_ratio"] = (peer_out / peer_seen) if peer_seen > 0 else 0.5
+                        snapshot["selected_wrong_ratio"] = (selected_wrong / selected_seen) if selected_seen > 0 else 0.5
         except Exception:
             pass
         try:

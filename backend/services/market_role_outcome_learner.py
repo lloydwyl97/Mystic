@@ -119,11 +119,18 @@ CREATE TABLE IF NOT EXISTS market_role_outcome_stats (
 """
 
 
+_SCHEMA_INIT_DONE: set[str] = set()
+
+
 def _ensure_schema(db_path: str) -> None:
+    key = str(db_path)
+    if key in _SCHEMA_INIT_DONE:
+        return
     try:
         with sqlite3.connect(db_path) as conn:
             conn.executescript(_SCHEMA_SQL)
             conn.commit()
+        _SCHEMA_INIT_DONE.add(key)
     except Exception as exc:
         logger.warning("market_role_outcome_learner schema init failed: %s", exc)
 

@@ -137,10 +137,17 @@ def arm_key(symbol: str, setup: str, regime: str) -> str:
     return f"{_normalize_symbol(symbol)}|{_normalize_setup(setup)}|{_normalize_regime(regime)}"
 
 
+_BANDIT_SCHEMA_READY: set[str] = set()
+
+
 def ensure_bandit_schema(db_path: str | Path) -> None:
-    with sqlite3.connect(str(db_path), timeout=15) as conn:
+    key = str(db_path)
+    if key in _BANDIT_SCHEMA_READY:
+        return
+    with sqlite3.connect(key, timeout=15) as conn:
         conn.executescript(_SCHEMA)
         conn.commit()
+    _BANDIT_SCHEMA_READY.add(key)
 
 
 def _is_win(pnl: float, exit_reason: str) -> bool:

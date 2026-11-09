@@ -165,6 +165,7 @@ _SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS ix_ai_infer_symbol_ts ON ai_inference_log(symbol, ts_utc)",
+    "CREATE INDEX IF NOT EXISTS ix_ai_infer_decision_id ON ai_inference_log(decision_id)",
     """
     CREATE TABLE IF NOT EXISTS ai_feature_samples (
         id                  INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -91,7 +91,14 @@ PROVENANCE_COLUMNS: tuple[str, ...] = (
 )
 
 
+_LEARNING_SCHEMA_READY: set[str] = set()
+
+
 def _ensure_table(db_path: str = DATABASE_PATH) -> None:
+    key = str(db_path)
+    if key in _LEARNING_SCHEMA_READY:
+        return
+
     def _op() -> None:
         with connect_rw(db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -110,6 +117,7 @@ def _ensure_table(db_path: str = DATABASE_PATH) -> None:
             conn.commit()
 
     run_locked_retry(_op)
+    _LEARNING_SCHEMA_READY.add(key)
 
 
 def _resolve_mode_safe() -> str:
